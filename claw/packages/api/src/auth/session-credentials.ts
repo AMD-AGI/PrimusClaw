@@ -23,6 +23,7 @@ import { CLAW_DEPLOY_MODE } from "../config.js";
 import { db } from "../infra/db.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import type { UserInfo } from "./models.js";
+import { PLAINTEXT_CREDENTIAL_FIELDS, sealedCredentialFields } from "./sealed-session-credentials.js";
 
 /** Raised when a caller has no platform key to record. */
 export class MissingPlatformKeyError extends Error {
@@ -36,32 +37,7 @@ export class MissingPlatformKeyError extends Error {
   }
 }
 
-export interface TrustedSessionCredentials {
-  platformKey: string;
-  llmApiKey: string;
-}
-
-/**
- * Read only credentials this service previously stamped.
- *
- * Session config also contains caller-controlled fields, so checking for strings
- * alone turns arbitrary JSON into a bearer token. Keep the trust decision in one
- * helper so dispatch, platform backfill, and teardown cannot drift.
- */
-export function readTrustedSessionCredentials(config: unknown): TrustedSessionCredentials {
-  if (!config || typeof config !== "object" || Array.isArray(config)) {
-    return { platformKey: "", llmApiKey: "" };
-  }
-  const cfg = config as Record<string, unknown>;
-  if (cfg._server_managed_credentials !== true) {
-    return { platformKey: "", llmApiKey: "" };
-  }
-  const platformKey = typeof cfg.platform_key === "string" ? cfg.platform_key : "";
-  const llmApiKey = typeof cfg.llm_api_key === "string"
-    ? cfg.llm_api_key
-    : (typeof cfg.virtual_key === "string" ? cfg.virtual_key : "");
-  return { platformKey, llmApiKey };
-}
+export { readTrustedSessionCredentials, type TrustedSessionCredentials } from "./sealed-session-credentials.js";
 
 /**
  * The config fields a session must carry for its tasks to run as their submitter.
@@ -72,15 +48,10 @@ export function readTrustedSessionCredentials(config: unknown): TrustedSessionCr
  * asked it to believe.
  */
 export function sessionCredentialPatch(user: UserInfo): Record<string, unknown> {
-  const llmKey = resolveUserLlmKey(user);
-  return {
-    // Explicit nulls clear a key from an earlier submission. Omitting the field
-    // would leave session-level credentials at their previous value after a
-    // caller rotated or revoked one.
-    platform_key: user.platformKey || null,
-    llm_api_key: llmKey || null,
-    _server_managed_credentials: true,
-  };
+  // Sealed even when both keys are empty: the blob replaces the one from an
+  // earlier submission, so a caller who rotated or revoked a key does not leave
+  // the old one on the session.
+  return sealedCredentialFields({ platformKey: user.platformKey || "", llmApiKey: resolveUserLlmKey(user) || "" });
 }
 
 /** Refuse only the deployment mode that must authenticate to SaFE. */
@@ -102,7 +73,8 @@ export function assertSessionCredentialsForDispatch(
  * running as its submitter instead of failing forever.
  *
  * Merged with `||` rather than replacing config: the row holds unrelated
- * caller-owned fields, and a submission is not a reason to drop them.
+ * caller-owned fields, and a submission is not a reason to drop them. The plain
+ * key fields an earlier build wrote are removed in the same statement.
  */
 export async function stampSessionCredentials(
   sessionId: string,
@@ -119,8 +91,8 @@ export async function stampSessionCredentials(
   const runner = client ?? db;
   await runner.query(
     `UPDATE claw_sessions
-        SET config = COALESCE(config, '{}'::jsonb) || $2::jsonb
+        SET config = (COALESCE(config, '{}'::jsonb) - $3::text[]) || $2::jsonb
       WHERE session_id = $1`,
-    [sessionId, JSON.stringify(sessionCredentialPatch(user))],
+    [sessionId, JSON.stringify(sessionCredentialPatch(user)), PLAINTEXT_CREDENTIAL_FIELDS],
   );
 }

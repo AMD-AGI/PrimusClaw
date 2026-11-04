@@ -107,13 +107,10 @@ function registerAcceptedPrefixCases(ctx: () => Ctx): void {
     );
     assert.equal(roots.rowCount, 2, "the roots the response names are the committed ones");
 
-    const cfg = await scalar(
-      c,
-      `SELECT config->>'platform_key' AS k, config->>'_server_managed_credentials' AS m
-       FROM claw_sessions WHERE session_id = 's-batch'`,
-    );
-    assert.equal(cfg!.k, "pk-u1");
-    assert.equal(cfg!.m, "true");
+    const cfg = await scalar(c, "SELECT config FROM claw_sessions WHERE session_id = 's-batch'");
+    const { readTrustedSessionCredentials } = await import("../src/auth/session-credentials.js");
+    assert.equal(readTrustedSessionCredentials(cfg!.config).platformKey, "pk-u1");
+    assert.equal(JSON.stringify(cfg!.config).includes("pk-u1"), false, "and sealed, never in the clear");
   });
 
   test("a batch every input of which is admitted keeps size at the requested count", async () => {

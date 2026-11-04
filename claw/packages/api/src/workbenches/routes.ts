@@ -30,6 +30,7 @@ import {
   assertSessionCredentialsForDispatch,
   MissingPlatformKeyError,
   sessionCredentialPatch,
+  stampSessionCredentials,
 } from "../auth/session-credentials.js";
 import { db } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
@@ -76,10 +77,6 @@ async function ensureSession(
     (body.session_id as string | undefined) ?? "new workbench session",
     user,
   );
-  // The shared patch, not a second copy of it. This route was the only one that
-  // recorded the caller's key, and the bug was the other paths not doing what it
-  // did -- keeping two spellings of it is how they drift apart again.
-  const runConfigPatch = sessionCredentialPatch(user);
   const provided = (body.session_id as string | undefined) ?? undefined;
   if (provided) {
     const r = await client.query(
@@ -98,12 +95,7 @@ async function ensureSession(
       // Nodes that run in a session that acts as a user run with the review tools in their hands: the person's say, like creating it.
       const unattended = await actingTurnRefusalFor(req, provided, client);
       if (unattended) throw new UnattendedActingTurn(unattended);
-      await client.query(
-        `UPDATE claw_sessions
-            SET config = COALESCE(config, '{}'::jsonb) || $2::jsonb
-          WHERE session_id = $1`,
-        [provided, JSON.stringify(runConfigPatch)],
-      );
+      await stampSessionCredentials(provided, user, client);
       return { sessionId: provided, created: false };
     }
   }
@@ -129,7 +121,9 @@ async function ensureSession(
         //
         // Same for the caller's virtual key: Brain needs it as llm_api_key
         // when a workbench reaches an LLM-backed authoring step.
-        ...runConfigPatch,
+        // The shared patch, not a second copy of it: keeping two spellings of
+        // it is how the entry points drift apart again.
+        ...sessionCredentialPatch(user),
       }),
     ],
   );
