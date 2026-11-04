@@ -216,6 +216,9 @@ describe("assistant memory tools", { skip }, () => {
     const turn = await message(alice, `记住：PR 都用 opus 审；还有忘掉 #${id}`);
     assert.equal(await code(mt.memorySave(turn, { type: "user", title: "PR 用 opus 审", body: "PR 都用 opus 审", evidence_quote: "PR 都用 opus 审" })), "memory_not_here");
     assert.equal(await code(mt.memoryForget(turn, { id: String(id) })), "memory_not_here");
+    // Nor is it shown there, or read back.
+    assert.equal(await code(mt.memoryRecall(turn, {})), "memory_not_here");
+    assert.equal(await mt.routerMemoryBlock("alice", alice.routerSid), null);
     await w.q(`UPDATE claw_sessions SET config = config - 'memory' WHERE session_id = $1`, [alice.routerSid]);
     await svc.setMemoryPreference("alice", false);
     assert.equal(await code(mt.memoryForget(turn, { id: String(id) })), "memory_off");
@@ -289,6 +292,16 @@ describe("assistant memory tools", { skip }, () => {
     assert.ok(otherWorker && !otherWorker.includes(`#${bound}`), "another item's worker is not shown it");
     const chat = await svc.buildMemoryCatalogue("alice");
     assert.ok(chat && !chat.text.includes(`#${bound}`) && chat.text.includes(`#${general}`), chat?.text);
+
+    // Recall reaches no further than what a worker is shown: not another item's entry, by number, search or list.
+    const otherTurn = await w.workerTurn(other.itemId);
+    assert.equal((await mt.memoryRecall(otherTurn, { id: String(bound) })).ok, false);
+    assert.deepEqual(((await mt.memoryRecall(otherTurn, { query: "opus" })).entries as unknown[]).length, 0);
+    assert.deepEqual((await mt.memoryRecall(otherTurn, {})).entries, [`#${general} [user] 回复用中文`]);
+    await w.closeRun(otherTurn.task_id);
+    const ownTurn = await w.workerTurn(item.itemId);
+    assert.equal(((await mt.memoryRecall(ownTurn, { id: String(bound) })).entry as { title: string }).title, "这个事项用 opus 审");
+    assert.equal(((await mt.memoryRecall(ownTurn, { query: "opus" })).entries as unknown[]).length, 1);
   });
 
   test("I2 a review item's session is shown what was bound to its item and nothing else", async () => {

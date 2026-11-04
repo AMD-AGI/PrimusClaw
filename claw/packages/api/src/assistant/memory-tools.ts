@@ -187,25 +187,29 @@ function full(r: MemoryRow): Record<string, unknown> {
   };
 }
 
-/** Read the user's memory: one entry by number, a search, or every entry one line each. Any live turn of the assistant's. */
+/**
+ * Read the user's memory: one entry by number, a search, or every entry one line each. Any live turn of the assistant's,
+ * in a session where their memory is kept. A worker reads what holds everywhere and what is bound to its own item, never
+ * another item's: that is what it is shown, and recall must not reach further.
+ */
 export async function memoryRecall(
   claims: AssistantTokenClaims, args: { id?: unknown; query?: unknown },
 ): Promise<Record<string, unknown>> {
   const { userId } = await inTransaction(async (q) => {
     const turn = await assertLiveRun(q, claims);
-    if (!assistantMemoryOn() || !(await getMemoryPreference(turn.userId))) {
-      throw new ToolRefused("memory_off", "long-term memory is off for this user");
-    }
+    await requireMemoryHere(q, claims.sid, turn.userId);
     return turn;
   });
+  const visible = (r: MemoryRow): boolean =>
+    claims.role === "router" || r.work_item_id === null || r.work_item_id === claims.item_id;
   if (args.id !== undefined && args.id !== null && args.id !== "") {
-    const rows = await recallMemory(userId, { id: entryId(args.id) });
+    const rows = (await recallMemory(userId, { id: entryId(args.id) })).filter(visible);
     return rows.length ? { ok: true, entry: full(rows[0]) } : { ok: false, error: "not_found", message: "no such entry" };
   }
   const query = typeof args.query === "string" ? args.query.trim() : "";
-  if (query) return { ok: true, entries: (await recallMemory(userId, { query })).map(full) };
+  if (query) return { ok: true, entries: (await recallMemory(userId, { query })).filter(visible).map(full) };
   // Waiting for the user's confirmation, or the profile earlier versions generated: not the model's to read (`readEntry`).
-  const rows = (await listMemories(userId)).filter((r) => r.status === "active" && r.category !== "user_profile");
+  const rows = (await listMemories(userId)).filter((r) => r.status === "active" && r.category !== "user_profile" && visible(r));
   return { ok: true, count: rows.length, entries: rows.map(line) };
 }
 
@@ -273,10 +277,18 @@ async function orNothing(what: string, sessionId: string, read: () => Promise<st
   }
 }
 
+/** Whether the session is one other people read (`memory: "off"`, a group's), where no one's personal memory is shown. */
+async function sessionWithoutMemory(sessionId: string): Promise<boolean> {
+  const row = (await db.query("SELECT config->'memory' AS memory FROM claw_sessions WHERE session_id = $1", [sessionId])).rows[0] as
+    { memory: unknown } | undefined;
+  return !row || row.memory === "off" || row.memory === false;
+}
+
 /** The router's memory section and the user's index, or null where the assistant has no memory. */
 export async function routerMemoryBlock(userId: string, sessionId: string): Promise<string | null> {
   if (!assistantMemoryOn()) return null;
   return orNothing("router", sessionId, async () => {
+    if (await sessionWithoutMemory(sessionId)) return null;
     if (!(await getMemoryPreference(userId))) return ROUTER_MEMORY_OFF;
     const catalogue = await buildMemoryCatalogue(userId, { preamble: ROUTER_MEMORY_PREAMBLE, boundItems: await boundItemLabels(userId) });
     return `${ROUTER_MEMORY_PROMPT}\n\n${catalogue?.text ?? "## Long-term Memory\n(no entries yet)"}`;
@@ -287,7 +299,7 @@ export async function routerMemoryBlock(userId: string, sessionId: string): Prom
 export async function workerMemoryBlock(userId: string, itemId: string, sessionId: string): Promise<string | null> {
   if (!assistantMemoryOn()) return null;
   return orNothing("worker", sessionId, async () => {
-    if (!(await getMemoryPreference(userId))) return null;
+    if (await sessionWithoutMemory(sessionId) || !(await getMemoryPreference(userId))) return null;
     const bound = await memoriesOfItem(userId, itemId);
     const catalogue = await buildMemoryCatalogue(userId, { preamble: WORKER_MEMORY_PREAMBLE });
     const parts = [bound.length ? renderItemMemories(bound, ITEM_MEMORY_INTRO) : "", catalogue?.text ?? ""].filter(Boolean);
