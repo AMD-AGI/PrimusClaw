@@ -157,6 +157,23 @@ unattended while Cursor keeps asking. For that agent the connector then:
   `mode_update` carry `unattended`, so a client can always show whether a session asks. `status` and the line `run` prints
   at start-up name the agents without per-step approval.
 
+**Before the first phone session, check which way your Claude settings go.** When `permissions.defaultMode` is
+`bypassPermissions` in your user `settings.json` (`$CLAUDE_CONFIG_DIR`, else `~/.claude`) or in Claude's managed settings,
+every session of a `claude` agent without `approval = "never"` is closed with `mode_not_enforced` (a `claude-attach`
+agent accepts the warning while it takes a conversation over, so it is not affected).
+`claw-connector status` and the start-up line of `run` say so for each such agent:
+
+```
+warning:    claude: sessions will be refused (mode_not_enforced): Claude defaults to bypassPermissions here (permissions.defaultMode in /home/me/.claude/settings.json); set approval = "never" on this agent or change defaultMode
+```
+
+Choose one: `approval = "never"` on that agent (knowing the risk below), or another `defaultMode` in that file. The check
+reads the two files from which the Claude adapter takes `bypassPermissions` (it ignores that value in a repository's
+`.claude/settings.json` and `.claude/settings.local.json`), and only the exact spelling counts, as for the adapter; root
+without `IS_SANDBOX` cannot use bypass, and `permissions.disableBypassPermissionsMode = "disable"` turns it off. It applies
+to every agent that runs `claude-agent-acp` except `claude-attach`. Codex and Cursor have no equivalent: their own
+settings are replaced by the mode the connector sets and reads back.
+
 **The risk, in one sentence:** an agent without per-step approval acts on whatever it is told, including text it read in
 a file or a web page, with everything your account can do inside its roots (and `--force` or full access reach outside the
 sandbox the adapter would otherwise keep), and nobody is asked first.
@@ -308,7 +325,7 @@ session stops the agent process; it never deletes the conversation.
 | `hooks install\|uninstall\|status` | The `SessionStart`/`SessionEnd` hooks alone; `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
 | `run` | Connect and serve. Exit code 3 means the connector was revoked. |
-| `status [--json]` | Running or not, paused, signed in, agents, adapter processes. |
+| `status [--json]` | Running or not, paused, signed in, agents, adapter processes, and a `warning:` line for each agent whose sessions will be refused because Claude's own settings default to `bypassPermissions` (see [Running without per-step approval](#running-without-per-step-approval)). |
 | `pause` / `resume` | Stop every agent within a second and stay offline, or undo that. |
 | `stop` | Stop the running connector and every agent it started. |
 | `logout` | Stop, ask the identity service to revoke the sign-in, delete it from this machine. The stored connector id stays, so the next sign-in reuses the same connector. |
