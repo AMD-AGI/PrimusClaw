@@ -14,8 +14,11 @@
  * The stub server below rotates its tool list on every `tools/list`, which is
  * that behaviour without randomness. Only the network edges are fake (LLM and
  * MCP server); the history is shaped the way the API hands it to Brain: the
- * stored turns replayed, then the new prompt, with Brain wrapping the new
- * prompt on top.
+ * stored turns replayed, with Brain appending the new prompt, wrapped. Both
+ * turns carry the same rules text, so the anchor ends the system run: with no
+ * system run the anchor is the first message, which turn 1 sends wrapped and
+ * turn 2 replays as stored, and the comparison would be about that instead of
+ * the tool order.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -100,6 +103,7 @@ function commonPrefixLength(a: string[], b: string[]): number {
 }
 
 const mcpServers = { stub: { type: "http", url: mcp.url, token: "t" } };
+const RULES = "Answer in one line.";
 const noSandbox = { attachHands: async () => { throw new Error("these turns need no sandbox"); } };
 
 test("the stub reorders its tools on every listing, and connectPlatformMcp hands back one order regardless", async () => {
@@ -137,13 +141,13 @@ test("the first request of the next turn shares its prefix with the last request
   world.script([{ tool: "mcp__stub__alpha", input: {} }, { text: "first answer" }, { text: "second answer" }]);
   const prompt1 = "what does alpha say?";
   await new AgentEngine().execute(
-    baseRequest({ mcp_servers: mcpServers, history: [{ role: "user", content: prompt1 }], prompt: prompt1 }),
+    baseRequest({ mcp_servers: mcpServers, rules_text: RULES, history: [], prompt: prompt1 }),
     (async () => {}) as never, undefined, null, noSandbox as never,
   );
   assert.equal(world.llmBodies.length, 2, "turn 1 is a tool call and an answer");
 
   // Turn 2 as the API replays it: the stored user turn, the assistant turn with
-  // its tool call, the tool result, then the new prompt.
+  // its tool call and the tool result. The new prompt is Brain's to add.
   const prompt2 = "and what about bravo?";
   const history = [
     { role: "user", content: prompt1 },
@@ -152,10 +156,9 @@ test("the first request of the next turn shares its prefix with the last request
       { type: "tool_use", id: "tu0", name: "mcp__stub__alpha", input: {} },
     ] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "tu0", content: "tool result" }] },
-    { role: "user", content: prompt2 },
   ];
   await new AgentEngine().execute(
-    baseRequest({ mcp_servers: mcpServers, history, prompt: prompt2 }),
+    baseRequest({ mcp_servers: mcpServers, rules_text: RULES, history, prompt: prompt2 }),
     (async () => {}) as never, undefined, null, noSandbox as never,
   );
   assert.equal(world.llmBodies.length, 3);
