@@ -19,7 +19,8 @@ import {
   type OutstandingReconciliation, type ReclaimCause,
 } from "../clients/hands.js";
 import {
-  syncWorkspaceToS3, syncWorkspaceFromS3, archiveRunToS3, copyS3Prefix, syncLeftSnapshot, TRANSCRIPT_PREFIX,
+  syncWorkspaceToS3, syncWorkspaceFromS3, syncUploadsFromS3, archiveRunToS3, copyS3Prefix, syncLeftSnapshot,
+  TRANSCRIPT_PREFIX,
 } from "../workspace/s3-uploader.js";
 import { invalidateSyncManifest } from "../workspace/sync-delta.js";
 import { syncWorkspace, restoreWorkspace } from "../workspace/sync.js";
@@ -464,6 +465,7 @@ export interface TaskRunnerSideEffects {
   markRetryPending: typeof markRetryPending;
   syncWorkspaceToS3: typeof syncWorkspaceToS3;
   syncWorkspaceFromS3: typeof syncWorkspaceFromS3;
+  syncUploadsFromS3: typeof syncUploadsFromS3;
   archiveRunToS3: typeof archiveRunToS3;
   copyS3Prefix: typeof copyS3Prefix;
   syncWorkspace: typeof syncWorkspace;
@@ -500,6 +502,7 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   markRetryPending,
   syncWorkspaceToS3,
   syncWorkspaceFromS3,
+  syncUploadsFromS3,
   archiveRunToS3,
   copyS3Prefix,
   syncWorkspace,
@@ -2642,6 +2645,13 @@ class TaskRunner {
     }).catch(() => { /* a status event must not fail the run */ });
 
     await this.resolveResumeState(this.pendingResumeCkpt, created);
+    // Only a sandbox restored from S3 has the files the user uploaded while it
+    // was up: one reused, or refilled from the shared filesystem, is given them.
+    if (!created || this.resumeMode === "workspace_restore") {
+      try { await fx().syncUploadsFromS3(this.hands, this.sessionId, this.userId); } catch (e) {
+        logger.warn({ err: e, sessionId: this.sessionId }, "s3.uploads_sync_failed");
+      }
+    }
     return this.hands;
   }
 
