@@ -60,15 +60,16 @@ export function quoteSupports(quote: string, text: string): boolean {
 // start of a clause: "forget ..." (not "I keep forgetting my vim shortcuts", "don't forget", "forget it" = never
 // mind), or "delete"/"remove"/"undo" aimed at a memory ("delete the vim memory", "undo memory #3"; not "remove vim
 // from my laptop"); in Chinese "忘掉 ..."/"别记 ...", or erasing aimed at an entry ("把这条记忆删掉", "撤销记忆 #3";
-// not "我总是忘记 vim 快捷键", "忘了说，我用 vim").
+// not "我总是忘记 vim 快捷键", "忘了说，我用 vim", "我不想删除这条记忆").
 const POLITE = String.raw`(?:(?:please|pls|can you|could you|would you|you can|you should|i want you to|i'd like you to|i would like you to|go ahead and|let's|just|now|ok|okay)\s+)*`;
 const MEMORY_ZH = "(?:记忆|这条|那条|这一条|那一条|条目)";
-const ERASE_ZH = "(?<!不要|别|不用|不|勿|没|没有|不能|不许)(?:忘掉|忘记|删掉|删除|删了|撤销|撤回|去掉)";
+const ERASE_ZH = "(?<!不要|别|不用|不|勿|没|没有|不能|不许|不想|不希望|不必|不该|被)(?:忘掉|忘记|删掉|删除|删了|撤销|撤回|去掉)";
+const ZH_PLEASE = "^(?:请|麻烦)?你?(?:帮我|给我)?";
 const FORGET_REQUEST = [
   new RegExp(`^${POLITE}(?:forget|stop remembering|unlearn)\\b(?!\\s+(?:it|about it)\\b)`, "i"),
   new RegExp(`^${POLITE}(?:delete|remove|erase|drop|clear|undo|revert)\\b(?:\\s+[\\w'#-]+){0,4}?\\s+(?:memory|memories)\\b`, "i"),
-  new RegExp(`^(?:请|麻烦)?你?(?:帮我|给我)?(?:忘掉|忘记(?:它|这|那|关于|掉)|忘了(?:它|这|那|吧)|别记|不要记|不用记|别再记)`),
-  new RegExp(`${MEMORY_ZH}.{0,20}${ERASE_ZH}|${ERASE_ZH}.{0,20}${MEMORY_ZH}`),
+  new RegExp(`${ZH_PLEASE}(?:忘掉|忘记(?:它|这|那|关于|掉)|忘了(?:它|这|那|吧)|别记|不要记|不用记|别再记)`),
+  new RegExp(`${ZH_PLEASE}(?:(?:(?:把|将).{0,20}?)?${MEMORY_ZH}.{0,10}?${ERASE_ZH}|${ERASE_ZH}.{0,20}${MEMORY_ZH})`),
 ];
 // The entry by its number: "#3", "memory 3", "记忆 #3", "第3条"; a bare number ("delete 3 files") is not a reference.
 const ENTRY_NUMBER = /#\s*(\d+)|(?:memory|note|entry|记忆|条目)\s*#?\s*(\d+)|第\s*(\d+)\s*条/gi;
