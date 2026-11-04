@@ -87,7 +87,7 @@ type Item = { atom: Atom; min: number; max: number };
 type Atom =
   | { t: "lit"; ch: string } | { t: "any" } | { t: "anchor" } | { t: "esc"; e: string }
   | { t: "class"; neg: boolean; set: Array<{ ch?: string; range?: [string, string]; esc?: string }> }
-  | { t: "group"; look: boolean; branches: Item[][] };
+  | { t: "group"; look: boolean; behind?: boolean; branches: Item[][] };
 
 function parsePattern(src: string): Item[][] {
   let i = 0;
@@ -119,15 +119,16 @@ function parsePattern(src: string): Item[][] {
     const c = src[i++] as string;
     if (c === "(") {
       let look = false;
+      let behind = false;
       if (src[i] === "?") {
         if (src[i + 1] === ":") i += 2;
         else if (src[i + 1] === "=" || src[i + 1] === "!") { look = true; i += 2; }
-        else if (src[i + 1] === "<" && (src[i + 2] === "=" || src[i + 2] === "!")) { look = true; i += 3; }
+        else if (src[i + 1] === "<" && (src[i + 2] === "=" || src[i + 2] === "!")) { look = true; behind = src[i + 2] === "="; i += 3; }
         else if (src[i + 1] === "<") i = src.indexOf(">", i) + 1;
       }
       const branches = alternation();
       i++; // the closing bracket
-      return { t: "group", look, branches };
+      return { t: "group", look, behind, branches };
     }
     if (c === "[") {
       let neg = false;
@@ -184,7 +185,11 @@ function seedOf(text: string): number {
  */
 export const SAMPLE_MAX = 120;
 
-/** Up to `count` short strings the pattern matches (all or most of the time: lookarounds and anchors are not enforced). */
+/**
+ * Short strings the pattern matches (all or most of the time: lookaheads, negative lookbehinds and anchors are not enforced): up to `count` made by random
+ * choices, and then one for every branch of every alternation, so that a branch is never left out because the random choices did not reach
+ * it (a pattern of many branches, one of them catastrophic, is read on lines made from that one too).
+ */
 export function sampleStrings(source: string, count = 12): string[] {
   const rnd = generator(seedOf(source));
   const pick = <T>(xs: T[]): T => xs[Math.floor(rnd() * xs.length)] as T;
@@ -209,14 +214,38 @@ export function sampleStrings(source: string, count = 12): string[] {
         const first = a.set.find((m) => m.ch !== undefined || m.range);
         return first?.ch ?? first?.range?.[0] ?? "a";
       }
-      case "group": return a.look ? "" : sequence(pick(a.branches));
+      // What a positive lookbehind asks for is written where it stands, since it is read from there backwards; other lookarounds are not.
+      case "group": return a.look && !a.behind ? "" : alternation(a.branches);
     }
+  };
+  // A branch to take, when one is forced: `forced` is the alternation and the branch, and an alternation that holds it somewhere inside one
+  // of its branches takes that branch, and a repeat that holds it repeats at least once, so that the forced branch is reached.
+  let forced: { alts: Item[][]; branch: number } | null = null;
+  const holds = new Map<Item[][], boolean>();
+  const reaches = (alts: Item[][]): boolean => {
+    if (forced === null) return false;
+    if (alts === forced.alts) return true;
+    let r = holds.get(alts);
+    if (r === undefined) {
+      r = alts.some((items) => items.some(({ atom: a }) => a.t === "group" && reaches(a.branches)));
+      holds.set(alts, r);
+    }
+    return r;
+  };
+  const alternation = (alts: Item[][]): string => {
+    if (forced !== null && alts === forced.alts) return sequence(alts[forced.branch]!);
+    if (forced !== null) {
+      const on = alts.find((items) => items.some(({ atom: a }) => a.t === "group" && reaches(a.branches)));
+      if (on !== undefined) return sequence(on);
+    }
+    return sequence(pick(alts));
   };
   const sequence = (items: Item[]): string => {
     let out = "";
     for (const { atom: a, min, max } of items) {
       const most = Math.min(max, min + 2);
-      const n = min + Math.floor(rnd() * (most - min + 1));
+      let n = min + Math.floor(rnd() * (most - min + 1));
+      if (n === 0 && max > 0 && a.t === "group" && reaches(a.branches)) n = 1;
       for (let k = 0; k < n; k++) out += atom(a);
     }
     return out;
@@ -224,9 +253,27 @@ export function sampleStrings(source: string, count = 12): string[] {
   const tree = parsePattern(source);
   const out = new Set<string>();
   for (let k = 0; k < count * 12 && out.size < count; k++) {
-    const s = sequence(pick(tree));
+    const s = alternation(tree);
     if (s.length <= SAMPLE_MAX) out.add(s);
   }
+  // Every alternation of the pattern, the whole of it included, and every branch of each.
+  const alternations: Item[][][] = [];
+  const collect = (alts: Item[][]): void => {
+    if (alts.length > 1) alternations.push(alts);
+    for (const items of alts) for (const { atom: a } of items) if (a.t === "group") collect(a.branches);
+  };
+  collect(tree);
+  for (const alts of alternations) {
+    for (let branch = 0; branch < alts.length; branch++) {
+      forced = { alts, branch };
+      holds.clear();
+      for (let tries = 0; tries < 12; tries++) {
+        const s = alternation(tree);
+        if (s.length <= SAMPLE_MAX) { out.add(s); break; }
+      }
+    }
+  }
+  forced = null;
   return [...out];
 }
 

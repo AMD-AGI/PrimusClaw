@@ -259,9 +259,14 @@ const isWord = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && c <= 
 const isLineEnd = (c: number): boolean => c === 10 || c === 13 || c === 0x2028 || c === 0x2029;
 
 export interface CountedPattern {
-  /** The pattern as V8 runs it, without `g` and `y`, as the sweep reads it. */
+  /** The pattern as V8 runs it, without `g` and `y`. */
   native: RegExp;
-  /** Steps of one `exec` of the pattern on `text` (searching from its start), or `Infinity` when that is over `budget`. */
+  /**
+   * Steps of one `exec` of the pattern on `text` (searching from its start), or `Infinity` when that is over `budget`. A pattern with `g`
+   * is run as a caller that wants every match runs it (`matchAll`, `replace`): on from where the last match ended, to the end of the text.
+   * A pattern with `y` is run from wherever the caller sets `lastIndex`, so from every place in the text, each a sticky `exec` of its own,
+   * a match found or not. Either way a match early in the line does not end the count.
+   */
   steps: (text: string, budget?: number) => number;
 }
 
@@ -272,6 +277,10 @@ export interface CountedPattern {
 export function counted(source: string, flags: string): CountedPattern {
   const runFlags = flags.replace(/[gyd]/g, "");
   const native = new RegExp(source, runFlags);
+  const everyStart = flags.includes("y");
+  const global = !everyStart && flags.includes("g");
+  const sticky = new RegExp(source, `${runFlags}y`);
+  const nativeGlobal = new RegExp(source, `${runFlags}g`);
   const { node, groups } = parse(source, runFlags);
   const { prog, regs } = compile(node, source);
   const first = firstChars(node);
@@ -396,23 +405,45 @@ export function counted(source: string, flags: string): CountedPattern {
     // A run that finds nothing has gone back over everything it did, and so has given back every capture and register it set.
     caps.fill(-1);
     reg.fill(-1);
+    nativeGlobal.lastIndex = 0;
     for (let start = 0; start <= len; start++) {
       if (++count > budget) { sp = 0; return Infinity; }
       if (canStart !== null && (start === len || !inClass(canStart, text.charCodeAt(start)))) continue;
       const end = run(prog, start);
       if (end === -2) { sp = 0; return Infinity; }
-      if (end >= 0) { caps[0] = start; caps[1] = end; found = Array.from(caps); break; }
+      if (end >= 0) { caps[0] = start; caps[1] = end; }
+      if (everyStart) {
+        // Each start is one sticky `exec`, and is compared with V8's at that `lastIndex`.
+        sticky.lastIndex = start;
+        same(text, end >= 0 ? Array.from(caps) : null, sticky.exec(text), start);
+        caps.fill(-1);
+        reg.fill(-1);
+        continue;
+      }
+      if (end >= 0 && global) {
+        // Every match in turn, each compared with V8's next one; the next search starts where this match ended (one on, if it was empty).
+        same(text, Array.from(caps), nativeGlobal.exec(text), start);
+        caps.fill(-1);
+        reg.fill(-1);
+        start = end > start ? end - 1 : start;
+        continue;
+      }
+      if (end >= 0) { found = Array.from(caps); break; }
     }
-    const expected = native.exec(text);
-    const same = expected === null ? found === null
+    if (global) same(text, null, nativeGlobal.exec(text), len);
+    else if (!everyStart) same(text, found, native.exec(text), 0);
+    return count;
+  };
+  const same = (text: string, found: number[] | null, expected: RegExpExecArray | null, from: number): void => {
+    const len = text.length;
+    const agree = expected === null ? found === null
       : found !== null && Array.from({ length: groups + 1 }, (_, g) => g).every((g) => {
         const mine = found![2 * g]! < 0 || found![2 * g + 1]! < 0 ? undefined : text.slice(found![2 * g]!, found![2 * g + 1]!);
         return mine === expected[g] && (g > 0 || found![0] === expected.index);
       });
-    if (!same) {
-      throw new UnsupportedPattern(`/${source}/${flags} on ${JSON.stringify(text.slice(0, 60))}... (${len} characters): the counter matched ${found === null ? "nothing" : JSON.stringify(text.slice(found[0], found[1]).slice(0, 60))} at ${found?.[0]}, V8 ${expected === null ? "nothing" : `${JSON.stringify(expected[0].slice(0, 60))} at ${expected.index}`}`);
+    if (!agree) {
+      throw new UnsupportedPattern(`/${source}/${flags} on ${JSON.stringify(text.slice(0, 60))}... (${len} characters, from ${from}): the counter matched ${found === null ? "nothing" : JSON.stringify(text.slice(found[0], found[1]).slice(0, 60))} at ${found?.[0]}, V8 ${expected === null ? "nothing" : `${JSON.stringify(expected[0].slice(0, 60))} at ${expected.index}`}`);
     }
-    return count;
   };
   return { native, steps };
 }

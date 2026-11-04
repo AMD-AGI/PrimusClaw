@@ -136,6 +136,14 @@ test("S2 the count flags the patterns that were super-linear, written as they we
     assert.ok(samples.some((x) => re.test(x)), `none of ${JSON.stringify(samples.slice(0, 3))} matches /${source}/`);
   }
 
+  // A catastrophic branch among many that are not is read on lines of its own (a sample is made for every branch of every alternation), and
+  // a sticky pattern is counted from every place a caller can set `lastIndex` to, not only from the first place it matches.
+  const hidden = `^(?:${Array.from({ length: 60 }, (_, k) => `x{${k + 1}}`).join("|")}|q+(?:q+)+)$`;
+  for (const [source, flags, what] of [[hidden, "", "a catastrophic branch after sixty that are not"], ["(?:x|(?<=x)q+(?:q+)+$)", "y", "a sticky pattern that matches early"]] as const) {
+    const verdict = workOf(source, flags, SWEEP_LENGTH, SWEEP);
+    assert.ok(verdict.slow.length > 0, `${what}: not slow by the verdict of S3 (the most work was ${describeWork(verdict.most, SWEEP_LENGTH, STEPS_PER_CHAR)})`);
+  }
+
   // The counter refuses a pattern whose syntax it does not read, rather than count it as cheap. On one it reads, every count it gives is of a
   // run that matched what V8's `exec` matches, the same text at the same place with the same groups (`steps` throws otherwise): lookbehind
   // with groups, a group in a repeat that matches nothing, a group a later iteration does not take part in, `/i`, `/m`, a boundary.
