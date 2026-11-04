@@ -346,6 +346,11 @@ describe("assistant review items", { skip }, () => {
     await audit(merged.session_id, "gh_pr_merge", "ok", "merged");
     for (const [it, code] of [[merging, "merge_in_progress"], [merged, "already_merged"]] as const) {
       const turn = await w.routerTurn(alice);
+      // Stopping a review is the person's say (`attendedTurn`): the turn answers their signed-in message.
+      await w.q(
+        `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, attended_via) VALUES ($1, $2, 'alice', 'stop it', '{"kind":"person"}'::jsonb)`,
+        [alice.routerSid, turn.mid],
+      );
       await assert.rejects(w.mod.tools.workStop(turn, { item_id: it.item_id, reason: "stop it" }), (err: any) => err.code === code, code);
       await w.closeRun(turn.task_id);
     }

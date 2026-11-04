@@ -88,6 +88,7 @@ export function standIn(c: ReviewEvalCase) {
       }
       case "work_stop": {
         const seq = seqOf(input.item_id);
+        if (seq !== null && c.attended === false && items.find((i) => i.seq === seq)?.review) return refuse("not_attended");
         return seq === null ? refuse("item_not_found") : { ...ok({ outcome: "stopped" }), item: seq };
       }
       case "review_start": {

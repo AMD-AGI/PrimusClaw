@@ -27,6 +27,8 @@ import { db, inTransaction, type Querier } from "../infra/db.js";
 import { deterministicEventId, enqueue, kickDelivery } from "../notifications/outbox.js";
 import type { AssistantActionPayload } from "../notifications/assistant-events.js";
 import { decidedViaOf, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
+
+export { attendedTurn };
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { IDENTITY_TOKEN_METHOD } from "../auth/identity-token.js";
 import type { UserInfo } from "../auth/models.js";
@@ -35,7 +37,7 @@ import {
   reviewItemsEnabled, startReviews, syncReviewItemOfSession,
 } from "./review-items.js";
 import type { AssistantTokenClaims } from "./token.js";
-import { assertLiveRun, ToolRefused } from "./tools.js";
+import { attendedTurn, ToolRefused } from "./tools.js";
 import { resolveWorkItemNow } from "./work-items.js";
 
 const logger = pino({ name: "assistant-review-tools" });
@@ -111,32 +113,6 @@ async function asTool<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-/**
- * The live turn, its user, and the person's message it answers, or a refusal that says which of them is missing.
- * `q` is a transaction's: the session row stays held (`assertLiveRun`) until the write it protects is done.
- */
-export async function attendedTurn(
-  q: Querier, claims: AssistantTokenClaims,
-): Promise<{ userId: string; message: TurnMessage; via: AttendedVia }> {
-  const { userId } = await assertLiveRun(q, claims);
-  const message = await turnMessage(q, claims.sid, claims.mid);
-  if (!message || !message.attendedVia) {
-    throw new ToolRefused(
-      "not_attended",
-      "this turn does not answer a message the user sent signed in (it is a report, or the message came with a key), so it cannot act for them: tell the user what you would do and ask them to say it in chat",
-    );
-  }
-  if (!message.fresh) {
-    throw new ToolRefused("attendance_expired", "the user's message is too old to act on now: ask them to confirm in a new message");
-  }
-  if (message.readUntrusted) {
-    throw new ToolRefused(
-      "read_untrusted",
-      "this turn has read what a worker wrote (work_recall), so it no longer acts for the user: tell them what you would do and ask them to confirm in a new message",
-    );
-  }
-  return { userId, message, via: message.attendedVia };
-}
 
 // --- Grounding: pure, so the evaluation and the tests ask the same question the tools do ------------------------
 

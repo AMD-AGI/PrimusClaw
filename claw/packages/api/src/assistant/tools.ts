@@ -19,7 +19,7 @@ import { CLAW_ASSISTANT_WORKER_MODEL, CLAW_DEPLOY_MODE } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
-import { markUntrustedRead } from "./inbound.js";
+import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, SayRefused, type SayDeps } from "./outbound.js";
 import { parseReport } from "./report.js";
@@ -74,6 +74,33 @@ export async function assertLiveRun(
   }
   if (!row.user_id) throw new ToolRefused("turn_not_live", "the session has no owner");
   return { userId: row.user_id };
+}
+
+/**
+ * The live turn, its user, and the person's message it answers, or a refusal that says which of them is missing.
+ * `q` is a transaction's: the session row stays held (`assertLiveRun`) until the write it protects is done.
+ */
+export async function attendedTurn(
+  q: Querier, claims: AssistantTokenClaims,
+): Promise<{ userId: string; message: TurnMessage; via: AttendedVia }> {
+  const { userId } = await assertLiveRun(q, claims);
+  const message = await turnMessage(q, claims.sid, claims.mid);
+  if (!message || !message.attendedVia) {
+    throw new ToolRefused(
+      "not_attended",
+      "this turn does not answer a message the user sent signed in (it is a report, or the message came with a key), so it cannot act for them: tell the user what you would do and ask them to say it in chat",
+    );
+  }
+  if (!message.fresh) {
+    throw new ToolRefused("attendance_expired", "the user's message is too old to act on now: ask them to confirm in a new message");
+  }
+  if (message.readUntrusted) {
+    throw new ToolRefused(
+      "read_untrusted",
+      "this turn has read what a worker wrote (work_recall), so it no longer acts for the user: tell them what you would do and ask them to confirm in a new message",
+    );
+  }
+  return { userId, message, via: message.attendedVia };
 }
 
 function requireRole(claims: AssistantTokenClaims, role: "router" | "worker"): void {
@@ -229,6 +256,10 @@ export async function workStop(
     // In the stop's own transaction, so a turn that loses its gate cannot close an item between the two.
     guard: async (query) => {
       if ((await assertLiveRun(query, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");
+      // Stopping a review also denies what waits for the person's answer in it: that is their say, so a report's turn,
+      // or one that read a worker's words, cannot. The stop button on the item needs nothing (the person pressed it).
+      const kind = (await query("SELECT kind FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0]?.kind;
+      if (kind === "review") await attendedTurn(query, claims);
     },
   });
   if (stopped.status === "not_found") throw new ToolRefused("item_not_found", "no such item");

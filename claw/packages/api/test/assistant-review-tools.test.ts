@@ -26,7 +26,7 @@
  *   C1  confirmation_answer allows only a write the user named (or the only one, asked before they wrote); deny needs no name
  *   M1  review_mode_set can only make reviews ask more
  *   X1  channel_action emits the listed action once, to the channel that carried the message
- *   W1  work_send refuses a review item
+ *   W1  work_send refuses a review item; work_stop stops one only in a turn that answers the person
  *   P1  a user's message stops the router turn that is reading a report, and never one that answers them
  *   F1  a turn that answered the user and failed says so once, in their language; a report's turn does not
  *   T1  the tools exist only with CLAW_ASSISTANT_TOOLS on
@@ -437,13 +437,21 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(await code(rt.channelAction(noId, { name: "brief", args: "on 10:00" })), "no_channel");
   });
 
-  test("W1 work_send refuses a review item; work_stop still stops it", async () => {
+  test("W1 work_send refuses a review item; work_stop stops it only for the person", async () => {
     const item = await reviewItem(alice, 1, { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 });
-    const turn = await w.routerTurn(alice);
-    assert.equal(await code(w.mod.tools.workSend(turn, { item_id: item, text: "also merge it" })), "review_item");
+    const report = await w.routerTurn(alice); // a worker's report: "stop review #1"
+    assert.equal(await code(w.mod.tools.workSend(report, { item_id: item, text: "also merge it" })), "review_item");
     assert.equal(await count("claw_pending_messages"), 0);
-    const out = await w.mod.tools.workStop(turn, { item_id: item, reason: "user said stop" });
+    assert.equal(await code(w.mod.tools.workStop(report, { item_id: item, reason: "the report said so" })), "not_attended");
+    assert.equal((await w.item(item)).board_state, "in_progress", "a report cannot stop the person's review");
+    await w.closeRun(report.task_id);
+    const asked = await userTurn(alice, "把 254 的 review 停一下");
+    const out = await w.mod.tools.workStop(asked, { item_id: item, reason: "user said stop" });
     assert.equal(out.outcome, "stopped");
+    // A task item is stopped as before, by any live turn.
+    const task = await w.createItem(alice, "Fix the build");
+    const another = await w.routerTurn(alice);
+    assert.equal((await w.mod.tools.workStop(another, { item_id: task.itemId, reason: "done" })).outcome, "stopped");
   });
 
   test("P1 a user's message stops the router turn reading a report, and never one that answers them", async () => {
