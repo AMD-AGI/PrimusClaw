@@ -3,6 +3,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import { guardPath } from "../../runtime/path-guard.js";
 import { WORKSPACE } from "../../config.js";
@@ -28,41 +29,25 @@ function sizeOf(p: string): number | null {
 }
 
 /**
- * Where the file open on `fd` is now, or why it does not count as inside `root`.
- *
- * The path is the kernel's, read back from /proc, so it follows renames. A file
- * with a second name could be one outside the workspace under a name inside it.
+ * Where the file or directory open on `fd` is now, or why it does not count as
+ * inside `root`. The path is the kernel's, read back from /proc, so it follows
+ * renames.
  */
-function placeOf(fd: number, root: string): { at: string } | { not: string } {
+function placeOf(fd: number, root: string): string | null {
   let at: string;
   try {
     at = fs.readlinkSync(`/proc/self/fd/${fd}`);
   } catch {
-    return { not: "cannot tell which file was opened" };
+    return "cannot tell which file was opened";
   }
-  const st = fs.fstatSync(fd);
-  if (!st.isFile() || st.nlink !== 1) return { not: `${at} is not a file with one name` };
   const rel = path.relative(root, at);
-  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return { not: `resolved to ${at}, outside the workspace` };
-  return { at };
-}
-
-/** Remove the file this call created on `fd`, under whatever name it has now, if that name is still it. */
-function removeCreated(fd: number): void {
-  try {
-    const at = fs.readlinkSync(`/proc/self/fd/${fd}`);
-    const mine = fs.fstatSync(fd);
-    const there = fs.lstatSync(at);
-    if (there.ino === mine.ino && there.dev === mine.dev) fs.unlinkSync(at);
-  } catch {
-    // already gone, or no longer reachable by that name
-  }
+  return rel.startsWith("..") || path.isAbsolute(rel) ? `resolved to ${at}, outside the workspace` : null;
 }
 
 /**
- * Open `rel` below the workspace root for writing, one name at a time from a
- * descriptor of the directory above it, never through a symbolic link, making
- * the directories on the way. Each name is looked up through
+ * Open the directory `parts` names below the workspace root, one name at a time
+ * from a descriptor of the directory above it, never through a symbolic link,
+ * making the directories on the way. Each name is looked up through
  * /proc/self/fd/<dir>/<name>, i.e. relative to that open directory, so swapping
  * a directory for a link at any moment cannot redirect the open.
  *
@@ -72,69 +57,50 @@ function removeCreated(fd: number): void {
  * the part below the workspace root is checked: the root itself is the
  * deployment's to place.
  */
-function openBelow(root: string, rel: string): { fd: number; created: boolean } | { not: string } {
-  const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW, O_DIRECTORY, O_NONBLOCK } = fs.constants;
-  const WRITE = O_WRONLY | O_NOFOLLOW | O_NONBLOCK;   // a FIFO planted there fails instead of hanging the call
-  const parts = rel.split(path.sep);
-  const name = parts.pop()!;
+function openDirBelow(root: string, parts: string[]): number | string {
+  const { O_RDONLY, O_NOFOLLOW, O_DIRECTORY } = fs.constants;
   let dir = fs.openSync(root, O_RDONLY | O_DIRECTORY);
   let shown = root;
-  const notThrough = (e: any, at: string): { not: string } => {
-    if (e?.code !== "ELOOP" && e?.code !== "ENOTDIR") throw e;
-    let link = false;
+  for (const part of parts) {
+    const at = `/proc/self/fd/${dir}/${part}`;
+    shown = path.join(shown, part);
+    let next: number;
     try {
-      link = fs.lstatSync(at).isSymbolicLink();
-    } catch {
-      // gone again: report it as what the open saw
-    }
-    return { not: `${shown} is ${link || e.code === "ELOOP" ? "a symbolic link" : "not a directory"}` };
-  };
-  try {
-    for (const part of parts) {
-      const at = `/proc/self/fd/${dir}/${part}`;
-      shown = path.join(shown, part);
       try {
         fs.mkdirSync(at);
       } catch (e: any) {
         if (e?.code !== "EEXIST") throw e;
       }
-      let next: number;
+      next = fs.openSync(at, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    } catch (e: any) {
+      let link = e?.code === "ELOOP";
       try {
-        next = fs.openSync(at, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-      } catch (e: any) {
-        return notThrough(e, at);
+        link ||= fs.lstatSync(at).isSymbolicLink();
+      } catch {
+        // gone again: report it as what the open saw
       }
       fs.closeSync(dir);
-      dir = next;
+      if (e?.code !== "ELOOP" && e?.code !== "ENOTDIR") throw e;
+      return `${shown} is ${link ? "a symbolic link" : "not a directory"}`;
     }
-    const at = `/proc/self/fd/${dir}/${name}`;
-    shown = path.join(shown, name);
-    try {
-      return { fd: fs.openSync(at, WRITE | O_CREAT | O_EXCL), created: true };
-    } catch (e: any) {
-      if (e?.code !== "EEXIST") return notThrough(e, at);
-    }
-    try {
-      return { fd: fs.openSync(at, WRITE), created: false };
-    } catch (e: any) {
-      return notThrough(e, at);
-    }
-  } finally {
     fs.closeSync(dir);
+    dir = next;
   }
+  return dir;
 }
 
 /**
- * Write `body` to `p` only if the file opened is the one `p` names inside the
- * workspace; returns why not, or null when written.
+ * Write `body` to `p` only if it lands where `p` names inside the workspace;
+ * returns why not, or null when written.
  *
- * The file is opened by openBelow and written only through that descriptor, so
- * the bytes can reach no file but the one opened inside the workspace. Nothing
- * stops another process renaming a directory holding it while it is written, so
- * where it is is asked again after the write: a file moved out meanwhile, or a
- * write that failed part way, is emptied again (and removed, if this call
- * created it). A move after that is a move of a finished file, which no write
- * can prevent.
+ * The bytes go into a new file only Hands can open (made next to the target
+ * through the directory's descriptor), which then takes the target's name in
+ * that same directory: no other name, link or file can receive them, and a
+ * file already at `p` is replaced rather than written into. Nothing stops
+ * another process renaming a directory while this runs, so where the file is
+ * is asked once more after the rename: one moved out meanwhile is emptied and
+ * removed. A move after that is a move of a finished file, which no write can
+ * prevent.
  */
 function writeWhereNamed(p: string, body: Buffer): string | null {
   const named = path.relative(path.resolve(WORKSPACE), p);
@@ -145,34 +111,38 @@ function writeWhereNamed(p: string, body: Buffer): string | null {
     return null;
   }
   const root = fs.realpathSync(path.resolve(WORKSPACE));
-  const opened = openBelow(root, named);
-  if ("not" in opened) return `not written: ${opened.not}`;
-  const { fd, created } = opened;
-  const undo = () => {
-    fs.ftruncateSync(fd, 0);
-    if (created) removeCreated(fd);
-  };
+  const parts = named.split(path.sep);
+  const name = parts.pop()!;
+  const dir = openDirBelow(root, parts);
+  if (typeof dir === "string") return `not written: ${dir}`;
+  const part = `/proc/self/fd/${dir}/.${name}.${randomBytes(6).toString("hex")}.part`;
+  const target = `/proc/self/fd/${dir}/${name}`;
+  let fd: number | undefined;
   try {
-    const before = placeOf(fd, root);
-    if ("not" in before) {
-      if (created) removeCreated(fd);
-      return `not written: ${p} ${before.not}`;
-    }
+    const away = placeOf(dir, root);
+    if (away) return `not written: ${p} ${away}`;
+    const { O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW } = fs.constants;
+    fd = fs.openSync(part, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
     try {
-      fs.ftruncateSync(fd, 0);
       fs.writeFileSync(fd, body);
+      fs.fchmodSync(fd, 0o666 & ~process.umask());
+      fs.renameSync(part, target);
     } catch (e) {
-      undo();
+      fs.rmSync(part, { force: true });
       throw e;
     }
-    const after = placeOf(fd, root);
-    if ("not" in after) {
-      undo();
-      return `not written: ${p} was moved while being written and ${after.not}`;
+    const moved = placeOf(fd, root);
+    if (moved) {
+      fs.ftruncateSync(fd, 0);
+      const mine = fs.fstatSync(fd);
+      const there = fs.lstatSync(target, { throwIfNoEntry: false });
+      if (there && there.ino === mine.ino && there.dev === mine.dev) fs.unlinkSync(target);
+      return `not written: ${p} was moved while being written and ${moved}`;
     }
     return null;
   } finally {
-    fs.closeSync(fd);
+    if (fd !== undefined) fs.closeSync(fd);
+    fs.closeSync(dir);
   }
 }
 
