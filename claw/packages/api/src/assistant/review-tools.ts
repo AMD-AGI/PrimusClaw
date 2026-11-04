@@ -367,13 +367,15 @@ export function confirmationNamed(
   return prGrounded(text, ref) && (sharing === 1 || repoGrounded(text, ref, [], []));
 }
 
-/** Words that say yes to a held write. */
-const APPROVAL = /可以|合吧|合入|合并|合了|同意|批准|放行|通过|确认|没问题|行|好|(?<![a-z])(?:yes|yep|ok|okay|sure|approve[sd]?|allow|go ahead|proceed|lgtm|ship it|merge(?: it)?|confirm(?:ed)?)(?![a-z])/i;
 /**
- * Words that say no, not yet, or ask: a message with any of them is not a yes, whatever else it says. Any 不 or 没 counts
- * (不可以, 不应该, 没同意), except in 不错 and 没问题; any English contraction in n't counts (shouldn't, won't).
+ * Phrases that say yes to a held write, and nothing else: not a bare 好 or 行 (这行代码, 好像), not a bare merge (maybe merge).
  */
-const NOT_APPROVAL = /不(?!错)|没(?!问题)|别|勿|莫|甭|否|未|拒|取消|停|撤|等|再看|慢着|吗|么|呢|怎|进度|情况|状态|[?？]|n['’]t\b|(?<![a-z])(?:no|nope|not|never|neither|nor|cannot|deny|reject|refuse|cancel|abort|revert|undo|block|hold|wait|pause|stop|status|why|how|what|when|whether|later|if)(?![a-z])/i;
+const APPROVAL = /可以合|合吧|合入吧|合并吧|同意|批准|放行|没问题|好的|行吧|(?<![a-z])(?:yes|ok|okay|sure|approve[sd]?|allow|go ahead|lgtm|ship it|merge it|proceed|confirm(?:ed)?)(?![a-z])/i;
+/**
+ * Words that say no, not yet, maybe, or ask, or raise a concern: a message with any of them is not a yes, whatever else it
+ * says. Any 不 or 没 counts (不可以, 不应该, 没同意), except in 不错 and 没问题; any English n't counts (shouldn't, won't).
+ */
+const NOT_APPROVAL = /不(?!错)|没(?!问题)|(?<!没)问题|别|勿|莫|甭|否|未|拒|取消|停|撤|等|再看|慢着|也许|可能|或许|大概|好像|要不要|考虑|吗|么|呢|怎|进度|情况|状态|[?？]|n['’]t\b|(?<![a-z])(?:no|nope|not|never|neither|nor|cannot|deny|reject|refuse|cancel|abort|revert|undo|block|hold|wait|pause|stop|status|why|how|what|when|whether|later|if|could|would|should|might|maybe|perhaps|probably|can|think|consider|issue|problem|concern)(?![a-z])/i;
 
 /**
  * Whether the person's message says yes, and only yes: an approval word, and no word of refusal, delay or question. Naming
