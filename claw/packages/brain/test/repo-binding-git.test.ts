@@ -722,3 +722,33 @@ test("GB5 a background clone that finishes is not stopped", async () => {
   assert.equal(b.state, "cloned");
   assert.ok(!s.tools.includes("kill_shell"), s.tools.join());
 });
+
+for (const shellClass of ["lost", "ended_unreaped"] as const) {
+  test(`GB6 a background clone whose shell is ${shellClass} fails at once instead of waiting on it again`, async () => {
+    const s = sandbox(`gb6-${shellClass}`);
+    let waits = 0;
+    const kills: unknown[] = [];
+    const hands = {
+      async callToolFull(name: string, args: Record<string, unknown>) {
+        if (name === "bash" && args.run_in_background === true) {
+          return { text: "Started background shell sh-1.", isError: false, structured: { shell_id: "sh-1" } };
+        }
+        if (name === "wait") {
+          // Bounded so that a loop that keeps asking ends the test red rather than hanging it.
+          if (++waits > 3) return { text: "Error: asked again", isError: true };
+          return {
+            text: `Shell sh-1 is ${shellClass}; nothing was waited for`, isError: false,
+            structured: { shell_id: "sh-1", shell_class: shellClass, blocking: false, finished: false, status: null, exit_code: null, waited_sec: 0 },
+          };
+        }
+        if (name === "kill_shell") { kills.push(args.shell_id); return { text: "killed", isError: false }; }
+        return s.hands.callToolFull(name, args);
+      },
+    };
+    const b = await bindRepo(hands, { url: REPO_URL }, { root: s.root, stateDir: s.state, background: true });
+    assert.equal(b.state, "failed", JSON.stringify(b));
+    assert.equal(waits, 1, "the clone was waited on again after the wait said there was nothing to wait for");
+    assert.match(b.failure ?? "", new RegExp(shellClass));
+    assert.deepEqual(kills, ["sh-1"]);
+  });
+}

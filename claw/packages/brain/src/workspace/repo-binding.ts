@@ -170,8 +170,13 @@ async function shLong(
       const w = await hands.callToolFull("wait", { shell_id: shellId, timeout_sec: CLONE_TIMEOUT_SEC }, signal);
       out += `${w.text}\n`;
       if (w.isError) return { ok: false, out };
-      const s = w.structured as { finished?: unknown; exit_code?: unknown } | undefined;
+      const s = w.structured as { finished?: unknown; exit_code?: unknown; blocking?: unknown; shell_class?: unknown } | undefined;
       if (s?.finished === true) { finished = true; return { ok: s.exit_code === 0, out }; }
+      // Hands answers without waiting when the shell can never finish (lost after a
+      // Hands restart, or ended but unreaped): asking again would answer the same at once.
+      if (s?.blocking === false) {
+        return { ok: false, out: `${out}stderr: the background shell is ${String(s.shell_class ?? "not running")} and will not finish` };
+      }
       if (Date.now() >= deadline) {
         return { ok: false, out: `stderr: did not finish within ${CLONE_BACKGROUND_MAX_SEC}s and was stopped` };
       }
