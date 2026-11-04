@@ -243,6 +243,19 @@ describe("E a session bound to one pull request, over the wire", () => {
     await c.close();
   });
 
+  test("E5 the tool route takes review_only from the session row: gh_pr_merge is refused as review_only and GitHub is not reached; a stored value that is not a boolean reads as review only; false merges as before", async () => {
+    // [stored review_only, refused]
+    for (const [reviewOnly, refused] of [[true, true], ["yes", true], [false, false]] as const) {
+      await e.sql("UPDATE claw_sessions SET config = config || $1::jsonb WHERE session_id = 's-1'", [JSON.stringify({ review_only: reviewOnly })]);
+      e.gh.calls.length = 0;
+      const c = await connect(token());
+      const r = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD });
+      await c.close();
+      assert.equal(r.body.reason === "review_only", refused, `${JSON.stringify(reviewOnly)}: ${r.text}`);
+      assert.equal(e.gh.calls.length === 0, refused, `${JSON.stringify(reviewOnly)}: GitHub reached only when it may merge`);
+    }
+  });
+
   test("E4 a held review is listed with its kind and what it would post, so a card can show it", async () => {
     e.identity.answer = async () => credential({ delegation: true });
     const c = await connect(token());

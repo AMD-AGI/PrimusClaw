@@ -415,7 +415,7 @@ export interface ExecuteRequest {
   /**
    * How hard the model is asked to think on every LLM turn of this run, its sub-agents included (Anthropic: `output_config.effort`;
    * OpenAI: `reasoning_effort`). Absent means the model's own default, which is what every run had before the field. The API sets it
-   * for a session that reviews a pull request on someone's behalf, when an operator set `CLAW_GITHUB_REVIEW_EFFORT`.
+   * from the session's `effort`, which its creator chose (`POST /v1/sessions`, `PATCH /v1/sessions/:id`).
    */
   effort?: ReasoningEffort;
   /**

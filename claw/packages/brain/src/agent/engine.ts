@@ -563,6 +563,7 @@ export class AgentEngine {
           ...(isReasoningEffort(request.effort) ? { effort: request.effort } : {}),
           ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
           ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),
+          ...(request.withhold_sandbox_keys ? { actingReview: true } : {}),
           apiUrl,
           apiKey,
           maxTurns,
