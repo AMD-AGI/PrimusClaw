@@ -72,7 +72,8 @@ review and the merge and who is the reviewer of record, and whose own standing a
    on it.
    The creator may also ask for a review only with `config.review_only = true`: `gh_pr_merge` is then
    refused (`review_only`) before anything is read or written, so the session reviews, and may approve,
-   but never merges and never approves on the way to a merge; a merge held for such a session is refused
+   but never merges and never approves on the way to a merge; an approval is refused (`review_only`) as well
+   while GitHub's auto-merge is on for the pull request, since it could merge it; a merge held for such a session is refused
    at the acting user's allow as well. Like the target it is written only at creation, is `400` without
    `config.acting_as` or when it is neither a boolean nor null (null and absent are false), and a stored value that is
    not a boolean reads as true.

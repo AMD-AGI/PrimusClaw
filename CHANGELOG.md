@@ -47,7 +47,8 @@ record it.
   review model or review effort setting.
 - `config.review_only: true` on a session created with `config.acting_as` (a `400` without it, or for a value that is
   neither a boolean nor null): its `gh_pr_merge` is refused with `review_only` before anything is read, so it reviews, and may
-  approve, but never merges and never approves on the way to a merge; a held merge of such a session is refused at
+  approve, but never merges, never approves on the way to a merge, and does not approve while GitHub's auto-merge is
+  on for the pull request (`review_only` as well); a held merge of such a session is refused at
   the acting user's allow as well.
 - A deep review behind `CLAW_GITHUB_REVIEW_DEEP_ENABLED`, on by default (`false` turns it off, and then the review
   instructions, path advice and thresholds are exactly the previous ones). On, any change of a non-test source file,

@@ -156,6 +156,8 @@ interface PullState {
   nodeId: string;
   /** The pull request's entry in the merge queue when it is already in one, as GitHub reports it; null when it is not. */
   queueEntry: QueueEntry | null;
+  /** Someone turned GitHub's auto-merge on for the pull request, so an approval that completes its requirements merges it. */
+  autoMerge: boolean;
 }
 
 /** What one `gh_pr_get` read from GitHub, kept for the pages of the same head (see `reviewRead`). */
@@ -220,7 +222,7 @@ const REVIEW_PAGE = 100;
 const MAX_REVIEW_PAGES = 10;
 
 const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){
-  id mergeStateStatus mergeable reviewDecision headRefOid isMergeQueueEnabled isInMergeQueue mergeQueueEntry{id position state}
+  id mergeStateStatus mergeable reviewDecision headRefOid isMergeQueueEnabled isInMergeQueue mergeQueueEntry{id position state} autoMergeRequest{enabledAt}
   reviewThreads(first:100){totalCount nodes{isResolved}}}}}`;
 
 /** What a page served from a session's read asks of GitHub: the repository as it is now (the gates of `readRepo`) and the head. */
@@ -1064,6 +1066,7 @@ export class GithubReview {
     const g = await ctx.client.graphql<{ repository?: { pullRequest?: {
       id?: string; mergeStateStatus?: string; mergeable?: string; reviewDecision?: string | null; headRefOid?: string; isMergeQueueEnabled?: boolean | null;
       isInMergeQueue?: boolean | null; mergeQueueEntry?: { id?: string | null; position?: number | null; state?: string | null } | null;
+      autoMergeRequest?: { enabledAt?: string | null } | null;
       reviewThreads?: { totalCount?: number; nodes?: Array<{ isResolved?: boolean }> };
     } | null } | null }>(THREADS_QUERY, { owner: ref.owner, name: ref.repo, number: ref.number });
     const p = g.repository?.pullRequest;
@@ -1082,6 +1085,7 @@ export class GithubReview {
       queueEntry: p.isInMergeQueue === true || p.mergeQueueEntry
         ? { id: p.mergeQueueEntry?.id ?? null, position: p.mergeQueueEntry?.position ?? null, state: p.mergeQueueEntry?.state ?? null }
         : null,
+      autoMerge: p.autoMergeRequest != null,
     };
   }
 
@@ -1134,7 +1138,12 @@ export class GithubReview {
     // The reviewer's own flags and judgement count here as they do at the merge.
     const risk = await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, read, flags, judgement)));
     ctx.acc.riskReasons = this.auditedReasons(risk);
-    this.requireGreen(await this.readState(ctx, ref, pr, repo), pr.headSha);
+    const state = await this.readState(ctx, ref, pr, repo);
+    // A session asked for a review only may approve, but not an approval that would merge: with auto-merge on, it can.
+    if (ctx.actor.reviewOnly && state.autoMerge) {
+      throw new Refusal("review_only", "this session was asked for a review only, and auto-merge is on for this pull request, so an approval could merge it: nothing was posted. Post the review as COMMENT or REQUEST_CHANGES instead.");
+    }
+    this.requireGreen(state, pr.headSha);
     return risk;
   }
 
