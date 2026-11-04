@@ -25,11 +25,10 @@ import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import {
-  ASSISTANT_MCP_SERVER, ROUTER_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderRouterSystem, renderWorkerSystem,
-  type ManifestItem,
+  ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderObserverSystem,
+  renderRouterSystem, renderWorkerSystem, type ManifestItem,
 } from "./prompts.js";
 import { startWorkerRun } from "./run-started.js";
-import { OBSERVER_PROMPT_VERSION, renderObserverSystem } from "./observe.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 
 const logger = pino({ name: "assistant-role" });

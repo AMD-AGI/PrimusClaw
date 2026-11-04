@@ -12,7 +12,6 @@
  * says all outlive it.
  */
 import type pg from "pg";
-import { ensureObserveSchema } from "./observe.js";
 
 export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void> {
   await client.query(`
@@ -126,6 +125,43 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
        ON claw_assistant_says(item_id, item_attention_seq) WHERE fallback`,
   );
 
-  // The places the assistant watches, and what it would have done there.
   await ensureObserveSchema(client);
+}
+
+/** The places the assistant watches (`observe.ts`), and what it would have done there. */
+async function ensureObserveSchema(client: pg.PoolClient): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_scopes (
+      user_id       TEXT NOT NULL,
+      scope         TEXT NOT NULL,
+      -- observe | auto; auto is set only by a person (see observe.ts)
+      mode          TEXT NOT NULL DEFAULT 'observe',
+      session_id    TEXT NOT NULL UNIQUE,
+      mode_set_at   TIMESTAMPTZ,
+      mode_set_via  JSONB,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, scope)
+    )
+  `);
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_observations (
+      id          BIGSERIAL PRIMARY KEY,
+      user_id     TEXT NOT NULL,
+      scope       TEXT NOT NULL,
+      session_id  TEXT NOT NULL,
+      run_id      TEXT NOT NULL,
+      tool        TEXT NOT NULL,
+      args        JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await client.query(
+    "CREATE INDEX IF NOT EXISTS idx_assistant_observations_scope ON claw_assistant_observations(user_id, scope, id DESC)",
+  );
+  // A model that repeats a call, or a Brain that replays it, records it once.
+  await client.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_observations_once
+       ON claw_assistant_observations(run_id, tool, md5(args::text))`,
+  );
 }

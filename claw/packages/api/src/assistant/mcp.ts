@@ -19,13 +19,13 @@ import pino from "pino";
 import { z } from "zod";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY } from "../config.js";
 import { ASSISTANT_MCP_PATH } from "./role-profile.js";
-import { SAY_MAX_CHARS } from "./prompts.js";
+import { PASS_REASONS, SAY_MAX_CHARS } from "./prompts.js";
 import { REPORT_KINDS } from "./work-items.js";
 import { type AssistantTokenClaims, verifyAssistantToken } from "./token.js";
 import {
   report, say, ToolRefused, workCreate, workRecall, workSend, workStop, type RecallDetail,
 } from "./tools.js";
-import { observeEveryTool, PASS_REASONS, recordObservation } from "./observe.js";
+import { observeEveryTool, recordObservation } from "./observe.js";
 
 const logger = pino({ name: "assistant-mcp" });
 
