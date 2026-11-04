@@ -109,6 +109,26 @@ review is done (accepted by policy); a write held for the requester themselves, 
 `expired`, `refused`), a merge refused by a gate, a failed turn or a turn that posted nothing needs them; a write held for
 someone else, or being made, is in progress; a denied one is done (stopped). A review session gets no worker report tool.
 
+### From the assistant's conversation
+
+With `CLAW_ASSISTANT_TOOLS=on` as well, the assistant's router can start, restart and answer reviews from what the user says
+(`assistant/review-tools.ts`): `review_start`, `review_restart`, `confirmation_answer`, `review_mode_set` (only towards
+`high_risk_confirm`; turning confirmations off stays the user's own setting) and `channel_action` (a setting the user's channel
+listed with the message, sent to it as an `assistant.action` event). `work_stop` stops a review item; `work_send` refuses one.
+
+They act only for the person, never for a key or a report:
+
+- **Attended.** The turn must answer a message the route recorded as carried by an identity-provider token (the same reading as
+  answering a held merge), received at most `CLAW_ASSISTANT_ATTENDED_TTL_SEC` (default 600) seconds before the tool is called.
+  A turn started by a worker's report, or by a message sent with a key or a browser session, is refused (`not_attended`).
+- **Grounded.** A pull request's number must be in that message; its repository named there, listed by the channel
+  (`channel_context.repos`), or used by the user's recent reviews; a model named there; a reviewer the user themself or someone
+  the channel listed with a Claw `user_id` (`channel_context.people`); and a held write the user allows named by its number,
+  unless it was the only one waiting when they wrote.
+
+The review is then made by the same `startReviews` / `restartReview` as the routes above, with the person's message standing
+for their sign-in, so every check above applies unchanged.
+
 ## The tools
 
 | Tool | What it does |

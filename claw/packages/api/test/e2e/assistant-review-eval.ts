@@ -30,7 +30,7 @@ const MODEL = need("EVAL_MODEL");
 const RUNS = Math.floor(numberFromEnv(process.env.EVAL_RUNS, "EVAL_RUNS", 1, 1));
 const ONLY = new Set((process.env.EVAL_CASES || "").split(",").map((s) => s.trim()).filter(Boolean));
 const OUT = process.env.EVAL_OUT;
-const apiKey = (): string => (process.env.EVAL_KEY ?? readFileSync(need("EVAL_KEY_FILE"), "utf8")).trim();
+const apiKey = (): string => (process.env.EVAL_KEY || readFileSync(need("EVAL_KEY_FILE"), "utf8")).trim();
 
 const cases = REVIEW_CASES.filter((c) => !ONLY.size || ONLY.has(c.id));
 const llm = messagesLlm({ baseUrl: BASE_URL, model: MODEL, apiKey });
