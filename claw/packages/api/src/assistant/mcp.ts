@@ -7,8 +7,8 @@
  * Served under `/v1/internal/`, which is where the global caller authentication steps aside for routes that
  * authenticate themselves (`isAnonymousPath`). The credential here is not a caller's: it is the bearer
  * `role-profile.ts` minted for one turn, and what it proves is which turn is calling. It is checked on every
- * request, and what it permits is what its role is given: a router the five tools of a conversation, a worker
- * the one tool it reports through.
+ * request, and what it permits is what its role is given: a router the five tools of a conversation (and, with
+ * `CLAW_ASSISTANT_TOOLS=on`, the five that act for the person), a worker the one tool it reports through.
  *
  * Stateless, like `/mcp`: a server is built per request, because what it offers depends on who is asking.
  */
@@ -17,7 +17,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import pino from "pino";
 import { z } from "zod";
-import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS } from "../config.js";
 import { ASSISTANT_MCP_PATH } from "./role-profile.js";
 import { SAY_MAX_CHARS } from "./prompts.js";
 import { REPORT_KINDS } from "./work-items.js";
@@ -25,6 +25,7 @@ import { type AssistantTokenClaims, verifyAssistantToken } from "./token.js";
 import {
   report, say, ToolRefused, workCreate, workRecall, workSend, workStop, type RecallDetail,
 } from "./tools.js";
+import { channelAction, confirmationAnswer, MAX_PRS, reviewModeSet, reviewRestart, reviewStart } from "./review-tools.js";
 
 const logger = pino({ name: "assistant-mcp" });
 
@@ -45,14 +46,66 @@ async function answer(claims: AssistantTokenClaims, name: string, run: () => Pro
   } catch (err) {
     if (err instanceof ToolRefused) {
       logger.info({ sid: claims.sid, tool: name, code: err.code }, "assistant.tool_refused");
-      return result({ ok: false, error: err.code, message: err.message }, true);
+      return result({ ok: false, error: err.code, message: err.message, ...(err.data ? { data: err.data } : {}) }, true);
     }
     logger.error({ err, sid: claims.sid, tool: name }, "assistant.tool_failed");
     return result({ ok: false, error: "internal_error", message: "the call failed; try once more" }, true);
   }
 }
 
-export function createAssistantMcpServer(claims: AssistantTokenClaims): McpServer {
+/** The tools that act for the person (`review-tools.ts`); each refuses unless the turn answers their signed-in message. */
+function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims): void {
+  mcp.tool(
+    "review_start",
+    `Start a review of each pull request the user named, as a work item each (at most ${MAX_PRS}). Merges only with merge=true.`,
+    {
+      prs: z.array(z.string()).describe("Each as owner/repo#number or its URL; only numbers the user wrote."),
+      merge: z.boolean().describe("true only when the user clearly asked to merge after the review; otherwise false (review only)."),
+      reviewer: z.string().optional().describe("Whose GitHub account reviews: leave out for the user; else the user_id of someone in People."),
+      model: z.string().optional().describe("Only when the user named a model."),
+      effort: z.enum(["low", "medium", "high"]).optional().describe("Only when the user asked for one."),
+    },
+    (args) => answer(claims, "review_start", () => reviewStart(claims, args)),
+  );
+  mcp.tool(
+    "review_restart",
+    "Stop a review item and start it again with changed settings (model, merge or review only). Refused once merged.",
+    {
+      item_id: z.string().describe(ITEM_ID_PARAM),
+      model: z.string().optional().describe("Only when the user named a model; left out keeps the old one."),
+      merge: z.boolean().optional().describe("Left out keeps what the review was asked to do."),
+      effort: z.enum(["low", "medium", "high"]).optional(),
+    },
+    (args) => answer(claims, "review_restart", () => reviewRestart(claims, args)),
+  );
+  mcp.tool(
+    "confirmation_answer",
+    "Answer a write (a merge or an approval) that waits for the user's own confirmation, listed under Waiting for you.",
+    {
+      decision: z.enum(["allow", "deny"]),
+      confirmation_id: z.string().optional().describe("The id from Waiting for you."),
+      pr: z.string().optional().describe("Or the pull request: owner/repo#number or its number."),
+    },
+    (args) => answer(claims, "confirmation_answer", () => confirmationAnswer(claims, args)),
+  );
+  mcp.tool(
+    "review_mode_set",
+    "Make the user's reviews ask them before every high-risk approval or merge (high_risk_confirm).",
+    { mode: z.string().describe("high_risk_confirm") },
+    (args) => answer(claims, "review_mode_set", () => reviewModeSet(claims, args)),
+  );
+  mcp.tool(
+    "channel_action",
+    "Have the user's chat channel run one of the actions listed under Channel actions, as if the user typed it.",
+    {
+      name: z.string().describe("The action's name as listed."),
+      args: z.string().optional().describe("What follows the name, as the action's usage shows."),
+    },
+    (args) => answer(claims, "channel_action", () => channelAction(claims, args)),
+  );
+}
+
+export function createAssistantMcpServer(claims: AssistantTokenClaims, reviewTools: boolean = CLAW_ASSISTANT_TOOLS): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
   if (claims.role === "router") {
     mcp.tool(
@@ -92,6 +145,7 @@ export function createAssistantMcpServer(claims: AssistantTokenClaims): McpServe
       { item_id: z.string().describe(ITEM_ID_PARAM), detail: z.enum(["summary", "reports", "worker_tail"]) },
       (args) => answer(claims, "work_recall", () => workRecall(claims, { item_id: args.item_id, detail: args.detail as RecallDetail })),
     );
+    if (reviewTools) registerReviewTools(mcp, claims);
   } else {
     mcp.tool(
       "report",

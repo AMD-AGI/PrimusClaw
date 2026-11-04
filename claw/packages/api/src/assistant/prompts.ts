@@ -16,6 +16,8 @@ import { REPORT_SUMMARY_MAX } from "./report.js";
 import type { ReportKind } from "./work-items.js";
 
 export const ROUTER_PROMPT_VERSION = "router-v2";
+/** The router's prompt with the review and settings tools (`CLAW_ASSISTANT_TOOLS=on`): router-v2 and `ROUTER_REVIEW_PROMPT`. */
+export const ROUTER_REVIEW_PROMPT_VERSION = "router-v3";
 
 /** The assistant's MCP server, which is what Brain puts before each of its tools' names. */
 export const ASSISTANT_MCP_SERVER = "assistant";
@@ -57,6 +59,17 @@ How to handle a message
 
 Reply in the language of the user's latest message, even when item titles or reports are in another language. A line like [${REPLY_LANGUAGE_LABEL}: X] after the user's message names that language; use it. Be brief: one message per turn is normal, and every message must be worth the attention it takes.`;
 
+export const ROUTER_REVIEW_PROMPT = `Reviews and settings
+These tools act for the user, with their GitHub account or their settings. They work only in a turn that answers a message the user just sent signed in; in a turn a ${WORK_EVENT_PREFIX} report started they are refused, so tell the user what you would do and let them say it.
+- review_start(prs, merge, reviewer?, model?, effort?): start reviewing pull requests, one review item each. prs are owner/repo#number, and only numbers the user wrote. At most 10 in one message: when the user names more, ask which to start with, and never split them over several calls. When the user gives only a number, use the repository of their recent review items or the one under Channel repos; if neither fits, ask which repository. merge is true only when the user clearly asked for a merge (合入, 合并, merge, 审完合, approve and merge); review, check, 看一下, 审一下, 只审 mean merge=false; when unsure, ask in one short say. reviewer: leave it out for the user; for another person pass their user_id from People in this message (the person must have one). model only when the user named one (用 opus → opus); effort only when they asked.
+- review_restart(item_id, model?, merge?, effort?): the user wants a review changed (another model, merge after all, review only) or run again. It stops the old item and starts a new one with the rest unchanged. It is refused once merged.
+- work_stop(item_id, reason) stops a review as well, and cancels what waits for confirmation in it. If it answers merge_in_progress or already_merged, tell the user exactly that.
+- work_send does not reach a review: use review_restart.
+- confirmation_answer(decision, confirmation_id?, pr?): the user answers a write listed under Waiting for you (224 可以合入, go ahead with 224 → allow; 别合, no → deny). Name it by confirmation_id or pr.
+- review_mode_set(mode): high_risk_confirm when the user wants to be asked before every high-risk approval or merge. Turning confirmations off is a setting only the user changes, in their settings: tell them so.
+- channel_action(name, args): the user asks in words for a setting their channel lists under Channel actions (每天十点给我晨报 → brief, "on 10:00"). Only actions listed with this message; if none fits, tell them the command to type.
+Every one of these may be refused, and a refusal is the answer: tell the user what it says and what they can do; never report work as started or done that was refused.`;
+
 export const WORKER_PROMPT = `You are a worker on one work item for a user. Nobody reads your plain output: the user talks to their assistant, and the assistant only learns what you tell it with the report tool (${TOOL_NAME_PREFIX}report).
 
 Report as you go, and keep reports few:
@@ -88,6 +101,8 @@ export interface ManifestItem {
   lastReportKind: string | null;
   resultVersion: number;
   pendingQuestion: string | null;
+  /** A review item's settings, which the user may ask to change (`review_restart`). */
+  review?: { pr: string; actingAsName: string | null; model: string | null; reviewOnly: boolean };
 }
 
 /**
@@ -104,12 +119,53 @@ export function formatManifestLine(item: ManifestItem): string {
   if (item.lastReportKind) tail.push(`last report: ${item.lastReportKind}`);
   if (item.resultVersion > 0) tail.push(`result v${item.resultVersion}`);
   if (item.pendingQuestion) tail.push(`asks: ${oneLine(item.pendingQuestion)}`);
+  if (item.review) {
+    const r = item.review;
+    tail.push(`review of ${oneLine(r.pr)}${r.actingAsName ? ` as ${oneLine(r.actingAsName)}` : ""}, ${r.reviewOnly ? "review only" : "merge"}${r.model ? `, model ${oneLine(r.model)}` : ""}`);
+  }
   return tail.length ? `${parts.join(" ")} (${tail.join("; ")})` : parts.join(" ");
 }
 
 export function renderRouterSystem(items: readonly ManifestItem[]): string {
   const list = items.length ? items.map(formatManifestLine).join("\n") : "(no work items yet)";
   return `${ROUTER_PROMPT}\n\nWork items (open ones, and ones closed in the last day):\n${list}`;
+}
+
+/** What the router is shown beside the item list when it has the review and settings tools, for one turn. */
+export interface ReviewContext {
+  confirmations: Array<{ id: string; repo: string; pr: number; kind: string; expires_at: Date | string }>;
+  reviewMode: string;
+  /** What the channel sent with the message this turn answers; empty for a turn a report started. */
+  people: Array<{ name: string; user_id?: string }>;
+  actions: Array<{ name: string; usage?: string; summary?: string }>;
+  repos: string[];
+}
+
+export function renderReviewContext(c: ReviewContext): string {
+  const iso = (d: Date | string) => (d instanceof Date ? d.toISOString() : String(d));
+  const waiting = c.confirmations.length
+    ? c.confirmations.map((x) => `- confirmation_id: ${x.id} | ${x.kind === "review" ? "approval" : "merge"} of ${oneLine(x.repo)}#${x.pr} | expires ${iso(x.expires_at)}`).join("\n")
+    : "(nothing)";
+  const people = c.people.length
+    ? c.people.map((p) => `- ${oneLine(p.name)}${p.user_id ? ` (user_id: ${oneLine(p.user_id)})` : " (not linked: cannot review as them)"}`).join("\n")
+    : "(none)";
+  const actions = c.actions.length
+    ? c.actions.map((a) => `- ${oneLine(a.name)}${a.usage ? ` | usage: ${oneLine(a.usage)}` : ""}${a.summary ? ` | ${oneLine(a.summary)}` : ""}`).join("\n")
+    : "(none)";
+  return `${ROUTER_REVIEW_PROMPT}
+
+Waiting for you (writes that wait for the user's own confirmation):
+${waiting}
+
+The user's review mode: ${c.reviewMode}
+
+People in this message (from the channel):
+${people}
+
+Channel repos: ${c.repos.length ? c.repos.map(oneLine).join(", ") : "(none)"}
+
+Channel actions:
+${actions}`;
 }
 
 export function renderWorkerSystem(item: { seq: number; title: string }): string {

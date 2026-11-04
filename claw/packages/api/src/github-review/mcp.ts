@@ -142,11 +142,8 @@ function refuse(reply: FastifyReply, status: number, error: string): FastifyRepl
 const CONFIRMATION_STATUSES = new Set<string>(["pending", "merging", "merged", "queued", "submitted", "denied", "stale", "expired", "refused"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export async function registerGithubReviewRoutes(app: FastifyInstance, opts: GithubReviewRouteOptions = {}): Promise<void> {
-  if (!(opts.enabled ?? CLAW_GITHUB_REVIEW_ENABLED)) return;
-  const settings = opts.settings ?? (() => readGithubReviewSettings());
-  const database: Queryable = opts.db ?? db;
-  const service = opts.service ?? new GithubReview({
+function newGithubReview(settings: () => GithubReviewSettings, database: Queryable): GithubReview {
+  return new GithubReview({
     settings, db: database,
     resolveCredential: async (req) => {
       const client = identityClient();
@@ -154,6 +151,24 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
       return client.resolveExternalCredential(req);
     },
   });
+}
+
+let processService: GithubReview | null = null;
+
+/**
+ * The process's one review service: the routes' and the assistant's (`confirmation_answer`) are the same object, so the
+ * limits it keeps in memory (writes in flight per pull request) count both.
+ */
+export function githubReviewService(): GithubReview {
+  processService ??= newGithubReview(() => readGithubReviewSettings(), db);
+  return processService;
+}
+
+export async function registerGithubReviewRoutes(app: FastifyInstance, opts: GithubReviewRouteOptions = {}): Promise<void> {
+  if (!(opts.enabled ?? CLAW_GITHUB_REVIEW_ENABLED)) return;
+  const settings = opts.settings ?? (() => readGithubReviewSettings());
+  const database: Queryable = opts.db ?? db;
+  const service = opts.service ?? (opts.settings || opts.db ? newGithubReview(settings, database) : githubReviewService());
 
   app.all("/v1/internal/github-review/mcp", async (req, reply) => {
     const header = String(req.headers.authorization ?? "");

@@ -733,6 +733,11 @@ export const CLAW_ASSISTANT_WORKER_MODEL = env("CLAW_ASSISTANT_WORKER_MODEL");
 export const CLAW_ASSISTANT_ROUTER_MAX_TURNS = envInt("CLAW_ASSISTANT_ROUTER_MAX_TURNS", 8, { min: 1 });
 // How long an item may need the user with nobody having told them before the system tells them.
 export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWEEP_SEC", 300, { min: 1 });
+// `on` gives the router the review and settings tools (review_start, review_restart, confirmation_answer,
+// review_mode_set, channel_action); anything else leaves it the five tools of a conversation.
+export const CLAW_ASSISTANT_TOOLS = env("CLAW_ASSISTANT_TOOLS", "off").trim().toLowerCase() === "on";
+// How long after the assistant received a signed-in message a turn answering it may still act for the person.
+export const CLAW_ASSISTANT_ATTENDED_TTL_SEC = envInt("CLAW_ASSISTANT_ATTENDED_TTL_SEC", 600, { min: 1 });
 // The address Brain reaches this API at; the assistant MCP service is served under it.
 export const INTERNAL_BACKEND_URL =
   process.env.INTERNAL_BACKEND_URL || `http://127.0.0.1:${process.env.API_PORT || "8200"}`;

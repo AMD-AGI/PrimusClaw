@@ -31,7 +31,8 @@ import {
 
 /** A refusal written for the model to read and act on. Anything else thrown is a fault, not an answer. */
 export class ToolRefused extends Error {
-  constructor(readonly code: string, message: string) {
+  /** `data`: facts the refusal is about (the item that already has the pull request, what is left of a limit). */
+  constructor(readonly code: string, message: string, readonly data?: Record<string, unknown>) {
     super(message);
     this.name = "ToolRefused";
   }
@@ -190,6 +191,10 @@ export async function workSend(
     const q = { query };
     const { userId } = await assertLiveRun(query, claims);
     const item = found(await resolveWorkItem(query, userId, args.item_id, { forUpdate: true }));
+    // A review's session takes input only from the person (`acting-turns.ts`), and a review changes by its parameters.
+    if ((await query("SELECT kind FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0]?.kind === "review") {
+      throw new ToolRefused("review_item", "a review takes no instructions: use review_restart to change how it runs, or work_stop to stop it");
+    }
     // The same words already sent to this item in this router turn are a replayed call. Asked of the item's own log,
     // not of the queue: the queue's key is gone once the message has been handed to a run.
     const replayed = await query(
@@ -226,7 +231,11 @@ export async function workStop(
     },
   });
   if (stopped.status === "not_found") throw new ToolRefused("item_not_found", "no such item");
-  if (stopped.status === "conflict") throw new ToolRefused("item_closed", "that item is already finished");
+  if (stopped.status === "conflict") {
+    if (stopped.error === "merge_in_progress") throw new ToolRefused("merge_in_progress", "the merge was already being carried out, so it could not be stopped: tell the user as it is");
+    if (stopped.error === "already_merged") throw new ToolRefused("already_merged", "it is already merged; stopping does not undo that: tell the user as it is");
+    throw new ToolRefused("item_closed", "that item is already finished");
+  }
   return { ok: true, item_id: item.item_id, seq: item.seq, outcome: "stopped" };
 }
 

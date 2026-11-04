@@ -18,16 +18,17 @@
 import pino from "pino";
 import {
   CLAW_AGENT_GUIDELINE_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_ROUTER_MAX_TURNS, CLAW_ASSISTANT_TOKEN_KEY,
-  CLAW_ASSISTANT_WORKER_MODEL, INTERNAL_BACKEND_URL,
+  CLAW_ASSISTANT_TOOLS, CLAW_ASSISTANT_WORKER_MODEL, INTERNAL_BACKEND_URL,
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import {
-  ASSISTANT_MCP_SERVER, ROUTER_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderRouterSystem, renderWorkerSystem,
-  type ManifestItem,
+  ASSISTANT_MCP_SERVER, ROUTER_PROMPT_VERSION, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX,
+  renderReviewContext, renderRouterSystem, renderWorkerSystem, type ManifestItem,
 } from "./prompts.js";
+import { reviewContextFor } from "./review-tools.js";
 import { startWorkerRun } from "./run-started.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 
@@ -73,7 +74,7 @@ export async function skipsSkillSelection(sessionId: string): Promise<boolean> {
 
 export async function routerManifest(userId: string): Promise<ManifestItem[]> {
   const rows = (await db.query(
-    `SELECT item_id, seq, title, summary, board_state, last_report_kind, result_version, pending_question FROM (
+    `SELECT item_id, seq, title, summary, board_state, last_report_kind, result_version, pending_question, kind, params FROM (
        SELECT * FROM claw_work_items
         WHERE user_id = $1
           AND (board_state <> 'done' OR closed_at > NOW() - $2::interval)
@@ -90,7 +91,19 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
     lastReportKind: (r.last_report_kind as string | null) ?? null,
     resultVersion: Number(r.result_version),
     pendingQuestion: (r.pending_question as string | null) ?? null,
+    ...(r.kind === "review" ? { review: reviewOf(r.params) } : {}),
   }));
+}
+
+function reviewOf(params: unknown): NonNullable<ManifestItem["review"]> {
+  const p = (params && typeof params === "object" ? params : {}) as Record<string, any>;
+  const pr = p.pr && typeof p.pr === "object" ? `${p.pr.owner}/${p.pr.repo}#${p.pr.number}` : "?";
+  return {
+    pr,
+    actingAsName: typeof p.acting_as_name === "string" ? p.acting_as_name : null,
+    model: typeof p.model === "string" ? p.model : null,
+    reviewOnly: p.review_only !== false,
+  };
 }
 
 /** How far back the user's own messages are read for a language, when the current one does not show it. */
@@ -164,8 +177,16 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     task.mcp_servers = {};
     for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
     withSystemAppend(task, renderRouterSystem(await routerManifest(role.userId)));
+    if (CLAW_ASSISTANT_TOOLS) {
+      const review = await reviewContextFor(role.userId, sessionId, messageId);
+      const ctx = review.message?.context;
+      withSystemAppend(task, renderReviewContext({
+        confirmations: review.confirmations, reviewMode: review.reviewMode,
+        people: ctx?.people ?? [], actions: ctx?.actions ?? [], repos: ctx?.repos ?? [],
+      }));
+    }
     await addReplyLanguage(task, sessionId);
-    logger.info({ sessionId, taskId, prompt: ROUTER_PROMPT_VERSION }, "assistant.router_turn");
+    logger.info({ sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);
     if (!started) throw new Error("assistant.worker_item_missing");
