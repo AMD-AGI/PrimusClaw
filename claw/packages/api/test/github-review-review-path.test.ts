@@ -245,6 +245,21 @@ test("the instructions build what the closest tests import before running them, 
   assert.match(text, /Bound every command with `timeout 600`/);
 });
 
+test("the deep review installs, builds and tests under the runtime version the repository declares, fetched and checked when the sandbox's is older", () => {
+  const text = DEEP_PR_REVIEW_INSTRUCTIONS.replace(/\s+/g, " ");
+  // The default sandbox image ships Node 22; a repository that declares >=26 loads nothing that imports undici until the version is
+  // switched, so the switch comes after the tests are found and before anything is installed or built.
+  const find = text.indexOf("run the tests closest to the change");
+  const runtime = text.indexOf("use the runtime version the repository declares");
+  const build = text.indexOf("build what those tests need first, the documented way");
+  assert.ok(find > 0 && runtime > find && build > runtime, `${find} ${runtime} ${build}`);
+  assert.match(text, /declares \(`\.nvmrc`, `engines`, `go\.mod`\): if the sandbox's is older, put that one in `\.pr-review\/` first/);
+  // From the official site, checked as the image's own Node is, and used by every later command.
+  assert.match(text, /`nodejs\.org\/dist\/latest-v<major>\.x\/`, checked against its `SHASUMS256\.txt`\) and first on `PATH`/);
+  // The review without the deep review is not changed.
+  assert.doesNotMatch(PR_REVIEW_INSTRUCTIONS, /runtime version/);
+});
+
 test("the second pass is handed the diff file, what was read and the callers seen but not opened, and is told its turn bound", () => {
   const text = DEEP_PR_REVIEW_INSTRUCTIONS.replace(/\s+/g, " ");
   // The main loop writes the change into the checkout once, out of anything committed, before the second pass starts.
