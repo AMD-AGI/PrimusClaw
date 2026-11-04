@@ -321,7 +321,13 @@ export async function getContextUsageSnapshot(
   };
 }
 
-/** Build full messages array: system(memory+summary+rules) + history + user(prompt). */
+/**
+ * The history Brain is handed for a turn: system (memory + summary + rules), then the stored turns that fit.
+ *
+ * It never holds this turn's prompt. Brain appends the prompt itself (brain/src/agent/engine.ts), wrapped with the
+ * skills and tools it resolved, so a history that also ended with it showed the model every message twice. `prompt`
+ * is taken only to reserve its share of the budget.
+ */
 export async function buildMessages(
   sessionId: string,
   prompt: string,
@@ -343,8 +349,5 @@ export async function buildMessages(
   // History (sliding window)
   const history = await buildHistory(sessionId, Math.max(remaining, 10_000));
   messages.push(...history);
-
-  // New user prompt
-  messages.push({ role: "user", content: prompt });
   return messages;
 }

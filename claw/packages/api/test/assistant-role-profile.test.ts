@@ -309,7 +309,7 @@ describe("assistant role profile", { skip }, () => {
       const [row] = await w.q("SELECT prompt, input FROM claw_tasks WHERE task_id = $1", [result.runId]);
       assert.equal(row.prompt, content, "the run row holds the user's words");
       assert.ok(!JSON.stringify(row.input).includes("Reply language"));
-      assert.equal(task.history.at(-1).content, content, "and so does the history Brain is given");
+      assert.ok(!task.history.some((m: { content: unknown }) => JSON.stringify(m.content).includes(content)), "and the history Brain is given does not repeat it");
     }
 
     // The doorbell claim.
@@ -358,7 +358,7 @@ describe("assistant role profile", { skip }, () => {
       await completeAsBrain(request, "On it.");
       assert.deepEqual(await stored(), [["user", content], ["assistant", "On it."]], `fat dispatch, ${language}`);
       const next = JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: "ok" })).published[0]);
-      assert.deepEqual(next.history.map((m: any) => [m.role, m.content]), [["user", content], ["assistant", "On it."], ["user", "ok"]], "what Brain is given as history");
+      assert.deepEqual(next.history.map((m: any) => [m.role, m.content]), [["user", content], ["assistant", "On it."]], "what Brain is given as history: the stored turns, and not the prompt it adds itself");
       assert.ok(!JSON.stringify(next.history).match(line));
     }
 

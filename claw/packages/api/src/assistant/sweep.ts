@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * What the sweeper does for the assistant on each tick: the two things that must happen even if every
+ * What the sweeper does for the assistant on each tick: the things that must happen even if every
  * model, hook and message went wrong.
  *
  * The third guarantee, that an item's first message and a queued report are drained, is the sweeper's
@@ -13,6 +13,7 @@ import { CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { sweepReviewItems } from "./review-items.js";
 import { reconcileOrphanedItems, reconcileWorkerRuns } from "./turn-end.js";
 import { tellSilentItems } from "./silent-sweep.js";
+import { surfaceStuckItems } from "./watchdog.js";
 
 export async function sweepAssistant(): Promise<void> {
   if (!CLAW_ASSISTANT_ENABLED) return;
@@ -23,5 +24,8 @@ export async function sweepAssistant(): Promise<void> {
   await reconcileOrphanedItems();
   // Review items report nothing: their state is read off the review's own tables, here as well as at each turn's end and answer.
   await sweepReviewItems();
+  // An item something is still open behind, with no sign of life past the watchdog's threshold (off by default): in
+  // front of the user with the reason, before the announcement below looks for items that need them.
+  await surfaceStuckItems();
   await tellSilentItems();
 }

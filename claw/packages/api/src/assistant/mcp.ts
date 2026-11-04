@@ -8,7 +8,8 @@
  * authenticate themselves (`isAnonymousPath`). The credential here is not a caller's: it is the bearer
  * `role-profile.ts` minted for one turn, and what it proves is which turn is calling. It is checked on every
  * request, and what it permits is what its role is given: a router the five tools of a conversation (and, with
- * `CLAW_ASSISTANT_TOOLS=on`, the five that act for the person), a worker the one tool it reports through.
+ * `CLAW_ASSISTANT_TOOLS=on`, the five that act for the person), a worker the one tool it reports through, an
+ * observer the router's tools and `pass`, every one of which only records.
  *
  * Stateless, like `/mcp`: a server is built per request, because what it offers depends on who is asking.
  */
@@ -19,13 +20,14 @@ import pino from "pino";
 import { z } from "zod";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS } from "../config.js";
 import { ASSISTANT_MCP_PATH } from "./role-profile.js";
-import { SAY_MAX_CHARS } from "./prompts.js";
+import { PASS_REASONS, SAY_MAX_CHARS } from "./prompts.js";
 import { REPORT_KINDS } from "./work-items.js";
 import { type AssistantTokenClaims, verifyAssistantToken } from "./token.js";
 import {
   report, say, ToolRefused, workCreate, workRecall, workSend, workStop, type RecallDetail,
 } from "./tools.js";
 import { channelAction, confirmationAnswer, MAX_PRS, reviewModeSet, reviewRestart, reviewStart } from "./review-tools.js";
+import { observeEveryTool, recordObservation } from "./observe.js";
 
 const logger = pino({ name: "assistant-mcp" });
 
@@ -107,7 +109,22 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims): void
 
 export function createAssistantMcpServer(claims: AssistantTokenClaims, reviewTools: boolean = CLAW_ASSISTANT_TOOLS): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
-  if (claims.role === "router") {
+  if (claims.role === "observer") {
+    // Before anything is registered: from here on every tool, the router's below and any added to them later, only
+    // records what the turn would have done (`observe.ts`).
+    observeEveryTool(mcp, (tool, args) => answer(claims, tool, () => recordObservation(claims, tool, args)));
+    mcp.tool(
+      "pass",
+      "Record that you would do nothing about this message, and why.",
+      {
+        reason: z.enum(PASS_REASONS),
+        note: z.string().optional().describe("One short line, if the reason needs it."),
+      },
+      // Replaced by the recorder like every other tool here; never called.
+      async () => result({ ok: false }, true),
+    );
+  }
+  if (claims.role === "router" || claims.role === "observer") {
     mcp.tool(
       "say",
       `Send the user a message. This is the only way to speak to them. At most ${SAY_MAX_CHARS} characters.`,
