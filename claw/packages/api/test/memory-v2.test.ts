@@ -506,7 +506,7 @@ describe("memory v2", { skip }, () => {
       `I never said "forget memory #${id}"`, `don't forget memory #${id}`, `do not undo memory #${id}`, `不要忘掉记忆 #${id}`,
       `别撤销记忆 #${id}`, `forget memory #${id}?`, `forget memory #${id} and #${id + 1}`, `forget memory #${id}\nno wait, keep it`,
       `Forget memory #${id}. I use vim.`, `what happens if I say forget memory #${id}`, `forget memory #${id + 1}`,
-      `forget memory ${id}`, `forget memory # ${id}`, `forget memory#${id}`, `forget  memory #${id}x`, `忘掉 记忆 #${id}`, `忘掉记忆 # ${id}`, `forget memory #0${id}`, `forget memories #${id}`,
+      `forget memory ${id}`, `forget memory # ${id}`, `forget memory#${id}`, `forget  memory #${id}x`, `忘掉 记忆 #${id}`, `forget memory\uFEFF#${id}`, `忘掉记忆 # ${id}`, `forget memory #0${id}`, `forget memories #${id}`,
     ];
     for (const said of refused) {
       const m = await turn(sid, said);
@@ -695,6 +695,10 @@ test("G1 memoryCommand reads only the whole fixed command", async () => {
     ["undo memory # 12", null],
     ["undo memory#12", null],
     ["撤销 记忆#12", null],
+    ["forget memory\uFEFF#3", null],
+    ["forget\u200Bmemory #3", null],
+    ["\uFEFFforget memory #3", null],
+    ["forget\u00A0memory #3", { op: "forget", id: 3 }],
     ["ＵＮＤＯ ＭＥＭＯＲＹ ＃１２", { op: "undo", id: 12 }],
     ["忘掉记忆 #3", { op: "forget", id: 3 }],
     ["请撤销记忆#3。", { op: "undo", id: 3 }],

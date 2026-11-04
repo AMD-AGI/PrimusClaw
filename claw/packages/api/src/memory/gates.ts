@@ -72,7 +72,9 @@ const MEMORY_COMMANDS: ReadonlyArray<{ pattern: RegExp; op: Record<string, Memor
  * a quote to cut out.
  */
 export function memoryCommand(message: string): { op: MemoryCommandOp; id: number } | null {
-  const said = (message || "").normalize("NFKC").trim().toLowerCase().replace(/\s+/g, " ");
+  // Spaces and tabs only: JavaScript's \s also takes format characters such as U+FEFF, which would let an
+  // invisible character stand for the space the command spells or forbids.
+  const said = (message || "").normalize("NFKC").toLowerCase().replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "").replace(/[ \t]+/g, " ");
   for (const { pattern, op } of MEMORY_COMMANDS) {
     const m = pattern.exec(said);
     const id = m ? Number(m[2]) : NaN;
