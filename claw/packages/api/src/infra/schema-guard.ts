@@ -236,7 +236,7 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: [
       "item_id", "user_id", "seq", "title", "summary", "board_state", "last_report_kind",
       "pending_question", "outcome", "worker_session_id", "generation", "result_version",
-      "accepted_version", "attention_seq", "repo", "created_at", "updated_at", "closed_at",
+      "accepted_version", "attention_seq", "repo", "created_at", "updated_at", "closed_at", "kind", "params",
     ],
   },
   {

@@ -10,6 +10,7 @@
  * queued message on an ordinary session.
  */
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
+import { sweepReviewItems } from "./review-items.js";
 import { reconcileOrphanedItems, reconcileWorkerRuns } from "./turn-end.js";
 import { tellSilentItems } from "./silent-sweep.js";
 
@@ -20,5 +21,7 @@ export async function sweepAssistant(): Promise<void> {
   // none is the second's.
   await reconcileWorkerRuns();
   await reconcileOrphanedItems();
+  // Review items report nothing: their state is read off the review's own tables, here as well as at each turn's end and answer.
+  await sweepReviewItems();
   await tellSilentItems();
 }

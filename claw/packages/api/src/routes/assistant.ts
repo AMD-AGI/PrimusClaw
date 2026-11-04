@@ -9,6 +9,8 @@
  *   GET  /v1/work-items/:id               one item with its latest events
  *   POST /v1/work-items/:id/accept        {version}: the result the user saw, and only that one
  *   POST /v1/work-items/:id/stop
+ *   POST /v1/assistant/reviews            reviews on someone's behalf, as items (`review-items.ts`)
+ *   POST /v1/assistant/reviews/:id/restart the same pull request again, with what the body changes
  *
  * Talking to the assistant is the existing `POST /v1/sessions/:id/messages`.
  *
@@ -20,12 +22,16 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import pino from "pino";
 import { getUser } from "../auth/middleware.js";
+import { getAuthMethod } from "../auth/request-credential.js";
 import { getOrCreateAssistant } from "../assistant/assistant.js";
 import {
   acceptWorkItem, BOARD_STATES, getWorkItem, itemView, listWorkItems, recentEvents, stopWorkItem,
   type BoardState, type DecisionResult,
 } from "../assistant/work-items.js";
-import { CLAW_ASSISTANT_ENABLED } from "../config.js";
+import {
+  parseRestartRequest, parseReviewRequest, restartReview, ReviewItemRefused, startReviews, syncReviewItem,
+} from "../assistant/review-items.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_REVIEW_ITEMS, CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 
 const logger = pino({ name: "assistant" });
 
@@ -97,12 +103,47 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
     if (!userId) return;
     const itemId = (req.params as { id: string }).id;
     try {
-      return answer(reply, await stopWorkItem({ userId, itemId, source: "user" }));
+      const result = await stopWorkItem({ userId, itemId, source: "user" });
+      // A merge the board has not caught up with yet: the item says so now rather than at the next sweep.
+      if (result.status === "conflict" && result.error === "already_merged") {
+        const synced = await syncReviewItem(itemId).catch(() => null);
+        if (synced) return reply.status(409).send({ ok: false, error: result.error, data: synced });
+      }
+      return answer(reply, result);
     } catch (err) {
       // The item is already closed; saying so lets the caller press stop again
       // to send the interrupt a second time.
       logger.error({ err, itemId }, "assistant.stop_interrupt_failed");
       return reply.status(503).send({ ok: false, error: "interrupt_not_recorded" });
+    }
+  });
+
+  if (!CLAW_ASSISTANT_REVIEW_ITEMS || !CLAW_GITHUB_REVIEW_ENABLED) return;
+
+  const refused = (reply: FastifyReply, err: unknown) => {
+    if (!(err instanceof ReviewItemRefused)) throw err;
+    return reply.status(err.status).send({ ok: false, error: err.code, message: err.message, data: err.data });
+  };
+
+  app.post("/v1/assistant/reviews", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    try {
+      const items = await startReviews(getUser(req)!, getAuthMethod(req), parseReviewRequest(req.body));
+      return reply.send({ ok: true, data: { items } });
+    } catch (err) {
+      return refused(reply, err);
+    }
+  });
+
+  app.post("/v1/assistant/reviews/:id/restart", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    try {
+      const out = await restartReview(getUser(req)!, getAuthMethod(req), (req.params as { id: string }).id, parseRestartRequest(req.body));
+      return reply.send({ ok: true, data: out });
+    } catch (err) {
+      return refused(reply, err);
     }
   });
 }

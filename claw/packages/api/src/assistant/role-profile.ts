@@ -49,14 +49,17 @@ export type SessionRole =
   | { role: "router"; userId: string }
   | { role: "worker"; userId: string; itemId: string; seq: number; title: string };
 
-/** Null for every session that is neither a user's assistant nor an item's worker. */
+/**
+ * Null for every session that is neither a user's assistant nor a task item's worker. A review item's session is an ordinary session that
+ * acts as a user: it gets no report tool, no worker prompt and no worker model, and its item's state is read off what it did.
+ */
 export async function sessionRole(sessionId: string): Promise<SessionRole | null> {
   const rows = (await db.query(
     `SELECT 'router' AS role, a.user_id, NULL AS item_id, NULL::int AS seq, NULL AS title
        FROM claw_assistants a WHERE a.session_id = $1
      UNION ALL
      SELECT 'worker', w.user_id, w.item_id, w.seq, w.title
-       FROM claw_work_items w WHERE w.worker_session_id = $1`,
+       FROM claw_work_items w WHERE w.worker_session_id = $1 AND w.kind = 'task'`,
     [sessionId],
   )).rows as Array<{ role: string; user_id: string; item_id: string | null; seq: number | null; title: string | null }>;
   const row = rows[0];

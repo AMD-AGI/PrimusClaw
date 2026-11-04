@@ -154,6 +154,39 @@ describe("P which pull requests", () => {
     }
   });
 
+  test("P6 the check before a review is started: the same gates as a read, with the acting user's say, and nothing written", async () => {
+    const ref = { owner: "AMD-AGI", repo: "demo", number: 7 };
+    const ok = await e.service.checkPullRequest(e.actor, ref);
+    assert.deepEqual([ok.isError, ok.body.status, ok.body.head_sha], [false, "ok", HEAD]);
+    for (const [patch, code] of [[{ state: "closed" }, "not_open"], [{ merged: true }, "already_merged"], [{ draft: true }, "draft"]] as const) {
+      e.gh.pr = { ...e.gh.pr, state: "open", draft: false, merged: false, ...patch };
+      assert.equal(reason(await e.service.checkPullRequest(e.actor, ref)), code, code);
+    }
+    e.gh.pr = { ...e.gh.pr, state: "open", draft: false, merged: false };
+    e.gh.repo = { ...e.gh.repo, private: true };
+    assert.equal(reason(await e.service.checkPullRequest(e.actor, ref)), "repository_not_public");
+    e.gh.repo = { ...e.gh.repo, private: false };
+    assert.equal(reason(await e.service.checkPullRequest(e.actor, { ...ref, owner: "evil" })), "owner_not_allowed");
+    // Someone else's account: their switch decides, as for every tool.
+    denied();
+    assert.equal(reason(await e.service.checkPullRequest({ ...e.actor, requesterUserId: "u-someone-else" }, ref)), "delegation_off");
+    assert.equal(posts().length + puts().length, 0, "nothing was written to GitHub");
+    const rows = await e.db.query("SELECT tool, write FROM claw_github_audit WHERE tool = 'gh_pr_check'");
+    assert.ok(rows.rows.length > 0 && rows.rows.every((r: any) => r.write === false), "each check is audited, and none counts as a write");
+  });
+
+  test("P7 a review its requester stopped makes no approval and no merge: asked under the write lock, before anything is written", async () => {
+    allowed();
+    (e.service as unknown as { deps: { sessionStopped?: (sid: string) => Promise<boolean> } }).deps.sessionStopped = async (sid) => sid === e.actor.sessionId;
+    approvedHere();
+    assert.equal(reason(await merge()), "review_stopped");
+    assert.equal(reason(await submit({ event: "APPROVE" })), "review_stopped");
+    assert.equal(posts().length + puts().length, 0);
+    assert.equal(Number((await e.db.query("SELECT COUNT(*)::int AS n FROM claw_github_write_locks")).rows[0].n), 0, "the lock was given back");
+    // A comment approves nothing and takes no lock: it is not asked.
+    assert.notEqual(reason(await submit({ event: "COMMENT" })), "review_stopped");
+  });
+
   test("P5 a feature that is off answers nothing and touches nothing", async () => {
     const { reviewEnv: make } = await import("./support/review-env.js");
     const off = await make({}, { reviewed: false });

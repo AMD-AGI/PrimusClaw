@@ -25,6 +25,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { IdentityUnavailableError } from "@claw/utils";
 import pino from "pino";
 import { z } from "zod";
+import {
+  confirmationOfStoppedReview, denyForStoppedReview, reviewItemPorts, reviewSessionStopped, syncReviewItemOfSession,
+} from "../assistant/review-items.js";
 import { identityClient } from "../auth/identity.js";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
@@ -37,7 +40,7 @@ import { SECTIONS } from "./pages.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
 import { HOLD_GUIDANCE } from "./risk.js";
-import { REVIEW_MODES, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type Queryable, type ReviewMode } from "./store.js";
+import { REVIEW_MODES, getConfirmation, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type Queryable, type ReviewMode } from "./store.js";
 import { verifySessionToolToken } from "./token.js";
 
 const logger = pino({ name: "github-review-mcp" });
@@ -147,13 +150,16 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
   const settings = opts.settings ?? (() => readGithubReviewSettings());
   const database: Queryable = opts.db ?? db;
   const service = opts.service ?? new GithubReview({
-    settings, db: database,
+    settings, db: database, sessionStopped: reviewSessionStopped,
     resolveCredential: async (req) => {
       const client = identityClient();
       if (!client) throw new IdentityUnavailableError("credential", "not_configured");
       return client.resolveExternalCredential(req);
     },
   });
+
+  // The review items of the assistant check a pull request with this same service before they make a session for it.
+  reviewItemPorts.checkPullRequest = (actor, ref) => service.checkPullRequest(actor, ref);
 
   app.all("/v1/internal/github-review/mcp", async (req, reply) => {
     const header = String(req.headers.authorization ?? "");
@@ -228,7 +234,17 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     const decision = ((req.body ?? {}) as { decision?: unknown }).decision;
     if (decision !== "allow" && decision !== "deny") return refuse(reply, 400, "decision must be allow or deny");
     if (!UUID_RE.test(req.params.id)) return refuse(reply, 404, "not_found");
+    // A write held by a review its requester stopped is not made, whatever the answer (`confirmationOfStoppedReview`).
+    if (await confirmationOfStoppedReview(req.params.id)) {
+      const row = await getConfirmation(database, req.params.id);
+      if (row && row.actorUserId !== user.userId) return refuse(reply, 403, "only_the_acting_user_can_decide");
+      await denyForStoppedReview(req.params.id);
+      return reply.send({ ok: true, status: "denied", reason: "review_stopped" });
+    }
     const answer = await service.decide(user.userId, req.params.id, decision, caller.via);
+    // The review item of the session, if it is one, closes with its answer.
+    const decided = await getConfirmation(database, req.params.id).catch(() => null);
+    if (decided) await syncReviewItemOfSession(decided.sessionId).catch((err) => logger.warn({ err }, "github_review.review_item_sync_failed"));
     return reply.status(answer.http).send(answer.body);
   });
 

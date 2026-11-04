@@ -17,6 +17,8 @@
 import pino from "pino";
 import { CLAW_DEPLOY_MODE, RUN_DOORBELL_DISPATCH } from "../config.js";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
+import { actingUserOf } from "../github-review/acting-as.js";
+import type { AttendedProof } from "../github-review/acting-session.js";
 import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import { db, type StatementRunner } from "../infra/db.js";
 import { insertPendingMessage, submitMessagePorts } from "../sessions/submit-message.js";
@@ -31,12 +33,18 @@ export interface ServerMessage {
   content: string;
   /** Names this message for a retry: a second one with the same key into the same session is not queued. */
   dedupeKey?: string;
+  /**
+   * The person's say, for a session that acts as a user (`config.acting_as`): only the request that created it can give it
+   * (`checkSessionCreate`). Without it such a session is refused, as every route refuses a turn in it to a key a sandbox holds
+   * (`github-review/acting-turns.ts`): the server queuing a message is a way to start a turn too.
+   */
+  attended?: AttendedProof;
 }
 
 export type QueuedServerMessage =
   | { ok: true; pendingId: number | null; deduplicated: boolean }
   /** The session holds no credentials of its owner to run a turn with (it never received a message from them). */
-  | { ok: false; error: "session_not_found" | "no_credentials" };
+  | { ok: false; error: "session_not_found" | "no_credentials" | "acting_session_unattended" };
 
 export async function queueServerMessage(q: StatementRunner, m: ServerMessage): Promise<QueuedServerMessage> {
   const session = (await q.query(
@@ -44,6 +52,7 @@ export async function queueServerMessage(q: StatementRunner, m: ServerMessage): 
     [m.sessionId],
   )).rows[0] as { config: unknown } | undefined;
   if (!session) return { ok: false, error: "session_not_found" };
+  if (actingUserOf(session.config) !== null && !m.attended) return { ok: false, error: "acting_session_unattended" };
   const creds = readTrustedSessionCredentials(session.config);
   // The same rule a message from the owner is held to (`assertSessionCredentialsForDispatch`): on SaFE the
   // platform key is what owns the workload, so a turn without one is not started under a shared identity.

@@ -231,7 +231,8 @@ test("E2b a message the server queues on a session by itself is frozen without t
     await plantVault();
     const id = await session(actingAs);
     await h.sql("UPDATE claw_sessions SET config = config || $2::jsonb WHERE session_id = $1", [id, JSON.stringify({ platform_key: "pk", llm_api_key: "vk", _server_managed_credentials: true })]);
-    const queued = await queueServerMessage(db, { sessionId: id, userId: ALICE.userId, content: "a worker's first task" });
+    // A session that acts as a user takes a server's message only with the person's proof (`checkSessionCreate`); a review item has it.
+    const queued = await queueServerMessage(db, { sessionId: id, userId: ALICE.userId, content: "a worker's first task", attended: { via: null } as never });
     assert.equal(queued.ok, true, `${what}: ${JSON.stringify(queued)}`);
     const rows = await h.sql("SELECT * FROM claw_pending_messages WHERE session_id = $1", [id]);
     assert.equal(rows.length, 1, `${what}: queued`);
