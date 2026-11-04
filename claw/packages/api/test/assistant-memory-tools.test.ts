@@ -26,9 +26,10 @@
  *       worker only, kept out of the chat's catalogue; another user's item cannot be named
  *   I2  a review item's session is shown what was bound to its item and nothing else of the user's memory, and nothing in
  *       a session marked `memory: "off"`
- *   I3  a duplicate or a near one is an entry of the same binding: an item-bound save next to a matching global entry, or
- *       one bound to another item, is stored bound to its item (not `existing`, not `similar_exists`); a chat save matching
- *       an item's entry is stored for the chat's catalogue; within one binding a duplicate is still `existing`
+ *   I3  a duplicate or a near one is an entry of the same binding (within one, still `existing` / `similar_exists`):
+ *       a  an item-bound save with the same words as a global or another item's entry is stored bound to its item
+ *       b  an item-level override close to a global entry is stored for the item, not refused as `similar_exists`
+ *       c  a chat save matching only an item's entry is stored, in the chat's catalogue
  *   I4  a worker's search is chosen from what it may read before the top ten are taken and before anything counts as read
  *   I5  an entry bound to an item whose row is gone stays in the router's index, so it can be seen and forgotten
  *   W1  a router session marked `memory: "off"` starts workers that are marked so too: no index, no recall
@@ -337,42 +338,52 @@ describe("assistant memory tools", { skip }, () => {
     assert.equal(await mt.reviewMemoryBlock(reviewSid), null, "memory off: nothing");
   });
 
-  test("I3 an item-bound save is not answered by a global or another item's entry, nor a chat save by an item's", async () => {
+  /** An item-bound save from the person's message, as the router makes one. */
+  async function saveFor(seq: number, title: string, body: string) {
+    const turn = await message(alice, `#${seq} ${body}，记住`);
+    try {
+      return await mt.memorySave(turn, { type: "feedback", title, body, evidence_quote: body, item_id: `#${seq}` });
+    } finally {
+      await w.closeRun(turn.task_id);
+    }
+  }
+
+  test("I3a an item-bound save with the same words as a global or another item's entry is stored bound to its item", async () => {
     const general = await stored("alice", "PR 用 opus 审");
     const item = await w.createItem(alice, "Review 254");
     const other = await w.createItem(alice, "Review 255");
-    const save = async (seq: number, title: string, body: string) => {
-      const turn = await message(alice, `#${seq} ${body}，记住`);
-      const r = await mt.memorySave(turn, { type: "feedback", title, body, evidence_quote: body, item_id: `#${seq}` });
-      await w.closeRun(turn.task_id);
-      return r;
-    };
-    // The same words as the global entry, bound to an item: stored, bound to it, and shown to that item's worker.
-    const same = await save(item.seq, "PR 用 opus 审", "PR 用 opus 审");
+    const same = await saveFor(item.seq, "PR 用 opus 审", "PR 用 opus 审");
     assert.equal(same.op, "add", JSON.stringify(same));
-    assert.notEqual(same.id, general);
     const worker = await mt.workerMemoryBlock("alice", item.itemId, item.workerSid);
     assert.ok(worker?.includes(`#${same.id} PR 用 opus 审: PR 用 opus 审`), worker ?? "");
-    // The same words bound to another item: stored for that one, not answered by the first item's entry.
-    const otherSame = await save(other.seq, "PR 用 opus 审", "PR 用 opus 审");
+    const otherSame = await saveFor(other.seq, "PR 用 opus 审", "PR 用 opus 审");
     assert.equal(otherSame.op, "add", JSON.stringify(otherSame));
-    // An item-level override of the general preference, close to it in words: stored, not `similar_exists` on the global one.
-    const near = await w.createItem(alice, "Review 256");
-    const override = await save(near.seq, "PR 用 opus 审，重点看安全", "PR 用 opus 审，重点看安全");
-    assert.equal(override.op, "add", JSON.stringify(override));
-    assert.deepEqual((await entries()).map((e) => [e.id, e.work_item_id]),
-      [[general, null], [same.id, item.itemId], [otherSame.id, other.itemId], [override.id, near.itemId]]);
-    // Within one binding a duplicate is still a duplicate, and a near one still refused.
-    assert.equal((await save(item.seq, "PR 用 opus 审", "PR 用 opus 审")).op, "existing");
-    assert.equal(await code(save(near.seq, "PR 用 opus 审，重点看安全性", "PR 用 opus 审，重点看安全性")), "similar_exists");
+    assert.deepEqual((await entries()).map((e) => [e.id, e.work_item_id]), [[general, null], [same.id, item.itemId], [otherSame.id, other.itemId]]);
+    // Within one binding a duplicate is still a duplicate.
+    assert.deepEqual(await saveFor(item.seq, "PR 用 opus 审", "PR 用 opus 审").then((r) => [r.op, r.id]), ["existing", same.id]);
+  });
 
-    // The chat's own save, matching only an item's entry: stored, and in the chat's catalogue.
-    const onlyBound = await save(item.seq, "晨报十点发", "晨报十点发");
-    assert.equal(onlyBound.op, "add");
+  test("I3b an item-level override close to a global entry is stored for the item, not refused as similar_exists", async () => {
+    const general = await stored("alice", "PR 用 opus 审");
+    const item = await w.createItem(alice, "Review 256");
+    const override = await saveFor(item.seq, "PR 用 opus 审，重点看安全", "PR 用 opus 审，重点看安全");
+    assert.equal(override.op, "add", JSON.stringify(override));
+    assert.deepEqual((await entries()).map((e) => [e.id, e.work_item_id]), [[general, null], [override.id, item.itemId]]);
+    // Within one binding a near one is still refused.
+    assert.equal(await code(saveFor(item.seq, "PR 用 opus 审，重点看安全性", "PR 用 opus 审，重点看安全性")), "similar_exists");
+  });
+
+  test("I3c a chat save matching only an item's entry is stored, and is in the chat's catalogue", async () => {
+    const item = await w.createItem(alice, "Review 257");
+    const bound = await saveFor(item.seq, "晨报十点发", "晨报十点发");
+    assert.equal(bound.op, "add");
     const chat = await svc.writeMemory("alice", { type: "user", title: "晨报十点发", body: "晨报十点发" }, { kind: "model", sessionId: "chat", quote: "晨报十点发", humanMessages: ["晨报十点发"] });
-    assert.ok(chat.ok && chat.op === "add" && chat.id !== onlyBound.id, JSON.stringify(chat));
+    assert.ok(chat.ok && chat.op === "add" && chat.id !== bound.id, JSON.stringify(chat));
     const catalogue = await svc.buildMemoryCatalogue("alice");
     assert.ok(catalogue?.text.includes(`#${chat.id} 晨报十点发`), catalogue?.text);
+    // And a second chat save of the same words is the chat's duplicate.
+    const again = await svc.writeMemory("alice", { type: "user", title: "晨报十点发", body: "晨报十点发" }, { kind: "model", sessionId: "chat", quote: "晨报十点发", humanMessages: ["晨报十点发"] });
+    assert.ok(again.ok && again.op === "existing" && again.id === chat.id, JSON.stringify(again));
   });
 
   test("I4 a worker's search is chosen from what it may read, before the top ten and before anything counts as read", async () => {
