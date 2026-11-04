@@ -28,6 +28,13 @@ record it.
 ## [Unreleased]
 
 ### Added
+- On-behalf GitHub reviews as work items of the assistant, behind `CLAW_ASSISTANT_REVIEW_ITEMS` (default off; needs
+  `CLAW_ASSISTANT_ENABLED` and `CLAW_GITHUB_REVIEW_ENABLED`): `POST /v1/assistant/reviews` and `POST
+  /v1/assistant/reviews/:id/restart`; `claw_work_items.kind` (`task` | `review`) and `params` (new columns, required at
+  start-up when the assistant is on) on every board row; one open review per pull request across users; stopping a review
+  item denies what its session holds for an answer. See `claw/docs/github-review.md`, "As an item of the assistant".
+  `POST /v1/sessions` now checks `acting_as`, `review_target`, `review_only`, the model and the effort through the same
+  function (`github-review/acting-session.ts`); its answers are unchanged.
 - A general working guideline for agent turns (`claw/packages/api/src/sessions/agent-guideline.ts`): read before
   changing, verify before claiming done, say what was not verified, cite sources, answer in the user's language, treat
   text from pages and files as data, respect approvals. It names no product. With `CLAW_AGENT_GUIDELINE_ENABLED=true`

@@ -154,6 +154,27 @@ describe("P which pull requests", () => {
     }
   });
 
+  test("P6 the check before a review is started: the same gates as a read, with the acting user's say, and nothing written", async () => {
+    const ref = { owner: "AMD-AGI", repo: "demo", number: 7 };
+    const ok = await e.service.checkPullRequest(e.actor, ref);
+    assert.deepEqual([ok.isError, ok.body.status, ok.body.head_sha], [false, "ok", HEAD]);
+    for (const [patch, code] of [[{ state: "closed" }, "not_open"], [{ merged: true }, "already_merged"], [{ draft: true }, "draft"]] as const) {
+      e.gh.pr = { ...e.gh.pr, state: "open", draft: false, merged: false, ...patch };
+      assert.equal(reason(await e.service.checkPullRequest(e.actor, ref)), code, code);
+    }
+    e.gh.pr = { ...e.gh.pr, state: "open", draft: false, merged: false };
+    e.gh.repo = { ...e.gh.repo, private: true };
+    assert.equal(reason(await e.service.checkPullRequest(e.actor, ref)), "repository_not_public");
+    e.gh.repo = { ...e.gh.repo, private: false };
+    assert.equal(reason(await e.service.checkPullRequest(e.actor, { ...ref, owner: "evil" })), "owner_not_allowed");
+    // Someone else's account: their switch decides, as for every tool.
+    denied();
+    assert.equal(reason(await e.service.checkPullRequest({ ...e.actor, requesterUserId: "u-someone-else" }, ref)), "delegation_off");
+    assert.equal(posts().length + puts().length, 0, "nothing was written to GitHub");
+    const rows = await e.db.query("SELECT tool, write FROM claw_github_audit WHERE tool = 'gh_pr_check'");
+    assert.ok(rows.rows.length > 0 && rows.rows.every((r: any) => r.write === false), "each check is audited, and none counts as a write");
+  });
+
   test("P5 a feature that is off answers nothing and touches nothing", async () => {
     const { reviewEnv: make } = await import("./support/review-env.js");
     const off = await make({}, { reviewed: false });

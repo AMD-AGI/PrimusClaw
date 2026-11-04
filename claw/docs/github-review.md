@@ -85,6 +85,30 @@ review and the merge and who is the reviewer of record, and whose own standing a
 3. The model reviews by the review instructions (below) and posts one review; if it is clean it
    merges. Every gate is in the tool, not in the prompt.
 
+## As an item of the assistant
+
+With `CLAW_ASSISTANT_REVIEW_ITEMS` on (and `CLAW_ASSISTANT_ENABLED`), a review can also be started as a work item of the
+requester's assistant, so it is on their board and can be stopped there. The session is the same: it is made by the same
+check as `POST /v1/sessions` makes of a session with `config.acting_as` (`github-review/acting-session.ts`), with the same
+credentials asked of the caller, and holds the same tools and gates.
+
+| Route | |
+|---|---|
+| `POST /v1/assistant/reviews` | `{prs: [{owner, repo, number, message?}], acting_as?, acting_as_name?, model?, effort?, review_only?}`: one item per pull request (1 to 10), all of them or none. `review_only` defaults to `true`; `message` is the session's first message, written by Claw when absent |
+| `POST /v1/assistant/reviews/:id/restart` | The same pull request again with what the body changes (`model`, `effort`, `review_only`, `message`); the old item is stopped as a stop would stop it |
+| `POST /v1/work-items/:id/stop` | Also denies every write the session holds for an answer, in the same transaction; `409 merge_in_progress` while one is being made, `409 already_merged` after a merge |
+
+Before anything is made: only an identity-provider token (`403 interactive_sign_in_required` / `service_client_not_allowed`);
+one open review per pull request whoever asked (`409 review_in_progress`, or `review_in_progress_by_other` without the other
+person's item); the hourly limits below, counting the open reviews that have not written yet (`429 rate_limited` with how many
+more fit); the requester's limit of unfinished items (`409 too_many_active_items`); and the pull request read with the acting
+user's account (`422 pr_check_failed` with the tool's refusal code, `503 pr_check_unavailable` for an outage).
+
+The item's state is read off the audit and confirmation tables, never from the model: a merge, a queued merge or a posted
+review is done (accepted by policy); a write held for the requester themselves, or a closed one that did not write (`stale`,
+`expired`, `refused`), a merge refused by a gate, a failed turn or a turn that posted nothing needs them; a write held for
+someone else, or being made, is in progress; a denied one is done (stopped). A review session gets no worker report tool.
+
 ## The tools
 
 | Tool | What it does |
