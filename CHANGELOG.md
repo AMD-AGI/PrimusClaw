@@ -38,11 +38,18 @@ record it.
   documents, GitHub, MCP, long-running) run through the API a client uses, graded from the session's events and files,
   with per-category tool calls, failed calls, approvals, turn time, sandbox wait and tokens taken from what Brain
   already records. `EVAL_ARM=guideline` compares a run with the guideline against one without.
-- A session created with `config.acting_as` and no `model` (a pull request reviewed on someone's behalf) runs on
-  `CLAW_GITHUB_REVIEW_MODEL` (default `claude-opus-5.5`, apart from the deployment's `DEFAULT_MODEL`; `default` keeps
-  that); a request's own `model` wins. `CLAW_GITHUB_REVIEW_EFFORT` (unset by default: nothing is sent, as before) runs
-  every turn of it at that effort while it runs on that model (new `ExecuteRequest.effort`, which Brain sends as
-  `output_config.effort`, or `reasoning_effort`, on every turn and sub-agent of the run). The requester's key pays.
+- A session chooses its reasoning effort as it chooses its model: `effort` (`low`, `medium`, `high`, or `null` for none)
+  on `POST /v1/sessions` and `PATCH /v1/sessions/:id`, stored in `claw_sessions.effort` (new column, required at start-up)
+  and sent on every turn and on every task-system run of the session (new `ExecuteRequest.effort`, which Brain sends as `output_config.effort`, or
+  `reasoning_effort`, on every turn and sub-agent of the run). A value outside the set is a `400`; none sends nothing,
+  as before. A session created with `config.acting_as` (a pull request reviewed on someone's behalf) is an ordinary
+  session in this: it runs on the model and effort its creator chose, or the deployment's defaults. There is no
+  review model or review effort setting.
+- `config.review_only: true` on a session created with `config.acting_as` (a `400` without it, or for a value that is
+  neither a boolean nor null): its `gh_pr_merge` is refused with `review_only` before anything is read, so it reviews, and may
+  approve, but never merges, never approves on the way to a merge, and does not approve while GitHub's auto-merge is
+  on for the pull request (`review_only` as well); a held merge of such a session is refused at
+  the acting user's allow as well.
 - A deep review behind `CLAW_GITHUB_REVIEW_DEEP_ENABLED`, on by default (`false` turns it off, and then the review
   instructions, path advice and thresholds are exactly the previous ones). On, any change of a non-test source file,
   or of more than 200 lines (`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES`, 600 with it off), takes the sandbox path (`source_change`), and the
@@ -561,6 +568,10 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- An on-behalf review of a pull request that changes two or more `SKILL.md` files can approve again: Brain's
+  skill-read guard (`BRAIN_BLOCK_SKILL_SUBAGENTS`) turned its second pass away, since that pass names the files the
+  review read, and an approval needs the second pass. The guard no longer applies to a session that acts as a user
+  (`withhold_sandbox_keys`); every other run keeps it.
 - A session's queue is drained by one drain at a time (a lease on the session row, the new column
   `claw_sessions.pending_drain_until`, added on start). Two drains running together -- a turn's completion and the
   sweeper's, or two workers' reports waking an idle assistant a moment apart -- each started a turn: the second

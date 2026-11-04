@@ -17,13 +17,14 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { taskSubject } from "@claw/protocol";
-import type { ExecuteRequest, ScriptStep, TaskMode } from "@claw/protocol";
+import type { ExecuteRequest, ReasoningEffort, ScriptStep, TaskMode } from "@claw/protocol";
 import {
   MissingPlatformKeyError,
   readTrustedSessionCredentials,
 } from "../auth/session-credentials.js";
 import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_DEPLOY_MODE, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
+import { sessionEffortFromRow } from "../sessions/session-model.js";
 import { actingSessionTurnFields, withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { defaultTaskWorkspaceId } from "./default-workspace.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
@@ -147,6 +148,8 @@ async function loadSessionCredentials(sessionId: string): Promise<{
   workspace_id: string;
   llm_api_key: string;
   withhold_sandbox_keys: boolean;
+  /** The reasoning effort the session chose (`claw_sessions.effort`), or none. */
+  effort: ReasoningEffort | undefined;
 }> {
   // `claw_sessions` only ships `user_id` in the canonical schema; the legacy
   // `platform_key` / `workspace_id` columns are optional add-ons in some
@@ -179,6 +182,8 @@ async function loadSessionCredentials(sessionId: string): Promise<{
   if (CLAW_DEPLOY_MODE !== "kubernetes" && !credentials.platformKey) {
     throw new MissingPlatformKeyError(`session ${sessionId}`);
   }
+  // Read now, as a chat turn reads it (sessions/dispatch.ts): a run of the session asks for the effort the session has.
+  const effort = sessionEffortFromRow((await db.query("SELECT effort FROM claw_sessions WHERE session_id = $1", [sessionId])).rows[0]);
   return {
     user_id: row.user_id ?? "",
     platform_key: credentials.platformKey,
@@ -187,6 +192,7 @@ async function loadSessionCredentials(sessionId: string): Promise<{
     workspace_id: sessionWorkspaceId || defaultTaskWorkspaceId(process.env, CLAW_DEPLOY_MODE === "kubernetes"),
     llm_api_key: credentials.llmApiKey,
     withhold_sandbox_keys: withholdsSandboxKeys(cfg),
+    effort,
   };
 }
 
@@ -448,7 +454,7 @@ function buildExecuteRequest(opts: {
     workspace_id: extractSandboxNamespace(sandboxSpecForBrain) || session.workspace_id || undefined,
     platform_key: session.platform_key || "",
     llm_api_key: session.llm_api_key || undefined,
-    ...(session.withhold_sandbox_keys ? { withhold_sandbox_keys: true, ...actingSessionTurnFields(updated.model ?? undefined) } : {}),
+    ...(session.withhold_sandbox_keys ? { withhold_sandbox_keys: true, ...actingSessionTurnFields() } : {}),
     user_id: session.user_id || "",
     user_env: userEnvForReq,
     plugin_id: updated.plugin_id ?? undefined,
@@ -461,6 +467,7 @@ function buildExecuteRequest(opts: {
     script: rendered.script as ExecuteRequest["script"] | undefined,
     tools_allowlist: (updated.tools_allowlist as string[]) ?? undefined,
     model: updated.model ?? undefined,
+    ...(session.effort ? { effort: session.effort } : {}),
     files_workspace_id: filesWorkspaceId,
     files_workspace_required: true,
     // Legacy fields removed -- new schema uses sandbox_spec exclusively.
