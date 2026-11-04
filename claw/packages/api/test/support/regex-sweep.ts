@@ -303,7 +303,7 @@ export function worstCost(
  * at `length` cost (`ms`); and the part of that cost that grows faster than the line (`excessMs`), whatever the rest of it is and however
  * fast the machine is: what it costs over four times the cost at a quarter of the length is three quarters of a part that grows with the
  * square of the line (`bn²` less `4b(n/4)²`), so that is taken as four thirds of it, which is more than the part when it grows faster still
- * (five quarters of a cubic part, and nearly all of an exponential one). It is less than the part for one that grows as a power of the line
+ * (five quarters of a cubic part, and four thirds of an exponential one). It is less than the part for one that grows as a power of the line
  * between one and two (a third of the cost for `n^1.2`), and a part that grows only a little faster than the line cannot be told from a linear
  * one on a busy machine at all; a backtracking pattern does not cost such a power, its cost grows with a whole power of the line or faster. The ratio is only telling where that is well over the resolution of the clock: a pattern that costs a microsecond
  * or two can take eight times as long on four times the line for reasons that have nothing to do with backtracking. A ratio of two times taken on the same
