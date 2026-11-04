@@ -25,7 +25,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { IdentityUnavailableError } from "@claw/utils";
 import pino from "pino";
 import { z } from "zod";
-import { confirmationOfStoppedReview, denyForStoppedReview, reviewItemPorts, syncReviewItemOfSession } from "../assistant/review-items.js";
+import {
+  confirmationOfStoppedReview, denyForStoppedReview, reviewItemPorts, reviewSessionStopped, syncReviewItemOfSession,
+} from "../assistant/review-items.js";
 import { identityClient } from "../auth/identity.js";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
@@ -148,7 +150,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
   const settings = opts.settings ?? (() => readGithubReviewSettings());
   const database: Queryable = opts.db ?? db;
   const service = opts.service ?? new GithubReview({
-    settings, db: database,
+    settings, db: database, sessionStopped: reviewSessionStopped,
     resolveCredential: async (req) => {
       const client = identityClient();
       if (!client) throw new IdentityUnavailableError("credential", "not_configured");

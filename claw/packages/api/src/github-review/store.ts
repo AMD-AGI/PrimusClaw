@@ -114,6 +114,11 @@ export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<v
 
 // ---------------------------------------------------------------- write lock
 
+/** The lock on one acting user's approvals and merges of one pull request: the key the tools and a stop of a review item share. */
+export function writeLockKey(actorUserId: string, ref: { owner: string; repo: string; number: number }): string {
+  return `${actorUserId}|${`${ref.owner}/${ref.repo}`.toLowerCase()}#${ref.number}`;
+}
+
 /**
  * Takes the lock on one acting user's approvals and merges of one pull request, or answers null when another call holds it. Between
  * deciding that an approval or a merge is not held and making it, another call of the same acting user on the same pull request could
@@ -563,8 +568,24 @@ export async function sessionMerged(db: Queryable, sessionId: string): Promise<b
  * The deny comes before the look for one being carried out: a decision that claims a row after this statement finds it denied, and one
  * that claimed it before is seen as `merging`.
  */
-export async function closeConfirmationsForStop(db: Queryable, sessionId: string, stoppedBy: string): Promise<"already_merged" | "merge_in_progress" | null> {
+export async function closeConfirmationsForStop(
+  db: Queryable, sessionId: string, stoppedBy: string, write: { actorUserId: string; pr: { owner: string; repo: string; number: number } },
+): Promise<"already_merged" | "merge_in_progress" | null> {
   if (await sessionMerged(db, sessionId)) return "already_merged";
+  // A merge or an approval the session is making right now holds this lock for as long as it works, and no confirmation says so. The
+  // stop takes the lock in its own transaction, so a write that asks for it meanwhile waits for the stop and then finds the review stopped
+  // (`GithubReview.oneAtATime`); one that holds it now is being made, and the stop says so instead of claiming it stopped anything.
+  const key = writeLockKey(write.actorUserId, write.pr);
+  const taken = await db.query(
+    `INSERT INTO claw_github_write_locks (lock_key, holder, expires_at) VALUES ($1, $2, NOW() + INTERVAL '2 minutes')
+     ON CONFLICT (lock_key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
+       WHERE claw_github_write_locks.expires_at <= NOW()
+     RETURNING holder`,
+    [key, `stop:${sessionId}`],
+  );
+  if (!taken.rows.length) return "merge_in_progress";
+  // Released when the transaction commits; a waiter then takes it and reads the stop.
+  await db.query("DELETE FROM claw_github_write_locks WHERE lock_key = $1 AND holder = $2", [key, `stop:${sessionId}`]);
   await db.query(
     `UPDATE claw_github_confirmations
         SET status = 'denied', decided_at = NOW(), decided_by = $2, result = '{"by":"requester","reason":"stopped"}'::jsonb
@@ -572,5 +593,7 @@ export async function closeConfirmationsForStop(db: Queryable, sessionId: string
     [sessionId, stoppedBy],
   );
   const merging = await db.query("SELECT 1 FROM claw_github_confirmations WHERE session_id = $1 AND status = 'merging' LIMIT 1", [sessionId]);
-  return merging.rows.length > 0 ? "merge_in_progress" : null;
+  if (merging.rows.length > 0) return "merge_in_progress";
+  // A decision that finished between the first look and the deny.
+  return (await sessionMerged(db, sessionId)) ? "already_merged" : null;
 }

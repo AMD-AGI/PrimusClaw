@@ -9,11 +9,12 @@
  *   V2  only a person's identity-provider token (or an allowed service's) may start one; anything else is refused and leaves nothing
  *   V3  a request that is wrong is refused before anything is asked or made
  *   V4  one open review per pull request, whoever asked; another person's item is not named; a batch with one is refused whole
- *   V5  the hourly limits are asked before any session is made, and say how many more fit
+ *   V5  the hourly limits are asked before any session is made, and say how many more fit; two creates at once cannot both take the last
  *   V6  a review counts toward the user's limit of unfinished items, and says that is what was met
  *   V7  GitHub is asked before a session is made: a refusal, or an outage, makes nothing
  *   S1  stop denies what the session holds, in the same transaction; a merge being made, or made, refuses the stop and changes nothing
  *   S2  the assistant's work_stop passes those two refusals on as they are
+ *   S3  a merge being made without a confirmation (the write lock is held) refuses the stop too; after the stop the tools see it
  *   R1  restart: the same pull request with what changed, the old item stopped by the stop's rules
  *   M1  the state, from every confirmation status and every way a turn ends (table)
  *   M2  the state written to the item: entering "needs you" wakes the assistant once, done does not, a repeat writes nothing
@@ -256,6 +257,14 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual([over.status, over.body.data], [429, { scope: "deployment", limit: 5, remaining: 2 }]);
   });
 
+  test("V5b two requesters using the same account at once cannot both take its last start", async () => {
+    await one("carol", { acting_as: "bob", prs: [PR(1)] });
+    await one("dave", { acting_as: "bob", prs: [PR(2)] });
+    const [a, b] = await Promise.all([start("alice", { prs: [PR(3)], acting_as: "bob" }), start("erin", { prs: [PR(4)], acting_as: "bob" })]);
+    assert.deepEqual([a.status, b.status].sort(), [200, 429]);
+    assert.equal(await count("claw_work_items", "params->>'acting_as' = 'bob'"), 3);
+  });
+
   test("V6 a review counts toward the user's limit of unfinished items, and the refusal says it is that limit", async () => {
     await w.user("alice");
     for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);
@@ -310,6 +319,23 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual([late.status, late.body.error, late.body.data.board_state, late.body.data.outcome], [409, "already_merged", "done", "accepted"],
       "and the board says what happened");
     assert.equal(interrupts.length, 1, "neither refused stop interrupted anything");
+  });
+
+  test("S3 a merge the session is making right now (it holds the write lock, no confirmation says so) refuses the stop; a later one finds the review stopped", async () => {
+    const it = await one("alice", { review_only: false });
+    const held = await confirmation(it.session_id, "pending");
+    const key = "alice|amd-agi/primusclaw#254";
+    await w.q("INSERT INTO claw_github_write_locks (lock_key, holder, expires_at) VALUES ($1, 'tool-call', NOW() + INTERVAL '1 minute')", [key]);
+    const busy = await call("alice", `/v1/work-items/${it.item_id}/stop`, {});
+    assert.deepEqual([busy.status, busy.body.error, busy.body.data.board_state], [409, "merge_in_progress", "in_progress"]);
+    assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [held]))[0].status, "pending", "nothing was denied");
+    assert.equal((await w.q("SELECT holder FROM claw_github_write_locks WHERE lock_key = $1", [key]))[0].holder, "tool-call", "and the lock is still the tool's");
+    // The tool call finished (its lock lapsed): the stop goes ahead, and leaves no lock behind it.
+    await w.q("UPDATE claw_github_write_locks SET expires_at = NOW() - INTERVAL '1 second' WHERE lock_key = $1", [key]);
+    assert.equal((await call("alice", `/v1/work-items/${it.item_id}/stop`, {})).status, 200);
+    assert.equal(await count("claw_github_write_locks", `lock_key = '${key}'`), 0);
+    assert.equal(await ri.reviewSessionStopped(it.session_id), true, "what the review tools ask before an approval or a merge");
+    assert.equal(await ri.reviewSessionStopped((await one("alice", { prs: [PR(300)] })).session_id), false);
   });
 
   test("S2 the assistant's work_stop says what the stop said: a merge being made, or made, is not reported as a finished item", async () => {

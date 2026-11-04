@@ -387,11 +387,11 @@ export async function stopWorkItem(input: {
   const stopped = await inTransaction(async (query) => {
     await input.guard?.(query);
     const open = (await query(
-      "SELECT kind, worker_session_id FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND board_state <> 'done' FOR UPDATE",
+      "SELECT kind, params, worker_session_id FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND board_state <> 'done' FOR UPDATE",
       [input.itemId, input.userId],
-    )).rows[0] as { kind: string; worker_session_id: string } | undefined;
+    )).rows[0] as { kind: string; params: { acting_as: string; pr: { owner: string; repo: string; number: number } }; worker_session_id: string } | undefined;
     if (open?.kind === "review") {
-      const refusal = await closeConfirmationsForStop({ query }, open.worker_session_id, input.userId);
+      const refusal = await closeConfirmationsForStop({ query }, open.worker_session_id, input.userId, { actorUserId: open.params.acting_as, pr: open.params.pr });
       if (refusal) throw new StopRefused(refusal);
     }
     const rows = (await query(

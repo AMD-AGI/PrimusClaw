@@ -175,6 +175,18 @@ describe("P which pull requests", () => {
     assert.ok(rows.rows.length > 0 && rows.rows.every((r: any) => r.write === false), "each check is audited, and none counts as a write");
   });
 
+  test("P7 a review its requester stopped makes no approval and no merge: asked under the write lock, before anything is written", async () => {
+    allowed();
+    (e.service as unknown as { deps: { sessionStopped?: (sid: string) => Promise<boolean> } }).deps.sessionStopped = async (sid) => sid === e.actor.sessionId;
+    approvedHere();
+    assert.equal(reason(await merge()), "review_stopped");
+    assert.equal(reason(await submit({ event: "APPROVE" })), "review_stopped");
+    assert.equal(posts().length + puts().length, 0);
+    assert.equal(Number((await e.db.query("SELECT COUNT(*)::int AS n FROM claw_github_write_locks")).rows[0].n), 0, "the lock was given back");
+    // A comment approves nothing and takes no lock: it is not asked.
+    assert.notEqual(reason(await submit({ event: "COMMENT" })), "review_stopped");
+  });
+
   test("P5 a feature that is off answers nothing and touches nothing", async () => {
     const { reviewEnv: make } = await import("./support/review-env.js");
     const off = await make({}, { reviewed: false });

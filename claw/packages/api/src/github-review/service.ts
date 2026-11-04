@@ -36,7 +36,7 @@ import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  acquireWriteLock, countPendingConfirmations, getReviewMode, headReviewFacts, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
+  acquireWriteLock, writeLockKey, countPendingConfirmations, getReviewMode, headReviewFacts, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
   type Confirmation, type DecidedVia, type HeldReview, type Queryable, type ReviewComment, type ReviewEvent, type ReviewMode,
 } from "./store.js";
 
@@ -83,6 +83,8 @@ export interface ReviewDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Where the structured log lines go; the process's logger by default. */
   logger?: { info(fields: Record<string, unknown>, message: string): void };
+  /** Whether the requester stopped the review this session is (assistant/review-items.ts); an approval or a merge is then not made. */
+  sessionStopped?: (sessionId: string) => Promise<boolean>;
 }
 
 interface Ctx {
@@ -563,9 +565,14 @@ export class GithubReview {
    * refused at once, nothing written, and may be made again.
    */
   private async oneAtATime<T>(ctx: Ctx, ref: PrRef, body: () => Promise<T>): Promise<T> {
-    const key = `${ctx.actor.actorUserId}|${`${ref.owner}/${ref.repo}`.toLowerCase()}#${ref.number}`;
+    const key = writeLockKey(ctx.actor.actorUserId, ref);
     const holder = await acquireWriteLock(this.deps.db, key, WRITE_LOCK_SECONDS);
     if (!holder) throw new Refusal("write_in_progress", "another approval or merge of this pull request with this account is being decided; nothing was written, try again in a moment");
+    // Asked under the lock a stop takes too (store.ts closeConfirmationsForStop): a stop either saw this write coming, or this sees the stop.
+    if (this.deps.sessionStopped && await this.deps.sessionStopped(ctx.actor.sessionId)) {
+      await releaseWriteLock(this.deps.db, key, holder).catch(() => undefined);
+      throw new Refusal("review_stopped", "the person who asked for this review stopped it; nothing was written");
+    }
     // Renewed while the call works, however long GitHub takes; only a call that died lets it lapse.
     const renew = setInterval(() => { void renewWriteLock(this.deps.db, key, holder, WRITE_LOCK_SECONDS).catch(() => undefined); }, (WRITE_LOCK_SECONDS * 1000) / 4);
     renew.unref?.();

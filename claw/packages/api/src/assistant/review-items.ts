@@ -292,6 +292,14 @@ async function insertReview(q: StatementRunner, user: UserInfo, plan: Planned): 
   return { item_id: item.itemId, seq: item.seq, title: name, session_id: plan.sessionId, pr: plan.pr };
 }
 
+/**
+ * Creates of review items take turns, deployment-wide, for the rest of the transaction: the hourly limits are counts over every requester
+ * and acting account, and two creates that counted at once would both fit. They are few, so one lock is enough.
+ */
+async function takeCreateTurn(query: Querier): Promise<void> {
+  await query("SELECT pg_advisory_xact_lock(hashtext('claw.assistant.review_items.create'))");
+}
+
 /** The unique index on open reviews of one pull request, met by a create that raced another: answered as the check before it would. */
 async function inReviewTransaction<T>(userId: string, prs: PrRef[], run: (query: Querier) => Promise<T>): Promise<T> {
   try {
@@ -326,7 +334,8 @@ export async function startReviews(user: UserInfo, method: string | null, reques
   await getOrCreateAssistant(user.userId);
   const created = await inReviewTransaction(user.userId, plans.map((p) => p.pr), async (query) => {
     const q = { query };
-    // The assistant row first, as `insertWorkItem` takes it: two requests of one user meet here, and the limits are asked again behind it.
+    await takeCreateTurn(query);
+    // The assistant row, as `insertWorkItem` takes it.
     await query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [user.userId]);
     for (const plan of plans) await refuseIfReviewed(q, user.userId, plan.pr);
     await refuseOverLimit(q, actingAs, plans.length);
@@ -375,12 +384,13 @@ export async function restartReview(
   await getOrCreateAssistant(user.userId);
   const result = await inReviewTransaction(user.userId, [was.pr], async (query) => {
     const q = { query };
+    await takeCreateTurn(query);
     await query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [user.userId]);
     const row = (await query(
       "SELECT board_state, worker_session_id, seq FROM claw_work_items WHERE item_id = $1 AND user_id = $2 FOR UPDATE", [itemId, user.userId],
     )).rows[0] as { board_state: string; worker_session_id: string; seq: number } | undefined;
     if (!row) throw new ReviewItemRefused(404, "not_found", "no such item");
-    const refusal = await closeConfirmationsForStop(q, row.worker_session_id, user.userId);
+    const refusal = await closeConfirmationsForStop(q, row.worker_session_id, user.userId, { actorUserId: was.acting_as, pr: was.pr });
     if (refusal) {
       throw new ReviewItemRefused(409, refusal, refusal === "already_merged"
         ? `${prName(was.pr)} is already merged; nothing to review again` : `the merge of ${prName(was.pr)} is being made right now`, {});
@@ -575,6 +585,15 @@ export async function confirmationOfStoppedReview(confirmationId: string): Promi
     `SELECT 1 FROM claw_github_confirmations c JOIN claw_work_items w ON w.worker_session_id = c.session_id
       WHERE c.confirmation_id = $1 AND w.kind = 'review' AND w.outcome = 'stopped'`,
     [confirmationId],
+  );
+  return r.rows.length > 0;
+}
+
+/** Whether this session is a review its requester stopped: the review tools then make no approval and no merge (`GithubReview.oneAtATime`). */
+export async function reviewSessionStopped(sessionId: string): Promise<boolean> {
+  if (!CLAW_ASSISTANT_REVIEW_ITEMS) return false;
+  const r = await db.query(
+    "SELECT 1 FROM claw_work_items WHERE worker_session_id = $1 AND kind = 'review' AND outcome = 'stopped'", [sessionId],
   );
   return r.rows.length > 0;
 }
