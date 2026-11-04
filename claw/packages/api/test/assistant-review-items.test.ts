@@ -495,6 +495,25 @@ describe("assistant review items", { skip }, () => {
     assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [later]))[0].status, "denied");
   });
 
+  test("D1b only the acting user answers a held write of a stopped review, at the route and at the assistant's confirmation_answer alike", async () => {
+    const stopped = await one("alice", { prs: [PR(301)] });
+    assert.equal((await call("alice", `/v1/work-items/${stopped.item_id}/stop`, {})).status, 200);
+    const late = await confirmation(stopped.session_id, "pending");
+    const r = await call("bob", `/v1/github-review/confirmations/${late}/decision`, { decision: "deny" });
+    assert.deepEqual([r.status, r.body.error], [403, "only_the_acting_user_can_decide"]);
+    // The assistant's tool answers through the route's own function, so it cannot answer for someone else either.
+    const { reviewToolPorts } = await import("../src/assistant/review-tools.js");
+    const t = await reviewToolPorts.decide("bob", late, "deny", null);
+    assert.deepEqual([t.http, t.body.error], [403, "only_the_acting_user_can_decide"]);
+    assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [late]))[0].status, "pending",
+      "nobody else's answer touched it");
+    assert.equal(decisions.length, 0);
+    // The acting user's own answer, through the tool, is the route's: denied as stopped.
+    const own = await reviewToolPorts.decide("alice", late, "allow", null);
+    assert.deepEqual([own.http, own.body.status, own.body.reason], [200, "denied", "review_stopped"]);
+    assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [late]))[0].status, "denied");
+  });
+
   test("G1 a review session is no worker: no role profile, no worker report at its turn's end, not an orphan to the task sweep", async () => {
     const it = await one("alice");
     assert.equal(await w.mod.role.sessionRole(it.session_id), null, "no report tool, no worker prompt, no worker model");

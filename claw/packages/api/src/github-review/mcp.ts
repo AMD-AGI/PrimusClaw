@@ -40,7 +40,9 @@ import { SECTIONS } from "./pages.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
 import { HOLD_GUIDANCE } from "./risk.js";
-import { REVIEW_MODES, getConfirmation, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type Queryable, type ReviewMode } from "./store.js";
+import {
+  REVIEW_MODES, getConfirmation, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type DecidedVia, type Queryable, type ReviewMode,
+} from "./store.js";
 import { verifySessionToolToken } from "./token.js";
 
 const logger = pino({ name: "github-review-mcp" });
@@ -167,6 +169,28 @@ export function githubReviewService(): GithubReview {
   return processService;
 }
 
+/**
+ * The acting user's answer to a held write, as everyone who takes one gives it: the decision route and the assistant's
+ * `confirmation_answer` both call this, so neither can skip a step the other takes. The caller has already decided who is
+ * answering (`deciderUserId`) and how they were present (`via`); only the acting user can answer, here as in `decide`.
+ * A write held by a review its requester stopped is not made, whatever the answer (`confirmationOfStoppedReview`), and
+ * the review item of the session, if it is one, closes with the answer.
+ */
+export async function decideConfirmation(
+  service: GithubReview, database: Queryable, deciderUserId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null,
+): Promise<{ http: number; body: Record<string, unknown> }> {
+  if (await confirmationOfStoppedReview(id)) {
+    const row = await getConfirmation(database, id);
+    if (row && row.actorUserId !== deciderUserId) return { http: 403, body: { ok: false, error: "only_the_acting_user_can_decide" } };
+    await denyForStoppedReview(id);
+    return { http: 200, body: { ok: true, status: "denied", reason: "review_stopped" } };
+  }
+  const answer = await service.decide(deciderUserId, id, decision, via);
+  const decided = await getConfirmation(database, id).catch(() => null);
+  if (decided) await syncReviewItemOfSession(decided.sessionId).catch((err) => logger.warn({ err }, "github_review.review_item_sync_failed"));
+  return answer;
+}
+
 export async function registerGithubReviewRoutes(app: FastifyInstance, opts: GithubReviewRouteOptions = {}): Promise<void> {
   if (!(opts.enabled ?? CLAW_GITHUB_REVIEW_ENABLED)) return;
   const settings = opts.settings ?? (() => readGithubReviewSettings());
@@ -249,17 +273,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     const decision = ((req.body ?? {}) as { decision?: unknown }).decision;
     if (decision !== "allow" && decision !== "deny") return refuse(reply, 400, "decision must be allow or deny");
     if (!UUID_RE.test(req.params.id)) return refuse(reply, 404, "not_found");
-    // A write held by a review its requester stopped is not made, whatever the answer (`confirmationOfStoppedReview`).
-    if (await confirmationOfStoppedReview(req.params.id)) {
-      const row = await getConfirmation(database, req.params.id);
-      if (row && row.actorUserId !== user.userId) return refuse(reply, 403, "only_the_acting_user_can_decide");
-      await denyForStoppedReview(req.params.id);
-      return reply.send({ ok: true, status: "denied", reason: "review_stopped" });
-    }
-    const answer = await service.decide(user.userId, req.params.id, decision, caller.via);
-    // The review item of the session, if it is one, closes with its answer.
-    const decided = await getConfirmation(database, req.params.id).catch(() => null);
-    if (decided) await syncReviewItemOfSession(decided.sessionId).catch((err) => logger.warn({ err }, "github_review.review_item_sync_failed"));
+    const answer = await decideConfirmation(service, database, user.userId, req.params.id, decision, caller.via);
     return reply.status(answer.http).send(answer.body);
   });
 

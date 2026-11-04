@@ -15,8 +15,8 @@
  *    repository, one the channel or their recent reviews use). Text from reports or recalled items is not their message.
  *
  * Everything past that is the review's own gates, which these call rather than repeat: creating, stopping and restarting
- * a review item is `review-items.ts`; answering a held write is the review service's `decide`, which checks the head
- * commit and every gate again.
+ * a review item is `review-items.ts`; answering a held write is the decision route's own `decideConfirmation`
+ * (`github-review/mcp.ts`), whose `decide` checks the head commit and every gate again.
  */
 import pino from "pino";
 import { IDENTITY_TOKEN_METHOD } from "../auth/identity-token.js";
@@ -24,15 +24,14 @@ import type { UserInfo } from "../auth/models.js";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { parsePrRef, type PrRef } from "../github-review/github.js";
-import { githubReviewService } from "../github-review/mcp.js";
-import { DEFAULT_REVIEW_MODE, getReviewMode, setReviewMode } from "../github-review/store.js";
+import { decideConfirmation, githubReviewService } from "../github-review/mcp.js";
+import { DEFAULT_REVIEW_MODE, getReviewMode, setReviewMode, type DecidedVia } from "../github-review/store.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { deterministicEventId, enqueue, kickDelivery } from "../notifications/outbox.js";
 import type { AssistantActionPayload } from "../notifications/assistant-events.js";
 import { decidedViaOf, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import {
-  confirmationOfStoppedReview, denyForStoppedReview, parseRestartRequest, parseReviewRequest, restartReview, ReviewItemRefused,
-  reviewItemsEnabled, startReviews, syncReviewItemOfSession,
+  parseRestartRequest, parseReviewRequest, restartReview, ReviewItemRefused, reviewItemsEnabled, startReviews,
 } from "./review-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { attendedTurn, ToolRefused } from "./tools.js";
@@ -40,27 +39,13 @@ import { resolveWorkItemNow } from "./work-items.js";
 
 const logger = pino({ name: "assistant-review-tools" });
 
-/**
- * Answer a held write as the decision route does: a write held by a review its requester stopped is denied whatever the
- * answer, and the review item of the session closes with the answer (`review-items.ts`).
- */
-async function decideAsTheRoute(userId: string, id: string, decision: "allow" | "deny", via: ReturnType<typeof decidedViaOf>) {
-  if (await confirmationOfStoppedReview(id)) {
-    await denyForStoppedReview(id);
-    return { http: 200, body: { ok: true, status: "denied", reason: "review_stopped" } as Record<string, unknown> };
-  }
-  const answer = await githubReviewService().decide(userId, id, decision, via);
-  const row = (await db.query("SELECT session_id FROM claw_github_confirmations WHERE confirmation_id = $1", [id])).rows[0] as
-    { session_id: string } | undefined;
-  if (row) await syncReviewItemOfSession(row.session_id).catch((err) => logger.warn({ err }, "assistant.review_item_sync_failed"));
-  return answer;
-}
-
 /** The ways out of this module, so a test can stand in for what lies beyond the HTTP boundary of each. */
 export const reviewToolPorts = {
   startReviews,
   restartReview,
-  decide: decideAsTheRoute,
+  /** The decision route's own function (`decideConfirmation`), with the process's review service, not a copy of it. */
+  decide: (userId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null) =>
+    decideConfirmation(githubReviewService(), db, userId, id, decision, via),
   kick: (): Promise<void> => kickDelivery(),
 };
 
