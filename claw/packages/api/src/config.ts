@@ -449,6 +449,10 @@ export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
 // recording, evolve worker, and skill-files cleanup are all short-circuited.
 export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLED", false);
 
+// When true: every turn that does the user's work (not an assistant Router turn) carries the
+// general working guideline (sessions/agent-guideline.ts) in its system message.
+export const CLAW_AGENT_GUIDELINE_ENABLED = envBool("CLAW_AGENT_GUIDELINE_ENABLED", false);
+
 // --- Outbound notifications (default OFF) ---
 // When false: no notification tables, routes, outbox writes or delivery loop.
 export const CLAW_NOTIFICATIONS_ENABLED = envBool("CLAW_NOTIFICATIONS_ENABLED", false);
