@@ -1342,8 +1342,20 @@ export const MULTI_NODE_SWEEPER_INTERVAL_MS = envInt(
 // SUB_AGENT_MAX_TURNS: upper bound on turns inside a sub-agent. 0 disables
 // the `task` tool entirely (sub-agents unavailable).
 export const SUB_AGENT_MAX_TURNS = envInt("SUB_AGENT_MAX_TURNS", 0);
-export const SUB_AGENT_MAX_CONCURRENT = envInt("SUB_AGENT_MAX_CONCURRENT", 2);
+export const SUB_AGENT_MAX_CONCURRENT = envInt("SUB_AGENT_MAX_CONCURRENT", 4, { min: 1, max: 16 });
 export const SUB_AGENT_MAX_DEPTH = envInt("SUB_AGENT_MAX_DEPTH", 1);
+// SUB_AGENT_MODELS: the models a `task` call may name for its sub-agent, besides
+// the run's own (comma-separated; empty: a sub-agent always runs on the run's
+// model, and `task` offers no choice). SUB_AGENT_EXPLORE_MODEL: what an
+// `explore` or `readonly` sub-agent runs on when the call names none -- a
+// cheaper model for reading and searching; empty: the run's model. It is one of
+// SUB_AGENT_MODELS by construction (added to the list when absent), so the
+// default is never a model the call itself could not have named.
+export const SUB_AGENT_EXPLORE_MODEL = env("SUB_AGENT_EXPLORE_MODEL").trim();
+export const SUB_AGENT_MODELS: ReadonlyArray<string> = [...new Set([
+  ...env("SUB_AGENT_MODELS").split(",").map((m) => m.trim()).filter(Boolean),
+  ...(SUB_AGENT_EXPLORE_MODEL ? [SUB_AGENT_EXPLORE_MODEL] : []),
+])];
 // Block sub-agent dispatches whose prompt is dominated by skill-file reads.
 // The dispatch is rejected with an error message instructing the agent to
 // use the direct `read` tool. Mitigates a recurring pattern where Opus
@@ -1721,6 +1733,13 @@ export const A2A_STREAM_MAX_MS = envInt("A2A_STREAM_MAX_MS", 600_000, { min: 1_0
 
 // --- Background Shell ---
 export const BG_SHELL_ENABLED = envBool("BG_SHELL_ENABLED", false);
+/**
+ * Background work that finishes in an idle sandbox (no turn running) wakes the
+ * session: the keepalive sweep, which already watches that sandbox's jobs, asks
+ * the API for a turn that reports the result (api sessions/wake.ts). Off by
+ * default: each wake is a model turn the user did not send.
+ */
+export const BACKGROUND_WORK_WAKE_ENABLED = envBool("BACKGROUND_WORK_WAKE_ENABLED", false);
 
 /**
  * The foreground command ceiling, for describing the bash tool to the model.

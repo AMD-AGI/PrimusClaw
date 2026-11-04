@@ -172,6 +172,13 @@ interface KeepaliveDeps {
     workloadId: string,
     opts?: { rows?: Array<[string, Record<string, HandleInfo>]> },
   ) => Promise<void>;
+  /**
+   * Called once when an idle sandbox's background work is seen to have finished:
+   * the verdict that recorded zero jobs replaced one, from the same idle period,
+   * that counted some. `key` names that finish (the sandbox and its idle period),
+   * so the replica that wins the write is the only one that calls this for it.
+   */
+  onBackgroundWorkFinished?: (sessionId: string, key: string) => void;
   /** Test seam for the ping-phase budget. */
   pingBudgetMs?: number;
   /** Test seam for the idle-expiry budget. */
@@ -2984,6 +2991,14 @@ async function persistVerdict(
       }));
       try {
         await deps.kv.update(key, next, e.revision);
+        // The work ended in this idle period: the verdict this write replaced
+        // counted jobs, and was measured under the same idle period as this one.
+        if (
+          running === 0 && (info.bgRunning ?? 0) > 0
+          && info.bgIdleSince === idleSinceAtStart && info.bgIdleRev === idleRevAtStart
+        ) {
+          deps.onBackgroundWorkFinished?.(sessionId, `${identity}:${idleSinceAtStart ?? ""}:${idleRevAtStart ?? ""}`);
+        }
         return;
       } catch {
         // The next attempt re-reads the entry and all guards.
