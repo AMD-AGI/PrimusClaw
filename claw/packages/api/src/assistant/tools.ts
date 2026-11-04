@@ -226,7 +226,12 @@ export async function workStop(
     },
   });
   if (stopped.status === "not_found") throw new ToolRefused("item_not_found", "no such item");
-  if (stopped.status === "conflict") throw new ToolRefused("item_closed", "that item is already finished");
+  if (stopped.status === "conflict") {
+    // A review whose merge is being made, or was made: say exactly that, so the user is told the truth and nothing is undone.
+    if (stopped.error === "merge_in_progress") throw new ToolRefused(stopped.error, "the merge is being made right now and cannot be stopped");
+    if (stopped.error === "already_merged") throw new ToolRefused(stopped.error, "the pull request is already merged; nothing was stopped or reverted");
+    throw new ToolRefused("item_closed", "that item is already finished");
+  }
   return { ok: true, item_id: item.item_id, seq: item.seq, outcome: "stopped" };
 }
 

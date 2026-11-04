@@ -13,6 +13,7 @@
  *   V6  a review counts toward the user's limit of unfinished items, and says that is what was met
  *   V7  GitHub is asked before a session is made: a refusal, or an outage, makes nothing
  *   S1  stop denies what the session holds, in the same transaction; a merge being made, or made, refuses the stop and changes nothing
+ *   S2  the assistant's work_stop passes those two refusals on as they are
  *   R1  restart: the same pull request with what changed, the old item stopped by the stop's rules
  *   M1  the state, from every confirmation status and every way a turn ends (table)
  *   M2  the state written to the item: entering "needs you" wakes the assistant once, done does not, a repeat writes nothing
@@ -309,6 +310,19 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual([late.status, late.body.error, late.body.data.board_state, late.body.data.outcome], [409, "already_merged", "done", "accepted"],
       "and the board says what happened");
     assert.equal(interrupts.length, 1, "neither refused stop interrupted anything");
+  });
+
+  test("S2 the assistant's work_stop says what the stop said: a merge being made, or made, is not reported as a finished item", async () => {
+    const alice = await w.user("alice");
+    const merging = await one("alice", { prs: [PR(300)] });
+    await confirmation(merging.session_id, "merging");
+    const merged = await one("alice", { prs: [PR(400)] });
+    await audit(merged.session_id, "gh_pr_merge", "ok", "merged");
+    for (const [it, code] of [[merging, "merge_in_progress"], [merged, "already_merged"]] as const) {
+      const turn = await w.routerTurn(alice);
+      await assert.rejects(w.mod.tools.workStop(turn, { item_id: it.item_id, reason: "stop it" }), (err: any) => err.code === code, code);
+      await w.closeRun(turn.task_id);
+    }
   });
 
   test("R1 restart: the same pull request with what changed, the old item stopped by the stop's rules", async () => {
