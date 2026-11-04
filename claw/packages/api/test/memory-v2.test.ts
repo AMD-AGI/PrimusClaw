@@ -24,7 +24,8 @@
  *   D1  deleting is for good: no text of the entry is left anywhere in the database
  *   D2  a deleted entry is gone from the next turn's catalogue
  *   D3  undo restores the previous version of an edit (a confirmation included) and deletes a new entry
- *   D4  forgetting needs the user's own request to forget that entry, quoted; any other sentence of theirs is not one
+ *   D4  forgetting needs the user's own instruction to forget that entry, quoted; a sentence that only mentions
+ *       forgetting or deleting, or deletes something else, is not one
  * Reads
  *   R1  the catalogue is one line per entry, bounded by lines and by tokens, user and feedback first, pinned on top
  *   R2  a project entry past its review date leaves the catalogue (counted) until it is confirmed again
@@ -378,6 +379,7 @@ describe("memory v2", { skip }, () => {
     assert.deepEqual([row.status, row.content], ["pending", "a pending fact about tabs"], "untouched, still waiting");
   });
 
+
   // ── deletes ───────────────────────────────────────────────────────────────
 
   test("D1 deleting is for good: no text of the entry is left anywhere", async () => {
@@ -450,12 +452,21 @@ describe("memory v2", { skip }, () => {
     const anySentence = await tool("forget_memory", sid, t.messageId, { id, evidence_quote: "remember I use vim" });
     assert.equal(anySentence.ok, false, "a sentence of the user's that does not ask to forget is not a request");
     await w.closeRun(t.taskId);
-    for (const said of ["I keep forgetting my vim shortcuts", "don't forget I use vim", "我总忘记 vim 的快捷键"]) {
+    // Each mentions forgetting or deleting, shares "vim" with the entry, and is no instruction to forget it.
+    const incidental = [
+      "I keep forgetting my vim shortcuts", "don't forget I use vim", "我总忘记 vim 的快捷键", "I forget my vim notes all the time",
+      "remove vim from my laptop", "can you delete the vim swap files", "forget it, I use vim anyway", "I can't delete the vim memory",
+      "忘了说，我用 vim", "不要删除这条记忆，我用 vim", `delete ${id} files in vim`,
+    ];
+    for (const said of incidental) {
       const m = await turn(sid, said);
-      const r = await tool("forget_memory", sid, m.messageId, { id, evidence_quote: said });
-      assert.equal(r.ok, false, `${said}: mentions forgetting, asks nothing`);
+      for (const undo of [false, true]) {
+        const r = await tool("forget_memory", sid, m.messageId, { id, evidence_quote: said, undo });
+        assert.equal(r.ok, false, `${said} (undo ${undo}): mentions forgetting, asks nothing`);
+      }
       await w.closeRun(m.taskId);
     }
+    assert.equal((await entries()).length, 1);
     const t1 = await turn(sid, "please delete the note about the weather");
     const other = await tool("forget_memory", sid, t1.messageId, { id, evidence_quote: "please delete the note about the weather" });
     assert.equal(other.ok, false, "a request to forget something else is not a request to forget this");
@@ -472,6 +483,17 @@ describe("memory v2", { skip }, () => {
     const asked = await tool("forget_memory", sid, t2.messageId, { id: id2, evidence_quote: `撤销记忆 #${id2}`, undo: true });
     assert.equal(asked.ok, true, asked.text);
     assert.deepEqual(await entries(), []);
+    await w.closeRun(t2.taskId);
+    for (const said of ["delete the vim memory", "把关于 vim 的那条记忆删掉", "忘掉我用 vim 这件事", "Please forget I use vim."]) {
+      await tool("save_memory", sid, (await turn(sid, "remember I use vim")).messageId, save("uses vim", "uses vim", "I use vim"));
+      await w.q("UPDATE claw_tasks SET status = 'completed'");
+      const n = Number((await entries())[0].id);
+      const m = await turn(sid, said);
+      const r = await tool("forget_memory", sid, m.messageId, { id: n, evidence_quote: said });
+      assert.equal(r.ok, true, `${said}: ${r.text}`);
+      assert.deepEqual(await entries(), []);
+      await w.closeRun(m.taskId);
+    }
   });
 
   // ── reads ─────────────────────────────────────────────────────────────────
