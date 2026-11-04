@@ -495,3 +495,16 @@ test("maskArguments and summaryPrompt keep a credential's id and name, and hide 
   assert.ok(prompt.includes("claw5-gate-allow"), prompt);
   assert.ok(!prompt.includes("plainvalue-without-shape"), prompt);
 });
+
+test("maskArguments and credentialValues hide a Vault secret_id and a map of passwords keyed by name", () => {
+  const uuid = "6a1c2f3e-0b4d-4e5f-8a9b-0c1d2e3f4a5b";
+  const input = { secret_id: uuid, VAULT_SECRET_ID: uuid, passwords_by_name: { prod: "XkjQmzPl" }, apikey_name: { prod: "Zq81mmLp" } };
+  const values = credentialValues(input);
+  assert.ok(values.includes(uuid), String(values));
+  assert.ok(values.includes("XkjQmzPl"), String(values));
+  assert.ok(values.includes("Zq81mmLp"), String(values));
+  const out = maskArguments(input, values) as Record<string, unknown>;
+  for (const key of Object.keys(input)) assert.equal(out[key], "[hidden]", key);
+  const prompt = summaryPrompt("mcp__vault__approle_login", input, {});
+  for (const secret of [uuid, "XkjQmzPl", "Zq81mmLp"]) assert.ok(!prompt.includes(secret), prompt);
+});

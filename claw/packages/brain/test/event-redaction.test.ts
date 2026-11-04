@@ -252,3 +252,37 @@ test("a permissionRequest keeps the id and name of the key it targets, and masks
   assert.equal(input.apikey_name, "claw5-gate-allow");
   assert.equal(input.api_key, "<redacted>");
 });
+
+test("a permissionRequest masks a Vault secret_id and a map of passwords keyed by name", () => {
+  // The value under secret_id / SecretID / VAULT_SECRET_ID IS the credential,
+  // a plain UUID with no shape; passwords_by_name is a container whose child
+  // keys say nothing. Both must stay masked whole.
+  const uuid = "6a1c2f3e-0b4d-4e5f-8a9b-0c1d2e3f4a5b";
+  const event = redactPersistedEvent({
+    type: "permissionRequest",
+    tool: "mcp__vault__approle_login",
+    input: {
+      secret_id: uuid,
+      SecretID: uuid,
+      VAULT_SECRET_ID: uuid,
+      ROLE_SECRET_ID: uuid,
+      passwords_by_name: { prod: "XkjQmzPl" },
+      secrets_by_id: { "7": "XkjQmzPl" },
+      credentials_by_name: { prod: "XkjQmzPl" },
+      apikey_name: { prod: "XkjQmzPl" },
+    },
+  });
+  const encoded = JSON.stringify(event);
+  assert.ok(!encoded.includes(uuid), encoded);
+  assert.ok(!encoded.includes("XkjQmzPl"), encoded);
+  const input = event.input as Record<string, unknown>;
+  for (const key of Object.keys(input)) assert.equal(input[key], "<redacted>", key);
+});
+
+test("a tool named ..._secret_by_id still masks every argument", () => {
+  const event = redactPersistedEvent({
+    type: "agent_step",
+    argumentsDetail: { mcp__vault__read_secret_by_id: { id: "6a1c2f3e-0b4d-4e5f-8a9b-0c1d2e3f4a5b" } },
+  });
+  assert.ok(!JSON.stringify(event).includes("6a1c2f3e"), JSON.stringify(event));
+});

@@ -197,8 +197,8 @@ const ENV_KEYS = new Set(["env", "user env", "session env", "runtime env"]);
 const COUNTER_KEYS = new Set(["token usage", "token count", "token limit", "token len"]);
 
 /**
- * Last words that make a credential-named key name the credential rather than
- * hold it: `apikey_id`, `secretName`, `token_prefix`.
+ * Whole keys that name a credential rather than hold one: `apikey_id`,
+ * `apiKeyName`, `access_key_id`, `credential_id`, `token_prefix`.
  *
  * The value under such a key is how a person tells one credential from
  * another, and masking it is not cosmetic. An approval card for
@@ -207,14 +207,36 @@ const COUNTER_KEYS = new Set(["token usage", "token count", "token limit", "toke
  * [hidden]", and the approver was asked to allow a delete without being shown
  * which key it deletes.
  *
- * Only the LAST word counts, and only when something precedes it, so the
- * credential word still decides every other position: `id_token` ends in
- * `token` and stays masked, and `api_key_id_secret` ends in `secret`. A value
- * under an identifier key is not trusted either; it still goes through the
- * shape scan, so a real key pasted into a `key_name` field is caught by what
- * it looks like.
+ * This is a closed list of whole keys, not a rule about a key's last word.
+ * A trailing `id` or `name` does not by itself say the value is a label:
+ * HashiCorp Vault's AppRole `secret_id` and Consul/Nomad's ACL `SecretID` ARE
+ * the credential, are plain UUIDs the shape scan cannot recognise, and are
+ * spelled exactly like an identifier. So the nouns here are only those whose
+ * id/name/prefix is a public label -- an API key, an access key (AWS's
+ * `access_key_id` is the half that is sent in the clear), a credential record
+ * -- and `secret` and `password` are never among them. A token's name and
+ * prefix are labels, but `token_id` is not listed: Vault's token lookup
+ * returns the token itself under `id`.
+ *
+ * Matching the WHOLE key also keeps the list from reaching anything it did not
+ * name: `VAULT_SECRET_ID`, `openai_api_key_id`, `passwords_by_name` and a tool
+ * called `..._secret_by_id` are not in it and are judged by the word rules
+ * below. Plural tails are not listed, because a plural is a collection.
+ *
+ * The exemption is for a scalar only; see {@link isSensitiveKey}. And a value
+ * under one of these keys is not trusted either: the callers still pass it
+ * through the shape scan, so a real key pasted into `apikey_name` is caught by
+ * what it looks like.
  */
-const IDENTIFIER_TAILS = new Set(["id", "ids", "uuid", "name", "names", "prefix", "prefixes"]);
+const IDENTIFIER_KEYS = new Set(
+  [
+    ...["apikey", "api key", "access key", "credential"].flatMap((noun) =>
+      ["id", "uuid", "name", "prefix"].map((tail) => `${noun} ${tail}`),
+    ),
+    "token name",
+    "token prefix",
+  ],
+);
 
 /**
  * Split a key into lowercase words across camelCase, snake_case, kebab-case and
@@ -241,20 +263,29 @@ function splitWords(key: string): string[] {
  *
  * Matching is by word, not substring: `accessToken` and `apiKeySecret` are
  * credentials, while `tokenizer` and `brokenLink` merely contain the letters.
- * A key that ends in an identifier word (`apiKeyId`, `secretName`) names a
- * credential instead of holding one and is not masked; see
- * {@link IDENTIFIER_TAILS}.
+ * A few whole keys (`apiKeyId`, `credential_id`) name a credential instead of
+ * holding one and are not masked when their value is a scalar; see
+ * {@link IDENTIFIER_KEYS}.
  * The predicate errs towards redacting -- a masked field that turned out to be
  * harmless is a cosmetic bug, a leaked one is not -- so anything genuinely safe
  * that trips it belongs in {@link COUNTER_KEYS} with a note on why.
+ *
+ * `value`, when the caller has it, is what is stored under `key`. It matters
+ * only for {@link IDENTIFIER_KEYS}: their exemption holds for a scalar and
+ * never for an object or array.
  */
-export function isSensitiveKey(key: string): boolean {
+export function isSensitiveKey(key: string, value?: unknown): boolean {
   const words = splitWords(key);
   if (words.length === 0) return false;
   const normalized = words.join(" ");
   if (COUNTER_KEYS.has(normalized)) return false;
   if (ENV_KEYS.has(normalized)) return true;
-  if (words.length > 1 && IDENTIFIER_TAILS.has(words[words.length - 1]!)) return false;
+  // Only a scalar is a label. An object or array under an identifier key is a
+  // container whose children can be anything -- `{apikey_name: {prod: "..."}}`
+  // is a map from a name to a key -- so it is masked as a whole, as any other
+  // credential-named key is. Callers that walk a JSON tree pass the value;
+  // those that judge a header, env or query-parameter name have only strings.
+  if (IDENTIFIER_KEYS.has(normalized) && (value === null || typeof value !== "object")) return false;
   for (let i = 0; i < words.length; i += 1) {
     if (SENSITIVE_WORDS.has(words[i]!)) return true;
     // Qualified only: sensitive as part of a name, never as the whole of one.
