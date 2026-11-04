@@ -14,7 +14,7 @@ import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage
 import { loadRules } from "./rules.js";
 import { bindRepo, renderRepoBlock } from "../workspace/repo-binding.js";
 import { repoSkillsToList } from "../workspace/repo-skills.js";
-import { normalizeMcpConfigs } from "../clients/mcp-config.js";
+import { normalizeMcpConfigs, originsSendingPlaceholder } from "../clients/mcp-config.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
 import { HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
@@ -163,8 +163,10 @@ export class AgentEngine {
     // truthy, not `=== true`: a mark that is not a boolean is still a mark.
     const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
     // Marketplace and plugin servers are third parties' at URLs nobody vetted, so the requester's
-    // platform key fills their `<SAFE_API_KEY>` only on a host the operator trusts
-    // (MCP_PLATFORM_KEY_ALLOWED_HOSTS). A request's own servers are the requester's choice of where
+    // platform key fills their `<SAFE_API_KEY>` only where the operator trusts it: a host listed in
+    // MCP_PLATFORM_KEY_ALLOWED_HOSTS, or, in a run given the defaults, an origin the defaults file
+    // itself sends the key to (a plugin commonly ships the platform servers the defaults file mounts,
+    // under the same names, and replaces them). A request's own servers are the requester's choice of where
     // their own key goes. A `pinned_address` is the API's record of where it vetted a request's
     // server; one in a tool or plugin config is the author's, and would connect a trusted host name
     // to an address of their choosing, so it is dropped.
@@ -181,10 +183,14 @@ export class AgentEngine {
     const defaultMcp = Object.fromEntries(
       Object.entries(defaults?.mcpServers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name) && !Object.hasOwn(requestMcp, name)),
     );
+    const platformKeyHosts = new Set([
+      ...MCP_PLATFORM_KEY_ALLOWED_HOSTS,
+      ...originsSendingPlaceholder(defaults?.mcpServers ?? {}, "SAFE_API_KEY"),
+    ]);
     const mergedMcp = {
       ...normalizeMcpConfigs(defaultMcp, envOverrides, defaults?.mcpEnvAllow),
       ...normalizeMcpConfigs(requestMcp, envOverrides),
-      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, MCP_PLATFORM_KEY_ALLOWED_HOSTS),
+      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, platformKeyHosts),
     };
 
     const allSkills: Record<string, string> = {};

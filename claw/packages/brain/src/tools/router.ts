@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { HandsClient, withHandsTimeout, type ShellClassProbe } from "../clients/hands.js";
+import { HandsClient, withHandsTimeout, type ShellClassProbe, type ToolImage } from "../clients/hands.js";
 import { isSandboxTool, toolTimeoutCeilingSec } from "./hands.js";
 import { handleA2ACall } from "../clients/a2a.js";
 import { LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON } from "../tasks/abort-registry.js";
@@ -87,6 +87,7 @@ const BG_SHELL_DISABLED_MESSAGE =
 export type RouteOutcome = {
   isError: boolean;
   structured?: Record<string, unknown>;
+  images?: ToolImage[];
   /** A `deliver_file` that copied its file: what the terminal event tells the client. */
   delivery?: Delivery;
 };
@@ -557,6 +558,7 @@ export class ToolRouter {
         // here left every read, wait and kill answerable only by matching the
         // prose a later reword would change.
         outcome.structured = answered.structured as Record<string, unknown> | undefined;
+        outcome.images = answered.images;
       }
       const result = answered.text;
       if (name === "bash" && typeof input.command === "string") {
