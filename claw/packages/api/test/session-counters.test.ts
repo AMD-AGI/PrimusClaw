@@ -205,6 +205,19 @@ test("a create refused for claiming a server-managed key books neither outcome",
   }
 });
 
+test("a caller cannot supply the sealed keys either", async () => {
+  dbStub = stubDb();
+  const app = await ownedApp();
+  try {
+    const res = await post(app, { config: { sealed_credentials: "x" } });
+    assert.equal(res.statusCode, 400);
+    assert.equal(JSON.parse(res.body).error, "config.sealed_credentials is server-managed");
+    assert.equal(dbStub!.ran(/^INSERT INTO claw_sessions/), false);
+  } finally {
+    await app.close();
+  }
+});
+
 test("a delete that commits books one session deletion as ok", async () => {
   healthyPorts();
   sessionOwnedByCaller();

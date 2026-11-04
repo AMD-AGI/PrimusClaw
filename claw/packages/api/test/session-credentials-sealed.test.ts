@@ -10,6 +10,7 @@
  *   W1  a stamp seals the keys and removes the plain fields an older build wrote, keeping the rest of config
  *   B1  the backfill seals every stamped row that holds plain keys, leaves the others alone, and is idempotent
  *   B2  initDb runs the backfill
+ *   B3  a row whose config changed after the backfill read it is not overwritten, and the next run seals it
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -104,6 +105,28 @@ describe("sealed session credentials", { skip }, () => {
     }
     assert.equal(await raw("e"), untouched.e, "a row this service never stamped is not touched");
     assert.equal(await raw("f"), untouched.f, "a row already sealed is not rewritten");
+  });
+
+  test("B3 a row changed between the backfill's read and its write is left for the next run", async () => {
+    await seed("a", { platform_key: "pk-a", llm_api_key: "vk-a", _server_managed_credentials: true });
+    const client = await h.app.db.db.pool.connect();
+    try {
+      let raced = false;
+      const racing = {
+        query: async (text: string, params: unknown[]) => {
+          const r = await client.query(text, params);
+          if (!raced && /^\s*SELECT/.test(text)) {
+            raced = true;
+            await q(`UPDATE claw_sessions SET config = config || '{"platform_key": "pk-rotated"}'::jsonb WHERE session_id = 'a'`);
+          }
+          return r;
+        },
+      } as unknown as Parameters<typeof mod.sealPlaintextSessionCredentials>[0];
+      assert.equal(await mod.sealPlaintextSessionCredentials(racing), 0);
+      assert.equal((await config("a")).platform_key, "pk-rotated", "the newer write is not overwritten");
+      assert.equal(await mod.sealPlaintextSessionCredentials(client), 1);
+    } finally { client.release(); }
+    assert.deepEqual(mod.readTrustedSessionCredentials(await config("a")), { platformKey: "pk-rotated", llmApiKey: "vk-a" });
   });
 
   test("B2 initDb runs the backfill", async () => {
