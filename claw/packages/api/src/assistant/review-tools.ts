@@ -19,6 +19,9 @@
  * commit and every gate again.
  */
 import pino from "pino";
+import { IDENTITY_TOKEN_METHOD } from "../auth/identity-token.js";
+import type { UserInfo } from "../auth/models.js";
+import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { parsePrRef, type PrRef } from "../github-review/github.js";
 import { githubReviewService } from "../github-review/mcp.js";
@@ -27,11 +30,6 @@ import { db, inTransaction, type Querier } from "../infra/db.js";
 import { deterministicEventId, enqueue, kickDelivery } from "../notifications/outbox.js";
 import type { AssistantActionPayload } from "../notifications/assistant-events.js";
 import { decidedViaOf, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
-
-export { attendedTurn };
-import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
-import { IDENTITY_TOKEN_METHOD } from "../auth/identity-token.js";
-import type { UserInfo } from "../auth/models.js";
 import {
   confirmationOfStoppedReview, denyForStoppedReview, parseRestartRequest, parseReviewRequest, restartReview, ReviewItemRefused,
   reviewItemsEnabled, startReviews, syncReviewItemOfSession,
