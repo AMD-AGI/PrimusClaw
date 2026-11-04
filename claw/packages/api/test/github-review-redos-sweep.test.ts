@@ -9,9 +9,11 @@
  * pattern added later is timed too, whoever forgot to name it.
  *
  *   S1  the reader of the sources finds the literals it should and none of the divisions, strings and comments around them
- *   S2  the timing sees what it is for: the patterns that were super-linear (copied as they were) are over the bound
+ *   S2  the timing sees what it is for: the patterns that were super-linear (copied as they were) are over the bound, and their cost grows
+ *       faster than their line
  *   S3  every regular expression literal in `src/github-review` is under it, on lines at the longest a changed line is read, including lines
- *       that say the opening of the pattern over and over
+ *       that say the opening of the pattern over and over; or, where one `exec` was timed over it, its cost on every line timed over it grows
+ *       no faster than the line does, since a pause of a busy runner makes a pattern of a few microseconds look slow and never makes it grow
  *   S4  the entry points that read a repository's own text (`.github/claw-review.yml`, a `package.json` change) cost a bounded amount on the
  *       lines that were slow, and read what they read before
  *   S5  one `assessRisk` call on the most a pull request can make it read (500 lines at the cap) costs a bounded amount, whatever the lines
@@ -26,7 +28,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { assessRisk, parseRepoConfig, type RiskFile } from "../src/github-review/risk.js";
 import { MAX_LINE_CHARS, MAX_READ_CHARS } from "../src/github-review/risk-signals.js";
-import { regexLiterals, sampleStrings, worstCost } from "./support/regex-sweep.js";
+import { growth, regexLiterals, sampleStrings, worstCost } from "./support/regex-sweep.js";
 
 const SOURCES = new URL("../src/github-review/", import.meta.url);
 /** The longest a line is that a pattern of the rule pack reads, and the most lines of that length one change can make it read. */
@@ -43,6 +45,11 @@ const EXEC_BOUND_MS = CALL_BUDGET_MS / LINES_AT_CAP;
 /** The length and the bound the first sweep used, which the patterns it was written for are timed at (see S2). */
 const FORMER_LENGTH = 8000;
 const FORMER_BOUND_MS = 10;
+/**
+ * How many times as long a pattern may take on its slowest line as on that line at a quarter of the length (`growth`): a pattern linear in its
+ * line takes about 4 times as long and one that costs the square of it about 16, so this is the middle of the two by ratio, not a time.
+ */
+const GROWTH_BOUND = 8;
 /**
  * What the call on lines that nothing reads is held to, since the ratio above takes it as its unit and a slowdown that reaches every line
  * moves it as much as it moves what it is compared with. Both are timed in the same run, and neither goes through the rule pack's work on a line.
@@ -108,21 +115,47 @@ test("S2 the timing flags the patterns that were super-linear, written as they w
   ];
   for (const [source, flags, what, length, bound] of formerly) {
     const { ms, line } = worstCost(source, flags, length, bound);
-    assert.ok(ms > bound, `${what}: ${ms.toFixed(1)} ms is not over the bound of ${bound} ms (${line})`);
+    assert.ok(ms > bound, `${what}: ${ms.toFixed(1)} ms is not over the bound of ${bound} ms (${line.what})`);
+    // What S3 asks of a pattern that was timed over the bound, these answer as super-linear. Asked on the slowest of all the lines (found at
+    // a quarter of the length, where that costs a sixteenth), not on the first line over the bound: on a slow enough machine that one can be
+    // a line the pattern reads in linear time. Three rounds: they are far over it.
+    const slowest = worstCost(source, flags, length / 4).line;
+    const grew = growth(source, flags, slowest, length, 3);
+    assert.ok(grew.ratio > GROWTH_BOUND && grew.ms > bound, `${what}: ${grew.ratio.toFixed(1)} times as long at four times the length, ${grew.ms.toFixed(1)} ms (${slowest.what})`);
     const re = new RegExp(source, flags);
     const samples = sampleStrings(source);
     assert.ok(samples.some((x) => re.test(x)), `none of ${JSON.stringify(samples.slice(0, 3))} matches /${source}/`);
   }
 });
 
-test("S3 every regular expression literal in the module costs under the bound on a line at the longest a changed line is read, whatever the line repeats", () => {
+test("S3 every regular expression literal in the module costs under the bound on a line at the longest a changed line is read, or grows no faster than the line, whatever the line repeats", () => {
+  // The bound is a fraction of a millisecond, and a CI runner whose CPU is shared has once timed a pattern that costs 0.06 ms at 1.45 ms
+  // (in each of the three timings of its line). So a pattern over it is asked how its cost grows on each line it was over it on, a ratio
+  // of two times that the same pauses touch alike, and is slow only if it grows faster than the line: the defect the bound is there for is
+  // a pattern whose cost grows with the square of its line (S2), and such a pattern is over the bound in the first place and over
+  // GROWTH_BOUND as well, on the line that showed it, whichever line cost the most. It is still over the bound in the least of the rounds
+  // that measured its growth, which a pattern that only looked slow in one moment is not. A pattern whose cost is partly linear and partly
+  // super-linear can grow less than GROWTH_BOUND and still cost over the bound; it is slow when the part of its cost that grows faster
+  // than the line is over the bound by itself, a part that is nothing for a linear pattern however slow the machine is. That part is measured
+  // as backtracking makes it, growing with the square of the line or a higher power of it (see `growth`), not as a power between one and two.
   const slow: string[] = [];
   let timed = 0;
   for (const f of readdirSync(SOURCES).filter((n) => n.endsWith(".ts"))) {
     for (const r of regexLiterals(readFileSync(new URL(f, SOURCES), "utf8"))) {
-      const { ms, line } = worstCost(r.source, r.flags, MAX_LINE_CHARS);
+      const { over } = worstCost(r.source, r.flags, MAX_LINE_CHARS, Infinity, EXEC_BOUND_MS);
       timed += 1;
-      if (ms > EXEC_BOUND_MS) slow.push(`${f}:${r.line} /${r.source}/ ${ms.toFixed(2)} ms on ${line}`);
+      const isSlow = (g: { ratio: number; ms: number; excessMs: number }): boolean =>
+        (g.ratio > GROWTH_BOUND && g.ms > EXEC_BOUND_MS) || g.excessMs > EXEC_BOUND_MS;
+      for (const line of over) {
+        // Asked twice before it is called slow: a super-linear pattern is over both every time.
+        const grew = [growth(r.source, r.flags, line, MAX_LINE_CHARS)];
+        if (isSlow(grew[0]!)) grew.push(growth(r.source, r.flags, line, MAX_LINE_CHARS));
+        if (grew.every(isSlow)) {
+          const g = grew[grew.length - 1]!;
+          slow.push(`${f}:${r.line} /${r.source}/ ${g.ms.toFixed(2)} ms on ${line.what}, ${g.ratio.toFixed(1)} times as long as at a quarter of the length (${g.excessMs.toFixed(2)} ms of it super-linear)`);
+          break;
+        }
+      }
     }
   }
   assert.ok(timed > 120, `${timed} patterns timed`);
