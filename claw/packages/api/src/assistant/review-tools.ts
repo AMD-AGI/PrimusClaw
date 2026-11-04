@@ -118,16 +118,20 @@ export function mentionsNumber(text: string, n: number): boolean {
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** Whether the repository is one the person meant: named in the message, the channel's own, or one they reviewed in lately. */
+/**
+ * Whether the repository is one the person meant: named in the message, or, when the message names none, the one repository
+ * it can only be: the channel's own, or else the one they reviewed in lately. Two candidates and a bare number name neither.
+ */
 export function repoGrounded(text: string, pr: Pick<PrRef, "owner" | "repo">, channelRepos: readonly string[], recentRepos: readonly string[]): boolean {
   const full = lower(`${pr.owner}/${pr.repo}`);
-  if ([...channelRepos, ...recentRepos].some((r) => lower(r) === full)) return true;
   const t = lower(text);
   // The whole name, not the start of a longer one: `PrimusClaw` is not named by `PrimusClaw-fork`, `PrimusClaw.old` or `PrimusClaw..old`.
   // A bare name counts unless it is written under an owner (`other/PrimusClaw` names another owner's repository).
   const whole = (name: string, before: string) =>
     new RegExp(`(?<![${before}])${escapeRe(name)}(?![a-z0-9_-]|\\.+[a-z0-9_-])`).test(t);
-  return whole(full, "a-z0-9_.-") || whole(lower(pr.repo), "a-z0-9_./-");
+  if (whole(full, "a-z0-9_.-") || whole(lower(pr.repo), "a-z0-9_./-")) return true;
+  const candidates = new Set((channelRepos.length ? channelRepos : recentRepos).map(lower));
+  return candidates.size === 1 && candidates.has(full);
 }
 
 /**
@@ -377,6 +381,10 @@ export async function confirmationAnswer(
     // when they wrote. Saying no only makes less happen, so it needs neither.
     if (args.decision === "allow") {
       const waiting = await waitingWhenWritten(q, userId, message.receivedAt);
+      // A write held after they wrote is one they have not seen (a new head, a new hold): their yes was not about it.
+      if (!waiting.includes(pick.id)) {
+        refuseUngrounded("confirmation_after_message", `the write waiting on ${pick.repo}#${pick.pr} was held after the user's message: tell them, and let them answer it`);
+      }
       const only = waiting.length === 1 && waiting[0] === pick.id;
       const [owner = "", repo = ""] = pick.repo.split("/");
       const ref = { owner, repo, number: pick.pr };

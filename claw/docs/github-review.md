@@ -121,10 +121,11 @@ They act only for the person, never for a key or a report:
 - **Attended.** The turn must answer a message the route recorded as carried by an identity-provider token (the same reading as
   answering a held merge), received at most `CLAW_ASSISTANT_ATTENDED_TTL_SEC` (default 600) seconds before the tool is called.
   A turn started by a worker's report, or by a message sent with a key or a browser session, is refused (`not_attended`).
-- **Grounded.** A pull request's number must be in that message; its repository named there, listed by the channel
-  (`channel_context.repos`), or used by the user's recent reviews; a model named there; a reviewer the user themself or someone
-  the channel listed with a Claw `user_id` (`channel_context.people`); and a held write the user allows named by its number,
-  unless it was the only one waiting when they wrote.
+- **Grounded.** A pull request's number must be in that message; its repository named there, or, when the message names none,
+  the only repository it can be: the channel's own (`channel_context.repos`), else the one the user's recent reviews used (two
+  candidates and a bare number are refused, so the assistant asks); a model named there; a reviewer the user themself or someone
+  the channel listed with a Claw `user_id` (`channel_context.people`); and a held write the user allows already waiting when they
+  wrote, and named by its number unless it was the only one waiting.
 
 The review is then made by the same `startReviews` / `restartReview` as the routes above, with the person's message standing
 for their sign-in, so every check above applies unchanged.

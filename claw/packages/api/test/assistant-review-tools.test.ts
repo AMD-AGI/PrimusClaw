@@ -20,7 +20,7 @@
  *   S1  review_start hands across exactly what the user asked: prs, review only or merge, reviewer, model, who and which message
  *   S2  a pull request must be in the user's message, as a number of its own
  *   S2b a number written in full with its repository binds the two
- *   S3  a repository must be named, the channel's own, or one of the user's recent reviews
+ *   S3  a repository must be named, the channel's own, or one of the user's recent reviews; a bare number with two candidates names neither
  *   S3b a repository is named whole: not by a longer name that starts with it, nor under another owner
  *   S4  a reviewer is the user, or someone the channel listed with a Claw user id
  *   S5  a model must be named by the user
@@ -342,7 +342,7 @@ describe("assistant review tools", { skip }, () => {
     assert.deepEqual(rt.fullRefsIn("see a/b#1, https://github.com/C/D/pull/22 and e/f#333x"), ["a/b#1", "c/d#22", "e/f#333"]);
   });
 
-  test("S3 a repository must be named, the channel's own, or one of the user's recent reviews", async () => {
+  test("S3 a repository must be named, the channel's own, or one of the user's recent reviews; a bare number with two candidates names neither", async () => {
     const bare = { channel: "teams", channel_message_id: "a" };
     const none = await userTurn(alice, "审 254", { context: bare });
     assert.equal(await code(rt.reviewStart(none, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false })), "repo_not_grounded");
@@ -355,6 +355,17 @@ describe("assistant review tools", { skip }, () => {
     const recent = await userTurn(alice, "再审 30", { context: bare });
     await rt.reviewStart(recent, { prs: ["AMD-AGI/Primus-Turbo#30"], merge: false });
     assert.equal(calls.start.length, 2);
+    // Reviews in two repositories lately: "31" alone is in neither, whichever the model picks.
+    await reviewItem(alice, 2, { owner: "AMD-AGI", repo: "PrimusClaw", number: 13 });
+    const two = await userTurn(alice, "再审 31", { context: bare });
+    for (const pr of ["AMD-AGI/Primus-Turbo#31", "AMD-AGI/PrimusClaw#31"]) {
+      assert.equal(await code(rt.reviewStart(two, { prs: [pr], merge: false })), "repo_not_grounded", pr);
+    }
+    // The channel's one repository is the one meant, not another the user reviewed in.
+    const inChannel = await userTurn(alice, "再审 31", { context: { ...bare, repos: ["AMD-AGI/PrimusClaw"] } });
+    assert.equal(await code(rt.reviewStart(inChannel, { prs: ["AMD-AGI/Primus-Turbo#31"], merge: false })), "repo_not_grounded");
+    await rt.reviewStart(inChannel, { prs: ["AMD-AGI/PrimusClaw#31"], merge: false });
+    assert.equal(calls.start.length, 3);
   });
 
   test("S3b a repository is named whole: not by a longer name that starts with it, nor under another owner", async () => {
@@ -460,9 +471,13 @@ describe("assistant review tools", { skip }, () => {
     const onlyOne = await userTurn(alice, "可以合");
     await rt.confirmationAnswer(onlyOne, { decision: "allow" });
     assert.equal(calls.decide.length, 2);
-    // One asked after the user wrote is not what they answered.
+    // One asked after the user wrote is not what they answered, even when it is of the pull request they named.
     await w.q("UPDATE claw_github_confirmations SET created_at = NOW() + INTERVAL '1 minute' WHERE confirmation_id = $1", [c224]);
-    assert.equal(await code(rt.confirmationAnswer(onlyOne, { decision: "allow" })), "pr_not_in_message");
+    assert.equal(await code(rt.confirmationAnswer(onlyOne, { decision: "allow" })), "confirmation_after_message");
+    const namedBefore = await userTurn(alice, "224 可以合入");
+    assert.equal(await code(rt.confirmationAnswer(namedBefore, { decision: "allow" })), "confirmation_after_message");
+    assert.equal(await code(rt.confirmationAnswer(namedBefore, { decision: "allow", pr: "224" })), "confirmation_after_message");
+    assert.equal(calls.decide.length, 2);
     await w.q("UPDATE claw_github_confirmations SET created_at = NOW() - INTERVAL '1 minute' WHERE confirmation_id = $1", [c224]);
 
     // Two waited when the user wrote; one has gone since. "可以合" was not about the one left.
