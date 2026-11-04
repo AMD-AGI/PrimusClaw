@@ -64,6 +64,12 @@ export interface NotificationPayload {
   user_id: string;
   session_id: string;
   task_id: string;
+  /**
+   * Run events only: the chat message whose turn this run was (`null` for a run no chat message started).
+   * A client that sent the message and already showed the turn's answer can tell this run's end is that turn's
+   * by the id, not by when it ended: a run ends after its last answer, sometimes minutes after.
+   */
+  message_id?: string | null;
   trigger_id: string | null;
   title: string;
   summary: string;
@@ -108,7 +114,7 @@ export interface RunFinished {
 export async function recordRunFinished(input: RunFinished): Promise<number> {
   if (!input.taskIds.length) return 0;
   const rows = (await db.query(
-    `SELECT t.task_id, s.user_id, s.name, s.config->>'trigger_id' AS trigger_id,
+    `SELECT t.task_id, t.metadata->>'message_id' AS message_id, s.user_id, s.name, s.config->>'trigger_id' AS trigger_id,
             (s.config->'notify_on_finish' = 'true'::jsonb) AS notify_on_finish,
             COALESCE(t.completed_at, NOW()) AS finished_at,
             EXTRACT(EPOCH FROM (COALESCE(t.completed_at, NOW()) - COALESCE(t.started_at, t.created_at))) AS seconds
@@ -139,6 +145,7 @@ export async function recordRunFinished(input: RunFinished): Promise<number> {
       user_id: row.user_id,
       session_id: input.sessionId,
       task_id: row.task_id,
+      message_id: row.message_id || null,
       trigger_id: row.trigger_id ?? null,
       title: `${type === "run.failed" ? "Run failed" : "Run completed"}${name ? `: ${name}` : ""}`.slice(0, 200),
       summary: type === "run.failed" ? clipSummary(input.failureReason ?? "") : "",

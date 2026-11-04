@@ -34,7 +34,7 @@ describe("notification outbox", { skip }, () => {
   const deliver = () => outbox.deliverDue({ transport, resolve: pub, allowedHosts: new Set() });
   const makeDue = () => q("UPDATE claw_notification_outbox SET next_attempt_at = NOW() - interval '1 second' WHERE delivered_at IS NULL AND dropped_at IS NULL");
 
-  async function seedRun(opts: { sid: string; tid: string; owner?: string; trigger?: string; seconds?: number; notify?: unknown }) {
+  async function seedRun(opts: { sid: string; tid: string; owner?: string; trigger?: string; seconds?: number; notify?: unknown; messageId?: string }) {
     const cfg: Record<string, unknown> = opts.trigger ? { trigger_id: opts.trigger } : {};
     if (opts.notify !== undefined) cfg.notify_on_finish = opts.notify;
     await q(
@@ -42,9 +42,9 @@ describe("notification outbox", { skip }, () => {
       [opts.sid, opts.owner ?? "u1", JSON.stringify(cfg)],
     );
     await q(
-      `INSERT INTO claw_tasks (task_id, session_id, name, status, started_at, completed_at)
-       VALUES ($1, $2, 'run', 'completed', NOW() - make_interval(secs => $3), NOW()) ON CONFLICT DO NOTHING`,
-      [opts.tid, opts.sid, opts.seconds ?? 5],
+      `INSERT INTO claw_tasks (task_id, session_id, name, status, started_at, completed_at, metadata)
+       VALUES ($1, $2, 'run', 'completed', NOW() - make_interval(secs => $3), NOW(), $4::jsonb) ON CONFLICT DO NOTHING`,
+      [opts.tid, opts.sid, opts.seconds ?? 5, JSON.stringify(opts.messageId ? { message_id: opts.messageId } : {})],
     );
   }
   async function subscribe(owner = "u1", url = "https://hooks.example.com/claw", extra: Record<string, unknown> = {}) {
@@ -96,6 +96,20 @@ describe("notification outbox", { skip }, () => {
       assert.equal(trig.type, "run.completed");
       assert.equal(trig.user_id, "u1");
       assert.match(trig.link, /\/sessions\/s-trig$/);
+    });
+
+    test("a chat turn's run names the turn's message, so its sender can match the end to the answer it showed", async () => {
+      await subscribe();
+      await seedRun({ sid: "s-turn", tid: "t-turn", seconds: 120, notify: true, messageId: "claw-1793790955023" });
+      await seedRun({ sid: "s-trig", tid: "t-trig", trigger: "trg-1", seconds: 3 });
+      await outbox.recordRunFinished({ sessionId: "s-turn", taskIds: ["t-turn"], outcome: "completed" });
+      await outbox.recordRunFinished({ sessionId: "s-trig", taskIds: ["t-trig"], outcome: "failed", failureReason: "boom" });
+      const byTask = new Map((await rows()).map((r) => [r.payload.task_id, r.payload]));
+      assert.equal(byTask.get("t-turn").message_id, "claw-1793790955023");
+      assert.equal(byTask.get("t-trig").message_id, null, "a run no chat message started names none");
+      await deliver();
+      const delivered = sent.map((r) => JSON.parse(String(r.body))).find((b) => b.task_id === "t-turn");
+      assert.equal(delivered?.message_id, "claw-1793790955023", "the receiver is sent the id, not only the outbox row");
     });
 
     test("long_run requires the session's notify_on_finish opt-in", async () => {
