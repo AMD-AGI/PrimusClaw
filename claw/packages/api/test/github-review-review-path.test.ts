@@ -118,7 +118,7 @@ function recorder() {
 }
 
 async function envWith(env: Record<string, string> = {}) {
-  const e = await reviewEnv(env);
+  const e = await reviewEnv(env, { reviewed: false });
   const rec = recorder();
   const service = new GithubReview({
     settings: () => e.settings, db: e.db, fetchImpl: e.gh.fetch, logger: rec.logger,

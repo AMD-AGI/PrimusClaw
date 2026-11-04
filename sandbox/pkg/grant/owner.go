@@ -17,7 +17,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
@@ -355,7 +354,7 @@ func (s *Service) createOwner(ctx context.Context, name string, spec runtimev1al
 
 // updateOwner replaces the caps, templates, and user name of an owner record.
 func (s *Service) updateOwner(ctx context.Context, name string, want runtimev1alpha1.SandboxGrantSpec) error {
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := s.rewrite(name, func() error {
 		current, err := s.get(ctx, name)
 		if err != nil {
 			return err

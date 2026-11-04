@@ -343,15 +343,40 @@ export function applyPlatformKeyEnv(
   if (!kubernetesMode) env.SAFE_API_KEY = apiKey;
 }
 
-/** The variables a process in a sandbox reads a model or platform key from. */
-export const SANDBOX_KEY_ENV_NAMES: readonly string[] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SAFE_API_KEY"];
+/**
+ * The only variables a sandbox of a request marked `withhold_sandbox_keys` is given: the ones Brain sets itself for Hands to run (its
+ * token, the session, the port, the workspace, the platform URL and the topology handoff path). The session's model reads what strangers
+ * wrote and runs their code (a pull request's tests), and whatever the sandbox's environment holds that code can read: so nothing of any
+ * layer is kept by name of what it is not (the spec's env, the deployment's system env, the owner's variables, the request's own), because
+ * a deny list only knows the credentials someone thought of. Kubernetes mode adds the LLM base URLs after this.
+ */
+export const ACTING_SANDBOX_ENV_NAMES: ReadonlySet<string> = new Set([
+  "AUTH_CLAW_TOKEN",
+  "CLAW_SESSION_ID",
+  "MCP_PORT",
+  "WORKSPACE_PATH",
+  "SAFE_API_URL",
+  "TOPOLOGY_HANDOFF_FILE",
+]);
+
+/** Takes every variable that is not one of `ACTING_SANDBOX_ENV_NAMES` out of a sandbox's composed environment. */
+export function withholdSandboxEnv(env: Record<string, string>): void {
+  for (const name of Object.keys(env)) {
+    if (!ACTING_SANDBOX_ENV_NAMES.has(name)) delete env[name];
+  }
+}
+
+/** What a handle registered for this request records of its environment (`HandleInfo.withheld_env`). */
+export function handleEnvRecord(request: Pick<ExecuteRequest, "withhold_sandbox_keys">): { withheld_env?: true } {
+  return request.withhold_sandbox_keys === true ? { withheld_env: true } : {};
+}
 
 /**
- * Takes every key variable out of a sandbox's composed environment, whichever layer put it there (the spec's env, the system's, the
- * user's own variables, the request's). For a request marked `withhold_sandbox_keys`: the session's model reads what strangers wrote.
+ * Whether a registered handle may serve this request: one that withholds its sandbox's environment is served only by a sandbox built to
+ * withhold it.
  */
-export function withholdKeyEnv(env: Record<string, string>): void {
-  for (const name of SANDBOX_KEY_ENV_NAMES) delete env[name];
+export function handleServesEnvOf(info: { withheld_env?: boolean }, request: Pick<ExecuteRequest, "withhold_sandbox_keys">): boolean {
+  return request.withhold_sandbox_keys !== true || info.withheld_env === true;
 }
 
 /**
