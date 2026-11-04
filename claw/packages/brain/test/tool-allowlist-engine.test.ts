@@ -164,11 +164,12 @@ test("a requested review (sandbox_profile review) is held to its fixed list what
   world.llmBodies.length = 0;
   const hands = fakeHands();
   const mcpBefore = pw.mcpCalls.length;
+  const req = baseRequest({
+    session_id: uniqueSession(), plugin_id: 5, plugin_tools: [mcpRow(17, pw.mcpUrl)],
+    tools_allowlist: ["*"], sandbox_profile: "review", memory_enabled: true,
+  }) as Record<string, unknown>;
   await new AgentEngine().execute(
-    baseRequest({
-      session_id: uniqueSession(), plugin_id: 5, plugin_tools: [mcpRow(17, pw.mcpUrl)],
-      tools_allowlist: ["*"], sandbox_profile: "review", memory_enabled: true,
-    }),
+    req as never,
     (async () => {}) as never, undefined, null as never, { attachHands: async () => hands as never } as never,
   );
   const offered = ((JSON.parse(world.llmBodies[0]!) as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name).sort();
@@ -179,4 +180,6 @@ test("a requested review (sandbox_profile review) is held to its fixed list what
   assert.equal(hands.calls.some((c) => c.name === "write"), false, "the write was not run");
   assert.ok(refusalIn(world.llmBodies[1] ?? "", "write"), "the model was told it is not available");
   assert.equal(pw.mcpCalls.length, mcpBefore, "the plugin's server was not reached");
+  // The engine itself stripped the run to its profile before reading it: no plugin, no memory, and its sandbox holds no keys.
+  assert.deepEqual(["plugin_id" in req, "plugin_tools" in req, req.memory_enabled, req.withhold_sandbox_keys], [false, false, false, true]);
 });

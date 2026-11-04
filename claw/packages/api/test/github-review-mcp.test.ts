@@ -120,6 +120,11 @@ describe("A' who asked, for a review asked of the acting user", () => {
       [JSON.stringify({ acting_as: "u-bob", requested_by: { user_id: "u-bob", label: "Bob" } })]);
     assert.equal((await post(token({ sessionId: "s-3", requesterUserId: "u-bob" }))).status, 403);
     assert.equal((await post(token({ sessionId: "s-3", requesterUserId: "u-alice" }))).status, 200);
+    // One alice owns that names bob and claims carol asked: still alice's, so a token naming carol is refused.
+    await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-4', 'u-alice', $1::jsonb)",
+      [JSON.stringify({ acting_as: "u-bob", requested_by: { user_id: "u-carol", label: "Carol" }, sandbox_profile: "review" })]);
+    assert.equal((await post(token({ sessionId: "s-4", requesterUserId: "u-carol" }))).status, 403);
+    assert.equal((await post(token({ sessionId: "s-4", requesterUserId: "u-alice" }))).status, 200);
     assert.equal(e.gh.calls.length, 0);
   });
 });

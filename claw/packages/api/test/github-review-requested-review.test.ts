@@ -158,6 +158,7 @@ test("U1 who asked and whose profile it is, read from a stored config; the reque
   assert.equal(by.requesterOf({ user_id: "u-bob", config: REQUESTED }), "u-alice");
   assert.equal(by.requesterOf({ user_id: "u-alice", config: { acting_as: "u-bob", requested_by: { user_id: "u-bob" } } }), "u-alice", "owner is not the acting user: the owner");
   assert.equal(by.requesterOf({ user_id: "u-carol", config: REQUESTED }), "u-carol", "a session the reviewer does not own is its owner's");
+  assert.equal(by.requesterOf({ user_id: "u-alice", config: { ...REQUESTED, requested_by: { user_id: "u-carol" } } }), "u-alice", "whatever it says asked");
   assert.equal(by.requesterOf({ user_id: "u-bob", config: { acting_as: "u-bob" } }), "u-bob");
   assert.equal(by.requesterLabelOf(REQUESTED), "Alice A");
   assert.equal(by.requesterLabelOf({ acting_as: "u-bob", acting_as_requester: "Old Name" }), "Old Name", "older sessions keep their label");
