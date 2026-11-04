@@ -28,6 +28,7 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A review asked of someone else (`POST /v1/assistant/reviews` with `acting_as` naming another person) is that person's: their item, their session sealed with their own keys (brought as `x-acting-as-token` and `x-acting-as-api-key`), their quota; their delegation switch is asked at creation and before every queued turn; the session runs with a fixed review profile and, on SaFE, a sandbox in `SANDBOX_CPU_NAMESPACE` created with `useWorkspaceStorage: false`; the requester sees four facts only. `POST /v1/sessions` refuses `requested_by`, `sandbox_profile`, `requester_note` and, while the review items are on, `acting_as` naming anyone but the caller. New settings `CLAW_REVIEW_FOR_OTHERS_*`.
 - The assistant can watch a group chat or a repository and record what it would do there without doing it, behind
   `CLAW_ASSISTANT_OBSERVE` (default off; needs `CLAW_ASSISTANT_ENABLED`): `POST /v1/assistant/observations` hands one
   message of a place (`group:<channel>:<id>` or `repo:<owner>/<repo>`) to a watcher session of the caller's own, whose

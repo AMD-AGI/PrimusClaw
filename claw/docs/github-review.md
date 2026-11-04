@@ -109,6 +109,39 @@ review is done (accepted by policy); a write held for the requester themselves, 
 `expired`, `refused`), a merge refused by a gate, a failed turn or a turn that posted nothing needs them; a write held for
 someone else, or being made, is in progress; a denied one is done (stopped). A review session gets no worker report tool.
 
+### A review asked of someone else
+
+When `acting_as` names someone other than the caller (R asks X), the review is X's work, not R's: X's item on X's board, X's
+session sealed with X's own keys (so it runs on X's model quota), and R is recorded as who asked. The asking service sends X's
+credentials with the request: `x-acting-as-token` (X's delegated identity-provider token, from a client listed in both
+`CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` and `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS`, `sub` = `acting_as`) and
+`x-acting-as-api-key` (X's own `ak-` key, which SaFE must say is X's). Without them, or with anyone else's, nothing is made
+(`401 acting_as_credentials_required`, `invalid_acting_as_token`, `key_subject_mismatch`; `403 acting_as_mismatch`,
+`acting_as_not_delegated`, `service_client_not_allowed`).
+
+- X's switch that lets others act for them is asked of the identity service when the review is asked (`403 delegation_off`,
+  `actor_not_bound`, `credential_expired`; `503 delegation_unavailable`) and again before every queued turn of it. Turned off, the
+  review is not run, it goes to X as failed with the reason, and X's keys are removed from every open review others asked of X.
+- The session config carries `requested_by: {user_id, label}` and `sandbox_profile: "review"`, written only by the server;
+  `POST /v1/sessions` refuses both (and `requester_note`) as server-managed, and refuses `acting_as` naming anyone but the caller
+  (`403 acting_as_must_be_self`) while these routes exist. The review tools take `requested_by` as the requester only when the
+  session's owner is the acting user; for every other session the requester is the owner.
+- The session runs with a fixed profile: the review tools and the sandbox's file and shell tools, nothing else (no skills,
+  memory, triggers, stored variables, default or application MCP servers, `a2a_call`, `deliver_file`; no pattern or skill
+  evolution from it). Brain applies the same list again. Its sandbox is built in the deployment's existing CPU sandbox workspace
+  (`SANDBOX_CPU_NAMESPACE`), whatever the request names, without a GPU, and always with `useWorkspaceStorage: false`, so SaFE
+  mounts neither X's directory nor the workspace's volumes. A deployment without `SANDBOX_CPU_NAMESPACE` gives such a review no
+  sandbox tools.
+- X's review-agent limits (the deployment's defaults for every person for now): `CLAW_REVIEW_FOR_OTHERS_MAX_ACTIVE` (20) open
+  reviews others asked of X, `CLAW_REVIEW_FOR_OTHERS_PER_REQUESTER_MAX_ACTIVE` (10) of them per requester, both apart from X's
+  own item limit (`409 too_many_active_items` with `data.scope` `reviewer` or `requester`); `CLAW_REVIEW_FOR_OTHERS_TURNS_PER_ITEM`
+  (200) model turns per review and `CLAW_REVIEW_FOR_OTHERS_TURNS_PER_DAY` (2000) for all of them per UTC day.
+- `requester_note` (up to 2000 characters) is quoted after the first message as untrusted text that cannot change merging, the
+  model or the pull request; a body naming `requested_by` or `sandbox_profile` is a 400.
+- R is answered without the session's ids, may stop the review and read it, and sees four facts only on every answer
+  (`{status, pr_url, verdict, merged}`, frozen into `params.requester_view` when the item closes). Restart and accept are X's
+  (404 for R), and R cannot send a turn into X's session.
+
 ## The tools
 
 | Tool | What it does |
