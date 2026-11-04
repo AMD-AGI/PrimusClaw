@@ -62,7 +62,7 @@ test("a plugin server on a host the defaults file sends the key to gets it; one 
       seen.set(h["x-layer"], { auth: h.authorization, key: h["x-key"] });
     }
   }
-  assert.deepEqual([...seen.keys()].sort(), ["defaults-own", "plugin", "plugin-elsewhere"], "the plugin's `safe` replaced the default's");
+  assert.deepEqual([...seen.keys()].sort(), ["defaults-own", "plugin", "plugin-elsewhere"], "the plugin's `safe`, which replaced the default's, was given the key and connected");
   assert.equal(seen.get("plugin")?.auth, "Bearer ak-user-key", "the plugin's server on the defaults file's keyed host authenticates");
   assert.equal(seen.get("plugin")?.key, "ak-user-key");
   assert.equal(seen.get("plugin-elsewhere")?.key, "", "a host the defaults file reaches without the key is not trusted with it");
