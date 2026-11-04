@@ -72,7 +72,7 @@ const FORGET_REQUEST = [
   new RegExp(`${ZH_PLEASE}(?:(?:(?:把|将).{0,20}?)?${MEMORY_ZH}.{0,10}?${ERASE_ZH}|${ERASE_ZH}.{0,20}${MEMORY_ZH})`),
 ];
 // The entry by its number: "#3", "memory 3", "记忆 #3", "第3条"; a bare number ("delete 3 files") is not a reference.
-const ENTRY_NUMBER = /#\s*(\d+)|(?:memory|note|entry|记忆|条目)\s*#?\s*(\d+)|第\s*(\d+)\s*条/gi;
+const ENTRY_NUMBER = /#\s*(\d+)|(?:memory|note|entry|记忆|条目)[\s#]*(\d+)|第\s*(\d+)\s*条/gi;
 
 /**
  * Whether a quote asks to forget or undo this entry: one of its clauses is an instruction to forget (see
@@ -81,7 +81,7 @@ const ENTRY_NUMBER = /#\s*(\d+)|(?:memory|note|entry|记忆|条目)\s*#?\s*(\d+)
  */
 export function quoteAsksToForget(quote: string, id: number, entry: string): boolean {
   // The entry must be named in the instruction itself: "Forget my password: I use vim." asks nothing about vim.
-  return quote.normalize("NFKC").replace(/[’‘]/g, "'").split(/\s*[.!?;:,\n。！？；：，、]+\s*/).some((clause) => {
+  return quote.normalize("NFKC").replace(/[’‘]/g, "'").split(/[.!?;:,\n。！？；：，、]+/).map((c) => c.trim()).some((clause) => {
     if (!FORGET_REQUEST.some((r) => r.test(clause))) return false;
     const numbers = [...clause.matchAll(ENTRY_NUMBER)].map((m) => m[1] ?? m[2] ?? m[3]);
     return numbers.includes(String(id)) || quoteSupports(clause, entry);
