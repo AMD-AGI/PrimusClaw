@@ -157,11 +157,14 @@ describe("assistant review continuation", { skip }, () => {
     const [brief] = await w.pending(second.session_id);
     assert.match(brief.content, /^Review https:\/\/github\.com\/AMD-AGI\/demo\/pull\/7\. Review only/, "the brief first, as it was");
     assert.match(brief.content, /This is a re-review of AMD-AGI\/demo#7\. The last review \(item #1\) was of head 111111111111, verdict REQUEST_CHANGES/);
-    assert.match(brief.content, /- src\/app\.ts:3 \(thread PRRT_1\): c_bad is wrong\n- src\/app\.ts:4 \(thread PRRT_2\): d_bad is wrong/);
+    assert.match(brief.content, /Open findings of the last review:\n- src\/app\.ts:3 \(thread PRRT_1\)\n- src\/app\.ts:4 \(thread PRRT_2\)$/);
+    // The first message is queued with the person's proof: what the last review's model wrote is not put into it.
+    assert.doesNotMatch(brief.content, /is wrong/);
     assert.equal(item2.params.brief, done1.params.brief, "the stored brief is not nested with the continuation");
 
     const o2 = (await service.getPr(actor(second.session_id), { pr: PR_REF })).body as any;
     assert.deepEqual([o2.continuation.scope, o2.continuation.since_head_sha, o2.continuation.findings.map((f: any) => f.thread_id)], ["delta", HEAD, ["PRRT_1", "PRRT_2"]]);
+    assert.deepEqual(o2.untrusted.previous_findings.map((f: any) => f.note), ["c_bad is wrong", "d_bad is wrong"], "what they said, as data");
     const diff = o2.untrusted.diff as string;
     assert.match(diff, /\+e_new_bug/, "the new issue is in what is read");
     assert.match(diff, /-c_bad\n\+c_good/, "and so is the fix to check");

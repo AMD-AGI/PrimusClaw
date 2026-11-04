@@ -105,8 +105,10 @@ describe("N recording and scope", () => {
     const o = await overview();
     assert.deepEqual(o.continuation, {
       since_head_sha: OLD, scope: "delta", reason: "small_delta", evidence: [], delta_files: ["src/app.ts"],
-      findings: [{ path: "src/app.ts", line: 3, thread_id: "PRRT_1", resolved: false, note: "c is wrong" }],
+      findings: [{ path: "src/app.ts", line: 3, thread_id: "PRRT_1", resolved: false }],
     });
+    // What a finding said was written by a model that read the pull request: it is data, under `untrusted`, never beside the instructions.
+    assert.deepEqual(o.untrusted.previous_findings, [{ thread_id: "PRRT_1", path: "src/app.ts", line: 3, note: "c is wrong" }]);
     assert.match(o.how_to_read, /^This is a re-review of only what changed since 222222222222: `files` and `diff` hold that change/);
     assert.match(o.how_to_read, /gh_thread_resolve/);
     assert.equal(e.gh.count(/\/compare\//, "GET"), 1, "one compare of the two heads");
@@ -165,6 +167,7 @@ describe("N recording and scope", () => {
     await env({ continued: false });
     const o = await overview();
     assert.equal(o.continuation, undefined);
+    assert.equal(o.untrusted.previous_findings, undefined);
     assert.doesNotMatch(o.how_to_read, /re-review/);
     assert.equal(e.gh.count(/\/compare\//), 0);
   });

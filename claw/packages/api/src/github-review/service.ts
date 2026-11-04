@@ -205,6 +205,8 @@ interface ReviewRead {
   reviewPathReason: string;
   /** `how_to_read` of the overview: the deep review's sandbox path reads the diff from its checkout instead of in pages. */
   howToRead: string;
+  /** A re-review's findings of the last review with their notes: words a model wrote after reading the pull request, so under `untrusted`. */
+  previousNotes?: Array<{ thread_id: string | null; path: string; line: number; note: string }>;
 }
 
 /** Most files GitHub lists in one compare; a compare with this many may have been cut, so it is read as a large change. */
@@ -443,6 +445,7 @@ export class GithubReview {
       readId, pr, files: shown, overview: { ...overview, read_id: readId }, instructions: instructions.text, conversation,
       riskReasons: risk.evidence.map((e) => `evidence: ${e}`), reviewPath: choice.path, reviewPathReason: choice.reason,
       howToRead: continuation && scope ? `${this.continuationHowTo(continuation, scope)} ${howToRead}` : howToRead,
+      ...(continuation ? { previousNotes: continuation.findings.map((f) => ({ thread_id: f.thread_id, path: f.path, line: f.line, note: ctx.client.redact(f.note) })) } : {}),
     };
   }
 
@@ -479,8 +482,8 @@ export class GithubReview {
     return {
       since_head_sha: c.sinceHeadSha, scope: scope.scope, reason: scope.reason, evidence: scope.evidence,
       delta_files: scope.scope === "full" ? [] : scope.files.map((f) => f.path),
-      // The last review's own findings, as this deployment posted and recorded them; the notes are its words, data like the rest.
-      findings: c.findings.map((f) => ({ path: f.path, line: f.line, thread_id: f.thread_id, resolved: f.resolved, note: f.note })),
+      // The last review's findings as this deployment recorded them; what each said is under `untrusted.previous_findings`.
+      findings: c.findings.map((f) => ({ path: f.path, line: f.line, thread_id: f.thread_id, resolved: f.resolved })),
     };
   }
 
@@ -500,7 +503,8 @@ export class GithubReview {
   private overviewBody(read: ReviewRead, file: string | null, inline: Inline, redact: (t: string) => string): Record<string, unknown> {
     const sections = Object.fromEntries(PAGED_SECTIONS.map((s) => [s, { chars: this.sectionText(read, s, file, redact).length, inline: s in inline }]));
     const untrusted = { title: clip(read.pr.title, 300), ...(inline.files !== undefined ? { files: inline.files } : {}),
-      ...(inline.conversation !== undefined ? { conversation: inline.conversation } : {}), ...(inline.diff !== undefined ? { diff: inline.diff } : {}) };
+      ...(inline.conversation !== undefined ? { conversation: inline.conversation } : {}), ...(inline.diff !== undefined ? { diff: inline.diff } : {}),
+      ...(read.previousNotes?.length ? { previous_findings: read.previousNotes } : {}) };
     return {
       ...read.overview, how_to_read: read.howToRead, sections,
       ...(inline.instructions !== undefined ? { review_instructions: inline.instructions } : {}),
