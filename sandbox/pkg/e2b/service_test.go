@@ -236,7 +236,7 @@ func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 				t.Fatalf("create=%v", err)
 			}
 			_, _, err = svc.Create(context.Background(), keys["measurement"], body)
-			if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" || !strings.HasPrefix(oe.Detail, "sbx-") || strings.Contains(oe.Detail, " ") {
+			if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" || !strings.HasPrefix(oe.Detail, "sbx-") || !strings.Contains(oe.Detail, ": "+tc.reason) || !strings.Contains(oe.Detail, tc.want) {
 				t.Fatalf("replay=%v", err)
 			}
 		})
@@ -260,7 +260,7 @@ func TestReplayThatEndsTheRefKeepsTheReason(t *testing.T) {
 	awaitStarted(t, runner.started, done)
 	_, _, err := svc.Create(context.Background(), keys["measurement"], body)
 	var oe *grant.OpError
-	if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" {
+	if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" || !strings.HasPrefix(oe.Detail, "sbx-") || !strings.Contains(oe.Detail, failure) {
 		t.Fatalf("replay=%v", err)
 	}
 	refs, err := svc.grants.ListRoleSandboxes(context.Background(), "gr-01jb7m9k2x", "measurement")
