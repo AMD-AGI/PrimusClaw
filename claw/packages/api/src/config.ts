@@ -416,6 +416,8 @@ export const S3_API_ENDPOINT = env("S3_API_ENDPOINT") || S3_ENDPOINT;
 // --- Upload TTL sweeper (S3 `.uploads/` per-session cleanup) ---
 // TTL for per-session upload artifacts in days. 0 disables the sweeper.
 export const UPLOAD_TTL_DAYS = envInt("UPLOAD_TTL_DAYS", 7);
+/** How long the download of a file the agent delivered (`deliver_file`) keeps working, counted from the delivery. */
+export const DELIVERY_TTL_DAYS = envInt("DELIVERY_TTL_DAYS", 7, { min: 1 });
 // Sweep cadence in minutes.
 export const UPLOAD_SWEEP_INTERVAL_MIN = envInt("UPLOAD_SWEEP_INTERVAL_MIN", 60);
 
@@ -503,6 +505,10 @@ export const CLAW_REMOTE_AGENTS_RETENTION_DAYS = envInt("CLAW_REMOTE_AGENTS_RETE
 // When false: no tables, no routes, no MCP server offered to a session, and a session
 // that asks for `config.acting_as` is refused. See docs/github-review.md.
 export const CLAW_GITHUB_REVIEW_ENABLED = envBool("CLAW_GITHUB_REVIEW_ENABLED", false);
+
+// --- GitHub tools for every session whose owner stored a GH_TOKEN (default OFF) ---
+// When false: no route, and no `github` MCP server is offered to a session. See claw/docs/github-mcp.md.
+export const CLAW_GITHUB_MCP_ENABLED = envBool("CLAW_GITHUB_MCP_ENABLED", false);
 
 /**
  * How a connector's access token is checked (see auth/connector-token.ts). Read

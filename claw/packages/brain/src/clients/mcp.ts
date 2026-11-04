@@ -13,6 +13,90 @@ import { Agent, fetch as undiciFetch } from "undici";
 
 const logger = pino({ name: "mcp-clients" });
 
+/** A content block of a tool result or a resource read, as the server sent it. */
+interface McpContentBlock {
+  type?: string;
+  text?: string;
+  data?: string;
+  mimeType?: string;
+  uri?: string;
+  name?: string;
+  blob?: string;
+  resource?: McpContentBlock;
+}
+
+function base64Bytes(b64: string): number {
+  const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((b64.length * 3) / 4) - padding);
+}
+
+/** A resource's contents (a `resources/read` entry, or the `resource` of an embedded block). */
+function renderResourceContents(r: McpContentBlock): string {
+  const uri = r.uri ?? "(no uri)";
+  if (typeof r.text === "string") return `[resource ${uri}]\n${r.text}`;
+  const size = typeof r.blob === "string" ? `, ${base64Bytes(r.blob)} bytes` : "";
+  return `[resource ${uri} (${r.mimeType ?? "binary"}${size}): binary content, not shown]`;
+}
+
+/**
+ * What the model reads of an MCP result: every block, in order. Text as it is;
+ * anything else as one line that says what it was, so an image, an embedded
+ * resource or a link is never turned into an empty answer. With no blocks at
+ * all, the result's `structuredContent`, if any.
+ */
+export function renderMcpContent(blocks: unknown, structured?: unknown): string {
+  const parts: string[] = [];
+  for (const b of Array.isArray(blocks) ? (blocks as McpContentBlock[]) : []) {
+    if (!b || typeof b !== "object") continue;
+    switch (b.type) {
+      case "text":
+        if (b.text) parts.push(b.text);
+        break;
+      case "image":
+      case "audio": {
+        const size = typeof b.data === "string" ? `, ${base64Bytes(b.data)} bytes` : "";
+        parts.push(`[${b.type} (${b.mimeType ?? "unknown type"}${size}): not shown, this result is passed on as text only]`);
+        break;
+      }
+      case "resource":
+        parts.push(b.resource && typeof b.resource === "object" ? renderResourceContents(b.resource) : "[resource: empty]");
+        break;
+      case "resource_link":
+        parts.push(`[resource link ${b.uri ?? "(no uri)"}${b.name ? ` "${b.name}"` : ""}${b.mimeType ? ` (${b.mimeType})` : ""}]`);
+        break;
+      default:
+        parts.push(`[${String(b.type ?? "unknown")} content: not shown]`);
+    }
+  }
+  if (parts.length === 0 && structured !== undefined && structured !== null) return JSON.stringify(structured);
+  return parts.join("\n");
+}
+
+/**
+ * The two tools through which the model reaches a server's resources, offered
+ * for a server that declares the `resources` capability under the server's own
+ * prefix (`mcp__<server>__list_resources`), so a server's `requires_approval` /
+ * `auto_approve` name them like any other of its tools. A server that has a tool
+ * of the same name keeps its own.
+ */
+const LIST_RESOURCES = "list_resources";
+const READ_RESOURCE = "read_resource";
+
+function resourceToolSchemas(server: string): Array<{ name: string; description: string; input_schema: Record<string, unknown> }> {
+  return [
+    {
+      name: LIST_RESOURCES,
+      description: `[${server}] List the resources this server offers (uri, name, description, type). Pass the returned next_cursor to see more.`,
+      input_schema: { type: "object", properties: { cursor: { type: "string", description: "next_cursor from the previous page" } } },
+    },
+    {
+      name: READ_RESOURCE,
+      description: `[${server}] Read one resource of this server by its uri.`,
+      input_schema: { type: "object", properties: { uri: { type: "string" } }, required: ["uri"] },
+    },
+  ];
+}
+
 interface McpClientWrapper {
   callTool: (name: string, args: Record<string, unknown>) => Promise<string>;
   listTools: () => Promise<ToolSchema[]>;
@@ -113,18 +197,45 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
 
   logger.info({ name, url, type: effectiveType }, "mcp_client.connected");
 
+  // Filled by listTools: the resource tools this server is offered (none for a
+  // server without resources, or whose own tools have those names).
+  const resourceTools = new Set<string>();
+
   return {
     async callTool(toolName: string, args: Record<string, unknown>): Promise<string> {
+      if (resourceTools.has(toolName)) {
+        if (toolName === LIST_RESOURCES) {
+          const cursor = typeof args.cursor === "string" && args.cursor ? args.cursor : undefined;
+          const page = await client.listResources(cursor ? { cursor } : {});
+          return JSON.stringify({
+            resources: page.resources.map((r) => ({ uri: r.uri, name: r.name, description: r.description, mimeType: r.mimeType })),
+            ...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),
+          });
+        }
+        if (typeof args.uri !== "string" || !args.uri) throw new Error("read_resource needs a uri");
+        const read = await client.readResource({ uri: args.uri });
+        return read.contents.map((c) => renderResourceContents(c as McpContentBlock)).join("\n");
+      }
       const result = await client.callTool({ name: toolName, arguments: args });
-      return mcpContentText(result.content);
+      return renderMcpContent(result.content, result.structuredContent);
     },
     async listTools(): Promise<ToolSchema[]> {
       const result = await client.listTools();
-      return result.tools.map((t) => ({
-        name: `mcp__${name}__${t.name}`,
+      const own = new Set(result.tools.map((t) => t.name));
+      const tools = result.tools.map((t) => ({
+        name: t.name,
         description: t.description || `[${name}] ${t.name}`,
         input_schema: (t.inputSchema as Record<string, unknown>) || { type: "object", properties: {} },
       }));
+      resourceTools.clear();
+      if (client.getServerCapabilities()?.resources) {
+        for (const t of resourceToolSchemas(name)) {
+          if (own.has(t.name)) continue;
+          resourceTools.add(t.name);
+          tools.push(t);
+        }
+      }
+      return tools.map((t) => ({ ...t, name: `mcp__${name}__${t.name}` }));
     },
     async close() {
       try { await client.close(); } catch { /* ignore */ }

@@ -31,6 +31,7 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 /** Which module exports each `register*Routes` that `index.ts` calls on the app. */
 const REGISTRARS: Record<string, string> = {
   registerSessionRoutes: "routes/sessions.js",
+  registerSessionDeliveryRoutes: "routes/session-deliveries.js",
   registerEventRoutes: "routes/events.js",
   registerAnthropicManagedAgentsRoutes: "routes/anthropic-managed-agents.js",
   registerAdminRoutes: "routes/admin.js",
@@ -45,6 +46,7 @@ const REGISTRARS: Record<string, string> = {
   registerAssistantMcpRoutes: "assistant/mcp.js",
   registerTriggerMcpRoutes: "triggers/mcp.js",
   registerGithubReviewRoutes: "github-review/mcp.js",
+  registerGithubMcpRoutes: "github-mcp/mcp.js",
   registerAnswerFeedbackRoutes: "routes/answer-feedback.js",
   registerImageRoutes: "routes/images.js",
   registerSystemEnvVarRoutes: "routes/system-env-vars.js",

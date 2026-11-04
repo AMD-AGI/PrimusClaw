@@ -19,6 +19,7 @@ import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
+import { registerSessionDeliveryRoutes } from "./routes/session-deliveries.js";
 import { registerAnswerFeedbackRoutes } from "./routes/answer-feedback.js";
 import { registerImageRoutes } from "./routes/images.js";
 import { registerEventRoutes } from "./routes/events.js";
@@ -45,6 +46,8 @@ import { registerSandboxAdminRoutes } from "./routes/sandbox-admin.js";
 import { registerTerminalRoutes } from "./routes/terminal.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
 import { registerGithubReviewRoutes } from "./github-review/mcp.js";
+import { registerGithubMcpRoutes } from "./github-mcp/mcp.js";
+import { githubMcpConfigErrors, readGithubMcpSettings } from "./github-mcp/settings.js";
 import { githubReviewConfigErrors, readGithubReviewSettings } from "./github-review/settings.js";
 import { identityClient } from "./auth/identity.js";
 import { identityTokenSettings } from "./auth/identity-token.js";
@@ -175,6 +178,14 @@ function assertGithubReviewConfig(): void {
   throw new Error(`CLAW_GITHUB_REVIEW_ENABLED is true but GitHub review cannot be offered: ${errors.join("; ")}`);
 }
 
+/** Refuse to serve the GitHub tools without the secret that signs their token. */
+function assertGithubMcpConfig(): void {
+  const errors = githubMcpConfigErrors(readGithubMcpSettings());
+  if (errors.length === 0) return;
+  logger.error({ errors }, "startup.github_mcp_refused");
+  throw new Error(`CLAW_GITHUB_MCP_ENABLED is true but the GitHub tools cannot be offered: ${errors.join("; ")}`);
+}
+
 async function main() {
   validateStartupConfig();
   assertNoSharedIdentityBypass();
@@ -190,6 +201,7 @@ async function main() {
   startIdentityClient(logger);
   // Off unless CLAW_GITHUB_REVIEW_ENABLED. A deployment that asked for it and cannot offer its gates does not start.
   assertGithubReviewConfig();
+  assertGithubMcpConfig();
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
   // not a runtime surprise on the first PUT /v1/users/me/env-vars/* call.
@@ -299,6 +311,7 @@ async function main() {
   app.addHook("preHandler", authMiddleware);
 
   await registerSessionRoutes(app);
+  await registerSessionDeliveryRoutes(app);
   await registerAnswerFeedbackRoutes(app);
   await registerImageRoutes(app);
   await registerEventRoutes(app);
@@ -319,6 +332,8 @@ async function main() {
   await registerTriggerMcpRoutes(app);
   // Off unless CLAW_GITHUB_REVIEW_ENABLED: nothing is registered otherwise.
   await registerGithubReviewRoutes(app);
+  // Off unless CLAW_GITHUB_MCP_ENABLED: nothing is registered otherwise.
+  await registerGithubMcpRoutes(app);
   await registerSystemEnvVarRoutes(app);
   await registerSandboxAdminRoutes(app);
   await registerTerminalRoutes(app);

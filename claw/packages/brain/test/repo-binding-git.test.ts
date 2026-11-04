@@ -723,7 +723,8 @@ test("GB5 a background clone that finishes is not stopped", async () => {
   assert.ok(!s.tools.includes("kill_shell"), s.tools.join());
 });
 
-for (const shellClass of ["lost", "ended_unreaped"] as const) {
+// `lost`: the group may still be running and has recorded no exit, so it is waited for.
+for (const shellClass of ["lost"] as const) {
   test(`GB6 a background clone whose wait does not block (${shellClass}) is asked again only after a pause`, async () => {
     const s = sandbox(`gb6-${shellClass}`);
     const asked: number[] = [];
@@ -756,3 +757,83 @@ for (const shellClass of ["lost", "ended_unreaped"] as const) {
     assert.deepEqual(kills, ["sh-1"]);
   });
 }
+
+/**
+ * A Hands that restarted while the clone ran: every wait answers at once with the
+ * class it now gives the shell (`lost` while the group may live, `ended_unreaped`
+ * once it is gone), never `finished`. `runAt` is the wait before which the command
+ * really runs to its end (0: before the first wait, i.e. before the restart; null:
+ * never). The fourth wait answers an error, so a loop that does not decide ends red
+ * at once instead of waiting out the 900s deadline.
+ */
+function restartedHands(s: Sandbox, classAt: (wait: number) => "lost" | "ended_unreaped", runAt: number | null) {
+  const waits: number[] = [];
+  const kills: unknown[] = [];
+  let command = "";
+  const hands = {
+    async callToolFull(name: string, args: Record<string, unknown>) {
+      if (name === "bash" && args.run_in_background === true) {
+        command = String(args.command);
+        return { text: "Started background shell sh-1.", isError: false, structured: { shell_id: "sh-1" } };
+      }
+      if (name === "wait") {
+        waits.push(performance.now());
+        if (runAt !== null && waits.length === runAt + 1) await s.hands.callToolFull("bash", { command });
+        if (waits.length > 3) return { text: "Error: the sandbox went away", isError: true };
+        const shellClass = classAt(waits.length);
+        return {
+          text: `Shell sh-1 is ${shellClass}; nothing was waited for`, isError: false,
+          structured: { shell_id: "sh-1", shell_class: shellClass, blocking: false, finished: false, status: null, exit_code: null, waited_sec: 0 },
+        };
+      }
+      if (name === "kill_shell") { kills.push(args.shell_id); return { text: "killed", isError: false }; }
+      return s.hands.callToolFull(name, args);
+    },
+  };
+  return { hands, waits, kills };
+}
+
+for (const shellClass of ["lost", "ended_unreaped"] as const) {
+  test(`GB7 a clone that finished before Hands restarted (${shellClass}) is taken as done at once and not stopped`, async () => {
+    const s = sandbox(`gb7-${shellClass}`);
+    const h = restartedHands(s, () => shellClass, 0);
+    const b = await bindRepo(h.hands, { url: REPO_URL }, { root: s.root, stateDir: s.state, background: true });
+    assert.equal(b.state, "cloned", JSON.stringify(b));
+    assert.equal(fs.readFileSync(path.join(b.path, "README.md"), "utf8"), "# example\n");
+    assert.equal(h.waits.length, 1, "the clone's own exit record was not read on the first answer");
+    assert.deepEqual(h.kills, [], "a clone that had finished was stopped");
+    assert.deepEqual(fs.readdirSync(s.state).filter((f) => f.startsWith(".claw-repo-exit-")), [], "the exit record is left behind");
+  });
+}
+
+test("GB8 a clone that failed before Hands restarted fails at once with its exit status, and is not stopped", async () => {
+  const s = sandbox("gb8");
+  const h = restartedHands(s, () => "ended_unreaped", 0);
+  const b = await bindRepo(h.hands, { url: `${URL_BASE}/missing.git` }, { root: s.root, stateDir: s.state, background: true });
+  assert.equal(b.state, "failed");
+  assert.match(b.failure ?? "", /git clone of .* failed: .*exited with status 128 while Hands had lost track of it/);
+  assert.equal(h.waits.length, 1);
+  assert.deepEqual(h.kills, []);
+  assert.deepEqual(fs.readdirSync(s.root), [], "the failed clone cleaned up after itself");
+});
+
+test("GB9 a clone still running when Hands restarted is waited for, and taken as done once it records its exit", async () => {
+  const s = sandbox("gb9");
+  // Runs to its end before the third wait; until then nothing says it ended, and the group may live.
+  const h = restartedHands(s, () => "lost", 2);
+  const b = await bindRepo(h.hands, { url: REPO_URL }, { root: s.root, stateDir: s.state, background: true });
+  assert.equal(b.state, "cloned", JSON.stringify(b));
+  assert.equal(h.waits.length, 3, "a lost clone with no exit record was given up on instead of waited for");
+  for (let i = 1; i < h.waits.length; i++) assert.ok(h.waits[i] - h.waits[i - 1] >= BACKGROUND_REPOLL_MS - 50);
+  assert.deepEqual(h.kills, []);
+});
+
+test("GB10 a clone whose process group is gone without an exit record was stopped: a clear failure at once, nothing killed", async () => {
+  const s = sandbox("gb10");
+  const h = restartedHands(s, () => "ended_unreaped", null);
+  const b = await bindRepo(h.hands, { url: REPO_URL }, { root: s.root, stateDir: s.state, background: true });
+  assert.equal(b.state, "failed");
+  assert.match(b.failure ?? "", /ended without recording an exit status/);
+  assert.equal(h.waits.length, 1);
+  assert.deepEqual(h.kills, []);
+});

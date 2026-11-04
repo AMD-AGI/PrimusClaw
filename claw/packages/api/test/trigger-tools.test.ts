@@ -284,7 +284,7 @@ describe("trigger tools", { skip }, () => {
     await w.q("DELETE FROM claw_pending_messages");
 
     // The worker session's key is gone (revoked, or never stamped), so the firing fails and pauses.
-    await w.q("UPDATE claw_sessions SET config = config || '{\"platform_key\": null}'::jsonb WHERE session_id = $1", [item.workerSid]);
+    await w.q("UPDATE claw_sessions SET config = config - 'sealed_credentials' WHERE session_id = $1", [item.workerSid]);
     await makeDue(id, "2026-10-27T00:00:00Z");
     await sched.tickTriggers(new Date("2026-10-27T00:00:30Z"));
     assert.equal((await trig(id)).paused_reason, "credential_invalid");
