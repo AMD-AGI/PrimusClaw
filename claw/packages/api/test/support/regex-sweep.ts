@@ -177,6 +177,13 @@ function seedOf(text: string): number {
   return h >>> 0;
 }
 
+/**
+ * The longest a sample string is. A pattern whose shortest match is longer than this has no sample and so no line of the sweep, which the
+ * sweep test fails on (a pattern it read on no line is not a pattern it found cheap); and the lines of the sweep are at least twice this
+ * long (`workOf`), so that at least half of each is the part it repeats.
+ */
+export const SAMPLE_MAX = 120;
+
 /** Up to `count` short strings the pattern matches (all or most of the time: lookarounds and anchors are not enforced). */
 export function sampleStrings(source: string, count = 12): string[] {
   const rnd = generator(seedOf(source));
@@ -218,7 +225,7 @@ export function sampleStrings(source: string, count = 12): string[] {
   const out = new Set<string>();
   for (let k = 0; k < count * 12 && out.size < count; k++) {
     const s = sequence(pick(tree));
-    if (s.length <= 60) out.add(s);
+    if (s.length <= SAMPLE_MAX) out.add(s);
   }
   return [...out];
 }
@@ -308,13 +315,13 @@ export interface Work {
  * character of the line, or where the part of its steps that grows with the square of the line has a coefficient over `quadratic`. A line
  * on which one `exec` takes no more than `quadratic` times the square of half the line is not measured at the two shorter lengths: the steps
  * at a length include that part, which is at least the coefficient times the square of the part of the line that repeats, and no line of
- * the sweep has less than half of itself repeating once it is longer than twice a sample (a sample is at most 60 characters). With
+ * the sweep has less than half of itself repeating once it is at least twice as long as the longest sample (SAMPLE_MAX). With
  * `stopAtFirst` it returns at the first slow line. Also the line the pattern did the most work on, and the one whose work grew fastest.
  */
 export function workOf(
   source: string, flags: string, length: number, bounds: { perChar: number; quadratic: number; stopAtFirst?: boolean },
 ): { slow: Work[]; most: Work; fastest: Work; lines: number } {
-  if (length < 240) throw new Error(`a length of ${length} is too short for the lines of the sweep to repeat over half of it`);
+  if (length < 2 * SAMPLE_MAX) throw new Error(`a length of ${length} is too short for the lines of the sweep to repeat over half of it`);
   const pattern = counted(source, flags);
   const none: Work = { line: { what: "", at: () => "", period: 1 }, steps: 0, quadratic: 0 };
   const out = { slow: [] as Work[], most: none, fastest: none, lines: 0 };

@@ -29,7 +29,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { assessRisk, parseRepoConfig, type RiskFile } from "../src/github-review/risk.js";
 import { MAX_LINE_CHARS, MAX_READ_CHARS } from "../src/github-review/risk-signals.js";
-import { describeWork, regexLiterals, sampleStrings, workOf } from "./support/regex-sweep.js";
+import { describeWork, regexLiterals, SAMPLE_MAX, sampleStrings, workOf } from "./support/regex-sweep.js";
 import { counted, UnsupportedPattern } from "./support/regex-work.js";
 
 const SOURCES = new URL("../src/github-review/", import.meta.url);
@@ -44,8 +44,9 @@ const CALL_BUDGET_RATIO = 4;
 /**
  * The length of line the sweep counts a pattern's work at (and at three quarters and half of it, for how the work grows). A count has no
  * noise, so the line need not be as long as the longest a pattern reads (MAX_LINE_CHARS), only long enough for the opening of a sample (at
- * most 41 characters with its space) to repeat several times between the three lengths, and for the shortest of them to be longer than the
- * longest bounded repeat of any pattern (S1 checks that), past which a bounded repeat is linear in the line however it backtracks.
+ * most 41 characters with its space) to repeat several times between the three lengths, for most of it to be what it repeats however long
+ * its sample is (at least twice SAMPLE_MAX), and for the shortest of the three to be longer than the longest bounded repeat of any pattern
+ * (S3 checks that), past which a bounded repeat is linear in the line however it backtracks.
  */
 const SWEEP_LENGTH = 500;
 /**
@@ -128,8 +129,8 @@ test("S2 the count flags the patterns that were super-linear, written as they we
   for (const [source, flags, what] of formerly) {
     const verdict = workOf(source, flags, SWEEP_LENGTH, SWEEP);
     assert.ok(verdict.slow.length > 0, `${what}: not slow by the verdict of S3 (the most work was ${describeWork(verdict.most, SWEEP_LENGTH, STEPS_PER_CHAR)}; the fastest growth ${describeWork(verdict.fastest, SWEEP_LENGTH, STEPS_PER_CHAR)})`);
-    const grown = workOf(source, flags, 240, growthOnly);
-    assert.ok(grown.slow.length > 0 && grown.slow[0]!.quadratic > 8 * QUADRATIC_BOUND, `${what}: its work does not grow with the square of the line (the fastest growth was ${describeWork(grown.fastest, 240, Infinity)})`);
+    const grown = workOf(source, flags, 2 * SAMPLE_MAX, growthOnly);
+    assert.ok(grown.slow.length > 0 && grown.slow[0]!.quadratic > 8 * QUADRATIC_BOUND, `${what}: its work does not grow with the square of the line (the fastest growth was ${describeWork(grown.fastest, 2 * SAMPLE_MAX, Infinity)})`);
     const re = new RegExp(source, flags);
     const samples = sampleStrings(source);
     assert.ok(samples.some((x) => re.test(x)), `none of ${JSON.stringify(samples.slice(0, 3))} matches /${source}/`);
@@ -161,6 +162,8 @@ test("S3 every regular expression literal in the module does a bounded amount of
       const work = workOf(r.source, r.flags, SWEEP_LENGTH, SWEEP);
       patterns += 1;
       lines += work.lines;
+      // A pattern with no sample string is read on no line, which is not the same as cheap on every line.
+      if (work.lines === 0) slow.push(`${f}:${r.line} /${r.source}/ read on no line: no string of at most ${SAMPLE_MAX} characters was made that it matches`);
       if (work.slow.length > 0) slow.push(`${f}:${r.line} /${r.source}/ ${describeWork(work.slow[0]!, SWEEP_LENGTH, STEPS_PER_CHAR)}`);
     }
   }
