@@ -40,10 +40,25 @@ function onFirstCall(name: "renameSync" | "writeFileSync" | "ftruncateSync", mea
   return () => { (fs as any)[name] = real; };
 }
 
+/** What the regular file at `p` holds, read without following a final link; null for anything else. */
+function fileText(p: string): string | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch {
+    return null;
+  }
+  try {
+    return fs.fstatSync(fd).isFile() ? fs.readFileSync(fd, "utf-8") : null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function outsideHolds(text: string): string[] {
   return (fs.readdirSync(OUTSIDE, { recursive: true }) as string[])
     .map((n) => path.join(OUTSIDE, n))
-    .filter((f) => fs.lstatSync(f).isFile() && fs.readFileSync(f, "utf-8").includes(text));
+    .filter((f) => fileText(f)?.includes(text));
 }
 
 function result(res: { content: Array<{ text: string }> }) {
@@ -69,8 +84,7 @@ test("a final link is replaced in the workspace, never written through", async (
   const out = result(await downloadS3.execute({ files: [{ local_path: target, presigned_url: url }] }));
   assert.deepEqual(out.ok, [target]);
   assert.equal(fs.readFileSync(victim, "utf-8"), "keep");
-  assert.equal(fs.lstatSync(target).isFile(), true);
-  assert.equal(fs.readFileSync(target, "utf-8"), "uploaded bytes");
+  assert.equal(fileText(target), "uploaded bytes", "a regular file, not the link, holds the download");
 });
 
 test("an ordinary path is written, readable as any new file is", async () => {
