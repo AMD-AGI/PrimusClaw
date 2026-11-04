@@ -498,6 +498,8 @@ describe("memory v2", { skip }, () => {
       "Forget my password. I use vim.", "forget my password, I use vim", "Forget my password: I use vim", "忘掉我的密码。我用 vim",
       "忘掉密码：我用 vim", "Forget my password — I use vim.", "Forget my password - I use vim", "Forget my password (I use vim)",
       "Forget my password \"I use vim\"",
+      // An instruction inside an aside or a quotation belongs to the sentence around it.
+      "Please don’t (forget I use vim)", "I never said \"forget I use vim\"", "Please don't — forget I use vim",
       // Not wanting it deleted is no request to delete it.
       "我不想删除这条关于 vim 的记忆", "我不希望删除这条关于 vim 的记忆", "这条 vim 记忆为什么被删除了",
     ];
@@ -545,6 +547,7 @@ describe("memory v2", { skip }, () => {
     for (const [said, quote] of [
       ["delete the vim memory"], ["把关于 vim 的那条记忆删掉"], ["忘掉我用 vim 这件事"], ["Please forget I use vim."],
       ["ok, please forget that I use vim, thanks", "forget that I use vim"],
+      ["Please forget that I use vim (I switched to emacs)", "forget that I use vim"],
     ]) {
       await tool("save_memory", sid, (await turn(sid, "remember I use vim")).messageId, save("uses vim", "uses vim", "I use vim"));
       await w.q("UPDATE claw_tasks SET status = 'completed'");

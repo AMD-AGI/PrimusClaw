@@ -77,11 +77,24 @@ const ENTRY_NUMBER = /#\s*(\d+)|(?:memory|note|entry|记忆|条目)[\s#]*(\d+)|�
 /**
  * The clauses of a user's message: an instruction to forget names its entry within its own clause. Every mark
  * `normalizeText` drops ends one (stops, commas, colons, dashes, brackets, quotation marks), except those inside a
- * reference or a word: an apostrophe, "#", "_", and a hyphen between two letters or digits.
+ * reference or a word: an apostrophe, "#", "_", and a hyphen between two letters or digits. Only the start of the
+ * message and a stop, comma or colon begin an instruction (`opens`): what follows a bracket, quotation mark or dash
+ * is an aside or a quotation of the sentence before it ("Please don't (forget I use vim)", "I never said 'forget
+ * memory #3'").
  */
-function clauses(text: string): string[] {
-  return text.normalize("NFKC").replace(/[’‘]/g, "'")
-    .split(/(?:(?!['#_-])[\p{P}\p{S}]|-(?!(?<=[\p{L}\p{N}]-)[\p{L}\p{N}])|\n)+/u).map((c) => c.trim());
+function clauses(text: string): Array<{ clause: string; opens: boolean }> {
+  const parts = text.normalize("NFKC").replace(/[’‘]/g, "'")
+    .split(/((?:(?!['#_-])[\p{P}\p{S}]|-(?!(?<=[\p{L}\p{N}]-)[\p{L}\p{N}])|\n)+)/u);
+  const out: Array<{ clause: string; opens: boolean }> = [];
+  let marks = "";
+  parts.forEach((part, i) => {
+    if (i % 2) { marks += part; return; }
+    const clause = part.trim();
+    if (!clause) return;
+    out.push({ clause, opens: /^[.!?;:,\n。！？；：，、]*$/u.test(marks) });
+    marks = "";
+  });
+  return out;
 }
 
 /** Whether a clause is an instruction to forget (see FORGET_REQUEST) that names this entry by its number or by what it says. */
@@ -104,15 +117,15 @@ export function quoteAsksToForget(quote: string, messages: readonly string[], id
   if ([...q].length < QUOTE_MIN) return false;
   return messages.some((message) => {
     const whole = normalizeText(message);
-    const spans: Array<{ clause: string; start: number; end: number }> = [];
-    for (const clause of clauses(message)) {
+    const spans: Array<{ clause: string; opens: boolean; start: number; end: number }> = [];
+    for (const { clause, opens } of clauses(message)) {
       const start = spans.at(-1)?.end ?? 0;
-      spans.push({ clause, start, end: start + normalizeText(clause).length });
+      spans.push({ clause, opens, start, end: start + normalizeText(clause).length });
     }
     // The delimiters are punctuation and whitespace, which normalisation drops, so the clauses tile the message.
     if ((spans.at(-1)?.end ?? 0) !== whole.length) return false;
-    return spans.some(({ clause, start, end }) => {
-      if (!clauseAsksToForget(clause, id, entry)) return false;
+    return spans.some(({ clause, opens, start, end }) => {
+      if (!opens || !clauseAsksToForget(clause, id, entry)) return false;
       const at = whole.indexOf(q, Math.max(0, start - q.length + 1));
       return at !== -1 && at < end;
     });
