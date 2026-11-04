@@ -33,6 +33,25 @@ test("no rules means no policy", () => {
   assert.equal(bashApprovalPolicyFrom([]).active, false);
 });
 
+test("the platform's built-in rules hold their commands without counting as an operator's policy", () => {
+  const cases: Array<[string, Parameters<typeof bashApprovalPolicyFrom>[0], boolean, boolean]> = [
+    // [why, sources, active, operatorActive]
+    ["platform rules alone", [{ source: "defaults", value: RULES, platform: true }], true, false],
+    ["an operator's rules", [{ source: "env", value: RULES }], true, true],
+    ["both", [{ source: "env", value: RULES }, { source: "defaults", value: RULES, platform: true }], true, true],
+    ["malformed platform rules hold everything", [{ source: "defaults", value: [{ bogus: 1 }], platform: true }], true, true],
+    ["absent platform rules", [{ source: "defaults", value: undefined, platform: true }], false, false],
+  ];
+  for (const [why, sources, active, operatorActive] of cases) {
+    const p = bashApprovalPolicyFrom(sources);
+    assert.equal(p.active, active, why);
+    assert.equal(p.operatorActive, operatorActive, why);
+  }
+  const p = bashApprovalPolicyFrom([{ source: "defaults", value: RULES, platform: true }]);
+  assert.equal(p.check("rm -rf /data/x"), "rm of data", "a platform rule still holds the command it names");
+  assert.equal(p.check("ls /data"), null);
+});
+
 test("http rule: method plus url prefix, with implied methods and quoting", () => {
   const p = policy();
   const held = [

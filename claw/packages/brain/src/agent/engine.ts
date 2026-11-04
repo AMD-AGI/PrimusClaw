@@ -15,6 +15,7 @@ import { loadRules } from "./rules.js";
 import { bindRepo, renderRepoBlock } from "../workspace/repo-binding.js";
 import { repoSkillsToList } from "../workspace/repo-skills.js";
 import { normalizeMcpConfigs, originsSendingPlaceholder } from "../clients/mcp-config.js";
+import { DEFAULT_BASH_APPROVAL_RULES } from "./bash-approval-defaults.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
 import { HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
@@ -36,7 +37,7 @@ import {
   ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, LLM_API_STYLE,
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
-  BASH_APPROVAL_RULES, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
+  BASH_APPROVAL_RULES, BASH_APPROVAL_DEFAULTS_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
   MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, BG_SHELL_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
@@ -338,19 +339,21 @@ export class AgentEngine {
     // only when some server declares one: without a rule the loop gets no
     // controller and behaves exactly as before.
     const approval = approvalPolicyFromMcp(mergedMcp);
-    // Bash commands a rule holds, from plugin / marketplace tool configs and
-    // the deployment's BASH_APPROVAL_RULES. Same gate, same semantics.
+    // Bash commands a rule holds, from plugin / marketplace tool configs, the
+    // deployment's BASH_APPROVAL_RULES and the built-in GitHub write rules.
+    // Same gate, same semantics.
     const bashPolicy = bashApprovalPolicyFrom([
       ...[...pluginLayer.bashApproval, ...resolved.bashApproval].map((value) => ({ source: "tool_config", value })),
       { source: "BASH_APPROVAL_RULES", value: bashApprovalFromEnvValue(BASH_APPROVAL_RULES) },
+      { source: "defaults", value: BASH_APPROVAL_DEFAULTS_ENABLED ? DEFAULT_BASH_APPROVAL_RULES : undefined, platform: true },
     ]);
     // With a2a_call on, an allow that answers a peer's approval request is held for the user
     // (a2aApprovalHold). Nothing else changes: calls the policies do not name stay as they were.
-    // The trigger tools' hold is the platform's in the same way: it holds trigger_create and
-    // trigger_cancel, and must not make HITL_ENABLED ask about every call of a worker or doorbell
-    // turn that nobody is watching.
-    const policyActive = approval.operatorActive || bashPolicy.active;
-    const anyApproval = approval.active || policyActive || A2A_CLIENT_ENABLED;
+    // The trigger tools' hold and the built-in bash rules are the platform's in the same way: they
+    // hold what they name, and must not make HITL_ENABLED ask about every call of a worker or
+    // doorbell turn that nobody is watching.
+    const policyActive = approval.operatorActive || bashPolicy.operatorActive;
+    const anyApproval = approval.active || bashPolicy.active || A2A_CLIENT_ENABLED;
     // The channel decisions arrive on. Approvals need it, and so does the
     // question tool, which waits for its answer on the same subject: a
     // deployment that turns questions on without any approval policy gets the
