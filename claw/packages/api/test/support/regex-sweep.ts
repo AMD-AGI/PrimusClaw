@@ -227,62 +227,98 @@ export function sampleStrings(source: string, count = 12): string[] {
 const kindOf = (c: string): string => (/\w/.test(c) ? "w" : /\s/.test(c) ? "s" : c);
 
 /**
- * The lines made of one opening of a sample string said over and over (`#[arg(#[arg(#[arg(` ...), each `length` characters long: the
- * first 1 to 40 characters of a sample, alone and with a space after, with and without a character that fails the match at the end.
+ * The lines made of one opening of a sample string said over and over (`#[arg(#[arg(#[arg(` ...): the first 1 to 40 characters of a sample,
+ * alone and with a space after, with and without a character that fails the match at the end, each as a recipe for a line of any length.
  * A pattern that scans on from its opening to the end of the line (`#\[arg\([^\]]*long`) starts again at every copy of the opening and reads
  * the rest of the line each time, so it costs the square of the line however short the run of one character it can divide is; a run of
  * one character pushed in (`worstCost` below) never says its opening twice and does not find that.
  */
-function repeatedOpenings(samples: string[], length: number): string[] {
+function repeatedOpenings(samples: string[]): Line[] {
   const units = new Set<string>();
   for (const s of samples) {
     for (let end = 1; end <= Math.min(s.length, 40); end++) { units.add(s.slice(0, end)); units.add(`${s.slice(0, end)} `); }
   }
-  const lines: string[] = [];
+  const lines: Line[] = [];
   for (const unit of units) {
-    const line = unit.repeat(Math.ceil(length / unit.length)).slice(0, length);
-    lines.push(line, `${line.slice(0, length - 1)}!`);
+    const at = (length: number): string => unit.repeat(Math.ceil(length / unit.length)).slice(0, length);
+    const what = `${JSON.stringify(unit.repeat(Math.ceil(24 / unit.length)).slice(0, 24))}... (an opening said over and over)`;
+    lines.push({ what, at }, { what: `${what}, then "!"`, at: (length) => `${at(length).slice(0, length - 1)}!` });
   }
   return lines;
 }
 
+/** A line the sweep times a pattern on, as a recipe: the same line at any length, so that how its cost grows with the length can be asked. */
+export interface Line { what: string; at: (length: number) => string }
+
 /**
- * The most one `exec` of the pattern cost, in milliseconds, over the sample strings each with a run of `length` characters pushed in where
- * the kind of character changes, and with a character that fails the match after the run, and over lines that say one opening of a sample
- * over and over (`repeatedOpenings`). Each slow line is timed again and the fastest of the runs counts, so one pause of the process is not
- * a slow pattern. With `stopAboveMs` it stops at the first line over that, which is how a pattern that is known to be slow is shown to be
- * without waiting for it on every line.
+ * The most one `exec` of the pattern cost, in milliseconds, over the sample strings each with a run of characters pushed in where the kind of
+ * character changes, and with a character that fails the match after the run, and over lines that say one opening of a sample over and over
+ * (`repeatedOpenings`), every line `length` characters long. Each slow line is timed again and the fastest of the runs counts, so one pause of
+ * the process is not a slow pattern. With `stopAboveMs` it stops at the first line over that, which is how a pattern that is known to be slow
+ * is shown to be without waiting for it on every line. `line` is the line that cost the most, which `growth` times again at other lengths.
  */
-export function worstCost(source: string, flags: string, length: number, stopAboveMs = Infinity): { ms: number; line: string } {
+export function worstCost(source: string, flags: string, length: number, stopAboveMs = Infinity): { ms: number; line: Line } {
   const re = new RegExp(source, flags.replace(/[gy]/g, ""));
-  let worst = { ms: 0, line: "" };
+  let worst: { ms: number; line: Line } = { ms: 0, line: { what: "", at: () => "" } };
   const time = (line: string): number => { const t0 = performance.now(); re.exec(line); return performance.now() - t0; };
   const samples = sampleStrings(source);
-  const slowest = (line: string, what: string): boolean => {
-    let ms = time(line);
+  const slowest = (line: Line): boolean => {
+    const text = line.at(length);
+    let ms = time(text);
     if (ms > worst.ms) {
-      ms = Math.min(ms, time(line), time(line));
-      if (ms > worst.ms) worst = { ms, line: what };
+      ms = Math.min(ms, time(text), time(text));
+      if (ms > worst.ms) worst = { ms, line };
     }
     return worst.ms > stopAboveMs;
   };
-  for (const line of repeatedOpenings(samples, length)) {
-    if (slowest(line, `${JSON.stringify(line.slice(0, 24))}... (an opening said over and over, ${length} characters)`)) return worst;
-  }
+  for (const line of repeatedOpenings(samples)) if (slowest(line)) return worst;
   for (const s of samples) {
     // The places to push a run in: both ends, and wherever the kind of character changes.
     const cuts = Array.from({ length: s.length + 1 }, (_, k) => k).filter((k) => k === 0 || k === s.length || kindOf(s[k - 1] as string) !== kindOf(s[k] as string));
     for (const k of cuts) {
       for (const filler of new Set([" ", "a", "\t", s[k - 1] ?? "", s[k] ?? "", s.slice(Math.max(0, k - 2), k), s.slice(k, k + 2)])) {
         if (filler === "") continue;
-        const room = length - s.length;
-        const run = filler.repeat(Math.ceil(room / filler.length)).slice(0, room);
-        const pushed = s.slice(0, k) + run + s.slice(k);
-        for (const line of [pushed, `${pushed.slice(0, length - 1)}!`]) {
-          if (slowest(line, `${JSON.stringify(s)} with ${JSON.stringify(filler)} x ${run.length} at ${k}`)) return worst;
+        const pushed = (length: number): string => {
+          const room = Math.max(0, length - s.length);
+          return s.slice(0, k) + filler.repeat(Math.ceil(room / filler.length)).slice(0, room) + s.slice(k);
+        };
+        const what = `${JSON.stringify(s)} with ${JSON.stringify(filler)} repeated at ${k}`;
+        for (const line of [{ what, at: pushed }, { what: `${what}, then "!"`, at: (length: number) => `${pushed(length).slice(0, length - 1)}!` }]) {
+          if (slowest(line)) return worst;
         }
       }
     }
   }
   return worst;
 }
+
+/**
+ * How many times as long an `exec` of the pattern takes on the line at `length` as on the same line at a quarter of it: about 4 for a pattern
+ * whose cost is linear in its line, about 16 for one that costs the square of it, and more for worse. A ratio of two times taken on the same
+ * machine in the same moments, not a number of milliseconds: a busy or slow machine slows both alike. The two are timed in turn, `rounds`
+ * times, and the least of each is the one compared, since a pause only ever makes a run slower. Each time is of as many `exec`s as make the
+ * one on the long line last some tens of microseconds: enough that a pattern that costs a microsecond is not timed at the resolution of the
+ * clock, and short enough that most runs fit between two of the pauses of a machine whose CPU is shared (a time of a millisecond is cut by
+ * one in almost every round on a CPU quota of a quarter, and the least of them is no longer a time nothing touched).
+ */
+export function growth(source: string, flags: string, line: Line, length: number, rounds = 15): number {
+  const re = new RegExp(source, flags.replace(/[gy]/g, ""));
+  const short = line.at(Math.floor(length / 4));
+  const long = line.at(length);
+  const time = (text: string, runs: number): number => {
+    const t0 = performance.now();
+    for (let k = 0; k < runs; k++) re.exec(text);
+    return performance.now() - t0;
+  };
+  time(short, 1);
+  const once = Math.min(time(long, 1), time(long, 1));
+  const runs = Math.min(100, Math.max(1, Math.ceil(0.05 / Math.max(once, 0.0005))));
+  let leastShort = Infinity;
+  let leastLong = Infinity;
+  for (let round = 0; round < rounds; round++) {
+    leastShort = Math.min(leastShort, time(short, runs));
+    leastLong = Math.min(leastLong, time(long, runs));
+  }
+  return leastLong / leastShort;
+}
+
