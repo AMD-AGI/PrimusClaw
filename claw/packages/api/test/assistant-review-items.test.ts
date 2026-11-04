@@ -35,6 +35,7 @@ describe("assistant review items", { skip }, () => {
   let w: World;
   let app: FastifyInstance;
   let ri: typeof import("../src/assistant/review-items.js");
+  let readTrustedSessionCredentials: typeof import("../src/auth/sealed-session-credentials.js").readTrustedSessionCredentials;
   let checks: Array<{ actor: Record<string, unknown>; pr: Record<string, unknown> }>;
   let checkAnswer: (pr: { owner: string; repo: string; number: number }) => { isError: boolean; body: Record<string, unknown> };
   let interrupts: string[];
@@ -52,6 +53,7 @@ describe("assistant review items", { skip }, () => {
       CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "clawy",
     });
     ri = await import("../src/assistant/review-items.js");
+    ({ readTrustedSessionCredentials } = await import("../src/auth/sealed-session-credentials.js"));
     const { registerAssistantRoutes } = await import("../src/routes/assistant.js");
     const { registerGithubReviewRoutes } = await import("../src/github-review/mcp.js");
     app = Fastify();
@@ -165,9 +167,12 @@ describe("assistant review items", { skip }, () => {
         [s.config.acting_as, s.config.review_target, s.config.review_only, s.config.acting_as_requester, s.config.notify_on_finish],
         ["bob", it.pr, false, "Name alice", true],
       );
-      assert.deepEqual([s.config.platform_key, s.config.llm_api_key, s.config._server_managed_credentials], ["pk-alice", "vk-alice", true]);
+      // Sealed, as every server-stamped credential is (`auth/sealed-session-credentials.ts`): the turn runs with the requester's keys.
+      assert.deepEqual([s.config.platform_key, s.config.llm_api_key, s.config._server_managed_credentials], [undefined, undefined, true]);
+      assert.deepEqual(readTrustedSessionCredentials(s.config), { platformKey: "pk-alice", llmApiKey: "vk-alice" });
       const queued = await w.pending(it.session_id);
       assert.equal(queued.length, 1);
+      assert.equal(it.message_id, `claw-pending-${queued[0].id}`, "the answer names the first message's turn");
       assert.equal(queued[0].content, item.params.brief);
     }
     assert.match((await w.pending(items[0].session_id))[0].content, /^Review https:\/\/github\.com\/AMD-AGI\/PrimusClaw\/pull\/254\. If the review finds nothing that blocks it, approve and merge it/);
@@ -364,6 +369,7 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual([fresh.params.acting_as, fresh.params.acting_as_name, fresh.params.model, fresh.params.review_only, fresh.params.pr], ["bob", "Bob B", "claude-opus-5.5", false, PR(254)]);
     assert.match(fresh.params.brief, /approve and merge it/, "a review that now merges is told so");
     assert.equal((await w.q("SELECT model FROM claw_sessions WHERE session_id = $1", [fresh.worker_session_id]))[0].model, "claude-opus-5.5");
+    assert.equal(r.body.data.item.message_id, `claw-pending-${(await w.pending(fresh.worker_session_id))[0].id}`, "a restart names its first turn too");
     assert.equal(interrupts.length, 1, "the old session was interrupted");
     // Nothing changed but the model: the old words are sent again.
     const again = await call("alice", `/v1/assistant/reviews/${fresh.item_id}/restart`, { model: null });

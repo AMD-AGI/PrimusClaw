@@ -26,7 +26,7 @@ import { readGithubReviewSettings } from "../github-review/settings.js";
 import { closeConfirmationsForStop, finishConfirmation } from "../github-review/store.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
-import { SWEEPABLE_RUN_STATUSES, stopSessionRuns } from "../tasks/chat-run.js";
+import { queuedMessageId, SWEEPABLE_RUN_STATUSES, stopSessionRuns } from "../tasks/chat-run.js";
 import { getOrCreateAssistant } from "./assistant.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { queueRouterWake } from "./reports.js";
@@ -248,6 +248,8 @@ export interface CreatedReview {
   title: string;
   session_id: string;
   pr: PrRef;
+  /** The turn id of the session's first message (`claw-pending-<id>`), for a caller that follows that turn's stream. */
+  message_id: string | null;
 }
 
 interface Planned {
@@ -289,7 +291,9 @@ async function insertReview(q: StatementRunner, user: UserInfo, plan: Planned): 
     sessionId: plan.sessionId, userId: user.userId, content: plan.params.brief, dedupeKey: `start:${item.itemId}`, attended: plan.attended,
   });
   if (!queued.ok) throw new ReviewItemRefused(503, queued.error, "the review could not be started", {});
-  return { item_id: item.itemId, seq: item.seq, title: name, session_id: plan.sessionId, pr: plan.pr };
+  return {
+    item_id: item.itemId, seq: item.seq, title: name, session_id: plan.sessionId, pr: plan.pr, message_id: queued.pendingId === null ? null : queuedMessageId(queued.pendingId),
+  };
 }
 
 /**
