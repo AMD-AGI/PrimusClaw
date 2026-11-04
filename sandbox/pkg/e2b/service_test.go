@@ -220,7 +220,7 @@ func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 		want   string
 	}{
 		{name: "workload failed", fail: errors.New("workload sbx-1 phase Failed: CapacityGone: allocation generation is Lost"), status: http.StatusInternalServerError, reason: "sandbox_create_failed", want: "CapacityGone"},
-		{name: "pending timeout", hold: true, status: http.StatusServiceUnavailable, reason: "pending_timeout", want: "not running after 1s"},
+		{name: "pending timeout", hold: true, status: http.StatusInternalServerError, reason: "pending_timeout", want: "not running after 1s"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
