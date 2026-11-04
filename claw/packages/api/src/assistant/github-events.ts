@@ -13,7 +13,8 @@
  * the worker is started. The model only judges what to do about them.
  *
  * Whose words reach the worker is decided in code before any model reads them: people who can write to the repository and the
- * owner's own account (`TRUSTED_ASSOCIATIONS`); anyone else's comment is recorded and dropped. What an event can do is what the item
+ * owner's own account (`TRUSTED_PERMISSIONS`, asked of GitHub per author); anyone else's comment is recorded and dropped, and a check run's
+ * name, which a pull request from a fork can set, is never passed on. What an event can do is what the item
  * could already do. The poll only reads. The worker answers on the pull
  * request through `pr_reply`, which posts as the owner only when the owner, signed in themselves, allowed it for
  * this subscription (`reply_allowed`), which ending the subscription takes back; nothing a model or a comment says turns that on, and
@@ -81,12 +82,15 @@ const COMMENT_KINDS: ReadonlySet<string> = new Set(["issue_comment", "review_com
 /** What people write (as opposed to what CI and the pull request's own state say). */
 const AUTHORED_KINDS: ReadonlySet<string> = new Set(["issue_comment", "review_comment", "review"]);
 /**
- * Whose words reach a worker: people who can write to the repository (GitHub's `author_association`), and the owner's own account.
- * They could already push code the worker runs, so their text gives nobody a way in they did not have. Anyone else's comment is
- * stored and dropped with the reason (`author_not_trusted`), never delivered: on a public repository that is anybody on the internet,
- * writing to a model that holds the owner's credentials.
+ * Whose words reach a worker: people who can write to this repository (GitHub's answer for the author's permission on it, asked with
+ * the owner's token), and the owner's own account. They could already push code the worker runs, so their text gives nobody a way in
+ * they did not have. Anyone else's comment, and anyone whose permission GitHub does not tell us, is stored and dropped with the reason
+ * (`author_not_trusted`), never delivered: on a public repository that is anybody on the internet, writing to a model that holds the
+ * owner's credentials. `author_association` is not enough: a member of the organisation may only read the repository.
  */
-export const TRUSTED_ASSOCIATIONS: ReadonlySet<string> = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+export const TRUSTED_PERMISSIONS: ReadonlySet<string> = new Set(["admin", "maintain", "write"]);
+/** Stored values shorter than this are not looked for in an answer: they are not credentials, and would refuse ordinary words. */
+export const SECRET_MIN_LENGTH = 8;
 
 export function githubEventsEnabled(): boolean {
   return CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_GITHUB_EVENTS;
@@ -277,8 +281,6 @@ export interface GithubEvent {
   replyTo?: string | null;
   headSha?: string | null;
   occurredAt: string | null;
-  /** GitHub's `author_association` of a comment or review: how the author stands to the repository. */
-  association?: string | null;
 }
 
 const clip = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, max)}…[cut]`);
@@ -334,7 +336,7 @@ async function checkRunsOf(gh: GithubClient, path: string): Promise<{ runs: any[
 
 /** What is new on the pull request, and whether it is closed. Throws what GitHub threw: an unread pull request is not a quiet one. */
 export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscription, "owner" | "repo" | "number" | "since" | "cursor_at">):
-  Promise<{ events: GithubEvent[]; closed: "pr_merged" | "pr_closed" | null; readUpTo: Date | null; login: string | null }> {
+  Promise<{ events: GithubEvent[]; closed: "pr_merged" | "pr_closed" | null; readUpTo: Date | null; login: string | null; writers: Set<string> }> {
   const r: PrRef = { owner: sub.owner, repo: sub.repo, number: sub.number };
   // The account answers are posted with: what our own answers are written by.
   const me = login((await gh.get<any>("/user")).json);
@@ -355,14 +357,14 @@ export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscrip
   };
   for (const c of await sinceList(repoPath(r, `/issues/${r.number}/comments`))) {
     if (!after(c?.created_at, sub.since)) continue;
-    events.push({ kind: "issue_comment", githubId: String(c.id), author: login(c.user), url: c.html_url ?? null, body: String(c.body ?? ""), occurredAt: c.created_at, association: c.author_association ?? null });
+    events.push({ kind: "issue_comment", githubId: String(c.id), author: login(c.user), url: c.html_url ?? null, body: String(c.body ?? ""), occurredAt: c.created_at });
   }
   for (const c of await sinceList(repoPath(r, `/pulls/${r.number}/comments`))) {
     if (!after(c?.created_at, sub.since)) continue;
     events.push({
       kind: "review_comment", githubId: String(c.id), author: login(c.user), url: c.html_url ?? null, body: String(c.body ?? ""),
       path: typeof c.path === "string" ? c.path : null, line: Number.isInteger(c.line) ? c.line : (Number.isInteger(c.original_line) ? c.original_line : null),
-      replyTo: String(c.in_reply_to_id ?? c.id), occurredAt: c.created_at, association: c.author_association ?? null,
+      replyTo: String(c.in_reply_to_id ?? c.id), occurredAt: c.created_at,
     });
   }
   for (const v of await newestPages(gh, repoPath(r, `/pulls/${r.number}/reviews`))) {
@@ -371,7 +373,7 @@ export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscrip
     const body = String(v.body ?? "").trim();
     // A comment-only review with no text of its own is its inline comments, which arrive by themselves.
     if (!body && state !== "APPROVED" && state !== "CHANGES_REQUESTED") continue;
-    events.push({ kind: "review", githubId: String(v.id), author: login(v.user), url: v.html_url ?? null, body: body ? `${state}: ${body}` : state, occurredAt: v.submitted_at, association: v.author_association ?? null });
+    events.push({ kind: "review", githubId: String(v.id), author: login(v.user), url: v.html_url ?? null, body: body ? `${state}: ${body}` : state, occurredAt: v.submitted_at });
   }
   const head = typeof pr.head?.sha === "string" ? pr.head.sha : null;
   if (head && pr.state === "open") {
@@ -383,7 +385,9 @@ export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscrip
     if (finished && failed.length && last >= sub.since.getTime()) {
       events.push({
         kind: "check_failed", githubId: head, author: null, url: failed[0]?.details_url ?? failed[0]?.html_url ?? null, headSha: head,
-        body: failed.slice(0, 20).map((c) => `${c.name}: ${c.conclusion}`).join("\n"), occurredAt: new Date(last).toISOString(),
+        // Counts, ids and conclusions only: a run's name is whatever the workflow says, and a fork's pull request writes its workflow.
+        body: `${failed.length} of ${runs.length} check runs failed: ${failed.slice(0, 20).map((c) => `run ${Number(c.id) || "?"} ${FAILED_CONCLUSIONS.has(String(c.conclusion)) ? c.conclusion : "failure"}`).join(", ")}`,
+        occurredAt: new Date(last).toISOString(),
       });
     }
   }
@@ -395,7 +399,16 @@ export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscrip
       body: pr.merged ? "the pull request was merged" : "the pull request was closed without merging", occurredAt: pr.closed_at ?? null,
     });
   }
-  return { events, closed, readUpTo, login: me };
+  // Who among the authors can write to the repository, asked once per author per read. Not answered is not a writer.
+  const writers = new Set<string>();
+  const authors = [...new Set(events.filter((e) => AUTHORED_KINDS.has(e.kind) && e.author && e.author !== me).map((e) => e.author as string))];
+  for (const author of authors) {
+    const got = await gh.get<any>(repoPath(r, `/collaborators/${encodeURIComponent(author)}/permission`), undefined, [403, 404]);
+    const role = String(got.json?.role_name ?? "");
+    const permission = String(got.json?.permission ?? "");
+    if (got.status === 200 && (TRUSTED_PERMISSIONS.has(role) || TRUSTED_PERMISSIONS.has(permission))) writers.add(author);
+  }
+  return { events, closed, readUpTo, login: me, writers };
 }
 
 export const eventIdOf = (subId: number, e: Pick<GithubEvent, "kind" | "githubId">): string => `gh:${subId}:${e.kind}:${e.githubId}`;
@@ -413,7 +426,8 @@ function readError(err: unknown): string {
 
 /** Stored, deduplicated by id, and the subscription moved on, in one transaction: a read that is not stored is read again. */
 export async function storeEvents(
-  sub: Subscription, read: { events: GithubEvent[]; closed: "pr_merged" | "pr_closed" | null; readUpTo: Date | null; login: string | null },
+  sub: Subscription,
+  read: { events: GithubEvent[]; closed: "pr_merged" | "pr_closed" | null; readUpTo: Date | null; login: string | null; writers: ReadonlySet<string> },
 ): Promise<number> {
   return inTransaction(async (query) => {
     const live = (await query("SELECT state FROM claw_work_item_subscriptions WHERE id = $1 FOR UPDATE", [sub.id])).rows[0] as
@@ -428,7 +442,7 @@ export async function storeEvents(
     )).rows as Array<{ event_id: string }>).map((r) => r.event_id) : []);
     const isOurs = (e: GithubEvent): boolean => byUs(e) && markersIn(e.body).some((m) => answered.has(m));
     const untrusted = (e: GithubEvent): boolean => AUTHORED_KINDS.has(e.kind)
-      && !(read.login !== null && e.author === read.login) && !TRUSTED_ASSOCIATIONS.has(String(e.association ?? ""));
+      && !(read.login !== null && e.author === read.login) && !(e.author !== null && read.writers.has(e.author));
     let stored = 0;
     for (const e of read.events) {
       if (isOurs(e)) continue;
@@ -819,8 +833,8 @@ export async function prReply(
   }
   // What the owner keeps (the env vault the worker's sandbox is given, and the token answers are posted with) never leaves in an answer,
   // whatever a comment talked the worker into writing; nor does anything shaped like a credential.
-  const secrets = [token, ...Object.values(await loadUserEnvSnapshot(db, target.user_id, logger))];
-  if (redactSecrets(body, secrets).hits > 0) {
+  const stored = Object.values(await loadUserEnvSnapshot(db, target.user_id, logger)).map((v) => v.trim()).filter((v) => v.length >= SECRET_MIN_LENGTH);
+  if (redactSecrets(body, [token]).hits > 0 || body.includes(token) || stored.some((v) => body.includes(v))) {
     if (!retry) await release();
     throw new ToolRefused("body_contains_secret", "the answer contains a credential or one of the user's stored values; it was not posted");
   }

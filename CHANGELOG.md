@@ -40,8 +40,8 @@ record it.
   and only where the owner allowed it themselves (`reply: true`, which needs an identity-provider sign-in; a key or
   ending the subscription takes it away); an answer carrying the owner's token, one of their stored values or
   anything shaped like a credential is refused. Only comments and reviews by people who can write to the repository
-  (`author_association` OWNER, MEMBER, COLLABORATOR) or by the owner's own account reach the worker; others are
-  recorded and dropped. Reviews on someone's behalf are never subscribed. New tables `claw_work_item_subscriptions`,
+  (their permission on it, asked of GitHub: admin, maintain or write) or by the owner's own account reach the worker;
+  others are recorded and dropped. A failed CI is passed on as counts, run ids and conclusions, never the runs' names. Reviews on someone's behalf are never subscribed. New tables `claw_work_item_subscriptions`,
   `claw_work_item_github_events` and `claw_work_item_pr_replies` (required at start-up when the assistant is on);
   `CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS` (default 20) caps what one user watches.
 - On-behalf GitHub reviews as work items of the assistant, behind `CLAW_ASSISTANT_REVIEW_ITEMS` (default off; needs
