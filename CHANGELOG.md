@@ -40,13 +40,13 @@ record it.
   already records. `EVAL_ARM=guideline` compares a run with the guideline against one without.
 - A session chooses its reasoning effort as it chooses its model: `effort` (`low`, `medium`, `high`, or `null` for none)
   on `POST /v1/sessions` and `PATCH /v1/sessions/:id`, stored in `claw_sessions.effort` (new column, required at start-up)
-  and sent on every turn (new `ExecuteRequest.effort`, which Brain sends as `output_config.effort`, or
+  and sent on every turn and on every task-system run of the session (new `ExecuteRequest.effort`, which Brain sends as `output_config.effort`, or
   `reasoning_effort`, on every turn and sub-agent of the run). A value outside the set is a `400`; none sends nothing,
   as before. A session created with `config.acting_as` (a pull request reviewed on someone's behalf) is an ordinary
   session in this: it runs on the model and effort its creator chose, or the deployment's defaults. There is no
   review model or review effort setting.
 - `config.review_only: true` on a session created with `config.acting_as` (a `400` without it, or for a value that is
-  not a boolean): its `gh_pr_merge` is refused with `review_only` before anything is read, so it reviews, and may
+  neither a boolean nor null): its `gh_pr_merge` is refused with `review_only` before anything is read, so it reviews, and may
   approve, but never merges and never approves on the way to a merge; a held merge of such a session is refused at
   the acting user's allow as well.
 - A deep review behind `CLAW_GITHUB_REVIEW_DEEP_ENABLED`, on by default (`false` turns it off, and then the review

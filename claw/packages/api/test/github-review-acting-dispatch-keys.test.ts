@@ -105,10 +105,11 @@ const taskRow = () => ({
   dag_root_task_id: null, started_at: NOW, created_at: NOW, model: "claude-opus-5.5",
 });
 
-async function dispatchDag(config: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function dispatchDag(config: Record<string, unknown>, effort: string | null = null): Promise<Record<string, unknown>> {
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
     if (/SELECT user_id, config FROM claw_sessions/.test(sql)) return { rows: [{ user_id: "u-1", config }], rowCount: 1 };
+    if (/^SELECT effort FROM claw_sessions WHERE session_id = \$1$/.test(sql)) return { rows: [{ effort }], rowCount: 1 };
     if (/^UPDATE claw_tasks/.test(sql) || /FROM claw_tasks t LEFT JOIN claw_sessions/.test(sql)) return { rows: [taskRow()], rowCount: 1 };
     if (/claw_workspace/.test(sql)) return { rows: [{ workspace_id: "kws_1", storage_prefix: "users/u-1/sessions/s-1/" }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
@@ -130,6 +131,8 @@ test("D2 a task of a DAG is marked for a session that acts as a user, and its ke
     const request = await dispatchDag({ platform_key: "pk-user-1", _server_managed_credentials: true, ...(actingAs === undefined ? {} : { acting_as: actingAs }) });
     assert.equal(request.withhold_sandbox_keys, marked ? true : undefined, what);
     assert.equal(request.effort, undefined, `${what}: the environment's old review effort is not read`);
+    const chosen = await dispatchDag({ platform_key: "pk-user-1", _server_managed_credentials: true, ...(actingAs === undefined ? {} : { acting_as: actingAs }) }, "medium");
+    assert.equal(chosen.effort, "medium", `${what}: a run of the session asks for the effort the session chose`);
     assert.equal(request.rolling_cache_ttl, marked ? "5m" : undefined, `${what}: nobody waits between a review's turns; any other DAG keeps Brain's TTL`);
     assert.equal(request.sub_agent_max_turns, marked ? 20 : undefined, `${what}: a review's second pass is bounded; any other DAG's is not`);
     assert.equal(request.platform_key, "pk-user-1", `${what}: Brain still needs the key to own the workload`);

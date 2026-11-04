@@ -74,7 +74,8 @@ review and the merge and who is the reviewer of record, and whose own standing a
    refused (`review_only`) before anything is read or written, so the session reviews, and may approve,
    but never merges and never approves on the way to a merge; a merge held for such a session is refused
    at the acting user's allow as well. Like the target it is written only at creation, is `400` without
-   `config.acting_as` or when it is not a boolean, and a stored value that is not a boolean reads as true.
+   `config.acting_as` or when it is neither a boolean nor null (null and absent are false), and a stored value that is
+   not a boolean reads as true.
 2. From then on every turn of that session is offered an MCP server named `github_review`
    (reserved: a request cannot replace it) with four tools, hosted by the API at
    `POST /v1/internal/github-review/mcp`. Brain calls it with a token signed by the API
