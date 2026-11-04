@@ -495,7 +495,8 @@ describe("memory v2", { skip }, () => {
       "remove vim from my laptop", "can you delete the vim swap files", "forget it, I use vim anyway", "I can't delete the vim memory",
       "忘了说，我用 vim", "不要删除这条记忆，我用 vim", `delete ${id} files in vim`,
       // An instruction to forget something else, with the entry's words in another clause.
-      "Forget my password. I use vim.", "forget my password, I use vim", "忘掉我的密码。我用 vim",
+      "Forget my password. I use vim.", "forget my password, I use vim", "Forget my password: I use vim", "忘掉我的密码。我用 vim",
+      "忘掉密码：我用 vim",
     ];
     for (const said of incidental) {
       const m = await turn(sid, said);

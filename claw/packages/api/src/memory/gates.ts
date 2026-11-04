@@ -61,27 +61,26 @@ export function quoteSupports(quote: string, text: string): boolean {
 // mind), or "delete"/"remove"/"undo" aimed at a memory ("delete the vim memory", "undo memory #3"; not "remove vim
 // from my laptop"); in Chinese "忘掉 ..."/"别记 ...", or erasing aimed at an entry ("把这条记忆删掉", "撤销记忆 #3";
 // not "我总是忘记 vim 快捷键", "忘了说，我用 vim").
-const CLAUSE_START = String.raw`(?:^|[:：、]\s*)`;
 const POLITE = String.raw`(?:(?:please|pls|can you|could you|would you|you can|you should|i want you to|i'd like you to|i would like you to|go ahead and|let's|just|now|ok|okay)\s+)*`;
 const MEMORY_ZH = "(?:记忆|这条|那条|这一条|那一条|条目)";
 const ERASE_ZH = "(?<!不要|别|不用|不|勿|没|没有|不能|不许)(?:忘掉|忘记|删掉|删除|删了|撤销|撤回|去掉)";
 const FORGET_REQUEST = [
-  new RegExp(`${CLAUSE_START}${POLITE}(?:forget|stop remembering|unlearn)\\b(?!\\s+(?:it|about it)\\b)`, "i"),
-  new RegExp(`${CLAUSE_START}${POLITE}(?:delete|remove|erase|drop|clear|undo|revert)\\b(?:\\s+[\\w'#-]+){0,4}?\\s+(?:memory|memories)\\b`, "i"),
-  new RegExp(`${CLAUSE_START}(?:请|麻烦)?你?(?:帮我|给我)?(?:忘掉|忘记(?:它|这|那|关于|掉)|忘了(?:它|这|那|吧)|别记|不要记|不用记|别再记)`),
-  new RegExp(`${MEMORY_ZH}[^，。！？；,.!?;\\n]{0,20}${ERASE_ZH}|${ERASE_ZH}[^，。！？；,.!?;\\n]{0,20}${MEMORY_ZH}`),
+  new RegExp(`^${POLITE}(?:forget|stop remembering|unlearn)\\b(?!\\s+(?:it|about it)\\b)`, "i"),
+  new RegExp(`^${POLITE}(?:delete|remove|erase|drop|clear|undo|revert)\\b(?:\\s+[\\w'#-]+){0,4}?\\s+(?:memory|memories)\\b`, "i"),
+  new RegExp(`^(?:请|麻烦)?你?(?:帮我|给我)?(?:忘掉|忘记(?:它|这|那|关于|掉)|忘了(?:它|这|那|吧)|别记|不要记|不用记|别再记)`),
+  new RegExp(`${MEMORY_ZH}.{0,20}${ERASE_ZH}|${ERASE_ZH}.{0,20}${MEMORY_ZH}`),
 ];
 // The entry by its number: "#3", "memory 3", "记忆 #3", "第3条"; a bare number ("delete 3 files") is not a reference.
 const ENTRY_NUMBER = /#\s*(\d+)|(?:memory|note|entry|记忆|条目)\s*#?\s*(\d+)|第\s*(\d+)\s*条/gi;
 
 /**
  * Whether a quote asks to forget or undo this entry: one of its clauses is an instruction to forget (see
- * FORGET_REQUEST) that names the entry by its number or by what it says. Any other sentence of the user's ("review this repository",
- * "I keep forgetting my vim shortcuts", "remove vim from my laptop") is not such a request.
+ * FORGET_REQUEST) that names the entry by its number or by what it says. Any other sentence of the user's
+ * ("review this repository", "I keep forgetting my vim shortcuts", "remove vim from my laptop") is not one.
  */
 export function quoteAsksToForget(quote: string, id: number, entry: string): boolean {
-  // The entry must be named in the instruction itself: "Forget my password. I use vim." asks nothing about vim.
-  return quote.normalize("NFKC").replace(/[’‘]/g, "'").split(/\s*[.!?;,\n。！？；，]+\s*/).some((clause) => {
+  // The entry must be named in the instruction itself: "Forget my password: I use vim." asks nothing about vim.
+  return quote.normalize("NFKC").replace(/[’‘]/g, "'").split(/\s*[.!?;:,\n。！？；：，、]+\s*/).some((clause) => {
     if (!FORGET_REQUEST.some((r) => r.test(clause))) return false;
     const numbers = [...clause.matchAll(ENTRY_NUMBER)].map((m) => m[1] ?? m[2] ?? m[3]);
     return numbers.includes(String(id)) || quoteSupports(clause, entry);
