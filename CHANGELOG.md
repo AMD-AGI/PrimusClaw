@@ -36,7 +36,9 @@ record it.
   in what the assistant said to them just before, quoting that message, and never in a conversation marked
   `memory: "off"`. A task item's worker is shown a read-only index and may only recall; a review item's session is shown
   only the entries bound to its item. An entry can be bound to one work item (`claw_memory_entries.work_item_id`, a new
-  column required at start-up); bound entries are left out of the chat's catalogue. The chat's own memory tools and
+  column required at start-up); bound entries are left out of the chat's catalogue, and a save is checked for a duplicate
+  or a near one only against entries of the same binding. Workers started from a session marked `memory: "off"` are
+  marked so too. The chat's own memory tools and
   their fixed forget and undo phrases are unchanged.
 - On-behalf GitHub reviews as work items of the assistant, behind `CLAW_ASSISTANT_REVIEW_ITEMS` (default off; needs
   `CLAW_ASSISTANT_ENABLED` and `CLAW_GITHUB_REVIEW_ENABLED`): `POST /v1/assistant/reviews` and `POST
