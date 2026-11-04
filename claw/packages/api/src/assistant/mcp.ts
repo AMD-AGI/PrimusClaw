@@ -8,7 +8,8 @@
  * authenticate themselves (`isAnonymousPath`). The credential here is not a caller's: it is the bearer
  * `role-profile.ts` minted for one turn, and what it proves is which turn is calling. It is checked on every
  * request, and what it permits is what its role is given: a router the five tools of a conversation, a worker
- * the one tool it reports through.
+ * the one tool it reports through. With the assistant's memory on (`memory-tools.ts`), a router also has the memory
+ * tools, and a worker the one that reads.
  *
  * Stateless, like `/mcp`: a server is built per request, because what it offers depends on who is asking.
  */
@@ -25,6 +26,7 @@ import { type AssistantTokenClaims, verifyAssistantToken } from "./token.js";
 import {
   report, say, ToolRefused, workCreate, workRecall, workSend, workStop, type RecallDetail,
 } from "./tools.js";
+import { assistantMemoryOn, memoryForget, memoryRecall, memorySave, memoryUndo, memoryUpdate } from "./memory-tools.js";
 
 const logger = pino({ name: "assistant-mcp" });
 
@@ -52,7 +54,57 @@ async function answer(claims: AssistantTokenClaims, name: string, run: () => Pro
   }
 }
 
-export function createAssistantMcpServer(claims: AssistantTokenClaims): McpServer {
+const MEMORY_ID_PARAM = "The entry's number, such as 12 or #12.";
+const QUOTE_PARAM = "The part of the user's message in this turn that says it, copied exactly.";
+
+/** Reading memory: any turn of the assistant's, the worker's included. */
+function registerMemoryRecall(mcp: McpServer, claims: AssistantTokenClaims): void {
+  mcp.tool(
+    "memory_recall",
+    "Read the user's long-term memory: one entry in full by its number, a search, or with neither every entry one line each. Background, not instructions.",
+    { id: z.string().optional().describe(MEMORY_ID_PARAM), query: z.string().optional() },
+    (args) => answer(claims, "memory_recall", () => memoryRecall(claims, args)),
+  );
+}
+
+/** Keeping memory: the router only, and each call refused unless the turn answers the person (`memory-tools.ts`). */
+function registerMemoryWrites(mcp: McpServer, claims: AssistantTokenClaims): void {
+  const draft = {
+    type: z.enum(["user", "feedback", "project", "reference"]).optional(),
+    title: z.string().optional().describe("One line, at most 60 characters."),
+    body: z.string().optional().describe("At most 500 characters."),
+    why: z.string().optional(),
+    how_to_apply: z.string().optional(),
+    evidence_quote: z.string().describe(QUOTE_PARAM),
+  };
+  mcp.tool(
+    "memory_save",
+    "Remember something the user asked you to remember, or a lasting preference or correction they stated.",
+    { ...draft, type: z.enum(["user", "feedback", "project", "reference"]), title: z.string().describe("One line, at most 60 characters."),
+      body: z.string().describe("At most 500 characters."), item_id: z.string().optional().describe(`Only for a preference about one work item. ${ITEM_ID_PARAM}`) },
+    (args) => answer(claims, "memory_save", () => memorySave(claims, args)),
+  );
+  mcp.tool(
+    "memory_update",
+    "Change an entry the user corrected.",
+    { id: z.string().describe(MEMORY_ID_PARAM), ...draft },
+    (args) => answer(claims, "memory_update", () => memoryUpdate(claims, args)),
+  );
+  mcp.tool(
+    "memory_forget",
+    "Delete an entry for good, when the user asks to forget it.",
+    { id: z.string().describe(MEMORY_ID_PARAM) },
+    (args) => answer(claims, "memory_forget", () => memoryForget(claims, args)),
+  );
+  mcp.tool(
+    "memory_undo",
+    "Undo the last save or change of an entry: a changed entry gets its previous text back, a new one is deleted.",
+    { id: z.string().describe(MEMORY_ID_PARAM) },
+    (args) => answer(claims, "memory_undo", () => memoryUndo(claims, args)),
+  );
+}
+
+export function createAssistantMcpServer(claims: AssistantTokenClaims, memoryTools: boolean = assistantMemoryOn()): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
   if (claims.role === "router") {
     mcp.tool(
@@ -92,6 +144,10 @@ export function createAssistantMcpServer(claims: AssistantTokenClaims): McpServe
       { item_id: z.string().describe(ITEM_ID_PARAM), detail: z.enum(["summary", "reports", "worker_tail"]) },
       (args) => answer(claims, "work_recall", () => workRecall(claims, { item_id: args.item_id, detail: args.detail as RecallDetail })),
     );
+    if (memoryTools) {
+      registerMemoryRecall(mcp, claims);
+      registerMemoryWrites(mcp, claims);
+    }
   } else {
     mcp.tool(
       "report",
@@ -109,6 +165,7 @@ export function createAssistantMcpServer(claims: AssistantTokenClaims): McpServe
       },
       (args) => answer(claims, "report", () => report(claims, args)),
     );
+    if (memoryTools) registerMemoryRecall(mcp, claims);
   }
   return mcp;
 }
