@@ -21,7 +21,8 @@
  *   G4  a conversation others read (`memory: "off"`, a group's) never writes personal memory; nor a user who has memory off
  *   G5  the person's say is asked again inside the transaction that writes: a turn that stops being theirs in between
  *       writes nothing
- *   G6  a turn that has ended cannot act; a worker cannot write; another user's entry is not reachable
+ *   G6  a turn that has ended cannot act; a worker cannot write; an observer neither reads nor writes; another user's
+ *       entry is not reachable
  *   I1  an entry about one item is bound to it: listed to the router with the item's number, shown in full to that item's
  *       worker only, kept out of the chat's catalogue; another user's item cannot be named
  *   I2  a review item's session is shown what was bound to its item and nothing else of the user's memory, and nothing in
@@ -270,6 +271,10 @@ describe("assistant memory tools", { skip }, () => {
     signedIn.set(worker.mid, { userId: "alice", content: `忘掉 #${id}`, receivedAt: await now() });
     assert.equal(await code(mt.memoryForget(worker, { id: String(id) })), "not_allowed");
     assert.equal(await code(mt.memorySave(worker, { type: "user", title: "x", body: "忘掉", evidence_quote: "忘掉" })), "not_allowed");
+    // An observer's tools only record (`observeEveryTool`); were one to run, it reads and writes nothing of the user's memory.
+    const observer = { ...(await w.routerTurn(alice)), role: "observer" } as unknown as Claims;
+    assert.equal(await code(mt.memoryRecall(observer, {})), "not_allowed");
+    assert.equal(await code(mt.memoryForget(observer, { id: String(id) })), "not_allowed");
     const bobs = await message(bob, `忘掉 #${id}`);
     assert.equal(await code(mt.memoryForget(bobs, { id: String(id) })), "not_found");
     assert.equal((await entries()).length, 1);

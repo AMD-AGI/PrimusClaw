@@ -195,6 +195,7 @@ function full(r: MemoryRow): Record<string, unknown> {
 export async function memoryRecall(
   claims: AssistantTokenClaims, args: { id?: unknown; query?: unknown },
 ): Promise<Record<string, unknown>> {
+  if (claims.role !== "router" && claims.role !== "worker") throw new ToolRefused("not_allowed", `this tool is not for the ${claims.role}`);
   const { userId } = await inTransaction(async (q) => {
     const turn = await assertLiveRun(q, claims);
     await requireMemoryHere(q, claims.sid, turn.userId);
