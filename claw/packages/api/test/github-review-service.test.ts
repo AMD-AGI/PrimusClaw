@@ -1391,6 +1391,15 @@ describe("E the review the instructions ask for, held to by the tools", () => {
     assert.equal(reason(await submit({ event: "APPROVE" })), "second_pass_required");
     await unreviewed({ CLAW_GITHUB_REVIEW_DEEP_ENABLED: "false" });
     assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
+    // A head with letters in it, named in capitals in the second pass's prompt, is still that head.
+    await unreviewed();
+    const head = "ab".repeat(20);
+    e.gh.pr.head = { ...e.gh.pr.head, sha: head };
+    e.gh.graphql.headRefOid = head;
+    await reviewedHead(e, { head, secondPass: false });
+    await subAgentEnded(e, { prompt: `Second pass of ${head.slice(0, 7).toUpperCase()} in /workspace/demo.` });
+    const approval = await submit({ event: "APPROVE", head_sha: head });
+    assert.equal(approval.body.status, "submitted", approval.text);
   });
 
   test("E4 the whole review through the tools: the read records the sandbox path, the approval waits for the second pass, and the merge goes ahead on this session's own approval", async () => {
