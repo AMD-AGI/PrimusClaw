@@ -600,20 +600,21 @@ describe("assistant review tools", { skip }, () => {
 
     // A message that names the pull request without saying yes to it is no allow either.
     for (const text of ["224 别合", "224 先别合，我再看看", "what's the status of PR 224?", "224 怎么样了", "don't merge 224", "224 merge status",
-      "224 可以合入吗", "wait on 224", "no, not 224"]) {
+      "224 可以合入吗", "wait on 224", "no, not 224", "224 不可以合入", "224 不应该合", "224 还没同意", "224 先等等再合", "224 你可以合入了？",
+      "you shouldn't merge 224", "224 can't be merged yet", "ok, but hold 224", "merge 224 only if CI passes", "224 暂缓，未确认"]) {
       const named = await userTurn(alice, text, { context: ctx });
       assert.equal(await code(rt.confirmationAnswer(named, { decision: "allow", confirmation_id: c224 })), "allow_not_in_message", text);
     }
     assert.equal(calls.decide.length, 0);
 
     // The person's own words still work, beside the same list.
-    for (const text of ["224 可以合入", "go ahead with 224", "224 lgtm, merge it", "ok 224", "AMD-AGI/PrimusClaw#224 同意"]) {
+    for (const text of ["224 可以合入", "go ahead with 224", "224 lgtm, merge it", "ok 224", "AMD-AGI/PrimusClaw#224 同意", "224 没问题，合吧", "224 不错，可以合"]) {
       await w.q("UPDATE claw_github_confirmations SET status = 'pending', decided_at = NULL WHERE confirmation_id = $1", [c224]);
       const yes = await userTurn(alice, text, { context: ctx });
       await rt.confirmationAnswer(yes, { decision: "allow" });
       assert.deepEqual(calls.decide.at(-1), { userId: alice.userId, id: c224, decision: "allow", via: null }, text);
     }
-    assert.equal(calls.decide.length, 5);
+    assert.equal(calls.decide.length, 7);
     const brief = await userTurn(alice, "晨报关掉", { context: ctx });
     await rt.channelAction(brief, { name: "brief", args: "off" });
     assert.equal(await count("claw_notification_outbox"), 1);

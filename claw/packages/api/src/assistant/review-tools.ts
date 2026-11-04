@@ -369,8 +369,11 @@ export function confirmationNamed(
 
 /** Words that say yes to a held write. */
 const APPROVAL = /可以|合吧|合入|合并|合了|同意|批准|放行|通过|确认|没问题|行|好|(?<![a-z])(?:yes|yep|ok|okay|sure|approve[sd]?|allow|go ahead|proceed|lgtm|ship it|merge(?: it)?|confirm(?:ed)?)(?![a-z])/i;
-/** Words that say no, not yet, or ask: a message with any of them is not a yes, whatever else it says. */
-const NOT_APPROVAL = /别|不要|不用|不行|不能|不合|先不|暂不|不同意|拒绝|取消|停|等等|等一下|再看|吗|么|怎么样|进度|情况|状态|[?？]|(?<![a-z])(?:no|nope|not|don't|dont|do not|never|deny|reject|cancel|hold|wait|stop|status|why|how|what|when|whether|later)(?![a-z])/i;
+/**
+ * Words that say no, not yet, or ask: a message with any of them is not a yes, whatever else it says. Any 不 or 没 counts
+ * (不可以, 不应该, 没同意), except in 不错 and 没问题; any English contraction in n't counts (shouldn't, won't).
+ */
+const NOT_APPROVAL = /不(?!错)|没(?!问题)|别|勿|莫|甭|否|未|拒|取消|停|撤|等|再看|慢着|吗|么|呢|怎|进度|情况|状态|[?？]|n['’]t\b|(?<![a-z])(?:no|nope|not|never|neither|nor|cannot|deny|reject|refuse|cancel|abort|revert|undo|block|hold|wait|pause|stop|status|why|how|what|when|whether|later|if)(?![a-z])/i;
 
 /**
  * Whether the person's message says yes, and only yes: an approval word, and no word of refusal, delay or question. Naming
