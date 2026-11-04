@@ -338,6 +338,7 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
     "assistant/messages.ts": "queueServerMessage: refuses a session with config.acting_as unless it is handed the attended proof (below)",
     "assistant/tools.ts": "work_create makes sessions without acting_as; work_send into a review item's session is refused by queueServerMessage, which it gives no proof",
     "assistant/reports.ts": "wakes the user's router session, which never carries acting_as",
+    "assistant/observe.ts": "queues a place's message on the caller's own watcher session, made without acting_as; queueServerMessage, given no proof, refuses one that carries it",
     "assistant/review-items.ts": "queues a review session's first message with the proof that routes/assistant.ts's request passed checkSessionCreate (below)",
     "routes/a2a.ts": "A2A sessions are made by A2A for its caller (a2a_caller_id) and never carry config.acting_as",
     "routes/a2a-v2.ts": "the same sessions: the decision it forwards answers a turn of one of them",

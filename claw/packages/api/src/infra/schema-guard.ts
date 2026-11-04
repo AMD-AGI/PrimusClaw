@@ -249,6 +249,17 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     onlyWhenAssistant: true,
     columns: ["say_id", "user_id", "item_id", "item_attention_seq", "text", "fallback", "created_at", "delivered_at"],
   },
+  {
+    table: "claw_assistant_scopes",
+    // What makes a session an observer, whose every tool only records: absent, the role lookup fails and so does the turn.
+    onlyWhenAssistant: true,
+    columns: ["user_id", "scope", "mode", "session_id", "mode_set_at", "mode_set_via", "created_at", "updated_at"],
+  },
+  {
+    table: "claw_assistant_observations",
+    onlyWhenAssistant: true,
+    columns: ["id", "user_id", "scope", "session_id", "run_id", "tool", "args", "created_at"],
+  },
 ];
 
 /**
