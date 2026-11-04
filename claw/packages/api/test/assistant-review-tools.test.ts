@@ -33,6 +33,7 @@
  *   W1  work_send refuses a review item; work_stop stops one only in a turn that answers the person
  *   W2  work_stop stops only the review the person's message points at
  *   W3  a pull request written with # is that pull request, never the item that happens to have its number
+ *   W4  the only review is meant when the message names nothing else, never when it names another pull request or item
  *   P1  a user's message stops the router turn that is reading a report, and never one that answers them
  *   F1  a turn that answered the user and failed says so once, in their language; a report's turn does not
  *   T1  the tools exist only with CLAW_ASSISTANT_TOOLS on
@@ -579,6 +580,24 @@ describe("assistant review tools", { skip }, () => {
     await w.closeRun(bare.task_id);
     assert.equal(calls.restart.length, 0);
     assert.equal(rt.mentionsItem("PR #5 and #12", 12), true, "an item number beside a pull request is still the item");
+  });
+
+  test("W4 the only review is meant when the message names nothing else, never when it names another pull request or item", async () => {
+    const only = await reviewItem(alice, 12, { owner: "AMD-AGI", repo: "PrimusClaw", number: 500 });
+    for (const text of ["stop PR #12", "停 PR 12", "stop #7", "stop AMD-AGI/PrimusClaw#12", "停掉 https://github.com/AMD-AGI/PrimusClaw/pull/12"]) {
+      const turn = await userTurn(alice, text);
+      assert.equal(await code(w.mod.tools.workStop(turn, { item_id: only, reason: "user said stop" })), "item_not_in_message", text);
+      assert.equal(await code(rt.reviewRestart(turn, { item_id: only, model: "claude-opus-4-8" })), "item_not_in_message", text);
+      await w.closeRun(turn.task_id);
+    }
+    assert.equal((await w.item(only)).board_state, "in_progress");
+    assert.equal(calls.restart.length, 0);
+    const pr = { owner: "AMD-AGI", repo: "PrimusClaw", number: 500 };
+    for (const text of ["停掉", "stop it", "stop #12", "stop PR #500", "AMD-AGI/PrimusClaw#500 停掉"]) {
+      assert.equal(rt.namesOtherTarget(text, pr, 12), false, text);
+    }
+    const plain = await userTurn(alice, "停掉吧");
+    assert.equal((await w.mod.tools.workStop(plain, { item_id: only, reason: "user said stop" })).outcome, "stopped");
   });
 
   test("P1 a user's message stops the router turn reading a report, and never one that answers them", async () => {

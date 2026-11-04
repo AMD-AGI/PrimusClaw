@@ -270,7 +270,25 @@ function pointsAtReview(message: TurnMessage, reviews: ReviewRow[], item: Review
     && (sharing === 1 || repoGrounded(message.content, pr, message.context.repos, []));
   // `#N` where N is also the number of a pull request under review is that pull request, not item #N.
   const bySeq = mentionsItem(message.content, item.seq) && !reviews.some((r) => Number(r.params?.pr?.number) === item.seq);
-  return byNumber || bySeq || reviews.length === 1;
+  // The only review is the one meant when the message names no other: "stop it" is that review, "stop PR #12" is not
+  // when it reviews #500, whatever its item number.
+  return byNumber || bySeq || (reviews.length === 1 && !!pr && !namesOtherTarget(message.content, pr, item.seq));
+}
+
+/**
+ * Whether the text names a pull request or an item other than this review's: a `#N`, a `PR N` / `pull request N`, or an
+ * `owner/repo#N` / URL that is neither its pull request nor its item number.
+ */
+export function namesOtherTarget(text: string, pr: PrRef, seq: number): boolean {
+  const number = Number(pr.number);
+  for (const m of text.matchAll(/(?<![A-Za-z0-9_.-])#(\d{1,9})(?![0-9])/g)) {
+    if (Number(m[1]) !== number && Number(m[1]) !== seq) return true;
+  }
+  for (const m of text.matchAll(/(?:\bprs?|\bpull(?:\s+request)?|拉取请求|合并请求)[\s:：#]*(\d{1,9})(?![0-9])/gi)) {
+    if (Number(m[1]) !== number) return true;
+  }
+  const own = `${pr.owner}/${pr.repo}#${number}`.toLowerCase();
+  return fullRefsIn(text).some((r) => r !== own);
 }
 
 /**

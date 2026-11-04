@@ -189,7 +189,8 @@ export async function decideConfirmation(
     await denyForStoppedReview(id);
     return { http: 200, body: { ok: true, status: "denied", reason: "review_stopped" } };
   }
-  const answer = await service.decide(deciderUserId, id, decision, via);
+  // Asked again where the answer is given (`decide` claims the row, then asks): a stop that lands between the two checks decides nothing.
+  const answer = await service.decide(deciderUserId, id, decision, via, guard ? () => inTransaction(guard) : undefined);
   const decided = await getConfirmation(database, id).catch(() => null);
   if (decided) await syncReviewItemOfSession(decided.sessionId).catch((err) => logger.warn({ err }, "github_review.review_item_sync_failed"));
   return answer;
