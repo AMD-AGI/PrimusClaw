@@ -19,7 +19,7 @@ import { parseItemRef } from "../../src/assistant/item-ref.js";
 import { createAssistantMcpServer } from "../../src/assistant/mcp.js";
 import { renderReviewContext, renderRouterSystem, WORK_EVENT_PREFIX } from "../../src/assistant/prompts.js";
 import {
-  actionRequested, confirmationNamed, mentionsNumber, modelGrounded, parsePrs, prGrounded, repoGrounded,
+  actionRequested, approvalInMessage, confirmationNamed, mentionsNumber, modelGrounded, parsePrs, prGrounded, repoGrounded,
 } from "../../src/assistant/review-tools.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
 import type { Block, Llm, Message, ModelResponse, ToolSchema } from "./assistant-router-eval-lib.js";
@@ -132,6 +132,7 @@ export function standIn(c: ReviewEvalCase) {
         if (!input.confirmation_id && !input.pr) pick = pending.length === 1 ? pending[0] : undefined;
         if (!pick) return refuse("confirmation_not_found");
         if (input.decision === "allow" && !confirmationNamed(text, pick, pending)) return refuse("pr_not_in_message");
+        if (input.decision === "allow" && !approvalInMessage(text)) return refuse("allow_not_in_message");
         return { ...ok({ status: input.decision === "allow" ? "merged" : "denied" }), confirmation: pick.pr };
       }
       case "review_mode_set":

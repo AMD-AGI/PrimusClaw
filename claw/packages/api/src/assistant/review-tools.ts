@@ -367,6 +367,20 @@ export function confirmationNamed(
   return prGrounded(text, ref) && (sharing === 1 || repoGrounded(text, ref, [], []));
 }
 
+/** Words that say yes to a held write. */
+const APPROVAL = /可以|合吧|合入|合并|合了|同意|批准|放行|通过|确认|没问题|行|好|(?<![a-z])(?:yes|yep|ok|okay|sure|approve[sd]?|allow|go ahead|proceed|lgtm|ship it|merge(?: it)?|confirm(?:ed)?)(?![a-z])/i;
+/** Words that say no, not yet, or ask: a message with any of them is not a yes, whatever else it says. */
+const NOT_APPROVAL = /别|不要|不用|不行|不能|不合|先不|暂不|不同意|拒绝|取消|停|等等|等一下|再看|吗|么|怎么样|进度|情况|状态|[?？]|(?<![a-z])(?:no|nope|not|don't|dont|do not|never|deny|reject|cancel|hold|wait|stop|status|why|how|what|when|whether|later)(?![a-z])/i;
+
+/**
+ * Whether the person's message says yes, and only yes: an approval word, and no word of refusal, delay or question. Naming
+ * the pull request is not saying yes to it ("224 别合", "status of 224?"). Read in code, as the name is: the router reads what
+ * workers wrote beside the message, and only the person's words let a write through.
+ */
+export function approvalInMessage(text: string): boolean {
+  return APPROVAL.test(text) && !NOT_APPROVAL.test(text);
+}
+
 export async function confirmationAnswer(
   claims: AssistantTokenClaims, args: { decision: "allow" | "deny"; confirmation_id?: string; pr?: string },
 ): Promise<Record<string, unknown>> {
@@ -403,6 +417,9 @@ export async function confirmationAnswer(
       }
       if (!confirmationNamed(message.content, pick, pending)) {
         refuseUngrounded("pr_not_in_message", `the user's message does not name ${pick.repo}#${pick.pr}: ask them to say which pull request to let through`);
+      }
+      if (!approvalInMessage(message.content)) {
+        refuseUngrounded("allow_not_in_message", `the user's message does not say yes to ${pick.repo}#${pick.pr}: do not let it through; ask them, or let them press the button`);
       }
     }
     return { userId, via, id: pick.id, repo: pick.repo, pr: pick.pr };

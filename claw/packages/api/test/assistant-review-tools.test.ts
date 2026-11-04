@@ -28,7 +28,7 @@
  *   R1  review_restart takes a review the user pointed at, and only a review
  *   R1b an item number is read whole: #11 does not point at #1, nor repo#1 at item #1
  *   C1  confirmation_answer allows only a write the user named, by its pull request or its confirmation id, asked before they
- *       wrote; being the only one waiting names nothing; deny needs no name
+ *       wrote, in a message that says yes; being the only one waiting names nothing; deny needs no name
  *   M1  review_mode_set can only make reviews ask more
  *   X1  channel_action emits the listed action once, to the channel that carried the message, when the message asks for it
  *   U1  what a worker wrote in the item list (summary, question) never makes an unrelated signed-in message allow a write or run
@@ -598,10 +598,22 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(calls.decide.length, 0);
     assert.equal(await count("claw_notification_outbox"), 0);
 
+    // A message that names the pull request without saying yes to it is no allow either.
+    for (const text of ["224 别合", "224 先别合，我再看看", "what's the status of PR 224?", "224 怎么样了", "don't merge 224", "224 merge status",
+      "224 可以合入吗", "wait on 224", "no, not 224"]) {
+      const named = await userTurn(alice, text, { context: ctx });
+      assert.equal(await code(rt.confirmationAnswer(named, { decision: "allow", confirmation_id: c224 })), "allow_not_in_message", text);
+    }
+    assert.equal(calls.decide.length, 0);
+
     // The person's own words still work, beside the same list.
-    const yes = await userTurn(alice, "224 可以合入", { context: ctx });
-    await rt.confirmationAnswer(yes, { decision: "allow" });
-    assert.deepEqual(calls.decide.at(-1), { userId: alice.userId, id: c224, decision: "allow", via: null });
+    for (const text of ["224 可以合入", "go ahead with 224", "224 lgtm, merge it", "ok 224", "AMD-AGI/PrimusClaw#224 同意"]) {
+      await w.q("UPDATE claw_github_confirmations SET status = 'pending', decided_at = NULL WHERE confirmation_id = $1", [c224]);
+      const yes = await userTurn(alice, text, { context: ctx });
+      await rt.confirmationAnswer(yes, { decision: "allow" });
+      assert.deepEqual(calls.decide.at(-1), { userId: alice.userId, id: c224, decision: "allow", via: null }, text);
+    }
+    assert.equal(calls.decide.length, 5);
     const brief = await userTurn(alice, "晨报关掉", { context: ctx });
     await rt.channelAction(brief, { name: "brief", args: "off" });
     assert.equal(await count("claw_notification_outbox"), 1);
