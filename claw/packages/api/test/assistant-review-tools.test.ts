@@ -16,6 +16,7 @@
  *   A1  a turn that answers no signed-in message cannot act: a report's turn, a key's message, an injected report
  *   A2  the person's say goes stale after CLAW_ASSISTANT_ATTENDED_TTL_SEC
  *   A3  a turn that read what a worker wrote (work_recall) no longer acts for the person
+ *   A4  a turn the person interrupts while the review service works writes nothing: the service asks again as it writes
  *   S1  review_start hands across exactly what the user asked: prs, review only or merge, reviewer, model, who and which message
  *   S2  a pull request must be in the user's message, as a number of its own
  *   S2b a number written in full with its repository binds the two
@@ -258,6 +259,35 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(calls.start.length, 1);
   });
 
+  test("A4 a turn the person interrupts while the review service works writes nothing: the service asks again as it writes", async () => {
+    const { inTransaction } = await import("../src/infra/db.js");
+    const ports = { ...rt.reviewToolPorts };
+    const guards: string[] = [];
+    // Each stand-in does what the service does with the guard: asks it in the transaction that would write, here after the turn ended.
+    const late = (turn: Claims) => async (guard: unknown) => {
+      assert.equal(typeof guard, "function", "the tool hands the service a guard");
+      await w.closeRun(turn.task_id);
+      guards.push("asked");
+      await inTransaction(guard as never);
+    };
+    try {
+      await reviewItem(alice, 1, { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 });
+      const c = await confirmation(alice.userId, 254);
+      const start = await userTurn(alice, "审 254");
+      rt.reviewToolPorts.startReviews = (async (_u: unknown, _m: unknown, _r: unknown, guard: unknown) => late(start)(guard)) as never;
+      assert.equal(await code(rt.reviewStart(start, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false })), "turn_not_live");
+      const restart = await userTurn(alice, "换 opus 重审 254");
+      rt.reviewToolPorts.restartReview = (async (_u: unknown, _m: unknown, _i: unknown, _c: unknown, guard: unknown) => late(restart)(guard)) as never;
+      assert.equal(await code(rt.reviewRestart(restart, { item_id: "#1", model: "claude-opus-4-8" })), "turn_not_live");
+      const allow = await userTurn(alice, "254 可以合入");
+      rt.reviewToolPorts.decide = (async (_u: unknown, _i: unknown, _d: unknown, _v: unknown, guard: unknown) => late(allow)(guard)) as never;
+      assert.equal(await code(rt.confirmationAnswer(allow, { decision: "allow", confirmation_id: c })), "turn_not_live");
+      assert.deepEqual(guards, ["asked", "asked", "asked"]);
+    } finally {
+      Object.assign(rt.reviewToolPorts, ports);
+    }
+  });
+
   test("S1 review_start hands across exactly what the user asked", async () => {
     const ctx = { ...DEFAULT_CTX, people: [{ name: "Wei Lei", user_id: "u-weilei", email: "weilei@amd.com" }] };
     const turn = await userTurn(alice, "请 Wei Lei 用 opus 审 254 和 257，审完合入", { context: ctx });
@@ -327,7 +357,7 @@ describe("assistant review tools", { skip }, () => {
 
   test("S3b a repository is named whole: not by a longer name that starts with it, nor under another owner", async () => {
     const bare = { channel: "teams", channel_message_id: "a" };
-    for (const text of ["审 AMD-AGI/PrimusClaw-fork 254", "审 AMD-AGI/PrimusClaw.old 254", "审 someone/PrimusClaw 254", "审 PrimusClaw-fork 254"]) {
+    for (const text of ["审 AMD-AGI/PrimusClaw-fork 254", "审 AMD-AGI/PrimusClaw.old 254", "审 someone/PrimusClaw 254", "审 PrimusClaw-fork 254", "审 AMD-AGI/PrimusClaw..fork 254"]) {
       const turn = await userTurn(alice, text, { context: bare });
       assert.equal(await code(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false })), "repo_not_grounded", text);
     }

@@ -32,7 +32,7 @@ import { identityClient } from "../auth/identity.js";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
-import { db } from "../infra/db.js";
+import { db, inTransaction, type Querier } from "../infra/db.js";
 import { parseActingAs } from "./acting-as.js";
 import { classifyAttendedCaller } from "./attended.js";
 import { reviewOnlyOf, reviewTargetOf } from "./review-target.js";
@@ -172,13 +172,17 @@ export function githubReviewService(): GithubReview {
 /**
  * The acting user's answer to a held write, as everyone who takes one gives it: the decision route and the assistant's
  * `confirmation_answer` both call this, so neither can skip a step the other takes. The caller has already decided who is
- * answering (`deciderUserId`) and how they were present (`via`); only the acting user can answer, here as in `decide`.
+ * answering (`deciderUserId`) and how they were present (`via`); only the acting user can answer, here as in `decide`. A `guard`
+ * that throws decides nothing.
  * A write held by a review its requester stopped is not made, whatever the answer (`confirmationOfStoppedReview`), and
  * the review item of the session, if it is one, closes with the answer.
  */
 export async function decideConfirmation(
   service: GithubReview, database: Queryable, deciderUserId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null,
+  guard?: (query: Querier) => Promise<void>,
 ): Promise<{ http: number; body: Record<string, unknown> }> {
+  // The caller's own condition, asked last before anything is decided (the assistant's tool: its turn is still live).
+  if (guard) await inTransaction(guard);
   if (await confirmationOfStoppedReview(id)) {
     const row = await getConfirmation(database, id);
     if (row && row.actorUserId !== deciderUserId) return { http: 403, body: { ok: false, error: "only_the_acting_user_can_decide" } };

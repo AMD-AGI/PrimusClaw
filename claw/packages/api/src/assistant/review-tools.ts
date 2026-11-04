@@ -44,8 +44,8 @@ export const reviewToolPorts = {
   startReviews,
   restartReview,
   /** The decision route's own function (`decideConfirmation`), with the process's review service, not a copy of it. */
-  decide: (userId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null) =>
-    decideConfirmation(githubReviewService(), db, userId, id, decision, via),
+  decide: (userId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null, guard?: (q: Querier) => Promise<void>) =>
+    decideConfirmation(githubReviewService(), db, userId, id, decision, via, guard),
   kick: (): Promise<void> => kickDelivery(),
 };
 
@@ -86,6 +86,16 @@ async function requesterSignedIn(q: Querier, routerSid: string, userId: string, 
   };
 }
 
+/**
+ * What the review service asks again in the transaction that writes: the turn is still live and still answers the person's
+ * fresh, signed-in message (`attendedTurn`). A turn the person interrupted while the service checked GitHub writes nothing.
+ */
+function stillActing(claims: AssistantTokenClaims, userId: string): (q: Querier) => Promise<void> {
+  return async (q) => {
+    if ((await attendedTurn(q, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");
+  };
+}
+
 /** The review service's answer, as the tool's: its code, words and data, so the router reads what the interface said. */
 async function asTool<T>(run: () => Promise<T>): Promise<T> {
   try {
@@ -113,10 +123,10 @@ export function repoGrounded(text: string, pr: Pick<PrRef, "owner" | "repo">, ch
   const full = lower(`${pr.owner}/${pr.repo}`);
   if ([...channelRepos, ...recentRepos].some((r) => lower(r) === full)) return true;
   const t = lower(text);
-  // The whole name, not the start of a longer one: `PrimusClaw` is not named by `PrimusClaw-fork` or `PrimusClaw.old`.
+  // The whole name, not the start of a longer one: `PrimusClaw` is not named by `PrimusClaw-fork`, `PrimusClaw.old` or `PrimusClaw..old`.
   // A bare name counts unless it is written under an owner (`other/PrimusClaw` names another owner's repository).
   const whole = (name: string, before: string) =>
-    new RegExp(`(?<![${before}])${escapeRe(name)}(?![a-z0-9_-]|\\.[a-z0-9_-])`).test(t);
+    new RegExp(`(?<![${before}])${escapeRe(name)}(?![a-z0-9_-]|\\.+[a-z0-9_-])`).test(t);
   return whole(full, "a-z0-9_.-") || whole(lower(pr.repo), "a-z0-9_./-");
 }
 
@@ -225,7 +235,7 @@ export async function reviewStart(
     ...(ready.actingAsName ? { acting_as_name: ready.actingAsName } : {}),
     ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
     review_only: !args.merge,
-  })));
+  }), stillActing(claims, ready.userId)));
   return { ok: true, items };
 }
 
@@ -283,12 +293,12 @@ export async function reviewRestart(
     if (args.model && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out to keep the one it had");
     }
-    return { itemId: item.item_id, signedIn: await requesterSignedIn(q, claims.sid, userId, message, via) };
+    return { userId, itemId: item.item_id, signedIn: await requesterSignedIn(q, claims.sid, userId, message, via) };
   });
   const restarted = await asTool(async () => reviewToolPorts.restartReview(chosen.signedIn.user, chosen.signedIn.method, chosen.itemId, parseRestartRequest({
     ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
     ...(typeof args.merge === "boolean" ? { review_only: !args.merge } : {}),
-  })));
+  }), stillActing(claims, chosen.userId)));
   return { ok: true, ...restarted };
 }
 
@@ -353,7 +363,7 @@ export async function confirmationAnswer(
     }
     return { userId, via, id: pick.id, repo: pick.repo, pr: pick.pr };
   });
-  const answer = await reviewToolPorts.decide(chosen.userId, chosen.id, args.decision, decidedViaOf(chosen.via));
+  const answer = await reviewToolPorts.decide(chosen.userId, chosen.id, args.decision, decidedViaOf(chosen.via), stillActing(claims, chosen.userId));
   if (answer.http >= 400) {
     const body = answer.body as { error?: string };
     throw new ToolRefused(String(body.error ?? "decision_refused"), "the decision was not taken");

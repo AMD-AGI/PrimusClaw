@@ -518,6 +518,23 @@ describe("assistant review items", { skip }, () => {
     assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [late]))[0].status, "denied");
   });
 
+  test("D1c a caller's guard is asked in the transaction that writes: when it refuses, no item, no restart and no decision is made", async () => {
+    const alice = { userId: "alice", userName: "Name alice", platformKey: "pk-alice", virtualKey: "vk-alice", roles: ["default"] };
+    const gone = async () => { throw new Error("the turn ended"); };
+    await assert.rejects(ri.startReviews(alice, "identity_token", ri.parseReviewRequest({ prs: [PR(254)] }), gone), /the turn ended/);
+    assert.equal(checks.length, 1, "the guard is asked after GitHub was, where the write is");
+    await nothingMade();
+    const it = await one("alice", { prs: [PR(255)] });
+    await assert.rejects(ri.restartReview(alice, "identity_token", it.item_id, ri.parseRestartRequest({ model: "claude-opus-5.5" }), gone), /the turn ended/);
+    assert.equal((await w.item(it.item_id)).board_state, "in_progress", "the old review is not stopped");
+    assert.equal(await count("claw_work_items"), 1, "and no new one is made");
+    const held = await confirmation(it.session_id, "pending");
+    const { reviewToolPorts } = await import("../src/assistant/review-tools.js");
+    await assert.rejects(reviewToolPorts.decide("alice", held, "allow", null, gone), /the turn ended/);
+    assert.equal(decisions.length, 0);
+    assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [held]))[0].status, "pending");
+  });
+
   test("G1 a review session is no worker: no role profile, no worker report at its turn's end, not an orphan to the task sweep", async () => {
     const it = await one("alice");
     assert.equal(await w.mod.role.sessionRole(it.session_id), null, "no report tool, no worker prompt, no worker model");
