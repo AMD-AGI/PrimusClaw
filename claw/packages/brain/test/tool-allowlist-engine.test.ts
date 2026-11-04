@@ -158,3 +158,25 @@ test("the engine hands the router the parsed list, and nothing when the request 
   }
   assert.deepEqual(seen, [["read", "mcp__board__*"], null, null]);
 });
+
+test("a requested review (sandbox_profile review) is held to its fixed list whatever the request lists: no write, no plugin server, and a call outside it is refused", async () => {
+  world.script(ONE("write", { file_path: "/workspace/x", content: "y" }));
+  world.llmBodies.length = 0;
+  const hands = fakeHands();
+  const mcpBefore = pw.mcpCalls.length;
+  await new AgentEngine().execute(
+    baseRequest({
+      session_id: uniqueSession(), plugin_id: 5, plugin_tools: [mcpRow(17, pw.mcpUrl)],
+      tools_allowlist: ["*"], sandbox_profile: "review", memory_enabled: true,
+    }),
+    (async () => {}) as never, undefined, null as never, { attachHands: async () => hands as never } as never,
+  );
+  const offered = ((JSON.parse(world.llmBodies[0]!) as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name).sort();
+  for (const name of ["bash", "read", "task"]) assert.ok(offered.includes(name), `offered ${name}`);
+  for (const name of ["write", "edit", "mcp__board__ping", "save_memory", "deliver_file", "a2a_call", "web_fetch"]) {
+    assert.equal(offered.includes(name), false, `not offered ${name}`);
+  }
+  assert.equal(hands.calls.some((c) => c.name === "write"), false, "the write was not run");
+  assert.ok(refusalIn(world.llmBodies[1] ?? "", "write"), "the model was told it is not available");
+  assert.equal(pw.mcpCalls.length, mcpBefore, "the plugin's server was not reached");
+});

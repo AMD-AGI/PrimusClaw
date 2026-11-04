@@ -16,6 +16,8 @@
 process.env.CLAW_NOTIFICATIONS_ENABLED = "1";
 process.env.CLAW_MEMORY_ENABLED = "1";
 process.env.CLAW_SKILL_EVOLUTION_ENABLED = "1";
+// For the requested review below: its session is told apart only while GitHub review is on.
+process.env.CLAW_GITHUB_REVIEW_ENABLED = "1";
 
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach } from "node:test";
@@ -167,3 +169,14 @@ for (const [name, event] of OUTCOMES) {
   });
 }
 
+
+test("a review someone asked of the owner learns nothing for the owner: no task pattern and no skill evolution from its run", async () => {
+  await seed(false);
+  await h.sql("UPDATE claw_sessions SET config = $2::jsonb WHERE session_id = $1",
+    [SESSION, JSON.stringify({ acting_as: "u-1", requested_by: { user_id: "u-2", label: "U2" }, sandbox_profile: "review" })]);
+  await consume(completion({ final_text: "done", failed: false }));
+  assert.equal(calls.includes("maybeRecordTaskPattern"), false, calls.join(","));
+  assert.equal(calls.includes("enqueueEvolutionJob"), false, calls.join(","));
+  assert.ok(calls.includes("maybeSummarize"), "the rest of the completion is as for any run");
+  assert.ok(calls.includes("recordRunFinished"));
+});

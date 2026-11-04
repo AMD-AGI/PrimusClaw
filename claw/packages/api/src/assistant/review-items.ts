@@ -605,10 +605,10 @@ async function haltRequestedReviews(ownerUserId: string, sessionIds: string[], h
 }
 
 const HALTED: Record<Exclude<DelegationAnswer, "on">, string> = {
-  off: "the reviewer turned off reviews on their behalf",
-  not_bound: "the reviewer has no GitHub account bound",
-  expired: "the reviewer's GitHub authorization has expired",
-  unavailable: "the reviewer's permission could not be confirmed",
+  off: "reviewer turned off reviews for others",
+  not_bound: "reviewer has no GitHub account bound",
+  expired: "reviewer's GitHub authorization expired",
+  unavailable: "reviewer's permission could not be confirmed",
 };
 
 /**
@@ -627,7 +627,7 @@ export async function gateRequestedReviewTurn(sessionId: string): Promise<boolea
   const by = requestedByOf(row.config);
   const actingAs = actingUserOf(row.config);
   if (!by || !actingAs) {
-    await haltRequestedReviews(owner, [sessionId], { reason: "unreadable", message: "who asked for this review cannot be read" }, true);
+    await haltRequestedReviews(owner, [sessionId], { reason: "unreadable", message: "who asked for it cannot be read" }, true);
     return false;
   }
   const answer = await delegationNow(actingAs, by.user_id);
@@ -645,7 +645,7 @@ export async function gateRequestedReviewTurn(sessionId: string): Promise<boolea
   if (turns.left <= 0) {
     await haltRequestedReviews(owner, [sessionId], {
       reason: "turn_budget_used",
-      message: turns.scope === "item" ? "this review used all the model turns one review may take" : "reviews others asked of the reviewer used today's model turns",
+      message: turns.scope === "item" ? "turn budget of this review used up" : "today's turn budget for others' reviews used up",
     }, false);
     return false;
   }
@@ -709,7 +709,7 @@ export function reviewState(f: ReviewFacts): ReviewState {
   ]);
   // A review the server stopped before its turn ran: the owner's to look at, with the reason; never a review in progress for ever.
   if (f.halted && !submitted) {
-    return { boardState: "needs_you", reportKind: "failed", summary: `the review of ${pr} was not run: ${f.halted.message}`, question: `Look at the review of ${pr}` };
+    return { boardState: "needs_you", reportKind: "failed", summary: `${pr} not run: ${f.halted.message}`, question: `Look at the review of ${pr}` };
   }
   if (f.turn === "none") return { boardState: "in_progress", summary: `reviewing ${pr}`, question: null };
   const closed = latest(f.confirmations.filter((c) => ["denied", "stale", "expired", "refused"].includes(c.status)));

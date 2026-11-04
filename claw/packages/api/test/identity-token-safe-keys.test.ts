@@ -675,3 +675,52 @@ describe("K7 a delegated token has no keys, except an allow-listed service's, wh
     assert.equal(user(await run(delegatedBy("fir"), client, { "x-api-key": "ak-alice-platform" })).platformKey, "");
   });
 });
+
+describe("K8 the credentials a service brings for the person a review is asked of (`verifyActingAsCredentials`)", () => {
+  const BOB_DELEGATED = () => mint({ sub: "u-bob", name: "Bob", act: { sub: "svc-chat" }, client_id: "clawy" });
+  const ask = async (token: string, apiKey: string, over: { actingAs?: string; allowed?: string[] } = {}) => {
+    const { verifyActingAsCredentials } = await import("../src/auth/identity-token.js");
+    return verifyActingAsCredentials({ token, apiKey, actingAs: over.actingAs ?? "u-bob", allowedClients: over.allowed ?? ["clawy"] }, client);
+  };
+  beforeEach(() => { process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = "clawy"; });
+
+  test("the person's delegated token from a service on both lists, and their own key: that person, with their own keys", async () => {
+    const r = await ask(BOB_DELEGATED(), "ak-bob-platform");
+    assert.equal(r.ok, true, JSON.stringify(r));
+    if (!r.ok) return;
+    assert.deepEqual([r.user.userId, r.user.userName, r.user.platformKey, r.user.virtualKey, r.user.delegation],
+      ["u-bob", "Bob", "ak-bob-platform", "sk-bob-virtual", { actorSub: "svc-chat", clientId: "clawy" }]);
+    assert.deepEqual(verifyCalls().map((c) => JSON.parse(c.body).apiKey), ["ak-bob-platform"], "SaFE judged the key");
+    assert.equal(exchangeCalls().length, 0, "nothing is exchanged for it");
+  });
+
+  test("every other combination is refused, and says which", async () => {
+    const cases: Array<[string, () => Promise<Awaited<ReturnType<typeof ask>>>, number, string]> = [
+      ["no token", () => ask("", "ak-bob-platform"), 401, "acting_as_credentials_required"],
+      ["no key", () => ask(BOB_DELEGATED(), ""), 401, "acting_as_credentials_required"],
+      ["the person's token with the requester's key", () => ask(BOB_DELEGATED(), "ak-alice-platform"), 401, "key_subject_mismatch"],
+      ["a key SaFE does not know", () => ask(BOB_DELEGATED(), "ak-nobody"), 401, "invalid_acting_as_api_key"],
+      ["someone else's token", () => ask(mint({ sub: "u-alice", act: { sub: "svc-chat" }, client_id: "clawy" }), "ak-bob-platform"), 403, "acting_as_mismatch"],
+      ["the person's own sign-in, not a service's", () => ask(mint({ sub: "u-bob", client_id: "clawy" }), "ak-bob-platform"), 403, "acting_as_not_delegated"],
+      ["a service not allowed to speak for a person", () => ask(BOB_DELEGATED(), "ak-bob-platform", { allowed: ["other"] }), 403, "service_client_not_allowed"],
+      ["a forged signature", () => ask(mint({ sub: "u-bob", act: { sub: "svc-chat" }, client_id: "clawy" }, testKey("ES256", "k-es", true)), "ak-bob-platform"), 401, "invalid_acting_as_token"],
+      ["a token without the API scope", () => ask(mint({ sub: "u-bob", act: { sub: "svc-chat" }, client_id: "clawy", scope: "openid" }), "ak-bob-platform"), 401, "invalid_acting_as_token"],
+      ["an ak- key as the token", () => ask("ak-bob-platform", "ak-bob-platform"), 401, "invalid_acting_as_token"],
+    ];
+    for (const [what, run, status, error] of cases) {
+      const r = await run();
+      assert.equal(r.ok, false, what);
+      if (!r.ok) assert.deepEqual([r.status, r.error], [status, error], what);
+    }
+    // A service on the decision list that may not bring a person's own key is refused as well.
+    process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = "someone-else";
+    const r = await ask(BOB_DELEGATED(), "ak-bob-platform");
+    assert.deepEqual(r.ok ? null : [r.status, r.error], [403, "service_client_not_allowed"]);
+  });
+
+  test("without the identity-token path there is nothing to verify with: 503, never a yes", async () => {
+    process.env.CLAW_IDENTITY_TOKEN_AUTH_ENABLED = "false";
+    const r = await ask(BOB_DELEGATED(), "ak-bob-platform");
+    assert.deepEqual(r.ok ? null : [r.status, r.error], [503, "acting_as_unverifiable"]);
+  });
+});

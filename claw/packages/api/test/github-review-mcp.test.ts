@@ -105,6 +105,25 @@ describe("A who may call", () => {
   });
 });
 
+describe("A' who asked, for a review asked of the acting user", () => {
+  beforeEach(async () => { await boot(); });
+
+  test("A4 the requester of a review the server recorded as asked of its owner is who asked; any other session's is its owner, whatever its config says", async () => {
+    const post = (bearer: string) => fetch(`${base}/v1/internal/github-review/mcp`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${bearer}` }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+    // bob's own session, which alice asked for (what `POST /v1/assistant/reviews` writes).
+    await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-2', 'u-bob', $1::jsonb)",
+      [JSON.stringify({ acting_as: "u-bob", requested_by: { user_id: "u-alice", label: "Alice A" }, sandbox_profile: "review" })]);
+    assert.equal((await post(token({ sessionId: "s-2", requesterUserId: "u-alice" }))).status, 200, "the token names who asked");
+    assert.equal((await post(token({ sessionId: "s-2", requesterUserId: "u-bob" }))).status, 403, "not the owner: they did not ask");
+    // A session alice owns that names bob and claims bob asked: alice's own, and never bob's own review of himself.
+    await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-3', 'u-alice', $1::jsonb)",
+      [JSON.stringify({ acting_as: "u-bob", requested_by: { user_id: "u-bob", label: "Bob" } })]);
+    assert.equal((await post(token({ sessionId: "s-3", requesterUserId: "u-bob" }))).status, 403);
+    assert.equal((await post(token({ sessionId: "s-3", requesterUserId: "u-alice" }))).status, 200);
+    assert.equal(e.gh.calls.length, 0);
+  });
+});
+
 describe("B a tool call", () => {
   beforeEach(async () => { await boot(); });
 

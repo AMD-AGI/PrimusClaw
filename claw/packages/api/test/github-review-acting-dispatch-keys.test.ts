@@ -25,6 +25,8 @@ process.env.CLAW_GITHUB_REVIEW_ENABLED = "true";
 process.env.CLAW_GITHUB_REVIEW_MCP_SECRET = "t".repeat(40);
 process.env.TASK_DISPATCH_STAGE_TIMEOUT_MS = "200";
 process.env.CLAW_DEPLOY_MODE = "safe";
+// The deployment's CPU sandbox workspace, where a requested review's sandbox goes (D5, D6); without one such a review has no sandbox tools.
+process.env.SANDBOX_CPU_NAMESPACE = "global-cpu";
 process.env.CLAW_GITHUB_REVIEW_EFFORT = "high"; // left over from a deployment that set it: no longer read, a turn carries only its session's own effort
 
 const { db } = await import("../src/infra/db.js");
@@ -69,7 +71,7 @@ const ACTING: Array<[string, unknown, boolean]> = [
   ["no acting_as", undefined, false],
 ];
 
-async function claim(actingAs: unknown, model = "claude-opus-5.5", effort?: string): Promise<{ request: Record<string, unknown>; asked: string[] }> {
+async function claim(actingAs: unknown, model = "claude-opus-5.5", effort?: string, config?: Record<string, unknown>): Promise<{ request: Record<string, unknown>; asked: string[] }> {
   const asked: string[] = [];
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
@@ -78,6 +80,8 @@ async function claim(actingAs: unknown, model = "claude-opus-5.5", effort?: stri
       return { rows: [{ task_id: "ktsk_1", session_id: "s-1", status: "preparing", deadline_at: null, input: { prompt: "hello", session_id: "s-1", user_id: "u-1", model, ...(effort ? { effort } : {}), credentials: blob } }], rowCount: 1 };
     }
     if (/SELECT config->'acting_as' AS acting_as FROM claw_sessions/.test(sql)) return { rows: actingAs === undefined ? [{ acting_as: null }] : [{ acting_as: actingAs }], rowCount: 1 };
+    if (config && /^SELECT user_id, config FROM claw_sessions WHERE session_id = \$1 AND deleted_at IS NULL$/.test(sql)) return { rows: [{ user_id: "u-bob", config }], rowCount: 1 };
+    if (/exec_complete/.test(sql)) return { rows: [{ item: 3, day: 10 }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
   const res = await app.inject({ method: "POST", url: "/v1/internal/tasks/ktsk_1/claim", headers: { authorization: `Bearer ${TOKEN}` }, payload: { brain_id: "brain-7" } });
@@ -112,6 +116,7 @@ async function dispatchDag(config: Record<string, unknown>, effort: string | nul
     if (/^SELECT effort FROM claw_sessions WHERE session_id = \$1$/.test(sql)) return { rows: [{ effort }], rowCount: 1 };
     if (/^UPDATE claw_tasks/.test(sql) || /FROM claw_tasks t LEFT JOIN claw_sessions/.test(sql)) return { rows: [taskRow()], rowCount: 1 };
     if (/claw_workspace/.test(sql)) return { rows: [{ workspace_id: "kws_1", storage_prefix: "users/u-1/sessions/s-1/" }], rowCount: 1 };
+    if (/exec_complete/.test(sql)) return { rows: [{ item: 3, day: 10 }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
   const published: Array<Record<string, unknown>> = [];
@@ -137,6 +142,32 @@ test("D2 a task of a DAG is marked for a session that acts as a user, and its ke
     assert.equal(request.sub_agent_max_turns, marked ? 20 : undefined, `${what}: a review's second pass is bounded; any other DAG's is not`);
     assert.equal(request.platform_key, "pk-user-1", `${what}: Brain still needs the key to own the workload`);
   }
+});
+
+/** What `POST /v1/assistant/reviews` writes for a review alice asked of bob. */
+const REQUESTED = { acting_as: "u-bob", requested_by: { user_id: "u-alice", label: "Alice" }, sandbox_profile: "review" };
+const PROFILE_TOOLS = ["mcp__github_review__*", "read", "glob", "grep", "ls", "bash", "bash_output", "kill_shell", "task", "todo_write"];
+
+test("D5 a turn of a review someone asked of the owner is claimed with the fixed review profile, from the live row; the owner's own review is not", async () => {
+  const { request } = await claim("u-bob", "claude-opus-5.5", undefined, REQUESTED);
+  assert.equal(request.sandbox_profile, "review");
+  assert.deepEqual(request.tools_allowlist, PROFILE_TOOLS);
+  assert.equal(request.max_turns, 197, "the turns left: 200 for the review less the 3 it took (the day has more)");
+  assert.deepEqual([request.memory_enabled, request.skill_evolution_enabled, request.withhold_sandbox_keys], [false, false, true]);
+  for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "workspace_id", "topology"]) assert.equal(field in request, false, field);
+  assert.equal(request.platform_key, "pk-live", "Brain still runs it with the session's keys: the reviewer's own");
+  const own = (await claim("u-bob", "claude-opus-5.5", undefined, { acting_as: "u-bob" })).request;
+  assert.deepEqual([own.sandbox_profile, own.tools_allowlist, own.max_turns], [undefined, undefined, undefined], "a review of one's own account is as it was");
+});
+
+test("D6 a task of a DAG in a review someone asked of the owner is dispatched with the same profile", async () => {
+  const request = await dispatchDag({ platform_key: "pk-user-1", _server_managed_credentials: true, ...REQUESTED });
+  assert.equal(request.sandbox_profile, "review");
+  assert.deepEqual(request.tools_allowlist, PROFILE_TOOLS);
+  assert.deepEqual(request.mcp_servers, {});
+  assert.deepEqual([request.memory_enabled, request.skill_evolution_enabled, request.max_turns, request.workspace_id], [false, false, 197, undefined]);
+  const own = await dispatchDag({ platform_key: "pk-user-1", _server_managed_credentials: true, acting_as: "u-bob" });
+  assert.equal(own.sandbox_profile, undefined);
 });
 
 function walk(dir: string): string[] {
