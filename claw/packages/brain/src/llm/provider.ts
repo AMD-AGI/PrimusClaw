@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { Message, ToolSchema } from "@claw/protocol";
+import type { Message, ReasoningEffort, ToolSchema } from "@claw/protocol";
 
 /**
  * Normalized content blocks produced by any LlmProvider. Matches the
@@ -166,6 +166,10 @@ export interface LlmSessionOptions {
   apiKey: string;
   userId?: string;
   sessionId?: string;
+  /** Every `streamTurn` of the session asks for this reasoning effort; absent leaves the gateway's defaults. `complete` keeps its own. */
+  effort?: ReasoningEffort;
+  /** The rolling cache markers of every `streamTurn` are written for five minutes; the anchor keeps `LLM_CACHE_TTL`. */
+  rollingCacheTtl?: "5m";
 }
 
 export interface LlmProvider {

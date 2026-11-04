@@ -259,3 +259,17 @@ test("H4 a non-text block is named, not dropped", () => {
   );
   assert.equal(mcpContentText(undefined), "");
 });
+
+test("gh_pr_get of the github_review server is cut only past its own bound; the same text from any other tool at the generic cap", async () => {
+  const { GITHUB_REVIEW_READ_TOOL, GITHUB_REVIEW_READ_MAX_CHARS } = await import("../src/agent/agent-loop.js");
+  const page = "d".repeat(23_000);
+  // [tool, text, kept whole]
+  const cases: Array<[string, string, boolean]> = [
+    [GITHUB_REVIEW_READ_TOOL, page, true],
+    [GITHUB_REVIEW_READ_TOOL, "d".repeat(GITHUB_REVIEW_READ_MAX_CHARS), true],
+    [GITHUB_REVIEW_READ_TOOL, "d".repeat(GITHUB_REVIEW_READ_MAX_CHARS + 1), false],
+    ["mcp__other__gh_pr_get", page, false],
+    ["bash", page, false],
+  ];
+  for (const [tool, text, whole] of cases) assert.equal(truncateToolResult(text, tool) === text, whole, `${tool} ${text.length}`);
+});

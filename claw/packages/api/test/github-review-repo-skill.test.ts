@@ -18,7 +18,7 @@ after(closeShared);
 
 const ref = parsePrRef("AMD-AGI/demo#7")!;
 const pick = async (gh: FakeGithub) =>
-  selectReviewInstructions(new GithubClient({ token: TOKEN, apiUrl: "https://api.github.com", fetchImpl: gh.fetch }), ref, "main");
+  selectReviewInstructions(new GithubClient({ token: TOKEN, apiUrl: "https://api.github.com", fetchImpl: gh.fetch }), ref, "main", undefined, false);
 
 test("with nothing in the repository the default skill is used, read at the base tip", async () => {
   const gh = new FakeGithub();

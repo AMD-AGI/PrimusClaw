@@ -126,6 +126,18 @@ test("messages the plan did not touch are passed through by identity", () => {
   }
 });
 
+test("with rolling markers at 5m the 1h anchor is rendered first and every later marker is the bare 5m one", () => {
+  // The API refuses a request where a shorter-lived marker comes before a longer-lived one; the anchor is the only 1h one and it is first.
+  const req = prepareAnthropicRequest(convo(40), { ttl: "1h", rollingTtl: "5m" });
+  const markers: unknown[] = [];
+  for (const m of req.messages) {
+    if (Array.isArray(m.content)) for (const b of m.content as Array<Record<string, unknown>>) if (b.cache_control) markers.push(b.cache_control);
+  }
+  assert.equal(markers.length, req.breakpointsApplied);
+  assert.deepEqual(markers, [{ type: "ephemeral", ttl: "1h" }, ...Array(markers.length - 1).fill({ type: "ephemeral" })]);
+  assert.ok(markers.length > 1);
+});
+
 test("5m renders the bare ephemeral marker, 1h adds the ttl field", () => {
   const five = prepareAnthropicRequest(convo(2), { ttl: "5m" });
   const oneH = prepareAnthropicRequest(convo(2), { ttl: "1h" });
@@ -172,11 +184,10 @@ test("a marker the planner asks for but the renderer refuses is not counted", ()
     { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "s" }] },
   ];
   const bogus = {
-    ttl: "1h" as const,
     systemRunLength: 0,
     breakpoints: [
-      { kind: "message" as const, messageIndex: 0, blockIndex: 0, wrapStringContent: true },
-      { kind: "message" as const, messageIndex: 1, blockIndex: 0, wrapStringContent: false },
+      { kind: "message" as const, messageIndex: 0, blockIndex: 0, wrapStringContent: true, ttl: "1h" as const },
+      { kind: "message" as const, messageIndex: 1, blockIndex: 0, wrapStringContent: false, ttl: "1h" as const },
     ],
   };
   const req = renderCacheMarkers(msgs, bogus);

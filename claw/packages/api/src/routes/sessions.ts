@@ -1169,6 +1169,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       }
       sessionModel = parsedModel.model;
     }
+    // A session that reviews on someone's behalf runs on the review model unless its creator named one: the requester's key pays.
+    if (sessionModel === null && parsedActingAs.actingAs !== null) {
+      sessionModel = readGithubReviewSettings().reviewModel;
+    }
 
     if (parentSid && !user) {
       return reply.status(401).send({ ok: false, error: "authentication required" });
