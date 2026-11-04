@@ -291,13 +291,15 @@ const ZIP_PRESIGN_EXPIRES_SEC = 3600;
 //   .git        - a repository's object store, which the snapshot carries so
 //                 unpushed commits survive a sandbox restart: thousands of
 //                 files, none of them the user's artifacts
+//   .deliveries - the copies `deliver_file` made, each served by its own route
+//                 (routes/session-deliveries.ts); the original is in the listing
 //
 // `.transcripts/` is deliberately absent. It is written by Brain rather than by
 // the sandbox, so the sync treats it as internal -- but it is the user's record
 // of what their run did, and it was downloadable from this listing for every
 // release before it moved into a directory. Hiding it here would take a feature
 // away as a side effect of a storage-layout change.
-const INTERNAL_PREFIXES_RE = /(?:^|\/)(\.zip-cache|\.uploads|\.skills|\.git)\//;
+const INTERNAL_PREFIXES_RE = /(?:^|\/)(\.zip-cache|\.uploads|\.skills|\.git|\.deliveries)\//;
 
 /**
  * Whether an object under the session prefix is hidden from the user's files.
@@ -308,6 +310,18 @@ const INTERNAL_PREFIXES_RE = /(?:^|\/)(\.zip-cache|\.uploads|\.skills|\.git)\//;
  */
 export function isHiddenSessionFile(rel: string): boolean {
   return INTERNAL_PREFIXES_RE.test(rel);
+}
+
+const DELIVERY_SEGMENT_RE = /(?:^|\/)\.deliveries(?:\/|$)/;
+
+/**
+ * Whether a path or object key is a delivered copy. Those are served by their
+ * own route to a signed-in owner only (routes/session-deliveries.ts), and by no
+ * file route: here the owner's key is enough, and the sandbox holds that key.
+ * Asked of the whole key, so a folder download of a parent cannot include them.
+ */
+export function isDeliveryPath(pathOrKey: string): boolean {
+  return DELIVERY_SEGMENT_RE.test(pathOrKey);
 }
 
 function zipKeyFor(sessionPrefix: string, taskId: string): string {
@@ -496,7 +510,7 @@ async function listS3KeysUnderPrefix(
     for (const obj of res.Contents || []) {
       if (!obj.Key || obj.Size === undefined || obj.Size <= 0) continue;
       const rel = obj.Key.slice(prefix.length);
-      if (isHiddenSessionFile(rel)) continue;
+      if (isHiddenSessionFile(rel) || isDeliveryPath(obj.Key)) continue;
       entries.push({ key: obj.Key, size: obj.Size });
     }
     ct = res.IsTruncated ? res.NextContinuationToken : undefined;
@@ -2188,6 +2202,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     const filePath = rawPath.replace(/\/(download|stream)$/, "");
 
     if (filePath.includes("..")) return reply.status(400).send({ ok: false, error: "invalid path" });
+    if (isDeliveryPath(filePath)) return reply.status(404).send({ ok: false, error: "file not found" });
 
     const scope = await requireSessionScope(req, reply, sessionId);
     if (!scope) return reply;
