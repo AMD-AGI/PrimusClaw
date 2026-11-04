@@ -23,7 +23,8 @@
  *   F5  a pull request that cannot be read for ten minutes puts the item in front of the user, once
  *   K1  a result waiting for the user stays acceptable whatever the watch reports: an unreadable pull request, and comments held back
  *       for authors the token may not check, are told once the result is no longer waiting (sent back), never over it
- *   K2  a pull request merged while its result waits for the user does not take the result back; accepted, the merge is dropped
+ *   K2  a pull request merged while its result waits for the user does not take the result back; accepted, the merge is dropped;
+ *       news among the closings, however many come before it, still sends the item back
  *   F8  a closed pull request whose comments were cut at the page limit is read to the end before the watch ends
  *   F9  a list cut short is read on from where GitHub's own order stopped: an issue's comments by creation, review comments by update
  *   F10 items that cannot take their events now (wake limit) do not keep others from being delivered
@@ -629,6 +630,26 @@ describe("assistant GitHub events", { skip }, () => {
     );
     assert.equal(await ev.deliverItemEvents(two.itemId), "delivered");
     assert.equal((await w.item(two.itemId)).board_state, "in_progress");
+
+    // More closings than one message holds, older than a comment: the comment is news all the same, and is not held behind them.
+    const three = await watched({ title: "third" });
+    await w.q("UPDATE claw_work_items SET board_state = 'needs_you', last_report_kind = 'ready', result_version = 1 WHERE item_id = $1", [three.itemId]);
+    await w.q(
+      `INSERT INTO claw_work_item_github_events (event_id, sub_id, item_id, kind, github_id, body, occurred_at)
+       SELECT 'gh:k2c:' || n, $1, $2, 'pr_closed', 'merged-' || n, 'merged', NOW() - INTERVAL '1 hour' FROM generate_series(1, $3) n`,
+      [three.subId, three.itemId, ev.EVENTS_PER_MESSAGE + 1],
+    );
+    await w.q(
+      `INSERT INTO claw_work_item_github_events (event_id, sub_id, item_id, kind, github_id, body, occurred_at)
+       VALUES ('gh:k2d', $1, $2, 'issue_comment', '10', 'a later comment', NOW())`,
+      [three.subId, three.itemId],
+    );
+    await ev.deliverPendingEvents();
+    assert.equal((await w.item(three.itemId)).board_state, "in_progress", "sent back by the comment");
+    await handedToRun(three.workerSid);
+    await ev.deliverPendingEvents();
+    const [rest] = await w.pending(three.workerSid);
+    assert.ok(rest?.content.includes("a later comment"), "and the comment reaches the worker");
   });
 
   test("F8 a closed pull request whose comments were cut at the page limit is read to the end first", async () => {

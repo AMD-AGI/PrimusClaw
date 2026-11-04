@@ -793,7 +793,12 @@ export async function deliverItemEvents(itemId: string): Promise<"delivered" | "
     if (wakes >= WAKES_PER_WINDOW) return { status: "limited" as const };
     // The pull request closing (merged, most often by the user) is no reason to take back a result the user has not judged yet: it is
     // kept, and reaches the worker with the next news or once the user sends the item back. Accepted, the item ends and it is dropped.
-    if (canAccept(item) && pending.every((e) => e.kind === "pr_closed")) return { status: "held" as const };
+    // Asked of everything waiting, not of this batch: closings older than a comment fill a batch by themselves.
+    if (canAccept(item) && !(await query(
+      `SELECT 1 FROM claw_work_item_github_events
+        WHERE item_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL AND kind <> 'pr_closed' LIMIT 1`,
+      [itemId],
+    )).rowCount) return { status: "held" as const };
     // A result waiting for the user is no longer the one to accept once there is news on the pull request. An item in progress is left
     // alone: its running turn keeps its generation, and the next turn reads these.
     if (item.board_state === "needs_you") {
