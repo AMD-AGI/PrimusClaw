@@ -165,7 +165,9 @@ describe("assistant review items", { skip }, () => {
         [s.config.acting_as, s.config.review_target, s.config.review_only, s.config.acting_as_requester, s.config.notify_on_finish],
         ["bob", it.pr, false, "Name alice", true],
       );
-      assert.deepEqual([s.config.platform_key, s.config.llm_api_key, s.config._server_managed_credentials], ["pk-alice", "vk-alice", true]);
+      // Sealed since #263: read as the dispatch reads them.
+      const { readTrustedSessionCredentials } = await import("../src/auth/session-credentials.js");
+      assert.deepEqual(readTrustedSessionCredentials(s.config), { platformKey: "pk-alice", llmApiKey: "vk-alice" });
       const queued = await w.pending(it.session_id);
       assert.equal(queued.length, 1);
       assert.equal(queued[0].content, item.params.brief);
