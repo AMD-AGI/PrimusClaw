@@ -8,7 +8,7 @@
  * field on the session would not do: `config`, `team_role` and `parent_session_id` are caller input.
  *
  * A router turn is cut down to the assistant tools (`tools_allowlist`, which Brain enforces), given its
- * prompt and the current list of work items, and kept short. A worker turn gets its prompt and the one tool
+ * prompt and the current list of work items, and kept short. An observer turn is cut the same way, without the list. A worker turn gets its prompt and the one tool
  * it reports through. Both get a bearer for the assistant MCP service that names this turn.
  *
  * Applied wherever a turn's request is finished: when it is dispatched on the wire, when a queued message is
@@ -25,8 +25,8 @@ import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import {
-  ASSISTANT_MCP_SERVER, ROUTER_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderRouterSystem, renderWorkerSystem,
-  type ManifestItem,
+  ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderObserverSystem,
+  renderRouterSystem, renderWorkerSystem, type ManifestItem,
 } from "./prompts.js";
 import { startWorkerRun } from "./run-started.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
@@ -47,7 +47,9 @@ const TOKEN_FALLBACK_TTL_SEC = 7 * 24 * 60 * 60;
 
 export type SessionRole =
   | { role: "router"; userId: string }
-  | { role: "worker"; userId: string; itemId: string; seq: number; title: string };
+  | { role: "worker"; userId: string; itemId: string; seq: number; title: string }
+  /** A scope's watcher (`observe.ts`): a router's tools, every one of which only records. */
+  | { role: "observer"; userId: string; scope: string };
 
 /**
  * Null for every session that is neither a user's assistant nor a task item's worker. A review item's session is an ordinary session that
@@ -59,19 +61,24 @@ export async function sessionRole(sessionId: string): Promise<SessionRole | null
        FROM claw_assistants a WHERE a.session_id = $1
      UNION ALL
      SELECT 'worker', w.user_id, w.item_id, w.seq, w.title
-       FROM claw_work_items w WHERE w.worker_session_id = $1 AND w.kind = 'task'`,
+       FROM claw_work_items w WHERE w.worker_session_id = $1 AND w.kind = 'task'
+     UNION ALL
+     SELECT 'observer', o.user_id, NULL, NULL, o.scope
+       FROM claw_assistant_scopes o WHERE o.session_id = $1`,
     [sessionId],
   )).rows as Array<{ role: string; user_id: string; item_id: string | null; seq: number | null; title: string | null }>;
   const row = rows[0];
   if (!row) return null;
   if (row.role === "router") return { role: "router", userId: row.user_id };
+  if (row.role === "observer") return { role: "observer", userId: row.user_id, scope: row.title as string };
   return { role: "worker", userId: row.user_id, itemId: row.item_id as string, seq: Number(row.seq), title: row.title as string };
 }
 
-/** Whether a turn of this session must skip skill selection, which costs an LLM call a router has no use for. */
+/** Whether a turn of this session must skip skill selection, which costs an LLM call a router (or an observer) has no use for. */
 export async function skipsSkillSelection(sessionId: string): Promise<boolean> {
   if (!CLAW_ASSISTANT_ENABLED) return false;
-  return (await sessionRole(sessionId))?.role === "router";
+  const role = (await sessionRole(sessionId))?.role;
+  return role === "router" || role === "observer";
 }
 
 export async function routerManifest(userId: string): Promise<ManifestItem[]> {
@@ -150,7 +157,7 @@ function withSystemAppend(task: Record<string, unknown>, text: string): void {
  */
 export async function applySessionRoleToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
   const role = CLAW_ASSISTANT_ENABLED ? await sessionRole(sessionId) : null;
-  if (CLAW_AGENT_GUIDELINE_ENABLED && role?.role !== "router") withAgentGuideline(task);
+  if (CLAW_AGENT_GUIDELINE_ENABLED && role?.role !== "router" && role?.role !== "observer") withAgentGuideline(task);
   if (!role) return;
   const taskId = stringField(task, "task_id");
   const messageId = stringField(task, "message_id");
@@ -159,7 +166,16 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
   const base = { sid: sessionId, mid: messageId, task_id: taskId, exp };
 
   let claims: AssistantTokenClaims;
-  if (role.role === "router") {
+  if (role.role === "observer") {
+    // A router's cut, with none of the owner's own items in view: what is said here comes from other people.
+    claims = { ...base, role: "observer" };
+    task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN];
+    task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
+    task.mcp_servers = {};
+    for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
+    withSystemAppend(task, renderObserverSystem(role.scope));
+    logger.info({ sessionId, taskId, scope: role.scope, prompt: OBSERVER_PROMPT_VERSION }, "assistant.observer_turn");
+  } else if (role.role === "router") {
     claims = { ...base, role: "router" };
     task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN];
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
