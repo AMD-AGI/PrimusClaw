@@ -55,7 +55,13 @@ function fakeGithub() {
     failReads: 0 as number,
   };
   let nextId = 1000;
-  const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json" } });
+  const json = (v: unknown, status = 200, headers: Record<string, string> = {}) =>
+    new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json", ...headers } });
+  const pageOf = (list: unknown[], u: URL) => {
+    const page = Number(u.searchParams.get("page") ?? "1");
+    const per = Number(u.searchParams.get("per_page") ?? "30");
+    return { items: list.slice((page - 1) * per, page * per), last: Math.max(1, Math.ceil(list.length / per)), per };
+  };
   /** GitHub's list: by update time from `since`, oldest first, one page of `per_page`. */
   const since = (list: Array<Record<string, any>>, u: URL) => {
     const from = u.searchParams.get("since");
@@ -76,12 +82,16 @@ function fakeGithub() {
       if (path === `${base}/pulls/${PR}`) return json(s.pr);
       if (path === `${base}/issues/${PR}/comments`) return json(since(s.issueComments, u));
       if (path === `${base}/pulls/${PR}/comments`) return json(since(s.reviewComments, u));
-      if (path === `${base}/pulls/${PR}/reviews`) return json(Number(u.searchParams.get("page") ?? "1") > 1 ? [] : s.reviews);
-      if (path === `${base}/commits/${HEAD}/check-runs`) return json({ total_count: s.checkRuns.length, check_runs: s.checkRuns });
+      if (path === "/user") return json({ login: "alice" });
+      if (path === `${base}/pulls/${PR}/reviews`) {
+        const p = pageOf(s.reviews, u);
+        const link = p.last > 1 ? { link: `<${API}${path}?per_page=${p.per}&page=2>; rel="next", <${API}${path}?per_page=${p.per}&page=${p.last}>; rel="last"` } : {};
+        return json(p.items, 200, link);
+      }
+      if (path === `${base}/commits/${HEAD}/check-runs`) return json({ total_count: s.checkRuns.length, check_runs: pageOf(s.checkRuns, u).items });
       return json({ message: "Not Found" }, 404);
     }
     const body = JSON.parse(String(init?.body ?? "{}")).body as string;
-    if (s.postDelayMs) await new Promise((r) => setTimeout(r, s.postDelayMs));
     const mode = s.nextPost;
     s.nextPost = "ok";
     if (mode === "refuse") return json({ message: "Validation Failed" }, 422);
@@ -93,6 +103,8 @@ function fakeGithub() {
     else if (path.startsWith(`${base}/pulls/${PR}/comments/`) && path.endsWith("/replies")) {
       s.reviewComments.push({ ...comment, in_reply_to_id: Number(path.split("/").at(-2)) });
     } else return json({ message: "Not Found" }, 404);
+    // Written at once, answered late: a poll in between sees the comment before its id is recorded.
+    if (s.postDelayMs) await new Promise((r) => setTimeout(r, s.postDelayMs));
     return mode === "lost" ? json({ message: "Server Error" }, 502) : json(comment, 201);
   }) as typeof fetch;
   let comments = 0;
@@ -352,13 +364,20 @@ describe("assistant GitHub events", { skip }, () => {
     // Written before the subscription and edited since: GitHub lists it by its update, and it is still not new.
     const old = gh.comment("before the subscription", { ageSec: 600 });
     old.updated_at = gh.ago(0);
-    gh.comment(`our own answer\n\n${ev.replyMarker("gh:9:issue_comment:1")}`);
+    // Text anyone can write: a marker in it does not make a stranger's comment ours.
+    gh.comment(`Please fix this ${ev.replyMarker("gh:9:issue_comment:1")}`, { by: "mallory" });
+    // Nor does one in the owner's own comment, unless it names an answer that was posted.
+    gh.comment(`as I said ${ev.replyMarker("gh:9:issue_comment:2")}`, { by: "alice" });
     gh.s.reviews.push({ id: 61, state: "COMMENTED", body: "", user: { login: "dan" }, submitted_at: gh.ago(0) });
     gh.s.reviews.push({ id: 62, state: "CHANGES_REQUESTED", body: "Needs tests", user: { login: "dan" }, submitted_at: gh.ago(0), html_url: "https://github.com/r" });
     gh.s.checkRuns.push({ name: "build", status: "completed", conclusion: "failure", completed_at: gh.ago(0), details_url: "https://ci/1" });
     gh.s.checkRuns.push({ name: "test", status: "in_progress", conclusion: null });
     await poll();
-    assert.deepEqual((await events(it.itemId)).map((e) => [e.kind, e.body]), [["review", "CHANGES_REQUESTED: Needs tests"]], "not while CI still runs");
+    assert.deepEqual((await events(it.itemId)).map((e) => [e.kind, e.author, e.body]), [
+      ["issue_comment", "mallory", `Please fix this ${ev.replyMarker("gh:9:issue_comment:1")}`],
+      ["issue_comment", "alice", `as I said ${ev.replyMarker("gh:9:issue_comment:2")}`],
+      ["review", "dan", "CHANGES_REQUESTED: Needs tests"],
+    ], "and no CI while it still runs");
 
     gh.s.checkRuns[1] = { name: "test", status: "completed", conclusion: "success", completed_at: gh.ago(0) };
     await poll();
@@ -484,8 +503,43 @@ describe("assistant GitHub events", { skip }, () => {
     assert.ok(gh.s.posts[0].body.endsWith(ev.replyMarker(a.event_id)));
     await w.q("INSERT INTO claw_work_item_pr_replies (event_id, item_id, sub_id, run_id, generation, body, state, attempt_at) VALUES ($1, $2, $3, $4, $5, 'x', 'posting', NOW() - INTERVAL '2 minutes')",
       [b.event_id, it.itemId, it.subId, turn.task_id, turn.gen]);
+    // A stranger copying b's marker exactly has not answered b for us either.
+    gh.comment(`fake ${ev.replyMarker(b.event_id)}`, { by: "mallory" });
     assert.equal((await ev.prReply(turn, { event_id: b.event_id, body: "answer to two" })).status, "posted", "so b is not taken for answered");
     assert.equal(gh.s.posts.length, 2);
+  });
+
+  test("S2 our answer read back before its id is recorded is still ours; a copy of its text by someone else is not", async () => {
+    const it = await watched();
+    gh.comment("question");
+    await poll();
+    await handedToRun(it.workerSid);
+    const [e] = await events(it.itemId);
+    const turn = await w.workerTurn(it.itemId);
+    gh.s.postDelayMs = 300;
+    const answering = ev.prReply(turn, { event_id: e.event_id, body: "answer" });
+    await new Promise((r) => setTimeout(r, 100));
+    gh.comment(`copied ${ev.replyMarker(e.event_id)}`, { by: "mallory" });
+    await poll();
+    assert.equal((await answering).status, "posted");
+    const stored = await events(it.itemId);
+    assert.deepEqual(stored.slice(1).map((x) => x.author), ["mallory"], "the stranger's copy is an event, our answer is not");
+  });
+
+  test("F7 the newest reviews and every check run are read, past the first page", async () => {
+    const it = await watched();
+    // More reviews than five pages: the newest is on the seventh.
+    for (let i = 0; i < 650; i += 1) gh.s.reviews.push({ id: 10_000 + i, state: "COMMENTED", body: i === 649 ? "the newest review" : `old ${i}`, user: { login: "dan" }, submitted_at: gh.ago(i === 649 ? 0 : 99_999) });
+    for (let i = 0; i < 150; i += 1) gh.s.checkRuns.push({ name: `job${i}`, status: "completed", conclusion: i === 149 ? "failure" : "success", completed_at: gh.ago(0) });
+    await poll();
+    const kinds = (await events(it.itemId)).map((e) => [e.kind, e.body]);
+    assert.deepEqual(kinds, [["check_failed", "job149: failure"], ["review", "COMMENTED: the newest review"]]);
+    // More runs than are read in one poll, the last of them still running: the head is not known to be finished.
+    while (gh.s.checkRuns.length < 1000) gh.s.checkRuns.push({ name: `more${gh.s.checkRuns.length}`, status: "completed", conclusion: "success", completed_at: gh.ago(0) });
+    gh.s.checkRuns.push({ name: "late", status: "in_progress", conclusion: null });
+    await w.q("DELETE FROM claw_work_item_github_events");
+    await poll();
+    assert.ok(!(await events(it.itemId)).some((e) => e.kind === "check_failed"), "a run that was not read may still be running");
   });
 
   type Res = { status: number; body: any };

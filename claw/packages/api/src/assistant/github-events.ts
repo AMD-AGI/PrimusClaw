@@ -41,9 +41,11 @@ import { reopenWorkItem, resolveWorkItem } from "./work-items.js";
 const logger = pino({ name: "assistant-github-events" });
 
 export const GITHUB_EVENT_PREFIX = "[github_event]";
-/** What every answer `pr_reply` posts ends with: how the loop knows its own words, and how a retry finds an answer that landed. */
+/** What every answer `pr_reply` posts ends with: how a retry finds an answer that landed (with the author it was posted as). */
 export const REPLY_MARKER_PREFIX = "<!-- claw-reply:";
 export const replyMarker = (eventId: string): string => `${REPLY_MARKER_PREFIX}${eventId} -->`;
+/** The events whose markers a text carries. */
+const markersIn = (text: string): string[] => [...text.matchAll(/<!-- claw-reply:(\S+) -->/g)].map((m) => m[1]!);
 /** An answer names its own event and no other: a marker in what the model wrote (quoted from a stranger, say) would make another event look answered. */
 const withoutMarkers = (text: string): string => text.split(REPLY_MARKER_PREFIX).join("<!-- quoted-claw-reply:");
 
@@ -56,6 +58,7 @@ const WAKE_WINDOW = "10 minutes";
 export const READ_FAILURE_REPORT_SEC = 600;
 const PER_PAGE = 100;
 const MAX_PAGES = 5;
+const MAX_CHECK_PAGES = 10;
 const POLL_BATCH = 20;
 export const EVENT_BODY_MAX = 2000;
 /** Events in one message to the worker; more wait for the next. */
@@ -68,6 +71,8 @@ const FAILED_CONCLUSIONS = new Set(["failure", "timed_out", "action_required", "
 
 export const EVENT_KINDS = ["issue_comment", "review", "review_comment", "check_failed", "pr_closed"] as const;
 export type GithubEventKind = (typeof EVENT_KINDS)[number];
+/** The kinds a `pr_reply` answer can be read back as. */
+const COMMENT_KINDS: ReadonlySet<string> = new Set(["issue_comment", "review_comment"]);
 
 export function githubEventsEnabled(): boolean {
   return CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_GITHUB_EVENTS;
@@ -259,7 +264,6 @@ export interface GithubEvent {
 
 const clip = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, max)}…[cut]`);
 const login = (u: unknown): string | null => (u && typeof u === "object" && typeof (u as { login?: unknown }).login === "string" ? (u as { login: string }).login : null);
-const isOurs = (body: unknown): boolean => typeof body === "string" && body.includes(REPLY_MARKER_PREFIX);
 const after = (iso: unknown, since: Date): boolean => typeof iso === "string" && Date.parse(iso) >= since.getTime();
 
 /** A list, page by page, up to `MAX_PAGES`. `capped` says the last page was full: there may be more than was read. */
@@ -277,10 +281,44 @@ async function pagesOf(gh: GithubClient, path: string, query: Record<string, str
 const pages = async (gh: GithubClient, path: string, query: Record<string, string | number> = {}): Promise<any[]> =>
   (await pagesOf(gh, path, query)).items;
 
+/**
+ * The newest `MAX_PAGES` pages of a list GitHub gives oldest first and cannot filter by time (a pull request's reviews): the first page
+ * says which is the last (`Link: rel="last"`), and the pages before it are read back from there.
+ */
+async function newestPages(gh: GithubClient, path: string): Promise<any[]> {
+  const first = await gh.get<any[]>(path, { per_page: PER_PAGE, page: 1 });
+  const lastPage = Number(/[?&]page=(\d+)[^>]*>;\s*rel="last"/.exec(first.headers.get("link") ?? "")?.[1] ?? "1");
+  const items: any[] = Array.isArray(first.json) ? [...first.json] : [];
+  if (!Number.isSafeInteger(lastPage) || lastPage <= 1) return items;
+  const from = Math.max(2, lastPage - MAX_PAGES + 1);
+  const newest: any[] = from === 2 ? items : [];
+  for (let page = from; page <= lastPage; page += 1) {
+    const got = (await gh.get<any[]>(path, { per_page: PER_PAGE, page })).json;
+    if (Array.isArray(got)) newest.push(...got);
+  }
+  return newest;
+}
+
+/** Every check run of a commit, page by page; `complete` is false when there were more than were read. */
+async function checkRunsOf(gh: GithubClient, path: string): Promise<{ runs: any[]; complete: boolean }> {
+  const runs: any[] = [];
+  let total = 0;
+  for (let page = 1; page <= MAX_CHECK_PAGES; page += 1) {
+    const got = (await gh.get<any>(path, { per_page: PER_PAGE, page })).json ?? {};
+    total = Number(got.total_count ?? 0);
+    const list = Array.isArray(got.check_runs) ? got.check_runs : [];
+    runs.push(...list);
+    if (list.length < PER_PAGE || runs.length >= total) break;
+  }
+  return { runs, complete: runs.length >= total };
+}
+
 /** What is new on the pull request, and whether it is closed. Throws what GitHub threw: an unread pull request is not a quiet one. */
 export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscription, "owner" | "repo" | "number" | "since" | "cursor_at">):
-  Promise<{ events: GithubEvent[]; closed: "pr_merged" | "pr_closed" | null; readUpTo: Date | null }> {
+  Promise<{ events: GithubEvent[]; closed: "pr_merged" | "pr_closed" | null; readUpTo: Date | null; login: string | null }> {
   const r: PrRef = { owner: sub.owner, repo: sub.repo, number: sub.number };
+  // The account answers are posted with: what our own answers are written by.
+  const me = login((await gh.get<any>("/user")).json);
   const pr = (await gh.get<any>(repoPath(r, `/pulls/${r.number}`))).json ?? {};
   const since = { since: sub.cursor_at.toISOString() };
   const events: GithubEvent[] = [];
@@ -297,20 +335,20 @@ export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscrip
     return got.items;
   };
   for (const c of await sinceList(repoPath(r, `/issues/${r.number}/comments`))) {
-    if (!after(c?.created_at, sub.since) || isOurs(c?.body)) continue;
+    if (!after(c?.created_at, sub.since)) continue;
     events.push({ kind: "issue_comment", githubId: String(c.id), author: login(c.user), url: c.html_url ?? null, body: String(c.body ?? ""), occurredAt: c.created_at });
   }
   for (const c of await sinceList(repoPath(r, `/pulls/${r.number}/comments`))) {
-    if (!after(c?.created_at, sub.since) || isOurs(c?.body)) continue;
+    if (!after(c?.created_at, sub.since)) continue;
     events.push({
       kind: "review_comment", githubId: String(c.id), author: login(c.user), url: c.html_url ?? null, body: String(c.body ?? ""),
       path: typeof c.path === "string" ? c.path : null, line: Number.isInteger(c.line) ? c.line : (Number.isInteger(c.original_line) ? c.original_line : null),
       replyTo: String(c.in_reply_to_id ?? c.id), occurredAt: c.created_at,
     });
   }
-  for (const v of await pages(gh, repoPath(r, `/pulls/${r.number}/reviews`))) {
+  for (const v of await newestPages(gh, repoPath(r, `/pulls/${r.number}/reviews`))) {
     const state = String(v?.state ?? "");
-    if (state === "PENDING" || !after(v?.submitted_at, sub.since) || isOurs(v?.body)) continue;
+    if (state === "PENDING" || !after(v?.submitted_at, sub.since)) continue;
     const body = String(v.body ?? "").trim();
     // A comment-only review with no text of its own is its inline comments, which arrive by themselves.
     if (!body && state !== "APPROVED" && state !== "CHANGES_REQUESTED") continue;
@@ -318,8 +356,9 @@ export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscrip
   }
   const head = typeof pr.head?.sha === "string" ? pr.head.sha : null;
   if (head && pr.state === "open") {
-    const runs = ((await gh.get<any>(repoPath(r, `/commits/${encodeURIComponent(head)}/check-runs`), { per_page: PER_PAGE })).json?.check_runs ?? []) as any[];
-    const finished = runs.length > 0 && runs.every((c) => c?.status === "completed");
+    const { runs, complete } = await checkRunsOf(gh, repoPath(r, `/commits/${encodeURIComponent(head)}/check-runs`));
+    // A head whose runs were not all read is not known to be finished: asked again at the next poll.
+    const finished = complete && runs.length > 0 && runs.every((c) => c?.status === "completed");
     const failed = runs.filter((c) => FAILED_CONCLUSIONS.has(String(c?.conclusion)));
     const last = runs.reduce((m, c) => Math.max(m, Date.parse(c?.completed_at ?? "") || 0), 0);
     if (finished && failed.length && last >= sub.since.getTime()) {
@@ -337,7 +376,7 @@ export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscrip
       body: pr.merged ? "the pull request was merged" : "the pull request was closed without merging", occurredAt: pr.closed_at ?? null,
     });
   }
-  return { events, closed, readUpTo };
+  return { events, closed, readUpTo, login: me };
 }
 
 export const eventIdOf = (subId: number, e: Pick<GithubEvent, "kind" | "githubId">): string => `gh:${subId}:${e.kind}:${e.githubId}`;
@@ -355,14 +394,23 @@ function readError(err: unknown): string {
 
 /** Stored, deduplicated by id, and the subscription moved on, in one transaction: a read that is not stored is read again. */
 export async function storeEvents(
-  sub: Subscription, read: { events: GithubEvent[]; closed: "pr_merged" | "pr_closed" | null; readUpTo: Date | null },
+  sub: Subscription, read: { events: GithubEvent[]; closed: "pr_merged" | "pr_closed" | null; readUpTo: Date | null; login: string | null },
 ): Promise<number> {
   return inTransaction(async (query) => {
     const live = (await query("SELECT state FROM claw_work_item_subscriptions WHERE id = $1 FOR UPDATE", [sub.id])).rows[0] as
       { state: string } | undefined;
     if (live?.state !== "active") return 0;
+    // Our own answers: written by the account answers are posted with, carrying the marker of an answer we are posting or posted
+    // (`claw_work_item_pr_replies`). Never the marker alone: anyone can copy text, nobody can write as that account but its owner.
+    const byUs = (e: GithubEvent): boolean => COMMENT_KINDS.has(e.kind) && read.login !== null && e.author === read.login;
+    const markers = read.events.filter(byUs).flatMap((e) => markersIn(e.body));
+    const answered = new Set(markers.length ? ((await query(
+      "SELECT event_id FROM claw_work_item_pr_replies WHERE event_id = ANY($1::text[])", [markers],
+    )).rows as Array<{ event_id: string }>).map((r) => r.event_id) : []);
+    const isOurs = (e: GithubEvent): boolean => byUs(e) && markersIn(e.body).some((m) => answered.has(m));
     let stored = 0;
     for (const e of read.events) {
+      if (isOurs(e)) continue;
       const inserted = await query(
         `INSERT INTO claw_work_item_github_events
            (event_id, sub_id, item_id, kind, github_id, author, url, body, path, line, reply_to, head_sha, occurred_at)
@@ -664,12 +712,17 @@ function replyPath(t: ReplyTarget): { post: string; list: string } {
   return { post: repoPath(r, `/issues/${t.number}/comments`), list: repoPath(r, `/issues/${t.number}/comments`) };
 }
 
-/** An answer to this event that is already on the pull request: a post whose result was lost. */
-async function findPosted(gh: GithubClient, t: ReplyTarget, since: Date): Promise<string | null> {
+/**
+ * An answer to this event that is already on the pull request: a post whose result was lost. It carries the event's marker and was
+ * written by the account the answer is posted with; a stranger who copied the marker has not answered for us.
+ */
+async function findPosted(gh: GithubClient, t: ReplyTarget, since: Date): Promise<{ url: string | null; id: string } | null> {
   const marker = replyMarker(t.event_id);
+  const me = login((await gh.get<any>("/user")).json);
+  if (!me) return null;
   const listed = await pages(gh, replyPath(t).list, { since: new Date(since.getTime() - SINCE_MARGIN_SEC * 1000).toISOString() });
-  const hit = listed.find((c) => typeof c?.body === "string" && c.body.includes(marker));
-  return hit ? String(hit.html_url ?? "") : null;
+  const hit = listed.find((c) => typeof c?.body === "string" && c.body.includes(marker) && login(c.user) === me);
+  return hit ? { url: typeof hit.html_url === "string" ? hit.html_url : null, id: String(hit.id) } : null;
 }
 
 /** Statuses after which GitHub certainly did not write the comment. */
@@ -732,8 +785,9 @@ export async function prReply(
   const release = () => db.query(
     "DELETE FROM claw_work_item_pr_replies WHERE event_id = $1 AND state = 'posting' AND attempt = $2", [eventId, attempt],
   );
-  const posted = (url: string | null) => db.query(
-    "UPDATE claw_work_item_pr_replies SET state = 'posted', url = $2, posted_at = NOW() WHERE event_id = $1", [eventId, url],
+  const posted = (url: string | null, commentId: string | null) => db.query(
+    "UPDATE claw_work_item_pr_replies SET state = 'posted', url = $2, comment_id = $3, posted_at = NOW() WHERE event_id = $1",
+    [eventId, url, commentId],
   );
   const token = await githubEventPorts.loadToken(target.user_id);
   if (!token) {
@@ -746,13 +800,13 @@ export async function prReply(
     if (retry) {
       const found = await findPosted(gh, target, createdAt);
       if (found !== null) {
-        await posted(found || null);
-        return { ok: true, status: "already_posted", url: found || null };
+        await posted(found.url, found.id);
+        return { ok: true, status: "already_posted", url: found.url };
       }
     }
     const answer = await gh.request<any>("POST", replyPath(target).post, { body: { body: `${withoutMarkers(body)}\n\n${replyMarker(eventId)}` } });
     const url = typeof answer.json?.html_url === "string" ? answer.json.html_url : null;
-    await posted(url);
+    await posted(url, answer.json?.id == null ? null : String(answer.json.id));
     return { ok: true, status: "posted", url };
   } catch (err) {
     if (definitelyNotWritten(err)) {

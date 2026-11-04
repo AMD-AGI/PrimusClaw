@@ -205,6 +205,8 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
       -- Which try holds the row: only that try may give it back.
       attempt     INT NOT NULL DEFAULT 1,
       url         TEXT,
+      -- GitHub's id for the posted comment.
+      comment_id  TEXT,
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       posted_at   TIMESTAMPTZ
     )

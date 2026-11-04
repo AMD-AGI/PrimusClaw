@@ -269,7 +269,7 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
   {
     table: "claw_work_item_pr_replies",
     onlyWhenAssistant: true,
-    columns: ["event_id", "item_id", "sub_id", "run_id", "generation", "body", "state", "attempt_at", "attempt", "url", "created_at", "posted_at"],
+    columns: ["event_id", "item_id", "sub_id", "run_id", "generation", "body", "state", "attempt_at", "attempt", "url", "comment_id", "created_at", "posted_at"],
   },
 ];
 
