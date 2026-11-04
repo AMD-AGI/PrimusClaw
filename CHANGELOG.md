@@ -31,7 +31,8 @@ record it.
 - A review item reviewed again continues the last review (with `CLAW_ASSISTANT_REVIEW_ITEMS`): what a review posted is
   recorded with its threads (`claw_github_audit.posted`, a new column; `params.record` on the item), a restart or a new
   request after the requester's closed item gives the fresh session the open findings to check first, and `gh_pr_get`
-  reads only the change since the last head unless it was rewritten, is large or touches security or CI paths. Such a
+  reads only the change since the last head unless it was rewritten, merged the base branch in, is large or touches
+  security or CI paths. Such a
   session is offered `gh_thread_resolve` for the recorded threads of the acting user's own findings. See
   `claw/docs/github-review.md`, "A review again".
 - On-behalf GitHub reviews as work items of the assistant, behind `CLAW_ASSISTANT_REVIEW_ITEMS` (default off; needs

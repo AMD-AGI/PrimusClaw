@@ -123,7 +123,7 @@ a `continuation` block whose `scope` the code decides:
 |---|---|---|
 | `unchanged` | The head is the one reviewed last time | Nothing: only the findings are checked |
 | `delta` | GitHub's compare of the two heads says `ahead`, within the review path's size limits, and touching no security or CI path | The change since the last head |
-| `full` | `history_rewritten` (force push or rebase), `large_delta`, or `security_path` | The whole pull request, as a first review reads it |
+| `full` | `history_rewritten` (force push or rebase), `base_merged` (the base branch merged into the head since, as "Update branch" does: a merge commit, or a changed file the pull request does not change), `large_delta`, or `security_path` | The whole pull request, as a first review reads it |
 
 On the deep review's sandbox path, `review_path.advice` of a `delta` or `unchanged` re-review says so too: the checkout is
 for reading around the change and running tests, and its whole-pull-request diff is not reviewed again. The risk, the holds

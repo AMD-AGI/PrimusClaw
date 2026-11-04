@@ -86,7 +86,7 @@ export class FakeGithub {
    */
   threads: Array<{ id: string; isResolved: boolean; path: string; line: number; reviewId: number; author: string; pr: number; repo: string }> = [];
   /** `old...new` -> what `GET /compare/old...new` answers; a pair not named here is 404 (the old head is gone, as after a force push). */
-  compares: Record<string, { status: string; files: FakeFile[] }> = {};
+  compares: Record<string, { status: string; files: FakeFile[]; commits?: Array<{ sha: string; parents: Array<{ sha: string }> }> }> = {};
   /** Make the read of a posted review's threads fail, for a test that the review is posted all the same. */
   threadsReadFails = false;
 
@@ -186,7 +186,7 @@ export class FakeGithub {
     const compare = /\/compare\/([0-9a-f]{40}\.\.\.[0-9a-f]{40})$/.exec(p);
     if (compare) {
       const answer = this.compares[compare[1] as string];
-      return answer ? json(200, { status: answer.status, files: answer.files }) : json(404, { message: "Not Found" });
+      return answer ? json(200, { status: answer.status, files: answer.files, commits: answer.commits ?? [] }) : json(404, { message: "Not Found" });
     }
     if (/\/git\/ref\/heads\/(.+)$/.test(p)) return json(200, { object: { sha: BASE_TIP } });
     const tree = /\/git\/trees\/([0-9a-f]{40})$/.exec(p);

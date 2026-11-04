@@ -13,6 +13,8 @@
  *   N6  a large change since: the whole pull request again
  *   N7  a change since that touches security or CI paths: the whole pull request again
  *   N8  a first review is not asked about any of it
+ *   N9  the base merged into the head since ("Update branch"): the whole pull request again, not the base's change as the delta
+ *   N10 a recorded last head that is no commit sha is not put in a compare: the whole pull request again
  *   T1  gh_thread_resolve resolves a thread the last review recorded and opened with the acting user's account
  *   T2  ... and nothing else: a thread not recorded, another person's, another pull request's, at a head that moved, of a stopped review
  *   T3  a thread already resolved is not resolved again; with writes off nothing is; none of it counts against the hourly review limits
@@ -165,6 +167,8 @@ describe("N recording and scope", () => {
     for (const filename of ["src/auth/session.ts", ".github/workflows/ci.yml"]) {
       await env();
       e.gh.compares[`${OLD}...${HEAD}`]!.files = [{ filename, status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n x\n+y" }];
+      // A file of the pull request's own: the author changed it since.
+      e.gh.files.push({ filename, status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n x\n+y" });
       const o = await overview();
       assert.deepEqual([o.continuation.scope, o.continuation.reason], ["full", "security_path"], filename);
       assert.ok(o.continuation.evidence.some((x: string) => x.includes(filename)), filename);
@@ -182,6 +186,59 @@ describe("N recording and scope", () => {
     const section = async (name: string) => (await readSection(e.service, e.actor, PR, name)).text;
     const expected = createHash("sha256").update(JSON.stringify([HEAD, "main", await section("instructions"), await section("conversation"), await section("diff")])).digest("hex").slice(0, 16);
     assert.equal(o.read_id, expected);
+  });
+});
+
+describe("N base merged", () => {
+  const MAIN_PATCH = "@@ -1 +1,2 @@\n x\n+from_main";
+  test("N9 after Update branch the base's change is not reviewed as the delta: a file the pull request does not change, or a merge commit", async () => {
+    // Main's change to a file the pull request never touched: compare still says `ahead`.
+    await env();
+    e.gh.compares[`${OLD}...${HEAD}`] = { status: "ahead", files: [{ filename: "lib/from-main.ts", status: "modified", additions: 1, deletions: 0, patch: MAIN_PATCH }] };
+    let o = await overview();
+    assert.deepEqual([o.continuation.scope, o.continuation.reason, o.continuation.delta_files], ["full", "base_merged", []]);
+    assert.match(o.how_to_read, /the whole pull request is reviewed again \(base_merged\)/);
+    let diff = (await readSection(e.service, e.actor, PR, "diff")).text;
+    assert.doesNotMatch(diff, /from_main/, "main's change is not what is read");
+    assert.match(diff, /\+b2_first_round/, "the whole pull request is");
+    // An inline comment on what is read lands on a file of the pull request.
+    const posted = await e.service.submitReview(e.actor, {
+      pr: PR, head_sha: HEAD, event: "COMMENT", body: "One.", risk_judgement: LOW, comments: [{ path: "src/app.ts", line: 3, body: "x" }],
+    });
+    assert.equal(posted.body.status, "submitted", posted.text);
+
+    // The author's fix and main's change together: one file outside the pull request is enough.
+    await env();
+    e.gh.compares[`${OLD}...${HEAD}`]!.files.push({ filename: "lib/from-main.ts", status: "modified", additions: 1, deletions: 0, patch: MAIN_PATCH });
+    o = await overview();
+    assert.deepEqual([o.continuation.scope, o.continuation.reason], ["full", "base_merged"]);
+
+    // Main changed only a file the pull request also changes: the merge commit says so.
+    await env();
+    e.gh.compares[`${OLD}...${HEAD}`]!.commits = [
+      { sha: "3".repeat(40), parents: [{ sha: OLD }] },
+      { sha: "4".repeat(40), parents: [{ sha: "3".repeat(40) }, { sha: "5".repeat(40) }] },
+    ];
+    o = await overview();
+    assert.deepEqual([o.continuation.scope, o.continuation.reason, o.continuation.evidence], ["full", "base_merged", ["a merge commit since the last review"]]);
+    diff = (await readSection(e.service, e.actor, PR, "diff")).text;
+    assert.match(diff, /\+b2_first_round/);
+
+    // The author's own commits only (one parent each): still the delta.
+    await env();
+    e.gh.compares[`${OLD}...${HEAD}`]!.commits = [{ sha: "3".repeat(40), parents: [{ sha: OLD }] }];
+    o = await overview();
+    assert.deepEqual([o.continuation.scope, o.continuation.reason], ["delta", "small_delta"]);
+  });
+
+  test("N10 a recorded last head that is no commit sha is never put in a compare request", async () => {
+    for (const since of ["../../pulls/8", `${"a".repeat(39)}g`, "main"]) {
+      await env();
+      continuation!.sinceHeadSha = since;
+      const o = await overview();
+      assert.deepEqual([o.continuation.scope, o.continuation.reason], ["full", "history_rewritten"], since);
+      assert.equal(e.gh.count(/\/compare\//), 0, `${since}: no compare asked for`);
+    }
   });
 });
 

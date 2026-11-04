@@ -107,7 +107,7 @@ export interface ReviewContinuation {
  */
 export interface ContinuationScope {
   scope: "delta" | "unchanged" | "full";
-  reason: "head_unchanged" | "small_delta" | "history_rewritten" | "large_delta" | "security_path";
+  reason: "head_unchanged" | "small_delta" | "history_rewritten" | "base_merged" | "large_delta" | "security_path";
   files: RiskFile[];
   evidence: string[];
 }
@@ -467,13 +467,23 @@ export class GithubReview {
     if (since === pr.headSha) return { scope: "unchanged", reason: "head_unchanged", files: [], evidence: [] };
     const full = (reason: ContinuationScope["reason"], evidence: string[] = []): ContinuationScope => ({ scope: "full", reason, files: change.files, evidence });
     if (!SHA_RE.test(since)) return full("history_rewritten");
-    const a = await ctx.client.get<{ status?: string; files?: Array<Record<string, unknown>> }>(repoPath(ref, `/compare/${since}...${pr.headSha}`), undefined, [404]);
+    const a = await ctx.client.get<{ status?: string; files?: Array<Record<string, unknown>>; commits?: Array<{ parents?: unknown[] }> }>(
+      repoPath(ref, `/compare/${since}...${pr.headSha}`), undefined, [404]);
     if (a.status === 404 || a.json?.status !== "ahead") return full("history_rewritten");
     const files: RiskFile[] = (a.json.files ?? []).map((f) => ({
       path: String(f.filename ?? ""), status: String(f.status ?? ""), additions: Number(f.additions ?? 0), deletions: Number(f.deletions ?? 0),
       patch: typeof f.patch === "string" ? f.patch : undefined,
       previousPath: typeof f.previous_filename === "string" && f.previous_filename ? f.previous_filename : undefined,
     }));
+    // After "Update branch" (the base merged into the head) the compare is still `ahead`, but what it holds is the base's change, not the
+    // pull request's: its files are not the pull request's, and an inline comment on one is refused. A merge commit since the last head, or a
+    // changed file the pull request does not change, means the delta is not the author's own, and the whole pull request is read again.
+    if ((a.json.commits ?? []).some((cm) => Array.isArray(cm.parents) && cm.parents.length > 1)) {
+      return full("base_merged", ["a merge commit since the last review"]);
+    }
+    const prPaths = new Set(change.files.map((f) => f.path));
+    const outside = files.filter((f) => !prPaths.has(f.path)).map((f) => f.path);
+    if (outside.length > 0) return full("base_merged", [`${outside.length} changed files since the last review are not files of this pull request`]);
     const lines = files.reduce((n, f) => n + f.additions + f.deletions, 0);
     if (files.length >= COMPARE_MAX_FILES || files.length > ctx.settings.fastMaxFiles || lines > ctx.settings.fastMaxChangedLines) {
       return full("large_delta", [`${files.length} files and ${lines} changed lines since the last review`]);
