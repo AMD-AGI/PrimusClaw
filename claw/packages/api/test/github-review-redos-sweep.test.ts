@@ -136,7 +136,8 @@ test("S3 every regular expression literal in the module costs under the bound on
   // GROWTH_BOUND as well, on the line that showed it, whichever line cost the most. It is still over the bound in the least of the rounds
   // that measured its growth, which a pattern that only looked slow in one moment is not. A pattern whose cost is partly linear and partly
   // super-linear can grow less than GROWTH_BOUND and still cost over the bound; it is slow when the part of its cost that grows faster
-  // than the line is over the bound by itself, a part that is nothing for a linear pattern however slow the machine is.
+  // than the line is over the bound by itself, a part that is nothing for a linear pattern however slow the machine is. That part is measured
+  // as backtracking makes it, growing with the square of the line or a higher power of it (see `growth`), not as a power between one and two.
   const slow: string[] = [];
   let timed = 0;
   for (const f of readdirSync(SOURCES).filter((n) => n.endsWith(".ts"))) {
