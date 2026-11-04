@@ -1889,8 +1889,9 @@ export const RULES_DIR = env("RULES_DIR", "/app/rules");
 // unreadable means the feature is off and chats are built exactly as before.
 export const PLATFORM_DEFAULTS_FILE = env("PLATFORM_DEFAULTS_FILE");
 // Comma-separated hosts a marketplace tool's or a plugin's MCP server must name
-// for its `<SAFE_API_KEY>` to expand to the caller's platform key. Those servers
-// are written by third parties at any URL; anywhere else the key expands to "".
+// for its `<SAFE_API_KEY>` to expand to the caller's platform key, besides the
+// hosts the defaults file's own `<SAFE_API_KEY>` servers name. Those servers are
+// written by third parties at any URL; anywhere else the key expands to "".
 export const MCP_PLATFORM_KEY_ALLOWED_HOSTS: ReadonlySet<string> = new Set(
   env("MCP_PLATFORM_KEY_ALLOWED_HOSTS").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
 );

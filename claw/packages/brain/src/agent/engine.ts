@@ -14,7 +14,7 @@ import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage
 import { loadRules } from "./rules.js";
 import { bindRepo, renderRepoBlock } from "../workspace/repo-binding.js";
 import { repoSkillsToList } from "../workspace/repo-skills.js";
-import { normalizeMcpConfigs } from "../clients/mcp-config.js";
+import { hostsNamingPlaceholder, normalizeMcpConfigs } from "../clients/mcp-config.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
 import { HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
@@ -161,10 +161,13 @@ export class AgentEngine {
     // enter a run, and every run of Brain comes through it, a turn, a queued turn, a task of a DAG;
     // a sub-agent starts from the schemas of the run that made it, so it has none either. Read as
     // truthy, not `=== true`: a mark that is not a boolean is still a mark.
-    const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
+    const operatorDefaults = PLATFORM_DEFAULTS_FILE ? loadPlatformDefaults() : null;
+    const defaults = request.withhold_sandbox_keys ? null : operatorDefaults;
     // Marketplace and plugin servers are third parties' at URLs nobody vetted, so the requester's
-    // platform key fills their `<SAFE_API_KEY>` only on a host the operator trusts
-    // (MCP_PLATFORM_KEY_ALLOWED_HOSTS). A request's own servers are the requester's choice of where
+    // platform key fills their `<SAFE_API_KEY>` only on a host the operator trusts: one listed in
+    // MCP_PLATFORM_KEY_ALLOWED_HOSTS, or one the operator's own defaults file already sends the key
+    // to (a plugin commonly ships the same platform servers the defaults file mounts, under the same
+    // names, and replaces them). A request's own servers are the requester's choice of where
     // their own key goes. A `pinned_address` is the API's record of where it vetted a request's
     // server; one in a tool or plugin config is the author's, and would connect a trusted host name
     // to an address of their choosing, so it is dropped.
@@ -181,10 +184,14 @@ export class AgentEngine {
     const defaultMcp = Object.fromEntries(
       Object.entries(defaults?.mcpServers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name) && !Object.hasOwn(requestMcp, name)),
     );
+    const platformKeyHosts = new Set([
+      ...MCP_PLATFORM_KEY_ALLOWED_HOSTS,
+      ...hostsNamingPlaceholder(operatorDefaults?.mcpServers ?? {}, "SAFE_API_KEY"),
+    ]);
     const mergedMcp = {
       ...normalizeMcpConfigs(defaultMcp, envOverrides, defaults?.mcpEnvAllow),
       ...normalizeMcpConfigs(requestMcp, envOverrides),
-      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, MCP_PLATFORM_KEY_ALLOWED_HOSTS),
+      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, platformKeyHosts),
     };
 
     const allSkills: Record<string, string> = {};

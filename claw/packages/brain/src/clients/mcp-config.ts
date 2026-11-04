@@ -55,6 +55,23 @@ function literalUrlHost(url: unknown): string | null {
 }
 
 /**
+ * The literal hosts of the servers that name `<name>` anywhere in their config: where those servers
+ * already send the value that placeholder expands to.
+ */
+export function hostsNamingPlaceholder(
+  servers: Record<string, Record<string, unknown>>,
+  name: string,
+): Set<string> {
+  const hosts = new Set<string>();
+  for (const spec of Object.values(servers)) {
+    if (!spec || typeof spec !== "object" || !JSON.stringify(spec).includes(`<${name}>`)) continue;
+    const host = literalUrlHost(spec.url);
+    if (host) hosts.add(host);
+  }
+  return hosts;
+}
+
+/**
  * Normalize and validate MCP server configs.
  * @param servers - raw MCP server configs from tool_ids / request
  * @param overrides - values the request carries, for `<VAR>` placeholders in spec
@@ -76,6 +93,11 @@ export function normalizeMcpConfigs(
 
     const host = overrideHosts ? literalUrlHost(rawSpec.url) : null;
     const trusted = !overrideHosts || (host !== null && overrideHosts.has(host));
+    if (!trusted) {
+      const withheld = Object.keys(overrides).filter((k) => JSON.stringify(rawSpec).includes(`<${k}>`));
+      // Visible here, not only as the server's later auth failure, so an operator can tell a host to list.
+      if (withheld.length) logger.warn({ server: name, host, withheld }, "mcp.placeholder_withheld_untrusted_host");
+    }
     const spec = replaceEnvPlaceholders({ ...rawSpec }, trusted ? overrides : {}, envAllow) as Record<string, unknown>;
 
     if (!spec.type) {
