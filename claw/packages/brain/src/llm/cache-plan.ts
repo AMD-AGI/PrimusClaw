@@ -95,12 +95,13 @@ export interface CacheBreakpoint {
    * `cache_control`, and indexing into one yields a character.
    */
   wrapStringContent: boolean;
+  /** Lifetime of the entry this marker writes: the anchor's is the run's TTL, a rolling marker's may be shorter. */
+  ttl: CacheTtl;
 }
 
 export interface CachePlan {
   /** Ordered from the front of the prompt to the back. Never longer than MAX_BREAKPOINTS. */
   breakpoints: CacheBreakpoint[];
-  ttl: CacheTtl;
   /**
    * Length of the leading `role:"system"` run the renderer must hoist into the
    * top-level `system` parameter. Zero on the task-dispatch path, which builds
@@ -178,13 +179,13 @@ function lastMarkableAtOrBefore(flat: readonly FlatPosition[], from: number): nu
   return -1;
 }
 
-/** Index in `flat` of the first block belonging to `messageIndex`, or -1. */
-function toBreakpoint(p: FlatPosition, systemRunLength: number): CacheBreakpoint {
+function toBreakpoint(p: FlatPosition, systemRunLength: number, ttl: CacheTtl): CacheBreakpoint {
   return {
     kind: p.messageIndex < systemRunLength ? "system" : "message",
     messageIndex: p.messageIndex,
     blockIndex: p.blockIndex,
     wrapStringContent: p.wrapStringContent,
+    ttl,
   };
 }
 
@@ -205,14 +206,21 @@ function toBreakpoint(p: FlatPosition, systemRunLength: number): CacheBreakpoint
  * The result is deterministic: `streamTurnWithRetry` re-enters the provider up
  * to four times per turn, and a marker that moved between attempts would turn
  * each retry from a cache read into a paid cache write.
+ *
+ * `rollingTtl: "5m"` writes the rolling markers for five minutes while the
+ * anchor keeps `ttl`: a run nobody waits on comes back within seconds, so the
+ * tail is read long before five minutes and a 1h write of it is paid at 8/5 the
+ * price for nothing. Only ever shorter than the anchor's, never longer: the API
+ * requires a longer-lived marker to come before a shorter-lived one, and the
+ * anchor is always first.
  */
 export function planCacheBreakpoints(
   messages: readonly Message[],
-  opts: { ttl: CacheTtl; maxBreakpoints?: number },
+  opts: { ttl: CacheTtl; rollingTtl?: "5m"; maxBreakpoints?: number },
 ): CachePlan {
   const maxBreakpoints = opts.maxBreakpoints ?? MAX_BREAKPOINTS;
   const systemRunLength = leadingSystemRun(messages);
-  const plan: CachePlan = { breakpoints: [], ttl: opts.ttl, systemRunLength };
+  const plan: CachePlan = { breakpoints: [], systemRunLength };
   if (messages.length === 0 || maxBreakpoints <= 0) return plan;
 
   const flat = flatten(messages);
@@ -275,6 +283,7 @@ export function planCacheBreakpoints(
   // rolling loop is what enforces the cap, and the anchor is a single entry
   // pushed before it. A second cap here would be unreachable, and an
   // unreachable guard is one no test can hold in place.
-  plan.breakpoints = chosen.map((i) => toBreakpoint(flat[i], systemRunLength));
+  const rollingTtl = opts.rollingTtl ?? opts.ttl;
+  plan.breakpoints = chosen.map((i) => toBreakpoint(flat[i], systemRunLength, i === anchor ? opts.ttl : rollingTtl));
   return plan;
 }

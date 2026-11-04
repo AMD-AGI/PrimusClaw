@@ -24,7 +24,7 @@ import {
   type HandsRecoveryAllowance,
   type RecreateHandsResult,
 } from "./index.js";
-import type { Message, ToolSchema, TokenUsage, EventCallback } from "@claw/protocol";
+import type { Message, ReasoningEffort, ToolSchema, TokenUsage, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import { safePreview } from "@claw/utils";
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
@@ -262,6 +262,12 @@ export interface LoopOptions {
   apiUrl: string;
   apiKey: string;
   maxTurns: number;
+  /** The run's reasoning effort (`ExecuteRequest.effort`), asked on every turn of this loop and of its sub-agents. */
+  effort?: ReasoningEffort;
+  /** `ExecuteRequest.rolling_cache_ttl`, for this loop and its sub-agents. */
+  rollingCacheTtl?: "5m";
+  /** `ExecuteRequest.sub_agent_max_turns`: the most turns a sub-agent of this loop may take. */
+  subAgentMaxTurns?: number;
   router: ToolRouter;
   onEvent: EventCallback;
   signal?: AbortSignal;
@@ -380,6 +386,25 @@ const TOOL_RESULT_TAIL_CHARS = 1500;
  * which the store never exceeds, and its own notice, which names the paging and
  * never a sandbox tool.
  */
+/** A sub-agent's turn cap: the run's own when it set one, never above a deployment's `SUB_AGENT_MAX_TURNS`, else the parent's. */
+export function subAgentTurnCap(requested: number | undefined, parentMaxTurns: number): number {
+  const deployment = SUB_AGENT_MAX_TURNS > 0 ? SUB_AGENT_MAX_TURNS : parentMaxTurns;
+  return requested !== undefined && requested > 0 && (deployment <= 0 || requested < deployment) ? requested : deployment;
+}
+
+/**
+ * `gh_pr_get` of the API's reserved `github_review` server pages a pull request itself, every page under the API's own bound
+ * (`PAGE_MAX_CHARS`, pages.ts), so it gets a bound of its own just above that one. Under the generic cap a review read its diff and its
+ * instructions in 5500-character pages, 42 calls over five reviews; this bound carries four times as much per call.
+ */
+export const GITHUB_REVIEW_READ_TOOL = "mcp__github_review__gh_pr_get";
+export const GITHUB_REVIEW_READ_MAX_CHARS = 24_000;
+
+/** The generic cap, or a tool's own when it pages its answers itself. */
+function resultCapFor(toolName: string | undefined): number {
+  return toolName === GITHUB_REVIEW_READ_TOOL ? GITHUB_REVIEW_READ_MAX_CHARS : TOOL_RESULT_MAX_CHARS;
+}
+
 export function truncateToolResult(text: string, toolName?: string, savedAt?: string): string {
   if (toolName === LOAD_SKILL_TOOL) {
     if (typeof text !== "string" || text.length <= LOAD_SKILL_RESULT_MAX_CHARS) return text;
@@ -388,7 +413,7 @@ export function truncateToolResult(text: string, toolName?: string, savedAt?: st
     const dropped = text.length - head.length - tail.length;
     return `${head}\n\n[... ${dropped} chars cut from this ${LOAD_SKILL_TOOL} result; get what is missing by calling ${LOAD_SKILL_TOOL} again with name, file and the offset to continue from ...]\n\n${tail}`;
   }
-  if (typeof text !== "string" || text.length <= TOOL_RESULT_MAX_CHARS) return text;
+  if (typeof text !== "string" || text.length <= resultCapFor(toolName)) return text;
   if (toolName === "read") return truncateReadResult(text);
   const head = text.slice(0, TOOL_RESULT_HEAD_CHARS);
   const tail = text.slice(-TOOL_RESULT_TAIL_CHARS);
@@ -424,7 +449,7 @@ function truncateReadResult(text: string): string {
 
 /** Whether a result is kept whole in the sandbox before it is cut: not for tools whose source can simply be read again. */
 function spillsWhenCut(text: string, toolName: string): boolean {
-  return typeof text === "string" && text.length > TOOL_RESULT_MAX_CHARS
+  return typeof text === "string" && text.length > resultCapFor(toolName)
     && toolName !== "read" && toolName !== LOAD_SKILL_TOOL;
 }
 
@@ -926,7 +951,7 @@ class AgentLoopRunner {
     // through LoopOptions, so this one call to a module-level singleton was the
     // only thing standing between this file and being testable at all.
     this.session = opts.llmSession
-      ?? getProvider().createSession({ model, apiUrl, apiKey, userId, sessionId });
+      ?? getProvider().createSession({ model, apiUrl, apiKey, userId, sessionId, effort: opts.effort, rollingCacheTtl: opts.rollingCacheTtl });
     // Captured alongside the session because the cache metrics have to say
     // which wire produced each number: the two protocols differ in what they
     // report at all -- cache writes, and the TTL split -- so the same counter
@@ -2395,8 +2420,9 @@ class AgentLoopRunner {
         parentRouter: this.router,
         onEvent: this.onEvent,
         signal: this.signal,
-        model: this.model, apiUrl: this.apiUrl, apiKey: this.apiKey,
-        maxTurns: SUB_AGENT_MAX_TURNS > 0 ? SUB_AGENT_MAX_TURNS : this.maxTurns,
+        model: this.model, apiUrl: this.apiUrl, apiKey: this.apiKey, effort: this.opts.effort,
+        rollingCacheTtl: this.opts.rollingCacheTtl,
+        maxTurns: subAgentTurnCap(this.opts.subAgentMaxTurns, this.maxTurns),
         userId: this.userId, sessionId: this.sessionId,
         depth: this.depth + 1,
         hooks: this.opts.hooks,

@@ -4,15 +4,16 @@
 /**
  * `gh_pr_get` in pages that a model reads whole.
  *
- * Brain cuts every tool result longer than its cap (`TOOL_RESULT_MAX_CHARS` in brain's agent-loop.ts, 6000 characters) to a head and a
- * tail, so a result that is longer is a result the model reads only in part: the review instructions, the middle of the diff. Here every
+ * Brain cuts every tool result longer than its cap to a head and a tail (for this tool `GITHUB_REVIEW_READ_MAX_CHARS` in brain's
+ * agent-loop.ts, 24000 characters), so a result that is longer is a result the model reads only in part: the review instructions, the
+ * middle of the diff. Here every
  * answer is built to fit under {@link PAGE_MAX_CHARS} as the model receives it (the JSON text, after redaction), and what does not fit
  * is a named section read in pages: each page says where the next one starts, and none is cut.
  */
 import { diffNotSent, type RiskFile } from "./risk.js";
 
-/** Below Brain's cut at 6000 characters, with room for what a transport adds around the text. */
-export const PAGE_MAX_CHARS = 5500;
+/** Below Brain's cut of this tool's results at 24000 characters, with room for what a transport adds around the text. */
+export const PAGE_MAX_CHARS = 23_000;
 
 export const SECTIONS = ["overview", "instructions", "files", "diff", "conversation"] as const;
 export type Section = typeof SECTIONS[number];

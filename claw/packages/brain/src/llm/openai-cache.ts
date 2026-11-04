@@ -122,7 +122,7 @@ export interface PreparedOpenAiMessages {
  */
 export function planOpenAiCacheBreakpoints(
   wire: readonly WireMessage[],
-  opts: { ttl: CacheTtl; maxBreakpoints?: number },
+  opts: { ttl: CacheTtl; rollingTtl?: "5m"; maxBreakpoints?: number },
 ): CachePlan {
   return planCacheBreakpoints(project(wire), opts);
 }
@@ -137,15 +137,14 @@ export function planOpenAiCacheBreakpoints(
 export function renderPlannedOpenAiMarkers(
   wire: readonly WireMessage[],
   plan: CachePlan,
-  opts: { style: "anthropic" | "native"; ttl: CacheTtl },
+  opts: { style: "anthropic" | "native" },
 ): PreparedOpenAiMessages {
   // `kind` and `systemRunLength` are ignored on purpose: this wire keeps
   // role:"system" inside the messages array, so there is no hoist to perform
   // and a system message is just another position.
-  const wanted = new Set(plan.breakpoints.map((b) => b.messageIndex));
+  const wanted = new Map(plan.breakpoints.map((b) => [b.messageIndex, b.ttl]));
   if (wanted.size === 0) return { messages: [...wire], breakpointsApplied: 0 };
 
-  const marker = markerFor(opts.style, opts.ttl);
   let applied = 0;
   // Widen EVERY markable message, mark only the planned ones.
   //
@@ -164,9 +163,10 @@ export function renderPlannedOpenAiMarkers(
   const messages = wire.map((m, i) => {
     if (!markableWire(m)) return m;
     const part: Record<string, unknown> = { type: "text", text: m.content as string };
-    if (wanted.has(i)) {
+    const ttl = wanted.get(i);
+    if (ttl !== undefined) {
       applied++;
-      Object.assign(part, marker);
+      Object.assign(part, markerFor(opts.style, ttl));
     }
     return { ...m, content: [part] };
   });
@@ -178,7 +178,7 @@ export function renderPlannedOpenAiMarkers(
 
 export function renderOpenAiCacheMarkers(
   wire: readonly WireMessage[],
-  opts: { style: "anthropic" | "native"; ttl: CacheTtl; maxBreakpoints?: number },
+  opts: { style: "anthropic" | "native"; ttl: CacheTtl; rollingTtl?: "5m"; maxBreakpoints?: number },
 ): PreparedOpenAiMessages {
   return renderPlannedOpenAiMarkers(wire, planOpenAiCacheBreakpoints(wire, opts), opts);
 }

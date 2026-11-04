@@ -191,6 +191,7 @@ test("on the sandbox path gh_pr_get carries the recipe and no token anywhere; on
   assert.equal(JSON.stringify(await e.sql("SELECT * FROM claw_github_audit")).includes(TOKEN), false);
 
   const fast = await reviewEnv();
+  fast.gh.files = [{ filename: "docs/app.md", status: "modified", additions: 3, deletions: 1, patch: "@@ -1,4 +1,6 @@\n a\n-b\n+b2\n+c\n+d\n e\n f" }];
   const quick = (await fast.service.getPr(fast.actor, { pr: PR })).body as any;
   assert.equal(quick.review_path.path, "api_diff");
   assert.equal(quick.review_path.sandbox_recipe, null);
