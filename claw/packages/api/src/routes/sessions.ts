@@ -11,6 +11,7 @@ import { submitSessionMessage } from "../sessions/submit-message.js";
 import { SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { checkSessionCreate } from "../github-review/acting-session.js";
+import { REQUESTED_REVIEW_CONFIG_KEYS, reviewItemsAvailable } from "../github-review/requested-by.js";
 import { loadUserEnvForSession, withholdsSandboxKeys } from "../github-review/session-tools.js";
 import {
   forceIdleAfterInterrupt, queuedMessageId, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
@@ -1117,6 +1118,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       "_server_managed_credentials",
       // Set below from the verified caller, never taken from the request.
       "acting_as_requester",
+      // Who asked for a review of someone else, and the profile it runs with: written only by the review items
+      // (`assistant/review-items.ts`), from the authenticated caller. A session made here that carried them would
+      // pass for a review the acting user was asked to make.
+      ...REQUESTED_REVIEW_CONFIG_KEYS,
     ];
     const suppliedReservedKey = reservedConfigKeys.find((key) =>
       Object.prototype.hasOwnProperty.call(sessionConfig, key)
@@ -1143,6 +1148,16 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     if (!checked.ok) {
       if (checked.log) logger.warn({ userId: user?.userId, method: getAuthMethod(req) ?? "none", clientId: user?.delegation?.clientId?.slice(0, 128) }, checked.log);
       return reply.status(checked.status).send({ ok: false, error: checked.error });
+    }
+    // A review of someone else's account is that person's work, made only by `POST /v1/assistant/reviews`, which checks their say and
+    // their credentials and puts it on their board. Here a session may act only as its own creator; while the review items are not
+    // available on this deployment there is no other way, and the older path stays as it was.
+    if (checked.actingAs !== null && user && checked.actingAs !== user.userId && reviewItemsAvailable()) {
+      logger.warn({ userId: user.userId }, "github_review.acting_as_other_refused");
+      return reply.status(403).send({
+        ok: false, error: "acting_as_must_be_self",
+        message: "a review of another person's account is asked with POST /v1/assistant/reviews",
+      });
     }
     const sessionModel = checked.model;
     const sessionEffort = checked.effort;

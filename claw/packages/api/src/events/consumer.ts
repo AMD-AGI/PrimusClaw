@@ -28,6 +28,7 @@ import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { skipsSkillSelection } from "../assistant/role-profile.js";
+import { reviewProfileSession } from "../github-review/session-tools.js";
 import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
 import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
 import { a2aPushEnabled } from "../routes/a2a-flags.js";
@@ -1141,10 +1142,13 @@ async function handleComplete(
   //     pattern occurrences accumulate over many sessions.
   //     Pattern recording gated by CLAW_SKILL_EVOLUTION_ENABLED. Summary
   //     stays unconditional. Memory is never extracted in the background.
+  // A review someone asked of the owner learns nothing for the owner: no pattern, no skill evolution from what a stranger's pull request
+  // made its model do (`github-review/review-profile.ts`). A session whose profile cannot be read is treated as one.
+  const learns = !(await reviewProfileSession(sessionId).catch(() => ({ userId: "" })));
   setImmediate(() => {
     completionPorts.maybeSummarize(sessionId, userId).catch(err =>
       logger.error({ err, sessionId }, "summarize_failed"));
-    if (CLAW_SKILL_EVOLUTION_ENABLED) {
+    if (CLAW_SKILL_EVOLUTION_ENABLED && learns) {
       completionPorts.maybeRecordTaskPattern(sessionId, userId, event).catch(err =>
         logger.error({ err, sessionId }, "skill.pattern_record_failed"));
     }
@@ -1155,7 +1159,7 @@ async function handleComplete(
   //     expensive to lose (LLM-decided multi-mutation batches), so it goes
   //     into a real DB-backed queue. marketplace/evolve-worker.ts polls and runs jobs
   //     with retries and crash recovery. Gated by CLAW_SKILL_EVOLUTION_ENABLED.
-  if (CLAW_SKILL_EVOLUTION_ENABLED) {
+  if (CLAW_SKILL_EVOLUTION_ENABLED && learns) {
     try {
       await completionPorts.enqueueEvolutionJob(sessionId, userId, event as Record<string, unknown>);
     } catch (err) {
@@ -1320,6 +1324,9 @@ async function drainNextPendingMessage(sessionId: string, userId: string): Promi
 )).rows[0];
 
 if (pending) {
+  // A review someone asked of the session's owner runs only while the owner still lets others act for them, asked now, and while its
+  // turn budget has room; otherwise it is halted here and nothing is sent (`gateRequestedReviewTurn`).
+  if (!(await (await import("../assistant/review-items.js")).gateRequestedReviewTurn(sessionId))) return;
   const pendingUserId = pending.user_id || userId;
   const history = await buildMessages(sessionId, pending.content, pendingUserId);
 

@@ -100,6 +100,7 @@ import { metrics, type TerminalRefusalReason, type TaskOutcome } from "../infra/
 import { deleteRunRows } from "../sandbox/bg-handle-rows.js";
 import { bgRowStore } from "../sandbox/bg-row-store.js";
 import { readHandsEntry } from "../sandbox/registry.js";
+import { applyReviewProfileBackstop } from "../agent/review-profile.js";
 
 const logger = pino({ name: "task-runner" });
 const sc = StringCodec();
@@ -1286,6 +1287,8 @@ class TaskRunner {
     this.engine = deps.engine;
 
     this.msg = msg;
+    // The review profile is applied before the run reads anything of the request, the sandbox it asks for included (`review-profile.ts`).
+    applyReviewProfileBackstop(request);
     this.request = request;
     this.sessionId = sessionId;
     this.lockKey = lockKey;

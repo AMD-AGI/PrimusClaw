@@ -403,3 +403,80 @@ export async function verifyIdentityAccessToken(
     throw err;
   }
 }
+
+/** Why the credentials a service brought for the person a request names were not taken; the code is the HTTP answer's. */
+export type ActingAsRefusal = { ok: false; status: 401 | 403 | 500 | 503; error: string; message: string };
+
+/**
+ * The person a review is asked of, from the credentials the asking service brought for them (`x-acting-as-token`, `x-acting-as-api-key`):
+ * their delegated identity-provider token and their own `ak-` key. Nothing here trusts the service's word that the person is behind it:
+ *
+ *   - the token must verify as any access token does (type, audience, scope, subject; the provider's answer when introspection is on),
+ *     must be delegated (`act`), and must name exactly the person asked of (`sub === actingAs`);
+ *   - the service it was issued to must be in both lists an operator keeps for this: the services that may speak for a person
+ *     (`allowedClients`, CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS) and the services that may bring a person's own key
+ *     (CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS);
+ *   - SaFE must accept the key and say it is the token subject's own (`ownKeysOf`, the same rule as for the requester's own key).
+ *
+ * What comes back is that person with their own keys, which the review's session is sealed with: the work is theirs and runs on their
+ * quota. Only for this request; nothing is kept beyond the session it makes.
+ */
+export async function verifyActingAsCredentials(
+  input: { token: string; apiKey: string; actingAs: string; allowedClients: readonly string[] },
+  verifier: TokenKeyVerifier,
+): Promise<{ ok: true; user: UserInfo } | ActingAsRefusal> {
+  const no = (status: ActingAsRefusal["status"], error: string, message: string): ActingAsRefusal => {
+    logger.warn({ reason: error, actingAs: input.actingAs.slice(0, MAX_SUBJECT_CHARS) }, "auth.acting_as.refused");
+    return { ok: false, status, error, message };
+  };
+  const settings = identityTokenSettings();
+  const identity = settings.enabled ? identityClient() : null;
+  if (!identity) return no(503, "acting_as_unverifiable", "this deployment cannot verify a token of the person the review is asked of");
+  const token = input.token.trim();
+  if (!token || !input.apiKey.trim()) {
+    return no(401, "acting_as_credentials_required", "a review asked of another person needs that person's delegated token and own key");
+  }
+  if (isApiKey(token) || !JWT_SHAPE.test(token)) return no(401, "invalid_acting_as_token", "x-acting-as-token is not an access token");
+  try {
+    const { claims } = await identity.verifyJwt(token, { audience: settings.audience, typ: "at+jwt" });
+    if (!scopesOf(claims.scope).includes(settings.scope)) return no(401, "invalid_acting_as_token", "x-acting-as-token lacks the API scope");
+    const sub = typeof claims.sub === "string" ? claims.sub : "";
+    if (!sub || sub.length > MAX_SUBJECT_CHARS || sub !== sub.trim() || CONTROL_CHARS.test(sub) || RESERVED_SUBJECTS.has(sub)) {
+      return no(401, "invalid_acting_as_token", "x-acting-as-token names no usable subject");
+    }
+    if (sub !== input.actingAs) return no(403, "acting_as_mismatch", "x-acting-as-token is not the token of the person the review is asked of");
+    const clientId = typeof claims.client_id === "string" && claims.client_id.trim() !== "" ? claims.client_id : "";
+    const actorSub = text((claims.act as { sub?: unknown } | undefined)?.sub);
+    if (claims.act === undefined || !clientId) return no(403, "acting_as_not_delegated", "x-acting-as-token must be a service's delegated token");
+    if (!input.allowedClients.includes(clientId) || !settings.ownKeyClientIds.includes(clientId)) {
+      return no(403, "service_client_not_allowed", "the service that brought x-acting-as-token may not speak for another person");
+    }
+    if (settings.introspect) {
+      const answer = await identity.introspect(token, { tokenTypeHint: "access_token" });
+      if (!answer.active || (answer.sub !== undefined && answer.sub !== sub)) return no(401, "invalid_acting_as_token", "x-acting-as-token is no longer active");
+    }
+    const keys = await ownKeysOf(verifier, input.apiKey.trim(), sub);
+    if (keys.status === "unavailable") return no(503, "acting_as_keys_unavailable", "cannot reach SaFE to verify x-acting-as-api-key");
+    if (keys.status !== "keys") return no(500, "authentication_misconfigured", keys.status === "misconfigured" ? keys.message : "no keys");
+    return {
+      ok: true,
+      user: {
+        userId: sub,
+        userName: (text(claims.name) || text(claims.preferred_username) || text(claims.email) || sub).slice(0, MAX_SUBJECT_CHARS),
+        roles: ["default"],
+        platformKey: keys.platformKey,
+        virtualKey: keys.virtualKey,
+        delegation: { ...(actorSub ? { actorSub: actorSub.slice(0, MAX_SUBJECT_CHARS) } : {}), clientId },
+      },
+    };
+  } catch (err) {
+    if (err instanceof OwnKeyRefused) {
+      const e = err.outcome.status === "rejected" ? err.outcome.error : null;
+      return no(401, e?.legacyError === "key_subject_mismatch" ? "key_subject_mismatch" : "invalid_acting_as_api_key",
+        e?.legacyError === "key_subject_mismatch" ? "x-acting-as-api-key is not the key of the person the review is asked of" : "SaFE does not accept x-acting-as-api-key");
+    }
+    if (err instanceof JwtVerificationError) return no(401, "invalid_acting_as_token", `x-acting-as-token was refused (${err.reason})`);
+    if (err instanceof IdentityUnavailableError) return no(503, "acting_as_unverifiable", "cannot reach the identity provider to verify x-acting-as-token");
+    throw err;
+  }
+}

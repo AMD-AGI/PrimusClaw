@@ -26,6 +26,8 @@ import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_DEPLOY_MODE, CLAW_SKILL_EVOLUTION_EN
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { sessionEffortFromRow } from "../sessions/session-model.js";
 import { actingSessionTurnFields, withholdsSandboxKeys } from "../github-review/session-tools.js";
+import { usesReviewProfile } from "../github-review/requested-by.js";
+import { applyReviewProfile, reviewTurnsLeft } from "../github-review/review-profile.js";
 import { defaultTaskWorkspaceId } from "./default-workspace.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { db } from "../infra/db.js";
@@ -148,6 +150,8 @@ async function loadSessionCredentials(sessionId: string): Promise<{
   workspace_id: string;
   llm_api_key: string;
   withhold_sandbox_keys: boolean;
+  /** For a review someone asked of the session's owner: the model turns it may still take; null for every other session. */
+  review_turns_left: number | null;
   /** The reasoning effort the session chose (`claw_sessions.effort`), or none. */
   effort: ReasoningEffort | undefined;
 }> {
@@ -192,6 +196,7 @@ async function loadSessionCredentials(sessionId: string): Promise<{
     workspace_id: sessionWorkspaceId || defaultTaskWorkspaceId(process.env, CLAW_DEPLOY_MODE === "kubernetes"),
     llm_api_key: credentials.llmApiKey,
     withhold_sandbox_keys: withholdsSandboxKeys(cfg),
+    review_turns_left: usesReviewProfile(cfg) ? (await reviewTurnsLeft(sessionId, row.user_id ?? "")).left : null,
     effort,
   };
 }
@@ -413,6 +418,13 @@ function buildExecuteRequest(opts: {
   /** From `pluginToolsForRun`; undefined leaves the field off the message. */
   pluginTools: unknown[] | null | undefined;
 }): ExecuteRequest {
+  const request = executeRequestOf(opts);
+  // A task in a review someone asked of the owner runs with the same fixed profile as its turns (`github-review/review-profile.ts`).
+  if (opts.session.review_turns_left !== null) applyReviewProfile(request as unknown as Record<string, unknown>, opts.session.review_turns_left);
+  return request;
+}
+
+function executeRequestOf(opts: Parameters<typeof buildExecuteRequest>[0]): ExecuteRequest {
   const { updated, rendered, session, internalToken, filesWorkspaceId, pluginTools } = opts;
   const sandboxSpecForBrain = (rendered.sandbox_spec ?? "none") as ExecuteRequest["sandbox_spec"];
   // Lift per-user env snapshot from task.input back to the top-level

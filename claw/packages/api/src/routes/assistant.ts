@@ -22,6 +22,12 @@
  * read and write filters on it, so another user's item answers 404 rather than
  * 403. Registered only when `CLAW_ASSISTANT_ENABLED` is on; otherwise the paths
  * do not exist.
+ *
+ * One exception, and it is narrow: a review someone (R) asked of another person
+ * (X) is X's item, and R may read how it stands and stop it, nothing else. R is
+ * answered with four facts only (`requester-view.ts`), on the read and on both
+ * branches of the stop; accept and restart stay X's (404 for R), and X's session
+ * is X's (its routes answer R 404 as for any other session).
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import pino from "pino";
@@ -45,6 +51,11 @@ import { readGithubReviewSettings } from "../github-review/settings.js";
 import {
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_OBSERVE, CLAW_ASSISTANT_REVIEW_ITEMS, CLAW_GITHUB_REVIEW_ENABLED,
 } from "../config.js";
+import { asRequesterAnswer } from "../assistant/review-items.js";
+import { requesterViewOf } from "../assistant/requester-view.js";
+import { verifyActingAsCredentials } from "../auth/identity-token.js";
+import { credentialVerifier } from "../auth/middleware.js";
+import { db } from "../infra/db.js";
 
 const logger = pino({ name: "assistant" });
 
@@ -55,6 +66,30 @@ function requireRealUser(req: FastifyRequest, reply: FastifyReply): string | nul
     return null;
   }
   return userId;
+}
+
+/**
+ * The credentials a service brought for the person a review is asked of, checked (`verifyActingAsCredentials`): a port, so that a test
+ * can answer without an identity provider or SaFE.
+ */
+export const actingAsCredentialPorts = {
+  verify: (input: { token: string; apiKey: string; actingAs: string }) => verifyActingAsCredentials(
+    { ...input, allowedClients: readGithubReviewSettings().decisionClientIds }, credentialVerifier(),
+  ),
+};
+
+function header(req: FastifyRequest, name: string): string {
+  const v = req.headers[name];
+  return (Array.isArray(v) ? v[0] ?? "" : v ?? "").trim();
+}
+
+/** A review item someone else owns that this user asked for, or null. */
+async function requestedItem(userId: string, itemId: string): Promise<Record<string, unknown> | null> {
+  const row = (await db.query(
+    "SELECT * FROM claw_work_items WHERE item_id = $1 AND kind = 'review' AND params->>'requested_by' = $2 AND user_id <> $2",
+    [itemId, userId],
+  )).rows[0] as Record<string, unknown> | undefined;
+  return row ?? null;
 }
 
 function answer(reply: FastifyReply, result: DecisionResult) {
@@ -87,7 +122,11 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
     const userId = requireRealUser(req, reply);
     if (!userId) return;
     const row = await getWorkItem(userId, (req.params as { id: string }).id);
-    if (!row) return reply.status(404).send({ ok: false, error: "not_found" });
+    if (!row) {
+      const asked = await requestedItem(userId, (req.params as { id: string }).id);
+      if (asked) return reply.send({ ok: true, data: await requesterViewOf(db, asked) });
+      return reply.status(404).send({ ok: false, error: "not_found" });
+    }
     return reply.send({
       ok: true,
       data: {
@@ -115,6 +154,24 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
     const userId = requireRealUser(req, reply);
     if (!userId) return;
     const itemId = (req.params as { id: string }).id;
+    // The person who asked for a review stops it as its owner would (the held writes are denied in X's name), and hears only the four facts.
+    if (!(await getWorkItem(userId, itemId))) {
+      const asked = await requestedItem(userId, itemId);
+      if (asked) {
+        try {
+          const result = await stopWorkItem({ userId: asked.user_id as string, itemId, source: "user", reason: "stopped by the requester" });
+          if (result.status === "not_found") return reply.status(404).send({ ok: false, error: "not_found" });
+          if (result.status === "conflict" && result.error === "already_merged") await syncReviewItem(itemId).catch(() => null);
+          const now = (await db.query("SELECT * FROM claw_work_items WHERE item_id = $1", [itemId])).rows[0] as Record<string, unknown>;
+          const view = await requesterViewOf(db, now);
+          if (result.status === "conflict") return reply.status(409).send({ ok: false, error: result.error, data: view });
+          return reply.send({ ok: true, data: view });
+        } catch (err) {
+          logger.error({ err, itemId }, "assistant.stop_interrupt_failed");
+          return reply.status(503).send({ ok: false, error: "interrupt_not_recorded" });
+        }
+      }
+    }
     try {
       const result = await stopWorkItem({ userId, itemId, source: "user" });
       // A merge the board has not caught up with yet: the item says so now rather than at the next sweep.
@@ -144,8 +201,19 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
     const userId = requireRealUser(req, reply);
     if (!userId) return;
     try {
-      const items = await startReviews(getUser(req)!, getAuthMethod(req), parseReviewRequest(req.body));
-      return reply.send({ ok: true, data: { items } });
+      const request = parseReviewRequest(req.body);
+      const forOther = request.actingAs !== null && request.actingAs !== userId;
+      if (forOther) {
+        // The person asked of proves it is theirs to give: their delegated token and their own key, brought by an allowed service.
+        const verified = await actingAsCredentialPorts.verify({
+          token: header(req, "x-acting-as-token"), apiKey: header(req, "x-acting-as-api-key"), actingAs: request.actingAs!,
+        });
+        if (!verified.ok) return reply.status(verified.status).send({ ok: false, error: verified.error, message: verified.message, data: {} });
+        request.actingAsUser = verified.user;
+      }
+      const items = await startReviews(getUser(req)!, getAuthMethod(req), request);
+      // The session is the reviewer's: the person who asked is not told its id.
+      return reply.send({ ok: true, data: { items: forOther ? items.map(asRequesterAnswer) : items } });
     } catch (err) {
       return refused(reply, err);
     }

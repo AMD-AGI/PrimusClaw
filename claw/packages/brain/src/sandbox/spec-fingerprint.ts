@@ -37,6 +37,11 @@ export interface SandboxSpecFacts {
    * built withheld only the key variables and still holds the deployment's system env, so it is not reused either.
    */
   withholdKeys?: boolean;
+  /**
+   * The run's profile (`sandbox_profile`): `review` is a sandbox built for a requested review, without workspace storage. Part of the
+   * fingerprint only when set, for the same reason as `withholdKeys`: a sandbox built for anything else is never reused for one.
+   */
+  profile?: "review";
 }
 
 /**
@@ -79,6 +84,7 @@ export function sandboxSpecFingerprint(facts: SandboxSpecFacts): string {
     // this process holds, even transiently.
     llmKey: fingerprintLlmKey(facts.llmKey),
     ...(facts.withholdKeys ? { withheldEnv: "brain-only" } : {}),
+    ...(facts.profile ? { profile: facts.profile } : {}),
   });
   // A format prefix, not part of the hash, so a comparison change can be told
   // apart from a spec change. evaluateReuse treats a different format as a

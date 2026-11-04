@@ -22,6 +22,7 @@ import {
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
+import { reviewProfileSession } from "../github-review/session-tools.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import {
@@ -74,8 +75,13 @@ export async function sessionRole(sessionId: string): Promise<SessionRole | null
   return { role: "worker", userId: row.user_id, itemId: row.item_id as string, seq: Number(row.seq), title: row.title as string };
 }
 
-/** Whether a turn of this session must skip skill selection, which costs an LLM call a router (or an observer) has no use for. */
+/**
+ * Whether a turn of this session must skip skill selection: a router's or an observer's, which costs an LLM call they have no use for, and a review someone
+ * asked of the owner, whose fixed profile has none of the owner's skills (`github-review/review-profile.ts`). Both skill entries (the
+ * immediate turn and the queued one) ask here.
+ */
 export async function skipsSkillSelection(sessionId: string): Promise<boolean> {
+  if (await reviewProfileSession(sessionId)) return true;
   if (!CLAW_ASSISTANT_ENABLED) return false;
   const role = (await sessionRole(sessionId))?.role;
   return role === "router" || role === "observer";

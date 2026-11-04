@@ -42,6 +42,7 @@ import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.
 import { HOLD_GUIDANCE } from "./risk.js";
 import { REVIEW_MODES, getConfirmation, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type Queryable, type ReviewMode } from "./store.js";
 import { verifySessionToolToken } from "./token.js";
+import { requesterLabelOf, requesterOf } from "./requested-by.js";
 
 const logger = pino({ name: "github-review-mcp" });
 
@@ -160,6 +161,8 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
 
   // The review items of the assistant check a pull request with this same service before they make a session for it.
   reviewItemPorts.checkPullRequest = (actor, ref) => service.checkPullRequest(actor, ref);
+  // And ask whether the acting user lets others act for them, when a review is asked of them and before each of its turns.
+  reviewItemPorts.delegationOf = typeof service.delegationOf === "function" ? (actor, requester) => service.delegationOf(actor, requester) : null;
 
   app.all("/v1/internal/github-review/mcp", async (req, reply) => {
     const header = String(req.headers.authorization ?? "");
@@ -181,7 +184,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     }
     // The token proves what was true when it was minted; the session says what is true now.
     const acting = parseActingAs(row?.config?.acting_as);
-    if (!row || row.user_id !== claims.requesterUserId || !acting.ok || acting.actingAs !== claims.actorUserId) {
+    if (!row || requesterOf(row) !== claims.requesterUserId || !acting.ok || acting.actingAs !== claims.actorUserId) {
       return refuse(reply, 403, "session_mismatch");
     }
     // A target that is there and cannot be read is not "no target": the session does not get the tools.
@@ -190,7 +193,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
       logger.warn({ sessionId: claims.sessionId }, "github_review.review_target_unreadable");
       return refuse(reply, 403, "review_target_invalid");
     }
-    const label = typeof row.config?.acting_as_requester === "string" ? row.config.acting_as_requester : undefined;
+    const label = requesterLabelOf(row.config);
     const mcp = buildReviewToolServer(service, {
       sessionId: claims.sessionId, requesterUserId: claims.requesterUserId, actorUserId: claims.actorUserId, requesterLabel: label, reviewTarget: target.target,
       reviewOnly: reviewOnlyOf(row.config),

@@ -41,6 +41,9 @@ describe("assistant review items", { skip }, () => {
   let interrupts: string[];
   let decisions: Array<{ id: string; decision: string }>;
   let decideEffect: (id: string) => Promise<void>;
+  /** What the identity service says of each acting user's switch now; "on" when a test says nothing. */
+  let delegation: Record<string, string>;
+  let delegationAsked: Array<[string, string]>;
 
   before(async () => {
     w = await startWorld({
@@ -69,7 +72,19 @@ describe("assistant review items", { skip }, () => {
       if (method !== "none") (req as any).authMethod = typeof method === "string" ? method : "identity_token";
     });
     await registerAssistantRoutes(app);
+    // The person a review is asked of, as their credentials would prove them: `tok-<id>` and `ak-<id>` are that person's own.
+    const { actingAsCredentialPorts } = await import("../src/routes/assistant.js");
+    actingAsCredentialPorts.verify = async ({ token, apiKey, actingAs }) => {
+      if (!token || !apiKey) return { ok: false, status: 401, error: "acting_as_credentials_required", message: "none" };
+      if (token !== `tok-${actingAs}`) return { ok: false, status: 403, error: "acting_as_mismatch", message: "not theirs" };
+      if (apiKey !== `ak-${actingAs}`) return { ok: false, status: 401, error: "key_subject_mismatch", message: "not their key" };
+      return { ok: true, user: { userId: actingAs, userName: `Name ${actingAs}`, roles: ["default"], platformKey: `pk-${actingAs}`, virtualKey: `vk-${actingAs}` } };
+    };
     const fakeService = {
+      delegationOf: async (actor: string, requester: string) => {
+        delegationAsked.push([actor, requester]);
+        return delegation[actor] ?? "on";
+      },
       checkPullRequest: async (actor: Record<string, unknown>, pr: { owner: string; repo: string; number: number }) => {
         checks.push({ actor, pr });
         return { ...checkAnswer(pr), text: "" };
@@ -95,6 +110,8 @@ describe("assistant review items", { skip }, () => {
     decisions = [];
     checkAnswer = () => ({ isError: false, body: { status: "ok", title: "t", head_sha: "a".repeat(40) } });
     decideEffect = async () => {};
+    delegation = {};
+    delegationAsked = [];
     interrupts = [];
     w.h.app.chatRun.chatRunPorts.publishInterrupt = (subject: string) => { interrupts.push(subject); };
   });
@@ -104,7 +121,13 @@ describe("assistant review items", { skip }, () => {
     const r = await app.inject({ method: "POST", url, payload: payload as never, headers: { "x-test-user": user, ...headers } });
     return { status: r.statusCode, body: r.json() };
   }
-  const start = (user: string, body: unknown, headers: Record<string, string> = {}) => call(user, "/v1/assistant/reviews", body, headers);
+  /** For a review asked of someone else, the asking service brings that person's credentials unless a test says otherwise. */
+  const credsOf = (of: string) => ({ "x-acting-as-token": `tok-${of}`, "x-acting-as-api-key": `ak-${of}` });
+  const start = (user: string, body: unknown, headers: Record<string, string> = {}) => {
+    const of = (body as { acting_as?: unknown })?.acting_as;
+    const creds = typeof of === "string" && of !== user && !("x-acting-as-token" in headers) ? credsOf(of) : {};
+    return call(user, "/v1/assistant/reviews", body, { ...creds, ...headers });
+  };
   const PR = (number: number, owner = "AMD-AGI", repo = "PrimusClaw") => ({ owner, repo, number });
   const count = async (table: string, where = "TRUE") => Number((await w.q(`SELECT COUNT(*)::int AS n FROM ${table} WHERE ${where}`))[0].n);
   /** What a refused request must have left alone. */
@@ -142,7 +165,7 @@ describe("assistant review items", { skip }, () => {
     );
   }
 
-  test("V1 start makes one item per pull request, an acting session as the create route makes one, and queues its first message", async () => {
+  test("V1 a review asked of someone else is theirs: their item, their session sealed with their own keys, the requester recorded as who asked", async () => {
     const r = await start("alice", {
       prs: [PR(254), { ...PR(257), message: "Review https://github.com/AMD-AGI/PrimusClaw/pull/257 and answer in Chinese." }],
       acting_as: "bob", acting_as_name: "Bob B", model: "claude-opus-5.5", effort: "high", review_only: false,
@@ -150,45 +173,65 @@ describe("assistant review items", { skip }, () => {
     assert.equal(r.status, 200, JSON.stringify(r.body));
     const items = r.body.data.items as Array<Record<string, any>>;
     assert.deepEqual(items.map((i) => [i.seq, i.title, i.pr.number]), [[1, "Review+merge PrimusClaw#254", 254], [2, "Review+merge PrimusClaw#257", 257]]);
+    // The session is the reviewer's: the person who asked is not told its id, nor its first turn's.
+    assert.deepEqual(items.map((i) => ["session_id" in i, "message_id" in i]), [[false, false], [false, false]]);
     for (const it of items) {
       const item = await w.item(it.item_id);
+      assert.equal(item.user_id, "bob", "the item is on the reviewer's board");
       assert.equal(item.kind, "review");
       assert.equal(item.board_state, "in_progress");
-      assert.equal(item.worker_session_id, it.session_id);
       assert.deepEqual({ ...item.params, brief: undefined }, {
         pr: it.pr, acting_as: "bob", acting_as_name: "Bob B", model: "claude-opus-5.5", effort: "high", review_only: false, brief: undefined,
+        requested_by: "alice", requester_label: "Name alice", requester_note: null,
       });
-      const [s] = await w.q("SELECT user_id, model, effort, config, parent_session_id FROM claw_sessions WHERE session_id = $1", [it.session_id]);
-      assert.equal(s.user_id, "alice");
+      const [s] = await w.q("SELECT user_id, model, effort, config, parent_session_id FROM claw_sessions WHERE session_id = $1", [item.worker_session_id]);
+      assert.equal(s.user_id, "bob", "and so is the session");
       assert.equal(s.model, "claude-opus-5.5");
       assert.equal(s.effort, "high");
       assert.equal(s.parent_session_id, null);
       assert.deepEqual(
-        [s.config.acting_as, s.config.review_target, s.config.review_only, s.config.acting_as_requester, s.config.notify_on_finish],
-        ["bob", it.pr, false, "Name alice", true],
+        [s.config.acting_as, s.config.review_target, s.config.review_only, s.config.requested_by, s.config.sandbox_profile, s.config.acting_as_requester, s.config.notify_on_finish],
+        ["bob", it.pr, false, { user_id: "alice", label: "Name alice" }, "review", undefined, true],
       );
-      // Sealed, as every server-stamped credential is (`auth/sealed-session-credentials.ts`): the turn runs with the requester's keys.
+      // Sealed with the reviewer's own keys, the ones their credentials proved: the review runs on their quota, never the requester's.
       assert.deepEqual([s.config.platform_key, s.config.llm_api_key, s.config._server_managed_credentials], [undefined, undefined, true]);
-      assert.deepEqual(readTrustedSessionCredentials(s.config), { platformKey: "pk-alice", llmApiKey: "vk-alice" });
-      const queued = await w.pending(it.session_id);
+      assert.deepEqual(readTrustedSessionCredentials(s.config), { platformKey: "pk-bob", llmApiKey: "vk-bob" });
+      const queued = await w.pending(item.worker_session_id);
       assert.equal(queued.length, 1);
-      assert.equal(it.message_id, `claw-pending-${queued[0].id}`, "the answer names the first message's turn");
       assert.equal(queued[0].content, item.params.brief);
+      assert.equal(queued[0].user_id, "bob", "the first turn runs as the reviewer");
     }
-    assert.match((await w.pending(items[0].session_id))[0].content, /^Review https:\/\/github\.com\/AMD-AGI\/PrimusClaw\/pull\/254\. If the review finds nothing that blocks it, approve and merge it/);
-    assert.equal((await w.pending(items[1].session_id))[0].content, "Review https://github.com/AMD-AGI/PrimusClaw/pull/257 and answer in Chinese.");
-    assert.deepEqual(w.drains.map((d) => d.sessionId), items.map((i) => i.session_id), "each review's turn is started");
-    assert.deepEqual(checks.map((c) => [c.actor.requesterUserId, c.actor.actorUserId, c.actor.sessionId, (c.pr as any).number]),
-      items.map((i) => ["alice", "bob", i.session_id, i.pr.number]), "GitHub was asked with the acting user's account, for the session to be made");
-    // The board shows what kind of item it is, and what it was asked with.
-    const board = await app.inject({ method: "GET", url: "/v1/work-items", headers: { "x-test-user": "alice" } });
+    const sessions = await Promise.all(items.map(async (i) => (await w.item(i.item_id)).worker_session_id));
+    assert.match((await w.pending(sessions[0]))[0].content, /^Review https:\/\/github\.com\/AMD-AGI\/PrimusClaw\/pull\/254\. If the review finds nothing that blocks it, approve and merge it/);
+    assert.equal((await w.pending(sessions[1]))[0].content, "Review https://github.com/AMD-AGI/PrimusClaw/pull/257 and answer in Chinese.");
+    assert.deepEqual(w.drains.map((d) => [d.sessionId, d.userId]), sessions.map((sid) => [sid, "bob"]), "each review's turn is started, as the reviewer");
+    assert.deepEqual(checks.map((c) => [c.actor.requesterUserId, c.actor.actorUserId, (c.pr as any).number]),
+      items.map((i) => ["alice", "bob", i.pr.number]), "GitHub was asked with the acting user's account, for the person who asked");
+    assert.deepEqual(delegationAsked, [["bob", "alice"]], "the reviewer's switch was asked, now, once for the batch");
+    // The reviewer's board shows it; the requester's does not.
+    const board = await app.inject({ method: "GET", url: "/v1/work-items", headers: { "x-test-user": "bob" } });
     assert.deepEqual(board.json().data.map((r: any) => [r.kind, r.params.pr.number, r.params.review_only, r.can_accept]).sort(), [["review", 254, false, false], ["review", 257, false, false]]);
-    // Merging is asked for, never assumed.
+    const theirs = await app.inject({ method: "GET", url: "/v1/work-items", headers: { "x-test-user": "alice" } });
+    assert.deepEqual(theirs.json().data, []);
+  });
+
+  test("V1b a review of one's own account is exactly what it was: the caller's item and session, no requester, the ids in the answer", async () => {
     const only = await start("carol", { prs: [PR(300)] });
-    const onlyItem = await w.item(only.body.data.items[0].item_id);
-    assert.equal(onlyItem.params.review_only, true);
-    assert.equal((await w.q("SELECT config FROM claw_sessions WHERE session_id = $1", [onlyItem.worker_session_id]))[0].config.review_only, true);
-    assert.match(onlyItem.params.brief, /Review only: post your review and do not merge it\./);
+    assert.equal(only.status, 200);
+    const it = only.body.data.items[0];
+    const item = await w.item(it.item_id);
+    assert.equal(item.user_id, "carol");
+    assert.equal(item.worker_session_id, it.session_id);
+    assert.equal(it.message_id, `claw-pending-${(await w.pending(it.session_id))[0].id}`, "the answer names the first message's turn");
+    assert.deepEqual(Object.keys(item.params).sort(), ["acting_as", "acting_as_name", "brief", "effort", "model", "pr", "review_only"]);
+    const [s] = await w.q("SELECT user_id, config FROM claw_sessions WHERE session_id = $1", [it.session_id]);
+    assert.deepEqual(Object.keys(s.config).sort(), ["_server_managed_credentials", "acting_as", "acting_as_requester", "notify_on_finish", "review_only", "review_target", "sealed_credentials"]);
+    assert.equal(s.config.acting_as_requester, "Name carol");
+    assert.deepEqual(readTrustedSessionCredentials(s.config), { platformKey: "pk-carol", llmApiKey: "vk-carol" });
+    // Merging is asked for, never assumed.
+    assert.equal(item.params.review_only, true);
+    assert.match(item.params.brief, /Review only: post your review and do not merge it\./);
+    assert.deepEqual(delegationAsked, [], "nobody's switch is asked for a review of one's own account");
   });
 
   test("V2 only an identity-provider token starts one: a key, a cookie, a connector, no method or a service not allowed is refused and leaves nothing", async () => {
@@ -356,33 +399,55 @@ describe("assistant review items", { skip }, () => {
     }
   });
 
-  test("R1 restart: the same pull request with what changed, the old item stopped by the stop's rules", async () => {
-    const it = await one("alice", { model: "claude-sonnet-5", acting_as: "bob", acting_as_name: "Bob B" });
+  test("R1 restart: the same pull request with what changed, the old item stopped by the stop's rules; only the owner restarts", async () => {
+    await one("alice", { model: "claude-sonnet-5", acting_as: "bob", acting_as_name: "Bob B" });
+    const [first] = await w.q("SELECT item_id, worker_session_id FROM claw_work_items WHERE user_id = 'bob'");
+    const it = { item_id: first.item_id as string, session_id: first.worker_session_id as string };
     const held = await confirmation(it.session_id, "pending", "merge", "bob");
-    const r = await call("alice", `/v1/assistant/reviews/${it.item_id}/restart`, { model: "claude-opus-5.5", review_only: false });
+    assert.equal((await call("alice", `/v1/assistant/reviews/${it.item_id}/restart`, {})).status, 404, "the person who asked cannot restart it");
+    const r = await call("bob", `/v1/assistant/reviews/${it.item_id}/restart`, { model: "claude-opus-5.5", review_only: false });
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.deepEqual(r.body.data.stopped, { item_id: it.item_id, seq: 1 });
     const old = await w.item(it.item_id);
     assert.deepEqual([old.board_state, old.outcome], ["done", "stopped"]);
     assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [held]))[0].status, "denied");
     const fresh = await w.item(r.body.data.item.item_id);
-    assert.deepEqual([fresh.params.acting_as, fresh.params.acting_as_name, fresh.params.model, fresh.params.review_only, fresh.params.pr], ["bob", "Bob B", "claude-opus-5.5", false, PR(254)]);
+    assert.deepEqual([fresh.user_id, fresh.params.acting_as, fresh.params.acting_as_name, fresh.params.model, fresh.params.review_only, fresh.params.pr, fresh.params.requested_by],
+      ["bob", "bob", "Bob B", "claude-opus-5.5", false, PR(254), "alice"], "still asked by the same person");
+    const [freshSession] = await w.q("SELECT config FROM claw_sessions WHERE session_id = $1", [fresh.worker_session_id]);
+    assert.deepEqual([freshSession.config.requested_by, freshSession.config.sandbox_profile], [{ user_id: "alice", label: "Name alice" }, "review"]);
+    assert.deepEqual(delegationAsked.at(-1), ["bob", "alice"], "and the reviewer's say is asked again");
     assert.match(fresh.params.brief, /approve and merge it/, "a review that now merges is told so");
     assert.equal((await w.q("SELECT model FROM claw_sessions WHERE session_id = $1", [fresh.worker_session_id]))[0].model, "claude-opus-5.5");
     assert.equal(r.body.data.item.message_id, `claw-pending-${(await w.pending(fresh.worker_session_id))[0].id}`, "a restart names its first turn too");
     assert.equal(interrupts.length, 1, "the old session was interrupted");
     // Nothing changed but the model: the old words are sent again.
-    const again = await call("alice", `/v1/assistant/reviews/${fresh.item_id}/restart`, { model: null });
+    const again = await call("bob", `/v1/assistant/reviews/${fresh.item_id}/restart`, { model: null });
     assert.equal((await w.item(again.body.data.item.item_id)).params.brief, fresh.params.brief);
 
-    assert.equal((await call("alice", `/v1/assistant/reviews/${again.body.data.item.item_id}/restart`, {}, { "x-test-method": "api_key" })).status, 403);
-    assert.equal((await call("bob", `/v1/assistant/reviews/${again.body.data.item.item_id}/restart`, {})).status, 404, "another user's item is not there");
-    const task = await w.createItem(await w.user("alice"), "a task");
-    assert.deepEqual([(await call("alice", `/v1/assistant/reviews/${task.itemId}/restart`, {})).body.error], ["not_a_review_item"]);
-    await audit(again.body.data.item.session_id, "gh_pr_merge", "ok", "queued");
-    const merged = await call("alice", `/v1/assistant/reviews/${again.body.data.item.item_id}/restart`, {});
+    assert.equal((await call("bob", `/v1/assistant/reviews/${again.body.data.item.item_id}/restart`, {}, { "x-test-method": "api_key" })).status, 403);
+    assert.equal((await call("carol", `/v1/assistant/reviews/${again.body.data.item.item_id}/restart`, {})).status, 404, "another user's item is not there");
+    const task = await w.createItem(await w.user("bob"), "a task");
+    assert.deepEqual([(await call("bob", `/v1/assistant/reviews/${task.itemId}/restart`, {})).body.error], ["not_a_review_item"]);
+    delegation.bob = "off";
+    const off = await call("bob", `/v1/assistant/reviews/${again.body.data.item.item_id}/restart`, {});
+    assert.deepEqual([off.status, off.body.error], [403, "delegation_off"], "a review others asked for is not restarted once the switch is off");
+    delete delegation.bob;
+    await audit(again.body.data.item.session_id, "gh_pr_merge", "ok", "queued", "bob");
+    const merged = await call("bob", `/v1/assistant/reviews/${again.body.data.item.item_id}/restart`, {});
     assert.deepEqual([merged.status, merged.body.error], [409, "already_merged"]);
-    assert.equal(await count("claw_work_items", "kind = 'review' AND board_state <> 'done'"), 1, "the refused restart made nothing and stopped nothing");
+    assert.equal(await count("claw_work_items", "kind = 'review' AND board_state <> 'done'"), 1, "the refused restarts made nothing and stopped nothing");
+  });
+
+  test("R1b restart of one's own review keeps it one's own", async () => {
+    const it = await one("alice", { model: "claude-sonnet-5" });
+    const r = await call("alice", `/v1/assistant/reviews/${it.item_id}/restart`, { model: "claude-opus-5.5" });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const fresh = await w.item(r.body.data.item.item_id);
+    assert.deepEqual([fresh.user_id, fresh.params.requested_by, fresh.params.model], ["alice", undefined, "claude-opus-5.5"]);
+    const [cfg] = await w.q("SELECT config FROM claw_sessions WHERE session_id = $1", [fresh.worker_session_id]);
+    assert.deepEqual([cfg.config.requested_by, cfg.config.sandbox_profile, cfg.config.acting_as_requester], [undefined, undefined, "Name alice"]);
+    assert.deepEqual(delegationAsked, []);
   });
 
   test("M1 the state of a review, from every confirmation status and every way its turn ends", () => {

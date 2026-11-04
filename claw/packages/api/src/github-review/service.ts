@@ -604,6 +604,24 @@ export class GithubReview {
    * that is not a draft). A refusal here costs no session and no turn, where the same refusal from the session's first tool call costs both.
    * Not held to any session's request budget: there is no session yet, and it writes nothing.
    */
+  /**
+   * Whether the acting user lets others act for them, asked of the identity service now: what a review someone asked of them is checked
+   * against when it is made and before every turn it is about to take (`assistant/review-items.ts`). The credential the answer comes with
+   * is dropped unused. `off` is the switch turned off; `not_bound` and `expired` are no GitHub account to act with; `unavailable` is the
+   * identity service not answering, which is never taken as yes.
+   */
+  async delegationOf(actorUserId: string, requesterUserId: string): Promise<"on" | "off" | "not_bound" | "expired" | "unavailable"> {
+    try {
+      const cred = await this.deps.resolveCredential({ userId: actorUserId, provider: GITHUB_PROVIDER, requesterUserId, purpose: "delegation_check" });
+      if (cred.expiresAt !== null && cred.expiresAt <= this.now()) return "expired";
+      return cred.delegation ? "on" : "off";
+    } catch (err) {
+      if (err instanceof IdentityCredentialRefusedError && err.code === "not_bound") return "not_bound";
+      if (err instanceof IdentityCredentialRefusedError && err.code === "expired") return "expired";
+      return "unavailable";
+    }
+  }
+
   checkPullRequest(actor: ReviewActor, ref: PrRef): Promise<ToolOutcome> {
     return this.run(actor, "gh_pr_check", { pr: `${ref.owner}/${ref.repo}#${ref.number}` }, async (ctx) => {
       const { pr } = await this.load(ctx, ref);
@@ -709,7 +727,7 @@ export class GithubReview {
    */
   private async sessionFacts(sessionId: string): Promise<{ requesterLabel?: string; reviewOnly: boolean }> {
     try {
-      const r = await this.deps.db.query("SELECT config->>'acting_as_requester' AS label, config->'review_only' AS review_only FROM claw_sessions WHERE session_id = $1", [sessionId]);
+      const r = await this.deps.db.query("SELECT COALESCE(config->'requested_by'->>'label', config->>'acting_as_requester') AS label, config->'review_only' AS review_only FROM claw_sessions WHERE session_id = $1", [sessionId]);
       const row = r.rows[0] as { label?: unknown; review_only?: unknown } | undefined;
       const label = row?.label;
       return { requesterLabel: typeof label === "string" && label ? label : undefined, reviewOnly: reviewOnlyOf({ review_only: row?.review_only }) };

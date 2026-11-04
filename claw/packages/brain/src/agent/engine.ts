@@ -47,6 +47,7 @@ import type { ExecuteExtras } from "./index.js";
 import { untheadedRunIdentity, type RunIdentity } from "../tasks/run-identity.js";
 import { HookRunner, registryHasAny } from "./hooks.js";
 import pino from "pino";
+import { applyReviewProfileBackstop, isReviewProfile, reviewProfileAllowlist } from "./review-profile.js";
 
 const logger = pino({ name: "agent-engine" });
 
@@ -88,6 +89,8 @@ export class AgentEngine {
     hands?: HandsClient | null,
     extras?: ExecuteExtras,
   ): Promise<ExecuteResult> {
+    // Before anything reads the request: a requested review keeps only what its fixed profile allows (`review-profile.ts`).
+    applyReviewProfileBackstop(request);
     // Which wire protocol Brain speaks to the LLM is a deployment-wide
     // choice (LLM_API_STYLE); apiKey still honors per-request BYOK/platform
     // key overrides via resolveRequestLlmKey on top of that provider's
@@ -228,7 +231,10 @@ export class AgentEngine {
     // The tools the run may use at all (`tools_allowlist`), read once for everything below that asks:
     // the prompt (is `load_skill` among them?), the router and the schemas the model is offered.
     // No field, or an empty one, is no restriction.
-    const toolAllowlist = parseToolAllowlist(request.tools_allowlist);
+    // A requested review (`sandbox_profile`) is held to its fixed list whatever the request lists (`review-profile.ts`).
+    const toolAllowlist = isReviewProfile(request)
+      ? reviewProfileAllowlist(parseToolAllowlist(request.tools_allowlist))
+      : parseToolAllowlist(request.tools_allowlist);
     // A run whose list leaves `load_skill` out (any list written before the tool existed) is not offered
     // it, and the router refuses it. Its prompt must not send the model there: it gets the skill hint
     // from before the tool, which reads SKILL.md with `read`.
