@@ -37,8 +37,11 @@ record it.
   that cannot be read for 10 minutes puts the item in front of the user. New routes `POST/GET
   /v1/work-items/:id/subscriptions` and `DELETE /v1/work-items/:id/subscriptions/:sub_id`; the router gets
   `work_subscribe`, the worker `pr_reply`, which answers one event on the pull request as the owner, once per event,
-  and only where the owner allowed it themselves (`reply: true`, which needs an identity-provider sign-in; a key can
-  only take it away). Reviews on someone's behalf are never subscribed. New tables `claw_work_item_subscriptions`,
+  and only where the owner allowed it themselves (`reply: true`, which needs an identity-provider sign-in; a key or
+  ending the subscription takes it away); an answer carrying the owner's token, one of their stored values or
+  anything shaped like a credential is refused. Only comments and reviews by people who can write to the repository
+  (`author_association` OWNER, MEMBER, COLLABORATOR) or by the owner's own account reach the worker; others are
+  recorded and dropped. Reviews on someone's behalf are never subscribed. New tables `claw_work_item_subscriptions`,
   `claw_work_item_github_events` and `claw_work_item_pr_replies` (required at start-up when the assistant is on);
   `CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS` (default 20) caps what one user watches.
 - On-behalf GitHub reviews as work items of the assistant, behind `CLAW_ASSISTANT_REVIEW_ITEMS` (default off; needs

@@ -12,9 +12,12 @@
  * item are then put on its worker's queue as one message, in the same transaction that marks them delivered, and
  * the worker is started. The model only judges what to do about them.
  *
- * What an event can do is what the item could already do. The poll only reads. The worker answers on the pull
+ * Whose words reach the worker is decided in code before any model reads them: people who can write to the repository and the
+ * owner's own account (`TRUSTED_ASSOCIATIONS`); anyone else's comment is recorded and dropped. What an event can do is what the item
+ * could already do. The poll only reads. The worker answers on the pull
  * request through `pr_reply`, which posts as the owner only when the owner, signed in themselves, allowed it for
- * this subscription (`reply_allowed`); nothing a model or a comment says turns that on. Without it, answering
+ * this subscription (`reply_allowed`), which ending the subscription takes back; nothing a model or a comment says turns that on, and
+ * an answer holding the owner's token, a stored value of theirs or anything shaped like a credential is not posted. Without it, answering
  * uses the `github` tools, whose every write waits for the owner as before. A review on someone's behalf (an item
  * of kind `review`, a session that acts as a user) is never subscribed: every turn in such a session needs the
  * person's say (`github-review/acting-turns.ts`), and an event has none.
@@ -27,6 +30,8 @@ import pino from "pino";
 import {
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_GITHUB_EVENTS, CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS, CLAW_ASSISTANT_GITHUB_POLL_SEC,
 } from "../config.js";
+import { redactSecrets } from "@claw/utils";
+import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { readGithubMcpSettings } from "../github-mcp/settings.js";
 import { loadGithubToken } from "../github-mcp/mcp.js";
 import { GithubClient, GithubError, parsePrRef, repoPath, type PrRef } from "../github-review/github.js";
@@ -73,6 +78,15 @@ export const EVENT_KINDS = ["issue_comment", "review", "review_comment", "check_
 export type GithubEventKind = (typeof EVENT_KINDS)[number];
 /** The kinds a `pr_reply` answer can be read back as. */
 const COMMENT_KINDS: ReadonlySet<string> = new Set(["issue_comment", "review_comment"]);
+/** What people write (as opposed to what CI and the pull request's own state say). */
+const AUTHORED_KINDS: ReadonlySet<string> = new Set(["issue_comment", "review_comment", "review"]);
+/**
+ * Whose words reach a worker: people who can write to the repository (GitHub's `author_association`), and the owner's own account.
+ * They could already push code the worker runs, so their text gives nobody a way in they did not have. Anyone else's comment is
+ * stored and dropped with the reason (`author_not_trusted`), never delivered: on a public repository that is anybody on the internet,
+ * writing to a model that holds the owner's credentials.
+ */
+export const TRUSTED_ASSOCIATIONS: ReadonlySet<string> = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 
 export function githubEventsEnabled(): boolean {
   return CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_GITHUB_EVENTS;
@@ -193,11 +207,14 @@ export async function listSubscriptions(userId: string, itemId: string): Promise
   return rows.map(subscriptionView);
 }
 
-/** Stop watching. Null when the subscription is not the caller's (or not there). */
+/**
+ * Stop watching, and take back any permission to answer: an event already delivered can no longer be answered without asking. Null
+ * when the subscription is not the caller's (or not there).
+ */
 export async function endSubscription(userId: string, itemId: string, subId: number): Promise<SubscriptionView | null> {
   const row = (await db.query(
     `UPDATE claw_work_item_subscriptions
-        SET state = 'ended', end_reason = COALESCE(end_reason, 'user'), ended_at = COALESCE(ended_at, NOW())
+        SET state = 'ended', end_reason = COALESCE(end_reason, 'user'), ended_at = COALESCE(ended_at, NOW()), reply_allowed = FALSE
       WHERE id = $1 AND item_id = $2 AND user_id = $3
       RETURNING *`,
     [subId, itemId, userId],
@@ -260,6 +277,8 @@ export interface GithubEvent {
   replyTo?: string | null;
   headSha?: string | null;
   occurredAt: string | null;
+  /** GitHub's `author_association` of a comment or review: how the author stands to the repository. */
+  association?: string | null;
 }
 
 const clip = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, max)}…[cut]`);
@@ -336,14 +355,14 @@ export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscrip
   };
   for (const c of await sinceList(repoPath(r, `/issues/${r.number}/comments`))) {
     if (!after(c?.created_at, sub.since)) continue;
-    events.push({ kind: "issue_comment", githubId: String(c.id), author: login(c.user), url: c.html_url ?? null, body: String(c.body ?? ""), occurredAt: c.created_at });
+    events.push({ kind: "issue_comment", githubId: String(c.id), author: login(c.user), url: c.html_url ?? null, body: String(c.body ?? ""), occurredAt: c.created_at, association: c.author_association ?? null });
   }
   for (const c of await sinceList(repoPath(r, `/pulls/${r.number}/comments`))) {
     if (!after(c?.created_at, sub.since)) continue;
     events.push({
       kind: "review_comment", githubId: String(c.id), author: login(c.user), url: c.html_url ?? null, body: String(c.body ?? ""),
       path: typeof c.path === "string" ? c.path : null, line: Number.isInteger(c.line) ? c.line : (Number.isInteger(c.original_line) ? c.original_line : null),
-      replyTo: String(c.in_reply_to_id ?? c.id), occurredAt: c.created_at,
+      replyTo: String(c.in_reply_to_id ?? c.id), occurredAt: c.created_at, association: c.author_association ?? null,
     });
   }
   for (const v of await newestPages(gh, repoPath(r, `/pulls/${r.number}/reviews`))) {
@@ -352,7 +371,7 @@ export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscrip
     const body = String(v.body ?? "").trim();
     // A comment-only review with no text of its own is its inline comments, which arrive by themselves.
     if (!body && state !== "APPROVED" && state !== "CHANGES_REQUESTED") continue;
-    events.push({ kind: "review", githubId: String(v.id), author: login(v.user), url: v.html_url ?? null, body: body ? `${state}: ${body}` : state, occurredAt: v.submitted_at });
+    events.push({ kind: "review", githubId: String(v.id), author: login(v.user), url: v.html_url ?? null, body: body ? `${state}: ${body}` : state, occurredAt: v.submitted_at, association: v.author_association ?? null });
   }
   const head = typeof pr.head?.sha === "string" ? pr.head.sha : null;
   if (head && pr.state === "open") {
@@ -408,16 +427,19 @@ export async function storeEvents(
       "SELECT event_id FROM claw_work_item_pr_replies WHERE event_id = ANY($1::text[])", [markers],
     )).rows as Array<{ event_id: string }>).map((r) => r.event_id) : []);
     const isOurs = (e: GithubEvent): boolean => byUs(e) && markersIn(e.body).some((m) => answered.has(m));
+    const untrusted = (e: GithubEvent): boolean => AUTHORED_KINDS.has(e.kind)
+      && !(read.login !== null && e.author === read.login) && !TRUSTED_ASSOCIATIONS.has(String(e.association ?? ""));
     let stored = 0;
     for (const e of read.events) {
       if (isOurs(e)) continue;
+      const dropped = untrusted(e) ? "author_not_trusted" : null;
       const inserted = await query(
         `INSERT INTO claw_work_item_github_events
-           (event_id, sub_id, item_id, kind, github_id, author, url, body, path, line, reply_to, head_sha, occurred_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+           (event_id, sub_id, item_id, kind, github_id, author, url, body, path, line, reply_to, head_sha, occurred_at, dropped_at, drop_reason)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CASE WHEN $14::text IS NULL THEN NULL ELSE NOW() END, $14)
          ON CONFLICT (event_id) DO NOTHING`,
         [eventIdOf(sub.id, e), sub.id, sub.item_id, e.kind, e.githubId, e.author, e.url, clip(e.body, EVENT_BODY_MAX),
-          e.path ?? null, e.line ?? null, e.replyTo ?? null, e.headSha ?? null, e.occurredAt],
+          e.path ?? null, e.line ?? null, e.replyTo ?? null, e.headSha ?? null, e.occurredAt, dropped],
       );
       stored += inserted.rowCount ?? 0;
     }
@@ -794,6 +816,13 @@ export async function prReply(
     // Nothing was sent by this attempt; an earlier one that may have been is still looked for by the next.
     if (!retry) await release();
     throw new ToolRefused("no_github_token", "the user keeps no GitHub token (GH_TOKEN), so nothing can be posted");
+  }
+  // What the owner keeps (the env vault the worker's sandbox is given, and the token answers are posted with) never leaves in an answer,
+  // whatever a comment talked the worker into writing; nor does anything shaped like a credential.
+  const secrets = [token, ...Object.values(await loadUserEnvSnapshot(db, target.user_id, logger))];
+  if (redactSecrets(body, secrets).hits > 0) {
+    if (!retry) await release();
+    throw new ToolRefused("body_contains_secret", "the answer contains a credential or one of the user's stored values; it was not posted");
   }
   const gh = github(token);
   try {
