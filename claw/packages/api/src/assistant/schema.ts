@@ -184,6 +184,8 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
       -- Set with the worker's queued message, in the same transaction.
       delivered_at  TIMESTAMPTZ,
       delivery_key  TEXT,
+      -- The last time a delivery could not be queued (the worker's session gone, say): such items go to the back of the line.
+      tried_at      TIMESTAMPTZ,
       dropped_at    TIMESTAMPTZ,
       drop_reason   TEXT
     )

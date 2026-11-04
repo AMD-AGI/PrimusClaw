@@ -820,10 +820,14 @@ export async function deliverItemEvents(itemId: string): Promise<"delivered" | "
       [pending.map((e) => e.event_id), key],
     );
     return { status: "delivered" as const, sessionId: item.worker_session_id, userId: item.user_id };
-  }).catch((err: unknown) => {
+  }).catch(async (err: unknown) => {
     const notQueued = (err as { notQueued?: string })?.notQueued;
     if (!notQueued) throw err;
     logger.warn({ itemId, error: notQueued }, "assistant.github_events_not_queued");
+    // To the back of the line: an item that cannot take its events must not keep the ones behind it from theirs.
+    await db.query(
+      "UPDATE claw_work_item_github_events SET tried_at = NOW() WHERE item_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL", [itemId],
+    );
     return { status: "not_queued" as const };
   });
   if (out.status === "delivered") await drainSessionIfIdle(out.sessionId, out.userId);
@@ -832,8 +836,9 @@ export async function deliverItemEvents(itemId: string): Promise<"delivered" | "
 
 export async function deliverPendingEvents(): Promise<number> {
   // Oldest waiting first, and never an item that could not take them now: one at its wake limit, or one holding a result for the user
-  // with nothing pending but the pull request closing (`deliverItemEvents` keeps those). Otherwise items that keep waiting would fill
-  // every batch and others behind them would wait for good.
+  // with nothing pending but the pull request closing (`deliverItemEvents` keeps those). One whose message could not be queued last
+  // time goes behind every item not yet tried. Otherwise items that keep waiting would fill every batch and others behind them would
+  // wait for good.
   const items = (await db.query(
     `SELECT e.item_id FROM claw_work_item_github_events e
        LEFT JOIN claw_work_items w ON w.item_id = e.item_id
@@ -843,7 +848,7 @@ export async function deliverPendingEvents(): Promise<number> {
       GROUP BY e.item_id, w.board_state, w.last_report_kind
      HAVING NOT (w.board_state IS NOT DISTINCT FROM 'needs_you' AND w.last_report_kind IS NOT DISTINCT FROM 'ready'
                  AND bool_and(e.kind = 'pr_closed'))
-      ORDER BY MIN(e.created_at)
+      ORDER BY MAX(e.tried_at) NULLS FIRST, MIN(e.created_at)
       LIMIT 100`,
     [WAKE_WINDOW, WAKES_PER_WINDOW],
   )).rows as Array<{ item_id: string }>;

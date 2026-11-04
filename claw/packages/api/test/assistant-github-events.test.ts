@@ -28,6 +28,7 @@
  *   F8  a closed pull request whose comments were cut at the page limit is read to the end before the watch ends
  *   F9  a list cut short is read on from where GitHub's own order stopped: an issue's comments by creation, review comments by update
  *   F10 items that cannot take their events now (wake limit) do not keep others from being delivered
+ *   F11 items whose message cannot be queued (their worker's session is gone) go to the back of the line
  *   R5  answers taken back while an answer is being prepared: nothing is posted
  *   H1  the routes: owner only, reply needs the person, a key can only take it away, a limit on subscriptions
  *   W1  an answer the owner approved through the github tools is Claw's own: read back, it wakes nobody; the owner's own words still do
@@ -700,6 +701,30 @@ describe("assistant GitHub events", { skip }, () => {
     await poll();
     const [msg] = await w.pending(it.workerSid);
     assert.ok(msg?.content.includes("behind a hundred held items"), "delivered in the same poll");
+  });
+
+  test("F11 items whose message cannot be queued do not keep another item's events from being delivered", async () => {
+    const it = await watched();
+    // A hundred items of bob's whose worker sessions are gone, each with an event waiting, all older than alice's comment.
+    await w.q(
+      `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id)
+       SELECT 'a-gone-' || lpad(n::text, 3, '0'), 'bob', 300 + n, 'gone', 'in_progress', 'sess-gone-' || n FROM generate_series(1, 100) n`,
+    );
+    await w.q(
+      `INSERT INTO claw_work_item_subscriptions (item_id, user_id, owner, repo, number, since, cursor_at, state)
+       SELECT 'a-gone-' || lpad(n::text, 3, '0'), 'bob', 'acme', 'app', 1000 + n, NOW(), NOW(), 'ended' FROM generate_series(1, 100) n`,
+    );
+    await w.q(
+      `INSERT INTO claw_work_item_github_events (event_id, sub_id, item_id, kind, github_id, body, created_at)
+       SELECT 'gh:gone:' || s.id, s.id, s.item_id, 'issue_comment', s.id::text, 'x', NOW() - INTERVAL '1 hour'
+         FROM claw_work_item_subscriptions s WHERE s.item_id LIKE 'a-gone-%'`,
+    );
+    gh.comment("behind a hundred items that cannot take theirs");
+    await poll();
+    await ev.deliverPendingEvents();
+    const [msg] = await w.pending(it.workerSid);
+    assert.ok(msg?.content.includes("behind a hundred items that cannot take theirs"), "delivered at the next pass, not never");
+    assert.equal(await count("claw_work_item_github_events", "item_id LIKE 'a-gone-%' AND delivered_at IS NULL AND dropped_at IS NULL AND tried_at IS NOT NULL"), 100, "theirs are kept");
   });
 
   test("R5 answers taken back while an answer is being prepared: nothing is posted", async () => {

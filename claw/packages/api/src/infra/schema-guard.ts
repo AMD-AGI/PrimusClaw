@@ -263,7 +263,7 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     onlyWhenAssistant: true,
     columns: [
       "event_id", "sub_id", "item_id", "kind", "github_id", "author", "url", "body", "path", "line", "reply_to", "head_sha", "occurred_at",
-      "created_at", "delivered_at", "delivery_key", "dropped_at", "drop_reason",
+      "created_at", "delivered_at", "delivery_key", "tried_at", "dropped_at", "drop_reason",
     ],
   },
   {
