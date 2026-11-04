@@ -4,6 +4,7 @@
 import pg from "pg";
 import { APP_RUNS_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
 import { ensureAssistantSchema } from "../assistant/schema.js";
+import { sealPlaintextSessionCredentials } from "../auth/sealed-session-credentials.js";
 import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
@@ -1540,6 +1541,14 @@ export async function initDb(): Promise<void> {
           SET cleanup_state = 'pending', cleanup_next_at = NOW()
         WHERE deleted_at IS NOT NULL AND cleanup_state IS NULL`,
     ).catch(() => {});
+
+    // Keys that sessions stamped by earlier builds hold in plain config fields
+    // are sealed here; matches nothing once done (sealed-session-credentials.ts).
+    // Not fatal: the reader still accepts the plain fields, and the next start retries.
+    await sealPlaintextSessionCredentials(client).then(
+      (n) => { if (n > 0) logger.info({ sessions: n }, "db.session_credentials_sealed"); },
+      (err) => logger.warn({ err: (err as Error)?.message }, "db.session_credentials_seal_failed"),
+    );
 
     // Per-session recency lookup. The sweeper's stuck-session reaper asks
     // "has this session emitted an event lately", which without this index is a

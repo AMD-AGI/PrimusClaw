@@ -108,9 +108,10 @@ describe("assistant tools", { skip }, () => {
     const [session] = await w.q("SELECT * FROM claw_sessions WHERE session_id = $1", [item.worker_session_id]);
     assert.equal(session.user_id, "alice");
     assert.equal(session.parent_session_id, null, "no tree: an assistant would grow it for ever");
-    assert.equal(session.config.platform_key, "pk-alice");
-    assert.equal(session.config.llm_api_key, "vk-alice");
-    assert.equal(session.config._server_managed_credentials, true);
+    const { readTrustedSessionCredentials } = await import("../src/auth/session-credentials.js");
+    assert.deepEqual(readTrustedSessionCredentials(session.config), { platformKey: "pk-alice", llmApiKey: "vk-alice" });
+    assert.equal(session.config.platform_key, undefined, "the router's keys are copied sealed, never in the clear");
+    assert.equal(session.config.llm_api_key, undefined);
     assert.equal(session.config.repo.url, "https://github.com/acme/app.git");
     assert.equal(session.config.notify_on_finish, undefined, "a worker does not announce its own finish");
     assert.equal(item.repo.url, "https://github.com/acme/app.git");
