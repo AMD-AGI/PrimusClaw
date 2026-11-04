@@ -13,6 +13,7 @@ import { lookupTool, type LookupFailure } from "../tools/lookup.js";
 export { platformToolsBase } from "../tools/lookup.js";
 import { uploadDirToSandbox } from "../sandbox/write.js";
 import { createPrivateStagingRoot } from "../tasks/plugin-from-message.js";
+import { ENV_PLACEHOLDER_NAME_RE } from "../clients/mcp-config.js";
 import type { HandsClient } from "../clients/hands.js";
 import type { EventCallback } from "@claw/protocol";
 
@@ -27,6 +28,8 @@ const logger = pino({ name: "platform-defaults" });
 export interface PlatformDefaults {
   skills: Array<{ toolId: number; name?: string }>;
   mcpServers: Record<string, Record<string, unknown>>;
+  /** The environment names `mcpServers` may name as `<NAME>` placeholders (`mcp_env_allow`). */
+  mcpEnvAllow: ReadonlySet<string>;
 }
 
 /** A default skill ready to be listed in the prompt; its body is not loaded. */
@@ -46,10 +49,15 @@ export interface DefaultSkill {
    * A skill that came with the request's plugin rather than from the platform
    * defaults. Its write must not fail quietly: see `LazyDefaultSkills.ensure`.
    */
-  source?: "plugin";
+  source?: "plugin" | "repo";
+  /**
+   * Where the skill's files already are in the sandbox, for a skill that came with the bound
+   * repository: its scripts run from there, and it is never written to `.skills/`.
+   */
+  sandboxDir?: string;
 }
 
-const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+export const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 export const DESCRIPTION_MAX = 300;
 export const MAX_DEFAULT_SKILLS = 50;
 
@@ -129,7 +137,17 @@ function parseDefaults(raw: unknown): PlatformDefaults {
       mcpServers[k] = v;
     }
   }
-  return { skills, mcpServers };
+  const mcpEnvAllow = new Set<string>();
+  if (raw.mcp_env_allow !== undefined) {
+    if (!Array.isArray(raw.mcp_env_allow)) throw new Error("mcp_env_allow must be an array");
+    for (const name of raw.mcp_env_allow) {
+      if (typeof name !== "string" || !ENV_PLACEHOLDER_NAME_RE.test(name)) {
+        throw new Error(`invalid mcp_env_allow name '${String(name)}'`);
+      }
+      mcpEnvAllow.add(name);
+    }
+  }
+  return { skills, mcpServers, mcpEnvAllow };
 }
 
 /**
@@ -365,6 +383,13 @@ export async function resolveDefaultSkills(
  */
 export class LazyDefaultSkills {
   private written = new Set<string>();
+  /**
+   * Writes under way, by skill name, so a second call needing the same skill
+   * waits for that upload instead of starting another: reads in one turn run
+   * together, and a second upload rewriting a skill's files could hand one of
+   * them a file mid-rewrite. Each resolves to whether the write succeeded.
+   */
+  private writing = new Map<string, Promise<boolean>>();
   private lastHands: HandsClient | null = null;
 
   constructor(
@@ -389,59 +414,75 @@ export class LazyDefaultSkills {
    * only in the file (progressive listing), so running the call on without them
    * would hand the agent a bare file-not-found for a skill it was told to use.
    * The throw fails that one tool call, with a message naming the skill; the
-   * skill stays pending, so repeating the call writes it again.
+   * skill stays pending, so repeating the call writes it again. Every call that
+   * was waiting on that write gets the same throw.
    */
   async ensure(hands: HandsClient, text: string, coldSandbox = false): Promise<void> {
-    if (hands !== this.lastHands) { this.written.clear(); this.lastHands = hands; }
+    if (hands !== this.lastHands) { this.written.clear(); this.writing.clear(); this.lastHands = hands; }
     const pending = this.skills.filter((s) => !this.written.has(s.name));
     if (!pending.length) return;
     const named = pending.filter((s) => text.includes(s.name));
     const namesAWrittenSkill = this.skills.some((s) => this.written.has(s.name) && text.includes(s.name));
     const todo = named.length ? named : namesAWrittenSkill ? [] : pending;
-    const rel = this.sessionDir === "/workspace" ? "" : this.sessionDir.replace(/^\/workspace\/?/, "").replace(/^\/+/, "");
     const failedPlugin: string[] = [];
     for (const s of todo) {
-      const t0 = Date.now();
-      const plugin = s.source === "plugin";
-      try {
-        const base = rel ? path.posix.join(rel, ".skills", s.name) : path.posix.join(".skills", s.name);
-        const attempt = async () => {
-          const up = await uploadDirToSandbox(hands, s.localDir, base);
-          const shippable = up.total - up.skipped;
-          if (up.failed > 0 || (shippable > 0 && up.uploaded === 0) || up.total === 0) throw new Error("upload failed");
-        };
-        try {
-          await attempt();
-        } catch (first) {
-          // The staged copy may be gone; stage again rather than leave the
-          // agent with a skill the prompt promised.
-          if (!s.restage) throw first;
-          s.localDir = await s.restage();
-          await attempt();
-        }
-        this.written.add(s.name);
-        // Plugin skills are not platform defaults: they stay out of the
-        // platform-default metrics, as they stay out of its events below.
-        if (plugin) logger.info({ name: s.name, toolId: s.toolId, elapsedMs: Date.now() - t0 }, "skill.plugin_written_to_sandbox");
-        else metrics.onPlatformSkillLazyWrite("ok", (Date.now() - t0) / 1000, coldSandbox);
-      } catch (err) {
-        if (plugin) {
-          logger.warn({ name: s.name, toolId: s.toolId, err: (err as Error).message }, "skill.plugin_write_failed");
-          failedPlugin.push(s.name);
-          await this.onEvent?.({ type: "toolUsed", tool: "download_skill", actionId: `plugin_skill_${s.toolId}`, status: "error", brief: `Failed to write plugin skill: ${s.name}` });
-          continue;
-        }
-        logger.warn({ name: s.name, err: (err as Error).message }, "platform_defaults.lazy_write_failed");
-        metrics.onPlatformSkillLazyWrite("failed", (Date.now() - t0) / 1000, coldSandbox);
-        metrics.onPlatformDefault("skill", "failed", "lazy_write");
-        await this.onEvent?.({ type: "toolUsed", tool: "platform_defaults", actionId: `platform_default_write_${s.toolId}`, status: "error", brief: `Failed to write default skill: ${s.name}` });
+      let write = this.writing.get(s.name);
+      if (!write) {
+        write = this.write(hands, s, coldSandbox);
+        this.writing.set(s.name, write);
+        const settled = write;
+        const clear = () => { if (this.writing.get(s.name) === settled) this.writing.delete(s.name); };
+        void settled.then(clear, clear);
       }
+      if (!(await write) && s.source === "plugin") failedPlugin.push(s.name);
     }
     if (failedPlugin.length) {
       throw new Error(
         `Failed to write plugin skill ${failedPlugin.map((n) => `'${n}'`).join(", ")} into the sandbox; `
         + `this call was not run. Repeat it to retry the write.`,
       );
+    }
+  }
+
+  /** One skill's upload; reports a failure and resolves false rather than throwing. */
+  private async write(hands: HandsClient, s: DefaultSkill, coldSandbox: boolean): Promise<boolean> {
+    const rel = this.sessionDir === "/workspace" ? "" : this.sessionDir.replace(/^\/workspace\/?/, "").replace(/^\/+/, "");
+    const t0 = Date.now();
+    const plugin = s.source === "plugin";
+    try {
+      const base = rel ? path.posix.join(rel, ".skills", s.name) : path.posix.join(".skills", s.name);
+      const attempt = async () => {
+        const up = await uploadDirToSandbox(hands, s.localDir, base);
+        const shippable = up.total - up.skipped;
+        if (up.failed > 0 || (shippable > 0 && up.uploaded === 0) || up.total === 0) throw new Error("upload failed");
+      };
+      try {
+        await attempt();
+      } catch (first) {
+        // The staged copy may be gone; stage again rather than leave the
+        // agent with a skill the prompt promised.
+        if (!s.restage) throw first;
+        s.localDir = await s.restage();
+        await attempt();
+      }
+      // A sandbox swapped while this upload ran is not the one it wrote to.
+      if (hands === this.lastHands) this.written.add(s.name);
+      // Plugin skills are not platform defaults: they stay out of the
+      // platform-default metrics, as they stay out of its events below.
+      if (plugin) logger.info({ name: s.name, toolId: s.toolId, elapsedMs: Date.now() - t0 }, "skill.plugin_written_to_sandbox");
+      else metrics.onPlatformSkillLazyWrite("ok", (Date.now() - t0) / 1000, coldSandbox);
+      return true;
+    } catch (err) {
+      if (plugin) {
+        logger.warn({ name: s.name, toolId: s.toolId, err: (err as Error).message }, "skill.plugin_write_failed");
+        await this.onEvent?.({ type: "toolUsed", tool: "download_skill", actionId: `plugin_skill_${s.toolId}`, status: "error", brief: `Failed to write plugin skill: ${s.name}` });
+        return false;
+      }
+      logger.warn({ name: s.name, err: (err as Error).message }, "platform_defaults.lazy_write_failed");
+      metrics.onPlatformSkillLazyWrite("failed", (Date.now() - t0) / 1000, coldSandbox);
+      metrics.onPlatformDefault("skill", "failed", "lazy_write");
+      await this.onEvent?.({ type: "toolUsed", tool: "platform_defaults", actionId: `platform_default_write_${s.toolId}`, status: "error", brief: `Failed to write default skill: ${s.name}` });
+      return false;
     }
   }
 }

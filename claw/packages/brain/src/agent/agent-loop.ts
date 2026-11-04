@@ -3,7 +3,7 @@
 
 import { ToolRouter, SPILL_MAX_CHARS, type RouteOutcome } from "../tools/router.js";
 import { isRetryable } from "../infra/retry.js";
-import { runSubagent, SUBAGENT_TYPES, type SubagentType } from "./sub-agent.js";
+import { pickSubagentModel, runSubagent, SUBAGENT_TYPES, type SubagentType } from "./sub-agent.js";
 import {
   SUB_AGENT_MAX_TURNS, SUB_AGENT_MAX_CONCURRENT, SUB_AGENT_MAX_DEPTH,
   BRAIN_BLOCK_SKILL_SUBAGENTS,
@@ -24,7 +24,7 @@ import {
   type HandsRecoveryAllowance,
   type RecreateHandsResult,
 } from "./index.js";
-import type { Message, ToolSchema, TokenUsage, EventCallback } from "@claw/protocol";
+import type { Message, ReasoningEffort, ToolSchema, TokenUsage, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import { safePreview } from "@claw/utils";
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
@@ -50,6 +50,15 @@ const logger = pino({ name: "agent-loop" });
  * in one is time the run holds a slot without using it.
  */
 const WAITING_TOOLS = new Set(["wait"]);
+
+/**
+ * Sandbox tools that only read, so a run of them in one turn goes to the
+ * sandbox together rather than one after another: Hands serves each from the
+ * file system without changing it. Every other tool still runs alone, in the
+ * order the model emitted it (the sandbox has one writer).
+ */
+const PARALLEL_READ_TOOLS = new Set(["read", "grep", "glob", "ls"]);
+const PARALLEL_READ_LIMIT = 8;
 
 /**
  * The classes a `wait` can still block in.
@@ -262,6 +271,12 @@ export interface LoopOptions {
   apiUrl: string;
   apiKey: string;
   maxTurns: number;
+  /** The run's reasoning effort (`ExecuteRequest.effort`), asked on every turn of this loop and of its sub-agents. */
+  effort?: ReasoningEffort;
+  /** `ExecuteRequest.rolling_cache_ttl`, for this loop and its sub-agents. */
+  rollingCacheTtl?: "5m";
+  /** `ExecuteRequest.sub_agent_max_turns`: the most turns a sub-agent of this loop may take. */
+  subAgentMaxTurns?: number;
   router: ToolRouter;
   onEvent: EventCallback;
   signal?: AbortSignal;
@@ -380,6 +395,25 @@ const TOOL_RESULT_TAIL_CHARS = 1500;
  * which the store never exceeds, and its own notice, which names the paging and
  * never a sandbox tool.
  */
+/** A sub-agent's turn cap: the run's own when it set one, never above a deployment's `SUB_AGENT_MAX_TURNS`, else the parent's. */
+export function subAgentTurnCap(requested: number | undefined, parentMaxTurns: number): number {
+  const deployment = SUB_AGENT_MAX_TURNS > 0 ? SUB_AGENT_MAX_TURNS : parentMaxTurns;
+  return requested !== undefined && requested > 0 && (deployment <= 0 || requested < deployment) ? requested : deployment;
+}
+
+/**
+ * `gh_pr_get` of the API's reserved `github_review` server pages a pull request itself, every page under the API's own bound
+ * (`PAGE_MAX_CHARS`, pages.ts), so it gets a bound of its own just above that one. Under the generic cap a review read its diff and its
+ * instructions in 5500-character pages, 42 calls over five reviews; this bound carries four times as much per call.
+ */
+export const GITHUB_REVIEW_READ_TOOL = "mcp__github_review__gh_pr_get";
+export const GITHUB_REVIEW_READ_MAX_CHARS = 24_000;
+
+/** The generic cap, or a tool's own when it pages its answers itself. */
+function resultCapFor(toolName: string | undefined): number {
+  return toolName === GITHUB_REVIEW_READ_TOOL ? GITHUB_REVIEW_READ_MAX_CHARS : TOOL_RESULT_MAX_CHARS;
+}
+
 export function truncateToolResult(text: string, toolName?: string, savedAt?: string): string {
   if (toolName === LOAD_SKILL_TOOL) {
     if (typeof text !== "string" || text.length <= LOAD_SKILL_RESULT_MAX_CHARS) return text;
@@ -388,7 +422,7 @@ export function truncateToolResult(text: string, toolName?: string, savedAt?: st
     const dropped = text.length - head.length - tail.length;
     return `${head}\n\n[... ${dropped} chars cut from this ${LOAD_SKILL_TOOL} result; get what is missing by calling ${LOAD_SKILL_TOOL} again with name, file and the offset to continue from ...]\n\n${tail}`;
   }
-  if (typeof text !== "string" || text.length <= TOOL_RESULT_MAX_CHARS) return text;
+  if (typeof text !== "string" || text.length <= resultCapFor(toolName)) return text;
   if (toolName === "read") return truncateReadResult(text);
   const head = text.slice(0, TOOL_RESULT_HEAD_CHARS);
   const tail = text.slice(-TOOL_RESULT_TAIL_CHARS);
@@ -424,7 +458,7 @@ function truncateReadResult(text: string): string {
 
 /** Whether a result is kept whole in the sandbox before it is cut: not for tools whose source can simply be read again. */
 function spillsWhenCut(text: string, toolName: string): boolean {
-  return typeof text === "string" && text.length > TOOL_RESULT_MAX_CHARS
+  return typeof text === "string" && text.length > resultCapFor(toolName)
     && toolName !== "read" && toolName !== LOAD_SKILL_TOOL;
 }
 
@@ -756,6 +790,14 @@ class AgentLoopRunner {
    * every task in the batch is already counted.
    */
   private toolsStarted = 0;
+  /**
+   * The PARALLEL_READ_TOOLS among `toolsStarted` and, in this process, among
+   * `totalToolCalls`. A read changes nothing a redelivery could repeat, so
+   * `mayRethrowOpenFailure` leaves them out: a first turn of several reads is
+   * the commonest cold-start shape, and they now start together.
+   */
+  private readsStarted = 0;
+  private readsCounted = 0;
   private setupCommands: Array<{ cmd: string; turn: number }>;
   private readonly startTime: number;
   private readonly initialTurn: number;
@@ -926,7 +968,7 @@ class AgentLoopRunner {
     // through LoopOptions, so this one call to a module-level singleton was the
     // only thing standing between this file and being testable at all.
     this.session = opts.llmSession
-      ?? getProvider().createSession({ model, apiUrl, apiKey, userId, sessionId });
+      ?? getProvider().createSession({ model, apiUrl, apiKey, userId, sessionId, effort: opts.effort, rollingCacheTtl: opts.rollingCacheTtl });
     // Captured alongside the session because the cache metrics have to say
     // which wire produced each number: the two protocols differ in what they
     // report at all -- cache writes, and the TTL split -- so the same counter
@@ -1637,12 +1679,22 @@ class AgentLoopRunner {
     // whole tool-call timeout to take effect. Cancelled calls still get a
     // tool_result — the API rejects an assistant tool_use with no matching
     // result — they just get one that says so instead of running.
-    for (const tc of otherCalls) {
+    for (let i = 0; i < otherCalls.length;) {
+      // Consecutive reads go together (see PARALLEL_READ_TOOLS); anything a
+      // person may be asked to approve keeps its own turn at the card.
+      const together = (tc: any) => PARALLEL_READ_TOOLS.has(tc.name)
+        && !this.opts.hitl?.willAsk(tc.name as string, (tc.input || {}) as Record<string, unknown>);
+      let end = i + 1;
+      if (together(otherCalls[i])) {
+        while (end < otherCalls.length && end - i < PARALLEL_READ_LIMIT && together(otherCalls[end])) end++;
+      }
+      const batch = otherCalls.slice(i, end);
+      i = end;
       if (this.signal?.aborted) {
-        resultByToolId.set((tc as any).id as string, CANCELLED_TOOL_RESULT);
+        for (const tc of batch) resultByToolId.set((tc as any).id as string, CANCELLED_TOOL_RESULT);
         continue;
       }
-      await this.runRegularTool(tc, turn, resultByToolId);
+      await Promise.all(batch.map((tc) => this.runRegularTool(tc, turn, resultByToolId)));
     }
 
     // Run `task` tools concurrently, bounded.
@@ -1934,12 +1986,15 @@ class AgentLoopRunner {
       // had no matching entry to update). Total bytes still drop ~60% vs
       // the pre-optimisation baseline because the terminal event no longer
       // re-sends argumentsDetail (only `description` carrying the result).
+    const isRead = PARALLEL_READ_TOOLS.has(toolName);
     this.toolsStarted++;
+    if (isRead) this.readsStarted++;
     await this.onEvent({
         type: "toolUsed", tool: toolName, actionId: toolId, status: "start",
         argumentsDetail: { [toolName]: toolInput },
       });
     this.totalToolCalls++;
+    if (isRead) this.readsCounted++;
     this.toolCallsByName[toolName] = (this.toolCallsByName[toolName] || 0) + 1;
 
       // PreToolUse: plugin hooks may block the call, edit input, or no-op.
@@ -2173,7 +2228,7 @@ class AgentLoopRunner {
         // and the delivery is acked, which is how a classified-retryable race
         // became a permanent task failure on the default path while the eager
         // path naked correctly. See brain/src/agent/attach-error.ts.
-        if (this.mayRethrowOpenFailure(err)) throw err.cause;
+        if (this.mayRethrowOpenFailure(err, isRead)) throw err.cause;
         // A call that threw is a call that did not happen. Left at its
         // optimistic default the outcome would fall through to the success
         // count below, which is the one place a transport failure could be
@@ -2251,10 +2306,14 @@ class AgentLoopRunner {
    * it opens the sandbox before any tool has run, so there is nothing to
    * repeat.
    *
-   * `totalToolCalls` is incremented before the call it counts, so 1 is "this
-   * one, and nothing before it". It also carries across a redelivery from the
-   * checkpoint, which keeps a resumed run on the conservative side: the work
-   * behind that count is in the recovered history and must not be re-run.
+   * Reads (PARALLEL_READ_TOOLS) are not counted: re-running one repeats
+   * nothing, and a batch of them starts together, so counting them would cost
+   * an all-read first turn its redelivery. Every other call is, the failing
+   * one excepted (`isRead` says which it is): both counters are incremented
+   * before the call they count. `totalToolCalls` also carries across a
+   * redelivery from the checkpoint, reads and all, which keeps a resumed run on
+   * the conservative side: the work behind that count is in the recovered
+   * history and must not be re-run.
    *
    * The cost of being wrong either way decides where the line sits. Refusing a
    * rethrow loses a redelivery, and the model is told the sandbox could not be
@@ -2262,7 +2321,7 @@ class AgentLoopRunner {
    * wrongly repeats a side effect that has already left the process, which
    * nothing downstream can undo.
    */
-  private mayRethrowOpenFailure(err: unknown): boolean {
+  private mayRethrowOpenFailure(err: unknown, isRead: boolean): boolean {
     const e = err as { name?: string; cause?: unknown } | null;
     if (e?.name !== "SandboxAttachError") return false;
     if (!isRetryable(e.cause)) return false;
@@ -2271,12 +2330,15 @@ class AgentLoopRunner {
     // begun, including a sibling that has not reached its own increment;
     // `totalToolCalls` arrives from the checkpoint and covers work done under
     // an earlier delivery, which `toolsStarted` has no memory of.
-    if (this.toolsStarted > 1 || this.totalToolCalls > 1) {
+    const self = isRead ? 0 : 1;
+    if (this.toolsStarted - this.readsStarted > self || this.totalToolCalls - this.readsCounted > self) {
       logger.warn(
         {
           sessionId: this.sessionId,
           toolsStarted: this.toolsStarted,
+          readsStarted: this.readsStarted,
           totalToolCalls: this.totalToolCalls,
+          readsCounted: this.readsCounted,
         },
         "sandbox.open_retryable_but_turn_has_run_tools",
       );
@@ -2376,6 +2438,8 @@ class AgentLoopRunner {
       if (this.depth >= SUB_AGENT_MAX_DEPTH) {
         throw new Error(`sub-agent nesting limit reached (depth=${this.depth}, max=${SUB_AGENT_MAX_DEPTH})`);
         }
+      const picked = pickSubagentModel(toolInput.model, subagentType, this.model);
+      if ("error" in picked) throw new Error(picked.error.replace(/^Error: /, ""));
       // A sub-agent gets its own router around the same sandbox, so the run
       // has to have one by now even if this turn's parent never used a tool.
       const subHands = this.opts.hands ?? await this.opts.attachHands?.();
@@ -2397,8 +2461,9 @@ class AgentLoopRunner {
         parentRouter: this.router,
         onEvent: this.onEvent,
         signal: this.signal,
-        model: this.model, apiUrl: this.apiUrl, apiKey: this.apiKey,
-        maxTurns: SUB_AGENT_MAX_TURNS > 0 ? SUB_AGENT_MAX_TURNS : this.maxTurns,
+        model: picked.model, fallbackModel: picked.fallback, apiUrl: this.apiUrl, apiKey: this.apiKey, effort: this.opts.effort,
+        rollingCacheTtl: this.opts.rollingCacheTtl,
+        maxTurns: subAgentTurnCap(this.opts.subAgentMaxTurns, this.maxTurns),
         userId: this.userId, sessionId: this.sessionId,
         depth: this.depth + 1,
         hooks: this.opts.hooks,
@@ -2414,7 +2479,7 @@ class AgentLoopRunner {
         // `task` whose sandbox never opened did not run a sub-agent, and the
         // open is reached from here too (`attachHands` above) for a turn whose
         // first tool is a `task`.
-        if (this.mayRethrowOpenFailure(err)) throw err.cause;
+        if (this.mayRethrowOpenFailure(err, false)) throw err.cause;
         resultText = `Error: ${err?.message || String(err)}`;
       this.errorCount++;
       logger.warn({ err, subagentId, depth: this.depth, sessionId: this.sessionId }, "sub-agent.failed");

@@ -31,7 +31,7 @@ export interface World {
   llmBodies: string[];
   downloads: number[];
   listCalls: number;
-  setTools(t: Array<{ id: number; name: string; zip?: Buffer; fail?: boolean; type?: string; version?: string | null; hang?: boolean; delayMs?: number }>): void;
+  setTools(t: Array<{ id: number; name: string; zip?: Buffer; fail?: boolean; type?: string; version?: string | null; hang?: boolean; delayMs?: number; config?: Record<string, unknown> }>): void;
   byIdCalls: number[];
   /** Every request path the marketplace saw, in order. */
   paths: string[];
@@ -79,7 +79,7 @@ export async function startWorld(defaultsFile?: object): Promise<World> {
       if (t?.hang) return;
       res.setHeader("content-type", "application/json");
       if (!t) { res.statusCode = 404; res.end(JSON.stringify({ ok: false, error: "not_found", message: "tool not found" })); return; }
-      res.end(JSON.stringify({ ok: true, data: { id: t.id, name: t.name, type: t.type ?? "skill", ...(t.version === null ? {} : { updated_at: t.version ?? "v1" }) } }));
+      res.end(JSON.stringify({ ok: true, data: { id: t.id, name: t.name, type: t.type ?? "skill", ...(t.config ? { config: t.config } : {}), ...(t.version === null ? {} : { updated_at: t.version ?? "v1" }) } }));
       return;
     }
     if (/^(\/claw-api)?\/v1\/tools\?/.test(url)) {

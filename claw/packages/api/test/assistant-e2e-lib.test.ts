@@ -20,13 +20,15 @@
  *   B11 a round's item is the one whose title names its task, not a task whose name merely contains it
  *   B12 a round waits only as long as it takes for the user's last hour plus the round to fit the message cap
  *   B13 an idempotent request is repeated on 5xx or a failed send, not on an answer, and gives up after its tries
+ *   B14 the answer to a message is the first say its own turn made, whether or not it offers an item to accept; a say
+ *       another turn made first (a worker's report passed on) is not it, and neither is one the session has no turn for
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, signPayload } from "../src/notifications/signing.js";
 import {
-  aliveSandboxes, duplicateEventIds, itemNamed, latencyMs, newItemsSince, percentile, renderTimings, retry5xx, runTag, sayPacingWaitMs,
+  aliveSandboxes, answerTo, duplicateEventIds, itemNamed, latencyMs, newItemsSince, percentile, renderTimings, retry5xx, runTag, sayPacingWaitMs,
   settle, startReceiver, until,
 } from "./e2e/assistant-p1-lib.js";
 
@@ -237,4 +239,26 @@ test("B13 an idempotent request is repeated on 5xx and on a failed send only", a
   assert.equal(c.calls(), 3);
   const d = seq([new Error("down"), new Error("down")]);
   assert.equal(await retry5xx(d.call, 2, 1), 599, "a request that could not be sent is a failure");
+});
+
+test("B14 the answer to a message is the say its own turn made", () => {
+  const item = (canAccept: boolean) => ({ item_id: "kwi_1", seq: 1, title: "t", board_state: "needs_you", result_version: 1, can_accept: canAccept });
+  const say = (eventId: string, at: number, canAccept?: boolean) => ({
+    at, eventId, type: "assistant.say", text: "x", fallback: false, verified: true, ...(canAccept === undefined ? {} : { item: item(canAccept) }),
+  });
+  const said = (sayId: string, turn?: string) => ({ data: { type: "AssistantSay", say_id: sayId, ...(turn ? { turn_message_id: turn } : {}) } });
+  const session = [
+    { data: { type: "toolUsed", say_id: "s-q" } },
+    said("s-report", "claw-pending-301"),
+    said("s-q", "claw-1"),
+    said("s-q2", "claw-1"),
+    said("s-old"),
+  ];
+  // Rounds 3 and 19 of soak 6: the reply offered the finished item, and was counted as no answer.
+  const received = [say("s-old", 1), say("s-report", 2, true), say("s-q", 3, true), say("s-q2", 4)];
+  assert.equal(answerTo("claw-1", session, received)?.eventId, "s-q", "its own say, though it offers an item to accept");
+  assert.equal(answerTo("claw-pending-301", session, received)?.eventId, "s-report");
+  assert.equal(answerTo("claw-2", session, received), undefined, "a message no turn has answered has no answer");
+  assert.equal(answerTo("claw-1", session, received.slice(0, 2)), undefined, "the answer is not yet received");
+  assert.equal(answerTo("claw-1", [], received), undefined, "an unread session answers nothing");
 });

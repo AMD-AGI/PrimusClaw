@@ -17,10 +17,11 @@
  */
 import pino from "pino";
 import {
-  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_ROUTER_MAX_TURNS, CLAW_ASSISTANT_TOKEN_KEY,
+  CLAW_AGENT_GUIDELINE_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_ROUTER_MAX_TURNS, CLAW_ASSISTANT_TOKEN_KEY,
   CLAW_ASSISTANT_WORKER_MODEL, INTERNAL_BACKEND_URL,
 } from "../config.js";
 import { db } from "../infra/db.js";
+import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import {
@@ -137,14 +138,16 @@ function withSystemAppend(task: Record<string, unknown>, text: string): void {
 }
 
 /**
- * Finish the execute request of a turn of an assistant session. Does nothing for any other session.
+ * Finish the execute request of a turn: the working guideline for every turn that does the user's work, when
+ * it is switched on, and an assistant session's role. A Router turn only dispatches, under its own prompt, so
+ * it gets no guideline.
  *
  * Fails closed: a router turn whose profile could not be applied would run with every tool Brain has, so
  * an error here ends the dispatch or the claim and is retried, never skipped.
  */
 export async function applySessionRoleToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
-  if (!CLAW_ASSISTANT_ENABLED) return;
-  const role = await sessionRole(sessionId);
+  const role = CLAW_ASSISTANT_ENABLED ? await sessionRole(sessionId) : null;
+  if (CLAW_AGENT_GUIDELINE_ENABLED && role?.role !== "router") withAgentGuideline(task);
   if (!role) return;
   const taskId = stringField(task, "task_id");
   const messageId = stringField(task, "message_id");

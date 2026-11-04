@@ -104,25 +104,25 @@ export function renderCacheMarkers(
   messages: readonly Message[],
   plan: CachePlan,
 ): PreparedAnthropicRequest {
-  // messageIndex -> block indices to mark. Built from the plan, which addresses
+  // messageIndex -> block index -> TTL. Built from the plan, which addresses
   // the array as handed in, so markers are applied BEFORE the system run is
   // split off and the indices shift.
-  const marks = new Map<number, Set<number>>();
+  const marks = new Map<number, Map<number, CacheTtl>>();
   for (const bp of plan.breakpoints) {
-    let set = marks.get(bp.messageIndex);
-    if (!set) marks.set(bp.messageIndex, (set = new Set()));
-    set.add(bp.blockIndex);
+    let byBlock = marks.get(bp.messageIndex);
+    if (!byBlock) marks.set(bp.messageIndex, (byBlock = new Map()));
+    byBlock.set(bp.blockIndex, bp.ttl);
   }
 
-  const cacheControl = cacheControlFor(plan.ttl);
   const rendered: Message[] = messages.map((message, i) => {
     const wanted = marks.get(i);
     if (!wanted || wanted.size === 0) return message; // untouched: same object
     const source = contentBlocks(message.content);
     const blocks = source.map((block, b) => {
-      if (!wanted.has(b)) return block; // untouched: same object
+      const ttl = wanted.get(b);
+      if (ttl === undefined) return block; // untouched: same object
       if (!isMarkableBlock(block)) return block;
-      return { ...block, cache_control: { ...cacheControl } };
+      return { ...block, cache_control: cacheControlFor(ttl) };
     });
     return { ...message, content: blocks };
   });
@@ -180,7 +180,7 @@ export function stripCacheControl(prepared: PreparedAnthropicRequest): PreparedA
 
 export function prepareAnthropicRequest(
   messages: readonly Message[],
-  opts: { ttl: CacheTtl; maxBreakpoints?: number },
+  opts: { ttl: CacheTtl; rollingTtl?: "5m"; maxBreakpoints?: number },
 ): PreparedAnthropicRequest {
   return renderCacheMarkers(messages, planCacheBreakpoints(messages, opts));
 }

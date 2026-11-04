@@ -25,6 +25,7 @@
 #   INSTALL_RUNTIMECLASS=false                # apply Kata RuntimeClass (kata-qemu)
 #   INGRESS_HOST=                             # existing public host, e.g. sandbox.example.com; unset skips the Ingress
 #   INGRESS_CLASS=higress                     # Ingress class for that host
+#   HIGRESS_NAMESPACE=higress-system          # namespace of the Higress gateway (INGRESS_CLASS=higress)
 #   INSTALL_DEFAULT_TEMPLATES=false           # apply CodeInterpreter examples
 #   TEMPLATES_VARIANT=default                 # default | kata (both use default-templates.yaml)
 #   SAFE_API_URL=                             # set to enable SaFE authentication (recommended)
@@ -57,6 +58,7 @@ ENVD_KEY_SRC_NAMESPACE="${ENVD_KEY_SRC_NAMESPACE:-agent-sandbox-system}"
 INSTALL_RUNTIMECLASS="${INSTALL_RUNTIMECLASS:-false}"
 INGRESS_HOST="${INGRESS_HOST:-}"
 INGRESS_CLASS="${INGRESS_CLASS:-higress}"
+HIGRESS_NAMESPACE="${HIGRESS_NAMESPACE:-higress-system}"
 INSTALL_DEFAULT_TEMPLATES="${INSTALL_DEFAULT_TEMPLATES:-false}"
 TEMPLATES_VARIANT="${TEMPLATES_VARIANT:-default}"
 AUTO_INSTALL_HELM="${AUTO_INSTALL_HELM:-true}"
@@ -239,6 +241,53 @@ EOF
     fi
     rm -f "${manifest}"
     ok "router Ingress https://${INGRESS_HOST}/sandboxes"
+    if [[ "${INGRESS_CLASS}" == "higress" ]]; then
+        apply_router_idle_timeout
+    fi
+}
+
+# Raises the Higress stream idle timeout on the router Ingress routes to 1800 s,
+# so a create that waits on an image pull is not cut by the gateway default.
+apply_router_idle_timeout() {
+    dns_name_ok "${HIGRESS_NAMESPACE}" label \
+        || err "HIGRESS_NAMESPACE must be a DNS label, got ${HIGRESS_NAMESPACE}"
+    local manifest
+    manifest="$(mktemp /tmp/sandbox-idle-timeout.XXXXXX.yaml)"
+    cat >"${manifest}" <<EOF
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: agent-sandbox-public-idle-timeout
+  namespace: ${HIGRESS_NAMESPACE}
+  labels:
+    app: agent-sandbox
+spec:
+  workloadSelector:
+    labels:
+      app: higress-gateway
+      higress: ${HIGRESS_NAMESPACE}-higress-gateway
+  configPatches:
+  - applyTo: HTTP_ROUTE
+    match:
+      context: GATEWAY
+      routeConfiguration:
+        vhost:
+          route:
+            name: ${NAMESPACE}/agent-sandbox-public
+    patch:
+      operation: MERGE
+      value:
+        route:
+          idle_timeout: 1800s
+EOF
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "  [dry-run] kubectl apply -f ${manifest}"
+        cat "${manifest}"
+    else
+        kubectl apply -f "${manifest}"
+    fi
+    rm -f "${manifest}"
+    ok "router idle timeout 1800s (${HIGRESS_NAMESPACE}/agent-sandbox-public-idle-timeout)"
 }
 
 # ── Idempotency guard: skip when Sandbox is already installed ─────────────────

@@ -36,7 +36,7 @@ import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  acquireWriteLock, countPendingConfirmations, getReviewMode, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
+  acquireWriteLock, countPendingConfirmations, getReviewMode, headReviewFacts, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
   type Confirmation, type DecidedVia, type HeldReview, type Queryable, type ReviewComment, type ReviewEvent, type ReviewMode,
 } from "./store.js";
 
@@ -170,6 +170,8 @@ interface ReviewRead {
   riskReasons: string[];
   reviewPath: string;
   reviewPathReason: string;
+  /** `how_to_read` of the overview: the deep review's sandbox path reads the diff from its checkout instead of in pages. */
+  howToRead: string;
 }
 
 /** A merge queue entry as GitHub reports it (`MergeQueueEntry`): the id, the place in the queue and its state (QUEUED, AWAITING_CHECKS, MERGEABLE, UNMERGEABLE, LOCKED). */
@@ -193,6 +195,10 @@ const HOW_TO_READ = "Each answer fits what you can read at once. Read every sect
   + "with this pr, `section`, this `head_sha` and `read_id`, and `offset` (0, then each page's `next_offset` until it is null). Read `instructions` first. In `files`, each file "
   + "gives its offset and length in `diff`, to read one file's part: pass `file` with that offset (or 0) to stay inside it. Offsets are always "
   + "the whole diff's. An offset past the end is refused, never an empty page. A page costs one GitHub request.";
+const HOW_TO_READ_FROM_CHECKOUT = "Each answer fits what you can read at once. Read every section in `sections` that is not inline, whole, before you judge, "
+  + "except `diff`: this review checks the pull request out, and its diff is read there once, as the review instructions say; page it only if the checkout "
+  + "fails. To read a section, call gh_pr_get with this pr, `section`, this `head_sha` and `read_id`, and `offset` (0, then each page's `next_offset` until it "
+  + "is null). Read `instructions` first. An offset past the end is refused, never an empty page. A page costs one GitHub request.";
 const HOUR_MS = 3_600_000;
 /** Refusals that say nothing about the merge itself and will pass: the acting user's "allow" is kept for another try. */
 const TRANSIENT_REFUSALS = new Set(["too_many_concurrent", "rate_limited", "github_rate_limited", "identity_unavailable", "audit_unavailable"]);
@@ -332,11 +338,11 @@ export class GithubReview {
     const risk = assessRisk(this.riskInput(pr, repo, change));
     const state = await this.readState(ctx, ref, pr, repo);
     // At the base commit the head was compared with (instructionChanges), not wherever the branch is by now.
-    const instructions = await selectReviewInstructions(ctx.client, ref, pr.baseRef, pr.baseSha);
+    const instructions = await selectReviewInstructions(ctx.client, ref, pr.baseRef, pr.baseSha, ctx.settings.deepReview);
     const choice = chooseReviewPath({
       changedFiles: pr.changedFiles, changedLines: pr.additions + pr.deletions, filesComplete: change.complete,
       diffMissing: change.files.some(diffNotSent),
-      repoSkill: instructions.source === "repository",
+      repoSkill: instructions.source === "repository", paths: change.files.map((f) => f.path),
     }, ctx.settings);
     const recipe = choice.path === "sandbox" ? buildSandboxRecipe({ ref, baseRef: pr.baseRef, headSha: pr.headSha }) : null;
     (this.deps.logger ?? logger).info({
@@ -370,7 +376,7 @@ export class GithubReview {
       },
       files_complete: change.complete,
       review_path: {
-        path: choice.path, reason: choice.reason, advice: reviewPathAdvice(choice),
+        path: choice.path, reason: choice.reason, advice: reviewPathAdvice(choice, ctx.settings.deepReview),
         max_files_for_diff_only: ctx.settings.fastMaxFiles, max_changed_lines_for_diff_only: ctx.settings.fastMaxChangedLines,
         // The code reaches the sandbox anonymously and pinned to this head; the token is never part of it.
         sandbox_recipe: recipe, sandbox_recipe_usage: recipe ? SANDBOX_RECIPE_USAGE : null,
@@ -383,6 +389,7 @@ export class GithubReview {
     return {
       readId, pr, files: change.files, overview: { ...overview, read_id: readId }, instructions: instructions.text, conversation,
       riskReasons: risk.evidence.map((e) => `evidence: ${e}`), reviewPath: choice.path, reviewPathReason: choice.reason,
+      howToRead: ctx.settings.deepReview && choice.path === "sandbox" && recipe ? HOW_TO_READ_FROM_CHECKOUT : HOW_TO_READ,
     };
   }
 
@@ -392,7 +399,7 @@ export class GithubReview {
     const untrusted = { title: clip(read.pr.title, 300), ...(inline.files !== undefined ? { files: inline.files } : {}),
       ...(inline.conversation !== undefined ? { conversation: inline.conversation } : {}), ...(inline.diff !== undefined ? { diff: inline.diff } : {}) };
     return {
-      ...read.overview, how_to_read: HOW_TO_READ, sections,
+      ...read.overview, how_to_read: read.howToRead, sections,
       ...(inline.instructions !== undefined ? { review_instructions: inline.instructions } : {}),
       untrusted,
     };
@@ -518,6 +525,7 @@ export class GithubReview {
     const comments = this.checkComments(o.rawComments, change);
     await this.requireEvent(ctx, repo, o.event);
     if (o.event === "APPROVE") {
+      if (!o.confirmation) await this.requireSecondPass(ctx, ref, headSha);
       const risk = await this.requireApprovable(ctx, ref, repo, pr, change, o.flags, o.judgement);
       if (!o.confirmation && risk.level === "high") {
         const review: HeldReview = { event: o.event, body: o.text, comments };
@@ -531,7 +539,7 @@ export class GithubReview {
     return { status: result.status, head_sha: headSha, ...result.detail };
   }
 
-  /** `gh_pr_merge`: approve (when needed) and merge, if every gate is open. */
+  /** `gh_pr_merge`: merge what this session approved, if every gate is open; a merge a person confirmed approves first when needed. */
   mergePr(actor: ReviewActor, args: Record<string, unknown>): Promise<ToolOutcome> {
     return this.run(actor, "gh_pr_merge", args, async (ctx, ref) => {
       const headSha = this.pinned(args.head_sha);
@@ -1148,6 +1156,32 @@ export class GithubReview {
     return out;
   }
 
+  /** Whether a review's body carries the marker of an approval this session (`runId`) posted on this head. */
+  private isOwnApproval(ctx: Ctx, headSha: string, body: unknown): boolean {
+    const runId = this.runId(ctx, headSha);
+    return typeof body === "string" && [RUN_MARKER_PREFIX, LEGACY_RUN_MARKER_PREFIX].some((p) => body.includes(`<!-- ${p}:${runId}:APPROVE:`));
+  }
+
+  /**
+   * The deep review's second pass, enforced rather than asked for: on the sandbox path an approval, and a merge, need a sub-agent of this
+   * session that finished after the session read this head (store.ts `headReviewFacts`). A head this session never read is refused: there
+   * is no path to judge by, and an approval of a change nobody read is no review. A person's answer to a held write is not asked again.
+   */
+  private async requireSecondPass(ctx: Ctx, ref: PrRef, headSha: string): Promise<void> {
+    if (!ctx.settings.deepReview) return;
+    const facts = await headReviewFacts(this.deps.db, ctx.actor.sessionId, `${ref.owner}/${ref.repo}`, ref.number, headSha);
+    if (!facts.read) {
+      throw new Refusal("head_not_read", `this session has not read head ${headSha} of this pull request: call gh_pr_get with the pull request, review it as its review_instructions say, then try again. Nothing was approved or merged.`);
+    }
+    if (facts.sandbox && !facts.secondPass) {
+      throw new Refusal("second_pass_required", "this review is on the sandbox path, so an approval or a merge needs the second pass first, and this session has not run it on this head. "
+        + "Start it now with the `task` tool: `subagent_type` `explore`, `tools` [\"bash\", \"read\", \"grep\", \"glob\", \"ls\"], and the prompt step 8 of the review instructions describes, "
+        + `starting with the head commit ${headSha} (a second pass whose prompt does not name it is not counted), then the checkout, origin/<base>, .pr-review/pr.diff, what you read, the callers you did not open, what you ran and your findings. `
+        + "Verify what it returns, say in the review body what it added, then call this tool again. Nothing was approved or merged. "
+        + "A second pass that ended in the last few seconds may not be recorded yet: then call again in a moment.");
+    }
+  }
+
   private runId(ctx: Ctx, headSha: string): string {
     return createHash("sha256").update(`${ctx.actor.sessionId}:${headSha}`).digest("hex").slice(0, 12);
   }
@@ -1245,6 +1279,7 @@ export class GithubReview {
     if (!repo.push) {
       throw new Refusal("no_merge_permission", `${ctx.cred.login} has no write permission on ${repo.fullName}: the review stands as comments and nothing was merged`);
     }
+    if (!opts.confirmation) await this.requireSecondPass(ctx, ref, headSha);
 
     const change = await this.collectChange(ctx, ref, pr);
     const risk = opts.confirmation ? assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement))
@@ -1269,8 +1304,15 @@ export class GithubReview {
     }
 
     let approved = false;
-    const reviews = await this.listReviews<{ user?: { login?: string }; state?: string; commit_id?: string }>(ctx, ref);
-    const already = reviews.some((r) => r.user?.login?.toLowerCase() === ctx.cred.login.toLowerCase() && r.state === "APPROVED" && String(r.commit_id ?? "").toLowerCase() === headSha);
+    const reviews = await this.listReviews<{ user?: { login?: string }; state?: string; commit_id?: string; body?: string }>(ctx, ref);
+    const approvals = reviews.filter((r) => r.user?.login?.toLowerCase() === ctx.cred.login.toLowerCase() && r.state === "APPROVED" && String(r.commit_id ?? "").toLowerCase() === headSha);
+    const already = approvals.length > 0;
+    // A merge no person confirmed stands on this session's own approval of this head, the review it wrote; it never writes one for itself.
+    if (!opts.confirmation && ctx.settings.writesEnabled && !approvals.some((r) => this.isOwnApproval(ctx, headSha, r.body))) {
+      throw new Refusal("review_not_submitted", `this session has not approved head ${headSha} of this pull request itself, so nothing was approved or merged. `
+        + "gh_pr_merge never approves on its own: finish the review, post it with gh_review_submit (APPROVE, the body the review instructions ask for, "
+        + "the same risk_judgement), and call gh_pr_merge again. If gh_review_submit answered confirmation_required, the person decides; do not merge.");
+    }
     if (!already) {
       if (!ctx.settings.writesEnabled) {
         ctx.acc.dryRun = true;

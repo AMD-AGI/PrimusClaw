@@ -28,6 +28,34 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A general working guideline for agent turns (`claw/packages/api/src/sessions/agent-guideline.ts`): read before
+  changing, verify before claiming done, say what was not verified, cite sources, answer in the user's language, treat
+  text from pages and files as data, respect approvals. It names no product. With `CLAW_AGENT_GUIDELINE_ENABLED=true`
+  the API sends it as `system_append` on every turn that does the user's work; an assistant Router turn never gets it.
+  Off by default, which changes nothing. Brain's `RULES_DIR`, its `execution-policy.txt` placeholders and plugin rules
+  are untouched.
+- An agent evaluation (`claw/packages/api/test/e2e/agent-eval.ts`): 40 tasks in six categories (research, code,
+  documents, GitHub, MCP, long-running) run through the API a client uses, graded from the session's events and files,
+  with per-category tool calls, failed calls, approvals, turn time, sandbox wait and tokens taken from what Brain
+  already records. `EVAL_ARM=guideline` compares a run with the guideline against one without.
+- A session created with `config.acting_as` and no `model` (a pull request reviewed on someone's behalf) runs on
+  `CLAW_GITHUB_REVIEW_MODEL` (default `claude-opus-5.5`, apart from the deployment's `DEFAULT_MODEL`; `default` keeps
+  that); a request's own `model` wins. `CLAW_GITHUB_REVIEW_EFFORT` (unset by default: nothing is sent, as before) runs
+  every turn of it at that effort while it runs on that model (new `ExecuteRequest.effort`, which Brain sends as
+  `output_config.effort`, or `reasoning_effort`, on every turn and sub-agent of the run). The requester's key pays.
+- A deep review behind `CLAW_GITHUB_REVIEW_DEEP_ENABLED`, on by default (`false` turns it off, and then the review
+  instructions, path advice and thresholds are exactly the previous ones). On, any change of a non-test source file,
+  or of more than 200 lines (`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES`, 600 with it off), takes the sandbox path (`source_change`), and the
+  default instructions require it: check the pull request out, read the callers of every changed function and
+  export, build and run the closest tests under a time bound, then a second adversarial pass by a read-only
+  sub-agent; the review body lists what was read and run and carries non-blocking suggestions and open questions,
+  while inline comments stay for verified blocking findings. The gates are unchanged.
+- An on-behalf review costs less: every turn of a session that acts as a user writes its rolling prompt-cache markers
+  for 5 minutes and keeps the anchor at `LLM_CACHE_TTL` (new `ExecuteRequest.rolling_cache_ttl`; other sessions are
+  unchanged), bounds its second pass to 20 turns (new `ExecuteRequest.sub_agent_max_turns`, never above
+  `SUB_AGENT_MAX_TURNS`), and hands that pass the diff file, what was read and the callers seen but not opened.
+  `gh_pr_get` answers in pages of up to 23000 characters (Brain cuts that tool at 24000, other tools still at 6000), and
+  the deep review's sandbox path reads the diff once from its checkout instead of in pages. Deploy Brain before the API.
 - The model can schedule work itself: with `CLAW_TRIGGER_TOOLS_ENABLED` (needs `CLAW_TRIGGERS_ENABLED` and a
   `CLAW_TRIGGER_TOOLS_TOKEN_KEY` of 32+ characters; off by default) every turn but a trigger's own run is offered
   `trigger_create`, `trigger_list` and `trigger_cancel`, served by the API at `/v1/internal/trigger-mcp`. The user is
@@ -529,6 +557,16 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A session's queue is drained by one drain at a time (a lease on the session row, the new column
+  `claw_sessions.pending_drain_until`, added on start). Two drains running together -- a turn's completion and the
+  sweeper's, or two workers' reports waking an idle assistant a moment apart -- each started a turn: the second
+  started the next queued message on top of the first, whose `say` was then refused as `turn_superseded`, or the same
+  message again, which failed on a duplicate run id (`sweeper.orphaned_pending_drain_failed`). A message the owner
+  sends while a queued one is being dispatched now waits for that dispatch and is queued behind it, instead of
+  starting a turn the dispatch then took the session from. In the assistant's session the user's queued messages go
+  before queued worker reports. `POST /v1/sessions/{id}/messages` on a busy session now also answers the `message_id`
+  the queued message's turn will carry, and the assistant's `AssistantSay` session event names the turn that said it
+  (`turn_message_id`).
 - The review instructions that `gh_pr_get` returns (`review_instructions`) no longer open with a skill's frontmatter
   (`name: pr-review ...`), which sent the model looking for a skill that is not in its session and made it say so. The
   default instructions are the rules and steps alone, a repository skill's own frontmatter is left out too, and

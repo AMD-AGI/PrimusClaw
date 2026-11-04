@@ -764,12 +764,9 @@ export const CHECKPOINT_WRITE_VERSION = envInt("CHECKPOINT_WRITE_VERSION", 3, {
  * has no business being able to decrypt a conversation.
  */
 export const BRAIN_CHECKPOINT_KEY = env("BRAIN_CHECKPOINT_KEY");
-// Read once, then taken out of the environment. A session owner supplies its
-// own mcp_servers config, and the MCP client expands <ENV_VAR> placeholders out
-// of process.env (clients/mcp-config.ts) -- so a key left sitting in the
-// environment is a key that can be asked for by name and shipped out as an
-// Authorization header. Nothing else reads it from process.env, and dropping it
-// here also keeps it out of every stdio MCP child process we spawn.
+// Read once, then taken out of the environment: nothing else reads it from
+// process.env, and a key that is not there cannot be named by an MCP
+// placeholder (clients/mcp-config.ts) even in a defaults file that lists it.
 delete process.env.BRAIN_CHECKPOINT_KEY;
 export const SESSION_ID = env("SESSION_ID");
 export const USER_ID = env("USER_ID", "default");
@@ -1342,8 +1339,20 @@ export const MULTI_NODE_SWEEPER_INTERVAL_MS = envInt(
 // SUB_AGENT_MAX_TURNS: upper bound on turns inside a sub-agent. 0 disables
 // the `task` tool entirely (sub-agents unavailable).
 export const SUB_AGENT_MAX_TURNS = envInt("SUB_AGENT_MAX_TURNS", 0);
-export const SUB_AGENT_MAX_CONCURRENT = envInt("SUB_AGENT_MAX_CONCURRENT", 2);
+export const SUB_AGENT_MAX_CONCURRENT = envInt("SUB_AGENT_MAX_CONCURRENT", 4, { min: 1, max: 16 });
 export const SUB_AGENT_MAX_DEPTH = envInt("SUB_AGENT_MAX_DEPTH", 1);
+// SUB_AGENT_MODELS: the models a `task` call may name for its sub-agent, besides
+// the run's own (comma-separated; empty: a sub-agent always runs on the run's
+// model, and `task` offers no choice). SUB_AGENT_EXPLORE_MODEL: what an
+// `explore` or `readonly` sub-agent runs on when the call names none -- a
+// cheaper model for reading and searching; empty: the run's model. It is one of
+// SUB_AGENT_MODELS by construction (added to the list when absent), so the
+// default is never a model the call itself could not have named.
+export const SUB_AGENT_EXPLORE_MODEL = env("SUB_AGENT_EXPLORE_MODEL").trim();
+export const SUB_AGENT_MODELS: ReadonlyArray<string> = [...new Set([
+  ...env("SUB_AGENT_MODELS").split(",").map((m) => m.trim()).filter(Boolean),
+  ...(SUB_AGENT_EXPLORE_MODEL ? [SUB_AGENT_EXPLORE_MODEL] : []),
+])];
 // Block sub-agent dispatches whose prompt is dominated by skill-file reads.
 // The dispatch is rejected with an error message instructing the agent to
 // use the direct `read` tool. Mitigates a recurring pattern where Opus
@@ -1727,6 +1736,13 @@ export const A2A_STREAM_MAX_MS = envInt("A2A_STREAM_MAX_MS", 600_000, { min: 1_0
 
 // --- Background Shell ---
 export const BG_SHELL_ENABLED = envBool("BG_SHELL_ENABLED", false);
+/**
+ * Background work that finishes in an idle sandbox (no turn running) wakes the
+ * session: the keepalive sweep, which already watches that sandbox's jobs, asks
+ * the API for a turn that reports the result (api sessions/wake.ts). Off by
+ * default: each wake is a model turn the user did not send.
+ */
+export const BACKGROUND_WORK_WAKE_ENABLED = envBool("BACKGROUND_WORK_WAKE_ENABLED", false);
 
 /**
  * The foreground command ceiling, for describing the bash tool to the model.
@@ -1878,6 +1894,12 @@ export const RULES_DIR = env("RULES_DIR", "/app/rules");
 // JSON ({"skills":[{"tool_id":N,"name"?:"x"}],"mcp_servers":{...}}); unset or
 // unreadable means the feature is off and chats are built exactly as before.
 export const PLATFORM_DEFAULTS_FILE = env("PLATFORM_DEFAULTS_FILE");
+// Comma-separated hosts a marketplace tool's or a plugin's MCP server must name
+// for its `<SAFE_API_KEY>` to expand to the caller's platform key. Those servers
+// are written by third parties at any URL; anywhere else the key expands to "".
+export const MCP_PLATFORM_KEY_ALLOWED_HOSTS: ReadonlySet<string> = new Set(
+  env("MCP_PLATFORM_KEY_ALLOWED_HOSTS").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
+);
 // Whether the file's `skills` apply. Off: only its MCP servers are mounted.
 export const PROGRESSIVE_SKILLS_ENABLED = envBool("PROGRESSIVE_SKILLS_ENABLED", false);
 // Budget for the downloaded skill files (plugin skills and marketplace tool_ids
