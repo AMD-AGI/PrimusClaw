@@ -118,6 +118,11 @@ describe("N recording and scope", () => {
     assert.match(diff, /\+c_fixed/);
     assert.doesNotMatch(diff, /-b\n\+b2_first_round/, "the first round's change is not read again");
     assert.equal(o.files_complete, true);
+    // The change touches source code, so the deep review's path is the sandbox: its checkout's whole diff is not what this review reads.
+    assert.equal(o.review_path.path, "sandbox");
+    assert.match(o.review_path.advice, /^This re-review covers only the change since 222222222222: the `diff` section, read in pages/);
+    assert.match(o.review_path.advice, /`git diff 2{40} HEAD`, not `\.pr-review\/pr\.diff`, which is the whole pull request: do not review that file/);
+    assert.doesNotMatch(o.how_to_read, /its diff is read there once/, "pages, not the checkout's whole diff");
     assert.ok(o.pull_request, "the overview is the whole pull request's otherwise");
   });
 
@@ -126,6 +131,7 @@ describe("N recording and scope", () => {
     continuation!.sinceHeadSha = HEAD;
     const o = await overview();
     assert.deepEqual([o.continuation.scope, o.continuation.reason, o.continuation.delta_files], ["unchanged", "head_unchanged", []]);
+    assert.match(o.review_path.advice, /^Nothing changed since the last review: check its findings at this head and review nothing else\./);
     assert.equal((await readSection(e.service, e.actor, PR, "diff")).text, "");
     assert.equal(e.gh.count(/\/compare\//), 0);
   });
@@ -137,6 +143,7 @@ describe("N recording and scope", () => {
     assert.deepEqual([o.continuation.scope, o.continuation.reason], ["full", "history_rewritten"]);
     assert.match((await readSection(e.service, e.actor, PR, "diff")).text, /\+b2_first_round/);
     assert.match(o.how_to_read, /the whole pull request is reviewed again \(history_rewritten\)/);
+    assert.match(o.review_path.advice, /^This review must use a sandbox/, "a full re-review is read as a first review is");
     await env();
     e.gh.compares[`${OLD}...${HEAD}`]!.status = "diverged";
     o = await overview();

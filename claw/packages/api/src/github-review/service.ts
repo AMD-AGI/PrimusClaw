@@ -428,7 +428,10 @@ export class GithubReview {
       },
       files_complete: change.complete,
       review_path: {
-        path: choice.path, reason: choice.reason, advice: reviewPathAdvice(choice, ctx.settings.deepReview),
+        path: choice.path, reason: choice.reason,
+        // A re-review that reads only the change since the last head reads it here, whatever the path: the checkout's whole diff is the
+        // pull request's, which the review instructions read on the sandbox path and this review must not review again.
+        advice: continuation && scope && scope.scope !== "full" ? this.continuationAdvice(continuation, scope, choice.path) : reviewPathAdvice(choice, ctx.settings.deepReview),
         max_files_for_diff_only: ctx.settings.fastMaxFiles, max_changed_lines_for_diff_only: ctx.settings.fastMaxChangedLines,
         // The code reaches the sandbox anonymously and pinned to this head; the token is never part of it.
         sandbox_recipe: recipe, sandbox_recipe_usage: recipe ? SANDBOX_RECIPE_USAGE : null,
@@ -491,6 +494,16 @@ export class GithubReview {
       // `untrusted.previous_findings`, by the same number.
       findings: c.findings.map((f, i) => ({ n: i + 1, thread_id: f.thread_id, resolved: f.resolved })),
     };
+  }
+
+  private continuationAdvice(c: ReviewContinuation, scope: ContinuationScope, path: string): string {
+    const since = c.sinceHeadSha.toLowerCase();
+    const checkout = path === "sandbox"
+      ? ` The sandbox_recipe checks the head out to read around the change and run the tests closest to it; there the change is \`git diff ${since} HEAD\`, not \`.pr-review/pr.diff\`, which is the whole pull request: do not review that file.`
+      : " Do not start a sandbox for it.";
+    return scope.scope === "unchanged"
+      ? `Nothing changed since the last review: check its findings at this head and review nothing else.${checkout}`
+      : `This re-review covers only the change since ${since.slice(0, 12)}: the \`diff\` section, read in pages, overrides the review instructions' step that reads the whole diff from the checkout.${checkout}`;
   }
 
   private continuationHowTo(c: ReviewContinuation, scope: ContinuationScope): string {

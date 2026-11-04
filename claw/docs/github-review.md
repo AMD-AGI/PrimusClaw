@@ -125,7 +125,9 @@ a `continuation` block whose `scope` the code decides:
 | `delta` | GitHub's compare of the two heads says `ahead`, within the review path's size limits, and touching no security or CI path | The change since the last head |
 | `full` | `history_rewritten` (force push or rebase), `large_delta`, or `security_path` | The whole pull request, as a first review reads it |
 
-The risk, the holds and every gate of a write stay those of the whole pull request. Such a session is also offered
+On the deep review's sandbox path, `review_path.advice` of a `delta` or `unchanged` re-review says so too: the checkout is
+for reading around the change and running tests, and its whole-pull-request diff is not reviewed again. The risk, the holds
+and every gate of a write stay those of the whole pull request. Such a session is also offered
 `gh_thread_resolve(pr, thread_id, head_sha)`, which resolves the thread of a fixed finding: only a thread the last review
 recorded (`thread_not_recorded`), opened by the acting user's own account (`not_own_thread`), on this pull request
 (`thread_not_on_pull_request`), at the head the session read (`head_moved`), and not after the requester stopped the review
