@@ -68,6 +68,14 @@ before(async () => {
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       deleted_at TIMESTAMPTZ
     )`);
+  // Read by the unforced take, which asks whether a stale gate's session is empty.
+  await pg.exec(`
+    CREATE TABLE claw_tasks (
+      task_id TEXT PRIMARY KEY,
+      session_id TEXT,
+      status TEXT,
+      metadata JSONB DEFAULT '{}'::jsonb
+    )`);
 });
 after(async () => { await pg.close(); });
 

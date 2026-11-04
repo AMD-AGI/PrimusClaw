@@ -59,7 +59,7 @@ import {
   releaseRunUseStrict,
 } from "../workspace/store.js";
 import {
-  ACTIONABLE_RECEIPT_SQL, deliverySettledSql, failChatRunDispatch, gateOwnershipEnforced,
+  ACTIONABLE_RECEIPT_SQL, deliverySettledSql, failChatRunDispatch, gateNamesEndedTurnSql, gateOwnershipEnforced,
   hasHolderEvidence, noDeliveryInFlightSql,
   parseDispatchCompensationRecord, SWEEPABLE_RUN_STATUSES, UNSUPPORTED_RECEIPT_SQL,
 } from "./chat-run.js";
@@ -1434,7 +1434,8 @@ async function releaseSessionsOfLostRuns(
       WHERE s.session_id = g.session_id
         AND s.agent_status = 'running'
         AND s.deleted_at IS NULL
-        AND (NOT $3::boolean OR s.agent_gate_message_id = g.message_id)
+        AND (NOT $3::boolean OR s.agent_gate_message_id = g.message_id
+             OR ${gateNamesEndedTurnSql("s.session_id", "s.agent_gate_message_id")})
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = s.session_id
@@ -1933,7 +1934,8 @@ async function runCleanupAction(row: AmbiguousDispatch): Promise<boolean> {
         WHERE s.session_id = $1
           AND s.agent_status = 'running'
           AND s.deleted_at IS NULL
-          AND (NOT $3::boolean OR s.agent_gate_message_id IS NOT DISTINCT FROM $2)
+          AND (NOT $3::boolean OR s.agent_gate_message_id IS NOT DISTINCT FROM $2
+               OR ${gateNamesEndedTurnSql("s.session_id", "s.agent_gate_message_id")})
           AND NOT EXISTS (
             SELECT 1 FROM claw_tasks t
              WHERE t.session_id = s.session_id
@@ -2425,6 +2427,7 @@ export async function reapStuckSessions(): Promise<number> {
   const r = await db.query(
     `UPDATE claw_sessions s
         SET agent_status = 'idle',
+            agent_gate_message_id = NULL,
             updated_at = NOW()
       WHERE s.agent_status = 'running'
         AND s.deleted_at IS NULL
