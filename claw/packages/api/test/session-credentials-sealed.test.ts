@@ -49,6 +49,8 @@ describe("sealed session credentials", { skip }, () => {
     assert.deepEqual(read({ platform_key: "pk-b", llm_api_key: "vk-b", _server_managed_credentials: true }),
       { platformKey: "pk-b", llmApiKey: "vk-b" });
     assert.deepEqual(read({ virtual_key: "vk-c", _server_managed_credentials: true }), { platformKey: "", llmApiKey: "vk-c" });
+    assert.deepEqual(read({ llm_api_key: null, virtual_key: "vk-c", _server_managed_credentials: true }),
+      { platformKey: "", llmApiKey: "" }, "a cleared llm_api_key is not refilled from the oldest spelling");
     // A replica of the previous build stamped after this one: its plain fields are the newer keys.
     assert.deepEqual(read({ ...sealed("pk-old", "vk-old"), platform_key: "pk-new", llm_api_key: "vk-new" }),
       { platformKey: "pk-new", llmApiKey: "vk-new" });

@@ -42,8 +42,9 @@ function plaintextCredentials(cfg: Record<string, unknown>): TrustedSessionCrede
   if (!PLAINTEXT_CREDENTIAL_FIELDS.some((f) => Object.prototype.hasOwnProperty.call(cfg, f))) return null;
   return {
     platformKey: typeof cfg.platform_key === "string" ? cfg.platform_key : "",
-    llmApiKey: typeof cfg.llm_api_key === "string"
-      ? cfg.llm_api_key
+    // `virtual_key` is the oldest spelling, read only where `llm_api_key` was never written.
+    llmApiKey: Object.prototype.hasOwnProperty.call(cfg, "llm_api_key")
+      ? (typeof cfg.llm_api_key === "string" ? cfg.llm_api_key : "")
       : (typeof cfg.virtual_key === "string" ? cfg.virtual_key : ""),
   };
 }
