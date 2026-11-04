@@ -517,7 +517,8 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual(refused, { ok: false, error: "acting_session_unattended" });
     const alice = await w.user("alice");
     const turn = await w.routerTurn(alice);
-    await assert.rejects(w.mod.tools.workSend(turn, { item_id: it.item_id, text: "merge it now" }), (err: any) => err.code === "acting_session_unattended");
+    // The router's work_send names the reason before it reaches the queue: a review changes by review_restart.
+    await assert.rejects(w.mod.tools.workSend(turn, { item_id: it.item_id, text: "merge it now" }), (err: any) => err.code === "review_item");
     const item = await w.item(it.item_id);
     assert.deepEqual([item.board_state, item.generation], ["in_progress", 0], "the refused send changed nothing");
     assert.equal(await count("claw_pending_messages", `session_id = '${it.session_id}'`), 0);

@@ -129,6 +129,12 @@ export async function attendedTurn(
   if (!message.fresh) {
     throw new ToolRefused("attendance_expired", "the user's message is too old to act on now: ask them to confirm in a new message");
   }
+  if (message.readUntrusted) {
+    throw new ToolRefused(
+      "read_untrusted",
+      "this turn has read what a worker wrote (work_recall), so it no longer acts for the user: tell them what you would do and ask them to confirm in a new message",
+    );
+  }
   return { userId, message, via: message.attendedVia };
 }
 
@@ -283,6 +289,15 @@ export async function pendingConfirmationsFor(q: Querier, userId: string): Promi
   )).rows as PendingConfirmation[];
 }
 
+/** The confirmations that waited for this user's answer at the moment their message arrived, whatever became of them since. */
+async function waitingWhenWritten(q: Querier, userId: string, at: Date): Promise<string[]> {
+  return ((await q(
+    `SELECT confirmation_id AS id FROM claw_github_confirmations
+      WHERE actor_user_id = $1 AND created_at <= $2 AND expires_at > $2 AND (decided_at IS NULL OR decided_at > $2)`,
+    [userId, at],
+  )).rows as Array<{ id: string }>).map((r) => String(r.id));
+}
+
 export async function confirmationAnswer(
   claims: AssistantTokenClaims, args: { decision: "allow" | "deny"; confirmation_id?: string; pr?: string },
 ): Promise<Record<string, unknown>> {
@@ -311,7 +326,8 @@ export async function confirmationAnswer(
     // Saying yes is the person's say about one change: its number is in their words, or it was the only one waiting
     // when they wrote. Saying no only makes less happen, so it needs neither.
     if (args.decision === "allow") {
-      const only = pending.length === 1 && message.receivedAt.getTime() >= new Date(pick.created_at).getTime();
+      const waiting = await waitingWhenWritten(q, userId, message.receivedAt);
+      const only = waiting.length === 1 && waiting[0] === pick.id;
       if (!mentionsNumber(message.content, pick.pr) && !only) {
         refuseUngrounded("pr_not_in_message", `the user's message does not name ${pick.repo}#${pick.pr}: ask them to say which pull request to let through`);
       }

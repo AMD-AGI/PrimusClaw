@@ -19,6 +19,7 @@ import { CLAW_ASSISTANT_WORKER_MODEL, CLAW_DEPLOY_MODE } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
+import { markUntrustedRead } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, SayRefused, type SayDeps } from "./outbound.js";
 import { parseReport } from "./report.js";
@@ -252,6 +253,8 @@ export async function workRecall(
   const named = found(await resolveWorkItemNow(userId, args.item_id));
   const item = await getWorkItem(userId, named.item_id);
   if (!item) throw new ToolRefused("item_not_found", "no such item");
+  // Before it is read: from here on this turn has read what a worker wrote, and no longer acts for the person.
+  await markUntrustedRead((text, params) => db.query(text, params), claims.sid, claims.mid);
   const summary = {
     item_id: item.item_id, seq: item.seq, title: item.title, board_state: item.board_state,
     last_report_kind: item.last_report_kind, summary: item.summary, pending_question: item.pending_question,

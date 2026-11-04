@@ -141,6 +141,9 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
       -- What the channel sent beside the text (people, actions, repos, channel_message_id), already bounded.
       channel_context  JSONB NOT NULL DEFAULT '{}'::jsonb,
       received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      -- Set when the turn answering it read what a worker wrote (work_recall): from then on that turn's model has read
+      -- text nobody vouches for, so it no longer acts for the person.
+      untrusted_read_at TIMESTAMPTZ,
       PRIMARY KEY (session_id, message_id)
     )
   `);

@@ -127,6 +127,8 @@ export async function recordAssistantMessage(tx: PoolClient, m: {
 
 export interface TurnMessage {
   messageId: string;
+  /** The turn answering it has read what a worker wrote (`markUntrustedRead`). */
+  readUntrusted: boolean;
   /** The sender's name as their sign-in gave it, when it did. */
   userName: string | null;
   content: string;
@@ -140,16 +142,17 @@ export interface TurnMessage {
 /** The user's message a router turn answers, or null for a turn that answers none (a worker's report). */
 export async function turnMessage(q: Querier, sessionId: string, messageId: string): Promise<TurnMessage | null> {
   const row = (await q(
-    `SELECT message_id, user_name, content, attended_via, channel_context, received_at,
+    `SELECT message_id, user_name, content, attended_via, channel_context, received_at, untrusted_read_at IS NOT NULL AS read_untrusted,
             received_at > NOW() - make_interval(secs => $3::int) AS fresh
        FROM claw_assistant_messages WHERE session_id = $1 AND message_id = $2`,
     [sessionId, messageId, CLAW_ASSISTANT_ATTENDED_TTL_SEC],
   )).rows[0] as {
-    message_id: string; user_name: string | null; content: string; attended_via: AttendedVia | null; channel_context: unknown; received_at: Date; fresh: boolean;
+    message_id: string; read_untrusted: boolean; user_name: string | null; content: string; attended_via: AttendedVia | null; channel_context: unknown; received_at: Date; fresh: boolean;
   } | undefined;
   if (!row) return null;
   return {
     messageId: row.message_id,
+    readUntrusted: row.read_untrusted === true,
     userName: row.user_name,
     content: row.content,
     context: parseChannelContext(row.channel_context),
@@ -157,6 +160,17 @@ export async function turnMessage(q: Querier, sessionId: string, messageId: stri
     receivedAt: new Date(row.received_at),
     fresh: row.fresh === true,
   };
+}
+
+/**
+ * The turn answering this message has read text a worker or a page wrote (`work_recall`). The person's say covers what
+ * they wrote, not what the model read afterwards, so the turn stops acting for them (`attendedTurn` refuses).
+ */
+export async function markUntrustedRead(q: Querier, sessionId: string, messageId: string): Promise<void> {
+  await q(
+    "UPDATE claw_assistant_messages SET untrusted_read_at = NOW() WHERE session_id = $1 AND message_id = $2 AND untrusted_read_at IS NULL",
+    [sessionId, messageId],
+  );
 }
 
 /**
