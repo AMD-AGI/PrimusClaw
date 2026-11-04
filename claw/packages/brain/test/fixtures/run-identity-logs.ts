@@ -123,7 +123,7 @@ const kv = {
 bindTaskRunnerDeps({
   kv: kv as never, kvCkpt: kv as never,
   emitter: { async emit() {} } as never,
-  engine: { async execute() { return { finalText: "", tokenUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0 }, turns: 0, pendingMemories: [], pendingSkills: [], skillsUsed: {}, errorCount: 0, toolStats: { total_calls: 0, error_calls: 0, by_tool: {} }, elapsedMs: 0 } as never; } },
+  engine: { async execute() { return { finalText: "", tokenUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0 }, turns: 0, pendingSkills: [], skillsUsed: {}, errorCount: 0, toolStats: { total_calls: 0, error_calls: 0, by_tool: {} }, elapsedMs: 0 } as never; } },
   sideEffects: {
     ensureHands: noop({ handsUrl: "http://hands.test", created: true, token: "t" }),
     destroyHands: noop(undefined), reapPendingHands: noop(undefined),

@@ -1326,6 +1326,32 @@ export async function initDb(): Promise<void> {
       CREATE UNIQUE INDEX IF NOT EXISTS unique_user_profile
       ON claw_memory_entries(user_id) WHERE category = 'user_profile'
     `).catch(() => {});
+    // Memory v2 (memory/service.ts). A row without `mtype` predates it and is shown under its category's type.
+    for (const [col, type] of [
+      ["mtype", "TEXT"], ["title", "TEXT"], ["why", "TEXT"], ["how_to_apply", "TEXT"],
+      ["status", "TEXT NOT NULL DEFAULT 'active'"], ["pinned", "BOOLEAN NOT NULL DEFAULT FALSE"], ["token_count", "INT"],
+      ["evidence_quote", "TEXT"], ["source_kind", "TEXT"], ["recorded_at", "TIMESTAMPTZ"], ["last_confirmed_at", "TIMESTAMPTZ"],
+      ["expires_at", "TIMESTAMPTZ"], ["prev_title", "TEXT"], ["prev_body", "TEXT"],
+    ] as const) {
+      await client.query(`ALTER TABLE claw_memory_entries ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
+    }
+    // What happened to each entry, for audit and undo. A deleted entry's events keep that it existed and lose
+    // what it said (title and quote are cleared), and a refused write never records what it carried.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_memory_events (
+        id              BIGSERIAL PRIMARY KEY,
+        user_id         TEXT NOT NULL,
+        entry_id        INT,
+        op              TEXT NOT NULL,
+        actor           TEXT NOT NULL,
+        session_id      TEXT,
+        reason          TEXT,
+        title           TEXT,
+        evidence_quote  TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_memory_events_entry ON claw_memory_events(user_id, entry_id)");
 
     // Per-user opt-in for long-term memory. No row means off.
     await client.query(`

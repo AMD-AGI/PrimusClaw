@@ -26,7 +26,6 @@ import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_DEPLOY_MODE, CLAW_SKILL_EVOLUTION_EN
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { actingSessionTurnFields, withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { defaultTaskWorkspaceId } from "./default-workspace.js";
-import { isMemoryActive } from "../memory/service.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { db } from "../infra/db.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
@@ -405,11 +404,10 @@ function buildExecuteRequest(opts: {
   session: Awaited<ReturnType<typeof loadSessionCredentials>>;
   internalToken: string;
   filesWorkspaceId: string;
-  memoryEnabled: boolean;
   /** From `pluginToolsForRun`; undefined leaves the field off the message. */
   pluginTools: unknown[] | null | undefined;
 }): ExecuteRequest {
-  const { updated, rendered, session, internalToken, filesWorkspaceId, memoryEnabled, pluginTools } = opts;
+  const { updated, rendered, session, internalToken, filesWorkspaceId, pluginTools } = opts;
   const sandboxSpecForBrain = (rendered.sandbox_spec ?? "none") as ExecuteRequest["sandbox_spec"];
   // Lift per-user env snapshot from task.input back to the top-level
   // ExecuteRequest field Brain expects. expandDag embedded it under
@@ -457,7 +455,8 @@ function buildExecuteRequest(opts: {
     ...(pluginTools !== undefined ? { plugin_tools: pluginTools } : {}),
     prompt: rendered.prompt ?? undefined,
     history: [],
-    memory_enabled: memoryEnabled,
+    // A task, DAG node or application run is not the user's conversation: no memory tools.
+    memory_enabled: false,
     skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
     script: rendered.script as ExecuteRequest["script"] | undefined,
     tools_allowlist: (updated.tools_allowlist as string[]) ?? undefined,
@@ -631,7 +630,6 @@ export async function dispatchPreparedRow(locked: ClawTaskRow): Promise<Dispatch
     );
     const req = buildExecuteRequest({
       updated, rendered, session, internalToken, filesWorkspaceId,
-      memoryEnabled: await isMemoryActive(session.user_id || ""),
       pluginTools: await pluginToolsForRun(updated, session.user_id || ""),
     });
     // Scripts and apps run no model turn.
