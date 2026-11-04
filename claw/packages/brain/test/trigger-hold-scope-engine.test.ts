@@ -24,7 +24,7 @@ import { fakeNats } from "./support/fake-nats.js";
 const world = await startWorld();
 const pw = await startPluginWorld();
 const { AgentEngine } = await import("../src/agent/engine.js");
-const { HITL_ENABLED } = await import("../src/config.js");
+const { HITL_ENABLED, BASH_APPROVAL_DEFAULTS_ENABLED } = await import("../src/config.js");
 test.after(async () => { await world.close(); await pw.close(); });
 
 /** The server entry `applyTriggerToolsToTask` adds, at the API's path on the stub MCP server (it answers any path). */
@@ -67,6 +67,9 @@ async function run(tool: string, opts: { operatorPolicy?: string; trigger?: bool
 
 test("the premise: HITL_ENABLED is on and a person can be asked", () => {
   assert.equal(HITL_ENABLED, true);
+  // The built-in bash rules are on too (the default): they are the platform's like the trigger hold, so they must
+  // not make every other call of the turn wait either.
+  assert.equal(BASH_APPROVAL_DEFAULTS_ENABLED, true);
 });
 
 test("with the trigger tools on, a tool they do not hold runs without asking anyone", async () => {

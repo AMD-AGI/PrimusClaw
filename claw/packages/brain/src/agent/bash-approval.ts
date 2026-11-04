@@ -44,6 +44,12 @@ const logger = pino({ name: "bash-approval" });
 export interface BashApprovalPolicy {
   /** True when at least one rule (or a malformed config) is in force. */
   readonly active: boolean;
+  /**
+   * True when a rule of a source other than the platform's built-in defaults is in force (or a config is
+   * malformed). Only such a rule makes the turn one whose every tool HITL_ENABLED asks about; the defaults
+   * hold the commands they name and nothing else.
+   */
+  readonly operatorActive: boolean;
   /** The label of the first rule the command matches, or null to run it. */
   check(command: unknown): string | null;
 }
@@ -412,6 +418,8 @@ export interface BashApprovalSource {
   /** Where the value came from, for the log only. */
   source: string;
   value: unknown;
+  /** The platform's built-in rules: they hold their commands without counting toward `operatorActive`. */
+  platform?: boolean;
 }
 
 /**
@@ -422,9 +430,10 @@ export interface BashApprovalSource {
 export function bashApprovalPolicyFrom(sources: BashApprovalSource[]): BashApprovalPolicy {
   const rules: Rule[] = [];
   let holdAll = false;
+  let operatorRules = false;
   /** Why everything is held, for the first cause found; what `check` reports. */
   let holdLabel = MALFORMED_LABEL;
-  for (const { source, value } of sources) {
+  for (const { source, value, platform } of sources) {
     if (value === undefined || value === null || value === false) continue;
     // One source value, not an entry of a rule list: the engine hands each item
     // of a plugin's `bashApproval` over as a source of its own.
@@ -443,6 +452,7 @@ export function bashApprovalPolicyFrom(sources: BashApprovalSource[]): BashAppro
     value.forEach((raw, index) => {
       try {
         rules.push(compileRule(raw));
+        if (!platform) operatorRules = true;
       } catch (err) {
         logger.warn({ source, index, reason: (err as Error).message }, "bash_approval.invalid_holding_all_commands");
         holdAll = true;
@@ -451,6 +461,7 @@ export function bashApprovalPolicyFrom(sources: BashApprovalSource[]): BashAppro
   }
   return {
     active: holdAll || rules.length > 0,
+    operatorActive: holdAll || operatorRules,
     check(command: unknown): string | null {
       if (holdAll) return holdLabel;
       if (typeof command !== "string" || command.length > MAX_COMMAND_CHARS) return "unreadable bash command";
