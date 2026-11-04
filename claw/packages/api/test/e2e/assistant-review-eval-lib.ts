@@ -18,7 +18,9 @@ import { CLAW_ASSISTANT_ROUTER_MAX_TURNS } from "../../src/config.js";
 import { parseItemRef } from "../../src/assistant/item-ref.js";
 import { createAssistantMcpServer } from "../../src/assistant/mcp.js";
 import { renderReviewContext, renderRouterSystem, WORK_EVENT_PREFIX } from "../../src/assistant/prompts.js";
-import { mentionsNumber, modelGrounded, parsePrs, prGrounded, repoGrounded } from "../../src/assistant/review-tools.js";
+import {
+  actionRequested, confirmationNamed, mentionsNumber, modelGrounded, parsePrs, prGrounded, repoGrounded,
+} from "../../src/assistant/review-tools.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
 import type { Block, Llm, Message, ModelResponse, ToolSchema } from "./assistant-router-eval-lib.js";
 import { promptFor, userTurn } from "./assistant-router-eval-lib.js";
@@ -129,14 +131,16 @@ export function standIn(c: ReviewEvalCase) {
         }
         if (!input.confirmation_id && !input.pr) pick = pending.length === 1 ? pending[0] : undefined;
         if (!pick) return refuse("confirmation_not_found");
-        if (input.decision === "allow" && !mentionsNumber(text, pick.pr) && pending.length !== 1) return refuse("pr_not_in_message");
+        if (input.decision === "allow" && !confirmationNamed(text, pick, pending)) return refuse("pr_not_in_message");
         return { ...ok({ status: input.decision === "allow" ? "merged" : "denied" }), confirmation: pick.pr };
       }
       case "review_mode_set":
         return input.mode === "high_risk_confirm" ? ok({ review_mode: "high_risk_confirm" }) : refuse(input.mode === "fully_auto" ? "needs_the_person" : "invalid_arguments");
       case "channel_action": {
         const name = String(input.name ?? "").replace(/^\/+/, "");
-        return (c.actions ?? []).some((a) => a.name === name) ? ok({ event_id: "e1" }) : refuse("action_not_offered");
+        const offered = (c.actions ?? []).find((a) => a.name === name);
+        if (!offered) return refuse("action_not_offered");
+        return actionRequested(text, offered) ? ok({ event_id: "e1" }) : refuse("action_not_in_message");
       }
       default:
         return refuse("unknown_tool");

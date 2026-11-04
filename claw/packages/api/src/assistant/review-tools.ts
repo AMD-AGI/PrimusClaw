@@ -352,6 +352,21 @@ async function waitingWhenWritten(q: Querier, userId: string, at: Date): Promise
   )).rows as Array<{ id: string }>).map((r) => String(r.id));
 }
 
+/**
+ * Whether the person's message names this held write: its confirmation id, or its pull request's number (with the
+ * repository when another waiting write shares the number). Being the only one waiting does not name it.
+ */
+export function confirmationNamed(
+  text: string, pick: { id: string; repo: string; pr: number }, pending: ReadonlyArray<{ pr: number }>,
+): boolean {
+  if (pick.id && text.toLowerCase().includes(pick.id.toLowerCase())) return true;
+  const [owner = "", repo = ""] = pick.repo.split("/");
+  const ref = { owner, repo, number: pick.pr };
+  // The number of another waiting write in another repository is not this one's name.
+  const sharing = pending.filter((c) => c.pr === pick.pr).length;
+  return prGrounded(text, ref) && (sharing === 1 || repoGrounded(text, ref, [], []));
+}
+
 export async function confirmationAnswer(
   claims: AssistantTokenClaims, args: { decision: "allow" | "deny"; confirmation_id?: string; pr?: string },
 ): Promise<Record<string, unknown>> {
@@ -377,21 +392,16 @@ export async function confirmationAnswer(
       throw new ToolRefused("which_confirmation", "more than one write waits for the user: ask which pull request");
     }
     if (!pick) throw new ToolRefused("confirmation_not_found", "no write of that pull request waits for the user");
-    // Saying yes is the person's say about one change: its number is in their words, or it was the only one waiting
-    // when they wrote. Saying no only makes less happen, so it needs neither.
+    // Saying yes is the person's say about one change: its pull request or its confirmation id is in their words. Being the
+    // only one waiting is not enough: the router reads what workers wrote beside the message, and a "yes" about something
+    // else must not let a write through. Saying no only makes less happen, so it needs neither.
     if (args.decision === "allow") {
       const waiting = await waitingWhenWritten(q, userId, message.receivedAt);
       // A write held after they wrote is one they have not seen (a new head, a new hold): their yes was not about it.
       if (!waiting.includes(pick.id)) {
         refuseUngrounded("confirmation_after_message", `the write waiting on ${pick.repo}#${pick.pr} was held after the user's message: tell them, and let them answer it`);
       }
-      const only = waiting.length === 1 && waiting[0] === pick.id;
-      const [owner = "", repo = ""] = pick.repo.split("/");
-      const ref = { owner, repo, number: pick.pr };
-      // The number of another waiting write in another repository is not this one's name.
-      const sharing = pending.filter((c) => c.pr === pick.pr).length;
-      const named = prGrounded(message.content, ref) && (sharing === 1 || repoGrounded(message.content, ref, [], []));
-      if (!named && !only) {
+      if (!confirmationNamed(message.content, pick, pending)) {
         refuseUngrounded("pr_not_in_message", `the user's message does not name ${pick.repo}#${pick.pr}: ask them to say which pull request to let through`);
       }
     }
@@ -426,6 +436,32 @@ export async function reviewModeSet(claims: AssistantTokenClaims, args: { mode: 
   });
 }
 
+/** Words of a summary that say nothing about which action it is. */
+const ACTION_STOPWORDS = new Set([
+  "about", "also", "been", "each", "every", "from", "have", "into", "more", "only", "some", "than", "that", "them", "then",
+  "they", "this", "what", "when", "will", "with", "your", "turn", "send", "show", "sets", "set",
+]);
+/** What separates the parts of a Chinese label: punctuation, spaces, and the particles that join a modifier to its noun. */
+const CJK_SPLIT = /[^\p{Script=Han}]+|[的和与及或给]/u;
+
+/**
+ * Whether the person's message asks for this channel action: it types the command (`/brief`, `/brief10:0`), names it
+ * (`brief`), or says what it is about, a word of its label (`morning` of "morning brief", `晨报` of "每个工作日的晨报").
+ */
+export function actionRequested(text: string, action: { name: string; summary?: string }): boolean {
+  const t = lower(text);
+  const name = lower(action.name);
+  if (name && new RegExp(`(?<![a-z0-9_])/?${escapeRe(name)}(?![a-z_])`).test(t)) return true;
+  const label = action.summary ?? "";
+  for (const word of lower(label).match(/[a-z][a-z0-9-]{3,}/g) ?? []) {
+    if (!ACTION_STOPWORDS.has(word) && new RegExp(`(?<![a-z0-9_])${escapeRe(word)}(?![a-z0-9_])`).test(t)) return true;
+  }
+  for (const part of label.split(CJK_SPLIT)) {
+    if (part.length >= 2 && text.includes(part)) return true;
+  }
+  return false;
+}
+
 export async function channelAction(claims: AssistantTokenClaims, args: { name: string; args?: string }): Promise<Record<string, unknown>> {
   requireRouter(claims);
   const name = String(args.name ?? "").trim().replace(/^\/+/, "");
@@ -435,8 +471,14 @@ export async function channelAction(claims: AssistantTokenClaims, args: { name: 
   const sent = await inTransaction(async (q) => {
     const { userId, message } = await attendedTurn(q, claims);
     // Only what the channel that carried this message said it can do: Claw knows no channel's commands.
-    if (!message.context.actions.some((a) => a.name === name)) {
+    const offered = message.context.actions.find((a) => a.name === name);
+    if (!offered) {
       throw new ToolRefused("action_not_offered", "the channel did not list that action with this message: tell the user what to type instead");
+    }
+    // Listed is what the channel can do; asked is what the person wants. The router reads what workers wrote beside the
+    // message, so the person's own words must ask for this action.
+    if (!actionRequested(message.content, offered)) {
+      refuseUngrounded("action_not_in_message", "the user's message does not ask for that action: do not change their settings unasked; tell them the command if they want it");
     }
     if (!message.context.channel_message_id) {
       throw new ToolRefused("no_channel", "this message did not come through a channel that runs actions");
