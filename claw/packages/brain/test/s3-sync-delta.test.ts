@@ -1287,3 +1287,44 @@ test("L12 a sync whose every listed file is held back leaves no record behind th
   await syncWorkspaceToS3(sb.client, "sess-1", "user-1", { gitLimits: TIGHT });
   assert.ok(store.objects.has("users/user-1/sessions/sess-1/a.txt"), "the file is back in S3");
 });
+
+test("L13 a file the stat missed is uploaded and still named, so its removal is pruned by name", async () => {
+  // `stat` leaves out a file it could not read; the upload still sends it, and a
+  // record that did not name it would let a prune by name keep its object for good.
+  const sb = threeFiles();
+  sb.reply = (command) => {
+    if (!command.includes("stat -c")) return undefined;
+    return sb.run(command).stdout.split("\n").filter((l) => !l.endsWith("/workspace/dir/c.txt")).join("\n");
+  };
+  await sb.sync();
+  sb.reply = undefined;
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/dir/c.txt"), "uploaded");
+  assert.deepEqual(recordPruned(sb), [true]);
+
+  store.lists = 0;
+  sb.remove("dir/c.txt");
+  await sb.sync();
+  assert.equal(store.lists, 0, "the record named it, so no listing was needed");
+  assert.equal(store.objects.has("users/user-1/sessions/sess-1/dir/c.txt"), false, "pruned by name");
+});
+
+for (const bad of ["", "/etc/passwd", "../other-session/a.txt", "dir/../../x", "./a.txt", "dir//b.txt"]) {
+  test(`L14 a record naming ${JSON.stringify(bad)} is not pruned by`, async () => {
+    // The record is in a directory the sandbox can write, and a prune by name
+    // turns each of its names into a DeleteObject key.
+    const sb = threeFiles();
+    await sb.sync();
+    for (const f of sb.manifestFiles()) {
+      const p = join(sb.state, f);
+      const shard = JSON.parse(readFileSync(p, "utf-8"));
+      shard.files[bad] = ["", "", "", ""];
+      writeFileSync(p, `${JSON.stringify(shard)}\n`);
+    }
+    store.lists = 0;
+    store.deletes = [];
+    sb.remove("dir/c.txt");
+    await sb.sync();
+    assert.equal(store.lists, 1, "the prefix is listed instead");
+    assert.deepEqual(store.deletes, ["users/user-1/sessions/sess-1/dir/c.txt"]);
+  });
+}

@@ -117,7 +117,8 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
   );
   mcp.tool(
     "gh_pr_merge",
-    "Approve (when needed) and merge the pull request if every gate is open: CI green on the head commit, no unresolved thread, merge state CLEAN, "
+    "Merge the pull request after your own APPROVE review of this head (gh_review_submit). It never approves for you: a merge that is not held answers "
+    + "review_not_submitted without that review, and only a held merge the acting user confirms is approved on their say. It merges only if every gate is open: CI green on the head commit, no unresolved thread, merge state CLEAN, "
     + "the acting user allowing it (refused when they wrote the pull request), and not held: a merge you judge high (`risk_judgement`), one with no judgement, "
     + "and one with a hard hold answer confirmation_required and wait for them (under the acting user's fully_auto review_mode only repo_holds do). "
     + "A branch that is merged through a merge queue gets the pull request put in the queue instead (status queued, never merged): the queue runs its own checks and merges it, and this tool does not follow it. "
