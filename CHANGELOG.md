@@ -38,7 +38,8 @@ record it.
   only the entries bound to its item. An entry can be bound to one work item (`claw_memory_entries.work_item_id`, a new
   column required at start-up); bound entries are left out of the chat's catalogue, and a save is checked for a duplicate
   or a near one only against entries of the same binding. Workers started from a session marked `memory: "off"` are
-  marked so too. The chat's own memory tools and
+  marked so too, and an assistant's watcher of a group or a repository is never served the chat's memory. The chat's
+  own memory tools and
   their fixed forget and undo phrases are unchanged.
 - The assistant can watch a group chat or a repository and record what it would do there without doing it, behind
   `CLAW_ASSISTANT_OBSERVE` (default off; needs `CLAW_ASSISTANT_ENABLED`): `POST /v1/assistant/observations` hands one
