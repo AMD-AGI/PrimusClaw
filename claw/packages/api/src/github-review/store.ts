@@ -460,22 +460,31 @@ export async function getConfirmation(db: Queryable, id: string): Promise<Confir
   return r.rows[0] ? toConfirmation(r.rows[0] as Record<string, unknown>) : null;
 }
 
+/** The caller (`$1`) is the acting user, or the requester of a session they own; never the requester of someone else's session. */
+const VISIBLE_TO_CALLER = `(claw_github_confirmations.actor_user_id = $1
+   OR (claw_github_confirmations.requester_user_id = $1
+       AND EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = claw_github_confirmations.session_id AND s.user_id = $1)))`;
+
 /**
- * Confirmations a caller may see: those of the sessions they own and those that
- * ask them. Pending ones that have run out are closed on the way, so nobody is
- * shown a card that can no longer be answered.
+ * Confirmations a caller may see: those that ask them (they are the acting user),
+ * and those they requested in a session they own. A review someone else asked of
+ * the acting user runs in the acting user's session with the asker as requester:
+ * its confirmations (the session, the review the model drafted as the acting user,
+ * the reasons, the checks) are the acting user's alone, and the asker sees only the
+ * item's `requester_view`. Pending ones that have run out are closed on the way, so
+ * nobody is shown a card that can no longer be answered.
  */
 export async function listConfirmations(
   db: Queryable, callerUserId: string, filter: { sessionId?: string; status?: ConfirmationStatus },
 ): Promise<Confirmation[]> {
   await db.query(
     `UPDATE claw_github_confirmations SET status = 'expired'
-      WHERE status = 'pending' AND expires_at <= NOW() AND (requester_user_id = $1 OR actor_user_id = $1)`,
+      WHERE status = 'pending' AND expires_at <= NOW() AND ${VISIBLE_TO_CALLER}`,
     [callerUserId],
   );
   const r = await db.query(
     `SELECT * FROM claw_github_confirmations
-      WHERE (requester_user_id = $1 OR actor_user_id = $1)
+      WHERE ${VISIBLE_TO_CALLER}
         AND ($2::text IS NULL OR session_id = $2)
         AND ($3::text IS NULL OR status = $3)
       ORDER BY created_at DESC LIMIT 50`,

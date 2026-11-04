@@ -603,6 +603,36 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual((await w.item(posted.item_id)).params.requester_view, { status: "done", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/500", verdict: "comment", merged: false });
   });
 
+  test("Q6b a requested review's held writes are the reviewer's alone: the requester lists none of them, by any filter; their own sessions' still list", async () => {
+    const list = async (user: string, query = "") => {
+      const r = await app.inject({ method: "GET", url: `/v1/github-review/confirmations${query}`, headers: { "x-test-user": user } });
+      assert.equal(r.statusCode, 200, r.body);
+      return (r.json().data.items as Array<{ id: string }>).map((c) => c.id).sort();
+    };
+    const it = await askedOfBob({ review_only: false });
+    // As the review tools hold them: the requester is who asked (alice), the acting user the reviewer (bob).
+    const held = await confirmation(it.session_id, "pending", "merge", "bob");
+    const review = await confirmation(it.session_id, "pending", "review", "bob");
+    // A pending one of an older head commit that has run out (made as another status first: one pending per commit and kind).
+    const gone = await confirmation(it.session_id, "denied", "merge", "bob");
+    await w.q("UPDATE claw_github_confirmations SET status = 'pending', expires_at = NOW() - INTERVAL '1 minute', head_sha = $2 WHERE confirmation_id = $1", [gone, "b".repeat(40)]);
+    const rows = await w.q("SELECT DISTINCT requester_user_id, actor_user_id FROM claw_github_confirmations WHERE session_id = $1", [it.session_id]);
+    assert.deepEqual(rows, [{ requester_user_id: "alice", actor_user_id: "bob" }], "the rows do name alice as requester");
+    for (const q of ["", `?session_id=${it.session_id}`, "?status=pending", "?status=expired", `?session_id=${it.session_id}&status=pending`]) {
+      assert.deepEqual(await list("alice", q), [], `the requester lists nothing (${q || "no filter"})`);
+    }
+    assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [gone]))[0].status, "pending", "nor closes the reviewer's");
+    assert.deepEqual(await list("bob"), [held, review].sort(), "the reviewer lists them");
+    assert.deepEqual(await list("bob", "?status=expired"), [gone], "and closes the one that ran out");
+    assert.deepEqual(await list("carol"), [], "nobody else lists them");
+
+    // A session the requester owns (their own review, or one made before reviews were the reviewer's) still lists what it holds for them.
+    await w.q("INSERT INTO claw_sessions (session_id, name, user_id, mode, config) VALUES ('older', 't', 'alice', 'claw', $1::jsonb)", [JSON.stringify({ acting_as: "bob" })]);
+    const older = await confirmation("older", "pending", "merge", "bob");
+    assert.deepEqual(await list("alice"), [older], "the requester owns that session");
+    assert.deepEqual(await list("bob"), [held, review, older].sort(), "and the acting user is asked by it");
+  });
+
   test("Q7 before each queued turn the reviewer's switch is asked again: off halts every review others asked of them and removes the keys sealed into them", () => withEnv(ROOMY, async () => {
     const a = await askedOfBob({ prs: [PR(1)] });
     const b = await askedOfBob({ prs: [PR(2)] }, "carol");

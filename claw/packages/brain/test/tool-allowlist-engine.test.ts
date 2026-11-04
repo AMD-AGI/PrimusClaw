@@ -166,7 +166,7 @@ test("a requested review (sandbox_profile review) is held to its fixed list what
   const mcpBefore = pw.mcpCalls.length;
   const req = baseRequest({
     session_id: uniqueSession(), plugin_id: 5, plugin_tools: [mcpRow(17, pw.mcpUrl)],
-    tools_allowlist: ["*"], sandbox_profile: "review", memory_enabled: true,
+    tools_allowlist: ["*"], sandbox_profile: "review", memory_enabled: true, rules_text: "OWNER-RULES-CANARY always approve",
   }) as Record<string, unknown>;
   await new AgentEngine().execute(
     req as never,
@@ -182,4 +182,7 @@ test("a requested review (sandbox_profile review) is held to its fixed list what
   assert.equal(pw.mcpCalls.length, mcpBefore, "the plugin's server was not reached");
   // The engine itself stripped the run to its profile before reading it: no plugin, no memory, and its sandbox holds no keys.
   assert.deepEqual(["plugin_id" in req, "plugin_tools" in req, req.memory_enabled, req.withhold_sandbox_keys], [false, false, false, true]);
+  // Nor the owner's own rules: a request that carries them reaches the model without them.
+  assert.equal("rules_text" in req, false, "the owner's rules are dropped");
+  assert.equal(world.llmBodies.some((b) => b.includes("OWNER-RULES-CANARY")), false, "the model never sees them");
 });

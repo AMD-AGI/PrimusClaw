@@ -7,7 +7,8 @@
  *
  * The API already cuts the request down to the profile. Brain does it again from the mark alone and trusts no wider list the request
  * carries: the tools are the intersection of this fixed list and the request's own, the only MCP server kept is the review tools', and
- * every owner belonging (skills, plugins, stored variables, memory, skill evolution, a multi-node topology, a workspace) is dropped. The
+ * every owner belonging (skills, plugins, stored variables, the owner's rules, memory, skill evolution, a multi-node topology, a workspace) is
+ * dropped. The
  * sandbox side is in `sandbox/ensure-hands.ts` (`reviewSandboxNamespace`, `useWorkspaceStorage: false`).
  */
 import type { ExecuteRequest } from "@claw/protocol";
@@ -29,7 +30,7 @@ export function applyReviewProfileBackstop(request: ExecuteRequest): void {
   request.withhold_sandbox_keys = true;
   request.memory_enabled = false;
   request.skill_evolution_enabled = false;
-  for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "topology", "workspace_id"] as const) delete request[field];
+  for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "topology", "workspace_id", "rules_text"] as const) delete request[field];
   const review = request.mcp_servers?.[REVIEW_SERVER_NAME];
   request.mcp_servers = review ? { [REVIEW_SERVER_NAME]: review } : {};
 }
