@@ -13,6 +13,7 @@
  *   D2  a task of a DAG (the scheduler's dispatch) is marked from the session's stored config, and its key is still handed to Brain
  *   D3  each place that hands Brain a turn for a stored session decides the sandbox's keys
  *   D4  a hosted application's sandbox is made with the owner's keys, so none is made for such a session
+ *   D7  a requested review with no turn left is not claimed, and its task is not dispatched: `max_turns` 0 would be no limit to Brain
  */
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
@@ -72,6 +73,15 @@ const ACTING: Array<[string, unknown, boolean]> = [
 ];
 
 async function claim(actingAs: unknown, model = "claude-opus-5.5", effort?: string, config?: Record<string, unknown>): Promise<{ request: Record<string, unknown>; asked: string[] }> {
+  const { res, asked } = await claimResponse(actingAs, model, effort, config);
+  assert.equal(res.statusCode, 200, res.body);
+  return { request: res.json().request as Record<string, unknown>, asked };
+}
+
+/** The turns the session's review has taken (`exec_complete`), as the budget reads them; 3 of 200 unless a test says. */
+let itemTurnsUsed = 3;
+
+async function claimResponse(actingAs: unknown, model = "claude-opus-5.5", effort?: string, config?: Record<string, unknown>) {
   const asked: string[] = [];
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
@@ -81,12 +91,11 @@ async function claim(actingAs: unknown, model = "claude-opus-5.5", effort?: stri
     }
     if (/SELECT config->'acting_as' AS acting_as FROM claw_sessions/.test(sql)) return { rows: actingAs === undefined ? [{ acting_as: null }] : [{ acting_as: actingAs }], rowCount: 1 };
     if (config && /^SELECT user_id, config FROM claw_sessions WHERE session_id = \$1 AND deleted_at IS NULL$/.test(sql)) return { rows: [{ user_id: "u-bob", config }], rowCount: 1 };
-    if (/exec_complete/.test(sql)) return { rows: [{ item: 3, day: 10 }], rowCount: 1 };
+    if (/exec_complete/.test(sql)) return { rows: [{ item: itemTurnsUsed, day: 10 }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
   const res = await app.inject({ method: "POST", url: "/v1/internal/tasks/ktsk_1/claim", headers: { authorization: `Bearer ${TOKEN}` }, payload: { brain_id: "brain-7" } });
-  assert.equal(res.statusCode, 200, res.body);
-  return { request: res.json().request as Record<string, unknown>, asked };
+  return { res, asked };
 }
 
 test("D1 a turn claimed from the queue is marked for a session that acts as a user, from the live row, and its keys still go to Brain", async () => {
@@ -110,25 +119,33 @@ const taskRow = () => ({
 });
 
 async function dispatchDag(config: Record<string, unknown>, effort: string | null = null): Promise<Record<string, unknown>> {
-  db.query = (async (text: string) => {
+  const { published } = await dispatchDagRun(config, effort);
+  assert.equal(published.length, 1, "the run was dispatched");
+  return published[0]!;
+}
+
+async function dispatchDagRun(config: Record<string, unknown>, effort: string | null = null) {
+  const failed: unknown[][] = [];
+  db.query = (async (text: string, params?: unknown[]) => {
     const sql = text.replace(/\s+/g, " ").trim();
+    if (/UPDATE claw_tasks/.test(sql) && /failure_reason/.test(sql)) failed.push(params ?? []);
     if (/SELECT user_id, config FROM claw_sessions/.test(sql)) return { rows: [{ user_id: "u-1", config }], rowCount: 1 };
     if (/^SELECT effort FROM claw_sessions WHERE session_id = \$1$/.test(sql)) return { rows: [{ effort }], rowCount: 1 };
     if (/^UPDATE claw_tasks/.test(sql) || /FROM claw_tasks t LEFT JOIN claw_sessions/.test(sql)) return { rows: [taskRow()], rowCount: 1 };
     if (/claw_workspace/.test(sql)) return { rows: [{ workspace_id: "kws_1", storage_prefix: "users/u-1/sessions/s-1/" }], rowCount: 1 };
-    if (/exec_complete/.test(sql)) return { rows: [{ item: 3, day: 10 }], rowCount: 1 };
+    if (/exec_complete/.test(sql)) return { rows: [{ item: itemTurnsUsed, day: 10 }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
   const published: Array<Record<string, unknown>> = [];
   const publish = taskPublisher.publish;
   taskPublisher.publish = (async (payload: string) => { published.push(JSON.parse(payload)); }) as typeof taskPublisher.publish;
+  let result: Awaited<ReturnType<typeof dispatchTask>>;
   try {
-    await dispatchTask("t-1");
+    result = await dispatchTask("t-1");
   } finally {
     taskPublisher.publish = publish;
   }
-  assert.equal(published.length, 1, "the run was dispatched");
-  return published[0]!;
+  return { published, result, failed };
 }
 
 test("D2 a task of a DAG is marked for a session that acts as a user, and its key still goes to Brain", async () => {
@@ -207,5 +224,34 @@ test("D4 a hosted application run is refused for a session that acts as a user, 
     } else {
       assert.deepEqual([out, asked.some((sql) => /FROM plugins/.test(sql))], [{ statusCode: 404, response: { ok: false, error: "plugin_not_found" } }, true], `${what}: the next check is the one it was`);
     }
+  }
+});
+
+test("D7 a requested review with no turn left is not claimed, and a task of it is not dispatched: max_turns 0 would be no limit to Brain", async () => {
+  itemTurnsUsed = 200;
+  try {
+    const { res, asked } = await claimResponse("u-bob", "claude-opus-5.5", undefined, REQUESTED);
+    assert.equal(res.statusCode, 422, res.body);
+    assert.equal(res.json().error, "unclaimable", "terminal: no retry gives it turns");
+    assert.doesNotMatch(res.body, /max_turns/, "no request carrying max_turns was handed out");
+    assert.ok(asked.some((sql) => /UPDATE claw_tasks/.test(sql) && /failure_reason/.test(sql)), "the row is failed, not released for another claim");
+
+    const { published, result, failed } = await dispatchDagRun({ platform_key: "pk-user-1", _server_managed_credentials: true, ...REQUESTED });
+    assert.equal(published.length, 0, "nothing was published");
+    assert.equal(result.ok, false);
+    assert.ok(failed.some((params) => JSON.stringify(params).includes("review_turn_budget_used")), JSON.stringify(failed));
+
+    // The owner's own review has no review budget and runs as before.
+    assert.equal((await claim("u-bob", "claude-opus-5.5", undefined, { acting_as: "u-bob" })).request.max_turns, undefined);
+  } finally {
+    itemTurnsUsed = 3;
+  }
+  // With one turn left, it runs, capped at that one.
+  itemTurnsUsed = 199;
+  try {
+    assert.equal((await claim("u-bob", "claude-opus-5.5", undefined, REQUESTED)).request.max_turns, 1);
+    assert.equal((await dispatchDag({ platform_key: "pk-user-1", _server_managed_credentials: true, ...REQUESTED })).max_turns, 1);
+  } finally {
+    itemTurnsUsed = 3;
   }
 });

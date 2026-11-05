@@ -87,6 +87,8 @@ const SANDBOX_IMAGE_RE = /(?:^|\s)sandboximage:\s*(\S+)/im;
 export function resolveSandboxImageFromRequest(request: ExecuteRequest): string {
   const direct = String(request.sandbox_image ?? "").trim();
   if (direct) return direct;
+  // A requested review's prompt holds what the requester wrote: it never picks the image the review runs in.
+  if (isReviewProfile(request)) return "";
   const fromPrompt = SANDBOX_IMAGE_RE.exec(String(request.prompt ?? ""))?.[1]?.trim();
   return fromPrompt || "";
 }

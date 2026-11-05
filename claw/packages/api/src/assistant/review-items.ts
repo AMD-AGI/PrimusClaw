@@ -839,15 +839,33 @@ export async function gateRequestedReviewTurn(sessionId: string): Promise<boolea
     await haltRequestedReviews(owner, [...new Set([sessionId, ...all])], { reason: answer === "off" ? "delegation_off" : answer, message: HALTED[answer] }, true);
     return false;
   }
+  return (await turnBudgetRefusal(sessionId, owner)) === null;
+}
+
+/**
+ * Before any turn of a session is sent, on the path that sends it at once (`sessions/dispatch.ts`, which the owner's own messages and the
+ * review's first turn take): for a review someone asked of the owner whose turn budget is used up, the reason it is refused, and the
+ * review is halted; null for every other session and for a review with turns left. The owner's own messages are not asked about delegation
+ * (`gateRequestedReviewTurn`), but a turn with no budget is not run for anyone: Brain reads `max_turns` 0 as no limit.
+ */
+export async function refuseReviewTurnOverBudget(sessionId: string): Promise<string | null> {
+  if (!CLAW_GITHUB_REVIEW_ENABLED) return null;
+  const row = (await db.query(
+    "SELECT user_id, config FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL", [sessionId],
+  )).rows[0] as { user_id: string | null; config: unknown } | undefined;
+  if (!row?.user_id || !usesReviewProfile(row.config)) return null;
+  return turnBudgetRefusal(sessionId, row.user_id);
+}
+
+/** The turn budget of a requested review: null while it has turns left, else the refusal, with the review halted. */
+async function turnBudgetRefusal(sessionId: string, owner: string): Promise<string | null> {
   const turns = await reviewTurnsLeft(sessionId, owner);
-  if (turns.left <= 0) {
-    await haltRequestedReviews(owner, [sessionId], {
-      reason: "turn_budget_used",
-      message: turns.scope === "item" ? "turn budget of this review used up" : "today's turn budget for others' reviews used up",
-    }, false);
-    return false;
-  }
-  return true;
+  if (turns.left > 0) return null;
+  await haltRequestedReviews(owner, [sessionId], {
+    reason: "turn_budget_used",
+    message: turns.scope === "item" ? "turn budget of this review used up" : "today's turn budget for others' reviews used up",
+  }, false);
+  return "review_turn_budget_used";
 }
 
 

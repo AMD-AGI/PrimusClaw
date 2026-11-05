@@ -47,7 +47,7 @@ import type { ExecuteExtras } from "./index.js";
 import { untheadedRunIdentity, type RunIdentity } from "../tasks/run-identity.js";
 import { HookRunner, registryHasAny } from "./hooks.js";
 import pino from "pino";
-import { applyReviewProfileBackstop, isReviewProfile, reviewProfileAllowlist } from "./review-profile.js";
+import { applyReviewProfileBackstop, isReviewProfile, reviewProfileAllowlist, reviewTurnBudgetRefusal } from "./review-profile.js";
 
 const logger = pino({ name: "agent-engine" });
 
@@ -91,6 +91,9 @@ export class AgentEngine {
   ): Promise<ExecuteResult> {
     // Before anything reads the request: a requested review keeps only what its fixed profile allows (`review-profile.ts`).
     applyReviewProfileBackstop(request);
+    // And it runs only with a positive turn budget: 0 is no limit below (`runHandleTask` refuses it before a sandbox is opened).
+    const noBudget = reviewTurnBudgetRefusal(request);
+    if (noBudget !== null) throw new Error(noBudget);
     // Which wire protocol Brain speaks to the LLM is a deployment-wide
     // choice (LLM_API_STYLE); apiKey still honors per-request BYOK/platform
     // key overrides via resolveRequestLlmKey on top of that provider's

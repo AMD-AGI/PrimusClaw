@@ -54,6 +54,7 @@ import {
 } from "../config.js";
 import { ensureHands } from "../sandbox/ensure-hands.js";
 import { isMultiNodeRequest } from "../sandbox/multi-node/prompt-flags.js";
+import { applyReviewProfileBackstop, reviewTurnBudgetRefusal } from "../agent/review-profile.js";
 import { gpuWorkspaceFor } from "../sandbox/workspace-select.js";
 import { getMultiNodeProvider, multiNodeAvailable } from "../sandbox/multi-node/factory.js";
 import type { MultiNodeContext } from "../sandbox/multi-node/types.js";
@@ -986,8 +987,32 @@ export async function refuseUnsupportedMode(
   lockKey: string,
 ): Promise<boolean> {
   if (request.mode === undefined || request.mode === "llm" || request.mode === "script" || request.mode === "app") return false;
-  const { kvCkpt } = getDeps();
   logger.error({ sessionId, taskId: request.task_id, mode: request.mode }, "task.mode_not_implemented");
+  await refuseBeforeRun(msg, request, lockKey, unsupportedModeReason(request.mode));
+  return true;
+}
+
+/**
+ * A requested review (`sandbox_profile: "review"`) with no positive turn budget is failed before anything runs: no sandbox, no cluster,
+ * no model turn. The agent loop reads 0 as no limit, so running it would spend the reviewer's quota without one
+ * (`agent/review-profile.ts` `reviewTurnBudgetRefusal`).
+ */
+export async function refuseReviewWithoutTurnBudget(
+  msg: JsMsg,
+  request: ExecuteRequest,
+  sessionId: string,
+  lockKey: string,
+): Promise<boolean> {
+  const why = reviewTurnBudgetRefusal(request);
+  if (why === null) return false;
+  logger.error({ sessionId, taskId: request.task_id, maxTurns: request.max_turns ?? null }, "task.review_without_turn_budget_refused");
+  await refuseBeforeRun(msg, request, lockKey, why);
+  return true;
+}
+
+/** Fail a task that is not to run at all, with the reason, and let go of it. */
+async function refuseBeforeRun(msg: JsMsg, request: ExecuteRequest, lockKey: string, failureReason: string): Promise<void> {
+  const { kvCkpt } = getDeps();
   try {
     await deliverAgentDone(kvCkpt, request, {
       finalText: "",
@@ -999,12 +1024,12 @@ export async function refuseUnsupportedMode(
       toolStats: { total_calls: 0, error_calls: 1, by_tool: {} },
       elapsedMs: 0,
       abortReason: "error",
-      failureReason: unsupportedModeReason(request.mode),
+      failureReason,
     });
     await ackAndClearCallback(msg, kvCkpt, request);
   } catch (err) {
     if (err instanceof AgentDoneDeliveryError) {
-      logger.error({ err, taskId: request.task_id }, "task.mode_refusal_delivery_exhausted");
+      logger.error({ err, taskId: request.task_id }, "task.refusal_delivery_exhausted");
       msg.nak(5_000);
     } else {
       throw err;
@@ -1013,7 +1038,6 @@ export async function refuseUnsupportedMode(
     activeAbort.delete(lockKey);
     await fx().releaseTaskLock(lockKey).catch(() => {});
   }
-  return true;
 }
 
 /**
@@ -4770,8 +4794,12 @@ export async function runHandleTask(
   abortCtrl: AbortController,
   claim: RunClaim = null,
 ): Promise<void> {
+  // Before anything decides the run's sandbox (a multi-node cluster, the image, the workspace): a requested review keeps only its fixed
+  // profile, and the prompt that holds the requester's words is not read as configuration (`agent/review-profile.ts`).
+  applyReviewProfileBackstop(request);
   if (await replayPendingCallback(msg, request, lockKey)) return;
   if (await refuseUnsupportedMode(msg, request, sessionId, lockKey)) return;
+  if (await refuseReviewWithoutTurnBudget(msg, request, sessionId, lockKey)) return;
   if (await maybeRunSandboxlessTask(msg, request, sessionId, lockKey, abortCtrl)) return;
   await new TaskRunner(
     msg, request, sessionId, lockKey, messageId, userId, abortCtrl, claim,

@@ -42,11 +42,27 @@ export function reviewSandboxAvailable(): boolean {
 const OWNER_FIELDS = ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "workspace_id", "topology", "agent_hooks", "rules_text"] as const;
 
 /**
+ * A turn of a requested review that has no turn left: it is not sent. Brain reads `max_turns` 0 (or none) as no limit at all, so a review
+ * whose budget is used up must never reach it with the budget it has left.
+ */
+export class ReviewTurnBudgetUsedError extends Error {
+  readonly code = "review_turn_budget_used";
+  constructor(readonly left: number) {
+    super(`review_turn_budget_used: a requested review has ${left} model turns left and is not run`);
+    this.name = "ReviewTurnBudgetUsedError";
+  }
+}
+
+/**
  * Put the profile on a turn or a task: the allow-list (Brain enforces it), only the review tools' server, no owner belongings, no memory
- * and no skill evolution, the review sandbox, and the turns it may still take. `maxTurns` 0 is a turn that must not run; the caller
- * refuses it before it is sent (`reviewTurnGate`), so 0 here only caps a task that slipped through.
+ * and no skill evolution, the review sandbox, and the turns it may still take (`reviewTurnsLeft`). A budget below 1 throws
+ * `ReviewTurnBudgetUsedError` and leaves the task as it was: `max_turns` 0 is no limit to Brain, so nothing under the profile is sent with
+ * it. Every path that sends a turn refuses such a turn before it gets here (`assistant/review-items.ts` `refuseReviewTurnOverBudget`: the
+ * immediate turn, `sessions/dispatch.ts`; and the queued one, `gateRequestedReviewTurn`); the throw is what stops one that got past them
+ * (a claim, a task of the session, a turn that ran out meanwhile). Brain refuses a marked request without a positive budget as well.
  */
 export function applyReviewProfile(task: Record<string, unknown>, maxTurns: number): void {
+  if (!Number.isSafeInteger(maxTurns) || maxTurns < 1) throw new ReviewTurnBudgetUsedError(maxTurns);
   const servers = task.mcp_servers as Record<string, Record<string, unknown>> | undefined;
   const review = servers?.[GITHUB_REVIEW_SERVER_NAME];
   task.mcp_servers = review ? { [GITHUB_REVIEW_SERVER_NAME]: review } : {};
@@ -55,7 +71,7 @@ export function applyReviewProfile(task: Record<string, unknown>, maxTurns: numb
   task.memory_enabled = false;
   task.skill_evolution_enabled = false;
   task.sandbox_profile = "review";
-  task.max_turns = Math.max(0, maxTurns);
+  task.max_turns = maxTurns;
 }
 
 // ------------------------------------------------------------------------------------------------ the owner's review-agent settings

@@ -172,6 +172,14 @@ export async function dispatchTaskToBrain(
   // and relied on second.
   let runTaskId: string | null = null;
   try {
+    // First, before anything is written: a turn of a review someone asked of the session's owner whose turn budget is used up is refused
+    // and the review halted (`refuseReviewTurnOverBudget`). Sent, it would carry `max_turns` 0, which Brain reads as no limit.
+    // Imported here: review-items reaches this module through routes/sessions.ts.
+    const overBudget = await (await import("../assistant/review-items.js")).refuseReviewTurnOverBudget(sessionId);
+    if (overBudget !== null) {
+      await onPublishFailure();
+      return { kind: "rejected", messageId, reason: overBudget };
+    }
     // Bound before anything is written, and bound once.
     //
     // A turn that cannot be bound to a workspace is refused rather than

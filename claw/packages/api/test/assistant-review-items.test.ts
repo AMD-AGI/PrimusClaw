@@ -24,6 +24,7 @@
  *   A1  a review the assistant started (`mergeNeedsConfirmation`) is a session that merges only on a confirmation, and every restart keeps it
  *   G1  a review session is no worker: no role profile, no worker report at its turn's end, not an orphan to the task sweep
  *   G2  nothing the server queues reaches an acting session without the person's proof: work_send into a review is refused
+ *   Q8b a requested review with no turn left is refused on the immediate path (a follow-up into its idle session) and halted
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -702,6 +703,42 @@ describe("assistant review items", { skip }, () => {
       for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
   });
+
+  test("Q8b a requested review with no turn left is sent nowhere with max_turns 0: a follow-up into the idle session is refused and the review halted", () => withEnv({
+    ...ROOMY, CLAW_REVIEW_FOR_OTHERS_TURNS_PER_ITEM: "10", CLAW_REVIEW_FOR_OTHERS_TURNS_PER_DAY: "1000",
+  }, async () => {
+    const { ReviewTurnBudgetUsedError } = await import("../src/github-review/review-profile.js");
+    const { applySandboxKeyPolicyToTask } = await import("../src/github-review/session-tools.js");
+    const a = await askedOfBob({ prs: [PR(11)] });
+    // Its first turn ran and used the whole budget; the session is idle with nothing queued.
+    await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [a.session_id]);
+    await w.q("UPDATE claw_sessions SET agent_status = 'idle' WHERE session_id = $1", [a.session_id]);
+    await w.q(`INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES (gen_random_uuid()::text, $1, 'exec_complete', $2::jsonb)`,
+      [a.session_id, JSON.stringify({ type: "exec_complete", turns: 10 })]);
+    const tasksBefore = await count("claw_tasks", `session_id = '${a.session_id}'`);
+    const messagesBefore = await count("claw_session_events", `session_id = '${a.session_id}' AND event = 'UserMessage'`);
+
+    // Whatever builds a turn of it (the immediate one, the queued one, the claim) is refused, and the task is not given a budget of 0.
+    const task: Record<string, unknown> = { session_id: a.session_id };
+    await assert.rejects(applySandboxKeyPolicyToTask(task, a.session_id), (e: unknown) => e instanceof ReviewTurnBudgetUsedError);
+    assert.equal("max_turns" in task, false);
+
+    // The follow-up message, sent straight into the idle session (the immediate path a message from its owner takes).
+    const sent = await w.mod.submit.submitSessionMessage({
+      sessionId: a.session_id, userId: "bob", user: { userId: "bob", userName: "B", roles: ["default"], platformKey: "pk-bob", virtualKey: "vk-bob" } as never,
+      content: "one more look, with --nodes 2 --mn-backend rayjob", messageType: "text", toolIds: [], sessionEnv: {},
+    });
+    assert.deepEqual(sent, { kind: "admission_rejected", messageId: (sent as { messageId: string }).messageId, reason: "review_turn_budget_used" });
+    assert.equal(await count("claw_tasks", `session_id = '${a.session_id}'`), tasksBefore, "no run was opened");
+    assert.equal(await count("claw_session_events", `session_id = '${a.session_id}' AND event = 'UserMessage'`), messagesBefore, "nothing added to the transcript");
+    assert.equal((await w.q("SELECT agent_status FROM claw_sessions WHERE session_id = $1", [a.session_id]))[0].agent_status, "idle", "the session is handed back");
+    const item = await w.item(a.item_id);
+    assert.deepEqual([item.board_state, item.last_report_kind, item.params.halted.reason], ["needs_you", "failed", "turn_budget_used"]);
+
+    // The owner's own review has no review budget: the same check lets it through.
+    const own = await one("bob", { prs: [PR(12)] });
+    assert.equal(await ri.refuseReviewTurnOverBudget(own.session_id), null);
+  }));
 
   test("M1 the state of a review, from every confirmation status and every way its turn ends", () => {
     const base = { ownerUserId: "alice", actingAs: "alice", actingAsName: null, reviewOnly: false, pr: PR(7), confirmations: [], writes: [], turn: "finished" as const };

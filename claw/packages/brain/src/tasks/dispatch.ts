@@ -25,6 +25,7 @@ import { RUN_DOORBELL_DISPATCH, TASK_MAX_DELIVER, TASK_POISON_DELIVERY_COUNT } f
 import { metrics, type DoorbellDeclineReason } from "../infra/metrics.js";
 import { clearRetryPending, hasFailedAttempt } from "./retry-pending.js";
 import { resolveSandboxImageFromRequest } from "../sandbox/ensure-hands.js";
+import { applyReviewProfileBackstop, isReviewProfile } from "../agent/review-profile.js";
 import {
   requestedNodeCount, resolveTopology,
 } from "../sandbox/multi-node/prompt-flags.js";
@@ -204,7 +205,8 @@ function logTaskReceived(request: ExecuteRequest, msg: JsMsg): void {
   // cluster. Surface it rather than letting the task look ordinary.
   // Only the prompt route can silently downgrade like this: a declared
   // topology missing its backend is refused outright.
-  const requestedNodes = request.topology ? 0 : requestedNodeCount(request.prompt ?? "");
+  // Not read for a requested review either: its prompt is not configuration (`resolveTopology`).
+  const requestedNodes = request.topology || isReviewProfile(request) ? 0 : requestedNodeCount(request.prompt ?? "");
   if (multiNodeSpec === null && requestedNodes >= 2) {
     logger.warn(
       {
@@ -388,6 +390,8 @@ async function handleResolvedRequest(
   // diverge, and every settle from this holder is then refused as stale.
   claimGeneration?: number,
 ): Promise<void> {
+  // First, before anything reads the request: a requested review keeps only what its fixed profile allows (`agent/review-profile.ts`).
+  applyReviewProfileBackstop(request);
   const kv = getKv();
   logTaskReceived(request, msg);
   const sessionId = request.session_id;
