@@ -42,7 +42,7 @@ import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { canAccessSession, isSystemAdmin, type UserInfo } from "../auth/models.js";
 import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
-import { releaseSessionGateForTurn, takeSessionGate } from "../tasks/chat-run.js";
+import { queuedMessageId, releaseSessionGateForTurn, takeSessionGate } from "../tasks/chat-run.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
 import { DRAIN_UNDER_WAY_SQL } from "./drain-claim.js";
 import { dispatchTaskToBrain, newChatMessageId } from "./dispatch.js";
@@ -99,6 +99,11 @@ interface SubmitSessionMessageBase {
    * acts as a user); a caller that is not a request has nothing to ask.
    */
   refuse?: (tx: PoolClient) => Promise<string | null>;
+  /**
+   * Runs inside the transaction once the message is accepted, with the id of the turn that will carry it (queued or
+   * dispatched): what must be on record about the message before any turn can read it. Not called for a duplicate.
+   */
+  accepted?: (tx: PoolClient, messageId: string) => Promise<void>;
 }
 
 /**
@@ -339,6 +344,7 @@ export async function submitSessionMessage(
         toolsAllowlist,
         dedupeKey,
       });
+      if (inserted.id !== null) await input.accepted?.(client, queuedMessageId(inserted.id));
       await client.query("COMMIT");
       queued = { pendingId: inserted.id, deduplicated: inserted.deduplicated, wasRunning: status === "running" };
     } else {
@@ -347,6 +353,7 @@ export async function submitSessionMessage(
       capturedUserEnvSnapshot = userEnvSnapshot;
 
       await takeSessionGate(sessionId, turnMessageId, client);
+      await input.accepted?.(client, turnMessageId);
       await client.query("COMMIT");
     }
   } catch (e) {

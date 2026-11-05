@@ -125,6 +125,31 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
        ON claw_assistant_says(item_id, item_attention_seq) WHERE fallback`,
   );
 
+  // What a router turn may act on: the user's message it answers, as received, with how the request that carried
+  // it was authenticated. Written in the transaction that accepts the message, keyed by the id of the turn that
+  // will carry it, so a turn can never read a message it does not answer. A report the server queued has no row.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_messages (
+      session_id       TEXT NOT NULL,
+      message_id       TEXT NOT NULL,
+      user_id          TEXT NOT NULL,
+      -- The name the sign-in gave, for what a review signs with ("asked by ...").
+      user_name        TEXT,
+      content          TEXT NOT NULL,
+      -- {kind: "person"} or {kind: "service", client_id, act_sub} when an identity-provider token carried it; NULL otherwise.
+      attended_via     JSONB,
+      -- What the channel sent beside the text (people, actions, repos, channel_message_id), already bounded.
+      channel_context  JSONB NOT NULL DEFAULT '{}'::jsonb,
+      received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      -- Set when the turn answering it read what a worker wrote (work_recall): from then on that turn's model has read
+      -- text nobody vouches for, so it no longer acts for the person.
+      untrusted_read_at TIMESTAMPTZ,
+      PRIMARY KEY (session_id, message_id)
+    )
+  `);
+  await client.query(
+    "CREATE INDEX IF NOT EXISTS idx_assistant_messages_received ON claw_assistant_messages(received_at)",
+  );
   await ensureObserveSchema(client);
 }
 

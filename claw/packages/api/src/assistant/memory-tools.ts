@@ -9,8 +9,8 @@
  * phrase. The assistant's messages are not all the person's: a worker's report wakes it too, and a model in any
  * sandbox of theirs holds their key and can send it a message. So the router's write tools ask, in code:
  *
- *  - the person is behind this turn: it answers a message they sent signed in, a few minutes ago (C2's `attendedTurn`,
- *    the design's §3.8), asked again inside the transaction that writes;
+ *  - the person is behind this turn: it answers a message they sent signed in, a few minutes ago (`attendedTurn`,
+ *    the design's §3.8, the same check the review tools make), asked again inside the transaction that writes;
  *  - what it touches was named by the person: an entry's number is in their message, or in what the assistant said to
  *    them just before it (`claw_assistant_says`, written by the server when it delivered the words); a quote is from
  *    their message;
@@ -30,8 +30,7 @@ import {
   ITEM_MEMORY_INTRO, ROUTER_MEMORY_OFF, ROUTER_MEMORY_PREAMBLE, ROUTER_MEMORY_PROMPT, WORKER_MEMORY_PREAMBLE, renderItemMemories,
 } from "./prompts.js";
 import type { AssistantTokenClaims } from "./token.js";
-import * as assistantTools from "./tools.js";
-import { assertLiveRun, ToolRefused } from "./tools.js";
+import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
 import { resolveWorkItemNow } from "./work-items.js";
 
 const logger = pino({ name: "assistant-memory" });
@@ -53,27 +52,14 @@ export interface AttendedMessage {
   receivedAt: Date;
 }
 
-/** The shape of C2's `attendedTurn` (`assistant/tools.ts` once AMD-AGI/PrimusClaw#269 is in), as far as it is read here. */
-type AttendedTurn = (q: Querier, claims: AssistantTokenClaims) => Promise<{
-  userId: string; message: { content: string; receivedAt: Date | string };
-}>;
-
-/** The ways out of this module, so a test can stand in for what another change provides. */
+/** The ways out of this module, so a test can stand in for one turn's answer. */
 export const memoryToolPorts = {
   /**
-   * The person behind this turn, or a refusal. C2 owns the question (`attendedTurn`: the turn answers a message the
-   * route recorded as carried by an identity-provider token, fresh, and not one whose turn has read a worker's words).
-   * TODO(#269): until C2 is on main there is no record of who sent a message, so nothing can show the person is there,
-   * and every write refuses. Read at call time from `tools.ts`'s exports, so it is C2's own function the moment it lands.
+   * The person behind this turn, or a refusal. The review tools own the question (`attendedTurn`: the turn answers a
+   * message the route recorded as carried by an identity-provider token, fresh, and not one whose turn has read a
+   * worker's words); memory asks the same one, so the two can never disagree about who is there.
    */
   attended: async (q: Querier, claims: AssistantTokenClaims): Promise<AttendedMessage> => {
-    const attendedTurn = (assistantTools as unknown as Record<string, unknown>).attendedTurn as AttendedTurn | undefined;
-    if (typeof attendedTurn !== "function") {
-      throw new ToolRefused(
-        "attendance_unavailable",
-        "this deployment cannot yet tell that the user is the one asking, so memory can only be read here: tell the user to change it in their memory settings",
-      );
-    }
     const turn = await attendedTurn(q, claims);
     return { userId: turn.userId, content: turn.message.content, receivedAt: new Date(turn.message.receivedAt) };
   },

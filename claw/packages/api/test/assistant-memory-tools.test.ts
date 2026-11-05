@@ -5,12 +5,13 @@
  * The user's long-term memory in the assistant (`CLAW_ASSISTANT_MEMORY_TOOLS=on`), against a real Postgres with the
  * production schema. Skipped without DATABASE_URL, and a skip is not a pass.
  *
- * Who is behind a turn is C2's question (`attendedTurn`). Where it is not on main yet, the port stands in for it here,
- * answering for the messages this file sends as signed in and refusing every other turn, as C2 refuses a report's
- * turn; A0 checks what the real port does on the tree under test.
+ * Who is behind a turn is the review tools' question (`attendedTurn`), asked here for real: a message this file sends
+ * is written down as the route writes one that came with the person's sign-in (`claw_assistant_messages`), and a
+ * worker's report has none.
  *
- *   A0  the real port: with no `attendedTurn` the writes refuse (`attendance_unavailable`) and reading still works;
- *       with C2's, a turn that answers no recorded message is refused
+ *   A0  attendance: a turn answering the person's fresh signed-in message writes; a report's turn, a message that came
+ *       with a key, one older than the attended window and a turn that has read a worker's words are each refused with
+ *       `attendedTurn`'s own code, and write nothing; reading still works in all of them
  *   N1  a natural "forget" acts on an entry whose number is in the person's message
  *   N2  ... or in what the assistant said to them just before ("forget the second one" after a list)
  *   N3  a natural "undo" of what was just saved, by the number the assistant announced
@@ -19,8 +20,8 @@
  *       before the message, or only after it
  *   G3  a save or a change quotes the person's message of this turn: not an earlier one, not a report
  *   G4  a conversation others read (`memory: "off"`, a group's) never writes personal memory; nor a user who has memory off
- *   G5  the person's say is asked again inside the transaction that writes: a turn that stops being theirs in between
- *       writes nothing
+ *   G5  the person's say is asked again inside the transaction that writes: a turn that reads a worker's words in
+ *       between writes nothing
  *   G6  a turn that has ended cannot act; a worker cannot write; an observer neither reads nor writes; another user's
  *       entry is not reachable
  *   I1  an entry about one item is bound to it: listed to the router with the item's number, shown in full to that item's
@@ -58,8 +59,6 @@ describe("assistant memory tools", { skip }, () => {
   let realAttended: typeof mt.memoryToolPorts.attended;
   let alice: { userId: string; routerSid: string };
   let bob: { userId: string; routerSid: string };
-  /** The messages this file sent signed in, by the id of the turn that answers each. */
-  const signedIn = new Map<string, { userId: string; content: string; receivedAt: Date }>();
   let app: FastifyInstance;
   let base = "";
 
@@ -76,14 +75,8 @@ describe("assistant memory tools", { skip }, () => {
   });
   after(async () => { await app?.close(); await w?.stop(); });
   beforeEach(async () => {
-    await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_sessions, claw_notification_outbox, claw_memory_entries, claw_memory_events, claw_user_memory_prefs, claw_assistant_scopes CASCADE");
-    signedIn.clear();
-    // C2's question, answered for this file's own signed-in messages only; a report's turn has none.
-    mt.memoryToolPorts.attended = async (_q, claims) => {
-      const m = signedIn.get(claims.mid);
-      if (!m) throw new (w.mod.tools.ToolRefused)("not_attended", "this turn does not answer a message the user sent signed in");
-      return m;
-    };
+    await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistant_messages, claw_assistants, claw_sessions, claw_notification_outbox, claw_memory_entries, claw_memory_events, claw_user_memory_prefs, claw_assistant_scopes CASCADE");
+    mt.memoryToolPorts.attended = realAttended;
     alice = await w.user("alice");
     bob = await w.user("bob");
     await svc.setMemoryPreference("alice", true);
@@ -95,16 +88,28 @@ describe("assistant memory tools", { skip }, () => {
     try { await p; } catch (err) { assert.ok(err instanceof t().ToolRefused, `a fault, not a refusal: ${err}`); return (err as { code: string }).code; }
     return assert.fail("accepted");
   };
-  const now = async (): Promise<Date> => new Date((await w.q("SELECT NOW() AS t"))[0].t);
   const entries = async (userId = "alice") =>
     w.q("SELECT id, title, content, work_item_id FROM claw_memory_entries WHERE user_id = $1 AND kind IS NULL ORDER BY id", [userId]);
 
-  /** The person sends their assistant a message, signed in; the turn that answers it is live. */
-  async function message(u: { userId: string; routerSid: string }, content: string): Promise<Claims> {
+  /** A message the turn `claims` answers, written down as the route writes it (`recordAssistantMessage`). */
+  async function recordMessage(
+    claims: Claims, userId: string, content: string, o: { via?: object | null; agoSec?: number } = {},
+  ): Promise<void> {
+    await w.q(
+      `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, user_name, content, attended_via, channel_context, received_at)
+       VALUES ($1, $2, $3, NULL, $4, $5::jsonb, '{}'::jsonb, NOW() - make_interval(secs => $6::int))`,
+      [claims.sid, claims.mid, userId, content, o.via === null ? null : JSON.stringify(o.via ?? { kind: "person" }), o.agoSec ?? 0],
+    );
+  }
+
+  /** The person sends their assistant a message, signed in (or as `o` says); the turn that answers it is live. */
+  async function message(
+    u: { userId: string; routerSid: string }, content: string, o: { via?: object | null; agoSec?: number } = {},
+  ): Promise<Claims> {
     const turn = await w.routerTurn(u);
     // Where the chat's memory finds what the user said (`humanMessages`): a write here must not reach past this message.
     await w.q("UPDATE claw_tasks SET prompt = $2 WHERE task_id = $1", [turn.task_id, content]);
-    signedIn.set(turn.mid, { userId: u.userId, content, receivedAt: await now() });
+    await recordMessage(turn, u.userId, content, o);
     return turn;
   }
   /** A worker's report wakes the router: a live turn that answers no message of the person's. */
@@ -124,19 +129,41 @@ describe("assistant memory tools", { skip }, () => {
     if (ago) await w.q("UPDATE claw_assistant_says SET created_at = created_at - make_interval(secs => $2::int) WHERE user_id = $1", [u.userId, ago]);
   }
 
-  test("A0 the real port: without C2 the writes refuse and reading works; with C2 a turn without a recorded message is refused", async () => {
-    mt.memoryToolPorts.attended = realAttended;
+  test("A0 attendance: the person's fresh signed-in message writes; a report, a key, a stale message or a read of a worker's words does not", async () => {
     const id = await stored("alice", "回复用中文，说人话");
-    const turn = await w.routerTurn(alice);
-    const hasC2 = typeof (t() as unknown as Record<string, unknown>).attendedTurn === "function";
-    const expected = hasC2 ? "not_attended" : "attendance_unavailable";
-    assert.equal(await code(mt.memoryForget(turn, { id: String(id) })), expected);
-    assert.equal(await code(mt.memorySave(turn, { type: "user", title: "简短", body: "回答简短", evidence_quote: "回答简短" })), expected);
-    assert.equal(await code(mt.memoryUpdate(turn, { id: String(id), body: "x", evidence_quote: "x" })), expected);
-    assert.equal(await code(mt.memoryUndo(turn, { id: String(id) })), expected);
-    assert.equal((await entries()).length, 1, "nothing was written or deleted");
-    const read = await mt.memoryRecall(turn, {});
-    assert.deepEqual(read.entries, [`#${id} [user] 回复用中文，说人话`]);
+    const writes = (turn: Claims, content: string) => [
+      () => mt.memorySave(turn, { type: "user", title: "简短", body: "回答简短", evidence_quote: content }),
+      () => mt.memoryUpdate(turn, { id: String(id), body: "回答简短", evidence_quote: content }),
+      () => mt.memoryForget(turn, { id: String(id) }),
+      () => mt.memoryUndo(turn, { id: String(id) }),
+    ];
+    const ask = `回答简短，#${id} 也改一下`;
+    // One live turn at a time, as the session's gate allows: each is opened, asked and closed before the next.
+    const cases: Array<[string, () => Promise<Claims>]> = [
+      ["not_attended", () => w.routerTurn(alice)],
+      ["not_attended", () => message(alice, ask, { via: null })],
+      ["attendance_expired", () => message(alice, ask, { agoSec: 3600 })],
+      ["read_untrusted", async () => {
+        const turn = await message(alice, ask);
+        const { db } = await import("../src/infra/db.js");
+        await (await import("../src/assistant/inbound.js")).markUntrustedRead((sql, params) => db.query(sql, params), turn.sid, turn.mid);
+        return turn;
+      }],
+    ];
+    for (const [expected, open] of cases) {
+      const turn = await open();
+      for (const call of writes(turn, ask)) assert.equal(await code(call()), expected);
+      assert.deepEqual((await mt.memoryRecall(turn, {})).entries, [`#${id} [user] 回复用中文，说人话`], "reading still works");
+      await w.closeRun(turn.task_id);
+    }
+    assert.deepEqual((await entries()).map((e) => [e.id, e.content]), [[id, "回复用中文，说人话"]], "nothing was written or deleted");
+
+    // The same words, sent signed in and fresh: the writes act.
+    const turn = await message(alice, ask);
+    const saved = await mt.memorySave(turn, { type: "user", title: "简短", body: "回答简短", evidence_quote: "回答简短" });
+    assert.equal(saved.ok, true, JSON.stringify(saved));
+    assert.equal((await mt.memoryForget(turn, { id: String(id) })).ok, true);
+    assert.deepEqual((await entries()).map((e) => e.content), ["回答简短"]);
   });
 
   test("N1 a natural forget acts on the entry whose number the person wrote", async () => {
@@ -239,24 +266,28 @@ describe("assistant memory tools", { skip }, () => {
   test("G5 the person's say is asked again where the write happens: a turn that stops being theirs writes nothing", async () => {
     const id = await stored("alice", "回复用中文");
     const asked: string[] = [];
-    const answerOnce = (turn: Claims) => {
+    const content = `记住：回答要简短。另外 #${id} 改成回复用英文；不对，忘掉 #${id}，或者撤销 #${id}`;
+    // The real question each time; after the first asking the turn reads a worker's words (`work_recall` marks it).
+    const readsAfterFirstAsk = () => {
       let n = 0;
-      mt.memoryToolPorts.attended = async (_q, claims) => {
+      mt.memoryToolPorts.attended = async (q, claims) => {
         n += 1;
         asked.push(claims.mid);
-        if (n > 1) throw new (t().ToolRefused)("attendance_expired", "too old");
-        return signedIn.get(turn.mid) as { userId: string; content: string; receivedAt: Date };
+        const answered = await realAttended(q, claims);
+        if (n === 1) await w.q("UPDATE claw_assistant_messages SET untrusted_read_at = NOW() WHERE session_id = $1 AND message_id = $2", [claims.sid, claims.mid]);
+        return answered;
       };
     };
-    const turn = await message(alice, `记住：回答要简短。另外 #${id} 改成回复用英文；不对，忘掉 #${id}，或者撤销 #${id}`);
     for (const call of [
-      () => mt.memorySave(turn, { type: "user", title: "回答简短", body: "回答要简短", evidence_quote: "回答要简短" }),
-      () => mt.memoryUpdate(turn, { id: String(id), title: "回复用英文", body: "回复用英文", evidence_quote: "回复用英文" }),
-      () => mt.memoryForget(turn, { id: String(id) }),
-      () => mt.memoryUndo(turn, { id: String(id) }),
+      (turn: Claims) => mt.memorySave(turn, { type: "user", title: "回答简短", body: "回答要简短", evidence_quote: "回答要简短" }),
+      (turn: Claims) => mt.memoryUpdate(turn, { id: String(id), title: "回复用英文", body: "回复用英文", evidence_quote: "回复用英文" }),
+      (turn: Claims) => mt.memoryForget(turn, { id: String(id) }),
+      (turn: Claims) => mt.memoryUndo(turn, { id: String(id) }),
     ]) {
-      answerOnce(turn);
-      assert.equal(await code(call()), "attendance_expired");
+      const turn = await message(alice, content);
+      readsAfterFirstAsk();
+      assert.equal(await code(call(turn)), "read_untrusted");
+      await w.closeRun(turn.task_id);
     }
     assert.equal(asked.length, 8, "asked before and again inside each write");
     assert.deepEqual((await entries()).map((e) => [e.id, e.content]), [[id, "回复用中文"]]);
@@ -269,7 +300,7 @@ describe("assistant memory tools", { skip }, () => {
     assert.equal(await code(mt.memoryForget(ended, { id: String(id) })), "turn_not_live");
     const item = await w.createItem(alice, "Fix the build");
     const worker = await w.workerTurn(item.itemId);
-    signedIn.set(worker.mid, { userId: "alice", content: `忘掉 #${id}`, receivedAt: await now() });
+    await recordMessage(worker, "alice", `忘掉 #${id}`);
     assert.equal(await code(mt.memoryForget(worker, { id: String(id) })), "not_allowed");
     assert.equal(await code(mt.memorySave(worker, { type: "user", title: "x", body: "忘掉", evidence_quote: "忘掉" })), "not_allowed");
     // An observer's tools only record (`observeEveryTool`); were one to run, it reads and writes nothing of the user's memory.

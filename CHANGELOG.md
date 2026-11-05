@@ -31,8 +31,8 @@ record it.
 - The user's long-term memory in the assistant, behind `CLAW_ASSISTANT_MEMORY_TOOLS` (`on` | `off`, default off; needs
   `CLAW_ASSISTANT_ENABLED` and `CLAW_MEMORY_ENABLED`, and the user's own opt-in). A router turn is shown the one-line
   index and offered `memory_recall`, `memory_save`, `memory_update`, `memory_forget` and `memory_undo`; each write acts only
-  for a turn that answers the person's own signed-in, recent message (the assistant's attended check, which arrives with
-  the review tools; until then every write is refused and reading works), on an entry whose number is in that message or
+  for a turn that answers the person's own signed-in, recent message (the review tools' attended check: a worker's report,
+  a message sent with a key, a stale one or a turn that has read a worker's words is refused; reading works), on an entry whose number is in that message or
   in what the assistant said to them just before, quoting that message, and never in a conversation marked
   `memory: "off"`. A task item's worker is shown a read-only index and may only recall; a review item's session is shown
   only the entries bound to its item. An entry can be bound to one work item (`claw_memory_entries.work_item_id`, a new
@@ -41,6 +41,11 @@ record it.
   marked so too, and an assistant's watcher of a group or a repository is never served the chat's memory. The chat's
   own memory tools and
   their fixed forget and undo phrases are unchanged.
+- `run.completed` and `run.failed` notifications carry `message_id`, the message whose turn the run was (a trigger's
+  run names the message the trigger sent; `null` for a task that has none). A client that sent that message and
+  already showed its answer can now tell the run's end is that turn's by the id: a run is closed after its last
+  answer, often more than a minute after, so matching by time sent a second "Run completed" card to the chat that had
+  just shown the answer.
 - The assistant can watch a group chat or a repository and record what it would do there without doing it, behind
   `CLAW_ASSISTANT_OBSERVE` (default off; needs `CLAW_ASSISTANT_ENABLED`): `POST /v1/assistant/observations` hands one
   message of a place (`group:<channel>:<id>` or `repo:<owner>/<repo>`) to a watcher session of the caller's own, whose
@@ -60,6 +65,16 @@ record it.
   item denies what its session holds for an answer. See `claw/docs/github-review.md`, "As an item of the assistant".
   `POST /v1/sessions` now checks `acting_as`, `review_target`, `review_only`, the model and the effort through the same
   function (`github-review/acting-session.ts`); its answers are unchanged.
+- The assistant's review and settings tools, behind `CLAW_ASSISTANT_TOOLS=on` (default off): `review_start`,
+  `review_restart`, `confirmation_answer`, `review_mode_set` (towards `high_risk_confirm` only) and `channel_action`
+  (an `assistant.action` outbox event when the user typed the command whole; otherwise an `assistant.say` carrying the
+  command as `confirm_action`, for the channel to run only when the user presses its button). A held write is let through
+  only by the exact command `批准 #<ref>` / `approve #<ref>` naming it, or the card's button. They act only in a router turn
+  that answers the user's own signed-in message
+  (recorded in the new `claw_assistant_messages` when the message is accepted, with how it was authenticated), received
+  at most `CLAW_ASSISTANT_ATTENDED_TTL_SEC` (600) seconds before, that has not read a worker's words; and only on what
+  that message names. A user's message now stops a router turn that is reading a worker's report, and a router turn
+  that answered the user and failed without a word is followed by one system notice. See `claw/docs/github-review.md`.
 - GitHub tools as an MCP server hosted by the API, off by default (`CLAW_GITHUB_MCP_ENABLED`, with
   `CLAW_GITHUB_MCP_SECRET`). A session whose owner keeps `GH_TOKEN` in their env vault is offered `github`:
   eleven read tools that run without asking and six write tools (comment, open an issue or a pull request,
