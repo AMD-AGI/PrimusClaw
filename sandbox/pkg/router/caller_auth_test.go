@@ -244,6 +244,7 @@ func TestIdentityHeadersPreservedWhenAuthDisabled(t *testing.T) {
 	t.Cleanup(wmServer.Close)
 
 	cfg := DefaultConfig()
+	cfg.EnableAuth = false
 	cfg.WorkloadManagerURL = wmServer.URL
 	s := &Server{
 		cfg:   cfg,

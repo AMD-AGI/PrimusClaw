@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Caller authentication middleware for the Router (default off, --enable-auth to enable).
+// Caller authentication middleware for the Router (default on; --enable-auth=false to disable).
 // A caller presents "Authorization: Bearer <credential>": a platform API key (ak-...) or an
 // access token issued by the identity provider for this service. The credential is
 // validated through identity provider token introspection (RFC 7662).

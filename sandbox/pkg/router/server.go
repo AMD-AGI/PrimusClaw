@@ -67,6 +67,7 @@ func DefaultConfig() Config {
 	return Config{
 		Port:                  8080,
 		MaxConcurrentRequests: 1000,
+		EnableAuth:            true,
 		Namespace:             "default",
 	}
 }
@@ -166,9 +167,9 @@ func (s *Server) setupRoutes() {
 	v1 := s.engine.Group("/v1")
 	v1.Use(s.concurrencyLimitMiddleware())
 
-	// Caller authentication (default off). When --enable-auth is set, every /v1/
-	// request must carry a credential the identity provider accepts; a missing
-	// identity client fails closed.
+	// Caller authentication (default on). --enable-auth=false registers no
+	// middleware. Otherwise every /v1 request must carry a credential the
+	// identity provider accepts; a missing identity client fails closed.
 	if s.cfg.EnableAuth {
 		// Strip caller-asserted identity only when it is replaced by a verified
 		// identity. In explicitly unauthenticated deployments, retain the legacy

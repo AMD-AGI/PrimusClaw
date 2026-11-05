@@ -145,7 +145,7 @@ func main() {
 	flag.IntVar(&wmPort, "wm-port", wmPort, "HTTP listen port for the internal Workload Manager API")
 	flag.IntVar(&routerCfg.MaxConcurrentRequests, "max-concurrent-requests", routerCfg.MaxConcurrentRequests, "Max concurrent Router requests")
 	flag.BoolVar(&routerCfg.EnableAuth, "enable-auth", routerCfg.EnableAuth,
-		"Require an identity provider credential on /v1 (IDENTITY_INTROSPECT_URL and client credentials)")
+		"Require an identity provider credential on /v1 (default true; IDENTITY_INTROSPECT_URL and client credentials)")
 	flag.StringVar(&deprecatedSafeAPIURL, "safe-api-url", "",
 		"Deprecated and ignored for authentication: /v1 credentials are checked by identity introspection")
 	flag.StringVar(&namespaceSelector, "namespace-selector", "",
@@ -206,8 +206,12 @@ func main() {
 	if v := os.Getenv("AGENT_SANDBOX_NAMESPACE"); v != "" {
 		wmCfg.Namespace = v
 	}
-	if v := os.Getenv("ENABLE_AUTH"); v == "true" {
+	// ENABLE_AUTH overrides --enable-auth when set. The flag defaults to on.
+	switch os.Getenv("ENABLE_AUTH") {
+	case "true":
 		routerCfg.EnableAuth = true
+	case "false":
+		routerCfg.EnableAuth = false
 	}
 	if deprecatedSafeAPIURL != "" {
 		fmt.Fprintln(os.Stderr,
