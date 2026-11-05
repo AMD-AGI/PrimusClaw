@@ -61,8 +61,27 @@ export interface WorkItemNeedsYouPayload extends AssistantEventBase {
 }
 
 /**
+ * A review the person asked of someone else, handed to the channel that carried their message (`review_start` with a reviewer, when
+ * that message declared `channel_context.handoffs: ["review_for_other"]`). It runs on the reviewer's own credentials, which only that
+ * channel holds, so the channel starts it itself (`POST /v1/assistant/reviews` with the reviewer's token and key) and tells the person
+ * how it went. Every field is the router's call as Claw checked it: the reviewer is someone the channel listed with this message, each
+ * pull request is one the person's message names. `requester_note` is the person's own message, to quote to the reviewer as untrusted.
+ */
+export interface AssistantReviewHandoff {
+  reviewer: { user_id: string; name: string };
+  prs: Array<{ owner: string; repo: string; number: number }>;
+  merge: boolean;
+  requester_note: string;
+}
+
+/** The name an `assistant.action` carries when it is a handoff rather than one of the channel's own commands. */
+export const REVIEW_HANDOFF_ACTION = "review_for_other";
+
+/**
  * A setting the channel offered beside the user's message, to be run by that channel as if the user typed it
- * (`channel_action`). The channel runs it only for a message it sent itself (`channel_message_id`), once per `event_id`.
+ * (`channel_action`); or, with `review` (and the action named `review_for_other`), a review asked of someone else, handed to the
+ * channel to start with that person's credentials. The channel runs it only for a message it sent itself (`channel_message_id`), once
+ * per `event_id`.
  */
 export interface AssistantActionPayload {
   type: "assistant.action";
@@ -74,6 +93,7 @@ export interface AssistantActionPayload {
   /** What the channel called that message when it sent it. */
   channel_message_id: string;
   action: { name: string; args: string };
+  review?: AssistantReviewHandoff;
 }
 
 export type AssistantEventPayload = AssistantSayPayload | WorkItemNeedsYouPayload | AssistantActionPayload;

@@ -28,6 +28,11 @@ record it.
 ## [Unreleased]
 
 ### Added
+- The assistant's `review_start` naming another person is handed to the channel that carried the message when that channel declares
+  it can start such a review with the reviewer's own credentials (`channel_context.handoffs: ["review_for_other"]`): an
+  `assistant.action` named `review_for_other` with a typed `review` (reviewer, pull requests, merge, the person's message), queued
+  once after the same grounding, and the router is answered `handed_off`. A channel that does not declare it, or a user with no
+  subscription to `assistant.action`, gets the `acting_as_credentials_required` refusal as before.
 - Archived sessions can be deleted on a schedule: `SESSION_RETENTION_DAYS` (default 0, off) makes the API's daily
   maintenance delete a session that many days after it was archived, through the same commit as a user's delete (queued
   messages dropped, turns, events and summaries stamped deleted) with its S3 workspace and checkpoint prefixes removed by

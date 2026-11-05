@@ -30,6 +30,9 @@
  *       theirs lets a held merge through, only the exact command, by the person it waits for
  *   S7  a review by someone else is refused from here (their credentials cannot be carried), and the router is told to send the user to
  *       the deployment's review agent (CLAW_GITHUB_REVIEW_AGENT_NAME)
+ *   S7b a review by someone else, from a channel that said it can be handed one (`channel_context.handoffs`), is handed to that channel
+ *       as typed data (an `assistant.action` carrying `review`), once, after the same grounding; nothing is made here, and a channel
+ *       that did not say so, or that takes no actions, gets the refusal of S7 as before
  *   R1  review_restart takes a review the user pointed at, and only a review
  *   R1b an item number is read whole: #11 does not point at #1, nor repo#1 at item #1
  *   C1  confirmation_answer allows only when the message is the exact approval command (批准 #<ref> / approve #<ref>) naming a
@@ -855,6 +858,87 @@ describe("assistant review tools", { skip }, () => {
       assert.ok(refused!.message.includes(`ask ${readGithubReviewSettings().agentName} for it`), "named as the deployment names its review agent");
       assert.equal(await count("claw_work_items"), 0, "nothing was made");
       assert.equal(await count("claw_sessions", "config ? 'acting_as'"), 0);
+    } finally {
+      rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
+        calls.start.push({ user, method, request });
+        return startAnswer(request);
+      }) as never;
+    }
+  });
+
+  test("S7b a review by someone else is handed, as typed data, to the channel that said it can start it with that person's credentials", async () => {
+    rt.reviewToolPorts.startReviews = saved.startReviews as never; // the real service: a handoff never reaches it
+    try {
+      const people = [{ name: "Wei Lei", user_id: "u-weilei" }];
+      const ctx = { ...DEFAULT_CTX, people, handoffs: ["review_for_other", "something_else"] };
+      const handoffs = async () => (await w.q(
+        "SELECT event_id, subscription_id, payload FROM claw_notification_outbox WHERE payload->>'type' = 'assistant.action' ORDER BY id",
+      )) as Recorded[];
+      const refusal = async (turn: Claims, args: Recorded) => {
+        try { await rt.reviewStart(turn, args as never); } catch (err) { return err as { code: string; message: string }; }
+        return assert.fail("accepted");
+      };
+
+      // A channel that takes no actions now: refused as before, nothing queued.
+      const unsubscribed = await userTurn(alice, "请 Wei Lei 审 254", { context: ctx });
+      const before = await refusal(unsubscribed, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: "u-weilei" });
+      assert.equal(before.code, "acting_as_credentials_required");
+      assert.equal(before.message, rt.askTheReviewAgent());
+      assert.equal((await handoffs()).length, 0);
+      await w.closeRun(unsubscribed.task_id);
+
+      const sub = await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
+      await w.subscribe(bob.userId, ["assistant.say", "assistant.action"]);
+
+      // A channel that did not say it can be handed a review (an older client): refused as before.
+      const older = await userTurn(alice, "请 Wei Lei 审 254", { context: { ...DEFAULT_CTX, people } });
+      assert.equal((await refusal(older, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: "u-weilei" })).code, "acting_as_credentials_required");
+      assert.equal((await handoffs()).length, 0);
+      await w.closeRun(older.task_id);
+
+      // The grounding comes first: a reviewer the channel did not list, a pull request the message does not name, a key's message.
+      const ungrounded = await userTurn(alice, "请 Wei Lei 审 254", { context: ctx });
+      assert.equal(await code(rt.reviewStart(ungrounded, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: "u-someone" })), "reviewer_not_in_message");
+      assert.equal(await code(rt.reviewStart(ungrounded, { prs: ["AMD-AGI/PrimusClaw#255"], merge: false, reviewer: "u-weilei" })), "pr_not_in_message");
+      await w.closeRun(ungrounded.task_id);
+      const viaKey = await userTurn(alice, "请 Wei Lei 审 254", { context: ctx, via: null });
+      assert.equal(await code(rt.reviewStart(viaKey, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: "u-weilei" })), "not_attended");
+      await w.closeRun(viaKey.task_id);
+      assert.equal((await handoffs()).length, 0, "nothing handed over for a call that was refused");
+
+      const text = "请 @Wei Lei 用 opus review 合入 AMD-AGI/PrimusClaw#254 和 #257";
+      const turn = await userTurn(alice, text, { context: ctx });
+      const out = await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254", "AMD-AGI/PrimusClaw#257"], merge: true, reviewer: "u-weilei", model: "opus" }) as Recorded;
+      assert.equal(out.ok, true);
+      assert.equal(out.handed_off, true);
+      assert.deepEqual([out.reviewer, out.prs, out.merge, out.set_aside], ["Wei Lei", ["AMD-AGI/PrimusClaw#254", "AMD-AGI/PrimusClaw#257"], true, ["model"]]);
+      assert.match(out.note, /nothing has started yet/);
+      // A replayed call in the same turn queues nothing more.
+      await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#257", "AMD-AGI/PrimusClaw#254"], merge: true, reviewer: "u-weilei" });
+      const rows = await handoffs();
+      assert.equal(rows.length, 1, "one event, to alice's channel only");
+      assert.equal(rows[0].subscription_id, sub);
+      assert.deepEqual({ ...rows[0].payload, occurred_at: "x" }, {
+        type: "assistant.action", event_id: out.event_id, occurred_at: "x", user_id: alice.userId, message_id: turn.mid,
+        channel_message_id: "act-1", action: { name: "review_for_other", args: "" },
+        review: {
+          reviewer: { user_id: "u-weilei", name: "Wei Lei" },
+          prs: [{ owner: "AMD-AGI", repo: "PrimusClaw", number: 254 }, { owner: "AMD-AGI", repo: "PrimusClaw", number: 257 }],
+          merge: true, requester_note: text,
+        },
+      });
+      assert.equal(await count("claw_work_items"), 0, "nothing was made here: the channel starts it");
+      assert.equal(await count("claw_sessions", "config ? 'acting_as'"), 0);
+      assert.equal(calls.start.length, 0);
+      // A review of the user's own account is not handed over: it starts here, as before.
+      const own = await userTurn(alice, "审一下 254", { context: ctx });
+      rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
+        calls.start.push({ user, method, request });
+        return startAnswer(request);
+      }) as never;
+      assert.equal(((await rt.reviewStart(own, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false })) as Recorded).handed_off, undefined);
+      assert.equal(calls.start.length, 1);
+      assert.equal((await handoffs()).length, 1);
     } finally {
       rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
         calls.start.push({ user, method, request });

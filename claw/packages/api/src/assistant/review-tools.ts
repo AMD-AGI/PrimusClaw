@@ -38,10 +38,10 @@ import { db, inTransaction, type Querier } from "../infra/db.js";
 import { deterministicEventId, enqueue, kickDelivery } from "../notifications/outbox.js";
 import { recordActionConfirm } from "./outbound.js";
 import { confirmationRef } from "./prompts.js";
-import type { AssistantActionPayload } from "../notifications/assistant-events.js";
+import { REVIEW_HANDOFF_ACTION, type AssistantActionPayload, type AssistantReviewHandoff } from "../notifications/assistant-events.js";
 import { decidedViaOf, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import {
-  parseRestartRequest, parseReviewRequest, restartReview, ReviewItemRefused, reviewItemsEnabled, startReviews,
+  parseRestartRequest, parseReviewRequest, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused, reviewItemsEnabled, startReviews,
 } from "./review-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { attendedTurn, ToolRefused } from "./tools.js";
@@ -250,6 +250,13 @@ export async function reviewStart(
         : "reviewer must be left out (the user), or be the user_id of someone in this message's people list",
     );
   });
+  // A review asked of someone else runs on their own credentials, which only the channel that carried the message can bring. When it
+  // said it can be handed one, it is: the channel starts it as the reviewer and tells the person how it went. Otherwise it is refused
+  // below, as before (`asRequesterOfOther`).
+  if (ready.actingAs !== ready.userId) {
+    const handed = await handOffReview(claims, prs, { userId: ready.actingAs, name: ready.actingAsName ?? "" }, args.merge);
+    if (handed) return { ...handed, ...(args.model || args.effort ? { set_aside: [...(args.model ? ["model"] : []), ...(args.effort ? ["effort"] : [])] } : {}) };
+  }
   // The body `POST /v1/assistant/reviews` would have been sent, read by the same parser: the same checks either way.
   // `merge=true` is the router's reading of a sentence, and natural language never approves a merge: the review's session merges only once
   // the acting user confirms that very merge (`mergeNeedsConfirmation`, held by the review tools; the card's button or `批准 #<ref>`).
@@ -264,6 +271,52 @@ export async function reviewStart(
     mergeNeedsConfirmation: true,
   }, stillActing(claims, ready.userId))));
   return { ok: true, items };
+}
+
+/**
+ * Hand a review asked of someone else to the channel that carried the person's message (`assistant.action` with `review`), when that
+ * message declared it can be handed one (`channel_context.handoffs`) and one of the person's channels takes actions. The grounding is
+ * done (the reviewer is someone the channel listed, each pull request one the message names, the person is here), and is asked again
+ * here, in the transaction that queues the event. Null when it cannot be handed over: the caller refuses it as it always did.
+ * Whether the reviewer lets anyone act for them, and every gate of the review, are the review service's, when the channel asks it.
+ */
+async function handOffReview(
+  claims: AssistantTokenClaims, prs: PrRef[], reviewer: { userId: string; name: string }, merge: boolean,
+): Promise<Record<string, unknown> | null> {
+  const queued = await inTransaction(async (q) => {
+    const { userId, message } = await attendedTurn(q, claims);
+    const channelMessageId = message.context.channel_message_id;
+    if (!message.context.handoffs.includes("review_for_other") || !channelMessageId) return null;
+    const subs = (await q(
+      `SELECT subscription_id FROM claw_notification_subscriptions
+        WHERE owner_user_id = $1 AND enabled AND 'assistant.action' = ANY(event_types)`,
+      [userId],
+    )).rows as Array<{ subscription_id: string }>;
+    if (!subs.length) return null;
+    const review: AssistantReviewHandoff = {
+      reviewer: { user_id: reviewer.userId, name: reviewer.name },
+      prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
+      merge,
+      requester_note: message.content.slice(0, REQUESTER_NOTE_MAX_CHARS),
+    };
+    // One handoff per message, reviewer, pull requests and merge: a replayed call queues nothing more.
+    const key = [reviewer.userId, merge ? "merge" : "review", ...review.prs.map((p) => `${p.owner}/${p.repo}#${p.number}`.toLowerCase()).sort()].join("\u0000");
+    const eventId = deterministicEventId("assistant.review_handoff", claims.mid, key);
+    const payload: AssistantActionPayload = {
+      type: "assistant.action", event_id: eventId, occurred_at: new Date().toISOString(), user_id: userId,
+      message_id: claims.mid, channel_message_id: channelMessageId, action: { name: REVIEW_HANDOFF_ACTION, args: "" }, review,
+    };
+    await enqueue(eventId, subs, payload, q);
+    return { eventId };
+  });
+  if (!queued) return null;
+  logger.info({ eventId: queued.eventId, prs: prs.length }, "assistant.review_handed_off");
+  void reviewToolPorts.kick().catch((err) => logger.error({ err }, "assistant.review_handoff_kick_failed"));
+  return {
+    ok: true, handed_off: true, event_id: queued.eventId, reviewer: reviewer.name || reviewer.userId,
+    prs: prs.map((p) => `${p.owner}/${p.repo}#${p.number}`), merge,
+    note: `nothing has started yet: the user's channel starts this review as ${reviewer.name || "that person"}, on their own credentials, and tells the user itself whether it started (or why not). Say only that it was handed over; do not say it has started, will merge, or name items.`,
+  };
 }
 
 /**
