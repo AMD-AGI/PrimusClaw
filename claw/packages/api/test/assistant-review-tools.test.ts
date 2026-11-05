@@ -432,6 +432,15 @@ describe("assistant review tools", { skip }, () => {
     ] as const) {
       assert.equal(rt.reviewerNamed(text, person, [alex1, alex2]), named, `${text} / ${person.user_id}`);
     }
+    // One person's email starts with another's name: "Alex" names neither of them.
+    const chen = p("Alex Chen", "u-chen", "alex@amd.com");
+    const wu = p("Alex Wu", "u-wu", "alex@vendor.com");
+    for (const [text, person, named] of [
+      ["Please Alex review #254", chen, false], ["Please Alex review #254", wu, false], ["Please Wu review #254", wu, true],
+      ["alex@vendor.com review #254", wu, true], ["alex@vendor.com review #254", chen, false],
+    ] as const) {
+      assert.equal(rt.reviewerNamed(text, person, [chen, wu]), named, `${text} / ${person.user_id}`);
+    }
     await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: alice.userId });
     assert.equal(calls.start[0].request.actingAs, null);
   });

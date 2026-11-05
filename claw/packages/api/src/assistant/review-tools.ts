@@ -170,25 +170,25 @@ export function modelGrounded(text: string, model: string): boolean {
 const HAN = /\p{Script=Han}/u;
 
 /**
- * Whether the person's own message names this person: their name (when no one else the channel listed has the same one), a part of it no
- * one else listed shares, their email or the part before its `@`, or their user id. Case aside; a Latin word only whole (`Lei` is not named by `Leila`), a Chinese name anywhere
- * in the text. Being listed beside the message is the channel's say that the person is there; this is the person's say that it is them.
+ * Whether the person's own message names this person by something that is theirs alone among the people the channel listed: their name,
+ * a part of it, their email, the part of it before the `@`, or their user id, each only when no one else listed has the same (so two
+ * people called Alex Chen, or `alex@a` and `alex@b`, are told apart only by what differs). Case aside; a Latin word only whole (`Lei` is
+ * not named by `Leila`), a Chinese name anywhere in the text. Being listed beside the message is the channel's say that the person is
+ * there; this is the person's say that it is them.
  */
 export function reviewerNamed(text: string, person: ChannelPerson & { user_id: string }, people: readonly ChannelPerson[]): boolean {
   const t = lower(text);
-  const appears = (raw: string): boolean => {
-    const s = lower(raw.trim());
-    if (s.length < 2) return false;
+  const appears = (s: string): boolean => {
     if (HAN.test(s)) return t.includes(s);
     return new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(s)}(?![\\p{L}\\p{N}_])`, "u").test(t);
   };
-  const parts = (name: string): string[] => name.split(/[\s,，、.·]+/).map((p) => lower(p)).filter((p) => p.length >= 2);
-  const others = people.filter((p) => p !== person && p.user_id !== person.user_id);
-  const othersParts = new Set(others.flatMap((p) => parts(p.name)));
-  const sameName = others.some((p) => lower(p.name.trim()) === lower(person.name.trim()));
-  const local = person.email?.split("@")[0] ?? "";
-  return (!sameName && appears(person.name)) || appears(person.user_id) || (!!person.email && appears(person.email)) || (local.length >= 3 && appears(local))
-    || parts(person.name).some((p) => !othersParts.has(p) && appears(p));
+  const words = (p: ChannelPerson): string[] => {
+    const local = p.email?.split("@")[0] ?? "";
+    return [p.name, ...p.name.split(/[\s,，、.·]+/), p.user_id ?? "", p.email ?? "", local.length >= 3 ? local : ""]
+      .map((w) => lower(w.trim())).filter((w) => w.length >= 2);
+  };
+  const theirs = new Set(people.filter((p) => p !== person && p.user_id !== person.user_id).flatMap(words));
+  return words(person).some((w) => !theirs.has(w) && appears(w));
 }
 
 /** The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased. */
