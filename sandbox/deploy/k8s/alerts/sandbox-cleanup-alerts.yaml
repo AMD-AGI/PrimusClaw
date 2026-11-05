@@ -48,8 +48,10 @@ spec:
       description: claw-brain counted session teardowns it could not finish in the
         last hour (claw_brain_session_cleanup_incomplete_total, by reason). The sandbox
         is left to the idle-reclaim path instead of being removed by the delete. no_platform_key
-        means the session owner has no linked SaFE key, so Claw could not call SaFE
-        to delete the workload. Check claw-brain logs for session.cleanup_incomplete
+        means the session still has a sandbox binding that carries no SaFE key (or the
+        hands KV could not be read), so Claw could not call SaFE to delete the workload;
+        a deleted session with no binding at all is not counted, since Claw holds no
+        handle to anything it could own. Check claw-brain logs for session.cleanup_incomplete
         and the Sandbox pods in global-cpu.
       runbook: https://github.com/AMD-AGI/PrimusClaw/blob/main/sandbox/deploy/k8s/alerts/sandbox-cleanup-alerts.yaml
       summary: Session deletes did not finish their sandbox teardown
