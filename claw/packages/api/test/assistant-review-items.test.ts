@@ -19,6 +19,8 @@
  *   M1  the state, from every confirmation status and every way a turn ends (table)
  *   M2  the state written to the item: entering "needs you" wakes the assistant once, done does not, a repeat writes nothing
  *   D1  an answer to a held write closes the item; a held write of a stopped review is denied whatever the answer
+ *   D1d a held write of a stopped review that was already answered (submitted, or being made) is not "denied as stopped"
+ *   D1e the caller's guard is asked with the owner's assistant row held (the reviewer's, for a review asked of them)
  *   G1  a review session is no worker: no role profile, no worker report at its turn's end, not an orphan to the task sweep
  *   G2  nothing the server queues reaches an acting session without the person's proof: work_send into a review is refused
  */
@@ -843,6 +845,45 @@ describe("assistant review items", { skip }, () => {
     await assert.rejects(reviewToolPorts.decide("alice", held, "allow", null, gone), /the turn ended/);
     assert.equal(decisions.length, 0);
     assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [held]))[0].status, "pending");
+  });
+
+  test("D1d a held write of a stopped review that was already answered keeps how it ended: not denied as stopped", async () => {
+    const it = await askedOfBob({ prs: [PR(302)], review_only: false });
+    const submitted = await confirmation(it.session_id, "submitted", "review", "bob");
+    assert.equal((await call("alice", `/v1/work-items/${it.item_id}/stop`, {})).status, 200, "the requester stops it");
+    // A merge allowed and being made when the card is pressed again (claimed after the stop's look).
+    const merging = await confirmation(it.session_id, "merging", "merge", "bob");
+    for (const id of [submitted, merging]) {
+      const r = await call("bob", `/v1/github-review/confirmations/${id}/decision`, { decision: "allow" });
+      assert.equal(r.status, 200);
+      assert.notEqual(r.body.reason, "review_stopped", "the stop denied nothing here");
+    }
+    const status = async (id: string) => (await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [id]))[0].status;
+    assert.deepEqual([await status(submitted), await status(merging)], ["submitted", "merging"], "neither is rewritten as denied");
+    // One still waiting is denied as stopped, for the reviewer only.
+    const late = await confirmation(it.session_id, "pending", "merge", "bob");
+    assert.deepEqual((await call("alice", `/v1/github-review/confirmations/${late}/decision`, { decision: "allow" })).body.error, "only_the_acting_user_can_decide");
+    const own = await call("bob", `/v1/github-review/confirmations/${late}/decision`, { decision: "allow" });
+    assert.deepEqual([own.body.status, own.body.reason, await status(late)], ["denied", "review_stopped", "denied"]);
+  });
+
+  test("D1e the caller's guard is asked with the owner's assistant row held: the reviewer's, for a review asked of them", async () => {
+    const user = (id: string) => ({ userId: id, userName: `Name ${id}`, platformKey: `pk-${id}`, virtualKey: `vk-${id}`, roles: ["default"] });
+    const seen: string[] = [];
+    const probe = (owner: string) => async () => {
+      try {
+        await w.q("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE NOWAIT", [owner]);
+        seen.push(`${owner}:free`);
+      } catch (err) {
+        seen.push(`${owner}:${(err as { code?: string }).code === "55P03" ? "held" : String(err)}`);
+      }
+    };
+    await ri.startReviews(user("alice"), "identity_token",
+      { ...ri.parseReviewRequest({ prs: [PR(260)], acting_as: "bob" }), actingAsUser: user("bob") }, probe("bob"));
+    const [asked] = await w.q("SELECT item_id FROM claw_work_items WHERE user_id = 'bob'");
+    await ri.restartReview(user("bob"), "identity_token", asked.item_id, ri.parseRestartRequest({}), probe("bob"));
+    await ri.startReviews(user("alice"), "identity_token", ri.parseReviewRequest({ prs: [PR(261)] }), probe("alice"));
+    assert.deepEqual(seen, ["bob:held", "bob:held", "alice:held"]);
   });
 
   test("G1 a review session is no worker: no role profile, no worker report at its turn's end, not an orphan to the task sweep", async () => {

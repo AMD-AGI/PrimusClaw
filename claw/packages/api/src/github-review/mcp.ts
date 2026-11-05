@@ -187,8 +187,8 @@ export async function decideConfirmation(
   if (await confirmationOfStoppedReview(id)) {
     const row = await getConfirmation(database, id);
     if (row && row.actorUserId !== deciderUserId) return { http: 403, body: { ok: false, error: "only_the_acting_user_can_decide" } };
-    await denyForStoppedReview(id);
-    return { http: 200, body: { ok: true, status: "denied", reason: "review_stopped" } };
+    // Answered meanwhile: `decide` below says how it ended, instead of a stop that denied nothing.
+    if (await denyForStoppedReview(id)) return { http: 200, body: { ok: true, status: "denied", reason: "review_stopped" } };
   }
   // Asked again where the answer is given (`decide` claims the row, then asks): a stop that lands between the two checks decides nothing.
   const answer = await service.decide(deciderUserId, id, decision, via, guard ? () => inTransaction(guard) : undefined);

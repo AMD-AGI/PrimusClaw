@@ -20,9 +20,9 @@ export const ROUTER_PROMPT_VERSION = "router-v4";
 /**
  * The router's prompt with the review and settings tools (`CLAW_ASSISTANT_TOOLS=on`): router-v4 and `ROUTER_REVIEW_PROMPT`
  * (v6: v5 with an allow only on the user's exact approval command, and a channel action not typed as its command put to the user
- * as a button).
+ * as a button; v7: v6 with a review by someone else refused here and sent to Clawy).
  */
-export const ROUTER_REVIEW_PROMPT_VERSION = "router-v6";
+export const ROUTER_REVIEW_PROMPT_VERSION = "router-v7";
 
 /** The assistant's MCP server, which is what Brain puts before each of its tools' names. */
 export const ASSISTANT_MCP_SERVER = "assistant";
@@ -66,7 +66,7 @@ Reply in the language of the user's latest message, even when item titles or rep
 
 export const ROUTER_REVIEW_PROMPT = `Reviews and settings
 These tools act for the user, with their GitHub account or their settings. They work only in a turn that answers a message the user just sent signed in; in a turn a ${WORK_EVENT_PREFIX} report started they are refused, so tell the user what you would do and let them say it.
-- review_start(prs, merge, reviewer?, model?, effort?): start reviewing pull requests, one review item each. prs are owner/repo#number, and only numbers the user wrote. At most 10 in one message: when the user names more, ask which to start with, and never split them over several calls. When the user gives only a number, use the one repository under Channel repos, else the one repository of their recent review items; if there is none or more than one, ask which repository. merge is true only when the user clearly asked for a merge (合入, 合并, merge, 审完合, approve and merge); review, check, 看一下, 审一下, 只审 mean merge=false; when unsure, ask in one short say. reviewer: leave it out for the user; for another person pass their user_id from People in this message (the person must have one). model only when the user named one (用 opus → opus); effort only when they asked.
+- review_start(prs, merge, reviewer?, model?, effort?): start reviewing pull requests, one review item each. prs are owner/repo#number, and only numbers the user wrote. At most 10 in one message: when the user names more, ask which to start with, and never split them over several calls. When the user gives only a number, use the one repository under Channel repos, else the one repository of their recent review items; if there is none or more than one, ask which repository. merge is true only when the user clearly asked for a merge (合入, 合并, merge, 审完合, approve and merge); review, check, 看一下, 审一下, 只审 mean merge=false; when unsure, ask in one short say. reviewer: leave it out for the user. A review by another person (their user_id from People) runs on their own credentials, which you cannot carry, so it is refused with acting_as_credentials_required: tell the user to ask Clawy for it (@Clawy, naming the reviewer), or to have it reviewed as themselves. model only when the user named one (用 opus → opus); effort only when they asked.
 - review_restart(item_id, model?, merge?, effort?): the user wants a review changed (another model, merge after all, review only) or run again. It stops the old item and starts a new one with the rest unchanged. It is refused once merged.
 - work_stop(item_id, reason) stops a review as well (like the tools above, only in a turn that answers the user), and cancels what waits for confirmation in it. If it answers merge_in_progress or already_merged, tell the user exactly that.
 - work_send does not reach a review: use review_restart.
@@ -147,9 +147,27 @@ export function formatManifestLine(item: ManifestItem): string {
   return `${head} ${data.join(", ")}`;
 }
 
-export function renderRouterSystem(items: readonly ManifestItem[]): string {
+/** A review the user asked of someone else, as their router is shown it: its item_id and the four facts (`requester-view.ts`). */
+export interface AskedOfOtherLine {
+  itemId: string;
+  view: { status: string; pr_url: string | null; verdict: string | null; merged: boolean };
+}
+
+export function formatAskedOfOtherLine(a: AskedOfOtherLine): string {
+  const v = a.view;
+  return `- item_id: ${a.itemId} | ${v.pr_url ? quoted(v.pr_url) : "(no pull request)"} | status: ${oneLine(v.status)} | verdict: ${v.verdict ? oneLine(v.verdict) : "none yet"} | merged: ${v.merged ? "yes" : "no"}`;
+}
+
+/**
+ * Reviews the user asked others to do: read-only entries, after the user's own items. They are the reviewer's work, not on the user's
+ * board and without a number of theirs, so they are named by item_id only; only these four facts are known of them.
+ */
+export const ASKED_OF_OTHERS_HEADER = "Reviews the user asked someone else to do (read-only, and not the user's own items: no number, no work_send or review_restart; work_recall shows the same four facts, and work_stop stops one when the user asks, naming its pull request):";
+
+export function renderRouterSystem(items: readonly ManifestItem[], askedOfOthers: readonly AskedOfOtherLine[] = []): string {
   const list = items.length ? items.map(formatManifestLine).join("\n") : "(no work items yet)";
-  return `${ROUTER_PROMPT}\n\nWork items (open ones, and ones closed in the last day):\n${UNTRUSTED_PREAMBLE}\n${UNTRUSTED_OPEN}\n${list}\n${UNTRUSTED_CLOSE}`;
+  const own = `${ROUTER_PROMPT}\n\nWork items (open ones, and ones closed in the last day):\n${UNTRUSTED_PREAMBLE}\n${UNTRUSTED_OPEN}\n${list}\n${UNTRUSTED_CLOSE}`;
+  return askedOfOthers.length ? `${own}\n\n${ASKED_OF_OTHERS_HEADER}\n${askedOfOthers.map(formatAskedOfOtherLine).join("\n")}` : own;
 }
 
 /** The short form of a confirmation id the user is shown and types back (`批准 #a3f9c2`): its first six hex digits, lower-cased. */

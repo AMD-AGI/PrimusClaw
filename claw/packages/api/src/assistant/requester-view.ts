@@ -86,3 +86,36 @@ export async function freezeRequesterView(q: StatementRunner, itemId: string): P
     [itemId, JSON.stringify(view)],
   );
 }
+
+/**
+ * A review item someone else owns that this user asked for, or null. Named only by its item_id: an item's number is its owner's, and
+ * the same number on the requester's own board is another item.
+ */
+export async function requestedItemOf(q: StatementRunner, userId: string, itemId: string): Promise<Record<string, unknown> | null> {
+  const row = (await q.query(
+    "SELECT * FROM claw_work_items WHERE item_id = $1 AND kind = 'review' AND params->>'requested_by' = $2 AND user_id <> $2",
+    [itemId, userId],
+  )).rows[0] as Record<string, unknown> | undefined;
+  return row ?? null;
+}
+
+/** One review the user asked of someone else, as their own assistant may know it: its item_id and the four facts, nothing more. */
+export interface AskedOfOther { item_id: string; view: RequesterView }
+
+/**
+ * The reviews this user asked of others that are open, or closed within `closedWindow`, newest first, at most `limit`. A closed one is
+ * its frozen `params.requester_view`; an open one has none yet and is the four facts as they are now. Nothing else of the item (its
+ * title, summary, question, the reviewer's words, the session) is read, so nothing the reviewer's session wrote reaches the requester.
+ */
+export async function askedOfOthers(q: StatementRunner, userId: string, closedWindow: string, limit: number): Promise<AskedOfOther[]> {
+  const rows = (await q.query(
+    `SELECT item_id, board_state, outcome, worker_session_id, params FROM claw_work_items
+      WHERE kind = 'review' AND params ? 'requested_by' AND params->>'requested_by' = $1 AND user_id <> $1
+        AND (board_state <> 'done' OR closed_at > NOW() - $2::interval)
+      ORDER BY updated_at DESC LIMIT $3`,
+    [userId, closedWindow, limit],
+  )).rows as Array<Record<string, unknown>>;
+  const out: AskedOfOther[] = [];
+  for (const row of rows) out.push({ item_id: String(row.item_id), view: await requesterViewOf(q, row) });
+  return out;
+}

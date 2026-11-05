@@ -63,7 +63,7 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims): void
     {
       prs: z.array(z.string()).describe("Each as owner/repo#number or its URL; only numbers the user wrote."),
       merge: z.boolean().describe("true only when the user clearly asked to merge after the review; otherwise false (review only)."),
-      reviewer: z.string().optional().describe("Whose GitHub account reviews: leave out for the user; else the user_id of someone in People."),
+      reviewer: z.string().optional().describe("Whose GitHub account reviews: leave out for the user. Someone else's (a user_id from People) is refused as acting_as_credentials_required: the user asks Clawy for that."),
       model: z.string().optional().describe("Only when the user named a model."),
       effort: z.enum(["low", "medium", "high"]).optional().describe("Only when the user asked for one."),
     },

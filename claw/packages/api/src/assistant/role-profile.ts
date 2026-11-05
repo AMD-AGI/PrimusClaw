@@ -27,8 +27,9 @@ import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import {
   ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_PROMPT_VERSION, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION,
-  WORK_EVENT_PREFIX, renderObserverSystem, renderReviewContext, renderRouterSystem, renderWorkerSystem, type ManifestItem,
+  WORK_EVENT_PREFIX, renderObserverSystem, renderReviewContext, renderRouterSystem, renderWorkerSystem, type AskedOfOtherLine, type ManifestItem,
 } from "./prompts.js";
+import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
 import { startWorkerRun } from "./run-started.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
@@ -109,6 +110,11 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
     pendingQuestion: (r.pending_question as string | null) ?? null,
     ...(r.kind === "review" ? { review: reviewOf(r.params) } : {}),
   }));
+}
+
+/** The reviews the user asked of others, in the same window as their own items: the four facts each, read-only. */
+export async function askedOfOthersManifest(userId: string): Promise<AskedOfOtherLine[]> {
+  return (await askedOfOthers(db, userId, MANIFEST_CLOSED_WINDOW, MANIFEST_MAX_ITEMS)).map((a) => ({ itemId: a.item_id, view: a.view }));
 }
 
 function reviewOf(params: unknown): NonNullable<ManifestItem["review"]> {
@@ -201,7 +207,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // Only the assistant's own server: every other one is a connection made and a tool never offered.
     task.mcp_servers = {};
     for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
-    withSystemAppend(task, renderRouterSystem(await routerManifest(role.userId)));
+    withSystemAppend(task, renderRouterSystem(await routerManifest(role.userId), await askedOfOthersManifest(role.userId)));
     if (CLAW_ASSISTANT_TOOLS) {
       const review = await reviewContextFor(role.userId, sessionId, messageId);
       const ctx = review.message?.context;

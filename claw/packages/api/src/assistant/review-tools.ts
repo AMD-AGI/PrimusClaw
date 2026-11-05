@@ -248,14 +248,35 @@ export async function reviewStart(
     );
   });
   // The body `POST /v1/assistant/reviews` would have been sent, read by the same parser: the same checks either way.
-  const items = await asTool(async () => reviewToolPorts.startReviews(ready.signedIn.user, ready.signedIn.method, parseReviewRequest({
+  const items = await asTool(async () => asRequesterOfOther(ready.actingAs !== ready.userId, () => reviewToolPorts.startReviews(ready.signedIn.user, ready.signedIn.method, parseReviewRequest({
     prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
     ...(ready.actingAs !== ready.userId ? { acting_as: ready.actingAs } : {}),
     ...(ready.actingAsName ? { acting_as_name: ready.actingAsName } : {}),
     ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
     review_only: !args.merge,
-  }), stillActing(claims, ready.userId)));
+  }), stillActing(claims, ready.userId))));
   return { ok: true, items };
+}
+
+/**
+ * A review asked of someone else runs on that person's own credentials (their delegated token and their own key), which only the
+ * asking service brings with the request (`POST /v1/assistant/reviews`, `x-acting-as-token` / `x-acting-as-api-key`). The assistant
+ * holds the requester's keys, never the reviewer's, so the review service refuses such a review from here
+ * (`acting_as_credentials_required`) before it looks at anything else, and this is deliberate: the refusal stays, and the router is
+ * told what the user can do instead, which is to ask through Clawy, the service that carries the reviewer's credentials.
+ */
+export const ASK_THROUGH_CLAWY =
+  "a review as someone else runs on that person's own GitHub credentials, which this assistant cannot carry: nothing was started. Tell the user to ask Clawy for it (for example @Clawy in the pull request or the chat, naming the reviewer), or to start the review as themselves";
+
+async function asRequesterOfOther<T>(forOther: boolean, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if (forOther && err instanceof ReviewItemRefused && err.code === "acting_as_credentials_required") {
+      throw new ReviewItemRefused(err.status, err.code, ASK_THROUGH_CLAWY, err.data);
+    }
+    throw err;
+  }
 }
 
 /** The user's review items the router could mean, newest first: the open ones and those closed in the last day. */

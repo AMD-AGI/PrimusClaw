@@ -27,7 +27,7 @@ import { checkSessionCreate, type AttendedProof } from "../github-review/acting-
 import { isValidPrRef, type PrRef } from "../github-review/github.js";
 import type { ReviewActor, ToolOutcome } from "../github-review/service.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
-import { closeConfirmationsForStop, finishConfirmation } from "../github-review/store.js";
+import { closeConfirmationsForStop } from "../github-review/store.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { queuedMessageId, SWEEPABLE_RUN_STATUSES, stopSessionRuns } from "../tasks/chat-run.js";
@@ -476,10 +476,13 @@ export async function startReviews(
   const created = await inReviewTransaction(owner.userId, requestedBy, plans.map((p) => p.pr), async (query) => {
     const q = { query };
     await takeCreateTurn(query);
-    // The caller's own condition, asked in the transaction that writes (the assistant's tools: the turn is still live).
-    if (guard) await guard(query);
-    // The assistant row, as `insertWorkItem` takes it.
+    // The owner's assistant row, as `insertWorkItem` takes it: for a review asked of someone else, X's row, not the caller's.
     await query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [owner.userId]);
+    // The caller's own condition (the assistant's tools: the turn is still live), asked once X's row is held and before the open
+    // reviews and the limits are counted again, so nothing it waits on can change what those counts see.
+    if (guard) await guard(query);
+    // TODO(#272, C1b): a review that continues an earlier one may continue only a record of the same owner (`owner.userId`) and the
+    // same `requested_by` (`requestedBy`, null for the owner's own), and must choose it here: after `guard`, in this transaction.
     for (const plan of plans) await refuseIfReviewed(q, owner.userId, requestedBy, plan.pr);
     await refuseOverLimit(q, actingAs, plans.length);
     const out: CreatedReview[] = [];
@@ -545,8 +548,9 @@ export async function restartReview(
   const result = await inReviewTransaction(user.userId, requestedBy, [was.pr], async (query) => {
     const q = { query };
     await takeCreateTurn(query);
-    if (guard) await guard(query);
+    // The owner's assistant row first, then the caller's condition, then the item and the counts (as `startReviews`).
     await query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [user.userId]);
+    if (guard) await guard(query);
     const row = (await query(
       "SELECT board_state, worker_session_id, seq FROM claw_work_items WHERE item_id = $1 AND user_id = $2 FOR UPDATE", [itemId, user.userId],
     )).rows[0] as { board_state: string; worker_session_id: string; seq: number } | undefined;
@@ -828,14 +832,16 @@ export async function syncReviewItemOfSession(sessionId: string): Promise<boolea
 }
 
 /**
- * Whether a confirmation was held by the session of a review item its requester stopped. Such a write is not made whatever the answer:
- * the stop denied what was pending then, and this is the one that was opened by a tool call still in flight when the stop came.
+ * Whether a confirmation still waiting for an answer was held by the session of a review item that was stopped (by its owner, or by the
+ * person who asked for it). Such a write is not made whatever the answer: the stop denied what was pending then, and this is the one that
+ * was opened by a tool call still in flight when the stop came. One already answered is not this: an approval submitted before the stop,
+ * or a write being made right now, keeps its own state, and the answer to it says how it ended rather than that the stop denied it.
  */
 export async function confirmationOfStoppedReview(confirmationId: string): Promise<boolean> {
   if (!CLAW_ASSISTANT_REVIEW_ITEMS) return false;
   const r = await db.query(
     `SELECT 1 FROM claw_github_confirmations c JOIN claw_work_items w ON w.worker_session_id = c.session_id
-      WHERE c.confirmation_id = $1 AND w.kind = 'review' AND w.outcome = 'stopped'`,
+      WHERE c.confirmation_id = $1 AND c.status = 'pending' AND w.kind = 'review' AND w.outcome = 'stopped'`,
     [confirmationId],
   );
   return r.rows.length > 0;
@@ -850,9 +856,18 @@ export async function reviewSessionStopped(sessionId: string): Promise<boolean> 
   return r.rows.length > 0;
 }
 
-/** Deny one held write of a stopped review, as the stop would have. */
-export async function denyForStoppedReview(confirmationId: string): Promise<void> {
-  await finishConfirmation(db, confirmationId, "denied", "stopped", { by: "requester", reason: "stopped" });
+/**
+ * Deny one held write of a stopped review, as the stop would have: only while it still waits (never one being made right now). False
+ * when it no longer waited, so the caller answers with how it did end.
+ */
+export async function denyForStoppedReview(confirmationId: string): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_github_confirmations
+        SET status = 'denied', decided_at = COALESCE(decided_at, NOW()), decided_by = COALESCE(decided_by, 'stopped'), result = $2::jsonb
+      WHERE confirmation_id = $1 AND status = 'pending' RETURNING confirmation_id`,
+    [confirmationId, JSON.stringify({ by: "requester", reason: "stopped" })],
+  );
+  return r.rows.length > 0;
 }
 
 /**

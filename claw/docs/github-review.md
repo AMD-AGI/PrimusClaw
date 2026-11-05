@@ -171,7 +171,21 @@ They act only for the person, never for a key or a report:
   draws no button shows the text, which tells the user to type the command.
 
 The review is then made by the same `startReviews` / `restartReview` as the routes above, with the person's message standing
-for their sign-in, so every check above applies unchanged.
+for their sign-in, so every check above applies unchanged. Their `guard` (the turn is still live and still answers that message) is
+asked in the transaction that writes, once the owner's assistant row is held and before the open reviews and limits are counted again.
+
+A review asked of someone else meets the assistant in three places:
+
+- `review_start` naming another person (`reviewer`) is refused with `acting_as_credentials_required`: such a review runs on the
+  reviewer's own credentials, which only the asking service brings (`x-acting-as-token`, `x-acting-as-api-key`), and the assistant
+  holds the requester's keys only. The refusal tells the router to send the user to Clawy.
+- The requester's assistant lists the reviews they asked of others, open or closed in the last day, read-only after their own items:
+  the item_id and the four facts (`params.requester_view` once closed), nothing else. `work_recall` on one answers the same four facts
+  whatever detail is asked, and does not count as reading what a worker wrote. `work_stop` on one stops it as the requester's
+  `POST /v1/work-items/:id/stop` does, only in a turn that answers the requester's signed-in message naming its pull request, and
+  answers the four facts, frozen into the item as it closes.
+- A held write of a stopped review is denied as stopped (`review_stopped`) only while it still waits; one already answered (an approval
+  submitted before the stop, a merge being made) keeps its state, and a later answer to it says how it ended.
 
 ## The tools
 

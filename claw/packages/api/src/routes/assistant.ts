@@ -52,7 +52,7 @@ import {
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_OBSERVE, CLAW_ASSISTANT_REVIEW_ITEMS, CLAW_GITHUB_REVIEW_ENABLED,
 } from "../config.js";
 import { asRequesterAnswer } from "../assistant/review-items.js";
-import { requesterViewOf } from "../assistant/requester-view.js";
+import { requestedItemOf, requesterViewOf } from "../assistant/requester-view.js";
 import { verifyActingAsCredentials } from "../auth/identity-token.js";
 import { credentialVerifier } from "../auth/middleware.js";
 import { db } from "../infra/db.js";
@@ -84,13 +84,7 @@ function header(req: FastifyRequest, name: string): string {
 }
 
 /** A review item someone else owns that this user asked for, or null. */
-async function requestedItem(userId: string, itemId: string): Promise<Record<string, unknown> | null> {
-  const row = (await db.query(
-    "SELECT * FROM claw_work_items WHERE item_id = $1 AND kind = 'review' AND params->>'requested_by' = $2 AND user_id <> $2",
-    [itemId, userId],
-  )).rows[0] as Record<string, unknown> | undefined;
-  return row ?? null;
-}
+const requestedItem = (userId: string, itemId: string): Promise<Record<string, unknown> | null> => requestedItemOf(db, userId, itemId);
 
 function answer(reply: FastifyReply, result: DecisionResult) {
   if (result.status === "not_found") return reply.status(404).send({ ok: false, error: "not_found" });

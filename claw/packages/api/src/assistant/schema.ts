@@ -72,6 +72,11 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
        lower(params->'pr'->>'owner'), lower(params->'pr'->>'repo'), (params->'pr'->>'number'))
      WHERE kind = 'review' AND board_state <> 'done'`,
   );
+  // The reviews a person asked of others, which their own assistant lists read-only (`requester-view.ts`) on every turn.
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_work_items_requested_by ON claw_work_items((params->>'requested_by'), updated_at DESC)
+     WHERE kind = 'review' AND params ? 'requested_by'`,
+  );
 
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_work_item_events (
