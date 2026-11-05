@@ -10,6 +10,8 @@
  * request, and what it permits is what its role is given: a router the five tools of a conversation (and, with
  * `CLAW_ASSISTANT_TOOLS=on`, the five that act for the person), a worker the one tool it reports through, an
  * observer the router's tools and `pass`, every one of which only records.
+ * With GitHub events on (`github-events.ts`), a router may also have an item watch a pull request, and a worker may
+ * answer an event on it.
  *
  * Stateless, like `/mcp`: a server is built per request, because what it offers depends on who is asking.
  */
@@ -22,6 +24,7 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS 
 import { ASSISTANT_MCP_PATH } from "./role-profile.js";
 import { PASS_REASONS, SAY_MAX_CHARS } from "./prompts.js";
 import { REPORT_KINDS } from "./work-items.js";
+import { githubEventsEnabled, prReply, REPLY_BODY_MAX, workSubscribe } from "./github-events.js";
 import { type AssistantTokenClaims, verifyAssistantToken } from "./token.js";
 import {
   report, say, ToolRefused, workCreate, workRecall, workSend, workStop, type RecallDetail,
@@ -162,6 +165,15 @@ export function createAssistantMcpServer(claims: AssistantTokenClaims, reviewToo
       { item_id: z.string().describe(ITEM_ID_PARAM), detail: z.enum(["summary", "reports", "worker_tail"]) },
       (args) => answer(claims, "work_recall", () => workRecall(claims, { item_id: args.item_id, detail: args.detail as RecallDetail })),
     );
+    if (githubEventsEnabled()) {
+      mcp.tool(
+        "work_subscribe",
+        "Have an item watch a GitHub pull request: new comments, reviews and failed CI on it go straight to the item's worker. "
+        + "Use it when the user wants an item to follow up on a pull request. It never lets the worker answer on GitHub without the user's approval.",
+        { item_id: z.string().describe(ITEM_ID_PARAM), pr: z.string().describe("The pull request: owner/repo#123 or its https://github.com URL.") },
+        (args) => answer(claims, "work_subscribe", () => workSubscribe(claims, { item_id: args.item_id, pr: args.pr })),
+      );
+    }
     if (reviewTools) registerReviewTools(mcp, claims);
   } else {
     mcp.tool(
@@ -180,6 +192,18 @@ export function createAssistantMcpServer(claims: AssistantTokenClaims, reviewToo
       },
       (args) => answer(claims, "report", () => report(claims, args)),
     );
+    if (githubEventsEnabled()) {
+      mcp.tool(
+        "pr_reply",
+        "Answer one GitHub event from a [github_event] message on its pull request, as the user: under the review comment it answers, "
+        + "or as a comment on the pull request. At most once per event, and only where the user allowed it.",
+        {
+          event_id: z.string().describe("The event_id from the [github_event] message."),
+          body: z.string().describe(`The answer, in Markdown; at most ${REPLY_BODY_MAX} characters.`),
+        },
+        (args) => answer(claims, "pr_reply", () => prReply(claims, args)),
+      );
+    }
   }
   return mcp;
 }

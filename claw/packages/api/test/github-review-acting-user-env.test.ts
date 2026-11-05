@@ -435,6 +435,7 @@ test("E9 every place in the source that reads the vault or puts it on a request 
     "tasks/template-renderer.ts": "a template reads the task's input, which holds the vault of a run made before the session was marked; the render context leaves it out for a session that withholds its keys (E8b)",
     "tasks/run-spec.ts": "strips it from a run's stored spec, for every session",
     "github-review/review-profile.ts": "only removes it: the fixed profile of a review asked of someone else takes it off every turn and task (github-review-requested-review.test.ts, P1)",
+    "assistant/github-events.ts": "pr_reply reads the owner's vault only to refuse an answer that would publish one of its values; nothing read is put on a request or a turn, and a review item (acting session) never has a subscription",
     "crypto/user-env.ts": "the vault's own reader and cipher",
     "routes/user-env-vars.ts": "the owner's routes to edit the vault, not a request to Brain",
     "infra/db.ts": "the column of the queued message and the table of the vault, as schema",

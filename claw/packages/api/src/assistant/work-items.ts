@@ -461,7 +461,8 @@ export async function stopWorkItem(input: {
  */
 export async function reopenWorkItem(
   q: StatementRunner,
-  input: { userId: string; itemId: string; text?: string },
+  /** `source` is who sent it back: the router forwarding the user's words, or a GitHub event on a pull request it watches. */
+  input: { userId: string; itemId: string; text?: string; source?: "router" | "github" },
 ): Promise<WorkItemView | null> {
   const rows = (await q.query(
     `WITH upd AS (
@@ -472,11 +473,11 @@ export async function reopenWorkItem(
     RETURNING ${ITEM_COLUMNS}, generation
      ), ev AS (
        INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
-       SELECT item_id, 'progress', 'router', generation, $3 FROM upd
+       SELECT item_id, 'progress', $4, generation, $3 FROM upd
     RETURNING id
      )
      SELECT upd.* FROM upd, ev`,
-    [input.itemId, input.userId, input.text ?? null],
+    [input.itemId, input.userId, input.text ?? null, input.source ?? "router"],
   )).rows as Array<Record<string, unknown>>;
   return rows[0] ? itemView(rows[0]) : null;
 }
