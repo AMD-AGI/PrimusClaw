@@ -30,6 +30,11 @@ function getClient(): SafeClient | null {
   return _client;
 }
 
+/** The SaFE client the credential paths verify with, for a route that verifies a second person's key (`verifyActingAsCredentials`). */
+export function credentialVerifier(): SafeClient | null {
+  return getClient();
+}
+
 function isDevMode(): boolean {
   return ["dev", "development", "local"].includes(APP_ENV.toLowerCase());
 }

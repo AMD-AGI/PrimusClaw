@@ -22,14 +22,16 @@ import {
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
+import { reviewProfileSession } from "../github-review/session-tools.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import { reviewMemoryBlock, routerMemoryBlock, workerMemoryBlock } from "./memory-tools.js";
 import {
   ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_PROMPT_VERSION, ROUTER_REVIEW_PROMPT_VERSION,
   WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderObserverSystem, renderReviewContext, renderRouterSystem, renderWorkerSystem,
-  type ManifestItem,
+  type AskedOfOtherLine, type ManifestItem,
 } from "./prompts.js";
+import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
 import { startWorkerRun } from "./run-started.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
@@ -77,8 +79,13 @@ export async function sessionRole(sessionId: string): Promise<SessionRole | null
   return { role: "worker", userId: row.user_id, itemId: row.item_id as string, seq: Number(row.seq), title: row.title as string };
 }
 
-/** Whether a turn of this session must skip skill selection, which costs an LLM call a router (or an observer) has no use for. */
+/**
+ * Whether a turn of this session must skip skill selection: a router's or an observer's, which costs an LLM call they have no use for, and a review someone
+ * asked of the owner, whose fixed profile has none of the owner's skills (`github-review/review-profile.ts`). Both skill entries (the
+ * immediate turn and the queued one) ask here.
+ */
 export async function skipsSkillSelection(sessionId: string): Promise<boolean> {
+  if (await reviewProfileSession(sessionId)) return true;
   if (!CLAW_ASSISTANT_ENABLED) return false;
   const role = (await sessionRole(sessionId))?.role;
   return role === "router" || role === "observer";
@@ -105,6 +112,11 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
     pendingQuestion: (r.pending_question as string | null) ?? null,
     ...(r.kind === "review" ? { review: reviewOf(r.params) } : {}),
   }));
+}
+
+/** The reviews the user asked of others, in the same window as their own items: the four facts each, read-only. */
+export async function askedOfOthersManifest(userId: string): Promise<AskedOfOtherLine[]> {
+  return (await askedOfOthers(db, userId, MANIFEST_CLOSED_WINDOW, MANIFEST_MAX_ITEMS)).map((a) => ({ itemId: a.item_id, view: a.view }));
 }
 
 function reviewOf(params: unknown): NonNullable<ManifestItem["review"]> {
@@ -202,7 +214,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // Only the assistant's own server: every other one is a connection made and a tool never offered.
     task.mcp_servers = {};
     for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
-    withSystemAppend(task, renderRouterSystem(await routerManifest(role.userId)));
+    withSystemAppend(task, renderRouterSystem(await routerManifest(role.userId), await askedOfOthersManifest(role.userId)));
     if (CLAW_ASSISTANT_TOOLS) {
       const review = await reviewContextFor(role.userId, sessionId, messageId);
       const ctx = review.message?.context;

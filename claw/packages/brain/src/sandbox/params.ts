@@ -18,6 +18,7 @@ import type { ExecuteRequest, SandboxSpec, SandboxSpecCreate, SandboxSpecUse } f
 import { TOPOLOGY_HANDOFF_SCHEMA, type TopologyHandoffV1 } from "@claw/protocol";
 import { LEGACY_TOPOLOGY_ENV } from "../config.js";
 import { normalizeWorkloadResourcesEntry } from "./workload-resources.js";
+import { isReviewProfile } from "../agent/review-profile.js";
 // Type-only: avoids a runtime import cycle (ensure.ts -> sandbox/ensure-hands.ts -> sandbox/params.ts).
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxFiles, type SandboxExec, type SandboxFile } from "./multi-node/sandbox-key.js";
@@ -68,6 +69,19 @@ export interface EffectiveSandboxParams {
  * since SaFE workload create cannot proceed without an image.
  */
 export function resolveSandboxAction(request: ExecuteRequest): SandboxAction {
+  const action = resolveSandboxActionFromRequest(request);
+  // A requested review's sandbox is a CPU sandbox whatever the request names (`sandbox_profile: "review"`): every GPU key (`gpu`, and a
+  // vendor's `<domain>/gpu`) is dropped here, where every provider (SaFE and Kubernetes alike) and the spec fingerprint read the resources.
+  if (action.kind === "create" && isReviewProfile(request)) action.params.resources = withoutGpuKeys(action.params.resources);
+  return action;
+}
+
+/** The resources without any GPU key. */
+export function withoutGpuKeys<T extends Record<string, unknown>>(resources: T): T {
+  return Object.fromEntries(Object.entries(resources).filter(([k]) => !/gpu/i.test(k))) as T;
+}
+
+function resolveSandboxActionFromRequest(request: ExecuteRequest): SandboxAction {
   const spec = request.sandbox_spec;
 
   if (spec === "none") return { kind: "none" };

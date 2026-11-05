@@ -13,6 +13,7 @@ import {
   type HandsRecoveryAllowance,
   type RecreateHandsResult,
 } from "../agent/index.js";
+import type { TurnPool } from "../agent/agent-loop.js";
 import type { NatsEmitter } from "../events/emitter.js";
 import {
   HandsClient, isHandsNetworkError,
@@ -54,6 +55,7 @@ import {
 } from "../config.js";
 import { ensureHands } from "../sandbox/ensure-hands.js";
 import { isMultiNodeRequest } from "../sandbox/multi-node/prompt-flags.js";
+import { applyReviewProfileBackstop, reviewTurnBudgetRefusal } from "../agent/review-profile.js";
 import { gpuWorkspaceFor } from "../sandbox/workspace-select.js";
 import { getMultiNodeProvider, multiNodeAvailable } from "../sandbox/multi-node/factory.js";
 import type { MultiNodeContext } from "../sandbox/multi-node/types.js";
@@ -987,8 +989,32 @@ export async function refuseUnsupportedMode(
   lockKey: string,
 ): Promise<boolean> {
   if (request.mode === undefined || request.mode === "llm" || request.mode === "script" || request.mode === "app") return false;
-  const { kvCkpt } = getDeps();
   logger.error({ sessionId, taskId: request.task_id, mode: request.mode }, "task.mode_not_implemented");
+  await refuseBeforeRun(msg, request, lockKey, unsupportedModeReason(request.mode));
+  return true;
+}
+
+/**
+ * A requested review (`sandbox_profile: "review"`) with no positive turn budget is failed before anything runs: no sandbox, no cluster,
+ * no model turn. The agent loop reads 0 as no limit, so running it would spend the reviewer's quota without one
+ * (`agent/review-profile.ts` `reviewTurnBudgetRefusal`).
+ */
+export async function refuseReviewWithoutTurnBudget(
+  msg: JsMsg,
+  request: ExecuteRequest,
+  sessionId: string,
+  lockKey: string,
+): Promise<boolean> {
+  const why = reviewTurnBudgetRefusal(request);
+  if (why === null) return false;
+  logger.error({ sessionId, taskId: request.task_id, maxTurns: request.max_turns ?? null }, "task.review_without_turn_budget_refused");
+  await refuseBeforeRun(msg, request, lockKey, why);
+  return true;
+}
+
+/** Fail a task that is not to run at all, with the reason, and let go of it. */
+async function refuseBeforeRun(msg: JsMsg, request: ExecuteRequest, lockKey: string, failureReason: string): Promise<void> {
+  const { kvCkpt } = getDeps();
   try {
     await deliverAgentDone(kvCkpt, request, {
       finalText: "",
@@ -1000,12 +1026,12 @@ export async function refuseUnsupportedMode(
       toolStats: { total_calls: 0, error_calls: 1, by_tool: {} },
       elapsedMs: 0,
       abortReason: "error",
-      failureReason: unsupportedModeReason(request.mode),
+      failureReason,
     });
     await ackAndClearCallback(msg, kvCkpt, request);
   } catch (err) {
     if (err instanceof AgentDoneDeliveryError) {
-      logger.error({ err, taskId: request.task_id }, "task.mode_refusal_delivery_exhausted");
+      logger.error({ err, taskId: request.task_id }, "task.refusal_delivery_exhausted");
       msg.nak(5_000);
     } else {
       throw err;
@@ -1014,7 +1040,6 @@ export async function refuseUnsupportedMode(
     activeAbort.delete(lockKey);
     await fx().releaseTaskLock(lockKey).catch(() => {});
   }
-  return true;
 }
 
 /**
@@ -1106,6 +1131,15 @@ class TaskRunner {
 
   // Mutable checkpoint state (updated by onCheckpoint callback).
   private latestCheckpointState: CheckpointState | null = null;
+  /** A requested review's turn pool, handed over by the engine (`ExecuteExtras.onTurnPool`). */
+  private turnPool: TurnPool | null = null;
+  /**
+   * The turns an interrupted or failed run reports: its checkpoint's, or under a review's pool what the pool gave if that is more. A
+   * checkpoint counts the parent's finished turns only, so a run stopped inside a `task` would otherwise not be charged its sub-agents'.
+   */
+  private reportedTurns(ckptTurns: number): number {
+    return this.turnPool ? Math.max(ckptTurns, this.turnPool.used) : ckptTurns;
+  }
   /**
    * What the run had done as of the last thing that recorded it, which is what
    * every terminal path reports.
@@ -2985,6 +3019,7 @@ class TaskRunner {
           attachHands: this.attachHands,
           runIdentity: this.runIdentity,
           natsConnection: getDeps().emitter.nc,
+          onTurnPool: (pool) => { this.turnPool = pool; },
         });
       }
     } finally {
@@ -3647,7 +3682,7 @@ class TaskRunner {
     // Once, so the two sinks below cannot disagree by however long the first
     // of them takes.
     const elapsedMs = this.elapsedMsForRun();
-    const turnsCompleted = ckptState?.turns_completed ?? 0;
+    const turnsCompleted = this.reportedTurns(ckptState?.turns_completed ?? 0);
     // Bound once and shared by the three sinks below -- the event, the DAG
     // callback and the S3 transcript. Spelling the same mapping out at each of
     // them is how they came to disagree in the first place.
@@ -3954,7 +3989,7 @@ class TaskRunner {
       total_calls: ckptStateF?.total_tool_calls ?? 0,
       error_calls: ckptStateF?.error_count ?? 0,
     };
-    const partialTurns = ckptStateF?.turns_completed ?? 0;
+    const partialTurns = this.reportedTurns(ckptStateF?.turns_completed ?? 0);
     // The same rule the interrupt path reports on, for the same reason: a
     // failure is by definition inside the turn after the last checkpoint, so
     // the checkpoint's own clock cannot see the part of the run that was still
@@ -4774,8 +4809,12 @@ export async function runHandleTask(
   abortCtrl: AbortController,
   claim: RunClaim = null,
 ): Promise<void> {
+  // Before anything decides the run's sandbox (a multi-node cluster, the image, the workspace): a requested review keeps only its fixed
+  // profile, and the prompt that holds the requester's words is not read as configuration (`agent/review-profile.ts`).
+  applyReviewProfileBackstop(request);
   if (await replayPendingCallback(msg, request, lockKey)) return;
   if (await refuseUnsupportedMode(msg, request, sessionId, lockKey)) return;
+  if (await refuseReviewWithoutTurnBudget(msg, request, sessionId, lockKey)) return;
   if (await maybeRunSandboxlessTask(msg, request, sessionId, lockKey, abortCtrl)) return;
   await new TaskRunner(
     msg, request, sessionId, lockKey, messageId, userId, abortCtrl, claim,

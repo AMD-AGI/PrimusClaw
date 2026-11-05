@@ -35,7 +35,7 @@ import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { parseActingAs } from "./acting-as.js";
 import { classifyAttendedCaller } from "./attended.js";
-import { reviewOnlyOf, reviewTargetOf } from "./review-target.js";
+import { mergeNeedsConfirmationOf, reviewOnlyOf, reviewTargetOf } from "./review-target.js";
 import { SECTIONS } from "./pages.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
@@ -44,6 +44,7 @@ import {
   REVIEW_MODES, getConfirmation, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type DecidedVia, type Queryable, type ReviewMode,
 } from "./store.js";
 import { verifySessionToolToken } from "./token.js";
+import { requesterLabelOf, requesterOf } from "./requested-by.js";
 
 const logger = pino({ name: "github-review-mcp" });
 
@@ -203,8 +204,8 @@ export async function decideConfirmation(
   if (await confirmationOfStoppedReview(id)) {
     const row = await getConfirmation(database, id);
     if (row && row.actorUserId !== deciderUserId) return { http: 403, body: { ok: false, error: "only_the_acting_user_can_decide" } };
-    await denyForStoppedReview(id);
-    return { http: 200, body: { ok: true, status: "denied", reason: "review_stopped" } };
+    // Answered meanwhile: `decide` below says how it ended, instead of a stop that denied nothing.
+    if (await denyForStoppedReview(id)) return { http: 200, body: { ok: true, status: "denied", reason: "review_stopped" } };
   }
   // Asked again where the answer is given (`decide` claims the row, then asks): a stop that lands between the two checks decides nothing.
   const answer = await service.decide(deciderUserId, id, decision, via, guard ? () => inTransaction(guard) : undefined);
@@ -221,6 +222,8 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
 
   // The review items of the assistant check a pull request with this same service before they make a session for it.
   reviewItemPorts.checkPullRequest = (actor, ref) => service.checkPullRequest(actor, ref);
+  // And ask whether the acting user lets others act for them, when a review is asked of them and before each of its turns.
+  reviewItemPorts.delegationOf = typeof service.delegationOf === "function" ? (actor, requester) => service.delegationOf(actor, requester) : null;
 
   app.all("/v1/internal/github-review/mcp", async (req, reply) => {
     const header = String(req.headers.authorization ?? "");
@@ -242,7 +245,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     }
     // The token proves what was true when it was minted; the session says what is true now.
     const acting = parseActingAs(row?.config?.acting_as);
-    if (!row || row.user_id !== claims.requesterUserId || !acting.ok || acting.actingAs !== claims.actorUserId) {
+    if (!row || requesterOf(row) !== claims.requesterUserId || !acting.ok || acting.actingAs !== claims.actorUserId) {
       return refuse(reply, 403, "session_mismatch");
     }
     // A target that is there and cannot be read is not "no target": the session does not get the tools.
@@ -251,11 +254,11 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
       logger.warn({ sessionId: claims.sessionId }, "github_review.review_target_unreadable");
       return refuse(reply, 403, "review_target_invalid");
     }
-    const label = typeof row.config?.acting_as_requester === "string" ? row.config.acting_as_requester : undefined;
+    const label = requesterLabelOf(row.config);
     const continuation = reviewItemsEnabled() ? await reviewContinuationOf(claims.sessionId).catch(() => null) : null;
     const mcp = buildReviewToolServer(service, {
       sessionId: claims.sessionId, requesterUserId: claims.requesterUserId, actorUserId: claims.actorUserId, requesterLabel: label, reviewTarget: target.target,
-      reviewOnly: reviewOnlyOf(row.config),
+      reviewOnly: reviewOnlyOf(row.config), mergeNeedsConfirmation: mergeNeedsConfirmationOf(row.config),
     }, { resolvable: continuation?.findings.some((f) => f.thread_id !== null && !f.resolved) === true });
     // Stateless, like the platform's own MCP endpoint: one server and transport per request.
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as unknown as () => string });

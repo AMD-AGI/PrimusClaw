@@ -381,6 +381,15 @@ export interface ExecuteRequest {
    * its prompt and saves none from it. Absent means a session like any other, as before the field existed.
    */
   withhold_sandbox_keys?: boolean;
+  /**
+   * `"review"`: a review one person asked another to make, run as the reviewer (the API's `review-profile.ts`). The run gets a fixed
+   * profile whatever else the request carries: the review tools and the sandbox's file and shell tools only (Brain applies the same
+   * allow-list again), no skills, memory, plugins, stored variables or extra MCP servers, and it is marked `withhold_sandbox_keys`. Its
+   * sandbox is built in the deployment's CPU sandbox workspace (SANDBOX_CPU_NAMESPACE; AGENT_SANDBOX_NAMESPACE in Kubernetes mode), never
+   * a workspace the request names, a multi-node cluster's or a GPU workspace, and is created with `useWorkspaceStorage: false`, so SaFE
+   * mounts neither the owner's directory nor the workspace's volumes. Absent: a session like any other.
+   */
+  sandbox_profile?: "review";
 
   // ── Legacy chat fields (Phase 4 removes; do not use in new task code) ─
   /** @deprecated Use `sandbox_spec.image`. Kept for legacy chat NATS path. */

@@ -17,7 +17,9 @@
  * Two acts are never read from a sentence at all, since a misreading there merges a pull request or changes a setting: letting a
  * held write through needs the person's message to be the exact command `批准 #<ref>` / `approve #<ref>` naming it (or the card's
  * button), and a channel action runs at once only when the message is its command typed whole; otherwise it is put to the person
- * as that command with a button, and runs only when they press it.
+ * as that command with a button, and runs only when they press it. So `merge=true` on a review this router starts or restarts never
+ * merges by itself: the review's session holds its merge for the person's confirmation (`config.merge_needs_confirmation`), which only
+ * that command or the card's button gives.
  *
  * Everything past that is the review's own gates, which these call rather than repeat: creating, stopping and restarting
  * a review item is `review-items.ts`; answering a held write is the decision route's own `decideConfirmation`
@@ -29,6 +31,7 @@ import type { UserInfo } from "../auth/models.js";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { parsePrRef, type PrRef } from "../github-review/github.js";
+import { readGithubReviewSettings } from "../github-review/settings.js";
 import { decideConfirmation, githubReviewService } from "../github-review/mcp.js";
 import { DEFAULT_REVIEW_MODE, getReviewMode, setReviewMode, type DecidedVia } from "../github-review/store.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -248,14 +251,43 @@ export async function reviewStart(
     );
   });
   // The body `POST /v1/assistant/reviews` would have been sent, read by the same parser: the same checks either way.
-  const items = await asTool(async () => reviewToolPorts.startReviews(ready.signedIn.user, ready.signedIn.method, parseReviewRequest({
-    prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
-    ...(ready.actingAs !== ready.userId ? { acting_as: ready.actingAs } : {}),
-    ...(ready.actingAsName ? { acting_as_name: ready.actingAsName } : {}),
-    ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
-    review_only: !args.merge,
-  }), stillActing(claims, ready.userId)));
+  // `merge=true` is the router's reading of a sentence, and natural language never approves a merge: the review's session merges only once
+  // the acting user confirms that very merge (`mergeNeedsConfirmation`, held by the review tools; the card's button or `批准 #<ref>`).
+  const items = await asTool(async () => asRequesterOfOther(ready.actingAs !== ready.userId, () => reviewToolPorts.startReviews(ready.signedIn.user, ready.signedIn.method, {
+    ...parseReviewRequest({
+      prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
+      ...(ready.actingAs !== ready.userId ? { acting_as: ready.actingAs } : {}),
+      ...(ready.actingAsName ? { acting_as_name: ready.actingAsName } : {}),
+      ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
+      review_only: !args.merge,
+    }),
+    mergeNeedsConfirmation: true,
+  }, stillActing(claims, ready.userId))));
   return { ok: true, items };
+}
+
+/**
+ * A review asked of someone else runs on that person's own credentials (their delegated token and their own key), which only the
+ * asking service brings with the request (`POST /v1/assistant/reviews`, `x-acting-as-token` / `x-acting-as-api-key`). The assistant
+ * holds the requester's keys, never the reviewer's, so the review service refuses such a review from here
+ * (`acting_as_credentials_required`) before it looks at anything else. That is deliberate: the refusal stays, and the router is told
+ * what the user can do instead, which is to ask the deployment's review agent (`CLAW_GITHUB_REVIEW_AGENT_NAME`, the name its reviews
+ * are signed with), whose service brings the reviewer's credentials. The platform names no client of its own (`docs/github-review.md`).
+ */
+export function askTheReviewAgent(): string {
+  const agent = readGithubReviewSettings().agentName;
+  return `a review as someone else runs on that person's own GitHub credentials, which this assistant cannot carry: nothing was started. Tell the user to ask ${agent} for it (mention ${agent} in the pull request or the chat, naming the reviewer), or to start the review as themselves`;
+}
+
+async function asRequesterOfOther<T>(forOther: boolean, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if (forOther && err instanceof ReviewItemRefused && err.code === "acting_as_credentials_required") {
+      throw new ReviewItemRefused(err.status, err.code, askTheReviewAgent(), err.data);
+    }
+    throw err;
+  }
 }
 
 /** The user's review items the router could mean, newest first: the open ones and those closed in the last day. */
@@ -334,10 +366,14 @@ export async function reviewRestart(
     }
     return { userId, itemId: item.item_id, signedIn: await requesterSignedIn(q, claims.sid, userId, message, via) };
   });
-  const restarted = await asTool(async () => reviewToolPorts.restartReview(chosen.signedIn.user, chosen.signedIn.method, chosen.itemId, parseRestartRequest({
-    ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
-    ...(typeof args.merge === "boolean" ? { review_only: !args.merge } : {}),
-  }), stillActing(claims, chosen.userId)));
+  // As at a start: whatever the router passed for merge, the restarted review merges only on the acting user's confirmation.
+  const restarted = await asTool(async () => reviewToolPorts.restartReview(chosen.signedIn.user, chosen.signedIn.method, chosen.itemId, {
+    ...parseRestartRequest({
+      ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
+      ...(typeof args.merge === "boolean" ? { review_only: !args.merge } : {}),
+    }),
+    mergeNeedsConfirmation: true,
+  }, stillActing(claims, chosen.userId)));
   return { ok: true, ...restarted };
 }
 

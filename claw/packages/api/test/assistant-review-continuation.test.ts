@@ -13,6 +13,8 @@
  *   A3  the record is the facts': a dry run, a refusal or a retry that found its review already there records nothing, and a restart of
  *       a review that posted nothing is a first review again
  *   A4  only a re-review with an open recorded thread is offered gh_thread_resolve, over the real MCP route
+ *   A8  a review asked of someone else continues only the reviewer's last closed review asked by the same requester; the reviewer's own
+ *       request continues only their own, never one someone else asked of them
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -209,6 +211,46 @@ describe("assistant review continuation", { skip }, () => {
     assert.equal(other.params.continues, undefined, "carol's review does not build on alice's");
     assert.doesNotMatch((await w.pending(theirs.session_id))[0].content, /re-review/);
     assert.equal((await w.item(first.item_id)).params.continues, undefined, "and a first review continues nothing");
+  });
+
+  test("A8 a review asked of someone else continues the reviewer's last review asked by the same requester, and nothing else", async () => {
+    // bob's closed reviews of the pull request: his own, one alice asked of him, and the newest, one carol asked of him.
+    const closed = async (seq: number, requestedBy: string | null, head: string, ageMin: number) => {
+      const itemId = `kwi_closed${seq}`;
+      const continues = { from_item: "kwi_older", from_seq: 1, head_sha: head, verdict: "COMMENT", model: null, findings: [] };
+      await w.q(
+        `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, outcome, worker_session_id, kind, params, created_at, closed_at)
+         VALUES ($1, 'bob', $2, 't', 'done', 'accepted', $3, 'review', $4::jsonb, NOW() - make_interval(mins => $5::int), NOW())`,
+        [itemId, seq, `ws_${itemId}`, JSON.stringify({
+          pr: PR, acting_as: "bob", review_only: true, brief: "b", continues,
+          ...(requestedBy ? { requested_by: requestedBy, requester_label: requestedBy } : {}),
+        }), ageMin],
+      );
+      return itemId;
+    };
+    const own = await closed(1, null, "1".repeat(40), 30);
+    const fromAlice = await closed(2, "alice", "2".repeat(40), 20);
+    await closed(3, "carol", "4".repeat(40), 10);
+    const user = (id: string) => ({ userId: id, userName: `Name ${id}`, platformKey: `pk-${id}`, virtualKey: `vk-${id}`, roles: ["default"] });
+    const saved = ri.reviewItemPorts.delegationOf;
+    ri.reviewItemPorts.delegationOf = async () => "on";
+    try {
+      const [asked] = await ri.startReviews(user("alice"), "identity_token",
+        { ...ri.parseReviewRequest({ prs: [PR], acting_as: "bob" }), actingAsUser: user("bob") });
+      const item = await w.item(asked.item_id);
+      assert.deepEqual([item.user_id, item.params.requested_by, item.params.continues?.from_item], ["bob", "alice", fromAlice],
+        "alice's request continues alice's last request of bob, not bob's own nor carol's newer one");
+      assert.equal((await call("bob", `/v1/work-items/${asked.item_id}/stop`, {})).status, 200);
+      const [mine] = await ri.startReviews(user("bob"), "identity_token", ri.parseReviewRequest({ prs: [PR] }));
+      assert.deepEqual([(await w.item(mine.item_id)).params.requested_by, (await w.item(mine.item_id)).params.continues?.from_item], [undefined, own],
+        "bob's own request continues his own review, not the newer ones others asked of him");
+      assert.equal((await call("bob", `/v1/work-items/${mine.item_id}/stop`, {})).status, 200);
+      const [dave] = await ri.startReviews(user("dave"), "identity_token",
+        { ...ri.parseReviewRequest({ prs: [PR], acting_as: "bob" }), actingAsUser: user("bob") });
+      assert.equal((await w.item(dave.item_id)).params.continues, undefined, "a requester with no earlier request of bob continues nothing");
+    } finally {
+      ri.reviewItemPorts.delegationOf = saved;
+    }
   });
 
   test("A3 a dry run, a refusal or a review already there records nothing; a restart of a review that posted nothing is a first review", async () => {

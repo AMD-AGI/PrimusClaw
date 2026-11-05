@@ -117,6 +117,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
       images: [params.image.trim()],
       resources: params.resourcesArray ?? resourcesMapToWorkloadArray(params.resources),
       timeout,
+      ...(params.useWorkspaceStorage === false ? { useWorkspaceStorage: false } : {}),
     };
 
     const resp = await fetch(`${SAFE_API_URL}/api/v1/workloads`, {
