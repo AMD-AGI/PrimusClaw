@@ -692,13 +692,15 @@ export class ToolRouter {
           directory: { type: "string", description: "Subdirectory to search in" },
         }, required: ["pattern"],
       }},
-      { name: "grep", description: "Search file contents with a regex pattern. Case-insensitive unless case_sensitive is set. Searches dot-directories such as .github; skips .git, node_modules and caches.", input_schema: {
+      { name: "grep", description: "Search file contents with a regex pattern. Case-insensitive unless case_sensitive is set. output_mode picks matching lines with context (default), file paths only, or a count per file; head_limit keeps the first N entries. Searches dot-directories such as .github; skips .git, node_modules and caches.", input_schema: {
         type: "object", properties: {
           pattern: { type: "string", description: "Regular expression pattern" },
           path: { type: "string", description: "File or directory to search" },
           context: { type: "number", description: "Lines of context around matches (default 2)" },
           case_sensitive: { type: "boolean", description: "Match case exactly (default false)" },
           glob: { type: "string", description: "Only search files matching this glob, e.g. *.ts or src/**/*.py" },
+          output_mode: { type: "string", enum: ["content", "files_with_matches", "count"], description: "content (default): matching lines with context; files_with_matches: only the paths of matching files; count: matching lines per file" },
+          head_limit: { type: "integer", minimum: 1, description: "Return only the first N entries: matching lines for content, files otherwise (default: all)" },
         }, required: ["pattern"],
       }},
       { name: "ls", description: "List directory contents with file types and sizes", input_schema: {
