@@ -15,6 +15,7 @@
  *   T1 which archived sessions are deleted and which are never taken (table-driven)
  *   T2 a deletion goes through the user's delete commit: rows stamped, queue dropped, cleanup pending
  *   T3 a session that becomes ineligible after the scan is skipped under its row lock
+ *      (T3c: including a team member whose run starts mid-deletion, under the member's lock)
  *   T4 the batch limit takes the oldest first; dry run reports and changes nothing; 0 is off
  *   T5 the S3 workspace and checkpoint prefixes are removed by the existing cleanup sweep
  *   T6 the purge removes stamped rows of sessions deleted past the window, and nothing else
@@ -206,6 +207,32 @@ describe("session retention", { skip }, () => {
     assert.equal(report.skipped, 1);
     assert.equal((await rows("SELECT 1 FROM claw_pending_messages WHERE session_id = 'racy'")).length, 1,
       "the declined transaction dropped nothing");
+  });
+
+  test("T3c a team member starting a run while the parent is being deleted is waited for", async () => {
+    await seed({ id: "lead" });
+    await seed({ id: "member", status: "active", archivedDays: null, updatedDays: 1, parent: "lead" });
+    // The member's run starts in a transaction of its own that has written the
+    // child row but not committed: the deletion must wait on that row and then
+    // see the run, not read the old value and delete the lead beside it.
+    const starter = await cluster!.connect();
+    await starter.query("BEGIN");
+    await starter.query("UPDATE claw_sessions SET agent_status = 'running' WHERE session_id = 'member'");
+    const pass = retention.runSessionRetention(SETTINGS);
+    let blocked = false;
+    for (let i = 0; i < 100 && !blocked; i++) {
+      const r = await starter.query(
+        `SELECT 1 FROM pg_stat_activity
+          WHERE wait_event_type = 'Lock' AND pid <> pg_backend_pid() AND datname = current_database()`);
+      blocked = r.rows.length > 0;
+      if (!blocked) await new Promise((res) => setTimeout(res, 50));
+    }
+    await starter.query("COMMIT");
+    const report = await pass;
+    assert.ok(blocked, "the deletion waited on the member's row");
+    assert.deepEqual(await deletedIds(), []);
+    assert.equal(report.deleted, 0);
+    assert.equal(report.skipped, 1);
   });
 
   test("T3b commitSessionDeletion with a declining precondition writes nothing", async () => {

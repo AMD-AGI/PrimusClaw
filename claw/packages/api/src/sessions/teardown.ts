@@ -570,8 +570,9 @@ export interface TeardownInput {
  * `onlyIf` is for a caller that chose the session from a scan rather than
  * from a request -- the retention pass in sessions/retention.ts. It is asked
  * after the session row is locked, inside the same transaction, so what it
- * checks cannot change between its answer and the commit: a run cannot start
- * and the session cannot be unarchived, both of which write that row. When it
+ * checks of that row cannot change between its answer and the commit: a run of
+ * the session cannot start and it cannot be unarchived, both of which write
+ * that row. Rows of other sessions it reads (a team member's) it locks itself. When it
  * answers false nothing is written and this returns false.
  *
  * @returns true when the deletion committed, false when `onlyIf` declined it.

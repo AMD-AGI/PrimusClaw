@@ -35,8 +35,8 @@
  *     and every other trigger starts a new session per firing and never comes
  *     back to an old one.
  *
- * The same predicate selects the batch and is asked again under the session's
- * row lock inside the deletion's own transaction, so a session that became
+ * The same predicate selects the batch and is asked again under the row locks
+ * of the session and its team members inside the deletion's own transaction, so a session that became
  * ineligible between the scan and its turn -- a message sent, an unarchive -- is
  * skipped rather than deleted.
  *
@@ -158,10 +158,21 @@ async function deleteExpiredSessions(
       break;
     }
     const committed = await commitSessionDeletion(sessionId, {
-      onlyIf: async (query: Querier) => (await query(
-        `SELECT 1 FROM claw_sessions s WHERE s.session_id = $2 AND ${retentionPredicate(1, workItems)}`,
-        [s.retentionDays, sessionId],
-      )).rows.length > 0,
+      onlyIf: async (query: Querier) => {
+        // A team member's run starts by writing the member's own row, not this
+        // one, so the session lock alone does not hold it off: lock the members
+        // too, so a run starting now is waited for and seen, and none starts
+        // before this commits.
+        await query(
+          `SELECT 1 FROM claw_sessions WHERE parent_session_id = $1 AND deleted_at IS NULL
+            ORDER BY session_id FOR UPDATE`,
+          [sessionId],
+        );
+        return (await query(
+          `SELECT 1 FROM claw_sessions s WHERE s.session_id = $2 AND ${retentionPredicate(1, workItems)}`,
+          [s.retentionDays, sessionId],
+        )).rows.length > 0;
+      },
     }).catch((err: unknown) => {
       // One session's transaction failing is not a reason to stop the batch;
       // it is still archived and the next pass selects it again.
