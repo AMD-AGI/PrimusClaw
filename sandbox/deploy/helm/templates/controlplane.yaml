@@ -257,9 +257,11 @@ spec:
                   fieldPath: metadata.namespace
             - name: ENABLE_AUTH
               value: {{ ternary "true" "false" .Values.router.config.enableAuth | quote }}
+            {{- $upstreamOnly := .Values.router.config.upstreamOnly }}
+            {{- if or (kindIs "bool" $upstreamOnly) (and (kindIs "string" $upstreamOnly) (ne $upstreamOnly "")) }}
             - name: SANDBOX_UPSTREAM_ONLY
-              {{- /* Renders "true" unless router.config.upstreamOnly is false. */}}
-              value: {{ ternary "true" "false" (ne (toString .Values.router.config.upstreamOnly) "false") | quote }}
+              value: {{ $upstreamOnly | toString | quote }}
+            {{- end }}
             - name: SAFE_API_URL
               value: {{ .Values.router.config.safeApiUrl | quote }}
             {{- if .Values.router.config.namespaceSelector }}

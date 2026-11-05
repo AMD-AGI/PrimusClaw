@@ -324,12 +324,60 @@ func TestE2BInvokeTokenIsBoundToItsSandbox(t *testing.T) {
 	}
 }
 
-func TestUpstreamOnlyFromEnv(t *testing.T) {
-	if !UpstreamOnlyFromEnv("") || !UpstreamOnlyFromEnv("true") || !UpstreamOnlyFromEnv("  ") {
-		t.Fatal("upstream-only defaults on")
+func TestConfigureUpstreamOnlyFollowsRole(t *testing.T) {
+	upstreamPEM := string(mustPEM(t, mustJWT(t)))
+	cases := []struct {
+		name     string
+		upstream string
+		raw      string
+		want     bool
+		wantErr  bool
+	}{
+		{name: "single cluster unset", raw: "", want: false},
+		{name: "single cluster blank", raw: "  ", want: false},
+		{name: "single cluster false", raw: "false", want: false},
+		{name: "single cluster explicit on", raw: "true", wantErr: true},
+		{name: "cluster Router unset", upstream: upstreamPEM, raw: "", want: true},
+		{name: "cluster Router true", upstream: upstreamPEM, raw: "true", want: true},
+		{name: "cluster Router false", upstream: upstreamPEM, raw: " false ", want: false},
 	}
-	if UpstreamOnlyFromEnv("false") || UpstreamOnlyFromEnv(" false ") {
-		t.Fatal("the exact value false turns upstream-only off")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Server{}
+			if err := s.ConfigureDataPlane("ccs300", "", tc.upstream, nil); err != nil {
+				t.Fatal(err)
+			}
+			err := s.ConfigureUpstreamOnly(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("explicit upstream-only accepted without an upstream key")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.dp.upstreamOnly != tc.want {
+				t.Fatalf("upstreamOnly = %v, want %v", s.dp.upstreamOnly, tc.want)
+			}
+		})
+	}
+}
+
+func TestSingleClusterAcceptsDirectCaller(t *testing.T) {
+	s := &Server{store: store.NewMemoryStore()}
+	s.setupRoutes()
+	if err := s.ConfigureDataPlane("ccs300", "", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ConfigureUpstreamOnly(""); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v2/sandboxes", nil)
+	s.engine.ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "upstream_hop_required") {
+		t.Fatalf("single-cluster Router rejected a direct caller: %d %s", rec.Code, rec.Body.String())
 	}
 }
 

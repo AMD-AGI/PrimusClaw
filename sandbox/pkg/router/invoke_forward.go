@@ -22,7 +22,9 @@ import (
 
 const (
 	// EnvUpstreamOnly makes a cluster Router accept calls only as invocations
-	// forwarded by the managing Router. Unset is on. The exact value "false" turns it off.
+	// forwarded by the managing Router. Unset follows the role: on when an upstream
+	// public key is configured, off for a single-cluster or managing Router.
+	// The exact value "false" turns it off. Any other value turns it on.
 	EnvUpstreamOnly = "SANDBOX_UPSTREAM_ONLY"
 	// invokeControlSession is the session claim of a forwarded E2B collection call
 	// (create or list), which names no sandbox.
@@ -51,10 +53,24 @@ func (s *Server) WithWorkloadLocator(locate WorkloadLocator) *Server {
 	return s
 }
 
-// UpstreamOnlyFromEnv reports whether /v1 accepts only forwarded invocations.
-// An empty value is on. The exact value "false" turns it off.
-func UpstreamOnlyFromEnv(raw string) bool {
-	return strings.TrimSpace(raw) != "false"
+// ConfigureUpstreamOnly applies the EnvUpstreamOnly value. An empty value turns the
+// mode on only when an upstream public key is configured. "false" turns it off.
+// Any other value turns it on and requires the cluster id and upstream key.
+func (s *Server) ConfigureUpstreamOnly(raw string) error {
+	var on bool
+	switch strings.TrimSpace(raw) {
+	case "":
+		on = s.dp.upstream != nil
+	case "false":
+		on = false
+	default:
+		on = true
+	}
+	if err := s.SetUpstreamOnly(on); err != nil {
+		return err
+	}
+	log.Info("dataplane upstream-only resolved", "upstream_only", on, "upstream_key", s.dp.upstream != nil, "cluster_id", s.dp.clusterID)
+	return nil
 }
 
 // SetUpstreamOnly turns on the mode in which /v1 accepts only forwarded invocations.

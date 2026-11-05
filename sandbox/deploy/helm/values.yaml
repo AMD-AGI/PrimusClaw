@@ -130,10 +130,12 @@ router:
     # all — not a weaker check, none. Set true in production; it requires
     # controlplane.config.identity.introspectUrl and its client Secret.
     enableAuth: false
-    # /v1 accepts only invocations forwarded by the managing Router.
-    # false sets SANDBOX_UPSTREAM_ONLY=false and turns that off. On requires
-    # SANDBOX_CLUSTER_ID and SANDBOX_UPSTREAM_PUBLIC_KEY or the process refuses to start.
-    upstreamOnly: true
+    # /v1 and the E2B control plane accept only invocations forwarded by the
+    # managing Router. Empty follows the role: on for a cluster Router with
+    # SANDBOX_UPSTREAM_PUBLIC_KEY, off for a single-cluster or managing Router.
+    # true forces it on and requires SANDBOX_CLUSTER_ID and the upstream key,
+    # or the process refuses to start. false forces it off.
+    upstreamOnly: ""
     safeApiUrl: ""                # grant identity check (SAFE_API_URL); not used for /v1 auth
     # Label selector (kubectl -l syntax) of the namespaces the Router and the
     # Workload Manager serve, e.g. "example.com/sandbox=enabled". A request for
