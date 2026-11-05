@@ -100,7 +100,9 @@ export function reviewAgentSettings(_userId: string): ReviewAgentSettings {
 /**
  * The model turns this requested review may still take: the item's own budget less what its session's runs took, and the owner's daily
  * budget (UTC) less what every review others asked of them took today, the lower of the two. Counted from the runs' completion records
- * (`exec_complete.turns`), so a run still going counts when it ends; each run is capped at what was left when it started.
+ * (`exec_complete.turns`), so a run still going counts when it ends; each run is capped at what was left when it started. A run's turns
+ * there are its sub-agents' too: under the profile Brain takes every turn of the run and of its sub-agents from one pool of `max_turns`
+ * and reports what the pool gave (`agent-loop.ts` `TurnPool`).
  */
 export async function reviewTurnsLeft(sessionId: string, ownerUserId: string, q: StatementRunner = db): Promise<{ left: number; scope: "item" | "day" }> {
   const s = reviewAgentSettings(ownerUserId);

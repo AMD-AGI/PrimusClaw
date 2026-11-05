@@ -136,7 +136,10 @@ credentials with the request: `x-acting-as-token` (X's delegated identity-provid
 - X's review-agent limits (the deployment's defaults for every person for now): `CLAW_REVIEW_FOR_OTHERS_MAX_ACTIVE` (20) open
   reviews others asked of X, `CLAW_REVIEW_FOR_OTHERS_PER_REQUESTER_MAX_ACTIVE` (10) of them per requester, both apart from X's
   own item limit (`409 too_many_active_items` with `data.scope` `reviewer` or `requester`); `CLAW_REVIEW_FOR_OTHERS_TURNS_PER_ITEM`
-  (200) model turns per review and `CLAW_REVIEW_FOR_OTHERS_TURNS_PER_DAY` (2000) for all of them per UTC day.
+  (200) model turns per review and `CLAW_REVIEW_FOR_OTHERS_TURNS_PER_DAY` (2000) for all of them per UTC day. A review's
+  sub-agents take their turns from the same budget and are counted with it.
+- The model and effort are X's: a `model` or `effort` R names is not taken (the review runs on the deployment's default), and R's
+  answer says so with `ignored: ["model", "effort"]` (whichever were named). X may change them on X's own restart.
 - `requester_note` (up to 2000 characters) is quoted after the first message as untrusted text that cannot change merging, the
   model or the pull request; a body naming `requested_by` or `sandbox_profile` is a 400.
 - R is answered without the session's ids, may stop the review and read it, and sees four facts only on every answer

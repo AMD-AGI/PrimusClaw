@@ -179,19 +179,21 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual(items.map((i) => [i.seq, i.title, i.pr.number]), [[1, "Review+merge PrimusClaw#254", 254], [2, "Review+merge PrimusClaw#257", 257]]);
     // The session is the reviewer's: the person who asked is not told its id, nor its first turn's.
     assert.deepEqual(items.map((i) => ["session_id" in i, "message_id" in i]), [[false, false], [false, false]]);
+    // The model and the effort are the reviewer's, on whose quota it runs: what the requester named is set aside, and they are told so.
+    assert.deepEqual(items.map((i) => i.ignored), [["model", "effort"], ["model", "effort"]]);
     for (const it of items) {
       const item = await w.item(it.item_id);
       assert.equal(item.user_id, "bob", "the item is on the reviewer's board");
       assert.equal(item.kind, "review");
       assert.equal(item.board_state, "in_progress");
       assert.deepEqual({ ...item.params, brief: undefined }, {
-        pr: it.pr, acting_as: "bob", acting_as_name: "Bob B", model: "claude-opus-5.5", effort: "high", review_only: false, brief: undefined,
+        pr: it.pr, acting_as: "bob", acting_as_name: "Bob B", model: null, effort: null, review_only: false, brief: undefined,
         requested_by: "alice", requester_label: "Name alice", requester_note: null,
       });
       const [s] = await w.q("SELECT user_id, model, effort, config, parent_session_id FROM claw_sessions WHERE session_id = $1", [item.worker_session_id]);
       assert.equal(s.user_id, "bob", "and so is the session");
-      assert.equal(s.model, "claude-opus-5.5");
-      assert.equal(s.effort, "high");
+      assert.equal(s.model, null, "the reviewer's default model, not the one the requester named");
+      assert.equal(s.effort, null);
       assert.equal(s.parent_session_id, null);
       assert.deepEqual(
         [s.config.acting_as, s.config.review_target, s.config.review_only, s.config.requested_by, s.config.sandbox_profile, s.config.acting_as_requester, s.config.notify_on_finish],
@@ -220,9 +222,12 @@ describe("assistant review items", { skip }, () => {
   });
 
   test("V1b a review of one's own account is exactly what it was: the caller's item and session, no requester, the ids in the answer", async () => {
-    const only = await start("carol", { prs: [PR(300)] });
+    const only = await start("carol", { prs: [PR(300)], model: "claude-opus-5.5", effort: "high" });
     assert.equal(only.status, 200);
     const it = only.body.data.items[0];
+    // One's own review runs on the model and effort one names, and nothing is set aside.
+    assert.deepEqual([it.ignored, (await w.q("SELECT model, effort FROM claw_sessions WHERE session_id = $1", [it.session_id]))[0]],
+      [undefined, { model: "claude-opus-5.5", effort: "high" }]);
     const item = await w.item(it.item_id);
     assert.equal(item.user_id, "carol");
     assert.equal(item.worker_session_id, it.session_id);

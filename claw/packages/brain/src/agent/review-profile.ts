@@ -11,8 +11,9 @@
  * dropped. It is applied where a request enters Brain (`tasks/dispatch.ts`, `tasks/runner.ts` `runHandleTask`), before anything decides
  * the run's sandbox, and again by the engine. The prompt is never read as configuration under the mark: what a requester wrote is in it
  * (`multi-node/prompt-flags.ts`, `resolveSandboxImageFromRequest`). The sandbox side is in `sandbox/ensure-hands.ts`
- * (`reviewSandboxNamespace`, `useWorkspaceStorage: false`). The run takes at most `max_turns` turns, and a request under the mark without
- * a positive one is refused (`reviewTurnBudgetRefusal`): 0 means no limit to the agent loop.
+ * (`reviewSandboxNamespace`, `useWorkspaceStorage: false`). The run takes at most `max_turns` turns, its sub-agents' included (the engine's
+ * `TurnPool`, whose count is the turns the run reports), and a request under the mark without a positive one is refused
+ * (`reviewTurnBudgetRefusal`): 0 means no limit to the agent loop.
  */
 import type { ExecuteRequest } from "@claw/protocol";
 import { parseToolAllowlist, type ToolAllowlist } from "../tools/allowlist.js";

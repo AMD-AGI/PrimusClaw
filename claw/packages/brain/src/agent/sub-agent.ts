@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { agentLoop } from "./agent-loop.js";
+import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { ToolRouter, INHERIT_MODEL, type WebToolServices } from "../tools/router.js";
 import type { HandsClient } from "../clients/hands.js";
 import type { HookRunner } from "./hooks.js";
@@ -141,6 +141,8 @@ export interface RunSubagentOptions {
    * sub-agent's own loop for the calls that loop handles itself.
    */
   toolAllowlist?: ToolAllowlist | null;
+  /** The parent run's shared turn budget (`LoopOptions.turnPool`), forwarded so the sub-agent's turns are taken from it. */
+  turnPool?: TurnPool;
 }
 
 export interface SubagentResult {
@@ -269,6 +271,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
     // Forwarded, never re-derived: these waits belong to the parent's run.
     runIdentity: opts.runIdentity,
     toolAllowlist: opts.toolAllowlist,
+    ...(opts.turnPool ? { turnPool: opts.turnPool } : {}),
   });
 
   let result;

@@ -583,6 +583,8 @@ export class AgentEngine {
           ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
           ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),
           ...(request.withhold_sandbox_keys ? { actingReview: true } : {}),
+          // A requested review's sub-agents take their turns from its budget, and are charged with it (`TurnPool`).
+          ...(isReviewProfile(request) ? { turnPool: { left: maxTurns, used: 0 } } : {}),
           apiUrl,
           apiKey,
           maxTurns,

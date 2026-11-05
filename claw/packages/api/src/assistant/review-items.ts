@@ -394,6 +394,11 @@ export interface CreatedReview {
   pr: PrRef;
   /** The turn id of the session's first message (`claw-pending-<id>`), for a caller that follows that turn's stream. */
   message_id: string | null;
+  /**
+   * What the request named that the review does not take: a review asked of someone else runs on the reviewer's default model and
+   * effort, never on ones the requester chose (`startReviews`). Absent when nothing was set aside.
+   */
+  ignored?: Array<"model" | "effort">;
 }
 
 interface Planned {
@@ -517,8 +522,16 @@ export async function startReviews(
   }
   const owner: UserInfo = forOther ? request.actingAsUser! : user;
   const requestedBy = forOther ? user.userId : null;
+  // The model and the effort are the reviewer's to choose, on whose quota the review runs: what the requester names is not taken, and
+  // the review runs on the reviewer's defaults (the deployment's, until a person can name the ones others may ask for). The requester is
+  // told what was set aside. The reviewer may still change them on their own restart or in their own session.
+  const ignored = forOther
+    ? (["model", "effort"] as const).filter((f) => request[f] !== undefined && request[f] !== null && request[f] !== "")
+    : [];
+  const model = forOther ? undefined : request.model;
+  const effort = forOther ? undefined : request.effort;
   const plans: Planned[] = request.prs.map(({ pr, message }) => {
-    const checked = checkAsCreate(user, method, actingAs, pr, request.reviewOnly, request.model, request.effort, request.mergeNeedsConfirmation === true);
+    const checked = checkAsCreate(user, method, actingAs, pr, request.reviewOnly, model, effort, request.mergeNeedsConfirmation === true);
     const label = String(checked.config.acting_as_requester ?? user.userId);
     const base: ReviewParams = {
       pr, acting_as: actingAs, acting_as_name: request.actingAsName, model: checked.model, effort: checked.effort,
@@ -559,8 +572,8 @@ export async function startReviews(
     return out;
   });
   for (const c of created) await drainSessionIfIdle(c.session_id, owner.userId);
-  logger.info({ userId: user.userId, actingAs, owner: owner.userId, items: created.map((c) => c.item_id) }, "assistant.reviews_started");
-  return created;
+  logger.info({ userId: user.userId, actingAs, owner: owner.userId, items: created.map((c) => c.item_id), ignored }, "assistant.reviews_started");
+  return ignored.length > 0 ? created.map((c) => ({ ...c, ignored: [...ignored] })) : created;
 }
 
 /** What a review created for someone else is answered with: not the session's ids, which are the reviewer's. */
