@@ -70,7 +70,10 @@ spec:
       resources: ["pods", "pods/ephemeralcontainers"]
   matchConditions:
   - name: create-or-ephemeral-containers
-    expression: request.operation == 'CREATE' || request.subResource == 'ephemeralcontainers'
+    # request.subResource is absent on a plain Pod UPDATE; reading it directly
+    # errors there, and with failurePolicy Fail under Deny that error refuses
+    # every label, annotation or finalizer update of a running sandbox Pod.
+    expression: request.operation == 'CREATE' || request.?subResource.orValue('') == 'ephemeralcontainers'
   - name: is-sandbox
     expression: >-
       object.metadata.?ownerReferences.orValue([]).exists(o,
