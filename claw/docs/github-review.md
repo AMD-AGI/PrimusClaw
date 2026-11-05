@@ -168,7 +168,7 @@ and every gate of a write stay those of the whole pull request. Such a session i
 `gh_thread_resolve(pr, thread_id, head_sha)`, which resolves the thread of a fixed finding: only a thread the last review
 recorded (`thread_not_recorded`), opened by the acting user's own account (`not_own_thread`), on this pull request
 (`thread_not_on_pull_request`), at the head the session read (`head_moved`), and not after the requester stopped the review
-(`review_stopped`), and not while GitHub's auto-merge is on for a session that may not merge by itself (a review only, or one the
+(`review_stopped`), and not while GitHub's auto-merge is on, or the pull request is in the merge queue, for a session that may not merge by itself (a review only, or one the
 assistant started; `auto_merge_on`), since resolving the last open conversation can be what merges it. It is not counted in the
 hourly review limits. With review items on, every review (not only an approval)
 and every `gh_thread_resolve` takes the acting account's write lock on the pull request, which a restart takes too: one still
@@ -194,8 +194,8 @@ They act only for the person, never for a key or a report:
 - **`merge=true` never merges.** Whether the user asked for a merge is the router's reading of a sentence, and natural language
   never approves one. So every review the router starts or restarts (`review_start`, `review_restart`, whatever `merge` says) is
   made with `config.merge_needs_confirmation` (kept by every later restart of it): its `gh_pr_merge`, and a `gh_review_submit`
-  `APPROVE` while GitHub's auto-merge is on, are held for the acting user (`confirmation_required`) whatever the risk and their
-  review mode, and it resolves no thread while auto-merge is on (see `gh_thread_resolve`); the merge is made only from that confirmation: the card's button or the exact command below, by the acting
+  `APPROVE` while GitHub's auto-merge is on or the pull request is in the merge queue, are held for the acting user (`confirmation_required`) whatever the risk and their
+  review mode, and it resolves no thread while auto-merge is on or the pull request is in the merge queue (see `gh_thread_resolve`); the merge is made only from that confirmation: the card's button or the exact command below, by the acting
   user. `merge=true` only lets the review go on to ask for that confirmation after its verdict; `merge=false` is a review only.
 - **Two acts are never read from a sentence.** A held write is let through only when the user's whole message is the approval
   command `批准 #<ref>` or `approve #<ref>` (case, spacing, a full-width `＃` and closing punctuation aside), where `<ref>` is the

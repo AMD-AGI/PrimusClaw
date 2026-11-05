@@ -194,6 +194,11 @@ interface PullState {
   autoMerge: boolean;
 }
 
+/** GitHub merges the pull request by itself once its requirements are met: auto-merge is on, or it already waits in the merge queue. */
+function mergesByItself(state: Pick<PullState, "autoMerge" | "queueEntry">): boolean {
+  return state.autoMerge || state.queueEntry !== null;
+}
+
 /** What one `gh_pr_get` read from GitHub, kept for the pages of the same head (see `reviewRead`). */
 type Inline = Partial<Record<Exclude<Section, "overview">, string>>;
 
@@ -1345,13 +1350,13 @@ export class GithubReview {
     const risk = await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, read, flags, judgement)));
     ctx.acc.riskReasons = this.auditedReasons(risk);
     const state = await this.readState(ctx, ref, pr, repo);
-    // A session asked for a review only may approve, but not an approval that would merge: with auto-merge on, it can.
-    if (ctx.actor.reviewOnly && state.autoMerge) {
-      throw new Refusal("review_only", "this session was asked for a review only, and auto-merge is on for this pull request, so an approval could merge it: nothing was posted. Post the review as COMMENT or REQUEST_CHANGES instead.");
+    // A session asked for a review only may approve, but not an approval that would merge: with auto-merge on, or in the merge queue, it can.
+    if (ctx.actor.reviewOnly && mergesByItself(state)) {
+      throw new Refusal("review_only", "this session was asked for a review only, and auto-merge is on for this pull request (or it is in the merge queue), so an approval could merge it: nothing was posted. Post the review as COMMENT or REQUEST_CHANGES instead.");
     }
     this.requireGreen(state, pr.headSha);
-    // An approval that GitHub's auto-merge would turn into a merge is that merge: a review the assistant started holds it for the acting user.
-    return state.autoMerge ? this.confirmedMergesOnly(ctx, risk) : risk;
+    // An approval that GitHub's auto-merge or merge queue would turn into a merge is that merge: a review the assistant started holds it for the acting user.
+    return mergesByItself(state) ? this.confirmedMergesOnly(ctx, risk) : risk;
   }
 
   private checkComments(raw: unknown, change: Change | null): ReviewComment[] {
@@ -1545,10 +1550,10 @@ export class GithubReview {
         }
         const redact = (x: string): string => ctx.client.redact(x);
         if (t.isResolved === true) return ok({ status: "already_resolved", thread_id: threadId, head_sha: headSha }, redact);
-        // With GitHub's auto-merge on, the last open conversation resolved can be what merges the pull request. A session that may not merge
-        // by itself (a review only, or one the assistant started, whose merge waits for the acting user's confirmation) leaves it open.
-        if ((ctx.actor.reviewOnly || ctx.actor.mergeNeedsConfirmation) && (await this.readMergeFacts(ctx, ref)).autoMerge) {
-          throw new Refusal("auto_merge_on", "auto-merge is on for this pull request, so resolving a conversation could merge it, and this session "
+        // With GitHub's auto-merge on, or the pull request in the merge queue, the last open conversation resolved can be what merges it. A session
+        // that may not merge by itself (a review only, or one the assistant started, whose merge waits for the acting user's confirmation) leaves it open.
+        if ((ctx.actor.reviewOnly || ctx.actor.mergeNeedsConfirmation) && mergesByItself(await this.readMergeFacts(ctx, ref))) {
+          throw new Refusal("auto_merge_on", "auto-merge is on for this pull request (or it is in the merge queue), so resolving a conversation could merge it, and this session "
             + "does not merge by itself: nothing was resolved. Leave the thread open and say in your review that the finding is fixed.");
         }
         if (!ctx.settings.writesEnabled) {
