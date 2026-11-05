@@ -989,6 +989,10 @@ describe("assistant review items", { skip }, () => {
     await handoff("h-unechoed", [256], true);
     const unechoed = await made(await start("alice", { prs: [PR(256)], acting_as: "bob", review_only: false }));
     assert.deepEqual([unechoed.config.review_only, unechoed.config.merge_needs_confirmation], [false, true]);
+    // ...and, when the router read no merge, it only reviews: leaving the id out does not lift the handoff's review-only reading.
+    await handoff("h-unechoed-review", [259], false);
+    const unechoedReview = await made(await start("alice", { prs: [PR(259)], acting_as: "bob", review_only: false }));
+    assert.deepEqual([unechoedReview.config.review_only, unechoedReview.config.merge_needs_confirmation], [true, true]);
 
     // A handoff names its requester, its reviewer and its pull requests, and lives as long as its delivery could take.
     await handoff("h-257", [257], true);
@@ -1005,7 +1009,7 @@ describe("assistant review items", { skip }, () => {
     }
     await w.q("UPDATE claw_assistant_review_handoffs SET created_at = NOW() - make_interval(hours => $1::int + 1) WHERE handoff_id = 'h-257'", [ri.REVIEW_HANDOFF_HOURS]);
     assert.deepEqual((await start("alice", { prs: [PR(257)], acting_as: "bob", handoff_id: "h-257" })).body.error, "handoff_not_found", "expired");
-    assert.equal(await count("claw_work_items"), 3, "nothing made by a refused handoff");
+    assert.equal(await count("claw_work_items"), 4, "nothing made by a refused handoff");
 
     // Two starts from one handoff at once, each for a different one of its pull requests (so no open review stands between them): one is
     // made, the other is told the handoff was used.

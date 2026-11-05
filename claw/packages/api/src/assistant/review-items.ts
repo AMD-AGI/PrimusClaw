@@ -279,7 +279,8 @@ export async function recordReviewHandoff(q: Querier, h: { handoffId: string; us
 /**
  * What a review asked of someone else may do when the assistant handed it over: null when no handoff of the caller to this reviewer names
  * any of these pull requests. The gate does not depend on the channel echoing the handoff: a request for the same reviewer and pull requests
- * that leaves `handoff_id` out still waits for the reviewer's confirmation before it merges. A request that names one must be the
+ * that leaves `handoff_id` out still waits for the reviewer's confirmation before it merges, and only reviews unless one of those handoffs
+ * read a merge. A request that names one must be the
  * caller's, to this reviewer, for pull requests it covers, not yet started from, and not expired; it is then started from once, and merges
  * only if the router read a merge.
  */
@@ -306,7 +307,7 @@ async function handoffGate(requesterId: string, reviewerId: string, request: Rev
       WHERE user_id = $1 AND reviewer_user_id = $2 AND created_at > NOW() - make_interval(hours => $3::int) AND prs && $4::text[]`,
     [requesterId, reviewerId, REVIEW_HANDOFF_HOURS, keys],
   )).rows as Array<{ merge: boolean }>;
-  return rows.length ? { handoffId: null, merge: true } : null;
+  return rows.length ? { handoffId: null, merge: rows.some((r) => r.merge) } : null;
 }
 
 /** The changes a restart asks for; what it leaves out is the old item's. */

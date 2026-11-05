@@ -232,7 +232,8 @@ A review asked of someone else meets the assistant in three places:
   once the reviewer confirms that very merge (`merge_needs_confirmation`, the card's button or `批准 #<ref>` / `approve #<ref>`), and
   only reviews when the router read no merge. A `handoff_id` must be the caller's handoff to that reviewer, cover the pull requests
   asked, be under 24 hours old and unused (one start per handoff; a replay is refused `handoff_used`). A request of the same person, to
-  the same reviewer, for a handed-over pull request that leaves `handoff_id` out is held for the reviewer's confirmation all the same.
+  the same reviewer, for a handed-over pull request that leaves `handoff_id` out is held for the reviewer's confirmation all the same,
+  and only reviews unless one of those handoffs read a merge.
   The reviewer must also be named in the person's own message (their name, a part of it no other listed person shares, their email or
   user id), not only listed beside it (`reviewer_not_named`). `channel_action` never sends an action named `review_for_other`. Otherwise (a channel that did not declare it, or no channel takes actions) it is refused with
   `acting_as_credentials_required`, and the refusal tells the router to send the user to the deployment's review agent, by the name
