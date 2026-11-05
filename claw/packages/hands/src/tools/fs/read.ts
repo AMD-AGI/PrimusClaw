@@ -112,12 +112,16 @@ export const read = {
     if (args.line_numbers === false && !args.offset && !args.limit) {
       return { content: [{ type: "text" as const, text: content }] };
     }
+    // A newline ends a line, it does not start one: "a\nb\n" is two lines, not two and an empty third.
     const lines = content.split("\n");
+    const endsWithNewline = lines.length > 1 && lines[lines.length - 1] === "";
+    if (endsWithNewline) lines.pop();
     const start = Math.max(0, (args.offset ?? 1) - 1);
     const end = Math.min(lines.length, start + (args.limit && args.limit > 0 ? args.limit : READ_DEFAULT_LINES));
     const page = lines.slice(start, end);
+    // Raw text keeps the file's own final newline when the page reaches the end.
     const body = args.line_numbers === false
-      ? page.join("\n")
+      ? page.join("\n") + (endsWithNewline && end === lines.length && page.length > 0 ? "\n" : "")
       : page.map((l, i) => `${start + i + 1}|${l}`).join("\n");
     const more = end < lines.length
       ? `\n[lines ${start + 1}-${end} of ${lines.length}; call read with offset=${end + 1} for more]`

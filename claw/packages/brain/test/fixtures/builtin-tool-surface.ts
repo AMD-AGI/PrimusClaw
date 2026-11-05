@@ -78,7 +78,7 @@ const SHARED: Record<string, Expected> = {
     required: ["path", "old_string", "new_string"],
   },
   glob: { properties: ["pattern", "directory"], required: ["pattern"] },
-  grep: { properties: ["pattern", "path", "context", "case_sensitive", "glob"], required: ["pattern"] },
+  grep: { properties: ["pattern", "path", "context", "case_sensitive", "glob", "output_mode", "head_limit"], required: ["pattern"] },
   ls: { properties: ["path"] },
   notebook_edit: {
     properties: ["path", "cell_index", "old_string", "new_string"],

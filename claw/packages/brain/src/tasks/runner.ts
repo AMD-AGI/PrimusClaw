@@ -60,6 +60,7 @@ import { gpuWorkspaceFor } from "../sandbox/workspace-select.js";
 import { getMultiNodeProvider, multiNodeAvailable } from "../sandbox/multi-node/factory.js";
 import type { MultiNodeContext } from "../sandbox/multi-node/types.js";
 import { destroyHands, reapPendingHands, classifySandboxFailure } from "../sandbox/reaper.js";
+import { rememberRouterCredential } from "../sandbox/sandbox-router.js";
 import { probeSandboxContainer } from "../sandbox/container-probe.js";
 import { fetchPlatformFacts } from "../sandbox/platform-facts-read.js";
 import type { PlatformFacts, RunEndedParkOutcome } from "@claw/protocol";
@@ -488,7 +489,6 @@ export interface TaskRunnerSideEffects {
   /** Constructing the client is itself a seam: it opens an MCP transport. */
   makeHandsClient: (
     url: string, token: string, owner: string, run: string, deadlineAt: string | undefined, shellRun: string,
-    platformKey?: string,
   ) => HandsClient;
 }
 
@@ -525,8 +525,8 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   releaseTaskLock,
   // Hoisted function declaration: the binding exists before this const runs.
   flushTranscript,
-  makeHandsClient: (url, token, owner, run, deadlineAt, shellRun, platformKey) =>
-    new HandsClient(url, token, owner, run, deadlineAt, shellRun, platformKey),
+  makeHandsClient: (url, token, owner, run, deadlineAt, shellRun) =>
+    new HandsClient(url, token, owner, run, deadlineAt, shellRun),
 };
 
 let _deps: TaskRunnerDeps | null = null;
@@ -1896,7 +1896,7 @@ class TaskRunner {
         attemptId: this.attempt.attemptId },
     );
     const newHands = fx().makeHandsClient(
-      newUrl, newToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun, this.platformKey,
+      newUrl, newToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
     );
     // Fold the newest in-flight snapshot into the session prefix *before*
     // restoring from it. The session prefix only advances on a successful
@@ -1963,7 +1963,6 @@ class TaskRunner {
       this.handsUrl,
       TaskRunner.RECOVERY_HEALTH_TIMEOUT_MS,
       this.abortCtrl.signal,
-      this.platformKey,
     );
 
     // Hands is answering, so the sandbox is fine and this client is not. A
@@ -2036,7 +2035,6 @@ class TaskRunner {
     this.hands?.close().catch(() => {});
     const fresh = fx().makeHandsClient(
       this.handsUrl, this.handsToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
-      this.platformKey,
     );
     this.hands = fresh;
     return fresh;
@@ -2664,7 +2662,7 @@ class TaskRunner {
       attempt: this.attempt,
     });
     this.hands = fx().makeHandsClient(
-      handsUrl, handsToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun, this.platformKey,
+      handsUrl, handsToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
     );
     // ensureHands returns only after bootstrap and the health check, so this
     // is the first moment a sandbox can actually be used -- unlike the
@@ -2734,12 +2732,12 @@ class TaskRunner {
     if (!entry) return null;
     const info = JSON.parse(entry.value) as { handsUrl?: unknown; token?: unknown; platformKey?: unknown };
     if (typeof info.handsUrl !== "string" || !info.handsUrl) return null;
+    rememberRouterCredential(info.handsUrl, info.platformKey);
     // Not closed afterwards: the reconciliation reads two plain HTTP routes and
     // never opens the MCP transport, so there is nothing holding a connection.
     return fx().makeHandsClient(
       info.handsUrl, typeof info.token === "string" ? info.token : "",
       this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
-      this.platformKey || (typeof info.platformKey === "string" ? info.platformKey : ""),
     );
   }
 

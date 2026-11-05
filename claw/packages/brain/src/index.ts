@@ -66,8 +66,9 @@ import {
 } from "./sandbox/registry.js";
 import { getMultiNodeProvider, multiNodeAvailable } from "./sandbox/multi-node/factory.js";
 import type { SessionDestroyResult } from "./sandbox/multi-node/types.js";
+import { destroySessionCompute } from "./sandbox/session-compute-teardown.js";
 import {
-  destroyHands, parkForIdleReclaim, readSessionPlatformKey, releaseLocalHandsState,
+  destroyHands, parkForIdleReclaim, releaseLocalHandsState,
   startMultiNodeSweeper, startSandboxSweeper,
 } from "./sandbox/reaper.js";
 import { activeAbort, SIGTERM_ABORT_REASON } from "./tasks/abort-registry.js";
@@ -653,14 +654,14 @@ async function cleanupSession(sid: string, payload: Uint8Array): Promise<void> {
   markSessionDeleted(sid);
   await abortRunsOfDeletedSession(sid);
 
-  const platformKey = decodeCleanupPayload(payload.length ? sc.decode(payload) : "").platformKey
-    || (await readSessionPlatformKey(sid));
+  const offeredKey = decodeCleanupPayload(payload.length ? sc.decode(payload) : "").platformKey ?? "";
   let complete = false;
   let failureReason: SessionCleanupIncompleteReason | undefined;
   try {
-    const destroyed: SessionDestroyResult = multiNodeAvailable()
-      ? await getMultiNodeProvider().destroyForSession(sid, { platformKey })
-      : { complete: true, found: 0, deleted: 0 };
+    const destroyed: SessionDestroyResult = await destroySessionCompute(sid, offeredKey, {
+      multiNodeAvailable,
+      destroyForSession: (sessionId, opts) => getMultiNodeProvider().destroyForSession(sessionId, opts),
+    });
     complete = destroyed.complete;
     failureReason = destroyed.reason;
     if (complete) await destroyHands(sid);

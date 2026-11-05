@@ -370,6 +370,19 @@ if [ "$DEPLOY_CLAW" = "true" ]; then
   [ -n "${BYOK_VERIFY_MODELS_URL:-}" ] && claw_env+=("BYOK_VERIFY_MODELS_URL=$BYOK_VERIFY_MODELS_URL")
   [ -n "${BYOK_VERIFY_API_STYLE:-}" ]  && claw_env+=("BYOK_VERIFY_API_STYLE=$BYOK_VERIFY_API_STYLE")
   [ -n "${PG_SSL_NO_VERIFY:-}" ]       && claw_env+=("PG_SSL_NO_VERIFY=$PG_SSL_NO_VERIFY")
+  # Claw must know whether the Router authenticates: with auth on it presents the
+  # sandbox owner's SaFE key to the Router (Hands through the port proxy, app MCP,
+  # the console's sandbox lists), and a Router with auth on refuses anything else.
+  # Follows the Sandbox installed here; an explicit value wins.
+  if [ -n "${SANDBOX_ROUTER_AUTH_ENABLED:-}" ]; then
+    claw_env+=("SANDBOX_ROUTER_AUTH_ENABLED=$SANDBOX_ROUTER_AUTH_ENABLED")
+  elif [ "$DEPLOY_SANDBOX" = "true" ]; then
+    if [ "$INSECURE_SANDBOX" = "true" ]; then
+      claw_env+=("SANDBOX_ROUTER_AUTH_ENABLED=false")
+    else
+      claw_env+=("SANDBOX_ROUTER_AUTH_ENABLED=true")
+    fi
+  fi
 
   log "+ env ${claw_env[*]} bash $REPO_ROOT/claw/deploy/deploy.sh ${claw_flags[*]}"
   env "${claw_env[@]}" bash "$REPO_ROOT/claw/deploy/deploy.sh" "${claw_flags[@]}"

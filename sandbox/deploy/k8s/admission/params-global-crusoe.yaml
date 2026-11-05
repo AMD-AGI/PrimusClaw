@@ -1,0 +1,14 @@
+# Parameters of sandbox-pod-guardrails on global-crusoe (SaFE cluster "crusoe").
+# GPU sandboxes in the SaFE workspaces crusoe-spur-vk and top-models use the
+# workspace's hostpath volume /shared_nfs (it is the workspace volume, not a PVC).
+# One key per namespace; the value is a comma-separated list of allowed roots.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sandbox-pod-guardrails
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/part-of: agent-sandbox
+data:
+  crusoe-spur-vk: /shared_nfs
+  top-models: /shared_nfs

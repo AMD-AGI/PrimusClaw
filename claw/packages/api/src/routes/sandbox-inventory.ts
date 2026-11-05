@@ -84,8 +84,8 @@ export interface InventoryDeps {
    * like a deployment that has none.
    */
   dagHandles(): Promise<Array<[string, Record<string, HandleInfo>]>>;
-  /** `platformKey` is the session owner's key, which a routed URL needs to pass the Router. */
-  probeHealth(handsUrl: string, platformKey: string): Promise<boolean>;
+  /** `platformKey` is the entry's owner key, for a Router that authenticates (see admin.ts). */
+  probeHealth(handsUrl: string, platformKey?: string): Promise<boolean>;
   sessionIdFromKey(key: string): string;
 }
 
@@ -230,7 +230,7 @@ export async function collectSandboxInventory(deps: InventoryDeps): Promise<Sand
     sessions.push(rowFromEntry(
       deps.sessionIdFromKey(key), info,
       handsUrl
-        ? await deps.probeHealth(handsUrl, typeof info.platformKey === "string" ? info.platformKey : "")
+        ? await deps.probeHealth(handsUrl, typeof info.platformKey === "string" ? info.platformKey : undefined)
         : false,
     ));
   }

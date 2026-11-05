@@ -18,15 +18,83 @@
 #   - Each account has its own JetStream namespace, so prod and devs can
 #     reuse the same subject names (events.>, tasks.>) without collision.
 
+# Pod hardening. Both containers run as uid 1000 on a read-only root
+# filesystem: nats writes only to the JetStream PVC (/data, made writable by
+# fsGroup) and its pid file (/var/run/nats, an emptyDir the chart already
+# mounts); the reloader shares that uid so it can still signal nats.
+# OnRootMismatch re-owns an existing root-owned PVC once, on the first start
+# after this lands, and skips the walk afterwards.
 container:
   image:
     repository: nats
     tag: 2.12.6-alpine
+  merge:
+    securityContext: &hardened
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
 
 reloader:
   image:
     repository: natsio/nats-server-config-reloader
     tag: 0.21.1
+  merge:
+    securityContext: *hardened
+
+podTemplate:
+  merge:
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+
+# nats-box: the CLI keeps its context under $XDG_CONFIG_HOME (/nsc/.config),
+# which becomes an emptyDir; the image's WORKDIR /root is mode 0700, hence
+# workingDir. upgrade.sh execs `nats kv put/get` here, which needs nothing else.
+natsBox:
+  container:
+    merge:
+      workingDir: /tmp
+      securityContext: *hardened
+    # patch, not merge: a merged list would replace the chart's own
+    # contexts mount instead of adding to it.
+    patch:
+    - op: add
+      path: /volumeMounts/-
+      value: {name: nsc-config, mountPath: /nsc/.config}
+    - op: add
+      path: /volumeMounts/-
+      value: {name: tmp, mountPath: /tmp}
+  podTemplate:
+    merge:
+      spec:
+        automountServiceAccountToken: false
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+          seccompProfile:
+            type: RuntimeDefault
+    patch:
+    - op: add
+      path: /spec/volumes/-
+      value: {name: nsc-config, emptyDir: {}}
+    - op: add
+      path: /spec/volumes/-
+      value: {name: tmp, emptyDir: {}}
 
 # storageClassName is injected at deploy time via:
 #   --set config.jetstream.fileStore.pvc.storageClassName=$STORAGE_CLASS

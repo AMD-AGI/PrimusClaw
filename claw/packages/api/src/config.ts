@@ -428,6 +428,22 @@ export const UPLOAD_SWEEP_INTERVAL_MIN = envInt("UPLOAD_SWEEP_INTERVAL_MIN", 60)
 // makes it active again.
 export const SESSION_AUTO_ARCHIVE_DAYS = envInt("SESSION_AUTO_ARCHIVE_DAYS", 7, { min: 0 });
 
+// --- Archived-session retention ---
+// An archived session is deleted this many days after it was archived, by the
+// same daily pass and through the same deletion path as a user's delete (the
+// conversation rows are stamped deleted, the S3 workspace and checkpoint
+// prefixes are removed by the cleanup sweeper). 0 disables it. See
+// sessions/retention.ts for which archived sessions are never taken.
+export const SESSION_RETENTION_DAYS = envInt("SESSION_RETENTION_DAYS", 0, { min: 0 });
+// The soft-deleted conversation rows of a session deleted more than this many
+// days ago (turns, events, summaries) are removed for good. 0 disables it.
+export const SESSION_PURGE_DAYS = envInt("SESSION_PURGE_DAYS", 0, { min: 0 });
+// How many sessions one daily pass deletes, and separately how many deleted
+// sessions it purges the rows of.
+export const SESSION_RETENTION_BATCH = envInt("SESSION_RETENTION_BATCH", 500, { min: 1 });
+// Count and log what the pass would delete and purge, and change nothing.
+export const SESSION_RETENTION_DRY_RUN = envBool("SESSION_RETENTION_DRY_RUN", false);
+
 // --- Memory / Skill LLM ---
 export const MEMORY_LLM_MODEL = env("MEMORY_LLM_MODEL", env("DEFAULT_MODEL", "claude-opus-4-6"));
 export const MEMORY_LLM_API_KEY = env("MEMORY_LLM_API_KEY", env("ANTHROPIC_AUTH_TOKEN", env("ANTHROPIC_API_KEY")));

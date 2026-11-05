@@ -193,9 +193,11 @@ export const SANDBOX_CPU_NAMESPACE = env("SANDBOX_CPU_NAMESPACE");
  * another cluster, where that name does not resolve and the Router is the only way in.
  * Has no effect without SANDBOX_ROUTER_URL.
  *
- * Routed Hands requests carry the session owner's platform key in Authorization,
- * which the Router authenticates and strips, and the per-sandbox Hands token in
- * X-Hands-Token, which Hands validates.
+ * Routed Hands requests carry the per-sandbox Hands token in X-Hands-Token. A Router
+ * running with `--enable-auth` also needs a SaFE key it accepts: with
+ * SANDBOX_ROUTER_AUTH_ENABLED on, `Authorization` carries the sandbox owner's platform
+ * key (see `rememberRouterCredential` in sandbox/sandbox-router.ts); with it off, such a
+ * Router refuses them with 401 and the Hands health check fails loudly.
  */
 export const SANDBOX_HANDS_VIA_ROUTER = envBool("SANDBOX_HANDS_VIA_ROUTER", false);
 
@@ -211,7 +213,9 @@ export function handsBehindRouterProxy(): boolean {
  * Whether the sandbox Router runs with `--enable-auth`. It decides what an
  * application's session-level MCP carries as `token`: with auth on, the
  * `<SAFE_API_KEY>` placeholder (the Router authenticates the session owner);
- * with auth off, the run's MCP token. Must match the API's setting.
+ * with auth off, the run's MCP token. With it on, routed Hands requests also
+ * present the sandbox owner's platform key to the Router. Must match the API's
+ * setting.
  */
 export const SANDBOX_ROUTER_AUTH_ENABLED = envBool("SANDBOX_ROUTER_AUTH_ENABLED", false);
 export const SANDBOX_NAMESPACE = env("SANDBOX_NAMESPACE", "default");

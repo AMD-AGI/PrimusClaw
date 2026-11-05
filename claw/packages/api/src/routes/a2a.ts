@@ -892,8 +892,11 @@ async function assertParentWritable(
   auth: A2AAuthContext,
   q: StatementRunner,
 ): Promise<void> {
+  // Held until the attach commits, for the reason `resolveParentAuthorisation`
+  // in routes/sessions.ts gives: a deletion of the parent waits for it, or it
+  // waits for the deletion and then finds the parent gone.
   const parent = (await q.query(
-    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR KEY SHARE",
     [parentSessionId],
   )).rows[0] as { user_id?: string | null } | undefined;
   const caller: UserInfo = {

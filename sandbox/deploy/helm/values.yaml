@@ -21,6 +21,17 @@ controlplane:
     workloadManager: 8081
     managerMetrics: 8082
     managerHealth: 8083
+  # Ingress NetworkPolicy of the control plane. It admits every pod in the
+  # cluster on the router, workload-manager and metrics ports. Traffic that
+  # does not come from a pod has no pod identity and needs an ipBlock here:
+  # a gateway or a node process on the host network (from the node address on
+  # its own node, and from the node's overlay address, e.g. flannel.1, on any
+  # other), and, under an engine that learns a new pod's address a second or
+  # two after it starts (kube-router), a client's first connection from a new
+  # pod. Example: ["10.244.0.0/16", "192.0.2.0/24"] for the pod network and the
+  # node subnet. Empty by default: pods only.
+  networkPolicy:
+    extraIngressCIDRs: []
   config:
     leaderElect: true
     extensions: true

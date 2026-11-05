@@ -28,7 +28,7 @@ import {
 import { getSystemEnv } from "../infra/system-env.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
 import { checkHandsHealth } from "./hands-health.js";
-import { safeHandsBaseUrl } from "./sandbox-router.js";
+import { rememberRouterCredential, safeHandsBaseUrl } from "./sandbox-router.js";
 import type { HandsHealthResult } from "./hands-health.js";
 import { destroyHands } from "./reaper.js";
 import {
@@ -468,7 +468,8 @@ async function probeHandleSandbox(
   token?: string,
   signal?: AbortSignal,
 ): Promise<HandleSandboxState> {
-  const health = await checkHandsHealth(handsUrl, REUSE_HEALTH_TIMEOUT_MS, signal, identity?.platformKey ?? "");
+  rememberRouterCredential(handsUrl, identity && "platformKey" in identity ? identity.platformKey : undefined);
+  const health = await checkHandsHealth(handsUrl, REUSE_HEALTH_TIMEOUT_MS, signal);
   if (health.ok) return { state: "serving", detail: health.detail };
   // Without both of these there is nothing to probe or restart WITH: the
   // container is reached through the identity, and Hands is relaunched with the
@@ -1797,6 +1798,7 @@ async function reuseOwnDagHandle(
   }
 
   const identity = identityFromHandleInfo(own);
+  rememberRouterCredential(own.hands_url, own.platform_key);
 
   // Half-created, or built for something else. `makeOnProvisioned` registers the
   // handle the moment SaFE assigns an id -- deliberately, because a cancel
@@ -1956,6 +1958,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
   if (!recorded) return null;
   const { binding, info } = recorded;
   const identity = reuseIdentity(info);
+  rememberRouterCredential(info.handsUrl, identity.platformKey);
   const hasToken = typeof info.token === "string" && info.token.length > 0;
   if (typeof info.terminalReason === "string" && info.terminalReason) {
     // The previous sandbox is already finished: this turn is new work, not a
@@ -2086,10 +2089,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
     return null;
   }
 
-  const health = await checkHandsHealth(
-    info.handsUrl as string, REUSE_HEALTH_TIMEOUT_MS, signal,
-    typeof info.platformKey === "string" ? info.platformKey : "",
-  );
+  const health = await checkHandsHealth(info.handsUrl as string, REUSE_HEALTH_TIMEOUT_MS, signal);
   if (health.ok && hasToken) {
     logger.info(
       { sessionId, handsUrl: info.handsUrl, specMatch: verdict.reason },
@@ -2617,6 +2617,7 @@ async function provisionHands(
       );
     }
     const identity = identityFromHandleInfo(info);
+    rememberRouterCredential(info.hands_url, info.platform_key);
     // A registered handle is not necessarily a living Hands endpoint. Probe
     // and restart against this handle's identity, never the shared session key.
     await assertDagHandleAlive(
@@ -2859,6 +2860,7 @@ async function provisionHands(
   // The cluster DNS name unless Hands is reached through the Router, in which
   // case the Router's port proxy for this sandbox (see sandbox-router.ts).
   const handsBaseUrl = safeHandsBaseUrl(nsForSandbox, workloadId, mcpPort);
+  rememberRouterCredential(handsBaseUrl, apiKey);
 
   logger.info({ sessionId, workloadId, handsBaseUrl }, "ensureHands.bootstrap_start");
   await bootstrapHandsInSandbox(
@@ -2874,7 +2876,7 @@ async function provisionHands(
     try {
       // The shared probe, so a routed URL carries the session header the
       // Router needs and fails over between Router bases like every other call.
-      const hr = await checkHandsHealth(`${handsBaseUrl}/mcp`, 3000, undefined, inst.platformKey ?? "");
+      const hr = await checkHandsHealth(`${handsBaseUrl}/mcp`, 3000);
       if (hr.ok) { handsHealthy = true; break; }
     } catch { /* retry */ }
     await sleep(HANDS_HEALTH_INTERVAL_MS);

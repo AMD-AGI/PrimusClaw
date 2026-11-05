@@ -4,9 +4,8 @@
 /**
  * Hands reached through the Router's port proxy, over real sockets.
  *
- * The proxy routes on x-session-id, authenticates Authorization as the session
- * owner's platform key and strips it, so every Hands request carries the
- * session, the platform key, and the Hands credential in X-Hands-Token.
+ * The proxy routes on x-session-id and strips Authorization, so every Hands
+ * request must carry the session and the credential in X-Hands-Token as well.
  * The first Router base here is a closed port, so the same requests also prove
  * that a Hands URL built on a dead base still gets through.
  */
@@ -50,36 +49,25 @@ test("with the flag on, the Hands base is the Router's port proxy for the sandbo
   );
 });
 
-test("health and a credentialed route carry the session, the platform key and X-Hands-Token, past a dead base", async () => {
+test("health and a credentialed route carry the session and X-Hands-Token, past a dead base", async () => {
   resetRouterPreferenceForTest();
   seen.length = 0;
   const mcpUrl = `${safeHandsBaseUrl("ns", "wl-7", "9100")}/mcp`;
   assert.equal(new URL(mcpUrl).origin, dead, "built on the first base, which is down");
 
-  const health = await checkHandsHealth(mcpUrl, 3_000, undefined, "ak-owner");
+  const health = await checkHandsHealth(mcpUrl, 3_000);
   assert.deepEqual(health, { ok: true, detail: "ok" });
   assert.equal(seen[0].url, "/v1/namespaces/ns/code-interpreters/wl-7/invocations/proxy/9100/health");
   assert.equal(seen[0].headers["x-session-id"], "wl-7");
-  assert.equal(seen[0].headers.authorization, "Bearer ak-owner");
 
-  const running = await countActiveShells(mcpUrl, "tok", "owner-1", 5_000, "ak-owner");
+  const running = await countActiveShells(mcpUrl, "tok", "owner-1");
   assert.equal(running, 2);
   const last = seen[seen.length - 1];
   assert.equal(last.url, "/v1/namespaces/ns/code-interpreters/wl-7/invocations/proxy/9100/internal/shells/active");
   assert.equal(last.headers["x-session-id"], "wl-7");
   const token = last.headers["x-hands-token"];
   assert.ok(typeof token === "string" && token.length > 0, "credential travels in X-Hands-Token");
-  assert.equal(last.headers.authorization, "Bearer ak-owner", "Authorization is the platform key, not the Hands credential");
-});
-
-test("without a platform key a routed request offers the Router no credential", async () => {
-  resetRouterPreferenceForTest();
-  seen.length = 0;
-  const mcpUrl = `${safeHandsBaseUrl("ns", "wl-8", "9100")}/mcp`;
-  await countActiveShells(mcpUrl, "tok", "owner-1");
-  const last = seen[seen.length - 1];
-  assert.equal(last.headers.authorization, undefined);
-  assert.ok(last.headers["x-hands-token"], "the Hands credential still travels in X-Hands-Token");
+  assert.equal(last.headers.authorization, `Bearer ${token}`, "and in Authorization, the same value");
 });
 
 test("a restart takes the Hands port from the proxy path, not the Router's port", () => {

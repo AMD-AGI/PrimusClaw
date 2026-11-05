@@ -63,6 +63,7 @@ import {
   type HandsProbeEntry,
 } from "./container-probe.js";
 import { checkHandsHealth } from "./hands-health.js";
+import { rememberRouterCredential } from "./sandbox-router.js";
 import {
   parseExecTimeoutMs, type SandboxExecOptions, type SandboxInstance,
 } from "./provider.js";
@@ -403,6 +404,7 @@ export async function restartHandsInSandbox(
   attempt: HandsRestartAttempt,
 ): Promise<HandsRestartResult> {
   const { sessionId, handsUrl } = attempt;
+  rememberRouterCredential(handsUrl, attempt.entry?.platformKey);
   // Checked here rather than at the call sites, because only one of the three
   // was checking it: the two in ensure-hands restarted Hands regardless, so
   // turning the flag off disabled a third of the feature and left an operator
@@ -492,7 +494,7 @@ export async function restartHandsInSandbox(
       : attempt.pollTries ?? SANDBOX_HANDS_RESTART_MAX_TRIES;
     const intervalMs = attempt.pollIntervalMs ?? SANDBOX_HANDS_RESTART_INTERVAL_MS;
     for (let tries = 0; tries < maxTries; tries++) {
-      const health = await checkHandsHealth(handsUrl, HEALTH_TIMEOUT_MS, attempt.signal, inst.platformKey ?? "");
+      const health = await checkHandsHealth(handsUrl, HEALTH_TIMEOUT_MS, attempt.signal);
       if (health.ok) {
         logger.info(
           { sessionId, tries: tries + 1, launchDetail },

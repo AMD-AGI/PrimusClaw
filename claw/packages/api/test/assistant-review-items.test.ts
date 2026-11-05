@@ -22,6 +22,10 @@
  *   D1d a held write of a stopped review that was already answered (submitted, or being made) is not "denied as stopped"
  *   D1e the caller's guard is asked with the owner's assistant row held (the reviewer's, for a review asked of them)
  *   A1  a review the assistant started (`mergeNeedsConfirmation`) is a session that merges only on a confirmation, and every restart keeps it
+ *   H1  a review the assistant handed to the channel (`review_for_other`) and the channel started over the route: whatever the body says,
+ *       its merge waits for the reviewer's own confirmation, it merges not at all when the router did not read a merge, one handoff starts
+ *       once (a replay, sequential or concurrent, makes nothing), a handoff names only its own requester, reviewer and pull requests, and a
+ *       request that leaves the handoff's id out is held all the same
  *   G1  a review session is no worker: no role profile, no worker report at its turn's end, not an orphan to the task sweep
  *   G2  nothing the server queues reaches an acting session without the person's proof: work_send into a review is refused
  *   Q8b a requested review with no turn left is refused on the immediate path (a follow-up into its idle session) and halted
@@ -108,7 +112,7 @@ describe("assistant review items", { skip }, () => {
   });
   beforeEach(async () => {
     await w.q(`TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants,
-      claw_sessions, claw_github_confirmations, claw_github_audit CASCADE`);
+      claw_sessions, claw_github_confirmations, claw_github_audit, claw_assistant_review_handoffs CASCADE`);
     w.drains.length = 0;
     checks = [];
     decisions = [];
@@ -950,6 +954,86 @@ describe("assistant review items", { skip }, () => {
     // A body cannot set it, nor can one clear it: it is not read from a request.
     assert.equal((ri.parseReviewRequest({ prs: [PR(264)], merge_needs_confirmation: false }) as Record<string, unknown>).mergeNeedsConfirmation, undefined);
   });
+
+  test("H1 a review the assistant handed over merges only on the reviewer's confirmation, whatever the channel's body says; one handoff starts once", () => withEnv({
+    ...ROOMY, CLAW_REVIEW_FOR_OTHERS_MAX_ACTIVE: "20", CLAW_REVIEW_FOR_OTHERS_PER_REQUESTER_MAX_ACTIVE: "20", CLAW_ASSISTANT_MAX_ACTIVE_ITEMS: "20",
+  }, async () => {
+    const { mergeNeedsConfirmationOf } = await import("../src/github-review/review-target.js");
+    const q = ((text: string, params?: unknown[]) => w.q(text, params as never)) as never;
+    const handoff = (id: string, prs: number[], merge: boolean, reviewer = "bob", user = "alice") =>
+      ri.recordReviewHandoff(q, { handoffId: id, userId: user, reviewerUserId: reviewer, prs: prs.map((n) => PR(n)), merge });
+    const config = async (sessionId: string) => (await w.q("SELECT config FROM claw_sessions WHERE session_id = $1", [sessionId]))[0].config;
+    const made = async (r: Res) => {
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      const item = await w.item(r.body.data.items[0].item_id);
+      return { item, config: await config(item.worker_session_id) };
+    };
+
+    // The router read a merge: the channel asks for one (review_only false), and the review is made to wait for bob's confirmation.
+    await handoff("h-merge", [254], true);
+    const merged = await made(await start("alice", { prs: [PR(254)], acting_as: "bob", review_only: false, handoff_id: "h-merge" }));
+    assert.deepEqual([merged.config.merge_needs_confirmation, merged.config.review_only, merged.item.params.merge_needs_confirmation], [true, false, true]);
+    assert.equal(mergeNeedsConfirmationOf(merged.config), true, "the review tools of bob's session hold its merge for bob (G1, G3, G4 of github-review-assistant-merge)");
+    assert.equal(merged.item.user_id, "bob");
+    assert.ok((await w.q("SELECT used_at FROM claw_assistant_review_handoffs WHERE handoff_id = 'h-merge'"))[0].used_at, "started from once");
+    // A replay of the same handoff makes nothing, even for a pull request the open review does not block.
+    const replay = await start("alice", { prs: [PR(254)], acting_as: "bob", review_only: false, handoff_id: "h-merge" });
+    assert.deepEqual([replay.status, replay.body.error], [409, "handoff_used"]);
+
+    // The router did not read a merge: whatever the channel's body says, the review only reviews.
+    await handoff("h-review", [255], false);
+    const reviewOnly = await made(await start("alice", { prs: [PR(255)], acting_as: "bob", review_only: false, handoff_id: "h-review" }));
+    assert.deepEqual([reviewOnly.config.review_only, reviewOnly.config.merge_needs_confirmation], [true, true]);
+
+    // The channel leaves the id out: the review of a handed-over pull request by that reviewer for that person is held all the same.
+    await handoff("h-unechoed", [256], true);
+    const unechoed = await made(await start("alice", { prs: [PR(256)], acting_as: "bob", review_only: false }));
+    assert.deepEqual([unechoed.config.review_only, unechoed.config.merge_needs_confirmation], [false, true]);
+    // ...and, when the router read no merge, it only reviews: leaving the id out does not lift the handoff's review-only reading.
+    await handoff("h-unechoed-review", [259], false);
+    const unechoedReview = await made(await start("alice", { prs: [PR(259)], acting_as: "bob", review_only: false }));
+    assert.deepEqual([unechoedReview.config.review_only, unechoedReview.config.merge_needs_confirmation], [true, true]);
+    // A start without the id uses up the handoff it matched: its id then starts nothing more, not even its other pull request.
+    await handoff("h-unechoed-two", [264, 265], true);
+    await made(await start("alice", { prs: [PR(264)], acting_as: "bob", review_only: false }));
+    const afterUnechoed = await start("alice", { prs: [PR(265)], acting_as: "bob", review_only: false, handoff_id: "h-unechoed-two" });
+    assert.deepEqual([afterUnechoed.status, afterUnechoed.body.error], [409, "handoff_used"]);
+
+    // A handoff names its requester, its reviewer and its pull requests, and lives as long as its delivery could take.
+    await handoff("h-257", [257], true);
+    for (const [user, body, status, error] of [
+      ["alice", { prs: [PR(258)], acting_as: "bob", handoff_id: "h-257" }, 409, "handoff_mismatch"],
+      ["alice", { prs: [PR(257), PR(258)], acting_as: "bob", handoff_id: "h-257" }, 409, "handoff_mismatch"],
+      ["carol", { prs: [PR(257)], acting_as: "bob", handoff_id: "h-257" }, 404, "handoff_not_found"],
+      ["alice", { prs: [PR(257)], acting_as: "dave", handoff_id: "h-257" }, 404, "handoff_not_found"],
+      ["alice", { prs: [PR(257)], acting_as: "bob", handoff_id: "h-none" }, 404, "handoff_not_found"],
+      ["alice", { prs: [PR(257)], handoff_id: "h-257" }, 400, "invalid_request"],
+    ] as const) {
+      const r = await start(user, body);
+      assert.deepEqual([r.status, r.body.error], [status, error], JSON.stringify([user, body]));
+    }
+    await w.q("UPDATE claw_assistant_review_handoffs SET created_at = NOW() - make_interval(hours => $1::int + 1) WHERE handoff_id = 'h-257'", [ri.REVIEW_HANDOFF_HOURS]);
+    assert.deepEqual((await start("alice", { prs: [PR(257)], acting_as: "bob", handoff_id: "h-257" })).body.error, "handoff_not_found", "expired");
+    assert.equal(await count("claw_work_items"), 5, "nothing made by a refused handoff");
+    // Too late to start by its id, yet a start without it is still held: the record binds for as long as it is kept.
+    const late = await made(await start("alice", { prs: [PR(257)], acting_as: "bob", review_only: false }));
+    assert.deepEqual([late.config.review_only, late.config.merge_needs_confirmation], [false, true]);
+
+    // Two starts from one handoff at once, each for a different one of its pull requests (so no open review stands between them): one is
+    // made, the other is told the handoff was used.
+    await handoff("h-race", [260, 261], true, "carol");
+    const raced = await Promise.all([260, 261].map((n) => start("alice", { prs: [PR(n)], acting_as: "carol", review_only: false, handoff_id: "h-race" })));
+    assert.deepEqual(raced.map((r) => [r.status, r.body.error ?? null]).sort(), [[200, null], [409, "handoff_used"]], JSON.stringify(raced.map((r) => r.body)));
+    assert.equal(await count("claw_work_items", "user_id = 'carol'"), 1, "one start from one handoff");
+    // A record past its keeping is pruned with the next handoff of the person, and binds nothing after.
+    await w.q("UPDATE claw_assistant_review_handoffs SET created_at = NOW() - make_interval(days => $1::int + 1) WHERE handoff_id = 'h-257'", [ri.REVIEW_HANDOFF_RETENTION_DAYS]);
+    await handoff("h-later", [263], false);
+    assert.deepEqual((await w.q("SELECT handoff_id FROM claw_assistant_review_handoffs WHERE handoff_id IN ('h-257', 'h-later') ORDER BY 1")).map((r) => r.handoff_id), ["h-later"]);
+
+    // A review asked of someone else with no handoff behind it is what it was: the asking service's own, merging as it always did.
+    const direct = await made(await start("alice", { prs: [PR(262)], acting_as: "bob", review_only: false }));
+    assert.deepEqual([direct.config.review_only, direct.config.merge_needs_confirmation], [false, undefined]);
+  }));
 
   test("G1 a review session is no worker: no role profile, no worker report at its turn's end, not an orphan to the task sweep", async () => {
     const it = await one("alice");

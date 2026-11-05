@@ -155,7 +155,7 @@ interface HandsKvEntry extends SharedVerdictFields, ReclaimEvidenceFields {
 interface KeepaliveDeps {
   kv: KV;
   /** Test seam for the EnvD jobs probe. Production never calls Hands here. */
-  countActiveShells?: (url: string, token: string, owner: string, timeoutMs?: number, platformKey?: string) => Promise<number>;
+  countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
   /** Publish a terminal sandbox event to the session event stream. */
   emitSandboxFailure?: (
     sessionId: string,
@@ -227,9 +227,7 @@ async function probeJobs(
     // workload reported absent or terminal is that regardless of who counts
     // its jobs, and the substitution must not turn it into an unknown.
     await assertSandboxRunning(entry);
-    return {
-      count: await deps.countActiveShells(info.handsUrl ?? "", info.token ?? "", sessionId, undefined, info.platformKey ?? ""),
-    };
+    return { count: await deps.countActiveShells(info.handsUrl ?? "", info.token ?? "", sessionId) };
   }
   const result = await inspectSandboxJobs(entry);
   // Expiry CAS is conditioned on the enrollment revision. Persisting identity

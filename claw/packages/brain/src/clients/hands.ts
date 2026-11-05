@@ -293,10 +293,10 @@ export function explainHandsError(
  * addressing decision depends on: a test that cannot choose which version it is
  * talking to cannot exercise either side of the boundary.
  */
-async function probeShellRecordsCapability(url: string, platformKey = ""): Promise<boolean> {
+async function probeShellRecordsCapability(url: string): Promise<boolean> {
   try {
     const resp = await handsFetch(handsEndpoint(url, "/health"), {
-      headers: handsRouteHeaders(url, platformKey),
+      headers: handsRouteHeaders(url),
       signal: AbortSignal.timeout(5_000),
       dispatcher: HANDS_DISPATCHER,
     } as Parameters<typeof undiciFetch>[1]);
@@ -311,7 +311,7 @@ let readShellRecordsCapability = probeShellRecordsCapability;
 
 /** Swap the capability read; returns the call that puts the real one back. */
 export function bindShellRecordsCapabilityForTest(
-  fn: (url: string, platformKey?: string) => Promise<boolean>,
+  fn: (url: string) => Promise<boolean>,
 ): () => void {
   readShellRecordsCapability = fn;
   return () => { readShellRecordsCapability = probeShellRecordsCapability; };
@@ -781,7 +781,6 @@ export class HandsClient {
     private run: string = "",
     private deadlineAt: string = "",
     private shellRun: string = run,
-    private platformKey: string = "",
   ) {
     this.client = new Client(
       { name: "brain", version: "1.0.0" },
@@ -802,9 +801,9 @@ export class HandsClient {
         fetch: handsFetch as unknown as typeof fetch,
         requestInit: {
           headers: {
-            // Routed: the platform key in Authorization for the Router, which
-            // strips it, the Hands token in X-Hands-Token, and x-session-id.
-            ...handsCredentialHeaders(this.url, this.token, this.platformKey),
+            // Authorization plus X-Hands-Token, and x-session-id when routed:
+            // the Router strips the first and needs the last.
+            ...handsCredentialHeaders(this.url, this.token),
             ...(this.owner ? { [OWNER_HEADER]: this.owner } : {}),
             ...(this.shellRun ? { [RUN_HEADER]: this.shellRun } : {}),
             ...(this.deadlineAt ? { [DEADLINE_HEADER]: this.deadlineAt } : {}),
@@ -837,7 +836,7 @@ export class HandsClient {
       // A read that fails answers the more restrictive of the two, wherever it
       // fails: it costs a run-qualified id a record-writing Hands would have
       // taken plain, never an address left unenforced.
-      this.recordsCapability = await readShellRecordsCapability(this.url, this.platformKey).catch(() => false);
+      this.recordsCapability = await readShellRecordsCapability(this.url).catch(() => false);
     }
     return this.recordsCapability;
   }
@@ -892,7 +891,7 @@ export class HandsClient {
     try {
       const resp = await handsFetch(handsEndpoint(this.url, "/internal/shells/class"), {
         method: "POST",
-        headers: { ...handsCredentialHeaders(this.url, this.scopedCredential(), this.platformKey), "content-type": "application/json" },
+        headers: { ...handsCredentialHeaders(this.url, this.scopedCredential()), "content-type": "application/json" },
         body: JSON.stringify({ shell_id: await this.wireShellId(shellId) }),
         signal: AbortSignal.timeout(timeoutMs),
         dispatcher: HANDS_DISPATCHER,
@@ -917,7 +916,7 @@ export class HandsClient {
     try {
       const resp = await handsFetch(handsEndpoint(this.url, "/internal/shells/record"), {
         method: "POST",
-        headers: { ...handsCredentialHeaders(this.url, this.scopedCredential(), this.platformKey), "content-type": "application/json" },
+        headers: { ...handsCredentialHeaders(this.url, this.scopedCredential()), "content-type": "application/json" },
         body: JSON.stringify({ shell_id: shellId }),
         signal: AbortSignal.timeout(10_000),
         dispatcher: HANDS_DISPATCHER,
@@ -1263,7 +1262,7 @@ export class HandsClient {
     if (!this.shellRun) return { stopped: 0, escalated: 0, surviving: 0, shells: [] };
     const resp = await handsFetch(handsEndpoint(this.url, "/internal/shells/reap"), {
       method: "POST",
-      headers: { ...handsCredentialHeaders(this.url, this.scopedCredential(), this.platformKey), "content-type": "application/json" },
+      headers: { ...handsCredentialHeaders(this.url, this.scopedCredential()), "content-type": "application/json" },
       body: JSON.stringify({ cause, reclaim_op: reclaimOp, grace_ms: graceMs }),
       // Derived from the grace rather than fixed beside it: a deadline chosen
       // independently leaves the top of the grace domain unusable end to end,
@@ -1406,13 +1405,12 @@ export async function countActiveShells(
   token: string,
   owner: string,
   timeoutMs = 5_000,
-  platformKey = "",
 ): Promise<number> {
   if (!owner) throw new Error("hands_active_shells_failed: empty owner");
   const resp = await handsFetch(handsEndpoint(url, "/internal/shells/active"), {
     method: "POST",
     headers: {
-      ...handsCredentialHeaders(url, mintScopeCredential({ owner, run: null }, token), platformKey),
+      ...handsCredentialHeaders(url, mintScopeCredential({ owner, run: null }, token)),
       "content-type": "application/json",
     },
     body: JSON.stringify({}),

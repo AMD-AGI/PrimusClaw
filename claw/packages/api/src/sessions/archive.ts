@@ -5,7 +5,7 @@
  * Archiving a session: the reversible way to take it out of the default list.
  *
  * It reuses `claw_sessions.status` (`active` | `archived`) and changes nothing
- * else, so an archived session can still be read, opened and continued. The
+ * else but `archived_at`, so an archived session can still be read, opened and continued. The
  * activity clock is `updated_at`, which every run-gate transition and rename
  * already bumps; archiving leaves it alone and unarchiving resets it, so a
  * session someone just brought back is not swept again the next day.
@@ -46,7 +46,7 @@ export async function archiveIdleSessions(days: number, q: Queryable = db): Prom
   if (!(days > 0)) return 0;
   const r = await q.query(
     `UPDATE claw_sessions s
-        SET status = 'archived'
+        SET status = 'archived', archived_at = NOW()
       WHERE s.deleted_at IS NULL
         AND COALESCE(s.status, 'active') = 'active'
         AND NOT COALESCE(s.config ? 'primus_anthropic_compat', false)
@@ -64,7 +64,10 @@ export type ArchiveResult = "ok" | "running" | "not_found";
 /** Owner-requested archive. Refused while a run is in flight (here or in a team member); idempotent otherwise. */
 export async function archiveSession(sessionId: string, q: Queryable = db): Promise<ArchiveResult> {
   const r = await q.query(
-    `UPDATE claw_sessions s SET status = 'archived'
+    `UPDATE claw_sessions s
+        SET status = 'archived',
+            -- Archiving an archived session again does not restart its retention clock.
+            archived_at = CASE WHEN s.status = 'archived' THEN s.archived_at ELSE NOW() END
       WHERE s.session_id = $1 AND s.deleted_at IS NULL
         AND ${NO_RUN_IN_FLIGHT}`,
     [sessionId],
@@ -81,7 +84,7 @@ export async function archiveSession(sessionId: string, q: Queryable = db): Prom
 /** Make a session active again and restart its idle clock. */
 export async function unarchiveSession(sessionId: string, q: Queryable = db): Promise<boolean> {
   const r = await q.query(
-    `UPDATE claw_sessions SET status = 'active', updated_at = NOW()
+    `UPDATE claw_sessions SET status = 'active', archived_at = NULL, updated_at = NOW()
       WHERE session_id = $1 AND deleted_at IS NULL`,
     [sessionId],
   );

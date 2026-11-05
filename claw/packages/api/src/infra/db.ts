@@ -1199,6 +1199,10 @@ export async function initDb(): Promise<void> {
     await addCol("effort", "TEXT");
     // Until when a drain of the session's queue is under way (`sessions/drain-claim.ts`). NULL: none is.
     await addCol("pending_drain_until", "TIMESTAMPTZ");
+    // When the session was last archived, which is what SESSION_RETENTION_DAYS
+    // counts from (sessions/retention.ts). NULL for one archived before this
+    // column existed, which retention reads as its updated_at instead.
+    await addCol("archived_at", "TIMESTAMPTZ");
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_user ON claw_sessions(user_id, created_at DESC)").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_context ON claw_sessions(context_id) WHERE context_id != ''").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_a2a_caller ON claw_sessions(a2a_caller_id) WHERE a2a_caller_id != ''").catch(() => {});

@@ -19,12 +19,20 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { handsCredentialHeaders } from "@claw/protocol";
+import { SANDBOX_ROUTER_AUTH_ENABLED } from "../config.js";
+
+/** Read per call, so a test can flip it; the environment sets it at boot. */
+export const handsExecSettings = { routerAuth: SANDBOX_ROUTER_AUTH_ENABLED };
 
 /** Where a session's sandbox can be reached, as the registry holds it. */
 export interface HandsTarget {
   url: string;
   token: string;
-  /** The session owner's platform key, which a routed URL needs to pass the Router. */
+  /**
+   * The SaFE key the sandbox was created with (its owner's), from the same
+   * entry. Presented to a Router that runs with --enable-auth when the URL goes
+   * through its port proxy; never sent while SANDBOX_ROUTER_AUTH_ENABLED is off.
+   */
   platformKey?: string;
 }
 
@@ -49,7 +57,9 @@ export interface ExecResult {
 export async function execInSandbox(target: HandsTarget, command: string, timeoutSec: number): Promise<ExecResult> {
   const client = new Client({ name: "claw-api", version: "1.0.0" }, { capabilities: {} });
   const transport = new StreamableHTTPClientTransport(new URL(target.url), {
-    requestInit: { headers: handsCredentialHeaders(target.url, target.token, target.platformKey ?? "") },
+    requestInit: {
+      headers: handsCredentialHeaders(target.url, target.token, handsExecSettings.routerAuth ? target.platformKey : undefined),
+    },
   });
   try {
     try {

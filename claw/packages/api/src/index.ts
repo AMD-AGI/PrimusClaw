@@ -9,6 +9,7 @@ import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
+  SESSION_PURGE_DAYS, SESSION_RETENTION_BATCH, SESSION_RETENTION_DAYS, SESSION_RETENTION_DRY_RUN,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
@@ -73,6 +74,7 @@ import { startEventConsumer } from "./events/consumer.js";
 import { startEvolveWorker } from "./marketplace/evolve-worker.js";
 import { startUploadSweeper } from "./sessions/upload-sweeper.js";
 import { archiveIdleSessions } from "./sessions/archive.js";
+import { runSessionRetentionOnce } from "./sessions/retention.js";
 import { cleanupOrphanSkillFiles, cleanupOldPatterns } from "./marketplace/skill-service.js";
 import { registry as metricsRegistry } from "./infra/metrics.js";
 import { assertRolloutConfigAtStartup } from "./startup/rollout-config.js";
@@ -397,13 +399,24 @@ async function main() {
   // is fully frozen so toggling the flag back ON restores prior state without
   // value loss. Memory has none: nothing about it changes on a timer.
   const runMaintenance = () => {
-    archiveIdleSessions(SESSION_AUTO_ARCHIVE_DAYS).catch(err => logger.error({ err }, "session_archive.failed"));
+    // Archive first, then retention: a session archived today is days away from
+    // the retention window either way, and the order keeps one pass's log readable.
+    archiveIdleSessions(SESSION_AUTO_ARCHIVE_DAYS)
+      .catch(err => logger.error({ err }, "session_archive.failed"))
+      .then(() => runSessionRetentionOnce({
+        retentionDays: SESSION_RETENTION_DAYS,
+        purgeDays: SESSION_PURGE_DAYS,
+        batch: SESSION_RETENTION_BATCH,
+        dryRun: SESSION_RETENTION_DRY_RUN,
+      }))
+      .catch(err => logger.error({ err }, "session_retention.failed"));
     if (CLAW_SKILL_EVOLUTION_ENABLED) {
       cleanupOrphanSkillFiles().catch(err => logger.error({ err }, "skill_files.cleanup_failed"));
       cleanupOldPatterns().catch(err => logger.error({ err }, "skill_patterns.cleanup_failed"));
     }
   };
-  if (CLAW_SKILL_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0) {
+  if (CLAW_SKILL_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0
+    || SESSION_RETENTION_DAYS > 0 || SESSION_PURGE_DAYS > 0) {
     setTimeout(() => {
       runMaintenance();
       setInterval(runMaintenance, 24 * 60 * 60 * 1000);

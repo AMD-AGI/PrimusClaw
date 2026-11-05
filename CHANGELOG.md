@@ -28,6 +28,24 @@ record it.
 ## [Unreleased]
 
 ### Added
+- The assistant's `review_start` naming another person is handed to the channel that carried the message when that channel declares
+  it can start such a review with the reviewer's own credentials (`channel_context.handoffs: ["review_for_other"]`): an
+  `assistant.action` named `review_for_other` with a typed `review` (reviewer, pull requests, merge, the person's message), queued
+  once after the same grounding, and the router is answered `handed_off`. A channel that does not declare it, or a user with no
+  subscription to `assistant.action`, gets the `acting_as_credentials_required` refusal as before. The handoff is recorded
+  (`claw_assistant_review_handoffs`) and its id handed over (`review.handoff_id`); `POST /v1/assistant/reviews` takes it back as
+  `handoff_id` and reads the record, not the body: such a review merges only once the reviewer confirms the merge, only reviews when the
+  router read no merge, and starts once per handoff; a request for a handed-over pull request without the id is held the same. The
+  reviewer must be named in the person's message, not only listed by the channel (`reviewer_not_named`).
+- Archived sessions can be deleted on a schedule: `SESSION_RETENTION_DAYS` (default 0, off) makes the API's daily
+  maintenance delete a session that many days after it was archived, through the same commit as a user's delete (queued
+  messages dropped, turns, events and summaries stamped deleted) with its S3 workspace and checkpoint prefixes removed by
+  the existing cleanup sweeper. Never taken: sessions made through the Anthropic-compatible API, sessions with a run in
+  flight (their own or a team member's), open tasks or queued messages, and the worker session of any work item; each
+  is checked again under the session's row lock before it is deleted. `SESSION_PURGE_DAYS` (default 0, off) removes for
+  good the stamped rows of sessions deleted more than that many days ago. `SESSION_RETENTION_BATCH` (default 500) bounds
+  each pass; `SESSION_RETENTION_DRY_RUN=true` only logs the counts (`session_retention.dry_run`). Archiving now records
+  `claw_sessions.archived_at` (a new nullable column; a session archived before it existed counts from `updated_at`).
 - A review asked of someone else (`POST /v1/assistant/reviews` with `acting_as` naming another person) is that person's: their item, their session sealed with their own keys (brought as `x-acting-as-token` and `x-acting-as-api-key`), their quota; their delegation switch is asked at creation and before every queued turn; the session runs with a fixed review profile and, on SaFE, a sandbox in `SANDBOX_CPU_NAMESPACE` created with `useWorkspaceStorage: false`; the requester sees four facts only. `POST /v1/sessions` refuses `requested_by`, `sandbox_profile`, `requester_note` and `acting_as` naming anyone but the caller (a deployment with `CLAW_ASSISTANT_REVIEW_ITEMS` off has no way to ask a review of someone else). New settings `CLAW_REVIEW_FOR_OTHERS_*`. The assistant's `review_start` refuses a review by someone else (`acting_as_credentials_required`; the user is sent to the review agent named by `CLAW_GITHUB_REVIEW_AGENT_NAME`); the requester's assistant lists the reviews they asked of others read-only (four facts), and `work_recall` / `work_stop` act on them with only those facts in the answer. A review the assistant's router starts or restarts merges nothing by itself, whatever its `merge` says: its session (`config.merge_needs_confirmation`, kept by every restart) holds its merge, and an approval GitHub's auto-merge or merge queue would turn into one, for the acting user's confirmation whatever the risk and review mode, made only from the card's button or `批准 #<ref>` / `approve #<ref>`; while auto-merge is on or the pull request is in the merge queue, such a session (and a review-only one) resolves no thread (`gh_thread_resolve` answers `auto_merge_on`).
 - The user's long-term memory in the assistant, behind `CLAW_ASSISTANT_MEMORY_TOOLS` (`on` | `off`, default off; needs
   `CLAW_ASSISTANT_ENABLED` and `CLAW_MEMORY_ENABLED`, and the user's own opt-in). A router turn is shown the one-line
@@ -542,6 +560,13 @@ record it.
   like the platform defaults instead of being inlined.
 
 ### Security
+- Claw works with a sandbox Router that runs with `--enable-auth`. With `SANDBOX_ROUTER_AUTH_ENABLED` on, every Hands
+  request that goes through the Router's port proxy (`SANDBOX_HANDS_VIA_ROUTER`) presents the sandbox owner's platform key
+  in `Authorization`: Brain's MCP client, health checks, shell records and the sweeper, and the API's changes view and
+  sandbox census. Before, they carried only the Hands token, which such a Router answers with 401, so the Router could
+  not authenticate while Hands was reached through it. Hands still reads its own token from `X-Hands-Token`; the Router
+  strips `Authorization` before forwarding. With the setting off nothing changes. `deploy/deploy.sh` now sets
+  `SANDBOX_ROUTER_AUTH_ENABLED` for Claw from the Sandbox it installs (`true` unless `--insecure-sandbox`).
 - A session that acts as a user (`config.acting_as`, GitHub review on; its turns carry `withhold_sandbox_keys`) is no longer
   given the deployment's platform defaults (`PLATFORM_DEFAULTS_FILE`): no default MCP server and no default skill. The default
   servers are called with the requester's own key (`<SAFE_API_KEY>`), so a pull request's text that a review turn reads could
@@ -670,6 +695,12 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- Deleting a session that has no `hands.<sid>` binding and no key on its cleanup notification -- every session the
+  retention pass deletes, and every sweeper replay of a delete that already finished -- is a finished teardown with
+  nothing to address (`session.cleanup_nothing_addressable`), not `no_platform_key`. Claw holds no handle to anything
+  such a session could own, and parking it did nothing, so each one only logged `session.cleanup_incomplete_parked`
+  and counted `claw_brain_session_cleanup_incomplete_total` once per Brain replica, firing the sandbox-teardown alert.
+  A binding without a key, or a KV store that cannot be read, is still reported as incomplete.
 - An on-behalf review of a pull request that changes two or more `SKILL.md` files can approve again: Brain's
   skill-read guard (`BRAIN_BLOCK_SKILL_SUBAGENTS`) turned its second pass away, since that pass names the files the
   review read, and an approval needs the second pass. The guard no longer applies to a session that acts as a user
