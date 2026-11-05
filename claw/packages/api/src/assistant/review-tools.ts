@@ -29,6 +29,7 @@ import type { UserInfo } from "../auth/models.js";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { parsePrRef, type PrRef } from "../github-review/github.js";
+import { readGithubReviewSettings } from "../github-review/settings.js";
 import { decideConfirmation, githubReviewService } from "../github-review/mcp.js";
 import { DEFAULT_REVIEW_MODE, getReviewMode, setReviewMode, type DecidedVia } from "../github-review/store.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -262,18 +263,21 @@ export async function reviewStart(
  * A review asked of someone else runs on that person's own credentials (their delegated token and their own key), which only the
  * asking service brings with the request (`POST /v1/assistant/reviews`, `x-acting-as-token` / `x-acting-as-api-key`). The assistant
  * holds the requester's keys, never the reviewer's, so the review service refuses such a review from here
- * (`acting_as_credentials_required`) before it looks at anything else, and this is deliberate: the refusal stays, and the router is
- * told what the user can do instead, which is to ask through Clawy, the service that carries the reviewer's credentials.
+ * (`acting_as_credentials_required`) before it looks at anything else. That is deliberate: the refusal stays, and the router is told
+ * what the user can do instead, which is to ask the deployment's review agent (`CLAW_GITHUB_REVIEW_AGENT_NAME`, the name its reviews
+ * are signed with), whose service brings the reviewer's credentials. The platform names no client of its own (`docs/github-review.md`).
  */
-export const ASK_THROUGH_CLAWY =
-  "a review as someone else runs on that person's own GitHub credentials, which this assistant cannot carry: nothing was started. Tell the user to ask Clawy for it (for example @Clawy in the pull request or the chat, naming the reviewer), or to start the review as themselves";
+export function askTheReviewAgent(): string {
+  const agent = readGithubReviewSettings().agentName;
+  return `a review as someone else runs on that person's own GitHub credentials, which this assistant cannot carry: nothing was started. Tell the user to ask ${agent} for it (mention ${agent} in the pull request or the chat, naming the reviewer), or to start the review as themselves`;
+}
 
 async function asRequesterOfOther<T>(forOther: boolean, run: () => Promise<T>): Promise<T> {
   try {
     return await run();
   } catch (err) {
     if (forOther && err instanceof ReviewItemRefused && err.code === "acting_as_credentials_required") {
-      throw new ReviewItemRefused(err.status, err.code, ASK_THROUGH_CLAWY, err.data);
+      throw new ReviewItemRefused(err.status, err.code, askTheReviewAgent(), err.data);
     }
     throw err;
   }

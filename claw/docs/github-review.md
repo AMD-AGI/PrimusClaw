@@ -178,7 +178,8 @@ A review asked of someone else meets the assistant in three places:
 
 - `review_start` naming another person (`reviewer`) is refused with `acting_as_credentials_required`: such a review runs on the
   reviewer's own credentials, which only the asking service brings (`x-acting-as-token`, `x-acting-as-api-key`), and the assistant
-  holds the requester's keys only. The refusal tells the router to send the user to Clawy.
+  holds the requester's keys only. The refusal tells the router to send the user to the deployment's review agent, by the name its
+  reviews are signed with (`CLAW_GITHUB_REVIEW_AGENT_NAME`).
 - The requester's assistant lists the reviews they asked of others, open or closed in the last day, read-only after their own items:
   the item_id and the four facts (`params.requester_view` once closed), nothing else. `work_recall` on one answers the same four facts
   whatever detail is asked, and does not count as reading what a worker wrote. `work_stop` on one stops it as the requester's

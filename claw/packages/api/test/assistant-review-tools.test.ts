@@ -25,7 +25,8 @@
  *   S4  a reviewer is the user, or someone the channel listed with a Claw user id
  *   S5  a model must be named by the user
  *   S6  what the review service refuses reaches the model as it said it, with its data
- *   S7  a review by someone else is refused from here (their credentials cannot be carried), and the router is told to send the user to Clawy
+ *   S7  a review by someone else is refused from here (their credentials cannot be carried), and the router is told to send the user to
+ *       the deployment's review agent (CLAW_GITHUB_REVIEW_AGENT_NAME)
  *   R1  review_restart takes a review the user pointed at, and only a review
  *   R1b an item number is read whole: #11 does not point at #1, nor repo#1 at item #1
  *   C1  confirmation_answer allows only when the message is the exact approval command (批准 #<ref> / approve #<ref>) naming a
@@ -796,7 +797,7 @@ describe("assistant review tools", { skip }, () => {
     assert.match(w.mod.routerTurnEnd.turnLostNotice(["review 254 please"]) ?? "", /did not go through/);
   });
 
-  test("S7 a review by someone else is refused from here, and the router is told to send the user to Clawy", async () => {
+  test("S7 a review by someone else is refused from here, and the router is told to send the user to the review agent", async () => {
     // The real review service: the assistant holds the requester's keys, never the reviewer's, so nothing can be made.
     rt.reviewToolPorts.startReviews = saved.startReviews as never;
     try {
@@ -805,8 +806,9 @@ describe("assistant review tools", { skip }, () => {
       let refused: { code: string; message: string } | null = null;
       try { await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: "u-weilei" }); } catch (err) { refused = err as never; }
       assert.equal(refused?.code, "acting_as_credentials_required");
-      assert.equal(refused?.message, rt.ASK_THROUGH_CLAWY, "the router is told what the user can do instead");
-      assert.match(refused!.message, /Clawy/);
+      assert.equal(refused?.message, rt.askTheReviewAgent(), "the router is told what the user can do instead");
+      const { readGithubReviewSettings } = await import("../src/github-review/settings.js");
+      assert.ok(refused!.message.includes(`ask ${readGithubReviewSettings().agentName} for it`), "named as the deployment names its review agent");
       assert.equal(await count("claw_work_items"), 0, "nothing was made");
       assert.equal(await count("claw_sessions", "config ? 'acting_as'"), 0);
     } finally {
