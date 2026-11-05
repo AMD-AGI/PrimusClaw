@@ -146,9 +146,11 @@ export function text(t: Pick<Trace, "files">, path: string): string | null {
   return b ? b.toString("utf8") : null;
 }
 
-/** Same text, ignoring line-end spaces and the trailing newline. */
-export const sameText = (a: string | null, b: string): boolean =>
-  a !== null && a.replace(/[ \t]+$/gm, "").trimEnd() === b.replace(/[ \t]+$/gm, "").trimEnd();
+/** Text as the graders compare it: LF line ends, no line-end spaces, no trailing newline. */
+const comparable = (s: string): string => s.replace(/\r\n?/g, "\n").replace(/[ \t]+$/gm, "").trimEnd();
+
+/** Same text, ignoring line-end style (CRLF, CR or LF), line-end spaces and the trailing newline. */
+export const sameText = (a: string | null, b: string): boolean => a !== null && comparable(a) === comparable(b);
 
 /** The model reached the network: a web tool that answered, or a shell command that goes out. */
 export function reachedNetwork(t: Pick<Trace, "calls">): boolean {

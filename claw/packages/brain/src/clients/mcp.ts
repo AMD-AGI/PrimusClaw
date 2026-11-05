@@ -10,6 +10,7 @@ import { isIP } from "node:net";
 import { redactSecrets } from "@claw/utils";
 import pino from "pino";
 import { Agent, fetch as undiciFetch } from "undici";
+import { mcpToolFilter } from "./mcp-tool-filter.js";
 
 const logger = pino({ name: "mcp-clients" });
 
@@ -324,13 +325,35 @@ export async function connectPlatformMcp(
   const failed: McpConnectFailure[] = [];
 
   for (const [name, spec] of Object.entries(servers)) {
+    // `enabled_tools` / `disabled_tools` (mcp-tool-filter.ts): read before connecting, so a
+    // field nobody can read keeps the server out of the run, said as unavailable.
+    const filter = mcpToolFilter(spec);
+    if (filter && "invalid" in filter) {
+      logger.warn({ name, field: filter.invalid }, "mcp_client.tool_filter_invalid_server_skipped");
+      failed.push({ name, reason: `its ${filter.invalid} setting cannot be read (expected a non-empty list of tool names)` });
+      continue;
+    }
     try {
       const wrapper = await connectMcpServer(name, spec);
       wrappers.push(wrapper);
-      clients.set(name, wrapper);
-      const tools = await wrapper.listTools();
+      const listed = await wrapper.listTools();
+      const prefix = `mcp__${name}__`;
+      const tools = filter ? listed.filter((t) => filter.allows(t.name.slice(prefix.length))) : listed;
+      if (filter) {
+        const own = new Set(listed.map((t) => t.name.slice(prefix.length)));
+        const unknown = filter.exactNames.filter((n) => !own.has(n));
+        // A name the server does not list is most likely a typo or a renamed tool: say it to the operator.
+        if (unknown.length) logger.warn({ name, unknown }, "mcp_client.tool_filter_names_unknown");
+      }
+      clients.set(name, filter
+        ? {
+            callTool: (toolName, args) => filter.allows(toolName)
+              ? wrapper.callTool(toolName, args)
+              : Promise.reject(new Error(`Tool ${toolName} is not enabled on MCP server ${name}`)),
+          }
+        : wrapper);
       schemas.push(...tools);
-      logger.info({ name, toolCount: tools.length }, "mcp_client.tools_loaded");
+      logger.info({ name, toolCount: tools.length, ...(filter ? { listedCount: listed.length } : {}) }, "mcp_client.tools_loaded");
     } catch (err) {
       // Log URL + type so operators can diagnose 4xx / DNS / TLS without
       // cross-referencing SaFE Tools API responses.

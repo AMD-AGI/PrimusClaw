@@ -60,12 +60,25 @@ function walkFiles(dir: string): string[] {
   return results;
 }
 
+/** What a search returns: the matching lines, the files that match, or a count per file. */
+export const GREP_OUTPUT_MODES = ["content", "files_with_matches", "count"] as const;
+export type GrepOutputMode = (typeof GREP_OUTPUT_MODES)[number];
+
+export type GrepArgs = {
+  pattern: string; path?: string; context?: number; case_sensitive?: boolean; glob?: string;
+  output_mode?: GrepOutputMode; head_limit?: number;
+};
+
 const schema = {
   pattern: z.string().describe("Regex pattern to search for"),
   path: z.string().optional().describe("File or directory to search"),
   context: z.number().optional().describe("Lines of context around matches (default: 2)"),
   case_sensitive: z.boolean().optional().describe("Match case exactly (default false: case-insensitive)"),
   glob: z.string().optional().describe("Only search files whose path matches this glob, e.g. *.ts or src/**/*.py"),
+  output_mode: z.enum(GREP_OUTPUT_MODES).optional()
+    .describe('"content" (default): matching lines with context; "files_with_matches": only the paths of files that match; "count": matching lines per file'),
+  head_limit: z.number().int().positive().optional()
+    .describe("Return only the first N entries: matching lines for content, files for files_with_matches and count (default: all)"),
 };
 
 // Defenses against ReDoS / runaway scans:
@@ -80,9 +93,9 @@ const TOTAL_TIMEOUT_MS = 30_000;
 
 export const grep = {
   name: "grep",
-  description: "Search file contents with a regex (case-insensitive unless case_sensitive). Searches dot-directories such as .github; skips .git, node_modules, caches, uploads and files over 8 MB.",
+  description: "Search file contents with a regex (case-insensitive unless case_sensitive). output_mode picks matching lines (default), file paths only, or a count per file; head_limit keeps the first N. Searches dot-directories such as .github; skips .git, node_modules, caches, uploads and files over 8 MB.",
   zodSchema: schema,
-  execute: async (args: { pattern: string; path?: string; context?: number; case_sensitive?: boolean; glob?: string }) => {
+  execute: async (args: GrepArgs) => {
     if (args.pattern.length > PATTERN_MAX_LEN) {
       return { content: [{ type: "text" as const, text: `Pattern too long (${args.pattern.length} > ${PATTERN_MAX_LEN})` }] };
     }
@@ -90,12 +103,18 @@ export const grep = {
     try { target = args.path ? guardPath(args.path) : WORKSPACE; } catch (e: any) {
       return { content: [{ type: "text" as const, text: `Error: ${e.message}` }] };
     }
+    const mode: GrepOutputMode = args.output_mode ?? "content";
+    if (!GREP_OUTPUT_MODES.includes(mode)) {
+      return { content: [{ type: "text" as const, text: `Invalid output_mode: ${String(mode)} (use ${GREP_OUTPUT_MODES.join(", ")})` }] };
+    }
+    const limit = args.head_limit !== undefined && Number.isInteger(args.head_limit) && args.head_limit > 0 ? args.head_limit : Infinity;
     const ctx = args.context ?? 2;
     let regex: RegExp;
     try { regex = new RegExp(args.pattern, args.case_sensitive ? "" : "i"); } catch (e: any) {
       return { content: [{ type: "text" as const, text: `Invalid regex: ${e.message}` }] };
     }
     const results: string[] = [];
+    const notes: string[] = [];
     const isDir = fs.statSync(target).isDirectory();
     const walked = isDir ? walkFiles(target) : [target];
     // A pattern without a slash names a file, at any depth; with one it is a path under the searched directory.
@@ -105,9 +124,13 @@ export const grep = {
     const totalDeadline = Date.now() + TOTAL_TIMEOUT_MS;
     let timedOutFiles = 0;
     let tooLarge = 0;
-    for (const file of files) {
+    // Entries kept: matching lines (content) or files (files_with_matches, count).
+    let entries = 0;
+    let truncated = false;
+    for (let f = 0; f < files.length && !truncated; f++) {
+      const file = files[f]!;
       if (Date.now() > totalDeadline) {
-        results.push(`[grep aborted: total timeout ${TOTAL_TIMEOUT_MS}ms hit, ${files.length - results.length} files unscanned]`);
+        notes.push(`[grep aborted: total timeout ${TOTAL_TIMEOUT_MS}ms hit, ${files.length - f} files unscanned]`);
         break;
       }
       try {
@@ -118,22 +141,36 @@ export const grep = {
         const rel = path.relative(WORKSPACE, file);
         const fileDeadline = Date.now() + PER_FILE_TIMEOUT_MS;
         let aborted = false;
+        let matched = 0;
         for (let i = 0; i < lines.length; i++) {
           // Bail if this single file's regex work blew the per-file budget —
           // protects against catastrophic backtracking on a hostile line.
           if (i % 256 === 0 && Date.now() > fileDeadline) { aborted = true; break; }
-          if (regex.test(lines[i])) {
-            const start = Math.max(0, i - ctx);
-            const end = Math.min(lines.length, i + ctx + 1);
-            results.push(`${rel}:`);
-            for (let j = start; j < end; j++) {
-              results.push(`  ${j + 1}${j === i ? ":" : "-"}${lines[j]}`);
-            }
-            results.push("");
+          if (!regex.test(lines[i]!)) continue;
+          matched++;
+          if (mode === "files_with_matches") break;
+          if (mode !== "content") continue;
+          if (entries >= limit) { truncated = true; break; }
+          entries++;
+          const start = Math.max(0, i - ctx);
+          const end = Math.min(lines.length, i + ctx + 1);
+          results.push(`${rel}:`);
+          for (let j = start; j < end; j++) {
+            results.push(`  ${j + 1}${j === i ? ":" : "-"}${lines[j]}`);
           }
+          results.push("");
         }
-        if (aborted) { timedOutFiles++; results.push(`${rel}: [scan aborted at ${PER_FILE_TIMEOUT_MS}ms]`); }
+        if (mode !== "content" && matched > 0) {
+          if (entries >= limit) { truncated = true; break; }
+          entries++;
+          results.push(mode === "count" ? `${rel}:${matched}` : rel);
+        }
+        if (aborted) { timedOutFiles++; notes.push(`${rel}: [scan aborted at ${PER_FILE_TIMEOUT_MS}ms]`); }
       } catch { /* skip binary/unreadable */ }
+    }
+    if (truncated) {
+      const what = mode === "content" ? "matching lines" : "files";
+      notes.push(`[showing the first ${limit} ${what} (head_limit); there are more]`);
     }
     if (tooLarge > 0) {
       results.unshift(`[note] ${tooLarge} file(s) over ${GREP_MAX_FILE_BYTES / (1024 * 1024)} MB not searched.`);
@@ -141,6 +178,7 @@ export const grep = {
     if (timedOutFiles > 0) {
       results.unshift(`[note] ${timedOutFiles} file(s) hit the per-file ${PER_FILE_TIMEOUT_MS}ms scan timeout (possible ReDoS pattern).`);
     }
+    results.push(...notes);
     return { content: [{ type: "text" as const, text: results.join("\n") || "(no matches)" }] };
   },
 };

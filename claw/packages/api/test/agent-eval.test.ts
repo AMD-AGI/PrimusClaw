@@ -12,13 +12,14 @@
  *   E6  the summary leaves skipped tasks out, and adds up Brain's own numbers per category and in total
  *   E7  the set is 40 tasks in six categories, and no grader passes a session that did nothing
  *   E8  graders pass on what a correct session leaves
+ *   E9  text graders ignore line-end style: a CSV written with CRLF (Python's csv module) matches the LF answer
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 import AdmZip from "adm-zip";
 
 import {
-  behaviour, lastTestRunPassed, reachedNetwork, summarize, traceOf, type EventRow, type Outcome, type ToolCall, type Trace,
+  behaviour, lastTestRunPassed, reachedNetwork, sameText, summarize, traceOf, type EventRow, type Outcome, type ToolCall, type Trace,
 } from "./e2e/agent-eval-lib.js";
 import { CATEGORIES, TASKS, type EvalContext } from "./e2e/agent-eval-tasks.js";
 
@@ -186,4 +187,17 @@ test("E8 graders pass on what a correct session leaves", () => {
   const l2 = task("l2");
   assert.equal(l2.grade({ ...nothing, files: { "l2/times.txt": Buffer.from("1000\n1136\n") } }, CTX).pass, true);
   assert.equal(l2.grade({ ...nothing, files: { "l2/times.txt": Buffer.from("1000\n1100\n") } }, CTX).pass, false);
+});
+
+test("E9 text graders ignore line-end style", () => {
+  assert.equal(sameText("a,b\r\n1,2\r\n", "a,b\n1,2\n"), true, "CRLF");
+  assert.equal(sameText("a,b\r1,2", "a,b\n1,2\n"), true, "bare CR");
+  assert.equal(sameText("a,b  \r\n1,2\t\r\n", "a,b\n1,2"), true, "line-end spaces before a CRLF");
+  assert.equal(sameText("a,b\r\n1,3\r\n", "a,b\n1,2\n"), false, "different content is still different");
+  assert.equal(sameText("a,b1,2", "a,b\n1,2"), false, "a missing line break is still different");
+  assert.equal(sameText(null, ""), false);
+
+  const d2 = task("d2");
+  const crlf = Buffer.from("id,name,score\r\n2,bo,93\r\n3,chen,85\r\n1,ana,71\r\n");
+  assert.equal(d2.grade({ ...nothing, files: { "d2/scores.csv": crlf } }, CTX).pass, true, "csv.writer's CRLF output");
 });
