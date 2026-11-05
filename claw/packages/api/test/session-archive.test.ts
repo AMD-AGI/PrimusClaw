@@ -58,6 +58,7 @@ before(async () => {
       user_id TEXT,
       agent_status TEXT DEFAULT 'idle',
       status TEXT DEFAULT 'active',
+      archived_at TIMESTAMPTZ,
       parent_session_id TEXT,
       agent_gate_message_id TEXT,
       config JSONB DEFAULT '{}'::jsonb,

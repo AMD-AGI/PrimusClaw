@@ -142,8 +142,14 @@ export async function resolveParentAuthorisation(
   if (!user) {
     return { statusCode: 401, response: { ok: false, error: "authentication required" } };
   }
+  // `FOR KEY SHARE` holds the parent against a deletion committing before the
+  // child does: a deletion locks the parent `FOR UPDATE` and then checks its
+  // team members (the retention pass refuses a parent with a running member),
+  // and a member inserted after that check would be missed. Waiting here instead
+  // re-reads `deleted_at` once the deletion commits, so the create is refused.
+  // Ordinary writes to the parent take a weaker lock and are not held up.
   const parent = (await q.query(
-    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR KEY SHARE",
     [parentSid],
   )).rows[0] as { user_id?: string | null } | undefined;
   if (!parent) return { statusCode: 404, response: { ok: false, error: "parent_session_not_found" } };
