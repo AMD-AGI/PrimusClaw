@@ -25,11 +25,18 @@
 #     SETGID, SETUID (sandboxes run as root: apt, chown, su to a service user,
 #     signal its processes; NET_RAW, MKNOD, SYS_CHROOT, SETPCAP, SETFCAP are dropped);
 #   - a seccomp profile other than RuntimeDefault or Localhost.
+# Except in the namespaces the parameter key virtual-kubelet.namespaces lists:
+# their sandboxes run on Autopilot virtual-kubelet nodes, whose backend refuses
+# any seccomp profile and any capability added or dropped. There a container may
+# have no seccomp profile at all (Unconfined is still refused) and need not drop
+# ALL (it still may add nothing outside the list above). Everything else holds.
 # Running Pods are not affected; only creation (and ephemeral containers) is checked.
 #
 # Parameters: ConfigMap kube-system/sandbox-pod-guardrails, one key per namespace
 # whose sandboxes may mount host paths, value = comma-separated allowed roots
-# (a path equal to a root or below it). See params-<cluster>.yaml. A missing
+# (a path equal to a root or below it), and the key virtual-kubelet.namespaces,
+# a comma-separated list of namespaces (a namespace name cannot contain a dot, so
+# the key never collides with one). See params-<cluster>.yaml. A missing
 # ConfigMap refuses every sandbox Pod (parameterNotFoundAction: Deny).
 #
 # Apply (per cluster, params first):
@@ -92,8 +99,14 @@ spec:
     expression: >-
       ['AUDIT_WRITE', 'CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'FSETID', 'KILL',
        'NET_BIND_SERVICE', 'SETGID', 'SETUID']
+  - name: virtualKubeletNamespace
+    expression: >-
+      params.?data.orValue({})[?'virtual-kubelet.namespaces'].orValue('').split(',').map(n, n.trim()).exists(n, n == request.namespace)
   - name: podSeccompType
     expression: object.spec.?securityContext.?seccompProfile.?type.orValue('')
+  - name: allowedSeccompTypes
+    expression: >-
+      variables.virtualKubeletNamespace ? ['RuntimeDefault', 'Localhost', ''] : ['RuntimeDefault', 'Localhost']
   - name: bad_privileged
     expression: >-
       object.spec.containers.filter(c, c.?securityContext.?privileged.orValue(false)).map(c, c.name) +
@@ -106,14 +119,14 @@ spec:
       object.spec.?ephemeralContainers.orValue([]).filter(c, c.?securityContext.?allowPrivilegeEscalation.orValue(true)).map(c, c.name)
   - name: bad_capabilities
     expression: >-
-      object.spec.containers.filter(c, !c.?securityContext.?capabilities.?drop.orValue([]).exists(d, d == 'ALL') || !c.?securityContext.?capabilities.?add.orValue([]).all(a, a in variables.allowedCapabilities)).map(c, c.name) +
-      object.spec.?initContainers.orValue([]).filter(c, !c.?securityContext.?capabilities.?drop.orValue([]).exists(d, d == 'ALL') || !c.?securityContext.?capabilities.?add.orValue([]).all(a, a in variables.allowedCapabilities)).map(c, c.name) +
-      object.spec.?ephemeralContainers.orValue([]).filter(c, !c.?securityContext.?capabilities.?drop.orValue([]).exists(d, d == 'ALL') || !c.?securityContext.?capabilities.?add.orValue([]).all(a, a in variables.allowedCapabilities)).map(c, c.name)
+      object.spec.containers.filter(c, (!variables.virtualKubeletNamespace && !c.?securityContext.?capabilities.?drop.orValue([]).exists(d, d == 'ALL')) || !c.?securityContext.?capabilities.?add.orValue([]).all(a, a in variables.allowedCapabilities)).map(c, c.name) +
+      object.spec.?initContainers.orValue([]).filter(c, (!variables.virtualKubeletNamespace && !c.?securityContext.?capabilities.?drop.orValue([]).exists(d, d == 'ALL')) || !c.?securityContext.?capabilities.?add.orValue([]).all(a, a in variables.allowedCapabilities)).map(c, c.name) +
+      object.spec.?ephemeralContainers.orValue([]).filter(c, (!variables.virtualKubeletNamespace && !c.?securityContext.?capabilities.?drop.orValue([]).exists(d, d == 'ALL')) || !c.?securityContext.?capabilities.?add.orValue([]).all(a, a in variables.allowedCapabilities)).map(c, c.name)
   - name: bad_seccomp
     expression: >-
-      object.spec.containers.filter(c, !(c.?securityContext.?seccompProfile.?type.orValue(variables.podSeccompType) in ['RuntimeDefault', 'Localhost'])).map(c, c.name) +
-      object.spec.?initContainers.orValue([]).filter(c, !(c.?securityContext.?seccompProfile.?type.orValue(variables.podSeccompType) in ['RuntimeDefault', 'Localhost'])).map(c, c.name) +
-      object.spec.?ephemeralContainers.orValue([]).filter(c, !(c.?securityContext.?seccompProfile.?type.orValue(variables.podSeccompType) in ['RuntimeDefault', 'Localhost'])).map(c, c.name)
+      object.spec.containers.filter(c, !(c.?securityContext.?seccompProfile.?type.orValue(variables.podSeccompType) in variables.allowedSeccompTypes)).map(c, c.name) +
+      object.spec.?initContainers.orValue([]).filter(c, !(c.?securityContext.?seccompProfile.?type.orValue(variables.podSeccompType) in variables.allowedSeccompTypes)).map(c, c.name) +
+      object.spec.?ephemeralContainers.orValue([]).filter(c, !(c.?securityContext.?seccompProfile.?type.orValue(variables.podSeccompType) in variables.allowedSeccompTypes)).map(c, c.name)
   - name: bad_hostPort
     expression: >-
       object.spec.containers.filter(c, c.?ports.orValue([]).exists(p, p.?hostPort.orValue(0) != 0)).map(c, c.name) +
@@ -167,11 +180,15 @@ spec:
   - expression: size(variables.bad_capabilities) == 0
     reason: Forbidden
     messageExpression: >-
-      'sandbox pod: ' + variables.bad_capabilities.join(',') + ': capabilities must drop ALL and add only ' + variables.allowedCapabilities.join(',') + ''
+      'sandbox pod: ' + variables.bad_capabilities.join(',') +
+      (variables.virtualKubeletNamespace ? ': capabilities may add only ' : ': capabilities must drop ALL and add only ') +
+      variables.allowedCapabilities.join(',')
   - expression: size(variables.bad_seccomp) == 0
     reason: Forbidden
     messageExpression: >-
-      'sandbox pod: ' + variables.bad_seccomp.join(',') + ': seccompProfile must be RuntimeDefault (or Localhost), on the pod or the container'
+      'sandbox pod: ' + variables.bad_seccomp.join(',') +
+      (variables.virtualKubeletNamespace ? ': seccompProfile must be unset, RuntimeDefault or Localhost' :
+       ': seccompProfile must be RuntimeDefault (or Localhost), on the pod or the container')
   - expression: size(variables.bad_hostPort) == 0
     reason: Forbidden
     messageExpression: >-
