@@ -32,3 +32,16 @@ test("a routed URL names the sandbox port, not the Router's", () => {
   assert.equal(routedHandsPort("http://r:8080/v1/namespaces/ns/code-interpreters/wl/invocations/proxy/9100/mcp"), "9100");
   assert.equal(routedHandsPort("http://wl.ns.svc.cluster.local:9100/mcp"), null);
 });
+
+test("a Router key goes in Authorization on a routed URL only, and Hands keeps its credential", () => {
+  const routed = "http://r/v1/namespaces/ns/code-interpreters/wl/invocations/proxy/9100/mcp";
+  const direct = "http://wl.ns.svc.cluster.local:9100/mcp";
+  assert.deepEqual(handsCredentialHeaders(routed, "t", "ak-owner"),
+    { "x-session-id": "wl", Authorization: "Bearer ak-owner", "X-Hands-Token": "t" });
+  assert.deepEqual(handsCredentialHeaders(direct, "t", "ak-owner"), { Authorization: "Bearer t" },
+    "the owner's key never goes to a sandbox directly");
+  assert.deepEqual(handsCredentialHeaders(routed, "t", "  "),
+    { "x-session-id": "wl", Authorization: "Bearer t", "X-Hands-Token": "t" }, "a blank key is no key");
+  assert.deepEqual(handsRouteHeaders(routed, "ak-owner"), { "x-session-id": "wl", Authorization: "Bearer ak-owner" });
+  assert.deepEqual(handsRouteHeaders(direct, "ak-owner"), {});
+});

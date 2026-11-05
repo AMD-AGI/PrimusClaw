@@ -351,6 +351,9 @@ test("C5 the registry read: only a ready entry with an address and a token names
     entries.set(key, entry);
     assert.deepEqual(await readHandsTarget("s-reg", bucket), ok ? { url: "http://h/mcp", token: "t" } : null, label);
   }
+  entries.set(key, { value: enc({ ...ready, platformKey: "ak-owner" }) });
+  assert.deepEqual(await readHandsTarget("s-reg", bucket), { url: "http://h/mcp", token: "t", platformKey: "ak-owner" },
+    "the owner's key comes with the target, for a Router that authenticates");
   assert.equal(await readHandsTarget("s-absent", bucket), null, "no entry");
   assert.equal(await readHandsTarget("s-reg", { get: async () => { throw new Error("registry down"); } }), null, "an unreadable registry is not a sandbox");
 });

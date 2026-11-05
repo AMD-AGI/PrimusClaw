@@ -19,11 +19,13 @@
  * working after that node goes away.
  */
 import pino from "pino";
+import { routedHandsSessionId } from "@claw/protocol";
 import {
   SAFE_API_URL,
   SANDBOX_CPU_NAMESPACE,
   SANDBOX_CPU_ROUTER_URL,
   SANDBOX_HANDS_VIA_ROUTER,
+  SANDBOX_ROUTER_AUTH_ENABLED,
   SANDBOX_ROUTER_URL,
 } from "../config.js";
 
@@ -189,8 +191,72 @@ export async function fetchThroughRouters<R>(
 }
 
 /**
+ * The SaFE key a routed Hands request presents to a Router that runs with
+ * `--enable-auth`, per sandbox.
+ *
+ * Such a Router answers 401 to anything on its /v1 routes without a SaFE cookie
+ * or `ak-` key, and 403 unless that key's user owns the sandbox (or is a full
+ * admin). A routed Hands request carries only the per-sandbox Hands token, which
+ * the Router cannot verify, so it would be refused. The key that may address a
+ * sandbox is the one it was created with: its owner's platform key. Every place
+ * that learns a Hands URL together with that key records it here, and
+ * `withRouterFailover` -- which every routed Hands request in Brain goes through
+ * -- puts it in `Authorization`. The Router strips `Authorization` before
+ * forwarding, and Hands reads its own token from X-Hands-Token on a routed
+ * request, so Hands sees exactly what it saw before.
+ *
+ * Only consulted while SANDBOX_ROUTER_AUTH_ENABLED is on: with auth off a
+ * user's key is not sent anywhere it is not needed. Keyed by the Router session
+ * id in the URL (the workload id), bounded, oldest forgotten first; a sandbox
+ * whose key was forgotten is relearned the next time its entry is read, and
+ * until then fails loudly with the Router's 401 rather than silently.
+ */
+const ROUTER_CREDENTIALS_MAX = 4096;
+const routerCredentials = new Map<string, string>();
+
+/** Remember the key that may address the sandbox at `handsUrl`. Ignores a direct URL or an empty key. */
+export function rememberRouterCredential(handsUrl: unknown, platformKey: unknown): void {
+  if (typeof handsUrl !== "string" || typeof platformKey !== "string") return;
+  const key = platformKey.trim();
+  const session = key ? routedHandsSessionId(handsUrl) : null;
+  if (!session) return;
+  routerCredentials.delete(session);
+  routerCredentials.set(session, key);
+  if (routerCredentials.size > ROUTER_CREDENTIALS_MAX) {
+    const oldest = routerCredentials.keys().next().value;
+    if (oldest !== undefined) routerCredentials.delete(oldest);
+  }
+}
+
+/** Read per call, so a test can flip it; the environment sets it at boot. */
+export const routerAuthSettings = { enabled: SANDBOX_ROUTER_AUTH_ENABLED };
+
+/** The key to present for `url`, when the Router authenticates and one is known. */
+export function routerCredentialFor(url: string): string | null {
+  if (!routerAuthSettings.enabled) return null;
+  const session = routedHandsSessionId(url);
+  return session ? routerCredentials.get(session) ?? null : null;
+}
+
+/** Forget every remembered key. Tests only. */
+export function resetRouterCredentialsForTest(): void {
+  routerCredentials.clear();
+}
+
+// `init` with `Authorization` replaced, whatever shape its headers came in.
+function withRouterAuthorization(init: RequestInit | undefined, key: string): RequestInit {
+  const headers: Record<string, string> = {};
+  new Headers(init?.headers ?? {}).forEach((value, name) => { headers[name] = value; });
+  headers.authorization = `Bearer ${key}`;
+  return { ...init, headers };
+}
+
+/**
  * Wrap a fetch so a URL on one of `bases` fails over to the others. Any other
  * URL, or a `Request` object, passes straight through.
+ *
+ * A routed Hands URL also gets its sandbox owner's key in `Authorization` when
+ * the Router authenticates (see `rememberRouterCredential`).
  */
 export function withRouterFailover<F extends (input: any, init?: any) => Promise<any>>(
   fetchImpl: F,
@@ -203,6 +269,8 @@ export function withRouterFailover<F extends (input: any, init?: any) => Promise
   const wrapped = (input: unknown, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : null;
     if (url === null) return fetchImpl(input, init);
+    const routerKey = routerCredentialFor(url);
+    if (routerKey) init = withRouterAuthorization(init, routerKey);
     for (const list of lists()) {
       if (list.length < 2) continue;
       const base = list.find((b) => url === b || url.startsWith(`${b}/`) || url.startsWith(`${b}?`));

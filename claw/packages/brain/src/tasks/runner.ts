@@ -60,6 +60,7 @@ import { gpuWorkspaceFor } from "../sandbox/workspace-select.js";
 import { getMultiNodeProvider, multiNodeAvailable } from "../sandbox/multi-node/factory.js";
 import type { MultiNodeContext } from "../sandbox/multi-node/types.js";
 import { destroyHands, reapPendingHands, classifySandboxFailure } from "../sandbox/reaper.js";
+import { rememberRouterCredential } from "../sandbox/sandbox-router.js";
 import { probeSandboxContainer } from "../sandbox/container-probe.js";
 import { fetchPlatformFacts } from "../sandbox/platform-facts-read.js";
 import type { PlatformFacts, RunEndedParkOutcome } from "@claw/protocol";
@@ -2729,8 +2730,9 @@ class TaskRunner {
     if (this.hands) return this.hands;
     const entry = await readHandsEntry(this.kv, this.sessionId).catch(() => null);
     if (!entry) return null;
-    const info = JSON.parse(entry.value) as { handsUrl?: unknown; token?: unknown };
+    const info = JSON.parse(entry.value) as { handsUrl?: unknown; token?: unknown; platformKey?: unknown };
     if (typeof info.handsUrl !== "string" || !info.handsUrl) return null;
+    rememberRouterCredential(info.handsUrl, info.platformKey);
     // Not closed afterwards: the reconciliation reads two plain HTTP routes and
     // never opens the MCP transport, so there is nothing holding a connection.
     return fx().makeHandsClient(
