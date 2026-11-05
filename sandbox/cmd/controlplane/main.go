@@ -444,6 +444,11 @@ func main() {
 		os.Exit(1)
 	}
 	workloads.SetRemoteClusters(routerServer.RemoteClusterIDs())
+	routerServer.WithWorkloadLocator(workloads.Locate)
+	if err := routerServer.SetUpstreamOnly(os.Getenv(router.EnvUpstreamOnly) == "true"); err != nil {
+		log.Error("dataplane upstream-only config failed", "error", err)
+		os.Exit(1)
+	}
 
 	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, dynamicClient, apiServer, st, workloads, wmCfg.Namespace)
 	if err != nil {

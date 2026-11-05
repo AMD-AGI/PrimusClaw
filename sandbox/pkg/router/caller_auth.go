@@ -83,6 +83,10 @@ func bearerCredential(c *gin.Context) string {
 // A missing or inactive credential is 401; an identity provider that cannot answer is 503.
 func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if _, forwarded := invokeHopFrom(c); forwarded {
+			c.Next()
+			return
+		}
 		credential := bearerCredential(c)
 		if credential == "" {
 			recordCallerAuthRejection(c, http.StatusUnauthorized)

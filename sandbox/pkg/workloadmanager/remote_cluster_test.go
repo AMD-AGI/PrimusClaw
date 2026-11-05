@@ -78,6 +78,37 @@ func TestSessionSkipsRemoteWorkload(t *testing.T) {
 	}
 }
 
+func TestLocateAnyWorkload(t *testing.T) {
+	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
+		workloadGVR: "WorkloadList",
+	})
+	for name, phase := range map[string]string{"claw-brain-1": "Running", "claw-done": "Succeeded"} {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "amd.com/v1",
+			"kind":       "Workload",
+			"metadata": map[string]any{
+				"name":   name,
+				"labels": map[string]any{safeClusterIDLabel: "crusoe", safeUserIDLabel: "u1"},
+			},
+			"spec":   map[string]any{"workspace": "crusoe-ws"},
+			"status": map[string]any{"phase": phase},
+		}}
+		if _, err := dc.Resource(workloadGVR).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	creator := NewSafeWorkloadCreator(dc, nil)
+	cluster, ns, owner, err := creator.Locate(context.Background(), "claw-brain-1")
+	if err != nil || cluster != "crusoe" || ns != "crusoe-ws" || owner != "u1" {
+		t.Fatalf("cluster=%q ns=%q owner=%q err=%v", cluster, ns, owner, err)
+	}
+	for _, name := range []string{"claw-done", "missing", "Not_A_Label"} {
+		if _, _, _, err := creator.Locate(context.Background(), name); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("%s: err=%v", name, err)
+		}
+	}
+}
+
 func TestPodAddressPrefersMaster(t *testing.T) {
 	scheme := k8sruntime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {

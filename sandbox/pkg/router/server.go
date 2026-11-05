@@ -81,6 +81,8 @@ type Server struct {
 	grants         *grant.Service
 	// dp is the cross-cluster data-plane hop. Empty routes keep every sandbox local.
 	dp dataPlane
+	// locator finds the cluster of a Workload session; nil keeps every invocation local.
+	locator WorkloadLocator
 
 	// policies caches the sealed allow-list of grant sandboxes by sandbox id.
 	policyMu sync.Mutex
@@ -172,6 +174,10 @@ func (s *Server) setupRoutes() {
 		// identity. In explicitly unauthenticated deployments, retain the legacy
 		// upstream-provided identity headers.
 		v1.Use(stripUntrustedIdentityHeaders())
+	}
+	// An invocation forwarded by the managing Router carries its verified caller.
+	v1.Use(s.invokeHopMiddleware())
+	if s.cfg.EnableAuth {
 		v1.Use(s.callerAuthMiddleware())
 		log.Info("caller auth middleware enabled on /v1/ routes")
 	}
@@ -531,6 +537,18 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 		return
 	}
 
+	hop, forwarded := invokeHopFrom(c)
+	if forwarded && sessionID != hop.SessionID {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "forwarded invocation does not match its session",
+			"code":  "invoke_hop_mismatch",
+		})
+		return
+	}
+	if sessionID != "" && s.forwardRemoteInvocation(c, sessionID) {
+		return
+	}
+
 	if s.sessionManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session manager not available"})
 		return
@@ -599,34 +617,18 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 	}
 	sessionID = info.SessionID
 
-	// A session ID is a routing handle, not an authorization credential.
-	// When SaFE auth is enabled, only the owning user or a full system-admin may
-	// invoke, proxy, or tunnel into the sandbox. A read-only admin is denied
-	// because even GET/proxy/tunnel requests can trigger arbitrary user-service
-	// side effects. Legacy mappings without an owner are recoverable only by a
-	// full admin.
-	if s.cfg.EnableAuth {
-		callerID := c.GetString("userId")
-		callerRole := c.GetString("userRole")
-		if callerID == "" {
-			recordCallerAuthRejection(c, http.StatusUnauthorized)
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "verified user identity is missing",
-				"code":  "caller_identity_missing",
-			})
-			return
-		}
-		// Labelled like the 401s above: EnvD returns 403 too, for a session-id
-		// binding it cannot match, and that one is an infrastructure fault
-		// rather than an ownership decision made here.
-		if callerRole != "system-admin" && (info.UserID == "" || info.UserID != callerID) {
-			recordCallerAuthRejection(c, http.StatusForbidden)
+	// A forwarded invocation was authorized by the managing Router for this
+	// session; it is bound to the namespace that Router resolved.
+	if forwarded {
+		if hop.Namespace != "" && info.Namespace != hop.Namespace {
 			c.JSON(http.StatusForbidden, gin.H{
-				"error": "sandbox access denied",
-				"code":  "caller_not_session_owner",
+				"error": "forwarded invocation does not match its session",
+				"code":  "invoke_hop_mismatch",
 			})
 			return
 		}
+	} else if s.cfg.EnableAuth && !s.authorizeSessionOwner(c, info.UserID) {
+		return
 	}
 
 	// A sealed grant sandbox is served only by the E2B data plane, which
@@ -686,6 +688,38 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 	}
 
 	s.proxyRequest(c, targetURL, sessionID)
+}
+
+// authorizeSessionOwner admits the session owner or a full system-admin and answers
+// every other caller.
+//
+// A session ID is a routing handle, not an authorization credential. A read-only
+// admin is denied because even GET/proxy/tunnel requests can trigger arbitrary
+// user-service side effects. Legacy mappings without an owner are recoverable
+// only by a full admin.
+func (s *Server) authorizeSessionOwner(c *gin.Context, ownerID string) bool {
+	callerID := c.GetString("userId")
+	callerRole := c.GetString("userRole")
+	if callerID == "" {
+		recordCallerAuthRejection(c, http.StatusUnauthorized)
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "verified user identity is missing",
+			"code":  "caller_identity_missing",
+		})
+		return false
+	}
+	// Labelled like the 401s above: EnvD returns 403 too, for a session-id
+	// binding it cannot match, and that one is an infrastructure fault
+	// rather than an ownership decision made here.
+	if callerRole != "system-admin" && (ownerID == "" || ownerID != callerID) {
+		recordCallerAuthRejection(c, http.StatusForbidden)
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "sandbox access denied",
+			"code":  "caller_not_session_owner",
+		})
+		return false
+	}
+	return true
 }
 
 // logRouterExecute peeks the execute POST body, restores it, and logs every invocation.

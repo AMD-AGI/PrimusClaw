@@ -36,6 +36,8 @@ const (
 	// EnvD rejects this audience, so a hop token cannot be replayed at a sandbox.
 	hopAudience   = "agent-sandbox-dataplane"
 	hopExpiration = time.Minute
+	// invokeAudience is a /v1 invocation forwarded by the managing Router to the cluster Router.
+	invokeAudience = "agent-sandbox-invoke"
 
 	// IdentitySecretName is the K8s Secret that stores the Router's RSA key pair.
 	IdentitySecretName = "envd-router-identity" //nolint:gosec // name reference, not credential
@@ -174,6 +176,35 @@ func (jm *JWTManager) generateHopToken(sandboxID, cluster, namespace string, sea
 		claims["sealed"] = true
 		claims["inputs"] = strings.Join(inputs, "\n")
 		claims["outputs"] = strings.Join(outputs, "\n")
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	return token.SignedString(jm.privateKey)
+}
+
+// generateInvokeToken signs a short-lived token that authorizes one /v1 invocation
+// session on one cluster for the caller the managing Router verified.
+func (jm *JWTManager) generateInvokeToken(sessionID, cluster, namespace, userID, userName, role string) (string, error) {
+	if jm == nil || jm.privateKey == nil {
+		return "", fmt.Errorf("JWT private key is unavailable")
+	}
+	if sessionID == "" || cluster == "" {
+		return "", fmt.Errorf("session id and cluster are required")
+	}
+	if err := jm.privateKey.Validate(); err != nil {
+		return "", fmt.Errorf("invalid JWT private key: %w", err)
+	}
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"iss":        jwtIssuer,
+		"aud":        invokeAudience,
+		"iat":        now.Unix(),
+		"exp":        now.Add(hopExpiration).Unix(),
+		"session_id": sessionID,
+		"cluster":    cluster,
+		"namespace":  namespace,
+		"sub":        userID,
+		"user_name":  userName,
+		"role":       role,
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	return token.SignedString(jm.privateKey)

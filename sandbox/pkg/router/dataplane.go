@@ -45,6 +45,8 @@ type dataPlane struct {
 	routes    map[string]string
 	upstream  *rsa.PublicKey
 	pods      PodAddressFunc
+	// upstreamOnly limits /v1 to invocations forwarded by the managing Router.
+	upstreamOnly bool
 }
 
 // ConfigureDataPlane installs the cluster table and the key that verifies hop tokens.
