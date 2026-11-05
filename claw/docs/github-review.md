@@ -109,6 +109,33 @@ review is done (accepted by policy); a write held for the requester themselves, 
 `expired`, `refused`), a merge refused by a gate, a failed turn or a turn that posted nothing needs them; a write held for
 someone else, or being made, is in progress; a denied one is done (stopped). A review session gets no worker report tool.
 
+### A review again: it continues the last one
+
+A posted review of an item's session is recorded on its audit row (`claw_github_audit.posted`: the event and each inline finding
+with the thread GitHub opened for it), and the item keeps the result in `params.record`: the head reviewed, the verdict, the
+model and each finding with its thread and whether it is resolved. Nothing of it comes from the model. A restart, or a new
+request for a pull request whose last item of the same requester is closed, makes a fresh session that continues that record
+(`params.continues`): its first message names the open findings by number and thread id, to check first (their paths and
+what they said are under `untrusted.previous_findings`, since the first message is the person's), and `gh_pr_get` answers with
+a `continuation` block whose `scope` the code decides:
+
+| `scope` | When | What `files` and `diff` hold |
+|---|---|---|
+| `unchanged` | The head is the one reviewed last time | Nothing: only the findings are checked |
+| `delta` | GitHub's compare of the two heads says `ahead`, within the review path's size limits, and touching no security or CI path | The change since the last head |
+| `full` | `history_rewritten` (force push or rebase), `base_merged` (the base branch merged into the head since, as "Update branch" does: a merge commit, or a changed file the pull request does not change), `large_delta`, or `security_path` | The whole pull request, as a first review reads it |
+
+On the deep review's sandbox path, `review_path.advice` of a `delta` or `unchanged` re-review says so too: the checkout is
+for reading around the change and running tests, and its whole-pull-request diff is not reviewed again. The risk, the holds
+and every gate of a write stay those of the whole pull request. Such a session is also offered
+`gh_thread_resolve(pr, thread_id, head_sha)`, which resolves the thread of a fixed finding: only a thread the last review
+recorded (`thread_not_recorded`), opened by the acting user's own account (`not_own_thread`), on this pull request
+(`thread_not_on_pull_request`), at the head the session read (`head_moved`), and not after the requester stopped the review
+(`review_stopped`). It is not counted in the hourly review limits. With review items on, every review (not only an approval)
+and every `gh_thread_resolve` takes the acting account's write lock on the pull request, which a restart takes too: one still
+being made when its item is restarted holds the restart (`409 merge_in_progress`), and one that comes after it is refused
+(`review_stopped`).
+
 ### From the assistant's conversation
 
 With `CLAW_ASSISTANT_TOOLS=on` as well, the assistant's router can start, restart and answer reviews from what the user says
