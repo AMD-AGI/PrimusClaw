@@ -434,16 +434,19 @@ secret:
   # Reach Hands through the Router's port proxy instead of the sandbox's cluster DNS name
   # (SANDBOX_HANDS_VIA_ROUTER). Only needed when sandboxes run in another cluster, where
   # that name does not resolve. SaFE mode only.
-  # Requires a Router running without --enable-auth (router.config.enableAuth=false in
-  # the sandbox chart): routed Hands requests carry the per-sandbox Hands token, not a
-  # SaFE API key, so a Router with auth on answers 401 and Hands provisioning fails its
-  # health check.
+  # With a Router that runs with --enable-auth, set sandboxRouterAuthEnabled too: routed
+  # Hands requests then present the sandbox owner's platform key to the Router (and the
+  # Hands token in X-Hands-Token, which is what Hands reads); without it they carry only
+  # the Hands token, the Router answers 401 and Hands provisioning fails its health check.
   sandboxHandsViaRouter: "false"
   # Set "true" when the sandbox Router runs with --enable-auth (SANDBOX_ROUTER_AUTH_ENABLED).
-  # A hosted application's session-level MCP then carries the <SAFE_API_KEY> placeholder as
-  # its token, which Brain expands to the session owner's platform key; otherwise it carries
-  # the run's MCP token. The console's admin sandbox lists (GET /v1/admin/sandbox/*) then
-  # present the admin caller's platform key to the Router as a Bearer credential.
+  # Every request Claw sends through the Router then presents a SaFE key it accepts: routed
+  # Hands requests (Brain and the API) the sandbox owner's platform key; a hosted
+  # application's session-level MCP the <SAFE_API_KEY> placeholder as its token, which Brain
+  # expands to the session owner's platform key (otherwise the run's MCP token); the
+  # console's admin sandbox lists (GET /v1/admin/sandbox/*) the admin caller's platform key.
+  # Safe to turn on before the Router's auth: a Router without it ignores these and strips
+  # Authorization before forwarding. Turn it off only after the Router's auth is off.
   sandboxRouterAuthEnabled: "false"
   clawDeployRoot: ""
   workspacePersistBase: ""

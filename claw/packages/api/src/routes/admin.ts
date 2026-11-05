@@ -10,7 +10,7 @@ import { countIncompatibleDoorbellRuns } from "../tasks/run-claim.js";
 import {
   DOORBELL_SEMANTICS_KEY, doorbellGateOpen, doorbellInFlight, doorbellLatch,
 } from "../tasks/doorbell-gate.js";
-import { SAFE_API_URL } from "../config.js";
+import { SAFE_API_URL, SANDBOX_ROUTER_AUTH_ENABLED } from "../config.js";
 import { getUser, internalTokenAuth as internalAuth } from "../auth/middleware.js";
 import { canWriteSessionAsOperator } from "../auth/models.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
@@ -125,11 +125,12 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
           return entry ? new TextDecoder().decode(entry.value) : null;
         },
         dagHandles: listDagHandles,
-        probeHealth: async (handsUrl) => {
+        probeHealth: async (handsUrl, platformKey) => {
           try {
             const r = await fetch(`${handsUrl.replace(/\/mcp\/?$/, "")}/health`, {
-              // A Router port-proxy URL needs its session header to be routed.
-              headers: handsRouteHeaders(handsUrl),
+              // A Router port-proxy URL needs its session header to be routed, and a
+              // Router with --enable-auth the sandbox owner's key.
+              headers: handsRouteHeaders(handsUrl, SANDBOX_ROUTER_AUTH_ENABLED ? platformKey : undefined),
               signal: AbortSignal.timeout(3000),
             });
             return r.ok;
