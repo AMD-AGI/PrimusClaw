@@ -1,0 +1,261 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Grafana alerts for sandbox cleanup failures, for the grafana-operator in
+# primus-safe (Grafana instance labelled dashboards=monitoring). Routed to the
+# same contact point as the Clawy rule group.
+#
+# Apply:    kubectl -n primus-safe apply -f sandbox-cleanup-alerts.yaml
+# Rollback: kubectl -n primus-safe delete grafanaalertrulegroup agent-sandbox-cleanup
+#           kubectl -n primus-safe delete grafanafolder agent-sandbox
+#
+# Every query uses series that exist today: claw-brain's own counters and
+# kube-state-metrics. Not covered, because nothing exports it yet:
+#   - session_cleanup.stuck in claw-api is a log line only (no metric);
+#   - a Sandbox or CodeInterpreter object whose pod is gone (kube-state-metrics
+#     has no custom-resource state for agents.x-k8s.io);
+#   - the agent-sandbox control plane exports no metrics to VictoriaMetrics;
+#   - GPU sandboxes on the crusoe cluster.
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaFolder
+metadata:
+  name: agent-sandbox
+  namespace: primus-safe
+spec:
+  allowCrossNamespaceImport: false
+  instanceSelector:
+    matchLabels:
+      dashboards: monitoring
+  title: Agent sandbox
+  uid: agent-sandbox
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaAlertRuleGroup
+metadata:
+  name: agent-sandbox-cleanup
+  namespace: primus-safe
+spec:
+  allowCrossNamespaceImport: false
+  folderRef: agent-sandbox
+  instanceSelector:
+    matchLabels:
+      dashboards: monitoring
+  interval: 1m
+  name: agent-sandbox-cleanup
+  rules:
+  - annotations:
+      description: claw-brain counted session teardowns it could not finish in the
+        last hour (claw_brain_session_cleanup_incomplete_total, by reason). The sandbox
+        is left to the idle-reclaim path instead of being removed by the delete. no_platform_key
+        means the session owner has no linked SaFE key, so Claw could not call SaFE
+        to delete the workload. Check claw-brain logs for session.cleanup_incomplete
+        and the Sandbox pods in global-cpu.
+      runbook: https://github.com/AMD-AGI/PrimusClaw/blob/main/sandbox/deploy/k8s/alerts/sandbox-cleanup-alerts.yaml
+      summary: Session deletes did not finish their sandbox teardown
+    condition: B
+    data:
+    - datasourceUid: victoriametrics
+      model:
+        datasource:
+          type: prometheus
+          uid: victoriametrics
+        expr: sum by (reason) (increase_pure(claw_brain_session_cleanup_incomplete_total[1h]))
+        instant: true
+        refId: A
+      refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+    - datasourceUid: __expr__
+      model:
+        conditions:
+        - evaluator:
+            params:
+            - 0
+            type: gt
+          type: query
+        datasource:
+          type: __expr__
+          uid: __expr__
+        expression: A
+        refId: B
+        type: threshold
+      refId: B
+    execErrState: Error
+    for: 0s
+    labels:
+      component: sandbox
+      severity: warning
+      team: primus-claw
+    noDataState: OK
+    notificationSettings:
+      group_by:
+      - alertname
+      - grafana_folder
+      group_interval: 5m
+      group_wait: 30s
+      receiver: autopilot-grafana-alerting-autopilot-fle
+      repeat_interval: 4h
+    title: Session teardown left sandboxes behind
+    uid: sandbox-cleanup-incomplete
+  - annotations:
+      description: claw-brain counted sandbox stop attempts that did not succeed in
+        the last hour (claw_sandbox_stop_total with outcome other than ok), after
+        its own retries. The sandbox keeps running until its 24 h workload deadline.
+        Check the claw-brain reaper logs and SaFE's workload API.
+      runbook: https://github.com/AMD-AGI/PrimusClaw/blob/main/sandbox/deploy/k8s/alerts/sandbox-cleanup-alerts.yaml
+      summary: Hands sandbox teardowns fail
+    condition: B
+    data:
+    - datasourceUid: victoriametrics
+      model:
+        datasource:
+          type: prometheus
+          uid: victoriametrics
+        expr: sum(increase_pure(claw_sandbox_stop_total{outcome!="ok"}[1h])) or vector(0)
+        instant: true
+        refId: A
+      refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+    - datasourceUid: __expr__
+      model:
+        conditions:
+        - evaluator:
+            params:
+            - 0
+            type: gt
+          type: query
+        datasource:
+          type: __expr__
+          uid: __expr__
+        expression: A
+        refId: B
+        type: threshold
+      refId: B
+    execErrState: Error
+    for: 0s
+    labels:
+      component: sandbox
+      severity: warning
+      team: primus-claw
+    noDataState: OK
+    notificationSettings:
+      group_by:
+      - alertname
+      - grafana_folder
+      group_interval: 5m
+      group_wait: 30s
+      receiver: autopilot-grafana-alerting-autopilot-fle
+      repeat_interval: 4h
+    title: Sandbox teardown fails
+    uid: sandbox-stop-failed
+  - annotations:
+      description: 'A pod owned by a Sandbox (agents.x-k8s.io) has existed for more
+        than 26 h. Claw sandboxes run under a 24 h workload deadline (activeDeadlineSeconds
+        86400) and the oldest one in the 7 days before this rule was 23.8 h old, so
+        this one escaped every cleanup path: Claw''s teardown, SaFE''s workload timeout
+        and the idle reclaim. The pod label names it; delete its SaFE workload.'
+      runbook: https://github.com/AMD-AGI/PrimusClaw/blob/main/sandbox/deploy/k8s/alerts/sandbox-cleanup-alerts.yaml
+      summary: A sandbox pod is older than 26 hours
+    condition: B
+    data:
+    - datasourceUid: victoriametrics
+      model:
+        datasource:
+          type: prometheus
+          uid: victoriametrics
+        expr: max by (namespace, pod) ((time() - max by (namespace, pod, uid) (kube_pod_created))
+          * on (uid) group_left () max by (uid) (kube_pod_owner{owner_kind="Sandbox"}))
+        instant: true
+        refId: A
+      refId: A
+      relativeTimeRange:
+        from: 900
+        to: 0
+    - datasourceUid: __expr__
+      model:
+        conditions:
+        - evaluator:
+            params:
+            - 93600
+            type: gt
+          type: query
+        datasource:
+          type: __expr__
+          uid: __expr__
+        expression: A
+        refId: B
+        type: threshold
+      refId: B
+    execErrState: Error
+    for: 15m
+    labels:
+      component: sandbox
+      severity: warning
+      team: primus-claw
+    noDataState: OK
+    notificationSettings:
+      group_by:
+      - alertname
+      - grafana_folder
+      group_interval: 5m
+      group_wait: 30s
+      receiver: autopilot-grafana-alerting-autopilot-fle
+      repeat_interval: 4h
+    title: Sandbox pod outlived its deadline
+    uid: sandbox-pod-overdue
+  - annotations:
+      description: vmagent has not scraped any claw-brain /metrics for 10 minutes,
+        so the sandbox teardown alerts in this group cannot fire. Check the primus-claw-brain
+        pods and their metrics port.
+      runbook: https://github.com/AMD-AGI/PrimusClaw/blob/main/sandbox/deploy/k8s/alerts/sandbox-cleanup-alerts.yaml
+      summary: The sandbox cleanup metrics are not scraped
+    condition: B
+    data:
+    - datasourceUid: victoriametrics
+      model:
+        datasource:
+          type: prometheus
+          uid: victoriametrics
+        expr: max(up{job="primus-claw-brain"}) or vector(0)
+        instant: true
+        refId: A
+      refId: A
+      relativeTimeRange:
+        from: 900
+        to: 0
+    - datasourceUid: __expr__
+      model:
+        conditions:
+        - evaluator:
+            params:
+            - 1
+            type: lt
+          type: query
+        datasource:
+          type: __expr__
+          uid: __expr__
+        expression: A
+        refId: B
+        type: threshold
+      refId: B
+    execErrState: Error
+    for: 10m
+    labels:
+      component: sandbox
+      severity: warning
+      team: primus-claw
+    noDataState: OK
+    notificationSettings:
+      group_by:
+      - alertname
+      - grafana_folder
+      group_interval: 5m
+      group_wait: 30s
+      receiver: autopilot-grafana-alerting-autopilot-fle
+      repeat_interval: 4h
+    title: claw-brain metrics are not scraped
+    uid: sandbox-cleanup-metrics-missing
