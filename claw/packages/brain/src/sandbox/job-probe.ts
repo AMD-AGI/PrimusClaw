@@ -11,7 +11,7 @@ import {
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import type { SandboxInstance, SandboxStatus } from "./provider.js";
 import { SandboxRuntimeTerminalError } from "./errors.js";
-import { fetchThroughRouters, sandboxRouterBasesFor } from "./sandbox-router.js";
+import { fetchThroughRouters, sandboxRouterBases } from "./sandbox-router.js";
 
 export interface JobProbeEntry {
   provider?: "safe-workload" | "agent-sandbox";
@@ -226,7 +226,7 @@ export async function inspectSandboxJobs(
 
   // SaFE mode may list several Router bases (see sandbox-router.ts); the
   // agent-sandbox provider and the no-Router ingress each have one.
-  const routers = agent ? [] : sandboxRouterBasesFor(inst.namespace);
+  const routers = agent ? [] : sandboxRouterBases();
   const base = agent
     ? AGENT_SANDBOX_ROUTER_URL.replace(/\/+$/, "")
     : (routers.length > 0 ? routers[0] : `${SAFE_API_URL}/sandbox`);

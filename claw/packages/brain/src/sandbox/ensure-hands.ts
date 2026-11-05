@@ -244,8 +244,7 @@ function sandboxNamespaceFor(
   // A multi-node run's sandbox goes where its cluster is, whatever the sandbox asks for.
   // The optimizer in it drives the cluster through the Ray head's service and the Infera
   // pods' IPs, which resolve only on the cluster's own cluster; a CPU-only sandbox placed
-  // by its resources would land in the CPU workspace, which may be on another one. The
-  // Router follows the namespace (`sandboxRouterBasesFor`), so it is the cluster's.
+  // by its resources would land in the CPU workspace, which may be on another one.
   const clusterNamespace = multiNodeContext?.namespace?.trim();
   if (clusterNamespace) return clusterNamespace;
   // SaFE mode: a deployment with a CPU workspace chooses by what the sandbox asks for
