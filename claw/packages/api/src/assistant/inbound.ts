@@ -38,12 +38,21 @@ const MESSAGE_RETENTION = "7 days";
 
 export interface ChannelPerson { name: string; user_id?: string; email?: string }
 export interface ChannelAction { name: string; usage?: string; summary?: string }
+/**
+ * What a channel can be handed to carry out itself, as typed data (`channel_context.handoffs`). `review_for_other`: a review the person
+ * asks of someone else, which runs on that person's own credentials; only a channel that holds them (their exchanged
+ * token and their linked key) can start it, so the router hands it over (`review_start`, `AssistantActionPayload.review`) instead of
+ * being refused. A name Claw does not know is dropped: a channel cannot widen what is handed to it.
+ */
+export const CHANNEL_HANDOFFS = ["review_for_other"] as const;
+export type ChannelHandoff = (typeof CHANNEL_HANDOFFS)[number];
 export interface ChannelContext {
   channel?: string;
   channel_message_id?: string;
   people: ChannelPerson[];
   actions: ChannelAction[];
   repos: string[];
+  handoffs: ChannelHandoff[];
 }
 
 export type AttendedVia = { kind: "person" } | { kind: "service"; client_id: string; act_sub: string };
@@ -79,11 +88,12 @@ export function parseChannelContext(raw: unknown): ChannelContext {
   }
   const repos = (Array.isArray(c.repos) ? c.repos : []).map(str).filter((r): r is string => !!r && /^[^/\s]+\/[^/\s]+$/.test(r))
     .slice(0, CONTEXT_LIST_MAX);
+  const handoffs = CHANNEL_HANDOFFS.filter((h) => Array.isArray(c.handoffs) && c.handoffs.includes(h));
   const channel = str(c.channel);
   const channelMessageId = str(c.channel_message_id);
   return {
     ...(channel ? { channel } : {}), ...(channelMessageId ? { channel_message_id: channelMessageId } : {}),
-    people, actions, repos,
+    people, actions, repos, handoffs,
   };
 }
 
