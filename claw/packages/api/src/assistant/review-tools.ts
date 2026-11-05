@@ -170,8 +170,8 @@ export function modelGrounded(text: string, model: string): boolean {
 const HAN = /\p{Script=Han}/u;
 
 /**
- * Whether the person's own message names this person: their name (or a part of it no one else the channel listed shares), their email or
- * the part before its `@`, or their user id. Case aside; a Latin word only whole (`Lei` is not named by `Leila`), a Chinese name anywhere
+ * Whether the person's own message names this person: their name (when no one else the channel listed has the same one), a part of it no
+ * one else listed shares, their email or the part before its `@`, or their user id. Case aside; a Latin word only whole (`Lei` is not named by `Leila`), a Chinese name anywhere
  * in the text. Being listed beside the message is the channel's say that the person is there; this is the person's say that it is them.
  */
 export function reviewerNamed(text: string, person: ChannelPerson & { user_id: string }, people: readonly ChannelPerson[]): boolean {
@@ -183,9 +183,11 @@ export function reviewerNamed(text: string, person: ChannelPerson & { user_id: s
     return new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(s)}(?![\\p{L}\\p{N}_])`, "u").test(t);
   };
   const parts = (name: string): string[] => name.split(/[\s,，、.·]+/).map((p) => lower(p)).filter((p) => p.length >= 2);
-  const othersParts = new Set(people.filter((p) => p !== person && p.user_id !== person.user_id).flatMap((p) => parts(p.name)));
+  const others = people.filter((p) => p !== person && p.user_id !== person.user_id);
+  const othersParts = new Set(others.flatMap((p) => parts(p.name)));
+  const sameName = others.some((p) => lower(p.name.trim()) === lower(person.name.trim()));
   const local = person.email?.split("@")[0] ?? "";
-  return appears(person.name) || appears(person.user_id) || (!!person.email && appears(person.email)) || (local.length >= 3 && appears(local))
+  return (!sameName && appears(person.name)) || appears(person.user_id) || (!!person.email && appears(person.email)) || (local.length >= 3 && appears(local))
     || parts(person.name).some((p) => !othersParts.has(p) && appears(p));
 }
 

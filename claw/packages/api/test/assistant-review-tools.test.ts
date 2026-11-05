@@ -424,6 +424,14 @@ describe("assistant review tools", { skip }, () => {
     ] as const) {
       assert.equal(rt.reviewerNamed(text, person, people), named, `${text} / ${person.name}`);
     }
+    // Two people listed under one name: the name names neither, only what tells them apart does.
+    const alex1 = p("Alex Chen", "u-alex1", "alex.chen@amd.com");
+    const alex2 = p("Alex Chen", "u-alex2", "achen2@amd.com");
+    for (const [text, person, named] of [
+      ["请 Alex Chen 审 254", alex1, false], ["请 Alex Chen 审 254", alex2, false], ["请 achen2 审 254", alex2, true], ["请 achen2 审 254", alex1, false],
+    ] as const) {
+      assert.equal(rt.reviewerNamed(text, person, [alex1, alex2]), named, `${text} / ${person.user_id}`);
+    }
     await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: alice.userId });
     assert.equal(calls.start[0].request.actingAs, null);
   });

@@ -251,10 +251,15 @@ export function parseReviewRequest(body: unknown): ReviewRequest {
 // ------------------------------------------------------------------------------------------------ handoffs from the assistant
 
 /**
- * How long a review the assistant handed to a channel can be started from it, and binds whatever is started for the same request: the
- * outbox's delivery window (`GIVE_UP_AFTER_HOURS`), the longest the channel can take to receive it.
+ * How long a review the assistant handed to a channel can be started from it by its id: the outbox's delivery window
+ * (`GIVE_UP_AFTER_HOURS`), the longest the channel can take to receive it.
  */
 export const REVIEW_HANDOFF_HOURS = 24;
+/**
+ * How long the record is kept, and binds a request for the same person, reviewer and pull request that leaves the id out (`handoffGate`):
+ * well past the window in which it can be started by its id, so that a late start without the id is held as well.
+ */
+export const REVIEW_HANDOFF_RETENTION_DAYS = 30;
 
 const prKey = (pr: PrRef): string => `${pr.owner}/${pr.repo}#${pr.number}`.toLowerCase();
 
@@ -266,8 +271,8 @@ const prKey = (pr: PrRef): string => `${pr.owner}/${pr.repo}#${pr.number}`.toLow
  */
 export async function recordReviewHandoff(q: Querier, h: { handoffId: string; userId: string; reviewerUserId: string; prs: PrRef[]; merge: boolean }): Promise<void> {
   await q(
-    `DELETE FROM claw_assistant_review_handoffs WHERE user_id = $1 AND created_at < NOW() - make_interval(hours => $2::int)`,
-    [h.userId, REVIEW_HANDOFF_HOURS],
+    `DELETE FROM claw_assistant_review_handoffs WHERE user_id = $1 AND created_at < NOW() - make_interval(days => $2::int)`,
+    [h.userId, REVIEW_HANDOFF_RETENTION_DAYS],
   );
   await q(
     `INSERT INTO claw_assistant_review_handoffs (handoff_id, user_id, reviewer_user_id, prs, merge)
@@ -280,7 +285,7 @@ export async function recordReviewHandoff(q: Querier, h: { handoffId: string; us
  * What a review asked of someone else may do when the assistant handed it over: null when no handoff of the caller to this reviewer names
  * any of these pull requests. The gate does not depend on the channel echoing the handoff: a request for the same reviewer and pull requests
  * that leaves `handoff_id` out still waits for the reviewer's confirmation before it merges, and only reviews unless one of those handoffs
- * read a merge. A request that names one must be the
+ * read a merge, for as long as the record is kept (`REVIEW_HANDOFF_RETENTION_DAYS`), however late it comes. A request that names one must be the
  * caller's, to this reviewer, for pull requests it covers, not yet started from, and not expired; it is then started from once, and merges
  * only if the router read a merge.
  */
@@ -304,8 +309,8 @@ async function handoffGate(requesterId: string, reviewerId: string, request: Rev
   }
   const rows = (await db.query(
     `SELECT merge FROM claw_assistant_review_handoffs
-      WHERE user_id = $1 AND reviewer_user_id = $2 AND created_at > NOW() - make_interval(hours => $3::int) AND prs && $4::text[]`,
-    [requesterId, reviewerId, REVIEW_HANDOFF_HOURS, keys],
+      WHERE user_id = $1 AND reviewer_user_id = $2 AND created_at > NOW() - make_interval(days => $3::int) AND prs && $4::text[]`,
+    [requesterId, reviewerId, REVIEW_HANDOFF_RETENTION_DAYS, keys],
   )).rows as Array<{ merge: boolean }>;
   return rows.length ? { handoffId: null, merge: rows.some((r) => r.merge) } : null;
 }

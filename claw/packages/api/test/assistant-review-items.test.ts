@@ -1010,6 +1010,9 @@ describe("assistant review items", { skip }, () => {
     await w.q("UPDATE claw_assistant_review_handoffs SET created_at = NOW() - make_interval(hours => $1::int + 1) WHERE handoff_id = 'h-257'", [ri.REVIEW_HANDOFF_HOURS]);
     assert.deepEqual((await start("alice", { prs: [PR(257)], acting_as: "bob", handoff_id: "h-257" })).body.error, "handoff_not_found", "expired");
     assert.equal(await count("claw_work_items"), 4, "nothing made by a refused handoff");
+    // Too late to start by its id, yet a start without it is still held: the record binds for as long as it is kept.
+    const late = await made(await start("alice", { prs: [PR(257)], acting_as: "bob", review_only: false }));
+    assert.deepEqual([late.config.review_only, late.config.merge_needs_confirmation], [false, true]);
 
     // Two starts from one handoff at once, each for a different one of its pull requests (so no open review stands between them): one is
     // made, the other is told the handoff was used.
@@ -1017,6 +1020,10 @@ describe("assistant review items", { skip }, () => {
     const raced = await Promise.all([260, 261].map((n) => start("alice", { prs: [PR(n)], acting_as: "carol", review_only: false, handoff_id: "h-race" })));
     assert.deepEqual(raced.map((r) => [r.status, r.body.error ?? null]).sort(), [[200, null], [409, "handoff_used"]], JSON.stringify(raced.map((r) => r.body)));
     assert.equal(await count("claw_work_items", "user_id = 'carol'"), 1, "one start from one handoff");
+    // A record past its keeping is pruned with the next handoff of the person, and binds nothing after.
+    await w.q("UPDATE claw_assistant_review_handoffs SET created_at = NOW() - make_interval(days => $1::int + 1) WHERE handoff_id = 'h-257'", [ri.REVIEW_HANDOFF_RETENTION_DAYS]);
+    await handoff("h-later", [263], false);
+    assert.deepEqual((await w.q("SELECT handoff_id FROM claw_assistant_review_handoffs WHERE handoff_id IN ('h-257', 'h-later') ORDER BY 1")).map((r) => r.handoff_id), ["h-later"]);
 
     // A review asked of someone else with no handoff behind it is what it was: the asking service's own, merging as it always did.
     const direct = await made(await start("alice", { prs: [PR(262)], acting_as: "bob", review_only: false }));
