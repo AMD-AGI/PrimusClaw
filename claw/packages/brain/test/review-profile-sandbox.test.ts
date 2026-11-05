@@ -13,6 +13,7 @@
  *   S4  the backstop: what Brain strips from such a request, and the tools it allows whatever the request lists
  *   S5  the prompt is not configuration for such a request (it holds the requester's words): no multi-node cluster, no image from it
  *   S6  such a request without a positive turn budget is refused (0 is no limit to the agent loop)
+ *   S7  the resources every provider builds from (Kubernetes mode reads them as they are) carry no GPU key for such a request
  */
 process.env.SANDBOX_CPU_NAMESPACE = "global-cpu";
 process.env.SANDBOX_NAMESPACE = "gpu-default";
@@ -175,4 +176,22 @@ test("S6 a review request runs only with a positive turn budget; any other reque
   }
   assert.equal(reviewTurnBudgetRefusal({ sandbox_profile: "review", max_turns: 1 }), null);
   assert.equal(reviewTurnBudgetRefusal({ max_turns: 0 }), null, "0 is an ordinary run's own choice of no limit");
+});
+
+test("S7 the resources every provider builds from carry no GPU key for a review request, from the spec or the legacy fields; the control keeps them", () => {
+  const gpuResources = { cpu: "2", memory: "4Gi", gpu: "1", "amd.com/gpu": "1", "nvidia.com/gpu": "2" };
+  for (const shape of [
+    { sandbox_spec: { handle: "main", image: "registry.test/img:1", resources: gpuResources } },
+    { sandbox_spec: undefined, sandbox_image: "registry.test/img:1", resources: gpuResources },
+  ]) {
+    const review = resolveSandboxAction(request({ ...shape, sandbox_profile: "review" } as never));
+    assert.equal(review.kind, "create");
+    const res = (review as { params: { resources: Record<string, string> } }).params.resources;
+    assert.deepEqual(Object.keys(res).filter((k) => /gpu/i.test(k)), [], JSON.stringify(res));
+    assert.equal(res.cpu, "2", "the rest is kept");
+    const control = resolveSandboxAction(request(shape as never));
+    const kept = (control as { params: { resources: Record<string, string> } }).params.resources;
+    assert.equal(kept.gpu, "1", "an ordinary request keeps its GPU");
+    assert.equal(kept["nvidia.com/gpu"], "2");
+  }
 });

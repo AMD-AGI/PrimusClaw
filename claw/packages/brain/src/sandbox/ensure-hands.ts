@@ -43,6 +43,7 @@ import {
   handleEnvRecord,
   handleServesEnvOf,
   sandboxUserEnv,
+  withoutGpuKeys,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
@@ -154,8 +155,7 @@ function effectiveWorkloadResources(
 }
 
 function withoutGpu(entry: Record<string, string | number>): Record<string, string | number> {
-  const { gpu: _gpu, "amd.com/gpu": _amd, ...rest } = entry;
-  return rest;
+  return withoutGpuKeys(entry);
 }
 
 /**
