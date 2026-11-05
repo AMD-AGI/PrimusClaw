@@ -520,10 +520,15 @@ export async function forgetAllMemories(userId: string): Promise<number> {
 }
 
 /** Read entries back: one by id, or the closest matches to a query. Counts as a use of each. */
-export async function recallMemory(userId: string, by: { id?: number; query?: string; item?: string }): Promise<MemoryRow[]> {
+export async function recallMemory(
+  userId: string, by: { id?: number; query?: string; item?: string; boundOnly?: boolean },
+): Promise<MemoryRow[]> {
   // `item`: only what holds everywhere and what is bound to that item (an assistant's worker), chosen before the top ten are
   // taken and before anything counts as read, so another item's entries neither crowd the answer out nor are counted.
-  const reaches = (r: MemoryRow): boolean => by.item === undefined || r.work_item_id === null || r.work_item_id === by.item;
+  // `boundOnly`: what is bound to that item and nothing that holds everywhere (a worker that may post on GitHub unasked).
+  const reaches = (r: MemoryRow): boolean => by.item === undefined
+    || r.work_item_id === by.item
+    || (r.work_item_id === null && by.boundOnly !== true);
   let rows: MemoryRow[];
   if (by.id !== undefined) {
     const row = await readEntry(userId, by.id, true);

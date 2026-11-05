@@ -35,7 +35,9 @@ record it.
   a message sent with a key, a stale one or a turn that has read a worker's words is refused; reading works), on an entry whose number is in that message or
   in what the assistant said to them just before, quoting that message, and never in a conversation marked
   `memory: "off"`. A task item's worker is shown a read-only index and may only recall; a review item's session is shown
-  only the entries bound to its item. An entry can be bound to one work item (`claw_memory_entries.work_item_id`, a new
+  only the entries bound to its item, and so is a task item's worker while any of its pull request subscriptions allows
+  answers without asking (`reply_allowed`): no index in its prompt, and `memory_recall`, asked again on every call,
+  reaches only entries bound to its item. An entry can be bound to one work item (`claw_memory_entries.work_item_id`, a new
   column required at start-up); bound entries are left out of the chat's catalogue, and a save is checked for a duplicate
   or a near one only against entries of the same binding. Workers started from a session marked `memory: "off"` are
   marked so too, and an assistant's watcher of a group or a repository is never served the chat's memory. The chat's

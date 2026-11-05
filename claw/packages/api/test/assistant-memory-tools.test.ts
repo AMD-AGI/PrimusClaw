@@ -38,6 +38,10 @@
  *   O1  an assistant's watcher of a group or a repository (observe) is not a session the chat's memory serves
  *   P1  a router turn carries the memory section and index (or the off note); a worker turn a read-only index
  *   T1  over the wire: a router is offered the memory tools, a worker only memory_recall
+ *   R1  a worker whose item may answer on its pull request unasked (a subscription with `reply_allowed`) is shown and
+ *       recalls only what is bound to its item: no index in its prompt, no entry that holds everywhere by number, search
+ *       or list; a worker whose subscription does not allow answers is unchanged
+ *   R2  answers turned on during a run take the rest of the memory away from the next call; turned off, it comes back
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -75,7 +79,7 @@ describe("assistant memory tools", { skip }, () => {
   });
   after(async () => { await app?.close(); await w?.stop(); });
   beforeEach(async () => {
-    await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistant_messages, claw_assistants, claw_sessions, claw_notification_outbox, claw_memory_entries, claw_memory_events, claw_user_memory_prefs, claw_assistant_scopes CASCADE");
+    await w.q("TRUNCATE claw_work_item_subscriptions, claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistant_messages, claw_assistants, claw_sessions, claw_notification_outbox, claw_memory_entries, claw_memory_events, claw_user_memory_prefs, claw_assistant_scopes CASCADE");
     mt.memoryToolPorts.attended = realAttended;
     alice = await w.user("alice");
     bob = await w.user("bob");
@@ -533,5 +537,69 @@ describe("assistant memory tools", { skip }, () => {
       await worker.close();
     }
     assert.equal((await entries()).length, 1);
+  });
+  test("R1 a worker that may answer on its pull request unasked is shown and recalls only what is bound to its item", async () => {
+    const ge = await import("../src/assistant/github-events.js");
+    const general = await stored("alice", "私人：家里的地址");
+    const replying = await w.createItem(alice, "Watch PR 7");
+    const asking = await w.createItem(alice, "Watch PR 8");
+    const bound = (await svc.writeMemory("alice", { type: "project", title: "PR 7 用英文答复", body: "PR 7 用英文答复" },
+      { kind: "model", sessionId: "chat", quote: "PR 7 用英文答复", humanMessages: ["PR 7 用英文答复"] }, { workItemId: replying.itemId }));
+    assert.ok(bound.ok, JSON.stringify(bound));
+    await ge.subscribeItem({ userId: "alice", item: replying.itemId, pr: "o/r#7", reply: true });
+    await ge.subscribeItem({ userId: "alice", item: asking.itemId, pr: "o/r#8", reply: false });
+
+    // The prompt, as a worker turn is set up.
+    const prompt = async (item: { workerSid: string }): Promise<string> => {
+      const run = await w.openRun(item.workerSid);
+      const task: Record<string, unknown> = { task_id: run.taskId, message_id: run.messageId, prompt: "go" };
+      await w.mod.role.applySessionRoleToTask(task, item.workerSid);
+      await w.closeRun(run.taskId);
+      return String(task.system_append);
+    };
+    const shown = await prompt(replying);
+    assert.ok(shown.includes(`#${bound.id} PR 7 用英文答复`), shown);
+    assert.ok(!shown.includes(`#${general} 私人`) && !shown.includes("家里的地址"), `no entry that holds everywhere: ${shown}`);
+    assert.ok(!shown.includes("memory_recall(id)"), "no index");
+
+    const turn = await w.workerTurn(replying.itemId);
+    assert.deepEqual(await mt.memoryRecall(turn, { id: String(general) }), {
+      ok: false, error: "not_found", message: "no such entry",
+      note: "this item may answer on its pull request without asking the user, so only what the user bound to this item can be read here",
+    });
+    assert.equal(((await mt.memoryRecall(turn, { query: "家里的地址" })).entries as unknown[]).length, 0);
+    assert.deepEqual((await mt.memoryRecall(turn, {})).entries, [`#${bound.id} [project] PR 7 用英文答复`]);
+    assert.equal(((await mt.memoryRecall(turn, { id: String(bound.id) })).entry as { title: string }).title, "PR 7 用英文答复");
+    assert.equal(((await mt.memoryRecall(turn, { query: "英文答复" })).entries as unknown[]).length, 1);
+    await w.closeRun(turn.task_id);
+    const counted = await w.q("SELECT id FROM claw_memory_entries WHERE user_id = 'alice' AND access_count > 0 ORDER BY id");
+    assert.deepEqual(counted.map((r: { id: number }) => Number(r.id)), [bound.id], "the refused entry is not counted as read");
+
+    // A subscription that does not allow answers changes nothing: index and recall as before.
+    assert.ok((await prompt(asking)).includes(`#${general} 私人：家里的地址`));
+    const other = await w.workerTurn(asking.itemId);
+    assert.equal(((await mt.memoryRecall(other, { id: String(general) })).entry as { title: string }).title, "私人：家里的地址");
+    assert.deepEqual((await mt.memoryRecall(other, {})).entries, [`#${general} [user] 私人：家里的地址`]);
+  });
+
+  test("R2 answers turned on during a run take the rest of the memory away from the next call", async () => {
+    const ge = await import("../src/assistant/github-events.js");
+    const general = await stored("alice", "私人：家里的地址");
+    const item = await w.createItem(alice, "Watch PR 9");
+    const sub = await ge.subscribeItem({ userId: "alice", item: item.itemId, pr: "o/r#9" });
+    const turn = await w.workerTurn(item.itemId);
+    assert.equal(((await mt.memoryRecall(turn, { id: String(general) })).entry as { title: string }).title, "私人：家里的地址");
+
+    await ge.subscribeItem({ userId: "alice", item: item.itemId, pr: "o/r#9", reply: true });
+    assert.equal((await mt.memoryRecall(turn, { id: String(general) })).ok, false, "the same run, the next call");
+    assert.equal(((await mt.memoryRecall(turn, { query: "家里的地址" })).entries as unknown[]).length, 0);
+    assert.deepEqual((await mt.memoryRecall(turn, {})).entries, []);
+
+    await ge.subscribeItem({ userId: "alice", item: item.itemId, pr: "o/r#9", reply: false });
+    assert.equal((await mt.memoryRecall(turn, { id: String(general) })).ok, true, "taken back, the index is the worker's again");
+    await ge.subscribeItem({ userId: "alice", item: item.itemId, pr: "o/r#9", reply: true });
+    assert.equal((await mt.memoryRecall(turn, { id: String(general) })).ok, false);
+    await ge.endSubscription("alice", item.itemId, sub.sub_id);
+    assert.equal((await mt.memoryRecall(turn, { id: String(general) })).ok, true, "an ended subscription answers nothing");
   });
 });

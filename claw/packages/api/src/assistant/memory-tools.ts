@@ -17,7 +17,9 @@
  *  - the conversation is theirs alone: a session marked `memory: "off"` (a group's) never writes personal memory.
  *
  * Reading is not acting for anyone: the router recalls in any live turn, a task item's worker is shown a read-only index
- * and may recall, and a review item's session is shown only what the person bound to that item.
+ * and may recall, and a review item's session is shown only what the person bound to that item. A task item's worker that
+ * may answer on a pull request without asking (`itemPostsUnasked`) is shown and may recall only what is bound to its item:
+ * what it reads, a comment on that pull request can ask it to post there.
  */
 import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_MEMORY_TOOLS } from "../config.js";
@@ -174,6 +176,17 @@ function full(r: MemoryRow): Record<string, unknown> {
 }
 
 /**
+ * Whether the item's worker may post on GitHub without the person: one of its subscriptions allows answers. Such a worker reads
+ * what strangers write and can be talked into posting it, so it reaches only memory bound to its item. Asked on every call, so
+ * answers turned on during a run take the rest of the memory away from the next call. A failed read is not "no": it throws.
+ */
+export async function itemPostsUnasked(q: Querier, itemId: string): Promise<boolean> {
+  return ((await q(
+    "SELECT 1 FROM claw_work_item_subscriptions WHERE item_id = $1 AND reply_allowed LIMIT 1", [itemId],
+  )).rowCount ?? 0) > 0;
+}
+
+/**
  * Read the user's memory: one entry by number, a search, or every entry one line each. Any live turn of the assistant's,
  * in a session where their memory is kept. A worker reads what holds everywhere and what is bound to its own item, never
  * another item's: that is what it is shown, and recall must not reach further.
@@ -182,23 +195,26 @@ export async function memoryRecall(
   claims: AssistantTokenClaims, args: { id?: unknown; query?: unknown },
 ): Promise<Record<string, unknown>> {
   if (claims.role !== "router" && claims.role !== "worker") throw new ToolRefused("not_allowed", `this tool is not for the ${claims.role}`);
-  const { userId } = await inTransaction(async (q) => {
-    const turn = await assertLiveRun(q, claims);
-    await requireMemoryHere(q, claims.sid, turn.userId);
-    return turn;
-  });
   // A worker's reach is asked of the store itself, so another item's entries are neither among its results nor counted as read.
   const item = claims.role === "router" ? undefined : (claims.item_id ?? "");
-  const visible = (r: MemoryRow): boolean => item === undefined || r.work_item_id === null || r.work_item_id === item;
+  const { userId, boundOnly } = await inTransaction(async (q) => {
+    const turn = await assertLiveRun(q, claims);
+    await requireMemoryHere(q, claims.sid, turn.userId);
+    return { userId: turn.userId, boundOnly: item !== undefined && await itemPostsUnasked(q, item) };
+  });
+  const visible = (r: MemoryRow): boolean => item === undefined || r.work_item_id === item || (r.work_item_id === null && !boundOnly);
+  const note = boundOnly
+    ? { note: "this item may answer on its pull request without asking the user, so only what the user bound to this item can be read here" }
+    : {};
   if (args.id !== undefined && args.id !== null && args.id !== "") {
-    const rows = await recallMemory(userId, { id: entryId(args.id), item });
-    return rows.length ? { ok: true, entry: full(rows[0]) } : { ok: false, error: "not_found", message: "no such entry" };
+    const rows = await recallMemory(userId, { id: entryId(args.id), item, boundOnly });
+    return rows.length ? { ok: true, entry: full(rows[0]) } : { ok: false, error: "not_found", message: "no such entry", ...note };
   }
   const query = typeof args.query === "string" ? args.query.trim() : "";
-  if (query) return { ok: true, entries: (await recallMemory(userId, { query, item })).map(full) };
+  if (query) return { ok: true, entries: (await recallMemory(userId, { query, item, boundOnly })).map(full), ...note };
   // Waiting for the user's confirmation, or the profile earlier versions generated: not the model's to read (`readEntry`).
   const rows = (await listMemories(userId)).filter((r) => r.status === "active" && r.category !== "user_profile" && visible(r));
-  return { ok: true, count: rows.length, entries: rows.map(line) };
+  return { ok: true, count: rows.length, entries: rows.map(line), ...note };
 }
 
 export async function memorySave(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -286,13 +302,18 @@ export async function routerMemoryBlock(userId: string, sessionId: string): Prom
   });
 }
 
-/** A task item's worker: what the user bound to the item, in full, and the read-only index. Null when there is neither. */
+/**
+ * A task item's worker: what the user bound to the item, in full, and the read-only index. Null when there is neither. A worker
+ * that may post on its pull request unasked (`itemPostsUnasked`) is not shown the index: only what is bound to its item.
+ */
 export async function workerMemoryBlock(userId: string, itemId: string, sessionId: string): Promise<string | null> {
   if (!assistantMemoryOn()) return null;
   return orNothing("worker", sessionId, async () => {
     if (await sessionWithoutMemory(sessionId) || !(await getMemoryPreference(userId))) return null;
     const bound = await memoriesOfItem(userId, itemId);
-    const catalogue = await buildMemoryCatalogue(userId, { preamble: WORKER_MEMORY_PREAMBLE });
+    const catalogue = await itemPostsUnasked((text, params) => db.query(text, params), itemId)
+      ? null
+      : await buildMemoryCatalogue(userId, { preamble: WORKER_MEMORY_PREAMBLE });
     const parts = [bound.length ? renderItemMemories(bound, ITEM_MEMORY_INTRO) : "", catalogue?.text ?? ""].filter(Boolean);
     return parts.length ? parts.join("\n\n") : null;
   });
