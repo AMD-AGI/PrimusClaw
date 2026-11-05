@@ -105,6 +105,30 @@ describe("A who may call", () => {
   });
 });
 
+describe("A' who asked, for a review asked of the acting user", () => {
+  beforeEach(async () => { await boot(); });
+
+  test("A4 the requester of a review the server recorded as asked of its owner is who asked; any other session's is its owner, whatever its config says", async () => {
+    const post = (bearer: string) => fetch(`${base}/v1/internal/github-review/mcp`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${bearer}` }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+    // bob's own session, which alice asked for (what `POST /v1/assistant/reviews` writes).
+    await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-2', 'u-bob', $1::jsonb)",
+      [JSON.stringify({ acting_as: "u-bob", requested_by: { user_id: "u-alice", label: "Alice A" }, sandbox_profile: "review" })]);
+    assert.equal((await post(token({ sessionId: "s-2", requesterUserId: "u-alice" }))).status, 200, "the token names who asked");
+    assert.equal((await post(token({ sessionId: "s-2", requesterUserId: "u-bob" }))).status, 403, "not the owner: they did not ask");
+    // A session alice owns that names bob and claims bob asked: alice's own, and never bob's own review of himself.
+    await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-3', 'u-alice', $1::jsonb)",
+      [JSON.stringify({ acting_as: "u-bob", requested_by: { user_id: "u-bob", label: "Bob" } })]);
+    assert.equal((await post(token({ sessionId: "s-3", requesterUserId: "u-bob" }))).status, 403);
+    assert.equal((await post(token({ sessionId: "s-3", requesterUserId: "u-alice" }))).status, 200);
+    // One alice owns that names bob and claims carol asked: still alice's, so a token naming carol is refused.
+    await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-4', 'u-alice', $1::jsonb)",
+      [JSON.stringify({ acting_as: "u-bob", requested_by: { user_id: "u-carol", label: "Carol" }, sandbox_profile: "review" })]);
+    assert.equal((await post(token({ sessionId: "s-4", requesterUserId: "u-carol" }))).status, 403);
+    assert.equal((await post(token({ sessionId: "s-4", requesterUserId: "u-alice" }))).status, 200);
+    assert.equal(e.gh.calls.length, 0);
+  });
+});
+
 describe("B a tool call", () => {
   beforeEach(async () => { await boot(); });
 
@@ -253,6 +277,38 @@ describe("E a session bound to one pull request, over the wire", () => {
       await c.close();
       assert.equal(r.body.reason === "review_only", refused, `${JSON.stringify(reviewOnly)}: ${r.text}`);
       assert.equal(e.gh.calls.length === 0, refused, `${JSON.stringify(reviewOnly)}: GitHub reached only when it may merge`);
+    }
+  });
+
+  test("E6 the tool route takes merge_needs_confirmation from the session row: such a session's merge is held, nothing merged, and only the acting user's allow on the card's route makes it", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    const http = async (user: string, path: string, body: unknown) => {
+      const r = await fetch(base + path, { method: "POST", headers: { "x-test-user": user, "content-type": "application/json" }, body: JSON.stringify(body) });
+      return { status: r.status, body: (await r.json().catch(() => null)) as any };
+    };
+    // [stored merge_needs_confirmation, held]: a value that is not false reads as one that waits.
+    for (const [stored, held] of [[true, true], ["yes", true], [false, false], [null, false]] as const) {
+      e = await reviewEnv({}, { approved: true });
+      e.identity.answer = async () => credential({ delegation: true });
+      e.gh.reviews.push(ownApproval("s-1"));
+      e.gh.graphql.mergeStateStatus = "CLEAN";
+      await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-1', 'u-alice', $1::jsonb)",
+        [JSON.stringify({ acting_as: "u-bob", acting_as_requester: "Alice A", merge_needs_confirmation: stored })]);
+      app.server.closeAllConnections(); await app.close(); await boot();
+      const c = await connect(token());
+      const r = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD, risk_judgement: { level: "low", reason: "an ordinary change" } });
+      await c.close();
+      const merges = () => e.gh.calls.filter((x) => x.method === "PUT").length;
+      assert.equal(r.body.status, held ? "confirmation_required" : "merged", `${JSON.stringify(stored)}: ${r.text}`);
+      assert.equal(merges(), held ? 0 : 1, JSON.stringify(stored));
+      if (!held) continue;
+      const path = `/v1/github-review/confirmations/${r.body.confirmation_id}/decision`;
+      // The person who asked is not the person it waits for; nor is anyone else.
+      for (const other of ["u-alice", "u-mallory"]) assert.equal((await http(other, path, { decision: "allow" })).status, 403, other);
+      assert.equal(merges(), 0);
+      const ok = await http("u-bob", path, { decision: "allow" });
+      assert.equal(ok.body.status, "merged", JSON.stringify(ok.body));
+      assert.equal(merges(), 1);
     }
   });
 

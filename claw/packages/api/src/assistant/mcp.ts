@@ -117,8 +117,8 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims): void
     `Start a review of each pull request the user named, as a work item each (at most ${MAX_PRS}). Merges only with merge=true.`,
     {
       prs: z.array(z.string()).describe("Each as owner/repo#number or its URL; only numbers the user wrote."),
-      merge: z.boolean().describe("true only when the user clearly asked to merge after the review; otherwise false (review only)."),
-      reviewer: z.string().optional().describe("Whose GitHub account reviews: leave out for the user; else the user_id of someone in People."),
+      merge: z.boolean().describe("true only when the user clearly asked to merge after the review; otherwise false (review only). Even true merges nothing by itself: the merge waits for the user's confirmation (the card's button or 批准 #<ref>)."),
+      reviewer: z.string().optional().describe("Whose GitHub account reviews: leave out for the user. Someone else's (a user_id from People) is refused as acting_as_credentials_required: tell the user what the refusal says to do."),
       model: z.string().optional().describe("Only when the user named a model."),
       effort: z.enum(["low", "medium", "high"]).optional().describe("Only when the user asked for one."),
     },

@@ -285,6 +285,16 @@ export function specFromTopology(topology: EnvironmentTopology): MultiNodePrompt
 }
 
 /**
+ * A review one person asked another to make (`sandbox_profile: "review"`, `agent/review-profile.ts`) is never multi-node, whatever its
+ * topology or its prompt says: its prompt holds text the requester wrote, and the cluster would be built on the reviewer's platform key.
+ * So neither question below reads the prompt (or a declaration) for such a request.
+ */
+function isReviewProfileRequest(request: { sandbox_profile?: unknown }): boolean {
+  // The mark itself, read here rather than through `isReviewProfile`: this module imports no more than the protocol (above).
+  return request.sandbox_profile === "review";
+}
+
+/**
  * The topology a request asks for, from wherever it declared it.
  *
  * The body wins when present, and an invalid body is refused rather than
@@ -296,8 +306,9 @@ export function specFromTopology(topology: EnvironmentTopology): MultiNodePrompt
  * @throws when `topology` is present and does not validate.
  */
 export function resolveTopology(
-  request: { prompt?: string; topology?: unknown },
+  request: { prompt?: string; topology?: unknown; sandbox_profile?: unknown },
 ): MultiNodePromptSpec | null {
+  if (isReviewProfileRequest(request)) return null;
   if (request.topology !== undefined && request.topology !== null) {
     const checked = validateTopology(request.topology);
     if (!checked.ok) {
@@ -329,7 +340,8 @@ export function resolveTopology(
  * caller rather than of this function, and `claw_tasks.topology` is already
  * reserved for a path that has no admission check yet.
  */
-export function isMultiNodeRequest(request: { prompt?: string; topology?: unknown }): boolean {
+export function isMultiNodeRequest(request: { prompt?: string; topology?: unknown; sandbox_profile?: unknown }): boolean {
+  if (isReviewProfileRequest(request)) return false;
   if (request.topology !== undefined && request.topology !== null) {
     const checked = validateTopology(request.topology);
     return checked.ok ? checked.value.nodes >= 2 : true;

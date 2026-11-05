@@ -8,7 +8,7 @@ import path from "node:path";
 import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
 import { filterToolSchemas, parseToolAllowlist } from "../tools/allowlist.js";
-import { agentLoop } from "./agent-loop.js";
+import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
 import { loadRules } from "./rules.js";
@@ -47,6 +47,7 @@ import type { ExecuteExtras } from "./index.js";
 import { untheadedRunIdentity, type RunIdentity } from "../tasks/run-identity.js";
 import { HookRunner, registryHasAny } from "./hooks.js";
 import pino from "pino";
+import { applyReviewProfileBackstop, isReviewProfile, reviewProfileAllowlist, reviewTurnBudgetRefusal } from "./review-profile.js";
 
 const logger = pino({ name: "agent-engine" });
 
@@ -88,6 +89,11 @@ export class AgentEngine {
     hands?: HandsClient | null,
     extras?: ExecuteExtras,
   ): Promise<ExecuteResult> {
+    // Before anything reads the request: a requested review keeps only what its fixed profile allows (`review-profile.ts`).
+    applyReviewProfileBackstop(request);
+    // And it runs only with a positive turn budget: 0 is no limit below (`runHandleTask` refuses it before a sandbox is opened).
+    const noBudget = reviewTurnBudgetRefusal(request);
+    if (noBudget !== null) throw new Error(noBudget);
     // Which wire protocol Brain speaks to the LLM is a deployment-wide
     // choice (LLM_API_STYLE); apiKey still honors per-request BYOK/platform
     // key overrides via resolveRequestLlmKey on top of that provider's
@@ -228,7 +234,10 @@ export class AgentEngine {
     // The tools the run may use at all (`tools_allowlist`), read once for everything below that asks:
     // the prompt (is `load_skill` among them?), the router and the schemas the model is offered.
     // No field, or an empty one, is no restriction.
-    const toolAllowlist = parseToolAllowlist(request.tools_allowlist);
+    // A requested review (`sandbox_profile`) is held to its fixed list whatever the request lists (`review-profile.ts`).
+    const toolAllowlist = isReviewProfile(request)
+      ? reviewProfileAllowlist(parseToolAllowlist(request.tools_allowlist))
+      : parseToolAllowlist(request.tools_allowlist);
     // A run whose list leaves `load_skill` out (any list written before the tool existed) is not offered
     // it, and the router refuses it. Its prompt must not send the model there: it gets the skill hint
     // from before the tool, which reads SKILL.md with `read`.
@@ -555,6 +564,8 @@ export class AgentEngine {
       //    Turn budget: request.max_turns (per-task override) → MAX_TURNS env → default.
       //    0 or negative disables the cap in agent-loop.
       const maxTurns = request.max_turns ?? MAX_TURNS;
+      const turnPool: TurnPool | undefined = isReviewProfile(request) ? { left: maxTurns, used: 0 } : undefined;
+      if (turnPool) extras?.onTurnPool?.(turnPool);
       logger.info({
         sessionId,
         maxTurns,
@@ -574,6 +585,10 @@ export class AgentEngine {
           ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
           ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),
           ...(request.withhold_sandbox_keys ? { actingReview: true } : {}),
+          // A requested review's sub-agents take their turns from its budget, and are charged with it (`TurnPool`).
+          // Its sub-agents run on its own model (`subAgentsOnRunModel`), and the runner sees the pool, so a run stopped or failed midway
+          // is charged what it took (`TaskRunner` `reportedTurns`).
+          ...(turnPool ? { turnPool, subAgentsOnRunModel: true } : {}),
           apiUrl,
           apiKey,
           maxTurns,

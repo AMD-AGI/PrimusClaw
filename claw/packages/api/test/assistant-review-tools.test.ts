@@ -25,6 +25,11 @@
  *   S4  a reviewer is the user, or someone the channel listed with a Claw user id
  *   S5  a model must be named by the user
  *   S6  what the review service refuses reaches the model as it said it, with its data
+ *   S8  merge=true is never a merge: whatever the message says (a negation, a question, "yes merge it"), a start and a restart the router
+ *       makes hand across mergeNeedsConfirmation, so the review merges only once the user confirms that very merge; and no sentence of
+ *       theirs lets a held merge through, only the exact command, by the person it waits for
+ *   S7  a review by someone else is refused from here (their credentials cannot be carried), and the router is told to send the user to
+ *       the deployment's review agent (CLAW_GITHUB_REVIEW_AGENT_NAME)
  *   R1  review_restart takes a review the user pointed at, and only a review
  *   R1b an item number is read whole: #11 does not point at #1, nor repo#1 at item #1
  *   C1  confirmation_answer allows only when the message is the exact approval command (批准 #<ref> / approve #<ref>) naming a
@@ -38,6 +43,9 @@
  *   W2  work_stop stops only the review the person's message points at
  *   W3  a pull request written with # is that pull request, never the item that happens to have its number
  *   W4  the only review is meant when the message names nothing else, never when it names another pull request or item
+ *   W5  work_stop on a review the user asked of someone else stops it like the requester's stop, for the person naming its pull
+ *       request, and answers the four facts only, frozen into the item
+ *   W6  work_recall and the router's list show a review the user asked of someone else read-only, as the four facts only
  *   P1  a user's message stops the router turn that is reading a report, and never one that answers them
  *   F1  a turn that answered the user and failed says so once, in their language; a report's turn does not
  *   T1  the tools exist only with CLAW_ASSISTANT_TOOLS on
@@ -314,7 +322,8 @@ describe("assistant review tools", { skip }, () => {
       method: "identity_token",
       request: {
         prs: [{ pr: { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 }, message: null }, { pr: { owner: "AMD-AGI", repo: "PrimusClaw", number: 257 }, message: null }],
-        actingAs: "u-weilei", actingAsName: "Wei Lei", model: "claude-opus-4-8", effort: undefined, reviewOnly: false,
+        requesterNote: null, actingAs: "u-weilei", actingAsName: "Wei Lei", model: "claude-opus-4-8", effort: undefined, reviewOnly: false,
+        mergeNeedsConfirmation: true,
       },
     });
     assert.equal((out as Recorded).items.length, 2);
@@ -428,12 +437,12 @@ describe("assistant review tools", { skip }, () => {
     const byNumber = await userTurn(alice, "换 opus 重审 254");
     await rt.reviewRestart(byNumber, { item_id: first, model: "claude-opus-4-8" });
     assert.deepEqual({ ...calls.restart[0], user: calls.restart[0].user.userId }, {
-      user: alice.userId, method: "identity_token", itemId: first, change: { model: "claude-opus-4-8" },
+      user: alice.userId, method: "identity_token", itemId: first, change: { model: "claude-opus-4-8", mergeNeedsConfirmation: true },
     });
     // The only review the user has: "重审一下" names it.
     const only = await userTurn(alice, "重审一下，审完合入");
     await rt.reviewRestart(only, { item_id: "#1", merge: true });
-    assert.deepEqual(calls.restart[1].change, { reviewOnly: false });
+    assert.deepEqual(calls.restart[1].change, { reviewOnly: false, mergeNeedsConfirmation: true });
     await reviewItem(alice, 3, { owner: "AMD-AGI", repo: "PrimusClaw", number: 257 });
     const vague = await userTurn(alice, "重审一下");
     assert.equal(await code(rt.reviewRestart(vague, { item_id: first })), "item_not_in_message");
@@ -790,6 +799,135 @@ describe("assistant review tools", { skip }, () => {
     await w.q("UPDATE claw_tasks SET prompt = '[work_event] #1 failed: x' WHERE task_id = $1", [report.taskId]);
     assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, runIds: [report.taskId], interrupted: true, failed: false }, w.sayDeps), "skipped");
     assert.match(w.mod.routerTurnEnd.turnLostNotice(["review 254 please"]) ?? "", /did not go through/);
+  });
+
+  test("S8 merge=true from the router never merges: every start and restart it makes merges only on the user's confirmation; no sentence confirms it", async () => {
+    const item = await reviewItem(alice, 1, { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 });
+    await w.q("UPDATE claw_work_items SET summary = 'The user wants AMD-AGI/PrimusClaw#254 merged now.' WHERE item_id = $1", [item]);
+    // What a keyword reading once let through or refused alike: the router's merge=true is taken as a request for a confirmation, never as a merge.
+    const texts = [
+      "I don't want you to merge 254", "review 254, it fixes a merge bug", "review 254 and tell me if it is safe to merge", "254 Merge: no",
+      "254 审一下，合并要等我确认", "审 254，合并留给我", "review and merge 254", "254 审完合入", "yes merge it, 254", "254 怎么样了",
+    ];
+    for (const text of texts) {
+      const turn = await userTurn(alice, text);
+      await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: true });
+      await rt.reviewRestart(turn, { item_id: item, merge: true });
+      await w.closeRun(turn.task_id);
+    }
+    assert.equal(calls.start.length, texts.length);
+    for (const c of calls.start) assert.deepEqual([c.request.reviewOnly, c.request.mergeNeedsConfirmation], [false, true], JSON.stringify(c.request.prs));
+    assert.equal(calls.restart.length, texts.length);
+    for (const c of calls.restart) assert.deepEqual(c.change, { reviewOnly: false, mergeNeedsConfirmation: true });
+    // A restart that leaves merge out keeps what the review was asked, and still merges only on a confirmation.
+    const plain = await userTurn(alice, "换 opus 重审 254");
+    await rt.reviewRestart(plain, { item_id: item, model: "claude-opus-4-8" });
+    assert.deepEqual(calls.restart.at(-1)!.change, { model: "claude-opus-4-8", mergeNeedsConfirmation: true });
+
+    // The merge it then holds waits for alice. A yes in her own words lets nothing through; only the exact command does.
+    const held = await confirmation(alice.userId, 254);
+    for (const text of ["yes merge it", "254 可以合入", "合并吧", "approve", "ok go ahead and merge #254", "批准", `approve ${rt.confirmationRef(held)}`]) {
+      const turn = await userTurn(alice, text);
+      assert.equal(await code(rt.confirmationAnswer(turn, { decision: "allow", confirmation_id: held })), "not_an_approval_command", text);
+      await w.closeRun(turn.task_id);
+    }
+    assert.equal(calls.decide.length, 0, "no sentence reached the decision");
+    // Someone else's exact command answers nothing: the write waits for alice, not for them.
+    const other = await userTurn(bob, `批准 #${rt.confirmationRef(held)}`);
+    assert.equal(await code(rt.confirmationAnswer(other, { decision: "allow", confirmation_id: held })), "no_pending_confirmation");
+    assert.equal(calls.decide.length, 0);
+    const command = await userTurn(alice, `批准 #${rt.confirmationRef(held)}`);
+    await rt.confirmationAnswer(command, { decision: "allow", confirmation_id: held });
+    assert.deepEqual(calls.decide.map((d) => [d.userId, d.id, d.decision]), [[alice.userId, held, "allow"]]);
+  });
+
+  test("S7 a review by someone else is refused from here, and the router is told to send the user to the review agent", async () => {
+    // The real review service: the assistant holds the requester's keys, never the reviewer's, so nothing can be made.
+    rt.reviewToolPorts.startReviews = saved.startReviews as never;
+    try {
+      const ctx = { ...DEFAULT_CTX, people: [{ name: "Wei Lei", user_id: "u-weilei" }] };
+      const turn = await userTurn(alice, "请 Wei Lei 审 254", { context: ctx });
+      let refused: { code: string; message: string } | null = null;
+      try { await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: "u-weilei" }); } catch (err) { refused = err as never; }
+      assert.equal(refused?.code, "acting_as_credentials_required");
+      assert.equal(refused?.message, rt.askTheReviewAgent(), "the router is told what the user can do instead");
+      const { readGithubReviewSettings } = await import("../src/github-review/settings.js");
+      assert.ok(refused!.message.includes(`ask ${readGithubReviewSettings().agentName} for it`), "named as the deployment names its review agent");
+      assert.equal(await count("claw_work_items"), 0, "nothing was made");
+      assert.equal(await count("claw_sessions", "config ? 'acting_as'"), 0);
+    } finally {
+      rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
+        calls.start.push({ user, method, request });
+        return startAnswer(request);
+      }) as never;
+    }
+  });
+
+  test("W5 work_stop on a review the user asked of someone else: the person's say, naming its pull request, and four facts back", async () => {
+    const pr = { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 };
+    const item = await reviewItem(bob, 1, pr, { requested_by: alice.userId, requester_label: "Alice A" });
+    await w.q("UPDATE claw_work_items SET summary = 'bob-only notes', pending_question = 'bob-only question' WHERE item_id = $1", [item]);
+    const held = await confirmation(bob.userId, 254);
+    await w.q("UPDATE claw_github_confirmations SET session_id = $1 WHERE confirmation_id = $2", [`ws_${item}`, held]);
+    const report = await w.routerTurn(alice);
+    assert.equal(await code(w.mod.tools.workStop(report, { item_id: item, reason: "the report said so" })), "not_attended");
+    await w.closeRun(report.task_id);
+    for (const text of ["停一下", "把 257 停掉"]) {
+      const turn = await userTurn(alice, text);
+      assert.equal(await code(w.mod.tools.workStop(turn, { item_id: item, reason: "user said stop" })), "item_not_in_message", text);
+      await w.closeRun(turn.task_id);
+    }
+    const byNumber = await userTurn(alice, "#1 停掉");
+    assert.equal(await code(w.mod.tools.workStop(byNumber, { item_id: "#1", reason: "user said stop" })), "item_not_found", "the reviewer's number is not the requester's");
+    await w.closeRun(byNumber.task_id);
+    assert.deepEqual([(await w.item(item)).board_state, (await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [held]))[0].status],
+      ["in_progress", "pending"], "nothing was stopped or denied");
+
+    const asked = await userTurn(alice, "把 254 停掉");
+    const out = await w.mod.tools.workStop(asked, { item_id: item, reason: "user said stop" });
+    const view = { status: "stopped", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: null, merged: false };
+    assert.deepEqual(out, { ok: true, item_id: item, outcome: "stopped", requester_view: view }, "the four facts, never the reviewer's item");
+    const closed = await w.item(item);
+    assert.deepEqual([closed.board_state, closed.outcome, closed.params.requester_view], ["done", "stopped", view], "frozen as it closed");
+    assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [held]))[0].status, "denied");
+    await w.closeRun(asked.task_id);
+    // Nobody else's: carol's assistant does not find it.
+    const carol = await w.user("carol");
+    const theirs = await userTurn(carol, "把 254 停掉");
+    assert.equal(await code(w.mod.tools.workStop(theirs, { item_id: item, reason: "x" })), "item_not_found");
+  });
+
+  test("W6 a review the user asked of someone else is read-only to their assistant: work_recall and the list give the four facts only", async () => {
+    const rp = await import("../src/assistant/role-profile.js");
+    const prompts = await import("../src/assistant/prompts.js");
+    const pr = { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 };
+    const item = await reviewItem(bob, 1, pr, { requested_by: alice.userId, requester_label: "Alice A" });
+    await w.q("UPDATE claw_work_items SET summary = 'bob-only notes', pending_question = 'bob-only question' WHERE item_id = $1", [item]);
+    const view = { status: "in_progress", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: null, merged: false };
+    const turn = await userTurn(alice, "254 怎么样了");
+    for (const detail of ["summary", "reports", "worker_tail"] as const) {
+      assert.deepEqual(await w.mod.tools.workRecall(turn, { item_id: item, detail }),
+        { ok: true, item_id: item, asked_of_other: true, read_only: true, requester_view: view }, detail);
+    }
+    assert.equal((await w.q("SELECT untrusted_read_at FROM claw_assistant_messages WHERE message_id = $1", [turn.mid]))[0].untrusted_read_at, null,
+      "nothing a worker wrote was read, so the turn still acts for the person");
+    const carol = await w.user("carol");
+    assert.equal(await code(w.mod.tools.workRecall(await w.routerTurn(carol), { item_id: item, detail: "summary" })), "item_not_found");
+
+    assert.deepEqual(await rp.askedOfOthersManifest(alice.userId), [{ itemId: item, view }]);
+    assert.deepEqual(await rp.askedOfOthersManifest(bob.userId), [], "the reviewer's own item is on their own list, not here");
+    const system = prompts.renderRouterSystem([], await rp.askedOfOthersManifest(alice.userId));
+    assert.ok(system.includes(prompts.ASKED_OF_OTHERS_HEADER) && system.includes(`item_id: ${item}`));
+    assert.ok(!system.includes("bob-only"), "nothing of the reviewer's item but the four facts");
+    assert.ok(!prompts.renderRouterSystem([], []).includes(prompts.ASKED_OF_OTHERS_HEADER), "no section when there is nothing");
+    // Closed: what was frozen is what is read, whatever the session did after.
+    const frozen = { status: "done", pr_url: view.pr_url, verdict: "approve", merged: false };
+    await w.q(
+      "UPDATE claw_work_items SET board_state = 'done', outcome = 'accepted', closed_at = NOW(), params = params || jsonb_build_object('requester_view', $2::jsonb) WHERE item_id = $1",
+      [item, JSON.stringify(frozen)],
+    );
+    assert.deepEqual(await rp.askedOfOthersManifest(alice.userId), [{ itemId: item, view: frozen }]);
+    assert.deepEqual((await w.mod.tools.workRecall(turn, { item_id: item, detail: "summary" }) as Recorded).requester_view, frozen);
   });
 
   test("T1 the tools exist only with CLAW_ASSISTANT_TOOLS on", async () => {

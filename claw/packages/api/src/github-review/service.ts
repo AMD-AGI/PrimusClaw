@@ -54,6 +54,11 @@ export interface ReviewActor {
   reviewTarget?: PrRef | null;
   /** `config.review_only` (review-target.ts): the session reviews and never merges, so `gh_pr_merge` is refused (`review_only`). */
   reviewOnly?: boolean;
+  /**
+   * `config.merge_needs_confirmation` (review-target.ts): a review the assistant's router started. Its merge, and an approval that GitHub's
+   * auto-merge would turn into one, is always held for the acting user's confirmation (C2), whatever the risk and their review mode.
+   */
+  mergeNeedsConfirmation?: boolean;
 }
 
 export interface ToolOutcome {
@@ -187,6 +192,11 @@ interface PullState {
   queueEntry: QueueEntry | null;
   /** Someone turned GitHub's auto-merge on for the pull request, so an approval that completes its requirements merges it. */
   autoMerge: boolean;
+}
+
+/** GitHub merges the pull request by itself once its requirements are met: auto-merge is on, or it already waits in the merge queue. */
+function mergesByItself(state: Pick<PullState, "autoMerge" | "queueEntry">): boolean {
+  return state.autoMerge || state.queueEntry !== null;
 }
 
 /** What one `gh_pr_get` read from GitHub, kept for the pages of the same head (see `reviewRead`). */
@@ -737,6 +747,24 @@ export class GithubReview {
    * that is not a draft). A refusal here costs no session and no turn, where the same refusal from the session's first tool call costs both.
    * Not held to any session's request budget: there is no session yet, and it writes nothing.
    */
+  /**
+   * Whether the acting user lets others act for them, asked of the identity service now: what a review someone asked of them is checked
+   * against when it is made and before every turn it is about to take (`assistant/review-items.ts`). The credential the answer comes with
+   * is dropped unused. `off` is the switch turned off; `not_bound` and `expired` are no GitHub account to act with; `unavailable` is the
+   * identity service not answering, which is never taken as yes.
+   */
+  async delegationOf(actorUserId: string, requesterUserId: string): Promise<"on" | "off" | "not_bound" | "expired" | "unavailable"> {
+    try {
+      const cred = await this.deps.resolveCredential({ userId: actorUserId, provider: GITHUB_PROVIDER, requesterUserId, purpose: "delegation_check" });
+      if (cred.expiresAt !== null && cred.expiresAt <= this.now()) return "expired";
+      return cred.delegation ? "on" : "off";
+    } catch (err) {
+      if (err instanceof IdentityCredentialRefusedError && err.code === "not_bound") return "not_bound";
+      if (err instanceof IdentityCredentialRefusedError && err.code === "expired") return "expired";
+      return "unavailable";
+    }
+  }
+
   checkPullRequest(actor: ReviewActor, ref: PrRef): Promise<ToolOutcome> {
     return this.run(actor, "gh_pr_check", { pr: `${ref.owner}/${ref.repo}#${ref.number}` }, async (ctx) => {
       const { pr } = await this.load(ctx, ref);
@@ -860,7 +888,7 @@ export class GithubReview {
    */
   private async sessionFacts(sessionId: string): Promise<{ requesterLabel?: string; reviewOnly: boolean }> {
     try {
-      const r = await this.deps.db.query("SELECT config->>'acting_as_requester' AS label, config->'review_only' AS review_only FROM claw_sessions WHERE session_id = $1", [sessionId]);
+      const r = await this.deps.db.query("SELECT COALESCE(config->'requested_by'->>'label', config->>'acting_as_requester') AS label, config->'review_only' AS review_only FROM claw_sessions WHERE session_id = $1", [sessionId]);
       const row = r.rows[0] as { label?: unknown; review_only?: unknown } | undefined;
       const label = row?.label;
       return { requesterLabel: typeof label === "string" && label ? label : undefined, reviewOnly: reviewOnlyOf({ review_only: row?.review_only }) };
@@ -1206,6 +1234,17 @@ export class GithubReview {
     return { ...risk, level: reasons.length > 0 ? "high" : "low", reasons };
   }
 
+  /**
+   * A review the assistant's router started (`ReviewActor.mergeNeedsConfirmation`) merges only once the acting user has confirmed that very
+   * write: the router's `merge=true` came from reading a sentence, and natural language never approves a merge. So the merge is held, whatever
+   * the risk and the acting user's review mode, and made only from the card's button or the exact command (`decide`, with the confirmation).
+   */
+  private confirmedMergesOnly(ctx: Ctx, risk: RiskResult): RiskResult {
+    if (!ctx.actor.mergeNeedsConfirmation) return risk;
+    const reason = `the review was started through ${ctx.cred.login}'s assistant, so a merge is made only once ${ctx.cred.login} confirms it (the button on its card, or 批准 #<ref>)`;
+    return { ...risk, level: "high", reasons: [...risk.reasons, reason] };
+  }
+
   /** The audit row keeps why a write was held and what the rules saw, the evidence marked as such. */
   private auditedReasons(risk: RiskResult): string[] {
     return [...risk.reasons, ...risk.evidence.filter((e) => !risk.reasons.includes(e)).map((e) => `evidence: ${e}`)];
@@ -1311,12 +1350,13 @@ export class GithubReview {
     const risk = await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, read, flags, judgement)));
     ctx.acc.riskReasons = this.auditedReasons(risk);
     const state = await this.readState(ctx, ref, pr, repo);
-    // A session asked for a review only may approve, but not an approval that would merge: with auto-merge on, it can.
-    if (ctx.actor.reviewOnly && state.autoMerge) {
-      throw new Refusal("review_only", "this session was asked for a review only, and auto-merge is on for this pull request, so an approval could merge it: nothing was posted. Post the review as COMMENT or REQUEST_CHANGES instead.");
+    // A session asked for a review only may approve, but not an approval that would merge: with auto-merge on, or in the merge queue, it can.
+    if (ctx.actor.reviewOnly && mergesByItself(state)) {
+      throw new Refusal("review_only", "this session was asked for a review only, and auto-merge is on for this pull request (or it is in the merge queue), so an approval could merge it: nothing was posted. Post the review as COMMENT or REQUEST_CHANGES instead.");
     }
     this.requireGreen(state, pr.headSha);
-    return risk;
+    // An approval that GitHub's auto-merge or merge queue would turn into a merge is that merge: a review the assistant started holds it for the acting user.
+    return mergesByItself(state) ? this.confirmedMergesOnly(ctx, risk) : risk;
   }
 
   private checkComments(raw: unknown, change: Change | null): ReviewComment[] {
@@ -1510,6 +1550,12 @@ export class GithubReview {
         }
         const redact = (x: string): string => ctx.client.redact(x);
         if (t.isResolved === true) return ok({ status: "already_resolved", thread_id: threadId, head_sha: headSha }, redact);
+        // With GitHub's auto-merge on, or the pull request in the merge queue, the last open conversation resolved can be what merges it. A session
+        // that may not merge by itself (a review only, or one the assistant started, whose merge waits for the acting user's confirmation) leaves it open.
+        if ((ctx.actor.reviewOnly || ctx.actor.mergeNeedsConfirmation) && mergesByItself(await this.readMergeFacts(ctx, ref))) {
+          throw new Refusal("auto_merge_on", "auto-merge is on for this pull request (or it is in the merge queue), so resolving a conversation could merge it, and this session "
+            + "does not merge by itself: nothing was resolved. Leave the thread open and say in your review that the finding is fixed.");
+        }
         if (!ctx.settings.writesEnabled) {
           ctx.acc.dryRun = true;
           return ok({ status: "dry_run", thread_id: threadId, note: "writes are switched off in this deployment; nothing was resolved" }, redact);
@@ -1546,7 +1592,7 @@ export class GithubReview {
 
     const change = await this.collectChange(ctx, ref, pr);
     const risk = opts.confirmation ? assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement))
-      : await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement)));
+      : this.confirmedMergesOnly(ctx, await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement))));
     ctx.acc.riskReasons = this.auditedReasons(risk);
     let state = await this.readState(ctx, ref, pr, repo);
     // A branch with a merge queue takes the pull request through it (see `viaQueue`); the queue, not this call, chooses the merge method.

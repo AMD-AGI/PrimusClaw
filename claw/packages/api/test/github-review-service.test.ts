@@ -1238,13 +1238,19 @@ describe("C high risk waits for the acting user", () => {
     assert.equal(reason(await merge()), "delegation_off");
   });
 
-  test("C8 the confirmations a caller can list are their own: the actor's and the requester's, not anyone else's", async () => {
+  test("C8 the confirmations a caller can list are their own: the actor's, and the requester's of a session the requester owns; not anyone else's", async () => {
     const { listConfirmations } = await import("../src/github-review/store.js");
+    await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-1', 'u-alice', $1::jsonb)", [JSON.stringify({ acting_as: "u-bob", acting_as_requester: "Alice A" })]);
     await merge();
     assert.equal((await listConfirmations(e.db, "u-bob", { status: "pending" })).length, 1);
     assert.equal((await listConfirmations(e.db, "u-alice", { sessionId: "s-1", status: "pending" })).length, 1);
     assert.equal((await listConfirmations(e.db, "u-mallory", { status: "pending" })).length, 0);
     assert.equal((await listConfirmations(e.db, "u-alice", { sessionId: "other", status: "pending" })).length, 0);
+    // The same row in a session the acting user owns (a review alice asked of bob): it is bob's alone.
+    await e.sql("UPDATE claw_sessions SET user_id = 'u-bob', config = $1::jsonb WHERE session_id = 's-1'", [JSON.stringify({ acting_as: "u-bob", requested_by: { user_id: "u-alice", label: "Alice A" } })]);
+    assert.equal((await listConfirmations(e.db, "u-alice", { status: "pending" })).length, 0);
+    assert.equal((await listConfirmations(e.db, "u-alice", { sessionId: "s-1", status: "pending" })).length, 0);
+    assert.equal((await listConfirmations(e.db, "u-bob", { sessionId: "s-1", status: "pending" })).length, 1);
   });
 });
 

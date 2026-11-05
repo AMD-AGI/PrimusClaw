@@ -19,10 +19,12 @@ import { storedActingAs } from "./acting-turns.js";
 import { reviewTargetOf } from "./review-target.js";
 import { readGithubReviewSettings } from "./settings.js";
 import { mintSessionToolToken } from "./token.js";
+import { applyReviewProfile, GITHUB_REVIEW_SERVER_NAME, reviewTurnsLeft } from "./review-profile.js";
+import { requesterOf, usesReviewProfile } from "./requested-by.js";
 
 const logger = pino({ name: "github-review-session" });
 
-export const GITHUB_REVIEW_SERVER_NAME = "github_review";
+export { GITHUB_REVIEW_SERVER_NAME };
 
 type McpServers = Record<string, Record<string, unknown>>;
 
@@ -105,6 +107,22 @@ export async function applySandboxKeyPolicyToTask(task: Record<string, unknown>,
   task.withhold_sandbox_keys = true;
   delete task.user_env;
   Object.assign(task, actingSessionTurnFields());
+  // A review someone asked of the owner runs with the fixed review profile, last, so that nothing applied before it widens it.
+  const profiled = await reviewProfileSession(sessionId);
+  if (profiled) applyReviewProfile(task, (await reviewTurnsLeft(sessionId, profiled.userId)).left);
+}
+
+/**
+ * The owner of a session that runs with the review profile (`requested-by.ts`), read from its row now, or null for any other session.
+ * Not caught, like `sessionWithholdsSandboxKeys`: a turn whose profile cannot be read is not sent with its owner's tools.
+ */
+export async function reviewProfileSession(sessionId: string, q: Parameters<typeof storedActingAs>[1] = db): Promise<{ userId: string } | null> {
+  if (!CLAW_GITHUB_REVIEW_ENABLED) return null;
+  const row = (await q.query(
+    "SELECT user_id, config FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL", [sessionId],
+  )).rows[0] as { user_id: string | null; config: unknown } | undefined;
+  if (!row?.user_id || !usesReviewProfile(row.config)) return null;
+  return { userId: row.user_id };
 }
 
 export async function githubReviewMcpServers(sessionId: string): Promise<McpServers> {
@@ -129,7 +147,8 @@ export async function githubReviewMcpServers(sessionId: string): Promise<McpServ
       return {};
     }
     const token = mintSessionToolToken(
-      { sessionId, requesterUserId: row.user_id, actorUserId: actingUser }, settings.mcpSecret, settings.tokenTtlSeconds,
+      // The person who asked: the owner, or for a review asked of the owner, whom the server recorded as asking (`requesterOf`).
+      { sessionId, requesterUserId: requesterOf(row) ?? row.user_id, actorUserId: actingUser }, settings.mcpSecret, settings.tokenTtlSeconds,
     );
     return { [GITHUB_REVIEW_SERVER_NAME]: { type: "http", url: settings.mcpUrl, token } };
   } catch (err) {

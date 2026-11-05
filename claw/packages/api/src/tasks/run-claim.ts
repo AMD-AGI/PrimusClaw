@@ -11,6 +11,7 @@
  */
 
 import { sessionWithholdsSandboxKeys } from "../github-review/session-tools.js";
+import { ReviewTurnBudgetUsedError } from "../github-review/review-profile.js";
 import { applyAppMcpToTask } from "../sessions/app-mcp.js";
 import { applySessionRoleToTask } from "../assistant/role-profile.js";
 import { applyTriggerToolsToTask } from "../triggers/mcp.js";
@@ -186,7 +187,8 @@ async function finishClaim(
     // straight back through claim-next, failing identically each time until
     // `claim_count` ran out. Twenty-two claims of a 500, then a row archived
     // as retries-exhausted, for a fault no retry could have fixed.
-    if (isCredentialFault(err)) {
+    // A requested review with no turn left is not run either, and no retry gives it turns (`applyReviewProfile`).
+    if (isCredentialFault(err) || err instanceof ReviewTurnBudgetUsedError) {
       await markUnclaimable(taskId);
       return "unclaimable";
     }

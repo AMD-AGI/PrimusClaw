@@ -22,7 +22,7 @@ import {
 } from "./attribution.js";
 import {
   HANDS_MCP_URL, SAFE_API_URL, SANDBOX_NAMESPACE, AUTH_INTERNAL_TOKEN,
-  ANTHROPIC_BASE_URL, OPENAI_BASE_URL, isKubernetesMode, AGENT_SANDBOX_NAMESPACE,
+  ANTHROPIC_BASE_URL, OPENAI_BASE_URL, isKubernetesMode, AGENT_SANDBOX_NAMESPACE, SANDBOX_CPU_NAMESPACE,
   HANDS_HEALTH_MAX_TRIES, HANDS_HEALTH_INTERVAL_MS,
 } from "../config.js";
 import { getSystemEnv } from "../infra/system-env.js";
@@ -43,6 +43,7 @@ import {
   handleEnvRecord,
   handleServesEnvOf,
   sandboxUserEnv,
+  withoutGpuKeys,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
@@ -70,6 +71,7 @@ import {
   type HandsProbeEntry,
 } from "./container-probe.js";
 import { sandboxSpecFingerprint, evaluateReuse, type ReuseVerdict } from "./spec-fingerprint.js";
+import { isReviewProfile } from "../agent/review-profile.js";
 import { metrics } from "../infra/metrics.js";
 import { handsSessionKey } from "./hands-key.js";
 import { readHandsEntry, retentionStore, type HandsBinding } from "./registry.js";
@@ -86,6 +88,8 @@ const SANDBOX_IMAGE_RE = /(?:^|\s)sandboximage:\s*(\S+)/im;
 export function resolveSandboxImageFromRequest(request: ExecuteRequest): string {
   const direct = String(request.sandbox_image ?? "").trim();
   if (direct) return direct;
+  // A requested review's prompt holds what the requester wrote: it never picks the image the review runs in.
+  if (isReviewProfile(request)) return "";
   const fromPrompt = SANDBOX_IMAGE_RE.exec(String(request.prompt ?? ""))?.[1]?.trim();
   return fromPrompt || "";
 }
@@ -143,9 +147,28 @@ function effectiveWorkloadResources(
   request: ExecuteRequest,
   params: { resources: Record<string, string> },
 ): Array<Record<string, string | number>> | null {
-  return Object.keys(params.resources).length > 0
+  const resources = Object.keys(params.resources).length > 0
     ? resourcesMapToWorkloadArray(params.resources)
     : resourcesJsonToWorkloadArray(request.resources);
+  // A requested review's sandbox is a CPU sandbox in the CPU workspace: a GPU it asked for is not given (it would queue there for ever).
+  return isReviewProfile(request) && resources ? resources.map(withoutGpu) : resources;
+}
+
+function withoutGpu(entry: Record<string, string | number>): Record<string, string | number> {
+  return withoutGpuKeys(entry);
+}
+
+/**
+ * Where a requested review's sandbox goes (`sandbox_profile: "review"`): the deployment's existing CPU sandbox workspace, whatever the
+ * request names; Kubernetes mode's own sandbox namespace there. A SaFE deployment without a CPU workspace has no place for it, and the run
+ * is refused a sandbox rather than given one in a workspace that would hold the owner's storage (the API offers such a review no sandbox
+ * tools in the first place).
+ */
+export function reviewSandboxNamespace(kubernetes: boolean, cpuNamespace: string, agentNamespace: string): string {
+  if (kubernetes) return agentNamespace;
+  const cpu = cpuNamespace.trim();
+  if (!cpu) throw new Error("a requested review has no sandbox on this deployment: SANDBOX_CPU_NAMESPACE is not set");
+  return cpu;
 }
 
 /**
@@ -208,6 +231,7 @@ export function requestSpecFingerprint(
       // not per-request and so is not folded in there.
       llmKey: withholdKeys ? undefined : resolveRequestLlmKey(request),
       withholdKeys,
+      ...(isReviewProfile(request) ? { profile: "review" } : {}),
     });
   }
   const resources: Record<string, string> = {};
@@ -223,6 +247,7 @@ export function requestSpecFingerprint(
     labels,
     namespace,
     withholdKeys,
+    ...(isReviewProfile(request) ? { profile: "review" } : {}),
   });
 }
 
@@ -240,6 +265,8 @@ function sandboxNamespaceFor(
   resources?: unknown,
   multiNodeContext?: MultiNodeContext,
 ): string {
+  // First: a requested review's sandbox ignores the workspace the request names, a multi-node cluster and the GPU choice alike.
+  if (isReviewProfile(request)) return reviewSandboxNamespace(isKubernetesMode(), SANDBOX_CPU_NAMESPACE, AGENT_SANDBOX_NAMESPACE);
   if (isKubernetesMode()) return request.workspace_id?.trim() || AGENT_SANDBOX_NAMESPACE;
   // A multi-node run's sandbox goes where its cluster is, whatever the sandbox asks for.
   // The optimizer in it drives the cluster through the Ray head's service and the Infera
@@ -2812,6 +2839,9 @@ async function provisionHands(
       onEvent,
       signal: options.signal,
       reclaimOnAbort: options.reclaimOnAbort,
+      // A requested review's sandbox gets none of the workspace's storage: SaFE then mounts neither the owner's directory nor the
+      // workspace's volumes. Sent as false, never left out (SaFE reads an absent field as true).
+      ...(isReviewProfile(request) ? { useWorkspaceStorage: false } : {}),
     });
   } catch (err) {
     await hold.release();

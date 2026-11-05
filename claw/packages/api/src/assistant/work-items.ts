@@ -17,6 +17,8 @@
  */
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS } from "../config.js";
 import { closeConfirmationsForStop } from "../github-review/store.js";
+import { reviewAgentSettings } from "../github-review/review-profile.js";
+import { freezeRequesterView } from "./requester-view.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { ITEM_REF_HINT, parseItemRef, type ItemRefError } from "./item-ref.js";
 import { stopSessionRuns } from "../tasks/chat-run.js";
@@ -283,25 +285,43 @@ export async function recentEvents(itemId: string, limit = 20): Promise<Array<Re
 
 export type InsertWorkItemResult =
   | { ok: true; itemId: string; seq: number }
-  | { ok: false; error: "too_many_active_items" | "no_assistant" };
+  | { ok: false; error: "too_many_active_items" | "too_many_requested_reviews" | "too_many_from_requester" | "no_assistant" };
 
 /**
  * The item row and its `created` event. Must run inside the transaction that also
  * creates the worker session: the user's assistant row is locked first, so two
  * creates for one user take their numbers and meet the limit one after the other.
+ *
+ * Two kinds of open item are counted apart, under the same lock and in the same
+ * statement: the user's own (the per-user limit), and reviews others asked of the
+ * user (`requestedBy`, the user's review-agent limits: in all, and per requester).
+ * Neither can take the other's room, so what others ask never fills the user's board.
  */
 export async function insertWorkItem(
   q: StatementRunner,
-  input: { userId: string; title: string; workerSessionId: string; repo?: unknown; kind?: ItemKind; params?: Record<string, unknown> },
+  input: {
+    userId: string; title: string; workerSessionId: string; repo?: unknown; kind?: ItemKind; params?: Record<string, unknown>;
+    /** Who asked for this review, when it is not the user's own. */
+    requestedBy?: string | null;
+  },
 ): Promise<InsertWorkItemResult> {
   const locked = await q.query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [input.userId]);
   if (!locked.rowCount) return { ok: false, error: "no_assistant" };
   const counts = (await q.query(
-    `SELECT COUNT(*) FILTER (WHERE board_state <> 'done')::int AS active, COALESCE(MAX(seq), 0)::int + 1 AS next
+    `SELECT COUNT(*) FILTER (WHERE board_state <> 'done' AND NOT (params ? 'requested_by'))::int AS active,
+            COUNT(*) FILTER (WHERE board_state <> 'done' AND params ? 'requested_by')::int AS others,
+            COUNT(*) FILTER (WHERE board_state <> 'done' AND params->>'requested_by' = $2)::int AS requester,
+            COALESCE(MAX(seq), 0)::int + 1 AS next
        FROM claw_work_items WHERE user_id = $1`,
-    [input.userId],
-  )).rows[0] as { active: number; next: number };
-  if (counts.active >= CLAW_ASSISTANT_MAX_ACTIVE_ITEMS) return { ok: false, error: "too_many_active_items" };
+    [input.userId, input.requestedBy ?? null],
+  )).rows[0] as { active: number; others: number; requester: number; next: number };
+  if (input.requestedBy) {
+    const limits = reviewAgentSettings(input.userId);
+    if (counts.others >= limits.othersMaxActive) return { ok: false, error: "too_many_requested_reviews" };
+    if (counts.requester >= limits.perRequesterMaxActive) return { ok: false, error: "too_many_from_requester" };
+  } else if (counts.active >= CLAW_ASSISTANT_MAX_ACTIVE_ITEMS) {
+    return { ok: false, error: "too_many_active_items" };
+  }
   const itemId = newWorkItemId();
   await q.query(
     `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo, kind, params)
@@ -413,6 +433,8 @@ export async function stopWorkItem(input: {
     // A first message still waiting for the worker's session must not start a
     // turn on an item the user has already stopped.
     if (row) await query("DELETE FROM claw_pending_messages WHERE session_id = $1", [row.worker_session_id]);
+    // A review someone else asked for: what they may see of it is written as it closes.
+    if (row && open?.kind === "review") await freezeRequesterView({ query }, input.itemId);
     return row;
   }).catch((err: unknown) => {
     if (!(err instanceof StopRefused)) throw err;

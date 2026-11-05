@@ -39,7 +39,8 @@ review and the merge and who is the reviewer of record, and whose own standing a
 
 ## How a session uses it
 
-1. The requester creates a session with `config.acting_as = "<user id>"` (`POST /v1/sessions`),
+1. The requester creates a session with `config.acting_as = "<user id>"` (`POST /v1/sessions`; there only their own id,
+   `403 acting_as_must_be_self` otherwise: a review of someone else is asked as below, "A review asked of someone else"),
    signed in with an identity provider's access token: a person's own, or a service's that an
    operator named (see "Who may speak for the person"). An `ak-` key, a BYOK key, a connector token
    and a browser session cookie are refused (`403 interactive_sign_in_required`): the key a sandbox
@@ -109,6 +110,47 @@ review is done (accepted by policy); a write held for the requester themselves, 
 `expired`, `refused`), a merge refused by a gate, a failed turn or a turn that posted nothing needs them; a write held for
 someone else, or being made, is in progress; a denied one is done (stopped). A review session gets no worker report tool.
 
+### A review asked of someone else
+
+When `acting_as` names someone other than the caller (R asks X), the review is X's work, not R's: X's item on X's board, X's
+session sealed with X's own keys (so it runs on X's model quota), and R is recorded as who asked. The asking service sends X's
+credentials with the request: `x-acting-as-token` (X's delegated identity-provider token, from a client listed in both
+`CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` and `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS`, `sub` = `acting_as`) and
+`x-acting-as-api-key` (X's own `ak-` key, which SaFE must say is X's). Without them, or with anyone else's, nothing is made
+(`401 acting_as_credentials_required`, `invalid_acting_as_token`, `key_subject_mismatch`; `403 acting_as_mismatch`,
+`acting_as_not_delegated`, `service_client_not_allowed`).
+
+- X's switch that lets others act for them is asked of the identity service when the review is asked (`403 delegation_off`,
+  `actor_not_bound`, `credential_expired`; `503 delegation_unavailable`) and again before every queued turn of it. Turned off, the
+  review is not run, it goes to X as failed with the reason, and X's keys are removed from every open review others asked of X.
+- The session config carries `requested_by: {user_id, label}` and `sandbox_profile: "review"`, written only by the server;
+  `POST /v1/sessions` refuses both (and `requester_note`) as server-managed, and refuses `acting_as` naming anyone but the caller
+  (`403 acting_as_must_be_self`), whether or not these routes are on. The review tools take `requested_by` as the requester only when the
+  session's owner is the acting user; for every other session the requester is the owner.
+- The session runs with a fixed profile: the review tools and the sandbox's file and shell tools, nothing else (no skills,
+  memory, triggers, stored variables, default or application MCP servers, `a2a_call`, `deliver_file`; no pattern or skill
+  evolution from it). Brain applies the same list again. Its sandbox is built in the deployment's existing CPU sandbox workspace
+  (`SANDBOX_CPU_NAMESPACE`), whatever the request names, without a GPU, and always with `useWorkspaceStorage: false`, so SaFE
+  mounts neither X's directory nor the workspace's volumes. A deployment without `SANDBOX_CPU_NAMESPACE` gives such a review no
+  sandbox tools.
+- X's review-agent limits (the deployment's defaults for every person for now): `CLAW_REVIEW_FOR_OTHERS_MAX_ACTIVE` (20) open
+  reviews others asked of X, `CLAW_REVIEW_FOR_OTHERS_PER_REQUESTER_MAX_ACTIVE` (10) of them per requester, both apart from X's
+  own item limit (`409 too_many_active_items` with `data.scope` `reviewer` or `requester`); `CLAW_REVIEW_FOR_OTHERS_TURNS_PER_ITEM`
+  (200) model turns per review and `CLAW_REVIEW_FOR_OTHERS_TURNS_PER_DAY` (2000) for all of them per UTC day. A review's
+  sub-agents take their turns from the same budget and are counted with it, as is a context-compaction summary, and a review
+  stopped or failed partway is charged the turns it took.
+- The model and effort are X's: a `model` or `effort` R names is not taken (the review runs on the deployment's default), and R's
+  answer says so with `ignored: ["model", "effort"]` (whichever were named). X may change them on X's own restart. The review's
+  sub-agents run on the review's model, never on one a `task` call names or the reading default.
+- `requester_note` (up to 2000 characters) is quoted after the first message as untrusted text that cannot change merging, the
+  model or the pull request; a body naming `requested_by` or `sandbox_profile` is a 400.
+- R is answered without the session's ids, may stop the review and read it, and sees four facts only on every answer
+  (`{status, pr_url, verdict, merged}`, frozen into `params.requester_view` when the item closes). Restart and accept are X's
+  (404 for R), and R cannot send a turn into X's session. The writes the session holds for confirmation are X's alone: R's
+  `GET /v1/github-review/confirmations` lists none of them, whatever the filter.
+- A review again (below) continues only the last closed review of the same pull request with the same owner and the same
+  requester: a new request from R continues R's last request of X, never X's own review or another requester's.
+
 ### A review again: it continues the last one
 
 A posted review of an item's session is recorded on its audit row (`claw_github_audit.posted`: the event and each inline finding
@@ -131,7 +173,9 @@ and every gate of a write stay those of the whole pull request. Such a session i
 `gh_thread_resolve(pr, thread_id, head_sha)`, which resolves the thread of a fixed finding: only a thread the last review
 recorded (`thread_not_recorded`), opened by the acting user's own account (`not_own_thread`), on this pull request
 (`thread_not_on_pull_request`), at the head the session read (`head_moved`), and not after the requester stopped the review
-(`review_stopped`). It is not counted in the hourly review limits. With review items on, every review (not only an approval)
+(`review_stopped`), and not while GitHub's auto-merge is on, or the pull request is in the merge queue, for a session that may not merge by itself (a review only, or one the
+assistant started; `auto_merge_on`), since resolving the last open conversation can be what merges it. It is not counted in the
+hourly review limits. With review items on, every review (not only an approval)
 and every `gh_thread_resolve` takes the acting account's write lock on the pull request, which a restart takes too: one still
 being made when its item is restarted holds the restart (`409 merge_in_progress`), and one that comes after it is refused
 (`review_stopped`).
@@ -152,6 +196,12 @@ They act only for the person, never for a key or a report:
   the only repository it can be: the channel's own (`channel_context.repos`), else the one the user's recent reviews used (two
   candidates and a bare number are refused, so the assistant asks); a model named there; a reviewer the user themself or someone
   the channel listed with a Claw `user_id` (`channel_context.people`).
+- **`merge=true` never merges.** Whether the user asked for a merge is the router's reading of a sentence, and natural language
+  never approves one. So every review the router starts or restarts (`review_start`, `review_restart`, whatever `merge` says) is
+  made with `config.merge_needs_confirmation` (kept by every later restart of it): its `gh_pr_merge`, and a `gh_review_submit`
+  `APPROVE` while GitHub's auto-merge is on or the pull request is in the merge queue, are held for the acting user (`confirmation_required`) whatever the risk and their
+  review mode, and it resolves no thread while auto-merge is on or the pull request is in the merge queue (see `gh_thread_resolve`); the merge is made only from that confirmation: the card's button or the exact command below, by the acting
+  user. `merge=true` only lets the review go on to ask for that confirmation after its verdict; `merge=false` is a review only.
 - **Two acts are never read from a sentence.** A held write is let through only when the user's whole message is the approval
   command `批准 #<ref>` or `approve #<ref>` (case, spacing, a full-width `＃` and closing punctuation aside), where `<ref>` is the
   first six hex digits of its confirmation id (the assistant shows it; the whole id also works), and only for a write that was
@@ -163,7 +213,22 @@ They act only for the person, never for a key or a report:
   draws no button shows the text, which tells the user to type the command.
 
 The review is then made by the same `startReviews` / `restartReview` as the routes above, with the person's message standing
-for their sign-in, so every check above applies unchanged.
+for their sign-in, so every check above applies unchanged. Their `guard` (the turn is still live and still answers that message) is
+asked in the transaction that writes, once the owner's assistant row is held and before the open reviews and limits are counted again.
+
+A review asked of someone else meets the assistant in three places:
+
+- `review_start` naming another person (`reviewer`) is refused with `acting_as_credentials_required`: such a review runs on the
+  reviewer's own credentials, which only the asking service brings (`x-acting-as-token`, `x-acting-as-api-key`), and the assistant
+  holds the requester's keys only. The refusal tells the router to send the user to the deployment's review agent, by the name its
+  reviews are signed with (`CLAW_GITHUB_REVIEW_AGENT_NAME`).
+- The requester's assistant lists the reviews they asked of others, open or closed in the last day, read-only after their own items:
+  the item_id and the four facts (`params.requester_view` once closed), nothing else. `work_recall` on one answers the same four facts
+  whatever detail is asked, and does not count as reading what a worker wrote. `work_stop` on one stops it as the requester's
+  `POST /v1/work-items/:id/stop` does, only in a turn that answers the requester's signed-in message naming its pull request, and
+  answers the four facts, frozen into the item as it closes.
+- A held write of a stopped review is denied as stopped (`review_stopped`) only while it still waits; one already answered (an approval
+  submitted before the stop, a merge being made) keeps its state, and a later answer to it says how it ended.
 
 ## The tools
 
@@ -401,7 +466,7 @@ independent of `delegation` (whether others may ask), which stays at the identit
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations of the caller's own sessions and those that ask the caller. `{items:[{id, kind, review, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}`. `kind` is `merge` or `review`; for a `review`, `review` is `{event, body, comments: [{path, line, side, body}]}` as it will be posted (without its footer), and `null` for a merge. `status` is `pending`, `merging`, `merged`, `queued`, `submitted`, `denied`, `stale`, `expired` or `refused` |
+| `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations that ask the caller (the acting user) and those the caller requested in a session they own. A review someone else asked of the acting user runs in the acting user's session: its confirmations are listed to the acting user only, never to who asked, who reads the item's four facts instead. `{items:[{id, kind, review, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}`. `kind` is `merge` or `review`; for a `review`, `review` is `{event, body, comments: [{path, line, side, body}]}` as it will be posted (without its footer), and `null` for a merge. `status` is `pending`, `merging`, `merged`, `queued`, `submitted`, `denied`, `stale`, `expired` or `refused` |
 | `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given with an identity provider's access token: their own sign-in at the provider, or an allowed service's (next section). Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`), a BYOK key, a connector token or a browser session cookie, whatever the id (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). The sandbox of an ordinary session holds its owner's key, and with SaFE's built-in sign-in that key sets the owner's password and logs in, which returns a session cookie the API verifies as the person's own: so neither a key nor a cookie is proof of a person, and a model in any session of that user could otherwise answer a confirmation itself. On `allow` every gate is read again and the held write is made with the acting user's account; the answer is `{status: "merged" \| "queued" \| "submitted" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha, queue_entry_id, queue_position, queue_state, review_id, url}` (`merged` for a merge, `queued` for a merge that put the pull request in the base branch's merge queue, which is not yet merged, `submitted` for a review). `retry` means the write could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once a review, an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The write is recorded as asked for by the requester, not by the acting user. A service an operator named may answer for the acting user too (next section) |
 
 A browser session cookie would be taken again only where the platform that issues it refuses to set a
