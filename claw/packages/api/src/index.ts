@@ -10,6 +10,7 @@ import {
   AUTH_INTERNAL_TOKEN, NATS_URL,
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   SESSION_PURGE_DAYS, SESSION_RETENTION_BATCH, SESSION_RETENTION_DAYS, SESSION_RETENTION_DRY_RUN,
+  SESSION_RETENTION_LOCK_RETRY_MIN,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
@@ -408,7 +409,7 @@ async function main() {
         purgeDays: SESSION_PURGE_DAYS,
         batch: SESSION_RETENTION_BATCH,
         dryRun: SESSION_RETENTION_DRY_RUN,
-      }))
+      }, { delayMs: SESSION_RETENTION_LOCK_RETRY_MIN * 60 * 1000, retries: 12 }))
       .catch(err => logger.error({ err }, "session_retention.failed"));
     if (CLAW_SKILL_EVOLUTION_ENABLED) {
       cleanupOrphanSkillFiles().catch(err => logger.error({ err }, "skill_files.cleanup_failed"));

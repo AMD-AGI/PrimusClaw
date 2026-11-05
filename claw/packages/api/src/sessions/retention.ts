@@ -268,12 +268,47 @@ export async function runSessionRetention(
   return report;
 }
 
+/** How a pass that found the lock taken asks again. */
+export interface RetentionLockRetry {
+  /** Wait between attempts. */
+  delayMs: number;
+  /** Attempts after the first. */
+  retries: number;
+}
+
+const DEFAULT_LOCK_RETRY: RetentionLockRetry = { delayMs: 10 * 60 * 1000, retries: 12 };
+
 /**
  * The maintenance entry point: one replica at a time, so two replicas do not
  * walk the same batch.
+ *
+ * A pass that finds the lock taken asks again after `retry.delayMs`, up to
+ * `retry.retries` times, rather than skipping until the next day. The holder is
+ * usually another replica in its own pass, and then the later attempt runs a
+ * second, short pass over what is left, which is harmless. But it can also be a
+ * replica that is gone and whose backend the server has not dropped yet -- a
+ * pod killed mid-pass by a rolling update -- and the replica that replaced it
+ * starts its pass a minute after boot, well inside that window. Skipping then
+ * meant no retention for a day, or for as long as deploys kept landing inside
+ * the window. The server releases such a lock once its TCP keepalive gives up
+ * on the dead peer (see db.ts), which the default delay comfortably outlasts.
  */
-export async function runSessionRetentionOnce(s: RetentionSettings): Promise<void> {
+export async function runSessionRetentionOnce(
+  s: RetentionSettings,
+  retry: RetentionLockRetry = DEFAULT_LOCK_RETRY,
+): Promise<void> {
   if (!(s.retentionDays > 0) && !(s.purgeDays > 0)) return;
-  await withLeaderLock(LEADER_LOCK_IDS.sessionRetention, "session_retention",
-    (lease) => runSessionRetention(s, lease));
+  for (let attempt = 0; ; attempt += 1) {
+    const outcome = await withLeaderLock(LEADER_LOCK_IDS.sessionRetention, "session_retention",
+      (lease) => runSessionRetention(s, lease));
+    if (outcome.ran) return;
+    if (attempt >= retry.retries) {
+      logger.warn({ attempts: attempt + 1 },
+        "session_retention.lock_busy_gave_up (another session held the lock on every attempt; "
+        + "the next daily pass tries again)");
+      return;
+    }
+    logger.info({ attempt: attempt + 1, retryInMs: retry.delayMs }, "session_retention.lock_busy_retrying");
+    await new Promise<void>((resolve) => { setTimeout(resolve, retry.delayMs); });
+  }
 }

@@ -443,6 +443,10 @@ export const SESSION_PURGE_DAYS = envInt("SESSION_PURGE_DAYS", 0, { min: 0 });
 export const SESSION_RETENTION_BATCH = envInt("SESSION_RETENTION_BATCH", 500, { min: 1 });
 // Count and log what the pass would delete and purge, and change nothing.
 export const SESSION_RETENTION_DRY_RUN = envBool("SESSION_RETENTION_DRY_RUN", false);
+// A pass that finds another replica (or a dead one's not yet dropped backend)
+// holding the retention lock asks again after this many minutes, up to twelve
+// times, instead of waiting for the next day.
+export const SESSION_RETENTION_LOCK_RETRY_MIN = envInt("SESSION_RETENTION_LOCK_RETRY_MIN", 10, { min: 1 });
 
 // --- Memory / Skill LLM ---
 export const MEMORY_LLM_MODEL = env("MEMORY_LLM_MODEL", env("DEFAULT_MODEL", "claude-opus-4-6"));
