@@ -35,10 +35,11 @@
  *   EVAL_VARIANTS     1: also run the cases that are variants of another (default: not)
  *   EVAL_K            attempts per case (default 3): the report has pass@1 (mean) and pass^k
  *   EVAL_ITEM_WAIT    seconds to wait for an item's result, unless the case sets item_wait_s (default 300)
- *   EVAL_KEEP_TEXT    1: keep the final answers in the results (they are the identity's own data; default: only their length)
+ *   EVAL_KEEP_TEXT    1: keep the final answers in the results (they are the identity's own data, and can contain what an
+ *                     oracle reads from it; default: only their length). Write such results only somewhere private.
  *   EVAL_OUT          a directory for the results: <mode>.json and <mode>.md
  *   EVAL_RECORD_DIR   a directory for <mode>-recordings.jsonl: every attempt as observed (what the identity was shown
- *                     included), for EVAL_OFFLINE; written only when set
+ *                     included), for EVAL_OFFLINE; written only when set, and only together with EVAL_KEEP_TEXT=1
  *   EVAL_JUDGE_URL, EVAL_JUDGE_MODEL, EVAL_JUDGE_KEY_FILE
  *                     an Anthropic-compatible gateway, a model and its key: each case with a rubric or a judge-only fact
  *                     is also graded by that model, recorded beside the deterministic verdict and never instead of it.
@@ -56,7 +57,7 @@ import { fileURLToPath } from "node:url";
 import { apiClient, until } from "./assistant-p1-lib.js";
 import { traceOf, type EventRow, type ToolCall } from "./agent-eval-lib.js";
 import {
-  apiQuery, caseHash, caseSays, cardsOf, cleanupOf, finalSay, grade, forRecording, identityRefusal, itemsStartedBy, loadCases, parseRecordings, passed, pick, planOf,
+  apiQuery, caseHash, caseSays, cardsOf, cleanupOf, finalSay, grade, forRecording, identityRefusal, itemsStartedBy, loadCases, parseRecordings, pick, planOf,
   renderTable, routeOf, saysOf, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, turnsOf,
   type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type Recording, type Turn,
 } from "./sa-eval-lib.js";
@@ -88,6 +89,9 @@ const ITEM_WAIT_SEC = int("EVAL_ITEM_WAIT", 300, 10, 3600);
 const KEEP_TEXT = process.env.EVAL_KEEP_TEXT === "1";
 const OUT = process.env.EVAL_OUT;
 const RECORD_DIR = process.env.EVAL_RECORD_DIR;
+// A recording holds what the identity was shown (and so anything an oracle reads back from its data): it is written only
+// when the operator also asks to keep the text, knowingly.
+if (RECORD_DIR && !KEEP_TEXT) { console.error("EVAL_RECORD_DIR writes the answers the identity was shown: set EVAL_KEEP_TEXT=1 as well to say so"); process.exit(2); }
 
 /** The key, from the environment or the file named there; never a default. Never printed, never written. */
 function apiKey(): string {
@@ -405,19 +409,22 @@ async function main(): Promise<void> {
   log(`mode=${MODE} plugin=${PLUGIN_ID ?? "-"} cases=${cases.length} k=${K}`);
   let sessionId = "";
   let stream: LiveStream | null = null;
-  let floorAtStart = 0;
   let createdAssistant = false;   // the run made the identity's assistant session: it is deleted at the end
-  if (MODE === "assistant") {
-    const a = await api("POST", "/v1/assistant", {});
-    sessionId = a.json?.data?.session_id;
-    if (a.status !== 200 || !sessionId) { console.error(`POST /v1/assistant answered ${a.status}`); process.exit(2); }
-    createdAssistant = a.json?.data?.created === true;
-    floorAtStart = Math.max(0, ...(await board()).map((i) => i.seq));
-    stream = new LiveStream(sessionId, true);
-    await stream.open();
-  }
+  // The board's highest number is read before anything is made, so whatever fails after it, everything numbered above it
+  // is the run's and is closed below.
+  const floorAtStart = MODE === "assistant" ? Math.max(0, ...(await board()).map((i) => i.seq)) : 0;
   const results: CaseResult[] = [];
+  let cleanupFailed: string[] = [];
+  let leftOpen: number[] = [];
   try {
+    if (MODE === "assistant") {
+      const a = await api("POST", "/v1/assistant", {});
+      sessionId = a.json?.data?.session_id;
+      if (a.status !== 200 || !sessionId) throw new Error(`POST /v1/assistant answered ${a.status}`);
+      createdAssistant = a.json?.data?.created === true;
+      stream = new LiveStream(sessionId, true);
+      await stream.open();
+    }
     for (const c of cases) {
       const r: CaseResult = { id: c.id, area: c.area, pipeline: c.pipeline, mode: MODE, hash: c.source?.hash ?? caseHash(c), attempts: [] };
       results.push(r);
@@ -436,26 +443,35 @@ async function main(): Promise<void> {
         log(`${a.error ? "ERROR" : a.pass ? "pass" : "FAIL"} ${c.id}#${k + 1} route=${a.route ?? "-"} cards=${a.cards ?? "-"} first=${a.firstReplyMs}ms final=${a.finalMs}ms ${a.error ?? failed.join("; ")}`);
       }
     }
+  } catch (err) {
+    log(`run stopped: ${err instanceof Error ? err.message : String(err)}`);
+    cleanupFailed.push("the run stopped before its cases finished");
   } finally {
     stream?.close();
-  }
-  // Whatever happened, nothing the run started stays open.
-  let leftOpen: number[] = [];
-  if (MODE === "assistant") {
-    for (const i of (await board()).filter((x) => x.seq > floorAtStart && x.board_state !== "done")) log(`closing #${i.seq}: ${await close(i)}`);
-    await sleep(5_000);
-    leftOpen = (await board()).filter((x) => x.seq > floorAtStart && x.board_state !== "done").map((x) => x.seq);
-    log(`items created by the run that are still open: ${leftOpen.length ? leftOpen.join(",") : "none"}`);
-    if (createdAssistant) {
-      const gone = await until(async () => ((await api("DELETE", `/v1/sessions/${sessionId}`).catch(() => ({ status: 0 }))).status === 200 ? true : undefined), Date.now() + 60_000, 10_000);
-      log(gone ? "deleted the assistant session the run created" : `could not delete the assistant session ${sessionId} the run created`);
+    // Whatever happened, nothing the run started stays open; what could not be closed fails the run.
+    if (MODE === "assistant") {
+      try {
+        for (const i of (await board()).filter((x) => x.seq > floorAtStart && x.board_state !== "done")) log(`closing #${i.seq}: ${await close(i)}`);
+        await sleep(5_000);
+        leftOpen = (await board()).filter((x) => x.seq > floorAtStart && x.board_state !== "done").map((x) => x.seq);
+      } catch (err) {
+        cleanupFailed.push(`the board could not be read to close the run's items: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      log(`items created by the run that are still open: ${leftOpen.length ? leftOpen.join(",") : "none"}`);
+      if (leftOpen.length) cleanupFailed.push(`items still open: ${leftOpen.join(",")}`);
+      if (createdAssistant) {
+        const gone = await until(async () => ((await api("DELETE", `/v1/sessions/${sessionId}`).catch(() => ({ status: 0 }))).status === 200 ? true : undefined), Date.now() + 60_000, 10_000);
+        log(gone ? "deleted the assistant session the run created" : `could not delete the assistant session ${sessionId} the run created`);
+        if (!gone) cleanupFailed.push("the assistant session the run created was not deleted");
+      }
     }
   }
+  cleanupFailed = cleanupFailed.map(scrub);
   if (RECORD_DIR) {
     mkdirSync(RECORD_DIR, { recursive: true });
     writeFileSync(join(RECORD_DIR, `${MODE}-recordings.jsonl`), scrub(recordings.map((r) => JSON.stringify(r)).join("\n") + "\n"));
   }
-  report(results, cases.length, leftOpen);
+  report(results, cases.length, leftOpen, cleanupFailed);
 }
 
 /** Grade recorded attempts again with the current cases and grader: no key, no request. */
@@ -473,12 +489,12 @@ function offline(cases: readonly EvalCase[], file: string): void {
       finalChars: o.final.length, firstReplyMs: o.firstReplyMs, finalMs: o.finalMs, items: [] });
   }
   if (!results.size) { console.error(`no recording in ${file} matches a selected case`); process.exit(2); }
-  report([...results.values()], results.size, []);
+  report([...results.values()], results.size, [], []);
 }
 
-function report(results: CaseResult[], selected: number, leftOpen: number[]): void {
+function report(results: CaseResult[], selected: number, leftOpen: number[], cleanupFailed: string[]): void {
   const sum = totals(results);
-  const summary = { mode: MODE, offline: !!OFFLINE, plugin: PLUGIN_ID ?? null, k: K, finished_at: iso(), cases: selected, totals: sum, left_open: leftOpen };
+  const summary = { mode: MODE, offline: !!OFFLINE, plugin: PLUGIN_ID ?? null, k: K, finished_at: iso(), cases: selected, totals: sum, left_open: leftOpen, cleanup_failed: cleanupFailed };
   if (OUT) {
     mkdirSync(OUT, { recursive: true });
     writeFileSync(join(OUT, `${MODE}.json`), scrub(JSON.stringify({ ...summary, results }, null, 1)));
@@ -486,7 +502,8 @@ function report(results: CaseResult[], selected: number, leftOpen: number[]): vo
   }
   console.log(scrub(renderTable(results)));
   console.log(JSON.stringify(summary));
-  process.exit(results.every((r) => r.attempts.every((a) => !a.error)) ? 0 : 1);
+  for (const why of cleanupFailed) console.error(`cleanup: ${why}`);
+  process.exit(results.every((r) => r.attempts.every((a) => !a.error)) && !cleanupFailed.length ? 0 : 1);
 }
 
 void main();

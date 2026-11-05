@@ -259,6 +259,10 @@ test("S13 judge-only content and recordings", () => {
   assert.deepEqual(verdictOf(plain, grade(plain, observed({ final: "1060", factValues: [["1060"]] })), null), { pass: true });
   const withOracle = caseOf({ facts: [{ claim: "n", oracle: { kind: "api", query: "/v1/me#name" } }, { claim: "s", oracle: { kind: "static", value: "1" } }] });
   assert.deepEqual(forRecording(withOracle, observed({ factValues: [["Secret Name"], ["1"]] })).factValues, [null, ["1"]]);
+  // Offline, that oracle was not read: the fact is unverified and the attempt is not a pass, however right the rest is.
+  const offline = grade(withOracle, observed({ final: "1", factValues: [null, ["1"]] }));
+  assert.equal(offline.find((x) => x.name === "fact n")?.unverified, true);
+  assert.deepEqual(verdictOf(withOracle, offline, null), { pass: false, unjudged: true });
   const r: CaseResult = { id: "a", area: "k", pipeline: "catalog", mode: "assistant", hash: "h",
     attempts: [{ pass: false, unjudged: true, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: 1, finalMs: 2, items: [] }] };
   assert.equal(totals([r]).all!.unjudged, 1);

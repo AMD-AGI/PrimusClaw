@@ -324,7 +324,9 @@ export interface Observed {
   factValues: Array<string[] | null>;
 }
 
-export interface Check { name: string; pass: boolean; skipped?: true; detail?: string }
+/** `unverified`: a check that applies but could not be made here (an API oracle not read: offline). The attempt is then not
+ * a pass (`verdictOf`). */
+export interface Check { name: string; pass: boolean; skipped?: true; unverified?: true; detail?: string }
 
 const CJK = /[㐀-鿿]/g;
 
@@ -350,7 +352,11 @@ export function grade(c: EvalCase, o: Observed): Check[] {
   (c.facts ?? []).forEach((f, k) => {
     const values = o.factValues[k] ?? null;
     const name = `fact ${f.claim}`.slice(0, 80);
-    if (values === null) { skip(name); return; }
+    if (values === null) {
+      if (apiQuery(f.oracle)) out.push({ name, pass: true, skipped: true, unverified: true, detail: "oracle not read" });
+      else skip(name);
+      return;
+    }
     const want = values.slice(0, 10);
     // An oracle's value is the identity's own data: the result says only how many were expected, never what.
     const detail = f.oracle?.kind === "api" ? `expected ${want.length} oracle value(s)` : `expected ${want.join(", ").slice(0, 80)}`;
@@ -437,7 +443,7 @@ export interface Attempt {
   finalMs: number | null;
   items: Array<Pick<ItemSeen, "seq" | "kind" | "board_state"> & { cleanup: string }>;
   judge?: { pass: boolean; why: string } | null;
-  /** The case has content only a judge can grade (a rubric, or a fact with no value) and no judge graded it: not a pass. */
+  /** Not fully graded, so not a pass: content only a judge can grade and no judge graded it, or an oracle not read (offline). */
   unjudged?: true;
   error?: string;
 }
@@ -453,6 +459,7 @@ export const needsJudge = (c: EvalCase): boolean =>
  */
 export function verdictOf(c: EvalCase, checks: readonly Check[], judge: { pass: boolean } | null | undefined): { pass: boolean; unjudged?: true } {
   if (!passed(checks)) return { pass: false };
+  if (checks.some((x) => x.unverified)) return { pass: false, unjudged: true };
   if (!needsJudge(c)) return { pass: true };
   if (!judge) return { pass: false, unjudged: true };
   return { pass: judge.pass };
