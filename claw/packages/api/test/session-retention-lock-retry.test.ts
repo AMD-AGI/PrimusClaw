@@ -110,9 +110,9 @@ describe("session retention lock after a dead replica", { skip }, () => {
     await seedExpired("expired");
     const holderPid = await deadReplicaHoldingTheLock();
 
-    const delayMs = 1_000;
+    const delayMs = 2_000;
     const started = Date.now();
-    const pass = retention.runSessionRetentionOnce(SETTINGS, { delayMs, retries: 5 });
+    const pass = retention.runSessionRetentionOnce(SETTINGS, { ...retention.DEFAULT_RETENTION_RUN, lockRetryDelayMs: delayMs, lockRetries: 5 });
     let settled = false;
     void pass.then(() => { settled = true; }, () => { settled = true; });
 
@@ -129,9 +129,13 @@ describe("session retention lock after a dead replica", { skip }, () => {
     await pass;
     const tookMs = Date.now() - started;
     assert.equal(await isDeleted("expired"), true, "the retried attempt took the lock and ran the pass");
-    assert.ok(tookMs < 2 * delayMs + 1_000, `the pass ran on its first retry, not later (took ${tookMs}ms)`);
+    // The first retry is due at one delay and the second at two.
+    assert.ok(tookMs < 2 * delayMs, `the pass ran on its first retry, not later (took ${tookMs}ms)`);
+    // Advisory locks are cluster-wide: count this file's database only, since
+    // other suites run beside this one on the same server.
     const left = await admin.query(
-      "SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND granted");
+      "SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND granted"
+      + " AND database = (SELECT oid FROM pg_database WHERE datname = current_database())");
     assert.equal(left.rows[0].n, 0, "the pass released the lock it took");
   });
 
@@ -139,7 +143,7 @@ describe("session retention lock after a dead replica", { skip }, () => {
     await seedExpired("expired");
     const holderPid = await deadReplicaHoldingTheLock();
 
-    await retention.runSessionRetentionOnce(SETTINGS, { delayMs: 50, retries: 2 });
+    await retention.runSessionRetentionOnce(SETTINGS, { ...retention.DEFAULT_RETENTION_RUN, lockRetryDelayMs: 50, lockRetries: 2 });
     assert.equal(await isDeleted("expired"), false);
 
     const admin = await cluster!.connect();

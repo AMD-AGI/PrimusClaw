@@ -447,6 +447,10 @@ export const SESSION_RETENTION_DRY_RUN = envBool("SESSION_RETENTION_DRY_RUN", fa
 // holding the retention lock asks again after this many minutes, up to twelve
 // times, instead of waiting for the next day.
 export const SESSION_RETENTION_LOCK_RETRY_MIN = envInt("SESSION_RETENTION_LOCK_RETRY_MIN", 10, { min: 1 });
+// One hold of the retention lock stops after this many seconds and the pass
+// continues in a fresh hold half a minute later, until the day's batch is spent.
+// Kept under the leader lock's ten-minute stall alarm.
+export const SESSION_RETENTION_HOLD_BUDGET_SEC = envInt("SESSION_RETENTION_HOLD_BUDGET_SEC", 300, { min: 1 });
 
 // --- Memory / Skill LLM ---
 export const MEMORY_LLM_MODEL = env("MEMORY_LLM_MODEL", env("DEFAULT_MODEL", "claude-opus-4-6"));

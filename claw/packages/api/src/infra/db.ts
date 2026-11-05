@@ -1580,6 +1580,15 @@ export async function initDb(): Promise<void> {
       `CREATE INDEX IF NOT EXISTS idx_sessions_cleanup_oldest
          ON claw_sessions(deleted_at) WHERE cleanup_state = 'pending'`,
     ).catch(() => {});
+    // The retention purge's walk over deleted sessions (sessions/retention.ts),
+    // in exactly its keyset order, so each page is an index range read from the
+    // cursor rather than a scan and sort of every deleted session.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_sessions_deleted_walk",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sessions_deleted_walk
+         ON claw_sessions(deleted_at, session_id) WHERE deleted_at IS NOT NULL`,
+    );
     // Sessions deleted before this existed had their cleanup attempted exactly
     // once, inside the request, and whatever failed there was logged and left.
     // The objects of those sessions are still in the bucket, which is the leak

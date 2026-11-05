@@ -45,6 +45,13 @@
  * ago. The session row itself stays, because it carries the cleanup state the
  * sweeper and its stuck report read, and the deletion time retention windows are
  * measured from.
+ *
+ * Each hold of the lock is bounded in time as well as in count. Deleting a
+ * session takes a fraction of a second, so a daily batch of thousands held the
+ * lock past the leader lock's stall alarm (a 5000-session pass held it 13.5
+ * minutes). A hold stops at its time budget and the pass continues in a fresh
+ * hold a little later, until the day's batch is spent; the batch stays the
+ * daily limit.
  */
 import pino from "pino";
 
@@ -81,12 +88,48 @@ export interface RetentionReport {
   deleted: number;
   /** Sessions selected but found ineligible under their row lock. */
   skipped: number;
-  /** Deleted sessions past the purge window that still have rows, before the batch limit. */
+  /**
+   * Deleted sessions past the purge window found with rows to remove. Counted
+   * while walking them, so the walk's stop at the batch or the time budget
+   * bounds it.
+   */
   purgeEligible: number;
   /** Deleted sessions whose rows this pass removed (in a dry run, would have). */
   purgedSessions: number;
   /** Rows removed per table (in a dry run, the rows the purged sessions hold). */
   purgedRows: Record<(typeof PURGED_TABLES)[number], number>;
+  /** This hold stopped at its time budget with work left; the pass continues in another hold. */
+  timedOut: boolean;
+}
+
+/**
+ * Where a pass that spans several holds of the lock has got to. One per daily
+ * pass; each hold reads and advances it.
+ */
+export interface RetentionProgress {
+  /** Deletions left in the day's batch. */
+  deleteLeft: number;
+  /** Purges left in the day's batch. */
+  purgeLeft: number;
+  /**
+   * The purge walk's position: the last session it visited, in (deleted_at,
+   * session_id) order. The time is Postgres's own text for it, because a JS
+   * Date keeps milliseconds and the column has microseconds: a cursor rounded
+   * down would hand the walk the same session again.
+   */
+  purgeCursor?: { deletedAt: string; sessionId: string };
+  deleteDone: boolean;
+  purgeDone: boolean;
+}
+
+export function newRetentionProgress(s: RetentionSettings): RetentionProgress {
+  return { deleteLeft: s.batch, purgeLeft: s.batch, deleteDone: false, purgeDone: false };
+}
+
+/** The bound on one hold: when it ends, and where it starts from. */
+interface HoldLimits {
+  deadline: number;
+  progress: RetentionProgress;
 }
 
 /**
@@ -127,17 +170,23 @@ async function tableExists(q: Queryable, name: string): Promise<boolean> {
 async function deleteExpiredSessions(
   s: RetentionSettings,
   report: RetentionReport,
+  limits: HoldLimits,
   lease?: LeaderLease,
 ): Promise<void> {
+  const { progress } = limits;
   const workItems = await tableExists(db, "claw_work_items");
   const counted = await db.query(
     `SELECT COUNT(*)::int AS n FROM claw_sessions s WHERE ${retentionPredicate(1, workItems)}`,
     [s.retentionDays],
   );
   report.eligible = (counted.rows[0] as { n: number }).n;
-  if (report.eligible === 0) return;
+  if (report.eligible === 0 || progress.deleteLeft <= 0) {
+    progress.deleteDone = true;
+    return;
+  }
   if (s.dryRun) {
-    report.deleted = Math.min(report.eligible, s.batch);
+    report.deleted = Math.min(report.eligible, progress.deleteLeft);
+    progress.deleteDone = true;
     return;
   }
   const picked = (await db.query(
@@ -145,18 +194,28 @@ async function deleteExpiredSessions(
       WHERE ${retentionPredicate(1, workItems)}
       ORDER BY COALESCE(s.archived_at, s.updated_at)
       LIMIT $2`,
-    [s.retentionDays, s.batch],
+    [s.retentionDays, progress.deleteLeft],
   )).rows as Array<{ session_id: string }>;
 
+  let attempted = 0;
   for (const { session_id: sessionId } of picked) {
+    // At least one per hold, so a budget shorter than one deletion still moves.
+    if (attempted > 0 && Date.now() >= limits.deadline) {
+      report.timedOut = true;
+      return;
+    }
     const lost = lease?.lost();
     if (lost) {
       logger.error(
         { deleted: report.deleted, err: lost.message },
         "session_retention.stopped (the lock connection dropped; the rest is left to the next pass)",
       );
-      break;
+      return;
     }
+    attempted += 1;
+    // Spent whatever the outcome: a session that fails every time is still
+    // retried by the next daily pass, not by every hold of this one.
+    progress.deleteLeft -= 1;
     const committed = await commitSessionDeletion(sessionId, {
       onlyIf: async (query: Querier) => {
         // A team member's run starts by writing the member's own row, not this
@@ -184,65 +243,106 @@ async function deleteExpiredSessions(
     if (committed === true) report.deleted += 1;
     else if (committed === false) report.skipped += 1;
   }
+  progress.deleteDone = true;
 }
 
 /**
  * Remove the stamped rows of sessions deleted more than `purgeDays` ago.
  *
- * Per session, so each statement is an index lookup on `session_id` rather than
- * a scan of the events table, which is the largest one in the database.
+ * Every statement is per session, so each is an index lookup on `session_id`
+ * rather than a scan of the events table, which is the largest one in the
+ * database. That includes choosing which sessions to purge: the first version
+ * asked it as one query, `s.deleted_at < ... AND (EXISTS ... OR EXISTS ...)`,
+ * and Postgres turns EXISTS under OR into a hashed subplan, which reads every
+ * stamped row of the events table to build the hash. On a 20 GB table that ran
+ * past the statement timeout on every pass, and the purge never removed a row.
+ * So the walk is over `claw_sessions` alone, in (deleted_at, session_id) order,
+ * a page at a time, and each session is asked on its own whether it has rows
+ * to remove.
  */
 async function purgeDeletedRows(
   s: RetentionSettings,
   report: RetentionReport,
+  limits: HoldLimits,
   lease?: LeaderLease,
 ): Promise<void> {
-  // The same row condition the DELETE below uses, so a session is selected only
-  // while it has a row this pass can remove and never spends the batch on nothing.
-  const hasRows = PURGED_TABLES.map((t) =>
-    `EXISTS (SELECT 1 FROM ${t} x WHERE x.session_id = s.session_id AND x.deleted_at IS NOT NULL
-             AND x.deleted_at < NOW() - ($1::int * INTERVAL '1 day'))`,
-  ).join(" OR ");
-  const where = `s.deleted_at < NOW() - ($1::int * INTERVAL '1 day') AND (${hasRows})`;
-  const counted = await db.query(
-    `SELECT COUNT(*)::int AS n FROM claw_sessions s WHERE ${where}`,
-    [s.purgeDays],
-  );
-  report.purgeEligible = (counted.rows[0] as { n: number }).n;
-  if (report.purgeEligible === 0) return;
-  const picked = (await db.query(
-    `SELECT s.session_id FROM claw_sessions s WHERE ${where} ORDER BY s.deleted_at LIMIT $2`,
-    [s.purgeDays, s.batch],
-  )).rows as Array<{ session_id: string }>;
+  const { progress } = limits;
+  // A row is purged only once its own stamp is past the window too: a late
+  // write stamped by a second deletion commit is not older than the session's.
+  const cond = `session_id = $1 AND deleted_at IS NOT NULL
+                AND deleted_at < NOW() - ($2::int * INTERVAL '1 day')`;
+  const probe = `SELECT ${PURGED_TABLES.map((t) => `EXISTS (SELECT 1 FROM ${t} WHERE ${cond})`).join(" OR ")} AS has`;
+  const PAGE = 500;
+  let visited = 0;
+  for (;;) {
+    // Two statements rather than one with `$2 IS NULL OR ...`: the row
+    // comparison has to stand on its own to be a range condition on
+    // idx_sessions_deleted_walk, which starts each page at the cursor.
+    const cursor = progress.purgeCursor;
+    const page = (await (cursor
+      ? db.query(
+        `SELECT s.session_id, s.deleted_at::text AS deleted_at FROM claw_sessions s
+          WHERE s.deleted_at IS NOT NULL AND s.deleted_at < NOW() - ($1::int * INTERVAL '1 day')
+            AND (s.deleted_at, s.session_id) > ($2::timestamptz, $3::text)
+          ORDER BY s.deleted_at, s.session_id
+          LIMIT $4`,
+        [s.purgeDays, cursor.deletedAt, cursor.sessionId, PAGE],
+      )
+      : db.query(
+        `SELECT s.session_id, s.deleted_at::text AS deleted_at FROM claw_sessions s
+          WHERE s.deleted_at IS NOT NULL AND s.deleted_at < NOW() - ($1::int * INTERVAL '1 day')
+          ORDER BY s.deleted_at, s.session_id
+          LIMIT $2`,
+        [s.purgeDays, PAGE],
+      ))).rows as Array<{ session_id: string; deleted_at: string }>;
 
-  for (const { session_id: sessionId } of picked) {
-    if (lease?.lost()) break;
-    for (const table of PURGED_TABLES) {
-      // A row is purged only once its own stamp is past the window too: a late
-      // write stamped by a second deletion commit is not older than the session's.
-      const cond = `session_id = $1 AND deleted_at IS NOT NULL
-                    AND deleted_at < NOW() - ($2::int * INTERVAL '1 day')`;
-      if (s.dryRun) {
-        const r = await db.query(`SELECT COUNT(*)::int AS n FROM ${table} WHERE ${cond}`, [sessionId, s.purgeDays]);
-        report.purgedRows[table] += (r.rows[0] as { n: number }).n;
-      } else {
-        const r = await db.query(`DELETE FROM ${table} WHERE ${cond}`, [sessionId, s.purgeDays]);
-        report.purgedRows[table] += r.rowCount ?? 0;
+    for (const { session_id: sessionId, deleted_at: deletedAt } of page) {
+      if (progress.purgeLeft <= 0) {
+        progress.purgeDone = true;
+        return;
       }
+      if (visited > 0 && Date.now() >= limits.deadline) {
+        report.timedOut = true;
+        return;
+      }
+      if (lease?.lost()) return;
+      visited += 1;
+      const has = (await db.query(probe, [sessionId, s.purgeDays])).rows[0] as { has: boolean };
+      if (has.has) {
+        report.purgeEligible += 1;
+        for (const table of PURGED_TABLES) {
+          if (s.dryRun) {
+            const r = await db.query(`SELECT COUNT(*)::int AS n FROM ${table} WHERE ${cond}`, [sessionId, s.purgeDays]);
+            report.purgedRows[table] += (r.rows[0] as { n: number }).n;
+          } else {
+            const r = await db.query(`DELETE FROM ${table} WHERE ${cond}`, [sessionId, s.purgeDays]);
+            report.purgedRows[table] += r.rowCount ?? 0;
+          }
+        }
+        report.purgedSessions += 1;
+        progress.purgeLeft -= 1;
+      }
+      progress.purgeCursor = { deletedAt, sessionId };
     }
-    report.purgedSessions += 1;
+    if (page.length < PAGE) {
+      progress.purgeDone = true;
+      return;
+    }
   }
 }
 
 /**
- * One retention pass: delete what has expired, then purge what was deleted.
+ * One hold of a retention pass: delete what has expired, then purge what was
+ * deleted.
  *
  * Each half is skipped when its setting is 0. Errors in the first half do not
- * stop the second.
+ * stop the second. Without `limits` the hold has no time budget and a fresh
+ * batch: the whole pass in one hold.
  */
 export async function runSessionRetention(
   s: RetentionSettings,
   lease?: LeaderLease,
+  limits: HoldLimits = { deadline: Infinity, progress: newRetentionProgress(s) },
 ): Promise<RetentionReport> {
   const report: RetentionReport = {
     dryRun: s.dryRun,
@@ -252,14 +352,24 @@ export async function runSessionRetention(
     purgeEligible: 0,
     purgedSessions: 0,
     purgedRows: { claw_conversation_turns: 0, claw_session_events: 0, claw_session_summaries: 0 },
+    timedOut: false,
   };
-  if (s.retentionDays > 0) {
-    await deleteExpiredSessions(s, report, lease)
-      .catch((err) => logger.error({ err }, "session_retention.delete_pass_failed"));
+  const { progress } = limits;
+  if (s.retentionDays > 0 && !progress.deleteDone) {
+    await deleteExpiredSessions(s, report, limits, lease)
+      .catch((err) => {
+        // Failed, not unfinished: the next daily pass starts it again.
+        progress.deleteDone = true;
+        logger.error({ err }, "session_retention.delete_pass_failed");
+      });
   }
-  if (s.purgeDays > 0) {
-    await purgeDeletedRows(s, report, lease)
-      .catch((err) => logger.error({ err }, "session_retention.purge_pass_failed"));
+  // The purge waits for the deletions of the day's batch, which come first.
+  if (s.purgeDays > 0 && !progress.purgeDone && !report.timedOut) {
+    await purgeDeletedRows(s, report, limits, lease)
+      .catch((err) => {
+        progress.purgeDone = true;
+        logger.error({ err }, "session_retention.purge_pass_failed");
+      });
   }
   logger.info(
     { ...report, retentionDays: s.retentionDays, purgeDays: s.purgeDays, batch: s.batch },
@@ -268,22 +378,40 @@ export async function runSessionRetention(
   return report;
 }
 
-/** How a pass that found the lock taken asks again. */
-export interface RetentionLockRetry {
-  /** Wait between attempts. */
-  delayMs: number;
-  /** Attempts after the first. */
-  retries: number;
+/** How a daily pass spreads over holds of the lock. */
+export interface RetentionRunOptions {
+  /** The time budget of one hold; past it the hold stops and the pass continues in another. */
+  holdBudgetMs: number;
+  /** The pause between two holds of one pass. */
+  continueDelayMs: number;
+  /** The wait before asking again for a lock another session holds. */
+  lockRetryDelayMs: number;
+  /** How many times a pass asks again for a held lock. */
+  lockRetries: number;
 }
 
-const DEFAULT_LOCK_RETRY: RetentionLockRetry = { delayMs: 10 * 60 * 1000, retries: 12 };
+export const DEFAULT_RETENTION_RUN: RetentionRunOptions = {
+  holdBudgetMs: 5 * 60 * 1000,
+  continueDelayMs: 30 * 1000,
+  lockRetryDelayMs: 10 * 60 * 1000,
+  lockRetries: 12,
+};
+
+/** A backstop on holds per pass; the batch is what normally ends it. */
+const MAX_HOLDS = 200;
+
+const pause = (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); });
 
 /**
  * The maintenance entry point: one replica at a time, so two replicas do not
  * walk the same batch.
  *
- * A pass that finds the lock taken asks again after `retry.delayMs`, up to
- * `retry.retries` times, rather than skipping until the next day. The holder is
+ * A hold that reaches its time budget lets go of the lock and the pass carries
+ * on in a new hold after `continueDelayMs`, from where it stopped and with what
+ * is left of the day's batch.
+ *
+ * A pass that finds the lock taken asks again after `lockRetryDelayMs`, up to
+ * `lockRetries` times, rather than skipping until the next day. The holder is
  * usually another replica in its own pass, and then the later attempt runs a
  * second, short pass over what is left, which is harmless. But it can also be a
  * replica that is gone and whose backend the server has not dropped yet -- a
@@ -295,20 +423,33 @@ const DEFAULT_LOCK_RETRY: RetentionLockRetry = { delayMs: 10 * 60 * 1000, retrie
  */
 export async function runSessionRetentionOnce(
   s: RetentionSettings,
-  retry: RetentionLockRetry = DEFAULT_LOCK_RETRY,
+  run: RetentionRunOptions = DEFAULT_RETENTION_RUN,
 ): Promise<void> {
   if (!(s.retentionDays > 0) && !(s.purgeDays > 0)) return;
-  for (let attempt = 0; ; attempt += 1) {
+  const progress = newRetentionProgress(s);
+  let busy = 0;
+  for (let holds = 0; holds < MAX_HOLDS;) {
     const outcome = await withLeaderLock(LEADER_LOCK_IDS.sessionRetention, "session_retention",
-      (lease) => runSessionRetention(s, lease));
-    if (outcome.ran) return;
-    if (attempt >= retry.retries) {
-      logger.warn({ attempts: attempt + 1 },
-        "session_retention.lock_busy_gave_up (another session held the lock on every attempt; "
-        + "the next daily pass tries again)");
-      return;
+      (lease) => runSessionRetention(s, lease, { deadline: Date.now() + run.holdBudgetMs, progress }));
+    if (!outcome.ran) {
+      if (busy >= run.lockRetries) {
+        logger.warn({ attempts: busy + 1 },
+          "session_retention.lock_busy_gave_up (another session held the lock on every attempt; "
+          + "the next daily pass tries again)");
+        return;
+      }
+      busy += 1;
+      logger.info({ attempt: busy, retryInMs: run.lockRetryDelayMs }, "session_retention.lock_busy_retrying");
+      await pause(run.lockRetryDelayMs);
+      continue;
     }
-    logger.info({ attempt: attempt + 1, retryInMs: retry.delayMs }, "session_retention.lock_busy_retrying");
-    await new Promise<void>((resolve) => { setTimeout(resolve, retry.delayMs); });
+    holds += 1;
+    if (!outcome.result.timedOut) return;
+    logger.info(
+      { holds, deleteLeft: progress.deleteLeft, purgeLeft: progress.purgeLeft, continueInMs: run.continueDelayMs },
+      "session_retention.continuing (the hold reached its time budget)",
+    );
+    await pause(run.continueDelayMs);
   }
+  logger.warn({ holds: MAX_HOLDS }, "session_retention.stopped_at_hold_limit");
 }

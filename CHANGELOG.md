@@ -707,6 +707,13 @@ record it.
   (`PG_TCP_KEEPALIVES_IDLE_S`, `PG_TCP_KEEPALIVES_INTERVAL_S`, `PG_TCP_KEEPALIVES_COUNT`, defaults 60/10/6), so such a
   backend and its locks go about two minutes after the peer, and a retention pass that finds the lock held asks again
   every `SESSION_RETENTION_LOCK_RETRY_MIN` minutes (default 10), up to twelve times.
+- The purge of deleted sessions' rows (`SESSION_PURGE_DAYS`) removes rows again: choosing the sessions to purge was one
+  query that Postgres planned as a scan of the whole events table, which hit the statement timeout on every pass
+  (`session_retention.purge_pass_failed`). It now walks deleted sessions a page at a time, along a new index
+  (`idx_sessions_deleted_walk`, built concurrently at startup), and asks each on its own, by index. And a retention pass
+  no longer holds its lock past the stall alarm (`leader.hold_exceeded`): each hold stops after
+  `SESSION_RETENTION_HOLD_BUDGET_SEC` seconds (default 300) and the pass continues in a new hold 30 seconds later, until
+  the day's `SESSION_RETENTION_BATCH` is spent.
 - An on-behalf review of a pull request that changes two or more `SKILL.md` files can approve again: Brain's
   skill-read guard (`BRAIN_BLOCK_SKILL_SUBAGENTS`) turned its second pass away, since that pass names the files the
   review read, and an approval needs the second pass. The guard no longer applies to a session that acts as a user
