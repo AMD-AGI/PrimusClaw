@@ -804,6 +804,7 @@ describe("assistant review tools", { skip }, () => {
     for (const text of [
       "254 怎么样了", "审一下 254", "254 先别合", "重审 254", "Don't merge AMD-AGI/PrimusClaw#254; just review it", "254 不要合入，只审",
       "审 254，先不合并", "254 合入了吗", "is 254 merged?", "254 has a merge conflict, review it", "review 254, never merge it", "254 merge?",
+      "Should we merge #254?", "Can you merge AMD-AGI/PrimusClaw#254?", "要合入 254 吗", "254 合入？",
     ]) {
       const turn = await userTurn(alice, text);
       assert.equal(await code(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: true })), "merge_not_in_message", text);
