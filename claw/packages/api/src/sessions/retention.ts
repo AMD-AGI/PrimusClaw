@@ -162,7 +162,9 @@ async function deleteExpiredSessions(
         // A team member's run starts by writing the member's own row, not this
         // one, so the session lock alone does not hold it off: lock the members
         // too, so a run starting now is waited for and seen, and none starts
-        // before this commits.
+        // before this commits. A member created or attached from now on reads
+        // this session `FOR KEY SHARE` (routes/sessions.ts, routes/a2a.ts), so
+        // it waits for this commit and then finds the parent deleted.
         await query(
           `SELECT 1 FROM claw_sessions WHERE parent_session_id = $1 AND deleted_at IS NULL
             ORDER BY session_id FOR UPDATE`,
