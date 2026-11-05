@@ -45,7 +45,8 @@ type dataPlane struct {
 	routes    map[string]string
 	upstream  *rsa.PublicKey
 	pods      PodAddressFunc
-	// upstreamOnly limits /v1 to invocations forwarded by the managing Router.
+	// upstreamOnly limits /v1 and the E2B control plane to invocations forwarded
+	// by the managing Router. /v1/health stays open.
 	upstreamOnly bool
 }
 

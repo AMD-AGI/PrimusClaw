@@ -21,9 +21,12 @@ import (
 )
 
 const (
-	// EnvUpstreamOnly makes a cluster Router accept /v1 calls only as invocations
+	// EnvUpstreamOnly makes a cluster Router accept calls only as invocations
 	// forwarded by the managing Router. Unset is on. The exact value "false" turns it off.
 	EnvUpstreamOnly = "SANDBOX_UPSTREAM_ONLY"
+	// invokeControlSession is the session claim of a forwarded E2B collection call
+	// (create or list), which names no sandbox.
+	invokeControlSession = "*"
 
 	invocationRoute = "/v1/namespaces/:namespace/code-interpreters/:name/invocations/*path"
 	ctxInvokeHop    = "invokeHop"
@@ -81,15 +84,47 @@ func (s *Server) invokeHopMiddleware() gin.HandlerFunc {
 			}
 		}
 		if s.dp.upstreamOnly && c.FullPath() != "/v1/health" {
-			recordCallerAuthRejection(c, http.StatusUnauthorized)
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "this Router accepts /v1 calls only from the managing Router",
-				"code":  "upstream_hop_required",
-			})
+			s.rejectDirectCaller(c)
 			return
 		}
 		c.Next()
 	}
+}
+
+// rejectDirectCaller answers a caller that did not arrive as a forwarded invocation.
+func (s *Server) rejectDirectCaller(c *gin.Context) {
+	recordCallerAuthRejection(c, http.StatusUnauthorized)
+	c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+		"error": "this Router accepts calls only from the managing Router",
+		"code":  "upstream_hop_required",
+	})
+}
+
+// enforceUpstreamHop admits a request on an upstream-only Router when it carries
+// this cluster's invoke token. sessionID empty means an E2B collection call.
+// A non-upstream-only Router admits every caller.
+func (s *Server) enforceUpstreamHop(c *gin.Context, sessionID string) bool {
+	if !s.dp.upstreamOnly {
+		return true
+	}
+	hop, err := verifyInvokeToken(s.dp.upstream, bearerCredential(c), s.dp.clusterID)
+	if err != nil {
+		s.rejectDirectCaller(c)
+		return false
+	}
+	want := sessionID
+	if want == "" {
+		want = invokeControlSession
+	}
+	if hop.SessionID != want {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"error": "forwarded invocation does not match its session",
+			"code":  "invoke_hop_mismatch",
+		})
+		return false
+	}
+	setHopUserContext(c, hop)
+	return true
 }
 
 // setHopUserContext records a verified forwarded invocation and its caller identity.
@@ -153,10 +188,66 @@ func (s *Server) forwardRemoteInvocation(c *gin.Context, sessionID string) bool 
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
 		return true
 	}
+	s.proxyToCluster(c, base, cluster, token)
+	return true
+}
+
+// forwardRemoteE2B sends an E2B control-plane call to the cluster Router.
+// A sandbox in the local store stays local. Collection calls go to the one
+// configured remote cluster. It reports false when the call stays here.
+func (s *Server) forwardRemoteE2B(c *gin.Context) bool {
+	if s.dp.upstreamOnly || len(s.dp.routes) == 0 || s.jwt == nil {
+		return false
+	}
+	sandboxID := c.Param("sandboxID")
+	cluster, namespace, session := "", "", invokeControlSession
+	if sandboxID != "" {
+		if s.locator == nil {
+			return false
+		}
+		if s.store != nil {
+			if _, err := s.store.GetSandboxBySessionID(c.Request.Context(), sandboxID); err == nil {
+				return false
+			}
+		}
+		var err error
+		cluster, namespace, _, err = s.locator(c.Request.Context(), sandboxID)
+		if err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				log.Warn("e2b: workload lookup failed", "sandboxId", sandboxID, "error", err)
+			}
+			return false
+		}
+		session = sandboxID
+	} else {
+		ids := s.RemoteClusterIDs()
+		if len(ids) != 1 {
+			return false
+		}
+		cluster = ids[0]
+	}
+	base, ok := s.forwardTarget(cluster)
+	if !ok {
+		return false
+	}
+	token, err := s.jwt.generateInvokeToken(session, cluster, namespace, "", "", "")
+	if err != nil {
+		log.Error("e2b: failed to sign forward token", "error", err, "sandboxId", sandboxID, "cluster", cluster)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
+		return true
+	}
+	s.proxyToCluster(c, base, cluster, token)
+	return true
+}
+
+// proxyToCluster forwards the original request to a cluster Router, replacing
+// the caller credential with an invoke token. X-API-KEY is left for the cluster
+// Workload Manager.
+func (s *Server) proxyToCluster(c *gin.Context, base, cluster, token string) {
 	target, err := url.Parse(base)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "cluster route is invalid"})
-		return true
+		return
 	}
 	target.Path = strings.TrimRight(target.Path, "/") + c.Request.URL.Path
 	target.RawPath = ""
@@ -183,7 +274,6 @@ func (s *Server) forwardRemoteInvocation(c *gin.Context, sessionID string) bool 
 		},
 	}
 	proxy.ServeHTTP(c.Writer, c.Request)
-	return true
 }
 
 // verifyInvokeToken checks the managing Router's signature, audience, and cluster

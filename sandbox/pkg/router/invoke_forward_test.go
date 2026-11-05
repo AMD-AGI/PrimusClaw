@@ -220,6 +220,110 @@ func TestLocalSessionIsNotForwarded(t *testing.T) {
 	}
 }
 
+func TestUpstreamOnlyRejectsDirectE2B(t *testing.T) {
+	p := newForwardPair(t, "u1")
+	wmHits := &atomic.Int32{}
+	wm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wmHits.Add(1)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(wm.Close)
+	p.exec.cfg.WorkloadManagerURL = wm.URL
+
+	for _, path := range []string{"/sandboxes", "/v2/sandboxes", "/v2/sandboxes/" + forwardSession + "/connect"} {
+		req, err := http.NewRequest(http.MethodPost, p.cluster.URL+path, strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-API-KEY", "e2b-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized || errorCode(string(body)) != "upstream_hop_required" {
+			t.Fatalf("%s status=%d body=%s", path, resp.StatusCode, body)
+		}
+	}
+	if wmHits.Load() != 0 {
+		t.Fatal("direct E2B call reached the workload manager")
+	}
+}
+
+func TestGlobalForwardsE2BToCluster(t *testing.T) {
+	p := newForwardPair(t, "u1")
+	var gotPath, gotKey, gotAuth atomic.Value
+	wm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath.Store(r.URL.Path)
+		gotKey.Store(r.Header.Get("X-API-KEY"))
+		gotAuth.Store(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(wm.Close)
+	p.exec.cfg.WorkloadManagerURL = wm.URL
+
+	req, err := http.NewRequest(http.MethodPost, p.front.URL+"/v2/sandboxes/"+forwardSession+"/connect", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-API-KEY", "e2b-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	if gotPath.Load().(string) != "/v2/sandboxes/"+forwardSession+"/connect" || gotKey.Load().(string) != "e2b-key" {
+		t.Fatalf("path=%v key=%v", gotPath.Load(), gotKey.Load())
+	}
+	auth, _ := gotAuth.Load().(string)
+	if !strings.HasPrefix(auth, "Bearer ") || auth == "Bearer e2b-key" {
+		t.Fatalf("cluster authorization=%q", auth)
+	}
+
+	req, err = http.NewRequest(http.MethodPost, p.front.URL+"/sandboxes", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-API-KEY", "e2b-key")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || gotPath.Load().(string) != "/sandboxes" {
+		t.Fatalf("collection status=%d path=%v body=%s", resp.StatusCode, gotPath.Load(), body)
+	}
+}
+
+func TestE2BInvokeTokenIsBoundToItsSandbox(t *testing.T) {
+	p := newForwardPair(t, "u1")
+	token, err := p.global.jwt.generateInvokeToken("other-sandbox", "crusoe", "crusoe-ws", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, p.cluster.URL+"/v2/sandboxes/"+forwardSession, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-API-KEY", "e2b-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || errorCode(string(body)) != "invoke_hop_mismatch" {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
 func TestUpstreamOnlyFromEnv(t *testing.T) {
 	if !UpstreamOnlyFromEnv("") || !UpstreamOnlyFromEnv("true") || !UpstreamOnlyFromEnv("  ") {
 		t.Fatal("upstream-only defaults on")

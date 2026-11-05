@@ -259,6 +259,7 @@ func (s *Server) setupRoutes() {
 
 	// E2B control plane. Outside /v1 so SaFE auth does not replace X-API-KEY.
 	// Workload Manager resolves the key. A missing key is rejected here.
+	// An upstream-only Router accepts these routes only as a forwarded invocation.
 	// /sandboxes and /v2/sandboxes are the same control plane. SDK 2.51+
 	// uses POST /v2/sandboxes and POST /v2/sandboxes/{id}/connect.
 	// PATCH sets the timeout.

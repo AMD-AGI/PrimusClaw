@@ -508,7 +508,7 @@ secret:
   # and response headers carry credentials. Empty is off, and off is default.
   llmDebugResponseHeaders: ""
   anthropicBaseUrl: ""
-  defaultModel: claude-opus-4-7
+  defaultModel: claude-opus-5-5
   openaiBaseUrl: ""
   byokVerifyModelsUrl: ""
   byokVerifyApiStyle: openai
