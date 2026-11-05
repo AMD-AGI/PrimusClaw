@@ -220,7 +220,7 @@ func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 		want   string
 	}{
 		{name: "workload failed", fail: errors.New("workload sbx-1 phase Failed: CapacityGone: allocation generation is Lost"), status: http.StatusInternalServerError, reason: "sandbox_create_failed", want: "CapacityGone"},
-		{name: "pending timeout", hold: true, status: http.StatusInternalServerError, reason: "pending_timeout", want: "not running after 1s"},
+		{name: "pending timeout", hold: true, status: http.StatusServiceUnavailable, reason: "pending_timeout", want: "not running after 1s"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -270,6 +270,27 @@ func TestReplayThatEndsTheRefKeepsTheReason(t *testing.T) {
 	close(runner.hold)
 	if err := <-done; !errors.As(err, &oe) || oe.Status != http.StatusInternalServerError || !strings.Contains(oe.Detail, "CapacityGone") {
 		t.Fatalf("create=%v", err)
+	}
+}
+
+func TestReplayWithoutEndReasonNamesOnlyTheSandbox(t *testing.T) {
+	svc, _, keys := testPlane(t, 600, []int32{1}, 1)
+	key := keys["measurement"]
+	created, status, err := svc.Create(context.Background(), key, CreateBody{
+		TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"},
+	})
+	if err != nil || status != http.StatusCreated {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	if err := svc.grants.EndSandbox(context.Background(), "gr-01jb7m9k2x", created.SandboxID, ""); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = svc.Create(context.Background(), key, CreateBody{
+		TemplateID: "runner", Metadata: map[string]string{idempotencyMetadataKey: "once"},
+	})
+	var oe *grant.OpError
+	if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" || oe.Detail != created.SandboxID {
+		t.Fatalf("replay=%v", err)
 	}
 }
 
@@ -579,7 +600,8 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	_, _, err = svc.Create(context.Background(), key, CreateBody{
 		TemplateID: "ar-01ja-runner-g1", Metadata: map[string]string{"agent-sandbox.io/idempotency-key": "once"},
 	})
-	if !grant.IsReason(err, "idempotency_key_spent") || !strings.Contains(err.Error(), first.SandboxID) {
+	var spent *grant.OpError
+	if !errors.As(err, &spent) || spent.Status != http.StatusGone || spent.Reason != "idempotency_key_spent" || spent.Detail != first.SandboxID+": killed" {
 		t.Fatalf("err=%v", err)
 	}
 	if _, err := svc.Connect(context.Background(), key, first.SandboxID); !grant.IsReason(err, "sandbox_not_found") {

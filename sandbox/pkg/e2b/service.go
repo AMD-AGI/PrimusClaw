@@ -320,7 +320,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		}
 		failed := grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			failed = grant.Op(http.StatusInternalServerError, "pending_timeout", "not running after "+tpl.Pending.String()+": "+runErr.Error())
+			failed = grant.Op(http.StatusServiceUnavailable, "pending_timeout", "not running after "+tpl.Pending.String()+": "+runErr.Error())
 		}
 		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
 		return SandboxResponse{}, 0, failed
