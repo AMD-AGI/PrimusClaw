@@ -189,7 +189,8 @@ They act only for the person, never for a key or a report:
   the only repository it can be: the channel's own (`channel_context.repos`), else the one the user's recent reviews used (two
   candidates and a bare number are refused, so the assistant asks); a model named there; a reviewer the user themself or someone
   the channel listed with a Claw `user_id` (`channel_context.people`); and a review that merges only when the message asks for a
-  merge (合入, 合并, 合进, 审完合, merge; else `merge_not_in_message`), at a start and at a restart alike.
+  merge (合入, 合并, 合进, 审完合, merge), none of them negated just before ("don't merge", "不要合入") or asked as a
+  question ("合入了吗"); else `merge_not_in_message`, at a start and at a restart alike.
 - **Two acts are never read from a sentence.** A held write is let through only when the user's whole message is the approval
   command `批准 #<ref>` or `approve #<ref>` (case, spacing, a full-width `＃` and closing punctuation aside), where `<ref>` is the
   first six hex digits of its confirmation id (the assistant shows it; the whole id also works), and only for a write that was

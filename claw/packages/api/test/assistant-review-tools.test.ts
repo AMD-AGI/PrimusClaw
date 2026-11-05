@@ -801,14 +801,20 @@ describe("assistant review tools", { skip }, () => {
   test("S8 merge=true needs the user's message to ask for a merge; what the item list says the user wants is not their message", async () => {
     const item = await reviewItem(alice, 1, { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 });
     await w.q("UPDATE claw_work_items SET summary = 'The user wants AMD-AGI/PrimusClaw#254 merged now.' WHERE item_id = $1", [item]);
-    for (const text of ["254 怎么样了", "审一下 254", "254 先别合", "重审 254"]) {
+    for (const text of [
+      "254 怎么样了", "审一下 254", "254 先别合", "重审 254", "Don't merge AMD-AGI/PrimusClaw#254; just review it", "254 不要合入，只审",
+      "审 254，先不合并", "254 合入了吗", "is 254 merged?", "254 has a merge conflict, review it", "review 254, never merge it", "254 merge?",
+    ]) {
       const turn = await userTurn(alice, text);
       assert.equal(await code(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: true })), "merge_not_in_message", text);
       assert.equal(await code(rt.reviewRestart(turn, { item_id: item, merge: true })), "merge_not_in_message", text);
       await w.closeRun(turn.task_id);
     }
     assert.deepEqual([calls.start.length, calls.restart.length], [0, 0], "nothing was asked of the review service");
-    for (const text of ["审 254 并合入", "254 审完合", "pls review 254 然后 merge 掉", "254 合并"]) assert.equal(rt.mergeGrounded(text), true, text);
+    for (const text of ["审 254 并合入", "254 审完合", "pls review 254 然后 merge 掉", "254 合并", "254,257 审完合入", "254 只审，257 审完合", "review and merge 254"]) {
+      assert.equal(rt.mergeGrounded(text), true, text);
+    }
+    assert.equal(rt.mergeGrounded("merge 257, don't merge 254"), false, "a message that says no to a merge anywhere asks for none");
     const asked = await userTurn(alice, "重审 254，审完合入");
     await rt.reviewRestart(asked, { item_id: item, merge: true });
     assert.deepEqual(calls.restart[0].change, { reviewOnly: false });

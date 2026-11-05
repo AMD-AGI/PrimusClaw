@@ -164,13 +164,27 @@ export function modelGrounded(text: string, model: string): boolean {
   return lower(model).split(/[^a-z0-9]+/).some((part) => /^[a-z][a-z0-9]{2,}$/.test(part) && t.includes(part));
 }
 
+/** A word the router's prompt reads as a merge. Not "merged" (a question about a state) nor a "merge conflict". */
+const MERGE_ASK = /合入|合并|合进|审完合|\bmerge\b(?!\s*conflicts?\b)/gi;
+/** A negation shortly before such a word: "don't merge", "不要合入", "never merge", "先别...合并". */
+const NEGATION_BEFORE = /别|不|勿|禁止|无需|\bdon'?t\b|\bdo\s+not\b|\bnever\b|\bnot\b|\bno\b|\bwithout\b|\bstop\b|\bskip\b|\bavoid\b/i;
+/** A question right after it: "合入了吗", "merge?". */
+const QUESTION_AFTER = /^\s*(?:了吗|了么|了没|了沒|吗|没有|\?|？)/;
+const NEGATION_WINDOW = 12;
+
 /**
- * Whether the user's message asks for a merge at all: one of the words the router's prompt reads as a merge (合入, 合并, 合进, 审完合,
- * merge). A necessary condition, like a model's name: the router still decides, but a message without one never makes a review that
- * merges, whatever the item list or a page the router read says the user wants.
+ * Whether the user's message asks for a merge: one of the words the router's prompt reads as a merge (合入, 合并, 合进, 审完合, merge),
+ * and every one of them asks it, none negated just before ("don't merge", "不要合入") nor asked as a question ("合入了吗"). A message that
+ * says no to a merge anywhere asks for none, so the router asks the user rather than choose. A necessary condition, like a model's name:
+ * the router still decides, but a message without such an ask never makes a review that merges, whatever the item list or a page the
+ * router read says the user wants.
  */
 export function mergeGrounded(text: string): boolean {
-  return /合入|合并|合进|审完合|merge/i.test(text);
+  const asks = [...text.matchAll(MERGE_ASK)];
+  return asks.length > 0 && asks.every((m) => {
+    const at = m.index ?? 0;
+    return !NEGATION_BEFORE.test(text.slice(Math.max(0, at - NEGATION_WINDOW), at)) && !QUESTION_AFTER.test(text.slice(at + m[0].length));
+  });
 }
 
 const MERGE_NOT_ASKED = "the user did not ask to merge: pass merge=false unless their message asks for it (合入, 合并, merge)";
