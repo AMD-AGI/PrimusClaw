@@ -2,6 +2,10 @@
 # GPU sandboxes in the SaFE workspaces crusoe-spur-vk and top-models use the
 # workspace's hostpath volume /shared_nfs (it is the workspace volume, not a PVC).
 # One key per namespace; the value is a comma-separated list of allowed roots.
+# Both workspaces are external: every Pod in them runs on an Autopilot
+# virtual-kubelet node, whose backend refuses a seccomp profile and any
+# capability added or dropped, so virtual-kubelet.namespaces lists them and the
+# policy does not require either there (see sandbox-pod-guardrails.yaml).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,3 +16,20 @@ metadata:
 data:
   crusoe-spur-vk: /shared_nfs
   top-models: /shared_nfs
+  virtual-kubelet.namespaces: crusoe-spur-vk,top-models
+---
+# The binding of sandbox-pod-guardrails on this cluster (see sandbox-pod-guardrails.yaml).
+# Warn only: violations are warnings, nothing is refused.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: sandbox-pod-guardrails
+  labels:
+    app.kubernetes.io/part-of: agent-sandbox
+spec:
+  policyName: sandbox-pod-guardrails
+  paramRef:
+    name: sandbox-pod-guardrails
+    namespace: kube-system
+    parameterNotFoundAction: Deny
+  validationActions: [Audit, Warn]
