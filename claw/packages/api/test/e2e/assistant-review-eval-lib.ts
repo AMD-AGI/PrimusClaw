@@ -19,7 +19,7 @@ import { parseItemRef } from "../../src/assistant/item-ref.js";
 import { createAssistantMcpServer } from "../../src/assistant/mcp.js";
 import { renderReviewContext, renderRouterSystem, WORK_EVENT_PREFIX } from "../../src/assistant/prompts.js";
 import {
-  approvalCommand, confirmationRef, mentionsNumber, modelGrounded, parsePrs, prGrounded, repoGrounded, typedActionCommand,
+  approvalCommand, confirmationRef, mentionsNumber, mergeGrounded, modelGrounded, parsePrs, prGrounded, repoGrounded, typedActionCommand,
 } from "../../src/assistant/review-tools.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
 import type { Block, Llm, Message, ModelResponse, ToolSchema } from "./assistant-router-eval-lib.js";
@@ -103,6 +103,7 @@ export function standIn(c: ReviewEvalCase) {
           if (!KNOWN_REPOS.has(`${pr.owner}/${pr.repo}`.toLowerCase())) return refuse("pr_check_failed", "github_not_found: no such repository");
         }
         if (input.model && !modelGrounded(text, input.model)) return refuse("model_not_in_message");
+        if (input.merge && !mergeGrounded(text)) return refuse("merge_not_in_message");
         if (input.reviewer && input.reviewer !== SELF) {
           const person = (c.people ?? []).find((p) => p.user_id === input.reviewer);
           if (!person) return refuse("reviewer_not_in_message");
@@ -119,6 +120,7 @@ export function standIn(c: ReviewEvalCase) {
         const reviews = items.filter((i) => i.review);
         if (!mentionsNumber(text, n) && !text.includes(`#${item.seq}`) && reviews.length !== 1) return { ...refuse("item_not_in_message"), item: seq ?? undefined };
         if (input.model && !modelGrounded(text, input.model)) return { ...refuse("model_not_in_message"), item: item.seq };
+        if (input.merge === true && !mergeGrounded(text)) return { ...refuse("merge_not_in_message"), item: item.seq };
         return { ...ok({ item: { item_id: "kwi_evalnew", seq: 60 } }), item: item.seq };
       }
       case "confirmation_answer": {

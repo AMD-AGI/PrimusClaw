@@ -164,6 +164,17 @@ export function modelGrounded(text: string, model: string): boolean {
   return lower(model).split(/[^a-z0-9]+/).some((part) => /^[a-z][a-z0-9]{2,}$/.test(part) && t.includes(part));
 }
 
+/**
+ * Whether the user's message asks for a merge at all: one of the words the router's prompt reads as a merge (合入, 合并, 合进, 审完合,
+ * merge). A necessary condition, like a model's name: the router still decides, but a message without one never makes a review that
+ * merges, whatever the item list or a page the router read says the user wants.
+ */
+export function mergeGrounded(text: string): boolean {
+  return /合入|合并|合进|审完合|merge/i.test(text);
+}
+
+const MERGE_NOT_ASKED = "the user did not ask to merge: pass merge=false unless their message asks for it (合入, 合并, merge)";
+
 /** The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased. */
 export function fullRefsIn(text: string): string[] {
   const out: string[] = [];
@@ -235,6 +246,7 @@ export async function reviewStart(
     if (args.model && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out unless they named one");
     }
+    if (args.merge && !mergeGrounded(message.content)) refuseUngrounded("merge_not_in_message", MERGE_NOT_ASKED);
     const signedIn = await requesterSignedIn(q, claims.sid, userId, message, via);
     if (!args.reviewer || args.reviewer === userId) return { userId, signedIn, actingAs: userId, actingAsName: undefined };
     const reviewer = lower(args.reviewer);
@@ -357,6 +369,7 @@ export async function reviewRestart(
     if (args.model && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out to keep the one it had");
     }
+    if (args.merge === true && !mergeGrounded(message.content)) refuseUngrounded("merge_not_in_message", MERGE_NOT_ASKED);
     return { userId, itemId: item.item_id, signedIn: await requesterSignedIn(q, claims.sid, userId, message, via) };
   });
   const restarted = await asTool(async () => reviewToolPorts.restartReview(chosen.signedIn.user, chosen.signedIn.method, chosen.itemId, parseRestartRequest({
