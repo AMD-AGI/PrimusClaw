@@ -45,7 +45,6 @@ import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { TOOL_NAME_PREFIX } from "./prompts.js";
 import { ingestReport } from "./reports.js";
 import type { AssistantTokenClaims } from "./token.js";
-import { assistantMemoryOn } from "./memory-tools.js";
 import { assertLiveRun, ToolRefused } from "./tools.js";
 import { canAccept, reopenWorkItem, resolveWorkItem, type WorkReport } from "./work-items.js";
 
@@ -235,14 +234,8 @@ export async function subscribeItem(input: SubscribeInput): Promise<Subscription
     )).rows[0] as Record<string, any> | undefined;
     if (existing) {
       if (input.reply === undefined || input.reply === existing.reply_allowed) return { ...subscriptionView(existing), created: false };
-      // Allowed now: the run under way may have been shown the user's whole memory, so only the next one answers (`prReply`).
-      // The item's row is locked above, so no run starts between reading its generation and this write.
       const updated = (await query(
-        `UPDATE claw_work_item_subscriptions
-            SET reply_allowed = $2,
-                reply_since_gen = CASE WHEN $2 THEN (SELECT generation FROM claw_work_items WHERE item_id = $3) ELSE reply_since_gen END
-          WHERE id = $1 RETURNING *`,
-        [existing.id, input.reply, found.item.item_id],
+        "UPDATE claw_work_item_subscriptions SET reply_allowed = $2 WHERE id = $1 RETURNING *", [existing.id, input.reply],
       )).rows[0] as Record<string, any>;
       return { ...subscriptionView(updated), created: false };
     }
@@ -253,9 +246,8 @@ export async function subscribeItem(input: SubscribeInput): Promise<Subscription
       throw new SubscriptionRefused(409, "too_many_subscriptions", `at most ${CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS} pull requests can be watched at once`);
     }
     const row = (await query(
-      `INSERT INTO claw_work_item_subscriptions (item_id, user_id, owner, repo, number, reply_allowed, reply_since_gen, since, cursor_at)
-       VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $6 THEN (SELECT generation FROM claw_work_items WHERE item_id = $1) END,
-               NOW() - make_interval(secs => $7::int), NOW() - make_interval(secs => $7::int))
+      `INSERT INTO claw_work_item_subscriptions (item_id, user_id, owner, repo, number, reply_allowed, since, cursor_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW() - make_interval(secs => $7::int), NOW() - make_interval(secs => $7::int))
        RETURNING *`,
       [found.item.item_id, input.userId, ref.owner, ref.repo, ref.number, input.reply === true, SINCE_MARGIN_SEC],
     )).rows[0] as Record<string, any>;
@@ -1006,19 +998,12 @@ export function storedValueIn(text: string, vault: Record<string, string>): stri
 }
 
 /**
- * Whether this run started no later than answers were allowed, while the assistant has the user's memory: such a run was set up
- * before its item could answer unasked, so it may have been shown the user's whole memory index or recalled entries beyond its
- * item (`memory-tools.ts`), and nothing it holds may be posted unasked. A later run is shown only what is bound to the item.
- * Allowed before this was recorded (null): no run since has been shown more than that.
+ * The item's worker has been shown the user's memory beyond the item (`memory-tools.ts`), and its session keeps what it read from
+ * run to run: nothing of it may be posted where strangers asked for it, so this item answers only by asking the user.
  */
-function startedBeforeReplies(gen: number | undefined, replySinceGen: number | null): boolean {
-  if (!assistantMemoryOn() || replySinceGen === null || replySinceGen === undefined) return false;
-  return gen === undefined || gen <= Number(replySinceGen);
-}
-
-const replyAllowedMidRun = (): ToolRefused => new ToolRefused(
-  "reply_not_allowed_yet",
-  "answers without asking were allowed after this run started, so this run cannot post them; use the github tools, which ask the user. The next run can answer",
+const memoryReachedRefusal = (): ToolRefused => new ToolRefused(
+  "memory_reached",
+  "this item's worker has read the user's memory beyond this item, so it cannot answer on GitHub without asking; use the github tools, which ask the user",
 );
 
 /** Statuses after which GitHub certainly did not write the comment. */
@@ -1043,7 +1028,7 @@ export async function prReply(
     await assertLiveRun(query, claims);
     const t = (await query(
       `SELECT e.event_id, e.kind, e.github_id, e.reply_to, e.delivered_at, s.id AS sub_id, s.owner, s.repo, s.number, s.reply_allowed, s.user_id,
-              s.reply_since_gen, w.generation, w.board_state
+              w.generation, w.board_state, w.memory_reached_at
          FROM claw_work_item_github_events e
          JOIN claw_work_item_subscriptions s ON s.id = e.sub_id
          JOIN claw_work_items w ON w.item_id = e.item_id
@@ -1051,7 +1036,7 @@ export async function prReply(
         FOR UPDATE OF w FOR SHARE OF s`,
       [eventId, claims.item_id],
     )).rows[0] as (ReplyTarget & {
-      delivered_at: Date | null; reply_allowed: boolean; reply_since_gen: number | null; generation: number; board_state: string;
+      delivered_at: Date | null; reply_allowed: boolean; generation: number; board_state: string; memory_reached_at: Date | null;
     }) | undefined;
     if (!t || !t.delivered_at) throw new ToolRefused("event_not_found", "no such event on this item: use an event_id from a [github_event] message");
     if (t.board_state === "done") throw new ToolRefused("item_closed", "this item is finished or stopped");
@@ -1062,7 +1047,7 @@ export async function prReply(
     if (!t.reply_allowed) {
       throw new ToolRefused("reply_not_allowed", "the user has not allowed answers on this pull request without asking; use the github tools, which ask them");
     }
-    if (startedBeforeReplies(claims.gen, t.reply_since_gen)) throw replyAllowedMidRun();
+    if (t.memory_reached_at) throw memoryReachedRefusal();
     const prior = (await query(
       "SELECT state, url, created_at, attempt_at > NOW() - make_interval(secs => $2::int) AS leased FROM claw_work_item_pr_replies WHERE event_id = $1 FOR UPDATE",
       [eventId, REPLY_LEASE_SEC],
@@ -1107,15 +1092,16 @@ export async function prReply(
   // Asked again right before GitHub is: the permission may have been taken back while the token and the vault were read. What is left
   // is the post itself, which nothing can call back once it is sent.
   const still = (await db.query(
-    "SELECT reply_allowed AS ok, reply_since_gen FROM claw_work_item_subscriptions WHERE id = $1", [target.sub_id],
-  )).rows[0] as { ok: boolean; reply_since_gen: number | null } | undefined;
+    `SELECT s.reply_allowed AS ok, w.memory_reached_at FROM claw_work_item_subscriptions s
+       JOIN claw_work_items w ON w.item_id = s.item_id WHERE s.id = $1`, [target.sub_id],
+  )).rows[0] as { ok: boolean; memory_reached_at: Date | null } | undefined;
   if (!still?.ok) {
     if (!retry) await release();
     throw new ToolRefused("reply_not_allowed", "the user has taken back answers on this pull request without asking; use the github tools, which ask them");
   }
-  if (startedBeforeReplies(claims.gen, still.reply_since_gen)) {
+  if (still.memory_reached_at) {
     if (!retry) await release();
-    throw replyAllowedMidRun();
+    throw memoryReachedRefusal();
   }
   const gh = github(token);
   try {

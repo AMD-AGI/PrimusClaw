@@ -37,9 +37,10 @@ record it.
   `memory: "off"`. A task item's worker is shown a read-only index and may only recall; a review item's session is shown
   only the entries bound to its item, and so is a task item's worker while any of its pull request subscriptions allows
   answers without asking (`reply_allowed`): no index in its prompt, and `memory_recall`, asked again on every call,
-  reaches only entries bound to its item. A run that was already under way when answers were allowed may have been shown
-  more, so `pr_reply` refuses it (`reply_not_allowed_yet`) and the item's next run answers
-  (`claw_work_item_subscriptions.reply_since_gen`, a new column required at start-up). An entry can be bound to one work item (`claw_memory_entries.work_item_id`, a new
+  reaches only entries bound to its item. A worker's session keeps what it read from run to run, so once
+  an item's worker has been shown the index or recalled an entry beyond its item, `pr_reply` refuses that item for good
+  (`memory_reached`; it answers by asking, through the github tools) (`claw_work_items.memory_reached_at`, a new column
+  required at start-up). An entry can be bound to one work item (`claw_memory_entries.work_item_id`, a new
   column required at start-up); bound entries are left out of the chat's catalogue, and a save is checked for a duplicate
   or a near one only against entries of the same binding. Workers started from a session marked `memory: "off"` are
   marked so too, and an assistant's watcher of a group or a repository is never served the chat's memory. The chat's

@@ -65,6 +65,9 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   // state is read off what it did (`review-items.ts`). `params` is what a review was asked with.
   await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'task'");
   await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS params JSONB NOT NULL DEFAULT '{}'::jsonb");
+  // When the item's worker was first shown the user's memory beyond the item (the index, or an entry recalled): its session
+  // keeps what it read from run to run, so from then on it never answers on GitHub without asking (`memory-tools.ts`).
+  await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS memory_reached_at TIMESTAMPTZ");
   // One open review of a pull request at a time, whoever asked: two sessions reviewing it could both write to it.
   // GitHub's names are not case sensitive, and neither is this.
   await client.query(
@@ -137,9 +140,6 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
       number           INT NOT NULL,
       -- Whether the worker may answer on the pull request as the owner without asking: only the owner, signed in, turns it on.
       reply_allowed    BOOLEAN NOT NULL DEFAULT FALSE,
-      -- The item's run generation when answers were last allowed: a run of that generation or earlier may have been shown
-      -- the user's whole memory index (memory-tools.ts), so only a later run answers unasked while memory is on.
-      reply_since_gen  INT,
       -- active | ended
       state            TEXT NOT NULL DEFAULT 'active',
       -- item_closed | pr_merged | pr_closed | user
@@ -162,7 +162,6 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_subscriptions_active
        ON claw_work_item_subscriptions(item_id, lower(owner), lower(repo), number) WHERE state = 'active'`,
   );
-  await client.query("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS reply_since_gen INT");
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_work_item_subscriptions_due ON claw_work_item_subscriptions(polled_at) WHERE state = 'active'",
   );

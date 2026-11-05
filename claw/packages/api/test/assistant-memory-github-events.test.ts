@@ -9,10 +9,13 @@
  * A worker that may answer on its pull request without asking (`pr_reply`) reads what strangers write there, so nothing of the
  * user's memory beyond its item may be in reach of an answer:
  *
- *   C1  answers allowed before the run: its prompt has only the item's entries, and it answers
- *   C2  answers allowed during a run that was shown the whole index (and recalled an entry beyond its item): that run cannot
- *       answer, and cannot recall that entry again; the next run is shown only the item's entries, and answers
- *   C3  answers taken back and allowed again during a run: that run cannot answer
+ *   C1  answers allowed before the first run: its prompt has only the item's entries, and it answers
+ *   C2  answers allowed after a run was shown the whole index (and recalled an entry beyond its item): that run cannot answer,
+ *       and cannot recall that entry again; nor can any later run of the item, whose session keeps what was read, though its
+ *       prompt has only the item's entries
+ *   C3  answers taken back during a run, an entry beyond the item recalled, and answers allowed again: the item cannot answer
+ *   C4  a worker never shown more than its item's entries answers once answers are allowed, during its run or after it
+ *   C5  shown the index and nothing recalled is shown all the same: the item cannot answer
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -106,7 +109,7 @@ describe("assistant memory with GitHub answers", { skip }, () => {
 
   const shows = (prompt: string, id: number, title: string) => prompt.includes(`#${id} ${title}`);
 
-  test("C1 answers allowed before the run: the prompt has only the item's entries, and the run answers", async () => {
+  test("C1 answers allowed before the first run: the prompt has only the item's entries, and the run answers", async () => {
     const item = await w.createItem(alice, "Watch PR 7");
     const general = await stored("私人：家里的地址");
     const bound = await stored("PR 7 用英文答复", item.itemId);
@@ -119,7 +122,7 @@ describe("assistant memory with GitHub answers", { skip }, () => {
     assert.equal(posts.length, 1);
   });
 
-  test("C2 answers allowed during a run that was shown the whole index: that run cannot answer; the next one can", async () => {
+  test("C2 answers allowed after a run was shown the whole index: neither that run nor a later one answers", async () => {
     const item = await w.createItem(alice, "Watch PR 7");
     const general = await stored("私人：家里的地址");
     const sub = await ev.subscribeItem({ userId: "alice", item: item.itemId, pr: PR_REF, reply: false });
@@ -129,20 +132,21 @@ describe("assistant memory with GitHub answers", { skip }, () => {
 
     await ev.subscribeItem({ userId: "alice", item: item.itemId, pr: PR_REF, reply: true });
     const event = await delivered(item.itemId, sub.sub_id);
-    assert.equal(await code(ev.prReply(first.claims, { event_id: event, body: "私人：家里的地址" })), "reply_not_allowed_yet");
-    assert.equal(await code(ev.prReply(first.claims, { event_id: event, body: "anything" })), "reply_not_allowed_yet");
+    assert.equal(await code(ev.prReply(first.claims, { event_id: event, body: "私人：家里的地址" })), "memory_reached");
+    assert.equal(await code(ev.prReply(first.claims, { event_id: event, body: "anything" })), "memory_reached");
     assert.equal(posts.length, 0);
     assert.equal(Number((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_item_pr_replies"))[0].n), 0, "nothing claimed");
     assert.equal((await mt.memoryRecall(first.claims, { id: String(general) })).ok, false, "and no more of it is read");
     await w.closeRun(first.claims.task_id);
 
+    // The session the next run continues still holds what the first one recalled.
     const next = await run(item);
     assert.ok(!next.prompt.includes("家里的地址"), next.prompt);
-    assert.equal((await ev.prReply(next.claims, { event_id: event, body: "Answered." })).status, "posted");
-    assert.deepEqual(posts.map((p) => p.split("\n")[0]), ["Answered."]);
+    assert.equal(await code(ev.prReply(next.claims, { event_id: event, body: "私人：家里的地址" })), "memory_reached");
+    assert.equal(posts.length, 0);
   });
 
-  test("C3 answers taken back and allowed again during a run: that run cannot answer", async () => {
+  test("C3 answers taken back during a run, an entry beyond the item recalled, and allowed again: the item cannot answer", async () => {
     const item = await w.createItem(alice, "Watch PR 7");
     const general = await stored("私人：家里的地址");
     const sub = await ev.subscribeItem({ userId: "alice", item: item.itemId, pr: PR_REF, reply: true });
@@ -150,7 +154,35 @@ describe("assistant memory with GitHub answers", { skip }, () => {
     await ev.subscribeItem({ userId: "alice", item: item.itemId, pr: PR_REF, reply: false });
     assert.equal(((await mt.memoryRecall(r.claims, { id: String(general) })).entry as { body: string }).body, "私人：家里的地址");
     await ev.subscribeItem({ userId: "alice", item: item.itemId, pr: PR_REF, reply: true });
-    assert.equal(await code(ev.prReply(r.claims, { event_id: await delivered(item.itemId, sub.sub_id), body: "私人：家里的地址" })), "reply_not_allowed_yet");
+    assert.equal(await code(ev.prReply(r.claims, { event_id: await delivered(item.itemId, sub.sub_id), body: "私人：家里的地址" })), "memory_reached");
+    assert.equal(posts.length, 0);
+  });
+
+  test("C4 a worker never shown more than its item's entries answers once answers are allowed", async () => {
+    const item = await w.createItem(alice, "Watch PR 7");
+    const other = await w.createItem(alice, "Another");
+    const bound = await stored("PR 7 用英文答复", item.itemId);
+    await stored("另一个事项的事", other.itemId);
+    const sub = await ev.subscribeItem({ userId: "alice", item: item.itemId, pr: PR_REF, reply: false });
+    const r = await run(item);
+    assert.ok(r.prompt.includes(`#${bound} PR 7 用英文答复`) && !r.prompt.includes("另一个事项"), r.prompt);
+    assert.equal(((await mt.memoryRecall(r.claims, { id: String(bound) })).entry as { body: string }).body, "PR 7 用英文答复");
+    assert.equal(((await mt.memoryRecall(r.claims, { query: "答复" })).entries as unknown[]).length, 1);
+    await ev.subscribeItem({ userId: "alice", item: item.itemId, pr: PR_REF, reply: true });
+    assert.equal((await ev.prReply(r.claims, { event_id: await delivered(item.itemId, sub.sub_id), body: "Answered." })).status, "posted");
+    await w.closeRun(r.claims.task_id);
+    const next = await run(item);
+    assert.equal((await ev.prReply(next.claims, { event_id: await delivered(item.itemId, sub.sub_id), body: "Again." })).status, "posted");
+    assert.equal(posts.length, 2);
+  });
+  test("C5 shown the index and nothing recalled is shown all the same: the item cannot answer", async () => {
+    const item = await w.createItem(alice, "Watch PR 7");
+    const general = await stored("私人：家里的地址");
+    const sub = await ev.subscribeItem({ userId: "alice", item: item.itemId, pr: PR_REF, reply: false });
+    const r = await run(item);
+    assert.ok(shows(r.prompt, general, "私人：家里的地址"), r.prompt);
+    await ev.subscribeItem({ userId: "alice", item: item.itemId, pr: PR_REF, reply: true });
+    assert.equal(await code(ev.prReply(r.claims, { event_id: await delivered(item.itemId, sub.sub_id), body: "私人：家里的地址" })), "memory_reached");
     assert.equal(posts.length, 0);
   });
 });

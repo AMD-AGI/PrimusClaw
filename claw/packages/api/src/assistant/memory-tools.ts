@@ -19,7 +19,8 @@
  * Reading is not acting for anyone: the router recalls in any live turn, a task item's worker is shown a read-only index
  * and may recall, and a review item's session is shown only what the person bound to that item. A task item's worker that
  * may answer on a pull request without asking (`itemPostsUnasked`) is shown and may recall only what is bound to its item:
- * what it reads, a comment on that pull request can ask it to post there.
+ * what it reads, a comment on that pull request can ask it to post there. And a worker's session keeps what it read from run
+ * to run, so a worker that was ever shown more than its item's entries (`memoryReached`) never answers unasked (`prReply`).
  */
 import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_MEMORY_TOOLS } from "../config.js";
@@ -187,6 +188,15 @@ export async function itemPostsUnasked(q: Querier, itemId: string): Promise<bool
 }
 
 /**
+ * Written before the worker is shown anything of the user's memory beyond its item (the index, or a recalled entry that is not
+ * bound to it): the session keeps what it read, so from then on the item never answers on GitHub without asking (`prReply`).
+ * A failed write shows nothing: it throws.
+ */
+async function memoryReached(itemId: string): Promise<void> {
+  await db.query("UPDATE claw_work_items SET memory_reached_at = COALESCE(memory_reached_at, NOW()) WHERE item_id = $1", [itemId]);
+}
+
+/**
  * Read the user's memory: one entry by number, a search, or every entry one line each. Any live turn of the assistant's,
  * in a session where their memory is kept. A worker reads what holds everywhere and what is bound to its own item, never
  * another item's: that is what it is shown, and recall must not reach further.
@@ -206,14 +216,19 @@ export async function memoryRecall(
   const note = boundOnly
     ? { note: "this item may answer on its pull request without asking the user, so only what the user bound to this item can be read here" }
     : {};
+  // What a worker is about to read beyond its item is recorded first (`memoryReached`).
+  const reading = async (rows: MemoryRow[]): Promise<MemoryRow[]> => {
+    if (item !== undefined && rows.some((r) => r.work_item_id !== item)) await memoryReached(item);
+    return rows;
+  };
   if (args.id !== undefined && args.id !== null && args.id !== "") {
-    const rows = await recallMemory(userId, { id: entryId(args.id), item, boundOnly });
+    const rows = await reading(await recallMemory(userId, { id: entryId(args.id), item, boundOnly }));
     return rows.length ? { ok: true, entry: full(rows[0]) } : { ok: false, error: "not_found", message: "no such entry", ...note };
   }
   const query = typeof args.query === "string" ? args.query.trim() : "";
-  if (query) return { ok: true, entries: (await recallMemory(userId, { query, item, boundOnly })).map(full), ...note };
+  if (query) return { ok: true, entries: (await reading(await recallMemory(userId, { query, item, boundOnly }))).map(full), ...note };
   // Waiting for the user's confirmation, or the profile earlier versions generated: not the model's to read (`readEntry`).
-  const rows = (await listMemories(userId)).filter((r) => r.status === "active" && r.category !== "user_profile" && visible(r));
+  const rows = await reading((await listMemories(userId)).filter((r) => r.status === "active" && r.category !== "user_profile" && visible(r)));
   return { ok: true, count: rows.length, entries: rows.map(line), ...note };
 }
 
@@ -314,6 +329,8 @@ export async function workerMemoryBlock(userId: string, itemId: string, sessionI
     const catalogue = await itemPostsUnasked((text, params) => db.query(text, params), itemId)
       ? null
       : await buildMemoryCatalogue(userId, { preamble: WORKER_MEMORY_PREAMBLE });
+    // Shown the index: recorded before it is, and a failed write shows nothing (`orNothing`).
+    if (catalogue) await memoryReached(itemId);
     const parts = [bound.length ? renderItemMemories(bound, ITEM_MEMORY_INTRO) : "", catalogue?.text ?? ""].filter(Boolean);
     return parts.length ? parts.join("\n\n") : null;
   });
