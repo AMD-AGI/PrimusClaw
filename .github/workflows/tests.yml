@@ -9,6 +9,13 @@ name: Tests
 # noticing.
 on:
   push:
+    # main and the deploy/* branches only: every other branch reaches CI as a
+    # pull request, and a push trigger there ran the whole workflow a second
+    # time on the same commit (the two runs sit in different concurrency
+    # groups, so neither cancelled the other).
+    branches:
+      - main
+      - "deploy/**"
     paths-ignore:
       - "**/*.md"
       - "docs/**"
@@ -33,17 +40,35 @@ permissions:
   contents: read
 
 jobs:
-  claw:
-    name: Claw (TypeScript)
+  # The Claw suite is ~9,000 node:test cases across five workspace packages.
+  # Run back to back in one job it took ~10 minutes, nearly all of it api and
+  # brain, and it was the last check to finish on every pull request. It is
+  # split here by package, and api and brain further by node's own
+  # --test-shard (round-robin over the sorted file list, so every file lands in
+  # exactly one shard). Each shard has its own Postgres, so the shards do not
+  # share a database either.
+  claw-shard:
+    name: Claw tests (${{ matrix.label }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `shard` is "<index>/<total>" or empty for the whole package.
+          - { label: "utils, protocol, hands", packages: "utils protocol hands", shard: "", extras: true }
+          - { label: "brain 1/2", packages: "brain", shard: "1/2", extras: false }
+          - { label: "brain 2/2", packages: "brain", shard: "2/2", extras: false }
+          - { label: "api 1/4", packages: "api", shard: "1/4", extras: false }
+          - { label: "api 2/4", packages: "api", shard: "2/4", extras: false }
+          - { label: "api 3/4", packages: "api", shard: "3/4", extras: false }
+          - { label: "api 4/4", packages: "api", shard: "4/4", extras: false }
     defaults:
       run:
         working-directory: claw
     # The doorbell concurrency suite needs two connections holding two
-    # transactions against one server, which PGlite cannot host. Both this job
-    # and claw-node-tests.yaml run the whole workspace glob, so a service on
-    # only one of them leaves the other skipping the exactly-once proof.
+    # transactions against one server, which PGlite cannot host. Every shard
+    # gets the service, so no shard skips the exactly-once proof.
     services:
       postgres:
         image: postgres:16
@@ -67,28 +92,143 @@ jobs:
 
       - run: npm ci
 
-      # Build first: `npm test` runs the sources through tsx, so a type error
-      # that only tsc catches would otherwise slip through.
+      # Build first: workspace packages resolve @claw/* through dist/index.js
+      # and tsx does not compile dependency sources on the fly; and a type
+      # error that only tsc catches would otherwise slip through.
       - run: npm run build
 
       # The test directory is outside every package's `typecheck`, so a name in
       # a stub that resolves to nothing throws a ReferenceError the surrounding
-      # seam catches -- and the test passes having asserted nothing. This is the
-      # only job that builds Claw, so it is the only place the guard can run.
+      # seam catches -- and the test passes having asserted nothing.
       - name: Tests must resolve
+        if: matrix.extras
         run: |
           bash scripts/lint-tests-must-resolve.sh --self-test
           bash scripts/lint-tests-must-resolve.sh --all
 
-      - run: npm test
+      # Runs each package's own `npm test` command with the shard flag added.
+      # A TAP copy of the results feeds the per-package counts the gate jobs
+      # below check and print.
+      - name: npm test (${{ matrix.label }})
         env:
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+          PACKAGES: ${{ matrix.packages }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -uo pipefail
+          expected='tsx --test test/*.test.ts'
+          counts="$RUNNER_TEMP/claw-counts"
+          mkdir -p "$counts"
+          rc=0
+          for pkg in $PACKAGES; do
+            script=$(node -p "require('./packages/$pkg/package.json').scripts.test")
+            if [ "$script" != "$expected" ]; then
+              echo "::error::packages/$pkg test script is '$script', not '$expected'; update tests.yml to run it"
+              exit 1
+            fi
+            tap="$RUNNER_TEMP/$pkg.tap"
+            echo "::group::@claw/$pkg ${SHARD:-(whole package)}"
+            ( cd "packages/$pkg" && npx --no-install tsx --test ${SHARD:+--test-shard=$SHARD} \
+                --test-reporter=spec --test-reporter-destination=stdout \
+                --test-reporter=tap --test-reporter-destination="$tap" \
+                test/*.test.ts ) || rc=1
+            echo "::endgroup::"
+            tag="${SHARD:-1/1}"
+            PKG="$pkg" SHARD_TAG="$tag" TAP="$tap" OUT="$counts/$pkg-${tag/\//of}.json" node -e '
+              const fs = require("fs");
+              const tap = fs.existsSync(process.env.TAP) ? fs.readFileSync(process.env.TAP, "utf8") : "";
+              const n = (k) => { const m = [...tap.matchAll(new RegExp("^# " + k + " (\\d+)$", "gm"))].pop(); return m ? Number(m[1]) : null; };
+              const r = { package: process.env.PKG, shard: process.env.SHARD_TAG,
+                tests: n("tests"), pass: n("pass"), fail: n("fail"), cancelled: n("cancelled"),
+                skipped: n("skipped"), todo: n("todo") };
+              fs.writeFileSync(process.env.OUT, JSON.stringify(r));
+              console.log(JSON.stringify(r));
+            '
+          done
+          exit "$rc"
 
       # End-to-end smoke test over the real MCP transport: starts Hands against
       # a temporary workspace and drives it. Needs no cluster, GPU or LLM key,
       # and keeps the published example from rotting unnoticed.
       - name: Minimal demo (Hands over MCP)
+        if: matrix.extras
         run: ./examples/hands-mcp/run.sh
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: claw-counts-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/claw-counts/*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The check names the single Claw job reported before it was sharded:
+  # `Claw (TypeScript)` from this workflow and `npm test --workspaces` from
+  # claw-node-tests.yaml, which ran the identical commands against the identical
+  # service a second time. The suite now runs once; both names stay, so nothing
+  # keyed on either one goes missing. Each is green only when every shard
+  # passed and every workspace package in claw/package.json reported all of its
+  # shards with no failures.
+  claw:
+    name: ${{ matrix.check }}
+    needs: claw-shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ["Claw (TypeScript)", "npm test --workspaces"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: claw/package.json
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: claw-counts-*
+          path: counts
+          merge-multiple: true
+
+      - name: Every shard passed and every package was covered
+        env:
+          SHARDS_RESULT: ${{ needs.claw-shard.result }}
+        run: |
+          node - <<'JS'
+          const fs = require("fs");
+          const ws = JSON.parse(fs.readFileSync("claw/package.json", "utf8")).workspaces
+            .map((w) => w.replace(/^packages\//, ""));
+          const dir = "counts";
+          const rows = fs.existsSync(dir)
+            ? fs.readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(fs.readFileSync(`${dir}/${f}`, "utf8")))
+            : [];
+          const errors = [];
+          if (process.env.SHARDS_RESULT !== "success") errors.push(`claw-shard jobs: ${process.env.SHARDS_RESULT}`);
+          const keys = ["tests", "pass", "fail", "cancelled", "skipped", "todo"];
+          const table = ["| package | shards | " + keys.join(" | ") + " |", "|---|---|" + keys.map(() => "---").join("|") + "|"];
+          const total = Object.fromEntries(keys.map((k) => [k, 0]));
+          for (const pkg of ws) {
+            const mine = rows.filter((r) => r.package === pkg);
+            const totals = new Set(mine.map((r) => r.shard.split("/")[1]));
+            const n = totals.size === 1 ? Number([...totals][0]) : NaN;
+            const seen = new Set(mine.map((r) => Number(r.shard.split("/")[0])));
+            if (!(n > 0) || seen.size !== n || mine.length !== n || ![...Array(n).keys()].every((i) => seen.has(i + 1))) {
+              errors.push(`${pkg}: shards reported ${JSON.stringify(mine.map((r) => r.shard))}, not one complete set`);
+            }
+            const sum = Object.fromEntries(keys.map((k) => [k, mine.reduce((a, r) => a + (r[k] ?? NaN), 0)]));
+            if (!(sum.tests > 0)) errors.push(`${pkg}: no tests counted`);
+            if (sum.fail !== 0 || sum.cancelled !== 0) errors.push(`${pkg}: fail=${sum.fail} cancelled=${sum.cancelled}`);
+            for (const k of keys) total[k] += sum[k];
+            table.push(`| ${pkg} | ${mine.length} | ` + keys.map((k) => sum[k]).join(" | ") + " |");
+          }
+          for (const r of rows) if (!ws.includes(r.package)) errors.push(`counts for unknown package ${r.package}`);
+          table.push("| **all** | | " + keys.map((k) => total[k]).join(" | ") + " |");
+          const out = ["## Claw node:test counts", "", ...table, ""].join("\n");
+          console.log(out);
+          if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out + "\n");
+          if (errors.length) { for (const e of errors) console.log(`::error::${e}`); process.exit(1); }
+          JS
 
   connector:
     name: Connector (TypeScript)
