@@ -319,6 +319,11 @@ export interface LoopOptions {
    */
   turnPool?: TurnPool;
   /**
+   * A requested review's sub-agents run on the run's own model: what a `task` call names, and the reading default
+   * (SUB_AGENT_EXPLORE_MODEL), are not taken. The run's model is the reviewer's, and the brief the model reads is the requester's.
+   */
+  subAgentsOnRunModel?: boolean;
+  /**
    * `ExecuteRequest.withhold_sandbox_keys`: a session that acts as a user, which is a pull request review. Its second pass is a `task`
    * whose prompt names the files the review read, so a change to two skill files would trip the skill-read guard
    * (`BRAIN_BLOCK_SKILL_SUBAGENTS`) and the review could never approve: the guard does not apply to such a loop.
@@ -1832,7 +1837,9 @@ class AgentLoopRunner {
     // markers on and this reading input_tokens, a twelve-hour run would grow
     // unchecked to the 1M window and die there. The two must never ship apart.
     const promptTokens = this.promptTokensThisTurn;
-    if (this.depth === 0 && promptTokens > COMPACTION_TRIGGER_INPUT_TOKENS) {
+    // The summary is a model call as well: under a pool it takes a turn, and with none left there is no next turn to make room for.
+    if (this.depth === 0 && promptTokens > COMPACTION_TRIGGER_INPUT_TOKENS
+      && (!this.opts.turnPool || takePooledTurn(this.opts.turnPool))) {
       const before = this.workingMessages.length;
       this.compactionRound++;
       const outcome = await compactConversation(this.session, this.workingMessages, this.sessionId, this.compactionRound, turn);
@@ -2533,7 +2540,7 @@ class AgentLoopRunner {
       if (this.depth >= SUB_AGENT_MAX_DEPTH) {
         throw new Error(`sub-agent nesting limit reached (depth=${this.depth}, max=${SUB_AGENT_MAX_DEPTH})`);
         }
-      const picked = pickSubagentModel(toolInput.model, subagentType, this.model);
+      const picked = this.opts.subAgentsOnRunModel ? { model: this.model } : pickSubagentModel(toolInput.model, subagentType, this.model);
       if ("error" in picked) throw new Error(picked.error.replace(/^Error: /, ""));
       // A sub-agent gets its own router around the same sandbox, so the run
       // has to have one by now even if this turn's parent never used a tool.

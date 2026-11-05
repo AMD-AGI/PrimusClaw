@@ -62,3 +62,21 @@ test("the pool hands out exactly what it holds", () => {
   assert.deepEqual([takePooledTurn(pool), takePooledTurn(pool), takePooledTurn(pool)], [true, true, false]);
   assert.deepEqual(pool, { left: 0, used: 2 });
 });
+
+test("the engine hands a requested review's pool to the runner, which reports it on a stop or a failure; an ordinary run has none", async () => {
+  const seen: Array<{ left: number; used: number }> = [];
+  const runWith = async (over: Record<string, unknown>) => {
+    world.script(script());
+    const out = await new AgentEngine().execute(
+      baseRequest({ session_id: uniqueSession(), sub_agent_max_turns: 20, ...over }),
+      (async () => {}) as never, undefined, null as never,
+      { attachHands: async () => fakeHands() as never, onTurnPool: (p: { left: number; used: number }) => seen.push(p) } as never,
+    ) as { turns: number };
+    return out.turns;
+  };
+  const turns = await runWith({ sandbox_profile: "review", max_turns: 50 });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].used, turns, "the pool the runner holds is the one the run drew from");
+  await runWith({ max_turns: 4 });
+  assert.equal(seen.length, 1, "no pool for an ordinary run");
+});

@@ -8,7 +8,7 @@ import path from "node:path";
 import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
 import { filterToolSchemas, parseToolAllowlist } from "../tools/allowlist.js";
-import { agentLoop } from "./agent-loop.js";
+import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
 import { loadRules } from "./rules.js";
@@ -564,6 +564,8 @@ export class AgentEngine {
       //    Turn budget: request.max_turns (per-task override) → MAX_TURNS env → default.
       //    0 or negative disables the cap in agent-loop.
       const maxTurns = request.max_turns ?? MAX_TURNS;
+      const turnPool: TurnPool | undefined = isReviewProfile(request) ? { left: maxTurns, used: 0 } : undefined;
+      if (turnPool) extras?.onTurnPool?.(turnPool);
       logger.info({
         sessionId,
         maxTurns,
@@ -584,7 +586,9 @@ export class AgentEngine {
           ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),
           ...(request.withhold_sandbox_keys ? { actingReview: true } : {}),
           // A requested review's sub-agents take their turns from its budget, and are charged with it (`TurnPool`).
-          ...(isReviewProfile(request) ? { turnPool: { left: maxTurns, used: 0 } } : {}),
+          // Its sub-agents run on its own model (`subAgentsOnRunModel`), and the runner sees the pool, so a run stopped or failed midway
+          // is charged what it took (`TaskRunner` `reportedTurns`).
+          ...(turnPool ? { turnPool, subAgentsOnRunModel: true } : {}),
           apiUrl,
           apiKey,
           maxTurns,

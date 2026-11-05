@@ -13,6 +13,7 @@ import {
   type HandsRecoveryAllowance,
   type RecreateHandsResult,
 } from "../agent/index.js";
+import type { TurnPool } from "../agent/agent-loop.js";
 import type { NatsEmitter } from "../events/emitter.js";
 import {
   HandsClient, isHandsNetworkError,
@@ -1129,6 +1130,15 @@ class TaskRunner {
 
   // Mutable checkpoint state (updated by onCheckpoint callback).
   private latestCheckpointState: CheckpointState | null = null;
+  /** A requested review's turn pool, handed over by the engine (`ExecuteExtras.onTurnPool`). */
+  private turnPool: TurnPool | null = null;
+  /**
+   * The turns an interrupted or failed run reports: its checkpoint's, or under a review's pool what the pool gave if that is more. A
+   * checkpoint counts the parent's finished turns only, so a run stopped inside a `task` would otherwise not be charged its sub-agents'.
+   */
+  private reportedTurns(ckptTurns: number): number {
+    return this.turnPool ? Math.max(ckptTurns, this.turnPool.used) : ckptTurns;
+  }
   /**
    * What the run had done as of the last thing that recorded it, which is what
    * every terminal path reports.
@@ -3005,6 +3015,7 @@ class TaskRunner {
           attachHands: this.attachHands,
           runIdentity: this.runIdentity,
           natsConnection: getDeps().emitter.nc,
+          onTurnPool: (pool) => { this.turnPool = pool; },
         });
       }
     } finally {
@@ -3667,7 +3678,7 @@ class TaskRunner {
     // Once, so the two sinks below cannot disagree by however long the first
     // of them takes.
     const elapsedMs = this.elapsedMsForRun();
-    const turnsCompleted = ckptState?.turns_completed ?? 0;
+    const turnsCompleted = this.reportedTurns(ckptState?.turns_completed ?? 0);
     // Bound once and shared by the three sinks below -- the event, the DAG
     // callback and the S3 transcript. Spelling the same mapping out at each of
     // them is how they came to disagree in the first place.
@@ -3974,7 +3985,7 @@ class TaskRunner {
       total_calls: ckptStateF?.total_tool_calls ?? 0,
       error_calls: ckptStateF?.error_count ?? 0,
     };
-    const partialTurns = ckptStateF?.turns_completed ?? 0;
+    const partialTurns = this.reportedTurns(ckptStateF?.turns_completed ?? 0);
     // The same rule the interrupt path reports on, for the same reason: a
     // failure is by definition inside the turn after the last checkpoint, so
     // the checkpoint's own clock cannot see the part of the run that was still
