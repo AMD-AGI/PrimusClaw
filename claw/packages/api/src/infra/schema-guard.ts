@@ -254,7 +254,7 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     // What the GitHub event loop claims and advances: absent, nothing an item watches is read.
     onlyWhenAssistant: true,
     columns: [
-      "id", "item_id", "user_id", "owner", "repo", "number", "reply_allowed", "state", "end_reason", "since", "cursor_at",
+      "id", "item_id", "user_id", "owner", "repo", "number", "reply_allowed", "reply_since_gen", "state", "end_reason", "since", "cursor_at",
       "polled_at", "last_error", "failing_since", "failure_reported", "trust_reported", "created_at", "ended_at",
     ],
   },

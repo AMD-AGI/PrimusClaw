@@ -137,6 +137,9 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
       number           INT NOT NULL,
       -- Whether the worker may answer on the pull request as the owner without asking: only the owner, signed in, turns it on.
       reply_allowed    BOOLEAN NOT NULL DEFAULT FALSE,
+      -- The item's run generation when answers were last allowed: a run of that generation or earlier may have been shown
+      -- the user's whole memory index (memory-tools.ts), so only a later run answers unasked while memory is on.
+      reply_since_gen  INT,
       -- active | ended
       state            TEXT NOT NULL DEFAULT 'active',
       -- item_closed | pr_merged | pr_closed | user
@@ -159,6 +162,7 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_subscriptions_active
        ON claw_work_item_subscriptions(item_id, lower(owner), lower(repo), number) WHERE state = 'active'`,
   );
+  await client.query("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS reply_since_gen INT");
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_work_item_subscriptions_due ON claw_work_item_subscriptions(polled_at) WHERE state = 'active'",
   );
