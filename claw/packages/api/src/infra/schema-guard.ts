@@ -250,6 +250,28 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["say_id", "user_id", "item_id", "item_attention_seq", "text", "fallback", "created_at", "delivered_at"],
   },
   {
+    table: "claw_work_item_subscriptions",
+    // What the GitHub event loop claims and advances: absent, nothing an item watches is read.
+    onlyWhenAssistant: true,
+    columns: [
+      "id", "item_id", "user_id", "owner", "repo", "number", "reply_allowed", "state", "end_reason", "since", "cursor_at",
+      "polled_at", "last_error", "failing_since", "failure_reported", "trust_reported", "created_at", "ended_at",
+    ],
+  },
+  {
+    table: "claw_work_item_github_events",
+    onlyWhenAssistant: true,
+    columns: [
+      "event_id", "sub_id", "item_id", "kind", "github_id", "author", "url", "body", "path", "line", "reply_to", "head_sha", "occurred_at",
+      "created_at", "delivered_at", "delivery_key", "tried_at", "dropped_at", "drop_reason",
+    ],
+  },
+  {
+    table: "claw_work_item_pr_replies",
+    onlyWhenAssistant: true,
+    columns: ["event_id", "item_id", "sub_id", "run_id", "generation", "body", "state", "attempt_at", "attempt", "url", "comment_id", "created_at", "posted_at"],
+  },
+  {
     table: "claw_assistant_scopes",
     // What makes a session an observer, whose every tool only records: absent, the role lookup fails and so does the turn.
     onlyWhenAssistant: true,

@@ -125,6 +125,101 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
        ON claw_assistant_says(item_id, item_attention_seq) WHERE fallback`,
   );
 
+  // GitHub events for work items (`github-events.ts`): which pull request an item watches, what was seen on it,
+  // and what the item's worker answered. Used only while CLAW_ASSISTANT_GITHUB_EVENTS is on.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_work_item_subscriptions (
+      id               BIGSERIAL PRIMARY KEY,
+      item_id          TEXT NOT NULL,
+      user_id          TEXT NOT NULL,
+      owner            TEXT NOT NULL,
+      repo             TEXT NOT NULL,
+      number           INT NOT NULL,
+      -- Whether the worker may answer on the pull request as the owner without asking: only the owner, signed in, turns it on.
+      reply_allowed    BOOLEAN NOT NULL DEFAULT FALSE,
+      -- active | ended
+      state            TEXT NOT NULL DEFAULT 'active',
+      -- item_closed | pr_merged | pr_closed | user
+      end_reason       TEXT,
+      -- Nothing created before this is an event: the subscription's start, less a margin for the two clocks.
+      since            TIMESTAMPTZ NOT NULL,
+      -- Where the next read of comments starts (GitHub's 'since', which is by update time).
+      cursor_at        TIMESTAMPTZ NOT NULL,
+      polled_at        TIMESTAMPTZ,
+      last_error       TEXT,
+      failing_since    TIMESTAMPTZ,
+      failure_reported BOOLEAN NOT NULL DEFAULT FALSE,
+      -- The owner was told that comments by others are held back because their token cannot see who may write to the repository.
+      trust_reported   BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ended_at         TIMESTAMPTZ
+    )
+  `);
+  await client.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_subscriptions_active
+       ON claw_work_item_subscriptions(item_id, lower(owner), lower(repo), number) WHERE state = 'active'`,
+  );
+  await client.query(
+    "CREATE INDEX IF NOT EXISTS idx_work_item_subscriptions_due ON claw_work_item_subscriptions(polled_at) WHERE state = 'active'",
+  );
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_work_item_github_events (
+      -- gh:<subscription>:<kind>:<GitHub's id>: the same comment read twice is the same row.
+      event_id      TEXT PRIMARY KEY,
+      sub_id        BIGINT NOT NULL,
+      item_id       TEXT NOT NULL,
+      -- issue_comment | review | review_comment | check_failed | pr_closed
+      kind          TEXT NOT NULL,
+      github_id     TEXT NOT NULL,
+      author        TEXT,
+      url           TEXT,
+      body          TEXT,
+      path          TEXT,
+      line          INT,
+      -- A review comment's thread: the comment a reply goes under (GitHub takes no reply to a reply).
+      reply_to      TEXT,
+      head_sha      TEXT,
+      occurred_at   TIMESTAMPTZ,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      -- Set with the worker's queued message, in the same transaction.
+      delivered_at  TIMESTAMPTZ,
+      delivery_key  TEXT,
+      -- The last time a delivery could not be queued (the worker's session gone, say): such items go to the back of the line.
+      tried_at      TIMESTAMPTZ,
+      dropped_at    TIMESTAMPTZ,
+      drop_reason   TEXT
+    )
+  `);
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_work_item_github_events_undelivered
+       ON claw_work_item_github_events(item_id, created_at) WHERE delivered_at IS NULL AND dropped_at IS NULL`,
+  );
+  // Comments held back for an author the owner's token may not check: the poll asks whether the owner was told about them.
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_work_item_github_events_unverifiable
+       ON claw_work_item_github_events(sub_id) WHERE drop_reason = 'author_unverifiable'`,
+  );
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_work_item_pr_replies (
+      -- One answer per event, whatever replays it.
+      event_id    TEXT PRIMARY KEY,
+      item_id     TEXT NOT NULL,
+      sub_id      BIGINT NOT NULL,
+      run_id      TEXT NOT NULL,
+      generation  INT NOT NULL,
+      body        TEXT NOT NULL,
+      -- posting (written before GitHub is asked) | posted
+      state       TEXT NOT NULL,
+      attempt_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      -- Which try holds the row: only that try may give it back.
+      attempt     INT NOT NULL DEFAULT 1,
+      url         TEXT,
+      -- GitHub's id for the posted comment.
+      comment_id  TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      posted_at   TIMESTAMPTZ
+    )
+  `);
   // What a router turn may act on: the user's message it answers, as received, with how the request that carried
   // it was authenticated. Written in the transaction that accepts the message, keyed by the id of the turn that
   // will carry it, so a turn can never read a message it does not answer. A report the server queued has no row.

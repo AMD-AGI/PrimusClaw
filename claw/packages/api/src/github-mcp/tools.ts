@@ -25,6 +25,16 @@ export const READ_TOOLS = [
   "issue_get", "issue_list", "review_threads_list", "code_search",
 ] as const;
 
+/**
+ * What every comment these tools write ends with: a mark, invisible on GitHub, that the comment was written from Claw. A pull request an
+ * item watches (`assistant/github-events.ts`) is read with the same account, and a comment of that account carrying the mark is Claw's
+ * own words, not the owner's: delivering it to the worker would wake it on its own answer. Only the account can write as itself, so a
+ * stranger who copies the mark changes nothing.
+ */
+export const CLAW_WRITE_MARK = "<!-- claw:github-tool -->";
+const COMMENT_MAX = 65_536 - CLAW_WRITE_MARK.length - 2;
+const marked = (body: string): string => `${body}\n\n${CLAW_WRITE_MARK}`;
+
 /** What one answer may hold; the rest is cut with a line that says so. */
 export const MAX_ANSWER_CHARS = 60_000;
 const MAX_PATCH_CHARS = 4_000;
@@ -259,9 +269,9 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
 
   // ---- writes: each waits for the user's decision ----
   mcp.tool("issue_comment", "Post a comment on an issue or a pull request's conversation. Waits for the user's approval.", {
-    repo: REPO, number: NUMBER, body: z.string().min(1).max(65_536),
+    repo: REPO, number: NUMBER, body: z.string().min(1).max(COMMENT_MAX),
   }, (a) => answer("issue_comment", async () => {
-    const c = (await gh.request<any>("POST", repoPath(repoOf(a.repo), `/issues/${a.number}/comments`), { body: { body: a.body } })).json;
+    const c = (await gh.request<any>("POST", repoPath(repoOf(a.repo), `/issues/${a.number}/comments`), { body: { body: marked(a.body) } })).json;
     return { id: c?.id, url: c?.html_url };
   }));
 
@@ -295,11 +305,11 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
   }));
 
   mcp.tool("review_thread_reply", "Reply in a review thread (its id from review_threads_list). Waits for the user's approval.", {
-    thread_id: z.string().min(1).max(200), body: z.string().min(1).max(65_536),
+    thread_id: z.string().min(1).max(200), body: z.string().min(1).max(COMMENT_MAX),
   }, (a) => answer("review_thread_reply", async () => {
     const data = await gh.graphql<any>(
       "mutation($id: ID!, $body: String!) { addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $id, body: $body }) { comment { url } } }",
-      { id: a.thread_id, body: a.body },
+      { id: a.thread_id, body: marked(a.body) },
     );
     return { url: data?.addPullRequestReviewThreadReply?.comment?.url };
   }));

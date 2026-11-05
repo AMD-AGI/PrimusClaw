@@ -497,6 +497,20 @@ export const CLAW_ASSISTANT_REVIEW_ITEMS = envBool("CLAW_ASSISTANT_REVIEW_ITEMS"
 // read-only index, a review item's session the entries bound to its item. Needs CLAW_ASSISTANT_ENABLED and
 // CLAW_MEMORY_ENABLED as well; anything else leaves every assistant turn exactly as without memory.
 export const CLAW_ASSISTANT_MEMORY_TOOLS = env("CLAW_ASSISTANT_MEMORY_TOOLS", "off").trim().toLowerCase() === "on";
+// GitHub events for work items: an item watches a pull request, and new comments, reviews and failed CI
+// reach its worker without anybody mentioning it (`assistant/github-events.ts`). Needs CLAW_ASSISTANT_ENABLED
+// as well; off, there are no subscription routes, no tools for them and nothing polls.
+export const CLAW_ASSISTANT_GITHUB_EVENTS = envBool("CLAW_ASSISTANT_GITHUB_EVENTS", false);
+// How often a watched pull request is read. The time an event takes to reach its worker is at most this.
+export const CLAW_ASSISTANT_GITHUB_POLL_SEC = envInt("CLAW_ASSISTANT_GITHUB_POLL_SEC", 30, { min: 10 });
+// Pull requests one user's items may watch at once.
+export const CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS = envInt("CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS", 20, { min: 1 });
+// Bot accounts (such as `some-review-app[bot]`) whose comments on a watched pull request reach the worker. A bot has no
+// permission on a repository to ask GitHub about, so without this every bot is held back; list only bots that do not
+// repeat what others wrote. Comma-separated logins; empty by default.
+export const CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS: ReadonlySet<string> = new Set(
+  env("CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+);
 
 // --- Remote agents (default OFF) ---
 // When false: no remote-agent tables, no routes, and nothing polls. A connector

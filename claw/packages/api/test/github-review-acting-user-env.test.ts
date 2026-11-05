@@ -434,6 +434,7 @@ test("E9 every place in the source that reads the vault or puts it on a request 
     "tasks/dispatcher.ts": "a task of a DAG lifts it out of its input; none for a session that withholds its keys (E8)",
     "tasks/template-renderer.ts": "a template reads the task's input, which holds the vault of a run made before the session was marked; the render context leaves it out for a session that withholds its keys (E8b)",
     "tasks/run-spec.ts": "strips it from a run's stored spec, for every session",
+    "assistant/github-events.ts": "pr_reply reads the owner's vault only to refuse an answer that would publish one of its values; nothing read is put on a request or a turn, and a review item (acting session) never has a subscription",
     "crypto/user-env.ts": "the vault's own reader and cipher",
     "routes/user-env-vars.ts": "the owner's routes to edit the vault, not a request to Brain",
     "infra/db.ts": "the column of the queued message and the table of the vault, as schema",
