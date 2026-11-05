@@ -220,6 +220,15 @@ func TestLocalSessionIsNotForwarded(t *testing.T) {
 	}
 }
 
+func TestUpstreamOnlyFromEnv(t *testing.T) {
+	if !UpstreamOnlyFromEnv("") || !UpstreamOnlyFromEnv("true") || !UpstreamOnlyFromEnv("  ") {
+		t.Fatal("upstream-only defaults on")
+	}
+	if UpstreamOnlyFromEnv("false") || UpstreamOnlyFromEnv(" false ") {
+		t.Fatal("the exact value false turns upstream-only off")
+	}
+}
+
 func TestSetUpstreamOnlyRequiresUpstreamKey(t *testing.T) {
 	s := &Server{}
 	if err := s.SetUpstreamOnly(true); err == nil {

@@ -449,7 +449,7 @@ func main() {
 	}
 	workloads.SetRemoteClusters(routerServer.RemoteClusterIDs())
 	routerServer.WithWorkloadLocator(workloads.Locate)
-	if err := routerServer.SetUpstreamOnly(os.Getenv(router.EnvUpstreamOnly) == "true"); err != nil {
+	if err := routerServer.SetUpstreamOnly(router.UpstreamOnlyFromEnv(os.Getenv(router.EnvUpstreamOnly))); err != nil {
 		log.Error("dataplane upstream-only config failed", "error", err)
 		os.Exit(1)
 	}

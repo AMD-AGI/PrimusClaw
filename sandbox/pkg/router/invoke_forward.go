@@ -22,7 +22,7 @@ import (
 
 const (
 	// EnvUpstreamOnly makes a cluster Router accept /v1 calls only as invocations
-	// forwarded by the managing Router.
+	// forwarded by the managing Router. Unset is on. The exact value "false" turns it off.
 	EnvUpstreamOnly = "SANDBOX_UPSTREAM_ONLY"
 
 	invocationRoute = "/v1/namespaces/:namespace/code-interpreters/:name/invocations/*path"
@@ -46,6 +46,12 @@ type invokeHop struct {
 func (s *Server) WithWorkloadLocator(locate WorkloadLocator) *Server {
 	s.locator = locate
 	return s
+}
+
+// UpstreamOnlyFromEnv reports whether /v1 accepts only forwarded invocations.
+// An empty value is on. The exact value "false" turns it off.
+func UpstreamOnlyFromEnv(raw string) bool {
+	return strings.TrimSpace(raw) != "false"
 }
 
 // SetUpstreamOnly turns on the mode in which /v1 accepts only forwarded invocations.
