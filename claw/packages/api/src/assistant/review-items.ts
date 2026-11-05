@@ -23,7 +23,7 @@ import { actingUserOf, parseActingAs } from "../github-review/acting-as.js";
 import { REVIEW_SANDBOX_PROFILE, requestedByOf, usesReviewProfile } from "../github-review/requested-by.js";
 import { reviewAgentSettings, reviewTurnsLeft } from "../github-review/review-profile.js";
 import { SEALED_CREDENTIALS_FIELD } from "../auth/sealed-session-credentials.js";
-import { checkSessionCreate, type AttendedProof } from "../github-review/acting-session.js";
+import { checkSessionCreate, proofForFirstMessageAgain, type AttendedProof } from "../github-review/acting-session.js";
 import { isValidPrRef, type PrRef } from "../github-review/github.js";
 import type { ReviewActor, ReviewContinuation, ToolOutcome } from "../github-review/service.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
@@ -32,10 +32,12 @@ import { db, inTransaction, type Querier, type StatementRunner } from "../infra/
 import { insertSessionRow } from "../routes/sessions.js";
 import { queuedMessageId, SWEEPABLE_RUN_STATUSES, stopSessionRuns } from "../tasks/chat-run.js";
 import { getOrCreateAssistant } from "./assistant.js";
-import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
+import { drainSessionIfIdle, queueServerMessage, type QueuedServerMessage } from "./messages.js";
 import { queueRouterWake } from "./reports.js";
 import { freezeRequesterView } from "./requester-view.js";
 import { clipOneLine, getWorkItem, insertWorkItem, itemView, type Outcome, type WorkItemView } from "./work-items.js";
+import { resolveUserLlmKey } from "../llm/key-source.js";
+import { modelAnswer, modelChoiceOn, ModelChoiceRefused, resolveItemModel, type ResolvedModel } from "./model-choice.js";
 
 const logger = pino({ name: "assistant-review-items" });
 
@@ -55,6 +57,8 @@ export interface ReviewParams {
   acting_as: string;
   acting_as_name: string | null;
   model: string | null;
+  /** The model the review was to run on and could not, with the payer's key (`model-choice.ts`); only on a review that fell back. */
+  model_asked?: string;
   effort: string | null;
   review_only: boolean;
   /**
@@ -474,6 +478,12 @@ export interface CreatedReview {
    * effort, never on ones the requester chose (`startReviews`). Absent when nothing was set aside.
    */
   ignored?: Array<"model" | "effort">;
+  /**
+   * With model choice on (`model-choice.ts`): the model the review runs on (null: the deployment's default), and the one it was to run
+   * on when the payer's key could not use it. Absent with model choice off.
+   */
+  model?: string | null;
+  fell_back_from?: string;
 }
 
 interface Planned {
@@ -608,13 +618,17 @@ export async function startReviews(
   const ignored = forOther
     ? (["model", "effort"] as const).filter((f) => request[f] !== undefined && request[f] !== null && request[f] !== "")
     : [];
-  const model = forOther ? undefined : request.model;
+  // With model choice on, the model is decided once for the request: the one it names (not for someone else), else the payer's own
+  // defaults, else the deployment's review default, each checked against the allow-list and the payer's key.
+  const choice = modelChoiceOn() ? await reviewModelFor(owner, forOther ? undefined : request.model) : null;
+  const model = choice ? choice.model : forOther ? undefined : request.model;
   const effort = forOther ? undefined : request.effort;
   const plans: Planned[] = request.prs.map(({ pr, message }) => {
     const checked = checkAsCreate(user, method, actingAs, pr, request.reviewOnly, model, effort, request.mergeNeedsConfirmation === true);
     const label = String(checked.config.acting_as_requester ?? user.userId);
     const base: ReviewParams = {
       pr, acting_as: actingAs, acting_as_name: request.actingAsName, model: checked.model, effort: checked.effort,
+      ...(choice?.fellBackFrom ? { model_asked: choice.fellBackFrom } : {}),
       review_only: request.reviewOnly, brief: message ?? defaultBrief(pr, request.reviewOnly),
       ...(request.mergeNeedsConfirmation === true ? { merge_needs_confirmation: true as const } : {}),
     };
@@ -663,8 +677,28 @@ export async function startReviews(
     return out;
   });
   for (const c of created) await drainSessionIfIdle(c.session_id, owner.userId);
-  logger.info({ userId: user.userId, actingAs, owner: owner.userId, items: created.map((c) => c.item_id), ignored }, "assistant.reviews_started");
-  return ignored.length > 0 ? created.map((c) => ({ ...c, ignored: [...ignored] })) : created;
+  logger.info({ userId: user.userId, actingAs, owner: owner.userId, items: created.map((c) => c.item_id), ignored, ...(choice ? { model: choice.model, source: choice.source } : {}) }, "assistant.reviews_started");
+  const answered = choice ? created.map((c) => ({ ...c, ...modelAnswer(choice) })) : created;
+  return ignored.length > 0 ? answered.map((c) => ({ ...c, ignored: [...ignored] })) : answered;
+}
+
+/**
+ * The model a review runs on (`resolveItemModel`): `asked` is what the request named (undefined for one asked of someone else, whose own
+ * settings decide), and the payer is the review's owner, on whose key and with whose defaults it runs. A model that is not a string is
+ * left to the create check, which refuses it as it always did.
+ */
+async function reviewModelFor(owner: UserInfo, asked: unknown): Promise<ResolvedModel | null> {
+  if (asked !== undefined && asked !== null && typeof asked !== "string") return null;
+  try {
+    return await resolveItemModel((t, p) => db.query(t, p), {
+      kind: "review", payerUserId: owner.userId, payerKey: resolveUserLlmKey(owner), asked: (asked as string | null | undefined) || null,
+    });
+  } catch (err) {
+    if (err instanceof ModelChoiceRefused) {
+      throw new ReviewItemRefused(err.code === "model_not_allowed" ? 400 : 503, err.code, err.message, err.data);
+    }
+    throw err;
+  }
 }
 
 /** What a review created for someone else is answered with: not the session's ids, which are the reviewer's. */
@@ -818,15 +852,21 @@ export async function restartReview(
   const reviewOnly = change.reviewOnly ?? was.review_only;
   // Once the assistant has started or restarted a review, every later restart of it merges only on the acting user's confirmation too.
   const mergeNeedsConfirmation = was.merge_needs_confirmation === true || change.mergeNeedsConfirmation === true;
+  // A restart that names a model is a choice like a start's (`reviewModelFor`, the owner restarting is the payer); one that names none keeps
+  // the model the review had.
+  const choice = modelChoiceOn() && "model" in change && change.model !== null && change.model !== undefined ? await reviewModelFor(user, change.model) : null;
   const checked = checkAsCreate(user, method, was.acting_as, was.pr, reviewOnly,
-    "model" in change ? change.model : was.model, "effort" in change ? change.effort : was.effort, mergeNeedsConfirmation);
+    choice ? choice.model : "model" in change ? change.model : was.model, "effort" in change ? change.effort : was.effort, mergeNeedsConfirmation);
   // The old words are sent again only if they still say what is asked: a review that now merges, or now does not, gets new ones.
   const brief = change.message ?? (reviewOnly === was.review_only ? was.brief : defaultBrief(was.pr, reviewOnly));
   const { halted: _halted, ...kept } = was;
   const plan: Planned = {
     pr: was.pr, sessionId: randomUUID(), attended: checked.attended,
     config: requestedBy ? asRequested(checked.config, { user_id: requestedBy, label: was.requester_label ?? requestedBy }) : checked.config,
-    params: { ...kept, model: checked.model, effort: checked.effort, review_only: reviewOnly, brief, ...(mergeNeedsConfirmation ? { merge_needs_confirmation: true as const } : {}) },
+    params: {
+      ...kept, model: checked.model, effort: checked.effort, review_only: reviewOnly, brief, ...(mergeNeedsConfirmation ? { merge_needs_confirmation: true as const } : {}),
+      ...(choice?.fellBackFrom ? { model_asked: choice.fellBackFrom } : {}),
+    },
   };
   await refuseIfReviewed(db, user.userId, requestedBy, was.pr, itemId);
   if (requestedBy) await refuseUnlessDelegated(was.acting_as, requestedBy, was.acting_as_name || was.acting_as);
@@ -872,7 +912,23 @@ export async function restartReview(
   await stopSessionRuns(result.oldSession);
   await drainSessionIfIdle(result.item.session_id, user.userId);
   logger.info({ userId: user.userId, stopped: itemId, item: result.item.item_id }, "assistant.review_restarted");
-  return { stopped: { item_id: itemId, seq: result.seq }, item: result.item };
+  // With model choice on, the restarted item says which model it runs on, as a start does.
+  const item = modelChoiceOn() ? { ...result.item, ...(choice ? modelAnswer(choice) : { model: plan.params.model }) } : result.item;
+  return { stopped: { item_id: itemId, seq: result.seq }, item };
+}
+
+/**
+ * A review session's first message queued once more, for the turn the gateway refused before its model ran for want of a key binding
+ * (`model-fallback.ts`). That message is the one the person's request queued with their say; the proof for queueing it again is made only
+ * when the session has run that one turn and no other and the words are the same (`proofForFirstMessageAgain`), so no later message of the
+ * session, which only the person can send, is ever queued by the server. Null when there is no such proof.
+ */
+export async function queueReviewFirstTurnAgain(
+  q: StatementRunner, sessionId: string, userId: string, content: string, dedupeKey: string,
+): Promise<QueuedServerMessage | null> {
+  const proof = await proofForFirstMessageAgain(q, sessionId, content);
+  if (!proof) return null;
+  return queueServerMessage(q, { sessionId, userId, content, dedupeKey, attended: proof });
 }
 
 // ------------------------------------------------------------------------------------------------ a requested review's turns

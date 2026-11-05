@@ -28,8 +28,9 @@ import { REPORT_KINDS } from "./work-items.js";
 import { githubEventsEnabled, prReply, REPLY_BODY_MAX, workSubscribe } from "./github-events.js";
 import { type AssistantTokenClaims, verifyAssistantToken } from "./token.js";
 import {
-  report, say, ToolRefused, workCreate, workRecall, workSend, workStop, type RecallDetail,
+  modelDefaultSet, report, say, ToolRefused, workCreate, workRecall, workSend, workStop, type RecallDetail,
 } from "./tools.js";
+import { modelChoiceOn } from "./model-choice.js";
 import { assistantMemoryOn, memoryForget, memoryRecall, memorySave, memoryUndo, memoryUpdate } from "./memory-tools.js";
 import { channelAction, confirmationAnswer, MAX_PRS, reviewModeSet, reviewRestart, reviewStart } from "./review-tools.js";
 import { observeEveryTool, recordObservation } from "./observe.js";
@@ -110,8 +111,12 @@ function registerMemoryWrites(mcp: McpServer, claims: AssistantTokenClaims): voi
   );
 }
 
+/** What a `model` argument says, with model choice on (`model-choice.ts`) and without. */
+const MODEL_PARAM_ASKED = "Only when the user asked for a model for this, by name or by kind (the strongest, a fast one): a name from Models";
+const MODEL_PARAM_CHOICE = `${MODEL_PARAM_ASKED}; left out, the user's own default applies.`;
+
 /** The tools that act for the person (`review-tools.ts`); each refuses unless the turn answers their signed-in message. */
-function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims): void {
+function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims, choice: boolean): void {
   mcp.tool(
     "review_start",
     `Start a review of each pull request the user named, as a work item each (at most ${MAX_PRS}). Merges only with merge=true.`,
@@ -119,7 +124,7 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims): void
       prs: z.array(z.string()).describe("Each as owner/repo#number or its URL; only numbers the user wrote."),
       merge: z.boolean().describe("true only when the user clearly asked to merge after the review; otherwise false (review only). Even true merges nothing by itself: the merge waits for the user's confirmation (the card's button or 批准 #<ref>)."),
       reviewer: z.string().optional().describe("Whose GitHub account reviews: leave out for the user. Someone else's (a user_id from People) is handed to the user's channel when it can start it with that person's credentials (handed_off: say it was handed over, not that it started), and otherwise refused as acting_as_credentials_required: tell the user what the refusal says to do."),
-      model: z.string().optional().describe("Only when the user named a model."),
+      model: z.string().optional().describe(choice ? MODEL_PARAM_CHOICE : "Only when the user named a model."),
       effort: z.enum(["low", "medium", "high"]).optional().describe("Only when the user asked for one."),
     },
     (args) => answer(claims, "review_start", () => reviewStart(claims, args)),
@@ -129,7 +134,7 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims): void
     "Stop a review item and start it again with changed settings (model, merge or review only). Refused once merged.",
     {
       item_id: z.string().describe(ITEM_ID_PARAM),
-      model: z.string().optional().describe("Only when the user named a model; left out keeps the old one."),
+      model: z.string().optional().describe(choice ? `${MODEL_PARAM_ASKED}; left out keeps the old one.` : "Only when the user named a model; left out keeps the old one."),
       merge: z.boolean().optional().describe("Left out keeps what the review was asked to do."),
       effort: z.enum(["low", "medium", "high"]).optional(),
     },
@@ -164,6 +169,7 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims): void
 
 export function createAssistantMcpServer(
   claims: AssistantTokenClaims, reviewTools: boolean = CLAW_ASSISTANT_TOOLS, memoryTools: boolean = assistantMemoryOn(),
+  modelChoice: boolean = modelChoiceOn(),
 ): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
   if (claims.role === "observer") {
@@ -198,15 +204,30 @@ export function createAssistantMcpServer(
         title: z.string().describe("At most 40 characters."),
         brief: z.string().describe("Everything the worker needs, as a self-contained task: it cannot see the conversation."),
         repo: z.unknown().optional().describe("The repository the work is in, if any: { url, branch? }."),
+        ...(modelChoice ? { model: z.string().optional().describe(MODEL_PARAM_CHOICE) } : {}),
       },
       (args) => answer(claims, "work_create", () => workCreate(claims, args)),
     );
     mcp.tool(
       "work_send",
       "Forward a new instruction or the user's answer to the worker of an item. The item goes back to in progress.",
-      { item_id: z.string().describe(ITEM_ID_PARAM), text: z.string() },
+      {
+        item_id: z.string().describe(ITEM_ID_PARAM), text: z.string(),
+        ...(modelChoice ? { model: z.string().optional().describe(`${MODEL_PARAM_ASKED}; the item runs on it from now on. Left out keeps the one it has.`) } : {}),
+      },
       (args) => answer(claims, "work_send", () => workSend(claims, args)),
     );
+    if (modelChoice) {
+      mcp.tool(
+        "model_default_set",
+        "Set the user's own default model from now on: for every item, or with kind=review for reviews. model null clears it. Only when the user asked for a default.",
+        {
+          model: z.string().nullable().describe("A name from Models, or null to clear."),
+          kind: z.enum(["review"]).optional().describe("review for their reviews only; left out for every item."),
+        },
+        (args) => answer(claims, "model_default_set", () => modelDefaultSet(claims, args)),
+      );
+    }
     mcp.tool(
       "work_stop",
       "Stop an item the user no longer wants.",
@@ -228,7 +249,7 @@ export function createAssistantMcpServer(
         (args) => answer(claims, "work_subscribe", () => workSubscribe(claims, { item_id: args.item_id, pr: args.pr })),
       );
     }
-    if (reviewTools) registerReviewTools(mcp, claims);
+    if (reviewTools) registerReviewTools(mcp, claims, modelChoice);
     // An observer is offered them too, as every router tool, and each call only records (`observeEveryTool`); were one
     // ever to run, `memory-tools.ts` refuses every role but the router's (and the worker's recall).
     if (memoryTools) {

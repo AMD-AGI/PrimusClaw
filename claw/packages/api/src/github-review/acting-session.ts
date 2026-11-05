@@ -101,3 +101,27 @@ export function checkSessionCreate(input: {
     ok: true, actingAs: parsedActingAs.actingAs, target: parsedTarget.target, reviewOnly: parsedReviewOnly.reviewOnly, model, effort, attended,
   };
 }
+
+/**
+ * The one other proof there is: for queueing again, once, the first message of a session that acts as a user, after the gateway refused the
+ * model of its first turn for want of a key binding and before that model ran (`assistant/model-fallback.ts`, by way of
+ * `assistant/review-items.ts`). The person's say was for that message in that session, which the proof `checkSessionCreate` made let the
+ * server queue; it is the same words given again, on another model. So it is made only when the database shows exactly that: the session
+ * acts as a user, has had one turn and no other, that turn failed, and its words are `content`. Null otherwise.
+ */
+export async function proofForFirstMessageAgain(
+  q: { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }> }, sessionId: string, content: string,
+): Promise<AttendedProof | null> {
+  const row = (await q.query(
+    `SELECT s.config->'acting_as' AS acting_as,
+            (SELECT COUNT(*)::int FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat') AS turns,
+            (SELECT COUNT(*)::int FROM claw_pending_messages p WHERE p.session_id = s.session_id) AS queued,
+            (SELECT t.status FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS status,
+            (SELECT COALESCE(t.prompt, t.input->>'prompt', '') FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS words
+       FROM claw_sessions s WHERE s.session_id = $1 AND s.deleted_at IS NULL`,
+    [sessionId],
+  )).rows[0] as { acting_as: unknown; turns: number; queued: number; status: string | null; words: string | null } | undefined;
+  if (!row || typeof row.acting_as !== "string" || Number(row.turns) !== 1 || Number(row.queued) !== 0) return null;
+  if (row.status !== "failed" || row.words !== content) return null;
+  return { via: null } as AttendedProof;
+}

@@ -47,6 +47,7 @@ import {
 import type { AssistantTokenClaims } from "./token.js";
 import { attendedTurn, ToolRefused } from "./tools.js";
 import { resolveWorkItemNow } from "./work-items.js";
+import { modelChoiceOn } from "./model-choice.js";
 
 export { confirmationRef };
 
@@ -265,7 +266,9 @@ export async function reviewStart(
         refuseUngrounded("repo_not_grounded", `the user did not name ${pr.owner}/${pr.repo}: ask them which repository`);
       }
     }
-    if (args.model && !modelGrounded(message.content, args.model)) {
+    // With model choice on, the model is checked against the allow-list and the payer's key instead (`model-choice.ts`): "use the fast
+    // one" names a model without its name, and the quota spent is the user's own.
+    if (args.model && !modelChoiceOn() && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out unless they named one");
     }
     const signedIn = await requesterSignedIn(q, claims.sid, userId, message, via);
@@ -460,7 +463,7 @@ export async function reviewRestart(
     const item = reviews.find((r) => r.item_id === named.item.item_id);
     if (!item) throw new ToolRefused("not_a_review_item", "that item is not a review: only a review can be restarted");
     if (!pointsAtReview(message, reviews, item)) refuseUngrounded("item_not_in_message", "the user did not say which review: ask them (the pull request number is enough)");
-    if (args.model && !modelGrounded(message.content, args.model)) {
+    if (args.model && !modelChoiceOn() && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out to keep the one it had");
     }
     return { userId, itemId: item.item_id, signedIn: await requesterSignedIn(q, claims.sid, userId, message, via) };
