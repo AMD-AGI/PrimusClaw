@@ -32,6 +32,9 @@ test("the review routes do not exist and no review item is looked for", async ()
     assert.equal(await ri.syncReviewItemOfSession("s-1"), false);
     assert.equal(await ri.confirmationOfStoppedReview("c-1"), false);
     assert.equal(await ri.sweepReviewItems(), 0);
+    // A re-review is not continued and nothing a review posts is recorded: the review tools get nothing of review items (C1b).
+    assert.equal(await ri.reviewContinuationOf("s-1"), null);
+    assert.deepEqual(ri.reviewItemServiceDeps(), {});
   } finally {
     await app.close();
   }

@@ -28,6 +28,13 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A review item reviewed again continues the last review (with `CLAW_ASSISTANT_REVIEW_ITEMS`): what a review posted is
+  recorded with its threads (`claw_github_audit.posted`, a new column; `params.record` on the item), a restart or a new
+  request after the requester's closed item gives the fresh session the open findings to check first, and `gh_pr_get`
+  reads only the change since the last head unless it was rewritten, merged the base branch in, is large or touches
+  security or CI paths. Such a
+  session is offered `gh_thread_resolve` for the recorded threads of the acting user's own findings. See
+  `claw/docs/github-review.md`, "A review again".
 - `run.completed` and `run.failed` notifications carry `message_id`, the message whose turn the run was (a trigger's
   run names the message the trigger sent; `null` for a task that has none). A client that sent that message and
   already showed its answer can now tell the run's end is that turn's by the id: a run is closed after its last
