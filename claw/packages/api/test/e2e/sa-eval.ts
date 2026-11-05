@@ -56,8 +56,8 @@ import { fileURLToPath } from "node:url";
 import { apiClient, until } from "./assistant-p1-lib.js";
 import { traceOf, type EventRow, type ToolCall } from "./agent-eval-lib.js";
 import {
-  apiQuery, caseHash, caseSays, cardsOf, cleanupOf, finalSay, grade, identityRefusal, itemsStartedBy, loadCases, parseRecordings, passed, pick, planOf,
-  renderTable, routeOf, saysOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, turnsOf,
+  apiQuery, caseHash, caseSays, cardsOf, cleanupOf, finalSay, grade, forRecording, identityRefusal, itemsStartedBy, loadCases, parseRecordings, passed, pick, planOf,
+  renderTable, routeOf, saysOf, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, turnsOf,
   type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type Recording, type Turn,
 } from "./sa-eval-lib.js";
 
@@ -235,10 +235,11 @@ async function judge(c: EvalCase, turns: Turn[], final: string): Promise<{ pass:
 
 const attemptOf = async (c: EvalCase, turns: Turn[], o: Observed, tools: string[], items: Attempt["items"]): Promise<Attempt> => {
   const checks = grade(c, o);
-  if (RECORD_DIR) recordings.push({ case_id: c.id, mode: MODE, attempt: recordings.filter((r) => r.case_id === c.id).length + 1, at: iso(), observed: o });
+  if (RECORD_DIR) recordings.push({ case_id: c.id, mode: MODE, attempt: recordings.filter((r) => r.case_id === c.id).length + 1, at: iso(), observed: forRecording(c, o) });
+  const verdict = await judge(c, turns, o.final);
   return {
-    pass: passed(checks), checks, route: o.route, cards: o.cards, tools, final: KEEP_TEXT ? scrub(o.final) : null, finalChars: o.final.length,
-    firstReplyMs: o.firstReplyMs, finalMs: o.finalMs, items, judge: await judge(c, turns, o.final),
+    ...verdictOf(c, checks, verdict), checks, route: o.route, cards: o.cards, tools, final: KEEP_TEXT ? scrub(o.final) : null, finalChars: o.final.length,
+    firstReplyMs: o.firstReplyMs, finalMs: o.finalMs, items, judge: verdict,
   };
 };
 
@@ -405,10 +406,12 @@ async function main(): Promise<void> {
   let sessionId = "";
   let stream: LiveStream | null = null;
   let floorAtStart = 0;
+  let createdAssistant = false;   // the run made the identity's assistant session: it is deleted at the end
   if (MODE === "assistant") {
     const a = await api("POST", "/v1/assistant", {});
     sessionId = a.json?.data?.session_id;
     if (a.status !== 200 || !sessionId) { console.error(`POST /v1/assistant answered ${a.status}`); process.exit(2); }
+    createdAssistant = a.json?.data?.created === true;
     floorAtStart = Math.max(0, ...(await board()).map((i) => i.seq));
     stream = new LiveStream(sessionId, true);
     await stream.open();
@@ -443,6 +446,10 @@ async function main(): Promise<void> {
     await sleep(5_000);
     leftOpen = (await board()).filter((x) => x.seq > floorAtStart && x.board_state !== "done").map((x) => x.seq);
     log(`items created by the run that are still open: ${leftOpen.length ? leftOpen.join(",") : "none"}`);
+    if (createdAssistant) {
+      const gone = await until(async () => ((await api("DELETE", `/v1/sessions/${sessionId}`).catch(() => ({ status: 0 }))).status === 200 ? true : undefined), Date.now() + 60_000, 10_000);
+      log(gone ? "deleted the assistant session the run created" : `could not delete the assistant session ${sessionId} the run created`);
+    }
   }
   if (RECORD_DIR) {
     mkdirSync(RECORD_DIR, { recursive: true });
@@ -462,7 +469,7 @@ function offline(cases: readonly EvalCase[], file: string): void {
     results.set(c.id, r);
     const o = rec.observed;
     const checks = grade(c, o);
-    r.attempts.push({ pass: passed(checks), checks, route: o.route, cards: o.cards, tools: o.calls.map((x) => x.name), final: KEEP_TEXT ? o.final : null,
+    r.attempts.push({ ...verdictOf(c, checks, null), checks, route: o.route, cards: o.cards, tools: o.calls.map((x) => x.name), final: KEEP_TEXT ? o.final : null,
       finalChars: o.final.length, firstReplyMs: o.firstReplyMs, finalMs: o.finalMs, items: [] });
   }
   if (!results.size) { console.error(`no recording in ${file} matches a selected case`); process.exit(2); }

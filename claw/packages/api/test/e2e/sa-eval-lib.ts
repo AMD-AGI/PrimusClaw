@@ -437,7 +437,31 @@ export interface Attempt {
   finalMs: number | null;
   items: Array<Pick<ItemSeen, "seq" | "kind" | "board_state"> & { cleanup: string }>;
   judge?: { pass: boolean; why: string } | null;
+  /** The case has content only a judge can grade (a rubric, or a fact with no value) and no judge graded it: not a pass. */
+  unjudged?: true;
   error?: string;
+}
+
+/** The case has content only a judge can grade: a rubric, or a fact whose value is neither written nor read by an oracle. */
+export const needsJudge = (c: EvalCase): boolean =>
+  !!c.rubric || (c.facts ?? []).some((f) => !apiQuery(f.oracle) && !(f.oracle && f.oracle.kind !== "api" && f.oracle.value !== undefined));
+
+/**
+ * An attempt's verdict: every deterministic check, and, for a case with content only a judge can grade, the judge's
+ * PASS. Without a judge such an attempt is never a pass: it is reported as unjudged, so a reply that only looks right
+ * (on time, the right route, but without the fact asked for) is not counted as passing.
+ */
+export function verdictOf(c: EvalCase, checks: readonly Check[], judge: { pass: boolean } | null | undefined): { pass: boolean; unjudged?: true } {
+  if (!passed(checks)) return { pass: false };
+  if (!needsJudge(c)) return { pass: true };
+  if (!judge) return { pass: false, unjudged: true };
+  return { pass: judge.pass };
+}
+
+/** What a recording keeps of an observation: an api oracle's values are the identity's data, so they are left out (null:
+ * an offline grading skips that fact). */
+export function forRecording(c: EvalCase, o: Observed): Observed {
+  return { ...o, factValues: o.factValues.map((v, k) => (apiQuery(c.facts?.[k]?.oracle) ? null : v)) };
 }
 
 export interface CaseResult {
@@ -460,6 +484,8 @@ export interface Totals {
   passAt1: number;
   /** Cases that passed all of their attempts. */
   passAllK: number;
+  /** Attempts that passed every deterministic check but whose content no judge graded (not counted as passes). */
+  unjudged: number;
   errors: number;
   firstReplyP50Ms: number | null;
   firstReplyP90Ms: number | null;
@@ -481,6 +507,7 @@ export function totals(results: readonly CaseResult[]): Record<string, Totals> {
       cases: rs.length,
       passAt1: rs.reduce((s, r) => s + passAt1(r), 0) / rs.length,
       passAllK: rs.filter(passAll).length,
+      unjudged: rs.reduce((n, r) => n + r.attempts.filter((a) => a.unjudged).length, 0),
       errors: rs.reduce((n, r) => n + r.attempts.filter((a) => a.error).length, 0),
       firstReplyP50Ms: percentile(nums(attempts.map((a) => a.firstReplyMs)), 50),
       firstReplyP90Ms: percentile(nums(attempts.map((a) => a.firstReplyMs)), 90),
@@ -500,7 +527,8 @@ export function renderTable(results: readonly CaseResult[]): string {
     const failed = r.attempts.flatMap((x) => (x.error ? [`error: ${x.error.slice(0, 80)}`]
       : x.checks.filter((c) => !c.pass).map((c) => c.name + (c.detail ? ` (${c.detail.slice(0, 60)})` : ""))));
     const tools = [...new Set(a.tools)].map((t) => t.replace(/^mcp__/, "")).join(" ").slice(0, 120);
-    const verdict = `${r.attempts.filter((x) => x.pass).length}/${r.attempts.length}`;
+    const unjudged = r.attempts.filter((x) => x.unjudged).length;
+    const verdict = `${r.attempts.filter((x) => x.pass).length}/${r.attempts.length}${unjudged ? ` (${unjudged} unjudged)` : ""}`;
     return `| ${r.id} | ${a.route ?? "-"} | ${tools || "-"} | ${sec(a.firstReplyMs)} | ${sec(a.finalMs)} | ${verdict} | ${[...new Set(failed)].join("; ").replace(/\|/g, "/").slice(0, 300)} |`;
   });
   return ["| case | route | tools | first (s) | final (s) | passed | failed checks |", "|---|---|---|---|---|---|---|", ...rows].join("\n");

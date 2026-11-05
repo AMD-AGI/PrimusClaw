@@ -18,6 +18,7 @@
  *   S9  the seed set: at least 20 cases, unique ids, the regression case as specified, every case fails an empty observation
  *   S10 pass@1 is a mean over cases, pass^k counts cases that passed every attempt
  *   S11 the identity gate: no acknowledgement, a wrong one, a denied identity or an enabled subscription refuses the run
+ *   S13 content only a judge can grade is never a pass without a judge; a judge's FAIL fails it; recordings drop oracle values
  *   S12 the last turn: the items a turn started are read from its own calls' answers; a dry-run plan; recordings parse
  */
 import assert from "node:assert/strict";
@@ -29,7 +30,7 @@ import { fileURLToPath } from "node:url";
 
 import type { ToolCall } from "./e2e/agent-eval-lib.js";
 import {
-  apiQuery, caseSays, cardsOf, identityRefusal, itemsStartedBy, parseRecordings, planOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
+  apiQuery, caseSays, cardsOf, forRecording, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
 } from "./e2e/sa-eval-lib.js";
 
@@ -242,4 +243,24 @@ test("S12 last turn, plan, recordings", () => {
   assert.match(plan[1]!, /skip \(assistant only\)/);
   const rec = { case_id: "a", mode: "assistant", attempt: 1, at: "t", observed: observed() };
   assert.deepEqual(parseRecordings(`${JSON.stringify(rec)}\n\n${JSON.stringify({ case_id: "x" })}\n`).map((r) => r.case_id), ["a"]);
+});
+
+test("S13 judge-only content and recordings", () => {
+  const judged = caseOf({ facts: [{ claim: "the node count" }] });
+  const plain = caseOf({ facts: [{ claim: "sum", oracle: { kind: "static", value: "1060" } }] });
+  assert.equal(needsJudge(judged), true);
+  assert.equal(needsJudge(plain), false);
+  assert.equal(needsJudge(caseOf({ rubric: "r" })), true);
+  const ok = grade(judged, observed({ factValues: [null] }));
+  assert.ok(passed(ok));
+  assert.deepEqual(verdictOf(judged, ok, null), { pass: false, unjudged: true });
+  assert.deepEqual(verdictOf(judged, ok, { pass: false }), { pass: false });
+  assert.deepEqual(verdictOf(judged, ok, { pass: true }), { pass: true });
+  assert.deepEqual(verdictOf(plain, grade(plain, observed({ final: "1060", factValues: [["1060"]] })), null), { pass: true });
+  const withOracle = caseOf({ facts: [{ claim: "n", oracle: { kind: "api", query: "/v1/me#name" } }, { claim: "s", oracle: { kind: "static", value: "1" } }] });
+  assert.deepEqual(forRecording(withOracle, observed({ factValues: [["Secret Name"], ["1"]] })).factValues, [null, ["1"]]);
+  const r: CaseResult = { id: "a", area: "k", pipeline: "catalog", mode: "assistant", hash: "h",
+    attempts: [{ pass: false, unjudged: true, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: 1, finalMs: 2, items: [] }] };
+  assert.equal(totals([r]).all!.unjudged, 1);
+  assert.equal(totals([r]).all!.passAllK, 0);
 });
