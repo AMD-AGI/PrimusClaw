@@ -11,6 +11,8 @@
  *   G3  the acting user's allow (the card's button or the exact command reach this same `decide`) makes the merge
  *   G4  anyone else's allow is refused, and nothing is merged
  *   G5  a session the router did not start merges as before
+ *   G6  with auto-merge on, resolving the last conversation can be the merge: such a session (and a review-only one) resolves nothing;
+ *       without auto-merge, or for a session that merges by itself, the thread is resolved as before
  */
 import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach, describe } from "node:test";
@@ -81,5 +83,25 @@ describe("G a review the assistant started", () => {
     const o = await merge();
     assert.equal(o.body.status, "merged", o.text);
     assert.deepEqual(await pending(), []);
+  });
+
+  test("G6 with auto-merge on, a thread is not resolved by a session that may not merge by itself; otherwise it is", async () => {
+    const recorded = { sinceHeadSha: "2".repeat(40), findings: [{ path: "src/app.ts", line: 3, thread_id: "PRRT_1", note: "c is wrong", resolved: false }] };
+    const cases: Array<[string, Record<string, unknown>, boolean, string]> = [
+      ["router-started, auto-merge on", { mergeNeedsConfirmation: true }, true, "auto_merge_on"],
+      ["review only, auto-merge on", { reviewOnly: true }, true, "auto_merge_on"],
+      ["router-started, auto-merge off", { mergeNeedsConfirmation: true }, false, "resolved"],
+      ["not router-started, auto-merge on", {}, true, "resolved"],
+    ];
+    for (const [name, actor, autoMerge, want] of cases) {
+      e = await reviewEnv({}, { actor, deps: { continuationOf: async () => recorded, recordPosted: true, sessionStopped: async () => false } });
+      e.gh.threads.push({ id: "PRRT_1", isResolved: false, path: "src/app.ts", line: 3, reviewId: 800, author: "bob", pr: 7, repo: "AMD-AGI/demo" });
+      e.gh.graphql.autoMergeRequest = autoMerge ? { enabledAt: "2026-11-04T00:00:00Z" } : null;
+      const o = await e.service.resolveThread(e.actor, { pr: PR, thread_id: "PRRT_1", head_sha: HEAD });
+      assert.equal(o.isError ? o.body.reason : o.body.status, want, `${name}: ${o.text}`);
+      assert.equal(e.gh.resolves.length, want === "resolved" ? 1 : 0, `${name}: resolves`);
+      assert.equal(e.gh.threads[0]?.isResolved, want === "resolved", name);
+      assert.equal(puts().length, 0, `${name}: nothing merged`);
+    }
   });
 });

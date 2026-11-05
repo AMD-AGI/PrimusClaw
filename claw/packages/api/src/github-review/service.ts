@@ -1545,6 +1545,12 @@ export class GithubReview {
         }
         const redact = (x: string): string => ctx.client.redact(x);
         if (t.isResolved === true) return ok({ status: "already_resolved", thread_id: threadId, head_sha: headSha }, redact);
+        // With GitHub's auto-merge on, the last open conversation resolved can be what merges the pull request. A session that may not merge
+        // by itself (a review only, or one the assistant started, whose merge waits for the acting user's confirmation) leaves it open.
+        if ((ctx.actor.reviewOnly || ctx.actor.mergeNeedsConfirmation) && (await this.readMergeFacts(ctx, ref)).autoMerge) {
+          throw new Refusal("auto_merge_on", "auto-merge is on for this pull request, so resolving a conversation could merge it, and this session "
+            + "does not merge by itself: nothing was resolved. Leave the thread open and say in your review that the finding is fixed.");
+        }
         if (!ctx.settings.writesEnabled) {
           ctx.acc.dryRun = true;
           return ok({ status: "dry_run", thread_id: threadId, note: "writes are switched off in this deployment; nothing was resolved" }, redact);
