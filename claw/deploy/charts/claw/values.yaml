@@ -434,8 +434,9 @@ secret:
   # Reach Hands through the Router's port proxy instead of the sandbox's cluster DNS name
   # (SANDBOX_HANDS_VIA_ROUTER). Only needed when sandboxes run in another cluster, where
   # that name does not resolve. SaFE mode only.
-  # Routed Hands requests carry the per-sandbox Hands token in X-Hands-Token, not a
-  # platform key; a Router with --enable-auth lets them through and Hands validates it.
+  # A routed Hands request carries the session owner's platform key in Authorization,
+  # which a Router with --enable-auth authenticates, and the per-sandbox Hands token in
+  # X-Hands-Token, which Hands checks.
   sandboxHandsViaRouter: "false"
   # Set "true" when the sandbox Router runs with --enable-auth (SANDBOX_ROUTER_AUTH_ENABLED).
   # A hosted application's session-level MCP then carries the <SAFE_API_KEY> placeholder as
@@ -508,7 +509,7 @@ secret:
   # and response headers carry credentials. Empty is off, and off is default.
   llmDebugResponseHeaders: ""
   anthropicBaseUrl: ""
-  defaultModel: claude-opus-5-5
+  defaultModel: claude-opus-4-7
   openaiBaseUrl: ""
   byokVerifyModelsUrl: ""
   byokVerifyApiStyle: openai
