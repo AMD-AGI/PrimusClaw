@@ -686,6 +686,12 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- Deleting a session that has no `hands.<sid>` binding and no key on its cleanup notification -- every session the
+  retention pass deletes, and every sweeper replay of a delete that already finished -- is a finished teardown with
+  nothing to address (`session.cleanup_nothing_addressable`), not `no_platform_key`. Claw holds no handle to anything
+  such a session could own, and parking it did nothing, so each one only logged `session.cleanup_incomplete_parked`
+  and counted `claw_brain_session_cleanup_incomplete_total` once per Brain replica, firing the sandbox-teardown alert.
+  A binding without a key, or a KV store that cannot be read, is still reported as incomplete.
 - An on-behalf review of a pull request that changes two or more `SKILL.md` files can approve again: Brain's
   skill-read guard (`BRAIN_BLOCK_SKILL_SUBAGENTS`) turned its second pass away, since that pass names the files the
   review read, and an approval needs the second pass. The guard no longer applies to a session that acts as a user
