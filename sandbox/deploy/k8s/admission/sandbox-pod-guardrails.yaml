@@ -1,0 +1,193 @@
+# Guardrails for sandbox Pods, enforced by the API server whoever creates the Pod:
+# SaFE (Workload kind Sandbox), the Agent Sandbox controller (agents.x-k8s.io
+# Sandbox / SandboxWarmPool), Claw, or a Pod created directly with sandbox labels.
+# Kubernetes-native (ValidatingAdmissionPolicy, GA since 1.30); no webhook to run.
+#
+# A Pod is a sandbox when any of these holds:
+#   - an owner reference to agents.x-k8s.io Sandbox or extensions.agents.x-k8s.io SandboxWarmPool;
+#   - a label agents.x-k8s.io/sandbox-name-hash, agents.x-k8s.io/pool or
+#     runtime.agent-sandbox.io/sandbox-name;
+#   - labels team=primus-claw and primus-claw/component (Claw's sandbox labels).
+#
+# Refused for such a Pod (CREATE, and adding ephemeral containers):
+#   - a volume from PVC pfs-1 (the shared workspace file system), or any PVC whose
+#     name does not end in -<sandbox name> (the Agent Sandbox volumeClaimTemplates
+#     naming); generic ephemeral volumes are per Pod and allowed;
+#   - volume types other than emptyDir, configMap, secret, downwardAPI, projected,
+#     ephemeral, persistentVolumeClaim, hostPath and image (no inline nfs/cephfs/csi);
+#   - hostPath outside the roots the parameter ConfigMap lists for the namespace;
+#   - a ServiceAccount token: automountServiceAccountToken must be false and no
+#     projected serviceAccountToken source may be present;
+#   - hostNetwork, hostPID, hostIPC, hostPort, privileged;
+#   - allowPrivilegeEscalation not explicitly false;
+#   - capabilities that do not drop ALL, or add anything outside
+#     AUDIT_WRITE, CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, NET_BIND_SERVICE,
+#     SETGID, SETUID (sandboxes run as root: apt, chown, su to a service user,
+#     signal its processes; NET_RAW, MKNOD, SYS_CHROOT, SETPCAP, SETFCAP are dropped);
+#   - a seccomp profile other than RuntimeDefault or Localhost.
+# Running Pods are not affected; only creation (and ephemeral containers) is checked.
+#
+# Parameters: ConfigMap kube-system/sandbox-pod-guardrails, one key per namespace
+# whose sandboxes may mount host paths, value = comma-separated allowed roots
+# (a path equal to a root or below it). See params-<cluster>.yaml. A missing
+# ConfigMap refuses every sandbox Pod (parameterNotFoundAction: Deny).
+#
+# Apply (per cluster, params first):
+#   kubectl --context <cluster> apply -f params-<cluster>.yaml
+#   kubectl --context <cluster> apply -f sandbox-pod-guardrails.yaml
+# The binding starts in [Audit, Warn]: violations are returned as warnings and
+# written to the API audit log (annotation
+# validation.policy.admission.k8s.io/validation_failure), nothing is refused.
+# Switch to [Deny] once live sandboxes comply.
+# Rollback:
+#   kubectl --context <cluster> delete validatingadmissionpolicybinding sandbox-pod-guardrails
+#   kubectl --context <cluster> delete validatingadmissionpolicy sandbox-pod-guardrails
+#   kubectl --context <cluster> -n kube-system delete configmap sandbox-pod-guardrails
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: sandbox-pod-guardrails
+  labels:
+    app.kubernetes.io/part-of: agent-sandbox
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["pods", "pods/ephemeralcontainers"]
+  matchConditions:
+  - name: create-or-ephemeral-containers
+    expression: request.operation == 'CREATE' || request.subResource == 'ephemeralcontainers'
+  - name: is-sandbox
+    expression: >-
+      object.metadata.?ownerReferences.orValue([]).exists(o,
+        (o.apiVersion.startsWith('agents.x-k8s.io/') && o.kind == 'Sandbox') ||
+        (o.apiVersion.startsWith('extensions.agents.x-k8s.io/') && o.kind == 'SandboxWarmPool')) ||
+      'agents.x-k8s.io/sandbox-name-hash' in object.metadata.?labels.orValue({}) ||
+      'agents.x-k8s.io/pool' in object.metadata.?labels.orValue({}) ||
+      'runtime.agent-sandbox.io/sandbox-name' in object.metadata.?labels.orValue({}) ||
+      (object.metadata.?labels.orValue({})[?'team'].orValue('') == 'primus-claw' &&
+       'primus-claw/component' in object.metadata.?labels.orValue({}))
+  variables:
+  - name: sandboxOwners
+    expression: >-
+      object.metadata.?ownerReferences.orValue([]).filter(o,
+        o.apiVersion.startsWith('agents.x-k8s.io/') && o.kind == 'Sandbox').map(o, o.name)
+  - name: sandboxName
+    expression: >-
+      size(variables.sandboxOwners) > 0 ? variables.sandboxOwners[0] :
+      object.metadata.?labels.orValue({})[?'runtime.agent-sandbox.io/sandbox-name'].orValue('')
+  - name: volumes
+    expression: object.spec.?volumes.orValue([])
+  - name: hostPathRoots
+    expression: >-
+      params.?data.orValue({})[?request.namespace].orValue('').split(',').map(r, r.trim()).filter(r, r != '')
+  - name: allowedCapabilities
+    expression: >-
+      ['AUDIT_WRITE', 'CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'FSETID', 'KILL',
+       'NET_BIND_SERVICE', 'SETGID', 'SETUID']
+  - name: podSeccompType
+    expression: object.spec.?securityContext.?seccompProfile.?type.orValue('')
+  - name: bad_privileged
+    expression: >-
+      object.spec.containers.filter(c, c.?securityContext.?privileged.orValue(false)).map(c, c.name) +
+      object.spec.?initContainers.orValue([]).filter(c, c.?securityContext.?privileged.orValue(false)).map(c, c.name) +
+      object.spec.?ephemeralContainers.orValue([]).filter(c, c.?securityContext.?privileged.orValue(false)).map(c, c.name)
+  - name: bad_allowPrivilegeEscalation
+    expression: >-
+      object.spec.containers.filter(c, c.?securityContext.?allowPrivilegeEscalation.orValue(true)).map(c, c.name) +
+      object.spec.?initContainers.orValue([]).filter(c, c.?securityContext.?allowPrivilegeEscalation.orValue(true)).map(c, c.name) +
+      object.spec.?ephemeralContainers.orValue([]).filter(c, c.?securityContext.?allowPrivilegeEscalation.orValue(true)).map(c, c.name)
+  - name: bad_capabilities
+    expression: >-
+      object.spec.containers.filter(c, !c.?securityContext.?capabilities.?drop.orValue([]).exists(d, d == 'ALL') || !c.?securityContext.?capabilities.?add.orValue([]).all(a, a in variables.allowedCapabilities)).map(c, c.name) +
+      object.spec.?initContainers.orValue([]).filter(c, !c.?securityContext.?capabilities.?drop.orValue([]).exists(d, d == 'ALL') || !c.?securityContext.?capabilities.?add.orValue([]).all(a, a in variables.allowedCapabilities)).map(c, c.name) +
+      object.spec.?ephemeralContainers.orValue([]).filter(c, !c.?securityContext.?capabilities.?drop.orValue([]).exists(d, d == 'ALL') || !c.?securityContext.?capabilities.?add.orValue([]).all(a, a in variables.allowedCapabilities)).map(c, c.name)
+  - name: bad_seccomp
+    expression: >-
+      object.spec.containers.filter(c, !(c.?securityContext.?seccompProfile.?type.orValue(variables.podSeccompType) in ['RuntimeDefault', 'Localhost'])).map(c, c.name) +
+      object.spec.?initContainers.orValue([]).filter(c, !(c.?securityContext.?seccompProfile.?type.orValue(variables.podSeccompType) in ['RuntimeDefault', 'Localhost'])).map(c, c.name) +
+      object.spec.?ephemeralContainers.orValue([]).filter(c, !(c.?securityContext.?seccompProfile.?type.orValue(variables.podSeccompType) in ['RuntimeDefault', 'Localhost'])).map(c, c.name)
+  - name: bad_hostPort
+    expression: >-
+      object.spec.containers.filter(c, c.?ports.orValue([]).exists(p, p.?hostPort.orValue(0) != 0)).map(c, c.name) +
+      object.spec.?initContainers.orValue([]).filter(c, c.?ports.orValue([]).exists(p, p.?hostPort.orValue(0) != 0)).map(c, c.name) +
+      object.spec.?ephemeralContainers.orValue([]).filter(c, c.?ports.orValue([]).exists(p, p.?hostPort.orValue(0) != 0)).map(c, c.name)
+  validations:
+  - expression: >-
+      variables.volumes.all(v, !has(v.persistentVolumeClaim) || v.persistentVolumeClaim.claimName != 'pfs-1')
+    reason: Forbidden
+    message: 'sandbox pod: the shared workspace volume (PVC pfs-1) may not be mounted'
+  - expression: >-
+      variables.volumes.all(v, !has(v.persistentVolumeClaim) ||
+        (variables.sandboxName != '' && v.persistentVolumeClaim.claimName.endsWith('-' + variables.sandboxName)))
+    reason: Forbidden
+    messageExpression: >-
+      'sandbox pod: PVC ' + variables.volumes.filter(v, has(v.persistentVolumeClaim)).map(v, v.persistentVolumeClaim.claimName).join(',') +
+      ' was not created for sandbox "' + variables.sandboxName + '" (its name must end in -<sandbox name>)'
+  - expression: >-
+      variables.volumes.all(v, has(v.emptyDir) || has(v.configMap) || has(v.secret) || has(v.downwardAPI) ||
+        has(v.projected) || has(v.ephemeral) || has(v.persistentVolumeClaim) || has(v.hostPath) || has(v.image))
+    reason: Forbidden
+    messageExpression: >-
+      'sandbox pod: volume ' + variables.volumes.filter(v, !(has(v.emptyDir) || has(v.configMap) || has(v.secret) ||
+        has(v.downwardAPI) || has(v.projected) || has(v.ephemeral) || has(v.persistentVolumeClaim) || has(v.hostPath) ||
+        has(v.image))).map(v, v.name).join(',') + ' has a type sandboxes may not use'
+  - expression: >-
+      variables.volumes.all(v, !has(v.hostPath) ||
+        (!v.hostPath.path.contains('/..') &&
+         variables.hostPathRoots.exists(r, v.hostPath.path == r || v.hostPath.path.startsWith(r + '/'))))
+    reason: Forbidden
+    messageExpression: >-
+      'sandbox pod: hostPath ' + variables.volumes.filter(v, has(v.hostPath)).map(v, v.hostPath.path).join(',') +
+      ' is outside the roots allowed in namespace ' + request.namespace + ' [' + variables.hostPathRoots.join(',') + ']'
+  - expression: >-
+      object.spec.?automountServiceAccountToken.orValue(true) == false &&
+      variables.volumes.all(v, !has(v.projected) || v.projected.?sources.orValue([]).all(s, !has(s.serviceAccountToken)))
+    reason: Forbidden
+    message: 'sandbox pod: automountServiceAccountToken must be false and no ServiceAccount token may be projected'
+  - expression: >-
+      !object.spec.?hostNetwork.orValue(false) && !object.spec.?hostPID.orValue(false) && !object.spec.?hostIPC.orValue(false)
+    reason: Forbidden
+    message: 'sandbox pod: hostNetwork, hostPID and hostIPC are not allowed'
+  - expression: size(variables.bad_privileged) == 0
+    reason: Forbidden
+    messageExpression: >-
+      'sandbox pod: ' + variables.bad_privileged.join(',') + ': privileged containers are not allowed'
+  - expression: size(variables.bad_allowPrivilegeEscalation) == 0
+    reason: Forbidden
+    messageExpression: >-
+      'sandbox pod: ' + variables.bad_allowPrivilegeEscalation.join(',') + ': securityContext.allowPrivilegeEscalation must be false'
+  - expression: size(variables.bad_capabilities) == 0
+    reason: Forbidden
+    messageExpression: >-
+      'sandbox pod: ' + variables.bad_capabilities.join(',') + ': capabilities must drop ALL and add only ' + variables.allowedCapabilities.join(',') + ''
+  - expression: size(variables.bad_seccomp) == 0
+    reason: Forbidden
+    messageExpression: >-
+      'sandbox pod: ' + variables.bad_seccomp.join(',') + ': seccompProfile must be RuntimeDefault (or Localhost), on the pod or the container'
+  - expression: size(variables.bad_hostPort) == 0
+    reason: Forbidden
+    messageExpression: >-
+      'sandbox pod: ' + variables.bad_hostPort.join(',') + ': hostPort is not allowed'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: sandbox-pod-guardrails
+  labels:
+    app.kubernetes.io/part-of: agent-sandbox
+spec:
+  policyName: sandbox-pod-guardrails
+  paramRef:
+    name: sandbox-pod-guardrails
+    namespace: kube-system
+    parameterNotFoundAction: Deny
+  # Audit + Warn while sandbox creators are brought into line; then [Deny].
+  validationActions: [Audit, Warn]

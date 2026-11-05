@@ -1,0 +1,10 @@
+# Parameters of sandbox-pod-guardrails on the global cluster (SaFE cluster "global").
+# No namespace may give sandboxes a host path: the CPU sandboxes in global-cpu need none.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sandbox-pod-guardrails
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/part-of: agent-sandbox
+data: {}
