@@ -29,6 +29,24 @@ record it.
 
 ### Added
 - A review asked of someone else (`POST /v1/assistant/reviews` with `acting_as` naming another person) is that person's: their item, their session sealed with their own keys (brought as `x-acting-as-token` and `x-acting-as-api-key`), their quota; their delegation switch is asked at creation and before every queued turn; the session runs with a fixed review profile and, on SaFE, a sandbox in `SANDBOX_CPU_NAMESPACE` created with `useWorkspaceStorage: false`; the requester sees four facts only. `POST /v1/sessions` refuses `requested_by`, `sandbox_profile`, `requester_note` and `acting_as` naming anyone but the caller (a deployment with `CLAW_ASSISTANT_REVIEW_ITEMS` off has no way to ask a review of someone else). New settings `CLAW_REVIEW_FOR_OTHERS_*`. The assistant's `review_start` refuses a review by someone else (`acting_as_credentials_required`; the user is sent to the review agent named by `CLAW_GITHUB_REVIEW_AGENT_NAME`); the requester's assistant lists the reviews they asked of others read-only (four facts), and `work_recall` / `work_stop` act on them with only those facts in the answer. A review the assistant's router starts or restarts merges nothing by itself, whatever its `merge` says: its session (`config.merge_needs_confirmation`, kept by every restart) holds its merge, and an approval GitHub's auto-merge would turn into one, for the acting user's confirmation whatever the risk and review mode, made only from the card's button or `批准 #<ref>` / `approve #<ref>`; while auto-merge is on, such a session (and a review-only one) resolves no thread (`gh_thread_resolve` answers `auto_merge_on`).
+- The user's long-term memory in the assistant, behind `CLAW_ASSISTANT_MEMORY_TOOLS` (`on` | `off`, default off; needs
+  `CLAW_ASSISTANT_ENABLED` and `CLAW_MEMORY_ENABLED`, and the user's own opt-in). A router turn is shown the one-line
+  index and offered `memory_recall`, `memory_save`, `memory_update`, `memory_forget` and `memory_undo`; each write acts only
+  for a turn that answers the person's own signed-in, recent message (the review tools' attended check: a worker's report,
+  a message sent with a key, a stale one or a turn that has read a worker's words is refused; reading works), on an entry whose number is in that message or
+  in what the assistant said to them just before, quoting that message, and never in a conversation marked
+  `memory: "off"`. A task item's worker is shown a read-only index and may only recall; a review item's session is shown
+  only the entries bound to its item, and so is a task item's worker while any of its pull request subscriptions allows
+  answers without asking (`reply_allowed`): no index in its prompt, and `memory_recall`, asked again on every call,
+  reaches only entries bound to its item. A worker's session keeps what it read from run to run, so once
+  an item's worker has been shown the index or recalled an entry beyond its item, `pr_reply` refuses that item for good
+  (`memory_reached`; it answers by asking, through the github tools) (`claw_work_items.memory_reached_at`, a new column
+  required at start-up). An entry can be bound to one work item (`claw_memory_entries.work_item_id`, a new
+  column required at start-up); bound entries are left out of the chat's catalogue, and a save is checked for a duplicate
+  or a near one only against entries of the same binding. Workers started from a session marked `memory: "off"` are
+  marked so too, and an assistant's watcher of a group or a repository is never served the chat's memory. The chat's
+  own memory tools and
+  their fixed forget and undo phrases are unchanged.
 - A work item can watch a GitHub pull request, behind `CLAW_ASSISTANT_GITHUB_EVENTS` (default off; needs
   `CLAW_ASSISTANT_ENABLED`). New comments, reviews, review comments, a failed CI on the head commit and the pull request
   closing reach the item's worker as one queued message, without anybody mentioning it and without going through the

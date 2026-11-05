@@ -492,6 +492,11 @@ export const CLAW_ASSISTANT_MAX_ACTIVE_ITEMS = envInt("CLAW_ASSISTANT_MAX_ACTIVE
 // On-behalf GitHub reviews as work items of the assistant (`POST /v1/assistant/reviews`). Needs
 // CLAW_ASSISTANT_ENABLED and CLAW_GITHUB_REVIEW_ENABLED as well; off, the routes do not exist.
 export const CLAW_ASSISTANT_REVIEW_ITEMS = envBool("CLAW_ASSISTANT_REVIEW_ITEMS", false);
+// `on` gives the assistant the user's long-term memory: the router a one-line index and the memory tools
+// (recall, and save/update/forget/undo for a signed-in message that names the entry), a task item's worker a
+// read-only index, a review item's session the entries bound to its item. Needs CLAW_ASSISTANT_ENABLED and
+// CLAW_MEMORY_ENABLED as well; anything else leaves every assistant turn exactly as without memory.
+export const CLAW_ASSISTANT_MEMORY_TOOLS = env("CLAW_ASSISTANT_MEMORY_TOOLS", "off").trim().toLowerCase() === "on";
 // GitHub events for work items: an item watches a pull request, and new comments, reviews and failed CI
 // reach its worker without anybody mentioning it (`assistant/github-events.ts`). Needs CLAW_ASSISTANT_ENABLED
 // as well; off, there are no subscription routes, no tools for them and nothing polls.
