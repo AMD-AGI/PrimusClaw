@@ -73,9 +73,13 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
+        runAsGroup: 1000
         fsGroup: 1000
-      {{- if or .Values.tls.extraCACertsConfigMap .Values.grantSigningKey.enabled .Values.api.extraVolumes }}
+        seccompProfile:
+          type: RuntimeDefault
       volumes:
+      - name: tmp
+        emptyDir: {}
       {{- if .Values.tls.extraCACertsConfigMap }}
       - name: extra-ca
         configMap:
@@ -91,7 +95,6 @@ spec:
       {{- end }}
       {{- with .Values.api.extraVolumes }}
       {{- toYaml . | nindent 6 }}
-      {{- end }}
       {{- end }}
       containers:
       - name: api
@@ -196,16 +199,21 @@ spec:
         {{- with .Values.api.extraEnv }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-        # The startup budget has to cover a schema migration, because initDb runs
-        # before the server listens: nothing answers /health while a migration is
-        # in flight, on the replica doing it and on every replica waiting behind
-        # its advisory lock. At 30 x 3s the budget was 90s while a single
-        # statement was allowed PG_MIGRATION_STATEMENT_TIMEOUT_MS (300s), so the
-        # longest migration the code permits could never finish -- the pod was
-        # killed and the next one started the same statement again. 120 x 3s is
-        # 360s, which leaves the statement its whole budget plus connect time.
-        {{- if or .Values.tls.extraCACertsConfigMap .Values.grantSigningKey.enabled .Values.api.extraVolumeMounts }}
+        securityContext:
+          # The root filesystem is read-only. The api writes no files of its own;
+          # anything that needs a temporary file gets /tmp, an emptyDir.
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
         volumeMounts:
+        - name: tmp
+          mountPath: {{ include "primus-claw.mountPath" (list . "api" "tmp") }}
         {{- if .Values.tls.extraCACertsConfigMap }}
         - name: extra-ca
           mountPath: {{ include "primus-claw.mountPath" (list . "api" "extra-ca") }}
@@ -219,7 +227,14 @@ spec:
         {{- with .Values.api.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-        {{- end }}
+        # The startup budget has to cover a schema migration, because initDb runs
+        # before the server listens: nothing answers /health while a migration is
+        # in flight, on the replica doing it and on every replica waiting behind
+        # its advisory lock. At 30 x 3s the budget was 90s while a single
+        # statement was allowed PG_MIGRATION_STATEMENT_TIMEOUT_MS (300s), so the
+        # longest migration the code permits could never finish -- the pod was
+        # killed and the next one started the same statement again. 120 x 3s is
+        # 360s, which leaves the statement its whole budget plus connect time.
         startupProbe:
           httpGet: { path: /health, port: http }
           periodSeconds: 3
