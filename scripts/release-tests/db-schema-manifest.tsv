@@ -5,6 +5,7 @@ table	claw_sessions	status_event_at
 table	claw_sessions	user_id
 table	claw_sessions	config
 table	claw_sessions	parent_session_id
+table	claw_sessions	archived_at
 table	claw_session_events	processed_at
 table	claw_idempotency_keys	expires_at
 table	claw_conversation_turns	turn_index
