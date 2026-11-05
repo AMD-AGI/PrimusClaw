@@ -24,6 +24,10 @@ import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, SayRefused, type SayDeps } from "./outbound.js";
 import { requestedItemOf, requesterViewOf, type RequesterView } from "./requester-view.js";
 import { parseReport } from "./report.js";
+import { resolveUserLlmKey } from "../llm/key-source.js";
+import {
+  assertAllowedModel, isAllowedModel, modelAnswer, modelChoiceOn, ModelChoiceRefused, modelParams, resolveItemModel, writeModelPrefs, type ResolvedModel,
+} from "./model-choice.js";
 import { ingestReport } from "./reports.js";
 import type { AssistantTokenClaims } from "./token.js";
 import {
@@ -149,9 +153,35 @@ function memoryOffIn(config: unknown): boolean {
   return memory === "off" || memory === false;
 }
 
+/**
+ * The model a router turn's item runs on (`model-choice.ts`), with the key the router's own session holds: the user's, which the item's
+ * worker is sealed with as well. A refusal is the tool's.
+ */
+async function itemModelFor(claims: AssistantTokenClaims, asked: string | undefined): Promise<ResolvedModel> {
+  const userId = await assistantUser(claims.sid);
+  const router = (await db.query("SELECT config FROM claw_sessions WHERE session_id = $1", [claims.sid])).rows[0] as { config: unknown } | undefined;
+  const creds = readTrustedSessionCredentials(router?.config);
+  try {
+    return await resolveItemModel((t, p) => db.query(t, p), {
+      kind: "task", payerUserId: userId, asked: asked ?? null,
+      payerKey: resolveUserLlmKey({ userId, userName: userId, roles: [], platformKey: creds.platformKey, virtualKey: creds.llmApiKey }),
+    });
+  } catch (err) {
+    if (err instanceof ModelChoiceRefused) throw new ToolRefused(err.code, err.message, err.data);
+    throw err;
+  }
+}
+
+/** A `model` argument as the tools take it: absent, or a non-empty string. */
+function modelArg(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  if (typeof raw !== "string") throw new ToolRefused("invalid_arguments", "model must be a model name");
+  return raw.trim();
+}
+
 export async function workCreate(
-  claims: AssistantTokenClaims, args: { title: string; brief: string; repo?: unknown },
-): Promise<{ ok: true; item_id: string; seq: number; deduplicated: boolean }> {
+  claims: AssistantTokenClaims, args: { title: string; brief: string; repo?: unknown; model?: string },
+): Promise<{ ok: true; item_id: string; seq: number; deduplicated: boolean; model?: string | null; fell_back_from?: string }> {
   requireRole(claims, "router");
   const title = clipOneLine(args.title, TITLE_MAX);
   const brief = args.brief.trim();
@@ -162,6 +192,8 @@ export async function workCreate(
     if (!parsed.ok) throw new ToolRefused("invalid_repo", parsed.error);
     repo = parsed.repo ?? undefined;
   }
+  // With model choice off the worker asks for the deployment's worker model, as it always did, and its item records nothing of it.
+  const choice = modelChoiceOn() ? await itemModelFor(claims, modelArg(args.model)) : null;
   const created = await inTransaction(async (query) => {
     const q = { query };
     const { userId } = await assertLiveRun(query, claims);
@@ -195,9 +227,9 @@ export async function workCreate(
       config: { ...sealedCredentialFields(creds), ...(repo !== undefined ? { repo } : {}), ...(memoryOffIn(router?.config) ? { memory: "off" } : {}) },
       parentSid: null,
       role: "",
-      model: CLAW_ASSISTANT_WORKER_MODEL || null,
+      model: choice ? choice.model : CLAW_ASSISTANT_WORKER_MODEL || null,
     }, { parentSid: null });
-    const item = await insertWorkItem(q, { userId, title, workerSessionId, repo });
+    const item = await insertWorkItem(q, { userId, title, workerSessionId, repo, ...(choice ? { params: modelParams(choice) } : {}) });
     if (!item.ok) {
       throw new ToolRefused(item.error, item.error === "too_many_active_items"
         ? "too many unfinished items: ask the user which to stop or finish first"
@@ -211,15 +243,22 @@ export async function workCreate(
   });
   // The row is the commitment; running it is only the drain, which the sweeper repeats if this is lost.
   if (created.workerSessionId) await drainSessionIfIdle(created.workerSessionId, created.userId);
-  return { ok: true, item_id: created.itemId, seq: created.seq, deduplicated: created.workerSessionId === null };
+  return {
+    ok: true, item_id: created.itemId, seq: created.seq, deduplicated: created.workerSessionId === null,
+    // A replayed call names the item made the first time, whose model was decided then.
+    ...(choice && created.workerSessionId ? modelAnswer(choice) : {}),
+  };
 }
 
 export async function workSend(
-  claims: AssistantTokenClaims, args: { item_id: string; text: string },
-): Promise<{ ok: true; item_id: string; seq: number; status: "in_progress" }> {
+  claims: AssistantTokenClaims, args: { item_id: string; text: string; model?: string },
+): Promise<{ ok: true; item_id: string; seq: number; status: "in_progress"; model?: string | null; fell_back_from?: string }> {
   requireRole(claims, "router");
   const text = args.text.trim();
   if (!text) throw new ToolRefused("invalid_arguments", "work_send needs text");
+  // A model named with the instruction is the item's from this turn on; none named keeps the one it has.
+  const asked = modelChoiceOn() ? modelArg(args.model) : undefined;
+  const choice = asked ? await itemModelFor(claims, asked) : null;
   const sent = await inTransaction(async (query) => {
     const q = { query };
     const { userId } = await assertLiveRun(query, claims);
@@ -241,12 +280,47 @@ export async function workSend(
     if (!await reopenWorkItem(q, { userId, itemId: item.item_id, text })) {
       throw new ToolRefused("item_closed", "that item is finished or stopped; start a new item instead");
     }
+    if (choice) {
+      await query("UPDATE claw_sessions SET model = $2, updated_at = NOW() WHERE session_id = $1", [item.worker_session_id, choice.model]);
+      await query(
+        "UPDATE claw_work_items SET params = (params - 'model_asked') || $2::jsonb WHERE item_id = $1",
+        [item.item_id, JSON.stringify(modelParams(choice))],
+      );
+    }
     const queued = await queueServerMessage(q, { sessionId: item.worker_session_id, userId, content: text });
     if (!queued.ok) throw new ToolRefused(queued.error, "the instruction could not be delivered");
     return { userId, item, workerSessionId: item.worker_session_id };
   });
   if (sent.workerSessionId) await drainSessionIfIdle(sent.workerSessionId, sent.userId);
-  return { ok: true, item_id: sent.item.item_id, seq: sent.item.seq, status: "in_progress" };
+  return { ok: true, item_id: sent.item.item_id, seq: sent.item.seq, status: "in_progress", ...(choice && sent.workerSessionId ? modelAnswer(choice) : {}) };
+}
+
+/**
+ * `model_default_set`: the user's own default model from now on, for every item (`kind` left out) or for reviews (`kind: "review"`);
+ * `model: null` clears it. It changes their settings, so only a turn that answers their own signed-in message may (`attendedTurn`).
+ */
+export async function modelDefaultSet(
+  claims: AssistantTokenClaims, args: { kind?: string; model: string | null },
+): Promise<{ ok: true; kind: "default" | "review"; model: string | null }> {
+  requireRole(claims, "router");
+  if (!modelChoiceOn()) throw new ToolRefused("not_allowed", "model choice is off on this deployment");
+  if (args.kind !== undefined && args.kind !== "review" && args.kind !== "default") {
+    throw new ToolRefused("invalid_arguments", "kind is review, or left out for every item");
+  }
+  const model = args.model === null || args.model === undefined || args.model === "" ? null : modelArg(args.model) ?? null;
+  if (model !== null && !isAllowedModel(model)) {
+    // The same refusal, and the same list, as an item that names it.
+    try { assertAllowedModel(model); } catch (err) {
+      if (err instanceof ModelChoiceRefused) throw new ToolRefused(err.code, err.message, err.data);
+      throw err;
+    }
+  }
+  const field = args.kind === "review" ? "review_model" : "default_model";
+  const saved = await inTransaction(async (query) => {
+    const { userId } = await attendedTurn(query, claims);
+    return writeModelPrefs(query, userId, { [field]: model });
+  });
+  return { ok: true, kind: args.kind === "review" ? "review" : "default", model: saved[field] };
 }
 
 export async function workStop(

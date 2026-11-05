@@ -341,6 +341,7 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
     "assistant/github-events.ts": "hands GitHub events to a task item's worker through queueServerMessage, which it gives no proof, so an acting session is refused; a review item cannot subscribe and its stored events are dropped before that",
     "assistant/observe.ts": "queues a place's message on the caller's own watcher session, made without acting_as; queueServerMessage, given no proof, refuses one that carries it",
     "assistant/review-items.ts": "queues a review session's first message with the proof that routes/assistant.ts's request passed checkSessionCreate (below)",
+    "assistant/model-fallback.ts": "runs a refused turn again: a worker's or the router's through queueServerMessage, which refuses an acting session without the proof, and a review's first message through review-items.ts with proofForFirstMessageAgain (below)",
     "routes/a2a.ts": "A2A sessions are made by A2A for its caller (a2a_caller_id) and never carry config.acting_as",
     "routes/a2a-v2.ts": "the same sessions: the decision it forwards answers a turn of one of them",
     "infra/metrics.ts": "the name of a metric label, not a call",
@@ -373,6 +374,13 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   const proofMade = [...found.keys(), "github-review/acting-session.ts"].filter((f) => /as AttendedProof\b/.test(stripComments(readFileSync(join(src, f), "utf8"))));
   assert.deepEqual(proofMade, ["github-review/acting-session.ts"], "the attended proof is made in acting-session.ts and nowhere else");
   assert.match(actingSession, /if \(!caller\.ok\) return[\s\S]*?attended = \{ via: caller\.via \} as AttendedProof;/, "and only after the classifier said yes");
+  // The one other proof: the same first message queued again, once its first turn was refused before its model ran, made only when the
+  // database shows that session ran that one turn, it failed and its words are the same; asked for by the review items alone.
+  assert.equal((actingSession.match(/as AttendedProof\b/g) ?? []).length, 2, "two places make a proof: the create's check and the first message's re-run");
+  assert.match(actingSession, /Number\(row\.turns\) !== 1[\s\S]*?row\.status !== "failed" \|\| row\.words !== content\) return null;\s*return \{ via: null \} as AttendedProof;/,
+    "the re-run's proof only for a session whose one turn failed with the same words");
+  const rerunProof = [...found.keys()].filter((f) => /\bproofForFirstMessageAgain\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
+  assert.deepEqual(rerunProof, ["assistant/review-items.ts"], "only the review items ask for the re-run's proof");
   const messages = stripComments(readFileSync(join(src, "assistant/messages.ts"), "utf8"));
   assert.match(messages, /if \(actingUserOf\(session\.config\) !== null && !m\.attended\) return \{ ok: false, error: "acting_session_unattended" \};/, "queueServerMessage refuses an acting session without the proof");
   const handsProof = [...found.keys()].filter((f) => /\battended: \w+\.attended\b/.test(stripComments(readFileSync(join(src, f), "utf8"))));

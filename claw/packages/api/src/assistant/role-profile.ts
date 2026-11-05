@@ -27,10 +27,12 @@ import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import { reviewMemoryBlock, routerMemoryBlock, workerMemoryBlock } from "./memory-tools.js";
 import {
-  ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_PROMPT_VERSION, ROUTER_REVIEW_PROMPT_VERSION,
-  WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderObserverSystem, renderReviewContext, renderRouterSystem, renderWorkerSystem,
-  type AskedOfOtherLine, type ManifestItem,
+  ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
+  ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderModelChoice, renderObserverSystem, renderReviewContext,
+  renderRouterSystem, renderWorkerSystem, type AskedOfOtherLine, type ManifestItem,
 } from "./prompts.js";
+import { allowedModels, modelChoiceOn, platformModel, readModelPrefs } from "./model-choice.js";
+import { rerunModelOf } from "./model-fallback.js";
 import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
 import { startWorkerRun } from "./run-started.js";
@@ -225,16 +227,30 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     }
     const memory = await routerMemoryBlock(role.userId, sessionId);
     if (memory) withSystemAppend(task, memory);
+    const choice = modelChoiceOn();
+    if (choice) {
+      // The allow-list with its labels and the user's own defaults, so that "the fast one" becomes a name the tools take.
+      const prefs = await readModelPrefs((t, p) => db.query(t, p), role.userId);
+      withSystemAppend(task, renderModelChoice({
+        models: allowedModels(), defaultModel: prefs.default_model, reviewModel: prefs.review_model,
+        platformTask: platformModel("task"), platformReview: platformModel("review"),
+      }));
+      // A turn the gateway refused for want of a key binding, run again on the fallback (`model-fallback.ts`): this turn only.
+      const rerun = await rerunModelOf(sessionId, messageId);
+      if (rerun) task.model = rerun;
+    }
     await addReplyLanguage(task, sessionId);
     logger.info({
       sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION,
-      ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}),
+      ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
     }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);
     if (!started) throw new Error("assistant.worker_item_missing");
     claims = { ...base, role: "worker", item_id: started.itemId, gen: started.generation };
-    if (CLAW_ASSISTANT_WORKER_MODEL) task.model = CLAW_ASSISTANT_WORKER_MODEL;
+    // With model choice on, the worker's session holds the model chosen for its item (`model-choice.ts`), and the deployment's worker
+    // model only fills in for a session that names none. Off, it is every worker turn's model, as it always was.
+    if (CLAW_ASSISTANT_WORKER_MODEL && !(modelChoiceOn() && stringField(task, "model"))) task.model = CLAW_ASSISTANT_WORKER_MODEL;
     withSystemAppend(task, renderWorkerSystem({ seq: started.seq, title: started.title }));
     const memory = await workerMemoryBlock(role.userId, started.itemId, sessionId);
     if (memory) withSystemAppend(task, memory);
