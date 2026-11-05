@@ -91,7 +91,10 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
+        runAsGroup: 1000
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       terminationGracePeriodSeconds: {{ .Values.brain.terminationGracePeriodSeconds }}
       initContainers:
       - name: wait-for-migration
@@ -133,6 +136,16 @@ spec:
         resources:
           requests: { cpu: "50m", memory: "32Mi" }
           limits: { cpu: "200m", memory: "128Mi" }
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: kubernetes.io/hostname
@@ -151,8 +164,9 @@ spec:
                 matchLabels:
                   app: primus-claw
                   component: primus-claw-brain
-      {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.tls.extraCACertsConfigMap .Values.brain.extraVolumes }}
       volumes:
+      - name: tmp
+        emptyDir: {}
       {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
       - name: sandbox-template
         configMap:
@@ -168,7 +182,6 @@ spec:
       {{- end }}
       {{- with .Values.brain.extraVolumes }}
       {{- toYaml . | nindent 6 }}
-      {{- end }}
       {{- end }}
       containers:
       - name: brain
@@ -337,8 +350,21 @@ spec:
         {{- with .Values.brain.extraEnv }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-        {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.tls.extraCACertsConfigMap .Values.brain.extraVolumeMounts }}
+        securityContext:
+          # The root filesystem is read-only; the process writes only under /tmp
+          # (os.tmpdir(): skill staging and plugin work), an emptyDir below.
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
         volumeMounts:
+        - name: tmp
+          mountPath: {{ include "primus-claw.mountPath" (list . "brain" "tmp") }}
         {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
         - name: sandbox-template
           mountPath: {{ include "primus-claw.mountPath" (list . "brain" "sandbox-template") }}
@@ -351,7 +377,6 @@ spec:
         {{- end }}
         {{- with .Values.brain.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
-        {{- end }}
         {{- end }}
         startupProbe:
           httpGet: { path: /health, port: http }
