@@ -10,7 +10,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { PGlite } from "@electric-sql/pglite";
 import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
-import { GithubReview, type ReviewActor } from "../../src/github-review/service.js";
+import { GithubReview, type ReviewActor, type ReviewDeps } from "../../src/github-review/service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "../../src/github-review/settings.js";
 import { GITHUB_REVIEW_SCHEMA_SQL, type Queryable } from "../../src/github-review/store.js";
 import { FakeGithub, HEAD } from "./fake-github.js";
@@ -104,7 +104,11 @@ export function ownApproval(sessionId: string, head: string = HEAD, prefix = "cl
 
 export async function reviewEnv(
   env: Record<string, string> = {},
-  over: { actor?: Partial<ReviewActor>; cred?: Partial<ResolvedCredential>; reviewed?: boolean; approved?: boolean } = {},
+  over: {
+    actor?: Partial<ReviewActor>; cred?: Partial<ResolvedCredential>; reviewed?: boolean; approved?: boolean;
+    /** What a review item adds to the service (`continuationOf`, `recordPosted`, `sessionStopped`). */
+    deps?: Pick<ReviewDeps, "continuationOf" | "recordPosted" | "sessionStopped">;
+  } = {},
 ): Promise<ReviewEnv> {
   const pg = (shared ??= new PGlite());
   await pg.exec("DROP TABLE IF EXISTS claw_github_audit, claw_github_confirmations, claw_github_review_settings, claw_github_write_locks, claw_sessions, claw_session_events");
@@ -129,6 +133,7 @@ export async function reviewEnv(
     settings: () => current, db, fetchImpl: gh.fetch,
     sleep: async (ms) => { sleeps.push(ms); hooks.onSleep(ms); },
     resolveCredential: async (req) => { resolved.push(req); return identity.answer(req); },
+    ...over.deps,
   });
   const actor: ReviewActor = { sessionId: "s-1", requesterUserId: "u-alice", actorUserId: "u-bob", requesterLabel: "Alice A", ...over.actor };
   const made = {

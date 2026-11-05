@@ -106,6 +106,9 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
       updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`,
   `CREATE INDEX IF NOT EXISTS idx_github_audit_session ON claw_github_audit(session_id)`,
+  // What a review that was posted said, for the review item it belongs to (assistant/review-items.ts reviewRecord): its event and each inline
+  // finding with the thread GitHub made for it. Written only for a review item's session; null for every other call.
+  `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS posted JSONB`,
 ];
 
 export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<void> {
@@ -208,7 +211,14 @@ export interface AuditFinish {
   reviewPath?: string;
   reviewPathReason?: string;
   reviewMode?: string;
+  /** A posted review's record (`PostedReview`), for a review item's session only. */
+  posted?: PostedReview | null;
 }
+
+/** One inline finding of a posted review: where it is, the thread GitHub opened for it (null when that could not be read) and its first words. */
+export interface PostedFinding { path: string; line: number; thread_id: string | null; note: string }
+/** What a posted review said, as `claw_github_audit.posted` keeps it. */
+export interface PostedReview { event: string; review_id: number | null; findings: PostedFinding[] }
 
 export async function auditStart(db: Queryable, a: AuditStart): Promise<number> {
   const r = await db.query(
@@ -225,12 +235,14 @@ export async function auditFinish(db: Queryable, id: number, f: AuditFinish): Pr
         SET repo = COALESCE($2, repo), pr = COALESCE($3, pr), head_sha = COALESCE($4, head_sha),
             github_requests = $5, github_request_ids = $6::jsonb, github_status = $7,
             risk_reasons = $8::jsonb, confirmation_id = $9, dry_run = $10, write = $11,
-            result = $12, detail = $13, review_path = $14, review_path_reason = $15, review_mode = COALESCE($16, review_mode)
+            result = $12, detail = $13, review_path = $14, review_path_reason = $15, review_mode = COALESCE($16, review_mode),
+            posted = COALESCE($17::jsonb, posted)
       WHERE id = $1`,
     [
       id, f.repo ?? null, f.pr ?? null, f.headSha ?? null, f.githubRequests, JSON.stringify(f.githubRequestIds.slice(-20)),
       f.githubStatus ?? null, JSON.stringify(f.riskReasons ?? []), f.confirmationId ?? null, f.dryRun, f.write,
       f.result, (f.detail ?? "").slice(0, 500), f.reviewPath ?? null, f.reviewPathReason ?? null, f.reviewMode ?? null,
+      f.posted ? JSON.stringify(f.posted) : null,
     ],
   );
 }
