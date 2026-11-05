@@ -40,7 +40,7 @@
  * started, the items on the board, and the time each message arrived here.
  */
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 
 import { percentile, traceOf, type EventRow, type ToolCall } from "./agent-eval-lib.js";
@@ -115,10 +115,12 @@ export function loadCases(dir: string): { cases: Array<EvalCase & { dir: string 
   const cases: Array<EvalCase & { dir: string }> = [];
   const bad: string[] = [];
   const walk = (d: string): void => {
-    for (const name of readdirSync(d).sort()) {
+    // The entry's own type, read with the listing: no separate stat that a change between the two could make stale.
+    for (const entry of readdirSync(d, { withFileTypes: true }).sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0))) {
+      const name = entry.name;
       const p = join(d, name);
-      if (statSync(p).isDirectory()) walk(p);
-      else if (name.endsWith(".jsonl")) {
+      if (entry.isDirectory()) walk(p);
+      else if (entry.isFile() && name.endsWith(".jsonl")) {
         const got = parseCases(readFileSync(p, "utf8"), relative(dir, p));
         bad.push(...got.bad);
         const sub = relative(dir, d).split("/")[0] || "";
