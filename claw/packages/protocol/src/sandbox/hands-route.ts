@@ -13,9 +13,10 @@
  *
  * - it finds the session from the `x-session-id` header, and refuses a GET
  *   without one (a POST without one would ask it to create a sandbox);
- * - it strips `Authorization` before forwarding, so Hands never sees the
- *   bearer credential. On a routed URL the credential therefore also travels
- *   in {@link HANDS_TOKEN_HEADER}, which Hands accepts in its place.
+ * - it authenticates `Authorization` as the caller (the session owner's
+ *   platform key) and strips it before forwarding, so Hands never sees it. On a
+ *   routed URL the Hands credential therefore travels in
+ *   {@link HANDS_TOKEN_HEADER}, which Hands accepts in its place.
  *
  * Both are derived from the URL alone, so every caller holding a Hands URL --
  * Brain's client, its health probes, the API's inventory probe -- builds the
@@ -60,24 +61,28 @@ export function routedHandsPort(url: string): string | null {
   return routedParts(url)?.port ?? null;
 }
 
-/** Headers a Hands request needs to be routed at all; empty for a direct URL. */
-export function handsRouteHeaders(url: string): Record<string, string> {
+/**
+ * Headers a Hands request needs to pass the Router: the session, and the
+ * session owner's platform key, which the Router authenticates. Empty for a
+ * direct URL. Without a platform key a routed request carries no
+ * `Authorization` and the Router refuses it.
+ */
+export function handsRouteHeaders(url: string, platformKey = ""): Record<string, string> {
   const session = routedHandsSessionId(url);
-  return session ? { "x-session-id": session } : {};
+  if (!session) return {};
+  return platformKey
+    ? { "x-session-id": session, Authorization: `Bearer ${platformKey}` }
+    : { "x-session-id": session };
 }
 
 /**
- * The credential, and for a routed URL the routing headers and the credential
- * again in {@link HANDS_TOKEN_HEADER}. A direct URL gets exactly the one
- * `Authorization` header it always got, so nothing changes where the Router is
- * not in the path.
+ * The Hands credential as `Authorization` for a direct URL. For a routed URL,
+ * the routing headers with the platform key, and the Hands credential in
+ * {@link HANDS_TOKEN_HEADER}. A direct URL gets exactly the one `Authorization`
+ * header it always got, so nothing changes where the Router is not in the path.
  */
-export function handsCredentialHeaders(url: string, credential: string): Record<string, string> {
-  const route = handsRouteHeaders(url);
+export function handsCredentialHeaders(url: string, credential: string, platformKey = ""): Record<string, string> {
+  const route = handsRouteHeaders(url, platformKey);
   if (!route["x-session-id"]) return { Authorization: `Bearer ${credential}` };
-  return {
-    ...route,
-    Authorization: `Bearer ${credential}`,
-    [HANDS_TOKEN_HEADER]: credential,
-  };
+  return { ...route, [HANDS_TOKEN_HEADER]: credential };
 }

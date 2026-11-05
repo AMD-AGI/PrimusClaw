@@ -1111,7 +1111,10 @@ async function sweepStaleHandsPass(): Promise<void> {
       const handsUrl = (info.handsUrl as string) || "";
       if (!handsUrl) continue;
 
-      const health = await checkHandsHealth(handsUrl, SWEEPER_HEALTH_TIMEOUT_MS);
+      const health = await checkHandsHealth(
+        handsUrl, SWEEPER_HEALTH_TIMEOUT_MS, undefined,
+        typeof info.platformKey === "string" ? info.platformKey : "",
+      );
       if (health.ok) { sweeperFailureCounts.delete(sessionId); continue; }
 
       const fails = (sweeperFailureCounts.get(sessionId) ?? 0) + 1;

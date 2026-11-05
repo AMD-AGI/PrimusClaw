@@ -441,7 +441,7 @@ async function probeHandleSandbox(
   token?: string,
   signal?: AbortSignal,
 ): Promise<HandleSandboxState> {
-  const health = await checkHandsHealth(handsUrl, REUSE_HEALTH_TIMEOUT_MS, signal);
+  const health = await checkHandsHealth(handsUrl, REUSE_HEALTH_TIMEOUT_MS, signal, identity?.platformKey ?? "");
   if (health.ok) return { state: "serving", detail: health.detail };
   // Without both of these there is nothing to probe or restart WITH: the
   // container is reached through the identity, and Hands is relaunched with the
@@ -2059,7 +2059,10 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
     return null;
   }
 
-  const health = await checkHandsHealth(info.handsUrl as string, REUSE_HEALTH_TIMEOUT_MS, signal);
+  const health = await checkHandsHealth(
+    info.handsUrl as string, REUSE_HEALTH_TIMEOUT_MS, signal,
+    typeof info.platformKey === "string" ? info.platformKey : "",
+  );
   if (health.ok && hasToken) {
     logger.info(
       { sessionId, handsUrl: info.handsUrl, specMatch: verdict.reason },
@@ -2841,7 +2844,7 @@ async function provisionHands(
     try {
       // The shared probe, so a routed URL carries the session header the
       // Router needs and fails over between Router bases like every other call.
-      const hr = await checkHandsHealth(`${handsBaseUrl}/mcp`, 3000);
+      const hr = await checkHandsHealth(`${handsBaseUrl}/mcp`, 3000, undefined, inst.platformKey ?? "");
       if (hr.ok) { handsHealthy = true; break; }
     } catch { /* retry */ }
     await sleep(HANDS_HEALTH_INTERVAL_MS);

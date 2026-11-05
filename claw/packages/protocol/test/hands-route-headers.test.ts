@@ -17,15 +17,21 @@ test("a Router port-proxy URL names its session; a direct one names none", () =>
   assert.deepEqual(handsRouteHeaders(routed), { "x-session-id": "wl-1" });
 });
 
-test("the credential goes in both headers only when routed", () => {
-  // A direct URL keeps exactly the header it always had.
-  assert.deepEqual(handsCredentialHeaders("http://wl.ns.svc.cluster.local:9100/mcp", "t"), {
+test("a routed URL carries the platform key for the Router and the Hands token for Hands", () => {
+  const routed = "http://r/v1/namespaces/ns/code-interpreters/wl/invocations/proxy/9100/mcp";
+  // A direct URL keeps exactly the header it always had, platform key or not.
+  assert.deepEqual(handsCredentialHeaders("http://wl.ns.svc.cluster.local:9100/mcp", "t", "ak-1"), {
     Authorization: "Bearer t",
   });
-  assert.deepEqual(
-    handsCredentialHeaders("http://r/v1/namespaces/ns/code-interpreters/wl/invocations/proxy/9100/mcp", "t"),
-    { "x-session-id": "wl", Authorization: "Bearer t", "X-Hands-Token": "t" },
-  );
+  assert.deepEqual(handsCredentialHeaders(routed, "t", "ak-1"), {
+    "x-session-id": "wl", Authorization: "Bearer ak-1", "X-Hands-Token": "t",
+  });
+  assert.deepEqual(handsRouteHeaders(routed, "ak-1"), { "x-session-id": "wl", Authorization: "Bearer ak-1" });
+});
+
+test("the Hands token is never offered to the Router as a caller credential", () => {
+  const routed = "http://r/v1/namespaces/ns/code-interpreters/wl/invocations/proxy/9100/mcp";
+  assert.deepEqual(handsCredentialHeaders(routed, "t"), { "x-session-id": "wl", "X-Hands-Token": "t" });
 });
 
 test("a routed URL names the sandbox port, not the Router's", () => {

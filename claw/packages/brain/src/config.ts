@@ -193,9 +193,9 @@ export const SANDBOX_CPU_NAMESPACE = env("SANDBOX_CPU_NAMESPACE");
  * another cluster, where that name does not resolve and the Router is the only way in.
  * Has no effect without SANDBOX_ROUTER_URL.
  *
- * Routed Hands requests carry the per-sandbox Hands token (in Authorization and
- * X-Hands-Token), not a platform key. A Router with `--enable-auth` lets a Hands port
- * call through on X-Hands-Token, and Hands validates the token.
+ * Routed Hands requests carry the session owner's platform key in Authorization,
+ * which the Router authenticates and strips, and the per-sandbox Hands token in
+ * X-Hands-Token, which Hands validates.
  */
 export const SANDBOX_HANDS_VIA_ROUTER = envBool("SANDBOX_HANDS_VIA_ROUTER", false);
 

@@ -492,7 +492,7 @@ export async function restartHandsInSandbox(
       : attempt.pollTries ?? SANDBOX_HANDS_RESTART_MAX_TRIES;
     const intervalMs = attempt.pollIntervalMs ?? SANDBOX_HANDS_RESTART_INTERVAL_MS;
     for (let tries = 0; tries < maxTries; tries++) {
-      const health = await checkHandsHealth(handsUrl, HEALTH_TIMEOUT_MS, attempt.signal);
+      const health = await checkHandsHealth(handsUrl, HEALTH_TIMEOUT_MS, attempt.signal, inst.platformKey ?? "");
       if (health.ok) {
         logger.info(
           { sessionId, tries: tries + 1, launchDetail },

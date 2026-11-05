@@ -125,11 +125,11 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
           return entry ? new TextDecoder().decode(entry.value) : null;
         },
         dagHandles: listDagHandles,
-        probeHealth: async (handsUrl) => {
+        probeHealth: async (handsUrl, platformKey) => {
           try {
             const r = await fetch(`${handsUrl.replace(/\/mcp\/?$/, "")}/health`, {
-              // A Router port-proxy URL needs its session header to be routed.
-              headers: handsRouteHeaders(handsUrl),
+              // A Router port-proxy URL needs its session header and the owner's platform key.
+              headers: handsRouteHeaders(handsUrl, platformKey),
               signal: AbortSignal.timeout(3000),
             });
             return r.ok;

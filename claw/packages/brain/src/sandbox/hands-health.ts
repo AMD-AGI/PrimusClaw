@@ -37,16 +37,20 @@ export interface HandsHealthResult {
   detail: string;
 }
 
-/** Ask Hands' health route, giving up after `timeoutMs`. Never throws. */
+/**
+ * Ask Hands' health route, giving up after `timeoutMs`. Never throws.
+ * `platformKey` is the session owner's key, which a routed URL needs to pass the Router.
+ */
 export async function checkHandsHealth(
   handsMcpUrl: string,
   timeoutMs: number,
   signal?: AbortSignal,
+  platformKey = "",
 ): Promise<HandsHealthResult> {
   if (!handsMcpUrl) return { ok: false, detail: "no_url" };
   try {
     const resp = await healthFetch(handsEndpoint(handsMcpUrl, "/health"), {
-      headers: handsRouteHeaders(handsMcpUrl),
+      headers: handsRouteHeaders(handsMcpUrl, platformKey),
       signal: signal
         ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
         : AbortSignal.timeout(timeoutMs),

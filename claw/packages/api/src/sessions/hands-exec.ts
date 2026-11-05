@@ -24,6 +24,8 @@ import { handsCredentialHeaders } from "@claw/protocol";
 export interface HandsTarget {
   url: string;
   token: string;
+  /** The session owner's platform key, which a routed URL needs to pass the Router. */
+  platformKey?: string;
 }
 
 /** The sandbox did not answer: gone, reclaimed, restarting, or not the one the entry describes. */
@@ -47,7 +49,7 @@ export interface ExecResult {
 export async function execInSandbox(target: HandsTarget, command: string, timeoutSec: number): Promise<ExecResult> {
   const client = new Client({ name: "claw-api", version: "1.0.0" }, { capabilities: {} });
   const transport = new StreamableHTTPClientTransport(new URL(target.url), {
-    requestInit: { headers: handsCredentialHeaders(target.url, target.token) },
+    requestInit: { headers: handsCredentialHeaders(target.url, target.token, target.platformKey ?? "") },
   });
   try {
     try {
