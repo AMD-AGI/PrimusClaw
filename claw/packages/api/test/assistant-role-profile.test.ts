@@ -131,6 +131,30 @@ describe("assistant role profile", { skip }, () => {
     return { task: JSON.parse(stub.published[0]!), runId: stub.runId };
   }
 
+  test("A1b the router's list holds every open item, the newest closed ones of the last day, and when and how each closed", async () => {
+    const { routerManifest } = await import("../src/assistant/role-profile.js");
+    // #1 is the open item beforeEach made. #2-#25 open, #26-#50 closed an hour ago, #51 closed two days ago.
+    const rows: string[] = [];
+    for (let seq = 2; seq <= 51; seq++) {
+      const open = seq <= 25;
+      const closedAt = seq === 51 ? "NOW() - interval '2 days'" : open ? "NULL" : "NOW() - interval '1 hour'";
+      rows.push(`('kwi_m${seq}', 'alice', ${seq}, 'item ${seq}', '${open ? "in_progress" : "done"}', 'w-m${seq}', ${open ? "NULL" : seq % 2 ? "'accepted'" : "'stopped'"}, ${closedAt})`);
+    }
+    await w.q(`INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, outcome, closed_at) VALUES ${rows.join(", ")}`);
+    const items = await routerManifest("alice");
+    const seqs = items.map((i) => i.seq);
+    const open = Array.from({ length: 25 }, (_, k) => k + 1);
+    assert.deepEqual(seqs.filter((n) => n <= 25), open, "every open item is listed, past the cap on closed ones");
+    assert.deepEqual(seqs.filter((n) => n > 25), Array.from({ length: 20 }, (_, k) => k + 31), "the 20 newest closed in the last day");
+    assert.ok(!seqs.includes(51), "an item closed two days ago is not listed");
+    assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), "in number order");
+    const closed = items.find((i) => i.seq === 50)!;
+    assert.equal(closed.outcome, "stopped");
+    assert.ok(closed.createdAt instanceof Date && closed.closedAt instanceof Date);
+    assert.equal(items.find((i) => i.seq === 49)!.outcome, "accepted");
+    assert.equal(items.find((i) => i.seq === 1)!.closedAt, null);
+  });
+
   test("A1 a router turn is cut to the assistant tools and carries a bearer naming its own run", async () => {
     const { published, result } = await send(alice.routerSid, "alice", { doorbell: false });
     const task = JSON.parse(published[0]);
@@ -145,7 +169,7 @@ describe("assistant role profile", { skip }, () => {
     assert.ok(claims.exp > Math.floor(Date.now() / 1000) + 3600, "outlives the longest turn the row allows");
     assert.ok(task.system_append.startsWith("You are the user's personal assistant."));
     assert.ok(!task.system_append.includes(AGENT_GUIDELINE), "a router only dispatches: the working guideline is not its");
-    assert.match(task.system_append, new RegExp(`Work items \\(open ones[^)]*\\):\\n.*\\n<untrusted_data>\\n#1 \\(item_id: ${item.itemId}\\) \\[in_progress\\] title: "Fix the build"`));
+    assert.match(task.system_append, new RegExp(`Work items \\(open ones[^)]*\\):\\n.*\\n<untrusted_data>\\n#1 \\(item_id: ${item.itemId}\\) \\[in_progress\\] \\(status: in progress; created \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC\\) title: "Fix the build"`));
     assert.equal(task.skills, undefined);
   });
 
@@ -178,7 +202,7 @@ describe("assistant role profile", { skip }, () => {
     const claims = verify(request);
     assert.equal(claims.task_id, result.runId, "the bearer names the claimed run");
     assert.equal(claims.task_id, request.task_id);
-    assert.match(request.system_append, /#2 \(item_id: kwi_\w+\) \[in_progress\] title: "Added while it waited"/);
+    assert.match(request.system_append, /#2 \(item_id: kwi_\w+\) \[in_progress\] \(status: in progress; created [^)]+ UTC\) title: "Added while it waited"/);
   });
 
   test("A3 a queued router message replayed on the wire is profiled after its run is opened", async () => {

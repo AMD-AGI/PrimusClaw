@@ -17,7 +17,7 @@
  *   R5  the stand-in refuses what the real tools refuse: a long say, a send to a closed item, an unknown item, a name that is not one
  *   R5b the stand-in names an item as the real tools do: by id or by number, in every tool and in say
  *   R6  the loop follows the model's calls to the end, and a refused call changes nothing
- *   R7  scoring accepts the listed alternatives, forgives silence only where allowed, and checks item and language
+ *   R7  scoring accepts the listed alternatives, forgives silence only where allowed, and checks item, language and what a reply must not claim
  *   R8  an item is named by its id or its number as the real tools read it; "#3" is item 3 and is counted as a number
  *   R8f a turn that ends in plain text and no say is delivered as a say, as the completion handler does, for a turn that answers the user
  *   R8e the model is sent the user's words with the reply-language line the API adds, and for a report, the language of the user's earlier words
@@ -185,7 +185,7 @@ test("R6b a model that never stops calling tools is cut at the turn budget, and 
   assert.equal(summarize([score]).errors, 1);
 });
 
-test("R7 scoring accepts the listed alternatives, forgives silence only where allowed, and checks item and language", async () => {
+test("R7 scoring accepts the listed alternatives, forgives silence only where allowed, and checks item, language and what a reply must not claim", async () => {
   const tools = await routerTools();
   const run = (c: EvalCase, ...calls: Block[]) => runCase(c, { llm: scripted([reply(...calls), reply()]).llm, tools });
 
@@ -213,6 +213,17 @@ test("R7 scoring accepts the listed alternatives, forgives silence only where al
   assert.ok(scoreCase(zh, await run(zh, use("say", { text: "有 4 件在进行。" }))).turnOk);
   const en = byId("pro-02");
   assert.equal(scoreCase(en, await run(en, use("say", { text: "进行中。" }))).langOk, false);
+
+  // pro-13: the history says #5 waits for acceptance, the list says it is closed; repeating the history is a miss of the turn.
+  const stale = byId("pro-13");
+  for (const text of ["#5 还在等你接受。", "#5 release notes 已完成，等你点接受。", "#5 is still waiting for you to accept it."]) {
+    const s = scoreCase(stale, await run(stale, use("say", { text })));
+    assert.ok(s.dispatchOk && !s.contentOk && !s.turnOk, text);
+  }
+  for (const text of ["目前没有需要你处理的事项。#5 release notes 已完成并已确认，不用再管。", "进行中的有 #1、#4、#7、#8；#5 已经收起了。"]) {
+    const s = scoreCase(stale, await run(stale, use("say", { text })));
+    assert.ok(s.contentOk && s.turnOk, text);
+  }
 
   // Several effects are compared as sets.
   const mix = byId("mul-01");
