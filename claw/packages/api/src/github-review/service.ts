@@ -37,7 +37,7 @@ import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
   acquireWriteLock, writeLockKey, countPendingConfirmations, getReviewMode, headReviewFacts, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
-  type Confirmation, type DecidedVia, type HeldReview, type Queryable, type ReviewComment, type ReviewEvent, type ReviewMode,
+  type ClaimResult, type Confirmation, type DecidedVia, type HeldReview, type Queryable, type ReviewComment, type ReviewEvent, type ReviewMode,
 } from "./store.js";
 
 const logger = pino({ name: "github-review" });
@@ -624,7 +624,9 @@ export class GithubReview {
    * of the merge. A service has no say of its own: the person it names is the only
    * one whose answer it can give.
    */
-  async decide(deciderUserId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null = null): Promise<{ http: number; body: Record<string, unknown> }> {
+  async decide(
+    deciderUserId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null = null, guard?: () => Promise<void>,
+  ): Promise<{ http: number; body: Record<string, unknown> }> {
     const row = await getConfirmation(this.deps.db, id);
     if (!row) return { http: 404, body: { ok: false, error: "not_found" } };
     if (row.actorUserId !== deciderUserId) return { http: 403, body: { ok: false, error: "only_the_acting_user_can_decide" } };
@@ -633,13 +635,29 @@ export class GithubReview {
     if (via) {
       (this.deps.logger ?? logger).info({ confirmation_id: id, subject: deciderUserId, client_id: via.clientId, act_sub: via.actorSub, decision }, "github_review.decision_by_service");
     }
-    if (decision === "deny") {
+    // The claim is where the answer is given. A caller's `guard` (the assistant's tool: its turn is still live) is asked once the
+    // row is ours and before anything follows from it, so a turn stopped before the claim committed decides nothing: the
+    // confirmation is given back, or closed when it can no longer be answered. A stop after that is a stop after the answer.
+    const claim = async (): Promise<ClaimResult> => {
       const claimed = await claimConfirmation(this.deps.db, id, deciderUserId, via);
+      if (!claimed.ok || !guard) return claimed;
+      try {
+        await guard();
+      } catch (err) {
+        if (!(await reopenConfirmation(this.deps.db, id))) {
+          await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { ...by, reason: "decider_not_acting" });
+        }
+        throw err;
+      }
+      return claimed;
+    };
+    if (decision === "deny") {
+      const claimed = await claim();
       if (!claimed.ok) return { http: 200, body: { ok: true, status: claimed.reason === "expired" ? "expired" : "refused", reason: claimed.reason } };
       await finishConfirmation(this.deps.db, id, "denied", deciderUserId, via ? by : { by: "actor" });
       return { http: 200, body: { ok: true, status: "denied" } };
     }
-    const claimed = await claimConfirmation(this.deps.db, id, deciderUserId, via);
+    const claimed = await claim();
     if (!claimed.ok) {
       return { http: 200, body: { ok: true, status: claimed.reason === "expired" ? "expired" : "refused", reason: claimed.reason } };
     }
