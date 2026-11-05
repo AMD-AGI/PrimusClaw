@@ -39,9 +39,10 @@ import { deterministicEventId, enqueue, kickDelivery } from "../notifications/ou
 import { recordActionConfirm } from "./outbound.js";
 import { confirmationRef } from "./prompts.js";
 import { REVIEW_HANDOFF_ACTION, type AssistantActionPayload, type AssistantReviewHandoff } from "../notifications/assistant-events.js";
-import { decidedViaOf, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
+import { decidedViaOf, turnMessage, type AttendedVia, type ChannelPerson, type TurnMessage } from "./inbound.js";
 import {
-  parseRestartRequest, parseReviewRequest, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused, reviewItemsEnabled, startReviews,
+  parseRestartRequest, parseReviewRequest, recordReviewHandoff, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused, reviewItemsEnabled,
+  startReviews,
 } from "./review-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { attendedTurn, ToolRefused } from "./tools.js";
@@ -166,6 +167,28 @@ export function modelGrounded(text: string, model: string): boolean {
   return lower(model).split(/[^a-z0-9]+/).some((part) => /^[a-z][a-z0-9]{2,}$/.test(part) && t.includes(part));
 }
 
+const HAN = /\p{Script=Han}/u;
+
+/**
+ * Whether the person's own message names this person: their name (or a part of it no one else the channel listed shares), their email or
+ * the part before its `@`, or their user id. Case aside; a Latin word only whole (`Lei` is not named by `Leila`), a Chinese name anywhere
+ * in the text. Being listed beside the message is the channel's say that the person is there; this is the person's say that it is them.
+ */
+export function reviewerNamed(text: string, person: ChannelPerson & { user_id: string }, people: readonly ChannelPerson[]): boolean {
+  const t = lower(text);
+  const appears = (raw: string): boolean => {
+    const s = lower(raw.trim());
+    if (s.length < 2) return false;
+    if (HAN.test(s)) return t.includes(s);
+    return new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(s)}(?![\\p{L}\\p{N}_])`, "u").test(t);
+  };
+  const parts = (name: string): string[] => name.split(/[\s,，、.·]+/).map((p) => lower(p)).filter((p) => p.length >= 2);
+  const othersParts = new Set(people.filter((p) => p !== person && p.user_id !== person.user_id).flatMap((p) => parts(p.name)));
+  const local = person.email?.split("@")[0] ?? "";
+  return appears(person.name) || appears(person.user_id) || (!!person.email && appears(person.email)) || (local.length >= 3 && appears(local))
+    || parts(person.name).some((p) => !othersParts.has(p) && appears(p));
+}
+
 /** The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased. */
 export function fullRefsIn(text: string): string[] {
   const out: string[] = [];
@@ -240,8 +263,14 @@ export async function reviewStart(
     const signedIn = await requesterSignedIn(q, claims.sid, userId, message, via);
     if (!args.reviewer || args.reviewer === userId) return { userId, signedIn, actingAs: userId, actingAsName: undefined };
     const reviewer = lower(args.reviewer);
-    const person = message.context.people.find((p) => p.user_id === args.reviewer);
-    if (person) return { userId, signedIn, actingAs: args.reviewer, actingAsName: person.name };
+    const person = message.context.people.find((p): p is ChannelPerson & { user_id: string } => p.user_id === args.reviewer);
+    if (person) {
+      // A review as someone else runs on their account: the person's message must name them, not only the channel list them.
+      if (!reviewerNamed(message.content, person, message.context.people)) {
+        refuseUngrounded("reviewer_not_named", `the user's message does not name ${person.name || "that person"}: ask them who should review it`);
+      }
+      return { userId, signedIn, actingAs: args.reviewer, actingAsName: person.name };
+    }
     const named = message.context.people.some((p) => lower(p.name) === reviewer || (p.email !== undefined && lower(p.email) === reviewer));
     return refuseUngrounded(
       named ? "reviewer_not_linked" : "reviewer_not_in_message",
@@ -276,9 +305,16 @@ export async function reviewStart(
 /**
  * Hand a review asked of someone else to the channel that carried the person's message (`assistant.action` with `review`), when that
  * message declared it can be handed one (`channel_context.handoffs`) and one of the person's channels takes actions. The grounding is
- * done (the reviewer is someone the channel listed, each pull request one the message names, the person is here), and is asked again
- * here, in the transaction that queues the event. Null when it cannot be handed over: the caller refuses it as it always did.
- * Whether the reviewer lets anyone act for them, and every gate of the review, are the review service's, when the channel asks it.
+ * done by the caller, against the recorded message (the reviewer is someone the channel listed and the message names, each pull request
+ * one the message names), and a recorded message does not change; what can change, that the turn is still live and answers the person's
+ * fresh, signed-in message (`attendedTurn`), is asked again here, in the transaction that queues the event. Null when it cannot be
+ * handed over: the caller refuses it as it always did.
+ *
+ * The handoff is written down (`recordReviewHandoff`) with the event, and its id travels in the payload (`review.handoff_id`) for the
+ * channel to echo. The router's `merge` is its reading of a sentence, so `POST /v1/assistant/reviews` reads that record, not the
+ * channel's body: such a review merges only once the reviewer confirms that very merge (`merge_needs_confirmation`), never when the
+ * router did not read a merge, and is started from one handoff once. Whether the reviewer lets anyone act for them, and every other gate
+ * of the review, are the review service's, when the channel asks it.
  */
 async function handOffReview(
   claims: AssistantTokenClaims, prs: PrRef[], reviewer: { userId: string; name: string }, merge: boolean,
@@ -293,15 +329,17 @@ async function handOffReview(
       [userId],
     )).rows as Array<{ subscription_id: string }>;
     if (!subs.length) return null;
+    // One handoff per message, reviewer, pull requests and merge: a replayed call queues nothing more.
+    const key = [reviewer.userId, merge ? "merge" : "review", ...prs.map((p) => `${p.owner}/${p.repo}#${p.number}`.toLowerCase()).sort()].join("\u0000");
+    const eventId = deterministicEventId("assistant.review_handoff", claims.mid, key);
     const review: AssistantReviewHandoff = {
+      handoff_id: eventId,
       reviewer: { user_id: reviewer.userId, name: reviewer.name },
       prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
       merge,
       requester_note: message.content.slice(0, REQUESTER_NOTE_MAX_CHARS),
     };
-    // One handoff per message, reviewer, pull requests and merge: a replayed call queues nothing more.
-    const key = [reviewer.userId, merge ? "merge" : "review", ...review.prs.map((p) => `${p.owner}/${p.repo}#${p.number}`.toLowerCase()).sort()].join("\u0000");
-    const eventId = deterministicEventId("assistant.review_handoff", claims.mid, key);
+    await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge });
     const payload: AssistantActionPayload = {
       type: "assistant.action", event_id: eventId, occurred_at: new Date().toISOString(), user_id: userId,
       message_id: claims.mid, channel_message_id: channelMessageId, action: { name: REVIEW_HANDOFF_ACTION, args: "" }, review,
@@ -315,7 +353,7 @@ async function handOffReview(
   return {
     ok: true, handed_off: true, event_id: queued.eventId, reviewer: reviewer.name || reviewer.userId,
     prs: prs.map((p) => `${p.owner}/${p.repo}#${p.number}`), merge,
-    note: `nothing has started yet: the user's channel starts this review as ${reviewer.name || "that person"}, on their own credentials, and tells the user itself whether it started (or why not). Say only that it was handed over; do not say it has started, will merge, or name items.`,
+    note: `nothing has started yet: the user's channel starts this review as ${reviewer.name || "that person"}, on their own credentials, and tells the user itself whether it started (or why not). ${merge ? `Even then it merges nothing by itself: ${reviewer.name || "that person"} must confirm the merge. ` : ""}Say only that it was handed over; do not say it has started, will merge, or name items.`,
   };
 }
 
@@ -570,6 +608,10 @@ export async function channelAction(claims: AssistantTokenClaims, args: { name: 
   const name = String(args.name ?? "").trim().replace(/^\/+/, "");
   const actionArgs = String(args.args ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
   if (!name) throw new ToolRefused("invalid_arguments", "name the action, as the channel listed it");
+  // A handoff's name is Claw's, not a channel command: an action under that name would reach the channel without what a handoff carries.
+  if (lower(name) === REVIEW_HANDOFF_ACTION) {
+    throw new ToolRefused("action_reserved", `${REVIEW_HANDOFF_ACTION} is not a channel action: a review by someone else is asked with review_start`);
+  }
   if (actionArgs.length > ACTION_ARGS_MAX) throw new ToolRefused("invalid_arguments", `args is at most ${ACTION_ARGS_MAX} characters`);
   const command = actionCommand(name, actionArgs);
   const sent = await inTransaction(async (q) => {

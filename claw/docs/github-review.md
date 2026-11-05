@@ -225,9 +225,16 @@ A review asked of someone else meets the assistant in three places:
   the same grounding (the reviewer is someone the channel listed, each pull request one the message names, the person is here): an
   `assistant.action` with `action.name` `review_for_other` and `review: {reviewer: {user_id, name}, prs: [{owner, repo, number}],
   merge, requester_note}` (the person's own message), once per message, reviewer, pull requests and merge. The router is answered
-  `handed_off` and told that nothing has started yet; the channel starts the review with `POST /v1/assistant/reviews` and the
-  reviewer's credentials, where every check of that route applies (the reviewer's delegation, the open reviews, the limits), and tells
-  the person itself how it went. Otherwise (a channel that did not declare it, or no channel takes actions) it is refused with
+  `handed_off` and told that nothing has started yet; the channel starts the review with `POST /v1/assistant/reviews`, the reviewer's
+  credentials and `handoff_id` (the `review.handoff_id` it was handed), and tells the person itself how it went. The route applies its
+  own checks (the reviewer's delegation, the open reviews, the limits) and, beyond them, the record Claw kept of the handoff
+  (`claw_assistant_review_handoffs`), not the channel's body: `merge` is the router's reading of a sentence, so the review merges only
+  once the reviewer confirms that very merge (`merge_needs_confirmation`, the card's button or `批准 #<ref>` / `approve #<ref>`), and
+  only reviews when the router read no merge. A `handoff_id` must be the caller's handoff to that reviewer, cover the pull requests
+  asked, be under 24 hours old and unused (one start per handoff; a replay is refused `handoff_used`). A request of the same person, to
+  the same reviewer, for a handed-over pull request that leaves `handoff_id` out is held for the reviewer's confirmation all the same.
+  The reviewer must also be named in the person's own message (their name, a part of it no other listed person shares, their email or
+  user id), not only listed beside it (`reviewer_not_named`). `channel_action` never sends an action named `review_for_other`. Otherwise (a channel that did not declare it, or no channel takes actions) it is refused with
   `acting_as_credentials_required`, and the refusal tells the router to send the user to the deployment's review agent, by the name
   its reviews are signed with (`CLAW_GITHUB_REVIEW_AGENT_NAME`).
 - The requester's assistant lists the reviews they asked of others, open or closed in the last day, read-only after their own items:

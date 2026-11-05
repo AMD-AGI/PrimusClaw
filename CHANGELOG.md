@@ -32,7 +32,11 @@ record it.
   it can start such a review with the reviewer's own credentials (`channel_context.handoffs: ["review_for_other"]`): an
   `assistant.action` named `review_for_other` with a typed `review` (reviewer, pull requests, merge, the person's message), queued
   once after the same grounding, and the router is answered `handed_off`. A channel that does not declare it, or a user with no
-  subscription to `assistant.action`, gets the `acting_as_credentials_required` refusal as before.
+  subscription to `assistant.action`, gets the `acting_as_credentials_required` refusal as before. The handoff is recorded
+  (`claw_assistant_review_handoffs`) and its id handed over (`review.handoff_id`); `POST /v1/assistant/reviews` takes it back as
+  `handoff_id` and reads the record, not the body: such a review merges only once the reviewer confirms the merge, only reviews when the
+  router read no merge, and starts once per handoff; a request for a handed-over pull request without the id is held the same. The
+  reviewer must be named in the person's message, not only listed by the channel (`reviewer_not_named`).
 - Archived sessions can be deleted on a schedule: `SESSION_RETENTION_DAYS` (default 0, off) makes the API's daily
   maintenance delete a session that many days after it was archived, through the same commit as a user's delete (queued
   messages dropped, turns, events and summaries stamped deleted) with its S3 workspace and checkpoint prefixes removed by
