@@ -106,6 +106,7 @@ const scrub = (s: string): string => scrubWith(s, [KEY]);
 const iso = (): string => new Date().toISOString();
 const log = (...a: unknown[]): void => console.log(iso(), ...a.map((x) => (typeof x === "string" ? scrub(x) : x)));
 const recordings: Recording[] = [];
+const sessionsLeft: string[] = [];   // baseline sessions the run made and could not delete: they fail the run
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // --- The live stream of a session ---------------------------------------------------------------------------------
@@ -243,7 +244,8 @@ const attemptOf = async (c: EvalCase, turns: Turn[], o: Observed, tools: string[
   const verdict = await judge(c, turns, o.final);
   return {
     ...verdictOf(c, checks, verdict), checks, route: o.route, cards: o.cards, tools, final: KEEP_TEXT ? scrub(o.final) : null, finalChars: o.final.length,
-    firstReplyMs: o.firstReplyMs, finalMs: o.finalMs, items, judge: verdict,
+    // The judge's reason can quote the answer: kept only with the text.
+    firstReplyMs: o.firstReplyMs, finalMs: o.finalMs, items, judge: verdict && (KEEP_TEXT ? verdict : { pass: verdict.pass, why: "" }),
   };
 };
 
@@ -382,7 +384,7 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
   } finally {
     stream.close();
     const gone = await until(async () => ((await api("DELETE", `/v1/sessions/${sessionId}`).catch(() => ({ status: 0 }))).status === 200 ? true : undefined), Date.now() + 60_000, 10_000);
-    if (!gone) log(`could not delete session ${sessionId} of ${c.id}`);
+    if (!gone) { log(`could not delete session ${sessionId} of ${c.id}`); sessionsLeft.push(sessionId); }
   }
 }
 
@@ -466,6 +468,7 @@ async function main(): Promise<void> {
       }
     }
   }
+  if (sessionsLeft.length) cleanupFailed.push(`baseline sessions not deleted: ${sessionsLeft.join(",")}`);
   cleanupFailed = cleanupFailed.map(scrub);
   if (RECORD_DIR) {
     mkdirSync(RECORD_DIR, { recursive: true });
