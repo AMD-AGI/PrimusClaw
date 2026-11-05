@@ -25,9 +25,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
-	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
@@ -36,9 +36,10 @@ type Config struct {
 	Port                  int
 	MaxConcurrentRequests int
 	EnableAuth            bool
-	SafeAPIURL            string
-	WorkloadManagerURL    string
-	Namespace             string
+	// Identity validates caller credentials on /v1 when EnableAuth is set.
+	Identity           *identity.Client
+	WorkloadManagerURL string
+	Namespace          string
 	// Namespaces decides which namespaces /v1/namespaces/:namespace serves.
 	// nil admits every namespace.
 	Namespaces *nsadmission.Admitter
@@ -77,7 +78,6 @@ type Server struct {
 	sessionManager SessionManager
 	engine         *gin.Engine
 	jwt            *JWTManager
-	safeClient     *safe.Client // SaFE API Key verification client (nil when auth disabled)
 	grants         *grant.Service
 	// dp is the cross-cluster data-plane hop. Empty routes keep every sandbox local.
 	dp dataPlane
@@ -115,16 +115,6 @@ func New(
 	s := &Server{
 		cfg:   cfg,
 		store: st,
-	}
-
-	// Initialize SaFE API Key client (when auth is enabled)
-	if cfg.EnableAuth {
-		if cfg.SafeAPIURL == "" {
-			log.Error("--enable-auth requires --safe-api-url to be set")
-		} else {
-			s.safeClient = safe.NewClient(cfg.SafeAPIURL)
-			log.Info("SaFE API Key authentication enabled", "safeAPIURL", cfg.SafeAPIURL)
-		}
 	}
 
 	// Initialize SessionManager
@@ -174,15 +164,16 @@ func (s *Server) setupRoutes() {
 	v1 := s.engine.Group("/v1")
 	v1.Use(s.concurrencyLimitMiddleware())
 
-	// SaFE API Key authentication middleware (Layer 1, default off)
-	// When --enable-auth is set, all /v1/ requests must carry a valid SaFE API Key.
-	if s.cfg.EnableAuth && s.safeClient != nil {
-		// Strip caller-asserted identity only when SaFE can replace it with a
-		// verified identity. In explicitly unauthenticated deployments, retain
-		// the legacy upstream-provided identity headers.
+	// Caller authentication (default off). When --enable-auth is set, every /v1/
+	// request must carry a credential the identity provider accepts; a missing
+	// identity client fails closed.
+	if s.cfg.EnableAuth {
+		// Strip caller-asserted identity only when it is replaced by a verified
+		// identity. In explicitly unauthenticated deployments, retain the legacy
+		// upstream-provided identity headers.
 		v1.Use(stripUntrustedIdentityHeaders())
-		v1.Use(s.safeAuthMiddleware())
-		log.Info("SaFE API Key auth middleware enabled on /v1/ routes")
+		v1.Use(s.callerAuthMiddleware())
+		log.Info("caller auth middleware enabled on /v1/ routes")
 	}
 
 	// ── Data plane: invocation routes (handled locally) ──────────────────

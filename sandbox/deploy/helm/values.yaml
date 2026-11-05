@@ -46,7 +46,9 @@ controlplane:
     # image (built with EXTRA_CA_CERT_URLS) and fails the same way if it is empty.
     sandboxExtraCAConfigMap: ""
     sandboxExtraCARequired: false
-    # Identity provider keys on the E2B API. They are enabled when
+    # Identity provider introspection client. introspectUrl alone checks the
+    # /v1 caller credential when router.config.enableAuth is true.
+    # Identity provider keys on the E2B API are enabled when
     # introspectUrl and ownerPolicyConfigMap are both set. The client Secret
     # holds client_id and client_secret; the identity provider creates that
     # Secret once in this namespace and does not rotate it. The ConfigMap key
@@ -125,9 +127,10 @@ router:
   config:
     maxConcurrentRequests: 1000
     # false leaves the Router and Workload Manager with NO auth middleware at
-    # all — not a weaker check, none. Set true (plus safeApiUrl) in production.
+    # all — not a weaker check, none. Set true in production; it requires
+    # controlplane.config.identity.introspectUrl and its client Secret.
     enableAuth: false
-    safeApiUrl: ""                # required when enableAuth=true
+    safeApiUrl: ""                # grant identity check (SAFE_API_URL); not used for /v1 auth
     # Label selector (kubectl -l syntax) of the namespaces the Router and the
     # Workload Manager serve, e.g. "example.com/sandbox=enabled". A request for
     # a namespace that does not match gets 403 namespace_not_admitted (not 404,

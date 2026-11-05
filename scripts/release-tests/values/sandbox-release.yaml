@@ -7,6 +7,8 @@ controlplane:
     tag: release-test@sha256:1111111111111111111111111111111111111111111111111111111111111111
   config:
     envdInjectorImage: example.invalid/agent-sandbox-envd-injector:release-test@sha256:2222222222222222222222222222222222222222222222222222222222222222
+    identity:
+      introspectUrl: https://identity.example/oauth/introspect
 router:
   config:
     enableAuth: true

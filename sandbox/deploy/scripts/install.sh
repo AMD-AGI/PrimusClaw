@@ -28,7 +28,8 @@
 #   HIGRESS_NAMESPACE=higress-system          # namespace of the Higress gateway (INGRESS_CLASS=higress)
 #   INSTALL_DEFAULT_TEMPLATES=false           # apply CodeInterpreter examples
 #   TEMPLATES_VARIANT=default                 # default | kata (both use default-templates.yaml)
-#   SAFE_API_URL=                             # set to enable SaFE authentication (recommended)
+#   IDENTITY_INTROSPECT_URL=                  # set to enable /v1 authentication (recommended)
+#   SAFE_API_URL=                             # SaFE API URL for the grant identity check
 #   ALLOW_INSECURE_NO_AUTH=false              # true = install WITHOUT auth (dev clusters only)
 #   EGRESS_ENABLED=true                       # enable EnvD egress enforcement
 #   EGRESS_EXTRA_BLOCKED_CIDRS=               # comma-separated additional CIDRs
@@ -511,12 +512,17 @@ fi
 # acknowledged, and this installer will not pick a side on the operator's behalf.
 if [[ -n "${SAFE_API_URL:-}" ]]; then
     HELM_ARGS+=(
-        --set "router.config.enableAuth=true"
         --set "router.config.safeApiUrl=${SAFE_API_URL}"
-        --set "workloadmanager.config.enableAuth=true"
         --set "workloadmanager.config.safeApiUrl=${SAFE_API_URL}"
     )
-    ok "authentication ENABLED against ${SAFE_API_URL}"
+fi
+if [[ -n "${IDENTITY_INTROSPECT_URL:-}" ]]; then
+    HELM_ARGS+=(
+        --set "router.config.enableAuth=true"
+        --set "workloadmanager.config.enableAuth=true"
+        --set "controlplane.config.identity.introspectUrl=${IDENTITY_INTROSPECT_URL}"
+    )
+    ok "authentication ENABLED against ${IDENTITY_INTROSPECT_URL}"
 elif [[ "${ALLOW_INSECURE_NO_AUTH:-false}" == "true" ]]; then
     HELM_ARGS+=( --set "security.allowInsecureNoAuth=true" )
     warn "authentication DISABLED (ALLOW_INSECURE_NO_AUTH=true)."
@@ -525,7 +531,7 @@ elif [[ "${ALLOW_INSECURE_NO_AUTH:-false}" == "true" ]]; then
 else
     err "refusing to install without an explicit authentication choice.
     Either enable authentication:
-        SAFE_API_URL=https://<your-safe-api> $0
+        IDENTITY_INTROSPECT_URL=https://<identity>/oauth/introspect $0
     or acknowledge an unauthenticated development install:
         ALLOW_INSECURE_NO_AUTH=true $0
     See the 'Production hardening' section of sandbox/README.md."

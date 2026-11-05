@@ -245,8 +245,10 @@ spec:
             - --shutdown-timeout={{ int .Values.controlplane.shutdown.timeoutSeconds }}s
             - --shutdown-stop-grace={{ int .Values.controlplane.shutdown.stopGraceSeconds }}s
             {{- if .Values.router.config.enableAuth }}
+            {{- if not .Values.controlplane.config.identity.introspectUrl }}
+            {{- fail "router.config.enableAuth requires controlplane.config.identity.introspectUrl" }}
+            {{- end }}
             - --enable-auth=true
-            - --safe-api-url={{ .Values.router.config.safeApiUrl }}
             {{- end }}
           env:
             - name: AGENT_SANDBOX_NAMESPACE
@@ -298,7 +300,7 @@ spec:
               value: {{ .Values.controlplane.config.registrySecret | quote }}
             {{- end }}
             {{- with .Values.controlplane.config.identity }}
-            {{- if and .introspectUrl .ownerPolicyConfigMap }}
+            {{- if .introspectUrl }}
             - name: IDENTITY_CLIENT_ID
               valueFrom:
                 secretKeyRef:
@@ -311,6 +313,8 @@ spec:
                   key: client_secret
             - name: IDENTITY_INTROSPECT_URL
               value: {{ .introspectUrl | quote }}
+            {{- end }}
+            {{- if and .introspectUrl .ownerPolicyConfigMap }}
             - name: E2B_OWNER_POLICY
               valueFrom:
                 configMapKeyRef:

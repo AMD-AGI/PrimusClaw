@@ -15,12 +15,13 @@ All traffic enters through the **Router** gateway under `/v1`. Two planes:
 
 ## Authentication
 
-When the Router runs with `--enable-auth`, every `/v1/*` request must carry credentials:
+When the Router runs with `--enable-auth`, every `/v1/*` request must carry
+`Authorization: Bearer <credential>`: a platform API key (`ak-...`) or an access
+token issued by the identity provider for this service. The credential is
+validated through identity provider token introspection.
 
-- **Cookie** (browser): `Token=<safe-token>; userType=sso`
-- **API Key** (SDK / CLI): `Authorization: Bearer ak-<your-key>`
-
-Missing/invalid credentials return `401` with `{"error": "..."}`.
+Missing or invalid credentials return `401` with `{"error": "...", "code": "..."}`.
+An identity provider that cannot answer returns `503` (`caller_auth_unavailable`).
 
 ## Typical Flow
 
