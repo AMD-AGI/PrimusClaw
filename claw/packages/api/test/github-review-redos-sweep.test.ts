@@ -9,11 +9,12 @@
  * pattern added later is timed too, whoever forgot to name it.
  *
  *   S1  the reader of the sources finds the literals it should and none of the divisions, strings and comments around them
- *   S2  the timing sees what it is for: the patterns that were super-linear (copied as they were) are over the bound, and their cost grows
- *       faster than their line
- *   S3  every regular expression literal in `src/github-review` is under it, on lines at the longest a changed line is read, including lines
- *       that say the opening of the pattern over and over; or, where one `exec` was timed over it, its cost on every line timed over it grows
- *       no faster than the line does, since a pause of a busy runner makes a pattern of a few microseconds look slow and never makes it grow
+ *   S2  the count sees what it is for: the patterns that were super-linear (copied as they were) are slow by the verdict of S3, and by how
+ *       their work grows alone; and the counter refuses what it cannot read rather than count it as cheap
+ *   S3  every regular expression literal in `src/github-review` does a bounded amount of work per character of a line, and none of it grows
+ *       with the square of the line, on every line of the sweep, including lines that say the opening of the pattern over and over. Work is
+ *       counted, in steps of a matcher that counts them (`support/regex-work.ts`), not timed: a time on a busy runner made a linear pattern
+ *       look slow (#255) and a quadratic one look linear (#277), and a count is the same on every machine
  *   S4  the entry points that read a repository's own text (`.github/claw-review.yml`, a `package.json` change) cost a bounded amount on the
  *       lines that were slow, and read what they read before
  *   S5  one `assessRisk` call on the most a pull request can make it read (500 lines at the cap) costs a bounded amount, whatever the lines
@@ -28,28 +29,39 @@ import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { assessRisk, parseRepoConfig, type RiskFile } from "../src/github-review/risk.js";
 import { MAX_LINE_CHARS, MAX_READ_CHARS } from "../src/github-review/risk-signals.js";
-import { growth, regexLiterals, sampleStrings, worstCost } from "./support/regex-sweep.js";
+import { describeWork, regexLiterals, SAMPLE_MAX, sampleStrings, workOf } from "./support/regex-sweep.js";
+import { counted, UnsupportedPattern } from "./support/regex-work.js";
 
 const SOURCES = new URL("../src/github-review/", import.meta.url);
 /** The longest a line is that a pattern of the rule pack reads, and the most lines of that length one change can make it read. */
 const LINES_AT_CAP = MAX_READ_CHARS / MAX_LINE_CHARS;
 /**
- * What one `assessRisk` call may cost on such a change whatever its lines say: the call is synchronous in the API's own process, so this is
- * how long every tenant waits for one pull request. A call on lines that no pattern has anything to say about costs a quarter of it.
+ * What one `assessRisk` call may cost on such a change whatever its lines say, as S5 measures it: this many times what a call on lines that
+ * no pattern has anything to say about costs. The call is synchronous in the API's own process, so it is how long every tenant waits for one
+ * pull request.
  */
-const CALL_BUDGET_MS = 400;
-/** The same budget as S5 measures it: a call may cost this many times what a call on lines that no pattern has anything to say about costs. */
 const CALL_BUDGET_RATIO = 4;
-/** So the most one pattern may cost on one line at the cap: a pattern that costs more makes a call over the budget when the change repeats what it starts on. */
-const EXEC_BOUND_MS = CALL_BUDGET_MS / LINES_AT_CAP;
-/** The length and the bound the first sweep used, which the patterns it was written for are timed at (see S2). */
-const FORMER_LENGTH = 8000;
-const FORMER_BOUND_MS = 10;
 /**
- * How many times as long a pattern may take on its slowest line as on that line at a quarter of the length (`growth`): a pattern linear in its
- * line takes about 4 times as long and one that costs the square of it about 16, so this is the middle of the two by ratio, not a time.
+ * The length of line the sweep counts a pattern's work at (and at three quarters and half of it, for how the work grows). A count has no
+ * noise, so the line need not be as long as the longest a pattern reads (MAX_LINE_CHARS), only long enough for the opening of a sample (at
+ * most 41 characters with its space) to repeat several times between the three lengths, for most of it to be what it repeats however long
+ * its sample is (at least twice SAMPLE_MAX), and for the shortest of the three to be longer than the longest bounded repeat of any pattern
+ * (S3 checks that), past which a bounded repeat is linear in the line however it backtracks.
  */
-const GROWTH_BOUND = 8;
+const SWEEP_LENGTH = 500;
+/**
+ * The most steps one `exec` may take per character of a line. Every literal of the module takes at most about 90 (the extension list of
+ * `review-path.ts`, an alternation of some sixty names tried at every dot), and most fewer than 10.
+ */
+const STEPS_PER_CHAR = 256;
+/**
+ * The most the steps may grow with the square of the line (`Work.quadratic`): on a line at the longest a pattern reads, that part is a
+ * quarter of what STEPS_PER_CHAR allows the whole there. Every literal of the module measures exactly 0, as a linear pattern does; the
+ * patterns that were super-linear (S2) measure 0.21 or more, and a pattern that scans on to the end of the line from every copy of an opening
+ * as long as the longest the sweep says (41 characters) about 0.04.
+ */
+const QUADRATIC_BOUND = STEPS_PER_CHAR / MAX_LINE_CHARS / 4;
+const SWEEP = { perChar: STEPS_PER_CHAR, quadratic: QUADRATIC_BOUND, stopAtFirst: true };
 /**
  * What the call on lines that nothing reads is held to, since the ratio above takes it as its unit and a slowdown that reaches every line
  * moves it as much as it moves what it is compared with. Both are timed in the same run, and neither goes through the rule pack's work on a line.
@@ -95,70 +107,78 @@ test("S1 the reader finds regular expression literals and not the divisions, str
   for (const name of ["risk.ts", "risk-signals.ts", "diff.ts", "github.ts", "settings.ts"]) assert.ok(found.some((r) => r.f === name), name);
 });
 
-test("S2 the timing flags the patterns that were super-linear, written as they were, and the strings it makes are ones the pattern matches", () => {
-  // [pattern as it was, flags, what it read, line length, bound]: the bound scales with the length, since a linear pattern costs in proportion
-  // to it. The first four were slow at the head the first sweep was written against, the one that was missed and the three beside it; the
-  // fifth is one of the three that the review before it named, made linear since (a Go function), at a length where it already costs a
-  // second; the last three were slow at the head the sweep was extended against (they were not found because it never said an opening twice,
-  // and the bound was on one `exec`), the pattern that reads a Rust attribute, the first route pattern and the suppression pattern.
-  const former = (length: number): number => (FORMER_BOUND_MS * length) / FORMER_LENGTH;
-  const atCap = (length: number): number => (EXEC_BOUND_MS * length) / MAX_LINE_CHARS;
-  const formerly: Array<[string, string, string, number, number]> = [
-    ['^\\s*"[^"]+"\\s*,?\\s*$', "", "a manifest's string entry", FORMER_LENGTH, former(FORMER_LENGTH)],
-    ['^\\s+-\\s+["\']?([^"\'\\s][^"\']*?)["\']?\\s*$', "", "a list item of the repository's own config", FORMER_LENGTH, former(FORMER_LENGTH)],
-    ["\\s+#.*$", "", "a trailing comment of the repository's own config", FORMER_LENGTH, former(FORMER_LENGTH)],
-    ["\\/+$", "", "trailing slashes of a URL", FORMER_LENGTH, former(FORMER_LENGTH)],
-    ["^func\\s+(?:\\(\\s*\\w*\\s*\\*?\\s*(\\w+)(?:\\[[^\\]]*\\])?\\s*\\)\\s*)?([A-Z]\\w*)\\s*[[(]", "", "a Go function", 600, former(600)],
-    ['#\\[(?:arg|clap)\\([^\\]]*\\blong\\b(?:\\s*=\\s*"([\\w-]+)")?', "", "a Rust attribute that names a long flag", FORMER_LENGTH, atCap(FORMER_LENGTH)],
-    ["(?<![\\w$])(?:(?:r|e|g)|\\w*(?:app|App|router|Router|fastify|server|Server|mux|Mux|routes?|Routes?|group|Group))\\.(get|post|put|patch|delete|options|head|all|route|GET|POST|PUT|PATCH|DELETE|Any)\\s*(?:<[^>]*>)?\\(\\s*[`'\"]((?:\\/|\\*)[^`'\"]*)[`'\"]", "", "an HTTP route with type arguments", FORMER_LENGTH, atCap(FORMER_LENGTH)],
-    ["#nosec|\\bnosec\\b|checkov:skip|trivy:ignore|NOSONAR|pragma:\\s*allowlist|nolint:[^\\n]*gosec|noqa:\\s*S\\d|lgtm\\[|codeql\\[|eslint-disable[^\\n]*security", "i", "a comment that switches a security check off", FORMER_LENGTH, atCap(FORMER_LENGTH)],
+test("S2 the count flags the patterns that were super-linear, written as they were, and the strings it makes are ones the pattern matches", () => {
+  // [pattern as it was, flags, what it read]. The first four were slow at the head the first sweep was written against, the one that was
+  // missed and the three beside it; the fifth is one of the three that the review before it named, made linear since (a Go function); the
+  // next three were slow at the head the sweep was extended against (they were not found because it never said an opening twice, and the
+  // bound was on one `exec`), the pattern that reads a Rust attribute, the first route pattern and the suppression pattern.
+  const formerly: Array<[string, string, string]> = [
+    ['^\\s*"[^"]+"\\s*,?\\s*$', "", "a manifest's string entry"],
+    ['^\\s+-\\s+["\']?([^"\'\\s][^"\']*?)["\']?\\s*$', "", "a list item of the repository's own config"],
+    ["\\s+#.*$", "", "a trailing comment of the repository's own config"],
+    ["\\/+$", "", "trailing slashes of a URL"],
+    ["^func\\s+(?:\\(\\s*\\w*\\s*\\*?\\s*(\\w+)(?:\\[[^\\]]*\\])?\\s*\\)\\s*)?([A-Z]\\w*)\\s*[[(]", "", "a Go function"],
+    ['#\\[(?:arg|clap)\\([^\\]]*\\blong\\b(?:\\s*=\\s*"([\\w-]+)")?', "", "a Rust attribute that names a long flag"],
+    ["(?<![\\w$])(?:(?:r|e|g)|\\w*(?:app|App|router|Router|fastify|server|Server|mux|Mux|routes?|Routes?|group|Group))\\.(get|post|put|patch|delete|options|head|all|route|GET|POST|PUT|PATCH|DELETE|Any)\\s*(?:<[^>]*>)?\\(\\s*[`'\"]((?:\\/|\\*)[^`'\"]*)[`'\"]", "", "an HTTP route with type arguments"],
+    ["#nosec|\\bnosec\\b|checkov:skip|trivy:ignore|NOSONAR|pragma:\\s*allowlist|nolint:[^\\n]*gosec|noqa:\\s*S\\d|lgtm\\[|codeql\\[|eslint-disable[^\\n]*security", "i", "a comment that switches a security check off"],
   ];
-  for (const [source, flags, what, length, bound] of formerly) {
-    const { ms, line } = worstCost(source, flags, length, bound);
-    assert.ok(ms > bound, `${what}: ${ms.toFixed(1)} ms is not over the bound of ${bound} ms (${line.what})`);
-    // What S3 asks of a pattern that was timed over the bound, these answer as super-linear. Asked on the slowest of all the lines (found at
-    // a quarter of the length, where that costs a sixteenth), not on the first line over the bound: on a slow enough machine that one can be
-    // a line the pattern reads in linear time. Three rounds: they are far over it.
-    const slowest = worstCost(source, flags, length / 4).line;
-    const grew = growth(source, flags, slowest, length, 3);
-    assert.ok(grew.ratio > GROWTH_BOUND && grew.ms > bound, `${what}: ${grew.ratio.toFixed(1)} times as long at four times the length, ${grew.ms.toFixed(1)} ms (${slowest.what})`);
+  // How the work of each grows, with no budget on the steps, so that the growth is what flags it and not a budget that a pattern whose work
+  // is only large per character would be over too; at a shorter length, since the worst of them is cubic or worse. Being counts, the same in
+  // every run, on every machine.
+  const growthOnly = { perChar: Infinity, quadratic: QUADRATIC_BOUND, stopAtFirst: true };
+  for (const [source, flags, what] of formerly) {
+    const verdict = workOf(source, flags, SWEEP_LENGTH, SWEEP);
+    assert.ok(verdict.slow.length > 0, `${what}: not slow by the verdict of S3 (the most work was ${describeWork(verdict.most, SWEEP_LENGTH, STEPS_PER_CHAR)}; the fastest growth ${describeWork(verdict.fastest, SWEEP_LENGTH, STEPS_PER_CHAR)})`);
+    const grown = workOf(source, flags, 2 * SAMPLE_MAX, growthOnly);
+    assert.ok(grown.slow.length > 0 && grown.slow[0]!.quadratic > 8 * QUADRATIC_BOUND, `${what}: its work does not grow with the square of the line (the fastest growth was ${describeWork(grown.fastest, 2 * SAMPLE_MAX, Infinity)})`);
     const re = new RegExp(source, flags);
     const samples = sampleStrings(source);
     assert.ok(samples.some((x) => re.test(x)), `none of ${JSON.stringify(samples.slice(0, 3))} matches /${source}/`);
   }
+
+  // A super-linear branch among many that are not is read on lines of its own (a sample is made for every branch of every alternation), and
+  // a sticky pattern is counted from every place a caller can set `lastIndex` to, not only from the first place it matches. (Quadratic, not
+  // exponential, so that the test does not itself hold a pattern a scanner reports.)
+  const hidden = `^(?:${Array.from({ length: 60 }, (_, k) => `x{${k + 1}}`).join("|")}|q\\s*\\s*$)`;
+  for (const [source, flags, what] of [[hidden, "", "a super-linear branch after sixty that are not"], ["(?:x|(?<=x)\\s*\\s*$)", "y", "a sticky pattern that matches early"]] as const) {
+    const verdict = workOf(source, flags, SWEEP_LENGTH, SWEEP);
+    assert.ok(verdict.slow.length > 0, `${what}: not slow by the verdict of S3 (the most work was ${describeWork(verdict.most, SWEEP_LENGTH, STEPS_PER_CHAR)})`);
+  }
+
+  // The counter refuses a pattern whose syntax it does not read, rather than count it as cheap. On one it reads, every count it gives is of a
+  // run that matched what V8's `exec` matches, the same text at the same place with the same groups (`steps` throws otherwise): lookbehind
+  // with groups, a group in a repeat that matches nothing, a group a later iteration does not take part in, `/i`, `/m`, a boundary.
+  for (const [source, flags] of [["(a)\\1", ""], ["\\p{L}+", "u"], ["(?i:a)", ""], ["\\k<x>(?<x>a)", ""], ["a", "v"]] as const) {
+    assert.throws(() => counted(source, flags).steps("aaaa"), UnsupportedPattern, `/${source}/${flags}`);
+  }
+  for (const [source, flags, text] of [["(?<=(a)b)c(?=(d))", "", "xxabcd"], ["(a?)?b", "", "aab"], ["(?:(a)|b)+", "", "ab"], ["[^\\W_]+", "i", "__Ab9_"], ["^b", "m", "a\nb"], ["a*", "g", "bab"], ["\\bé", "i", "xÉ é"]] as const) {
+    const pattern = counted(source, flags);
+    assert.ok(pattern.steps(text) > 0 && pattern.steps(text) === pattern.steps(text), `/${source}/${flags} on ${JSON.stringify(text)}`);
+  }
 });
 
-test("S3 every regular expression literal in the module costs under the bound on a line at the longest a changed line is read, or grows no faster than the line, whatever the line repeats", () => {
-  // The bound is a fraction of a millisecond, and a CI runner whose CPU is shared has once timed a pattern that costs 0.06 ms at 1.45 ms
-  // (in each of the three timings of its line). So a pattern over it is asked how its cost grows on each line it was over it on, a ratio
-  // of two times that the same pauses touch alike, and is slow only if it grows faster than the line: the defect the bound is there for is
-  // a pattern whose cost grows with the square of its line (S2), and such a pattern is over the bound in the first place and over
-  // GROWTH_BOUND as well, on the line that showed it, whichever line cost the most. It is still over the bound in the least of the rounds
-  // that measured its growth, which a pattern that only looked slow in one moment is not. A pattern whose cost is partly linear and partly
-  // super-linear can grow less than GROWTH_BOUND and still cost over the bound; it is slow when the part of its cost that grows faster
-  // than the line is over the bound by itself, a part that is nothing for a linear pattern however slow the machine is. That part is measured
-  // as backtracking makes it, growing with the square of the line or a higher power of it (see `growth`), not as a power between one and two.
+test("S3 every regular expression literal in the module does a bounded amount of work per character of a line, and none that grows with its square, whatever the line repeats", () => {
+  // Counted, not timed (see `support/regex-work.ts`): the steps one `exec` takes on a line at SWEEP_LENGTH, and, where they could hide a part
+  // that grows with the square of the line, the steps on the same line at three quarters and half of it. The sweep reads the literals at the
+  // length and in the lines it reads them in; no line is read again, and no verdict depends on the machine or on what else it is doing.
   const slow: string[] = [];
-  let timed = 0;
+  let patterns = 0;
+  let lines = 0;
+  let longestBoundedRepeat = 0;
   for (const f of readdirSync(SOURCES).filter((n) => n.endsWith(".ts"))) {
     for (const r of regexLiterals(readFileSync(new URL(f, SOURCES), "utf8"))) {
-      const { over } = worstCost(r.source, r.flags, MAX_LINE_CHARS, Infinity, EXEC_BOUND_MS);
-      timed += 1;
-      const isSlow = (g: { ratio: number; ms: number; excessMs: number }): boolean =>
-        (g.ratio > GROWTH_BOUND && g.ms > EXEC_BOUND_MS) || g.excessMs > EXEC_BOUND_MS;
-      for (const line of over) {
-        // Asked twice before it is called slow: a super-linear pattern is over both every time.
-        const grew = [growth(r.source, r.flags, line, MAX_LINE_CHARS)];
-        if (isSlow(grew[0]!)) grew.push(growth(r.source, r.flags, line, MAX_LINE_CHARS));
-        if (grew.every(isSlow)) {
-          const g = grew[grew.length - 1]!;
-          slow.push(`${f}:${r.line} /${r.source}/ ${g.ms.toFixed(2)} ms on ${line.what}, ${g.ratio.toFixed(1)} times as long as at a quarter of the length (${g.excessMs.toFixed(2)} ms of it super-linear)`);
-          break;
-        }
-      }
+      for (const m of r.source.matchAll(/(?<!\\)\{(\d+)(?:,(\d*))?\}/g)) longestBoundedRepeat = Math.max(longestBoundedRepeat, Number(m[2] || m[1]));
+      const work = workOf(r.source, r.flags, SWEEP_LENGTH, SWEEP);
+      patterns += 1;
+      lines += work.lines;
+      // A pattern with no sample string is read on no line, which is not the same as cheap on every line.
+      if (work.lines === 0) slow.push(`${f}:${r.line} /${r.source}/ read on no line: no string of at most ${SAMPLE_MAX} characters was made that it matches`);
+      if (work.slow.length > 0) slow.push(`${f}:${r.line} /${r.source}/ ${describeWork(work.slow[0]!, SWEEP_LENGTH, STEPS_PER_CHAR)}`);
     }
   }
-  assert.ok(timed > 120, `${timed} patterns timed`);
+  assert.ok(patterns > 120, `${patterns} patterns counted`);
+  assert.ok(lines > 100_000, `${lines} lines read`);
+  assert.ok(longestBoundedRepeat < SWEEP_LENGTH / 2, `a repeat of up to ${longestBoundedRepeat} is not linear on the shortest line the sweep reads (${SWEEP_LENGTH / 2})`);
   assert.deepEqual(slow, []);
 });
 

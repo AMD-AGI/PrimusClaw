@@ -319,7 +319,9 @@ async function inReviewTransaction<T>(userId: string, prs: PrRef[], run: (query:
  * `POST /v1/assistant/reviews`: one item per pull request, all of them or none. Every refusal comes before anything is made, in the
  * order of what it costs to ask: the request, the open reviews, the hourly limits, then GitHub.
  */
-export async function startReviews(user: UserInfo, method: string | null, request: ReviewRequest): Promise<CreatedReview[]> {
+export async function startReviews(
+  user: UserInfo, method: string | null, request: ReviewRequest, guard?: (query: Querier) => Promise<void>,
+): Promise<CreatedReview[]> {
   const actingAs = request.actingAs ?? user.userId;
   const plans: Planned[] = request.prs.map(({ pr, message }) => {
     const checked = checkAsCreate(user, method, actingAs, pr, request.reviewOnly, request.model, request.effort);
@@ -339,6 +341,8 @@ export async function startReviews(user: UserInfo, method: string | null, reques
   const created = await inReviewTransaction(user.userId, plans.map((p) => p.pr), async (query) => {
     const q = { query };
     await takeCreateTurn(query);
+    // The caller's own condition, asked in the transaction that writes (the assistant's tools: the turn is still live).
+    if (guard) await guard(query);
     // The assistant row, as `insertWorkItem` takes it.
     await query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [user.userId]);
     for (const plan of plans) await refuseIfReviewed(q, user.userId, plan.pr);
@@ -367,6 +371,7 @@ function readParams(row: Record<string, unknown>): ReviewParams | null {
  */
 export async function restartReview(
   user: UserInfo, method: string | null, itemId: string, change: ReturnType<typeof parseRestartRequest>,
+  guard?: (query: Querier) => Promise<void>,
 ): Promise<{ stopped: { item_id: string; seq: number }; item: CreatedReview }> {
   const old = await getWorkItem(user.userId, itemId);
   if (!old) throw new ReviewItemRefused(404, "not_found", "no such item");
@@ -389,6 +394,7 @@ export async function restartReview(
   const result = await inReviewTransaction(user.userId, [was.pr], async (query) => {
     const q = { query };
     await takeCreateTurn(query);
+    if (guard) await guard(query);
     await query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [user.userId]);
     const row = (await query(
       "SELECT board_state, worker_session_id, seq FROM claw_work_items WHERE item_id = $1 AND user_id = $2 FOR UPDATE", [itemId, user.userId],

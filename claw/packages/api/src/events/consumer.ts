@@ -1195,9 +1195,12 @@ async function handleComplete(
     } catch (err) {
       logger.error({ err, sessionId }, "assistant.turn_end_failed");
     }
-    // 9b. A router turn that answered the user in plain text and said nothing: the text is what it meant to say.
-    //     Best-effort: a turn whose words were lost here is a user who heard nothing, which the model could have
-    //     caused on its own, so this is a repair and not a promise.
+  }
+  // 9b. A router turn that answered the user in plain text and said nothing: the text is what it meant to say. One that
+  //     failed or was stopped and said nothing: the user is told it did not go through. Best-effort: a turn whose words
+  //     were lost here is a user who heard nothing, which the model could have caused on its own, so this is a repair
+  //     and not a promise.
+  if (CLAW_ASSISTANT_ENABLED && endedRunIds.length) {
     try {
       await completionPorts.deliverUnsaidAnswer({
         sessionId,

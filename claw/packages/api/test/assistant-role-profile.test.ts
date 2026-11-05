@@ -145,7 +145,7 @@ describe("assistant role profile", { skip }, () => {
     assert.ok(claims.exp > Math.floor(Date.now() / 1000) + 3600, "outlives the longest turn the row allows");
     assert.ok(task.system_append.startsWith("You are the user's personal assistant."));
     assert.ok(!task.system_append.includes(AGENT_GUIDELINE), "a router only dispatches: the working guideline is not its");
-    assert.match(task.system_append, new RegExp(`Work items \\(open ones[^)]*\\):\\n#1 \\(item_id: ${item.itemId}\\) \\[in_progress\\] Fix the build`));
+    assert.match(task.system_append, new RegExp(`Work items \\(open ones[^)]*\\):\\n.*\\n<untrusted_data>\\n#1 \\(item_id: ${item.itemId}\\) \\[in_progress\\] title: "Fix the build"`));
     assert.equal(task.skills, undefined);
   });
 
@@ -178,7 +178,7 @@ describe("assistant role profile", { skip }, () => {
     const claims = verify(request);
     assert.equal(claims.task_id, result.runId, "the bearer names the claimed run");
     assert.equal(claims.task_id, request.task_id);
-    assert.match(request.system_append, /#2 \(item_id: kwi_\w+\) \[in_progress\] Added while it waited/);
+    assert.match(request.system_append, /#2 \(item_id: kwi_\w+\) \[in_progress\] title: "Added while it waited"/);
   });
 
   test("A3 a queued router message replayed on the wire is profiled after its run is opened", async () => {
