@@ -44,11 +44,12 @@
  *                     an Anthropic-compatible gateway, a model and its key: each case with a rubric or a judge-only fact
  *                     is also graded by that model, recorded beside the deterministic verdict and never instead of it.
  *
- * The assistant mode works in the key owner's one assistant conversation, so use a test identity where you can. It
- * runs the cases one at a time, waits for the assistant to be idle before each, and cleans up everything it started:
- * every work item numbered after the run began is accepted (a result that waits, at the version shown) or stopped.
- * Items the identity had before the run are never touched. Exit 0 when every attempt ran to a verdict; the score is
- * a measurement, not a gate.
+ * The assistant mode works in the key owner's one assistant conversation (it must be a test identity, see above). It
+ * runs the cases one at a time, waits for the assistant to be idle before each, and cleans up what it started: every
+ * work item its own turns' work_create / review_start answers name is accepted (a result that waits, at the version
+ * shown) or stopped, and an assistant session it created is deleted. No other item is touched; a new open item it cannot
+ * tie to its calls is reported. Exit 0 when every attempt ran to a verdict and the cleanup is complete; the score is a
+ * measurement, not a gate.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -107,6 +108,9 @@ const iso = (): string => new Date().toISOString();
 const log = (...a: unknown[]): void => console.log(iso(), ...a.map((x) => (typeof x === "string" ? scrub(x) : x)));
 const recordings: Recording[] = [];
 const sessionsLeft: string[] = [];   // baseline sessions the run made and could not delete: they fail the run
+/** Checks whose detail quotes what the identity was shown: kept only with EVAL_KEEP_TEXT. */
+const TEXT_DETAIL = /^(no internal text|items named by title)/;
+const RUN_ITEMS = new Set<string>();   // ids of the items the run's own turns started: the only items it ever closes
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // --- The live stream of a session ---------------------------------------------------------------------------------
@@ -242,8 +246,9 @@ const attemptOf = async (c: EvalCase, turns: Turn[], o: Observed, tools: string[
   const checks = grade(c, o);
   if (RECORD_DIR) recordings.push({ case_id: c.id, mode: MODE, attempt: recordings.filter((r) => r.case_id === c.id).length + 1, at: iso(), observed: forRecording(c, o) });
   const verdict = await judge(c, turns, o.final);
+  const kept = KEEP_TEXT ? checks : checks.map((x) => (TEXT_DETAIL.test(x.name) && x.detail ? { ...x, detail: "<hidden: EVAL_KEEP_TEXT>" } : x));
   return {
-    ...verdictOf(c, checks, verdict), checks, route: o.route, cards: o.cards, tools, final: KEEP_TEXT ? scrub(o.final) : null, finalChars: o.final.length,
+    ...verdictOf(c, checks, verdict), checks: kept, route: o.route, cards: o.cards, tools, final: KEEP_TEXT ? scrub(o.final) : null, finalChars: o.final.length,
     // The judge's reason can quote the answer: kept only with the text.
     firstReplyMs: o.firstReplyMs, finalMs: o.finalMs, items, judge: verdict && (KEEP_TEXT ? verdict : { pass: verdict.pass, why: "" }),
   };
@@ -270,8 +275,12 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   }
   // The Router's turns for the case's messages end (each is short: it answers or hands the work on).
   await until(() => (messageIds.every((id) => turnEnded(stream.events, id)) ? true : undefined), Date.now() + 180_000, 500);
-  const mine = (all: ItemSeen[]): ItemSeen[] => all.filter((i) => i.seq > floor);
+  // The case's items are only those its own turns started (read from their work_create / review_start answers): an item
+  // someone else put on the board meanwhile (a review asked of this identity) is neither graded nor closed here.
+  const started = turnCalls(stream.events, messageIds);
+  const mine = (all: ItemSeen[]): ItemSeen[] => itemsStartedBy(started, all.filter((i) => i.seq > floor));
   let items = mine(await board());
+  for (const i of items) RUN_ITEMS.add(i.item_id);
   if (items.length) {
     // The item's result (or question, or failure; or its end, for a case that stops it), then what was said about it.
     const settled = (is: ItemSeen[]): boolean => is.every((i) => (c.items_closed ? i.board_state === "done" : i.board_state !== "in_progress"));
@@ -309,6 +318,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   // Clean up: everything the attempt started is accepted (a result that waits, at its version) or stopped.
   const cleaned: Attempt["items"] = [];
   for (const i of mine(await board().catch(() => items))) {
+    RUN_ITEMS.add(i.item_id);
     const seen = items.find((x) => x.item_id === i.item_id) ?? i;
     cleaned.push({ seq: i.seq, kind: i.kind, board_state: seen.board_state, cleanup: await close(i) });
   }
@@ -453,9 +463,14 @@ async function main(): Promise<void> {
     // Whatever happened, nothing the run started stays open; what could not be closed fails the run.
     if (MODE === "assistant") {
       try {
-        for (const i of (await board()).filter((x) => x.seq > floorAtStart && x.board_state !== "done")) log(`closing #${i.seq}: ${await close(i)}`);
+        for (const i of (await board()).filter((x) => RUN_ITEMS.has(x.item_id) && x.board_state !== "done")) log(`closing #${i.seq}: ${await close(i)}`);
         await sleep(5_000);
-        leftOpen = (await board()).filter((x) => x.seq > floorAtStart && x.board_state !== "done").map((x) => x.seq);
+        const after = (await board()).filter((x) => x.seq > floorAtStart && x.board_state !== "done");
+        leftOpen = after.filter((x) => RUN_ITEMS.has(x.item_id)).map((x) => x.seq);
+        // New open items the run cannot tie to its own calls are left alone, and said: on a test identity nobody else
+        // makes items, so they are most likely the run's own whose answer could not be read, and a person must look.
+        const foreign = after.filter((x) => !RUN_ITEMS.has(x.item_id)).map((x) => x.seq);
+        if (foreign.length) cleanupFailed.push(`open items not tied to the run's calls, left alone: ${foreign.join(",")}`);
       } catch (err) {
         cleanupFailed.push(`the board could not be read to close the run's items: ${err instanceof Error ? err.message : String(err)}`);
       }
