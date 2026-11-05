@@ -214,7 +214,7 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "id", "user_id", "category", "content", "importance",
       "access_count", "created_at", "last_accessed", "deleted_at", "kind",
       "mtype", "title", "why", "how_to_apply", "status", "pinned", "token_count", "evidence_quote", "source_kind",
-      "recorded_at", "last_confirmed_at", "expires_at", "prev_title", "prev_body",
+      "recorded_at", "last_confirmed_at", "expires_at", "prev_title", "prev_body", "work_item_id",
     ],
   },
   {
@@ -237,6 +237,7 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "item_id", "user_id", "seq", "title", "summary", "board_state", "last_report_kind",
       "pending_question", "outcome", "worker_session_id", "generation", "result_version",
       "accepted_version", "attention_seq", "repo", "created_at", "updated_at", "closed_at", "kind", "params",
+      "memory_reached_at",
     ],
   },
   {

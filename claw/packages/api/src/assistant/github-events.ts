@@ -997,6 +997,15 @@ export function storedValueIn(text: string, vault: Record<string, string>): stri
   return null;
 }
 
+/**
+ * The item's worker has been shown the user's memory beyond the item (`memory-tools.ts`), and its session keeps what it read from
+ * run to run: nothing of it may be posted where strangers asked for it, so this item answers only by asking the user.
+ */
+const memoryReachedRefusal = (): ToolRefused => new ToolRefused(
+  "memory_reached",
+  "this item's worker has read the user's memory beyond this item, so it cannot answer on GitHub without asking; use the github tools, which ask the user",
+);
+
 /** Statuses after which GitHub certainly did not write the comment. */
 const definitelyNotWritten = (err: unknown): boolean =>
   err instanceof GithubError && !err.rateLimited && err.status >= 400 && err.status < 500;
@@ -1019,14 +1028,16 @@ export async function prReply(
     await assertLiveRun(query, claims);
     const t = (await query(
       `SELECT e.event_id, e.kind, e.github_id, e.reply_to, e.delivered_at, s.id AS sub_id, s.owner, s.repo, s.number, s.reply_allowed, s.user_id,
-              w.generation, w.board_state
+              w.generation, w.board_state, w.memory_reached_at
          FROM claw_work_item_github_events e
          JOIN claw_work_item_subscriptions s ON s.id = e.sub_id
          JOIN claw_work_items w ON w.item_id = e.item_id
         WHERE e.event_id = $1 AND e.item_id = $2
         FOR UPDATE OF w FOR SHARE OF s`,
       [eventId, claims.item_id],
-    )).rows[0] as (ReplyTarget & { delivered_at: Date | null; reply_allowed: boolean; generation: number; board_state: string }) | undefined;
+    )).rows[0] as (ReplyTarget & {
+      delivered_at: Date | null; reply_allowed: boolean; generation: number; board_state: string; memory_reached_at: Date | null;
+    }) | undefined;
     if (!t || !t.delivered_at) throw new ToolRefused("event_not_found", "no such event on this item: use an event_id from a [github_event] message");
     if (t.board_state === "done") throw new ToolRefused("item_closed", "this item is finished or stopped");
     if (Number(t.generation) !== claims.gen) {
@@ -1036,6 +1047,7 @@ export async function prReply(
     if (!t.reply_allowed) {
       throw new ToolRefused("reply_not_allowed", "the user has not allowed answers on this pull request without asking; use the github tools, which ask them");
     }
+    if (t.memory_reached_at) throw memoryReachedRefusal();
     const prior = (await query(
       "SELECT state, url, created_at, attempt_at > NOW() - make_interval(secs => $2::int) AS leased FROM claw_work_item_pr_replies WHERE event_id = $1 FOR UPDATE",
       [eventId, REPLY_LEASE_SEC],
@@ -1080,11 +1092,16 @@ export async function prReply(
   // Asked again right before GitHub is: the permission may have been taken back while the token and the vault were read. What is left
   // is the post itself, which nothing can call back once it is sent.
   const still = (await db.query(
-    "SELECT reply_allowed AS ok FROM claw_work_item_subscriptions WHERE id = $1", [target.sub_id],
-  )).rows[0] as { ok: boolean } | undefined;
+    `SELECT s.reply_allowed AS ok, w.memory_reached_at FROM claw_work_item_subscriptions s
+       JOIN claw_work_items w ON w.item_id = s.item_id WHERE s.id = $1`, [target.sub_id],
+  )).rows[0] as { ok: boolean; memory_reached_at: Date | null } | undefined;
   if (!still?.ok) {
     if (!retry) await release();
     throw new ToolRefused("reply_not_allowed", "the user has taken back answers on this pull request without asking; use the github tools, which ask them");
+  }
+  if (still.memory_reached_at) {
+    if (!retry) await release();
+    throw memoryReachedRefusal();
   }
   const gh = github(token);
   try {

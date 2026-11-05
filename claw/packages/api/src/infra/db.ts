@@ -1335,6 +1335,10 @@ export async function initDb(): Promise<void> {
       ["status", "TEXT NOT NULL DEFAULT 'active'"], ["pinned", "BOOLEAN NOT NULL DEFAULT FALSE"], ["token_count", "INT"],
       ["evidence_quote", "TEXT"], ["source_kind", "TEXT"], ["recorded_at", "TIMESTAMPTZ"], ["last_confirmed_at", "TIMESTAMPTZ"],
       ["expires_at", "TIMESTAMPTZ"], ["prev_title", "TEXT"], ["prev_body", "TEXT"],
+      // The assistant's work item an entry is about (`assistant/memory-tools.ts`): shown to that item's worker and
+      // the router, and kept out of every other conversation's catalogue. No foreign key: the assistant's tables
+      // exist only where the assistant is on.
+      ["work_item_id", "TEXT"],
     ] as const) {
       await client.query(`ALTER TABLE claw_memory_entries ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
     }

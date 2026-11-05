@@ -24,9 +24,11 @@ import { db } from "../infra/db.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
+import { reviewMemoryBlock, routerMemoryBlock, workerMemoryBlock } from "./memory-tools.js";
 import {
-  ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_PROMPT_VERSION, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION,
-  WORK_EVENT_PREFIX, renderObserverSystem, renderReviewContext, renderRouterSystem, renderWorkerSystem, type ManifestItem,
+  ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_PROMPT_VERSION, ROUTER_REVIEW_PROMPT_VERSION,
+  WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderObserverSystem, renderReviewContext, renderRouterSystem, renderWorkerSystem,
+  type ManifestItem,
 } from "./prompts.js";
 import { reviewContextFor } from "./review-tools.js";
 import { startWorkerRun } from "./run-started.js";
@@ -171,7 +173,12 @@ function withSystemAppend(task: Record<string, unknown>, text: string): void {
 export async function applySessionRoleToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
   const role = CLAW_ASSISTANT_ENABLED ? await sessionRole(sessionId) : null;
   if (CLAW_AGENT_GUIDELINE_ENABLED && role?.role !== "router" && role?.role !== "observer") withAgentGuideline(task);
-  if (!role) return;
+  if (!role) {
+    // A review item's session is an ordinary one; what the person bound to its item is all it is shown of their memory.
+    const memory = CLAW_ASSISTANT_ENABLED ? await reviewMemoryBlock(sessionId) : null;
+    if (memory) withSystemAppend(task, memory);
+    return;
+  }
   const taskId = stringField(task, "task_id");
   const messageId = stringField(task, "message_id");
   if (!taskId || !messageId) throw new Error("assistant.role_profile_without_run_identity");
@@ -204,14 +211,21 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
         people: ctx?.people ?? [], actions: ctx?.actions ?? [], repos: ctx?.repos ?? [],
       }));
     }
+    const memory = await routerMemoryBlock(role.userId, sessionId);
+    if (memory) withSystemAppend(task, memory);
     await addReplyLanguage(task, sessionId);
-    logger.info({ sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION }, "assistant.router_turn");
+    logger.info({
+      sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION,
+      ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}),
+    }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);
     if (!started) throw new Error("assistant.worker_item_missing");
     claims = { ...base, role: "worker", item_id: started.itemId, gen: started.generation };
     if (CLAW_ASSISTANT_WORKER_MODEL) task.model = CLAW_ASSISTANT_WORKER_MODEL;
     withSystemAppend(task, renderWorkerSystem({ seq: started.seq, title: started.title }));
+    const memory = await workerMemoryBlock(role.userId, started.itemId, sessionId);
+    if (memory) withSystemAppend(task, memory);
     logger.info({ sessionId, taskId, itemId: started.itemId, generation: started.generation, prompt: WORKER_PROMPT_VERSION }, "assistant.worker_turn");
   }
 

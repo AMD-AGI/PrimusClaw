@@ -98,7 +98,8 @@ async function existsOrNoTable(sql: string, params: unknown[]): Promise<boolean>
  * Whether a session's turns are the user's own conversation, which is the only kind memory serves.
  *
  * Not served, by server-side facts a caller cannot write: a session owned by someone else, an assistant's
- * router or a work item's worker (their user turns are written by the router, not the person), an
+ * router or a work item's worker (their user turns are written by the router, not the person), an assistant's
+ * watcher of a group or a repository (its turns are other people's messages), an
  * application's run, and any session that has carried a non-chat run (an A2A peer's, a task's, a DAG node's).
  * Not served on the caller's word either: `config.memory: "off"`, which is how a client marks a session other
  * people read, a group chat, and a child session (`parent_session_id`), whose turns its parent writes.
@@ -126,6 +127,8 @@ export async function memoryAccess(sessionId: string, userId: string): Promise<M
     }
     for (const sql of [
       "SELECT 1 FROM claw_assistants WHERE session_id = $1",
+      // An assistant's watcher of a group or a repository (`assistant/observe.ts`): what it reads is other people's.
+      "SELECT 1 FROM claw_assistant_scopes WHERE session_id = $1",
       "SELECT 1 FROM claw_work_items WHERE worker_session_id = $1",
       "SELECT 1 FROM claw_app_runs WHERE session_id = $1 LIMIT 1",
     ]) {
@@ -162,10 +165,12 @@ export interface MemoryRow {
   last_confirmed_at: string | null;
   expires_at: string | null;
   can_undo: boolean;
+  /** The assistant's work item the entry is about, or null for one that holds everywhere. */
+  work_item_id: string | null;
 }
 
 const ROW_COLUMNS = `id, category, content, mtype, title, why, how_to_apply, status, pinned, source_kind, source_session,
-  COALESCE(recorded_at, created_at) AS recorded_at, last_confirmed_at, expires_at,
+  COALESCE(recorded_at, created_at) AS recorded_at, last_confirmed_at, expires_at, work_item_id,
   (expires_at IS NOT NULL AND expires_at <= NOW()) AS due, prev_body IS NOT NULL OR prev_title IS NOT NULL AS can_undo`;
 
 const LEGACY_TITLE_CHARS = 80;
@@ -196,6 +201,7 @@ function toRow(r: Record<string, any>): MemoryRow {
     last_confirmed_at: r.last_confirmed_at ? new Date(r.last_confirmed_at).toISOString() : null,
     expires_at: r.expires_at ? new Date(r.expires_at).toISOString() : null,
     can_undo: r.can_undo === true,
+    work_item_id: r.work_item_id ?? null,
   };
 }
 
@@ -315,11 +321,22 @@ function checkDraft(
 }
 
 /**
+ * What a caller other than the chat and REST paths adds to a write. `guard` runs first inside the transaction that
+ * writes, under the user's lock; what it throws is thrown, and nothing is written. The assistant uses it to ask again,
+ * where it counts, that the turn acting is still live and still answers the person (`assistant/memory-tools.ts`).
+ */
+export interface WriteOptions {
+  /** The assistant's work item the entry is about; the caller has checked it is the user's. */
+  workItemId?: string | null;
+  guard?: (q: Querier) => Promise<void>;
+}
+
+/**
  * Store a new entry. Duplicate of an existing one: nothing new, its id is the answer. Close to an existing
  * one: refused with that entry, to be updated instead (`force_new` overrides only with a different quote).
  * Full: refused. Never drops another entry.
  */
-export async function writeMemory(userId: string, draft: MemoryDraft, actor: MemoryActor): Promise<WriteResult> {
+export async function writeMemory(userId: string, draft: MemoryDraft, actor: MemoryActor, opts: WriteOptions = {}): Promise<WriteResult> {
   const checked = checkDraft(draft, actor, null);
   if (!checked.ok) {
     await recordRefusal(userId, actor, checked.error, null);
@@ -334,15 +351,20 @@ export async function writeMemory(userId: string, draft: MemoryDraft, actor: Mem
   const result = await inTransaction(async (q) => {
     // One writer per user at a time, so the count and the duplicate check hold for the insert that follows.
     await q("SELECT pg_advisory_xact_lock(hashtext('claw_memory:' || $1))", [userId]);
+    await opts.guard?.(q);
     const live = (await q(
-      `SELECT id, category, content, mtype, title, evidence_quote FROM claw_memory_entries WHERE user_id = $1 AND ${LIVE_ROWS}`,
+      `SELECT id, category, content, mtype, title, evidence_quote, work_item_id FROM claw_memory_entries WHERE user_id = $1 AND ${LIVE_ROWS}`,
       [userId],
     )).rows as Array<Record<string, any>>;
+    // A duplicate or a near one is an entry of the same binding: one bound to another item, or to none, is shown elsewhere, and
+    // answering with it would leave nothing bound here (or, for a chat save, nothing in the chat's catalogue).
+    const workItemId = opts.workItemId ?? null;
+    const peers = live.filter((r) => (r.work_item_id ?? null) === workItemId);
     const key = normalizeText(`${title}\n${body}`);
-    const same = live.find((r) => normalizeText(`${r.title || ""}\n${r.content}`) === key || normalizeText(r.content) === normalizeText(body));
+    const same = peers.find((r) => normalizeText(`${r.title || ""}\n${r.content}`) === key || normalizeText(r.content) === normalizeText(body));
     if (same) return { ok: true as const, id: Number(same.id), op: "existing" as const, status, title: same.title || legacyTitle(same.content), live: live.length };
     let closest: { row: Record<string, any>; score: number } | null = null;
-    for (const r of live) {
+    for (const r of peers) {
       const score = Math.max(similarity(body, r.content), r.title ? similarity(title, r.title) : 0);
       if (score >= SIMILARITY_THRESHOLD && (!closest || score > closest.score)) closest = { row: r, score };
     }
@@ -360,12 +382,12 @@ export async function writeMemory(userId: string, draft: MemoryDraft, actor: Mem
     const row = (await q(
       `INSERT INTO claw_memory_entries
          (user_id, category, content, importance, source_session, source_type, mtype, title, why, how_to_apply, status,
-          token_count, evidence_quote, source_kind, recorded_at, last_confirmed_at, expires_at)
+          token_count, evidence_quote, source_kind, recorded_at, last_confirmed_at, expires_at, work_item_id)
        VALUES ($1, $2, $3, 0.5, $4, $5, $2, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW(),
-               CASE WHEN $13::int IS NULL THEN NULL ELSE NOW() + make_interval(days => $13::int) END)
+               CASE WHEN $13::int IS NULL THEN NULL ELSE NOW() + make_interval(days => $13::int) END, $14)
        RETURNING id`,
       [userId, type, body, actor.kind === "model" ? actor.sessionId : null, actor.kind === "model" ? "explicit" : "manual",
-        title, why, how, status, estimateTokens(`${title}\n${body}`), quote, sourceKind, days],
+        title, why, how, status, estimateTokens(`${title}\n${body}`), quote, sourceKind, days, workItemId],
     )).rows[0];
     const id = Number(row.id);
     await recordEvent(q, { userId, entryId: id, op: "add", actor: actor.kind, sessionId: actor.kind === "model" ? actor.sessionId : null, title, quote });
@@ -379,7 +401,9 @@ export async function writeMemory(userId: string, draft: MemoryDraft, actor: Mem
  * Change an entry. The previous title and body are kept (one level) so the change can be undone, and the
  * entry counts as confirmed again: a project or reference entry gets a fresh review date.
  */
-export async function updateMemory(userId: string, id: number, draft: MemoryDraft & { pinned?: unknown }, actor: MemoryActor): Promise<WriteResult> {
+export async function updateMemory(
+  userId: string, id: number, draft: MemoryDraft & { pinned?: unknown }, actor: MemoryActor, opts: Pick<WriteOptions, "guard"> = {},
+): Promise<WriteResult> {
   const current = await readEntry(userId, id, actor.kind === "model");
   if (!current) {
     await recordRefusal(userId, actor, "not_found", id);
@@ -397,6 +421,7 @@ export async function updateMemory(userId: string, id: number, draft: MemoryDraf
   const days = reviewDays(type, draft.expires_in_days);
   const quote = actor.kind === "model" ? actor.quote : null;
   const done = await inTransaction(async (q) => {
+    await opts.guard?.(q);
     // The model's edit holds only while the entry is still active (a REST edit may have made it pending since).
     const updated = await q(
       `UPDATE claw_memory_entries SET
@@ -442,8 +467,11 @@ function modelSees(actorKind: "model" | "api"): string {
 }
 
 /** Delete one entry for good. */
-export async function forgetMemory(userId: string, id: number, actorKind: "model" | "api"): Promise<boolean> {
+export async function forgetMemory(
+  userId: string, id: number, actorKind: "model" | "api", guard?: (q: Querier) => Promise<void>,
+): Promise<boolean> {
   return inTransaction(async (q) => {
+    await guard?.(q);
     const found = (await q(
       `SELECT id FROM claw_memory_entries WHERE user_id = $1 AND id = $2 AND kind IS NULL AND deleted_at IS NULL${modelSees(actorKind)} FOR UPDATE`,
       [userId, id],
@@ -457,8 +485,11 @@ export async function forgetMemory(userId: string, id: number, actorKind: "model
  * Undo the last change to an entry: an edited entry gets its previous title and body back, a new one (nothing
  * to go back to) is deleted. One level only.
  */
-export async function undoMemory(userId: string, id: number, actorKind: "model" | "api"): Promise<"restored" | "deleted" | "not_found"> {
+export async function undoMemory(
+  userId: string, id: number, actorKind: "model" | "api", guard?: (q: Querier) => Promise<void>,
+): Promise<"restored" | "deleted" | "not_found"> {
   return inTransaction(async (q) => {
+    await guard?.(q);
     const row = (await q(
       `SELECT prev_title, prev_body FROM claw_memory_entries WHERE user_id = $1 AND id = $2 AND kind IS NULL AND deleted_at IS NULL${modelSees(actorKind)} FOR UPDATE`,
       [userId, id],
@@ -489,14 +520,23 @@ export async function forgetAllMemories(userId: string): Promise<number> {
 }
 
 /** Read entries back: one by id, or the closest matches to a query. Counts as a use of each. */
-export async function recallMemory(userId: string, by: { id?: number; query?: string }): Promise<MemoryRow[]> {
+export async function recallMemory(
+  userId: string, by: { id?: number; query?: string; item?: string; boundOnly?: boolean },
+): Promise<MemoryRow[]> {
+  // `item`: only what holds everywhere and what is bound to that item (an assistant's worker), chosen before the top ten are
+  // taken and before anything counts as read, so another item's entries neither crowd the answer out nor are counted.
+  // `boundOnly`: what is bound to that item and nothing that holds everywhere (a worker that may post on GitHub unasked).
+  const reaches = (r: MemoryRow): boolean => by.item === undefined
+    || r.work_item_id === by.item
+    || (r.work_item_id === null && by.boundOnly !== true);
   let rows: MemoryRow[];
   if (by.id !== undefined) {
     const row = await readEntry(userId, by.id, true);
-    rows = row ? [toRow(row)] : [];
+    rows = row ? [toRow(row)].filter(reaches) : [];
   } else {
     const query = by.query ?? "";
-    const all = (await db.query(`SELECT ${ROW_COLUMNS} FROM claw_memory_entries WHERE user_id = $1 AND ${USER_ROWS} AND status = 'active'`, [userId])).rows.map(toRow);
+    const all = (await db.query(`SELECT ${ROW_COLUMNS} FROM claw_memory_entries WHERE user_id = $1 AND ${USER_ROWS} AND status = 'active'`, [userId]))
+      .rows.map(toRow).filter(reaches);
     const needle = normalizeText(query);
     rows = all
       .map((r) => ({ r, score: normalizeText(`${r.title}\n${r.body}`).includes(needle) ? 1 : similarity(query, `${r.title} ${r.body}`) }))
@@ -530,6 +570,24 @@ function catalogueLine(r: MemoryRow): string {
   return `- [${r.type}] #${r.id} ${r.title}${dates}`;
 }
 
+export interface CatalogueOptions {
+  /** What the block says before the lines, in place of the chat's (which names the chat's own tools). */
+  preamble?: string;
+  /** Work items whose entries are listed, each with the label its lines end with. Without it, no item's entries are. */
+  boundItems?: ReadonlyMap<string, string>;
+}
+
+/** The user's active entries about one work item, in full, oldest first. */
+export async function memoriesOfItem(userId: string, itemId: string): Promise<MemoryRow[]> {
+  const rows = (await db.query(
+    `SELECT ${ROW_COLUMNS} FROM claw_memory_entries
+      WHERE user_id = $1 AND work_item_id = $2 AND ${USER_ROWS} AND status = 'active'
+      ORDER BY id`,
+    [userId, itemId],
+  )).rows;
+  return rows.map(toRow);
+}
+
 export interface MemoryCatalogue {
   text: string;
   tokens: number;
@@ -543,13 +601,16 @@ export interface MemoryCatalogue {
  * CLAW_MEMORY_CATALOGUE_MAX_LINES lines and CLAW_MEMORY_CATALOGUE_MAX_TOKENS tokens. Entries waiting for the
  * user's confirmation and entries past their review date are left out and counted.
  */
-export async function buildMemoryCatalogue(userId: string): Promise<MemoryCatalogue | null> {
+export async function buildMemoryCatalogue(userId: string, opts: CatalogueOptions = {}): Promise<MemoryCatalogue | null> {
   const rows = (await db.query(
     `SELECT ${ROW_COLUMNS}, COALESCE(last_confirmed_at, created_at) AS fresh FROM claw_memory_entries
       WHERE user_id = $1 AND ${USER_ROWS} AND status = 'active'`,
     [userId],
   )).rows as Array<Record<string, any>>;
-  const entries = rows.map((r) => ({ row: toRow(r), fresh: new Date(r.fresh).getTime() }));
+  const bound = opts.boundItems;
+  const entries = rows.map((r) => ({ row: toRow(r), fresh: new Date(r.fresh).getTime() }))
+    // An entry about one work item is that item's business: listed only where the caller names the item.
+    .filter((e) => e.row.work_item_id === null || bound?.has(e.row.work_item_id));
   const due = entries.filter((e) => e.row.due_for_review).length;
   const shown = entries
     .filter((e) => !e.row.due_for_review)
@@ -565,15 +626,19 @@ export async function buildMemoryCatalogue(userId: string): Promise<MemoryCatalo
     ...(due ? [`${due} project/reference entries are past their review date and not listed; the user can confirm or delete them in their memory settings.`] : []),
   ];
   const render = (lines: string[], omitted: number) => [
-    `## Long-term Memory\n<memory-index count="${shown.length}">`, CATALOGUE_PREAMBLE, ...lines, ...footer(omitted), "</memory-index>",
+    `## Long-term Memory\n<memory-index count="${shown.length}">`, opts.preamble ?? CATALOGUE_PREAMBLE, ...lines, ...footer(omitted), "</memory-index>",
   ].join("\n");
+  const line = (r: MemoryRow): string => {
+    const label = r.work_item_id ? bound?.get(r.work_item_id) : undefined;
+    return label ? `${catalogueLine(r)} (${label})` : catalogueLine(r);
+  };
 
   const lines: string[] = [];
   for (const r of shown) {
     if (lines.length >= CLAW_MEMORY_CATALOGUE_MAX_LINES) break;
-    const candidate = [...lines, catalogueLine(r)];
+    const candidate = [...lines, line(r)];
     if (estimateTokens(render(candidate, shown.length - candidate.length)) > CLAW_MEMORY_CATALOGUE_MAX_TOKENS) break;
-    lines.push(catalogueLine(r));
+    lines.push(line(r));
   }
   const text = render(lines, shown.length - lines.length);
   return { text, tokens: estimateTokens(text), listed: lines.length, total: shown.length, dueForReview: due };

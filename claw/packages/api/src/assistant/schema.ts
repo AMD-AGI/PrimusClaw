@@ -65,6 +65,9 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   // state is read off what it did (`review-items.ts`). `params` is what a review was asked with.
   await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'task'");
   await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS params JSONB NOT NULL DEFAULT '{}'::jsonb");
+  // When the item's worker was first shown the user's memory beyond the item (the index, or an entry recalled): its session
+  // keeps what it read from run to run, so from then on it never answers on GitHub without asking (`memory-tools.ts`).
+  await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS memory_reached_at TIMESTAMPTZ");
   // One open review of a pull request at a time, whoever asked: two sessions reviewing it could both write to it.
   // GitHub's names are not case sensitive, and neither is this.
   await client.query(
