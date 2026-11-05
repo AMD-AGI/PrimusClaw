@@ -28,6 +28,32 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A work item can watch a GitHub pull request, behind `CLAW_ASSISTANT_GITHUB_EVENTS` (default off; needs
+  `CLAW_ASSISTANT_ENABLED`). New comments, reviews, review comments, a failed CI on the head commit and the pull request
+  closing reach the item's worker as one queued message, without anybody mentioning it and without going through the
+  router. A small loop reads each watched pull request every `CLAW_ASSISTANT_GITHUB_POLL_SEC` (default 30, at least 10)
+  with the owner's own `GH_TOKEN`; each event is stored once under GitHub's id and delivered in the transaction that
+  queues the message, at most 6 deliveries per item in 10 minutes (the rest wait, they are not dropped). A pull request
+  that cannot be read for 10 minutes puts the item in front of the user; neither that nor any other report of the watch's own
+  replaces a result waiting for the user (it is told once the result is sent back), and the pull request closing does not take
+  such a result back. New routes `POST/GET
+  /v1/work-items/:id/subscriptions` and `DELETE /v1/work-items/:id/subscriptions/:sub_id`; the router gets
+  `work_subscribe`, the worker `pr_reply`, which answers one event on the pull request as the owner, once per event,
+  and only where the owner allowed it themselves (`reply: true`, which needs an identity-provider sign-in; a key or
+  ending the subscription takes it away); an answer carrying the owner's token, one of their stored values or
+  anything shaped like a credential is refused. Only comments and reviews by people who can write to the repository
+  (their permission on it, asked of GitHub: admin, maintain or write) or by the owner's own account reach the worker;
+  others are recorded and dropped. When the owner's token cannot see who may write (no push access, as on an upstream a
+  fork's pull request goes to), others' comments are held back as `author_unverifiable` and the owner is asked once
+  whether to keep watching; a permission GitHub would not give (a rate limit) is asked again, never judged. Bots reach
+  the worker only when listed in `CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS` (default empty). Comments the `github` tools write
+  end with an invisible `<!-- claw:github-tool -->` mark, so an answer the owner approved there does not come back to the
+  worker as news. One poll asks GitHub five things; one user's watched pull requests share 1200 requests an hour (each is
+  read less often the more there are), and nothing of theirs is read while GitHub reports less than a fifth of their
+  token's hour left. Every stored value is looked for in an answer, a value shorter than 8 characters as a whole word,
+  and the refusal names the variable. Events still waiting when the user stops watching are dropped. A failed CI is passed on as counts, run ids and conclusions, never the runs' names. Reviews on someone's behalf are never subscribed. New tables `claw_work_item_subscriptions`,
+  `claw_work_item_github_events` and `claw_work_item_pr_replies` (required at start-up when the assistant is on);
+  `CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS` (default 20) caps what one user watches.
 - A review item reviewed again continues the last review (with `CLAW_ASSISTANT_REVIEW_ITEMS`): what a review posted is
   recorded with its threads (`claw_github_audit.posted`, a new column; `params.record` on the item), a restart or a new
   request after the requester's closed item gives the fresh session the open findings to check first, and `gh_pr_get`
