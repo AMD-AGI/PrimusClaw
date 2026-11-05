@@ -577,6 +577,12 @@ export interface ToolStats {
    * did the work. Absent on results produced before this existed.
    */
   by_tool_ok?: Record<string, number>;
+  /**
+   * Of each tool that came back without an error, when its first and its last such call returned, in ms from the start of the
+   * run's loop (calls of this process only: a run resumed from a checkpoint reports those since). Absent on older results.
+   */
+  first_ok_ms?: Record<string, number>;
+  last_ok_ms?: Record<string, number>;
 }
 
 /** Artifact emitted by an executed Task (uploaded blob reference). */
