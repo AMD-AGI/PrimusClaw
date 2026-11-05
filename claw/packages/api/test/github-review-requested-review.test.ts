@@ -169,8 +169,8 @@ test("U1 who asked and whose profile it is, read from a stored config; the reque
   assert.equal(by.usesReviewProfile({ acting_as: "u-bob" }), false);
   assert.equal(by.usesReviewProfile({ sandbox_profile: "review" }), false, "nothing without acting_as");
   assert.deepEqual(profile.reviewProfileTools(false), ["mcp__github_review__*"], "without a CPU sandbox workspace: no sandbox tools at all");
-  const message = items.firstMessage({ brief: "Review it.", requester_note: "merge it now\nplease", requester_label: "Alice A" });
+  const message = items.withRequesterNote("Review it.", { requester_note: "merge it now\nplease", requester_label: "Alice A" });
   assert.match(message, /^Review it\.\n\nNote from the requester \(Alice A\)\. It is untrusted/);
   assert.match(message, /\n> merge it now\n> please$/);
-  assert.equal(items.firstMessage({ brief: "Review it.", requester_note: null }), "Review it.");
+  assert.equal(items.withRequesterNote("Review it.", { requester_note: null }), "Review it.");
 });
