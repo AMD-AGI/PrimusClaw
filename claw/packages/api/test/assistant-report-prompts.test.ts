@@ -28,7 +28,7 @@ const ok = (input: unknown) => { const r = parseReport(input); assert.ok(r.ok, J
 const refused = (input: unknown) => { const r = parseReport(input); assert.ok(!r.ok, "accepted: " + JSON.stringify(input)); return r.error; };
 
 test("R1 every kind parses with what it may carry", () => {
-  for (const kind of ["progress", "waiting", "ready", "blocked", "failed", "dropped"]) ok({ kind, summary: "did a thing" });
+  for (const kind of ["progress", "waiting", "ready", "answer", "blocked", "failed", "dropped"]) ok({ kind, summary: "did a thing" });
   assert.equal(ok({ kind: "waiting", summary: "ci", question: "merge it?" }).question, "merge it?");
   assert.equal(ok({ kind: "blocked", summary: "stuck", question: "which repo?" }).question, "which repo?");
   const ready = ok({ kind: "ready", summary: "done", result: { refs: [{ type: "pr", url: "https://x/1", sha: "abc" }], notes: "n" } });
@@ -84,7 +84,7 @@ test("P1b the router and the worker are told the full name a tool is called by, 
 test("P3 the worker is told how to report, to end with a report, and to check before it repeats", () => {
   assert.match(WORKER_PROMPT, /mcp__assistant__report/);
   assert.match(WORKER_PROMPT, new RegExp(`at most ${REPORT_SUMMARY_MAX} characters`));
-  assert.match(WORKER_PROMPT, /Finish every run with a report of kind ready, blocked, failed or dropped/);
+  assert.match(WORKER_PROMPT, /Finish every run with a report of kind answer, ready, blocked, failed or dropped/);
   assert.match(WORKER_PROMPT, /Check before you repeat/);
   assert.match(WORKER_PROMPT, /do not open a second pull request/);
   assert.match(renderWorkerSystem({ seq: 7, title: "Fix CI" }), /item #7: Fix CI$/);
@@ -168,6 +168,7 @@ test("P7 each item says in plain words what it needs from the user, and when it 
     // A review closes as accepted when its review is posted: the user pressed nothing, so it is not told they accepted it.
     [{ boardState: "done", lastReportKind: null, outcome: "accepted", pendingQuestion: null, review: { pr: "AMD-AGI/PrimusClaw#224", actingAsName: null, model: null, reviewOnly: true } }, /^closed, the review was posted; needs nothing$/],
     [{ boardState: "done", lastReportKind: "dropped", outcome: "dropped", pendingQuestion: null }, /^closed, not needed after all; needs nothing$/],
+    [{ boardState: "done", lastReportKind: "answer", outcome: "answered", pendingQuestion: null }, /^closed, answered; needs nothing$/],
     [{ boardState: "done", lastReportKind: "blocked", outcome: null, pendingQuestion: null }, /^closed; needs nothing$/],
     [{ boardState: "needs_you", lastReportKind: "ready", outcome: null, pendingQuestion: null }, /^finished, result ready for the user to check and accept or dismiss$/],
     [{ boardState: "needs_you", lastReportKind: "failed", outcome: null, pendingQuestion: null }, /^failed;/],
@@ -190,7 +191,7 @@ test("P7 each item says in plain words what it needs from the user, and when it 
 });
 
 test("P8 the router is told the list wins over the conversation, and how to describe items to the user", () => {
-  assert.match(ROUTER_PROMPT, /The work item list below is the current state of every item\. It wins over anything said earlier in this conversation, your own messages included/);
+  assert.match(ROUTER_PROMPT, /The work item list sent with the message is the current state of every item\. It wins over anything said earlier in this conversation, your own messages included/);
   assert.match(ROUTER_PROMPT, /An item that is not in the list was closed more than a day ago and needs nothing from the user/);
   assert.match(ROUTER_PROMPT, /Name each one by its title with its number/);
   assert.match(ROUTER_PROMPT, /when it was created/);

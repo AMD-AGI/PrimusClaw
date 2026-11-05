@@ -788,6 +788,10 @@ export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWE
 // `on` gives the router the review and settings tools (review_start, review_restart, confirmation_answer,
 // review_mode_set, channel_action); anything else leaves it the five tools of a conversation.
 export const CLAW_ASSISTANT_TOOLS = env("CLAW_ASSISTANT_TOOLS", "off").trim().toLowerCase() === "on";
+// The marketplace plugin whose MCP servers the assistant reads from and its workers run with, when the message names
+// none (a chat client that talks to the assistant sends no plugin). Blank or 0: none, and a router turn has no read tools.
+// A router turn is offered only the read tools `assistant/read-tools.ts` lists of it; a worker gets the whole plugin.
+export const CLAW_ASSISTANT_PLUGIN_ID = envInt("CLAW_ASSISTANT_PLUGIN_ID", 0, { min: 0 });
 // How long after the assistant received a signed-in message a turn answering it may still act for the person.
 export const CLAW_ASSISTANT_ATTENDED_TTL_SEC = envInt("CLAW_ASSISTANT_ATTENDED_TTL_SEC", 600, { min: 1 });
 // Group chats and repositories the assistant watches, recording what it would do without doing it

@@ -492,12 +492,14 @@ describe("assistant memory tools", { skip }, () => {
     const task: Record<string, unknown> = { task_id: turn.task_id, message_id: turn.mid, prompt: "你好" };
     await w.mod.role.applySessionRoleToTask(task, alice.routerSid);
     const append = String(task.system_append);
-    assert.ok(append.includes("memory_forget(id)") && append.includes(`#${id} 回复用中文`), append);
+    // The section is the system prompt's, the same every turn; the entries go with the message, so a save leaves the prompt as it was.
+    assert.ok(append.includes("memory_forget(id)") && !append.includes(`#${id} 回复用中文`), append);
+    assert.ok(String(task.prompt).includes(`#${id} 回复用中文`), String(task.prompt));
     await svc.setMemoryPreference("alice", false);
     const off: Record<string, unknown> = { task_id: turn.task_id, message_id: turn.mid, prompt: "你好" };
     await w.mod.role.applySessionRoleToTask(off, alice.routerSid);
     assert.ok(String(off.system_append).includes("Long-term memory is turned off"), String(off.system_append));
-    assert.ok(!String(off.system_append).includes(`#${id}`));
+    assert.ok(!String(off.system_append).includes(`#${id}`) && !String(off.prompt).includes(`#${id}`));
     await svc.setMemoryPreference("alice", true);
 
     const item = await w.createItem(alice, "Fix the build");

@@ -27,10 +27,10 @@ import { newWorkItemId } from "../tasks/ids.js";
 export const BOARD_STATES = ["in_progress", "needs_you", "done"] as const;
 export type BoardState = (typeof BOARD_STATES)[number];
 
-export const REPORT_KINDS = ["progress", "waiting", "ready", "blocked", "failed", "dropped"] as const;
+export const REPORT_KINDS = ["progress", "waiting", "ready", "answer", "blocked", "failed", "dropped"] as const;
 export type ReportKind = (typeof REPORT_KINDS)[number];
 
-export type Outcome = "accepted" | "dropped" | "stopped";
+export type Outcome = "accepted" | "answered" | "dropped" | "stopped";
 
 /** `task`: a worker that reports does it. `review`: a GitHub review on someone's behalf, whose state is read off what it did (`review-items.ts`). */
 export const ITEM_KINDS = ["task", "review"] as const;
@@ -83,6 +83,10 @@ export function reportTransition(report: Pick<WorkReport, "kind" | "question">):
     case "waiting": return question ? { ...NEEDS_YOU, question } : QUIET;
     case "blocked": return { ...NEEDS_YOU, question };
     case "ready": return { ...NEEDS_YOU, newResult: true };
+    // A task that only found something out: the answer is the whole result, so the item closes and the router passes it on.
+    // There is no version to accept (`canAccept` is for a ready result only). It is a new thing for the user to hear, so the
+    // attention counter goes up: a router that does not say it leaves it to the silent sweep (`silent-sweep.ts`).
+    case "answer": return { ...QUIET, boardState: "done", wake: true, needsAttention: true, outcome: "answered" };
     case "failed": return NEEDS_YOU;
     case "dropped": return { ...QUIET, boardState: "done", wake: true, outcome: "dropped" };
   }

@@ -520,6 +520,19 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- Assistant: the router answers a question itself when a read-only tool can. With `CLAW_ASSISTANT_PLUGIN_ID` set (new; default 0,
+  none), a router turn is given that plugin's MCP servers listed in
+  `claw/packages/api/src/assistant/read-tools.ts`, cut to their read tools by name (`tools_allowlist`), and no skill, rule or write
+  tool of it; its prompt (`router-read-v1`) says to answer such a question with those tools and to start a work item only for work
+  that produces or changes something. A plugin named on the message gives the router no read tools: the list vouches only for
+  servers the operator configured. A work item's worker runs with the message's plugin, else that one, on every turn (recorded on the item as
+  `params.plugin_id`). A worker that only found something out reports `kind="answer"` (`worker-v2`): the item closes as `answered`
+  and the router passes the answer on, with nothing to accept; an answer the router does not say is said by the silent sweep.
+  Once a router turn has called one of its read tools, Brain refuses the assistant's acting tools for the rest of that turn
+  (new `ExecuteRequest.read_taint`): the user's message covers what they wrote, not what the model read afterwards. A router or observer turn is marked `skip_platform_defaults` (new
+  `ExecuteRequest` field), so Brain connects no default MCP server and lists no default skill after the message. The router's system
+  prompt is now the same on every turn (`router-v6`): the item list, the review state and the memory entries go with the message,
+  and its history is its last 40 to 59 turns from a start that moves every 20, so the provider's prompt cache keeps both.
 - GitHub review: whether an `APPROVE` or a merge made with someone else's account waits for that person's
   confirmation is now decided by the reviewing model's `risk_judgement` (`high` holds, `low` lets it through the
   other gates), not by the rule pack (`claw/packages/api/src/github-review/risk.ts`, `assessRisk`; rule pack

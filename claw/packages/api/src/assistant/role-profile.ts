@@ -25,14 +25,16 @@ import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
-import { reviewMemoryBlock, routerMemoryBlock, workerMemoryBlock } from "./memory-tools.js";
+import { reviewMemoryBlock, routerMemoryParts, workerMemoryBlock } from "./memory-tools.js";
 import {
   ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
-  ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderModelChoice, renderObserverSystem, renderReviewContext,
-  renderRouterSystem, renderWorkerSystem, type AskedOfOtherLine, type ManifestItem,
+  ROUTER_READ_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderModelChoice,
+  renderObserverSystem, renderReviewState, renderRouterItems, renderRouterPrompt, renderWorkerSystem, withTurnState,
+  type AskedOfOtherLine, type ManifestItem,
 } from "./prompts.js";
 import { allowedModels, modelChoiceOn, platformModel, readModelPrefs } from "./model-choice.js";
 import { rerunModelOf } from "./model-fallback.js";
+import { AFTER_READ_TOOLS, routerReadTools } from "./read-tools.js";
 import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
 import { startWorkerRun } from "./run-started.js";
@@ -217,29 +219,49 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
     task.mcp_servers = {};
     for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
+    task.skip_platform_defaults = true;
     withSystemAppend(task, renderObserverSystem(role.scope));
     logger.info({ sessionId, taskId, scope: role.scope, prompt: OBSERVER_PROMPT_VERSION }, "assistant.observer_turn");
   } else if (role.role === "router") {
     claims = { ...base, role: "router" };
-    task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN];
+    // The read-only tools of the deployment's assistant plugin (`read-tools.ts`), and nothing else of it: no skills, rules or write
+    // tools. A plugin the message named is not one the read list can vouch for, so it gives the router nothing.
+    const read = await routerReadTools(role.userId);
+    task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN, ...(read?.allowlist ?? [])];
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
-    // Only the assistant's own server: every other one is a connection made and a tool never offered.
+    // Only the assistant's own server and the plugin's read servers: any other is a connection made and a tool never offered.
     task.mcp_servers = {};
     for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
-    withSystemAppend(task, renderRouterSystem(await routerManifest(role.userId), await askedOfOthersManifest(role.userId)));
+    if (read) {
+      task.plugin_id = read.pluginId;
+      task.plugin_tools = read.pluginTools;
+      // Once it has read one of their results, the turn no longer acts for the person: Brain refuses the acting tools.
+      task.read_taint = { sources: read.allowlist, allow_after: AFTER_READ_TOOLS.map((t) => `${TOOL_NAME_PREFIX}${t}`) };
+    }
+    // Neither the deployment's default MCP servers nor its default skills: the hint that lists them would follow the user's message.
+    task.skip_platform_defaults = true;
+    // The system prompt is the same on every turn, so it and the history after it come from the prompt cache. What changes
+    // from turn to turn (the item list, what waits for the user, what the channel sent) goes with the message instead.
+    withSystemAppend(task, renderRouterPrompt(read?.servers ?? []));
+    const state = [renderRouterItems(await routerManifest(role.userId), await askedOfOthersManifest(role.userId))];
     if (CLAW_ASSISTANT_TOOLS) {
+      withSystemAppend(task, ROUTER_REVIEW_PROMPT);
       const review = await reviewContextFor(role.userId, sessionId, messageId);
       const ctx = review.message?.context;
-      withSystemAppend(task, renderReviewContext({
+      state.push(renderReviewState({
         confirmations: review.confirmations, reviewMode: review.reviewMode,
         people: ctx?.people ?? [], actions: ctx?.actions ?? [], repos: ctx?.repos ?? [],
       }));
     }
-    const memory = await routerMemoryBlock(role.userId, sessionId);
-    if (memory) withSystemAppend(task, memory);
+    const memory = await routerMemoryParts(role.userId, sessionId);
+    if (memory) {
+      withSystemAppend(task, memory.prompt);
+      if (memory.entries) state.push(memory.entries);
+    }
     const choice = modelChoiceOn();
     if (choice) {
-      // The allow-list with its labels and the user's own defaults, so that "the fast one" becomes a name the tools take.
+      // The allow-list with its labels and the user's own defaults, so that "the fast one" becomes a name the tools take. In the
+      // system prompt: it changes only when the user changes a default, not from turn to turn.
       const prefs = await readModelPrefs((t, p) => db.query(t, p), role.userId);
       withSystemAppend(task, renderModelChoice({
         models: allowedModels(), defaultModel: prefs.default_model, reviewModel: prefs.review_model,
@@ -250,9 +272,12 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       if (rerun) task.model = rerun;
     }
     await addReplyLanguage(task, sessionId);
+    // Even with no words (a turn the system starts): the list is what the prompt says to answer from.
+    task.prompt = withTurnState(stringField(task, "prompt"), state);
     logger.info({
-      sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION,
+      sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION, base: ROUTER_PROMPT_VERSION,
       ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
+      ...(read ? { read: ROUTER_READ_PROMPT_VERSION, readServers: read.servers, pluginId: read.pluginId } : {}),
     }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);

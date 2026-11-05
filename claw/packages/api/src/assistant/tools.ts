@@ -22,6 +22,8 @@ import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
 import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, SayRefused, type SayDeps } from "./outbound.js";
+import { WORK_EVENT_PREFIX } from "./prompts.js";
+import { assistantPluginId } from "./read-tools.js";
 import { requestedItemOf, requesterViewOf, type RequesterView } from "./requester-view.js";
 import { parseReport } from "./report.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
@@ -128,14 +130,25 @@ async function assistantUser(sessionId: string): Promise<string> {
 
 // --- Router ---------------------------------------------------------------------------
 
+/**
+ * The item whose answer woke this router turn (`formatWorkEvent` with kind `answer`), or undefined. A say in that turn that names no
+ * item is about it: recorded so, it is the say the silent sweep looks for, and the answer is not announced a second time.
+ */
+async function answerItemOfTurn(taskId: string): Promise<string | undefined> {
+  const prompt = (await db.query("SELECT prompt FROM claw_tasks WHERE task_id = $1", [taskId])).rows[0]?.prompt as string | undefined;
+  return prompt?.match(ANSWER_EVENT_RE)?.[1];
+}
+const ANSWER_EVENT_RE = new RegExp(`^${WORK_EVENT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} #\\d+ \\(item_id: (kwi_[0-9A-Za-z]+)\\) answer:`);
+
 export async function say(
   claims: AssistantTokenClaims, args: { text: string; item_id?: string }, deps: SayDeps = {},
 ): Promise<{ ok: true; say_id: string; subscribers: number }> {
   requireRole(claims, "router");
   const userId = await assistantUser(claims.sid);
+  const itemId = args.item_id?.trim() ? args.item_id : await answerItemOfTurn(claims.task_id);
   try {
     const out = await recordAssistantSay({
-      userId, sessionId: claims.sid, text: args.text, itemId: args.item_id, turnMessageId: claims.mid,
+      userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid,
       guard: async (q) => {
         if ((await assertLiveRun(q, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");
       },
@@ -229,7 +242,13 @@ export async function workCreate(
       role: "",
       model: choice ? choice.model : CLAW_ASSISTANT_WORKER_MODEL || null,
     }, { parentSid: null });
-    const item = await insertWorkItem(q, { userId, title, workerSessionId, repo, ...(choice ? { params: modelParams(choice) } : {}) });
+    // The plugin the worker runs with, every turn of it (`queueServerMessage` reads it off the item): the one the user's message
+    // to the assistant named, else the assistant's (`CLAW_ASSISTANT_PLUGIN_ID`). None leaves the worker a plain session, as before.
+    const routerRun = (await query("SELECT plugin_id FROM claw_tasks WHERE task_id = $1", [claims.task_id])).rows[0] as
+      { plugin_id: number | null } | undefined;
+    const pluginId = assistantPluginId(routerRun?.plugin_id);
+    const params = { ...(choice ? modelParams(choice) : {}), ...(pluginId !== null ? { plugin_id: pluginId } : {}) };
+    const item = await insertWorkItem(q, { userId, title, workerSessionId, repo, ...(Object.keys(params).length ? { params } : {}) });
     if (!item.ok) {
       throw new ToolRefused(item.error, item.error === "too_many_active_items"
         ? "too many unfinished items: ask the user which to stop or finish first"

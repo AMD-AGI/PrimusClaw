@@ -7,7 +7,7 @@ import { handleA2ACall } from "../clients/a2a.js";
 import { LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON } from "../tasks/abort-registry.js";
 import { callBackendMcpTool } from "../clients/backend-mcp.js";
 import { getPluginToolScope } from "./scope.js";
-import { toolNotAllowedMessage, type ToolAllowlist } from "./allowlist.js";
+import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import { MEMORY_TOOLS, MEMORY_TOOL_SCHEMAS, callMemoryTool } from "./memory-tools.js";
 import {
@@ -209,6 +209,8 @@ export class ToolRouter {
    * sub-agent was handed, which the same list has already narrowed.
    */
   private toolAllowlist: ToolAllowlist | null = null;
+  /** The run's `read_taint` (`allowlist.ts`): set by the engine, null when the request has none. */
+  readTaint: ReadTaint | null = null;
 
   /**
    * Whom `a2a_call` acts for and how long the run has: the session's owner (an identity
@@ -409,6 +411,8 @@ export class ToolRouter {
     if (this.toolAllowlist && !this.toolAllowlist.allows(name)) {
       return refuse(outcome, toolNotAllowedMessage(name));
     }
+    const tainted = this.readTaint?.refusal(name);
+    if (tainted) return refuse(outcome, tainted);
 
     if (LOOP_INTERCEPTED_TOOLS.has(name)) {
       throw new Error(`${name} must be handled by engine loop, not router`);

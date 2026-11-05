@@ -390,6 +390,21 @@ export interface ExecuteRequest {
    * mounts neither the owner's directory nor the workspace's volumes. Absent: a session like any other.
    */
   sandbox_profile?: "review";
+  /**
+   * `true`: this run is not given the deployment's platform defaults (`PLATFORM_DEFAULTS_FILE`): no default MCP server is connected
+   * and no default skill is listed or fetched. Everything else is as for any run: what the request itself carries (its MCP servers,
+   * its plugin) is still there. The API sets it for an assistant's router and observer turns, which only route and answer and whose
+   * prompt must not end with a skill list. Absent, or anything but `true`: a run like any other.
+   */
+  skip_platform_defaults?: boolean;
+  /**
+   * Once this run has called a tool that matches `sources` (a tool whose result is text other people wrote), only tools matching
+   * `sources` or `allow_after` may be called for the rest of the run; any other is refused by Brain before it is run. Entries are
+   * written like `tools_allowlist` (an exact name, or a prefix ending in `*`). The API sets it on an assistant's router turn that has
+   * read-only tools: after it has read such a result, the turn no longer acts for the user (no review, setting or memory write).
+   * Absent: no such rule.
+   */
+  read_taint?: { sources: string[]; allow_after: string[] };
 
   // ── Legacy chat fields (Phase 4 removes; do not use in new task code) ─
   /** @deprecated Use `sandbox_spec.image`. Kept for legacy chat NATS path. */

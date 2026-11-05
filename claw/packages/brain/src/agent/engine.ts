@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
-import { filterToolSchemas, parseToolAllowlist } from "../tools/allowlist.js";
+import { filterToolSchemas, parseReadTaint, parseToolAllowlist } from "../tools/allowlist.js";
 import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
@@ -168,7 +168,11 @@ export class AgentEngine {
     // enter a run, and every run of Brain comes through it, a turn, a queued turn, a task of a DAG;
     // a sub-agent starts from the schemas of the run that made it, so it has none either. Read as
     // truthy, not `=== true`: a mark that is not a boolean is still a mark.
-    const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
+    // A run marked `skip_platform_defaults` (an assistant's router or observer turn) has none either; what its own request carries
+    // stays. Read as `=== true`: it is not a safety mark, so a value that is not a boolean leaves the run as it was.
+    const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys && request.skip_platform_defaults !== true
+      ? loadPlatformDefaults()
+      : null;
     // Marketplace and plugin servers are third parties' at URLs nobody vetted, so the requester's
     // platform key fills their `<SAFE_API_KEY>` only where the operator trusts it: a host listed in
     // MCP_PLATFORM_KEY_ALLOWED_HOSTS, or, in a run given the defaults, an origin the defaults file
@@ -441,6 +445,7 @@ export class AgentEngine {
       // run, both read from the one parsed list. No field, or an empty one, is
       // no restriction and leaves both exactly as they were.
       router.setToolAllowlist(toolAllowlist);
+      router.readTaint = parseReadTaint(request.read_taint);
       const allToolSchemas = filterToolSchemas([...router.getToolSchemas(), ...mcpResult.schemas], toolAllowlist);
 
       const messages = [...(request.history || [])];
