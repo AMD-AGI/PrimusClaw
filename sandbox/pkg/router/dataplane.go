@@ -30,7 +30,9 @@ const (
 	// separated by commas: crusoe=https://example/crusoe/agent-sandbox
 	EnvClusterRoutes = "SANDBOX_CLUSTER_ROUTES"
 	// EnvUpstreamPublicKey is the managing Router's public PEM.
-	// Empty disables the hop receiver.
+	// Set it only on a cluster Router in multi-cluster mode. A single-cluster or
+	// managing Router leaves it empty, which disables the hop receiver and
+	// upstream-only.
 	EnvUpstreamPublicKey = "SANDBOX_UPSTREAM_PUBLIC_KEY"
 )
 

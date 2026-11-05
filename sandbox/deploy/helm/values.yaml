@@ -135,6 +135,8 @@ router:
     # SANDBOX_UPSTREAM_PUBLIC_KEY, off for a single-cluster or managing Router.
     # true forces it on and requires SANDBOX_CLUSTER_ID and the upstream key,
     # or the process refuses to start. false forces it off.
+    # SANDBOX_UPSTREAM_PUBLIC_KEY is set only on a cluster Router in multi-cluster
+    # mode; a single-cluster deployment leaves it unset.
     upstreamOnly: ""
     safeApiUrl: ""                # grant identity check (SAFE_API_URL); not used for /v1 auth
     # Label selector (kubectl -l syntax) of the namespaces the Router and the
