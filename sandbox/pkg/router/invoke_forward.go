@@ -133,7 +133,7 @@ func (s *Server) forwardRemoteInvocation(c *gin.Context, sessionID string) bool 
 	if !ok {
 		return false
 	}
-	if s.cfg.EnableAuth && !s.authorizeSessionOwner(c, ownerID) {
+	if s.cfg.EnableAuth && !handsPassthroughFrom(c) && !s.authorizeSessionOwner(c, ownerID) {
 		return true
 	}
 	if s.jwt == nil {

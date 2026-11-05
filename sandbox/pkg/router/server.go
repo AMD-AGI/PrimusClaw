@@ -627,7 +627,7 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 			})
 			return
 		}
-	} else if s.cfg.EnableAuth && !s.authorizeSessionOwner(c, info.UserID) {
+	} else if s.cfg.EnableAuth && !handsPassthroughFrom(c) && !s.authorizeSessionOwner(c, info.UserID) {
 		return
 	}
 

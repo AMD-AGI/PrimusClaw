@@ -87,6 +87,11 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		if isHandsPassthrough(c) {
+			c.Set(ctxHandsPassthrough, true)
+			c.Next()
+			return
+		}
 		credential := bearerCredential(c)
 		if credential == "" {
 			recordCallerAuthRejection(c, http.StatusUnauthorized)
