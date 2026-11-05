@@ -8,7 +8,8 @@ import { singleflightCreate, type FlightResult } from "../shared/singleflight.js
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { submitSessionMessage } from "../sessions/submit-message.js";
-import { SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { attendedViaOfRequest, parseChannelContext, preemptReportTurn, recordAssistantMessage } from "../assistant/inbound.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { checkSessionCreate } from "../github-review/acting-session.js";
 import { REQUESTED_REVIEW_CONFIG_KEYS } from "../github-review/requested-by.js";
@@ -1892,7 +1893,19 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       // A turn in a session that acts as a user is the person's say, like creating it: the key a sandbox holds is the owner's own and
       // reaches this route, so it must not be able to put work in front of a model that holds the person's GitHub account.
       refuse: (tx) => actingTurnRefusalFor(req, sessionId, tx),
+      // A message to the user's own assistant is written down with how it was authenticated, for the turn that answers it.
+      ...(CLAW_ASSISTANT_ENABLED ? {
+        accepted: (tx: PoolClient, messageId: string) => recordAssistantMessage(tx, {
+          sessionId, messageId, userId, userName: user?.userName, content,
+          attendedVia: attendedViaOfRequest(req),
+          context: parseChannelContext(body.channel_context),
+        }),
+      } : {}),
     });
+    if (CLAW_ASSISTANT_ENABLED && submitted.kind === "queued" && submitted.drain === "awaiting_turn") {
+      // What the user says next goes before a worker's report the assistant is still reading.
+      await preemptReportTurn(sessionId).catch((err) => logger.warn({ err, sessionId }, "assistant.report_turn_preempt_failed"));
+    }
     switch (submitted.kind) {
       case "session_not_found":
         return reply.status(404).send({ ok: false, error: "session not found" });

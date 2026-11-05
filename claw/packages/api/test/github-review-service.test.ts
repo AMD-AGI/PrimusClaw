@@ -1049,6 +1049,30 @@ describe("C high risk waits for the acting user", () => {
     assert.equal((await pending())[0]?.status, "stale");
   });
 
+  test("C5b a caller's guard is asked once the confirmation is claimed: when it refuses, nothing is written and the confirmation is given back", async () => {
+    const id = String((await merge()).body.confirmation_id);
+    const seen: string[] = [];
+    const gone = async () => {
+      seen.push(String((await pending())[0]?.status));
+      throw new Error("the turn ended");
+    };
+    for (const decision of ["allow", "deny"] as const) {
+      await assert.rejects(e.service.decide("u-bob", id, decision, null, gone), /the turn ended/);
+      assert.equal((await pending())[0]?.status, "pending", decision);
+    }
+    assert.deepEqual(seen, ["merging", "merging"], "asked after the claim, where the answer is given");
+    assert.equal(e.gh.writes.length, 0);
+    // One that can no longer be given back is closed, never left claimed.
+    await e.sql("UPDATE claw_github_confirmations SET expires_at = NOW() + INTERVAL '1 second' WHERE confirmation_id = $1", [id]);
+    const late = async () => { await new Promise((r) => setTimeout(r, 1500)); throw new Error("the turn ended"); };
+    await assert.rejects(e.service.decide("u-bob", id, "allow", null, late), /the turn ended/);
+    assert.equal((await pending())[0]?.status, "refused");
+    assert.equal(e.gh.writes.length, 0);
+    // A guard that passes changes nothing.
+    const fresh = String((await merge()).body.confirmation_id);
+    assert.equal((await e.service.decide("u-bob", fresh, "allow", null, async () => {})).body.status, "merged");
+  });
+
   test("C5 deny merges nothing; an expired confirmation merges nothing", async () => {
     const id = String((await merge()).body.confirmation_id);
     assert.equal((await e.service.decide("u-bob", id, "deny")).body.status, "denied");
