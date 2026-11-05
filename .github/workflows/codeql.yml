@@ -7,6 +7,13 @@ name: CodeQL
 # Weekly schedule still runs on the default branch for full analysis.
 on:
   push:
+    # main and the deploy/* branches only: every other branch reaches CI as a
+    # pull request, and a push trigger there ran the whole workflow a second
+    # time on the same commit (the two runs sit in different concurrency
+    # groups, so neither cancelled the other).
+    branches:
+      - main
+      - "deploy/**"
     paths-ignore:
       - "**/*.md"
       - "docs/**"
