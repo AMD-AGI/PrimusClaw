@@ -33,6 +33,9 @@
 #   EGRESS_ENABLED=true                       # enable EnvD egress enforcement
 #   EGRESS_EXTRA_BLOCKED_CIDRS=               # comma-separated additional CIDRs
 #                                             # one of the two above MUST be provided
+#   CONTROLPLANE_INGRESS_CIDRS=               # comma-separated CIDRs the control plane also admits
+#                                             # (host-network gateways, node overlay addresses; see
+#                                             # controlplane.networkPolicy in values.yaml). Unset = pods only
 #   SANDBOX_EXTRA_CA_CONFIGMAP=               # ConfigMap of PEM CA certs mounted into every sandbox
 #   SANDBOX_EXTRA_CA_NAMESPACES=default       # comma-separated sandbox namespaces the ConfigMap must exist in
 #   SANDBOX_EXTRA_CA_REQUIRED=false           # true = the envd-injector image carries the CA (EXTRA_CA_CERT_URLS)
@@ -68,6 +71,7 @@ HELM_INSTALL_DIR="${HELM_INSTALL_DIR:-${HOME}/.local/bin}"
 DRY_RUN="${DRY_RUN:-false}"
 EGRESS_ENABLED="${EGRESS_ENABLED:-true}"
 EGRESS_EXTRA_BLOCKED_CIDRS="${EGRESS_EXTRA_BLOCKED_CIDRS:-}"
+CONTROLPLANE_INGRESS_CIDRS="${CONTROLPLANE_INGRESS_CIDRS:-}"
 SANDBOX_EXTRA_CA_CONFIGMAP="${SANDBOX_EXTRA_CA_CONFIGMAP:-}"
 SANDBOX_EXTRA_CA_NAMESPACES="${SANDBOX_EXTRA_CA_NAMESPACES:-default}"
 SANDBOX_EXTRA_CA_REQUIRED="${SANDBOX_EXTRA_CA_REQUIRED:-false}"
@@ -457,17 +461,28 @@ VALUES_FILE="$(mktemp /tmp/agent-sandbox-values.XXXXXX.json)"
 chmod 600 "${VALUES_FILE}"
 EGRESS_ENABLED_FOR_VALUES="${EGRESS_ENABLED}" \
 EGRESS_CIDRS_FOR_VALUES="${EGRESS_EXTRA_BLOCKED_CIDRS}" \
+INGRESS_CIDRS_FOR_VALUES="${CONTROLPLANE_INGRESS_CIDRS}" \
 python3 - "${VALUES_FILE}" <<'PY'
+import ipaddress
 import json
 import os
 import sys
 
 enabled = os.environ["EGRESS_ENABLED_FOR_VALUES"].lower() == "true"
 cidrs = ",".join(item.strip() for item in os.environ["EGRESS_CIDRS_FOR_VALUES"].split(",") if item.strip())
+values = {"egress": {"enabled": enabled, "extraBlockedCIDRs": cidrs}}
+ingress = [item.strip() for item in os.environ["INGRESS_CIDRS_FOR_VALUES"].split(",") if item.strip()]
+for item in ingress:
+    try:
+        ipaddress.ip_network(item, strict=True)
+    except ValueError as exc:
+        sys.exit(f"CONTROLPLANE_INGRESS_CIDRS: {item!r} is not a CIDR: {exc}")
+# Unset leaves the chart default (pods only). This installer does not reuse the
+# release's values, so a re-run must name them again.
+if ingress:
+    values["controlplane"] = {"networkPolicy": {"extraIngressCIDRs": ingress}}
 with open(sys.argv[1], "w", encoding="utf-8") as f:
-    json.dump({
-        "egress": {"enabled": enabled, "extraBlockedCIDRs": cidrs},
-    }, f)
+    json.dump(values, f)
 PY
 trap 'rm -f "${VALUES_FILE:-}"' EXIT
 

@@ -888,3 +888,60 @@ defaultSandbox:
   image: ""
   cpu: "2"
   memory: 4Gi
+
+# NetworkPolicies for the release namespace and for the namespaces Claw's
+# sandboxes (Hands) run in. Off by default: they only mean something under an
+# engine that enforces them (Calico, Cilium, kube-router, ...), and an allow
+# list that misses a dependency breaks the install. Turn on with the lists
+# below filled in for the cluster.
+networkPolicy:
+  enabled: false
+  # Ingress to every pod of the release namespace, by CIDR. Pod and namespace
+  # selectors are deliberately not offered: a gateway on the host network has
+  # no pod identity (it arrives from the node address, or from the node's
+  # overlay address on another node), and an engine that learns a new pod's
+  # address a second or two after it starts refuses a selector-matched
+  # client's first connection. Typically the pod network, e.g. [10.244.0.0/16].
+  # Empty: nothing may connect.
+  ingressCIDRs: []
+  # Node-local DNS cache addresses (NodeLocal DNSCache), allowed on port 53
+  # next to the kube-dns pods, e.g. [169.254.20.10].
+  dnsIPs: []
+  # Namespaces every pod may reach on any port (SaFE apiserver, identity,
+  # the agent-sandbox control plane).
+  egressNamespaces: []
+  # Namespaces reachable on the listed ports only, e.g. an object store:
+  # [{namespace: minio, ports: [9000]}].
+  egressNamespacePorts: []
+  # Private destinations by CIDR and port, e.g. the gateway and the Kubernetes
+  # API on the node subnet: [{cidr: 192.0.2.0/24, ports: [80, 443, 6443]}].
+  egressCIDRs: []
+  # Public destinations: any address outside privateCIDRs, on these ports
+  # (LLM and Git over HTTPS/SSH, AMQP over TLS for Teams, ...).
+  publicEgressPorts: [80, 443]
+  # Excluded from "public": the private ranges, link-local (cloud metadata),
+  # carrier-grade NAT and loopback.
+  privateCIDRs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 169.254.0.0/16
+    - 100.64.0.0/10
+    - 127.0.0.0/8
+  # Egress of the Hands pods, in each namespace they run in. Only Egress is
+  # restricted: ingress there is the workspace's business.
+  sandboxEgress:
+    enabled: false
+    # Namespaces the sandboxes run in (secret.sandboxNamespace and every
+    # workspace namespace a request can name).
+    namespaces: []
+    podLabels:
+      primus-claw/component: hands
+    # In-cluster services a sandbox needs, by namespace and pod labels.
+    egressPods:
+      - namespace: agent-sandbox-system
+        podLabels: {app: agent-sandbox-controlplane}
+        ports: [8080, 8081]
+    # Private destinations by CIDR and port, as networkPolicy.egressCIDRs.
+    egressCIDRs: []
+    publicEgressPorts: [80, 443, 22]
