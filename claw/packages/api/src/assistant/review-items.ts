@@ -287,9 +287,10 @@ export async function recordReviewHandoff(q: Querier, h: { handoffId: string; us
  * that leaves `handoff_id` out still waits for the reviewer's confirmation before it merges, and only reviews unless one of those handoffs
  * read a merge, for as long as the record is kept (`REVIEW_HANDOFF_RETENTION_DAYS`), however late it comes. A request that names one must be the
  * caller's, to this reviewer, for pull requests it covers, not yet started from, and not expired; it is then started from once, and merges
- * only if the router read a merge.
+ * only if the router read a merge. A request that leaves the id out uses up every unused handoff it matched (`taken`), so none of them
+ * starts another review by its id afterwards.
  */
-async function handoffGate(requesterId: string, reviewerId: string, request: ReviewRequest): Promise<{ handoffId: string | null; merge: boolean } | null> {
+async function handoffGate(requesterId: string, reviewerId: string, request: ReviewRequest): Promise<{ handoffId: string | null; merge: boolean; taken: string[] } | null> {
   const keys = request.prs.map(({ pr }) => prKey(pr));
   if (request.handoffId) {
     const row = (await db.query(
@@ -305,14 +306,15 @@ async function handoffGate(requesterId: string, reviewerId: string, request: Rev
     if (outside.length) {
       throw new ReviewItemRefused(409, "handoff_mismatch", `the handoff does not name ${outside.join(", ")}: nothing was started`, { field: "handoff_id" });
     }
-    return { handoffId: request.handoffId, merge: row.merge };
+    return { handoffId: request.handoffId, merge: row.merge, taken: [request.handoffId] };
   }
   const rows = (await db.query(
-    `SELECT merge FROM claw_assistant_review_handoffs
+    `SELECT handoff_id, merge, used_at FROM claw_assistant_review_handoffs
       WHERE user_id = $1 AND reviewer_user_id = $2 AND created_at > NOW() - make_interval(days => $3::int) AND prs && $4::text[]`,
     [requesterId, reviewerId, REVIEW_HANDOFF_RETENTION_DAYS, keys],
-  )).rows as Array<{ merge: boolean }>;
-  return rows.length ? { handoffId: null, merge: rows.some((r) => r.merge) } : null;
+  )).rows as Array<{ handoff_id: string; merge: boolean; used_at: Date | null }>;
+  if (!rows.length) return null;
+  return { handoffId: null, merge: rows.some((r) => r.merge), taken: rows.filter((r) => !r.used_at).map((r) => r.handoff_id) };
 }
 
 /** The changes a restart asks for; what it leaves out is the old item's. */
@@ -644,6 +646,9 @@ export async function startReviews(
         [handoff.handoffId],
       );
       if (!taken.rowCount) throw new ReviewItemRefused(409, "handoff_used", "a review was already started from this handoff: nothing was started", { field: "handoff_id" });
+    } else if (handoff?.taken.length) {
+      // A start that left the id out uses up the handoffs it matched: none of them starts a second review by its id.
+      await query("UPDATE claw_assistant_review_handoffs SET used_at = NOW() WHERE handoff_id = ANY($1::text[]) AND used_at IS NULL", [handoff.taken]);
     }
     for (const plan of plans) await refuseIfReviewed(q, owner.userId, requestedBy, plan.pr);
     await refuseOverLimit(q, actingAs, plans.length);

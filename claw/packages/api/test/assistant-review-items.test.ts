@@ -993,6 +993,11 @@ describe("assistant review items", { skip }, () => {
     await handoff("h-unechoed-review", [259], false);
     const unechoedReview = await made(await start("alice", { prs: [PR(259)], acting_as: "bob", review_only: false }));
     assert.deepEqual([unechoedReview.config.review_only, unechoedReview.config.merge_needs_confirmation], [true, true]);
+    // A start without the id uses up the handoff it matched: its id then starts nothing more, not even its other pull request.
+    await handoff("h-unechoed-two", [264, 265], true);
+    await made(await start("alice", { prs: [PR(264)], acting_as: "bob", review_only: false }));
+    const afterUnechoed = await start("alice", { prs: [PR(265)], acting_as: "bob", review_only: false, handoff_id: "h-unechoed-two" });
+    assert.deepEqual([afterUnechoed.status, afterUnechoed.body.error], [409, "handoff_used"]);
 
     // A handoff names its requester, its reviewer and its pull requests, and lives as long as its delivery could take.
     await handoff("h-257", [257], true);
@@ -1009,7 +1014,7 @@ describe("assistant review items", { skip }, () => {
     }
     await w.q("UPDATE claw_assistant_review_handoffs SET created_at = NOW() - make_interval(hours => $1::int + 1) WHERE handoff_id = 'h-257'", [ri.REVIEW_HANDOFF_HOURS]);
     assert.deepEqual((await start("alice", { prs: [PR(257)], acting_as: "bob", handoff_id: "h-257" })).body.error, "handoff_not_found", "expired");
-    assert.equal(await count("claw_work_items"), 4, "nothing made by a refused handoff");
+    assert.equal(await count("claw_work_items"), 5, "nothing made by a refused handoff");
     // Too late to start by its id, yet a start without it is still held: the record binds for as long as it is kept.
     const late = await made(await start("alice", { prs: [PR(257)], acting_as: "bob", review_only: false }));
     assert.deepEqual([late.config.review_only, late.config.merge_needs_confirmation], [false, true]);

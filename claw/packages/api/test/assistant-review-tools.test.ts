@@ -441,6 +441,20 @@ describe("assistant review tools", { skip }, () => {
     ] as const) {
       assert.equal(rt.reviewerNamed(text, person, [chen, wu]), named, `${text} / ${person.user_id}`);
     }
+    // One person's name is the start of another's: where the longer name is written, it names only that person.
+    const zhA = p("王一涵", "u-zha");
+    const zhB = p("王一涵娜", "u-zhb");
+    const alexC = p("Alex Chen", "u-ac");
+    const alexCW = p("Alex Chen Wu", "u-acw");
+    for (const [text, person, people2, named] of [
+      ["请王一涵娜审 AMD-AGI/PrimusClaw#254", zhA, [zhA, zhB], false], ["请王一涵娜审 AMD-AGI/PrimusClaw#254", zhB, [zhA, zhB], true],
+      ["请王一涵审 254", zhA, [zhA, zhB], true], ["请王一涵审 254", zhB, [zhA, zhB], false],
+      ["王一涵娜和王一涵一起审", zhA, [zhA, zhB], true],
+      ["Please Alex Chen Wu review #254", alexC, [alexC, alexCW], false], ["Please Alex Chen Wu review #254", alexCW, [alexC, alexCW], true],
+      ["Please Alex Chen review #254", alexC, [alexC, alexCW], true], ["Please Alex Chen review #254", alexCW, [alexC, alexCW], false],
+    ] as const) {
+      assert.equal(rt.reviewerNamed(text, person, people2), named, `${text} / ${person.user_id}`);
+    }
     await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: alice.userId });
     assert.equal(calls.start[0].request.actingAs, null);
   });

@@ -172,23 +172,29 @@ const HAN = /\p{Script=Han}/u;
 /**
  * Whether the person's own message names this person by something that is theirs alone among the people the channel listed: their name,
  * a part of it, their email, the part of it before the `@`, or their user id, each only when no one else listed has the same (so two
- * people called Alex Chen, or `alex@a` and `alex@b`, are told apart only by what differs). Case aside; a Latin word only whole (`Lei` is
- * not named by `Leila`), a Chinese name anywhere in the text. Being listed beside the message is the channel's say that the person is
- * there; this is the person's say that it is them.
+ * people called Alex Chen, or `alex@a` and `alex@b`, are told apart only by what differs), and only where it is not part of another listed
+ * person's longer word (`王一涵` in `王一涵娜`). Case aside; a Latin word only whole (`Lei` is not named by `Leila`), a Chinese name anywhere
+ * in the text. Being listed beside the message is the channel's say that the person is there; this is the person's say that it is them.
  */
 export function reviewerNamed(text: string, person: ChannelPerson & { user_id: string }, people: readonly ChannelPerson[]): boolean {
   const t = lower(text);
-  const appears = (s: string): boolean => {
-    if (HAN.test(s)) return t.includes(s);
-    return new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(s)}(?![\\p{L}\\p{N}_])`, "u").test(t);
+  // Where the word stands in the text, as [start, end) spans.
+  const spans = (s: string): Array<[number, number]> => {
+    const re = HAN.test(s) ? new RegExp(escapeRe(s), "gu") : new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(s)}(?![\\p{L}\\p{N}_])`, "gu");
+    return [...t.matchAll(re)].map((m) => [m.index, m.index + m[0].length] as [number, number]);
   };
   const words = (p: ChannelPerson): string[] => {
     const local = p.email?.split("@")[0] ?? "";
     return [p.name, ...p.name.split(/[\s,，、.·]+/), p.user_id ?? "", p.email ?? "", local.length >= 3 ? local : ""]
       .map((w) => lower(w.trim())).filter((w) => w.length >= 2);
   };
-  const theirs = new Set(people.filter((p) => p !== person && p.user_id !== person.user_id).flatMap(words));
-  return words(person).some((w) => !theirs.has(w) && appears(w));
+  const theirs = [...new Set(people.filter((p) => p !== person && p.user_id !== person.user_id).flatMap(words))];
+  const taken = new Set(theirs);
+  // A word of this person's counts where it stands on its own, not where it is part of another listed person's longer word: "王一涵"
+  // inside "王一涵娜", or "Alex Chen" inside "Alex Chen Wu", names that other person.
+  const inLonger = (w: string, [a, b]: [number, number]): boolean =>
+    theirs.some((o) => o.length > w.length && o.includes(w) && spans(o).some(([c, d]) => c <= a && b <= d));
+  return words(person).some((w) => !taken.has(w) && spans(w).some((span) => !inLonger(w, span)));
 }
 
 /** The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased. */
