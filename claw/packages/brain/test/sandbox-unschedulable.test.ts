@@ -700,8 +700,14 @@ test("the long ceilings still apply to what the short limit does not cover", { t
  * Every line the process logs while `fn` runs, and until `settled` says the ones
  * wanted have arrived: pino writes to fd 1 with fs.write / fs.writeSync, and
  * asynchronously, so a test that follows a noisy one waits behind its backlog.
+ *
+ * `settled` is asked about whole lines, one at a time. The backlog is earlier
+ * tests' lines, with the same message names for another workload, and it reaches
+ * fs.write in chunks of at most 16 KiB; a question asked of the text as a whole
+ * is answered by one line from the backlog and another from this test, while the
+ * line it was waiting for is still in the next chunk.
  */
-async function captureLogs<T>(fn: () => Promise<T>, settled: (logs: string) => boolean): Promise<{ out: T; logs: string }> {
+async function captureLogs<T>(fn: () => Promise<T>, settled: (line: string) => boolean): Promise<{ out: T; logs: string }> {
   const logs: string[] = [];
   const realWriteSync = fs.writeSync;
   const realWrite = fs.write;
@@ -715,7 +721,7 @@ async function captureLogs<T>(fn: () => Promise<T>, settled: (logs: string) => b
   }) as typeof fs.write;
   try {
     const out = await fn();
-    for (let waited = 0; waited < 20_000 && !settled(logs.join("")); waited += 50) {
+    for (let waited = 0; waited < 20_000 && !logs.join("").split("\n").some(settled); waited += 50) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     return { out, logs: logs.join("") };
@@ -728,7 +734,8 @@ async function captureLogs<T>(fn: () => Promise<T>, settled: (logs: string) => b
 test("the platform's own text, identifiers and all, is in the log and in nothing the user is sent", { timeout: 5000 }, async () => {
   const { out, logs } = await captureLogs(
     () => run([incident()], { workloadId: "wl-incident", unschedulableTimeoutMs: 300_000 }),
-    (all) => all.includes("test.unschedulable") && all.includes('"wl-incident"'),
+    // This workload's give-up, the last of its lines: not any workload's, which an earlier test's backlog has.
+    (line) => line.includes("test.unschedulable") && line.includes('"wl-incident"'),
   );
   assert.equal(out.ended, "sandbox_unschedulable");
   // Lines of earlier tests can still be flushing; this one's are the ones for its own workload.
