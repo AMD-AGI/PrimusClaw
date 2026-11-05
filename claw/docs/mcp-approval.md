@@ -60,3 +60,43 @@ an object with a `tool` and an optional `when`:
 This is a convenience for unattended sessions, not an authorization boundary.
 Keep server-side authorization as the real control, and list only tools whose
 effect is cheap and reversible.
+
+## Offering a subset: `enabled_tools` and `disabled_tools`
+
+Two more fields on the same server spec decide which of the server's tools the
+model is offered at all (`src/clients/mcp-tool-filter.ts`). Every offered tool's
+schema is sent on every model call, so a server with dozens of tools costs that
+much prompt on every turn; these fields cut it per server.
+
+| Field | Effect |
+|---|---|
+| `enabled_tools` | Only these tools are offered. |
+| `disabled_tools` | These tools are not offered, whatever `enabled_tools` says. |
+
+Names and patterns work as for `requires_approval`: the server's own names, a
+trailing `*` matches a prefix, and a bare `*` matches every tool. `camelCase`
+spellings are read too; with both spellings present a tool must pass both.
+
+```json
+{
+  "mcpServers": {
+    "ops": {
+      "url": "https://mcp.example.invalid/mcp",
+      "enabled_tools": ["get_*", "preview_*", "job_requeue"],
+      "disabled_tools": ["get_audit"]
+    }
+  }
+}
+```
+
+- Absent fields offer every tool, as before.
+- A tool that is not offered cannot be called either: the client refuses the
+  call and the server never sees it.
+- A field that is present but cannot be read (not a list, an empty list, an
+  entry that is not a non-empty string, `null`) keeps the whole server out of
+  the run. It is reported like a server that is down (the `mcp_unavailable`
+  progress event and the note to the model), with the field named.
+- A name the server does not list is logged as
+  `mcp_client.tool_filter_names_unknown`, so a typo or a renamed tool is visible.
+- It is a prompt-size control, not an authorization boundary: a tool that must
+  never run belongs off the server or behind `requires_approval`.
