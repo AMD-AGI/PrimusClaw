@@ -54,6 +54,11 @@ export interface ReviewActor {
   reviewTarget?: PrRef | null;
   /** `config.review_only` (review-target.ts): the session reviews and never merges, so `gh_pr_merge` is refused (`review_only`). */
   reviewOnly?: boolean;
+  /**
+   * `config.merge_needs_confirmation` (review-target.ts): a review the assistant's router started. Its merge, and an approval that GitHub's
+   * auto-merge would turn into one, is always held for the acting user's confirmation (C2), whatever the risk and their review mode.
+   */
+  mergeNeedsConfirmation?: boolean;
 }
 
 export interface ToolOutcome {
@@ -1224,6 +1229,17 @@ export class GithubReview {
     return { ...risk, level: reasons.length > 0 ? "high" : "low", reasons };
   }
 
+  /**
+   * A review the assistant's router started (`ReviewActor.mergeNeedsConfirmation`) merges only once the acting user has confirmed that very
+   * write: the router's `merge=true` came from reading a sentence, and natural language never approves a merge. So the merge is held, whatever
+   * the risk and the acting user's review mode, and made only from the card's button or the exact command (`decide`, with the confirmation).
+   */
+  private confirmedMergesOnly(ctx: Ctx, risk: RiskResult): RiskResult {
+    if (!ctx.actor.mergeNeedsConfirmation) return risk;
+    const reason = `the review was started through ${ctx.cred.login}'s assistant, so a merge is made only once ${ctx.cred.login} confirms it (the button on its card, or 批准 #<ref>)`;
+    return { ...risk, level: "high", reasons: [...risk.reasons, reason] };
+  }
+
   /** The audit row keeps why a write was held and what the rules saw, the evidence marked as such. */
   private auditedReasons(risk: RiskResult): string[] {
     return [...risk.reasons, ...risk.evidence.filter((e) => !risk.reasons.includes(e)).map((e) => `evidence: ${e}`)];
@@ -1334,7 +1350,8 @@ export class GithubReview {
       throw new Refusal("review_only", "this session was asked for a review only, and auto-merge is on for this pull request, so an approval could merge it: nothing was posted. Post the review as COMMENT or REQUEST_CHANGES instead.");
     }
     this.requireGreen(state, pr.headSha);
-    return risk;
+    // An approval that GitHub's auto-merge would turn into a merge is that merge: a review the assistant started holds it for the acting user.
+    return state.autoMerge ? this.confirmedMergesOnly(ctx, risk) : risk;
   }
 
   private checkComments(raw: unknown, change: Change | null): ReviewComment[] {
@@ -1564,7 +1581,7 @@ export class GithubReview {
 
     const change = await this.collectChange(ctx, ref, pr);
     const risk = opts.confirmation ? assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement))
-      : await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement)));
+      : this.confirmedMergesOnly(ctx, await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement))));
     ctx.acc.riskReasons = this.auditedReasons(risk);
     let state = await this.readState(ctx, ref, pr, repo);
     // A branch with a merge queue takes the pull request through it (see `viaQueue`); the queue, not this call, chooses the merge method.

@@ -280,6 +280,38 @@ describe("E a session bound to one pull request, over the wire", () => {
     }
   });
 
+  test("E6 the tool route takes merge_needs_confirmation from the session row: such a session's merge is held, nothing merged, and only the acting user's allow on the card's route makes it", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    const http = async (user: string, path: string, body: unknown) => {
+      const r = await fetch(base + path, { method: "POST", headers: { "x-test-user": user, "content-type": "application/json" }, body: JSON.stringify(body) });
+      return { status: r.status, body: (await r.json().catch(() => null)) as any };
+    };
+    // [stored merge_needs_confirmation, held]: a value that is not false reads as one that waits.
+    for (const [stored, held] of [[true, true], ["yes", true], [false, false], [null, false]] as const) {
+      e = await reviewEnv({}, { approved: true });
+      e.identity.answer = async () => credential({ delegation: true });
+      e.gh.reviews.push(ownApproval("s-1"));
+      e.gh.graphql.mergeStateStatus = "CLEAN";
+      await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-1', 'u-alice', $1::jsonb)",
+        [JSON.stringify({ acting_as: "u-bob", acting_as_requester: "Alice A", merge_needs_confirmation: stored })]);
+      app.server.closeAllConnections(); await app.close(); await boot();
+      const c = await connect(token());
+      const r = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD, risk_judgement: { level: "low", reason: "an ordinary change" } });
+      await c.close();
+      const merges = () => e.gh.calls.filter((x) => x.method === "PUT").length;
+      assert.equal(r.body.status, held ? "confirmation_required" : "merged", `${JSON.stringify(stored)}: ${r.text}`);
+      assert.equal(merges(), held ? 0 : 1, JSON.stringify(stored));
+      if (!held) continue;
+      const path = `/v1/github-review/confirmations/${r.body.confirmation_id}/decision`;
+      // The person who asked is not the person it waits for; nor is anyone else.
+      for (const other of ["u-alice", "u-mallory"]) assert.equal((await http(other, path, { decision: "allow" })).status, 403, other);
+      assert.equal(merges(), 0);
+      const ok = await http("u-bob", path, { decision: "allow" });
+      assert.equal(ok.body.status, "merged", JSON.stringify(ok.body));
+      assert.equal(merges(), 1);
+    }
+  });
+
   test("E4 a held review is listed with its kind and what it would post, so a card can show it", async () => {
     e.identity.answer = async () => credential({ delegation: true });
     const c = await connect(token());

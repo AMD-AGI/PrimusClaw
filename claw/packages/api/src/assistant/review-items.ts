@@ -57,6 +57,11 @@ export interface ReviewParams {
   model: string | null;
   effort: string | null;
   review_only: boolean;
+  /**
+   * Set when the assistant's router started or restarted the review (`review_start`, `review_restart`): its session merges only once the
+   * acting user confirms that very merge (`config.merge_needs_confirmation`, review-target.ts). Kept by every later restart.
+   */
+  merge_needs_confirmation?: true;
   /** The first message of the review's session, as it was sent; a restart that changes nothing about it sends it again. */
   brief: string;
   /**
@@ -182,6 +187,11 @@ export interface ReviewRequest {
    * by the HTTP route, never parsed from a body. Without it a review cannot be asked of someone else.
    */
   actingAsUser?: UserInfo;
+  /**
+   * The assistant's router asked (`review_start`): a merge is made only once the acting user confirms it (`merge_needs_confirmation`). Set by
+   * the router's tool, never parsed from a body.
+   */
+  mergeNeedsConfirmation?: boolean;
 }
 
 const bad = (field: string, message: string): ReviewItemRefused => new ReviewItemRefused(400, "invalid_request", message, { field });
@@ -233,7 +243,7 @@ export function parseReviewRequest(body: unknown): ReviewRequest {
 }
 
 /** The changes a restart asks for; what it leaves out is the old item's. */
-export function parseRestartRequest(body: unknown): { model?: unknown; effort?: unknown; reviewOnly?: boolean; message?: string | null } {
+export function parseRestartRequest(body: unknown): { model?: unknown; effort?: unknown; reviewOnly?: boolean; message?: string | null; mergeNeedsConfirmation?: boolean } {
   if (body === undefined || body === null) return {};
   if (typeof body !== "object" || Array.isArray(body)) throw bad("body", "the body must be a JSON object");
   const b = body as Record<string, unknown>;
@@ -252,10 +262,14 @@ export function parseRestartRequest(body: unknown): { model?: unknown; effort?: 
  * Who may be named and on what: the same check as `POST /v1/sessions` makes of a session that acts as a user, for each pull request.
  * The proof it hands back is what lets the server queue the session's first message (`queueServerMessage`).
  */
-function checkAsCreate(user: UserInfo, method: string | null, actingAs: string, pr: PrRef, reviewOnly: boolean, model: unknown, effort: unknown): {
+function checkAsCreate(
+  user: UserInfo, method: string | null, actingAs: string, pr: PrRef, reviewOnly: boolean, model: unknown, effort: unknown, mergeNeedsConfirmation = false,
+): {
   config: Record<string, unknown>; model: string | null; effort: string | null; attended: AttendedProof;
 } {
-  const config: Record<string, unknown> = { acting_as: actingAs, review_target: { ...pr }, review_only: reviewOnly };
+  const config: Record<string, unknown> = {
+    acting_as: actingAs, review_target: { ...pr }, review_only: reviewOnly, ...(mergeNeedsConfirmation ? { merge_needs_confirmation: true } : {}),
+  };
   const checked = checkSessionCreate({ config, model, effort, user, method });
   if (!checked.ok) {
     throw checked.status === 400
@@ -504,11 +518,12 @@ export async function startReviews(
   const owner: UserInfo = forOther ? request.actingAsUser! : user;
   const requestedBy = forOther ? user.userId : null;
   const plans: Planned[] = request.prs.map(({ pr, message }) => {
-    const checked = checkAsCreate(user, method, actingAs, pr, request.reviewOnly, request.model, request.effort);
+    const checked = checkAsCreate(user, method, actingAs, pr, request.reviewOnly, request.model, request.effort, request.mergeNeedsConfirmation === true);
     const label = String(checked.config.acting_as_requester ?? user.userId);
     const base: ReviewParams = {
       pr, acting_as: actingAs, acting_as_name: request.actingAsName, model: checked.model, effort: checked.effort,
       review_only: request.reviewOnly, brief: message ?? defaultBrief(pr, request.reviewOnly),
+      ...(request.mergeNeedsConfirmation === true ? { merge_needs_confirmation: true as const } : {}),
     };
     return {
       pr, sessionId: randomUUID(), attended: checked.attended,
@@ -560,6 +575,9 @@ function readParams(row: Record<string, unknown>): ReviewParams | null {
   return {
     pr: p.pr, acting_as: p.acting_as, acting_as_name: p.acting_as_name ?? null, model: p.model ?? null, effort: p.effort ?? null,
     review_only: p.review_only !== false, brief: typeof p.brief === "string" ? p.brief : defaultBrief(p.pr, p.review_only !== false),
+    // Any stored value but `undefined`/`false` keeps it: a restart refuses more, never less.
+    ...(p.merge_needs_confirmation !== undefined && p.merge_needs_confirmation !== null && (p.merge_needs_confirmation as unknown) !== false
+      ? { merge_needs_confirmation: true as const } : {}),
     ...(typeof p.requested_by === "string" && p.requested_by
       ? { requested_by: p.requested_by, requester_label: typeof p.requester_label === "string" ? p.requester_label : p.requested_by, requester_note: typeof p.requester_note === "string" ? p.requester_note : null }
       : {}),
@@ -694,15 +712,17 @@ export async function restartReview(
   if (!was) throw new ReviewItemRefused(400, "not_a_review_item", "only a review item can be restarted");
   const requestedBy = was.requested_by ?? null;
   const reviewOnly = change.reviewOnly ?? was.review_only;
+  // Once the assistant has started or restarted a review, every later restart of it merges only on the acting user's confirmation too.
+  const mergeNeedsConfirmation = was.merge_needs_confirmation === true || change.mergeNeedsConfirmation === true;
   const checked = checkAsCreate(user, method, was.acting_as, was.pr, reviewOnly,
-    "model" in change ? change.model : was.model, "effort" in change ? change.effort : was.effort);
+    "model" in change ? change.model : was.model, "effort" in change ? change.effort : was.effort, mergeNeedsConfirmation);
   // The old words are sent again only if they still say what is asked: a review that now merges, or now does not, gets new ones.
   const brief = change.message ?? (reviewOnly === was.review_only ? was.brief : defaultBrief(was.pr, reviewOnly));
   const { halted: _halted, ...kept } = was;
   const plan: Planned = {
     pr: was.pr, sessionId: randomUUID(), attended: checked.attended,
     config: requestedBy ? asRequested(checked.config, { user_id: requestedBy, label: was.requester_label ?? requestedBy }) : checked.config,
-    params: { ...kept, model: checked.model, effort: checked.effort, review_only: reviewOnly, brief },
+    params: { ...kept, model: checked.model, effort: checked.effort, review_only: reviewOnly, brief, ...(mergeNeedsConfirmation ? { merge_needs_confirmation: true as const } : {}) },
   };
   await refuseIfReviewed(db, user.userId, requestedBy, was.pr, itemId);
   if (requestedBy) await refuseUnlessDelegated(was.acting_as, requestedBy, was.acting_as_name || was.acting_as);

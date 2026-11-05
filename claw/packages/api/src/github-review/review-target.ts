@@ -50,3 +50,16 @@ export function reviewOnlyOf(config: unknown): boolean {
   const parsed = parseReviewOnly(value);
   return parsed.ok ? parsed.reviewOnly : true;
 }
+
+/**
+ * `config.merge_needs_confirmation` of a session: written by the server, never by a caller, on the session of a review the assistant's
+ * router started or restarted (`review_start`, `review_restart`). Natural language never approves a merge, and the router's `merge=true`
+ * is read from a sentence, so such a session merges nothing, and approves nothing GitHub's auto-merge would merge, until the acting user
+ * has confirmed that very write: the tools hold it (`confirmation_required`) whatever its risk and the acting user's review mode, and it is
+ * made only from the card's button or the exact command `批准 #<ref>` / `approve #<ref>` (C2). Absent or `false` is no such session;
+ * any other stored value reads as one: the caller refuses more, never less.
+ */
+export function mergeNeedsConfirmationOf(config: unknown): boolean {
+  const value = config !== null && typeof config === "object" ? (config as Record<string, unknown>).merge_needs_confirmation : undefined;
+  return value !== undefined && value !== null && value !== false;
+}

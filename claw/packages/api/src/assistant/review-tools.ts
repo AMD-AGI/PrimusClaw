@@ -17,7 +17,9 @@
  * Two acts are never read from a sentence at all, since a misreading there merges a pull request or changes a setting: letting a
  * held write through needs the person's message to be the exact command `批准 #<ref>` / `approve #<ref>` naming it (or the card's
  * button), and a channel action runs at once only when the message is its command typed whole; otherwise it is put to the person
- * as that command with a button, and runs only when they press it.
+ * as that command with a button, and runs only when they press it. So `merge=true` on a review this router starts or restarts never
+ * merges by itself: the review's session holds its merge for the person's confirmation (`config.merge_needs_confirmation`), which only
+ * that command or the card's button gives.
  *
  * Everything past that is the review's own gates, which these call rather than repeat: creating, stopping and restarting
  * a review item is `review-items.ts`; answering a held write is the decision route's own `decideConfirmation`
@@ -164,35 +166,6 @@ export function modelGrounded(text: string, model: string): boolean {
   return lower(model).split(/[^a-z0-9]+/).some((part) => /^[a-z][a-z0-9]{2,}$/.test(part) && t.includes(part));
 }
 
-/** A word the router's prompt reads as a merge. Not "merged" (a question about a state) nor a "merge conflict". */
-const MERGE_ASK = /合入|合并|合进|审完合|\bmerge\b(?!\s*conflicts?\b)/gi;
-/** A negation shortly before such a word: "don't merge", "不要合入", "never merge", "先别...合并". */
-const NEGATION_BEFORE = /别|不|勿|禁止|无需|\bdon'?t\b|\bdo\s+not\b|\bnever\b|\bnot\b|\bno\b|\bwithout\b|\bstop\b|\bskip\b|\bavoid\b/i;
-/** A question right after it: "合入了吗", "合入没有". */
-const QUESTION_AFTER = /^\s*(?:了吗|了么|了没|了沒|吗|没有)/;
-/** A message that asks anything ("Should we merge #254?", "要合入吗"): it is no instruction to merge, whatever word it uses. */
-const QUESTION_ANYWHERE = /[?？]|吗|么/;
-const NEGATION_WINDOW = 12;
-
-/**
- * Whether the user's message asks for a merge: one of the words the router's prompt reads as a merge (合入, 合并, 合进, 审完合, merge),
- * and every one of them asks it, none negated just before ("don't merge", "不要合入"), in a message that asks no question ("Should we
- * merge #254?", "合入了吗"). A message that says no to a merge anywhere, or asks anything, asks for none, so the router asks the user
- * rather than choose. A necessary condition, like a model's name:
- * the router still decides, but a message without such an ask never makes a review that merges, whatever the item list or a page the
- * router read says the user wants.
- */
-export function mergeGrounded(text: string): boolean {
-  const asks = [...text.matchAll(MERGE_ASK)];
-  if (QUESTION_ANYWHERE.test(text)) return false;
-  return asks.length > 0 && asks.every((m) => {
-    const at = m.index ?? 0;
-    return !NEGATION_BEFORE.test(text.slice(Math.max(0, at - NEGATION_WINDOW), at)) && !QUESTION_AFTER.test(text.slice(at + m[0].length));
-  });
-}
-
-const MERGE_NOT_ASKED = "the user did not ask to merge: pass merge=false unless their message asks for it (合入, 合并, merge)";
-
 /** The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased. */
 export function fullRefsIn(text: string): string[] {
   const out: string[] = [];
@@ -264,7 +237,6 @@ export async function reviewStart(
     if (args.model && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out unless they named one");
     }
-    if (args.merge && !mergeGrounded(message.content)) refuseUngrounded("merge_not_in_message", MERGE_NOT_ASKED);
     const signedIn = await requesterSignedIn(q, claims.sid, userId, message, via);
     if (!args.reviewer || args.reviewer === userId) return { userId, signedIn, actingAs: userId, actingAsName: undefined };
     const reviewer = lower(args.reviewer);
@@ -279,13 +251,18 @@ export async function reviewStart(
     );
   });
   // The body `POST /v1/assistant/reviews` would have been sent, read by the same parser: the same checks either way.
-  const items = await asTool(async () => asRequesterOfOther(ready.actingAs !== ready.userId, () => reviewToolPorts.startReviews(ready.signedIn.user, ready.signedIn.method, parseReviewRequest({
-    prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
-    ...(ready.actingAs !== ready.userId ? { acting_as: ready.actingAs } : {}),
-    ...(ready.actingAsName ? { acting_as_name: ready.actingAsName } : {}),
-    ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
-    review_only: !args.merge,
-  }), stillActing(claims, ready.userId))));
+  // `merge=true` is the router's reading of a sentence, and natural language never approves a merge: the review's session merges only once
+  // the acting user confirms that very merge (`mergeNeedsConfirmation`, held by the review tools; the card's button or `批准 #<ref>`).
+  const items = await asTool(async () => asRequesterOfOther(ready.actingAs !== ready.userId, () => reviewToolPorts.startReviews(ready.signedIn.user, ready.signedIn.method, {
+    ...parseReviewRequest({
+      prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
+      ...(ready.actingAs !== ready.userId ? { acting_as: ready.actingAs } : {}),
+      ...(ready.actingAsName ? { acting_as_name: ready.actingAsName } : {}),
+      ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
+      review_only: !args.merge,
+    }),
+    mergeNeedsConfirmation: true,
+  }, stillActing(claims, ready.userId))));
   return { ok: true, items };
 }
 
@@ -387,13 +364,16 @@ export async function reviewRestart(
     if (args.model && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out to keep the one it had");
     }
-    if (args.merge === true && !mergeGrounded(message.content)) refuseUngrounded("merge_not_in_message", MERGE_NOT_ASKED);
     return { userId, itemId: item.item_id, signedIn: await requesterSignedIn(q, claims.sid, userId, message, via) };
   });
-  const restarted = await asTool(async () => reviewToolPorts.restartReview(chosen.signedIn.user, chosen.signedIn.method, chosen.itemId, parseRestartRequest({
-    ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
-    ...(typeof args.merge === "boolean" ? { review_only: !args.merge } : {}),
-  }), stillActing(claims, chosen.userId)));
+  // As at a start: whatever the router passed for merge, the restarted review merges only on the acting user's confirmation.
+  const restarted = await asTool(async () => reviewToolPorts.restartReview(chosen.signedIn.user, chosen.signedIn.method, chosen.itemId, {
+    ...parseRestartRequest({
+      ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
+      ...(typeof args.merge === "boolean" ? { review_only: !args.merge } : {}),
+    }),
+    mergeNeedsConfirmation: true,
+  }, stillActing(claims, chosen.userId)));
   return { ok: true, ...restarted };
 }
 

@@ -21,6 +21,7 @@
  *   D1  an answer to a held write closes the item; a held write of a stopped review is denied whatever the answer
  *   D1d a held write of a stopped review that was already answered (submitted, or being made) is not "denied as stopped"
  *   D1e the caller's guard is asked with the owner's assistant row held (the reviewer's, for a review asked of them)
+ *   A1  a review the assistant started (`mergeNeedsConfirmation`) is a session that merges only on a confirmation, and every restart keeps it
  *   G1  a review session is no worker: no role profile, no worker report at its turn's end, not an orphan to the task sweep
  *   G2  nothing the server queues reaches an acting session without the person's proof: work_send into a review is refused
  */
@@ -884,6 +885,28 @@ describe("assistant review items", { skip }, () => {
     await ri.restartReview(user("bob"), "identity_token", asked.item_id, ri.parseRestartRequest({}), probe("bob"));
     await ri.startReviews(user("alice"), "identity_token", ri.parseReviewRequest({ prs: [PR(261)] }), probe("alice"));
     assert.deepEqual(seen, ["bob:held", "bob:held", "alice:held"]);
+  });
+
+  test("A1 a review the assistant started merges only on a confirmation: its session says so, and so does every later restart of it, whoever restarts", async () => {
+    const user = (id: string) => ({ userId: id, userName: `Name ${id}`, platformKey: `pk-${id}`, virtualKey: `vk-${id}`, roles: ["default"] });
+    const config = async (sessionId: string) => (await w.q("SELECT config FROM claw_sessions WHERE session_id = $1", [sessionId]))[0].config;
+    const [started] = await ri.startReviews(user("alice"), "identity_token",
+      { ...ri.parseReviewRequest({ prs: [PR(262)], review_only: false }), mergeNeedsConfirmation: true });
+    assert.deepEqual([(await config(started.session_id)).merge_needs_confirmation, (await config(started.session_id)).review_only], [true, false]);
+    assert.equal((await w.item(started.item_id)).params.merge_needs_confirmation, true);
+    // A restart through the route (no say of the assistant's) keeps it: the assistant's review stays one that waits for the person.
+    const r = await call("alice", `/v1/assistant/reviews/${started.item_id}/restart`, { model: "claude-opus-5.5" });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const fresh = await w.item(r.body.data.item.item_id);
+    assert.equal((await config(fresh.worker_session_id)).merge_needs_confirmation, true);
+    assert.equal(fresh.params.merge_needs_confirmation, true);
+    // The assistant's restart of a review the person started over the route makes it one as well.
+    const own = await one("alice", { prs: [PR(263)], review_only: false });
+    assert.equal((await config(own.session_id)).merge_needs_confirmation, undefined, "a review the person started themself is as before");
+    const again = await ri.restartReview(user("alice"), "identity_token", own.item_id, { ...ri.parseRestartRequest({}), mergeNeedsConfirmation: true });
+    assert.equal((await config(again.item.session_id)).merge_needs_confirmation, true);
+    // A body cannot set it, nor can one clear it: it is not read from a request.
+    assert.equal((ri.parseReviewRequest({ prs: [PR(264)], merge_needs_confirmation: false }) as Record<string, unknown>).mergeNeedsConfirmation, undefined);
   });
 
   test("G1 a review session is no worker: no role profile, no worker report at its turn's end, not an orphan to the task sweep", async () => {

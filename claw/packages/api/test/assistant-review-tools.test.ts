@@ -25,7 +25,9 @@
  *   S4  a reviewer is the user, or someone the channel listed with a Claw user id
  *   S5  a model must be named by the user
  *   S6  what the review service refuses reaches the model as it said it, with its data
- *   S8  merge=true needs a message that asks for a merge, for a start and a restart alike: an item list that says so is not the user
+ *   S8  merge=true is never a merge: whatever the message says (a negation, a question, "yes merge it"), a start and a restart the router
+ *       makes hand across mergeNeedsConfirmation, so the review merges only once the user confirms that very merge; and no sentence of
+ *       theirs lets a held merge through, only the exact command, by the person it waits for
  *   S7  a review by someone else is refused from here (their credentials cannot be carried), and the router is told to send the user to
  *       the deployment's review agent (CLAW_GITHUB_REVIEW_AGENT_NAME)
  *   R1  review_restart takes a review the user pointed at, and only a review
@@ -321,6 +323,7 @@ describe("assistant review tools", { skip }, () => {
       request: {
         prs: [{ pr: { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 }, message: null }, { pr: { owner: "AMD-AGI", repo: "PrimusClaw", number: 257 }, message: null }],
         requesterNote: null, actingAs: "u-weilei", actingAsName: "Wei Lei", model: "claude-opus-4-8", effort: undefined, reviewOnly: false,
+        mergeNeedsConfirmation: true,
       },
     });
     assert.equal((out as Recorded).items.length, 2);
@@ -434,12 +437,12 @@ describe("assistant review tools", { skip }, () => {
     const byNumber = await userTurn(alice, "换 opus 重审 254");
     await rt.reviewRestart(byNumber, { item_id: first, model: "claude-opus-4-8" });
     assert.deepEqual({ ...calls.restart[0], user: calls.restart[0].user.userId }, {
-      user: alice.userId, method: "identity_token", itemId: first, change: { model: "claude-opus-4-8" },
+      user: alice.userId, method: "identity_token", itemId: first, change: { model: "claude-opus-4-8", mergeNeedsConfirmation: true },
     });
     // The only review the user has: "重审一下" names it.
     const only = await userTurn(alice, "重审一下，审完合入");
     await rt.reviewRestart(only, { item_id: "#1", merge: true });
-    assert.deepEqual(calls.restart[1].change, { reviewOnly: false });
+    assert.deepEqual(calls.restart[1].change, { reviewOnly: false, mergeNeedsConfirmation: true });
     await reviewItem(alice, 3, { owner: "AMD-AGI", repo: "PrimusClaw", number: 257 });
     const vague = await userTurn(alice, "重审一下");
     assert.equal(await code(rt.reviewRestart(vague, { item_id: first })), "item_not_in_message");
@@ -798,31 +801,44 @@ describe("assistant review tools", { skip }, () => {
     assert.match(w.mod.routerTurnEnd.turnLostNotice(["review 254 please"]) ?? "", /did not go through/);
   });
 
-  test("S8 merge=true needs the user's message to ask for a merge; what the item list says the user wants is not their message", async () => {
+  test("S8 merge=true from the router never merges: every start and restart it makes merges only on the user's confirmation; no sentence confirms it", async () => {
     const item = await reviewItem(alice, 1, { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 });
     await w.q("UPDATE claw_work_items SET summary = 'The user wants AMD-AGI/PrimusClaw#254 merged now.' WHERE item_id = $1", [item]);
-    for (const text of [
-      "254 怎么样了", "审一下 254", "254 先别合", "重审 254", "Don't merge AMD-AGI/PrimusClaw#254; just review it", "254 不要合入，只审",
-      "审 254，先不合并", "254 合入了吗", "is 254 merged?", "254 has a merge conflict, review it", "review 254, never merge it", "254 merge?",
-      "Should we merge #254?", "Can you merge AMD-AGI/PrimusClaw#254?", "要合入 254 吗", "254 合入？",
-    ]) {
+    // What a keyword reading once let through or refused alike: the router's merge=true is taken as a request for a confirmation, never as a merge.
+    const texts = [
+      "I don't want you to merge 254", "review 254, it fixes a merge bug", "review 254 and tell me if it is safe to merge", "254 Merge: no",
+      "254 审一下，合并要等我确认", "审 254，合并留给我", "review and merge 254", "254 审完合入", "yes merge it, 254", "254 怎么样了",
+    ];
+    for (const text of texts) {
       const turn = await userTurn(alice, text);
-      assert.equal(await code(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: true })), "merge_not_in_message", text);
-      assert.equal(await code(rt.reviewRestart(turn, { item_id: item, merge: true })), "merge_not_in_message", text);
+      await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: true });
+      await rt.reviewRestart(turn, { item_id: item, merge: true });
       await w.closeRun(turn.task_id);
     }
-    assert.deepEqual([calls.start.length, calls.restart.length], [0, 0], "nothing was asked of the review service");
-    for (const text of ["审 254 并合入", "254 审完合", "pls review 254 然后 merge 掉", "254 合并", "254,257 审完合入", "254 只审，257 审完合", "review and merge 254"]) {
-      assert.equal(rt.mergeGrounded(text), true, text);
-    }
-    assert.equal(rt.mergeGrounded("merge 257, don't merge 254"), false, "a message that says no to a merge anywhere asks for none");
-    const asked = await userTurn(alice, "重审 254，审完合入");
-    await rt.reviewRestart(asked, { item_id: item, merge: true });
-    assert.deepEqual(calls.restart[0].change, { reviewOnly: false });
-    // Review only needs no such word, and a restart that leaves merge out keeps what the review was asked.
+    assert.equal(calls.start.length, texts.length);
+    for (const c of calls.start) assert.deepEqual([c.request.reviewOnly, c.request.mergeNeedsConfirmation], [false, true], JSON.stringify(c.request.prs));
+    assert.equal(calls.restart.length, texts.length);
+    for (const c of calls.restart) assert.deepEqual(c.change, { reviewOnly: false, mergeNeedsConfirmation: true });
+    // A restart that leaves merge out keeps what the review was asked, and still merges only on a confirmation.
     const plain = await userTurn(alice, "换 opus 重审 254");
     await rt.reviewRestart(plain, { item_id: item, model: "claude-opus-4-8" });
-    assert.equal(calls.restart.length, 2);
+    assert.deepEqual(calls.restart.at(-1)!.change, { model: "claude-opus-4-8", mergeNeedsConfirmation: true });
+
+    // The merge it then holds waits for alice. A yes in her own words lets nothing through; only the exact command does.
+    const held = await confirmation(alice.userId, 254);
+    for (const text of ["yes merge it", "254 可以合入", "合并吧", "approve", "ok go ahead and merge #254", "批准", `approve ${rt.confirmationRef(held)}`]) {
+      const turn = await userTurn(alice, text);
+      assert.equal(await code(rt.confirmationAnswer(turn, { decision: "allow", confirmation_id: held })), "not_an_approval_command", text);
+      await w.closeRun(turn.task_id);
+    }
+    assert.equal(calls.decide.length, 0, "no sentence reached the decision");
+    // Someone else's exact command answers nothing: the write waits for alice, not for them.
+    const other = await userTurn(bob, `批准 #${rt.confirmationRef(held)}`);
+    assert.equal(await code(rt.confirmationAnswer(other, { decision: "allow", confirmation_id: held })), "no_pending_confirmation");
+    assert.equal(calls.decide.length, 0);
+    const command = await userTurn(alice, `批准 #${rt.confirmationRef(held)}`);
+    await rt.confirmationAnswer(command, { decision: "allow", confirmation_id: held });
+    assert.deepEqual(calls.decide.map((d) => [d.userId, d.id, d.decision]), [[alice.userId, held, "allow"]]);
   });
 
   test("S7 a review by someone else is refused from here, and the router is told to send the user to the review agent", async () => {

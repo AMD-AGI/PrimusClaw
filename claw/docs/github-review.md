@@ -188,9 +188,13 @@ They act only for the person, never for a key or a report:
 - **Grounded.** A pull request's number must be in that message; its repository named there, or, when the message names none,
   the only repository it can be: the channel's own (`channel_context.repos`), else the one the user's recent reviews used (two
   candidates and a bare number are refused, so the assistant asks); a model named there; a reviewer the user themself or someone
-  the channel listed with a Claw `user_id` (`channel_context.people`); and a review that merges only when the message asks for a
-  merge (合入, 合并, 合进, 审完合, merge), none of them negated just before ("don't merge", "不要合入"), in a message
-  that asks no question ("Should we merge #254?", "合入了吗"); else `merge_not_in_message`, at a start and at a restart alike.
+  the channel listed with a Claw `user_id` (`channel_context.people`).
+- **`merge=true` never merges.** Whether the user asked for a merge is the router's reading of a sentence, and natural language
+  never approves one. So every review the router starts or restarts (`review_start`, `review_restart`, whatever `merge` says) is
+  made with `config.merge_needs_confirmation` (kept by every later restart of it): its `gh_pr_merge`, and a `gh_review_submit`
+  `APPROVE` while GitHub's auto-merge is on, are held for the acting user (`confirmation_required`) whatever the risk and their
+  review mode, and the merge is made only from that confirmation: the card's button or the exact command below, by the acting
+  user. `merge=true` only lets the review go on to ask for that confirmation after its verdict; `merge=false` is a review only.
 - **Two acts are never read from a sentence.** A held write is let through only when the user's whole message is the approval
   command `批准 #<ref>` or `approve #<ref>` (case, spacing, a full-width `＃` and closing punctuation aside), where `<ref>` is the
   first six hex digits of its confirmation id (the assistant shows it; the whole id also works), and only for a write that was
