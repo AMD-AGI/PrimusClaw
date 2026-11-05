@@ -296,6 +296,8 @@ jobs:
 
       - run: bash scripts/release-tests/sandbox-router-ingress.sh
 
+      - run: bash scripts/release-tests/network-policy-charts.sh
+
   claw-extra-values:
     name: Claw deploy extra values (env, ConfigMap and Secret mounts)
     runs-on: ubuntu-latest

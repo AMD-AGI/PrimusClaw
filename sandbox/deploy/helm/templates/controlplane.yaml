@@ -407,9 +407,16 @@ spec:
     - from:
         - namespaceSelector: {}
           podSelector: {}
+        {{- range .Values.controlplane.networkPolicy.extraIngressCIDRs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.controlplane.ports.router }}
+        # The workloadmanager Service targets this port.
+        - protocol: TCP
+          port: {{ .Values.controlplane.ports.workloadManager }}
         - protocol: TCP
           port: {{ .Values.controlplane.ports.managerMetrics }}
 {{- end }}
