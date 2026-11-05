@@ -42,6 +42,12 @@ export interface SandboxSpecFacts {
    * fingerprint only when set, for the same reason as `withholdKeys`: a sandbox built for anything else is never reused for one.
    */
   profile?: "review";
+  /**
+   * The sandbox was built without the workspace's storage (SaFE's `useWorkspaceStorage: false`). Part of the fingerprint only when
+   * true, so a sandbox built with the storage mounted -- every CPU sandbox an earlier Brain built -- is not reused for one that is not
+   * to have it, and every fingerprint of a sandbox that keeps the storage compares as it did.
+   */
+  withoutWorkspaceStorage?: boolean;
 }
 
 /**
@@ -85,6 +91,7 @@ export function sandboxSpecFingerprint(facts: SandboxSpecFacts): string {
     llmKey: fingerprintLlmKey(facts.llmKey),
     ...(facts.withholdKeys ? { withheldEnv: "brain-only" } : {}),
     ...(facts.profile ? { profile: facts.profile } : {}),
+    ...(facts.withoutWorkspaceStorage ? { workspaceStorage: "none" } : {}),
   });
   // A format prefix, not part of the hash, so a comparison change can be told
   // apart from a spec change. evaluateReuse treats a different format as a

@@ -184,11 +184,15 @@ for (const row of ROWS) {
 
 test("the spec fingerprint carries the namespace the multi-node sandbox is created in", async () => {
   const withCluster = await place(CPU_ONLY, undefined, clusterIn("gpu-ws"));
-  const sameSandboxNamed = await place(CPU_ONLY, "gpu-ws");
+  const clusterElsewhere = await place(CPU_ONLY, undefined, clusterIn("cpu-ws"));
+  const sameNamespaceSingleNode = await place(CPU_ONLY, "gpu-ws");
   const singleNode = await place(CPU_ONLY, undefined);
-  // The sandbox lives in gpu-ws, so it is the same sandbox as a single-node one asked for there ...
-  assert.equal(withCluster.recordedSpec, sameSandboxNamed.recordedSpec);
-  // ... and not the one a later CPU-only single-node turn asks for in the CPU workspace, which
+  // Two multi-node sandboxes alike in everything but the namespace their cluster is in are not the same sandbox ...
+  assert.notEqual(withCluster.recordedSpec, clusterElsewhere.recordedSpec);
+  // ... nor is a CPU-only single-node one asked for in gpu-ws: that one is built without the
+  // workspace's storage, which the multi-node run's sandbox keeps (sandboxWithoutWorkspaceStorage) ...
+  assert.notEqual(withCluster.recordedSpec, sameNamespaceSingleNode.recordedSpec);
+  // ... nor the one a later CPU-only single-node turn asks for in the CPU workspace, which
   // must not be handed a pod that is on the GPU cluster.
   assert.notEqual(withCluster.recordedSpec, singleNode.recordedSpec);
 });

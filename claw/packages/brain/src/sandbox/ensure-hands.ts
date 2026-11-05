@@ -47,7 +47,7 @@ import {
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
-import { sandboxNamespaceForResources } from "./workspace-select.js";
+import { resourcesNeedGpu, sandboxNamespaceForResources } from "./workspace-select.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
@@ -172,6 +172,29 @@ export function reviewSandboxNamespace(kubernetes: boolean, cpuNamespace: string
 }
 
 /**
+ * Whether a SaFE sandbox is created without the workspace's storage (`useWorkspaceStorage: false`: SaFE then mounts neither the
+ * owner's directory nor the workspace's volumes, such as the shared filesystem at /mnt/ceph).
+ *
+ * Every CPU sandbox is: nothing Brain or Hands runs in one reads the workspace's storage (the session works in /workspace), and a
+ * mounted shared filesystem would let any session read every other user's files. Two kinds keep SaFE's default, which mounts both:
+ *   - a sandbox that asks for a GPU (a GPU workload reads models and data from the workspace's volumes), and
+ *   - a multi-node run's sandbox, whatever it asks for: the Hyperloom optimizer in it resolves its session directories from
+ *     `USER_DATA_PATH`, which SaFE injects from the same volume the cluster's pods mount (see `applyMultiNodeExternalEnv`).
+ * A requested review's sandbox never keeps it (it is a CPU sandbox in the CPU workspace whatever the request names).
+ *
+ * One definition for the create and the fingerprint, so a sandbox built with the storage is never reused for one that is not to have it.
+ */
+export function sandboxWithoutWorkspaceStorage(
+  request: ExecuteRequest,
+  resources: unknown,
+  multiNodeContext?: MultiNodeContext,
+): boolean {
+  if (isReviewProfile(request)) return true;
+  if (multiNodeContext) return false;
+  return !resourcesNeedGpu(resources);
+}
+
+/**
  * Condense a request into the spec its sandbox will be built to.
  *
  * One definition for the comparison and both write sites, because a fingerprint
@@ -248,6 +271,7 @@ export function requestSpecFingerprint(
     namespace,
     withholdKeys,
     ...(isReviewProfile(request) ? { profile: "review" } : {}),
+    ...(sandboxWithoutWorkspaceStorage(request, effective, multiNodeContext) ? { withoutWorkspaceStorage: true } : {}),
   });
 }
 
@@ -2839,9 +2863,10 @@ async function provisionHands(
       onEvent,
       signal: options.signal,
       reclaimOnAbort: options.reclaimOnAbort,
-      // A requested review's sandbox gets none of the workspace's storage: SaFE then mounts neither the owner's directory nor the
-      // workspace's volumes. Sent as false, never left out (SaFE reads an absent field as true).
-      ...(isReviewProfile(request) ? { useWorkspaceStorage: false } : {}),
+      // A CPU sandbox (a requested review's included) gets none of the workspace's storage: SaFE then mounts neither the owner's
+      // directory nor the workspace's volumes. Sent as false, never left out (SaFE reads an absent field as true). A GPU or
+      // multi-node run's sandbox keeps SaFE's default; see sandboxWithoutWorkspaceStorage.
+      ...(sandboxWithoutWorkspaceStorage(request, workloadResourcesArr, multiNodeContext) ? { useWorkspaceStorage: false } : {}),
     });
   } catch (err) {
     await hold.release();
