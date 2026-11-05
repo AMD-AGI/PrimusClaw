@@ -39,13 +39,16 @@
 # the key never collides with one). See params-<cluster>.yaml. A missing
 # ConfigMap refuses every sandbox Pod (parameterNotFoundAction: Deny).
 #
-# Apply (per cluster, params first):
+# The binding is per cluster and lives in params-<cluster>.yaml with the
+# parameters, because its validationActions differ: [Deny, Audit] refuses a
+# violating Pod and writes the API audit log (annotation
+# validation.policy.admission.k8s.io/validation_failure); [Audit, Warn] refuses
+# nothing and returns violations as warnings. global is [Deny, Audit];
+# global-crusoe stays [Audit, Warn].
+#
+# Apply (per cluster, params and binding first):
 #   kubectl --context <cluster> apply -f params-<cluster>.yaml
 #   kubectl --context <cluster> apply -f sandbox-pod-guardrails.yaml
-# The binding starts in [Audit, Warn]: violations are returned as warnings and
-# written to the API audit log (annotation
-# validation.policy.admission.k8s.io/validation_failure), nothing is refused.
-# Switch to [Deny] once live sandboxes comply.
 # Rollback:
 #   kubectl --context <cluster> delete validatingadmissionpolicybinding sandbox-pod-guardrails
 #   kubectl --context <cluster> delete validatingadmissionpolicy sandbox-pod-guardrails
@@ -196,18 +199,3 @@ spec:
     reason: Forbidden
     messageExpression: >-
       'sandbox pod: ' + variables.bad_hostPort.join(',') + ': hostPort is not allowed'
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicyBinding
-metadata:
-  name: sandbox-pod-guardrails
-  labels:
-    app.kubernetes.io/part-of: agent-sandbox
-spec:
-  policyName: sandbox-pod-guardrails
-  paramRef:
-    name: sandbox-pod-guardrails
-    namespace: kube-system
-    parameterNotFoundAction: Deny
-  # Audit + Warn while sandbox creators are brought into line; then [Deny].
-  validationActions: [Audit, Warn]

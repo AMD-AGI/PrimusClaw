@@ -17,3 +17,19 @@ data:
   crusoe-spur-vk: /shared_nfs
   top-models: /shared_nfs
   virtual-kubelet.namespaces: crusoe-spur-vk,top-models
+---
+# The binding of sandbox-pod-guardrails on this cluster (see sandbox-pod-guardrails.yaml).
+# Warn only: violations are warnings, nothing is refused.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: sandbox-pod-guardrails
+  labels:
+    app.kubernetes.io/part-of: agent-sandbox
+spec:
+  policyName: sandbox-pod-guardrails
+  paramRef:
+    name: sandbox-pod-guardrails
+    namespace: kube-system
+    parameterNotFoundAction: Deny
+  validationActions: [Audit, Warn]

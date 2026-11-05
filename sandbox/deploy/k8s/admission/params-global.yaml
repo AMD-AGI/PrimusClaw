@@ -8,3 +8,19 @@ metadata:
   labels:
     app.kubernetes.io/part-of: agent-sandbox
 data: {}
+---
+# The binding of sandbox-pod-guardrails on this cluster (see sandbox-pod-guardrails.yaml).
+# Enforced: a violating sandbox Pod is refused.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: sandbox-pod-guardrails
+  labels:
+    app.kubernetes.io/part-of: agent-sandbox
+spec:
+  policyName: sandbox-pod-guardrails
+  paramRef:
+    name: sandbox-pod-guardrails
+    namespace: kube-system
+    parameterNotFoundAction: Deny
+  validationActions: [Deny, Audit]
