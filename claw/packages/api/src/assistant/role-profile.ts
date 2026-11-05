@@ -91,14 +91,21 @@ export async function skipsSkillSelection(sessionId: string): Promise<boolean> {
   return role === "router" || role === "observer";
 }
 
+/**
+ * The router's item list: every open item, and the newest items closed in the last day. Open items are never cut: the
+ * prompt tells the router that an item missing from the list is closed, which holds only while all open ones are in it.
+ * Their number is bounded where they are made (`insertWorkItem`: the user's own, and reviews others asked of them).
+ */
 export async function routerManifest(userId: string): Promise<ManifestItem[]> {
   const rows = (await db.query(
-    `SELECT item_id, seq, title, summary, board_state, last_report_kind, result_version, pending_question, kind, params FROM (
-       SELECT * FROM claw_work_items
-        WHERE user_id = $1
-          AND (board_state <> 'done' OR closed_at > NOW() - $2::interval)
-        ORDER BY seq DESC LIMIT $3
-     ) newest ORDER BY seq`,
+    `SELECT item_id, seq, title, summary, board_state, last_report_kind, result_version, pending_question, kind, params,
+            outcome, created_at, closed_at FROM (
+       (SELECT * FROM claw_work_items WHERE user_id = $1 AND board_state <> 'done')
+       UNION ALL
+       (SELECT * FROM claw_work_items
+         WHERE user_id = $1 AND board_state = 'done' AND closed_at > NOW() - $2::interval
+         ORDER BY seq DESC LIMIT $3)
+     ) listed ORDER BY seq`,
     [userId, MANIFEST_CLOSED_WINDOW, MANIFEST_MAX_ITEMS],
   )).rows as Array<Record<string, unknown>>;
   return rows.map((r) => ({
@@ -110,6 +117,9 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
     lastReportKind: (r.last_report_kind as string | null) ?? null,
     resultVersion: Number(r.result_version),
     pendingQuestion: (r.pending_question as string | null) ?? null,
+    outcome: (r.outcome as string | null) ?? null,
+    createdAt: (r.created_at as Date | null) ?? null,
+    closedAt: (r.closed_at as Date | null) ?? null,
     ...(r.kind === "review" ? { review: reviewOf(r.params) } : {}),
   }));
 }
