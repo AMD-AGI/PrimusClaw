@@ -656,39 +656,7 @@ func (s *Server) resolveInvokeSandbox(c *gin.Context, sessionID, namespace, name
 	if err != nil {
 		log.Error("GetSandboxBySession failed",
 			"kind", kind, "name", name, "sessionId", sessionID, "error", err)
-		errMsg := err.Error()
-
-		// A Workload Manager refusal or transient condition is relayed as is.
-		var wmErr *wmStatusError
-		if errors.As(err, &wmErr) {
-			if wmErr.RetryAfter != "" {
-				c.Header("Retry-After", wmErr.RetryAfter)
-			}
-			c.Data(wmErr.Status, "application/json; charset=utf-8", wmErr.Body)
-			return nil, false
-		}
-
-		// Session not found (expired/deleted, not recoverable from K8s either)
-		if strings.Contains(errMsg, "session") && strings.Contains(errMsg, "not found") {
-			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
-			return nil, false
-		}
-		// CodeInterpreter template not found in K8s
-		if strings.Contains(errMsg, "not found") {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": fmt.Sprintf("%s %q not found in namespace %q", kind, name, namespace),
-			})
-			return nil, false
-		}
-		// Store connection error (and K8s recovery also failed)
-		if strings.Contains(errMsg, "store lookup failed") {
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error":  "session store temporarily unavailable, please retry",
-				"detail": errMsg,
-			})
-			return nil, false
-		}
-		c.JSON(http.StatusBadGateway, gin.H{"error": errMsg})
+		writeSessionLookupError(c, err, kind, name, namespace)
 		return nil, false
 	}
 	// Admission is judged on the namespace the sandbox actually lives in, not
@@ -717,6 +685,45 @@ func (s *Server) resolveInvokeSandbox(c *gin.Context, sessionID, namespace, name
 		return nil, false
 	}
 	return info, true
+}
+
+// writeSessionLookupError answers a failed session lookup: a Workload Manager
+// refusal is relayed as is, a missing session or template is 404, a store
+// outage is 503 and anything else is 502.
+func writeSessionLookupError(c *gin.Context, err error, kind, name, namespace string) {
+	errMsg := err.Error()
+
+	// A Workload Manager refusal or transient condition is relayed as is.
+	var wmErr *wmStatusError
+	if errors.As(err, &wmErr) {
+		if wmErr.RetryAfter != "" {
+			c.Header("Retry-After", wmErr.RetryAfter)
+		}
+		c.Data(wmErr.Status, "application/json; charset=utf-8", wmErr.Body)
+		return
+	}
+
+	// Session not found (expired/deleted, not recoverable from K8s either)
+	if strings.Contains(errMsg, "session") && strings.Contains(errMsg, "not found") {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		return
+	}
+	// CodeInterpreter template not found in K8s
+	if strings.Contains(errMsg, "not found") {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": fmt.Sprintf("%s %q not found in namespace %q", kind, name, namespace),
+		})
+		return
+	}
+	// Store connection error (and K8s recovery also failed)
+	if strings.Contains(errMsg, "store lookup failed") {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":  "session store temporarily unavailable, please retry",
+			"detail": errMsg,
+		})
+		return
+	}
+	c.JSON(http.StatusBadGateway, gin.H{"error": errMsg})
 }
 
 // authorizeSessionOwner admits the session owner or a full system-admin and answers
