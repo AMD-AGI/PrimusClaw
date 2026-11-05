@@ -32,8 +32,8 @@ type forwardPair struct {
 	execIDHit *atomic.Int32
 }
 
-// newForwardPair builds a global Router that locates forwardSession on cluster crusoe
-// and a crusoe Router in upstream-only mode that serves it.
+// newForwardPair builds a global Router that locates forwardSession on cluster cluster-a
+// and a cluster-a Router in upstream-only mode that serves it.
 func newForwardPair(t *testing.T, caller string) *forwardPair {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -54,7 +54,7 @@ func newForwardPair(t *testing.T, caller string) *forwardPair {
 	t.Cleanup(execID.Close)
 	execStore := store.NewMemoryStore()
 	if err := execStore.StoreSandbox(context.Background(), &store.SandboxInfo{
-		SessionID: forwardSession, Namespace: "crusoe-ws", UserID: "u1",
+		SessionID: forwardSession, Namespace: "ws-a", UserID: "u1",
 		PodIP: envdHost(t, envd), PodPort: envdPort(t, envd),
 	}); err != nil {
 		t.Fatal(err)
@@ -70,7 +70,7 @@ func newForwardPair(t *testing.T, caller string) *forwardPair {
 		jwt:            mustJWT(t),
 	}
 	p.exec.setupRoutes()
-	if err := p.exec.ConfigureDataPlane("crusoe", "", string(mustPEM(t, globalJWT)), nil); err != nil {
+	if err := p.exec.ConfigureDataPlane("cluster-a", "", string(mustPEM(t, globalJWT)), nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.exec.SetUpstreamOnly(true); err != nil {
@@ -87,14 +87,14 @@ func newForwardPair(t *testing.T, caller string) *forwardPair {
 		jwt:   globalJWT,
 	}
 	p.global.setupRoutes()
-	if err := p.global.ConfigureDataPlane("global", "crusoe="+p.cluster.URL, "", nil); err != nil {
+	if err := p.global.ConfigureDataPlane("global", "cluster-a="+p.cluster.URL, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	p.global.WithWorkloadLocator(func(_ context.Context, name string) (string, string, string, error) {
 		if name != forwardSession {
 			return "", "", "", store.ErrNotFound
 		}
-		return "crusoe", "crusoe-ws", "u1", nil
+		return "cluster-a", "ws-a", "u1", nil
 	})
 	p.front = httptest.NewServer(p.global.engine)
 	t.Cleanup(p.front.Close)
@@ -105,7 +105,7 @@ func newForwardPair(t *testing.T, caller string) *forwardPair {
 func invoke(t *testing.T, base, session, credential string) (int, string) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost,
-		base+"/v1/namespaces/crusoe-ws/code-interpreters/"+forwardSession+"/invocations/api/execute",
+		base+"/v1/namespaces/ws-a/code-interpreters/"+forwardSession+"/invocations/api/execute",
 		strings.NewReader(`{"command":["true"]}`))
 	if err != nil {
 		t.Fatal(err)
@@ -193,7 +193,7 @@ func TestUpstreamOnlyRejectsDirectCaller(t *testing.T) {
 
 func TestInvokeTokenIsBoundToItsSession(t *testing.T) {
 	p := newForwardPair(t, "u1")
-	token, err := p.global.jwt.generateInvokeToken("claw-other", "crusoe", "crusoe-ws", "u1", "", "default")
+	token, err := p.global.jwt.generateInvokeToken("claw-other", "cluster-a", "ws-a", "u1", "", "default")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestInvokeTokenIsBoundToItsSession(t *testing.T) {
 
 func TestInvokeTokenForAnotherClusterIsRejected(t *testing.T) {
 	p := newForwardPair(t, "u1")
-	token, err := p.global.jwt.generateInvokeToken(forwardSession, "other", "crusoe-ws", "u1", "", "default")
+	token, err := p.global.jwt.generateInvokeToken(forwardSession, "other", "ws-a", "u1", "", "default")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestInvokeTokenForAnotherClusterIsRejected(t *testing.T) {
 
 func TestDataPlaneHopTokenIsNotAnInvokeToken(t *testing.T) {
 	p := newForwardPair(t, "u1")
-	token, err := p.global.jwt.GenerateHopToken(forwardSession, "crusoe")
+	token, err := p.global.jwt.GenerateHopToken(forwardSession, "cluster-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,10 +232,10 @@ func TestLocalSessionIsNotForwarded(t *testing.T) {
 	located := false
 	p.global.WithWorkloadLocator(func(context.Context, string) (string, string, string, error) {
 		located = true
-		return "crusoe", "crusoe-ws", "u1", nil
+		return "cluster-a", "ws-a", "u1", nil
 	})
 	if err := p.global.store.StoreSandbox(context.Background(), &store.SandboxInfo{
-		SessionID: forwardSession, Namespace: "crusoe-ws", UserID: "u1",
+		SessionID: forwardSession, Namespace: "ws-a", UserID: "u1",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestLocalSessionIsResolvedOnce(t *testing.T) {
 	sm := &countingSessionManager{}
 	p.global.sessionManager = sm
 	if err := p.global.store.StoreSandbox(context.Background(), &store.SandboxInfo{
-		SessionID: forwardSession, Namespace: "crusoe-ws", UserID: "u1",
+		SessionID: forwardSession, Namespace: "ws-a", UserID: "u1",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -300,80 +300,45 @@ func TestUpstreamOnlyRejectsDirectE2B(t *testing.T) {
 	}
 }
 
-func TestGlobalForwardsE2BToCluster(t *testing.T) {
+func TestManagingRouterServesE2BLocally(t *testing.T) {
 	p := newForwardPair(t, "u1")
-	var gotPath, gotKey, gotAuth atomic.Value
-	wm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath.Store(r.URL.Path)
-		gotKey.Store(r.Header.Get("X-API-KEY"))
-		gotAuth.Store(r.Header.Get("Authorization"))
+	clusterWM := &atomic.Int32{}
+	cwm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clusterWM.Add(1)
 		w.WriteHeader(http.StatusCreated)
 	}))
-	t.Cleanup(wm.Close)
-	p.exec.cfg.WorkloadManagerURL = wm.URL
+	t.Cleanup(cwm.Close)
+	p.exec.cfg.WorkloadManagerURL = cwm.URL
+	var gotPath atomic.Value
+	gwm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath.Store(r.URL.Path)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(gwm.Close)
+	p.global.cfg.WorkloadManagerURL = gwm.URL
 
-	req, err := http.NewRequest(http.MethodPost, p.front.URL+"/v2/sandboxes/"+forwardSession+"/connect", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
+	for _, path := range []string{"/sandboxes", "/v2/sandboxes/" + forwardSession + "/connect"} {
+		req, err := http.NewRequest(http.MethodPost, p.front.URL+path, strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-API-KEY", "e2b-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated || gotPath.Load() != path {
+			t.Fatalf("%s status=%d path=%v body=%s", path, resp.StatusCode, gotPath.Load(), body)
+		}
 	}
-	req.Header.Set("X-API-KEY", "e2b-key")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
-	}
-	if gotPath.Load().(string) != "/v2/sandboxes/"+forwardSession+"/connect" || gotKey.Load().(string) != "e2b-key" {
-		t.Fatalf("path=%v key=%v", gotPath.Load(), gotKey.Load())
-	}
-	auth, _ := gotAuth.Load().(string)
-	if !strings.HasPrefix(auth, "Bearer ") || auth == "Bearer e2b-key" {
-		t.Fatalf("cluster authorization=%q", auth)
-	}
-
-	req, err = http.NewRequest(http.MethodPost, p.front.URL+"/sandboxes", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("X-API-KEY", "e2b-key")
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated || gotPath.Load().(string) != "/sandboxes" {
-		t.Fatalf("collection status=%d path=%v body=%s", resp.StatusCode, gotPath.Load(), body)
+	if clusterWM.Load() != 0 {
+		t.Fatal("E2B control-plane call left the managing Router")
 	}
 }
 
-func TestE2BInvokeTokenIsBoundToItsSandbox(t *testing.T) {
-	p := newForwardPair(t, "u1")
-	token, err := p.global.jwt.generateInvokeToken("other-sandbox", "crusoe", "crusoe-ws", "", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest(http.MethodGet, p.cluster.URL+"/v2/sandboxes/"+forwardSession, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("X-API-KEY", "e2b-key")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden || errorCode(string(body)) != "invoke_hop_mismatch" {
-		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
-	}
-}
-
-func TestConfigureUpstreamOnlyFollowsRole(t *testing.T) {
+func TestConfigureUpstreamOnlyIsOptIn(t *testing.T) {
 	upstreamPEM := string(mustPEM(t, mustJWT(t)))
 	cases := []struct {
 		name     string
@@ -386,20 +351,21 @@ func TestConfigureUpstreamOnlyFollowsRole(t *testing.T) {
 		{name: "single cluster blank", raw: "  ", want: false},
 		{name: "single cluster false", raw: "false", want: false},
 		{name: "single cluster explicit on", raw: "true", wantErr: true},
-		{name: "cluster Router unset", upstream: upstreamPEM, raw: "", want: true},
+		{name: "cluster Router unset", upstream: upstreamPEM, raw: "", want: false},
 		{name: "cluster Router true", upstream: upstreamPEM, raw: "true", want: true},
 		{name: "cluster Router false", upstream: upstreamPEM, raw: " false ", want: false},
+		{name: "cluster Router invalid", upstream: upstreamPEM, raw: "yes", wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &Server{}
-			if err := s.ConfigureDataPlane("ccs300", "", tc.upstream, nil); err != nil {
+			if err := s.ConfigureDataPlane("cluster-a", "", tc.upstream, nil); err != nil {
 				t.Fatal(err)
 			}
 			err := s.ConfigureUpstreamOnly(tc.raw)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatal("explicit upstream-only accepted without an upstream key")
+					t.Fatal("invalid upstream-only configuration accepted")
 				}
 				return
 			}
@@ -416,7 +382,7 @@ func TestConfigureUpstreamOnlyFollowsRole(t *testing.T) {
 func TestSingleClusterAcceptsDirectCaller(t *testing.T) {
 	s := &Server{store: store.NewMemoryStore()}
 	s.setupRoutes()
-	if err := s.ConfigureDataPlane("ccs300", "", "", nil); err != nil {
+	if err := s.ConfigureDataPlane("cluster-a", "", "", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.ConfigureUpstreamOnly(""); err != nil {

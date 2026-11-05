@@ -88,13 +88,11 @@ func (s *Server) e2bAccessGate(c *gin.Context) {
 }
 
 // proxyE2B forwards an E2B control-plane call after requiring X-API-KEY.
-// The Workload Manager resolves the key. On an upstream-only Router the call
-// must be an invocation forwarded by the managing Router.
+// The Workload Manager resolves the key. An upstream-only Router refuses it:
+// the E2B control plane is served by the managing Router.
 func (s *Server) proxyE2B(c *gin.Context) {
-	if s.forwardRemoteE2B(c) {
-		return
-	}
-	if !s.enforceUpstreamHop(c, c.Param("sandboxID")) {
+	if s.dp.upstreamOnly {
+		s.rejectDirectCaller(c)
 		return
 	}
 	if c.GetHeader("X-API-KEY") == "" {

@@ -7,28 +7,24 @@ import (
 	"context"
 	"crypto/rsa"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
 const (
-	// EnvUpstreamOnly makes a cluster Router accept calls only as invocations
-	// forwarded by the managing Router. Unset follows the role: on when an upstream
-	// public key is configured, off for a single-cluster or managing Router.
-	// The exact value "false" turns it off. Any other value turns it on.
+	// EnvUpstreamOnly makes a cluster Router accept /v1 calls only as invocations
+	// forwarded by the managing Router and refuse the E2B control plane. It is off
+	// unless set to true.
 	EnvUpstreamOnly = "SANDBOX_UPSTREAM_ONLY"
-	// invokeControlSession is the session claim of a forwarded E2B collection call
-	// (create or list), which names no sandbox.
-	invokeControlSession = "*"
 
 	invocationRoute = "/v1/namespaces/:namespace/code-interpreters/:name/invocations/*path"
 	ctxInvokeHop    = "invokeHop"
@@ -53,18 +49,17 @@ func (s *Server) WithWorkloadLocator(locate WorkloadLocator) *Server {
 	return s
 }
 
-// ConfigureUpstreamOnly applies the EnvUpstreamOnly value. An empty value turns the
-// mode on only when an upstream public key is configured. "false" turns it off.
-// Any other value turns it on and requires the cluster id and upstream key.
+// ConfigureUpstreamOnly applies the EnvUpstreamOnly value. Empty is off. A true
+// value turns the mode on and requires the cluster id and upstream key; a value
+// that is not a boolean is an error.
 func (s *Server) ConfigureUpstreamOnly(raw string) error {
-	var on bool
-	switch strings.TrimSpace(raw) {
-	case "":
-		on = s.dp.upstream != nil
-	case "false":
-		on = false
-	default:
-		on = true
+	on := false
+	if v := strings.TrimSpace(raw); v != "" {
+		parsed, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("%s=%q is not a boolean", EnvUpstreamOnly, raw)
+		}
+		on = parsed
 	}
 	if err := s.SetUpstreamOnly(on); err != nil {
 		return err
@@ -114,33 +109,6 @@ func (s *Server) rejectDirectCaller(c *gin.Context) {
 		"error": "this Router accepts calls only from the managing Router",
 		"code":  "upstream_hop_required",
 	})
-}
-
-// enforceUpstreamHop admits a request on an upstream-only Router when it carries
-// this cluster's invoke token. sessionID empty means an E2B collection call.
-// A non-upstream-only Router admits every caller.
-func (s *Server) enforceUpstreamHop(c *gin.Context, sessionID string) bool {
-	if !s.dp.upstreamOnly {
-		return true
-	}
-	hop, err := verifyInvokeToken(s.dp.upstream, bearerCredential(c), s.dp.clusterID)
-	if err != nil {
-		s.rejectDirectCaller(c)
-		return false
-	}
-	want := sessionID
-	if want == "" {
-		want = invokeControlSession
-	}
-	if hop.SessionID != want {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-			"error": "forwarded invocation does not match its session",
-			"code":  "invoke_hop_mismatch",
-		})
-		return false
-	}
-	setHopUserContext(c, hop)
-	return true
 }
 
 // setHopUserContext records a verified forwarded invocation and its caller identity.
@@ -211,57 +179,8 @@ func (s *Server) forwardRemoteInvocation(c *gin.Context, sessionID string) (hand
 	return true, nil
 }
 
-// forwardRemoteE2B sends an E2B control-plane call to the cluster Router.
-// A sandbox in the local store stays local. Collection calls go to the one
-// configured remote cluster. It reports false when the call stays here.
-func (s *Server) forwardRemoteE2B(c *gin.Context) bool {
-	if s.dp.upstreamOnly || len(s.dp.routes) == 0 || s.jwt == nil {
-		return false
-	}
-	sandboxID := c.Param("sandboxID")
-	cluster, namespace, session := "", "", invokeControlSession
-	if sandboxID != "" {
-		if s.locator == nil {
-			return false
-		}
-		if s.store != nil {
-			if _, err := s.store.GetSandboxBySessionID(c.Request.Context(), sandboxID); err == nil {
-				return false
-			}
-		}
-		var err error
-		cluster, namespace, _, err = s.locator(c.Request.Context(), sandboxID)
-		if err != nil {
-			if !errors.Is(err, store.ErrNotFound) {
-				log.Warn("e2b: workload lookup failed", "sandboxId", sandboxID, "error", err)
-			}
-			return false
-		}
-		session = sandboxID
-	} else {
-		ids := s.RemoteClusterIDs()
-		if len(ids) != 1 {
-			return false
-		}
-		cluster = ids[0]
-	}
-	base, ok := s.forwardTarget(cluster)
-	if !ok {
-		return false
-	}
-	token, err := s.jwt.generateInvokeToken(session, cluster, namespace, "", "", "")
-	if err != nil {
-		log.Error("e2b: failed to sign forward token", "error", err, "sandboxId", sandboxID, "cluster", cluster)
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
-		return true
-	}
-	s.proxyToCluster(c, base, cluster, token)
-	return true
-}
-
 // proxyToCluster forwards the original request to a cluster Router, replacing
-// the caller credential with an invoke token. X-API-KEY is left for the cluster
-// Workload Manager.
+// the caller credential with an invoke token.
 func (s *Server) proxyToCluster(c *gin.Context, base, cluster, token string) {
 	target, err := url.Parse(base)
 	if err != nil {
@@ -301,21 +220,8 @@ func verifyInvokeToken(pub *rsa.PublicKey, raw, cluster string) (invokeHop, erro
 	if pub == nil || raw == "" {
 		return invokeHop{}, errors.New("missing invoke token")
 	}
-	token, err := jwt.Parse(raw, func(token *jwt.Token) (interface{}, error) {
-		return pub, nil
-	},
-		jwt.WithValidMethods([]string{"RS256"}),
-		jwt.WithIssuer(jwtIssuer),
-		jwt.WithAudience(invokeAudience),
-		jwt.WithExpirationRequired(),
-		jwt.WithIssuedAt(),
-		jwt.WithLeeway(time.Minute),
-	)
-	if err != nil || !token.Valid {
-		return invokeHop{}, errors.New("invalid invoke token")
-	}
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
+	claims, err := parseRouterToken(pub, raw, invokeAudience)
+	if err != nil {
 		return invokeHop{}, errors.New("invalid invoke token")
 	}
 	str := func(key string) string {

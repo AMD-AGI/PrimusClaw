@@ -154,20 +154,10 @@ func (jm *JWTManager) GenerateHopToken(sandboxID, cluster string) (string, error
 // generateHopToken signs a hop token. The namespace and sealed file roots travel
 // in the token so the cluster Router can use them. A client header cannot.
 func (jm *JWTManager) generateHopToken(sandboxID, cluster, namespace string, sealed bool, inputs, outputs []string) (string, error) {
-	if jm == nil || jm.privateKey == nil {
-		return "", fmt.Errorf("JWT private key is unavailable")
-	}
 	if sandboxID == "" || cluster == "" {
 		return "", fmt.Errorf("sandbox id and cluster are required")
 	}
-	if err := jm.privateKey.Validate(); err != nil {
-		return "", fmt.Errorf("invalid JWT private key: %w", err)
-	}
 	claims := jwt.MapClaims{
-		"iss":        jwtIssuer,
-		"aud":        hopAudience,
-		"iat":        time.Now().Unix(),
-		"exp":        time.Now().Add(hopExpiration).Unix(),
 		"sandbox_id": sandboxID,
 		"cluster":    cluster,
 		"namespace":  namespace,
@@ -177,37 +167,63 @@ func (jm *JWTManager) generateHopToken(sandboxID, cluster, namespace string, sea
 		claims["inputs"] = strings.Join(inputs, "\n")
 		claims["outputs"] = strings.Join(outputs, "\n")
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	return token.SignedString(jm.privateKey)
+	return jm.signRouterToken(hopAudience, hopExpiration, claims)
 }
 
 // generateInvokeToken signs a short-lived token that authorizes one /v1 invocation
 // session on one cluster for the caller the managing Router verified.
 func (jm *JWTManager) generateInvokeToken(sessionID, cluster, namespace, userID, userName, role string) (string, error) {
-	if jm == nil || jm.privateKey == nil {
-		return "", fmt.Errorf("JWT private key is unavailable")
-	}
 	if sessionID == "" || cluster == "" {
 		return "", fmt.Errorf("session id and cluster are required")
 	}
-	if err := jm.privateKey.Validate(); err != nil {
-		return "", fmt.Errorf("invalid JWT private key: %w", err)
-	}
-	now := time.Now()
-	claims := jwt.MapClaims{
-		"iss":        jwtIssuer,
-		"aud":        invokeAudience,
-		"iat":        now.Unix(),
-		"exp":        now.Add(hopExpiration).Unix(),
+	return jm.signRouterToken(invokeAudience, hopExpiration, jwt.MapClaims{
 		"session_id": sessionID,
 		"cluster":    cluster,
 		"namespace":  namespace,
 		"sub":        userID,
 		"user_name":  userName,
 		"role":       role,
+	})
+}
+
+// signRouterToken signs a token from this Router to a cluster Router. It sets
+// the issuer, audience and validity window on claims.
+func (jm *JWTManager) signRouterToken(audience string, ttl time.Duration, claims jwt.MapClaims) (string, error) {
+	if jm == nil || jm.privateKey == nil {
+		return "", fmt.Errorf("JWT private key is unavailable")
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	return token.SignedString(jm.privateKey)
+	if err := jm.privateKey.Validate(); err != nil {
+		return "", fmt.Errorf("invalid JWT private key: %w", err)
+	}
+	now := time.Now()
+	claims["iss"] = jwtIssuer
+	claims["aud"] = audience
+	claims["iat"] = now.Unix()
+	claims["exp"] = now.Add(ttl).Unix()
+	return jwt.NewWithClaims(jwt.SigningMethodRS256, claims).SignedString(jm.privateKey)
+}
+
+// parseRouterToken verifies the signature, issuer, audience and validity window
+// of a token signed by the managing Router and returns its claims.
+func parseRouterToken(pub *rsa.PublicKey, raw, audience string) (jwt.MapClaims, error) {
+	token, err := jwt.Parse(raw, func(*jwt.Token) (interface{}, error) {
+		return pub, nil
+	},
+		jwt.WithValidMethods([]string{"RS256"}),
+		jwt.WithIssuer(jwtIssuer),
+		jwt.WithAudience(audience),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+		jwt.WithLeeway(time.Minute),
+	)
+	if err != nil || !token.Valid {
+		return nil, errors.New("invalid router token")
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, errors.New("invalid router token")
+	}
+	return claims, nil
 }
 
 // PublicKey returns the key a peer uses to verify tokens from this Router.

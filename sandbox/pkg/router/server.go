@@ -259,7 +259,7 @@ func (s *Server) setupRoutes() {
 
 	// E2B control plane. Outside /v1 so SaFE auth does not replace X-API-KEY.
 	// Workload Manager resolves the key. A missing key is rejected here.
-	// An upstream-only Router accepts these routes only as a forwarded invocation.
+	// An upstream-only Router refuses these routes.
 	// /sandboxes and /v2/sandboxes are the same control plane. SDK 2.51+
 	// uses POST /v2/sandboxes and POST /v2/sandboxes/{id}/connect.
 	// PATCH sets the timeout.
@@ -539,113 +539,11 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 		return
 	}
 
-	hop, forwarded := invokeHopFrom(c)
-	if forwarded && sessionID != hop.SessionID {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "forwarded invocation does not match its session",
-			"code":  "invoke_hop_mismatch",
-		})
-		return
-	}
-	var local *store.SandboxInfo
-	if sessionID != "" {
-		handled, found := s.forwardRemoteInvocation(c, sessionID)
-		if handled {
-			return
-		}
-		local = found
-	}
-
-	if local == nil && s.sessionManager == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session manager not available"})
-		return
-	}
-
-	// Get or create sandbox — delegate to SessionManager.
-	// The SessionManager has a 3-layer lookup:
-	//   1. Session store (CR-backed in production)
-	//   2. WM recovery endpoint → Sandbox CR (fallback)
-	//   3. Error with actionable message
-	// Auto-creation (when sessionID is empty) only happens for POST requests (guarded above).
-	// A forwarded invocation's Authorization is the hop token, which is not a
-	// caller credential the Workload Manager can verify, so it is not passed on.
-	authorization := c.GetHeader("Authorization")
-	if forwarded {
-		authorization = ""
-	}
-	requestContext := withCallerCredentials(
-		c.Request.Context(),
-		authorization,
-		c.GetHeader("Cookie"),
-	)
-	info, err := local, error(nil)
-	if info == nil {
-		info, err = s.sessionManager.GetSandboxBySession(requestContext, sessionID, namespace, name, kind)
-	}
-	if err != nil {
-		log.Error("GetSandboxBySession failed",
-			"kind", kind, "name", name, "sessionId", sessionID, "error", err)
-		errMsg := err.Error()
-
-		// A Workload Manager refusal or transient condition is relayed as is.
-		var wmErr *wmStatusError
-		if errors.As(err, &wmErr) {
-			if wmErr.RetryAfter != "" {
-				c.Header("Retry-After", wmErr.RetryAfter)
-			}
-			c.Data(wmErr.Status, "application/json; charset=utf-8", wmErr.Body)
-			return
-		}
-
-		// Session not found (expired/deleted, not recoverable from K8s either)
-		if strings.Contains(errMsg, "session") && strings.Contains(errMsg, "not found") {
-			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
-			return
-		}
-		// CodeInterpreter template not found in K8s
-		if strings.Contains(errMsg, "not found") {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": fmt.Sprintf("%s %q not found in namespace %q", kind, name, namespace),
-			})
-			return
-		}
-		// Store connection error (and K8s recovery also failed)
-		if strings.Contains(errMsg, "store lookup failed") {
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error":  "session store temporarily unavailable, please retry",
-				"detail": errMsg,
-			})
-			return
-		}
-		c.JSON(http.StatusBadGateway, gin.H{"error": errMsg})
-		return
-	}
-	// Admission is judged on the namespace the sandbox actually lives in, not
-	// the one the URL names: a session ID resolves to its sandbox wherever it
-	// is, so judging the URL would let a session from a non-admitted namespace
-	// through any admitted one (and unlabelling a namespace would not cut off
-	// its live sessions), while refusing a URL that merely differs would break
-	// clients that name a default namespace for every session. For an
-	// auto-created sandbox this repeats the middleware's check on the same
-	// namespace.
-	if !s.cfg.Namespaces.Gate(c, info.Namespace) {
+	info, ok := s.resolveInvokeSandbox(c, sessionID, namespace, name, kind)
+	if !ok {
 		return
 	}
 	sessionID = info.SessionID
-
-	// A forwarded invocation was authorized by the managing Router for this
-	// session; it is bound to the namespace that Router resolved.
-	if forwarded {
-		if hop.Namespace != "" && info.Namespace != hop.Namespace {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": "forwarded invocation does not match its session",
-				"code":  "invoke_hop_mismatch",
-			})
-			return
-		}
-	} else if s.cfg.EnableAuth && !s.authorizeSessionOwner(c, info.UserID) {
-		return
-	}
 
 	// A sealed grant sandbox is served only by the E2B data plane, which
 	// applies the sealed allow-list. Exec, terminal, files, port proxy and
@@ -704,6 +602,121 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 	}
 
 	s.proxyRequest(c, targetURL, sessionID)
+}
+
+// resolveInvokeSandbox finds the sandbox an invocation targets and authorizes the
+// caller for it: a Workload in another cluster is forwarded to that cluster's
+// Router, a local session is looked up or created, admitted by its namespace and
+// checked against its owner or the forwarded invocation. ok is false when the
+// request has been answered.
+func (s *Server) resolveInvokeSandbox(c *gin.Context, sessionID, namespace, name, kind string) (info *store.SandboxInfo, ok bool) {
+	hop, forwarded := invokeHopFrom(c)
+	if forwarded && sessionID != hop.SessionID {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "forwarded invocation does not match its session",
+			"code":  "invoke_hop_mismatch",
+		})
+		return nil, false
+	}
+	var local *store.SandboxInfo
+	if sessionID != "" {
+		handled, found := s.forwardRemoteInvocation(c, sessionID)
+		if handled {
+			return nil, false
+		}
+		local = found
+	}
+
+	if local == nil && s.sessionManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session manager not available"})
+		return nil, false
+	}
+
+	// Get or create sandbox — delegate to SessionManager.
+	// The SessionManager has a 3-layer lookup:
+	//   1. Session store (CR-backed in production)
+	//   2. WM recovery endpoint → Sandbox CR (fallback)
+	//   3. Error with actionable message
+	// Auto-creation (when sessionID is empty) only happens for POST requests (guarded above).
+	// A forwarded invocation's Authorization is the hop token, which is not a
+	// caller credential the Workload Manager can verify, so it is not passed on.
+	authorization := c.GetHeader("Authorization")
+	if forwarded {
+		authorization = ""
+	}
+	requestContext := withCallerCredentials(
+		c.Request.Context(),
+		authorization,
+		c.GetHeader("Cookie"),
+	)
+	info, err := local, error(nil)
+	if info == nil {
+		info, err = s.sessionManager.GetSandboxBySession(requestContext, sessionID, namespace, name, kind)
+	}
+	if err != nil {
+		log.Error("GetSandboxBySession failed",
+			"kind", kind, "name", name, "sessionId", sessionID, "error", err)
+		errMsg := err.Error()
+
+		// A Workload Manager refusal or transient condition is relayed as is.
+		var wmErr *wmStatusError
+		if errors.As(err, &wmErr) {
+			if wmErr.RetryAfter != "" {
+				c.Header("Retry-After", wmErr.RetryAfter)
+			}
+			c.Data(wmErr.Status, "application/json; charset=utf-8", wmErr.Body)
+			return nil, false
+		}
+
+		// Session not found (expired/deleted, not recoverable from K8s either)
+		if strings.Contains(errMsg, "session") && strings.Contains(errMsg, "not found") {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+			return nil, false
+		}
+		// CodeInterpreter template not found in K8s
+		if strings.Contains(errMsg, "not found") {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": fmt.Sprintf("%s %q not found in namespace %q", kind, name, namespace),
+			})
+			return nil, false
+		}
+		// Store connection error (and K8s recovery also failed)
+		if strings.Contains(errMsg, "store lookup failed") {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":  "session store temporarily unavailable, please retry",
+				"detail": errMsg,
+			})
+			return nil, false
+		}
+		c.JSON(http.StatusBadGateway, gin.H{"error": errMsg})
+		return nil, false
+	}
+	// Admission is judged on the namespace the sandbox actually lives in, not
+	// the one the URL names: a session ID resolves to its sandbox wherever it
+	// is, so judging the URL would let a session from a non-admitted namespace
+	// through any admitted one (and unlabelling a namespace would not cut off
+	// its live sessions), while refusing a URL that merely differs would break
+	// clients that name a default namespace for every session. For an
+	// auto-created sandbox this repeats the middleware's check on the same
+	// namespace.
+	if !s.cfg.Namespaces.Gate(c, info.Namespace) {
+		return nil, false
+	}
+
+	// A forwarded invocation was authorized by the managing Router for this
+	// session; it is bound to the namespace that Router resolved.
+	if forwarded {
+		if hop.Namespace != "" && info.Namespace != hop.Namespace {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "forwarded invocation does not match its session",
+				"code":  "invoke_hop_mismatch",
+			})
+			return nil, false
+		}
+	} else if s.cfg.EnableAuth && !s.authorizeSessionOwner(c, info.UserID) {
+		return nil, false
+	}
+	return info, true
 }
 
 // authorizeSessionOwner admits the session owner or a full system-admin and answers

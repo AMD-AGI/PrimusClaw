@@ -59,7 +59,7 @@ func RejectionFor(err error) Rejection {
 }
 
 // PlatformRole picks the highest-priority role from the introspected roles.
-// The roles are the platform roles primus-identity reads from its store (the
+// The roles are the platform roles the identity provider reads from its store (the
 // platform groups plus "default"), so they are taken as the caller's role.
 // Priority: system-admin > system-admin-readonly > default.
 func PlatformRole(roles []string) string {

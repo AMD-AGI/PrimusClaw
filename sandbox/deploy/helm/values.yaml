@@ -130,11 +130,11 @@ router:
     # all — not a weaker check, none. Set true in production; it requires
     # controlplane.config.identity.introspectUrl and its client Secret.
     enableAuth: false
-    # /v1 and the E2B control plane accept only invocations forwarded by the
-    # managing Router. Empty follows the role: on for a cluster Router with
-    # SANDBOX_UPSTREAM_PUBLIC_KEY, off for a single-cluster or managing Router.
-    # true forces it on and requires SANDBOX_CLUSTER_ID and the upstream key,
-    # or the process refuses to start. false forces it off.
+    # true makes a cluster Router accept /v1 only as invocations forwarded by the
+    # managing Router and refuse the E2B control plane, which the managing
+    # Router serves. It requires SANDBOX_CLUSTER_ID and SANDBOX_UPSTREAM_PUBLIC_KEY,
+    # or the process refuses to start. Empty or false is off. Turn it on only
+    # after every caller of this cluster Router goes through the managing Router.
     # SANDBOX_UPSTREAM_PUBLIC_KEY is set only on a cluster Router in multi-cluster
     # mode; a single-cluster deployment leaves it unset.
     upstreamOnly: ""

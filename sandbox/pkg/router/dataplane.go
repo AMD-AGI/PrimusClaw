@@ -11,10 +11,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
@@ -31,8 +29,8 @@ const (
 	EnvClusterRoutes = "SANDBOX_CLUSTER_ROUTES"
 	// EnvUpstreamPublicKey is the managing Router's public PEM.
 	// Set it only on a cluster Router in multi-cluster mode. A single-cluster or
-	// managing Router leaves it empty, which disables the hop receiver and
-	// upstream-only.
+	// managing Router leaves it empty, which disables the hop receiver.
+	// Upstream-only requires it.
 	EnvUpstreamPublicKey = "SANDBOX_UPSTREAM_PUBLIC_KEY"
 )
 
@@ -47,8 +45,8 @@ type dataPlane struct {
 	routes    map[string]string
 	upstream  *rsa.PublicKey
 	pods      PodAddressFunc
-	// upstreamOnly limits /v1 and the E2B control plane to invocations forwarded
-	// by the managing Router. /v1/health stays open.
+	// upstreamOnly limits /v1 to invocations forwarded by the managing Router and
+	// refuses the E2B control plane. /v1/health stays open.
 	upstreamOnly bool
 }
 
@@ -186,7 +184,7 @@ func (s *Server) handleDataPlaneHop(c *gin.Context) {
 		writeGate(c, http.StatusServiceUnavailable, "sandbox_unavailable", "dataplane hop is not configured")
 		return
 	}
-	raw := bearerToken(c.GetHeader("Authorization"))
+	raw := bearerCredential(c)
 	ref, err := verifyHopToken(s.dp.upstream, raw, sandboxID, s.dp.clusterID)
 	if err != nil {
 		writeGate(c, http.StatusUnauthorized, "invalid_token", "hop token is not valid for this cluster")
@@ -221,7 +219,7 @@ func (s *Server) handleLocalEnvD(c *gin.Context) {
 		writeGate(c, http.StatusNotFound, "sandbox_not_found", "dataplane hop is not configured")
 		return
 	}
-	raw := bearerToken(c.GetHeader("Authorization"))
+	raw := bearerCredential(c)
 	ref, err := verifyHopToken(s.dp.upstream, raw, "", s.dp.clusterID)
 	if err != nil || ref.ID == "" {
 		writeGate(c, http.StatusUnauthorized, "invalid_token", "hop token is not valid for this cluster")
@@ -278,14 +276,6 @@ func (s *Server) localSandbox(ctx context.Context, namespace, sandboxID string) 
 	return &store.SandboxInfo{SessionID: sandboxID, PodIP: ip, PodPort: port}, nil
 }
 
-func bearerToken(header string) string {
-	parts := strings.SplitN(header, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		return ""
-	}
-	return strings.TrimSpace(parts[1])
-}
-
 // verifyHopToken checks the managing Router's signature, audience, sandbox id, and cluster.
 // An empty sandboxID accepts the id carried in the token, which is how an envd
 // path with no id in the URL is routed.
@@ -293,21 +283,8 @@ func verifyHopToken(pub *rsa.PublicKey, raw, sandboxID, cluster string) (runtime
 	if pub == nil || raw == "" {
 		return runtimev1alpha1.GrantSandboxRef{}, errors.New("missing hop token")
 	}
-	token, err := jwt.Parse(raw, func(token *jwt.Token) (interface{}, error) {
-		return pub, nil
-	},
-		jwt.WithValidMethods([]string{"RS256"}),
-		jwt.WithIssuer(jwtIssuer),
-		jwt.WithAudience(hopAudience),
-		jwt.WithExpirationRequired(),
-		jwt.WithIssuedAt(),
-		jwt.WithLeeway(time.Minute),
-	)
-	if err != nil || !token.Valid {
-		return runtimev1alpha1.GrantSandboxRef{}, errors.New("invalid hop token")
-	}
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
+	claims, err := parseRouterToken(pub, raw, hopAudience)
+	if err != nil {
 		return runtimev1alpha1.GrantSandboxRef{}, errors.New("invalid hop token")
 	}
 	gotSandbox, _ := claims["sandbox_id"].(string)

@@ -20,7 +20,7 @@ const testHandsTokenHeader = "X-Hands-Token"
 func handsCall(t *testing.T, p *forwardPair, port int, authorization, handsToken string) (int, string) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet,
-		p.front.URL+"/v1/namespaces/crusoe-ws/code-interpreters/"+forwardSession+
+		p.front.URL+"/v1/namespaces/ws-a/code-interpreters/"+forwardSession+
 			"/invocations/proxy/"+strconv.Itoa(port)+"/mcp", nil)
 	if err != nil {
 		t.Fatal(err)
