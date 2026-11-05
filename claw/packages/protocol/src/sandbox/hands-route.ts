@@ -60,24 +60,35 @@ export function routedHandsPort(url: string): string | null {
   return routedParts(url)?.port ?? null;
 }
 
-/** Headers a Hands request needs to be routed at all; empty for a direct URL. */
-export function handsRouteHeaders(url: string): Record<string, string> {
+/**
+ * Headers a Hands request needs to be routed at all; empty for a direct URL.
+ *
+ * `routerKey` is the SaFE key a Router running with `--enable-auth` requires
+ * (the sandbox owner's): sent in `Authorization` on a routed URL only. The
+ * Router strips that header before forwarding, so Hands never sees it.
+ */
+export function handsRouteHeaders(url: string, routerKey?: string): Record<string, string> {
   const session = routedHandsSessionId(url);
-  return session ? { "x-session-id": session } : {};
+  if (!session) return {};
+  const key = routerKey?.trim();
+  return key ? { "x-session-id": session, Authorization: `Bearer ${key}` } : { "x-session-id": session };
 }
 
 /**
  * The credential, and for a routed URL the routing headers and the credential
  * again in {@link HANDS_TOKEN_HEADER}. A direct URL gets exactly the one
  * `Authorization` header it always got, so nothing changes where the Router is
- * not in the path.
+ * not in the path. With `routerKey` (see {@link handsRouteHeaders}) a routed
+ * URL carries that key in `Authorization` instead, and Hands still reads its
+ * credential from {@link HANDS_TOKEN_HEADER}.
  */
-export function handsCredentialHeaders(url: string, credential: string): Record<string, string> {
+export function handsCredentialHeaders(url: string, credential: string, routerKey?: string): Record<string, string> {
   const route = handsRouteHeaders(url);
   if (!route["x-session-id"]) return { Authorization: `Bearer ${credential}` };
+  const key = routerKey?.trim();
   return {
     ...route,
-    Authorization: `Bearer ${credential}`,
+    Authorization: `Bearer ${key || credential}`,
     [HANDS_TOKEN_HEADER]: credential,
   };
 }

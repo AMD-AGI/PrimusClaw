@@ -7,9 +7,8 @@
  *   GET /v1/admin/sandbox/templates   templates of every user
  *   GET /v1/admin/sandbox/sessions    sandboxes of every user
  *
- * The Router lists everything for a caller it does not know: the deployments run
- * it without --enable-auth (Hands reaches sandboxes through it that way), so its
- * management API must not be reachable from a browser. These routes are the
+ * The Router lists everything for a caller it does not know when it runs without
+ * --enable-auth, so its management API must not be reachable from a browser. These routes are the
  * browser's way in. The global preHandler authenticates the caller, the handler
  * requires an admin role, and the request that reaches the Router is built here
  * from a fixed set of query fields, with none of the caller's headers or cookies.

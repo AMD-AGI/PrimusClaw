@@ -551,6 +551,13 @@ record it.
   like the platform defaults instead of being inlined.
 
 ### Security
+- Claw works with a sandbox Router that runs with `--enable-auth`. With `SANDBOX_ROUTER_AUTH_ENABLED` on, every Hands
+  request that goes through the Router's port proxy (`SANDBOX_HANDS_VIA_ROUTER`) presents the sandbox owner's platform key
+  in `Authorization`: Brain's MCP client, health checks, shell records and the sweeper, and the API's changes view and
+  sandbox census. Before, they carried only the Hands token, which such a Router answers with 401, so the Router could
+  not authenticate while Hands was reached through it. Hands still reads its own token from `X-Hands-Token`; the Router
+  strips `Authorization` before forwarding. With the setting off nothing changes. `deploy/deploy.sh` now sets
+  `SANDBOX_ROUTER_AUTH_ENABLED` for Claw from the Sandbox it installs (`true` unless `--insecure-sandbox`).
 - A session that acts as a user (`config.acting_as`, GitHub review on; its turns carry `withhold_sandbox_keys`) is no longer
   given the deployment's platform defaults (`PLATFORM_DEFAULTS_FILE`): no default MCP server and no default skill. The default
   servers are called with the requester's own key (`<SAFE_API_KEY>`), so a pull request's text that a review turn reads could
