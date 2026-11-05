@@ -165,18 +165,21 @@ func invokeHopFrom(c *gin.Context) (invokeHop, bool) {
 }
 
 // forwardRemoteInvocation sends an invocation of a Workload in another cluster to
-// that cluster's Router. A session in the local store stays local. It reports false
-// when the session is not a remote Workload, and true when the request has been answered.
-func (s *Server) forwardRemoteInvocation(c *gin.Context, sessionID string) bool {
+// that cluster's Router. A session in the local store stays local and is returned
+// so the caller does not look it up again. handled is true when the request has
+// been answered. Namespace admission for a remote Workload is applied by the
+// cluster Router that serves its namespace; this Router's selector covers only
+// namespaces in its own cluster.
+func (s *Server) forwardRemoteInvocation(c *gin.Context, sessionID string) (handled bool, local *store.SandboxInfo) {
 	if s.locator == nil || len(s.dp.routes) == 0 {
-		return false
+		return false, nil
 	}
 	if _, forwarded := invokeHopFrom(c); forwarded {
-		return false
+		return false, nil
 	}
 	if s.store != nil {
-		if _, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID); err == nil {
-			return false
+		if info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID); err == nil {
+			return false, info
 		}
 	}
 	cluster, namespace, ownerID, err := s.locator(c.Request.Context(), sessionID)
@@ -184,28 +187,28 @@ func (s *Server) forwardRemoteInvocation(c *gin.Context, sessionID string) bool 
 		if !errors.Is(err, store.ErrNotFound) {
 			log.Warn("invoke: workload lookup failed", "sessionId", sessionID, "error", err)
 		}
-		return false
+		return false, nil
 	}
 	base, ok := s.forwardTarget(cluster)
 	if !ok {
-		return false
+		return false, nil
 	}
-	if s.cfg.EnableAuth && !handsPassthroughFrom(c) && !s.authorizeSessionOwner(c, ownerID) {
-		return true
+	if s.cfg.EnableAuth && !s.authorizeSessionOwner(c, ownerID) {
+		return true, nil
 	}
 	if s.jwt == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
-		return true
+		return true, nil
 	}
 	token, err := s.jwt.generateInvokeToken(sessionID, cluster, namespace,
 		c.GetString("userId"), c.GetString("userName"), c.GetString("userRole"))
 	if err != nil {
 		log.Error("invoke: failed to sign forward token", "error", err, "sessionId", sessionID, "cluster", cluster)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
-		return true
+		return true, nil
 	}
 	s.proxyToCluster(c, base, cluster, token)
-	return true
+	return true, nil
 }
 
 // forwardRemoteE2B sends an E2B control-plane call to the cluster Router.

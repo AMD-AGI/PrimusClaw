@@ -12,8 +12,6 @@ package workloadmanager
 
 import (
 	"errors"
-	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -38,12 +36,9 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 		c.Request.Header.Del(UserNameHeader)
 		c.Request.Header.Del(UserRoleHeader)
 
-		credential := bearerCredential(c.GetHeader("Authorization"))
+		credential := identity.BearerCredential(c.GetHeader("Authorization"))
 		if credential == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "authentication required: use Authorization: Bearer <API key or access token>",
-				"code":  "caller_credentials_missing",
-			})
+			abortCaller(c, identity.MissingCredential)
 			return
 		}
 
@@ -51,38 +46,26 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 		if err != nil {
 			if errors.Is(err, identity.ErrInactive) {
 				log.Warn("WM: caller credential refused", "remote_addr", c.ClientIP())
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-					"error": "credential verification failed: invalid or expired credential",
-					"code":  "caller_credential_invalid",
-				})
-				return
 			}
-			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-				"error": "identity provider is unavailable",
-				"code":  "caller_auth_unavailable",
-			})
+			abortCaller(c, identity.RejectionFor(err))
 			return
 		}
 
 		setVerifiedUser(c, tok)
 		log.Debug("WM: auth OK", "userId", tok.Subject,
-			"role", resolveRoleFromSaFERoles(tok.Roles), "path", c.Request.URL.Path)
+			"role", identity.PlatformRole(tok.Roles), "path", c.Request.URL.Path)
 		c.Next()
 	}
 }
 
-// bearerCredential returns the credential of an "Authorization: Bearer" header, or "".
-func bearerCredential(header string) string {
-	parts := strings.SplitN(header, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		return ""
-	}
-	return strings.TrimSpace(parts[1])
+// abortCaller answers a rejected caller.
+func abortCaller(c *gin.Context, r identity.Rejection) {
+	c.AbortWithStatusJSON(r.Status, gin.H{"error": r.Message, "code": r.Code})
 }
 
 // setVerifiedUser writes the verified identity to request headers and the Gin context.
 func setVerifiedUser(c *gin.Context, tok identity.Token) {
-	role := resolveRoleFromSaFERoles(tok.Roles)
+	role := identity.PlatformRole(tok.Roles)
 	c.Request.Header.Set(UserIDHeader, tok.Subject)
 	c.Request.Header.Set(UserNameHeader, tok.Email)
 	c.Request.Header.Set(UserRoleHeader, role)

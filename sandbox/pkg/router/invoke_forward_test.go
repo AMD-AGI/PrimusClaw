@@ -144,6 +144,31 @@ func TestForwardRemoteInvocationReachesClusterSandbox(t *testing.T) {
 	}
 }
 
+func TestForwardedMissDoesNotSendHopTokenToWM(t *testing.T) {
+	p := newForwardPair(t, "u1")
+	var wmAuth atomic.Value
+	wm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wmAuth.Store(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(wm.Close)
+	emptyStore := store.NewMemoryStore()
+	sm, err := NewSessionManager(emptyStore, wm.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.exec.store = emptyStore
+	p.exec.sessionManager = sm
+
+	status, body := invoke(t, p.front.URL, forwardSession, "ak-owner")
+	if status != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", status, body)
+	}
+	if auth, _ := wmAuth.Load().(string); auth != "" {
+		t.Fatalf("hop credential reached WM: %q", auth)
+	}
+}
+
 func TestForwardRemoteInvocationDeniesNonOwner(t *testing.T) {
 	p := newForwardPair(t, "intruder")
 	status, body := invoke(t, p.front.URL, forwardSession, "ak-other")
@@ -217,6 +242,30 @@ func TestLocalSessionIsNotForwarded(t *testing.T) {
 	invoke(t, p.front.URL, forwardSession, "ak-owner")
 	if located || p.envdHits.Load() != 0 {
 		t.Fatalf("local session located=%v envdHits=%d", located, p.envdHits.Load())
+	}
+}
+
+// countingSessionManager records how often the Router asks it for a session.
+type countingSessionManager struct{ calls atomic.Int32 }
+
+// GetSandboxBySession counts the call and reports the session as missing.
+func (m *countingSessionManager) GetSandboxBySession(context.Context, string, string, string, string) (*store.SandboxInfo, error) {
+	m.calls.Add(1)
+	return nil, store.ErrNotFound
+}
+
+func TestLocalSessionIsResolvedOnce(t *testing.T) {
+	p := newForwardPair(t, "u1")
+	sm := &countingSessionManager{}
+	p.global.sessionManager = sm
+	if err := p.global.store.StoreSandbox(context.Background(), &store.SandboxInfo{
+		SessionID: forwardSession, Namespace: "crusoe-ws", UserID: "u1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	invoke(t, p.front.URL, forwardSession, "ak-owner")
+	if n := sm.calls.Load(); n != 0 {
+		t.Fatalf("session manager asked %d times for a session the store already returned", n)
 	}
 }
 

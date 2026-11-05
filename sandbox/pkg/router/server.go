@@ -547,11 +547,16 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 		})
 		return
 	}
-	if sessionID != "" && s.forwardRemoteInvocation(c, sessionID) {
-		return
+	var local *store.SandboxInfo
+	if sessionID != "" {
+		handled, found := s.forwardRemoteInvocation(c, sessionID)
+		if handled {
+			return
+		}
+		local = found
 	}
 
-	if s.sessionManager == nil {
+	if local == nil && s.sessionManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session manager not available"})
 		return
 	}
@@ -562,12 +567,21 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 	//   2. WM recovery endpoint → Sandbox CR (fallback)
 	//   3. Error with actionable message
 	// Auto-creation (when sessionID is empty) only happens for POST requests (guarded above).
+	// A forwarded invocation's Authorization is the hop token, which is not a
+	// caller credential the Workload Manager can verify, so it is not passed on.
+	authorization := c.GetHeader("Authorization")
+	if forwarded {
+		authorization = ""
+	}
 	requestContext := withCallerCredentials(
 		c.Request.Context(),
-		c.GetHeader("Authorization"),
+		authorization,
 		c.GetHeader("Cookie"),
 	)
-	info, err := s.sessionManager.GetSandboxBySession(requestContext, sessionID, namespace, name, kind)
+	info, err := local, error(nil)
+	if info == nil {
+		info, err = s.sessionManager.GetSandboxBySession(requestContext, sessionID, namespace, name, kind)
+	}
 	if err != nil {
 		log.Error("GetSandboxBySession failed",
 			"kind", kind, "name", name, "sessionId", sessionID, "error", err)
@@ -629,7 +643,7 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 			})
 			return
 		}
-	} else if s.cfg.EnableAuth && !handsPassthroughFrom(c) && !s.authorizeSessionOwner(c, info.UserID) {
+	} else if s.cfg.EnableAuth && !s.authorizeSessionOwner(c, info.UserID) {
 		return
 	}
 
