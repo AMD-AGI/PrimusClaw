@@ -426,6 +426,8 @@ test("S16 no false denial of a capability", () => {
     // A GitHub URL a local command printed, beside another command's failure.
     ["git remote -v && cat README-missing", "origin\thttps://github.com/o/r.git (fetch)\norigin\thttps://github.com/o/r.git (push)\ncat: README-missing: No such file or directory"],
     ["gh --version; false", "gh version 2.97.0 (2026-10-01)\nhttps://github.com/cli/cli/releases/tag/v2.97.0"],
+    // A GitHub URL on one line and another command's error on the next are not one failure at GitHub.
+    ["git remote -v && make build", "origin\thttps://github.com/o/r.git (fetch)\nmake: *** [Makefile:3: build] Error 1"],
     ["echo git status; false", "git status"],
     ["git status", "fatal: not a git repository (or any of the parent directories): .git"],
     ["cd /tmp && git status && git push origin HEAD", "fatal: not a git repository (or any of the parent directories): .git"],
