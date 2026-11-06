@@ -29,6 +29,9 @@
  *   R9 a judge that gives no verdict (an error status, no PASS or FAIL) makes the attempt an error of the run, not a FAIL; its
  *      FAIL fails, its PASS passes. R3e a stop while the stream holds its history back ends the wait at once
  *   R10 an oracle that could not be read makes the attempt the run's error before anything is sent; one that answers is graded
+ *   R11 a read the grade needs that failed (a worker's events, the board through the item wait) makes the attempt the run's
+ *      error, its item still closed; in the final cleanup, a board that answers again after a while is read again and the
+ *      run's items are closed
  *   R8 a work_create that found someone else's open item with the same title (`deduplicated`): that item is not the run's, and
  *      is neither closed nor stripped of its worker's session
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
@@ -71,6 +74,11 @@ class FakeClaw {
   /** The next board read answers this much later (the run's first read is before anything is made). */
   boardDelayMs = 0;
   boardReads = 0;
+  /** The board answers 503 until then; `boardScript` first gives the next reads' statuses. */
+  boardFailUntil = 0;
+  boardScript: number[] = [];
+  /** Sessions whose stored events answer 500. */
+  readonly failReplay = new Set<string>();
   router: (content: string, messageId: string, sessionId: string) => void = () => {};
   /** Stored events the stream does not deliver (a stream stalled without dropping). */
   hidden: (data: Record<string, unknown>) => boolean = () => false;
@@ -120,6 +128,8 @@ class FakeClaw {
     if (method === "GET" && path === "/v1/notification-subscriptions") return send(200, { ok: true, data: [] });
     if (method === "GET" && path === "/v1/work-items") {
       this.boardReads++;
+      const scripted = this.boardScript.shift();
+      if (scripted !== undefined ? scripted !== 200 : Date.now() < this.boardFailUntil) return send(scripted ?? 503, { ok: false });
       if (this.boardDelayMs) { const wait = this.boardDelayMs; this.boardDelayMs = 0; setTimeout(() => send(200, { ok: true, data: this.items }), wait); return; }
       return send(200, { ok: true, data: this.items });
     }
@@ -174,7 +184,9 @@ class FakeClaw {
     if ((m = /^\/v1\/chat\/sessions\/([^/]+)\/messages$/.exec(path)) && method === "GET") {
       if (!this.sessions.has(m[1]!)) return send(404, { ok: false });
       const sessionId = m[1]!;
-      if (url.searchParams.get("mode") === "replay") return send(200, { ok: true, data: this.rows.get(sessionId) ?? [] });
+      if (url.searchParams.get("mode") === "replay") {
+        return this.failReplay.has(sessionId) ? send(500, { ok: false }) : send(200, { ok: true, data: this.rows.get(sessionId) ?? [] });
+      }
       res.writeHead(200, { "content-type": "text/event-stream" });
       for (const row of this.rows.get(sessionId) ?? []) if (row.event_type !== "exec_complete") res.write(frame(row));
       if (this.historyDelayMs) await new Promise((r) => setTimeout(r, this.historyDelayMs));
@@ -657,5 +669,36 @@ test("R10 an oracle that could not be read is the run's error, before anything i
     assert.match(run.out, /ERROR t-o-001#1 .*infra: the oracle of fact 1 could not be read \(the Claw API answered 503\): not graded/, run.out);
     assert.match(run.out, /pass t-o-002#1/, "an oracle that answered is graded: 3 is named");
     assert.deepEqual(claw.sent.map((x) => x.content), ["t-o-002"], "nothing sent for the case whose oracle could not be read");
+  } finally { rmSync(r.dir, { recursive: true, force: true }); }
+});
+
+test("R11 a read that failed is the run's error, and the cleanup reads again", { timeout: 120_000 }, async () => {
+  const claw = new FakeClaw();
+  const base = await claw.start();
+  claw.failReplay.add("worker-1");
+  claw.router = (content, id) => {
+    if (content === "worker") claw.turn(id, { item: item(1), say: "Task 1 is ready for your review." });
+    if (content === "board") {
+      // The item is read once in progress; then the board cannot be read through the rest of the wait, while the item gets
+      // its result, nor for a while after.
+      claw.boardScript = [200];
+      claw.boardFailUntil = Date.now() + 8_000;
+      const it = item(2, { board_state: "in_progress", can_accept: false });
+      claw.turn(id, { item: it, say: "On it." });
+      setTimeout(() => {
+        it.board_state = "ready";
+        it.can_accept = true;
+        claw.emit({ type: "AssistantSay", say_id: `ready-${id}`, turn_message_id: "", text: "Task 2 is ready.", item: { item_id: it.item_id, board_state: "ready", can_accept: true } });
+      }, 500);
+    }
+  };
+  const r = runner(base, [itemCase({ id: "t-r-001", turns: [{ user: "worker" }] }), itemCase({ id: "t-r-002", turns: [{ user: "board" }], item_wait_s: 2 })]);
+  const run = await r.done;
+  await claw.stop();
+  try {
+    assert.match(run.out, /ERROR t-r-001#1 .*infra: could not read item 1's worker calls \(replay answered 500\): not graded/, run.out);
+    assert.match(run.out, /ERROR t-r-002#1 .*infra: could not read the board \(board answered 503\): not graded/);
+    assert.deepEqual(claw.calls.filter((c) => c.includes("/accept")).sort(), ["POST /v1/work-items/item-1/accept", "POST /v1/work-items/item-2/accept"], "both closed");
+    assert.ok(!claw.sessions.has("worker-2"), "the cleanup read the board again and deleted item 2's worker session");
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });

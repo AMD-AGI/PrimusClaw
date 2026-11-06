@@ -305,13 +305,25 @@ async function replay(sessionId: string): Promise<EventRow[]> {
   return r.json.data as EventRow[];
 }
 
-/** The tool calls of an item's worker, when the item names one the key can read; [] otherwise. */
+/** The tool calls of an item's worker; [] for an item that names none. Throws when the item or the worker's events cannot be read. */
 async function workerCalls(itemId: string): Promise<ToolCall[]> {
   const r = await api("GET", `/v1/work-items/${itemId}`);
+  if (r.status !== 200) throw new Error(`the item answered ${r.status}`);
   const sid = r.json?.data?.worker_session_id;
-  if (r.status !== 200 || typeof sid !== "string" || !sid) return [];
-  return traceOf(await replay(sid).catch(() => [])).calls;
+  if (typeof sid !== "string" || !sid) return [];
+  return traceOf(await replay(sid)).calls;
 }
+
+/**
+ * Reads whose failure leaves `fallback` and records why in `unread`: a read that failed is not evidence, so an attempt with
+ * one is the run's error (after its cleanup), never graded on what is missing.
+ */
+const reading = (unread: string[]) => async <T>(what: string, p: Promise<T>, fallback: T): Promise<T> => {
+  try { return await p; } catch (err) { unread.push(`${what} (${err instanceof Error ? err.message : String(err)})`); return fallback; }
+};
+
+/** The board, read again for a while when a read fails (the cleanup's reads); null when it could not be read in that time. */
+const boardWithin = (ms: number): Promise<ItemSeen[] | null> => until(async () => board().catch(() => undefined), Date.now() + ms, 3_000);
 
 async function idle(sessionId: string, waitMs: number): Promise<boolean> {
   return (await waitFor(async () => {
@@ -473,13 +485,18 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   for (const i of items) RUN_ITEMS.add(i.item_id);
   // A request the case's item holds for its person: answered the way that person's channel answers it.
   const hold = c.hold && items.length ? await answerHold(c.hold, items, start + (c.item_wait_s ?? ITEM_WAIT_SEC) * 1000) : undefined;
+  const unread: string[] = [];
+  const read = reading(unread);
   if (items.length) {
-    // The item's result (or question, or failure; or its end, for a case that stops it), then what was said about it.
+    // The item's result (or question, or failure; or its end, for a case that stops it), then what was said about it. The items
+    // graded are the last ones read: a board that could not be read at the end gives none (an error, not a stale state).
     const settled = (is: ItemSeen[]): boolean => is.every((i) => (c.items_closed ? i.board_state === "done" : i.board_state !== "in_progress"));
+    let boardError: string | null = null;
     await waitFor(async () => {
-      items = mine(await board().catch(() => items));
-      return settled(items) ? true : undefined;
+      try { items = mine(await board()); boardError = null; } catch (err) { boardError = err instanceof Error ? err.message : String(err); }
+      return !boardError && settled(items) ? true : undefined;
     }, start + (c.item_wait_s ?? ITEM_WAIT_SEC) * 1000, 5_000);
+    if (boardError) unread.push(`the board (${boardError})`);
     await waitFor(() => (items.every((i) => i.board_state === "in_progress"
       || saysOf(stream.events).some((s) => s.itemId === i.item_id && s.itemState !== "in_progress")) ? true : undefined), Date.now() + 30_000, 1_000);
   }
@@ -498,7 +515,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   const lastItems = itemsStartedBy(lastRouter, items, RUN_ITEMS);
   const lastIds = lastItems.map((i) => i.item_id);
   const lastCalls = [...lastRouter];
-  for (const i of lastItems) lastCalls.push(...(await workerCalls(i.item_id).catch(() => [])));
+  for (const i of lastItems) lastCalls.push(...(await read(`item ${i.seq}'s worker calls`, workerCalls(i.item_id), [])));
   const lastSays = caseSays(says, [lastId], lastIds);
   const final = finalSay(says, [lastId], lastIds);
   const shown = caseSays(says, messageIds, items.map((i) => i.item_id));
@@ -510,7 +527,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
     items, factValues: values, ...(hold ? { hold } : {}),
   };
   const allCalls = [...turnCalls(stream.events, messageIds)];
-  for (const i of items) if (!lastIds.includes(i.item_id)) allCalls.push(...(await workerCalls(i.item_id).catch(() => [])));
+  for (const i of items) if (!lastIds.includes(i.item_id)) allCalls.push(...(await read(`item ${i.seq}'s worker calls`, workerCalls(i.item_id), [])));
   allCalls.push(...lastCalls.filter((x) => !lastRouter.includes(x)));
   // Clean up: everything the attempt started is accepted (a result that waits, at its version) or stopped.
   const cleaned: Attempt["items"] = [];
@@ -520,6 +537,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
     cleaned.push({ seq: i.seq, kind: i.kind, board_state: seen.board_state, cleanup: await closeItem(i) });
   }
   if (gaps.length) throw new Error(`the stream missed ${gaps.length} stored event(s) of the case (${gaps.slice(0, 3).join(",")}): not graded`);
+  if (unread.length) throw new Error(`infra: could not read ${unread.join("; ")}: not graded`);
   return attemptOf(c, turns, observed, allCalls.map((x) => x.name), cleaned);
 }
 
@@ -872,13 +890,24 @@ async function main(): Promise<void> {
             cleanupFailed.push(`turns of the run still running at its end (what they start is not closed): ${RUN_MESSAGES.filter((id) => !stored.includes(id)).join(",") || "(the stored events could not be read)"}`);
           }
           // From the stream and from the stored events: a work_create answer the stream missed still ties its item to the run.
-          const above = (await board()).filter((x) => x.seq > floorAtStart);
-          const storedCalls = traceOf((await replay(sessionId).catch(() => [])).filter((r) => RUN_MESSAGES.includes(String(r.data?.message_id ?? "")))).calls;
+          const above = ((await boardWithin(30_000)) ?? []).filter((x) => x.seq > floorAtStart);
+          const rows = await until(async () => replay(sessionId).catch(() => undefined), Date.now() + 30_000, 3_000);
+          if (!rows) cleanupFailed.push("the stored events could not be read to tie the run's items to its turns");
+          const storedCalls = traceOf((rows ?? []).filter((r) => RUN_MESSAGES.includes(String(r.data?.message_id ?? "")))).calls;
           for (const i of itemsStartedBy([...turnCalls(stream.events, RUN_MESSAGES), ...storedCalls], above, RUN_ITEMS)) RUN_ITEMS.add(i.item_id);
         }
-        for (const i of (await board()).filter((x) => RUN_ITEMS.has(x.item_id) && !CLEARED.has(x.item_id))) log(`closing #${i.seq}: ${await closeItem(i)}`);
+        // Each item on its own: one that cannot be closed does not keep the others open.
+        const open = await boardWithin(30_000);
+        if (!open) throw new Error("the board could not be read for 30 s");
+        for (const i of open.filter((x) => RUN_ITEMS.has(x.item_id) && !CLEARED.has(x.item_id))) {
+          try { log(`closing #${i.seq}: ${await closeItem(i)}`); } catch (err) {
+            cleanupFailed.push(`#${i.seq} could not be closed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
         await sleep(5_000);
-        const after = (await board()).filter((x) => x.seq > floorAtStart && x.board_state !== "done");
+        const final = await boardWithin(30_000);
+        if (!final) throw new Error("the board could not be read for 30 s");
+        const after = final.filter((x) => x.seq > floorAtStart && x.board_state !== "done");
         leftOpen = after.filter((x) => RUN_ITEMS.has(x.item_id)).map((x) => x.seq);
         // New open items the run cannot tie to its own calls are left alone, and said: on a test identity nobody else
         // makes items, so they are most likely the run's own whose answer could not be read, and a person must look.
