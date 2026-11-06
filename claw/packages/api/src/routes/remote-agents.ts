@@ -429,10 +429,6 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       ? { ...parsed.value, by: owner, client: clientLabel(req) }
       : parsed.value;
     const since = type === "prompt" || type === "cancel" ? await remoteEventMark(sessionId).catch(() => undefined) : undefined;
-    // A stop pressed in the attached chat: its turn_end ends what was sent before it, not a prompt sent right after it.
-    if (type === "cancel" && since !== undefined) {
-      await noteRemoteCancel(owner, sessionId, since).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
-    }
     const out = await store.issueCommand({
       owner, client: clientLabel(req), connectorId: session.connector_id, agentId: session.agent_id, sessionId,
       type, cmdId, payload, auditDetail: spec.audit(parsed.value), closesSession: spec.closesSession, commandsPerMinute,
@@ -443,6 +439,10 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
         && (type !== "decision" || out.row.payload?.option_id === (parsed.value as { option_id: string }).option_id);
       if (!same) return fail(reply, 409, type === "decision" ? "already_decided" : "idempotency_key_reused");
       return reply.send({ ok: true, data: { cmd_id: cmdId, duplicate: true } });
+    }
+    // A stop pressed in the attached chat (queued now, not a retry): its turn_end ends what was sent before it, not a prompt after it.
+    if (type === "cancel" && since !== undefined) {
+      await noteRemoteCancel(owner, sessionId, since).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
     }
     // A prompt typed into an attached chat is an item the assistant can name ("did it finish?"), told to nobody: the chat shows it.
     if (type === "prompt") {

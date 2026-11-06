@@ -475,8 +475,16 @@ describe("development environment items and devenv_send", { skip }, () => {
     // The attached chat's stop with two open, then one more: the cancel ends the two, the third runs on.
     await prompt("a");
     await prompt("b");
-    assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "cancel" })).status, 202);
+    const cancel = async () => {
+      const r = await fetch(`${base}/v1/remote-agents/sessions/${sid}/commands`, {
+        method: "POST", headers: { "x-test-user": "alice", "content-type": "application/json", "idempotency-key": "stop-1" }, body: JSON.stringify({ type: "cancel" }),
+      });
+      return { status: r.status, body: await r.json() as Recorded };
+    };
+    assert.equal((await cancel()).status, 202);
     await prompt("c");
+    // The chat retries the same stop: nothing new is queued, and the prompt sent after the stop still counts.
+    assert.equal((await cancel()).body.data.duplicate, true);
     assert.equal((await remoteItem(sid)).params.open_turns, 3);
     await events("alice", cid, sid, [end("cancelled")]);
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_turns], ["in_progress", 1]);
