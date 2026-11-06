@@ -4736,7 +4736,13 @@ class TaskRunner {
       await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
     }
 
-    const result = await runner.run(this.abortCtrl.signal);
+    // The run's signal also cuts short a wait for the sandbox. Whether the workload
+    // being waited on is stopped there follows the same split as below: a run this
+    // Brain finishes (a cancel, the deadline, a terminal row) stops it at once; a
+    // run handed over (a drain, a lost lease) leaves it for its successor to adopt.
+    const result = await runner.run(this.abortCtrl.signal, {
+      reclaimOnAbort: () => this.stillOwnsLock() && this.abortCtrl.signal.reason !== SIGTERM_ABORT_REASON,
+    });
     if (result.kind === "ended" && finishOnly) {
       await this.settleFinishOnly();
       return;

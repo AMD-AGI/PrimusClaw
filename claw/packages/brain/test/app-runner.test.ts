@@ -651,6 +651,30 @@ test("R4 finishNow(cancelled) finishes a running run: SIGTERM, revoke, stop sand
   assert.equal(h.world.rec.state, "ended");
 });
 
+test("R4b the run's stop reaches the sandbox ensure, but not the one finishNow makes to read a final the application left", async () => {
+  const { SandboxProvisionTerminalError } = await import("../src/sandbox/errors.js");
+  const h = harness();
+  const wl = await toRunning(h);
+  // The application wrote a successful final to shared storage, and its sandbox went.
+  h.world.appExits(wl, finalExit(0));
+  h.world.killWorkload(wl, "absent");
+  // An ensure that honours the stop, as the real one does: nothing is made once it has fired.
+  const ensure = h.world.sandbox.ensure;
+  const seen: Array<boolean | undefined> = [];
+  h.world.sandbox.ensure = async (run, opts) => {
+    seen.push(opts?.signal?.aborted);
+    if (opts?.signal?.aborted) throw new SandboxProvisionTerminalError("sandbox_wait_interrupted", "stopped");
+    return ensure(run, opts);
+  };
+  const stop = new AbortController();
+  stop.abort();
+  assert.deepEqual(await h.runner.run(stop.signal), { kind: "aborted" });
+  const outcome = await h.runner.finishNow("cancelled");
+  assert.deepEqual(seen, [undefined], "finishNow's reader sandbox is not cut short by the stop it is carrying out");
+  assert.equal(outcome.success, true, "the final the application wrote before its sandbox went is the run's result");
+  assert.equal(h.world.rec.state, "ended");
+});
+
 test("R5 finishing also stops a sandbox the row never recorded", async () => {
   const h = harness();
   await until(h, "provisioning", 1);

@@ -748,6 +748,17 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- An app run cancelled while its sandbox is still being created, typically by its session being deleted seconds after
+  the run was submitted, no longer leaves that sandbox running until its workload timeout. The run's signal now reaches
+  the sandbox ensure: no create is sent once it has fired, and the wait for a workload that exists (one whose create was
+  already under way included) ends at once. A wait cut short by a cancel, the deadline or a terminal row stops the
+  workload; one cut short by a drain or a lost lease leaves it for the next holder.
+  Before, the wait ran on until the workload was Running (minutes, for a queued one), and the finish that followed came
+  after the run's lease had expired, was refused (`not_holder`) and stopped nothing. As a backstop, the sweeper now moves
+  a run whose task was closed before the run reached `finishing` (`provisioning`, `starting`, `running`, `restarting`)
+  to `finishing` once the task's lease has been gone, and the task closed, for `LEASE_LOST_GRACE_SEC`, so the existing
+  finish-only dispatch stops its sandboxes and revokes its grant (`sweeper.abandoned_app_runs_to_finishing`); a finish
+  that fails every one of its bounded hand-overs is left for an operator, as before.
 - A database failover no longer leaves the API on the old primary, and no longer costs the assistant's replies. A
   switchover demotes the old primary in place, and a connection still on it answers every read and refuses every write
   (`25006`): `inTransaction` handed such a connection back to the pool after a clean rollback, to fail the next

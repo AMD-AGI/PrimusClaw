@@ -14,6 +14,8 @@
  *   A1b a failed app run is reported as a failure with the runner's reason
  *   A1c a cancel finishes the run; a drain or a lost lease leaves it to its
  *       successor
+ *   A1d the same split decides whether a sandbox still being waited for is
+ *       stopped when the run's signal fires
  *   A2 llm, script, app and an omitted mode are not refused
  *   A3 a mode this Brain has never heard of is refused, the engine untouched
  */
@@ -27,7 +29,7 @@ import type { TaskRunnerSideEffects } from "../src/tasks/runner.js";
 import type { AppRunner, AppRunResult, AppRunOutcome } from "../src/apps/app-runner.js";
 
 const { bindTaskRunnerDeps, runHandleTask, refuseUnsupportedMode } = await import("../src/tasks/runner.js");
-const { activeAbort, SIGTERM_ABORT_REASON, LEASE_LOST_ABORT_REASON, DEADLINE_EXCEEDED_ABORT_REASON } =
+const { activeAbort, SIGTERM_ABORT_REASON, LEASE_LOST_ABORT_REASON, DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON } =
   await import("../src/tasks/abort-registry.js");
 
 interface FakeRunner {
@@ -41,7 +43,7 @@ interface FakeRunner {
   made: Array<{ platformKey: string; epoch: number }>;
   closed: string[];
   /** What run() answers. It may also fire the abort first, as a real cancel would. */
-  script: (signal: AbortSignal) => Promise<AppRunResult>;
+  script: (signal: AbortSignal, opts?: { reclaimOnAbort?: () => boolean }) => Promise<AppRunResult>;
 }
 
 function harness(runner?: FakeRunner) {
@@ -78,7 +80,7 @@ function harness(runner?: FakeRunner) {
       runner?.made.push({ platformKey, epoch });
       return {
         markEnded: async (why: string) => { runner?.closed.push(why); return true; },
-        run: async (signal: AbortSignal) => { runner!.runs++; return runner!.script(signal); },
+        run: async (signal: AbortSignal, opts?: { reclaimOnAbort?: () => boolean }) => { runner!.runs++; return runner!.script(signal, opts); },
         finishNow: async (cause: string): Promise<AppRunOutcome> => { runner!.finishes.push(cause); if (runner!.finishThrows) throw new Error("finish kept failing"); return runner!.finishOutcome ?? { success: false, reason: cause }; },
       } as unknown as AppRunner;
     }) as never,
@@ -219,6 +221,32 @@ test("A1c a user cancel finishes the run; a drain or a lost lease leaves it to t
     left.script = async () => { c.abort(reason); return { kind: "aborted" }; };
     await runHandleTask(h.msg, request("app"), "s-app", "lock.s-app", "m1", "u1", c);
     assert.deepEqual(left.finishes, [], `${String(reason)}: the successor reconciles it; nothing is stopped here`);
+  }
+});
+
+test("A1d a sandbox the run is waiting for is stopped when the run is finished here, and left when it is handed over", async () => {
+  // Asked as the AppRunner asks it: when the abort is seen, not when the run starts.
+  const cases: Array<[string, unknown, boolean]> = [
+    ["user cancel", undefined, true],
+    ["deadline", DEADLINE_EXCEEDED_ABORT_REASON, true],
+    ["terminal row", RUN_ROW_TERMINAL_ABORT_REASON, true],
+    ["drain", SIGTERM_ABORT_REASON, false],
+    ["lost lease", LEASE_LOST_ABORT_REASON, false],
+  ];
+  for (const [name, reason, reclaims] of cases) {
+    let answer: boolean | undefined;
+    const r = fakeRunner(async () => ({ kind: "aborted" }));
+    const h = harness(r);
+    const c = new AbortController();
+    activeAbort.set("lock.s-app", c);
+    r.script = async (_signal, opts) => {
+      assert.equal(typeof opts?.reclaimOnAbort, "function", `${name}: the run is told what its stop means`);
+      c.abort(reason);
+      answer = opts!.reclaimOnAbort!();
+      return { kind: "aborted" };
+    };
+    await runHandleTask(h.msg, request("app"), "s-app", "lock.s-app", "m1", "u1", c);
+    assert.equal(answer, reclaims, `${name}: ${reclaims ? "the workload is stopped" : "the workload is left for the successor"}`);
   }
 });
 

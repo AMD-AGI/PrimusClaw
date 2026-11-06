@@ -224,3 +224,26 @@ test("every contained failure is still reported, at a level somebody sees", () =
     "a null rejection must not rethrow from the catch that contains it",
   );
 });
+
+test("an app run closed before it reached finishing is moved there after the lost-lease reaper and before the requeue, in one tick", async () => {
+  // The requeue hands a finish to a live Brain only for a run in `finishing`. The pass that
+  // moves a run its holder never got that far must run before it, or the run waits a whole
+  // tick; and after the reaper, which closes the tasks whose holder is gone.
+  const seen = stubDb();
+  db.lockPool.connect = (async () => ({
+    query: async () => ({ rows: [{ ok: false }] }),
+    release: () => {},
+  })) as unknown as typeof db.lockPool.connect;
+
+  await sweeperTick();
+
+  const at = (pattern: RegExp, name: string): number => {
+    const i = seen.findIndex((sql) => pattern.test(sql));
+    assert.ok(i >= 0, `${name} ran`);
+    return i;
+  };
+  const reaper = at(/its worker went away before confirming the stop/, "the lost-lease reaper");
+  const moved = at(/UPDATE claw_app_runs r SET state = 'finishing'/, "the pass that moves an abandoned run to finishing");
+  const requeue = at(/jsonb_build_object\('app_finish_prior'/, "the finishing requeue");
+  assert.ok(reaper < moved && moved < requeue, `order: reaper ${reaper}, moved ${moved}, requeue ${requeue}`);
+});
