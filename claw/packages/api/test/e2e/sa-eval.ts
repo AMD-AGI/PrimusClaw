@@ -17,6 +17,7 @@
  *   EVAL_MODE=baseline EVAL_PLUGIN_ID=<id> EVAL_CLAW=... EVAL_KEY_FILE=... npx tsx test/e2e/sa-eval.ts
  *
  *   EVAL_DRY_RUN=1 npx tsx test/e2e/sa-eval.ts                                  # load, check and plan: nothing is sent
+ *   EVAL_STATIC=1 npx tsx test/e2e/sa-eval.ts                                   # what cases ask for against what their arm can do
  *   EVAL_OFFLINE=<dir>/assistant-recordings.jsonl npx tsx test/e2e/sa-eval.ts    # grade recorded attempts again, offline
  *
  * A live run requires EVAL_CLAW (the API root, to which `/v1/...` is appended), the key as EVAL_KEY or EVAL_KEY_FILE
@@ -43,6 +44,18 @@
  *   EVAL_JUDGE_URL, EVAL_JUDGE_MODEL, EVAL_JUDGE_KEY_FILE
  *                     an Anthropic-compatible gateway, a model and its key: each case with a rubric or a judge-only fact
  *                     is also graded by that model, recorded beside the deterministic verdict and never instead of it.
+ *   EVAL_VARS_FILE    a JSON object of run variables for `{{name}}` placeholders (nested objects give `{{a.b}}`); EVAL_VAR_<NAME>
+ *                     sets one too. A case whose placeholders have no value is skipped and says which.
+ *   EVAL_GITHUB_TOKEN_FILE, EVAL_GITHUB_API
+ *                     the eval identity's GitHub token and API root (default https://api.github.com) for `gh:` oracles
+ *   EVAL_ORACLE_PLUGIN_ID
+ *                     the plugin whose MCP servers `mcp:` oracles read (default EVAL_PLUGIN_ID); only tools on the router's list
+ *                     of reads are ever called, so an oracle cannot write
+ *
+ * EVAL_STATIC reports, without sending anything, every case that can never pass on its arm (a tools_must no tool of the arm
+ * matches: the router's from `assistant/read-tools.ts`, the worker's every plugin server, given as EVAL_STATIC_SERVERS or the
+ * router's servers plus github and schedules), every case that needs the assistant and still runs in baseline, and every
+ * description written as a value; exit 1 when there is one. EVAL_OUT gets static.json.
  *
  * The assistant mode works in the key owner's one assistant conversation (it must be a test identity, see above). It
  * runs the cases one at a time, waits for the assistant to be idle before each, and cleans up what it started: every
@@ -57,13 +70,16 @@ import { fileURLToPath } from "node:url";
 
 import { apiClient, until } from "./assistant-p1-lib.js";
 import { traceOf, type EventRow, type ToolCall } from "./agent-eval-lib.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
-  apiQuery, caseHash, caseSays, cardsOf, cleanupOf, finalSay, grade, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal,
-  itemsStartedBy, loadCases, parseRecordings, pick, planOf, renderTable, routeOf, saysOf, verdictOf, scrub as scrubWith, select, sseFrames,
-  toolPattern, totals, turnCalls, turnEnded, turnsOf,
-  type Attempt, type CaseResult, type EvalCase, type HoldSeen, type HoldSpec, type ItemSeen, type LiveEvent, type Mode, type Observed,
-  type Recording, type Turn,
+  BUILTIN_TOOLS, caseHash, caseSays, cardsOf, cleanupOf, filledCase, finalSay, grade, forRecording, identityRefusal, itemsStartedBy, judgePrompt,
+  loadCases, missingVars, needsJudge, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf, saysOf, staticFindings,
+  verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest, holdAnswers, toolPattern,
+  type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery, type Recording,
+  type Turn, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
+import * as readTools from "../../src/assistant/read-tools.js";
 
 const need = (name: string): string => {
   const v = process.env[name];
@@ -79,8 +95,9 @@ const int = (name: string, fallback: number, min: number, max: number): number =
 const list = (name: string): Set<string> => new Set((process.env[name] || "").split(",").map((s) => s.trim()).filter(Boolean));
 
 const DRY_RUN = process.env.EVAL_DRY_RUN === "1";
+const STATIC = process.env.EVAL_STATIC === "1";
 const OFFLINE = process.env.EVAL_OFFLINE;
-const LIVE = !DRY_RUN && !OFFLINE;
+const LIVE = !DRY_RUN && !STATIC && !OFFLINE;
 const CLAW = LIVE ? need("EVAL_CLAW").replace(/\/+$/, "") : "";
 const MODE = (process.env.EVAL_MODE || "assistant") as Mode;
 if (MODE !== "assistant" && MODE !== "baseline") { console.error("EVAL_MODE must be assistant or baseline"); process.exit(2); }
@@ -111,7 +128,23 @@ const log = (...a: unknown[]): void => console.log(iso(), ...a.map((x) => (typeo
 const recordings: Recording[] = [];
 const sessionsLeft: string[] = [];   // baseline sessions the run made and could not delete: they fail the run
 /** Checks whose detail quotes what the identity was shown: kept only with EVAL_KEEP_TEXT. */
-const TEXT_DETAIL = /^(no internal text|items named by title)/;
+const TEXT_DETAIL = /^(no internal text|items named by title|no false denial)/;
+
+/** The run's variables: the environment (`{NAME}`) and EVAL_VARS_FILE (`{{name}}`, nested objects as `{{a.b}}`). */
+function runVars(): Vars {
+  const out: Record<string, string | undefined> = { ...process.env };
+  const file = process.env.EVAL_VARS_FILE;
+  if (!file) return out;
+  const flat = (o: unknown, at: string): void => {
+    if (o !== null && typeof o === "object" && !Array.isArray(o)) for (const [k, v] of Object.entries(o)) flat(v, at ? `${at}.${k}` : k);
+    else if (at && o !== null && o !== undefined) out[at] = String(o);
+  };
+  flat(JSON.parse(readFileSync(file, "utf8")), "");
+  return out;
+}
+const VARS = runVars();
+/** The router's reads as allow-list entries: the only MCP tools an `mcp:` oracle may call. */
+const ROUTER_READS = Object.keys(readTools.ROUTER_READ_TOOLS).flatMap((s) => readTools.readToolPatterns(s));
 const RUN_ITEMS = new Set<string>();   // ids of the items the run's own turns started: the only items it ever closes
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -207,30 +240,75 @@ async function idle(sessionId: string, waitMs: number): Promise<boolean> {
   }, Date.now() + waitMs, 2_000)) === true;
 }
 
-/** The values each fact expects, read now: an `api` oracle through the same API with the eval identity. */
+/** The values each fact expects, read now with the eval identity: the Claw API, GitHub, or a read tool of the plugin. */
 async function factValues(c: EvalCase): Promise<Array<string[] | null>> {
   const out: Array<string[] | null> = [];
   for (const f of c.facts ?? []) {
     const o = f.oracle;
-    const q = apiQuery(o);
-    if (q) {
-      const r = await api("GET", q.path).catch(() => null);
-      out.push(r?.status === 200 ? pick(r.json, q.at) : []);   // an oracle that could not be read expects something unnamed: a failure
-    } else out.push(o && o.kind !== "api" && o.value !== undefined ? [o.value] : null);
+    const q = oracleQuery(o);
+    // An oracle that could not be read expects something unnamed: the fact fails, it is never skipped.
+    if (q) out.push(await readOracle(q).catch(() => []));
+    else out.push(o && o.kind !== "api" && o.value !== undefined ? [o.value] : null);
   }
   return out;
+}
+
+async function readOracle(q: OracleQuery): Promise<string[]> {
+  if (q.via === "claw") {
+    const r = await api("GET", q.path);
+    return r.status === 200 ? pick(r.json, q.at) : [];
+  }
+  if (q.via === "github") {
+    const tokenFile = process.env.EVAL_GITHUB_TOKEN_FILE;
+    const token = tokenFile ? readFileSync(tokenFile, "utf8").trim() : "";
+    const root = (process.env.EVAL_GITHUB_API || "https://api.github.com").replace(/\/+$/, "");
+    const res = await fetch(`${root}${q.path}`, {
+      headers: { accept: "application/vnd.github+json", ...(token ? { authorization: `Bearer ${token}` } : {}) }, signal: AbortSignal.timeout(30_000),
+    });
+    return res.status === 200 ? pick(await res.json(), q.at) : [];
+  }
+  if (!oracleMayRun(q, ROUTER_READS)) throw new Error(`mcp:${q.server}/${q.tool} is not one of the router's reads`);
+  const client = await mcpClient(q.server);
+  const r = await client.callTool({ name: q.tool, arguments: q.args }) as { content?: Array<{ type: string; text?: string }>; isError?: boolean };
+  const text = r.content?.find((x) => x.type === "text")?.text ?? "";
+  if (r.isError) return [];
+  let json: unknown = text;
+  try { json = JSON.parse(text); } catch { /* a plain-text answer: picked as it is */ }
+  return pick(json, q.at);
+}
+
+const mcpClients = new Map<string, Promise<Client>>();
+/** A client of one of the oracle plugin's MCP servers, as Brain connects to it, with the eval identity's key. */
+function mcpClient(server: string): Promise<Client> {
+  let c = mcpClients.get(server);
+  if (!c) {
+    c = (async () => {
+      const id = process.env.EVAL_ORACLE_PLUGIN_ID || process.env.EVAL_PLUGIN_ID;
+      if (!id) throw new Error("mcp: oracles need EVAL_ORACLE_PLUGIN_ID");
+      const r = await api("GET", `/v1/plugins/${encodeURIComponent(id)}`);
+      const specs = ((r.json?.data?.tools ?? []) as Array<{ type?: string; config?: { mcpServers?: Record<string, Record<string, unknown>> } }>)
+        .filter((t) => String(t.type).toLowerCase() === "mcp").map((t) => t.config?.mcpServers?.[server]).filter(Boolean);
+      const spec = specs[0];
+      if (!spec || typeof spec.url !== "string") throw new Error(`plugin ${id} has no MCP server ${server}`);
+      const fill = (v: unknown): string => String(v).split("<SAFE_API_KEY>").join(KEY);
+      const headers: Record<string, string> = Object.fromEntries(Object.entries((spec.headers as Record<string, unknown>) ?? {}).map(([k, v]) => [k, fill(v)]));
+      headers.authorization = `Bearer ${typeof spec.token === "string" && spec.token ? fill(spec.token) : KEY}`;
+      const client = new Client({ name: "sa-eval-oracle", version: "1.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(spec.url), { requestInit: { headers } }));
+      return client;
+    })();
+    mcpClients.set(server, c);
+  }
+  return c;
 }
 
 // --- The optional judge ---------------------------------------------------------------------------------------------
 
 async function judge(c: EvalCase, turns: Turn[], final: string): Promise<{ pass: boolean; why: string } | null> {
   const url = process.env.EVAL_JUDGE_URL, model = process.env.EVAL_JUDGE_MODEL, keyFile = process.env.EVAL_JUDGE_KEY_FILE;
-  const claims = (c.facts ?? []).filter((f) => !f.oracle).map((f) => f.claim);
-  if (!url || !model || !keyFile || (!c.rubric && !claims.length)) return null;
+  if (!url || !model || !keyFile || !needsJudge(c)) return null;
   const key = readFileSync(keyFile, "utf8").trim();
-  const prompt = `You grade one reply of an assistant to a user.\nUser said:\n${turns.map((t) => t.user).join("\n")}\n\n`
-    + `Assistant's final reply:\n${final}\n\n${c.rubric ? `Rubric: ${c.rubric}\n` : ""}${claims.length ? `The reply must state: ${claims.join("; ")}\n` : ""}`
-    + "\nAnswer with one line: PASS or FAIL, a colon, and one short reason.";
+  const prompt = judgePrompt(c, turns, final);
   try {
     const res = await fetch(`${url.replace(/\/+$/, "")}/v1/messages`, {
       method: "POST", signal: AbortSignal.timeout(60_000),
@@ -460,9 +538,10 @@ async function main(): Promise<void> {
   if (!cases.length) { console.error("no case selected"); process.exit(2); }
   if (DRY_RUN) {
     console.log(`dry run: mode=${MODE} k=${K} cases=${cases.length} from ${CASES_DIR}; nothing is sent`);
-    for (const line of planOf(cases, MODE, process.env)) console.log(line);
+    for (const line of planOf(cases, MODE, VARS)) console.log(line);
     process.exit(loaded.bad.length ? 1 : 0);
   }
+  if (STATIC) staticCheck(cases, loaded.bad);
   if (OFFLINE) return offline(cases, OFFLINE);
   // Before anything is said to anybody's assistant: whose key this is, and whether a channel would carry the run to a person.
   const me = await api("GET", "/v1/me");
@@ -493,13 +572,15 @@ async function main(): Promise<void> {
     for (const c of cases) {
       const r: CaseResult = { id: c.id, area: c.area, pipeline: c.pipeline, mode: MODE, hash: c.source?.hash ?? caseHash(c), attempts: [] };
       results.push(r);
-      const turns = turnsOf(c, process.env);
       if (c.modes && !c.modes.includes(MODE)) { r.skipped = `${c.modes.join(",")} only`; continue; }
-      if (turns === null) { r.skipped = `needs ${c.needs}`; continue; }
+      // Placeholders filled everywhere they sit: turns, claims, values, oracle queries and the rubric.
+      const filled = filledCase(c, VARS);
+      if (filled === null) { r.skipped = `needs ${missingVars(c, VARS).join(", ")}`; continue; }
+      const turns = filled.turns;
       for (let k = 0; k < K; k++) {
         let a: Attempt;
         try {
-          a = MODE === "assistant" ? await runAssistant(c, turns, sessionId, stream!) : await runBaseline(c, turns);
+          a = MODE === "assistant" ? await runAssistant(filled, turns, sessionId, stream!) : await runBaseline(filled, turns);
         } catch (err) {
           a = { pass: false, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: null, finalMs: null, items: [], error: scrub(err instanceof Error ? err.message : String(err)) };
         }
@@ -545,12 +626,37 @@ async function main(): Promise<void> {
   report(results, cases.length, leftOpen, cleanupFailed);
 }
 
+/**
+ * The arms' tools from the code that gives them (`assistant/read-tools.ts`, and the GitHub and web lookups where a version of it
+ * has them), and every case's findings against them. Nothing is sent.
+ */
+function staticCheck(cases: readonly EvalCase[], bad: readonly string[]): never {
+  const m = readTools as Record<string, unknown>;
+  const github = Array.isArray(m.ROUTER_GITHUB_READ_TOOLS) ? (m.ROUTER_GITHUB_READ_TOOLS as string[]).map((t) => `mcp__github__${t}`) : [];
+  const web = Array.isArray(m.ROUTER_WEB_TOOLS) ? (m.ROUTER_WEB_TOOLS as string[]) : [];
+  const servers = (process.env.EVAL_STATIC_SERVERS || [...Object.keys(readTools.ROUTER_READ_TOOLS), "github", "schedules"].join(","))
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  const worker = [...servers.map((s) => `mcp__${s}__*`), BUILTIN_TOOLS];
+  const arms: Arms = { router: ["mcp__assistant__*", ...ROUTER_READS, ...github, ...web], worker, baseline: worker };
+  const found = staticFindings(cases, arms, VARS);
+  const count = (xs: Array<{ kind: string }>) => xs.reduce<Record<string, number>>((n, x) => ({ ...n, [x.kind]: (n[x.kind] ?? 0) + 1 }), {});
+  for (const p of found.problems) console.log(`PROBLEM ${p.id} ${p.kind}: ${p.detail}`);
+  const summary = { cases: cases.length, not_loaded: bad.length, problems: count(found.problems), notes: count(found.notes), router_servers: Object.keys(readTools.ROUTER_READ_TOOLS),
+    router_github: github.length > 0, router_web: web.length > 0, worker_servers: servers };
+  console.log(JSON.stringify(summary));
+  if (OUT) {
+    mkdirSync(OUT, { recursive: true });
+    writeFileSync(join(OUT, "static.json"), JSON.stringify({ ...summary, problems: found.problems, notes: found.notes }, null, 1));
+  }
+  process.exit(found.problems.length || bad.length ? 1 : 0);
+}
+
 /** Grade recorded attempts again with the current cases and grader: no key, no request. */
 function offline(cases: readonly EvalCase[], file: string): void {
   const byId = new Map(cases.map((c) => [c.id, c]));
   const results = new Map<string, CaseResult>();
   for (const rec of parseRecordings(readFileSync(file, "utf8"))) {
-    const c = byId.get(rec.case_id);
+    const c = byId.get(rec.case_id) && filledCase(byId.get(rec.case_id)!, VARS);
     if (!c) continue;
     const r = results.get(c.id) ?? { id: c.id, area: c.area, pipeline: c.pipeline, mode: rec.mode, hash: c.source?.hash ?? caseHash(c), attempts: [] };
     results.set(c.id, r);

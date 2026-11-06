@@ -20,8 +20,16 @@
  *   S11 the identity gate: no acknowledgement, a wrong one, a denied identity or an enabled subscription refuses the run
  *   S13 content only a judge can grade is never a pass without a judge; a judge's FAIL fails it; recordings drop oracle values
  *   S12 the last turn: the items a turn started are read from its own calls' answers; a dry-run plan; recordings parse
- *   S14 a request an item holds for its person: the case says how to answer it; held, on time, answered, waited, and how the
+ *   S22 a request an item holds for its person: the case says how to answer it; held, on time, answered, waited, and how the
  *       call ended are each graded, and a baseline skips them; read off the worker's events
+ *   S14 placeholders: `{NAME}` and `{{a.b}}`, several in one case, filled in turns, claims, values, oracle queries and the rubric;
+ *       a case with one unfilled is skipped and names every one missing
+ *   S15 oracles: Claw API, GitHub and MCP reads are runnable (an MCP one only for a router read); a description is graded by the
+ *       judge, which is shown it, so a case with no rubric is no longer unjudged for good
+ *   S16 no false denial: the assistant saying it cannot reach something, with no failed call, fails any case; after a failed
+ *       call, in a case that may refuse, or said of a system rather than of itself, it does not
+ *   S17 the static check: a tools_must no tool of the arm matches is reported (the router without GitHub: "my open PRs"),
+ *       unless blocked; an assistant-only case that runs in baseline; a description written as a value; the seed set is clean
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -31,7 +39,10 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import type { ToolCall } from "./e2e/agent-eval-lib.js";
+import * as readTools from "../src/assistant/read-tools.js";
 import {
+  BUILTIN_TOOLS, CAPABILITY_DENIAL, fill, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
+  type Arms,
   apiQuery, caseSays, cardsOf, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
 } from "./e2e/sa-eval-lib.js";
@@ -271,7 +282,7 @@ test("S13 judge-only content and recordings", () => {
   assert.equal(totals([r]).all!.passAllK, 0);
 });
 
-test("S14 a request an item holds for its person", () => {
+test("S22 a request an item holds for its person", () => {
   const bad = (hold: unknown) => parseCases(JSON.stringify({ id: "h", turns: [{ user: "q" }], hold }), "f").bad;
   assert.deepEqual(bad({ tool: "mcp__safe__workload_stop", decide: "allow" }), []);
   assert.match(bad({ decide: "allow" })[0]!, /hold without a tool/);
@@ -310,4 +321,119 @@ test("S14 a request an item holds for its person", () => {
   assert.equal(heldCallRan(denied, "tu-1"), false);
   assert.deepEqual(holdAnswers({ tool: "ask_user_question", decide: "answer", answers: { "*": "" } }, heldRequest(rows, "tu-q")?.questions), { q1: "mi355x" });
   assert.deepEqual(holdAnswers({ tool: "ask_user_question", decide: "answer", answers: { q1: "mi300x" } }, null), { q1: "mi300x" });
+});
+
+test("S14 placeholders, several to a case", () => {
+  const vars = { repo: "o/r", "user.gh": "octo", EVAL_GH_LOGIN: "octo", EVAL_VAR_PR_A: "12" };
+  assert.deepEqual(placeholdersOf("{{repo}} {{ user.gh }} {EVAL_GH_LOGIN} {notone} {{repo}}"), ["repo", "user.gh", "EVAL_GH_LOGIN"]);
+  assert.equal(fill("{{repo}}#{{pr_a}} by {{user.gh}} / {EVAL_GH_LOGIN} / {{missing}}", vars), "o/r#12 by octo / octo / {{missing}}");
+  const c = caseOf({
+    turns: [{ user: "看一下 {{repo}} 我还有哪些没合的 PR" }], rubric: "lists {{user.gh}}'s PRs",
+    facts: [{ claim: "PRs of {{user.gh}}", oracle: { kind: "api", query: "gh:/search/issues?q=is:pr+author:{{user.gh}}+repo:{{repo}}#items.*.number" } },
+      { claim: "the PR", oracle: { kind: "static", value: "{{pr_a}}" } }],
+  });
+  assert.deepEqual(missingVars(c, {}), ["pr_a", "repo", "user.gh"], "every missing one, not the first");
+  assert.equal(filledCase(c, {}), null);
+  assert.equal(turnsOf(c, { repo: "o/r" }), null);
+  const f = filledCase(c, vars)!;
+  assert.equal(f.turns[0]!.user, "看一下 o/r 我还有哪些没合的 PR");
+  assert.equal(f.rubric, "lists octo's PRs");
+  assert.equal(f.facts![0]!.oracle!.query, "gh:/search/issues?q=is:pr+author:octo+repo:o/r#items.*.number");
+  assert.equal(f.facts![1]!.oracle!.value, "12", "EVAL_VAR_<NAME> fills {{name}}");
+  // `needs`: one or several, environment or run variables.
+  assert.deepEqual(missingVars(caseOf({ needs: ["EVAL_X", "repo"] }), { repo: "a" }), ["EVAL_X"]);
+  assert.deepEqual(missingVars(caseOf({ needs: "EVAL_X" }), { EVAL_X: "1" }), []);
+  assert.match(planOf([c], "assistant", {})[0]!, /skip \(needs pr_a, repo, user\.gh\)/);
+  assert.match(planOf([c], "assistant", vars)[0]!, /facts=github,value/);
+});
+
+test("S15 runnable oracles, and what the judge is shown", () => {
+  assert.deepEqual(oracleQuery({ kind: "api", query: "/v1/me#name" }), { via: "claw", path: "/v1/me", at: "name" });
+  assert.deepEqual(oracleQuery({ kind: "api", query: "gh:/search/issues?q=is:pr+is:open#total_count" }), { via: "github", path: "/search/issues?q=is:pr+is:open", at: "total_count" });
+  assert.deepEqual(oracleQuery({ kind: "api", query: "mcp:safe/node_get?name=n1&limit=3&ready=true#phase" }),
+    { via: "mcp", server: "safe", tool: "node_get", args: { name: "n1", limit: 3, ready: true }, at: "phase" });
+  assert.deepEqual(oracleQuery({ kind: "api", query: "mcp:safe/opsjob_list#0.phase" }), { via: "mcp", server: "safe", tool: "opsjob_list", args: {}, at: "0.phase" });
+  assert.equal(oracleQuery({ kind: "api", query: "gh:/search/issues?q=author:{{user.gh}}#total_count" }), null, "an unfilled placeholder is not run");
+  assert.equal(oracleQuery({ kind: "api", query: "github search is:pr is:open author:me -> numbers" }), null);
+  assert.equal(oracleQuery({ kind: "static", value: "1" }), null);
+  // An MCP oracle runs only a tool the router may read.
+  const reads = ["mcp__safe__node_get", "mcp__autopilot__get_*"];
+  assert.ok(oracleMayRun(oracleQuery({ kind: "api", query: "mcp:safe/node_get?name=n#x" })!, reads));
+  assert.ok(oracleMayRun(oracleQuery({ kind: "api", query: "mcp:autopilot/get_status#x" })!, reads));
+  assert.ok(!oracleMayRun(oracleQuery({ kind: "api", query: "mcp:safe/workload_delete?id=w#x" })!, reads));
+  assert.ok(oracleMayRun(oracleQuery({ kind: "api", query: "/v1/me#x" })!, []));
+  // A described read is the judge's: it is shown the claim and the description. Before, such a fact without a rubric was never judged.
+  const described = caseOf({ facts: [{ claim: "covers every open PR", oracle: { kind: "api", query: "github search is:pr is:open author:me -> numbers" } }] });
+  assert.equal(needsJudge(described), true);
+  assert.deepEqual(judgeFacts(described), ["covers every open PR (checked against: github search is:pr is:open author:me -> numbers)"]);
+  const prompt = judgePrompt(described, [{ user: "我有几个开着的 PR" }], "3 个");
+  assert.match(prompt, /The reply must state: covers every open PR \(checked against: github search/);
+  assert.match(prompt, /Always: The reply must not say that it cannot reach or do something/);
+  assert.doesNotMatch(judgePrompt(caseOf({ may_deny: true, rubric: "refuses" }), [{ user: "rm -rf /" }], "no"), /Always:/);
+  assert.equal(needsJudge(caseOf({ facts: [{ claim: "n", oracle: { kind: "api", query: "gh:/x#y" } }] })), false, "a runnable oracle needs no judge");
+  // Offline, a GitHub or MCP oracle was not read either: unverified, never a pass.
+  const gh = caseOf({ facts: [{ claim: "n", oracle: { kind: "api", query: "gh:/x#y" } }] });
+  assert.deepEqual(verdictOf(gh, grade(gh, observed({ factValues: [null] })), null), { pass: false, unjudged: true });
+  assert.deepEqual(forRecording(gh, observed({ factValues: [["42"]] })).factValues, [null], "an oracle's value is not recorded");
+});
+
+test("S16 no false denial of a capability", () => {
+  const c = caseOf({ route: "answer" });
+  const denied = (final: string, calls: ToolCall[] = [], over: Partial<EvalCase> = {}) =>
+    failed(caseOf({ ...c, ...over }), observed({ final, calls })).includes("no false denial");
+  for (const text of ["我读不了 GitHub，没法看你的 PR。", "抱歉，我无法访问 GitHub。", "我这边没有 GitHub 的工具。", "我目前不能联网。", "我没有权限查看这个 workspace",
+    "I can't access GitHub from here.", "I don't have access to the internet.", "I'm unable to browse the web.", "I have no tools for that."]) {
+    assert.ok(denied(text), text);
+    assert.ok(CAPABILITY_DENIAL.test(text), text);
+  }
+  // Said after a call of the turn failed, it may be true; in a case where refusing is right, it is not this failure.
+  assert.ok(!denied("我无法访问 GitHub：令牌被拒绝了。", [call("mcp__github__issue_search", false)]));
+  assert.ok(!denied("我不能读取 ~/.ssh 下的文件。", [], { may_deny: true }));
+  // A fact about a system, or "found nothing", is not a denial.
+  for (const text of ["node-7 无法访问，已经离线 2 小时。", "没有找到失败的运行。", "我查到 3 个开着的 PR。", "I don't see any failed runs today.", "The node cannot reach the registry."]) {
+    assert.ok(!denied(text), text);
+  }
+  const check = grade(c, observed({ final: "我读不了 GitHub" })).find((x) => x.name === "no false denial");
+  assert.equal(check?.detail, "我读不了");
+});
+
+test("S17 the static check", () => {
+  // The router as on main before it could look up GitHub (67eede4): its own tools and the plugin servers' reads.
+  const router = ["mcp__assistant__*", ...Object.keys(readTools.ROUTER_READ_TOOLS).flatMap((s) => readTools.readToolPatterns(s)).filter((p) => !p.startsWith("mcp__github__"))];
+  const worker = ["mcp__safe__*", "mcp__autopilot__*", "mcp__github__*", BUILTIN_TOOLS];
+  const arms: Arms = { router, worker, baseline: worker };
+  assert.ok(reachable("mcp__safe__workload_list", router));
+  assert.ok(reachable("mcp__autopilot__get_*", router));
+  assert.ok(!reachable("mcp__github*", router));
+  assert.ok(!reachable("mcp__safe__workload_logs|mcp__safe__workload_pod_logs", router));
+  assert.ok(reachable("mcp__github*", worker));
+  assert.ok(reachable("web_search|bash", worker), "Brain's own tools");
+  assert.ok(!reachable("mcp__pulse__*", worker));
+  assert.ok(reachable("mcp__*__get_*", ["mcp__autopilot__get_*"]) && reachable("mcp__autopilot__*", ["mcp__autopilot__get_status"]));
+  assert.ok(!reachable("mcp__assistant__work_create", worker));
+  // "我还有哪些没合的 PR" (real-github-ro-079): an answer that only GitHub can give, asked of a router without GitHub.
+  const mine = caseOf({ id: "gh-079", route: "answer", tools_must: ["mcp__github*"], modes: ["assistant"] });
+  assert.deepEqual(staticFindings([mine], arms).problems, [{ id: "gh-079", kind: "unreachable", detail: "mcp__github* on router" }]);
+  assert.deepEqual(staticFindings([mine], { ...arms, router: [...router, "mcp__github__issue_search"] }).problems, [], "reachable once the router has it");
+  assert.deepEqual(staticFindings([{ ...mine, route: "item" }], arms).problems, [], "an item's worker has GitHub");
+  const blocked = staticFindings([{ ...mine, blocked: "no GitHub lookups yet" }], arms);
+  assert.deepEqual(blocked.problems, []);
+  assert.deepEqual(blocked.notes.map((n) => n.kind), ["blocked"]);
+  // Needs the assistant's own tools but runs in both modes: set modes ["assistant"].
+  const start = caseOf({ id: "w", route: "item", tools_must: ["mcp__assistant__work_create"] });
+  assert.deepEqual(staticFindings([start], arms).problems.map((p) => p.kind), ["assistant-only"]);
+  assert.deepEqual(staticFindings([{ ...start, modes: ["assistant"] }], arms).problems, []);
+  // A description written as a value can never be found in an answer: it belongs in the rubric.
+  const desc = caseOf({ id: "d", facts: [{ claim: "asks", oracle: { kind: "static", value: "asks repo + PR number" } }, { claim: "n", oracle: { kind: "static", value: "25" } },
+    { claim: "x", oracle: { kind: "fixture", value: "no tool call" } }, { claim: "name", oracle: { kind: "static", value: "global-control-plane" } }] });
+  assert.deepEqual(staticFindings([desc], arms).problems.map((p) => `${p.kind} ${p.detail}`), ["descriptive-value asks", "descriptive-value x"]);
+  const judged = staticFindings([caseOf({ id: "j", facts: [{ claim: "c", oracle: { kind: "api", query: "claw_work_items count" } }, { claim: "g", oracle: { kind: "api", query: "gh:/x/{{repo}}#y" } }] })], arms);
+  assert.deepEqual(judged.notes.map((n) => `${n.kind} ${n.detail}`), ["judge-only c", "needs-vars repo"]);
+  // The seed set, against this version's own router: nothing that can never pass.
+  const { cases } = loadCases(SEED_DIR);
+  const m = readTools as Record<string, unknown>;
+  const ownRouter = [...router, ...(Array.isArray(m.ROUTER_GITHUB_READ_TOOLS) ? (m.ROUTER_GITHUB_READ_TOOLS as string[]).map((t) => `mcp__github__${t}`) : []),
+    ...(Array.isArray(m.ROUTER_WEB_TOOLS) ? (m.ROUTER_WEB_TOOLS as string[]) : [])];
+  const seedWorker = ["autopilot", "safe", "dispatron", "pulse", "agent-board", "github", "schedules"].map((s) => `mcp__${s}__*`).concat(BUILTIN_TOOLS);
+  assert.deepEqual(staticFindings(cases, { router: ownRouter, worker: seedWorker, baseline: seedWorker }).problems, []);
 });

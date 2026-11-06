@@ -18,20 +18,33 @@
  *   tools_must       tool names the last turn must each call; `*` matches anything, `a|b` either
  *   tools_must_not   tool names the last turn must not call (read-only questions list work_create)
  *   facts            [{claim, oracle: {kind: static|api|fixture, value?, query?}}]; the final answer must name the value.
- *                    An `api` oracle is a Claw API GET run with the eval identity at run time, `<path>#<pick>`, e.g.
- *                    `/v1/work-items?state=in_progress#data.length` or `/v1/me#name`; a fact without a value or a
- *                    query (or with a query that is not of that form) is for the judge only.
+ *                    An `api` oracle is read at run time with the eval identity, in one of three forms (`oracleQuery`):
+ *                      `/v1/...#<pick>`                a Claw API GET, e.g. `/v1/work-items?state=in_progress#data.length`
+ *                      `gh:/...#<pick>`                a GitHub REST GET, e.g. `gh:/search/issues?q=is:pr+author:{EVAL_GH_LOGIN}#total_count`
+ *                      `mcp:<server>/<tool>?k=v#<pick>` a read tool of the plugin's MCP server, e.g. `mcp:safe/node_get?name=n1#phase`
+ *                    A static or fixture value is a value to find in the answer (a number, a name); a description of what
+ *                    the answer should say belongs in the rubric. A fact without a value or a runnable query is graded by the
+ *                    judge, with the oracle's text as what it is checked against.
  *   cards            none | accept | confirm                            what the user may be shown to press in the last turn
  *   style            {reply_lang: follow_user, max_chars, no_ids}
  *   latency_budget_s {first, final, each}                               seconds from the last turn's sending (each: per turn)
  *   source           {kind: real|synthetic|public, hash, ref}
  *   notes            why the case exists
  * and, for this runner only (all optional): `rubric` (what a judge model grades, `EVAL_JUDGE_*`), `modes` (the modes the
- * case runs in, default both), `needs` (an environment variable whose value fills `{NAME}` in the turns; skipped
- * without it), `item_wait_s` (how long to wait for an item's result), `items_closed` (every item the case started
- * is closed when it is graded: an interrupt that stopped it), `hold` (assistant mode: the case's item holds a request
- * for its person, a write to approve or a question, and the runner answers it as the person's channel does, see
- * {@link HoldSpec}).
+ * case runs in, default both: a case that needs the assistant's own tools or items says `["assistant"]`), `needs` (one or
+ * more variables it needs besides those its text names), `item_wait_s` (how long to wait for an item's result),
+ * `items_closed` (every item the case started is closed when it is graded: an interrupt that stopped it), `blocked` (why
+ * a tool the case must call cannot be reached on its arm yet: the static check reports it instead of failing on it),
+ * `may_deny` (saying it cannot do something is a right answer here: a refusal of an unsafe request),
+ * `hold` (assistant mode: the case's item holds a request for its person, a write to approve or a question, and the
+ * runner answers it as the person's channel does, see {@link HoldSpec}).
+ *
+ * Placeholders fill turns, claims, values, oracle queries and the rubric: `{NAME}` is an environment variable, `{{name}}`
+ * (also `{{a.b}}`) a run variable from EVAL_VARS_FILE or EVAL_VAR_<NAME>. A case with a placeholder that has no value
+ * is skipped, and says which.
+ *
+ * Every case is also held to one rule (`CAPABILITY_DENIAL`, and the judge's prompt): the answer must not say it cannot reach
+ * or do something it has a tool for, unless it tried and the tool failed.
  *
  * route, tools, cards, the final answer and its latency are the LAST turn's: earlier turns are context and may start
  * items of their own. Leaks are looked for in everything the case showed, and `items_closed` covers every item.
@@ -73,9 +86,11 @@ export interface EvalCase {
   variant_of?: string;
   rubric?: string;
   modes?: Mode[];
-  needs?: string;
+  needs?: string | string[];
   item_wait_s?: number;
   items_closed?: boolean;
+  blocked?: string;
+  may_deny?: boolean;
   hold?: HoldSpec;
 }
 
@@ -223,10 +238,59 @@ export function select<T extends EvalCase & { dir?: string }>(cases: readonly T[
     && (!dirs.size || dirs.has(c.dir ?? c.pipeline)) && (variants || !c.variant_of));
 }
 
-/** The case's turns with `{NAME}` filled from `env`; null when the case needs a variable that is not set. */
-export function turnsOf(c: EvalCase, env: Record<string, string | undefined>): Turn[] | null {
-  if (c.needs && !env[c.needs]) return null;
-  return c.turns.map((t) => ({ ...t, user: t.user.replace(/\{([A-Z_]+)\}/g, (all, name: string) => env[name] ?? all) }));
+/** Where placeholders come from: environment variables (`{NAME}`) and run variables (`{{name}}`, or EVAL_VAR_<NAME>). */
+export type Vars = Readonly<Record<string, string | undefined>>;
+
+/** `{{name}}` (group 1) or `{NAME}` (group 2). A placeholder's name, as `needs` and a skip say it, is `repo` for `{{repo}}`. */
+const PLACEHOLDER = /\{\{\s*([A-Za-z][\w.-]*)\s*\}\}|\{([A-Z][A-Z0-9_]*)\}/g;
+const HAS_PLACEHOLDER = new RegExp(PLACEHOLDER.source);
+const envName = (name: string): string => `EVAL_VAR_${name.toUpperCase().replace(/[.-]/g, "_")}`;
+const valueOf = (vars: Vars, name: string, run: boolean): string | undefined => {
+  const v = run ? (vars[name] ?? vars[envName(name)]) : vars[name];
+  return v === undefined || v === "" ? undefined : v;
+};
+
+/** The placeholders a text names. */
+export function placeholdersOf(text: string): string[] {
+  return [...new Set([...text.matchAll(PLACEHOLDER)].map((m) => m[1] ?? m[2]!))];
+}
+
+/** The text with every placeholder that has a value filled; one without a value is left as written. */
+export function fill(text: string, vars: Vars): string {
+  return text.replace(PLACEHOLDER, (all, run: string | undefined, env: string | undefined) => valueOf(vars, run ?? env!, run !== undefined) ?? all);
+}
+
+/** Every text of a case a placeholder can sit in. */
+const textsOf = (c: EvalCase): string[] => [
+  ...c.turns.map((t) => t.user), c.rubric ?? "",
+  ...(c.facts ?? []).flatMap((f) => [f.claim, f.oracle?.value ?? "", f.oracle?.query ?? ""]),
+];
+
+/** The variables a case needs that have no value, sorted: its placeholders and its `needs`. */
+export function missingVars(c: EvalCase, vars: Vars): string[] {
+  const out = new Set<string>();
+  for (const t of textsOf(c)) {
+    for (const m of t.matchAll(PLACEHOLDER)) if (valueOf(vars, m[1] ?? m[2]!, m[1] !== undefined) === undefined) out.add(m[1] ?? m[2]!);
+  }
+  for (const n of [c.needs ?? []].flat()) if (valueOf(vars, n, !/^[A-Z][A-Z0-9_]*$/.test(n)) === undefined) out.add(n);
+  return [...out].sort();
+}
+
+/** The case with its placeholders filled; null when one has no value (the case is skipped, `missingVars` says why). */
+export function filledCase(c: EvalCase, vars: Vars): EvalCase | null {
+  if (missingVars(c, vars).length) return null;
+  const f = (s: string): string => fill(s, vars);
+  return {
+    ...c, turns: c.turns.map((t) => ({ ...t, user: f(t.user) })), ...(c.rubric !== undefined ? { rubric: f(c.rubric) } : {}),
+    ...(c.facts ? { facts: c.facts.map((x) => ({ claim: f(x.claim), ...(x.oracle ? { oracle: {
+      kind: x.oracle.kind, ...(x.oracle.value !== undefined ? { value: f(x.oracle.value) } : {}), ...(x.oracle.query !== undefined ? { query: f(x.oracle.query) } : {}),
+    } } : {}) })) } : {}),
+  };
+}
+
+/** The case's turns with every placeholder filled; null when the case needs a variable that has no value. */
+export function turnsOf(c: EvalCase, vars: Vars): Turn[] | null {
+  return filledCase(c, vars)?.turns ?? null;
 }
 
 /** A short, stable hash of what the case says (for a case that does not carry one). */
@@ -249,6 +313,40 @@ export function apiQuery(o: Oracle | undefined): { path: string; at: string } | 
   const m = o?.kind === "api" ? /^(\/v1\/[^#\s]*)#(\S+)$/.exec(o.query ?? "") : null;
   return m ? { path: m[1]!, at: m[2]! } : null;
 }
+
+/** An `api` oracle this runner can read at run time, by where it reads (see the case format above). */
+export type OracleQuery =
+  | { via: "claw"; path: string; at: string }
+  | { via: "github"; path: string; at: string }
+  | { via: "mcp"; server: string; tool: string; args: Record<string, unknown>; at: string };
+
+/** The read an `api` oracle names, or null for one this runner cannot run (a description, or a placeholder not filled). */
+export function oracleQuery(o: Oracle | undefined): OracleQuery | null {
+  if (o?.kind !== "api") return null;
+  const q = (o.query ?? "").trim();
+  if (HAS_PLACEHOLDER.test(q)) return null;
+  const claw = apiQuery(o);
+  if (claw) return { via: "claw", ...claw };
+  const gh = /^gh:(\/[^#\s]*)#(\S+)$/.exec(q);
+  if (gh) return { via: "github", path: gh[1]!, at: gh[2]! };
+  const mcp = /^mcp:([a-z0-9][a-z0-9_-]*)\/([A-Za-z0-9_]+)(?:\?([^#\s]*))?#(\S+)$/.exec(q);
+  if (!mcp) return null;
+  const args: Record<string, unknown> = {};
+  for (const [k, v] of new URLSearchParams(mcp[3] ?? "")) {
+    // A number, a boolean or null as itself; anything else as the text it is.
+    args[k] = /^(-?\d+(\.\d+)?|true|false|null)$/.test(v) ? JSON.parse(v) : v;
+  }
+  return { via: "mcp", server: mcp[1]!, tool: mcp[2]!, args, at: mcp[4]! };
+}
+
+/** Brain's allow-list matching: an exact name, or a prefix before a trailing `*`. */
+const allowedBy = (allow: readonly string[], name: string): boolean => allow.some((p) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : name === p));
+
+/**
+ * Whether an `mcp:` oracle may be run: only a tool on the router's list of reads (`assistant/read-tools.ts`, as
+ * `tools_allowlist` entries), so an oracle can never write. Anything else is graded by the judge.
+ */
+export const oracleMayRun = (q: OracleQuery, reads: readonly string[]): boolean => q.via !== "mcp" || allowedBy(reads, `mcp__${q.server}__${q.tool}`);
 
 /** Values picked from JSON by a dotted path: `data.length`, `name`, `data.*.title` (every element), `data.0.seq`. */
 export function pick(json: unknown, path: string): string[] {
@@ -289,6 +387,22 @@ export const INTERNAL_TEXT: ReadonlyArray<[string, RegExp]> = [
   ["claw message id", /\bclaw-(pending-)?\d+\b/],
   ["prompt leak", /system prompt|<\/?(system|tool_result|function_calls)>/i],
 ];
+/**
+ * An answer in which the assistant says that it itself cannot reach something: it cannot access, read, browse or query a
+ * system, has no permission or no tool for it, cannot get on the internet. Said of itself, so a fact about a system ("the node
+ * cannot be reached") is not one. Whether it was false is what the tools say: a denial with no failed call in the turn is one
+ * (`grade`); a case where refusing is right says `may_deny`.
+ */
+export const CAPABILITY_DENIAL = new RegExp([
+  "我(目前|现在|暂时|这边|这里)?(还)?(无法|不能|没法|没办法|不可以)(直接)?(访问|读取|查看|查询|获取|连接|联网|上网|浏览|打开|拿到)",
+  "我(这边|这里)?(访问|读取|查询|连接|读|查|看)不了", "我(这边|这里)?(访问|连接|拿)不到",
+  "我(这边|这里)?(没有|无)[^，。,.!！?？\\n]{0,12}?(工具|能力|接口|权限)",
+  "(无法|不能|没法)(联网|上网)", "没有(联网|上网)(能力|功能|工具)",
+  "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:access|read|browse|reach|connect to|query|look up|fetch|check|open|get to)\\b",
+  "\\bI (?:don(?:'|’)?t|do not) have (?:any )?(?:access|permission|internet|web access|a tool|the tools?|tools?)\\b",
+  "\\bI have no (?:access|internet|web access|tools?)\\b",
+].join("|"), "i");
+
 /** With `style.no_ids`: an item named only by its number ("编号 #178", "#178。") rather than by its title. */
 export const BARE_NUMBER = /编号\s*#?\d+|#\d+(?=\s*($|[，。、,.;；:：)）!！?？]))/m;
 
@@ -438,7 +552,7 @@ export function grade(c: EvalCase, o: Observed): Check[] {
     const values = o.factValues[k] ?? null;
     const name = `fact ${f.claim}`.slice(0, 80);
     if (values === null) {
-      if (apiQuery(f.oracle)) out.push({ name, pass: true, skipped: true, unverified: true, detail: "oracle not read" });
+      if (oracleQuery(f.oracle)) out.push({ name, pass: true, skipped: true, unverified: true, detail: "oracle not read" });
       else skip(name);
       return;
     }
@@ -455,6 +569,12 @@ export function grade(c: EvalCase, o: Observed): Check[] {
   for (const [label, re] of INTERNAL_TEXT) {
     const m = re.exec(shownText);
     out.push({ name: `no internal text: ${label}`, pass: m === null, detail: m ? m[0] : undefined });
+  }
+  if (!c.may_deny) {
+    // A denial right after a tool of the turn failed can be true; one with no failed call is the failure this rule is for.
+    const m = CAPABILITY_DENIAL.exec(o.final);
+    const failedCall = o.calls.some((x) => x.ok === false);
+    out.push({ name: "no false denial", pass: m === null || failedCall, detail: m ? `${m[0]}${failedCall ? " (after a failed call)" : ""}` : undefined });
   }
   if (c.style?.no_ids) {
     const m = BARE_NUMBER.exec(shownText);
@@ -548,8 +668,33 @@ export interface Attempt {
 }
 
 /** The case has content only a judge can grade: a rubric, or a fact whose value is neither written nor read by an oracle. */
-export const needsJudge = (c: EvalCase): boolean =>
-  !!c.rubric || (c.facts ?? []).some((f) => !apiQuery(f.oracle) && !(f.oracle && f.oracle.kind !== "api" && f.oracle.value !== undefined));
+export const needsJudge = (c: EvalCase): boolean => !!c.rubric || judgeFacts(c).length > 0;
+
+/** A fact graded without a judge: a runnable oracle, or a static or fixture value. */
+const deterministic = (f: Fact): boolean => !!oracleQuery(f.oracle) || (!!f.oracle && f.oracle.kind !== "api" && f.oracle.value !== undefined);
+
+/**
+ * What only a judge can grade, one line per fact: its claim and, where the oracle describes a read this runner cannot make,
+ * that description as what the claim is checked against. Without these lines in its prompt a judge would see a case with
+ * no rubric as having nothing to grade, and it would stay unjudged for good.
+ */
+export function judgeFacts(c: EvalCase): string[] {
+  return (c.facts ?? []).filter((f) => !deterministic(f))
+    .map((f) => (f.oracle?.query || f.oracle?.value ? `${f.claim} (checked against: ${f.oracle.query ?? f.oracle.value})` : f.claim));
+}
+
+/** The rule every judged case is held to, besides its own: no false denial of a capability (see CAPABILITY_DENIAL). */
+export const NO_FALSE_DENIAL_RULE = "The reply must not say that it cannot reach or do something (GitHub, the web, a platform, the user's own data) "
+  + "when it has a tool for that, unless it tried the tool and the tool failed. Declining an unsafe or forbidden request is not such a denial.";
+
+/** The judge's prompt for one case: the user's turns, the final reply, the rubric, the facts only it can grade, and the rule. */
+export function judgePrompt(c: EvalCase, turns: readonly Turn[], final: string): string {
+  const facts = judgeFacts(c);
+  return `You grade one reply of an assistant to a user.\nUser said:\n${turns.map((t) => t.user).join("\n")}\n\n`
+    + `Assistant's final reply:\n${final}\n\n${c.rubric ? `Rubric: ${c.rubric}\n` : ""}${facts.length ? `The reply must state: ${facts.join("; ")}\n` : ""}`
+    + `${c.may_deny ? "" : `Always: ${NO_FALSE_DENIAL_RULE}\n`}`
+    + "\nAnswer with one line: PASS or FAIL, a colon, and one short reason.";
+}
 
 /**
  * An attempt's verdict: every deterministic check, and, for a case with content only a judge can grade, the judge's
@@ -567,7 +712,7 @@ export function verdictOf(c: EvalCase, checks: readonly Check[], judge: { pass: 
 /** What a recording keeps of an observation: an api oracle's values are the identity's data, so they are left out (null:
  * an offline grading skips that fact). */
 export function forRecording(c: EvalCase, o: Observed): Observed {
-  return { ...o, factValues: o.factValues.map((v, k) => (apiQuery(c.facts?.[k]?.oracle) ? null : v)) };
+  return { ...o, factValues: o.factValues.map((v, k) => (oracleQuery(c.facts?.[k]?.oracle) ? null : v)) };
 }
 
 export interface CaseResult {
@@ -674,9 +819,13 @@ export function identityRefusal(me: Identity, subs: readonly Subscription[], env
 /** What a run would do, without doing it (EVAL_DRY_RUN): one line per case. */
 export function planOf(cases: readonly EvalCase[], mode: Mode, env: Record<string, string | undefined>): string[] {
   return cases.map((c) => {
-    const turns = turnsOf(c, env);
-    const skip = c.modes && !c.modes.includes(mode) ? `skip (${c.modes.join(",")} only)` : turns === null ? `skip (needs ${c.needs})` : "";
-    const facts = (c.facts ?? []).map((f) => (apiQuery(f.oracle) ? "api" : f.oracle?.value !== undefined && f.oracle.kind !== "api" ? "value" : "judge"));
+    const missing = missingVars(c, env);
+    const skip = c.modes && !c.modes.includes(mode) ? `skip (${c.modes.join(",")} only)` : missing.length ? `skip (needs ${missing.join(", ")})` : "";
+    const filled = filledCase(c, env) ?? c;
+    const facts = (filled.facts ?? []).map((f) => {
+      const q = oracleQuery(f.oracle);
+      return q ? (q.via === "claw" ? "api" : q.via) : f.oracle?.value !== undefined && f.oracle.kind !== "api" ? "value" : "judge";
+    });
     return [c.id, skip || `${c.turns.length} turn(s)`, `route=${c.route ?? "-"}`, `tools=${(c.tools_must ?? []).join(",") || "-"}`,
       `facts=${facts.join(",") || "-"}`, `budget=${JSON.stringify(c.latency_budget_s ?? {})}`].join("  ");
   });
@@ -691,4 +840,91 @@ export interface Recording { case_id: string; mode: Mode; attempt: number; at: s
 export function parseRecordings(text: string): Recording[] {
   return text.split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Recording)
     .filter((r) => typeof r.case_id === "string" && r.observed && Array.isArray(r.observed.calls));
+}
+
+// --- Static checks: what a case asks for against what its arm can do ----------------------------------------------------
+
+/**
+ * The tools each arm of the evaluation can call, as `tools_allowlist` entries (an exact name, or a prefix ending in `*`).
+ *   router    the assistant's router turn: its own tools and the reads `assistant/read-tools.ts` gives it
+ *   worker    a work item's worker, and a plain session: every server of the plugin, and Brain's own tools (any name that is not
+ *             an MCP tool's)
+ *   baseline  a plain session with the plugin (EVAL_MODE=baseline): the worker's tools, without the assistant's
+ */
+export interface Arms { router: readonly string[]; worker: readonly string[]; baseline: readonly string[] }
+
+/** An entry that allows every tool that is not an MCP tool (Brain's built-ins: web_search, Bash, ...). */
+export const BUILTIN_TOOLS = "<builtin>";
+
+/**
+ * Whether some tool name matches both a case's pattern (`*` anywhere, `a|b` either) and an allow-list. A built-in tool is any
+ * name that does not start with `mcp__`.
+ */
+export function reachable(pattern: string, allow: readonly string[]): boolean {
+  return pattern.split("|").map((a) => a.trim()).some((alt) => allow.some((entry) => {
+    const head = alt.split("*")[0]!;
+    // Some name matching alt does not start with mcp__, unless alt's literal head already does.
+    if (entry === BUILTIN_TOOLS) return !head.startsWith("mcp__");
+    if (!entry.endsWith("*")) return toolPattern(alt).test(entry);
+    // A prefix entry: some name starting with it matches alt, when alt's literal head and the prefix agree as far as both go.
+    const pre = entry.slice(0, -1);
+    return alt.includes("*") ? head.startsWith(pre) || pre.startsWith(head) : alt.startsWith(pre);
+  }));
+}
+
+/** The arms a case runs on, with the tools each can reach for its last turn: an answer is the router's alone; an item adds its worker. */
+export function armsOf(c: EvalCase, arms: Arms): Array<{ arm: "router" | "router+worker" | "baseline"; allow: readonly string[] }> {
+  const modes = c.modes ?? ["assistant", "baseline"];
+  const out: Array<{ arm: "router" | "router+worker" | "baseline"; allow: readonly string[] }> = [];
+  if (modes.includes("assistant")) {
+    out.push(c.route === "item" || c.route === "review" ? { arm: "router+worker", allow: [...arms.router, ...arms.worker] } : { arm: "router", allow: arms.router });
+  }
+  if (modes.includes("baseline")) out.push({ arm: "baseline", allow: arms.baseline });
+  return out;
+}
+
+/** A static or fixture value that describes what the answer should say instead of being a value to find in it. */
+export function descriptiveValue(v: string): boolean {
+  const t = v.trim();
+  return t.split(/\s+/).length >= 3 || /\||->|>=|<=|\bor\b/.test(t)
+    || /^(asks?|no|not|does|doesn't|states?|mentions?|lists?|names?|covers?|refuses?|declines?|offers?|says?|explains?|either|any|at least|reply|answer|regex)\b/i.test(t);
+}
+
+export interface CaseFinding { id: string; kind: "unreachable" | "assistant-only" | "descriptive-value" | "blocked" | "judge-only" | "needs-vars"; detail: string }
+
+/**
+ * What can be told about cases without running them. Problems (the check fails on them):
+ *   unreachable        a tools_must pattern no tool of the case's arm matches (the case can never pass there), unless `blocked`
+ *   assistant-only     one only the assistant's own tools match, on a case that also runs in baseline: it needs modes ["assistant"]
+ *   descriptive-value  a static or fixture value that is a description: it belongs in the rubric
+ * Notes (said, not failed): blocked (with its reason), judge-only (a fact no oracle can read), needs-vars (skipped without them).
+ */
+export function staticFindings(cases: readonly EvalCase[], arms: Arms, vars: Vars = {}): { problems: CaseFinding[]; notes: CaseFinding[] } {
+  const problems: CaseFinding[] = [];
+  const notes: CaseFinding[] = [];
+  for (const c of cases) {
+    for (const { arm, allow } of armsOf(c, arms)) {
+      for (const p of c.tools_must ?? []) {
+        if (reachable(p, allow)) continue;
+        const assistantOnly = arm === "baseline" && reachable(p, arms.router) && p.split("|").every((a) => a.trim().startsWith("mcp__assistant__"));
+        if (assistantOnly) problems.push({ id: c.id, kind: "assistant-only", detail: `${p}: only the assistant has it; set modes ["assistant"]` });
+        else if (c.blocked) notes.push({ id: c.id, kind: "blocked", detail: `${p} on ${arm}: ${c.blocked}` });
+        else problems.push({ id: c.id, kind: "unreachable", detail: `${p} on ${arm}` });
+      }
+    }
+    for (const f of c.facts ?? []) {
+      const o = f.oracle;
+      if (o && o.kind !== "api" && o.value !== undefined && descriptiveValue(o.value)) problems.push({ id: c.id, kind: "descriptive-value", detail: `${f.claim}`.slice(0, 80) });
+      // Runnable once its placeholders are filled, whatever they are filled with.
+      else if (o?.kind === "api" && !oracleQuery({ ...o, query: (o.query ?? "").replace(PLACEHOLDER, "x") })) {
+        notes.push({ id: c.id, kind: "judge-only", detail: `${f.claim}`.slice(0, 80) });
+      }
+    }
+    if (c.blocked && armsOf(c, arms).every(({ allow }) => (c.tools_must ?? []).every((p) => reachable(p, allow)))) {
+      notes.push({ id: c.id, kind: "blocked", detail: `reachable now on every arm: drop "blocked" (${c.blocked})` });
+    }
+    const missing = missingVars(c, vars);
+    if (missing.length) notes.push({ id: c.id, kind: "needs-vars", detail: missing.join(", ") });
+  }
+  return { problems, notes };
 }
