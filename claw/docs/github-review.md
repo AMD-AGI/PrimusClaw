@@ -235,16 +235,16 @@ A review asked of someone else meets the assistant in three places:
   `handed_off` and told that nothing has started yet; the channel starts the review with `POST /v1/assistant/reviews`, the reviewer's
   credentials and `handoff_id` (the `review.handoff_id` it was handed), and answers the person's message about it itself, in one
   message: whether it started, on which model, and how its merge is made, read from what the route answered (each created item's
-  `review_only`, and `merge_needs_confirmation` when its merge waits for the reviewer's own confirmation whatever their review mode). The
+  `review_only`; `merge_needs_confirmation` is absent, since the reviewer's own review mode decides) and the reviewer's review mode. The
   router says nothing about it: from the handoff on, a `say` in that turn is refused (`handed_off`), and neither the turn's plain text
   nor a notice that the turn failed is delivered for it (the handoff record keeps the turn's `message_id`). The route applies its
   own checks (the reviewer's delegation, the open reviews, the limits) and, beyond them, the record Claw kept of the handoff
-  (`claw_assistant_review_handoffs`), not the channel's body: `merge` is the router's reading of a sentence, so the review merges only
-  once the reviewer confirms that very merge (`merge_needs_confirmation`, the card's button or `批准 #<ref>` / `approve #<ref>`), and
-  only reviews when the router read no merge. A `handoff_id` must be the caller's handoff to that reviewer, cover the pull requests
-  asked, be under 24 hours old and unused (one start per handoff; a replay is refused `handoff_used`). A request of the same person, to
-  the same reviewer, for a handed-over pull request that leaves `handoff_id` out is held for the reviewer's confirmation all the same,
-  and only reviews unless one of those handoffs read a merge, for as long as the record is kept (30 days), however late it comes.
+  (`claw_assistant_review_handoffs`), not the channel's body: the review only reviews when the router read no merge. When it may merge,
+  it merges as the reviewer's own review mode says, exactly as a review the person asked of them in the chat: under `high_risk_confirm`
+  a high-risk approval or merge waits for the reviewer's confirmation, under `fully_auto` only what the repository itself requires does.
+  A `handoff_id` must be the caller's handoff to that reviewer, cover the pull requests asked, be under 24 hours old and unused (one start
+  per handoff; a replay is refused `handoff_used`). A request that leaves `handoff_id` out is an ordinary request of the reviewer,
+  whatever was handed over before.
   The reviewer must also be named in the person's own message by something no other listed person shares (their name, a part of it,
   their email or the part before its `@`, their user id), not only listed beside it (`reviewer_not_named`). `channel_action` never sends an action named `review_for_other`. Otherwise (a channel that did not declare it, or no channel takes actions) it is refused with
   `acting_as_credentials_required`, and the refusal tells the router to send the user to the deployment's review agent, by the name

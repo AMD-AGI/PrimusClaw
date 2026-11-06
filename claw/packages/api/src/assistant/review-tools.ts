@@ -19,7 +19,8 @@
  * button), and a channel action runs at once only when the message is its command typed whole; otherwise it is put to the person
  * as that command with a button, and runs only when they press it. So `merge=true` on a review this router starts or restarts never
  * merges by itself: the review's session holds its merge for the person's confirmation (`config.merge_needs_confirmation`), which only
- * that command or the card's button gives.
+ * that command or the card's button gives. A review of someone else's account is not started here: it is handed to the person's channel
+ * (`handOffReview`), which starts it as a review asked of that person, merging as their own review setting says.
  *
  * Everything past that is the review's own gates, which these call rather than repeat: creating, stopping and restarting
  * a review item is `review-items.ts`; answering a held write is the decision route's own `decideConfirmation`
@@ -548,10 +549,11 @@ export async function reviewStart(
  * handed over: the caller refuses it as it always did.
  *
  * The handoff is written down (`recordReviewHandoff`) with the event, and its id travels in the payload (`review.handoff_id`) for the
- * channel to echo. The router's `merge` is its reading of a sentence, so `POST /v1/assistant/reviews` reads that record, not the
- * channel's body: such a review merges only once the reviewer confirms that very merge (`merge_needs_confirmation`), never when the
- * router did not read a merge, and is started from one handoff once. Whether the reviewer lets anyone act for them, and every other gate
- * of the review, are the review service's, when the channel asks it.
+ * channel to echo. `POST /v1/assistant/reviews` reads that record, not the channel's body: such a review never merges when the router did
+ * not read a merge, and is started from one handoff once. When it may merge, it merges as the reviewer's own review setting says, as a
+ * review the person asked of them in the chat would (a reviewer who chose to confirm high-risk writes is asked; one who chose fully
+ * automatic merges is not). Whether the reviewer lets anyone act for them, and every other gate of the review, are the review service's,
+ * when the channel asks it.
  */
 async function handOffReview(
   claims: AssistantTokenClaims, prs: PrRef[], reviewer: { userId: string; name: string }, merge: boolean, note: string,

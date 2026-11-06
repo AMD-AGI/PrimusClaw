@@ -254,9 +254,9 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
     "CREATE INDEX IF NOT EXISTS idx_assistant_messages_received ON claw_assistant_messages(received_at)",
   );
   // A review the person asked of someone else that the router handed to their channel (`review_start`, `review_for_other`): written in
-  // the transaction that queues the handoff, and read by `POST /v1/assistant/reviews` when the channel starts it. Whatever the channel
-  // sends, a review of these pull requests by this reviewer for this person then waits for the reviewer's confirmation before it merges
-  // (`merge_needs_confirmation`), merges at all only if the person's message asked for a merge, and is started from one handoff once.
+  // the transaction that queues the handoff, and read by `POST /v1/assistant/reviews` when the channel starts it with its id. Whatever the
+  // channel sends, such a review merges at all only if the person's message asked for a merge, and is started from one handoff once; how it
+  // merges is the reviewer's own review setting's, as for any review asked of them.
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_assistant_review_handoffs (
       handoff_id       TEXT PRIMARY KEY,

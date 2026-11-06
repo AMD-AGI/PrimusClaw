@@ -198,7 +198,7 @@ export interface ReviewRequest {
   mergeNeedsConfirmation?: boolean;
   /**
    * The handoff the assistant queued for this request (`review_for_other`, `claw_assistant_review_handoffs`), echoed by the channel that
-   * starts it. Only names a record the server wrote: what the review may do is read from that record, never from this request.
+   * starts it. Only names a record the server wrote: whether the review may merge at all is read from that record, never from this request.
    */
   handoffId?: string | null;
 }
@@ -259,19 +259,16 @@ export function parseReviewRequest(body: unknown): ReviewRequest {
  * (`GIVE_UP_AFTER_HOURS`), the longest the channel can take to receive it.
  */
 export const REVIEW_HANDOFF_HOURS = 24;
-/**
- * How long the record is kept, and binds a request for the same person, reviewer and pull request that leaves the id out (`handoffGate`):
- * well past the window in which it can be started by its id, so that a late start without the id is held as well.
- */
+/** How long the record is kept: well past the window in which it can be started by its id. */
 export const REVIEW_HANDOFF_RETENTION_DAYS = 30;
 
 const prKey = (pr: PrRef): string => `${pr.owner}/${pr.repo}#${pr.number}`.toLowerCase();
 
 /**
  * Write down a review the assistant's router handed to the person's channel (`review_start` naming someone else), in the transaction that
- * queues the handoff. The channel starts it over `POST /v1/assistant/reviews` with the reviewer's credentials, and that route reads this
- * record (`handoffGate`): the router's `merge=true` is its reading of a sentence, so such a review never merges without the reviewer's own
- * confirmation, and never merges at all when the router did not read a merge.
+ * queues the handoff. The channel starts it over `POST /v1/assistant/reviews` with the reviewer's credentials and the handoff's id, and that
+ * route reads this record (`handoffGate`): the review is started from it once, and never merges at all when the router did not read a merge.
+ * When it may merge, it merges as the reviewer's own review setting says, exactly as a review the person asked of them in the chat would.
  */
 export async function recordReviewHandoff(
   q: Querier, h: { handoffId: string; userId: string; reviewerUserId: string; prs: PrRef[]; merge: boolean; messageId?: string },
@@ -288,39 +285,27 @@ export async function recordReviewHandoff(
 }
 
 /**
- * What a review asked of someone else may do when the assistant handed it over: null when no handoff of the caller to this reviewer names
- * any of these pull requests. The gate does not depend on the channel echoing the handoff: a request for the same reviewer and pull requests
- * that leaves `handoff_id` out still waits for the reviewer's confirmation before it merges, and only reviews unless one of those handoffs
- * read a merge, for as long as the record is kept (`REVIEW_HANDOFF_RETENTION_DAYS`), however late it comes. A request that names one must be the
- * caller's, to this reviewer, for pull requests it covers, not yet started from, and not expired; it is then started from once, and merges
- * only if the router read a merge. A request that leaves the id out uses up every unused handoff it matched (`taken`), so none of them
- * starts another review by its id afterwards.
+ * What a review the assistant handed over may do: null for a request that names no handoff, which is an ordinary request of the reviewer,
+ * whatever was handed over before. A request that names one must be the caller's, to this reviewer, for pull requests it covers, not yet
+ * started from, and not expired; it is then started from once, and merges only if the router read a merge. How it merges is the reviewer's
+ * own setting's, as for any review asked of them: the gate holds nothing for confirmation itself.
  */
-async function handoffGate(requesterId: string, reviewerId: string, request: ReviewRequest): Promise<{ handoffId: string | null; merge: boolean; taken: string[] } | null> {
-  const keys = request.prs.map(({ pr }) => prKey(pr));
-  if (request.handoffId) {
-    const row = (await db.query(
-      `SELECT prs, merge, used_at FROM claw_assistant_review_handoffs
-        WHERE handoff_id = $1 AND user_id = $2 AND reviewer_user_id = $3 AND created_at > NOW() - make_interval(hours => $4::int)`,
-      [request.handoffId, requesterId, reviewerId, REVIEW_HANDOFF_HOURS],
-    )).rows[0] as { prs: string[]; merge: boolean; used_at: Date | null } | undefined;
-    if (!row) {
-      throw new ReviewItemRefused(404, "handoff_not_found", "no handoff of this person to this reviewer has that id, or it has expired: nothing was started", { field: "handoff_id" });
-    }
-    if (row.used_at) throw new ReviewItemRefused(409, "handoff_used", "a review was already started from this handoff: nothing was started", { field: "handoff_id" });
-    const outside = keys.filter((k) => !row.prs.includes(k));
-    if (outside.length) {
-      throw new ReviewItemRefused(409, "handoff_mismatch", `the handoff does not name ${outside.join(", ")}: nothing was started`, { field: "handoff_id" });
-    }
-    return { handoffId: request.handoffId, merge: row.merge, taken: [request.handoffId] };
+async function handoffGate(requesterId: string, reviewerId: string, request: ReviewRequest): Promise<{ handoffId: string; merge: boolean } | null> {
+  if (!request.handoffId) return null;
+  const row = (await db.query(
+    `SELECT prs, merge, used_at FROM claw_assistant_review_handoffs
+      WHERE handoff_id = $1 AND user_id = $2 AND reviewer_user_id = $3 AND created_at > NOW() - make_interval(hours => $4::int)`,
+    [request.handoffId, requesterId, reviewerId, REVIEW_HANDOFF_HOURS],
+  )).rows[0] as { prs: string[]; merge: boolean; used_at: Date | null } | undefined;
+  if (!row) {
+    throw new ReviewItemRefused(404, "handoff_not_found", "no handoff of this person to this reviewer has that id, or it has expired: nothing was started", { field: "handoff_id" });
   }
-  const rows = (await db.query(
-    `SELECT handoff_id, merge, used_at FROM claw_assistant_review_handoffs
-      WHERE user_id = $1 AND reviewer_user_id = $2 AND created_at > NOW() - make_interval(days => $3::int) AND prs && $4::text[]`,
-    [requesterId, reviewerId, REVIEW_HANDOFF_RETENTION_DAYS, keys],
-  )).rows as Array<{ handoff_id: string; merge: boolean; used_at: Date | null }>;
-  if (!rows.length) return null;
-  return { handoffId: null, merge: rows.some((r) => r.merge), taken: rows.filter((r) => !r.used_at).map((r) => r.handoff_id) };
+  if (row.used_at) throw new ReviewItemRefused(409, "handoff_used", "a review was already started from this handoff: nothing was started", { field: "handoff_id" });
+  const outside = request.prs.map(({ pr }) => prKey(pr)).filter((k) => !row.prs.includes(k));
+  if (outside.length) {
+    throw new ReviewItemRefused(409, "handoff_mismatch", `the handoff does not name ${outside.join(", ")}: nothing was started`, { field: "handoff_id" });
+  }
+  return { handoffId: request.handoffId, merge: row.merge };
 }
 
 /** The changes a restart asks for; what it leaves out is the old item's. */
@@ -484,9 +469,9 @@ export interface CreatedReview {
   review_only: boolean;
   /**
    * Present when every merge (and every approval GitHub would turn into one) of this review waits for the acting user's own
-   * confirmation, the card's button or `批准 #<ref>`, whatever their review mode: a review the assistant started or handed over
-   * (`config.merge_needs_confirmation`). Absent: the acting user's review mode decides, as for any review of theirs. A channel that tells
-   * the person how the merge will be made reads it here, not from the review mode alone.
+   * confirmation, the card's button or `批准 #<ref>`, whatever their review mode: a review the assistant's router started
+   * (`config.merge_needs_confirmation`). Absent: the acting user's review mode decides, as for any review of theirs, including one the
+   * assistant handed to a channel. A channel that tells the person how the merge will be made reads it here.
    */
   merge_needs_confirmation?: true;
   /**
@@ -618,10 +603,11 @@ export async function startReviews(
       "a review asked of another person needs that person's own credentials, brought by a service allowed to speak for them", {});
   }
   if (!forOther && request.handoffId) throw bad("handoff_id", "handoff_id names a review asked of someone else");
-  // A review the assistant handed to the channel (`recordReviewHandoff`): the merge waits for the reviewer's confirmation, whatever the
-  // request says, and is not made at all when the person's message did not ask for one.
+  // A review the assistant handed to the channel (`recordReviewHandoff`): not made to merge at all when the person's message did not ask
+  // for one, whatever the request says. Otherwise it merges as the reviewer's own setting says, as a review asked of them in the chat does:
+  // nothing here holds it for their confirmation (Yihan, 2026-11-06), and a request that names no handoff is an ordinary request.
   const handoff = forOther ? await handoffGate(user.userId, actingAs, request) : null;
-  if (handoff) request = { ...request, mergeNeedsConfirmation: true, reviewOnly: request.reviewOnly || !handoff.merge };
+  if (handoff) request = { ...request, reviewOnly: request.reviewOnly || !handoff.merge };
   const owner: UserInfo = forOther ? request.actingAsUser! : user;
   const requestedBy = forOther ? user.userId : null;
   // The model and the effort are the reviewer's to choose, on whose quota the review runs: what the requester names is not taken, and
@@ -666,15 +652,12 @@ export async function startReviews(
     // reviews and the limits are counted again, so nothing it waits on can change what those counts see.
     if (guard) await guard(query);
     // Started from once: a replay of the same handoff, however it races this one, makes nothing.
-    if (handoff?.handoffId) {
+    if (handoff) {
       const taken = await query(
         "UPDATE claw_assistant_review_handoffs SET used_at = NOW() WHERE handoff_id = $1 AND used_at IS NULL",
         [handoff.handoffId],
       );
       if (!taken.rowCount) throw new ReviewItemRefused(409, "handoff_used", "a review was already started from this handoff: nothing was started", { field: "handoff_id" });
-    } else if (handoff?.taken.length) {
-      // A start that left the id out uses up the handoffs it matched: none of them starts a second review by its id.
-      await query("UPDATE claw_assistant_review_handoffs SET used_at = NOW() WHERE handoff_id = ANY($1::text[]) AND used_at IS NULL", [handoff.taken]);
     }
     for (const plan of plans) await refuseIfReviewed(q, owner.userId, requestedBy, plan.pr);
     await refuseOverLimit(q, actingAs, plans.length);
