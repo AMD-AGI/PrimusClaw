@@ -184,12 +184,19 @@ test("a message's turn reaches Brain as written, and its stored UserMessage is m
 test("the words an assistant's router turn answers are stored masked, and ordinary words as they are", async () => {
   const written: unknown[][] = [];
   const tx = { query: async (_sql: string, params: unknown[]) => { written.push(params); return { rowCount: 0, rows: [] }; } } as unknown as PoolClient;
-  const record = (content: string) => recordAssistantMessage(tx, {
-    sessionId: SESSION, messageId: MESSAGE, userId: "u-1", content, attendedVia: { kind: "person" },
-    context: { people: [], actions: [], repos: [], handoffs: [] },
+  const ordinaryContext = {
+    channel: "teams", people: [{ user_id: "u-2", name: "Wei Lei" }],
+    actions: [{ name: "deploy", usage: "/deploy <env>", summary: "Deploy a release" }], repos: ["AMD-AGI/PrimusClaw"], handoffs: [],
+  };
+  const record = (content: string, context: Record<string, unknown> = ordinaryContext) => recordAssistantMessage(tx, {
+    sessionId: SESSION, messageId: MESSAGE, userId: "u-1", content, attendedVia: { kind: "person" }, context: context as never,
   });
-  await record(`log in with ${WITH_SECRETS}`);
+  await record(`log in with ${WITH_SECRETS}`, {
+    ...ordinaryContext, actions: [{ name: "deploy", usage: `/deploy --key ${SAFE_KEY}`, summary: WITH_SECRETS }],
+  });
   noSecretIn(written[0]![3], "claw_assistant_messages.content");
+  noSecretIn(written[0]![5], "claw_assistant_messages.channel_context");
   await record(ORDINARY);
   assert.equal(written[1]![3], ORDINARY);
+  assert.deepEqual(JSON.parse(written[1]![5] as string), ordinaryContext, "an ordinary context is stored as it came");
 });

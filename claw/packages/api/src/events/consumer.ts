@@ -1169,7 +1169,8 @@ async function handleComplete(
     if (skillsUsedPatched) {
       (event as any).skills_used = skillsUsed;
       if (eventRowId) {
-        await db.query(`UPDATE claw_session_events SET data = $1 WHERE id = $2`, [event, eventRowId]);
+        // The stored copy again, masked as the insert above masked it: `event` itself is the one the turn's handling reads.
+        await db.query(`UPDATE claw_session_events SET data = $1 WHERE id = $2`, [redactStoredValue(event), eventRowId]);
       }
     }
 
