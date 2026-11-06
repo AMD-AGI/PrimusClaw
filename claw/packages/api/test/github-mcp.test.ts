@@ -390,6 +390,39 @@ describe("B lists a turn sees whole", () => {
     assert.equal(seen.length, 1, "nothing more is read for it");
   });
 
+  test("B13b a read for by_repo that fails costs the count, not the answer: the page read is returned and the note says why", async () => {
+    const at = (n: number, repo: string) => ({ ...hit(n), repository_url: `${API}/repos/${repo}`, html_url: `https://github.com/${repo}/pull/${n}` });
+    const all = Array.from({ length: 140 }, (_, i) => at(i + 1, i % 2 ? "ROCm/spur" : "AMD-AGI/PrimusClaw"));
+    const failures: Array<[string, () => Response, RegExp]> = [
+      ["search rate limit (403)", () => new Response(JSON.stringify({ message: "API rate limit exceeded" }), { status: 403, headers: { "content-type": "application/json", "x-ratelimit-remaining": "0", "retry-after": "60" } }), /GitHub answered 403/],
+      ["secondary rate limit (429)", () => new Response(JSON.stringify({ message: "secondary rate limit" }), { status: 429, headers: { "content-type": "application/json", "retry-after": "30" } }), /GitHub answered 429/],
+      ["a 502", () => json({ message: "Bad Gateway" }, 502), /GitHub answered 502/],
+      ["a dropped connection", () => { throw new TypeError("fetch failed"); }, /reading the other matches failed;/],
+      ["a timeout", () => { throw new DOMException("The operation was aborted due to timeout", "TimeoutError"); }, /reading the other matches failed;/],
+    ];
+    const c = await connect(token());
+    for (const [what, fail, said] of failures) {
+      seen = [];
+      respond = (url) => {
+        if (url.pathname !== "/search/issues") return json({}, 404);
+        // The question's own page (50) answers; every read of 100 for the count fails.
+        if (url.searchParams.get("per_page") === "100") return fail();
+        return json({ total_count: 140, incomplete_results: false, items: all.slice(0, 50) });
+      };
+      const r = await call(c, "issue_search", { query: "is:pr is:open author:@me" });
+      assert.equal(r.isError, false, `${what}: ${r.text}`);
+      const found = JSON.parse(r.text);
+      assert.equal(found.total_count, 140, what);
+      assert.deepEqual(found.items.map((i: any) => i.number), Array.from({ length: found.shown }, (_, i) => i + 1), `${what}: the page read is answered`);
+      assert.ok(found.shown > 0, what);
+      assert.equal(found.by_repo, undefined, what);
+      assert.match(found.note, said, `${what}: ${found.note}`);
+      assert.match(found.note, /the matches shown and total_count are as read/, what);
+      assert.ok(!/rate limit exceeded|secondary rate limit|Bad Gateway|fetch failed|aborted/.test(r.text), `${what}: nothing GitHub or the network said`);
+      assert.ok(seen.some((x) => new URL(x.url).searchParams.get("per_page") === "100"), `${what}: the count was tried`);
+    }
+  });
+
   test("B14 pr_list state merged: only merged ones, most recently merged first, read in update order", async () => {
     // Created in the order 319, 306 (the creation order GitHub lists by), merged in the other: 306 at 09:50:16, 319 at 09:49:47.
     const closed = [

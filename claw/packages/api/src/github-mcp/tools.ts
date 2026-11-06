@@ -325,33 +325,52 @@ function actionsRunOf(c: Record<string, any>): number | null {
 /** A search's matches are counted per repository (`by_repo`) up to this many: GitHub's search pages hold 100, so three more reads at most. */
 export const BY_REPO_MAX = 300;
 
+/** Why a search has no `by_repo`: too many matches, the matches changed (or a read was cut short) between reads, or a read failed. */
+export type ByRepoUnavailable = "too_many" | "changed" | { failed: number | null };
+
 /**
  * How many of a search's matches are in each repository, most first: from the page already read when it holds them all, else read
- * 100 at a time while there are at most BY_REPO_MAX; null beyond that, or when a page could not be read whole. "How many pull
- * requests have I open, and where" was answered from the 21 of a list cut in two, with "the count per repository is not certain".
+ * 100 at a time while there are at most BY_REPO_MAX; otherwise why not. "How many pull requests have I open, and where" was answered
+ * from the 21 of a list cut in two, with "the count per repository is not certain". Never throws: the count is an extra beside
+ * the page already read, so a read of it that fails (search's own rate limit, a 5xx, a timeout) costs the count and not the answer.
  */
 export async function searchCountByRepo(
   gh: GithubClient, query: string, firstPage: ReadonlyArray<{ repo?: string }>, total: number,
-): Promise<Record<string, number> | null> {
+): Promise<{ byRepo: Record<string, number> } | { unavailable: ByRepoUnavailable }> {
   let repos: Array<string | undefined>;
   if (firstPage.length >= total) {
     repos = firstPage.map((i) => i.repo);
   } else {
-    if (total > BY_REPO_MAX) return null;
+    if (total > BY_REPO_MAX) return { unavailable: "too_many" };
     repos = [];
-    for (let page = 1; repos.length < total && page <= Math.ceil(BY_REPO_MAX / 100); page++) {
-      const res = (await gh.get<any>("/search/issues", { q: query, sort: "updated", order: "desc", per_page: 100, page })).json;
-      if (res?.incomplete_results === true) return null;
-      const got = (res?.items ?? []).map((i: any) => repoOfUrl(i.repository_url));
-      repos.push(...got);
-      if (got.length < 100) break;
+    try {
+      for (let page = 1; repos.length < total && page <= Math.ceil(BY_REPO_MAX / 100); page++) {
+        const res = (await gh.get<any>("/search/issues", { q: query, sort: "updated", order: "desc", per_page: 100, page })).json;
+        if (res?.incomplete_results === true) return { unavailable: "changed" };
+        const got = (res?.items ?? []).map((i: any) => repoOfUrl(i.repository_url));
+        repos.push(...got);
+        if (got.length < 100) break;
+      }
+    } catch (err) {
+      // A GithubError of status 0 is the network's (a dropped connection, a timeout): no status GitHub sent.
+      const status = err instanceof GithubError && err.status > 0 ? err.status : null;
+      logger.warn({ tool: "issue_search", status, errorClass: (err as Error)?.constructor?.name }, "github_mcp.by_repo_read_failed");
+      return { unavailable: { failed: status } };
     }
     // Matches that came or went between the reads: no count is better than a wrong one.
-    if (repos.length !== total) return null;
+    if (repos.length !== total) return { unavailable: "changed" };
   }
   const counts = new Map<string, number>();
   for (const r of repos) counts.set(r ?? "unknown", (counts.get(r ?? "unknown") ?? 0) + 1);
-  return Object.fromEntries([...counts.entries()].sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0])));
+  return { byRepo: Object.fromEntries([...counts.entries()].sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))) };
+}
+
+/** What a search's note says when it has no `by_repo` (fixed words: nothing GitHub sent is repeated). */
+export function byRepoNote(why: ByRepoUnavailable): string {
+  if (why === "too_many") return `by_repo is not counted for more than ${BY_REPO_MAX} matches: narrow the query with repo: or org: to count one`;
+  if (why === "changed") return "by_repo could not be counted: the matches changed while they were read; ask again";
+  return `by_repo could not be counted: reading the other matches failed${why.failed !== null ? ` (GitHub answered ${why.failed})` : ""}; `
+    + "the matches shown and total_count are as read; ask again for the count";
 }
 
 /** A search's qualifiers that name where to search: GitHub refuses some tokens a search that carries one. */
@@ -619,16 +638,12 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     const seen = (page - 1) * perPage + items.length;
     // A search GitHub cut short may report a low total_count, so a page that seems to hold every match may not: no by_repo then.
     const incomplete = res?.incomplete_results === true;
-    const byRepo = page === 1 && total !== null && !incomplete ? await searchCountByRepo(gh, a.query, items, total) : null;
+    const counted = page === 1 && total !== null && !incomplete ? await searchCountByRepo(gh, a.query, items, total) : null;
+    const byRepo = counted && "byRepo" in counted ? counted.byRepo : null;
     const notes = [
       ...(incomplete ? ["GitHub's search timed out before it found every match: total_count may be low"] : []),
-      ...(page === 1 && total !== null && !byRepo
-        ? [incomplete
-          ? "by_repo is not counted for a search that timed out; ask again"
-          : total > BY_REPO_MAX
-          ? `by_repo is not counted for more than ${BY_REPO_MAX} matches: narrow the query with repo: or org: to count one`
-          : "by_repo could not be counted: the matches changed while they were read; ask again"]
-        : []),
+      ...(page === 1 && total !== null && incomplete ? ["by_repo is not counted for a search that timed out; ask again"] : []),
+      ...(counted && "unavailable" in counted ? [byRepoNote(counted.unavailable)] : []),
     ];
     return listAnswer(items, {
       total_count: total,
