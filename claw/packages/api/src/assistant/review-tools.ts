@@ -223,33 +223,59 @@ export function personHandles(p: ChannelPerson): string[] {
  * or marks between them ("Wei, Lei", "lei.wei"), so `Lei` is not named by `Leila`, nor by `weilei`, and Latin letters next to Chinese
  * still stand on their own ("请Wei, Lei帮我").
  */
-function handleSpans(t: string, words: readonly Word[], h: string): Array<[number, number]> {
+function handleSpans(x: ReadText, h: string, max = Infinity): Array<[number, number]> {
   const out: Array<[number, number]> = [];
   if (/^\p{Script=Han}+$/u.test(h)) {
-    for (let i = t.indexOf(h); i >= 0; i = t.indexOf(h, i + 1)) out.push([i, i + h.length]);
+    for (let i = x.t.indexOf(h); i >= 0 && out.length < max; i = x.t.indexOf(h, i + 1)) out.push([i, i + h.length]);
     return out;
   }
-  // From each word the handle starts with, the words after it while each continues the handle; `at` is how much of it they spell.
-  for (let i = 0; i < words.length; i++) {
-    for (let j = i, at = 0; j < words.length && at < h.length; j++) {
-      if ((j > i && !words[j].joined) || !h.startsWith(words[j].w, at)) break;
-      at += words[j].w.length;
-      if (at === h.length) out.push([words[i].a, words[j].b]);
-    }
+  // Where the handle is spelled by whole words (`ReadText.runs`): it starts where a word does and ends where one does. After a place
+  // that does not, the search goes on from the next word's start, the first place another could.
+  for (let i = x.runs.indexOf(h); i >= 0 && out.length < max;) {
+    const first = x.startAt[i];
+    const last = x.endAt[i + h.length];
+    if (first >= 0 && last >= 0) out.push([x.words[first].a, x.words[last].b]);
+    const next = x.nextStart[i + 1];
+    i = next < 0 ? -1 : x.runs.indexOf(h, next);
   }
   return out;
 }
 
-/** A word of the lower-cased text (`WORD`), where it stands, and whether only a `NAME_GAP` separates it from the word before. */
-interface Word { w: string; a: number; b: number; joined: boolean }
+/**
+ * A lower-cased text read for names: its words (`WORD`) where they stand, and `runs`, the words that only name marks (`NAME_GAP`)
+ * separate run together, each such run apart from the next by a space, which no handle has; `startAt` / `endAt` give the word that
+ * starts / ends at each place of `runs` (-1 for none). A handle is then found by the platform's own search, not word by word.
+ */
+interface ReadText {
+  t: string; words: Array<{ a: number; b: number }>; runs: string; startAt: Int32Array; endAt: Int32Array;
+  /** The first place at or after each place of `runs` where a word starts (-1 for none). */
+  nextStart: Int32Array;
+}
 
-function wordsOf(t: string): Word[] {
-  const out: Word[] = [];
-  for (const m of t.matchAll(WORD)) {
-    const prev = out.at(-1);
-    out.push({ w: m[0], a: m.index, b: m.index + m[0].length, joined: !!prev && NAME_GAP.test(t.slice(prev.b, m.index)) });
-  }
-  return out;
+function readText(t: string): ReadText {
+  const words: Array<{ w: string; a: number; b: number }> = [];
+  for (const m of t.matchAll(WORD)) words.push({ w: m[0], a: m.index, b: m.index + m[0].length });
+  const parts: string[] = [];
+  const at: number[] = [];
+  let len = 0;
+  words.forEach((w, k) => {
+    if (k > 0 && !NAME_GAP.test(t.slice(words[k - 1].b, w.a))) {
+      parts.push(" ");
+      len += 1;
+    }
+    at.push(len);
+    parts.push(w.w);
+    len += w.w.length;
+  });
+  const startAt = new Int32Array(len + 1).fill(-1);
+  const endAt = new Int32Array(len + 1).fill(-1);
+  words.forEach((w, k) => {
+    startAt[at[k]] = k;
+    endAt[at[k] + w.w.length] = k;
+  });
+  const nextStart = new Int32Array(len + 2).fill(-1);
+  for (let i = len; i >= 0; i--) nextStart[i] = startAt[i] >= 0 ? i : nextStart[i + 1];
+  return { t, words, runs: parts.join(""), startAt, endAt, nextStart };
 }
 
 /**
@@ -258,6 +284,11 @@ function wordsOf(t: string): Word[] {
  * Reading a message costs each listed person's every handle, so this bounds what one message can make the process do.
  */
 export const NAMES_TEXT_MAX = 8 * 1024;
+/**
+ * The most places one handle is looked at in a message. A handle of another person's written more often than this is taken to stand
+ * around every place a shorter one does (so that one names nobody: the safe answer), and only the first places of the person's own count.
+ */
+const NAME_PLACES_MAX = 50;
 
 /**
  * Whether the person's own message names this person by something that is theirs alone among the people the channel listed: one of
@@ -269,42 +300,29 @@ export const NAMES_TEXT_MAX = 8 * 1024;
  */
 export function reviewerNamed(text: string, person: ChannelPerson & { user_id: string }, people: readonly ChannelPerson[]): boolean {
   if (text.length > NAMES_TEXT_MAX) return false;
-  const t = lower(text);
-  const words = wordsOf(t);
+  const x = readText(lower(text));
   const theirs = [...new Set(people.filter((p) => p !== person && p.user_id !== person.user_id).flatMap(personHandles))];
   const taken = new Set(theirs);
-  // Where another person's longer handle stands is worked out once for the text, not once for each place a shorter one does, so a
-  // message that writes a name many times costs as much as reading it.
-  const where = new Map<string, (a: number, b: number) => boolean>();
-  const inside = (o: string): ((a: number, b: number) => boolean) => {
-    let f = where.get(o);
-    if (!f) where.set(o, f = withinSpans(handleSpans(t, words, o)));
-    return f;
+  // Where another person's longer handle stands is found once for the text, at most `NAME_PLACES_MAX` places (null past that: around
+  // every place), not once for each place a shorter one stands.
+  const where = new Map<string, Array<[number, number]> | null>();
+  const placesOf = (o: string): Array<[number, number]> | null => {
+    if (!where.has(o)) {
+      const places = handleSpans(x, o, NAME_PLACES_MAX + 1);
+      where.set(o, places.length > NAME_PLACES_MAX ? null : places);
+    }
+    return where.get(o) ?? null;
   };
   return personHandles(person).some((h) => {
     if (taken.has(h)) return false;
-    const spans = handleSpans(t, words, h);
+    const spans = handleSpans(x, h, NAME_PLACES_MAX);
     if (!spans.length) return false;
-    const longer = theirs.filter((o) => o.length > h.length && o.includes(h)).map(inside);
-    return spans.some(([a, b]) => !longer.some((within) => within(a, b)));
+    const longer = theirs.filter((o) => o.length > h.length && o.includes(h));
+    return spans.some(([a, b]) => !longer.some((o) => {
+      const places = placesOf(o);
+      return places === null || places.some(([c, d]) => c <= a && b <= d);
+    }));
   });
-}
-
-/** Whether [a, b) lies inside one of these spans: the furthest end among those that start at or before `a`, found by halving. */
-function withinSpans(spans: Array<[number, number]>): (a: number, b: number) => boolean {
-  const sorted = [...spans].sort((x, y) => x[0] - y[0]);
-  const reach: number[] = [];
-  for (const [, d] of sorted) reach.push(Math.max(reach.at(-1) ?? -1, d));
-  return (a, b) => {
-    let lo = 0;
-    let hi = sorted.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (sorted[mid][0] <= a) lo = mid + 1;
-      else hi = mid;
-    }
-    return lo > 0 && reach[lo - 1] >= b;
-  };
 }
 
 /**
@@ -317,9 +335,14 @@ export function reviewerCandidates(
 ): Array<ChannelPerson & { user_id: string }> {
   const linked = people.filter((p): p is ChannelPerson & { user_id: string } => !!p.user_id && p.user_id !== requester);
   if (text.length > NAMES_TEXT_MAX) return linked.slice(0, MAX_REVIEWER_CANDIDATES);
-  const t = lower(text);
-  const words = wordsOf(t);
-  const written = linked.filter((p) => personHandles(p).some((h) => handleSpans(t, words, h).length > 0));
+  const x = readText(lower(text));
+  // Each handle is looked for once, however many listed people have it.
+  const seen = new Map<string, boolean>();
+  const written = linked.filter((p) => personHandles(p).some((h) => {
+    let found = seen.get(h);
+    if (found === undefined) seen.set(h, found = handleSpans(x, h, 1).length > 0);
+    return found;
+  }));
   return (written.length ? written : linked).slice(0, MAX_REVIEWER_CANDIDATES);
 }
 

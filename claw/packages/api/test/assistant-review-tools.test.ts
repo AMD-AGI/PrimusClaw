@@ -32,7 +32,8 @@
  *       the request from the next one; the requester is never offered
  *   S4e a message is read as a reply, or for a reviewer's name, only up to what such a message can be: a long one costs no more than
  *       reading it (as the person's message, and as the earlier message a reply looks back to), names nobody, and everyone listed is
- *       offered; the longest reply ever offered is still one
+ *       offered; fifty listed people with long aliases a message spells nearly whole cost no more; the longest reply ever offered is
+ *       still one
  *   S5  a model must be named by the user
  *   S6  what the review service refuses reaches the model as it said it, with its data
  *   S8  merge=true is never a merge: whatever the message says (a negation, a question, "yes merge it"), a start and a restart the router
@@ -674,6 +675,16 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(which.code, "reviewer_not_named");
     assert.deepEqual(which.data?.candidates?.map((c: Recorded) => c.user_id), ["u-ac", "u-acw"]);
     await w.closeRun(manyTurn.task_id);
+    // Fifty listed people, ten long aliases each, that a message as long as is read for names spells nearly to their end.
+    const crowd = Array.from({ length: 50 }, (_, i) => person(`Person ${i}`, `u-p${i}`, {
+      aliases: Array.from({ length: 10 }, (_, j) => `${"a".repeat(190)}u${i}x${j}`),
+    }));
+    const crowded = `Please review PrimusClaw#304 ${"a ".repeat(4070)}`;
+    const crowdTurn = await userTurn(alice, crowded, { context: ctx(crowd), agoSec: 10 });
+    const crowdWhich = await timed("review_start among fifty", () => refusal(crowdTurn, { ...ask, reviewer: "u-p0" }));
+    assert.equal(crowdWhich.code, "reviewer_not_named");
+    assert.equal(crowdWhich.data?.candidates?.length, 5);
+    await w.closeRun(crowdTurn.task_id);
     // A request with a long paste after it still names its reviewer.
     const pasted = `请 Wei, Lei 帮我 review PrimusClaw PR #304，背景：\n${"日志 line ".repeat(450)}`;
     assert.ok(pasted.length > 3600);
