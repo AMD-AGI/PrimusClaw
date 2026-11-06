@@ -48,8 +48,12 @@
  *                     check failed.
  *   EVAL_VARS_FILE    a JSON object of run variables for `{{name}}` placeholders (nested objects give `{{a.b}}`); EVAL_VAR_<NAME>
  *                     sets one too. A case whose placeholders have no value is skipped and says which.
+ *   EVAL_VARS_CMD     a command (a program and its arguments separated by spaces, run without a shell) run right before
+ *                     each case, whose stdout is a JSON object of run variables, over those
+ *                     above: a value that moves (how many pull requests are open) is read when the case runs. One that fails
+ *                     makes that case the run's error, never a grade against values from before
  *   EVAL_GITHUB_TOKEN_FILE, EVAL_GITHUB_API
- *                     the eval identity's GitHub token and API root (default https://api.github.com) for `gh:` oracles
+ *                     the eval identity's GitHub token and API root (default https://api.github.com) for `gh:` and `ghql:` oracles
  *   EVAL_ORACLE_PLUGIN_ID, EVAL_ORACLE_MCP_HOSTS
  *                     the plugin whose MCP servers `mcp:` oracles read (default EVAL_PLUGIN_ID), and the hosts their URLs may
  *                     have (comma list, https only; default the host of EVAL_CLAW): the key is sent nowhere else. Only tools on
@@ -67,6 +71,19 @@
  *                     its own message: a turn whose exec_complete is not stored by then makes the attempt an error, not a grade;
  *                     so does an assistant session still running that long before a case. An attempt is graded on what the
  *                     stream showed only when it showed every stored event of the case (15 s grace); otherwise it is an error
+ *   EVAL_SAY_GRACE_S  how long, after a turn ended, its first say is waited for (default 5): a router that says nothing gets the
+ *                     server's own reply a moment after its turn ends, and that reply is what the person is shown
+ *   EVAL_GAP_S        seconds between the end of one case and the start of the next (default 0)
+ *   EVAL_FRESH_SESSION_EVERY
+ *                     assistant mode: a new assistant session every that many cases (1: each case its own; default 0: one for
+ *                     the run), so no case is read in the context of earlier ones. The session before is let finish, its items
+ *                     closed, and it is deleted and seen gone first. Only a session the run made is ever deleted, so this needs an
+ *                     identity without an assistant session at the start
+ *   EVAL_SEND_TOKEN_CMD
+ *                     assistant mode: a command (as EVAL_VARS_CMD: no shell) that prints a signed-in access token of the key's own identity (an identity
+ *                     provider's, for the Claw API): the run's messages are sent with it, as a person's channel sends them, so a
+ *                     turn may act for the person (`attendedTurn`: memory, settings, confirmations). Everything else uses the key.
+ *                     The token must be the key's identity (`GET /v1/me`), or the run refuses; it is never printed
  *   EVAL_QUIET_S      the assistant mode refuses to start when the identity's assistant session has a turn running, or had any
  *                     event less than this many seconds ago (default 300; 0 checks only for a running turn): another run, or a
  *                     person, is using the identity. Each run going at the same time needs an identity of its own
@@ -89,6 +106,7 @@
  * the cleanup above runs; the run exits 1, and says so if a turn was still running at its end. A second signal exits at
  * once without it. Send it to the runner's own process: `npx` (npm exec) does not pass a signal on.
  */
+import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -102,9 +120,9 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import {
   BUILTIN_TOOLS, assistantInUse, capRefusedSays, caseHash, caseSays, cardsOf, cleanupOf, countedSays, countedSaysOf, deleteSessionConfirmed,
   mergeSays, parseSayLog, endedTurns, storedTurnEnds, streamMissed, filledCase, filesFrom, finalSay, grade, forRecording, identityRefusal, itemsStartedBy,
-  judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf,
+  judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   sayWaitMs, saysOf, staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
-  holdAnswers, toolPattern, judgeVerdict,
+  holdAnswers, toolPattern, judgeVerdict, oracleValues, withToolFailures, flatVars, storedTurnCalls,
   type SayMark, type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
@@ -158,7 +176,7 @@ function apiKey(): string {
 }
 const KEY = LIVE ? apiKey() : "";
 const api = apiClient(CLAW, KEY);
-const scrub = (s: string): string => scrubWith(s, [KEY]);
+const scrub = (s: string): string => scrubWith(s, [KEY, ...sendTokens]);
 const iso = (): string => new Date().toISOString();
 const log = (...a: unknown[]): void => console.log(iso(), ...a.map((x) => (typeof x === "string" ? scrub(x) : x)));
 const recordings: Recording[] = [];
@@ -168,17 +186,73 @@ const TEXT_DETAIL = /^(no internal text|items named by title|no false denial)/;
 
 /** The run's variables: the environment (`{NAME}`) and EVAL_VARS_FILE (`{{name}}`, nested objects as `{{a.b}}`). */
 function runVars(): Vars {
-  const out: Record<string, string | undefined> = { ...process.env };
   const file = process.env.EVAL_VARS_FILE;
-  if (!file) return out;
-  const flat = (o: unknown, at: string): void => {
-    if (o !== null && typeof o === "object" && !Array.isArray(o)) for (const [k, v] of Object.entries(o)) flat(v, at ? `${at}.${k}` : k);
-    else if (at && o !== null && o !== undefined) out[at] = String(o);
-  };
-  flat(JSON.parse(readFileSync(file, "utf8")), "");
-  return out;
+  return { ...process.env, ...(file ? flatVars(JSON.parse(readFileSync(file, "utf8"))) : {}) };
 }
 const VARS = runVars();
+const VARS_CMD = process.env.EVAL_VARS_CMD;
+/**
+ * The words of an EVAL_*_CMD: a program and its arguments separated by spaces, run as they are, never through a shell (no quoting,
+ * no expansion; a script that needs a shell is a file the program runs).
+ */
+/** How a command failed: its signal, its exit status, or why it could not start (ENOENT: no such program). */
+function commandFailure(err: unknown): string {
+  const e = err as { status?: number | null; signal?: string | null; code?: string };
+  return e.signal ?? (typeof e.status === "number" ? `exit ${e.status}` : e.code ?? "?");
+}
+function commandWords(cmd: string): string[] {
+  const words = cmd.trim().split(/\s+/).filter(Boolean);
+  if (!words.length) { console.error("an EVAL_*_CMD is empty"); process.exit(2); }
+  return words;
+}
+const FRESH_EVERY = int("EVAL_FRESH_SESSION_EVERY", 0, 0, 100_000);
+const SEND_TOKEN_CMD = process.env.EVAL_SEND_TOKEN_CMD;
+const sendTokens: string[] = [];   // every token EVAL_SEND_TOKEN_CMD gave: scrubbed like the key
+let sendTokenCached: { token: string; until: number } | null = null;
+
+/**
+ * A signed-in access token of the key's identity for the messages the run sends (EVAL_SEND_TOKEN_CMD prints it): a message sent with
+ * it is one the person sent signed in (`attendedTurn`), so what only such a message allows (a memory or a setting written, a
+ * confirmation answered) is graded as a person gets it. Asked for again a minute before its `exp`. Never printed or written.
+ */
+function sendToken(): string {
+  if (sendTokenCached && Date.now() < sendTokenCached.until) return sendTokenCached.token;
+  let token: string;
+  try {
+    const [program, ...args] = commandWords(SEND_TOKEN_CMD!);
+    token = execFileSync(program!, args, { encoding: "utf8", timeout: 120_000, stdio: ["ignore", "pipe", "pipe"] }).trim();
+  } catch (err) {
+    throw new Error(`infra: EVAL_SEND_TOKEN_CMD failed (${commandFailure(err)})`);
+  }
+  if (!token || /\s/.test(token)) throw new Error("infra: EVAL_SEND_TOKEN_CMD printed no token");
+  sendTokens.push(token);
+  let exp = 0;
+  try { exp = Number(JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")).exp) * 1000; } catch { /* not a JWT: asked for each time */ }
+  sendTokenCached = { token, until: Number.isFinite(exp) && exp > 0 ? exp - 60_000 : 0 };
+  return token;
+}
+const GAP_MS = int("EVAL_GAP_S", 0, 0, 3_600) * 1000;
+const SAY_GRACE_MS = int("EVAL_SAY_GRACE_S", 5, 0, 120) * 1000;
+
+/**
+ * The run's variables for one case: EVAL_VARS_CMD's (a JSON object on its stdout, run now, before the case) over the run's. Values that
+ * move (a count of open pull requests) are then read right before the case that names them. A command that fails, or prints no
+ * JSON object, is the run's error for that case: it is never graded against values from before.
+ */
+function caseVars(): Vars {
+  if (!VARS_CMD) return VARS;
+  let out: string;
+  try {
+    const [program, ...args] = commandWords(VARS_CMD);
+    out = execFileSync(program!, args, { encoding: "utf8", timeout: 120_000, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 4 << 20 });
+  } catch (err) {
+    throw new Error(`infra: EVAL_VARS_CMD failed (${commandFailure(err)}): not graded`);
+  }
+  let json: unknown;
+  try { json = JSON.parse(out); } catch { throw new Error("infra: EVAL_VARS_CMD printed no JSON: not graded"); }
+  if (json === null || typeof json !== "object" || Array.isArray(json)) throw new Error("infra: EVAL_VARS_CMD printed no JSON object: not graded");
+  return { ...VARS, ...flatVars(json) };
+}
 /** The router's reads as allow-list entries: the only MCP tools an `mcp:` oracle may call. */
 const ROUTER_READS = Object.keys(readTools.ROUTER_READ_TOOLS).flatMap((s) => readTools.readToolPatterns(s));
 const RUN_ITEMS = new Set<string>();   // ids of the items the run's own turns started: the only items it ever closes
@@ -186,7 +260,6 @@ const CLEARED = new Set<string>();     // of those, the ones closed with their w
 const RUN_MESSAGES: string[] = [];     // every message the run sent to the assistant, to tie items to it after a stop
 const OWN_SESSIONS = new Set<string>(); // the only sessions the run ever deletes: made by it, or answered for its own items
 const CLEANUP_ISSUES: string[] = [];   // what closing an item could not finish: it fails the run
-const UNKNOWN_SENDS = { n: 0 };        // messages to the assistant whose answer was lost: taken or not, the run cannot say
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // --- Stopping -------------------------------------------------------------------------------------------------------
@@ -313,7 +386,7 @@ async function workerCalls(itemId: string): Promise<ToolCall[]> {
   if (r.status !== 200) throw new Error(`the item answered ${r.status}`);
   const sid = r.json?.data?.worker_session_id;
   if (typeof sid !== "string" || !sid) return [];
-  return traceOf(await replay(sid)).calls;
+  return withToolFailures(traceOf(await replay(sid)).calls);
 }
 
 /**
@@ -355,17 +428,22 @@ async function readOracle(q: OracleQuery): Promise<string[]> {
   if (q.via === "claw") {
     const r = await api("GET", q.path);
     if (r.status !== 200) throw new Error(`the Claw API answered ${r.status}`);
-    return pick(r.json, q.at);
+    return oracleValues(r.json, q);
   }
-  if (q.via === "github") {
+  if (q.via === "github" || q.via === "github-graphql") {
     const tokenFile = process.env.EVAL_GITHUB_TOKEN_FILE;
     const token = tokenFile ? readFileSync(tokenFile, "utf8").trim() : "";
     const root = (process.env.EVAL_GITHUB_API || "https://api.github.com").replace(/\/+$/, "");
-    const res = await fetch(`${root}${q.path}`, {
-      headers: { accept: "application/vnd.github+json", ...(token ? { authorization: `Bearer ${token}` } : {}) }, signal: AbortSignal.timeout(30_000),
-    });
+    const headers = { accept: "application/vnd.github+json", ...(token ? { authorization: `Bearer ${token}` } : {}) };
+    const res = q.via === "github"
+      ? await fetch(`${root}${q.path}`, { headers, signal: AbortSignal.timeout(30_000) })
+      // GraphQL needs a token; a query only (`oracleQuery` takes no mutation).
+      : await fetch(`${root}/graphql`, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ query: q.query }), signal: AbortSignal.timeout(30_000) });
     if (res.status !== 200) throw new Error(`GitHub answered ${res.status}`);
-    return pick(await res.json(), q.at);
+    const json = await res.json() as { errors?: unknown[] };
+    // GraphQL answers a refused query with 200 and `errors`: nothing was read.
+    if (q.via === "github-graphql" && Array.isArray(json?.errors) && json.errors.length) throw new Error("GitHub GraphQL answered errors");
+    return oracleValues(json, q);
   }
   if (!oracleMayRun(q, ROUTER_READS)) throw new Error(`mcp:${q.server}/${q.tool} is not one of the router's reads`);
   const client = await mcpClient(q.server);
@@ -374,7 +452,7 @@ async function readOracle(q: OracleQuery): Promise<string[]> {
   if (r.isError) throw new Error(`mcp:${q.server}/${q.tool} answered an error`);
   let json: unknown = text;
   try { json = JSON.parse(text); } catch { /* a plain-text answer: picked as it is */ }
-  return pick(json, q.at);
+  return oracleValues(json, q);
 }
 
 const mcpClients = new Map<string, Promise<Client>>();
@@ -480,7 +558,8 @@ async function uploadFiles(sessionId: string, folder: string, files: readonly Tu
   return named.map((n) => ({ path: `${folder}/${n.name}`, name: n.name, media_type: n.type, size: n.size }));
 }
 
-async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, stream: LiveStream): Promise<Attempt> {
+async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSession): Promise<Attempt> {
+  const { id: sessionId, stream } = session;
   // Never into a conversation still going: its messages and items would be taken for this case's.
   if (!(await idle(sessionId, turnWaitMs(true)))) throw new Error(`the assistant session was still running ${turnWaitMs(true) / 1000} s before ${c.id}: nothing sent, not graded`);
   const floor = Math.max(0, ...(await board()).map((i) => i.seq));
@@ -499,14 +578,16 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
       const files = t.files?.length ? await uploadFiles(sessionId, `sa-eval/${c.id}-${messageIds.length + 1}-${Date.now()}`, t.files) : [];
       const at = Date.now();
       // A message whose answer was lost (or a 5xx) may still have been taken: its turn is waited for at the end, unnamed.
+      // Sent signed in when EVAL_SEND_TOKEN_CMD gives a token (the person's own message, `attendedTurn`), else with the key.
       const r = await api("POST", `/v1/sessions/${sessionId}/messages`, {
         content: t.user, messageType: "text", ...(files.length ? { channel_context: { files } } : {}),
-      })
-        .catch((err) => { UNKNOWN_SENDS.n++; throw err; });
-      if (r.status >= 500) UNKNOWN_SENDS.n++;
+      }, SEND_TOKEN_CMD ? sendToken() : KEY)
+        .catch((err) => { session.unknownSends++; throw err; });
+      if (r.status >= 500) session.unknownSends++;
       const id = r.json?.message_id;
       if (r.status !== 200 || typeof id !== "string") throw new Error(`message answered ${r.status}`);
       RUN_MESSAGES.push(id);
+      session.messages.push(id);
       messageIds.push(id);
       sentAt.push(at);
       over.push(turnsOver(sessionId, (stored) => stored.includes(id), () => turnEnded(stream.events, id), at + turnWaitMs(true), waitFor));
@@ -518,6 +599,11 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   const ended = await Promise.all(over);
   const late = messageIds.filter((_, k) => !ended[k]);
   if (late.length) throw new Error(`no end of the turn of ${late.join(",")} within ${turnWaitMs(true) / 1000} s of its message: not graded`);
+  // A turn whose router said nothing gets the server's own reply (a fallback say) a moment after its end: each turn's first say is
+  // waited for a little (EVAL_SAY_GRACE_S), so that reply is graded and timed rather than taken for no answer.
+  if (SAY_GRACE_MS) {
+    await waitFor(() => (messageIds.every((id) => saysOf(stream.events).some((x) => x.turn === id)) ? true : undefined), Date.now() + SAY_GRACE_MS, 200);
+  }
   // The case's items are only those its own turns started (read from their work_create / review_start answers): an item
   // someone else put on the board meanwhile (a review asked of this identity) is neither graded nor closed here.
   const started = turnCalls(stream.events, messageIds);
@@ -846,6 +932,140 @@ function writeSayLog(file: string, says: readonly SayMark[]): void {
   }
 }
 
+// --- The assistant conversation ---------------------------------------------------------------------------------------
+
+/** One assistant session the run works in, and what it knows of it. */
+interface AssistantSession {
+  id: string;
+  stream: LiveStream;
+  /** The run made it: it is deleted when the run is done with it. */
+  created: boolean;
+  /** Its stored events from before the run (none for one the run made), and the turns they ended. */
+  before: EventRow[];
+  historyAtStart: Set<string>;
+  historyEnds: Set<string>;
+  /** The messages the run sent to it, and how many more whose answer was lost (taken or not, the run cannot say). */
+  messages: string[];
+  unknownSends: number;
+}
+
+/**
+ * The identity's assistant session (`POST /v1/assistant`), its stream open. One the run did not make is used only when nobody else is
+ * using it, and never with EVAL_FRESH_SESSION_EVERY (the run deletes the sessions it changes from, and only its own). After the first,
+ * the run has just deleted its previous one, so the server must make a new one.
+ */
+async function openAssistant(first: boolean): Promise<AssistantSession> {
+  const a = await api("POST", "/v1/assistant", {});
+  const id = a.json?.data?.session_id;
+  if (a.status !== 200 || typeof id !== "string" || !id) throw new Error(`POST /v1/assistant answered ${a.status}`);
+  const created = a.json?.data?.created === true;
+  if (created) OWN_SESSIONS.add(id);
+  else if (!first) throw new Error(`POST /v1/assistant gave session ${id}, which the run did not make, after the run deleted its own`);
+  else if (FRESH_EVERY) {
+    console.error("refusing to run: EVAL_FRESH_SESSION_EVERY needs an identity without an assistant session (the run deletes only its own); one exists");
+    process.exit(2);
+  } else {
+    // Nobody else may be using it: another run's messages and items would be taken for this one's, and either run's
+    // cleanup would close what the other is still grading. Each parallel run needs an identity of its own.
+    const s = await api("GET", `/v1/sessions/${id}`);
+    if (s.status !== 200) { console.error(`refusing to run: GET of the assistant session answered ${s.status}`); process.exit(2); }
+    const rows = await replay(id).catch(() => null);
+    if (!rows) { console.error("refusing to run: the assistant session's events could not be read"); process.exit(2); }
+    const lastAt = rows.reduce<number | null>((m, x) => { const t = Date.parse(x.created_at); return Number.isFinite(t) && (m === null || t > m) ? t : m; }, null);
+    const busy = assistantInUse(s.json?.data ?? null, lastAt, Date.now(), QUIET_MS);
+    if (busy) { console.error(`refusing to run: ${busy}; another run or a person is using this identity`); process.exit(2); }
+  }
+  const stream = new LiveStream(id, true);
+  await stream.open();
+  // Read after the stream opened, so a say in between is counted twice rather than not at all (and an event in between is
+  // taken as before the run: nothing was sent yet).
+  const before = created ? [] : await replay(id);
+  const session: AssistantSession = { id, stream, created, before, historyAtStart: new Set(), historyEnds: new Set(), messages: [], unknownSends: 0 };
+  for (const r of before as Array<EventRow & { event_id?: unknown }>) session.historyAtStart.add(String(r.event_id ?? ""));
+  for (const t of storedTurnEnds(before)) session.historyEnds.add(t);
+  return session;
+}
+
+/**
+ * Done with a session: its turns are let end (a minute at most), every item they started is closed (`closeRunItems`), its stream is
+ * closed and, when the run made it, it is deleted and seen gone. Returns what could not be done; `leftOpen` gets the run's items left open.
+ */
+async function closeSession(session: AssistantSession, floorAtStart: number, leftOpen: number[]): Promise<string[]> {
+  const issues: string[] = [];
+  const { id, stream } = session;
+  // A turn already asked for may still start an item: let the session's turns end (a minute at most) and take every item
+  // their calls answered for as the run's, whatever stopped the run.
+  // A message whose answer was lost has a turn the run cannot name: it waits for as many more turns ended since it began.
+  const ended = (stored: readonly string[]): boolean => session.messages.every((m) => stored.includes(m))
+    && stored.filter((m) => !session.historyEnds.has(m)).length >= session.messages.length + session.unknownSends;
+  const over = await turnsOver(id, ended, () => !session.unknownSends && session.messages.every((m) => turnEnded(stream.events, m)),
+    Date.now() + Math.min(60_000, turnWaitMs(true)), until, 2_000);
+  // What a turn still running starts later is not seen, and not closed: a person must look. Named by the stored events,
+  // which are what says a turn is over.
+  if (!over) {
+    const stored = storedTurnEnds(await replay(id).catch(() => []));
+    const open = session.messages.filter((m) => !stored.includes(m));
+    if (session.unknownSends) open.push(`${session.unknownSends} message(s) whose answer was lost`);
+    issues.push(`turns of the run still running at its end (what they start is not closed): ${open.join(",") || "(the stored events could not be read)"}`);
+  }
+  issues.push(...await closeRunItems(floorAtStart, leftOpen, session));
+  stream.close();
+  if (session.created) {
+    const gone = await deleteOwn(id);
+    log(gone ? `deleted the assistant session ${id} the run created` : `could not delete the assistant session ${id} the run created`);
+    if (!gone) issues.push(`the assistant session ${id} the run created was not deleted`);
+  }
+  return issues;
+}
+
+/**
+ * Close every item of the run still open: those its attempts saw, and (with `session`) every one a turn of the run's own messages started,
+ * from the stream and from the stored events after the run began (a work_create answer the stream missed still ties its item). A
+ * turn of anyone else's message in the session, or of a message whose answer was lost, ties nothing. An open item above the run's first board number that is tied to nothing is
+ * left alone and said.
+ */
+async function closeRunItems(floorAtStart: number, leftOpen: number[], session: AssistantSession | null): Promise<string[]> {
+  const issues: string[] = [];
+  try {
+    // One read of the board, again for up to 30 s, both to tie items to the run's turns and to close them.
+    const open = await boardWithin(30_000);
+    if (!open) throw new Error("the board could not be read for 30 s");
+    if (session) {
+      const rows = await until(async () => replay(session.id).catch(() => undefined), Date.now() + 30_000, 3_000);
+      if (!rows) issues.push("the stored events could not be read to tie the run's items to its turns");
+      const after = (rows ?? []).filter((r) => !session.historyAtStart.has(String((r as { event_id?: unknown }).event_id ?? "")));
+      // Only the turns of the messages the run sent and knows by id tie items. A turn of a message someone else sent to the
+      // session meanwhile is not the run's; nor, as far as anything shows, is a message whose answer was lost: the server
+      // may or may not have taken it, and a person's message with the same text would look the same. Their items are left
+      // alone and said below.
+      const calls = [...turnCalls(session.stream.events, session.messages), ...storedTurnCalls(after, session.messages)];
+      const above = open.filter((x) => x.seq > floorAtStart);
+      for (const i of itemsStartedBy(calls, above, RUN_ITEMS)) RUN_ITEMS.add(i.item_id);
+    }
+    // Each item on its own: one that cannot be closed does not keep the others open.
+    for (const i of open.filter((x) => RUN_ITEMS.has(x.item_id) && !CLEARED.has(x.item_id))) {
+      try { log(`closing #${i.seq}: ${await closeItem(i)}`); } catch (err) {
+        issues.push(`#${i.seq} could not be closed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    // Each closed item was seen done (`closeItem`): the board is read again at once.
+    const final = await boardWithin(30_000);
+    if (!final) throw new Error("the board could not be read for 30 s");
+    const after = final.filter((x) => x.seq > floorAtStart && x.board_state !== "done");
+    for (const seq of after.filter((x) => RUN_ITEMS.has(x.item_id)).map((x) => x.seq)) if (!leftOpen.includes(seq)) leftOpen.push(seq);
+    // New open items the run cannot tie to its own calls are left alone, and said: on a test identity nobody else
+    // makes items, so they are most likely the run's own whose answer could not be read, and a person must look.
+    const foreign = after.filter((x) => !RUN_ITEMS.has(x.item_id)).map((x) => x.seq);
+    if (foreign.length) {
+      const lost = session?.unknownSends ? ` (${session.unknownSends} message(s) of the run whose answer was lost may have started some: check and close those)` : "";
+      issues.push(`open items not tied to the run's calls, left alone: ${foreign.join(",")}${lost}`);
+    }
+  } catch (err) {
+    issues.push(`the board could not be read to close the run's items: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return issues;
+}
+
 // --- The run ------------------------------------------------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -870,76 +1090,90 @@ async function main(): Promise<void> {
   process.on("SIGINT", stopOn);
   process.on("SIGTERM", stopOn);
   log(`mode=${MODE} plugin=${PLUGIN_ID ?? "-"} cases=${cases.length} k=${K}`);
-  let sessionId = "";
-  let stream: LiveStream | null = null;
-  let createdAssistant = false;   // the run made the identity's assistant session: it is deleted at the end
-  let priorSays: SayMark[] = [];  // the identity's counted says made before the run was listening
-  const historyAtStart = new Set<string>();   // the assistant session's events from before the run (none for one it made)
-  const historyEnds = new Set<string>();      // and the turns they ended
+  // Messages go with a signed-in token when EVAL_SEND_TOKEN_CMD gives one: it must be the same identity's.
+  if (SEND_TOKEN_CMD && LIVE && MODE === "assistant") {
+    const token = sendToken();
+    const tme = await apiClient(CLAW, token)("GET", "/v1/me");
+    // The same account: `userId`, the one identifier `/v1/me` always has (a name or an email can be shared, or missing).
+    const userId = me.json?.userId;
+    if (tme.status !== 200 || typeof userId !== "string" || !userId || tme.json?.userId !== userId) {
+      console.error(`refusing to run: the token of EVAL_SEND_TOKEN_CMD is not the key's identity (GET /v1/me answered ${tme.status})`);
+      process.exit(2);
+    }
+  }
+  let session: AssistantSession | null = null;
+  let priorSays: SayMark[] = [];  // the identity's counted says made before the run was listening (and of its earlier sessions)
   const sayLog = sayLogPath(String(me.json?.email || me.json?.name || ""));
   // The board's highest number is read before anything is made, so whatever fails after it, everything numbered above it
   // is the run's and is closed below.
   const floorAtStart = MODE === "assistant" ? Math.max(0, ...(await board()).map((i) => i.seq)) : 0;
   const results: CaseResult[] = [];
   let cleanupFailed: string[] = [];
-  let leftOpen: number[] = [];
+  const leftOpen: number[] = [];
+  let casesInSession = 0;
   try {
     if (MODE === "assistant") {
       live();
-      const a = await api("POST", "/v1/assistant", {});
-      sessionId = a.json?.data?.session_id;
-      if (a.status !== 200 || !sessionId) throw new Error(`POST /v1/assistant answered ${a.status}`);
-      createdAssistant = a.json?.data?.created === true;
-      if (createdAssistant) OWN_SESSIONS.add(sessionId);
-      else {
-        // Nobody else may be using it: another run's messages and items would be taken for this one's, and either run's
-        // cleanup would close what the other is still grading. Each parallel run needs an identity of its own.
-        const s = await api("GET", `/v1/sessions/${sessionId}`);
-        if (s.status !== 200) { console.error(`refusing to run: GET of the assistant session answered ${s.status}`); process.exit(2); }
-        const rows = await replay(sessionId).catch(() => null);
-        if (!rows) { console.error("refusing to run: the assistant session's events could not be read"); process.exit(2); }
-        const lastAt = rows.reduce<number | null>((m, x) => { const t = Date.parse(x.created_at); return Number.isFinite(t) && (m === null || t > m) ? t : m; }, null);
-        const busy = assistantInUse(s.json?.data ?? null, lastAt, Date.now(), QUIET_MS);
-        if (busy) { console.error(`refusing to run: ${busy}; another run or a person is using this identity`); process.exit(2); }
-      }
-      stream = new LiveStream(sessionId, true);
-      await stream.open();
-      // Read after the stream opened, so a say in between is counted twice rather than not at all (and an event in between is
-      // taken as before the run: nothing was sent yet).
-      const before = createdAssistant ? [] : await replay(sessionId);
-      for (const r of before as Array<EventRow & { event_id?: unknown }>) historyAtStart.add(String(r.event_id ?? ""));
-      for (const id of storedTurnEnds(before)) historyEnds.add(id);
-      priorSays = mergeSays([readSayLog(sayLog), countedSaysOf(before)], Date.now());
+      session = await openAssistant(true);
+      priorSays = mergeSays([readSayLog(sayLog), countedSaysOf(session.before)], Date.now());
     }
+    let lastCaseEnd = 0;   // when the last case that sent anything ended: the next waits EVAL_GAP_S from it
     cases: for (const c of cases) {
       const r: CaseResult = { id: c.id, area: c.area, pipeline: c.pipeline, mode: MODE, hash: c.source?.hash ?? caseHash(c), attempts: [] };
       if (stopSignal) break;
       results.push(r);
       if (c.modes && !c.modes.includes(MODE)) { r.skipped = `${c.modes.join(",")} only`; continue; }
       if (MODE !== "assistant" && c.turns.some((t) => t.files?.length)) { r.skipped = "files are sent on the assistant path only"; continue; }
+      if (GAP_MS && lastCaseEnd) {
+        try { await pause(lastCaseEnd + GAP_MS - Date.now()); } catch (err) { if (err instanceof Interrupted) break cases; throw err; }
+      }
+      // The run's variables, read again right before the case when EVAL_VARS_CMD says how (its failure is the run's error here).
+      let vars: Vars;
+      try { vars = caseVars(); } catch (err) {
+        const why = scrub(err instanceof Error ? err.message : String(err));
+        r.attempts.push({ pass: false, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: null, finalMs: null, items: [], error: why });
+        log(`ERROR ${c.id}#1 ${why}`);
+        continue;
+      }
       // Placeholders filled everywhere they sit: turns, claims, values, oracle queries and the rubric.
-      const filled = filledCase(c, VARS);
-      if (filled === null) { r.skipped = `needs ${missingVars(c, VARS).join(", ")}`; continue; }
+      const filled = filledCase(c, vars);
+      if (filled === null) { r.skipped = `needs ${missingVars(c, vars).join(", ")}`; continue; }
       const turns = filled.turns;
+      // A new assistant conversation every EVAL_FRESH_SESSION_EVERY cases: what an earlier case said is not this one's context. The
+      // old one is settled (its items closed) and deleted, and seen gone, first; a run that cannot do that stops.
+      if (MODE === "assistant" && FRESH_EVERY && casesInSession >= FRESH_EVERY) {
+        priorSays = mergeSays([priorSays, countedSays(session!.stream.events)], Date.now());
+        const old = session!;
+        session = null;
+        const issues = await closeSession(old, floorAtStart, leftOpen);
+        if (issues.length) { cleanupFailed.push(...issues); break cases; }
+        try { session = await openAssistant(false); } catch (err) {
+          cleanupFailed.push(`a new assistant session could not be had: ${err instanceof Error ? err.message : String(err)}`);
+          break cases;
+        }
+        casesInSession = 0;
+      }
+      casesInSession++;
       for (let k = 0; k < K; k++) {
         if (MODE === "assistant") {
-          try { await paceSays(stream!, priorSays); } catch (err) { if (err instanceof Interrupted) break cases; throw err; }
+          try { await paceSays(session!.stream, priorSays); } catch (err) { if (err instanceof Interrupted) break cases; throw err; }
         }
         let a: Attempt;
         const caseStart = Date.now();
         const earlier = new Set(RUN_MESSAGES);   // an earlier attempt's refusal that arrives late is not this one's
         try {
-          a = MODE === "assistant" ? await runAssistant(filled, turns, sessionId, stream!) : await runBaseline(filled, turns);
+          a = MODE === "assistant" ? await runAssistant(filled, turns, session!) : await runBaseline(filled, turns);
         } catch (err) {
           a = { pass: false, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: null, finalMs: null, items: [], error: scrub(err instanceof Error ? err.message : String(err)) };
         }
         // A say the server refused for its hourly cap is the run's failure, not the assistant's.
-        const refused = MODE === "assistant" && !a.error ? capRefusedSays(stream!.events, caseStart, earlier) : 0;
+        const refused = MODE === "assistant" && !a.error ? capRefusedSays(session!.stream.events, caseStart, earlier) : 0;
         if (refused) a = { ...a, pass: false, error: `infra: ${refused} say(s) refused by the hourly cap (say_rate_limited)` };
-        if (MODE === "assistant") writeSayLog(sayLog, mergeSays([priorSays, countedSays(stream!.events)], Date.now()));
+        if (MODE === "assistant") writeSayLog(sayLog, mergeSays([priorSays, countedSays(session!.stream.events)], Date.now()));
         r.attempts.push(a);
         const failed = a.checks.filter((x) => !x.pass).map((x) => x.name);
         log(`${a.error ? "ERROR" : a.pass ? "pass" : "FAIL"} ${c.id}#${k + 1} route=${a.route ?? "-"} cards=${a.cards ?? "-"} first=${a.firstReplyMs}ms final=${a.finalMs}ms ${a.error ?? failed.join("; ")}`);
+        lastCaseEnd = Date.now();
         if (stopSignal) break cases;
       }
     }
@@ -950,66 +1184,15 @@ async function main(): Promise<void> {
   } finally {
     // Whatever happened, nothing the run started stays open; what could not be closed fails the run.
     if (MODE === "assistant") {
-      try {
-        if (stream) {
-          // A turn already asked for may still start an item: let the run's turns end (a minute at most) and take every item
-          // their calls answered for as the run's, whatever stopped the run.
-          // A message whose answer was lost has a turn the run cannot name: it waits for as many more turns ended since it began.
-          const ended = (stored: readonly string[]): boolean => RUN_MESSAGES.every((id) => stored.includes(id))
-            && stored.filter((id) => !historyEnds.has(id)).length >= RUN_MESSAGES.length + UNKNOWN_SENDS.n;
-          const over = await turnsOver(sessionId, ended, () => !UNKNOWN_SENDS.n && RUN_MESSAGES.every((id) => turnEnded(stream!.events, id)),
-            Date.now() + Math.min(60_000, turnWaitMs(true)), until, 2_000);
-          // What a turn still running starts later is not seen, and not closed: a person must look. Named by the stored events,
-          // which are what says a turn is over.
-          if (!over) {
-            const stored = storedTurnEnds(await replay(sessionId).catch(() => []));
-            const open = RUN_MESSAGES.filter((id) => !stored.includes(id));
-            if (UNKNOWN_SENDS.n) open.push(`${UNKNOWN_SENDS.n} message(s) whose answer was lost`);
-            cleanupFailed.push(`turns of the run still running at its end (what they start is not closed): ${open.join(",") || "(the stored events could not be read)"}`);
-          }
-        }
-        // One read of the board, again for up to 30 s, both to tie items to the run's turns and to close them.
-        const open = await boardWithin(30_000);
-        if (!open) throw new Error("the board could not be read for 30 s");
-        if (stream) {
-          // Every item a turn of the session started while the run was on is the run's (nobody else was using the session: the
-          // start refused one in use), from the stream and from the stored events after the run began: a work_create answer the
-          // stream missed, or the turn of a message whose answer was lost (the run never learned its id), still ties its item.
-          const rows = await until(async () => replay(sessionId).catch(() => undefined), Date.now() + 30_000, 3_000);
-          if (!rows) cleanupFailed.push("the stored events could not be read to tie the run's items to its turns");
-          const after = (rows ?? []).filter((r) => !historyAtStart.has(String((r as { event_id?: unknown }).event_id ?? "")));
-          const calls = [...traceOf(stream.events.map((e) => ({ event_type: String(e.data.type ?? ""), created_at: new Date(e.at).toISOString(), data: e.data }))).calls,
-            ...traceOf(after).calls];
-          const above = open.filter((x) => x.seq > floorAtStart);
-          for (const i of itemsStartedBy(calls, above, RUN_ITEMS)) RUN_ITEMS.add(i.item_id);
-        }
-        // Each item on its own: one that cannot be closed does not keep the others open.
-        for (const i of open.filter((x) => RUN_ITEMS.has(x.item_id) && !CLEARED.has(x.item_id))) {
-          try { log(`closing #${i.seq}: ${await closeItem(i)}`); } catch (err) {
-            cleanupFailed.push(`#${i.seq} could not be closed: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-        // Each closed item was seen done (`closeItem`): the board is read again at once.
-        const final = await boardWithin(30_000);
-        if (!final) throw new Error("the board could not be read for 30 s");
-        const after = final.filter((x) => x.seq > floorAtStart && x.board_state !== "done");
-        leftOpen = after.filter((x) => RUN_ITEMS.has(x.item_id)).map((x) => x.seq);
-        // New open items the run cannot tie to its own calls are left alone, and said: on a test identity nobody else
-        // makes items, so they are most likely the run's own whose answer could not be read, and a person must look.
-        const foreign = after.filter((x) => !RUN_ITEMS.has(x.item_id)).map((x) => x.seq);
-        if (foreign.length) cleanupFailed.push(`open items not tied to the run's calls, left alone: ${foreign.join(",")}`);
-      } catch (err) {
-        cleanupFailed.push(`the board could not be read to close the run's items: ${err instanceof Error ? err.message : String(err)}`);
+      if (session) {
+        writeSayLog(sayLog, mergeSays([priorSays, countedSays(session.stream.events)], Date.now()));
+        cleanupFailed.push(...await closeSession(session, floorAtStart, leftOpen));
+      } else {
+        // No session open (none was had, or the run stopped while it changed sessions): the run's items are still closed.
+        cleanupFailed.push(...await closeRunItems(floorAtStart, leftOpen, null));
       }
       log(`items created by the run that are still open: ${leftOpen.length ? leftOpen.join(",") : "none"}`);
       if (leftOpen.length) cleanupFailed.push(`items still open: ${leftOpen.join(",")}`);
-      if (stream) writeSayLog(sayLog, mergeSays([priorSays, countedSays(stream.events)], Date.now()));
-      stream?.close();
-      if (createdAssistant) {
-        const gone = await deleteOwn(sessionId);
-        log(gone ? "deleted the assistant session the run created" : `could not delete the assistant session ${sessionId} the run created`);
-        if (!gone) cleanupFailed.push("the assistant session the run created was not deleted");
-      }
     }
   }
   if (sessionsLeft.length) cleanupFailed.push(`sessions the run made not deleted: ${sessionsLeft.join(",")}`);

@@ -41,6 +41,14 @@
  *       then answers 404, a refusal ends the attempt
  *   S23 files: a turn's files must name a fixture inside the cases directory; the files the assistant's messages hand the user are
  *       read with the item that delivered each; `delivers` and `min_chars` are graded, and skipped in baseline
+ *   S24 oracle steps after a pick: a state said in words, an empty list as a word, a filtered count, a file's content and a regex;
+ *       a value with `||` is named by any of its alternatives; a GraphQL oracle is a query only; an unknown step is not runnable
+ *   S25 with no_ids, a number that names a pull request, an issue, a CI run, a topic or `owner/repo#n` is not a bare item number
+ *   S26 a GitHub read that answered its failure in words is a failed call (Brain records it as a success), so a reply that it could
+ *       not read is explained; another tool's text is not read that way
+ *   S27 run variables from a JSON object: nested objects as `a.b`, null as no value
+ *   S28 a label for the kind of answer, or settings written as code, is a description, not a value; a number, a name, a path or a time is a value
+ *   S29 the stored calls of the run's own turns (the messages it knows by id): a person's turn in the same session is not one
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -57,6 +65,7 @@ import {
   apiQuery, caseSays, cardsOf, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
   assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded,
+  bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
 } from "./e2e/sa-eval-lib.js";
 
 const SEED_DIR = join(dirname(fileURLToPath(import.meta.url)), "e2e", "sa-eval-cases");
@@ -702,4 +711,120 @@ test("S23 files in, files and long answers out", () => {
   assert.deepEqual(failed(caseOf({ delivers: [{ type: "application/vnd.openxmlformats" }] }), observed({ delivered })), ["delivers * application/vnd.openxmlformats"]);
   const baseline = grade(c, observed({ mode: "baseline", route: undefined, cards: undefined, final: "x".repeat(700) }));
   assert.ok(baseline.find((x) => x.name.startsWith("delivers"))?.skipped, "baseline has no files to grade, and says so");
+});
+
+test("S24 oracle steps after a pick", () => {
+  const q = (query: string) => oracleQuery({ kind: "api", query });
+  const merged = q("gh:/repos/o/r/pulls/296#merged|map:true=merged||已合并;false=not merged||未合并");
+  assert.deepEqual(merged, { via: "github", path: "/repos/o/r/pulls/296", at: "merged", steps: ["map:true=merged||已合并;false=not merged||未合并"] });
+  assert.deepEqual(oracleValues({ merged: true }, merged!), ["merged||已合并"]);
+  assert.deepEqual(oracleValues({ merged: false }, merged!), ["not merged||未合并"]);
+  assert.ok(names("PR #296 已合并。", "merged||已合并"), "any alternative names it");
+  assert.ok(!names("PR #296 还开着。", "merged||已合并"));
+  // An empty list is a word, and a list that is not empty is left as it is.
+  const open = q("gh:/repos/o/r/pulls?state=open#*.number|empty:none||没有");
+  assert.deepEqual(oracleValues([], open!), ["none||没有"]);
+  assert.deepEqual(oracleValues([{ number: 3 }, { number: 5 }], open!), ["3", "5"]);
+  // A filtered count: one author's open pull requests out of the list.
+  const mine = q("gh:/repos/o/r/pulls?state=open#*|where:user.login=octo|count");
+  const pulls = [{ user: { login: "octo" } }, { user: { login: "someone" } }, { user: { login: "octo" } }];
+  assert.deepEqual(oracleValues(pulls, mine!), ["2"]);
+  assert.deepEqual(oracleValues(pulls, q("gh:/x#*|where:user.login!=octo|count")!), ["1"]);
+  assert.deepEqual(oracleValues([], mine!), ["0"], "none of them is a count of 0");
+  // A file's content (base64, as the contents API gives it) and a regex's first group.
+  const file = q("gh:/repos/o/r/contents/claw/package.json#content|b64|match:\"version\":\\s*\"([^\"]+)\"");
+  const content = Buffer.from('{\n  "name": "claw",\n  "version": "0.1.0"\n}\n').toString("base64").replace(/(.{20})/g, "$1\n");
+  assert.deepEqual(oracleValues({ content }, file!), ["0.1.0"]);
+  // A GraphQL count of unresolved review threads; a mutation is never an oracle.
+  const threads = q("ghql:query{repository(owner:\"o\",name:\"r\"){pullRequest(number:291){reviewThreads(first:100){nodes{isResolved}}}}}#data.repository.pullRequest.reviewThreads.nodes.*|where:isResolved=false|count");
+  assert.equal(threads?.via, "github-graphql");
+  const answer = { data: { repository: { pullRequest: { reviewThreads: { nodes: [{ isResolved: true }, { isResolved: false }, { isResolved: false }] } } } } };
+  assert.deepEqual(oracleValues(answer, threads!), ["2"]);
+  assert.equal(q("ghql:mutation{addComment(input:{}){clientMutationId}}#data"), null, "a mutation is not read");
+  assert.equal(githubReadOnlyQuery("{ viewer { login } }"), true);
+  assert.equal(githubReadOnlyQuery("query Q { a } mutation M { b }"), false);
+  // A step this runner does not know: the oracle is not runnable (the judge grades it), never read wrong.
+  assert.equal(q("gh:/x#a|sum"), null);
+  assert.equal(q("/v1/work-items#data.length|count")?.via, "claw");
+  assert.deepEqual(q("mcp:safe/node_list?limit=5#data.*|where:status=Ready|count"),
+    { via: "mcp", server: "safe", tool: "node_list", args: { limit: 5 }, at: "data.*", steps: ["where:status=Ready", "count"] });
+  // Picking within, sorting and keeping the first; a regex filter with an alternation.
+  const keys = [{ name: "b", exp: "2027-03" }, { name: "a", exp: "2026-12" }, { name: "c", exp: "2027-01", deleted: true }];
+  assert.deepEqual(oracleValues({ items: keys }, q("mcp:safe/apikey_list#items.*|where:deleted!=true|sort:exp|first|get:name")!), ["a"]);
+  assert.deepEqual(oracleValues({ items: keys }, q("mcp:safe/apikey_list#items.*|sort:-exp|take:2|get:name")!), ["b", "c"]);
+  const titled = q("/v1/work-items#data.*|where:title~行数\\|line|count");
+  assert.deepEqual(titled?.steps, ["where:title~行数|line", "count"]);
+  assert.deepEqual(oracleValues({ data: [{ title: "统计行数" }, { title: "Count LINES" }, { title: "other" }] }, titled!), ["2"]);
+  assert.deepEqual(oracleValues({ data: [{ title: "统计行数" }, { title: "other" }] }, q("/v1/work-items#data.*|where:title!~行数|get:title")!), ["other"]);
+  // The old forms are unchanged.
+  assert.deepEqual(q("gh:/search/issues?q=is:pr#total_count"), { via: "github", path: "/search/issues?q=is:pr", at: "total_count" });
+});
+
+test("S25 numbers that are not the person's items", () => {
+  for (const text of ["PR #294、#296。", "AMD-AGI/PrimusClaw 开着 2 个 PR：PR #294, #296.", "CI run #1447 failed.", "看板话题 #12。",
+    "AMD-AGI/PrimusClaw#321。", "issues #3 and #4.", "the last pull request was #306."]) {
+    assert.equal(bareItemNumber(text), null, text);
+  }
+  for (const [text, bare] of [["事项 #12。", "#12"], ["编号 #3 已完成", "编号 #3"], ["PR #294 合入了。已完成的是 #7。", "#7"], ["PR #294 合入后，事项 #8。", "#8"]] as const) {
+    assert.equal(bareItemNumber(text), bare, text);
+  }
+  const c = caseOf({ style: { no_ids: true } });
+  assert.deepEqual(failed(c, observed({ shown: ["开着的 PR：#294、#296。"], final: "开着的 PR：#294、#296。" })).filter((n) => n.startsWith("items")), []);
+  assert.deepEqual(failed(c, observed({ shown: ["#12。"], final: "#12。" })).filter((n) => n.startsWith("items")), ["items named by title"]);
+  assert.deepEqual(failed(c, observed({ shown: ["#12 修复登录超时 已完成。"], final: "x" })).filter((n) => n.startsWith("items")), []);
+});
+
+test("S26 a GitHub read that answered its failure", () => {
+  const gh = (result: string, name = "mcp__github__issue_search"): ToolCall => ({ id: name, name, input: {}, ok: true, result, at: 0 });
+  const calls = withToolFailures([
+    gh("GitHub answered 422: the request was refused as invalid"), gh("[{\"number\":1}]", "mcp__github__pr_list"),
+    gh("GitHub could not be reached (the request failed or timed out); try once more", "mcp__github__pr_get"),
+    gh("GitHub answered 422: not a GitHub tool", "mcp__safe__node_list"),
+  ]);
+  assert.deepEqual(calls.map((x) => x.ok), [false, true, false, true]);
+  // On the stream: turnCalls reads it the same way.
+  const events: LiveEvent[] = [
+    ev(1, { type: "toolUsed", message_id: "m1", tool: "mcp__github__issue_search", status: "start", actionId: "a1" }),
+    ev(2, { type: "toolUsed", message_id: "m1", tool: "mcp__github__issue_search", status: "success", actionId: "a1", result: "GitHub answered 422: the request was refused as invalid" }),
+  ];
+  assert.deepEqual(turnCalls(events, ["m1"]).map((x) => x.ok), [false]);
+  // A reply that it could not read is explained by the failed read.
+  const c = caseOf({ lang: "en", turns: [{ user: "how many PRs are open?" }] });
+  const o = observed({ final: "I can't reach GitHub search right now.", shown: ["I can't reach GitHub search right now."], calls: turnCalls(events, ["m1"]) });
+  assert.equal(grade(c, o).find((x) => x.name === "no false denial")?.unverified, undefined);
+});
+
+test("S27 run variables from a JSON object", () => {
+  assert.deepEqual(flatVars({ gh: { login: "octo", pr296: { state_text: "merged" } }, n: 3, none: null, list: [1] }),
+    { "gh.login": "octo", "gh.pr296.state_text": "merged", n: "3", none: undefined, list: "1" });
+  // A value read now as null takes away one read before: the case that needs it is skipped, never graded with the old one.
+  const vars = { ...{ "gh.n": "7" }, ...flatVars({ gh: { n: null } }) };
+  const c = caseOf({ turns: [{ user: "count {{gh.n}}" }] });
+  assert.deepEqual(missingVars(c, vars), ["gh.n"]);
+  // Nor does EVAL_VAR_<NAME> stand in for it; without the null it still does.
+  const env = { EVAL_VAR_GH_N: "7", ...flatVars({ gh: { n: null } }) };
+  assert.deepEqual(missingVars(c, env), ["gh.n"]);
+  assert.equal(filledCase(c, env), null);
+  assert.equal(filledCase(c, { EVAL_VAR_GH_N: "7" })?.turns[0]?.user, "count 7");
+});
+
+test("S28 labels and settings written as values are descriptions", () => {
+  for (const v of ["clarify", "ack", "joke", "merge=false", "merge=true, model=opus", "NOT_ACTIONS: github", "fish; ROCm", "rollback; readiness"]) {
+    assert.equal(descriptiveValue(v), true, v);
+  }
+  for (const v of ["17.38%", "test_say_refuses_uuid", "周四 15:00", "s[::-1]", "hyperloom:11-13-g62-a4440c8798", "astropy/modeling/separable.py", "批准 #{{confirm_ref}}", "3"]) {
+    assert.equal(descriptiveValue(v), false, v);
+  }
+});
+
+test("S29 the stored calls of the run's own turns: a person's turn in the same session, even with the same text, is not one", () => {
+  const msg = (id: string, text: string) => ({ event_type: "UserMessage", created_at: "2026-11-06T10:00:00Z", data: { type: "UserMessage", message_id: id, role: "user", data: { content: [{ type: "text", text }] } } });
+  const created = (id: string, item: string) => [
+    { event_type: "toolUsed", created_at: "2026-11-06T10:00:01Z", data: { type: "toolUsed", message_id: id, tool: "mcp__assistant__work_create", status: "start", actionId: `a-${id}` } },
+    { event_type: "toolUsed", created_at: "2026-11-06T10:00:02Z", data: { type: "toolUsed", message_id: id, tool: "mcp__assistant__work_create", status: "success", actionId: `a-${id}`, result: JSON.stringify({ ok: true, item_id: item, seq: 1 }) } },
+  ];
+  const rows = [msg("m1", "first"), ...created("m1", "i1"), msg("m2", "second"), ...created("m2", "i2"), msg("p1", "first"), ...created("p1", "i3")];
+  const items = (ids: string[]) => storedTurnCalls(rows, ids).filter((c) => c.ok).flatMap((c) => [...c.result.matchAll(/"item_id":"([^"]+)"/g)].map((m) => m[1])).sort();
+  assert.deepEqual(items(["m1", "m2"]), ["i1", "i2"], "the person's turn (p1) started i3, which is not the run's");
+  assert.deepEqual(items([]), [], "no message known: nothing is the run's");
 });

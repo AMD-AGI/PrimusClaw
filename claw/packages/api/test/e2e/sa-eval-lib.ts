@@ -24,6 +24,14 @@
  *                      `/v1/...#<pick>`                a Claw API GET, e.g. `/v1/work-items?state=in_progress#data.length`
  *                      `gh:/...#<pick>`                a GitHub REST GET, e.g. `gh:/search/issues?q=is:pr+author:{EVAL_GH_LOGIN}#total_count`
  *                      `mcp:<server>/<tool>?k=v#<pick>` a read tool of the plugin's MCP server, e.g. `mcp:safe/node_get?name=n1#phase`
+ *                      `ghql:<query>#<pick>`           a read-only GitHub GraphQL query (a review thread's state is only there)
+ *                    A pick may be followed by `|`-separated steps (`ORACLE_STEPS`): `where:<path>=<v>` (or `!=`) keeps the picked
+ *                    elements whose field is (not) v (`~<re>` / `!~<re>`: matches a regex, `\|` for its alternation), `get:<path>` picks
+ *                    within each, `sort:<path>` (`-<path>` descending), `first` and `take:<n>` keep the first ones, `count` is how many
+ *                    there are, `b64` decodes (a file's content), `match:<re>`
+ *                    takes a regex's first group (or the match), `map:<from>=<to>;...` says a value in words (`true=merged`), and
+ *                    `empty:<text>` stands for an empty list (`empty:none||没有`). A value with `||` is named when any one of its
+ *                    alternatives is.
  *                    A static or fixture value is a value to find in the answer (a number, a name); a description of what
  *                    the answer should say belongs in the rubric. A fact without a value or a runnable query is graded by the
  *                    judge, with the oracle's text as what it is checked against.
@@ -261,7 +269,8 @@ const PLACEHOLDER = /\{\{\s*([A-Za-z][\w.-]*)\s*\}\}|\{([A-Z][A-Z0-9_]*)\}/g;
 const HAS_PLACEHOLDER = new RegExp(PLACEHOLDER.source);
 const envName = (name: string): string => `EVAL_VAR_${name.toUpperCase().replace(/[.-]/g, "_")}`;
 const valueOf = (vars: Vars, name: string, run: boolean): string | undefined => {
-  const v = run ? (vars[name] ?? vars[envName(name)]) : vars[name];
+  // A run variable set to no value (a null read just now, `flatVars`) is no value: EVAL_VAR_<NAME> does not stand in for it.
+  const v = run && !Object.hasOwn(vars, name) ? vars[envName(name)] : vars[name];
   return v === undefined || v === "" ? undefined : v;
 };
 
@@ -303,6 +312,20 @@ export function filledCase(c: EvalCase, vars: Vars): EvalCase | null {
   };
 }
 
+/**
+ * A JSON object's values as run variables: nested objects give `a.b`. A null is no value, and is kept as one: merged over earlier
+ * variables it takes theirs away, so a value that could not be read now is never graded with one read before.
+ */
+export function flatVars(json: unknown): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = {};
+  const flat = (o: unknown, at: string): void => {
+    if (o !== null && typeof o === "object" && !Array.isArray(o)) for (const [k, v] of Object.entries(o)) flat(v, at ? `${at}.${k}` : k);
+    else if (at) out[at] = o === null || o === undefined ? undefined : String(o);
+  };
+  flat(json, "");
+  return out;
+}
+
 /** The case's turns with every placeholder filled; null when the case needs a variable that has no value. */
 export function turnsOf(c: EvalCase, vars: Vars): Turn[] | null {
   return filledCase(c, vars)?.turns ?? null;
@@ -324,16 +347,34 @@ export function toolPattern(p: string): RegExp {
  * The Claw API read of an `api` oracle (`/v1/...#pick`), or null when the query is not one this runner can run (a
  * description of a read a person or another tool makes): such a fact is graded by the judge only.
  */
-export function apiQuery(o: Oracle | undefined): { path: string; at: string } | null {
-  const m = o?.kind === "api" ? /^(\/v1\/[^#\s]*)#(\S+)$/.exec(o.query ?? "") : null;
-  return m ? { path: m[1]!, at: m[2]! } : null;
+export function apiQuery(o: Oracle | undefined): { path: string; at: string; steps?: string[] } | null {
+  const m = o?.kind === "api" ? /^(\/v1\/[^#\s]*)#(.+)$/s.exec((o.query ?? "").trim()) : null;
+  const tail = m ? pickAndSteps(m[2]!) : null;
+  return m && tail ? { path: m[1]!, ...tail } : null;
 }
 
 /** An `api` oracle this runner can read at run time, by where it reads (see the case format above). */
-export type OracleQuery =
+export type OracleQuery = (
   | { via: "claw"; path: string; at: string }
   | { via: "github"; path: string; at: string }
-  | { via: "mcp"; server: string; tool: string; args: Record<string, unknown>; at: string };
+  | { via: "github-graphql"; query: string; at: string }
+  | { via: "mcp"; server: string; tool: string; args: Record<string, unknown>; at: string }
+) & { steps?: string[] };
+
+/**
+ * The steps an oracle's pick may be followed by (`#<pick>|step|step`), in order, over what was picked. Each one either keeps some
+ * of the values or turns them into others; a step this runner does not know makes the oracle one it cannot run.
+ */
+export const ORACLE_STEPS = /^(?:count|first|b64|get:\S+|sort:-?\S+|take:\d+|where:[^=!~]+(?:!?=|!?~).*|match:.+|map:.+|empty:.+)$/s;
+
+/** `#<pick>` and its `|` steps, split; null when a step is not one of `ORACLE_STEPS`. */
+function pickAndSteps(tail: string): { at: string; steps?: string[] } | null {
+  // A single `|` separates steps; `||` inside one (alternatives of a word: `map:true=merged||已合并`) belongs to it, and so does `\|`
+  // (an alternation in a regex: `where:title~行数\|line`).
+  const [at, ...steps] = tail.split(/(?<![|\\])\|(?!\|)/).map((x) => x.replace(/\\\|/g, "|"));
+  if (!at || /\s/.test(at) || !steps.every((x) => ORACLE_STEPS.test(x))) return null;
+  return steps.length ? { at, steps } : { at };
+}
 
 /** The read an `api` oracle names, or null for one this runner cannot run (a description, or a placeholder not filled). */
 export function oracleQuery(o: Oracle | undefined): OracleQuery | null {
@@ -342,17 +383,27 @@ export function oracleQuery(o: Oracle | undefined): OracleQuery | null {
   if (HAS_PLACEHOLDER.test(q)) return null;
   const claw = apiQuery(o);
   if (claw) return { via: "claw", ...claw };
-  const gh = /^gh:(\/[^#\s]*)#(\S+)$/.exec(q);
-  if (gh) return { via: "github", path: gh[1]!, at: gh[2]! };
-  const mcp = /^mcp:([a-z0-9][a-z0-9_-]*)\/([A-Za-z0-9_]+)(?:\?([^#\s]*))?#(\S+)$/.exec(q);
-  if (!mcp) return null;
+  const gh = /^gh:(\/[^#\s]*)#(.+)$/s.exec(q);
+  if (gh) { const t = pickAndSteps(gh[2]!); return t ? { via: "github", path: gh[1]!, ...t } : null; }
+  // A query only: a mutation is never sent (`githubReadOnlyQuery`).
+  const ql = /^ghql:([^#]+)#(.+)$/s.exec(q);
+  if (ql) { const t = pickAndSteps(ql[2]!); return t && githubReadOnlyQuery(ql[1]!) ? { via: "github-graphql", query: ql[1]!.trim(), ...t } : null; }
+  const mcp = /^mcp:([a-z0-9][a-z0-9_-]*)\/([A-Za-z0-9_]+)(?:\?([^#\s]*))?#(.+)$/s.exec(q);
+  const mcpTail = mcp ? pickAndSteps(mcp[4]!) : null;
+  if (!mcp || !mcpTail) return null;
   const args: Record<string, unknown> = {};
   for (const [k, v] of new URLSearchParams(mcp[3] ?? "")) {
     // A number, a boolean or null as itself; anything else as the text it is.
     args[k] = /^(-?\d+(\.\d+)?|true|false|null)$/.test(v) ? JSON.parse(v) : v;
   }
-  return { via: "mcp", server: mcp[1]!, tool: mcp[2]!, args, at: mcp[4]! };
+  return { via: "mcp", server: mcp[1]!, tool: mcp[2]!, args, ...mcpTail };
 }
+
+/** A GraphQL document that is one query: no mutation or subscription, whatever it is named. */
+export const githubReadOnlyQuery = (q: string): boolean => {
+  const t = q.trim();
+  return /^(query\b[^{]*)?\{/.test(t) && !/\b(mutation|subscription)\b/.test(t);
+};
 
 /**
  * Where an `mcp:` oracle may connect, and with what: the server's URL when it is https on one of `hosts`, and its headers with the
@@ -383,6 +434,48 @@ export const oracleMayRun = (q: OracleQuery, reads: readonly string[]): boolean 
 
 /** Values picked from JSON by a dotted path: `data.length`, `name`, `data.*.title` (every element), `data.0.seq`. */
 export function pick(json: unknown, path: string): string[] {
+  return pickValues(json, path).map(text);
+}
+
+const text = (v: unknown): string => (typeof v === "object" ? JSON.stringify(v) : String(v));
+
+/** An oracle's values: its pick, then its steps (`ORACLE_STEPS`) in order. */
+export function oracleValues(json: unknown, q: Pick<OracleQuery, "at" | "steps">): string[] {
+  let cur = pickValues(json, q.at);
+  for (const step of q.steps ?? []) {
+    const [op, ...rest] = step.split(":");
+    const arg = rest.join(":");
+    if (op === "count") cur = [cur.length];
+    else if (op === "first") cur = cur.slice(0, 1);
+    else if (op === "take") cur = cur.slice(0, Number(arg));
+    else if (op === "get") cur = cur.flatMap((v) => pickValues(v, arg));
+    else if (op === "sort") {
+      // By a field, ascending (`sort:-field` descending); numbers as numbers, anything else as text.
+      const desc = arg.startsWith("-");
+      const key = (v: unknown): string | number => { const x = pickValues(v, desc ? arg.slice(1) : arg)[0]; return typeof x === "number" ? x : text(x ?? ""); };
+      cur = [...cur].sort((a, b) => { const x = key(a), y = key(b); const c = x < y ? -1 : x > y ? 1 : 0; return desc ? -c : c; });
+    }
+    else if (op === "b64") cur = cur.map((v) => Buffer.from(String(v).replace(/\s+/g, ""), "base64").toString("utf8"));
+    else if (op === "where") {
+      // `field=v` / `field!=v` compare the text; `field~re` / `field!~re` test a regex, case-insensitive.
+      const m = /^([^=!~]+)(!?)([=~])(.*)$/s.exec(arg)!;
+      const [field, not, op2, want] = [m[1]!.trim(), m[2] === "!", m[3], m[4]!];
+      const re = op2 === "~" ? new RegExp(want, "i") : null;
+      cur = cur.filter((v) => pickValues(v, field).map(text).some((x) => (re ? re.test(x) : x === want)) !== not);
+    } else if (op === "match") {
+      const re = new RegExp(arg, "m");
+      cur = cur.flatMap((v) => { const m = re.exec(text(v)); return m ? [m[1] ?? m[0]] : []; });
+    } else if (op === "map") {
+      const table = new Map(arg.split(";").map((pair) => { const i = pair.indexOf("="); return [pair.slice(0, i).trim(), pair.slice(i + 1)] as const; }));
+      cur = cur.map((v) => table.get(text(v)) ?? v);
+    } else if (op === "empty") {
+      if (!cur.length) cur = [arg];
+    }
+  }
+  return cur.map(text);
+}
+
+function pickValues(json: unknown, path: string): unknown[] {
   let cur: unknown[] = [json];
   for (const part of path.split(".")) {
     const next: unknown[] = [];
@@ -393,11 +486,12 @@ export function pick(json: unknown, path: string): string[] {
     }
     cur = next.filter((v) => v !== undefined && v !== null);
   }
-  return cur.map((v) => (typeof v === "object" ? JSON.stringify(v) : String(v)));
+  return cur;
 }
 
 /** Does the answer name the value? Case-insensitive, spaces ignored; a number must stand on its own (12 is not 120). */
 export function names(answer: string, value: string): boolean {
+  if (value.includes("||")) return value.split("||").some((alt) => names(answer, alt));
   const a = answer.toLowerCase().replace(/\s+/g, "");
   const v = value.toLowerCase().replace(/\s+/g, "");
   if (!v) return false;
@@ -536,6 +630,35 @@ export const SELF_INABILITY = new RegExp([
 /** With `style.no_ids`: an item named only by its number ("编号 #178", "#178。") rather than by its title. */
 export const BARE_NUMBER = /编号\s*#?\d+|#\d+(?=\s*($|[，。、,.;；:：)）!！?？]))/m;
 
+/**
+ * What says a number is not one of the person's items: a pull request, an issue, a CI run, a board topic, a plan or job, or
+ * `owner/repo#n`, earlier in the same clause ("PR #294、#296", "the last pull request was #306"), with no item named after it.
+ */
+const NOT_AN_ITEM = /\b(?:PRs?|pull requests?|pulls?|issues?|runs?|topics?|jobs?|builds?|plans?|workflows?)\b|[\w.-]+\/[\w.-]+$|拉取请求|合并请求|议题|话题|主题|运行|作业|构建|流水线/gi;
+const AN_ITEM = /\b(?:items?|tasks?)\b|事项|任务/i;
+
+/** The first item named only by its number (`BARE_NUMBER`) that is not something else's number (`NOT_AN_ITEM`); null when none is. */
+export function bareItemNumber(text: string): string | null {
+  const re = new RegExp(BARE_NUMBER.source, "gm");
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    if (m[0].startsWith("编号")) return m[0];
+    const clause = text.slice(Math.max(0, m.index - 120), m.index).split(/[。!！?？\n;；]|\.\s/).at(-1) ?? "";
+    const other = [...clause.matchAll(NOT_AN_ITEM)].at(-1);
+    if (!other || AN_ITEM.test(clause.slice(other.index! + other[0].length))) return m[0];
+  }
+  return null;
+}
+
+/**
+ * A GitHub read's failure as the router's GitHub tools word it (`github-mcp/tools.ts`, `readFailure`). Brain records such a result
+ * as a success, so a failed read would look like one that answered, and a reply that it could not read would look unexplained.
+ */
+export const GITHUB_READ_FAILURE = /^(?:GitHub answered \d{3}\b|GitHub could not be reached|GitHub refused the request|the call failed; try once more)/;
+
+/** The calls, with a GitHub read that answered its failure (`GITHUB_READ_FAILURE`) counted as failed. */
+export const withToolFailures = (calls: readonly ToolCall[]): ToolCall[] => calls.map((c) =>
+  (c.ok === true && /(^|__)github__/.test(c.name) && GITHUB_READ_FAILURE.test(c.result.trim()) ? { ...c, ok: false } : c));
+
 /** One event of a session as it arrived on the live stream (`at`: when this runner received it). */
 export interface LiveEvent { at: number; eventId: string; data: Record<string, any> }
 
@@ -580,7 +703,13 @@ export function turnCalls(events: readonly LiveEvent[], messageIds: readonly str
   const rows: EventRow[] = events
     .filter((e) => ids.has(String(e.data?.message_id ?? "")))
     .map((e) => ({ event_type: String(e.data.type ?? ""), created_at: new Date(e.at).toISOString(), data: e.data }));
-  return traceOf(rows).calls;
+  return withToolFailures(traceOf(rows).calls);
+}
+
+/** The tool calls of these turns in stored events (`?mode=replay`), as `turnCalls` reads them from a stream. */
+export function storedTurnCalls(rows: readonly EventRow[], messageIds: readonly string[]): ToolCall[] {
+  const ids = new Set(messageIds);
+  return withToolFailures(traceOf(rows.filter((r) => ids.has(String(r.data?.message_id ?? "")))).calls);
 }
 
 /**
@@ -903,8 +1032,8 @@ export function grade(c: EvalCase, o: Observed): Check[] {
       : { name: "no false denial", pass: true });
   }
   if (c.style?.no_ids) {
-    const m = BARE_NUMBER.exec(shownText);
-    out.push({ name: "items named by title", pass: m === null, detail: m ? m[0] : undefined });
+    const m = bareItemNumber(shownText);
+    out.push({ name: "items named by title", pass: m === null, detail: m ?? undefined });
   }
   if (c.style?.reply_lang === "follow_user" && c.lang !== "mixed") {
     const letters = o.final.replace(/\s/g, "").length;
@@ -1227,6 +1356,9 @@ export function armsOf(c: EvalCase, arms: Arms): Array<{ arm: "router" | "router
 /** A static or fixture value that describes what the answer should say instead of being a value to find in it. */
 export function descriptiveValue(v: string): boolean {
   const t = v.trim();
+  // A label for the kind of answer ("clarify", "ack"), or settings written as code ("merge=false", "NOT_ACTIONS: github", "fish; ROCm"),
+  // is not something the answer says either.
+  if (/^(clarify|short|joke|irrelevant|ack|abstain|refuse|greeting)$/i.test(t) || /^\w+=\w+(,\s*\w+=\w+)*$|;\s|:\s/.test(t)) return true;
   return t.split(/\s+/).length >= 3 || /\||->|>=|<=|\bor\b/.test(t)
     || /^(asks?|no|not|does|doesn't|states?|mentions?|lists?|names?|covers?|refuses?|declines?|offers?|says?|explains?|either|any|at least|reply|answer|regex)\b/i.test(t);
 }
