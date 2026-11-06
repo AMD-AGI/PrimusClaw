@@ -671,9 +671,12 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
       return res.status >= 500 ? undefined : { status: res.status, json };
     } catch { return undefined; }
   };
-  const created = await until(create, Date.now() + 60_000, 5_000);
+  // A stop ends the asking: a repeat could be the request that makes the session, and nothing is sent after a stop.
+  let created: Awaited<ReturnType<typeof create>> | null = await create();
+  if (!created && !stopSignal) created = await until(async () => (stopSignal ? null : create()), Date.now() + 60_000, 5_000);
   if (!created) {
     CLEANUP_ISSUES.push(`the session of ${c.id} was asked for and never confirmed (idempotency key ${key}): one may be left`);
+    live();
     throw new Error("the session's creation could not be confirmed in 60 s: not graded");
   }
   const sessionId: string | undefined = created.json?.data?.session_id;
