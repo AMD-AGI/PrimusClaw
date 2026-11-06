@@ -22,6 +22,7 @@ import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach, describe, mock } from "node:test";
 import { IdentityCredentialRefusedError } from "@claw/utils";
 import { LEGACY_RUN_MARKER_PREFIX } from "../src/github-review/legacy-names.js";
+import { MAX_PENDING_CONFIRMATIONS } from "../src/github-review/service.js";
 import { HEAD } from "./support/fake-github.js";
 import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, expired, ownApproval, readSection, reviewEnv, reviewedHead, subAgentEnded, unbound, type ReviewEnv } from "./support/review-env.js";
 
@@ -1107,9 +1108,9 @@ describe("C high risk waits for the acting user", () => {
     assert.deepEqual(await pending(), []);
   });
 
-  test("C10 one acting user is not asked about more than ten merges at once", async () => {
+  test("C10 one acting user is not asked about more than MAX_PENDING_CONFIRMATIONS (30) merges at once", async () => {
     e.configure({ CLAW_GITHUB_REQUESTS_PER_SESSION: "1000" });
-    for (let n = 1; n <= 10; n++) {
+    for (let n = 1; n <= MAX_PENDING_CONFIRMATIONS; n++) {
       const sha = n.toString(16).padStart(2, "0").repeat(20);
       e.gh.pr.head = { ...e.gh.pr.head, sha };
       e.gh.graphql.headRefOid = sha;
@@ -1121,7 +1122,7 @@ describe("C high risk waits for the acting user", () => {
     e.gh.graphql.headRefOid = sha;
     await reviewedHead(e, { head: sha });
     assert.equal(reason(await merge({ head_sha: sha })), "too_many_pending_confirmations");
-    assert.equal((await pending()).length, 10);
+    assert.equal((await pending()).length, MAX_PENDING_CONFIRMATIONS);
     assert.equal(e.gh.writes.length, 0);
   });
 
