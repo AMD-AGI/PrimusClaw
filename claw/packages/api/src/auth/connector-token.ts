@@ -28,7 +28,11 @@
  *     is also asked whether it is still active, and a revoked grant stops being
  *     honoured within `CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS` (5 by
  *     default): the identity client keeps an answer for 30 seconds for every
- *     caller, and a connector token is judged by none older than that.
+ *     caller, and a connector token is judged by none older than that. The one
+ *     exception is a provider that cannot be asked: then the last active answer
+ *     is used inside the client's stale window, never past the token's own
+ *     expiry (checked above), so an outage bounds a revocation by the token's
+ *     lifetime, as with introspection off.
  *
  * Off unless remote agents and the identity client are both on; with either off
  * this path abstains and the request is judged by the credentials it already had.
