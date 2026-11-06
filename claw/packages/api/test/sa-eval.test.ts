@@ -520,7 +520,7 @@ test("S17 the static check", () => {
   assert.ok(reachable("mcp__safe__workload_list", router));
   assert.ok(reachable("mcp__autopilot__get_*", router));
   assert.ok(!reachable("mcp__github*", router));
-  assert.ok(!reachable("mcp__safe__workload_logs|mcp__safe__workload_pod_logs", router));
+  assert.ok(!reachable("mcp__safe__apikey_list|mcp__safe__secret_list", router));
   assert.ok(reachable("mcp__github*", worker));
   assert.ok(reachable("web_search|bash", worker), "Brain's own tools");
   assert.ok(!reachable("mcp__pulse__*", worker));

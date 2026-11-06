@@ -11,6 +11,7 @@ import type { McpToolCaller } from "../clients/mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
 import type { RunCitations } from "./citations.js";
+import type { LogReads } from "./log-reads.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import { MEMORY_TOOLS, MEMORY_TOOL_SCHEMAS, callMemoryTool } from "./memory-tools.js";
 import {
@@ -223,6 +224,8 @@ export class ToolRouter {
   readTaint: ReadTaint | null = null;
   /** The run's `cite` (`citations.ts`): set by the engine on the top-level router, null when the request has none. */
   citations: RunCitations | null = null;
+  /** The run's `log_reads` (`log-reads.ts`): set by the engine, null when the request has none. */
+  logReads: LogReads | null = null;
 
   /**
    * Whom `a2a_call` acts for and how long the run has: the session's owner (an identity
@@ -629,6 +632,8 @@ export class ToolRouter {
       const [, server, ...rest] = name.split("__");
       const client = this.platformMcp.get(server);
       if (!client) throw new Error(`Unknown MCP server: ${server}`);
+      // A log read (`log_reads`): asked for no more than its bound, and its answer masked before anything reads it.
+      if (this.logReads?.has(name)) return this.logReads.filter(await client.callTool(rest.join("__"), this.logReads.bound(name, input), outcome, meta));
       return client.callTool(rest.join("__"), input, outcome, meta);
     }
 

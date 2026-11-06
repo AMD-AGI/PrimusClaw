@@ -37,6 +37,7 @@ import { allowedModels, modelChoiceOn, platformModel, readModelPrefs } from "./m
 import { rerunModelOf } from "./model-fallback.js";
 import { AFTER_READ_TOOLS, routerLookups } from "./read-tools.js";
 import { heldForPersonManifest, renderHeldForPerson } from "./holds.js";
+import { triggerToolSettings } from "../triggers/mcp.js";
 import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
 import { promptImagesOf, renderFilesState } from "./files.js";
@@ -236,15 +237,19 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
   } else if (role.role === "router") {
     claims = { ...base, role: "router" };
     // What the router may look up itself (`read-tools.ts`): the read-only tools of the deployment's assistant plugin, and nothing
-    // else of it (no skills, rules or write tools; a plugin the message named is not one the read list can vouch for, so it gives
-    // the router nothing); the reads of the user's own GitHub; and the web.
-    const lookups = await routerLookups(role.userId, sessionId);
+    // else of it but its reply-style rule (no skills or write tools; a plugin the message named is not one the read list can vouch
+    // for, so it gives the router nothing); the reads of the user's own GitHub; their scheduled tasks; and the web.
+    const lookups = await routerLookups(role.userId, sessionId, { mcpServers: task.mcp_servers, messageId, taskId, triggerKey: triggerToolSettings.key });
     const read = lookups.plugin;
     task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN, ...lookups.allowlist];
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
-    // Only the assistant's own server, the plugin's read servers and the user's GitHub: any other is a connection made and a tool
-    // never offered. The GitHub entry is built here from the session, as `githubMcpServers` builds a worker's.
-    task.mcp_servers = { ...lookups.githubServers };
+    // Only the assistant's own server, the plugin's read servers, the user's GitHub and the turn's own scheduled tasks: any other is
+    // a connection made and a tool never offered. The GitHub entry is built here from the session, as `githubMcpServers` builds a
+    // worker's; the `schedules` one is kept only when this API minted its bearer for this turn (`ownTriggerServer`).
+    task.mcp_servers = { ...lookups.servers };
+    // The plugin's log reads: bounded to their last lines, and masked before the model reads them (Brain, `log-reads.ts`).
+    if (lookups.logReads) task.log_reads = lookups.logReads;
+    else delete task.log_reads;
     for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
     if (read) {
       task.plugin_id = read.pluginId;

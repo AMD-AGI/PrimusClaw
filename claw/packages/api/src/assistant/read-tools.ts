@@ -10,15 +10,21 @@
  * (Brain enforces `tools_allowlist` on both). The servers come only from the deployment's assistant plugin
  * (`CLAW_ASSISTANT_PLUGIN_ID`), never from a plugin a message names: a name says nothing about where a server is, so the list
  * holds only for servers the operator chose. Of that plugin only its `mcp` rows, and of them only the servers listed here, so a
- * router turn neither connects to a server it may not call nor is shown the plugin's skills and rules.
+ * router turn neither connects to a server it may not call nor is shown the plugin's skills; of its rules, only ROUTER_RULES.
  *
  * Besides the plugin's: the reads of the API's own GitHub server (`github-mcp/`), as the user, for a user who keeps a GitHub
- * token, the same entry a worker's turn is given; and Brain's web search and fetch, where the deployment's Brain has them.
+ * token, the same entry a worker's turn is given; the user's scheduled tasks (`trigger_list` of the API's own `schedules` server,
+ * where the turn was given it); and Brain's web search and fetch, where the deployment's Brain has them.
+ *
+ * Of the plugin's reads, the ones that return a log (ROUTER_LOG_READS) are bounded and filtered by Brain (`ExecuteRequest.log_reads`):
+ * a router turn asks for the last ROUTER_LOG_LINES lines or entries, and credential-shaped text in the answer is masked before the
+ * model sees it. And of the plugin's rules, the ones named in ROUTER_RULES are the router's too: how a reply is written.
  */
-import { GITHUB_MCP_SERVER } from "@claw/protocol";
-import { CLAW_ASSISTANT_PLUGIN_ID } from "../config.js";
+import { GITHUB_MCP_SERVER, TRIGGER_MCP_PATH, TRIGGER_MCP_SERVER } from "@claw/protocol";
+import { CLAW_ASSISTANT_PLUGIN_ID, INTERNAL_BACKEND_URL } from "../config.js";
 import { githubMcpServers } from "../github-mcp/mcp.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
+import { verifyTriggerToken } from "../triggers/token.js";
 import { routerReadsByServer } from "./tool-classes.js";
 
 /**
@@ -28,6 +34,30 @@ import { routerReadsByServer } from "./tool-classes.js";
  * read's prefix is never offered.
  */
 export const ROUTER_READ_TOOLS: Readonly<Record<string, readonly string[]>> = routerReadsByServer();
+
+/**
+ * Of the reads above, the ones whose answer is a log, each with the argument that counts its lines or entries. Brain asks for at
+ * most ROUTER_LOG_LINES of them and masks credential-shaped text in what they answer before the model reads it (`log_reads`): a
+ * job prints its environment, and what a router turn reads it may say to the person. A read with an empty argument counts nothing
+ * but may carry a log's end, and is masked only: a pod's containers, whose termination message Kubernetes fills from the last
+ * lines of the log (`terminationMessagePolicy: FallbackToLogsOnError`).
+ */
+export const ROUTER_LOG_READS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  safe: {
+    workload_logs: "limit", workload_events: "limit", workload_pod_logs: "tail_lines", node_pod_logs: "tail_lines",
+    node_reboot_logs: "limit", cluster_logs: "tail_lines", workload_pod_containers: "",
+  },
+};
+/** The lines or entries a router turn's log read asks for: the end of a log, where a failure is. */
+export const ROUTER_LOG_LINES = 40;
+/** What of a plain-text log answer a router turn keeps, from its end. */
+export const ROUTER_LOG_CHARS = 6000;
+
+/** The plugin's rules a router turn is given, by name: how a reply is written, which is the router's to do. */
+export const ROUTER_RULES: readonly string[] = ["teams-reply-style"];
+
+/** The reads of the API's own `schedules` server a router turn may call: the user's scheduled tasks. */
+export const ROUTER_TRIGGER_READ_TOOLS = ["trigger_list"] as const;
 
 /** The `tools_allowlist` entries of one server's read tools, as Brain names them. */
 export function readToolPatterns(server: string): string[] {
@@ -68,6 +98,10 @@ export interface RouterLookups {
   plugin: RouterReadTools | null;
   /** The turn's `github` server, as a worker's turn gets it; empty for a user who keeps no GitHub token. */
   githubServers: McpServers;
+  /** Every MCP server the turn connects to besides the plugin's: `githubServers`, and its own `schedules` server when it has one. */
+  servers: McpServers;
+  /** The turn's `log_reads`, or null when it has no log read. */
+  logReads: { tools: Record<string, string>; lines: number; chars: number } | null;
   /** The reads of that server the turn may call: `ROUTER_GITHUB_READ_TOOLS`, or none without the server. */
   githubTools: readonly string[];
   /** Every lookup tool as `tools_allowlist` entries: the turn's `read_taint` sources as well. */
@@ -81,18 +115,54 @@ export interface RouterLookups {
   cleanFailures: string[];
 }
 
-/** A router turn's lookups: the plugin's read tools, the user's GitHub, and the web. */
-export async function routerLookups(userId: string, sessionId: string): Promise<RouterLookups> {
+/**
+ * The turn's own `schedules` server, as `applyTriggerToolsToTask` (`triggers/mcp.ts`) gave it, or nothing: kept only when it is
+ * at the API's own address and its bearer is one this API minted for this turn (this session, this message, this run). A request's own
+ * `mcp_servers` is caller input, and any other entry by that name is not the user's scheduled tasks.
+ */
+export function ownTriggerServer(carried: unknown, sessionId: string, messageId: string, taskId: string, key: string): McpServers {
+  if (!carried || typeof carried !== "object" || !Object.hasOwn(carried, TRIGGER_MCP_SERVER)) return {};
+  const spec = (carried as McpServers)[TRIGGER_MCP_SERVER];
+  if (!spec || typeof spec !== "object" || spec.url !== `${INTERNAL_BACKEND_URL}${TRIGGER_MCP_PATH}` || typeof spec.token !== "string") return {};
+  const verdict = verifyTriggerToken(spec.token, key);
+  if (!verdict.ok || verdict.claims.sid !== sessionId || verdict.claims.mid !== messageId || verdict.claims.task_id !== taskId) return {};
+  return { [TRIGGER_MCP_SERVER]: spec };
+}
+
+/** The turn's `log_reads` for the plugin's servers it connects to, or null when none of them has a log read. */
+export function routerLogReads(servers: readonly string[]): RouterLookups["logReads"] {
+  const tools: Record<string, string> = {};
+  for (const server of servers) {
+    if (!Object.hasOwn(ROUTER_LOG_READS, server)) continue;
+    for (const [tool, arg] of Object.entries(ROUTER_LOG_READS[server])) tools[`mcp__${server}__${tool}`] = arg;
+  }
+  return Object.keys(tools).length ? { tools, lines: ROUTER_LOG_LINES, chars: ROUTER_LOG_CHARS } : null;
+}
+
+/**
+ * A router turn's lookups: the plugin's read tools, the user's GitHub, the user's scheduled tasks, and the web. `turn` is what the
+ * request already carries: its MCP servers (where `applyTriggerToolsToTask` put the turn's `schedules` server), its message id,
+ * and the trigger tools' key.
+ */
+export async function routerLookups(
+  userId: string, sessionId: string, turn: { mcpServers?: unknown; messageId?: string; taskId?: string; triggerKey?: string } = {},
+): Promise<RouterLookups> {
   const plugin = await routerReadTools(userId);
   const githubServers = await githubMcpServers(sessionId);
   const githubTools = Object.hasOwn(githubServers, GITHUB_MCP_SERVER) ? ROUTER_GITHUB_READ_TOOLS : [];
+  const schedules = turn.messageId && turn.taskId && turn.triggerKey
+    ? ownTriggerServer(turn.mcpServers, sessionId, turn.messageId, turn.taskId, turn.triggerKey) : {};
+  const triggerReads = Object.hasOwn(schedules, TRIGGER_MCP_SERVER) ? ROUTER_TRIGGER_READ_TOOLS.map((t) => `mcp__${TRIGGER_MCP_SERVER}__${t}`) : [];
   const cleanFailures = [...githubTools.map((t) => `mcp__${GITHUB_MCP_SERVER}__${t}`), ...ROUTER_WEB_TOOLS];
-  return { plugin, githubServers, githubTools, allowlist: [...(plugin?.allowlist ?? []), ...cleanFailures], cleanFailures };
+  return {
+    plugin, githubServers, servers: { ...githubServers, ...schedules }, githubTools, logReads: routerLogReads(plugin?.servers ?? []),
+    allowlist: [...(plugin?.allowlist ?? []), ...triggerReads, ...cleanFailures], cleanFailures,
+  };
 }
 
 export interface RouterReadTools {
   pluginId: number;
-  /** The plugin's `mcp` rows, each cut to the servers that have read tools here. */
+  /** The plugin's `mcp` rows, each cut to the servers that have read tools here, and its rules named in ROUTER_RULES. */
   pluginTools: unknown[];
   /** The servers the turn connects to, in the order the plugin lists them. */
   servers: string[];
@@ -110,14 +180,17 @@ export function assistantPluginId(named: unknown): number | null {
   return positiveInt(named) ?? positiveInt(CLAW_ASSISTANT_PLUGIN_ID);
 }
 
-/** Cut a plugin's tools to its MCP servers that have read tools. Pure, for the tests. */
+/** Cut a plugin's tools to its MCP servers that have read tools, and its rules named in ROUTER_RULES. Pure, for the tests. */
 export function readToolsOfPlugin(pluginId: number, tools: readonly unknown[]): RouterReadTools {
   const pluginTools: unknown[] = [];
   const servers: string[] = [];
   for (const tool of tools) {
     if (!tool || typeof tool !== "object") continue;
     const row = tool as Record<string, unknown>;
-    if (String(row.type ?? "").toLowerCase() !== "mcp") continue;
+    const type = String(row.type ?? "").toLowerCase();
+    // A rule is text Brain adds to the prompt (its file, by `config.s3_key`): carried as the plugin has it.
+    if (type === "rule" && typeof row.name === "string" && ROUTER_RULES.includes(row.name)) { pluginTools.push(row); continue; }
+    if (type !== "mcp") continue;
     const config = row.config && typeof row.config === "object" ? row.config as Record<string, unknown> : {};
     const all = config.mcpServers && typeof config.mcpServers === "object" ? config.mcpServers as Record<string, unknown> : {};
     const kept = Object.fromEntries(Object.entries(all).filter(([name]) => readToolPatterns(name).length > 0 && !servers.includes(name)));
