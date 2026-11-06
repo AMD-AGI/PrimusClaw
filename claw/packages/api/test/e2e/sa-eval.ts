@@ -889,16 +889,19 @@ async function main(): Promise<void> {
             const stored = storedTurnEnds(await replay(sessionId).catch(() => []));
             cleanupFailed.push(`turns of the run still running at its end (what they start is not closed): ${RUN_MESSAGES.filter((id) => !stored.includes(id)).join(",") || "(the stored events could not be read)"}`);
           }
+        }
+        // One read of the board, again for up to 30 s, both to tie items to the run's turns and to close them.
+        const open = await boardWithin(30_000);
+        if (!open) throw new Error("the board could not be read for 30 s");
+        if (stream) {
           // From the stream and from the stored events: a work_create answer the stream missed still ties its item to the run.
-          const above = ((await boardWithin(30_000)) ?? []).filter((x) => x.seq > floorAtStart);
           const rows = await until(async () => replay(sessionId).catch(() => undefined), Date.now() + 30_000, 3_000);
           if (!rows) cleanupFailed.push("the stored events could not be read to tie the run's items to its turns");
           const storedCalls = traceOf((rows ?? []).filter((r) => RUN_MESSAGES.includes(String(r.data?.message_id ?? "")))).calls;
+          const above = open.filter((x) => x.seq > floorAtStart);
           for (const i of itemsStartedBy([...turnCalls(stream.events, RUN_MESSAGES), ...storedCalls], above, RUN_ITEMS)) RUN_ITEMS.add(i.item_id);
         }
         // Each item on its own: one that cannot be closed does not keep the others open.
-        const open = await boardWithin(30_000);
-        if (!open) throw new Error("the board could not be read for 30 s");
         for (const i of open.filter((x) => RUN_ITEMS.has(x.item_id) && !CLEARED.has(x.item_id))) {
           try { log(`closing #${i.seq}: ${await closeItem(i)}`); } catch (err) {
             cleanupFailed.push(`#${i.seq} could not be closed: ${err instanceof Error ? err.message : String(err)}`);

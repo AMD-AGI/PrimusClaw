@@ -31,7 +31,7 @@
  *   R10 an oracle that could not be read makes the attempt the run's error before anything is sent; one that answers is graded
  *   R11 a read the grade needs that failed (a worker's events, the board through the item wait) makes the attempt the run's
  *      error, its item still closed; in the final cleanup, a board that answers again after a while is read again and the
- *      run's items are closed
+ *      run's items are closed (R11b: one the attempt never saw, tied by its work_create answer on that same read)
  *   R8 a work_create that found someone else's open item with the same title (`deduplicated`): that item is not the run's, and
  *      is neither closed nor stripped of its worker's session
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
@@ -691,6 +691,12 @@ test("R11 a read that failed is the run's error, and the cleanup reads again", {
         claw.emit({ type: "AssistantSay", say_id: `ready-${id}`, turn_message_id: "", text: "Task 2 is ready.", item: { item_id: it.item_id, board_state: "ready", can_accept: true } });
       }, 500);
     }
+    if (content === "no board") {
+      // The board cannot be read from the turn on, for 8 s: the attempt never saw its item; the final cleanup finds it.
+      claw.boardScript = [];
+      claw.boardFailUntil = Date.now() + 8_000;
+      claw.turn(id, { item: item(3, { board_state: "in_progress", can_accept: false }), say: "On it." });
+    }
   };
   const r = runner(base, [itemCase({ id: "t-r-001", turns: [{ user: "worker" }] }), itemCase({ id: "t-r-002", turns: [{ user: "board" }], item_wait_s: 2 })]);
   const run = await r.done;
@@ -699,6 +705,28 @@ test("R11 a read that failed is the run's error, and the cleanup reads again", {
     assert.match(run.out, /ERROR t-r-001#1 .*infra: could not read item 1's worker calls \(replay answered 500\): not graded/, run.out);
     assert.match(run.out, /ERROR t-r-002#1 .*infra: could not read the board \(board answered 503\): not graded/);
     assert.deepEqual(claw.calls.filter((c) => c.includes("/accept")).sort(), ["POST /v1/work-items/item-1/accept", "POST /v1/work-items/item-2/accept"], "both closed");
-    assert.ok(!claw.sessions.has("worker-2"), "the cleanup read the board again and deleted item 2's worker session");
+    assert.ok(!claw.sessions.has("worker-2"), "its worker's session deleted");
+    const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+    assert.deepEqual(report.cleanup_failed, [], "the final cleanup completed");
+  } finally { rmSync(r.dir, { recursive: true, force: true }); }
+});
+
+test("R11b an item the attempt never saw, the board down: the final cleanup reads it again and closes it", { timeout: 120_000 }, async () => {
+  const claw = new FakeClaw();
+  const base = await claw.start();
+  claw.router = (_content, id) => {
+    // The board cannot be read from the turn on, for 8 s.
+    claw.boardFailUntil = Date.now() + 8_000;
+    claw.turn(id, { item: item(3, { board_state: "in_progress", can_accept: false }), say: "On it." });
+  };
+  const r = runner(base, [itemCase({ id: "t-r-003", item_wait_s: 2 })]);
+  const run = await r.done;
+  await claw.stop();
+  try {
+    assert.match(run.out, /ERROR t-r-003#1 .*board answered 503/, run.out);
+    assert.deepEqual(claw.calls.filter((c) => c.includes("/stop") || c.includes("/accept")), ["POST /v1/work-items/item-3/stop"], "tied by its work_create answer, closed");
+    assert.ok(!claw.sessions.has("worker-3"), "its worker's session deleted");
+    const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+    assert.deepEqual(report.cleanup_failed, [], "the final cleanup completed");
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });
