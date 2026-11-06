@@ -31,9 +31,11 @@ const MAX_SUBSCRIPTIONS_PER_USER = 5;
 // `approval.requested` and the assistant's events are accepted here but are not in the
 // default set a new subscription gets (the INSERT below): a receiver has to ask for them.
 // `sources` says what started a run, so it narrows run events only; an assistant event
-// reaches every subscription that lists its type.
+// reaches every subscription that lists its type. `assistant_item` is the one source that is
+// not a run's: an `approval.requested` that an assistant's work item holds (`assistant/holds.ts`).
+// It is not in the default set either, so only a receiver that can draw such a request gets one.
 const EVENT_TYPES: string[] = ["run.completed", "run.failed", "approval.requested", ...ASSISTANT_EVENT_TYPES];
-const SOURCES = ["trigger", "long_run"];
+const SOURCES = ["trigger", "long_run", "assistant_item"];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function requireRealUser(req: FastifyRequest, reply: FastifyReply): string | null {

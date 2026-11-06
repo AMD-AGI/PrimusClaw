@@ -17,7 +17,7 @@ import { repoSkillsToList } from "../workspace/repo-skills.js";
 import { normalizeMcpConfigs, originsSendingPlaceholder } from "../clients/mcp-config.js";
 import { DEFAULT_BASH_APPROVAL_RULES } from "./bash-approval-defaults.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
-import { HitlController } from "./hitl.js";
+import { decisionWaitMs, HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp, mcpUnavailableNote } from "../clients/mcp.js";
@@ -387,8 +387,11 @@ export class AgentEngine {
     const decisions = (anyApproval || ASK_USER_QUESTION_ENABLED) && extras?.natsConnection
       ? new DecisionDispatcher(extras.natsConnection, sessionId)
       : null;
+    // How long a person is waited for in this run: the API's word for an assistant's work item, else Brain's settings.
+    const waitMs = decisionWaitMs(request.decision_wait_ms);
     const hitl = anyApproval
       ? new HitlController(decisions, onEvent, {
+          ...(waitMs !== undefined ? { timeoutMs: waitMs } : {}),
           requireApproval: (t) => approval.requiresApproval(t),
           autoApprovalRule: (t, input) => approval.autoApprovalRule(t, input),
           requireApprovalFor: (t, input) =>
@@ -631,6 +634,7 @@ export class AgentEngine {
           // available" whenever it was called and a question could not be asked
           // of anyone, a web client or an A2A caller.
           questionDispatcher: decisions ?? undefined,
+          ...(waitMs !== undefined ? { questionTimeoutMs: waitMs } : {}),
           onCheckpoint: extras?.onCheckpoint,
           onCacheUse: extras?.onCacheUse,
           resumeFrom: extras?.resumeCheckpoint,

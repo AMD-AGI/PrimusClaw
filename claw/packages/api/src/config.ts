@@ -829,6 +829,11 @@ export const CLAW_ASSISTANT_OBSERVE = envBool("CLAW_ASSISTANT_OBSERVE", false);
 // How long an item in progress may go without any sign of progress before the watchdog puts it in front of
 // its owner, with the reason (`assistant/watchdog.ts`). 0 is off.
 export const CLAW_ASSISTANT_WATCHDOG_SEC = envInt("CLAW_ASSISTANT_WATCHDOG_SEC", 0, { min: 0 });
+// How long a work item's worker waits for its person's decision on a held tool call, or for the answer to its question,
+// before the call is refused (`decision_wait_ms` of its turns; `assistant/holds.ts`). The item waits in needs_you meanwhile,
+// and the person is told on their channel. 0 leaves Brain's own settings, a few minutes, which nobody away from the
+// console could meet.
+export const CLAW_ASSISTANT_DECISION_WAIT_SEC = envInt("CLAW_ASSISTANT_DECISION_WAIT_SEC", 3600, { min: 0, max: 86_400 });
 // Model choice for the assistant's items (`assistant/model-choice.ts`): an item's model asked for in the message, the user's
 // own defaults, an allow-list, and a fallback when the payer's key cannot use a model. `on` turns it on; anything else (the
 // default) leaves every tool, prompt, table and turn exactly as without it. An empty CLAW_ASSISTANT_MODELS is the same as off.

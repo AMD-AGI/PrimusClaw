@@ -43,6 +43,7 @@ import { registerNotificationSubscriptionRoutes } from "./routes/notification-su
 import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
 import { startNotificationWorker } from "./notifications/outbox.js";
 import { registerAssistantDeliveryHook } from "./assistant/outbound.js";
+import { registerHoldDeliveryHook } from "./assistant/holds.js";
 import { a2aPushEnabled } from "./routes/a2a-flags.js";
 import { startA2aPushWorker } from "./routes/a2a-push.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
@@ -391,6 +392,8 @@ async function main() {
   if (CLAW_NOTIFICATIONS_ENABLED) startNotificationWorker();
   // The assistant's messages go out through the same outbox, so both switches have to be on.
   if (CLAW_NOTIFICATIONS_ENABLED && CLAW_ASSISTANT_ENABLED) registerAssistantDeliveryHook();
+  // A work item's request that a channel took is the item's needs-you message (`assistant/holds.ts`).
+  if (CLAW_NOTIFICATIONS_ENABLED && CLAW_ASSISTANT_ENABLED) registerHoldDeliveryHook();
   if (a2aPushEnabled()) startA2aPushWorker();
   // Reads the pull requests work items watch and hands what is new to their workers; does nothing unless both switches are on.
   startGithubEventWatch();

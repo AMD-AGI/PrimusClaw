@@ -35,6 +35,7 @@ import { rerunOnFallback } from "../assistant/model-fallback.js";
 import { a2aPushEnabled } from "../routes/a2a-flags.js";
 import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
 import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
+import { holdForPerson, QUESTION_TOOL, releaseHold } from "../assistant/holds.js";
 import {
   markChatRunRunning, closeChatRun, gateNamesEndedTurnSql, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
@@ -506,15 +507,27 @@ export async function consumeEventDelivery(msg: {
       // up. Best-effort: a row left describing itself as preparing is a
       // reporting inaccuracy, and this event is not worth redelivering over.
       await markChatRunRunning(sessionId);
-    } else if (event.type === "permissionRequest" && CLAW_NOTIFICATIONS_ENABLED) {
-      // Brain is now waiting for a person to decide on a held tool call. Tell the
-      // owner's subscriptions, so the wait does not depend on someone watching the
-      // run. Best-effort like the run notifications, and idempotent: the row's
-      // key is derived from the request, so a redelivered event records nothing new.
+    } else if (event.type === "permissionRequest" || event.type === "userQuestion") {
+      // A work item's worker asking its person is the item's to tell (`assistant/holds.ts`).
+      const taken = CLAW_ASSISTANT_ENABLED ? await eventNotificationPorts.holdOrRetry(sessionId, event, msg) : "session";
+      if (taken === "retry") return;
+      if (taken === "session" && event.type === "permissionRequest" && CLAW_NOTIFICATIONS_ENABLED) {
+        // Brain is now waiting for a person to decide on a held tool call. Tell the
+        // owner's subscriptions, so the wait does not depend on someone watching the
+        // run. Best-effort like the run notifications, and idempotent: the row's
+        // key is derived from the request, so a redelivered event records nothing new.
+        try {
+          await eventNotificationPorts.recordApprovalRequested({ sessionId, event });
+        } catch (err) {
+          logger.error({ err, sessionId }, "notification.approval_record_failed");
+        }
+      }
+    } else if (CLAW_ASSISTANT_ENABLED && (event.type === "decisionResult" || (event.type === "toolUsed" && event.tool === QUESTION_TOOL))) {
+      // The wait is over (a decision, an answer, or Brain gave up): an item held for it goes back to in progress.
       try {
-        await eventNotificationPorts.recordApprovalRequested({ sessionId, event });
+        await eventNotificationPorts.releaseHold({ sessionId, event });
       } catch (err) {
-        logger.error({ err, sessionId }, "notification.approval_record_failed");
+        logger.error({ err, sessionId }, "assistant.hold_release_failed");
       }
     }
 
@@ -818,6 +831,22 @@ function runClaimOf(event: Record<string, unknown>): number | undefined {
  */
 export const eventNotificationPorts = {
   recordApprovalRequested,
+  holdForPerson,
+  releaseHold,
+  /**
+   * A worker of a work item asks its person (`assistant/holds.ts`). "taken": the item holds it and its person is told, or it
+   * is nobody's to tell any more. "session": not an item's worker; the request is any session's. "retry": recording it
+   * failed, and the event is redelivered (it is idempotent), since an item left in progress is a request nobody hears of.
+   */
+  async holdOrRetry(sessionId: string, event: Record<string, unknown>, msg: { nak: (millis?: number) => void }): Promise<"taken" | "session" | "retry"> {
+    try {
+      return (await eventNotificationPorts.holdForPerson({ sessionId, event })) === "not_an_item" ? "session" : "taken";
+    } catch (err) {
+      logger.error({ err, sessionId, type: event.type }, "assistant.hold_record_failed");
+      msg.nak(5_000);
+      return "retry";
+    }
+  },
 };
 
 /**

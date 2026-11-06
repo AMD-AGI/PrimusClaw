@@ -17,8 +17,8 @@
  */
 import pino from "pino";
 import {
-  CLAW_AGENT_GUIDELINE_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_ROUTER_MAX_TURNS, CLAW_ASSISTANT_TOKEN_KEY,
-  CLAW_ASSISTANT_TOOLS, CLAW_ASSISTANT_WORKER_MODEL, INTERNAL_BACKEND_URL,
+  CLAW_AGENT_GUIDELINE_ENABLED, CLAW_ASSISTANT_DECISION_WAIT_SEC, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_ROUTER_MAX_TURNS,
+  CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS, CLAW_ASSISTANT_WORKER_MODEL, INTERNAL_BACKEND_URL,
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
@@ -35,6 +35,7 @@ import {
 import { allowedModels, modelChoiceOn, platformModel, readModelPrefs } from "./model-choice.js";
 import { rerunModelOf } from "./model-fallback.js";
 import { AFTER_READ_TOOLS, routerLookups } from "./read-tools.js";
+import { heldForPersonManifest, renderHeldForPerson } from "./holds.js";
 import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
 import { startWorkerRun } from "./run-started.js";
@@ -252,6 +253,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     const github = lookups.githubTools.length > 0;
     withSystemAppend(task, renderRouterPrompt({ servers: read?.servers ?? [], github: lookups.githubTools }));
     const state = [renderRouterItems(await routerManifest(role.userId), await askedOfOthersManifest(role.userId))];
+    // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
+    state.push(renderHeldForPerson(await heldForPersonManifest(role.userId)));
     if (CLAW_ASSISTANT_TOOLS) {
       withSystemAppend(task, ROUTER_REVIEW_PROMPT);
       const review = await reviewContextFor(role.userId, sessionId, messageId);
@@ -299,6 +302,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     withSystemAppend(task, renderWorkerSystem({ seq: started.seq, title: started.title }));
     // A worker does its item's work in the sandbox, so Brain opens it beside the turn's first model call rather than after it.
     task.sandbox_prestart = true;
+    // A write it holds, or a question it asks, waits for a person who is told on their channel and may be away: not Brain's minutes.
+    if (CLAW_ASSISTANT_DECISION_WAIT_SEC > 0) task.decision_wait_ms = CLAW_ASSISTANT_DECISION_WAIT_SEC * 1000;
     const memory = await workerMemoryBlock(role.userId, started.itemId, sessionId);
     if (memory) withSystemAppend(task, memory);
     logger.info({ sessionId, taskId, itemId: started.itemId, generation: started.generation, prompt: WORKER_PROMPT_VERSION }, "assistant.worker_turn");

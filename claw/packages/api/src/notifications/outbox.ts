@@ -22,7 +22,7 @@ import { decryptUserEnvValue } from "../crypto/user-env.js";
 import { db, type Querier } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { approvalTarget, redactCommandSecrets } from "./approval-target.js";
-import type { AssistantEventPayload } from "./assistant-events.js";
+import type { AssistantEventPayload, AssistantItemSnapshot } from "./assistant-events.js";
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, signPayload } from "./signing.js";
 import { httpTransport, type Transport } from "./transport.js";
 import { guardWebhookUrl, parseAllowedHosts, type Resolver } from "./url-guard.js";
@@ -77,6 +77,26 @@ export interface NotificationPayload {
   link: string;
   /** Present on `approval.requested` only. */
   approval?: ApprovalInfo;
+  /**
+   * `assistant_item`: an `approval.requested` held by the worker of an assistant's work item (`assistant/holds.ts`), sent only to a
+   * subscription that lists that source. Absent on every other event.
+   */
+  source?: "assistant_item";
+  /** With `source`: the work item that waits, as an assistant event draws it. */
+  item?: AssistantItemSnapshot;
+  /**
+   * With `source`, when what waits is a question (`approval.tool` is `ask_user_question`): what it asks. Answered as a client
+   * answers any question (`messageType: "answer"`), not with a decision.
+   */
+  questions?: HeldQuestion[];
+}
+
+/** One question of an `ask_user_question`, as a channel shows it: masked and clipped. */
+export interface HeldQuestion {
+  id: string;
+  question: string;
+  options: Array<{ id: string; label: string }>;
+  allow_multiple: boolean;
 }
 
 /** Everything an outbox row can carry. Run events keep `NotificationPayload`; an assistant event has its own. */
@@ -191,6 +211,20 @@ const TITLE_MAX = 200;
 const text = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
 /**
+ * When Brain began waiting for a person on this request (`permissionRequest`, `userQuestion`), and when it stops: epoch
+ * milliseconds. The wait began when Brain emitted the event. A timestamp in the future can only be clock skew: the wait
+ * began now. A timestamp in the past is a late delivery (a consumer that fell behind, a redelivery) and is kept, so the
+ * expiry is the one Brain is working to.
+ */
+export function waitWindow(event: Record<string, unknown>, clock: number): { startedAt: number; expiresAt: number } {
+  const emittedAt = Number(event.ts);
+  const startedAt = Number.isFinite(emittedAt) && emittedAt > 0 ? Math.min(emittedAt, clock) : clock;
+  const waitMs = Number(event.timeout_ms);
+  const waitWindowMs = Number.isFinite(waitMs) && waitMs > 0 && waitMs <= APPROVAL_MAX_WAIT_MS ? waitMs : APPROVAL_DEFAULT_WAIT_MS;
+  return { startedAt, expiresAt: startedAt + waitWindowMs };
+}
+
+/**
  * Record a notification for a tool call that is held for a person's decision.
  *
  * Fed by the `permissionRequest` event Brain emits when it starts waiting. The
@@ -241,18 +275,13 @@ export async function recordApprovalRequested(
   if (!subs.length) return 0;
 
   const clock = now();
-  const emittedAt = Number(event.ts);
-  // The wait began when Brain emitted the event. A timestamp in the future can only be clock skew:
-  // the wait began now. A timestamp in the past is a late delivery (a consumer that fell behind, a
-  // redelivery) and is kept, so the expiry is the one Brain is working to.
-  const startedAt = Number.isFinite(emittedAt) && emittedAt > 0 ? Math.min(emittedAt, clock) : clock;
-  const waitMs = Number(event.timeout_ms);
-  const waitWindowMs = Number.isFinite(waitMs) && waitMs > 0 && waitMs <= APPROVAL_MAX_WAIT_MS ? waitMs : APPROVAL_DEFAULT_WAIT_MS;
+  const window = waitWindow(event, clock);
   // Brain has already stopped waiting: a push now would announce a request nobody can still answer.
-  if (startedAt + waitWindowMs <= clock) {
-    logger.info({ sessionId, lateByMs: clock - startedAt - waitWindowMs }, "notification.approval_expired_skipped");
+  if (window.expiresAt <= clock) {
+    logger.info({ sessionId, lateByMs: clock - window.expiresAt }, "notification.approval_expired_skipped");
     return 0;
   }
+  const { startedAt } = window;
 
   // The run this request belongs to: Brain stamps every event with the message id of the turn.
   const messageId = text(event.message_id);
@@ -282,7 +311,7 @@ export async function recordApprovalRequested(
       tool_use_id: toolUseId.slice(0, 200),
       tool: redactCommandSecrets(tool).slice(0, 200),
       target: approvalTarget(tool, event.input),
-      expires_at: new Date(startedAt + waitWindowMs).toISOString(),
+      expires_at: new Date(window.expiresAt).toISOString(),
     },
   };
   return enqueue(eventId, subs, payload);

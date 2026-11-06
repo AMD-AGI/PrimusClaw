@@ -58,9 +58,11 @@ import { fileURLToPath } from "node:url";
 import { apiClient, until } from "./assistant-p1-lib.js";
 import { traceOf, type EventRow, type ToolCall } from "./agent-eval-lib.js";
 import {
-  apiQuery, caseHash, caseSays, cardsOf, cleanupOf, finalSay, grade, forRecording, identityRefusal, itemsStartedBy, loadCases, parseRecordings, pick, planOf,
-  renderTable, routeOf, saysOf, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, turnsOf,
-  type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type Recording, type Turn,
+  apiQuery, caseHash, caseSays, cardsOf, cleanupOf, finalSay, grade, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal,
+  itemsStartedBy, loadCases, parseRecordings, pick, planOf, renderTable, routeOf, saysOf, verdictOf, scrub as scrubWith, select, sseFrames,
+  toolPattern, totals, turnCalls, turnEnded, turnsOf,
+  type Attempt, type CaseResult, type EvalCase, type HoldSeen, type HoldSpec, type ItemSeen, type LiveEvent, type Mode, type Observed,
+  type Recording, type Turn,
 } from "./sa-eval-lib.js";
 
 const need = (name: string): string => {
@@ -281,6 +283,8 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   const mine = (all: ItemSeen[]): ItemSeen[] => itemsStartedBy(started, all.filter((i) => i.seq > floor));
   let items = mine(await board());
   for (const i of items) RUN_ITEMS.add(i.item_id);
+  // A request the case's item holds for its person: answered the way that person's channel answers it.
+  const hold = c.hold && items.length ? await answerHold(c.hold, items, start + (c.item_wait_s ?? ITEM_WAIT_SEC) * 1000) : undefined;
   if (items.length) {
     // The item's result (or question, or failure; or its end, for a case that stops it), then what was said about it.
     const settled = (is: ItemSeen[]): boolean => is.every((i) => (c.items_closed ? i.board_state === "done" : i.board_state !== "in_progress"));
@@ -310,7 +314,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
     mode: MODE, route: routeOf(lastItems, lastRouter, lastSays), cards: cardsOf(lastSays), calls: lastCalls, shown: shown.map((s) => s.text),
     final: final?.text ?? "", firstReplyMs: firstOwn === null ? null : firstOwn - lastSent, finalMs: final ? final.at - lastSent : null,
     replyMs: messageIds.map((id, k) => { const s = says.find((x) => x.turn === id); return s ? s.at - sentAt[k]! : null; }),
-    items, factValues: values,
+    items, factValues: values, ...(hold ? { hold } : {}),
   };
   const allCalls = [...turnCalls(stream.events, messageIds)];
   for (const i of items) if (!lastIds.includes(i.item_id)) allCalls.push(...(await workerCalls(i.item_id).catch(() => [])));
@@ -323,6 +327,53 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
     cleaned.push({ seq: i.seq, kind: i.kind, board_state: seen.board_state, cleanup: await close(i) });
   }
   return attemptOf(c, turns, observed, allCalls.map((x) => x.name), cleaned);
+}
+
+/**
+ * Wait for one of the case's items to hold a request `spec` names for its person (`params.hold`), then answer it as the person's
+ * channel does: a `decision` or an `answer` on the worker's session, after `wait_s`. What is seen is graded (`grade`, `hold`).
+ * Gives up when every item has gone on without such a request, or at the deadline.
+ */
+async function answerHold(spec: HoldSpec, items: readonly ItemSeen[], deadline: number): Promise<HoldSeen> {
+  const seen: HoldSeen = { tool: null, cardMs: null, answered: null, heldAfterWait: null, ran: null };
+  const want = toolPattern(spec.tool);
+  const look = async (itemId: string): Promise<any> => {
+    const r = await api("GET", `/v1/work-items/${itemId}`).catch(() => null);
+    return r?.status === 200 ? r.json?.data : null;
+  };
+  const found = await until(async () => {
+    let open = false;
+    for (const i of items) {
+      const d = await look(i.item_id);
+      const h = d?.params?.hold;
+      if (d && h && typeof h.tool_use_id === "string" && want.test(String(h.tool))) {
+        const held = (d.events ?? []).find((e: any) => e.source === "hold" && e.kind === "waiting" && e.result?.tool_use_id === h.tool_use_id);
+        return { itemId: i.item_id, sid: String(d.worker_session_id), toolUseId: h.tool_use_id as string, tool: String(h.tool), heldAt: held ? Date.parse(held.created_at) : Date.now() };
+      }
+      if (!d || d.board_state === "in_progress" || d.params?.hold) open = true;
+    }
+    return open ? undefined : null;
+  }, deadline, 1_000);
+  if (!found) return seen;
+  seen.tool = found.tool;
+  const rows = await replay(found.sid).catch(() => []);
+  const request = heldRequest(rows, found.toolUseId);
+  if (request && Number.isFinite(request.ts)) seen.cardMs = found.heldAt - request.ts;
+  if (spec.wait_s) {
+    await sleep(spec.wait_s * 1000);
+    const d = await look(found.itemId);
+    seen.heldAfterWait = d?.board_state === "needs_you" && d?.params?.hold?.tool_use_id === found.toolUseId;
+  }
+  const body = spec.decide === "answer"
+    ? { messageType: "answer", extData: { tool_use_id: found.toolUseId, answers: holdAnswers(spec, request?.questions), skipped: [] } }
+    : { messageType: "decision", extData: { tool_use_id: found.toolUseId, action: spec.decide } };
+  seen.answered = (await api("POST", `/v1/sessions/${found.sid}/messages`, body).catch(() => ({ status: 0 }))).status;
+  // How the call ended: its own result after the answer, read off the worker's session.
+  seen.ran = await until(async () => {
+    const ran = heldCallRan(await replay(found.sid).catch(() => []), found.toolUseId);
+    return ran === null ? undefined : ran;
+  }, Date.now() + 120_000, 2_000);
+  return seen;
 }
 
 async function close(i: ItemSeen): Promise<string> {
