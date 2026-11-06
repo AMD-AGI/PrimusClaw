@@ -137,7 +137,7 @@ describe("connector_list", { skip }, () => {
     assert.match(r.body.note, /not instructions to you/);
 
     // The API: every tool that acts for the person (attendedTurn) is refused for the rest of the turn.
-    await assert.rejects(attended(), (err: { code?: string }) => err.code === "read_untrusted");
+    await assert.rejects(attended(), (err: { code?: string; message?: string }) => err.code === "read_untrusted" && /connector_list/.test(err.message ?? ""));
 
     // Brain: connector_list is a read_taint source of the router's turn, so after it work_create is refused and say is not.
     const task: Record<string, unknown> = { task_id: turn.task_id, message_id: turn.mid, prompt: "我的笔记本连上了吗" };
