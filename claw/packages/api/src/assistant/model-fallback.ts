@@ -36,6 +36,7 @@ import { drainSessionIfIdle, queueServerMessage, type QueuedServerMessage } from
 import { fallbackModel, modelChoiceOn } from "./model-choice.js";
 import { recordSystemNotice, type SayDeps } from "./outbound.js";
 import { queueReviewFirstTurnAgain } from "./review-items.js";
+import { redactStoredText } from "@claw/utils";
 
 const logger = pino({ name: "assistant-model-fallback" });
 
@@ -138,7 +139,7 @@ export async function rerunOnFallback(end: FailedTurn, deps: SayDeps = {}): Prom
     );
     if (!once.rowCount) return null;
     const dedupeKey = `model-fallback:${messageId}`;
-    if (whose.kind === "router") return rerunRouterTurn(query, end.sessionId, whose.ownerId, messageId, dedupeKey);
+    if (whose.kind === "router") return rerunRouterTurn(query, end.sessionId, whose.ownerId, messageId, dedupeKey, run.prompt);
     // The item's row, held to the end of this transaction, as a stop and a restart hold it (`stopWorkItem`, `restartReview`): one that was
     // stopped or restarted since it was read above is not run again, and none can be stopped between this check and the queueing.
     const open = (await query("SELECT board_state FROM claw_work_items WHERE item_id = $1 FOR UPDATE", [whose.itemId])).rows[0] as
@@ -191,15 +192,20 @@ class NotRerun extends Error {}
  * The user's message queued again on their router session, with what the route wrote down about it copied to the new turn's id: the same
  * words, the same authentication, the same moment received (so it goes stale when the first would have), and whether it had read what a
  * worker wrote. Nothing for a turn that answers no message of the user's.
+ *
+ * The stored message has credential-shaped content masked (`recordAssistantMessage`), and the model is not to be given a different message
+ * the second time: when the refused run's prompt is that same message as the user wrote it (masking it gives the stored words), the
+ * prompt is what is queued. Otherwise the stored words are.
  */
 async function rerunRouterTurn(
-  query: Querier, sessionId: string, userId: string, messageId: string, dedupeKey: string,
+  query: Querier, sessionId: string, userId: string, messageId: string, dedupeKey: string, prompt: string,
 ): Promise<{ words: string } | null> {
   const message = (await query(
     "SELECT content FROM claw_assistant_messages WHERE session_id = $1 AND message_id = $2", [sessionId, messageId],
   )).rows[0] as { content: string } | undefined;
   if (!message) throw new NotRerun();
-  const out = await queueServerMessage({ query }, { sessionId, userId, content: message.content, dedupeKey });
+  const words = prompt && redactStoredText(prompt).text === message.content ? prompt : message.content;
+  const out = await queueServerMessage({ query }, { sessionId, userId, content: words, dedupeKey });
   if (!out.ok || out.pendingId === null) throw new NotRerun();
   const rerunId = queuedMessageId(out.pendingId);
   await query(
@@ -210,5 +216,5 @@ async function rerunRouterTurn(
     [sessionId, messageId, rerunId],
   );
   await query("UPDATE claw_assistant_model_fallbacks SET rerun_message_id = $3 WHERE session_id = $1 AND message_id = $2", [sessionId, messageId, rerunId]);
-  return { words: message.content };
+  return { words };
 }

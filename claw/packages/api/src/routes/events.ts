@@ -8,6 +8,8 @@ import { db } from "../infra/db.js";
 import { createSessionSubscription } from "../events/store.js";
 import { AppEventOrder, appEventIdentity, appEventKey } from "../events/app-events.js";
 import { redactPublicJson } from "../events/redaction.js";
+import { TOOL_TEXT_DELTA_EVENT } from "../events/consumer.js";
+import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
 /**
  * V2-native SSE event stream: Brain events are forwarded verbatim (raw V2
  * `type` as the SSE `event` field, full payload as `data`); the historical V1
@@ -136,6 +138,29 @@ export function historySegment(
   return { frames, seenIds };
 }
 
+/**
+ * A turn's streamed `say` text after it was taken back (`toolTextVoid`, `assistant/router-speed.ts`): not forwarded. The void says
+ * that turn's say is not going to be said (refused, or the turn handed a review to the person's channel), so a later preview of it
+ * would only put words on screen that never come. Per connection, as the live stream is; remembers the newest few turns only.
+ */
+export class StreamVoided {
+  private readonly turns = new Set<string>();
+
+  constructor(private readonly max = 64) {}
+
+  /** False for a `toolTextDelta` of a turn voided before it on this stream; true for everything else. */
+  forward(evt: Record<string, unknown>): boolean {
+    const turn = typeof evt.message_id === "string" ? evt.message_id : "";
+    if (!turn) return true;
+    if (evt.type === TOOL_TEXT_VOID_EVENT) {
+      this.turns.add(turn);
+      if (this.turns.size > this.max) this.turns.delete(this.turns.values().next().value as string);
+      return true;
+    }
+    return !(evt.type === TOOL_TEXT_DELTA_EVENT && this.turns.has(turn));
+  }
+}
+
 export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
 
   // SSE event stream (supports ?mode=replay for full history JSON).
@@ -212,9 +237,14 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       const seenIds = new Set<string>();
       const seenAppEvents = new Set<string>();
       const appEventOrder = new AppEventOrder();
+      const streamVoided = new StreamVoided();
 
       // 1. Push history from DB — one SSE frame per row.
-      const afterEventId = req.query.after || null;
+      // `Last-Event-ID` too: it is what a browser's EventSource sends when it
+      // reconnects by itself -- after a pod drain ended the stream with a
+      // `retry:` (infra/graceful-shutdown.ts), say -- to the same URL, which
+      // has no `?after=`. Without it the reconnect replays the whole history.
+      const afterEventId = req.query.after || lastEventIdOf(req.headers["last-event-id"]) || null;
       const historyRows = afterEventId
         ? (await db.query(
             "SELECT event_id, event, data FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL AND event_id > $2 ORDER BY id",
@@ -253,6 +283,7 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
           const name = eventName(evt);
           if (!name) continue;
           if (!shouldForward(evt, fwdOpts)) continue;
+          if (!streamVoided.forward(evt)) continue;
           const liveId = `claw-${seq}`;
           if (seenIds.has(liveId)) continue;
           seenIds.add(liveId);
@@ -273,4 +304,12 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       return reply;
     },
   );
+}
+
+/** The `Last-Event-ID` header, if it is one of the ids this stream hands out. */
+export function lastEventIdOf(header: string | string[] | undefined): string | null {
+  const value = Array.isArray(header) ? header[0] : header;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9_.:-]{1,200}$/.test(trimmed) ? trimmed : null;
 }

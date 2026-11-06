@@ -202,6 +202,11 @@ async function runScenario(opts: {
    */
   seedCheckpoint?: Partial<CheckpointState>;
   seedCallback?: Uint8Array;
+  /**
+   * The outbox key reads back as NATS's delete marker: an earlier execution of
+   * this task_id delivered its callback and `ackAndClearCallback` deleted it.
+   */
+  seedClearedCallback?: boolean;
 }) {
   const sessionId = opts.sessionId ?? SESSION;
   const { msg, verdicts } = fakeMsg(opts.deliveryCount ?? 1);
@@ -210,6 +215,16 @@ async function runScenario(opts: {
   if (opts.seedCallback) {
     assert.ok(opts.taskId, "a persisted callback belongs to a task");
     ckptStore.set(`task-result.${opts.taskId}`, opts.seedCallback);
+  }
+  if (opts.seedClearedCallback) {
+    assert.ok(opts.taskId, "a cleared callback belongs to a task");
+    const outboxKey = `task-result.${opts.taskId}`;
+    const get = kvCkpt.get.bind(kvCkpt);
+    // NATS KV answers a deleted key with its delete marker, not null, until the bucket's TTL.
+    (kvCkpt as unknown as { get: (key: string) => Promise<unknown> }).get = async (key: string) =>
+      key === outboxKey && !ckptStore.has(key)
+        ? { key, value: new Uint8Array(0), operation: "DEL" }
+        : get(key);
   }
   if (opts.seedCheckpoint) {
     ckptStore.set(
@@ -969,6 +984,30 @@ test("redelivery replays a persisted callback without executing the task again",
   assert.ok(!r.calls.includes("engine.execute"), "replay must not repeat task side effects");
   assert.equal(r.ckptStore.has(`task-result.${taskId}`), false);
   assert.ok(r.calls.includes("releaseTaskLock"));
+});
+
+// A script task that returned wait_external delivered its callback and cleared its outbox. When
+// the external wait resolves, the API puts the same row back to queued and publishes it again
+// under the same task_id, to run from step 0. The outbox key now reads back as a delete marker;
+// that marker belongs to the earlier execution, so this delivery must run the script again.
+test("a task resumed after wait_external runs again although its outbox reads back as a delete marker", async () => {
+  const taskId = "task-wait-external-resume";
+  let replayed = 0;
+  const r = await runScenario({
+    taskId, seedClearedCallback: true,
+    request: { mode: "script" } as Partial<ExecuteRequest>,
+    engineBehavior: async () => result(),
+    sideEffects: {
+      postAgentDone: (async (_req: unknown, res: ExecuteResult) => {
+        if (res.finalText === undefined) replayed++;
+      }) as never,
+    },
+  });
+
+  assert.ok(r.calls.includes("runScript"), "the resumed script runs from step 0");
+  assert.equal(replayed, 0, "the cleared outbox is not replayed as a result");
+  assert.deepEqual(r.verdicts, ["ack"], "the fresh execution ends the delivery once");
+  assert.equal(r.completion?.failed, false, "and reports its own terminal state");
 });
 
 for (const outcome of ["success", "failure"] as const) {

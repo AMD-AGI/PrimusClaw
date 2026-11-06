@@ -20,9 +20,12 @@ import pino from "pino";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
-import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
+import { markUntrustedRead, turnMessage, type AttendedVia, type ChannelFile, type TurnMessage } from "./inbound.js";
+import { handFilesToWorker, workerFilesNote } from "./files.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, recordSystemNotice, SayOutcomeUnknown, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
+import { voidStreamedSay } from "./router-speed.js";
+import { mayHandOff } from "./say-hold.js";
 import { saySources, SAY_SOURCE_OUTCOMES } from "./citations.js";
 import { metrics } from "../infra/metrics.js";
 import { bareItemNumbers, internalTextIn, userWordsOf } from "./internal-text.js";
@@ -30,7 +33,7 @@ import { parseItemRef } from "./item-ref.js";
 import { detectLanguage, languageToAnswerIn, replyLanguageLine, replyLanguageMismatch } from "./language.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 import { assistantPluginId } from "./read-tools.js";
-import { requestedItemOf, requesterViewOf, type RequesterView } from "./requester-view.js";
+import { requestedItemOf, requesterViewOf, routerView, type RequesterView } from "./requester-view.js";
 import { parseReport } from "./report.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import {
@@ -96,7 +99,7 @@ export async function assertLiveRun(
  * `q` is a transaction's: the session row stays held (`assertLiveRun`) until the write it protects is done.
  */
 export async function attendedTurn(
-  q: Querier, claims: AssistantTokenClaims,
+  q: Querier, claims: AssistantTokenClaims, opts: { readUntrustedOk?: boolean } = {},
 ): Promise<{ userId: string; message: TurnMessage; via: AttendedVia }> {
   const { userId } = await assertLiveRun(q, claims);
   const message = await turnMessage(q, claims.sid, claims.mid);
@@ -109,7 +112,7 @@ export async function attendedTurn(
   if (!message.fresh) {
     throw new ToolRefused("attendance_expired", "the user's message is too old to act on now: ask them to confirm in a new message");
   }
-  if (message.readUntrusted) {
+  if (message.readUntrusted && !opts.readUntrustedOk) {
     throw new ToolRefused(
       "read_untrusted",
       "this turn has read what a worker wrote (work_recall), so it no longer acts for the user: tell them what you would do and ask them to confirm in a new message",
@@ -202,9 +205,26 @@ async function assertSayReadable(
 export async function say(
   claims: AssistantTokenClaims, args: { text: string; item_id?: string; sources?: unknown }, deps: SayDeps = {}, meta?: unknown,
 ): Promise<{ ok: true; say_id: string; subscribers: number }> {
+  try {
+    return await sayOnce(claims, args, deps, meta);
+  } catch (err) {
+    // A refused say never reaches the person: what was streamed of it is taken back, so a channel does not keep it as a message
+    // (2026-11-06 15:11Z: a say refused after a handoff left its first words "已把 Primus" in the person's chat).
+    if (err instanceof ToolRefused && err.code !== "say_outcome_unknown") {
+      await voidStreamedSay(claims.sid, claims.mid, err.code, deps.publishStreamVoid);
+    }
+    throw err;
+  }
+}
+
+async function sayOnce(
+  claims: AssistantTokenClaims, args: { text: string; item_id?: string; sources?: unknown }, deps: SayDeps, meta: unknown,
+): Promise<{ ok: true; say_id: string; subscribers: number }> {
   requireRole(claims, "router");
   const userId = await assistantUser(claims.sid);
-  const run = (await db.query("SELECT prompt FROM claw_tasks WHERE task_id = $1", [claims.task_id])).rows[0] as { prompt: string | null } | undefined;
+  const run = (await db.query(
+    "SELECT prompt, COALESCE(started_at, created_at) AS began FROM claw_tasks WHERE task_id = $1", [claims.task_id],
+  )).rows[0] as { prompt: string | null; began: Date } | undefined;
   // Refused, not cleaned: the router rewrites it in the user's words, which a filter cannot do for it.
   if (typeof args.text === "string") {
     const found = internalTextIn(args.text, userWordsOf([run?.prompt ?? ""]));
@@ -219,11 +239,13 @@ export async function say(
   // for, and the answer is not announced a second time.
   const itemId = args.item_id?.trim() ? args.item_id : answerItemOf(run?.prompt);
   if (typeof args.text === "string") await assertSayReadable(claims, userId, run?.prompt ?? "", args.text, itemId);
+  // A turn that may still hand a review to the person's channel: what it says goes out when it ends, or never if it hands one over.
+  const holdForTurn = claims.mid && mayHandOff(await turnMessage((t, p) => db.query(t, p), claims.sid, claims.mid)) ? claims.mid : undefined;
   const cited = meta === undefined ? null : saySources(meta, typeof args.text === "string" ? args.text.trim() : "");
   if (cited) for (const outcome of SAY_SOURCE_OUTCOMES) metrics.onAssistantSaySources(outcome, cited.counts[outcome]);
   try {
     const out = await recordAssistantSay({
-      userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid,
+      userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid, holdForTurn, turnBegan: run?.began, amendNotice: true,
       ...(cited?.sources.length ? { sources: cited.sources } : {}),
       guard: async (q) => {
         if ((await assertLiveRun(q, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");
@@ -268,6 +290,26 @@ async function itemModelFor(claims: AssistantTokenClaims, asked: string | undefi
   }
 }
 
+/**
+ * The files of the message this router turn answers, copied into the worker's session before its message is queued
+ * (`files.ts`): what the worker is told about, and the names of those that could not be copied, for the router to tell the user.
+ * None for a turn that answers no message of the user's (a report's).
+ */
+async function filesForWorker(
+  q: Querier, claims: AssistantTokenClaims, userId: string, workerSessionId: string,
+): Promise<{ note: string; attached: number; notAttached: string[] }> {
+  const files: ChannelFile[] = (await turnMessage(q, claims.sid, claims.mid))?.context.files ?? [];
+  if (!files.length) return { note: "", attached: 0, notAttached: [] };
+  const handed = await handFilesToWorker({ userId, routerSessionId: claims.sid, workerSessionId, files });
+  return { note: workerFilesNote(handed.attached), attached: handed.attached.length, notAttached: handed.failed.map((f) => f.name) };
+}
+
+/** What a work call's answer says of the files: how many went to the worker, and which did not (the router tells the user). */
+function filesAnswer(files: { attached: number; notAttached: string[] } | null): Record<string, unknown> {
+  if (!files || (!files.attached && !files.notAttached.length)) return {};
+  return { files_attached: files.attached, ...(files.notAttached.length ? { files_not_attached: files.notAttached } : {}) };
+}
+
 /** A `model` argument as the tools take it: absent, or a non-empty string. */
 function modelArg(raw: unknown): string | undefined {
   if (raw === undefined || raw === null || raw === "") return undefined;
@@ -288,9 +330,10 @@ export function startedNotice(item: { seq: number; title: string }, language: st
  * first thing a user heard used to wait for the router to write the item's whole brief and then its own line (2026-11-06 baseline:
  * first reply p90 8.3 s). Only in a turn that answers the user (a worker's report starts nothing the user asked for) in Chinese or
  * English (in any other language the router says it), and not in one that handed a review to the person's channel; once per item
- * (`recordSystemNotice`'s key), and as the system's own message, so it is not counted against the say limit and the router still
- * says what this does not (a model that fell back, a question). Best effort: the item is started whether or not this is heard,
- * and the router is told which (`announced`).
+ * (`recordSystemNotice`'s key), and as the system's own message, so it is not counted against the say limit. It is the turn's one
+ * message: a say after it in the turn is added to it (`amends`, `turnAnnouncedStart`), and a start whose model fell back is not
+ * announced, so the router says the start and the fallback in one line. Best effort: the item is started whether or not this is heard, and the router
+ * is told which (`announced`).
  */
 async function announceStarted(
   claims: AssistantTokenClaims, userId: string, item: { seq: number; title: string; itemId: string }, deps: SayDeps,
@@ -316,7 +359,10 @@ async function announceStarted(
 
 export async function workCreate(
   claims: AssistantTokenClaims, args: { title: string; brief: string; repo?: unknown; model?: string }, deps: SayDeps = {},
-): Promise<{ ok: true; item_id: string; seq: number; deduplicated: boolean; announced: boolean; model?: string | null; fell_back_from?: string }> {
+): Promise<{
+  ok: true; item_id: string; seq: number; deduplicated: boolean; announced: boolean; model?: string | null; fell_back_from?: string;
+  files_attached?: number; files_not_attached?: string[];
+}> {
   requireRole(claims, "router");
   const title = clipOneLine(args.title, TITLE_MAX);
   const brief = args.brief.trim();
@@ -340,7 +386,7 @@ export async function workCreate(
           AND created_at > NOW() - $3::interval`,
       [userId, title, DUPLICATE_CREATE_WINDOW],
     )).rows[0] as { item_id: string; seq: number } | undefined;
-    if (same) return { itemId: same.item_id, seq: Number(same.seq), userId, workerSessionId: null };
+    if (same) return { itemId: same.item_id, seq: Number(same.seq), userId, workerSessionId: null, files: null };
 
     const router = (await query("SELECT config FROM claw_sessions WHERE session_id = $1", [claims.sid])).rows[0] as
       { config: unknown } | undefined;
@@ -376,25 +422,39 @@ export async function workCreate(
         ? "too many unfinished items: ask the user which to stop or finish first"
         : "the user has no assistant");
     }
+    // The files of the user's message are in the worker's session before its first message can run.
+    const files = await filesForWorker(query, claims, userId, workerSessionId);
     const queued = await queueServerMessage(q, {
-      sessionId: workerSessionId, userId, content: brief, dedupeKey: `start:${item.itemId}`,
+      sessionId: workerSessionId, userId, content: `${brief}${files.note}`, dedupeKey: `start:${item.itemId}`,
     });
     if (!queued.ok) throw new ToolRefused(queued.error, "the worker could not be started");
-    return { itemId: item.itemId, seq: item.seq, userId, workerSessionId };
+    return {
+      itemId: item.itemId, seq: item.seq, userId, workerSessionId,
+      files: { attached: files.attached, notAttached: files.notAttached },
+    };
   });
   // The row is the commitment; running it is only the drain, which the sweeper repeats if this is lost.
   if (created.workerSessionId) await drainSessionIfIdle(created.workerSessionId, created.userId);
-  const announced = created.workerSessionId ? await announceStarted(claims, created.userId, { seq: created.seq, title, itemId: created.itemId }, deps) : false;
+  // A model that fell back is something the user must hear with the start: the router says the start itself then, in one line
+  // (announced: false), rather than as an addition to the system's notice (`turnAnnouncedStart`).
+  const fellBack = !!(choice && modelAnswer(choice).fell_back_from);
+  const announced = created.workerSessionId && !fellBack
+    ? await announceStarted(claims, created.userId, { seq: created.seq, title, itemId: created.itemId }, deps)
+    : false;
   return {
     ok: true, item_id: created.itemId, seq: created.seq, deduplicated: created.workerSessionId === null, announced,
     // A replayed call names the item made the first time, whose model was decided then.
     ...(choice && created.workerSessionId ? modelAnswer(choice) : {}),
+    ...filesAnswer(created.files),
   };
 }
 
 export async function workSend(
   claims: AssistantTokenClaims, args: { item_id: string; text: string; model?: string },
-): Promise<{ ok: true; item_id: string; seq: number; status: "in_progress"; model?: string | null; fell_back_from?: string }> {
+): Promise<{
+  ok: true; item_id: string; seq: number; status: "in_progress"; model?: string | null; fell_back_from?: string;
+  files_attached?: number; files_not_attached?: string[];
+}> {
   requireRole(claims, "router");
   const text = args.text.trim();
   if (!text) throw new ToolRefused("invalid_arguments", "work_send needs text");
@@ -418,7 +478,7 @@ export async function workSend(
         LIMIT 1`,
       [item.item_id, text, claims.task_id],
     );
-    if (replayed.rowCount) return { userId, item, workerSessionId: null };
+    if (replayed.rowCount) return { userId, item, workerSessionId: null, files: null };
     if (!await reopenWorkItem(q, { userId, itemId: item.item_id, text })) {
       throw new ToolRefused("item_closed", "that item is finished or stopped; start a new item instead");
     }
@@ -429,12 +489,18 @@ export async function workSend(
         [item.item_id, JSON.stringify(modelParams(choice))],
       );
     }
-    const queued = await queueServerMessage(q, { sessionId: item.worker_session_id, userId, content: text });
+    // The files of the user's message are in the worker's session before the instruction can run (a running sandbox gets them when
+    // the next turn attaches to it).
+    const files = await filesForWorker(query, claims, userId, item.worker_session_id);
+    const queued = await queueServerMessage(q, { sessionId: item.worker_session_id, userId, content: `${text}${files.note}` });
     if (!queued.ok) throw new ToolRefused(queued.error, "the instruction could not be delivered");
-    return { userId, item, workerSessionId: item.worker_session_id };
+    return { userId, item, workerSessionId: item.worker_session_id, files };
   });
   if (sent.workerSessionId) await drainSessionIfIdle(sent.workerSessionId, sent.userId);
-  return { ok: true, item_id: sent.item.item_id, seq: sent.item.seq, status: "in_progress", ...(choice && sent.workerSessionId ? modelAnswer(choice) : {}) };
+  return {
+    ok: true, item_id: sent.item.item_id, seq: sent.item.seq, status: "in_progress", ...(choice && sent.workerSessionId ? modelAnswer(choice) : {}),
+    ...filesAnswer(sent.files),
+  };
 }
 
 /**
@@ -530,7 +596,7 @@ async function stopAskedOfOther(
     await syncReviewItem(itemId).catch(() => null);
   }
   const now = (await db.query("SELECT * FROM claw_work_items WHERE item_id = $1", [itemId])).rows[0] as Record<string, unknown>;
-  const view = await requesterViewOf(db, now);
+  const view = routerView(await requesterViewOf(db, now));
   if (stopped.status === "conflict") {
     if (stopped.error === "merge_in_progress") throw new ToolRefused(stopped.error, "the merge is being made right now and cannot be stopped", { requester_view: view });
     if (stopped.error === "already_merged") throw new ToolRefused(stopped.error, "the pull request is already merged; nothing was stopped or reverted", { requester_view: view });
@@ -553,7 +619,7 @@ export async function workRecall(
     // A review the user asked of someone else: read-only, and only the four facts (`requester-view.ts`), whatever detail was asked.
     // Nothing in them was written by a worker or the reviewer's session, so the turn still acts for the person afterwards.
     const asked = await requestedItemOf(db, userId, args.item_id.trim());
-    if (asked) return { ok: true, item_id: String(asked.item_id), asked_of_other: true, read_only: true, requester_view: await requesterViewOf(db, asked) };
+    if (asked) return { ok: true, item_id: String(asked.item_id), asked_of_other: true, read_only: true, requester_view: routerView(await requesterViewOf(db, asked)) };
   }
   const named = found(lookup);
   const item = await getWorkItem(userId, named.item_id);

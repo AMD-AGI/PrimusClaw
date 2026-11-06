@@ -31,18 +31,23 @@ import {
   ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
   ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderModelChoice,
   renderObserverSystem, renderReviewState, renderRouterItems, renderRouterPrompt, renderWorkerSystem, withTurnState,
+  ROUTER_DEVENV_PROMPT_VERSION, renderRouterDevenvSection,
   type AskedOfOtherLine, type ManifestItem,
 } from "./prompts.js";
 import { allowedModels, modelChoiceOn, platformModel, readModelPrefs } from "./model-choice.js";
 import { rerunModelOf } from "./model-fallback.js";
 import { AFTER_READ_TOOLS, routerLookups } from "./read-tools.js";
 import { heldForPersonManifest, renderHeldForPerson } from "./holds.js";
+import { triggerToolSettings } from "../triggers/mcp.js";
 import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
+import { promptImagesOf, renderFilesState } from "./files.js";
+import { turnMessage } from "./inbound.js";
 import { startWorkerRun } from "./run-started.js";
 import { githubEventsEnabled } from "./github-events.js";
 import { jobWatchesEnabled } from "./job-watch.js";
 import { renderRouterProactiveSection, ROUTER_PROACTIVE_PROMPT_VERSION } from "./proactive-prompt.js";
+import { devenvToolsOn } from "./devenv-tools.js";
 import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 import { applyRouterTurnSpeed } from "./router-speed.js";
@@ -233,15 +238,19 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
   } else if (role.role === "router") {
     claims = { ...base, role: "router" };
     // What the router may look up itself (`read-tools.ts`): the read-only tools of the deployment's assistant plugin, and nothing
-    // else of it (no skills, rules or write tools; a plugin the message named is not one the read list can vouch for, so it gives
-    // the router nothing); the reads of the user's own GitHub; and the web.
-    const lookups = await routerLookups(role.userId, sessionId);
+    // else of it but its reply-style rule (no skills or write tools; a plugin the message named is not one the read list can vouch
+    // for, so it gives the router nothing); the reads of the user's own GitHub; their scheduled tasks; and the web.
+    const lookups = await routerLookups(role.userId, sessionId, { mcpServers: task.mcp_servers, messageId, taskId, triggerKey: triggerToolSettings.key });
     const read = lookups.plugin;
     task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN, ...lookups.allowlist];
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
-    // Only the assistant's own server, the plugin's read servers and the user's GitHub: any other is a connection made and a tool
-    // never offered. The GitHub entry is built here from the session, as `githubMcpServers` builds a worker's.
-    task.mcp_servers = { ...lookups.githubServers };
+    // Only the assistant's own server, the plugin's read servers, the user's GitHub and the turn's own scheduled tasks: any other is
+    // a connection made and a tool never offered. The GitHub entry is built here from the session, as `githubMcpServers` builds a
+    // worker's; the `schedules` one is kept only when this API minted its bearer for this turn (`ownTriggerServer`).
+    task.mcp_servers = { ...lookups.servers };
+    // The plugin's log reads: bounded to their last lines, and masked before the model reads them (Brain, `log-reads.ts`).
+    if (lookups.logReads) task.log_reads = lookups.logReads;
+    else delete task.log_reads;
     for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
     if (read) {
       task.plugin_id = read.pluginId;
@@ -266,6 +275,14 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
     const held = renderHeldForPerson(await heldForPersonManifest(role.userId));
     if (held) state.push(held);
+    // What the person sent beside their words (`files.ts`): the router is told what came, and is shown the pictures itself (Brain
+    // reads them from this session's uploads), since it has no sandbox to open them in.
+    const files = (await turnMessage((t, p) => db.query(t, p), sessionId, messageId))?.context.files ?? [];
+    if (files.length) {
+      state.push(renderFilesState(files));
+      const images = promptImagesOf(files);
+      if (images.length) task.prompt_images = images;
+    }
     if (CLAW_ASSISTANT_TOOLS) {
       withSystemAppend(task, ROUTER_REVIEW_PROMPT);
       const review = await reviewContextFor(role.userId, sessionId, messageId);
@@ -280,6 +297,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       withSystemAppend(task, memory.prompt);
       if (memory.entries) state.push(memory.entries);
     }
+    const devenv = devenvToolsOn();
+    if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS }));
     const proactive = { schedules: assistantSchedulesOn(), jobs: jobWatchesEnabled(), pullRequests: githubEventsEnabled() };
     const proactiveSection = renderRouterProactiveSection(proactive);
     if (proactiveSection) withSystemAppend(task, proactiveSection);
@@ -306,6 +325,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION, base: ROUTER_PROMPT_VERSION,
       ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
       ...(proactiveSection ? { proactive: ROUTER_PROACTIVE_PROMPT_VERSION } : {}),
+      ...(devenv ? { devenv: ROUTER_DEVENV_PROMPT_VERSION } : {}),
       read: ROUTER_READ_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),
       ...(cite ? { cite: ROUTER_CITE_PROMPT_VERSION } : {}),
     }, "assistant.router_turn");

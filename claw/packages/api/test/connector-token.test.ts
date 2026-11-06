@@ -104,7 +104,7 @@ describe("connector access tokens", { skip }, () => {
     app = Fastify();
     await app.register((await import("@fastify/cookie")).default);
     app.addHook("preHandler", authMiddleware);
-    await registerRemoteAgentRoutes(app, { pingMs: 150, pollMs: 40 });
+    await registerRemoteAgentRoutes(app, { pingMs: 150, pollMs: 40, presenceSweepMs: 0 });
     await app.listen({ port: 0, host: "127.0.0.1" });
     base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
   });
@@ -509,6 +509,15 @@ describe("connector access tokens", { skip }, () => {
       assert.equal(frame.id, undefined, "carries no id, so it can never be a resume position");
       assert.equal(frame.json().connector_id, cid);
       await stream.waitEnded();
+      // Kept on the connector, so presence can say an offline connector went because its sign-in did.
+      let ended: Record<string, any> | undefined;
+      for (let i = 0; i < 50; i++) {
+        ended = (await q("SELECT stream_end_reason, stream_closed_at FROM claw_remote_connectors WHERE connector_id = $1", [cid])).rows[0];
+        if (ended?.stream_end_reason) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.equal(ended?.stream_end_reason, "token_expired");
+      assert.ok(ended?.stream_closed_at, "and when");
       // Not a revocation: the connector is still registered and may reconnect.
       const again = await SseClient.open(`${base}/v1/remote-agents/connectors/${cid}/commands`, bearer(mint()));
       streams.push(again);
@@ -594,7 +603,7 @@ describe("connector access tokens", { skip }, () => {
         (req as any).user = { userId: "u1", userName: "u1", roles: ["default"], platformKey: "", virtualKey: "" };
         recordRequestCredential(req, "connector_token", Date.now() + 60_000);
       });
-      await registerRemoteAgentRoutes(stub);
+      await registerRemoteAgentRoutes(stub, { presenceSweepMs: 0, retentionDays: 0 });
       await stub.ready();
       try {
         assert.ok(routes.length >= 12, `only ${routes.length} routes`);

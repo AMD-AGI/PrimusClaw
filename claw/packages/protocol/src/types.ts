@@ -69,7 +69,14 @@ export interface SandboxSpecCreate {
    * fails the message with reason `sandbox_pending_timeout` if it never starts.
    */
   timeout?: number;
-  /** Extra env vars baked into the sandbox at create time. */
+  /**
+   * Extra env vars baked into the sandbox at create time. Stored in the SaFE
+   * workload, whose env SaFE returns to every caller allowed to read it: a
+   * name or value that looks like a credential is withheld from the workload
+   * and reaches the sandbox only at bootstrap (and an app only with its start
+   * command), so it is not there for an image entrypoint. Put no secret here
+   * under another name.
+   */
   env?: Record<string, string>;
   /** Extra labels merged into the SaFE workload (Sweeper consistency keys). */
   labels?: Record<string, string>;
@@ -422,6 +429,24 @@ export interface ExecuteRequest {
    * `user_urls`, the addresses the user wrote in the message the turn answers: reading a page confirms a source, it never adds one.
    */
   cite?: { tools: string[]; source_servers?: string[]; user_urls?: string[] };
+  /**
+   * The lookups of this run whose results are log text, by exact tool name (`mcp__<server>__<tool>`), each with the argument
+   * that says how many lines or entries it returns (`tail_lines`, `limit`; empty for a read that counts nothing but may carry log
+   * text, such as a container's termination message). For such a call Brain lowers that argument to `lines` (and sets it when
+   * the call names none), masks credential-shaped text in the answer (`redactLogSecrets` of @claw/utils) before
+   * the model, an event or a log line sees it, and keeps only the last `chars` characters of an answer that is plain text
+   * (`brain/src/tools/log-reads.ts`). The API sets it on an assistant's router turn that has such reads. Absent, or unreadable:
+   * results are as the tools answered.
+   */
+  log_reads?: { tools: Record<string, string>; lines: number; chars: number };
+  /**
+   * Images the person sent with the message this run answers, shown to the model with the prompt, in this order. Each is a path
+   * relative to the session's own files (`.uploads/<path>`, as `POST /v1/sessions/:id/upload` stored it): Brain reads it from the
+   * session's object-store prefix and nowhere else, and shows it only when its bytes are a whole PNG, JPEG, GIF or WebP of at most
+   * IMAGE_MAX_BYTES (images.ts); one it cannot show is named in a line instead. The API sets it on an assistant's router turn, which
+   * has no sandbox to `read` an image in. Absent: the prompt is text, as before.
+   */
+  prompt_images?: string[];
 
   // ── Legacy chat fields (Phase 4 removes; do not use in new task code) ─
   /** @deprecated Use `sandbox_spec.image`. Kept for legacy chat NATS path. */

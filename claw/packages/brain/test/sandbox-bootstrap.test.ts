@@ -13,12 +13,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, writeFile, readFile, chmod } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, chmod, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   bootstrapHandsInSandbox, handsBinarySources, handsBaseEnv, HANDS_ENV_FILE,
   HANDS_ENV_PAYLOAD_ENV, HANDS_TOKEN_ENV, writeEnvFileCmd, brainAssetCurl,
+  HANDS_RESTART_ENV_FILE, restoreEnvFileCmd,
   handsBinaryDownloadCmd, HANDS_LOG_PATH, HANDS_STATE_DIR,
   inImageStartCmd, type SandboxExecFn,
   HANDS_DOWNLOAD_ATTEMPTS, HANDS_DOWNLOAD_RETRY_DELAY_SEC,
@@ -683,8 +684,65 @@ test("the shell expands the request env into the env file and the launched proce
   assert.equal(await run(launch, { [HANDS_TOKEN_ENV]: secretToken }), 0);
   assert.equal(await readFile(out, "utf8"), secretToken);
 
-  const write = writeEnvFileCmd({ HF_TOKEN: "it's \"quoted\"\n$(nope)" });
+  const copy = path.join(dir, "state", "restart-env");
+  const write = writeEnvFileCmd({ HF_TOKEN: "it's \"quoted\"\n$(nope)" }, copy);
   const target = path.join(dir, "env.json");
   assert.equal(await run(write.cmd.split(HANDS_ENV_FILE).join(target), write.env), 0);
   assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { HF_TOKEN: "it's \"quoted\"\n$(nope)" });
+});
+
+/** Content and permission bits read through one handle, so both describe the same file. */
+async function readWithMode(p: string, dirOnly = false): Promise<{ text: string; mode: number }> {
+  const fh = await open(p, "r");
+  try {
+    const mode = (await fh.stat()).mode & 0o777;
+    return { text: dirOnly ? "" : await fh.readFile("utf8"), mode };
+  } finally {
+    await fh.close();
+  }
+}
+
+/**
+ * The environment, credentials included, no longer travels in the SaFE workload (sandbox/workload-env.ts), so a Hands restarted in
+ * place cannot inherit it from the container: bootstrap keeps a private copy, and a restart puts it back.
+ */
+test("the env file keeps a private restart copy without the Hands token, and a restart puts it back", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-restart-env-"));
+  const copy = path.join(dir, "state", "restart-env");
+  const target = path.join(dir, "env.json");
+  const run = (cmd: string, env: Record<string, string> = {}) => new Promise<number>((resolve) => {
+    const child = execFile("sh", ["-c", cmd.split(HANDS_ENV_FILE).join(target)], { env: { PATH: "/usr/bin:/bin", ...env } }, () => {});
+    child.on("exit", (code) => resolve(code ?? -1));
+  });
+  const write = writeEnvFileCmd({ HF_TOKEN: "hf-secret", AUTH_CLAW_TOKEN: "t".repeat(64), AUTH_INTERNAL_TOKEN: "legacy" }, copy);
+  assert.equal(await run(write.cmd, write.env), 0);
+  const written = await readWithMode(copy);
+  assert.deepEqual(JSON.parse(written.text), { HF_TOKEN: "hf-secret" },
+    "the token travels with each start command and is never written to disk");
+  assert.equal(written.mode, 0o600);
+  assert.equal((await readWithMode(path.join(dir, "state"), true)).mode, 0o700);
+
+  await rm(target, { force: true }); // Hands read and unlinked it
+  assert.equal(await run(`${restoreEnvFileCmd(copy)} exit 0`), 0);
+  const restored = await readWithMode(target);
+  assert.deepEqual(JSON.parse(restored.text), { HF_TOKEN: "hf-secret" });
+  assert.equal(restored.mode, 0o600);
+
+  // A sandbox bootstrapped before the copy existed still has its environment in the pod spec: an empty file, consumed like any other.
+  await rm(target, { force: true });
+  assert.equal(await run(`${restoreEnvFileCmd(path.join(dir, "absent"))} exit 0`), 0);
+  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), {});
+});
+
+test("a restart (no environment from the caller) restores the copy before every source and tells Hands where it is", async () => {
+  const r = recorder([ok, ok]);
+  await bootstrapHandsInSandbox(r.exec, SESSION, PORT, TOKEN);
+  const starts = startAttempts(r.cmds);
+  assert.ok(starts.length >= 1);
+  for (const cmd of starts) {
+    assert.ok(cmd.startsWith(restoreEnvFileCmd()), "the copy is put back before each source, as a fresh write is");
+    assert.ok(cmd.includes(`HANDS_ENV_FILE=${HANDS_ENV_FILE}`), "Hands is told where to find it");
+  }
+  assert.ok(HANDS_RESTART_ENV_FILE.startsWith("/tmp/.claw-hands/"), "the copy sits in the 0700 state directory");
+  for (const o of r.opts) assert.ok(!o?.env?.[HANDS_ENV_PAYLOAD_ENV], "nothing is re-sent: a restart has no request to compose it from");
 });

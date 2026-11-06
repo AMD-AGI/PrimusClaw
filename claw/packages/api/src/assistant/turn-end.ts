@@ -19,7 +19,7 @@ import pino from "pino";
 import { db } from "../infra/db.js";
 import { SWEEPABLE_RUN_STATUSES } from "../tasks/chat-run.js";
 import { REPORT_SUMMARY_MAX } from "./report.js";
-import { ingestReport } from "./reports.js";
+import { announceDeliveries, ingestReport } from "./reports.js";
 import { syncReviewItemOfSession } from "./review-items.js";
 import { REPORT_KINDS, reportTransition, type WorkReport } from "./work-items.js";
 
@@ -116,7 +116,12 @@ export async function recordRunEnd(
   detail: { finalText?: string; failureReason?: string } = {},
 ): Promise<"recorded" | "skipped"> {
   const record = await runRecord(workerSessionId, runId);
-  if (!record || record.told || record.continuing) return "skipped";
+  if (!record) return "skipped";
+  if (record.told || record.continuing) {
+    // Nothing to report, but a file the run delivered after its last report (or one a report's announcement missed) is the user's.
+    await announceDeliveries(record.item_id);
+    return "skipped";
+  }
   const result = await ingestReport(
     { itemId: record.item_id, workerSessionId, generation: Number(record.generation), runId },
     endReport(outcome, detail),

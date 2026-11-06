@@ -75,6 +75,23 @@ export interface AssistantConfirmWrite {
   expires_at: string;
 }
 
+/**
+ * A file a work item's worker delivered (`deliver_file`), for a channel to offer as a download. The download is Claw's own link,
+ * `GET /v1/sessions/{session_id}/deliveries/{id}`, which answers only the signed-in owner of that session (the item's worker
+ * session, which is the user's). `data_base64` is a small image itself (`DELIVERY_INLINE_TYPES`, at most
+ * `DELIVERY_INLINE_MAX_BYTES`), for a channel that shows it without fetching the link.
+ */
+export interface AssistantFile {
+  /** The work item whose worker delivered it. */
+  item_id: string;
+  session_id: string;
+  id: string;
+  name: string;
+  size: number;
+  content_type: string;
+  data_base64?: string;
+}
+
 /** Something the assistant chose to say to the user. */
 export interface AssistantSayPayload extends AssistantEventBase {
   type: "assistant.say";
@@ -82,6 +99,16 @@ export interface AssistantSayPayload extends AssistantEventBase {
   /** Present only when the message cites any (`CLAW_ASSISTANT_CITATIONS`); a receiver that does not read it shows the text alone. */
   sources?: AssistantSaySource[];
   confirm_write?: AssistantConfirmWrite;
+  /** Files the user gets with the message (a worker's deliveries, `deliveries.ts`): one download each. */
+  files?: AssistantFile[];
+  /**
+   * The `event_id` of an earlier message of this turn that this one adds to: the system's start notice of an item, after which the
+   * router's words belong in that same message. A channel that still has that message shows it with these words added (its text, a
+   * blank line, this text); one that does not shows this as a message of its own.
+   */
+  amends?: string;
+  /** A system notice's: the message id of the turn it answers (what an `amends` of that turn is matched by). */
+  turn_message_id?: string;
 }
 
 /** The system's own message, sent when an item has needed the user for a while and nobody has said so. */
@@ -107,6 +134,12 @@ export interface AssistantReviewHandoff {
   prs: Array<{ owner: string; repo: string; number: number }>;
   merge: boolean;
   requester_note: string;
+  /**
+   * What the router said in the same turn before handing the review over (another question of the person's answered), in order. Held
+   * and never delivered on its own (`say-hold.ts`), so the channel's one answer carries it: the channel adds it to that answer. Absent
+   * when nothing was said.
+   */
+  held_says?: string[];
 }
 
 /** The name an `assistant.action` carries when it is a handoff rather than one of the channel's own commands. */

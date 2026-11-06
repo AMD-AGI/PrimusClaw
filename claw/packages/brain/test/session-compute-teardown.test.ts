@@ -114,3 +114,45 @@ test("a deployment without SaFE has nothing to destroy and reads nothing", async
 
   assert.deepEqual(result, { complete: true, found: 0, deleted: 0 });
 });
+
+test("the binding's workspace goes with the key, whichever key it is", async () => {
+  bindStore({ entry: { workloadId: "w1", platformKey: "binding-key", namespace: "global-cpu" } });
+  const seen: Array<{ platformKey: string; workspaces: string[] }> = [];
+  const deps = {
+    multiNodeAvailable: () => true,
+    destroyForSession: async (_sid: string, opts: { platformKey: string; workspaces: string[] }) => {
+      seen.push(opts);
+      return { complete: true, found: 0, deleted: 0 };
+    },
+  };
+
+  await destroySessionCompute(SID, "", deps);
+  await destroySessionCompute(SID, "caller-key", deps);
+
+  assert.deepEqual(seen, [
+    { platformKey: "binding-key", workspaces: ["global-cpu"] },
+    { platformKey: "caller-key", workspaces: ["global-cpu"] },
+  ]);
+});
+
+test("a non-admin session's teardown completes through the real provider", async (t) => {
+  // The whole path that parked sessions as cleanup_incomplete_parked: the binding names global-cpu, the
+  // key may list only there, and the provider must ask there.
+  const { SafeMultiNodeProvider } = await import("../src/sandbox/multi-node/safe-provider.js");
+  bindStore({ entry: { workloadId: "w1", platformKey: "user-key", namespace: "global-cpu" } });
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if ((init?.method ?? "GET") === "DELETE") return new Response(null, { status: 204 });
+    const ws = new URL(String(input), "http://safe.test").searchParams.get("workspaceId");
+    if (ws !== "global-cpu") return new Response("{}", { status: 403 });
+    return new Response(JSON.stringify({ totalCount: 1, items: [{ workloadId: "w1", phase: "running" }] }), { status: 200 });
+  }) as typeof globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+
+  const result = await destroySessionCompute(SID, "", {
+    multiNodeAvailable: () => true,
+    destroyForSession: (sid, opts) => new SafeMultiNodeProvider().destroyForSession(sid, opts),
+  });
+
+  assert.deepEqual(result, { complete: true, found: 1, deleted: 1 });
+});

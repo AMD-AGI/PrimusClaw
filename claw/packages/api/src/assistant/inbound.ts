@@ -24,6 +24,7 @@ import { CLAW_ASSISTANT_ATTENDED_TTL_SEC } from "../config.js";
 import { classifyAttendedCaller } from "../github-review/attended.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import type { DecidedVia } from "../github-review/store.js";
+import { redactStoredText, redactStoredValue } from "@claw/utils";
 import { db, type Querier } from "../infra/db.js";
 import { stopTurnRuns } from "../tasks/chat-run.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
@@ -52,6 +53,17 @@ export interface ChannelAction { name: string; usage?: string; summary?: string 
  */
 export const CHANNEL_HANDOFFS = ["review_for_other"] as const;
 export type ChannelHandoff = (typeof CHANNEL_HANDOFFS)[number];
+/**
+ * A file the person sent with the message, which the channel has already put in the assistant's session
+ * (`POST /v1/sessions/:id/upload`). `path` is where that upload stored it, relative to the session's `.uploads/` (as the upload
+ * answered it), and it is the only thing Claw reads the file by: always below this session's own `.uploads/`, so a channel cannot
+ * name anything else. The name, type and size are what the channel says, for the model to read.
+ */
+export interface ChannelFile { path: string; name: string; media_type?: string; size?: number }
+/** At most this many files of one message are taken (a channel that sends more has its first ones read). */
+export const CONTEXT_FILES_MAX = 10;
+const FILE_PATH_MAX = 300;
+
 export interface ChannelContext {
   channel?: string;
   channel_message_id?: string;
@@ -59,6 +71,38 @@ export interface ChannelContext {
   actions: ChannelAction[];
   repos: string[];
   handoffs: ChannelHandoff[];
+  /** The files sent with the message (`ChannelFile`); empty when none were. */
+  files: ChannelFile[];
+}
+
+/**
+ * A file's upload path as Claw reads it: relative to `.uploads/`, no `..` or empty segment, no backslash or control character, no
+ * leading slash. Null for anything else, which names no file.
+ */
+export function uploadPathOf(raw: unknown): string | null {
+  if (typeof raw !== "string" || !raw || raw.length > FILE_PATH_MAX) return null;
+  if (/[\u0000-\u001f\u007f\\]/.test(raw)) return null;
+  return raw.split("/").some((s) => s === "" || s === "." || s === "..") ? null : raw;
+}
+
+function parseFiles(raw: unknown): ChannelFile[] {
+  const files: ChannelFile[] = [];
+  const seen = new Set<string>();
+  for (const f of objects(raw)) {
+    const path = uploadPathOf(f.path);
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    const name = str(f.name) ?? path.slice(path.lastIndexOf("/") + 1).slice(0, CONTEXT_STRING_MAX);
+    const mediaType = str(f.media_type);
+    const size = typeof f.size === "number" && Number.isSafeInteger(f.size) && f.size >= 0 ? f.size : undefined;
+    files.push({
+      path, name,
+      ...(mediaType && /^[\w.+-]+\/[\w.+-]+$/.test(mediaType) ? { media_type: mediaType.toLowerCase() } : {}),
+      ...(size !== undefined ? { size } : {}),
+    });
+    if (files.length >= CONTEXT_FILES_MAX) break;
+  }
+  return files;
 }
 
 export type AttendedVia = { kind: "person" } | { kind: "service"; client_id: string; act_sub: string };
@@ -100,7 +144,7 @@ export function parseChannelContext(raw: unknown): ChannelContext {
   const channelMessageId = str(c.channel_message_id);
   return {
     ...(channel ? { channel } : {}), ...(channelMessageId ? { channel_message_id: channelMessageId } : {}),
-    people, actions, repos, handoffs,
+    people, actions, repos, handoffs, files: parseFiles(c.files),
   };
 }
 
@@ -121,7 +165,9 @@ export function decidedViaOf(via: AttendedVia): DecidedVia | null {
 
 /**
  * Write down a message the user sent to their own assistant, inside the transaction that accepts it. Nothing for any
- * other session: the row is what makes a router turn able to act, and only a router turn reads it.
+ * other session: the row is what makes a router turn able to act, and only a router turn reads it. The words and the channel's
+ * context are stored with credential-shaped content masked (`redactStoredText`, `redactStoredValue`); the turn's prompt is the
+ * queued message, which is not.
  */
 export async function recordAssistantMessage(tx: PoolClient, m: {
   sessionId: string; messageId: string; userId: string; userName?: string; content: string; attendedVia: AttendedVia | null; context: ChannelContext;
@@ -131,7 +177,7 @@ export async function recordAssistantMessage(tx: PoolClient, m: {
      SELECT $1, $2, $3, $7, $4, $5::jsonb, $6::jsonb
       WHERE EXISTS (SELECT 1 FROM claw_assistants WHERE session_id = $1 AND user_id = $3)
      ON CONFLICT (session_id, message_id) DO NOTHING`,
-    [m.sessionId, m.messageId, m.userId, m.content, m.attendedVia ? JSON.stringify(m.attendedVia) : null, JSON.stringify(m.context),
+    [m.sessionId, m.messageId, m.userId, redactStoredText(m.content).text, m.attendedVia ? JSON.stringify(m.attendedVia) : null, JSON.stringify(redactStoredValue(m.context)),
       m.userName?.slice(0, CONTEXT_STRING_MAX) || null],
   );
   if (inserted.rowCount) {

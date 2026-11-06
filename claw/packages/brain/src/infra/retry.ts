@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { isTransientNatsError } from "./nats-transient.js";
 import { sleep } from "@claw/utils";
 import pino from "pino";
 import {
@@ -191,6 +192,10 @@ export function isRetryable(err: unknown): boolean {
   // — the actual fetch/DNS detail lives in `.cause`). Without these checks
   // transient gateway hiccups burn the task instead of getting redelivered.
   if (e?.name === "APIConnectionError" || e?.name === "APIConnectionTimeoutError") return true;
+  // NATS reachability (a PubAck that never came, a stream between leaders, a
+  // reconnect in progress) by the client's own error code. See
+  // isTransientNatsError for why the message cannot be used for this.
+  if (isTransientNatsError(err)) return true;
   if (typeof e?.status === "number" && [408, 409, 429, 500, 502, 503, 504].includes(e.status)) return true;
   // A DAG handle row that kept moving under a conditional write
   // (`DagHandleContendedError`, brain/src/sandbox/errors.ts). Matched by name

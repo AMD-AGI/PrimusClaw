@@ -20,7 +20,7 @@
 import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach, describe } from "node:test";
 import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "../src/github-review/legacy-names.js";
-import type { ToolOutcome } from "../src/github-review/service.js";
+import { MAX_PENDING_CONFIRMATIONS, type ToolOutcome } from "../src/github-review/service.js";
 import { setReviewMode } from "../src/github-review/store.js";
 import { BASE_TIP, HEAD } from "./support/fake-github.js";
 import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, ownApproval, reviewEnv as makeEnv, reviewedHead, unbound, type ReviewEnv } from "./support/review-env.js";
@@ -356,16 +356,17 @@ describe("H what is held for the acting user", () => {
 
   test("H12 the limit on what one acting user is asked counts approvals and merges together", async () => {
     highRisk();
-    for (let n = 1; n <= 10; n++) {
+    for (let n = 1; n <= MAX_PENDING_CONFIRMATIONS; n++) {
       e.actor = { ...e.actor, sessionId: `s-${n}` };
       await reviewedHead(e);
       assert.equal((await submit({ event: "APPROVE", body: `Review ${n}.` })).body.status, "confirmation_required", `review ${n}`);
     }
-    e.actor = { ...e.actor, sessionId: "s-11" };
+    assert.equal(MAX_PENDING_CONFIRMATIONS, 30);
+    e.actor = { ...e.actor, sessionId: `s-${MAX_PENDING_CONFIRMATIONS + 1}` };
     await reviewedHead(e);
     assert.equal(reason(await submit({ event: "APPROVE", body: "One too many." })), "too_many_pending_confirmations");
     assert.equal(reason(await merge()), "too_many_pending_confirmations");
-    assert.equal((await rows()).length, 10);
+    assert.equal((await rows()).length, MAX_PENDING_CONFIRMATIONS);
   });
 
   test("H13 a pull request GitHub's own state refuses is not asked about: CI red and an open thread are refused before the acting user is woken, for an approval as for a merge", async () => {

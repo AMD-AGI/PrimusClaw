@@ -18,8 +18,18 @@ import type {
 import { decodeRunTimeReport } from "@claw/protocol";
 import pino from "pino";
 import type { SandboxEntry } from "../sandbox/keepalive.js";
+import { sendWithTransientRetry } from "../infra/transient-http.js";
 
 const logger = pino({ name: "task-callback" });
+
+/** Re-sends of a lease renewal across an API pod swap. */
+export const LEASE_RETRY_DELAYS_MS: readonly number[] = [250, 1_000];
+/**
+ * Re-sends of one `agent_done` attempt across an API pod swap: about seven
+ * seconds in all, which covers a pod leaving the endpoints and the next one
+ * answering, without stretching one attempt past the redelivery it guards.
+ */
+export const AGENT_DONE_TRANSIENT_DELAYS_MS: readonly number[] = [250, 500, 1_000, 2_000, 3_000];
 
 export class AgentDoneDeliveryError extends Error {
   override readonly name = "AgentDoneDeliveryError";
@@ -330,10 +340,11 @@ export async function askRunLease(
 ): Promise<LeaseAnswer> {
   const lease = request.run_lease;
   if (!lease?.url) return { kind: "unresolved" };
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5_000);
   try {
-    const resp = await fetch(lease.url, {
+    // Retried only across an API pod swap (see transient-http.ts): a renewal
+    // that is merely unresolved costs nothing this tick, but one that keeps
+    // landing on a closing pod for a whole rollout ages the lease for nothing.
+    const resp = await sendWithTransientRetry(() => fetch(lease.url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -357,7 +368,10 @@ export async function askRunLease(
         } : {}),
         run_time: renewal.runTime,
       } satisfies RunLeaseRequest),
-      signal: controller.signal,
+      signal: AbortSignal.timeout(5_000),
+    }), {
+      delaysMs: LEASE_RETRY_DELAYS_MS,
+      onRetry: (attempt, why) => logger.warn({ attempt, why }, "run.lease_renew_retry"),
     });
     // 409 is the one rejection that means something: this worker is not the
     // one the row recognises. Any other failure is just a failure, and a worker
@@ -381,8 +395,6 @@ export async function askRunLease(
       "run.lease_renew_failed",
     );
     return { kind: "unresolved" };
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -588,14 +600,21 @@ export async function postAgentDone(
   let shed = false;
   let maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5_000);
     try {
-      const resp = await fetch(url, {
+      // Each of the three attempts rides out an API pod swap on its own
+      // (see transient-http.ts). The terminal transition it lands is
+      // idempotent -- a row already terminal is not moved again -- so a
+      // resend after a reset that hid a success is harmless, while giving up
+      // during a rollout leaves the run to be redelivered and resumed for
+      // nothing.
+      const resp = await sendWithTransientRetry(() => fetch(url, {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
-        signal: controller.signal,
+        signal: AbortSignal.timeout(5_000),
+      }), {
+        delaysMs: AGENT_DONE_TRANSIENT_DELAYS_MS,
+        onRetry: (n, why) => logger.warn({ taskId: request.task_id, attempt, transientRetry: n, why }, "agent_done.transient_retry"),
       });
       if (resp.ok) return;
       // 413 is the one status a retry cannot help with: the body is too large
@@ -614,8 +633,6 @@ export async function postAgentDone(
     } catch (error) {
       if (error instanceof AgentDoneDeliveryError) throw error;
       lastError = error instanceof Error ? error : new Error(String(error));
-    } finally {
-      clearTimeout(timeout);
     }
     logger.warn(
       { taskId: request.task_id, attempt, err: lastError.message },

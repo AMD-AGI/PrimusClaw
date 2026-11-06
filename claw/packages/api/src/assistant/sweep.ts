@@ -9,12 +9,16 @@
  * existing orphan drain (`drainOrphanedPendingMessages`): everything the assistant queues is an ordinary
  * queued message on an ordinary session.
  */
+import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { releaseHoldsOfEndedRuns } from "./holds.js";
-import { sweepReviewItems } from "./review-items.js";
+import { followReviewItems, sweepReviewItems } from "./review-items.js";
 import { reconcileOrphanedItems, reconcileWorkerRuns } from "./turn-end.js";
+import { announceMissedDeliveries } from "./deliveries.js";
 import { tellSilentItems } from "./silent-sweep.js";
 import { surfaceStuckItems } from "./watchdog.js";
+
+const logger = pino({ name: "assistant-sweep" });
 
 export async function sweepAssistant(): Promise<void> {
   if (!CLAW_ASSISTANT_ENABLED) return;
@@ -28,8 +32,12 @@ export async function sweepAssistant(): Promise<void> {
   await reconcileOrphanedItems();
   // Review items report nothing: their state is read off the review's own tables, here as well as at each turn's end and answer.
   await sweepReviewItems();
+  // And what became of their pull requests on GitHub: merged or closed there ends the item; a merge the requester asked for is made.
+  await followReviewItems();
   // An item something is still open behind, with no sign of life past the watchdog's threshold (off by default): in
   // front of the user with the reason, before the announcement below looks for items that need them.
   await surfaceStuckItems();
+  // The files of a report whose announcement did not get through (the store did not answer), before the announcement below.
+  await announceMissedDeliveries().catch((err) => logger.warn({ err }, "assistant.missed_deliveries_sweep_failed"));
   await tellSilentItems();
 }

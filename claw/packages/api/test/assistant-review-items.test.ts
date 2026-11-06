@@ -31,6 +31,13 @@
  *   G1  a review session is no worker: no role profile, no worker report at its turn's end, not an orphan to the task sweep
  *   G2  nothing the server queues reaches an acting session without the person's proof: work_send into a review is refused
  *   Q8b a requested review with no turn left is refused on the immediate path (a follow-up into its idle session) and halted
+ *   FW1 the sweep follows a finished review's pull request: the requester's merge (asked of someone else, to merge) ends the item merged,
+ *       with the held merge closed and the requester's view merged; who asked, who reviews and whether the requester may merge are passed
+ *   FW2 merged or closed on GitHub ends an item whatever it held; a review only is followed without the requester's merge
+ *   FW3 which items are followed, and how often: one look per item per interval, none while its turn runs, before it ran, or once done/stopped;
+ *       a turn that ended without writing anything is followed too
+ *   FW4 the whole way, through the route and the review service: handed over to merge, bob approves and his merge is held for the risk,
+ *       the sweep merges with alice's own account, the item ends merged and bob's late allow makes nothing
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -331,16 +338,107 @@ describe("assistant review items", { skip }, () => {
     assert.equal(await count("claw_work_items", "params->>'acting_as' = 'bob'"), 3);
   });
 
-  test("V6 a review counts toward the user's limit of unfinished items, and the refusal says it is that limit", async () => {
+  /** The hourly limits of this world are smaller than what the queue tests count; they are another test's (V5). */
+  async function withHourlyRoom(run: () => Promise<void>): Promise<void> {
+    const env = { CLAW_GITHUB_REVIEWS_PER_TOKEN_PER_HOUR: "50", CLAW_GITHUB_REVIEWS_PER_HOUR: "50" };
+    const saved = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, env);
+    try {
+      await run();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+
+  test("V6 a review counts toward the user's limit of unfinished items; one over it waits for a slot, and past the queue's room the refusal says it is that limit", () => withHourlyRoom(async () => {
     await w.user("alice");
     for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);
     await one("alice");
+    w.drains.length = 0;
     const r = await start("alice", { prs: [PR(300)] });
-    assert.deepEqual([r.status, r.body.error, r.body.data], [409, "too_many_active_items", { limit: 4 }]);
-    assert.match(r.body.message, /the most one person may have/);
-    assert.equal(await count("claw_work_items", "kind = 'review'"), 1);
-    assert.equal(await count("claw_sessions", "config ? 'acting_as'"), 1, "the session it would have used was rolled back");
-  });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const [queued] = r.body.data.items;
+    assert.deepEqual([queued.queued, queued.message_id], [{ reason: "too_many_active_items" }, null], "made, and said to wait");
+    const item = await w.item(queued.item_id);
+    assert.deepEqual([item.board_state, item.params.queued?.reason], ["in_progress", "too_many_active_items"]);
+    assert.equal(await count("claw_pending_messages", `session_id = '${queued.session_id}'`), 0, "nothing of it can run yet");
+    assert.equal(w.drains.length, 0, "nothing drained");
+    // A task item is still refused at the limit: the queued review holds no slot, and four running items do.
+    await assert.rejects(w.createItem(await w.user("alice"), "task 4"));
+    // Past the queue's room (`MAX_QUEUED_ITEMS`), the limit's refusal stands, and what it would have made is rolled back.
+    const { MAX_QUEUED_ITEMS } = await import("../src/assistant/work-items.js");
+    for (let n = 1; n < MAX_QUEUED_ITEMS; n++) assert.equal((await start("alice", { prs: [PR(300 + n)] })).body.data.items[0].queued?.reason, "too_many_active_items");
+    const full = await start("alice", { prs: [PR(400)] });
+    assert.deepEqual([full.status, full.body.error, full.body.data], [409, "too_many_active_items", { limit: 4 }]);
+    assert.match(full.body.message, /the most one person may have/);
+    assert.equal(await count("claw_work_items", "kind = 'review'"), 1 + MAX_QUEUED_ITEMS);
+    assert.equal(await count("claw_sessions", "config ? 'acting_as'"), 1 + MAX_QUEUED_ITEMS, "the session it would have used was rolled back");
+  }));
+
+  test("V6b a queued review starts by itself, oldest first, once a slot is free; one stopped while it waits never starts", () => withHourlyRoom(async () => {
+    await w.user("alice");
+    for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);
+    const running = await one("alice");
+    const a = (await start("alice", { prs: [PR(301)] })).body.data.items[0];
+    const b = (await start("alice", { prs: [PR(302)] })).body.data.items[0];
+    const c = (await start("alice", { prs: [PR(303)] })).body.data.items[0];
+    assert.deepEqual([a.queued, b.queued, c.queued].map((x) => x?.reason), Array(3).fill("too_many_active_items"));
+    // Still full: a tick starts nothing.
+    assert.equal(await ri.startQueuedReviews(), 0);
+    assert.equal(await count("claw_pending_messages", `session_id IN ('${a.session_id}', '${b.session_id}', '${c.session_id}')`), 0);
+    // The one queued second is stopped while it waits: it is done, and never takes a slot.
+    const { stopWorkItem } = await import("../src/assistant/work-items.js");
+    assert.equal((await stopWorkItem({ userId: "alice", itemId: b.item_id, source: "user" })).status, "ok");
+    // A slot is free: the running review is stopped. The next tick starts the oldest waiting one only.
+    assert.equal((await stopWorkItem({ userId: "alice", itemId: running.item_id, source: "user" })).status, "ok");
+    w.drains.length = 0;
+    assert.equal(await ri.sweepReviewItems() >= 0, true);
+    const pending = await w.q("SELECT session_id, content FROM claw_pending_messages");
+    assert.deepEqual(pending.map((p) => p.session_id), [a.session_id], "the oldest waiting review, and only it");
+    assert.match(pending[0].content, /pull\/301/, "with its own first message");
+    assert.ok(w.drains.some((d) => JSON.stringify(d).includes(a.session_id)), "and handed to a run");
+    const started = await w.item(a.item_id);
+    assert.equal(started.params.queued, undefined);
+    assert.equal(started.summary, "reviewing AMD-AGI/PrimusClaw#301");
+    assert.match((await w.item(c.item_id)).summary, /#303 is queued: it starts by itself when a slot is free/);
+    assert.equal((await w.item(b.item_id)).board_state, "done");
+    // Started once: another tick starts nothing more, and queues no second first message.
+    assert.equal(await ri.startQueuedReviews(), 0);
+    assert.equal(await count("claw_pending_messages"), 1);
+  }));
+
+  test("V6d a queued review its owner writes into while it waits ran: it stops waiting, gets no server message, and is not halted", () => withHourlyRoom(async () => {
+    await w.user("alice");
+    for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);
+    await one("alice");
+    const waiting = (await start("alice", { prs: [PR(301)] })).body.data.items[0];
+    assert.equal(waiting.queued?.reason, "too_many_active_items");
+    const run = await w.openRun(waiting.session_id);   // (the owner's own message into the session they hold the id of)
+    await ri.startQueuedReviews();
+    const item = await w.item(waiting.item_id);
+    assert.deepEqual([item.params.queued, item.params.halted], [undefined, undefined]);
+    assert.equal(await count("claw_pending_messages", `session_id = '${waiting.session_id}'`), 0, "no first message of the server's on top");
+    await w.closeRun(run.taskId, "completed");
+    // It holds its slot now: the next review waits.
+    assert.equal((await start("alice", { prs: [PR(302)] })).body.data.items[0].queued?.reason, "too_many_active_items");
+  }));
+
+  test("V6c a queued review restarted once a slot is free starts as any restart does, and holds its slot", () => withHourlyRoom(async () => {
+    await w.user("alice");
+    for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);
+    const running = await one("alice");
+    const waiting = (await start("alice", { prs: [PR(301)] })).body.data.items[0];
+    assert.equal(waiting.queued?.reason, "too_many_active_items");
+    const { stopWorkItem } = await import("../src/assistant/work-items.js");
+    assert.equal((await stopWorkItem({ userId: "alice", itemId: running.item_id, source: "user" })).status, "ok");
+    const alice = { userId: "alice", userName: "Name alice", platformKey: "pk-alice", virtualKey: "vk-alice", roles: ["default"] };
+    const again = await ri.restartReview(alice, "identity_token", waiting.item_id, ri.parseRestartRequest({}));
+    assert.equal(again.item.queued, undefined, "it fit, so it started");
+    assert.equal((await w.item(again.item.item_id)).params.queued, undefined, "and the new item is not marked as waiting");
+    assert.equal(await count("claw_pending_messages", `session_id = '${again.item.session_id}'`), 1, "its first message is queued");
+    // It holds the slot it took: the next review waits.
+    assert.equal((await start("alice", { prs: [PR(302)] })).body.data.items[0].queued?.reason, "too_many_active_items");
+  }));
 
   test("V7 GitHub is asked first: a pull request it refuses, or an outage, makes nothing", async () => {
     checkAnswer = (pr) => pr.number === 2
@@ -546,19 +644,26 @@ describe("assistant review items", { skip }, () => {
     try {
       await askedOfBob({ prs: [PR(1)] });
       await askedOfBob({ prs: [PR(2)] });
+      // Over a limit, the review waits for a slot: said to the requester with the limit it waits on.
       const third = await start("alice", { prs: [PR(3)], acting_as: "bob", acting_as_name: "Bob B" });
-      assert.deepEqual([third.status, third.body.error, third.body.data], [409, "too_many_active_items", { limit: 2, scope: "requester" }]);
-      assert.match(third.body.message, /you already have 2 reviews waiting for Bob B/);
+      assert.deepEqual([third.status, third.body.data.items[0].queued], [200, { reason: "too_many_from_requester" }]);
       await askedOfBob({ prs: [PR(4)] }, "carol");
       const full = await start("dave", { prs: [PR(5)], acting_as: "bob", acting_as_name: "Bob B" });
-      assert.deepEqual([full.status, full.body.error, full.body.data], [409, "too_many_active_items", { limit: 3, scope: "reviewer" }]);
-      assert.match(full.body.message, /Bob B already has 3 reviews others asked for open/);
+      assert.deepEqual([full.status, full.body.data.items[0].queued], [200, { reason: "too_many_requested_reviews" }]);
       // The reviewer's own room is theirs: four own items fit beside the three others asked for (the per-user limit here is 4).
       const bob = await w.user("bob");
       for (let i = 0; i < 3; i++) await w.createItem(bob, `task ${i}`);
-      assert.equal((await start("bob", { prs: [PR(6)] })).status, 200, "the reviewer's own review still fits");
-      assert.deepEqual([(await start("bob", { prs: [PR(7)] })).body.error], ["too_many_active_items"]);
-      assert.equal(await count("claw_work_items", "user_id = 'bob'"), 7);
+      const own = await start("bob", { prs: [PR(6)] });
+      assert.deepEqual([own.status, own.body.data.items[0].queued], [200, undefined], "the reviewer's own review still starts");
+      assert.deepEqual([(await start("bob", { prs: [PR(7)] })).body.data.items[0].queued], [{ reason: "too_many_active_items" }]);
+      assert.equal(await count("claw_work_items", "user_id = 'bob'"), 10);
+      // A slot of the reviewer's limit is free: carol's review ends. Alice's waits on her own per-requester limit still, so dave's starts.
+      const carols = (await w.q("SELECT item_id FROM claw_work_items WHERE params->>'requested_by' = 'carol'"))[0].item_id as string;
+      const { stopWorkItem } = await import("../src/assistant/work-items.js");
+      assert.equal((await stopWorkItem({ userId: "bob", itemId: carols, source: "user" })).status, "ok");
+      assert.equal(await ri.startQueuedReviews(), 1);
+      const waiting = await w.q("SELECT params->>'requested_by' AS by FROM claw_work_items WHERE board_state <> 'done' AND params ? 'queued' ORDER BY seq");
+      assert.deepEqual(waiting.map((r) => r.by), ["alice", null], "alice's waits on her own limit, bob's own on his");
     } finally {
       for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
@@ -594,7 +699,7 @@ describe("assistant review items", { skip }, () => {
     const it = await askedOfBob({ review_only: false });
     const read = async (user = "alice") => app.inject({ method: "GET", url: `/v1/work-items/${it.item_id}`, headers: { "x-test-user": user } });
     const view = (await read()).json();
-    assert.deepEqual(view, { ok: true, data: { status: "in_progress", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: null, merged: false } });
+    assert.deepEqual(view, { ok: true, data: { status: "in_progress", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: null, merged: false, waiting_for: null, findings: null, note: null } });
     assert.equal((await read("carol")).statusCode, 404, "nobody else's");
     assert.ok("worker_session_id" in (await read("bob")).json().data, "the reviewer sees their item as ever");
     assert.equal((await call("alice", `/v1/work-items/${it.item_id}/accept`, { version: 0 })).status, 404, "accepting is the reviewer's");
@@ -602,7 +707,7 @@ describe("assistant review items", { skip }, () => {
     await audit(it.session_id, "gh_review_submit", "ok", "submitted", "bob", true);
     await w.q("UPDATE claw_github_audit SET arguments = '{\"event\": \"APPROVE\"}'::jsonb WHERE session_id = $1", [it.session_id]);
     const stopped = await call("alice", `/v1/work-items/${it.item_id}/stop`, {});
-    assert.deepEqual(stopped, { status: 200, body: { ok: true, data: { status: "stopped", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: "approve", merged: false } } });
+    assert.deepEqual(stopped, { status: 200, body: { ok: true, data: { status: "stopped", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: "approve", merged: false, waiting_for: null, findings: null, note: null } } });
     assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [held]))[0].status, "denied", "what was held is denied");
     assert.equal(interrupts.length, 1, "and the session interrupted");
     const closed = await w.item(it.item_id);
@@ -616,14 +721,99 @@ describe("assistant review items", { skip }, () => {
     const merged = await askedOfBob({ prs: [PR(400)] });
     await audit(merged.session_id, "gh_pr_merge", "ok", "merged", "bob");
     const late = await call("alice", `/v1/work-items/${merged.item_id}/stop`, {});
-    assert.deepEqual(late, { status: 409, body: { ok: false, error: "already_merged", data: { status: "done", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/400", verdict: null, merged: true } } });
+    assert.deepEqual(late, { status: 409, body: { ok: false, error: "already_merged", data: { status: "done", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/400", verdict: null, merged: true, waiting_for: null, findings: null, note: null } } });
     // A review that closes by its facts (posted, turn over) is frozen the same way.
     const posted = await askedOfBob({ prs: [PR(500)] });
     await turnRan(posted.session_id);
     await audit(posted.session_id, "gh_review_submit", "ok", "submitted", "bob", true);
     await w.q("UPDATE claw_github_audit SET arguments = '{\"event\": \"COMMENT\"}'::jsonb WHERE session_id = $1", [posted.session_id]);
     await ri.syncReviewItem(posted.item_id);
-    assert.deepEqual((await w.item(posted.item_id)).params.requester_view, { status: "done", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/500", verdict: "comment", merged: false });
+    assert.deepEqual((await w.item(posted.item_id)).params.requester_view, { status: "done", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/500", verdict: "comment", merged: false, waiting_for: null, findings: null, note: null });
+  });
+
+  test("Q6c while it waits for the reviewer the requester is told for what, and what the review found; the list of reviews asked of others has them", async () => {
+    const read = async (id: string, user = "alice") => (await app.inject({ method: "GET", url: `/v1/work-items/${id}`, headers: { "x-test-user": user } })).json().data;
+    // Approved, and its merge held for bob (a handed-over review's merge always is): it waits for bob to confirm the merge.
+    const held = await askedOfBob({ review_only: false, acting_as_name: "Bob B" });
+    await turnRan(held.session_id);
+    await confirmation(held.session_id, "pending", "merge", "bob");
+    await audit(held.session_id, "gh_review_submit", "ok", "submitted", "bob", true);
+    const secret = "ghp_" + "A1b2C3d4E5".repeat(4);
+    await w.q("UPDATE claw_github_audit SET arguments = '{\"event\": \"APPROVE\"}'::jsonb, posted = $2::jsonb WHERE session_id = $1", [held.session_id, JSON.stringify({
+      event: "APPROVE", review_id: 7, findings: [
+        { path: "a.ts", line: 3, thread_id: "T1", note: `  Nit:   the lock is\n taken twice; token ${secret} ` + "x".repeat(300) },
+        { path: "b.ts", line: 9, thread_id: "T2", note: "second" },
+      ],
+    })]);
+    await ri.syncReviewItem(held.item_id);
+    assert.equal((await w.item(held.item_id)).board_state, "needs_you");
+    const view = await read(held.item_id);
+    assert.deepEqual([view.status, view.verdict, view.merged, view.waiting_for, view.findings], ["waiting_for_reviewer", "approve", false, "confirm_merge", 2]);
+    assert.ok(view.note.startsWith("Nit: the lock is taken twice; token ") && view.note.length <= 160 && !view.note.includes(secret), view.note);
+    assert.deepEqual(Object.keys(view).sort(), ["findings", "merged", "note", "pr_url", "status", "verdict", "waiting_for"], "nothing else of bob's item");
+
+    // A review that failed: it waits for a restart (bob's, or alice asking again), and says so.
+    const failed = await askedOfBob({ prs: [PR(401)] });
+    await turnRan(failed.session_id, "failed");
+    await ri.syncReviewItem(failed.item_id);
+    assert.deepEqual([(await read(failed.item_id)).status, (await read(failed.item_id)).waiting_for, (await read(failed.item_id)).findings],
+      ["waiting_for_reviewer", "failed", null]);
+
+    // The list: alice's two, whom she asked, and her view of each; nobody else's.
+    const list = async (user: string) => {
+      const r = await app.inject({ method: "GET", url: "/v1/work-items/asked-of-others", headers: { "x-test-user": user } });
+      assert.equal(r.statusCode, 200, r.body);
+      return r.json().data as Array<{ item_id: string; reviewer: string | null; view: Record<string, unknown> }>;
+    };
+    const mine = await list("alice");
+    assert.deepEqual(mine.map((a) => a.item_id).sort(), [held.item_id, failed.item_id].sort());
+    assert.deepEqual(mine.find((a) => a.item_id === held.item_id), { item_id: held.item_id, reviewer: "Bob B", view });
+    assert.deepEqual(await list("bob"), [], "the reviewer's own items are on their board, not here");
+    assert.deepEqual(await list("carol"), []);
+
+    // A view frozen before it had these fields reads them as null.
+    const old = { status: "done", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/401", verdict: "approve", merged: true };
+    await w.q("UPDATE claw_work_items SET board_state = 'done', outcome = 'accepted', closed_at = NOW(), params = params || jsonb_build_object('requester_view', $2::jsonb) WHERE item_id = $1",
+      [failed.item_id, JSON.stringify(old)]);
+    assert.deepEqual(await read(failed.item_id), { ...old, waiting_for: null, findings: null, note: null });
+  });
+
+  test("Q6d a requester's stop freezes what the review had posted by then, though no sync wrote it to the item yet", async () => {
+    const it = await askedOfBob({ review_only: false });
+    await audit(it.session_id, "gh_review_submit", "ok", "submitted", "bob", true);
+    await w.q("UPDATE claw_github_audit SET arguments = '{\"event\": \"REQUEST_CHANGES\"}'::jsonb, posted = $2::jsonb WHERE session_id = $1", [it.session_id, JSON.stringify({
+      event: "REQUEST_CHANGES", review_id: 8, findings: [{ path: "a.ts", line: 1, thread_id: "T9", note: "Blocking: the lock is taken twice" }],
+    })]);
+    assert.equal((await w.item(it.item_id)).params.record ?? null, null, "no sync ran: the item has no record yet");
+    const stopped = await call("alice", `/v1/work-items/${it.item_id}/stop`, {});
+    assert.equal(stopped.status, 200, JSON.stringify(stopped.body));
+    assert.deepEqual([stopped.body.data.verdict, stopped.body.data.findings, stopped.body.data.note], ["request_changes", 1, "Blocking: the lock is taken twice"]);
+    assert.deepEqual((await w.item(it.item_id)).params.requester_view, stopped.body.data, "frozen as answered");
+  });
+
+  test("Q6e a submit recorded while the view is frozen is frozen whole: never its verdict without what it posted", async () => {
+    const rv = await import("../src/assistant/requester-view.js");
+    const it = await askedOfBob({ review_only: false });
+    await audit(it.session_id, "gh_review_submit", "started", "", "bob", true);
+    await w.q("UPDATE claw_work_items SET board_state = 'done', outcome = 'stopped', closed_at = NOW() WHERE item_id = $1", [it.item_id]);
+    // The submit's one write (result, detail, posted: `auditFinish`) commits right after the freeze first reads what was posted.
+    let finished = false;
+    const pool = (await import("../src/infra/db.js")).db;
+    const q = {
+      query: async (sql: string, params?: unknown[]) => {
+        const r = await pool.query(sql, params as any[]);
+        if (!finished && sql.includes("SELECT head_sha, posted FROM claw_github_audit")) {
+          finished = true;
+          await w.q(`UPDATE claw_github_audit SET result = 'ok', detail = 'submitted', arguments = '{"event": "APPROVE"}'::jsonb, posted = $2::jsonb
+                      WHERE session_id = $1`, [it.session_id, JSON.stringify({ event: "APPROVE", review_id: 9, findings: [{ path: "a.ts", line: 2, thread_id: "T3", note: "Nit: a name" }] })]);
+        }
+        return r;
+      },
+    };
+    await rv.freezeRequesterView(q as any, it.item_id);
+    assert.ok(finished, "the submit landed in between");
+    const frozen = (await w.item(it.item_id)).params.requester_view;
+    assert.deepEqual([frozen.verdict, frozen.findings, frozen.note], ["approve", 1, "Nit: a name"]);
   });
 
   test("Q6b a requested review's held writes are the reviewer's alone: the requester lists none of them, by any filter; their own sessions' still list", async () => {
@@ -686,6 +876,26 @@ describe("assistant review items", { skip }, () => {
     assert.equal((await w.item(c.item_id)).params.halted.reason, "unavailable");
     assert.equal((await w.item(d.item_id)).params.halted, undefined);
     assert.deepEqual(await keysOf(d.session_id), { platformKey: "pk-bob", llmApiKey: "vk-bob" });
+  }));
+
+  test("Q7b a review that waits for a slot is halted with the rest when the say is withdrawn: it stops waiting, says so, and never starts from the queue", () => withEnv({ ...ROOMY, CLAW_REVIEW_FOR_OTHERS_PER_REQUESTER_MAX_ACTIVE: "1" }, async () => {
+    const running = await askedOfBob({ prs: [PR(1)] });
+    const r = await start("alice", { prs: [PR(2)], acting_as: "bob", acting_as_name: "Bob B" });
+    const waiting = r.body.data.items[0];
+    assert.deepEqual([r.status, waiting.queued], [200, { reason: "too_many_from_requester" }]);
+    delegation.bob = "off";
+    assert.equal(await ri.gateRequestedReviewTurn(running.session_id), false);
+    const item = await w.item(waiting.item_id);
+    assert.deepEqual([item.params.queued, item.params.halted?.reason], [undefined, "delegation_off"], "halted, and no longer waiting");
+    assert.deepEqual([item.board_state, item.last_report_kind], ["needs_you", "failed"]);
+    assert.match(item.summary, /^AMD-AGI\/PrimusClaw#2 not run: reviewer turned off reviews for others$/, "the halt is put in front of the owner, not \"queued\"");
+    // The reviewer turns delegation back on and a slot frees: the halted review is not started by the queue without a new request.
+    delete delegation.bob;
+    const { stopWorkItem } = await import("../src/assistant/work-items.js");
+    assert.equal((await stopWorkItem({ userId: "bob", itemId: running.item_id, source: "user" })).status, "ok");
+    assert.equal(await ri.startQueuedReviews(), 0);
+    assert.equal(await count("claw_pending_messages", `session_id = '${waiting.session_id}'`), 0, "nothing of it is queued to run");
+    assert.equal((await w.item(waiting.item_id)).params.halted?.reason, "delegation_off", "the halt reason stands");
   }));
 
   test("Q8 a requested review's turns are budgeted: per review and per reviewer per day, and an exhausted one does not run", async () => {
@@ -1098,6 +1308,186 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual([item.board_state, item.outcome, item.last_report_kind], ["done", "accepted", null], "no worker's ready, so nothing to accept");
     assert.equal(await count("claw_work_item_events", `item_id = '${it.item_id}' AND source = 'turn_end'`), 0);
   });
+
+  /** The pull request outcome `followPullRequest` would find, written as it writes it; every call is kept. */
+  async function followed(fn: (f: Record<string, any>) => Promise<{ status: string; reason?: string }>): Promise<Array<Record<string, any>>> {
+    const seen: Array<Record<string, any>> = [];
+    ri.reviewItemPorts.followPullRequest = async (f) => {
+      seen.push(f as never);
+      const body = await fn(f as never);
+      const ok = body.status !== "refused";
+      await w.q(
+        `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, result, detail)
+         VALUES ($1, $1, $2, 'AMD-AGI/PrimusClaw', 254, $3, 'gh_pr_follow', $4, $5)`,
+        [f.requesterUserId, f.sessionId, "a".repeat(40), ok ? "ok" : "refused", ok ? body.status : body.reason ?? ""],
+      );
+      if (body.status === "merged") {
+        await w.q("UPDATE claw_github_confirmations SET status = 'merged', decided_by = $2 WHERE session_id = $1 AND status = 'pending'", [f.sessionId, f.requesterUserId]);
+      }
+      return { isError: !ok, body: body as never, text: JSON.stringify(body) };
+    };
+    return seen;
+  }
+
+  test("FW1 the requester's merge after the reviewer's approval ends the item merged, and the requester's view says merged", async () => {
+    const r = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    const it = r.body.data.items[0];
+    assert.equal(it.merge_by_requester, true, "the channel is told the requester's account merges after the approval");
+    const item = await w.item(it.item_id);
+    await turnRan(item.worker_session_id);
+    await audit(item.worker_session_id, "gh_review_submit", "ok", "submitted", "bob");
+    await confirmation(item.worker_session_id, "pending", "merge", "bob");
+    await ri.sweepReviewItems();
+    assert.equal((await w.item(it.item_id)).summary, "the merge of AMD-AGI/PrimusClaw#254 is held");
+    const seen = await followed(async () => ({ status: "merged" }));
+    try {
+      assert.equal(await ri.followReviewItems(), 1);
+      assert.deepEqual(seen.map((f) => [f.sessionId, f.actingUserId, f.requesterUserId, f.requesterLabel, f.mergeByRequester, f.ref.number]),
+        [[item.worker_session_id, "bob", "alice", "Name alice", true, 254]]);
+      const after = await w.item(it.item_id);
+      assert.deepEqual([after.board_state, after.outcome, after.summary],
+        ["done", "accepted", "AMD-AGI/PrimusClaw#254 was merged by the requester's account after the approval"]);
+      assert.equal(after.params.requester_view.merged, true);
+      assert.equal(after.params.requester_view.status, "done");
+    } finally {
+      ri.reviewItemPorts.followPullRequest = null;
+    }
+  });
+
+  test("FW2 merged or closed on GitHub ends an item whatever it still held; a review only is followed without the requester's merge", async () => {
+    const r = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: true });
+    const it = r.body.data.items[0];
+    assert.equal("merge_by_requester" in it, false, "a review only is not merged by anyone");
+    const item = await w.item(it.item_id);
+    await turnRan(item.worker_session_id);
+    await audit(item.worker_session_id, "gh_review_submit", "ok", "submitted", "bob");
+    await confirmation(item.worker_session_id, "pending", "review", "bob");
+    await ri.sweepReviewItems();
+    let answer = { status: "waiting", reason: "approval_missing" } as { status: string; reason?: string };
+    const seen = await followed(async () => answer);
+    try {
+      // Still open: nothing changes.
+      assert.equal(await ri.followReviewItems(), 0);
+      assert.equal(seen[0]!.mergeByRequester, false, "a review only is never merged by the requester");
+      assert.equal((await w.item(it.item_id)).board_state, "needs_you");
+      // A refused look (GitHub down) changes nothing either.
+      answer = { status: "refused", reason: "github_error" };
+      assert.equal(await ri.followReviewItems(Date.now() + 100_000), 0);
+      assert.equal((await w.item(it.item_id)).board_state, "needs_you");
+      answer = { status: "already_merged" };
+      assert.equal(await ri.followReviewItems(Date.now() + 200_000), 1);
+      let after = await w.item(it.item_id);
+      assert.deepEqual([after.board_state, after.outcome, after.summary], ["done", "accepted", "AMD-AGI/PrimusClaw#254 was merged on GitHub"]);
+      assert.equal(after.params.requester_view.merged, true);
+      // Closed without a merge: done, as stopped.
+      const r2 = await start("alice", { prs: [PR(255)], acting_as: "bob", review_only: false });
+      const it2 = await w.item(r2.body.data.items[0].item_id);
+      await turnRan(it2.worker_session_id);
+      await audit(it2.worker_session_id, "gh_pr_merge", "refused", "merge_state_not_clean", "bob");
+      answer = { status: "closed" };
+      assert.equal(await ri.followReviewItems(Date.now() + 300_000), 1);
+      after = await w.item(it2.item_id);
+      assert.deepEqual([after.board_state, after.outcome], ["done", "stopped"]);
+      assert.equal(after.params.requester_view.merged, false);
+    } finally {
+      ri.reviewItemPorts.followPullRequest = null;
+    }
+  });
+
+  test("FW3 one look per item per interval, by one caller; none while its turn runs, before it ran, or once it is done or stopped", async () => {
+    const seen = await followed(async () => ({ status: "waiting", reason: "ci_not_green" }));
+    try {
+      const r = await start("alice", { prs: [PR(254), PR(255), PR(256)], acting_as: "bob", review_only: false });
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      const items = await Promise.all((r.body.data.items as Array<{ item_id: string }>).map((i) => w.item(i.item_id)));
+      const [ran, running, never] = items;
+      await turnRan(ran!.worker_session_id);
+      await audit(ran!.worker_session_id, "gh_review_submit", "ok", "submitted", "bob");
+      // A turn that is running now: its review may still write.
+      await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [running!.worker_session_id]);
+      await audit(running!.worker_session_id, "gh_review_submit", "ok", "submitted", "bob");
+      await w.openRun(running!.worker_session_id);
+      const now = Date.now();
+      // Two sweeps at once (two replicas): the item is looked at once.
+      await Promise.all([ri.followReviewItems(now), ri.followReviewItems(now)]);
+      assert.deepEqual(seen.map((f) => f.sessionId), [ran!.worker_session_id], `not ${never!.item_id} (never ran), not the running one`);
+      await ri.followReviewItems(now + 10_000);
+      assert.equal(seen.length, 1, "not again within the interval");
+      await ri.followReviewItems(now + ri.REVIEW_FOLLOW_MS + 1);
+      assert.equal(seen.length, 2, "and again after it");
+      // A turn that ended without writing anything (it failed): its pull request is followed too.
+      await turnRan(never!.worker_session_id, "failed");
+      await ri.sweepReviewItems();
+      assert.equal((await w.item(never!.item_id)).board_state, "needs_you");
+      await ri.followReviewItems(now + ri.REVIEW_FOLLOW_MS + 2);
+      assert.ok(seen.some((f) => f.sessionId === never!.worker_session_id), "a failed turn's pull request is followed");
+      // Stopped by the requester, or done: never again.
+      await w.q("UPDATE claw_work_items SET board_state = 'done', outcome = 'stopped' WHERE item_id = $1", [ran!.item_id]);
+      const looked = seen.length;
+      await ri.followReviewItems(now + 3 * ri.REVIEW_FOLLOW_MS);
+      assert.ok(!seen.slice(looked).some((f) => f.sessionId === ran!.worker_session_id), "a stopped item is not followed");
+    } finally {
+      ri.reviewItemPorts.followPullRequest = null;
+    }
+  });
+
+  test("FW4 handed over to merge: bob's approval lands, his merge is held, and alice's own account merges it with no confirmation from bob", () => withEnv({
+    ...ROOMY, CLAW_REVIEW_FOR_OTHERS_MAX_ACTIVE: "20", CLAW_REVIEW_FOR_OTHERS_PER_REQUESTER_MAX_ACTIVE: "20", CLAW_ASSISTANT_MAX_ACTIVE_ITEMS: "20",
+  }, async () => {
+    const { GithubReview } = await import("../src/github-review/service.js");
+    const { readGithubReviewSettings } = await import("../src/github-review/settings.js");
+    const { setReviewMode } = await import("../src/github-review/store.js");
+    const { mergeNeedsConfirmationOf, reviewOnlyOf } = await import("../src/github-review/review-target.js");
+    const { FakeGithub, HEAD } = await import("./support/fake-github.js");
+    const { credential, reviewedHead, REQUESTER_TOKEN, SECRET, PR: DEMO } = await import("./support/review-env.js");
+    const pg = w.h.app.db.db;
+    const db = { query: async (text: string, params?: unknown[]) => { const r = await pg.query(text, params as never); return { rows: r.rows, rowCount: r.rowCount }; } };
+    const q = ((text: string, params?: unknown[]) => w.q(text, params as never)) as never;
+    await setReviewMode(db, "bob", "high_risk_confirm");
+    const pr = { owner: "AMD-AGI", repo: "demo", number: 7 };
+    await ri.recordReviewHandoff(q, { handoffId: "h-fw4", userId: "alice", reviewerUserId: "bob", prs: [pr], merge: true });
+    const r = await start("alice", { prs: [pr], acting_as: "bob", acting_as_name: "Bob B", review_only: false, handoff_id: "h-fw4" });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const item = await w.item(r.body.data.items[0].item_id);
+    const cfg = (await w.q("SELECT config FROM claw_sessions WHERE session_id = $1", [item.worker_session_id]))[0].config;
+    const actor = {
+      sessionId: item.worker_session_id, requesterUserId: "alice", actorUserId: "bob", requesterLabel: "Name alice",
+      reviewOnly: reviewOnlyOf(cfg), mergeNeedsConfirmation: mergeNeedsConfirmationOf(cfg),
+    };
+    const gh = new FakeGithub();
+    const service = new GithubReview({
+      settings: () => readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MCP_SECRET: SECRET, CLAW_GITHUB_WRITES_ENABLED: "true" }, true),
+      db, fetchImpl: gh.fetch, sleep: async () => {}, recordPosted: true, sessionStopped: ri.reviewSessionStopped,
+      resolveCredential: async (req) => (req.userId === "bob" ? credential() : credential({ token: REQUESTER_TOKEN, providerLogin: "alice" })),
+    });
+    // bob's review: it approves the head (judged low), then its merge is judged high and held for bob, as his setting says.
+    await reviewedHead({ sql: (text: string, params?: unknown[]) => w.q(text, params as never), actor }, { pr: DEMO });
+    const approved = await service.submitReview(actor, { pr: DEMO, head_sha: HEAD, event: "APPROVE", body: "No blocking findings.", risk_judgement: { level: "low", reason: "an ordinary change" } });
+    assert.equal(approved.body.status, "submitted", approved.text);
+    const held = await service.mergePr(actor, { pr: DEMO, head_sha: HEAD, risk_judgement: { level: "high", reason: "a person should look" } });
+    assert.equal(held.body.status, "confirmation_required", held.text);
+    await turnRan(item.worker_session_id);
+    await ri.sweepReviewItems();
+    assert.equal((await w.item(item.item_id)).summary, "the merge of AMD-AGI/demo#7 is held");
+    gh.calls.length = 0;
+    ri.reviewItemPorts.followPullRequest = (f) => service.followPullRequest(f);
+    try {
+      assert.equal(await ri.followReviewItems(), 1);
+    } finally {
+      ri.reviewItemPorts.followPullRequest = null;
+    }
+    const merges = gh.calls.filter((c) => c.method === "PUT");
+    assert.equal(merges.length, 1);
+    assert.equal(merges[0]!.authorization, `Bearer ${REQUESTER_TOKEN}`, "merged with alice's own account");
+    const after = await w.item(item.item_id);
+    assert.deepEqual([after.board_state, after.outcome, after.summary], ["done", "accepted", "AMD-AGI/demo#7 was merged by the requester's account after the approval"]);
+    assert.equal(after.params.requester_view.merged, true);
+    const [c] = await w.q("SELECT confirmation_id, status, decided_by FROM claw_github_confirmations WHERE session_id = $1", [item.worker_session_id]);
+    assert.deepEqual([c.status, c.decided_by], ["merged", "alice"]);
+    const late = await service.decide("bob", c.confirmation_id, "allow");
+    assert.deepEqual([late.body.status, late.body.reason], ["refused", "not_pending"]);
+    assert.equal(gh.calls.filter((x) => x.method === "PUT").length, 1, "bob's late allow merged nothing");
+  }));
 
   test("G2 nothing the server queues reaches an acting session without the person's proof: work_send into a review is refused", async () => {
     const it = await one("alice");

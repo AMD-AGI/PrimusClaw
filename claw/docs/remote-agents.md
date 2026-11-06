@@ -174,11 +174,29 @@ connector replaces the older, which receives `event: superseded` and ends. When 
 connector is revoked its stream receives `event: revoked` and ends, and every
 connector-side route answers `401 revoked`.
 
+**Presence over time.** Every 15 s one API replica (an advisory lock picks it) compares
+each connector with the presence it last recorded and writes every change it sees to
+`claw_remote_connector_transitions`. `GET /v1/remote-agents/connectors` gives each
+connector `last_seen_at` (its last heartbeat or stream activity) and, while offline,
+`offline_since` (when it was last seen before it went) and `offline_reason`:
+`auth_expired` when the server ended its last stream because its token expired or its
+grant was revoked, `no_heartbeat` otherwise.
+
+When the assistant is on, a connector that stays offline for 5 minutes, counted from when
+the sweep first found it offline, is reported once to its owner through their assistant:
+when it was last seen, why it went, and the command that brings it back
+(`claw-connector run`, after `claw-connector login` when its sign-in ran out). When it
+comes back after that, the owner is told once that it has. Short breaks (a Claw release
+cuts every stream for a few seconds) and a Claw outage (the sweep is down with it) are
+never reported. Nothing is said about a connector its owner revoked, one replaced by an
+online connector of the same name, or one that was already offline when presence was
+first recorded for it. Transitions are kept as long as closed sessions are (Retention).
+
 ## User side
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/remote-agents/connectors` | The caller's connectors, with `online` and their agents. |
+| `GET /v1/remote-agents/connectors` | The caller's connectors, with `online`, `last_seen_at`, `offline_since`, `offline_reason` and their agents. |
 | `DELETE .../connectors/:cid` | Revoke: closes its sessions, drops its queued commands. |
 | `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?, resume_ref?}`. `409 connector_offline` unless online. |
 | `GET .../sessions`, `GET .../sessions/:id` | List, and read one with `connector_online`. |
@@ -210,11 +228,30 @@ A write made through the same API replica reaches an open stream at once. A writ
 made through another replica is found by the stream's own read of the database,
 which an idle stream does every 5 s, so it can arrive up to that much later.
 
+## The assistant
+
+Where remote agents are on, the assistant's router has a read-only tool, `devenv_list`, and
+its prompt treats the user's development environments (开发环境, dev box, my machine) as their
+connectors, never as SaFE workspaces. The tool answers the caller's own connectors that are not
+revoked: each machine's name, whether it is online, when it was last seen, its version and its
+agents; and every session on it, both the ones open through Claw and the agents' own
+conversations a connector offers to take over (`capabilities.resumable`), each with its folder,
+state (`working`, `waiting_for_you`, `idle`, `in_terminal`), last activity, a label
+(`machine/agent/n`) and the command that attaches the user's chat to it
+(`/agent attach <session id or conversation ref>`). The router passes that command to the
+channel with `channel_action`; a conversation open in a terminal on the machine, or a machine
+that is offline, has none. `detail: "activity"` adds each session's current step and the end of
+its last answer. Names, folders and what agents wrote can be named by anyone, so a turn that has
+read the list no longer acts for the user, with one exception: it may still put
+`/agent attach <ref>` for one of the user's own attachable sessions to them, as a button they
+press (never run at once); any other ref or action is refused.
+
 ## Retention
 
 A closed session is deleted with all of its events `CLAW_REMOTE_AGENTS_RETENTION_DAYS`
 days (default 30) after it closed; each API replica checks hourly. Zero or less keeps
-them for ever. Live sessions are never deleted, and neither is the audit trail.
+them for ever. Live sessions are never deleted, and neither is the audit trail. Presence
+transitions older than the same number of days go in the same sweep.
 
 ## Audit
 

@@ -373,6 +373,19 @@ export const RUN_LEASE_TTL_MS = envInt(
 // sweeper that runs slightly too often.
 export const TASK_SWEEPER_TICK_MS = envInt("TASK_SWEEPER_TICK_MS", 60_000, { min: 1_000 });
 /**
+ * From SIGTERM to exit, at most (see infra/graceful-shutdown.ts). Must fit
+ * inside what the pod's terminationGracePeriodSeconds leaves after its preStop
+ * sleep, or the kubelet's SIGKILL ends the drain instead; the chart's 90s grace
+ * minus a 10s preStop leaves 80s, and this keeps 5s of it spare.
+ */
+export const SHUTDOWN_DEADLINE_MS = envInt("SHUTDOWN_DEADLINE_MS", 75_000, { min: 1_000 });
+/**
+ * How long to keep serving after SIGTERM before closing. Zero behind the chart,
+ * whose preStop sleep has already taken the pod out of the endpoints; a
+ * deployment without one sets this instead.
+ */
+export const SHUTDOWN_DELAY_MS = envInt("SHUTDOWN_DELAY_MS", 0, { min: 0 });
+/**
  * How long past its expiry a lease may sit before the run is declared gone.
  *
  * Derived rather than chosen, and derived from the thing it must not preempt:

@@ -23,9 +23,9 @@ import { actingUserOf, parseActingAs } from "../github-review/acting-as.js";
 import { REVIEW_SANDBOX_PROFILE, requestedByOf, usesReviewProfile } from "../github-review/requested-by.js";
 import { reviewAgentSettings, reviewTurnsLeft } from "../github-review/review-profile.js";
 import { SEALED_CREDENTIALS_FIELD } from "../auth/sealed-session-credentials.js";
-import { checkSessionCreate, proofForFirstMessageAgain, type AttendedProof } from "../github-review/acting-session.js";
+import { checkSessionCreate, proofForFirstMessageAgain, proofForQueuedFirstMessage, type AttendedProof } from "../github-review/acting-session.js";
 import { isValidPrRef, type PrRef } from "../github-review/github.js";
-import type { ReviewActor, ReviewContinuation, ToolOutcome } from "../github-review/service.js";
+import type { FollowRequest, ReviewActor, ReviewContinuation, ToolOutcome } from "../github-review/service.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import { REVIEW_ROWS_ONLY, closeConfirmationsForStop, type PostedReview } from "../github-review/store.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
@@ -35,7 +35,7 @@ import { getOrCreateAssistant } from "./assistant.js";
 import { drainSessionIfIdle, queueServerMessage, type QueuedServerMessage } from "./messages.js";
 import { queueRouterWake } from "./reports.js";
 import { freezeRequesterView } from "./requester-view.js";
-import { clipOneLine, getWorkItem, insertWorkItem, itemView, type Outcome, type WorkItemView } from "./work-items.js";
+import { clipOneLine, getWorkItem, insertWorkItem, itemView, RUNNING, WAITING, type Outcome, type WorkItemView } from "./work-items.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { modelAnswer, modelChoiceOn, ModelChoiceRefused, resolveItemModel, type ResolvedModel } from "./model-choice.js";
 
@@ -78,6 +78,11 @@ export interface ReviewParams {
   requester_note?: string | null;
   /** Why the server stopped running the review before its turn (`haltRequestedReview`): the reviewer's say was withdrawn, or the budget ran out. */
   halted?: { reason: string; message: string };
+  /**
+   * Set while the review waits for a slot (`insertWorkItem` with `queueWhenFull`): since when, and the limit it waits on. Its session has
+   * no message yet; `startQueuedReviews` queues the first one and removes this once a slot is free.
+   */
+  queued?: { since: string; reason: string };
   /** The last review of the same pull request this one continues (a restart, or a new request after a closed item), as the facts recorded it. */
   continues?: ReviewContinues | null;
   /** What this review has posted so far, from the same facts (`reviewRecord`); written when the item's state is brought up to date. */
@@ -119,9 +124,12 @@ export type DelegationAnswer = "on" | "off" | "not_bound" | "expired" | "unavail
 export const reviewItemPorts: {
   checkPullRequest: ((actor: ReviewActor, ref: PrRef) => Promise<ToolOutcome>) | null;
   delegationOf: ((actorUserId: string, requesterUserId: string) => Promise<DelegationAnswer>) | null;
+  /** What became of a review's pull request, and the requester's merge of it (`GithubReview.followPullRequest`). */
+  followPullRequest: ((f: FollowRequest) => Promise<ToolOutcome>) | null;
 } = {
   checkPullRequest: null,
   delegationOf: null,
+  followPullRequest: null,
 };
 
 export function reviewItemsEnabled(): boolean {
@@ -476,11 +484,23 @@ export interface CreatedReview {
    */
   merge_needs_confirmation?: true;
   /**
+   * Present on a review asked of someone else that may merge: once the reviewer's approval of the head is on GitHub and the gates are
+   * open, the requester's own GitHub account merges it when it wrote the pull request (`followReviewItems`), without the reviewer
+   * confirming the merge. A channel that tells the person how the merge will be made reads it here.
+   */
+  merge_by_requester?: true;
+  /**
    * With model choice on (`model-choice.ts`): the model the review runs on (null: the deployment's default), and the one it was to run
    * on when the payer's key could not use it. Absent with model choice off.
    */
   model?: string | null;
   fell_back_from?: string;
+  /**
+   * Present when the limit it would go over (`reason`: `too_many_active_items`, `too_many_requested_reviews`, `too_many_from_requester`)
+   * was full: the item is made and waits for a slot, and starts by itself, oldest first, once one is free (`startQueuedReviews`). Nothing of
+   * it has run. Absent: it started.
+   */
+  queued?: { reason: string };
 }
 
 interface Planned {
@@ -554,9 +574,16 @@ async function insertReview(q: StatementRunner, owner: UserInfo, plan: Planned):
   }, { parentSid: null });
   const item = await insertWorkItem(q, {
     userId: owner.userId, title: name, workerSessionId: plan.sessionId, kind: "review", params: plan.params as unknown as Record<string, unknown>,
-    requestedBy: plan.params.requested_by ?? null,
+    requestedBy: plan.params.requested_by ?? null, queueWhenFull: true,
   });
   if (!item.ok) throw itemLimitRefusal(item.error, plan.params, owner.userId);
+  if (item.queued) {   // (its first message waits with it: nothing of it may run before it has a slot)
+    return {
+      item_id: item.itemId, seq: item.seq, title: name, session_id: plan.sessionId, pr: plan.pr, message_id: null,
+      review_only: plan.params.review_only, ...(plan.params.merge_needs_confirmation === true ? { merge_needs_confirmation: true as const } : {}),
+      queued: { reason: item.queued },
+    };
+  }
   const queued = await queueServerMessage(q, {
     sessionId: plan.sessionId, userId: owner.userId, content: firstMessage(plan), dedupeKey: `start:${item.itemId}`, attended: plan.attended,
   });
@@ -564,6 +591,7 @@ async function insertReview(q: StatementRunner, owner: UserInfo, plan: Planned):
   return {
     item_id: item.itemId, seq: item.seq, title: name, session_id: plan.sessionId, pr: plan.pr, message_id: queued.pendingId === null ? null : queuedMessageId(queued.pendingId),
     review_only: plan.params.review_only, ...(plan.params.merge_needs_confirmation === true ? { merge_needs_confirmation: true as const } : {}),
+    ...(plan.params.requested_by && !plan.params.review_only ? { merge_by_requester: true as const } : {}),
   };
 }
 
@@ -672,8 +700,8 @@ export async function startReviews(
     }
     return out;
   });
-  for (const c of created) await drainSessionIfIdle(c.session_id, owner.userId);
-  logger.info({ userId: user.userId, actingAs, owner: owner.userId, items: created.map((c) => c.item_id), ignored, ...(choice ? { model: choice.model, source: choice.source } : {}) }, "assistant.reviews_started");
+  for (const c of created) if (!c.queued) await drainSessionIfIdle(c.session_id, owner.userId);
+  logger.info({ userId: user.userId, actingAs, owner: owner.userId, items: created.map((c) => c.item_id), queued: created.filter((c) => c.queued).map((c) => c.item_id), ignored, ...(choice ? { model: choice.model, source: choice.source } : {}) }, "assistant.reviews_started");
   const answered = choice ? created.map((c) => ({ ...c, ...modelAnswer(choice) })) : created;
   return ignored.length > 0 ? answered.map((c) => ({ ...c, ignored: [...ignored] })) : answered;
 }
@@ -716,6 +744,7 @@ function readParams(row: Record<string, unknown>): ReviewParams | null {
       ? { requested_by: p.requested_by, requester_label: typeof p.requester_label === "string" ? p.requester_label : p.requested_by, requester_note: typeof p.requester_note === "string" ? p.requester_note : null }
       : {}),
     ...(p.halted && typeof p.halted === "object" ? { halted: p.halted } : {}),
+    ...(p.queued && typeof p.queued === "object" ? { queued: p.queued } : {}),
     continues: readContinues(p.continues),
   };
 }
@@ -774,6 +803,22 @@ export async function reviewRecord(q: StatementRunner, sessionId: string, params
     model: last ? params.model : (before as ReviewContinues).model,
     findings: [...carried, ...fresh].slice(-MAX_FINDINGS),
   };
+}
+
+/**
+ * Write the item's record of what its review posted (`params.record`) from the audit as it is now. The state sync does this on every
+ * change; a close that is not the sync's (the requester's stop) does it first, so that the view frozen then (`freezeRequesterView`) has
+ * what was posted up to that moment.
+ */
+export async function refreshReviewRecord(q: StatementRunner, itemId: string): Promise<void> {
+  const row = (await q.query(
+    "SELECT kind, worker_session_id, params FROM claw_work_items WHERE item_id = $1 AND kind = 'review'", [itemId],
+  )).rows[0] as Record<string, unknown> | undefined;
+  const params = row ? readParams(row) : null;
+  if (!row || !params) return;
+  const record = await reviewRecord(q, row.worker_session_id as string, params);
+  if (JSON.stringify(record) === JSON.stringify((row.params as Record<string, unknown> | null)?.record ?? null)) return;
+  await q.query("UPDATE claw_work_items SET params = params || jsonb_build_object('record', $2::jsonb) WHERE item_id = $1", [itemId, JSON.stringify(record)]);
 }
 
 /** What a re-review of `row`'s pull request continues: its record, named by the item; null when it posted nothing to continue. */
@@ -855,7 +900,8 @@ export async function restartReview(
     choice ? choice.model : "model" in change ? change.model : was.model, "effort" in change ? change.effort : was.effort, mergeNeedsConfirmation);
   // The old words are sent again only if they still say what is asked: a review that now merges, or now does not, gets new ones.
   const brief = change.message ?? (reviewOnly === was.review_only ? was.brief : defaultBrief(was.pr, reviewOnly));
-  const { halted: _halted, ...kept } = was;
+  // (a restart is made as any start is: neither why the old one was halted nor that it waited for a slot carries over)
+  const { halted: _halted, queued: _queued, ...kept } = was;
   const plan: Planned = {
     pr: was.pr, sessionId: randomUUID(), attended: checked.attended,
     config: requestedBy ? asRequested(checked.config, { user_id: requestedBy, label: was.requester_label ?? requestedBy }) : checked.config,
@@ -906,7 +952,7 @@ export async function restartReview(
     return { oldSession: row.worker_session_id, seq: Number(row.seq), item: await insertReview(q, user, plan) };
   });
   await stopSessionRuns(result.oldSession);
-  await drainSessionIfIdle(result.item.session_id, user.userId);
+  if (!result.item.queued) await drainSessionIfIdle(result.item.session_id, user.userId);
   logger.info({ userId: user.userId, stopped: itemId, item: result.item.item_id }, "assistant.review_restarted");
   // With model choice on, the restarted item says which model it runs on, as a start does.
   const item = modelChoiceOn() ? { ...result.item, ...(choice ? modelAnswer(choice) : { model: plan.params.model }) } : result.item;
@@ -949,7 +995,9 @@ async function haltRequestedReviews(ownerUserId: string, sessionIds: string[], h
       );
     }
     return (await query(
-      `UPDATE claw_work_items SET params = params || jsonb_build_object('halted', $2::jsonb), updated_at = NOW()
+      // A review that waits for a slot stops waiting too: a halted review never starts from the queue (`startQueuedReviews`), and its
+      // owner is shown the halt rather than "queued".
+      `UPDATE claw_work_items SET params = (params - 'queued') || jsonb_build_object('halted', $2::jsonb), updated_at = NOW()
         WHERE worker_session_id = ANY($1::text[]) AND kind = 'review' AND board_state <> 'done' RETURNING item_id`,
       [sessionIds, JSON.stringify(halted)],
     )).rows.map((r) => (r as { item_id: string }).item_id);
@@ -1042,7 +1090,13 @@ export interface ReviewFacts {
   turn: "running" | "failed" | "finished" | "none";
   /** Why the server stopped running a review someone asked of the owner (`haltRequestedReviews`), or null. */
   halted?: { reason: string; message: string } | null;
+  /** The review waits for a slot (`ReviewParams.queued`): nothing of it has run. */
+  queued?: boolean;
 }
+
+/** The audit rows of `GithubReview.followPullRequest`, and the details of those that end a review item. */
+export const FOLLOW_TOOL = "gh_pr_follow";
+const FOLLOW_ENDS: ReadonlySet<string> = new Set(["merged", "queued", "already_merged", "closed"]);
 
 export type ReviewState =
   | { boardState: "in_progress"; summary: string; question: string | null }
@@ -1056,8 +1110,20 @@ export type ReviewState =
  */
 export function reviewState(f: ReviewFacts): ReviewState {
   const pr = prName(f.pr);
+  if (f.queued && !f.halted) return { boardState: "in_progress", summary: `${pr} is queued: it starts by itself when a slot is free`, question: null };
   const own = f.actingAs === f.ownerUserId;
   const latest = <T extends { at: number }>(xs: T[]): T | null => xs.reduce<T | null>((a, x) => (!a || x.at >= a.at ? x : a), null);
+  // What the sweep found of the pull request on GitHub (`followReviewItems`): merged by the requester's own account after this review's
+  // approval, merged or closed by anyone, which ends the item whatever it still held for an answer.
+  const ended = latest(f.writes.filter((w) => w.tool === FOLLOW_TOOL && w.result === "ok" && FOLLOW_ENDS.has(w.detail)));
+  if (ended) {
+    switch (ended.detail) {
+      case "merged": return { boardState: "done", outcome: "accepted", summary: `${pr} was merged by the requester's account after the approval` };
+      case "queued": return { boardState: "done", outcome: "accepted", summary: `${pr} is in the merge queue` };
+      case "already_merged": return { boardState: "done", outcome: "accepted", summary: `${pr} was merged on GitHub` };
+      default: return { boardState: "done", outcome: "stopped", summary: `${pr} was closed on GitHub without a merge` };
+    }
+  }
   const merged = f.confirmations.find((c) => c.status === "merged" || c.status === "queued")
     ?? f.writes.find((w) => w.tool === "gh_pr_merge" && w.result === "ok" && (w.detail === "merged" || w.detail === "queued"));
   if (merged) {
@@ -1116,7 +1182,7 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
   )).rows as Array<{ status: string; kind: string; at: unknown }>;
   const writes = (await q.query(
     `SELECT tool, result, detail, at FROM claw_github_audit
-      WHERE session_id = $1 AND tool IN ('gh_pr_merge', 'gh_review_submit') AND result <> 'started'`,
+      WHERE session_id = $1 AND tool IN ('gh_pr_merge', 'gh_review_submit', '${FOLLOW_TOOL}') AND result <> 'started'`,
     [sessionId],
   )).rows as Array<{ tool: string; result: string; detail: string; at: unknown }>;
   const turn = (await q.query(
@@ -1132,6 +1198,7 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
     writes: writes.map((w) => ({ tool: w.tool, result: w.result, detail: w.detail, at: ms(w.at) })),
     turn: turn.busy ? "running" : turn.last === null ? "none" : turn.last === "failed" || turn.last === "cancelled" ? "failed" : "finished",
     halted: row.params.halted ?? null,
+    queued: row.params.queued !== undefined,
   };
 }
 
@@ -1248,6 +1315,7 @@ export async function sweepReviewItems(): Promise<number> {
        FROM claw_work_items w
       WHERE w.worker_session_id = c.session_id AND w.kind = 'review' AND w.outcome = 'stopped' AND c.status = 'pending'`,
   );
+  await startQueuedReviews().catch((err) => logger.warn({ err }, "assistant.review_queue_failed"));
   const open = (await db.query(
     "SELECT item_id FROM claw_work_items WHERE kind = 'review' AND board_state <> 'done' ORDER BY updated_at LIMIT $1", [REVIEW_SWEEP_BATCH],
   )).rows as Array<{ item_id: string }>;
@@ -1262,4 +1330,189 @@ export async function sweepReviewItems(): Promise<number> {
     }
   }
   return changed;
+}
+
+/** How often one review item's pull request is looked at on GitHub, at most. */
+export const REVIEW_FOLLOW_MS = 90_000;
+/** Review items looked at in one tick, the longest unlooked-at first. */
+export const REVIEW_FOLLOW_BATCH = 30;
+
+/**
+ * Every tick, for the open review items whose review has had its turn (or was halted before it): what became of the pull request on GitHub
+ * (`GithubReview.followPullRequest`). A pull request merged or closed there ends the item, and what its session still held for the
+ * reviewer's answer is closed with it, so an item does not wait for ever on a confirmation nobody needs. For a review asked of someone
+ * else whose requester asked for a merge, the requester's own account merges it once the reviewer's approval is on GitHub and every
+ * gate is open, instead of asking the reviewer to confirm the merge. One item is looked at by one replica at a time, every
+ * `REVIEW_FOLLOW_MS` at most; a look that fails says so in the log and is tried at the next.
+ */
+export async function followReviewItems(now = Date.now()): Promise<number> {
+  const follow = reviewItemPorts.followPullRequest;
+  if (!CLAW_ASSISTANT_REVIEW_ITEMS || !follow) return 0;
+  const due = now - REVIEW_FOLLOW_MS;
+  const rows = (await db.query(
+    `SELECT w.item_id FROM claw_work_items w
+      WHERE w.kind = 'review' AND w.board_state <> 'done' AND w.outcome IS DISTINCT FROM 'stopped'
+        AND COALESCE(NULLIF(substring(w.params->>'followed_at' from '^[0-9]{1,15}$'), '')::bigint, 0) < $1
+        AND (EXISTS (SELECT 1 FROM claw_github_confirmations c WHERE c.session_id = w.worker_session_id)
+          OR EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = w.worker_session_id AND a.tool IN ('gh_review_submit', 'gh_pr_merge') AND a.result <> 'started')
+          -- A turn that ended without writing anything (it failed, or posted nothing), and a review the server halted: their pull
+          -- request can still be merged or closed by someone, which ends them too.
+          OR EXISTS (SELECT 1 FROM claw_tasks t WHERE t.session_id = w.worker_session_id AND t.origin = 'chat')
+          OR w.params ? 'halted')
+        AND NOT EXISTS (SELECT 1 FROM claw_tasks t WHERE t.session_id = w.worker_session_id AND t.origin = 'chat' AND t.status = ANY($2::text[]))
+        AND NOT EXISTS (SELECT 1 FROM claw_pending_messages m WHERE m.session_id = w.worker_session_id)
+      ORDER BY COALESCE(NULLIF(substring(w.params->>'followed_at' from '^[0-9]{1,15}$'), '')::bigint, 0), w.updated_at
+      LIMIT $3`,
+    [due, SWEEPABLE_RUN_STATUSES, REVIEW_FOLLOW_BATCH],
+  )).rows as Array<{ item_id: string }>;
+  let ended = 0;
+  for (const { item_id } of rows) {
+    // Taken by one replica: the one whose update still finds it due.
+    const taken = (await db.query(
+      `UPDATE claw_work_items SET params = params || jsonb_build_object('followed_at', $2::bigint)
+        WHERE item_id = $1 AND board_state <> 'done'
+          AND COALESCE(NULLIF(substring(params->>'followed_at' from '^[0-9]{1,15}$'), '')::bigint, 0) < $3
+        RETURNING user_id, worker_session_id, params, kind`,
+      [item_id, now, due],
+    )).rows[0] as Record<string, unknown> | undefined;
+    const params = taken ? readParams(taken) : null;
+    if (!taken || !params) continue;
+    const requestedBy = params.requested_by ?? null;
+    try {
+      const out = await follow({
+        sessionId: String(taken.worker_session_id), ref: params.pr, actingUserId: params.acting_as,
+        requesterUserId: requestedBy ?? String(taken.user_id), requesterLabel: params.requester_label ?? undefined,
+        mergeByRequester: requestedBy !== null && requestedBy !== params.acting_as && params.review_only === false,
+      });
+      const status = String(out.body.status ?? "");
+      logger.info({ itemId: item_id, status, reason: out.body.reason ?? null }, "assistant.review_followed");
+      if (!out.isError && FOLLOW_ENDS.has(status)) {
+        await syncReviewItem(item_id);
+        ended += 1;
+      }
+    } catch (err) {
+      logger.warn({ err, itemId: item_id }, "assistant.review_follow_failed");
+    }
+  }
+  return ended;
+}
+
+// ------------------------------------------------------------------------------------------------ the queue
+
+/**
+ * Start the reviews that wait for a slot (`ReviewParams.queued`) whose owner now has one: every tick (`sweepReviewItems`), oldest first per
+ * owner, under the owner's assistant row lock that `insertWorkItem` takes, so a create and a start count the same slots one after the other.
+ * A review's first message is queued then, on the proof that its request was checked and its say given when it was made
+ * (`proofForQueuedFirstMessage`), and goes through every gate a queued turn does (`gateRequestedReviewTurn`: the reviewer's say asked again,
+ * the turn budget). One whose first message cannot be queued (its keys were removed meanwhile) is halted, which puts it in front of its owner.
+ * The number started.
+ */
+export async function startQueuedReviews(): Promise<number> {
+  if (!CLAW_ASSISTANT_REVIEW_ITEMS) return 0;
+  // Every owner with a review waiting, each tick: a batch would ask the same full owners again and again and never reach one with room.
+  const owners = (await db.query(
+    `SELECT user_id FROM claw_work_items WHERE kind = 'review' AND ${WAITING} GROUP BY user_id ORDER BY MIN(created_at)`,
+  )).rows as Array<{ user_id: string }>;
+  let started = 0;
+  for (const { user_id: owner } of owners) {
+    try {
+      const sessions = await startQueuedOf(owner);
+      for (const s of sessions) await drainSessionIfIdle(s.sessionId, owner);
+      for (const s of sessions) await syncReviewItem(s.itemId).catch((err) => logger.warn({ err, itemId: s.itemId }, "assistant.review_sync_failed"));
+      started += sessions.filter((s) => s.started).length;
+    } catch (err) {
+      logger.warn({ err, owner }, "assistant.review_queue_owner_failed");
+    }
+  }
+  return started;
+}
+
+async function startQueuedOf(owner: string): Promise<Array<{ itemId: string; sessionId: string; started: boolean }>> {
+  return inTransaction(async (query) => {
+    const q = { query };
+    if (!(await query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [owner])).rowCount) return [];
+    const limits = reviewAgentSettings(owner);
+    const counts = (await query(
+      `SELECT COUNT(*) FILTER (WHERE ${RUNNING} AND NOT (params ? 'requested_by'))::int AS own,
+              COUNT(*) FILTER (WHERE ${RUNNING} AND params ? 'requested_by')::int AS others
+         FROM claw_work_items WHERE user_id = $1`,
+      [owner],
+    )).rows[0] as { own: number; others: number };
+    const perRequester = new Map((await query(
+      `SELECT params->>'requested_by' AS by, COUNT(*)::int AS n FROM claw_work_items
+        WHERE user_id = $1 AND ${RUNNING} AND params ? 'requested_by' GROUP BY 1`,
+      [owner],
+    )).rows.map((r) => [(r as { by: string }).by, Number((r as { n: number }).n)]));
+    const waiting = (await query(
+      `SELECT item_id, user_id, kind, worker_session_id, params FROM claw_work_items
+        WHERE user_id = $1 AND kind = 'review' AND ${WAITING} AND NOT (params ? 'halted') ORDER BY seq FOR UPDATE`,
+      [owner],
+    )).rows as Array<Record<string, unknown>>;
+    const out: Array<{ itemId: string; sessionId: string; started: boolean }> = [];
+    for (const row of waiting) {
+      const params = readParams(row);
+      if (!params) {
+        // Unreadable, it can never start: it stops waiting (so it holds no queue place) and is put in front of its owner as not run.
+        await query(
+          `UPDATE claw_work_items SET params = (params - 'queued') || jsonb_build_object('halted', $2::jsonb), updated_at = NOW() WHERE item_id = $1`,
+          [row.item_id, JSON.stringify({ reason: "unreadable", message: "it could not be read to start it from the queue" })],
+        );
+        continue;
+      }
+      const by = params.requested_by ?? null;
+      const itemId = row.item_id as string;
+      const sessionId = row.worker_session_id as string;
+      // The owner can write into their own review's session while it waits (its id is theirs): that ran it, as their own message runs
+      // any session of theirs. It no longer waits, takes its slot, and gets no first message of the server's on top of the owner's.
+      const ran = Number(((await query(
+        `SELECT (SELECT COUNT(*) FROM claw_tasks WHERE session_id = $1) + (SELECT COUNT(*) FROM claw_pending_messages WHERE session_id = $1) AS n`,
+        [sessionId],
+      )).rows[0] as { n: number | string }).n) > 0;
+      if (ran) {
+        await query("UPDATE claw_work_items SET params = params - 'queued', updated_at = NOW() WHERE item_id = $1", [itemId]);
+        await query(
+          "INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary) SELECT item_id, 'progress', 'user', generation, 'started by its owner while it waited' FROM claw_work_items WHERE item_id = $1",
+          [itemId],
+        );
+        if (by) {
+          counts.others += 1;
+          perRequester.set(by, (perRequester.get(by) ?? 0) + 1);
+        } else {
+          counts.own += 1;
+        }
+        out.push({ itemId, sessionId, started: false });
+        continue;
+      }
+      const fits = by
+        ? counts.others < limits.othersMaxActive && (perRequester.get(by) ?? 0) < limits.perRequesterMaxActive
+        : counts.own < CLAW_ASSISTANT_MAX_ACTIVE_ITEMS;
+      if (!fits) continue;   // (one of another kind, or of another requester, may still fit)
+      const proof = await proofForQueuedFirstMessage(q, sessionId);
+      const sent = proof ? await queueServerMessage(q, {
+        sessionId, userId: owner, content: firstMessage({ pr: params.pr, sessionId, config: {}, attended: proof, params }),
+        dedupeKey: `start:${itemId}`, attended: proof,
+      }) : null;
+      const halted = sent?.ok ? null : { reason: "not_started", message: "it could not be started from the queue" };
+      await query(
+        `UPDATE claw_work_items SET params = (params - 'queued')${halted ? " || jsonb_build_object('halted', $2::jsonb)" : ""}, updated_at = NOW()
+          WHERE item_id = $1`,
+        halted ? [itemId, JSON.stringify(halted)] : [itemId],
+      );
+      await query(
+        "INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary) SELECT item_id, 'progress', 'policy', generation, $2 FROM claw_work_items WHERE item_id = $1",
+        [itemId, halted ? "not started from the queue" : "started from the queue"],
+      );
+      if (!halted) {
+        if (by) {
+          counts.others += 1;
+          perRequester.set(by, (perRequester.get(by) ?? 0) + 1);
+        } else {
+          counts.own += 1;
+        }
+      }
+      out.push({ itemId, sessionId, started: !halted });
+    }
+    if (out.length) logger.info({ owner, started: out.filter((o) => o.started).map((o) => o.itemId), halted: out.filter((o) => !o.started).map((o) => o.itemId) }, "assistant.review_queue_started");
+    return out;
+  });
 }

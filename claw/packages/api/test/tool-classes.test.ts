@@ -86,13 +86,17 @@ describe("MCP tool classes", () => {
       }
       for (const w of toolsOfClass(server, "write")) assert.ok(!allows(readToolPatterns(server), `mcp__${server}__${w}`), `${server}: ${w}`);
     }
-    // What the hand-written list (main before this change) offered, applied to each server's tools/list as the live servers
-    // answered it on 2026-11-06: written out here, not computed from the catalog, so a tool the catalog dropped would show.
+    // What the hand-written list (main before #313) offered, plus the diagnosis reads the router now makes itself, applied to
+    // each server's tools/list as the live servers answered it on 2026-11-06: written out here, not computed from the catalog,
+    // so a tool the catalog dropped would show.
     const before: Record<string, string[]> = {
       autopilot: ["get_allocation_marker", "get_audit", "get_events", "get_gpupools", "get_host_exclusions", "get_metrics", "get_pods", "get_status",
         "get_submit_account_exclusions", "get_whoami"],
-      safe: ["cluster_get", "cluster_list", "flavor_get", "flavor_list", "node_get", "node_list", "node_status", "opsjob_get", "opsjob_list", "user_self",
-        "workload_get", "workload_list", "workspace_get", "workspace_list"],
+      // And a failure's diagnosis, which the router reads itself (logs bounded and masked by Brain, `ROUTER_LOG_READS`):
+      // cluster_logs, flavor_avail, node_pod_logs, node_reboot_logs and the workload_events/logs/pod_containers/pod_logs reads.
+      safe: ["cluster_get", "cluster_list", "cluster_logs", "flavor_avail", "flavor_get", "flavor_list", "node_get", "node_list", "node_pod_logs",
+        "node_reboot_logs", "node_status", "opsjob_get", "opsjob_list", "user_self", "workload_events", "workload_get", "workload_list",
+        "workload_logs", "workload_pod_containers", "workload_pod_logs", "workspace_get", "workspace_list"],
       dispatron: ["get_alerts", "get_changes", "get_configs", "get_configs_config_id", "get_events", "get_facade_defaults", "get_findings", "get_follow_history",
         "get_follow_policy_plan_id", "get_follow_status", "get_ka_runs_run_artifacts_name", "get_me", "get_people", "get_plans", "get_plans_plan_id",
         "get_plans_plan_id_commits", "get_plans_plan_id_day0", "get_plans_plan_id_latest", "get_plans_plan_id_stats", "get_plans_plan_id_trend",
@@ -100,11 +104,13 @@ describe("MCP tool classes", () => {
         "get_source_commits_sha", "get_source_versions", "get_sources"],
       pulse: ["cost_overview", "leaderboard_history", "leaderboard_list", "leaderboard_show", "leaderboard_summary", "leaderboard_top", "upstream_issue",
         "upstream_issues", "upstream_pr", "upstream_prs"],
-      "agent-board": ["get_me", "get_repository_tree", "get_user_orgs", "issue_read", "label_read", "list_issues", "list_my_repos", "list_org_repos"],
+      // And the board's notifications and milestones.
+      "agent-board": ["get_me", "get_repository_tree", "get_user_orgs", "issue_read", "label_read", "list_issues", "list_my_repos", "list_org_repos",
+        "milestone_read", "notification_read"],
     };
     assert.deepEqual(ROUTER_READ_TOOLS, before, "the router is offered exactly what it was offered before, server by server");
     // Kept back, each for a reason the catalog states.
-    for (const t of ["apikey_list", "secret_list", "workload_logs", "workload_pod_logs"]) {
+    for (const t of ["apikey_current", "apikey_list", "secret_list", "node_export"]) {
       assert.ok(!allows(readToolPatterns("safe"), `mcp__safe__${t}`), t);
       assert.ok(TOOL_CATALOG.safe!.notForRouter?.[t], t);
     }

@@ -36,6 +36,7 @@ import { db } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
+import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
 
 const logger = pino({ name: "remote-agents" });
 
@@ -56,6 +57,10 @@ export interface RemoteAgentOptions {
   maxStreamsPerUser?: number;
   /** Shared with the process, so a test can see a stream leave. */
   waker?: Waker;
+  /** How often this replica sweeps presence (`remote-agents/presence.ts`); zero or less runs no sweep. */
+  presenceSweepMs?: number;
+  /** How long a connector stays offline before its owner is told. */
+  offlineNoticeMs?: number;
 }
 
 /**
@@ -186,7 +191,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       timer = setTimeout(async () => {
         try {
           const n = await store.pruneClosedSessions(retentionDays);
-          if (n > 0) logger.info({ sessions: n, retentionDays }, "remote_agents.retention_swept");
+          const t = await prunePresenceHistory(retentionDays);
+          if (n > 0 || t > 0) logger.info({ sessions: n, presenceTransitions: t, retentionDays }, "remote_agents.retention_swept");
         } catch (err) {
           logger.warn({ err: (err as Error)?.message }, "remote_agents.retention_sweep_failed");
         }
@@ -196,6 +202,13 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     };
     schedule(Math.min(sweepMs, 60_000));
     app.addHook("onClose", async () => { stopped = true; clearTimeout(timer); });
+  }
+  // Presence over time, and telling an owner when a connector has gone (and come back). Every replica runs it; a lock
+  // makes each sweep one replica's. Stops with the server.
+  const presenceSweepMs = opts.presenceSweepMs ?? PRESENCE_SWEEP_MS;
+  if (presenceSweepMs > 0) {
+    const stop = startPresenceSweep({ onlineWindowMs, noticeAfterMs: opts.offlineNoticeMs ?? OFFLINE_NOTICE_MS, sweepMs: presenceSweepMs });
+    app.addHook("onClose", async () => stop());
   }
   // A reader's stream polls the database, so one user cannot hold an unbounded number open.
   const openReaders = new Map<string, number>();
@@ -294,6 +307,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       const streamConn = randomUUID();
       let cursor = 0;
       let nextTokenCheck = Date.now() + pingMs;
+      // The last frame this stream was ended with, kept on the connector so presence can say why it went.
+      let endReason = "closed";
+      const end = (frame: "token_expired" | "revoked" | "superseded") => { endReason = frame; return { frames: [], stop: sseFrame(frame, { connector_id: cid }) }; };
       await store.markStreamOpen(cid, streamConn);
       return serveSse(req, reply, waker, timing, {
         key: `c:${cid}`,
@@ -303,13 +319,13 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
           // A stream opened with an access token ends when the token does (the
           // connector reconnects with a fresh one), and when the provider says
           // its grant was revoked (checked as often as a ping, when introspection is on).
-          if (tokenExpired(req)) return { frames: [], stop: sseFrame("token_expired", { connector_id: cid }) };
+          if (tokenExpired(req)) return end("token_expired");
           if (Date.now() >= nextTokenCheck) {
             nextTokenCheck = Date.now() + pingMs;
-            if (await tokenRevoked(req)) return { frames: [], stop: sseFrame("revoked", { connector_id: cid }) };
+            if (await tokenRevoked(req)) return end("revoked");
           }
           const verdict = await store.streamVerdict(cid, streamConn);
-          if (verdict) return { frames: [], stop: sseFrame(verdict, { connector_id: cid }) };
+          if (verdict) return end(verdict);
           const rows = await store.commandsAfter(cid, cursor, 100);
           const frames = rows.map((r) => {
             cursor = Number(r.cmd_seq);
@@ -321,7 +337,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
           return { frames, more: rows.length === 100 };
         },
         onPing: () => store.touchStream(cid, streamConn),
-        onClose: () => store.markStreamClosed(cid, streamConn),
+        onClose: () => store.markStreamClosed(cid, streamConn, endReason),
       });
     },
   );

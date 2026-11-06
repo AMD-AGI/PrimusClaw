@@ -115,16 +115,16 @@ describe("assistant router turn end", { skip }, () => {
   });
 
   test("T5 a text too long for say is cut to fit, and a refusal is not a fault and leaves the user the cap's notice", async () => {
-    const long = "x".repeat(700);
+    const long = "x".repeat(9500);
     assert.equal(await end(await endedTurn("Tell me everything"), { finalText: long }), "said");
     const [said] = await says();
-    assert.equal(said.text.length, 600);
+    assert.equal(said.text.length, 9000);
     assert.ok(said.text.endsWith("x…"));
     // What say counts is UTF-16 units, so a text of two-unit characters is cut sooner, and never in the middle of one.
     await w.q("TRUNCATE claw_assistant_says");
-    assert.equal(await end(await endedTurn("Tell me more"), { finalText: "😀".repeat(700) }), "said");
+    assert.equal(await end(await endedTurn("Tell me more"), { finalText: "😀".repeat(4600) }), "said");
     const emoji = (await says())[0].text as string;
-    assert.ok(emoji.length <= 600 && emoji.length >= 598, String(emoji.length));
+    assert.ok(emoji.length <= 9000 && emoji.length >= 8998, String(emoji.length));
     assert.ok(emoji.endsWith("😀…"));
     assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(emoji), "no half of a character");
 

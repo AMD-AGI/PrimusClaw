@@ -20,6 +20,7 @@ import {
   HandsRecoveryBudgetExhausted,
   HandsRecoveryRefused,
   type CheckpointState,
+  type PendingTurn,
   type HandsRecoveryAction,
   type HandsRecoveryAllowance,
   type RecreateHandsResult,
@@ -398,6 +399,13 @@ export interface LoopOptions {
    *  Caller persists state to NATS KV for cross-Brain resume. */
   onCheckpoint?: (state: CheckpointState) => Promise<void>;
   /**
+   * Called inside a turn, before and after each call that is not a plain read,
+   * with the state a resumed run needs to finish this turn without asking the
+   * model again (`pending_turn`). Still called once the run is aborted. Top
+   * level only: a sub-agent is journalled as the parent's `task` call.
+   */
+  onTurnJournal?: (state: CheckpointState) => Promise<void>;
+  /**
    * Called the moment a turn's response shows the prefix cache was used, with
    * the timestamp that goes into `last_cache_use_at`.
    *
@@ -609,6 +617,29 @@ function truncateToolUseInputs(content: unknown): unknown {
  *  calls report the cancellation rather than silently getting "(no result)". */
 const CANCELLED_TOOL_RESULT =
   "Cancelled: the run was stopped before this tool call was dispatched.";
+
+/**
+ * What a resumed run says for a call that had started when the run stopped and
+ * has no recorded result. It is not made again: it may already have taken
+ * effect, and a second review comment or message cannot be taken back.
+ */
+export const INTERRUPTED_TOOL_RESULT =
+  "Interrupted: the run was stopped while this call was in progress, and it was not repeated when the run resumed. "
+  + "It may or may not have taken effect. Check its effect before calling it again; do not repeat a write blindly.";
+
+/** The in-memory side of a `pending_turn` this attempt is writing. */
+interface TurnJournal {
+  turn: number;
+  content: unknown[];
+  stopReason: string | null;
+  resultByToolId: Map<string, string>;
+  /** Dispatched and not yet recorded as finished. */
+  inflight: Set<string>;
+  /** Finished in a way that does not say whether it took effect (aborted mid-call). */
+  ambiguous: Set<string>;
+  /** Writes are chained so a later one never lands under an earlier one. */
+  chain: Promise<void>;
+}
 
 // ── Auto-compaction config ──
 // Trigger threshold lives in config.ts (env-overridable) so a deployment
@@ -894,6 +925,14 @@ class AgentLoopRunner {
   private setupCommands: Array<{ cmd: string; turn: number }>;
   private readonly startTime: number;
   private readonly initialTurn: number;
+  /** The interrupted turn to finish from its journal instead of asking the model again. */
+  private replayTurn: PendingTurn | undefined;
+  /** Recorded results and in-flight ids for the tool calls of the turn being replayed. */
+  private replayTools: { results: Map<string, string>; started: Set<string> } | undefined;
+  /** This attempt's journal of the turn now running, once it has begun a call that is not a read. */
+  private journal: TurnJournal | undefined;
+  /** What a journal of the turn now in its tool phase would start from. */
+  private journalSeed: Pick<TurnJournal, "turn" | "content" | "stopReason" | "resultByToolId"> | undefined;
   // Checkpoint cadence anchor (checkpoint-architecture-redesign §5.4).
   // Seeded to startTime so the wall-clock fallback uses elapsed task time,
   // not pod uptime; resumed runs continue the same effective baseline.
@@ -1028,6 +1067,11 @@ class AgentLoopRunner {
       resumeFrom?.setup_commands ? [...resumeFrom.setup_commands] : [];
     this.startTime = Date.now() - (resumeFrom?.elapsed_ms_before ?? 0);
     this.initialTurn = resumeFrom?.turns_completed ?? 0;
+    const pending = resumeFrom?.pending_turn;
+    if (pending && pending.turn === this.initialTurn && Array.isArray(pending.content)
+      && pending.content.some((b) => (b as { type?: string })?.type === "tool_use")) {
+      this.replayTurn = pending;
+    }
     // Carried across the redelivery rather than re-inferred. See
     // CheckpointState.last_cache_use_at.
     this.lastCacheUseAt = resumeFrom?.last_cache_use_at;
@@ -1475,6 +1519,127 @@ class AgentLoopRunner {
     }
   }
 
+  /**
+   * The state a checkpoint carries, as of now. Shared by the turn-boundary
+   * checkpoint and the turn journal so the two cannot drift apart.
+   */
+  private snapshotState(turnsCompleted: number): CheckpointState {
+    return {
+      // A snapshot, like every other field in this literal. workingMessages
+      // is mutated in place -- compaction does `length = 0` then pushes the
+      // replacement -- so handing over the live array lets the writer
+      // serialize a conversation from after the counters beside it were
+      // read. The deep copy the checkpoint redactor used to make hid this;
+      // it does not run on this path any more.
+      messages: this.workingMessages.slice(),
+      last_cache_use_at: this.lastCacheUseAt,
+      turns_completed: turnsCompleted,
+      usage: { ...this.usage },
+      text_parts: [...this.textParts],
+      error_count: this.errorCount,
+      tool_calls_by_name: { ...this.toolCallsByName },
+      tool_ok_by_name: { ...this.toolOkByName },
+      total_tool_calls: this.totalToolCalls,
+      elapsed_ms_before: Date.now() - this.startTime,
+      setup_commands: [...this.setupCommands],
+      plan_mode: this.planMode,
+      todo_state: [...this.todoState],
+      rebuilds_used: this.rebuildsUsed,
+      recoveries_used: this.recoveriesUsed,
+    };
+  }
+
+  /** Whether a call is journalled: anything at the top level that is not a plain read. */
+  private journalsCall(toolName: string): boolean {
+    return this.depth === 0
+      && this.opts.onTurnJournal !== undefined
+      && !PARALLEL_READ_TOOLS.has(toolName)
+      && this.opts.parallelTools?.allows(toolName) !== true;
+  }
+
+  /**
+   * Answer a call of a replayed turn from its journal, if the journal has
+   * anything to say about it. A recorded result is returned as it was; a call
+   * that had started and recorded nothing is not made again (`PendingTurn`).
+   * Returns false for a call the interrupted attempt never dispatched, which
+   * then runs as usual.
+   */
+  private answerFromJournal(toolId: string, toolName: string, resultByToolId: Map<string, string>): boolean {
+    const replay = this.replayTools;
+    if (!replay) return false;
+    const recorded = replay.results.get(toolId);
+    if (recorded !== undefined) {
+      resultByToolId.set(toolId, recorded);
+      logger.info({ sessionId: this.sessionId, toolName, toolId }, "tool.replayed_from_journal");
+      return true;
+    }
+    if (replay.started.has(toolId)) {
+      resultByToolId.set(toolId, INTERRUPTED_TOOL_RESULT);
+      logger.warn({ sessionId: this.sessionId, toolName, toolId }, "tool.replay_interrupted_not_repeated");
+      return true;
+    }
+    return false;
+  }
+
+  /** Record that a journalled call is about to be dispatched. */
+  private async journalStart(toolId: string): Promise<void> {
+    const seed = this.journalSeed;
+    if (!seed) return;
+    this.journal ??= { ...seed, inflight: new Set(), ambiguous: new Set(), chain: Promise.resolve() };
+    this.journal.inflight.add(toolId);
+    await this.writeJournal();
+  }
+
+  /**
+   * Record how a journalled call ended. `ambiguous` is a call cut off by the
+   * abort: its error says nothing about whether it took effect, so it stays
+   * recorded as started rather than as a result a resumed run would act on.
+   */
+  private async journalDone(toolId: string, result: string, ambiguous: boolean): Promise<void> {
+    const j = this.journal;
+    if (!j || !j.inflight.delete(toolId)) return;
+    if (ambiguous) j.ambiguous.add(toolId);
+    else j.resultByToolId.set(toolId, result);
+    await this.writeJournal();
+  }
+
+  /** Withdraw a call that is known not to have run (its delivery is being retried whole). */
+  private async journalForget(toolId: string): Promise<void> {
+    const j = this.journal;
+    if (!j || !j.inflight.delete(toolId)) return;
+    await this.writeJournal();
+  }
+
+  private async writeJournal(): Promise<void> {
+    const j = this.journal;
+    const sink = this.opts.onTurnJournal;
+    if (!j || !sink) return;
+    const results: Record<string, string> = {};
+    for (const [id, r] of j.resultByToolId) {
+      if (r !== CANCELLED_TOOL_RESULT && !j.inflight.has(id) && !j.ambiguous.has(id)) results[id] = r;
+    }
+    // Taken now, not when the write runs: the chain may hold it behind an
+    // earlier write, and the counters keep moving.
+    const state: CheckpointState = {
+      ...this.snapshotState(j.turn),
+      pending_turn: {
+        turn: j.turn,
+        content: j.content,
+        stop_reason: j.stopReason,
+        results,
+        started: [...j.inflight, ...j.ambiguous],
+      },
+    };
+    const write = j.chain.then(() => sink(state)).catch((err: unknown) => {
+      // Best effort, like the boundary checkpoint: a store that cannot be
+      // written does not stop the run. A resume then goes back to the last
+      // state that did land, as it did before the journal existed.
+      logger.warn({ err, sessionId: this.sessionId, turn: j.turn }, "turn_journal.write_failed");
+    });
+    j.chain = write;
+    await write;
+  }
+
   /** One full loop iteration: LLM call → tool dispatch → bookkeeping.
    *  Returns true when the caller's `for` loop should break (end_turn / no
    *  tool calls), false to continue to the next turn. */
@@ -1483,7 +1648,28 @@ class AgentLoopRunner {
     this.effectiveTools = this.buildEffectiveTools();
 
     const turnStart = Date.now();
-    const streamResult = await this.streamTurnWithRetry(turn, turnStart);
+    // A turn interrupted part-way through its tool calls is finished from its
+    // journal: the model already answered it, and asking again is what made
+    // a resumed run repeat a call that had left the process (`PendingTurn`).
+    // Its usage, text and cache accounting were counted by the attempt that
+    // made the call, and are in the checkpoint this run resumed from.
+    const replay = this.replayTurn?.turn === turn ? this.replayTurn : undefined;
+    this.replayTurn = undefined;
+    const streamResult: Awaited<ReturnType<LlmSession["streamTurn"]>> = replay
+      ? {
+        content: replay.content as Awaited<ReturnType<LlmSession["streamTurn"]>>["content"],
+        stopReason: replay.stop_reason as Awaited<ReturnType<LlmSession["streamTurn"]>>["stopReason"],
+        usage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0 },
+        firstByteMs: 0,
+      } as Awaited<ReturnType<LlmSession["streamTurn"]>>
+      : await this.streamTurnWithRetry(turn, turnStart);
+    if (replay) {
+      this.replayTools = { results: new Map(Object.entries(replay.results ?? {})), started: new Set(replay.started ?? []) };
+      logger.info(
+        { turn, sessionId: this.sessionId, recorded: this.replayTools.results.size, started: this.replayTools.started.size },
+        "agent-loop.turn_replayed",
+      );
+    }
     const { content, stopReason, usage: turnUsage, firstByteMs, routedModel } = streamResult;
     logger.info(
       {
@@ -1499,7 +1685,7 @@ class AgentLoopRunner {
     this.usage.output_tokens += turnUsage.output_tokens;
     this.usage.cache_read += turnUsage.cache_read;
     this.usage.cache_create += turnUsage.cache_create;
-    this.usage.turns++;
+    if (!replay) this.usage.turns++;
 
     // Cache accounting, per turn. Before this, the only place cache_read and
     // cache_create reached anybody was the terminal ResultMessage -- and the
@@ -1515,7 +1701,7 @@ class AgentLoopRunner {
     // end_turn return below, because the measurement is true of every turn,
     // not only the ones that continue.
     this.promptTokensThisTurn = streamResult.promptTokens ?? turnUsage.input_tokens;
-    if (streamResult.promptTokens === undefined && turnUsage.input_tokens === 0) {
+    if (!replay && streamResult.promptTokens === undefined && turnUsage.input_tokens === 0) {
       metrics.onPromptSizeUnknown();
       logger.warn({ turn, sessionId: this.sessionId, routedModel }, "agent-loop.prompt_size_unknown");
     }
@@ -1647,7 +1833,7 @@ class AgentLoopRunner {
       this.opts.onCacheUse?.(turnStart);
     }
 
-    metrics.onLlmTurnCache({
+    if (!replay) metrics.onLlmTurnCache({
       provider: this.wireProtocol,
       inputTokens: turnUsage.input_tokens,
       outputTokens: turnUsage.output_tokens,
@@ -1688,7 +1874,9 @@ class AgentLoopRunner {
       ...(routedModel ? { routed_model: routedModel } : {}),
     };
     this.turnText = content.filter((b: any) => b.type === "text").map((b: any) => String(b.text ?? "")).join(" ");
-    for (const b of content) {
+    // A replayed turn's text was published, and kept, by the attempt that
+    // received it.
+    for (const b of replay ? [] : content) {
       if ((b as any).type === "text") {
         const text = (b as any).text as string;
         this.textParts.push(text);
@@ -1786,6 +1974,8 @@ class AgentLoopRunner {
     // be reordered back into the schema-required order (one entry per
     // tool_use block, in the same order the model emitted them).
     const resultByToolId = new Map<string, string>();
+    this.journal = undefined;
+    this.journalSeed = { turn, content: content as unknown[], stopReason: stopReason ?? null, resultByToolId };
 
     const taskCalls = toolUses.filter((tc: any) => tc.name === "task");
     const otherCalls = toolUses.filter((tc: any) => tc.name !== "task");
@@ -1832,6 +2022,12 @@ class AgentLoopRunner {
         await Promise.all(batch.map((tc: any) => this.runTaskTool(tc, turn, resultByToolId)));
       }
     }
+
+    // Every call of the turn has an answer; from here the turn is the
+    // boundary checkpoint's to persist.
+    this.journal = undefined;
+    this.journalSeed = undefined;
+    this.replayTools = undefined;
 
     // Build results in the model's emitted order so tool_result blocks line up.
     // Apply per-result truncation here (single chokepoint) so every tool's
@@ -1964,29 +2160,7 @@ class AgentLoopRunner {
       // made a failing checkpoint look like a fresh one, so the wall-clock
       // fallback stopped retrying and the run kept going with no durable state.
       try {
-        await this.opts.onCheckpoint({
-          // A snapshot, like every other field in this literal. workingMessages
-          // is mutated in place -- compaction does `length = 0` then pushes the
-          // replacement -- so handing over the live array lets the writer
-          // serialize a conversation from after the counters beside it were
-          // read. The deep copy the checkpoint redactor used to make hid this;
-          // it does not run on this path any more.
-          messages: this.workingMessages.slice(),
-          last_cache_use_at: this.lastCacheUseAt,
-          turns_completed: turn + 1,
-          usage: { ...this.usage },
-          text_parts: [...this.textParts],
-          error_count: this.errorCount,
-          tool_calls_by_name: { ...this.toolCallsByName },
-          tool_ok_by_name: { ...this.toolOkByName },
-          total_tool_calls: this.totalToolCalls,
-          elapsed_ms_before: Date.now() - this.startTime,
-          setup_commands: [...this.setupCommands],
-          plan_mode: this.planMode,
-          todo_state: [...this.todoState],
-          rebuilds_used: this.rebuildsUsed,
-          recoveries_used: this.recoveriesUsed,
-        });
+        await this.opts.onCheckpoint(this.snapshotState(turn + 1));
         this.lastCheckpointAt = Date.now();
       } catch (e) {
         logger.error({ err: e, sessionId: this.sessionId, turn },
@@ -2139,6 +2313,8 @@ class AgentLoopRunner {
       }
     logger.info({ turn, sessionId: this.sessionId, toolName, input: logInput }, "tool.call");
 
+      // A call of a turn being finished from its journal (`PendingTurn`).
+      if (this.answerFromJournal(toolId, toolName, resultByToolId)) return;
       // Outside the run's tool allowlist: answered here, before a hook, an
       // approver or a sandbox probe can be reached on its behalf.
       if (await this.refuseUnlisted(toolName, toolId, resultByToolId)) return;
@@ -2331,6 +2507,10 @@ class AgentLoopRunner {
         return;
       }
 
+      // Recorded before it is dispatched, so a run stopped while it is in
+      // flight knows not to make it again (`PendingTurn`).
+      const journalled = this.journalsCall(toolName);
+      if (journalled) await this.journalStart(toolId);
       const toolStart = Date.now();
       let resultText: string;
       let toolOutcome: RouteOutcome = { isError: false };
@@ -2399,7 +2579,12 @@ class AgentLoopRunner {
         // and the delivery is acked, which is how a classified-retryable race
         // became a permanent task failure on the default path while the eager
         // path naked correctly. See brain/src/agent/attach-error.ts.
-        if (this.mayRethrowOpenFailure(err, isRead)) throw err.cause;
+        if (this.mayRethrowOpenFailure(err, isRead)) {
+          // The sandbox never opened, so the call never ran: the redelivery
+          // that follows must make it, not report it interrupted.
+          if (journalled) await this.journalForget(toolId);
+          throw err.cause;
+        }
         // A call that threw is a call that did not happen. Left at its
         // optimistic default the outcome would fall through to the success
         // count below, which is the one place a transport failure could be
@@ -2451,6 +2636,10 @@ class AgentLoopRunner {
         this.toolFirstOkMs[toolName] = Math.min(this.toolFirstOkMs[toolName] ?? returnedAt, returnedAt);
         this.toolLastOkMs[toolName] = Math.max(this.toolLastOkMs[toolName] ?? returnedAt, returnedAt);
       }
+      // Before the event below: a publish that fails ends the run, and the
+      // result has to be on record by then. A call cut off by the abort says
+      // nothing about whether it took effect, so it stays recorded as started.
+      if (journalled) await this.journalDone(toolId, resultText, toolOutcome.isError && this.signal?.aborted === true);
     await this.onEvent({
         type: "toolUsed", tool: toolName, actionId: toolId, status: "success",
         description: resultText.slice(0, 2000),
@@ -2557,6 +2746,7 @@ class AgentLoopRunner {
     // open a sandbox for the sub-agent before anything else could object. It
     // counts as no started call, so it is turned away ahead of the increment
     // below, which only a call that really begins may make.
+    if (this.answerFromJournal(tc.id as string, "task", resultByToolId)) return;
     if (await this.refuseUnlisted("task", tc.id as string, resultByToolId)) return;
     // FIRST, before any await. A sibling in the same `Promise.all` batch must
     // be visible to a check made while this one is still suspended -- see
@@ -2610,6 +2800,8 @@ class AgentLoopRunner {
     this.totalToolCalls++;
     this.toolCallsByName["task"] = (this.toolCallsByName["task"] || 0) + 1;
 
+      const journalled = this.journalsCall("task");
+      if (journalled) await this.journalStart(toolId);
       let resultText: string;
       try {
       if (this.depth >= SUB_AGENT_MAX_DEPTH) {
@@ -2657,12 +2849,18 @@ class AgentLoopRunner {
         // `task` whose sandbox never opened did not run a sub-agent, and the
         // open is reached from here too (`attachHands` above) for a turn whose
         // first tool is a `task`.
-        if (this.mayRethrowOpenFailure(err, false)) throw err.cause;
+        if (this.mayRethrowOpenFailure(err, false)) {
+          if (journalled) await this.journalForget(toolId);
+          throw err.cause;
+        }
         resultText = `Error: ${err?.message || String(err)}`;
       this.errorCount++;
       logger.warn({ err, subagentId, depth: this.depth, sessionId: this.sessionId }, "sub-agent.failed");
       }
 
+      // A sub-agent the abort cut short may have done part of its work: what
+      // it returned is not the whole answer, so it stays recorded as started.
+      if (journalled) await this.journalDone(toolId, resultText, this.signal?.aborted === true);
     await this.onEvent({
         type: "toolUsed", tool: "task", actionId: toolId, status: "success",
         description: resultText.slice(0, 2000),

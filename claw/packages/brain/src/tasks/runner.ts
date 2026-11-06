@@ -93,6 +93,7 @@ import {
   activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isUserCancelReason,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
+import { isTransientNatsError } from "../infra/nats-transient.js";
 import { pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
 import {
   redactEgressPayload, redactPersistedEvent, type RuntimeSecrets,
@@ -608,13 +609,26 @@ function checkpointS3Prefix(userId: string, sessionId: string, messageId: string
  * e32c683c-9809-40c1-a1a7-0cee3565465b. Keep vendor request_id in the
  * surfaced text so support can still trace upstream incidents.
  */
-function classifyTaskFailure(rawMsg: string): {
+function classifyTaskFailure(rawMsg: string, err?: unknown): {
   reason: string;
   userText: string;
 } {
   const msg = String(rawMsg || "");
   const reqIdMatch = msg.match(/"request_id"\s*:\s*"(req_[A-Za-z0-9_]+)"/);
   const reqIdSuffix = reqIdMatch ? ` (vendor request_id: ${reqIdMatch[1]})` : "";
+
+  // Before every message pattern below: a NatsError's message is the bare word
+  // "TIMEOUT", which the timeout pattern would read as the model timing out.
+  // It is Claw's own event bus or lock store that did not answer, the model was
+  // never involved, and saying otherwise sends whoever reads the reason to the
+  // wrong system. Normally such an error is retried rather than reaching here;
+  // this is what a run that used up its retries on one says.
+  if (isTransientNatsError(err)) {
+    return {
+      reason: "infra_transient",
+      userText: "Claw's internal messaging was briefly unavailable and the run could not continue. Please retry.",
+    };
+  }
 
   // First, because the sentence below mentions a deadline and would otherwise
   // be classified as an upstream timeout -- telling the user to retry a run
@@ -676,6 +690,9 @@ function classifyRetryableReason(err: unknown): string {
   const msg = String(e?.message || err || "");
   const causeMsg = String(e?.cause?.message || "");
   const causeCode = String(e?.cause?.code || "");
+  // First, for the reason classifyTaskFailure gives: "TIMEOUT" is a NatsError's
+  // whole message, and the line below would file it as the model's.
+  if (isTransientNatsError(err)) return "nats_transient";
   if (e?.name === "APIConnectionTimeoutError" || /timeout|deadline/i.test(msg)) return "llm_connection_timeout";
   if (e?.name === "APIConnectionError" || /connection error|fetch failed/i.test(msg)) return "llm_connection_error";
   if (typeof e?.status === "number") return `http_${e.status}`;
@@ -878,9 +895,33 @@ async function replayPendingCallback(
   }
   if (!entry) return false;
 
+  // A cleared outbox is no pending callback. NATS KV answers a key deleted by
+  // ackAndClearCallback with its delete marker (operation DEL/PURGE, empty
+  // value) rather than null, and the marker stays until the bucket's TTL. It
+  // says an earlier execution of this task_id delivered its callback, not that
+  // this delivery's did: a script task that returned wait_external is put back
+  // to queued and published again under the same task_id to run from step 0,
+  // and an app run's finish is handed to a new Brain the same way. Either is a
+  // fresh execution, exactly as when the key was never written.
+  if (entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return false;
+
+  let stored: ExecuteResult & { run_time?: RunTimeReport };
   try {
-    const { run_time: runTime, ...result } = JSON.parse(sc.decode(entry.value)) as
-      ExecuteResult & { run_time?: RunTimeReport };
+    stored = JSON.parse(sc.decode(entry.value)) as ExecuteResult & { run_time?: RunTimeReport };
+  } catch (err) {
+    // deliverAgentDone writes only JSON, so this entry holds no result that can
+    // be replayed, and retrying cannot make it parse. Drop it and run this
+    // delivery as if nothing was pending, rather than failing every delivery
+    // until the message is poisoned.
+    logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_unreadable");
+    await kvCkpt.delete(key).catch((e) => {
+      logger.warn({ err: e, taskId: request.task_id }, "task.agent_done_outbox_cleanup_failed");
+    });
+    return false;
+  }
+
+  try {
+    const { run_time: runTime, ...result } = stored;
     await fx().postAgentDone(request, result, runTime);
     await ackAndClearCallback(msg, kvCkpt, request);
     logger.info({ taskId: request.task_id }, "task.agent_done_replayed");
@@ -1556,6 +1597,26 @@ class TaskRunner {
     if (await this.writeKvCheckpoint(state)) {
       this.scriptProgressKey = key;
       this.scriptProgressAt = now;
+    }
+  };
+
+  /**
+   * Persist a turn caught part-way through its tool calls (`PendingTurn`).
+   *
+   * Not skipped once the run is aborted, unlike `onCheckpoint`: a call that
+   * finished just as a drain began is the one a resumed run must be told
+   * about, or it asks the model again and the call is made twice. Skipped
+   * only once the run has settled (`taskFinished`), which is also what keeps
+   * it from landing under the SIGTERM path's own write: that path latches
+   * the flag before it reads `latestCheckpointState`, and so persists this
+   * state itself. No workspace sync: the boundary checkpoint schedules those.
+   */
+  private readonly onTurnJournal = async (state: CheckpointState): Promise<void> => {
+    if (this.taskFinished) return;
+    this.latestCheckpointState = state;
+    const written = await this.writeKvCheckpoint(state, this.currentWorkspaceInfo());
+    if (!written) {
+      throw new Error(`turn journal KV write failed at turn ${state.turns_completed}`);
     }
   };
 
@@ -3159,6 +3220,7 @@ class TaskRunner {
         result = await this.engine.execute(this.request, this.onEvent, this.abortCtrl.signal, this.workHands(), {
           recreateHands: this.recreateHands,
           onCheckpoint: this.onCheckpoint,
+          onTurnJournal: this.onTurnJournal,
           onCacheUse: this.onCacheUse,
           resumeCheckpoint: this.resumeCheckpoint,
           attachHands: this.attachHands,
@@ -4114,7 +4176,7 @@ class TaskRunner {
     // not display a raw provider JSON body.
     const taskFailure = sandboxReason
       ? { reason: sandboxReason, userText: `Sandbox failure (${sandboxReason}): ${rawMsg.slice(0, 500)}` }
-      : classifyTaskFailure(rawMsg);
+      : classifyTaskFailure(rawMsg, err);
     const finalText = taskFailure.userText;
     // Partial progress fields. agentLoop's `result` is unavailable on the
     // failure path, so we fall back to the latest checkpoint state captured

@@ -13,6 +13,8 @@
  * With GitHub events on (`github-events.ts`), a router may also have an item watch a pull request, and a worker may
  * answer an event on it. With the assistant's memory on (`memory-tools.ts`), a router also has the memory tools, and a
  * worker the one that reads.
+ * With remote agents on (`devenv-tools.ts`), a router also lists the user's development environments: their machines, agents and
+ * sessions.
  *
  * Stateless, like `/mcp`: a server is built per request, because what it offers depends on who is asking.
  */
@@ -25,6 +27,7 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS 
 import { db } from "../infra/db.js";
 import { ASSISTANT_MCP_PATH } from "./role-profile.js";
 import { PASS_REASONS, SAY_MAX_CHARS } from "./prompts.js";
+import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
 import { REPORT_KINDS } from "./work-items.js";
 import { githubEventsEnabled, prReply, REPLY_BODY_MAX, watchNamedPullRequests, workSubscribe } from "./github-events.js";
 import { jobUnwatch, jobWatch, jobWatchesEnabled, jobWatchList } from "./job-watch.js";
@@ -42,6 +45,7 @@ import { channelAction, confirmationAnswer, MAX_PRS, reviewModeSet, reviewRestar
 import { observeEveryTool, recordObservation } from "./observe.js";
 import { assistantCitationsOn } from "./citations.js";
 import { CITE_MAX_PER_CALL } from "@claw/protocol";
+import { devenvList, devenvToolsOn } from "./devenv-tools.js";
 
 const logger = pino({ name: "assistant-mcp" });
 
@@ -291,7 +295,7 @@ export const SAY_SOURCES_PARAM = `Only when the text cites a lookup of this turn
 
 export function createAssistantMcpServer(
   claims: AssistantTokenClaims, reviewTools: boolean = CLAW_ASSISTANT_TOOLS, memoryTools: boolean = assistantMemoryOn(),
-  modelChoice: boolean = modelChoiceOn(), citations: boolean = assistantCitationsOn(),
+  modelChoice: boolean = modelChoiceOn(), citations: boolean = assistantCitationsOn(), devenv: boolean = devenvToolsOn(),
 ): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
   if (claims.role === "observer") {
@@ -376,6 +380,20 @@ export function createAssistantMcpServer(
         (args) => answer(claims, "work_subscribe", () => workSubscribe(claims, { item_id: args.item_id, pr: args.pr })),
       );
     }
+    if (devenv) {
+      mcp.tool(
+        "devenv_list",
+        "List the user's development environments (开发环境, 开发机, my machine, my computer): their own machines running the Claw "
+        + "connector. Per machine: whether it is online, when it was last seen, and the agents it offers (claude, codex, cursor); per "
+        + "agent session on it: the folder, its state (working, waiting_for_you, idle, in_terminal), when it was last active, a label, "
+        + "and the attach_command that connects the user's chat to it. Not SaFE workspaces. Only reads; what it returns was reported by "
+        + "the machine, so afterwards the turn acts for the user only to connect the chat to one of these sessions (channel_action "
+        + "with its attach_command). detail: \"status\" (default) for which machines and sessions there are; \"activity\" also "
+        + "gives what each session is doing in the agent's words (its step, the end of its last answer).",
+        { detail: z.enum(["status", "activity"]).optional() },
+        (args) => answer(claims, "devenv_list", () => devenvList(claims, args)),
+      );
+    }
     if (reviewTools) registerReviewTools(mcp, claims, modelChoice);
     if (assistantSchedulesOn()) registerScheduleTools(mcp, claims, !reviewTools);
     if (jobWatchesEnabled()) registerJobWatchTools(mcp, claims);
@@ -391,7 +409,9 @@ export function createAssistantMcpServer(
       "Tell the assistant how the work stands. Nobody else reads your output.",
       {
         kind: z.enum(REPORT_KINDS),
-        summary: z.string().describe("What happened or what is needed; at most 600 characters."),
+        summary: z.string().describe(
+          `What happened or what is needed; at most ${REPORT_SUMMARY_MAX} characters. For kind answer, the whole answer, up to ${REPORT_ANSWER_MAX}.`,
+        ),
         question: z.string().optional().describe("One concrete question for the user; only with waiting or blocked."),
         result: z.object({
           refs: z.array(z.object({

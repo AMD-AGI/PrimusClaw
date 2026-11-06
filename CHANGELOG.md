@@ -28,9 +28,36 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A review item's pull request is followed after its turn (`gh_pr_follow`, the review items' sweep, at most every 90 s per item):
+  merged or closed on GitHub ends the item and closes what its session still held for the reviewer's answer. For a review asked of
+  someone else that may merge, the requester's own GitHub account merges their pull request once the reviewer's approval of the head
+  is on GitHub, CI is green, no thread is open and the merge state is CLEAN, instead of waiting for the reviewer to confirm a held
+  merge; the held merge closes as merged by the requester. One acting user may now be asked about 30 writes at once (was 10).
+- Remote connector presence over time: every change of a connector's presence is recorded, the connector list gives
+  `last_seen_at`, `offline_since` and `offline_reason` (`auth_expired`, `no_heartbeat`), and a connector offline for 5 minutes
+  is reported once to its owner through their assistant with when it was last seen and the command that brings it back, then
+  once more when it is back. The seconds-long breaks a Claw release causes are never reported.
 - Three GitHub writes, each held for the user's decision like every write of the `github` server: `checks_rerun_failed` (run
   again the failed jobs of a GitHub Actions workflow run; `checks_list` now gives a job's `run_id`), `pr_request_reviewers` (people
   and teams) and `labels_set` (the whole list of an issue's or pull request's labels). None is a router read.
+- An assistant's router turn diagnoses a failure itself: of the assistant plugin's servers it is offered SaFE's `workload_logs`,
+  `workload_events`, `workload_pod_logs`, `workload_pod_containers`, `node_pod_logs`, `node_reboot_logs`, `cluster_logs` and
+  `flavor_avail`, and the agent board's `notification_read` and `milestone_read`; the user's scheduled tasks (`trigger_list` of
+  the turn's own `schedules` server, kept only when this API minted its bearer for this turn's session, message and run); and the plugin's
+  `teams-reply-style` rule. Its log reads go to Brain as the new `ExecuteRequest.log_reads` (each read's line-counting
+  argument, empty for `workload_pod_containers`, which counts nothing but whose termination messages can hold a log's end):
+  Brain asks for at most 40 lines or entries, masks credential-shaped text in the answer before the model, an event or a log
+  line sees it (new `redactLogSecrets` of @claw/utils: `redactSecrets`; values after a credential's name, where an unquoted
+  value runs to its line's end, or to the closing quote of the string its name is in, and no separator or bracket ends it; Kubernetes environment variables named like a credential; armored private keys, OpenPGP ones
+  included, and a key whose BEGIN line the tail cut off, from its first base64 line), and keeps the last 6000 characters of a
+  plain-text answer.
+- An assistant router turn answers about the user's development environments itself: `devenv_list` (where
+  `CLAW_REMOTE_AGENTS_ENABLED` is on) lists their own machines (online, last seen, version, agents) and every agent session on them
+  (open through Claw, or the agent's own conversation a connector offers to take over) with its state, folder, last activity, a
+  label and the command that attaches the chat to it; `detail: "activity"` adds what each one is doing in the agent's words.
+  Either read marks the turn as having read untrusted text; such a turn may still put the attach command of one of the user's own
+  sessions to them as a button, and nothing else. The router prompt treats 开发环境 / dev box / my machine as the connector, never as
+  a SaFE workspace, and "connect me to it" as `channel_action` with that attach command. Only the caller's rows are read.
 - Citations for the assistant router's answers, behind `CLAW_ASSISTANT_CITATIONS` (default off). The router writes [1], [2] in its
   `say` and names each number's address in `say`'s new `sources` argument; the new `ExecuteRequest.cite` makes Brain keep the sources
   the turn's own lookups returned (`web_search` hits and what the API's GitHub server lists in its results' `_meta["claw/sources"]`:
@@ -44,6 +71,25 @@ record it.
   prefix of the message, and a `sources` argument of the wrong type is read as none rather than refusing the say. New counter
   `claw_assistant_say_sources_total{outcome}` (`cited`, `dropped_not_in_turn`, `dropped_invalid`, `dropped_over_cap`,
   `unreferenced`, `suppressed_link_text`).
+- The assistant takes the files a person sends and hands back the files and long answers its work produces. A channel uploads the
+  files to the assistant's session and names them beside the message (`channel_context.files`: `path` below `.uploads/`, `name`,
+  `media_type`, `size`; at most 10, only paths inside the session's own uploads). The router turn that answers the message is told what
+  came and is shown the images itself: the new `prompt_images` field of the execute request names them, and Brain reads them from the
+  session's uploads and sends them with the prompt as image blocks (whole PNG, JPEG, GIF or WebP up to 3.5 MB, at most 4 and 6 MiB of base64 together; the checks
+  are now one module, `@claw/protocol` `images.ts`, shared with Hands' `read`; the OpenAI wire sends them as image parts). Every item
+  the turn starts or instructs (`work_create`, `work_send`) gets a server-side copy of every file in its worker's session before its
+  message is queued (the copies side by side, under one 10 s deadline), and the worker is told where; a copy the store refused or
+  that was not done by the deadline is answered as `files_not_attached`. A worker's
+  `deliver_file` reaches the user: after a report that says something (any kind but progress), at a worker run's end and from the
+  assistant sweep, each delivered file still downloadable is announced once, oldest first, as an `assistant.say` in the system's words
+  carrying `files` (`item_id`, `session_id`, `id`, `name`, `size`, `content_type`, a small image inline) for a channel to draw as a
+  download; a report records how far its files were announced in the new table `claw_work_item_delivery_checks`, so a store that did
+  not answer is retried by the sweep, and a file's message that neither a channel's outbox nor the session holds is published
+  again. A delivered file's name is said inside a code span and redacted as the message's text is. Long answers are said whole: `say`
+  takes up to 9000 characters (the router is still asked for about 600 unless the user needs more), an `answer` report up to 8800
+  (other kinds stay at 600), and an answer longer than 600 is sent to the user whole by the system at once (stored for sending in the
+  report's own transaction, and only then is the router told it was sent); a plain-text router ending is cut only past 9000. The super-agent evaluation sends a turn's `files` as a channel does and grades
+  `delivers` and `style.min_chars`.
 - Quicker assistant router turns. A router turn can ask for low reasoning effort (`CLAW_ASSISTANT_ROUTER_EFFORT`: low | medium |
   high | `default`, the default, for the model's own; set `low` where the router runs on a reasoning model such as Claude; a session
   that chose an effort keeps it), and its `say` is published while the model writes it (`CLAW_ASSISTANT_STREAM_SAY`, default on): the
@@ -696,6 +742,17 @@ record it.
   like the platform defaults instead of being inlined.
 
 ### Security
+- What the API stores of a conversation now has credentials masked before it is written: session events (`claw_session_events`,
+  as the event consumer, the message route and the A2A route write them), conversation turns (`claw_conversation_turns`) and the
+  words an assistant's router turn answers (`claw_assistant_messages`). The new `redactStoredText` / `redactStoredValue`
+  (`@claw/utils`) add to `redactSecrets` a SaFE API key (`ak-...`), a short `Bearer` token with a digit in it, an armored private
+  key, and a value written after a credential's name (`password=`, `"api_key": "..."`, `token: ...`), leaving code, placeholders and
+  sentences alone (`password = getPassword()`, `password: string`, `${DB_PASSWORD}`, `"Enter your password"`). Identifier fields
+  (`id`, `*_id`, `*Id`: `message_id`, `tool_use_id`, `actionId`, ...) holding one token are stored as they are, whatever their shape,
+  since readers match stored rows on them (a 64-hex A2A `messageId` is not a credential). Only the stored copy
+  is masked: the turn's prompt reaches Brain as written, and a router turn run again on the fallback model is given its prompt as the
+  model first was when that prompt is the stored message. Later turns read their history from the masked rows. Rows written before
+  this change are not rewritten.
 - Claw works with a sandbox Router that runs with `--enable-auth`. With `SANDBOX_ROUTER_AUTH_ENABLED` on, every Hands
   request that goes through the Router's port proxy (`SANDBOX_HANDS_VIA_ROUTER`) presents the sandbox owner's platform key
   in `Authorization`: Brain's MCP client, health checks, shell records and the sweeper, and the API's changes view and
@@ -831,6 +888,23 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A work item's worker whose item waits for a person (`needs_you`) or is `done` no longer keeps its sandbox for background work: past
+  `WAITING_ITEM_SANDBOX_RELEASE_SECONDS` (API, default 900) of quiet with nothing queued, the orphan sweep stops it, and the next turn
+  starts a fresh one. A review session's leftover test Postgres had held global-cpu sandboxes for up to two hours behind held merges.
+- Brain: deleting a session owned by a non-admin key (every ordinary user, and service identities such as `sa-eval-bot`,
+  `sa-release-gate` and `dispatron-service`) no longer stops at `cleanup_incomplete_parked`. The session-scoped SaFE workload
+  list named no workspace, which SaFE answers with 403 for any key that is not an admin's, so teardown read it as
+  `mn.safe_lookup_failed`. When the unscoped list is refused with 403, teardown and the multi-node idle sweep now list in
+  the workspace the session recorded (its `hands.<sid>` binding's `namespace`), one list per workspace when there are several;
+  a key that may read the unscoped list (an admin's) keeps reaching every workspace.
+- The assistant router sees each person a message names with their address and other handles beside their user id (`People in
+  this message`), so it can pick one of two people with the same name from the reply that names them (`确认 Wei, Lei (weil2)`).
+- The sandbox's E2B file API takes an absolute path as that path. `files.write('/tmp/x')` wrote `<workspace>/tmp/x`, so a
+  command reading `/tmp/x` found nothing, and a process `cwd` of `/tmp` ran in `<workspace>/tmp`. An unsealed sandbox's file calls
+  run under the uid its commands get, so the mapping bounded nothing; they now follow E2B (absolute paths as given, relative ones
+  under the workspace, responses name the absolute path). A sealed sandbox keeps its grant's workspace-rooted paths (`/in` is
+  `<workspace>/in`), and a sealed path that would leave the workspace is refused with `permission_denied` "path escapes the
+  sandbox root". Ships in the envd injector image.
 - The GitHub list reads (`issue_search`, `pr_list`, `issue_list`, `repo_list`, `code_search`) answer the whole list a question
   asks for: `{ total_count, shown, complete, next_page?, items }`, pages of 50 by default (up to 100), and an answer of at most
   `GITHUB_LIST_MAX_CHARS` that Brain keeps whole (any other result is still cut to its head and tail at 6000 characters, which
