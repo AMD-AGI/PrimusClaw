@@ -98,6 +98,8 @@ import {
 import { startWatchdog } from "./infra/watchdog.js";
 import { registerAdminCheckpointRoutes } from "./routes/admin.js";
 import { bindBrainAppGrant } from "./apps/app-grant.js";
+import { reclaimPreviousIncarnation } from "./tasks/previous-incarnation.js";
+import { installProcessGuards } from "./infra/process-guards.js";
 import { DrainState, versionDrainAction } from "./infra/drain-state.js";
 
 const logger = pino({ name: "brain" });
@@ -133,8 +135,16 @@ let consumerIter: { stop: () => void } | null = null;
 
 // ===== Signal handlers =====
 
-function installSignalHandlers(): void {
-  const handler = (sig: string) => {
+/**
+ * Stop taking work, hand every run on this pod back, and exit with `exitCode`.
+ *
+ * Reached from SIGTERM/SIGINT (exit 0) and from an uncaught exception (exit 1,
+ * see installProcessGuards): either way the runs here are aborted with the
+ * SIGTERM reason, which checkpoints them and releases their claims and locks,
+ * so another replica resumes them in seconds rather than after their leases
+ * and the reaper's grace have run out.
+ */
+function beginShutdown(sig: string, exitCode = 0): void {
     // Guards re-entry into *shutdown* only. Testing the shared drain flag here
     // is what let a version-drained pod skip its own SIGTERM handling.
     if (!drainState.beginShutdown()) return;
@@ -166,17 +176,37 @@ function installSignalHandlers(): void {
       } catch (err) {
         logger.warn({ err, signal: sig }, "brain.drain.release_deferred_failed");
       }
-      try { await nc.drain(); } catch { /* ignore */ }
+      try { await nc?.drain(); } catch { /* ignore */ }
       logger.info({
         signal: sig,
         drainedSessions: activeSessions.length,
+        exitCode,
       }, "brain.drain.complete");
-      process.exit(0);
+      process.exit(exitCode);
     });
-  };
+}
 
-  process.once("SIGTERM", () => handler("SIGTERM"));
-  process.once("SIGINT", () => handler("SIGINT"));
+/**
+ * How long an exit forced by an uncaught exception may spend handing runs back.
+ * A SIGTERM has the pod's grace period behind it; this has nothing, and a
+ * process that has already thrown once may hang in its own drain.
+ */
+const FATAL_DRAIN_DEADLINE_MS = 60_000;
+
+function installSignalHandlers(): void {
+  process.once("SIGTERM", () => beginShutdown("SIGTERM"));
+  process.once("SIGINT", () => beginShutdown("SIGINT"));
+}
+
+function installFaultGuards(): void {
+  installProcessGuards({
+    log: logger,
+    count: (kind) => metrics.onProcessFault(kind),
+    onFatal: () => {
+      setTimeout(() => process.exit(1), FATAL_DRAIN_DEADLINE_MS).unref();
+      beginShutdown("uncaughtException", 1);
+    },
+  });
 }
 
 /**
@@ -839,6 +869,8 @@ async function startHttpServer(deliveryResidency: DeliveryResidency): Promise<vo
 }
 
 async function main(): Promise<void> {
+  // Before anything can leave a promise behind: see installProcessGuards.
+  installFaultGuards();
   // First, and before any connection: see `proveKeepaliveCapacity`. A pod that
   // refuses its own configuration must refuse it while it is still holding
   // nothing.
@@ -846,6 +878,10 @@ async function main(): Promise<void> {
   // Off unless IDENTITY_CLIENT_ENABLED is set; nothing in Brain uses it yet.
   startIdentityClient(logger);
   const jsm = await initializeInfrastructure();
+  // After the lock bucket is bound and before the first claim: see
+  // previous-incarnation.ts. Nothing this process holds can be released here,
+  // because it holds nothing yet.
+  await reclaimPreviousIncarnation();
   const deliveryResidency = await startTaskDelivery(jsm);
   installSignalHandlers();
   installInterruptSubscriber();

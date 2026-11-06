@@ -12,11 +12,13 @@ import {
   SESSION_PURGE_DAYS, SESSION_RETENTION_BATCH, SESSION_RETENTION_DAYS, SESSION_RETENTION_DRY_RUN,
   SESSION_RETENTION_HOLD_BUDGET_SEC, SESSION_RETENTION_LOCK_RETRY_MIN,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
+  SHUTDOWN_DEADLINE_MS, SHUTDOWN_DELAY_MS,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
-import { initDb } from "./infra/db.js";
+import { db, initDb } from "./infra/db.js";
+import { GracefulShutdown } from "./infra/graceful-shutdown.js";
 import { bindApiAppGrant } from "./grants/app-grant.js";
-import { initNats } from "./infra/nats.js";
+import { initNats, nc as natsConnection } from "./infra/nats.js";
 import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
@@ -296,7 +298,32 @@ async function main() {
     },
   });
 
+  // Before any route: the shutdown has to see every response, including the
+  // event streams that hijack theirs. See infra/graceful-shutdown.ts.
+  const shutdown = new GracefulShutdown({
+    logger,
+    deadlineMs: SHUTDOWN_DEADLINE_MS,
+    delayMs: SHUTDOWN_DELAY_MS,
+    closeServer: () => app.close(),
+    steps: [
+      { name: "nats", run: async () => { await natsConnection?.drain(); } },
+      { name: "db", run: () => Promise.all([db.pool.end(), db.lockPool.end()]) },
+    ],
+    exit: (code) => process.exit(code),
+  });
+  app.addHook("onRequest", async (_req, reply) => {
+    shutdown.watchResponse(reply.raw);
+  });
+  shutdown.install();
+
+  // Liveness: the process is up. Stays 200 while draining, so a pod finishing
+  // its requests is not restarted for doing so.
   app.get("/health", async () => ({ status: "ok", service: "api-v2" }));
+  // Readiness: the process wants new requests. 503 from SIGTERM on.
+  app.get("/ready", async (_req, reply) => {
+    if (shutdown.draining) return reply.status(503).send({ status: "draining", service: "api-v2" });
+    return { status: "ok", service: "api-v2" };
+  });
 
   // Prometheus scrape endpoint (text/plain Prom exposition).
   app.get("/metrics", async (_req, reply) => {

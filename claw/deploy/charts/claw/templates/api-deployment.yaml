@@ -70,6 +70,12 @@ spec:
           (get .Values.api "admitTreeMaxNodes" | default 0)
           (get .Values.api "admitTreeMaxDepth" | default 0) | sha256sum }}
     spec:
+      # Room for the drain in infra/graceful-shutdown.ts: the preStop sleep
+      # below, then up to SHUTDOWN_DEADLINE_MS (75s by default) of requests and
+      # event streams finishing. The kubelet's clock starts before the preStop,
+      # so this has to cover both; at the old 30s there was nothing to cover,
+      # because the process exited the moment SIGTERM arrived.
+      terminationGracePeriodSeconds: {{ .Values.api.terminationGracePeriodSeconds | default 90 }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -104,6 +110,14 @@ spec:
         ports:
         - name: http
           containerPort: {{ .Values.api.port }}
+        # SIGTERM only after the pod has left the Service's endpoints. Removal
+        # and the signal start together, and kube-proxy and the gateway take a
+        # few seconds to stop routing here; a process that closed its listener
+        # straight away refused the connections that arrived in between.
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sleep", "{{ .Values.api.preStopSleepSeconds | default 10 }}"]
         envFrom:
         - secretRef:
             name: primus-claw-secrets
@@ -243,8 +257,11 @@ spec:
           httpGet: { path: /health, port: http }
           periodSeconds: 10
           failureThreshold: 3
+        # /ready, not /health: it turns 503 from SIGTERM on while /health stays
+        # 200, so a draining pod is taken out of rotation without the liveness
+        # probe restarting it in the middle of finishing its requests.
         readinessProbe:
-          httpGet: { path: /health, port: http }
+          httpGet: { path: /ready, port: http }
           periodSeconds: 5
           failureThreshold: 2
         resources:

@@ -26,6 +26,7 @@ import {
 } from "../tasks/run-claim.js";
 import type { RunSettlement } from "../tasks/run-time-ledger.js";
 import { wakeSession } from "../sessions/wake.js";
+import { requeueOrphanedDoorbellLeases } from "../tasks/sweeper.js";
 
 const logger = pino({ name: "internal-runs" });
 
@@ -263,6 +264,26 @@ function registerFailClaimRoute(app: FastifyInstance): void {
   );
 }
 
+/**
+ * Brain, starting: give back whatever my previous incarnation was running.
+ *
+ * Only a brain whose id is its pod name calls this, and only before it claims
+ * anything; see `requeueOrphanedDoorbellLeases` for why that makes every row
+ * still leased to the id an orphan.
+ */
+function registerReleaseOrphansRoute(app: FastifyInstance): void {
+  app.post(
+    "/v1/internal/runs/release-orphans",
+    { preHandler: clusterInternalAuth },
+    async (req, reply) => {
+      const brainId = brainIdFrom(req.body);
+      if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id_required" });
+      const requeued = await requeueOrphanedDoorbellLeases(brainId);
+      return { ok: true, requeued };
+    },
+  );
+}
+
 function registerClaimNextRoute(app: FastifyInstance): void {
   app.post(
     "/v1/internal/runs/claim-next",
@@ -324,5 +345,6 @@ export async function registerInternalRunRoutes(app: FastifyInstance): Promise<v
   registerUnclaimRoute(app);
   registerFailClaimRoute(app);
   registerClaimNextRoute(app);
+  registerReleaseOrphansRoute(app);
   registerSessionWakeRoute(app);
 }

@@ -674,6 +674,51 @@ export async function requeueLostDoorbellLeases(): Promise<number> {
 }
 
 /**
+ * Put back every doorbell run a brain's previous incarnation was holding.
+ *
+ * Asked by a brain as it starts, before it claims anything, and only by one
+ * whose `BRAIN_ID` is its pod name: a container restarted in place keeps that
+ * name and is the only process that can carry it, so a running row leased to
+ * it at this moment can only have belonged to the process that just died. On
+ * 2026-11-06 a brain container crashed and restarted in seconds, and its runs
+ * then stood for eleven minutes -- the lease's 45 seconds plus the reaper's
+ * grace -- for a takeover the restarted container could have made at once.
+ * The lock side of the same hand-back is in brain/src/tasks/lock.ts.
+ *
+ * Same transition, same columns, as `requeueLostDoorbellLeases`; what differs
+ * is only how the row is known to be orphaned -- by its owner's own word rather
+ * than by its lease running out.
+ */
+export async function requeueOrphanedDoorbellLeases(brainId: string): Promise<number> {
+  const rows = await applyTaskStatusTransition("queued", {
+    extra: {
+      lease_owner: null,
+      lease_expires_at: null,
+      heartbeat_at: null,
+      internal_token_hash: null,
+      attempt_id: null,
+      started_at: null,
+    },
+    setSql: [`metadata = ${requeueSojournSql("COALESCE(metadata, '{}'::jsonb)")}`],
+    where: `status IN ('preparing','running')
+        AND origin = 'chat'
+        AND metadata->>'dispatch' = 'doorbell'
+        AND lease_owner = $1
+        AND (deadline_at IS NULL OR deadline_at > NOW())`,
+    params: [brainId],
+  });
+  if (!rows.length) return 0;
+  logger.warn(
+    { requeued: rows.length, brainId,
+      rows: rows.map((row: ClawTaskRow) => ({ task_id: row.task_id, session_id: row.session_id })) },
+    "sweeper.requeued_orphaned_doorbell_leases",
+  );
+  metrics.onDoorbellLeaseRequeued(rows.length);
+  metrics.onQueueEntered("requeue", rows.length);
+  return rows.length;
+}
+
+/**
  * What a queue timeout has to say, and to whom.
  *
  * Closing the row and opening the gate is the database's half. The client

@@ -183,6 +183,13 @@ const handsBinaryDownloadDuration = new Histogram({
 // rightful holder of a NATS KV lock and therefore skipped the delete.
 // Steady-state value MUST be 0; any non-zero rate signals competing
 // brain pods or post-pause holder mismatch and warrants investigation.
+const processFaultTotal = new Counter({
+  name: "claw_brain_process_fault_total",
+  help: "Errors that escaped every handler and reached the process: an unhandled rejection (logged and survived) or an uncaught exception (drained, then exited). Any increase is a bug to fix.",
+  labelNames: ["kind"] as const, // "unhandled_rejection" | "uncaught_exception"
+  registers: [registry],
+});
+
 const lockReleaseSkippedTotal = new Counter({
   name: "claw_brain_lock_release_skipped_total",
   help: "Session-lock release calls that detected we are no longer the holder (INV-13 protection fired).",
@@ -948,6 +955,9 @@ export const metrics = {
       handsBinaryDownloadBytes.inc(bytes);
       handsBinaryDownloadDuration.observe(elapsedSec);
     }
+  },
+  onProcessFault(kind: "unhandled_rejection" | "uncaught_exception"): void {
+    processFaultTotal.inc({ kind });
   },
   onLockReleaseSkipped(reason: "not_holder" | "cas_lost" | "legacy_format"): void {
     lockReleaseSkippedTotal.inc({ reason });
