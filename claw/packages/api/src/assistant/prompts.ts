@@ -357,12 +357,13 @@ export function formatManifestLine(item: ManifestItem): string {
 /** A review the user asked of someone else, as their router is shown it: its item_id and the four facts (`requester-view.ts`). */
 export interface AskedOfOtherLine {
   itemId: string;
-  view: { status: string; pr_url: string | null; verdict: string | null; merged: boolean };
+  view: { status: string; pr_url: string | null; verdict: string | null; merged: boolean; waiting_for?: string | null; findings?: number | null };
 }
 
 export function formatAskedOfOtherLine(a: AskedOfOtherLine): string {
   const v = a.view;
-  return `- item_id: ${a.itemId} | ${v.pr_url ? quoted(v.pr_url) : "(no pull request)"} | status: ${oneLine(v.status)} | verdict: ${v.verdict ? oneLine(v.verdict) : "none yet"} | merged: ${v.merged ? "yes" : "no"}`;
+  return `- item_id: ${a.itemId} | ${v.pr_url ? quoted(v.pr_url) : "(no pull request)"} | status: ${oneLine(v.status)} | verdict: ${v.verdict ? oneLine(v.verdict) : "none yet"} | merged: ${v.merged ? "yes" : "no"}`
+    + (v.waiting_for ? ` | waiting for: ${oneLine(v.waiting_for)}` : "") + (v.findings !== null && v.findings !== undefined ? ` | open findings: ${v.findings}` : "");
 }
 
 /**
