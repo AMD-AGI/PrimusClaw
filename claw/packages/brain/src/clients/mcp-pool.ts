@@ -68,6 +68,23 @@ function isSessionGone(err: unknown): boolean {
   return (err as { code?: unknown } | null)?.code === 404;
 }
 
+/**
+ * `p`, or the signal's reason as soon as it is aborted. A connect another run may be waiting on too is shared, so a run that has
+ * to stop stops waiting for it rather than cancelling it.
+ */
+function untilAborted<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error("aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => { signal.removeEventListener("abort", onAbort); resolve(v); },
+      (e: unknown) => { signal.removeEventListener("abort", onAbort); reject(e); },
+    );
+  });
+}
+
 /** One server's connection for one user and one spec. */
 export class McpPoolEntry {
   refs = 0;
@@ -191,14 +208,14 @@ export class McpPoolEntry {
     name: string, args: Record<string, unknown>, outcome?: unknown, meta?: Record<string, unknown>, signal?: AbortSignal,
   ): Promise<string> {
     this.lastUsedAt = Date.now();
-    const conn = await this.current();
+    const conn = await untilAborted(this.current(), signal);
     try {
       return await conn.callTool(name, args, outcome, meta, signal);
     } catch (err) {
       if (isSessionGone(err) && !this.retired && !signal?.aborted) {
         logger.warn({ name: this.name, tool: name }, "mcp_pool.session_gone_reconnecting");
         await this.drop(conn);
-        return (await this.current()).callTool(name, args, outcome, meta, signal);
+        return (await untilAborted(this.current(), signal)).callTool(name, args, outcome, meta, signal);
       }
       // The connection may be the reason: the next turn lists the tools first, and reconnects if that fails too.
       this.verifiedAt = 0;

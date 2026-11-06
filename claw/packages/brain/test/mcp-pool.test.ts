@@ -17,6 +17,7 @@
  *   R7  without a user the run opens its own connections and closes them, as before
  *   R8  an idle connection is closed, and a superseded spec's connection with it
  *   R9  an SSE connection (a request held open) is closed when its run ends, not kept
+ *   R10 a run that is aborted while its call waits for a shared reconnect stops waiting; the reconnect goes on for others
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -282,4 +283,25 @@ test("R9 an SSE connection is closed when its run ends, not kept", async () => {
     await pool.closeAll();
     await new Promise<void>((r) => { server.close(() => r()); server.closeAllConnections(); });
   }
+});
+
+test("R10 an aborted run stops waiting for a shared reconnect, which goes on for the others", async () => {
+  const s = await startCountingServer({ stateful: true });
+  const pool = newPool();
+  try {
+    const t1 = await connectPlatformMcp({ fx: spec(s.url) }, { pool, userId: "alice" });
+    // The session is gone and the reconnect is slow: the call waits for it.
+    s.dropSessions();
+    s.initDelayMs = 1_000;
+    const ctrl = new AbortController();
+    const started = Date.now();
+    const call = t1.clients.get("fx")!.callTool("echo", {}, undefined, undefined, ctrl.signal);
+    setTimeout(() => ctrl.abort(new Error("run stopped")), 100);
+    await assert.rejects(call, /run stopped/);
+    assert.ok(Date.now() - started < 700, `the aborted call waited ${Date.now() - started} ms for the reconnect`);
+    // Another holder's call still gets the connection the reconnect makes.
+    assert.equal(await t1.clients.get("fx")!.callTool("echo", {}), "ran echo");
+    assert.equal(s.initializes, 2);
+    await t1.closeAll();
+  } finally { await pool.closeAll(); await s.close(); }
 });
