@@ -449,8 +449,10 @@ export const SESSION_RETENTION_DAYS = envInt("SESSION_RETENTION_DAYS", 0, { min:
 // The soft-deleted conversation rows of a session deleted more than this many
 // days ago (turns, events, summaries) are removed for good. 0 disables it.
 export const SESSION_PURGE_DAYS = envInt("SESSION_PURGE_DAYS", 0, { min: 0 });
-// How many sessions one daily pass deletes, and separately how many deleted
-// sessions it purges the rows of.
+// How many sessions retention deletes in a day, across all replicas (counted
+// from the deletions of the last 24 hours, so restarts and more replicas do not
+// multiply it), and separately how many deleted sessions one pass purges the
+// rows of.
 export const SESSION_RETENTION_BATCH = envInt("SESSION_RETENTION_BATCH", 500, { min: 1 });
 // Count and log what the pass would delete and purge, and change nothing.
 export const SESSION_RETENTION_DRY_RUN = envBool("SESSION_RETENTION_DRY_RUN", false);
