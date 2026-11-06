@@ -34,6 +34,8 @@
  *       of its own or none
  *   F14 sent at once only in the user's own words: an instruction the user did not write (say, one an agent's answer on the item
  *       list put to the model) is a card, even in the user's own signed-in turn
+ *   F15 two stops in a row, each followed by an instruction, before either cancel's end has come: each end is taken in turn, and
+ *       only the last instruction is left open
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -176,7 +178,8 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal(item.summary, "Makefile README.md docs/ src/");
     const line = await manifestLine("alice", item.item_id);
     assert.match(line, /finished: the agent's turn on that machine ended/);
-    assert.match(line, /summary: "Makefile README.md docs\/ src\/"/);
+    // The answer is the agent's words: not on the list the router reads every turn (work_recall reads it, and marks the turn).
+    assert.doesNotMatch(line, /Makefile/);
     const evs = await w.itemEvents(item.item_id);
     assert.deepEqual(evs.map((e: Recorded) => [e.kind, e.source]), [["created", "remote"], ["progress", "remote"], ["answer", "remote"]]);
     assert.equal(evs[1].summary, "列一下当前目录");
@@ -547,13 +550,13 @@ describe("development environment items and devenv_send", { skip }, () => {
     // the rest, and the cancel is no longer pending, so it takes nothing from the instructions after it.
     assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "now docs" })).status, 202);
     assert.equal((await post("alice", `/v1/work-items/${String(out.item_id)}/stop`, {})).status, 200);
-    assert.equal(typeof (await remoteItem(sid)).params.cancel_after, "number");
+    assert.equal((await remoteItem(sid)).params.cancels.length, 1);
     const m = seqs.get(sid) ?? 0;
     seqs.set(sid, m + 1);
     await store.ingestEvents({ connector_id: cid, owner_user_id: "alice" }, [{ index: 0, session_id: sid, seq: m + 1, type: "turn_end", ts: Date.now(), data: { stopReason: "cancelled" } }] as never);
     assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "and format" })).status, 202);
     item = await remoteItem(sid);
-    assert.deepEqual([item.board_state, item.params.open_turns, item.params.cancel_after ?? null], ["in_progress", 1, null]);
+    assert.deepEqual([item.board_state, item.params.open_turns, item.params.cancels.length], ["in_progress", 1, 0]);
   });
 
   test("F13 a turn that finished as the stop was on its way never ends the instruction sent after the stop", async () => {
@@ -589,7 +592,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     await events("alice", cid, sid, [chunk("third done"), end()]);
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "third done"]);
     await events("alice", cid, sid, [end("cancelled")]);
-    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.cancel_after ?? null], ["done", null]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.cancels.length], ["done", 0]);
   });
 
   test("F14 an instruction not in the user's own words is only a card, even in their signed-in turn", async () => {
@@ -606,6 +609,25 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal(tools.inTheirWords("ask codex to FIX the test", "fix the test"), true);
   });
 
+  test("F15 two stops before either cancel's end has come: each end is the oldest one's, and the last instruction stays open", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const sid = await chatSession("alice", cid);
+    const send = async (body: Recorded) => assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, body)).status, 202);
+    await send({ type: "prompt", text: "p1" });
+    await send({ type: "cancel" });
+    await send({ type: "prompt", text: "p2" });
+    await send({ type: "cancel" });
+    await send({ type: "prompt", text: "p3" });
+    assert.equal((await remoteItem(sid)).params.cancels.length, 2);
+    await events("alice", cid, sid, [end("cancelled"), end("cancelled")]);
+    let item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.params.open_turns, item.params.cancels.length], ["in_progress", 1, 0], "p3 is still running");
+    await events("alice", cid, sid, [chunk("p3 done"), end()]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.summary], ["done", "p3 done"]);
+  });
+
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {
     const section = prompts.renderRouterDevenvSection({ actions: true, send: true });
     assert.match(section, /devenv_send, called directly and first, never after devenv_list/);
@@ -613,7 +635,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v2");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v3");
     assert.equal(items.remoteWorkerSessionId("x"), "remote:x");
   });
 });

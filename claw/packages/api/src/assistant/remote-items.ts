@@ -89,16 +89,22 @@ export interface RemoteParams {
   last_event_id: number;
   /** The session event that ended the item (a turn's end, a refusal, the session closing); 0 while open, or when stopped from Claw. */
   closed_event_id?: number;
-  /**
-   * A cancel was sent and the turn_end it brings (exactly one, `stopReason: "cancelled"`) has not come yet: the newest session event
-   * before it was sent. Absent when none is pending.
-   */
-  cancel_after?: number | null;
-  /** Prompts sent after that cancel: still to run when its turn_end comes. */
-  after_cancel?: number;
-  /** Prompts open when that cancel was sent whose turn may still end on its own (it finished as the cancel was on its way). */
-  before_cancel?: number;
+  /** Cancels sent whose turn_end has not come yet, oldest first (`PendingCancel`). */
+  cancels?: PendingCancel[];
 }
+
+/** A cancel sent to the session whose end (one turn_end, `stopReason: "cancelled"`) has not come yet. */
+export interface PendingCancel {
+  /** The newest session event before it was queued: its end comes after this. */
+  after: number;
+  /** Turns that may be running when it reaches the agent and may still end on their own first (at most one). */
+  before: number;
+  /** Prompts sent after it (and before the next cancel): they run once it is done. */
+  n: number;
+}
+
+const pendingCancels = (p: Partial<RemoteParams> | null | undefined): PendingCancel[] =>
+  Array.isArray(p?.cancels) ? p!.cancels!.map((c) => ({ after: Number(c.after) || 0, before: Number(c.before) || 0, n: Number(c.n) || 0 })) : [];
 
 export const langOf = (text: string): RemoteLang => (/\p{Script=Han}/u.test(text) ? "zh" : "en");
 
@@ -162,17 +168,26 @@ export async function inRemoteSessionOrder<T>(sessionId: string, run: () => Prom
  */
 export async function noteRemoteCancel(owner: string, sessionId: string, mark: number): Promise<void> {
   if (!remoteItemsOn()) return;
-  await db.query(
-    // Of the prompts open, at most one is running and may end on its own; the queued ones are dropped with no end of theirs.
-    `UPDATE claw_work_items
-        SET params = params || $3::jsonb
-              || jsonb_build_object('before_cancel', LEAST(1, GREATEST(0, COALESCE((params->>'open_turns')::int, 0)))),
-            updated_at = NOW()
-      WHERE worker_session_id = $1 AND user_id = $2 AND kind = 'remote'
-        AND NOT EXISTS (SELECT 1 FROM claw_remote_events e WHERE e.session_id = $4 AND e.id > $5 AND e.type = 'turn_end'
-                         AND e.data->>'stopReason' = 'cancelled')`,
-    [remoteWorkerSessionId(sessionId), owner, JSON.stringify({ cancel_after: mark, after_cancel: 0 }), sessionId, mark],
-  );
+  await inTransaction(async (q) => {
+    const item = (await q(
+      "SELECT item_id, params FROM claw_work_items WHERE worker_session_id = $1 AND user_id = $2 AND kind = 'remote' FOR UPDATE",
+      [remoteWorkerSessionId(sessionId), owner],
+    )).rows[0] as { item_id: string; params: RemoteParams } | undefined;
+    if (!item) return;
+    const cancels = pendingCancels(item.params);
+    // Its end already posted (with no cancel before it still pending): it ended what was open then, and nothing is pending.
+    if (!cancels.length && (await q(
+      `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND id > $2 AND type = 'turn_end' AND data->>'stopReason' = 'cancelled' LIMIT 1`,
+      [sessionId, mark],
+    )).rows[0]) return;
+    // What may be running when it reaches the agent: with an earlier cancel pending, one of the prompts sent after that one; else
+    // one of those open now. At most one runs; queued ones are dropped with no end of theirs.
+    const last = cancels.at(-1);
+    const before = Math.min(1, last ? last.n : Math.max(0, Number(item.params?.open_turns) || 0));
+    cancels.push({ after: mark, before, n: 0 });
+    await q("UPDATE claw_work_items SET params = params || $2::jsonb, updated_at = NOW() WHERE item_id = $1",
+      [item.item_id, JSON.stringify({ cancels })]);
+  });
 }
 
 /** The newest event a remote session has posted so far: taken before a prompt is queued, as its `NotePrompt.since`. */
@@ -240,23 +255,22 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
     // An item that ended skipped what the session posted since. What came after this prompt was queued is this prompt's, but never
     // the event that ended the item, nor any before it: those belong to the turns before (one that ended as this prompt was queued,
     // or one whose end was stored but not yet applied when the item was stopped). The end of a pending cancel after that point is
-    // still the cancel's (`cancel_after`); one before it is passed over with the rest, and the cancel is no longer pending.
+    // still a pending cancel's; the cancels whose ends lie before it are passed over with the rest, and are no longer pending.
     const closedBy = Number(open.params?.closed_event_id) || 0;
     const from = Math.max(last, closedBy);
-    let cancelPending = typeof open.params?.cancel_after === "number";
-    if (open.board_state === "done" && cancelPending) {
-      const ended = (await q(
-        `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND id > $2 AND id <= $3 AND type = 'turn_end'
-            AND data->>'stopReason' = 'cancelled' LIMIT 1`,
-        [p.sessionId, Number(open.params.cancel_after), from],
-      )).rows[0];
-      if (ended) cancelPending = false;
+    const cancels = pendingCancels(open.params);
+    if (open.board_state === "done" && cancels.length) {
+      const passed = Number((await q(
+        `SELECT COUNT(*)::int AS n FROM claw_remote_events WHERE session_id = $1 AND id > $2 AND id <= $3 AND type = 'turn_end'
+            AND data->>'stopReason' = 'cancelled'`,
+        [p.sessionId, cancels[0].after, from],
+      )).rows[0].n);
+      cancels.splice(0, passed);
     }
+    // A prompt sent while a cancel is pending runs after it.
+    if (cancels.length) cancels[cancels.length - 1].n += 1;
     const patch = {
-      asked, origin: p.origin, lang, open_turns: turns,
-      ...(cancelPending
-        ? { after_cancel: (Number(open.params?.after_cancel) || 0) + 1 }
-        : typeof open.params?.cancel_after === "number" ? { cancel_after: null, after_cancel: 0 } : {}),
+      asked, origin: p.origin, lang, open_turns: turns, cancels,
       ...(open.board_state === "done" ? { waiting: [], closed_event_id: 0, last_event_id: from } : {}),
     };
     await q(
@@ -389,20 +403,26 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       // Before it, a turn that was running when the cancel was sent may still end on its own (it finished as the cancel was on its
       // way): that end is the turn's from before the cancel, never one sent after it. A further end with none of those left means the
       // cancel found nothing to end and brought no end of its own, and the count goes on from the prompts sent after it.
+      // Several cancels pending are taken in the order they were sent: each end is the oldest one's.
       let afterCancel: number | null = null;
       let beforeCancelEnd = false;
-      if (e.type === REMOTE_EVENT_TURN_END && typeof p.cancel_after === "number" && e.id > p.cancel_after) {
-        const before = Math.max(0, Number(p.before_cancel) || 0);
-        if (flat(e.data.stopReason, 40) !== "cancelled" && before > 0) {
-          p.before_cancel = before - 1;
+      let stillPending = false;
+      const cancels = pendingCancels(p);
+      if (e.type === REMOTE_EVENT_TURN_END && cancels.length && e.id > cancels[0].after) {
+        const head = cancels[0];
+        if (flat(e.data.stopReason, 40) !== "cancelled" && head.before > 0) {
+          head.before -= 1;
           beforeCancelEnd = true;
         } else {
-          afterCancel = Math.max(0, Number(p.after_cancel) || 0);
-          p.cancel_after = null;
-          p.after_cancel = 0;
-          p.before_cancel = 0;
+          cancels.shift();
+          // No end of its own came (it found nothing to end): this one is of a prompt sent after it, no longer running for the next.
+          if (flat(e.data.stopReason, 40) !== "cancelled" && cancels.length && cancels[0].before > 0) cancels[0].before -= 1;
+          if (cancels.length) stillPending = true;
+          else afterCancel = head.n;
         }
+        p.cancels = cancels;
       }
+      const sentAfter = cancels.reduce((sum, c) => sum + c.n, 0);
       if (board === "done" && e.type !== REMOTE_EVENT_SESSION_CLOSED) continue;
       if (e.type === REMOTE_EVENT_PERMISSION_REQUEST) {
         const actionId = flat(e.data.actionId, 128);
@@ -428,7 +448,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         const stop = flat(e.data.stopReason, 40);
         // A cancel ends the running turn and drops every queued prompt with no turn_end of their own: nothing sent before it is open.
         // The turn from before the cancel ended on its own: with nothing sent after the cancel, the item ends with it.
-        if (beforeCancelEnd && (Number(p.after_cancel) || 0) > 0) continue;
+        if ((beforeCancelEnd && sentAfter > 0) || stillPending) continue;
         p.open_turns = beforeCancelEnd ? 0 : afterCancel !== null
           ? (stop === "cancelled" ? afterCancel : Math.max(0, afterCancel - 1))
           : stop === "cancelled" ? 0 : Math.max(0, (Number(p.open_turns) || 0) - 1);
@@ -470,6 +490,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         const unfinished = (Number(p.open_turns) || 0) > 0;
         p.open_turns = 0;
         p.waiting = [];
+        p.cancels = [];
         await write(
           `board_state = 'done', outcome = 'dropped', last_report_kind = 'dropped', summary = $2, pending_question = NULL,
            closed_at = NOW(), attention_seq = attention_seq + $3::int`,
