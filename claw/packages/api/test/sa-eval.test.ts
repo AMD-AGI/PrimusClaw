@@ -41,7 +41,7 @@ import { fileURLToPath } from "node:url";
 import type { ToolCall } from "./e2e/agent-eval-lib.js";
 import * as readTools from "../src/assistant/read-tools.js";
 import {
-  BUILTIN_TOOLS, CAPABILITY_DENIAL, fill, oracleMcpTarget, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
+  BUILTIN_TOOLS, CAPABILITY_DENIAL, SELF_INABILITY, fill, oracleMcpTarget, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
   type Arms,
   apiQuery, caseSays, cardsOf, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
@@ -398,12 +398,17 @@ test("S16 no false denial of a capability", () => {
   const c = caseOf({ route: "answer" });
   const denied = (final: string, calls: ToolCall[] = [], over: Partial<EvalCase> = {}) =>
     failed(caseOf({ ...c, ...over }), observed({ final, calls })).includes("no false denial");
+  // The words of the first form are what a check names; "not connected" carries no verb, so it is reported by its own words.
+  assert.ok(denied("I'm not connected to GitHub, so I can't pull the open PRs.", [call("mcp__github__issue_search")]),
+    "a GitHub call that succeeded does not excuse it");
   for (const text of ["我读不了 GitHub，没法看你的 PR。", "抱歉，我无法访问 GitHub。", "我这边没有 GitHub 的工具。", "我目前不能联网。", "我没有权限查看这个 workspace",
     "我看不到你的 GitHub 仓库。", "I can't access GitHub from here.", "I don't have access to the internet.", "I'm unable to browse the web.",
     "I have no tools for that.", "I can't view GitHub from here.", "I cannot see your pull requests.", "I'm not able to view the web.",
-    "I cannot view the latest pull requests on GitHub."]) {
+    "I cannot view the latest pull requests on GitHub.", "I'm not connected to GitHub, so I can't pull the open PRs.",
+    "I'm unable to retrieve your pull requests from GitHub.", "I don't have a connection to SaFE.", "我连不上 GitHub，没法拉取 PR。",
+    "I have no way to reach the web from here."]) {
     assert.ok(denied(text), text);
-    assert.ok(CAPABILITY_DENIAL.test(text), text);
+    assert.ok(CAPABILITY_DENIAL.test(text) || SELF_INABILITY.test(text), text);
   }
   // Said after a call to what it denies failed, it may be true; in a case where refusing is right, it is not this failure.
   assert.ok(!denied("我无法访问 GitHub：令牌被拒绝了。", [call("mcp__github__issue_search", false)]));
@@ -417,7 +422,9 @@ test("S16 no false denial of a capability", () => {
   assert.ok(!denied("我不能读取 ~/.ssh 下的文件。", [], { may_deny: true }));
   // A fact about a system, or "found nothing", is not a denial.
   for (const text of ["node-7 无法访问，已经离线 2 小时。", "没有找到失败的运行。", "我查到 3 个开着的 PR。", "I don't see any failed runs today.", "The node cannot reach the registry.",
-    "I can't see any failed runs today.", "我看不到失败的运行。", "I can't see any failures on the dashboard."]) {
+    "I can't see any failed runs today.", "我看不到失败的运行。", "I can't see any failures on the dashboard.",
+    "I can't find any open PRs of yours on GitHub.", "我无法确定 SaFE 上这个节点何时恢复。", "I can't tell why the run failed; its log ends early.",
+    "I can't delete that workload on SaFE without your approval.", "我不能直接删除 SaFE 上的 workload，需要你确认。"]) {
     assert.ok(!denied(text), text);
   }
   // A failed shell command excuses a GitHub denial only when it failed at GitHub: a line of its answer is a failure that names

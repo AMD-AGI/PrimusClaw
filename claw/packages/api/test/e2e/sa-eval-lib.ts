@@ -467,15 +467,42 @@ const GITHUB_FAILED = /\b(fatal|error|denied|not found|unable|could not|failed|f
 export function falseDenials(final: string, calls: readonly ToolCall[]): string[] {
   const failed = calls.filter((x) => x.ok === false);
   const sentences = [...final.matchAll(/[^。！？!?\n]+?(?:[。！？!?\n]|\.(?=\s|$)|$)/g)].map((m) => ({ at: m.index!, text: m[0] }));
+  const sentenceAt = (at: number): string => sentences.find((x) => at >= x.at && at < x.at + x.text.length)?.text ?? final;
+  const systemsOf = (sentence: string) => DENIED_SYSTEMS.filter(([words]) => words.test(sentence)).map(([, reaches]) => reaches);
   const out: string[] = [];
-  for (const m of final.matchAll(new RegExp(CAPABILITY_DENIAL.source, "gi"))) {
-    const sentence = sentences.find((x) => m.index! >= x.at && m.index! < x.at + x.text.length)?.text ?? final;
-    const named = DENIED_SYSTEMS.filter(([words]) => words.test(sentence)).map(([, reaches]) => reaches);
+  const seen = new Set<number>();
+  const judge = (at: number, words: string, needsSystem: boolean): void => {
+    const sentence = sentenceAt(at);
+    const named = systemsOf(sentence);
+    if (needsSystem && !named.length) return;   // "I can't …" of nothing it names: an answer, not a denial
+    if (needsSystem && CONSENT.test(sentence)) return;   // "I can't delete it on SaFE without your approval": the approval flow
+    const start = sentences.find((x) => at >= x.at && at < x.at + x.text.length)?.at ?? -1;
+    if (seen.has(start) && needsSystem) return;  // one denial per sentence is enough to grade it
+    seen.add(start);
     const justified = failed.length > 0 && (named.length === 0 || named.every((reaches) => failed.some(reaches)));
-    if (!justified) out.push(m[0]);
-  }
+    if (!justified) out.push(words);
+  };
+  for (const m of final.matchAll(new RegExp(CAPABILITY_DENIAL.source, "gi"))) judge(m.index!, m[0], false);
+  for (const m of final.matchAll(new RegExp(SELF_INABILITY.source, "gi"))) judge(m.index!, m[0], true);
   return out;
 }
+
+/** A sentence about waiting for the person's yes, which is how a write goes, not an inability. */
+const CONSENT = /approv|confirm|your (?:go-ahead|ok|permission|consent)|批准|确认|同意/i;
+
+/**
+ * Broader than CAPABILITY_DENIAL, and only a denial in a sentence that names a system (`DENIED_SYSTEMS`): the assistant says that
+ * it itself is not connected, set up or allowed, or cannot or has no way to do something ("I'm not connected to GitHub, so I can't
+ * pull the open PRs", "我连不上 GitHub"). "I can't find any…" and "I can't see any failed runs" are answers about what it looked
+ * at, not inabilities, and are left out.
+ */
+export const SELF_INABILITY = new RegExp([
+  "\\bI(?:'m|’m| am)? (?:currently |still |really )?(?:not (?:connected|able|allowed|authori[sz]ed|set up|linked|integrated|signed in|logged in|permitted)"
+    + "|unable|can(?:'|’)?t|cannot|can not|have no (?:access|way|tools?|integration|connection)"
+    + "|don(?:'|’)?t have (?:access|permission|a way|the ability|any (?:access|tools?|way)|tools?|an? (?:integration|connection)))\\b"
+    + "(?!\\s+(?:find|locate|spot|tell|say|confirm|see any|see a|recall|remember))",
+  "我(目前|现在|暂时|这边|这里)?(还)?(连不上|接不上|没有接入|没接入|未接入|没有连接|没连接|未连接|没有权限|没权限)",
+].join("|"), "i");
 
 /** With `style.no_ids`: an item named only by its number ("编号 #178", "#178。") rather than by its title. */
 export const BARE_NUMBER = /编号\s*#?\d+|#\d+(?=\s*($|[，。、,.;；:：)）!！?？]))/m;
