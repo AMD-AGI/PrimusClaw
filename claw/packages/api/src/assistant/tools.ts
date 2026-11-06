@@ -23,6 +23,7 @@ import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } fr
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, SayOutcomeUnknown, SayRefused, type SayDeps } from "./outbound.js";
 import { voidStreamedSay } from "./router-speed.js";
+import { mayHandOff } from "./say-hold.js";
 import { saySources, SAY_SOURCE_OUTCOMES } from "./citations.js";
 import { metrics } from "../infra/metrics.js";
 import { internalTextIn, userWordsOf } from "./internal-text.js";
@@ -155,7 +156,7 @@ export async function say(
     // A refused say never reaches the person: what was streamed of it is taken back, so a channel does not keep it as a message
     // (2026-11-06 15:11Z: a say refused after a handoff left its first words "已把 Primus" in the person's chat).
     if (err instanceof ToolRefused && err.code !== "say_outcome_unknown") {
-      await voidStreamedSay(claims.sid, claims.mid, err.code, deps.publishSessionEvent);
+      await voidStreamedSay(claims.sid, claims.mid, err.code, deps.publishStreamVoid);
     }
     throw err;
   }
@@ -180,11 +181,13 @@ async function sayOnce(
   // A say in the turn an answer woke that names no item is about that item: recorded so, it is the say the silent sweep looks
   // for, and the answer is not announced a second time.
   const itemId = args.item_id?.trim() ? args.item_id : answerItemOf(run?.prompt);
+  // A turn that may still hand a review to the person's channel: what it says goes out when it ends, or never if it hands one over.
+  const holdForTurn = claims.mid && mayHandOff(await turnMessage((t, p) => db.query(t, p), claims.sid, claims.mid)) ? claims.mid : undefined;
   const cited = meta === undefined ? null : saySources(meta, typeof args.text === "string" ? args.text.trim() : "");
   if (cited) for (const outcome of SAY_SOURCE_OUTCOMES) metrics.onAssistantSaySources(outcome, cited.counts[outcome]);
   try {
     const out = await recordAssistantSay({
-      userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid,
+      userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid, holdForTurn,
       ...(cited?.sources.length ? { sources: cited.sources } : {}),
       guard: async (q) => {
         if ((await assertLiveRun(q, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");

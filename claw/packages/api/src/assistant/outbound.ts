@@ -19,6 +19,7 @@ import pino from "pino";
 import { CLAW_ASSISTANT_SAY_MAX_PER_HOUR, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { publishEvent } from "../events/store.js";
+import { HOLD_SECONDS, heldStatus } from "./say-hold.js";
 import { db, FAILOVER_RETRY_DELAY_MS, inTransaction, isFailoverError, neverCommitted, type Querier } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import {
@@ -75,6 +76,8 @@ export interface SayInput {
   turnMessageId?: string;
   /** What the message cites, already checked (`citations.ts`): carried by its event to the channel and the web client. */
   sources?: AssistantSaySource[];
+  /** Its deliveries are held until this turn (a message id) ends or hands a review over (`say-hold.ts`). */
+  holdForTurn?: string;
 }
 
 export interface SayDeps {
@@ -82,6 +85,8 @@ export interface SayDeps {
   maxPerHour?: number;
   publishSessionEvent?: (sessionId: string, event: Record<string, unknown>) => Promise<void>;
   kick?: () => Promise<void>;
+  /** Where a refused say's streamed text is taken back (`router-speed.ts`, `voidStreamedSay`); the session's event stream by default. */
+  publishStreamVoid?: (sessionId: string, event: Record<string, unknown>) => Promise<void>;
 }
 
 export interface SayOutcome {
@@ -129,6 +134,8 @@ interface ToStoreBase {
   userId: string;
   sessionId: string | null;
   text: string;
+  /** Held deliveries (`say-hold.ts`). */
+  hold?: { status: string; seconds: number };
 }
 
 type ToStore =
@@ -168,7 +175,7 @@ async function store(q: Querier, m: ToStore): Promise<Stored | null> {
       [m.userId, m.type],
     )).rows
     : [];
-  const subscribers = await enqueue(m.sayId, subs, payload, q);
+  const subscribers = await enqueue(m.sayId, subs, payload, q, m.hold);
   return { sayId: m.sayId, sessionId: m.sessionId, payload, subscribers };
 }
 
@@ -463,7 +470,10 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
         [input.userId],
       )).rows[0].n);
       if (recent >= limit) throw new SayCapped(limit);
-      return storeOne({ type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item, sources: input.sources });
+      return storeOne({
+        type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item, sources: input.sources,
+        ...(input.holdForTurn ? { hold: { status: heldStatus(input.holdForTurn), seconds: HOLD_SECONDS } } : {}),
+      });
     }, (late) => announce(late, deps, input.turnMessageId));
   } catch (err) {
     if (err instanceof SayCapped) throw await refusedByCap(input, text, err, deps);

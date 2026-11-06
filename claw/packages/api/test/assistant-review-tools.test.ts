@@ -1269,9 +1269,19 @@ describe("assistant review tools", { skip }, () => {
       const handoffVoids: Array<[string, string | undefined, string]> = [];
       const savedVoid = rt.reviewToolPorts.voidStreamedSay;
       rt.reviewToolPorts.voidStreamedSay = async (sid: string, mid: string | undefined, reason: string) => { handoffVoids.push([sid, mid, reason]); };
-      const voidsOf = (mid: string) => w.events.filter((e) => e.type === "toolTextVoid" && e.message_id === mid);
-      // Something else the person asked is said before the handoff, as the prompt asks: that goes through.
-      await w.mod.tools.say(turn, { text: "另外，SaFE 现在一切正常。" }, w.sayDeps);
+      const streamVoids: Recorded[] = [];
+      const voidsOf = (mid: string) => streamVoids.filter((e) => e.type === "toolTextVoid" && e.message_id === mid);
+      // A say before the handoff in the same turn (2026-11-06 gate 1b: "交给 Wei, Lei 了", then the chat's "Wei, Lei 还没绑定 GitHub"): stored,
+      // but its delivery is held until the turn ends, and the handoff drops it.
+      await w.mod.tools.say(turn, { text: "已交给 Wei, Lei 了。" }, w.sayDeps);
+      const deliveries = async (text: string) => (await w.q(
+        `SELECT o.delivered_at, o.dropped_at, o.last_status, o.next_attempt_at > NOW() AS held FROM claw_notification_outbox o
+           JOIN claw_assistant_says s ON s.say_id::text = o.event_id WHERE s.user_id = $1 AND s.text = $2`, [alice.userId, text],
+      )) as Recorded[];
+      const before = await deliveries("已交给 Wei, Lei 了。");
+      assert.equal(before.length, 1);
+      assert.equal(before[0].held, true, "not due while the turn may still hand a review over");
+      assert.equal(before[0].last_status, `held_for_turn:${turn.mid}`);
       const out = await rt.reviewStart(turn, {
         prs: ["AMD-AGI/PrimusClaw#307", "AMD-AGI/PrimusClaw#309", "AMD-AGI/Primus-SaFE#840"], merge: true, reviewer: "u-weilei",
       }) as Recorded;
@@ -1281,13 +1291,15 @@ describe("assistant review tools", { skip }, () => {
         "已把这 3 个 PR 的评审和合入交给 Wei, Lei。合入也需要他本人确认，不会自动合。", "已交给对方了。", "另外 #307 之前的评审结论是需要修改。",
       ]) {
         try {
-          await w.mod.tools.say(turn, { text: words }, w.sayDeps);
+          await w.mod.tools.say(turn, { text: words }, { ...w.sayDeps, publishStreamVoid: async (_sid: string, e: Recorded) => { streamVoids.push(e); } });
           assert.fail(`said: ${words}`);
         } catch (err) {
           assert.equal((err as { code?: string }).code, "handed_off", String(err));
         }
       }
-      assert.deepEqual(await says(), ["另外，SaFE 现在一切正常。"]);
+      assert.deepEqual(await says(), ["已交给 Wei, Lei 了。"]);
+      const after = await deliveries("已交给 Wei, Lei 了。");
+      assert.ok(after[0].dropped_at && !after[0].delivered_at, "the handoff dropped the say held before it: the chat's answer is the one message");
       // What was streamed of each refused say is taken back on the turn's stream (2026-11-06 15:11Z: "已把 Primus" stayed as a message),
       // and so is the turn's say text from the handoff on; the say that went through takes nothing back.
       assert.deepEqual(handoffVoids, [[alice.routerSid, turn.mid, "handed_off"]]);
@@ -1308,7 +1320,7 @@ describe("assistant review tools", { skip }, () => {
       assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, failed: true }, w.sayDeps), "skipped");
       // A completion that does not name the message is matched by the message its run was started for.
       assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, messageId: undefined, interrupted: true }, w.sayDeps), "skipped");
-      assert.deepEqual(await says(), ["另外，SaFE 现在一切正常。"], "nothing beside the chat's own answer");
+      assert.deepEqual(await says(), ["已交给 Wei, Lei 了。"], "nothing beside the chat's own answer");
       assert.equal(await actionsRun(), 2);
       // The same failure in a turn that handed nothing over is still told, once (F1): the check is the handoff, not the failure.
       const plain = await userTurn(alice, "309 怎么样了");
@@ -1322,7 +1334,21 @@ describe("assistant review tools", { skip }, () => {
       await w.closeRun(next.task_id);
       const bobs = await userTurn(bob, "你好");
       await w.mod.tools.say(bobs, { text: "你好！" }, w.sayDeps);
-      assert.deepEqual(await says(), ["另外，SaFE 现在一切正常。", "还在审。"]);
+      assert.deepEqual(await says(), ["已交给 Wei, Lei 了。", "还在审。"]);
+      assert.equal((await deliveries("还在审。"))[0].held, false, "a turn that cannot hand a review over is not held");
+
+      // A turn that could have handed a review over and did not: what it said is held while it runs, and goes out when it ends.
+      const asked = await userTurn(alice, "Wei, Lei 在吗", { context: ctx });
+      await w.mod.tools.say(asked, { text: "他今天在。" }, w.sayDeps);
+      assert.equal((await deliveries("他今天在。"))[0].held, true);
+      await w.closeRun(asked.task_id);
+      const kicksBefore = w.kicks();
+      assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, runIds: [asked.task_id], messageId: asked.mid }, w.sayDeps), "skipped");
+      const released = (await deliveries("他今天在。"))[0];
+      assert.equal(released.held, false, "due now");
+      assert.equal(released.last_status, null);
+      assert.ok(!released.dropped_at);
+      assert.ok(w.kicks() > kicksBefore, "and delivery is kicked");
     } finally {
       rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
         calls.start.push({ user, method, request });

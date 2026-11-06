@@ -26,6 +26,8 @@ import { detectLanguage } from "./language.js";
 import { SAY_TEXT_MAX, recordAssistantSay, recordSystemNotice, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
 import { internalTextIn, userWordsOf } from "./internal-text.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
+import { releaseHeldSays } from "./say-hold.js";
+import { kickDelivery } from "../notifications/outbox.js";
 
 const logger = pino({ name: "assistant-router-turn-end" });
 
@@ -96,6 +98,14 @@ export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}
        FROM claw_tasks WHERE session_id = $1 AND task_id = ANY($2::text[]) AND origin = 'chat'`,
     [end.sessionId, end.runIds],
   )).rows as Array<{ began: Date; prompt: string; message_id: string | null }>;
+  // What the turn said while it might still hand a review over (`say-hold.ts`) goes out now: it ended. (A handoff dropped it already.)
+  const held = new Set([end.messageId, ...runs.map((r) => r.message_id)].filter((m): m is string => !!m));
+  let released = 0;
+  for (const messageId of held) released += await releaseHeldSays((t, p) => db.query(t, p), messageId);
+  if (released) {
+    logger.info({ sessionId: end.sessionId, released }, "assistant.held_says_released");
+    await (deps.kick ?? kickDelivery)().catch((err) => logger.warn({ err }, "assistant.held_says_kick_failed"));
+  }
   if (!runs.length) return "skipped";
   const prompts = runs.map((r) => r.prompt);
   let text = lost ? turnLostNotice(prompts) : answerToDeliver(end.finalText, prompts);

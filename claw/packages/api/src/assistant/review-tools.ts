@@ -52,6 +52,7 @@ import { attendedTurn, ToolRefused } from "./tools.js";
 import { resolveWorkItemNow } from "./work-items.js";
 import { modelChoiceOn } from "./model-choice.js";
 import { voidStreamedSay } from "./router-speed.js";
+import { dropHeldSays } from "./say-hold.js";
 
 export { confirmationRef };
 
@@ -622,6 +623,9 @@ async function handOffReview(
       requester_note: note.slice(0, REQUESTER_NOTE_MAX_CHARS),
     };
     await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge, messageId: claims.mid });
+    // What the turn said before this, held until it ended (`say-hold.ts`), never goes out: the channel's answer is the one message.
+    const dropped = await dropHeldSays(q, claims.mid);
+    if (dropped) logger.info({ eventId, dropped }, "assistant.held_says_dropped_for_handoff");
     const payload: AssistantActionPayload = {
       type: "assistant.action", event_id: eventId, occurred_at: new Date().toISOString(), user_id: userId,
       message_id: claims.mid, channel_message_id: channelMessageId, action: { name: REVIEW_HANDOFF_ACTION, args: "" }, review,
