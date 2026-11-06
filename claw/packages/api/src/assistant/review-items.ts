@@ -1294,7 +1294,7 @@ export const REVIEW_FOLLOW_MS = 90_000;
 export const REVIEW_FOLLOW_BATCH = 30;
 
 /**
- * Every tick, for the open review items whose review has had its turn: what became of the pull request on GitHub
+ * Every tick, for the open review items whose review has had its turn (or was halted before it): what became of the pull request on GitHub
  * (`GithubReview.followPullRequest`). A pull request merged or closed there ends the item, and what its session still held for the
  * reviewer's answer is closed with it, so an item does not wait for ever on a confirmation nobody needs. For a review asked of someone
  * else whose requester asked for a merge, the requester's own account merges it once the reviewer's approval is on GitHub and every
@@ -1310,7 +1310,11 @@ export async function followReviewItems(now = Date.now()): Promise<number> {
       WHERE w.kind = 'review' AND w.board_state <> 'done' AND w.outcome IS DISTINCT FROM 'stopped'
         AND COALESCE(NULLIF(substring(w.params->>'followed_at' from '^[0-9]{1,15}$'), '')::bigint, 0) < $1
         AND (EXISTS (SELECT 1 FROM claw_github_confirmations c WHERE c.session_id = w.worker_session_id)
-          OR EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = w.worker_session_id AND a.tool IN ('gh_review_submit', 'gh_pr_merge') AND a.result <> 'started'))
+          OR EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = w.worker_session_id AND a.tool IN ('gh_review_submit', 'gh_pr_merge') AND a.result <> 'started')
+          -- A turn that ended without writing anything (it failed, or posted nothing), and a review the server halted: their pull
+          -- request can still be merged or closed by someone, which ends them too.
+          OR EXISTS (SELECT 1 FROM claw_tasks t WHERE t.session_id = w.worker_session_id AND t.origin = 'chat')
+          OR w.params ? 'halted')
         AND NOT EXISTS (SELECT 1 FROM claw_tasks t WHERE t.session_id = w.worker_session_id AND t.origin = 'chat' AND t.status = ANY($2::text[]))
         AND NOT EXISTS (SELECT 1 FROM claw_pending_messages m WHERE m.session_id = w.worker_session_id)
       ORDER BY COALESCE(NULLIF(substring(w.params->>'followed_at' from '^[0-9]{1,15}$'), '')::bigint, 0), w.updated_at

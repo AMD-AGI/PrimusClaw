@@ -34,7 +34,8 @@
  *   FW1 the sweep follows a finished review's pull request: the requester's merge (asked of someone else, to merge) ends the item merged,
  *       with the held merge closed and the requester's view merged; who asked, who reviews and whether the requester may merge are passed
  *   FW2 merged or closed on GitHub ends an item whatever it held; a review only is followed without the requester's merge
- *   FW3 which items are followed, and how often: one look per item per interval, none while its turn runs, before it ran, or once done/stopped
+ *   FW3 which items are followed, and how often: one look per item per interval, none while its turn runs, before it ran, or once done/stopped;
+ *       a turn that ended without writing anything is followed too
  *   FW4 the whole way, through the route and the review service: handed over to merge, bob approves and his merge is held for the risk,
  *       the sweep merges with alice's own account, the item ends merged and bob's late allow makes nothing
  */
@@ -1208,10 +1209,17 @@ describe("assistant review items", { skip }, () => {
       assert.equal(seen.length, 1, "not again within the interval");
       await ri.followReviewItems(now + ri.REVIEW_FOLLOW_MS + 1);
       assert.equal(seen.length, 2, "and again after it");
+      // A turn that ended without writing anything (it failed): its pull request is followed too.
+      await turnRan(never!.worker_session_id, "failed");
+      await ri.sweepReviewItems();
+      assert.equal((await w.item(never!.item_id)).board_state, "needs_you");
+      await ri.followReviewItems(now + ri.REVIEW_FOLLOW_MS + 2);
+      assert.ok(seen.some((f) => f.sessionId === never!.worker_session_id), "a failed turn's pull request is followed");
       // Stopped by the requester, or done: never again.
       await w.q("UPDATE claw_work_items SET board_state = 'done', outcome = 'stopped' WHERE item_id = $1", [ran!.item_id]);
+      const looked = seen.length;
       await ri.followReviewItems(now + 3 * ri.REVIEW_FOLLOW_MS);
-      assert.equal(seen.length, 2, "a stopped item is not followed");
+      assert.ok(!seen.slice(looked).some((f) => f.sessionId === ran!.worker_session_id), "a stopped item is not followed");
     } finally {
       ri.reviewItemPorts.followPullRequest = null;
     }
