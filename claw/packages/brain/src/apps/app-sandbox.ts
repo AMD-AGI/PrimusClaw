@@ -197,7 +197,7 @@ function appSpecEnv(spec: Pick<SandboxSpecCreate, "env"> | null | undefined): Re
  */
 export function appSandboxEnv(run: Pick<AppSandboxRun, "runId" | "sandboxSpec">): Record<string, string> {
   const spec = appSpecEnv(run.sandboxSpec);
-  return { ...workloadSpecEnv(spec, spec, new Set()), [APP_RUN_ID_ENV]: run.runId };
+  return { ...workloadSpecEnv(spec, spec, [], new Set()), [APP_RUN_ID_ENV]: run.runId };
 }
 
 /**

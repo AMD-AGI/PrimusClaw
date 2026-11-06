@@ -60,3 +60,8 @@ test("the spec's own plain settings are baked into the workload; its credential-
   const env = { ...PLUMBING, ...spec, OVERRIDDEN: "planted-by-user", SYSTEM_SETTING: "planted-system" };
   assert.deepEqual(workloadSpecEnv(env, spec), { ...PLUMBING, BOOT_MODE: "fast" });
 });
+
+test("a Hands setting name set by the owner's variables or the request's env is the user's, and stays out of the workload", () => {
+  const env = { ...PLUMBING, BG_SHELL_CUSTOM_VALUE: "planted-user", ENVD_CUSTOM_VALUE: "planted-session", BG_SHELL_MAX_CONCURRENT: "2" };
+  assert.deepEqual(workloadSpecEnv(env, {}, ["BG_SHELL_CUSTOM_VALUE", "ENVD_CUSTOM_VALUE"]), { ...PLUMBING, BG_SHELL_MAX_CONCURRENT: "2" });
+});

@@ -267,6 +267,13 @@ test("a change in the owner's stored variables is a change in an ordinary sandbo
   );
 });
 
+test("a Hands-setting name in the owner's variables or the request's env never reaches the workload, though Hands gets it", async () => {
+  const r = await sandboxEnvOf({ user_env: { BG_SHELL_CUSTOM_VALUE: "planted-user" }, session_env: { ENVD_CUSTOM_VALUE: "planted-session" } } as Partial<ExecuteRequest>);
+  assert.deepEqual([r.handsEnvFile.BG_SHELL_CUSTOM_VALUE, r.handsEnvFile.ENVD_CUSTOM_VALUE], ["planted-user", "planted-session"],
+    "control: the user-env gate admits these names, so they are in the composed environment");
+  for (const [name, value] of Object.entries(r.created.env)) assert.ok(!value.startsWith("planted-"), `${name} carries a user layer's value`);
+});
+
 test("the deployment's system env is in an ordinary sandbox and in none of a marked one, in either place its environment travels", async () => {
   const ordinary = await sandboxEnvOf({});
   for (const env of handsEnvOnly(ordinary)) {

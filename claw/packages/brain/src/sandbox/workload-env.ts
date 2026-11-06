@@ -93,22 +93,31 @@ export function looksLikeCredential(name: string, value: string): boolean {
  * out; so is every other layer -- the deployment's system env and the owner's
  * stored variables -- whatever it is called.
  *
+ * Hands' runtime settings are kept only when no user layer set the name: the
+ * owner's stored variables and the request's env are the user's own, and a
+ * user layer may carry such a name (the user-env gate admits some prefixes),
+ * so its value is never written to the workload.
+ *
  * @param env The composed sandbox environment; not modified.
  * @param specEnv The sandbox spec's own env, the only layer kept by name.
+ * @param userLayerNames Names the owner's variables or the request's env set.
  * @param allowed The names the workload may carry besides those.
  */
 export function workloadSpecEnv(
   env: Record<string, string>,
   specEnv: Record<string, string> = {},
+  userLayerNames: Iterable<string> = [],
   allowed: ReadonlySet<string> = HANDS_WORKLOAD_ENV_NAMES,
 ): Record<string, string> {
+  const fromUser = new Set(userLayerNames);
   const out: Record<string, string> = {};
   for (const [name, value] of Object.entries(env)) {
     if (PLATFORM_CREDENTIAL_ENV.has(name)) continue;
     if (allowed.has(name)) { out[name] = value; continue; }
     if (looksLikeCredential(name, value)) continue;
     const fromSpec = Object.prototype.hasOwnProperty.call(specEnv, name) && specEnv[name] === value;
-    if (fromSpec || isHandsRuntimeSetting(name)) out[name] = value;
+    const handsSetting = isHandsRuntimeSetting(name) && !fromUser.has(name);
+    if (fromSpec || handsSetting) out[name] = value;
   }
   return out;
 }

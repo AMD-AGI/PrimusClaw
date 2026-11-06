@@ -2837,7 +2837,10 @@ async function provisionHands(
       // Credentials stay out of the workload: SaFE returns its env to every
       // caller allowed to read the workload. The full environment reaches
       // Hands through bootstrap's env file below (sandbox/workload-env.ts).
-      env: workloadSpecEnv(env, action.params.env ?? {}),
+      env: workloadSpecEnv(env, action.params.env ?? {}, [
+        ...Object.keys(sandboxUserEnv(request)),
+        ...Object.keys(request.session_env ?? {}),
+      ]),
       labels,
       timeoutSec,
       ttlSec: ttlSeconds,
