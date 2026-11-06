@@ -27,6 +27,8 @@
  *   HD15 a write held for a person who writes Chinese: what the worker found is said first, then the write is put to them in Chinese,
  *        as what it would do and what it would post, never as the tool's name; with a channel that draws it, the same order
  *   HD16 a person who writes English is asked as before, and a hold with nothing reported before it says nothing first
+ *   HD17 the plain words say every field the write sets: a pull request's new title and base, an issue's labels, a draft pull
+ *        request; a field the words do not know is still shown, as key=value, on the card and in the needs-you message
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -603,5 +605,50 @@ describe("assistant holds", { skip }, () => {
     const text = rows[0].payload.text as string;
     assert.ok(text.startsWith(`#${item.seq} "Comment on PR 322" needs your approval to: Post a comment on AMD-AGI/PrimusClaw#322 as your GitHub account.`), text);
     assert.ok(text.includes(COMMENT.body));
+  });
+
+  test("HD17 the plain words say every field the write sets, and show the ones they do not know", async () => {
+    await wrote("把 AMD-AGI/PrimusClaw#5 的标题和 base 改一下，再开个 issue 和一个草稿 PR。");
+    await subscribe("alice", ["assistant.say", "work_item.needs_you"], ["trigger", "long_run"]);   // draws no request
+    const ask = async (title: string, tool: string, input: Record<string, unknown>) => {
+      await w.q("TRUNCATE claw_notification_outbox");
+      const item = await w.createItem(alice, title);
+      const turn = await w.workerTurn(item.itemId);
+      await deliver(item.workerSid, held({ tool: `mcp__github__${tool}`, input, summary: "", message_id: turn.mid }));
+      const rows = await outbox();
+      assert.deepEqual(rows.map((r) => r.payload.type), ["work_item.needs_you"]);
+      return { pending: (await w.item(item.itemId)).pending_question as string, text: rows[0].payload.text as string, item };
+    };
+
+    // A pull request whose title and base change: both are said, with the new values; the new description is the detail.
+    const update = await ask("改 PR #5", "pr_update", { repo: "o/r", number: 5, title: "Fix the cut", base: "release", body: "New description." });
+    const updated = "修改 o/r#5：标题改为「Fix the cut」，base 改为 release，正文改为下文";
+    assert.equal(update.pending, `需要你批准：${updated}`);
+    assert.ok(update.text.startsWith(`#${update.item.seq} 改 PR #5 需要你批准一个操作：${updated}。\n内容如下：\n---\nNew description.\n---`), update.text);
+    // Closing it with a new base: the base is not dropped behind the close.
+    const close = await ask("关 PR #6", "pr_update", { repo: "o/r", number: 6, base: "main", state: "closed" });
+    assert.equal(close.pending, "需要你批准：修改 o/r#6：base 改为 main，关闭它");
+
+    // An issue's labels.
+    const issue = await ask("开 issue", "issue_create", { repo: "o/r", title: "Flaky test", body: "It flakes.", labels: ["bug", "flaky-test"] });
+    assert.equal(issue.pending, "需要你批准：以你的 GitHub 账号在 o/r 新建 issue「Flaky test」，标签：bug, flaky-test");
+
+    // A draft pull request is said to be one; a field the words do not know is shown as the target shows it.
+    const pr = await ask("开草稿 PR", "pr_create", { repo: "o/r", head: "fix/x", base: "main", title: "Fix x", draft: true, maintainer_can_modify: false });
+    const opened = "以你的 GitHub 账号在 o/r 开一个草稿 PR「Fix x」（fix/x → main）（另设 maintainer_can_modify=false）";
+    assert.equal(pr.pending, `需要你批准：${opened}`);
+    assert.ok(pr.text.includes(`需要你批准一个操作：${opened}。`), pr.text);
+
+    // With a channel that draws the request, the text said before the card (there is one: the new description) and the card's
+    // summary carry the same words.
+    await w.q("TRUNCATE claw_notification_outbox, claw_notification_subscriptions");
+    await channel();
+    const item = await w.createItem(alice, "改 PR #7");
+    const turn = await w.workerTurn(item.itemId);
+    await deliver(item.workerSid, held({ tool: "mcp__github__pr_update", input: { repo: "o/r", number: 7, title: "T2", base: "release", body: "D2" }, summary: "", message_id: turn.mid }));
+    const card = await outbox();
+    assert.deepEqual(card.map((r) => r.payload.type), ["assistant.say", "approval.requested"]);
+    assert.equal(card[0].payload.text, `#${item.seq} 改 PR #7 要做的操作：修改 o/r#7：标题改为「T2」，base 改为 release，正文改为下文。\n内容如下：\n---\nD2\n---\n在下面的卡片上批准或拒绝。`);
+    assert.equal(card[1].payload.summary, "修改 o/r#7：标题改为「T2」，base 改为 release，正文改为下文");
   });
 });

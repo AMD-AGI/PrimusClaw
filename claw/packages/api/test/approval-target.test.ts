@@ -7,7 +7,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { APPROVAL_TARGET_MAX, approvalTarget, redactCommandSecrets } from "../src/notifications/approval-target.js";
+import { APPROVAL_TARGET_MAX, approvalAction, approvalTarget, redactCommandSecrets } from "../src/notifications/approval-target.js";
 
 const GH = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
 
@@ -153,4 +153,21 @@ test("redactCommandSecrets is idempotent and leaves ordinary text alone", () => 
   const once = redactCommandSecrets(`GH_TOKEN=abc123 curl -u a:b https://h --token zzz`);
   assert.equal(redactCommandSecrets(once), once);
   assert.equal(redactCommandSecrets("git log --oneline -5"), "git log --oneline -5");
+});
+
+test("approvalAction says every field a GitHub write sets, and shows the ones its words do not know", () => {
+  const say = (tool: string, input: Record<string, unknown>, zh = false) => approvalAction(`mcp__github__${tool}`, input, zh).action;
+  assert.equal(say("pr_update", { repo: "o/r", number: 5, title: "New", base: "release" }), 'Change o/r#5: title to "New", base to release');
+  assert.equal(say("pr_update", { repo: "o/r", number: 5, title: "New", base: "release" }, true), "修改 o/r#5：标题改为「New」，base 改为 release");
+  assert.equal(say("pr_update", { repo: "o/r", number: 5, body: "b", state: "open" }), "Change o/r#5: description to the text below, reopen it");
+  assert.equal(say("issue_create", { repo: "o/r", title: "T", labels: ["bug"] }), 'Open an issue "T" in o/r labelled bug as your GitHub account');
+  assert.equal(say("pr_create", { repo: "o/r", head: "h", base: "main", title: "T", draft: true }), 'Open a draft pull request "T" in o/r (h → main) as your GitHub account');
+  assert.equal(say("pr_create", { repo: "o/r", head: "h", base: "main", title: "T", draft: false }), 'Open a pull request "T" in o/r (h → main) as your GitHub account');
+  assert.equal(say("pr_request_reviewers", { repo: "o/r", number: 5, reviewers: ["a"], team_reviewers: ["t"] }), "Ask a, t to review o/r#5");
+  // A field added to a tool later, or a value the words cannot say, is shown and masked, not dropped.
+  assert.equal(say("pr_update", { repo: "o/r", number: 5, milestone: 3, state: "weird" }), "Change o/r#5 (also setting milestone=3 state=weird)");
+  const leaked = say("issue_comment", { repo: "o/r", number: 5, body: "x", token: GH });
+  assert.ok(!leaked.includes(GH) && /also setting token=/.test(leaked), leaked);
+  // The body is the detail, not a field to repeat.
+  assert.deepEqual(approvalAction("mcp__github__issue_comment", { repo: "o/r", number: 5, body: "hi" }, false), { action: "Post a comment on o/r#5 as your GitHub account", detail: "hi" });
 });
