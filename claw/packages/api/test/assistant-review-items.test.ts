@@ -303,8 +303,11 @@ describe("assistant review items", { skip }, () => {
   });
 
   test("V5 the hourly limits are asked before anything is made, and say how many more fit", async () => {
-    // bob's account: one session wrote in the hour, one open review has not written yet. The limit is 3, so one more fits.
+    // bob's account: one session wrote in the hour, one open review has not written yet. The limit is 3, so one more fits. Writes bob made
+    // with his own GitHub tools in two more sessions (a comment, a pull request, approved by him) are no reviews and do not count.
     await audit("s-old", "gh_review_submit", "ok", "submitted", "bob", true);
+    await audit("s-mcp-1", "github_mcp.issue_comment", "ok", "", "bob", true);
+    await audit("s-mcp-2", "github_mcp.pr_create", "ok", "", "bob", true);
     await one("carol", { acting_as: "bob" });
     checks = [];
     const two = await start("alice", { prs: [PR(300), PR(301)], acting_as: "bob" });

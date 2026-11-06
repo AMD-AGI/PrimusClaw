@@ -41,7 +41,7 @@ import { actingUserOf } from "../github-review/acting-as.js";
 import { GithubClient } from "../github-review/github.js";
 import { summarise } from "../github-review/service.js";
 import { GITHUB_PROVIDER, MIN_MCP_SECRET_LENGTH } from "../github-review/settings.js";
-import { auditFinish, auditStart, type Queryable } from "../github-review/store.js";
+import { GITHUB_MCP_AUDIT_TOOL_PREFIX, auditFinish, auditStart, type Queryable } from "../github-review/store.js";
 import { mintSessionToolToken, verifySessionToolToken } from "../github-review/token.js";
 import {
   GITHUB_MCP_PATH, GITHUB_MCP_TOKEN_TTL_SECONDS, GITHUB_TOKEN_ENV_NAME, readGithubMcpSettings, type GithubMcpSettings,
@@ -118,13 +118,14 @@ function purposeOf(body: unknown): string {
 /**
  * Each call made with a binding, written to GitHub review's audit log before it runs and finished after (as the review tools write
  * theirs): who, which session, which tool, its arguments summarised (never a body's text), what GitHub was asked and how it ended.
- * A call whose row cannot be written is not made.
+ * A call whose row cannot be written is not made. Its tool name (`github_mcp.<tool>`) keeps it out of every count of reviews and of a
+ * review session's request budget (`REVIEW_ROWS_ONLY`).
  */
 function bindingAudit(q: Queryable, claims: { sessionId: string; requesterUserId: string; actorUserId: string }, gh: GithubClient): GithubToolCallHook {
   return async (tool, args) => {
     let id: number;
     try {
-      id = await auditStart(q, { requesterUserId: claims.requesterUserId, actorUserId: claims.actorUserId, sessionId: claims.sessionId, tool: `${PURPOSE_PREFIX}.${tool}`, args: summarise(args) });
+      id = await auditStart(q, { requesterUserId: claims.requesterUserId, actorUserId: claims.actorUserId, sessionId: claims.sessionId, tool: `${GITHUB_MCP_AUDIT_TOOL_PREFIX}${tool}`, args: summarise(args) });
     } catch (err) {
       logger.error({ tool, code: (err as { code?: string })?.code ?? "" }, "github_mcp.audit_unavailable");
       return null;

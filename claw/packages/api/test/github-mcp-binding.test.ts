@@ -207,6 +207,14 @@ describe("D a GitHub binding serves an owner who keeps no GH_TOKEN", () => {
     assert.deepEqual([rows.length, rows[0].tool, rows[0].write, rows[0].result, rows[0].repo, rows[0].pr], [1, "github_mcp.issue_comment", true, "ok", "o/r", 7]);
     assert.equal((rows[0].arguments as Record<string, unknown>).body, `[${body.length} characters]`);
     assert.ok(!JSON.stringify(rows).includes("private remark"));
+    // It is the owner's own write, not a review: GitHub review's hourly count and its session budget do not see it.
+    const { recentWrites, sessionRequestCount } = await import("../src/github-review/store.js");
+    assert.equal((await recentWrites(db, "u-alice", 3_600_000)).count, 0);
+    assert.equal((await recentWrites(db, null, 3_600_000)).count, 0);
+    assert.equal(await sessionRequestCount(db, "s-1"), 0);
+    await sql("INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, write, github_requests, head_sha) VALUES ('u-alice', 'u-alice', 's-1', 'gh_review_submit', TRUE, 2, 'abc')");
+    assert.equal((await recentWrites(db, "u-alice", 3_600_000)).count, 1, "a review still counts");
+    assert.equal(await sessionRequestCount(db, "s-1"), 2);
   });
 
   test("D4b a call GitHub refuses is audited as refused", async () => {
