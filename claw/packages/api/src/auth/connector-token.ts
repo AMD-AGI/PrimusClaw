@@ -25,8 +25,14 @@
  *     the connector scope. A token for another audience or purpose is refused.
  *   - A token cannot be revoked by checking it locally, so it is good until it
  *     expires (minutes). With `CLAW_CONNECTOR_TOKEN_INTROSPECT` on, the provider
- *     is also asked whether it is still active (cached for a few seconds by the
- *     client), and a revoked grant stops being honoured at once.
+ *     is also asked whether it is still active, and a revoked grant stops being
+ *     honoured within `CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS` (5 by
+ *     default): the identity client keeps an answer for 30 seconds for every
+ *     caller, and a connector token is judged by none older than that. The one
+ *     exception is a provider that cannot be asked: then the last active answer
+ *     is used inside the client's stale window, never past the token's own
+ *     expiry (checked above), so an outage bounds a revocation by the token's
+ *     lifetime, as with introspection off.
  *
  * Off unless remote agents and the identity client are both on; with either off
  * this path abstains and the request is judged by the credentials it already had.
@@ -106,7 +112,7 @@ export async function verifyConnectorToken(req: FastifyRequest, pathname: string
       return reject("subject", refuse(401, "invalid_token", "the access token names no usable subject"));
     }
     if (settings.introspect) {
-      const answer = await identity.introspect(token, { tokenTypeHint: "access_token" });
+      const answer = await identity.introspect(token, { tokenTypeHint: "access_token", maxAgeMs: settings.introspectMaxAgeMs });
       if (!answer.active || (answer.sub !== undefined && answer.sub !== sub)) {
         return reject("inactive", refuse(401, "invalid_token", "the access token is no longer active"));
       }
@@ -168,7 +174,8 @@ export async function tokenRevoked(req: FastifyRequest): Promise<boolean> {
   const header = req.headers.authorization;
   if (!identity || !header?.startsWith("Bearer ")) return false;
   try {
-    return !(await identity.introspect(header.slice(7).trim(), { tokenTypeHint: "access_token" })).active;
+    const { introspectMaxAgeMs } = connectorTokenSettings();
+    return !(await identity.introspect(header.slice(7).trim(), { tokenTypeHint: "access_token", maxAgeMs: introspectMaxAgeMs })).active;
   } catch (err) {
     if (err instanceof IdentityUnavailableError) return false;
     throw err;

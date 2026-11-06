@@ -4,10 +4,11 @@
 export { sleep } from "./async.js";
 export { constantTimeEquals } from "./security/constant-time.js";
 export {
-  redactSecrets, safePreview, scanForSecretLeak, looksLikeCredentialValue,
+  redactSecrets, redactLogSecrets, safePreview, scanForSecretLeak, looksLikeCredentialValue,
   looksLikeVersionString, isCredentialFreeLocator,
   type RedactResult, type ScanHit,
 } from "./security/redact-secrets.js";
+export { redactStoredText, redactStoredValue } from "./security/stored-secrets.js";
 export { isSensitiveKey } from "./security/sensitive-keys.js";
 export { coerceToolInput, isPlainObject } from "./tool-input.js";
 export {

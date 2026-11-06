@@ -55,6 +55,11 @@ export interface MultiNodeEnsureOptions {
   deliveryCount?: number;
   /** SaFE API key of the requesting user; required by the safe provider. */
   platformKey?: string;
+  /**
+   * Workspaces the session's workloads were recorded in (session-scoped lookups). A non-admin key may
+   * only list workloads in a named workspace; none given keeps the unscoped list.
+   */
+  workspaces?: string[];
   /** The run's cancel signal: aborting ends the wait for the cluster and deletes it. */
   signal?: AbortSignal;
   /** False when that signal's abort is not a cancel (restart, successor, deadline):

@@ -120,7 +120,10 @@ A webhook must be https and must resolve to a public address. A host named in
 `CLAW_A2A_PUSH_ALLOWED_HOSTS` (comma separated) is the operator's exception, the
 only place plain http is accepted, for an in-cluster receiver. The check runs
 when the config is created and again at every delivery, which connects to the
-address that was checked. Delivery is at least once and in order per config,
+address that was checked. With `CLAW_A2A_PUSH_ALLOWED_HOSTS_ONLY=true` the list
+is the whole of it: a host it does not name is refused even when it is public, at
+creation and again at every delivery, for a deployment whose receivers are all its
+own. Delivery is at least once and in order per config,
 retried with backoff and abandoned after an hour.
 
 ## Not supported

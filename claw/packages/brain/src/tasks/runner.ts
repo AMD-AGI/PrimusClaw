@@ -1614,6 +1614,26 @@ class TaskRunner {
     }
   };
 
+  /**
+   * Persist a turn caught part-way through its tool calls (`PendingTurn`).
+   *
+   * Not skipped once the run is aborted, unlike `onCheckpoint`: a call that
+   * finished just as a drain began is the one a resumed run must be told
+   * about, or it asks the model again and the call is made twice. Skipped
+   * only once the run has settled (`taskFinished`), which is also what keeps
+   * it from landing under the SIGTERM path's own write: that path latches
+   * the flag before it reads `latestCheckpointState`, and so persists this
+   * state itself. No workspace sync: the boundary checkpoint schedules those.
+   */
+  private readonly onTurnJournal = async (state: CheckpointState): Promise<void> => {
+    if (this.taskFinished) return;
+    this.latestCheckpointState = state;
+    const written = await this.writeKvCheckpoint(state, this.currentWorkspaceInfo());
+    if (!written) {
+      throw new Error(`turn journal KV write failed at turn ${state.turns_completed}`);
+    }
+  };
+
   private readonly onCheckpoint = async (state: CheckpointState): Promise<void> => {
     if (this.abortCtrl.signal.aborted || this.taskFinished) {
       logger.debug(
@@ -3214,6 +3234,7 @@ class TaskRunner {
         result = await this.engine.execute(this.request, this.onEvent, this.abortCtrl.signal, this.workHands(), {
           recreateHands: this.recreateHands,
           onCheckpoint: this.onCheckpoint,
+          onTurnJournal: this.onTurnJournal,
           onCacheUse: this.onCacheUse,
           resumeCheckpoint: this.resumeCheckpoint,
           attachHands: this.attachHands,

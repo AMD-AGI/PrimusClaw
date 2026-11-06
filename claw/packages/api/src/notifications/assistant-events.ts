@@ -56,7 +56,7 @@ export interface AssistantSaySource {
   n: number;
   url: string;
   title: string;
-  kind: "web" | "github_pr" | "github_issue" | "github_repo" | "github_check" | "github_file";
+  kind: "web" | "github_pr" | "github_issue" | "github_repo" | "github_check" | "github_file" | "board";
 }
 
 /**
@@ -98,9 +98,22 @@ export interface AssistantSayPayload extends AssistantEventBase {
   confirm_action?: AssistantConfirmAction;
   /** Present only when the message cites any (`CLAW_ASSISTANT_CITATIONS`); a receiver that does not read it shows the text alone. */
   sources?: AssistantSaySource[];
+  /**
+   * Present only when the router suggested any (`CLAW_ASSISTANT_SUGGESTED_REPLIES`): up to three short replies the user may send
+   * next, each one plain line. A channel shows them as buttons that send the words as the user's message; one that cannot ignores them.
+   */
+  suggested_replies?: string[];
   confirm_write?: AssistantConfirmWrite;
   /** Files the user gets with the message (a worker's deliveries, `deliveries.ts`): one download each. */
   files?: AssistantFile[];
+  /**
+   * The `event_id` of an earlier message of this turn that this one adds to: the system's start notice of an item, after which the
+   * router's words belong in that same message. A channel that still has that message shows it with these words added (its text, a
+   * blank line, this text); one that does not shows this as a message of its own.
+   */
+  amends?: string;
+  /** A system notice's: the message id of the turn it answers (what an `amends` of that turn is matched by). */
+  turn_message_id?: string;
 }
 
 /** The system's own message, sent when an item has needed the user for a while and nobody has said so. */
@@ -126,6 +139,12 @@ export interface AssistantReviewHandoff {
   prs: Array<{ owner: string; repo: string; number: number }>;
   merge: boolean;
   requester_note: string;
+  /**
+   * What the router said in the same turn before handing the review over (another question of the person's answered), in order. Held
+   * and never delivered on its own (`say-hold.ts`), so the channel's one answer carries it: the channel adds it to that answer. Absent
+   * when nothing was said.
+   */
+  held_says?: string[];
 }
 
 /** The name an `assistant.action` carries when it is a handoff rather than one of the channel's own commands. */

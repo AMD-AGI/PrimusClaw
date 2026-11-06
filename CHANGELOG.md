@@ -28,15 +28,47 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A review item's pull request is followed after its turn (`gh_pr_follow`, the review items' sweep, at most every 90 s per item):
+  merged or closed on GitHub ends the item and closes what its session still held for the reviewer's answer. For a review asked of
+  someone else that may merge, the requester's own GitHub account merges their pull request once the reviewer's approval of the head
+  is on GitHub, CI is green, no thread is open and the merge state is CLEAN, instead of waiting for the reviewer to confirm a held
+  merge; the held merge closes as merged by the requester. One acting user may now be asked about 30 writes at once (was 10).
+- Remote connector presence over time: every change of a connector's presence is recorded, the connector list gives
+  `last_seen_at`, `offline_since` and `offline_reason` (`auth_expired`, `no_heartbeat`), and a connector offline for 5 minutes
+  is reported once to its owner through their assistant with when it was last seen and the command that brings it back, then
+  once more when it is back. The seconds-long breaks a Claw release causes are never reported.
+- The assistant router's `say` takes an optional `suggested` (`CLAW_ASSISTANT_SUGGESTED_REPLIES`, default on): up to three short
+  replies the user is likely to send next. They are checked (one plain line of at most 30 code points each, no address, markup, slash
+  command or internal text, none twice; one that does not fit is left out and never refuses the message) and carried by
+  `assistant.say` and the session's `AssistantSay` as `suggested_replies`, for a channel to show as buttons that send them.
+- Citations of the agent board: `CLAW_ASSISTANT_CITE_LINK_SERVERS` (`agent-board=https://host/board/`, default none) names plugin
+  read servers whose JSON results carry their own pages as `html_url`; a router turn that reads one sends them as
+  `ExecuteRequest.cite.link_servers`, and Brain keeps the `html_url` of each top-level result object under that prefix as a source of
+  the new kind `board`. A `say` that cited a board issue it had read lost the source before (no lookup of the turn had returned it).
+- The router's read section says what it can do, from the tool catalog (`router-read-v7`): reads at once; every write of its
+  servers, GitHub's and anything needing code or a run through a work item whose worker asks the user before each write; never
+  "read-only", and never a system failure (a sandbox that would not start, a 403) as a limit.
 - Three GitHub writes, each held for the user's decision like every write of the `github` server: `checks_rerun_failed` (run
   again the failed jobs of a GitHub Actions workflow run; `checks_list` now gives a job's `run_id`), `pr_request_reviewers` (people
   and teams) and `labels_set` (the whole list of an issue's or pull request's labels). None is a router read.
-- An assistant router turn lists the user's own remote connectors itself: `connector_list` (where `CLAW_REMOTE_AGENTS_ENABLED` is on)
-  answers each connector's name, whether it is online, when it was last seen and the agents it offers, with how many there are and
-  how many are online. It only reads the caller's rows, as `GET /v1/remote-agents/connectors` does, and a router may still call it
-  after another lookup has answered. The names are what the connector program reported, so they are untrusted: the call marks the
-  turn as having read untrusted text, as `work_recall` does, and is one of the router's `read_taint` sources, so the rest of the
-  turn cannot act for the user (`work_create`, `work_send`, reviews, schedules and the other acting tools are refused).
+- An assistant's router turn diagnoses a failure itself: of the assistant plugin's servers it is offered SaFE's `workload_logs`,
+  `workload_events`, `workload_pod_logs`, `workload_pod_containers`, `node_pod_logs`, `node_reboot_logs`, `cluster_logs` and
+  `flavor_avail`, and the agent board's `notification_read` and `milestone_read`; the user's scheduled tasks (`trigger_list` of
+  the turn's own `schedules` server, kept only when this API minted its bearer for this turn's session, message and run); and the plugin's
+  `teams-reply-style` rule. Its log reads go to Brain as the new `ExecuteRequest.log_reads` (each read's line-counting
+  argument, empty for `workload_pod_containers`, which counts nothing but whose termination messages can hold a log's end):
+  Brain asks for at most 40 lines or entries, masks credential-shaped text in the answer before the model, an event or a log
+  line sees it (new `redactLogSecrets` of @claw/utils: `redactSecrets`; values after a credential's name, where an unquoted
+  value runs to its line's end, or to the closing quote of the string its name is in, and no separator or bracket ends it; Kubernetes environment variables named like a credential; armored private keys, OpenPGP ones
+  included, and a key whose BEGIN line the tail cut off, from its first base64 line), and keeps the last 6000 characters of a
+  plain-text answer.
+- An assistant router turn answers about the user's development environments itself: `devenv_list` (where
+  `CLAW_REMOTE_AGENTS_ENABLED` is on) lists their own machines (online, last seen, version, agents) and every agent session on them
+  (open through Claw, or the agent's own conversation a connector offers to take over) with its state, folder, last activity, a
+  label and the command that attaches the chat to it; `detail: "activity"` adds what each one is doing in the agent's words.
+  Either read marks the turn as having read untrusted text; such a turn may still put the attach command of one of the user's own
+  sessions to them as a button, and nothing else. The router prompt treats 开发环境 / dev box / my machine as the connector, never as
+  a SaFE workspace, and "connect me to it" as `channel_action` with that attach command. Only the caller's rows are read.
 - Citations for the assistant router's answers, behind `CLAW_ASSISTANT_CITATIONS` (default off). The router writes [1], [2] in its
   `say` and names each number's address in `say`'s new `sources` argument; the new `ExecuteRequest.cite` makes Brain keep the sources
   the turn's own lookups returned (`web_search` hits and what the API's GitHub server lists in its results' `_meta["claw/sources"]`:
@@ -721,6 +753,17 @@ record it.
   like the platform defaults instead of being inlined.
 
 ### Security
+- What the API stores of a conversation now has credentials masked before it is written: session events (`claw_session_events`,
+  as the event consumer, the message route and the A2A route write them), conversation turns (`claw_conversation_turns`) and the
+  words an assistant's router turn answers (`claw_assistant_messages`). The new `redactStoredText` / `redactStoredValue`
+  (`@claw/utils`) add to `redactSecrets` a SaFE API key (`ak-...`), a short `Bearer` token with a digit in it, an armored private
+  key, and a value written after a credential's name (`password=`, `"api_key": "..."`, `token: ...`), leaving code, placeholders and
+  sentences alone (`password = getPassword()`, `password: string`, `${DB_PASSWORD}`, `"Enter your password"`). Identifier fields
+  (`id`, `*_id`, `*Id`: `message_id`, `tool_use_id`, `actionId`, ...) holding one token are stored as they are, whatever their shape,
+  since readers match stored rows on them (a 64-hex A2A `messageId` is not a credential). Only the stored copy
+  is masked: the turn's prompt reaches Brain as written, and a router turn run again on the fallback model is given its prompt as the
+  model first was when that prompt is the stored message. Later turns read their history from the masked rows. Rows written before
+  this change are not rewritten.
 - Claw works with a sandbox Router that runs with `--enable-auth`. With `SANDBOX_ROUTER_AUTH_ENABLED` on, every Hands
   request that goes through the Router's port proxy (`SANDBOX_HANDS_VIA_ROUTER`) presents the sandbox owner's platform key
   in `Authorization`: Brain's MCP client, health checks, shell records and the sweeper, and the API's changes view and
@@ -859,6 +902,20 @@ record it.
 - A work item's worker whose item waits for a person (`needs_you`) or is `done` no longer keeps its sandbox for background work: past
   `WAITING_ITEM_SANDBOX_RELEASE_SECONDS` (API, default 900) of quiet with nothing queued, the orphan sweep stops it, and the next turn
   starts a fresh one. A review session's leftover test Postgres had held global-cpu sandboxes for up to two hours behind held merges.
+- Brain: deleting a session owned by a non-admin key (every ordinary user, and service identities such as `sa-eval-bot`,
+  `sa-release-gate` and `dispatron-service`) no longer stops at `cleanup_incomplete_parked`. The session-scoped SaFE workload
+  list named no workspace, which SaFE answers with 403 for any key that is not an admin's, so teardown read it as
+  `mn.safe_lookup_failed`. When the unscoped list is refused with 403, teardown and the multi-node idle sweep now list in
+  the workspace the session recorded (its `hands.<sid>` binding's `namespace`), one list per workspace when there are several;
+  a key that may read the unscoped list (an admin's) keeps reaching every workspace.
+- The assistant router sees each person a message names with their address and other handles beside their user id (`People in
+  this message`), so it can pick one of two people with the same name from the reply that names them (`确认 Wei, Lei (weil2)`).
+- The sandbox's E2B file API takes an absolute path as that path. `files.write('/tmp/x')` wrote `<workspace>/tmp/x`, so a
+  command reading `/tmp/x` found nothing, and a process `cwd` of `/tmp` ran in `<workspace>/tmp`. An unsealed sandbox's file calls
+  run under the uid its commands get, so the mapping bounded nothing; they now follow E2B (absolute paths as given, relative ones
+  under the workspace, responses name the absolute path). A sealed sandbox keeps its grant's workspace-rooted paths (`/in` is
+  `<workspace>/in`), and a sealed path that would leave the workspace is refused with `permission_denied` "path escapes the
+  sandbox root". Ships in the envd injector image.
 - The GitHub list reads (`issue_search`, `pr_list`, `issue_list`, `repo_list`, `code_search`) answer the whole list a question
   asks for: `{ total_count, shown, complete, next_page?, items }`, pages of 50 by default (up to 100), and an answer of at most
   `GITHUB_LIST_MAX_CHARS` that Brain keeps whole (any other result is still cut to its head and tail at 6000 characters, which
@@ -879,6 +936,20 @@ record it.
   to `finishing` once the task's lease has been gone, and the task closed, for `LEASE_LOST_GRACE_SEC`, so the existing
   finish-only dispatch stops its sandboxes and revokes its grant (`sweeper.abandoned_app_runs_to_finishing`); a finish
   that fails every one of its bounded hand-overs is left for an operator, as before.
+- An assistant message no channel can carry is no longer silent: one stored with no notification subscription for its type is counted
+  (`claw_assistant_say_unreachable_total{type}`) and logged as `assistant.say_unreachable` with the user and the item, once per user
+  per clock hour across replicas. The silent sweep takes a message as told only when it was delivered or has an outbox row still queued
+  and not failed, so a fallback stored while nothing could carry it no longer counts; once a subscription takes its type, the sweep sends it. A subscription
+  created or changed to take `assistant.say` or `work_item.needs_you` is sent, once, the newest unreached message of each item that still
+  needs its owner.
+- A receiver's `410 Gone` drops that outbox row at once (`last_status = http_410`) and is not counted against the subscription, so a
+  receiver that cannot reach one of a user's conversations no longer gets that user's subscription disabled.
+- A leader lock held on a connection made before a failover this process noticed is lost (`LeadershipLostError`, the lease, the
+  stall alarm): the demoted server may still answer it, but its lock fences nothing on the new primary.
+- Session retention can no longer spend a place of the day that a user's own delete took: every session deletion takes one advisory
+  lock, and retention asks the day's count again under it before each deletion.
+- A revoked connector grant is refused within `CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS` (default 5; was up to the identity
+  client's 30-second cache). The identity client's `introspect` takes a per-call `maxAgeMs`.
 - A database failover no longer leaves the API on the old primary, and no longer costs the assistant's replies. A
   switchover demotes the old primary in place, and a connection still on it answers every read and refuses every write
   (`25006`): `inTransaction` handed such a connection back to the pool after a clean rollback, to fail the next

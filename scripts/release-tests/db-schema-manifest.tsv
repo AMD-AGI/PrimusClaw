@@ -8,6 +8,7 @@ table	claw_sessions	parent_session_id
 table	claw_sessions	archived_at
 table	claw_session_events	processed_at
 table	claw_idempotency_keys	expires_at
+table	claw_schema_markers	name
 table	claw_conversation_turns	turn_index
 table	claw_session_summaries	session_id
 table	claw_pending_messages	session_env

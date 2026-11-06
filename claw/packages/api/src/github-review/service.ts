@@ -36,7 +36,7 @@ import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  acquireWriteLock, writeLockKey, countPendingConfirmations, getReviewMode, headReviewFacts, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
+  acquireWriteLock, writeLockKey, claimHeldMerges, countPendingConfirmations, postedApprovalIds, getReviewMode, headReviewFacts, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
   type ClaimResult, type Confirmation, type DecidedVia, type HeldReview, type PostedFinding, type PostedReview, type Queryable, type ReviewComment, type ReviewEvent, type ReviewMode,
 } from "./store.js";
 
@@ -59,6 +59,19 @@ export interface ReviewActor {
    * auto-merge would turn into one, is always held for the acting user's confirmation (C2), whatever the risk and their review mode.
    */
   mergeNeedsConfirmation?: boolean;
+}
+
+/** What `followPullRequest` is asked to look at: a review item's session, its pull request, who reviews and who asked. */
+export interface FollowRequest {
+  sessionId: string;
+  ref: PrRef;
+  /** X: whose account reviewed. */
+  actingUserId: string;
+  /** R: who asked; the owner for a review of one's own account. */
+  requesterUserId: string;
+  requesterLabel?: string;
+  /** R asked X for a review that merges (not a review only): R's account merges once X's approval is on GitHub. */
+  mergeByRequester: boolean;
 }
 
 export interface ToolOutcome {
@@ -259,8 +272,11 @@ const HOW_TO_READ_FROM_CHECKOUT = "Each answer fits what you can read at once. R
 const HOUR_MS = 3_600_000;
 /** Refusals that say nothing about the merge itself and will pass: the acting user's "allow" is kept for another try. */
 const TRANSIENT_REFUSALS = new Set(["too_many_concurrent", "rate_limited", "github_rate_limited", "identity_unavailable", "audit_unavailable"]);
-/** Writes (a merge, a review) waiting for one acting user's decision; past it nothing new is asked of them. */
-const MAX_PENDING_CONFIRMATIONS = 10;
+/**
+ * Writes (a merge, a review) waiting for one acting user's decision; past it nothing new is asked of them. A batch of ten reviews asked of one
+ * reviewer used to fill it (2026-11-06); a held merge whose pull request is merged or closed on GitHub no longer counts (`followPullRequest`).
+ */
+export const MAX_PENDING_CONFIRMATIONS = 30;
 /** The hidden line in a review's footer that names the run; a retry looks for it. The prefix an earlier release wrote is still looked for (legacy-names.ts). */
 const RUN_MARKER_PREFIX = "claw-review:run";
 const REVIEW_EVENTS: readonly ReviewEvent[] = ["COMMENT", "REQUEST_CHANGES", "APPROVE"];
@@ -771,6 +787,161 @@ export class GithubReview {
       this.requireOpen(pr);
       return ok({ status: "ok", title: pr.title, head_sha: pr.headSha, url: pr.url }, (t) => ctx.client.redact(t));
     }, { skipBudget: true, ref });
+  }
+
+  /**
+   * What became of the pull request of a review asked of someone else, looked at by the review items' sweep after the review's turn
+   * (`assistant/review-items.ts` `followReviewItems`), and the merge the requester asked for, made with the requester's own account.
+   *
+   * A review asked of X by R, when R's message asked for a merge (`mergeByRequester`: not a review only), has done its part once X's
+   * approval of the head is on GitHub. The merge is then R's: R wrote the pull request, R asked for it to be merged, and merging one's own
+   * pull request after a second person's approval is what GitHub's own rules are for. So the merge is made with R's GitHub account (R's
+   * own credential, which needs nobody's switch), and X is not asked to confirm it: X's review mode and X's held merge govern what is done
+   * with X's account, not what R does with R's own. It is made only when every one of these holds, read now:
+   *   - the pull request is open, not a draft, and R's account wrote it (`requester_not_author`) and may push to the repository;
+   *   - this review session posted an approval of the current head with X's account (its own audit row, `posted.review_id`), and GitHub
+   *     still has it as APPROVED on that commit (`approval_missing`): a push after it, or a dismissal, takes it back;
+   *   - CI is green on the head, no review thread is open, and GitHub's merge state is CLEAN (the repository's own rules, met as GitHub
+   *     counts them);
+   *   - nobody is deciding X's held merge right now (`write_in_progress`, `reviewer_deciding`). A held merge of the session for that head is
+   *     closed as merged by the requester, so X's card or command for it then answers that it no longer waits.
+   * Otherwise nothing is written and the answer says why (`status: "waiting"`); the sweep looks again later.
+   *
+   * Whether or not it merges, a pull request that is merged or closed on GitHub is said so (`already_merged`, `closed`), and every write
+   * the session still holds for X's answer is closed with it (`stale`, with the reason): there is nothing left to confirm.
+   * Without `mergeByRequester`, or when R has no GitHub account bound, the pull request is read with X's account, as the review read it.
+   */
+  async followPullRequest(f: FollowRequest): Promise<ToolOutcome> {
+    const asRequester = f.mergeByRequester && f.requesterUserId !== f.actingUserId;
+    const tool = "gh_pr_follow";
+    const args = { pr: `${f.ref.owner}/${f.ref.repo}#${f.ref.number}`, as: asRequester ? "requester" : "acting_user" };
+    const actor: ReviewActor = asRequester
+      ? { sessionId: f.sessionId, requesterUserId: f.requesterUserId, actorUserId: f.requesterUserId, requesterLabel: f.requesterLabel }
+      : { sessionId: f.sessionId, requesterUserId: f.requesterUserId, actorUserId: f.actingUserId, requesterLabel: f.requesterLabel };
+    const outcome = await this.run(actor, tool, args, async (ctx, ref) => {
+      const redact = (t: string): string => ctx.client.redact(t);
+      const { repo, pr } = await this.load(ctx, ref);
+      if (pr.merged || pr.state !== "open") {
+        const status = pr.merged ? "already_merged" : "closed";
+        await this.closeHeldForEnded(f.sessionId, f.requesterUserId, status);
+        return ok({ status, url: pr.url, head_sha: pr.headSha }, redact);
+      }
+      if (!asRequester) return ok({ status: "open", url: pr.url, head_sha: pr.headSha }, redact);
+      return ok(await this.mergeForRequester(ctx, ref, repo, pr, f), redact);
+    }, { skipBudget: true, ref: f.ref });
+    // R has no GitHub account bound (or it lapsed): what became of the pull request is still read, with X's account as the review read it.
+    if (asRequester && outcome.isError && ["actor_not_bound", "credential_expired", "acting_login_unknown"].includes(String(outcome.body.reason))) {
+      return this.followPullRequest({ ...f, mergeByRequester: false });
+    }
+    return outcome;
+  }
+
+  /** The merge of `followPullRequest`, as R, once X's approval is on GitHub. */
+  private async mergeForRequester(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, f: FollowRequest): Promise<Record<string, unknown>> {
+    const waiting = (reason: string, message: string, extra: Record<string, unknown> = {}): Record<string, unknown> =>
+      ({ status: "waiting", reason, message, url: pr.url, head_sha: pr.headSha, ...extra });
+    if (pr.draft) return waiting("draft", "the pull request is a draft");
+    if (!ctx.cred.login.trim() || pr.authorLogin.toLowerCase() !== ctx.cred.login.toLowerCase()) {
+      return waiting("requester_not_author", "the requester's GitHub account did not write this pull request, so the merge stays with the reviewer");
+    }
+    if (!repo.push) return waiting("no_merge_permission", `${ctx.cred.login} has no write permission on ${repo.fullName}`);
+    const approval = await this.sessionApprovalOf(ctx, ref, f.sessionId, pr.headSha);
+    if (!approval) return waiting("approval_missing", "the reviewer's approval of the current head is not on the pull request");
+    let state = await this.readState(ctx, ref, pr, repo);
+    try {
+      this.requireGreen(state, pr.headSha);
+    } catch (err) {
+      if (err instanceof Refusal) return waiting(err.code, err.message);
+      throw err;
+    }
+    state = await this.settleMergeState(ctx, ref, pr, state, false);
+    // Already in the merge queue (queued by a person): nothing to write, but the reviewer's held merge of this head is closed below as well.
+    const alreadyQueued = state.queueEntry;
+    const queue = this.viaQueue(ctx, state);
+    if (!alreadyQueued && !queue && state.mergeStateStatus !== "CLEAN") {
+      return waiting("merge_state_not_clean", `GitHub's merge state is ${state.mergeStateStatus} (review decision ${state.reviewDecision ?? "none"}), not CLEAN`);
+    }
+    const method = (["squash", "merge", "rebase"] as const).find((m) => repo.methods.includes(m));
+    if (!alreadyQueued && !queue && !method) return waiting("merge_method_not_allowed", this.methodRefusal(repo).message);
+    if (!alreadyQueued && queue && !state.nodeId) return waiting("unreadable_pull_request", "GitHub did not give the pull request's id");
+    if (!alreadyQueued && !ctx.settings.writesEnabled) {
+      ctx.acc.dryRun = true;
+      return { status: "would_merge", url: pr.url, head_sha: pr.headSha, note: "writes are switched off in this deployment: nothing was merged" };
+    }
+    // The reviewer's lock on their writes to this pull request: their own answer to a held merge, a stop, and this merge, one at a time.
+    const key = writeLockKey(f.actingUserId, ref);
+    const holder = await acquireWriteLock(this.deps.db, key, WRITE_LOCK_SECONDS);
+    if (!holder) return waiting("write_in_progress", "the reviewer's write to this pull request is being decided right now");
+    const claimed: string[] = [];
+    try {
+      if (this.deps.sessionStopped && await this.deps.sessionStopped(f.sessionId)) return waiting("review_stopped", "the review was stopped");
+      const held = await claimHeldMerges(this.deps.db, f.sessionId, pr.headSha, f.requesterUserId);
+      if (held === null) return waiting("reviewer_deciding", "the reviewer is deciding the held merge right now");
+      claimed.push(...held);
+      if (alreadyQueued) {
+        for (const id of claimed.splice(0)) {
+          await finishConfirmation(this.deps.db, id, "stale", f.requesterUserId, { by: "github", reason: "pr_queued", queue_entry_id: alreadyQueued.id });
+        }
+        return { status: "queued", already_queued: true, url: pr.url, head_sha: pr.headSha, queue_entry_id: alreadyQueued.id };
+      }
+      await this.limits(ctx, pr.headSha);
+      ctx.acc.write = true;
+      let body: Record<string, unknown>;
+      if (queue) {
+        body = await this.enqueue(ctx, ref, pr, state, pr.headSha, false);
+      } else {
+        try {
+          const merged = await ctx.client.request<{ sha?: string }>("PUT", repoPath(ref, `/pulls/${ref.number}/merge`), { body: { sha: pr.headSha, merge_method: method } });
+          body = { status: "merged", merge_sha: merged.json?.sha ?? null, method, url: pr.url, head_sha: pr.headSha, github_request_id: merged.requestId };
+        } catch (err) {
+          if (err instanceof GithubError && err.status === 409) throw new Refusal("head_moved", "the pull request changed while it was being merged; nothing was merged");
+          if (err instanceof GithubError && (err.status === 405 || err.status === 422)) throw new Refusal("not_mergeable", `GitHub refused the merge: ${err.message}`);
+          throw err;
+        }
+      }
+      for (const id of claimed.splice(0)) {
+        await finishConfirmation(this.deps.db, id, body.status === "queued" ? "queued" : "merged", f.requesterUserId, {
+          by: "requester", merge_sha: body.merge_sha ?? null, queue_entry_id: body.queue_entry_id ?? null,
+        });
+      }
+      return { ...body, approved_by: approval.login, review_id: approval.reviewId };
+    } finally {
+      // A merge that did not happen gives the reviewer's held merge back to them, still waiting.
+      for (const id of claimed) await reopenConfirmation(this.deps.db, id).catch(() => false);
+      await releaseWriteLock(this.deps.db, key, holder).catch(() => undefined);
+    }
+  }
+
+  /**
+   * The approval this review session posted of `headSha`, as GitHub has it now: the review id comes from the session's own audit row (what
+   * Claw itself posted with the reviewer's account), and GitHub must still say APPROVED on that very commit. Null otherwise.
+   */
+  private async sessionApprovalOf(ctx: Ctx, ref: PrRef, sessionId: string, headSha: string): Promise<{ reviewId: number; login: string } | null> {
+    const ids = await postedApprovalIds(this.deps.db, sessionId, `${ref.owner}/${ref.repo}`, ref.number, headSha);
+    for (const id of ids) {
+      let review: { state?: string; commit_id?: string; user?: { login?: string } | null } | null = null;
+      try {
+        review = (await ctx.client.get<{ state?: string; commit_id?: string; user?: { login?: string } | null }>(repoPath(ref, `/pulls/${ref.number}/reviews/${id}`))).json;
+      } catch (err) {
+        if (err instanceof GithubError && err.status === 404) continue;
+        throw err;
+      }
+      const login = String(review?.user?.login ?? "");
+      if (review?.state === "APPROVED" && String(review.commit_id ?? "").toLowerCase() === headSha && login && login.toLowerCase() !== ctx.cred.login.toLowerCase()) {
+        return { reviewId: id, login };
+      }
+    }
+    return null;
+  }
+
+  /** The writes a session still holds for an answer, once its pull request is merged or closed on GitHub: nothing is left to confirm. */
+  private async closeHeldForEnded(sessionId: string, requesterUserId: string, why: "already_merged" | "closed"): Promise<void> {
+    await this.deps.db.query(
+      `UPDATE claw_github_confirmations
+          SET status = 'stale', decided_at = NOW(), decided_by = $2, result = $3::jsonb
+        WHERE session_id = $1 AND status = 'pending'`,
+      [sessionId, requesterUserId, JSON.stringify({ by: "github", reason: why === "already_merged" ? "pr_merged" : "pr_closed" })],
+    );
   }
 
   /**

@@ -26,6 +26,7 @@
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
 import Fastify, { type FastifyInstance } from "fastify";
+import { redactStoredText } from "@claw/utils";
 
 import { postgresSkipReason } from "./support/pg-cluster.js";
 import { startWorld, type Claims, type World } from "./support/assistant-world.js";
@@ -425,6 +426,29 @@ describe("assistant model choice", { skip }, () => {
     assert.equal(await fb.rerunOnFallback({ ...end, sessionId: item2.worker_session_id, runIds: [later.taskId], messageId: later.messageId }, w.sayDeps), "skipped");
     assert.equal((await w.pending(item2.worker_session_id)).length, 0);
     assert.equal(await sessionModel(item2.worker_session_id), OPUS, "unchanged");
+  });
+
+  test("F3b a router turn run again is given the user's words as the model first was, not the masked copy stored of them", async () => {
+    // Assembled from pieces so no scanner reads this file as holding a credential.
+    const words = `deploy with ak-${"Q7w8E9r0T1y2".repeat(4)} please`;
+    const turn = await userTurn(alice, redactStoredText(words).text);
+    await w.q("UPDATE claw_tasks SET prompt = $2 WHERE task_id = $1", [turn.task_id, words]);
+    await w.closeRun(turn.task_id, "failed", "agent_error", 0);
+    const end = { sessionId: alice.routerSid, runIds: [turn.task_id], messageId: turn.mid, failed: true, interrupted: false, finalText: APIM_401 };
+    assert.equal(await fb.rerunOnFallback(end, w.sayDeps), "rerun");
+    const [queued] = await w.pending(alice.routerSid);
+    assert.equal(queued.content, words);
+    const copied = await w.q("SELECT content FROM claw_assistant_messages WHERE session_id = $1", [alice.routerSid]);
+    assert.ok(copied.every((r: { content: string }) => r.content === "deploy with <redacted> please"), "the stored copies stay masked");
+    await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [alice.routerSid]);
+
+    // A run whose prompt is not that message (masking it does not give the stored words) is run again with the stored words.
+    const other = await userTurn(alice, "review AMD-AGI/PrimusClaw#255");
+    await w.q("UPDATE claw_tasks SET prompt = 'something else' WHERE task_id = $1", [other.task_id]);
+    await w.closeRun(other.task_id, "failed", "agent_error", 0);
+    assert.equal(await fb.rerunOnFallback({ ...end, runIds: [other.task_id], messageId: other.mid }, w.sayDeps), "rerun");
+    assert.equal((await w.pending(alice.routerSid))[0].content, "review AMD-AGI/PrimusClaw#255");
+    await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [alice.routerSid]);
   });
 
   test("F3 a router turn answering the user runs again with their message and its attendance, and only that turn takes the fallback", async () => {

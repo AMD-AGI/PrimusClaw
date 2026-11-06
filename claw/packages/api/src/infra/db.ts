@@ -9,6 +9,7 @@ import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
 import { ensureGithubReviewSchema } from "../github-review/store.js";
+import { lockBoundedMigrationClient, type MigrationLockPolicy } from "./migration-guard.js";
 import { terminalTicketsSchemaSql } from "../terminal/schema.js";
 import pino from "pino";
 import {
@@ -357,6 +358,37 @@ function isStale(client: pg.ClientBase): boolean {
 export function noteFailover(err: unknown): void {
   failoverGeneration += 1;
   logger.warn({ code: (err as { code?: unknown })?.code, generation: failoverGeneration }, "db.failover_detected");
+  for (const watcher of [...failoverWatchers]) {
+    try {
+      watcher();
+    } catch (watcherErr) {
+      logger.error({ err: watcherErr }, "db.failover_watcher_failed");
+    }
+  }
+}
+
+const failoverWatchers = new Set<() => void>();
+
+/**
+ * A failover this process noticed after `client` connected, as an error naming it; undefined when there was none.
+ *
+ * For a holder of something that lives on one server -- an advisory lock -- whose connection may still be up: a
+ * failover noticed on any other connection says the server this one reached may have stopped being the primary, and a
+ * lock held there fences nothing on the new one, where another replica can take the same lock. A connection that is
+ * gone is `connectionLost`; this is the one still standing on a server the rest of the process has left. Stays set:
+ * the generation only goes up.
+ */
+export function failoverSince(client: pg.ClientBase): Error | undefined {
+  if (!isStale(client)) return undefined;
+  return new Error(
+    `a database failover was noticed after this connection was made (connection generation ${clientGeneration.get(client)}, now ${failoverGeneration})`,
+  );
+}
+
+/** Be told each time a failover is noticed (`noteFailover`). Returns an unsubscribe. A watcher that throws is logged. */
+export function onFailover(watcher: () => void): () => void {
+  failoverWatchers.add(watcher);
+  return () => failoverWatchers.delete(watcher);
 }
 
 /**
@@ -1368,9 +1400,22 @@ export async function ensureChatTurnClaimIndex(client: pg.PoolClient): Promise<v
   logger.error({ attempts: CHAT_TURN_INDEX_ATTEMPTS }, "db.chat_turn_index_attempts_exhausted");
 }
 
+/**
+ * How long one startup DDL statement may wait for its table lock, and how often
+ * it tries. See `infra/migration-guard.ts`: without a bound, a statement queued
+ * behind one open transaction holds up every query on that table, the serving
+ * replicas' included, for as long as that transaction lasts.
+ */
+export const MIGRATION_LOCK_POLICY: MigrationLockPolicy = {
+  lockTimeoutMs: envInt("PG_MIGRATION_LOCK_TIMEOUT_MS", 3_000, { min: 1 }),
+  attempts: envInt("PG_MIGRATION_LOCK_ATTEMPTS", 10, { min: 1 }),
+  backoffMs: 500,
+  maxBackoffMs: 4_000,
+};
+
 /** Run schema migrations on startup. */
 export async function initDb(): Promise<void> {
-  const client = await pool.connect();
+  const client = lockBoundedMigrationClient(await pool.connect(), MIGRATION_LOCK_POLICY);
   try {
     await client.query(`SET statement_timeout = ${MIGRATION_STATEMENT_TIMEOUT_MS}`);
     await client.query("SELECT pg_advisory_lock($1)", [SCHEMA_MIGRATION_LOCK_ID]);
@@ -1409,6 +1454,16 @@ export async function initDb(): Promise<void> {
         data        JSONB DEFAULT '{}'::jsonb,
         created_at  TIMESTAMPTZ DEFAULT NOW(),
         deleted_at  TIMESTAMPTZ
+      )
+    `);
+
+    // One row per one-time data migration that has finished, so a start that
+    // finds its row skips the pass instead of re-reading a table to find out
+    // there is nothing left to do (events/legacy-event-ids.ts).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_schema_markers (
+        name     TEXT PRIMARY KEY,
+        done_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
 

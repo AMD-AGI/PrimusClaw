@@ -23,6 +23,10 @@
  *   T8 the batch is the day's limit across passes and replicas, not each pass's
  *   T9 the next day's pass, 24 hours on, waits for the last day's deletions to leave the window
  *      and deletes a whole batch, once across replicas; one whose window frees far later ends
+ *   T10 a user's delete of an archived session between retention's count and its deletion
+ *      takes a place of the day: retention asks the count again under the lock and stops
+ *   T11 a deletion of an archived session holds the day's lock, and retention waits for an
+ *      archived deletion in flight and counts it
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -443,5 +447,82 @@ describe("session retention", { skip }, () => {
     await retention.runSessionRetentionOnce(batch, run);
     assert.ok(Date.now() - started < 30_000, "it did not wait for the window");
     assert.deepEqual(await deletedIds(), ["exp-3", "exp-4", "exp-5", "exp-6", "exp-7", "exp-8"]);
+  });
+  /** Archived sessions deleted in the last 24 hours that the day's limit counts. */
+  const countedToday = async () => Number((await rows(
+    `SELECT COUNT(*)::int AS n FROM claw_sessions s
+      WHERE s.deleted_at > NOW() - INTERVAL '1 day' AND s.status = 'archived'
+        AND NOT COALESCE(s.config ? 'primus_anthropic_compat', false)`,
+  ))[0].n);
+
+  test("T10 a user's delete after retention's count takes a place of the day, and retention does not spend it again", async () => {
+    await seed({ id: "exp-1", archivedDays: 41 });
+    await seed({ id: "exp-2", archivedDays: 42 });
+    // Archived yesterday: retention would not take it, its owner deletes it.
+    await seed({ id: "user-mid", archivedDays: 1 });
+    const batch = { ...SETTINGS, batch: 2 };
+    const real = dbModule.db.query;
+    let ownerDeleted = false;
+    // The owner's delete lands after retention has counted the day (2 left) and chosen its sessions.
+    dbModule.db.query = (async (text: string, params?: unknown[]) => {
+      const r = await real(text, params);
+      if (!ownerDeleted && /ORDER BY COALESCE\(s\.archived_at, s\.updated_at\)/.test(text)) {
+        ownerDeleted = true;
+        assert.equal(await teardown.commitSessionDeletion("user-mid"), true);
+      }
+      return r;
+    }) as typeof real;
+    let report;
+    try {
+      report = await retention.runSessionRetention(batch);
+    } finally {
+      dbModule.db.query = real;
+    }
+    assert.equal(ownerDeleted, true, "the owner's delete ran mid-pass");
+    assert.equal(report.deleted, 1, "one place was left once the owner's delete took the other");
+    assert.deepEqual(await deletedIds(), ["exp-2", "user-mid"], "the older one, and the owner's");
+    assert.equal(await countedToday(), 2, "the day's count never passes the batch");
+  });
+
+  test("T11 deleting an archived session holds the day's lock; retention waits for one in flight and counts it", { timeout: 30_000 }, async () => {
+    await seed({ id: "exp-1", archivedDays: 41 });
+    await seed({ id: "user-mid", archivedDays: 1 });
+    await seed({ id: "user-other", archivedDays: 1 });
+    const other = await cluster!.connect();
+    const waiting = async () => Number((await rows(
+      "SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+    ))[0].n);
+    const until = async (cond: () => Promise<boolean>, ms: number) => {
+      const end = Date.now() + ms;
+      while (Date.now() < end) {
+        if (await cond()) return true;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return false;
+    };
+    try {
+      // An owner's deletion in flight, holding the lock every archived deletion takes.
+      await other.query("BEGIN");
+      await other.query("SELECT pg_advisory_xact_lock($1)", [teardown.ARCHIVED_DELETION_LOCK_ID]);
+      await other.query("UPDATE claw_sessions SET deleted_at = NOW() WHERE session_id = 'user-mid'");
+
+      // A user's own delete of an archived session waits for it.
+      let ownerDone = false;
+      const owner = teardown.commitSessionDeletion("user-other").then((v) => { ownerDone = true; return v; });
+      assert.equal(await until(async () => (await waiting()) === 1, 5_000), true, "the owner's delete waits for the lock");
+      assert.equal(ownerDone, false);
+
+      // Retention, with one place left by the count it reads first, waits too.
+      const pass = retention.runSessionRetention({ ...SETTINGS, batch: 1 });
+      const bothWait = await until(async () => (await waiting()) === 2, 5_000);
+      await other.query("COMMIT");
+      assert.equal(bothWait, true, "retention's deletion waits for the lock");
+      assert.equal(await owner, true);
+      const report = await pass;
+      assert.equal(report.deleted, 0, "the in-flight deletion took the day's only place");
+      assert.equal((await deletedIds()).includes("exp-1"), false);
+    } finally {
+      await other.query("ROLLBACK").catch(() => {});
+    }
   });
 });

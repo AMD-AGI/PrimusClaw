@@ -59,6 +59,17 @@
  * prefix deleted before it stays deleted. This bounds the exposure. It does not
  * make a pass transactional, and no amount of checking here would.
  *
+ * A connection that stays up can lose the lock too. A failover demotes the
+ * server in place: a lock connection that reached it before can stay connected
+ * to it, holding a lock there that fences nothing on the new primary, where
+ * another replica takes the same lock. Nothing on that connection says so; what
+ * says so is the failover generation db.ts advances when any connection meets
+ * one (`failoverSince`, `onFailover`). So a hold whose connection is older than
+ * the last failover this process noticed is lost too, in the same three places
+ * a drop is: the watcher, the lease and the verdict. It may be a blip that left
+ * the primary where it was; a pass wrongly called not exclusive is retried on
+ * the next tick, and one wrongly called exclusive is the race this exists for.
+ *
  * What the lock cannot do is bound the scan. Serialising it means one stuck
  * replica stops every replica, where before this each swept independently and a
  * stuck one only wasted its own time. So the work has to be able to end on its
@@ -71,7 +82,7 @@
  */
 import pino from "pino";
 
-import { connectionLost, db, onConnectionLost } from "./db.js";
+import { connectionLost, db, failoverSince, onConnectionLost, onFailover } from "./db.js";
 
 const logger = pino({ name: "leader-lock" });
 
@@ -88,6 +99,7 @@ export const LEADER_LOCK_IDS = {
   uploadSweep: 8_264_179_233_102,
   sessionCleanup: 8_264_179_233_103,
   sessionRetention: 8_264_179_233_104,
+  legacyEventIds: 8_264_179_233_105,
 } as const;
 
 /**
@@ -209,6 +221,8 @@ export async function withLeaderLock<T>(
   // long the scan kept acting on a lock the server had already given away.
   let lostAt = 0;
   let stopWatching: () => void = () => {};
+  // Either way leadership ends: the connection dropped, or a failover was noticed since it connected.
+  const lostNow = (): Error | undefined => connectionLost(client) ?? failoverSince(client);
   try {
     const r = await client.query("SELECT pg_try_advisory_lock($1) AS ok", [lockId]);
     held = r.rows[0]?.ok === true;
@@ -228,14 +242,25 @@ export async function withLeaderLock<T>(
     // `AbortController.abort()` rethrows a listener's error from a
     // `process.nextTick` where no try/catch reaches it -- which would be the
     // unhandled 'error' crash that whole listener exists to prevent.
-    stopWatching = onConnectionLost(client, (err) => {
-      lostAt = Date.now();
+    const stopDrop = onConnectionLost(client, (err) => {
+      lostAt ||= Date.now();
       logger.error(
         { scan: name, lockId, err: err.message },
         "leader.lock_lost_mid_scan (the server released this lock when the connection "
         + "dropped; another replica may be running the same scan from here on)",
       );
     });
+    const stopFailover = onFailover(() => {
+      const since = failoverSince(client);
+      if (!since || lostAt) return;
+      lostAt = Date.now();
+      logger.error(
+        { scan: name, lockId, err: since.message },
+        "leader.lock_lost_mid_scan (a failover was noticed while this lock was held: it is held on a server "
+        + "that may no longer be the primary, and another replica may be running the same scan from here on)",
+      );
+    });
+    stopWatching = () => { stopDrop(); stopFailover(); };
     // Fires while fn is still pending, which is the only moment at which a hang
     // can be reported at all: a scan that never returns runs no code afterwards.
     const maxHoldMs = opts.maxHoldMs ?? DEFAULT_MAX_HOLD_MS;
@@ -243,7 +268,7 @@ export async function withLeaderLock<T>(
       // "No replica can run it" stops being true the moment the lock is gone,
       // so the alarm says which of the two stalls this is rather than asserting
       // an exclusion that has already ended.
-      const lost = connectionLost(client);
+      const lost = lostNow();
       if (lost) {
         logger.error(
           { scan: name, heldForMs: maxHoldMs, lockId, err: lost.message },
@@ -258,7 +283,7 @@ export async function withLeaderLock<T>(
       );
     }, maxHoldMs);
     stallAlarm.unref?.();
-    const result = await fn({ lost: () => connectionLost(client) });
+    const result = await fn({ lost: lostNow });
     // After `fn`, not instead of it. Racing the drop against `fn` and returning
     // early was considered and rejected: nothing here can cancel `fn`, so an
     // early return leaves it running detached -- which turns a serial sweeper
@@ -270,7 +295,7 @@ export async function withLeaderLock<T>(
     // Read from db.ts rather than from `lostAt`, so a drop that somehow reached
     // the record without reaching the watcher is still caught -- the record is
     // written before anything that can fail, the watcher call after it.
-    const lost = connectionLost(client);
+    const lost = lostNow();
     if (lost) throw new LeadershipLostError(name, lockId, lost, lostAt ? Date.now() - lostAt : 0);
     return { ran: true, result };
     // A `fn` that threw is deliberately not converted: its own error is the more

@@ -104,7 +104,7 @@ describe("connector access tokens", { skip }, () => {
     app = Fastify();
     await app.register((await import("@fastify/cookie")).default);
     app.addHook("preHandler", authMiddleware);
-    await registerRemoteAgentRoutes(app, { pingMs: 150, pollMs: 40 });
+    await registerRemoteAgentRoutes(app, { pingMs: 150, pollMs: 40, presenceSweepMs: 0 });
     await app.listen({ port: 0, host: "127.0.0.1" });
     base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
   });
@@ -469,6 +469,36 @@ describe("connector access tokens", { skip }, () => {
       assert.match(r.body.message, /no longer active/);
     });
 
+    test("is refused within the connector max age even while the identity client would keep the active answer longer", async () => {
+      process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT = "true";
+      // The production cache: an active answer kept 30 seconds for every caller.
+      process.env.IDENTITY_INTROSPECTION_CACHE_SECONDS = "30";
+      startIdentityClient(log);
+      process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS = "1";
+      try {
+        const token = mint();
+        const cid = await register(token);
+        const beat = () => asToken(token).post(`/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [AGENT] });
+        assert.equal((await beat()).status, 200);
+        revoked.add(payloadOf(token).jti);
+        assert.equal((await beat()).status, 200, "inside the max age the cached answer stands");
+        await new Promise((r) => setTimeout(r, 1_100));
+        const r = await beat();
+        assert.deepEqual([r.status, r.body.error], [401, "invalid_token"], "past it the provider is asked again");
+      } finally {
+        delete process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS;
+      }
+    });
+
+    test("the connector max age defaults to 5 seconds", async () => {
+      const { connectorTokenSettings } = await import("../src/config.js");
+      delete process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS;
+      assert.equal(connectorTokenSettings().introspectMaxAgeMs, 5_000);
+      process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS = "900";
+      assert.equal(connectorTokenSettings().introspectMaxAgeMs, 5_000, "a value out of range is not believed");
+      delete process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS;
+    });
+
     test("an answer for another subject is no answer for this token", async () => {
       process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT = "true";
       fake.introspect = () => ({ body: activeAnswer({ sub: "someone-else" }) });
@@ -509,6 +539,15 @@ describe("connector access tokens", { skip }, () => {
       assert.equal(frame.id, undefined, "carries no id, so it can never be a resume position");
       assert.equal(frame.json().connector_id, cid);
       await stream.waitEnded();
+      // Kept on the connector, so presence can say an offline connector went because its sign-in did.
+      let ended: Record<string, any> | undefined;
+      for (let i = 0; i < 50; i++) {
+        ended = (await q("SELECT stream_end_reason, stream_closed_at FROM claw_remote_connectors WHERE connector_id = $1", [cid])).rows[0];
+        if (ended?.stream_end_reason) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.equal(ended?.stream_end_reason, "token_expired");
+      assert.ok(ended?.stream_closed_at, "and when");
       // Not a revocation: the connector is still registered and may reconnect.
       const again = await SseClient.open(`${base}/v1/remote-agents/connectors/${cid}/commands`, bearer(mint()));
       streams.push(again);
@@ -594,7 +633,7 @@ describe("connector access tokens", { skip }, () => {
         (req as any).user = { userId: "u1", userName: "u1", roles: ["default"], platformKey: "", virtualKey: "" };
         recordRequestCredential(req, "connector_token", Date.now() + 60_000);
       });
-      await registerRemoteAgentRoutes(stub);
+      await registerRemoteAgentRoutes(stub, { presenceSweepMs: 0, retentionDays: 0 });
       await stub.ready();
       try {
         assert.ok(routes.length >= 12, `only ${routes.length} routes`);

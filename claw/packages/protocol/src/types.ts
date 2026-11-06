@@ -69,7 +69,14 @@ export interface SandboxSpecCreate {
    * fails the message with reason `sandbox_pending_timeout` if it never starts.
    */
   timeout?: number;
-  /** Extra env vars baked into the sandbox at create time. */
+  /**
+   * Extra env vars baked into the sandbox at create time. Stored in the SaFE
+   * workload, whose env SaFE returns to every caller allowed to read it: a
+   * name or value that looks like a credential is withheld from the workload
+   * and reaches the sandbox only at bootstrap (and an app only with its start
+   * command), so it is not there for an image entrypoint. Put no secret here
+   * under another name.
+   */
   env?: Record<string, string>;
   /** Extra labels merged into the SaFE workload (Sweeper consistency keys). */
   labels?: Record<string, string>;
@@ -420,8 +427,21 @@ export interface ExecuteRequest {
    * them. The API sets it on an assistant's router turn (`CLAW_ASSISTANT_CITATIONS`), for its `say`. Absent: nothing is kept or sent.
    * A page `web_fetch` read is kept only when a search or a trusted server of the run returned its address first, or it is one of
    * `user_urls`, the addresses the user wrote in the message the turn answers: reading a page confirms a source, it never adds one.
+   * `link_servers` names servers whose results are JSON objects that carry their own page as `html_url` (Gitea's, for the agent
+   * board), each with the address prefix its pages have: an `html_url` of a top-level object of such a result that starts with that
+   * prefix is kept, as a source of kind `board`. Nothing else of the result is read for addresses.
    */
-  cite?: { tools: string[]; source_servers?: string[]; user_urls?: string[] };
+  cite?: { tools: string[]; source_servers?: string[]; user_urls?: string[]; link_servers?: Record<string, string> };
+  /**
+   * The lookups of this run whose results are log text, by exact tool name (`mcp__<server>__<tool>`), each with the argument
+   * that says how many lines or entries it returns (`tail_lines`, `limit`; empty for a read that counts nothing but may carry log
+   * text, such as a container's termination message). For such a call Brain lowers that argument to `lines` (and sets it when
+   * the call names none), masks credential-shaped text in the answer (`redactLogSecrets` of @claw/utils) before
+   * the model, an event or a log line sees it, and keeps only the last `chars` characters of an answer that is plain text
+   * (`brain/src/tools/log-reads.ts`). The API sets it on an assistant's router turn that has such reads. Absent, or unreadable:
+   * results are as the tools answered.
+   */
+  log_reads?: { tools: Record<string, string>; lines: number; chars: number };
   /**
    * Images the person sent with the message this run answers, shown to the model with the prompt, in this order. Each is a path
    * relative to the session's own files (`.uploads/<path>`, as `POST /v1/sessions/:id/upload` stored it): Brain reads it from the

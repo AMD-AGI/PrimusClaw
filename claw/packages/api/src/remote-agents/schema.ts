@@ -34,6 +34,43 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_remote_connectors_owner ON claw_remote_connectors(owner_user_id) WHERE revoked_at IS NULL",
   );
+  // Presence as the sweep last judged it (`presence.ts`), and how the last command stream ended. Added
+  // columns, so a deployment that had the table before gets them in place. Asked first: every heartbeat
+  // updates this table, and an ALTER would take its exclusive lock on every start for nothing.
+  const missing = (await client.query(
+    `SELECT 1 FROM information_schema.columns
+      WHERE table_schema = current_schema() AND table_name = 'claw_remote_connectors' AND column_name = 'presence_episode'`,
+  )).rows.length === 0;
+  if (missing) await client.query(`
+    ALTER TABLE claw_remote_connectors
+      ADD COLUMN IF NOT EXISTS stream_closed_at  TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS stream_end_reason TEXT,
+      ADD COLUMN IF NOT EXISTS presence_state    TEXT,
+      ADD COLUMN IF NOT EXISTS presence_since    TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS offline_since     TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS offline_reason    TEXT,
+      ADD COLUMN IF NOT EXISTS offline_notice    TEXT,
+      ADD COLUMN IF NOT EXISTS presence_episode  BIGINT
+  `);
+  // Every change of presence the sweep saw. No owner index: it is read per connector.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_remote_connector_transitions (
+      id            BIGSERIAL PRIMARY KEY,
+      connector_id  UUID NOT NULL REFERENCES claw_remote_connectors(connector_id) ON DELETE CASCADE,
+      owner_user_id TEXT NOT NULL,
+      from_state    TEXT,
+      to_state      TEXT NOT NULL,
+      reason        TEXT,
+      last_seen_at  TIMESTAMPTZ,
+      at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await client.query(
+    "CREATE INDEX IF NOT EXISTS idx_remote_connector_transitions ON claw_remote_connector_transitions(connector_id, id)",
+  );
+  await client.query(
+    "CREATE INDEX IF NOT EXISTS idx_remote_connector_transitions_at ON claw_remote_connector_transitions(at)",
+  );
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_remote_agents (
       connector_id  UUID NOT NULL REFERENCES claw_remote_connectors(connector_id) ON DELETE CASCADE,

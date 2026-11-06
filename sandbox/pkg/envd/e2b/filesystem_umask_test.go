@@ -60,12 +60,12 @@ func TestFilesystemCreatesUnderTheProcessUmask(t *testing.T) {
 				}
 			}
 
-			ok("upload", postRaw(t, srv.URL+"/files?path=/out/a.txt", "text/plain", []byte("hi")))
+			ok("upload", postRaw(t, srv.URL+"/files?path=out/a.txt", "text/plain", []byte("hi")))
 			ok("mkdir", postRaw(t, srv.URL+"/filesystem.Filesystem/MakeDir", "application/proto",
-				appendString(nil, 1, "/made/dir")))
+				appendString(nil, 1, "made/dir")))
 			ok("move", postRaw(t, srv.URL+"/filesystem.Filesystem/Move", "application/proto",
-				protoMove("/out/a.txt", "/moved/b.txt")))
-			ok("overwrite", postRaw(t, srv.URL+"/files?path=/moved/b.txt", "text/plain", []byte("again")))
+				protoMove("out/a.txt", "moved/b.txt")))
+			ok("overwrite", postRaw(t, srv.URL+"/files?path=moved/b.txt", "text/plain", []byte("again")))
 
 			for path, want := range map[string]os.FileMode{
 				"out":         c.dir,

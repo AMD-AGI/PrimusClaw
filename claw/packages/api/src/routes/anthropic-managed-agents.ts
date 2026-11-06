@@ -1038,8 +1038,8 @@ function registerAnthropicSessionEventListRoute(app: FastifyInstance): void {
 
     const data: Record<string, unknown>[] = [];
     for (const row of rows) {
-      // Same masking the SSE stream applies. Stored events keep the raw text
-      // for audit; anything leaving over the API goes through redaction.
+      // Same masking the SSE stream applies. Stored events are already masked
+      // (`redactStoredValue`); anything leaving over the API goes through redaction too.
       const rowData = sanitizeSessionEvent(
         (typeof row.data === "object" && row.data) ? row.data as Record<string, unknown> : {},
       );

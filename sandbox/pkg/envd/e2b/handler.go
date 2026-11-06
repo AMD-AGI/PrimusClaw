@@ -330,13 +330,13 @@ func (h *handler) serveStreamInput(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) serveStat(w http.ResponseWriter, r *http.Request) {
 	h.servePathEntry(w, r, http.MethodGet, func(p string) (fileEntry, error) {
-		return h.files.stat(p)
+		return h.fs(r).stat(p)
 	})
 }
 
 func (h *handler) serveMakeDir(w http.ResponseWriter, r *http.Request) {
 	h.servePathEntry(w, r, http.MethodPost, func(p string) (fileEntry, error) {
-		return h.files.makeDir(p)
+		return h.fs(r).makeDir(p)
 	})
 }
 
@@ -355,7 +355,7 @@ func (h *handler) serveRemove(w http.ResponseWriter, r *http.Request) {
 		writeRPCError(w, err)
 		return
 	}
-	if err := h.files.remove(p); err != nil {
+	if err := h.fs(r).remove(p); err != nil {
 		writeRPCError(w, err)
 		return
 	}
@@ -381,7 +381,7 @@ func (h *handler) serveMove(w http.ResponseWriter, r *http.Request) {
 		writeRPCError(w, err)
 		return
 	}
-	ent, err := h.files.move(src, dst)
+	ent, err := h.fs(r).move(src, dst)
 	if err != nil {
 		writeRPCError(w, err)
 		return
@@ -404,7 +404,7 @@ func (h *handler) serveListDir(w http.ResponseWriter, r *http.Request) {
 		writeRPCError(w, err)
 		return
 	}
-	entries, err := h.files.list(p, depth)
+	entries, err := h.fs(r).list(p, depth)
 	if err != nil {
 		writeRPCError(w, err)
 		return
@@ -450,7 +450,14 @@ func (h *handler) servePathEntry(w http.ResponseWriter, r *http.Request, method 
 
 func (h *handler) allow(r *http.Request, method, userPath string) error {
 	sealed, inputs, outputs := policyOf(r)
-	return h.files.allow(sealed, inputs, outputs, method, userPath)
+	return h.files.scoped(sealed).allow(inputs, outputs, method, userPath)
+}
+
+// fs is the filesystem view the request is served from: sealed requests are
+// rooted at the workspace, others see the container as their commands do.
+func (h *handler) fs(r *http.Request) *files {
+	sealed, _, _ := policyOf(r)
+	return h.files.scoped(sealed)
 }
 
 func (h *handler) serveFiles(w http.ResponseWriter, r *http.Request) {
@@ -464,7 +471,7 @@ func (h *handler) serveFiles(w http.ResponseWriter, r *http.Request) {
 			writeRPCError(w, err)
 			return
 		}
-		fh, err := h.files.read(userPath)
+		fh, err := h.fs(r).read(userPath)
 		if err != nil {
 			writeRPCError(w, err)
 			return
@@ -487,11 +494,11 @@ func (h *handler) serveFiles(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer cleanup()
-		if err := h.files.write(userPath, src); err != nil {
+		if err := h.fs(r).write(userPath, src); err != nil {
 			writeRPCError(w, err)
 			return
 		}
-		ent, err := h.files.stat(userPath)
+		ent, err := h.fs(r).stat(userPath)
 		if err != nil {
 			writeRPCError(w, err)
 			return

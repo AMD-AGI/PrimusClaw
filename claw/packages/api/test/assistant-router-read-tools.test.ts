@@ -6,7 +6,8 @@
  * item with nothing to accept, and a router turn's request keeps what comes before the message the same from turn to turn, over a
  * real Postgres. Skipped without DATABASE_URL, and a skip is not a pass. The deployment's assistant plugin is 9, as on the site.
  *
- *   RT1 of a plugin, a router gets only the MCP servers listed as read-only, cut to their read tools; no skill, rule or write tool
+ *   RT1 of a plugin, a router gets only the MCP servers listed as read-only, cut to their read tools, and the reply-style rule; no
+ *       skill, other rule or write tool
  *   RT2 a router turn of the user asking "autopilot现在有几台节点": offered the autopilot read tools, told to answer itself, and given
  *       neither the deployment's defaults (no skill list after the message) nor a skill of the plugin
  *   RT3 the system prompt and the history before the message are the same on two turns between which an item was made; the item
@@ -16,6 +17,10 @@
  *   RT6 a worker's answer closes its item as answered, wakes the router with it, and leaves nothing to accept
  *   RT7 a router's history is its last 40 to 59 turns, from a start that moves every 20 turns and is always the user's turn
  *   RT8 an answer the router never said is said by the silent sweep, whole; one the router said with its item is not said again
+ *   RT9 a router turn diagnoses a failure itself: SaFE's logs, events and capacity are offered, and its log reads go to Brain as
+ *       `log_reads` (bounded to their last lines, masked); the board's notifications and milestones are offered too
+ *   RT10 a router turn keeps the turn's own scheduled-tasks server and may only list with it; a `schedules` entry the request carried
+ *       otherwise (another address, a bearer for another turn) is dropped
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -32,6 +37,7 @@ const TOOL_ROWS: Array<{ id: number; type: string; name: string; config: Record<
   { id: 2, type: "skill", name: "primus-platform", config: { s3_key: "plugins/2/", is_prefix: true } },
   { id: 8, type: "skill", name: "autopilot", config: { s3_key: "plugins/8/", is_prefix: true } },
   { id: 17, type: "rule", name: "teams-reply-style", config: { s3_key: "plugins/17/", is_prefix: true } },
+  { id: 21, type: "rule", name: "some-other-rule", config: { s3_key: "plugins/21/", is_prefix: true } },
   { id: 3, type: "mcp", name: "safe-mcp", config: { mcpServers: { safe: { type: "http", url: "https://safe.example/mcp", token: "<SAFE_API_KEY>", requires_approval: ["node_cordon"] } } } },
   { id: 26, type: "mcp", name: "autopilot-mcp", config: { mcpServers: { autopilot: { type: "http", url: "https://autopilot.example/mcp", token: "<SAFE_API_KEY>", auto_approve: ["get_*"], requires_approval: true } } } },
   { id: 18, type: "mcp", name: "dispatron-mcp", config: { mcpServers: { dispatron: { type: "http", url: "https://dispatron.example/mcp", token: "<SAFE_API_KEY>" } } } },
@@ -89,8 +95,11 @@ describe("assistant router read tools", { skip }, () => {
     const { readToolsOfPlugin, ROUTER_READ_TOOLS } = await import("../src/assistant/read-tools.js");
     const read = readToolsOfPlugin(PLUGIN, TOOL_ROWS);
     assert.deepEqual(read.servers, ["safe", "autopilot", "dispatron"], "the unlisted server is not connected");
-    assert.deepEqual(read.pluginTools.map((t: any) => t.id), [3, 26, 18], "no skill, no rule");
-    for (const t of read.pluginTools as any[]) assert.deepEqual(Object.keys(t.config), ["mcpServers"], "a row's other config is not carried");
+    assert.deepEqual(read.pluginTools.map((t: any) => t.id), [17, 3, 26, 18], "no skill, and of the rules only the reply style");
+    for (const t of read.pluginTools as any[]) {
+      if (t.type === "rule") assert.deepEqual(t.config, { s3_key: "plugins/17/", is_prefix: true }, "a rule is carried as the plugin has it");
+      else assert.deepEqual(Object.keys(t.config), ["mcpServers"], "an MCP row's other config is not carried");
+    }
     // Reads the site's tools are known to have, and writes of the same servers (names as Brain gives them).
     for (const name of ["mcp__autopilot__get_status", "mcp__autopilot__get_whoami", "mcp__safe__node_list", "mcp__safe__workload_get", "mcp__dispatron__get_runs"]) {
       assert.ok(allows(read.allowlist, name), `${name} is offered`);
@@ -102,14 +111,14 @@ describe("assistant router read tools", { skip }, () => {
     ]) assert.ok(!allows(read.allowlist, name), `${name} is not`);
     // Every pattern of the list is a read by its name: nothing that names a write by its usual verbs.
     for (const [server, tools] of Object.entries(ROUTER_READ_TOOLS)) {
-      for (const t of tools) assert.doesNotMatch(t, /create|delete|update|write|stop|apply|patch|put_|post_|cordon|drain|reboot|merge/, `${server}: ${t}`);
+      for (const t of tools) assert.doesNotMatch(t, /create|delete|update|write|stop|apply|patch|put_|post_|cordon|drain|reboot(?!_logs$)|merge/, `${server}: ${t}`);
     }
   });
 
   test(`RT2 a router turn asked "${QUESTION}" is offered the autopilot read tools and no skill`, async () => {
     const task = await send(alice.routerSid, QUESTION);
     assert.equal(task.plugin_id, PLUGIN);
-    assert.deepEqual(task.plugin_tools.map((t: any) => t.id), [3, 26, 18]);
+    assert.deepEqual(task.plugin_tools.map((t: any) => t.id), [17, 3, 26, 18]);
     assert.ok(task.tools_allowlist.includes("mcp__assistant__*"));
     assert.ok(allows(task.tools_allowlist, "mcp__autopilot__get_status"), "the autopilot read tool is offered");
     assert.ok(!allows(task.tools_allowlist, "mcp__autopilot__get_nodes"), "by name: a tool autopilot does not list is not offered");
@@ -118,7 +127,7 @@ describe("assistant router read tools", { skip }, () => {
     // After it has read one of their results the turn no longer acts for the person: only these are let through by Brain.
     assert.deepEqual(task.read_taint, {
       sources: task.tools_allowlist.filter((p: string) => p !== "mcp__assistant__*"),
-      allow_after: ["say", "work_recall", "memory_recall", "connector_list"].map((t) => `mcp__assistant__${t}`),
+      allow_after: ["say", "work_recall", "memory_recall", "devenv_list"].map((t) => `mcp__assistant__${t}`),
       // A plugin server words its own errors, so a failed read of one marks the turn like an answer; only the web is clean here.
       clean_failures: ["web_search", "web_fetch"],
     });
@@ -184,6 +193,67 @@ describe("assistant router read tools", { skip }, () => {
     const { readToolsOfPlugin } = await import("../src/assistant/read-tools.js");
     const odd = readToolsOfPlugin(PLUGIN, [{ id: 1, type: "mcp", config: { mcpServers: { constructor: {}, toString: {}, ["__proto__"]: {} } } }]);
     assert.deepEqual(odd.servers, []);
+  });
+
+  test("RT9 a router turn is offered SaFE's logs, events and capacity, and its log reads go to Brain bounded and masked", async () => {
+    const task = await send(alice.routerSid, "我的 workload 为什么失败了？看下日志");
+    for (const name of [
+      "mcp__safe__workload_logs", "mcp__safe__workload_events", "mcp__safe__workload_pod_logs", "mcp__safe__workload_pod_containers",
+      "mcp__safe__node_pod_logs", "mcp__safe__node_reboot_logs", "mcp__safe__cluster_logs", "mcp__safe__flavor_avail",
+    ]) {
+      assert.ok(allows(task.tools_allowlist, name), `${name} is offered`);
+      assert.ok(allows(task.read_taint.sources, name), `${name} marks the turn once it has read`);
+    }
+    for (const name of ["mcp__safe__workload_logs_download", "mcp__safe__apikey_list", "mcp__safe__secret_list", "mcp__safe__node_reboot"]) {
+      assert.ok(!allows(task.tools_allowlist, name), `${name} is not`);
+    }
+    assert.deepEqual(task.log_reads, {
+      tools: {
+        mcp__safe__workload_logs: "limit", mcp__safe__workload_events: "limit", mcp__safe__workload_pod_logs: "tail_lines",
+        mcp__safe__node_pod_logs: "tail_lines", mcp__safe__node_reboot_logs: "limit", mcp__safe__cluster_logs: "tail_lines",
+        // Counts nothing; masked, since a container's termination message can be the end of its log.
+        mcp__safe__workload_pod_containers: "",
+      },
+      lines: 40, chars: 6000,
+    });
+    const { ROUTER_READ_TOOLS, ROUTER_LOG_READS } = await import("../src/assistant/read-tools.js");
+    for (const [server, tools] of Object.entries(ROUTER_LOG_READS)) {
+      for (const t of Object.keys(tools)) assert.ok(ROUTER_READ_TOOLS[server]?.includes(t), `${server}.${t}: a log read is a router read`);
+    }
+    for (const t of ["notification_read", "milestone_read"]) assert.ok(ROUTER_READ_TOOLS["agent-board"].includes(t), t);
+  });
+
+  test("RT10 the turn's own scheduled-tasks server is kept, for listing only; any other entry by that name is dropped", async () => {
+    const triggers = await import("../src/triggers/mcp.js");
+    const { mintTriggerToken } = await import("../src/triggers/token.js");
+    const { INTERNAL_BACKEND_URL } = await import("../src/config.js");
+    const saved = { ...triggers.triggerToolSettings };
+    Object.assign(triggers.triggerToolSettings, { enabled: true, key: "k".repeat(40) });
+    try {
+      const task = await send(alice.routerSid, "我设了哪些定时任务？");
+      assert.ok(task.mcp_servers.schedules, "the turn's own server is kept");
+      assert.equal(task.mcp_servers.schedules.url, `${INTERNAL_BACKEND_URL}/v1/internal/trigger-mcp`);
+      assert.ok(allows(task.tools_allowlist, "mcp__schedules__trigger_list"));
+      assert.ok(allows(task.read_taint.sources, "mcp__schedules__trigger_list"));
+      for (const t of ["trigger_create", "trigger_cancel"]) assert.ok(!allows(task.tools_allowlist, `mcp__schedules__${t}`), `${t} is not offered`);
+
+      const { ownTriggerServer } = await import("../src/assistant/read-tools.js");
+      const key = triggers.triggerToolSettings.key;
+      const exp = Math.floor(Date.now() / 1000) + 600;
+      const url = `${INTERNAL_BACKEND_URL}/v1/internal/trigger-mcp`;
+      const entry = (over: Record<string, unknown>) => ({ schedules: { type: "http", url, token: mintTriggerToken({ sid: "s1", mid: "m1", task_id: "t1", exp }, key), ...over } });
+      assert.deepEqual(Object.keys(ownTriggerServer(entry({}), "s1", "m1", "t1", key)), ["schedules"], "minted for this turn");
+      assert.deepEqual(ownTriggerServer(entry({ url: "https://elsewhere.example/v1/internal/trigger-mcp" }), "s1", "m1", "t1", key), {}, "another address");
+      assert.deepEqual(ownTriggerServer(entry({}), "s1", "m2", "t1", key), {}, "a bearer for another message");
+      assert.deepEqual(ownTriggerServer(entry({}), "s1", "m1", "t2", key), {}, "a bearer for another run of the message");
+      assert.deepEqual(ownTriggerServer(entry({}), "s2", "m1", "t1", key), {}, "a bearer for another session");
+      assert.deepEqual(ownTriggerServer(entry({ token: mintTriggerToken({ sid: "s1", mid: "m1", task_id: "t1", exp }, "x".repeat(40)) }), "s1", "m1", "t1", key), {}, "signed with another key");
+      assert.deepEqual(ownTriggerServer(undefined, "s1", "m1", "t1", key), {});
+    } finally { Object.assign(triggers.triggerToolSettings, saved); }
+    // With the trigger tools off, the turn has no such server and nothing to list with.
+    const off = await send(alice.routerSid, "我设了哪些定时任务？");
+    assert.equal(off.mcp_servers.schedules, undefined);
+    assert.ok(!allows(off.tools_allowlist, "mcp__schedules__trigger_list"));
   });
 
   test("RT5 work_create records the plugin, and every message to the worker carries it", async () => {

@@ -24,6 +24,7 @@ import {
   checkProbationGraduation,
 } from "../marketplace/skill-service.js";
 import { appEventIdentity } from "./app-events.js";
+import { ensureEventIdUniqueness, normalizeLegacyEventIdsOnce } from "./legacy-event-ids.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
@@ -43,6 +44,7 @@ import {
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
 import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
+import { redactStoredValue } from "@claw/utils";
 import pino from "pino";
 import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
 import { metrics } from "../infra/metrics.js";
@@ -165,31 +167,12 @@ export async function startEventConsumer(): Promise<void> {
     });
   } catch { /* consumer may already exist */ }
 
-  // One-time migrations
-  try {
-    // 1. Normalize legacy event_ids (PRIMUS_CLAW_EVENTS-xxx, claw-evt-xxx, bare numbers)
-    const migrated = await db.query(
-      `UPDATE claw_session_events
-       SET event_id = 'claw-' || regexp_replace(event_id, '^.*?(\\d+)$', '\\1')
-       WHERE event_id !~ '^claw-\\d'
-         AND event_id ~ '\\d+$'
-         AND deleted_at IS NULL`,
-    );
-    if (migrated.rowCount) {
-      logger.info({ count: migrated.rowCount }, "event-consumer.migrated_legacy_event_ids");
-    }
-
-    // 2. Replace UNIQUE(event_id) with UNIQUE(event_id, session_id) to prevent
-    //    cross-session collisions when multiple sessions share stream seq space.
-    //    Always ensure the composite index exists first, then drop old if present.
-    await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS claw_session_events_event_session_idx ON claw_session_events (event_id, session_id)`);
-    try {
-      await db.query(`ALTER TABLE claw_session_events DROP CONSTRAINT IF EXISTS claw_session_events_event_id_key`);
-      logger.info("event-consumer.dropped_old_unique_constraint");
-    } catch { /* constraint may not exist */ }
-  } catch (e) {
-    logger.warn({ err: (e as Error).message }, "event-consumer.migration_failed");
-  }
+  // The uniqueness the inserts below arbitrate on: two catalog reads once it is
+  // in place. Then the legacy event-id rewrite: once per database (a marker row
+  // records it), and in the background, so this replica persists events while
+  // it runs.
+  await ensureEventIdUniqueness();
+  void normalizeLegacyEventIdsOnce();
 
   const consumer = await js.consumers.get(EVENT_STREAM, consumerName);
   const iter = await consumer.consume();
@@ -429,9 +412,11 @@ export async function consumeEventDelivery(msg: {
     const isAppEvent = event.type === "appEvent";
     const appEvent = appEventIdentity(event);
     try {
+      // The stored copy has credential-shaped content masked (`redactStoredValue`); `event` itself, which the completion below and
+      // every hook after it read, is not touched.
       const insertResult = await db.query(
         `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${isAppEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
-        [eventId, sessionId, (event.type as string) || "message", event],
+        [eventId, sessionId, (event.type as string) || "message", redactStoredValue(event)],
       );
       if (isAppEvent && !insertResult.rowCount) {
         logger.info({ sessionId, appTaskId: appEvent?.appTaskId, appEventId: appEvent?.eventId }, "event-consumer.app_event_duplicate_dropped");
@@ -1168,7 +1153,8 @@ async function handleComplete(
     if (skillsUsedPatched) {
       (event as any).skills_used = skillsUsed;
       if (eventRowId) {
-        await db.query(`UPDATE claw_session_events SET data = $1 WHERE id = $2`, [event, eventRowId]);
+        // The stored copy again, masked as the insert above masked it: `event` itself is the one the turn's handling reads.
+        await db.query(`UPDATE claw_session_events SET data = $1 WHERE id = $2`, [redactStoredValue(event), eventRowId]);
       }
     }
 

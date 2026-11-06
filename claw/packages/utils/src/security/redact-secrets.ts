@@ -492,6 +492,321 @@ export function redactSecrets(text: string, extraSecrets: string[] = []): Redact
 }
 
 /**
+ * Where a value written after a credential's name starts in a log line: `PASSWORD=`, `"api_key": "`, `Authorization: `, also
+ * inside a JSON string (`\\"token\\": \\"`), and a command line's option (`--password=...`, `--db-password ...`). The name
+ * starts where a name can (not inside another one; after a JSON string's `\\n`, `\\r` or `\\t`; after one or two dashes that start
+ * an option) and is judged by `isSensitiveKey`; an auth scheme (`Bearer`, `Basic`, `Token`) after it is kept and the value after the
+ * scheme is masked, quoted or not. Where the value ends is `NamedValueEnds`'s to find: a quoted value runs to its
+ * closing quote, spaces and all, so `"password": "correct horse battery staple"` goes whole.
+ */
+const NAMED_VALUE_START_RE = /(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrt])|(?<=(?:^|[^A-Za-z0-9_.\\-])-{1,2}))(\\["']|["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1([ \t]*[:=][ \t]*|(?<=(?:^|[^A-Za-z0-9_.\\-])-{1,2}[A-Za-z_][A-Za-z0-9_.-]{0,63})[ \t]+)((?:[Bb]asic|[Bb]earer|[Tt]oken)\s+)?(\\["']|["']?)/g;
+/** What ends a JSON scalar (a number, `true`, `false`, `null`) after a quoted key: the next member, or the object or array closing. */
+const JSON_SCALAR_END = /[,}\]]/;
+const JSON_SCALAR_RE = /^(?:-?\d[\d.eE+-]*|true|false|null)$/;
+
+/**
+ * Which string each name of a text is in, read forward once: `closeQuoteAt(i)` for `i` that never decreases. Counted per line
+ * from the quotes before the name: a line starts outside any string after a real line end, and inside a JSON string after that
+ * string's `\n` / `\r` (an odd run of backslashes before `n` or `r`). A `"` after an even run of backslashes opens or closes a
+ * string at the top level; a `\"` (one more than a multiple of four) opens or closes one inside a JSON string. A single quote is
+ * not counted: in prose it is an apostrophe.
+ */
+class LineTracker {
+  private at = 0;
+  /** 0 outside any string, 1 inside a `"` string, 2 inside a `\"` string within it. */
+  private level = 0;
+  /** The backslashes right before `at`. */
+  private run = 0;
+
+  constructor(private readonly text: string) {}
+
+  /** The quote that closes the string a name starting at `i` is in: empty when it is in none, `"`, or `\"`. */
+  closeQuoteAt(i: number): string {
+    const t = this.text;
+    for (; this.at < i; this.at += 1) {
+      const c = t[this.at];
+      if (c === "\n" || c === "\r") {
+        this.level = 0;
+      } else if (c === "\\") {
+        this.run += 1;
+        continue;
+      } else if ((c === "n" || c === "r") && this.run % 2 === 1) {
+        this.level = 1;
+      } else if (c === '"') {
+        if (this.run % 2 === 0) this.level = this.level === 0 ? 1 : 0;
+        else if (this.run % 4 === 1 && this.level > 0) this.level = this.level === 1 ? 2 : 1;
+      }
+      this.run = 0;
+    }
+    return this.level === 0 ? "" : this.level === 1 ? '"' : '\\"';
+  }
+}
+
+/**
+ * The first index at or after `from` where `at(i)` holds (the text's length when none does), for `from` that never decreases:
+ * an answer found from an earlier `from` stands for every later one up to it, so the whole text is scanned at most once.
+ */
+function forwardFinder(length: number, at: (i: number) => boolean): (from: number) => number {
+  let scannedFrom = -1;
+  let found = -1;
+  return (from) => {
+    if (from >= scannedFrom && from <= found) return found;
+    let i = from;
+    while (i < length && !at(i)) i += 1;
+    scannedFrom = from;
+    found = i;
+    return i;
+  };
+}
+
+/**
+ * Where each named value in one text ends, asked in the order the values start. A quoted value (`"`, `'`, or `\"`, `\'` inside a
+ * JSON string) ends at its closing quote before the line's real end: a quote escaped inside it is part of it (an even run of
+ * backslashes before the quote at the top level; one more than a multiple of four inside a JSON string, where the value's own
+ * escaped quote is `\\\"`). Without a closing quote it ends at the line's end, where a JSON string's `\n` counts as one.
+ *
+ * An unquoted value runs to its line's end, or, when its name is inside a string (`LineTracker`: the first line of a log in a
+ * JSON answer, any line of one, a message in quotes), to that string's closing quote if it comes first. No separator or bracket
+ * ends it: a generated password holds `&`, `;`, `,`, `)`, `}` and `>` as often as letters, and an `env` line has no structure
+ * after `=`; what follows a credential on its line goes with it. One exception, exact for JSON: after a quoted key, a number,
+ * `true`, `false` or `null` ends at the next `,`, `}` or `]`. Trailing spaces are not the value's. Each question is answered
+ * from scans that only move forward, so a log of any shape costs its length.
+ */
+class NamedValueEnds {
+  private readonly realLineEnd: (from: number) => number;
+  private readonly lineEnd: (from: number) => number;
+  private readonly scalarEnd: (from: number) => number;
+  private readonly closers = new Map<string, (from: number) => number>();
+
+  constructor(private readonly text: string) {
+    const t = text;
+    // A JSON string's line break, `\n`, or a string's within it, `\\n`: from the first backslash of the run, so none is left over.
+    const escapedBreak = (i: number) => {
+      if (t[i] !== "\\" || t[i - 1] === "\\") return false;
+      let j = i;
+      while (t[j] === "\\") j += 1;
+      return t[j] === "n" || t[j] === "r";
+    };
+    this.realLineEnd = forwardFinder(t.length, (i) => t[i] === "\n" || t[i] === "\r");
+    this.lineEnd = forwardFinder(t.length, (i) => t[i] === "\n" || t[i] === "\r" || escapedBreak(i));
+    this.scalarEnd = forwardFinder(t.length, (i) => JSON_SCALAR_END.test(t[i]));
+  }
+
+  /** The closing quote of this kind at or after `from`: the index its delimiter starts at. */
+  private closer(quote: string): (from: number) => number {
+    let find = this.closers.get(quote);
+    if (!find) {
+      const t = this.text;
+      const mark = quote[quote.length - 1];
+      const nested = quote.length === 2;
+      find = forwardFinder(t.length, (i) => {
+        if (t[i] !== mark) return false;
+        let b = 0;
+        while (i - b - 1 >= 0 && t[i - b - 1] === "\\") b += 1;
+        return nested ? b % 4 === 1 : b % 2 === 0;
+      });
+      this.closers.set(quote, find);
+    }
+    return find;
+  }
+
+  /**
+   * The end (exclusive) of the value starting at `from`, opened by `quote` (empty, or a quote with its escape), after a name that
+   * was quoted (`keyQuoted`) and is inside the string `closeQuote` closes (empty: none).
+   */
+  end(from: number, quote: string, keyQuoted: boolean, closeQuote: string): number {
+    const t = this.text;
+    let end: number;
+    if (/["']$/.test(quote)) {
+      const mark = this.closer(quote)(from);
+      const close = quote.length === 2 ? mark - 1 : mark;
+      if (mark < t.length && close >= from && mark < this.realLineEnd(from)) return close;
+      end = this.lineEnd(from);
+    } else {
+      end = this.lineEnd(from);
+      if (closeQuote) {
+        const mark = this.closer(closeQuote)(from);
+        end = Math.min(end, closeQuote.length === 2 && mark < t.length ? mark - 1 : mark);
+      }
+      if (keyQuoted) {
+        const scalar = Math.min(end, this.scalarEnd(from));
+        if (JSON_SCALAR_RE.test(t.slice(from, scalar).trim())) end = scalar;
+      }
+    }
+    while (end > from && /\s/.test(t[end - 1])) end -= 1;
+    return end;
+  }
+}
+
+/** Values a credential's name is followed by that are not a credential: a switch, a placeholder, a mask. */
+const NOT_A_VALUE_RE = /^(?:true|false|null|none|nil|undefined|enabled|disabled|yes|no|on|off|required|optional|\*+|x+|\.+)$/i;
+/**
+ * An armored private key's BEGIN or END line, with its label (`RSA `, `EC `, `OPENSSH `, `ENCRYPTED `, or none) and, for an
+ * OpenPGP key, ` BLOCK`.
+ */
+const PRIVATE_KEY_LINE_RE = /-----(BEGIN|END) ([A-Z0-9 ]{0,32})PRIVATE KEY( BLOCK)?-----/g;
+/** A line's last word when it can be a key's base64 (or a path made of the same characters), and what stands before it. */
+const KEY_TAIL_RE = /(?:^|[\s"'`:=,([{])([A-Za-z0-9+/]+={0,2})$/;
+/** The base64 run that ends right where an END line starts, on the same line. */
+const KEY_TOUCHING_END_RE = /[A-Za-z0-9+/]+={0,2}$/;
+/** An armored key's own header lines (an encrypted PEM's, an OpenPGP key's). */
+const PEM_HEADER_RE = /^\s*(?:Proc-Type|DEK-Info|Comment|Version|Hash):/;
+/** A body line far from the END line counts as key material only if its base64 word is this long (a PEM line is 64). */
+const KEY_WORD_MIN = 16;
+
+/**
+ * Where the masking of a key whose BEGIN line is not in the text (a log read from its tail) starts, for an END line at `endAt`
+ * with nothing to keep masked before `floor`. It walks back from the END line over the lines that hold the key: lines that end in
+ * a base64 word (any word for the first line above the END line, which may be a key's short last line; further up, a line that
+ * is nothing else, or one whose word has KEY_WORD_MIN characters, so a log prefix such as a timestamp before each line is
+ * allowed), the key's header lines, and blank lines between them. Lines are real lines or a JSON string's `\n` / `\r` ones. The
+ * masking starts at the base64 word of the highest such line, so what stands before it on that line (`{"logs": "`, a timestamp)
+ * is kept. When no line above the END line is key material, it starts at `floor`: what is kept before an END line is never a
+ * key's body.
+ */
+function orphanKeyStart(text: string, endAt: number, floor: number): number {
+  /** Where the line that ends at `end` starts, and where the line before it ends (-1 when this line starts at `floor`). */
+  const lineStartOf = (end: number): { start: number; prev: number } => {
+    for (let i = end; i > floor; i -= 1) {
+      const c = text[i - 1];
+      if (c === "\n" || c === "\r") return { start: i, prev: i - 1 };
+      if ((c === "n" || c === "r") && i - 2 >= floor && text[i - 2] === "\\") return { start: i, prev: i - 2 };
+    }
+    return { start: floor, prev: -1 };
+  };
+  let { start, prev } = lineStartOf(endAt);
+  let from = -1;
+  const touching = KEY_TOUCHING_END_RE.exec(text.slice(start, endAt));
+  if (touching) from = start + touching.index;
+  let nearest = true;
+  while (prev >= 0) {
+    const end = prev;
+    ({ start, prev } = lineStartOf(end));
+    const line = text.slice(start, end).trimEnd();
+    if (!line) continue;
+    if (PEM_HEADER_RE.test(line)) {
+      from = start;
+      nearest = false;
+      continue;
+    }
+    const m = KEY_TAIL_RE.exec(line);
+    if (!m) break;
+    const word = m[1];
+    if (!nearest && word.length < KEY_WORD_MIN && line.trimStart() !== word) break;
+    from = start + m.index + m[0].length - word.length;
+    nearest = false;
+  }
+  return from < 0 ? floor : from;
+}
+
+/**
+ * Armored private keys, each to its END line; their lines may be real line ends or a JSON string's `\n`. One without its END line
+ * (a log cut inside it) is masked to the end of the text; one without its BEGIN line (a log read from its tail) from where its
+ * body starts (`orphanKeyStart`). Each line is searched past the previous key's end, so the text is read once.
+ */
+function maskPrivateKeys(text: string): { text: string; hits: number } {
+  let out = "";
+  let kept = 0;
+  let hits = 0;
+  PRIVATE_KEY_LINE_RE.lastIndex = 0;
+  for (let m = PRIVATE_KEY_LINE_RE.exec(text); m; m = PRIVATE_KEY_LINE_RE.exec(text)) {
+    const [line, kind, label, block = ""] = m;
+    hits += 1;
+    if (kind === "BEGIN") {
+      const endLine = `-----END ${label}PRIVATE KEY${block}-----`;
+      const at = text.indexOf(endLine, m.index + line.length);
+      out += `${text.slice(kept, m.index)}<redacted private key>`;
+      if (at < 0) return { text: out, hits };
+      kept = at + endLine.length;
+    } else {
+      out += `${text.slice(kept, orphanKeyStart(text, m.index, kept))}<redacted private key>`;
+      kept = m.index + line.length;
+    }
+    PRIVATE_KEY_LINE_RE.lastIndex = kept;
+  }
+  return { text: out + text.slice(kept), hits };
+}
+
+/** Space in a spec dump: real, or a JSON string's escaped line ends and tabs. */
+const SP = String.raw`(?:\s|\\[nrt])*`;
+/**
+ * A Kubernetes container's environment variable as a spec dump prints it, `{"name": "DB_PASSWORD", "value": "..."}` (also inside a
+ * JSON string), and `- name: DB_PASSWORD` with `value: ...` on the next line: the credential's name is a value here, not a key,
+ * so the named-value pass does not see it.
+ */
+const ENV_PAIR_JSON_RE = new RegExp(String.raw`(\\?")name\1${SP}:${SP}\1([A-Za-z_][A-Za-z0-9_.-]{0,63})\1${SP},${SP}\1value\1${SP}:${SP}(\1)`, "g");
+const ENV_PAIR_YAML_RE = /(?:^|\n|\r|\\n|\\r)[ \t]*(?:-[ \t]+)?name:[ \t]*(\\?["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1[ \t]*(\r?\n|(?:\\r)?\\n)[ \t]*value:[ \t]*(\\?["']?)/g;
+
+/** The values of Kubernetes environment variables whose name is a credential's (`ENV_PAIR_*_RE`). */
+function maskEnvPairs(text: string): { text: string; hits: number } {
+  type Pair = { from: number; quote: string; keyQuoted: boolean; closeQuote: string };
+  const pairs: Pair[] = [];
+  ENV_PAIR_JSON_RE.lastIndex = 0;
+  for (let m = ENV_PAIR_JSON_RE.exec(text); m; m = ENV_PAIR_JSON_RE.exec(text)) {
+    if (isSensitiveKey(m[2])) pairs.push({ from: m.index + m[0].length, quote: m[3], keyQuoted: true, closeQuote: "" });
+  }
+  ENV_PAIR_YAML_RE.lastIndex = 0;
+  for (let m = ENV_PAIR_YAML_RE.exec(text); m; m = ENV_PAIR_YAML_RE.exec(text)) {
+    if (isSensitiveKey(m[2])) {
+      pairs.push({ from: m.index + m[0].length, quote: m[4], keyQuoted: false, closeQuote: m[3].startsWith("\\") ? '"' : "" });
+    }
+  }
+  if (!pairs.length) return { text, hits: 0 };
+  pairs.sort((a, b) => a.from - b.from);
+  const ends = new NamedValueEnds(text);
+  let out = "";
+  let kept = 0;
+  let hits = 0;
+  for (const p of pairs) {
+    if (p.from < kept) continue;
+    const end = ends.end(p.from, p.quote, p.keyQuoted, p.closeQuote);
+    const value = text.slice(p.from, end);
+    if (!value || NOT_A_VALUE_RE.test(value)) continue;
+    hits += 1;
+    out += `${text.slice(kept, p.from)}<redacted>`;
+    kept = end;
+  }
+  return { text: out + text.slice(kept), hits };
+}
+
+/**
+ * `redactSecrets`, and then what a log carries that a transcript pass does not mask: a value written after a credential's name
+ * (`DB_PASSWORD=...`, `"api_key": "..."`), a Kubernetes environment variable named like a credential, and an armored private key.
+ * For text a log read returned, before a model sees it (an assistant's router reads logs with `ExecuteRequest.log_reads`): a job
+ * prints its environment and its configuration, and names are the one thing such a value carries. Not for transcripts: there
+ * `token = getToken()` and `password: required` are code and prose, and the name pass is the one `redactSecrets` keeps out of free
+ * text on purpose.
+ */
+export function redactLogSecrets(text: string, extraSecrets: string[] = []): RedactResult {
+  const first = redactSecrets(text, extraSecrets);
+  const keys = maskPrivateKeys(first.text);
+  let hits = first.hits + keys.hits;
+  const out = keys.text;
+  const ends = new NamedValueEnds(out);
+  const lines = new LineTracker(out);
+  let masked = "";
+  let kept = 0;
+  NAMED_VALUE_START_RE.lastIndex = 0;
+  for (let m = NAMED_VALUE_START_RE.exec(out); m; m = NAMED_VALUE_START_RE.exec(out)) {
+    const [start, q1, name, sep, scheme = "", q2] = m;
+    if (!isSensitiveKey(name)) continue;
+    const from = m.index + start.length;
+    // `"env": [...]`, `"auth": {...}`: a structure, whose own entries are judged by their own names.
+    if (!q2 && !scheme && sep.includes(":") && (out[from] === "[" || out[from] === "{")) continue;
+    const end = ends.end(from, q2, q1 !== "", lines.closeQuoteAt(m.index));
+    const value = out.slice(from, end);
+    // Any value but a switch or a placeholder, however short: `password=abc` is a credential too.
+    if (!value || NOT_A_VALUE_RE.test(value)) continue;
+    hits += 1;
+    masked += `${out.slice(kept, m.index)}${q1}${name}${q1}${sep}${scheme}${q2}<redacted>`;
+    kept = end;
+    NAMED_VALUE_START_RE.lastIndex = end;
+  }
+  const pairs = maskEnvPairs(masked + out.slice(kept));
+  return { text: pairs.text, hits: hits + pairs.hits };
+}
+
+/**
  * Redact `text`, then truncate it to `max` characters for logging.
  *
  * The order is the point. Truncating first can cut a secret in half, leaving a

@@ -287,8 +287,15 @@ export async function recentEvents(itemId: string, limit = 20): Promise<Array<Re
 
 // --- Taking on an item ----------------------------------------------------------------
 
+/** The most items one user may have waiting for a slot (`queueWhenFull`); past it the limit's refusal stands. */
+export const MAX_QUEUED_ITEMS = 20;
+/** An open item that holds a slot, and one waiting for one (`params.queued`), as SQL over `claw_work_items`. */
+export const RUNNING = "board_state <> 'done' AND NOT (params ? 'queued')";
+export const WAITING = "board_state <> 'done' AND params ? 'queued'";
+
 export type InsertWorkItemResult =
-  | { ok: true; itemId: string; seq: number }
+  /** `queued`: over the limit named, the item waits for a slot (`queueWhenFull`) and nothing of it may run yet. */
+  | { ok: true; itemId: string; seq: number; queued?: "too_many_active_items" | "too_many_requested_reviews" | "too_many_from_requester" }
   | { ok: false; error: "too_many_active_items" | "too_many_requested_reviews" | "too_many_from_requester" | "no_assistant" };
 
 /**
@@ -300,6 +307,10 @@ export type InsertWorkItemResult =
  * statement: the user's own (the per-user limit), and reviews others asked of the
  * user (`requestedBy`, the user's review-agent limits: in all, and per requester).
  * Neither can take the other's room, so what others ask never fills the user's board.
+ *
+ * With `queueWhenFull`, an item over its limit is not refused but queued (`params.queued`), up to `MAX_QUEUED_ITEMS` per user: it
+ * holds no slot, and `startQueuedReviews` (review-items.ts) starts it, oldest first, once one is free. One that would fit while others
+ * of its kind still wait is queued behind them. Queued items are counted apart from the running ones.
  */
 export async function insertWorkItem(
   q: StatementRunner,
@@ -307,39 +318,49 @@ export async function insertWorkItem(
     userId: string; title: string; workerSessionId: string; repo?: unknown; kind?: ItemKind; params?: Record<string, unknown>;
     /** Who asked for this review, when it is not the user's own. */
     requestedBy?: string | null;
+    /** Over the limit, queue the item instead of refusing it (a review item: `insertReview`). */
+    queueWhenFull?: boolean;
   },
 ): Promise<InsertWorkItemResult> {
   const locked = await q.query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [input.userId]);
   if (!locked.rowCount) return { ok: false, error: "no_assistant" };
   const counts = (await q.query(
-    `SELECT COUNT(*) FILTER (WHERE board_state <> 'done' AND NOT (params ? 'requested_by'))::int AS active,
-            COUNT(*) FILTER (WHERE board_state <> 'done' AND params ? 'requested_by')::int AS others,
-            COUNT(*) FILTER (WHERE board_state <> 'done' AND params->>'requested_by' = $2)::int AS requester,
+    `SELECT COUNT(*) FILTER (WHERE ${RUNNING} AND NOT (params ? 'requested_by'))::int AS active,
+            COUNT(*) FILTER (WHERE ${RUNNING} AND params ? 'requested_by')::int AS others,
+            COUNT(*) FILTER (WHERE ${RUNNING} AND params->>'requested_by' = $2)::int AS requester,
+            COUNT(*) FILTER (WHERE ${WAITING})::int AS queued,
+            COUNT(*) FILTER (WHERE ${WAITING} AND (params ? 'requested_by') = ($2::text IS NOT NULL))::int AS queued_alike,
             COALESCE(MAX(seq), 0)::int + 1 AS next
        FROM claw_work_items WHERE user_id = $1`,
     [input.userId, input.requestedBy ?? null],
-  )).rows[0] as { active: number; others: number; requester: number; next: number };
+  )).rows[0] as { active: number; others: number; requester: number; queued: number; queued_alike: number; next: number };
+  let over: "too_many_active_items" | "too_many_requested_reviews" | "too_many_from_requester" | null = null;
   if (input.requestedBy) {
     const limits = reviewAgentSettings(input.userId);
-    if (counts.others >= limits.othersMaxActive) return { ok: false, error: "too_many_requested_reviews" };
-    if (counts.requester >= limits.perRequesterMaxActive) return { ok: false, error: "too_many_from_requester" };
+    if (counts.others >= limits.othersMaxActive) over = "too_many_requested_reviews";
+    else if (counts.requester >= limits.perRequesterMaxActive) over = "too_many_from_requester";
   } else if (counts.active >= CLAW_ASSISTANT_MAX_ACTIVE_ITEMS) {
-    return { ok: false, error: "too_many_active_items" };
+    over = "too_many_active_items";
   }
+  // Behind the ones already waiting, whether or not this one would fit now: the queue starts them in order.
+  const queue = input.queueWhenFull === true && (over !== null || counts.queued_alike > 0) && counts.queued < MAX_QUEUED_ITEMS;
+  if (over && !queue) return { ok: false, error: over };
+  const queued = queue ? (over ?? (input.requestedBy ? "too_many_requested_reviews" : "too_many_active_items")) : null;
+  const params = queued ? { ...(input.params ?? {}), queued: { since: new Date().toISOString(), reason: queued } } : input.params;
   const itemId = newWorkItemId();
   await q.query(
     `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo, kind, params)
      VALUES ($1, $2, $3, $4, 'in_progress', $5, $6::jsonb, $7, $8::jsonb)`,
     [
       itemId, input.userId, counts.next, clipOneLine(input.title, TITLE_MAX), input.workerSessionId,
-      input.repo === undefined ? null : JSON.stringify(input.repo), input.kind ?? "task", JSON.stringify(input.params ?? {}),
+      input.repo === undefined ? null : JSON.stringify(input.repo), input.kind ?? "task", JSON.stringify(params ?? {}),
     ],
   );
   await q.query(
     "INSERT INTO claw_work_item_events (item_id, kind, source, generation) VALUES ($1, 'created', 'router', 0)",
     [itemId],
   );
-  return { ok: true, itemId, seq: counts.next };
+  return { ok: true, itemId, seq: counts.next, ...(queued ? { queued } : {}) };
 }
 
 // --- What only a person decides -------------------------------------------------------

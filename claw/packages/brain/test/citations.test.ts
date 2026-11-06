@@ -16,6 +16,8 @@
  *   C8 the say's text streams whatever follows it: `sources` after `text` does not hold the text back
  *   C9 a page web_fetch read is a source only at an address a search or GitHub result or the user's message gave first: a link a
  *      result's text names, fetched and cited, is dropped, from the cache too
+ *   C10 a link server's (the agent board's) result objects are sources by their own `html_url` under the server's prefix: the say of
+ *      #16 keeps its board issue; an address in a body, under another prefix, of another server or of a failed call is not one
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
@@ -324,4 +326,49 @@ test("C7 the MCP client sends a request's _meta and reads a result's claw/source
 test("C8 the say's text streams whatever follows it: sources after text do not hold it back", () => {
   assert.equal(partialStringField(`{"text": "#309 merged [1]", "sources": ["https://github.com/AMD-AGI/Prim`, "text"), "#309 merged [1]");
   assert.equal(partialStringField(`{"text": "#309 mer`, "text"), "#309 mer");
+});
+
+test("C10 the agent board's issues are sources by their own html_url, under its prefix only", async () => {
+  const BOARD = "https://board.example/board/";
+  const ISSUE = `${BOARD}boards/clawy-eval/issues/2`;
+  const issues = JSON.stringify([
+    { html_url: ISSUE, title: "你真正会问 Clawy 的 10 个问题", body: "see https://evil.example/x and https://board.example/board/boards/other/issues/9" },
+    { html_url: "https://evil.example/board/boards/x/issues/1", title: "elsewhere" },
+    { html_url: `${BOARD}../admin`, title: "climbs out" },
+    { number: 3, title: "no address" },
+  ]);
+  const comments = JSON.stringify([{ html_url: `${ISSUE}#issuecomment-7`, body: "Also looping in" }]);
+  const repo = JSON.stringify({ html_url: `${BOARD}boards/hyperloom-multibranch`, full_name: "boards/hyperloom-multibranch" });
+  const { router, calls } = routerWith({
+    "agent-board": (tool) => tool === "list_issues" ? { text: issues }
+      : tool === "issue_read" ? { text: comments }
+      : tool === "get_repo" ? { text: repo }
+      : tool === "broken" ? { text: JSON.stringify([{ html_url: `${BOARD}boards/x/issues/5`, title: "failed" }]), isError: true }
+      : { text: "[{\"html_url\": \"" + BOARD + "cut" },
+    autopilot: () => ({ text: JSON.stringify([{ html_url: `${BOARD}boards/x/issues/6`, title: "not a link server" }]) }),
+    assistant: () => ({ text: "{\"ok\":true}" }),
+  });
+  router.citations = parseCite({ tools: [SAY], source_servers: [], link_servers: { "agent-board": BOARD, bad: "http://board.example/board/" } }, {});
+  for (const tool of ["list_issues", "issue_read", "get_repo", "broken", "cut"]) {
+    await router.route(`mcp__agent-board__${tool}`, {}, undefined, { isError: false });
+  }
+  await router.route("mcp__autopilot__get_nodes", {}, undefined, { isError: false });
+  assert.equal(router.citations!.size, 2, "the issue (its comment is the same page) and the board, nothing else");
+  // #16: the say names the board issue it read, and it reaches the API as a source.
+  await router.route(SAY, {
+    text: "clawy-eval 只有 2 条 [1]；hyperloom-multibranch 见 [2]；[3][4]",
+    sources: [ISSUE, `${BOARD}boards/hyperloom-multibranch`, "https://evil.example/x", `${BOARD}boards/other/issues/9`],
+  });
+  assert.deepEqual(calls.at(-1)!.meta, {
+    [CITE_SOURCES_META]: [
+      { n: 1, url: ISSUE, title: "你真正会问 Clawy 的 10 个问题", kind: "board" },
+      { n: 2, url: `${BOARD}boards/hyperloom-multibranch`, title: "boards/hyperloom-multibranch", kind: "board" },
+    ],
+    [CITE_DROPPED_META]: { not_in_turn: 2, invalid: 0, over_cap: 0 },
+  });
+  // Without link_servers (the deployment lists none), the same lookups keep nothing: as before.
+  const before = routerWith({ "agent-board": () => ({ text: issues }), assistant: () => ({ text: "{}" }) });
+  before.router.citations = parseCite({ tools: [SAY], source_servers: [] }, {});
+  await before.router.route("mcp__agent-board__list_issues", {}, undefined, { isError: false });
+  assert.equal(before.router.citations!.size, 0);
 });

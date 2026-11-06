@@ -12,6 +12,7 @@
  * they are dropped and the channel's answer stands alone (`dropHeldSays`); when the turn ends, they are due at once
  * (`releaseHeldSays`); if neither comes, they go out at HOLD_SECONDS as any other.
  */
+import { CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import type { Querier } from "../infra/db.js";
 import type { TurnMessage } from "./inbound.js";
 import type { AssistantSayPayload } from "../notifications/assistant-events.js";
@@ -28,14 +29,22 @@ export function mayHandOff(message: TurnMessage | null | undefined): boolean {
   return !!context && context.handoffs.includes("review_for_other") && context.people.some((p) => !!p.user_id);
 }
 
-/** The turn handed a review over: its held says never go out. The number of deliveries dropped. */
-export async function dropHeldSays(q: Querier, messageId: string): Promise<number> {
+/**
+ * The turn handed a review over: its held says never go out on their own. Returns their texts, each once, in the order they were said:
+ * the handoff carries them (`AssistantReviewHandoff.held_says`), so the channel's one answer still tells the person what they said.
+ */
+export async function dropHeldSays(q: Querier, messageId: string): Promise<string[]> {
+  if (!CLAW_NOTIFICATIONS_ENABLED) return [];   // (no outbox table: nothing is ever held)
   const r = await q(
-    `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'dropped: the turn handed a review to the channel'
-      WHERE last_status = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
+    `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'dropped: the turn handed a review to the channel; carried by the handoff'
+      WHERE last_status = $1 AND delivered_at IS NULL AND dropped_at IS NULL
+      RETURNING id, event_id, payload->>'text' AS text`,
     [heldStatus(messageId)],
   );
-  return r.rowCount ?? 0;
+  const rows = (r.rows as Array<{ id: string; event_id: string; text: string | null }>).sort((a, b) => Number(a.id) - Number(b.id));
+  const texts = new Map<string, string>();
+  for (const row of rows) if (row.text?.trim() && !texts.has(row.event_id)) texts.set(row.event_id, row.text.trim());
+  return [...texts.values()];
 }
 
 /**
@@ -43,6 +52,7 @@ export async function dropHeldSays(q: Querier, messageId: string): Promise<numbe
  * deliveries carry), for its session event, which was held with it (`outbound.ts`, `announce`).
  */
 export async function releaseHeldSays(q: Querier, messageId: string): Promise<Array<{ sayId: string; payload: AssistantSayPayload }>> {
+  if (!CLAW_NOTIFICATIONS_ENABLED) return [];   // (no outbox table: nothing is ever held)
   const r = await q(
     `UPDATE claw_notification_outbox SET next_attempt_at = NOW(), last_status = NULL
       WHERE last_status = $1 AND delivered_at IS NULL AND dropped_at IS NULL
@@ -55,15 +65,40 @@ export async function releaseHeldSays(q: Querier, messageId: string): Promise<Ar
 }
 
 /**
- * Whether the turn that began at `since` has had an item's start told to the user in the system's words (`announceStarted` in
- * `tools.ts`: "已开始：#N 标题。…" / "Started #N title. …", a system notice about the item). Its router then says nothing more in that
- * turn: the gate found a second message ("任务已建好…") beside that notice every time (2026-11-06).
+ * Whether the system's start notice of an item ("已开始：#N 标题。…" / "Started #N title. …", `announceStarted` in `tools.ts`) has been
+ * told since `since` (the turn began), whether or not any channel got it: what refuses the turn's unsaid final text after it, which
+ * would repeat it ("任务已建好…", found by the release gate on 2026-11-06). Read from the stored messages only, so it holds with
+ * notifications off and for a user no channel is subscribed for.
  */
-export async function turnAnnouncedStart(q: Querier, userId: string, since: Date | string): Promise<boolean> {
+export async function turnToldStart(q: Querier, userId: string, since: Date | string): Promise<boolean> {
   return (await q(
     `SELECT 1 FROM claw_assistant_says
       WHERE user_id = $1 AND fallback AND item_id IS NOT NULL AND created_at >= $2
         AND (text LIKE '已开始：#%' OR text LIKE 'Started #%') LIMIT 1`,
     [userId, since],
   )).rows.length > 0;
+}
+
+/**
+ * The system's start notice of an item told in the turn that began at `since` (`announceStarted` in `tools.ts`: "已开始：#N 标题。…" /
+ * "Started #N title. …", a system notice about the item), by its say id; null when there is none. A router say after it in the turn
+ * adds to that message (`AssistantSayPayload.amends`) instead of being a second one: the gate found a second message ("任务已建好…")
+ * beside that notice every time (2026-11-06), and refusing it lost what else it said.
+ */
+export async function turnAnnouncedStart(q: Querier, userId: string, since: Date | string, messageId: string): Promise<string | null> {
+  // Without notifications there is no channel to show the notice in, and no outbox table to find it by: a say is a message of its own.
+  if (!CLAW_NOTIFICATIONS_ENABLED) return null;
+  // Of this very turn: the message it answers, kept on the notice's delivery. A notice no channel got has no delivery to say whose it
+  // is, and turns of one user can overlap (an ended gate lets an older run speak), so it is never matched by time: a say after it is
+  // then a message of its own, which loses nothing (and there is no channel that would join the two). Read from the user's recent
+  // messages first (their index), then their deliveries.
+  const row = (await q(
+    `SELECT s.say_id::text AS say_id FROM claw_assistant_says s
+      WHERE s.user_id = $1 AND s.fallback AND s.item_id IS NOT NULL AND s.created_at >= $2
+        AND (s.text LIKE '已开始：#%' OR s.text LIKE 'Started #%')
+        AND EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text AND o.payload->>'turn_message_id' = $3)
+      ORDER BY s.created_at DESC LIMIT 1`,
+    [userId, since, messageId],
+  )).rows[0] as { say_id: string } | undefined;
+  return row?.say_id ?? null;
 }

@@ -49,6 +49,7 @@ import {
 } from "./review-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { attendedTurn, ToolRefused } from "./tools.js";
+import { attachRefOf, ownAttachRef } from "./devenv-tools.js";
 import { resolveWorkItemNow } from "./work-items.js";
 import { modelChoiceOn } from "./model-choice.js";
 import { voidStreamedSay } from "./router-speed.js";
@@ -615,17 +616,19 @@ async function handOffReview(
     // One handoff per message, reviewer, pull requests and merge: a replayed call queues nothing more.
     const key = [reviewer.userId, merge ? "merge" : "review", ...prs.map((p) => `${p.owner}/${p.repo}#${p.number}`.toLowerCase()).sort()].join("\u0000");
     const eventId = deterministicEventId("assistant.review_handoff", claims.mid, key);
+    await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge, messageId: claims.mid });
+    // What the turn said before this, held until it ended (`say-hold.ts`), does not go out on its own: the channel's answer is the
+    // one message, and it carries these words (`held_says`), so nothing the person asked besides the review is lost.
+    const held = await dropHeldSays(q, claims.mid);
+    if (held.length) logger.info({ eventId, held: held.length }, "assistant.held_says_joined_to_handoff");
     const review: AssistantReviewHandoff = {
       handoff_id: eventId,
       reviewer: { user_id: reviewer.userId, name: reviewer.name },
       prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
       merge,
       requester_note: note.slice(0, REQUESTER_NOTE_MAX_CHARS),
+      ...(held.length ? { held_says: held } : {}),
     };
-    await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge, messageId: claims.mid });
-    // What the turn said before this, held until it ended (`say-hold.ts`), never goes out: the channel's answer is the one message.
-    const dropped = await dropHeldSays(q, claims.mid);
-    if (dropped) logger.info({ eventId, dropped }, "assistant.held_says_dropped_for_handoff");
     const payload: AssistantActionPayload = {
       type: "assistant.action", event_id: eventId, occurred_at: new Date().toISOString(), user_id: userId,
       message_id: claims.mid, channel_message_id: channelMessageId, action: { name: REVIEW_HANDOFF_ACTION, args: "" }, review,
@@ -908,8 +911,21 @@ export async function channelAction(claims: AssistantTokenClaims, args: { name: 
   }
   if (actionArgs.length > ACTION_ARGS_MAX) throw new ToolRefused("invalid_arguments", `args is at most ${ACTION_ARGS_MAX} characters`);
   const command = actionCommand(name, actionArgs);
+  const attachRef = attachRefOf(name, actionArgs);
   const sent = await inTransaction(async (q) => {
-    const { userId, message } = await attendedTurn(q, claims);
+    let turn: Awaited<ReturnType<typeof attendedTurn>>;
+    // Whether this is a turn that has read untrusted text (a development environment list, `devenv-tools.ts`) putting the attach
+    // command of one of the user's own sessions to them: the one thing such a turn may still do, and only as a button.
+    let untrustedAttach = false;
+    try {
+      turn = await attendedTurn(q, claims);
+    } catch (err) {
+      if (!(err instanceof ToolRefused && err.code === "read_untrusted" && attachRef)) throw err;
+      turn = await attendedTurn(q, claims, { readUntrustedOk: true });
+      if (!(await ownAttachRef(turn.userId, attachRef))) throw err;
+      untrustedAttach = true;
+    }
+    const { userId, message } = turn;
     // Only what the channel that carried this message said it can do: Claw knows no channel's commands.
     const offered = message.context.actions.find((a) => a.name.replace(/^\/+/, "") === name);
     if (!offered) {
@@ -921,7 +937,7 @@ export async function channelAction(claims: AssistantTokenClaims, args: { name: 
     // Listed is what the channel can do; asked is what the person wants. Only the command typed whole runs at once: the router
     // reads what workers wrote beside the message, so how it read a sentence never changes a setting. Anything else is put to
     // the person as the exact command, with a button, and runs only when they press it (or type it).
-    if (!typedActionCommand(message.content, name, actionArgs)) {
+    if (untrustedAttach || !typedActionCommand(message.content, name, actionArgs)) {
       const zh = /\p{Script=Han}/u.test(message.content);
       const confirm = await recordActionConfirm(q, {
         userId, sessionId: claims.sid, key: `${claims.mid}\u0000${name}\u0000${actionArgs}`,

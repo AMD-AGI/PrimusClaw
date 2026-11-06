@@ -54,7 +54,7 @@ describe("claw-connector commands", () => {
     assert.match(u.errText(), /unknown command/);
     const v = ctx(home);
     assert.equal(await main(["--version"], v.c), EXIT.ok);
-    assert.equal(v.text(), "0.1.2");
+    assert.equal(v.text(), "0.1.3");
     assert.equal(await main(["--help"], ctx(home).c), EXIT.ok);
   });
 
@@ -237,17 +237,18 @@ describe("claw-connector commands", () => {
   test("run needs a config with agents and a sign-in, and refuses a credentials file others can read", async () => {
     const home = tmpdir();
     const work = tmpdir("w-");
+    // Each is exit 78: a supervisor must not restart a run that only a person can fix.
     const a = ctx(home);
-    assert.equal(await main(["run"], a.c), EXIT.failure);
+    assert.equal(await main(["run"], a.c), EXIT.needsPerson);
     assert.match(a.errText(), /agents\.toml/);
     writeConfig(home, work);
     const b = ctx(home);
-    assert.equal(await main(["run"], b.c), EXIT.failure);
+    assert.equal(await main(["run"], b.c), EXIT.needsPerson);
     assert.match(b.errText(), /not signed in/);
     await main(["login", "--server", "http://127.0.0.1:1", "--key", "k"], ctx(home).c);
     fs.chmodSync(credentialsFile(b.c.dirs), 0o644);
     const d = ctx(home);
-    assert.equal(await main(["run"], d.c), EXIT.failure);
+    assert.equal(await main(["run"], d.c), EXIT.needsPerson);
     assert.match(d.errText(), /readable by other users/);
   });
 

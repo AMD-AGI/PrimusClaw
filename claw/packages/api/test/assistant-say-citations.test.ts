@@ -23,7 +23,7 @@ process.env.CLAW_ASSISTANT_ENABLED = "true";
 process.env.CLAW_ASSISTANT_CITATIONS = "true";
 
 const {
-  saySources, sourceTitle, citedNumbers, makesLink, routerCite, userAddresses, SAY_SOURCES_MAX_BYTES, SAY_SOURCE_TITLE_MAX, USER_ADDRESSES_MAX,
+  saySources, sourceTitle, citedNumbers, makesLink, routerCite, citeLinkServers, userAddresses, SAY_SOURCES_MAX_BYTES, SAY_SOURCE_TITLE_MAX, USER_ADDRESSES_MAX,
 } = await import("../src/assistant/citations.js");
 const { TURN_STATE_HEADER } = await import("../src/assistant/prompts.js");
 const { renderRouterReadSection } = await import("../src/assistant/prompts.js");
@@ -125,6 +125,14 @@ test("SC4 a router turn cites with say, from the API's GitHub server when it has
   assert.deepEqual(routerCite({}, "总结一下 https://example.com/post", true),
     { tools: ["mcp__assistant__say"], source_servers: [], user_urls: ["https://example.com/post"] });
   assert.equal(routerCite({ [GITHUB_MCP_SERVER]: {} }, "https://example.com/post", false), null);
+  // A link server (the agent board) is named only when the turn reads it and the deployment lists it.
+  const board = { "agent-board": "https://board.example/board/" };
+  assert.deepEqual(routerCite({}, "", true, ["agent-board", "safe"], board),
+    { tools: ["mcp__assistant__say"], source_servers: [], link_servers: board });
+  assert.deepEqual(routerCite({}, "", true, ["safe"], board), { tools: ["mcp__assistant__say"], source_servers: [] });
+  assert.deepEqual(citeLinkServers(" agent-board=https://board.example/board/ , x=http://a.example/b/, y=https://a.example/b, z=https://a.example/b/?q=1, =https://a.example/c/, w"),
+    { "agent-board": "https://board.example/board/" }, "only name=https://host/path/ entries");
+  assert.deepEqual(citeLinkServers(""), {});
   const on = renderRouterReadSection({ servers: [], github: ["pr_get"], cite: true });
   const off = renderRouterReadSection({ servers: [], github: ["pr_get"] });
   assert.match(on, /Citing what you looked up/);

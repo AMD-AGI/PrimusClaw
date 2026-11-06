@@ -246,6 +246,15 @@ interface CommonWorkloadParams {
   timeoutSec?: number;
   /** Total lifetime used when timeoutSec is omitted; includes any shutdown buffer. */
   defaultTimeoutSec?: number;
+  /**
+   * The caller's `--extra-env` / `topology.extra_env`, the only route to the
+   * GPU pods' env (they run no Hands, so there is no env file to carry it).
+   * It is stored in the SaFE workload, whose env SaFE returns to every caller
+   * allowed to read the workload: it is the caller's own, deliberately placed
+   * configuration, and Brain adds no credential to it (unlike the Hands
+   * sandbox, see sandbox/workload-env.ts). A secret the GPU pods need belongs
+   * in a workspace Secret, not here.
+   */
   extraEnv?: Record<string, string>;
   extraLabels?: Record<string, string>;
 }

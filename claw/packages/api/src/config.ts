@@ -624,11 +624,24 @@ export const CLAW_GITHUB_MCP_BINDING_ENABLED = envBool("CLAW_GITHUB_MCP_BINDING_
  *   CLAW_CONNECTOR_TOKEN_INTROSPECT  also ask the identity provider whether the
  *                                    token is still active, so a revoked grant
  *                                    stops at once instead of when the token expires
+ *   CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS
+ *                                    the oldest provider answer a connector token is
+ *                                    judged by, default 5 (0: ask every time). The
+ *                                    identity client keeps an answer for
+ *                                    IDENTITY_INTROSPECTION_CACHE_SECONDS (30) for
+ *                                    every caller; this bounds it for connectors, so
+ *                                    a revoked grant is refused within this many
+ *                                    seconds on every replica. A value out of 0..300
+ *                                    is not believed and the default is used.
  */
-export function connectorTokenSettings(): { audience: string; introspect: boolean } {
+export const CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_DEFAULT_SECONDS = 5;
+
+export function connectorTokenSettings(): { audience: string; introspect: boolean; introspectMaxAgeMs: number } {
+  const maxAge = readIntSetting(process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS, { wholeNumbersOnly: true, min: 0, max: 300 });
   return {
     audience: env("CLAW_CONNECTOR_TOKEN_AUDIENCE", "claw-api"),
     introspect: envBool("CLAW_CONNECTOR_TOKEN_INTROSPECT", false),
+    introspectMaxAgeMs: (maxAge && !("problem" in maxAge) ? maxAge.value : CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_DEFAULT_SECONDS) * 1000,
   };
 }
 
@@ -864,6 +877,13 @@ export const CLAW_ASSISTANT_STREAM_SAY = envBool("CLAW_ASSISTANT_STREAM_SAY", tr
 // names each number's address in `sources`; Brain keeps only addresses this turn's lookups returned, and an `assistant.say` carries
 // them as `sources` for the channel to show. Off (the default): no `sources` on `say`, and the prompt asks for links in the text.
 export const CLAW_ASSISTANT_CITATIONS = envBool("CLAW_ASSISTANT_CITATIONS", false);
+// With citations on, the plugin read servers whose results carry their own pages as `html_url` (Gitea's, for the agent board), each
+// with the prefix those pages' addresses have: `agent-board=https://host/board/`, comma-separated. A router turn that has such a
+// server may cite the issues and boards it read there (`ExecuteRequest.cite.link_servers`). Empty (the default): none.
+export const CLAW_ASSISTANT_CITE_LINK_SERVERS = env("CLAW_ASSISTANT_CITE_LINK_SERVERS");
+// `true` (the default) gives the router's `say` an optional `suggested`: up to three short replies the user is likely to send next,
+// carried by `assistant.say` as `suggested_replies` for a channel to show as buttons that send them (`assistant/suggested.ts`).
+export const CLAW_ASSISTANT_SUGGESTED_REPLIES = envBool("CLAW_ASSISTANT_SUGGESTED_REPLIES", true);
 // How long an item may need the user with nobody having told them before the system tells them.
 export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWEEP_SEC", 300, { min: 1 });
 // `on` gives the router the review and settings tools (review_start, review_restart, confirmation_answer,

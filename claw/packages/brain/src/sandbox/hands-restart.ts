@@ -15,30 +15,23 @@
  * from the first bootstrap, so this is a process start rather than a pod
  * schedule plus a 90MB download plus a workspace restore.
  *
- * The environment is deliberately not resent, and that holds only while every
- * pod is built for the request it serves. Such a pod carries the composed
- * environment in its spec, so the container has it and every shell the new
- * Hands spawns inherits it; resending would mean recomposing secrets nothing
- * needs touched.
+ * The environment is not recomposed: a restart has no request to compose it
+ * from. The credentials in it are not in the pod spec either -- SaFE returns a
+ * workload's env to every caller allowed to read the workload, so the workload
+ * carries only plain settings (sandbox/workload-env.ts). Instead the first
+ * bootstrap keeps a private copy of the env file in Hands' 0700 state
+ * directory, and `bootstrapHandsInSandbox`, called here without an environment,
+ * puts that copy back for the new Hands to read (sandbox/bootstrap.ts
+ * restoreEnvFileCmd). A sandbox bootstrapped before the copy existed still
+ * carries its environment in its pod spec, which the new Hands inherits.
  *
- * A pod claimed from the warm pool is the exception, and the reason
- * `restartPreservesEnvironment` exists. It was created before anyone knew whose
- * request it would take, so `overrides.environment` never reached its spec and
- * the environment arrived only through HANDS_ENV_FILE -- which Hands reads once
- * and unlinks. Restarting in place there would start a Hands holding the base
- * environment and none of `user_env`, `session_env` or the LLM keys, answer
- * /health, and run every later command without the user's credentials: the
- * exact "looks healthy and is missing the user's credentials" failure the env
- * file was added to remove (see sandbox/bootstrap.ts writeEnvFileCmd).
- *
- * Brain cannot tell a pooled pod from a purpose-built one after the fact, so
- * the test is whether the deployment has a pool at all. Raising
- * AGENT_SANDBOX_WARM_POOL_SIZE therefore turns in-place restart off for
- * agent-sandbox instead of silently stripping credentials; the refusal is
- * marked `refused` so the caller falls back to the rebuild it had before
- * rather than treating it as a container worth keeping. Making the two work together means
- * composing the environment again here and handing it to
- * `bootstrapHandsInSandbox`; that is the work to do before that knob is raised.
+ * A pod claimed from the warm pool is the case `restartPreservesEnvironment`
+ * was written for: it was created before anyone knew whose request it would
+ * take, so its environment arrived only through HANDS_ENV_FILE. The restart
+ * copy covers it too, but the refusal is kept until a pooled restart has been
+ * exercised: raising AGENT_SANDBOX_WARM_POOL_SIZE turns in-place restart off
+ * for agent-sandbox, marked `refused`, so the caller falls back to the rebuild
+ * it had before rather than treating it as a container worth keeping.
  */
 import pino from "pino";
 import { sleep } from "@claw/utils";
@@ -234,9 +227,9 @@ export function stopStaleHandsCmd(): string {
 /**
  * Whether a restarted Hands would still hold the environment this one has.
  *
- * See the note at the top of this file: only for a pod created for its own
- * request, which is every pod while there is no warm pool. safe-workload has no
- * pool, so it is always safe.
+ * See the note at the top of this file. safe-workload has no pool, and its
+ * restart restores the environment from the copy bootstrap kept, so it is
+ * always safe.
  */
 export function restartPreservesEnvironment(inst: SandboxInstance): boolean {
   return inst.provider !== "agent-sandbox" || AGENT_SANDBOX_WARM_POOL_SIZE === 0;
