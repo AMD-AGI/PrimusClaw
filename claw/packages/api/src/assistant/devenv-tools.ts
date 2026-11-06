@@ -562,6 +562,10 @@ export function sendCardText(
  * sessions and agents are ever chosen (`planSend`), and what a machine reported reaches the model only after the choice, after which the
  * turn has read it.
  */
+const wordsOf = (s: string): string => s.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+/** Whether `text` stands, as it is, in what the person wrote (case and spacing aside). */
+export const inTheirWords = (said: string, text: string): boolean => wordsOf(said).includes(wordsOf(text));
+
 export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendArgs): Promise<Record<string, unknown>> {
   if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
   const text = typeof args.text === "string" ? args.text.trim() : "";
@@ -582,6 +586,12 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
     if (!(err instanceof ToolRefused)) throw err;
     attended = false;
     refusal = err;
+  }
+  // Sent at once only in the person's own words: an instruction the model worded (or took from text others wrote, such as an
+  // agent's answer on the item list) is put to them as a card, where they read exactly what would be sent.
+  if (attended && !inTheirWords(message.content, text)) {
+    attended = false;
+    refusal = new ToolRefused("not_their_words", "the instruction is not in the user's own words");
   }
   const planned = await planSend(userId, args);
   const lang = langOf(message.content);
