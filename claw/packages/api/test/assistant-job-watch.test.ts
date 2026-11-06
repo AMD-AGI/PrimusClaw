@@ -14,6 +14,10 @@
  *   J5  the poll claims each due watch once, and only due ones
  *   J6  job_watch_list and job_unwatch; the limit of watches
  *   J7  the tools are offered to a router only with the flag on (see assistant-job-watch-flag-off for off)
+ *   J8  a kind the deployment adds (CLAW_ASSISTANT_JOB_HTTP_SOURCES) is read over HTTP with the user's key: its URL names the id,
+ *       URL-encoded; each change is told once and the end ends the watch; a 404 is not found; with an owner path, a job of someone
+ *       else's is not theirs; the router is offered the kind and told what it is for; entries that cannot be trusted with a key are
+ *       left out
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -225,5 +229,94 @@ describe("assistant job watches", { skip }, () => {
     for (const n of ["job_watch", "job_watch_list", "job_unwatch"]) assert.ok(router.includes(n), n);
     const item = await w.createItem(alice, "x");
     assert.ok(!(await names(await w.workerTurn(item.itemId))).some((n) => n.startsWith("job_")));
+  });
+
+  test("J8 a kind the deployment adds is read over HTTP with the user's key, told once per change, and ends with the job", async (t) => {
+    const parsed = jw.parseJobHttpSources(JSON.stringify([
+      { kind: "build", description: "a build of the user's (its id)", url: "http://builds.ci.svc:8080/api/builds/{id}", state: "build.state",
+        detail: "build.reason", ended: ["succeeded", "failed", "canceled"] },
+      { kind: "own", url: "https://jobs.example/api/{id}", state: "status", owner: "owner_id", ended: ["done"] },
+      { kind: "leaky", url: "http://jobs.example/api/{id}", state: "s", ended: ["x"] },
+      { kind: "noid", url: "https://jobs.example/api/1", state: "s", ended: ["x"] },
+      { kind: "run", url: "https://jobs.example/api/{id}", state: "s", ended: ["x"] },
+      { kind: "creds", url: "https://u:p@jobs.example/api/{id}", state: "s", ended: ["x"] },
+      { kind: "noend", url: "https://jobs.example/api/{id}", state: "s", ended: [] },
+    ]));
+    assert.deepEqual(parsed.sources.map((x) => x.kind), ["build", "own"]);
+    assert.equal(parsed.errors.length, 5, parsed.errors.join("; "));
+    assert.match(parsed.errors[0], /https, or http to an in-cluster \.svc host/, "plain http off the cluster would carry the key in the clear");
+    assert.deepEqual(jw.parseJobHttpSources("{oops").errors, ["not JSON"]);
+    jw.setJobHttpSources(parsed.sources);
+    t.after(() => jw.setJobHttpSources(null));
+    const answers = new Map<string, { status: number; body: unknown }>();
+    const gets: Array<{ url: string; key: string }> = [];
+    const real = jw.jobWatchPorts.httpGet;
+    jw.jobWatchPorts.httpGet = async (url, key) => {
+      gets.push({ url, key });
+      return answers.get(url) ?? { status: 404, body: null };
+    };
+    t.after(() => { jw.jobWatchPorts.httpGet = real; });
+    const url = "http://builds.ci.svc:8080/api/builds/repair%3Aoneoff-1";
+    await w.subscribe("alice");
+    answers.set(url, { status: 200, body: { build: { state: "pending" } } });
+    const out = await jw.jobWatch(await userTurn(alice, "盯着 repair:oneoff-1 这个 build"), { kind: "build", id: "repair:oneoff-1", label: "修复构建" }) as Record<string, any>;
+    assert.deepEqual([out.watching, out.state, out.kind], [true, "pending", "build"]);
+    assert.deepEqual(gets, [{ url, key: "pk-alice" }], "the id is URL-encoded into the URL, read with the user's own key");
+    assert.equal(reads.length, 0, "SaFE is not asked about it");
+    const watch = await watchOf(out.watch_id);
+    const asPolled = { ...watch, id: Number(watch.id), transitions: Number(watch.transitions) };
+    assert.equal(await jw.pollWatch(asPolled), "same");
+    answers.set(url, { status: 200, body: { build: { state: "running" } } });
+    const [a, b] = await Promise.all([jw.pollWatch(asPolled), jw.pollWatch(asPolled)]);
+    assert.deepEqual([a, b].sort(), ["changed", "same"], "one change, however many polls saw it");
+    assert.deepEqual(await says("alice"), ["盯的作业 修复构建 现在是 running（之前是 pending）。"]);
+    answers.set(url, { status: 200, body: { build: { state: "failed", reason: "OOM on node 3" } } });
+    await due();
+    assert.deepEqual(await jw.pollDueWatches(), { polled: 1, changed: 1 });
+    assert.equal((await says("alice")).at(-1), "盯的作业 修复构建 已结束：failed。OOM on node 3。不再盯了。");
+    assert.equal((await watchOf(out.watch_id)).state, "ended");
+    await due();
+    assert.deepEqual(await jw.pollDueWatches(), { polled: 0, changed: 0 }, "an ended job is not read again");
+    assert.equal((await says("alice")).length, 2, "two changes, two messages");
+
+    // Ended already: answered, not watched; unknown: not found; unreadable answer: refused as unreadable.
+    answers.set("http://builds.ci.svc:8080/api/builds/b-done", { status: 200, body: { build: { state: "succeeded" } } });
+    assert.equal((await jw.jobWatch(await userTurn(alice, "watch b-done"), { kind: "build", id: "b-done" }) as Record<string, any>).watching, false);
+    assert.equal(await code(jw.jobWatch(await userTurn(alice, "watch b-none"), { kind: "build", id: "b-none" })), "not_found");
+    answers.set("http://builds.ci.svc:8080/api/builds/b-odd", { status: 200, body: { build: {} } });
+    assert.equal(await code(jw.jobWatch(await userTurn(alice, "watch b-odd"), { kind: "build", id: "b-odd" })), "unreadable");
+    answers.set("http://builds.ci.svc:8080/api/builds/b-403", { status: 403, body: null });
+    assert.equal(await code(jw.jobWatch(await userTurn(alice, "watch b-403"), { kind: "build", id: "b-403" })), "unreadable");
+
+    // With an owner path: only the user's own job.
+    answers.set("https://jobs.example/api/j-bob", { status: 200, body: { status: "running", owner_id: "bob" } });
+    answers.set("https://jobs.example/api/j-anon", { status: 200, body: { status: "running" } });
+    answers.set("https://jobs.example/api/j-alice", { status: 200, body: { status: "running", owner_id: "alice" } });
+    assert.equal(await code(jw.jobWatch(await userTurn(alice, "watch j-bob"), { kind: "own", id: "j-bob" })), "not_found");
+    assert.equal(await code(jw.jobWatch(await userTurn(alice, "watch j-anon"), { kind: "own", id: "j-anon" })), "not_found", "no owner named is no proof");
+    assert.equal((await jw.jobWatch(await userTurn(alice, "watch j-alice"), { kind: "own", id: "j-alice" }) as Record<string, any>).watching, true);
+
+    // The router is offered the kind, and told what it is for.
+    const { createAssistantMcpServer } = await import("../src/assistant/mcp.js");
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const server = createAssistantMcpServer(await userTurn(alice, "hi") as never, false, false, false);
+    const [x, y] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "t", version: "1" });
+    await Promise.all([server.connect(x), client.connect(y)]);
+    const tool = (await client.listTools()).tools.find((tt) => tt.name === "job_watch")!;
+    await client.close();
+    assert.deepEqual((tool.inputSchema.properties as any).kind.enum, ["workload", "run", "build", "own"]);
+    assert.match(String(tool.description), /a build of the user's \(its id\) \(kind build\)/);
+    const { renderRouterProactiveSection } = await import("../src/assistant/proactive-prompt.js");
+    assert.match(
+      renderRouterProactiveSection({ schedules: false, jobs: true, pullRequests: false, jobKinds: [{ kind: "build", description: "a build of the user's (its id)" }] }),
+      /run for a run of theirs in this deployment \(its task id\), build for a build of the user's \(its id\)\./,
+    );
+    // A kind no longer configured is not read: the watch says so rather than guessing.
+    jw.setJobHttpSources([]);
+    assert.equal(await code(jw.jobWatch(await userTurn(alice, "watch b"), { kind: "build", id: "b" })), "invalid_arguments");
+    const { db } = await import("../src/infra/db.js");
+    assert.deepEqual(await jw.readJob((q, p) => db.query(q, p), { user_id: "alice", source: "build", target: "b" }), { kind: "error", code: "source_not_configured" });
   });
 });

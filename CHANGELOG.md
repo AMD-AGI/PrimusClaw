@@ -65,6 +65,13 @@ record it.
 - The router's read section says what it can do, from the tool catalog (`router-read-v7`): reads at once; every write of its
   servers, GitHub's and anything needing code or a run through a work item whose worker asks the user before each write; never
   "read-only", and never a system failure (a sandbox that would not start, a 403) as a limit.
+- The assistant's week: `GET /v1/assistant/brief?range=week` and the router's `brief(range: "week")` put together the last seven
+  days (items that ended and how, pull requests merged or closed with their links, SaFE workloads that succeeded and failed), for a
+  weekly report written from what Claw holds. The router can schedule a brief through the same confirmation card as any trigger
+  (`trigger_create` with `action: "brief"`, no prompt), and a brief trigger whose schedule fires at most weekly says the week.
+- `CLAW_ASSISTANT_JOB_HTTP_SOURCES`: kinds of job the deployment adds to `job_watch`, each read over HTTP with the user's own
+  platform key (the URL names the job with `{id}`; dotted paths pick its state, a line about it and, optionally, its owner; listed
+  end states end the watch). Only https, or plain http to an in-cluster `.svc` host, is taken.
 - Three GitHub writes, each held for the user's decision like every write of the `github` server: `checks_rerun_failed` (run
   again the failed jobs of a GitHub Actions workflow run; `checks_list` now gives a job's `run_id`), `pr_request_reviewers` (people
   and teams) and `labels_set` (the whole list of an issue's or pull request's labels). None is a router read.

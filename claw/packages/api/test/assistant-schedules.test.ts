@@ -22,6 +22,8 @@
  *   S9  a card answered after the next run it showed: the trigger starts from the run after, and the answer says so
  *  S10  the same proposal again in a turn whose card was answered (or lapsed) says what became of it, and shows no new card
  *  S11  the same proposal again in a turn is the same card even after a run time has passed between the two calls
+ *   S12 trigger_create with action brief: a card naming the brief (the week, for a weekly schedule), no prompt needed; the press
+ *       creates a brief trigger; a run's card keeps its old params (no action); an unknown action is refused
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -378,6 +380,38 @@ describe("assistant schedules", { skip }, () => {
     assert.equal(again.confirmation_id, first.confirmation_id);
     assert.equal(await count("claw_assistant_confirmations"), 1, "one card, so one press can create it at most once");
     assert.equal(await count("claw_assistant_says"), 1);
+  });
+
+  test("S12 a brief is scheduled through the same card: the week for a weekly schedule, created as action brief", async () => {
+    await w.subscribe(alice.userId);
+    const turn = await userTurn(alice, "每周一 9 点给我周报");
+    const out = await sch.triggerCreateTool(turn, { name: "周报", schedule: "0 9 * * 1", timezone: "Asia/Shanghai", action: "brief" }) as Record<string, any>;
+    assert.equal(out.done, false);
+    const [c] = await w.q("SELECT * FROM claw_assistant_confirmations WHERE confirmation_id = $1", [out.confirmation_id]);
+    assert.equal(c.params.action, "brief");
+    const [say] = await w.q("SELECT text FROM claw_assistant_says");
+    assert.match(say.text, /要创建定时简报「周报」吗/);
+    assert.match(say.text, /你这一周的周报/, "a weekly schedule sends the week");
+    assert.match(say.text, /不运行模型/);
+    assert.match(say.text, new RegExp(`批准 #${out.ref}`));
+    const [row] = await w.q("SELECT payload FROM claw_notification_outbox");
+    assert.equal(row.payload.confirm_write.kind, "trigger_create", "the same card the chat draws");
+    assert.equal(await count("claw_triggers"), 0);
+    const pressed = await press("alice", out.confirmation_id, "allow");
+    assert.equal(pressed.body.data.status, "done", JSON.stringify(pressed.body));
+    const [t] = await w.q("SELECT * FROM claw_triggers");
+    assert.deepEqual([t.action, t.schedule, t.timezone, t.name], ["brief", "0 9 * * 1", "Asia/Shanghai", "周报"]);
+    assert.match(t.prompt, /daily brief/i, "the stored description; no model is ever given it");
+    assert.equal(pressed.body.data.result.trigger.action, "brief");
+
+    // A daily one says the day; a run's card is as it was, without an action of its own.
+    await sch.triggerCreateTool(await userTurn(alice, "每天早上 8 点给我简报"), { name: "简报", schedule: "0 8 * * *", timezone: "Asia/Shanghai", action: "brief" });
+    assert.match((await w.q("SELECT text FROM claw_assistant_says ORDER BY created_at DESC LIMIT 1"))[0].text, /你的每日简报/);
+    const run = await sch.triggerCreateTool(await userTurn(alice, "每天 9 点"), DAILY) as Record<string, any>;
+    const [rc] = await w.q("SELECT params FROM claw_assistant_confirmations WHERE confirmation_id = $1", [run.confirmation_id]);
+    assert.equal("action" in rc.params, false);
+    assert.equal(await code(sch.triggerCreateTool(await userTurn(alice, "x"), { ...DAILY, action: "dance" })), "invalid_arguments");
+    assert.equal(await code(sch.triggerCreateTool(await userTurn(alice, "x"), { ...DAILY, prompt: undefined })), "invalid_arguments", "a run still needs its prompt");
   });
 
   test("S8 a card pressed after it lapsed does nothing", async () => {
