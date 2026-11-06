@@ -72,7 +72,7 @@ export function readToolPatterns(server: string): string[] {
  * person's message covers what they wrote, not what the model read afterwards. Named by what is allowed, so a new tool is refused
  * until it is listed here.
  */
-export const AFTER_READ_TOOLS = ["say", "work_recall", "memory_recall", "connector_list"] as const;
+export const AFTER_READ_TOOLS = ["say", "work_recall", "memory_recall", "devenv_list"] as const;
 
 /**
  * The GitHub reads a router turn may call (`github-mcp/tools.ts`): finding and reading pull requests, issues, their checks and

@@ -304,6 +304,38 @@ export async function listSessions(owner: string, connectorId: string | null, li
   )).rows;
 }
 
+/** How many of a session's newest events {@link sessionActivity} reads, and how much of each one's text. */
+export const ACTIVITY_EVENTS = 300;
+const ACTIVITY_TEXT = 400;
+
+/**
+ * The owner's open sessions, newest activity first, each with its newest events cut down to what says what it is doing: the
+ * type, when, the text of a message chunk or the title of a tool step (at most {@link ACTIVITY_TEXT} characters), a permission
+ * request's id, a turn's stop reason, and whether the event is replayed history. `queued` counts prompts accepted for it that its connector has not
+ * yet acknowledged. Nothing of anyone else's: every row is filtered on `owner`.
+ */
+export async function sessionActivity(owner: string, limit: number, events = ACTIVITY_EVENTS): Promise<Row[]> {
+  return (await direct(
+    `SELECT s.session_id::text AS session_id, s.connector_id::text AS connector_id, s.agent_id, s.cwd, s.mode,
+            s.created_at, s.updated_at,
+            (SELECT COUNT(*)::int FROM claw_remote_commands m
+              WHERE m.connector_id = s.connector_id AND m.session_id = s.session_id AND m.type = 'prompt') AS queued,
+            COALESCE((
+              SELECT json_agg(x ORDER BY x.id) FROM (
+                SELECT e.id, e.type, e.occurred_at,
+                       LEFT(COALESCE(e.data->'update'->'content'->>'text', e.data->'update'->>'title', ''), $4) AS text,
+                       e.data->>'actionId' AS action_id, e.data->>'stopReason' AS stop,
+                       COALESCE(e.data->>'replay', '') = 'true' AS replay
+                  FROM claw_remote_events e WHERE e.session_id = s.session_id ORDER BY e.id DESC LIMIT $3
+              ) x
+            ), '[]'::json) AS events
+       FROM claw_remote_sessions s
+      WHERE s.owner_user_id = $1 AND s.status = 'active'
+      ORDER BY s.updated_at DESC LIMIT $2`,
+    [owner, limit, events, ACTIVITY_TEXT],
+  )).rows;
+}
+
 export async function eventsAfter(sessionId: string, cursor: number, limit: number): Promise<Row[]> {
   return (await direct(
     `SELECT id, seq, type, (EXTRACT(EPOCH FROM occurred_at) * 1000)::float8 AS ts, data

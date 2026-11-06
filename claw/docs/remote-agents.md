@@ -210,6 +210,22 @@ A write made through the same API replica reaches an open stream at once. A writ
 made through another replica is found by the stream's own read of the database,
 which an idle stream does every 5 s, so it can arrive up to that much later.
 
+## The assistant
+
+Where remote agents are on, the assistant's router has a read-only tool, `devenv_list`, and
+its prompt treats the user's development environments (开发环境, dev box, my machine) as their
+connectors, never as SaFE workspaces. The tool answers the caller's own connectors that are not
+revoked: each machine's name, whether it is online, when it was last seen, its version and its
+agents; and every session on it, both the ones open through Claw and the agents' own
+conversations a connector offers to take over (`capabilities.resumable`), each with its folder,
+state (`working`, `waiting_for_you`, `idle`, `in_terminal`), last activity, a label
+(`machine/agent/n`) and the command that attaches the user's chat to it
+(`/agent attach <session id or conversation ref>`). The router passes that command to the
+channel with `channel_action`; a conversation open in a terminal on the machine, or a machine
+that is offline, has none. By default the tool returns nothing an agent wrote; `detail:
+"activity"` adds each session's current step and the end of its last answer, and the turn that
+read them no longer acts for the user.
+
 ## Retention
 
 A closed session is deleted with all of its events `CLAW_REMOTE_AGENTS_RETENTION_DAYS`
