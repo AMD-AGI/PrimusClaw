@@ -23,9 +23,11 @@
 import pino from "pino";
 import { db } from "../infra/db.js";
 import { detectLanguage } from "./language.js";
-import { SAY_TEXT_MAX, recordAssistantSay, recordSystemNotice, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
+import { SAY_TEXT_MAX, publishSayEvent, recordAssistantSay, recordSystemNotice, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
 import { internalTextIn, userWordsOf } from "./internal-text.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
+import { releaseHeldSays } from "./say-hold.js";
+import { kickDelivery } from "../notifications/outbox.js";
 
 const logger = pino({ name: "assistant-router-turn-end" });
 
@@ -168,6 +170,19 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
        FROM claw_tasks WHERE session_id = $1 AND task_id = ANY($2::text[]) AND origin = 'chat'`,
     [end.sessionId, end.runIds],
   )).rows as Array<{ began: Date; prompt: string; message_id: string | null }>;
+  // What the turn said while it might still hand a review over (`say-hold.ts`) goes out now: it ended. (A handoff dropped it already.)
+  const held = new Set([end.messageId, ...runs.map((r) => r.message_id)].filter((m): m is string => !!m));
+  let released = 0;
+  for (const messageId of held) {
+    for (const say of await releaseHeldSays((t, p) => db.query(t, p), messageId)) {
+      released += 1;
+      await publishSayEvent(end.sessionId, say.sayId, say.payload, deps, messageId);   // the web client's copy, held with it
+    }
+  }
+  if (released) {
+    logger.info({ sessionId: end.sessionId, released }, "assistant.held_says_released");
+    await (deps.kick ?? kickDelivery)().catch((err) => logger.warn({ err }, "assistant.held_says_kick_failed"));
+  }
   if (!runs.length) return "skipped";
   const prompts = runs.map((r) => r.prompt);
   const why = lostWhy(end);
@@ -205,7 +220,7 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
     return stored ? "said" : "skipped";
   }
   try {
-    await recordAssistantSay({ userId: router.user_id, sessionId: end.sessionId, text, turnMessageId: end.messageId }, deps);
+    await recordAssistantSay({ userId: router.user_id, sessionId: end.sessionId, text, turnMessageId: end.messageId, turnBegan: began }, deps);
   } catch (err) {
     // A refusal (the hourly cap) is the same answer the model's own say would have had, and the user was told of the cap
     // when it first refused them (`recordAssistantSay`); only a fault is worth a retry, and it is thrown for the caller's.
