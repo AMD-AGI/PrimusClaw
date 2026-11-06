@@ -37,7 +37,7 @@ import { redactPublicJson } from "../events/redaction.js";
 import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
-import { noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
+import { noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
 const logger = pino({ name: "remote-agents" });
 
@@ -428,7 +428,11 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const payload = type === "decision"
       ? { ...parsed.value, by: owner, client: clientLabel(req) }
       : parsed.value;
-    const since = type === "prompt" ? await remoteEventMark(sessionId).catch(() => undefined) : undefined;
+    const since = type === "prompt" || type === "cancel" ? await remoteEventMark(sessionId).catch(() => undefined) : undefined;
+    // A stop pressed in the attached chat: its turn_end ends what was sent before it, not a prompt sent right after it.
+    if (type === "cancel" && since !== undefined) {
+      await noteRemoteCancel(owner, sessionId, since).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
+    }
     const out = await store.issueCommand({
       owner, client: clientLabel(req), connectorId: session.connector_id, agentId: session.agent_id, sessionId,
       type, cmdId, payload, auditDetail: spec.audit(parsed.value), closesSession: spec.closesSession, commandsPerMinute,

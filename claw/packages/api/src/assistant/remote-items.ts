@@ -89,6 +89,13 @@ export interface RemoteParams {
   last_event_id: number;
   /** The session event that ended the item (a turn's end, a refusal, the session closing); 0 while open, or when stopped from Claw. */
   closed_event_id?: number;
+  /**
+   * A cancel was sent and the turn_end it brings (exactly one, `stopReason: "cancelled"`) has not come yet: the newest session event
+   * before it was sent. Absent when none is pending.
+   */
+  cancel_after?: number | null;
+  /** Prompts sent after that cancel: still to run when its turn_end comes. */
+  after_cancel?: number;
 }
 
 export const langOf = (text: string): RemoteLang => (/\p{Script=Han}/u.test(text) ? "zh" : "en");
@@ -131,6 +138,18 @@ export interface NotePrompt {
    * known: the newest event now.
    */
   since?: number;
+}
+
+/**
+ * A cancel is about to be sent to one of the owner's remote sessions (`mark`: its newest event now): the turn_end it brings ends
+ * what was open before it, and a prompt sent after it (stop, then a new instruction at once) is not ended by it.
+ */
+export async function noteRemoteCancel(owner: string, sessionId: string, mark: number): Promise<void> {
+  if (!remoteItemsOn()) return;
+  await db.query(
+    `UPDATE claw_work_items SET params = params || $3::jsonb, updated_at = NOW() WHERE worker_session_id = $1 AND user_id = $2 AND kind = 'remote'`,
+    [remoteWorkerSessionId(sessionId), owner, JSON.stringify({ cancel_after: mark, after_cancel: 0 })],
+  );
 }
 
 /** The newest event a remote session has posted so far: taken before a prompt is queued, as its `NotePrompt.since`. */
@@ -199,8 +218,10 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
     // the event that ended the item, nor any before it (a turn that ended as this prompt was queued is the one before it). An item
     // stopped from Claw is not rewound: the end its cancel brings is still to come, or has passed, and it is no new turn's.
     const closedBy = Number(open.params?.closed_event_id) || 0;
+    const cancelPending = typeof open.params?.cancel_after === "number";
     const patch = {
       asked, origin: p.origin, lang, open_turns: turns,
+      ...(cancelPending ? { after_cancel: (Number(open.params?.after_cancel) || 0) + 1 } : {}),
       ...(open.board_state === "done"
         ? { waiting: [], closed_event_id: 0, ...(closedBy > 0 ? { last_event_id: Math.max(last, closedBy) } : {}) }
         : {}),
@@ -331,6 +352,14 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
     };
     for (const e of events) {
       p.last_event_id = e.id;
+      // The end a cancel sent from here brings: what was open before the cancel is over, and only the prompts sent after it remain.
+      let afterCancel: number | null = null;
+      if (e.type === REMOTE_EVENT_TURN_END && typeof p.cancel_after === "number" && e.id > p.cancel_after
+        && flat(e.data.stopReason, 40) === "cancelled") {
+        afterCancel = Math.max(0, Number(p.after_cancel) || 0);
+        p.cancel_after = null;
+        p.after_cancel = 0;
+      }
       if (board === "done" && e.type !== REMOTE_EVENT_SESSION_CLOSED) continue;
       if (e.type === REMOTE_EVENT_PERMISSION_REQUEST) {
         const actionId = flat(e.data.actionId, 128);
@@ -355,7 +384,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       } else if (e.type === REMOTE_EVENT_TURN_END) {
         const stop = flat(e.data.stopReason, 40);
         // A cancel ends the running turn and drops every queued prompt with no turn_end of their own: nothing sent before it is open.
-        p.open_turns = stop === "cancelled" ? 0 : Math.max(0, (Number(p.open_turns) || 0) - 1);
+        p.open_turns = afterCancel !== null ? afterCancel : stop === "cancelled" ? 0 : Math.max(0, (Number(p.open_turns) || 0) - 1);
         if (p.open_turns > 0) continue;
         const said = stopWords(stop, flat(e.data.error, 200), p.lang);
         const whole = await answerOf(q, sessionId, e.id);
@@ -455,6 +484,7 @@ export async function cancelRemoteItem(userId: string, params: unknown): Promise
   try {
     const s = await findSession(userId, sessionId);
     if (!s || s.status !== "active") return;
+    await noteRemoteCancel(userId, sessionId, await remoteEventMark(sessionId));
     const out = await issueCommand({
       owner: userId, client: "assistant", connectorId: s.connector_id, agentId: s.agent_id, sessionId, type: "cancel",
       cmdId: randomUUID(), payload: {}, auditDetail: REMOTE_COMMANDS.cancel.audit({}), closesSession: false,

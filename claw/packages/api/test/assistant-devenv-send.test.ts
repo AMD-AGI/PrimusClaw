@@ -27,6 +27,8 @@
  *   F9  what the session posts after a prompt is queued is that prompt's, even when it reaches Claw before the prompt's item is
  *       written: a first prompt's item, and a finished item reopened, both end with it; but the turn before it, ending as it was
  *       queued, never ends it
+ *   F10 stop, then a new instruction at once: the end the cancel brings ends what was sent before it, never the new one, whether
+ *       the stop was the item's button or the attached chat's
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -452,6 +454,34 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.deepEqual([item.board_state, item.params.open_turns, item.title], ["in_progress", 1, "laptop claude: fourth one"]);
     await events("alice", cid, sid, [chunk("fourth answer"), end()]);
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "fourth answer"]);
+  });
+
+  test("F10 the end a cancel brings never ends an instruction sent after the stop", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const out = await tools.devenvSend(await userTurn(alice, "跑 make test"), { text: "跑 make test" });
+    const sid = String(out.session_id);
+    const prompt = async (text: string) => assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text })).status, 202);
+
+    // The item's stop button, then a new instruction typed before the cancelled turn's end reaches Claw.
+    assert.equal((await post("alice", `/v1/work-items/${String(out.item_id)}/stop`, {})).status, 200);
+    await prompt("run lint instead");
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_turns], ["in_progress", 1]);
+    await events("alice", cid, sid, [chunk("partial"), end("cancelled")]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_turns], ["in_progress", 1], "the cancel's end is not lint's");
+    await events("alice", cid, sid, [chunk("lint clean"), end()]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "lint clean"]);
+
+    // The attached chat's stop with two open, then one more: the cancel ends the two, the third runs on.
+    await prompt("a");
+    await prompt("b");
+    assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "cancel" })).status, 202);
+    await prompt("c");
+    assert.equal((await remoteItem(sid)).params.open_turns, 3);
+    await events("alice", cid, sid, [end("cancelled")]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_turns], ["in_progress", 1]);
+    await events("alice", cid, sid, [chunk("c done"), end()]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "c done"]);
   });
 
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {
