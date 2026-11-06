@@ -775,6 +775,22 @@ export async function reviewRecord(q: StatementRunner, sessionId: string, params
   };
 }
 
+/**
+ * Write the item's record of what its review posted (`params.record`) from the audit as it is now. The state sync does this on every
+ * change; a close that is not the sync's (the requester's stop) does it first, so that the view frozen then (`freezeRequesterView`) has
+ * what was posted up to that moment.
+ */
+export async function refreshReviewRecord(q: StatementRunner, itemId: string): Promise<void> {
+  const row = (await q.query(
+    "SELECT kind, worker_session_id, params FROM claw_work_items WHERE item_id = $1 AND kind = 'review'", [itemId],
+  )).rows[0] as Record<string, unknown> | undefined;
+  const params = row ? readParams(row) : null;
+  if (!row || !params) return;
+  const record = await reviewRecord(q, row.worker_session_id as string, params);
+  if (JSON.stringify(record) === JSON.stringify((row.params as Record<string, unknown> | null)?.record ?? null)) return;
+  await q.query("UPDATE claw_work_items SET params = params || jsonb_build_object('record', $2::jsonb) WHERE item_id = $1", [itemId, JSON.stringify(record)]);
+}
+
 /** What a re-review of `row`'s pull request continues: its record, named by the item; null when it posted nothing to continue. */
 async function continuationOf(
   q: StatementRunner, row: { item_id: string; seq: number; worker_session_id: string; kind: string; params: unknown },

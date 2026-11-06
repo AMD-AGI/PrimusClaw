@@ -30,7 +30,7 @@ import { parseItemRef } from "./item-ref.js";
 import { detectLanguage, languageToAnswerIn, replyLanguageLine, replyLanguageMismatch } from "./language.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 import { assistantPluginId } from "./read-tools.js";
-import { requestedItemOf, requesterViewOf, type RequesterView } from "./requester-view.js";
+import { requestedItemOf, requesterViewOf, routerView, type RequesterView } from "./requester-view.js";
 import { parseReport } from "./report.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import {
@@ -530,7 +530,7 @@ async function stopAskedOfOther(
     await syncReviewItem(itemId).catch(() => null);
   }
   const now = (await db.query("SELECT * FROM claw_work_items WHERE item_id = $1", [itemId])).rows[0] as Record<string, unknown>;
-  const view = await requesterViewOf(db, now);
+  const view = routerView(await requesterViewOf(db, now));
   if (stopped.status === "conflict") {
     if (stopped.error === "merge_in_progress") throw new ToolRefused(stopped.error, "the merge is being made right now and cannot be stopped", { requester_view: view });
     if (stopped.error === "already_merged") throw new ToolRefused(stopped.error, "the pull request is already merged; nothing was stopped or reverted", { requester_view: view });
@@ -553,7 +553,7 @@ export async function workRecall(
     // A review the user asked of someone else: read-only, and only the four facts (`requester-view.ts`), whatever detail was asked.
     // Nothing in them was written by a worker or the reviewer's session, so the turn still acts for the person afterwards.
     const asked = await requestedItemOf(db, userId, args.item_id.trim());
-    if (asked) return { ok: true, item_id: String(asked.item_id), asked_of_other: true, read_only: true, requester_view: await requesterViewOf(db, asked) };
+    if (asked) return { ok: true, item_id: String(asked.item_id), asked_of_other: true, read_only: true, requester_view: routerView(await requesterViewOf(db, asked)) };
   }
   const named = found(lookup);
   const item = await getWorkItem(userId, named.item_id);
