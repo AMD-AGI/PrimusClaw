@@ -493,11 +493,13 @@ export function redactSecrets(text: string, extraSecrets: string[] = []): Redact
 
 /**
  * Where a value written after a credential's name starts in a log line: `PASSWORD=`, `"api_key": "`, `Authorization: `, also
- * inside a JSON string (`\\"token\\": \\"`). The name starts where a name can (not inside another one; after a JSON string's `\\n`,
- * `\\r` or `\\t`) and is judged by `isSensitiveKey`. Where the value ends is `NamedValueEnds`'s to find: a quoted value runs to its
+ * inside a JSON string (`\\"token\\": \\"`), and a command line's option (`--password=...`, `--db-password ...`). The name
+ * starts where a name can (not inside another one; after a JSON string's `\\n`, `\\r` or `\\t`; after one or two dashes that start
+ * an option) and is judged by `isSensitiveKey`; an auth scheme (`Bearer`, `Basic`, `Token`) after it is kept and the value after the
+ * scheme is masked, quoted or not. Where the value ends is `NamedValueEnds`'s to find: a quoted value runs to its
  * closing quote, spaces and all, so `"password": "correct horse battery staple"` goes whole.
  */
-const NAMED_VALUE_START_RE = /(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrt]))(\\?["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1(\s*[:=]\s*)(\\?["']?)/g;
+const NAMED_VALUE_START_RE = /(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrt])|(?<=(?:^|[^A-Za-z0-9_.\\-])-{1,2}))(\\?["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1(\s*[:=]\s*|(?<=(?:^|[^A-Za-z0-9_.\\-])-{1,2}[A-Za-z_][A-Za-z0-9_.-]{0,63})[ \t]+)((?:[Bb]asic|[Bb]earer|[Tt]oken)\s+)?(\\?["']?)/g;
 /** Where an unquoted value ends: a line's end, a quote, an escape, a separator, a closing bracket. Not a space: `a b` is one value. */
 const UNQUOTED_VALUE_END = /[\r\n"'\\,;&)\]}>]/;
 
@@ -615,14 +617,15 @@ export function redactLogSecrets(text: string, extraSecrets: string[] = []): Red
   let kept = 0;
   NAMED_VALUE_START_RE.lastIndex = 0;
   for (let m = NAMED_VALUE_START_RE.exec(out); m; m = NAMED_VALUE_START_RE.exec(out)) {
-    const [start, q1, name, sep, q2] = m;
+    const [start, q1, name, sep, scheme = "", q2] = m;
     if (!isSensitiveKey(name)) continue;
     const from = m.index + start.length;
     const end = ends.end(from, q2);
     const value = out.slice(from, end);
-    if (value.length < 4 || NOT_A_VALUE_RE.test(value)) continue;
+    // Any value but a switch or a placeholder, however short: `password=abc` is a credential too.
+    if (!value || NOT_A_VALUE_RE.test(value)) continue;
     hits += 1;
-    masked += `${out.slice(kept, m.index)}${q1}${name}${q1}${sep}${q2}<redacted>`;
+    masked += `${out.slice(kept, m.index)}${q1}${name}${q1}${sep}${scheme}${q2}<redacted>`;
     kept = end;
     NAMED_VALUE_START_RE.lastIndex = end;
   }

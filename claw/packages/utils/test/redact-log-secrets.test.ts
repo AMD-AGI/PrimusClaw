@@ -129,3 +129,20 @@ test("L11 a private key cut before its END line is masked to the end; unmatched 
     assert.ok(performance.now() - t0 < 1500, `${text.slice(0, 40)}: ${Math.round(performance.now() - t0)} ms`);
   }
 });
+
+test("L12 a command line's option, a short value and a quoted value after an auth scheme are masked", () => {
+  for (const [text, want] of [
+    // An unquoted value runs to its line's end: what follows it on the line goes with it.
+    ["run --password=Abc123!xyz --epochs 3", "run --password=<redacted>"],
+    ["run --api-key=Abc123!xyz", "run --api-key=<redacted>"],
+    ["mysql -u root --db-password s3cr3t", "mysql -u root --db-password <redacted>"],
+    ["password=abc", "password=<redacted>"],
+    ["token: 123", "token: <redacted>"],
+    ['Authorization: Bearer "sample-value" sent', 'Authorization: Bearer "<redacted>" sent'],
+    ["Authorization: Basic Zm9vOmJhcg==", "Authorization: Basic <redacted>"],
+  ] as const) {
+    assert.equal(redactLogSecrets(text).text, want, text);
+  }
+  // An option whose name is not a credential's keeps its value.
+  for (const line of ["--epochs 3 --lr 0.1", "--max-tokens 4096", "--tokenizer fast"]) assert.equal(redactLogSecrets(line).text, line, line);
+});
