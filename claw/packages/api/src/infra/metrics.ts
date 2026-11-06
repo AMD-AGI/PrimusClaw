@@ -111,6 +111,16 @@ const workItemStaleRejectedTotal = new Counter({
   registers: [registry],
 });
 
+// A message the assistant was not let say because its user had CLAW_ASSISTANT_SAY_MAX_PER_HOUR of them in the last
+// hour, by what the user was told: the notice that replies are paused (`sent`, the first refusal of a stretch at the
+// cap), nothing more because they had it already (`already_sent`), or nothing because storing it failed (`failed`).
+const assistantSayRateLimitedTotal = new Counter({
+  name: "claw_assistant_say_rate_limited_total",
+  help: "Assistant messages refused by the hourly say cap, by whether the user was sent the cap notice.",
+  labelNames: ["notice"] as const,
+  registers: [registry],
+});
+
 // `error` keeps a throw out of loadUsage or queueLength in the denominator;
 // without it a partial outage makes every rollout ratio read healthier.
 const admissionDecisionTotal = new Counter({
@@ -363,5 +373,8 @@ export const metrics = {
   },
   onWorkItemStaleRejected(source: "worker" | "turn_end" | "sweep" | "watchdog"): void {
     workItemStaleRejectedTotal.inc({ source });
+  },
+  onAssistantSayRateLimited(notice: "sent" | "already_sent" | "failed"): void {
+    assistantSayRateLimitedTotal.inc({ notice });
   },
 };

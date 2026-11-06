@@ -288,15 +288,97 @@ describe("assistant outbound", { skip }, () => {
       const limited = deps({ maxPerHour: 3 });
       for (let i = 0; i < 3; i += 1) await say(`m${i}`, {}, limited);
       await assert.rejects(say("m3", {}, limited), (e: any) => e.name === "SayRefused" && e.code === "say_rate_limited");
-      assert.equal((await saysRows()).length, 3);
+      const modelSays = async () => (await saysRows()).filter((s) => !s.fallback);
+      assert.equal((await modelSays()).length, 3);
 
       await outbound.recordAssistantSay({ userId: "u2", sessionId: "assistant-u2", text: "mine" }, limited);
-      assert.equal((await saysRows()).length, 4);
+      assert.equal((await modelSays()).length, 4);
 
       await q("UPDATE claw_assistant_says SET created_at = NOW() - interval '61 minutes' WHERE user_id = 'u1'");
       await say("a new hour", {}, limited);
-      assert.equal((await saysRows()).filter((s) => s.user_id === "u1").length, 4);
+      assert.equal((await modelSays()).filter((s) => s.user_id === "u1").length, 4);
     });
+
+    test("tells the user at the first refusal in an hour, once, in their language, tells the model it was not delivered, and counts every refusal", async () => {
+      const limited = deps({ maxPerHour: 2 });
+      const family = h.app.metrics.registry.getSingleMetric("claw_assistant_say_rate_limited_total");
+      assert.ok(family, "the counter is on the api registry");
+      const counted = async (notice: string) => (await family.get()).values.find((v) => v.labels.notice === notice)?.value ?? 0;
+      const before = { sent: await counted("sent"), already: await counted("already_sent") };
+      const tally = async () => [await counted("sent") - before.sent, await counted("already_sent") - before.already];
+      const notices = async () => (await saysRows()).filter((s) => s.fallback);
+      const capped = (e: any) => e.code === "say_rate_limited";
+
+      await say("one", {}, limited);
+      await say("two", {}, limited);
+      assert.equal((await notices()).length, 0, "no notice while there is room");
+      await assert.rejects(
+        say("three", {}, limited),
+        (e: any) => capped(e) && /NOT delivered/.test(e.message) && /has been told/.test(e.message),
+      );
+      const [notice] = await notices();
+      assert.deepEqual([notice?.text, notice?.user_id], [outbound.sayCapNotice("three"), "u1"], "the system's words, as a message of its own");
+      assert.deepEqual(events.filter((e) => e.event.text === notice.text).map((e) => e.sessionId), ["assistant-u1"], "the web client is told");
+
+      // The rest of the hour: refused and counted, and the user is not told again.
+      await assert.rejects(say("four", {}, limited), capped);
+      await assert.rejects(say("five", {}, limited), capped);
+      assert.equal((await notices()).length, 1);
+      assert.deepEqual(await tally(), [1, 2]);
+
+      // Under a steady overload the cap lets one message through each time the oldest turns an hour old: still the same hour.
+      await q(`UPDATE claw_assistant_says SET created_at = NOW() - interval '61 minutes'
+                WHERE say_id = (SELECT say_id FROM claw_assistant_says WHERE NOT fallback ORDER BY created_at LIMIT 1)`);
+      await say("six", {}, limited);
+      await assert.rejects(say("seven", {}, limited), capped);
+      assert.equal((await notices()).length, 1);
+      assert.deepEqual(await tally(), [1, 3]);
+
+      // A notice sent in the last clock hour, less than an hour ago, counts as well.
+      const hour = Number((await q("SELECT floor(extract(epoch FROM clock_timestamp()) / 3600)::bigint AS h")).rows[0].h);
+      const noticeId = (h: number) => outbox.deterministicEventId("assistant.notice", "u1", `say_capped:${h}`);
+      await q("UPDATE claw_assistant_says SET say_id = $1, created_at = NOW() - interval '30 minutes' WHERE fallback", [noticeId(hour - 1)]);
+      await assert.rejects(say("eight", {}, limited), capped);
+      assert.equal((await notices()).length, 1);
+      assert.deepEqual(await tally(), [1, 4]);
+
+      // An hour on, the next refusal tells the user again, in the language they are spoken to in.
+      await q("UPDATE claw_assistant_says SET created_at = created_at - interval '61 minutes'");
+      await say("九", {}, limited);
+      await say("十", {}, limited);
+      await assert.rejects(say("构建好了", {}, limited), capped);
+      assert.deepEqual((await notices()).map((s) => s.text), [outbound.sayCapNotice("three"), outbound.sayCapNotice("构建好了")]);
+      assert.match(outbound.sayCapNotice("构建好了"), /稍后再试/);
+      assert.deepEqual(await tally(), [2, 4]);
+    });
+
+    for (const order of ["the earlier hour first", "the later hour first"] as const) {
+      test(`tells the user once when two refusals come at once on either side of an hour, ${order}`, async () => {
+        const limited = deps({ maxPerHour: 1 });
+        await say("one", {}, limited);
+        // Each refusal's notice reads the hour, and waits there a little for the other: without the user's lock both
+        // would look for a notice before either had stored one, under two different hours. The later hour first is a
+        // transaction that started before the hour turned and got the lock after one that started after it.
+        let arrived = 0;
+        let bothThere!: () => void;
+        const both = new Promise<void>((resolve) => { bothThere = resolve; });
+        outbound.setCapNoticeHourForTest(async (hour) => {
+          arrived += 1;
+          const mine = arrived;
+          if (arrived === 2) bothThere();
+          await Promise.race([both, sleep(300)]);
+          return order === "the earlier hour first" ? hour + mine - 1 : hour + 2 - mine;
+        });
+        try {
+          const results = await Promise.allSettled([say("two", {}, limited), say("three", {}, limited)]);
+          assert.ok(results.every((r) => r.status === "rejected" && (r.reason as { code?: string }).code === "say_rate_limited"));
+        } finally {
+          outbound.setCapNoticeHourForTest(null);
+        }
+        assert.equal(arrived, 2, "both refusals reached the notice");
+        assert.equal((await saysRows()).filter((s) => s.fallback).length, 1);
+      });
+    }
 
     test("is a hard cap under concurrent says", async () => {
       const limited = deps({ maxPerHour: 3 });
@@ -309,7 +391,8 @@ describe("assistant outbound", { skip }, () => {
       const results = await Promise.allSettled(Array.from({ length: burst }, (_, i) => say(`burst ${i}`, { guard: barrier }, limited)));
       assert.equal(results.filter((r) => r.status === "fulfilled").length, 3);
       assert.ok(results.filter((r) => r.status === "rejected").every((r) => (r as PromiseRejectedResult).reason.code === "say_rate_limited"));
-      assert.equal((await saysRows()).length, 3);
+      assert.equal((await saysRows()).filter((s) => !s.fallback).length, 3);
+      assert.equal((await saysRows()).filter((s) => s.fallback).length, 1, "five refusals at once, one notice");
     });
 
     test("does not count the system's own needs-you messages, which are what is left when the assistant has not spoken", async () => {

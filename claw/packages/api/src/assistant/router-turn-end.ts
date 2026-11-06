@@ -123,7 +123,8 @@ export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}
   try {
     await recordAssistantSay({ userId: router.user_id, sessionId: end.sessionId, text, turnMessageId: end.messageId }, deps);
   } catch (err) {
-    // A refusal (the hourly cap) is the same answer the model's own say would have had; only a fault is worth a retry.
+    // A refusal (the hourly cap) is the same answer the model's own say would have had, and the user was told of the cap
+    // when it first refused them (`recordAssistantSay`); only a fault is worth a retry, and it is thrown for the caller's.
     if (err instanceof SayRefused) {
       logger.warn({ sessionId: end.sessionId, code: err.code }, "assistant.unsaid_answer_refused");
       return "skipped";

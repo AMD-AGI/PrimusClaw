@@ -748,6 +748,34 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A database failover no longer leaves the API on the old primary, and no longer costs the assistant's replies. A
+  switchover demotes the old primary in place, and a connection still on it answers every read and refuses every write
+  (`25006`): `inTransaction` handed such a connection back to the pool after a clean rollback, to fail the next
+  transaction too. The first failover error (`25006`, `57P01`-`57P03`, a `08` connection error or a dropped socket) now
+  marks every connection opened before it stale (so does an idle connection the switchover terminates): idle ones are
+  dropped as they are checked out, by any caller of either pool's `connect()` or `query()`, held ones as they are
+  released. A new connection of either pool is handed out only once its server says it is not in recovery (asked once
+  per connection), because for a few seconds the Service can route one to the demoted server, which refuses every write
+  and grants advisory locks that fence nothing. A statement is sent once more on a new connection, after `PG_FAILOVER_RETRY_DELAY_MS` (default 1000), when
+  running it twice is the same as running it once: Postgres refused it before it ran (`25006`, `57P03`), or it only
+  reads. A transaction that says it may run twice is retried the same way, and also when its connection went before
+  its `COMMIT` was sent; every way the assistant stores a message says so. A message whose `COMMIT` took effect but
+  whose answer the failover lost (a `say`, the cap's notice, a system notice, a needs-you message) is looked up,
+  announced and reported as stored; one not found then, or that cannot be looked up, is looked up again in the
+  background over the next minute and announced once found (an error on the `COMMIT` proves nothing either way), and a
+  `say` like that is reported as
+  `say_outcome_unknown`, and the Router ends the turn with the words instead of saying them again (they are delivered
+  only if the turn has not spoken). So the only `say` that faults is one that was not stored; it tells the Router the
+  message was not delivered and to call `say` again. Delivering a Router turn's unsaid answer is tried three times
+  before it is given up, instead of once.
+- A reply the assistant's hourly cap (`CLAW_ASSISTANT_SAY_MAX_PER_HOUR`) refused is no longer dropped without a word.
+  The model's `say` was refused, and so was delivering what it wrote instead, and the user heard nothing for as long as
+  the cap held. The first refusal in an hour now tells the user, in their language, that replies are paused and to try
+  again later (a notice in the system's words, not counted against the cap; at most one an hour, by the database's
+  clock and under the user's say lock, so a client that keeps writing at the cap gets one notice and not one per
+  message; a notice that failed to be stored is tried again in the background); the model is told the message was not delivered
+  and not to call `say` again in the turn; and every refusal is counted in `claw_assistant_say_rate_limited_total`, by
+  whether the user was sent the notice.
 - Deleting a session that has no `hands.<sid>` binding and no key on its cleanup notification -- every session the
   retention pass deletes, and every sweeper replay of a delete that already finished -- is a finished teardown with
   nothing to address (`session.cleanup_nothing_addressable`), not `no_platform_key`. Claw holds no handle to anything
