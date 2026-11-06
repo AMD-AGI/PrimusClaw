@@ -85,8 +85,10 @@ export interface RouterLookups {
   /** Every lookup tool as `tools_allowlist` entries: the turn's `read_taint` sources as well. */
   allowlist: string[];
   /**
-   * The lookups whose failures are in words no third party writes (`read_taint.clean_failures`): the GitHub server's (its own, or
-   * GitHub's API's) and Brain's web tools'. Not the plugin's servers: what they put in an error is theirs to choose.
+   * The lookups whose failures are in Claw's own words (`read_taint.clean_failures`): the reads of the API's GitHub server, which
+   * says a read's failure as the status GitHub answered with and never as GitHub's message (`github-mcp/tools.ts`), and Brain's
+   * web tools, which say theirs in fixed words and never with what a server or a search backend sent. Not the plugin's servers:
+   * what they put in an error is theirs to choose.
    */
   cleanFailures: string[];
 }

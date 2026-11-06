@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import pino from "pino";
 import { HandsClient, withHandsTimeout, type ShellClassProbe, type ToolImage } from "../clients/hands.js";
 import { isSandboxTool, toolTimeoutCeilingSec } from "./hands.js";
 import { handleA2ACall } from "../clients/a2a.js";
@@ -24,6 +25,8 @@ import type { WebSearchService } from "./web/search.js";
 import type { WebFetchService } from "./web/fetch.js";
 import { LOAD_SKILL_TOOL, type SkillStore } from "../agent/skill-store.js";
 import { TOOL_RESULTS_DIR } from "../workspace/excludes.js";
+
+const logger = pino({ name: "tool-router" });
 
 /**
  * The bash timeout ceiling the schema states.
@@ -424,6 +427,13 @@ export class ToolRouter {
       const text = await this.routeAllowed(name, input, signal, answered, ctx);
       failed = answered.isError;
       return text;
+    } catch (err) {
+      // A thrown message is not the source's own fixed words: it is whatever the transport or the server put in it (an HTTP
+      // body, a JSON-RPC error's message). A failure that leaves the turn unmarked must hold nothing anyone else wrote, so the
+      // model is told only that the call failed; the message goes to the log. An abort is the run ending, and is left as it is.
+      if (!taint.failsClean(name) || signal?.aborted) throw err;
+      logger.warn({ tool: name, err: err instanceof Error ? err.message : String(err) }, "read_taint.clean_failure_threw");
+      throw new Error(`${name} failed before it answered (what went wrong is not shown in this conversation)`);
     } finally {
       taint.ran(name, failed);
     }

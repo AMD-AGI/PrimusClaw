@@ -68,6 +68,31 @@ function domainMatchesAny(domain: string, denylist: string[]): boolean {
   return denylist.some((denied) => d === denied || d.endsWith("." + denied));
 }
 
+// ── Backend failures ──
+
+/** A backend this deployment has no key for: its message is this file's own. */
+class BackendNotConfigured extends Error {}
+
+/**
+ * A backend's failure, in this file's own words: by the error's class, its HTTP status or its code, never by its message. A
+ * backend's message is its body, its error JSON or its status text, and the failure of a search counts as having read nothing
+ * (`WebToolOutcome`). The message goes to the log.
+ */
+function backendFailure(err: unknown): string {
+  if (err instanceof BackendNotConfigured) return err.message;
+  const e = err as { status?: unknown; response?: { status?: unknown }; code?: unknown } | null;
+  const status = typeof e?.status === "number" ? e.status : e?.response?.status;
+  if (typeof status === "number" && Number.isInteger(status)) return `HTTP ${status}`;
+  const code = typeof e?.code === "string" ? e.code : "";
+  // The Anthropic SDK's connection errors carry neither a status nor a code, only their class.
+  const sdkClass = err instanceof Error ? err.constructor.name : "";
+  if (code === "ECONNABORTED" || code === "ETIMEDOUT" || sdkClass === "APIConnectionTimeoutError") return "timed out";
+  if (["ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH"].includes(code) || sdkClass === "APIConnectionError") {
+    return "could not be reached";
+  }
+  return "failed";
+}
+
 // ── Anthropic native search (sub-LLM wrapper) ──
 
 async function executeAnthropicSearch(
@@ -187,7 +212,7 @@ class TavilyProvider implements WebSearchProvider {
     blockedDomains?: string[];
     freshness?: string;
   }): Promise<SearchHit[]> {
-    if (!TAVILY_API_KEY) throw new Error("TAVILY_API_KEY not configured");
+    if (!TAVILY_API_KEY) throw new BackendNotConfigured("TAVILY_API_KEY not configured");
     const { default: axios } = await import("axios");
 
     const freshnessMap: Record<string, number> = { day: 1, week: 7, month: 30, year: 365 };
@@ -219,7 +244,7 @@ class BraveProvider implements WebSearchProvider {
     blockedDomains?: string[];
     freshness?: string;
   }): Promise<SearchHit[]> {
-    if (!BRAVE_API_KEY) throw new Error("BRAVE_API_KEY not configured");
+    if (!BRAVE_API_KEY) throw new BackendNotConfigured("BRAVE_API_KEY not configured");
     const { default: axios } = await import("axios");
 
     let q = query;
@@ -269,7 +294,7 @@ class SerperProvider implements WebSearchProvider {
     blockedDomains?: string[];
     freshness?: string;
   }): Promise<SearchHit[]> {
-    if (!SERPER_API_KEY) throw new Error("SERPER_API_KEY not configured");
+    if (!SERPER_API_KEY) throw new BackendNotConfigured("SERPER_API_KEY not configured");
     const { default: axios } = await import("axios");
 
     let q = query;
@@ -361,8 +386,8 @@ export class WebSearchService {
   }
 
   /**
-   * Every failure here is said in this service's own words, or a backend's error (never a page's text), so each one is marked in
-   * `outcome`. A search that answered is not, whatever it found.
+   * Every failure here is said in this service's own words (a backend's only as `backendFailure` names it, never its message),
+   * so each one is marked in `outcome`. A search that answered is not, whatever it found.
    */
   async execute(input: Record<string, unknown>, outcome?: WebToolOutcome): Promise<string> {
     const searchInput = input as unknown as WebSearchInput;
@@ -391,7 +416,7 @@ export class WebSearchService {
       return fail("Error: web search rate limit exceeded (30 req/min). Please wait before searching again.");
     }
 
-    // The last backend's failure, so a search that fails everywhere says why.
+    // The last backend's failure, so a search that fails everywhere says how (`backendFailure`).
     let lastError = "";
 
     // Anthropic native path (Claude engine only)
@@ -399,8 +424,8 @@ export class WebSearchService {
       try {
         return await executeAnthropicSearch(searchInput, this.ctx, fail);
       } catch (err: unknown) {
-        lastError = `anthropic: ${err instanceof Error ? err.message : String(err)}`;
-        logger.warn({ err: lastError }, "anthropic_search_failed, trying fallbacks");
+        lastError = `anthropic: ${backendFailure(err)}`;
+        logger.warn({ err: err instanceof Error ? err.message : String(err) }, "anthropic_search_failed, trying fallbacks");
       }
     }
 
@@ -427,8 +452,8 @@ export class WebSearchService {
 
         return formatThirdPartyResults(searchInput.query, hits);
       } catch (err: unknown) {
-        lastError = `${provider.name}: ${err instanceof Error ? err.message : String(err)}`;
-        logger.info({ provider: provider.name, err: lastError }, "search_provider_failed");
+        lastError = `${provider.name}: ${backendFailure(err)}`;
+        logger.info({ provider: provider.name, err: err instanceof Error ? err.message : String(err) }, "search_provider_failed");
       }
     }
 
@@ -436,7 +461,7 @@ export class WebSearchService {
       return fail("Error: web search disabled");
     }
 
-    if (lastError) return fail(`Error: web search failed (${lastError.slice(0, 500)})`);
+    if (lastError) return fail(`Error: web search failed (${lastError})`);
     return fail("Error: no web search provider available");
   }
 }

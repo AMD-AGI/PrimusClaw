@@ -27,7 +27,9 @@ Merging is not a tool here: it belongs to GitHub review (`github-review.md`), wh
 - A session that acts as another user (`config.acting_as`) is not offered these tools.
 - An assistant's router turn gets the same entry, cut by its `tools_allowlist` to the reads a question needs
   (`assistant/read-tools.ts`: no write, no whole diff, no job log), and under its `read_taint`: once a read has answered,
-  the turn can only speak, so what a pull request says cannot start or change work for the user.
+  the turn can only speak, so what a pull request says cannot start or change work for the user. A read that failed read
+  nothing and leaves the turn free to start the work, so a read's failure is said as the status GitHub answered with, in the
+  server's own words, never as GitHub's message (a write's failure still carries GitHub's message, for the worker).
 - The same writes made from the shell (`gh pr create`, `gh api -X POST`, ...) are held by the built-in bash
   rules (`bash-approval.md`).
 

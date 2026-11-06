@@ -402,8 +402,12 @@ export interface ExecuteRequest {
    * `sources` or `allow_after` may be called for the rest of the run; any other is refused by Brain before it is run. Entries are
    * written like `tools_allowlist` (an exact name, or a prefix ending in `*`). The API sets it on an assistant's router turn that has
    * read-only tools: after it has read such a result, the turn no longer acts for the user (no review, setting or memory write).
-   * `clean_failures`: the sources whose failures are said in words no third party writes (Claw's own, GitHub's API, a search
-   * backend's): a call of one of these that failed read nothing and does not mark the run. A failure of any other source marks it.
+   * `clean_failures`: the sources whose failures are said in Claw's own words only (fixed text, numbers, and the call's own
+   * arguments; never a status text, body, error message, certificate field or redirect target a remote sent): a call of one of
+   * these that failed read nothing and does not mark the run. A failure of any other source marks it. A call of one of these that
+   * threw is told to the model as having failed, without the thrown message.
+   * Under this rule the results earlier runs got from `sources` are not replayed from `history`: each is replaced with a fixed
+   * placeholder, so what one turn read is not in context in the next, which can act.
    * Absent: no such rule.
    */
   read_taint?: { sources: string[]; allow_after: string[]; clean_failures?: string[] };

@@ -28,6 +28,7 @@
  * (not an array, or no usable entry) allows nothing rather than everything.
  */
 import pino from "pino";
+import type { Message } from "@claw/protocol";
 
 const logger = pino({ name: "tool-allowlist" });
 
@@ -80,13 +81,20 @@ export function parseToolAllowlist(raw: unknown): ToolAllowlist | null {
  *
  * A call matching `sources` marks the run once it has returned: from then on only `allow_after` runs. While a source is still
  * running the run counts as marked, so the only call that can pass beside a read is one decided before it. A source matching
- * `clean_failures` that failed (the tool's own error bit, or a call that threw) read nothing anyone else wrote, so it marks nothing:
- * the turn can still start the work the lookup could not do. Any other source's failure marks the run like an answer: its text
- * is the server's to choose, and a server that echoes what someone wrote into an error must not lift the rule.
+ * `clean_failures` that failed read nothing anyone else wrote, so it marks nothing: the turn can still start the work the lookup
+ * could not do. That holds only because such a failure is told to the model in Claw's own words: the source's own fixed text (a
+ * web tool's, the API's GitHub server's), or, for a call that threw, `ToolRouter.route()`'s, never the thrown message. Any other
+ * source's failure marks the run like an answer: its text is the server's to choose, and a server that echoes what someone wrote
+ * into an error must not lift the rule.
+ *
+ * `isSource(name)` is what an earlier run of the session read with (`forgetEarlierReads`); `failsClean(name)` is whether a failure
+ * of `name` leaves the run unmarked.
  */
 export interface ReadTaint {
   refusal(toolName: string): string | null;
   ran(toolName: string, failed: boolean): void;
+  isSource(toolName: string): boolean;
+  failsClean(toolName: string): boolean;
 }
 
 export function parseReadTaint(raw: unknown): ReadTaint | null {
@@ -96,6 +104,7 @@ export function parseReadTaint(raw: unknown): ReadTaint | null {
   if (!sources || !sources.patterns.length) return null;
   const allowAfter = Array.isArray(r.allow_after) && r.allow_after.length ? parseToolAllowlist(r.allow_after) : null;
   const cleanFailures = Array.isArray(r.clean_failures) && r.clean_failures.length ? parseToolAllowlist(r.clean_failures) : null;
+  const failsClean = (name: string): boolean => sources.allows(name) && cleanFailures?.allows(name) === true;
   /** The first source that returned, other than a clean failure. */
   let readBy: string | null = null;
   /** Sources let through that have not reported yet. */
@@ -111,9 +120,44 @@ export function parseReadTaint(raw: unknown): ReadTaint | null {
       if (!sources.allows(name)) return;
       const i = running.indexOf(name);
       if (i >= 0) running.splice(i, 1);
-      if (!failed || !cleanFailures?.allows(name)) readBy ??= name;
+      if (!failed || !failsClean(name)) readBy ??= name;
     },
+    isSource: (name) => sources.allows(name),
+    failsClean,
   };
+}
+
+/** What an earlier run's lookup result is replaced with in a run under a read taint (`forgetEarlierReads`). */
+export const EARLIER_READ_PLACEHOLDER =
+  "[What this lookup returned is not kept past the turn that read it. Look it up again if it is needed.]";
+
+/**
+ * The session's history for a run under `taint`, with every result an earlier run got from one of its sources replaced by
+ * `EARLIER_READ_PLACEHOLDER`. The taint lasts one run, and the history replays earlier runs' tool results: kept, the text a
+ * lookup read in one turn would be in context in the next, which can act. What stays is what the user and the assistant said,
+ * and the calls themselves.
+ *
+ * A result is found by its `tool_use_id` in the assistant message before it, which names the tool; a result whose call cannot
+ * be found is replaced as well. The history is not changed in place.
+ */
+export function forgetEarlierReads(history: readonly Message[], taint: ReadTaint): Message[] {
+  const toolOf = new Map<string, string>();
+  for (const m of history) {
+    if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (b?.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string") toolOf.set(b.id, b.name);
+    }
+  }
+  const forget = (b: Record<string, unknown>): boolean => {
+    if (b?.type !== "tool_result") return false;
+    const name = typeof b.tool_use_id === "string" ? toolOf.get(b.tool_use_id) : undefined;
+    return name === undefined || taint.isSource(name);
+  };
+  return history.map((m) => {
+    if (m.role !== "user" || !Array.isArray(m.content)) return m;
+    if (!m.content.some(forget)) return m;
+    return { ...m, content: m.content.map((b) => (forget(b) ? { type: "tool_result", tool_use_id: b.tool_use_id, content: EARLIER_READ_PLACEHOLDER } : b)) };
+  });
 }
 
 /** The schemas a run may offer its model: all of them when there is no allowlist. */

@@ -59,8 +59,10 @@ export interface SearchHit {
 }
 
 /**
- * Filled by a web tool with whether it failed: the router's `RouteOutcome`. Set only for a failure whose text is the tool's own,
- * never for one that carries what a remote server sent, since a failed call counts as having read nothing (`ReadTaint`).
+ * Filled by a web tool with whether it failed: the router's `RouteOutcome`. Set only for a failure whose text is entirely the
+ * tool's own words (fixed phrases, numbers, and what the model itself asked for), never for one that carries anything a remote
+ * server or a search backend sent (a status text, a body, an error message, a certificate field, a redirect target), since a
+ * failed call counts as having read nothing (`ReadTaint`).
  */
 export interface WebToolOutcome {
   isError: boolean;

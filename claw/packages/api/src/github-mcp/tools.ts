@@ -15,7 +15,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import pino from "pino";
 import { z } from "zod";
-import { GithubError, isValidOwner, parseRepoRef, repoPath, type GithubClient } from "../github-review/github.js";
+import { GithubError, GithubGraphqlError, isValidOwner, parseRepoRef, repoPath, type GithubClient } from "../github-review/github.js";
 
 const logger = pino({ name: "github-mcp-tools" });
 
@@ -49,12 +49,56 @@ function cut(text: string, max = MAX_ANSWER_CHARS): string {
   return text.length <= max ? text : `${text.slice(0, max)}\n[cut: ${text.length - max} more characters]`;
 }
 
+/** What GitHub's answer with each status means, in these tools' own words. */
+const GITHUB_STATUS_MEANS: Record<number, string> = {
+  400: "the request was refused as malformed",
+  401: "the user's GitHub token was refused (expired or revoked); they can replace it in their Claw settings",
+  403: "the user's GitHub token may not read this (a missing permission, or an organization that requires SSO authorization)",
+  404: "not found, or the user's GitHub token cannot see it",
+  409: "a conflict (for example, an empty repository)",
+  410: "it is gone (deleted, or turned off for this repository)",
+  422: "the request was refused as invalid (for a search: check the syntax, and that the users and repositories it names exist and are visible)",
+  451: "unavailable for legal reasons",
+};
+
+/**
+ * A read's failure, in these tools' own words: the status GitHub answered with and what it means, never GitHub's message.
+ *
+ * A failed read reads nothing anyone else wrote, which is what lets an assistant's router turn go on and start the work a lookup
+ * could not do (`assistant/read-tools.ts`, `cleanFailures`). That holds only while the failure's text is all Claw's: GitHub's
+ * message, a GraphQL error and a transport error can each carry what someone else chose (a name, a query, an address), so none
+ * of them is passed on. They are logged, with GitHub's request id. `BadInput` is these tools' own, fixed, text.
+ */
+function readFailure(err: unknown): string {
+  if (err instanceof BadInput) return err.message;
+  if (err instanceof GithubGraphqlError) {
+    return "GitHub refused the request: the repository, pull request or thread may not exist, or the user's GitHub token cannot see it";
+  }
+  if (err instanceof GithubError) {
+    if (err.status === 0) return "GitHub could not be reached (the request failed or timed out); try once more";
+    if (err.rateLimited) {
+      return `GitHub answered ${err.status}: rate limited${err.retryAfterSeconds ? `; retry after ${err.retryAfterSeconds} seconds` : ""}`;
+    }
+    if (err.status >= 500) return `GitHub answered ${err.status}: GitHub could not answer (or its answer was too large to read); try once more`;
+    return `GitHub answered ${err.status}: ${GITHUB_STATUS_MEANS[err.status] ?? "the request was refused"}`;
+  }
+  return "the call failed; try once more";
+}
+
 async function answer(tool: string, run: () => Promise<unknown>): Promise<ToolResult> {
   try {
     const value = await run();
     return { content: [{ type: "text", text: cut(typeof value === "string" ? value : JSON.stringify(value)) }] };
   } catch (err) {
-    // GithubError's message is GitHub's own, redacted with the token by the client.
+    if ((READ_TOOLS as readonly string[]).includes(tool)) {
+      logger.warn({
+        tool, errorClass: (err as Error)?.constructor?.name, status: (err as GithubError)?.status, requestId: (err as GithubError)?.requestId,
+        err: (err as Error)?.message,
+      }, "github_mcp.read_failed");
+      return { content: [{ type: "text", text: readFailure(err) }], isError: true };
+    }
+    // A write's failure says what GitHub said (its message, redacted with the token by the client): a worker acts on it, and
+    // no router turn calls a write.
     if (err instanceof GithubError || err instanceof BadInput) {
       return { content: [{ type: "text", text: err.message }], isError: true };
     }
