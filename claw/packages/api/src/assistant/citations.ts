@@ -92,7 +92,8 @@ export function sourceTitle(raw: unknown, url: URL): string {
   // Redacted first, while a credential still has its own shape (the markup below takes its `_` and its prefix with it), and again
   // last, on what is shown.
   let plain = redact((typeof raw === "string" ? raw : "").replace(INVISIBLE, " "))
-    .replace(TAG, " ").replace(ENTITY, " ").replace(LINK, " $1 ").replace(ADDRESS, " ").replace(TOKEN_RUN, " ").replace(MARKUP, " ")
+    // An `&` left after the references is shown as the full-width ＆, which nothing decodes (`&#60img` without its `;` is markup too).
+    .replace(TAG, " ").replace(ENTITY, " ").replace(/&/g, "\uff06").replace(LINK, " $1 ").replace(ADDRESS, " ").replace(TOKEN_RUN, " ").replace(MARKUP, " ")
     .replace(/\s+/g, " ").trim();
   for (let block = plain.match(BLOCK); block; block = plain.match(BLOCK)) plain = plain.slice(block[0].length).trimStart();
   const cut = Array.from(plain).slice(0, SAY_SOURCE_TITLE_MAX).join("").trim();

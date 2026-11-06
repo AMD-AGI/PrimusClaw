@@ -55,8 +55,12 @@ test("C1 addresses compare by their normalized form; what cannot be a source has
     "https://acct.blob.core.windows.net/c/b?sv=2024&sig=abc", "https://x.example/cb?code=abc&state=s", "https://x.example/?access_token=abc",
     "https://x.example/?accessToken=abc", "https://x.example/?api_key=abc", "https://x.example/?apiKey=abc", "https://x.example/?key=abc",
     "https://s3.example/o?AWSAccessKeyId=AKIA&Expires=1", "https://x.example/cb#access_token=abc&token_type=bearer",
-    "https://x.example/?client_secret=abc", "https://x.example/?password=abc",
+    "https://x.example/?client_secret=abc", "https://x.example/?password=abc", "https://x.example/r?q=1;sig=opaque-secret-value",
+    "https://x.example/r#a=1;access_token=abc", "https://x.example/r?%73ig=abc",
   ]) assert.equal(citeKey(secret), null, secret);
+  // Nor an address with a character that could close an attribute or open a tag where it is shown.
+  for (const markup of ["https://example.com/<b>title</b>", 'https://example.com/a"onmouseover="x', "https://example.com/a'b",
+    "https://example.com/a`b", "https://example.com/{x}", "https://example.com/a|b", "https://example.com/a\\b"]) assert.equal(citeKey(markup), null, markup);
   for (const ok of ["https://example.com/search?q=primus+claw&page=2", "https://docs.example/guide#section-2",
     "https://github.com/o/r/pull/1#issuecomment-123", "https://example.com/a?design=1&keyboard=us&signal=on"]) assert.ok(citeKey(ok), ok);
 });

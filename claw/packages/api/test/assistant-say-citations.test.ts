@@ -38,12 +38,13 @@ test("SC1 an entry is kept only when it is well formed and cited in the text; Br
     pr(1, { title: "the same number again" }),
     pr(5),
     pr(7, { url: `${PR}?access_token=ghp_${"a".repeat(36)}` }),
+    pr(7, { url: `https://gist.example/ghp_${"a".repeat(36)}/raw` }),
     pr(8, { url: "https://user:pw@github.com/x" }),
     pr(8, { url: "https://bucket.example/r?X-Amz-Signature=QXdlc29tZVZlcnlTZWNyZXRTaWduYXR1cmU%3D" }),
     pr(0), pr(9), pr(2.5), { url: PR, kind: "github_pr" }, "https://github.com/x", null,
   ], { not_in_turn: 2, invalid: 1, over_cap: 1 }), text);
   assert.deepEqual(out.sources, [pr(1)]);
-  assert.deepEqual(out.counts, { cited: 1, dropped_not_in_turn: 2, dropped_invalid: 1 + 12, dropped_over_cap: 1, unreferenced: 1 });
+  assert.deepEqual(out.counts, { cited: 1, dropped_not_in_turn: 2, dropped_invalid: 1 + 13, dropped_over_cap: 1, unreferenced: 1 });
   assert.deepEqual(saySources(undefined, text), { sources: [], counts: { cited: 0, dropped_not_in_turn: 0, dropped_invalid: 0, dropped_over_cap: 0, unreferenced: 0 } });
   assert.deepEqual(saySources({ [CITE_SOURCES_META]: "x", [CITE_DROPPED_META]: { not_in_turn: -3, invalid: "9" } }, text).counts.dropped_not_in_turn, 0);
   const sorted = saySources(meta([pr(2), pr(1)]), "[1] [2]").sources.map((s) => s.n);
@@ -74,6 +75,7 @@ test("SC2 a title is one plain line with no markup, no address and no hidden cha
   for (const [title, shown] of [
     ["- [Click](https://evil.example)", "Click"], ["> quoted", "quoted"], ["1. first", "first"], ["+ * - nested", "nested"],
     ["## - # title", "title"], ["&lt;b&gt;bold&lt;/b&gt; &#91;x&#93;", "b bold /b x"], ["2026: a year", "2026: a year"],
+    ["&#60img src=x onerror=alert(1)&#62", "\uff06#60img src=x onerror=alert(1)\uff06#62"], ["AT&T news", "AT\uff06T news"],
   ]) assert.equal(sourceTitle(title, url), shown, title);
   assert.equal(sourceTitle("signed QXdlc29tZVZlcnlTZWNyZXRTaWduYXR1cmU%3D link", url), "signed link", "a token-like run goes");
   assert.equal(sourceTitle("o/r src/teams_agent/very/long/path/to/activity.py", url), "o/r src/teams agent/very/long/path/to/activity.py");
@@ -92,6 +94,9 @@ test("SC3 all of a message's sources fit the budget, and the longest message wit
     sources: out.sources,
   };
   assert.ok(Buffer.byteLength(JSON.stringify(payload)) < 16384, "Clawy's /claw-events takes at most 16 KiB");
+  // The longest text there is: 600 characters, each one JSON escapes to six bytes.
+  const escaped = { ...payload, text: `${"\u0001".repeat(600 - 24)}[1][2][3][4][5][6][7][8]` };
+  assert.ok(Buffer.byteLength(JSON.stringify(escaped)) < 16384, `${Buffer.byteLength(JSON.stringify(escaped))} bytes`);
 });
 
 test("SC4 a router turn cites with say, from the API's GitHub server when it has one; off, nothing changes", () => {

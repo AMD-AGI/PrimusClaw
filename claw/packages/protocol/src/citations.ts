@@ -64,8 +64,10 @@ const SECRET_PARAM_WORDS = ["signature", "token", "secret", "password", "passwd"
 /** Whether `url` carries a credential in a query or fragment parameter (`SECRET_PARAM_*`). */
 export function carriesSecret(url: URL): boolean {
   for (const part of [url.search, url.hash]) {
-    for (const name of new URLSearchParams(part.replace(/^[?#]/, "")).keys()) {
-      const low = name.toLowerCase();
+    // (`;` separates parameters too, for many servers)
+    for (const param of part.replace(/^[?#]/, "").split(/[&;]/)) {
+      let low: string;
+      try { low = decodeURIComponent(param.split("=", 1)[0].replace(/\+/g, " ")).toLowerCase(); } catch { return true; }
       const compact = low.replace(/[^a-z0-9]/g, "");
       if (SECRET_PARAM_WORDS.some((w) => compact.includes(w)) || low.split(/[^a-z0-9]+/).some((p) => SECRET_PARAM_PARTS.has(p))) return true;
     }
@@ -75,12 +77,14 @@ export function carriesSecret(url: URL): boolean {
 
 /**
  * The address `raw` names, when it can be a source: an absolute http or https URL, with a host, without credentials (neither as
- * a user nor as a parameter, `carriesSecret`), without whitespace, control or format characters, at most `CITE_URL_MAX` characters. Null
+ * a user nor as a parameter, `carriesSecret`), without whitespace, control, format or markup characters (`<>"'` and the like), at
+ * most `CITE_URL_MAX` characters. Null
  * for anything else.
  */
 export function citeableUrl(raw: unknown): URL | null {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > CITE_URL_MAX) return null;
-  if (/[\s\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}]/u.test(raw)) return null;
+  // Nor a character that could close an attribute or open a tag where it is shown: a canonical address has none.
+  if (/[\s\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}<>"'`{}|\\^]/u.test(raw)) return null;
   let url: URL;
   try {
     url = new URL(raw);
