@@ -111,15 +111,28 @@ export function redactStoredText(text: string): RedactResult {
  * A deep copy of a JSON-compatible value with every string masked by `redactStoredText`, and the value under a field named like a
  * credential (`isSensitiveKey`, the same judgement brain's `redactPersistedEvent` makes) replaced when it is a non-empty string or
  * a container. Keys and every other value are kept as they are, so the fields a reader routes on (`type`, ids, sequence numbers,
- * counts) are unchanged. The input is not modified.
+ * counts) are unchanged, and an identifier field's string (`IDENTIFIER_KEY_RE`) is not masked. The input is not modified.
  */
 export function redactStoredValue<T>(value: T): T {
   return walk(value) as T;
 }
 
-function walk(value: unknown): unknown {
-  if (typeof value === "string") return redactStoredText(value).text;
-  if (Array.isArray(value)) return value.map(walk);
+/**
+ * A field that names a record rather than holding content: `id`, `message_id`, `tool_use_id`, `actionId`, `app_task_id`. Readers
+ * match stored rows on these (a completion's `message_id`, a tool result's `tool_use_id`), and a caller may choose an id freely: an
+ * A2A `messageId` can be a 64-hex idempotency key, which `redactSecrets` takes for a credential. Brain keeps `message_id` after its
+ * own redaction for the same reason.
+ */
+const IDENTIFIER_KEY_RE = /^(?:id|[A-Za-z0-9_]*_id|[A-Za-z0-9]*[a-z0-9]Id)$/;
+/** An identifier is one token: a value with whitespace in it, or a long one, is content and is masked as usual. */
+const IDENTIFIER_VALUE_RE = /^[^\s]{1,256}$/;
+
+function walk(value: unknown, key?: string): unknown {
+  if (typeof value === "string") {
+    if (key !== undefined && IDENTIFIER_KEY_RE.test(key) && IDENTIFIER_VALUE_RE.test(value)) return value;
+    return redactStoredText(value).text;
+  }
+  if (Array.isArray(value)) return value.map((item) => walk(item));
   if (!value || typeof value !== "object") return value;
   if (value instanceof Date) return value;
   const out: Record<string, unknown> = {};
@@ -127,7 +140,7 @@ function walk(value: unknown): unknown {
     // A switch or a count under such a name (`{"token": false}`) keeps its type, an empty value has nothing to leak, and one
     // brain already masked stays as brain wrote it.
     const holds = (typeof child === "string" && child !== "" && child !== "[REDACTED]") || (!!child && typeof child === "object");
-    out[key] = holds && isSensitiveKey(key, child) ? "<redacted>" : walk(child);
+    out[key] = holds && isSensitiveKey(key, child) ? "<redacted>" : walk(child, key);
   }
   return out;
 }

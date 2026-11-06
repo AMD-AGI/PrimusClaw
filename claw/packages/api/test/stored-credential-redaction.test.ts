@@ -147,6 +147,35 @@ test("session events and conversation turns are stored masked; an ordinary event
   noSecretIn(turns[1].tool_results, "the turn's tool results");
 });
 
+test("a message id shaped like a credential is stored as it is, so the turn and its completion are still found by it", async () => {
+  // A caller chooses its message id (A2A `messageId`): a sha256 idempotency key is 64 hex characters, which the text pass takes
+  // for a credential. The id fields are what the completion, the turn's tools and the task view match stored rows on.
+  const hexId = "0123456789abcdef".repeat(4);
+  const toolId = `toolu_${body(24)}`;
+  await seedSession(h, SESSION);
+  await seedRun(h, "run-1", SESSION, { status: "running", messageId: hexId });
+  await deliver({ type: "toolUsed", message_id: hexId, actionId: toolId, tool_use_id: toolId, tool: "run_command", status: "start", input: { command: `echo ${WITH_SECRETS}` } });
+  await deliver({ type: "toolUsed", message_id: hexId, actionId: toolId, tool_use_id: toolId, tool: "run_command", status: "success", output: "ok" });
+  const complete = {
+    type: "exec_complete", session_id: SESSION, task_id: "run-1", user_id: "u-1", message_id: hexId,
+    prompt: "deploy", final_text: "done", failed: false, error_count: 0, skills_used: {},
+  };
+  await deliver(complete);
+  // Brain publishes a completion again after an interrupted run: it is recognised by its id and handled once.
+  await deliver(complete);
+
+  const events = await h.sql("SELECT data FROM claw_session_events WHERE session_id = $1 ORDER BY id", [SESSION]);
+  assert.deepEqual(events.slice(0, 3).map((e) => [e.data.type, e.data.message_id, e.data.actionId ?? null, e.data.tool_use_id ?? null]), [
+    ["toolUsed", hexId, toolId, toolId], ["toolUsed", hexId, toolId, toolId], ["exec_complete", hexId, null, null],
+  ]);
+  noSecretIn(events[0]!.data, "the toolUsed event");
+  const turns = await h.sql(
+    "SELECT role, tool_calls FROM claw_conversation_turns WHERE session_id = $1 ORDER BY turn_index", [SESSION],
+  );
+  assert.deepEqual(turns.map((t) => t.role), ["user", "assistant"], "the completion was handled once");
+  assert.equal(Array.isArray(turns[1]!.tool_calls) && turns[1]!.tool_calls.length, 1, "the stored turn kept its tool call");
+});
+
 test("a message's turn reaches Brain as written, and its stored UserMessage is masked", async () => {
   const { sessionDispatchPorts } = await import("../src/sessions/dispatch.js");
   const ports = { ...sessionDispatchPorts };

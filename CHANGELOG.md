@@ -701,7 +701,9 @@ record it.
   words an assistant's router turn answers (`claw_assistant_messages`). The new `redactStoredText` / `redactStoredValue`
   (`@claw/utils`) add to `redactSecrets` a SaFE API key (`ak-...`), a short `Bearer` token with a digit in it, an armored private
   key, and a value written after a credential's name (`password=`, `"api_key": "..."`, `token: ...`), leaving code, placeholders and
-  sentences alone (`password = getPassword()`, `password: string`, `${DB_PASSWORD}`, `"Enter your password"`). Only the stored copy
+  sentences alone (`password = getPassword()`, `password: string`, `${DB_PASSWORD}`, `"Enter your password"`). Identifier fields
+  (`id`, `*_id`, `*Id`: `message_id`, `tool_use_id`, `actionId`, ...) holding one token are stored as they are, whatever their shape,
+  since readers match stored rows on them (a 64-hex A2A `messageId` is not a credential). Only the stored copy
   is masked: the turn's prompt reaches Brain as written, and a router turn run again on the fallback model is given its prompt as the
   model first was when that prompt is the stored message. Later turns read their history from the masked rows. Rows written before
   this change are not rewritten.

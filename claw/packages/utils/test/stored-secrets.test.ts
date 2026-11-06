@@ -103,6 +103,28 @@ test("a stored event is masked as a copy: routing fields, types and the original
   assert.equal(redactStoredValue(3), 3);
 });
 
+test("identifier fields are kept as they are, whatever their shape; the same text elsewhere is masked", () => {
+  const hex = "0123456789abcdef".repeat(4);
+  const github = `gh${"p"}_${"Q7w8E9r0T1y2".repeat(3)}`;
+  const event = {
+    id: hex, message_id: hex, event_id: github, tool_use_id: github, actionId: hex, subagent_id: hex, app_task_id: hex,
+    nested: [{ message_id: hex, text: `id ${hex}` }], text: hex, message_id_note: `a sentence with ${github} in it`,
+  };
+  const out = redactStoredValue(event);
+  for (const key of ["id", "message_id", "event_id", "tool_use_id", "actionId", "subagent_id", "app_task_id"] as const) {
+    assert.equal(out[key], event[key], `${key} was rewritten`);
+  }
+  assert.equal(out.nested[0]!.message_id, hex);
+  assert.equal(out.nested[0]!.text, "id <redacted>");
+  assert.equal(out.text, "<redacted>");
+  assert.equal(out.message_id_note.includes(github), false, "a field that is not an identifier is masked");
+});
+
+test("an identifier field holding text is masked as content", () => {
+  const github = `gh${"p"}_${"Q7w8E9r0T1y2".repeat(3)}`;
+  assert.equal(redactStoredValue({ message_id: `see ${github}` }).message_id, "see <redacted>");
+});
+
 test("a long line with no credential is scanned in linear time", () => {
   const long = `${"a_".repeat(50_000)}password ${"x".repeat(100_000)} token`;
   const started = Date.now();
