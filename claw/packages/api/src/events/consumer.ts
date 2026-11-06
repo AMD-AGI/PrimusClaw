@@ -524,11 +524,7 @@ export async function consumeEventDelivery(msg: {
       }
     } else if (CLAW_ASSISTANT_ENABLED && (event.type === "decisionResult" || (event.type === "toolUsed" && event.tool === QUESTION_TOOL))) {
       // The wait is over (a decision, an answer, or Brain gave up): an item held for it goes back to in progress.
-      try {
-        await eventNotificationPorts.releaseHold({ sessionId, event });
-      } catch (err) {
-        logger.error({ err, sessionId }, "assistant.hold_release_failed");
-      }
+      if ((await eventNotificationPorts.releaseOrRetry(sessionId, event, msg)) === "retry") return;
     }
 
     // After the event is stored and, for a completion, processed: the run row a
@@ -843,6 +839,20 @@ export const eventNotificationPorts = {
       return (await eventNotificationPorts.holdForPerson({ sessionId, event })) === "not_an_item" ? "session" : "taken";
     } catch (err) {
       logger.error({ err, sessionId, type: event.type }, "assistant.hold_record_failed");
+      msg.nak(5_000);
+      return "retry";
+    }
+  },
+  /**
+   * The end of a wait an item may hold (`assistant/holds.ts`). "retry": recording it failed, and the event is redelivered (it is
+   * idempotent): no later event would put the item back in progress.
+   */
+  async releaseOrRetry(sessionId: string, event: Record<string, unknown>, msg: { nak: (millis?: number) => void }): Promise<"done" | "retry"> {
+    try {
+      await eventNotificationPorts.releaseHold({ sessionId, event });
+      return "done";
+    } catch (err) {
+      logger.error({ err, sessionId, type: event.type }, "assistant.hold_release_failed");
       msg.nak(5_000);
       return "retry";
     }

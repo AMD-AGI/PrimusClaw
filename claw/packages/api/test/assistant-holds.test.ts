@@ -11,7 +11,8 @@
  *        that lists the type and the assistant_item source, with the item; nobody else is sent it, and the router is not woken
  *   HD2  a question: the same, with the questions, masked and clipped
  *   HD3  the same request again changes nothing and sends nothing more, even once it was answered
- *   HD4  the decision, the answer, or the end of the wait puts the item back in progress; another request's end does not
+ *   HD4  the decision, the answer, or the end of the wait puts the item back in progress; another request's end does not;
+ *        a failure to record it is redelivered; a wait that is over is not listed as waiting
  *   HD5  with no channel that draws it, the item's needs-you message goes at once
  *   HD6  a request a channel took is the item's needs-you message: the silent sweep does not say it again
  *   HD7  the router is shown what waits, and a worker turn waits CLAW_ASSISTANT_DECISION_WAIT_SEC for its person
@@ -201,6 +202,33 @@ describe("assistant holds", { skip }, () => {
     await deliver(item.workerSid, { type: "decisionResult", actionId: "tu-2", tool_use_id: "tu-2", decision: "deny", by: "timeout" });
     assert.equal((await w.item(item.itemId)).board_state, "in_progress");
     assert.equal((await w.itemEvents(item.itemId)).at(-1)!.summary, "no decision in time");
+  });
+
+  test("HD4a a failure to record the end of a wait is retried, not dropped; a wait that is over is not shown as waiting", async () => {
+    const item = await workingItem();
+    await deliver(item.workerSid, held());
+    const real = w.mod.consumer.eventNotificationPorts.releaseHold;
+    let calls = 0;
+    w.mod.consumer.eventNotificationPorts.releaseHold = async (input) => {
+      calls += 1;
+      if (calls === 1) throw new Error("connection reset");
+      return real(input);
+    };
+    const decided = { type: "decisionResult", actionId: "tu-1", tool_use_id: "tu-1", decision: "allow", by: "user" };
+    try {
+      assert.deepEqual(await deliver(item.workerSid, decided), ["nak:5000"], "redelivered: nothing else would release the item");
+      assert.equal((await w.item(item.itemId)).board_state, "needs_you");
+      assert.deepEqual(await deliver(item.workerSid, decided), ["ack"]);
+    } finally {
+      w.mod.consumer.eventNotificationPorts.releaseHold = real;
+    }
+    assert.equal((await w.item(item.itemId)).board_state, "in_progress");
+
+    const other = await workingItem("Wait runs out");
+    await deliver(other.workerSid, held({ actionId: "tu-5", tool_use_id: "tu-5" }));
+    assert.equal((await holds.heldForPersonManifest("alice")).length, 1);
+    await w.q("UPDATE claw_work_items SET params = jsonb_set(params, '{hold,expires_at}', to_jsonb((NOW() - interval '1 minute')::text)) WHERE item_id = $1", [other.itemId]);
+    assert.deepEqual(await holds.heldForPersonManifest("alice"), [], "Brain has refused it: nobody can answer it any more");
   });
 
   test("HD4b a hold the worker's own report overtook is not undone by the late decision", async () => {

@@ -323,12 +323,16 @@ export interface HeldLine {
   hold: Hold;
 }
 
-/** Every request the user's items hold for them now (`params.hold` of the item's current need), oldest item first. */
+/**
+ * Every request the user's items hold for them now (`params.hold` of the item's current need, its wait not over), oldest item
+ * first. A wait that is over is Brain's refusal, which the worker goes on from: nobody can answer it any more.
+ */
 export async function heldForPersonManifest(userId: string): Promise<HeldLine[]> {
   const rows = (await db.query(
     `SELECT item_id, seq, title, params->'hold' AS hold FROM claw_work_items
       WHERE user_id = $1 AND board_state = 'needs_you' AND kind = 'task' AND params ? 'hold'
         AND (params->'hold'->>'attention_seq')::int = attention_seq
+        AND (params->'hold'->>'expires_at')::timestamptz > NOW()
       ORDER BY seq`,
     [userId],
   )).rows as Array<{ item_id: string; seq: number; title: string; hold: Hold }>;
