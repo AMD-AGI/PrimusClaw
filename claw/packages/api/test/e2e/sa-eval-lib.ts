@@ -29,7 +29,9 @@
  * and, for this runner only (all optional): `rubric` (what a judge model grades, `EVAL_JUDGE_*`), `modes` (the modes the
  * case runs in, default both), `needs` (an environment variable whose value fills `{NAME}` in the turns; skipped
  * without it), `item_wait_s` (how long to wait for an item's result), `items_closed` (every item the case started
- * is closed when it is graded: an interrupt that stopped it).
+ * is closed when it is graded: an interrupt that stopped it), `hold` (assistant mode: the case's item holds a request
+ * for its person, a write to approve or a question, and the runner answers it as the person's channel does, see
+ * {@link HoldSpec}).
  *
  * route, tools, cards, the final answer and its latency are the LAST turn's: earlier turns are context and may start
  * items of their own. Leaks are looked for in everything the case showed, and `items_closed` covers every item.
@@ -74,6 +76,34 @@ export interface EvalCase {
   needs?: string;
   item_wait_s?: number;
   items_closed?: boolean;
+  hold?: HoldSpec;
+}
+
+/**
+ * A request the case's item holds for its person (an entry of the item's `params.holds`, `assistant/holds.ts`): which tool, and how the
+ * runner answers it, through the routes a channel answers with (`POST /v1/sessions/<worker>/messages`, a `decision` or an
+ * `answer`). `wait_s` leaves it waiting that long first, to show the wait outlasts the minutes a console user gets.
+ * `answers` maps a question id to the answer; `*` as the id answers every question with its first option.
+ */
+export interface HoldSpec {
+  tool: string;
+  decide: "allow" | "deny" | "answer";
+  answers?: Record<string, string>;
+  wait_s?: number;
+}
+
+/** What the runner saw of a case's hold. */
+export interface HoldSeen {
+  /** The held tool, or null when the item never held a request the case named. */
+  tool: string | null;
+  /** From Brain asking (its `ts`) to the item holding it for the person (the hold's event, written with the request's announcement). */
+  cardMs: number | null;
+  /** The status the answer was given with; null when it was not given. */
+  answered: number | null;
+  /** With `wait_s`: whether the item still held the same request when the wait was over. */
+  heldAfterWait: boolean | null;
+  /** Whether the held call ran (for a question: whether the answer reached the worker); null when it could not be told. */
+  ran: boolean | null;
 }
 
 // --- Loading ------------------------------------------------------------------------------------------------------
@@ -89,6 +119,56 @@ export function problemsOf(c: Partial<EvalCase>): string[] {
   else if (c.turns.slice(1).some((t) => !(Number(t.after_ms) > 0))) out.push("a later turn without after_ms");
   if (c.route !== undefined && !ROUTES.includes(c.route)) out.push(`route ${c.route}`);
   if (c.cards !== undefined && !CARDS.includes(c.cards)) out.push(`cards ${c.cards}`);
+  if (c.hold !== undefined) {
+    const h = c.hold as Partial<HoldSpec>;
+    if (typeof h.tool !== "string" || !h.tool) out.push("hold without a tool");
+    if (!["allow", "deny", "answer"].includes(String(h.decide))) out.push(`hold decide ${h.decide}`);
+    if (h.decide === "answer" && (!h.answers || typeof h.answers !== "object" || !Object.keys(h.answers).length)) out.push("hold answer without answers");
+    if (h.wait_s !== undefined && !(Number.isInteger(h.wait_s) && h.wait_s >= 0 && h.wait_s <= 7200)) out.push(`hold wait_s ${h.wait_s}`);
+  }
+  return out;
+}
+
+/** The request a worker raised under this id, as its session's events stored it: Brain's `ts` and the tool, or null. */
+export function heldRequest(rows: readonly EventRow[], toolUseId: string): { ts: number; tool: string; questions: unknown } | null {
+  for (const r of rows) {
+    const d = r.data ?? {};
+    const type = d.type ?? r.event_type;
+    if (type === "permissionRequest" && (d.tool_use_id === toolUseId || d.actionId === toolUseId)) {
+      return { ts: Number(d.ts), tool: String(d.tool ?? ""), questions: null };
+    }
+    if (type === "userQuestion" && d.actionId === toolUseId) return { ts: Number(d.ts), tool: "ask_user_question", questions: d.questions };
+  }
+  return null;
+}
+
+/**
+ * Whether the held call ran after its answer: a successful result of that very call (the same id). A denied call ends with
+ * Brain's `decisionResult` and, at most, an error result. Null while neither has happened.
+ */
+export function heldCallRan(rows: readonly EventRow[], toolUseId: string): boolean | null {
+  let ended = false;
+  for (const r of rows) {
+    const d = r.data ?? {};
+    const type = d.type ?? r.event_type;
+    if (type === "toolUsed" && d.actionId === toolUseId && d.status !== "start") {
+      if (d.status === "success") return true;
+      ended = true;
+    }
+    if (type === "decisionResult" && (d.tool_use_id === toolUseId || d.actionId === toolUseId) && d.decision !== "allow" && d.action !== "allow") ended = true;
+  }
+  return ended ? false : null;
+}
+
+/** The answers a question card would send for `spec`: `*` answers each question with its first option's label. */
+export function holdAnswers(spec: HoldSpec, questions: unknown): Record<string, string> {
+  const given = spec.answers ?? {};
+  if (!("*" in given)) return { ...given };
+  const out: Record<string, string> = {};
+  for (const q of Array.isArray(questions) ? questions : []) {
+    const first = Array.isArray(q?.options) ? q.options[0] : undefined;
+    if (typeof q?.id === "string" && first) out[q.id] = String(first.label ?? first.id);
+  }
   return out;
 }
 
@@ -322,7 +402,12 @@ export interface Observed {
   items: ItemSeen[];
   /** The values of the case's facts, in order: an oracle's at run time, a static one's as written; null when there is none. */
   factValues: Array<string[] | null>;
+  /** A case with `hold`: what the runner saw of it (assistant mode only). */
+  hold?: HoldSeen;
 }
+
+/** The longest an item may take to hold its request for the person, from Brain asking: what a person waits for the card. */
+export const HOLD_CARD_MS = 5_000;
 
 /** `unverified`: a check that applies but could not be made here (an API oracle not read: offline). The attempt is then not
  * a pass (`verdictOf`). */
@@ -387,6 +472,20 @@ export function grade(c: EvalCase, o: Observed): Check[] {
   if (b.each !== undefined) {
     const each = b.each * 1000;
     out.push({ name: `each reply <= ${b.each}s`, pass: o.replyMs.length > 0 && o.replyMs.every((ms) => ms !== null && ms <= each), detail: o.replyMs.join(",") });
+  }
+  if (c.hold) {
+    const h = c.hold;
+    const labels = [`held ${h.tool}`, `held within ${HOLD_CARD_MS / 1000}s`, "answer taken",
+      ...(h.wait_s ? [`still held after ${h.wait_s}s`] : []), h.decide === "deny" ? "held call did not run" : h.decide === "answer" ? "answer reached the worker" : "held call ran"];
+    if (o.mode === "baseline") labels.forEach(skip);
+    else {
+      const seen = o.hold;
+      out.push({ name: labels[0]!, pass: !!seen?.tool && toolPattern(h.tool).test(seen.tool), detail: seen?.tool ?? "no hold" });
+      out.push({ name: labels[1]!, pass: seen?.cardMs != null && seen.cardMs >= 0 && seen.cardMs <= HOLD_CARD_MS, detail: `${seen?.cardMs ?? null}ms` });
+      out.push({ name: labels[2]!, pass: seen?.answered === 200, detail: `${seen?.answered ?? "not answered"}` });
+      if (h.wait_s) out.push({ name: labels[3]!, pass: seen?.heldAfterWait === true, detail: `${seen?.heldAfterWait ?? null}` });
+      out.push({ name: labels.at(-1)!, pass: seen?.ran === (h.decide !== "deny"), detail: `ran ${seen?.ran ?? "unknown"}` });
+    }
   }
   if (c.items_closed) {
     if (o.mode === "baseline") skip("items closed");

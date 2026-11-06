@@ -532,6 +532,14 @@ export interface ExecuteRequest {
    * assistant's worker turns. Absent, or anything but `true`: the sandbox opens on the first tool call, as before the field.
    */
   sandbox_prestart?: boolean;
+  /**
+   * How long, in milliseconds, this run waits for a person's decision on a held tool call or for the answer to an
+   * `ask_user_question`, in place of Brain's `HITL_DECISION_TIMEOUT_MS` and `ASK_USER_QUESTION_TIMEOUT_MS`; the
+   * `timeout_ms` of the request it announces says the same. The API sets it on the turns of an assistant's work item,
+   * whose person is told on a channel and may not be looking. Absent, or not a whole number from 1000 to 86400000:
+   * Brain's own settings, as before the field existed.
+   */
+  decision_wait_ms?: number;
   /** Pass-through MCP server configs (resolved at admission time). */
   mcp_servers?: Record<string, Record<string, unknown>>;
 

@@ -36,6 +36,20 @@ record it.
   loop only). The call itself still runs when the step is whole; the deltas are a preview for
   whoever follows the session live and are not stored. The router's read-only lookups (`read_taint.sources`) now run side by side
   within a step, as Brain's sandbox reads do.
+- An assistant's work item whose worker holds a write for its person's decision, or asks them with `ask_user_question`, now reaches
+  that person and waits for them (`assistant/holds.ts`). The item moves to needs_you with what it waits for as its question (and a
+  new attention), and the request goes out as an `approval.requested` with `source: "assistant_item"`, the item, and for a question
+  the questions, to each subscription that lists the type and the new `assistant_item` source (not in the default set; the
+  subscription routes accept it). With no such subscription the item's needs-you message goes at once, not after the silent sweep's
+  wait, and a request a channel took counts as that message, so the sweep does not repeat it. The decision, the answer, or the end
+  of the wait (`decisionResult`, the question's result) puts the item back in progress, as does the end of the run that waited (an
+  aborted wait sends no decision; the assistant sweep releases one whose run ended unseen). A worker's sub-agents can wait at once:
+  the item records each request (`params.holds`) and goes back to work only when the last is over, and a request whose end arrived
+  first holds nothing. The router's turn is shown what waits
+  ("Waiting for you in work items"), which only the person answers. Worker turns carry the new `ExecuteRequest.decision_wait_ms`
+  (`CLAW_ASSISTANT_DECISION_WAIT_SEC`, default 3600, 0 keeps Brain's settings), which Brain uses for that run's approval and
+  question waits and announces as their `timeout_ms`. Before, nobody was told and the item said "in progress" until Brain refused the
+  call after `HITL_DECISION_TIMEOUT_MS`. The super-agent evaluation runner answers such a request through the same routes (`hold`).
 - Model choice for the assistant's items, behind `CLAW_ASSISTANT_MODEL_CHOICE` (`on` | off, default off; needs `CLAW_ASSISTANT_ENABLED`
   and a non-empty `CLAW_ASSISTANT_MODELS`, the allow-list as `name=label,...`). One function decides an item's model: the model the
   message asked for, else the payer's own review default (reviews), else their own default, else the deployment's default for the kind

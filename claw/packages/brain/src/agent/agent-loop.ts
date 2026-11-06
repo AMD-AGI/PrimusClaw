@@ -389,6 +389,8 @@ export interface LoopOptions {
   hitl?: HitlController;
   /** NATS decision dispatcher for ask_user_question answers. */
   questionDispatcher?: import("../delivery/decision-dispatcher.js").DecisionDispatcher;
+  /** How long an ask_user_question waits for its answer: the run's `decision_wait_ms`, when it has one; else ASK_USER_QUESTION_TIMEOUT_MS. */
+  questionTimeoutMs?: number;
   /** Start in plan mode (read-only tools only until exit_plan_mode). */
   startInPlanMode?: boolean;
   /** Called after each complete turn (tool results appended to messages).
@@ -2283,9 +2285,10 @@ class AgentLoopRunner {
       // Registered before the question is announced: a caller that answers the
       // moment it sees the question would otherwise find nothing waiting, and
       // the answer would be dropped (the approval gate does the same, hitl.ts).
+      const questionWaitMs = this.opts.questionTimeoutMs ?? ASK_USER_QUESTION_TIMEOUT_MS;
       const waiting = this.opts.questionDispatcher.register({
           actionId: toolId, type: "answer",
-          timeoutMs: ASK_USER_QUESTION_TIMEOUT_MS,
+          timeoutMs: questionWaitMs,
           signal: this.signal,
         });
       waiting.catch(() => { /* consumed below; this only keeps an early failure from being unhandled */ });
@@ -2295,7 +2298,7 @@ class AgentLoopRunner {
           actionId: toolId,
           questions: finalInput.questions,
           // How long the answer is waited for, as a permissionRequest says it: a client stops offering the question then.
-          timeout_ms: ASK_USER_QUESTION_TIMEOUT_MS,
+          timeout_ms: questionWaitMs,
           ts: Date.now(),
         });
       } catch (err) {

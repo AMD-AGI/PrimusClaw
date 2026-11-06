@@ -20,6 +20,8 @@
  *   S11 the identity gate: no acknowledgement, a wrong one, a denied identity or an enabled subscription refuses the run
  *   S13 content only a judge can grade is never a pass without a judge; a judge's FAIL fails it; recordings drop oracle values
  *   S12 the last turn: the items a turn started are read from its own calls' answers; a dry-run plan; recordings parse
+ *   S14 a request an item holds for its person: the case says how to answer it; held, on time, answered, waited, and how the
+ *       call ended are each graded, and a baseline skips them; read off the worker's events
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -30,7 +32,7 @@ import { fileURLToPath } from "node:url";
 
 import type { ToolCall } from "./e2e/agent-eval-lib.js";
 import {
-  apiQuery, caseSays, cardsOf, forRecording, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
+  apiQuery, caseSays, cardsOf, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
 } from "./e2e/sa-eval-lib.js";
 
@@ -267,4 +269,45 @@ test("S13 judge-only content and recordings", () => {
     attempts: [{ pass: false, unjudged: true, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: 1, finalMs: 2, items: [] }] };
   assert.equal(totals([r]).all!.unjudged, 1);
   assert.equal(totals([r]).all!.passAllK, 0);
+});
+
+test("S14 a request an item holds for its person", () => {
+  const bad = (hold: unknown) => parseCases(JSON.stringify({ id: "h", turns: [{ user: "q" }], hold }), "f").bad;
+  assert.deepEqual(bad({ tool: "mcp__safe__workload_stop", decide: "allow" }), []);
+  assert.match(bad({ decide: "allow" })[0]!, /hold without a tool/);
+  assert.match(bad({ tool: "t", decide: "maybe" })[0]!, /hold decide maybe/);
+  assert.match(bad({ tool: "ask_user_question", decide: "answer" })[0]!, /hold answer without answers/);
+  assert.match(bad({ tool: "t", decide: "deny", wait_s: 9000 })[0]!, /hold wait_s 9000/);
+
+  const allow = caseOf({ hold: { tool: "mcp__safe__workload_*", decide: "allow", wait_s: 1800 } });
+  const good = { tool: "mcp__safe__workload_stop", cardMs: 1200, answered: 200, heldAfterWait: true, ran: true };
+  assert.deepEqual(failed(allow, observed({ hold: good })), []);
+  assert.deepEqual(failed(allow, observed({})), [
+    "held mcp__safe__workload_*", "held within 5s", "answer taken", "still held after 1800s", "held call ran",
+  ], "a case whose item never held anything fails every hold check");
+  assert.deepEqual(failed(allow, observed({ hold: { ...good, cardMs: 9000, heldAfterWait: false, ran: null } })),
+    ["held within 5s", "still held after 1800s", "held call ran"]);
+  assert.deepEqual(failed(allow, observed({ hold: { ...good, tool: "mcp__dispatron__post_runs" } })), ["held mcp__safe__workload_*"]);
+  const deny = caseOf({ hold: { tool: "mcp__agent-board__issue_write", decide: "deny" } });
+  assert.deepEqual(failed(deny, observed({ hold: { ...good, tool: "mcp__agent-board__issue_write", heldAfterWait: null, ran: false } })), []);
+  assert.deepEqual(failed(deny, observed({ hold: { ...good, tool: "mcp__agent-board__issue_write", ran: true } })), ["held call did not run"]);
+  const base = grade(deny, observed({ mode: "baseline", route: undefined, cards: undefined }));
+  assert.ok(base.filter((x) => x.name.startsWith("held")).every((x) => x.skipped), "a plain session has no item to hold");
+
+  const rows = [
+    { event_type: "permissionRequest", created_at: "", data: { type: "permissionRequest", tool_use_id: "tu-1", tool: "mcp__safe__workload_stop", ts: 1000 } },
+    { event_type: "userQuestion", created_at: "", data: { type: "userQuestion", actionId: "tu-q", ts: 2000, questions: [{ id: "q1", options: [{ id: "a", label: "mi355x" }] }, { id: "q2", options: [] }] } },
+  ];
+  assert.deepEqual(heldRequest(rows, "tu-1"), { ts: 1000, tool: "mcp__safe__workload_stop", questions: null });
+  assert.equal(heldRequest(rows, "tu-q")?.tool, "ask_user_question");
+  assert.equal(heldRequest(rows, "tu-x"), null);
+  assert.equal(heldCallRan(rows, "tu-1"), null, "nothing has happened yet");
+  const allowed = [...rows, { event_type: "toolUsed", created_at: "", data: { type: "toolUsed", actionId: "tu-1", status: "start" } },
+    { event_type: "toolUsed", created_at: "", data: { type: "toolUsed", actionId: "tu-1", status: "success" } }];
+  assert.equal(heldCallRan(allowed, "tu-1"), true);
+  const denied = [...rows, { event_type: "decisionResult", created_at: "", data: { type: "decisionResult", tool_use_id: "tu-1", decision: "deny" } },
+    { event_type: "toolUsed", created_at: "", data: { type: "toolUsed", actionId: "tu-1", status: "error" } }];
+  assert.equal(heldCallRan(denied, "tu-1"), false);
+  assert.deepEqual(holdAnswers({ tool: "ask_user_question", decide: "answer", answers: { "*": "" } }, heldRequest(rows, "tu-q")?.questions), { q1: "mi355x" });
+  assert.deepEqual(holdAnswers({ tool: "ask_user_question", decide: "answer", answers: { q1: "mi300x" } }, null), { q1: "mi300x" });
 });

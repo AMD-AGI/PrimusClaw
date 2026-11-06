@@ -10,6 +10,7 @@
  * queued message on an ordinary session.
  */
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
+import { releaseHoldsOfEndedRuns } from "./holds.js";
 import { sweepReviewItems } from "./review-items.js";
 import { reconcileOrphanedItems, reconcileWorkerRuns } from "./turn-end.js";
 import { tellSilentItems } from "./silent-sweep.js";
@@ -20,6 +21,9 @@ export async function sweepAssistant(): Promise<void> {
   // In this order: a run recorded as ready here needs the user, and is then eligible for the announcement.
   // The two passes share no item: one with a run started under its current generation is the first's, one with
   // none is the second's.
+  // First, a request whose run is over and was not seen to end: the item goes back to in progress, and its run's end is
+  // then the next pass's to record.
+  await releaseHoldsOfEndedRuns();
   await reconcileWorkerRuns();
   await reconcileOrphanedItems();
   // Review items report nothing: their state is read off the review's own tables, here as well as at each turn's end and answer.
