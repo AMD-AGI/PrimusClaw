@@ -23,6 +23,7 @@ import { db, FAILOVER_RETRY_DELAY_MS, inTransaction, isFailoverError, neverCommi
 import { metrics } from "../infra/metrics.js";
 import {
   ASSISTANT_EVENT_TYPES,
+  type AssistantFile,
   type AssistantItemSnapshot,
   type AssistantConfirmAction,
   type AssistantConfirmWrite,
@@ -37,8 +38,12 @@ import { canAccept, resolveWorkItem } from "./work-items.js";
 
 const logger = pino({ name: "assistant-outbound" });
 
-/** The longest message the assistant may say: about a hundred words. */
-export const SAY_TEXT_MAX = 600;
+/**
+ * The longest message the assistant may say, and the longest answer the system says for it: three chat messages of 3000
+ * characters, which is how a channel shows a long one (whole, never cut). The prompt still asks for about a hundred words
+ * (`SAY_BRIEF_CHARS`) unless the user asked for more; this is the bound, not the norm.
+ */
+export const SAY_TEXT_MAX = 9000;
 
 export type SayRefusal = "empty_text" | "text_too_long" | "item_not_found" | ItemRefError | "say_rate_limited" | "handed_off";
 
@@ -135,7 +140,7 @@ interface ToStoreBase {
 type ToStore =
   | (ToStoreBase & {
     type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; confirmWrite?: AssistantConfirmWrite;
-    sources?: AssistantSaySource[];
+    sources?: AssistantSaySource[]; files?: AssistantFile[];
   })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow });
 
@@ -148,6 +153,7 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
       ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}),
       ...(m.sources?.length ? { sources: m.sources } : {}),
       ...(m.confirmWrite ? { confirm_write: m.confirmWrite } : {}),
+      ...(m.files?.length ? { files: m.files } : {}),
     };
 }
 
@@ -201,6 +207,7 @@ async function announce(stored: Stored, deps: SayDeps, turnMessageId?: string): 
         // must see the card the channel draws, not only its words.
         ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
         ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
+        ...(payload.type === "assistant.say" && payload.files ? { files: payload.files } : {}),
         fallback: payload.type === "work_item.needs_you",
         ts: Date.parse(payload.occurred_at),
       });
@@ -556,12 +563,15 @@ export async function recordSystemNotice(
     userId: string; sessionId: string; text: string; key: string;
     /** The item it is about, attached as a say's is; and the message of the turn it answers, as on a say's event. */
     itemId?: string; turnMessageId?: string;
+    /** Files the user gets with it (a worker's deliveries, `deliveries.ts`). */
+    files?: AssistantFile[];
   }, deps: SayDeps = {},
 ): Promise<SayOutcome | null> {
   const stored = await storeSettled(async (q, storeOne) => storeOne({
     type: "assistant.say", fallback: true, item: input.itemId ? await loadItem(q, input.itemId, input.userId) : null,
     sayId: deterministicEventId("assistant.notice", input.userId, input.key),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
+    ...(input.files?.length ? { files: input.files } : {}),
   }), (late) => announce(late, deps, input.turnMessageId));
   if (!stored) return null;
   await announce(stored, deps, input.turnMessageId);

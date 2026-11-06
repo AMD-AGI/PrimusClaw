@@ -16,8 +16,10 @@ import { isDeepStrictEqual } from "node:util";
 import pino from "pino";
 import { inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
+import { announceItemDeliveries } from "./deliveries.js";
 import { queueServerMessage, drainSessionIfIdle } from "./messages.js";
-import { formatWorkEvent } from "./prompts.js";
+import { recordNeedsYouFallback } from "./outbound.js";
+import { formatWorkEvent, SAY_BRIEF_CHARS } from "./prompts.js";
 import {
   applyWorkerReport, type BoardState, type ReportKind, type ReportSource, type WorkReport,
 } from "./work-items.js";
@@ -68,6 +70,14 @@ async function repeatsLastReport(query: Querier, run: ReportRun, report: WorkRep
  * about. Null when there is no assistant to tell or the message could not be queued: what happened stands, and the sweep tells the user
  * an item that needs them even if the Router cannot be woken.
  */
+/**
+ * An answer longer than a usual message is said to the user whole by the system (`sayAnswerWhole`), formatted as the worker
+ * wrote it, instead of being retyped by the router into one; the router is told it was sent. A short one is the router's to say.
+ */
+export function answerSentWhole(kind: ReportKind, summary: string): boolean {
+  return kind === "answer" && summary.length > SAY_BRIEF_CHARS;
+}
+
 export async function queueRouterWake(q: StatementRunner, e: {
   itemId: string; userId: string; eventId: number; kind: ReportKind; version: number; summary: string; question: string | null;
 }): Promise<{ sessionId: string; userId: string } | null> {
@@ -83,6 +93,7 @@ export async function queueRouterWake(q: StatementRunner, e: {
     userId: e.userId,
     content: formatWorkEvent({
       itemId: e.itemId, seq: Number(target.seq), kind: e.kind, version: e.version, summary: e.summary, question: e.question,
+      sentInFull: answerSentWhole(e.kind, e.summary),
     }),
     dedupeKey: `wi-evt:${e.eventId}`,
   });
@@ -127,6 +138,31 @@ export async function ingestReport(
     throw err;
   }
   if (written.outcome.status === "stale") metrics.onWorkItemStaleRejected(source);
+  const applied = written.outcome.status === "applied";
+  // Before the router runs, so the user has the answer and the files first and the router's line follows them.
+  if (applied && answerSentWhole(recorded.kind, recorded.summary)) await sayAnswerWhole(run.itemId);
+  if ((applied && recorded.kind !== "progress") || source === "turn_end") await announceDeliveries(run.itemId);
   if (written.wake) await drainSessionIfIdle(written.wake.sessionId, written.wake.userId);
   return written.outcome;
+}
+
+/**
+ * The answer, whole, in the system's words (`recordNeedsYouFallback`: once per need of the item, so the silent sweep does not say
+ * it again). A failure is logged and left to that sweep, which says it later.
+ */
+async function sayAnswerWhole(itemId: string): Promise<void> {
+  try {
+    await recordNeedsYouFallback({ itemId });
+  } catch (err) {
+    logger.warn({ err, itemId }, "assistant.answer_not_sent_whole");
+  }
+}
+
+/** The worker's delivered files, to the user (`deliveries.ts`). Never fails the report: the next one tries again. */
+async function announceDeliveries(itemId: string): Promise<void> {
+  try {
+    await announceItemDeliveries(itemId);
+  } catch (err) {
+    logger.warn({ err, itemId }, "assistant.item_deliveries_not_announced");
+  }
 }

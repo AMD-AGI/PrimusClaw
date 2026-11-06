@@ -44,6 +44,21 @@ record it.
   prefix of the message, and a `sources` argument of the wrong type is read as none rather than refusing the say. New counter
   `claw_assistant_say_sources_total{outcome}` (`cited`, `dropped_not_in_turn`, `dropped_invalid`, `dropped_over_cap`,
   `unreferenced`, `suppressed_link_text`).
+- The assistant takes the files a person sends and hands back the files and long answers its work produces. A channel uploads the
+  files to the assistant's session and names them beside the message (`channel_context.files`: `path` below `.uploads/`, `name`,
+  `media_type`, `size`; at most 10, only paths inside the session's own uploads). The router turn that answers the message is told what
+  came and is shown the images itself: the new `prompt_images` field of the execute request names them, and Brain reads them from the
+  session's uploads and sends them with the prompt as image blocks (whole PNG, JPEG, GIF or WebP up to 3.5 MB, at most 4; the checks
+  are now one module, `@claw/protocol` `images.ts`, shared with Hands' `read`; the OpenAI wire sends them as image parts). Every item
+  the turn starts or instructs (`work_create`, `work_send`) gets a server-side copy of every file in its worker's session before its
+  message is queued, and the worker is told where; a copy the store refused is answered as `files_not_attached`. A worker's
+  `deliver_file` reaches the user: after a report that says something (any kind but progress, or the end of its turn) each delivered
+  file still downloadable is announced once, as an `assistant.say` in the system's words carrying `files` (`item_id`, `session_id`,
+  `id`, `name`, `size`, `content_type`, a small image inline) for a channel to draw as a download. Long answers are said whole: `say`
+  takes up to 9000 characters (the router is still asked for about 600 unless the user needs more), an `answer` report up to 8800
+  (other kinds stay at 600), and an answer longer than 600 is sent to the user whole by the system at once (the router is told it was
+  sent); a plain-text router ending is cut only past 9000. The super-agent evaluation sends a turn's `files` as a channel does and grades
+  `delivers` and `style.min_chars`.
 - Quicker assistant router turns. A router turn can ask for low reasoning effort (`CLAW_ASSISTANT_ROUTER_EFFORT`: low | medium |
   high | `default`, the default, for the model's own; set `low` where the router runs on a reasoning model such as Claude; a session
   that chose an effort keeps it), and its `say` is published while the model writes it (`CLAW_ASSISTANT_STREAM_SAY`, default on): the

@@ -12,7 +12,7 @@
  * only `say` reaches the user, and there is no accept tool at all.
  */
 import { REPLY_LANGUAGE_LABEL } from "./language.js";
-import { REPORT_SUMMARY_MAX } from "./report.js";
+import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
 import type { ReportKind } from "./work-items.js";
 
 /**
@@ -29,26 +29,38 @@ import type { ReportKind } from "./work-items.js";
  * an item, work_recall for how far an item got, the memory and channel tools for what they are for, the system's own failures never
  * given as an answer or a reason, a declined request said in a line, and every say in the reply language (say refuses another, and
  * an item number without its title).
+ * router-v11: v10 with a long answer said whole (up to SAY_MAX_CHARS, shown as up to three messages) instead of cut short, and an
+ * answer the system already sent in full not said again.
  */
-export const ROUTER_PROMPT_VERSION = "router-v10";
+export const ROUTER_PROMPT_VERSION = "router-v11";
 /**
  * The router's prompt with the review and settings tools (`CLAW_ASSISTANT_TOOLS=on`): router-v5 and `ROUTER_REVIEW_PROMPT`
  * (v6: v5 with an allow only on the user's exact approval command, and a channel action not typed as its command put to the user
  * as a button; v7: v6 with a review by someone else refused here, and the user told where to ask for it; v8: v7 on router-v5; v9: v8 on router-v6; v10: v9 on router-v7;
  * v11: v10 on router-v8; v12: v11 with nothing said about a review handed to the user's chat, which answers the message about it
- * itself, and how a started review merges told from its result; v13: v12 on router-v10).
+ * itself, and how a started review merges told from its result; v13: v12 on router-v10;
+ * v14: v13 on router-v11).
  */
-export const ROUTER_REVIEW_PROMPT_VERSION = "router-v13";
+export const ROUTER_REVIEW_PROMPT_VERSION = "router-v14";
 
 /** The assistant's MCP server, which is what Brain puts before each of its tools' names. */
 export const ASSISTANT_MCP_SERVER = "assistant";
 /** A tool is called by its full name, and the model is told so: a name without this is not a tool, and Brain turns it away. */
 export const TOOL_NAME_PREFIX = `mcp__${ASSISTANT_MCP_SERVER}__`;
-/** worker-v2: worker-v1 with report(kind="answer") for a task that only finds something out. */
-export const WORKER_PROMPT_VERSION = "worker-v2";
+/**
+ * worker-v2: worker-v1 with report(kind="answer") for a task that only finds something out.
+ * worker-v3: v2 with an answer given whole (up to REPORT_ANSWER_MAX; longer goes in a file), and every file the user should get
+ * handed over with deliver_file before the report.
+ */
+export const WORKER_PROMPT_VERSION = "worker-v3";
 
-/** The longest `say` text: about 100 words. A longer one is refused so the Router writes it shorter. */
-export const SAY_MAX_CHARS = 600;
+/**
+ * The longest `say` text (the API's `SAY_TEXT_MAX`): a channel shows a long one as up to three messages, whole. The norm is
+ * `SAY_BRIEF_CHARS`; the bound is for the answer the user asked to have in full.
+ */
+export const SAY_MAX_CHARS = 9000;
+/** What a `say` usually is: about 100 words. */
+export const SAY_BRIEF_CHARS = 600;
 
 export const WORK_EVENT_PREFIX = "[work_event]";
 
@@ -57,7 +69,7 @@ export const ROUTER_PROMPT = `You are the user's personal assistant. You talk to
 Nothing you write as plain text reaches the user. The only way to speak to the user is the say tool. If you do not call say, the user hears nothing.
 
 Tools (call each by its full name: ${TOOL_NAME_PREFIX} followed by the name below, for example ${TOOL_NAME_PREFIX}say)
-- say(text, item_id?): send the user a message. At most ${SAY_MAX_CHARS} characters (about 100 words); a longer text is refused, so write it shorter. Pass item_id when the message is about one work item, so the user can act on that item from the message.
+- say(text, item_id?): send the user a message. Keep it to about ${SAY_BRIEF_CHARS} characters (100 words). When the user needs a long answer (a list they asked for, a full result), say it whole, never cut short: up to ${SAY_MAX_CHARS} characters, which they get as up to three messages. Pass item_id when the message is about one work item, so the user can act on that item from the message.
 - work_create(title, brief, repo?): start a new work item and give it to a worker. title is at most 40 characters. brief is everything the worker needs, written as a self-contained task, because the worker cannot see this conversation: a few lines with the request and the names, links and constraints from the conversation, not a plan. It returns the new item's item_id and number.
 - work_send(item_id, text): forward a new instruction or the user's answer to the worker of an existing item. The item goes back to in_progress.
 - work_stop(item_id, reason): stop an item the user no longer wants.
@@ -74,7 +86,7 @@ How to handle a message
 3. A question about progress: answer from the work item list sent with the message. When the user asks how far an item got, what it is doing now or which of several is done, the list (in progress) is not enough: call work_recall(item, "reports") for each item asked about, all in one step, then say the answer (see Describing items).
 4. Chat or a question that needs no work: just say the answer.
    A request you will not carry out (it is unsafe, not allowed, or asks for internal addresses or secrets): say so in one short line, and what you can do instead. Never leave the user's message without an answer.
-5. A message that starts with ${WORK_EVENT_PREFIX} is a report from a worker, not something the user said. It is a fact about an item. Tell the user only what they need to decide, accept or know, in one message, passing the item's item_id to say (the user sees its number and title, never the id). Do not repeat the whole report. A report of kind answer is the answer to what the user asked: say it to them as the answer; the item is closed and there is nothing to accept.
+5. A message that starts with ${WORK_EVENT_PREFIX} is a report from a worker, not something the user said. It is a fact about an item. Tell the user only what they need to decide, accept or know, in one message, passing the item's item_id to say (the user sees its number and title, never the id). Do not repeat the whole report. A report of kind answer is the answer to what the user asked: say it to them as the answer; the item is closed and there is nothing to accept. When the report says the answer was already sent to the user in full, do not say it again: say nothing, or one short line only if they need to know something more.
 6. Speak on your own only when the user must decide something, a result is ready to accept, or an item failed. Do not narrate progress.
 7. You can never accept a result for the user. Accepting is a button the user presses. If the user says a result is fine, tell them to accept it from the message; if they want it changed, work_send what to change.
 8. Do not start a second item for work that already has one. If unsure, ask in one short say.
@@ -241,7 +253,9 @@ Report as you go, and keep reports few:
 - report(kind="ready", summary, result?) when the work is done and can be checked. Put what to look at in result.refs (a pull request url, a commit sha, a run id) and say in the summary what was done and how you checked it. A result the user cannot check is not ready.
 - report(kind="failed", summary) when the work cannot be done; say why.
 - report(kind="dropped", summary) when the work turns out not to be needed.
-summary is at most ${REPORT_SUMMARY_MAX} characters. A report that is refused tells you why: fix it and report again.
+summary is at most ${REPORT_SUMMARY_MAX} characters, except an answer's: an answer is given whole, up to ${REPORT_ANSWER_MAX} characters, never cut short. An answer longer than that goes into a file you deliver (below), with the gist in the summary. A report that is refused tells you why: fix it and report again.
+
+Files: the user cannot open your workspace. Every file the user asked for or should keep (a report, a chart, a spreadsheet, a document) is handed over with deliver_file before you report; the user gets a download for each file you deliver. A path in a summary is not a file they have. Files the user sent are named in the task, under /workspace/.uploads/.
 
 Finish every run with a report of kind answer, ready, blocked, failed or dropped. Ending without one is read as ready with your last message as the summary, so say plainly in that message what was done.
 
@@ -444,8 +458,15 @@ export function renderWorkerSystem(item: { seq: number; title: string }): string
 /** The message that wakes the Router for a worker's report. It starts with the marker the Router prompt names. */
 export function formatWorkEvent(e: {
   itemId: string; seq: number; kind: ReportKind; version?: number; summary: string; question?: string | null;
+  /** The answer was already sent to the user whole (`answerSentWhole`): the router is told so, with its beginning only. */
+  sentInFull?: boolean;
 }): string {
   const head = `${WORK_EVENT_PREFIX} #${e.seq} (item_id: ${e.itemId}) ${e.kind}${e.kind === "ready" && e.version ? ` v${e.version}` : ""}`;
+  if (e.sentInFull) {
+    const summary = oneLine(e.summary);
+    const start = Array.from(summary).slice(0, SAY_BRIEF_CHARS).join("");
+    return `${head}: (already sent to the user in full; this is its beginning) ${start}${start.length < summary.length ? "…" : ""}`;
+  }
   return `${head}: ${oneLine(e.summary)}${e.question ? `\nQuestion for the user: ${oneLine(e.question)}` : ""}`;
 }
 

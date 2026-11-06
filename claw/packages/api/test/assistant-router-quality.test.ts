@@ -213,9 +213,10 @@ describe("router quality, pure", () => {
 describe("router quality, the prompt", () => {
   test("Q7 router-v10 and router-read-v6 say each rule", async () => {
     const p = await import("../src/assistant/prompts.js");
-    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v10");
+    // router-v11 (this rule set, and a long answer said whole); its review prompt is router-v14 (v13 on router-v11).
+    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v11");
     assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v6");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v13");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v14");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): do not say that again/],
