@@ -130,6 +130,15 @@ interface SessionWorkloadPage {
  * `primus-claw/session-id` label selector used to have. SaFE matches the env
  * value exactly (jsonb `->> key = value`), so no other session can be returned.
  */
+/** A workload list SaFE answered with something other than 200. */
+class WorkloadListRefused extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 /**
  * The workspaces to list a session's workloads in, as given: trimmed, deduplicated, empty names dropped.
  *
@@ -137,7 +146,7 @@ interface SessionWorkloadPage {
  * the service identities Claw runs for (sa-eval-bot, sa-release-gate, dispatron-service) -- is answered 403
  * unless the request names a workspace the key may read, so an unscoped list made every non-admin session's
  * teardown `lookup_failed` and parked it for good. The workspaces come from what the session recorded
- * (its `hands.<sid>` binding's namespace); none recorded keeps the unscoped list, which an admin key reads.
+ * (its `hands.<sid>` binding's namespace), and are asked only after the unscoped list is refused.
  */
 export function sessionWorkspaces(workspaces: readonly (string | null | undefined)[] | undefined): string[] {
   const out: string[] = [];
@@ -149,8 +158,8 @@ export function sessionWorkspaces(workspaces: readonly (string | null | undefine
 }
 
 /**
- * Every workload a session owns in the given workspaces, one walk per workspace (unscoped when none is
- * given). A walk that fails fails the whole lookup: a teardown that read one workspace and not the other
+ * Every workload a session owns: the unscoped list when the key may read it, else one walk per recorded
+ * workspace. A walk that fails fails the whole lookup: a teardown that read one workspace and not the other
  * must not call the session clean.
  */
 async function findSessionWorkloads(
@@ -158,8 +167,15 @@ async function findSessionWorkloads(
   apiKey: string,
   workspaces?: readonly (string | null | undefined)[],
 ): Promise<SessionWorkloadPage> {
-  const scopes: Array<string | undefined> = sessionWorkspaces(workspaces);
-  if (scopes.length === 0) scopes.push(undefined);
+  const scopes = sessionWorkspaces(workspaces);
+  // The unscoped list first: a key that may read it (an admin's) sees every workspace, including one the
+  // binding does not name, exactly as before. Only its 403 -- the answer every other key gets -- moves the
+  // lookup to the recorded workspaces.
+  try {
+    return await findSessionWorkloadsIn(sessionId, apiKey, undefined);
+  } catch (err) {
+    if (!(err instanceof WorkloadListRefused) || err.status !== 403 || scopes.length === 0) throw err;
+  }
   const items: WorkloadRef[] = [];
   let incomplete = false;
   let reason: SessionWorkloadPage["reason"];
@@ -198,7 +214,10 @@ async function findSessionWorkloadsIn(
     if (workspaceId) query.set("workspaceId", workspaceId);
     const resp = await safeFetch(`/api/v1/workloads?${query}`, { apiKey });
     if (resp.status !== 200) {
-      throw new Error(`workloads list failed${workspaceId ? ` in ${workspaceId}` : ""}: HTTP ${resp.status} ${JSON.stringify(resp.body).slice(0, 300)}`);
+      throw new WorkloadListRefused(
+        resp.status,
+        `workloads list failed${workspaceId ? ` in ${workspaceId}` : ""}: HTTP ${resp.status} ${JSON.stringify(resp.body).slice(0, 300)}`,
+      );
     }
     // A 200 whose body is not a workload list hands us nothing to act on and
     // proves nothing about the session. Reported as incomplete rather than

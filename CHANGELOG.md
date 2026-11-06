@@ -867,9 +867,9 @@ record it.
 - Brain: deleting a session owned by a non-admin key (every ordinary user, and service identities such as `sa-eval-bot`,
   `sa-release-gate` and `dispatron-service`) no longer stops at `cleanup_incomplete_parked`. The session-scoped SaFE workload
   list named no workspace, which SaFE answers with 403 for any key that is not an admin's, so teardown read it as
-  `mn.safe_lookup_failed`. Teardown and the multi-node idle sweep now list in the workspace the session recorded (its
-  `hands.<sid>` binding's `namespace`), one list per workspace when there are several; a session that recorded none keeps the
-  unscoped list.
+  `mn.safe_lookup_failed`. When the unscoped list is refused with 403, teardown and the multi-node idle sweep now list in
+  the workspace the session recorded (its `hands.<sid>` binding's `namespace`), one list per workspace when there are several;
+  a key that may read the unscoped list (an admin's) keeps reaching every workspace.
 - The GitHub list reads (`issue_search`, `pr_list`, `issue_list`, `repo_list`, `code_search`) answer the whole list a question
   asks for: `{ total_count, shown, complete, next_page?, items }`, pages of 50 by default (up to 100), and an answer of at most
   `GITHUB_LIST_MAX_CHARS` that Brain keeps whole (any other result is still cut to its head and tail at 6000 characters, which

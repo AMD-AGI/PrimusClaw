@@ -431,11 +431,8 @@ test("a non-admin key tears down a session by naming its workspace", async (t) =
     { complete: result.complete, found: result.found, deleted: result.deleted, reason: result.reason },
     { complete: true, found: 2, deleted: 2, reason: undefined },
   );
-  const lists = calls.filter((c) => c.method === "GET");
-  assert.ok(lists.length > 0);
-  for (const c of lists) {
-    assert.equal(new URL(c.url, "http://safe.test").searchParams.get("workspaceId"), "global-cpu", "every list names the workspace");
-  }
+  const listed = calls.filter((c) => c.method === "GET").map((c) => new URL(c.url, "http://safe.test").searchParams.get("workspaceId"));
+  assert.deepEqual(listed, [null, "global-cpu"], "the unscoped list is refused, then the workspace is named");
 });
 
 test("a session recorded in two workspaces is listed in each, and nothing is listed twice", async (t) => {
@@ -450,7 +447,27 @@ test("a session recorded in two workspaces is listed in each, and nothing is lis
 
   assert.deepEqual({ complete: result.complete, found: result.found, deleted: result.deleted }, { complete: true, found: 2, deleted: 2 });
   const listed = calls.filter((c) => c.method === "GET").map((c) => new URL(c.url, "http://safe.test").searchParams.get("workspaceId"));
-  assert.deepEqual(listed, ["global-cpu", "gpu-ws"]);
+  assert.deepEqual(listed, [null, "global-cpu", "gpu-ws"]);
+});
+
+test("a key that may read the unscoped list (an admin's) is not narrowed to the recorded workspace", async (t) => {
+  // The unscoped list reaches every workspace; a cluster outside the binding's namespace is still found.
+  const calls = stubSafeApi(t, { list: [workload("sandbox-1", "running", "Sandbox"), workload("ray-elsewhere", "running", "RayJob")] });
+
+  const result = await new SafeMultiNodeProvider().destroyForSession(SESSION, { platformKey: KEY, workspaces: ["global-cpu"] });
+
+  assert.deepEqual({ complete: result.complete, found: result.found, deleted: result.deleted }, { complete: true, found: 2, deleted: 2 });
+  const listed = calls.filter((c) => c.method === "GET").map((c) => new URL(c.url, "http://safe.test").searchParams.get("workspaceId"));
+  assert.deepEqual(listed, [null]);
+});
+
+test("an unscoped list that fails other than 403 is not retried narrower", async (t) => {
+  stubSafeApi(t, { listStatus: 500 });
+
+  const result = await new SafeMultiNodeProvider().destroyForSession(SESSION, { platformKey: KEY, workspaces: ["global-cpu"] });
+
+  assert.equal(result.complete, false);
+  assert.equal(result.reason, "lookup_failed");
 });
 
 test("a workspace the key cannot read makes the teardown incomplete, not clean", async (t) => {
