@@ -30,6 +30,8 @@
  *   F10 stop, then a new instruction at once: the end the cancel brings ends what was sent before it, never the new one, whether
  *       the stop was the item's button or the attached chat's; a prompt and a stop are queued and noted one at a time per session;
  *       a turn's end stored but not yet applied when the item was stopped is the old turn's, not the next instruction's
+ *   F13 a turn that finished on its own as the stop was on its way: its end is the old turn's, whether the cancel then brings an end
+ *       of its own or none
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -550,6 +552,42 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "and format" })).status, 202);
     item = await remoteItem(sid);
     assert.deepEqual([item.board_state, item.params.open_turns, item.params.cancel_after ?? null], ["in_progress", 1, null]);
+  });
+
+  test("F13 a turn that finished as the stop was on its way never ends the instruction sent after the stop", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const prompt = async (sid: string, text: string) => assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text })).status, 202);
+
+    // Stop, a new instruction, then the old turn's own end, then the cancel's (it found nothing running), then the new one's.
+    const one = await tools.devenvSend(await userTurn(alice, "跑 make test"), { text: "跑 make test" });
+    const a = String(one.session_id);
+    assert.equal((await post("alice", `/v1/work-items/${String(one.item_id)}/stop`, {})).status, 200);
+    await prompt(a, "now lint");
+    await events("alice", cid, a, [chunk("tests done"), end()]);
+    assert.deepEqual([(await remoteItem(a)).board_state, (await remoteItem(a)).title], ["in_progress", "laptop claude: now lint"], "the old turn's end is not lint's");
+    await events("alice", cid, a, [end("cancelled")]);
+    assert.equal((await remoteItem(a)).board_state, "in_progress");
+    await events("alice", cid, a, [chunk("lint clean"), end()]);
+    assert.deepEqual([(await remoteItem(a)).board_state, (await remoteItem(a)).summary], ["done", "lint clean"]);
+
+    // The same, but the turn ended as the cancel reached it and the cancel brought no end of its own.
+    const sid = await chatSession("alice", cid);
+    await prompt(sid, "first");
+    assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "cancel" })).status, 202);
+    await prompt(sid, "second");
+    await events("alice", cid, sid, [chunk("first done"), end()]);
+    assert.equal((await remoteItem(sid)).board_state, "in_progress", "the first turn's end is not the second's");
+    await events("alice", cid, sid, [chunk("second done"), end()]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "second done"]);
+
+    // A stop with nothing sent after it: the turn that ended on its own ends the item, and the cancel's end changes nothing.
+    await prompt(sid, "third");
+    assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "cancel" })).status, 202);
+    await events("alice", cid, sid, [chunk("third done"), end()]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "third done"]);
+    await events("alice", cid, sid, [end("cancelled")]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.cancel_after ?? null], ["done", null]);
   });
 
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {

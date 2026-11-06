@@ -96,6 +96,8 @@ export interface RemoteParams {
   cancel_after?: number | null;
   /** Prompts sent after that cancel: still to run when its turn_end comes. */
   after_cancel?: number;
+  /** Prompts open when that cancel was sent whose turn may still end on its own (it finished as the cancel was on its way). */
+  before_cancel?: number;
 }
 
 export const langOf = (text: string): RemoteLang => (/\p{Script=Han}/u.test(text) ? "zh" : "en");
@@ -161,7 +163,11 @@ export async function inRemoteSessionOrder<T>(sessionId: string, run: () => Prom
 export async function noteRemoteCancel(owner: string, sessionId: string, mark: number): Promise<void> {
   if (!remoteItemsOn()) return;
   await db.query(
-    `UPDATE claw_work_items SET params = params || $3::jsonb, updated_at = NOW()
+    // Of the prompts open, at most one is running and may end on its own; the queued ones are dropped with no end of theirs.
+    `UPDATE claw_work_items
+        SET params = params || $3::jsonb
+              || jsonb_build_object('before_cancel', LEAST(1, GREATEST(0, COALESCE((params->>'open_turns')::int, 0)))),
+            updated_at = NOW()
       WHERE worker_session_id = $1 AND user_id = $2 AND kind = 'remote'
         AND NOT EXISTS (SELECT 1 FROM claw_remote_events e WHERE e.session_id = $4 AND e.id > $5 AND e.type = 'turn_end'
                          AND e.data->>'stopReason' = 'cancelled')`,
@@ -380,12 +386,22 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
     for (const e of events) {
       p.last_event_id = e.id;
       // The end a cancel sent from here brings: what was open before the cancel is over, and only the prompts sent after it remain.
+      // Before it, a turn that was running when the cancel was sent may still end on its own (it finished as the cancel was on its
+      // way): that end is the turn's from before the cancel, never one sent after it. A further end with none of those left means the
+      // cancel found nothing to end and brought no end of its own, and the count goes on from the prompts sent after it.
       let afterCancel: number | null = null;
-      if (e.type === REMOTE_EVENT_TURN_END && typeof p.cancel_after === "number" && e.id > p.cancel_after
-        && flat(e.data.stopReason, 40) === "cancelled") {
-        afterCancel = Math.max(0, Number(p.after_cancel) || 0);
-        p.cancel_after = null;
-        p.after_cancel = 0;
+      let beforeCancelEnd = false;
+      if (e.type === REMOTE_EVENT_TURN_END && typeof p.cancel_after === "number" && e.id > p.cancel_after) {
+        const before = Math.max(0, Number(p.before_cancel) || 0);
+        if (flat(e.data.stopReason, 40) !== "cancelled" && before > 0) {
+          p.before_cancel = before - 1;
+          beforeCancelEnd = true;
+        } else {
+          afterCancel = Math.max(0, Number(p.after_cancel) || 0);
+          p.cancel_after = null;
+          p.after_cancel = 0;
+          p.before_cancel = 0;
+        }
       }
       if (board === "done" && e.type !== REMOTE_EVENT_SESSION_CLOSED) continue;
       if (e.type === REMOTE_EVENT_PERMISSION_REQUEST) {
@@ -411,7 +427,11 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       } else if (e.type === REMOTE_EVENT_TURN_END) {
         const stop = flat(e.data.stopReason, 40);
         // A cancel ends the running turn and drops every queued prompt with no turn_end of their own: nothing sent before it is open.
-        p.open_turns = afterCancel !== null ? afterCancel : stop === "cancelled" ? 0 : Math.max(0, (Number(p.open_turns) || 0) - 1);
+        // The turn from before the cancel ended on its own: with nothing sent after the cancel, the item ends with it.
+        if (beforeCancelEnd && (Number(p.after_cancel) || 0) > 0) continue;
+        p.open_turns = beforeCancelEnd ? 0 : afterCancel !== null
+          ? (stop === "cancelled" ? afterCancel : Math.max(0, afterCancel - 1))
+          : stop === "cancelled" ? 0 : Math.max(0, (Number(p.open_turns) || 0) - 1);
         if (p.open_turns > 0) continue;
         const said = stopWords(stop, flat(e.data.error, 200), p.lang);
         const whole = await answerOf(q, sessionId, e.id);
