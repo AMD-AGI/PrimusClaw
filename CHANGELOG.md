@@ -59,7 +59,8 @@ record it.
   refuses by name each prompt a cancel drops from its queue (`command_rejected`, reason `cancelled`). Claw keeps the command
   numbers of an item's open prompts (`open_cmd_seqs`; a number, which the credential masking of events never changes, unlike a
   client's `Idempotency-Key` in a `cmd_id`) and ends exactly the prompt named; a turn's end that names a prompt the item does not
-  have open ends nothing. A connector that does not send `cmd_seq` is counted as before.
+  have open ends nothing. The end a cancel brings ends every prompt still open that was sent before it, so a prompt whose turn's end
+  never came (the connector restarted mid-turn) ends with the next stop. A connector that does not send `cmd_seq` is counted as before.
 - A router turn that said only a line that it was on it ("查一下 Autopilot 的状态。") before its lookup answered, and then wrote its
   answer as plain text, no longer leaves the person with that line alone: the completion skipped the text because the turn had
   spoken. When the turn's stored `toolUsed` events show that every say that went out came before its last lookup ended (answered or

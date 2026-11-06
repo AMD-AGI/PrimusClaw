@@ -274,7 +274,10 @@ sent before it, never a prompt sent after it, and a prompt the connector refused
 open (`open_cmd_seqs`), and a connector that names the prompt a turn ends (`turn_end.cmd_seq`) is followed by
 name: that end ends that prompt and no other, a refusal by name (`command_rejected`, including `cancelled` for a
 prompt a cancel dropped) ends the prompt it names, and the end of a turn the item does not have open (one that
-finished as a stop was on its way, the cancel's own end naming none) ends nothing. A `turn_end` without
+finished as a stop was on its way) ends nothing. The end a cancel brings (`stopReason: "cancelled"`, whether it
+names the turn it cancelled or none) also ends every prompt still open that was sent before that cancel: one
+whose turn's end never came (the connector restarted mid-turn, and does not run it again) ends with the next
+stop. A `turn_end` without
 `cmd_seq`, or a refusal of a prompt that never runs without one (a connector from before they were sent), makes
 the item count again until it next reopens: with counting, two
 stops in quick succession, with a turn ending on its own while the first cancel is on its way, can leave an

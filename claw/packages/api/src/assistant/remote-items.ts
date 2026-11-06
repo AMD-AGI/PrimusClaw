@@ -114,10 +114,21 @@ export interface PendingCancel {
   before: number;
   /** Prompts sent after it (and before the next cancel): they run once it is done. */
   n: number;
+  /**
+   * The `cmd_seq` of the prompts open when it was sent (the item's `open_cmd_seqs` then): its end ends every one of them still open,
+   * named or not. A prompt whose turn's end never comes (the connector restarted mid-turn: the prompt is not delivered again and the
+   * session's queue starts empty) is then ended by the next stop, whose cancel finds nothing running and names no prompt.
+   */
+  seqs?: number[];
 }
 
 const pendingCancels = (p: Partial<RemoteParams> | null | undefined): PendingCancel[] =>
-  Array.isArray(p?.cancels) ? p!.cancels!.map((c) => ({ after: Number(c.after) || 0, before: Number(c.before) || 0, n: Number(c.n) || 0 })) : [];
+  Array.isArray(p?.cancels)
+    ? p!.cancels!.map((c) => ({
+      after: Number(c.after) || 0, before: Number(c.before) || 0, n: Number(c.n) || 0,
+      seqs: Array.isArray(c.seqs) ? c.seqs.filter((x) => Number.isSafeInteger(x)) : [],
+    }))
+    : [];
 
 export const langOf = (text: string): RemoteLang => (/\p{Script=Han}/u.test(text) ? "zh" : "en");
 
@@ -190,16 +201,19 @@ export async function noteRemoteCancel(owner: string, sessionId: string, mark: n
     )).rows[0] as { item_id: string; params: RemoteParams } | undefined;
     if (!item) return;
     const cancels = pendingCancels(item.params);
-    // Its end already posted (with no cancel before it still pending): it ended what was open then, and nothing is pending.
+    const openSeqs = Array.isArray(item.params?.open_cmd_seqs) ? item.params.open_cmd_seqs : null;
+    // Its end already posted (with no cancel before it still pending): it ended what was open then, and nothing is pending. Followed
+    // by name, only once that end was applied: one posted and not yet applied is this cancel's, and ends what was open before it.
     if (!cancels.length && (await q(
-      `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND id > $2 AND type = 'turn_end' AND data->>'stopReason' = 'cancelled' LIMIT 1`,
-      [sessionId, mark],
+      `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND id > $2 AND type = 'turn_end' AND data->>'stopReason' = 'cancelled'
+          AND ($3::bigint IS NULL OR id <= $3::bigint) LIMIT 1`,
+      [sessionId, mark, openSeqs ? Number(item.params?.last_event_id) || 0 : null],
     )).rows[0]) return;
     // What may be running when it reaches the agent: with an earlier cancel pending, one of the prompts sent after that one; else
     // one of those open now. At most one runs; queued ones are dropped with no end of theirs.
     const last = cancels.at(-1);
     const before = Math.min(1, last ? last.n : Math.max(0, Number(item.params?.open_turns) || 0));
-    cancels.push({ after: mark, before, n: 0 });
+    cancels.push({ after: mark, before, n: 0, seqs: openSeqs ? [...openSeqs] : [] });
     await q("UPDATE claw_work_items SET params = params || $2::jsonb, updated_at = NOW() WHERE item_id = $1",
       [item.item_id, JSON.stringify({ cancels })]);
   });
@@ -453,15 +467,28 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       if ((e.type === REMOTE_EVENT_TURN_END || refusedUnrun) && !named) p.open_cmd_seqs = null;
       if (Array.isArray(p.open_cmd_seqs) && named) {
         if (board === "done") continue;
-        // Cancels pending are counted only for a connector that does not name its prompts.
-        if (e.type === REMOTE_EVENT_TURN_END) p.cancels = [];
-        if (seq === null || !p.open_cmd_seqs.includes(seq)) continue;
-        p.open_cmd_seqs = p.open_cmd_seqs.filter((c) => c !== seq);
-        p.open_turns = p.open_cmd_seqs.length;
+        const ended = new Set<number>(seq !== null ? [seq] : []);
+        // The end a cancel brings (`cancelled`, after the oldest cancel pending was sent): nothing sent before that cancel is left to
+        // run, so every prompt open when it was sent ends with it, whether it names the turn it cancelled or none (it found nothing
+        // running: a prompt whose turn's end never came, lost when the connector restarted mid-turn, ends here). A cancel pending
+        // that does not have the cancelled prompt open was sent before that prompt and its end is not coming any more (the turn it
+        // was sent for finished on its own as it was on its way): it is passed over, and what it had open the later one has too.
+        const pending = pendingCancels(p);
+        if (e.type === REMOTE_EVENT_TURN_END && flat(e.data.stopReason, 40) === "cancelled" && pending.length && e.id > pending[0].after) {
+          if (seq !== null) while (pending.length && !pending[0].seqs!.includes(seq)) pending.shift();
+          for (const c of pending.shift()?.seqs ?? []) ended.add(c);
+          p.cancels = pending;
+        }
+        const left = p.open_cmd_seqs.filter((c) => !ended.has(c));
+        if (left.length === p.open_cmd_seqs.length) continue;
+        p.open_cmd_seqs = left;
+        p.open_turns = left.length;
         if (p.open_turns > 0) continue;
         board = "done";
         p.closed_event_id = e.id;
         p.waiting = [];
+        // Nothing is open for a cancel still pending to end: the next prompt starts over.
+        p.cancels = [];
         if (e.type === REMOTE_EVENT_TURN_END) await closeAnswered(e);
         else await closeRefused(e, reason);
         continue;

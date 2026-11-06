@@ -39,7 +39,8 @@
  *       own as the first of two stops was on its way no longer leaves the last instruction's item open after it ended; an old turn's
  *       end never ends a newer instruction; a cancel's queued prompts, refused by name, end with it; a prompt whose command id is
  *       masked as a credential on the way (a credential-shaped Idempotency-Key) still ends by its number; an end naming no prompt (an
- *       older connector) makes the item count again, as before
+ *       older connector) makes the item count again, as before; a stop whose cancel finds nothing running (the connector restarted
+ *       mid-turn, and that turn's end never comes) ends every instruction sent before it
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -738,6 +739,20 @@ describe("development environment items and devenv_send", { skip }, () => {
     await send({ type: "prompt", text: "u1" });
     const u1 = (await promptIds(sid)).at(-1)!;
     assert.deepEqual((await remoteItem(sid)).params.open_cmd_seqs, [u1]);
+
+    // The connector restarts while u1 runs: u1 is not delivered again and its turn's end never comes. A stop then finds nothing
+    // running and its end names no prompt; it ends u1, and the item with it. The next instruction is followed as before.
+    await send({ type: "cancel" });
+    assert.deepEqual((await remoteItem(sid)).params.cancels.map((c: Recorded) => c.seqs), [[u1]]);
+    await events("alice", cid, sid, [endOf(null, "cancelled")]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome, item.params.open_cmd_seqs, item.params.cancels], ["done", "answered", [], []],
+      "a stop ends an instruction whose turn's end never came");
+    await send({ type: "prompt", text: "v1" });
+    const v1 = (await promptIds(sid)).at(-1)!;
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_cmd_seqs], ["in_progress", [v1]]);
+    await events("alice", cid, sid, [chunk("v1 done"), endOf(v1)]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "v1 done"]);
   });
 
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {
