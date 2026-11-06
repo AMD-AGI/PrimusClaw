@@ -314,7 +314,8 @@ export const saysOf = (events: readonly LiveEvent[]): Say[] => events
     itemId: e.data.item?.item_id ? String(e.data.item.item_id) : null,
     itemState: e.data.item?.board_state ? String(e.data.item.board_state) : null,
     canAccept: e.data.item?.can_accept === true,
-    confirm: !!e.data.confirm_action,
+    // A card the person presses: a channel's command to run (`confirm_action`) or a write the router proposed (`confirm_write`).
+    confirm: !!e.data.confirm_action || !!e.data.confirm_write,
     fallback: e.data.fallback === true,
   }));
 

@@ -318,6 +318,64 @@ export async function workSubscribe(
   }
 }
 
+/** At most this many pull requests a new item watches by itself: a brief listing more is about something else than each of them. */
+export const AUTO_WATCH_MAX = 3;
+const TOKEN_MAX = 300;
+const PR_URL = /^https:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9_.-]+)\/pull\/(\d{1,9})(?:[/?#].*)?$/i;
+const PR_SHORT = /^([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9_.-]+)#(\d{1,9})$/;
+
+/**
+ * The pull requests a text names in full, as a link or as owner/repo#123, in order, each once (GitHub's names are not case sensitive).
+ * The text is cut into words first and each word is matched from its start, so a long text costs one pass.
+ */
+export function pullRequestsNamedIn(text: string): PrRef[] {
+  const out: PrRef[] = [];
+  const seen = new Set<string>();
+  for (const raw of text.split(/[\s<>()[\]{}"'`,;，。、；：（）]+/)) {
+    const word = raw.replace(/[.:!?！？]+$/, "");
+    if (!word || word.length > TOKEN_MAX) continue;
+    const m = PR_URL.exec(word) ?? PR_SHORT.exec(word);
+    const ref = m ? parsePrRef(`${m[1]}/${m[2]}#${m[3]}`) : null;
+    if (!ref) continue;
+    const key = prName(ref).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ref);
+  }
+  return out;
+}
+
+/**
+ * A new task item about a pull request watches it from the start: the pull requests its title and brief name in full (at most
+ * `AUTO_WATCH_MAX`; with more, none). It is `work_subscribe` done by Claw, read-only as that is (answers on GitHub still wait for the
+ * user), and best effort: what could not be watched is returned with its reason, and the item stands either way. Not for a user
+ * whose GitHub token the loop cannot read: their watch could only fail, and after ten minutes put the item in front of them as
+ * blocked for a reason that is not the work's (`no_github_token`, returned for the router to say).
+ */
+export async function watchNamedPullRequests(
+  userId: string, itemId: string, texts: readonly string[],
+): Promise<{ watching: string[]; not_watched: Array<{ pr: string; error: string }> }> {
+  const out = { watching: [] as string[], not_watched: [] as Array<{ pr: string; error: string }> };
+  if (!githubEventsEnabled()) return out;
+  const refs = pullRequestsNamedIn(texts.join("\n"));
+  if (!refs.length || refs.length > AUTO_WATCH_MAX) return out;
+  if (!await githubEventPorts.loadToken(userId)) {
+    out.not_watched.push(...refs.map((ref) => ({ pr: prName(ref), error: "no_github_token" })));
+    return out;
+  }
+  for (const ref of refs) {
+    try {
+      const sub = await subscribeItem({ userId, item: itemId, pr: prName(ref) });
+      out.watching.push(sub.pr);
+    } catch (err) {
+      if (!(err instanceof SubscriptionRefused)) throw err;
+      out.not_watched.push({ pr: prName(ref), error: err.code });
+    }
+  }
+  if (out.watching.length) logger.info({ itemId, prs: out.watching }, "assistant.github_auto_watch");
+  return out;
+}
+
 // --- Reading GitHub ---------------------------------------------------------------------
 
 interface Subscription {

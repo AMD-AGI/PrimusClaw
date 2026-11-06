@@ -20,7 +20,7 @@ import {
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { gateNamesEndedTurnSql, stopTurnRuns } from "../tasks/chat-run.js";
-import { fireIntoItem, fireTrigger, type TriggerRow } from "./fire.js";
+import { fireBriefTrigger, fireIntoItem, fireTrigger, type TriggerRow } from "./fire.js";
 import { nextFireAfter } from "./schedule.js";
 
 const logger = pino({ name: "triggers-scheduler" });
@@ -68,12 +68,12 @@ async function endTrigger(triggerId: string, reason: "ended" | "item_closed"): P
 export async function tickTriggers(now: Date = new Date()): Promise<void> {
   const due = (await db.query(
     `SELECT trigger_id, owner_user_id, name, prompt, schedule, timezone, credential_enc, next_fire_at,
-            ends_at, max_runs, runs, item_id
+            ends_at, max_runs, runs, item_id, action
        FROM claw_triggers
       WHERE enabled AND paused_reason IS NULL AND next_fire_at <= $1
       ORDER BY next_fire_at LIMIT $2`,
     [now, BATCH],
-  )).rows as Array<TriggerRow & { next_fire_at: Date; ends_at: Date | null; max_runs: number | null; runs: number }>;
+  )).rows as Array<TriggerRow & { next_fire_at: Date; ends_at: Date | null; max_runs: number | null; runs: number; action: string }>;
 
   for (const t of due) {
     const planned = t.next_fire_at;
@@ -135,9 +135,13 @@ export async function tickTriggers(now: Date = new Date()): Promise<void> {
       continue;
     }
 
-    const outcome = t.item_id ? await fireIntoItem(t, planned) : await fireTrigger(t, planned);
-    if (outcome.status === "started") {
-      await recordFire(t.trigger_id, key, t.owner_user_id, "started", outcome.sessionId, null, outcome.messageId);
+    const outcome = t.action === "brief" ? await fireBriefTrigger(t, planned)
+      : t.item_id ? await fireIntoItem(t, planned) : await fireTrigger(t, planned);
+    if (outcome.status === "started" || outcome.status === "delivered") {
+      // A brief runs nothing: it is recorded as delivered, with no session, so it neither counts as a run against the daily
+      // limit nor holds the next firing back as one still open.
+      if (outcome.status === "delivered") await recordFire(t.trigger_id, key, t.owner_user_id, "delivered", null, null);
+      else await recordFire(t.trigger_id, key, t.owner_user_id, "started", outcome.sessionId, null, outcome.messageId);
       await db.query(
         `UPDATE claw_triggers
             SET consecutive_failures = 0, runs = runs + 1,

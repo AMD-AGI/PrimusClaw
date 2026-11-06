@@ -60,6 +60,7 @@ test("S1 route", () => {
   assert.equal(routeOf([item({ kind: "review" })], [call("mcp__assistant__work_create")], []), "review");
   assert.equal(routeOf([], [call("mcp__assistant__review_start")], []), "review");
   assert.equal(routeOf([], [], saysOf([say(1, "m1", "run it?", { confirm_action: { name: "github" } })])), "confirm");
+  assert.equal(routeOf([], [], saysOf([say(1, "m1", "create it?", { confirm_write: { confirmation_id: "c1", kind: "trigger_create" } })])), "confirm");
 });
 
 test("S2 final answer, what was shown, cards", () => {

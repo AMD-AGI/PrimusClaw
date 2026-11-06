@@ -44,6 +44,7 @@ const REGISTRARS: Record<string, string> = {
   registerRemoteAgentRoutes: "routes/remote-agents.js",
   registerAssistantRoutes: "routes/assistant.js",
   registerAssistantGithubEventRoutes: "routes/assistant-github-events.js",
+  registerAssistantProactiveRoutes: "routes/assistant-proactive.js",
   registerAssistantMcpRoutes: "assistant/mcp.js",
   registerTriggerMcpRoutes: "triggers/mcp.js",
   registerGithubReviewRoutes: "github-review/mcp.js",

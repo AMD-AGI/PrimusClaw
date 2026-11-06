@@ -548,6 +548,14 @@ export const CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS = envInt("CLAW_ASSISTANT_GI
 export const CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS: ReadonlySet<string> = new Set(
   env("CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
 );
+// Job watches: the assistant watches a SaFE workload or one of the user's own runs (a run another service such as a
+// planner started for them included) and tells the user when its state changes and when it ends
+// (`assistant/job-watch.ts`). Needs CLAW_ASSISTANT_ENABLED as well; off, there are no tools for it and nothing polls.
+export const CLAW_ASSISTANT_JOB_EVENTS = envBool("CLAW_ASSISTANT_JOB_EVENTS", false);
+// How often a watched job is read. A change reaches the user at most this long after it happened.
+export const CLAW_ASSISTANT_JOB_POLL_SEC = envInt("CLAW_ASSISTANT_JOB_POLL_SEC", 30, { min: 10 });
+// Jobs one user may have watched at once.
+export const CLAW_ASSISTANT_JOB_MAX_WATCHES = envInt("CLAW_ASSISTANT_JOB_MAX_WATCHES", 20, { min: 1 });
 
 // --- Remote agents (default OFF) ---
 // When false: no remote-agent tables, no routes, and nothing polls. A connector

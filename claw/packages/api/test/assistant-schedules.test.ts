@@ -1,0 +1,322 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * The router's scheduled tasks (`assistant/schedules.ts`) on a real Postgres, with triggers, the trigger tools and the assistant on.
+ * Skipped without DATABASE_URL, and a skip is not a pass.
+ *
+ *   S1  trigger_create creates nothing: it stores a confirmation and puts a card to the user (the say carries confirm_write, on the
+ *       outbox and on the session's event), with the schedule, the timezone, the next run in the user's own time and the prompt
+ *   S2  the card's button (`POST /v1/assistant/confirmations/:id/decision`) creates the trigger once, with the cron and timezone shown,
+ *       on the key of the request; only the person signed in (or the chat the operator named, for them) may press it, never a key; a
+ *       second press is told what the first did; deny creates nothing; another user's press is a 404
+ *   S3  trigger_cancel holds too, and its press really deletes the trigger
+ *   S4  a typed approval command (批准 #ref) creates it through confirmation_answer, only from a signed-in message written after the
+ *       card was shown; a yes in other words, and an unattended message, let nothing through; a no likewise needs 拒绝 #ref
+ *   S5  the limits are asked before a card is shown: an invalid schedule, a full trigger list, no key, a report's turn, a worker
+ *   S6  trigger_list shows the user's triggers and the cards waiting; the router's state lists the cards
+ *   S7  the tools are offered to a router only with the trigger tools on, and confirmation_answer reaches a card with the review tools
+ *       on or off
+ *   S8  a lapsed card does nothing when pressed
+ *   S9  a card answered after the next run it showed: the trigger starts from the run after, and the answer says so
+ */
+import assert from "node:assert/strict";
+import test, { after, before, beforeEach, describe } from "node:test";
+import Fastify, { type FastifyInstance } from "fastify";
+
+import { postgresSkipReason } from "./support/pg-cluster.js";
+import { startWorld, type Claims, type World } from "./support/assistant-world.js";
+
+const skip = postgresSkipReason();
+
+describe("assistant schedules", { skip }, () => {
+  let w: World;
+  let app: FastifyInstance;
+  let alice: { userId: string; routerSid: string };
+  let bob: { userId: string; routerSid: string };
+  let sch: typeof import("../src/assistant/schedules.js");
+  let inbound: typeof import("../src/assistant/inbound.js");
+
+  before(async () => {
+    w = await startWorld({
+      CLAW_TRIGGERS_ENABLED: "true", CLAW_TRIGGER_TOOLS_ENABLED: "true", CLAW_TRIGGER_TOOLS_TOKEN_KEY: "trigger-tools-test-key-0123456789abcdef",
+      CLAW_ASSISTANT_ATTENDED_TTL_SEC: "600", TRIGGER_MAX_PER_USER: "3", CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "clawy",
+    });
+    sch = await import("../src/assistant/schedules.js");
+    inbound = await import("../src/assistant/inbound.js");
+    sch.schedulePorts.sayDeps = w.sayDeps;
+    app = Fastify();
+    app.addHook("preHandler", async (req) => {
+      const id = req.headers["x-test-user"];
+      if (typeof id !== "string") return;
+      const client = req.headers["x-test-client"];
+      (req as any).user = {
+        userId: id, userName: `Name ${id}`, platformKey: `pk-button-${id}`, virtualKey: `vk-button-${id}`, roles: ["default"],
+        ...(typeof client === "string" ? { delegation: { actorSub: "svc", clientId: client } } : {}),
+      };
+      const method = req.headers["x-test-method"];
+      (req as any).authMethod = typeof method === "string" ? method : "identity_token";
+    });
+    await (await import("../src/routes/assistant-proactive.js")).registerAssistantProactiveRoutes(app);
+    await app.ready();
+  });
+  after(async () => { await app?.close(); await w?.stop(); });
+  beforeEach(async () => {
+    await w.q(`TRUNCATE claw_triggers, claw_trigger_fires, claw_assistant_confirmations, claw_assistant_says, claw_assistant_messages,
+      claw_notification_outbox, claw_notification_subscriptions, claw_work_item_events, claw_work_items, claw_pending_messages, claw_tasks,
+      claw_assistants, claw_sessions CASCADE`);
+    w.events.length = 0;
+    alice = await w.user("alice");
+    bob = await w.user("bob");
+  });
+
+  const PERSON = { kind: "person" } as const;
+  const DAILY = { name: "PR 早报", prompt: "List my open pull requests in AMD-AGI/PrimusClaw and any red CI; send me the list.", schedule: "0 9 * * *", timezone: "Asia/Shanghai" };
+
+  /** A live router turn answering a message the user sent, written down as the route writes it. */
+  async function userTurn(u: { routerSid: string; userId: string }, content: string, o: { via?: object | null; agoSec?: number } = {}): Promise<Claims> {
+    const turn = await w.routerTurn(u);
+    await w.q(
+      `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, user_name, content, attended_via, channel_context, received_at)
+       VALUES ($1, $2, $3, 'A', $4, $5::jsonb, $6::jsonb, NOW() - make_interval(secs => $7::int))`,
+      [u.routerSid, turn.mid, u.userId, content, o.via === null ? null : JSON.stringify(o.via ?? PERSON),
+        JSON.stringify(inbound.parseChannelContext({ channel: "teams", channel_message_id: "m-1" })), o.agoSec ?? 0],
+    );
+    return turn;
+  }
+  const code = async (p: Promise<unknown>): Promise<string> => {
+    try { await p; } catch (err) {
+      assert.equal((err as Error).name, "ToolRefused", `a fault, not a refusal: ${err}`);
+      return (err as { code: string }).code;
+    }
+    return assert.fail("accepted");
+  };
+  const count = async (table: string, where = "TRUE", params: unknown[] = []) =>
+    Number((await w.q(`SELECT COUNT(*)::int AS n FROM ${table} WHERE ${where}`, params))[0].n);
+  const press = async (user: string, id: string, decision: string, headers: Record<string, string> = {}) => {
+    const r = await app.inject({ method: "POST", url: `/v1/assistant/confirmations/${id}/decision`, payload: { decision }, headers: { "x-test-user": user, ...headers } });
+    return { status: r.statusCode, body: r.json() };
+  };
+
+  test("S1 trigger_create creates nothing and puts the whole of it to the user as a card", async () => {
+    await w.subscribe(alice.userId);
+    const turn = await userTurn(alice, "每天早上 9 点把我开着的 PR 和红色 CI 发给我");
+    const out = await sch.triggerCreateTool(turn, DAILY) as Record<string, any>;
+    assert.equal(out.ok, true);
+    assert.equal(out.done, false);
+    assert.match(out.note, /never say it is done/);
+    assert.equal(await count("claw_triggers"), 0, "nothing is scheduled by the call");
+    const [c] = await w.q("SELECT * FROM claw_assistant_confirmations");
+    assert.equal(c.kind, "trigger_create");
+    assert.equal(c.status, "pending");
+    assert.equal(c.params.schedule, "0 9 * * *");
+    assert.equal(c.params.timezone, "Asia/Shanghai");
+    assert.equal(out.ref, (await import("../src/assistant/prompts.js")).confirmationRef(c.confirmation_id));
+
+    const [say] = await w.q("SELECT * FROM claw_assistant_says");
+    assert.equal(say.fallback, true, "the system's own words, not counted as the router speaking");
+    assert.match(say.text, /PR 早报/);
+    assert.match(say.text, /0 9 \* \* \*（Asia\/Shanghai）/);
+    assert.match(say.text, /下次 \d{4}-\d{2}-\d{2} 09:00/, "the next run in the user's own time");
+    assert.match(say.text, /List my open pull requests/);
+    assert.match(say.text, new RegExp(`批准 #${out.ref}`));
+    const [row] = await w.q("SELECT payload FROM claw_notification_outbox");
+    assert.deepEqual(
+      { ...row.payload.confirm_write, expires_at: undefined },
+      { confirmation_id: c.confirmation_id, ref: out.ref, kind: "trigger_create", allow_label: "创建", expires_at: undefined },
+    );
+    const event = w.events.find((e) => e.type === "AssistantSay");
+    assert.equal(event?.confirm_write?.confirmation_id, c.confirmation_id, "a web client and an evaluation see the card too");
+
+    // The same call again in this turn is the same card.
+    const again = await sch.triggerCreateTool(turn, DAILY) as Record<string, any>;
+    assert.equal(again.confirmation_id, out.confirmation_id);
+    assert.equal(await count("claw_assistant_says"), 1);
+  });
+
+  test("S2 the button creates it once, as shown, on the key of the press; deny creates nothing; another user's press is a 404", async () => {
+    const out = await sch.triggerCreateTool(await userTurn(alice, "每天 9 点提醒我"), DAILY) as Record<string, any>;
+    assert.equal((await press("bob", out.confirmation_id, "allow")).status, 404);
+    // Only the person signed in, or their chat for them: never a key (any sandbox of theirs holds it), a cookie, or another service.
+    for (const [headers, error] of [[{ "x-test-method": "api_key" }, "interactive_sign_in_required"], [{ "x-test-method": "cookie" }, "interactive_sign_in_required"],
+      [{ "x-test-client": "some-bot" }, "service_client_not_allowed"]] as const) {
+      const refused = await press("alice", out.confirmation_id, "allow", headers);
+      assert.deepEqual([refused.status, refused.body.error], [403, error], JSON.stringify(headers));
+    }
+    assert.equal(await count("claw_triggers"), 0);
+    const first = await press("alice", out.confirmation_id, "allow");
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    assert.equal(first.body.data.status, "done");
+    assert.equal(first.body.data.answered_now, true);
+    const [t] = await w.q("SELECT * FROM claw_triggers");
+    assert.equal(t.owner_user_id, "alice");
+    assert.equal(t.schedule, "0 9 * * *");
+    assert.equal(t.timezone, "Asia/Shanghai");
+    assert.equal(t.action, "run");
+    assert.equal(t.prompt, DAILY.prompt);
+    assert.equal(new Date(t.next_fire_at).getUTCHours(), 1, "09:00 in Shanghai is 01:00 UTC");
+    const fire = await import("../src/triggers/fire.js");
+    assert.equal(fire.triggerPorts.getCredentialsFor(t as never)?.platformKey, "pk-button-alice", "it runs on the key of the press");
+    assert.equal(first.body.data.result.trigger.trigger_id, t.trigger_id);
+    assert.equal(first.body.data.result.next_run, first.body.data.result.shown_next_run, "it first runs when the card said");
+    assert.equal(first.body.data.result.first_run_moved, undefined);
+
+    assert.equal((await w.q("SELECT decided_via FROM claw_assistant_confirmations WHERE confirmation_id = $1", [out.confirmation_id]))[0].decided_via, "button");
+    const second = await press("alice", out.confirmation_id, "allow", { "x-test-client": "clawy" });
+    assert.equal(second.status, 200, "the chat the operator named answers for the person");
+    assert.equal(second.body.data.answered_now, false);
+    assert.equal(second.body.data.status, "done");
+    assert.equal(await count("claw_triggers"), 1, "one card, one trigger");
+
+    const other = await sch.triggerCreateTool(await userTurn(alice, "每周一 10 点也来一次"), { ...DAILY, name: "weekly", schedule: "0 10 * * 1" }) as Record<string, any>;
+    const denied = await press("alice", other.confirmation_id, "deny");
+    assert.equal(denied.body.data.status, "denied");
+    assert.equal((await press("alice", other.confirmation_id, "allow")).body.data.status, "denied", "a denied card stays denied");
+    assert.equal(await count("claw_triggers"), 1);
+    assert.equal((await press("alice", other.confirmation_id, "maybe")).status, 400);
+  });
+
+  test("S3 trigger_cancel holds too, and the press really deletes the trigger", async () => {
+    const made = await sch.triggerCreateTool(await userTurn(alice, "每天 9 点"), DAILY) as Record<string, any>;
+    await press("alice", made.confirmation_id, "allow");
+    const [t] = await w.q("SELECT trigger_id FROM claw_triggers");
+    assert.equal(await code(sch.triggerCancelTool(await userTurn(bob, "取消它"), { trigger_id: t.trigger_id })), "not_found", "not bob's");
+    const cancel = await sch.triggerCancelTool(await userTurn(alice, "把 PR 早报取消掉"), { trigger_id: t.trigger_id }) as Record<string, any>;
+    assert.equal(cancel.done, false);
+    assert.equal(await count("claw_triggers"), 1, "nothing is cancelled by the call");
+    const [say] = await w.q("SELECT text FROM claw_assistant_says ORDER BY created_at DESC LIMIT 1");
+    assert.match(say.text, /要取消定时任务「PR 早报」/);
+    const pressed = await press("alice", cancel.confirmation_id, "allow");
+    assert.equal(pressed.body.data.status, "done");
+    assert.equal(await count("claw_triggers"), 0, "the trigger is gone");
+  });
+
+  test("S4 批准 #ref lets it through only as a signed-in message written after the card", async () => {
+    const out = await sch.triggerCreateTool(await userTurn(alice, "每天 9 点"), DAILY) as Record<string, any>;
+    // Another yes lets nothing through, and is not taken for this card.
+    assert.equal(await sch.scheduleConfirmationAnswer(await userTurn(alice, "好的，创建吧"), { decision: "allow" }), null);
+    // The command, unattended (a key, not a sign-in), is refused with what to do instead.
+    assert.equal(await code(sch.scheduleConfirmationAnswer(await userTurn(alice, `批准 #${out.ref}`, { via: null }), { decision: "allow" }) as Promise<unknown>), "not_attended");
+    assert.equal(await count("claw_triggers"), 0);
+    const answered = await sch.scheduleConfirmationAnswer(await userTurn(alice, `批准 #${out.ref}`), { decision: "allow" }) as Record<string, any>;
+    assert.equal(answered.status, "done", JSON.stringify(answered));
+    const [t] = await w.q("SELECT * FROM claw_triggers");
+    const fire = await import("../src/triggers/fire.js");
+    assert.equal(fire.triggerPorts.getCredentialsFor(t as never)?.platformKey, "pk-alice", "a typed answer runs on the key the user's messages gave");
+    assert.equal((await w.q("SELECT decided_via FROM claw_assistant_confirmations"))[0].decided_via, "command");
+
+    // A command written before the card was shown is not an answer to it.
+    const later = await sch.triggerCreateTool(await userTurn(alice, "每周一"), { ...DAILY, name: "weekly", schedule: "0 10 * * 1" }) as Record<string, any>;
+    const early = await userTurn(alice, `批准 #${later.ref}`, { agoSec: 120 });
+    assert.equal(await code(sch.scheduleConfirmationAnswer(early, { decision: "allow" }) as Promise<unknown>), "confirmation_after_message");
+    // deny names the card by its id.
+    // A no is as exact as a yes: a no in other words, an unattended command, or a report's turn closes nothing.
+    assert.equal(await code(sch.scheduleConfirmationAnswer(await userTurn(alice, "不要了"), { decision: "deny", confirmation_id: later.confirmation_id }) as Promise<unknown>), "not_a_denial_command");
+    assert.equal(await code(sch.scheduleConfirmationAnswer(await userTurn(alice, `拒绝 #${later.ref}`, { via: null }), { decision: "deny" }) as Promise<unknown>), "not_attended");
+    assert.equal(await code(sch.scheduleConfirmationAnswer(await w.routerTurn(alice), { decision: "deny", confirmation_id: later.confirmation_id }) as Promise<unknown>), "not_a_denial_command");
+    assert.equal((await w.q("SELECT status FROM claw_assistant_confirmations WHERE confirmation_id = $1", [later.confirmation_id]))[0].status, "pending");
+    const deny = await sch.scheduleConfirmationAnswer(await userTurn(alice, `拒绝 #${later.ref}`), { decision: "deny", confirmation_id: later.confirmation_id }) as Record<string, any>;
+    assert.equal(deny.status, "denied");
+    assert.equal(await count("claw_triggers"), 1);
+  });
+
+  test("S5 a card is shown only for what could be created, from a user's message to the router", async () => {
+    const turn = await userTurn(alice, "每 5 分钟检查一次");
+    assert.equal(await code(sch.triggerCreateTool(turn, { ...DAILY, schedule: "*/5 * * * *" })), "invalid_arguments");
+    assert.equal(await code(sch.triggerCreateTool(turn, { ...DAILY, timezone: "Mars/Olympus" })), "invalid_arguments");
+    // A prompt the card could not show whole.
+    assert.equal(await code(sch.triggerCreateTool(turn, { ...DAILY, prompt: "x".repeat(sch.ROUTER_PROMPT_MAX + 1) })), "prompt_too_long");
+    // A report's turn answers no message of the user's.
+    const report = await w.routerTurn(alice);
+    assert.equal(await code(sch.triggerCreateTool(report, DAILY)), "not_from_user");
+    // No key reached the assistant yet.
+    await w.q("UPDATE claw_sessions SET config = '{}'::jsonb WHERE session_id = $1", [bob.routerSid]);
+    assert.equal(await code(sch.triggerCreateTool(await userTurn(bob, "每天 9 点"), DAILY)), "no_credentials");
+    // A full list.
+    const sealed = (await import("../src/triggers/store.js")).sealTriggerCredentials({ platformKey: "pk", virtualKey: "vk", userName: "alice" });
+    for (let i = 0; i < 3; i += 1) {
+      await w.q(
+        `INSERT INTO claw_triggers (trigger_id, owner_user_id, name, prompt, schedule, timezone, credential_enc) VALUES ($1, 'alice', $2, 'p', '0 9 * * *', 'UTC', $3)`,
+        [`t${i}`, `n${i}`, sealed],
+      );
+    }
+    assert.equal(await code(sch.triggerCreateTool(await userTurn(alice, "每天 9 点"), DAILY)), "trigger_limit_reached");
+    // A worker never has the router's tools.
+    const item = await w.createItem(alice, "something");
+    assert.equal(await code(sch.triggerCreateTool(await w.workerTurn(item.itemId), DAILY)), "not_allowed");
+    assert.equal(await count("claw_assistant_confirmations"), 0);
+  });
+
+  test("S6 trigger_list shows the triggers and the cards; the router's state lists the cards", async () => {
+    const out = await sch.triggerCreateTool(await userTurn(alice, "每天 9 点"), DAILY) as Record<string, any>;
+    const listed = await sch.triggerListTool(await userTurn(alice, "我有哪些定时任务")) as Record<string, any>;
+    assert.deepEqual(listed.triggers, []);
+    assert.equal(listed.waiting_for_confirmation.length, 1);
+    assert.equal(listed.waiting_for_confirmation[0].ref, out.ref);
+    const state = await sch.renderScheduleState("alice");
+    assert.match(state, new RegExp(`ref #${out.ref} .*create scheduled task "PR 早报" \\(0 9 \\* \\* \\*, Asia/Shanghai\\)`));
+    assert.equal(await sch.renderScheduleState("bob"), "", "nothing for a user with no card");
+    await press("alice", out.confirmation_id, "allow");
+    const after = await sch.triggerListTool(await userTurn(alice, "现在呢")) as Record<string, any>;
+    assert.equal(after.triggers.length, 1);
+    assert.equal(after.triggers[0].schedule, "0 9 * * *");
+    assert.equal("credential_enc" in after.triggers[0], false);
+    assert.deepEqual(after.waiting_for_confirmation, []);
+    const routes = await app.inject({ method: "GET", url: "/v1/assistant/confirmations", headers: { "x-test-user": "alice" } });
+    assert.deepEqual(routes.json().data, []);
+  });
+
+  test("S7 the router has the tools with the trigger tools on; confirmation_answer reaches a card with the review tools on or off", async () => {
+    const { createAssistantMcpServer } = await import("../src/assistant/mcp.js");
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const connect = async (claims: Claims, reviewTools: boolean) => {
+      const server = createAssistantMcpServer(claims as never, reviewTools, false, false);
+      const [a, b] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: "t", version: "1" });
+      await Promise.all([server.connect(a), client.connect(b)]);
+      return client;
+    };
+    const router = await connect(await userTurn(alice, "hi"), false);
+    const names = (await router.listTools()).tools.map((t) => t.name);
+    for (const n of ["trigger_list", "trigger_create", "trigger_cancel", "confirmation_answer", "brief"]) assert.ok(names.includes(n), n);
+    await router.close();
+    const item = await w.createItem(alice, "x");
+    const worker = await connect(await w.workerTurn(item.itemId), false);
+    assert.ok(!(await worker.listTools()).tools.some((t) => t.name.startsWith("trigger_")), "a worker has the trigger MCP service, not these");
+    await worker.close();
+
+    for (const reviewTools of [false, true]) {
+      const card = await sch.triggerCreateTool(await userTurn(alice, `每天 ${reviewTools ? 8 : 7} 点`), { ...DAILY, name: `t${reviewTools}`, schedule: `0 ${reviewTools ? 8 : 7} * * *` }) as Record<string, any>;
+      const client = await connect(await userTurn(alice, `批准 #${card.ref}`), reviewTools);
+      const res = await client.callTool({ name: "confirmation_answer", arguments: { decision: "allow" } });
+      const body = JSON.parse((res.content as Array<{ text: string }>)[0].text);
+      assert.equal(res.isError ?? false, false, JSON.stringify(body));
+      assert.equal(body.status, "done");
+      await client.close();
+    }
+    assert.equal(await count("claw_triggers"), 2);
+  });
+
+  test("S9 a card answered after the run it showed has passed says when it really runs first", async () => {
+    const out = await sch.triggerCreateTool(await userTurn(alice, "每天 9 点"), DAILY) as Record<string, any>;
+    const [c] = await w.q("SELECT params FROM claw_assistant_confirmations");
+    assert.match(c.params.next_run, /T01:00:00\.000Z$/, "the card's next run is kept with it");
+    const [say] = await w.q("SELECT text FROM claw_assistant_says");
+    assert.match(say.text, /之后才确认就从再下一次开始/, "the card says the next run is the next one only if confirmed before it");
+    await w.q("UPDATE claw_assistant_confirmations SET params = jsonb_set(params, '{next_run}', '\"2020-01-01T01:00:00.000Z\"')");
+    const pressed = await press("alice", out.confirmation_id, "allow");
+    assert.equal(pressed.body.data.status, "done");
+    assert.equal(pressed.body.data.result.first_run_moved, true);
+    assert.ok(Date.parse(pressed.body.data.result.next_run) > Date.now());
+  });
+
+  test("S8 a card pressed after it lapsed does nothing", async () => {
+    const out = await sch.triggerCreateTool(await userTurn(alice, "每天 9 点"), DAILY) as Record<string, any>;
+    await w.q("UPDATE claw_assistant_confirmations SET expires_at = NOW() - INTERVAL '1 second'");
+    const pressed = await press("alice", out.confirmation_id, "allow");
+    assert.equal(pressed.body.data.status, "expired");
+    assert.equal(pressed.body.data.answered_now, false);
+    assert.equal(await count("claw_triggers"), 0);
+  });
+});
