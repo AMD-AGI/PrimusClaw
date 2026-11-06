@@ -10,7 +10,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { HANDS_WORKLOAD_ENV_NAMES, PLATFORM_CREDENTIAL_ENV, workloadSpecEnv } from "../src/sandbox/workload-env.js";
+import { HANDS_WORKLOAD_ENV_NAMES, PLATFORM_CREDENTIAL_ENV, isHandsRuntimeSetting, workloadSpecEnv } from "../src/sandbox/workload-env.js";
+import { serviceOwned } from "../../hands/src/runtime/env-file.js";
 
 const SEEN_CREDENTIALS = [
   "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AUTH_CLAW_TOKEN", "OPENAI_API_KEY", "SAFE_API_KEY",
@@ -35,4 +36,21 @@ test("a platform credential is never carried, even if an allow list named it", (
   const env: Record<string, string> = { ...PLUMBING };
   for (const name of PLATFORM_CREDENTIAL_ENV) env[name] = "planted";
   assert.deepEqual(workloadSpecEnv(env, allowed), PLUMBING);
+});
+
+/**
+ * Hands refuses its own settings from the env file, so the container is the only way a deployment's value for one reaches it: those
+ * stay in the workload, or a system env `BG_SHELL_MAX_CONCURRENT` / `BASH_OUTPUT_BYTES` would silently fall back to Hands' default.
+ */
+test("Hands' own runtime settings stay in the workload, by the same rule Hands refuses them from the env file", () => {
+  const names = ["BG_SHELL_MAX_CONCURRENT", "BASH_OUTPUT_BYTES", "HANDS_CHILD_ISOLATION", "BASH_MAX_TIMEOUT_SEC", "WAIT_MAX_SEC",
+    "ENVD_SESSION_FILE", "MCP_PORT", "WORKSPACE_PATH", "SOME_SETTING", "AUTH_CLAW_TOKEN", "HF_TOKEN"];
+  for (const name of names) assert.equal(isHandsRuntimeSetting(name), serviceOwned(name) && !name.startsWith("AUTH_"), name);
+  const env = { ...PLUMBING, BG_SHELL_MAX_CONCURRENT: "1", BASH_OUTPUT_BYTES: "65536", HANDS_CHILD_ISOLATION: "1", SOME_SETTING: "x" };
+  assert.deepEqual(workloadSpecEnv(env), { ...PLUMBING, BG_SHELL_MAX_CONCURRENT: "1", BASH_OUTPUT_BYTES: "65536", HANDS_CHILD_ISOLATION: "1" });
+});
+
+test("a credential-looking name is not kept on the strength of a Hands prefix", () => {
+  const env = { ...PLUMBING, ENVD_ACCESS_KEY: "planted", HANDS_API_TOKEN: "planted", CLAW_SECRET: "planted" };
+  assert.deepEqual(workloadSpecEnv(env), PLUMBING);
 });
