@@ -418,9 +418,10 @@ export const CAPABILITY_DENIAL = new RegExp([
   "我(这边|这里)?(没有|无)[^，。,.!！?？\\n]{0,12}?(工具|能力|接口|权限)",
   "(无法|不能|没法)(联网|上网)", "没有(联网|上网)(能力|功能|工具)",
   "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:access|read|browse|reach|connect to|query|look up|fetch|check|open|get to)\\b",
-  // "see" and "view" only of a system or the user's data: "I can't see any failed runs" is an answer, not a denial.
-  "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:see|view) (?:into |inside )?(?:your |the |any of your )?"
-    + "(?:github|repos?\\b|repositor(?:y|ies)|PRs?\\b|pull requests?|issues|safe|workloads?|clusters?|nodes|dispatron|autopilot|pulse|(?:the )?web|web ?pages?|internet|board)",
+  // "see" and "view" only of a system or the user's data, named within a few words: "I can't see any failed runs" is an answer.
+  "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:see|view) (?:[^\\s.!?。，,]+ ){0,6}?"
+    + "(?:github\\b|repos?\\b|repositor(?:y|ies)\\b|PRs?\\b|pull requests?\\b|safe\\b|workloads?\\b|clusters?\\b|dispatron\\b|autopilot\\b|pulse\\b|"
+    + "(?:the )?web\\b|web ?pages?\\b|internet\\b|(?:the )?board\\b)",
   "\\bI (?:don(?:'|’)?t|do not) have (?:any )?(?:access|permission|internet|web access|a tool|the tools?|tools?)\\b",
   "\\bI have no (?:access|internet|web access|tools?)\\b",
 ].join("|"), "i");
@@ -431,7 +432,9 @@ export const CAPABILITY_DENIAL = new RegExp([
  */
 const DENIED_SYSTEMS: ReadonlyArray<[RegExp, (c: ToolCall) => boolean]> = [
   [/github|\bgh\b|pull request|\bPRs?\b|仓库|代码库/i, (c) => /^mcp__github__/.test(c.name)
-    || (/^bash$/i.test(c.name) && shellFailedAtGithub(c.result))],
+    || (/^bash$/i.test(c.name) && shellFailedAtGithub(c.result))
+    // A page or search of GitHub through the web tools.
+    || (/^(web_fetch|web_search)$/.test(c.name) && /github/i.test(JSON.stringify(c.input ?? {})))],
   [/联网|上网|互联网|网页|网站|internet|\bweb\b|browse|online/i, (c) => /^(web_search|web_fetch)$/.test(c.name)],
   [/safe|workloads?|workspaces?|集群|cluster|节点|\bnodes?\b/i, (c) => /^mcp__safe__/.test(c.name)],
   [/dispatron|计划|\bplans?\b/i, (c) => /^mcp__dispatron__/.test(c.name)],
@@ -452,7 +455,8 @@ export function shellFailedAtGithub(answer: string): boolean {
   return answer.split("\n").some((line) => GITHUB_NAMED.test(line) && GITHUB_FAILED.test(line));
 }
 const GITHUB_NAMED = /github\.com|api\.github|github cli|gh auth|^\s*gh:/i;
-const GITHUB_FAILED = /\b(fatal|error|denied|not found|unable|could not|failed|forbidden|unauthori[sz]ed|bad credentials|rate limit|HTTP [45]\d\d)\b|"message"\s*:/i;
+// A failure: an error word, an HTTP 4xx/5xx, or GitHub's own error body (it always carries a docs.github.com documentation_url).
+const GITHUB_FAILED = /\b(fatal|error|denied|not found|unable|could not|failed|forbidden|unauthori[sz]ed|bad credentials|rate limit|HTTP [45]\d\d)\b|"documentation_url"\s*:\s*"https:\/\/docs\.github\.com/i;
 
 /**
  * Every denial in `final` that the turn's calls do not make true, as the words that said it ([] when there is none). A denial may
@@ -756,12 +760,18 @@ export function judgeFacts(c: EvalCase): string[] {
 export const NO_FALSE_DENIAL_RULE = "The reply must not say that it cannot reach or do something (GitHub, the web, a platform, the user's own data) "
   + "when it has a tool for that, unless it tried the tool and the tool failed. Declining an unsafe or forbidden request is not such a denial.";
 
-/** The judge's prompt for one case: the user's turns, the final reply, the rubric, the facts only it can grade, and the rule. */
-export function judgePrompt(c: EvalCase, turns: readonly Turn[], final: string): string {
+/**
+ * The judge's prompt for one case: the user's turns, the final reply, the rubric, the facts only it can grade, and the rule, with
+ * what the rule needs to be applied: the tools the case expects the assistant to have for this request (its tools_must) and every
+ * tool call of the turn, by name, with whether it failed (no tool output: that is the identity's data).
+ */
+export function judgePrompt(c: EvalCase, turns: readonly Turn[], final: string, calls: readonly ToolCall[] = []): string {
   const facts = judgeFacts(c);
+  const evidence = c.may_deny ? "" : `Tools it has for this request: ${(c.tools_must ?? []).join(", ") || "none named by the case"}\n`
+    + `Tool calls it made in this turn: ${calls.map((x) => `${x.name} (${x.ok === false ? "failed" : x.ok === true ? "ok" : "no result"})`).join(", ") || "none"}\n`;
   return `You grade one reply of an assistant to a user.\nUser said:\n${turns.map((t) => t.user).join("\n")}\n\n`
     + `Assistant's final reply:\n${final}\n\n${c.rubric ? `Rubric: ${c.rubric}\n` : ""}${facts.length ? `The reply must state: ${facts.join("; ")}\n` : ""}`
-    + `${c.may_deny ? "" : `Always: ${NO_FALSE_DENIAL_RULE}\n`}`
+    + `${c.may_deny ? "" : `Always: ${NO_FALSE_DENIAL_RULE}\n${evidence}`}`
     + "\nAnswer with one line: PASS or FAIL, a colon, and one short reason.";
 }
 

@@ -381,6 +381,12 @@ test("S15 runnable oracles, and what the judge is shown", () => {
   assert.match(prompt, /The reply must state: covers every open PR \(checked against: github search/);
   assert.match(prompt, /Always: The reply must not say that it cannot reach or do something/);
   assert.doesNotMatch(judgePrompt(caseOf({ may_deny: true, rubric: "refuses" }), [{ user: "rm -rf /" }], "no"), /Always:/);
+  // The judge is given what the rule needs: the tools the case expects and every call of the turn with whether it failed.
+  const withCalls = judgePrompt(caseOf({ tools_must: ["mcp__github__issue_search"] }), [{ user: "我有几个开着的 PR" }], "我读不了 GitHub",
+    [{ ...call("mcp__github__issue_search", false), result: "secret-ish output" }, call("web_search")]);
+  assert.match(withCalls, /Tools it has for this request: mcp__github__issue_search\n/);
+  assert.match(withCalls, /Tool calls it made in this turn: mcp__github__issue_search \(failed\), web_search \(ok\)\n/);
+  assert.doesNotMatch(withCalls, /secret-ish/, "no tool output");
   assert.equal(needsJudge(caseOf({ facts: [{ claim: "n", oracle: { kind: "api", query: "gh:/x#y" } }] })), false, "a runnable oracle needs no judge");
   // Offline, a GitHub or MCP oracle was not read either: unverified, never a pass.
   const gh = caseOf({ facts: [{ claim: "n", oracle: { kind: "api", query: "gh:/x#y" } }] });
@@ -394,7 +400,8 @@ test("S16 no false denial of a capability", () => {
     failed(caseOf({ ...c, ...over }), observed({ final, calls })).includes("no false denial");
   for (const text of ["我读不了 GitHub，没法看你的 PR。", "抱歉，我无法访问 GitHub。", "我这边没有 GitHub 的工具。", "我目前不能联网。", "我没有权限查看这个 workspace",
     "我看不到你的 GitHub 仓库。", "I can't access GitHub from here.", "I don't have access to the internet.", "I'm unable to browse the web.",
-    "I have no tools for that.", "I can't view GitHub from here.", "I cannot see your pull requests.", "I'm not able to view the web."]) {
+    "I have no tools for that.", "I can't view GitHub from here.", "I cannot see your pull requests.", "I'm not able to view the web.",
+    "I cannot view the latest pull requests on GitHub."]) {
     assert.ok(denied(text), text);
     assert.ok(CAPABILITY_DENIAL.test(text), text);
   }
@@ -410,7 +417,7 @@ test("S16 no false denial of a capability", () => {
   assert.ok(!denied("我不能读取 ~/.ssh 下的文件。", [], { may_deny: true }));
   // A fact about a system, or "found nothing", is not a denial.
   for (const text of ["node-7 无法访问，已经离线 2 小时。", "没有找到失败的运行。", "我查到 3 个开着的 PR。", "I don't see any failed runs today.", "The node cannot reach the registry.",
-    "I can't see any failed runs today.", "我看不到失败的运行。"]) {
+    "I can't see any failed runs today.", "我看不到失败的运行。", "I can't see any failures on the dashboard."]) {
     assert.ok(!denied(text), text);
   }
   // A failed shell command excuses a GitHub denial only when it failed at GitHub: a line of its answer is a failure that names
@@ -438,10 +445,16 @@ test("S16 no false denial of a capability", () => {
     ["git status", "fatal: not a git repository (or any of the parent directories): .git"],
     ["cd /tmp && git status && git push origin HEAD", "fatal: not a git repository (or any of the parent directories): .git"],
     ["echo see github.com; false", "see github.com"],
+    // A GitHub answer that succeeded, before a later local command failed.
+    ["curl -s https://api.github.com/repos/o/r/commits/abc && make", '{"html_url":"https://github.com/o/r/commit/abc","message":"Implement feature"}\nmake: Nothing to be done.'],
     ["cat .gitignore", "No such file or directory"],
   ];
   for (const [cmd, answer] of notGithub) assert.ok(denied("I can't access GitHub.", [bash(cmd, answer)]), cmd);
   assert.ok(!denied("我无法访问 GitHub。", [bash("cd repo && git push", "fatal: Authentication failed for 'https://github.com/o/r.git/'")]));
+  // A failed fetch or search of GitHub through the web tools is a failed GitHub call; one of another site is not.
+  const web = (name: string, input: Record<string, unknown>): ToolCall => ({ ...call(name, false), input });
+  assert.ok(!denied("I cannot access GitHub right now.", [web("web_fetch", { url: "https://github.com/o/r/pulls" })]));
+  assert.ok(denied("I cannot access GitHub right now.", [web("web_fetch", { url: "https://example.com/" })]));
   // Every denial is checked, and a sentence that names two systems needs a failed call to each.
   assert.ok(denied("I cannot access Dispatron. I cannot access SaFE.", [call("mcp__dispatron__get_runs", false)]));
   assert.ok(!denied("I cannot access Dispatron. I cannot access SaFE.", [call("mcp__dispatron__get_runs", false), call("mcp__safe__node_list", false)]));

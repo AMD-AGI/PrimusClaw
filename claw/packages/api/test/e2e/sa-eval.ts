@@ -308,12 +308,12 @@ function mcpClient(server: string): Promise<Client> {
 
 // --- The optional judge ---------------------------------------------------------------------------------------------
 
-async function judge(c: EvalCase, turns: Turn[], final: string): Promise<{ pass: boolean; why: string } | null> {
+async function judge(c: EvalCase, turns: Turn[], final: string, calls: readonly ToolCall[]): Promise<{ pass: boolean; why: string } | null> {
   const url = process.env.EVAL_JUDGE_URL, model = process.env.EVAL_JUDGE_MODEL, keyFile = process.env.EVAL_JUDGE_KEY_FILE;
   // Every case, not only those with content only a judge can grade: the no-false-denial rule is in every prompt.
   if (!url || !model || !keyFile) return null;
   const key = readFileSync(keyFile, "utf8").trim();
-  const prompt = judgePrompt(c, turns, final);
+  const prompt = judgePrompt(c, turns, final, calls);
   try {
     const res = await fetch(`${url.replace(/\/+$/, "")}/v1/messages`, {
       method: "POST", signal: AbortSignal.timeout(60_000),
@@ -330,7 +330,7 @@ async function judge(c: EvalCase, turns: Turn[], final: string): Promise<{ pass:
 const attemptOf = async (c: EvalCase, turns: Turn[], o: Observed, tools: string[], items: Attempt["items"]): Promise<Attempt> => {
   const checks = grade(c, o);
   if (RECORD_DIR) recordings.push({ case_id: c.id, mode: MODE, attempt: recordings.filter((r) => r.case_id === c.id).length + 1, at: iso(), observed: forRecording(c, o) });
-  const verdict = await judge(c, turns, o.final);
+  const verdict = await judge(c, turns, o.final, o.calls);
   const kept = KEEP_TEXT ? checks : checks.map((x) => (TEXT_DETAIL.test(x.name) && x.detail ? { ...x, detail: "<hidden: EVAL_KEEP_TEXT>" } : x));
   return {
     ...verdictOf(c, checks, verdict), checks: kept, route: o.route, cards: o.cards, tools, final: KEEP_TEXT ? scrub(o.final) : null, finalChars: o.final.length,
