@@ -1407,9 +1407,9 @@ export async function followReviewItems(now = Date.now()): Promise<number> {
  */
 export async function startQueuedReviews(): Promise<number> {
   if (!CLAW_ASSISTANT_REVIEW_ITEMS) return 0;
+  // Every owner with a review waiting, each tick: a batch would ask the same full owners again and again and never reach one with room.
   const owners = (await db.query(
-    `SELECT user_id FROM claw_work_items WHERE kind = 'review' AND ${WAITING} GROUP BY user_id ORDER BY MIN(created_at) LIMIT $1`,
-    [REVIEW_SWEEP_BATCH],
+    `SELECT user_id FROM claw_work_items WHERE kind = 'review' AND ${WAITING} GROUP BY user_id ORDER BY MIN(created_at)`,
   )).rows as Array<{ user_id: string }>;
   let started = 0;
   for (const { user_id: owner } of owners) {
