@@ -20,7 +20,9 @@
 //     CLAW_A2A_PUSH_ALLOWED_HOSTS. The check runs when the config is created
 //     and again at every delivery, and the delivery connects to the address
 //     that passed (notifications/url-guard.ts, transport.ts), so a name that
-//     resolves elsewhere the second time cannot redirect it.
+//     resolves elsewhere the second time cannot redirect it. With
+//     CLAW_A2A_PUSH_ALLOWED_HOSTS_ONLY the list is the whole of it: a host not
+//     named is refused even when it is public, at creation and at delivery.
 //   - Delivery is at least once, durable (an outbox row per notification) and
 //     retried with backoff; a config is dropped with its task's final
 //     notification ("MUST persist until task completion or explicit deletion").
@@ -41,7 +43,7 @@ import { decryptUserEnvValue, encryptUserEnvValue } from "../crypto/user-env.js"
 import { sanitizeSessionEvent } from "../events/store.js";
 import { httpTransport, type Transport } from "../notifications/transport.js";
 import { guardWebhookUrl, type Resolver } from "../notifications/url-guard.js";
-import { a2aPushAllowedHosts, a2aPushEnabled } from "./a2a-flags.js";
+import { a2aPushAllowedHosts, a2aPushAllowedHostsOnly, a2aPushEnabled } from "./a2a-flags.js";
 import { loadLatestRunOfSession, loadRun, loadRunEvents, loadRunOfSessionMessage } from "./a2a-store.js";
 import {
   mapLiveEvent, newStreamState, statusUpdateEvent, taskOf, textArtifactId,
@@ -120,12 +122,36 @@ export type CreateResult =
   | { ok: true; config: TaskPushNotificationConfig }
   | { ok: false; kind: "refused_url" | "too_many" | "duplicate_id"; error: string };
 
+/**
+ * Where a notification may go: the SSRF guard, and with
+ * CLAW_A2A_PUSH_ALLOWED_HOSTS_ONLY on, only to a host the operator named. Asked
+ * when a config is created and again at every delivery, so taking a host off
+ * the list, or turning the switch on, stops a config that was already stored.
+ */
+export async function guardPushUrl(
+  url: string,
+  allowedHosts: Set<string>,
+  allowedHostsOnly: boolean,
+  resolve?: Resolver,
+): ReturnType<typeof guardWebhookUrl> {
+  if (allowedHostsOnly) {
+    let host: string;
+    try {
+      host = new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    } catch {
+      return { ok: false, reason: "invalid_url" };
+    }
+    if (!allowedHosts.has(host)) return { ok: false, reason: "host_not_allowed" };
+  }
+  return guardWebhookUrl(url, allowedHosts, resolve);
+}
+
 /** The URL check a config must pass before it is stored. */
 export async function checkWebhookUrl(
   url: string,
   resolve?: Resolver,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const guarded = await guardWebhookUrl(url, a2aPushAllowedHosts(), resolve);
+  const guarded = await guardPushUrl(url, a2aPushAllowedHosts(), a2aPushAllowedHostsOnly(), resolve);
   return guarded.ok ? { ok: true } : { ok: false, reason: guarded.reason };
 }
 
@@ -361,6 +387,7 @@ export interface DeliveryDeps {
   transport?: Transport;
   resolve?: Resolver;
   allowedHosts?: Set<string>;
+  allowedHostsOnly?: boolean;
 }
 
 interface Claimed {
@@ -420,7 +447,10 @@ async function sendOne(row: Claimed, deps: DeliveryDeps): Promise<boolean> {
   }
   let status: string;
   try {
-    const target = await guardWebhookUrl(String(config.url), deps.allowedHosts ?? a2aPushAllowedHosts(), deps.resolve);
+    const target = await guardPushUrl(
+      String(config.url), deps.allowedHosts ?? a2aPushAllowedHosts(),
+      deps.allowedHostsOnly ?? a2aPushAllowedHostsOnly(), deps.resolve,
+    );
     if (!target.ok) {
       status = `refused:${target.reason}`;
     } else {
