@@ -15,6 +15,9 @@
  *   T6  only an assistant's router session is looked at
  *   T7  the completion handler asks for it when a router turn ends, and the user's say is there afterwards
  *   T8  a fault delivering it (the database failing over) is tried again by the completion handler, not given up
+ *   T9  a turn whose every say came before its last lookup answered ("查一下 Autopilot 的状态。", then the lookup, then the answer in
+ *       plain text: the parity run's K2; a lookup that failed as well) has its text delivered as the answer, once; a say after the lookup, a refused say, or no
+ *       lookup at all leaves the turn alone as in T2
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -219,5 +222,93 @@ describe("assistant router turn end", { skip }, () => {
     }
     assert.equal(calls, 2, "tried again after the fault");
     assert.deepEqual((await says()).map((s) => s.text), ["Yes, all green."]);
+  });
+  test("T9 a turn that said only a line before its lookup answered gets its plain-text answer delivered, once", async () => {
+    const SAY_TOOL = "mcp__assistant__say";
+    let seq = 0;
+    /** The turn's toolUsed events, in the order Brain emitted them, as the event consumer stores them. */
+    const emitted = async (mid: string, events: Array<{ tool: string; status: string; is_error?: boolean; description?: string }>) => {
+      for (const e of events) {
+        seq += 1;
+        await w.q(
+          "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, 'toolUsed', $3)",
+          [`claw-t9-${seq}`, alice.routerSid, JSON.stringify({ type: "toolUsed", message_id: mid, ...e })],
+        );
+      }
+    };
+    const LINE = "查一下 Autopilot 的状态。";
+    const ANSWER = "三个节点都 unhealthy，是因为节点池不可用：crsuse2-m2m-v3-173 在退避中，18:30 UTC 恢复。";
+    const said = async (text: string) =>
+      w.q("INSERT INTO claw_assistant_says (say_id, user_id, text, fallback) VALUES (gen_random_uuid(), 'alice', $1, false)", [text]);
+
+    // K2: the line, then the lookup, then the answer written as plain text.
+    const k2 = await endedTurn("为什么我在autopilot页面看这3个节点都是unhealthy");
+    await said(LINE);
+    await emitted(k2.mid, [
+      { tool: SAY_TOOL, status: "start" }, { tool: SAY_TOOL, status: "success", description: '{"ok":true,"say_id":"s1"}' },
+      { tool: "mcp__autopilot__get_status", status: "start" }, { tool: "mcp__autopilot__get_status", status: "success", description: "{}" },
+    ]);
+    assert.equal(await end(k2, { finalText: ANSWER, messageId: k2.mid }), "said", "the person had only the line");
+    assert.deepEqual((await says()).map((s) => s.text), [LINE, ANSWER]);
+    // A completion delivered again finds the answer it stored.
+    assert.equal(await end(k2, { finalText: ANSWER, messageId: k2.mid }), "skipped");
+    assert.equal((await says()).length, 2);
+
+    // The answer said after the lookup: the turn answered, and its closing words are not a second message.
+    await w.q("TRUNCATE claw_assistant_says");
+    const answered = await endedTurn("autopilot 有几台节点");
+    await said("3 台。");
+    await emitted(answered.mid, [
+      { tool: "mcp__autopilot__get_status", status: "success", description: "{}" },
+      { tool: SAY_TOOL, status: "success", description: '{"ok":true}' },
+    ]);
+    assert.equal(await end(answered, { finalText: "Done.", messageId: answered.mid }), "skipped");
+
+    // A say refused after the lookup is not one the person got, so the line before it is all they hold.
+    await w.q("TRUNCATE claw_assistant_says");
+    const refused = await endedTurn("autopilot 有几台节点");
+    await said("查一下。");
+    await emitted(refused.mid, [
+      { tool: SAY_TOOL, status: "success", description: '{"ok":true}' },
+      { tool: "web_search", status: "success", description: "results" },
+      { tool: SAY_TOOL, status: "success", description: '{"ok":false,"error":"refused"}' },
+    ]);
+    assert.equal(await end(refused, { finalText: "节点池里有 3 台。", messageId: refused.mid }), "said");
+
+    // A lookup that failed ended as well: the turn's text after it (that it could not find out) is its answer.
+    await w.q("TRUNCATE claw_assistant_says");
+    const failedLookup = await endedTurn("autopilot 有几台节点");
+    await said("查一下。");
+    await emitted(failedLookup.mid, [
+      { tool: SAY_TOOL, status: "success", description: '{"ok":true}' },
+      { tool: "mcp__autopilot__get_status", status: "success", is_error: true, description: "node pool unavailable" },
+    ]);
+    assert.equal(await end(failedLookup, { finalText: "我现在查不到 Autopilot 的状态，稍后再试。", messageId: failedLookup.mid }), "said");
+
+    // No lookup in the turn (or one of another turn): a say is its answer, as in T2.
+    await w.q("TRUNCATE claw_assistant_says");
+    const plain = await endedTurn("你好");
+    await said("你好！");
+    await emitted(plain.mid, [{ tool: SAY_TOOL, status: "success", description: '{"ok":true}' }]);
+    await emitted("claw-another-turn", [{ tool: "mcp__autopilot__get_status", status: "success", description: "{}" }]);
+    assert.equal(await end(plain, { finalText: "Greeted.", messageId: plain.mid }), "skipped");
+
+    // Through a channel: the line was a real say of the turn, so the answer delivered at its end takes that line's place (`replaces`,
+    // AMD-AGI/PrimusClaw#360), one message, instead of a second one beside it.
+    await w.q("TRUNCATE claw_assistant_says, claw_notification_outbox");
+    await w.subscribe("alice");
+    const live = await w.routerTurn(alice);
+    await w.q("UPDATE claw_tasks SET prompt = $2, started_at = NOW() - INTERVAL '1 second' WHERE task_id = $1", [live.task_id, "为什么这3个节点都是unhealthy"]);
+    const line = await w.mod.tools.say(live as never, { text: LINE }, w.sayDeps);
+    await w.closeRun(live.task_id, "completed", undefined, 1);
+    await emitted(live.mid, [
+      { tool: SAY_TOOL, status: "success", description: JSON.stringify({ ok: true, say_id: line.say_id }) },
+      { tool: "mcp__autopilot__get_status", status: "success", description: "{}" },
+    ]);
+    assert.equal(await end(live, { finalText: ANSWER, messageId: live.mid }), "said");
+    const payloads = (await w.q("SELECT payload FROM claw_notification_outbox ORDER BY id")).map((r) => r.payload);
+    assert.equal(payloads.length, 2);
+    assert.equal(payloads[1].text, ANSWER);
+    assert.equal(payloads[1].replaces, line.say_id, "the answer takes the line's place");
   });
 });
