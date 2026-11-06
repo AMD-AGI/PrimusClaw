@@ -128,6 +128,11 @@ test("LR3 the rule: what it accepts, the bound, the mask, and the end of a long 
   assert.deepEqual(rule.bound("mcp__s__logs", { limit: "7" }), { limit: 7 });
   assert.deepEqual(rule.bound("mcp__s__logs", { limit: -1 }), { limit: 10 });
   assert.deepEqual(rule.bound("mcp__s__get", { limit: 500 }), { limit: 500 }, "not a log read");
+  // A read that counts nothing (an empty argument) is a log read: masked, and called as the model asked.
+  const states = parseLogReads({ tools: { mcp__s__containers: "" }, lines: 10, chars: 600 })!;
+  assert.equal(states.has("mcp__s__containers"), true);
+  assert.deepEqual(states.bound("mcp__s__containers", { pod: "p" }), { pod: "p" });
+  assert.equal(states.filter(JSON.stringify({ terminated: { message: `token: ${FAKE_PW}` } })).includes(FAKE_PW), false);
   // Out-of-range numbers fall back to the defaults, never to no bound.
   const lax = parseLogReads({ tools: { mcp__s__logs: "limit" }, lines: 1_000_000, chars: 1 })!;
   assert.deepEqual(lax.bound("mcp__s__logs", {}), { limit: 40 });

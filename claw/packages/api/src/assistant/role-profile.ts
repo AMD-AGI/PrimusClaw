@@ -239,7 +239,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // What the router may look up itself (`read-tools.ts`): the read-only tools of the deployment's assistant plugin, and nothing
     // else of it but its reply-style rule (no skills or write tools; a plugin the message named is not one the read list can vouch
     // for, so it gives the router nothing); the reads of the user's own GitHub; their scheduled tasks; and the web.
-    const lookups = await routerLookups(role.userId, sessionId, { mcpServers: task.mcp_servers, messageId, triggerKey: triggerToolSettings.key });
+    const lookups = await routerLookups(role.userId, sessionId, { mcpServers: task.mcp_servers, messageId, taskId, triggerKey: triggerToolSettings.key });
     const read = lookups.plugin;
     task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN, ...lookups.allowlist];
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;

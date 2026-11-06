@@ -9,7 +9,7 @@
  *
  * For such a call Brain:
  *  - asks for at most `lines`: the counting argument is lowered to it, and set to it when the call names none (the servers'
- *    own defaults are a thousand lines);
+ *    own defaults are a thousand lines); a read named with an empty argument counts nothing and is called as the model asked;
  *  - masks credential-shaped text in what it answered (`redactLogSecrets` of @claw/utils: shapes, values after a credential's
  *    name, private keys) before the model, an event or a log line sees it;
  *  - keeps only the last `chars` characters of an answer that is plain text, the end of a log being where it failed. An answer
@@ -49,7 +49,9 @@ export function parseLogReads(raw: unknown): LogReads | null {
   if (!r.tools || typeof r.tools !== "object" || Array.isArray(r.tools)) return null;
   const tools = new Map<string, string>();
   for (const [name, arg] of Object.entries(r.tools as Record<string, unknown>)) {
-    if (/^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_.-]+$/.test(name) && typeof arg === "string" && /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(arg)) tools.set(name, arg);
+    // An empty argument: a read whose answer may hold log text but that counts nothing (a pod's container states, whose
+    // termination message Kubernetes may fill from the log's end). It is masked and cut, never bounded.
+    if (/^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_.-]+$/.test(name) && typeof arg === "string" && /^(?:[A-Za-z_][A-Za-z0-9_]{0,63})?$/.test(arg)) tools.set(name, arg);
   }
   if (!tools.size) return null;
   const lines = typeof r.lines === "number" && Number.isSafeInteger(r.lines) && r.lines >= 1 && r.lines <= MAX_LINES ? r.lines : 40;

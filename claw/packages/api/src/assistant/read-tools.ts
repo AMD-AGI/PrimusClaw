@@ -38,12 +38,14 @@ export const ROUTER_READ_TOOLS: Readonly<Record<string, readonly string[]>> = ro
 /**
  * Of the reads above, the ones whose answer is a log, each with the argument that counts its lines or entries. Brain asks for at
  * most ROUTER_LOG_LINES of them and masks credential-shaped text in what they answer before the model reads it (`log_reads`): a
- * job prints its environment, and what a router turn reads it may say to the person.
+ * job prints its environment, and what a router turn reads it may say to the person. A read with an empty argument counts nothing
+ * but may carry a log's end, and is masked only: a pod's containers, whose termination message Kubernetes fills from the last
+ * lines of the log (`terminationMessagePolicy: FallbackToLogsOnError`).
  */
 export const ROUTER_LOG_READS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   safe: {
     workload_logs: "limit", workload_events: "limit", workload_pod_logs: "tail_lines", node_pod_logs: "tail_lines",
-    node_reboot_logs: "limit", cluster_logs: "tail_lines",
+    node_reboot_logs: "limit", cluster_logs: "tail_lines", workload_pod_containers: "",
   },
 };
 /** The lines or entries a router turn's log read asks for: the end of a log, where a failure is. */
@@ -115,15 +117,15 @@ export interface RouterLookups {
 
 /**
  * The turn's own `schedules` server, as `applyTriggerToolsToTask` (`triggers/mcp.ts`) gave it, or nothing: kept only when it is
- * at the API's own address and its bearer is one this API minted for this turn (this session, this message). A request's own
+ * at the API's own address and its bearer is one this API minted for this turn (this session, this message, this run). A request's own
  * `mcp_servers` is caller input, and any other entry by that name is not the user's scheduled tasks.
  */
-export function ownTriggerServer(carried: unknown, sessionId: string, messageId: string, key: string): McpServers {
+export function ownTriggerServer(carried: unknown, sessionId: string, messageId: string, taskId: string, key: string): McpServers {
   if (!carried || typeof carried !== "object" || !Object.hasOwn(carried, TRIGGER_MCP_SERVER)) return {};
   const spec = (carried as McpServers)[TRIGGER_MCP_SERVER];
   if (!spec || typeof spec !== "object" || spec.url !== `${INTERNAL_BACKEND_URL}${TRIGGER_MCP_PATH}` || typeof spec.token !== "string") return {};
   const verdict = verifyTriggerToken(spec.token, key);
-  if (!verdict.ok || verdict.claims.sid !== sessionId || verdict.claims.mid !== messageId) return {};
+  if (!verdict.ok || verdict.claims.sid !== sessionId || verdict.claims.mid !== messageId || verdict.claims.task_id !== taskId) return {};
   return { [TRIGGER_MCP_SERVER]: spec };
 }
 
@@ -143,12 +145,13 @@ export function routerLogReads(servers: readonly string[]): RouterLookups["logRe
  * and the trigger tools' key.
  */
 export async function routerLookups(
-  userId: string, sessionId: string, turn: { mcpServers?: unknown; messageId?: string; triggerKey?: string } = {},
+  userId: string, sessionId: string, turn: { mcpServers?: unknown; messageId?: string; taskId?: string; triggerKey?: string } = {},
 ): Promise<RouterLookups> {
   const plugin = await routerReadTools(userId);
   const githubServers = await githubMcpServers(sessionId);
   const githubTools = Object.hasOwn(githubServers, GITHUB_MCP_SERVER) ? ROUTER_GITHUB_READ_TOOLS : [];
-  const schedules = turn.messageId && turn.triggerKey ? ownTriggerServer(turn.mcpServers, sessionId, turn.messageId, turn.triggerKey) : {};
+  const schedules = turn.messageId && turn.taskId && turn.triggerKey
+    ? ownTriggerServer(turn.mcpServers, sessionId, turn.messageId, turn.taskId, turn.triggerKey) : {};
   const triggerReads = Object.hasOwn(schedules, TRIGGER_MCP_SERVER) ? ROUTER_TRIGGER_READ_TOOLS.map((t) => `mcp__${TRIGGER_MCP_SERVER}__${t}`) : [];
   const cleanFailures = [...githubTools.map((t) => `mcp__${GITHUB_MCP_SERVER}__${t}`), ...ROUTER_WEB_TOOLS];
   return {

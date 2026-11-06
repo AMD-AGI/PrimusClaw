@@ -146,3 +146,92 @@ test("L12 a command line's option, a short value and a quoted value after an aut
   // An option whose name is not a credential's keeps its value.
   for (const line of ["--epochs 3 --lr 0.1", "--max-tokens 4096", "--tokenizer fast"]) assert.equal(redactLogSecrets(line).text, line, line);
 });
+
+test("L13 a private key whose BEGIN line the tail cut off is masked from its first base64 line to its END line", () => {
+  const body = ["MIIEowIBAAKCAQEAfakefakefakefakefakefakefakefakefakefakefakefake1", "MIIEowIBAAKCAQEAfakefakefakefakefakefakefakefakefakefakefakefake2"];
+  const tail = `${body.join("\n")}\n-----END RSA PRIVATE KEY-----\nok`;
+  assert.equal(redactLogSecrets(tail).text, "<redacted private key>\nok");
+  // Inside a JSON answer: what stands before the key on its line is kept, and the answer is still JSON.
+  const json = redactLogSecrets(JSON.stringify({ logs: tail })).text;
+  assert.equal(json, JSON.stringify({ logs: "<redacted private key>\nok" }));
+  // Lines a log prefixes (a timestamp), a short last line, an OpenPGP key's armor; what is above the key stays.
+  const stamped = [
+    "2026-11-06T16:00:00Z starting job", ...body.map((l) => `2026-11-06T16:00:01Z ${l}`), "2026-11-06T16:00:01Z Zm9v=",
+    "2026-11-06T16:00:01Z -----END OPENSSH PRIVATE KEY-----", "2026-11-06T16:00:02Z done",
+  ].join("\n");
+  const r = redactLogSecrets(stamped).text;
+  for (const l of [...body, "Zm9v="]) assert.equal(r.includes(l), false, `${l}: ${r}`);
+  assert.ok(r.startsWith("2026-11-06T16:00:00Z starting job\n2026-11-06T16:00:01Z <redacted private key>"), r);
+  assert.ok(r.endsWith("\n2026-11-06T16:00:02Z done"), r);
+  const pgp = redactLogSecrets(`lQOYBGfakefakefakefakefakefakefake\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nok`).text;
+  assert.equal(pgp, "<redacted private key>\nok");
+  // An END line with nothing that reads as a key above it: nothing before it is kept, rather than a key's body.
+  assert.equal(redactLogSecrets("a line, then: !\n-----END EC PRIVATE KEY-----\nok").text, "<redacted private key>\nok");
+  // A whole key after one cut at its start: each is masked, and what is between them stays.
+  const both = redactLogSecrets(`${body[0]}\n-----END RSA PRIVATE KEY-----\nbetween\n-----BEGIN EC PRIVATE KEY-----\nZm9vYmFy\n-----END EC PRIVATE KEY-----\nafter`).text;
+  assert.equal(both, "<redacted private key>\nbetween\n<redacted private key>\nafter");
+  // Many END lines and long lines before them still cost the text's length.
+  for (const text of ["-----END RSA PRIVATE KEY-----".repeat(16_000), `${"a ".repeat(100_000)}\n-----END RSA PRIVATE KEY-----`, `${"x".repeat(200_000)}-----END RSA PRIVATE KEY-----`]) {
+    const t0 = performance.now();
+    redactLogSecrets(text);
+    assert.ok(performance.now() - t0 < 1500, `${text.slice(0, 40)}: ${Math.round(performance.now() - t0)} ms`);
+  }
+});
+
+test("L14 an assignment line's value runs to the line's end, whatever separators the password holds", () => {
+  for (const [text, want] of [
+    ["export DB_PASSWORD=Xy7&kLm9\nnext", "export DB_PASSWORD=<redacted>\nnext"],
+    ["PASSWORD=abc;def&ghi\nnext", "PASSWORD=<redacted>\nnext"],
+    ["password=<hunter2>", "password=<redacted>"],
+    ["  DB_PASSWORD=a,b)c]d}e'f\"g", "  DB_PASSWORD=<redacted>"],
+    ["declare -x API_TOKEN=p&q=r", "declare -x API_TOKEN=<redacted>"],
+    ["ENV DB_PASSWORD=x;y", "ENV DB_PASSWORD=<redacted>"],
+    ["password: Xy7&kLm9 # from vault", "password: <redacted>"],
+  ] as const) {
+    assert.equal(redactLogSecrets(text).text, want, text);
+  }
+  // Inside a JSON string: to the line's end there, or to the string's closing quote; the answer stays JSON.
+  const json = JSON.stringify({ logs: 'step 1\nDB_PASSWORD=Xy7&kLm9;"q"\nPASSWORD=last&one' });
+  const r = redactLogSecrets(json).text;
+  assert.equal(r, JSON.stringify({ logs: "step 1\nDB_PASSWORD=<redacted>\nPASSWORD=<redacted>" }));
+});
+
+test("L15 off an assignment line a separator or a bracket ends a value only where the text makes it one", () => {
+  for (const [text, want] of [
+    // Another pair follows: a query string, a map's next entry, a cookie's attribute.
+    ["GET /cb?code=1&access_token=Xy7&page=2 200", "GET /cb?code=1&access_token=<redacted>&page=2 200"],
+    ["config {password=Xy7, user=alice}", "config {password=<redacted>, user=alice}"],
+    ["X-Trace: a=1; token=abc; Path=/", "X-Trace: a=1; token=<redacted>; Path=/"],
+    // An opener before the name closes after the value.
+    ["connect(host=db, password=Xy7&k)", "connect(host=db, password=<redacted>)"],
+    // Otherwise they are the value's.
+    ["job 3: export DB_PASSWORD=Xy7&kLm9", "job 3: export DB_PASSWORD=<redacted>"],
+    ["[pod/a] PASSWORD=abc;def&ghi", "[pod/a] PASSWORD=<redacted>"],
+    ["got password=<hunter2> from env", "got password=<redacted>"],
+    ["got password=ab)c,d done", "got password=<redacted>"],
+  ] as const) {
+    assert.equal(redactLogSecrets(text).text, want, text);
+  }
+  const json = JSON.stringify({ logs: "2026-11-06T16:00:00Z DB_PASSWORD=Xy7&kLm9;x\nok" });
+  assert.equal(redactLogSecrets(json).text, JSON.stringify({ logs: "2026-11-06T16:00:00Z DB_PASSWORD=<redacted>\nok" }));
+  for (const text of ["a=1&password=x&".repeat(20_000), `password=${"(&".repeat(50_000)}`, `(${"password=x) ".repeat(20_000)}`]) {
+    const t0 = performance.now();
+    redactLogSecrets(text);
+    assert.ok(performance.now() - t0 < 1500, `${text.slice(0, 40)}: ${Math.round(performance.now() - t0)} ms`);
+  }
+});
+
+test("L16 a Kubernetes environment variable named like a credential, as a spec dump prints it", () => {
+  const spec = { env: [{ name: "DB_PASSWORD", value: "Xy7&kLm9 not real" }, { name: "LOG_LEVEL", value: "debug" }] };
+  for (const text of [JSON.stringify(spec), JSON.stringify(spec, null, 2), JSON.stringify({ logs: `spec: ${JSON.stringify(spec, null, 2)}` })]) {
+    const r = redactLogSecrets(text).text;
+    assert.equal(r.includes("Xy7"), false, r);
+    assert.ok(r.includes("debug"), r);
+    assert.doesNotThrow(() => JSON.parse(r));
+  }
+  const yaml = "env:\n- name: DB_PASSWORD\n  value: Xy7&kLm9\n- name: LOG_LEVEL\n  value: debug\n  - name: \"API_TOKEN\"\n    value: 'p q r'";
+  assert.equal(redactLogSecrets(yaml).text, "env:\n- name: DB_PASSWORD\n  value: <redacted>\n- name: LOG_LEVEL\n  value: debug\n  - name: \"API_TOKEN\"\n    value: '<redacted>'");
+  const inJson = redactLogSecrets(JSON.stringify({ logs: yaml })).text;
+  assert.equal(inJson.includes("Xy7") || inJson.includes("p q r"), false, inJson);
+  assert.doesNotThrow(() => JSON.parse(inJson));
+});

@@ -45,11 +45,15 @@ record it.
 - An assistant's router turn diagnoses a failure itself: of the assistant plugin's servers it is offered SaFE's `workload_logs`,
   `workload_events`, `workload_pod_logs`, `workload_pod_containers`, `node_pod_logs`, `node_reboot_logs`, `cluster_logs` and
   `flavor_avail`, and the agent board's `notification_read` and `milestone_read`; the user's scheduled tasks (`trigger_list` of
-  the turn's own `schedules` server, kept only when this API minted its bearer for this turn); and the plugin's
+  the turn's own `schedules` server, kept only when this API minted its bearer for this turn's session, message and run); and the plugin's
   `teams-reply-style` rule. Its log reads go to Brain as the new `ExecuteRequest.log_reads` (each read's line-counting
-  argument): Brain asks for at most 40 lines or entries, masks credential-shaped text in the answer before the model, an event or
-  a log line sees it (new `redactLogSecrets` of @claw/utils: `redactSecrets`, values after a credential's name, armored private
-  keys), and keeps the last 6000 characters of a plain-text answer.
+  argument, empty for `workload_pod_containers`, which counts nothing but whose termination messages can hold a log's end):
+  Brain asks for at most 40 lines or entries, masks credential-shaped text in the answer before the model, an event or a log
+  line sees it (new `redactLogSecrets` of @claw/utils: `redactSecrets`; values after a credential's name, where an assignment
+  line's value runs to the line's end and elsewhere a separator or a bracket ends a value only where another pair follows or its
+  opener stands before the name; Kubernetes environment variables named like a credential; armored private keys, OpenPGP ones
+  included, and a key whose BEGIN line the tail cut off, from its first base64 line), and keeps the last 6000 characters of a
+  plain-text answer.
 - Citations for the assistant router's answers, behind `CLAW_ASSISTANT_CITATIONS` (default off). The router writes [1], [2] in its
   `say` and names each number's address in `say`'s new `sources` argument; the new `ExecuteRequest.cite` makes Brain keep the sources
   the turn's own lookups returned (`web_search` hits and what the API's GitHub server lists in its results' `_meta["claw/sources"]`:

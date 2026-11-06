@@ -211,6 +211,8 @@ describe("assistant router read tools", { skip }, () => {
       tools: {
         mcp__safe__workload_logs: "limit", mcp__safe__workload_events: "limit", mcp__safe__workload_pod_logs: "tail_lines",
         mcp__safe__node_pod_logs: "tail_lines", mcp__safe__node_reboot_logs: "limit", mcp__safe__cluster_logs: "tail_lines",
+        // Counts nothing; masked, since a container's termination message can be the end of its log.
+        mcp__safe__workload_pod_containers: "",
       },
       lines: 40, chars: 6000,
     });
@@ -240,12 +242,13 @@ describe("assistant router read tools", { skip }, () => {
       const exp = Math.floor(Date.now() / 1000) + 600;
       const url = `${INTERNAL_BACKEND_URL}/v1/internal/trigger-mcp`;
       const entry = (over: Record<string, unknown>) => ({ schedules: { type: "http", url, token: mintTriggerToken({ sid: "s1", mid: "m1", task_id: "t1", exp }, key), ...over } });
-      assert.deepEqual(Object.keys(ownTriggerServer(entry({}), "s1", "m1", key)), ["schedules"], "minted for this turn");
-      assert.deepEqual(ownTriggerServer(entry({ url: "https://elsewhere.example/v1/internal/trigger-mcp" }), "s1", "m1", key), {}, "another address");
-      assert.deepEqual(ownTriggerServer(entry({}), "s1", "m2", key), {}, "a bearer for another message");
-      assert.deepEqual(ownTriggerServer(entry({}), "s2", "m1", key), {}, "a bearer for another session");
-      assert.deepEqual(ownTriggerServer(entry({ token: mintTriggerToken({ sid: "s1", mid: "m1", task_id: "t1", exp }, "x".repeat(40)) }), "s1", "m1", key), {}, "signed with another key");
-      assert.deepEqual(ownTriggerServer(undefined, "s1", "m1", key), {});
+      assert.deepEqual(Object.keys(ownTriggerServer(entry({}), "s1", "m1", "t1", key)), ["schedules"], "minted for this turn");
+      assert.deepEqual(ownTriggerServer(entry({ url: "https://elsewhere.example/v1/internal/trigger-mcp" }), "s1", "m1", "t1", key), {}, "another address");
+      assert.deepEqual(ownTriggerServer(entry({}), "s1", "m2", "t1", key), {}, "a bearer for another message");
+      assert.deepEqual(ownTriggerServer(entry({}), "s1", "m1", "t2", key), {}, "a bearer for another run of the message");
+      assert.deepEqual(ownTriggerServer(entry({}), "s2", "m1", "t1", key), {}, "a bearer for another session");
+      assert.deepEqual(ownTriggerServer(entry({ token: mintTriggerToken({ sid: "s1", mid: "m1", task_id: "t1", exp }, "x".repeat(40)) }), "s1", "m1", "t1", key), {}, "signed with another key");
+      assert.deepEqual(ownTriggerServer(undefined, "s1", "m1", "t1", key), {});
     } finally { Object.assign(triggers.triggerToolSettings, saved); }
     // With the trigger tools off, the turn has no such server and nothing to list with.
     const off = await send(alice.routerSid, "我设了哪些定时任务？");

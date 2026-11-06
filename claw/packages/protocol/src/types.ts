@@ -424,8 +424,9 @@ export interface ExecuteRequest {
   cite?: { tools: string[]; source_servers?: string[]; user_urls?: string[] };
   /**
    * The lookups of this run whose results are log text, by exact tool name (`mcp__<server>__<tool>`), each with the argument
-   * that says how many lines or entries it returns (`tail_lines`, `limit`). For such a call Brain lowers that argument to `lines`
-   * (and sets it when the call names none), masks credential-shaped text in the answer (`redactLogSecrets` of @claw/utils) before
+   * that says how many lines or entries it returns (`tail_lines`, `limit`; empty for a read that counts nothing but may carry log
+   * text, such as a container's termination message). For such a call Brain lowers that argument to `lines` (and sets it when
+   * the call names none), masks credential-shaped text in the answer (`redactLogSecrets` of @claw/utils) before
    * the model, an event or a log line sees it, and keeps only the last `chars` characters of an answer that is plain text
    * (`brain/src/tools/log-reads.ts`). The API sets it on an assistant's router turn that has such reads. Absent, or unreadable:
    * results are as the tools answered.
