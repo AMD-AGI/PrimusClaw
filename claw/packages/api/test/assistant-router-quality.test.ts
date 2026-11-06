@@ -156,6 +156,16 @@ describe("router quality, through the tools", { skip }, () => {
     assert.equal((await w.mod.tools.say(next as never, { text: `#${created.seq} Kubernetes 调度器简介 在进行。` }, w.sayDeps)).ok, true);
   });
 
+  test("Q4c with no channel subscribed, a say after the start notice is still marked as adding to it (for the session)", async () => {
+    await w.q("DELETE FROM claw_notification_subscriptions");
+    const turn = await turnFor("帮我新建一个任务：整理发布说明");
+    const created = await w.mod.tools.workCreate(turn as never, { title: "整理发布说明", brief: "do it" }, w.sayDeps);
+    assert.equal(created.announced, true);
+    const notice = (await w.q(`SELECT say_id::text AS id FROM claw_assistant_says WHERE text LIKE '已开始：#${created.seq} %'`))[0] as { id: string };
+    const added = await w.mod.tools.say(turn as never, { text: "顺便：会按版本分组。" }, w.sayDeps);
+    assert.equal(w.events.find((e) => e.type === "AssistantSay" && e.say_id === added.say_id)?.amends, notice.id);
+  });
+
   test("Q5 a turn whose model answered nothing is told as declined; any other failure as not gone through", async () => {
     const ended = async (prompt: string, finalText: string) => {
       const turn = await turnFor(prompt);
