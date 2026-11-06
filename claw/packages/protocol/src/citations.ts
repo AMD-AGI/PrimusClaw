@@ -16,8 +16,11 @@ export const CITE_SOURCES_META = "claw/sources";
 /** The `_meta` key of what Brain dropped from a citing call, by reason (`CiteDropped`). */
 export const CITE_DROPPED_META = "claw/sources_dropped";
 
-/** What a source is: a web page a search found or a fetch read, or an object of the user's GitHub. */
-export const CITE_SOURCE_KINDS = ["web", "github_pr", "github_issue", "github_repo", "github_check", "github_file"] as const;
+/**
+ * What a source is: a web page a search found or a fetch read, an object of the user's GitHub, or a page of a board a link server
+ * of the run listed (`ExecuteRequest.cite.link_servers`: an issue, a comment or a board on the agent board).
+ */
+export const CITE_SOURCE_KINDS = ["web", "github_pr", "github_issue", "github_repo", "github_check", "github_file", "board"] as const;
 export type CiteSourceKind = (typeof CITE_SOURCE_KINDS)[number];
 
 /** The most sources one call cites; the rest are dropped as `over_cap`. */

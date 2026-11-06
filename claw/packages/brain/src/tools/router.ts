@@ -440,7 +440,10 @@ export class ToolRouter {
     try {
       const text = await this.routeAllowed(name, input, signal, answered, ctx, meta);
       failed = answered.isError;
-      if (!failed) cite?.keep(name, answered.sources);
+      if (!failed) {
+        cite?.keep(name, answered.sources);
+        cite?.keepLinks(name, text);
+      }
       return text;
     } catch (err) {
       // A thrown message is not the source's own fixed words: it is whatever the transport or the server put in it (an HTTP

@@ -27,6 +27,7 @@ import { recordAssistantSay, recordSystemNotice, SayOutcomeUnknown, SayRefused, 
 import { voidStreamedSay } from "./router-speed.js";
 import { mayHandOff } from "./say-hold.js";
 import { saySources, SAY_SOURCE_OUTCOMES } from "./citations.js";
+import { suggestedReplies } from "./suggested.js";
 import { metrics } from "../infra/metrics.js";
 import { bareItemNumbers, internalTextIn, userWordsOf } from "./internal-text.js";
 import { parseItemRef } from "./item-ref.js";
@@ -203,7 +204,7 @@ async function assertSayReadable(
  * argument is never read.
  */
 export async function say(
-  claims: AssistantTokenClaims, args: { text: string; item_id?: string; sources?: unknown }, deps: SayDeps = {}, meta?: unknown,
+  claims: AssistantTokenClaims, args: { text: string; item_id?: string; sources?: unknown; suggested?: unknown }, deps: SayDeps = {}, meta?: unknown,
 ): Promise<{ ok: true; say_id: string; subscribers: number }> {
   try {
     return await sayOnce(claims, args, deps, meta);
@@ -218,7 +219,7 @@ export async function say(
 }
 
 async function sayOnce(
-  claims: AssistantTokenClaims, args: { text: string; item_id?: string; sources?: unknown }, deps: SayDeps, meta: unknown,
+  claims: AssistantTokenClaims, args: { text: string; item_id?: string; sources?: unknown; suggested?: unknown }, deps: SayDeps, meta: unknown,
 ): Promise<{ ok: true; say_id: string; subscribers: number }> {
   requireRole(claims, "router");
   const userId = await assistantUser(claims.sid);
@@ -243,10 +244,12 @@ async function sayOnce(
   const holdForTurn = claims.mid && mayHandOff(await turnMessage((t, p) => db.query(t, p), claims.sid, claims.mid)) ? claims.mid : undefined;
   const cited = meta === undefined ? null : saySources(meta, typeof args.text === "string" ? args.text.trim() : "");
   if (cited) for (const outcome of SAY_SOURCE_OUTCOMES) metrics.onAssistantSaySources(outcome, cited.counts[outcome]);
+  const suggested = suggestedReplies(args.suggested, userWordsOf([run?.prompt ?? ""]));
   try {
     const out = await recordAssistantSay({
       userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid, holdForTurn, turnBegan: run?.began, amendNotice: true,
       ...(cited?.sources.length ? { sources: cited.sources } : {}),
+      ...(suggested.length ? { suggested } : {}),
       guard: async (q) => {
         if ((await assertLiveRun(q, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");
       },

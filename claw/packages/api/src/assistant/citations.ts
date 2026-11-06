@@ -26,7 +26,7 @@
 import {
   CITE_DROPPED_META, CITE_MAX_PER_CALL, CITE_SOURCES_META, GITHUB_MCP_SERVER, citeableUrl, isCiteSourceKind, type CitedSource,
 } from "@claw/protocol";
-import { CLAW_ASSISTANT_CITATIONS, CLAW_ASSISTANT_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_CITATIONS, CLAW_ASSISTANT_CITE_LINK_SERVERS, CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { TOOL_NAME_PREFIX, TURN_STATE_HEADER, WORK_EVENT_PREFIX } from "./prompts.js";
 
@@ -112,19 +112,40 @@ export function userAddresses(prompt: string): string[] {
 }
 
 /**
+ * `CLAW_ASSISTANT_CITE_LINK_SERVERS` read: server name to the https prefix its pages have (ending in `/`). An entry that is not
+ * `name=https://host/path/` is left out.
+ */
+export function citeLinkServers(raw: string = CLAW_ASSISTANT_CITE_LINK_SERVERS): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const entry of raw.split(",")) {
+    const at = entry.indexOf("=");
+    const name = entry.slice(0, at).trim();
+    const prefix = entry.slice(at + 1).trim();
+    if (at <= 0 || !name || !prefix.endsWith("/")) continue;
+    const url = citeableUrl(prefix);
+    if (url?.protocol === "https:" && !url.search && !url.hash && url.toString() === prefix) out[name] = prefix;
+  }
+  return out;
+}
+
+/**
  * A router turn's `ExecuteRequest.cite`, or null with citations off: its `say` cites, from Brain's web tools and, when the turn
  * has the user's GitHub, this API's GitHub server; a page read is a source only at an address one of those returned or the
- * user wrote in `prompt` (`userAddresses`).
+ * user wrote in `prompt` (`userAddresses`). Of `readServers` (the plugin's servers the turn reads), those named in
+ * `CLAW_ASSISTANT_CITE_LINK_SERVERS` are link servers: the pages their results name as `html_url` can be cited.
  */
 export function routerCite(
   githubServers: Record<string, unknown>, prompt: string, on: boolean = assistantCitationsOn(),
-): { tools: string[]; source_servers: string[]; user_urls?: string[] } | null {
+  readServers: readonly string[] = [], linkServers: Record<string, string> = citeLinkServers(),
+): { tools: string[]; source_servers: string[]; user_urls?: string[]; link_servers?: Record<string, string> } | null {
   if (!on) return null;
   const userUrls = userAddresses(prompt);
+  const links = Object.fromEntries(readServers.filter((s) => Object.hasOwn(linkServers, s)).map((s) => [s, linkServers[s]]));
   return {
     tools: [`${TOOL_NAME_PREFIX}say`],
     source_servers: Object.hasOwn(githubServers, GITHUB_MCP_SERVER) ? [GITHUB_MCP_SERVER] : [],
     ...(userUrls.length ? { user_urls: userUrls } : {}),
+    ...(Object.keys(links).length ? { link_servers: links } : {}),
   };
 }
 

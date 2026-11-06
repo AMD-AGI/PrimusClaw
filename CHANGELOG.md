@@ -37,6 +37,17 @@ record it.
   `last_seen_at`, `offline_since` and `offline_reason` (`auth_expired`, `no_heartbeat`), and a connector offline for 5 minutes
   is reported once to its owner through their assistant with when it was last seen and the command that brings it back, then
   once more when it is back. The seconds-long breaks a Claw release causes are never reported.
+- The assistant router's `say` takes an optional `suggested` (`CLAW_ASSISTANT_SUGGESTED_REPLIES`, default on): up to three short
+  replies the user is likely to send next. They are checked (one plain line of at most 30 code points each, no address, markup, slash
+  command or internal text, none twice; one that does not fit is left out and never refuses the message) and carried by
+  `assistant.say` and the session's `AssistantSay` as `suggested_replies`, for a channel to show as buttons that send them.
+- Citations of the agent board: `CLAW_ASSISTANT_CITE_LINK_SERVERS` (`agent-board=https://host/board/`, default none) names plugin
+  read servers whose JSON results carry their own pages as `html_url`; a router turn that reads one sends them as
+  `ExecuteRequest.cite.link_servers`, and Brain keeps the `html_url` of each top-level result object under that prefix as a source of
+  the new kind `board`. A `say` that cited a board issue it had read lost the source before (no lookup of the turn had returned it).
+- The router's read section says what it can do, from the tool catalog (`router-read-v7`): reads at once; every write of its
+  servers, GitHub's and anything needing code or a run through a work item whose worker asks the user before each write; never
+  "read-only", and never a system failure (a sandbox that would not start, a 403) as a limit.
 - Three GitHub writes, each held for the user's decision like every write of the `github` server: `checks_rerun_failed` (run
   again the failed jobs of a GitHub Actions workflow run; `checks_list` now gives a job's `run_id`), `pr_request_reviewers` (people
   and teams) and `labels_set` (the whole list of an issue's or pull request's labels). None is a router read.

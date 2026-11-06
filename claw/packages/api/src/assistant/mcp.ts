@@ -28,6 +28,7 @@ import { db } from "../infra/db.js";
 import { ASSISTANT_MCP_PATH } from "./role-profile.js";
 import { PASS_REASONS, SAY_MAX_CHARS } from "./prompts.js";
 import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
+import { SAY_SUGGESTED_PARAM, suggestedRepliesOn } from "./suggested.js";
 import { REPORT_KINDS } from "./work-items.js";
 import { githubEventsEnabled, prReply, REPLY_BODY_MAX, watchNamedPullRequests, workSubscribe } from "./github-events.js";
 import { jobUnwatch, jobWatch, jobWatchesEnabled, jobWatchList } from "./job-watch.js";
@@ -289,13 +290,14 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims, choic
 
 /** What `say`'s `sources` says to the model (`CLAW_ASSISTANT_CITATIONS`). */
 export const SAY_SOURCES_PARAM = `Only when the text cites a lookup of this turn as [1], [2]: the address each number stands for, in order (the first is [1]), `
-  + "copied exactly from what the lookup returned (a web_search result's url, a GitHub result's url, or the URL web_fetch read when a search or "
+  + "copied exactly from what the lookup returned (a web_search result's url, a GitHub result's url, an agent board issue's or board's html_url, or the URL web_fetch read when a search or "
   + `GitHub result or the user's message gave it). At most ${CITE_MAX_PER_CALL}. `
   + "An address no lookup of this turn returned is dropped. Write it after text.";
 
 export function createAssistantMcpServer(
   claims: AssistantTokenClaims, reviewTools: boolean = CLAW_ASSISTANT_TOOLS, memoryTools: boolean = assistantMemoryOn(),
   modelChoice: boolean = modelChoiceOn(), citations: boolean = assistantCitationsOn(), devenv: boolean = devenvToolsOn(),
+  suggested: boolean = suggestedRepliesOn(),
 ): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
   if (claims.role === "observer") {
@@ -324,6 +326,8 @@ export function createAssistantMcpServer(
         // Never read here (Brain sends the sources in `_meta`), so one the model got wrong is no reason to refuse what it says: the
         // schema it is shown stays the same, and a `sources` that does not fit it is read as none.
         ...(citations ? { sources: z.array(z.string()).optional().catch(undefined).describe(SAY_SOURCES_PARAM) } : {}),
+        // Checked by `say` (`suggested.ts`), never a reason to refuse it: one that does not fit the schema is read as none.
+        ...(suggested ? { suggested: z.array(z.string()).optional().catch(undefined).describe(SAY_SUGGESTED_PARAM) } : {}),
       },
       // The sources come from Brain, in the request's `_meta` (`citations.ts`); never from the model's `sources` argument.
       (args, extra) => answer(claims, "say", () => say(claims, args, {}, citations ? extra._meta ?? {} : undefined), SAY_FAULT_MESSAGE),

@@ -56,7 +56,7 @@ export interface AssistantSaySource {
   n: number;
   url: string;
   title: string;
-  kind: "web" | "github_pr" | "github_issue" | "github_repo" | "github_check" | "github_file";
+  kind: "web" | "github_pr" | "github_issue" | "github_repo" | "github_check" | "github_file" | "board";
 }
 
 /**
@@ -98,6 +98,11 @@ export interface AssistantSayPayload extends AssistantEventBase {
   confirm_action?: AssistantConfirmAction;
   /** Present only when the message cites any (`CLAW_ASSISTANT_CITATIONS`); a receiver that does not read it shows the text alone. */
   sources?: AssistantSaySource[];
+  /**
+   * Present only when the router suggested any (`CLAW_ASSISTANT_SUGGESTED_REPLIES`): up to three short replies the user may send
+   * next, each one plain line. A channel shows them as buttons that send the words as the user's message; one that cannot ignores them.
+   */
+  suggested_replies?: string[];
   confirm_write?: AssistantConfirmWrite;
   /** Files the user gets with the message (a worker's deliveries, `deliveries.ts`): one download each. */
   files?: AssistantFile[];

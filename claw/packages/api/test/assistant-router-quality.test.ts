@@ -11,7 +11,8 @@
  *   Q4 work_create tells the user at once that the item started, in their language, once, only for a turn that answers them
  *   Q5 a router turn its model answered with nothing is told to the user as declined, not as "did not go through"
  *   Q6 each router turn that answers the user logs how soon it was first heard, last heard, and whether it started an item
- *   Q7 the router's prompt says each of the rules of router-v10 and router-read-v6
+ *   Q7 the router's prompt says each of the rules of router-v10 and router-read-v7
+ *   Q8 what the router can do is told from the tool catalog: each write of its servers, done by an item that asks first, never "read-only"
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -261,11 +262,11 @@ describe("router quality, pure", () => {
 });
 
 describe("router quality, the prompt", () => {
-  test("Q7 router-v10 and router-read-v6 say each rule", async () => {
+  test("Q7 router-v10 and router-read-v7 say each rule", async () => {
     const p = await import("../src/assistant/prompts.js");
     // router-v12 (this rule set, a long answer said whole, nothing after the start notice); its review prompt is router-v15.
     assert.equal(p.ROUTER_PROMPT_VERSION, "router-v13");
-    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v6");
+    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v7");
     assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v16");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
@@ -294,5 +295,27 @@ describe("router quality, the prompt", () => {
     assert.ok(!/call work_create in the same turn with the question/.test(system), "a failed lookup no longer starts an item");
     // The system prompt carries nothing that changes per turn, so it stays a prompt-cache prefix.
     assert.equal(p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search"] }), p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search"] }));
+  });
+
+  test("Q8 what the router can do comes from the tool catalog, and no system failure is a limit", async () => {
+    const p = await import("../src/assistant/prompts.js");
+    const { toolsOfClass } = await import("../src/assistant/tool-classes.js");
+    const system = p.renderRouterPrompt({ servers: ["agent-board", "safe"], github: ["issue_search"] });
+    const writes = [...toolsOfClass("agent-board", "write"), ...toolsOfClass("safe", "write")];
+    assert.ok(writes.length > 2, "the catalog lists writes for these servers");
+    const abilities = system.slice(system.indexOf("What you can do"));
+    for (const tool of writes) assert.ok(abilities.includes(tool), `the write ${tool} is named`);
+    // A read is not offered as a change.
+    const changes = abilities.split("\n").find((l) => l.startsWith("- Change things")) ?? "";
+    for (const read of toolsOfClass("agent-board", "read")) assert.ok(!new RegExp(`\\b${read}\\b`).test(changes), `the read ${read} is not a change`);
+    assert.match(abilities, /Never call yourself read-only, and never say you cannot write, change or send something listed here/);
+    assert.match(abilities, /Its worker asks the user on a card before each write runs, so say yes: you can, and it will ask them to approve the change first/);
+    assert.match(abilities, /GitHub \(comment, review/);
+    assert.match(abilities, /not a sandbox that would not start, a permission error, a status code \(such as 403\)/);
+    // Without GitHub, no GitHub writes are offered; without servers, still the item route for code and runs.
+    const bare = p.renderRouterPrompt({ servers: [], github: [] });
+    const bareAbilities = bare.slice(bare.indexOf("What you can do"));
+    assert.ok(!bareAbilities.includes("GitHub (comment"), "no GitHub writes without GitHub");
+    assert.match(bareAbilities, /anything that needs code, a shell, a checkout, a run or many steps/);
   });
 });

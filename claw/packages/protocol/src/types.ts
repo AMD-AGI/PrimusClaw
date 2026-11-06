@@ -427,8 +427,11 @@ export interface ExecuteRequest {
    * them. The API sets it on an assistant's router turn (`CLAW_ASSISTANT_CITATIONS`), for its `say`. Absent: nothing is kept or sent.
    * A page `web_fetch` read is kept only when a search or a trusted server of the run returned its address first, or it is one of
    * `user_urls`, the addresses the user wrote in the message the turn answers: reading a page confirms a source, it never adds one.
+   * `link_servers` names servers whose results are JSON objects that carry their own page as `html_url` (Gitea's, for the agent
+   * board), each with the address prefix its pages have: an `html_url` of a top-level object of such a result that starts with that
+   * prefix is kept, as a source of kind `board`. Nothing else of the result is read for addresses.
    */
-  cite?: { tools: string[]; source_servers?: string[]; user_urls?: string[] };
+  cite?: { tools: string[]; source_servers?: string[]; user_urls?: string[]; link_servers?: Record<string, string> };
   /**
    * The lookups of this run whose results are log text, by exact tool name (`mcp__<server>__<tool>`), each with the argument
    * that says how many lines or entries it returns (`tail_lines`, `limit`; empty for a read that counts nothing but may carry log
