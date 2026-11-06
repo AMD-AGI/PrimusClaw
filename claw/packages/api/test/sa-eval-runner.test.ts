@@ -841,6 +841,7 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
     const run = await r.done;
     await claw.stop();
     try {
+      assert.match(run.out, /t-p-001#1/, run.out);
       assert.ok(claw.calls.some((c) => /item-1\/(stop|accept)/.test(c)) && !claw.sessions.has("worker-1"), "the run's own item is closed");
       assert.ok(!claw.calls.some((c) => /item-2\/(stop|accept)/.test(c)), "the person's item is neither stopped nor accepted");
       assert.ok(claw.sessions.has("worker-2"), "the person's item keeps its worker's session");
