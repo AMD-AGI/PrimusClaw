@@ -47,7 +47,7 @@ import {
   type AdmissionAsk,
 } from "../tasks/admission.js";
 import { S3_BUCKET, UPLOAD_TTL_DAYS } from "../config.js";
-import { getS3Client } from "../infra/s3-client.js";
+import { getS3Client, S3_LIST_PAGE_KEYS } from "../infra/s3-client.js";
 import type { S3Client } from "@aws-sdk/client-s3";
 import { ListObjectsV2Command, GetObjectCommand, PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
@@ -510,7 +510,7 @@ async function listS3KeysUnderPrefix(
   let ct: string | undefined;
   do {
     const res = await s3.send(
-      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: ct }),
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: ct, MaxKeys: S3_LIST_PAGE_KEYS }),
     );
     for (const obj of res.Contents || []) {
       if (!obj.Key || obj.Size === undefined || obj.Size <= 0) continue;
@@ -2148,7 +2148,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     let ct: string | undefined;
     do {
       const res = await s3.send(
-        new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: ct }),
+        new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: ct, MaxKeys: S3_LIST_PAGE_KEYS }),
       );
       for (const obj of res.Contents || []) {
         const rel = (obj.Key || "").slice(prefix.length);

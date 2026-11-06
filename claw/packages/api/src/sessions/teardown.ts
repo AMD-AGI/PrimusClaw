@@ -61,7 +61,7 @@ import pino from "pino";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { sessionWorkspacePrefix, workspaceOwnerId } from "../workspace/prefix.js";
-import { getS3Client } from "../infra/s3-client.js";
+import { getS3Client, S3_LIST_PAGE_KEYS } from "../infra/s3-client.js";
 import { metrics } from "../infra/metrics.js";
 import { releaseSessionRefs, workspaceForSession } from "../workspace/store.js";
 import { sc, nc, kv, kvTombstones, jsm, EVENT_STREAM } from "../infra/nats.js";
@@ -233,11 +233,17 @@ function pastDeadline(deadline?: number): boolean {
  * removing keys already listed does not disturb the walk.
  *
  * The page boundary is where a deadline is honoured between listings. Inside a
- * page the delete batches honour it too: finishing a thousand-key page after
- * the clock has stopped is how an inline delete spends minutes in a request
- * handler, and how it overlaps a sweeper pass that thought it had the rest.
- * Stopping mid-page is still resumable -- the next attempt lists from the
- * start and the keys already gone are simply not returned.
+ * page the delete batches honour it too: finishing a full page after the clock
+ * has stopped is how an inline delete spends minutes in a request handler, and
+ * how it overlaps a sweeper pass that thought it had the rest. Stopping
+ * mid-page is still resumable -- the next attempt lists from the start and the
+ * keys already gone are simply not returned.
+ *
+ * The page is {@link S3_LIST_PAGE_KEYS} and not the API's thousand, because the
+ * listing is the one request here whose duration grows with its answer: on a
+ * store that lists slowly, a thousand-key page outlasts the client's request
+ * timeout, the walk fails before its first delete, and a session with more
+ * files than one such page can ever hold is never cleaned up at all.
  */
 async function deletePrefix(
   s3: S3Client,
@@ -251,7 +257,9 @@ async function deletePrefix(
   do {
     if (pastDeadline(deadline)) return { deleted, failed, complete: false };
     const page = await s3.send(
-      new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: token }),
+      new ListObjectsV2Command({
+        Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: token, MaxKeys: S3_LIST_PAGE_KEYS,
+      }),
     );
     const keys = (page.Contents ?? [])
       .map((obj) => obj.Key)
