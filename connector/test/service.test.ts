@@ -217,8 +217,11 @@ describe("service install / uninstall / status", () => {
     const a = ctx(home, { service: { ...D({ systemdBooted: () => false }), exec: chroot.exec } }, { PATH: "/bin" });
     assert.equal(await main(["service", "install"], a.c), EXIT.ok, a.errText());
     const script = keepaliveFile(a.c.dirs);
-    assert.equal(fs.statSync(script).mode & 0o777, 0o700);
-    const body = fs.readFileSync(script, "utf8");
+    const fd = fs.openSync(script, "r");
+    const mode = fs.fstatSync(fd).mode & 0o777;
+    const body = fs.readFileSync(fd, "utf8");
+    fs.closeSync(fd);
+    assert.equal(mode, 0o700);
     assert.match(body, /export PATH='\/bin'/);
     assert.match(body, /service ensure\n$/);
     assert.match(a.text(), /supervisor running \(pid \d+\)/);
@@ -387,5 +390,16 @@ describe("exit 78 and the disconnect record", () => {
       assert.equal(await running, EXIT.ok);
       assert.equal(recentDisconnects(r.c.dirs, 1)[0]?.reason, "stopped");
     } finally { connector?.stop(); await running; await claw.close(); }
+  });
+});
+
+describe("the disconnect record", () => {
+  test("is trimmed to its newer half past 128 KiB, newest last", async () => {
+    const { recordDisconnect } = await import("../src/health.js");
+    const dirs = ctx(tmpdir()).c.dirs;
+    for (let i = 0; i < 700; i++) recordDisconnect(dirs, { reason: "stream_lost", detail: `${i} ${"x".repeat(200)}` });
+    const size = Buffer.byteLength(fs.readFileSync(path.join(dirs.state, "disconnects.jsonl"), "utf8"));
+    assert.ok(size <= 128 * 1024, `size ${size}`);
+    assert.match(recentDisconnects(dirs, 1)[0]?.detail ?? "", /^699 /);
   });
 });

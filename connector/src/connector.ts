@@ -511,7 +511,9 @@ export class Connector {
     const pidf = pidFile(this.d.dirs);
     // A pid file left behind means the previous run never reached its own clean-up: it was killed (SIGKILL, OOM),
     // crashed, or the machine went down under it. Its last heartbeat is when connector.json was last written.
-    if (fs.existsSync(pidf)) {
+    let leftover = false;
+    try { fs.readFileSync(pidf); leftover = true; } catch { /* none: the previous run cleaned up, or there was none */ }
+    if (leftover) {
       let last: string | undefined;
       try { last = fs.statSync(identityFile(this.d.dirs)).mtime.toISOString(); } catch { /* never registered */ }
       recordDisconnect(this.d.dirs, { reason: "process_died", detail: `the previous run ended without shutting down (killed, crashed, or the machine restarted)${last ? `; last heartbeat ${last}` : ""}`, ...(last ? { at: last } : {}) });

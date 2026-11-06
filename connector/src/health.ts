@@ -27,9 +27,14 @@ export function recordDisconnect(dirs: Dirs, d: Omit<Disconnect, "at"> & { at?: 
   const file = disconnectsFile(dirs);
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    fs.appendFileSync(file, JSON.stringify({ at: d.at ?? new Date().toISOString(), reason: d.reason, ...(d.detail ? { detail: d.detail.slice(0, 300) } : {}) }) + "\n", { mode: 0o600 });
-    if (fs.statSync(file).size > MAX_BYTES) {
-      const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    // One descriptor for the append, the size and the read, so all three see the same file.
+    const fd = fs.openSync(file, "a+", 0o600);
+    let lines: string[] | null = null;
+    try {
+      fs.writeSync(fd, JSON.stringify({ at: d.at ?? new Date().toISOString(), reason: d.reason, ...(d.detail ? { detail: d.detail.slice(0, 300) } : {}) }) + "\n");
+      if (fs.fstatSync(fd).size > MAX_BYTES) lines = fs.readFileSync(fd, "utf8").split("\n").filter(Boolean);
+    } finally { fs.closeSync(fd); }
+    if (lines) {
       const tmp = `${file}.${process.pid}.tmp`;
       fs.writeFileSync(tmp, lines.slice(Math.floor(lines.length / 2)).join("\n") + "\n", { mode: 0o600 });
       fs.renameSync(tmp, file);
