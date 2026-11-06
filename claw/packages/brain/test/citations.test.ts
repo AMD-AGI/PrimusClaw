@@ -59,7 +59,7 @@ test("C1 addresses compare by their normalized form; what cannot be a source has
     "https://x.example/r#a=1;access_token=abc", "https://x.example/r?%73ig=abc",
   ]) assert.equal(citeKey(secret), null, secret);
   // Nor an address with a character that could close an attribute or open a tag where it is shown.
-  for (const markup of ["https://example.com/<b>title</b>", 'https://example.com/a"onmouseover="x', "https://example.com/a'b",
+  for (const markup of ["https://example.com/[x](https://evil.example)", "https://example.com/<b>title</b>", 'https://example.com/a"onmouseover="x', "https://example.com/a'b",
     "https://example.com/a`b", "https://example.com/{x}", "https://example.com/a|b", "https://example.com/a\\b"]) assert.equal(citeKey(markup), null, markup);
   for (const ok of ["https://example.com/search?q=primus+claw&page=2", "https://docs.example/guide#section-2",
     "https://github.com/o/r/pull/1#issuecomment-123", "https://example.com/a?design=1&keyboard=us&signal=on"]) assert.ok(citeKey(ok), ok);

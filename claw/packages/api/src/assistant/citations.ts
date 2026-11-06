@@ -10,7 +10,8 @@
  * cannot write; an address no lookup returned is dropped there and counted. What arrives is checked again here before it is
  * stored with the message and sent to the channel (`AssistantSayPayload.sources`):
  *
- *  - each entry's number is 1..`CITE_MAX_PER_CALL`, once, and appears in the text as `[n]` (not as a link's label `[n](...)`);
+ *  - each entry's number is 1..`CITE_MAX_PER_CALL`, once, and appears in the text as `[n]` on its own, not as or inside a link
+ *    (`citedNumbers`);
  *  - its address can be a source (`citeableUrl`: http or https, a host, no credentials as a user or a parameter) and has nothing
  *    a redaction would mask;
  *  - its title is a page's or a pull request's own words, which anyone may have written: it is cut to one plain line of
@@ -100,10 +101,19 @@ export function sourceTitle(raw: unknown, url: URL): string {
   return redact(cut) || url.host;
 }
 
-/** The numbers the text cites: `[n]`, and not a link's label `[n](...)`. */
+/** A markdown link, its label holding at most one level of brackets: `[[1]](address)` is a link, not a citation. */
+const MD_LINK = /\[(?:[^[\]\n]|\[[^[\]\n]*\])*\]\([^)\n]*\)/g;
+/** A reference definition: `[1]: address` at a line's start makes every `[1]` a link. */
+const REF_DEFINITION = /^ {0,3}\[[^\]\n]+\]:/m;
+
+/**
+ * The numbers the text cites as `[n]` on their own: not inside or as a link (`[n](...)`, `[[n]](...)`, `[a [n] b](...)`), and none
+ * at all in a text with a reference definition (`[n]: address` makes `[n]` a link to it).
+ */
 export function citedNumbers(text: string): Set<number> {
   const out = new Set<number>();
-  for (const m of text.matchAll(/\[(\d{1,2})\](?!\()/g)) out.add(Number(m[1]));
+  if (REF_DEFINITION.test(text)) return out;
+  for (const m of text.replace(MD_LINK, " ").matchAll(/\[(\d{1,2})\](?!\()/g)) out.add(Number(m[1]));
   return out;
 }
 

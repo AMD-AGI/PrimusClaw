@@ -47,6 +47,11 @@ test("SC1 an entry is kept only when it is well formed and cited in the text; Br
   assert.deepEqual(out.counts, { cited: 1, dropped_not_in_turn: 2, dropped_invalid: 1 + 13, dropped_over_cap: 1, unreferenced: 1 });
   assert.deepEqual(saySources(undefined, text), { sources: [], counts: { cited: 0, dropped_not_in_turn: 0, dropped_invalid: 0, dropped_over_cap: 0, unreferenced: 0 } });
   assert.deepEqual(saySources({ [CITE_SOURCES_META]: "x", [CITE_DROPPED_META]: { not_in_turn: -3, invalid: "9" } }, text).counts.dropped_not_in_turn, 0);
+  for (const linked of ["[[1]](https://evil.example/)", "see [a [1] b](https://evil.example/)", "see [1]\n\n[1]: https://evil.example/",
+    "see [1]\n   [x]: https://evil.example/", "[1](https://evil.example/)"]) {
+    assert.deepEqual([...citedNumbers(linked)], [], `a number that is or is in a link is no citation: ${linked}`);
+  }
+  assert.deepEqual([...citedNumbers("[[1]](https://evil.example/) and [2]")], [2], "a plain [2] beside a link is still cited");
   const sorted = saySources(meta([pr(2), pr(1)]), "[1] [2]").sources.map((s) => s.n);
   assert.deepEqual(sorted, [1, 2]);
 });

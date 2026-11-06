@@ -77,14 +77,14 @@ export function carriesSecret(url: URL): boolean {
 
 /**
  * The address `raw` names, when it can be a source: an absolute http or https URL, with a host, without credentials (neither as
- * a user nor as a parameter, `carriesSecret`), without whitespace, control, format or markup characters (`<>"'` and the like), at
+ * a user nor as a parameter, `carriesSecret`), without whitespace, control, format or markup characters (`<>"'[]` and the like), at
  * most `CITE_URL_MAX` characters. Null
  * for anything else.
  */
 export function citeableUrl(raw: unknown): URL | null {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > CITE_URL_MAX) return null;
   // Nor a character that could close an attribute or open a tag where it is shown: a canonical address has none.
-  if (/[\s\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}<>"'`{}|\\^]/u.test(raw)) return null;
+  if (/[\s\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}<>"'`{}|\\^[\]]/u.test(raw)) return null;
   let url: URL;
   try {
     url = new URL(raw);
