@@ -459,7 +459,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       if (type === "prompt") {
         await noteRemotePrompt({
           owner, sessionId, connectorId: session.connector_id, agentId: session.agent_id, text: (parsed.value as { text: string }).text, origin: "chat",
-          since,
+          since, cmdId,
         }).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
       }
       return queued;

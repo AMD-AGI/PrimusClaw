@@ -53,6 +53,12 @@ record it.
   write failures keep the `NatsError` as `cause`) is retried like a bare one instead of ending the run for good, and is reported as
   `infra_transient` rather than `upstream_timeout` when its retries run out. A retryable failure now waits 5 s, 10 s, 20 s, 40 s,
   then 60 s per attempt (was a flat 5 s), so a stall spends the delivery budget over the time it lasts.
+- A development environment item no longer stays in progress after its last instruction ended when two stops came in quick
+  succession and a turn finished on its own as the first was on its way. The connector (`connector/`, next release) names the
+  prompt each `turn_end` ends (`data.cmd_id`; `null` for the end of a cancel that found nothing running) and refuses by name each
+  prompt a cancel drops from its queue (`command_rejected`, reason `cancelled`). Claw keeps the command ids of an item's open
+  prompts (`open_cmds`) and ends exactly the prompt named; a turn's end that names a prompt the item does not have open ends
+  nothing. A connector that does not send `cmd_id` is counted as before.
 - A router turn that said only a line that it was on it ("查一下 Autopilot 的状态。") before its lookup answered, and then wrote its
   answer as plain text, no longer leaves the person with that line alone: the completion skipped the text because the turn had
   spoken. When the turn's stored `toolUsed` events show that every say that went out came before its last lookup ended (answered or

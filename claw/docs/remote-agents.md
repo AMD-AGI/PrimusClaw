@@ -58,6 +58,13 @@ Special event types: `permissionRequest` (`data.actionId`, `data.options[].optio
 `session_closed`. They are audited, and `permissionRequest` is what a decision is
 checked against.
 
+The connector in this repository names the prompt a turn ends: `turn_end` carries `data.cmd_id`, the
+`cmd_id` of the `prompt` command that started the turn, or `null` for the end a `cancel` posts when no turn was
+running. A prompt that never runs gets no `turn_end`; it is refused by name instead, as `command_rejected`
+(`data.type: "prompt"`, `data.cmd_id`, `data.reason`), and the prompts a `cancel` drops from the queue are
+refused this way with `reason: "cancelled"`. A connector from before this change sends `turn_end` without
+`cmd_id`, and its dropped prompts are not refused.
+
 ### Continuing a session that already exists
 
 A connector may offer sessions that already exist on its machine instead of (or beside) starting new ones. Claw does not
@@ -261,9 +268,14 @@ until its `permission_resolved`, the `turn_end` of the last prompt open closes i
 the agent's answer as its summary, and a `session_closed` closes it. Prompts and cancels for a session are
 queued and noted one at a time, in the order the connector runs them: the end a cancel brings ends what was
 sent before it, never a prompt sent after it, and a prompt the connector refused before queueing it
-(`too_many_queued_prompts`, `session_closed`) counts as ended. Known gap: the connector's `turn_end` does not
-yet name the prompt it ends, so two stops in quick succession, with a turn ending on its own while the first
-cancel is on its way, can leave an item in progress until its next turn ends. History a session had before its first prompt (a
+(`too_many_queued_prompts`, `session_closed`) counts as ended. The item keeps the command ids of the prompts
+open (`open_cmds`), and a connector that names the prompt a turn ends (`turn_end.cmd_id`) is followed by name:
+that end ends that prompt and no other, a refusal by name (`command_rejected`, including `cancelled` for a
+prompt a cancel dropped) ends the prompt it names, and the end of a turn the item does not have open (one that
+finished as a stop was on its way, the cancel's own end naming none) ends nothing. A `turn_end` without `cmd_id`
+(a connector from before it was sent) makes the item count again until it next reopens: with counting, two
+stops in quick succession, with a turn ending on its own while the first cancel is on its way, can leave an
+item in progress until its next turn ends. History a session had before its first prompt (a
 conversation taken over replays it) is not applied, and each event is applied once. A prompt the user typed
 into a chat attached to the session is told to nobody (the chat showed it, and the silent sweep skips these
 items); one the assistant sent is told once when it ends or waits for an approval. The router's item list

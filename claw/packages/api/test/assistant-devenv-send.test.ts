@@ -35,6 +35,10 @@
  *   F14 nothing is ever sent from the turn itself: whatever the words, in the user's own signed-in turn, it is a card
  *   F15 two stops in a row, each followed by an instruction, before either cancel's end has come: each end is taken in turn, and
  *       only the last instruction is left open
+ *   F16 a connector that names the prompt each turn's end ends (`turn_end.cmd_id`) is followed by name: a turn that finished on its
+ *       own as the first of two stops was on its way no longer leaves the last instruction's item open after it ended; an old turn's
+ *       end never ends a newer instruction; a cancel's queued prompts, refused by name, end with it; the card's command id is the one
+ *       named; an end naming no prompt (an older connector) makes the item count again, as before
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -394,7 +398,11 @@ describe("development environment items and devenv_send", { skip }, () => {
     const cid = await machine("alice", "laptop");
     const sid = await chatSession("alice", cid);
     const prompt = async (text: string) => assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text })).status, 202);
-    const rejected = (reason: string): [string, Recorded] => ["command_rejected", { type: "prompt", cmd_id: "c", reason }];
+    // Refused by the command id of the newest prompt, as every connector names the prompt it refuses.
+    const rejected = async (reason: string): Promise<[string, Recorded]> => {
+      const [row] = await w.q("SELECT cmd_id FROM claw_remote_commands WHERE session_id = $1 AND type = 'prompt' ORDER BY cmd_seq DESC LIMIT 1", [sid]);
+      return ["command_rejected", { type: "prompt", cmd_id: String(row.cmd_id), reason }];
+    };
 
     // Two prompts typed, then stop: the connector drops the queued one with no turn_end, and the running one ends cancelled.
     await prompt("first");
@@ -409,7 +417,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     await prompt("a");
     await prompt("b");
     await prompt("c");
-    await events("alice", cid, sid, [rejected("too_many_queued_prompts"), end()]);
+    await events("alice", cid, sid, [await rejected("too_many_queued_prompts"), end()]);
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_turns], ["in_progress", 1]);
     await events("alice", cid, sid, [chunk("b done"), end()]);
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "b done"]);
@@ -417,14 +425,14 @@ describe("development environment items and devenv_send", { skip }, () => {
     // A prompt refused when its turn starts posts its refusal and a turn_end: that is one prompt, not two.
     await prompt("x");
     await prompt("y");
-    await events("alice", cid, sid, [rejected("attach_busy"), end("error")]);
+    await events("alice", cid, sid, [await rejected("attach_busy"), end("error")]);
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_turns], ["in_progress", 1]);
     await events("alice", cid, sid, [end()]);
     assert.equal((await remoteItem(sid)).board_state, "done");
 
     // The only prompt open refused before it was queued: the item ends, dropped, saying why.
     await prompt("z");
-    await events("alice", cid, sid, [rejected("too_many_queued_prompts")]);
+    await events("alice", cid, sid, [await rejected("too_many_queued_prompts")]);
     item = await remoteItem(sid);
     assert.deepEqual([item.board_state, item.outcome, item.params.open_turns], ["done", "dropped", 0]);
     assert.match(item.summary, /too_many_queued_prompts/);
@@ -447,7 +455,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     const sid = await chatSession("alice", cid);
     await events("alice", cid, sid, [chunk("history"), end()]);
     const note = (text: string, since: number) =>
-      items.noteRemotePrompt({ owner: "alice", sessionId: sid, connectorId: cid, agentId: "claude", text, origin: "chat", since });
+      items.noteRemotePrompt({ owner: "alice", sessionId: sid, connectorId: cid, agentId: "claude", text, origin: "chat", since, cmdId: `note-${text}` });
 
     // The prompt is queued, the connector answers at once, and only then is the item written.
     let since = await items.remoteEventMark(sid);
@@ -637,6 +645,85 @@ describe("development environment items and devenv_send", { skip }, () => {
     await events("alice", cid, sid, [chunk("p3 done"), end()]);
     item = await remoteItem(sid);
     assert.deepEqual([item.board_state, item.summary], ["done", "p3 done"]);
+  });
+
+  test("F16 a connector that names each turn's prompt is followed by name, and one that does not is counted as before", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop");
+    /** The command ids of the session's prompts, oldest first, as the connector receives them. */
+    const promptIds = async (sid: string): Promise<string[]> =>
+      (await w.q("SELECT cmd_id FROM claw_remote_commands WHERE session_id = $1 AND type = 'prompt' ORDER BY cmd_seq", [sid])).map((r: Recorded) => String(r.cmd_id));
+    const endOf = (cmdId: string | null, stopReason = "end_turn"): [string, Recorded] => ["turn_end", { stopReason, cmd_id: cmdId }];
+
+    // The known gap of counting: p1 finishes on its own as the first stop is on its way (that stop brings no end of its own), p2 is
+    // cancelled by the second stop, then p3 runs and ends. Counted, the item stayed in progress; by name, p3's end ends it.
+    const one = await sendByCard(await userTurn(alice, "跑 make test"), { text: "跑 make test" });
+    const sid = String(one.session_id);
+    const send = async (body: Recorded) => assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, body)).status, 202);
+    await send({ type: "cancel" });
+    await send({ type: "prompt", text: "p2" });
+    await send({ type: "cancel" });
+    await send({ type: "prompt", text: "p3" });
+    const [p1, p2, p3] = await promptIds(sid);
+    // The card's prompt is under the command id derived from the card, and the item knows it by that id.
+    assert.match(p1, /^k:[0-9a-f]{40}$/);
+    assert.deepEqual((await remoteItem(sid)).params.open_cmds, [p1, p2, p3]);
+    await events("alice", cid, sid, [chunk("tests done"), endOf(p1)]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_cmds], ["in_progress", [p2, p3]]);
+    await events("alice", cid, sid, [endOf(p2, "cancelled")]);
+    assert.equal((await remoteItem(sid)).board_state, "in_progress", "p3 is still running");
+    await events("alice", cid, sid, [chunk("p3 done"), endOf(p3)]);
+    let item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome, item.summary, item.params.open_turns, item.params.open_cmds, item.params.cancels],
+      ["done", "answered", "p3 done", 0, [], []]);
+
+    // Stop, then a new instruction; the old turn's end and the cancel's end that names nothing come after: neither ends it.
+    await send({ type: "prompt", text: "q1" });
+    assert.equal((await post("alice", `/v1/work-items/${String(one.item_id)}/stop`, {})).status, 200);
+    await send({ type: "prompt", text: "q2" });
+    const [, , , q1, q2] = await promptIds(sid);
+    assert.deepEqual((await remoteItem(sid)).params.open_cmds, [q2]);
+    await events("alice", cid, sid, [chunk("q1 finished anyway"), endOf(q1), endOf(null, "cancelled")]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).title], ["in_progress", "laptop claude: q2"], "q1's end is not q2's");
+    // An end naming a prompt the item never had open, or a refusal of one, changes nothing either.
+    await events("alice", cid, sid, [endOf("k:someone-else"), ["command_rejected", { type: "prompt", cmd_id: "k:dropped-before", reason: "cancelled" }]]);
+    assert.deepEqual((await remoteItem(sid)).params.open_cmds, [q2]);
+    assert.equal((await remoteItem(sid)).board_state, "in_progress");
+    await events("alice", cid, sid, [chunk("q2 done"), endOf(q2)]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "q2 done"]);
+
+    // Two prompts, then stop: the queued one is refused by name (`cancelled`) and the running one ends cancelled.
+    await send({ type: "prompt", text: "r1" });
+    await send({ type: "prompt", text: "r2" });
+    await send({ type: "cancel" });
+    const [r1, r2] = (await promptIds(sid)).slice(-2);
+    await events("alice", cid, sid, [["command_rejected", { type: "prompt", cmd_id: r2, reason: "cancelled" }]]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_cmds], ["in_progress", [r1]]);
+    await events("alice", cid, sid, [chunk("half"), endOf(r1, "cancelled")]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome], ["done", "answered"]);
+    assert.match(item.summary, /已取消|cancelled/);
+
+    // The only prompt open refused before it was queued, by name: the item ends, dropped.
+    await send({ type: "prompt", text: "s1" });
+    const s1 = (await promptIds(sid)).at(-1)!;
+    await events("alice", cid, sid, [["command_rejected", { type: "prompt", cmd_id: s1, reason: "too_many_queued_prompts" }]]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome, item.params.open_cmds], ["done", "dropped", []]);
+
+    // An end that names no prompt at all (a connector from before names were sent): the item counts, as it always did.
+    await send({ type: "prompt", text: "t1" });
+    await send({ type: "prompt", text: "t2" });
+    await events("alice", cid, sid, [end()]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.params.open_turns, item.params.open_cmds], ["in_progress", 1, null]);
+    await events("alice", cid, sid, [chunk("t2 done"), end()]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "t2 done"]);
+    // The next instruction is followed by name again.
+    await send({ type: "prompt", text: "u1" });
+    const u1 = (await promptIds(sid)).at(-1)!;
+    assert.deepEqual((await remoteItem(sid)).params.open_cmds, [u1]);
   });
 
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {

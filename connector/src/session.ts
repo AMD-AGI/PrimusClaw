@@ -614,7 +614,7 @@ export class Session {
         started();
         this.audit("prompt_refused", { reason: refused.reason, detail: refused.detail.slice(0, 300) });
         this.rejectCommand("prompt", cmdId, refused.reason);
-        this.emit("turn_end", { stopReason: "error", error: refused.reason });
+        this.emit("turn_end", { stopReason: "error", error: refused.reason, cmd_id: cmdId });
         return;
       }
     }
@@ -622,7 +622,7 @@ export class Session {
       await this.ensureAdapter();
     } catch (e) {
       started();
-      this.emit("turn_end", { stopReason: "error", error: e instanceof SessionRefusal ? e.reason : "adapter_unavailable" });
+      this.emit("turn_end", { stopReason: "error", error: e instanceof SessionRefusal ? e.reason : "adapter_unavailable", cmd_id: cmdId });
       return this.refuse(e);
     }
     const a = this.adapter!;
@@ -634,10 +634,10 @@ export class Session {
       started();
       const res = await reply;
       const usage = isObject(res.usage) ? res.usage : undefined;
-      this.emit("turn_end", { stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}) });
+      this.emit("turn_end", { stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}), cmd_id: cmdId });
     } catch (e) {
       this.audit("turn_failed", { error: errMessage(e) });
-      this.emit("turn_end", { stopReason: "error", error: errMessage(e).slice(0, 300) });
+      this.emit("turn_end", { stopReason: "error", error: errMessage(e).slice(0, 300), cmd_id: cmdId });
     } finally {
       // At once, before the look at who holds the conversation open: the test below it for a terminal that writes
       // next is the size, and it must start from the turn's end, not from a moment later.
@@ -716,16 +716,22 @@ export class Session {
     this.touch();
   }
 
-  /** `cancel`: stop the turn, drop what was queued, answer every waiting permission request `cancelled`. */
+  /**
+   * `cancel`: stop the turn, drop what was queued, answer every waiting permission request `cancelled`. Each prompt dropped
+   * unrun is refused by name (`command_rejected`, reason `cancelled`): it never gets a `turn_end` of its own.
+   */
   async cancel(): Promise<void> {
-    const queued = this.queue.length;
+    const dropped = this.queue.map((q) => q.cmdId);
+    const queued = dropped.length;
     this.dropQueued();
+    for (const cmdId of dropped) this.rejectCommand("prompt", cmdId, "cancelled");
     const wasRunning = this.turnRunning;
     if (wasRunning && this.adapter && this.acpId) await this.adapter.notify("session/cancel", { sessionId: this.acpId }).catch(() => undefined);
     for (const actionId of this.book.cancelAll()) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "cancel" });
     this.audit("cancelled", { turn_running: wasRunning, queued_dropped: queued });
-    // A running turn ends with its own `turn_end` (stopReason cancelled). With none running, say so once.
-    if (!wasRunning) this.emit("turn_end", { stopReason: "cancelled" });
+    // A running turn ends with its own `turn_end` (stopReason cancelled, naming its prompt). With none running, say so once,
+    // naming no prompt: it ended none.
+    if (!wasRunning) this.emit("turn_end", { stopReason: "cancelled", cmd_id: null });
   }
 
   // --- ending ----------------------------------------------------------------------------
