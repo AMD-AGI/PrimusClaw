@@ -437,15 +437,22 @@ const DENIED_SYSTEMS: ReadonlyArray<[RegExp, (c: ToolCall) => boolean]> = [
 ];
 
 /**
- * Whether a shell command itself went to GitHub: one of its commands (split at `;`, `&&`, `||`, `|` and new lines) runs `gh` or
- * `git`, or fetches a github.com address with curl or wget. Text that only mentions them (`echo git status`) does not count.
+ * Whether a shell command itself went to GitHub: one of its commands (split at `;`, `&&`, `||`, `|` and new lines) runs `gh`, a
+ * `git` subcommand that talks to a remote (clone, fetch, pull, push, ls-remote, submodule), or fetches a github.com address with
+ * curl or wget. A local `git status` and text that only mentions them (`echo git status`) do not count.
  */
 export function shellReachesGithub(command: string): boolean {
   return command.split(/;|&&|\|\||\||\n/).some((part) => {
     const words = part.trim().split(/\s+/).filter(Boolean);
     while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!) || ["sudo", "env", "time", "command", "exec", "("].includes(words[0]!))) words.shift();
     const program = (words[0] ?? "").replace(/^\(+/, "").split("/").pop() ?? "";
-    if (program === "gh" || program === "git") return true;
+    if (program === "gh") return true;
+    if (program === "git") {
+      // The subcommand, past git's own options (`-C dir`, `-c k=v`, `--no-pager`).
+      const rest = words.slice(1);
+      while (rest.length && rest[0]!.startsWith("-")) rest.splice(0, ["-C", "-c"].includes(rest[0]!) ? 2 : 1);
+      return ["clone", "fetch", "pull", "push", "ls-remote", "submodule"].includes(rest[0] ?? "");
+    }
     return (program === "curl" || program === "wget") && words.some((w) => /(^|[/"'@])(api\.)?github\.com([/:"']|$)/i.test(w));
   });
 }

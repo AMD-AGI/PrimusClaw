@@ -416,7 +416,9 @@ test("S16 no false denial of a capability", () => {
   assert.ok(!denied("我无法访问 GitHub。", [bash("cd repo && git fetch origin")]));
   assert.ok(!denied("I can't access GitHub.", [bash("GH_TOKEN=x /usr/bin/gh api user")]));
   assert.ok(!denied("I can't access GitHub.", [bash("curl -sf https://api.github.com/repos/o/r")]));
-  for (const cmd of ["echo git status; false", "printf 'gh pr list'", "grep -r github.com docs", "cat .gitignore"]) {
+  assert.ok(!denied("I can't access GitHub.", [bash("git -C repo push origin HEAD")]));
+  for (const cmd of ["echo git status; false", "printf 'gh pr list'", "grep -r github.com docs", "cat .gitignore", "git status", "git -C repo log -1",
+    "cd /tmp && git diff"]) {
     assert.ok(denied("I can't access GitHub.", [bash(cmd)]), cmd);
   }
   // Every denial is checked, and a sentence that names two systems needs a failed call to each.
