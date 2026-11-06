@@ -35,7 +35,7 @@ import { rerunOnFallback } from "../assistant/model-fallback.js";
 import { a2aPushEnabled } from "../routes/a2a-flags.js";
 import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
 import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
-import { holdForPerson, QUESTION_TOOL, releaseHold } from "../assistant/holds.js";
+import { holdForPerson, QUESTION_TOOL, releaseHold, releaseRunHolds } from "../assistant/holds.js";
 import {
   markChatRunRunning, closeChatRun, gateNamesEndedTurnSql, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
@@ -873,6 +873,7 @@ export const completionPorts = {
   enqueueEvolutionJob,
   recordRunFinished,
   recordWorkerTurnEnd,
+  releaseRunHolds,
   deliverUnsaidAnswer,
   rerunOnFallback,
 };
@@ -1251,6 +1252,17 @@ async function handleComplete(
       }) === "rerun";
     } catch (err) {
       logger.error({ err, sessionId }, "assistant.model_fallback_failed");
+    }
+  }
+
+  // 8b. A request an item's worker was still waiting on when its run ended is over with the run: an aborted wait sends no
+  //     decision (`assistant/holds.ts`). Before 9, so the turn's end reads the release as the run's last word. Best-effort:
+  //     the assistant sweep releases what this misses.
+  if (CLAW_ASSISTANT_ENABLED && endedRunIds.length) {
+    try {
+      await completionPorts.releaseRunHolds(sessionId, endedRunIds);
+    } catch (err) {
+      logger.error({ err, sessionId }, "assistant.run_hold_release_failed");
     }
   }
 

@@ -80,7 +80,7 @@ export interface EvalCase {
 }
 
 /**
- * A request the case's item holds for its person (`params.hold` of the item, `assistant/holds.ts`): which tool, and how the
+ * A request the case's item holds for its person (an entry of the item's `params.holds`, `assistant/holds.ts`): which tool, and how the
  * runner answers it, through the routes a channel answers with (`POST /v1/sessions/<worker>/messages`, a `decision` or an
  * `answer`). `wait_s` leaves it waiting that long first, to show the wait outlasts the minutes a console user gets.
  * `answers` maps a question id to the answer; `*` as the id answers every question with its first option.

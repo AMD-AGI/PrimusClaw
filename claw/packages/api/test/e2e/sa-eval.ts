@@ -330,7 +330,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
 }
 
 /**
- * Wait for one of the case's items to hold a request `spec` names for its person (`params.hold`), then answer it as the person's
+ * Wait for one of the case's items to hold a request `spec` names for its person (`params.holds`), then answer it as the person's
  * channel does: a `decision` or an `answer` on the worker's session, after `wait_s`. What is seen is graded (`grade`, `hold`).
  * Gives up when every item has gone on without such a request, or at the deadline.
  */
@@ -345,12 +345,13 @@ async function answerHold(spec: HoldSpec, items: readonly ItemSeen[], deadline: 
     let open = false;
     for (const i of items) {
       const d = await look(i.item_id);
-      const h = d?.params?.hold;
-      if (d && h && typeof h.tool_use_id === "string" && want.test(String(h.tool))) {
+      const waiting: any[] = Array.isArray(d?.params?.holds) ? d.params.holds : [];
+      const h = waiting.find((x) => typeof x?.tool_use_id === "string" && want.test(String(x.tool)));
+      if (d && h) {
         const held = (d.events ?? []).find((e: any) => e.source === "hold" && e.kind === "waiting" && e.result?.tool_use_id === h.tool_use_id);
         return { itemId: i.item_id, sid: String(d.worker_session_id), toolUseId: h.tool_use_id as string, tool: String(h.tool), heldAt: held ? Date.parse(held.created_at) : Date.now() };
       }
-      if (!d || d.board_state === "in_progress" || d.params?.hold) open = true;
+      if (!d || d.board_state === "in_progress" || waiting.length) open = true;
     }
     return open ? undefined : null;
   }, deadline, 1_000);
@@ -362,7 +363,8 @@ async function answerHold(spec: HoldSpec, items: readonly ItemSeen[], deadline: 
   if (spec.wait_s) {
     await sleep(spec.wait_s * 1000);
     const d = await look(found.itemId);
-    seen.heldAfterWait = d?.board_state === "needs_you" && d?.params?.hold?.tool_use_id === found.toolUseId;
+    seen.heldAfterWait = d?.board_state === "needs_you"
+      && (Array.isArray(d?.params?.holds) ? d.params.holds : []).some((x: any) => x?.tool_use_id === found.toolUseId);
   }
   const body = spec.decide === "answer"
     ? { messageType: "answer", extData: { tool_use_id: found.toolUseId, answers: holdAnswers(spec, request?.questions), skipped: [] } }

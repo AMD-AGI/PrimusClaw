@@ -42,7 +42,10 @@ record it.
   the questions, to each subscription that lists the type and the new `assistant_item` source (not in the default set; the
   subscription routes accept it). With no such subscription the item's needs-you message goes at once, not after the silent sweep's
   wait, and a request a channel took counts as that message, so the sweep does not repeat it. The decision, the answer, or the end
-  of the wait (`decisionResult`, the question's result) puts the item back in progress. The router's turn is shown what waits
+  of the wait (`decisionResult`, the question's result) puts the item back in progress, as does the end of the run that waited (an
+  aborted wait sends no decision; the assistant sweep releases one whose run ended unseen). A worker's sub-agents can wait at once:
+  the item records each request (`params.holds`) and goes back to work only when the last is over, and a request whose end arrived
+  first holds nothing. The router's turn is shown what waits
   ("Waiting for you in work items"), which only the person answers. Worker turns carry the new `ExecuteRequest.decision_wait_ms`
   (`CLAW_ASSISTANT_DECISION_WAIT_SEC`, default 3600, 0 keeps Brain's settings), which Brain uses for that run's approval and
   question waits and announces as their `timeout_ms`. Before, nobody was told and the item said "in progress" until Brain refused the

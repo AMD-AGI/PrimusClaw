@@ -17,14 +17,19 @@
  *     takes an answer;
  *   - when no subscription takes it (a channel that cannot draw it yet), the item's needs-you message is sent at once
  *     instead of after the silent sweep's wait, so the person still hears of it within seconds;
- *   - when the decision, the answer or the end of the wait comes back from Brain, the item goes back to in progress.
+ *   - when the decision, the answer or the end of the wait comes back from Brain, or the run that waited ends without one
+ *     (an aborted wait sends no decision), the item goes back to in progress.
  *
  * How long Brain waits is the run's `decision_wait_ms` (`CLAW_ASSISTANT_DECISION_WAIT_SEC`, set on every worker turn in
  * `role-profile.ts`), not the few minutes a person at the console needs.
  *
- * What the item records of the wait is `params.hold`: which request (`tool_use_id`), what kind, and the attention it opened.
- * A hold whose attention is not the item's current one is over (the worker reported since, or the item was reopened), and
- * nothing reads it. Only a task item is held this way: a review's state is read off what it did (`review-items.ts`).
+ * What the item records of the wait is `params.holds`, one entry per request: which request (`tool_use_id`), what kind, the
+ * run that waits on it, and the attention it is current under. A worker's sub-agents run side by side and share its
+ * approvals, so more than one request can wait at once: each new one moves the attention on and carries the ones still
+ * waiting with it, and the item goes back to in progress only when none is left. A hold is current only while the item
+ * needs the user under the attention the hold carries; once the worker reported since (a new attention) or the item was
+ * sent back to work (no longer needs_you), the hold is over and nothing reads it. Only a task item is held this way: a
+ * review's state is read off what it did (`review-items.ts`).
  */
 import pino from "pino";
 import { CLAW_NOTIFICATIONS_ENABLED, NOTIFY_LINK_BASE } from "../config.js";
@@ -53,17 +58,40 @@ const PENDING_MAX = 300;
 
 export type HoldKind = "approval" | "question";
 
-/** What `params.hold` records. */
+/** One entry of `params.holds`. */
 export interface Hold {
   tool_use_id: string;
   kind: HoldKind;
   tool: string;
   /** What is asked, as the person is shown it (the call's target, or the first question). */
   target: string;
-  /** The item's `attention_seq` the hold opened: a hold is current only while the item's is the same. */
+  /** The item's `attention_seq` the hold is current under: only while the item's is the same and the item needs the user. */
   attention_seq: number;
   expires_at: string;
+  /** The run (`claw_tasks.task_id`) whose turn waits on it, or null when that could not be told: its end ends the wait. */
+  run_id: string | null;
 }
+
+/** The entries of `params.holds`, whatever else is there. */
+function holdsOf(params: Record<string, unknown> | null | undefined): Hold[] {
+  const raw = params?.holds;
+  return Array.isArray(raw)
+    ? raw.filter((h): h is Hold => !!h && typeof h === "object" && typeof (h as Hold).tool_use_id === "string")
+    : [];
+}
+
+/** The holds the item waits on now: under its attention, while it needs the user. */
+function currentHolds(item: { board_state: string; attention_seq: number; params: Record<string, unknown> | null }): Hold[] {
+  if (item.board_state !== "needs_you") return [];
+  return holdsOf(item.params).filter((h) => Number(h.attention_seq) === Number(item.attention_seq));
+}
+
+/**
+ * SQL: the entries of `params.holds` of the item `w` while it needs the user, as rows (`jsonb_array_elements`); none otherwise.
+ * The attention test (`currentHolds`) is the caller's, beside it.
+ */
+const HOLDS_WHILE_NEEDED = (w: string) => `jsonb_array_elements(CASE WHEN ${w}.board_state = 'needs_you' AND jsonb_typeof(${w}.params->'holds') = 'array'
+  THEN ${w}.params->'holds' ELSE '[]'::jsonb END)`;
 
 /** What a request from Brain is, when it is one a person answers: null for any other event. */
 function requestOf(event: Record<string, unknown>): { toolUseId: string; kind: HoldKind; tool: string } | null {
@@ -94,6 +122,30 @@ function endedRequest(event: Record<string, unknown>): { toolUseId: string; how:
     return toolUseId ? { toolUseId, how: event.status === "success" ? "answered" : "not answered" } : null;
   }
   return null;
+}
+
+/** Whether the event store has the end of this request on this session (what `endedRequest` reads as one). */
+async function endWasSeen(q: Querier, sessionId: string, toolUseId: string): Promise<boolean> {
+  const found = await q(
+    `SELECT 1 FROM claw_session_events
+      WHERE session_id = $1 AND deleted_at IS NULL
+        AND ((event = 'decisionResult' AND $2 IN (btrim(data->>'tool_use_id'), btrim(data->>'actionId')))
+          OR (event = 'toolUsed' AND data->>'tool' = $3 AND btrim(data->>'actionId') = $2
+              AND COALESCE(data->>'status', '') <> 'start'))
+      LIMIT 1`,
+    [sessionId, toolUseId, QUESTION_TOOL],
+  );
+  return (found.rowCount ?? 0) > 0;
+}
+
+/** The run a request of this session was made in: Brain stamps every event with its turn's message id. Null when unknown. */
+async function runOf(q: Querier, sessionId: string, messageId: unknown): Promise<string | null> {
+  if (typeof messageId !== "string" || !messageId.trim()) return null;
+  const row = (await q(
+    `SELECT task_id FROM claw_tasks WHERE session_id = $1 AND metadata->>'message_id' = $2 ORDER BY created_at DESC LIMIT 1`,
+    [sessionId, messageId.trim()],
+  )).rows[0] as { task_id: string } | undefined;
+  return row?.task_id ?? null;
 }
 
 const clip = (text: string, max: number): string => {
@@ -175,6 +227,9 @@ export async function holdForPerson(
     );
     if (seen.rowCount) return "held";
     if (item.board_state === "done") return "too_late";
+    // Its end got here first: a request whose recording failed and came back after it was answered, or one another replica
+    // took its time over. The event store has every event before it is acted on (`consumer.ts`), so the end is there.
+    if (await endWasSeen(q, input.sessionId, request.toolUseId)) return "too_late";
     const clock = now();
     const window = waitWindow(input.event, clock);
     if (window.expiresAt <= clock) return "too_late";
@@ -188,18 +243,21 @@ export async function holdForPerson(
     const recorded: Hold = {
       tool_use_id: request.toolUseId.slice(0, 200), kind: request.kind, tool: request.tool.slice(0, 200), target,
       attention_seq: attention, expires_at: new Date(window.expiresAt).toISOString(),
+      run_id: await runOf(q, input.sessionId, input.event.message_id),
     };
+    // Another request still waiting (a sub-agent beside this one asked too) waits on under the new attention: it is not over.
+    const holds = [...currentHolds(item).map((h) => ({ ...h, attention_seq: attention })), recorded];
     await q(
       `UPDATE claw_work_items
           SET board_state = 'needs_you', last_report_kind = 'waiting', pending_question = $2,
-              attention_seq = $3, params = params || jsonb_build_object('hold', $4::jsonb), updated_at = NOW()
+              attention_seq = $3, params = (params - 'hold') || jsonb_build_object('holds', $4::jsonb), updated_at = NOW()
         WHERE item_id = $1`,
-      [item.item_id, question, attention, JSON.stringify(recorded)],
+      [item.item_id, question, attention, JSON.stringify(holds)],
     );
     await q(
-      `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary, question, result)
-       VALUES ($1, 'waiting', 'hold', $2, $3, $3, jsonb_build_object('tool_use_id', $4::text))`,
-      [item.item_id, item.generation, question, recorded.tool_use_id],
+      `INSERT INTO claw_work_item_events (item_id, kind, source, generation, run_id, summary, question, result)
+       VALUES ($1, 'waiting', 'hold', $2, $3, $4, $4, jsonb_build_object('tool_use_id', $5::text))`,
+      [item.item_id, item.generation, recorded.run_id, question, recorded.tool_use_id],
     );
     const subscribers = CLAW_NOTIFICATIONS_ENABLED
       ? await announce(q, item, input.sessionId, request, recorded, questions, window.startedAt, input.event)
@@ -256,36 +314,116 @@ async function announce(
 
 /**
  * Brain stopped waiting on a request (`decisionResult`; an `ask_user_question` that returned): the item that held it goes back
- * to in progress, if the hold is still its current need. Returns whether the item moved. A request no item holds changes nothing.
+ * to in progress, if the hold was its current need and none is left waiting. Returns whether the item moved. A request no
+ * item holds changes nothing.
  */
 export async function releaseHold(input: { sessionId: string; event: Record<string, unknown> }): Promise<boolean> {
   const ended = endedRequest(input.event);
   if (!ended) return false;
-  return inTransaction(async (q) => {
-    const moved = (await q(
-      `UPDATE claw_work_items
-          SET board_state = 'in_progress', last_report_kind = 'progress', pending_question = NULL,
-              params = params - 'hold', updated_at = NOW()
-        WHERE worker_session_id = $1 AND board_state = 'needs_you'
-          AND params->'hold'->>'tool_use_id' = $2 AND (params->'hold'->>'attention_seq')::int = attention_seq
-    RETURNING item_id, generation`,
-      [input.sessionId, ended.toolUseId],
-    )).rows[0] as { item_id: string; generation: number } | undefined;
-    if (!moved) {
-      // Over already (the worker reported since, the item was reopened or closed): only the record of it goes.
-      await q(
-        "UPDATE claw_work_items SET params = params - 'hold' WHERE worker_session_id = $1 AND params->'hold'->>'tool_use_id' = $2",
-        [input.sessionId, ended.toolUseId],
-      );
-      return false;
+  return inTransaction((q) => endHolds(q, input.sessionId, (h) => h.tool_use_id === ended.toolUseId, ended.how));
+}
+
+/** What the item records when a run ended with a request of it still held: Brain waits on nothing of a run that is over. */
+export const RUN_ENDED_HOW = "the run ended before an answer";
+
+/**
+ * A worker's run ended (its completion, or the sweep for one whose completion never came): whatever of it the item still held
+ * is over, since an aborted or lost wait sends no decision. A hold whose run could not be told is ended by any run's end of the
+ * session: a worker session runs one turn at a time. Returns whether the item moved.
+ */
+export async function releaseRunHolds(sessionId: string, runIds: readonly string[]): Promise<boolean> {
+  if (!runIds.length) return false;
+  return inTransaction((q) => endHolds(q, sessionId, (h) => h.run_id === null || runIds.includes(h.run_id), RUN_ENDED_HOW));
+}
+
+/** A run whose completion the completion handler had: this long after it ended, a hold of it the handler left is the sweep's. */
+const RUN_HOLD_GRACE_SECONDS = 60;
+const RUN_HOLD_BATCH = 20;
+
+/**
+ * The sweep's half of `releaseRunHolds`: items that need the user for a request whose run is over and was not seen to end (Brain
+ * died while it waited). Every row it selects loses those holds, so none is selected again. Returns how many items moved.
+ */
+export async function releaseHoldsOfEndedRuns(): Promise<number> {
+  let rows: Array<{ worker_session_id: string; task_id: string }>;
+  try {
+    rows = (await db.query(
+      `SELECT DISTINCT w.worker_session_id, t.task_id
+         FROM claw_work_items w
+        CROSS JOIN LATERAL ${HOLDS_WHILE_NEEDED("w")} AS h(value)
+         JOIN claw_tasks t ON t.task_id = h.value->>'run_id' AND t.session_id = w.worker_session_id
+        WHERE w.board_state = 'needs_you' AND w.kind = 'task'
+          AND t.status IN ('completed', 'failed', 'cancelled')
+          AND t.completed_at < NOW() - make_interval(secs => $1::int)
+        LIMIT $2`,
+      [RUN_HOLD_GRACE_SECONDS, RUN_HOLD_BATCH],
+    )).rows as Array<{ worker_session_id: string; task_id: string }>;
+  } catch (err) {
+    // Not allowed to stop the rest of the sweep: the next tick asks again.
+    logger.warn({ err }, "assistant.run_hold_sweep_failed");
+    return 0;
+  }
+  let moved = 0;
+  for (const r of rows) {
+    try {
+      if (await releaseRunHolds(r.worker_session_id, [r.task_id])) moved += 1;
+    } catch (err) {
+      logger.warn({ err, sessionId: r.worker_session_id, runId: r.task_id }, "assistant.run_hold_release_failed");
     }
+  }
+  if (moved) logger.warn({ moved }, "assistant.released_holds_of_ended_runs");
+  return moved;
+}
+
+/**
+ * End the holds `ending` picks, under the item's row lock. When one of them was the item's current need and none of its current
+ * holds is left, the item goes back to in progress, with an event of the run that waited (so the run's end, `turn-end.ts`, reads
+ * the release as its last word and records what the run did after it). When another is still waiting, the item stays with the
+ * user, for that one. A hold that was over already is only dropped from the record.
+ */
+async function endHolds(q: Querier, sessionId: string, ending: (h: Hold) => boolean, how: string): Promise<boolean> {
+  const item = (await q(
+    `SELECT item_id, generation, board_state, attention_seq, params FROM claw_work_items WHERE worker_session_id = $1 FOR UPDATE`,
+    [sessionId],
+  )).rows[0] as Pick<ItemRow, "item_id" | "generation" | "board_state" | "attention_seq" | "params"> | undefined;
+  if (!item) return false;
+  const all = holdsOf(item.params);
+  const ended = all.filter(ending);
+  if (!ended.length) return false;
+  const current = currentHolds(item);
+  const endedNow = current.filter(ending);
+  const left = current.filter((h) => !ending(h));
+  const record = left.length
+    ? "(params - 'hold') || jsonb_build_object('holds', $2::jsonb)"
+    : "params - 'hold' - 'holds'";
+  if (!endedNow.length) {
+    // Over already (the worker reported since, the item was sent back to work or closed): only the record of it goes.
+    await q(`UPDATE claw_work_items SET params = ${record} WHERE item_id = $1`, left.length ? [item.item_id, JSON.stringify(left)] : [item.item_id]);
+    return false;
+  }
+  const event = (summary: string, runId: string | null, toolUseId: string) => q(
+    `INSERT INTO claw_work_item_events (item_id, kind, source, generation, run_id, summary, result)
+     VALUES ($1, 'progress', 'hold', $2, $3, $4, jsonb_build_object('tool_use_id', $5::text))`,
+    [item.item_id, item.generation, runId, summary, toolUseId],
+  );
+  if (left.length) {
+    // Another request of the worker's still waits: the item needs the user for that one, and says which.
+    const next = left[left.length - 1]!;
     await q(
-      `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary, result)
-       VALUES ($1, 'progress', 'hold', $2, $3, jsonb_build_object('tool_use_id', $4::text))`,
-      [moved.item_id, moved.generation, ended.how, ended.toolUseId],
+      `UPDATE claw_work_items SET pending_question = $3, params = ${record}, updated_at = NOW() WHERE item_id = $1`,
+      [item.item_id, JSON.stringify(left), pendingText(next.kind, next.target)],
     );
-    return true;
-  });
+    for (const h of endedNow) await event(how, h.run_id, h.tool_use_id);
+    return false;
+  }
+  await q(
+    `UPDATE claw_work_items
+        SET board_state = 'in_progress', last_report_kind = 'progress', pending_question = NULL, params = ${record}, updated_at = NOW()
+      WHERE item_id = $1`,
+    [item.item_id],
+  );
+  for (const h of endedNow) await event(how, h.run_id, h.tool_use_id);
+  return true;
 }
 
 /**
@@ -298,9 +436,10 @@ export function registerHoldDeliveryHook(): void {
     const p = payload as NotificationPayload;
     if (p.source !== HOLD_SOURCE || !p.item?.item_id || !p.approval?.tool_use_id) return;
     const item = (await db.query(
-      `SELECT user_id, attention_seq, pending_question FROM claw_work_items
-        WHERE item_id = $1 AND board_state = 'needs_you' AND params->'hold'->>'tool_use_id' = $2
-          AND (params->'hold'->>'attention_seq')::int = attention_seq`,
+      `SELECT w.user_id, w.attention_seq, w.pending_question FROM claw_work_items w
+        WHERE w.item_id = $1
+          AND EXISTS (SELECT 1 FROM ${HOLDS_WHILE_NEEDED("w")} AS h(value)
+                       WHERE h.value->>'tool_use_id' = $2 AND (h.value->>'attention_seq')::int = w.attention_seq)`,
       [p.item.item_id, p.approval.tool_use_id],
     )).rows[0] as { user_id: string; attention_seq: number; pending_question: string | null } | undefined;
     if (!item) return;
@@ -324,16 +463,18 @@ export interface HeldLine {
 }
 
 /**
- * Every request the user's items hold for them now (`params.hold` of the item's current need, its wait not over), oldest item
- * first. A wait that is over is Brain's refusal, which the worker goes on from: nobody can answer it any more.
+ * Every request the user's items hold for them now (`params.holds` of the item's current need, its wait not over), oldest item
+ * first and, within an item, in the order asked. A wait that is over is Brain's refusal, which the worker goes on from: nobody
+ * can answer it any more.
  */
 export async function heldForPersonManifest(userId: string): Promise<HeldLine[]> {
   const rows = (await db.query(
-    `SELECT item_id, seq, title, params->'hold' AS hold FROM claw_work_items
-      WHERE user_id = $1 AND board_state = 'needs_you' AND kind = 'task' AND params ? 'hold'
-        AND (params->'hold'->>'attention_seq')::int = attention_seq
-        AND (params->'hold'->>'expires_at')::timestamptz > NOW()
-      ORDER BY seq`,
+    `SELECT w.item_id, w.seq, w.title, h.value AS hold FROM claw_work_items w
+      CROSS JOIN LATERAL ${HOLDS_WHILE_NEEDED("w")} WITH ORDINALITY AS h(value, n)
+      WHERE w.user_id = $1 AND w.board_state = 'needs_you' AND w.kind = 'task'
+        AND (h.value->>'attention_seq')::int = w.attention_seq
+        AND (h.value->>'expires_at')::timestamptz > NOW()
+      ORDER BY w.seq, h.n`,
     [userId],
   )).rows as Array<{ item_id: string; seq: number; title: string; hold: Hold }>;
   return rows.map((r) => ({ itemId: r.item_id, seq: Number(r.seq), title: r.title, hold: r.hold }));

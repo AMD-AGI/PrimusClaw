@@ -18,6 +18,12 @@
  *   HD7  the router is shown what waits, and a worker turn waits CLAW_ASSISTANT_DECISION_WAIT_SEC for its person
  *   HD8  nothing for a closed item, a request whose wait is over, a review item, or a session that is no item's
  *   HD9  the subscription route takes the assistant_item source, and does not put it in the default set
+ *   HD10 two requests at once (a worker's sub-agents run side by side): each waits until its own end, the item until the last
+ *   HD11 a request whose end got here first (a redelivery, another replica) does not hold the item or send a card
+ *   HD12 a run that ends while it waits (an abort sends no decision) takes its holds with it, and only its own; the
+ *        interrupted run is then the sweep's to say, as any interrupted turn is
+ *   HD13 the sweep releases a hold whose run ended unseen, after the grace and once, in the same tick that records the run
+ *   HD14 a run that told the user something, then waited and went on, has its end recorded: the release is its last word
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -116,8 +122,9 @@ describe("assistant holds", { skip }, () => {
     assert.equal(row.attention_seq, 1);
     assert.match(row.pending_question, /^Approve or deny: mcp__safe__workload_stop .*workload_id=sa-eval-fixture-sleep/);
     assert.equal(row.pending_question.includes("ghp_abcdefghijklmnop"), false, "a credential in the call is masked");
-    assert.equal(row.params.hold.tool_use_id, "tu-1");
-    assert.equal(row.params.hold.attention_seq, 1);
+    assert.equal(row.params.holds.length, 1);
+    assert.equal(row.params.holds[0].tool_use_id, "tu-1");
+    assert.equal(row.params.holds[0].attention_seq, 1);
     const last = (await w.itemEvents(item.itemId)).at(-1)!;
     assert.deepEqual({ kind: last.kind, source: last.source }, { kind: "waiting", source: "hold" });
 
@@ -147,7 +154,7 @@ describe("assistant holds", { skip }, () => {
     const row = await w.item(item.itemId);
     assert.equal(row.board_state, "needs_you");
     assert.match(row.pending_question, /^Question for you: Which cluster\?/);
-    assert.equal(row.params.hold.kind, "question");
+    assert.equal(row.params.holds[0].kind, "question");
     const [{ payload: p }] = await outbox();
     assert.equal(p.approval.tool, "ask_user_question");
     assert.equal(p.approval.tool_use_id, "tu-q");
@@ -187,7 +194,7 @@ describe("assistant holds", { skip }, () => {
     let row = await w.item(item.itemId);
     assert.equal(row.board_state, "in_progress");
     assert.equal(row.pending_question, null);
-    assert.equal(row.params.hold, undefined);
+    assert.equal(row.params.holds, undefined);
     assert.equal((await w.itemEvents(item.itemId)).at(-1)!.summary, "approved");
 
     await deliver(item.workerSid, asked());
@@ -227,7 +234,7 @@ describe("assistant holds", { skip }, () => {
     const other = await workingItem("Wait runs out");
     await deliver(other.workerSid, held({ actionId: "tu-5", tool_use_id: "tu-5" }));
     assert.equal((await holds.heldForPersonManifest("alice")).length, 1);
-    await w.q("UPDATE claw_work_items SET params = jsonb_set(params, '{hold,expires_at}', to_jsonb((NOW() - interval '1 minute')::text)) WHERE item_id = $1", [other.itemId]);
+    await w.q("UPDATE claw_work_items SET params = jsonb_set(params, '{holds,0,expires_at}', to_jsonb((NOW() - interval '1 minute')::text)) WHERE item_id = $1", [other.itemId]);
     assert.deepEqual(await holds.heldForPersonManifest("alice"), [], "Brain has refused it: nobody can answer it any more");
   });
 
@@ -242,7 +249,7 @@ describe("assistant holds", { skip }, () => {
     const row = await w.item(item.itemId);
     assert.equal(row.board_state, "needs_you");
     assert.equal(row.last_report_kind, "ready", "the result still waits for the user");
-    assert.equal(row.params.hold, undefined, "only the record of the wait went");
+    assert.equal(row.params.holds, undefined, "only the record of the wait went");
   });
 
   test("HD5 with no channel that draws it, the item's needs-you message goes at once", async () => {
@@ -333,6 +340,150 @@ describe("assistant holds", { skip }, () => {
     }
     assert.deepEqual(seen, ["plain-1", review.workerSid], "a session's request is any session's, as before");
     assert.deepEqual(await outbox(), []);
+  });
+
+  const decided = (id: string, decision: "allow" | "deny", by = "user") =>
+    ({ type: "decisionResult", actionId: id, tool_use_id: id, decision, action: decision, by });
+  const completed = (sid: string, run: { mid: string; task_id: string }, over: Record<string, unknown> = {}) => ({
+    type: "exec_complete", session_id: sid, user_id: "alice", message_id: run.mid, task_id: run.task_id, prompt: "work",
+    final_text: "", failed: false, error_count: 0, skills_used: {}, ...over,
+  });
+  const ids = (holdList: Array<{ tool_use_id: string }> | undefined) => (holdList ?? []).map((h) => h.tool_use_id);
+
+  test("HD10 two requests at once: each waits until its own end, and the item until the last", async () => {
+    const item = await workingItem();
+    await channel();
+    await deliver(item.workerSid, held());
+    await deliver(item.workerSid, held({ actionId: "tu-2", tool_use_id: "tu-2", tool: "mcp__agent-board__issue_write", input: { title: "x" } }));
+    let row = await w.item(item.itemId);
+    assert.equal(row.attention_seq, 2);
+    assert.deepEqual(row.params.holds.map((h: { tool_use_id: string; attention_seq: number }) => [h.tool_use_id, h.attention_seq]), [["tu-1", 2], ["tu-2", 2]],
+      "the first still waits, under the new attention");
+    assert.equal((await outbox()).length, 2, "each request has its own card");
+    assert.deepEqual((await holds.heldForPersonManifest("alice")).map((l) => l.hold.tool_use_id), ["tu-1", "tu-2"]);
+
+    // The second ends first: the item still needs the user, for the first, and says so.
+    await deliver(item.workerSid, decided("tu-2", "deny"));
+    row = await w.item(item.itemId);
+    assert.equal(row.board_state, "needs_you");
+    assert.match(row.pending_question, /^Approve or deny: mcp__safe__workload_stop/);
+    assert.deepEqual(ids(row.params.holds), ["tu-1"]);
+    assert.equal(row.attention_seq, 2, "the same need, one request fewer");
+    assert.equal((await w.itemEvents(item.itemId)).at(-1)!.summary, "denied");
+    assert.deepEqual((await holds.heldForPersonManifest("alice")).map((l) => l.hold.tool_use_id), ["tu-1"]);
+
+    // The first's card taken now is still the item's current need: recorded as its needs-you message.
+    const sent: string[] = [];
+    await w.mod.outbox.deliverDue({ transport: async (req) => { sent.push(JSON.parse(req.body).approval.tool_use_id); return 200; }, resolve: PUBLIC, allowedHosts: new Set() });
+    assert.deepEqual(sent.sort(), ["tu-1", "tu-2"]);
+    const says = await w.q("SELECT item_attention_seq FROM claw_assistant_says");
+    assert.deepEqual(says.map((r) => Number(r.item_attention_seq)), [2]);
+
+    await deliver(item.workerSid, decided("tu-1", "allow"));
+    row = await w.item(item.itemId);
+    assert.equal(row.board_state, "in_progress");
+    assert.equal(row.pending_question, null);
+    assert.equal(row.params.holds, undefined);
+    assert.deepEqual(await holds.heldForPersonManifest("alice"), []);
+  });
+
+  test("HD11 a request whose end got here first does not hold the item", async () => {
+    const item = await workingItem();
+    await channel();
+    await deliver(item.workerSid, decided("tu-1", "allow"));
+    assert.deepEqual(await deliver(item.workerSid, held()), ["ack"]);
+    let row = await w.item(item.itemId);
+    assert.equal(row.board_state, "in_progress", "nobody waits on it any more");
+    assert.equal(row.params.holds, undefined);
+    assert.deepEqual(await outbox(), [], "no card for a request already answered");
+
+    // A question: its start is not its end, so it still holds; its end before the request does not.
+    await deliver(item.workerSid, { type: "toolUsed", tool: "ask_user_question", actionId: "tu-q", status: "start" });
+    await deliver(item.workerSid, asked());
+    assert.equal((await w.item(item.itemId)).board_state, "needs_you");
+    await deliver(item.workerSid, { type: "toolUsed", tool: "ask_user_question", actionId: "tu-q", status: "success" });
+    await deliver(item.workerSid, { type: "toolUsed", tool: "ask_user_question", actionId: "tu-q2", status: "success" });
+    await deliver(item.workerSid, asked({ actionId: "tu-q2" }));
+    row = await w.item(item.itemId);
+    assert.equal(row.board_state, "in_progress");
+    assert.equal((await outbox()).length, 1, "only the question that was still open");
+
+    // Another session's end of the same id is not this one's.
+    const other = await workingItem("Other");
+    await deliver(other.workerSid, held());
+    assert.equal((await w.item(other.itemId)).board_state, "needs_you");
+  });
+
+  test("HD12 a run that ends while it waits takes its holds with it, and only its own", async () => {
+    await channel();
+    const item = await w.createItem(alice, "Aborted wait");
+    const run = await w.workerTurn(item.itemId);
+    await deliver(item.workerSid, held({ message_id: run.mid }));
+    let row = await w.item(item.itemId);
+    assert.equal(row.params.holds[0].run_id, run.task_id, "the run that waits");
+    assert.equal((await w.itemEvents(item.itemId)).at(-1)!.run_id, run.task_id);
+
+    // Stopped from the console while it waited: Brain sends the run's completion and no decision.
+    assert.deepEqual(await deliver(item.workerSid, completed(item.workerSid, run, { interrupted: true })), ["ack"]);
+    row = await w.item(item.itemId);
+    assert.equal(row.board_state, "in_progress");
+    assert.equal(row.pending_question, null);
+    assert.equal(row.params.holds, undefined);
+    assert.deepEqual(await holds.heldForPersonManifest("alice"), []);
+    const last = (await w.itemEvents(item.itemId)).at(-1)!;
+    assert.deepEqual({ kind: last.kind, source: last.source, summary: last.summary, run_id: last.run_id },
+      { kind: "progress", source: "hold", summary: holds.RUN_ENDED_HOW, run_id: run.task_id });
+    // The interrupted run is the sweep's to say, as any interrupted turn is: the item does not sit in progress.
+    await w.q("UPDATE claw_tasks SET completed_at = NOW() - interval '10 minutes' WHERE task_id = $1", [run.task_id]);
+    assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), 1);
+    row = await w.item(item.itemId);
+    assert.equal(row.board_state, "needs_you");
+    assert.equal(row.last_report_kind, "failed");
+
+    // A run's end ends only what it waited on: the next run's request still waits.
+    const next = await w.createItem(alice, "Next run");
+    const first = await w.workerTurn(next.itemId);
+    await w.closeRun(first.task_id, "completed", undefined, 0);
+    const second = await w.workerTurn(next.itemId);
+    await deliver(next.workerSid, held({ actionId: "tu-n", tool_use_id: "tu-n", message_id: second.mid }));
+    assert.equal(await holds.releaseRunHolds(next.workerSid, [first.task_id]), false);
+    assert.deepEqual(ids((await w.item(next.itemId)).params.holds), ["tu-n"]);
+    assert.equal((await w.item(next.itemId)).board_state, "needs_you");
+    assert.equal(await holds.releaseRunHolds(next.workerSid, [second.task_id]), true);
+  });
+
+  test("HD13 the sweep releases a hold whose run ended unseen, after the grace and once", async () => {
+    await channel();
+    const item = await w.createItem(alice, "Brain went away");
+    const run = await w.workerTurn(item.itemId);
+    await deliver(item.workerSid, held({ message_id: run.mid }));
+    assert.equal(await holds.releaseHoldsOfEndedRuns(), 0, "a run still running keeps its hold");
+    await w.closeRun(run.task_id, "failed", "worker_lost", 5);
+    assert.equal(await holds.releaseHoldsOfEndedRuns(), 0, "within the grace it is the completion handler's");
+    await w.q("UPDATE claw_tasks SET completed_at = NOW() - interval '10 minutes' WHERE task_id = $1", [run.task_id]);
+    // One tick of the assistant sweep: the hold goes, and the run's end is recorded after it.
+    const { sweepAssistant } = await import("../src/assistant/sweep.js");
+    await sweepAssistant();
+    const row = await w.item(item.itemId);
+    assert.equal(row.params.holds, undefined);
+    assert.equal(row.board_state, "needs_you");
+    assert.equal(row.last_report_kind, "failed", "what the run did is said");
+    assert.equal(await holds.releaseHoldsOfEndedRuns(), 0, "and once");
+  });
+
+  test("HD14 a run that told the user something, then waited and went on, has its end recorded", async () => {
+    const item = await w.createItem(alice, "Asked then waited");
+    const run = await w.workerTurn(item.itemId);
+    await w.mod.reports.ingestReport({ itemId: item.itemId, workerSessionId: item.workerSid, generation: Number(run.gen), runId: run.task_id },
+      { kind: "blocked", summary: "Which cluster?", question: "Which cluster?" }, "worker");
+    await deliver(item.workerSid, held({ message_id: run.mid }));
+    await deliver(item.workerSid, decided("tu-1", "allow"));
+    assert.equal((await w.item(item.itemId)).board_state, "in_progress");
+    assert.deepEqual(await deliver(item.workerSid, completed(item.workerSid, run, { final_text: "Stopped it." })), ["ack"]);
+    const row = await w.item(item.itemId);
+    assert.equal(row.board_state, "needs_you", "the run's end is heard, not left in progress");
+    assert.equal(row.last_report_kind, "ready");
+    assert.equal(row.summary, "Stopped it.");
   });
 
   test("HD9 the subscription route takes the assistant_item source and leaves it out of the default set", async () => {

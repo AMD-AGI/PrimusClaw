@@ -254,7 +254,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     withSystemAppend(task, renderRouterPrompt({ servers: read?.servers ?? [], github: lookups.githubTools }));
     const state = [renderRouterItems(await routerManifest(role.userId), await askedOfOthersManifest(role.userId))];
     // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
-    state.push(renderHeldForPerson(await heldForPersonManifest(role.userId)));
+    const held = renderHeldForPerson(await heldForPersonManifest(role.userId));
+    if (held) state.push(held);
     if (CLAW_ASSISTANT_TOOLS) {
       withSystemAppend(task, ROUTER_REVIEW_PROMPT);
       const review = await reviewContextFor(role.userId, sessionId, messageId);
