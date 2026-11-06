@@ -39,6 +39,8 @@
  *   F13 the cap's notice whose COMMIT failed and did not take effect: it is stored and announced shortly after, once
  *   F14 the Router's say whose COMMIT failed and is not found right after, then lands: the Router is told the outcome is
  *       unknown (not to say it again), and the message is announced once it is found
+ *   F15 a worker's long answer, said whole by the system with its report, whose report COMMIT took effect and whose answer the
+ *       failover lost: the report sent again is a duplicate, and the answer is announced anyway, once
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -471,5 +473,32 @@ describe("database failover", { skip }, () => {
     const deadline = Date.now() + 8_000;
     while (!w.events.length && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
     assert.deepEqual(w.events.map((e) => e.say_id), [(row as unknown[])[0]], "announced once it was found");
+  });
+
+  test("F15 a long answer whose report COMMIT took effect and whose answer was lost: announced anyway, once", async () => {
+    const reports = await import("../src/assistant/reports.js");
+    const realDeps = reports.reportPorts.sayDeps;
+    reports.reportPorts.sayDeps = w.sayDeps;
+    try {
+      const item = await w.createItem(alice, "List the runs");
+      const answer = Array.from({ length: 40 }, (_, i) => `- run ${i + 1}: finished in ${i + 3} minutes`).join("\n");
+      assert.ok(reports.answerSentWhole("answer", answer), "an answer the system says whole");
+      const turn = await w.workerTurn(item.itemId);
+      const { out, cut } = await commitAnswerLost(() => w.mod.tools.report(turn as never, { kind: "answer", summary: answer }).then(
+        () => "recorded", (err: { code?: string }) => err.code ?? String(err)));
+      assert.equal(cut, 1, "the report's COMMIT answer was lost");
+      assert.equal(out, "57P01", "the worker hears that its report failed");
+      const stored = await w.q("SELECT say_id::text AS say_id, text FROM claw_assistant_says WHERE item_id = $1", [item.itemId]);
+      assert.equal(stored.length, 1, "the COMMIT took effect: the answer is stored for sending");
+      assert.ok(String(stored[0].text).endsWith(answer));
+      // The worker sends its report again: a duplicate of the one that landed, which announces nothing itself.
+      await w.mod.tools.report(turn as never, { kind: "answer", summary: answer });
+      const deadline = Date.now() + 8_000;
+      while (!w.events.some((e) => e.say_id === stored[0].say_id) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+      assert.equal(w.events.filter((e) => e.say_id === stored[0].say_id).length, 1, "the web client is told, once");
+      assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_says WHERE item_id = $1", [item.itemId]))[0].n, 1);
+    } finally {
+      reports.reportPorts.sayDeps = realDeps;
+    }
   });
 });

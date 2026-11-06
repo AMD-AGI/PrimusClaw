@@ -14,11 +14,11 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import pino from "pino";
-import { inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
+import { inTransaction, isFailoverError, neverCommitted, type Querier, type StatementRunner } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import { announceItemDeliveries } from "./deliveries.js";
 import { queueServerMessage, drainSessionIfIdle } from "./messages.js";
-import { storeAnswerWhole } from "./outbound.js";
+import { storeAnswerWhole, type SayDeps } from "./outbound.js";
 import { formatWorkEvent, SAY_BRIEF_CHARS } from "./prompts.js";
 import {
   applyWorkerReport, type BoardState, type ReportKind, type ReportSource, type WorkReport,
@@ -66,11 +66,6 @@ async function repeatsLastReport(query: Querier, run: ReportRun, report: WorkRep
 }
 
 /**
- * Queue the message that tells the item's owner's assistant what happened, in the caller's transaction, deduplicated on the event it is
- * about. Null when there is no assistant to tell or the message could not be queued: what happened stands, and the sweep tells the user
- * an item that needs them even if the Router cannot be woken.
- */
-/**
  * An answer longer than a usual message is said to the user whole by the system (`storeAnswerWhole`, in the report's own
  * transaction), formatted as the worker wrote it, instead of being retyped by the router into one; the router is told it was
  * sent. A short one is the router's to say.
@@ -79,6 +74,14 @@ export function answerSentWhole(kind: ReportKind, summary: string): boolean {
   return kind === "answer" && summary.length > SAY_BRIEF_CHARS;
 }
 
+/** How the answer said whole is published (`storeAnswerWhole`), behind a seam so a test can see it without a session stream. */
+export const reportPorts: { sayDeps: SayDeps } = { sayDeps: {} };
+
+/**
+ * Queue the message that tells the item's owner's assistant what happened, in the caller's transaction, deduplicated on the event it is
+ * about. Null when there is no assistant to tell or the message could not be queued: what happened stands, and the sweep tells the user
+ * an item that needs them even if the Router cannot be woken.
+ */
 export async function queueRouterWake(q: StatementRunner, e: {
   itemId: string; userId: string; eventId: number; kind: ReportKind; version: number; summary: string; question: string | null;
   /** The answer is stored for sending whole in this same transaction (`storeAnswerWhole`): the router is told so. */
@@ -119,8 +122,11 @@ export async function ingestReport(
     answer?: { announce: () => Promise<void> } | null;
   }
   let written: Written;
+  // The answer this report stored for sending, for the case the COMMIT's own answer is lost (see the catch).
+  let answerStored: { settle: () => void } | null = null;
   try {
     written = await inTransaction(async (query): Promise<Written> => {
+      answerStored = null;
       const q = { query };
       await guard?.(query);
       if (source === "worker" && await repeatsLastReport(query, run, recorded)) return { outcome: { status: "duplicate" }, wake: null };
@@ -131,7 +137,10 @@ export async function ingestReport(
       if (!applied.applied) return { outcome: { status: "stale" }, wake: null };
       // Stored for sending with the report itself, so the router below is told "sent in full" only of an answer that will be:
       // a failure to store it fails the report, which the worker sends again, rather than leaving an answer nobody says.
-      const answer = answerSentWhole(recorded.kind, recorded.summary) ? await storeAnswerWhole(query, run.itemId) : null;
+      const answer = answerSentWhole(recorded.kind, recorded.summary)
+        ? await storeAnswerWhole(query, run.itemId, reportPorts.sayDeps)
+        : null;
+      answerStored = answer;
       const wake = applied.wake
         ? await queueRouterWake(q, {
           itemId: run.itemId, userId: applied.userId, eventId: applied.eventId, kind: recorded.kind,
@@ -143,6 +152,10 @@ export async function ingestReport(
       };
     });
   } catch (err) {
+    // The COMMIT met a failover and its answer was lost: the report may have landed with the answer, and the report sent again
+    // is then a duplicate that announces nothing. The answer is looked up in the background and announced if it is there.
+    const pending = answerStored as { settle: () => void } | null;
+    if (pending && isFailoverError(err) && !neverCommitted(err)) pending.settle();
     if (source === "turn_end" && (err as { code?: string })?.code === UNIQUE_VIOLATION) {
       return { status: "duplicate" };
     }

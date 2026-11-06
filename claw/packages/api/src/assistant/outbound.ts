@@ -564,15 +564,19 @@ async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToSt
  * The answer that just closed an item, whole, in the system's words, stored in the transaction of the report that closed it
  * (`reports.ts`): the router is told it was sent in full only when it is stored for sending, never before. The same message,
  * under the same id, as the silent sweep's (`recordNeedsYouFallback`), so it is said once. Null when the item is not answered
- * or the message was stored before. `announce` after the commit.
+ * or the message was stored before. `announce` after the commit; `settle` instead when the COMMIT met a failover and its answer
+ * was lost (it may have taken effect): the message is looked up in the background and announced if it is there, as a say's is
+ * (`settleLater`), since the report sent again is then a duplicate that announces nothing.
  */
 export async function storeAnswerWhole(
   q: Querier, itemId: string, deps: SayDeps = {},
-): Promise<{ sayId: string; announce: () => Promise<void> } | null> {
+): Promise<{ sayId: string; announce: () => Promise<void>; settle: () => void } | null> {
   const m = await needsYouMessage(q, itemId);
   if (!m || m.item.board_state !== "done") return null;
   const stored = await store(q, m);
-  return stored ? { sayId: stored.sayId, announce: () => announce(stored, deps) } : null;
+  return stored
+    ? { sayId: stored.sayId, announce: () => announce(stored, deps), settle: () => settleLater(m, (late) => announce(late, deps)) }
+    : null;
 }
 
 /**
