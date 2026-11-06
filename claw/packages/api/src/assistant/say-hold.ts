@@ -46,3 +46,17 @@ export async function releaseHeldSays(q: Querier, messageId: string): Promise<nu
   );
   return r.rowCount ?? 0;
 }
+
+/**
+ * Whether the turn that began at `since` has had an item's start told to the user in the system's words (`announceStarted` in
+ * `tools.ts`: "已开始：#N 标题。…" / "Started #N title. …", a system notice about the item). Its router then says nothing more in that
+ * turn: the gate found a second message ("任务已建好…") beside that notice every time (2026-11-06).
+ */
+export async function turnAnnouncedStart(q: Querier, userId: string, since: Date | string): Promise<boolean> {
+  return (await q(
+    `SELECT 1 FROM claw_assistant_says
+      WHERE user_id = $1 AND fallback AND item_id IS NOT NULL AND created_at >= $2
+        AND (text LIKE '已开始：#%' OR text LIKE 'Started #%') LIMIT 1`,
+    [userId, since],
+  )).rows.length > 0;
+}

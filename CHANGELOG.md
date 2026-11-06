@@ -28,6 +28,9 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Three GitHub writes, each held for the user's decision like every write of the `github` server: `checks_rerun_failed` (run
+  again the failed jobs of a GitHub Actions workflow run; `checks_list` now gives a job's `run_id`), `pr_request_reviewers` (people
+  and teams) and `labels_set` (the whole list of an issue's or pull request's labels). None is a router read.
 - Citations for the assistant router's answers, behind `CLAW_ASSISTANT_CITATIONS` (default off). The router writes [1], [2] in its
   `say` and names each number's address in `say`'s new `sources` argument; the new `ExecuteRequest.cite` makes Brain keep the sources
   the turn's own lookups returned (`web_search` hits and what the API's GitHub server lists in its results' `_meta["claw/sources"]`:
@@ -63,6 +66,32 @@ record it.
   (`CLAW_ASSISTANT_DECISION_WAIT_SEC`, default 3600, 0 keeps Brain's settings), which Brain uses for that run's approval and
   question waits and announces as their `timeout_ms`. Before, nobody was told and the item said "in progress" until Brain refused the
   call after `HITL_DECISION_TIMEOUT_MS`. The super-agent evaluation runner answers such a request through the same routes (`hold`).
+- The assistant acts later on its own. With `CLAW_TRIGGER_TOOLS_ENABLED` (and triggers and the assistant on) the router has
+  `trigger_list`, and `trigger_create` / `trigger_cancel`, which create and cancel nothing themselves: the write is stored as a
+  confirmation (new table `claw_assistant_confirmations`, 24 hours) and put to the user as a card (`assistant.say` with
+  `confirm_write`: its id, short ref, kind and button label; the session's `AssistantSay` event now carries `confirm_write` and
+  `confirm_action` too). The user's press is `POST /v1/assistant/confirmations/:id/decision` (`allow` | `deny`), taken as a held
+  merge's answer is: from their own sign-in, or from a service listed in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` answering for them,
+  never from a key; or their whole signed-in message `批准 #<ref>` / `拒绝 #<ref>` through `confirmation_answer`. The write happens in
+  the transaction that closes the card, so one card does it once; the answer says when the trigger first runs. `GET
+  /v1/assistant/confirmations` lists open cards. A router turn proposes only while answering a message of the user's, before it has
+  read anything untrusted.
+- The user's brief: `GET /v1/assistant/brief?lang=&timezone=` puts it together without a model from their items, the pull requests
+  their items watch and what happened on them, the runs and approvals Claw notified them about and the writes waiting for them, the
+  jobs the assistant watches, and their SaFE workloads read with their own key (failed in the last day, pending over 30 minutes,
+  running). Every section is there; one that could not be read says "could not check". The router reads it with `brief` (with the
+  schedule tools; the turn no longer acts for the user afterwards). A trigger may now have `action: "brief"`
+  (new column `claw_triggers.action`, default `run`): it fires without a run, saying the brief through the owner's assistant once per
+  planned time (recorded as `delivered`; refused at creation without the assistant).
+- An item whose title or brief names pull requests in full (a link or `owner/repo#123`, at most three) watches them from the start, as
+  `work_subscribe` would (read-only), when the loop can read the user's GitHub token; `work_create` answers `watching` or
+  `not_watched` with the reason (`no_github_token` without one).
+- Job watches, behind `CLAW_ASSISTANT_JOB_EVENTS` (default off; `CLAW_ASSISTANT_JOB_POLL_SEC` 30, `CLAW_ASSISTANT_JOB_MAX_WATCHES`
+  20): the router's `job_watch` (a SaFE workload of the user's own, read with their key, or a run of theirs), `job_watch_list` and
+  `job_unwatch`.
+  A loop modelled on the GitHub events loop claims due watches, writes each change of state once (new tables
+  `claw_assistant_job_watches`, `claw_assistant_job_events`) and tells the user in their language; an ended job ends its watch, a gone
+  one says so, and one unreadable for ten minutes says so once.
 - Model choice for the assistant's items, behind `CLAW_ASSISTANT_MODEL_CHOICE` (`on` | off, default off; needs `CLAW_ASSISTANT_ENABLED`
   and a non-empty `CLAW_ASSISTANT_MODELS`, the allow-list as `name=label,...`). One function decides an item's model: the model the
   message asked for, else the payer's own review default (reviews), else their own default, else the deployment's default for the kind
@@ -565,6 +594,23 @@ record it.
   does: it is no longer held for the reviewer's confirmation whatever their mode (`fully_auto` merges, `high_risk_confirm` asks for
   high-risk writes). A request that leaves `handoff_id` out is an ordinary request again: an earlier handoff of the same pull request no
   longer holds it or makes it review-only.
+- The assistant router answers sooner, in the user's language, and names items the user can recognise (router prompt `router-v10`,
+  read section `router-read-v5`, review prompt `router-v13`). `work_create` tells the user at once that the item started, with its
+  number and title (a system message in Chinese or English, not counted against the say limit, sent with the item and the turn's
+  message id; not in another language, where the router says it, nor in a turn that handed a review to the person's channel); its
+  result says `announced`, and the router no longer repeats it. `say` also refuses an item number said without its title (`#6、#8`;
+  `bare_item_number`, naming what to write instead; a pull request's, issue's, run's or another repository's number is not an
+  item's, nor is the item the message is sent with) and a message plainly in another language than the turn's `[Reply language]`
+  (`reply_language`): an answer to a Chinese message with no Chinese character in it once the user's item titles are set aside. The
+  other way is left to the prompt: an English sentence may quote a Chinese title of anything, and a Japanese answer may be all kanji. A router turn whose model answered nothing (Brain's empty-turn failure, which is how a declined request
+  arrives) is told to the user as a request it cannot help with, not as one that did not go through. Every router turn that answers
+  the user logs `assistant.router_turn_timing` (first and final reply in ms from the message, replies, the system's own replies,
+  items started). The prompt now has the router put a one-line acknowledgement beside its first lookups, make a step's lookups at
+  once, start work a worker can find its way in (and send a request that fits an open item to it) and ask first only when a guess
+  would act on the wrong target, make every write and all sandbox work an item, use
+  work_recall for how far an item got and the memory and channel tools for what they are for, read GitHub only with its `github`
+  tools, search a research question again in other words before answering with the best candidate, answer a failed lookup from
+  another read or say it plainly (no longer by starting a work item), and never give the system's own failures as an answer.
 - An assistant's worker turn starts opening its sandbox when the turn starts, beside its first model call, instead of on its
   first tool call: the API marks worker turns with the new `ExecuteRequest.sandbox_prestart`, and Brain honours it behind
   `BRAIN_SANDBOX_PRESTART` (chart `brain.sandboxPrestart`, default on) for a run that opens its sandbox lazily and whose tool list
@@ -785,6 +831,15 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- The GitHub list reads (`issue_search`, `pr_list`, `issue_list`, `repo_list`, `code_search`) answer the whole list a question
+  asks for: `{ total_count, shown, complete, next_page?, items }`, pages of 50 by default (up to 100), and an answer of at most
+  `GITHUB_LIST_MAX_CHARS` that Brain keeps whole (any other result is still cut to its head and tail at 6000 characters, which
+  is how "my 22 open pull requests" was answered with about 15). `pr_list` takes `state: merged` (only merged ones, most
+  recently merged first; "the 3 latest merged" was read in creation order and named one merged before another), orders
+  `closed` by when each closed, and takes `author`. A search narrowed with `repo:`, `org:` or `user:` that GitHub refuses
+  (422, for some fine-grained tokens) says to list the repository with `pr_list` or `issue_list` instead.
+- A tool call whose result was the tool's own error is marked `is_error: true` on its `toolUsed` result event; its `status`
+  is still `success`. A failed GitHub read was recorded as one that read something, and the evaluation counted it so.
 - An app run cancelled while its sandbox is still being created, typically by its session being deleted seconds after
   the run was submitted, no longer leaves that sandbox running until its workload timeout. The run's signal now reaches
   the sandbox ensure: no create is sent once it has fired, and the wait for a workload that exists (one whose create was

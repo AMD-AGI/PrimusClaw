@@ -18,20 +18,33 @@
  *   tools_must       tool names the last turn must each call; `*` matches anything, `a|b` either
  *   tools_must_not   tool names the last turn must not call (read-only questions list work_create)
  *   facts            [{claim, oracle: {kind: static|api|fixture, value?, query?}}]; the final answer must name the value.
- *                    An `api` oracle is a Claw API GET run with the eval identity at run time, `<path>#<pick>`, e.g.
- *                    `/v1/work-items?state=in_progress#data.length` or `/v1/me#name`; a fact without a value or a
- *                    query (or with a query that is not of that form) is for the judge only.
+ *                    An `api` oracle is read at run time with the eval identity, in one of three forms (`oracleQuery`):
+ *                      `/v1/...#<pick>`                a Claw API GET, e.g. `/v1/work-items?state=in_progress#data.length`
+ *                      `gh:/...#<pick>`                a GitHub REST GET, e.g. `gh:/search/issues?q=is:pr+author:{EVAL_GH_LOGIN}#total_count`
+ *                      `mcp:<server>/<tool>?k=v#<pick>` a read tool of the plugin's MCP server, e.g. `mcp:safe/node_get?name=n1#phase`
+ *                    A static or fixture value is a value to find in the answer (a number, a name); a description of what
+ *                    the answer should say belongs in the rubric. A fact without a value or a runnable query is graded by the
+ *                    judge, with the oracle's text as what it is checked against.
  *   cards            none | accept | confirm                            what the user may be shown to press in the last turn
  *   style            {reply_lang: follow_user, max_chars, no_ids}
  *   latency_budget_s {first, final, each}                               seconds from the last turn's sending (each: per turn)
  *   source           {kind: real|synthetic|public, hash, ref}
  *   notes            why the case exists
  * and, for this runner only (all optional): `rubric` (what a judge model grades, `EVAL_JUDGE_*`), `modes` (the modes the
- * case runs in, default both), `needs` (an environment variable whose value fills `{NAME}` in the turns; skipped
- * without it), `item_wait_s` (how long to wait for an item's result), `items_closed` (every item the case started
- * is closed when it is graded: an interrupt that stopped it), `hold` (assistant mode: the case's item holds a request
- * for its person, a write to approve or a question, and the runner answers it as the person's channel does, see
- * {@link HoldSpec}).
+ * case runs in, default both: a case that needs the assistant's own tools or items says `["assistant"]`), `needs` (one or
+ * more variables it needs besides those its text names), `item_wait_s` (how long to wait for an item's result),
+ * `items_closed` (every item the case started is closed when it is graded: an interrupt that stopped it), `blocked` (why
+ * a tool the case must call cannot be reached on its arm yet: the static check reports it instead of failing on it),
+ * `may_deny` (saying it cannot do something is a right answer here: a refusal of an unsafe request),
+ * `hold` (assistant mode: the case's item holds a request for its person, a write to approve or a question, and the
+ * runner answers it as the person's channel does, see {@link HoldSpec}).
+ *
+ * Placeholders fill turns, claims, values, oracle queries and the rubric: `{NAME}` is an environment variable, `{{name}}`
+ * (also `{{a.b}}`) a run variable from EVAL_VARS_FILE or EVAL_VAR_<NAME>. A case with a placeholder that has no value
+ * is skipped, and says which.
+ *
+ * Every case is also held to one rule (`CAPABILITY_DENIAL`, and the judge's prompt): the answer must not say it cannot reach
+ * or do something it has a tool for, unless it tried and the tool failed.
  *
  * route, tools, cards, the final answer and its latency are the LAST turn's: earlier turns are context and may start
  * items of their own. Leaks are looked for in everything the case showed, and `items_closed` covers every item.
@@ -73,9 +86,11 @@ export interface EvalCase {
   variant_of?: string;
   rubric?: string;
   modes?: Mode[];
-  needs?: string;
+  needs?: string | string[];
   item_wait_s?: number;
   items_closed?: boolean;
+  blocked?: string;
+  may_deny?: boolean;
   hold?: HoldSpec;
 }
 
@@ -223,10 +238,59 @@ export function select<T extends EvalCase & { dir?: string }>(cases: readonly T[
     && (!dirs.size || dirs.has(c.dir ?? c.pipeline)) && (variants || !c.variant_of));
 }
 
-/** The case's turns with `{NAME}` filled from `env`; null when the case needs a variable that is not set. */
-export function turnsOf(c: EvalCase, env: Record<string, string | undefined>): Turn[] | null {
-  if (c.needs && !env[c.needs]) return null;
-  return c.turns.map((t) => ({ ...t, user: t.user.replace(/\{([A-Z_]+)\}/g, (all, name: string) => env[name] ?? all) }));
+/** Where placeholders come from: environment variables (`{NAME}`) and run variables (`{{name}}`, or EVAL_VAR_<NAME>). */
+export type Vars = Readonly<Record<string, string | undefined>>;
+
+/** `{{name}}` (group 1) or `{NAME}` (group 2). A placeholder's name, as `needs` and a skip say it, is `repo` for `{{repo}}`. */
+const PLACEHOLDER = /\{\{\s*([A-Za-z][\w.-]*)\s*\}\}|\{([A-Z][A-Z0-9_]*)\}/g;
+const HAS_PLACEHOLDER = new RegExp(PLACEHOLDER.source);
+const envName = (name: string): string => `EVAL_VAR_${name.toUpperCase().replace(/[.-]/g, "_")}`;
+const valueOf = (vars: Vars, name: string, run: boolean): string | undefined => {
+  const v = run ? (vars[name] ?? vars[envName(name)]) : vars[name];
+  return v === undefined || v === "" ? undefined : v;
+};
+
+/** The placeholders a text names. */
+export function placeholdersOf(text: string): string[] {
+  return [...new Set([...text.matchAll(PLACEHOLDER)].map((m) => m[1] ?? m[2]!))];
+}
+
+/** The text with every placeholder that has a value filled; one without a value is left as written. */
+export function fill(text: string, vars: Vars): string {
+  return text.replace(PLACEHOLDER, (all, run: string | undefined, env: string | undefined) => valueOf(vars, run ?? env!, run !== undefined) ?? all);
+}
+
+/** Every text of a case a placeholder can sit in. */
+const textsOf = (c: EvalCase): string[] => [
+  ...c.turns.map((t) => t.user), c.rubric ?? "",
+  ...(c.facts ?? []).flatMap((f) => [f.claim, f.oracle?.value ?? "", f.oracle?.query ?? ""]),
+];
+
+/** The variables a case needs that have no value, sorted: its placeholders and its `needs`. */
+export function missingVars(c: EvalCase, vars: Vars): string[] {
+  const out = new Set<string>();
+  for (const t of textsOf(c)) {
+    for (const m of t.matchAll(PLACEHOLDER)) if (valueOf(vars, m[1] ?? m[2]!, m[1] !== undefined) === undefined) out.add(m[1] ?? m[2]!);
+  }
+  for (const n of [c.needs ?? []].flat()) if (valueOf(vars, n, !/^[A-Z][A-Z0-9_]*$/.test(n)) === undefined) out.add(n);
+  return [...out].sort();
+}
+
+/** The case with its placeholders filled; null when one has no value (the case is skipped, `missingVars` says why). */
+export function filledCase(c: EvalCase, vars: Vars): EvalCase | null {
+  if (missingVars(c, vars).length) return null;
+  const f = (s: string): string => fill(s, vars);
+  return {
+    ...c, turns: c.turns.map((t) => ({ ...t, user: f(t.user) })), ...(c.rubric !== undefined ? { rubric: f(c.rubric) } : {}),
+    ...(c.facts ? { facts: c.facts.map((x) => ({ claim: f(x.claim), ...(x.oracle ? { oracle: {
+      kind: x.oracle.kind, ...(x.oracle.value !== undefined ? { value: f(x.oracle.value) } : {}), ...(x.oracle.query !== undefined ? { query: f(x.oracle.query) } : {}),
+    } } : {}) })) } : {}),
+  };
+}
+
+/** The case's turns with every placeholder filled; null when the case needs a variable that has no value. */
+export function turnsOf(c: EvalCase, vars: Vars): Turn[] | null {
+  return filledCase(c, vars)?.turns ?? null;
 }
 
 /** A short, stable hash of what the case says (for a case that does not carry one). */
@@ -249,6 +313,58 @@ export function apiQuery(o: Oracle | undefined): { path: string; at: string } | 
   const m = o?.kind === "api" ? /^(\/v1\/[^#\s]*)#(\S+)$/.exec(o.query ?? "") : null;
   return m ? { path: m[1]!, at: m[2]! } : null;
 }
+
+/** An `api` oracle this runner can read at run time, by where it reads (see the case format above). */
+export type OracleQuery =
+  | { via: "claw"; path: string; at: string }
+  | { via: "github"; path: string; at: string }
+  | { via: "mcp"; server: string; tool: string; args: Record<string, unknown>; at: string };
+
+/** The read an `api` oracle names, or null for one this runner cannot run (a description, or a placeholder not filled). */
+export function oracleQuery(o: Oracle | undefined): OracleQuery | null {
+  if (o?.kind !== "api") return null;
+  const q = (o.query ?? "").trim();
+  if (HAS_PLACEHOLDER.test(q)) return null;
+  const claw = apiQuery(o);
+  if (claw) return { via: "claw", ...claw };
+  const gh = /^gh:(\/[^#\s]*)#(\S+)$/.exec(q);
+  if (gh) return { via: "github", path: gh[1]!, at: gh[2]! };
+  const mcp = /^mcp:([a-z0-9][a-z0-9_-]*)\/([A-Za-z0-9_]+)(?:\?([^#\s]*))?#(\S+)$/.exec(q);
+  if (!mcp) return null;
+  const args: Record<string, unknown> = {};
+  for (const [k, v] of new URLSearchParams(mcp[3] ?? "")) {
+    // A number, a boolean or null as itself; anything else as the text it is.
+    args[k] = /^(-?\d+(\.\d+)?|true|false|null)$/.test(v) ? JSON.parse(v) : v;
+  }
+  return { via: "mcp", server: mcp[1]!, tool: mcp[2]!, args, at: mcp[4]! };
+}
+
+/**
+ * Where an `mcp:` oracle may connect, and with what: the server's URL when it is https on one of `hosts`, and its headers with the
+ * key put only where the spec asks for it by Brain's placeholder (`<SAFE_API_KEY>`, in `token` or a header). A spec without a token
+ * gets no authorization. A string says why the server may not be read: a plugin that points a known server name at another host
+ * never receives the key.
+ */
+export function oracleMcpTarget(spec: Record<string, unknown>, hosts: readonly string[], key: string): { url: URL; headers: Record<string, string> } | string {
+  let url: URL;
+  try { url = new URL(String(spec.url ?? "")); } catch { return "no valid url"; }
+  const allowed = hosts.map((h) => h.trim().toLowerCase()).filter(Boolean);
+  if (url.protocol !== "https:" || !allowed.includes(url.host.toLowerCase())) return `${url.host || "its host"} is not an allowed host`;
+  const fill = (v: unknown): string => String(v).split("<SAFE_API_KEY>").join(key);
+  const raw = spec.headers && typeof spec.headers === "object" ? spec.headers as Record<string, unknown> : {};
+  const headers: Record<string, string> = Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, fill(v)]));
+  if (typeof spec.token === "string" && spec.token) headers.authorization = `Bearer ${fill(spec.token)}`;
+  return { url, headers };
+}
+
+/** Brain's allow-list matching: an exact name, or a prefix before a trailing `*`. */
+const allowedBy = (allow: readonly string[], name: string): boolean => allow.some((p) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : name === p));
+
+/**
+ * Whether an `mcp:` oracle may be run: only a tool on the router's list of reads (`assistant/read-tools.ts`, as
+ * `tools_allowlist` entries), so an oracle can never write. Anything else is graded by the judge.
+ */
+export const oracleMayRun = (q: OracleQuery, reads: readonly string[]): boolean => q.via !== "mcp" || allowedBy(reads, `mcp__${q.server}__${q.tool}`);
 
 /** Values picked from JSON by a dotted path: `data.length`, `name`, `data.*.title` (every element), `data.0.seq`. */
 export function pick(json: unknown, path: string): string[] {
@@ -289,6 +405,119 @@ export const INTERNAL_TEXT: ReadonlyArray<[string, RegExp]> = [
   ["claw message id", /\bclaw-(pending-)?\d+\b/],
   ["prompt leak", /system prompt|<\/?(system|tool_result|function_calls)>/i],
 ];
+/**
+ * An answer in which the assistant says that it itself cannot reach something: it cannot access, read, browse or query a
+ * system, has no permission or no tool for it, cannot get on the internet. Said of itself, so a fact about a system ("the node
+ * cannot be reached") is not one. Whether it was false is what the tools say: a denial with no failed call in the turn is one
+ * (`grade`); a case where refusing is right says `may_deny`.
+ */
+export const CAPABILITY_DENIAL = new RegExp([
+  "我(目前|现在|暂时|这边|这里)?(还)?(无法|不能|没法|没办法|不可以)(直接)?(访问|读取|查看|查询|获取|连接|联网|上网|浏览|打开|拿到)(?![^，。！？,.!?]{0,16}?(是否|有没有))",
+  "我(这边|这里)?(访问|读取|查询|连接|读|查|看)不了", "我(这边|这里)?(访问|连接|拿)不到",
+  "我(这边|这里)?(看不到|看不见|没法看|无法看到?)(你的)?\\s*(GitHub|github|仓库|代码库|PR|拉取请求|SaFE|safe|集群|节点|Dispatron|Autopilot|Pulse|网页|看板)",
+  "我(这边|这里)?(没有|无)[^，。,.!！?？\\n]{0,12}?(工具|能力|接口|权限)",
+  "(无法|不能|没法)(联网|上网)", "没有(联网|上网)(能力|功能|工具)",
+  "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:access|read|browse|reach|connect to|query|look up|fetch|check|open|get to)\\b"
+    // "I can't check whether there are more PRs beyond this page" is a caveat about what it read, not an inability.
+    + "(?!\\s+(?:[^\\s,.;:!?]+\\s+){0,6}?(?:whether|if)\\b)",
+  // "see" and "view" only of a system or the user's data, named within a few words: "I can't see any failed runs" is an answer.
+  "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:see|view) (?!(?:any|anything|no|a single)\\b)(?:[^\\s.!?。，,]+ ){0,6}?"
+    + "(?:github\\b|repos?\\b|repositor(?:y|ies)\\b|PRs?\\b|pull requests?\\b|safe\\b|workloads?\\b|clusters?\\b|dispatron\\b|autopilot\\b|pulse\\b|"
+    + "(?:the )?web\\b|web ?pages?\\b|internet\\b|(?:the )?board\\b)",
+  "\\bI (?:don(?:'|’)?t|do not)(?: (?:currently|yet|really|actually))? have (?:any )?(?:access|permission|internet|web access|a tool|the tools?|tools?)\\b",
+  "\\bI have no (?:access|internet|web access|tools?)\\b",
+].join("|"), "i");
+
+/**
+ * The systems a denial can name, and which failed call reaches each: an MCP server's tool, Brain's web tools, or a shell command that
+ * failed at GitHub (`shellFailedAtGithub`; a failed `python x.py` is not a failed GitHub call).
+ */
+const DENIED_SYSTEMS: ReadonlyArray<[RegExp, (c: ToolCall) => boolean]> = [
+  [/github|\bgh\b|pull request|\bPRs?\b|仓库|代码库/i, (c) => /^mcp__github__/.test(c.name)
+    || (/^bash$/i.test(c.name) && shellFailedAtGithub(c.result))
+    // A page or search of GitHub through the web tools.
+    || (/^(web_fetch|web_search)$/.test(c.name) && /github/i.test(JSON.stringify(c.input ?? {})))],
+  [/联网|上网|互联网|网页|网站|internet|\bweb\b|browse|online/i, (c) => /^(web_search|web_fetch)$/.test(c.name)],
+  [/safe|workloads?|workspaces?|集群|cluster|节点|\bnodes?\b/i, (c) => /^mcp__safe__/.test(c.name)],
+  [/dispatron|计划|\bplans?\b/i, (c) => /^mcp__dispatron__/.test(c.name)],
+  [/autopilot/i, (c) => /^mcp__autopilot__/.test(c.name)],
+  [/pulse|leaderboard|排行/i, (c) => /^mcp__pulse__/.test(c.name)],
+  [/看板|\bboard\b|\bissues?\b/i, (c) => /^mcp__agent-board__/.test(c.name)],
+];
+
+/**
+ * Whether a failed shell call failed at GitHub: one line of what it answered is a failure that names GitHub (`fatal: unable to
+ * access 'https://github.com/…'`, `remote: Repository not found` beside a github.com URL, `HTTP 401: Bad credentials
+ * (https://api.github.com/…)`, gh's `gh: …` errors, GitHub's JSON error with docs.github.com), whatever program reached it (gh,
+ * git, curl, a Python or Node script). That line is the evidence a remote operation was tried and failed; a GitHub URL printed by
+ * a local command (`git remote -v`) beside another command's failure, a local `git status` that failed, or text that only
+ * mentions git, are not.
+ */
+export function shellFailedAtGithub(answer: string): boolean {
+  return answer.split("\n").some((line) => GITHUB_NAMED.test(line) && GITHUB_FAILED.test(line));
+}
+const GITHUB_NAMED = /github\.com|api\.github|github cli|gh auth|^\s*gh:/i;
+// A failure: an error word, an HTTP 4xx/5xx, or GitHub's own error body (it always carries a docs.github.com documentation_url).
+const GITHUB_FAILED = /\b(fatal|error|denied|not found|unable|could not|failed|forbidden|unauthori[sz]ed|bad credentials|rate limit|HTTP [45]\d\d)\b|"documentation_url"\s*:\s*"https:\/\/docs\.github\.com/i;
+
+/**
+ * Every denial in `final` that the turn's calls do not make true, as the words that said it ([] when there is none). A denial may
+ * be true only when a call of the turn failed; when its sentence names systems (GitHub, the web, SaFE, ...), each one it names
+ * needs a failed call of its own, so a failure of one system never excuses denying another; a denial that names none is taken as
+ * being about whichever call failed. Every denial is checked, not only the first.
+ */
+export function falseDenials(final: string, calls: readonly ToolCall[], request = ""): string[] {
+  const failed = calls.filter((x) => x.ok === false);
+  const sentences = [...final.matchAll(/[^。！？!?\n]+?(?:[。！？!?\n]|\.(?=\s|$)|$)/g)].map((m) => ({ at: m.index!, text: m[0] }));
+  const sentenceAt = (at: number): string => sentences.find((x) => at >= x.at && at < x.at + x.text.length)?.text ?? final;
+  const systemsOf = (sentence: string) => DENIED_SYSTEMS.filter(([words]) => words.test(sentence)).map(([, reaches]) => reaches);
+  const out: string[] = [];
+  const seen = new Set<number>();
+  const judge = (at: number, words: string, needsSystem: boolean): void => {
+    // The clause of the denial, not the whole sentence: "I found two PRs on GitHub, but I can't access SaFE" denies SaFE only.
+    const whole = sentenceAt(at);
+    const offset = at - (sentences.find((x) => at >= x.at && at < x.at + x.text.length)?.at ?? 0);
+    const cuts = [...whole.matchAll(/[;；，,]|\b(?:but|however|although|though|while)\b|但是|但|不过|可是/gi)].map((m) => m.index!);
+    const from = Math.max(0, ...cuts.filter((i) => i <= offset));
+    const to = Math.min(whole.length, ...cuts.filter((i) => i > offset));
+    const clause = whole.slice(from, to);
+    const sentence = systemsOf(clause).length ? clause : whole;
+    // A denial that names nothing ("I can't access it right now", "I'm not connected to it") is about what the user asked for,
+    // when the request names it.
+    const named = systemsOf(sentence).length ? systemsOf(sentence) : systemsOf(request);
+    if (needsSystem && !named.length) return;   // "I can't …" of nothing it or the request names: an answer, not a denial
+    if (needsSystem && CONSENT.test(sentence)) return;   // "I can't delete it on SaFE without your approval": the approval flow
+    const start = sentences.find((x) => at >= x.at && at < x.at + x.text.length)?.at ?? -1;
+    if (seen.has(start) && needsSystem) return;  // one denial per sentence is enough to grade it
+    seen.add(start);
+    const justified = failed.length > 0 && (named.length === 0 || named.every((reaches) => failed.some(reaches)));
+    if (!justified) out.push(words);
+  };
+  for (const m of final.matchAll(new RegExp(CAPABILITY_DENIAL.source, "gi"))) judge(m.index!, m[0], false);
+  for (const m of final.matchAll(new RegExp(SELF_INABILITY.source, "gi"))) judge(m.index!, m[0], true);
+  return out;
+}
+
+/** A sentence about waiting for the person's yes, which is how a write goes, not an inability. */
+const CONSENT = /approv|confirm|your (?:go-ahead|ok|permission|consent)|批准|确认|同意/i;
+
+/**
+ * Broader than CAPABILITY_DENIAL, and only a denial in a sentence that names a system (`DENIED_SYSTEMS`): the assistant says that
+ * it itself is not connected, set up or allowed, or cannot or has no way to do something ("I'm not connected to GitHub, so I can't
+ * pull the open PRs", "我连不上 GitHub"). "I can't find any…" and "I can't see any failed runs" are answers about what it looked
+ * at, not inabilities, and are left out.
+ */
+export const SELF_INABILITY = new RegExp([
+  "\\bI(?:'m|’m| am)? (?:currently |still |really |actually )?(?:not (?:currently |yet )?(?:connected|able|allowed|authori[sz]ed|set up|linked|integrated|signed in|logged in|permitted)"
+    + "|unable|can(?:'|’)?t|cannot|can not|have no (?:access|way|tools?|integration|connection)"
+    + "|(?:don(?:'|’)?t|do not)(?: (?:currently|yet|really|actually))? have (?:access|permission|a way|the ability|any (?:access|tools?|way)|tools?|an? (?:integration|connection)))\\b"
+    // What it could not conclude or promise about what it did read is an answer, not an inability.
+    + "(?!\\s+(?:[^\\s,.;:!?]+\\s+){0,6}?(?:whether|if)\\b)"
+    + "(?!\\s+(?:to\\s+)?(?:find|locate|spot|tell|say|confirm|verify|determine|know|see any|see a|recall|remember|rule out|exclude|guarantee|promise|"
+    + "be (?:sure|certain)|predict|estimate|explain|reproduce))",
+  "我(目前|现在|暂时|这边|这里)?(还)?(连不上|接不上|没有接入|没接入|未接入|没有连接|没连接|未连接|没有权限|没权限)",
+].join("|"), "i");
+
 /** With `style.no_ids`: an item named only by its number ("编号 #178", "#178。") rather than by its title. */
 export const BARE_NUMBER = /编号\s*#?\d+|#\d+(?=\s*($|[，。、,.;；:：)）!！?？]))/m;
 
@@ -314,7 +543,8 @@ export const saysOf = (events: readonly LiveEvent[]): Say[] => events
     itemId: e.data.item?.item_id ? String(e.data.item.item_id) : null,
     itemState: e.data.item?.board_state ? String(e.data.item.board_state) : null,
     canAccept: e.data.item?.can_accept === true,
-    confirm: !!e.data.confirm_action,
+    // A card the person presses: a channel's command to run (`confirm_action`) or a write the router proposed (`confirm_write`).
+    confirm: !!e.data.confirm_action || !!e.data.confirm_write,
     fallback: e.data.fallback === true,
   }));
 
@@ -327,9 +557,174 @@ export function turnCalls(events: readonly LiveEvent[], messageIds: readonly str
   return traceOf(rows).calls;
 }
 
+/**
+ * An event that closes its turn. The API never forwards `exec_complete` to a live stream (`routes/events.ts`), so there a turn
+ * ends with its main agent's `executionStats` (it finished) or its `statusUpdate` to failed; a replay has `exec_complete` as well.
+ * A sub-agent's events close nothing.
+ */
+export const endsTurn = (d: Record<string, any> | undefined): boolean => !!d && !d.subagent_id
+  && (d.type === "exec_complete" || d.type === "executionStats" || (d.type === "statusUpdate" && d.agentStatus === "failed"));
+
 /** A turn that ended, by its message id. */
 export const turnEnded = (events: readonly LiveEvent[], messageId: string): boolean =>
-  events.some((e) => e.data?.type === "exec_complete" && e.data.message_id === messageId);
+  events.some((e) => endsTurn(e.data) && e.data.message_id === messageId);
+
+/** The turns that ended, in order: one event per turn, however many of its closing events arrived. */
+export function endedTurns(events: readonly LiveEvent[]): LiveEvent[] {
+  const seen = new Set<string>();
+  return events.filter((e) => {
+    if (!endsTurn(e.data)) return false;
+    const turn = String(e.data.message_id || e.eventId);
+    if (seen.has(turn)) return false;
+    seen.add(turn);
+    return true;
+  });
+}
+
+/**
+ * The turns a session's stored events (`?mode=replay`) say ended: its main agent's `exec_complete`, one per turn. A turn whose
+ * delivery Brain gave up on ends with that event alone, which a stream never carries; read when a stream showed no end.
+ */
+export function storedTurnEnds(rows: readonly EventRow[]): string[] {
+  const out: string[] = [];
+  for (const r of rows) {
+    const d = r.data ?? {};
+    if ((d.type ?? r.event_type) !== "exec_complete" || d.subagent_id) continue;
+    const id = String(d.message_id ?? "");
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/**
+ * The stored events (`?mode=replay`, with their `event_id`, which is the stream's frame id) of the given turns, and of what was
+ * said about the given items, that the stream did not deliver: none when it showed everything a case is graded on. A turn's
+ * exec_complete is left out (a stream never carries it). Events that could not be read are a gap too.
+ */
+export function streamMissed(rows: ReadonlyArray<EventRow & { event_id?: unknown }> | null, events: readonly LiveEvent[],
+  messageIds: readonly string[], itemIds: readonly string[] = []): string[] {
+  if (!rows) return ["(the stored events could not be read)"];
+  const seen = new Set(events.map((e) => e.eventId));
+  const turns = new Set(messageIds);
+  const items = new Set(itemIds);
+  return rows.filter((r) => {
+    const d = r.data ?? {};
+    if ((d.type ?? r.event_type) === "exec_complete") return false;
+    const ours = turns.has(String(d.message_id ?? "")) || turns.has(String(d.turn_message_id ?? "")) || (d.item?.item_id !== undefined && items.has(String(d.item.item_id)));
+    return ours && !seen.has(String(r.event_id ?? ""));
+  }).map((r) => String(r.event_id ?? "?"));
+}
+
+/** What the main agent wrote in a plain session (`AssistantMessage`), in order: what its user was shown. */
+export const messagesOf = (events: readonly LiveEvent[]): string[] => events
+  .filter((e) => e.data?.type === "AssistantMessage" && !e.data.subagent_id)
+  .map((e) => (Array.isArray(e.data.data?.content) ? e.data.data.content : []).filter((b: any) => b?.type === "text").map((b: any) => String(b.text)).join(""))
+  .filter(Boolean);
+
+// --- Sharing an identity with its hourly say cap and with other runs --------------------------------------------------
+
+const HOUR_MS = 3_600_000;
+
+/** A say the cap counts: its id and when it was made (or seen). */
+export interface SayMark { id: string; at: number }
+
+/** The says the cap counts (`claw_assistant_says`, the system's fallbacks excluded), from a live stream. */
+export const countedSays = (events: readonly LiveEvent[]): SayMark[] => events
+  .filter((e) => e.data?.type === "AssistantSay" && e.data.fallback !== true)
+  .map((e) => ({ id: String(e.data.say_id ?? e.eventId), at: e.at }));
+
+/** The same from a session's stored events (`?mode=replay`): the says made before this run was listening. */
+export const countedSaysOf = (rows: readonly EventRow[]): SayMark[] => rows
+  .filter((r) => (r.data?.type ?? r.event_type) === "AssistantSay" && r.data?.fallback !== true)
+  .map((r) => ({ id: String(r.data?.say_id ?? ""), at: Date.parse(r.created_at) }))
+  .filter((m) => m.id && Number.isFinite(m.at));
+
+/** Says of several sources as one list: each id once (at its earliest time), only those of the hour before `now`. */
+export function mergeSays(lists: ReadonlyArray<readonly SayMark[]>, now: number): SayMark[] {
+  const by = new Map<string, number>();
+  for (const list of lists) for (const m of list) if (m.at > now - HOUR_MS && m.at <= now) by.set(m.id, Math.min(by.get(m.id) ?? Infinity, m.at));
+  return [...by].map(([id, at]) => ({ id, at })).sort((a, b) => a.at - b.at);
+}
+
+/**
+ * The says an earlier run on this host saw (EVAL_SAY_LOG, one `{"id","at"}` per line). The cap counts an identity's says
+ * whatever session they were in, and a run deletes the assistant session it made: the next run cannot read them back from
+ * the API. A line that is not a say is left out.
+ */
+export function parseSayLog(text: string): SayMark[] {
+  const out: SayMark[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const m = JSON.parse(line) as Partial<SayMark>;
+      if (typeof m.id === "string" && m.id && typeof m.at === "number" && Number.isFinite(m.at)) out.push({ id: m.id, at: m.at });
+    } catch { /* not a say */ }
+  }
+  return out;
+}
+
+/**
+ * How long to wait before the next case so that the identity's counted says of the last hour, and `reserve` more for the case,
+ * stay within `perHour`: the server refuses a say past CLAW_ASSISTANT_SAY_MAX_PER_HOUR in a rolling hour, and a refused say is
+ * a case lost to the run, not to the assistant. 0 to go now; `perHour` 0 never waits.
+ */
+export function sayWaitMs(says: readonly number[], now: number, perHour: number, reserve: number): number {
+  if (perHour <= 0) return 0;
+  const recent = says.filter((t) => t > now - HOUR_MS && t <= now).sort((a, b) => a - b);
+  const over = recent.length + reserve - perHour;
+  if (over <= 0) return 0;
+  // When the over-th oldest say leaves the hour, enough room is left; a reserve that alone exceeds perHour is refused at start.
+  return recent[Math.min(over, recent.length) - 1]! + HOUR_MS - now + 1_000;
+}
+
+/**
+ * The says of the assistant the server refused for its hourly cap since `since`, other than in the turns of the messages in
+ * `earlier` (an earlier attempt's, arriving late after a reconnect): an attempt with one is the run's failure.
+ */
+export const capRefusedSays = (events: readonly LiveEvent[], since: number, earlier: ReadonlySet<string> = new Set()): number => events.filter((e) => e.at >= since
+  && !earlier.has(String(e.data?.message_id ?? "")) && e.data?.type === "toolUsed" && e.data.tool === "mcp__assistant__say" && e.data.status === "error"
+  && [e.data.result, e.data.description, e.data.brief].some((x) => typeof x === "string" && x.includes("say_rate_limited"))).length;
+
+/**
+ * Why a run must not start on the identity's assistant session: someone is using it now (a turn is running, or something
+ * happened in it, its making included, less than `quietMs` ago). Two runs on one assistant see each other's messages and items, and a run that
+ * cleans up after another one deletes what that one is using; each parallel run needs an identity of its own. Null: free.
+ */
+export function assistantInUse(session: { agent_status?: unknown; created_at?: unknown } | null, lastEventAt: number | null, now: number, quietMs: number): string | null {
+  if (session?.agent_status === "running") return "a turn is running in the identity's assistant session";
+  // A session made a moment ago is in use too: another run made it, and has not sent anything yet.
+  const made = typeof session?.created_at === "string" ? Date.parse(session.created_at) : NaN;
+  if (Number.isFinite(made) && (lastEventAt === null || made > lastEventAt)) lastEventAt = made;
+  if (quietMs > 0 && lastEventAt !== null && now - lastEventAt < quietMs) {
+    return `the identity's assistant session was active ${Math.round((now - lastEventAt) / 1000)}s ago (EVAL_QUIET_S=${Math.round(quietMs / 1000)})`;
+  }
+  return null;
+}
+
+export interface ApiAnswer { status: number; json: any }
+
+/**
+ * Delete one session the run made, and see that it is gone: DELETE answers 200 (or 404, gone already), and only a GET that
+ * then answers 404 counts. A refusal (401, 403) ends it; anything else is tried again until `deadlineAt`. Only ever called
+ * with an id the run made or was answered for its own item: nothing is deleted by identity.
+ */
+export async function deleteSessionConfirmed(
+  api: (method: string, path: string) => Promise<ApiAnswer>, sessionId: string, deadlineAt: number, everyMs: number,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<boolean> {
+  const path = `/v1/sessions/${encodeURIComponent(sessionId)}`;
+  for (;;) {
+    const del = await api("DELETE", path).catch(() => ({ status: 0, json: null }));
+    // Not the run's to delete (or not its key): asking again changes nothing.
+    if (del.status === 401 || del.status === 403) return false;
+    if (del.status === 200 || del.status === 404) {
+      const got = await api("GET", path).catch(() => ({ status: 0, json: null }));
+      if (got.status === 404) return true;
+    }
+    if (Date.now() + everyMs > deadlineAt) return false;
+    await sleep(everyMs);
+  }
+}
 
 export interface ItemSeen { item_id: string; seq: number; title: string; kind: string; board_state: string; can_accept: boolean; result_version: number; outcome: string | null }
 
@@ -344,17 +739,22 @@ export function routeOf(items: readonly ItemSeen[], calls: readonly ToolCall[], 
 /**
  * The items a turn started: those whose id or number a successful work_create / review_start / review_restart call of
  * the turn answered with (`{"item_id": ..., "seq": ...}`), among the case's items. A call whose answer cannot be read
- * still makes the route an item (`routeOf`); it just names no item here.
+ * still makes the route an item (`routeOf`); it just names no item here. An answer `"deduplicated": true` names an open
+ * item that was there before (work_create finds one with the same title): it counts only when that item is already in
+ * `known` (the run's own), since another's would otherwise be closed, and its worker's session deleted, as the run's.
  */
-export function itemsStartedBy(calls: readonly ToolCall[], items: readonly ItemSeen[]): ItemSeen[] {
+export function itemsStartedBy(calls: readonly ToolCall[], items: readonly ItemSeen[], known: ReadonlySet<string> = new Set()): ItemSeen[] {
   const ids = new Set<string>();
   const seqs = new Set<number>();
+  const found = new Set<string>();   // named only by a deduplicated answer
+  const foundSeqs = new Set<number>();
   for (const c of calls) {
     if (c.ok !== true || !/(^|__)(work_create|review_start|review_restart)$/.test(c.name)) continue;
-    for (const m of c.result.matchAll(/"item_id"\s*:\s*"([^"]+)"/g)) ids.add(m[1]!);
-    for (const m of c.result.matchAll(/"seq"\s*:\s*(\d+)/g)) seqs.add(Number(m[1]));
+    const dedup = /"deduplicated"\s*:\s*true/.test(c.result);
+    for (const m of c.result.matchAll(/"item_id"\s*:\s*"([^"]+)"/g)) (dedup ? found : ids).add(m[1]!);
+    for (const m of c.result.matchAll(/"seq"\s*:\s*(\d+)/g)) (dedup ? foundSeqs : seqs).add(Number(m[1]));
   }
-  return items.filter((i) => ids.has(i.item_id) || seqs.has(i.seq));
+  return items.filter((i) => ids.has(i.item_id) || seqs.has(i.seq) || ((found.has(i.item_id) || foundSeqs.has(i.seq)) && known.has(i.item_id)));
 }
 
 /** What the user was offered to press, as a channel draws it: Accept on a result that waits, Run on a command to confirm. */
@@ -438,7 +838,7 @@ export function grade(c: EvalCase, o: Observed): Check[] {
     const values = o.factValues[k] ?? null;
     const name = `fact ${f.claim}`.slice(0, 80);
     if (values === null) {
-      if (apiQuery(f.oracle)) out.push({ name, pass: true, skipped: true, unverified: true, detail: "oracle not read" });
+      if (oracleQuery(f.oracle)) out.push({ name, pass: true, skipped: true, unverified: true, detail: "oracle not read" });
       else skip(name);
       return;
     }
@@ -455,6 +855,15 @@ export function grade(c: EvalCase, o: Observed): Check[] {
   for (const [label, re] of INTERNAL_TEXT) {
     const m = re.exec(shownText);
     out.push({ name: `no internal text: ${label}`, pass: m === null, detail: m ? m[0] : undefined });
+  }
+  if (!c.may_deny) {
+    // The rule is the judge's (it sees the turn's calls). What the detectors find is a denial no failed call explains: they never
+    // fail a case by themselves (a caveat they mistake for a denial must not fail a right answer); they make it unverified, so a
+    // run without a judge does not count it as a pass, and a judge decides it.
+    const unexplained = falseDenials(o.final, o.calls, c.turns.at(-1)?.user ?? "");
+    out.push(unexplained.length
+      ? { name: "no false denial", pass: true, skipped: true, unverified: true, detail: `${unexplained[0]}: a denial no failed call explains; the judge decides` }
+      : { name: "no false denial", pass: true });
   }
   if (c.style?.no_ids) {
     const m = BARE_NUMBER.exec(shownText);
@@ -548,8 +957,39 @@ export interface Attempt {
 }
 
 /** The case has content only a judge can grade: a rubric, or a fact whose value is neither written nor read by an oracle. */
-export const needsJudge = (c: EvalCase): boolean =>
-  !!c.rubric || (c.facts ?? []).some((f) => !apiQuery(f.oracle) && !(f.oracle && f.oracle.kind !== "api" && f.oracle.value !== undefined));
+export const needsJudge = (c: EvalCase): boolean => !!c.rubric || judgeFacts(c).length > 0;
+
+/** A fact graded without a judge: a runnable oracle, or a static or fixture value. */
+const deterministic = (f: Fact): boolean => !!oracleQuery(f.oracle) || (!!f.oracle && f.oracle.kind !== "api" && f.oracle.value !== undefined);
+
+/**
+ * What only a judge can grade, one line per fact: its claim and, where the oracle describes a read this runner cannot make,
+ * that description as what the claim is checked against. Without these lines in its prompt a judge would see a case with
+ * no rubric as having nothing to grade, and it would stay unjudged for good.
+ */
+export function judgeFacts(c: EvalCase): string[] {
+  return (c.facts ?? []).filter((f) => !deterministic(f))
+    .map((f) => (f.oracle?.query || f.oracle?.value ? `${f.claim} (checked against: ${f.oracle.query ?? f.oracle.value})` : f.claim));
+}
+
+/** The rule every judged case is held to, besides its own: no false denial of a capability (see CAPABILITY_DENIAL). */
+export const NO_FALSE_DENIAL_RULE = "The reply must not say that it cannot reach or do something (GitHub, the web, a platform, the user's own data) "
+  + "when it has a tool for that, unless it tried the tool and the tool failed. Declining an unsafe or forbidden request is not such a denial.";
+
+/**
+ * The judge's prompt for one case: the user's turns, the final reply, the rubric, the facts only it can grade, and the rule, with
+ * what the rule needs to be applied: the tools the case expects the assistant to have for this request (its tools_must) and every
+ * tool call of the turn, by name, with whether it failed (no tool output: that is the identity's data).
+ */
+export function judgePrompt(c: EvalCase, turns: readonly Turn[], final: string, calls: readonly ToolCall[] = []): string {
+  const facts = judgeFacts(c);
+  const evidence = c.may_deny ? "" : `Tools it has for this request: ${(c.tools_must ?? []).join(", ") || "none named by the case"}\n`
+    + `Tool calls it made in this turn: ${calls.map((x) => `${x.name} (${x.ok === false ? "failed" : x.ok === true ? "ok" : "no result"})`).join(", ") || "none"}\n`;
+  return `You grade one reply of an assistant to a user.\nUser said:\n${turns.map((t) => t.user).join("\n")}\n\n`
+    + `Assistant's final reply:\n${final}\n\n${c.rubric ? `Rubric: ${c.rubric}\n` : ""}${facts.length ? `The reply must state: ${facts.join("; ")}\n` : ""}`
+    + `${c.may_deny ? "" : `Always: ${NO_FALSE_DENIAL_RULE}\n${evidence}`}`
+    + "\nAnswer with one line: PASS or FAIL, a colon, and one short reason.";
+}
 
 /**
  * An attempt's verdict: every deterministic check, and, for a case with content only a judge can grade, the judge's
@@ -558,16 +998,17 @@ export const needsJudge = (c: EvalCase): boolean =>
  */
 export function verdictOf(c: EvalCase, checks: readonly Check[], judge: { pass: boolean } | null | undefined): { pass: boolean; unjudged?: true } {
   if (!passed(checks)) return { pass: false };
+  // A judge, where one is configured, grades every case (at least the no-false-denial rule, with the turn's calls): its verdict
+  // decides, also what the denial detectors left to it.
+  if (judge) return checks.some((x) => x.unverified && x.name !== "no false denial") ? { pass: false, unjudged: true } : { pass: judge.pass };
   if (checks.some((x) => x.unverified)) return { pass: false, unjudged: true };
-  if (!needsJudge(c)) return { pass: true };
-  if (!judge) return { pass: false, unjudged: true };
-  return { pass: judge.pass };
+  return needsJudge(c) ? { pass: false, unjudged: true } : { pass: true };
 }
 
 /** What a recording keeps of an observation: an api oracle's values are the identity's data, so they are left out (null:
  * an offline grading skips that fact). */
 export function forRecording(c: EvalCase, o: Observed): Observed {
-  return { ...o, factValues: o.factValues.map((v, k) => (apiQuery(c.facts?.[k]?.oracle) ? null : v)) };
+  return { ...o, factValues: o.factValues.map((v, k) => (oracleQuery(c.facts?.[k]?.oracle) ? null : v)) };
 }
 
 export interface CaseResult {
@@ -674,9 +1115,13 @@ export function identityRefusal(me: Identity, subs: readonly Subscription[], env
 /** What a run would do, without doing it (EVAL_DRY_RUN): one line per case. */
 export function planOf(cases: readonly EvalCase[], mode: Mode, env: Record<string, string | undefined>): string[] {
   return cases.map((c) => {
-    const turns = turnsOf(c, env);
-    const skip = c.modes && !c.modes.includes(mode) ? `skip (${c.modes.join(",")} only)` : turns === null ? `skip (needs ${c.needs})` : "";
-    const facts = (c.facts ?? []).map((f) => (apiQuery(f.oracle) ? "api" : f.oracle?.value !== undefined && f.oracle.kind !== "api" ? "value" : "judge"));
+    const missing = missingVars(c, env);
+    const skip = c.modes && !c.modes.includes(mode) ? `skip (${c.modes.join(",")} only)` : missing.length ? `skip (needs ${missing.join(", ")})` : "";
+    const filled = filledCase(c, env) ?? c;
+    const facts = (filled.facts ?? []).map((f) => {
+      const q = oracleQuery(f.oracle);
+      return q ? (q.via === "claw" ? "api" : q.via) : f.oracle?.value !== undefined && f.oracle.kind !== "api" ? "value" : "judge";
+    });
     return [c.id, skip || `${c.turns.length} turn(s)`, `route=${c.route ?? "-"}`, `tools=${(c.tools_must ?? []).join(",") || "-"}`,
       `facts=${facts.join(",") || "-"}`, `budget=${JSON.stringify(c.latency_budget_s ?? {})}`].join("  ");
   });
@@ -691,4 +1136,91 @@ export interface Recording { case_id: string; mode: Mode; attempt: number; at: s
 export function parseRecordings(text: string): Recording[] {
   return text.split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Recording)
     .filter((r) => typeof r.case_id === "string" && r.observed && Array.isArray(r.observed.calls));
+}
+
+// --- Static checks: what a case asks for against what its arm can do ----------------------------------------------------
+
+/**
+ * The tools each arm of the evaluation can call, as `tools_allowlist` entries (an exact name, or a prefix ending in `*`).
+ *   router    the assistant's router turn: its own tools and the reads `assistant/read-tools.ts` gives it
+ *   worker    a work item's worker, and a plain session: every server of the plugin, and Brain's own tools (any name that is not
+ *             an MCP tool's)
+ *   baseline  a plain session with the plugin (EVAL_MODE=baseline): the worker's tools, without the assistant's
+ */
+export interface Arms { router: readonly string[]; worker: readonly string[]; baseline: readonly string[] }
+
+/** An entry that allows every tool that is not an MCP tool (Brain's built-ins: web_search, Bash, ...). */
+export const BUILTIN_TOOLS = "<builtin>";
+
+/**
+ * Whether some tool name matches both a case's pattern (`*` anywhere, `a|b` either) and an allow-list. A built-in tool is any
+ * name that does not start with `mcp__`.
+ */
+export function reachable(pattern: string, allow: readonly string[]): boolean {
+  return pattern.split("|").map((a) => a.trim()).some((alt) => allow.some((entry) => {
+    const head = alt.split("*")[0]!;
+    // Some name matching alt does not start with mcp__, unless alt's literal head already does.
+    if (entry === BUILTIN_TOOLS) return !head.startsWith("mcp__");
+    if (!entry.endsWith("*")) return toolPattern(alt).test(entry);
+    // A prefix entry: some name starting with it matches alt, when alt's literal head and the prefix agree as far as both go.
+    const pre = entry.slice(0, -1);
+    return alt.includes("*") ? head.startsWith(pre) || pre.startsWith(head) : alt.startsWith(pre);
+  }));
+}
+
+/** The arms a case runs on, with the tools each can reach for its last turn: an answer is the router's alone; an item adds its worker. */
+export function armsOf(c: EvalCase, arms: Arms): Array<{ arm: "router" | "router+worker" | "baseline"; allow: readonly string[] }> {
+  const modes = c.modes ?? ["assistant", "baseline"];
+  const out: Array<{ arm: "router" | "router+worker" | "baseline"; allow: readonly string[] }> = [];
+  if (modes.includes("assistant")) {
+    out.push(c.route === "item" || c.route === "review" ? { arm: "router+worker", allow: [...arms.router, ...arms.worker] } : { arm: "router", allow: arms.router });
+  }
+  if (modes.includes("baseline")) out.push({ arm: "baseline", allow: arms.baseline });
+  return out;
+}
+
+/** A static or fixture value that describes what the answer should say instead of being a value to find in it. */
+export function descriptiveValue(v: string): boolean {
+  const t = v.trim();
+  return t.split(/\s+/).length >= 3 || /\||->|>=|<=|\bor\b/.test(t)
+    || /^(asks?|no|not|does|doesn't|states?|mentions?|lists?|names?|covers?|refuses?|declines?|offers?|says?|explains?|either|any|at least|reply|answer|regex)\b/i.test(t);
+}
+
+export interface CaseFinding { id: string; kind: "unreachable" | "assistant-only" | "descriptive-value" | "blocked" | "judge-only" | "needs-vars"; detail: string }
+
+/**
+ * What can be told about cases without running them. Problems (the check fails on them):
+ *   unreachable        a tools_must pattern no tool of the case's arm matches (the case can never pass there), unless `blocked`
+ *   assistant-only     one only the assistant's own tools match, on a case that also runs in baseline: it needs modes ["assistant"]
+ *   descriptive-value  a static or fixture value that is a description: it belongs in the rubric
+ * Notes (said, not failed): blocked (with its reason), judge-only (a fact no oracle can read), needs-vars (skipped without them).
+ */
+export function staticFindings(cases: readonly EvalCase[], arms: Arms, vars: Vars = {}): { problems: CaseFinding[]; notes: CaseFinding[] } {
+  const problems: CaseFinding[] = [];
+  const notes: CaseFinding[] = [];
+  for (const c of cases) {
+    for (const { arm, allow } of armsOf(c, arms)) {
+      for (const p of c.tools_must ?? []) {
+        if (reachable(p, allow)) continue;
+        const assistantOnly = arm === "baseline" && reachable(p, arms.router) && p.split("|").every((a) => a.trim().startsWith("mcp__assistant__"));
+        if (assistantOnly) problems.push({ id: c.id, kind: "assistant-only", detail: `${p}: only the assistant has it; set modes ["assistant"]` });
+        else if (c.blocked) notes.push({ id: c.id, kind: "blocked", detail: `${p} on ${arm}: ${c.blocked}` });
+        else problems.push({ id: c.id, kind: "unreachable", detail: `${p} on ${arm}` });
+      }
+    }
+    for (const f of c.facts ?? []) {
+      const o = f.oracle;
+      if (o && o.kind !== "api" && o.value !== undefined && descriptiveValue(o.value)) problems.push({ id: c.id, kind: "descriptive-value", detail: `${f.claim}`.slice(0, 80) });
+      // Runnable once its placeholders are filled, whatever they are filled with.
+      else if (o?.kind === "api" && !oracleQuery({ ...o, query: (o.query ?? "").replace(PLACEHOLDER, "x") })) {
+        notes.push({ id: c.id, kind: "judge-only", detail: `${f.claim}`.slice(0, 80) });
+      }
+    }
+    if (c.blocked && armsOf(c, arms).every(({ allow }) => (c.tools_must ?? []).every((p) => reachable(p, allow)))) {
+      notes.push({ id: c.id, kind: "blocked", detail: `reachable now on every arm: drop "blocked" (${c.blocked})` });
+    }
+    const missing = missingVars(c, vars);
+    if (missing.length) notes.push({ id: c.id, kind: "needs-vars", detail: missing.join(", ") });
+  }
+  return { problems, notes };
 }

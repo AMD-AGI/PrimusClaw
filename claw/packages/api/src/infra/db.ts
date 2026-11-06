@@ -1971,6 +1971,8 @@ export async function initDb(): Promise<void> {
       await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS max_runs INT");
       await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS runs INT NOT NULL DEFAULT 0");
       await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS item_id TEXT");
+      // What a firing does (`triggers/store.ts` TRIGGER_ACTIONS): start a run with the prompt, or say the owner's brief.
+      await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'run'");
       await client.query("CREATE INDEX IF NOT EXISTS idx_triggers_owner ON claw_triggers(owner_user_id)");
       await client.query("CREATE INDEX IF NOT EXISTS idx_triggers_due ON claw_triggers(next_fire_at) WHERE enabled AND paused_reason IS NULL");
       await client.query(`

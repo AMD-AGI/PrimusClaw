@@ -21,8 +21,8 @@ import type { NatsDecisionMessage } from "../src/delivery/decision-dispatcher.js
 
 // Generic example server and tool names; nothing here names a real service.
 const base = { url: "https://mcp.example.invalid/mcp", type: "http", token: "t" };
-const spec = (extra: Record<string, unknown>) => ({ safe: { ...base, ...extra } });
-const T = (bare: string) => `mcp__safe__${bare}`;
+const spec = (extra: Record<string, unknown>) => ({ ops: { ...base, ...extra } });   // a server the tool catalog does not know
+const T = (bare: string) => `mcp__ops__${bare}`;
 
 // ── the policy ───────────────────────────────────────────────────────────────
 
@@ -125,7 +125,7 @@ test("a malformed auto_approve releases nothing of that server, and the holds st
   ];
   for (const value of bad) {
     const p = approvalPolicyFromMcp({
-      safe: { ...base, requires_approval: true, auto_approve: value },
+      ops: { ...base, requires_approval: true, auto_approve: value },
       other: { ...base, requires_approval: true, auto_approve: ["a"] },
     });
     const label = JSON.stringify(value) ?? String(value);
@@ -183,7 +183,7 @@ test("a tool two servers claim is released only when both release it", () => {
 test("the field survives normalizeMcpConfigs", () => {
   const list = [{ tool: "a", when: { s: "paused" } }, "b_*"];
   const out = normalizeMcpConfigs(spec({ requires_approval: true, auto_approve: list }));
-  assert.deepEqual(out.safe.auto_approve, list);
+  assert.deepEqual(out.ops.auto_approve, list);
 });
 
 // ── the gate, through the real loop, a real HitlController and the real policy ─

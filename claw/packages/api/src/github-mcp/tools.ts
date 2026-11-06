@@ -13,7 +13,7 @@
  * every tool that is not listed in READ_TOOLS for the user's decision, including any added here later.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CITE_SOURCES_META, type CiteSource } from "@claw/protocol";
+import { CITE_SOURCES_META, GITHUB_LIST_MAX_CHARS, type CiteSource } from "@claw/protocol";
 import pino from "pino";
 import { z } from "zod";
 import { GithubError, GithubGraphqlError, isValidOwner, parseRepoRef, repoPath, type GithubClient } from "../github-review/github.js";
@@ -203,10 +203,139 @@ function issueSummary(i: Record<string, any>) {
   };
 }
 
+/** A pull request in a list: what a person reads in one line, without the description. */
+function prLine(p: Record<string, any>) {
+  return {
+    number: p.number, title: p.title, state: p.state, draft: p.draft, author: login(p.user), head: p.head?.ref, base: p.base?.ref,
+    ...(p.merged_at ? { merged_at: p.merged_at } : {}), ...(p.closed_at && !p.merged_at ? { closed_at: p.closed_at } : {}),
+    ...(Array.isArray(p.labels) && p.labels.length ? { labels: p.labels.map((l: { name?: string }) => l.name) } : {}),
+    created_at: p.created_at, updated_at: p.updated_at, url: p.html_url,
+  };
+}
+
+/** An issue or pull request in a list: `issueSummary` without the counts and empty fields a list has no use for. */
+function issueLine(i: Record<string, any>) {
+  const { labels, comments: _c, created_at: _created, ...rest } = issueSummary(i);
+  return { ...rest, ...(labels?.length ? { labels } : {}) };
+}
+
+/**
+ * A list answer that a turn sees whole: the items, in order, as many as fit in GITHUB_LIST_MAX_CHARS (which Brain keeps whole
+ * for these tools), and what says whether that is all of them. `total_count` is the number of matches where it is known (a
+ * search's count, or a list read to its end); `complete` is true only when every match is in `items`. A list cut in its middle
+ * by the turn's own result cap answered "15 of my 22 open pull requests" with nothing to say which were left out.
+ */
+export function listAnswer(items: readonly unknown[], meta: { total_count?: number | null; complete: boolean; next_page?: number | null; note?: string }): Record<string, unknown> {
+  const head = { total_count: meta.total_count ?? null, shown: 0, complete: false, ...(meta.note ? { note: meta.note } : {}) };
+  const kept: unknown[] = [];
+  // The envelope's own size, with room for the fields filled in below.
+  let size = JSON.stringify(head).length + 160;
+  for (const item of items) {
+    const n = JSON.stringify(item).length + 1;
+    if (size + n > GITHUB_LIST_MAX_CHARS) break;
+    kept.push(item);
+    size += n;
+  }
+  const cutBySize = kept.length < items.length;
+  const complete = meta.complete && !cutBySize;
+  return {
+    ...head, shown: kept.length, complete,
+    ...(cutBySize ? { not_shown: items.length - kept.length, cut: "the answer holds no more: ask for fewer per page, or narrow the query" } : {}),
+    ...(!complete && !cutBySize && meta.next_page ? { next_page: meta.next_page } : {}),
+    items: kept,
+  };
+}
+
+/**
+ * One page of a list GitHub pages itself (`per_page`, `page`): a page shorter than asked is the list's end, which gives the
+ * count; a full one may have more after it.
+ */
+export function pageAnswer(items: readonly unknown[], perPage: number, page: number): Record<string, unknown> {
+  const ended = items.length < perPage;
+  return listAnswer(items, {
+    total_count: ended ? (page - 1) * perPage + items.length : null,
+    complete: ended && page === 1,
+    next_page: ended ? null : page + 1,
+  });
+}
+
+type PullState = "open" | "closed" | "merged" | "all";
+
+/**
+ * Pull requests read page by page (100 each, at most MAX_SCAN_PAGES) to keep one author's, or to order closed ones by when
+ * they closed and merged ones by when they merged: GitHub's list orders by creation or by last update, and "the 3 most recently
+ * merged" read in creation order named a pull request merged before another it was created after.
+ *
+ * Closed and merged ones are read most recently updated first, and the reading stops once the ones asked for are settled: a pull
+ * request not read yet was updated no later than the oldest one read, and it closed or merged no later than it was updated, so
+ * once enough have closed (merged) at or after that time, nothing unread can come before them.
+ */
+async function scanPulls(
+  gh: GithubClient, r: { owner: string; repo: string }, filter: Record<string, string>, state: PullState, author: string | null,
+  perPage: number, page: number,
+): Promise<Record<string, unknown>> {
+  const ordered = state === "closed" || state === "merged";
+  const timeOf = (p: Record<string, any>): number => Date.parse(String(state === "merged" ? p.merged_at : p.closed_at)) || 0;
+  const latestFirst = (x: Record<string, any>, y: Record<string, any>): number => timeOf(y) - timeOf(x);
+  const want = page * perPage;
+  const kept: Record<string, any>[] = [];
+  let ended = false;
+  let settled = false;
+  let read = 0;
+  let oldestRead = Infinity;
+  for (let n = 1; n <= MAX_SCAN_PAGES && !ended && !settled; n++) {
+    const q = { ...filter, state: state === "merged" ? "closed" : state, sort: ordered ? "updated" : "created", direction: "desc", per_page: 100, page: n };
+    const list = (await gh.get<any[]>(repoPath(r, "/pulls"), q)).json ?? [];
+    read += list.length;
+    for (const p of list) {
+      if (author !== null && login(p.user)?.toLowerCase() !== author.toLowerCase()) continue;
+      if (state === "merged" && !p.merged_at) continue;
+      kept.push(p);
+    }
+    if (list.length) oldestRead = Math.min(oldestRead, Date.parse(String(list[list.length - 1].updated_at)) || 0);
+    ended = list.length < 100;
+    if (ordered && !ended && kept.length >= want) settled = timeOf([...kept].sort(latestFirst)[want - 1]) >= oldestRead;
+  }
+  const all = ordered ? [...kept].sort(latestFirst) : kept;
+  const what = state === "all" ? "" : `${state === "merged" ? "closed" : state} `;
+  return listAnswer(all.slice((page - 1) * perPage, want).map(prLine), {
+    total_count: ended ? all.length : null,
+    complete: ended && page === 1 && all.length <= perPage,
+    next_page: !ended || all.length > want ? page + 1 : null,
+    note: ended ? undefined
+      : `read the ${read} most recently ${ordered ? "updated" : "created"} ${what}pull requests, not all of them: how many there are in all is not known`
+        + (ordered && !settled ? `, and older ones may have ${state === "merged" ? "merged" : "closed"} later than some shown` : ""),
+  });
+}
+
+/** The workflow run of a GitHub Actions check run, from its details address (`.../actions/runs/<run>/job/<job>`), or null. */
+function actionsRunOf(c: Record<string, any>): number | null {
+  if (c?.app?.slug !== "github-actions" || typeof c.details_url !== "string") return null;
+  const m = /\/actions\/runs\/(\d{1,20})\/job\/\d+/.exec(c.details_url);
+  const n = m ? Number(m[1]) : NaN;
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+/** A search's qualifiers that name where to search: GitHub refuses some tokens a search that carries one. */
+const SCOPED_SEARCH_RE = /(^|\s)-?(repo|org|user):/i;
+
+/**
+ * A search narrowed with repo:, org: or user: that GitHub refused (422): fine-grained tokens of another owner are refused such a
+ * search even where they read the repository itself. The same pull requests and issues are read by listing the repository. Fixed
+ * words: a failed read says nothing GitHub sent (`readFailure`).
+ */
+const SCOPED_SEARCH_REFUSED = "GitHub answered 422: a search narrowed with repo:, org: or user: is refused for some tokens (a fine-grained "
+  + "token of another owner) even where the repository itself can be read. List the repository instead: pr_list with repo, state "
+  + "and author for pull requests, issue_list with repo and state for issues; both say how many there are";
+
+/** The most pages of 100 a list reads to filter or order it: past them it says it did not read to the end. */
+const MAX_SCAN_PAGES = 5;
+
 const REPO = z.string().describe("The repository, owner/name");
 const NUMBER = z.number().int().min(1).describe("The pull request or issue number");
-const PER_PAGE = z.number().int().min(1).max(50).optional().describe("Default 20");
+const PER_PAGE = z.number().int().min(1).max(100).optional().describe("Default 50");
 const PAGE = z.number().int().min(1).max(100).optional();
+const LIST_PER_PAGE = 50;
 
 const THREADS_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) { pullRequest(number: $number) { reviewThreads(first: 100) { nodes {
@@ -268,7 +397,9 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
   mcp.tool("repo_list", "List repositories, most recently pushed first: with no owner, the ones the user can reach (their own, ones they collaborate on and their organizations'); with owner, that user's or organization's.", {
     owner: z.string().optional().describe("A user or organization login; leave out for the user's own"), per_page: PER_PAGE, page: PAGE,
   }, (a) => answer("repo_list", async () => {
-    const q: Record<string, string | number> = { sort: "pushed", per_page: a.per_page ?? 20, page: a.page ?? 1 };
+    const perPage = a.per_page ?? LIST_PER_PAGE;
+    const page = a.page ?? 1;
+    const q: Record<string, string | number> = { sort: "pushed", per_page: perPage, page };
     let list: any[] | null;
     if (!a.owner) {
       list = (await gh.get<any[]>("/user/repos", q)).json;
@@ -278,27 +409,37 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
       const org = await gh.get<any[]>(`/orgs/${encodeURIComponent(a.owner)}/repos`, q, [404]);
       list = org.status === 404 ? (await gh.get<any[]>(`/users/${encodeURIComponent(a.owner)}/repos`, q)).json : org.json;
     }
-    return (list ?? []).map((r) => ({
+    const items = (list ?? []).map((r) => ({
       repo: r.full_name, private: r.private, archived: r.archived, fork: r.fork, default_branch: r.default_branch,
       description: r.description, url: r.html_url, pushed_at: r.pushed_at, open_issues_and_prs: r.open_issues_count,
     }));
-  }, (v) => on(each(v).map((r) => (typeof r.url === "string" ? { url: r.url, title: str(r.repo), kind: "github_repo" as const } : null)))));
+    return pageAnswer(items, perPage, page);
+  }, (v) => on(each(v?.items).map((r) => (typeof r.url === "string" ? { url: r.url, title: str(r.repo), kind: "github_repo" as const } : null)))));
 
   mcp.tool("pr_get", "A pull request: title, state, author, branches, head sha, mergeability, size and description.", {
     repo: REPO, number: NUMBER,
   }, (a) => answer("pr_get", async () => prSummary((await gh.get<any>(repoPath(repoOf(a.repo), `/pulls/${a.number}`))).json),
     (v) => on([itemSource(repoName(a.repo), v, true)])));
 
-  mcp.tool("pr_list", "List pull requests of a repository, newest first.", {
-    repo: REPO, state: z.enum(["open", "closed", "all"]).optional(), head: z.string().optional().describe("owner:branch"),
-    base: z.string().optional(), per_page: PER_PAGE, page: PAGE,
+  mcp.tool("pr_list", "List pull requests of a repository. state open (the default) or all: newest first; closed: most recently closed first; merged: only the merged ones, most recently merged first (use it for \"what merged last\"). author keeps one person's. Says how many there are (total_count) and whether every one is shown (complete).", {
+    repo: REPO, state: z.enum(["open", "closed", "merged", "all"]).optional(),
+    author: z.string().optional().describe("A user login: only the pull requests this person opened"),
+    head: z.string().optional().describe("owner:branch"), base: z.string().optional(), per_page: PER_PAGE, page: PAGE,
   }, (a) => answer("pr_list", async () => {
-    const q: Record<string, string | number> = { state: a.state ?? "open", per_page: a.per_page ?? 20, page: a.page ?? 1 };
-    if (a.head) q.head = a.head;
-    if (a.base) q.base = a.base;
-    const list = (await gh.get<any[]>(repoPath(repoOf(a.repo), "/pulls"), q)).json ?? [];
-    return list.map((p) => { const { body: _b, ...rest } = prSummary(p); return rest; });
-  }, (v) => on(each(v).map((p) => itemSource(repoName(a.repo), p, true)))));
+    const r = repoOf(a.repo);
+    const state = a.state ?? "open";
+    const perPage = a.per_page ?? LIST_PER_PAGE;
+    const page = a.page ?? 1;
+    if (a.author !== undefined && !isValidOwner(a.author)) throw new BadInput("author must be a user login");
+    const filter: Record<string, string> = {};
+    if (a.head) filter.head = a.head;
+    if (a.base) filter.base = a.base;
+    if ((state === "open" || state === "all") && a.author === undefined) {
+      const list = (await gh.get<any[]>(repoPath(r, "/pulls"), { ...filter, state, sort: "created", direction: "desc", per_page: perPage, page })).json ?? [];
+      return pageAnswer(list.map(prLine), perPage, page);
+    }
+    return scanPulls(gh, r, filter, state, a.author ?? null, perPage, page);
+  }, (v) => on(each(v?.items).map((p) => itemSource(repoName(a.repo), p, true)))));
 
   mcp.tool("pr_files", "The files a pull request changes, with each file's patch (long patches are cut).", {
     repo: REPO, number: NUMBER, page: PAGE,
@@ -321,7 +462,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     return reviews.map((r) => ({ id: r.id, author: login(r.user), state: r.state, submitted_at: r.submitted_at, commit: r.commit_id, body: r.body ?? "" }));
   }));
 
-  mcp.tool("checks_list", "The CI of a commit, branch or tag: every check run (its id is the job id job_logs takes) and every commit status.", {
+  mcp.tool("checks_list", "The CI of a commit, branch or tag: every check run (its id is the job id job_logs takes; a GitHub Actions job also gives the run_id of its workflow run, which checks_rerun_failed takes) and every commit status.", {
     repo: REPO, ref: z.string().describe("A commit sha (a pull request's head_sha), branch or tag"),
   }, (a) => answer("checks_list", async () => {
     const r = repoOf(a.repo);
@@ -331,7 +472,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     return {
       check_runs: (runs?.check_runs ?? []).map((c: any) => ({
         id: c.id, name: c.name, status: c.status, conclusion: c.conclusion, app: c.app?.slug, url: c.details_url,
-        started_at: c.started_at, completed_at: c.completed_at,
+        ...(actionsRunOf(c) ? { run_id: actionsRunOf(c) } : {}), started_at: c.started_at, completed_at: c.completed_at,
       })),
       combined_state: status?.state,
       statuses: (status?.statuses ?? []).map((s: any) => ({ context: s.context, state: s.state, description: s.description, url: s.target_url })),
@@ -371,24 +512,42 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     };
   }, (v) => on([itemSource(repoName(a.repo), v)])));
 
-  mcp.tool("issue_list", "List issues of a repository (pull requests are included and marked).", {
+  mcp.tool("issue_list", "List issues of a repository (pull requests are included and marked), most recently created first. Says how many there are when the list ends on this page (total_count) and whether every one is shown (complete).", {
     repo: REPO, state: z.enum(["open", "closed", "all"]).optional(), labels: z.string().optional().describe("Comma-separated label names"),
     per_page: PER_PAGE, page: PAGE,
   }, (a) => answer("issue_list", async () => {
-    const q: Record<string, string | number> = { state: a.state ?? "open", per_page: a.per_page ?? 20, page: a.page ?? 1 };
+    const perPage = a.per_page ?? LIST_PER_PAGE;
+    const page = a.page ?? 1;
+    const q: Record<string, string | number> = { state: a.state ?? "open", per_page: perPage, page };
     if (a.labels) q.labels = a.labels;
-    return ((await gh.get<any[]>(repoPath(repoOf(a.repo), "/issues"), q)).json ?? []).map(issueSummary);
-  }, (v) => on(each(v).map((i) => itemSource(repoName(a.repo), i)))));
+    return pageAnswer(((await gh.get<any[]>(repoPath(repoOf(a.repo), "/issues"), q)).json ?? []).map(issueLine), perPage, page);
+  }, (v) => on(each(v?.items).map((i) => itemSource(repoName(a.repo), i)))));
 
-  mcp.tool("issue_search", "Search pull requests and issues across GitHub, as the user, with GitHub's search syntax: `is:pr is:open author:@me` (the user's open pull requests), `is:pr is:open review-requested:@me`, `is:issue is:open assignee:@me`; narrow with `repo:owner/name` or `org:name`. Returns the total count and the matches, most recently updated first.", {
+  mcp.tool("issue_search", "Search pull requests and issues across GitHub, as the user, with GitHub's search syntax: `is:pr is:open author:@me` (the user's open pull requests), `is:pr is:open review-requested:@me`, `is:issue is:open assignee:@me`; narrow with `repo:owner/name` or `org:name` (some tokens are refused such a search: then list the repository with pr_list or issue_list). Returns the total count (total_count) and the matches, most recently updated first, and whether every match is shown (complete); list them all from `items`.", {
     query: z.string().min(1).max(256).describe("GitHub search syntax; @me is the user"),
     sort: z.enum(["updated", "created", "comments"]).optional().describe("Default updated"), per_page: PER_PAGE, page: PAGE,
   }, (a) => answer("issue_search", async () => {
-    const res = (await gh.get<any>("/search/issues", { q: a.query, sort: a.sort ?? "updated", order: "desc", per_page: a.per_page ?? 20, page: a.page ?? 1 })).json;
-    return {
-      total_count: res?.total_count, incomplete_results: res?.incomplete_results,
-      items: (res?.items ?? []).map((i: any) => ({ repo: repoOfUrl(i.repository_url), ...issueSummary(i), ...(i.pull_request ? { draft: i.draft === true } : {}) })),
-    };
+    const perPage = a.per_page ?? LIST_PER_PAGE;
+    const page = a.page ?? 1;
+    let res: any;
+    try {
+      res = (await gh.get<any>("/search/issues", { q: a.query, sort: a.sort ?? "updated", order: "desc", per_page: perPage, page })).json;
+    } catch (err) {
+      if (err instanceof GithubError && err.status === 422 && SCOPED_SEARCH_RE.test(a.query)) {
+        logger.warn({ tool: "issue_search", status: err.status, requestId: err.requestId }, "github_mcp.scoped_search_refused");
+        throw new BadInput(SCOPED_SEARCH_REFUSED);
+      }
+      throw err;
+    }
+    const items = (res?.items ?? []).map((i: any) => ({ repo: repoOfUrl(i.repository_url), ...issueLine(i), ...(i.pull_request ? { draft: i.draft === true } : {}) }));
+    const total = typeof res?.total_count === "number" ? res.total_count : null;
+    const seen = (page - 1) * perPage + items.length;
+    return listAnswer(items, {
+      total_count: total,
+      complete: page === 1 && total !== null && items.length >= total && res?.incomplete_results !== true,
+      next_page: total !== null && seen < total && items.length === perPage ? page + 1 : null,
+      ...(res?.incomplete_results === true ? { note: "GitHub's search timed out before it found every match: total_count may be low" } : {}),
+    });
   }, (v) => on(each(v?.items).map((i) => itemSource(typeof i.repo === "string" ? i.repo : undefined, i)))));
 
   mcp.tool("review_threads_list", "The review threads of a pull request: id (for review_thread_reply / review_thread_resolve), resolved or not, file, line and comments.", {
@@ -407,11 +566,16 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
   mcp.tool("code_search", "Search code on GitHub (GitHub's code search syntax, e.g. `foo repo:owner/name path:src`).", {
     query: z.string().min(1).max(256), per_page: PER_PAGE, page: PAGE,
   }, (a) => answer("code_search", async () => {
-    const res = (await gh.get<any>("/search/code", { q: a.query, per_page: a.per_page ?? 20, page: a.page ?? 1 })).json;
-    return {
-      total_count: res?.total_count,
-      items: (res?.items ?? []).map((i: any) => ({ repo: i.repository?.full_name, path: i.path, url: i.html_url })),
-    };
+    const perPage = a.per_page ?? LIST_PER_PAGE;
+    const page = a.page ?? 1;
+    const res = (await gh.get<any>("/search/code", { q: a.query, per_page: perPage, page })).json;
+    const items = (res?.items ?? []).map((i: any) => ({ repo: i.repository?.full_name, path: i.path, url: i.html_url }));
+    const total = typeof res?.total_count === "number" ? res.total_count : null;
+    return listAnswer(items, {
+      total_count: total,
+      complete: page === 1 && total !== null && items.length >= total,
+      next_page: total !== null && (page - 1) * perPage + items.length < total && items.length === perPage ? page + 1 : null,
+    });
   }, (v) => on(each(v?.items).map((i) => (typeof i.url === "string" ? { url: i.url, title: `${str(i.repo)} ${str(i.path)}`.trim(), kind: "github_file" as const } : null)))));
 
   // ---- writes: each waits for the user's decision ----
@@ -468,6 +632,39 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
       "mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { id isResolved } } }", { id: a.thread_id },
     );
     return { id: data?.resolveReviewThread?.thread?.id, resolved: data?.resolveReviewThread?.thread?.isResolved };
+  }));
+
+  mcp.tool("checks_rerun_failed", "Run again the failed jobs of a GitHub Actions workflow run, and the jobs that depend on them (its run_id from checks_list). Waits for the user's approval.", {
+    repo: REPO, run_id: z.number().int().min(1).describe("The workflow run: run_id of a check run in checks_list"),
+  }, (a) => answer("checks_rerun_failed", async () => {
+    await gh.request("POST", repoPath(repoOf(a.repo), `/actions/runs/${a.run_id}/rerun-failed-jobs`), { body: {} });
+    return { run_id: a.run_id, rerun: "the failed jobs and the jobs that depend on them" };
+  }));
+
+  mcp.tool("pr_request_reviewers", "Ask people (logins) or teams (slugs of the repository's organization) to review a pull request. Waits for the user's approval.", {
+    repo: REPO, number: NUMBER,
+    reviewers: z.array(z.string().min(1).max(39)).max(15).optional().describe("User logins"),
+    team_reviewers: z.array(z.string().min(1).max(100)).max(15).optional().describe("Team slugs"),
+  }, (a) => answer("pr_request_reviewers", async () => {
+    const reviewers = a.reviewers ?? [];
+    const teams = a.team_reviewers ?? [];
+    if (!reviewers.length && !teams.length) throw new BadInput("name at least one reviewer or team");
+    if (!reviewers.every(isValidOwner)) throw new BadInput("reviewers must be user logins");
+    const p = (await gh.request<any>("POST", repoPath(repoOf(a.repo), `/pulls/${a.number}/requested_reviewers`), {
+      body: { ...(reviewers.length ? { reviewers } : {}), ...(teams.length ? { team_reviewers: teams } : {}) },
+    })).json;
+    return {
+      number: p?.number, url: p?.html_url,
+      requested_reviewers: Array.isArray(p?.requested_reviewers) ? p.requested_reviewers.map(login) : undefined,
+      requested_teams: Array.isArray(p?.requested_teams) ? p.requested_teams.map((t: { slug?: string }) => t.slug) : undefined,
+    };
+  }));
+
+  mcp.tool("labels_set", "Set the labels of an issue or pull request to exactly this list: labels not in it are taken off, and an empty list takes every label off. Waits for the user's approval.", {
+    repo: REPO, number: NUMBER, labels: z.array(z.string().min(1).max(100)).max(100).describe("The whole list of labels it should carry"),
+  }, (a) => answer("labels_set", async () => {
+    const set = (await gh.request<any[]>("PUT", repoPath(repoOf(a.repo), `/issues/${a.number}/labels`), { body: { labels: a.labels } })).json ?? [];
+    return { number: a.number, labels: set.map((l: { name?: string }) => l.name) };
   }));
 
   return mcp;

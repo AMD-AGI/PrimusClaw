@@ -12,7 +12,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { assertSessionCredentialsForDispatch, stampSessionCredentials } from "../auth/session-credentials.js";
 import { getUser } from "../auth/middleware.js";
-import { TRIGGER_MIN_INTERVAL_MINUTES } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, TRIGGER_MIN_INTERVAL_MINUTES } from "../config.js";
 import { db } from "../infra/db.js";
 import { checkSchedule, nextFireAfter } from "../triggers/schedule.js";
 import {
@@ -41,6 +41,11 @@ export async function registerTriggerRoutes(app: FastifyInstance): Promise<void>
     if (!user) return;
     const parsed = parseTriggerInput((req.body ?? {}) as Record<string, unknown>);
     if (!parsed.ok) return reply.status(400).send({ ok: false, error: parsed.error });
+    // A brief is said through the owner's assistant: without one it would reach nobody, and fail until it paused.
+    if (parsed.input.action === "brief" && (!CLAW_ASSISTANT_ENABLED
+        || !(await db.query("SELECT 1 FROM claw_assistants WHERE user_id = $1", [user.userId])).rowCount)) {
+      return reply.status(400).send({ ok: false, error: "brief_needs_assistant" });
+    }
     try {
       assertSessionCredentialsForDispatch("trigger", user);
     } catch {

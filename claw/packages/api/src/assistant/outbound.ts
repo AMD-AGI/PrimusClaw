@@ -19,13 +19,14 @@ import pino from "pino";
 import { CLAW_ASSISTANT_SAY_MAX_PER_HOUR, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { publishEvent } from "../events/store.js";
-import { HOLD_SECONDS, heldStatus } from "./say-hold.js";
+import { HOLD_SECONDS, heldStatus, turnAnnouncedStart } from "./say-hold.js";
 import { db, FAILOVER_RETRY_DELAY_MS, inTransaction, isFailoverError, neverCommitted, type Querier } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import {
   ASSISTANT_EVENT_TYPES,
   type AssistantItemSnapshot,
   type AssistantConfirmAction,
+  type AssistantConfirmWrite,
   type AssistantSayPayload,
   type AssistantSaySource,
   type WorkItemNeedsYouPayload,
@@ -40,7 +41,7 @@ const logger = pino({ name: "assistant-outbound" });
 /** The longest message the assistant may say: about a hundred words. */
 export const SAY_TEXT_MAX = 600;
 
-export type SayRefusal = "empty_text" | "text_too_long" | "item_not_found" | ItemRefError | "say_rate_limited" | "handed_off";
+export type SayRefusal = "empty_text" | "text_too_long" | "item_not_found" | ItemRefError | "say_rate_limited" | "handed_off" | "already_announced";
 
 /** A say that was not stored. `code` is what the caller tells the model. */
 export class SayRefused extends Error {
@@ -78,6 +79,8 @@ export interface SayInput {
   sources?: AssistantSaySource[];
   /** Its deliveries are held until this turn (a message id) ends or hands a review over (`say-hold.ts`). */
   holdForTurn?: string;
+  /** When the turn that says it began: a turn whose item's start the system told the user says nothing more (`turnAnnouncedStart`). */
+  turnBegan?: Date | string;
 }
 
 export interface SayDeps {
@@ -140,7 +143,8 @@ interface ToStoreBase {
 
 type ToStore =
   | (ToStoreBase & {
-    type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; sources?: AssistantSaySource[];
+    type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; confirmWrite?: AssistantConfirmWrite;
+    sources?: AssistantSaySource[];
   })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow });
 
@@ -152,6 +156,7 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
     : {
       ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}),
       ...(m.sources?.length ? { sources: m.sources } : {}),
+      ...(m.confirmWrite ? { confirm_write: m.confirmWrite } : {}),
     };
 }
 
@@ -201,6 +206,10 @@ async function announce(stored: Stored, deps: SayDeps, turnMessageId?: string): 
         text: payload.text,
         ...(payload.item ? { item: payload.item } : {}),
         ...(payload.type === "assistant.say" && payload.sources ? { sources: payload.sources } : {}),
+        // What the message puts to the person to press, as a channel gets it: a web client, and an evaluation reading the session,
+        // must see the card the channel draws, not only its words.
+        ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
+        ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
         fallback: payload.type === "work_item.needs_you",
         ts: Date.parse(payload.occurred_at),
       });
@@ -453,6 +462,9 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
       if (await turnHandedOffReview(q, input.userId, input.turnMessageId)) {
         throw new SayRefused("handed_off", HANDED_OFF_REFUSAL);
       }
+      if (input.turnBegan && await turnAnnouncedStart(q, input.userId, input.turnBegan)) {
+        throw new SayRefused("already_announced", ALREADY_ANNOUNCED_REFUSAL);
+      }
       // One say at a time per user: the cap counts stored rows, and without this a burst
       // all count the same number and all insert.
       await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
@@ -531,6 +543,10 @@ export async function recordNeedsYouFallback(input: { itemId: string }, deps: Sa
   return { say_id: stored.sayId, subscribers: stored.subscribers };
 }
 
+/** What the router is told when the system already told the user, in this turn, that the item they asked for started. */
+export const ALREADY_ANNOUNCED_REFUSAL = "the system has already told the user in this turn that the item started (its number and title): "
+  + "nothing was sent, as a second message would repeat it. Say nothing more in this turn: end it.";
+
 /** What the router is told when its turn handed a review to the person's channel and then tried to speak. */
 export const HANDED_OFF_REFUSAL = "this turn handed a review to the user's chat, which answers this message about it itself, in one message: "
   + "nothing was sent. Say nothing more in this turn: end it.";
@@ -555,15 +571,19 @@ export async function turnHandedOffReview(q: Querier, userId: string, messageId:
  * limit nor taken for the turn having spoken. Once per `key`: a second call stores nothing and returns `null`.
  */
 export async function recordSystemNotice(
-  input: { userId: string; sessionId: string; text: string; key: string }, deps: SayDeps = {},
+  input: {
+    userId: string; sessionId: string; text: string; key: string;
+    /** The item it is about, attached as a say's is; and the message of the turn it answers, as on a say's event. */
+    itemId?: string; turnMessageId?: string;
+  }, deps: SayDeps = {},
 ): Promise<SayOutcome | null> {
-  const stored = await storeSettled((_q, storeOne) => storeOne({
-    type: "assistant.say", fallback: true, item: null,
+  const stored = await storeSettled(async (q, storeOne) => storeOne({
+    type: "assistant.say", fallback: true, item: input.itemId ? await loadItem(q, input.itemId, input.userId) : null,
     sayId: deterministicEventId("assistant.notice", input.userId, input.key),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
-  }), (late) => announce(late, deps));
+  }), (late) => announce(late, deps, input.turnMessageId));
   if (!stored) return null;
-  await announce(stored, deps);
+  await announce(stored, deps, input.turnMessageId);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
 }
 
@@ -579,6 +599,23 @@ export async function recordActionConfirm(
   const stored = await store(q, {
     type: "assistant.say", fallback: true, item: null, confirmAction: input.action,
     sayId: deterministicEventId("assistant.confirm_action", input.userId, input.key),
+    userId: input.userId, sessionId: input.sessionId, text: input.text,
+  });
+  if (!stored) return null;
+  return { sayId: stored.sayId, subscribers: stored.subscribers, announce: () => announce(stored, deps) };
+}
+
+/**
+ * A write the router proposed, put to the person with a button (`schedules.ts`): a message in the system's own words saying what
+ * would be done, carrying the confirmation for a channel to draw as a card. Stored in the caller's transaction, as a fallback, once per
+ * confirmation: `null` when it was stored before. `announce` after the commit.
+ */
+export async function recordWriteConfirm(
+  q: Querier, input: { userId: string; sessionId: string; text: string; confirm: AssistantConfirmWrite }, deps: SayDeps = {},
+): Promise<{ sayId: string; subscribers: number; announce: () => Promise<void> } | null> {
+  const stored = await store(q, {
+    type: "assistant.say", fallback: true, item: null, confirmWrite: input.confirm,
+    sayId: deterministicEventId("assistant.confirm_write", input.userId, input.confirm.confirmation_id),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
   });
   if (!stored) return null;

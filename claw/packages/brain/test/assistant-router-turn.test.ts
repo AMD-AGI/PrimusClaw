@@ -34,8 +34,8 @@ async function startAutopilot(): Promise<{ url: string; calls: string[]; close()
     req.on("data", (c) => (raw += c));
     req.on("end", async () => {
       const server = new McpServer({ name: "autopilot", version: "1.0.0" });
-      server.tool("get_nodes", "list the fleet's nodes", async () => {
-        calls.push("get_nodes");
+      server.tool("get_status", "list the fleet's nodes", async () => {
+        calls.push("get_status");
         return { content: [{ type: "text" as const, text: "12 nodes: 11 ready, 1 cordoned" }] };
       });
       server.tool("apply_host_exclusion_add", "exclude a host", async () => {
@@ -121,7 +121,7 @@ const textOf = (content: unknown): string => typeof content === "string" ? conte
 test(`RT1 the router asked "${QUESTION}" is offered autopilot's read tool and nothing that writes`, async () => {
   const r = await run(routerRequest(), [{ text: "ok" }]);
   const mcp = r.offered.filter((n) => n.startsWith("mcp__"));
-  assert.deepEqual(mcp, ["mcp__assistant__ping", "mcp__autopilot__get_nodes"]);
+  assert.deepEqual(mcp, ["mcp__assistant__ping", "mcp__autopilot__get_status"]);
   assert.ok(!r.offered.includes("mcp__autopilot__apply_host_exclusion_add"), "the write tool is not offered");
   assert.ok(!r.offered.some((n) => n.startsWith("mcp__fleet__")), "no default server");
   assert.doesNotMatch(r.raw[0], /Available MCP servers: [^"]*fleet/, "nor is one connected and named");
@@ -132,14 +132,14 @@ const SAYS = { read_taint: { sources: ["mcp__autopilot__get_*", "mcp__autopilot_
 
 test("RT2 it reads the answer and says it, with no work item", async () => {
   const r = await run(routerRequest(SAYS), [
-    { tool: "mcp__autopilot__get_nodes", input: {} },
+    { tool: "mcp__autopilot__get_status", input: {} },
     (body) => {
       assert.match(body, /12 nodes: 11 ready, 1 cordoned/, "the read tool's answer reaches the model");
       return { tool: "mcp__assistant__ping", input: {} };
     },
     { text: "done" },
   ]);
-  assert.deepEqual(r.autopilot, ["get_nodes"], "the read ran once, against the autopilot server");
+  assert.deepEqual(r.autopilot, ["get_status"], "the read ran once, against the autopilot server");
   assert.equal(r.assistantCalls >= 1, true, "and the router spoke through its own server");
   assert.equal(r.bodies.length, 3);
   assert.ok(!r.raw.some((b) => b.includes("work_create")), "no work item was asked for");
@@ -179,23 +179,23 @@ test("RT5 after a read, an acting tool is refused before it reaches its server; 
   // ping stands in for an acting tool (review_start, memory_save, ...): it is not in allow_after.
   let told = "";
   const after = await run(routerRequest(), [
-    { tool: "mcp__autopilot__get_nodes", input: {} },
+    { tool: "mcp__autopilot__get_status", input: {} },
     { tool: "mcp__assistant__ping", input: {} },
     (body) => { told = body; return { text: "done" }; },
   ]);
   assert.match(told, /can no longer act for the user/, "the model is told why");
-  assert.deepEqual(after.autopilot, ["get_nodes"]);
+  assert.deepEqual(after.autopilot, ["get_status"]);
   assert.equal(after.assistantCalls, 0, "the acting call never reached the assistant server");
   const before = await run(routerRequest(), [
     { tool: "mcp__assistant__ping", input: {} },
-    { tool: "mcp__autopilot__get_nodes", input: {} },
-    { tool: "mcp__autopilot__get_nodes", input: {} },
+    { tool: "mcp__autopilot__get_status", input: {} },
+    { tool: "mcp__autopilot__get_status", input: {} },
     { text: "done" },
   ]);
   assert.equal(before.assistantCalls, 1, "called before any read, it runs");
-  assert.deepEqual(before.autopilot, ["get_nodes", "get_nodes"], "and the read tools themselves keep working");
+  assert.deepEqual(before.autopilot, ["get_status", "get_status"], "and the read tools themselves keep working");
   const none = await run(routerRequest({ read_taint: undefined }), [
-    { tool: "mcp__autopilot__get_nodes", input: {} },
+    { tool: "mcp__autopilot__get_status", input: {} },
     { tool: "mcp__assistant__ping", input: {} },
     { text: "done" },
   ]);
