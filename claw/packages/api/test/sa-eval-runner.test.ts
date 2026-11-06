@@ -22,6 +22,9 @@
  *      message fails the case; a sub-agent's message is not the first reply; the final answer's time is when it was shown, not
  *      the turn's end), and the session is deleted and seen gone; R5b with two turns, what is graded of the last turn is its
  *      own (another turn's message delivered again is not its answer)
+ *   R7 a stream that missed a stored event of the case (a leak in a say it never delivered): an error, not a grade; an item whose
+ *      work_create answer the stream missed is still closed with its worker's session; an assistant session still running
+ *      before a case: nothing is sent, an error
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -59,6 +62,8 @@ class FakeClaw {
   boardDelayMs = 0;
   boardReads = 0;
   router: (content: string, messageId: string, sessionId: string) => void = () => {};
+  /** Stored events the stream does not deliver (a stream stalled without dropping). */
+  hidden: (data: Record<string, unknown>) => boolean = () => false;
   private readonly streams = new Map<string, Set<ServerResponse>>();
   private server!: Server;
   private n = 0;
@@ -80,7 +85,7 @@ class FakeClaw {
     this.rows.set(sessionId, [...(this.rows.get(sessionId) ?? []), row]);
     if (row.event_type === "exec_complete") this.settledAt.set(String(data.message_id), Date.now());
     // The API keeps exec_complete from a stream (`routes/events.ts`).
-    if (row.event_type === "exec_complete") return;
+    if (row.event_type === "exec_complete" || this.hidden(data)) return;
     for (const s of this.streams.get(sessionId) ?? []) s.write(frame(row));
   }
 
@@ -511,5 +516,41 @@ test("R6 a turn with no end on the stream", { timeout: 120_000 }, async () => {
     assert.match(run.out, /ERROR t-stats-001#1 .*no end of the turn of msg-6 within 2 s of its message: not graded/, "executionStats alone is not the end");
     assert.match(run.out, /cleanup: turns of the run still running at its end \(what they start is not closed\): msg-1,msg-6\n/, "the turns still running are named by the stored events");
     assert.deepEqual(claw.calls.filter((c) => c.startsWith("DELETE")), ["DELETE /v1/sessions/asst-1"]);
+  } finally { rmSync(r.dir, { recursive: true, force: true }); }
+});
+
+test("R7 what the stream missed is not graded; the run's items are still closed", { timeout: 120_000 }, async () => {
+  const claw = new FakeClaw();
+  const base = await claw.start();
+  // The stream misses the work_create answer and a say with a tool name in it; both are stored.
+  claw.hidden = (d) => (d.type === "toolUsed" && d.tool === "mcp__assistant__work_create" && d.status === "success") || (d.type === "AssistantSay" && String(d.text).includes("mcp__"));
+  claw.router = (content, id) => {
+    claw.turn(id, { item: item(1, { board_state: "in_progress", can_accept: false }), say: "On it." });
+    claw.emit({ type: "AssistantSay", say_id: `leak-${id}`, turn_message_id: id, text: "I called mcp__safe__node_list." });
+  };
+  const r = runner(base, [itemCase({ item_wait_s: 1 })]);
+  const run = await r.done;
+  await claw.stop();
+  try {
+    assert.match(run.out, /ERROR t-items-001#1 .*the stream missed 2 stored event\(s\) of the case/, run.out);
+    assert.deepEqual(claw.calls.filter((c) => c.includes("/stop") || c.includes("/accept")), ["POST /v1/work-items/item-1/stop"], "tied by its stored work_create answer and closed");
+    assert.ok(claw.calls.includes("DELETE /v1/sessions/worker-1") && !claw.sessions.has("worker-1"));
+    assert.doesNotMatch(run.out, /not tied to the run's calls/);
+  } finally { rmSync(r.dir, { recursive: true, force: true }); }
+});
+
+test("R7b an assistant session still running before a case: nothing is sent", { timeout: 120_000 }, async () => {
+  const claw = new FakeClaw();
+  const base = await claw.start();
+  // The first case's turn leaves the session running (a conversation that goes on).
+  claw.router = (_content, id) => { claw.turn(id, { say: "Done." }); claw.sessions.get(claw.assistant)!.status = "running"; };
+  const answer = (id: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: id }] });
+  const r = runner(base, [answer("t-a-001"), answer("t-a-002")], { EVAL_TURN_WAIT_S: "2" });
+  const run = await r.done;
+  await claw.stop();
+  try {
+    assert.match(run.out, /pass t-a-001#1/, run.out);
+    assert.match(run.out, /ERROR t-a-002#1 .*the assistant session was still running 2 s before t-a-002: nothing sent/);
+    assert.deepEqual(claw.sent.map((x) => x.content), ["t-a-001"]);
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });

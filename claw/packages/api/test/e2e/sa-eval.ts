@@ -63,8 +63,10 @@
  *                     0 turns the pace off. The says of an assistant session a run deleted cannot be read back and still
  *                     count: each run keeps the hour's says it saw in EVAL_SAY_LOG (default: a file per identity under
  *                     ~/.cache/sa-eval) for the next run on the same host
- *   EVAL_TURN_WAIT_S  how long a turn may take to end (default 180 for a router turn, 600 for a plain session's): a turn whose
- *                     end neither the stream nor the session's stored events show by then makes the attempt an error, not a grade
+ *   EVAL_TURN_WAIT_S  how long a turn may take to end (default 180 for a router turn, 600 for a plain session's), counted from
+ *                     its own message: a turn whose exec_complete is not stored by then makes the attempt an error, not a grade;
+ *                     so does an assistant session still running that long before a case. An attempt is graded on what the
+ *                     stream showed only when it showed every stored event of the case (15 s grace); otherwise it is an error
  *   EVAL_QUIET_S      the assistant mode refuses to start when the identity's assistant session has a turn running, or had any
  *                     event less than this many seconds ago (default 300; 0 checks only for a running turn): another run, or a
  *                     person, is using the identity. Each run going at the same time needs an identity of its own
@@ -99,10 +101,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   BUILTIN_TOOLS, assistantInUse, capRefusedSays, caseHash, caseSays, cardsOf, cleanupOf, countedSays, countedSaysOf, deleteSessionConfirmed,
-  mergeSays, parseSayLog, endedTurns, storedTurnEnds, filledCase, finalSay, grade, forRecording, identityRefusal, itemsStartedBy, judgePrompt,
-  loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf, sayWaitMs,
-  saysOf, staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest, holdAnswers,
-  toolPattern,
+  mergeSays, parseSayLog, endedTurns, storedTurnEnds, streamMissed, filledCase, finalSay, grade, forRecording, identityRefusal, itemsStartedBy,
+  judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf,
+  sayWaitMs, saysOf, staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
+  holdAnswers, toolPattern,
   type SayMark, type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
@@ -418,7 +420,8 @@ const attemptOf = async (c: EvalCase, turns: Turn[], o: Observed, tools: string[
 // --- One attempt on the assistant path ------------------------------------------------------------------------------
 
 async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, stream: LiveStream): Promise<Attempt> {
-  if (!(await idle(sessionId, 180_000))) log(`assistant still busy before ${c.id}; sending anyway (the message is queued)`);
+  // Never into a conversation still going: its messages and items would be taken for this case's.
+  if (!(await idle(sessionId, turnWaitMs(true)))) throw new Error(`the assistant session was still running ${turnWaitMs(true) / 1000} s before ${c.id}: nothing sent, not graded`);
   const floor = Math.max(0, ...(await board()).map((i) => i.seq));
   const values = await factValues(c);
   const start = Date.now();
@@ -466,6 +469,11 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
     await waitFor(() => (items.every((i) => i.board_state === "in_progress"
       || saysOf(stream.events).some((s) => s.itemId === i.item_id && s.itemState !== "in_progress")) ? true : undefined), Date.now() + 30_000, 1_000);
   }
+  // What is graded is what the stream showed, so only when it showed every stored event of the case's turns and of what was
+  // said about its items (a stream stalled without dropping would hide a leak, a card or a work_create); it gets 15 s to catch up.
+  const missed = async (): Promise<string[]> => streamMissed(await replay(sessionId).catch(() => null), stream.events, messageIds, items.map((i) => i.item_id));
+  let gaps = await missed();
+  if (gaps.length) await waitFor(async () => ((gaps = await missed()).length ? undefined : true), Date.now() + 15_000, 3_000);
   // What is graded is the last turn (earlier turns are its context and may start items of their own): its Router turn's
   // calls, the items that turn started and their workers' calls, what was said in it and about those items. Leaks are
   // looked for in everything the case showed; latencies run from the last turn's sending.
@@ -497,6 +505,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
     const seen = items.find((x) => x.item_id === i.item_id) ?? i;
     cleaned.push({ seq: i.seq, kind: i.kind, board_state: seen.board_state, cleanup: await closeItem(i) });
   }
+  if (gaps.length) throw new Error(`the stream missed ${gaps.length} stored event(s) of the case (${gaps.slice(0, 3).join(",")}): not graded`);
   return attemptOf(c, turns, observed, allCalls.map((x) => x.name), cleaned);
 }
 
@@ -655,7 +664,17 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
       await waitTurn(mids.length - 1);
     }
     await sleep(3_000);
-    const rows = await replay(sessionId);
+    let rows = await replay(sessionId);
+    // Graded is what the stream showed, so only when it showed every stored event of the case's turns (15 s to catch up).
+    const sentIds = mids.filter((m): m is string => !!m);
+    let gaps = streamMissed(rows, stream.events, sentIds);
+    if (gaps.length) {
+      await waitFor(async () => {
+        rows = await replay(sessionId).catch(() => rows);
+        return (gaps = streamMissed(rows, stream.events, sentIds)).length ? undefined : true;
+      }, Date.now() + 15_000, 3_000);
+    }
+    if (gaps.length) throw new Error(`the stream missed ${gaps.length} stored event(s) of the case (${gaps.slice(0, 3).join(",")}): not graded`);
     const all = traceOf(rows);
     const last = turns.length - 1;
     const lastMid = mids[last];
@@ -668,10 +687,12 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
     const storedFinal = rows.filter((r) => (r.data?.type ?? r.event_type) === "exec_complete" && !r.data?.subagent_id
       && (!lastMid || r.data?.message_id === lastMid)).at(-1)?.data?.final_text;
     const finalText = lastReplies.length ? messagesOf(lastReplies).at(-1) ?? "" : (typeof storedFinal === "string" ? storedFinal : "");
-    const shown = messagesOf(stream.events);
+    // A final answer that only the stored exec_complete had is checked with what was shown as well.
+    const streamed = messagesOf(stream.events);
+    const shown = finalText && !streamed.includes(finalText) ? [...streamed, finalText] : streamed;
     const firstText = turns.map((_, k) => repliesOf(k)[0]?.at ?? null);
     const observed: Observed = {
-      mode: MODE, calls: lastTrace.calls, shown: shown.length ? shown : [finalText], final: finalText,
+      mode: MODE, calls: lastTrace.calls, shown, final: finalText,
       firstReplyMs: firstText[last] === null ? null : firstText[last]! - sentAt[last]!,
       finalMs: lastReplies.length ? lastReplies.at(-1)!.at - sentAt[last]! : null,
       replyMs: firstText.map((a, k) => (a === null ? null : a - sentAt[k]!)), items: [], factValues: values,
@@ -836,8 +857,10 @@ async function main(): Promise<void> {
             const stored = storedTurnEnds(await replay(sessionId).catch(() => []));
             cleanupFailed.push(`turns of the run still running at its end (what they start is not closed): ${RUN_MESSAGES.filter((id) => !stored.includes(id)).join(",") || "(the stored events could not be read)"}`);
           }
+          // From the stream and from the stored events: a work_create answer the stream missed still ties its item to the run.
           const above = (await board()).filter((x) => x.seq > floorAtStart);
-          for (const i of itemsStartedBy(turnCalls(stream.events, RUN_MESSAGES), above)) RUN_ITEMS.add(i.item_id);
+          const storedCalls = traceOf((await replay(sessionId).catch(() => [])).filter((r) => RUN_MESSAGES.includes(String(r.data?.message_id ?? "")))).calls;
+          for (const i of itemsStartedBy([...turnCalls(stream.events, RUN_MESSAGES), ...storedCalls], above)) RUN_ITEMS.add(i.item_id);
         }
         for (const i of (await board()).filter((x) => RUN_ITEMS.has(x.item_id) && !CLEARED.has(x.item_id))) log(`closing #${i.seq}: ${await closeItem(i)}`);
         await sleep(5_000);

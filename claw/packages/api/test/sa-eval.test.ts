@@ -35,6 +35,8 @@
  *   S19 the say cap: the wait before a case keeps the hour's counted says and the reserve within the budget; fallbacks are not
  *       counted; says from the stream, the stored events and an earlier run's log are counted once each; a say refused for the
  *       cap is counted
+ *   S21 the stream showed everything a case is graded on: every stored event of its turns and of what was said about its items,
+ *       a turn's exec_complete aside; stored events that could not be read are a gap
  *   S20 sharing an identity: a running or recently active assistant session refuses the run; a session is deleted only when a GET
  *       then answers 404, a refusal ends the attempt
  */
@@ -52,7 +54,7 @@ import {
   type Arms,
   apiQuery, caseSays, cardsOf, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
-  assistantInUse, capRefusedSays, countedSays, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, turnEnded,
+  assistantInUse, capRefusedSays, countedSays, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded,
 } from "./e2e/sa-eval-lib.js";
 
 const SEED_DIR = join(dirname(fileURLToPath(import.meta.url)), "e2e", "sa-eval-cases");
@@ -635,4 +637,22 @@ test("S20 sharing an identity", async () => {
   assert.deepEqual(notOurs.calls, ["DELETE /v1/sessions/s1"], "a refusal is not asked again");
   const stays = fake({ DELETE: [200], GET: [200] });
   assert.equal(await deleteSessionConfirmed(stays.api, "s1", Date.now() + 50, 10, (ms) => new Promise((r) => setTimeout(r, ms))), false, "never seen gone");
+});
+
+test("S21 what the stream missed", () => {
+  const row = (event_id: string, data: Record<string, unknown>) => ({ event_id, event_type: String(data.type), created_at: new Date(0).toISOString(), data });
+  const rows = [
+    row("claw-1", { type: "toolUsed", message_id: "m1" }),
+    row("claw-2", { type: "AssistantSay", turn_message_id: "m1", text: "hi" }),
+    row("claw-3", { type: "AssistantSay", item: { item_id: "i1" }, text: "ready" }),
+    row("claw-4", { type: "exec_complete", message_id: "m1" }),
+    row("claw-5", { type: "toolUsed", message_id: "other" }),
+    row("claw-6", { type: "AssistantSay", item: { item_id: "i9" }, text: "not ours" }),
+  ];
+  const seen = (...ids: string[]) => ids.map((id) => ev(0, { type: "x" }, id));
+  assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2", "claw-3"), ["m1"], ["i1"]), [], "exec_complete is never streamed; others' events are not the case's");
+  assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-3"), ["m1"], ["i1"]), ["claw-2"], "a say of the case's turn the stream missed");
+  assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2"), ["m1"], ["i1"]), ["claw-3"], "a say about the case's item");
+  assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2"), ["m1"]), [], "an item the case did not start is not looked at");
+  assert.deepEqual(streamMissed(null, [], ["m1"]), ["(the stored events could not be read)"]);
 });

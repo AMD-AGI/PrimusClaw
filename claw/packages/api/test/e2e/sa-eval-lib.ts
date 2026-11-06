@@ -595,6 +595,25 @@ export function storedTurnEnds(rows: readonly EventRow[]): string[] {
   return out;
 }
 
+/**
+ * The stored events (`?mode=replay`, with their `event_id`, which is the stream's frame id) of the given turns, and of what was
+ * said about the given items, that the stream did not deliver: none when it showed everything a case is graded on. A turn's
+ * exec_complete is left out (a stream never carries it). Events that could not be read are a gap too.
+ */
+export function streamMissed(rows: ReadonlyArray<EventRow & { event_id?: unknown }> | null, events: readonly LiveEvent[],
+  messageIds: readonly string[], itemIds: readonly string[] = []): string[] {
+  if (!rows) return ["(the stored events could not be read)"];
+  const seen = new Set(events.map((e) => e.eventId));
+  const turns = new Set(messageIds);
+  const items = new Set(itemIds);
+  return rows.filter((r) => {
+    const d = r.data ?? {};
+    if ((d.type ?? r.event_type) === "exec_complete") return false;
+    const ours = turns.has(String(d.message_id ?? "")) || turns.has(String(d.turn_message_id ?? "")) || (d.item?.item_id !== undefined && items.has(String(d.item.item_id)));
+    return ours && !seen.has(String(r.event_id ?? ""));
+  }).map((r) => String(r.event_id ?? "?"));
+}
+
 /** What the main agent wrote in a plain session (`AssistantMessage`), in order: what its user was shown. */
 export const messagesOf = (events: readonly LiveEvent[]): string[] => events
   .filter((e) => e.data?.type === "AssistantMessage" && !e.data.subagent_id)
