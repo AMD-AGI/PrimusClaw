@@ -131,6 +131,8 @@ export function confirmText(
       : `Cancel the scheduled task "${c.name}" (${c.schedule}, ${c.timezone})? It will not run again. Press "Cancel it" below to confirm, or reply approve #${ref}.`;
   }
   const c = p as CreateParams;
+  const bounds = [c.until ? (zh ? `到 ${localTime(c.until, c.timezone)} 为止` : `until ${localTime(c.until, c.timezone)}`) : "",
+    c.max_runs ? (zh ? `最多 ${c.max_runs} 次` : `at most ${c.max_runs} runs`) : ""].filter(Boolean).join(zh ? "，" : ", ");
   if (c.action === "brief") {
     const week = briefRangeFor(c.schedule, c.timezone, nextRun ?? new Date()) === "week";
     const what = zh
@@ -138,11 +140,9 @@ export function confirmText(
       : (week ? "your weekly brief (the last seven days: items ended, pull requests merged, notifications, jobs and SaFE)"
         : "your daily brief (items, watched pull requests, notifications, jobs and SaFE)");
     return zh
-      ? `要创建定时简报「${c.name}」吗？\n时间：${c.schedule}（${c.timezone}），下次 ${localTime(nextRun, c.timezone)}（之后才确认就从再下一次开始）\n每次发给你：${what}。由 Claw 汇总，不运行模型。\n点下面的「创建」确认，或回复 批准 #${ref}。`
-      : `Create the scheduled brief "${c.name}"?\nWhen: ${c.schedule} (${c.timezone}), next ${localTime(nextRun, c.timezone)} (confirmed after that, it starts from the one after)\nEach time you get ${what}, put together by Claw with no model run.\nPress "Create" below to confirm, or reply approve #${ref}.`;
+      ? `要创建定时简报「${c.name}」吗？\n时间：${c.schedule}（${c.timezone}），下次 ${localTime(nextRun, c.timezone)}（之后才确认就从再下一次开始）${bounds ? `，${bounds}` : ""}\n每次发给你：${what}。由 Claw 汇总，不运行模型。\n点下面的「创建」确认，或回复 批准 #${ref}。`
+      : `Create the scheduled brief "${c.name}"?\nWhen: ${c.schedule} (${c.timezone}), next ${localTime(nextRun, c.timezone)} (confirmed after that, it starts from the one after)${bounds ? `, ${bounds}` : ""}\nEach time you get ${what}, put together by Claw with no model run.\nPress "Create" below to confirm, or reply approve #${ref}.`;
   }
-  const bounds = [c.until ? (zh ? `到 ${localTime(c.until, c.timezone)} 为止` : `until ${localTime(c.until, c.timezone)}`) : "",
-    c.max_runs ? (zh ? `最多 ${c.max_runs} 次` : `at most ${c.max_runs} runs`) : ""].filter(Boolean).join(zh ? "，" : ", ");
   return zh
     ? `要创建定时任务「${c.name}」吗？\n时间：${c.schedule}（${c.timezone}），下次 ${localTime(nextRun, c.timezone)}（之后才确认就从再下一次开始）${bounds ? `，${bounds}` : ""}\n每次运行以你的身份执行：${c.prompt}\n点下面的「创建」确认，或回复 批准 #${ref}。`
     : `Create the scheduled task "${c.name}"?\nWhen: ${c.schedule} (${c.timezone}), next run ${localTime(nextRun, c.timezone)} (confirmed after that, it starts from the run after)${bounds ? `, ${bounds}` : ""}\nEach run acts as you: ${c.prompt}\nPress "Create" below to confirm, or reply approve #${ref}.`;

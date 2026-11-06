@@ -404,6 +404,16 @@ describe("assistant schedules", { skip }, () => {
     assert.match(t.prompt, /daily brief/i, "the stored description; no model is ever given it");
     assert.equal(pressed.body.data.result.trigger.action, "brief");
 
+    // Its bounds are on the card, as for a run: what the press creates is what the card showed.
+    const until = new Date(Date.now() + 30 * 86_400_000).toISOString();
+    const bounded = await sch.triggerCreateTool(await userTurn(alice, "每周一 9 点给我周报，发 4 次，到下个月为止"),
+      { name: "周报到月底", schedule: "0 9 * * 1", timezone: "Asia/Shanghai", action: "brief", max_runs: 4, until }) as Record<string, any>;
+    const boundedSay = (await w.q("SELECT text FROM claw_assistant_says ORDER BY created_at DESC LIMIT 1"))[0].text;
+    assert.match(boundedSay, /最多 4 次/);
+    assert.match(boundedSay, new RegExp(`到 ${sch.localTime(until, "Asia/Shanghai")} 为止`));
+    await press("alice", bounded.confirmation_id, "allow");
+    const [bt] = await w.q("SELECT max_runs, ends_at FROM claw_triggers WHERE name = '周报到月底'");
+    assert.deepEqual([bt.max_runs, new Date(bt.ends_at).toISOString()], [4, until]);
     // A daily one says the day; a run's card is as it was, without an action of its own.
     await sch.triggerCreateTool(await userTurn(alice, "每天早上 8 点给我简报"), { name: "简报", schedule: "0 8 * * *", timezone: "Asia/Shanghai", action: "brief" });
     assert.match((await w.q("SELECT text FROM claw_assistant_says ORDER BY created_at DESC LIMIT 1"))[0].text, /你的每日简报/);

@@ -373,7 +373,8 @@ export async function composeBrief(
     await guarded("safe", () => safeSection(userId, opts.apiKey ?? null, w, now, needs, r)),
   ];
   const brief: Omit<Brief, "text"> = {
-    date: dateIn(now, opts.timezone), since: dateIn(new Date(now.getTime() - RANGE_MS[r] + (r === "week" ? 24 * 3600_000 : 0)), opts.timezone),
+    // The day the window starts on: what the brief holds is from that day on, never from before the date it shows.
+    date: dateIn(now, opts.timezone), since: dateIn(new Date(now.getTime() - RANGE_MS[r]), opts.timezone),
     range: r, lang, sections, needs_you: [...new Set(needs)].slice(0, NEEDS_YOU_MAX),
   };
   return { ...brief, text: renderBrief(brief) };

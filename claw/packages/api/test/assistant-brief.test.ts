@@ -366,7 +366,7 @@ describe("assistant brief", { skip }, () => {
     assert.equal(s.safe.summary, "1 succeeded and 2 failed in the last week, 1 pending for over 30 minutes, 1 running");
     assert.match(week.text, /^Weekly brief, \d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}$/m);
     const [from, to] = /(\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})/.exec(week.text)!.slice(1);
-    assert.equal((Date.parse(to) - Date.parse(from)) / 86_400_000, 6, "seven days, both ends included");
+    assert.equal((Date.parse(to) - Date.parse(from)) / 86_400_000, 7, "from the day seven days ago: nothing it holds is from before the date it shows");
     // The day is unchanged by it: no ended lines, no links.
     const day = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "en", now });
     assert.equal(day.sections[0].summary, "2 need you, 1 in progress, 1 ended in the last day");
