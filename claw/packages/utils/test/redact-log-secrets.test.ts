@@ -194,6 +194,15 @@ test("L14 an assignment line's value runs to the line's end, whatever separators
   const json = JSON.stringify({ logs: 'step 1\nDB_PASSWORD=Xy7&kLm9;"q"\nPASSWORD=last&one' });
   const r = redactLogSecrets(json).text;
   assert.equal(r, JSON.stringify({ logs: "step 1\nDB_PASSWORD=<redacted>\nPASSWORD=<redacted>" }));
+  // The first line of a log inside a JSON answer, after the string opens: an assignment line too, to the string's closing quote.
+  for (const [text, want] of [
+    [JSON.stringify({ logs: "export DB_PASSWORD=MyPass&region=secret" }), JSON.stringify({ logs: "export DB_PASSWORD=<redacted>" })],
+    [JSON.stringify({ lines: ["DB_PASSWORD=a&b=c;d", "ok"] }), JSON.stringify({ lines: ["DB_PASSWORD=<redacted>", "ok"] })],
+    [JSON.stringify({ logs: JSON.stringify({ msg: "DB_PASSWORD=a&b=c" }) }), JSON.stringify({ logs: JSON.stringify({ msg: "DB_PASSWORD=<redacted>" }) })],
+    ['config: "PASSWORD=a&b=c" next', 'config: "PASSWORD=<redacted>" next'],
+  ] as const) {
+    assert.equal(redactLogSecrets(text).text, want, text);
+  }
 });
 
 test("L15 off an assignment line a separator or a bracket ends a value only where the text makes it one", () => {

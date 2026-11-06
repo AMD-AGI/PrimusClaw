@@ -512,21 +512,26 @@ const CLOSER_OF: Readonly<Record<string, string>> = { "(": ")", "[": "]", "{": "
 const noBrackets = (): Record<string, number> => ({ ")": 0, "]": 0, "}": 0, ">": 0 });
 /**
  * What may stand before a credential's name on its line for the line to be an assignment, as `env`, `printenv`, `set` and a
- * shell script print one: indentation, and a shell's or a Dockerfile's keyword. Such a value has no structure after `=`: it is
- * masked to its line's end, whatever characters it holds.
+ * shell script print one: indentation, and a shell's or a Dockerfile's keyword; or all of that right after a string opens, as
+ * the first line of a log inside a JSON answer does (`{"logs":"export DB_PASSWORD=...`, `["DB_PASSWORD=...`, `msg: "...`). Such a
+ * value has no structure after `=`: it is masked to its line's end, or to the closing quote of the string it is in, whatever
+ * characters it holds. Group 1 is the quote that opened the string on this line, if one did.
  */
-const ASSIGNMENT_LINE_PREFIX_RE = /^[ \t]*(?:(?:export|declare(?:[ \t]+-[A-Za-z]+)*|typeset(?:[ \t]+-[A-Za-z]+)*|readonly|local|set|ENV)[ \t]+)?$/;
+const ASSIGNMENT_LINE_PREFIX_RE = /^(?:(?:[^\r\n]*?[:,[({=])?[ \t]*(\\?["']))?[ \t]*(?:(?:export|declare(?:[ \t]+-[A-Za-z]+)*|typeset(?:[ \t]+-[A-Za-z]+)*|readonly|local|set|ENV)[ \t]+)?$/;
 
 /** The line a named value is on, as `LineTracker` saw it up to the value's name. */
 interface LineContext {
   /** The name starts its line (after indentation or a shell keyword): the value runs to the line's end. */
   assignment: boolean;
-  /** The line began at a JSON string's `\n` or `\r`: the string's closing quote ends it as well. */
-  inJsonString: boolean;
+  /**
+   * The quote whose closing ends the line's value as well (an assignment's): `"` for a line that began at a JSON string's `\n` or
+   * `\r`, or the quote that opened a string before the name on the line (`\"` inside a JSON string). Empty when none.
+   */
+  closeQuote: string;
   /** Per closing bracket, how many of its openers before the name on this line are still open. */
   open: Record<string, number>;
 }
-const NO_LINE: LineContext = { assignment: false, inJsonString: false, open: noBrackets() };
+const NO_LINE: LineContext = { assignment: false, closeQuote: "", open: noBrackets() };
 
 /**
  * Where each line of a text starts, and the brackets opened on it, read forward once: `seek(i)` for `i` that never decreases.
@@ -569,9 +574,12 @@ class LineTracker {
   context(i: number, quote: string): LineContext {
     this.advance(i, true);
     const prefix = i - this.start <= 64 ? this.text.slice(this.start, i) : null;
+    const assignment = quote === "" && prefix !== null ? ASSIGNMENT_LINE_PREFIX_RE.exec(prefix) : null;
+    // A string opened on this line closes first; else, on a JSON string's line, that string's own closing quote.
+    const opened = assignment?.[1] ?? "";
     return {
-      assignment: quote === "" && prefix !== null && ASSIGNMENT_LINE_PREFIX_RE.test(prefix),
-      inJsonString: this.escapedStart,
+      assignment: assignment !== null,
+      closeQuote: opened ? (this.escapedStart && opened === '"' ? '\\"' : opened) : this.escapedStart ? '"' : "",
       open: { ...this.open },
     };
   }
@@ -645,6 +653,12 @@ class NamedValueEnds {
     return find;
   }
 
+  /** Where the closing `quote` at or after `from` starts (its backslash, for an escaped one). */
+  private closingAt(from: number, quote: string): number {
+    const mark = this.closer(quote)(from);
+    return quote.length === 2 && mark < this.text.length ? mark - 1 : mark;
+  }
+
   /** The end (exclusive) of the value starting at `from`, opened by `quote` (empty, or a quote with its escape), on `line`. */
   end(from: number, quote: string, line: LineContext): number {
     const quoted = /["']$/.test(quote);
@@ -655,7 +669,7 @@ class NamedValueEnds {
     }
     let end: number;
     if (quoted) end = this.lineEnd(from);
-    else if (line.assignment) end = line.inJsonString ? Math.min(this.lineEnd(from), this.closer('"')(from)) : this.lineEnd(from);
+    else if (line.assignment) end = line.closeQuote ? Math.min(this.lineEnd(from), this.closingAt(from, line.closeQuote)) : this.lineEnd(from);
     else end = this.unquotedEnd(from, line);
     while (end > from && /\s/.test(this.text[end - 1])) end -= 1;
     return end;
@@ -796,7 +810,7 @@ function maskEnvPairs(text: string): { text: string; hits: number } {
   ENV_PAIR_YAML_RE.lastIndex = 0;
   for (let m = ENV_PAIR_YAML_RE.exec(text); m; m = ENV_PAIR_YAML_RE.exec(text)) {
     if (isSensitiveKey(m[2])) {
-      pairs.push({ from: m.index + m[0].length, quote: m[4], line: { assignment: true, inJsonString: m[3].startsWith("\\"), open: noBrackets() } });
+      pairs.push({ from: m.index + m[0].length, quote: m[4], line: { assignment: true, closeQuote: m[3].startsWith("\\") ? '"' : "", open: noBrackets() } });
     }
   }
   if (!pairs.length) return { text, hits: 0 };
