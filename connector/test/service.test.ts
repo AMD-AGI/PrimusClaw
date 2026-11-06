@@ -328,6 +328,21 @@ describe("exit 78 and the disconnect record", () => {
     } finally { await claw.close(); }
   });
 
+  test("a key refused on every heartbeat while the command stream stays open (pings keep coming) still ends the run with 78", async () => {
+    const claw = await FakeClaw.start({ pingMs: 20 });
+    try {
+      const home = tmpdir();
+      writeConfig(home, tmpdir("w-"));
+      await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c);
+      const r = ctx(home, { timing: { heartbeatMs: 40, pausePollMs: 40, authFailLimit: 3, authFailWindowMs: 200 } });
+      const running = main(["run"], r.c);
+      await claw.until("online", () => claw.online && claw.heartbeats.length > 0);
+      claw.tokens.delete("good-token"); // the open stream is not re-checked, as with an API key on the real server
+      assert.equal(await running, EXIT.needsPerson);
+      assert.equal(recentDisconnects(r.c.dirs, 1)[0]?.reason, "auth_failed");
+    } finally { await claw.close(); }
+  });
+
   test("a short burst of refusals (shorter than authFailWindowMs) does not end the run", async () => {
     const claw = await FakeClaw.start();
     let connector: any;
