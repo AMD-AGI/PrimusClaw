@@ -22,10 +22,16 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import pino from "pino";
 import { z } from "zod";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS } from "../config.js";
+import { db } from "../infra/db.js";
 import { ASSISTANT_MCP_PATH } from "./role-profile.js";
 import { PASS_REASONS, SAY_MAX_CHARS } from "./prompts.js";
 import { REPORT_KINDS } from "./work-items.js";
-import { githubEventsEnabled, prReply, REPLY_BODY_MAX, workSubscribe } from "./github-events.js";
+import { githubEventsEnabled, prReply, REPLY_BODY_MAX, watchNamedPullRequests, workSubscribe } from "./github-events.js";
+import { jobUnwatch, jobWatch, jobWatchesEnabled, jobWatchList } from "./job-watch.js";
+import { briefTool } from "./brief.js";
+import {
+  assistantSchedulesOn, scheduleConfirmationAnswer, triggerCancelTool, triggerCreateTool, triggerListTool,
+} from "./schedules.js";
 import { type AssistantTokenClaims, verifyAssistantToken } from "./token.js";
 import {
   modelDefaultSet, report, say, ToolRefused, workCreate, workRecall, workSend, workStop, type RecallDetail,
@@ -118,6 +124,108 @@ function registerMemoryWrites(mcp: McpServer, claims: AssistantTokenClaims): voi
   );
 }
 
+/**
+ * The router's scheduled tasks (`schedules.ts`): it lists them itself, and creating or cancelling one is put to the user as a card
+ * they press. With the review tools off it also answers such a card's approval command (`confirmation_answer`); with them on, the
+ * review tools' own `confirmation_answer` hands such a card to the same function.
+ */
+function registerScheduleTools(mcp: McpServer, claims: AssistantTokenClaims, answersConfirmations: boolean): void {
+  mcp.tool(
+    "trigger_list",
+    "List the user's scheduled tasks (what runs, when it runs next, how often it ran) and the cards waiting for their confirmation.",
+    {},
+    () => answer(claims, "trigger_list", () => triggerListTool(claims)),
+  );
+  mcp.tool(
+    "trigger_create",
+    "Propose a task that runs later on its own, as the user: a recurring job, or one bounded with until or max_runs. Nothing is created by "
+    + "the call: the user is shown a card with all of it and it is created only when they press it. Each run gets prompt and nothing of this conversation.",
+    {
+      name: z.string().describe("A short name the user recognises, at most 120 characters."),
+      prompt: z.string().describe("The complete, self-contained instruction each run receives."),
+      schedule: z.string().describe("A five-field cron expression in the user's timezone, e.g. \"0 9 * * *\" for 09:00 every day, \"0 9 * * 1-5\" for weekdays."),
+      timezone: z.string().describe("The user's IANA timezone, e.g. \"Asia/Shanghai\"."),
+      until: z.string().optional().describe("ISO 8601 time after which it no longer runs."),
+      max_runs: z.number().int().optional().describe("Stop after this many runs."),
+    },
+    (args) => answer(claims, "trigger_create", () => triggerCreateTool(claims, args)),
+  );
+  mcp.tool(
+    "brief",
+    "The user's brief now, put together by Claw without a model: their items, the pull requests their items watch, what Claw notified "
+    + "them about, watched jobs and their SaFE workloads. Read-only; afterwards the turn no longer acts for the user.",
+    {},
+    () => answer(claims, "brief", () => briefTool(claims)),
+  );
+  mcp.tool(
+    "trigger_cancel",
+    "Propose cancelling one of the user's scheduled tasks for good: the user is shown a card and it is cancelled only when they press it.",
+    { trigger_id: z.string().describe("The trigger_id from trigger_list.") },
+    (args) => answer(claims, "trigger_cancel", () => triggerCancelTool(claims, args)),
+  );
+  if (answersConfirmations) {
+    mcp.tool(
+      "confirmation_answer",
+      "Answer a card listed under Scheduled tasks waiting for the user's confirmation.",
+      { decision: z.enum(["allow", "deny"]), confirmation_id: z.string().optional().describe("The id of the card.") },
+      (args) => answer(claims, "confirmation_answer", async () => {
+        const out = await scheduleConfirmationAnswer(claims, args);
+        if (!out) throw new ToolRefused("confirmation_not_found", "that is no waiting card: allow only when the user's whole message is 批准 #<ref> of a listed card; deny names its confirmation_id");
+        return out;
+      }),
+    );
+  }
+}
+
+/** The jobs the assistant watches for the user (`job-watch.ts`). */
+function registerJobWatchTools(mcp: McpServer, claims: AssistantTokenClaims): void {
+  mcp.tool(
+    "job_watch",
+    "Watch a job for the user and tell them when its state changes and when it ends: a SaFE workload (kind workload) or one of their "
+    + "own runs (kind run, its task id). Reading only. A job that has already ended is answered with its state instead.",
+    {
+      kind: z.enum(["workload", "run"]),
+      id: z.string().describe("The workload's id, or the run's task id, exactly as the user or a tool gave it."),
+      label: z.string().optional().describe("How the user calls it, at most 80 characters; the id when left out."),
+    },
+    (args) => answer(claims, "job_watch", () => jobWatch(claims, args)),
+  );
+  mcp.tool(
+    "job_watch_list",
+    "The jobs watched for the user, and the ones that ended in the last day, with their last state.",
+    {},
+    () => answer(claims, "job_watch_list", () => jobWatchList(claims)),
+  );
+  mcp.tool(
+    "job_unwatch",
+    "Stop watching a job when the user asks.",
+    { watch_id: z.string().describe("The watch_id from job_watch_list.") },
+    (args) => answer(claims, "job_unwatch", () => jobUnwatch(claims, args)),
+  );
+}
+
+/** `work_create`, and the pull requests its title and brief name watched by the new item from the start (`github-events.ts`). */
+async function workCreateWatching(
+  claims: AssistantTokenClaims, args: { title: string; brief: string; repo?: unknown; model?: string },
+): Promise<Record<string, unknown>> {
+  const created = await workCreate(claims, args);
+  if (created.deduplicated || !githubEventsEnabled()) return created;
+  const owner = (await db.query("SELECT user_id FROM claw_assistants WHERE session_id = $1", [claims.sid])).rows[0] as { user_id: string } | undefined;
+  if (!owner) return created;
+  try {
+    const watched = await watchNamedPullRequests(owner.user_id, created.item_id, [args.title, args.brief]);
+    return {
+      ...created,
+      ...(watched.watching.length ? { watching: watched.watching } : {}),
+      ...(watched.not_watched.length ? { not_watched: watched.not_watched } : {}),
+    };
+  } catch (err) {
+    // The item exists: a watch that could not be started is said, not a reason to report the item as not created.
+    logger.warn({ err, itemId: created.item_id }, "assistant.github_auto_watch_failed");
+    return { ...created, not_watched: [{ pr: "*", error: "internal_error" }] };
+  }
+}
+
 /** What a `model` argument says, with model choice on (`model-choice.ts`) and without. */
 const MODEL_PARAM_ASKED = "Only when the user asked for a model for this, by name or by kind (the strongest, a fast one): a name from Models";
 const MODEL_PARAM_CHOICE = `${MODEL_PARAM_ASKED}; left out, the user's own default applies.`;
@@ -149,13 +257,14 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims, choic
   );
   mcp.tool(
     "confirmation_answer",
-    "Answer a write (a merge or an approval) that waits for the user's own confirmation, listed under Waiting for you.",
+    "Answer a write (a merge or an approval) that waits for the user's own confirmation, listed under Waiting for you, or a scheduled task's card.",
     {
       decision: z.enum(["allow", "deny"]),
       confirmation_id: z.string().optional().describe("The id from Waiting for you."),
       pr: z.string().optional().describe("Or the pull request: owner/repo#number or its number."),
     },
-    (args) => answer(claims, "confirmation_answer", () => confirmationAnswer(claims, args)),
+    // A scheduled task's card first (`schedules.ts`): it answers only what names one of those, and leaves the rest to the reviews.
+    (args) => answer(claims, "confirmation_answer", async () => (await scheduleConfirmationAnswer(claims, args)) ?? confirmationAnswer(claims, args)),
   );
   mcp.tool(
     "review_mode_set",
@@ -224,7 +333,7 @@ export function createAssistantMcpServer(
         repo: z.unknown().optional().describe("The repository the work is in, if any: { url, branch? }."),
         ...(modelChoice ? { model: z.string().optional().describe(MODEL_PARAM_CHOICE) } : {}),
       },
-      (args) => answer(claims, "work_create", () => workCreate(claims, args)),
+      (args) => answer(claims, "work_create", () => workCreateWatching(claims, args)),
     );
     mcp.tool(
       "work_send",
@@ -268,6 +377,8 @@ export function createAssistantMcpServer(
       );
     }
     if (reviewTools) registerReviewTools(mcp, claims, modelChoice);
+    if (assistantSchedulesOn()) registerScheduleTools(mcp, claims, !reviewTools);
+    if (jobWatchesEnabled()) registerJobWatchTools(mcp, claims);
     // An observer is offered them too, as every router tool, and each call only records (`observeEveryTool`); were one
     // ever to run, `memory-tools.ts` refuses every role but the router's (and the worker's recall).
     if (memoryTools) {

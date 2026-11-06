@@ -25,6 +25,7 @@ import {
   ASSISTANT_EVENT_TYPES,
   type AssistantItemSnapshot,
   type AssistantConfirmAction,
+  type AssistantConfirmWrite,
   type AssistantSayPayload,
   type AssistantSaySource,
   type WorkItemNeedsYouPayload,
@@ -133,7 +134,8 @@ interface ToStoreBase {
 
 type ToStore =
   | (ToStoreBase & {
-    type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; sources?: AssistantSaySource[];
+    type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; confirmWrite?: AssistantConfirmWrite;
+    sources?: AssistantSaySource[];
   })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow });
 
@@ -145,6 +147,7 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
     : {
       ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}),
       ...(m.sources?.length ? { sources: m.sources } : {}),
+      ...(m.confirmWrite ? { confirm_write: m.confirmWrite } : {}),
     };
 }
 
@@ -194,6 +197,10 @@ async function announce(stored: Stored, deps: SayDeps, turnMessageId?: string): 
         text: payload.text,
         ...(payload.item ? { item: payload.item } : {}),
         ...(payload.type === "assistant.say" && payload.sources ? { sources: payload.sources } : {}),
+        // What the message puts to the person to press, as a channel gets it: a web client, and an evaluation reading the session,
+        // must see the card the channel draws, not only its words.
+        ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
+        ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
         fallback: payload.type === "work_item.needs_you",
         ts: Date.parse(payload.occurred_at),
       });
@@ -573,6 +580,23 @@ export async function recordActionConfirm(
   const stored = await store(q, {
     type: "assistant.say", fallback: true, item: null, confirmAction: input.action,
     sayId: deterministicEventId("assistant.confirm_action", input.userId, input.key),
+    userId: input.userId, sessionId: input.sessionId, text: input.text,
+  });
+  if (!stored) return null;
+  return { sayId: stored.sayId, subscribers: stored.subscribers, announce: () => announce(stored, deps) };
+}
+
+/**
+ * A write the router proposed, put to the person with a button (`schedules.ts`): a message in the system's own words saying what
+ * would be done, carrying the confirmation for a channel to draw as a card. Stored in the caller's transaction, as a fallback, once per
+ * confirmation: `null` when it was stored before. `announce` after the commit.
+ */
+export async function recordWriteConfirm(
+  q: Querier, input: { userId: string; sessionId: string; text: string; confirm: AssistantConfirmWrite }, deps: SayDeps = {},
+): Promise<{ sayId: string; subscribers: number; announce: () => Promise<void> } | null> {
+  const stored = await store(q, {
+    type: "assistant.say", fallback: true, item: null, confirmWrite: input.confirm,
+    sayId: deterministicEventId("assistant.confirm_write", input.userId, input.confirm.confirmation_id),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
   });
   if (!stored) return null;

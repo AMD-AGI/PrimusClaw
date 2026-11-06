@@ -39,6 +39,10 @@ import { heldForPersonManifest, renderHeldForPerson } from "./holds.js";
 import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
 import { startWorkerRun } from "./run-started.js";
+import { githubEventsEnabled } from "./github-events.js";
+import { jobWatchesEnabled } from "./job-watch.js";
+import { renderRouterProactiveSection, ROUTER_PROACTIVE_PROMPT_VERSION } from "./proactive-prompt.js";
+import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 import { applyRouterTurnSpeed } from "./router-speed.js";
 import { routerCite } from "./citations.js";
@@ -275,6 +279,10 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       withSystemAppend(task, memory.prompt);
       if (memory.entries) state.push(memory.entries);
     }
+    const proactive = { schedules: assistantSchedulesOn(), jobs: jobWatchesEnabled(), pullRequests: githubEventsEnabled() };
+    const proactiveSection = renderRouterProactiveSection(proactive);
+    if (proactiveSection) withSystemAppend(task, proactiveSection);
+    if (proactive.schedules) state.push(await renderScheduleState(role.userId));
     const choice = modelChoiceOn();
     if (choice) {
       // The allow-list with its labels and the user's own defaults, so that "the fast one" becomes a name the tools take. In the
@@ -296,6 +304,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     logger.info({
       sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION, base: ROUTER_PROMPT_VERSION,
       ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
+      ...(proactiveSection ? { proactive: ROUTER_PROACTIVE_PROMPT_VERSION } : {}),
       read: ROUTER_READ_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),
       ...(cite ? { cite: ROUTER_CITE_PROMPT_VERSION } : {}),
     }, "assistant.router_turn");

@@ -275,6 +275,78 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   // The router turn that handed it over (the person's message it answered): the channel answers that message about the review itself, in
   // one message, so the turn says nothing more (`say`, `deliverUnsaidAnswer`). Null on a handoff written before this column.
   await client.query("ALTER TABLE claw_assistant_review_handoffs ADD COLUMN IF NOT EXISTS message_id TEXT");
+
+  // A write the router proposed and the user confirms with one press (`schedules.ts`): creating or cancelling a scheduled task.
+  // Nothing is done until the user answers; the row is the card's meaning and its one-time use.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_confirmations (
+      confirmation_id TEXT PRIMARY KEY,
+      user_id         TEXT NOT NULL,
+      -- The router session and the turn that proposed it.
+      session_id      TEXT NOT NULL,
+      message_id      TEXT NOT NULL,
+      -- trigger_create | trigger_cancel
+      kind            TEXT NOT NULL,
+      params          JSONB NOT NULL,
+      -- The same proposal twice in one turn is one card.
+      dedupe_key      TEXT NOT NULL UNIQUE,
+      -- pending | done | denied | expired | failed
+      status          TEXT NOT NULL DEFAULT 'pending',
+      result          JSONB,
+      -- button | command
+      decided_via     TEXT,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at      TIMESTAMPTZ NOT NULL,
+      decided_at      TIMESTAMPTZ
+    )
+  `);
+  await client.query("CREATE INDEX IF NOT EXISTS idx_assistant_confirmations_user ON claw_assistant_confirmations(user_id, status)");
+
+  // Jobs the assistant watches for the user (`job-watch.ts`), and each change of state it saw. Used only while
+  // CLAW_ASSISTANT_JOB_EVENTS is on.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_job_watches (
+      id               BIGSERIAL PRIMARY KEY,
+      user_id          TEXT NOT NULL,
+      -- workload (a SaFE workload) | run (a run of the user's in this deployment)
+      source           TEXT NOT NULL,
+      target           TEXT NOT NULL,
+      label            TEXT NOT NULL,
+      -- The language the user asked in: what they are told is in it.
+      lang             TEXT NOT NULL DEFAULT 'en',
+      last_state       TEXT,
+      -- How many changes of state were seen: the next one's number, so each is told once.
+      transitions      INT NOT NULL DEFAULT 0,
+      -- active | ended
+      state            TEXT NOT NULL DEFAULT 'active',
+      -- finished | not_found | user
+      end_reason       TEXT,
+      polled_at        TIMESTAMPTZ,
+      last_error       TEXT,
+      failing_since    TIMESTAMPTZ,
+      failure_reported BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ended_at         TIMESTAMPTZ
+    )
+  `);
+  await client.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_job_watches_active
+       ON claw_assistant_job_watches(user_id, source, target) WHERE state = 'active'`,
+  );
+  await client.query("CREATE INDEX IF NOT EXISTS idx_assistant_job_watches_due ON claw_assistant_job_watches(polled_at) WHERE state = 'active'");
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_job_events (
+      -- job:<watch>:<transition number>
+      event_id   TEXT PRIMARY KEY,
+      watch_id   BIGINT NOT NULL,
+      user_id    TEXT NOT NULL,
+      from_state TEXT,
+      to_state   TEXT NOT NULL,
+      detail     TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await client.query("CREATE INDEX IF NOT EXISTS idx_assistant_job_events_user ON claw_assistant_job_events(user_id, created_at)");
   await ensureObserveSchema(client);
 }
 

@@ -66,6 +66,32 @@ record it.
   (`CLAW_ASSISTANT_DECISION_WAIT_SEC`, default 3600, 0 keeps Brain's settings), which Brain uses for that run's approval and
   question waits and announces as their `timeout_ms`. Before, nobody was told and the item said "in progress" until Brain refused the
   call after `HITL_DECISION_TIMEOUT_MS`. The super-agent evaluation runner answers such a request through the same routes (`hold`).
+- The assistant acts later on its own. With `CLAW_TRIGGER_TOOLS_ENABLED` (and triggers and the assistant on) the router has
+  `trigger_list`, and `trigger_create` / `trigger_cancel`, which create and cancel nothing themselves: the write is stored as a
+  confirmation (new table `claw_assistant_confirmations`, 24 hours) and put to the user as a card (`assistant.say` with
+  `confirm_write`: its id, short ref, kind and button label; the session's `AssistantSay` event now carries `confirm_write` and
+  `confirm_action` too). The user's press is `POST /v1/assistant/confirmations/:id/decision` (`allow` | `deny`), taken as a held
+  merge's answer is: from their own sign-in, or from a service listed in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` answering for them,
+  never from a key; or their whole signed-in message `批准 #<ref>` / `拒绝 #<ref>` through `confirmation_answer`. The write happens in
+  the transaction that closes the card, so one card does it once; the answer says when the trigger first runs. `GET
+  /v1/assistant/confirmations` lists open cards. A router turn proposes only while answering a message of the user's, before it has
+  read anything untrusted.
+- The user's brief: `GET /v1/assistant/brief?lang=&timezone=` puts it together without a model from their items, the pull requests
+  their items watch and what happened on them, the runs and approvals Claw notified them about and the writes waiting for them, the
+  jobs the assistant watches, and their SaFE workloads read with their own key (failed in the last day, pending over 30 minutes,
+  running). Every section is there; one that could not be read says "could not check". The router reads it with `brief` (with the
+  schedule tools; the turn no longer acts for the user afterwards). A trigger may now have `action: "brief"`
+  (new column `claw_triggers.action`, default `run`): it fires without a run, saying the brief through the owner's assistant once per
+  planned time (recorded as `delivered`; refused at creation without the assistant).
+- An item whose title or brief names pull requests in full (a link or `owner/repo#123`, at most three) watches them from the start, as
+  `work_subscribe` would (read-only), when the loop can read the user's GitHub token; `work_create` answers `watching` or
+  `not_watched` with the reason (`no_github_token` without one).
+- Job watches, behind `CLAW_ASSISTANT_JOB_EVENTS` (default off; `CLAW_ASSISTANT_JOB_POLL_SEC` 30, `CLAW_ASSISTANT_JOB_MAX_WATCHES`
+  20): the router's `job_watch` (a SaFE workload of the user's own, read with their key, or a run of theirs), `job_watch_list` and
+  `job_unwatch`.
+  A loop modelled on the GitHub events loop claims due watches, writes each change of state once (new tables
+  `claw_assistant_job_watches`, `claw_assistant_job_events`) and tells the user in their language; an ended job ends its watch, a gone
+  one says so, and one unreadable for ten minutes says so once.
 - Model choice for the assistant's items, behind `CLAW_ASSISTANT_MODEL_CHOICE` (`on` | off, default off; needs `CLAW_ASSISTANT_ENABLED`
   and a non-empty `CLAW_ASSISTANT_MODELS`, the allow-list as `name=label,...`). One function decides an item's model: the model the
   message asked for, else the payer's own review default (reviews), else their own default, else the deployment's default for the kind

@@ -59,12 +59,29 @@ export interface AssistantSaySource {
   kind: "web" | "github_pr" | "github_issue" | "github_repo" | "github_check" | "github_file";
 }
 
+/**
+ * A write the router proposed and Claw holds until the person answers it (`assistant/schedules.ts`): creating or cancelling a
+ * scheduled task. A channel that can draw buttons shows the message's text with two: one that lets it through and one that does
+ * not, each calling `POST /v1/assistant/confirmations/{confirmation_id}/decision` as that person (`allow` or `deny`). A channel that
+ * cannot shows the text, which tells the person the command that lets it through (`批准 #{ref}`).
+ */
+export interface AssistantConfirmWrite {
+  confirmation_id: string;
+  /** The short id the person may type back. */
+  ref: string;
+  kind: "trigger_create" | "trigger_cancel";
+  /** What the button that lets it through says, in the language of the text. */
+  allow_label: string;
+  expires_at: string;
+}
+
 /** Something the assistant chose to say to the user. */
 export interface AssistantSayPayload extends AssistantEventBase {
   type: "assistant.say";
   confirm_action?: AssistantConfirmAction;
   /** Present only when the message cites any (`CLAW_ASSISTANT_CITATIONS`); a receiver that does not read it shows the text alone. */
   sources?: AssistantSaySource[];
+  confirm_write?: AssistantConfirmWrite;
 }
 
 /** The system's own message, sent when an item has needed the user for a while and nobody has said so. */

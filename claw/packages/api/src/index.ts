@@ -35,7 +35,9 @@ import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
 import { registerAssistantRoutes } from "./routes/assistant.js";
 import { registerAssistantMcpRoutes } from "./assistant/mcp.js";
 import { registerAssistantGithubEventRoutes } from "./routes/assistant-github-events.js";
+import { registerAssistantProactiveRoutes } from "./routes/assistant-proactive.js";
 import { startGithubEventWatch } from "./assistant/github-events.js";
+import { startJobWatch } from "./assistant/job-watch.js";
 import { assertAssistantTokenKey } from "./assistant/token.js";
 import { registerTriggerMcpRoutes } from "./triggers/mcp.js";
 import { assertTriggerToolsConfig } from "./triggers/token.js";
@@ -335,6 +337,8 @@ async function main() {
   await registerAssistantRoutes(app);
   // The pull requests a work item watches; nothing unless CLAW_ASSISTANT_ENABLED and CLAW_ASSISTANT_GITHUB_EVENTS.
   await registerAssistantGithubEventRoutes(app);
+  // The brief and the cards the router puts to the user; nothing unless CLAW_ASSISTANT_ENABLED.
+  await registerAssistantProactiveRoutes(app);
   // The assistant's own MCP service, under /v1/internal/; registers nothing unless CLAW_ASSISTANT_ENABLED.
   await registerAssistantMcpRoutes(app);
   await registerTriggerMcpRoutes(app);
@@ -397,6 +401,8 @@ async function main() {
   if (a2aPushEnabled()) startA2aPushWorker();
   // Reads the pull requests work items watch and hands what is new to their workers; does nothing unless both switches are on.
   startGithubEventWatch();
+  // Reads the jobs the assistant watches for users and tells them what changed; does nothing unless CLAW_ASSISTANT_JOB_EVENTS is on.
+  startJobWatch();
 
   // Daily maintenance crons (every 24h, first run 1 min after startup).
   // Skill cleanups gated by CLAW_SKILL_EVOLUTION_ENABLED — when OFF, old data
