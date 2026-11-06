@@ -430,7 +430,8 @@ test("S16 no false denial of a capability", () => {
     "GitHub returned 20 results; I'm unable to verify whether there are additional open PRs beyond this page.",
     "I am not able to determine from the SaFE events why the pod restarted.",
     "GitHub returned 20 results; I can't check whether there are additional open PRs beyond this page.",
-    "I cannot check if more PRs exist on GitHub past the first page.", "GitHub 返回了 20 条；我无法查看是否还有更多 PR。"]) {
+    "I cannot check if more PRs exist on GitHub past the first page.", "GitHub 返回了 20 条；我无法查看是否还有更多 PR。",
+    "I cannot check GitHub to see if more PRs exist.", "我无法查看 GitHub 是否还有更多 PR。"]) {
     assert.ok(!denied(text), text);
   }
   // A failed shell command excuses a GitHub denial only when it failed at GitHub: a line of its answer is a failure that names
@@ -464,6 +465,13 @@ test("S16 no false denial of a capability", () => {
   ];
   for (const [cmd, answer] of notGithub) assert.ok(denied("I can't access GitHub.", [bash(cmd, answer)]), cmd);
   assert.ok(!denied("我无法访问 GitHub。", [bash("cd repo && git push", "fatal: Authentication failed for 'https://github.com/o/r.git/'")]));
+  // A denial that names nothing is about what the user asked for: only a failure of that system excuses it.
+  const asked = (final: string, calls: ToolCall[]) =>
+    failed(caseOf({ turns: [{ user: "我在 GitHub 上还有哪些开着的 PR？" }] }), observed({ final, calls })).includes("no false denial");
+  assert.ok(asked("I can't access it right now.", [bash("gh pr list", "bash: gh: command not found")]), "GitHub was never reached");
+  assert.ok(!asked("I can't access it right now.", [call("mcp__github__issue_search", false)]));
+  assert.ok(!denied("I can't access it right now.", [call("mcp__safe__node_list", false)]), "a request that names nothing: any failure");
+  assert.ok(denied("I cannot access GitHub, so I don't know if you have open PRs."), "a whether/if past a comma is another clause");
   // A failed fetch or search of GitHub through the web tools is a failed GitHub call; one of another site is not.
   const web = (name: string, input: Record<string, unknown>): ToolCall => ({ ...call(name, false), input });
   assert.ok(!denied("I cannot access GitHub right now.", [web("web_fetch", { url: "https://github.com/o/r/pulls" })]));

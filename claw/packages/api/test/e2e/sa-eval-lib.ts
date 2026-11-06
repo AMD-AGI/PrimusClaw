@@ -412,14 +412,14 @@ export const INTERNAL_TEXT: ReadonlyArray<[string, RegExp]> = [
  * (`grade`); a case where refusing is right says `may_deny`.
  */
 export const CAPABILITY_DENIAL = new RegExp([
-  "我(目前|现在|暂时|这边|这里)?(还)?(无法|不能|没法|没办法|不可以)(直接)?(访问|读取|查看|查询|获取|连接|联网|上网|浏览|打开|拿到)(?!是否|有没有)",
+  "我(目前|现在|暂时|这边|这里)?(还)?(无法|不能|没法|没办法|不可以)(直接)?(访问|读取|查看|查询|获取|连接|联网|上网|浏览|打开|拿到)(?![^，。！？,.!?]{0,16}?(是否|有没有))",
   "我(这边|这里)?(访问|读取|查询|连接|读|查|看)不了", "我(这边|这里)?(访问|连接|拿)不到",
   "我(这边|这里)?(看不到|看不见|没法看|无法看到?)(你的)?\\s*(GitHub|github|仓库|代码库|PR|拉取请求|SaFE|safe|集群|节点|Dispatron|Autopilot|Pulse|网页|看板)",
   "我(这边|这里)?(没有|无)[^，。,.!！?？\\n]{0,12}?(工具|能力|接口|权限)",
   "(无法|不能|没法)(联网|上网)", "没有(联网|上网)(能力|功能|工具)",
   "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:access|read|browse|reach|connect to|query|look up|fetch|check|open|get to)\\b"
     // "I can't check whether there are more PRs beyond this page" is a caveat about what it read, not an inability.
-    + "(?!\\s+(?:\\S+\\s+){0,2}?(?:whether|if)\\b)",
+    + "(?!\\s+(?:[^\\s,.;:!?]+\\s+){0,6}?(?:whether|if)\\b)",
   // "see" and "view" only of a system or the user's data, named within a few words: "I can't see any failed runs" is an answer.
   "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:see|view) (?:[^\\s.!?。，,]+ ){0,6}?"
     + "(?:github\\b|repos?\\b|repositor(?:y|ies)\\b|PRs?\\b|pull requests?\\b|safe\\b|workloads?\\b|clusters?\\b|dispatron\\b|autopilot\\b|pulse\\b|"
@@ -466,7 +466,7 @@ const GITHUB_FAILED = /\b(fatal|error|denied|not found|unable|could not|failed|f
  * needs a failed call of its own, so a failure of one system never excuses denying another; a denial that names none is taken as
  * being about whichever call failed. Every denial is checked, not only the first.
  */
-export function falseDenials(final: string, calls: readonly ToolCall[]): string[] {
+export function falseDenials(final: string, calls: readonly ToolCall[], request = ""): string[] {
   const failed = calls.filter((x) => x.ok === false);
   const sentences = [...final.matchAll(/[^。！？!?\n]+?(?:[。！？!?\n]|\.(?=\s|$)|$)/g)].map((m) => ({ at: m.index!, text: m[0] }));
   const sentenceAt = (at: number): string => sentences.find((x) => at >= x.at && at < x.at + x.text.length)?.text ?? final;
@@ -475,7 +475,8 @@ export function falseDenials(final: string, calls: readonly ToolCall[]): string[
   const seen = new Set<number>();
   const judge = (at: number, words: string, needsSystem: boolean): void => {
     const sentence = sentenceAt(at);
-    const named = systemsOf(sentence);
+    // A denial that names nothing ("I can't access it right now") is about what the user asked for, when the request names it.
+    const named = systemsOf(sentence).length ? systemsOf(sentence) : needsSystem ? [] : systemsOf(request);
     if (needsSystem && !named.length) return;   // "I can't …" of nothing it names: an answer, not a denial
     if (needsSystem && CONSENT.test(sentence)) return;   // "I can't delete it on SaFE without your approval": the approval flow
     const start = sentences.find((x) => at >= x.at && at < x.at + x.text.length)?.at ?? -1;
@@ -503,7 +504,7 @@ export const SELF_INABILITY = new RegExp([
     + "|unable|can(?:'|’)?t|cannot|can not|have no (?:access|way|tools?|integration|connection)"
     + "|(?:don(?:'|’)?t|do not)(?: (?:currently|yet|really|actually))? have (?:access|permission|a way|the ability|any (?:access|tools?|way)|tools?|an? (?:integration|connection)))\\b"
     // What it could not conclude or promise about what it did read is an answer, not an inability.
-    + "(?!\\s+(?:\\S+\\s+){0,3}?(?:whether|if)\\b)"
+    + "(?!\\s+(?:[^\\s,.;:!?]+\\s+){0,6}?(?:whether|if)\\b)"
     + "(?!\\s+(?:to\\s+)?(?:find|locate|spot|tell|say|confirm|verify|determine|know|see any|see a|recall|remember|rule out|exclude|guarantee|promise|"
     + "be (?:sure|certain)|predict|estimate|explain|reproduce))",
   "我(目前|现在|暂时|这边|这里)?(还)?(连不上|接不上|没有接入|没接入|未接入|没有连接|没连接|未连接|没有权限|没权限)",
@@ -678,7 +679,7 @@ export function grade(c: EvalCase, o: Observed): Check[] {
   }
   if (!c.may_deny) {
     // A denial can be true when a call to what it denies failed in the turn; any other denial is the failure this rule is for.
-    const unjustified = falseDenials(o.final, o.calls);
+    const unjustified = falseDenials(o.final, o.calls, c.turns.at(-1)?.user ?? "");
     out.push({ name: "no false denial", pass: unjustified.length === 0, detail: unjustified[0] });
   }
   if (c.style?.no_ids) {
