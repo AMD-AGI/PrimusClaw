@@ -199,6 +199,40 @@ jobs:
         run: |
           bash claw/scripts/lint-no-nullish-env-default.sh --all
 
+  sa-eval-static:
+    name: sa-eval cases can pass on their arm (EVAL_STATIC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The runner's static check reads the router's tools from the code that
+      # gives them (assistant/read-tools.ts, which resolves @claw/protocol
+      # through its dist), so the two packages it imports are built first.
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: claw/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: claw
+
+      - name: Build the packages the runner imports
+        run: npm run build -w packages/utils -w packages/protocol
+        working-directory: claw
+
+      # Every seed case against what its arm can call, as an operator runs
+      # it: a tools_must no tool of the arm has, an assistant-only case that
+      # also runs in baseline, or a description written as a value fails here,
+      # before a live run spends an evening on a case that can never pass.
+      - name: Run sa-eval EVAL_STATIC on the seed cases
+        run: EVAL_STATIC=1 npx tsx test/e2e/sa-eval.ts
+        working-directory: claw/packages/api
+
   promql-rollout-gates:
     name: evaluate the rollout gates against the PromQL engine
     runs-on: ubuntu-latest

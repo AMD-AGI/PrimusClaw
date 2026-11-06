@@ -38,6 +38,15 @@
  *      for again: not asked again, and the session that may be left is said
  *   R8 a work_create that found someone else's open item with the same title (`deduplicated`): that item is not the run's, and
  *      is neither closed nor stripped of its worker's session
+ *   R13 a turn whose router said nothing: the server's own reply, a moment after the turn's end, is waited for (EVAL_SAY_GRACE_S),
+ *      graded and timed; without the wait the case had no answer
+ *   R14 EVAL_FRESH_SESSION_EVERY: each case in a new assistant session, the one before closed and deleted (seen gone) first; an
+ *      identity that already has an assistant session refuses the run (the run deletes only its own)
+ *   R15 EVAL_VARS_CMD is run before each case, so a value read right before it fills its text; one that fails is the run's error for
+ *      that case, and nothing of it is sent
+ *   R16 EVAL_GAP_S: the next case waits that long after the last one ended
+ *   R17 EVAL_SEND_TOKEN_CMD: the messages go with the person's signed-in token, everything else with the key; a token that is not
+ *      the key's identity refuses the run before anything is sent
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -75,6 +84,13 @@ class FakeClaw {
   readonly rows = new Map<string, Row[]>();
   assistant = "asst-1";
   created = true;
+  /** A new assistant session (`asst-2`, ...) is made when the last one was deleted, as the API does. */
+  freshAssistant = false;
+  private assistantAsked = 0;
+  /** The authorization each message to a session came with. */
+  readonly messageAuth: string[] = [];
+  /** Who `GET /v1/me` says the caller is, by its authorization. */
+  meFor: (authorization: string) => string = () => EMAIL;
   /** The next board read answers this much later (the run's first read is before anything is made). */
   boardDelayMs = 0;
   boardReads = 0;
@@ -130,7 +146,10 @@ class FakeClaw {
     if (!(method === "GET" && path === "/v1/work-items")) { this.calls.push(`${method} ${path}${url.search}`); this.callAt.push(Date.now()); }
     const send = (status: number, json: unknown): void => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(json)); };
     let m: RegExpExecArray | null;
-    if (method === "GET" && path === "/v1/me") return send(200, { name: "sa-eval-bot", email: EMAIL });
+    if (method === "GET" && path === "/v1/me") {
+      const email = this.meFor(String(req.headers.authorization ?? ""));
+      return send(200, { userId: email === EMAIL ? "u-eval" : `u-${email}`, name: "sa-eval-bot", email });
+    }
     if (method === "POST" && path === "/judge/v1/messages") {
       const a = this.judgeAnswers.shift() ?? "PASS: ok";
       return typeof a === "number" ? send(a, { error: "down" }) : send(200, { content: [{ type: "text", text: a }] });
@@ -150,6 +169,10 @@ class FakeClaw {
     }
     if (method === "POST" && path === "/v1/assistant") {
       this.onAssistant();
+      if (this.freshAssistant && this.assistantAsked++ && !this.sessions.has(this.assistant)) {
+        this.assistant = `asst-${Number(this.assistant.slice(5)) + 1}`;
+        this.created = true;
+      }
       if (!this.sessions.has(this.assistant)) this.sessions.set(this.assistant, { status: "idle", stale: 0 });
       return send(200, { ok: true, data: { session_id: this.assistant, created: this.created } });
     }
@@ -183,6 +206,7 @@ class FakeClaw {
       const id = `msg-${this.sent.length + 1}`;
       const content = String(JSON.parse(body).content ?? "");
       this.sent.push({ at: Date.now(), content });
+      this.messageAuth.push(String(req.headers.authorization ?? ""));
       if (this.loseMessageAnswers > 0) { this.loseMessageAnswers--; req.socket.destroy(); }
       else send(200, { ok: true, message_id: id });
       const sessionId = m[1]!;
@@ -843,4 +867,146 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.ok(!claw2.sessions.has("plain-1"), "the session it made is deleted");
     } finally { rmSync(r2.dir, { recursive: true, force: true }); }
   });
+
+  const answerCase = (id: string, user = id) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user }] });
+
+  it("R13 the server's reply after a silent turn is waited for, graded and timed", { timeout: 120_000 }, async () => {
+    const runs: Run[] = [];
+    for (const grace of ["5", "0"]) {
+      const claw = new FakeClaw();
+      const base = await claw.start();
+      // The router says nothing; its turn ends, and the server's own reply comes 4 s later.
+      claw.router = (_content, id) => {
+        claw.emit({ type: "executionStats", message_id: id, turns: 1 });
+        setTimeout(() => claw.emit({ type: "exec_complete", message_id: id, final_text: "" }), 50);
+        setTimeout(() => claw.emit({ type: "AssistantSay", say_id: `say-${id}`, turn_message_id: id, text: "There are 3 nodes.", fallback: true }), 4_000);
+      };
+      const r = runner(base, [answerCase("t-grace-001")], { EVAL_SAY_GRACE_S: grace });
+      runs.push(await r.done);
+      await claw.stop();
+      rmSync(r.dir, { recursive: true, force: true });
+    }
+    const [waited, not] = runs as [Run, Run];
+    assert.equal(waited.code, 0, waited.out);
+    assert.match(waited.out, /pass t-grace-001#1 route=answer cards=none first=(\d+)ms/);
+    assert.ok(Number(/first=(\d+)ms/.exec(waited.out)![1]) >= 3_900, "timed from when the reply came");
+    assert.match(not.out, /FAIL t-grace-001#1 .*answered/, "without the wait the case had no answer");
+  });
+
+  it("R14 a new assistant session for each case, the one before deleted first", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.freshAssistant = true;
+    claw.router = (_content, id, sid) => claw.turn(id, { say: `answered in ${sid}` });
+    const r = runner(base, [answerCase("t-fresh-001"), answerCase("t-fresh-002")], { EVAL_FRESH_SESSION_EVERY: "1" });
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      const posts = claw.calls.filter((c) => /^POST \/v1\/sessions\/[^/]+\/messages$/.test(c));
+      assert.deepEqual(posts, ["POST /v1/sessions/asst-1/messages", "POST /v1/sessions/asst-2/messages"]);
+      const del1 = claw.calls.indexOf("DELETE /v1/sessions/asst-1");
+      assert.ok(del1 > 0 && del1 < claw.calls.indexOf(posts[1]!), "the first session is deleted before the second case is sent");
+      assert.ok(claw.calls.indexOf("GET /v1/sessions/asst-1", del1) > del1, "and seen gone");
+      assert.ok(claw.calls.includes("DELETE /v1/sessions/asst-2"));
+      assert.ok(!claw.sessions.has("asst-1") && !claw.sessions.has("asst-2"));
+      assert.deepEqual(JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8")).cleanup_failed, []);
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+
+    // An identity that already has an assistant session (not the run's): refused, nothing sent, nothing deleted.
+    const other = new FakeClaw();
+    const base2 = await other.start();
+    other.created = false;
+    other.sessions.set(other.assistant, { status: "idle", stale: 0 });
+    const r2 = runner(base2, [answerCase("t-fresh-003")], { EVAL_FRESH_SESSION_EVERY: "1" });
+    const run2 = await r2.done;
+    await other.stop();
+    try {
+      assert.equal(run2.code, 2, run2.out);
+      assert.match(run2.out, /EVAL_FRESH_SESSION_EVERY needs an identity without an assistant session/);
+      assert.equal(other.sent.length, 0);
+      assert.deepEqual(other.calls.filter((c) => c.startsWith("DELETE")), []);
+    } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+  });
+
+  it("R15 run variables read again before each case", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.router = (_content, id) => claw.turn(id, { say: "ok" });
+    const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    const counter = join(dir, "n");
+    // A program and its arguments, run without a shell: here a script file the shell runs.
+    writeFileSync(join(dir, "vars.sh"), `n=$(cat '${counter}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${counter}'; printf '{"gh": {"n": %s}}' $n\n`);
+    const r = runner(base, [answerCase("t-vars-001", "count {{gh.n}}"), answerCase("t-vars-002", "count {{gh.n}}")], { EVAL_VARS_CMD: `/bin/sh ${join(dir, "vars.sh")}` }, dir);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      assert.deepEqual(claw.sent.map((x) => x.content), ["count 1", "count 2"]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+
+    const failing = new FakeClaw();
+    const base2 = await failing.start();
+    failing.router = (_content, id) => failing.turn(id, { say: "ok" });
+    // A command that fails: nothing of the case is sent. Without a shell, `false; echo {}` is a program named `false;`, which does not exist.
+    const r2 = runner(base2, [answerCase("t-vars-003", "count {{gh.n}}"), answerCase("t-vars-004", "count {{gh.n}}")], { EVAL_VARS_CMD: "false ignored" });
+    const run2 = await r2.done;
+    await failing.stop();
+    try {
+      assert.equal(run2.code, 1, run2.out);
+      assert.match(run2.out, /ERROR t-vars-003#1 infra: EVAL_VARS_CMD failed \(exit 1\)/);
+      assert.equal(failing.sent.length, 0);
+    } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+
+    const noShell = new FakeClaw();
+    const base3 = await noShell.start();
+    const r3 = runner(base3, [answerCase("t-vars-005", "count {{gh.n}}")], { EVAL_VARS_CMD: "false; printf {}" });
+    const run3 = await r3.done;
+    await noShell.stop();
+    try {
+      assert.match(run3.out, /ERROR t-vars-005#1 infra: EVAL_VARS_CMD failed \(ENOENT\)/, "no shell: `false;` is looked for as a program");
+      assert.equal(noShell.sent.length, 0);
+    } finally { rmSync(r3.dir, { recursive: true, force: true }); }
+  });
+
+  it("R16 the gap between cases", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.router = (_content, id) => claw.turn(id, { say: "ok" });
+    const r = runner(base, [answerCase("t-gap-001"), answerCase("t-gap-002")], { EVAL_GAP_S: "8" });
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      assert.ok(claw.sent[1]!.at - claw.sent[0]!.at >= 8_000, `${claw.sent[1]!.at - claw.sent[0]!.at} ms between the cases`);
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it("R17 messages sent signed in, as the key's own identity only", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.router = (_content, id) => claw.turn(id, { say: "ok" });
+    const r = runner(base, [answerCase("t-token-001"), answerCase("t-token-002")], { EVAL_SEND_TOKEN_CMD: "printf tok-signed-in" });
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      assert.deepEqual(claw.messageAuth, ["Bearer tok-signed-in", "Bearer tok-signed-in"]);
+      assert.ok(!run.out.includes("tok-signed-in"), "the token is never printed");
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+
+    // Another account: its user id is not the key's.
+    const other = new FakeClaw();
+    const base2 = await other.start();
+    other.meFor = (auth) => (auth === "Bearer tok-someone" ? "someone@example.test" : EMAIL);
+    const r2 = runner(base2, [answerCase("t-token-003")], { EVAL_SEND_TOKEN_CMD: "printf tok-someone" });
+    const run2 = await r2.done;
+    await other.stop();
+    try {
+      assert.equal(run2.code, 2, run2.out);
+      assert.match(run2.out, /the token of EVAL_SEND_TOKEN_CMD is not the key's identity/);
+      assert.equal(other.sent.length, 0);
+    } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+  });
 });
+
