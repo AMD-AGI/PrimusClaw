@@ -42,14 +42,16 @@
  * argument that matters, or leave the tool unlisted.
  *
  * Over every spec stands the catalog of MCP tools (`@claw/protocol`'s
- * mcp-tool-catalog.ts): for a server it knows by name, every write it lists is
- * held whatever the spec says (`false`, a list that misses it, no field at
- * all), and is released by `auto_approve` only when the catalog calls it
- * releasable. A spec is a hand-kept list and falls behind its server (SaFE's
- * workload_resume ran unheld that way); the catalog is checked against the
- * server's own tools/list. The hold it adds for a server whose spec has no rule
- * of its own counts as the platform's: it holds those writes and turns nothing
- * else on (`operatorActive`).
+ * mcp-tool-catalog.ts): for a server it knows by name, every tool it does not
+ * list as a read (its writes, and any tool the server added since the catalog
+ * was reviewed) is held whatever the spec says (`false`, a list that misses
+ * it, no field at all), and `auto_approve` releases such a tool only when the
+ * catalog calls it a releasable write. A spec is a hand-kept list and falls
+ * behind its server (SaFE's workload_resume ran unheld that way); the catalog
+ * is checked against the server's own tools/list every night, and a tool it
+ * has not classified yet waits for a person meanwhile. The hold it adds for a
+ * server whose spec has no rule of its own counts as the platform's: it holds
+ * those tools and turns nothing else on (`operatorActive`).
  */
 import pino from "pino";
 import { TOOL_CATALOG, catalogClassOf, isCataloguedServer, isPlatformMcpServer, isReleasableWrite, type ToolCatalog } from "@claw/protocol";
@@ -206,9 +208,12 @@ export function approvalPolicyFromMcp(
       autos.push(match);
     }
     const ownRule = holds.length > 0;
-    // Whatever the spec says, a write the catalog lists for this server waits for a person.
-    const catalog = tools !== null && isCataloguedServer(name, tools) ? name : null;
-    if (catalog !== null) holds.push((bare) => catalogClassOf(catalog, bare, tools!) === "write");
+    // Whatever the spec says, a tool the catalog does not list as a read of this server waits for a person: a write, and a tool
+    // the server added since the catalog was reviewed (it is not known to read). Not for the API's own servers at their own
+    // path (`isPlatformMcpServer`): the API builds their hold itself, from this catalog (schedules) or holding every tool
+    // (github), and a server that only takes such a name is the operator's and gets the catalog like any other.
+    const catalog = tools !== null && isCataloguedServer(name, tools) && !isPlatformMcpServer(name, spec) ? name : null;
+    if (catalog !== null) holds.push((bare) => catalogClassOf(catalog, bare, tools!) !== "read");
     if (holds.length === 0) continue;
     rules.push({
       prefix, holds: (bare) => holds.some((h) => h(bare)), autos, catalog,
@@ -226,9 +231,9 @@ export function approvalPolicyFromMcp(
     let first: string | null = null;
     for (const r of holding) {
       if (r.autos.length === 0) return null;
-      // A catalogued write is released only where the catalog says it may be, whatever auto_approve lists.
+      // On a catalogued server only a read or a releasable write is released, whatever auto_approve lists.
       const bare = toolName.slice(r.prefix.length);
-      if (r.catalog !== null && catalogClassOf(r.catalog, bare, tools!) === "write" && !isReleasableWrite(r.catalog, bare, tools!)) return null;
+      if (r.catalog !== null && catalogClassOf(r.catalog, bare, tools!) !== "read" && !isReleasableWrite(r.catalog, bare, tools!)) return null;
       for (const a of r.autos) {
         const entry = a === null ? null : a(toolName.slice(r.prefix.length), input ?? {});
         if (entry === null) return null;

@@ -10,13 +10,16 @@
  *   AC2 `false`, no field at all: every catalogued write is held, no read is, and the hold turns nothing else on (operatorActive)
  *   AC3 auto_approve cannot release a write the catalog does not call releasable (an apply_*), can release one it does (a
  *       preview_*), and releases reads as before
- *   AC4 a server the catalog does not know is untouched; a tool the catalog does not list follows the spec alone
+ *   AC4 a server the catalog does not know is untouched; a tool the catalog does not list on a server it knows (one the server
+ *       added since) is held, and auto_approve does not release it, until the catalog classifies it
  *   AC5 through the controller a turn uses: with the hand list, workload_resume asks and is denied when nobody answers
+ *   AC6 the API's own schedules server at its own path keeps the hold the API built (from the same catalog); a server that only
+ *       takes its name gets the catalog like any other
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { TOOL_CATALOG, catalogClassOf } from "@claw/protocol";
+import { TOOL_CATALOG, TRIGGER_MCP_PATH, TRIGGER_MCP_SERVER, catalogClassOf } from "@claw/protocol";
 import { approvalPolicyFromMcp } from "../src/agent/approval-policy.js";
 import { HitlController } from "../src/agent/hitl.js";
 
@@ -67,14 +70,19 @@ test("AC3 auto_approve releases a catalogued write only where the catalog says i
   for (const w of ["workload_resume", "workload_delete", "workload_logs_download"]) assert.equal(safe.autoApprovalRule(S(w), {}), null, w);
 });
 
-test("AC4 a server the catalog does not know, and a tool it does not list, follow the spec alone", () => {
+test("AC4 an unknown server is untouched; an unknown tool of a known server waits until the catalog classifies it", () => {
   const p = approvalPolicyFromMcp({ ops: { ...base } });
   assert.equal(p.active, false);
   assert.equal(p.requiresApproval("mcp__ops__workload_resume"), false);
-  const listed = approvalPolicyFromMcp({ safe: { ...base, requires_approval: ["workload_stop"], auto_approve: ["tool_added_tomorrow"] } });
-  assert.equal(listed.requiresApproval(S("tool_added_tomorrow")), false, "not in the catalog: the spec does not hold it");
-  const all = approvalPolicyFromMcp({ safe: { ...base, requires_approval: true, auto_approve: ["tool_added_tomorrow"] } });
-  assert.notEqual(all.autoApprovalRule(S("tool_added_tomorrow"), {}), null, "not in the catalog: the spec releases it");
+  // SaFE adds workload_restart tomorrow; neither the hand list nor the catalog names it yet.
+  for (const spec of [{ ...base, requires_approval: SAFE_HAND_LIST }, { ...base }, { ...base, requires_approval: false }]) {
+    const listed = approvalPolicyFromMcp({ safe: spec });
+    assert.equal(listed.requiresApproval(S("workload_restart")), true, JSON.stringify(spec.requires_approval ?? "absent"));
+  }
+  const broad = approvalPolicyFromMcp({ safe: { ...base, requires_approval: true, auto_approve: ["workload_*", "tool_added_tomorrow"] } });
+  assert.equal(broad.autoApprovalRule(S("workload_restart"), {}), null, "a prefix in auto_approve does not release it");
+  assert.equal(broad.autoApprovalRule(S("tool_added_tomorrow"), {}), null, "nor does its own name");
+  assert.notEqual(broad.autoApprovalRule(S("workload_get"), {}), null, "a catalogued read still runs");
 });
 
 test("AC5 a turn's controller asks before workload_resume under the hand list, and denies it when nobody can answer", async () => {
@@ -93,4 +101,16 @@ test("AC5 a turn's controller asks before workload_resume under the hand list, a
   const r2 = await nobody.beforeToolUse({ sessionId: "s", actionId: "toolu_2", tool: S("workload_resume"), input: { workload_id: "w" } });
   assert.equal(r2.action, "deny", "no approval channel: a held write does not run");
   assert.equal((await nobody.beforeToolUse({ sessionId: "s", actionId: "toolu_3", tool: S("workload_get"), input: {} })).action, "allow");
+});
+
+test("AC6 the API's own schedules server keeps its own hold; one that only takes its name gets the catalog", () => {
+  const T = (bare: string) => `mcp__${TRIGGER_MCP_SERVER}__${bare}`;
+  const own = approvalPolicyFromMcp({ [TRIGGER_MCP_SERVER]: { ...base, url: `https://api.example.invalid${TRIGGER_MCP_PATH}`, requires_approval: ["trigger_create", "trigger_cancel"] } });
+  assert.equal(own.requiresApproval(T("trigger_create")), true);
+  assert.equal(own.requiresApproval(T("ping")), false, "the API's own server: its hold is the API's");
+  assert.equal(own.operatorActive, false);
+  const lookalike = approvalPolicyFromMcp({ [TRIGGER_MCP_SERVER]: { ...base, url: "https://elsewhere.example.invalid/mcp" } });
+  assert.equal(lookalike.requiresApproval(T("trigger_create")), true, "a catalogued write");
+  assert.equal(lookalike.requiresApproval(T("ping")), true, "a tool the catalog does not know");
+  assert.equal(lookalike.requiresApproval(T("trigger_list")), false, "a catalogued read");
 });
