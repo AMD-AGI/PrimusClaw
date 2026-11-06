@@ -56,6 +56,16 @@ export const ROUTER_LOG_CHARS = 6000;
 /** The plugin's rules a router turn is given, by name: how a reply is written, which is the router's to do. */
 export const ROUTER_RULES: readonly string[] = ["teams-reply-style"];
 
+/**
+ * The heading a router turn reads such a rule under (Brain puts a rule's description before its text). The rule is written for a Teams
+ * chat's own sessions, where what the model writes between tool calls is shown as progress ("Between tool calls, say in one short line
+ * what you are doing next"); a router did that with `say`, each call a message of the turn (2026-11-06). So the heading keeps the rule
+ * to how a say's text looks, and leaves when to say to the router's own prompt.
+ */
+export const ROUTER_RULE_HEADING =
+  "Reply style for the text of your say (formatting only, facts unchanged). When to say, and how often, is your instructions' to "
+  + "decide, not this rule's: its line about what you do between tool calls is not for you";
+
 /** The reads of the API's own `schedules` server a router turn may call: the user's scheduled tasks. */
 export const ROUTER_TRIGGER_READ_TOOLS = ["trigger_list"] as const;
 
@@ -77,6 +87,17 @@ export function readToolPatterns(server: string): string[] {
  * must come after the reads.
  */
 export const AFTER_READ_TOOLS = ["say", "work_recall", "memory_recall", "devenv_list", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list"] as const;
+
+/** The tool a router turn speaks with (`router-turn-end.ts`, `saidOnlyBeforeLookups`). */
+export const ROUTER_SPEAK_TOOL = "say";
+
+/**
+ * The assistant's own tools that only read: what a say written before it cannot have answered from (`saidOnlyBeforeLookups`). Named,
+ * not derived from AFTER_READ_TOOLS, which also holds what speaks or drafts after a read (`deliver_text`, `github_comment`).
+ */
+export const ROUTER_ASSISTANT_READS: readonly string[] = [
+  "work_recall", "memory_recall", "devenv_list", "claw_self_status", "brief", "trigger_list", "job_watch_list",
+];
 
 /**
  * The GitHub reads a router turn may call (`github-mcp/tools.ts`): finding and reading pull requests, issues, their checks and
@@ -192,8 +213,12 @@ export function readToolsOfPlugin(pluginId: number, tools: readonly unknown[]): 
     if (!tool || typeof tool !== "object") continue;
     const row = tool as Record<string, unknown>;
     const type = String(row.type ?? "").toLowerCase();
-    // A rule is text Brain adds to the prompt (its file, by `config.s3_key`): carried as the plugin has it.
-    if (type === "rule" && typeof row.name === "string" && ROUTER_RULES.includes(row.name)) { pluginTools.push(row); continue; }
+    // A rule is text Brain adds to the prompt (its file, by `config.s3_key`), under its description as a heading: carried as the plugin
+    // has it, under ROUTER_RULE_HEADING.
+    if (type === "rule" && typeof row.name === "string" && ROUTER_RULES.includes(row.name)) {
+      pluginTools.push({ ...row, description: ROUTER_RULE_HEADING });
+      continue;
+    }
     if (type !== "mcp") continue;
     const config = row.config && typeof row.config === "object" ? row.config as Record<string, unknown> : {};
     const all = config.mcpServers && typeof config.mcpServers === "object" ? config.mcpServers as Record<string, unknown> : {};

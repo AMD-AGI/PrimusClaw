@@ -39,6 +39,12 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A router turn that said only a line that it was on it ("查一下 Autopilot 的状态。") before its lookup answered, and then wrote its
+  answer as plain text, no longer leaves the person with that line alone: the completion skipped the text because the turn had
+  spoken. When the turn's stored `toolUsed` events show that every say that went out came before its last lookup ended (answered or
+  failed), the text is delivered as its answer, once, and takes the line's place (`replaces`, #360)
+  (`assistant.unsaid_answer_after_early_say`). The plugin's `teams-reply-style` rule reaches the router under a heading that keeps
+  it to how a say's text looks: its line asking for a line between tool calls is the Teams sessions', not the router's.
 - A worker that left what the user asked for in its last words (after a one-line report, or with no report) no longer loses it: final
   words of 1200 characters or more that no report of the run held are delivered as `item-<n>-reply.md`.
 - A `say` whose `[n]` lost its source (the page was fetched at an address no lookup returned) is refused with what to do, instead of

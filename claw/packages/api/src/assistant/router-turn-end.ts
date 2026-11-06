@@ -26,7 +26,8 @@ import { detectLanguage } from "./language.js";
 import { SAY_TEXT_MAX, publishSayEvent, recordAssistantSay, recordSystemNotice, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
 import { citedNumbers } from "./citations.js";
 import { internalTextIn, userWordsOf } from "./internal-text.js";
-import { WORK_EVENT_PREFIX } from "./prompts.js";
+import { TOOL_NAME_PREFIX, WORK_EVENT_PREFIX } from "./prompts.js";
+import { ROUTER_ASSISTANT_READS, ROUTER_SPEAK_TOOL } from "./read-tools.js";
 import { releaseHeldSays } from "./say-hold.js";
 import { kickDelivery } from "../notifications/outbox.js";
 
@@ -173,6 +174,44 @@ export async function routerTurnTiming(end: Pick<RouterTurnEnd, "sessionId" | "r
   };
 }
 
+/** The tools of a router turn that read (its lookups, the assistant's own reads): what a say written before cannot have answered from. */
+function isLookup(tool: string): boolean {
+  if (tool === "web_search" || tool === "web_fetch") return true;
+  if (tool.startsWith(TOOL_NAME_PREFIX)) return ROUTER_ASSISTANT_READS.includes(tool.slice(TOOL_NAME_PREFIX.length));
+  return tool.startsWith("mcp__");
+}
+
+/**
+ * Whether everything the turn answering `messageIds` said came before its last lookup answered, read from the session's stored
+ * events in the order Brain emitted them: the last `say` that went out (not one that failed or was refused) is earlier than the last
+ * lookup that ended, whether it answered or failed. False when the turn made no lookup, or its events say nothing either way.
+ */
+export async function saidOnlyBeforeLookups(sessionId: string, messageIds: ReadonlySet<string>): Promise<boolean> {
+  if (!messageIds.size) return false;
+  const rows = (await db.query(
+    `SELECT id, data->>'tool' AS tool, data->>'status' AS status, data->>'is_error' AS is_error, data->>'description' AS description
+       FROM claw_session_events
+      WHERE session_id = $1 AND event = 'toolUsed' AND deleted_at IS NULL AND data->>'message_id' = ANY($2::text[])
+        AND data->>'status' IS DISTINCT FROM 'start'
+      ORDER BY id`,
+    [sessionId, [...messageIds]],
+  )).rows as Array<{ id: string; tool: string | null; status: string | null; is_error: string | null; description: string | null }>;
+  let lastSay = -1;
+  let lastLookup = -1;
+  rows.forEach((row, i) => {
+    if (!row.tool) return;
+    const failed = row.status === "error" || row.is_error === "true";
+    if (row.tool === `${TOOL_NAME_PREFIX}${ROUTER_SPEAK_TOOL}`) {
+      // Only a say that went out is one the person holds.
+      if (!failed && !/^\s*\{\s*"ok"\s*:\s*false/.test(row.description ?? "")) lastSay = i;
+    } else if (isLookup(row.tool)) {
+      // A lookup that failed ended too: what the turn wrote after it (that it could not find out) is still its answer.
+      lastLookup = i;
+    }
+  });
+  return lastSay >= 0 && lastLookup > lastSay;
+}
+
 async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" | "skipped"> {
   const lost = end.failed || end.interrupted || end.fromSweeper;
   const router = (await db.query("SELECT user_id FROM claw_assistants WHERE session_id = $1", [end.sessionId])).rows[0] as
@@ -223,7 +262,22 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
     "SELECT 1 FROM claw_assistant_says WHERE user_id = $1 AND NOT fallback AND created_at >= $2 LIMIT 1",
     [router.user_id, began],
   );
-  if (spoke.rowCount) return "skipped";
+  // A turn that said something has answered, and the closing words it wrote after are not a second message. Unless all it said came
+  // before its last lookup answered: then the person holds a line that the turn was on it ("查一下 Autopilot 的状态。") and the answer
+  // is this text, which they would never get (the parity run's K2, 2026-11-06). Said now, it takes that line's place (`replaces`).
+  if (spoke.rowCount && !(!lost && !leaked && await saidOnlyBeforeLookups(end.sessionId, answered))) {
+    if (!lost && !leaked) logger.info({ sessionId: end.sessionId, runIds: end.runIds, chars: text.length }, "assistant.unsaid_text_after_say");
+    return "skipped";
+  }
+  if (spoke.rowCount) {
+    // Once: a redelivered completion finds the answer it stored (it is a say, so the turn's events do not change).
+    const stored = await db.query(
+      "SELECT 1 FROM claw_assistant_says WHERE user_id = $1 AND NOT fallback AND created_at >= $2 AND text = $3 LIMIT 1",
+      [router.user_id, began, text],
+    );
+    if (stored.rowCount) return "skipped";
+    logger.warn({ sessionId: end.sessionId, runIds: end.runIds }, "assistant.unsaid_answer_after_early_say");
+  }
   if (lost || leaked) {
     // Once per turn: a redelivered completion finds the notice it stored.
     const stored = await recordSystemNotice({

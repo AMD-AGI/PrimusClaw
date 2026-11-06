@@ -92,12 +92,20 @@ describe("assistant router read tools", { skip }, () => {
   }
 
   test("RT1 of a plugin, a router gets only the read-only servers, cut to their read tools", async () => {
-    const { readToolsOfPlugin, ROUTER_READ_TOOLS } = await import("../src/assistant/read-tools.js");
+    const { readToolsOfPlugin, ROUTER_READ_TOOLS, ROUTER_RULE_HEADING, ROUTER_ASSISTANT_READS, AFTER_READ_TOOLS } = await import("../src/assistant/read-tools.js");
+    // The assistant's reads (what a say before them cannot have answered from): each one allowed after a read, none that speaks or drafts.
+    for (const t of ROUTER_ASSISTANT_READS) assert.ok((AFTER_READ_TOOLS as readonly string[]).includes(t), t);
+    for (const t of ["say", "deliver_text", "github_comment"]) assert.ok(!ROUTER_ASSISTANT_READS.includes(t), `${t} is not a read`);
     const read = readToolsOfPlugin(PLUGIN, TOOL_ROWS);
     assert.deepEqual(read.servers, ["safe", "autopilot", "dispatron"], "the unlisted server is not connected");
     assert.deepEqual(read.pluginTools.map((t: any) => t.id), [17, 3, 26, 18], "no skill, and of the rules only the reply style");
     for (const t of read.pluginTools as any[]) {
-      if (t.type === "rule") assert.deepEqual(t.config, { s3_key: "plugins/17/", is_prefix: true }, "a rule is carried as the plugin has it");
+      if (t.type === "rule") {
+        assert.deepEqual(t.config, { s3_key: "plugins/17/", is_prefix: true }, "a rule is carried as the plugin has it");
+        // Under a heading that keeps it to how a say looks: its line about a line between tool calls is not the router's.
+        assert.equal(t.description, ROUTER_RULE_HEADING);
+        assert.match(t.description, /formatting only[\s\S]*its line about what you do between tool calls is not for you/);
+      }
       else assert.deepEqual(Object.keys(t.config), ["mcpServers"], "an MCP row's other config is not carried");
     }
     // Reads the site's tools are known to have, and writes of the same servers (names as Brain gives them).
