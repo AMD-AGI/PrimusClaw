@@ -18,6 +18,11 @@
  *       stopped when the run's signal fires
  *   A2 llm, script, app and an omitted mode are not refused
  *   A3 a mode this Brain has never heard of is refused, the engine untouched
+ *   A4 a task whose result outbox was already cleared (NATS returns the delete
+ *      marker, an empty value) is not replayed: a finish-only dispatch goes on
+ *      to finish the run, any other delivery is acked without running again
+ *   A5 an outbox entry that does not parse is dropped and the delivery acked,
+ *      instead of being retried until it is poisoned
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -46,7 +51,10 @@ interface FakeRunner {
   script: (signal: AbortSignal, opts?: { reclaimOnAbort?: () => boolean }) => Promise<AppRunResult>;
 }
 
-function harness(runner?: FakeRunner) {
+/** A KV entry as NATS returns it: a key deleted with `kv.delete` comes back as its delete marker, not null. */
+type KvEntry = { key: string; value: Uint8Array; operation?: string };
+
+function harness(runner?: FakeRunner, outbox?: { entry: KvEntry | null; deleted: string[] }) {
   const done: ExecuteResult[] = [];
   let acked = 0;
   let released = 0;
@@ -59,7 +67,11 @@ function harness(runner?: FakeRunner) {
   const settles: unknown[][] = [];
   let handOvers = 0;
   const events: Array<{ type?: string }> = [];
-  const kv = { async get() { return null; }, async put() { return 1; }, async delete() {} } as unknown as KV;
+  const kv = {
+    async get(key: string) { return key === "task-result.t-app" ? outbox?.entry ?? null : null; },
+    async put() { return 1; },
+    async delete(key: string) { outbox?.deleted.push(key); },
+  } as unknown as KV;
   const engine: Engine = {
     async execute(): Promise<ExecuteResult> { engineCalls++; throw new Error("engine must not run"); },
   };
@@ -353,4 +365,58 @@ test("A1i finish-only without a platform key: nothing is reported and the run ro
   assert.equal(h.done.length, 0);
   assert.equal(h.events.filter((e) => e.type === "statusUpdate").length, 0);
   assert.equal(h.acked(), 1);
+});
+
+// The live case (11-06): an app run cancelled while its sandbox was still being created was handed to a
+// new Brain to finish (`app_finish_only`). Its earlier delivery had cleared the result outbox, so the
+// key read back as a delete marker; replaying that empty value failed on every delivery until the
+// message was poisoned, and the run row stayed `finishing`.
+const DELETE_MARKER: KvEntry = { key: "task-result.t-app", value: new Uint8Array(0), operation: "DEL" };
+
+test("A4 finish-only with a cleared outbox: the run is finished, nothing is replayed", async () => {
+  for (const entry of [DELETE_MARKER, { ...DELETE_MARKER, operation: "PURGE" }, { key: "task-result.t-app", value: new Uint8Array(0) }]) {
+    const runner = fakeRunner(async () => ({ kind: "ended", outcome: { success: false, reason: "app run ended: cancelled" } }));
+    const outbox = { entry, deleted: [] as string[] };
+    const h = harness(runner, outbox);
+    const abortCtrl = new AbortController();
+    activeAbort.set("lock.s-app", abortCtrl);
+    await runHandleTask(h.msg, { ...request("app"), app_finish_only: true } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", abortCtrl);
+    assert.equal(runner.runs, 1, `${entry.operation ?? "empty"}: the AppRunner finishes the run`);
+    assert.equal(h.finishDone(), 1, "the task is handed back to its terminal state once");
+    assert.equal(h.done.length, 0, "an empty outbox is not replayed as a result");
+    assert.equal(h.acked(), 1);
+    assert.equal(h.released(), 1);
+    assert.equal(activeAbort.has("lock.s-app"), false);
+  }
+});
+
+test("A4b any other delivery with a cleared outbox is acked once and does not run the task again", async () => {
+  const runner = fakeRunner(async () => { throw new Error("must not run"); });
+  const outbox = { entry: DELETE_MARKER, deleted: [] as string[] };
+  const h = harness(runner, outbox);
+  await runApp(h);
+  assert.equal(runner.runs, 0, "its callback was delivered: the run is not started again");
+  assert.equal(h.created(), 0);
+  assert.equal(h.engineCalls(), 0);
+  assert.equal(h.done.length, 0, "nothing is reported twice");
+  assert.equal(h.acked(), 1, "acked, so it is not redelivered");
+  assert.equal(h.released(), 1);
+  assert.equal(activeAbort.has("lock.s-app"), false);
+});
+
+test("A5 an outbox entry that does not parse is dropped and acked, not retried until poisoned", async () => {
+  for (const finishOnlyFlag of [false, true]) {
+    const runner = fakeRunner(async () => { throw new Error("must not run"); });
+    const outbox = { entry: { key: "task-result.t-app", value: new TextEncoder().encode("{\"finalText\": "), operation: "PUT" }, deleted: [] as string[] };
+    const h = harness(runner, outbox);
+    const abortCtrl = new AbortController();
+    activeAbort.set("lock.s-app", abortCtrl);
+    await runHandleTask(h.msg, { ...request("app"), app_finish_only: finishOnlyFlag } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", abortCtrl);
+    assert.equal(h.acked(), 1, `finish-only=${finishOnlyFlag}: acked rather than nak'd for another failing replay`);
+    assert.deepEqual(outbox.deleted, ["task-result.t-app"], "the unreadable entry is removed, so the next delivery runs normally");
+    assert.equal(h.done.length, 0);
+    assert.equal(runner.runs, 0);
+    assert.equal(h.released(), 1);
+    assert.equal(activeAbort.has("lock.s-app"), false);
+  }
 });

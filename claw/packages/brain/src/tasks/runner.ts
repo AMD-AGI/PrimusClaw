@@ -878,9 +878,42 @@ async function replayPendingCallback(
   }
   if (!entry) return false;
 
+  // A cleared outbox is no pending callback. NATS KV answers a key deleted by
+  // ackAndClearCallback with its delete marker (operation DEL/PURGE, empty
+  // value) rather than null, so a later delivery of the same task -- an app
+  // run's finish handed to a new Brain, or a redelivery whose ack was lost --
+  // finds the marker. Its callback was delivered: an app finish goes on to
+  // finish the run, anything else is acked without running the task again.
+  const cleared = entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0;
+  if (cleared) {
+    if (request.mode === "app" && request.app_finish_only === true) return false;
+    logger.info({ taskId: request.task_id, operation: entry.operation }, "task.agent_done_already_delivered");
+    msg.ack();
+    activeAbort.delete(lockKey);
+    await fx().releaseTaskLock(lockKey).catch(() => {});
+    return true;
+  }
+
+  let stored: ExecuteResult & { run_time?: RunTimeReport };
   try {
-    const { run_time: runTime, ...result } = JSON.parse(sc.decode(entry.value)) as
-      ExecuteResult & { run_time?: RunTimeReport };
+    stored = JSON.parse(sc.decode(entry.value)) as ExecuteResult & { run_time?: RunTimeReport };
+  } catch (err) {
+    // deliverAgentDone writes only JSON, so this entry was never a result it
+    // can replay. Retrying cannot make it parse: drop it and ack, so the
+    // delivery ends here instead of failing until it is poisoned, and the next
+    // delivery of the task (an app run's finish) runs normally.
+    logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_unreadable");
+    await kvCkpt.delete(key).catch((e) => {
+      logger.warn({ err: e, taskId: request.task_id }, "task.agent_done_outbox_cleanup_failed");
+    });
+    msg.ack();
+    activeAbort.delete(lockKey);
+    await fx().releaseTaskLock(lockKey).catch(() => {});
+    return true;
+  }
+
+  try {
+    const { run_time: runTime, ...result } = stored;
     await fx().postAgentDone(request, result, runTime);
     await ackAndClearCallback(msg, kvCkpt, request);
     logger.info({ taskId: request.task_id }, "task.agent_done_replayed");
