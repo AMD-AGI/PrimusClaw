@@ -414,9 +414,13 @@ export const INTERNAL_TEXT: ReadonlyArray<[string, RegExp]> = [
 export const CAPABILITY_DENIAL = new RegExp([
   "我(目前|现在|暂时|这边|这里)?(还)?(无法|不能|没法|没办法|不可以)(直接)?(访问|读取|查看|查询|获取|连接|联网|上网|浏览|打开|拿到)",
   "我(这边|这里)?(访问|读取|查询|连接|读|查|看)不了", "我(这边|这里)?(访问|连接|拿)不到",
+  "我(这边|这里)?(看不到|看不见|没法看|无法看到?)(你的)?\\s*(GitHub|github|仓库|代码库|PR|拉取请求|SaFE|safe|集群|节点|Dispatron|Autopilot|Pulse|网页|看板)",
   "我(这边|这里)?(没有|无)[^，。,.!！?？\\n]{0,12}?(工具|能力|接口|权限)",
   "(无法|不能|没法)(联网|上网)", "没有(联网|上网)(能力|功能|工具)",
   "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:access|read|browse|reach|connect to|query|look up|fetch|check|open|get to)\\b",
+  // "see" and "view" only of a system or the user's data: "I can't see any failed runs" is an answer, not a denial.
+  "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:see|view) (?:into |inside )?(?:your |the |any of your )?"
+    + "(?:github|repos?\\b|repositor(?:y|ies)|PRs?\\b|pull requests?|issues|safe|workloads?|clusters?|nodes|dispatron|autopilot|pulse|(?:the )?web|web ?pages?|internet|board)",
   "\\bI (?:don(?:'|’)?t|do not) have (?:any )?(?:access|permission|internet|web access|a tool|the tools?|tools?)\\b",
   "\\bI have no (?:access|internet|web access|tools?)\\b",
 ].join("|"), "i");
@@ -769,9 +773,9 @@ export function judgePrompt(c: EvalCase, turns: readonly Turn[], final: string):
 export function verdictOf(c: EvalCase, checks: readonly Check[], judge: { pass: boolean } | null | undefined): { pass: boolean; unjudged?: true } {
   if (!passed(checks)) return { pass: false };
   if (checks.some((x) => x.unverified)) return { pass: false, unjudged: true };
-  if (!needsJudge(c)) return { pass: true };
-  if (!judge) return { pass: false, unjudged: true };
-  return { pass: judge.pass };
+  // A judge, where one is configured, grades every case (at least the no-false-denial rule): its FAIL fails any case.
+  if (judge) return { pass: judge.pass };
+  return needsJudge(c) ? { pass: false, unjudged: true } : { pass: true };
 }
 
 /** What a recording keeps of an observation: an api oracle's values are the identity's data, so they are left out (null:

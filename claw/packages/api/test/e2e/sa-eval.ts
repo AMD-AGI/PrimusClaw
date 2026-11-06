@@ -75,8 +75,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   BUILTIN_TOOLS, caseHash, caseSays, cardsOf, cleanupOf, filledCase, finalSay, grade, forRecording, identityRefusal, itemsStartedBy, judgePrompt,
-  loadCases, oracleMcpTarget, missingVars, needsJudge, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf, saysOf,
-  staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest, holdAnswers, toolPattern,
+  loadCases, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf, saysOf, staticFindings,
+  verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest, holdAnswers, toolPattern,
   type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery, type Recording,
   type Turn, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
@@ -310,7 +310,8 @@ function mcpClient(server: string): Promise<Client> {
 
 async function judge(c: EvalCase, turns: Turn[], final: string): Promise<{ pass: boolean; why: string } | null> {
   const url = process.env.EVAL_JUDGE_URL, model = process.env.EVAL_JUDGE_MODEL, keyFile = process.env.EVAL_JUDGE_KEY_FILE;
-  if (!url || !model || !keyFile || !needsJudge(c)) return null;
+  // Every case, not only those with content only a judge can grade: the no-false-denial rule is in every prompt.
+  if (!url || !model || !keyFile) return null;
   const key = readFileSync(keyFile, "utf8").trim();
   const prompt = judgePrompt(c, turns, final);
   try {

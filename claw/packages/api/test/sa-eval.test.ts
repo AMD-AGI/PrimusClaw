@@ -270,6 +270,8 @@ test("S13 judge-only content and recordings", () => {
   assert.deepEqual(verdictOf(judged, ok, { pass: false }), { pass: false });
   assert.deepEqual(verdictOf(judged, ok, { pass: true }), { pass: true });
   assert.deepEqual(verdictOf(plain, grade(plain, observed({ final: "1060", factValues: [["1060"]] })), null), { pass: true });
+  // Where a judge is configured it grades every case: its FAIL (the no-false-denial rule) fails one with nothing else for it.
+  assert.deepEqual(verdictOf(plain, grade(plain, observed({ final: "1060", factValues: [["1060"]] })), { pass: false }), { pass: false });
   const withOracle = caseOf({ facts: [{ claim: "n", oracle: { kind: "api", query: "/v1/me#name" } }, { claim: "s", oracle: { kind: "static", value: "1" } }] });
   assert.deepEqual(forRecording(withOracle, observed({ factValues: [["Secret Name"], ["1"]] })).factValues, [null, ["1"]]);
   // Offline, that oracle was not read: the fact is unverified and the attempt is not a pass, however right the rest is.
@@ -391,7 +393,8 @@ test("S16 no false denial of a capability", () => {
   const denied = (final: string, calls: ToolCall[] = [], over: Partial<EvalCase> = {}) =>
     failed(caseOf({ ...c, ...over }), observed({ final, calls })).includes("no false denial");
   for (const text of ["我读不了 GitHub，没法看你的 PR。", "抱歉，我无法访问 GitHub。", "我这边没有 GitHub 的工具。", "我目前不能联网。", "我没有权限查看这个 workspace",
-    "I can't access GitHub from here.", "I don't have access to the internet.", "I'm unable to browse the web.", "I have no tools for that."]) {
+    "我看不到你的 GitHub 仓库。", "I can't access GitHub from here.", "I don't have access to the internet.", "I'm unable to browse the web.",
+    "I have no tools for that.", "I can't view GitHub from here.", "I cannot see your pull requests.", "I'm not able to view the web."]) {
     assert.ok(denied(text), text);
     assert.ok(CAPABILITY_DENIAL.test(text), text);
   }
@@ -406,7 +409,8 @@ test("S16 no false denial of a capability", () => {
   assert.ok(denied("我无法访问 SaFE。Dispatron 那边也有问题。", [call("mcp__dispatron__get_runs", false)]));
   assert.ok(!denied("我不能读取 ~/.ssh 下的文件。", [], { may_deny: true }));
   // A fact about a system, or "found nothing", is not a denial.
-  for (const text of ["node-7 无法访问，已经离线 2 小时。", "没有找到失败的运行。", "我查到 3 个开着的 PR。", "I don't see any failed runs today.", "The node cannot reach the registry."]) {
+  for (const text of ["node-7 无法访问，已经离线 2 小时。", "没有找到失败的运行。", "我查到 3 个开着的 PR。", "I don't see any failed runs today.", "The node cannot reach the registry.",
+    "I can't see any failed runs today.", "我看不到失败的运行。"]) {
     assert.ok(!denied(text), text);
   }
   // A failed shell command excuses a GitHub denial only when it failed at GitHub: a line of its answer is a failure that names
