@@ -164,13 +164,19 @@ export async function sweepPresence(onlineWindowMs: number, noticeAfterMs: numbe
       }
       if (r.presence_state === "offline" && r.online) {
         const id = await record(r, "online", null);
+        // "Back" only to someone who was told it had gone (`back_sent`; put back to `back_pending` if it could not be stored).
+        const back = r.offline_notice === "sent";
         await q(
           `UPDATE claw_remote_connectors SET presence_state = 'online', presence_since = NOW(), offline_since = NULL, offline_reason = NULL,
-                  offline_notice = NULL, presence_episode = $2 WHERE connector_id = $1`,
-          [r.connector_id, id],
+                  offline_notice = $3, presence_episode = $2 WHERE connector_id = $1`,
+          [r.connector_id, id, back ? "back_sent" : null],
         );
-        // "Back" only to someone who was told it had gone.
-        if (r.offline_notice === "sent") notices.push({ ...base, kind: "online", episode: id, lastSeenAt: null, reason: null });
+        if (back) notices.push({ ...base, kind: "online", episode: id, lastSeenAt: null, reason: null });
+        continue;
+      }
+      if (r.presence_state === "online" && r.online && r.offline_notice === "back_pending") {
+        await q("UPDATE claw_remote_connectors SET offline_notice = 'back_sent' WHERE connector_id = $1", [r.connector_id]);
+        notices.push({ ...base, kind: "online", episode: Number(r.presence_episode), lastSeenAt: null, reason: null });
         continue;
       }
       if (r.presence_state === "offline" && r.offline_notice === "pending" && r.notice_due) {
@@ -227,7 +233,7 @@ export const presencePorts: {
 
 /**
  * One sweep and its notices. A notice that fails to be stored is put back to be tried by the next sweep (its key makes a
- * second attempt say nothing twice); one that "came back" is only logged, since the connector is online and fine.
+ * second attempt say nothing twice), as long as the connector is still in the episode it was about.
  */
 export async function runPresenceSweep(onlineWindowMs: number, noticeAfterMs: number = OFFLINE_NOTICE_MS): Promise<SweepResult> {
   const out = await sweepPresence(onlineWindowMs, noticeAfterMs);
@@ -237,12 +243,11 @@ export async function runPresenceSweep(onlineWindowMs: number, noticeAfterMs: nu
       logger.info({ owner: n.owner, connectorId: n.connectorId, kind: n.kind, episode: n.episode, told }, "remote_agents.presence_notice");
     } catch (err) {
       logger.warn({ err: (err as Error)?.message, connectorId: n.connectorId, kind: n.kind }, "remote_agents.presence_notice_failed");
-      if (n.kind === "offline") {
-        await db.query(
-          "UPDATE claw_remote_connectors SET offline_notice = 'pending' WHERE connector_id = $1 AND presence_episode = $2 AND offline_notice = 'sent'",
-          [n.connectorId, n.episode],
-        ).catch(() => {});
-      }
+      const [from, to] = n.kind === "offline" ? ["sent", "pending"] : ["back_sent", "back_pending"];
+      await db.query(
+        "UPDATE claw_remote_connectors SET offline_notice = $3 WHERE connector_id = $1 AND presence_episode = $2 AND offline_notice = $4",
+        [n.connectorId, n.episode, to, from],
+      ).catch((e) => logger.warn({ err: (e as Error)?.message, connectorId: n.connectorId }, "remote_agents.presence_notice_requeue_failed"));
     }
   }
   return out;

@@ -12,7 +12,7 @@
  *   P4  replaced by an online connector of the same name, or revoked by the owner: nothing told
  *   P5  a connector whose sign-in ran out is told to sign in again, not just to run
  *   P6  only one replica sweeps at a time
- *   P7  a notice that could not be stored is tried again by the next sweep and said once
+ *   P7  a notice (offline or back online) that could not be stored is tried again by the next sweep and said once
  *   P8  every notice goes to the connector's owner and nobody else
  */
 import assert from "node:assert/strict";
@@ -219,6 +219,20 @@ describe("remote connector presence", { skip }, () => {
     await sweep();
     assert.equal((await says("alice")).length, 1);
     assert.equal((await row(id)).offline_notice, "sent");
+    // The same for "back online": a failure leaves it owed, and the next sweep says it, once.
+    await streamBack(id);
+    presence.presencePorts.tell = async () => { throw new Error("outbox down"); };
+    try {
+      await sweep();
+    } finally {
+      presence.presencePorts.tell = real;
+    }
+    assert.equal((await row(id)).offline_notice, "back_pending");
+    assert.equal((await says("alice")).length, 1);
+    await sweep();
+    await sweep();
+    assert.deepEqual((await says("alice")).slice(1), ["你的开发环境 dev-box 已恢复在线。"]);
+    assert.equal((await row(id)).offline_notice, "back_sent");
   });
 
   test("P8 a notice goes to the connector's owner only, in their language", async () => {
