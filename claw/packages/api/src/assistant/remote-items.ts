@@ -118,7 +118,8 @@ export interface PendingCancel {
    * The `cmd_seq` of the prompts open when it was sent (the item's `open_cmd_seqs` then): its end ends every one of them still open,
    * named or not. A prompt whose turn's end never comes (the connector restarted mid-turn: the prompt is not delivered again and the
    * session's queue starts empty) is then ended by the next stop, whose cancel finds nothing running and names no prompt. Absent on
-   * a cancel noted before it was kept: its end makes the item count again (`open_turns`), as the end of a turn naming none does.
+   * a cancel noted before it was kept: what it had open is then every prompt open but the last ones sent after it (`n`, its own and
+   * those of the cancels after it), which are the newest the item has.
    */
   seqs?: number[];
 }
@@ -466,14 +467,6 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       const refusedUnrun = PROMPT_REFUSED_UNQUEUED.has(reason) || reason === PROMPT_DROPPED_BY_CANCEL;
       const named = (e.type === REMOTE_EVENT_TURN_END && Object.hasOwn(e.data, "cmd_seq")) || (refusedUnrun && seq !== null);
       if ((e.type === REMOTE_EVENT_TURN_END || refusedUnrun) && !named) p.open_cmd_seqs = null;
-      // The end of a cancel noted before the prompts open when it was sent were kept with it: counted, as before names were kept.
-      const pending = pendingCancels(p);
-      const cancelEnd = e.type === REMOTE_EVENT_TURN_END && flat(e.data.stopReason, 40) === "cancelled" && pending.length > 0
-        && e.id > pending[0].after;
-      if (cancelEnd && seq !== null) while (pending.length && pending[0].seqs && !pending[0].seqs.includes(seq)) pending.shift();
-      if (Array.isArray(p.open_cmd_seqs) && named && board !== "done" && cancelEnd && pending.length && !pending[0].seqs) {
-        p.open_cmd_seqs = null;
-      }
       if (Array.isArray(p.open_cmd_seqs) && named) {
         if (board === "done") continue;
         const ended = new Set<number>(seq !== null ? [seq] : []);
@@ -482,8 +475,13 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         // running: a prompt whose turn's end never came, lost when the connector restarted mid-turn, ends here). A cancel pending
         // that does not have the cancelled prompt open was sent before that prompt and its end is not coming any more (the turn it
         // was sent for finished on its own as it was on its way): it is passed over, and what it had open the later one has too.
-        if (cancelEnd) {
-          for (const c of pending.shift()?.seqs ?? []) ended.add(c);
+        const pending = pendingCancels(p);
+        if (e.type === REMOTE_EVENT_TURN_END && flat(e.data.stopReason, 40) === "cancelled" && pending.length && e.id > pending[0].after) {
+          if (seq !== null) while (pending.length && pending[0].seqs && !pending[0].seqs.includes(seq)) pending.shift();
+          const sentAfter = pending.reduce((sum, c) => sum + c.n, 0);
+          const head = pending.shift();
+          const open = p.open_cmd_seqs;
+          for (const c of head ? head.seqs ?? open.slice(0, Math.max(0, open.length - sentAfter)) : []) ended.add(c);
           p.cancels = pending;
         }
         const left = p.open_cmd_seqs.filter((c) => !ended.has(c));
