@@ -257,6 +257,17 @@ export interface WorkloadWaitOptions {
    * start one once the platform reports it NotReady. 0 or absent disables.
    */
   unschedulableTimeoutMs?: number;
+  /**
+   * The ceiling for a workload the platform reports dispatched (NotReady) while it
+   * says a node is being added for it (`TriggeredScaleUp`): such a wait is for
+   * capacity, which for a GPU node can take hours, not for a start. When set, that
+   * wait runs on this ceiling, counted from the first read of the scale-up, and the
+   * start ceiling does not run during it; 0 means no ceiling. Absent (the default,
+   * and what a multi-node cluster passes) keeps the ceilings of the phase: the
+   * start ceiling applies as it always did. Opt-in, so that a caller whose start
+   * ceiling is "wait indefinitely" is never given a limit it did not ask for.
+   */
+  scaleUpTimeoutMs?: number;
   deps?: WorkloadWaitDeps;
 }
 
@@ -298,6 +309,9 @@ async function sleepUnlessAborted(
  *     2xx whose body carries no phase;
  *   - Pending past the ceiling         -> sandbox_pending_timeout, counted only
  *     while queued and reset on dispatch;
+ *   - dispatched with a node being added past `scaleUpTimeoutMs`, for a caller
+ *     that set it -> sandbox_pending_timeout, counted from the first read of the
+ *     scale-up and reset once it is not one;
  *   - admitted, no node has taken the pod and none is being added, past
  *     `unschedulableTimeoutMs` -> sandbox_unschedulable, counted from the first
  *     such read, restarted by a message the stall has not had before, and
@@ -306,8 +320,8 @@ async function sleepUnlessAborted(
  *     autoscaler says it will not add a node) or the workload goes back to the
  *     queue;
  *   - dispatched but not ready past its own ceiling -> sandbox_start_timeout,
- *     counted from the first read that is not Pending and reset if the workload
- *     falls back to Pending. SaFE reports a container's waiting state nowhere
+ *     counted from the first read that is not Pending (nor, for a caller that set
+ *     `scaleUpTimeoutMs`, a node being added), and reset if it falls back to either. SaFE reports a container's waiting state nowhere
  *     (an image that can never be pulled reads as an ordinary slow start), so
  *     the only honest signal that a start will not finish is time;
  *   - the run's signal aborting        -> sandbox_wait_interrupted.
@@ -333,6 +347,7 @@ export async function waitForWorkloadReady(
   const NOTIFY_INTERVAL_MS = deps?.notifyIntervalMs ?? 600_000;
   const WAIT_NOTICE_GAP_MS = deps?.waitNoticeGapMs ?? 30_000;
   const UNSCHEDULABLE_TIMEOUT_MS = opts.unschedulableTimeoutMs ?? 0;
+  const SCALE_UP_TIMEOUT_MS = opts.scaleUpTimeoutMs;
 
   const detailUrl = `${SAFE_API_URL}/api/v1/workloads/${workloadId}`;
   const pollStart = now();
@@ -357,6 +372,9 @@ export async function waitForWorkloadReady(
   // soon as a read shows anything else, so it only grows through an unbroken
   // absence of progress.
   let unscheduledSince: number | null = null;
+  // When a dispatched workload was first seen with a node being added for it, in
+  // an unbroken run of such reads; used only when the caller set scaleUpTimeoutMs.
+  let scaleUpSince: number | null = null;
   // What the platform has said about the pod during this stall. A message not
   // among them is the platform doing something, so the stall starts over; one it
   // has already said, again, is not. Bounded, so a message that changes on every
@@ -569,8 +587,15 @@ export async function waitForWorkloadReady(
     // dispatched and busy pulling a large image is never reaped as "pending".
     // An unreadable phase leaves the clock alone; that case belongs to the
     // backstop above.
+    //
+    // A dispatched workload with a node being added for it is waiting for
+    // capacity, which for a GPU node can take hours, not for a start: for a caller
+    // that asked (scaleUpTimeoutMs), it runs on that ceiling, from the first read
+    // of the scale-up, and the start ceiling does not run.
+    const scalingUp = waiting?.scalingUp === true;
     if (phase === "pending") {
       dispatchedSince = null;
+      scaleUpSince = null;
       if (pendingSince === null) pendingSince = now();
       if (PENDING_TIMEOUT_MS > 0 && now() - pendingSince > PENDING_TIMEOUT_MS) {
         const pendingFor = ((now() - pendingSince) / 1000).toFixed(1);
@@ -580,8 +605,21 @@ export async function waitForWorkloadReady(
           `workload ${workloadId} still queued (Pending) after ${pendingFor}s`,
         );
       }
+    } else if (phase && scalingUp && SCALE_UP_TIMEOUT_MS !== undefined) {
+      pendingSince = null;
+      dispatchedSince = null;
+      if (scaleUpSince === null) scaleUpSince = now();
+      if (SCALE_UP_TIMEOUT_MS > 0 && now() - scaleUpSince > SCALE_UP_TIMEOUT_MS) {
+        const scalingFor = ((now() - scaleUpSince) / 1000).toFixed(1);
+        return await giveUp(
+          "sandbox_pending_timeout",
+          phase,
+          `workload ${workloadId} still waiting for the platform to add a node after ${scalingFor}s (phase=${phase})`,
+        );
+      }
     } else if (phase) {
       pendingSince = null;
+      scaleUpSince = null;
       // Dispatched and still short of ready (the terminal and ready cases left
       // above), so the start has to finish within its own ceiling.
       if (dispatchedSince === null) dispatchedSince = now();

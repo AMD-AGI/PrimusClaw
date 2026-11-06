@@ -68,7 +68,8 @@ const SCALING_UP_MESSAGE = `In queue - waiting for scale-up - ${SCHEDULER_ACCOUN
 const NOT_SCALING_MESSAGE = `In queue - waiting for scale-up - ${SCHEDULER_ACCOUNT}${POD_GROUP} - `
   + `NotTriggerScaleUp: pod didn't trigger scale-up: pool ${POOL}: NoHeadroom: the pods need 1 new node(s)`;
 const INCIDENT_SUMMARY =
-  "no node can take the sandbox right now (7 nodes: 4 unschedulable, 3 restricted to other workloads), and no new node is being added";
+  "no node can take the sandbox right now (7 nodes: 4 unschedulable, 3 restricted to other workloads), and no new node is being added"
+  + " (the autoscaler says: the pod does not fit a new node of this pool: TaintToleration: node(s) had untolerated taint)";
 /** Everything the platform's text carries that the user is not shown. */
 const IDENTIFIERS = new RegExp([POOL, "claw-sandboxes", "claw-1785291793209", "x7k2p", "sandbox-nodes/profile"].join("|"));
 const incident = (phase = "NotReady", message = INCIDENT_MESSAGE): Body =>
@@ -131,6 +132,7 @@ async function run(bodies: Body[], o: {
   unschedulableTimeoutMs?: number;
   pendingTimeoutMs?: number;
   startTimeoutMs?: number;
+  scaleUpTimeoutMs?: number;
   waitNoticeGapMs?: number;
 }) {
   const clock = fakeClock();
@@ -138,10 +140,12 @@ async function run(bodies: Body[], o: {
   const terminal: Array<{ phase: string; status: string; reason: string; message?: string }> = [];
   const gaveUp: Array<{ reason: string; phase: string }> = [];
   let ended: string | null = null;
+  let endedMessage = "";
   try {
     await waitForWorkloadReady({
       workloadId: o.workloadId ?? "wl-1", apiKey: "key", logPrefix: "test", isReady: isRunning,
       unschedulableTimeoutMs: o.unschedulableTimeoutMs,
+      scaleUpTimeoutMs: o.scaleUpTimeoutMs,
       onProgress: async (p) => { progress.push({ ...p, at: clock.now() } as Progress); },
       onTerminal: async (t) => { terminal.push(t); },
       onGiveUp: async (g) => { gaveUp.push(g); },
@@ -154,8 +158,9 @@ async function run(bodies: Body[], o: {
   } catch (e) {
     assert.ok(e instanceof SandboxProvisionTerminalError, `unexpected error: ${String(e)}`);
     ended = e.reason;
+    endedMessage = e.message;
   }
-  return { ended, progress, terminal, gaveUp, clock };
+  return { ended, endedMessage, progress, terminal, gaveUp, clock };
 }
 
 // ── reading the state ────────────────────────────────────────────────────────
@@ -263,6 +268,11 @@ test("the user is told in our words what the platform's text says, without its i
   );
   assert.equal(
     summarizeScheduling("NotTriggerScaleUp: pod didn't trigger scale-up: pool abc: NoHeadroom: the pods need 1 new node(s)"),
+    "no node can take the sandbox right now, and no new node is being added (the autoscaler says: NoHeadroom: the pods need 1 new node(s))",
+  );
+  // An autoscaler that gives no reason is not given one.
+  assert.equal(
+    summarizeScheduling("NotTriggerScaleUp: pod didn't trigger scale-up"),
     "no node can take the sandbox right now, and no new node is being added",
   );
   assert.equal(summarizeScheduling("something the platform wrote that we do not know"), null);
@@ -275,7 +285,7 @@ test("the user is told in our words what the platform's text says, without its i
     for (const phase of ["NotReady", "Pending"]) {
       const w = readWaitingState(incident(phase, message))!;
       assert.doesNotMatch(w.reason, IDENTIFIERS, message);
-      assert.ok(!w.reason.includes("\n") && w.reason.length < 200, w.reason);
+      assert.ok(!w.reason.includes("\n") && w.reason.length <= 300, w.reason);
     }
   }
   // Text it cannot summarise on an admitted workload is not passed through either.
@@ -566,12 +576,18 @@ test("a read that says nothing about the workload leaves a scale-up in force", {
   assert.equal(cleared.ended, "sandbox_unschedulable");
 });
 
-test("a scale-up that was seen is out of the short limit's clock, and the ceilings of the phase still apply", { timeout: 5000 }, async () => {
+test("a scale-up that was seen is out of the short limit's clock, and the ceilings of the phase still apply unless the caller set one for it", { timeout: 5000 }, async () => {
   const notReady = await run([scaleUpEvent(), failedScheduling()], {
     unschedulableTimeoutMs: 300_000, startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000,
   });
   assert.equal(notReady.ended, "sandbox_start_timeout");
   assert.equal(notReady.clock.value, 905_000 + 5_000);
+  // The run's sandbox sets scaleUpTimeoutMs: NotReady with a node being added runs on it, not on the start ceiling.
+  const sandbox = await run([scaleUpEvent(), failedScheduling()], {
+    unschedulableTimeoutMs: 300_000, startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000, scaleUpTimeoutMs: 10_800_000,
+  });
+  assert.equal(sandbox.ended, "sandbox_pending_timeout");
+  assert.equal(sandbox.clock.value, 10_800_000 + 10_000);
   const pending = await run([scaleUpEvent("Pending"), failedScheduling("Pending")], {
     unschedulableTimeoutMs: 300_000, startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000,
   });
@@ -598,7 +614,93 @@ test("a scale-up the autoscaler then says it will not do is counted from that re
   assert.equal(r.ended, "sandbox_unschedulable");
   assert.equal(r.clock.value, 515_000 + 305_000);
   assert.equal(r.progress.at(-1)!.waiting?.kind, "unscheduled");
-  assert.equal(r.progress.at(-1)!.waiting?.reason, "no node can take the sandbox right now (7 nodes: 4 unschedulable, 3 restricted to other workloads), and no new node is being added");
+  assert.equal(r.progress.at(-1)!.waiting?.reason, "no node can take the sandbox right now (7 nodes: 4 unschedulable, 3 restricted to other workloads), and no new node is being added (the autoscaler says: NoHeadroom: the pods need 1 new node(s))");
+});
+
+// The run of 2026-11-06 (Dispatron run 1461): a sandbox in an Autopilot group-job
+// workspace. The pod is gated until its node is bought, so the scheduler never fails
+// it and the platform's only account is the gate, then the autoscaler's decision,
+// which the platform keeps on the message once made. The platform reports the
+// workload NotReady throughout, with the pod listed and untaken.
+const GATED = "In queue - waiting for scale-up - Scheduling is blocked due to non-empty scheduling gates";
+const gated = (decision = ""): Body => ({
+  phase: "NotReady", queuePosition: 0,
+  message: decision ? `${GATED} - ${decision}` : GATED,
+  pods: [{ podId: "claw-1793988293579-sandbox-9kgj5", phase: "Pending" }],
+});
+const GATED_SCALING = `TriggeredScaleUp: pod triggered scale-up: job 271406 queued in pool ${POOL}`;
+const GATED_REFUSED = `NotTriggerScaleUp: pod didn't trigger scale-up: pool ${POOL}: NoHeadroom: the pods need 1 new node(s)`;
+/** The run's sandbox, as SafeWorkloadProvider waits for it. */
+const REAL_CEILINGS = {
+  unschedulableTimeoutMs: 300_000, startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000, scaleUpTimeoutMs: 10_800_000,
+};
+
+test("a gated sandbox the autoscaler is buying a node for waits past 5 minutes and past the start ceiling, until its node comes", { timeout: 10_000 }, async () => {
+  // 30s with only the gate said, then the scale-up; the 8-GPU node takes two hours to come.
+  const twoHours = 2 * 60 * 60 * 1000 / 5000;
+  const r = await run([...repeat(6, gated()), ...repeat(twoHours, gated(GATED_SCALING)), takenNotReady, running], REAL_CEILINGS);
+  assert.equal(r.ended, null);
+  assert.ok(r.clock.value > 2 * 60 * 60 * 1000, String(r.clock.value));
+  // The user is told a node is being added, and never that the sandbox cannot be scheduled after the scale-up.
+  const afterScaleUp = r.progress.filter((p) => p.at > 30_000 && p.at <= 30_000 + twoHours * 5000);
+  assert.ok(afterScaleUp.length >= 2);
+  for (const p of afterScaleUp) {
+    assert.deepEqual(p.waiting, { kind: "queued", reason: "the platform is adding a node for the sandbox" });
+  }
+});
+
+test("a gated sandbox whose node never comes ends at the 3-hour ceiling, counted from the scale-up, and says so", { timeout: 10_000 }, async () => {
+  const r = await run([...repeat(6, gated()), gated(GATED_SCALING)], REAL_CEILINGS);
+  assert.equal(r.ended, "sandbox_pending_timeout");
+  // Clocked from the first read of the scale-up (35s); the 30s before it were the short limit's.
+  assert.equal(r.clock.value, 35_000 + 10_800_000 + 5_000);
+  assert.match(r.endedMessage, /still waiting for the platform to add a node after 10805\.0s \(phase=notready\)/);
+});
+
+test("the ceiling for a node being added counts from the scale-up, not from a queue before it", { timeout: 10_000 }, async () => {
+  // Nearly three hours in SaFE's queue (Pending), then admitted with a node being added
+  // (NotReady): the node purchase gets its own three hours, not the queue's last minutes.
+  const queue = 10_700_000 / 5000;
+  const r = await run([...repeat(queue, queued(2)), gated(GATED_SCALING)], REAL_CEILINGS);
+  assert.equal(r.ended, "sandbox_pending_timeout");
+  assert.equal(r.clock.value, 10_705_000 + 10_800_000 + 5_000);
+});
+
+test("a multi-node cluster (no start ceiling, no scale-up ceiling) still waits indefinitely while a node is added", { timeout: 10_000 }, async () => {
+  // As multi-node/safe-provider.ts waits: startTimeoutMs 0 (MULTI_NODE_START_TIMEOUT_SECONDS
+  // default), no scaleUpTimeoutMs. Five hours of TriggeredScaleUp, past every sandbox ceiling,
+  // then the nodes come and it runs; nothing ends it on the way.
+  const fiveHours = 5 * 60 * 60 * 1000 / 5000;
+  const r = await run([...repeat(fiveHours, gated(GATED_SCALING)), takenNotReady, running], {
+    startTimeoutMs: 0, pendingTimeoutMs: 10_800_000,
+  });
+  assert.equal(r.ended, null);
+  assert.ok(r.clock.value > 5 * 60 * 60 * 1000, String(r.clock.value));
+  assert.deepEqual(r.gaveUp, []);
+});
+
+test("when the autoscaler refuses a gated sandbox, its reason is passed on without its identifiers, and the short limit ends it", { timeout: 10_000 }, async () => {
+  const r = await run([...repeat(6, gated()), gated(GATED_REFUSED)], REAL_CEILINGS);
+  assert.equal(r.ended, "sandbox_unschedulable");
+  // The refusal is new text, so the stall is counted from its first read (35s).
+  assert.equal(r.clock.value, 35_000 + 305_000);
+  const told = "no node can take the sandbox right now, and no new node is being added"
+    + " (the autoscaler says: NoHeadroom: the pods need 1 new node(s))";
+  assert.equal(r.progress.at(-1)!.waiting?.reason, told);
+  const message = r.terminal[0]!.message!;
+  assert.ok(message.includes(`could not be scheduled: ${told}`), message);
+  assert.doesNotMatch(message, IDENTIFIERS);
+  assert.doesNotMatch(JSON.stringify(r.progress), IDENTIFIERS);
+  assert.doesNotMatch(message, /271406|9kgj5/);
+});
+
+test("a scale-up the autoscaler later withdraws on a gated sandbox is counted from the withdrawal", { timeout: 10_000 }, async () => {
+  // 20 minutes of a node being added (past the 15-minute start ceiling, which does not apply),
+  // then the autoscaler says it will not add one: the short limit counts from that read.
+  const twentyMin = 20 * 60 * 1000 / 5000;
+  const r = await run([...repeat(twentyMin, gated(GATED_SCALING)), gated(GATED_REFUSED)], REAL_CEILINGS);
+  assert.equal(r.ended, "sandbox_unschedulable");
+  assert.equal(r.clock.value, (twentyMin + 1) * 5_000 + 305_000);
 });
 
 test("a scale-up that was seen does not outlive the pod being taken", { timeout: 5000 }, async () => {
