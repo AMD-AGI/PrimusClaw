@@ -12,6 +12,7 @@
  * they are dropped and the channel's answer stands alone (`dropHeldSays`); when the turn ends, they are due at once
  * (`releaseHeldSays`); if neither comes, they go out at HOLD_SECONDS as any other.
  */
+import { CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import type { Querier } from "../infra/db.js";
 import type { TurnMessage } from "./inbound.js";
 import type { AssistantSayPayload } from "../notifications/assistant-events.js";
@@ -33,6 +34,7 @@ export function mayHandOff(message: TurnMessage | null | undefined): boolean {
  * the handoff carries them (`AssistantReviewHandoff.held_says`), so the channel's one answer still tells the person what they said.
  */
 export async function dropHeldSays(q: Querier, messageId: string): Promise<string[]> {
+  if (!CLAW_NOTIFICATIONS_ENABLED) return [];   // (no outbox table: nothing is ever held)
   const r = await q(
     `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'dropped: the turn handed a review to the channel; carried by the handoff'
       WHERE last_status = $1 AND delivered_at IS NULL AND dropped_at IS NULL
@@ -50,6 +52,7 @@ export async function dropHeldSays(q: Querier, messageId: string): Promise<strin
  * deliveries carry), for its session event, which was held with it (`outbound.ts`, `announce`).
  */
 export async function releaseHeldSays(q: Querier, messageId: string): Promise<Array<{ sayId: string; payload: AssistantSayPayload }>> {
+  if (!CLAW_NOTIFICATIONS_ENABLED) return [];   // (no outbox table: nothing is ever held)
   const r = await q(
     `UPDATE claw_notification_outbox SET next_attempt_at = NOW(), last_status = NULL
       WHERE last_status = $1 AND delivered_at IS NULL AND dropped_at IS NULL
@@ -68,6 +71,8 @@ export async function releaseHeldSays(q: Querier, messageId: string): Promise<Ar
  * beside that notice every time (2026-11-06), and refusing it lost what else it said.
  */
 export async function turnAnnouncedStart(q: Querier, userId: string, since: Date | string, messageId: string): Promise<string | null> {
+  // Without notifications there is no channel to show the notice in, and no outbox table to find it by: a say is a message of its own.
+  if (!CLAW_NOTIFICATIONS_ENABLED) return null;
   // Of this very turn (the message it answers, kept on the notice's delivery): another turn of the same user's, in another session or
   // overlapping this one, has notices of its own. Read from the user's recent messages first (their index), then their deliveries.
   const row = (await q(
