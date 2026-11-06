@@ -57,6 +57,7 @@ import {
 import { dagHoldsWorkload, handleIdentityKey, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle, workloadHeldByOtherDag } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
 import { bootstrapHandsInSandbox, HANDS_LOG_PATH, HANDS_STATE_DIR } from "./bootstrap.js";
+import { workloadSpecEnv } from "./workload-env.js";
 import { countLiveWork, type LiveWorkAnswer } from "./live-work-gate.js";
 import { retainContainer } from "./retain-container.js";
 import { restartHandsInSandbox } from "./hands-restart.js";
@@ -2833,7 +2834,13 @@ async function provisionHands(
       image: workloadImage,
       resources: action.params.resources,
       resourcesArray: workloadResourcesArr,
-      env,
+      // Credentials stay out of the workload: SaFE returns its env to every
+      // caller allowed to read the workload. The full environment reaches
+      // Hands through bootstrap's env file below (sandbox/workload-env.ts).
+      env: workloadSpecEnv(env, action.params.env ?? {}, [
+        ...Object.keys(sandboxUserEnv(request)),
+        ...Object.keys(request.session_env ?? {}),
+      ]),
       labels,
       timeoutSec,
       ttlSec: ttlSeconds,

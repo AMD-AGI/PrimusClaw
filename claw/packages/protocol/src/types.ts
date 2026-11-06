@@ -69,7 +69,14 @@ export interface SandboxSpecCreate {
    * fails the message with reason `sandbox_pending_timeout` if it never starts.
    */
   timeout?: number;
-  /** Extra env vars baked into the sandbox at create time. */
+  /**
+   * Extra env vars baked into the sandbox at create time. Stored in the SaFE
+   * workload, whose env SaFE returns to every caller allowed to read it: a
+   * name or value that looks like a credential is withheld from the workload
+   * and reaches the sandbox only at bootstrap (and an app only with its start
+   * command), so it is not there for an image entrypoint. Put no secret here
+   * under another name.
+   */
   env?: Record<string, string>;
   /** Extra labels merged into the SaFE workload (Sweeper consistency keys). */
   labels?: Record<string, string>;
