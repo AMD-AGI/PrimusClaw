@@ -576,7 +576,7 @@ async function handOffReview(
       merge,
       requester_note: note.slice(0, REQUESTER_NOTE_MAX_CHARS),
     };
-    await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge });
+    await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge, messageId: claims.mid });
     const payload: AssistantActionPayload = {
       type: "assistant.action", event_id: eventId, occurred_at: new Date().toISOString(), user_id: userId,
       message_id: claims.mid, channel_message_id: channelMessageId, action: { name: REVIEW_HANDOFF_ACTION, args: "" }, review,
@@ -587,10 +587,14 @@ async function handOffReview(
   if (!queued) return null;
   logger.info({ eventId: queued.eventId, prs: prs.length }, "assistant.review_handed_off");
   void reviewToolPorts.kick().catch((err) => logger.error({ err }, "assistant.review_handoff_kick_failed"));
+  // What the router may tell the person of it: nothing. The channel answers their message about this review itself, in one message, once
+  // it has started it or knows why not: which pull requests, on which model, and how the merge is made, which only the started review
+  // knows (`CreatedReview.merge_needs_confirmation`). A word from the router beside it would be a second answer, written before any of
+  // that is known, so this turn's `say` is refused from here on (`turnHandedOffReview`).
   return {
     ok: true, handed_off: true, event_id: queued.eventId, reviewer: reviewer.name || reviewer.userId,
     prs: prs.map((p) => `${p.owner}/${p.repo}#${p.number}`), merge,
-    note: `nothing has started yet: the user's channel starts this review as ${reviewer.name || "that person"}, on their own credentials, and tells the user itself whether it started (or why not). ${merge ? `Even then it merges nothing by itself: ${reviewer.name || "that person"} must confirm the merge. ` : ""}Say only that it was handed over; do not say it has started, will merge, or name items.`,
+    note: `nothing has started yet. The user's chat starts this review as ${reviewer.name || "that person"}, and answers the user's message about it itself, in one message: whether it started, which model it runs on, and how the merge is made. Do not tell the user anything about this review: end the turn without say (any say in this turn is refused now).`,
   };
 }
 

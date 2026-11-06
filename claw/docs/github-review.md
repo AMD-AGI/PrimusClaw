@@ -233,7 +233,11 @@ A review asked of someone else meets the assistant in three places:
   `assistant.action` with `action.name` `review_for_other` and `review: {reviewer: {user_id, name}, prs: [{owner, repo, number}],
   merge, requester_note}` (the person's own message), once per message, reviewer, pull requests and merge. The router is answered
   `handed_off` and told that nothing has started yet; the channel starts the review with `POST /v1/assistant/reviews`, the reviewer's
-  credentials and `handoff_id` (the `review.handoff_id` it was handed), and tells the person itself how it went. The route applies its
+  credentials and `handoff_id` (the `review.handoff_id` it was handed), and answers the person's message about it itself, in one
+  message: whether it started, on which model, and how its merge is made, read from what the route answered (each created item's
+  `review_only`, and `merge_needs_confirmation` when its merge waits for the reviewer's own confirmation whatever their review mode). The
+  router says nothing about it: from the handoff on, a `say` in that turn is refused (`handed_off`), and neither the turn's plain text
+  nor a notice that the turn failed is delivered for it (the handoff record keeps the turn's `message_id`). The route applies its
   own checks (the reviewer's delegation, the open reviews, the limits) and, beyond them, the record Claw kept of the handoff
   (`claw_assistant_review_handoffs`), not the channel's body: `merge` is the router's reading of a sentence, so the review merges only
   once the reviewer confirms that very merge (`merge_needs_confirmation`, the card's button or `批准 #<ref>` / `approve #<ref>`), and

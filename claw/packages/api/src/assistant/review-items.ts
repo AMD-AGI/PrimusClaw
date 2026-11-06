@@ -273,15 +273,17 @@ const prKey = (pr: PrRef): string => `${pr.owner}/${pr.repo}#${pr.number}`.toLow
  * record (`handoffGate`): the router's `merge=true` is its reading of a sentence, so such a review never merges without the reviewer's own
  * confirmation, and never merges at all when the router did not read a merge.
  */
-export async function recordReviewHandoff(q: Querier, h: { handoffId: string; userId: string; reviewerUserId: string; prs: PrRef[]; merge: boolean }): Promise<void> {
+export async function recordReviewHandoff(
+  q: Querier, h: { handoffId: string; userId: string; reviewerUserId: string; prs: PrRef[]; merge: boolean; messageId?: string },
+): Promise<void> {
   await q(
     `DELETE FROM claw_assistant_review_handoffs WHERE user_id = $1 AND created_at < NOW() - make_interval(days => $2::int)`,
     [h.userId, REVIEW_HANDOFF_RETENTION_DAYS],
   );
   await q(
-    `INSERT INTO claw_assistant_review_handoffs (handoff_id, user_id, reviewer_user_id, prs, merge)
-     VALUES ($1, $2, $3, $4::text[], $5) ON CONFLICT (handoff_id) DO NOTHING`,
-    [h.handoffId, h.userId, h.reviewerUserId, h.prs.map(prKey), h.merge],
+    `INSERT INTO claw_assistant_review_handoffs (handoff_id, user_id, reviewer_user_id, prs, merge, message_id)
+     VALUES ($1, $2, $3, $4::text[], $5, $6) ON CONFLICT (handoff_id) DO NOTHING`,
+    [h.handoffId, h.userId, h.reviewerUserId, h.prs.map(prKey), h.merge, h.messageId ?? null],
   );
 }
 
@@ -478,6 +480,15 @@ export interface CreatedReview {
    * effort, never on ones the requester chose (`startReviews`). Absent when nothing was set aside.
    */
   ignored?: Array<"model" | "effort">;
+  /** The review never merges: it was asked for a review only (or a handoff whose message asked for no merge). */
+  review_only: boolean;
+  /**
+   * Present when every merge (and every approval GitHub would turn into one) of this review waits for the acting user's own
+   * confirmation, the card's button or `批准 #<ref>`, whatever their review mode: a review the assistant started or handed over
+   * (`config.merge_needs_confirmation`). Absent: the acting user's review mode decides, as for any review of theirs. A channel that tells
+   * the person how the merge will be made reads it here, not from the review mode alone.
+   */
+  merge_needs_confirmation?: true;
   /**
    * With model choice on (`model-choice.ts`): the model the review runs on (null: the deployment's default), and the one it was to run
    * on when the payer's key could not use it. Absent with model choice off.
@@ -566,6 +577,7 @@ async function insertReview(q: StatementRunner, owner: UserInfo, plan: Planned):
   if (!queued.ok) throw new ReviewItemRefused(503, queued.error, "the review could not be started", {});
   return {
     item_id: item.itemId, seq: item.seq, title: name, session_id: plan.sessionId, pr: plan.pr, message_id: queued.pendingId === null ? null : queuedMessageId(queued.pendingId),
+    review_only: plan.params.review_only, ...(plan.params.merge_needs_confirmation === true ? { merge_needs_confirmation: true as const } : {}),
   };
 }
 

@@ -944,6 +944,7 @@ describe("assistant review items", { skip }, () => {
     const r = await call("alice", `/v1/assistant/reviews/${started.item_id}/restart`, { model: "claude-opus-5.5" });
     assert.equal(r.status, 200, JSON.stringify(r.body));
     const fresh = await w.item(r.body.data.item.item_id);
+    assert.deepEqual([r.body.data.item.review_only, r.body.data.item.merge_needs_confirmation], [false, true], "the restart is answered how it merges");
     assert.equal((await config(fresh.worker_session_id)).merge_needs_confirmation, true);
     assert.equal(fresh.params.merge_needs_confirmation, true);
     // The assistant's restart of a review the person started over the route makes it one as well.
@@ -966,7 +967,10 @@ describe("assistant review items", { skip }, () => {
     const made = async (r: Res) => {
       assert.equal(r.status, 200, JSON.stringify(r.body));
       const item = await w.item(r.body.data.items[0].item_id);
-      return { item, config: await config(item.worker_session_id) };
+      const cfg = await config(item.worker_session_id);
+      // The asker is answered how the merge is made, as the session holds it: what a channel tells the person comes from here.
+      assert.deepEqual([r.body.data.items[0].review_only, r.body.data.items[0].merge_needs_confirmation], [cfg.review_only, cfg.merge_needs_confirmation]);
+      return { item, config: cfg };
     };
 
     // The router read a merge: the channel asks for one (review_only false), and the review is made to wait for bob's confirmation.
@@ -1031,8 +1035,10 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual((await w.q("SELECT handoff_id FROM claw_assistant_review_handoffs WHERE handoff_id IN ('h-257', 'h-later') ORDER BY 1")).map((r) => r.handoff_id), ["h-later"]);
 
     // A review asked of someone else with no handoff behind it is what it was: the asking service's own, merging as it always did.
-    const direct = await made(await start("alice", { prs: [PR(262)], acting_as: "bob", review_only: false }));
+    const directly = await start("alice", { prs: [PR(262)], acting_as: "bob", review_only: false });
+    const direct = await made(directly);
     assert.deepEqual([direct.config.review_only, direct.config.merge_needs_confirmation], [false, undefined]);
+    assert.equal("merge_needs_confirmation" in directly.body.data.items[0], false, "the reviewer's own review mode decides: not said to wait");
   }));
 
   test("G1 a review session is no worker: no role profile, no worker report at its turn's end, not an orphan to the task sweep", async () => {

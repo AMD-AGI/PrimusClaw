@@ -520,6 +520,12 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- Assistant: a review the router hands to the user's chat (`handed_off`) is answered there in one message, by the chat that starts
+  it: the router says nothing about it. From the handoff on, a `say` in that turn is refused (`handed_off`), and neither the turn's
+  plain text nor a notice that it failed is delivered for it; the handoff record keeps the turn's `message_id` (new column on
+  `claw_assistant_review_handoffs`). `POST /v1/assistant/reviews` and the restart route answer each created item's `review_only`, and
+  `merge_needs_confirmation` when its merge waits for the acting user's own confirmation whatever their review mode, so a channel tells
+  the person how the merge is made from what was started, not from the review mode alone (`router-v11`).
 - Assistant: the router's `say` refuses a message that shows the user internal text (a tool name, the `[work_event]` marker,
   an `item_id`, a run id, or an id of the UUID form the user did not write in the message the turn answers) with
   `internal_text`, and the router is told to name an item by its number and title (`router-v7`); a turn that ends in plain text

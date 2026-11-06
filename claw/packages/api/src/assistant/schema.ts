@@ -272,6 +272,9 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_assistant_review_handoffs_pair ON claw_assistant_review_handoffs(user_id, reviewer_user_id, created_at)",
   );
+  // The router turn that handed it over (the person's message it answered): the channel answers that message about the review itself, in
+  // one message, so the turn says nothing more (`say`, `deliverUnsaidAnswer`). Null on a handoff written before this column.
+  await client.query("ALTER TABLE claw_assistant_review_handoffs ADD COLUMN IF NOT EXISTS message_id TEXT");
   await ensureObserveSchema(client);
 }
 
