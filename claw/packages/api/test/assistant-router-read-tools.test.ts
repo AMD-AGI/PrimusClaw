@@ -118,7 +118,7 @@ describe("assistant router read tools", { skip }, () => {
     // After it has read one of their results the turn no longer acts for the person: only these are let through by Brain.
     assert.deepEqual(task.read_taint, {
       sources: task.tools_allowlist.filter((p: string) => p !== "mcp__assistant__*"),
-      allow_after: ["say", "work_recall", "memory_recall"].map((t) => `mcp__assistant__${t}`),
+      allow_after: ["say", "work_recall", "memory_recall", "connector_list"].map((t) => `mcp__assistant__${t}`),
       // A plugin server words its own errors, so a failed read of one marks the turn like an answer; only the web is clean here.
       clean_failures: ["web_search", "web_fetch"],
     });
