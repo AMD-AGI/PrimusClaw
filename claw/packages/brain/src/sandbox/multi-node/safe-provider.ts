@@ -130,7 +130,56 @@ interface SessionWorkloadPage {
  * `primus-claw/session-id` label selector used to have. SaFE matches the env
  * value exactly (jsonb `->> key = value`), so no other session can be returned.
  */
-async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<SessionWorkloadPage> {
+/**
+ * The workspaces to list a session's workloads in, as given: trimmed, deduplicated, empty names dropped.
+ *
+ * SaFE lists workloads across workspaces only for an admin key. Any other key -- every ordinary user, and
+ * the service identities Claw runs for (sa-eval-bot, sa-release-gate, dispatron-service) -- is answered 403
+ * unless the request names a workspace the key may read, so an unscoped list made every non-admin session's
+ * teardown `lookup_failed` and parked it for good. The workspaces come from what the session recorded
+ * (its `hands.<sid>` binding's namespace); none recorded keeps the unscoped list, which an admin key reads.
+ */
+export function sessionWorkspaces(workspaces: readonly (string | null | undefined)[] | undefined): string[] {
+  const out: string[] = [];
+  for (const w of workspaces ?? []) {
+    const name = typeof w === "string" ? w.trim() : "";
+    if (name && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * Every workload a session owns in the given workspaces, one walk per workspace (unscoped when none is
+ * given). A walk that fails fails the whole lookup: a teardown that read one workspace and not the other
+ * must not call the session clean.
+ */
+async function findSessionWorkloads(
+  sessionId: string,
+  apiKey: string,
+  workspaces?: readonly (string | null | undefined)[],
+): Promise<SessionWorkloadPage> {
+  const scopes: Array<string | undefined> = sessionWorkspaces(workspaces);
+  if (scopes.length === 0) scopes.push(undefined);
+  const items: WorkloadRef[] = [];
+  let incomplete = false;
+  let reason: SessionWorkloadPage["reason"];
+  for (const workspaceId of scopes) {
+    const page = await findSessionWorkloadsIn(sessionId, apiKey, workspaceId);
+    for (const ref of page.items) if (!items.some((r) => r.id === ref.id)) items.push(ref);
+    if (page.incomplete) {
+      incomplete = true;
+      // "Could not be read" says more than "read, but short", so it wins the label.
+      if (reason !== "lookup_failed") reason = page.reason;
+    }
+  }
+  return incomplete ? { items, incomplete, reason } : { items, incomplete: false };
+}
+
+async function findSessionWorkloadsIn(
+  sessionId: string,
+  apiKey: string,
+  workspaceId: string | undefined,
+): Promise<SessionWorkloadPage> {
   const items: WorkloadRef[] = [];
   let reported = 0;
   for (let page = 0; page < SESSION_MAX_PAGES; page++) {
@@ -146,9 +195,10 @@ async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<
       limit: String(SESSION_PAGE_SIZE),
       offset: String(page * SESSION_PAGE_SIZE),
     });
+    if (workspaceId) query.set("workspaceId", workspaceId);
     const resp = await safeFetch(`/api/v1/workloads?${query}`, { apiKey });
     if (resp.status !== 200) {
-      throw new Error(`workloads list failed: HTTP ${resp.status} ${JSON.stringify(resp.body).slice(0, 300)}`);
+      throw new Error(`workloads list failed${workspaceId ? ` in ${workspaceId}` : ""}: HTTP ${resp.status} ${JSON.stringify(resp.body).slice(0, 300)}`);
     }
     // A 200 whose body is not a workload list hands us nothing to act on and
     // proves nothing about the session. Reported as incomplete rather than
@@ -158,7 +208,7 @@ async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<
     const parsed = parseWorkloadListPage(resp.body);
     if (!parsed) {
       logger.warn(
-        { sessionId, page, body: JSON.stringify(resp.body).slice(0, 300) },
+        { sessionId, workspaceId, page, body: JSON.stringify(resp.body).slice(0, 300) },
         "mn.safe_list_unrecognised",
       );
       return { items, incomplete: true, reason: "lookup_failed" };
@@ -174,7 +224,7 @@ async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<
       const short = items.length < reported;
       if (short) {
         logger.warn(
-          { sessionId, addressable: items.length, reported },
+          { sessionId, workspaceId, addressable: items.length, reported },
           "mn.safe_list_incomplete",
         );
       }
@@ -182,7 +232,7 @@ async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<
     }
   }
   logger.warn(
-    { sessionId, pages: SESSION_MAX_PAGES, collected: items.length, reported },
+    { sessionId, workspaceId, pages: SESSION_MAX_PAGES, collected: items.length, reported },
     "mn.safe_list_page_cap",
   );
   return { items, incomplete: true, reason: "list_truncated" };
@@ -201,12 +251,14 @@ async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<
  * @param sessionId Session whose clusters should be reclaimed.
  * @param apiKey SaFE key of the session's owner.
  * @param messageId When set, delete only this cluster workload id.
+ * @param workspaces Where the session's workloads were recorded (see `sessionWorkspaces`).
  * @returns How many clusters were deleted.
  */
 export async function reclaimIdleSessionClusters(
   sessionId: string,
   apiKey: string,
   messageId?: string,
+  workspaces?: readonly (string | null | undefined)[],
 ): Promise<number> {
   const scoped = (messageId ?? "").trim();
   if (scoped) {
@@ -220,7 +272,7 @@ export async function reclaimIdleSessionClusters(
     // Unverified means not deleted. A cluster left behind costs GPUs until the
     // workload's own timeout; deleting something this session does not own
     // costs work nobody asked to end.
-    const { items, incomplete } = await findSessionWorkloads(sessionId, apiKey);
+    const { items, incomplete } = await findSessionWorkloads(sessionId, apiKey, workspaces);
     const named = items.find((ref) => ref.id === scoped);
     if (!named || !CLUSTER_KINDS.has(named.kind)) {
       logger.warn(
@@ -245,7 +297,7 @@ export async function reclaimIdleSessionClusters(
   // A shortfall is not worth reporting here. It cannot hide a running cluster
   // from this sweep -- the walk above pages through everything non-terminal, so
   // what is missing is an entry with no id, which no caller could delete anyway.
-  const { items } = await findSessionWorkloads(sessionId, apiKey);
+  const { items } = await findSessionWorkloads(sessionId, apiKey, workspaces);
   let deleted = 0;
   for (const ref of items) {
     if (!CLUSTER_KINDS.has(ref.kind)) continue;
@@ -458,7 +510,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     }
     let page: SessionWorkloadPage;
     try {
-      page = await findSessionWorkloads(sessionId, key);
+      page = await findSessionWorkloads(sessionId, key, opts?.workspaces);
     } catch (e) {
       // Nothing was enumerated, so there is nothing to act on.
       logger.warn({ err: String(e), sessionId }, "mn.safe_lookup_failed");

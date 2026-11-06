@@ -390,3 +390,96 @@ test("no platform key is incomplete, not nothing to do", async (t) => {
   assert.equal(result.reason, "no_platform_key");
   assert.equal(calls.length, 0, "without a key it cannot even list");
 });
+
+/**
+ * A non-admin key, the way SaFE answers one: the workload list without a workspace is 403, and a list in a
+ * workspace the key may read is served. Every ordinary user and every service identity Claw runs for is one;
+ * measured on global 2026-11-06 (unscoped 403, `workspaceId=global-cpu` 200), and teardown parked their
+ * sessions as `lookup_failed` until the list named the workspace.
+ */
+function stubNonAdminSafeApi(t: TestContext, byWorkspace: Record<string, unknown[]>): StubbedCall[] {
+  const calls: StubbedCall[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+    calls.push({ url, method });
+    if (method === "DELETE") return new Response(null, { status: 204 });
+    const params = new URL(url, "http://safe.test").searchParams;
+    const ws = params.get("workspaceId");
+    if (!ws || !(ws in byWorkspace)) {
+      return new Response(JSON.stringify({ errorCode: "Primus.00004", errorMessage: "forbidden" }), { status: 403 });
+    }
+    const all = byWorkspace[ws];
+    const offset = Number(params.get("offset") ?? "0");
+    return new Response(JSON.stringify(workloadList(all.slice(offset, offset + PAGE_SIZE), all.length)), { status: 200 });
+  }) as typeof globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  return calls;
+}
+
+test("a non-admin key tears down a session by naming its workspace", async (t) => {
+  const calls = stubNonAdminSafeApi(t, {
+    "global-cpu": [workload("sandbox-1", "running", "Sandbox"), workload("ray-1", "running", "RayJob")],
+  });
+
+  const result = await new SafeMultiNodeProvider().destroyForSession(SESSION, { platformKey: KEY, workspaces: ["global-cpu"] });
+
+  assert.deepEqual(
+    { complete: result.complete, found: result.found, deleted: result.deleted, reason: result.reason },
+    { complete: true, found: 2, deleted: 2, reason: undefined },
+  );
+  const lists = calls.filter((c) => c.method === "GET");
+  assert.ok(lists.length > 0);
+  for (const c of lists) {
+    assert.equal(new URL(c.url, "http://safe.test").searchParams.get("workspaceId"), "global-cpu", "every list names the workspace");
+  }
+});
+
+test("a session recorded in two workspaces is listed in each, and nothing is listed twice", async (t) => {
+  const calls = stubNonAdminSafeApi(t, {
+    "global-cpu": [workload("sandbox-1", "running", "Sandbox")],
+    "gpu-ws": [workload("ray-1", "running", "RayJob"), workload("sandbox-1", "running", "Sandbox")],
+  });
+
+  const result = await new SafeMultiNodeProvider().destroyForSession(SESSION, {
+    platformKey: KEY, workspaces: [" global-cpu ", "gpu-ws", "global-cpu", ""],
+  });
+
+  assert.deepEqual({ complete: result.complete, found: result.found, deleted: result.deleted }, { complete: true, found: 2, deleted: 2 });
+  const listed = calls.filter((c) => c.method === "GET").map((c) => new URL(c.url, "http://safe.test").searchParams.get("workspaceId"));
+  assert.deepEqual(listed, ["global-cpu", "gpu-ws"]);
+});
+
+test("a workspace the key cannot read makes the teardown incomplete, not clean", async (t) => {
+  stubNonAdminSafeApi(t, { "global-cpu": [workload("ray-1", "running", "RayJob")] });
+
+  const result = await new SafeMultiNodeProvider().destroyForSession(SESSION, {
+    platformKey: KEY, workspaces: ["global-cpu", "not-mine"],
+  });
+
+  assert.equal(result.complete, false);
+  assert.equal(result.reason, "lookup_failed");
+});
+
+test("with no workspace recorded the list stays unscoped, which a non-admin key cannot read", async (t) => {
+  stubNonAdminSafeApi(t, { "global-cpu": [workload("ray-1", "running", "RayJob")] });
+
+  const result = await new SafeMultiNodeProvider().destroyForSession(SESSION, { platformKey: KEY });
+
+  assert.equal(result.complete, false);
+  assert.equal(result.reason, "lookup_failed");
+});
+
+test("idle reclaim with a non-admin key finds the session's clusters in its workspace", async (t) => {
+  const calls = stubNonAdminSafeApi(t, {
+    "global-cpu": [workload("sandbox-1", "running", "Sandbox"), workload("ray-1", "running", "RayJob")],
+  });
+
+  assert.equal(await reclaimIdleSessionClusters(SESSION, KEY, undefined, ["global-cpu"]), 1);
+  assert.equal(await reclaimIdleSessionClusters(SESSION, KEY, "ray-1", ["global-cpu"]), 1);
+  const deleted = calls.filter((c) => c.method === "DELETE").map((c) => c.url.split("/").pop());
+  assert.deepEqual(deleted, ["ray-1", "ray-1"], "the sandbox is spared; only the cluster is reclaimed");
+});
