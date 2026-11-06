@@ -172,3 +172,13 @@ export function filterToolSchemas<T extends { name: string }>(
 export function toolNotAllowedMessage(toolName: string): string {
   return `Error: the tool '${toolName}' is not available in this session. It is outside the tools this session is allowed to use, so it was not run. Use only the tools you were given.`;
 }
+
+/**
+ * The tools `ExecuteRequest.read_taint` names as its sources: read-only lookups, so a step's consecutive calls of them may run side by
+ * side, as the sandbox reads do (`LoopOptions.parallelTools`). Null when the request names none.
+ */
+export function readTaintSources(raw: unknown): ToolAllowlist | null {
+  const sources = raw && typeof raw === "object" ? (raw as { sources?: unknown }).sources : undefined;
+  const parsed = Array.isArray(sources) && sources.length ? parseToolAllowlist(sources) : null;
+  return parsed && parsed.patterns.length ? parsed : null;
+}

@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
-import { filterToolSchemas, forgetEarlierReads, parseReadTaint, parseToolAllowlist } from "../tools/allowlist.js";
+import { filterToolSchemas, forgetEarlierReads, parseReadTaint, parseToolAllowlist, readTaintSources } from "../tools/allowlist.js";
 import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
@@ -57,6 +57,13 @@ const logger = pino({ name: "agent-engine" });
  * LLM_API_STYLE for provider selection). No Claude/Agent SDK dependency.
  * All state is local (multi-user safe).
  */
+/** `ExecuteRequest.stream_tool_text` as the loop takes it: the tool names it lists, or undefined for none or anything else. */
+export function streamToolText(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const names = raw.filter((n): n is string => typeof n === "string" && n.trim() !== "" && n.length <= 200).map((n) => n.trim());
+  return names.length ? names.slice(0, 8) : undefined;
+}
+
 /**
  * Headers for the web-tool Anthropic client.
  *
@@ -594,6 +601,8 @@ export class AgentEngine {
           // A value Brain does not know is no effort at all: the gateway's defaults, never a refused turn.
           ...(isReasoningEffort(request.effort) ? { effort: request.effort } : {}),
           ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
+          ...(streamToolText(request.stream_tool_text) ? { streamToolText: streamToolText(request.stream_tool_text)! } : {}),
+          parallelTools: readTaintSources(request.read_taint),
           ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),
           ...(request.withhold_sandbox_keys ? { actingReview: true } : {}),
           // A requested review's sub-agents take their turns from its budget, and are charged with it (`TurnPool`).

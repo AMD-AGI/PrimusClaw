@@ -39,6 +39,7 @@ import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
 import { startWorkerRun } from "./run-started.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
+import { applyRouterTurnSpeed } from "./router-speed.js";
 
 const logger = pino({ name: "assistant-role" });
 
@@ -278,6 +279,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       const rerun = await rerunModelOf(sessionId, messageId);
       if (rerun) task.model = rerun;
     }
+    // Little thinking, and the say streamed while it is written (`router-speed.ts`).
+    applyRouterTurnSpeed(task);
     await addReplyLanguage(task, sessionId);
     // Even with no words (a turn the system starts): the list is what the prompt says to answer from.
     task.prompt = withTurnState(stringField(task, "prompt"), state);

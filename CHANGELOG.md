@@ -28,6 +28,14 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Quicker assistant router turns. A router turn can ask for low reasoning effort (`CLAW_ASSISTANT_ROUTER_EFFORT`: low | medium |
+  high | `default`, the default, for the model's own; set `low` where the router runs on a reasoning model such as Claude; a session
+  that chose an effort keeps it), and its `say` is published while the model writes it (`CLAW_ASSISTANT_STREAM_SAY`, default on): the
+  new `ExecuteRequest.stream_tool_text` names tools whose `text` argument Brain streams (Anthropic `eager_input_streaming`, Claude
+  models only) and publishes as `toolTextDelta` events (`tool`, `actionId`, the text so far, at most every 400 ms per call, top-level
+  loop only). The call itself still runs when the step is whole; the deltas are a preview for
+  whoever follows the session live and are not stored. The router's read-only lookups (`read_taint.sources`) now run side by side
+  within a step, as Brain's sandbox reads do.
 - Model choice for the assistant's items, behind `CLAW_ASSISTANT_MODEL_CHOICE` (`on` | off, default off; needs `CLAW_ASSISTANT_ENABLED`
   and a non-empty `CLAW_ASSISTANT_MODELS`, the allow-list as `name=label,...`). One function decides an item's model: the model the
   message asked for, else the payer's own review default (reviews), else their own default, else the deployment's default for the kind

@@ -449,6 +449,13 @@ export interface ExecuteRequest {
    */
   effort?: ReasoningEffort;
   /**
+   * Tools (by full name) whose `text` argument is published while the model writes it: a `toolTextDelta` event (`tool`,
+   * `actionId`, `text` so far) at most every few hundred milliseconds per call, top-level loop only. An assistant router's `say`,
+   * so a channel can show the words before the turn's step ends. The call runs as before; a delta is a preview, not the message.
+   * Absent: none.
+   */
+  stream_tool_text?: string[];
+  /**
    * "5m": the rolling prompt-cache markers of this run's turns (sub-agents included) are written for five minutes, the anchor keeps
    * Brain's `LLM_CACHE_TTL`. For a run nobody waits on between turns; absent, every marker is written at `LLM_CACHE_TTL`. The API sets it
    * for a session that reviews a pull request on someone's behalf.

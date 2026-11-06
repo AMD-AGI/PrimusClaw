@@ -45,7 +45,7 @@ import { isTrackedRun, whileRecovering, whileWaiting, type WaitMode } from "../t
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import { getProvider } from "../llm/index.js";
-import type { LlmSession } from "../llm/provider.js";
+import type { LlmSession, StreamTurnOptions } from "../llm/provider.js";
 import { looksLikeToolArgumentsRejection, sanitizeToolUseInputs } from "../llm/tool-input.js";
 
 const logger = pino({ name: "agent-loop" });
@@ -64,6 +64,12 @@ const WAITING_TOOLS = new Set(["wait"]);
  */
 const PARALLEL_READ_TOOLS = new Set(["read", "grep", "glob", "ls"]);
 const PARALLEL_READ_LIMIT = 8;
+
+/**
+ * How often a streaming tool call's text is published while it is written (`LoopOptions.streamToolText`). A reader shows it in a
+ * chat, which takes about one update a second, so more would only be stored and dropped.
+ */
+export const TOOL_TEXT_DELTA_INTERVAL_MS = 400;
 
 /**
  * The classes a `wait` can still block in.
@@ -317,6 +323,17 @@ export interface LoopOptions {
   effort?: ReasoningEffort;
   /** `ExecuteRequest.rolling_cache_ttl`, for this loop and its sub-agents. */
   rollingCacheTtl?: "5m";
+  /**
+   * `ExecuteRequest.stream_tool_text`: tools whose `text` argument is published while the model writes it, as `toolTextDelta`
+   * events of the top-level loop (`{tool, actionId, text}`, the text so far), at most every TOOL_TEXT_DELTA_INTERVAL_MS per call.
+   * The call itself runs as every call does, when the turn is whole; the events only let a reader show its words sooner.
+   */
+  streamToolText?: readonly string[];
+  /**
+   * Tools besides the sandbox reads (PARALLEL_READ_TOOLS) whose consecutive calls in one step run side by side: the read-only lookups
+   * a request names (`read_taint.sources`, `readTaintSources`), each a separate request to its own server. Top-level loop only.
+   */
+  parallelTools?: Pick<ToolAllowlist, "allows"> | null;
   /** `ExecuteRequest.sub_agent_max_turns`: the most turns a sub-agent of this loop may take. */
   subAgentMaxTurns?: number;
   /**
@@ -1770,9 +1787,11 @@ class AgentLoopRunner {
     // tool_result — the API rejects an assistant tool_use with no matching
     // result — they just get one that says so instead of running.
     for (let i = 0; i < otherCalls.length;) {
-      // Consecutive reads go together (see PARALLEL_READ_TOOLS); anything a
-      // person may be asked to approve keeps its own turn at the card.
-      const together = (tc: any) => PARALLEL_READ_TOOLS.has(tc.name)
+      // Consecutive reads go together (see PARALLEL_READ_TOOLS), and so do the
+      // read-only tools the request names as such (`read_taint.sources`: an
+      // assistant router's lookups, each a separate request to its server);
+      // anything a person may be asked to approve keeps its own turn at the card.
+      const together = (tc: any) => (PARALLEL_READ_TOOLS.has(tc.name) || this.opts.parallelTools?.allows(tc.name) === true)
         && !this.opts.hitl?.willAsk(tc.name as string, (tc.input || {}) as Record<string, unknown>);
       let end = i + 1;
       if (together(otherCalls[i])) {
@@ -1974,6 +1993,29 @@ class AgentLoopRunner {
     return false;
   }
 
+  /**
+   * The `toolText` option of this loop's turns (`LoopOptions.streamToolText`), or none: a sub-agent's text is not the run's to show.
+   * Each call's text is published when it has grown and TOOL_TEXT_DELTA_INTERVAL_MS have passed since that call's last event; a
+   * publish that fails is logged and nothing else, since the call's whole input still arrives with the turn.
+   */
+  private toolTextOptions(): StreamTurnOptions | undefined {
+    const names = this.opts.streamToolText;
+    if (this.depth !== 0 || !names?.length) return undefined;
+    const lastAt = new Map<string, number>();
+    return {
+      toolText: {
+        tools: new Set(names),
+        onText: ({ id, name, text }) => {
+          const now = Date.now();
+          if (now - (lastAt.get(id) ?? -Infinity) < TOOL_TEXT_DELTA_INTERVAL_MS) return;
+          lastAt.set(id, now);
+          Promise.resolve(this.onEvent({ type: "toolTextDelta", tool: name, actionId: id, text })).catch((err: unknown) =>
+            logger.warn({ err: (err as Error)?.message, sessionId: this.sessionId, tool: name }, "agent-loop.tool_text_delta_failed"));
+        },
+      },
+    };
+  }
+
   /** One LLM streamTurn call with retry-with-backoff on transient errors. */
   private async streamTurnWithRetry(
     turn: number,
@@ -1998,7 +2040,7 @@ class AgentLoopRunner {
         // / sub-agent merges may add new ones between attempts. This
         // does NOT mutate workingMessages — KV stays a full audit trail.
         const llmMessages = filterResumeNotices(this.workingMessages);
-        return await this.session.streamTurn(llmMessages, this.effectiveTools, this.signal);
+        return await this.session.streamTurn(llmMessages, this.effectiveTools, this.signal, this.toolTextOptions());
       } catch (err: any) {
         let code = err?.code as string | undefined;
         const errMsg = err?.message || String(err);

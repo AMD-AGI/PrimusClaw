@@ -49,6 +49,9 @@ import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
 import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
 
+/** Brain's event for a streaming tool call's text so far (`ExecuteRequest.stream_tool_text`); never stored. */
+export const TOOL_TEXT_DELTA_EVENT = "toolTextDelta";
+
 export { recordCompletionTurns } from "./completion-turns.js";
 // Re-exported: this predicate lived here until it gained a second caller, and
 // moving it to the event store it queries would otherwise break its importers.
@@ -362,6 +365,14 @@ export async function consumeEventDelivery(msg: {
       return;
     }
     logger.info({ sessionId, type: event.type, seq: (msg as any).seq }, "event-consumer.msg_received");
+
+    // A streaming tool call's text so far (`toolTextDelta`: an assistant router's `say` while the model writes it). It is a preview
+    // for whoever follows the session live, who has it from the stream already; the call's whole input is stored with the call. So
+    // nothing is kept of it: it would be rows nobody reads back, several for every message the assistant says.
+    if (event.type === TOOL_TEXT_DELTA_EVENT) {
+      msg.ack();
+      return;
+    }
 
     // Dropped rather than persisted: everything below writes conversation
     // content, and the session it belongs to is gone. Acked because there is
