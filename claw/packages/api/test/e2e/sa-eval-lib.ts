@@ -423,11 +423,11 @@ export const CAPABILITY_DENIAL = new RegExp([
 
 /**
  * The systems a denial can name, and which failed call reaches each: an MCP server's tool, Brain's web tools, or a shell command that
- * itself went to GitHub (`gh`, `git`, a github.com address; a failed `python x.py` is not a failed GitHub call).
+ * failed at GitHub (`shellFailedAtGithub`; a failed `python x.py` is not a failed GitHub call).
  */
 const DENIED_SYSTEMS: ReadonlyArray<[RegExp, (c: ToolCall) => boolean]> = [
   [/github|\bgh\b|pull request|\bPRs?\b|仓库|代码库/i, (c) => /^mcp__github__/.test(c.name)
-    || (/^bash$/i.test(c.name) && shellReachesGithub(String(c.input?.command ?? "")))],
+    || (/^bash$/i.test(c.name) && shellFailedAtGithub(String(c.input?.command ?? ""), c.result))],
   [/联网|上网|互联网|网页|网站|internet|\bweb\b|browse|online/i, (c) => /^(web_search|web_fetch)$/.test(c.name)],
   [/safe|workloads?|workspaces?|集群|cluster|节点|\bnodes?\b/i, (c) => /^mcp__safe__/.test(c.name)],
   [/dispatron|计划|\bplans?\b/i, (c) => /^mcp__dispatron__/.test(c.name)],
@@ -436,25 +436,23 @@ const DENIED_SYSTEMS: ReadonlyArray<[RegExp, (c: ToolCall) => boolean]> = [
   [/看板|\bboard\b|\bissues?\b/i, (c) => /^mcp__agent-board__/.test(c.name)],
 ];
 
+/** Programs that can talk to GitHub from a shell. */
+const GITHUB_CLIENTS = new Set(["gh", "git", "curl", "wget"]);
+
 /**
- * Whether a shell command itself went to GitHub: one of its commands (split at `;`, `&&`, `||`, `|` and new lines) runs `gh`, a
- * `git` subcommand that talks to a remote (clone, fetch, pull, push, ls-remote, submodule), or fetches a github.com address with
- * curl or wget. A local `git status` and text that only mentions them (`echo git status`) do not count.
+ * Whether a failed shell call failed at GitHub: one of its commands (split at `;`, `&&`, `||`, `|` and new lines) runs a program
+ * that can talk to GitHub (gh, git, curl, wget), and what the call answered says GitHub (github.com, api.github, "GitHub", or
+ * gh's own `gh:` prefix). The answer is the evidence the remote was reached: a local `git status` that failed, a push a failed
+ * step before it kept from running (`git status && git push`), or text that only mentions git (`echo git status`) say nothing
+ * about GitHub.
  */
-export function shellReachesGithub(command: string): boolean {
-  return command.split(/;|&&|\|\||\||\n/).some((part) => {
+export function shellFailedAtGithub(command: string, answer: string): boolean {
+  const runs = command.split(/;|&&|\|\||\||\n/).some((part) => {
     const words = part.trim().split(/\s+/).filter(Boolean);
     while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!) || ["sudo", "env", "time", "command", "exec", "("].includes(words[0]!))) words.shift();
-    const program = (words[0] ?? "").replace(/^\(+/, "").split("/").pop() ?? "";
-    if (program === "gh") return true;
-    if (program === "git") {
-      // The subcommand, past git's own options (`-C dir`, `-c k=v`, `--no-pager`).
-      const rest = words.slice(1);
-      while (rest.length && rest[0]!.startsWith("-")) rest.splice(0, ["-C", "-c"].includes(rest[0]!) ? 2 : 1);
-      return ["clone", "fetch", "pull", "push", "ls-remote", "submodule"].includes(rest[0] ?? "");
-    }
-    return (program === "curl" || program === "wget") && words.some((w) => /(^|[/"'@])(api\.)?github\.com([/:"']|$)/i.test(w));
+    return GITHUB_CLIENTS.has((words[0] ?? "").replace(/^\(+/, "").split("/").pop() ?? "");
   });
+  return runs && /github\.com|api\.github|\bgithub\b|(^|\s)gh:/i.test(answer);
 }
 
 /**

@@ -409,18 +409,27 @@ test("S16 no false denial of a capability", () => {
   for (const text of ["node-7 无法访问，已经离线 2 小时。", "没有找到失败的运行。", "我查到 3 个开着的 PR。", "I don't see any failed runs today.", "The node cannot reach the registry."]) {
     assert.ok(!denied(text), text);
   }
-  // A failed shell command excuses a GitHub denial only when it went to GitHub itself.
-  const bash = (command: string): ToolCall => ({ ...call("bash", false), input: { command } });
-  assert.ok(denied("I can't access GitHub.", [bash("python missing.py")]));
-  assert.ok(!denied("I can't access GitHub.", [bash("gh pr list --author @me")]));
-  assert.ok(!denied("我无法访问 GitHub。", [bash("cd repo && git fetch origin")]));
-  assert.ok(!denied("I can't access GitHub.", [bash("GH_TOKEN=x /usr/bin/gh api user")]));
-  assert.ok(!denied("I can't access GitHub.", [bash("curl -sf https://api.github.com/repos/o/r")]));
-  assert.ok(!denied("I can't access GitHub.", [bash("git -C repo push origin HEAD")]));
-  for (const cmd of ["echo git status; false", "printf 'gh pr list'", "grep -r github.com docs", "cat .gitignore", "git status", "git -C repo log -1",
-    "cd /tmp && git diff"]) {
-    assert.ok(denied("I can't access GitHub.", [bash(cmd)]), cmd);
-  }
+  // A failed shell command excuses a GitHub denial only when it failed at GitHub: a GitHub client ran, and its answer says GitHub.
+  const bash = (command: string, answer = ""): ToolCall => ({ ...call("bash", false), input: { command }, result: answer });
+  const excused: Array<[string, string]> = [
+    ["gh pr list --author @me", "HTTP 401: Bad credentials (https://api.github.com/graphql)"],
+    ["GH_TOKEN=x /usr/bin/gh api user", "gh: Bad credentials (HTTP 401)"],
+    ["cd repo && git fetch origin", "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com"],
+    ["git remote show origin", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 403"],
+    ["git --git-dir /repo/.git fetch", "remote: Repository not found.\nfatal: repository 'https://github.com/o/r/' not found"],
+    ["curl -s https://api.github.com/repos/o/r", '{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest"}'],
+  ];
+  for (const [cmd, answer] of excused) assert.ok(!denied("I can't access GitHub.", [bash(cmd, answer)]), cmd);
+  const notGithub: Array<[string, string]> = [
+    ["python missing.py", "python: can't open file 'missing.py'"],
+    ["echo git status; false", "git status"],
+    ["git status", "fatal: not a git repository (or any of the parent directories): .git"],
+    ["cd /tmp && git status && git push origin HEAD", "fatal: not a git repository (or any of the parent directories): .git"],
+    ["echo see github.com; false", "see github.com"],
+    ["cat .gitignore", "No such file or directory"],
+  ];
+  for (const [cmd, answer] of notGithub) assert.ok(denied("I can't access GitHub.", [bash(cmd, answer)]), cmd);
+  assert.ok(!denied("我无法访问 GitHub。", [bash("cd repo && git push", "fatal: Authentication failed for 'https://github.com/o/r.git/'")]));
   // Every denial is checked, and a sentence that names two systems needs a failed call to each.
   assert.ok(denied("I cannot access Dispatron. I cannot access SaFE.", [call("mcp__dispatron__get_runs", false)]));
   assert.ok(!denied("I cannot access Dispatron. I cannot access SaFE.", [call("mcp__dispatron__get_runs", false), call("mcp__safe__node_list", false)]));
