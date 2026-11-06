@@ -65,6 +65,8 @@ describe("MCP tool classes", () => {
       assert.ok(tools.length > 0, `${server} lists tools`);
       assert.deepEqual([...toolsOfClass(server, "read"), ...toolsOfClass(server, "write")].sort(), [...tools].sort(), `${server}: read + write is every tool`);
     }
+    // Only a server whose tools are this repository's code may leave its unlisted tools to the spec (TC6 lists them from the code).
+    assert.deepEqual(Object.entries(TOOL_CATALOG).filter(([, c]) => c.unlisted !== undefined).map(([s, c]) => `${s}:${c.unlisted}`), ["schedules:spec"]);
     // The ones a person decided, where the server's annotations say nothing.
     assert.equal(classOf("safe", "workload_resume"), "write");
     assert.equal(classOf("safe", "workload_logs_download"), "write", "it starts a log-dump job and answers a presigned URL");

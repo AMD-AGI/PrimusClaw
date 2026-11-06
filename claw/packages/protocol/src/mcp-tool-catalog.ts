@@ -34,6 +34,12 @@ export interface ServerCatalog {
   notForRouter?: Readonly<Record<string, string>>;
   /** Writes an approval policy may release (`auto_approve`) without a decision, each with why. */
   releasable?: Readonly<Record<string, string>>;
+  /**
+   * What Brain does with a tool of this server the catalog does not list: `hold` it (the default: a server can add a tool any
+   * day, and until it is classified it is not known to read), or leave it to the spec (`spec`), only for a server whose tools are
+   * this repository's own code, so a tool it adds fails the tests until it is listed here.
+   */
+  unlisted?: "hold" | "spec";
 }
 
 export type ToolCatalog = Readonly<Record<string, ServerCatalog>>;
@@ -154,6 +160,9 @@ export const TOOL_CATALOG: ToolCatalog = {
     listedAt: "2026-11-06",
     tools: { trigger_cancel: U, trigger_create: U, trigger_list: U },
     reviewed: { trigger_cancel: "write", trigger_create: "write", trigger_list: "read" },
+    // Its tools are the API's code (`triggers/mcp.ts`), listed from the server itself by the API's tests, which fail on one this
+    // catalog does not list: an unlisted tool cannot reach a deployment unclassified.
+    unlisted: "spec",
     notForRouter: { trigger_list: "the API adds this server to worker turns only" },
   },
 };
@@ -176,6 +185,9 @@ export function catalogClassOf(server: string, tool: string, catalog: ToolCatalo
 
 /** Whether the catalog knows this server (by its name in `mcpServers`). */
 export const isCataloguedServer = (server: string, catalog: ToolCatalog = TOOL_CATALOG): boolean => own(catalog, server) !== undefined;
+
+/** Whether Brain holds a tool of this server that the catalog does not list (`unlisted`, default hold). */
+export const holdsUnlisted = (server: string, catalog: ToolCatalog = TOOL_CATALOG): boolean => own(catalog, server)?.unlisted !== "spec";
 
 /** Whether a catalogued write of this server may be released without a decision (`releasable`). */
 export const isReleasableWrite = (server: string, tool: string, catalog: ToolCatalog = TOOL_CATALOG): boolean =>
