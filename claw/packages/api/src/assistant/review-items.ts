@@ -35,14 +35,23 @@ import { getOrCreateAssistant } from "./assistant.js";
 import { drainSessionIfIdle, queueServerMessage, type QueuedServerMessage } from "./messages.js";
 import { queueRouterWake } from "./reports.js";
 import { freezeRequesterView } from "./requester-view.js";
-import { clipOneLine, getWorkItem, insertWorkItem, itemView, RUNNING, WAITING, type Outcome, type WorkItemView } from "./work-items.js";
+import { clipOneLine, getWorkItem, insertWorkItem, itemView, MAX_QUEUED_ITEMS, RUNNING, WAITING, type Outcome, type WorkItemView } from "./work-items.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { modelAnswer, modelChoiceOn, ModelChoiceRefused, resolveItemModel, type ResolvedModel } from "./model-choice.js";
 
 const logger = pino({ name: "assistant-review-items" });
 
-/** Pull requests one request may start reviews of. */
-export const MAX_REVIEWS_PER_REQUEST = 10;
+/**
+ * Pull requests one request may name: the ones it starts at once (`REVIEWS_STARTED_AT_ONCE`) and as many more as may wait for a slot
+ * (`MAX_QUEUED_ITEMS`).
+ */
+export const MAX_REVIEWS_PER_REQUEST = 30;
+/**
+ * At most this many reviews of one request run at once. The rest are made and wait for a slot (`ReviewParams.queued`, reason
+ * `too_many_in_request`), and the queue starts the next of them, in order, each time one of the request's reviews ends
+ * (`startQueuedReviews`). Yihan, 2026-11-06: fifteen pull requests in one message start ten and queue five, never refuse them all.
+ */
+export const REVIEWS_STARTED_AT_ONCE = 10;
 const BRIEF_MAX_CHARS = 20_000;
 /** The most a requester may write to the reviewer with a request. */
 export const REQUESTER_NOTE_MAX_CHARS = 2_000;
@@ -83,6 +92,11 @@ export interface ReviewParams {
    * no message yet; `startQueuedReviews` queues the first one and removes this once a slot is free.
    */
   queued?: { since: string; reason: string };
+  /**
+   * The request that named more than `REVIEWS_STARTED_AT_ONCE` pull requests, shared by all its reviews: at most that many of them run at
+   * once, and one waiting starts only while fewer do (`startQueuedOf`).
+   */
+  request_batch?: string;
   /** The last review of the same pull request this one continues (a restart, or a new request after a closed item), as the facts recorded it. */
   continues?: ReviewContinues | null;
   /** What this review has posted so far, from the same facts (`reviewRecord`); written when the item's state is brought up to date. */
@@ -497,7 +511,7 @@ export interface CreatedReview {
   fell_back_from?: string;
   /**
    * Present when the limit it would go over (`reason`: `too_many_active_items`, `too_many_requested_reviews`, `too_many_from_requester`)
-   * was full: the item is made and waits for a slot, and starts by itself, oldest first, once one is free (`startQueuedReviews`). Nothing of
+   * was full, or it is past the first `REVIEWS_STARTED_AT_ONCE` of its request (`too_many_in_request`): the item is made and waits for a slot, and starts by itself, oldest first, once one is free (`startQueuedReviews`). Nothing of
    * it has run. Absent: it started.
    */
   queued?: { reason: string };
@@ -509,6 +523,8 @@ interface Planned {
   config: Record<string, unknown>;
   attended: AttendedProof;
   params: ReviewParams;
+  /** Made waiting for a slot even when one is free: past the first `REVIEWS_STARTED_AT_ONCE` of its request. */
+  hold?: boolean;
 }
 
 /**
@@ -541,6 +557,10 @@ function itemLimitRefusal(error: string, params: ReviewParams, owner: string): R
     case "too_many_from_requester":
       return new ReviewItemRefused(409, "too_many_active_items", `you already have ${s.perRequesterMaxActive} reviews waiting for ${who}; stop one or wait for one to finish`,
         { limit: s.perRequesterMaxActive, scope: "requester" });
+    case "too_many_in_request":
+      return new ReviewItemRefused(409, "too_many_active_items",
+        `${who} already has ${MAX_QUEUED_ITEMS} reviews waiting for a slot, so the ones past the first ${REVIEWS_STARTED_AT_ONCE} of this request cannot wait as well; send them once some have started`,
+        { limit: MAX_QUEUED_ITEMS, scope: "queue" });
     case "too_many_active_items":
       return new ReviewItemRefused(409, "too_many_active_items",
         `you already have ${CLAW_ASSISTANT_MAX_ACTIVE_ITEMS} unfinished items, the most one person may have; stop or finish one first`,
@@ -574,7 +594,7 @@ async function insertReview(q: StatementRunner, owner: UserInfo, plan: Planned):
   }, { parentSid: null });
   const item = await insertWorkItem(q, {
     userId: owner.userId, title: name, workerSessionId: plan.sessionId, kind: "review", params: plan.params as unknown as Record<string, unknown>,
-    requestedBy: plan.params.requested_by ?? null, queueWhenFull: true,
+    requestedBy: plan.params.requested_by ?? null, queueWhenFull: true, ...(plan.hold ? { holdFor: "too_many_in_request" as const } : {}),
   });
   if (!item.ok) throw itemLimitRefusal(item.error, plan.params, owner.userId);
   if (item.queued) {   // (its first message waits with it: nothing of it may run before it has a slot)
@@ -650,7 +670,9 @@ export async function startReviews(
   const choice = modelChoiceOn() ? await reviewModelFor(owner, forOther ? undefined : request.model) : null;
   const model = choice ? choice.model : forOther ? undefined : request.model;
   const effort = forOther ? undefined : request.effort;
-  const plans: Planned[] = request.prs.map(({ pr, message }) => {
+  // A request of more than can run at once: its reviews share a batch, and the ones past the first `REVIEWS_STARTED_AT_ONCE` wait (`hold`).
+  const batch = request.prs.length > REVIEWS_STARTED_AT_ONCE ? randomUUID() : null;
+  const plans: Planned[] = request.prs.map(({ pr, message }, index) => {
     const checked = checkAsCreate(user, method, actingAs, pr, request.reviewOnly, model, effort, request.mergeNeedsConfirmation === true);
     const label = String(checked.config.acting_as_requester ?? user.userId);
     const base: ReviewParams = {
@@ -658,9 +680,10 @@ export async function startReviews(
       ...(choice?.fellBackFrom ? { model_asked: choice.fellBackFrom } : {}),
       review_only: request.reviewOnly, brief: message ?? defaultBrief(pr, request.reviewOnly),
       ...(request.mergeNeedsConfirmation === true ? { merge_needs_confirmation: true as const } : {}),
+      ...(batch ? { request_batch: batch } : {}),
     };
     return {
-      pr, sessionId: randomUUID(), attended: checked.attended,
+      pr, sessionId: randomUUID(), attended: checked.attended, ...(batch && index >= REVIEWS_STARTED_AT_ONCE ? { hold: true } : {}),
       config: forOther ? asRequested(checked.config, { user_id: user.userId, label }) : checked.config,
       params: forOther ? { ...base, requested_by: user.userId, requester_label: label, requester_note: request.requesterNote ?? null } : base,
     };
@@ -745,6 +768,7 @@ function readParams(row: Record<string, unknown>): ReviewParams | null {
       : {}),
     ...(p.halted && typeof p.halted === "object" ? { halted: p.halted } : {}),
     ...(p.queued && typeof p.queued === "object" ? { queued: p.queued } : {}),
+    ...(typeof p.request_batch === "string" && p.request_batch ? { request_batch: p.request_batch } : {}),
     continues: readContinues(p.continues),
   };
 }
@@ -901,7 +925,7 @@ export async function restartReview(
   // The old words are sent again only if they still say what is asked: a review that now merges, or now does not, gets new ones.
   const brief = change.message ?? (reviewOnly === was.review_only ? was.brief : defaultBrief(was.pr, reviewOnly));
   // (a restart is made as any start is: neither why the old one was halted nor that it waited for a slot carries over)
-  const { halted: _halted, queued: _queued, ...kept } = was;
+  const { halted: _halted, queued: _queued, request_batch: _batch, ...kept } = was;
   const plan: Planned = {
     pr: was.pr, sessionId: randomUUID(), attended: checked.attended,
     config: requestedBy ? asRequested(checked.config, { user_id: requestedBy, label: was.requester_label ?? requestedBy }) : checked.config,
@@ -1443,6 +1467,16 @@ async function startQueuedOf(owner: string): Promise<Array<{ itemId: string; ses
         WHERE user_id = $1 AND ${RUNNING} AND params ? 'requested_by' GROUP BY 1`,
       [owner],
     )).rows.map((r) => [(r as { by: string }).by, Number((r as { n: number }).n)]));
+    // The reviews of each large request that run (`request_batch`): one of its waiting reviews starts only while fewer than
+    // `REVIEWS_STARTED_AT_ONCE` do.
+    const perBatch = new Map((await query(
+      `SELECT params->>'request_batch' AS batch, COUNT(*)::int AS n FROM claw_work_items
+        WHERE user_id = $1 AND ${RUNNING} AND params ? 'request_batch' GROUP BY 1`,
+      [owner],
+    )).rows.map((r) => [(r as { batch: string }).batch, Number((r as { n: number }).n)]));
+    const took = (batch: string | undefined): void => {
+      if (batch) perBatch.set(batch, (perBatch.get(batch) ?? 0) + 1);
+    };
     const waiting = (await query(
       `SELECT item_id, user_id, kind, worker_session_id, params FROM claw_work_items
         WHERE user_id = $1 AND kind = 'review' AND ${WAITING} AND NOT (params ? 'halted') ORDER BY seq FOR UPDATE`,
@@ -1464,6 +1498,7 @@ async function startQueuedOf(owner: string): Promise<Array<{ itemId: string; ses
       const sessionId = row.worker_session_id as string;
       // The owner can write into their own review's session while it waits (its id is theirs): that ran it, as their own message runs
       // any session of theirs. It no longer waits, takes its slot, and gets no first message of the server's on top of the owner's.
+      // (Over any limit, its request's ten included: the owner's message runs whatever the counts say, and is counted from now on.)
       const ran = Number(((await query(
         `SELECT (SELECT COUNT(*) FROM claw_tasks WHERE session_id = $1) + (SELECT COUNT(*) FROM claw_pending_messages WHERE session_id = $1) AS n`,
         [sessionId],
@@ -1480,12 +1515,14 @@ async function startQueuedOf(owner: string): Promise<Array<{ itemId: string; ses
         } else {
           counts.own += 1;
         }
+        took(params.request_batch);
         out.push({ itemId, sessionId, started: false });
         continue;
       }
-      const fits = by
+      const fits = (by
         ? counts.others < limits.othersMaxActive && (perRequester.get(by) ?? 0) < limits.perRequesterMaxActive
-        : counts.own < CLAW_ASSISTANT_MAX_ACTIVE_ITEMS;
+        : counts.own < CLAW_ASSISTANT_MAX_ACTIVE_ITEMS)
+        && (!params.request_batch || (perBatch.get(params.request_batch) ?? 0) < REVIEWS_STARTED_AT_ONCE);
       if (!fits) continue;   // (one of another kind, or of another requester, may still fit)
       const proof = await proofForQueuedFirstMessage(q, sessionId);
       const sent = proof ? await queueServerMessage(q, {
@@ -1509,6 +1546,7 @@ async function startQueuedOf(owner: string): Promise<Array<{ itemId: string; ses
         } else {
           counts.own += 1;
         }
+        took(params.request_batch);
       }
       out.push({ itemId, sessionId, started: !halted });
     }

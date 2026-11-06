@@ -271,9 +271,9 @@ describe("assistant review items", { skip }, () => {
   });
 
   test("V3 a request that is wrong is refused before anything is asked or made", async () => {
-    const eleven = Array.from({ length: 11 }, (_, i) => PR(i + 1));
+    const tooMany = Array.from({ length: 31 }, (_, i) => PR(i + 1));
     for (const [body, field] of [
-      [{ prs: [] }, "prs"], [{ prs: eleven }, "prs"], [{}, "prs"], [{ prs: [PR(1), PR(1, "amd-agi", "primusclaw")] }, "prs[1]"],
+      [{ prs: [] }, "prs"], [{ prs: tooMany }, "prs"], [{}, "prs"], [{ prs: [PR(1), PR(1, "amd-agi", "primusclaw")] }, "prs[1]"],
       [{ prs: [{ owner: "AMD-AGI", repo: "x", number: "7" }] }, "prs[0]"], [{ prs: [PR(0)] }, "prs[0]"], [{ prs: [PR(1, "bad owner")] }, "prs[0]"],
       [{ prs: [PR(1)], review_only: "yes" }, "review_only"], [{ prs: [PR(1)], acting_as: 7 }, "acting_as"],
       [{ prs: [{ ...PR(1), message: 7 }] }, "prs[0].message"],
@@ -668,6 +668,43 @@ describe("assistant review items", { skip }, () => {
       for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
   });
+
+  test("Q3b fifteen pull requests in one request asked of someone else: ten start, five wait, and each that ends lets the next one start (Yihan, 2026-11-06)", () => withEnv({
+    CLAW_REVIEW_FOR_OTHERS_MAX_ACTIVE: "40", CLAW_REVIEW_FOR_OTHERS_PER_REQUESTER_MAX_ACTIVE: "30",
+    CLAW_GITHUB_REVIEWS_PER_TOKEN_PER_HOUR: "1000", CLAW_GITHUB_REVIEWS_PER_HOUR: "1000",
+  }, async () => {
+    const prs = Array.from({ length: 15 }, (_, i) => PR(501 + i));
+    const r = await start("alice", { prs, acting_as: "bob", acting_as_name: "Bob B" });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const items = r.body.data.items as Array<{ item_id: string; pr: { number: number }; queued?: { reason: string } }>;
+    assert.deepEqual(items.map((i) => [i.pr.number, i.queued?.reason ?? null]),
+      prs.map((p, i) => [p.number, i < 10 ? null : "too_many_in_request"]), "the first ten started, the last five wait, in the order named");
+    const sessions = await w.q("SELECT worker_session_id AS s FROM claw_work_items WHERE params ? 'queued'");
+    assert.equal(sessions.length, 5);
+    assert.equal(await count("claw_pending_messages", `session_id IN (${sessions.map((x) => `'${x.s}'`).join(",")})`), 0, "nothing of the five runs");
+    // The requester reads a waiting one as queued, and a started one as in progress.
+    const view = async (id: string) => (await app.inject({ method: "GET", url: `/v1/work-items/${id}`, headers: { "x-test-user": "alice" } })).json().data.status;
+    assert.deepEqual([await view(items[0].item_id), await view(items[10].item_id)], ["in_progress", "queued"]);
+    // Every limit has room, but ten of the request run: a tick starts none.
+    assert.equal(await ri.startQueuedReviews(), 0);
+    // One of the ten ends: the next tick starts the eleventh, and only it.
+    const { stopWorkItem } = await import("../src/assistant/work-items.js");
+    assert.equal((await stopWorkItem({ userId: "bob", itemId: items[3].item_id, source: "user" })).status, "ok");
+    assert.equal(await ri.startQueuedReviews(), 1);
+    assert.equal((await w.item(items[10].item_id)).params.queued, undefined);
+    assert.equal(await view(items[10].item_id), "in_progress");
+    assert.deepEqual((await w.q("SELECT params->'pr'->>'number' AS n FROM claw_work_items WHERE params ? 'queued' ORDER BY seq")).map((x) => Number(x.n)),
+      [512, 513, 514, 515]);
+    assert.equal(await ri.startQueuedReviews(), 0, "ten run again");
+    // Two more end: the next two start, in order.
+    for (const i of [0, 1]) assert.equal((await stopWorkItem({ userId: "bob", itemId: items[i].item_id, source: "user" })).status, "ok");
+    assert.equal(await ri.startQueuedReviews(), 2);
+    assert.deepEqual((await w.q("SELECT params->'pr'->>'number' AS n FROM claw_work_items WHERE params ? 'queued' ORDER BY seq")).map((x) => Number(x.n)),
+      [514, 515]);
+    // More than thirty in one request is refused whole, before anything is made.
+    const many = Array.from({ length: 31 }, (_, i) => PR(601 + i));
+    assert.equal((await start("alice", { prs: many, acting_as: "bob" })).status, 400);
+  }));
 
   test("Q4 one open review per pull request: the requester is told of their own request, nothing of the reviewer's or another's", async () => {
     const first = await askedOfBob();

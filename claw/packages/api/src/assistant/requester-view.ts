@@ -19,7 +19,8 @@ import { redactPublicJson } from "../events/redaction.js";
 import type { StatementRunner } from "../infra/db.js";
 
 export interface RequesterView {
-  status: "in_progress" | "waiting_for_reviewer" | "done" | "stopped";
+  /** `queued`: made, and waiting for a slot (`ReviewParams.queued`); it starts by itself, and then reads `in_progress`. */
+  status: "queued" | "in_progress" | "waiting_for_reviewer" | "done" | "stopped";
   pr_url: string | null;
   verdict: "approve" | "request_changes" | "comment" | null;
   merged: boolean;
@@ -81,7 +82,7 @@ export async function currentRequesterView(
   )).rows[0] as { verdict: string | null; merged: boolean; held: string | null };
   const status: RequesterView["status"] = row.board_state === "done"
     ? (row.outcome === "stopped" ? "stopped" : "done")
-    : row.board_state === "needs_you" ? "waiting_for_reviewer" : "in_progress";
+    : row.board_state === "needs_you" ? "waiting_for_reviewer" : params.queued ? "queued" : "in_progress";
   const waitingFor: RequesterView["waiting_for"] = status !== "waiting_for_reviewer" ? null
     : row.last_report_kind === "failed" ? "failed"
     : facts.held === "merge" ? "confirm_merge" : facts.held === "review" ? "confirm_review" : "reviewer";

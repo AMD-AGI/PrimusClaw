@@ -295,8 +295,11 @@ export const WAITING = "board_state <> 'done' AND params ? 'queued'";
 
 export type InsertWorkItemResult =
   /** `queued`: over the limit named, the item waits for a slot (`queueWhenFull`) and nothing of it may run yet. */
-  | { ok: true; itemId: string; seq: number; queued?: "too_many_active_items" | "too_many_requested_reviews" | "too_many_from_requester" }
-  | { ok: false; error: "too_many_active_items" | "too_many_requested_reviews" | "too_many_from_requester" | "no_assistant" };
+  | { ok: true; itemId: string; seq: number; queued?: QueueReason }
+  | { ok: false; error: QueueReason | "no_assistant" };
+
+/** The limit an item waits on, or is refused over: `too_many_in_request` is a review past the first ten its request starts at once. */
+export type QueueReason = "too_many_active_items" | "too_many_requested_reviews" | "too_many_from_requester" | "too_many_in_request";
 
 /**
  * The item row and its `created` event. Must run inside the transaction that also
@@ -320,6 +323,8 @@ export async function insertWorkItem(
     requestedBy?: string | null;
     /** Over the limit, queue the item instead of refusing it (a review item: `insertReview`). */
     queueWhenFull?: boolean;
+    /** With `queueWhenFull`: queue it even when the limits have room, for this reason; refused for it when the queue is full. */
+    holdFor?: "too_many_in_request";
   },
 ): Promise<InsertWorkItemResult> {
   const locked = await q.query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [input.userId]);
@@ -343,9 +348,10 @@ export async function insertWorkItem(
     over = "too_many_active_items";
   }
   // Behind the ones already waiting, whether or not this one would fit now: the queue starts them in order.
-  const queue = input.queueWhenFull === true && (over !== null || counts.queued_alike > 0) && counts.queued < MAX_QUEUED_ITEMS;
-  if (over && !queue) return { ok: false, error: over };
-  const queued = queue ? (over ?? (input.requestedBy ? "too_many_requested_reviews" : "too_many_active_items")) : null;
+  const held = input.holdFor ?? null;
+  const queue = input.queueWhenFull === true && (over !== null || held !== null || counts.queued_alike > 0) && counts.queued < MAX_QUEUED_ITEMS;
+  if ((over ?? held) && !queue) return { ok: false, error: (over ?? held)! };
+  const queued: QueueReason | null = queue ? (over ?? held ?? (input.requestedBy ? "too_many_requested_reviews" : "too_many_active_items")) : null;
   const params = queued ? { ...(input.params ?? {}), queued: { since: new Date().toISOString(), reason: queued } } : input.params;
   const itemId = newWorkItemId();
   await q.query(

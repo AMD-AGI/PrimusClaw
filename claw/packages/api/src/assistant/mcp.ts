@@ -43,6 +43,7 @@ import {
 import { modelChoiceOn } from "./model-choice.js";
 import { assistantMemoryOn, memoryForget, memoryRecall, memorySave, memoryUndo, memoryUpdate } from "./memory-tools.js";
 import { channelAction, confirmationAnswer, MAX_PRS, reviewModeSet, reviewRestart, reviewStart } from "./review-tools.js";
+import { REVIEWS_STARTED_AT_ONCE } from "./review-items.js";
 import { observeEveryTool, recordObservation } from "./observe.js";
 import { assistantCitationsOn } from "./citations.js";
 import { CITE_MAX_PER_CALL } from "@claw/protocol";
@@ -239,7 +240,7 @@ const MODEL_PARAM_CHOICE = `${MODEL_PARAM_ASKED}; left out, the user's own defau
 function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims, choice: boolean): void {
   mcp.tool(
     "review_start",
-    `Start a review of each pull request the user named, as a work item each (at most ${MAX_PRS}). Merges only with merge=true.`,
+    `Start a review of each pull request the user named, as a work item each, all in one call (up to ${MAX_PRS}; the first ${REVIEWS_STARTED_AT_ONCE} start, the rest wait for a slot and start by themselves). Merges only with merge=true.`,
     {
       prs: z.array(z.string()).describe("Each as owner/repo#number or its URL; only numbers the user wrote."),
       merge: z.boolean().describe("true only when the user clearly asked to merge after the review; otherwise false (review only). For the user's own review even true merges nothing by itself: the merge waits for their confirmation (the card's button or 批准 #<ref>)."),

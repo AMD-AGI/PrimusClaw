@@ -44,8 +44,8 @@ import {
   CONTEXT_STRING_MAX, decidedViaOf, parseChannelContext, turnMessage, type AttendedVia, type ChannelPerson, type TurnMessage,
 } from "./inbound.js";
 import {
-  parseRestartRequest, parseReviewRequest, recordReviewHandoff, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused, reviewItemsEnabled,
-  startReviews,
+  parseRestartRequest, parseReviewRequest, recordReviewHandoff, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused,
+  reviewItemsEnabled, REVIEWS_STARTED_AT_ONCE, startReviews,
 } from "./review-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { attendedTurn, ToolRefused } from "./tools.js";
@@ -72,7 +72,12 @@ export const reviewToolPorts = {
     voidStreamedSay(sessionId, messageId, reason),
 };
 
-export const MAX_PRS = 10;
+/**
+ * One review_start may name as many pull requests as one request for reviews (`MAX_REVIEWS_PER_REQUEST`): the first ten start, the rest
+ * wait for a slot. A literal, since review-items.js may not be initialised yet when this module is (they import each other); a test holds
+ * the two equal.
+ */
+export const MAX_PRS = 30;
 /** At most this many people are offered when the message names no reviewer alone. */
 const MAX_REVIEWER_CANDIDATES = 5;
 /** How long after the person's request their answer naming the reviewer (`确认 <name>`) still answers it. */
@@ -461,7 +466,9 @@ export function prGrounded(text: string, pr: PrRef): boolean {
 /** The pull requests a call names, parsed, or the refusal for the first that is not one. */
 export function parsePrs(prs: unknown): PrRef[] {
   if (!Array.isArray(prs) || prs.length === 0) throw new ToolRefused("invalid_arguments", "prs needs at least one pull request, as owner/repo#number or its URL");
-  if (prs.length > MAX_PRS) throw new ToolRefused("too_many_prs", `at most ${MAX_PRS} pull requests at once: ask the user which to start with`);
+  if (prs.length > MAX_PRS) {
+    throw new ToolRefused("too_many_prs", `at most ${MAX_PRS} pull requests in one call (the first ${REVIEWS_STARTED_AT_ONCE} start, the rest wait for a slot): start the first ${MAX_PRS} the user named and tell them to send the others once some have started`);
+  }
   const out: PrRef[] = [];
   for (const raw of prs) {
     const ref = parsePrRef(raw);

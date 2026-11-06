@@ -95,7 +95,7 @@ credentials asked of the caller, and holds the same tools and gates.
 
 | Route | |
 |---|---|
-| `POST /v1/assistant/reviews` | `{prs: [{owner, repo, number, message?}], acting_as?, acting_as_name?, model?, effort?, review_only?}`: one item per pull request (1 to 10), all of them or none. `review_only` defaults to `true`; `message` is the session's first message, written by Claw when absent. Answers `{items: [{item_id, seq, title, session_id, pr, message_id}]}`, where `message_id` is the turn id of that first message |
+| `POST /v1/assistant/reviews` | `{prs: [{owner, repo, number, message?}], acting_as?, acting_as_name?, model?, effort?, review_only?}`: one item per pull request (1 to 30), all of them or none; the first 10 of a request start and the rest wait for a slot (`queued: {reason: "too_many_in_request"}`), starting in order as the request's reviews end. `review_only` defaults to `true`; `message` is the session's first message, written by Claw when absent. Answers `{items: [{item_id, seq, title, session_id, pr, message_id}]}`, where `message_id` is the turn id of that first message |
 | `POST /v1/assistant/reviews/:id/restart` | The same pull request again with what the body changes (`model`, `effort`, `review_only`, `message`); the old item is stopped as a stop would stop it |
 | `POST /v1/work-items/:id/stop` | Also denies every write the session holds for an answer, in the same transaction; `409 merge_in_progress` while one is being made, `409 already_merged` after a merge |
 
