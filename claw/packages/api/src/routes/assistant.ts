@@ -6,6 +6,7 @@
  *
  *   POST /v1/assistant                    the caller's assistant session, made on first use
  *   GET  /v1/work-items?state=            the board: in_progress | needs_you | done
+ *   GET  /v1/work-items/asked-of-others   the reviews the caller asked of others: open, or closed in the last ASKED_CLOSED_WINDOW
  *   GET  /v1/work-items/:id               one item with its latest events
  *   POST /v1/work-items/:id/accept        {version}: the result the user saw, and only that one
  *   POST /v1/work-items/:id/stop
@@ -27,8 +28,8 @@
  *
  * One exception, and it is narrow: a review someone (R) asked of another person
  * (X) is X's item, and R may read how it stands and stop it, nothing else. R is
- * answered with four facts only (`requester-view.ts`), on the read and on both
- * branches of the stop; accept and restart stay X's (404 for R), and X's session
+ * answered with its requester view only (`requester-view.ts`), on the read, on both
+ * branches of the stop and in the list of reviews R asked of others; accept and restart stay X's (404 for R), and X's session
  * is X's (its routes answer R 404 as for any other session).
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
@@ -54,7 +55,7 @@ import {
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_OBSERVE, CLAW_ASSISTANT_REVIEW_ITEMS, CLAW_GITHUB_REVIEW_ENABLED,
 } from "../config.js";
 import { asRequesterAnswer } from "../assistant/review-items.js";
-import { requestedItemOf, requesterViewOf } from "../assistant/requester-view.js";
+import { askedOfOthers, requestedItemOf, requesterViewOf } from "../assistant/requester-view.js";
 import { verifyActingAsCredentials } from "../auth/identity-token.js";
 import { credentialVerifier } from "../auth/middleware.js";
 import { db } from "../infra/db.js";
@@ -98,6 +99,10 @@ function answer(reply: FastifyReply, result: DecisionResult) {
   return reply.send({ ok: true, data: result.item });
 }
 
+/** How long a review the caller asked of someone else stays listed after it closed, and how many are listed at most. */
+const ASKED_CLOSED_WINDOW = "3 days";
+const ASKED_MAX_ITEMS = 50;
+
 export async function registerAssistantRoutes(app: FastifyInstance): Promise<void> {
   if (!CLAW_ASSISTANT_ENABLED) return;
 
@@ -116,6 +121,14 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
       return reply.status(400).send({ ok: false, error: `state must be one of ${BOARD_STATES.join(", ")}` });
     }
     return reply.send({ ok: true, data: await listWorkItems(userId, (state as BoardState | undefined) ?? null) });
+  });
+
+  // A review the caller (R) asked of someone else is not on R's board (it is X's item): R's channel shows these beside it, each with
+  // its item_id, whom R asked and R's view of it (`requester-view.ts`), and nothing else of X's item.
+  app.get("/v1/work-items/asked-of-others", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    return reply.send({ ok: true, data: await askedOfOthers(db, userId, ASKED_CLOSED_WINDOW, ASKED_MAX_ITEMS) });
   });
 
   app.get("/v1/work-items/:id", async (req, reply) => {

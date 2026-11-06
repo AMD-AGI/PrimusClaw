@@ -79,7 +79,7 @@ describe("assistant say guard", { skip }, () => {
 
   test("G4 the router is told how to name items and that say refuses internal text", async () => {
     const { ROUTER_PROMPT, ROUTER_PROMPT_VERSION } = await import("../src/assistant/prompts.js");
-    assert.equal(ROUTER_PROMPT_VERSION, "router-v11");
+    assert.equal(ROUTER_PROMPT_VERSION, "router-v12");
     assert.match(ROUTER_PROMPT, /Name a work item to the user by its number and title, as in #12 修复登录超时, never by its item_id and never by its number alone: say refuses "#6、#8" without the titles\./);
     assert.match(ROUTER_PROMPT, /say refuses a message that does, and you write it again in plain words/);
   });

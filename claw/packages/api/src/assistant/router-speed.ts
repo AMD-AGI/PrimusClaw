@@ -11,8 +11,12 @@
  * can show the first words before the step that says them has ended. The message itself is still the `say` that runs when the step
  * is whole; what streams is a preview of it.
  */
+import pino from "pino";
 import { CLAW_ASSISTANT_ROUTER_EFFORT, CLAW_ASSISTANT_STREAM_SAY } from "../config.js";
+import { publishEvent } from "../events/store.js";
 import { TOOL_NAME_PREFIX } from "./prompts.js";
+
+const logger = pino({ name: "assistant-router-speed" });
 
 /** The router's `say`, as Brain names it: the one tool whose text is streamed. */
 export const STREAMED_SAY_TOOL = `${TOOL_NAME_PREFIX}say`;
@@ -24,4 +28,26 @@ export function applyRouterTurnSpeed(
   if (settings.effort && !task.effort) task.effort = settings.effort;
   if (settings.streamSay) task.stream_tool_text = [STREAMED_SAY_TOOL];
   else delete task.stream_tool_text;
+}
+
+/**
+ * The event that tells whoever follows a router turn live that the `say` text it streamed for that turn (`toolTextDelta`) is not
+ * going to be said: `{type: "toolTextVoid", tool, message_id, reason}`. Published when a say is refused (what was streamed of it
+ * never reaches the person) and when the turn hands a review to the person's channel (any later say of the turn is refused). A
+ * channel that showed the words takes them back instead of keeping them as a message; the session stream forwards no further
+ * `toolTextDelta` of that turn after it (`routes/events.ts`). Like the deltas it is live only: never stored (`events/consumer.ts`).
+ */
+export const TOOL_TEXT_VOID_EVENT = "toolTextVoid";
+
+/** Best effort: a void that cannot be published leaves the channel to the say's own refusal on the turn's stream. */
+export async function voidStreamedSay(
+  sessionId: string, messageId: string | undefined, reason: string,
+  publish: (sessionId: string, event: Record<string, unknown>) => Promise<void> = publishEvent,
+): Promise<void> {
+  if (!messageId) return;
+  try {
+    await publish(sessionId, { type: TOOL_TEXT_VOID_EVENT, tool: STREAMED_SAY_TOOL, message_id: messageId, reason });
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message, sessionId, reason }, "assistant.stream_void_publish_failed");
+  }
 }

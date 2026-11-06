@@ -49,6 +49,7 @@ import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 import { applyRouterTurnSpeed } from "./router-speed.js";
 import { routerCite } from "./citations.js";
+import { remoteConnectorsOn } from "./connector-tools.js";
 
 const logger = pino({ name: "assistant-role" });
 
@@ -250,9 +251,11 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       task.plugin_tools = read.pluginTools;
     }
     // Once it has read one of their results, the turn no longer acts for the person: Brain refuses the acting tools. A GitHub or
-    // web lookup that failed read nothing, and leaves the turn free to start the work instead.
+    // web lookup that failed read nothing, and leaves the turn free to start the work instead. `connector_list` is a source too:
+    // the names it returns are what a connector program chose (`connector-tools.ts`).
+    const connectorRead = remoteConnectorsOn() ? [`${TOOL_NAME_PREFIX}connector_list`] : [];
     task.read_taint = {
-      sources: lookups.allowlist, allow_after: AFTER_READ_TOOLS.map((t) => `${TOOL_NAME_PREFIX}${t}`), clean_failures: lookups.cleanFailures,
+      sources: [...lookups.allowlist, ...connectorRead], allow_after: AFTER_READ_TOOLS.map((t) => `${TOOL_NAME_PREFIX}${t}`), clean_failures: lookups.cleanFailures,
     };
     // Its say may cite what the lookups returned (`citations.ts`): Brain keeps their sources and hands say the ones it names.
     const cite = routerCite(lookups.githubServers, stringField(task, "prompt"));

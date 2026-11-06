@@ -189,13 +189,16 @@ export async function enqueue(
   subs: Array<{ subscription_id: string }>,
   payload: OutboundPayload,
   q: Querier = direct,
+  hold?: { status: string; seconds: number },
 ): Promise<number> {
   let written = 0;
   for (const sub of subs) {
+    // A held row is not due until `seconds` from now, and says so in `last_status` (`assistant/say-hold.ts`): whoever holds it
+    // releases it (due now) or drops it before then.
     const r = await q(
-      `INSERT INTO claw_notification_outbox (event_id, subscription_id, payload)
-       VALUES ($1, $2, $3::jsonb) ON CONFLICT (event_id, subscription_id) DO NOTHING`,
-      [eventId, sub.subscription_id, JSON.stringify(payload)],
+      `INSERT INTO claw_notification_outbox (event_id, subscription_id, payload, next_attempt_at, last_status)
+       VALUES ($1, $2, $3::jsonb, NOW() + make_interval(secs => $4), $5) ON CONFLICT (event_id, subscription_id) DO NOTHING`,
+      [eventId, sub.subscription_id, JSON.stringify(payload), hold?.seconds ?? 0, hold?.status ?? null],
     );
     written += r.rowCount ?? 0;
   }
