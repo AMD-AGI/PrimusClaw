@@ -23,7 +23,7 @@ import { actingUserOf, parseActingAs } from "../github-review/acting-as.js";
 import { REVIEW_SANDBOX_PROFILE, requestedByOf, usesReviewProfile } from "../github-review/requested-by.js";
 import { reviewAgentSettings, reviewTurnsLeft } from "../github-review/review-profile.js";
 import { SEALED_CREDENTIALS_FIELD } from "../auth/sealed-session-credentials.js";
-import { checkSessionCreate, proofForFirstMessageAgain, type AttendedProof } from "../github-review/acting-session.js";
+import { checkSessionCreate, proofForFirstMessageAgain, proofForQueuedFirstMessage, type AttendedProof } from "../github-review/acting-session.js";
 import { isValidPrRef, type PrRef } from "../github-review/github.js";
 import type { FollowRequest, ReviewActor, ReviewContinuation, ToolOutcome } from "../github-review/service.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
@@ -35,7 +35,7 @@ import { getOrCreateAssistant } from "./assistant.js";
 import { drainSessionIfIdle, queueServerMessage, type QueuedServerMessage } from "./messages.js";
 import { queueRouterWake } from "./reports.js";
 import { freezeRequesterView } from "./requester-view.js";
-import { clipOneLine, getWorkItem, insertWorkItem, itemView, type Outcome, type WorkItemView } from "./work-items.js";
+import { clipOneLine, getWorkItem, insertWorkItem, itemView, RUNNING, WAITING, type Outcome, type WorkItemView } from "./work-items.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { modelAnswer, modelChoiceOn, ModelChoiceRefused, resolveItemModel, type ResolvedModel } from "./model-choice.js";
 
@@ -78,6 +78,11 @@ export interface ReviewParams {
   requester_note?: string | null;
   /** Why the server stopped running the review before its turn (`haltRequestedReview`): the reviewer's say was withdrawn, or the budget ran out. */
   halted?: { reason: string; message: string };
+  /**
+   * Set while the review waits for a slot (`insertWorkItem` with `queueWhenFull`): since when, and the limit it waits on. Its session has
+   * no message yet; `startQueuedReviews` queues the first one and removes this once a slot is free.
+   */
+  queued?: { since: string; reason: string };
   /** The last review of the same pull request this one continues (a restart, or a new request after a closed item), as the facts recorded it. */
   continues?: ReviewContinues | null;
   /** What this review has posted so far, from the same facts (`reviewRecord`); written when the item's state is brought up to date. */
@@ -490,6 +495,12 @@ export interface CreatedReview {
    */
   model?: string | null;
   fell_back_from?: string;
+  /**
+   * Present when the limit it would go over (`reason`: `too_many_active_items`, `too_many_requested_reviews`, `too_many_from_requester`)
+   * was full: the item is made and waits for a slot, and starts by itself, oldest first, once one is free (`startQueuedReviews`). Nothing of
+   * it has run. Absent: it started.
+   */
+  queued?: { reason: string };
 }
 
 interface Planned {
@@ -563,9 +574,16 @@ async function insertReview(q: StatementRunner, owner: UserInfo, plan: Planned):
   }, { parentSid: null });
   const item = await insertWorkItem(q, {
     userId: owner.userId, title: name, workerSessionId: plan.sessionId, kind: "review", params: plan.params as unknown as Record<string, unknown>,
-    requestedBy: plan.params.requested_by ?? null,
+    requestedBy: plan.params.requested_by ?? null, queueWhenFull: true,
   });
   if (!item.ok) throw itemLimitRefusal(item.error, plan.params, owner.userId);
+  if (item.queued) {   // (its first message waits with it: nothing of it may run before it has a slot)
+    return {
+      item_id: item.itemId, seq: item.seq, title: name, session_id: plan.sessionId, pr: plan.pr, message_id: null,
+      review_only: plan.params.review_only, ...(plan.params.merge_needs_confirmation === true ? { merge_needs_confirmation: true as const } : {}),
+      queued: { reason: item.queued },
+    };
+  }
   const queued = await queueServerMessage(q, {
     sessionId: plan.sessionId, userId: owner.userId, content: firstMessage(plan), dedupeKey: `start:${item.itemId}`, attended: plan.attended,
   });
@@ -682,8 +700,8 @@ export async function startReviews(
     }
     return out;
   });
-  for (const c of created) await drainSessionIfIdle(c.session_id, owner.userId);
-  logger.info({ userId: user.userId, actingAs, owner: owner.userId, items: created.map((c) => c.item_id), ignored, ...(choice ? { model: choice.model, source: choice.source } : {}) }, "assistant.reviews_started");
+  for (const c of created) if (!c.queued) await drainSessionIfIdle(c.session_id, owner.userId);
+  logger.info({ userId: user.userId, actingAs, owner: owner.userId, items: created.map((c) => c.item_id), queued: created.filter((c) => c.queued).map((c) => c.item_id), ignored, ...(choice ? { model: choice.model, source: choice.source } : {}) }, "assistant.reviews_started");
   const answered = choice ? created.map((c) => ({ ...c, ...modelAnswer(choice) })) : created;
   return ignored.length > 0 ? answered.map((c) => ({ ...c, ignored: [...ignored] })) : answered;
 }
@@ -726,6 +744,7 @@ function readParams(row: Record<string, unknown>): ReviewParams | null {
       ? { requested_by: p.requested_by, requester_label: typeof p.requester_label === "string" ? p.requester_label : p.requested_by, requester_note: typeof p.requester_note === "string" ? p.requester_note : null }
       : {}),
     ...(p.halted && typeof p.halted === "object" ? { halted: p.halted } : {}),
+    ...(p.queued && typeof p.queued === "object" ? { queued: p.queued } : {}),
     continues: readContinues(p.continues),
   };
 }
@@ -932,7 +951,7 @@ export async function restartReview(
     return { oldSession: row.worker_session_id, seq: Number(row.seq), item: await insertReview(q, user, plan) };
   });
   await stopSessionRuns(result.oldSession);
-  await drainSessionIfIdle(result.item.session_id, user.userId);
+  if (!result.item.queued) await drainSessionIfIdle(result.item.session_id, user.userId);
   logger.info({ userId: user.userId, stopped: itemId, item: result.item.item_id }, "assistant.review_restarted");
   // With model choice on, the restarted item says which model it runs on, as a start does.
   const item = modelChoiceOn() ? { ...result.item, ...(choice ? modelAnswer(choice) : { model: plan.params.model }) } : result.item;
@@ -1068,6 +1087,8 @@ export interface ReviewFacts {
   turn: "running" | "failed" | "finished" | "none";
   /** Why the server stopped running a review someone asked of the owner (`haltRequestedReviews`), or null. */
   halted?: { reason: string; message: string } | null;
+  /** The review waits for a slot (`ReviewParams.queued`): nothing of it has run. */
+  queued?: boolean;
 }
 
 /** The audit rows of `GithubReview.followPullRequest`, and the details of those that end a review item. */
@@ -1086,6 +1107,7 @@ export type ReviewState =
  */
 export function reviewState(f: ReviewFacts): ReviewState {
   const pr = prName(f.pr);
+  if (f.queued) return { boardState: "in_progress", summary: `${pr} is queued: it starts by itself when a slot is free`, question: null };
   const own = f.actingAs === f.ownerUserId;
   const latest = <T extends { at: number }>(xs: T[]): T | null => xs.reduce<T | null>((a, x) => (!a || x.at >= a.at ? x : a), null);
   // What the sweep found of the pull request on GitHub (`followReviewItems`): merged by the requester's own account after this review's
@@ -1173,6 +1195,7 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
     writes: writes.map((w) => ({ tool: w.tool, result: w.result, detail: w.detail, at: ms(w.at) })),
     turn: turn.busy ? "running" : turn.last === null ? "none" : turn.last === "failed" || turn.last === "cancelled" ? "failed" : "finished",
     halted: row.params.halted ?? null,
+    queued: row.params.queued !== undefined,
   };
 }
 
@@ -1289,6 +1312,7 @@ export async function sweepReviewItems(): Promise<number> {
        FROM claw_work_items w
       WHERE w.worker_session_id = c.session_id AND w.kind = 'review' AND w.outcome = 'stopped' AND c.status = 'pending'`,
   );
+  await startQueuedReviews().catch((err) => logger.warn({ err }, "assistant.review_queue_failed"));
   const open = (await db.query(
     "SELECT item_id FROM claw_work_items WHERE kind = 'review' AND board_state <> 'done' ORDER BY updated_at LIMIT $1", [REVIEW_SWEEP_BATCH],
   )).rows as Array<{ item_id: string }>;
@@ -1368,4 +1392,96 @@ export async function followReviewItems(now = Date.now()): Promise<number> {
     }
   }
   return ended;
+}
+
+// ------------------------------------------------------------------------------------------------ the queue
+
+/**
+ * Start the reviews that wait for a slot (`ReviewParams.queued`) whose owner now has one: every tick (`sweepReviewItems`), oldest first per
+ * owner, under the owner's assistant row lock that `insertWorkItem` takes, so a create and a start count the same slots one after the other.
+ * A review's first message is queued then, on the proof that its request was checked and its say given when it was made
+ * (`proofForQueuedFirstMessage`), and goes through every gate a queued turn does (`gateRequestedReviewTurn`: the reviewer's say asked again,
+ * the turn budget). One whose first message cannot be queued (its keys were removed meanwhile) is halted, which puts it in front of its owner.
+ * The number started.
+ */
+export async function startQueuedReviews(): Promise<number> {
+  if (!CLAW_ASSISTANT_REVIEW_ITEMS) return 0;
+  const owners = (await db.query(
+    `SELECT user_id FROM claw_work_items WHERE kind = 'review' AND ${WAITING} GROUP BY user_id ORDER BY MIN(created_at) LIMIT $1`,
+    [REVIEW_SWEEP_BATCH],
+  )).rows as Array<{ user_id: string }>;
+  let started = 0;
+  for (const { user_id: owner } of owners) {
+    try {
+      const sessions = await startQueuedOf(owner);
+      for (const s of sessions) await drainSessionIfIdle(s.sessionId, owner);
+      for (const s of sessions) await syncReviewItem(s.itemId).catch((err) => logger.warn({ err, itemId: s.itemId }, "assistant.review_sync_failed"));
+      started += sessions.filter((s) => s.started).length;
+    } catch (err) {
+      logger.warn({ err, owner }, "assistant.review_queue_owner_failed");
+    }
+  }
+  return started;
+}
+
+async function startQueuedOf(owner: string): Promise<Array<{ itemId: string; sessionId: string; started: boolean }>> {
+  return inTransaction(async (query) => {
+    const q = { query };
+    if (!(await query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [owner])).rowCount) return [];
+    const limits = reviewAgentSettings(owner);
+    const counts = (await query(
+      `SELECT COUNT(*) FILTER (WHERE ${RUNNING} AND NOT (params ? 'requested_by'))::int AS own,
+              COUNT(*) FILTER (WHERE ${RUNNING} AND params ? 'requested_by')::int AS others
+         FROM claw_work_items WHERE user_id = $1`,
+      [owner],
+    )).rows[0] as { own: number; others: number };
+    const perRequester = new Map((await query(
+      `SELECT params->>'requested_by' AS by, COUNT(*)::int AS n FROM claw_work_items
+        WHERE user_id = $1 AND ${RUNNING} AND params ? 'requested_by' GROUP BY 1`,
+      [owner],
+    )).rows.map((r) => [(r as { by: string }).by, Number((r as { n: number }).n)]));
+    const waiting = (await query(
+      `SELECT item_id, user_id, kind, worker_session_id, params FROM claw_work_items
+        WHERE user_id = $1 AND kind = 'review' AND ${WAITING} ORDER BY seq FOR UPDATE`,
+      [owner],
+    )).rows as Array<Record<string, unknown>>;
+    const out: Array<{ itemId: string; sessionId: string; started: boolean }> = [];
+    for (const row of waiting) {
+      const params = readParams(row);
+      if (!params) continue;
+      const by = params.requested_by ?? null;
+      const fits = by
+        ? counts.others < limits.othersMaxActive && (perRequester.get(by) ?? 0) < limits.perRequesterMaxActive
+        : counts.own < CLAW_ASSISTANT_MAX_ACTIVE_ITEMS;
+      if (!fits) continue;   // (one of another kind, or of another requester, may still fit)
+      const itemId = row.item_id as string;
+      const sessionId = row.worker_session_id as string;
+      const proof = await proofForQueuedFirstMessage(q, sessionId);
+      const sent = proof ? await queueServerMessage(q, {
+        sessionId, userId: owner, content: firstMessage({ pr: params.pr, sessionId, config: {}, attended: proof, params }),
+        dedupeKey: `start:${itemId}`, attended: proof,
+      }) : null;
+      const halted = sent?.ok ? null : { reason: "not_started", message: "it could not be started from the queue" };
+      await query(
+        `UPDATE claw_work_items SET params = (params - 'queued')${halted ? " || jsonb_build_object('halted', $2::jsonb)" : ""}, updated_at = NOW()
+          WHERE item_id = $1`,
+        halted ? [itemId, JSON.stringify(halted)] : [itemId],
+      );
+      await query(
+        "INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary) SELECT item_id, 'progress', 'policy', generation, $2 FROM claw_work_items WHERE item_id = $1",
+        [itemId, halted ? "not started from the queue" : "started from the queue"],
+      );
+      if (!halted) {
+        if (by) {
+          counts.others += 1;
+          perRequester.set(by, (perRequester.get(by) ?? 0) + 1);
+        } else {
+          counts.own += 1;
+        }
+      }
+      out.push({ itemId, sessionId, started: !halted });
+    }
+    if (out.length) logger.info({ owner, started: out.filter((o) => o.started).map((o) => o.itemId), halted: out.filter((o) => !o.started).map((o) => o.itemId) }, "assistant.review_queue_started");
+    return out;
+  });
 }

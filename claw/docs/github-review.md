@@ -102,8 +102,15 @@ credentials asked of the caller, and holds the same tools and gates.
 Before anything is made: only an identity-provider token (`403 interactive_sign_in_required` / `service_client_not_allowed`);
 one open review per pull request whoever asked (`409 review_in_progress`, or `review_in_progress_by_other` without the other
 person's item); the hourly limits below, counting the open reviews that have not written yet (`429 rate_limited` with how many
-more fit); the requester's limit of unfinished items (`409 too_many_active_items`); and the pull request read with the acting
-user's account (`422 pr_check_failed` with the tool's refusal code, `503 pr_check_unavailable` for an outage).
+more fit); and the pull request read with the acting user's account (`422 pr_check_failed` with the tool's refusal code,
+`503 pr_check_unavailable` for an outage).
+
+The item limits (the owner's unfinished items, and the review-agent limits below) do not refuse a review: an item over one is made
+and waits for a slot, answered with `queued: {reason}` (the limit's code, `too_many_active_items`, `too_many_requested_reviews` or
+`too_many_from_requester`). Its session gets no message until then; every tick the sweeper starts the waiting reviews of each owner
+that now fit, oldest first, and one that would fit while others of its kind wait is queued behind them. A queued review holds no slot,
+counts as open for the hourly limits and for one review per pull request, and is stopped like any other. Only past 20 waiting items
+of one owner is the limit's refusal answered (`409 too_many_active_items`, with `data.scope` for the review-agent limits).
 
 The item's state is read off the audit and confirmation tables, never from the model: a merge, a queued merge or a posted
 review is done (accepted by policy); a write held for the requester themselves, or a closed one that did not write (`stale`,
