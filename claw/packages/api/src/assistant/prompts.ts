@@ -12,7 +12,7 @@
  * only `say` reaches the user, and there is no accept tool at all.
  */
 import { REPLY_LANGUAGE_LABEL } from "./language.js";
-import { REPORT_SUMMARY_MAX } from "./report.js";
+import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
 import type { ReportKind } from "./work-items.js";
 
 /**
@@ -29,26 +29,41 @@ import type { ReportKind } from "./work-items.js";
  * an item, work_recall for how far an item got, the memory and channel tools for what they are for, the system's own failures never
  * given as an answer or a reason, a declined request said in a line, and every say in the reply language (say refuses another, and
  * an item number without its title).
+ * router-v11: v10 with a long answer said whole (up to SAY_MAX_CHARS, shown as up to three messages) instead of cut short, and an
+ * answer the system already sent in full not said again.
+ * router-v12: v11 with nothing at all said after the system's start notice (a say after it is refused), and a start whose model fell
+ * back said by the router in its one line.
  */
-export const ROUTER_PROMPT_VERSION = "router-v10";
+export const ROUTER_PROMPT_VERSION = "router-v12";
 /**
  * The router's prompt with the review and settings tools (`CLAW_ASSISTANT_TOOLS=on`): router-v5 and `ROUTER_REVIEW_PROMPT`
  * (v6: v5 with an allow only on the user's exact approval command, and a channel action not typed as its command put to the user
  * as a button; v7: v6 with a review by someone else refused here, and the user told where to ask for it; v8: v7 on router-v5; v9: v8 on router-v6; v10: v9 on router-v7;
  * v11: v10 on router-v8; v12: v11 with nothing said about a review handed to the user's chat, which answers the message about it
- * itself, and how a started review merges told from its result; v13: v12 on router-v10).
+ * itself, and how a started review merges told from its result; v13: v12 on router-v10; v14: v13 on router-v11; v15: v14 on router-v12,
+ * with a turn that hands a review off saying nothing at all, before or after the call: a say after it is refused, and one before it
+ * is held and dropped, `say-hold.ts`).
  */
-export const ROUTER_REVIEW_PROMPT_VERSION = "router-v13";
+export const ROUTER_REVIEW_PROMPT_VERSION = "router-v15";
 
 /** The assistant's MCP server, which is what Brain puts before each of its tools' names. */
 export const ASSISTANT_MCP_SERVER = "assistant";
 /** A tool is called by its full name, and the model is told so: a name without this is not a tool, and Brain turns it away. */
 export const TOOL_NAME_PREFIX = `mcp__${ASSISTANT_MCP_SERVER}__`;
-/** worker-v2: worker-v1 with report(kind="answer") for a task that only finds something out. */
-export const WORKER_PROMPT_VERSION = "worker-v2";
+/**
+ * worker-v2: worker-v1 with report(kind="answer") for a task that only finds something out.
+ * worker-v3: v2 with an answer given whole (up to REPORT_ANSWER_MAX; longer goes in a file), and every file the user should get
+ * handed over with deliver_file before the report.
+ */
+export const WORKER_PROMPT_VERSION = "worker-v3";
 
-/** The longest `say` text: about 100 words. A longer one is refused so the Router writes it shorter. */
-export const SAY_MAX_CHARS = 600;
+/**
+ * The longest `say` text (the API's `SAY_TEXT_MAX`): a channel shows a long one as up to three messages, whole. The norm is
+ * `SAY_BRIEF_CHARS`; the bound is for the answer the user asked to have in full.
+ */
+export const SAY_MAX_CHARS = 9000;
+/** What a `say` usually is: about 100 words. */
+export const SAY_BRIEF_CHARS = 600;
 
 export const WORK_EVENT_PREFIX = "[work_event]";
 
@@ -57,7 +72,7 @@ export const ROUTER_PROMPT = `You are the user's personal assistant. You talk to
 Nothing you write as plain text reaches the user. The only way to speak to the user is the say tool. If you do not call say, the user hears nothing.
 
 Tools (call each by its full name: ${TOOL_NAME_PREFIX} followed by the name below, for example ${TOOL_NAME_PREFIX}say)
-- say(text, item_id?): send the user a message. At most ${SAY_MAX_CHARS} characters (about 100 words); a longer text is refused, so write it shorter. Pass item_id when the message is about one work item, so the user can act on that item from the message.
+- say(text, item_id?): send the user a message. Keep it to about ${SAY_BRIEF_CHARS} characters (100 words). When the user needs a long answer (a list they asked for, a full result), say it whole, never cut short: up to ${SAY_MAX_CHARS} characters, which they get as up to three messages. Pass item_id when the message is about one work item, so the user can act on that item from the message.
 - work_create(title, brief, repo?): start a new work item and give it to a worker. title is at most 40 characters. brief is everything the worker needs, written as a self-contained task, because the worker cannot see this conversation: a few lines with the request and the names, links and constraints from the conversation, not a plan. It returns the new item's item_id and number.
 - work_send(item_id, text): forward a new instruction or the user's answer to the worker of an existing item. The item goes back to in_progress.
 - work_stop(item_id, reason): stop an item the user no longer wants.
@@ -69,12 +84,12 @@ Work calls and say
 work_create, work_send and work_stop change things, and any of them can be refused: the item may be finished, or the user may have too many open items. Call them without a say in the same step, wait for their results, and only then call say, telling the user what actually happened. A say written before the result would tell the user something that may not be true. If a call was refused, fix the call or tell the user plainly; never report it as done.
 
 How to handle a message
-1. A new request that needs doing: work_create. When it starts, the system tells the user at once that it has, with its number and title (the result says announced: true): do not say that again. Say only what that does not tell them, such as a model that fell back or a question; when the result says announced: false, say one short line that you have taken it on, with the number and title from the result.
+1. A new request that needs doing: work_create. When it starts, the system tells the user at once that it has, with its number and title (the result says announced: true): that is the turn's message, so say nothing more in the turn (a say after it is refused). When the result says announced: false, say one short line that you have taken it on, with the number and title from the result, and the model it fell back to when the result says fell_back_from.
 2. A message that clearly points at an existing item (its number, or what it is about): work_send; when its result is back, say that it was forwarded.
 3. A question about progress: answer from the work item list sent with the message. When the user asks how far an item got, what it is doing now or which of several is done, the list (in progress) is not enough: call work_recall(item, "reports") for each item asked about, all in one step, then say the answer (see Describing items).
 4. Chat or a question that needs no work: just say the answer.
    A request you will not carry out (it is unsafe, not allowed, or asks for internal addresses or secrets): say so in one short line, and what you can do instead. Never leave the user's message without an answer.
-5. A message that starts with ${WORK_EVENT_PREFIX} is a report from a worker, not something the user said. It is a fact about an item. Tell the user only what they need to decide, accept or know, in one message, passing the item's item_id to say (the user sees its number and title, never the id). Do not repeat the whole report. A report of kind answer is the answer to what the user asked: say it to them as the answer; the item is closed and there is nothing to accept.
+5. A message that starts with ${WORK_EVENT_PREFIX} is a report from a worker, not something the user said. It is a fact about an item. Tell the user only what they need to decide, accept or know, in one message, passing the item's item_id to say (the user sees its number and title, never the id). Do not repeat the whole report. A report of kind answer is the answer to what the user asked: say it to them as the answer; the item is closed and there is nothing to accept. When the report says the answer was already sent to the user in full, do not say it again: say nothing, or one short line only if they need to know something more.
 6. Speak on your own only when the user must decide something, a result is ready to accept, or an item failed. Do not narrate progress.
 7. You can never accept a result for the user. Accepting is a button the user presses. If the user says a result is fine, tell them to accept it from the message; if they want it changed, work_send what to change.
 8. Do not start a second item for work that already has one. If unsure, ask in one short say.
@@ -124,8 +139,11 @@ Name a work item to the user by its number and title, as in #12 修复登录超�
  * router-read-v5: v3 with GitHub read only by its own tools (never web_fetch of api.github.com, never another server's), research
  * searched again in other words before an answer or a question, and a failed lookup answered by another read or said plainly,
  * never turned into a work item.
+ * router-read-v6: v5, and where a GitHub binding counts (`CLAW_GITHUB_MCP_BINDING_ENABLED`) a user without GitHub tools is told the one
+ * step that connects it (`/github bind`), not only that it is not linked; worded so that a bound user whose binding could not be read
+ * (the identity provider down: the turn then has no GitHub tools either) is not told that they never connected it.
  */
-export const ROUTER_READ_PROMPT_VERSION = "router-read-v5";
+export const ROUTER_READ_PROMPT_VERSION = "router-read-v6";
 
 /**
  * The read section's citing (`CLAW_ASSISTANT_CITATIONS`), logged beside it when on.
@@ -141,6 +159,8 @@ export interface RouterLookupsShown {
   github: readonly string[];
   /** say cites its lookups (`citations.ts`); absent or false, it puts the links in its text, as before. */
   cite?: boolean;
+  /** A GitHub account bound with `/github bind` gives the user these tools (`CLAW_GITHUB_MCP_BINDING_ENABLED`). */
+  githubBinding?: boolean;
 }
 
 /** How say cites what a lookup returned, with citing on. */
@@ -151,7 +171,10 @@ When say tells the user something a lookup of this turn returned (a web page, a 
 const GITHUB_SEARCH = "mcp__github__issue_search finds pull requests and issues anywhere with GitHub search syntax (is:pr is:open author:@me is the user's open pull requests; add repo:owner/name or org:name to narrow; total_count is the number).";
 
 /** The GitHub line of the read section: the reads the turn has, by their full names. */
-function githubLookups(tools: readonly string[]): string {
+function githubLookups(tools: readonly string[], binding = false): string {
+  if (!tools.length && binding) {
+    return "- GitHub: no GitHub tools in this conversation: the user has not connected GitHub yet, or their connection could not be read just now. For a question about their GitHub, say in one line that their GitHub is not connected here or could not be read just now, and that if they have not connected it they do so once by sending /github bind to Clawy in Teams (or by keeping a GH_TOKEN in their Claw settings) and then ask again; never that you cannot use GitHub. A public page can still be read with web_fetch.";
+  }
   if (!tools.length) {
     return "- GitHub: no GitHub tools in this conversation (the user may not have linked a GitHub token in their Claw settings). For a question about their GitHub, say that in one line; a public page can still be read with web_fetch.";
   }
@@ -163,7 +186,7 @@ function githubLookups(tools: readonly string[]): string {
 /** What the router is told about its lookups: what each reaches, and that a question they answer is answered here, now. */
 export function renderRouterReadSection(lookups: RouterLookupsShown): string {
   const reach = [
-    githubLookups(lookups.github),
+    githubLookups(lookups.github, lookups.githubBinding),
     "- The web: web_search for current facts and news, web_fetch to read one page, whenever they are in your tool list.",
     ...(lookups.servers.length
       ? [`- The read tools of these servers: ${lookups.servers.map((s) => oneLine(s)).join(", ")}, called by their full name (mcp__<server>__<tool>).`]
@@ -214,7 +237,7 @@ export const ITEM_MEMORY_INTRO =
 
 export const ROUTER_REVIEW_PROMPT = `Reviews and settings
 These tools act for the user, with their GitHub account or their settings. They work only in a turn that answers a message the user just sent signed in; in a turn a ${WORK_EVENT_PREFIX} report started they are refused, so tell the user what you would do and let them say it.
-- review_start(prs, merge, reviewer?, model?, effort?): start reviewing pull requests, one review item each. prs are owner/repo#number, and only numbers the user wrote. At most 10 in one message: when the user names more, ask which to start with, and never split them over several calls. When the user gives only a number, use the one repository under Channel repos, else the one repository of their recent review items; if there is none or more than one, ask which repository. merge is true only when the user clearly asked for a merge (合入, 合并, merge, 审完合, approve and merge); review, check, 看一下, 审一下, 只审 mean merge=false; when unsure, ask in one short say. merge=true never merges by itself: each started item says merge_needs_confirmation, and the review asks the user to confirm the merge (the card's button or 批准 #<ref>), so never tell them it will be merged unasked. reviewer: leave it out for the user. A review by another person (their user_id from People) runs on their own credentials, which you cannot carry: when the user's chat can carry them the call answers handed_off, and the chat starts the review as that person and answers the user's message about it itself, in one message (whether it started, on which model, how it merges). Then say nothing about that review, neither before nor after the call: end the turn without say (a say after it is refused). If the user's message also asks something else, answer that with say before you call review_start. Otherwise it is refused with acting_as_credentials_required: tell the user where to ask for it, as the refusal says, or offer to review it as themselves. model only when the user named one (用 opus → opus); effort only when they asked.
+- review_start(prs, merge, reviewer?, model?, effort?): start reviewing pull requests, one review item each. prs are owner/repo#number, and only numbers the user wrote. At most 10 in one message: when the user names more, ask which to start with, and never split them over several calls. When the user gives only a number, use the one repository under Channel repos, else the one repository of their recent review items; if there is none or more than one, ask which repository. merge is true only when the user clearly asked for a merge (合入, 合并, merge, 审完合, approve and merge); review, check, 看一下, 审一下, 只审 mean merge=false; when unsure, ask in one short say. merge=true never merges by itself: each started item says merge_needs_confirmation, and the review asks the user to confirm the merge (the card's button or 批准 #<ref>), so never tell them it will be merged unasked. reviewer: leave it out for the user. A review by another person (their user_id from People) runs on their own credentials, which you cannot carry: when the user's chat can carry them the call answers handed_off, and the chat starts the review as that person and answers the user's message about it itself, in one message (whether it started, on which model, how it merges). Then say nothing in that turn, neither before nor after the call, even when the user asks to be told who has it: the chat's answer tells them. A say after it is refused, and a say before it in the same turn is never delivered, so the chat's answer is the one message. So when reviewer is someone else, call review_start alone, as the turn's only action that speaks, and end the turn as soon as it answers. Otherwise it is refused with acting_as_credentials_required: tell the user where to ask for it, as the refusal says, or offer to review it as themselves. model only when the user named one (用 opus → opus); effort only when they asked.
 - review_restart(item_id, model?, merge?, effort?): the user wants a review changed (another model, merge after all, review only) or run again. It stops the old item and starts a new one with the rest unchanged. It is refused once merged.
 - work_stop(item_id, reason) stops a review as well (like the tools above, only in a turn that answers the user), and cancels what waits for confirmation in it. If it answers merge_in_progress or already_merged, tell the user exactly that.
 - work_send does not reach a review: use review_restart.
@@ -233,7 +256,9 @@ Report as you go, and keep reports few:
 - report(kind="ready", summary, result?) when the work is done and can be checked. Put what to look at in result.refs (a pull request url, a commit sha, a run id) and say in the summary what was done and how you checked it. A result the user cannot check is not ready.
 - report(kind="failed", summary) when the work cannot be done; say why.
 - report(kind="dropped", summary) when the work turns out not to be needed.
-summary is at most ${REPORT_SUMMARY_MAX} characters. A report that is refused tells you why: fix it and report again.
+summary is at most ${REPORT_SUMMARY_MAX} characters, except an answer's: an answer is given whole, up to ${REPORT_ANSWER_MAX} characters, never cut short. An answer longer than that goes into a file you deliver (below), with the gist in the summary. A report that is refused tells you why: fix it and report again.
+
+Files: the user cannot open your workspace. Every file the user asked for or should keep (a report, a chart, a spreadsheet, a document) is handed over with deliver_file before you report; the user gets a download for each file you deliver. A path in a summary is not a file they have. Files the user sent are named in the task, under /workspace/.uploads/.
 
 Finish every run with a report of kind answer, ready, blocked, failed or dropped. Ending without one is read as ready with your last message as the summary, so say plainly in that message what was done.
 
@@ -335,12 +360,13 @@ export function formatManifestLine(item: ManifestItem): string {
 /** A review the user asked of someone else, as their router is shown it: its item_id and the four facts (`requester-view.ts`). */
 export interface AskedOfOtherLine {
   itemId: string;
-  view: { status: string; pr_url: string | null; verdict: string | null; merged: boolean };
+  view: { status: string; pr_url: string | null; verdict: string | null; merged: boolean; waiting_for?: string | null; findings?: number | null };
 }
 
 export function formatAskedOfOtherLine(a: AskedOfOtherLine): string {
   const v = a.view;
-  return `- item_id: ${a.itemId} | ${v.pr_url ? quoted(v.pr_url) : "(no pull request)"} | status: ${oneLine(v.status)} | verdict: ${v.verdict ? oneLine(v.verdict) : "none yet"} | merged: ${v.merged ? "yes" : "no"}`;
+  return `- item_id: ${a.itemId} | ${v.pr_url ? quoted(v.pr_url) : "(no pull request)"} | status: ${oneLine(v.status)} | verdict: ${v.verdict ? oneLine(v.verdict) : "none yet"} | merged: ${v.merged ? "yes" : "no"}`
+    + (v.waiting_for ? ` | waiting for: ${oneLine(v.waiting_for)}` : "") + (v.findings !== null && v.findings !== undefined ? ` | open findings: ${v.findings}` : "");
 }
 
 /**
@@ -436,8 +462,15 @@ export function renderWorkerSystem(item: { seq: number; title: string }): string
 /** The message that wakes the Router for a worker's report. It starts with the marker the Router prompt names. */
 export function formatWorkEvent(e: {
   itemId: string; seq: number; kind: ReportKind; version?: number; summary: string; question?: string | null;
+  /** The answer was already sent to the user whole (`answerSentWhole`): the router is told so, with its beginning only. */
+  sentInFull?: boolean;
 }): string {
   const head = `${WORK_EVENT_PREFIX} #${e.seq} (item_id: ${e.itemId}) ${e.kind}${e.kind === "ready" && e.version ? ` v${e.version}` : ""}`;
+  if (e.sentInFull) {
+    const summary = oneLine(e.summary);
+    const start = Array.from(summary).slice(0, SAY_BRIEF_CHARS).join("");
+    return `${head}: (already sent to the user in full; this is its beginning) ${start}${start.length < summary.length ? "…" : ""}`;
+  }
   return `${head}: ${oneLine(e.summary)}${e.question ? `\nQuestion for the user: ${oneLine(e.question)}` : ""}`;
 }
 

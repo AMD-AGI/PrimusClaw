@@ -247,9 +247,19 @@ export async function auditFinish(db: Queryable, id: number, f: AuditFinish): Pr
   );
 }
 
-/** What this session has already asked of GitHub. */
+/**
+ * The GitHub tools (`github-mcp/`) write their calls made with a GitHub binding to this log too, under the tool name `github_mcp.<tool>`.
+ * Those rows are an owner's own reads and approved writes, never a review: every count of reviews, and a review session's request
+ * budget, leaves them out with this condition.
+ */
+export const GITHUB_MCP_AUDIT_TOOL_PREFIX = "github_mcp.";
+export const REVIEW_ROWS_ONLY = `tool NOT LIKE '${GITHUB_MCP_AUDIT_TOOL_PREFIX}%'`;
+
+/** What this session has already asked of GitHub with the review tools. */
 export async function sessionRequestCount(db: Queryable, sessionId: string): Promise<number> {
-  const r = await db.query("SELECT COALESCE(SUM(github_requests), 0)::int AS n FROM claw_github_audit WHERE session_id = $1", [sessionId]);
+  const r = await db.query(
+    `SELECT COALESCE(SUM(github_requests), 0)::int AS n FROM claw_github_audit WHERE session_id = $1 AND ${REVIEW_ROWS_ONLY}`, [sessionId],
+  );
   return Number((r.rows[0] as { n: number }).n);
 }
 
@@ -281,7 +291,7 @@ export async function recentWrites(
     `SELECT COUNT(DISTINCT session_id || ':' || head_sha)::int AS n,
             COALESCE(BOOL_OR(session_id = $3 AND head_sha = $4 AND ($5::bigint IS NULL OR id <> $5)), FALSE) AS present
        FROM claw_github_audit
-      WHERE write AND NOT dry_run
+      WHERE write AND NOT dry_run AND ${REVIEW_ROWS_ONLY}
         AND at > NOW() - ($2::bigint * INTERVAL '1 millisecond')
         AND ($1::text IS NULL OR actor_user_id = $1)`,
     [actorUserId, sinceMs, pair?.sessionId ?? null, pair?.headSha ?? null, pair?.selfId ?? null],

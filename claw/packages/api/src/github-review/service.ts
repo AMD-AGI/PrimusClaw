@@ -1960,8 +1960,8 @@ export class GithubReview {
   }
 }
 
-/** The arguments as the audit log keeps them: names and sizes, not the text of a review. */
-function summarise(args: Record<string, unknown>): Record<string, unknown> {
+/** The arguments as the audit log keeps them: names and sizes, not the text of a review. Also the GitHub tools' (github-mcp/mcp.ts). */
+export function summarise(args: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(args)) {
     if (typeof v === "string") out[k] = k === "body" ? `[${v.length} characters]` : v.slice(0, 200);

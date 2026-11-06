@@ -878,9 +878,33 @@ async function replayPendingCallback(
   }
   if (!entry) return false;
 
+  // A cleared outbox is no pending callback. NATS KV answers a key deleted by
+  // ackAndClearCallback with its delete marker (operation DEL/PURGE, empty
+  // value) rather than null, and the marker stays until the bucket's TTL. It
+  // says an earlier execution of this task_id delivered its callback, not that
+  // this delivery's did: a script task that returned wait_external is put back
+  // to queued and published again under the same task_id to run from step 0,
+  // and an app run's finish is handed to a new Brain the same way. Either is a
+  // fresh execution, exactly as when the key was never written.
+  if (entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return false;
+
+  let stored: ExecuteResult & { run_time?: RunTimeReport };
   try {
-    const { run_time: runTime, ...result } = JSON.parse(sc.decode(entry.value)) as
-      ExecuteResult & { run_time?: RunTimeReport };
+    stored = JSON.parse(sc.decode(entry.value)) as ExecuteResult & { run_time?: RunTimeReport };
+  } catch (err) {
+    // deliverAgentDone writes only JSON, so this entry holds no result that can
+    // be replayed, and retrying cannot make it parse. Drop it and run this
+    // delivery as if nothing was pending, rather than failing every delivery
+    // until the message is poisoned.
+    logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_unreadable");
+    await kvCkpt.delete(key).catch((e) => {
+      logger.warn({ err: e, taskId: request.task_id }, "task.agent_done_outbox_cleanup_failed");
+    });
+    return false;
+  }
+
+  try {
+    const { run_time: runTime, ...result } = stored;
     await fx().postAgentDone(request, result, runTime);
     await ackAndClearCallback(msg, kvCkpt, request);
     logger.info({ taskId: request.task_id }, "task.agent_done_replayed");

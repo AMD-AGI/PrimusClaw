@@ -188,7 +188,7 @@ function assertGithubReviewConfig(): void {
 
 /** Refuse to serve the GitHub tools without the secret that signs their token. */
 function assertGithubMcpConfig(): void {
-  const errors = githubMcpConfigErrors(readGithubMcpSettings());
+  const errors = githubMcpConfigErrors(readGithubMcpSettings(), identityClient() !== null, readGithubReviewSettings().enabled);
   if (errors.length === 0) return;
   logger.error({ errors }, "startup.github_mcp_refused");
   throw new Error(`CLAW_GITHUB_MCP_ENABLED is true but the GitHub tools cannot be offered: ${errors.join("; ")}`);

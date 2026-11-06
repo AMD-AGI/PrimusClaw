@@ -66,7 +66,8 @@ test("P1 the router prompt names the router's five tools and nothing that accept
 
 test("P2 the router is told plain output reaches nobody, with the limit the server enforces", async () => {
   assert.match(ROUTER_PROMPT, /Nothing you write as plain text reaches the user/);
-  assert.match(ROUTER_PROMPT, new RegExp(`At most ${SAY_MAX_CHARS} characters`));
+  assert.match(ROUTER_PROMPT, new RegExp(`up to ${SAY_MAX_CHARS} characters, which they get as up to three messages`));
+  assert.match(ROUTER_PROMPT, /say it whole, never cut short/);
   const { SAY_TEXT_MAX } = await import("../src/assistant/outbound.js");
   assert.equal(SAY_MAX_CHARS, SAY_TEXT_MAX);
 });

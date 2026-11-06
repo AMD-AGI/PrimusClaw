@@ -1095,6 +1095,36 @@ export async function syncUploadsFromS3(
   return files.length;
 }
 
+/**
+ * One object's bytes, read by Brain itself (never by a sandbox): `null` when there is no such object, and
+ * `"too_large"` when it holds more than `maxBytes`, which is then not read past the bound.
+ */
+export async function readObjectBounded(key: string, maxBytes: number): Promise<Buffer | null | "too_large"> {
+  let got;
+  try {
+    got = await getS3Client().send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }));
+  } catch (err) {
+    const name = (err as { name?: string })?.name;
+    if (name === "NoSuchKey" || name === "NotFound") return null;
+    throw err;
+  }
+  if (got.ContentLength != null && got.ContentLength > maxBytes) {
+    (got.Body as { destroy?: () => void } | undefined)?.destroy?.();
+    return "too_large";
+  }
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of got.Body as AsyncIterable<Uint8Array>) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      (got.Body as { destroy?: () => void } | undefined)?.destroy?.();
+      return "too_large";
+    }
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
 // ===== Recovery: copy a checkpoint prefix back to the session prefix =====
 
 /**

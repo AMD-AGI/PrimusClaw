@@ -27,7 +27,7 @@ import { checkSessionCreate, proofForFirstMessageAgain, type AttendedProof } fro
 import { isValidPrRef, type PrRef } from "../github-review/github.js";
 import type { FollowRequest, ReviewActor, ReviewContinuation, ToolOutcome } from "../github-review/service.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
-import { closeConfirmationsForStop, type PostedReview } from "../github-review/store.js";
+import { REVIEW_ROWS_ONLY, closeConfirmationsForStop, type PostedReview } from "../github-review/store.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { queuedMessageId, SWEEPABLE_RUN_STATUSES, stopSessionRuns } from "../tasks/chat-run.js";
@@ -415,7 +415,8 @@ async function refuseOverLimit(q: StatementRunner, actingAs: string, wanted: num
   const count = async (actor: string | null): Promise<number> => Number(((await q.query(
     `SELECT COUNT(*)::int AS n FROM (
        SELECT session_id FROM claw_github_audit
-        WHERE write AND NOT dry_run AND at > NOW() - ($2::bigint * INTERVAL '1 millisecond') AND ($1::text IS NULL OR actor_user_id = $1)
+        WHERE write AND NOT dry_run AND ${REVIEW_ROWS_ONLY} AND at > NOW() - ($2::bigint * INTERVAL '1 millisecond')
+          AND ($1::text IS NULL OR actor_user_id = $1)
        UNION
        SELECT worker_session_id FROM claw_work_items
         WHERE kind = 'review' AND board_state <> 'done' AND ($1::text IS NULL OR params->>'acting_as' = $1) AND item_id IS DISTINCT FROM $3
@@ -783,6 +784,22 @@ export async function reviewRecord(q: StatementRunner, sessionId: string, params
     model: last ? params.model : (before as ReviewContinues).model,
     findings: [...carried, ...fresh].slice(-MAX_FINDINGS),
   };
+}
+
+/**
+ * Write the item's record of what its review posted (`params.record`) from the audit as it is now. The state sync does this on every
+ * change; a close that is not the sync's (the requester's stop) does it first, so that the view frozen then (`freezeRequesterView`) has
+ * what was posted up to that moment.
+ */
+export async function refreshReviewRecord(q: StatementRunner, itemId: string): Promise<void> {
+  const row = (await q.query(
+    "SELECT kind, worker_session_id, params FROM claw_work_items WHERE item_id = $1 AND kind = 'review'", [itemId],
+  )).rows[0] as Record<string, unknown> | undefined;
+  const params = row ? readParams(row) : null;
+  if (!row || !params) return;
+  const record = await reviewRecord(q, row.worker_session_id as string, params);
+  if (JSON.stringify(record) === JSON.stringify((row.params as Record<string, unknown> | null)?.record ?? null)) return;
+  await q.query("UPDATE claw_work_items SET params = params || jsonb_build_object('record', $2::jsonb) WHERE item_id = $1", [itemId, JSON.stringify(record)]);
 }
 
 /** What a re-review of `row`'s pull request continues: its record, named by the item; null when it posted nothing to continue. */

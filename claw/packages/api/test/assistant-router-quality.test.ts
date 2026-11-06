@@ -11,7 +11,7 @@
  *   Q4 work_create tells the user at once that the item started, in their language, once, only for a turn that answers them
  *   Q5 a router turn its model answered with nothing is told to the user as declined, not as "did not go through"
  *   Q6 each router turn that answers the user logs how soon it was first heard, last heard, and whether it started an item
- *   Q7 the router's prompt says each of the rules of router-v10 and router-read-v5
+ *   Q7 the router's prompt says each of the rules of router-v10 and router-read-v6
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -125,6 +125,27 @@ describe("router quality, through the tools", { skip }, () => {
     assert.equal((await says()).length, 2);
   });
 
+  test("Q4b a turn whose item's start the system told says nothing more: one message, not the notice and a repeat of it", async () => {
+    // 2026-11-06 gate: "已开始：#N …" from the system, then the router's own "任务已建好…" beside it, every time.
+    const turn = await turnFor("帮我新建一个任务：写一份 Kubernetes 调度器简介");
+    // A line before the item is made is not a repeat of a notice that has not been told yet.
+    assert.equal((await w.mod.tools.say(turn as never, { text: "好的，这就建。" }, w.sayDeps)).ok, true);
+    const created = await w.mod.tools.workCreate(turn as never, { title: "Kubernetes 调度器简介", brief: "write it" }, w.sayDeps);
+    assert.equal(created.announced, true);
+    await assert.rejects(w.mod.tools.say(turn as never, { text: `任务已建好：#${created.seq} Kubernetes 调度器简介。` }, w.sayDeps), (err: any) => {
+      assert.equal(err.code, "already_announced");
+      return true;
+    });
+    // Nor does the turn's own final text go out in its place.
+    await w.closeRun(turn.task_id);
+    const end = { sessionId: alice.routerSid, runIds: [turn.task_id], messageId: turn.mid, failed: false, interrupted: false };
+    assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, finalText: "任务已建好。" }, w.sayDeps), "skipped");
+    assert.deepEqual((await says()).map((r: any) => r.text), ["好的，这就建。", `已开始：#${created.seq} Kubernetes 调度器简介。有结果或需要你时我会告诉你。`]);
+    // The next turn speaks as always.
+    const next = await turnFor("它开始了吗");
+    assert.equal((await w.mod.tools.say(next as never, { text: `#${created.seq} Kubernetes 调度器简介 在进行。` }, w.sayDeps)).ok, true);
+  });
+
   test("Q5 a turn whose model answered nothing is told as declined; any other failure as not gone through", async () => {
     const ended = async (prompt: string, finalText: string) => {
       const turn = await turnFor(prompt);
@@ -152,8 +173,9 @@ describe("router quality, through the tools", { skip }, () => {
   test("Q6 each router turn answering the user is timed: first and final reply, replies, items started", async () => {
     const turn = await turnFor("帮我修一下构建");
     await w.q("UPDATE claw_tasks SET created_at = NOW() - interval '3 seconds' WHERE task_id = $1", [turn.task_id]);
+    // The quick first line, then the item, whose start the system tells (nothing is said after it: Q4b).
+    await w.mod.tools.say(turn as never, { text: "这就修。" }, w.sayDeps);
     await w.mod.tools.workCreate(turn as never, { title: "修构建", brief: "fix the build" }, w.sayDeps);
-    await w.mod.tools.say(turn as never, { text: "用的是默认模型。" }, w.sayDeps);
     const timing = await w.mod.routerTurnEnd.routerTurnTiming({ sessionId: alice.routerSid, runIds: [turn.task_id], failed: false, interrupted: false });
     assert.ok(timing);
     assert.equal(timing.replies, 2);
@@ -211,14 +233,15 @@ describe("router quality, pure", () => {
 });
 
 describe("router quality, the prompt", () => {
-  test("Q7 router-v10 and router-read-v5 say each rule", async () => {
+  test("Q7 router-v10 and router-read-v6 say each rule", async () => {
     const p = await import("../src/assistant/prompts.js");
-    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v10");
-    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v5");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v13");
+    // router-v12 (this rule set, a long answer said whole, nothing after the start notice); its review prompt is router-v15.
+    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v12");
+    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v6");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v15");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
-      ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): do not say that again/],
+      ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): that is the turn's message, so say nothing more in the turn/],
       ["a quick first line", /put one short line that you are on it \(查一下 \/ Checking now\) in the first step, as a say beside the lookups/],
       ["lookups of a step at once", /Make every lookup a step needs in that one step, side by side/],
       ["GitHub only by its tools", /read with these mcp__github__ tools only: never with web_fetch of api\.github\.com or a github\.com page they read, and never with another server's tools \(the agent board is not GitHub\)/],
