@@ -419,7 +419,7 @@ export interface ReviewContext {
   confirmations: Array<{ id: string; repo: string; pr: number; kind: string; expires_at: Date | string }>;
   reviewMode: string;
   /** What the channel sent with the message this turn answers; empty for a turn a report started. */
-  people: Array<{ name: string; user_id?: string }>;
+  people: Array<{ name: string; user_id?: string; email?: string; aliases?: string[] }>;
   actions: Array<{ name: string; usage?: string; summary?: string }>;
   repos: string[];
 }
@@ -430,8 +430,13 @@ export function renderReviewState(c: ReviewContext): string {
   const waiting = c.confirmations.length
     ? c.confirmations.map((x) => `- ref #${confirmationRef(x.id)} | confirmation_id: ${x.id} | ${x.kind === "review" ? "approval" : "merge"} of ${oneLine(x.repo)}#${x.pr} | expires ${iso(x.expires_at)} | the user lets it through with: 批准 #${confirmationRef(x.id)}`).join("\n")
     : "(nothing)";
+  // A person's address and other handles are shown beside their name: two people with one name (`确认 Wei, Lei (weil2)`) are told
+  // apart by them, as the reply that picks one (`reviewerReply`) writes it.
+  const handles = (p: ReviewContext["people"][number]): string =>
+    [...(p.email ? [`email: ${oneLine(p.email)}`] : []), ...(p.aliases?.length ? [`also: ${p.aliases.map(oneLine).join(", ")}`] : [])]
+      .map((h) => `, ${h}`).join("");
   const people = c.people.length
-    ? c.people.map((p) => `- ${oneLine(p.name)}${p.user_id ? ` (user_id: ${oneLine(p.user_id)})` : " (not linked: cannot review as them)"}`).join("\n")
+    ? c.people.map((p) => `- ${oneLine(p.name)}${p.user_id ? ` (user_id: ${oneLine(p.user_id)}${handles(p)})` : ` (not linked: cannot review as them${handles(p)})`}`).join("\n")
     : "(none)";
   const actions = c.actions.length
     ? c.actions.map((a) => `- ${oneLine(a.name)}${a.usage ? ` | usage: ${oneLine(a.usage)}` : ""}${a.summary ? ` | ${oneLine(a.summary)}` : ""}`).join("\n")

@@ -881,6 +881,8 @@ record it.
   `mn.safe_lookup_failed`. When the unscoped list is refused with 403, teardown and the multi-node idle sweep now list in
   the workspace the session recorded (its `hands.<sid>` binding's `namespace`), one list per workspace when there are several;
   a key that may read the unscoped list (an admin's) keeps reaching every workspace.
+- The assistant router sees each person a message names with their address and other handles beside their user id (`People in
+  this message`), so it can pick one of two people with the same name from the reply that names them (`确认 Wei, Lei (weil2)`).
 - The GitHub list reads (`issue_search`, `pr_list`, `issue_list`, `repo_list`, `code_search`) answer the whole list a question
   asks for: `{ total_count, shown, complete, next_page?, items }`, pages of 50 by default (up to 100), and an answer of at most
   `GITHUB_LIST_MAX_CHARS` that Brain keeps whole (any other result is still cut to its head and tail at 6000 characters, which
