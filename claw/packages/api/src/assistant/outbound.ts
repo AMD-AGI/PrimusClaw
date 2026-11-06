@@ -213,7 +213,7 @@ export function setCapNoticeHourForTest(hook: ((hour: number) => number | Promis
  * -- see each other's notice instead of storing one each.
  */
 async function storeCapNotice(input: SayInput, text: string): Promise<Stored | null> {
-  return inTransaction(async (q) => {
+  return storeSettled(async (q, storeOne) => {
     await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
     const read = Number((await q("SELECT floor(extract(epoch FROM clock_timestamp()) / 3600)::bigint AS h")).rows[0].h);
     const hour = capNoticeHourHook ? await capNoticeHourHook(read) : read;
@@ -223,11 +223,11 @@ async function storeCapNotice(input: SayInput, text: string): Promise<Stored | n
       [ids],
     );
     if (told.rowCount) return null;
-    return store(q, {
+    return storeOne({
       type: "assistant.say", fallback: true, item: null, sayId: ids[0],
       userId: input.userId, sessionId: input.sessionId, text: sayCapNotice(text),
     });
-  }, { retryOnFailover: true });
+  });
 }
 
 /** What the user is told when the cap first refuses the assistant a message: short, in the language of that message. */
@@ -302,6 +302,36 @@ async function storedAfterAll(m: ToStore): Promise<Stored | null> {
 }
 
 /**
+ * A transaction that ends by storing one message, with what a failover can leave unsettled settled: a COMMIT that took
+ * effect and whose answer was lost. The message `run` stored is then looked up ({@link storedAfterAll}) and, when it is
+ * there, returned as if the COMMIT had answered, for the caller to announce -- a message stored and never announced is
+ * one a web client never sees, and one a later call finds stored and takes as told. Retried on a failover the way
+ * `inTransaction` retries a transaction that says it may run twice.
+ */
+async function storeSettled(
+  run: (q: Querier, storeOne: (m: ToStore) => Promise<Stored | null>) => Promise<Stored | null>,
+): Promise<Stored | null> {
+  let inserted: ToStore | null = null;
+  try {
+    return await inTransaction(async (q) => {
+      inserted = null;
+      return run(q, async (m) => {
+        const out = await store(q, m);
+        if (out) inserted = m;
+        return out;
+      });
+    }, { retryOnFailover: true });
+  } catch (err) {
+    const pending = inserted as ToStore | null;
+    if (!pending || !isFailoverError(err)) throw err;
+    const stored = await storedAfterAll(pending);
+    if (!stored) throw err;
+    logger.warn({ sayId: stored.sayId, code: (err as { code?: unknown }).code }, "assistant.say_commit_answer_lost");
+    return stored;
+  }
+}
+
+/**
  * Record a message the assistant chose to say. Throws {@link SayRefused} for an
  * empty or over-long text, for an item that is not this user's or is not named as
  * an item is (`item-ref.ts`), and for a user who
@@ -316,10 +346,9 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
 
   // One id for every attempt: what tells, after a failover took the COMMIT's answer, whether the message was stored.
   const sayId = randomUUID();
-  let storing: ToStore | null = null;
   let stored: Stored | null;
   try {
-    stored = await inTransaction(async (q) => {
+    stored = await storeSettled(async (q, storeOne) => {
       await input.guard?.(q);
       // One say at a time per user: the cap counts stored rows, and without this a burst
       // all count the same number and all insert.
@@ -338,18 +367,11 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
         [input.userId],
       )).rows[0].n);
       if (recent >= limit) throw new SayCapped(limit);
-      storing = { type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item };
-      return store(q, storing);
-    }, { retryOnFailover: true });
+      return storeOne({ type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item });
+    });
   } catch (err) {
     if (err instanceof SayCapped) throw await refusedByCap(input, text, err, deps);
-    // A failover can end the connection after its COMMIT took effect and before the answer came back. Then the message
-    // is stored and queued, and a fault would have the model say it again: the database is asked, and a message it
-    // has is announced and answered as said.
-    if (!storing || !isFailoverError(err)) throw err;
-    stored = await storedAfterAll(storing);
-    if (!stored) throw err;
-    logger.warn({ sayId, code: (err as { code?: unknown }).code }, "assistant.say_commit_answer_lost");
+    throw err;
   }
   if (!stored) throw new Error("a fresh say id was already stored");
   await announce(stored, deps, input.turnMessageId);
@@ -378,7 +400,7 @@ function needsYouText(item: ItemRow): string {
  * user before the call got here. Not counted against the say limit.
  */
 export async function recordNeedsYouFallback(input: { itemId: string }, deps: SayDeps = {}): Promise<SayOutcome | null> {
-  const stored = await inTransaction(async (q) => {
+  const stored = await storeSettled(async (q, storeOne) => {
     const item = await loadItem(q, input.itemId);
     const answered = item?.board_state === "done" && item.outcome === "answered";
     if (!item || (item.board_state !== "needs_you" && !answered)) return null;
@@ -389,7 +411,7 @@ export async function recordNeedsYouFallback(input: { itemId: string }, deps: Sa
         )).rows[0]?.summary as string | undefined) ?? ""
       : "";
     const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id ?? null;
-    return store(q, {
+    return storeOne({
       type: "work_item.needs_you",
       sayId: deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq)),
       userId: item.user_id,
@@ -397,7 +419,7 @@ export async function recordNeedsYouFallback(input: { itemId: string }, deps: Sa
       text: answered ? `#${item.seq} "${item.title}": ${answer}` : needsYouText(item),
       item,
     });
-  }, { retryOnFailover: true });
+  });
   if (!stored) return null;
   await announce(stored, deps);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
@@ -410,11 +432,11 @@ export async function recordNeedsYouFallback(input: { itemId: string }, deps: Sa
 export async function recordSystemNotice(
   input: { userId: string; sessionId: string; text: string; key: string }, deps: SayDeps = {},
 ): Promise<SayOutcome | null> {
-  const stored = await inTransaction((q) => store(q, {
+  const stored = await storeSettled((_q, storeOne) => storeOne({
     type: "assistant.say", fallback: true, item: null,
     sayId: deterministicEventId("assistant.notice", input.userId, input.key),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
-  }), { retryOnFailover: true });
+  }));
   if (!stored) return null;
   await announce(stored, deps);
   return { say_id: stored.sayId, subscribers: stored.subscribers };

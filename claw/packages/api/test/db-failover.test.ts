@@ -29,8 +29,10 @@
  *       not to say it again, the web client is told, and the message is stored once
  *   F9  the same, while the database cannot be asked: the Router is told the outcome is unknown and not to say it again,
  *       and the turn's final words are not delivered on top of the stored message
- *   F10 a caller that checks a connection out of the advisory-lock pool itself gets one made since the failover, and,
- *       for a while after it, one whose server says it is not in recovery
+ *   F10 a caller that checks a connection out of the advisory-lock pool itself gets one made since the failover, and
+ *       one whose server says it is not in recovery
+ *   F11 the say cap's notice whose COMMIT took effect and whose answer the failover lost: the web client is told, once,
+ *       and the Router hears the user was told
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -329,5 +331,21 @@ describe("database failover", { skip }, () => {
     } finally {
       client.release();
     }
+  });
+
+  test("F11 the cap's notice whose COMMIT took effect and whose answer the failover lost: announced, once", async () => {
+    const turn = await w.routerTurn(alice);
+    const capped = { ...w.sayDeps, maxPerHour: 1 };
+    assert.equal((await w.mod.tools.say(turn as never, { text: "First." }, capped)).ok, true);
+    w.events.length = 0;
+    // At the cap the say's own transaction rolls back, so the first COMMIT is the notice's.
+    const { out, cut } = await commitAnswerLost(() => w.mod.tools.say(turn as never, { text: "Second." }, capped).then(
+      () => ({ code: "said", message: "" }), (err: { code?: string; message?: string }) => ({ code: err.code, message: err.message ?? "" })));
+    assert.equal(cut, 1, "the notice's COMMIT answer was lost");
+    assert.equal(out.code, "say_rate_limited");
+    assert.match(out.message, /has been told/);
+    const notices = await w.q("SELECT say_id, text FROM claw_assistant_says WHERE fallback");
+    assert.deepEqual(notices.map((n) => n.text), [w.mod.outbound.sayCapNotice("Second.")]);
+    assert.deepEqual(w.events.map((e) => e.say_id), [notices[0].say_id], "the web client is told, once");
   });
 });

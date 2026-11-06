@@ -742,8 +742,9 @@ record it.
   and grants advisory locks that fence nothing. A statement is sent once more on a new connection, after `PG_FAILOVER_RETRY_DELAY_MS` (default 1000), when
   running it twice is the same as running it once: Postgres refused it before it ran (`25006`, `57P03`), or it only
   reads. A transaction that says it may run twice is retried the same way, and also when its connection went before
-  its `COMMIT` was sent; every way the assistant stores a message says so. A `say` whose `COMMIT` took effect but whose
-  answer the failover lost is looked up, announced and reported as said; one that cannot be looked up is reported as
+  its `COMMIT` was sent; every way the assistant stores a message says so. A message whose `COMMIT` took effect but
+  whose answer the failover lost (a `say`, the cap's notice, a system notice, a needs-you message) is looked up,
+  announced and reported as stored; a `say` that cannot be looked up is reported as
   `say_outcome_unknown`, and the Router ends the turn with the words instead of saying them again (they are delivered
   only if the turn has not spoken). So the only `say` that faults is one that was not stored; it tells the Router the
   message was not delivered and to call `say` again. Delivering a Router turn's unsaid answer is tried three times
