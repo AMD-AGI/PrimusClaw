@@ -484,7 +484,17 @@ async function cmdLogout(ctx: Ctx): Promise<number> {
     if (!creds) {
       notRevoked = credsProblem ? `the sign-in on this machine is unreadable (${credsProblem})` : "this machine is not signed in";
     } else {
+      // Only to the server this sign-in is for, as `run` resolves it (and `run` ignores a stored id for another server):
+      // a key or an access token sent to the server of an earlier sign-in would hand it a credential for this one.
+      let server: string | null = null;
       try {
+        let cfg: ConnectorConfig | null = null;
+        try { cfg = loadCfg(ctx); } catch (e) { if (!(e instanceof ConfigError)) throw e; }
+        server = serverUrl(ctx, undefined, cfg, creds);
+      } catch { /* no usable server: nothing is sent */ }
+      if (server !== row.server) {
+        notRevoked = `it was registered at ${row.server}, but this sign-in is for ${server ?? "no usable server"}, so nothing was sent to either`;
+      } else try {
         const tokens = providerFor(creds, (c) => { latest = c; saveCredentials(file, c); }, { fetch: ctx.fetch });
         const client = new ClawClient({ server: row.server, tokens, fetch: ctx.fetch, requestTimeoutMs: 15_000 });
         await client.revoke(row.connector_id, creds.kind);

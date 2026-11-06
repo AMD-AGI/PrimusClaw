@@ -616,6 +616,39 @@ describe("claw-connector commands", () => {
       } finally { await claw.close(); await id.close(); }
     });
 
+    test("a row stored for another server than this sign-in's: no credential is sent to either server, said so, exit not 0", async () => {
+      const a = await FakeClaw.start();
+      const b = await FakeClaw.start();
+      const id = await FakeIdentity.start();
+      try {
+        for (const kind of ["key", "device"] as const) {
+          const home = tmpdir();
+          const c = ctx(home);
+          // Signed in to A and ran there; then signed in to B.
+          assert.equal(await main(["login", "--server", a.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+          seedIdentity(c.c.dirs, a.url, a.connectorId);
+          if (kind === "key") {
+            b.tokens.add("key-b");
+            assert.equal(await main(["login", "--server", b.url, "--key", "key-b"], ctx(home).c), EXIT.ok);
+          } else {
+            id.refreshTokens.add("rb");
+            deviceCreds(c.c.dirs, b.url, id.url, "rb");
+          }
+          a.requests.length = 0;
+          b.requests.length = 0;
+          assert.equal(await main(["logout"], c.c), EXIT.failure, kind);
+          assert.deepEqual(a.requests, [], `${kind}: nothing reached A, so B's credential was not handed to it`);
+          assert.deepEqual(b.requests, [], `${kind}: nor B, which never had this row`);
+          assert.equal(a.revoked, false);
+          assert.match(c.errText(), new RegExp(`connector ${a.connectorId} was NOT revoked at Claw \\(it was registered at ${a.url}, but this sign-in is for ${b.url}`));
+          assert.ok(c.errText().includes(`${a.url}/v1/remote-agents/connectors/${a.connectorId}`), c.errText());
+          assert.doesNotMatch(c.text() + c.errText(), /key-b|good-token|access-/);
+          assert.equal(storedId(c.c.dirs).connector_id, a.connectorId);
+          assert.equal(fs.existsSync(credentialsFile(c.c.dirs)), false);
+        }
+      } finally { await a.close(); await b.close(); await id.close(); }
+    });
+
     test("a row Claw already revoked (or never had for this account) is reported and forgotten, and is a clean sign-out", async () => {
       const claw = await FakeClaw.start();
       try {
