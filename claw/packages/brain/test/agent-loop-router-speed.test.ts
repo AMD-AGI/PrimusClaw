@@ -204,3 +204,18 @@ test("the read-only lookups a request names run side by side; anything else afte
   assert.equal(serial.most, 1);
   assert.deepEqual(serial.routed, ["mcp__safe__node_list", "mcp__safe__workload_list", "mcp__assistant__work_create"]);
 });
+
+test("a call's deltas go out in order even when an earlier publish is slow, and all of them before the call runs", async () => {
+  const delivered: string[] = [];
+  // The first publish stalls (a retried JetStream publish); the later, longer texts must not overtake it.
+  const t = new ToolTextThrottle(new Set([SAY]), 20, async ({ text }) => {
+    if (text === "A") await sleep(150);
+    delivered.push(text);
+  });
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "A" });
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "AB" });
+  await sleep(40);
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "ABC" });
+  await t.flush();
+  assert.deepEqual(delivered, ["A", "AB", "ABC"]);
+});

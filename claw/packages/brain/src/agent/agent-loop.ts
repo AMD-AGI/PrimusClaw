@@ -79,15 +79,17 @@ export const TOOL_TEXT_DELTA_INTERVAL_MS = 400;
  * at most once every `intervalMs`, each time with the text so far. Text that arrives inside an interval is not dropped: it is
  * published when the interval ends (trailing edge), and whatever is still unpublished when the model's turn ends is published
  * by `flush`, before the call runs. So the last delta of a call is always its whole text, and a text that took longer to write
- * than its first fragment is published at least twice. A publish that fails is logged by `publish` and nothing else, since the
- * call's whole input still arrives with the turn.
+ * than its first fragment is published at least twice. A call's publishes go out one after another, in order, and `flush` waits
+ * for them all. A publish that fails is logged by `publish` and nothing else, since the call's whole input still arrives with the
+ * turn.
  */
 export class ToolTextThrottle {
   private readonly lastAt = new Map<string, number>();
   private readonly published = new Map<string, string>();
   private readonly pending = new Map<string, { name: string; text: string }>();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly inflight = new Set<Promise<void>>();
+  /** Per call, the publish sent last: each waits for the one before it, so a slow (retried) publish is never overtaken. */
+  private readonly chains = new Map<string, Promise<void>>();
   private closed = false;
   readonly options: StreamTurnOptions;
 
@@ -121,8 +123,8 @@ export class ToolTextThrottle {
     if (this.published.get(id) === text) return;
     this.lastAt.set(id, Date.now());
     this.published.set(id, text);
-    const p = this.publish({ id, name, text }).finally(() => this.inflight.delete(p));
-    this.inflight.add(p);
+    // In order: a reader shows the last delta it got, and an earlier prefix arriving after the whole text would roll it back.
+    this.chains.set(id, (this.chains.get(id) ?? Promise.resolve()).then(() => this.publish({ id, name, text })).catch(() => {}));
   }
 
   /** The turn is whole: publish what is pending now, and wait for every publish so far. */
@@ -131,7 +133,7 @@ export class ToolTextThrottle {
     this.timers.clear();
     for (const [id, p] of [...this.pending]) this.send(id, p.name, p.text);
     this.closed = true;
-    await Promise.all([...this.inflight]);
+    await Promise.all([...this.chains.values()]);
   }
 
   /** The attempt failed: publish nothing more of it. */
