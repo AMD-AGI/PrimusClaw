@@ -17,7 +17,7 @@ import { filterToRegExp } from "./nats-kv-stub.js";
 import fs from "node:fs";
 import { secretValuesOf } from "../src/apps/app-env.js";
 import { applyPlatformKeyEnv } from "../src/sandbox/params.js";
-import { appModelKeyEnv, ensureAppSandbox, readSandboxNodeName, type AppSandboxRun } from "../src/apps/app-sandbox.js";
+import { appModelKeyEnv, appStartEnv, ensureAppSandbox, readSandboxNodeName, type AppSandboxRun } from "../src/apps/app-sandbox.js";
 import { SANDBOX_DEFAULT_TIMEOUT_SECONDS } from "../src/config.js";
 import { workloadTimeoutSeconds } from "../src/sandbox/safe-workload-provider.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
@@ -464,6 +464,24 @@ test("the start command gets the two model variables Hands gets, and no SAFE_API
   for (const k of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]) assert.equal(env[k], hands[k], k);
   assert.ok(!("SAFE_API_KEY" in env), "only the two model variables are set, not a SAFE_API_KEY");
   assert.deepEqual(appModelKeyEnv(undefined), {});
+});
+
+test("a spec's own credentials stay out of the workload and reach the start command; its plain settings stay in the workload", async () => {
+  const safe = fakeSafe();
+  const r = run({ platformKey: "ak-owner" });
+  r.sandboxSpec = { ...r.sandboxSpec, env: { API_TOKEN: "spec-secret", DB_URL: "postgres://u:spec-pw@db/x", PLAIN: "1" } };
+  await ensureAppSandbox(r, { fetch: safe.fetch, recordWorkloadId: async () => {} });
+  const env = safe.created[0]!.env;
+  assert.ok(!("API_TOKEN" in env) && !("DB_URL" in env), "no credential of the spec's in the workload");
+  assert.equal(env.PLAIN, "1");
+  const start = appStartEnv(r.sandboxSpec, { APP_SETTING: "a", PLAIN: "from-app" }, "ak-owner");
+  assert.deepEqual(start, {
+    API_TOKEN: "spec-secret", DB_URL: "postgres://u:spec-pw@db/x", APP_SETTING: "a", PLAIN: "from-app",
+    ANTHROPIC_API_KEY: "ak-owner", OPENAI_API_KEY: "ak-owner",
+  });
+  const planted = appStartEnv({ env: { ANTHROPIC_API_KEY: "spec-key", SAFE_API_KEY: "planted" } }, { ANTHROPIC_API_KEY: "app-key" }, "ak-owner");
+  assert.equal(planted.ANTHROPIC_API_KEY, "ak-owner", "the platform's key is laid last");
+  assert.ok(!("SAFE_API_KEY" in planted), "a spec cannot plant SAFE_API_KEY");
 });
 
 test("a spec can supply neither a model key nor SAFE_API_KEY to the workload", async () => {

@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, writeFile, readFile, chmod, stat, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, chmod, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -691,6 +691,17 @@ test("the shell expands the request env into the env file and the launched proce
   assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { HF_TOKEN: "it's \"quoted\"\n$(nope)" });
 });
 
+/** Content and permission bits read through one handle, so both describe the same file. */
+async function readWithMode(p: string, dirOnly = false): Promise<{ text: string; mode: number }> {
+  const fh = await open(p, "r");
+  try {
+    const mode = (await fh.stat()).mode & 0o777;
+    return { text: dirOnly ? "" : await fh.readFile("utf8"), mode };
+  } finally {
+    await fh.close();
+  }
+}
+
 /**
  * The environment, credentials included, no longer travels in the SaFE workload (sandbox/workload-env.ts), so a Hands restarted in
  * place cannot inherit it from the container: bootstrap keeps a private copy, and a restart puts it back.
@@ -705,15 +716,17 @@ test("the env file keeps a private restart copy without the Hands token, and a r
   });
   const write = writeEnvFileCmd({ HF_TOKEN: "hf-secret", AUTH_CLAW_TOKEN: "t".repeat(64), AUTH_INTERNAL_TOKEN: "legacy" }, copy);
   assert.equal(await run(write.cmd, write.env), 0);
-  assert.deepEqual(JSON.parse(await readFile(copy, "utf8")), { HF_TOKEN: "hf-secret" },
+  const written = await readWithMode(copy);
+  assert.deepEqual(JSON.parse(written.text), { HF_TOKEN: "hf-secret" },
     "the token travels with each start command and is never written to disk");
-  assert.equal((await stat(copy)).mode & 0o777, 0o600);
-  assert.equal((await stat(path.join(dir, "state"))).mode & 0o777, 0o700);
+  assert.equal(written.mode, 0o600);
+  assert.equal((await readWithMode(path.join(dir, "state"), true)).mode, 0o700);
 
   await rm(target, { force: true }); // Hands read and unlinked it
   assert.equal(await run(`${restoreEnvFileCmd(copy)} exit 0`), 0);
-  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { HF_TOKEN: "hf-secret" });
-  assert.equal((await stat(target)).mode & 0o777, 0o600);
+  const restored = await readWithMode(target);
+  assert.deepEqual(JSON.parse(restored.text), { HF_TOKEN: "hf-secret" });
+  assert.equal(restored.mode, 0o600);
 
   // A sandbox bootstrapped before the copy existed still has its environment in the pod spec: an empty file, consumed like any other.
   await rm(target, { force: true });
@@ -722,7 +735,7 @@ test("the env file keeps a private restart copy without the Hands token, and a r
 });
 
 test("a restart (no environment from the caller) restores the copy before every source and tells Hands where it is", async () => {
-  const r = recorder([ok, fail("in-image too old"), ok]);
+  const r = recorder([ok, ok]);
   await bootstrapHandsInSandbox(r.exec, SESSION, PORT, TOKEN);
   const starts = startAttempts(r.cmds);
   assert.ok(starts.length >= 1);
