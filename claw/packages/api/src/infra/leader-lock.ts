@@ -88,6 +88,7 @@ export const LEADER_LOCK_IDS = {
   uploadSweep: 8_264_179_233_102,
   sessionCleanup: 8_264_179_233_103,
   sessionRetention: 8_264_179_233_104,
+  legacyEventIds: 8_264_179_233_105,
 } as const;
 
 /**

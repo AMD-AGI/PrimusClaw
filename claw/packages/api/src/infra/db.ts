@@ -9,6 +9,7 @@ import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
 import { ensureGithubReviewSchema } from "../github-review/store.js";
+import { lockBoundedMigrationClient, type MigrationLockPolicy } from "./migration-guard.js";
 import { terminalTicketsSchemaSql } from "../terminal/schema.js";
 import pino from "pino";
 import {
@@ -1368,9 +1369,22 @@ export async function ensureChatTurnClaimIndex(client: pg.PoolClient): Promise<v
   logger.error({ attempts: CHAT_TURN_INDEX_ATTEMPTS }, "db.chat_turn_index_attempts_exhausted");
 }
 
+/**
+ * How long one startup DDL statement may wait for its table lock, and how often
+ * it tries. See `infra/migration-guard.ts`: without a bound, a statement queued
+ * behind one open transaction holds up every query on that table, the serving
+ * replicas' included, for as long as that transaction lasts.
+ */
+export const MIGRATION_LOCK_POLICY: MigrationLockPolicy = {
+  lockTimeoutMs: envInt("PG_MIGRATION_LOCK_TIMEOUT_MS", 3_000, { min: 1 }),
+  attempts: envInt("PG_MIGRATION_LOCK_ATTEMPTS", 10, { min: 1 }),
+  backoffMs: 500,
+  maxBackoffMs: 4_000,
+};
+
 /** Run schema migrations on startup. */
 export async function initDb(): Promise<void> {
-  const client = await pool.connect();
+  const client = lockBoundedMigrationClient(await pool.connect(), MIGRATION_LOCK_POLICY);
   try {
     await client.query(`SET statement_timeout = ${MIGRATION_STATEMENT_TIMEOUT_MS}`);
     await client.query("SELECT pg_advisory_lock($1)", [SCHEMA_MIGRATION_LOCK_ID]);
@@ -1409,6 +1423,16 @@ export async function initDb(): Promise<void> {
         data        JSONB DEFAULT '{}'::jsonb,
         created_at  TIMESTAMPTZ DEFAULT NOW(),
         deleted_at  TIMESTAMPTZ
+      )
+    `);
+
+    // One row per one-time data migration that has finished, so a start that
+    // finds its row skips the pass instead of re-reading a table to find out
+    // there is nothing left to do (events/legacy-event-ids.ts).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_schema_markers (
+        name     TEXT PRIMARY KEY,
+        done_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
 
