@@ -11,6 +11,7 @@
  *   D2 the vault comes first: a GH_TOKEN is used and the identity provider is not asked
  *   D3 a read with the binding: the bound token goes to GitHub, the provider is told which tool, the call is in the audit log
  *   D4 a write with the binding: the same entry policy (held for the user), and an audit row that keeps no body text
+ *   D4c every write the server lists (#324's checks_rerun_failed, pr_request_reviewers, labels_set too): held, then run on the binding and audited
  *   D5 a call whose audit row cannot be written is not made
  *   D6 refusals: expired, not bound, provider down
  *   D7 GET /v1/github/connection: which token the user's tools would use
@@ -215,6 +216,36 @@ describe("D a GitHub binding serves an owner who keeps no GH_TOKEN", () => {
     await sql("INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, write, github_requests, head_sha) VALUES ('u-alice', 'u-alice', 's-1', 'gh_review_submit', TRUE, 2, 'abc')");
     assert.equal((await recentWrites(db, "u-alice", 3_600_000)).count, 1, "a review still counts");
     assert.equal(await sessionRequestCount(db, "s-1"), 2);
+  });
+
+  test("D4c every write the server lists, #324's three included, is held with a binding, and once approved runs on it and is audited", async () => {
+    const client = await connect();
+    // Derived from the server's own tools/list, not a hand-kept list: every tool that is not a read is a write here.
+    const writes = (await client.listTools()).tools.map((t) => t.name).filter((n) => !(READ_TOOLS as readonly string[]).includes(n));
+    for (const t of ["checks_rerun_failed", "pr_request_reviewers", "labels_set"]) assert.ok(writes.includes(t), t);
+    const policy = approvalPolicyFromMcp(await githubMcpServers("s-1", { settings: () => settings(), db, resolveBinding }));
+    for (const t of writes) {
+      assert.equal(policy.requiresApproval(`mcp__github__${t}`), true, t);
+      assert.equal(policy.autoApprovalRule(`mcp__github__${t}`, {}), null, t);
+    }
+    respond = (url) => {
+      if (url.pathname === "/repos/o/r/actions/runs/42/rerun-failed-jobs") return json({}, 201);
+      if (url.pathname === "/repos/o/r/pulls/7/requested_reviewers") return json({ number: 7, html_url: "https://github.com/o/r/pull/7", requested_reviewers: [{ login: "bob" }], requested_teams: [] }, 201);
+      if (url.pathname === "/repos/o/r/issues/7/labels") return json([{ name: "bug" }]);
+      return json({}, 404);
+    };
+    const made: Array<[string, Record<string, unknown>]> = [
+      ["checks_rerun_failed", { repo: "o/r", run_id: 42 }],
+      ["pr_request_reviewers", { repo: "o/r", number: 7, reviewers: ["bob"] }],
+      ["labels_set", { repo: "o/r", number: 7, labels: ["bug"] }],
+    ];
+    for (const [name, args] of made) {
+      const r = await call(client, name, args);
+      assert.equal(r.isError, false, `${name}: ${r.text}`);
+    }
+    assert.deepEqual(seen.map((s) => s.authorization), made.map(() => `Bearer ${BOUND_TOKEN}`));
+    const rows = await auditRows();
+    assert.deepEqual(rows.map((r) => [r.tool, r.write, r.result]), made.map(([n]) => [`github_mcp.${n}`, true, "ok"]));
   });
 
   test("D4b a call GitHub refuses is audited as refused", async () => {
