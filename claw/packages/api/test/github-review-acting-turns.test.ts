@@ -376,11 +376,17 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   assert.match(actingSession, /if \(!caller\.ok\) return[\s\S]*?attended = \{ via: caller\.via \} as AttendedProof;/, "and only after the classifier said yes");
   // The one other proof: the same first message queued again, once its first turn was refused before its model ran, made only when the
   // database shows that session ran that one turn, it failed and its words are the same; asked for by the review items alone.
-  assert.equal((actingSession.match(/as AttendedProof\b/g) ?? []).length, 2, "two places make a proof: the create's check and the first message's re-run");
+  assert.equal((actingSession.match(/as AttendedProof\b/g) ?? []).length, 3, "three places make a proof: the create's check, the first message's re-run, and a queued review's first message");
   assert.match(actingSession, /Number\(row\.turns\) !== 1[\s\S]*?row\.status !== "failed" \|\| row\.words !== content\) return null;\s*return \{ via: null \} as AttendedProof;/,
     "the re-run's proof only for a session whose one turn failed with the same words");
   const rerunProof = [...found.keys()].filter((f) => /\bproofForFirstMessageAgain\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
   assert.deepEqual(rerunProof, ["assistant/review-items.ts"], "only the review items ask for the re-run's proof");
+  // A review that waited for a slot: made by a request that passed the create's check, with no message until then. Its proof is made only
+  // for a session that acts as a user, belongs to an open review item still marked queued, and has had no turn and has no message.
+  assert.match(actingSession, /Number\(row\.turns\) !== 0 \|\| Number\(row\.queued\) !== 0 \|\| !row\.waiting\) return null;\s*return \{ via: null \} as AttendedProof;/,
+    "the queued review's proof only for a session with no turn and no message whose item still waits");
+  const queuedProof = [...found.keys()].filter((f) => /\bproofForQueuedFirstMessage\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
+  assert.deepEqual(queuedProof, ["assistant/review-items.ts"], "only the review items ask for a queued review's proof");
   const messages = stripComments(readFileSync(join(src, "assistant/messages.ts"), "utf8"));
   assert.match(messages, /if \(actingUserOf\(session\.config\) !== null && !m\.attended\) return \{ ok: false, error: "acting_session_unattended" \};/, "queueServerMessage refuses an acting session without the proof");
   const handsProof = [...found.keys()].filter((f) => /\battended: \w+\.attended\b/.test(stripComments(readFileSync(join(src, f), "utf8"))));

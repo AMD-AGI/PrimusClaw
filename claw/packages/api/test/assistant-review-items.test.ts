@@ -338,16 +338,107 @@ describe("assistant review items", { skip }, () => {
     assert.equal(await count("claw_work_items", "params->>'acting_as' = 'bob'"), 3);
   });
 
-  test("V6 a review counts toward the user's limit of unfinished items, and the refusal says it is that limit", async () => {
+  /** The hourly limits of this world are smaller than what the queue tests count; they are another test's (V5). */
+  async function withHourlyRoom(run: () => Promise<void>): Promise<void> {
+    const env = { CLAW_GITHUB_REVIEWS_PER_TOKEN_PER_HOUR: "50", CLAW_GITHUB_REVIEWS_PER_HOUR: "50" };
+    const saved = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, env);
+    try {
+      await run();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+
+  test("V6 a review counts toward the user's limit of unfinished items; one over it waits for a slot, and past the queue's room the refusal says it is that limit", () => withHourlyRoom(async () => {
     await w.user("alice");
     for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);
     await one("alice");
+    w.drains.length = 0;
     const r = await start("alice", { prs: [PR(300)] });
-    assert.deepEqual([r.status, r.body.error, r.body.data], [409, "too_many_active_items", { limit: 4 }]);
-    assert.match(r.body.message, /the most one person may have/);
-    assert.equal(await count("claw_work_items", "kind = 'review'"), 1);
-    assert.equal(await count("claw_sessions", "config ? 'acting_as'"), 1, "the session it would have used was rolled back");
-  });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const [queued] = r.body.data.items;
+    assert.deepEqual([queued.queued, queued.message_id], [{ reason: "too_many_active_items" }, null], "made, and said to wait");
+    const item = await w.item(queued.item_id);
+    assert.deepEqual([item.board_state, item.params.queued?.reason], ["in_progress", "too_many_active_items"]);
+    assert.equal(await count("claw_pending_messages", `session_id = '${queued.session_id}'`), 0, "nothing of it can run yet");
+    assert.equal(w.drains.length, 0, "nothing drained");
+    // A task item is still refused at the limit: the queued review holds no slot, and four running items do.
+    await assert.rejects(w.createItem(await w.user("alice"), "task 4"));
+    // Past the queue's room (`MAX_QUEUED_ITEMS`), the limit's refusal stands, and what it would have made is rolled back.
+    const { MAX_QUEUED_ITEMS } = await import("../src/assistant/work-items.js");
+    for (let n = 1; n < MAX_QUEUED_ITEMS; n++) assert.equal((await start("alice", { prs: [PR(300 + n)] })).body.data.items[0].queued?.reason, "too_many_active_items");
+    const full = await start("alice", { prs: [PR(400)] });
+    assert.deepEqual([full.status, full.body.error, full.body.data], [409, "too_many_active_items", { limit: 4 }]);
+    assert.match(full.body.message, /the most one person may have/);
+    assert.equal(await count("claw_work_items", "kind = 'review'"), 1 + MAX_QUEUED_ITEMS);
+    assert.equal(await count("claw_sessions", "config ? 'acting_as'"), 1 + MAX_QUEUED_ITEMS, "the session it would have used was rolled back");
+  }));
+
+  test("V6b a queued review starts by itself, oldest first, once a slot is free; one stopped while it waits never starts", () => withHourlyRoom(async () => {
+    await w.user("alice");
+    for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);
+    const running = await one("alice");
+    const a = (await start("alice", { prs: [PR(301)] })).body.data.items[0];
+    const b = (await start("alice", { prs: [PR(302)] })).body.data.items[0];
+    const c = (await start("alice", { prs: [PR(303)] })).body.data.items[0];
+    assert.deepEqual([a.queued, b.queued, c.queued].map((x) => x?.reason), Array(3).fill("too_many_active_items"));
+    // Still full: a tick starts nothing.
+    assert.equal(await ri.startQueuedReviews(), 0);
+    assert.equal(await count("claw_pending_messages", `session_id IN ('${a.session_id}', '${b.session_id}', '${c.session_id}')`), 0);
+    // The one queued second is stopped while it waits: it is done, and never takes a slot.
+    const { stopWorkItem } = await import("../src/assistant/work-items.js");
+    assert.equal((await stopWorkItem({ userId: "alice", itemId: b.item_id, source: "user" })).status, "ok");
+    // A slot is free: the running review is stopped. The next tick starts the oldest waiting one only.
+    assert.equal((await stopWorkItem({ userId: "alice", itemId: running.item_id, source: "user" })).status, "ok");
+    w.drains.length = 0;
+    assert.equal(await ri.sweepReviewItems() >= 0, true);
+    const pending = await w.q("SELECT session_id, content FROM claw_pending_messages");
+    assert.deepEqual(pending.map((p) => p.session_id), [a.session_id], "the oldest waiting review, and only it");
+    assert.match(pending[0].content, /pull\/301/, "with its own first message");
+    assert.ok(w.drains.some((d) => JSON.stringify(d).includes(a.session_id)), "and handed to a run");
+    const started = await w.item(a.item_id);
+    assert.equal(started.params.queued, undefined);
+    assert.equal(started.summary, "reviewing AMD-AGI/PrimusClaw#301");
+    assert.match((await w.item(c.item_id)).summary, /#303 is queued: it starts by itself when a slot is free/);
+    assert.equal((await w.item(b.item_id)).board_state, "done");
+    // Started once: another tick starts nothing more, and queues no second first message.
+    assert.equal(await ri.startQueuedReviews(), 0);
+    assert.equal(await count("claw_pending_messages"), 1);
+  }));
+
+  test("V6d a queued review its owner writes into while it waits ran: it stops waiting, gets no server message, and is not halted", () => withHourlyRoom(async () => {
+    await w.user("alice");
+    for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);
+    await one("alice");
+    const waiting = (await start("alice", { prs: [PR(301)] })).body.data.items[0];
+    assert.equal(waiting.queued?.reason, "too_many_active_items");
+    const run = await w.openRun(waiting.session_id);   // (the owner's own message into the session they hold the id of)
+    await ri.startQueuedReviews();
+    const item = await w.item(waiting.item_id);
+    assert.deepEqual([item.params.queued, item.params.halted], [undefined, undefined]);
+    assert.equal(await count("claw_pending_messages", `session_id = '${waiting.session_id}'`), 0, "no first message of the server's on top");
+    await w.closeRun(run.taskId, "completed");
+    // It holds its slot now: the next review waits.
+    assert.equal((await start("alice", { prs: [PR(302)] })).body.data.items[0].queued?.reason, "too_many_active_items");
+  }));
+
+  test("V6c a queued review restarted once a slot is free starts as any restart does, and holds its slot", () => withHourlyRoom(async () => {
+    await w.user("alice");
+    for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);
+    const running = await one("alice");
+    const waiting = (await start("alice", { prs: [PR(301)] })).body.data.items[0];
+    assert.equal(waiting.queued?.reason, "too_many_active_items");
+    const { stopWorkItem } = await import("../src/assistant/work-items.js");
+    assert.equal((await stopWorkItem({ userId: "alice", itemId: running.item_id, source: "user" })).status, "ok");
+    const alice = { userId: "alice", userName: "Name alice", platformKey: "pk-alice", virtualKey: "vk-alice", roles: ["default"] };
+    const again = await ri.restartReview(alice, "identity_token", waiting.item_id, ri.parseRestartRequest({}));
+    assert.equal(again.item.queued, undefined, "it fit, so it started");
+    assert.equal((await w.item(again.item.item_id)).params.queued, undefined, "and the new item is not marked as waiting");
+    assert.equal(await count("claw_pending_messages", `session_id = '${again.item.session_id}'`), 1, "its first message is queued");
+    // It holds the slot it took: the next review waits.
+    assert.equal((await start("alice", { prs: [PR(302)] })).body.data.items[0].queued?.reason, "too_many_active_items");
+  }));
 
   test("V7 GitHub is asked first: a pull request it refuses, or an outage, makes nothing", async () => {
     checkAnswer = (pr) => pr.number === 2
@@ -553,19 +644,26 @@ describe("assistant review items", { skip }, () => {
     try {
       await askedOfBob({ prs: [PR(1)] });
       await askedOfBob({ prs: [PR(2)] });
+      // Over a limit, the review waits for a slot: said to the requester with the limit it waits on.
       const third = await start("alice", { prs: [PR(3)], acting_as: "bob", acting_as_name: "Bob B" });
-      assert.deepEqual([third.status, third.body.error, third.body.data], [409, "too_many_active_items", { limit: 2, scope: "requester" }]);
-      assert.match(third.body.message, /you already have 2 reviews waiting for Bob B/);
+      assert.deepEqual([third.status, third.body.data.items[0].queued], [200, { reason: "too_many_from_requester" }]);
       await askedOfBob({ prs: [PR(4)] }, "carol");
       const full = await start("dave", { prs: [PR(5)], acting_as: "bob", acting_as_name: "Bob B" });
-      assert.deepEqual([full.status, full.body.error, full.body.data], [409, "too_many_active_items", { limit: 3, scope: "reviewer" }]);
-      assert.match(full.body.message, /Bob B already has 3 reviews others asked for open/);
+      assert.deepEqual([full.status, full.body.data.items[0].queued], [200, { reason: "too_many_requested_reviews" }]);
       // The reviewer's own room is theirs: four own items fit beside the three others asked for (the per-user limit here is 4).
       const bob = await w.user("bob");
       for (let i = 0; i < 3; i++) await w.createItem(bob, `task ${i}`);
-      assert.equal((await start("bob", { prs: [PR(6)] })).status, 200, "the reviewer's own review still fits");
-      assert.deepEqual([(await start("bob", { prs: [PR(7)] })).body.error], ["too_many_active_items"]);
-      assert.equal(await count("claw_work_items", "user_id = 'bob'"), 7);
+      const own = await start("bob", { prs: [PR(6)] });
+      assert.deepEqual([own.status, own.body.data.items[0].queued], [200, undefined], "the reviewer's own review still starts");
+      assert.deepEqual([(await start("bob", { prs: [PR(7)] })).body.data.items[0].queued], [{ reason: "too_many_active_items" }]);
+      assert.equal(await count("claw_work_items", "user_id = 'bob'"), 10);
+      // A slot of the reviewer's limit is free: carol's review ends. Alice's waits on her own per-requester limit still, so dave's starts.
+      const carols = (await w.q("SELECT item_id FROM claw_work_items WHERE params->>'requested_by' = 'carol'"))[0].item_id as string;
+      const { stopWorkItem } = await import("../src/assistant/work-items.js");
+      assert.equal((await stopWorkItem({ userId: "bob", itemId: carols, source: "user" })).status, "ok");
+      assert.equal(await ri.startQueuedReviews(), 1);
+      const waiting = await w.q("SELECT params->>'requested_by' AS by FROM claw_work_items WHERE board_state <> 'done' AND params ? 'queued' ORDER BY seq");
+      assert.deepEqual(waiting.map((r) => r.by), ["alice", null], "alice's waits on her own limit, bob's own on his");
     } finally {
       for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
@@ -778,6 +876,26 @@ describe("assistant review items", { skip }, () => {
     assert.equal((await w.item(c.item_id)).params.halted.reason, "unavailable");
     assert.equal((await w.item(d.item_id)).params.halted, undefined);
     assert.deepEqual(await keysOf(d.session_id), { platformKey: "pk-bob", llmApiKey: "vk-bob" });
+  }));
+
+  test("Q7b a review that waits for a slot is halted with the rest when the say is withdrawn: it stops waiting, says so, and never starts from the queue", () => withEnv({ ...ROOMY, CLAW_REVIEW_FOR_OTHERS_PER_REQUESTER_MAX_ACTIVE: "1" }, async () => {
+    const running = await askedOfBob({ prs: [PR(1)] });
+    const r = await start("alice", { prs: [PR(2)], acting_as: "bob", acting_as_name: "Bob B" });
+    const waiting = r.body.data.items[0];
+    assert.deepEqual([r.status, waiting.queued], [200, { reason: "too_many_from_requester" }]);
+    delegation.bob = "off";
+    assert.equal(await ri.gateRequestedReviewTurn(running.session_id), false);
+    const item = await w.item(waiting.item_id);
+    assert.deepEqual([item.params.queued, item.params.halted?.reason], [undefined, "delegation_off"], "halted, and no longer waiting");
+    assert.deepEqual([item.board_state, item.last_report_kind], ["needs_you", "failed"]);
+    assert.match(item.summary, /^AMD-AGI\/PrimusClaw#2 not run: reviewer turned off reviews for others$/, "the halt is put in front of the owner, not \"queued\"");
+    // The reviewer turns delegation back on and a slot frees: the halted review is not started by the queue without a new request.
+    delete delegation.bob;
+    const { stopWorkItem } = await import("../src/assistant/work-items.js");
+    assert.equal((await stopWorkItem({ userId: "bob", itemId: running.item_id, source: "user" })).status, "ok");
+    assert.equal(await ri.startQueuedReviews(), 0);
+    assert.equal(await count("claw_pending_messages", `session_id = '${waiting.session_id}'`), 0, "nothing of it is queued to run");
+    assert.equal((await w.item(waiting.item_id)).params.halted?.reason, "delegation_off", "the halt reason stands");
   }));
 
   test("Q8 a requested review's turns are budgeted: per review and per reviewer per day, and an exhausted one does not run", async () => {

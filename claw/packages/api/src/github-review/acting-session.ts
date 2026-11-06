@@ -125,3 +125,25 @@ export async function proofForFirstMessageAgain(
   if (row.status !== "failed" || row.words !== content) return null;
   return { via: null } as AttendedProof;
 }
+
+/**
+ * The proof for the first message of a review that waited for a slot (`params.queued`, `assistant/review-items.ts`): the request that made
+ * it was checked as `checkSessionCreate` checks any, and its item and session were made then, with the person's say, but its first message
+ * was held back so that nothing of it could run before a slot was free. Made only when the database shows exactly that: the session acts
+ * as a user, is a queued review item's, and has had no turn and has no message queued. Null otherwise.
+ */
+export async function proofForQueuedFirstMessage(
+  q: { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }> }, sessionId: string,
+): Promise<AttendedProof | null> {
+  const row = (await q.query(
+    `SELECT s.config->'acting_as' AS acting_as,
+            (SELECT COUNT(*)::int FROM claw_tasks t WHERE t.session_id = s.session_id) AS turns,
+            (SELECT COUNT(*)::int FROM claw_pending_messages p WHERE p.session_id = s.session_id) AS queued,
+            EXISTS (SELECT 1 FROM claw_work_items w WHERE w.worker_session_id = s.session_id AND w.kind = 'review'
+                     AND w.board_state <> 'done' AND w.params ? 'queued') AS waiting
+       FROM claw_sessions s WHERE s.session_id = $1 AND s.deleted_at IS NULL`,
+    [sessionId],
+  )).rows[0] as { acting_as: unknown; turns: number; queued: number; waiting: boolean } | undefined;
+  if (!row || typeof row.acting_as !== "string" || Number(row.turns) !== 0 || Number(row.queued) !== 0 || !row.waiting) return null;
+  return { via: null } as AttendedProof;
+}
