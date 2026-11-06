@@ -13,8 +13,8 @@
  *   AC4 a server the catalog does not know is untouched; a tool the catalog does not list on a server it knows (one the server
  *       added since) is held, and auto_approve does not release it, until the catalog classifies it
  *   AC5 through the controller a turn uses: with the hand list, workload_resume asks and is denied when nobody answers
- *   AC6 the trigger server: its catalogued writes are held by name whatever its URL (the API's own path on another host too);
- *       a tool it does not list follows the spec, since its tools are the API's code and the API's tests check them
+ *   AC6 the trigger server is held by name like any catalogued server: its writes and a tool it does not list, wherever it points
+ *       (the API's reserved path on another host too)
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -103,20 +103,19 @@ test("AC5 a turn's controller asks before workload_resume under the hand list, a
   assert.equal((await nobody.beforeToolUse({ sessionId: "s", actionId: "toolu_3", tool: S("workload_get"), input: {} })).action, "allow");
 });
 
-test("AC6 the trigger server: its writes are held by name whatever its URL; tools it does not list follow the spec", () => {
+test("AC6 the trigger server is held by name: its writes and any tool it does not list, wherever it points", () => {
   const T = (bare: string) => `mcp__${TRIGGER_MCP_SERVER}__${bare}`;
-  const own = approvalPolicyFromMcp({ [TRIGGER_MCP_SERVER]: { ...base, url: `https://api.example.invalid${TRIGGER_MCP_PATH}`, requires_approval: ["trigger_create", "trigger_cancel"] } });
-  assert.equal(own.requiresApproval(T("trigger_create")), true);
-  assert.equal(own.requiresApproval(T("ping")), false, "its unlisted tools are the API's code, checked by the API's tests: the spec decides");
-  assert.equal(own.operatorActive, false);
-  // A server that takes the name, even at the API's own path on another host, and holds nothing: the catalog's writes are held.
-  for (const url of [`https://attacker.example.invalid${TRIGGER_MCP_PATH}`, "https://elsewhere.example.invalid/mcp"]) {
-    const other = approvalPolicyFromMcp({ [TRIGGER_MCP_SERVER]: { ...base, url } });
-    assert.equal(other.active, true, url);
-    assert.equal(other.requiresApproval(T("trigger_create")), true, url);
-    assert.equal(other.requiresApproval(T("trigger_cancel")), true, url);
-    assert.equal(other.requiresApproval(T("trigger_list")), false, `${url}: a catalogued read`);
-    const released = approvalPolicyFromMcp({ [TRIGGER_MCP_SERVER]: { ...base, url, requires_approval: true, auto_approve: ["trigger_*"] } });
+  for (const url of [`https://api.example.invalid${TRIGGER_MCP_PATH}`, `https://attacker.example.invalid${TRIGGER_MCP_PATH}`, "https://elsewhere.example.invalid/mcp"]) {
+    for (const spec of [{ ...base, url, requires_approval: ["trigger_create", "trigger_cancel"] }, { ...base, url }]) {
+      const p = approvalPolicyFromMcp({ [TRIGGER_MCP_SERVER]: spec });
+      const label = `${url} ${JSON.stringify(spec.requires_approval ?? "absent")}`;
+      assert.equal(p.requiresApproval(T("trigger_create")), true, label);
+      assert.equal(p.requiresApproval(T("trigger_cancel")), true, label);
+      assert.equal(p.requiresApproval(T("drop_everything")), true, `${label}: a tool the catalog does not list`);
+      assert.equal(p.requiresApproval(T("trigger_list")), false, `${label}: a catalogued read`);
+    }
+    const released = approvalPolicyFromMcp({ [TRIGGER_MCP_SERVER]: { ...base, url, requires_approval: true, auto_approve: ["trigger_*", "drop_*"] } });
     assert.equal(released.autoApprovalRule(T("trigger_create"), {}), null, `${url}: not releasable`);
+    assert.equal(released.autoApprovalRule(T("drop_everything"), {}), null, `${url}: unlisted, not releasable`);
   }
 });

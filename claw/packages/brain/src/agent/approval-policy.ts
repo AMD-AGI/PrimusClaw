@@ -46,9 +46,7 @@
  * every tool it does not list (one the server added since the catalog was
  * reviewed) is held whatever the spec says (`false`, a list that misses it, no
  * field at all), and `auto_approve` releases such a tool only when the catalog
- * calls it a releasable write. The API's own trigger server is the one whose
- * unlisted tools the catalog leaves to the spec (`unlisted: "spec"`): its tools
- * are code, and the API's tests fail on one the catalog does not list. A spec is a hand-kept list and falls
+ * calls it a releasable write. A spec is a hand-kept list and falls
  * behind its server (SaFE's workload_resume ran unheld that way); the catalog
  * is checked against the server's own tools/list every night, and a tool it
  * has not classified yet waits for a person meanwhile. The hold it adds for a
@@ -56,7 +54,7 @@
  * those tools and turns nothing else on (`operatorActive`).
  */
 import pino from "pino";
-import { TOOL_CATALOG, catalogClassOf, holdsUnlisted, isCataloguedServer, isPlatformMcpServer, isReleasableWrite, type ToolCatalog } from "@claw/protocol";
+import { TOOL_CATALOG, catalogClassOf, isCataloguedServer, isPlatformMcpServer, isReleasableWrite, type ToolCatalog } from "@claw/protocol";
 
 const logger = pino({ name: "approval-policy" });
 
@@ -174,10 +172,9 @@ interface ServerRule {
  * `catalog`: the tool catalog that stands over the specs (default the platform's). `null` reads the specs alone, which is what an
  * audit of a spec needs (`api/src/assistant/tool-classes.ts`), never what a turn runs with.
  */
-/** Whether the catalog itself holds this tool of a catalogued server: a write it lists, or a tool it does not list (`unlisted`). */
+/** Whether the catalog itself holds this tool of a catalogued server: anything but a read it lists. */
 function heldByCatalog(server: string, bare: string, tools: ToolCatalog): boolean {
-  const cls = catalogClassOf(server, bare, tools);
-  return cls === "write" || (cls === null && holdsUnlisted(server, tools));
+  return catalogClassOf(server, bare, tools) !== "read";
 }
 
 export function approvalPolicyFromMcp(
@@ -217,9 +214,8 @@ export function approvalPolicyFromMcp(
     }
     const ownRule = holds.length > 0;
     // Whatever the spec says, a write the catalog lists for this server waits for a person, and so does a tool it does not list
-    // (one the server added since the catalog was reviewed: it is not known to read), unless the catalog leaves unlisted tools
-    // of this server to the spec (only the API's own servers, whose tools are code the tests check against the catalog). By
-    // name only: a server that takes a catalogued name gets the catalog whatever its URL says.
+    // (one the server added since the catalog was reviewed: it is not known to read). By name only: a server that takes a
+    // catalogued name gets the catalog whatever its URL says, the API's own trigger server included.
     const catalog = tools !== null && isCataloguedServer(name, tools) ? name : null;
     if (catalog !== null) holds.push((bare) => heldByCatalog(catalog, bare, tools!));
     if (holds.length === 0) continue;
