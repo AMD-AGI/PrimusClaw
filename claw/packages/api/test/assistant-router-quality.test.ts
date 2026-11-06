@@ -264,10 +264,10 @@ describe("router quality, pure", () => {
 describe("router quality, the prompt", () => {
   test("Q7 router-v10 and router-read-v7 say each rule", async () => {
     const p = await import("../src/assistant/prompts.js");
-    // router-v12 (this rule set, a long answer said whole, nothing after the start notice); its review prompt is router-v15.
+    // router-v12 (this rule set, a long answer said whole, nothing after the start notice); its review prompt is router-v17.
     assert.equal(p.ROUTER_PROMPT_VERSION, "router-v13");
     assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v7");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v16");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v17");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): a say after it in the turn is added to that same message, so never repeat the start/],
