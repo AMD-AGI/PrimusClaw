@@ -35,7 +35,7 @@ describe("assistant GitHub events, switch off", () => {
       assert.equal((await app.inject({ method, url, payload: method === "POST" ? { pr: "acme/app#1" } : undefined })).statusCode, 404, `${method} ${url}`);
     }
     const names = (claims: Record<string, unknown>) => Object.keys((mcp.createAssistantMcpServer(claims as never) as any)._registeredTools).sort();
-    assert.deepEqual(names({ role: "router", sid: "s", mid: "m", task_id: "t", exp: 1 }), ["say", "work_create", "work_recall", "work_send", "work_stop"]);
+    assert.deepEqual(names({ role: "router", sid: "s", mid: "m", task_id: "t", exp: 1 }), ["claw_self_status", "say", "work_create", "work_recall", "work_send", "work_stop"]);
     assert.deepEqual(names({ role: "worker", sid: "s", mid: "m", task_id: "t", exp: 1, item_id: "i", gen: 1 }), ["report"]);
     ev.startGithubEventWatch();
     assert.equal(ev.githubEventWatchRunning(), false, "nothing polls");

@@ -37,6 +37,7 @@ import {
 } from "../llm/tool-images.js";
 import { isSandboxTool } from "../tools/hands.js";
 import { LOAD_SKILL_TOOL, LOAD_SKILL_RESULT_MAX_CHARS } from "./skill-store.js";
+import { fitJsonResult, LIST_FIT_MAX_CHARS } from "./list-fit.js";
 import { toolNotAllowedMessage, type ToolAllowlist } from "../tools/allowlist.js";
 import type { HookRunner } from "./hooks.js";
 import { refusalMessage, type HitlController } from "./hitl.js";
@@ -504,6 +505,14 @@ export const GITHUB_REVIEW_READ_MAX_CHARS = 24_000;
 const GITHUB_LIST_READS = new Set(GITHUB_LIST_TOOLS.map((t) => `mcp__${GITHUB_MCP_SERVER}__${t}`));
 export const GITHUB_LIST_READ_MAX_CHARS = GITHUB_LIST_MAX_CHARS + 1_000;
 
+/**
+ * The MCP tools whose JSON lists are fitted (`list-fit.ts`) instead of cut head and tail: every server's but the API's GitHub lists and
+ * review read, which fit their own answers (above).
+ */
+export function fitsAsList(toolName: string | undefined): boolean {
+  return toolName !== undefined && toolName.startsWith("mcp__") && !GITHUB_LIST_READS.has(toolName) && toolName !== GITHUB_REVIEW_READ_TOOL;
+}
+
 /** The generic cap, or a tool's own when it pages its answers itself. */
 export function resultCapFor(toolName: string | undefined): number {
   if (toolName === GITHUB_REVIEW_READ_TOOL) return GITHUB_REVIEW_READ_MAX_CHARS;
@@ -520,6 +529,11 @@ export function truncateToolResult(text: string, toolName?: string, savedAt?: st
   }
   if (typeof text !== "string" || text.length <= resultCapFor(toolName)) return text;
   if (toolName === "read") return truncateReadResult(text);
+  // An MCP server's list, cut in its middle, was counted as if whole: its counts are taken over the whole of it first (`list-fit.ts`).
+  if (fitsAsList(toolName)) {
+    const fitted = fitJsonResult(text, LIST_FIT_MAX_CHARS, savedAt);
+    if (fitted !== null) return fitted;
+  }
   const head = text.slice(0, TOOL_RESULT_HEAD_CHARS);
   const tail = text.slice(-TOOL_RESULT_TAIL_CHARS);
   const dropped = text.length - TOOL_RESULT_HEAD_CHARS - TOOL_RESULT_TAIL_CHARS;

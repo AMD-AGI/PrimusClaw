@@ -48,6 +48,7 @@ import { githubEventsEnabled } from "./github-events.js";
 import { jobWatchesEnabled } from "./job-watch.js";
 import { renderRouterProactiveSection, ROUTER_PROACTIVE_PROMPT_VERSION } from "./proactive-prompt.js";
 import { devenvToolsOn } from "./devenv-tools.js";
+import { renderRouterSelfSection, ROUTER_SELF_PROMPT_VERSION, selfStatusOn } from "./self-status.js";
 import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 import { applyRouterTurnSpeed } from "./router-speed.js";
@@ -299,6 +300,9 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     }
     const devenv = devenvToolsOn();
     if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS }));
+    // Who it is (Clawy, with claw_self_status) and how to count what a lookup returned: the same on every turn, so it stays cached.
+    const self = selfStatusOn();
+    withSystemAppend(task, renderRouterSelfSection(self));
     const proactive = { schedules: assistantSchedulesOn(), jobs: jobWatchesEnabled(), pullRequests: githubEventsEnabled() };
     const proactiveSection = renderRouterProactiveSection(proactive);
     if (proactiveSection) withSystemAppend(task, proactiveSection);
@@ -327,7 +331,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       ...(proactiveSection ? { proactive: ROUTER_PROACTIVE_PROMPT_VERSION } : {}),
       ...(devenv ? { devenv: ROUTER_DEVENV_PROMPT_VERSION } : {}),
       read: ROUTER_READ_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),
-      ...(cite ? { cite: ROUTER_CITE_PROMPT_VERSION } : {}),
+      ...(cite ? { cite: ROUTER_CITE_PROMPT_VERSION } : {}), self: ROUTER_SELF_PROMPT_VERSION, selfStatus: self,
     }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);

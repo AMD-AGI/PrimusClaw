@@ -344,6 +344,40 @@ describe("B lists a turn sees whole", () => {
     assert.deepEqual(found.items.map((i: any) => i.number), Array.from({ length: found.shown }, (_, i) => i + 1), "the first ones, in order");
   });
 
+  test("B13a issue_search counts its matches per repository: from the page when it holds them all, else read 100 at a time up to 300", async () => {
+    const at = (n: number, repo: string) => ({ ...hit(n), repository_url: `${API}/repos/${repo}`, html_url: `https://github.com/${repo}/pull/${n}` });
+    const repoOf = (i: number) => (i < 12 ? "AMD-AGI/PrimusClaw" : i < 20 ? "ROCm/spur" : "AMD-AGI/Hyperloom");
+    const all = Array.from({ length: 140 }, (_, i) => at(i + 1, repoOf(i % 25)));
+    respond = (url) => {
+      if (url.pathname !== "/search/issues") return json({}, 404);
+      const per = Number(url.searchParams.get("per_page"));
+      const page = Number(url.searchParams.get("page"));
+      return json({ total_count: 140, incomplete_results: false, items: all.slice((page - 1) * per, page * per) });
+    };
+    const c = await connect(token());
+    const found = JSON.parse((await call(c, "issue_search", { query: "is:pr is:open author:@me" })).text);
+    const expected: Record<string, number> = {};
+    for (const i of all) expected[i.repository_url.slice(`${API}/repos/`.length)] = (expected[i.repository_url.slice(`${API}/repos/`.length)] ?? 0) + 1;
+    assert.deepEqual(found.by_repo, expected);
+    assert.equal(Object.values(found.by_repo as Record<string, number>).reduce((a, b) => a + b, 0), 140);
+    assert.deepEqual(Object.keys(found.by_repo), ["AMD-AGI/PrimusClaw", "ROCm/spur", "AMD-AGI/Hyperloom"], "most first");
+    assert.deepEqual(seen.map((x) => [new URL(x.url).searchParams.get("per_page"), new URL(x.url).searchParams.get("page")]), [["50", "1"], ["100", "1"], ["100", "2"]]);
+
+    seen = [];
+    const few = JSON.parse((await call(c, "issue_search", { query: "is:pr is:open author:@me", per_page: 100, page: 2 })).text);
+    assert.equal(few.by_repo, undefined, "a later page is not counted again");
+    assert.equal(seen.length, 1);
+
+    seen = [];
+    respond = (url) => url.pathname === "/search/issues"
+      ? json({ total_count: 301, incomplete_results: false, items: all.slice(0, 50) })
+      : json({}, 404);
+    const many = JSON.parse((await call(c, "issue_search", { query: "is:pr is:open author:@me" })).text);
+    assert.equal(many.by_repo, undefined);
+    assert.match(many.note, /not counted for more than 300/);
+    assert.equal(seen.length, 1, "nothing more is read past the bound");
+  });
+
   test("B14 pr_list state merged: only merged ones, most recently merged first, read in update order", async () => {
     // Created in the order 319, 306 (the creation order GitHub lists by), merged in the other: 306 at 09:50:16, 319 at 09:49:47.
     const closed = [

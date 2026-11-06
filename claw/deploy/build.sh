@@ -79,9 +79,11 @@ if [ "$USE_KANIKO" = "true" ]; then
   # passthrough the only route left is tls.insecureSkipVerify, which turns off
   # certificate verification for every outbound connection the image makes --
   # so the supported remedy was unreachable and the unsupported one was not.
-  KANIKO_BUILD_ARGS=""
+  # The image says which build it is (CLAW_BUILD, what the assistant's claw_self_status names as the version running).
+  KANIKO_BUILD_ARGS="        - \"--build-arg=CLAW_BUILD=${TAG}\""
   if [ -n "${EXTRA_CA_CERT_URLS:-}" ]; then
-    KANIKO_BUILD_ARGS="        - \"--build-arg=EXTRA_CA_CERT_URLS=${EXTRA_CA_CERT_URLS}\""
+    KANIKO_BUILD_ARGS="${KANIKO_BUILD_ARGS}
+        - \"--build-arg=EXTRA_CA_CERT_URLS=${EXTRA_CA_CERT_URLS}\""
   fi
 
   REGISTRY_HOST="${REGISTRY%%/*}"
@@ -276,6 +278,7 @@ else
       --exclude='./.env' --exclude='./.env.*' --exclude='deploy/values.*.env' \
       -C "$HARNESS_ROOT" -cf - . \
     | docker build --no-cache --progress=plain --network host \
+        --build-arg "CLAW_BUILD=$TAG" \
         ${EXTRA_CA_CERT_URLS:+--build-arg "EXTRA_CA_CERT_URLS=$EXTRA_CA_CERT_URLS"} \
         -t "$IMG" -f Dockerfile -
 

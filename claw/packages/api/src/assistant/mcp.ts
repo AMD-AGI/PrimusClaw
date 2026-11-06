@@ -45,6 +45,7 @@ import { assistantMemoryOn, memoryForget, memoryRecall, memorySave, memoryUndo, 
 import { channelAction, confirmationAnswer, MAX_PRS, reviewModeSet, reviewRestart, reviewStart } from "./review-tools.js";
 import { observeEveryTool, recordObservation } from "./observe.js";
 import { assistantCitationsOn } from "./citations.js";
+import { readSelfStatus, selfStatusOn } from "./self-status.js";
 import { CITE_MAX_PER_CALL } from "@claw/protocol";
 import { devenvList, devenvToolsOn } from "./devenv-tools.js";
 
@@ -375,6 +376,16 @@ export function createAssistantMcpServer(
       { item_id: z.string().describe(ITEM_ID_PARAM), detail: z.enum(["summary", "reports", "worker_tail"]) },
       (args) => answer(claims, "work_recall", () => workRecall(claims, { item_id: args.item_id, detail: args.detail as RecallDetail })),
     );
+    if (selfStatusOn()) {
+      mcp.tool(
+        "claw_self_status",
+        "How you yourself (Clawy, the Claw assistant) have been running over the last day, for every user: messages received, how soon "
+        + "the first reply came (p50, p90 in seconds), how many got no reply, router turns, work items and runs by how they ended, sandbox "
+        + "failures and the version running. Counts only; it only reads.",
+        { hours: z.number().int().min(1).max(168).optional().describe("The window in hours; 24 when left out.") },
+        (args) => answer(claims, "claw_self_status", () => readSelfStatus(args.hours ?? 24)),
+      );
+    }
     if (githubEventsEnabled()) {
       mcp.tool(
         "work_subscribe",
