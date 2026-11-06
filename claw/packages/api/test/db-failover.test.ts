@@ -41,6 +41,8 @@
  *       unknown (not to say it again), and the message is announced once it is found
  *   F15 a worker's long answer, said whole by the system with its report, whose report COMMIT took effect and whose answer the
  *       failover lost: the report sent again is a duplicate, and the answer is announced anyway, once
+ *   F16 the same answer's report COMMIT rolled back, and the report sent again landed on another replica, which stored and
+ *       announced it: this process's background lookup finds it in the session's stream and does not publish it again
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -497,6 +499,59 @@ describe("database failover", { skip }, () => {
       while (!w.events.some((e) => e.say_id === stored[0].say_id) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
       assert.equal(w.events.filter((e) => e.say_id === stored[0].say_id).length, 1, "the web client is told, once");
       assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_says WHERE item_id = $1", [item.itemId]))[0].n, 1);
+    } finally {
+      reports.reportPorts.sayDeps = realDeps;
+    }
+  });
+
+  test("F16 a long answer whose report COMMIT rolled back and landed on another replica: not published twice", async () => {
+    const reports = await import("../src/assistant/reports.js");
+    const { deterministicEventId } = await import("../src/notifications/outbox.js");
+    const realDeps = reports.reportPorts.sayDeps;
+    reports.reportPorts.sayDeps = w.sayDeps;
+    try {
+      const item = await w.createItem(alice, "List the runs again");
+      const answer = Array.from({ length: 40 }, (_, i) => `- run ${i + 1}: finished in ${i + 3} minutes`).join("\n");
+      const turn = await w.workerTurn(item.itemId);
+      const seq = Number((await w.q("SELECT attention_seq FROM claw_work_items WHERE item_id = $1", [item.itemId]))[0].attention_seq) + 1;
+      // The report's COMMIT is lost with the connection before it took effect: rolled back, and reported as 57P01.
+      const { default: pgModule } = await import("pg");
+      const proto = pgModule.Client.prototype as unknown as { query: (...args: unknown[]) => unknown };
+      const real = proto.query;
+      let cut = 0;
+      proto.query = function (this: unknown, ...args: unknown[]) {
+        if (args[0] === "COMMIT" && cut === 0) {
+          cut += 1;
+          return (real.apply(this, ["ROLLBACK"]) as Promise<unknown>).then(() => {
+            throw Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" });
+          });
+        }
+        return real.apply(this, args);
+      };
+      let out: string;
+      try {
+        out = await w.mod.tools.report(turn as never, { kind: "answer", summary: answer }).then(
+          () => "recorded", (err: { code?: string }) => err.code ?? String(err));
+      } finally {
+        proto.query = real;
+      }
+      assert.equal(cut, 1);
+      assert.equal(out, "57P01");
+      assert.equal((await w.q("SELECT * FROM claw_assistant_says WHERE item_id = $1", [item.itemId])).length, 0, "rolled back");
+      // Another replica takes the report sent again: it stores the answer under the same id and publishes its event, which the
+      // event consumer persists in the session.
+      const sayId = deterministicEventId("work_item.needs_you", item.itemId, String(seq));
+      await w.q(
+        "INSERT INTO claw_assistant_says (say_id, user_id, item_id, item_attention_seq, text, fallback) VALUES ($1, $2, $3, $4, $5, true)",
+        [sayId, alice.userId, item.itemId, seq, `#1 "List the runs again": ${answer}`],
+      );
+      await w.q(
+        "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ('f16-ev', $1, 'AssistantSay', $2::jsonb)",
+        [alice.routerSid, JSON.stringify({ type: "AssistantSay", session_id: alice.routerSid, say_id: sayId })],
+      );
+      // Past this process's first background lookups, which find the answer stored: it is not published a second time.
+      await new Promise((r) => setTimeout(r, 15 * 300 + 500));
+      assert.equal(w.events.filter((e) => e.say_id === sayId).length, 0, "the event the other replica published is the only one");
     } finally {
       reports.reportPorts.sayDeps = realDeps;
     }

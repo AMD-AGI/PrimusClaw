@@ -565,8 +565,8 @@ async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToSt
  * (`reports.ts`): the router is told it was sent in full only when it is stored for sending, never before. The same message,
  * under the same id, as the silent sweep's (`recordNeedsYouFallback`), so it is said once. Null when the item is not answered
  * or the message was stored before. `announce` after the commit; `settle` instead when the COMMIT met a failover and its answer
- * was lost (it may have taken effect): the message is looked up in the background and announced if it is there, as a say's is
- * (`settleLater`), since the report sent again is then a duplicate that announces nothing.
+ * was lost (it may have taken effect): the message is looked up in the background and announced if it is there and no session
+ * event holds it yet, as a say's is (`settleLater`), since the report sent again is then a duplicate that announces nothing.
  */
 export async function storeAnswerWhole(
   q: Querier, itemId: string, deps: SayDeps = {},
@@ -575,8 +575,26 @@ export async function storeAnswerWhole(
   if (!m || m.item.board_state !== "done") return null;
   const stored = await store(q, m);
   return stored
-    ? { sayId: stored.sayId, announce: () => announce(stored, deps), settle: () => settleLater(m, (late) => announce(late, deps)) }
+    ? {
+      sayId: stored.sayId,
+      announce: () => announce(stored, deps),
+      settle: () => settleLater(m, async (late) => {
+        // The COMMIT may have rolled back and the report sent again landed on another replica, which stored and announced it:
+        // `announcedHere` is this process's alone, so what the session's stream already holds is not published a second time.
+        if (late.sessionId && await eventInSession(late.sessionId, late.sayId)) return;
+        await announce(late, deps);
+      }),
+    }
     : null;
+}
+
+/** Whether the session's stream holds the message's event (published by any replica, persisted by the event consumer). */
+async function eventInSession(sessionId: string, sayId: string): Promise<boolean> {
+  const r = await db.query(
+    "SELECT 1 FROM claw_session_events WHERE session_id = $1 AND event = 'AssistantSay' AND data->>'say_id' = $2 LIMIT 1",
+    [sessionId, sayId],
+  );
+  return (r.rowCount ?? 0) > 0;
 }
 
 /**
