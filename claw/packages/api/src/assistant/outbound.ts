@@ -20,6 +20,7 @@ import { CLAW_ASSISTANT_SAY_MAX_PER_HOUR, CLAW_NOTIFICATIONS_ENABLED } from "../
 import { redactPublicJson } from "../events/redaction.js";
 import { publishEvent } from "../events/store.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
+import { metrics } from "../infra/metrics.js";
 import {
   ASSISTANT_EVENT_TYPES,
   type AssistantItemSnapshot,
@@ -29,6 +30,7 @@ import {
 } from "../notifications/assistant-events.js";
 import { deterministicEventId, enqueue, kickDelivery, onDelivered } from "../notifications/outbox.js";
 import type { ItemRefError } from "./item-ref.js";
+import { detectLanguage } from "./language.js";
 import { canAccept, resolveWorkItem } from "./work-items.js";
 
 const logger = pino({ name: "assistant-outbound" });
@@ -43,6 +45,13 @@ export class SayRefused extends Error {
   constructor(readonly code: SayRefusal, message: string) {
     super(message);
     this.name = "SayRefused";
+  }
+}
+
+/** A say refused by the hourly cap. */
+class SayCapped extends SayRefused {
+  constructor(readonly limit: number) {
+    super("say_rate_limited", `at most ${limit} messages an hour`);
   }
 }
 
@@ -181,23 +190,64 @@ async function loadItem(q: Querier, itemId: string, userId?: string): Promise<It
 }
 
 /**
- * Whether the user has had `limit` of the assistant's messages in the last hour, which is when `say` refuses another.
- * The system's own messages are not counted: they are what is left when the assistant has failed to speak.
+ * The cap's notice is stored under the clock hour it was sent in, so the only ones that can be less than an hour old
+ * are this hour's and the last hour's. Not the stretch since the user reached the cap: under a steady overload the
+ * cap lets one message through each time the oldest turns an hour old, and every such stretch would be told again.
  */
-export async function sayCapReached(q: Querier, userId: string, limit: number = CLAW_ASSISTANT_SAY_MAX_PER_HOUR): Promise<boolean> {
-  const recent = Number((await q(
-    `SELECT COUNT(*) AS n FROM claw_assistant_says
-      WHERE user_id = $1 AND NOT fallback AND created_at > NOW() - INTERVAL '1 hour'`,
-    [userId],
-  )).rows[0].n);
-  return recent >= limit;
+const capNoticeKey = (hour: number) => `say_capped:${hour}`;
+
+async function capNoticeWithinHour(userId: string, hour: number): Promise<boolean> {
+  const ids = [hour, hour - 1].map((h) => deterministicEventId("assistant.notice", userId, capNoticeKey(h)));
+  return Boolean((await db.query(
+    "SELECT 1 FROM claw_assistant_says WHERE say_id = ANY($1::uuid[]) AND created_at > NOW() - INTERVAL '1 hour' LIMIT 1",
+    [ids],
+  )).rowCount);
+}
+
+/** What the user is told when the cap first refuses the assistant a message: short, in the language of that message. */
+export function sayCapNotice(refused: string): string {
+  return detectLanguage(refused) === "Chinese"
+    ? "回复太频繁，已达到每小时的消息上限，请稍后再试。进行中的事项不受影响。"
+    : "Too many replies: the hourly message limit is reached. Please try again later; your work items are not affected.";
+}
+
+/** What the model is told when the cap refused its message. */
+function sayCapRefusal(limit: number, told: boolean): string {
+  return `NOT delivered: the user has had ${limit} messages in the last hour, the most allowed, and every say is refused until ` +
+    `fewer have. ${told ? "The user has been told their replies are paused for now. " : ""}Do not call say again in this turn.`;
+}
+
+/**
+ * A say the cap refused is not a silence: the first one in an hour tells the user, in the system's words
+ * (`sayCapNotice`, a fallback the cap does not count), and every one is counted. The ones after it in that hour find
+ * the notice there and tell the user nothing more, so a client that keeps writing, or a model that keeps trying, gets
+ * one notice and not one per message. The refusal goes back to the caller, for the model, in words that say the
+ * message did not go out.
+ */
+async function refusedByCap(input: SayInput, text: string, refused: SayCapped, deps: SayDeps): Promise<SayRefused> {
+  let told = true;
+  try {
+    const hour = Math.floor(Date.now() / 3_600_000);
+    // Two refusals at once both find no notice and store the same one: the second store finds the first's and stores nothing.
+    const notice = (await capNoticeWithinHour(input.userId, hour)) ? null : await recordSystemNotice({
+      userId: input.userId, sessionId: input.sessionId, text: sayCapNotice(text), key: capNoticeKey(hour),
+    }, deps);
+    metrics.onAssistantSayRateLimited(notice ? "sent" : "already_sent");
+    if (notice) logger.warn({ userId: input.userId, limit: refused.limit, sayId: notice.say_id }, "assistant.say_cap_notice_sent");
+  } catch (err) {
+    told = false;
+    metrics.onAssistantSayRateLimited("failed");
+    logger.error({ err, userId: input.userId }, "assistant.say_cap_notice_failed");
+  }
+  return new SayRefused("say_rate_limited", sayCapRefusal(refused.limit, told));
 }
 
 /**
  * Record a message the assistant chose to say. Throws {@link SayRefused} for an
  * empty or over-long text, for an item that is not this user's or is not named as
  * an item is (`item-ref.ts`), and for a user who
- * has already had `CLAW_ASSISTANT_SAY_MAX_PER_HOUR` messages in the last hour.
+ * has already had `CLAW_ASSISTANT_SAY_MAX_PER_HOUR` messages in the last hour, who
+ * is then told so once (`refusedByCap`).
  */
 export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): Promise<SayOutcome> {
   const text = input.text.trim();
@@ -205,21 +255,33 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
   if (text.length > SAY_TEXT_MAX) throw new SayRefused("text_too_long", `a message is at most ${SAY_TEXT_MAX} characters`);
   const limit = deps.maxPerHour ?? CLAW_ASSISTANT_SAY_MAX_PER_HOUR;
 
-  const stored = await inTransaction(async (q) => {
-    await input.guard?.(q);
-    // One say at a time per user: the cap counts stored rows, and without this a burst
-    // all count the same number and all insert.
-    await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
-    let item: ItemRow | null = null;
-    if (input.itemId?.trim()) {
-      const named = await resolveWorkItem(q, input.userId, input.itemId);
-      if (!named.ok) throw new SayRefused(named.error, named.message);
-      item = await loadItem(q, named.item.item_id, input.userId);
-      if (!item) throw new SayRefused("item_not_found", "no such item");
-    }
-    if (await sayCapReached(q, input.userId, limit)) throw new SayRefused("say_rate_limited", `at most ${limit} messages an hour`);
-    return store(q, { type: "assistant.say", sayId: randomUUID(), userId: input.userId, sessionId: input.sessionId, text, item });
-  }, { retryOnFailover: true });
+  let stored: Stored | null;
+  try {
+    stored = await inTransaction(async (q) => {
+      await input.guard?.(q);
+      // One say at a time per user: the cap counts stored rows, and without this a burst
+      // all count the same number and all insert.
+      await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
+      let item: ItemRow | null = null;
+      if (input.itemId?.trim()) {
+        const named = await resolveWorkItem(q, input.userId, input.itemId);
+        if (!named.ok) throw new SayRefused(named.error, named.message);
+        item = await loadItem(q, named.item.item_id, input.userId);
+        if (!item) throw new SayRefused("item_not_found", "no such item");
+      }
+      // The system's own messages are not counted: they are what is left when the assistant has failed to speak.
+      const recent = Number((await q(
+        `SELECT COUNT(*) AS n FROM claw_assistant_says
+          WHERE user_id = $1 AND NOT fallback AND created_at > NOW() - INTERVAL '1 hour'`,
+        [input.userId],
+      )).rows[0].n);
+      if (recent >= limit) throw new SayCapped(limit);
+      return store(q, { type: "assistant.say", sayId: randomUUID(), userId: input.userId, sessionId: input.sessionId, text, item });
+    }, { retryOnFailover: true });
+  } catch (err) {
+    if (err instanceof SayCapped) throw await refusedByCap(input, text, err, deps);
+    throw err;
+  }
   if (!stored) throw new Error("a fresh say id was already stored");
   await announce(stored, deps, input.turnMessageId);
   return { say_id: stored.sayId, subscribers: stored.subscribers };

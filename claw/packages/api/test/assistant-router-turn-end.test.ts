@@ -10,13 +10,11 @@
  *   T3  a turn that a worker's report started may end silent on purpose: what it wrote is not delivered
  *   T4  a turn that failed, was interrupted or was written by the sweeper delivers none of its words, only the system's notice, once;
  *       a turn that wrote nothing delivers nothing
- *   T5  a text too long for say is cut to fit; an answer the hourly cap refused is not a fault, and is not dropped
- *       silently either: the user is told in the system's words, once per turn
+ *   T5  a text too long for say is cut to fit; a refusal (the hourly cap) is not a fault and stores none of the model's
+ *       words, and the user has the cap's notice instead of nothing
  *   T6  only an assistant's router session is looked at
  *   T7  the completion handler asks for it when a router turn ends, and the user's say is there afterwards
- *   T8  a turn that answers the user and ended with no words because its say was refused by the cap: the same notice;
- *       a turn that is silent with room under the cap, or that a report started, is left alone
- *   T9  a fault delivering it (the database failing over) is tried again by the completion handler, not given up
+ *   T8  a fault delivering it (the database failing over) is tried again by the completion handler, not given up
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -116,7 +114,7 @@ describe("assistant router turn end", { skip }, () => {
     }
   });
 
-  test("T5 a text too long for say is cut to fit, and an answer the cap refused is told as such, once", async () => {
+  test("T5 a text too long for say is cut to fit, and a refusal is not a fault and leaves the user the cap's notice", async () => {
     const long = "x".repeat(700);
     assert.equal(await end(await endedTurn("Tell me everything"), { finalText: long }), "said");
     const [said] = await says();
@@ -131,37 +129,12 @@ describe("assistant router turn end", { skip }, () => {
     assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(emoji), "no half of a character");
 
     await w.q("TRUNCATE claw_assistant_says");
-    const cappedTurn = await endedTurn("Hello");
-    const capped = { sessionId: alice.routerSid, runIds: [cappedTurn.task_id], failed: false, interrupted: false, finalText: "Hi" };
-    assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer(capped, { ...w.sayDeps, maxPerHour: 0 }), "said");
-    const [notice] = await says();
-    assert.deepEqual([notice.text, notice.fallback], [w.mod.routerTurnEnd.sayCapNotice(["Hello"]), true], "the system's words, not the model's");
-    // Once per turn: a completion delivered again finds the notice.
-    assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer(capped, { ...w.sayDeps, maxPerHour: 0 }), "skipped");
-    assert.equal((await says()).length, 1);
-    // In the user's language.
-    assert.match(w.mod.routerTurnEnd.sayCapNotice(["构建怎么样了？"]) ?? "", /上限/);
-  });
-
-  test("T8 a turn that answers the user and ended silent because say was refused by the cap: told, once", async () => {
-    const silent = await endedTurn("Is the build green?");
-    // Room under the cap: a turn that ended without a word did so on its own account, and is left alone.
-    assert.equal(await end(silent, {}), "skipped");
-    assert.equal((await says()).length, 0);
-    // At the cap: the model's say was refused and it had nothing left to try.
-    const atCap = { ...w.sayDeps, maxPerHour: 0 };
-    const capped = { sessionId: alice.routerSid, runIds: [silent.task_id], failed: false, interrupted: false };
-    assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer(capped, atCap), "said");
-    assert.deepEqual((await says()).map((s) => [s.text, s.fallback]), [[w.mod.routerTurnEnd.sayCapNotice(["Is the build green?"]), true]]);
-    assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer(capped, atCap), "skipped", "once per turn");
-    // A turn that a worker's report started may end silent on purpose, cap or not.
-    await w.q("TRUNCATE claw_assistant_says");
-    const report = await endedTurn(REPORT);
-    assert.equal(
-      await w.mod.routerTurnEnd.deliverUnsaidAnswer({ sessionId: alice.routerSid, runIds: [report.task_id], failed: false, interrupted: false }, atCap),
-      "skipped",
+    const capped = await w.mod.routerTurnEnd.deliverUnsaidAnswer(
+      { sessionId: alice.routerSid, runIds: [(await endedTurn("Hello")).task_id], failed: false, interrupted: false, finalText: "Hi" },
+      { ...w.sayDeps, maxPerHour: 0 },
     );
-    assert.equal((await says()).length, 0);
+    assert.equal(capped, "skipped");
+    assert.deepEqual((await says()).map((s) => [s.text, s.fallback]), [[w.mod.outbound.sayCapNotice("Hi"), true]], "the system's words, not the model's");
   });
 
   test("T6 only an assistant's router session is looked at", async () => {
@@ -210,7 +183,7 @@ describe("assistant router turn end", { skip }, () => {
     assert.deepEqual(ended.map((e) => e.messageId), [turn.mid], "the say is the ended turn's: its message id goes with it");
   });
 
-  test("T9 a fault delivering the unsaid answer is tried again by the completion handler", async () => {
+  test("T8 a fault delivering the unsaid answer is tried again by the completion handler", async () => {
     const turn = await w.routerTurn(alice);
     await w.q("UPDATE claw_tasks SET prompt = 'Is the build green?' WHERE task_id = $1", [turn.task_id]);
     const { completionPorts, consumeEventDelivery, tombstoneReader, setUnsaidAnswerRetryDelayForTest } = w.mod.consumer;

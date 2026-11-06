@@ -736,15 +736,19 @@ record it.
   (`25006`): `inTransaction` handed such a connection back to the pool after a clean rollback, to fail the next
   transaction too. The first failover error (`25006`, `57P01`-`57P03`, a `08` connection error or a dropped socket) now
   marks every connection opened before it stale: idle ones are dropped as they are checked out, held ones as they are
-  released. A statement Postgres refused before it ran (`25006`, `57P03`) is sent once more on a new connection after
-  `PG_FAILOVER_RETRY_DELAY_MS` (default 1000); so is a transaction that says it may run twice, which every way the
-  assistant stores a message does. A `say` that faulted tells the Router the message was not delivered and to call `say`
-  again; delivering a Router turn's unsaid answer is tried three times before it is given up, instead of once.
-- A reply the assistant's hourly cap (`CLAW_ASSISTANT_SAY_MAX_PER_HOUR`) refused is no longer dropped without a word. The
-  model's `say` was refused, and so was delivering what it wrote instead, and the user heard nothing for as long as the
-  cap held. A turn that answers the user's own message and ends with its reply refused, or with no words because `say`
-  was, now stores a notice in the system's words that the reply was held back (once per turn, not counted against the
-  cap); a turn a worker's report started is left alone as before.
+  released. A statement is sent once more on a new connection, after `PG_FAILOVER_RETRY_DELAY_MS` (default 1000), when
+  running it twice is the same as running it once: Postgres refused it before it ran (`25006`, `57P03`), or it only
+  reads. A transaction that says it may run twice is retried the same way, and also when its connection went before
+  its `COMMIT` was sent; every way the assistant stores a message says so. A `say` that faulted tells the Router the
+  message was not delivered and to call `say` again; delivering a Router turn's unsaid answer is tried three times
+  before it is given up, instead of once.
+- A reply the assistant's hourly cap (`CLAW_ASSISTANT_SAY_MAX_PER_HOUR`) refused is no longer dropped without a word.
+  The model's `say` was refused, and so was delivering what it wrote instead, and the user heard nothing for as long as
+  the cap held. The first refusal in an hour now tells the user, in their language, that replies are paused and to try
+  again later (a notice in the system's words, not counted against the cap; at most one an hour, so a client that
+  keeps writing at the cap gets one notice and not one per message); the model is told the message was not delivered
+  and not to call `say` again in the turn; and every refusal is counted in `claw_assistant_say_rate_limited_total`, by
+  whether the user was sent the notice.
 - Deleting a session that has no `hands.<sid>` binding and no key on its cleanup notification -- every session the
   retention pass deletes, and every sweeper replay of a delete that already finished -- is a finished teardown with
   nothing to address (`session.cleanup_nothing_addressable`), not `no_platform_key`. Claw holds no handle to anything

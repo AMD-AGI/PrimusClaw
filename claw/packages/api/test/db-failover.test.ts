@@ -16,6 +16,15 @@
  *       a connection from before it
  *   F3  the Router's `say` mid-turn, while the database fails over: the message is stored once and the Router told so
  *   F4  a transaction that did not ask to be retried is not, and the next one runs on the new primary
+ *
+ * The other half of a switchover is the old primary terminating its backends (57P01) under statements in flight. A
+ * statement cut off that way may have taken effect, so only one that only reads is sent again; and a transaction
+ * cut off before its COMMIT was sent rolled back, so one that asked to be retried is run once more.
+ *
+ *   F5  a read cut off by the switchover is sent again once and answers; a write cut off the same way is not sent again
+ *   F6  a transaction that asked to be retried and was cut off before its COMMIT runs once more and lands once; one that
+ *       did not ask fails
+ *   F7  a transaction cut off during its COMMIT is not run again, though it asked: the COMMIT may have taken effect
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -77,6 +86,23 @@ describe("database failover", { skip }, () => {
   }
 
   const promoteSoon = () => setTimeout(() => { void promote(); }, 50);
+
+  /**
+   * The old primary going away under a statement in flight: the backend running the statement tagged `tag` is
+   * terminated (57P01), as a switchover terminates every backend of the server it demotes. Resolves once it has been.
+   */
+  async function terminateWhenRunning(tag: string): Promise<void> {
+    for (let i = 0; i < 500; i += 1) {
+      const hit = await admin.query(
+        `SELECT pg_terminate_backend(pid) AS done FROM pg_stat_activity
+          WHERE pid <> pg_backend_pid() AND state = 'active' AND query LIKE $1`,
+        [`%${tag}%`],
+      );
+      if (hit.rows.some((r) => r.done)) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail(`no statement tagged ${tag} ever ran`);
+  }
   const probes = async () => Number((await w.q("SELECT COUNT(*)::int AS n FROM failover_probe"))[0].n);
 
   test("F1 a statement refused as read-only is sent again once, on a new connection, and stored once", async () => {
@@ -134,5 +160,69 @@ describe("database failover", { skip }, () => {
     });
     assert.ok(!old.includes(pid));
     assert.deepEqual((await w.q("SELECT note FROM failover_probe")).map((r) => r.note), ["next"]);
+  });
+
+  test("F5 a read cut off by the switchover is sent again once and answers; a write cut off the same way is not", async () => {
+    const { isIdempotentStatement } = w.h.app.db;
+    for (const read of ["SELECT 1", "  select updated_at, deleted_at FROM t WHERE id = $1", "WITH x AS (SELECT 1) SELECT * FROM x"]) {
+      assert.equal(isIdempotentStatement(read), true, read);
+    }
+    for (const notOnly of [
+      "UPDATE t SET x = 1", "SELECT * FROM t FOR UPDATE", "SELECT nextval('s')", "SELECT pg_advisory_lock(1)",
+      "SELECT 1; DELETE FROM t", "WITH x AS (DELETE FROM t RETURNING 1) SELECT * FROM x", "SELECT * INTO t2 FROM t",
+    ]) {
+      assert.equal(isIdempotentStatement(notOnly), false, notOnly);
+    }
+
+    const [read] = await Promise.all([
+      w.h.app.db.db.query("SELECT pg_sleep(0.4) AS slept, 'f5-read' AS tag, 42 AS answer"),
+      terminateWhenRunning("f5-read"),
+    ]);
+    assert.equal(read.rows[0].answer, 42);
+
+    const write = w.h.app.db.db.query(
+      "WITH w AS (INSERT INTO failover_probe (note) VALUES ('f5-write') RETURNING id) SELECT pg_sleep(0.4), (SELECT COUNT(*) FROM w) AS n",
+    );
+    await terminateWhenRunning("f5-write");
+    await assert.rejects(write, (err: { code?: string; message?: string }) =>
+      err.code === "57P01" || /^Connection terminated/.test(err.message ?? ""));
+    assert.equal(await probes(), 0, "a statement that may have taken effect is not run again");
+  });
+
+  test("F6 a transaction that asked to be retried and was cut off before its COMMIT runs once more and lands once", async () => {
+    let runs = 0;
+    const cutOff = (tag: string) => async (q: (text: string, params?: unknown[]) => Promise<pg.QueryResult>) => {
+      runs += 1;
+      await q("INSERT INTO failover_probe (note) VALUES ($1)", [tag]);
+      if (runs === 1) await Promise.all([q(`SELECT pg_sleep(0.4), '${tag}-sleep'`), terminateWhenRunning(`${tag}-sleep`)]);
+    };
+    await w.h.app.db.inTransaction(cutOff("f6-retried"), { retryOnFailover: true });
+    assert.equal(runs, 2);
+    assert.deepEqual((await w.q("SELECT note FROM failover_probe")).map((r) => r.note), ["f6-retried"], "stored once");
+
+    runs = 0;
+    await assert.rejects(w.h.app.db.inTransaction(cutOff("f6-not-asked")), (err: { code?: string; message?: string }) =>
+      err.code === "57P01" || /^Connection terminated/.test(err.message ?? ""));
+    assert.equal(runs, 1);
+    assert.equal(await probes(), 1);
+  });
+
+  test("F7 a transaction cut off during its COMMIT is not run again, though it asked", async () => {
+    // A deferred trigger that takes a while: the transaction's COMMIT is the statement in flight when the backend goes.
+    await w.q("CREATE TABLE IF NOT EXISTS failover_slow_commit (id int)");
+    await w.q(`CREATE OR REPLACE FUNCTION failover_slow_commit() RETURNS trigger LANGUAGE plpgsql AS
+      $$ BEGIN PERFORM pg_sleep(0.4); RETURN NULL; END $$`);
+    await w.q("DROP TRIGGER IF EXISTS failover_slow_commit ON failover_slow_commit");
+    await w.q(`CREATE CONSTRAINT TRIGGER failover_slow_commit AFTER INSERT ON failover_slow_commit
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION failover_slow_commit()`);
+    let runs = 0;
+    const tx = w.h.app.db.inTransaction(async (q) => {
+      runs += 1;
+      await q("INSERT INTO failover_slow_commit VALUES (1)");
+    }, { retryOnFailover: true });
+    await terminateWhenRunning("COMMIT");
+    await assert.rejects(tx, (err: { code?: string; message?: string }) =>
+      err.code === "57P01" || /^Connection terminated/.test(err.message ?? ""));
+    assert.equal(runs, 1, "a COMMIT that may have taken effect is not followed by a second run");
   });
 });

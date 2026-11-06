@@ -523,11 +523,12 @@ describe("assistant tools", { skip }, () => {
     assert.equal(await code(t().say(turn, { text: "x".repeat(601) }, w.sayDeps)), "text_too_long");
     assert.equal(await code(t().say(turn, { text: "   " }, w.sayDeps)), "empty_text");
     assert.equal(await code(t().say(turn, { text: "hi" }, { ...w.sayDeps, maxPerHour: 1 })), "say_rate_limited");
-    assert.equal(await count("claw_assistant_says"), 1, "none of the refused ones was stored");
+    assert.equal(await count("claw_assistant_says", "NOT fallback"), 1, "none of the refused ones was stored");
+    assert.equal(await count("claw_assistant_says", "fallback"), 1, "the cap's refusal left the user its notice");
 
     // A turn that is over does not get a second chance by being slow.
     await w.closeRun(turn.task_id);
     assert.equal(await code(t().say(turn, { text: "late" }, w.sayDeps)), "turn_not_live");
-    assert.equal(await count("claw_assistant_says"), 1);
+    assert.equal(await count("claw_assistant_says"), 2);
   });
 });

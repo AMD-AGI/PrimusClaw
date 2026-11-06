@@ -278,8 +278,9 @@ if (DB_SCHEMA) {
 // whole pool, not about that one client: every connection opened before it is
 // dropped, the idle ones when they are next checked out through
 // `checkoutCurrent` and the held ones when they are released, and the
-// statement that met it is retried once on a new connection when Postgres has
-// said it never ran.
+// statement that met it is retried once on a new connection when running it
+// twice is the same as running it once: Postgres said it never ran, or it only
+// reads.
 
 /** SQLSTATEs that mean this connection is not on the primary any more, or the server is going away under it. */
 const FAILOVER_SQLSTATES = new Set([
@@ -309,6 +310,25 @@ export function isFailoverError(err: unknown): boolean {
 export function failedBeforeRunning(err: unknown): boolean {
   const code = (err as { code?: unknown } | null | undefined)?.code;
   return typeof code === "string" && NOT_RUN_SQLSTATES.has(code);
+}
+
+/** Where a statement that only reads may start. */
+const READ_STATEMENT = /^\s*(?:select|with|values|table|show)\b/i;
+/**
+ * Words a statement that only reads does not contain: a write, a lock, a sequence draw, a notification, a call into
+ * code that may do any of those. Matched anywhere in the text, inside a string or a column name too, so a read that
+ * happens to say one of them is not retried: a missed retry costs one error, a wrong one runs a write twice.
+ */
+const NOT_ONLY_A_READ =
+  /\b(?:insert|update|delete|merge|truncate|copy|call|do|into|lock|notify|listen|nextval|setval|set_config|pg_advisory\w*|pg_try_advisory\w*|pg_notify|pg_terminate_backend|pg_cancel_backend|lo_\w+|dblink\w*|txid_current\w*|pg_current_xact_id\w*)\b/i;
+
+/**
+ * A single statement that only reads, so running it twice is the same as running it once: the one kind sent again
+ * after a failover error that can come after a statement took effect (57P01, a dropped socket). Judged from the text,
+ * and anything it cannot tell is not one.
+ */
+export function isIdempotentStatement(text: string): boolean {
+  return READ_STATEMENT.test(text) && !text.includes(";") && !NOT_ONLY_A_READ.test(text);
 }
 
 /** How long a retry after a failover waits, so the Service has moved to the new primary. */
@@ -360,9 +380,9 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * One statement on the main pool. A statement that met a failover error marks
- * the pool's connections stale; one that Postgres refused before it ran is
- * sent once more, on a connection made since, after a pause long enough for
- * the Service to point at the new primary.
+ * the pool's connections stale; one that Postgres refused before it ran, or
+ * one that only reads, is sent once more, on a connection made since, after a
+ * pause long enough for the Service to point at the new primary.
  */
 async function query(text: string, params?: unknown[]): Promise<pg.QueryResult> {
   try {
@@ -370,7 +390,7 @@ async function query(text: string, params?: unknown[]): Promise<pg.QueryResult> 
   } catch (err) {
     if (!isFailoverError(err)) throw err;
     noteFailover(err);
-    if (!failedBeforeRunning(err)) throw err;
+    if (!failedBeforeRunning(err) && !isIdempotentStatement(text)) throw err;
     logger.warn({ code: (err as { code?: unknown }).code }, "db.failover_retry");
     await sleep(FAILOVER_RETRY_DELAY_MS);
     const client = await checkoutCurrent(pool);
@@ -416,18 +436,28 @@ export async function inTransaction<T>(
   try {
     return await transactionOnce(run);
   } catch (err) {
-    // Only for a caller that said `run` may run twice: the database is as it was (Postgres refused the
-    // statement before it ran, and the transaction rolled back), but what `run` did besides is not ours to know.
-    if (!opts.retryOnFailover || !failedBeforeRunning(err)) throw err;
+    // Only for a caller that said `run` may run twice: the database is as it was (Postgres refused the statement
+    // before it ran, or the connection went before COMMIT was sent, and the transaction rolled back), but what `run`
+    // did besides is not ours to know.
+    if (!opts.retryOnFailover || !(failedBeforeRunning(err) || rolledBackByFailover.has(err as object))) throw err;
     logger.warn({ code: (err as { code?: unknown }).code }, "db.failover_retry");
     await sleep(FAILOVER_RETRY_DELAY_MS);
     return transactionOnce(run);
   }
 }
 
+/**
+ * Failover errors a transaction met before its COMMIT was sent. Whatever the error, such a transaction did not take
+ * effect: the server rolls back a transaction whose connection it ends, and one that is still there is rolled back
+ * here. A failover error on the COMMIT itself is not one of them: the COMMIT may have taken effect before the answer
+ * was lost.
+ */
+const rolledBackByFailover = new WeakSet<object>();
+
 async function transactionOnce<T>(run: (query: Querier) => Promise<T>): Promise<T> {
   const client = await checkoutCurrent(pool);
   let broken = false;
+  let committing = false;
   try {
     try {
       // Inside the catch that rolls back, because a `BEGIN` that failed on the
@@ -435,6 +465,7 @@ async function transactionOnce<T>(run: (query: Querier) => Promise<T>): Promise<
       // is careful not to hand on.
       await client.query("BEGIN");
       const result = await run((text, params) => client.query(text, params));
+      committing = true;
       await client.query("COMMIT");
       return result;
     } catch (err) {
@@ -443,6 +474,7 @@ async function transactionOnce<T>(run: (query: Querier) => Promise<T>): Promise<
       if (isFailoverError(err)) {
         noteFailover(err);
         broken = true;
+        if (!committing) rolledBackByFailover.add(err as object);
       }
       await client.query("ROLLBACK").catch((rollbackErr: unknown) => {
         broken = true;
