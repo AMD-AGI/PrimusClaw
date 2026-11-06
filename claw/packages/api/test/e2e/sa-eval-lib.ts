@@ -421,7 +421,7 @@ export const CAPABILITY_DENIAL = new RegExp([
     // "I can't check whether there are more PRs beyond this page" is a caveat about what it read, not an inability.
     + "(?!\\s+(?:[^\\s,.;:!?]+\\s+){0,6}?(?:whether|if)\\b)",
   // "see" and "view" only of a system or the user's data, named within a few words: "I can't see any failed runs" is an answer.
-  "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:see|view) (?:[^\\s.!?。，,]+ ){0,6}?"
+  "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:see|view) (?!(?:any|anything|no|a single)\\b)(?:[^\\s.!?。，,]+ ){0,6}?"
     + "(?:github\\b|repos?\\b|repositor(?:y|ies)\\b|PRs?\\b|pull requests?\\b|safe\\b|workloads?\\b|clusters?\\b|dispatron\\b|autopilot\\b|pulse\\b|"
     + "(?:the )?web\\b|web ?pages?\\b|internet\\b|(?:the )?board\\b)",
   "\\bI (?:don(?:'|’)?t|do not)(?: (?:currently|yet|really|actually))? have (?:any )?(?:access|permission|internet|web access|a tool|the tools?|tools?)\\b",
@@ -474,10 +474,18 @@ export function falseDenials(final: string, calls: readonly ToolCall[], request 
   const out: string[] = [];
   const seen = new Set<number>();
   const judge = (at: number, words: string, needsSystem: boolean): void => {
-    const sentence = sentenceAt(at);
-    // A denial that names nothing ("I can't access it right now") is about what the user asked for, when the request names it.
-    const named = systemsOf(sentence).length ? systemsOf(sentence) : needsSystem ? [] : systemsOf(request);
-    if (needsSystem && !named.length) return;   // "I can't …" of nothing it names: an answer, not a denial
+    // The clause of the denial, not the whole sentence: "I found two PRs on GitHub, but I can't access SaFE" denies SaFE only.
+    const whole = sentenceAt(at);
+    const offset = at - (sentences.find((x) => at >= x.at && at < x.at + x.text.length)?.at ?? 0);
+    const cuts = [...whole.matchAll(/[;；，,]|\b(?:but|however|although|though|while)\b|但是|但|不过|可是/gi)].map((m) => m.index!);
+    const from = Math.max(0, ...cuts.filter((i) => i <= offset));
+    const to = Math.min(whole.length, ...cuts.filter((i) => i > offset));
+    const clause = whole.slice(from, to);
+    const sentence = systemsOf(clause).length ? clause : whole;
+    // A denial that names nothing ("I can't access it right now", "I'm not connected to it") is about what the user asked for,
+    // when the request names it.
+    const named = systemsOf(sentence).length ? systemsOf(sentence) : systemsOf(request);
+    if (needsSystem && !named.length) return;   // "I can't …" of nothing it or the request names: an answer, not a denial
     if (needsSystem && CONSENT.test(sentence)) return;   // "I can't delete it on SaFE without your approval": the approval flow
     const start = sentences.find((x) => at >= x.at && at < x.at + x.text.length)?.at ?? -1;
     if (seen.has(start) && needsSystem) return;  // one denial per sentence is enough to grade it
@@ -678,9 +686,13 @@ export function grade(c: EvalCase, o: Observed): Check[] {
     out.push({ name: `no internal text: ${label}`, pass: m === null, detail: m ? m[0] : undefined });
   }
   if (!c.may_deny) {
-    // A denial can be true when a call to what it denies failed in the turn; any other denial is the failure this rule is for.
-    const unjustified = falseDenials(o.final, o.calls, c.turns.at(-1)?.user ?? "");
-    out.push({ name: "no false denial", pass: unjustified.length === 0, detail: unjustified[0] });
+    // The rule is the judge's (it sees the turn's calls). What the detectors find is a denial no failed call explains: they never
+    // fail a case by themselves (a caveat they mistake for a denial must not fail a right answer); they make it unverified, so a
+    // run without a judge does not count it as a pass, and a judge decides it.
+    const unexplained = falseDenials(o.final, o.calls, c.turns.at(-1)?.user ?? "");
+    out.push(unexplained.length
+      ? { name: "no false denial", pass: true, skipped: true, unverified: true, detail: `${unexplained[0]}: a denial no failed call explains; the judge decides` }
+      : { name: "no false denial", pass: true });
   }
   if (c.style?.no_ids) {
     const m = BARE_NUMBER.exec(shownText);
@@ -815,9 +827,10 @@ export function judgePrompt(c: EvalCase, turns: readonly Turn[], final: string, 
  */
 export function verdictOf(c: EvalCase, checks: readonly Check[], judge: { pass: boolean } | null | undefined): { pass: boolean; unjudged?: true } {
   if (!passed(checks)) return { pass: false };
+  // A judge, where one is configured, grades every case (at least the no-false-denial rule, with the turn's calls): its verdict
+  // decides, also what the denial detectors left to it.
+  if (judge) return checks.some((x) => x.unverified && x.name !== "no false denial") ? { pass: false, unjudged: true } : { pass: judge.pass };
   if (checks.some((x) => x.unverified)) return { pass: false, unjudged: true };
-  // A judge, where one is configured, grades every case (at least the no-false-denial rule): its FAIL fails any case.
-  if (judge) return { pass: judge.pass };
   return needsJudge(c) ? { pass: false, unjudged: true } : { pass: true };
 }
 

@@ -397,7 +397,7 @@ test("S15 runnable oracles, and what the judge is shown", () => {
 test("S16 no false denial of a capability", () => {
   const c = caseOf({ route: "answer" });
   const denied = (final: string, calls: ToolCall[] = [], over: Partial<EvalCase> = {}) =>
-    failed(caseOf({ ...c, ...over }), observed({ final, calls })).includes("no false denial");
+    grade(caseOf({ ...c, ...over }), observed({ final, calls })).find((x) => x.name === "no false denial")?.unverified === true;
   // The words of the first form are what a check names; "not connected" carries no verb, so it is reported by its own words.
   assert.ok(denied("I'm not connected to GitHub, so I can't pull the open PRs.", [call("mcp__github__issue_search")]),
     "a GitHub call that succeeded does not excuse it");
@@ -467,7 +467,7 @@ test("S16 no false denial of a capability", () => {
   assert.ok(!denied("我无法访问 GitHub。", [bash("cd repo && git push", "fatal: Authentication failed for 'https://github.com/o/r.git/'")]));
   // A denial that names nothing is about what the user asked for: only a failure of that system excuses it.
   const asked = (final: string, calls: ToolCall[]) =>
-    failed(caseOf({ turns: [{ user: "我在 GitHub 上还有哪些开着的 PR？" }] }), observed({ final, calls })).includes("no false denial");
+    grade(caseOf({ turns: [{ user: "我在 GitHub 上还有哪些开着的 PR？" }] }), observed({ final, calls })).find((x) => x.name === "no false denial")?.unverified === true;
   assert.ok(asked("I can't access it right now.", [bash("gh pr list", "bash: gh: command not found")]), "GitHub was never reached");
   assert.ok(!asked("I can't access it right now.", [call("mcp__github__issue_search", false)]));
   assert.ok(!denied("I can't access it right now.", [call("mcp__safe__node_list", false)]), "a request that names nothing: any failure");
@@ -480,8 +480,19 @@ test("S16 no false denial of a capability", () => {
   assert.ok(denied("I cannot access Dispatron. I cannot access SaFE.", [call("mcp__dispatron__get_runs", false)]));
   assert.ok(!denied("I cannot access Dispatron. I cannot access SaFE.", [call("mcp__dispatron__get_runs", false), call("mcp__safe__node_list", false)]));
   assert.ok(denied("我无法访问 SaFE 和 Dispatron。", [call("mcp__dispatron__get_runs", false)]));
-  const check = grade(c, observed({ final: "我读不了 GitHub" })).find((x) => x.name === "no false denial");
-  assert.equal(check?.detail, "我读不了");
+  // Round 15: a result that is empty, and a true denial beside a lookup that worked, are not denials no call explains; an unnamed
+  // "not connected" is bound to the request.
+  assert.ok(!denied("I can't see any open PRs of yours on GitHub.", [call("mcp__github__issue_search")]));
+  assert.ok(!denied("I found two PRs on GitHub, but I can't access SaFE right now.", [call("mcp__github__issue_search"), call("mcp__safe__node_list", false)]));
+  assert.ok(asked("I'm not connected to it right now.", []), "the request names GitHub");
+  // What a detector finds never fails a case by itself: it is unverified, and the judge (or, without one, nobody) decides.
+  const flagged = grade(c, observed({ final: "我读不了 GitHub" }));
+  assert.ok(passed(flagged), "no deterministic failure");
+  assert.deepEqual(verdictOf(c, flagged, null), { pass: false, unjudged: true }, "without a judge: not a pass");
+  assert.deepEqual(verdictOf(c, flagged, { pass: false }), { pass: false }, "the judge says it is a false denial");
+  assert.deepEqual(verdictOf(c, flagged, { pass: true }), { pass: true }, "the judge says it is a caveat");
+  const check = flagged.find((x) => x.name === "no false denial");
+  assert.equal(check?.detail, "我读不了: a denial no failed call explains; the judge decides");
 });
 
 test("S17 the static check", () => {
