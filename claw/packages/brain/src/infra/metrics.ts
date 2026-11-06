@@ -190,6 +190,18 @@ const processFaultTotal = new Counter({
   registers: [registry],
 });
 
+const deadHolderLockTakeoverTotal = new Counter({
+  name: "claw_brain_dead_holder_lock_takeover_total",
+  help: "Task locks taken over from a holder that stopped renewing them (a brain lost with its node), for a run the API had already requeued to this pod.",
+  registers: [registry],
+});
+
+const lockSelfFencedTotal = new Counter({
+  name: "claw_brain_lock_self_fenced_total",
+  help: "Runs that stopped because their task lock had gone unrenewed for long enough that another brain could soon take it over (the holder gives up first).",
+  registers: [registry],
+});
+
 const lockReleaseSkippedTotal = new Counter({
   name: "claw_brain_lock_release_skipped_total",
   help: "Session-lock release calls that detected we are no longer the holder (INV-13 protection fired).",
@@ -958,6 +970,12 @@ export const metrics = {
   },
   onProcessFault(kind: "unhandled_rejection" | "uncaught_exception"): void {
     processFaultTotal.inc({ kind });
+  },
+  onDeadHolderLockTakenOver(): void {
+    deadHolderLockTakeoverTotal.inc();
+  },
+  onLockSelfFenced(): void {
+    lockSelfFencedTotal.inc();
   },
   onLockReleaseSkipped(reason: "not_holder" | "cas_lost" | "legacy_format"): void {
     lockReleaseSkippedTotal.inc({ reason });

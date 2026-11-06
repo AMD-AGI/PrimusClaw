@@ -21,7 +21,7 @@ import { NatsError } from "nats";
 import { isRetryable } from "../src/infra/retry.js";
 import { isTransientNatsError } from "../src/infra/nats-transient.js";
 import { __test__ } from "../src/tasks/runner.js";
-import { EMIT_RETRY_DELAYS_MS, NatsEmitter } from "../src/events/emitter.js";
+import { EMIT_RETRY_DELAYS_MS, EmitStoodDownError, NatsEmitter } from "../src/events/emitter.js";
 
 const { classifyTaskFailure, classifyRetryableReason } = __test__;
 
@@ -97,4 +97,18 @@ test("S3 a refusal is thrown at once, and a stall that outlasts the budget is th
   // The bound is what was measured, with room: the 2026-11-06 stall was ~20s.
   const sleptMs = EMIT_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0);
   assert.ok(sleptMs >= 20_000 && sleptMs <= 60_000, `retry sleeps total ${sleptMs}ms`);
+});
+
+test("S4 a publish whose sender stands down mid-stall is not sent again", async () => {
+  const { emitter, calls } = scriptedEmitter([natsTimeout(), natsTimeout(), null]);
+  let mine = true;
+  (emitter as unknown as { sleep: (ms: number) => Promise<void> }).sleep = async () => { mine = false; };
+  await assert.rejects(
+    emitter.emit("s1", { type: "exec_complete" }, { stillMine: () => mine }),
+    (err) => err instanceof EmitStoodDownError,
+  );
+  assert.equal(calls.length, 1, "the one attempt made before the stand-down, and no retry after it");
+  const { emitter: e2, calls: c2 } = scriptedEmitter([null]);
+  await assert.rejects(e2.emit("s1", { type: "exec_complete" }, { stillMine: () => false }));
+  assert.equal(c2.length, 0, "nothing at all once it has already stood down");
 });

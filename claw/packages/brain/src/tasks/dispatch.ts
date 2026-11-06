@@ -629,7 +629,14 @@ async function handleResolvedRequest(
 
   // 1. Distributed lock (NATS KV) on the same lockKey so cross-pod
   //    handlers don't race either.
-  const locked = await acquireTaskLock(lockKey, msg.seq);
+  // A claimed doorbell is a run the API has fenced: the claim bumped its
+  // claim_count, so whoever ran it before can no longer renew or settle it.
+  // That is what allows a lock its previous holder left behind -- a brain lost
+  // with its node -- to be taken over rather than waited out.
+  const locked = await acquireTaskLock(lockKey, msg.seq, {
+    taskId: request.task_id || undefined,
+    takeOverDeadHolder: claimedDoorbell,
+  });
   if (!locked) {
     await deferForLockContention(msg, request, {
       sessionId, lockKey, claimedDoorbell, taskId: request.task_id,

@@ -34,7 +34,8 @@ import {
   type AttemptRecord,
 } from "@claw/protocol";
 import {
-  CLAW_ASSISTANT_ENABLED, envBool, envInt, LEASE_LOST_GRACE_SEC, RUN_FAT_PREPARING_RECONCILE, TASK_SWEEPER_TICK_MS,
+  CLAW_ASSISTANT_ENABLED, DOORBELL_DEAD_LEASE_GRACE_SEC, DOORBELL_TAKEOVER_SWEEP_MS, RUN_LEASE_HEARTBEAT_MS, RUN_LEASE_TTL_MS,
+  envBool, envInt, LEASE_LOST_GRACE_SEC, RUN_FAT_PREPARING_RECONCILE, TASK_SWEEPER_TICK_MS,
 } from "../config.js";
 import { nc, taskDeliverySettlement } from "../infra/nats.js";
 import { LEADER_LOCK_IDS, type LeaderLease, withLeaderLock } from "../infra/leader-lock.js";
@@ -366,6 +367,7 @@ export const sweeperPorts = {
 
 let stopped = false;
 let timer: NodeJS.Timeout | null = null;
+let takeoverTimer: NodeJS.Timeout | null = null;
 
 /**
  * Backstop for runs that outlived their budget and did not stop themselves.
@@ -642,7 +644,10 @@ export async function reapStuckDagRoots(): Promise<number> {
  * statement, because a `--` comment inside a template literal survives only as
  * long as nobody collapses the string onto one line.
  */
-export async function requeueLostDoorbellLeases(): Promise<number> {
+export async function requeueLostDoorbellLeases(
+  graceSec: number = LEASE_LOST_GRACE_SEC,
+  event = "sweeper.requeued_lost_doorbell_leases",
+): Promise<number> {
   const rows = await applyTaskStatusTransition("queued", {
     extra: {
       lease_owner: null,
@@ -660,17 +665,85 @@ export async function requeueLostDoorbellLeases(): Promise<number> {
         AND lease_expires_at IS NOT NULL
         AND lease_expires_at < NOW() - ($1::int * INTERVAL '1 second')
         AND (deadline_at IS NULL OR deadline_at > NOW())`,
-    params: [LEASE_LOST_GRACE_SEC],
+    params: [graceSec],
   });
   if (!rows.length) return 0;
   logger.warn(
-    { requeued: rows.length, graceSec: LEASE_LOST_GRACE_SEC,
+    { requeued: rows.length, graceSec,
       rows: rows.map((row: ClawTaskRow) => ({ task_id: row.task_id, session_id: row.session_id })) },
-    "sweeper.requeued_lost_doorbell_leases",
+    event,
   );
   metrics.onDoorbellLeaseRequeued(rows.length);
   metrics.onQueueEntered("requeue", rows.length);
   return rows.length;
+}
+
+/**
+ * Whether this process has been able to hear lease renewals for long enough to
+ * judge them, as of `now`; and the bookkeeping that answers it.
+ *
+ * A lease that looks expired is only evidence of a dead worker if the renewals
+ * that would have extended it could have landed. They cannot while this
+ * process is not running (a fresh pod, or the whole API rolled at once) or
+ * while the database is not answering it -- and in both cases the renewals
+ * of perfectly healthy brains failed too, so every lease in the table is
+ * expired the moment things come back. Requeueing then would hand live runs
+ * to other brains (they would find the lock fresh and defer, but the live
+ * holder's next renewal is refused and its turn restarts from a checkpoint).
+ * So the fast pass waits one whole lease TTL of clean observation first:
+ * from its first successful round trip, and again after any pass that failed
+ * or took longer than a heartbeat. The slow reaper's long grace already
+ * outlasts such a window and is left as it is.
+ */
+export class LeaseObservation {
+  private since: number | null = null;
+  constructor(private readonly windowMs: number, private readonly slowMs: number) {}
+  /** True when a pass may act. */
+  ready(now: number): boolean {
+    return this.since !== null && now - this.since >= this.windowMs;
+  }
+  /** After each pass, with how long it took and whether it failed. */
+  record(now: number, tookMs: number, failed: boolean): void {
+    if (failed || tookMs > this.slowMs) this.since = null;
+    else if (this.since === null) this.since = now;
+  }
+}
+
+const deadLeaseObservation = new LeaseObservation(RUN_LEASE_TTL_MS, RUN_LEASE_HEARTBEAT_MS);
+
+/**
+ * Hand a doorbell run whose brain was lost with its node to another brain,
+ * one or two minutes after the loss rather than eleven.
+ *
+ * A brain restarted in place gives its runs back itself (release-orphans). One
+ * whose node went away is rescheduled under a new name, so nothing ever speaks
+ * for the dead id: its runs used to wait for the lease, the registry TTL on
+ * its `lock.<key>` and LEASE_LOST_GRACE_SEC -- 675 s measured on 2026-11-06.
+ * This is the same requeue with DOORBELL_DEAD_LEASE_GRACE_SEC instead, run on
+ * its own short loop; brain completes it by taking the stale lock over for the
+ * run it was handed (task-lock `deadHolderTakeover`).
+ *
+ * Exclusive execution does not rest on this guess being right. The claim that
+ * follows bumps `claim_count`, so the previous holder's renewals and its
+ * `agent_done` are refused from then on; and the next brain takes the lock
+ * only if nobody has rewritten it for TASK_LOCK_DEAD_HOLDER_MS -- a holder
+ * that is alive but cut off from the API is still renewing that, and keeps it.
+ */
+export async function requeueDeadDoorbellLeases(now = Date.now()): Promise<number> {
+  if (DOORBELL_DEAD_LEASE_GRACE_SEC <= 0) return 0;
+  const act = deadLeaseObservation.ready(now);
+  const started = Date.now();
+  let failed = true;
+  try {
+    // Until the window is full, a bare round trip: it is the observation.
+    const n = act
+      ? await requeueLostDoorbellLeases(DOORBELL_DEAD_LEASE_GRACE_SEC, "sweeper.requeued_dead_doorbell_leases")
+      : (await db.query("SELECT 1"), 0);
+    failed = false;
+    return n;
+  } finally {
+    deadLeaseObservation.record(Date.now(), Date.now() - started, failed);
+  }
 }
 
 /**
@@ -3078,7 +3151,7 @@ export async function sweeperTick(): Promise<void> {
   // Ahead of the wait-external and session scans, and after the deadline
   // backstop, so a run that is both past its budget and abandoned is closed
   // with the reason that explains it rather than the one that noticed second.
-  await runContained("sweeper.requeued_doorbell_leases_failed", requeueLostDoorbellLeases);
+  await runContained("sweeper.requeued_doorbell_leases_failed", () => requeueLostDoorbellLeases());
   await runContained("sweeper.lost_leases_failed", reapLostLeases);
   // After the reapers that close a task: a run they closed mid-finish is handed back here.
   // First one closed before its holder reached `finishing`, so the requeue below takes it in this tick.
@@ -3167,6 +3240,18 @@ export function startSweeper(): void {
   };
   void loop();
   logger.info({ tickMs: TASK_SWEEPER_TICK_MS }, "sweeper.started");
+  if (DOORBELL_DEAD_LEASE_GRACE_SEC > 0) {
+    const takeover = async () => {
+      if (stopped) return;
+      await runContained("sweeper.requeued_dead_doorbell_leases_failed", () => requeueDeadDoorbellLeases());
+      if (!stopped) takeoverTimer = setTimeout(takeover, DOORBELL_TAKEOVER_SWEEP_MS);
+    };
+    takeoverTimer = setTimeout(takeover, DOORBELL_TAKEOVER_SWEEP_MS);
+    logger.info(
+      { tickMs: DOORBELL_TAKEOVER_SWEEP_MS, graceSec: DOORBELL_DEAD_LEASE_GRACE_SEC },
+      "sweeper.dead_lease_takeover_started",
+    );
+  }
 }
 
 export function stopSweeper(): void {
@@ -3174,6 +3259,10 @@ export function stopSweeper(): void {
   if (timer) {
     clearTimeout(timer);
     timer = null;
+  }
+  if (takeoverTimer) {
+    clearTimeout(takeoverTimer);
+    takeoverTimer = null;
   }
 }
 

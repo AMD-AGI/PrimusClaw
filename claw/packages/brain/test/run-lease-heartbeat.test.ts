@@ -18,10 +18,11 @@ import type { ExecuteRequest, ExecuteResult } from "@claw/protocol";
 import {
   bindTaskRunnerDeps,
   runHandleTask,
+  SELF_FENCE_CHECK_MS,
   type TaskRunnerSideEffects,
 } from "../src/tasks/runner.js";
 import type { Engine, ExecuteExtras } from "../src/agent/index.js";
-import type { NatsEmitter } from "../src/events/emitter.js";
+import { EmitStoodDownError, type NatsEmitter } from "../src/events/emitter.js";
 import {
   activeAbort, LEASE_LOST_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "../src/tasks/abort-registry.js";
@@ -95,6 +96,8 @@ interface ScenarioControls {
    * a task id alone cannot tell this attempt from the delivery before it.
    */
   attemptId: () => string | null;
+  /** The signal the runner handed the engine: what stops the turn. */
+  signal: AbortSignal;
 }
 
 async function runScenario(opts: {
@@ -106,12 +109,22 @@ async function runScenario(opts: {
     extras: ExecuteExtras | undefined, ctl: ScenarioControls,
   ) => Promise<ExecuteResult>;
   leaseVerdict?: (n: number) => string;
+  /** Side effects to replace on top of the scenario's own. */
+  overrides?: Partial<TaskRunnerSideEffects>;
+  /** Run as a claimed doorbell holding this generation. */
+  claimCount?: number;
 }) {
   const renewals: LeaseRenewal[] = [];
+  const emitted: string[] = [];
+  const completions: Array<Record<string, unknown>> = [];
   const { msg } = fakeMsg();
   const { kv } = fakeKv();
   const { kv: kvCkpt } = fakeKv();
-  const emitter = { async emit() {} } as unknown as NatsEmitter;
+  const emitter = { async emit(_s: string, evt: Record<string, unknown>, o?: { stillMine?: () => boolean }) {
+    if (o?.stillMine && !o.stillMine()) throw new EmitStoodDownError(String(evt.type));
+    emitted.push(String(evt.type));
+    if (evt.type === "exec_complete") completions.push(evt);
+  } } as unknown as NatsEmitter;
   const noop = <T>(value: T) => (..._a: unknown[]) => Promise.resolve(value) as never;
 
   let releaseHands = () => {};
@@ -152,12 +165,13 @@ async function runScenario(opts: {
     releaseTaskLock: noop(undefined),
     flushTranscript: (() => Promise.resolve()) as never,
     makeHandsClient: (() => ({ close: async () => {} })) as never,
+    ...opts.overrides,
   } as unknown as TaskRunnerSideEffects;
 
   const engine: Engine = {
-    async execute(_req, _onEvent, _signal, _hands, extras) {
+    async execute(_req, _onEvent, signal, _hands, extras) {
       return opts.engineBehavior
-        ? opts.engineBehavior(extras, { kv, releaseHands, attemptId: () => attemptId })
+        ? opts.engineBehavior(extras, { kv, releaseHands, attemptId: () => attemptId, signal: signal! })
         : result();
     },
   };
@@ -177,8 +191,11 @@ async function runScenario(opts: {
   const abortCtrl = new AbortController();
   const lockKey = `lock.${SESSION}`;
   activeAbort.set(lockKey, abortCtrl);
-  await runHandleTask(msg, request, SESSION, lockKey, MESSAGE, "u1", abortCtrl);
-  return { renewals, abortCtrl };
+  await runHandleTask(
+    msg, request, SESSION, lockKey, MESSAGE, "u1", abortCtrl,
+    opts.claimCount === undefined ? null : { claimCount: opts.claimCount },
+  );
+  return { renewals, abortCtrl, emitted, completions };
 }
 
 test("a run with a lease claims it before it starts working", async () => {
@@ -498,4 +515,68 @@ test("but a run whose row is merely running is left alone", async () => {
   });
 
   assert.equal(abortCtrl.signal.aborted, false, "a live row is not a stop");
+});
+
+test("a run past its lock's self-fence stops on the local check, without waiting for a hung renewal", async (t) => {
+  // Cut off from NATS and from the API: the lock renewal never answers, and the
+  // lease renewals fail at the transport, which is "not a verdict". The only
+  // thing that can stop this run before another brain takes its lock over is
+  // the local fence (tasks/lock.ts lockSelfFenceMs).
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let fenced = false;
+  let abortReason: unknown;
+  let toolsAfterFence = 0;
+  await runScenario({
+    lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+    overrides: {
+      refreshTaskLock: (() => new Promise(() => {})) as never,
+      lockPastSelfFence: (() => fenced) as never,
+      postRunLease: (() => Promise.reject(new Error("connect ECONNREFUSED"))) as never,
+    },
+    async engineBehavior(_extras, ctl) {
+      t.mock.timers.tick(SELF_FENCE_CHECK_MS * 5);
+      assert.equal(ctl.signal.aborted, false, "inside the fence the run carries on");
+      fenced = true;
+      t.mock.timers.tick(SELF_FENCE_CHECK_MS);
+      // The engine checks its signal before every tool call; one that ran here
+      // would be a second writer beside the brain about to take over.
+      if (!ctl.signal.aborted) toolsAfterFence++;
+      abortReason = ctl.signal.reason;
+      return result();
+    },
+  });
+  assert.equal(toolsAfterFence, 0, "the turn was stopped within one check of the fence");
+  assert.equal(abortReason, LEASE_LOST_ABORT_REASON);
+});
+
+test("a run that passes its self-fence while saving its work does not publish a success", async (t) => {
+  // The turn ended, but the fence went up while the workspace and transcript
+  // were being saved. Another brain may hold the run from now on, and a
+  // completion from here would close its row.
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let fenced = false;
+  const { emitted } = await runScenario({
+    lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+    overrides: {
+      lockPastSelfFence: (() => fenced) as never,
+      flushTranscript: (async () => {
+        fenced = true;
+        t.mock.timers.tick(SELF_FENCE_CHECK_MS);
+      }) as never,
+    },
+  });
+  assert.ok(!emitted.includes("exec_complete"), `published: ${emitted.join(", ")}`);
+});
+
+test("a claimed doorbell's completion names the claim it holds", async () => {
+  // Without it the API closes the row whatever claim now holds it, so a
+  // completion that was already in flight when its holder stood down could
+  // close the row of the brain that took the run over.
+  const { completions } = await runScenario({
+    lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+    claimCount: 3,
+  });
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].run_claim, 3);
+  assert.equal(completions[0].task_id, TASK);
 });

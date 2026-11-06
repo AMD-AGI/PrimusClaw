@@ -38,7 +38,7 @@ import {
   BRAIN_BUNDLED_HANDS_BINARY,
   BRAIN_VERSION,
   BRAIN_REGISTRY_BUCKET, BRAIN_REGISTRY_TTL_MS, BRAIN_TOMBSTONES_BUCKET,
-  LOCK_REFRESH_INTERVAL_MS,
+  LOCK_REFRESH_INTERVAL_MS, TASK_LOCK_DEAD_HOLDER_MS,
   MULTI_NODE_IDLE_RECLAIM_MS, MULTI_NODE_SWEEPER_INTERVAL_MS,
   BRAIN_CHECKPOINTS_BUCKET, BRAIN_CHECKPOINTS_TTL_MS,
   LLM_API_STYLE,
@@ -76,6 +76,7 @@ import { abortRunsOfDeletedSession, interruptRunsAt } from "./tasks/interrupt.js
 import { markSessionDeleted } from "./infra/deleted-sessions.js";
 import {
   bindTaskLockKv, lockContentionNakMs, lockExpiresBetweenRenewals,
+  lockSelfFenceMs, lockSelfFenceTooTight,
 } from "./tasks/lock.js";
 import { bindTaskRunnerDeps } from "./tasks/runner.js";
 import { handleTask, bindTaskDispatchKv, inflightTasks, handleClaimedRequest, isFinishOnlyDelivery } from "./tasks/dispatch.js";
@@ -484,6 +485,29 @@ function validateStartupConfig(): void {
       },
       "startup.lock_renewal_too_slow (LOCK_REFRESH_INTERVAL_MS x 2 must fit inside "
       + "BRAIN_REGISTRY_TTL_MS, or two copies of one turn can run at once)",
+    );
+  }
+
+  // A dead-holder takeover reads "not rewritten for this long" as "gone", so the
+  // window has to hold several renewals: at fewer than three, one slow write
+  // under a healthy run looks like a death to the brain the API handed the run.
+  if (TASK_LOCK_DEAD_HOLDER_MS > 0 && TASK_LOCK_DEAD_HOLDER_MS < LOCK_REFRESH_INTERVAL_MS * 3) {
+    logger.error(
+      { deadHolderMs: TASK_LOCK_DEAD_HOLDER_MS, refreshIntervalMs: LOCK_REFRESH_INTERVAL_MS },
+      "startup.dead_holder_window_too_short (TASK_LOCK_DEAD_HOLDER_MS must be at least "
+      + "3 x LOCK_REFRESH_INTERVAL_MS, or a live holder's lock can be taken over)",
+    );
+  }
+
+  // A holder cut off from NATS and the API stops at its self-fence, one refresh
+  // interval before the takeover above may happen (tasks/lock.ts
+  // lockSelfFenceMs). Below two renewals that fence would stop healthy runs on
+  // a single slow write.
+  if (lockSelfFenceTooTight()) {
+    logger.error(
+      { deadHolderMs: TASK_LOCK_DEAD_HOLDER_MS, selfFenceMs: lockSelfFenceMs(), refreshIntervalMs: LOCK_REFRESH_INTERVAL_MS },
+      "startup.lock_self_fence_too_tight (TASK_LOCK_DEAD_HOLDER_MS - LOCK_REFRESH_INTERVAL_MS must be at least "
+      + "2 x LOCK_REFRESH_INTERVAL_MS)",
     );
   }
 

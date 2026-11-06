@@ -14,7 +14,7 @@ import {
   type RecreateHandsResult,
 } from "../agent/index.js";
 import type { TurnPool } from "../agent/agent-loop.js";
-import type { NatsEmitter } from "../events/emitter.js";
+import { EmitStoodDownError, type NatsEmitter } from "../events/emitter.js";
 import {
   HandsClient, isHandsNetworkError,
   type OutstandingReconciliation, type ReclaimCause,
@@ -94,7 +94,7 @@ import {
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
 import { isTransientNatsError } from "../infra/nats-transient.js";
-import { pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
+import { lockPastSelfFence, pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
 import {
   redactEgressPayload, redactPersistedEvent, type RuntimeSecrets,
 } from "../events/redaction.js";
@@ -117,6 +117,13 @@ const sc = StringCodec();
  * step finishes, which is always written at once.
  */
 const SCRIPT_PROGRESS_REFRESH_MS = 5 * 60 * 1000;
+
+/**
+ * How often a run checks, locally, whether it has passed its lock's self-fence.
+ * Small against the refresh interval the fence keeps in hand, so the check's own
+ * granularity cannot eat that margin.
+ */
+export const SELF_FENCE_CHECK_MS = 1_000;
 
 /**
  * The v4 seal key, decoded once.
@@ -265,8 +272,13 @@ async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteReque
  * a completion carrying a generation the row never handed out would close a
  * row this run does not own.
  */
-function runIdentity(request: ExecuteRequest): ExecCompleteRunIdentity {
-  const runClaim = currentFatDelivery()?.runClaim;
+function runIdentity(request: ExecuteRequest, claimedGeneration?: number): ExecCompleteRunIdentity {
+  // A claimed doorbell holds the generation its claim minted, outside any fat
+  // delivery context. Carried so the API closes the row only while that claim
+  // is still the row's: a completion from a holder that stood down (a lost
+  // lease, the lock's self-fence) and was succeeded by another claim no longer
+  // matches, however late the event arrives.
+  const runClaim = currentFatDelivery()?.runClaim ?? claimedGeneration;
   // A fat payload published by an API that predates the field carries no
   // `task_id`, only the lease URL -- and the URL names the row, which is why
   // `resolveRunIdentity` already reads it. Without the same fallback here such
@@ -487,6 +499,8 @@ export interface TaskRunnerSideEffects {
   /** Publish a task message again, as a new message on the same subject. */
   republishTask: (subject: string, data: Uint8Array) => Promise<void>;
   refreshTaskLock: typeof refreshTaskLock;
+  /** Local, no I/O: whether this run must stop before another brain may take its lock. */
+  lockPastSelfFence: typeof lockPastSelfFence;
   releaseTaskLock: typeof releaseTaskLock;
   flushTranscript: typeof flushTranscript;
   /** Constructing the client is itself a seam: it opens an MCP transport. */
@@ -525,6 +539,7 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
     await getDeps().emitter.nc.jetstream().publish(subject, data);
   },
   refreshTaskLock,
+  lockPastSelfFence,
   releaseTaskLock,
   // Hoisted function declaration: the binding exists before this const runs.
   flushTranscript,
@@ -1188,6 +1203,7 @@ class TaskRunner {
   private readonly transcriptStartedAt: number;
 
   private keepAlive!: ReturnType<typeof setInterval>;
+  private selfFence?: ReturnType<typeof setInterval>;
   private cancelDeadline: () => void = () => {};
   private readonly transcriptLog: Array<Record<string, unknown>> = [];
 
@@ -1452,14 +1468,17 @@ class TaskRunner {
     this.platformKey = request.platform_key || "";
   }
 
-  private readonly onEvent = async (evt: Record<string, unknown>): Promise<void> => {
+  private readonly onEvent = async (
+    evt: Record<string, unknown>, opts: { stillMine?: () => boolean } = {},
+  ): Promise<void> => {
     const safeEvent = redactPersistedEvent(
       evt,
       runtimeSecrets(this.request, this.platformKey),
     );
     if (this.messageId) safeEvent.message_id = this.messageId;
     this.transcriptLog.push({ ts: Date.now(), ...safeEvent });
-    await this.emitter.emit(this.sessionId, safeEvent);
+    if (opts.stillMine) await this.emitter.emit(this.sessionId, safeEvent, { stillMine: opts.stillMine });
+    else await this.emitter.emit(this.sessionId, safeEvent);
   };
 
   /**
@@ -3496,6 +3515,13 @@ class TaskRunner {
       tokenUsage: result.tokenUsage, toolStats: result.toolStats, failed: false,
     });
 
+    // The run may have stood down while it was saving its work: a lost lease,
+    // or the lock's self-fence, after which another brain may hold this run.
+    // A success published from here would then close the successor's row, so
+    // it is not published -- not first, and not on a retry once the stand-down
+    // arrives mid-publish. The ending is the stand-down's, as if the abort had
+    // been seen before this method was entered.
+    if (this.leaseLost) throw LEASE_LOST_ABORT_REASON;
     await this.onEvent({
       type: "exec_complete",
       session_id: this.sessionId,
@@ -3514,7 +3540,10 @@ class TaskRunner {
       skill_file_mutations: result.pendingSkillFileMutations,
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
-      ...runIdentity(this.request),
+      ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
+    }, { stillMine: () => !this.leaseLost }).catch((err: unknown) => {
+      if (err instanceof EmitStoodDownError) throw LEASE_LOST_ABORT_REASON;
+      throw err;
     });
     // Persist the user-visible completion event before handing task state to
     // Backend. If Brain dies after the callback, outbox replay can safely skip
@@ -3976,7 +4005,7 @@ class TaskRunner {
       selected_skills: Object.keys(this.request.skills || {}),
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
-      ...runIdentity(this.request),
+      ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
     });
     await deliverAgentDone(
       this.kvCkpt,
@@ -4244,7 +4273,7 @@ class TaskRunner {
       selected_skills: Object.keys(this.request.skills || {}),
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
-      ...runIdentity(this.request),
+      ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
     });
     // Task DAG: tell Backend the task failed so the scheduler can cascade
     // to downstream nodes and (eventually) tear sandboxes down.
@@ -4680,6 +4709,26 @@ class TaskRunner {
         logger.warn({ err: err?.message || String(err), sessionId: this.sessionId }, "task.kv_ttl_get_failed");
       });
     }, LOCK_REFRESH_INTERVAL_MS);
+
+    // The renewal above only reports once its write has answered, and a write
+    // to an unreachable NATS answers late or never -- while another brain may
+    // take a lock that names its run once it has gone unwritten for
+    // TASK_LOCK_DEAD_HOLDER_MS. So the deadline is also watched locally, on a
+    // timer short enough that this run stops (and runs no further tool) before
+    // that moment: `lockPastSelfFence` fires one refresh interval ahead of it,
+    // counted from when the last successful renewal was sent.
+    this.selfFence = setInterval(() => {
+      if (!fx().lockPastSelfFence(this.lockKey)) return;
+      this.leaseLost = true;
+      if (this.abortCtrl.signal.aborted) return;
+      logger.error(
+        { sessionId: this.sessionId, messageId: this.messageId, lockKey: this.lockKey },
+        "task.lock_self_fenced",
+      );
+      metrics.onLockSelfFenced();
+      this.abortCtrl.abort(LEASE_LOST_ABORT_REASON);
+    }, SELF_FENCE_CHECK_MS);
+    this.selfFence.unref?.();
   }
 
   private async executeRun(): Promise<void> {
@@ -4992,6 +5041,7 @@ class TaskRunner {
     if (outcome) metrics.onTask(outcome, (Date.now() - runStartedAt) / 1000);
     this.cancelDeadline();
     clearInterval(this.keepAlive);
+    if (this.selfFence) clearInterval(this.selfFence);
     if (leaseTimer) clearInterval(leaseTimer);
     endRun(this.runIdentity.key);
     activeAbort.delete(this.lockKey);

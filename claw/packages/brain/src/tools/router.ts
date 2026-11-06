@@ -636,8 +636,8 @@ export class ToolRouter {
       const client = this.platformMcp.get(server);
       if (!client) throw new Error(`Unknown MCP server: ${server}`);
       // A log read (`log_reads`): asked for no more than its bound, and its answer masked before anything reads it.
-      if (this.logReads?.has(name)) return this.logReads.filter(await client.callTool(rest.join("__"), this.logReads.bound(name, input), outcome, meta));
-      return client.callTool(rest.join("__"), input, outcome, meta);
+      if (this.logReads?.has(name)) return this.logReads.filter(await client.callTool(rest.join("__"), this.logReads.bound(name, input), outcome, meta, signal));
+      return client.callTool(rest.join("__"), input, outcome, meta, signal);
     }
 
     throw new Error(`Unknown tool: ${name}`);

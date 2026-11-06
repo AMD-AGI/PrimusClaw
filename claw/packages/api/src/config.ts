@@ -411,6 +411,29 @@ export const LEASE_LOST_GRACE_SEC = envInt(
   { min: 1 },
 );
 
+/**
+ * How long past its expiry a doorbell run's lease may sit before the run is
+ * handed to another brain as one whose worker was lost with its node. Zero
+ * turns this fast path off and leaves such runs to LEASE_LOST_GRACE_SEC.
+ *
+ * Shorter than LEASE_LOST_GRACE_SEC on purpose, and safe to be: that grace is
+ * long because the next worker would find the dead one's `lock.<key>` held
+ * until the registry bucket's TTL. A doorbell claim may now take that lock over
+ * once it has gone unrenewed for brain's TASK_LOCK_DEAD_HOLDER_MS (60 s), so
+ * the wait is a function of that instead: the lease expires no sooner than
+ * (RUN_LEASE_TTL_MS - RUN_LEASE_HEARTBEAT_MS) after the holder's last renewal,
+ * 30 s at the defaults, and this adds the other 30 s. A holder that is alive
+ * keeps renewing its lease over HTTP even while NATS is stalled, so it is
+ * never requeued here; and see `requeueDeadDoorbellLeases` for why an API that
+ * could not hear renewals does not judge them.
+ */
+export const DOORBELL_DEAD_LEASE_GRACE_SEC = envInt("DOORBELL_DEAD_LEASE_GRACE_SEC", 30, { min: 0 });
+/**
+ * How often the fast pass above runs. Its own loop rather than the sweeper's
+ * tick, whose 60 s would be most of the two minutes a lost node may cost.
+ */
+export const DOORBELL_TAKEOVER_SWEEP_MS = envInt("DOORBELL_TAKEOVER_SWEEP_MS", 10_000, { min: 1_000 });
+
 /** The timings above as the one thing they actually are: a single ordering. */
 export function runLeaseTiming(): RunLeaseTiming {
   return {
