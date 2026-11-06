@@ -861,6 +861,11 @@ export const CLAW_ASSISTANT_CITE_LINK_SERVERS = env("CLAW_ASSISTANT_CITE_LINK_SE
 // `true` (the default) gives the router's `say` an optional `suggested`: up to three short replies the user is likely to send next,
 // carried by `assistant.say` as `suggested_replies` for a channel to show as buttons that send them (`assistant/suggested.ts`).
 export const CLAW_ASSISTANT_SUGGESTED_REPLIES = envBool("CLAW_ASSISTANT_SUGGESTED_REPLIES", true);
+// `false` takes `claw_self_status` from the router (`assistant/self-status.ts`): how the assistant itself has been running over the last
+// day, read from Claw's own tables. On by default: it reads only counts, never a message, a session's settings or a user.
+export const CLAW_ASSISTANT_SELF_STATUS = envBool("CLAW_ASSISTANT_SELF_STATUS", true);
+// The build running, when the deployment says it; else `claw_self_status` reads the tag `deploy/build.sh` wrote into the image.
+export const CLAW_BUILD = env("CLAW_BUILD", "").trim();
 // How long an item may need the user with nobody having told them before the system tells them.
 export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWEEP_SEC", 300, { min: 1 });
 // `on` gives the router the review and settings tools (review_start, review_restart, confirmation_answer,

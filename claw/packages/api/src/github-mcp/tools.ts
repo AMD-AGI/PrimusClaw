@@ -225,8 +225,14 @@ function issueLine(i: Record<string, any>) {
  * search's count, or a list read to its end); `complete` is true only when every match is in `items`. A list cut in its middle
  * by the turn's own result cap answered "15 of my 22 open pull requests" with nothing to say which were left out.
  */
-export function listAnswer(items: readonly unknown[], meta: { total_count?: number | null; complete: boolean; next_page?: number | null; note?: string }): Record<string, unknown> {
-  const head = { total_count: meta.total_count ?? null, shown: 0, complete: false, ...(meta.note ? { note: meta.note } : {}) };
+export function listAnswer(
+  items: readonly unknown[],
+  meta: { total_count?: number | null; complete: boolean; next_page?: number | null; note?: string; by_repo?: Record<string, number> },
+): Record<string, unknown> {
+  const head = {
+    total_count: meta.total_count ?? null, shown: 0, complete: false, ...(meta.by_repo ? { by_repo: meta.by_repo } : {}),
+    ...(meta.note ? { note: meta.note } : {}),
+  };
   const kept: unknown[] = [];
   // The envelope's own size, with room for the fields filled in below.
   let size = JSON.stringify(head).length + 160;
@@ -314,6 +320,57 @@ function actionsRunOf(c: Record<string, any>): number | null {
   const m = /\/actions\/runs\/(\d{1,20})\/job\/\d+/.exec(c.details_url);
   const n = m ? Number(m[1]) : NaN;
   return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+/** A search's matches are counted per repository (`by_repo`) up to this many: GitHub's search pages hold 100, so three more reads at most. */
+export const BY_REPO_MAX = 300;
+
+/** Why a search has no `by_repo`: too many matches, the matches changed (or a read was cut short) between reads, or a read failed. */
+export type ByRepoUnavailable = "too_many" | "changed" | { failed: number | null };
+
+/**
+ * How many of a search's matches are in each repository, most first: from the page already read when it holds them all, else read
+ * 100 at a time while there are at most BY_REPO_MAX; otherwise why not. "How many pull requests have I open, and where" was answered
+ * from the 21 of a list cut in two, with "the count per repository is not certain". Never throws: the count is an extra beside
+ * the page already read, so a read of it that fails (search's own rate limit, a 5xx, a timeout) costs the count and not the answer.
+ */
+export async function searchCountByRepo(
+  gh: GithubClient, query: string, firstPage: ReadonlyArray<{ repo?: string }>, total: number,
+): Promise<{ byRepo: Record<string, number> } | { unavailable: ByRepoUnavailable }> {
+  let repos: Array<string | undefined>;
+  if (firstPage.length >= total) {
+    repos = firstPage.map((i) => i.repo);
+  } else {
+    if (total > BY_REPO_MAX) return { unavailable: "too_many" };
+    repos = [];
+    try {
+      for (let page = 1; repos.length < total && page <= Math.ceil(BY_REPO_MAX / 100); page++) {
+        const res = (await gh.get<any>("/search/issues", { q: query, sort: "updated", order: "desc", per_page: 100, page })).json;
+        if (res?.incomplete_results === true) return { unavailable: "changed" };
+        const got = (res?.items ?? []).map((i: any) => repoOfUrl(i.repository_url));
+        repos.push(...got);
+        if (got.length < 100) break;
+      }
+    } catch (err) {
+      // A GithubError of status 0 is the network's (a dropped connection, a timeout): no status GitHub sent.
+      const status = err instanceof GithubError && err.status > 0 ? err.status : null;
+      logger.warn({ tool: "issue_search", status, errorClass: (err as Error)?.constructor?.name }, "github_mcp.by_repo_read_failed");
+      return { unavailable: { failed: status } };
+    }
+    // Matches that came or went between the reads: no count is better than a wrong one.
+    if (repos.length !== total) return { unavailable: "changed" };
+  }
+  const counts = new Map<string, number>();
+  for (const r of repos) counts.set(r ?? "unknown", (counts.get(r ?? "unknown") ?? 0) + 1);
+  return { byRepo: Object.fromEntries([...counts.entries()].sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))) };
+}
+
+/** What a search's note says when it has no `by_repo` (fixed words: nothing GitHub sent is repeated). */
+export function byRepoNote(why: ByRepoUnavailable): string {
+  if (why === "too_many") return `by_repo is not counted for more than ${BY_REPO_MAX} matches: narrow the query with repo: or org: to count one`;
+  if (why === "changed") return "by_repo could not be counted: the matches changed while they were read; ask again";
+  return `by_repo could not be counted: reading the other matches failed${why.failed !== null ? ` (GitHub answered ${why.failed})` : ""}; `
+    + "the matches shown and total_count are as read; ask again for the count";
 }
 
 /** A search's qualifiers that name where to search: GitHub refuses some tokens a search that carries one. */
@@ -560,7 +617,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     return pageAnswer(((await gh.get<any[]>(repoPath(repoOf(a.repo), "/issues"), q)).json ?? []).map(issueLine), perPage, page);
   }, (v) => on(each(v?.items).map((i) => itemSource(repoName(a.repo), i)))));
 
-  mcp.tool("issue_search", "Search pull requests and issues across GitHub, as the user, with GitHub's search syntax: `is:pr is:open author:@me` (the user's open pull requests), `is:pr is:open review-requested:@me`, `is:issue is:open assignee:@me`; narrow with `repo:owner/name` or `org:name` (some tokens are refused such a search: then list the repository with pr_list or issue_list). Returns the total count (total_count) and the matches, most recently updated first, and whether every match is shown (complete); list them all from `items`.", {
+  mcp.tool("issue_search", "Search pull requests and issues across GitHub, as the user, with GitHub's search syntax: `is:pr is:open author:@me` (the user's open pull requests), `is:pr is:open review-requested:@me`, `is:issue is:open assignee:@me`; narrow with `repo:owner/name` or `org:name` (some tokens are refused such a search: then list the repository with pr_list or issue_list). Returns the total count (total_count), how many are in each repository (by_repo, up to " + BY_REPO_MAX + " matches), the matches, most recently updated first, and whether every match is shown (complete); list them all from `items`, and count from total_count and by_repo.", {
     query: z.string().min(1).max(256).describe("GitHub search syntax; @me is the user"),
     sort: z.enum(["updated", "created", "comments"]).optional().describe("Default updated"), per_page: PER_PAGE, page: PAGE,
   }, (a) => answer("issue_search", async () => {
@@ -579,11 +636,21 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     const items = (res?.items ?? []).map((i: any) => ({ repo: repoOfUrl(i.repository_url), ...issueLine(i), ...(i.pull_request ? { draft: i.draft === true } : {}) }));
     const total = typeof res?.total_count === "number" ? res.total_count : null;
     const seen = (page - 1) * perPage + items.length;
+    // A search GitHub cut short may report a low total_count, so a page that seems to hold every match may not: no by_repo then.
+    const incomplete = res?.incomplete_results === true;
+    const counted = page === 1 && total !== null && !incomplete ? await searchCountByRepo(gh, a.query, items, total) : null;
+    const byRepo = counted && "byRepo" in counted ? counted.byRepo : null;
+    const notes = [
+      ...(incomplete ? ["GitHub's search timed out before it found every match: total_count may be low"] : []),
+      ...(page === 1 && total !== null && incomplete ? ["by_repo is not counted for a search that timed out; ask again"] : []),
+      ...(counted && "unavailable" in counted ? [byRepoNote(counted.unavailable)] : []),
+    ];
     return listAnswer(items, {
       total_count: total,
-      complete: page === 1 && total !== null && items.length >= total && res?.incomplete_results !== true,
+      complete: page === 1 && total !== null && items.length >= total && !incomplete,
       next_page: total !== null && seen < total && items.length === perPage ? page + 1 : null,
-      ...(res?.incomplete_results === true ? { note: "GitHub's search timed out before it found every match: total_count may be low" } : {}),
+      ...(byRepo ? { by_repo: byRepo } : {}),
+      ...(notes.length ? { note: notes.join("; ") } : {}),
     });
   }, (v) => on(each(v?.items).map((i) => itemSource(typeof i.repo === "string" ? i.repo : undefined, i)))));
 
