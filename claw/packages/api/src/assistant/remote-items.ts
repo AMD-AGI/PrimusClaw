@@ -232,16 +232,26 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
     // An item that ended is opened again for the next instruction; one under way counts one more.
     const turns = open.board_state === "done" ? 1 : Math.max(0, Number(open.params?.open_turns) || 0) + 1;
     // An item that ended skipped what the session posted since. What came after this prompt was queued is this prompt's, but never
-    // the event that ended the item, nor any before it (a turn that ended as this prompt was queued is the one before it). An item
-    // stopped from Claw is not rewound: the end its cancel brings is still to come, or has passed, and it is no new turn's.
+    // the event that ended the item, nor any before it: those belong to the turns before (one that ended as this prompt was queued,
+    // or one whose end was stored but not yet applied when the item was stopped). The end of a pending cancel after that point is
+    // still the cancel's (`cancel_after`); one before it is passed over with the rest, and the cancel is no longer pending.
     const closedBy = Number(open.params?.closed_event_id) || 0;
-    const cancelPending = typeof open.params?.cancel_after === "number";
+    const from = Math.max(last, closedBy);
+    let cancelPending = typeof open.params?.cancel_after === "number";
+    if (open.board_state === "done" && cancelPending) {
+      const ended = (await q(
+        `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND id > $2 AND id <= $3 AND type = 'turn_end'
+            AND data->>'stopReason' = 'cancelled' LIMIT 1`,
+        [p.sessionId, Number(open.params.cancel_after), from],
+      )).rows[0];
+      if (ended) cancelPending = false;
+    }
     const patch = {
       asked, origin: p.origin, lang, open_turns: turns,
-      ...(cancelPending ? { after_cancel: (Number(open.params?.after_cancel) || 0) + 1 } : {}),
-      ...(open.board_state === "done"
-        ? { waiting: [], closed_event_id: 0, ...(closedBy > 0 ? { last_event_id: Math.max(last, closedBy) } : {}) }
-        : {}),
+      ...(cancelPending
+        ? { after_cancel: (Number(open.params?.after_cancel) || 0) + 1 }
+        : typeof open.params?.cancel_after === "number" ? { cancel_after: null, after_cancel: 0 } : {}),
+      ...(open.board_state === "done" ? { waiting: [], closed_event_id: 0, last_event_id: from } : {}),
     };
     await q(
       `UPDATE claw_work_items

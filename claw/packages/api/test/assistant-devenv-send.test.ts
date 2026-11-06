@@ -28,7 +28,8 @@
  *       written: a first prompt's item, and a finished item reopened, both end with it; but the turn before it, ending as it was
  *       queued, never ends it
  *   F10 stop, then a new instruction at once: the end the cancel brings ends what was sent before it, never the new one, whether
- *       the stop was the item's button or the attached chat's; a prompt and a stop are queued and noted one at a time per session
+ *       the stop was the item's button or the attached chat's; a prompt and a stop are queued and noted one at a time per session;
+ *       a turn's end stored but not yet applied when the item was stopped is the old turn's, not the next instruction's
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -514,6 +515,41 @@ describe("development environment items and devenv_send", { skip }, () => {
     }
     assert.equal((await sent).status, 202);
     assert.equal((await remoteItem(sid)).params.open_turns, 1);
+  });
+
+  test("F12 an end stored before the stop, applied after it, never ends the instruction sent after the stop", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const out = await tools.devenvSend(await userTurn(alice, "跑 make test"), { text: "跑 make test" });
+    const sid = String(out.session_id);
+    // The turn ends on the machine; its events are stored, and their item update has not run yet.
+    const n = seqs.get(sid) ?? 0;
+    const batch = [chunk("tests done"), end()].map(([type, data], i) => ({ index: i, session_id: sid, seq: n + 1 + i, type, ts: Date.now(), data }));
+    seqs.set(sid, n + 2);
+    await store.ingestEvents({ connector_id: cid, owner_user_id: "alice" }, batch as never);
+    // Stop, then a new instruction at once.
+    assert.equal((await post("alice", `/v1/work-items/${String(out.item_id)}/stop`, {})).status, 200);
+    assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "now lint" })).status, 202);
+    let item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.params.open_turns, item.title], ["in_progress", 1, "laptop claude: now lint"]);
+    // The cancel finds nothing running and says so; then the new instruction runs and ends.
+    await events("alice", cid, sid, [end("cancelled")]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_turns], ["in_progress", 1]);
+    await events("alice", cid, sid, [chunk("lint clean"), end()]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.summary], ["done", "lint clean"]);
+
+    // Another instruction, stopped, and the cancel's own end is stored (not yet applied) before the next one: it is passed over with
+    // the rest, and the cancel is no longer pending, so it takes nothing from the instructions after it.
+    assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "now docs" })).status, 202);
+    assert.equal((await post("alice", `/v1/work-items/${String(out.item_id)}/stop`, {})).status, 200);
+    assert.equal(typeof (await remoteItem(sid)).params.cancel_after, "number");
+    const m = seqs.get(sid) ?? 0;
+    seqs.set(sid, m + 1);
+    await store.ingestEvents({ connector_id: cid, owner_user_id: "alice" }, [{ index: 0, session_id: sid, seq: m + 1, type: "turn_end", ts: Date.now(), data: { stopReason: "cancelled" } }] as never);
+    assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "and format" })).status, 202);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.params.open_turns, item.params.cancel_after ?? null], ["in_progress", 1, null]);
   });
 
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {
