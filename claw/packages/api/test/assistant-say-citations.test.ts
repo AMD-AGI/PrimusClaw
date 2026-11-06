@@ -173,26 +173,35 @@ test("SC8 only what makes a link keeps a text from citing, read with its escapes
 });
 
 test("SC9 the addresses the user wrote are the ones a page read may confirm; never a report's, never the state Claw adds", () => {
-  assert.deepEqual(userAddresses("看看 https://example.com/a，再看 https://example.com/b. 和 (https://example.com/c) 还有 <https://example.com/d>"),
-    ["https://example.com/a", "https://example.com/b", "https://example.com/c", "https://example.com/d"]);
+  assert.deepEqual(userAddresses("看看 https://example.com/a 再看 https://example.com/b. 和 (https://example.com/c) 还有 <https://example.com/d>，好"),
+    ["https://example.com/d", "https://example.com/a", "https://example.com/b", "https://example.com/c"]);
   assert.deepEqual(userAddresses("[docs](https://docs.example/guide?x=1#s) and http://plain.example/p!"), ["https://docs.example/guide?x=1#s", "http://plain.example/p"]);
   assert.deepEqual(userAddresses("https://x.example/?access_token=abc https://user:pw@x.example/ https://x.example/a https://x.example/a"),
     ["https://x.example/a"], "one that cannot be a source is left out, a repeated one is listed once");
   assert.deepEqual(userAddresses("[work_event] #3 (item_id: kwi_abcd) ready: see https://evil.example/"), [], "a report is not the user's words");
   assert.deepEqual(userAddresses(`read https://example.com/a\n\n${TURN_STATE_HEADER}\n\n- title: "https://evil.example/"`), ["https://example.com/a"]);
   assert.deepEqual(userAddresses("no address, only example.com and www.example.com"), []);
-  // Each one whole, as the user's client links it, or none: never a part of one, which would be an address the user did not write.
+  // Each one a whole link of the text as GitHub's markdown makes them, or none: never a part of one, which would be an address
+  // the user did not write.
   for (const [text, whole] of [
     ["Read https://example.com/path_(ticket-12)", ["https://example.com/path_(ticket-12)"]],
     ["(see https://example.com/path_(ticket-12))", ["https://example.com/path_(ticket-12)"]],
     ["https://example.com/x)y and https://example.com/a(b", ["https://example.com/x)y", "https://example.com/a(b"]],
-    ["[https://e.example/a](https://e.example/a)", ["https://e.example/a"]],
-    ["'https://q.example/a' and \"https://q.example/b\".", ["https://q.example/a", "https://q.example/b"]],
-    ["https://x.example/a'b https://x.example/c[d] https://x.example/e\"f", []],
-    ["（https://cn.example/a）和 https://cn.example/文档，好吗", ["https://cn.example/a", "https://cn.example/文档"]],
-    ["https://example.com/a?b=1&c=2;d.", ["https://example.com/a?b=1&c=2;d"]],
+    ["Please open https://short.example/?url=https://evil.example/private", ["https://short.example/?url=https://evil.example/private"]],
+    ["(https://short.example/?u=(https://evil.example/p))", ["https://short.example/?u=(https://evil.example/p)"]],
+    ["see x=https://evil.example/p, ahttps://evil.example/q and https://ok.example/?r=(https://evil.example/s)", ["https://ok.example/?r=(https://evil.example/s)"]],
+    ["[https://e.example/a](https://e.example/a) *https://e.example/b* _https://e.example/c_", ["https://e.example/a", "https://e.example/b", "https://e.example/c"]],
+    ["https://x.example/a' https://x.example/b'c \"https://x.example/d\" https://x.example/e[f] https://x.example/g>", []],
+    ["看 https://cn.example/a，再看 https://cn.example/文档", ["https://cn.example/a，再看", "https://cn.example/文档"]],
+    ["https://example.com/a?b=1&c=2;d. https://example.com/e;", ["https://example.com/a?b=1&c=2;d", "https://example.com/e;"]],
+    ["<https://auto.example/a?b=(c> and <https://auto.example/d>", ["https://auto.example/a?b=(c", "https://auto.example/d"]],
+    ["https://a.example/?u=<https://b.example/c>", ["https://b.example/c", "https://a.example/?u="]],
+    ["x<https://evil.example/p <https://ok.example/q>https://evil.example/r", ["https://ok.example/q"]],
+    ["see\u00a0https://evil.example/p https://a.example/x\u00a0https://evil.example/q", []],
   ] as const) assert.deepEqual(userAddresses(text), whole, text);
-  assert.equal(userAddresses(`${"http://".repeat(5000)}x https://example.com/late`).length, 0, "bounded work: at most 64 starts read");
+  assert.deepEqual(userAddresses(`${"http://".repeat(5000)}x ${"=https://".repeat(5000)} https://example.com/late`), ["https://example.com/late"],
+    "a start inside an address, or where none can start, is not read as one");
+  assert.deepEqual(userAddresses(`${"(http://x.example ".repeat(100)}https://example.com/late`), ["http://x.example"], "bounded work: at most 64 read");
   const many = Array.from({ length: 30 }, (_, i) => `https://example.com/${i}`).join(" ");
   assert.equal(userAddresses(many).length, USER_ADDRESSES_MAX);
 });

@@ -41,22 +41,23 @@ export function assistantCitationsOn(): boolean {
 
 /** The most addresses of the user's message a turn may confirm as sources by reading them (`userAddresses`). */
 export const USER_ADDRESSES_MAX = 20;
-/**
- * Where an address written into a message ends, as GitHub's autolinks read one: at whitespace or `<`, `>`; and at the full-width
- * punctuation Chinese text puts right after one (`看 https://x/a，再看`), which an address never holds unencoded.
- */
-const ADDRESS_END = /[\s<>，。；：！？、（）【】《》「」『』“”‘’]/u;
-/** Where an http or https address starts in a piece of a message. */
+/** An autolink as CommonMark writes one, `<https://…>` (Clawy writes a link's address so): the address is all of it. */
+const AUTOLINK = /<(https?:\/\/[^\s<>]*)>/gi;
+/** What separates the pieces of a message an address may run through: whitespace (as CommonMark counts it). An address also ends at `<`. */
+const SPACE = /[ \t\n\r\f\v]/;
+/** Where an http or https address may start in a piece of a message. */
 const ADDRESS_START = /https?:\/\//gi;
-/** Characters GitHub's autolinks leave out of an address when it ends with them (sentence punctuation; quotes, which none holds). */
-const TRAILING = new Set([".", ",", ":", ";", "!", "?", "*", "_", "~", "'", '"']);
-/** At most this many places that start an address are read in a message: what one says is bounded work. */
+/** What may stand right before an address GitHub's autolinks take (besides nothing: the start of a piece). */
+const ADDRESS_BEFORE = new Set(["*", "_", "~", "("]);
+/** What GitHub's autolinks leave out of an address that ends with it: the punctuation that ends a sentence, and emphasis. */
+const TRAILING = new Set(["?", "!", ".", ",", ":", "*", "_", "~"]);
+/** At most this many addresses are read in a message (each autolink, each place an address starts): bounded work. */
 const ADDRESS_STARTS_MAX = 64;
 
 /**
- * An address as GitHub's autolinks take it from where it starts to the end of its piece of text: without the punctuation that
- * ends a sentence, and without a `)` at its end that closes nothing inside it (`(https://x/a)`, `[docs](https://x/a)`). Never cut
- * anywhere else: `https://x/path_(ticket-12)` stays whole, and an address with a character no address holds is no source at all.
+ * An address GitHub's autolinks take, from its start to the end of its piece of text: without the punctuation that ends a sentence,
+ * and without a `)` at its end that closes nothing inside it (`(https://x/a)`, `[docs](https://x/a)`). Never cut anywhere else:
+ * `https://x/path_(ticket-12)` stays whole, and one with a character no source address holds is no source at all.
  */
 function writtenAddress(rest: string): string {
   let end = rest.length;
@@ -78,22 +79,33 @@ function writtenAddress(rest: string): string {
 /**
  * The addresses the user wrote in the message a turn answers (`prompt`, as the turn was sent it), each one that can be a source
  * (`citeableUrl`), at most `USER_ADDRESSES_MAX`: a page `web_fetch` reads is a source only at one of these or at one a search or
- * GitHub lookup of the turn returned (`ExecuteRequest.cite.user_urls`). Each is the whole address as the user's own client links it
- * (`writtenAddress`), never a part of one. A worker's report (`[work_event]`) is not the user's words, and neither is the state
- * Claw adds after them (`TURN_STATE_HEADER`).
+ * GitHub lookup of the turn returned (`ExecuteRequest.cite.user_urls`). Each is a whole link of the text as GitHub's markdown makes
+ * them, never a part of one: an autolink `<https://…>`, or an address its autolinks take (at the start of a piece of text between
+ * whitespace, or after `(`, `*`, `_`, `~`; up to the end of the piece or a `<`, `writtenAddress`). So an address inside another's
+ * query (`https://a/?url=https://b/`), or right after a letter, `=` or `<`, is none. A worker's report (`[work_event]`) is not the user's words,
+ * and neither is the state Claw adds after them (`TURN_STATE_HEADER`).
  */
 export function userAddresses(prompt: string): string[] {
   if (prompt.startsWith(WORK_EVENT_PREFIX)) return [];
   const out: string[] = [];
+  const add = (address: string): boolean => {
+    if (citeableUrl(address) && !out.includes(address)) out.push(address);
+    return out.length < USER_ADDRESSES_MAX;
+  };
   let starts = 0;
-  for (const piece of prompt.split(TURN_STATE_HEADER, 1)[0].split(ADDRESS_END)) {
-    // Every address that starts in the piece runs to its end: `[https://x/a](https://x/a)` holds one that is no source (its
-    // brackets) and one that is.
+  // Each autolink is read whole, and leaves a `<` where it stood: an address before it ends there, and none starts right after it.
+  const words = prompt.split(TURN_STATE_HEADER, 1)[0].replace(AUTOLINK, (_whole, address: string) => {
+    if ((starts += 1) <= ADDRESS_STARTS_MAX) add(address);
+    return "<";
+  });
+  for (const piece of words.split(SPACE)) {
+    let taken = 0;   // where the last address read from this piece ends: a start before that is inside it
     for (const m of piece.matchAll(ADDRESS_START)) {
+      if (m.index < taken || (m.index > 0 && !ADDRESS_BEFORE.has(piece[m.index - 1]))) continue;
       if ((starts += 1) > ADDRESS_STARTS_MAX) return out;
-      const address = writtenAddress(piece.slice(m.index));
-      if (citeableUrl(address) && !out.includes(address)) out.push(address);
-      if (out.length >= USER_ADDRESSES_MAX) return out;
+      const lt = piece.indexOf("<", m.index);
+      taken = lt < 0 ? piece.length : lt;
+      if (!add(writtenAddress(piece.slice(m.index, taken)))) return out;
     }
   }
   return out;
