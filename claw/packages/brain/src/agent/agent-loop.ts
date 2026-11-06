@@ -75,6 +75,75 @@ const PARALLEL_READ_LIMIT = 8;
 export const TOOL_TEXT_DELTA_INTERVAL_MS = 400;
 
 /**
+ * When a streamed tool's text (`LoopOptions.streamToolText`) is published as `toolTextDelta`: a call's first text at once, then
+ * at most once every `intervalMs`, each time with the text so far. Text that arrives inside an interval is not dropped: it is
+ * published when the interval ends (trailing edge), and whatever is still unpublished when the model's turn ends is published
+ * by `flush`, before the call runs. So the last delta of a call is always its whole text, and a text that took longer to write
+ * than its first fragment is published at least twice. A publish that fails is logged by `publish` and nothing else, since the
+ * call's whole input still arrives with the turn.
+ */
+export class ToolTextThrottle {
+  private readonly lastAt = new Map<string, number>();
+  private readonly published = new Map<string, string>();
+  private readonly pending = new Map<string, { name: string; text: string }>();
+  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly inflight = new Set<Promise<void>>();
+  private closed = false;
+  readonly options: StreamTurnOptions;
+
+  constructor(
+    tools: ReadonlySet<string>,
+    private readonly intervalMs: number,
+    private readonly publish: (call: { id: string; name: string; text: string }) => Promise<void>,
+  ) {
+    this.options = { toolText: { tools, onText: (call) => this.onText(call) } };
+  }
+
+  private onText({ id, name, text }: { id: string; name: string; text: string }): void {
+    if (this.closed) return;
+    const wait = (this.lastAt.get(id) ?? -Infinity) + this.intervalMs - Date.now();
+    if (wait <= 0) {
+      this.send(id, name, text);
+      return;
+    }
+    this.pending.set(id, { name, text });
+    if (!this.timers.has(id)) {
+      this.timers.set(id, setTimeout(() => {
+        this.timers.delete(id);
+        const p = this.pending.get(id);
+        if (p && !this.closed) { this.pending.delete(id); this.send(id, p.name, p.text); }
+      }, wait));
+    }
+  }
+
+  private send(id: string, name: string, text: string): void {
+    this.pending.delete(id);
+    if (this.published.get(id) === text) return;
+    this.lastAt.set(id, Date.now());
+    this.published.set(id, text);
+    const p = this.publish({ id, name, text }).finally(() => this.inflight.delete(p));
+    this.inflight.add(p);
+  }
+
+  /** The turn is whole: publish what is pending now, and wait for every publish so far. */
+  async flush(): Promise<void> {
+    for (const t of this.timers.values()) clearTimeout(t);
+    this.timers.clear();
+    for (const [id, p] of [...this.pending]) this.send(id, p.name, p.text);
+    this.closed = true;
+    await Promise.all([...this.inflight]);
+  }
+
+  /** The attempt failed: publish nothing more of it. */
+  cancel(): void {
+    this.closed = true;
+    for (const t of this.timers.values()) clearTimeout(t);
+    this.timers.clear();
+    this.pending.clear();
+  }
+}
+
+/**
  * The classes a `wait` can still block in.
  *
  * The sandbox blocks for as long as the shell's registry entry reads running,
@@ -328,7 +397,8 @@ export interface LoopOptions {
   rollingCacheTtl?: "5m";
   /**
    * `ExecuteRequest.stream_tool_text`: tools whose `text` argument is published while the model writes it, as `toolTextDelta`
-   * events of the top-level loop (`{tool, actionId, text}`, the text so far), at most every TOOL_TEXT_DELTA_INTERVAL_MS per call.
+   * events of the top-level loop (`{tool, actionId, text}`, the text so far), at most every TOOL_TEXT_DELTA_INTERVAL_MS per call,
+   * and the whole text once more when the turn ends if the last delta was not it (`ToolTextThrottle`).
    * The call itself runs as every call does, when the turn is whole; the events only let a reader show its words sooner.
    */
   streamToolText?: readonly string[];
@@ -2195,25 +2265,14 @@ class AgentLoopRunner {
 
   /**
    * The `toolText` option of this loop's turns (`LoopOptions.streamToolText`), or none: a sub-agent's text is not the run's to show.
-   * Each call's text is published when it has grown and TOOL_TEXT_DELTA_INTERVAL_MS have passed since that call's last event; a
-   * publish that fails is logged and nothing else, since the call's whole input still arrives with the turn.
+   * See `ToolTextThrottle` for when each call's text is published.
    */
-  private toolTextOptions(): StreamTurnOptions | undefined {
+  private toolTextOptions(): ToolTextThrottle | undefined {
     const names = this.opts.streamToolText;
     if (this.depth !== 0 || !names?.length) return undefined;
-    const lastAt = new Map<string, number>();
-    return {
-      toolText: {
-        tools: new Set(names),
-        onText: ({ id, name, text }) => {
-          const now = Date.now();
-          if (now - (lastAt.get(id) ?? -Infinity) < TOOL_TEXT_DELTA_INTERVAL_MS) return;
-          lastAt.set(id, now);
-          Promise.resolve(this.onEvent({ type: "toolTextDelta", tool: name, actionId: id, text })).catch((err: unknown) =>
-            logger.warn({ err: (err as Error)?.message, sessionId: this.sessionId, tool: name }, "agent-loop.tool_text_delta_failed"));
-        },
-      },
-    };
+    return new ToolTextThrottle(new Set(names), TOOL_TEXT_DELTA_INTERVAL_MS, ({ id, name, text }) =>
+      Promise.resolve(this.onEvent({ type: "toolTextDelta", tool: name, actionId: id, text })).catch((err: unknown) =>
+        logger.warn({ err: (err as Error)?.message, sessionId: this.sessionId, tool: name }, "agent-loop.tool_text_delta_failed")));
   }
 
   /** One LLM streamTurn call with retry-with-backoff on transient errors. */
@@ -2233,6 +2292,7 @@ class AgentLoopRunner {
     // can fix.
     let sanitizedRetryUsed = false;
     let imagesDropped = false;
+    let toolText: ToolTextThrottle | undefined;
     for (let attempt = 0; ; attempt++) {
       try {
         // Filter accumulated [system-notice]: messages before each
@@ -2240,8 +2300,14 @@ class AgentLoopRunner {
         // / sub-agent merges may add new ones between attempts. This
         // does NOT mutate workingMessages — KV stays a full audit trail.
         const llmMessages = filterResumeNotices(this.workingMessages);
-        return await this.session.streamTurn(llmMessages, this.effectiveTools, this.signal, this.toolTextOptions());
+        toolText = this.toolTextOptions();
+        const result = await this.session.streamTurn(llmMessages, this.effectiveTools, this.signal, toolText?.options);
+        // The text written since the last delta, before the calls run: without it a text written inside one interval is a single delta.
+        await toolText?.flush();
+        return result;
       } catch (err: any) {
+        // A failed attempt's text is not the turn's: the retry streams it again from the start.
+        toolText?.cancel();
         let code = err?.code as string | undefined;
         const errMsg = err?.message || String(err);
         if (!sanitizedRetryUsed && !this.signal?.aborted && looksLikeToolArgumentsRejection(err)) {
