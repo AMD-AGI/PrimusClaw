@@ -1106,7 +1106,8 @@ export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECOND
 // that is still pulling. Without this the wait ended only at the workload's own
 // timeout, hours later, with the user's Stop doing nothing (it is also honoured
 // now, see waitForWorkloadReady). The clock RESETS if the workload falls back to
-// Pending. Set it above the slowest legitimate image pull for the deployment.
+// Pending, and does not run while the platform reports a node being added for the
+// sandbox (`TriggeredScaleUp`): that wait is on SANDBOX_PENDING_TIMEOUT_SECONDS. Set it above the slowest legitimate image pull for the deployment.
 // 0 waits indefinitely. Stored in ms; configured in seconds like the siblings.
 export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 15 * 60) * 1000;
 
@@ -1136,10 +1137,12 @@ export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 
 // healthy start (image pull, container boot) takes; that keeps its own, longer
 // ceiling above. It does NOT cover a workload still in the platform's queue (a
 // queue moves, and for a GPU sandbox can be hours), nor an admitted one with a
-// node being added (which can take longer than this): those keep the ceilings of
-// their phase, SANDBOX_PENDING_TIMEOUT_SECONDS while Pending and
-// SANDBOX_START_TIMEOUT_SECONDS once the platform reports it NotReady, and the
-// user is told why they are waiting. A cluster whose nodes scale up without the
+// node being added (which can take longer than this): both are waits for capacity
+// and run on SANDBOX_PENDING_TIMEOUT_SECONDS, whichever phase the platform reports
+// (a sandbox being given a node is often NotReady already), never on
+// SANDBOX_START_TIMEOUT_SECONDS; the user is told why they are waiting. When the
+// autoscaler refuses (`NotTriggerScaleUp`), the reason it gives is passed on, with
+// its identifiers taken out. A cluster whose nodes scale up without the
 // platform saying so should raise this or set 0. Applies to the sandbox a run
 // opens, not to hosted applications or multi-node clusters.
 // Stored in ms; configured in seconds like the siblings. Default 5 minutes. 0

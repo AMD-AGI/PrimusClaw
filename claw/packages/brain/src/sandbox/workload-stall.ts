@@ -128,6 +128,39 @@ function scaleUpWithdrawn(text: string): boolean {
 
 const count = (text: string, re: RegExp): number => Number(re.exec(text)?.[1] ?? 0);
 
+/** Long enough for the autoscaler's reason, short enough to stay one line of progress. */
+const REFUSAL_LIMIT = 120;
+
+/**
+ * What the autoscaler said when it refused to add a node (`NotTriggerScaleUp`), in
+ * its own words but without its identifiers, or null when it said nothing more. It
+ * is the one part of the platform's text the user is given as written: "no new node
+ * is being added" alone does not say whether to wait, retry or change the request,
+ * and the autoscaler's reason does ("NoHeadroom: the pods need 1 new node(s)", "does
+ * not fit a new node of this pool"). Pool ids, pod names, job ids and taint
+ * contents are taken out, as everywhere else.
+ */
+export function scaleUpRefusal(text: string): string | null {
+  const at = text.search(/\bNotTriggerScaleUp\b/);
+  if (at < 0) return null;
+  const said = text.slice(at)
+    .replace(/\bNotTriggerScaleUp\b:?/g, " ")
+    .replace(/\bpod didn't trigger scale-up\b:?/gi, " ")
+    // "pool <id>: <why>" leads with the pool; "pool <id> would ..." names it in a sentence.
+    .replace(/\bpool [\w-]+:/gi, " ")
+    .replace(/\bpool [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "the pool")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "")
+    // A namespace/name (a pod, a PodGroup); not a resource such as amd.com/gpu.
+    .replace(/\b(pod|podgroup) [a-z0-9][-a-z0-9]*\/[a-z0-9][-a-z0-9.]*[a-z0-9]/gi, (_m, kind: string) => `the ${kind.toLowerCase()}`)
+    .replace(/(?<![\w.])[a-z0-9][-a-z0-9]*\/[a-z0-9][-a-z0-9.]*[a-z0-9]/g, "")
+    .replace(/\{[^}]*\}/g, "")
+    .replace(/\bjob \d+\b/gi, "a job")
+    .replace(/\s+([:;,.])/g, "$1")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s:;,.-]+|[\s:;,-]+$/g, "");
+  return said ? cleanPlatformText(said, REFUSAL_LIMIT) : null;
+}
+
 /** Said while a node is being added for the sandbox. */
 const ADDING_NODE = "the platform is adding a node for the sandbox";
 
@@ -170,7 +203,11 @@ export function summarizeScheduling(text: string): string | null {
     causes.push(`${m[1]} short of ${m[2]}`);
   }
   const nodes = total ? ` (${total} nodes${causes.length ? `: ${causes.join(", ")}` : ", none available"})` : "";
-  return `no node can take the sandbox right now${nodes}${notAdded ? ", and no new node is being added" : ""}`;
+  const refusal = notAdded ? scaleUpRefusal(text) : null;
+  const notAddedClause = notAdded
+    ? `, and no new node is being added${refusal ? ` (the autoscaler says: ${refusal})` : ""}`
+    : "";
+  return `no node can take the sandbox right now${nodes}${notAddedClause}`;
 }
 
 /**
