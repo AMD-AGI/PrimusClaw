@@ -111,7 +111,8 @@ describe("assistant router read tools", { skip }, () => {
     assert.equal(task.plugin_id, PLUGIN);
     assert.deepEqual(task.plugin_tools.map((t: any) => t.id), [3, 26, 18]);
     assert.ok(task.tools_allowlist.includes("mcp__assistant__*"));
-    assert.ok(allows(task.tools_allowlist, "mcp__autopilot__get_nodes"), "the autopilot read tool is offered");
+    assert.ok(allows(task.tools_allowlist, "mcp__autopilot__get_status"), "the autopilot read tool is offered");
+    assert.ok(!allows(task.tools_allowlist, "mcp__autopilot__get_nodes"), "by name: a tool autopilot does not list is not offered");
     assert.ok(!allows(task.tools_allowlist, "mcp__autopilot__apply_host_exclusion_add"));
     assert.equal(task.skip_platform_defaults, true, "no default MCP server and no default skill list");
     // After it has read one of their results the turn no longer acts for the person: only these are let through by Brain.

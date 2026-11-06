@@ -19,27 +19,15 @@ import { GITHUB_MCP_SERVER } from "@claw/protocol";
 import { CLAW_ASSISTANT_PLUGIN_ID } from "../config.js";
 import { githubMcpServers } from "../github-mcp/mcp.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
+import { routerReadsByServer } from "./tool-classes.js";
 
 /**
- * Per server, the tools that only read. Each entry is a tool name, or a prefix ending in `*` (Brain's allow-list
- * matches nothing else). Only names whose every tool reads: a prefix that also covers a write is not used.
+ * Per server, the tools that only read and that a router turn is offered, by name: every read of the server's catalogued
+ * `tools/list` that the catalog does not keep from the router (`tool-catalog.ts`, derived in `tool-classes.ts`). A tool the
+ * catalog does not classify is offered nowhere, and the tests fail on it; there is no prefix, so a write a server adds under a
+ * read's prefix is never offered.
  */
-export const ROUTER_READ_TOOLS: Readonly<Record<string, readonly string[]>> = {
-  // Autopilot's MCP names its reads get_* / list_*; everything else (apply_*, preview_*, ...) is left out.
-  autopilot: ["get_*", "list_*"],
-  // SaFE's MCP mixes reads and writes under one resource prefix, so its reads are named one by one. The apikey_* tools are left
-  // out even where they read: a router has no use for the user's keys.
-  safe: [
-    "cluster_list", "cluster_get", "node_list", "node_get", "node_status", "workload_list", "workload_get",
-    "workspace_list", "workspace_get", "opsjob_list", "opsjob_get", "flavor_list", "flavor_get", "user_self",
-  ],
-  // Dispatron's MCP is its HTTP API, one tool per route, named by method: get_* is every GET.
-  dispatron: ["get_*"],
-  // Pulse: what its own plugin config lets through without approval, all of them reads.
-  pulse: ["leaderboard_*", "upstream_*", "cost_overview"],
-  // The agent board (Gitea): the read and list tools; *_write, create_* and fork_* change things.
-  "agent-board": ["get_*", "list_*", "issue_read", "label_read"],
-};
+export const ROUTER_READ_TOOLS: Readonly<Record<string, readonly string[]>> = routerReadsByServer();
 
 /** The `tools_allowlist` entries of one server's read tools, as Brain names them. */
 export function readToolPatterns(server: string): string[] {

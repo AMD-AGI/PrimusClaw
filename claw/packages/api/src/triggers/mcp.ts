@@ -9,7 +9,9 @@
  * bearer proves is which turn is calling; whose triggers those are is read from that turn's session. Creating a
  * trigger is held for the user's decision (`requires_approval`), which shows them the whole prompt and schedule:
  * a scheduled run acts on their behalf later with nobody watching. Cancelling is held too: it deletes for good any
- * of the user's triggers, also ones they set up themselves, so a fetched page must not be able to do it unseen.
+ * of the user's triggers, also ones they set up themselves, so a fetched page must not be able to do it unseen. Which tools
+ * are held is the catalog's list of this server's writes (`assistant/tool-catalog.ts`): a tool added here and not classified
+ * there fails the tests.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -18,6 +20,7 @@ import pino from "pino";
 import { z } from "zod";
 import { TRIGGER_MCP_PATH, TRIGGER_MCP_SERVER } from "@claw/protocol";
 import { tokenTtlSeconds } from "../assistant/role-profile.js";
+import { toolsOfClass } from "../assistant/tool-classes.js";
 import {
   CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, INTERNAL_BACKEND_URL, TRIGGER_MIN_INTERVAL_MINUTES,
 } from "../config.js";
@@ -135,7 +138,7 @@ export async function applyTriggerToolsToTask(task: Record<string, unknown>, ses
     task.mcp_servers = {
       ...(task.mcp_servers as Record<string, Record<string, unknown>> | undefined),
       [TRIGGER_MCP_SERVER]: {
-        type: "http", url: `${INTERNAL_BACKEND_URL}${TRIGGER_MCP_PATH}`, token, requires_approval: ["trigger_create", "trigger_cancel"],
+        type: "http", url: `${INTERNAL_BACKEND_URL}${TRIGGER_MCP_PATH}`, token, requires_approval: toolsOfClass(TRIGGER_MCP_SERVER, "write"),
       },
     };
   } catch (err) {
