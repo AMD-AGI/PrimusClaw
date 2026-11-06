@@ -6,12 +6,13 @@
  *
  * The model writes [1], [2] in its text and names each number's address in `say`'s `sources`. Those addresses are never taken as
  * sources here. Brain keeps what the turn's lookups returned (`ExecuteRequest.cite`: a search's pages, a page fetched whole, the
- * objects this API's GitHub server listed) and sends `say` the entries that matched, in the MCP request's `_meta`, which the model
+ * objects this API's GitHub server listed; a page fetched only at an address one of those returned or the user wrote) and sends
+ * `say` the entries that matched, in the MCP request's `_meta`, which the model
  * cannot write; an address no lookup returned is dropped there and counted. What arrives is checked again here before it is
  * stored with the message and sent to the channel (`AssistantSayPayload.sources`):
  *
- *  - each entry's number is 1..`CITE_MAX_PER_CALL`, once, and appears in the text as `[n]` on its own, not as or inside a link
- *    (`citedNumbers`);
+ *  - each entry's number is 1..`CITE_MAX_PER_CALL`, once, and appears in the text as `[n]` on its own, in a text that can make no
+ *    link at all (`citedNumbers`);
  *  - its address can be a source (`citeableUrl`: http or https, a host, no credentials as a user or a parameter) and has nothing
  *    a redaction would mask;
  *  - its title is a page's or a pull request's own words, which anyone may have written: it is cut to one plain line of
@@ -27,7 +28,7 @@ import {
 } from "@claw/protocol";
 import { CLAW_ASSISTANT_CITATIONS, CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { redactPublicJson } from "../events/redaction.js";
-import { TOOL_NAME_PREFIX } from "./prompts.js";
+import { TOOL_NAME_PREFIX, TURN_STATE_HEADER, WORK_EVENT_PREFIX } from "./prompts.js";
 
 /** The longest title a cited source is shown with, in code points. */
 export const SAY_SOURCE_TITLE_MAX = 80;
@@ -38,22 +39,55 @@ export function assistantCitationsOn(): boolean {
   return CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_CITATIONS;
 }
 
+/** The most addresses of the user's message a turn may confirm as sources by reading them (`userAddresses`). */
+export const USER_ADDRESSES_MAX = 20;
+/** An http or https address written into a message: up to the first character an address does not hold unescaped. */
+const WRITTEN_ADDRESS = /https?:\/\/[\w\-.~:/?#@!$&*+,;=%]+/gi;
+
+/**
+ * The addresses the user wrote in the message a turn answers (`prompt`, as the turn was sent it), each one that can be a source
+ * (`citeableUrl`), at most `USER_ADDRESSES_MAX`: a page `web_fetch` reads is a source only at one of these or at one a search or
+ * GitHub lookup of the turn returned (`ExecuteRequest.cite.user_urls`). A worker's report (`[work_event]`) is not the user's words,
+ * and neither is the state Claw adds after them (`TURN_STATE_HEADER`).
+ */
+export function userAddresses(prompt: string): string[] {
+  if (prompt.startsWith(WORK_EVENT_PREFIX)) return [];
+  const out: string[] = [];
+  for (const m of prompt.split(TURN_STATE_HEADER, 1)[0].matchAll(WRITTEN_ADDRESS)) {
+    // A sentence's own punctuation after it is not part of it (trimmed by hand: a `+$` pattern would rescan every run).
+    let end = m[0].length;
+    while (end > 0 && ".,;:!?*".includes(m[0][end - 1])) end -= 1;
+    const address = m[0].slice(0, end);
+    if (citeableUrl(address) && !out.includes(address)) out.push(address);
+    if (out.length >= USER_ADDRESSES_MAX) break;
+  }
+  return out;
+}
+
 /**
  * A router turn's `ExecuteRequest.cite`, or null with citations off: its `say` cites, from Brain's web tools and, when the turn
- * has the user's GitHub, this API's GitHub server.
+ * has the user's GitHub, this API's GitHub server; a page read is a source only at an address one of those returned or the
+ * user wrote in `prompt` (`userAddresses`).
  */
 export function routerCite(
-  githubServers: Record<string, unknown>, on: boolean = assistantCitationsOn(),
-): { tools: string[]; source_servers: string[] } | null {
+  githubServers: Record<string, unknown>, prompt: string, on: boolean = assistantCitationsOn(),
+): { tools: string[]; source_servers: string[]; user_urls?: string[] } | null {
   if (!on) return null;
+  const userUrls = userAddresses(prompt);
   return {
     tools: [`${TOOL_NAME_PREFIX}say`],
     source_servers: Object.hasOwn(githubServers, GITHUB_MCP_SERVER) ? [GITHUB_MCP_SERVER] : [],
+    ...(userUrls.length ? { user_urls: userUrls } : {}),
   };
 }
 
-/** What became of the sources a `say` was sent: the counter's `outcome` label. */
-export const SAY_SOURCE_OUTCOMES = ["cited", "dropped_not_in_turn", "dropped_invalid", "dropped_over_cap", "unreferenced"] as const;
+/**
+ * What became of the sources a `say` was sent: the counter's `outcome` label. `unreferenced`: the text writes no `[n]` for it;
+ * `suppressed_link_text`: it does, but the text can make a link (`makesLink`), so it cites nothing.
+ */
+export const SAY_SOURCE_OUTCOMES = [
+  "cited", "dropped_not_in_turn", "dropped_invalid", "dropped_over_cap", "unreferenced", "suppressed_link_text",
+] as const;
 export type SaySourceOutcome = (typeof SAY_SOURCE_OUTCOMES)[number];
 
 export interface SaySources {
@@ -103,21 +137,50 @@ export function sourceTitle(raw: unknown, url: URL): string {
 
 /** At a position: `[n]`. */
 const CITE_AT = /\[(\d{1,2})\]/y;
+/** A backslash escape, as markdown resolves it (`\.` is a `.` once shown). */
+const ESCAPED = /\\([!-/:-@[-`{-~])/g;
 /**
- * What lets a text make a link at all: an address, protocol-relative ones included (`//`, `www.`, `mailto:`), an e-mail address
- * (an `@` before a dotted domain, whatever comes before it: GFM links one by itself), an inline link or image or a reference definition, wherever it stands (a `]` before `(` or `:`,
- * spaces allowed: inside a quote or a list too), an HTML tag or an autolink (`<`). The router is told to put addresses in `sources` and never in the text, so a text with any of them
- * cites nothing: no `[n]` in it can be, or be inside, a link to an address of the model's.
+ * What makes a link where it stands, as CommonMark with GitHub's autolinks reads a text: an inline link or image (a `]` right before
+ * `(`: `[1] (2 days ago)` is text), an autolink or an HTML tag (`<` before a letter, `/`, `!` or `?`: `p99 < 10ms` is text), an
+ * address (`://`, `www.`, `mailto:`), an e-mail address (a local part right before `@` and a dotted domain after it: a mention
+ * `@alice.smith` is text). A link reference definition makes one too (`definesLink`).
  */
-const LINK_MAKING = /\/\/|\bwww\.|mailto:|@[\w-]+\.[a-z]|\]\s*[(:]|</i;
+const LINK_MAKING = /\]\(|<[a-z/!?]|:\/\/|www\.|(?:mailto|xmpp):|[a-z0-9._+-]@[a-z0-9_-]+\.[a-z0-9_-]/i;
+/** What may stand before a link reference definition's `[` on its line: indentation, a quote's `>`, a list item's marker. */
+const LINE_LEAD = new Set([" ", "\t", ">", "*", "+", "-", ".", ")", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]);
 
 /**
- * The numbers the text cites as `[n]` on their own, outside every bracket, and none at all in a text that can make a link
- * (`LINK_MAKING`). An escaped bracket is no bracket; an unclosed `[` leaves what follows it uncited.
+ * Whether the text defines a link reference (`[1]: https://…`, `[^2]: …`), which makes every `[1]` of it a link: a `[` that opens
+ * its line (only `LINE_LEAD` before it) closed by `]:`, its label holding no bracket and maybe running across lines. `Status [1]:
+ * merged` defines nothing.
  */
-export function citedNumbers(text: string): Set<number> {
+function definesLink(text: string): boolean {
+  let lead = true;
+  let open = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text[i];
+    if (c === "[") open = lead;
+    else if (c === "]") {
+      if (open && text[i + 1] === ":") return true;
+      open = false;
+    }
+    lead = c === "\n" || (lead && LINE_LEAD.has(c));
+  }
+  return false;
+}
+
+/** Whether the text can make a link (`LINK_MAKING`, `definesLink`), read as it is shown: with its backslash escapes resolved. */
+export function makesLink(text: string): boolean {
+  const shown = text.replace(ESCAPED, "$1");
+  return LINK_MAKING.test(shown) || definesLink(shown);
+}
+
+/**
+ * The numbers the text writes as `[n]` on their own, outside every bracket. An escaped bracket is no bracket; an unclosed `[`
+ * leaves what follows it unwritten.
+ */
+function writtenNumbers(text: string): Set<number> {
   const out = new Set<number>();
-  if (LINK_MAKING.test(text)) return out;
   let depth = 0;
   for (let i = 0; i < text.length; i += 1) {
     const c = text[i];
@@ -134,6 +197,15 @@ export function citedNumbers(text: string): Set<number> {
   return out;
 }
 
+/**
+ * The numbers the text cites: the ones it writes as `[n]` on their own (`writtenNumbers`), and none at all in a text that can make a
+ * link (`makesLink`). The router is told to put addresses in `sources` and never in the text, so no `[n]` can be, or be inside, a
+ * link to an address of the model's.
+ */
+export function citedNumbers(text: string): Set<number> {
+  return makesLink(text) ? new Set() : writtenNumbers(text);
+}
+
 const count = (v: unknown): number => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? Math.min(v, 1000) : 0);
 
 /**
@@ -142,7 +214,7 @@ const count = (v: unknown): number => (typeof v === "number" && Number.isSafeInt
  */
 export function saySources(meta: unknown, text: string): SaySources {
   const counts: Record<SaySourceOutcome, number> = {
-    cited: 0, dropped_not_in_turn: 0, dropped_invalid: 0, dropped_over_cap: 0, unreferenced: 0,
+    cited: 0, dropped_not_in_turn: 0, dropped_invalid: 0, dropped_over_cap: 0, unreferenced: 0, suppressed_link_text: 0,
   };
   const sources: CitedSource[] = [];
   if (!meta || typeof meta !== "object") return { sources, counts };
@@ -152,7 +224,8 @@ export function saySources(meta: unknown, text: string): SaySources {
   counts.dropped_invalid += count(dropped.invalid);
   counts.dropped_over_cap += count(dropped.over_cap);
   const listed = Array.isArray(m[CITE_SOURCES_META]) ? m[CITE_SOURCES_META] as unknown[] : [];
-  const cited = citedNumbers(text);
+  const written = writtenNumbers(text);
+  const linked = makesLink(text);
   const seen = new Set<number>();
   let bytes = 2;
   for (const raw of listed) {
@@ -166,7 +239,8 @@ export function saySources(meta: unknown, text: string): SaySources {
       continue;
     }
     seen.add(n);
-    if (!cited.has(n)) { counts.unreferenced += 1; continue; }
+    if (!written.has(n)) { counts.unreferenced += 1; continue; }
+    if (linked) { counts.suppressed_link_text += 1; continue; }
     const source: CitedSource = { n, url: e.url as string, title: sourceTitle(e.title, url), kind: e.kind };
     const size = Buffer.byteLength(JSON.stringify(source)) + 1;
     if (bytes + size > SAY_SOURCES_MAX_BYTES) { counts.dropped_over_cap += 1; continue; }

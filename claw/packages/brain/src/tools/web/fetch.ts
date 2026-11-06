@@ -458,8 +458,8 @@ export class WebFetchService {
       return fail(`Error: domain ${parsed.hostname} is blocked by WEB_FETCH_DOMAIN_DENYLIST`);
     }
 
-    // The page this call read whole, as a source (`tools/citations.ts`): only a page it returned, never a redirect it reported, an
-    // error or content it would not read.
+    // The page this call read whole, as a source (`tools/citations.ts`, which keeps it only where it confirms an address the turn
+    // already had): only a page it returned, never a redirect it reported, an error or content it would not read.
     const read = (finalUrl: string): void => {
       const source = outcome && webSource(finalUrl);
       if (outcome && source) outcome.sources = [source];

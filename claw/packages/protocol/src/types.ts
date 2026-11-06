@@ -418,8 +418,10 @@ export interface ExecuteRequest {
    * argument (addresses, the i-th standing for `[i+1]` in its text) looked up there; the entries found go to that tool in the MCP
    * request's `_meta["claw/sources"]`, what was dropped in `_meta["claw/sources_dropped"]`. The arguments are sent as the model wrote
    * them. The API sets it on an assistant's router turn (`CLAW_ASSISTANT_CITATIONS`), for its `say`. Absent: nothing is kept or sent.
+   * A page `web_fetch` read is kept only when a search or a trusted server of the run returned its address first, or it is one of
+   * `user_urls`, the addresses the user wrote in the message the turn answers: reading a page confirms a source, it never adds one.
    */
-  cite?: { tools: string[]; source_servers?: string[] };
+  cite?: { tools: string[]; source_servers?: string[]; user_urls?: string[] };
 
   // ── Legacy chat fields (Phase 4 removes; do not use in new task code) ─
   /** @deprecated Use `sandbox_spec.image`. Kept for legacy chat NATS path. */

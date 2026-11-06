@@ -6,9 +6,10 @@
  * assistant and notifications on. Skipped without DATABASE_URL, and a skip is not a pass.
  *
  *   SC5 say's schema has `sources` after `text` with citations on and not at all with them off; the `_meta` Brain sends is what the
- *       outbox payload carries, the model's `sources` argument never is, and the counter counts each outcome
+ *       outbox payload carries, the model's `sources` argument never is, and the counter counts each outcome; a `sources` the
+ *       model got wrong does not refuse the message
  *   SC6 the web client's event carries the same sources as the channel's payload
- *   SC7 a router turn's request cites with say, and its prompt says how; a worker turn neither
+ *   SC7 a router turn's request cites with say, with the addresses the user wrote, and its prompt says how; a worker turn neither
  */
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
@@ -61,13 +62,19 @@ describe("say with citations, on a real Postgres", { skip }, () => {
     const family = w.h.app.metrics.registry.getSingleMetric("claw_assistant_say_sources_total");
     assert.ok(family, "the counter is on the api registry");
     const counted = async (outcome: string) => (await family.get()).values.find((v) => v.labels.outcome === outcome)?.value ?? 0;
-    const before = { cited: await counted("cited"), missing: await counted("dropped_not_in_turn"), unreferenced: await counted("unreferenced") };
+    const before = {
+      cited: await counted("cited"), missing: await counted("dropped_not_in_turn"), unreferenced: await counted("unreferenced"),
+      suppressed: await counted("suppressed_link_text"),
+    };
 
     const router = await connect(w.mod.token.mintAssistantToken(await w.routerTurn(alice) as never, TOKEN_KEY));
     try {
       const say = (await router.listTools()).tools.find((t) => t.name === "say")!;
       assert.deepEqual(Object.keys((say.inputSchema as any).properties), ["text", "item_id", "sources"], "sources after text");
       assert.deepEqual((say.inputSchema as any).required, ["text"]);
+      const { SAY_SOURCES_PARAM } = await import("../src/assistant/mcp.js");
+      assert.deepEqual((say.inputSchema as any).properties.sources, { type: "array", items: { type: "string" }, description: SAY_SOURCES_PARAM },
+        "the model is shown a list of addresses");
 
       const text = "#309 已合入 [1]，CI 全绿 [2]。";
       const res = await router.callTool({
@@ -78,13 +85,24 @@ describe("say with citations, on a real Postgres", { skip }, () => {
       assert.equal(res.isError, undefined, JSON.stringify(res.content));
       const fabricated = await router.callTool({ name: "say", arguments: { text: "made up [1]", sources: ["https://made-up.example/x"] } });
       assert.equal(fabricated.isError, undefined);
+      // `sources` as objects, as one address, as a number: what Brain sent is still what is cited, and the message is not refused.
+      for (const sources of [[{ url: PR, title: "x" }], PR, 7, [PR, 3]]) {
+        const typo = await router.callTool({ name: "say", arguments: { text: "typed wrong [1]", sources }, _meta: meta([pr(1)]) });
+        assert.equal(typo.isError, undefined, `${JSON.stringify(sources)}: ${JSON.stringify(typo.content)}`);
+      }
+      const linked = await router.callTool({ name: "say", arguments: { text: "merged [1], see www.example.com" }, _meta: meta([pr(1)]) });
+      assert.equal(linked.isError, undefined);
     } finally { await router.close(); }
 
-    const [cited, fabricated] = await payloads();
+    const [cited, fabricated, ...rest] = await payloads();
+    const typos = rest.slice(0, 4);
+    assert.deepEqual(typos.map((p) => [p.text, p.sources]), Array.from({ length: 4 }, () => ["typed wrong [1]", [pr(1)]]));
+    assert.equal(rest[4].sources, undefined, "a text with a link of its own cites nothing");
+    assert.equal(await counted("suppressed_link_text") - before.suppressed, 1);
     assert.equal(cited.text, "#309 已合入 [1]，CI 全绿 [2]。", "the text as written");
     assert.deepEqual(cited.sources, [pr(1)]);
     assert.equal(fabricated.sources, undefined, "the model's own addresses are never sources");
-    assert.equal(await counted("cited") - before.cited, 1);
+    assert.equal(await counted("cited") - before.cited, 1 + 4);
     assert.equal(await counted("dropped_not_in_turn") - before.missing, 1);
     assert.equal(await counted("unreferenced") - before.unreferenced, 1);
 
@@ -123,6 +141,10 @@ describe("say with citations, on a real Postgres", { skip }, () => {
     const task: Record<string, any> = { task_id: turn.task_id, message_id: turn.mid, prompt: "#309 合了吗" };
     await w.mod.role.applySessionRoleToTask(task, alice.routerSid);
     assert.deepEqual(task.cite, { tools: ["mcp__assistant__say"], source_servers: [] }, "no GitHub server for a user without a token");
+    const reading = await w.routerTurn(alice);
+    const rtask: Record<string, any> = { task_id: reading.task_id, message_id: reading.mid, prompt: "总结一下 https://example.com/post" };
+    await w.mod.role.applySessionRoleToTask(rtask, alice.routerSid);
+    assert.deepEqual(rtask.cite.user_urls, ["https://example.com/post"], "the address the user wrote, which a page read may confirm");
     assert.match(task.system_append, /Citing what you looked up/);
     assert.deepEqual(task.stream_tool_text, ["mcp__assistant__say"], "the say still streams");
     const item = await w.createItem(alice, "Fix the build");

@@ -123,8 +123,8 @@ const assistantSayRateLimitedTotal = new Counter({
 
 // The sources the assistant's `say` was sent (`assistant/citations.ts`), by what became of each: shown with the message (`cited`),
 // dropped because no lookup of the turn returned the address (`dropped_not_in_turn`, the number that says the model is writing
-// addresses of its own), malformed (`dropped_invalid`), past the per-message cap (`dropped_over_cap`), or not cited in the text
-// (`unreferenced`).
+// addresses of its own), malformed (`dropped_invalid`), past the per-message cap (`dropped_over_cap`), not cited in the text
+// (`unreferenced`), or cited in a text that can make a link of its own and so cites nothing (`suppressed_link_text`).
 const assistantSaySourcesTotal = new Counter({
   name: "claw_assistant_say_sources_total",
   help: "Sources an assistant say was sent, by outcome.",
@@ -388,7 +388,9 @@ export const metrics = {
   onAssistantSayRateLimited(notice: "sent" | "already_sent" | "failed"): void {
     assistantSayRateLimitedTotal.inc({ notice });
   },
-  onAssistantSaySources(outcome: "cited" | "dropped_not_in_turn" | "dropped_invalid" | "dropped_over_cap" | "unreferenced", n: number): void {
+  onAssistantSaySources(
+    outcome: "cited" | "dropped_not_in_turn" | "dropped_invalid" | "dropped_over_cap" | "unreferenced" | "suppressed_link_text", n: number,
+  ): void {
     if (n > 0) assistantSaySourcesTotal.inc({ outcome }, n);
   },
 };

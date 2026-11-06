@@ -4,9 +4,12 @@
 /**
  * `ExecuteRequest.cite`: the sources a run's lookups returned, and the ones a citing call may name.
  *
- * A source is kept only from what a lookup's own code produced, never from text: a `web_search` result's hits, a page `web_fetch`
- * read whole, and the `_meta["claw/sources"]` of a result from a server the request names in `source_servers` that is one the API
- * adds itself (`isPlatformMcpServer`). A plugin's server, a page's body and the model's own words are never read for addresses.
+ * A source is kept only from what a lookup's own code produced, never from text: a `web_search` result's hits, and the
+ * `_meta["claw/sources"]` of a result from a server the request names in `source_servers` that is one the API adds itself
+ * (`isPlatformMcpServer`). A page `web_fetch` read whole only confirms a source: it is kept when its address is one of those or one
+ * the user wrote in the message the turn answers (`user_urls`), so what a page or a search result's text says cannot lead the model
+ * to an address of its choosing and make it a source. A plugin's server, a page's body and the model's own words are never read
+ * for addresses.
  *
  * A call of a citing tool (the router's `say`) gives its `sources` as addresses; each is looked up among the kept ones by a
  * normalized form (`citeKey`), and the kept entry is what is sent on, the tool's own address and not the model's copy of it. What is
@@ -28,6 +31,10 @@ export const RUN_SOURCES_MAX = 200;
 
 /** Brain's own lookups whose sources are kept: they fill `RouteOutcome.sources` themselves. */
 const BRAIN_SOURCE_TOOLS = new Set(["web_search", "web_fetch"]);
+/** The lookup that only confirms a source (a page read at an address another lookup returned or the user wrote), never adds one. */
+const CONFIRMING_TOOL = "web_fetch";
+/** The most addresses of the user's message a run reads from `cite.user_urls`. */
+export const USER_URLS_MAX = 20;
 
 /**
  * The form two addresses are compared in: scheme and host lower case (the URL parser does both), no fragment, no default port, no
@@ -65,7 +72,11 @@ export function webSource(url: string, title?: string): CiteSource | null {
 export class RunCitations {
   private readonly kept = new Map<string, CiteSource>();
 
-  constructor(private readonly citing: ReadonlySet<string>, private readonly sourceServers: ReadonlySet<string>) {}
+  /** `userKeys`: the `citeKey` of each address the user wrote in the message the turn answers (`cite.user_urls`). */
+  constructor(
+    private readonly citing: ReadonlySet<string>, private readonly sourceServers: ReadonlySet<string>,
+    private readonly userKeys: ReadonlySet<string> = new Set(),
+  ) {}
 
   /** Whether a call of `name` cites: its `sources` argument is looked up, and the result sent in the request's `_meta`. */
   cites(name: string): boolean {
@@ -80,13 +91,21 @@ export class RunCitations {
     return this.sourceServers.has(server);
   }
 
-  /** Keep the sources a call of `name` returned, when `name` is one whose sources are believed. Malformed entries are skipped. */
+  /**
+   * Keep the sources a call of `name` returned, when `name` is one whose sources are believed. Malformed entries are skipped, and so
+   * is a page `web_fetch` read at an address neither kept already nor written by the user (`CONFIRMING_TOOL`).
+   */
   keep(name: string, sources: unknown): void {
     if (!Array.isArray(sources) || !sources.length || !this.producedBy(name)) return;
     for (const raw of sources) {
       const source = citeSource(raw);
       const key = source && citeKey(source.url);
       if (!source || !key || this.kept.has(key)) continue;
+      if (name === CONFIRMING_TOOL && !this.userKeys.has(key)) {
+        // Host only: the address came from what the model read, and its path or query may carry anything.
+        logger.info({ tool: name, host: new URL(key).host }, "cite.fetch_not_confirmed");
+        continue;
+      }
       if (this.kept.size >= RUN_SOURCES_MAX) {
         logger.warn({ tool: name, max: RUN_SOURCES_MAX }, "cite.run_sources_full");
         return;
@@ -134,7 +153,7 @@ export class RunCitations {
  */
 export function parseCite(raw: unknown, servers: Record<string, unknown>): RunCitations | null {
   if (!raw || typeof raw !== "object") return null;
-  const r = raw as { tools?: unknown; source_servers?: unknown };
+  const r = raw as { tools?: unknown; source_servers?: unknown; user_urls?: unknown };
   const names = (v: unknown): string[] => (Array.isArray(v) ? v.filter((n): n is string => typeof n === "string" && n.trim() !== "").map((n) => n.trim()) : []);
   const tools = names(r.tools);
   if (!tools.length) return null;
@@ -144,5 +163,6 @@ export function parseCite(raw: unknown, servers: Record<string, unknown>): RunCi
     if (!ok) logger.warn({ server: name }, "cite.source_server_not_trusted");
     return ok;
   });
-  return new RunCitations(new Set(tools), new Set(trusted));
+  const userKeys = names(r.user_urls).slice(0, USER_URLS_MAX).map(citeKey).filter((k): k is string => k !== null);
+  return new RunCitations(new Set(tools), new Set(trusted), new Set(userKeys));
 }

@@ -97,8 +97,9 @@ export const ROUTER_READ_PROMPT_VERSION = "router-read-v3";
 /**
  * The read section's citing (`CLAW_ASSISTANT_CITATIONS`), logged beside it when on.
  * router-cite-v1: what came from a lookup is cited as [n] in say's text with its address in say's sources, never as a link.
+ * router-cite-v2: a page web_fetch read is cited only at an address a search or GitHub result or the user's message gave.
  */
-export const ROUTER_CITE_PROMPT_VERSION = "router-cite-v1";
+export const ROUTER_CITE_PROMPT_VERSION = "router-cite-v2";
 
 /** What a router turn can look up: the plugin's servers with read tools, and the GitHub reads it has (`read-tools.ts`), if any. */
 export interface RouterLookupsShown {
@@ -111,7 +112,7 @@ export interface RouterLookupsShown {
 
 /** How say cites what a lookup returned, with citing on. */
 const ROUTER_CITE_RULES = `Citing what you looked up
-When say tells the user something a lookup of this turn returned (a web page, a pull request, an issue, a check), cite it: put [1], [2] right after the sentence it supports, and pass the address each number stands for in say's sources, in the same order (sources[0] is [1]), copied exactly from the lookup's result: a web_search result's url, the URL web_fetch read, a GitHub result's url. Do not write those addresses, links or HTML into the text: the user sees each number as a link to its source, and a text with any address or link in it gets no citations at all. Only an address a lookup returned in this turn can be cited; any other is dropped, and its number then points nowhere. Cite at most 8, write text before sources, and leave sources out when nothing was looked up. The REMINDER at the end of a web_search result about markdown links does not apply to say.`;
+When say tells the user something a lookup of this turn returned (a web page, a pull request, an issue, a check), cite it: put [1], [2] right after the sentence it supports, and pass the address each number stands for in say's sources, in the same order (sources[0] is [1]), copied exactly from the lookup's result: a web_search result's url, a GitHub result's url, or the URL web_fetch read when a search or GitHub result or the user's message gave that address (a page you reached only through what a page or a result's text said cannot be cited). Do not write those addresses, links or HTML into the text: the user sees each number as a link to its source, and a text with any address or link in it gets no citations at all. Only an address a lookup returned in this turn can be cited; any other is dropped, and its number then points nowhere. Cite at most 8, write text before sources, and leave sources out when nothing was looked up. The REMINDER at the end of a web_search result about markdown links does not apply to say.`;
 
 /** The GitHub search, said with how to find the user's own pull requests. */
 const GITHUB_SEARCH = "mcp__github__issue_search finds pull requests and issues anywhere with GitHub search syntax (is:pr is:open author:@me is the user's open pull requests; add repo:owner/name or org:name to narrow; total_count is the number).";
