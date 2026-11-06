@@ -15,14 +15,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import pino from "pino";
 import { z } from "zod";
-import { GithubError, parseRepoRef, repoPath, type GithubClient } from "../github-review/github.js";
+import { GithubError, isValidOwner, parseRepoRef, repoPath, type GithubClient } from "../github-review/github.js";
 
 const logger = pino({ name: "github-mcp-tools" });
 
 /** The tools that only read. Everything else this server offers writes, and waits for the user. */
 export const READ_TOOLS = [
-  "repo_get_file", "pr_get", "pr_list", "pr_files", "pr_diff", "checks_list", "job_logs",
-  "issue_get", "issue_list", "review_threads_list", "code_search",
+  "repo_get_file", "repo_list", "pr_get", "pr_list", "pr_files", "pr_diff", "pr_reviews", "checks_list", "job_logs",
+  "issue_get", "issue_list", "issue_search", "review_threads_list", "code_search",
 ] as const;
 
 /**
@@ -83,6 +83,9 @@ function refOf(input: string): string {
 }
 
 const login = (u: unknown): string | undefined => (u && typeof u === "object" ? (u as { login?: string }).login : undefined);
+
+/** `owner/name` of a search hit, from its `repository_url` (`<api>/repos/owner/name`). */
+const repoOfUrl = (u: unknown): string | undefined => (typeof u === "string" ? /\/repos\/([^/]+\/[^/]+)$/.exec(u)?.[1] : undefined);
 
 function prSummary(p: Record<string, any>) {
   return {
@@ -159,6 +162,25 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
     return bytes.toString("utf8");
   }));
 
+  mcp.tool("repo_list", "List repositories, most recently pushed first: with no owner, the ones the user can reach (their own, ones they collaborate on and their organizations'); with owner, that user's or organization's.", {
+    owner: z.string().optional().describe("A user or organization login; leave out for the user's own"), per_page: PER_PAGE, page: PAGE,
+  }, (a) => answer("repo_list", async () => {
+    const q: Record<string, string | number> = { sort: "pushed", per_page: a.per_page ?? 20, page: a.page ?? 1 };
+    let list: any[] | null;
+    if (!a.owner) {
+      list = (await gh.get<any[]>("/user/repos", q)).json;
+    } else {
+      if (!isValidOwner(a.owner)) throw new BadInput("owner must be a user or organization login");
+      // An organization's list holds the private repositories the user may see; a user's login answers 404 there.
+      const org = await gh.get<any[]>(`/orgs/${encodeURIComponent(a.owner)}/repos`, q, [404]);
+      list = org.status === 404 ? (await gh.get<any[]>(`/users/${encodeURIComponent(a.owner)}/repos`, q)).json : org.json;
+    }
+    return (list ?? []).map((r) => ({
+      repo: r.full_name, private: r.private, archived: r.archived, fork: r.fork, default_branch: r.default_branch,
+      description: r.description, url: r.html_url, pushed_at: r.pushed_at, open_issues_and_prs: r.open_issues_count,
+    }));
+  }));
+
   mcp.tool("pr_get", "A pull request: title, state, author, branches, head sha, mergeability, size and description.", {
     repo: REPO, number: NUMBER,
   }, (a) => answer("pr_get", async () => prSummary((await gh.get<any>(repoPath(repoOf(a.repo), `/pulls/${a.number}`))).json)));
@@ -187,6 +209,13 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
 
   mcp.tool("pr_diff", "The whole unified diff of a pull request.", { repo: REPO, number: NUMBER }, (a) => answer("pr_diff", async () =>
     (await gh.getText(repoPath(repoOf(a.repo), `/pulls/${a.number}`), "application/vnd.github.diff")).text));
+
+  mcp.tool("pr_reviews", "The reviews of a pull request: who reviewed, their verdict (APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED), when, on which commit, and what they wrote.", {
+    repo: REPO, number: NUMBER,
+  }, (a) => answer("pr_reviews", async () => {
+    const reviews = (await gh.get<any[]>(repoPath(repoOf(a.repo), `/pulls/${a.number}/reviews`), { per_page: 100 })).json ?? [];
+    return reviews.map((r) => ({ id: r.id, author: login(r.user), state: r.state, submitted_at: r.submitted_at, commit: r.commit_id, body: r.body ?? "" }));
+  }));
 
   mcp.tool("checks_list", "The CI of a commit, branch or tag: every check run (its id is the job id job_logs takes) and every commit status.", {
     repo: REPO, ref: z.string().describe("A commit sha (a pull request's head_sha), branch or tag"),
@@ -242,6 +271,17 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
     const q: Record<string, string | number> = { state: a.state ?? "open", per_page: a.per_page ?? 20, page: a.page ?? 1 };
     if (a.labels) q.labels = a.labels;
     return ((await gh.get<any[]>(repoPath(repoOf(a.repo), "/issues"), q)).json ?? []).map(issueSummary);
+  }));
+
+  mcp.tool("issue_search", "Search pull requests and issues across GitHub, as the user, with GitHub's search syntax: `is:pr is:open author:@me` (the user's open pull requests), `is:pr is:open review-requested:@me`, `is:issue is:open assignee:@me`; narrow with `repo:owner/name` or `org:name`. Returns the total count and the matches, most recently updated first.", {
+    query: z.string().min(1).max(256).describe("GitHub search syntax; @me is the user"),
+    sort: z.enum(["updated", "created", "comments"]).optional().describe("Default updated"), per_page: PER_PAGE, page: PAGE,
+  }, (a) => answer("issue_search", async () => {
+    const res = (await gh.get<any>("/search/issues", { q: a.query, sort: a.sort ?? "updated", order: "desc", per_page: a.per_page ?? 20, page: a.page ?? 1 })).json;
+    return {
+      total_count: res?.total_count, incomplete_results: res?.incomplete_results,
+      items: (res?.items ?? []).map((i: any) => ({ repo: repoOfUrl(i.repository_url), ...issueSummary(i), ...(i.pull_request ? { draft: i.draft === true } : {}) })),
+    };
   }));
 
   mcp.tool("review_threads_list", "The review threads of a pull request: id (for review_thread_reply / review_thread_resolve), resolved or not, file, line and comments.", {

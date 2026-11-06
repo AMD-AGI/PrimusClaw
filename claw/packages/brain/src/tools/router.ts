@@ -6,6 +6,7 @@ import { isSandboxTool, toolTimeoutCeilingSec } from "./hands.js";
 import { handleA2ACall } from "../clients/a2a.js";
 import { LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON } from "../tasks/abort-registry.js";
 import { callBackendMcpTool } from "../clients/backend-mcp.js";
+import type { McpToolCaller } from "../clients/mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
@@ -256,7 +257,7 @@ export class ToolRouter {
 
   constructor(
     private hands: HandsClient | null,
-    private platformMcp: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }> = new Map(),
+    private platformMcp: Map<string, McpToolCaller> = new Map(),
     webServices?: WebToolServices,
     attachHands?: () => Promise<HandsClient>,
   ) {
@@ -381,11 +382,11 @@ export class ToolRouter {
   ): Promise<string> {
     if (name === "web_search") {
       if (!this.webServices.webSearch) return refuse(outcome, "Error: web search disabled");
-      return this.webServices.webSearch.execute(input);
+      return this.webServices.webSearch.execute(input, outcome);
     }
     if (name === "web_fetch") {
       if (!this.webServices.webFetch) return refuse(outcome, "Error: web fetch disabled");
-      return this.webServices.webFetch.execute(input);
+      return this.webServices.webFetch.execute(input, outcome);
     }
     throw new Error(`Unknown network tool: ${name}`);
   }
@@ -411,9 +412,31 @@ export class ToolRouter {
     if (this.toolAllowlist && !this.toolAllowlist.allows(name)) {
       return refuse(outcome, toolNotAllowedMessage(name));
     }
-    const tainted = this.readTaint?.refusal(name);
+    const taint = this.readTaint;
+    if (!taint) return this.routeAllowed(name, input, signal, outcome, ctx);
+    const tainted = taint.refusal(name);
     if (tainted) return refuse(outcome, tainted);
+    // Whether the call failed decides whether it read anything (`ReadTaint.ran`), so the bit is read here even when the caller
+    // passed no outcome. A call that threw failed.
+    const answered: RouteOutcome = outcome ?? { isError: false };
+    let failed = true;
+    try {
+      const text = await this.routeAllowed(name, input, signal, answered, ctx);
+      failed = answered.isError;
+      return text;
+    } finally {
+      taint.ran(name, failed);
+    }
+  }
 
+  /** `route()` for a call the allow-list and the read taint let through. */
+  private async routeAllowed(
+    name: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+    outcome?: RouteOutcome,
+    ctx?: { stepIdentity?: string },
+  ): Promise<string> {
     if (LOOP_INTERCEPTED_TOOLS.has(name)) {
       throw new Error(`${name} must be handled by engine loop, not router`);
     }
@@ -583,7 +606,7 @@ export class ToolRouter {
       const [, server, ...rest] = name.split("__");
       const client = this.platformMcp.get(server);
       if (!client) throw new Error(`Unknown MCP server: ${server}`);
-      return client.callTool(rest.join("__"), input);
+      return client.callTool(rest.join("__"), input, outcome);
     }
 
     throw new Error(`Unknown tool: ${name}`);

@@ -29,7 +29,7 @@ import {
 } from "../../config.js";
 import { isPreapprovedHost } from "./preapproved.js";
 import { summarizeContent, MAX_MARKDOWN_LENGTH } from "./summarize.js";
-import type { WebToolContext } from "./types.js";
+import type { WebToolContext, WebToolOutcome } from "./types.js";
 
 const logger = pino({ name: "web-fetch" });
 
@@ -300,7 +300,8 @@ export async function fetchWithRedirects(
 
         let next: URL;
         try { next = new URL(location, current.toString()); }
-        catch { throw new Error(`Invalid redirect URL: ${location}`); }
+        // Not the header's text: what a server sends never reaches a failure's message (`WebToolOutcome`).
+        catch { throw new Error("Invalid redirect URL in the Location header"); }
 
         if (next.protocol !== "https:" && next.protocol !== "http:") {
           throw new Error(`Redirect to unsupported protocol: ${next.protocol}`);
@@ -351,7 +352,16 @@ export async function fetchWithRedirects(
 export class WebFetchService {
   constructor(private ctx: WebToolContext) {}
 
-  async execute(input: Record<string, unknown>): Promise<string> {
+  /**
+   * A failure before any page was read (the address refused, the name unresolved, the request failed) is marked in `outcome`: its
+   * text is this service's own and the remote server's status at most. What a page sent is never marked, a redirect or a content
+   * type it named included, since a failed call counts as having read nothing (`WebToolOutcome`).
+   */
+  async execute(input: Record<string, unknown>, outcome?: WebToolOutcome): Promise<string> {
+    const fail = (text: string): string => {
+      if (outcome) outcome.isError = true;
+      return text;
+    };
     const url = input.url as string;
     const prompt = (input.prompt as string) ?? "";
     const maxBytes = Math.min(
@@ -363,11 +373,11 @@ export class WebFetchService {
     let parsed: URL;
     try { parsed = validateUrl(url); }
     catch (err: unknown) {
-      return `Error: ${err instanceof Error ? err.message : String(err)}`;
+      return fail(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     if (isDomainBlocked(parsed.hostname)) {
-      return `Error: domain ${parsed.hostname} is blocked by WEB_FETCH_DOMAIN_DENYLIST`;
+      return fail(`Error: domain ${parsed.hostname} is blocked by WEB_FETCH_DOMAIN_DENYLIST`);
     }
 
     const ck = cacheKey(parsed.toString(), raw ? "raw" : "", raw);
@@ -381,13 +391,13 @@ export class WebFetchService {
       result = await fetchWithRedirects(parsed, maxBytes, this.ctx.signal);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("SSRF")) return `Error: ${msg}`;
-      if (msg.includes("ENOTFOUND")) return `Error: DNS resolution failed for ${parsed.hostname}`;
+      if (msg.includes("SSRF")) return fail(`Error: ${msg}`);
+      if (msg.includes("ENOTFOUND")) return fail(`Error: DNS resolution failed for ${parsed.hostname}`);
       if (msg.includes("EGRESS_BLOCKED") || (err as any)?.response?.headers?.["x-proxy-error"] === "blocked-by-allowlist") {
-        return `Error: EGRESS_BLOCKED — the URL is blocked by the egress proxy allowlist`;
+        return fail(`Error: EGRESS_BLOCKED — the URL is blocked by the egress proxy allowlist`);
       }
       logger.warn({ url, err: msg }, "web_fetch_failed");
-      return `Error: fetch failed — ${msg}`;
+      return fail(`Error: fetch failed — ${msg}`);
     }
 
     if (result.redirectInfo) return result.redirectInfo;

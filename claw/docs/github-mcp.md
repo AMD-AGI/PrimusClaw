@@ -11,7 +11,7 @@ server, hosted by the API. Off by default; nothing is registered or offered whil
 
 | Reads (run without asking) | Writes (each waits for the user's decision) |
 |---|---|
-| `repo_get_file`, `pr_get`, `pr_list`, `pr_files`, `pr_diff`, `checks_list`, `job_logs`, `issue_get`, `issue_list`, `review_threads_list`, `code_search` | `issue_comment`, `issue_create`, `pr_create`, `pr_update`, `review_thread_reply`, `review_thread_resolve` |
+| `repo_get_file`, `repo_list`, `pr_get`, `pr_list`, `pr_files`, `pr_diff`, `pr_reviews`, `checks_list`, `job_logs`, `issue_get`, `issue_list`, `issue_search`, `review_threads_list`, `code_search` | `issue_comment`, `issue_create`, `pr_create`, `pr_update`, `review_thread_reply`, `review_thread_resolve` |
 
 Merging is not a tool here: it belongs to GitHub review (`github-review.md`), which has the gates for it.
 
@@ -25,6 +25,9 @@ Merging is not a tool here: it belongs to GitHub review (`github-review.md`), wh
   (still there, the same owner, not acting as another user) and reads the owner's `GH_TOKEN` from the vault for
   that request. Whose token is used comes from the session, never from a tool argument.
 - A session that acts as another user (`config.acting_as`) is not offered these tools.
+- An assistant's router turn gets the same entry, cut by its `tools_allowlist` to the reads a question needs
+  (`assistant/read-tools.ts`: no write, no whole diff, no job log), and under its `read_taint`: once a read has answered,
+  the turn can only speak, so what a pull request says cannot start or change work for the user.
 - The same writes made from the shell (`gh pr create`, `gh api -X POST`, ...) are held by the built-in bash
   rules (`bash-approval.md`).
 

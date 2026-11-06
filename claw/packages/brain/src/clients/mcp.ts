@@ -98,8 +98,14 @@ function resourceToolSchemas(server: string): Array<{ name: string; description:
   ];
 }
 
+/** Filled by a call with what the server answered beside its text: whether the result was the tool's own error. */
+export type McpCallOutcome = { isError: boolean };
+
+/** A connected server's tools, as a run calls them. */
+export type McpToolCaller = { callTool: (name: string, args: Record<string, unknown>, outcome?: McpCallOutcome) => Promise<string> };
+
 interface McpClientWrapper {
-  callTool: (name: string, args: Record<string, unknown>) => Promise<string>;
+  callTool: (name: string, args: Record<string, unknown>, outcome?: McpCallOutcome) => Promise<string>;
   listTools: () => Promise<ToolSchema[]>;
   close: () => Promise<void>;
 }
@@ -203,7 +209,7 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
   const resourceTools = new Set<string>();
 
   return {
-    async callTool(toolName: string, args: Record<string, unknown>): Promise<string> {
+    async callTool(toolName: string, args: Record<string, unknown>, outcome?: McpCallOutcome): Promise<string> {
       if (resourceTools.has(toolName)) {
         if (toolName === LIST_RESOURCES) {
           const cursor = typeof args.cursor === "string" && args.cursor ? args.cursor : undefined;
@@ -218,6 +224,8 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
         return read.contents.map((c) => renderResourceContents(c as McpContentBlock)).join("\n");
       }
       const result = await client.callTool({ name: toolName, arguments: args });
+      // The tool's own error bit (`isError`), which its text alone cannot carry: what it answered is a failure, not data it read.
+      if (outcome && result.isError === true) outcome.isError = true;
       return renderMcpContent(result.content, result.structuredContent);
     },
     async listTools(): Promise<ToolSchema[]> {
@@ -313,13 +321,13 @@ export function mcpUnavailableNote(failed: readonly McpConnectFailure[]): string
 export async function connectPlatformMcp(
   servers: Record<string, Record<string, unknown>>,
 ): Promise<{
-  clients: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }>;
+  clients: Map<string, McpToolCaller>;
   schemas: ToolSchema[];
   /** Servers that could not be connected or listed, with why; their tools are not offered. */
   failed: McpConnectFailure[];
   closeAll: () => Promise<void>;
 }> {
-  const clients = new Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }>();
+  const clients = new Map<string, McpToolCaller>();
   const schemas: ToolSchema[] = [];
   const wrappers: McpClientWrapper[] = [];
   const failed: McpConnectFailure[] = [];
@@ -347,8 +355,8 @@ export async function connectPlatformMcp(
       }
       clients.set(name, filter
         ? {
-            callTool: (toolName, args) => filter.allows(toolName)
-              ? wrapper.callTool(toolName, args)
+            callTool: (toolName, args, outcome) => filter.allows(toolName)
+              ? wrapper.callTool(toolName, args, outcome)
               : Promise.reject(new Error(`Tool ${toolName} is not enabled on MCP server ${name}`)),
           }
         : wrapper);

@@ -75,11 +75,17 @@ export function parseToolAllowlist(raw: unknown): ToolAllowlist | null {
 
 /**
  * `ExecuteRequest.read_taint`, read once per run: null when absent or unreadable as a rule with sources. Each call of a run asks
- * `refusal(name)` before it runs: null lets it through, a text refuses it. A call matching `sources` marks the run (before it runs,
- * so a call made in the same step as the read, decided before its result was seen, is the only one that can pass).
+ * `refusal(name)` before it runs: null lets it through, a text refuses it. Every call it let through reports `ran(name, failed)` once
+ * it has returned, before its result reaches the model.
+ *
+ * A call matching `sources` that answered marks the run: from then on only `allow_after` runs. While a source is still running
+ * the run counts as marked, so the only call that can pass beside a read is one decided before it. A source that failed (the
+ * tool's own error bit, or a call that threw) read nothing anyone wrote, so it marks nothing: the turn can still start the work the
+ * lookup could not do.
  */
 export interface ReadTaint {
   refusal(toolName: string): string | null;
+  ran(toolName: string, failed: boolean): void;
 }
 
 export function parseReadTaint(raw: unknown): ReadTaint | null {
@@ -88,12 +94,22 @@ export function parseReadTaint(raw: unknown): ReadTaint | null {
   const sources = Array.isArray(r.sources) && r.sources.length ? parseToolAllowlist(r.sources) : null;
   if (!sources || !sources.patterns.length) return null;
   const allowAfter = Array.isArray(r.allow_after) && r.allow_after.length ? parseToolAllowlist(r.allow_after) : null;
+  /** The first source that answered. */
   let readBy: string | null = null;
+  /** Sources let through that have not reported yet. */
+  const running: string[] = [];
   return {
     refusal(name) {
-      if (sources.allows(name)) { readBy ??= name; return null; }
-      if (readBy === null || allowAfter?.allows(name)) return null;
-      return `Error: '${name}' was not run. This turn has read text other people wrote (with ${readBy}), so it can no longer act for the user. Tell the user what you would do and ask them to confirm it in a new message.`;
+      if (sources.allows(name)) { running.push(name); return null; }
+      const by = readBy ?? running[0] ?? null;
+      if (by === null || allowAfter?.allows(name)) return null;
+      return `Error: '${name}' was not run. This turn has read text other people wrote (with ${by}), so it can no longer act for the user. Tell the user what you would do and ask them to confirm it in a new message.`;
+    },
+    ran(name, failed) {
+      if (!sources.allows(name)) return;
+      const i = running.indexOf(name);
+      if (i >= 0) running.splice(i, 1);
+      if (!failed) readBy ??= name;
     },
   };
 }

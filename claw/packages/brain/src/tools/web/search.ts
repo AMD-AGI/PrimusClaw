@@ -22,7 +22,7 @@ import {
   BRAVE_API_KEY,
   SERPER_API_KEY,
 } from "../../config.js";
-import type { WebToolContext, WebSearchProvider, SearchHit } from "./types.js";
+import type { WebToolContext, WebToolOutcome, WebSearchProvider, SearchHit } from "./types.js";
 
 const logger = pino({ name: "web-search" });
 
@@ -73,16 +73,17 @@ function domainMatchesAny(domain: string, denylist: string[]): boolean {
 async function executeAnthropicSearch(
   input: WebSearchInput,
   ctx: WebToolContext,
+  fail: (text: string) => string,
 ): Promise<string> {
   const query = (input.query ?? "").trim();
-  if (query.length < 2) return "Error: query must be at least 2 characters.";
+  if (query.length < 2) return fail("Error: query must be at least 2 characters.");
 
   const globalDenylist = parseDenylist(WEB_SEARCH_DOMAIN_DENYLIST);
   const rawAllowed = input.allowed_domains ?? (input.site ? [input.site] : undefined);
   const allowedDomains = rawAllowed?.filter((d) => !domainMatchesAny(d, globalDenylist));
 
   if (rawAllowed && allowedDomains && allowedDomains.length !== rawAllowed.length) {
-    return "Error: allowed_domains contains a domain blocked by WEB_SEARCH_DOMAIN_DENYLIST";
+    return fail("Error: allowed_domains contains a domain blocked by WEB_SEARCH_DOMAIN_DENYLIST");
   }
 
   const blockedDomains = allowedDomains?.length
@@ -90,7 +91,7 @@ async function executeAnthropicSearch(
     : [...(input.blocked_domains ?? []), ...globalDenylist].filter(Boolean);
 
   if (allowedDomains?.length && blockedDomains?.length) {
-    return "Error: allowed_domains and blocked_domains cannot both be non-empty.";
+    return fail("Error: allowed_domains and blocked_domains cannot both be non-empty.");
   }
 
   const model = WEB_SEARCH_MODEL || ctx.model;
@@ -359,15 +360,23 @@ export class WebSearchService {
     }
   }
 
-  async execute(input: Record<string, unknown>): Promise<string> {
+  /**
+   * Every failure here is said in this service's own words, or a backend's error (never a page's text), so each one is marked in
+   * `outcome`. A search that answered is not, whatever it found.
+   */
+  async execute(input: Record<string, unknown>, outcome?: WebToolOutcome): Promise<string> {
     const searchInput = input as unknown as WebSearchInput;
+    const fail = (text: string): string => {
+      if (outcome) outcome.isError = true;
+      return text;
+    };
 
     if (!searchInput.query || searchInput.query.trim().length < 2) {
-      return "Error: query must be at least 2 characters.";
+      return fail("Error: query must be at least 2 characters.");
     }
 
     if (searchInput.allowed_domains?.length && searchInput.blocked_domains?.length) {
-      return "Error: allowed_domains and blocked_domains cannot both be non-empty.";
+      return fail("Error: allowed_domains and blocked_domains cannot both be non-empty.");
     }
 
     if (searchInput.site && !searchInput.allowed_domains?.length) {
@@ -379,7 +388,7 @@ export class WebSearchService {
     }
 
     if (!this.rateLimiter.tryConsume()) {
-      return "Error: web search rate limit exceeded (30 req/min). Please wait before searching again.";
+      return fail("Error: web search rate limit exceeded (30 req/min). Please wait before searching again.");
     }
 
     // The last backend's failure, so a search that fails everywhere says why.
@@ -388,7 +397,7 @@ export class WebSearchService {
     // Anthropic native path (Claude engine only)
     if (WEB_SEARCH_PROVIDER === "anthropic") {
       try {
-        return await executeAnthropicSearch(searchInput, this.ctx);
+        return await executeAnthropicSearch(searchInput, this.ctx, fail);
       } catch (err: unknown) {
         lastError = `anthropic: ${err instanceof Error ? err.message : String(err)}`;
         logger.warn({ err: lastError }, "anthropic_search_failed, trying fallbacks");
@@ -424,10 +433,10 @@ export class WebSearchService {
     }
 
     if (WEB_SEARCH_PROVIDER === "disabled") {
-      return "Error: web search disabled";
+      return fail("Error: web search disabled");
     }
 
-    if (lastError) return `Error: web search failed (${lastError.slice(0, 500)})`;
-    return "Error: no web search provider available";
+    if (lastError) return fail(`Error: web search failed (${lastError.slice(0, 500)})`);
+    return fail("Error: no web search provider available");
   }
 }

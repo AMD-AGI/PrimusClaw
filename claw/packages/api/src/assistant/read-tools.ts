@@ -11,8 +11,13 @@
  * (`CLAW_ASSISTANT_PLUGIN_ID`), never from a plugin a message names: a name says nothing about where a server is, so the list
  * holds only for servers the operator chose. Of that plugin only its `mcp` rows, and of them only the servers listed here, so a
  * router turn neither connects to a server it may not call nor is shown the plugin's skills and rules.
+ *
+ * Besides the plugin's: the reads of the API's own GitHub server (`github-mcp/`), as the user, for a user who keeps a GitHub
+ * token, the same entry a worker's turn is given; and Brain's web search and fetch, where the deployment's Brain has them.
  */
+import { GITHUB_MCP_SERVER } from "@claw/protocol";
 import { CLAW_ASSISTANT_PLUGIN_ID } from "../config.js";
+import { githubMcpServers } from "../github-mcp/mcp.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
 
 /**
@@ -50,6 +55,47 @@ export function readToolPatterns(server: string): string[] {
  * until it is listed here.
  */
 export const AFTER_READ_TOOLS = ["say", "work_recall", "memory_recall"] as const;
+
+/**
+ * The GitHub reads a router turn may call (`github-mcp/tools.ts`): finding and reading pull requests, issues, their checks and
+ * reviews, repositories and files. Every one is in that server's READ_TOOLS, which it runs without asking; no write is, and neither
+ * a whole diff nor a job's log, which are a worker's to read.
+ */
+export const ROUTER_GITHUB_READ_TOOLS = [
+  "issue_search", "pr_list", "pr_get", "pr_files", "pr_reviews", "review_threads_list", "checks_list",
+  "issue_list", "issue_get", "repo_list", "repo_get_file", "code_search",
+] as const;
+
+/**
+ * Brain's own web tools: a search and a fetch of one public page (Brain refuses private and internal addresses). Brain offers them
+ * only where its deployment switched them on (`WEB_SEARCH_PROVIDER`, `WEB_FETCH_ENABLED`); listed here, they are the router's too.
+ */
+export const ROUTER_WEB_TOOLS = ["web_search", "web_fetch"] as const;
+
+type McpServers = Record<string, Record<string, unknown>>;
+
+/** Everything a router turn may look up, and what that takes on its request. */
+export interface RouterLookups {
+  /** The assistant plugin's read tools, or null. */
+  plugin: RouterReadTools | null;
+  /** The turn's `github` server, as a worker's turn gets it; empty for a user who keeps no GitHub token. */
+  githubServers: McpServers;
+  /** The reads of that server the turn may call: `ROUTER_GITHUB_READ_TOOLS`, or none without the server. */
+  githubTools: readonly string[];
+  /** Every lookup tool as `tools_allowlist` entries: the turn's `read_taint` sources as well. */
+  allowlist: string[];
+}
+
+/** A router turn's lookups: the plugin's read tools, the user's GitHub, and the web. */
+export async function routerLookups(userId: string, sessionId: string): Promise<RouterLookups> {
+  const plugin = await routerReadTools(userId);
+  const githubServers = await githubMcpServers(sessionId);
+  const githubTools = Object.hasOwn(githubServers, GITHUB_MCP_SERVER) ? ROUTER_GITHUB_READ_TOOLS : [];
+  return {
+    plugin, githubServers, githubTools,
+    allowlist: [...(plugin?.allowlist ?? []), ...githubTools.map((t) => `mcp__${GITHUB_MCP_SERVER}__${t}`), ...ROUTER_WEB_TOOLS],
+  };
+}
 
 export interface RouterReadTools {
   pluginId: number;

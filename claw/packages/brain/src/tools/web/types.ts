@@ -58,6 +58,14 @@ export interface SearchHit {
   snippet?: string;
 }
 
+/**
+ * Filled by a web tool with whether it failed: the router's `RouteOutcome`. Set only for a failure whose text is the tool's own,
+ * never for one that carries what a remote server sent, since a failed call counts as having read nothing (`ReadTaint`).
+ */
+export interface WebToolOutcome {
+  isError: boolean;
+}
+
 /** Provider interface — each backend implements this. */
 export interface WebSearchProvider {
   readonly name: string;

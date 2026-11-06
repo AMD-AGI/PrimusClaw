@@ -7,7 +7,8 @@
  * stand-in for GitHub as a `fetch`.
  *
  *   A  who may call: the token (and what it was minted for), the session row, its owner, the owner's GitHub token
- *   B  what a call does: which token goes where, refusals before any request, errors as errors, nothing secret
+ *   B  what a call does: which token goes where, refusals before any request, errors as errors, nothing secret; the
+ *      searches and lists a question needs (the user's open pull requests, their repositories, a pull request's reviews)
  *   C  the entry a turn is given: only for an owner who keeps a token, never for a session acting as someone else,
  *      and a policy Brain reads as "every write waits, the reads run"
  */
@@ -233,6 +234,72 @@ describe("B what a call does", () => {
     const r = await call(await connect(token()), "pr_update", { repo: "o/r", number: 7, title: "new", state: "closed" });
     assert.equal(r.isError, false);
     assert.deepEqual([seen[0].method, seen[0].url, seen[0].body], ["PATCH", `${API}/repos/o/r/pulls/7`, { title: "new", state: "closed" }]);
+  });
+});
+
+describe("B the reads a question needs", () => {
+  test("B6 issue_search asks GitHub's search as the user and answers with the count and each match's repository", async () => {
+    respond = (url) => url.pathname === "/search/issues"
+      ? json({
+          total_count: 3, incomplete_results: false,
+          items: [
+            { number: 300, title: "router reads", state: "open", user: { login: "alice" }, html_url: "https://github.com/AMD-AGI/PrimusClaw/pull/300", repository_url: `${API}/repos/AMD-AGI/PrimusClaw`, pull_request: {}, draft: false, comments: 2, labels: [{ name: "enhancement" }] },
+            { number: 12, title: "fix", state: "open", user: { login: "alice" }, html_url: "https://github.com/o/r/pull/12", repository_url: `${API}/repos/o/r`, pull_request: {}, draft: true, comments: 0, labels: [] },
+            { number: 5, title: "an issue", state: "open", user: { login: "alice" }, html_url: "https://github.com/o/r/issues/5", repository_url: `${API}/repos/o/r`, comments: 0, labels: [] },
+          ],
+        })
+      : json({}, 404);
+    const r = await call(await connect(token()), "issue_search", { query: "is:pr is:open author:@me" });
+    assert.equal(r.isError, false, r.text);
+    assert.equal(seen.length, 1);
+    const url = new URL(seen[0].url);
+    assert.deepEqual([url.origin + url.pathname, seen[0].authorization], [`${API}/search/issues`, `Bearer ${GH_TOKEN}`]);
+    assert.deepEqual(Object.fromEntries(url.searchParams), { q: "is:pr is:open author:@me", sort: "updated", order: "desc", per_page: "20", page: "1" });
+    const found = JSON.parse(r.text);
+    assert.equal(found.total_count, 3);
+    assert.deepEqual(found.items.map((i: any) => [i.repo, i.number, i.is_pull_request, i.draft]), [
+      ["AMD-AGI/PrimusClaw", 300, true, false], ["o/r", 12, true, true], ["o/r", 5, false, undefined],
+    ]);
+  });
+
+  test("B7 repo_list: the user's own repositories, an organization's, or a user's when the login is not an organization", async () => {
+    const repo = (full: string) => ({ full_name: full, private: true, archived: false, fork: false, default_branch: "main", html_url: `https://github.com/${full}`, pushed_at: "2026-11-06T00:00:00Z", open_issues_count: 4 });
+    respond = (url) => {
+      if (url.pathname === "/user/repos") return json([repo("alice/mine")]);
+      if (url.pathname === "/orgs/AMD-AGI/repos") return json([repo("AMD-AGI/PrimusClaw")]);
+      if (url.pathname === "/users/bob/repos") return json([repo("bob/theirs")]);
+      return json({ message: "Not Found" }, 404);
+    };
+    const c = await connect(token());
+    const names = async (args: Record<string, unknown>) => {
+      const r = await call(c, "repo_list", args);
+      assert.equal(r.isError, false, r.text);
+      return JSON.parse(r.text).map((x: any) => x.repo);
+    };
+    assert.deepEqual(await names({}), ["alice/mine"]);
+    assert.deepEqual(await names({ owner: "AMD-AGI" }), ["AMD-AGI/PrimusClaw"]);
+    assert.deepEqual(await names({ owner: "bob" }), ["bob/theirs"]);
+    assert.deepEqual(seen.map((x) => new URL(x.url).pathname), ["/user/repos", "/orgs/AMD-AGI/repos", "/orgs/bob/repos", "/users/bob/repos"]);
+    assert.ok(seen.every((x) => x.authorization === `Bearer ${GH_TOKEN}` && new URL(x.url).searchParams.get("sort") === "pushed"));
+    seen = [];
+    const bad = await call(c, "repo_list", { owner: "../user" });
+    assert.equal(bad.isError, true);
+    assert.equal(seen.length, 0, "a login that could aim the call elsewhere is refused before any request");
+  });
+
+  test("B8 pr_reviews: each review's author, verdict, time, commit and text", async () => {
+    respond = (url) => url.pathname === "/repos/o/r/pulls/7/reviews"
+      ? json([
+          { id: 1, user: { login: "carol" }, state: "CHANGES_REQUESTED", submitted_at: "2026-11-05T01:00:00Z", commit_id: "abc", body: "fix the test" },
+          { id: 2, user: { login: "dave" }, state: "APPROVED", submitted_at: "2026-11-05T02:00:00Z", commit_id: "def", body: null },
+        ])
+      : json({}, 404);
+    const r = await call(await connect(token()), "pr_reviews", { repo: "o/r", number: 7 });
+    assert.equal(r.isError, false, r.text);
+    assert.deepEqual(JSON.parse(r.text).map((x: any) => [x.author, x.state, x.commit, x.body]), [
+      ["carol", "CHANGES_REQUESTED", "abc", "fix the test"], ["dave", "APPROVED", "def", ""],
+    ]);
+    assert.equal(seen[0].authorization, `Bearer ${GH_TOKEN}`);
   });
 });
 

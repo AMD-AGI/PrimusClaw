@@ -125,9 +125,10 @@ describe("assistant router read tools", { skip }, () => {
     assert.equal(task.skills, undefined);
     assert.equal(task.tool_ids, undefined);
     // Told to answer itself: what the read tools are for, and that a question is not a work item.
-    assert.match(task.system_append, /Read-only lookups\nBesides the assistant tools you have read-only tools of these servers: safe, autopilot, dispatron\./);
-    assert.match(task.system_append, /call them yourself and say the answer, with the numbers\. Do not start a work item for it\./);
-    assert.match(task.system_append, /work_create is only for work that produces or changes something/);
+    assert.match(task.system_append, /\nRead-only lookups\nBesides the assistant tools you have tools that only read/);
+    assert.match(task.system_append, /- The read tools of these servers: safe, autopilot, dispatron, called by their full name/);
+    assert.match(task.system_append, /call them now, in this turn, and say the answer with the numbers[^\n]*Do not start a work item for it, and do not ask whether you should look\./);
+    assert.match(task.system_append, /work_create is for work that produces or changes something/);
     for (const text of [task.system_append, task.prompt]) {
       assert.ok(!text.includes("SKILL.md") && !text.includes("Platform Skills"), "no skill is named to the router");
     }
@@ -171,10 +172,10 @@ describe("assistant router read tools", { skip }, () => {
     await w.q("UPDATE plugins SET is_public = false, owner_user_id = 'bob' WHERE id = $1", [PLUGIN]);
     try {
       const hidden = await send(alice.routerSid, QUESTION);
-      assert.deepEqual(hidden.tools_allowlist, ["mcp__assistant__*"]);
+      assert.deepEqual(hidden.tools_allowlist, ["mcp__assistant__*", "web_search", "web_fetch"], "the web only");
       assert.equal(hidden.plugin_id, undefined);
       assert.equal(hidden.plugin_tools, undefined);
-      assert.doesNotMatch(hidden.system_append, /Read-only lookups/);
+      assert.doesNotMatch(hidden.system_append, /The read tools of these servers/);
     } finally { await w.q("UPDATE plugins SET is_public = true, owner_user_id = NULL WHERE id = $1", [PLUGIN]); }
     // A server named after an Object property is not in the list.
     const { readToolsOfPlugin } = await import("../src/assistant/read-tools.js");
