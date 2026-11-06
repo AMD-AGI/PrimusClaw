@@ -120,10 +120,15 @@ export function deliveryText(item: { seq: number; title: string }, file: { name:
     : `#${item.seq} ${item.title} delivered a file: ${codeName(file.name)} (${sizeText(file.size)})`;
 }
 
-/** The file as a channel gets it: what the download route needs, and a small image itself. */
+/**
+ * The file as a channel gets it: what the download route needs, and a small image itself. Its name goes through the same redaction
+ * as the message's text (a worker chose it, from what it read); the download route finds the file by its id, not by this name.
+ */
 async function assistantFile(itemId: string, ownerId: string, sessionId: string, d: StoredDelivery): Promise<AssistantFile> {
   const contentType = deliveryContentType(d.name);
-  const file: AssistantFile = { item_id: itemId, session_id: sessionId, id: d.id, name: d.name, size: d.size, content_type: contentType };
+  const file: AssistantFile = {
+    item_id: itemId, session_id: sessionId, id: d.id, name: String(redactPublicJson(d.name) ?? ""), size: d.size, content_type: contentType,
+  };
   if (DELIVERY_INLINE_TYPES.includes(contentType) && d.size > 0 && d.size <= DELIVERY_INLINE_MAX_BYTES) {
     try {
       const bytes = await deliveryPorts.read(`${sessionWorkspacePrefix(ownerId, sessionId)}${DELIVERY_DIR}/${d.id}/${d.name}`);

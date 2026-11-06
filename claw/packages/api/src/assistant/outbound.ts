@@ -511,24 +511,8 @@ function needsYouText(item: ItemRow): string {
  */
 export async function recordNeedsYouFallback(input: { itemId: string }, deps: SayDeps = {}): Promise<SayOutcome | null> {
   const stored = await storeSettled(async (q, storeOne) => {
-    const item = await loadItem(q, input.itemId);
-    const answered = item?.board_state === "done" && item.outcome === "answered";
-    if (!item || (item.board_state !== "needs_you" && !answered)) return null;
-    // An answer is said whole, from the report (the item's own summary is cut to a line).
-    const answer = answered
-      ? ((await q(
-          "SELECT summary FROM claw_work_item_events WHERE item_id = $1 AND kind = 'answer' ORDER BY id DESC LIMIT 1", [item.item_id],
-        )).rows[0]?.summary as string | undefined) ?? ""
-      : "";
-    const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id ?? null;
-    return storeOne({
-      type: "work_item.needs_you",
-      sayId: deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq)),
-      userId: item.user_id,
-      sessionId,
-      text: answered ? `#${item.seq} "${item.title}": ${answer}` : needsYouText(item),
-      item,
-    });
+    const m = await needsYouMessage(q, input.itemId);
+    return m ? storeOne(m) : null;
   }, (late) => announce(late, deps));
   if (!stored) return null;
   await announce(stored, deps);
@@ -552,6 +536,43 @@ export async function turnHandedOffReview(q: Querier, userId: string, messageId:
     "SELECT 1 FROM claw_assistant_review_handoffs WHERE user_id = $1 AND message_id = $2 LIMIT 1",
     [userId, messageId],
   )).rows.length > 0;
+}
+
+/** The system's message for an item that needs the user or was answered (`recordNeedsYouFallback`), or null when it is neither. */
+async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToStore, { type: "work_item.needs_you" }> | null> {
+  const item = await loadItem(q, itemId);
+  const answered = item?.board_state === "done" && item.outcome === "answered";
+  if (!item || (item.board_state !== "needs_you" && !answered)) return null;
+  // An answer is said whole, from the report (the item's own summary is cut to a line).
+  const answer = answered
+    ? ((await q(
+        "SELECT summary FROM claw_work_item_events WHERE item_id = $1 AND kind = 'answer' ORDER BY id DESC LIMIT 1", [item.item_id],
+      )).rows[0]?.summary as string | undefined) ?? ""
+    : "";
+  const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id ?? null;
+  return {
+    type: "work_item.needs_you",
+    sayId: deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq)),
+    userId: item.user_id,
+    sessionId,
+    text: answered ? `#${item.seq} "${item.title}": ${answer}` : needsYouText(item),
+    item,
+  };
+}
+
+/**
+ * The answer that just closed an item, whole, in the system's words, stored in the transaction of the report that closed it
+ * (`reports.ts`): the router is told it was sent in full only when it is stored for sending, never before. The same message,
+ * under the same id, as the silent sweep's (`recordNeedsYouFallback`), so it is said once. Null when the item is not answered
+ * or the message was stored before. `announce` after the commit.
+ */
+export async function storeAnswerWhole(
+  q: Querier, itemId: string, deps: SayDeps = {},
+): Promise<{ sayId: string; announce: () => Promise<void> } | null> {
+  const m = await needsYouMessage(q, itemId);
+  if (!m || m.item.board_state !== "done") return null;
+  const stored = await store(q, m);
+  return stored ? { sayId: stored.sayId, announce: () => announce(stored, deps) } : null;
 }
 
 /**

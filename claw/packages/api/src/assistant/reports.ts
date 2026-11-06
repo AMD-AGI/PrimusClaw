@@ -18,7 +18,7 @@ import { inTransaction, type Querier, type StatementRunner } from "../infra/db.j
 import { metrics } from "../infra/metrics.js";
 import { announceItemDeliveries } from "./deliveries.js";
 import { queueServerMessage, drainSessionIfIdle } from "./messages.js";
-import { recordNeedsYouFallback } from "./outbound.js";
+import { storeAnswerWhole } from "./outbound.js";
 import { formatWorkEvent, SAY_BRIEF_CHARS } from "./prompts.js";
 import {
   applyWorkerReport, type BoardState, type ReportKind, type ReportSource, type WorkReport,
@@ -71,8 +71,9 @@ async function repeatsLastReport(query: Querier, run: ReportRun, report: WorkRep
  * an item that needs them even if the Router cannot be woken.
  */
 /**
- * An answer longer than a usual message is said to the user whole by the system (`sayAnswerWhole`), formatted as the worker
- * wrote it, instead of being retyped by the router into one; the router is told it was sent. A short one is the router's to say.
+ * An answer longer than a usual message is said to the user whole by the system (`storeAnswerWhole`, in the report's own
+ * transaction), formatted as the worker wrote it, instead of being retyped by the router into one; the router is told it was
+ * sent. A short one is the router's to say.
  */
 export function answerSentWhole(kind: ReportKind, summary: string): boolean {
   return kind === "answer" && summary.length > SAY_BRIEF_CHARS;
@@ -80,6 +81,8 @@ export function answerSentWhole(kind: ReportKind, summary: string): boolean {
 
 export async function queueRouterWake(q: StatementRunner, e: {
   itemId: string; userId: string; eventId: number; kind: ReportKind; version: number; summary: string; question: string | null;
+  /** The answer is stored for sending whole in this same transaction (`storeAnswerWhole`): the router is told so. */
+  sentInFull?: boolean;
 }): Promise<{ sessionId: string; userId: string } | null> {
   const target = (await q.query(
     `SELECT w.seq, a.session_id AS router_session_id
@@ -93,7 +96,7 @@ export async function queueRouterWake(q: StatementRunner, e: {
     userId: e.userId,
     content: formatWorkEvent({
       itemId: e.itemId, seq: Number(target.seq), kind: e.kind, version: e.version, summary: e.summary, question: e.question,
-      sentInFull: answerSentWhole(e.kind, e.summary),
+      sentInFull: e.sentInFull === true,
     }),
     dedupeKey: `wi-evt:${e.eventId}`,
   });
@@ -111,7 +114,10 @@ export async function ingestReport(
   const recorded: WorkReport = report.kind === "ready"
     ? { ...report, result: { ...(report.result as Record<string, unknown> | undefined), run_id: run.runId } }
     : report;
-  interface Written { outcome: IngestOutcome; wake: { sessionId: string; userId: string } | null; eventId?: number }
+  interface Written {
+    outcome: IngestOutcome; wake: { sessionId: string; userId: string } | null; eventId?: number;
+    answer?: { announce: () => Promise<void> } | null;
+  }
   let written: Written;
   try {
     written = await inTransaction(async (query): Promise<Written> => {
@@ -123,13 +129,18 @@ export async function ingestReport(
         source, runId: run.runId, report: recorded,
       });
       if (!applied.applied) return { outcome: { status: "stale" }, wake: null };
+      // Stored for sending with the report itself, so the router below is told "sent in full" only of an answer that will be:
+      // a failure to store it fails the report, which the worker sends again, rather than leaving an answer nobody says.
+      const answer = answerSentWhole(recorded.kind, recorded.summary) ? await storeAnswerWhole(query, run.itemId) : null;
       const wake = applied.wake
         ? await queueRouterWake(q, {
           itemId: run.itemId, userId: applied.userId, eventId: applied.eventId, kind: recorded.kind,
-          version: applied.resultVersion, summary: recorded.summary, question: recorded.question ?? null,
+          version: applied.resultVersion, summary: recorded.summary, question: recorded.question ?? null, sentInFull: answer !== null,
         })
         : null;
-      return { outcome: { status: "applied", boardState: applied.boardState, wokeRouter: wake !== null }, wake, eventId: applied.eventId };
+      return {
+        outcome: { status: "applied", boardState: applied.boardState, wokeRouter: wake !== null }, wake, eventId: applied.eventId, answer,
+      };
     });
   } catch (err) {
     if (source === "turn_end" && (err as { code?: string })?.code === UNIQUE_VIOLATION) {
@@ -140,23 +151,11 @@ export async function ingestReport(
   if (written.outcome.status === "stale") metrics.onWorkItemStaleRejected(source);
   const applied = written.outcome.status === "applied";
   // Before the router runs, so the user has the answer and the files first and the router's line follows them.
-  if (applied && answerSentWhole(recorded.kind, recorded.summary)) await sayAnswerWhole(run.itemId);
+  if (written.answer) await written.answer.announce();
   if (applied && recorded.kind !== "progress") await announceDeliveries(run.itemId, written.eventId);
   else if (source === "turn_end") await announceDeliveries(run.itemId);
   if (written.wake) await drainSessionIfIdle(written.wake.sessionId, written.wake.userId);
   return written.outcome;
-}
-
-/**
- * The answer, whole, in the system's words (`recordNeedsYouFallback`: once per need of the item, so the silent sweep does not say
- * it again). A failure is logged and left to that sweep, which says it later.
- */
-async function sayAnswerWhole(itemId: string): Promise<void> {
-  try {
-    await recordNeedsYouFallback({ itemId });
-  } catch (err) {
-    logger.warn({ err, itemId }, "assistant.answer_not_sent_whole");
-  }
 }
 
 /**
