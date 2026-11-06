@@ -91,7 +91,7 @@ function maskNamedValues(text: string): { text: string; hits: number } {
 
 /** Mask credential-shaped content in one string that is about to be stored. */
 export function redactStoredText(text: string): RedactResult {
-  if (!text) return { text: text ?? "", hits: 0 };
+  if (!text) return { text: "", hits: 0 };
   const base = redactSecrets(text);
   let hits = base.hits;
   let out = base.text.replace(SAFE_API_KEY_RE, () => {
