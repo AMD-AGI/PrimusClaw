@@ -5,16 +5,16 @@
  * Deploy-mode-agnostic contract for provisioning the multi-node inference
  * cluster a task runs against.
  *
- * Clusters are created as SaFE workloads (RayJob or Infera); see factory.ts,
+ * Clusters are created as SaFE workloads (RayJob, Infera, Atom, or SGLangRouter); see factory.ts,
  * which rejects a deployment without SaFE. The result is a `MultiNodeContext`,
  * all the sandbox needs to drive the cluster via Hyperloom's "external mode"
  * (see sandbox/params.ts applyMultiNodeExternalEnv).
  */
 
-import type { ExecuteRequest } from "@claw/protocol";
+import type { ExecuteRequest, TopologyBackend } from "@claw/protocol";
 
 /** Engine topology, from the prompt's `--mn-backend`. */
-export type MultiNodeBackend = "rayjob" | "infera";
+export type MultiNodeBackend = TopologyBackend;
 
 /** Which mechanism provisioned the cluster. */
 export type MultiNodeProviderKind = "safe";
@@ -30,24 +30,28 @@ export interface MultiNodeContext {
   nodeCount: number;
   /** GPUs on each node; carried to the sandbox in the topology handoff. */
   gpusPerNode: number;
-  /** Base URL benchmarks target: Ray head :8888, or the Infera frontend on its derived port. */
+  /** Base URL benchmarks target: Ray head :8888, the Infera frontend, or the Atom/SGLangRouter router :8000. */
   serviceUrl: string;
   /** rayjob: host serving Ray Dashboard :8265 and GCS :6379. */
   headHost?: string;
   /** rayjob: Ray Dashboard auth token, when the dashboard is authenticated. */
   dashboardToken?: string;
-  /** infera: PEM private key authorised on the GPU pods. */
+  /** infera, atom, sglangrouter: PEM private key authorised on the GPU pods. */
   sshPrivateKey?: string;
-  /** infera: path the private key is materialised at inside the sandbox. */
+  /** infera, atom, sglangrouter: path the private key is materialised at inside the sandbox. */
   sshKeyPath?: string;
-  /** infera: SSH base port; decode pods are role-offset (see sandbox/multi-node/safe-body.ts). */
+  /** infera: SSH base port, decode pods role-offset; atom/sglangrouter: the one port of every pod. */
   sshPortBase?: number;
-  /** infera PD: prefill pod IPs, rank order. */
+  /** PD: prefill pod IPs, rank order. */
   prefillIps?: string[];
-  /** infera PD: decode pod IPs, rank order. */
+  /** PD: decode pod IPs, rank order. */
   decodeIps?: string[];
   /** infera aggregated: worker pod IPs, rank order (leader first). */
   workerIps?: string[];
+  /** atom/sglangrouter: prefill engine Service URL. */
+  prefillUrl?: string;
+  /** atom/sglangrouter: decode engine Service URL. */
+  decodeUrl?: string;
 }
 
 export interface MultiNodeEnsureOptions {

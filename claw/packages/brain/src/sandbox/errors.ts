@@ -56,6 +56,37 @@ export class SandboxProvisionTerminalError extends Error {
  * terminal give-up as an ordinary failure: it is recorded as `agent_error`,
  * and one whose message names a retryable status is naked back into the queue.
  */
+/**
+ * A sandbox or multi-node refusal whose banner code is fixed at the throw.
+ *
+ * The message stays human-readable. Classification reads `code`, so a wording
+ * change does not move the failure into another bucket.
+ */
+export class SandboxFailure extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "SandboxFailure";
+    this.code = code;
+  }
+}
+
+/**
+ * The coded sandbox failure behind `err`, wherever it sits in the cause chain.
+ *
+ * A lazy sandbox open wraps the original error. Matching the thrown class
+ * alone would miss it and fall through to message text.
+ */
+export function sandboxFailureOf(err: unknown): SandboxFailure | null {
+  let current: unknown = err;
+  for (let depth = 0; current && depth < 4; depth++) {
+    if (current instanceof SandboxFailure) return current;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
 export function provisionTerminalOf(err: unknown): SandboxProvisionTerminalError | null {
   let current: unknown = err;
   for (let depth = 0; current && depth < 4; depth++) {

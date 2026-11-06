@@ -171,11 +171,13 @@ export function resourcesMapToWorkloadArray(map: Record<string, string>): Array<
  * other sandbox callers authenticate with. Hyperloom keys the hand-off purely off
  * `HYPERLOOM_MN_EXT_SERVICE_URL`, so no credential variable selects the mode.
  *
- * The two backends drive the cluster through entirely different control planes:
- * rayjob talks to the head over Ray Dashboard REST (:8265) / GCS (:6379) and
- * needs no pod IPs, while infera SSHes into the GPU pods directly and needs
- * their IPs plus a private key. Only the variables the active backend reads are
- * set, since Hyperloom infers the mode from which ones are present.
+ * The backends drive the cluster through different control planes: rayjob talks
+ * to the head over Ray Dashboard REST (:8265) / GCS (:6379) and needs no pod
+ * IPs, infera SSHes into the GPU pods directly and needs their IPs plus a
+ * private key, and atom and sglangrouter serve on the router Service and, when
+ * a key was derived, also hand over SSH to their prefill and decode pods.
+ * Only the variables the active backend reads are set, since Hyperloom infers
+ * the mode from which ones are present.
  *
  * Nothing about the shared filesystem is set here. `USER_DATA_PATH` is the
  * workspace root Hyperloom resolves its session directories from, and SaFE's
@@ -194,6 +196,9 @@ export function applyMultiNodeExternalEnv(
   // The handoff file is the contract; its content and the files it points at are
   // written once the sandbox is healthy (see `buildTopologyHandoff`).
   env.TOPOLOGY_HANDOFF_FILE = TOPOLOGY_HANDOFF_PATH;
+  // Engine URLs are not part of the handoff file; Hyperloom reads them from the env.
+  if (ctx.prefillUrl) env.HYPERLOOM_MN_EXT_PREFILL_URL = ctx.prefillUrl;
+  if (ctx.decodeUrl) env.HYPERLOOM_MN_EXT_DECODE_URL = ctx.decodeUrl;
 
   if (!(opts.legacyTopologyEnv ?? LEGACY_TOPOLOGY_ENV)) return;
 
@@ -207,6 +212,17 @@ export function applyMultiNodeExternalEnv(
     // benchmark-only still works if this were omitted.
     if (ctx.headHost) env.HYPERLOOM_MN_EXT_HEAD_IP = ctx.headHost;
     if (ctx.dashboardToken) env.HYPERLOOM_MN_EXT_RAY_DASHBOARD_TOKEN = ctx.dashboardToken;
+    return;
+  }
+
+  // atom and sglangrouter: the optimizer SSHes into prefill and decode to
+  // relaunch the engine in place; every pod shares one sshd port.
+  if (ctx.backend === "atom" || ctx.backend === "sglangrouter") {
+    if (!hasSshKeyFile(ctx)) return;
+    env.HYPERLOOM_MN_EXT_SSH_KEY = ctx.sshKeyPath!;
+    if (ctx.sshPortBase) env.HYPERLOOM_MN_EXT_SSH_PORT = String(ctx.sshPortBase);
+    if (ctx.prefillIps?.length) env.HYPERLOOM_MN_EXT_PREFILL_IPS = ctx.prefillIps.join(",");
+    if (ctx.decodeIps?.length) env.HYPERLOOM_MN_EXT_DECODE_IPS = ctx.decodeIps.join(",");
     return;
   }
 
@@ -233,7 +249,7 @@ export const TOPOLOGY_HANDOFF_PATH = `${TOPOLOGY_HANDOFF_DIR}/topology.json`;
 const TOPOLOGY_KNOWN_HOSTS_PATH = `${TOPOLOGY_HANDOFF_DIR}/known_hosts`;
 
 /**
- * True when Brain writes the infera SSH key file. The one condition for both the
+ * True when Brain writes the cluster SSH key file. The one condition for both the
  * write and the `ssh_key_file` field, so the document never names a file that
  * was not written.
  */
@@ -270,7 +286,7 @@ export function buildTopologyHandoff(ctx: MultiNodeContext): TopologyHandoffBuil
     const ray: NonNullable<TopologyHandoffV1["ray"]> = {};
     if (ctx.headHost) ray.head_ip = ctx.headHost;
     handoff.ray = ray;
-  } else {
+  } else if (ctx.backend === "infera") {
     const infera: NonNullable<TopologyHandoffV1["infera"]> = {
       prefill_ips: [...(ctx.prefillIps ?? [])],
       decode_ips: [...(ctx.decodeIps ?? [])],
@@ -283,6 +299,16 @@ export function buildTopologyHandoff(ctx: MultiNodeContext): TopologyHandoffBuil
     // is usable by `ssh -o UserKnownHostsFile=...` without the reader creating it.
     files.push({ path: infera.known_hosts_file, content: "", mode: "600" });
     handoff.infera = infera;
+  } else if (hasSshKeyFile(ctx)) {
+    const cluster: NonNullable<TopologyHandoffV1["cluster"]> = {
+      ssh_key_file: ctx.sshKeyPath,
+      prefill_ips: [...(ctx.prefillIps ?? [])],
+      decode_ips: [...(ctx.decodeIps ?? [])],
+    };
+    if (ctx.sshPortBase) cluster.ssh_port = ctx.sshPortBase;
+    cluster.known_hosts_file = TOPOLOGY_KNOWN_HOSTS_PATH;
+    files.push({ path: cluster.known_hosts_file, content: "", mode: "600" });
+    handoff.cluster = cluster;
   }
 
   files.push({
