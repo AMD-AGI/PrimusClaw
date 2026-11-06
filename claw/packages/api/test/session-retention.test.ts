@@ -21,6 +21,8 @@
  *   T6 the purge removes stamped rows of sessions deleted past the window, and nothing else
  *   T7 archiving stamps archived_at, re-archiving keeps it, unarchiving clears it
  *   T8 the batch is the day's limit across passes and replicas, not each pass's
+ *   T9 the next day's pass, 24 hours on, waits for the last day's deletions to leave the window
+ *      and deletes a whole batch, once across replicas; one whose window frees far later ends
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -386,5 +388,60 @@ describe("session retention", { skip }, () => {
     assert.deepEqual([nextDay.eligible, nextDay.deleted], [2, 2]);
     assert.deepEqual(await deletedIds(),
       ["compat-gone", "exp-1", "exp-2", "exp-3", "exp-4", "user-gone"]);
+  });
+
+  test("T9 the next day's pass waits for the last day's deletions to leave the window", { timeout: 60_000 }, async () => {
+    // The daily pass runs every 24 hours and the window is the last 24 hours, so
+    // the next day's pass starts a little before the last day's deletions leave
+    // it: they were made a little after their pass started. Ending there with
+    // nothing deleted left the backlog to the day after, a batch every other day.
+    for (let i = 1; i <= 8; i += 1) await seed({ id: `exp-${i}`, archivedDays: 40 + i });
+    const batch = { ...SETTINGS, batch: 2 };
+    const run = {
+      ...retention.DEFAULT_RETENTION_RUN,
+      continueDelayMs: 10, lockRetryDelayMs: 20, lockRetries: 10_000, windowWaitMs: 60_000,
+    };
+    /** Put the last day's two deletions 24 hours back, less 3 and 5 seconds; when each leaves the window. */
+    const dayLater = async (ids: [string, string]): Promise<Date[]> => {
+      await q("UPDATE claw_sessions SET deleted_at = NOW() - INTERVAL '2 days' WHERE deleted_at IS NOT NULL");
+      await q(`UPDATE claw_sessions SET deleted_at = NOW() - INTERVAL '1 day'
+                 + CASE session_id WHEN $1 THEN INTERVAL '3 seconds' ELSE INTERVAL '5 seconds' END
+                WHERE session_id = ANY($2::text[])`, [ids[0], ids]);
+      const now = await retention.runSessionRetention({ ...batch, dryRun: true });
+      assert.equal(now.deleted, 0, "the day's batch is spent when the pass starts");
+      return (await rows(`SELECT deleted_at + INTERVAL '1 day' AS t FROM claw_sessions
+                           WHERE session_id = ANY($1::text[]) ORDER BY deleted_at`, [ids])).map((r) => r.t as Date);
+    };
+    /** Each of the day's deletions was made after a place had left the window. */
+    const madeAfter = async (ids: string[], leaves: Date[]): Promise<void> => {
+      const made = (await rows(`SELECT deleted_at FROM claw_sessions WHERE session_id = ANY($1::text[])
+                                 ORDER BY deleted_at`, [ids])).map((r) => r.deleted_at as Date);
+      for (const [i, t] of made.entries()) {
+        assert.ok(t >= leaves[i], `deletion ${i + 1} waited for its place: ${t.toISOString()} >= ${leaves[i].toISOString()}`);
+      }
+    };
+
+    await retention.runSessionRetentionOnce(batch, run);
+    assert.deepEqual(await deletedIds(), ["exp-7", "exp-8"], "day one");
+
+    // Day two: one pass deletes the whole batch, one as each place leaves.
+    let leaves = await dayLater(["exp-8", "exp-7"]);
+    await retention.runSessionRetentionOnce(batch, run);
+    assert.deepEqual(await deletedIds(), ["exp-5", "exp-6", "exp-7", "exp-8"], "a whole batch on day two");
+    await madeAfter(["exp-5", "exp-6"], leaves);
+
+    // Day three, two replicas' passes at once: still one batch for the fleet.
+    leaves = await dayLater(["exp-6", "exp-5"]);
+    await Promise.all([retention.runSessionRetentionOnce(batch, run), retention.runSessionRetentionOnce(batch, run)]);
+    assert.deepEqual(await deletedIds(), ["exp-3", "exp-4", "exp-5", "exp-6", "exp-7", "exp-8"], "one batch on day three");
+    await madeAfter(["exp-3", "exp-4"], leaves);
+
+    // A pass whose window frees hours from now (a replica booted after the day's
+    // pass) ends at once with nothing deleted, and leaves it to the next day's.
+    await q("UPDATE claw_sessions SET deleted_at = NOW() - INTERVAL '2 hours' WHERE session_id IN ('exp-3', 'exp-4')");
+    const started = Date.now();
+    await retention.runSessionRetentionOnce(batch, run);
+    assert.ok(Date.now() - started < 30_000, "it did not wait for the window");
+    assert.deepEqual(await deletedIds(), ["exp-3", "exp-4", "exp-5", "exp-6", "exp-7", "exp-8"]);
   });
 });

@@ -779,7 +779,10 @@ record it.
 - `SESSION_RETENTION_BATCH` is now a daily limit across replicas: every replica runs the maintenance pass a minute
   after it boots, and each pass deleted a whole batch of its own, so a rollout of four replicas deleted four batches
   (16,535 sessions in an hour with a batch of 5000) and left the cleanup sweeper hours behind. Each hold of the
-  retention lock now deletes at most the batch less the archived sessions deleted in the last 24 hours.
+  retention lock now deletes at most the batch less the archived sessions deleted in the last 24 hours. The next
+  day's pass, which starts 24 hours after the last and so a little before the last day's deletions leave that window,
+  waits for them and deletes as they leave instead of ending with nothing deleted (which would have made it a batch
+  every other day); it waits only when they start leaving within two hours, so a replica booted mid-day does not.
 - Deleting a session that has no `hands.<sid>` binding and no key on its cleanup notification -- every session the
   retention pass deletes, and every sweeper replay of a delete that already finished -- is a finished teardown with
   nothing to address (`session.cleanup_nothing_addressable`), not `no_platform_key`. Claw holds no handle to anything

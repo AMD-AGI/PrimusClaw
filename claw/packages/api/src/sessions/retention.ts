@@ -57,6 +57,15 @@
  * after that, so one rollout of four replicas is four passes. Each hold reads
  * what is left of the day from the deletions already made -- see
  * {@link retentionAllowance} -- which is the one record every replica shares.
+ *
+ * The day is the last 24 hours, and the next daily pass starts 24 hours after
+ * the last one, so it finds yesterday's deletions still inside the window: they
+ * were made a little after that pass started, and leave it a little after this
+ * one starts. So a pass whose batch is spent by deletions that leave the window
+ * soon waits for them and deletes as they leave, rather than ending with
+ * nothing done and leaving the backlog to the day after (a batch every other
+ * day). One whose window frees later than that -- a replica booted mid-day,
+ * after the day's pass -- ends, and the next daily pass takes it.
  */
 import pino from "pino";
 
@@ -112,7 +121,10 @@ export interface RetentionReport {
  * pass; each hold reads and advances it.
  */
 export interface RetentionProgress {
-  /** Deletions left in the day's batch. */
+  /**
+   * Deletions left in this pass's batch. What is left of the day's, read from
+   * the deletions themselves at every hold, can be less.
+   */
   deleteLeft: number;
   /** Purges left in the day's batch. */
   purgeLeft: number;
@@ -123,12 +135,34 @@ export interface RetentionProgress {
    * down would hand the walk the same session again.
    */
   purgeCursor?: { deletedAt: string; sessionId: string };
+  /**
+   * Set when the last 24 hours' deletions, not this pass's batch, stopped the
+   * deletions and the window frees part of the day's batch soon: when (by
+   * `Date.now()`) the next hold should start to delete what has left it.
+   */
+  deleteResumeAt?: number;
   deleteDone: boolean;
   purgeDone: boolean;
 }
 
 export function newRetentionProgress(s: RetentionSettings): RetentionProgress {
   return { deleteLeft: s.batch, purgeLeft: s.batch, deleteDone: false, purgeDone: false };
+}
+
+/** The deletions the day's limit counts, over `claw_sessions s`; see {@link retentionAllowance}. */
+const COUNTED_TODAY = `s.deleted_at > NOW() - INTERVAL '1 day'
+        AND s.status = 'archived'
+        AND NOT COALESCE(s.config ? 'primus_anthropic_compat', false)`;
+
+/** What is left of the day's batch. */
+interface Allowance {
+  /** Deletions left. */
+  left: number;
+  /**
+   * With none left, how long until one of the counted deletions turns 24 hours
+   * old and frees a place, measured on the database's clock from now.
+   */
+  freesInMs?: number;
 }
 
 /**
@@ -151,20 +185,47 @@ export function newRetentionProgress(s: RetentionSettings): RetentionProgress {
  * the row says who deleted it -- which can only make a day's retention smaller,
  * and how much deletion one day adds is what the limit is for.
  */
-async function retentionAllowance(batch: number): Promise<number> {
-  const r = await db.query(
-    `SELECT COUNT(*)::int AS n FROM claw_sessions s
-      WHERE s.deleted_at > NOW() - INTERVAL '1 day'
-        AND s.status = 'archived'
-        AND NOT COALESCE(s.config ? 'primus_anthropic_compat', false)`,
-  );
-  return Math.max(0, batch - (r.rows[0] as { n: number }).n);
+async function retentionAllowance(batch: number): Promise<Allowance> {
+  const r = await db.query(`SELECT COUNT(*)::int AS n FROM claw_sessions s WHERE ${COUNTED_TODAY}`);
+  const n = (r.rows[0] as { n: number }).n;
+  if (n < batch) return { left: batch - n };
+  // One place frees when the (n - batch + 1)th oldest of them leaves the window.
+  // The wait is the server's arithmetic, so the two hosts' clocks never meet.
+  const next = (await db.query(
+    `SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM (s.deleted_at + INTERVAL '1 day' - NOW())) * 1000))::bigint AS ms
+       FROM claw_sessions s WHERE ${COUNTED_TODAY}
+      ORDER BY s.deleted_at OFFSET $1 LIMIT 1`,
+    [n - batch],
+  )).rows[0] as { ms: string } | undefined;
+  // None: they left the window between the two statements.
+  return { left: 0, freesInMs: next ? Number(next.ms) : 0 };
 }
 
 /** The bound on one hold: when it ends, and where it starts from. */
 interface HoldLimits {
   deadline: number;
   progress: RetentionProgress;
+  /**
+   * How soon the window has to free a place for the pass to wait for it, when
+   * the day's batch is spent; unset, a spent day ends the deletions.
+   */
+  windowWaitMs?: number;
+}
+
+/**
+ * The day's batch stopped this hold's deletions: wait for the window to free
+ * a place if it does so within `windowWaitMs`, else the deletions are done.
+ */
+function afterDaySpent(day: Allowance, progress: RetentionProgress, limits: HoldLimits): void {
+  if (day.left > 0) {
+    // Places freed while this hold deleted: the next hold takes them.
+    progress.deleteResumeAt = Date.now();
+  } else if (limits.windowWaitMs !== undefined && day.freesInMs !== undefined
+    && day.freesInMs <= limits.windowWaitMs) {
+    progress.deleteResumeAt = Date.now() + day.freesInMs;
+  } else {
+    progress.deleteDone = true;
+  }
 }
 
 /**
@@ -209,22 +270,29 @@ async function deleteExpiredSessions(
   lease?: LeaderLease,
 ): Promise<void> {
   const { progress } = limits;
+  progress.deleteResumeAt = undefined;
   const workItems = await tableExists(db, "claw_work_items");
   const counted = await db.query(
     `SELECT COUNT(*)::int AS n FROM claw_sessions s WHERE ${retentionPredicate(1, workItems)}`,
     [s.retentionDays],
   );
   report.eligible = (counted.rows[0] as { n: number }).n;
-  if (report.eligible > 0 && progress.deleteLeft > 0) {
-    progress.deleteLeft = Math.min(progress.deleteLeft, await retentionAllowance(s.batch));
-  }
   if (report.eligible === 0 || progress.deleteLeft <= 0) {
     progress.deleteDone = true;
     return;
   }
+  // This hold deletes up to what is left of both the pass's batch and the
+  // day's; the pass's own still bounds a pass that waits for the window.
+  const day = await retentionAllowance(s.batch);
+  const room = Math.min(progress.deleteLeft, day.left);
   if (s.dryRun) {
-    report.deleted = Math.min(report.eligible, progress.deleteLeft);
+    // What deleting now would take; a dry run does not wait for the window.
+    report.deleted = Math.min(report.eligible, room);
     progress.deleteDone = true;
+    return;
+  }
+  if (room <= 0) {
+    afterDaySpent(day, progress, limits);
     return;
   }
   const picked = (await db.query(
@@ -232,7 +300,7 @@ async function deleteExpiredSessions(
       WHERE ${retentionPredicate(1, workItems)}
       ORDER BY COALESCE(s.archived_at, s.updated_at)
       LIMIT $2`,
-    [s.retentionDays, progress.deleteLeft],
+    [s.retentionDays, room],
   )).rows as Array<{ session_id: string }>;
 
   let attempted = 0;
@@ -280,6 +348,12 @@ async function deleteExpiredSessions(
     });
     if (committed === true) report.deleted += 1;
     else if (committed === false) report.skipped += 1;
+  }
+  // The day's batch, not the pass's, ended the selection, and there was more
+  // to delete than it took.
+  if (progress.deleteLeft > 0 && picked.length === room && report.eligible > room) {
+    afterDaySpent(await retentionAllowance(s.batch), progress, limits);
+    return;
   }
   progress.deleteDone = true;
 }
@@ -426,6 +500,14 @@ export interface RetentionRunOptions {
   lockRetryDelayMs: number;
   /** How many times a pass asks again for a held lock. */
   lockRetries: number;
+  /**
+   * How soon the last 24 hours' deletions have to start leaving the window for
+   * a pass whose day's batch they spent to wait for them. It covers how much
+   * later than yesterday's this pass reached its deletions -- the archive step
+   * before it, a lock it waited for -- and it is far short of a day, so a pass
+   * after the day's own (a replica booted mid-day) does not wait into the next.
+   */
+  windowWaitMs: number;
 }
 
 export const DEFAULT_RETENTION_RUN: RetentionRunOptions = {
@@ -433,6 +515,7 @@ export const DEFAULT_RETENTION_RUN: RetentionRunOptions = {
   continueDelayMs: 30 * 1000,
   lockRetryDelayMs: 10 * 60 * 1000,
   lockRetries: 12,
+  windowWaitMs: 2 * 60 * 60 * 1000,
 };
 
 /** A backstop on holds per pass; the batch is what normally ends it. */
@@ -446,7 +529,9 @@ const pause = (ms: number) => new Promise<void>((resolve) => { setTimeout(resolv
  *
  * A hold that reaches its time budget lets go of the lock and the pass carries
  * on in a new hold after `continueDelayMs`, from where it stopped and with what
- * is left of the day's batch.
+ * is left of the day's batch. One that found the day's batch spent by
+ * deletions about to leave the window lets go of it too, and the pass carries
+ * on when they have left (and not sooner than `continueDelayMs`).
  *
  * A pass that finds the lock taken asks again after `lockRetryDelayMs`, up to
  * `lockRetries` times, rather than skipping until the next day. The holder is
@@ -469,7 +554,9 @@ export async function runSessionRetentionOnce(
   let busy = 0;
   for (let holds = 0; holds < MAX_HOLDS;) {
     const outcome = await withLeaderLock(LEADER_LOCK_IDS.sessionRetention, "session_retention",
-      (lease) => runSessionRetention(s, lease, { deadline: Date.now() + run.holdBudgetMs, progress }));
+      (lease) => runSessionRetention(s, lease, {
+        deadline: Date.now() + run.holdBudgetMs, progress, windowWaitMs: run.windowWaitMs,
+      }));
     if (!outcome.ran) {
       if (busy >= run.lockRetries) {
         logger.warn({ attempts: busy + 1 },
@@ -483,12 +570,22 @@ export async function runSessionRetentionOnce(
       continue;
     }
     holds += 1;
-    if (!outcome.result.timedOut) return;
+    if (outcome.result.timedOut) {
+      logger.info(
+        { holds, deleteLeft: progress.deleteLeft, purgeLeft: progress.purgeLeft, continueInMs: run.continueDelayMs },
+        "session_retention.continuing (the hold reached its time budget)",
+      );
+      await pause(run.continueDelayMs);
+      continue;
+    }
+    const resumeAt = progress.deleteDone ? undefined : progress.deleteResumeAt;
+    if (resumeAt === undefined) return;
+    const waitMs = Math.max(run.continueDelayMs, resumeAt - Date.now());
     logger.info(
-      { holds, deleteLeft: progress.deleteLeft, purgeLeft: progress.purgeLeft, continueInMs: run.continueDelayMs },
-      "session_retention.continuing (the hold reached its time budget)",
+      { holds, deleteLeft: progress.deleteLeft, continueInMs: waitMs },
+      "session_retention.waiting_for_window (the last 24 hours' deletions spent the day's batch and start leaving it soon)",
     );
-    await pause(run.continueDelayMs);
+    await pause(waitMs);
   }
   logger.warn({ holds: MAX_HOLDS }, "session_retention.stopped_at_hold_limit");
 }
