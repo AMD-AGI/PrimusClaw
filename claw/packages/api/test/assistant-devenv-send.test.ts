@@ -378,7 +378,7 @@ describe("development environment items and devenv_send", { skip }, () => {
   });
 
   test("F7 a cancel closes the item however many prompts were queued; a refused prompt is one fewer, never two", async () => {
-    const alice = await w.user("alice");
+    await w.user("alice");
     const cid = await machine("alice", "laptop");
     const sid = await chatSession("alice", cid);
     const prompt = async (text: string) => assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text })).status, 202);
@@ -430,7 +430,7 @@ describe("development environment items and devenv_send", { skip }, () => {
   });
 
   test("F9 a turn that ended before its prompt's item was written still ends the item", async () => {
-    const alice = await w.user("alice");
+    await w.user("alice");
     const cid = await machine("alice", "laptop");
     const sid = await chatSession("alice", cid);
     await events("alice", cid, sid, [chunk("history"), end()]);
@@ -501,7 +501,7 @@ describe("development environment items and devenv_send", { skip }, () => {
   });
 
   test("F11 a prompt waits while a stop is being queued and noted for the same session, never in between", async () => {
-    const alice = await w.user("alice");
+    await w.user("alice");
     const cid = await machine("alice", "laptop");
     const sid = await chatSession("alice", cid);
     // Another request holds the session's order (as a stop being queued and noted does) until released.
@@ -610,7 +610,7 @@ describe("development environment items and devenv_send", { skip }, () => {
   });
 
   test("F15 two stops before either cancel's end has come: each end is the oldest one's, and the last instruction stays open", async () => {
-    const alice = await w.user("alice");
+    await w.user("alice");
     const cid = await machine("alice", "laptop");
     const sid = await chatSession("alice", cid);
     const send = async (body: Recorded) => assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, body)).status, 202);
