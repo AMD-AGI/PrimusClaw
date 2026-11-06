@@ -79,6 +79,14 @@ record it.
   value runs to its line's end, or to the closing quote of the string its name is in, and no separator or bracket ends it; Kubernetes environment variables named like a credential; armored private keys, OpenPGP ones
   included, and a key whose BEGIN line the tail cut off, from its first base64 line), and keeps the last 6000 characters of a
   plain-text answer.
+- Work on the user's development environments is on their work item list (`kind = 'remote'`, one item per remote session, written
+  by Claw from the session's prompts and its connector's events), so "did the one I just ran finish?" is answered from the list,
+  for a prompt typed into an attached chat (told to nobody) as for one the assistant sent (told once when it ends or waits for an
+  approval). New router tool `devenv_send` sends an instruction to an agent on one of the user's own machines (it picks the machine,
+  continues an idle session or opens one, and files the item); it runs at once only in a turn answering the user's own signed-in
+  message that read nothing untrusted, and otherwise is a card (held write kind `devenv_send`) sent only when they press it.
+  `work_send` refuses these items, `work_stop` cancels the agent's turn, and the silent sweep skips them. Router prompt
+  router-devenv-v2.
 - An assistant router turn answers about the user's development environments itself: `devenv_list` (where
   `CLAW_REMOTE_AGENTS_ENABLED` is on) lists their own machines (online, last seen, version, agents) and every agent session on them
   (open through Claw, or the agent's own conversation a connector offers to take over) with its state, folder, last activity, a

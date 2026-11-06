@@ -250,6 +250,40 @@ read the list no longer acts for the user, with one exception: it may still put
 `/agent attach <ref>` for one of the user's own attachable sessions to them, as a button they
 press (never run at once); any other ref or action is refused.
 
+### Development environment items
+
+Work on the user's machines is on their work item list (`kind = 'remote'`, one item per session, filed
+under the worker session id `remote:<session id>`), so the assistant can name it: "did it finish?". Claw
+writes the item from what passes through it: a `prompt` command opens it (in progress, titled with the
+machine, the agent and the start of the instruction), a `permissionRequest` puts it in front of the user
+until its `permission_resolved`, a `turn_end` closes it as answered with the end of the agent's answer as
+its summary, and a `session_closed` closes it. History a session had before its first prompt (a
+conversation taken over replays it) is not applied, and each event is applied once. A prompt the user typed
+into a chat attached to the session is told to nobody (the chat showed it, and the silent sweep skips these
+items); one the assistant sent is told once when it ends or waits for an approval. The router's item list
+says, for each, the agent, the session, whether its machine is online now, and the machine's name as quoted
+data. `work_send` refuses these items; `work_stop` closes one and cancels the agent's turn;
+`work_recall(item, "worker_tail")` is the end of the agent's answer.
+
+### Sending an instruction (`devenv_send`)
+
+`devenv_send{text, agent?, target?, cwd?}` sends an instruction to an agent on one of the user's own
+machines. It chooses the machine and agent itself, among the caller's connectors only: the one the user
+named (by machine name, session label or session id), else the only online machine offering that agent;
+more than one is `which_machine`, an offline one is `connector_offline`. It continues an idle session of
+that agent open through Claw, else opens a new one in the agent's first root (or the folder named, which
+must be under a root); a session working on something is never sent another (`busy`). The prompt goes
+through the same checks as the user's own route (session limit, command rate, audit with the prompt's hash
+only), under a command id derived from the turn, so a replayed call sends nothing twice.
+
+It runs at once only in a turn answering the user's own message sent signed in, still fresh, before which
+the turn read nothing untrusted. A turn that read `devenv_list` (or anything else untrusted), or answers a
+message sent with a key, puts the instruction to the user as a card instead (a held write,
+`claw_assistant_confirmations` kind `devenv_send`, answered by `POST /v1/assistant/confirmations/:id/decision`
+signed in, or by replying `批准 #<ref>`), and sends it only then, after checking again that the machine is
+online and the session idle. A turn answering no message (a worker's report) can do neither. What a machine
+reported reaches the model only after the choice, and the turn has read it from then on.
+
 ## Retention
 
 A closed session is deleted with all of its events `CLAW_REMOTE_AGENTS_RETENTION_DAYS`

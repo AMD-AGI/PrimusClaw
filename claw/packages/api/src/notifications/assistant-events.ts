@@ -69,7 +69,8 @@ export interface AssistantConfirmWrite {
   confirmation_id: string;
   /** The short id the person may type back. */
   ref: string;
-  kind: "trigger_create" | "trigger_cancel" | "github_comment";
+  /** `devenv_send`: an instruction for an agent on the person's own machine (`assistant/devenv-tools.ts`). */
+  kind: "trigger_create" | "trigger_cancel" | "github_comment" | "devenv_send";
   /** What the button that lets it through says, in the language of the text. */
   allow_label: string;
   expires_at: string;

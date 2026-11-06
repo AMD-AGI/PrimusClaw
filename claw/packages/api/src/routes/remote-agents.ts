@@ -37,6 +37,7 @@ import { redactPublicJson } from "../events/redaction.js";
 import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
+import { noteRemoteEvents, noteRemotePrompt } from "../assistant/remote-items.js";
 
 const logger = pino({ name: "remote-agents" });
 
@@ -169,6 +170,8 @@ async function serveSse(
 export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: RemoteAgentOptions = {}): Promise<void> {
   if (!CLAW_REMOTE_AGENTS_ENABLED) return;
   const waker = opts.waker ?? new Waker();
+  // Commands the assistant issues for the user (`devenv_send`) wake this replica's command streams as a route's do.
+  store.setCommandWaker((connectorId) => waker.wake(`c:${connectorId}`));
   const pingMs = opts.pingMs ?? REMOTE_AGENT_TIMING.pingMs;
   const pollMs = opts.pollMs ?? IDLE_POLL_MS;
   const onlineWindowMs = opts.onlineWindowMs ?? REMOTE_AGENT_TIMING.onlineWindowMs;
@@ -283,6 +286,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const events = batch.value.events.map((e) => ({ ...e, data: redactPublicJson(e.data) as Record<string, unknown> }));
     const result = await store.ingestEvents(connector as { connector_id: string; owner_user_id: string }, events, getAuthMethod(req));
     for (const sid of result.touched) waker.wake(`s:${sid}`);
+    // The assistant's view of the work (`assistant/remote-items.ts`): after the events are stored, and never a reason to refuse them.
+    if (result.touched.length) await noteRemoteEvents(owner, result.touched);
     const rejected = [...batch.value.rejected, ...result.rejected].sort((a, b) => a.index - b.index);
     return reply.send({ ok: true, data: { batch_id: batch.value.batchId, acked: result.acked, rejected } });
   });
@@ -432,6 +437,12 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       return reply.send({ ok: true, data: { cmd_id: cmdId, duplicate: true } });
     }
     waker.wake(`c:${session.connector_id}`);
+    // A prompt typed into an attached chat is an item the assistant can name ("did it finish?"), told to nobody: the chat shows it.
+    if (type === "prompt") {
+      await noteRemotePrompt({
+        owner, sessionId, connectorId: session.connector_id, agentId: session.agent_id, text: (parsed.value as { text: string }).text, origin: "chat",
+      }).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
+    }
     return reply.status(202).send({
       ok: true, data: { cmd_id: cmdId, cmd_seq: Number(out.row.cmd_seq), connector_online: !!connector.online },
     });

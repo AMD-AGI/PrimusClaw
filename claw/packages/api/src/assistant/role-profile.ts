@@ -16,6 +16,7 @@
  * at send time and the bearer expires, and the item list must be the one of that moment.
  */
 import pino from "pino";
+import { REMOTE_AGENT_TIMING } from "@claw/protocol";
 import {
   CLAW_AGENT_GUIDELINE_ENABLED, CLAW_ASSISTANT_DECISION_WAIT_SEC, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_ROUTER_MAX_TURNS,
   CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS, CLAW_ASSISTANT_WORKER_MODEL, INTERNAL_BACKEND_URL,
@@ -49,6 +50,7 @@ import { jobWatchesEnabled } from "./job-watch.js";
 import { renderRouterProactiveSection, ROUTER_PROACTIVE_PROMPT_VERSION } from "./proactive-prompt.js";
 import { renderRouterWritingSection, ROUTER_WRITING_PROMPT_VERSION } from "./writing-prompt.js";
 import { devenvToolsOn } from "./devenv-tools.js";
+import { remoteManifest } from "./remote-items.js";
 import { renderRouterSelfSection, ROUTER_SELF_PROMPT_VERSION, selfStatusOn } from "./self-status.js";
 import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
@@ -127,6 +129,8 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
      ) listed ORDER BY seq`,
     [userId, MANIFEST_CLOSED_WINDOW, MANIFEST_MAX_ITEMS],
   )).rows as Array<Record<string, unknown>>;
+  // Development environment items: where each runs, and whether that machine is online now (`remote-items.ts`).
+  const remote = await remoteManifest(userId, rows as Array<{ item_id: string; kind: string; params: unknown }>, REMOTE_AGENT_TIMING.onlineWindowMs);
   return rows.map((r) => ({
     itemId: String(r.item_id),
     seq: Number(r.seq),
@@ -140,6 +144,7 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
     createdAt: (r.created_at as Date | null) ?? null,
     closedAt: (r.closed_at as Date | null) ?? null,
     ...(r.kind === "review" ? { review: reviewOf(r.params) } : {}),
+    ...(remote.has(String(r.item_id)) ? { remote: remote.get(String(r.item_id)) } : {}),
   }));
 }
 
@@ -302,7 +307,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       if (memory.entries) state.push(memory.entries);
     }
     const devenv = devenvToolsOn();
-    if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS }));
+    if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS, send: true }));
     // Who it is (Clawy, with claw_self_status) and how to count what a lookup returned: the same on every turn, so it stays cached.
     const self = selfStatusOn();
     withSystemAppend(task, renderRouterSelfSection(self));

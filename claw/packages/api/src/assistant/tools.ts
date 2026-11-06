@@ -41,6 +41,7 @@ import {
   assertAllowedModel, isAllowedModel, modelAnswer, modelChoiceOn, ModelChoiceRefused, modelParams, resolveItemModel, writeModelPrefs, type ResolvedModel,
 } from "./model-choice.js";
 import { ingestReport } from "./reports.js";
+import { cancelRemoteItem, remoteAnswerTail } from "./remote-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import {
   clipOneLine, getWorkItem, insertWorkItem, recentEvents, reopenWorkItem, resolveWorkItem, resolveWorkItemNow, stopWorkItem,
@@ -490,8 +491,13 @@ export async function workSend(
     const { userId } = await assertLiveRun(query, claims);
     const item = found(await resolveWorkItem(query, userId, args.item_id, { forUpdate: true }));
     // A review's session takes input only from the person (`acting-turns.ts`), and a review changes by its parameters.
-    if ((await query("SELECT kind FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0]?.kind === "review") {
+    const kind = (await query("SELECT kind FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0]?.kind;
+    if (kind === "review") {
       throw new ToolRefused("review_item", "a review takes no instructions: use review_restart to change how it runs, or work_stop to stop it");
+    }
+    // An agent on the user's machine is sent instructions by devenv_send, which checks the machine and the person's say.
+    if (kind === "remote") {
+      throw new ToolRefused("remote_item", "this item is an agent on the user's machine: send it another instruction with devenv_send, target = its session");
     }
     // The same words already sent to this item in this router turn are a replayed call. Asked of the item's own log,
     // not of the queue: the queue's key is gone once the message has been handed to a run.
@@ -584,6 +590,8 @@ export async function workStop(
     },
   });
   if (stopped.status === "not_found") throw new ToolRefused("item_not_found", "no such item");
+  // An agent on the user's machine: its turn is cancelled too, as the stop button of an attached chat does.
+  if (stopped.status === "ok" && stopped.item.kind === "remote") await cancelRemoteItem(userId, stopped.item.params);
   if (stopped.status === "conflict") {
     // A review whose merge is being made, or was made: say exactly that, so the user is told the truth and nothing is undone.
     if (stopped.error === "merge_in_progress") throw new ToolRefused(stopped.error, "the merge is being made right now and cannot be stopped");
@@ -658,6 +666,11 @@ export async function workRecall(
   if (args.detail === "summary") return { ok: true, item: summary, note: UNTRUSTED_NOTE };
   if (args.detail === "reports") {
     return { ok: true, item: summary, note: UNTRUSTED_NOTE, reports: await recentEvents(named.item_id, RECALL_EVENTS) };
+  }
+  if (item.kind === "remote") {
+    // What the agent on the user's machine answered last, or is answering now.
+    const sessionId = String((item.params as { session_id?: unknown } | null)?.session_id ?? "");
+    return { ok: true, item: summary, note: UNTRUSTED_NOTE, worker_tail: sessionId ? await remoteAnswerTail(sessionId, WORKER_TAIL_MAX_CHARS) : "" };
   }
   const turns = (await db.query(
     `SELECT role, content FROM claw_conversation_turns
