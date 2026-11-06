@@ -257,38 +257,21 @@ export async function languageToAnswerIn(
   return null;
 }
 
-/** As many Latin words as make an English sentence the language check leaves alone, however much Chinese is around it. */
-const ENGLISH_SENTENCE_MIN_WORDS = 3;
-
-/** The script an answer due in Chinese cannot be without. */
-const SCRIPT_OF: Record<string, RegExp> = { Chinese: /\p{Script=Han}/u };
-
 /**
  * Whether a message the assistant is about to send is plainly in another language than the one it was told to answer in
  * (`[Reply language: X]`): the language it is in, or null when it is in that language or cannot be told apart from it.
  *
- * As careful as the rest of this module, because a wrong refusal costs the user a message: `others` (the user's item titles,
- * which are quoted from elsewhere) are left out first, and what remains must be judged to be another language by `readLanguage`
- * and, for an answer due in Chinese, have no Chinese character at all; for one due in English, have no English function word and fewer
- * than three English-looking words. Japanese and Korean are not checked: a short Japanese answer
- * may be all kanji and read as Chinese. So an English sentence that
- * quotes a Chinese title passes for English, and a Chinese answer full of English names and terms passes for Chinese.
- * Pure, for the tests.
+ * Asked only of an answer due in Chinese, and refused only when it has no Chinese character at all once the user's item titles
+ * (`others`, quoted from elsewhere) are left out: an answer to a Chinese message with none is in another language, whatever it
+ * quotes. The other way cannot be told safely: an English sentence may quote a Chinese title of anything (a pull request, a page)
+ * at any length, and a short Japanese answer may be all kanji, so an answer due in English, Japanese or Korean is never refused
+ * here (the prompt asks for it). Pure, for the tests.
  */
 export function replyLanguageMismatch(text: string, expected: string, others: readonly string[] = []): string | null {
-  // Only the two languages this can tell apart in a short answer: a Japanese answer may be all kanji (了解。), which reads as Chinese.
-  if (expected !== "Chinese" && expected !== "English") return null;
+  if (expected !== "Chinese") return null;
   let own = text;
   for (const o of others) if (o.trim()) own = own.split(o).join(" ");
+  if (/\p{Script=Han}/u.test(wording(own))) return null;
   const found = readLanguage(own).language;
-  if (!found || found === expected) return null;
-  const script = SCRIPT_OF[expected];
-  if (script) return script.test(wording(own)) ? null : found;
-  // English expected: only a message judged to be in another language with no English sentence in it at all: no English function word
-  // and fewer than three English-looking words, so an English sentence quoting a Chinese title from anywhere (a pull request, a page)
-  // is not refused, while a Chinese sentence naming a term or two (这个 PR 已经合入了) is.
-  if (expected !== "English") return null;
-  const plain = wording(own);
-  const latin = wordsOf(plain).filter((w) => /^[\p{Script=Latin}']{2,}$/u.test(w)).length;
-  return englishWords(plain) === 0 && latin < ENGLISH_SENTENCE_MIN_WORDS ? found : null;
+  return found && found !== expected ? found : null;
 }

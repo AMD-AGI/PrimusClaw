@@ -196,18 +196,17 @@ describe("router quality, pure", () => {
     const { replyLanguageMismatch } = await import("../src/assistant/language.js");
     assert.equal(replyLanguageMismatch("All three are done; nothing waits for you.", "Chinese"), "English");
     assert.equal(replyLanguageMismatch("三个都完成了，PR 在 https://github.com/o/r/pull/12，CI is green。", "Chinese"), null);
-    assert.equal(replyLanguageMismatch("这个 PR 已经合入了。", "English"), "Chinese");
-    assert.equal(replyLanguageMismatch("#6 修复登录超时 is done, and the PR is merged.", "English", ["修复登录超时"]), null);
-    assert.equal(replyLanguageMismatch("修复登录超时", "English", ["修复登录超时"]), null, "only a title says nothing");
-    assert.equal(replyLanguageMismatch("ok", "Chinese"), null);
-    assert.equal(replyLanguageMismatch("The answer is 42.", "English"), null);
     assert.equal(replyLanguageMismatch("全部完成。", "Chinese"), null);
-    // Japanese and Korean are not checked: a short Japanese answer may be all kanji.
-    assert.equal(replyLanguageMismatch("了解。", "Japanese"), null);
-    assert.equal(replyLanguageMismatch("All done.", "Korean"), null);
-    // An English sentence quoting a Chinese title that is not one of the user's items (a pull request's) is English.
-    assert.equal(replyLanguageMismatch("Review for PR #327 (修复登录超时) passed.", "English"), null);
-    assert.equal(replyLanguageMismatch("这个 PR 已经合入了，CI 也绿了。", "English"), "Chinese");
+    assert.equal(replyLanguageMismatch("ok", "Chinese"), null, "no words, no verdict");
+    // A Chinese answer that quotes a long English pull request title is Chinese.
+    assert.equal(replyLanguageMismatch("PR #327 feat(api): the assistant router answers sooner, in the user's language, and names items 已合入。", "Chinese"), null);
+    // A Chinese item title does not make an English answer Chinese.
+    assert.equal(replyLanguageMismatch("#6 修复登录超时 is done, and the PR is merged.", "Chinese", ["修复登录超时"]), "English");
+    // Never refused the other way: an English answer may quote a Chinese title of anything, a Japanese one may be all kanji.
+    for (const [text, lang] of [
+      ["这个 PR 已经合入了。", "English"], ["Review passed: 修复登录超时.", "English"], ["Review for PR #327 (修复登录超时) passed.", "English"],
+      ["了解。", "Japanese"], ["All done.", "Korean"],
+    ] as const) assert.equal(replyLanguageMismatch(text, lang), null, `${lang}: ${text}`);
   });
 });
 
@@ -235,7 +234,7 @@ describe("router quality, the prompt", () => {
       ["work_recall for how far an item got", /call work_recall\(item, "reports"\) for each item asked about, all in one step/],
       ["memory and channel tools", /the memory tools of the Memory section[\s\S]*channel_action, whether the user typed its command or said it in words/],
       ["a declined request in a line", /A request you will not carry out[^\n]*say so in one short line/],
-      ["every say in the reply language", /write every say in it, the last one too\. say refuses a message plainly in another language/],
+      ["every say in the reply language", /write every say in it, the last one too \(say refuses a reply to a Chinese message that has no Chinese in it\)/],
       ["no number without its title", /never by its number alone: say refuses "#6、#8" without the titles/],
     ];
     for (const [what, re] of rules) assert.match(system, re, what);

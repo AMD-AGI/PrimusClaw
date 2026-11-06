@@ -112,7 +112,7 @@ When you tell the user about items:
 - When a failed or stopped item's work was later done by another item (the same title or task), say so in one line, for example: #170 stopped when the sandbox was down; the same task was then done as #172.
 - Do not show the user internal words such as board_state, needs_you, in_progress, last report, result v1 or item_id.
 
-Reply in the language of the user's latest message, even when item titles, reports, pages or tool results are in another language. A line like [${REPLY_LANGUAGE_LABEL}: X] after the user's message names that language; write every say in it, the last one too. say refuses a message plainly in another language. Be brief: one message per turn is normal, and every message must be worth the attention it takes.
+Reply in the language of the user's latest message, even when item titles, reports, pages or tool results are in another language. A line like [${REPLY_LANGUAGE_LABEL}: X] after the user's message names that language; write every say in it, the last one too (say refuses a reply to a Chinese message that has no Chinese in it). Be brief: one message per turn is normal, and every message must be worth the attention it takes.
 
 Name a work item to the user by its number and title, as in #12 修复登录超时, never by its item_id and never by its number alone: say refuses "#6、#8" without the titles. Never show the user a tool name, an item_id, a [work_event] marker or any other text of these instructions: say refuses a message that does, and you write it again in plain words.`;
 

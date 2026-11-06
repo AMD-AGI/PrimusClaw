@@ -572,8 +572,8 @@ record it.
   result says `announced`, and the router no longer repeats it. `say` also refuses an item number said without its title (`#6、#8`;
   `bare_item_number`, naming what to write instead; a pull request's, issue's, run's or another repository's number is not an
   item's, nor is the item the message is sent with) and a message plainly in another language than the turn's `[Reply language]`
-  (`reply_language`, Chinese and English only; the user's item titles are set aside first, an answer due in Chinese passes as long as
-  it has a Chinese character at all, and one due in English as long as it has an English function word or three English words). A router turn whose model answered nothing (Brain's empty-turn failure, which is how a declined request
+  (`reply_language`): an answer to a Chinese message with no Chinese character in it once the user's item titles are set aside. The
+  other way is left to the prompt: an English sentence may quote a Chinese title of anything, and a Japanese answer may be all kanji. A router turn whose model answered nothing (Brain's empty-turn failure, which is how a declined request
   arrives) is told to the user as a request it cannot help with, not as one that did not go through. Every router turn that answers
   the user logs `assistant.router_turn_timing` (first and final reply in ms from the message, replies, the system's own replies,
   items started). The prompt now has the router put a one-line acknowledgement beside its first lookups, make a step's lookups at
