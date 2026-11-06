@@ -32,7 +32,7 @@ import {
   createSession, findConnector, findSession, issueCommand, listConnectors, sessionActivity, wakeConnector, type Row,
 } from "../remote-agents/store.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
-import { langOf, noteRemotePrompt, remoteEventMark, remoteWorkerSessionId, type RemoteLang } from "./remote-items.js";
+import { inRemoteSessionOrder, langOf, noteRemotePrompt, remoteEventMark, remoteWorkerSessionId, type RemoteLang } from "./remote-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
 
@@ -506,17 +506,22 @@ export async function executeSend(
     sessionId = String(made.session.session_id);
     fresh = true;
   }
-  const since = await remoteEventMark(sessionId);
-  const issued = await issueCommand({
-    owner: userId, client: "assistant", connectorId: plan.connector_id, agentId: plan.agent_id, sessionId, type: "prompt",
-    cmdId: `k:${cmdId}`, payload: parsed.value, auditDetail: REMOTE_COMMANDS.prompt.audit(parsed.value),
-    closesSession: false, commandsPerMinute: REMOTE_AGENT_LIMITS.commandsPerMinute,
+  const target = sessionId;
+  // Queued and noted in the session's order (`inRemoteSessionOrder`): a stop pressed meanwhile is counted before or after it, never between.
+  const issued = await inRemoteSessionOrder(target, async () => {
+    const since = await remoteEventMark(target);
+    const out = await issueCommand({
+      owner: userId, client: "assistant", connectorId: plan.connector_id, agentId: plan.agent_id, sessionId: target, type: "prompt",
+      cmdId: `k:${cmdId}`, payload: parsed.value, auditDetail: REMOTE_COMMANDS.prompt.audit(parsed.value),
+      closesSession: false, commandsPerMinute: REMOTE_AGENT_LIMITS.commandsPerMinute,
+    });
+    // The item the user is told the end of. A repeat (`duplicate`) found the first one's.
+    if (out.status === "queued") {
+      await noteRemotePrompt({ owner: userId, sessionId: target, connectorId: plan.connector_id, agentId: plan.agent_id, text, origin: "assistant", lang, since });
+    }
+    return out;
   });
   if (issued.status === "rate_limited") return { ok: false, error: "rate_limited", message: "too many instructions in the last minute: try again in a minute" };
-  // The item the user is told the end of. A repeat (`duplicate`) found the first one's.
-  if (issued.status === "queued") {
-    await noteRemotePrompt({ owner: userId, sessionId, connectorId: plan.connector_id, agentId: plan.agent_id, text, origin: "assistant", lang, since });
-  }
   wakeConnector(plan.connector_id);
   const row = (await db.query(
     "SELECT item_id, seq, title FROM claw_work_items WHERE worker_session_id = $1 AND user_id = $2", [remoteWorkerSessionId(sessionId), userId],

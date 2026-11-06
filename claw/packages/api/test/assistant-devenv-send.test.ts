@@ -28,7 +28,7 @@
  *       written: a first prompt's item, and a finished item reopened, both end with it; but the turn before it, ending as it was
  *       queued, never ends it
  *   F10 stop, then a new instruction at once: the end the cancel brings ends what was sent before it, never the new one, whether
- *       the stop was the item's button or the attached chat's
+ *       the stop was the item's button or the attached chat's; a prompt and a stop are queued and noted one at a time per session
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -490,6 +490,30 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_turns], ["in_progress", 1]);
     await events("alice", cid, sid, [chunk("c done"), end()]);
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "c done"]);
+  });
+
+  test("F11 a prompt waits while a stop is being queued and noted for the same session, never in between", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const sid = await chatSession("alice", cid);
+    // Another request holds the session's order (as a stop being queued and noted does) until released.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let held!: () => void;
+    const holding = new Promise<void>((r) => { held = r; });
+    const holder = items.inRemoteSessionOrder(sid, async () => { held(); await gate; });
+    await holding;
+    const sent = post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "after the stop" });
+    try {
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(await remoteItem(sid), undefined, "not noted while the session's order is held");
+      assert.deepEqual(await queued(cid), [], "not queued either");
+    } finally {
+      release();
+      await holder;
+    }
+    assert.equal((await sent).status, 202);
+    assert.equal((await remoteItem(sid)).params.open_turns, 1);
   });
 
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {

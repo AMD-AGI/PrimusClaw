@@ -37,7 +37,7 @@ import { redactPublicJson } from "../events/redaction.js";
 import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
-import { noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
+import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
 const logger = pino({ name: "remote-agents" });
 
@@ -428,28 +428,34 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const payload = type === "decision"
       ? { ...parsed.value, by: owner, client: clientLabel(req) }
       : parsed.value;
-    const since = type === "prompt" || type === "cancel" ? await remoteEventMark(sessionId).catch(() => undefined) : undefined;
-    const out = await store.issueCommand({
-      owner, client: clientLabel(req), connectorId: session.connector_id, agentId: session.agent_id, sessionId,
-      type, cmdId, payload, auditDetail: spec.audit(parsed.value), closesSession: spec.closesSession, commandsPerMinute,
-    });
+    const send = async () => {
+      const since = type === "prompt" || type === "cancel" ? await remoteEventMark(sessionId).catch(() => undefined) : undefined;
+      const queued = await store.issueCommand({
+        owner, client: clientLabel(req), connectorId: session.connector_id, agentId: session.agent_id, sessionId,
+        type, cmdId, payload, auditDetail: spec.audit(parsed.value), closesSession: spec.closesSession, commandsPerMinute,
+      });
+      if (queued.status !== "queued") return queued;
+      // A stop pressed in the attached chat (queued now, not a retry): its turn_end ends what was sent before it, not a prompt after it.
+      if (type === "cancel" && since !== undefined) {
+        await noteRemoteCancel(owner, sessionId, since).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
+      }
+      // A prompt typed into an attached chat is an item the assistant can name ("did it finish?"), told to nobody: the chat shows it.
+      if (type === "prompt") {
+        await noteRemotePrompt({
+          owner, sessionId, connectorId: session.connector_id, agentId: session.agent_id, text: (parsed.value as { text: string }).text, origin: "chat",
+          since,
+        }).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
+      }
+      return queued;
+    };
+    // A prompt and a stop are queued and noted one at a time per session, so the item counts them in the order the connector runs them.
+    const out = type === "prompt" || type === "cancel" ? await inRemoteSessionOrder(sessionId, send) : await send();
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");
     if (out.status === "duplicate") {
       const same = out.row.type === type && out.row.session_id === sessionId
         && (type !== "decision" || out.row.payload?.option_id === (parsed.value as { option_id: string }).option_id);
       if (!same) return fail(reply, 409, type === "decision" ? "already_decided" : "idempotency_key_reused");
       return reply.send({ ok: true, data: { cmd_id: cmdId, duplicate: true } });
-    }
-    // A stop pressed in the attached chat (queued now, not a retry): its turn_end ends what was sent before it, not a prompt after it.
-    if (type === "cancel" && since !== undefined) {
-      await noteRemoteCancel(owner, sessionId, since).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
-    }
-    // A prompt typed into an attached chat is an item the assistant can name ("did it finish?"), told to nobody: the chat shows it.
-    if (type === "prompt") {
-      await noteRemotePrompt({
-        owner, sessionId, connectorId: session.connector_id, agentId: session.agent_id, text: (parsed.value as { text: string }).text, origin: "chat",
-        since,
-      }).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
     }
     waker.wake(`c:${session.connector_id}`);
     return reply.status(202).send({

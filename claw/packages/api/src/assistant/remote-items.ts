@@ -141,6 +141,19 @@ export interface NotePrompt {
 }
 
 /**
+ * Queue a prompt or a cancel for a remote session and note it on its item, one at a time per session (a transaction-scoped advisory
+ * lock, across API replicas): the item then sees prompts and cancels in the order they were queued, which is the order the
+ * connector runs them, never a prompt noted between a cancel being queued and that cancel being noted.
+ */
+export async function inRemoteSessionOrder<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
+  if (!remoteItemsOn()) return run();
+  return inTransaction(async (q) => {
+    await q("SELECT pg_advisory_xact_lock(hashtext($1))", [`claw-remote-item:${sessionId}`]);
+    return run();
+  });
+}
+
+/**
  * A cancel was just queued for one of the owner's remote sessions (`mark`: its newest event before it was queued; a retry that
  * queued nothing notes nothing): the turn_end it brings ends what was open before it, and a prompt sent after it (stop, then a new
  * instruction at once) is not ended by it. Not noted when that turn_end has already been posted (it ended what was open then).
@@ -488,15 +501,18 @@ export async function cancelRemoteItem(userId: string, params: unknown): Promise
   try {
     const s = await findSession(userId, sessionId);
     if (!s || s.status !== "active") return;
-    const mark = await remoteEventMark(sessionId);
-    const out = await issueCommand({
-      owner: userId, client: "assistant", connectorId: s.connector_id, agentId: s.agent_id, sessionId, type: "cancel",
-      cmdId: randomUUID(), payload: {}, auditDetail: REMOTE_COMMANDS.cancel.audit({}), closesSession: false,
-      commandsPerMinute: REMOTE_AGENT_LIMITS.commandsPerMinute,
+    const queued = await inRemoteSessionOrder(sessionId, async () => {
+      const mark = await remoteEventMark(sessionId);
+      const out = await issueCommand({
+        owner: userId, client: "assistant", connectorId: s.connector_id, agentId: s.agent_id, sessionId, type: "cancel",
+        cmdId: randomUUID(), payload: {}, auditDetail: REMOTE_COMMANDS.cancel.audit({}), closesSession: false,
+        commandsPerMinute: REMOTE_AGENT_LIMITS.commandsPerMinute,
+      });
+      if (out.status !== "queued") return false;
+      await noteRemoteCancel(userId, sessionId, mark);
+      return true;
     });
-    if (out.status !== "queued") return;
-    await noteRemoteCancel(userId, sessionId, mark);
-    wakeConnector(s.connector_id);
+    if (queued) wakeConnector(s.connector_id);
   } catch (err) {
     logger.warn({ err, sessionId }, "assistant.remote_cancel_failed");
   }
