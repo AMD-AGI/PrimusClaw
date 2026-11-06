@@ -19,9 +19,9 @@
  *   A2 llm, script, app and an omitted mode are not refused
  *   A3 a mode this Brain has never heard of is refused, the engine untouched
  *   A4 a task whose result outbox was already cleared (NATS returns the delete
- *      marker, an empty value) is not replayed: a finish-only dispatch goes on
- *      to finish the run, any other delivery is acked without running again
- *   A5 an outbox entry that does not parse is dropped and the delivery acked,
+ *      marker, an empty value) is not replayed: the delivery runs as a fresh
+ *      execution, so a finish-only dispatch finishes its run
+ *   A5 an outbox entry that does not parse is dropped and the delivery runs,
  *      instead of being retried until it is poisoned
  */
 import test from "node:test";
@@ -390,33 +390,16 @@ test("A4 finish-only with a cleared outbox: the run is finished, nothing is repl
   }
 });
 
-test("A4b any other delivery with a cleared outbox is acked once and does not run the task again", async () => {
-  const runner = fakeRunner(async () => { throw new Error("must not run"); });
-  const outbox = { entry: DELETE_MARKER, deleted: [] as string[] };
+test("A5 an outbox entry that does not parse is dropped and the delivery runs, not retried until poisoned", async () => {
+  const runner = fakeRunner(async () => ({ kind: "ended", outcome: { success: false, reason: "app run ended: cancelled" } }));
+  const outbox = { entry: { key: "task-result.t-app", value: new TextEncoder().encode("{\"finalText\": "), operation: "PUT" }, deleted: [] as string[] };
   const h = harness(runner, outbox);
-  await runApp(h);
-  assert.equal(runner.runs, 0, "its callback was delivered: the run is not started again");
-  assert.equal(h.created(), 0);
-  assert.equal(h.engineCalls(), 0);
-  assert.equal(h.done.length, 0, "nothing is reported twice");
-  assert.equal(h.acked(), 1, "acked, so it is not redelivered");
+  const abortCtrl = new AbortController();
+  activeAbort.set("lock.s-app", abortCtrl);
+  await runHandleTask(h.msg, { ...request("app"), app_finish_only: true } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", abortCtrl);
+  assert.deepEqual(outbox.deleted, ["task-result.t-app"], "the unreadable entry is removed");
+  assert.equal(runner.runs, 1, "the finish runs instead of a failing replay");
+  assert.equal(h.finishDone(), 1);
+  assert.equal(h.acked(), 1);
   assert.equal(h.released(), 1);
-  assert.equal(activeAbort.has("lock.s-app"), false);
-});
-
-test("A5 an outbox entry that does not parse is dropped and acked, not retried until poisoned", async () => {
-  for (const finishOnlyFlag of [false, true]) {
-    const runner = fakeRunner(async () => { throw new Error("must not run"); });
-    const outbox = { entry: { key: "task-result.t-app", value: new TextEncoder().encode("{\"finalText\": "), operation: "PUT" }, deleted: [] as string[] };
-    const h = harness(runner, outbox);
-    const abortCtrl = new AbortController();
-    activeAbort.set("lock.s-app", abortCtrl);
-    await runHandleTask(h.msg, { ...request("app"), app_finish_only: finishOnlyFlag } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", abortCtrl);
-    assert.equal(h.acked(), 1, `finish-only=${finishOnlyFlag}: acked rather than nak'd for another failing replay`);
-    assert.deepEqual(outbox.deleted, ["task-result.t-app"], "the unreadable entry is removed, so the next delivery runs normally");
-    assert.equal(h.done.length, 0);
-    assert.equal(runner.runs, 0);
-    assert.equal(h.released(), 1);
-    assert.equal(activeAbort.has("lock.s-app"), false);
-  }
 });

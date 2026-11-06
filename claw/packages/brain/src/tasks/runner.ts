@@ -880,36 +880,27 @@ async function replayPendingCallback(
 
   // A cleared outbox is no pending callback. NATS KV answers a key deleted by
   // ackAndClearCallback with its delete marker (operation DEL/PURGE, empty
-  // value) rather than null, so a later delivery of the same task -- an app
-  // run's finish handed to a new Brain, or a redelivery whose ack was lost --
-  // finds the marker. Its callback was delivered: an app finish goes on to
-  // finish the run, anything else is acked without running the task again.
-  const cleared = entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0;
-  if (cleared) {
-    if (request.mode === "app" && request.app_finish_only === true) return false;
-    logger.info({ taskId: request.task_id, operation: entry.operation }, "task.agent_done_already_delivered");
-    msg.ack();
-    activeAbort.delete(lockKey);
-    await fx().releaseTaskLock(lockKey).catch(() => {});
-    return true;
-  }
+  // value) rather than null, and the marker stays until the bucket's TTL. It
+  // says an earlier execution of this task_id delivered its callback, not that
+  // this delivery's did: a script task that returned wait_external is put back
+  // to queued and published again under the same task_id to run from step 0,
+  // and an app run's finish is handed to a new Brain the same way. Either is a
+  // fresh execution, exactly as when the key was never written.
+  if (entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return false;
 
   let stored: ExecuteResult & { run_time?: RunTimeReport };
   try {
     stored = JSON.parse(sc.decode(entry.value)) as ExecuteResult & { run_time?: RunTimeReport };
   } catch (err) {
-    // deliverAgentDone writes only JSON, so this entry was never a result it
-    // can replay. Retrying cannot make it parse: drop it and ack, so the
-    // delivery ends here instead of failing until it is poisoned, and the next
-    // delivery of the task (an app run's finish) runs normally.
+    // deliverAgentDone writes only JSON, so this entry holds no result that can
+    // be replayed, and retrying cannot make it parse. Drop it and run this
+    // delivery as if nothing was pending, rather than failing every delivery
+    // until the message is poisoned.
     logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_unreadable");
     await kvCkpt.delete(key).catch((e) => {
       logger.warn({ err: e, taskId: request.task_id }, "task.agent_done_outbox_cleanup_failed");
     });
-    msg.ack();
-    activeAbort.delete(lockKey);
-    await fx().releaseTaskLock(lockKey).catch(() => {});
-    return true;
+    return false;
   }
 
   try {
