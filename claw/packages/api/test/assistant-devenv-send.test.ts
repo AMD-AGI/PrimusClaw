@@ -647,6 +647,16 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
     assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v3");
+    // What operators and release notes say Claw may run on a user's machine is what the code does: a card, never from the turn.
+    const { readFileSync } = await import("node:fs");
+    const doc = readFileSync(new URL("../../../docs/remote-agents.md", import.meta.url), "utf8");
+    const notes = readFileSync(new URL("../../../../CHANGELOG.md", import.meta.url), "utf8");
+    for (const text of [doc, notes]) {
+      assert.doesNotMatch(text, /runs at once/, "devenv_send never runs from the turn");
+      assert.match(text, /cards_off/);
+    }
+    assert.match(notes, new RegExp(`devenv_send[\\s\\S]*Router prompt ${prompts.ROUTER_DEVENV_PROMPT_VERSION}\\.`));
+    assert.match(doc, /cmdKey\("card", confirmationId\)/);
     assert.equal(items.remoteWorkerSessionId("x"), "remote:x");
   });
 });
