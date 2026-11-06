@@ -831,6 +831,9 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A work item's worker whose item waits for a person (`needs_you`) or is `done` no longer keeps its sandbox for background work: past
+  `WAITING_ITEM_SANDBOX_RELEASE_SECONDS` (API, default 900) of quiet with nothing queued, the orphan sweep stops it, and the next turn
+  starts a fresh one. A review session's leftover test Postgres had held global-cpu sandboxes for up to two hours behind held merges.
 - The GitHub list reads (`issue_search`, `pr_list`, `issue_list`, `repo_list`, `code_search`) answer the whole list a question
   asks for: `{ total_count, shown, complete, next_page?, items }`, pages of 50 by default (up to 100), and an answer of at most
   `GITHUB_LIST_MAX_CHARS` that Brain keeps whole (any other result is still cut to its head and tail at 6000 characters, which

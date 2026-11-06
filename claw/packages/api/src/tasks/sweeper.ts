@@ -34,7 +34,7 @@ import {
   type AttemptRecord,
 } from "@claw/protocol";
 import {
-  envBool, envInt, LEASE_LOST_GRACE_SEC, RUN_FAT_PREPARING_RECONCILE, TASK_SWEEPER_TICK_MS,
+  CLAW_ASSISTANT_ENABLED, envBool, envInt, LEASE_LOST_GRACE_SEC, RUN_FAT_PREPARING_RECONCILE, TASK_SWEEPER_TICK_MS,
 } from "../config.js";
 import { nc, taskDeliverySettlement } from "../infra/nats.js";
 import { LEADER_LOCK_IDS, type LeaderLease, withLeaderLock } from "../infra/leader-lock.js";
@@ -79,6 +79,64 @@ const SESSION_STUCK_TIMEOUT_SEC = envInt(
   BRAIN_TASK_TIMEOUT_SEC,
   { min: 1 },
 );
+/**
+ * How long background work may keep the sandbox of a work item's worker once
+ * the item no longer has its worker doing anything: it waits for a person
+ * (`needs_you`) or it is over (`done`).
+ *
+ * Background shells hold a parked sandbox for as long as they run, which is
+ * right for a chat whose user started a job and will come back to it. A work
+ * item's worker is different: once its turn ended with a question for a person,
+ * or the item closed, nothing in the session reads what those shells produce,
+ * and the person may answer hours later or never. A review session that started
+ * a Postgres for its tests and left it running held a global-cpu sandbox for
+ * two hours this way (2026-11-06, Wei Lei's held merges). Past this quiet time
+ * the sandbox is stopped like any other orphan; the item, the session and its
+ * history stay, and the next turn (the person's answer) starts a fresh sandbox.
+ */
+const WAITING_ITEM_SANDBOX_RELEASE_SEC = envInt(
+  "WAITING_ITEM_SANDBOX_RELEASE_SECONDS", 15 * 60, { min: 60 },
+);
+
+/**
+ * The work item `sessionId` is the worker of (one at most: the column is
+ * unique), when it waits for a person or is over, nothing is queued for the
+ * session, and the session's last run -- or the item's last change, whichever
+ * is later -- is at least WAITING_ITEM_SANDBOX_RELEASE_SEC ago. Null otherwise,
+ * and null on a failed read: keeping the sandbox one more tick is what the
+ * sweep did before this existed.
+ */
+export async function waitingItemPastRelease(
+  sessionId: string,
+  releaseSec: number = WAITING_ITEM_SANDBOX_RELEASE_SEC,
+): Promise<{ itemId: string; boardState: string; quietSec: number } | null> {
+  // Work items exist only with the assistant on (assistant/schema.ts).
+  if (!sessionId || !CLAW_ASSISTANT_ENABLED) return null;
+  try {
+    const r = await db.query(
+      `SELECT w.item_id, w.board_state,
+              EXTRACT(EPOCH FROM NOW() - GREATEST(
+                w.updated_at,
+                (SELECT MAX(COALESCE(t.completed_at, t.started_at, t.created_at)) FROM claw_tasks t WHERE t.session_id = $1)
+              ))::float8 AS quiet_sec,
+              EXISTS (SELECT 1 FROM claw_pending_messages p WHERE p.session_id = $1) AS queued
+         FROM claw_work_items w
+        WHERE w.worker_session_id = $1`,
+      [sessionId],
+    );
+    const row = r.rows[0] as
+      | { item_id: string; board_state: string; quiet_sec: number | string | null; queued: boolean }
+      | undefined;
+    if (!row || (row.board_state !== "needs_you" && row.board_state !== "done") || row.queued) return null;
+    const quietSec = Number(row.quiet_sec);
+    if (row.quiet_sec === null || !Number.isFinite(quietSec) || quietSec < releaseSec) return null;
+    return { itemId: row.item_id, boardState: row.board_state, quietSec: Math.round(quietSec) };
+  } catch (err) {
+    logger.warn({ sessionId, err: (err as Error)?.message ?? err }, "sweeper.waiting_item_read_failed");
+    return null;
+  }
+}
+
 /**
  * How long the orphan sweep will wait for a background-work verdict that has
  * not been published yet, before it stops waiting for one.
@@ -2799,12 +2857,25 @@ export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
         }
       }
       if (bg.state === "running") {
+        // A work item's worker that waits for a person, or whose item is over,
+        // does not keep its sandbox for background work past the release time
+        // (WAITING_ITEM_SANDBOX_RELEASE_SEC): it is stopped below like any orphan.
+        const waiting = await waitingItemPastRelease(sessionId);
+        if (!waiting) {
+          logger.info(
+            { dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running, measuredAt: bg.at },
+            "sweeper.orphan_handles_background_work",
+          );
+          deferred++;
+          continue;
+        }
         logger.info(
-          { dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running, measuredAt: bg.at },
-          "sweeper.orphan_handles_background_work",
+          {
+            dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running,
+            itemId: waiting.itemId, boardState: waiting.boardState, quietSec: waiting.quietSec,
+          },
+          "sweeper.orphan_handles_waiting_item_released",
         );
-        deferred++;
-        continue;
       }
       // A finished turn leaves its sandbox parked for the session's next message
       // (Brain's SANDBOX_IDLE_REUSE_SECONDS). The DAG row being terminal and
