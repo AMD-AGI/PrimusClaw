@@ -65,6 +65,21 @@ export async function releaseHeldSays(q: Querier, messageId: string): Promise<Ar
 }
 
 /**
+ * Whether the system's start notice of an item ("已开始：#N 标题。…" / "Started #N title. …", `announceStarted` in `tools.ts`) has been
+ * told since `since` (the turn began), whether or not any channel got it: what refuses the turn's unsaid final text after it, which
+ * would repeat it ("任务已建好…", found by the release gate on 2026-11-06). Read from the stored messages only, so it holds with
+ * notifications off and for a user no channel is subscribed for.
+ */
+export async function turnToldStart(q: Querier, userId: string, since: Date | string): Promise<boolean> {
+  return (await q(
+    `SELECT 1 FROM claw_assistant_says
+      WHERE user_id = $1 AND fallback AND item_id IS NOT NULL AND created_at >= $2
+        AND (text LIKE '已开始：#%' OR text LIKE 'Started #%') LIMIT 1`,
+    [userId, since],
+  )).rows.length > 0;
+}
+
+/**
  * The system's start notice of an item told in the turn that began at `since` (`announceStarted` in `tools.ts`: "已开始：#N 标题。…" /
  * "Started #N title. …", a system notice about the item), by its say id; null when there is none. A router say after it in the turn
  * adds to that message (`AssistantSayPayload.amends`) instead of being a second one: the gate found a second message ("任务已建好…")

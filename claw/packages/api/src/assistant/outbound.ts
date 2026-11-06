@@ -19,7 +19,7 @@ import pino from "pino";
 import { CLAW_ASSISTANT_SAY_MAX_PER_HOUR, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { publishEvent } from "../events/store.js";
-import { HOLD_SECONDS, heldStatus, turnAnnouncedStart } from "./say-hold.js";
+import { HOLD_SECONDS, heldStatus, turnAnnouncedStart, turnToldStart } from "./say-hold.js";
 import { db, FAILOVER_RETRY_DELAY_MS, inTransaction, isFailoverError, neverCommitted, type Querier } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import {
@@ -487,9 +487,13 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
       if (await turnHandedOffReview(q, input.userId, input.turnMessageId)) {
         throw new SayRefused("handed_off", HANDED_OFF_REFUSAL);
       }
-      const notice = input.turnBegan && input.turnMessageId
+      // The turn's unsaid final text after a start notice is refused whether or not a channel got the notice (`turnToldStart`); a say
+      // of the router's is added to the notice, matched by the turn on its delivery (`turnAnnouncedStart`), or is a message of its own.
+      if (!input.amendNotice && input.turnBegan && await turnToldStart(q, input.userId, input.turnBegan)) {
+        throw new SayRefused("already_announced", ALREADY_ANNOUNCED_REFUSAL);
+      }
+      const notice = input.amendNotice && input.turnBegan && input.turnMessageId
         ? await turnAnnouncedStart(q, input.userId, input.turnBegan, input.turnMessageId) : null;
-      if (notice && !input.amendNotice) throw new SayRefused("already_announced", ALREADY_ANNOUNCED_REFUSAL);
       // One say at a time per user: the cap counts stored rows, and without this a burst
       // all count the same number and all insert.
       await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);

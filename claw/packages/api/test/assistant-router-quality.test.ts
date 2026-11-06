@@ -165,6 +165,13 @@ describe("router quality, through the tools", { skip }, () => {
     assert.equal(added.ok, true, "stored, not refused");
     const event = w.events.find((e) => e.type === "AssistantSay" && e.say_id === added.say_id);
     assert.ok(event && event.amends === undefined);
+    // The turn's unsaid final text is still refused though no channel got the notice (Wei Lei on #344): it would repeat it.
+    await w.closeRun(turn.task_id);
+    const end = { sessionId: alice.routerSid, runIds: [turn.task_id], messageId: turn.mid, failed: false, interrupted: false };
+    const before = (await says()).length;
+    await w.q("DELETE FROM claw_assistant_says WHERE text = '顺便：会按版本分组。'");   // (a turn that said nothing of its own)
+    assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, finalText: "任务已建好。" }, w.sayDeps), "skipped");
+    assert.equal((await says()).length, before - 1, "nothing stored beside the notice");
   });
 
   test("Q5 a turn whose model answered nothing is told as declined; any other failure as not gone through", async () => {

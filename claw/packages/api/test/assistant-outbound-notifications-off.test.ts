@@ -50,6 +50,14 @@ describe("assistant outbound without notifications", { skip }, () => {
       { publishSessionEvent: async () => {}, kick: async () => {} },
     );
     assert.equal(out.subscribers, 0, "stored as a message of its own");
+    // With a start notice told in the turn, the turn's unsaid final text (no amendNotice) is refused all the same.
+    await h.app.db.db.query(
+      `INSERT INTO claw_assistant_says (say_id, user_id, item_id, text, fallback) VALUES (gen_random_uuid(), 'u1', 'kwi_x', '已开始：#1 x。', TRUE)`,
+    );
+    await assert.rejects(outbound.recordAssistantSay(
+      { userId: "u1", sessionId: "assistant-u1", text: "任务已建好。", turnMessageId: "m1", turnBegan: new Date(0) },
+      { publishSessionEvent: async () => {}, kick: async () => {} },
+    ), (err: any) => err.code === "already_announced");
   });
 
   test("the delivery hook is registered only behind both the notifications and the assistant flag", () => {
