@@ -43,8 +43,8 @@
  *     not name a workspace for -- an assistant item, a Teams message, a worker --
  *     so `available: true` above (which any Sandbox workspace earns, the console
  *     names one on every turn) does not say those turns can have one. `available`
- *     here is a Ready cluster AND the CPU workspace among the caller's Sandbox
- *     workspaces; when it is not among them, `reason` is `no_access`: SaFE lists
+ *     here is the CPU workspace among the caller's Sandbox workspaces AND its
+ *     cluster Ready (any cluster, when SaFE names none for it); when it is not among them, `reason` is `no_access`: SaFE lists
  *     only the workspaces an account may use, and creating a workload there is
  *     refused for the same account.
  *   - `workspaces[].admin` -- the caller manages that workspace. System-wide admin
@@ -193,9 +193,14 @@ export function buildMe(
   }
   const cpuId = cpuWorkspaceId.trim();
   if (cpuId) {
-    const hasCpu = sandboxWorkspaces.some((w) => w.id === cpuId);
-    sandbox.cpu = { workspaceId: cpuId, available: anyReadyCluster && hasCpu };
-    if (!hasCpu) sandbox.cpu.reason = "no_access";
+    const cpu = sandboxWorkspaces.find((w) => w.id === cpuId);
+    // The workspace's own cluster when SaFE names it: another cluster being Ready
+    // does not start a sandbox in this one.
+    const clusterReady = cpu?.clusterId
+      ? clusterItems.some((c) => c.clusterId === cpu.clusterId && c.phase === READY_PHASE)
+      : anyReadyCluster;
+    sandbox.cpu = { workspaceId: cpuId, available: cpu !== undefined && clusterReady };
+    if (!cpu) sandbox.cpu.reason = "no_access";
   }
   return { ...identityOf(user), sandbox, workspaces };
 }

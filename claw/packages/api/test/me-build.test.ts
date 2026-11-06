@@ -202,6 +202,11 @@ test("sandbox.cpu says whether the caller can have a sandbox in the deployment's
   for (const [name, workspaces, clusters, cpu] of rows) {
     assert.deepEqual(buildMe(USER, workspaces, clusters, NONE_MANAGED, "global-cpu", "global-cpu")?.sandbox.cpu, cpu, name);
   }
+  // The CPU workspace's own cluster decides, not whichever cluster is Ready.
+  const onGlobal = list(ws("global-cpu", { scopes: ["Sandbox"], clusterId: "global" }));
+  const crusoeReadyOnly = list({ clusterId: "crusoe", phase: "Ready" }, { clusterId: "global", phase: "NotReady" });
+  assert.equal(buildMe(USER, onGlobal, crusoeReadyOnly, NONE_MANAGED, "global-cpu", "global-cpu")?.sandbox.cpu?.available, false);
+  assert.equal(buildMe(USER, onGlobal, list({ clusterId: "global", phase: "Ready" }), NONE_MANAGED, "global-cpu", "global-cpu")?.sandbox.cpu?.available, true);
   const notMember = buildMe(USER, vkOnly, READY, NONE_MANAGED, "global-cpu", "global-cpu");
   assert.equal(notMember?.sandbox.available, true, "the console's own answer is unchanged");
   assert.equal(notMember?.sandbox.defaultWorkspaceId, "crusoe-spur-vk");
