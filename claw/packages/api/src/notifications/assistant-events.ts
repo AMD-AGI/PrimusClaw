@@ -63,11 +63,12 @@ export interface WorkItemNeedsYouPayload extends AssistantEventBase {
 /**
  * A review the person asked of someone else, handed to the channel that carried their message (`review_start` with a reviewer, when
  * that message declared `channel_context.handoffs: ["review_for_other"]`). It runs on the reviewer's own credentials, which only that
- * channel holds, so the channel starts it itself (`POST /v1/assistant/reviews` with the reviewer's token and key) and tells the person
- * how it went. Every field is the router's call as Claw checked it: the reviewer is someone the channel listed with this message, each
- * pull request is one the person's message names. `requester_note` is the person's own message, to quote to the reviewer as untrusted.
- * `handoff_id` names the record Claw kept of it: the channel echoes it as `handoff_id` in that request, which then starts once, merges
- * only if `merge` is true, and even then only once the reviewer confirms that very merge (Claw reads the record, not the request).
+ * channel holds, so the channel starts it itself (`POST /v1/assistant/reviews` with the reviewer's token and key) and answers the
+ * person's message about it, in one message (the router says nothing about it). Every field is the router's call as Claw checked it: the
+ * reviewer is someone the channel listed with this message, each pull request is one the person's message names. `requester_note` is the
+ * person's own message, to quote to the reviewer as untrusted. `handoff_id` names the record Claw kept of it: the channel echoes it as
+ * `handoff_id` in that request, which then starts once and merges only if `merge` is true (Claw reads the record, not the request); how it
+ * merges is the reviewer's own review setting's, as for a review asked of them in the chat, and the route's answer says so per item.
  */
 export interface AssistantReviewHandoff {
   handoff_id: string;
