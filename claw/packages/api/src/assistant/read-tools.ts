@@ -84,6 +84,11 @@ export interface RouterLookups {
   githubTools: readonly string[];
   /** Every lookup tool as `tools_allowlist` entries: the turn's `read_taint` sources as well. */
   allowlist: string[];
+  /**
+   * The lookups whose failures are in words no third party writes (`read_taint.clean_failures`): the GitHub server's (its own, or
+   * GitHub's API's) and Brain's web tools'. Not the plugin's servers: what they put in an error is theirs to choose.
+   */
+  cleanFailures: string[];
 }
 
 /** A router turn's lookups: the plugin's read tools, the user's GitHub, and the web. */
@@ -91,10 +96,8 @@ export async function routerLookups(userId: string, sessionId: string): Promise<
   const plugin = await routerReadTools(userId);
   const githubServers = await githubMcpServers(sessionId);
   const githubTools = Object.hasOwn(githubServers, GITHUB_MCP_SERVER) ? ROUTER_GITHUB_READ_TOOLS : [];
-  return {
-    plugin, githubServers, githubTools,
-    allowlist: [...(plugin?.allowlist ?? []), ...githubTools.map((t) => `mcp__${GITHUB_MCP_SERVER}__${t}`), ...ROUTER_WEB_TOOLS],
-  };
+  const cleanFailures = [...githubTools.map((t) => `mcp__${GITHUB_MCP_SERVER}__${t}`), ...ROUTER_WEB_TOOLS];
+  return { plugin, githubServers, githubTools, allowlist: [...(plugin?.allowlist ?? []), ...cleanFailures], cleanFailures };
 }
 
 export interface RouterReadTools {

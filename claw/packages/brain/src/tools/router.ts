@@ -416,7 +416,7 @@ export class ToolRouter {
     if (!taint) return this.routeAllowed(name, input, signal, outcome, ctx);
     const tainted = taint.refusal(name);
     if (tainted) return refuse(outcome, tainted);
-    // Whether the call failed decides whether it read anything (`ReadTaint.ran`), so the bit is read here even when the caller
+    // Whether the call failed can decide whether it read anything (`ReadTaint.ran`), so the bit is read here even when the caller
     // passed no outcome. A call that threw failed.
     const answered: RouteOutcome = outcome ?? { isError: false };
     let failed = true;

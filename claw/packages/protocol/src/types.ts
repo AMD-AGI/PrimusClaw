@@ -402,9 +402,11 @@ export interface ExecuteRequest {
    * `sources` or `allow_after` may be called for the rest of the run; any other is refused by Brain before it is run. Entries are
    * written like `tools_allowlist` (an exact name, or a prefix ending in `*`). The API sets it on an assistant's router turn that has
    * read-only tools: after it has read such a result, the turn no longer acts for the user (no review, setting or memory write).
+   * `clean_failures`: the sources whose failures are said in words no third party writes (Claw's own, GitHub's API, a search
+   * backend's): a call of one of these that failed read nothing and does not mark the run. A failure of any other source marks it.
    * Absent: no such rule.
    */
-  read_taint?: { sources: string[]; allow_after: string[] };
+  read_taint?: { sources: string[]; allow_after: string[]; clean_failures?: string[] };
 
   // ── Legacy chat fields (Phase 4 removes; do not use in new task code) ─
   /** @deprecated Use `sandbox_spec.image`. Kept for legacy chat NATS path. */

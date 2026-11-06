@@ -108,6 +108,8 @@ describe("assistant router lookups", { skip }, () => {
     assert.deepEqual(task.read_taint, {
       sources: task.tools_allowlist.filter((p: string) => p !== "mcp__assistant__*"),
       allow_after: ["say", "work_recall", "memory_recall"].map((t) => `mcp__assistant__${t}`),
+      // A failed GitHub or web lookup read nothing: the turn may still start the work.
+      clean_failures: [...ROUTER_GITHUB_READ_TOOLS.map((t) => `mcp__github__${t}`), "web_search", "web_fetch"],
     });
     for (const t of ROUTER_GITHUB_READ_TOOLS) assert.ok(task.read_taint.sources.includes(`mcp__github__${t}`), t);
     assert.ok(task.read_taint.sources.includes("web_search") && task.read_taint.sources.includes("web_fetch"));
@@ -127,8 +129,8 @@ describe("assistant router lookups", { skip }, () => {
     assert.match(system, /- The web: web_search for current facts and news, web_fetch to read one page/);
     assert.match(system, /call them now, in this turn, and say the answer with the numbers/);
     assert.match(system, /never ask whether to hand it to a worker first/);
-    assert.match(system, /If a lookup fails \(an error, not an empty answer\), call work_create in the same turn/);
-    assert.match(system, /a lookup that failed does not count/);
+    assert.match(system, /If a GitHub or web lookup fails \(an error, not an empty answer\), call work_create in the same turn/);
+    assert.match(system, /a GitHub or web lookup that failed does not count; a failed lookup of the servers above does/);
   });
 
   describe("LK3 through the API's own GitHub route", () => {
@@ -184,6 +186,7 @@ describe("assistant router lookups", { skip }, () => {
     assert.ok(!task.tools_allowlist.some((p: string) => p.startsWith("mcp__github__")));
     assert.deepEqual(task.tools_allowlist, ["mcp__assistant__*", "web_search", "web_fetch"]);
     assert.deepEqual(task.read_taint.sources, ["web_search", "web_fetch"]);
+    assert.deepEqual(task.read_taint.clean_failures, ["web_search", "web_fetch"]);
     assert.match(task.system_append, /- GitHub: no GitHub tools in this conversation/);
     assert.ok(!task.system_append.includes("mcp__github__issue_search"));
   });

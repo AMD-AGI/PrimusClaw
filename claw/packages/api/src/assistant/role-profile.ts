@@ -239,9 +239,11 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       task.plugin_id = read.pluginId;
       task.plugin_tools = read.pluginTools;
     }
-    // Once it has read one of their results, the turn no longer acts for the person: Brain refuses the acting tools. A lookup
-    // that failed read nothing, and leaves the turn free to start the work instead.
-    task.read_taint = { sources: lookups.allowlist, allow_after: AFTER_READ_TOOLS.map((t) => `${TOOL_NAME_PREFIX}${t}`) };
+    // Once it has read one of their results, the turn no longer acts for the person: Brain refuses the acting tools. A GitHub or
+    // web lookup that failed read nothing, and leaves the turn free to start the work instead.
+    task.read_taint = {
+      sources: lookups.allowlist, allow_after: AFTER_READ_TOOLS.map((t) => `${TOOL_NAME_PREFIX}${t}`), clean_failures: lookups.cleanFailures,
+    };
     // Neither the deployment's default MCP servers nor its default skills: the hint that lists them would follow the user's message.
     task.skip_platform_defaults = true;
     // The system prompt is the same on every turn, so it and the history after it come from the prompt cache. What changes

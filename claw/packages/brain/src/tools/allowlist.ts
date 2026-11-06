@@ -78,10 +78,11 @@ export function parseToolAllowlist(raw: unknown): ToolAllowlist | null {
  * `refusal(name)` before it runs: null lets it through, a text refuses it. Every call it let through reports `ran(name, failed)` once
  * it has returned, before its result reaches the model.
  *
- * A call matching `sources` that answered marks the run: from then on only `allow_after` runs. While a source is still running
- * the run counts as marked, so the only call that can pass beside a read is one decided before it. A source that failed (the
- * tool's own error bit, or a call that threw) read nothing anyone wrote, so it marks nothing: the turn can still start the work the
- * lookup could not do.
+ * A call matching `sources` marks the run once it has returned: from then on only `allow_after` runs. While a source is still
+ * running the run counts as marked, so the only call that can pass beside a read is one decided before it. A source matching
+ * `clean_failures` that failed (the tool's own error bit, or a call that threw) read nothing anyone else wrote, so it marks nothing:
+ * the turn can still start the work the lookup could not do. Any other source's failure marks the run like an answer: its text
+ * is the server's to choose, and a server that echoes what someone wrote into an error must not lift the rule.
  */
 export interface ReadTaint {
   refusal(toolName: string): string | null;
@@ -90,11 +91,12 @@ export interface ReadTaint {
 
 export function parseReadTaint(raw: unknown): ReadTaint | null {
   if (!raw || typeof raw !== "object") return null;
-  const r = raw as { sources?: unknown; allow_after?: unknown };
+  const r = raw as { sources?: unknown; allow_after?: unknown; clean_failures?: unknown };
   const sources = Array.isArray(r.sources) && r.sources.length ? parseToolAllowlist(r.sources) : null;
   if (!sources || !sources.patterns.length) return null;
   const allowAfter = Array.isArray(r.allow_after) && r.allow_after.length ? parseToolAllowlist(r.allow_after) : null;
-  /** The first source that answered. */
+  const cleanFailures = Array.isArray(r.clean_failures) && r.clean_failures.length ? parseToolAllowlist(r.clean_failures) : null;
+  /** The first source that returned, other than a clean failure. */
   let readBy: string | null = null;
   /** Sources let through that have not reported yet. */
   const running: string[] = [];
@@ -109,7 +111,7 @@ export function parseReadTaint(raw: unknown): ReadTaint | null {
       if (!sources.allows(name)) return;
       const i = running.indexOf(name);
       if (i >= 0) running.splice(i, 1);
-      if (!failed) readBy ??= name;
+      if (!failed || !cleanFailures?.allows(name)) readBy ??= name;
     },
   };
 }

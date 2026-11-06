@@ -14,8 +14,9 @@
  *   LK3 a lookup that failed read nothing: GitHub's own error, a call that threw, a web search or fetch that was refused, each leaves
  *       work_create to run in the same turn; each failure is counted as one, not as a tool that worked
  *   LK4 a read that answered stays read after a later lookup fails
- *   LK5 the rule itself (`parseReadTaint`): marked by a source that answered, not by one that failed; while a source is still
- *       running nothing outside allow_after runs
+ *   LK5 the rule itself (`parseReadTaint`): marked by a source that answered, not by one of `clean_failures` that failed, but by any
+ *       other source that failed; while a source is still running nothing outside allow_after runs
+ *   LK6 a plugin's read server is not a clean failure: its error, whatever it says, marks the turn like an answer
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -69,6 +70,10 @@ const github = await startServer("github", {
   pr_get: () => ({ text: JSON.stringify({ number: 300, state: "open" }) }),
   pr_create: () => ({ text: "created" }),
 });
+// An assistant plugin's read server, whose errors are its own to word.
+const autopilot = await startServer("autopilot", {
+  get_nodes: () => ({ text: `node pool unavailable: ${INJECTED}`, isError: true }),
+});
 const assistant = await startServer("assistant", {
   say: () => ({ text: "said" }),
   work_create: () => ({ text: JSON.stringify({ ok: true, item_id: "kwi_1", seq: 1 }) }),
@@ -80,11 +85,14 @@ const world = await startWorld();
 process.env.WEB_SEARCH_PROVIDER = "anthropic";
 process.env.WEB_FETCH_ENABLED = "true";
 const { AgentEngine } = await import("../src/agent/engine.js");
-test.after(async () => { await world.close(); await github.close(); await assistant.close(); });
+test.after(async () => { await world.close(); await github.close(); await assistant.close(); await autopilot.close(); });
 
 const GITHUB_READS = ["mcp__github__issue_search", "mcp__github__pr_get"];
 const WEB = ["web_search", "web_fetch"];
-const SOURCES = [...GITHUB_READS, ...WEB];
+const PLUGIN_READS = ["mcp__autopilot__get_*"];
+/** What `routerLookups` gives Brain: the GitHub reads and the web are clean failures, the plugin's reads are not. */
+const CLEAN = [...GITHUB_READS, ...WEB];
+const SOURCES = [...PLUGIN_READS, ...CLEAN];
 const AFTER = ["say", "work_recall", "memory_recall"].map((t) => `mcp__assistant__${t}`);
 
 /** The request the API sends for a router turn of a user who keeps a GitHub token: what `applySessionRoleToTask` leaves on it. */
@@ -103,8 +111,13 @@ function routerRequest(over: Record<string, unknown> = {}) {
         requires_approval: true, auto_approve: ["issue_search", "pr_get"],
       },
     },
+    plugin_id: 9,
+    plugin_tools: [{
+      id: 26, type: "mcp", name: "autopilot-mcp",
+      config: { mcpServers: { autopilot: { type: "http", url: `http://127.0.0.1:${autopilot.port}/mcp`, token: "t", auto_approve: ["get_*"], requires_approval: true } } },
+    }],
     skip_platform_defaults: true,
-    read_taint: { sources: SOURCES, allow_after: AFTER },
+    read_taint: { sources: SOURCES, allow_after: AFTER, clean_failures: CLEAN },
     ...over,
   });
 }
@@ -112,7 +125,7 @@ function routerRequest(over: Record<string, unknown> = {}) {
 async function run(request: unknown, turns: Turn[]) {
   world.script(turns);
   world.llmBodies.length = 0;
-  const before = { github: github.calls.length, assistant: assistant.calls.length };
+  const before = { github: github.calls.length, assistant: assistant.calls.length, autopilot: autopilot.calls.length };
   const result = await new AgentEngine().execute(
     request as never, (async () => {}) as never, undefined, null as never,
     { attachHands: async () => fakeHands() as never } as never,
@@ -124,6 +137,7 @@ async function run(request: unknown, turns: Turn[]) {
     raw: world.llmBodies,
     github: github.calls.slice(before.github).map((c) => c.tool),
     assistant: assistant.calls.slice(before.assistant).map((c) => c.tool),
+    autopilot: autopilot.calls.slice(before.autopilot).map((c) => c.tool),
     stats: result.toolStats,
   };
 }
@@ -223,8 +237,10 @@ test("LK4 a read that answered stays read after a later lookup fails", async () 
   assert.deepEqual(r.assistant, [], "the failed search did not undo the read before it");
 });
 
-test("LK5 the rule: a source that answered marks the turn, one that failed does not, and nothing acts while one runs", () => {
-  const taint = parseReadTaint({ sources: ["mcp__github__issue_search"], allow_after: ["mcp__assistant__say"] })!;
+test("LK5 the rule: a source that answered marks the turn, a clean one that failed does not, and nothing acts while one runs", () => {
+  const taint = parseReadTaint({
+    sources: ["mcp__github__issue_search"], allow_after: ["mcp__assistant__say"], clean_failures: ["mcp__github__issue_search"],
+  })!;
   const refused = (name: string) => taint.refusal(name) !== null;
   assert.equal(refused("mcp__assistant__work_create"), false, "before any lookup");
   assert.equal(taint.refusal("mcp__github__issue_search"), null, "a lookup itself always runs");
@@ -238,4 +254,29 @@ test("LK5 the rule: a source that answered marks the turn, one that failed does 
   taint.refusal("mcp__github__issue_search");
   taint.ran("mcp__github__issue_search", true);
   assert.equal(refused("mcp__assistant__work_create"), true, "a later failure does not undo a read");
+});
+
+test("LK5b a failed source that is not a clean failure marks the turn, and so does every source without the field", () => {
+  for (const clean of [["web_search"], undefined]) {
+    const taint = parseReadTaint({ sources: ["mcp__autopilot__get_*", "web_search"], allow_after: ["mcp__assistant__say"], clean_failures: clean })!;
+    taint.refusal("mcp__autopilot__get_nodes");
+    taint.ran("mcp__autopilot__get_nodes", true);
+    assert.match(taint.refusal("mcp__assistant__work_create") ?? "", /with mcp__autopilot__get_nodes/, JSON.stringify(clean));
+  }
+  const web = parseReadTaint({ sources: ["web_search"], allow_after: [] })!;
+  web.refusal("web_search");
+  web.ran("web_search", true);
+  assert.notEqual(web.refusal("mcp__assistant__work_create"), null, "without clean_failures a failure marks, as before");
+});
+
+test("LK6 a plugin read server's error marks the turn like an answer: work_create is refused after it", async () => {
+  let told = "";
+  const r = await run(routerRequest({ prompt: "autopilot现在有几台节点" }), [
+    { tool: "mcp__autopilot__get_nodes", input: {} },
+    (body) => { assert.match(body, /node pool unavailable/); return WORK; },
+    (body) => { told = body; return { text: "done" }; },
+  ]);
+  assert.deepEqual(r.autopilot, ["get_nodes"]);
+  assert.deepEqual(r.assistant, [], "work_create never reached the assistant");
+  assert.match(told, /This turn has read text other people wrote \(with mcp__autopilot__get_nodes\)/);
 });

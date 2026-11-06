@@ -118,6 +118,8 @@ describe("assistant router read tools", { skip }, () => {
     assert.deepEqual(task.read_taint, {
       sources: task.tools_allowlist.filter((p: string) => p !== "mcp__assistant__*"),
       allow_after: ["say", "work_recall", "memory_recall"].map((t) => `mcp__assistant__${t}`),
+      // A plugin server words its own errors, so a failed read of one marks the turn like an answer; only the web is clean here.
+      clean_failures: ["web_search", "web_fetch"],
     });
     for (const acting of ["work_create", "work_send", "review_start", "confirmation_answer", "review_mode_set", "channel_action", "memory_save", "work_stop", "model_default_set"]) {
       assert.ok(!allows(task.read_taint.allow_after, `mcp__assistant__${acting}`), `${acting} is refused after a read`);
