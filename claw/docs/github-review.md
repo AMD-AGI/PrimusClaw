@@ -195,7 +195,14 @@ They act only for the person, never for a key or a report:
 - **Grounded.** A pull request's number must be in that message; its repository named there, or, when the message names none,
   the only repository it can be: the channel's own (`channel_context.repos`), else the one the user's recent reviews used (two
   candidates and a bare number are refused, so the assistant asks); a model named there; a reviewer the user themself or someone
-  the channel listed with a Claw `user_id` (`channel_context.people`).
+  the channel listed with a Claw `user_id` (`channel_context.people`) whom the message names by a handle of theirs alone among those
+  listed: their name with its words in any order, run together or not (`Wei, Lei`, `lei wei`, `weilei`), a word of it, their user id,
+  their email or its part before the `@`, or one of the `aliases` the channel gave (a GitHub login, a chat user name). A handle two
+  listed people share, or one inside another's longer name (`王一涵` in `王一涵娜`), names neither: nothing starts, and the assistant
+  offers each person the message may mean (never the user) as the exact reply that picks them (`确认 Wei, Lei`; with what tells them
+  apart in brackets when two share a name, `确认 Alex Chen (achen2)`). A message that is that reply and nothing else, sent within ten
+  minutes of the request, starts that request with that reviewer; a sentence that only starts with 确认 is a request of its own.
+  A message longer than 8 KiB is not read for a name at all: it names nobody, and gets the same offer.
 - **`merge=true` never merges.** Whether the user asked for a merge is the router's reading of a sentence, and natural language
   never approves one. So every review the router starts or restarts (`review_start`, `review_restart`, whatever `merge` says) is
   made with `config.merge_needs_confirmation` (kept by every later restart of it): its `gh_pr_merge`, and a `gh_review_submit`

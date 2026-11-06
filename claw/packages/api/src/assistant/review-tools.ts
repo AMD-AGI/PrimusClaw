@@ -39,7 +39,9 @@ import { deterministicEventId, enqueue, kickDelivery } from "../notifications/ou
 import { recordActionConfirm } from "./outbound.js";
 import { confirmationRef } from "./prompts.js";
 import { REVIEW_HANDOFF_ACTION, type AssistantActionPayload, type AssistantReviewHandoff } from "../notifications/assistant-events.js";
-import { decidedViaOf, turnMessage, type AttendedVia, type ChannelPerson, type TurnMessage } from "./inbound.js";
+import {
+  CONTEXT_STRING_MAX, decidedViaOf, parseChannelContext, turnMessage, type AttendedVia, type ChannelPerson, type TurnMessage,
+} from "./inbound.js";
 import {
   parseRestartRequest, parseReviewRequest, recordReviewHandoff, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused, reviewItemsEnabled,
   startReviews,
@@ -64,6 +66,12 @@ export const reviewToolPorts = {
 };
 
 export const MAX_PRS = 10;
+/** At most this many people are offered when the message names no reviewer alone. */
+const MAX_REVIEWER_CANDIDATES = 5;
+/** How long after the person's request their answer naming the reviewer (`确认 <name>`) still answers it. */
+const REVIEWER_ANSWER_WINDOW = "10 minutes";
+/** How many replies (`确认 <name>`) in a row may stand between a request and the reply that answers it. */
+const REVIEWER_REPLIES_SKIPPED_MAX = 5;
 const ACTION_ARGS_MAX = 200;
 /** How far back a repository the user reviewed in counts as one they meant when they give only a number. */
 const RECENT_REPO_WINDOW = "7 days";
@@ -170,32 +178,218 @@ export function modelGrounded(text: string, model: string): boolean {
 
 const HAN = /\p{Script=Han}/u;
 
+/** The words of a text, lower-cased, where they stand: runs of letters and digits, a run of Chinese apart from the letters around it. */
+const WORD = /\p{Script=Han}+|(?:(?!\p{Script=Han})[\p{L}\p{N}])+/gu;
+/** What may stand between words written as one name: spaces and the marks names and addresses are written with ("Wei, Lei", "lei.wei"). */
+const NAME_GAP = /^[\s,.\uFF0C\u3001\u00B7_@'\u2019-]*$/u;
+/** A name of up to this many words is matched in any order of them; a longer one as written and reversed. */
+const NAME_ORDERS_MAX_WORDS = 4;
+
+const flat = (s: string): string => lower(s).replace(/[^\p{L}\p{N}]+/gu, "");
+
+function orders(words: string[]): string[][] {
+  if (words.length > NAME_ORDERS_MAX_WORDS) return [words, [...words].reverse()];
+  if (words.length <= 1) return [words];
+  return words.flatMap((w, i) => orders([...words.slice(0, i), ...words.slice(i + 1)]).map((rest) => [w, ...rest]));
+}
+
 /**
- * Whether the person's own message names this person by something that is theirs alone among the people the channel listed: their name,
- * a part of it, their email, the part of it before the `@`, or their user id, each only when no one else listed has the same (so two
- * people called Alex Chen, or `alex@a` and `alex@b`, are told apart only by what differs), and only where it is not part of another listed
- * person's longer word (`王一涵` in `王一涵娜`). Case aside; a Latin word only whole (`Lei` is not named by `Leila`), a Chinese name anywhere
- * in the text. Being listed beside the message is the channel's say that the person is there; this is the person's say that it is them.
+ * Every way a message may name this person, flattened (lower case, no spaces or marks): each word of their name, and its words run
+ * together in any order ("Wei, Lei": `wei`, `lei`, `weilei`, `leiwei`), with or without a bracketed part; their user id; their email
+ * and the part of it before the `@` ("lei.wei": `leiwei`); and each alias the channel gave. Two letters at least, three for an address's
+ * local part.
+ */
+export function personHandles(p: ChannelPerson): string[] {
+  const out = new Set<string>();
+  const add = (s: string, min = 2): void => {
+    const f = flat(s);
+    if (f.length >= min) out.add(f);
+  };
+  for (const variant of new Set([p.name, p.name.replace(/[(（[【][^)）\]】]*[)）\]】]/gu, " ")])) {
+    const words = [...lower(variant).matchAll(WORD)].map((m) => m[0]);
+    for (const w of words) add(w);
+    for (const o of orders(words)) add(o.join(""));
+  }
+  for (const h of [p.user_id ?? "", p.email ?? "", ...(p.aliases ?? [])]) {
+    add(h);
+    if (h.includes("@")) add(h.split("@")[0], 3);
+  }
+  return [...out];
+}
+
+/**
+ * Where in the text a handle (`personHandles`) is written, as [start, end) spans of the lower-cased text. A Chinese one anywhere, since
+ * a Chinese name runs into the words around it ("请王一涵帮我"); any other only as whole words, written as one ("weilei") or with spaces
+ * or marks between them ("Wei, Lei", "lei.wei"), so `Lei` is not named by `Leila`, nor by `weilei`, and Latin letters next to Chinese
+ * still stand on their own ("请Wei, Lei帮我").
+ */
+function handleSpans(x: ReadText, h: string, max = Infinity): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  if (/^\p{Script=Han}+$/u.test(h)) {
+    for (let i = x.t.indexOf(h); i >= 0 && out.length < max; i = x.t.indexOf(h, i + 1)) out.push([i, i + h.length]);
+    return out;
+  }
+  // Where the handle is spelled by whole words (`ReadText.runs`): it starts where a word does and ends where one does. After a place
+  // that does not, the search goes on from the next word's start, the first place another could.
+  for (let i = x.runs.indexOf(h); i >= 0 && out.length < max;) {
+    const first = x.startAt[i];
+    const last = x.endAt[i + h.length];
+    if (first >= 0 && last >= 0) out.push([x.words[first].a, x.words[last].b]);
+    const next = x.nextStart[i + 1];
+    i = next < 0 ? -1 : x.runs.indexOf(h, next);
+  }
+  return out;
+}
+
+/**
+ * A lower-cased text read for names: its words (`WORD`) where they stand, and `runs`, the words that only name marks (`NAME_GAP`)
+ * separate run together, each such run apart from the next by a space, which no handle has; `startAt` / `endAt` give the word that
+ * starts / ends at each place of `runs` (-1 for none). A handle is then found by the platform's own search, not word by word.
+ */
+interface ReadText {
+  t: string; words: Array<{ a: number; b: number }>; runs: string; startAt: Int32Array; endAt: Int32Array;
+  /** The first place at or after each place of `runs` where a word starts (-1 for none). */
+  nextStart: Int32Array;
+}
+
+function readText(t: string): ReadText {
+  const words: Array<{ w: string; a: number; b: number }> = [];
+  for (const m of t.matchAll(WORD)) words.push({ w: m[0], a: m.index, b: m.index + m[0].length });
+  const parts: string[] = [];
+  const at: number[] = [];
+  let len = 0;
+  words.forEach((w, k) => {
+    if (k > 0 && !NAME_GAP.test(t.slice(words[k - 1].b, w.a))) {
+      parts.push(" ");
+      len += 1;
+    }
+    at.push(len);
+    parts.push(w.w);
+    len += w.w.length;
+  });
+  const startAt = new Int32Array(len + 1).fill(-1);
+  const endAt = new Int32Array(len + 1).fill(-1);
+  words.forEach((w, k) => {
+    startAt[at[k]] = k;
+    endAt[at[k] + w.w.length] = k;
+  });
+  const nextStart = new Int32Array(len + 2).fill(-1);
+  for (let i = len; i >= 0; i--) nextStart[i] = startAt[i] >= 0 ? i : nextStart[i + 1];
+  return { t, words, runs: parts.join(""), startAt, endAt, nextStart };
+}
+
+/**
+ * The longest message read for a reviewer's name. A request is a line or two; a longer message names nobody by itself (it is not cut,
+ * which could leave a shorter listed name where a longer one was written), and the person is offered the short reply that picks them.
+ * Reading a message costs each listed person's every handle, so this bounds what one message can make the process do.
+ */
+export const NAMES_TEXT_MAX = 8 * 1024;
+/**
+ * The most places one handle is looked at in a message. A handle of another person's written more often than this is taken to stand
+ * around every place a shorter one does (so that one names nobody: the safe answer), and only the first places of the person's own count.
+ */
+const NAME_PLACES_MAX = 50;
+
+/**
+ * Whether the person's own message names this person by something that is theirs alone among the people the channel listed: one of
+ * their handles (`personHandles`: their name in any order of its words, run together or not, a part of it, their user id, their email
+ * or the part of it before the `@`, an alias the channel gave), each only when no one else listed has the same (so two people called
+ * Alex Chen, or two who share `Lei`, are told apart only by what differs), and only where it is not part of another listed person's
+ * longer handle (`王一涵` in `王一涵娜`, `Alex Chen` in `Alex Chen Wu`). Being listed beside the message is the channel's say that the
+ * person is there; this is the person's say that it is them. A message longer than `NAMES_TEXT_MAX` names nobody.
  */
 export function reviewerNamed(text: string, person: ChannelPerson & { user_id: string }, people: readonly ChannelPerson[]): boolean {
-  const t = lower(text);
-  // Where the word stands in the text, as [start, end) spans.
-  const spans = (s: string): Array<[number, number]> => {
-    const re = HAN.test(s) ? new RegExp(escapeRe(s), "gu") : new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(s)}(?![\\p{L}\\p{N}_])`, "gu");
-    return [...t.matchAll(re)].map((m) => [m.index, m.index + m[0].length] as [number, number]);
-  };
-  const words = (p: ChannelPerson): string[] => {
-    const local = p.email?.split("@")[0] ?? "";
-    return [p.name, ...p.name.split(/[\s,，、.·]+/), p.user_id ?? "", p.email ?? "", local.length >= 3 ? local : ""]
-      .map((w) => lower(w.trim())).filter((w) => w.length >= 2);
-  };
-  const theirs = [...new Set(people.filter((p) => p !== person && p.user_id !== person.user_id).flatMap(words))];
+  if (text.length > NAMES_TEXT_MAX) return false;
+  const x = readText(lower(text));
+  const theirs = [...new Set(people.filter((p) => p !== person && p.user_id !== person.user_id).flatMap(personHandles))];
   const taken = new Set(theirs);
-  // A word of this person's counts where it stands on its own, not where it is part of another listed person's longer word: "王一涵"
-  // inside "王一涵娜", or "Alex Chen" inside "Alex Chen Wu", names that other person.
-  const inLonger = (w: string, [a, b]: [number, number]): boolean =>
-    theirs.some((o) => o.length > w.length && o.includes(w) && spans(o).some(([c, d]) => c <= a && b <= d));
-  return words(person).some((w) => !taken.has(w) && spans(w).some((span) => !inLonger(w, span)));
+  // Where another person's longer handle stands is found once for the text, at most `NAME_PLACES_MAX` places (null past that: around
+  // every place), not once for each place a shorter one stands.
+  const where = new Map<string, Array<[number, number]> | null>();
+  const placesOf = (o: string): Array<[number, number]> | null => {
+    if (!where.has(o)) {
+      const places = handleSpans(x, o, NAME_PLACES_MAX + 1);
+      where.set(o, places.length > NAME_PLACES_MAX ? null : places);
+    }
+    return where.get(o) ?? null;
+  };
+  return personHandles(person).some((h) => {
+    if (taken.has(h)) return false;
+    const spans = handleSpans(x, h, NAME_PLACES_MAX);
+    if (!spans.length) return false;
+    const longer = theirs.filter((o) => o.length > h.length && o.includes(h));
+    return spans.some(([a, b]) => !longer.some((o) => {
+      const places = placesOf(o);
+      return places === null || places.some(([c, d]) => c <= a && b <= d);
+    }));
+  });
+}
+
+/**
+ * The listed people with a Claw user id whom the message may mean: any of their handles is written in it, theirs alone or not (`lei`
+ * of two people), or, when it writes none (or is longer than `NAMES_TEXT_MAX`), everyone listed. Who to offer the person to pick from when
+ * their message names nobody alone.
+ */
+export function reviewerCandidates(
+  text: string, people: readonly ChannelPerson[], requester: string,
+): Array<ChannelPerson & { user_id: string }> {
+  const linked = people.filter((p): p is ChannelPerson & { user_id: string } => !!p.user_id && p.user_id !== requester);
+  if (text.length > NAMES_TEXT_MAX) return linked.slice(0, MAX_REVIEWER_CANDIDATES);
+  const x = readText(lower(text));
+  // Each handle is looked for once, however many listed people have it.
+  const seen = new Map<string, boolean>();
+  const written = linked.filter((p) => personHandles(p).some((h) => {
+    let found = seen.get(h);
+    if (found === undefined) seen.set(h, found = handleSpans(x, h, 1).length > 0);
+    return found;
+  }));
+  return (written.length ? written : linked).slice(0, MAX_REVIEWER_CANDIDATES);
+}
+
+/**
+ * The longest a reply (`reviewerReply`) can be: the word, then a name and one handle in brackets, each at most `CONTEXT_STRING_MAX`
+ * long as the channel lists them, with room for spacing. A longer message is not one, and is not read further.
+ */
+const REPLY_MAX_CHARS = "confirm".length + 2 * CONTEXT_STRING_MAX + 32;
+/** Matched against the trimmed message. What separates the word from the name is never also the name's first character, so no input backtracks. */
+const REPLY = /^(?:确认|確認|confirm)[\s:：,，]*([^\s:：,，][^\n]*)$/iu;
+/** A handle in brackets at the end of a reply's name; what comes before it is the name. */
+const REPLY_TAG = /[(（]([^()（）]+)[)）]$/u;
+
+/** The word a reply that picks the reviewer starts with: `确认` in a Chinese message, `confirm` otherwise. */
+const replyWord = (text: string): string => (HAN.test(text) ? "确认" : "confirm");
+
+/**
+ * Whether the message is, whole, the person's answer to which reviewer they meant: `确认` or `confirm`, then nothing but one listed person's
+ * name or handle, and, in brackets after it, at most one more handle of the same person (`确认 Alex Chen (achen2)`): the shape of a reply
+ * `reviewerReply` offers. A sentence that merely starts with the word ("确认下，请 Wei, Lei 帮我 review #304") is not one, nor is a message
+ * longer than any reply can be (`REPLY_MAX_CHARS`), which is not read at all: this runs on the person's message and on several earlier ones.
+ */
+export function isReviewerReply(text: string, people: readonly ChannelPerson[]): boolean {
+  if (text.length > REPLY_MAX_CHARS) return false;
+  const m = REPLY.exec(text.trim());
+  if (!m) return false;
+  const tagged = REPLY_TAG.exec(m[1]);
+  const [name, tag] = tagged ? [m[1].slice(0, tagged.index).trimEnd(), tagged[1]] : [m[1], ""];
+  return people.some((p) => {
+    if (!p.user_id) return false;
+    const handles = new Set(personHandles(p));
+    return handles.has(flat(name)) && (!tag || handles.has(flat(tag)));
+  });
+}
+
+/**
+ * The exact reply that picks this person among those listed: `确认 <name>` when their name is theirs alone (`reviewerNamed`), otherwise
+ * the name with the first handle of theirs that tells them apart, in brackets: their address's local part, an alias, their address,
+ * their user id (`确认 Alex Chen (achen2)`), so two people with one name, or with the same words in another order, can each be picked.
+ */
+export function reviewerReply(text: string, person: ChannelPerson & { user_id: string }, people: readonly ChannelPerson[]): string {
+  const plain = `${replyWord(text)} ${person.name}`;
+  if (reviewerNamed(plain, person, people)) return plain;
+  for (const h of [person.email?.split("@")[0], ...(person.aliases ?? []), person.email]) {
+    if (h && reviewerNamed(`${plain} (${h})`, person, people)) return `${plain} (${h})`;
+  }
+  return `${plain} (${person.user_id})`;
 }
 
 /** The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased. */
@@ -244,6 +438,36 @@ function refuseUngrounded(code: string, message: string): never {
   throw new ToolRefused(code, message);
 }
 
+/**
+ * The request a reviewer's name answers (`确认 <name>`): the person's own last signed-in message before it in this session that is not
+ * itself such a reply (`isReviewerReply`, so a second reply after one that picked nobody still answers the request), sent at most
+ * `REVIEWER_ANSWER_WINDOW` earlier. Null when there is none.
+ */
+async function requestAnswered(q: Querier, sessionId: string, message: TurnMessage): Promise<string | null> {
+  const rows = (await q(
+    `SELECT content, channel_context FROM claw_assistant_messages
+      WHERE session_id = $1 AND message_id <> $2 AND attended_via IS NOT NULL
+        AND received_at <= $3 AND received_at > $3::timestamptz - $4::interval
+      ORDER BY received_at DESC LIMIT $5`,
+    [sessionId, message.messageId, message.receivedAt, REVIEWER_ANSWER_WINDOW, REVIEWER_REPLIES_SKIPPED_MAX + 1],
+  )).rows as Array<{ content: string; channel_context: unknown }>;
+  return rows.find((r) => !isReviewerReply(r.content, parseChannelContext(r.channel_context).people))?.content ?? null;
+}
+
+/**
+ * The message names no listed person alone as the reviewer: nothing starts, and the router asks which person, offering each one the
+ * message may mean as the exact short reply that picks them (`确认 <name>`), never a sentence to type again.
+ */
+function refuseWhichReviewer(code: string, text: string, people: readonly ChannelPerson[], requester: string): never {
+  const candidates = reviewerCandidates(text, people, requester)
+    .map((p) => ({ user_id: p.user_id, name: p.name, reply: reviewerReply(text, p, people) }));
+  const how = "Say in one short line that nothing has started and ask which person they mean. Do not describe what was checked or say that a name was not recognised, and never ask them to write their request again";
+  throw new ToolRefused(code, candidates.length
+    ? `${how}: offer each person under data.candidates by its exact reply (data.candidates[].reply), which the user can send as it is. When they send one, call review_start again with the same prs and merge, and that person's user_id as reviewer.`
+    : `${how}: tell them they can answer with just ${replyWord(text)} <name>. When they do, call review_start again with the same prs and merge, and the user_id People then lists for that name.`,
+  { candidates });
+}
+
 // --- Tools ------------------------------------------------------------------------------------------------------
 
 export async function reviewStart(
@@ -257,44 +481,46 @@ export async function reviewStart(
   // Asked here, so a refusal costs the review service nothing.
   const ready = await inTransaction(async (q) => {
     const { userId, message, via } = await attendedTurn(q, claims);
+    // `确认 <name>` answers the question which reviewer the person meant, for a review by someone else: the pull requests (and the model)
+    // are those of the request it answers, the person's message just before it; who reviews is read from the answer.
+    const forOther = !!args.reviewer && args.reviewer !== userId;
+    // Only a message that is such a reply, whole, and does not itself name every pull request.
+    const answered = forOther && isReviewerReply(message.content, message.context.people)
+      && !prs.every((pr) => prGrounded(message.content, pr)) ? await requestAnswered(q, claims.sid, message) : null;
+    const asked = answered ?? message.content;
     const recent = await recentReviewRepos(q, userId);
     for (const pr of prs) {
-      if (!prGrounded(message.content, pr)) {
+      if (!prGrounded(asked, pr)) {
         refuseUngrounded("pr_not_in_message", `${pr.owner}/${pr.repo}#${pr.number} is not what the user's message names: start only the pull requests they named`);
       }
-      if (!repoGrounded(message.content, pr, message.context.repos, recent)) {
+      if (!repoGrounded(asked, pr, message.context.repos, recent)) {
         refuseUngrounded("repo_not_grounded", `the user did not name ${pr.owner}/${pr.repo}: ask them which repository`);
       }
     }
     // With model choice on, the model is checked against the allow-list and the payer's key instead (`model-choice.ts`): "use the fast
     // one" names a model without its name, and the quota spent is the user's own.
-    if (args.model && !modelChoiceOn() && !modelGrounded(message.content, args.model)) {
+    if (args.model && !modelChoiceOn() && !modelGrounded(answered ? `${asked}\n${message.content}` : asked, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out unless they named one");
     }
     const signedIn = await requesterSignedIn(q, claims.sid, userId, message, via);
-    if (!args.reviewer || args.reviewer === userId) return { userId, signedIn, actingAs: userId, actingAsName: undefined };
+    const note = asked;
+    if (!args.reviewer || args.reviewer === userId) return { userId, signedIn, note, actingAs: userId, actingAsName: undefined };
     const reviewer = lower(args.reviewer);
-    const person = message.context.people.find((p): p is ChannelPerson & { user_id: string } => p.user_id === args.reviewer);
-    if (person) {
+    const people = message.context.people;
+    const person = people.find((p): p is ChannelPerson & { user_id: string } => p.user_id === args.reviewer);
+    if (person && reviewerNamed(message.content, person, people)) {
       // A review as someone else runs on their account: the person's message must name them, not only the channel list them.
-      if (!reviewerNamed(message.content, person, message.context.people)) {
-        refuseUngrounded("reviewer_not_named", `the user's message does not name ${person.name || "that person"}: ask them who should review it`);
-      }
-      return { userId, signedIn, actingAs: args.reviewer, actingAsName: person.name };
+      return { userId, signedIn, note, actingAs: args.reviewer, actingAsName: person.name };
     }
-    const named = message.context.people.some((p) => lower(p.name) === reviewer || (p.email !== undefined && lower(p.email) === reviewer));
-    return refuseUngrounded(
-      named ? "reviewer_not_linked" : "reviewer_not_in_message",
-      named
-        ? "that person has not linked their account, so nobody can review as them: tell the user"
-        : "reviewer must be left out (the user), or be the user_id of someone in this message's people list",
-    );
+    const named = !person && people.some((p) => !p.user_id && (lower(p.name) === reviewer || (p.email !== undefined && lower(p.email) === reviewer)));
+    if (named) refuseUngrounded("reviewer_not_linked", "that person has not linked their account, so nobody can review as them: tell the user");
+    return refuseWhichReviewer(person ? "reviewer_not_named" : "reviewer_not_in_message", message.content, people, userId);
   });
   // A review asked of someone else runs on their own credentials, which only the channel that carried the message can bring. When it
   // said it can be handed one, it is: the channel starts it as the reviewer and tells the person how it went. Otherwise it is refused
   // below, as before (`asRequesterOfOther`).
   if (ready.actingAs !== ready.userId) {
-    const handed = await handOffReview(claims, prs, { userId: ready.actingAs, name: ready.actingAsName ?? "" }, args.merge);
+    const handed = await handOffReview(claims, prs, { userId: ready.actingAs, name: ready.actingAsName ?? "" }, args.merge, ready.note);
     if (handed) return { ...handed, ...(args.model || args.effort ? { set_aside: [...(args.model ? ["model"] : []), ...(args.effort ? ["effort"] : [])] } : {}) };
   }
   // The body `POST /v1/assistant/reviews` would have been sent, read by the same parser: the same checks either way.
@@ -328,7 +554,7 @@ export async function reviewStart(
  * of the review, are the review service's, when the channel asks it.
  */
 async function handOffReview(
-  claims: AssistantTokenClaims, prs: PrRef[], reviewer: { userId: string; name: string }, merge: boolean,
+  claims: AssistantTokenClaims, prs: PrRef[], reviewer: { userId: string; name: string }, merge: boolean, note: string,
 ): Promise<Record<string, unknown> | null> {
   const queued = await inTransaction(async (q) => {
     const { userId, message } = await attendedTurn(q, claims);
@@ -348,7 +574,7 @@ async function handOffReview(
       reviewer: { user_id: reviewer.userId, name: reviewer.name },
       prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
       merge,
-      requester_note: message.content.slice(0, REQUESTER_NOTE_MAX_CHARS),
+      requester_note: note.slice(0, REQUESTER_NOTE_MAX_CHARS),
     };
     await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge });
     const payload: AssistantActionPayload = {
