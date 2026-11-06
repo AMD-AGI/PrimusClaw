@@ -599,7 +599,9 @@ export function storedTurnEnds(rows: readonly EventRow[]): string[] {
 /**
  * The stored events (`?mode=replay`, with their `event_id`, which is the stream's frame id) of the given turns, and of what was
  * said about the given items, that the stream did not deliver: none when it showed everything a case is graded on. A turn's
- * exec_complete is left out (a stream never carries it). Events that could not be read are a gap too.
+ * exec_complete and the user's own message are left out: a stream never carries either (Claw stores the UserMessage and
+ * publishes it on a subject no stream route subscribes to, `sessions/dispatch.ts`), and the runner wrote the message itself.
+ * Events that could not be read are a gap too.
  */
 export function streamMissed(rows: ReadonlyArray<EventRow & { event_id?: unknown }> | null, events: readonly LiveEvent[],
   messageIds: readonly string[], itemIds: readonly string[] = []): string[] {
@@ -609,7 +611,8 @@ export function streamMissed(rows: ReadonlyArray<EventRow & { event_id?: unknown
   const items = new Set(itemIds);
   return rows.filter((r) => {
     const d = r.data ?? {};
-    if ((d.type ?? r.event_type) === "exec_complete") return false;
+    const type = d.type ?? r.event_type;
+    if (type === "exec_complete" || type === "UserMessage") return false;
     const ours = turns.has(String(d.message_id ?? "")) || turns.has(String(d.turn_message_id ?? "")) || (d.item?.item_id !== undefined && items.has(String(d.item.item_id)));
     return ours && !seen.has(String(r.event_id ?? ""));
   }).map((r) => String(r.event_id ?? "?"));
