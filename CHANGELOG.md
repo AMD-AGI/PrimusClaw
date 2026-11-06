@@ -49,6 +49,10 @@ record it.
 - How far an item got is read now, not estimated: `work_recall(item, "live")` shows the worker's last steps with their times (a log's
   latest lines included), and a `say` that names an item still in progress, in a turn answering the user, is refused until that turn
   looked at the item.
+- A NATS timeout that reaches a brain run wrapped in another error (the sandbox layer's `hands KV is unavailable` and DAG-binding
+  write failures keep the `NatsError` as `cause`) is retried like a bare one instead of ending the run for good, and is reported as
+  `infra_transient` rather than `upstream_timeout` when its retries run out. A retryable failure now waits 5 s, 10 s, 20 s, 40 s,
+  then 60 s per attempt (was a flat 5 s), so a stall spends the delivery budget over the time it lasts.
 - A router turn that said only a line that it was on it ("查一下 Autopilot 的状态。") before its lookup answered, and then wrote its
   answer as plain text, no longer leaves the person with that line alone: the completion skipped the text because the turn had
   spoken. When the turn's stored `toolUsed` events show that every say that went out came before its last lookup ended (answered or
