@@ -104,7 +104,7 @@ import {
   mergeSays, parseSayLog, endedTurns, storedTurnEnds, streamMissed, filledCase, finalSay, grade, forRecording, identityRefusal, itemsStartedBy,
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf,
   sayWaitMs, saysOf, staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
-  holdAnswers, toolPattern,
+  holdAnswers, toolPattern, judgeVerdict,
   type SayMark, type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
@@ -420,20 +420,26 @@ async function judge(c: EvalCase, turns: Turn[], final: string, calls: readonly 
   if (!url || !model || !keyFile) return null;
   const key = readFileSync(keyFile, "utf8").trim();
   const prompt = judgePrompt(c, turns, final, calls);
-  try {
-    const res = await fetch(`${url.replace(/\/+$/, "")}/v1/messages`, {
-      method: "POST", signal: AbortSignal.timeout(60_000),
-      headers: { "content-type": "application/json", "x-api-key": key, authorization: `Bearer ${key}`, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model, max_tokens: JUDGE_MAX_TOKENS, messages: [{ role: "user", content: prompt }] }),
-    });
-    if (!res.ok) return { pass: false, why: `judge answered ${res.status}`, failed: true };
-    const text = String(((await res.json()) as any)?.content?.find((b: any) => b.type === "text")?.text ?? "");
-    const word = /^\s*(PASS|FAIL)\b/i.exec(text)?.[1]?.toUpperCase();
-    if (!word) return { pass: false, why: "judge gave no PASS or FAIL", failed: true };
-    return { pass: word === "PASS", why: scrubWith(text.trim().slice(0, 300), [KEY, key]) };
-  } catch (err) {
-    return { pass: false, why: `judge failed: ${err instanceof Error ? err.message : String(err)}`, failed: true };
+  // An answer without a verdict is asked once more: the gateway's model sometimes spends its turn on a thinking block.
+  let why = "judge gave no PASS or FAIL";
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(`${url.replace(/\/+$/, "")}/v1/messages`, {
+        method: "POST", signal: AbortSignal.timeout(60_000),
+        headers: { "content-type": "application/json", "x-api-key": key, authorization: `Bearer ${key}`, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model, max_tokens: JUDGE_MAX_TOKENS, messages: [{ role: "user", content: prompt }] }),
+      });
+      if (!res.ok) return { pass: false, why: `judge answered ${res.status}`, failed: true };
+      const body = (await res.json()) as any;
+      const text = (Array.isArray(body?.content) ? body.content : []).filter((b: any) => b?.type === "text").map((b: any) => String(b.text ?? "")).join("\n");
+      const word = judgeVerdict(text);
+      if (word) return { pass: word === "PASS", why: scrubWith(text.trim().slice(0, 300), [KEY, key]) };
+      why = `judge gave no PASS or FAIL (stop_reason ${String(body?.stop_reason ?? "?")}, ${text.length} chars of text)`;
+    } catch (err) {
+      return { pass: false, why: `judge failed: ${err instanceof Error ? err.message : String(err)}`, failed: true };
+    }
   }
+  return { pass: false, why, failed: true };
 }
 
 const attemptOf = async (c: EvalCase, turns: Turn[], o: Observed, tools: string[], items: Attempt["items"]): Promise<Attempt> => {

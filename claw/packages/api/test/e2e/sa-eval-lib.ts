@@ -596,6 +596,11 @@ export function storedTurnEnds(rows: readonly EventRow[]): string[] {
   return out;
 }
 
+/** The judge's verdict: PASS or FAIL as its first word, allowing markdown emphasis and a "Verdict:" label before it. */
+export function judgeVerdict(text: string): "PASS" | "FAIL" | undefined {
+  return /^[\s*_#>`"']*(?:verdict\s*[:：]\s*)?[*_`]*(PASS|FAIL)\b/i.exec(text)?.[1]?.toUpperCase() as "PASS" | "FAIL" | undefined;
+}
+
 /**
  * The stored events (`?mode=replay`, with their `event_id`, which is the stream's frame id) of the given turns, and of what was
  * said about the given items, that the stream did not deliver: none when it showed everything a case is graded on. A turn's

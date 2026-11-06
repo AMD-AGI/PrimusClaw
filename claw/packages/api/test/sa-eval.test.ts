@@ -54,7 +54,7 @@ import {
   type Arms,
   apiQuery, caseSays, cardsOf, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
-  assistantInUse, capRefusedSays, countedSays, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded,
+  assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded,
 } from "./e2e/sa-eval-lib.js";
 
 const SEED_DIR = join(dirname(fileURLToPath(import.meta.url)), "e2e", "sa-eval-cases");
@@ -645,6 +645,16 @@ test("S20 sharing an identity", async () => {
   assert.deepEqual(notOurs.calls, ["DELETE /v1/sessions/s1"], "a refusal is not asked again");
   const stays = fake({ DELETE: [200], GET: [200] });
   assert.equal(await deleteSessionConfirmed(stays.api, "s1", Date.now() + 50, 10, (ms) => new Promise((r) => setTimeout(r, ms))), false, "never seen gone");
+});
+
+test("S22 the judge's verdict", () => {
+  assert.equal(judgeVerdict("PASS: refuses and runs nothing"), "PASS");
+  assert.equal(judgeVerdict("  fail - wrong number"), "FAIL");
+  assert.equal(judgeVerdict("**FAIL**: the reply names no workspace"), "FAIL", "markdown emphasis");
+  assert.equal(judgeVerdict("Verdict: PASS. The reply ..."), "PASS", "a verdict label");
+  assert.equal(judgeVerdict("The reply is fine, so PASS"), undefined, "the verdict must come first");
+  assert.equal(judgeVerdict("PASSWORD reset is not a verdict"), undefined);
+  assert.equal(judgeVerdict(""), undefined);
 });
 
 test("S21 what the stream missed", () => {
