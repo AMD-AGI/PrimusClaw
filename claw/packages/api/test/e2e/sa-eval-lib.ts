@@ -657,9 +657,12 @@ export function sayWaitMs(says: readonly number[], now: number, perHour: number,
   return recent[Math.min(over, recent.length) - 1]! + HOUR_MS - now + 1_000;
 }
 
-/** The says of the assistant the server refused for its hourly cap since `since`: an attempt with one is the run's failure. */
-export const capRefusedSays = (events: readonly LiveEvent[], since: number): number => events.filter((e) => e.at >= since
-  && e.data?.type === "toolUsed" && e.data.tool === "mcp__assistant__say" && e.data.status === "error"
+/**
+ * The says of the assistant the server refused for its hourly cap since `since`, other than in the turns of the messages in
+ * `earlier` (an earlier attempt's, arriving late after a reconnect): an attempt with one is the run's failure.
+ */
+export const capRefusedSays = (events: readonly LiveEvent[], since: number, earlier: ReadonlySet<string> = new Set()): number => events.filter((e) => e.at >= since
+  && !earlier.has(String(e.data?.message_id ?? "")) && e.data?.type === "toolUsed" && e.data.tool === "mcp__assistant__say" && e.data.status === "error"
   && [e.data.result, e.data.description, e.data.brief].some((x) => typeof x === "string" && x.includes("say_rate_limited"))).length;
 
 /**

@@ -61,8 +61,8 @@
  *                     Keep it below the deployment's CLAW_ASSISTANT_SAY_MAX_PER_HOUR (120): a say the server refuses for its
  *                     cap makes the attempt an error of the run (`infra: ... say_rate_limited`), not a failure of the assistant.
  *                     0 turns the pace off. The says of an assistant session a run deleted cannot be read back and still
- *                     count: each run keeps the hour's says it saw in EVAL_SAY_LOG (default: a file per identity in the
- *                     host's temporary directory) for the next run on the same host
+ *                     count: each run keeps the hour's says it saw in EVAL_SAY_LOG (default: a file per identity under
+ *                     ~/.cache/sa-eval) for the next run on the same host
  *   EVAL_TURN_WAIT_S  how long a turn may take to end (default 180 for a router turn, 600 for a plain session's): a turn whose
  *                     end neither the stream nor the session's stored events show by then makes the attempt an error, not a grade
  *   EVAL_QUIET_S      the assistant mode refuses to start when the identity's assistant session has a turn running, or had any
@@ -82,13 +82,14 @@
  * after the DELETE answers 404. No other item is touched; a new open item it cannot tie to its calls is reported. Exit 0
  * when every attempt ran to a verdict and the cleanup is complete; the score is a measurement, not a gate.
  *
- * SIGINT or SIGTERM stops a live run between two steps: nothing more is sent, the turns already sent are let end (a minute
- * at most, or EVAL_TURN_WAIT_S if shorter) so that the items they start are known, and the cleanup above runs; the run exits 1. A second signal exits at
+ * SIGINT or SIGTERM stops a live run between two steps: nothing more is sent (an approval decision included), the turns
+ * already sent are let end (up to a minute more, or EVAL_TURN_WAIT_S if shorter) so that the items they start are known, and
+ * the cleanup above runs; the run exits 1, and says so if a turn was still running at its end. A second signal exits at
  * once without it. Send it to the runner's own process: `npx` (npm exec) does not pass a signal on.
  */
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -611,71 +612,75 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
   if (!sessionId) throw new Error(`create answered ${created.status}`);
   OWN_SESSIONS.add(sessionId);
   const stream = new LiveStream(sessionId, false);
-  let sent = 1;   // the turns sent: the first went with the session
+  // Each turn's message id (the first came with the session) and when it was sent: what is graded of a turn is its own.
+  const idOf = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+  const mids: Array<string | null> = [idOf(created.json?.data?.message?.message_id)];
+  const sentAt: number[] = [start];
   const denied = new Set<string>();
-  const ends = (): LiveEvent[] => endedTurns(stream.events);
-  // The cases only read: every approval is denied, so a turn waiting on one does not hang the run.
-  const denyAsked = async (): Promise<void> => {
-    for (const e of stream.events) {
-      const tid = e.data?.tool_use_id;
-      if (e.data?.type !== "permissionRequest" || typeof tid !== "string" || denied.has(tid)) continue;
-      denied.add(tid);
-      await api("POST", `/v1/sessions/${sessionId}/messages`, { messageType: "decision", extData: { tool_use_id: tid, action: "deny" } });
-    }
-  };
+  /** Turn k is over by the stored events: its own exec_complete, or (no id known) as many as turns sent. */
+  const overBy = (k: number) => (stored: readonly string[]): boolean => (mids[k] ? stored.includes(mids[k]!) : stored.length >= k + 1);
+  const streamedBy = (k: number) => (): boolean => (mids[k] ? turnEnded(stream.events, mids[k]!) : endedTurns(stream.events).length >= k + 1);
+  // A reply is the main agent's message in that turn: a sub-agent's is not shown to the user, and would make a slow reply
+  // look on time; another turn's (a message the stream delivered again after a reconnect) is not this turn's.
+  const repliesOf = (k: number): LiveEvent[] => stream.events.filter((e) => e.data?.type === "AssistantMessage" && !e.data.subagent_id
+    && (mids[k] ? e.data.message_id === mids[k] : e.at >= sentAt[k]! && !mids.includes(idOf(e.data.message_id))));
   try {
     await stream.open();
-    // One that has not ended in time is not graded: what was seen of it is part of a turn.
-    const waitEnds = async (n: number, deadline: number): Promise<void> => {
-      const over = await turnsOver(sessionId, (stored) => stored.length >= n, () => ends().length >= n, deadline,
-        (probe, at, every) => waitFor(async () => { await denyAsked(); return probe(); }, at, every));
-      if (!over) throw new Error(`no end of turn ${n} within ${turnWaitMs(false) / 1000} s: not graded`);
+    // The cases only read: every approval is denied, so a turn waiting on one does not hang the run. One that has not ended
+    // in time is not graded: what was seen of it is part of a turn.
+    const waitTurn = async (k: number): Promise<void> => {
+      const over = await turnsOver(sessionId, overBy(k), streamedBy(k), sentAt[k]! + turnWaitMs(false), (probe, at, every) => waitFor(async () => {
+        for (const e of stream.events) {
+          const tid = e.data?.tool_use_id;
+          if (e.data?.type !== "permissionRequest" || typeof tid !== "string" || denied.has(tid)) continue;
+          denied.add(tid);
+          live();
+          await api("POST", `/v1/sessions/${sessionId}/messages`, { messageType: "decision", extData: { tool_use_id: tid, action: "deny" } });
+        }
+        return probe();
+      }, at, every));
+      if (!over) throw new Error(`no end of turn ${k + 1} within ${turnWaitMs(false) / 1000} s of its message: not graded`);
     };
-    await waitEnds(1, start + turnWaitMs(false));
-    const sentAt: number[] = [start];
-    let lastMid: string | undefined;   // the last turn's message id (a single-turn case: every event is the last turn's)
-    // A reply is the main agent's message: a sub-agent's is not shown to the user, and would make a slow reply look on time.
-    const replied = (e: LiveEvent): boolean => e.data?.type === "AssistantMessage" && !e.data.subagent_id;
-    const firstText: Array<number | null> = [stream.events.find(replied)?.at ?? null];
-    for (const [k, t] of turns.slice(1).entries()) {
+    await waitTurn(0);
+    for (const t of turns.slice(1)) {
       const wait = start + (t.after_ms ?? 0) - Date.now();
       if (wait > 0) await pause(wait);
       live();
       const at = Date.now();
-      const r = await api("POST", `/v1/sessions/${sessionId}/messages`, { content: t.user, messageType: "text", pluginId: PLUGIN_ID });
-      sent++;
-      if (r.status !== 200) throw new Error(`message answered ${r.status}`);
-      lastMid = typeof r.json?.message_id === "string" ? r.json.message_id : undefined;
       sentAt.push(at);
-      await waitEnds(k + 2, at + turnWaitMs(false));
-      firstText.push(stream.events.find((e) => replied(e) && e.at >= at)?.at ?? null);
+      const r = await api("POST", `/v1/sessions/${sessionId}/messages`, { content: t.user, messageType: "text", pluginId: PLUGIN_ID });
+      mids.push(idOf(r.json?.message_id));
+      if (r.status !== 200) throw new Error(`message answered ${r.status}`);
+      await waitTurn(mids.length - 1);
     }
     await sleep(3_000);
     const rows = await replay(sessionId);
     const all = traceOf(rows);
-    const lastCalls = lastMid ? traceOf(rows, lastMid).calls : all.calls;
-    // The last turn's end as it streamed; none when only the stored events had it.
-    const last = ends().length >= turns.length ? ends().at(-1) : undefined;
-    const finalText = String(last?.data.final_text || all.final || "");
-    const lastSent = sentAt.at(-1)!;
-    const lastFirst = firstText.at(-1) ?? null;
-    // What the user was shown: the main agent's messages as they streamed (a turn's end on a stream carries no text). The final
-    // answer was shown with the last turn's last one, which can be well before the turn's end (the workspace sync follows it).
+    const lastMid = turns.length > 1 ? mids.at(-1) : null;   // a single-turn case: every event is the last turn's
+    const lastTrace = lastMid ? traceOf(rows, lastMid) : all;
+    const last = turns.length - 1;
+    // What the user was shown: the main agent's messages as they streamed (a turn's end on a stream carries no text). The
+    // final answer is the last turn's own, shown with its last message, which can be well before the turn's end (the
+    // workspace sync follows it); a last turn that showed nothing has no final answer, whatever an earlier turn said.
+    const lastReplies = repliesOf(last);
+    const finalText = lastReplies.length ? messagesOf(lastReplies).at(-1) ?? "" : String(lastTrace.final || "");
     const shown = messagesOf(stream.events);
-    const lastShown = stream.events.filter((e) => replied(e) && e.at >= lastSent).at(-1)?.at ?? last?.at;
+    const firstText = turns.map((_, k) => repliesOf(k)[0]?.at ?? null);
     const observed: Observed = {
-      mode: MODE, calls: lastCalls, shown: shown.length ? shown : [finalText], final: finalText,
-      firstReplyMs: lastFirst === null ? null : lastFirst - lastSent, finalMs: lastShown === undefined ? null : lastShown - lastSent,
+      mode: MODE, calls: lastTrace.calls, shown: shown.length ? shown : [finalText], final: finalText,
+      firstReplyMs: firstText[last] === null ? null : firstText[last]! - sentAt[last]!,
+      finalMs: lastReplies.length ? lastReplies.at(-1)!.at - sentAt[last]! : null,
       replyMs: firstText.map((a, k) => (a === null ? null : a - sentAt[k]!)), items: [], factValues: values,
     };
-    const trace = all;
-    return attemptOf(c, turns, observed, trace.calls.map((x) => x.name), []);
+    return attemptOf(c, turns, observed, all.calls.map((x) => x.name), []);
   } finally {
-    // Stopped mid-case: the turns already sent are let end first (a minute at most), as in the assistant mode, still denying
-    // what they ask to run; deleting the session would cut them off half done.
+    // Stopped mid-case: the turns already sent are let end first (a minute at most), as in the assistant mode; deleting the
+    // session would cut them off half done. Nothing is sent after the stop, a decision included: a turn waiting for one is cut
+    // off when the session is deleted, and the call it waits for never runs.
     if (stopSignal) {
-      await turnsOver(sessionId, (stored) => stored.length >= sent, () => ends().length >= sent, Date.now() + Math.min(60_000, turnWaitMs(false)),
-        (probe, at, every) => until(async () => { await denyAsked().catch(() => undefined); return probe(); }, at, every));
+      const over = await turnsOver(sessionId, (stored) => mids.every((_, k) => overBy(k)(stored)), () => mids.every((_, k) => streamedBy(k)()),
+        Date.now() + Math.min(60_000, turnWaitMs(false)), until);
+      if (!over) log(`a turn of ${c.id} was still running when its session was deleted`);
     }
     stream.close();
     if (!(await deleteOwn(sessionId))) { log(`could not delete session ${sessionId} of ${c.id}`); sessionsLeft.push(sessionId); }
@@ -696,9 +701,9 @@ async function paceSays(stream: LiveStream, prior: readonly SayMark[]): Promise<
   }
 }
 
-/** EVAL_SAY_LOG, else a file per identity in the host's temporary directory. */
+/** EVAL_SAY_LOG, else a file per identity under the operator's own ~/.cache/sa-eval (not a shared temporary directory). */
 const sayLogPath = (identity: string): string => process.env.EVAL_SAY_LOG
-  || join(tmpdir(), `sa-eval-says-${createHash("sha256").update(identity.trim().toLowerCase()).digest("hex").slice(0, 16)}.jsonl`);
+  || join(homedir(), ".cache", "sa-eval", `says-${createHash("sha256").update(identity.trim().toLowerCase()).digest("hex").slice(0, 16)}.jsonl`);
 
 function readSayLog(file: string): SayMark[] {
   try { return parseSayLog(readFileSync(file, "utf8")); } catch (err) {
@@ -710,7 +715,8 @@ function readSayLog(file: string): SayMark[] {
 /** The hour's counted says, for the next run on this host (written whole, then renamed into place). */
 function writeSayLog(file: string, says: readonly SayMark[]): void {
   try {
-    writeFileSync(`${file}.tmp`, says.map((m) => JSON.stringify(m)).join("\n") + (says.length ? "\n" : ""));
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    writeFileSync(`${file}.tmp`, says.map((m) => JSON.stringify(m)).join("\n") + (says.length ? "\n" : ""), { mode: 0o600 });
     renameSync(`${file}.tmp`, file);
   } catch (err) {
     log(`say log ${file} could not be written (the next run will not see this run's says): ${err instanceof Error ? err.message : String(err)}`);
@@ -791,13 +797,14 @@ async function main(): Promise<void> {
         }
         let a: Attempt;
         const caseStart = Date.now();
+        const earlier = new Set(RUN_MESSAGES);   // an earlier attempt's refusal that arrives late is not this one's
         try {
           a = MODE === "assistant" ? await runAssistant(filled, turns, sessionId, stream!) : await runBaseline(filled, turns);
         } catch (err) {
           a = { pass: false, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: null, finalMs: null, items: [], error: scrub(err instanceof Error ? err.message : String(err)) };
         }
         // A say the server refused for its hourly cap is the run's failure, not the assistant's.
-        const refused = MODE === "assistant" && !a.error ? capRefusedSays(stream!.events, caseStart) : 0;
+        const refused = MODE === "assistant" && !a.error ? capRefusedSays(stream!.events, caseStart, earlier) : 0;
         if (refused) a = { ...a, pass: false, error: `infra: ${refused} say(s) refused by the hourly cap (say_rate_limited)` };
         if (MODE === "assistant") writeSayLog(sayLog, mergeSays([priorSays, countedSays(stream!.events)], Date.now()));
         r.attempts.push(a);
@@ -817,8 +824,10 @@ async function main(): Promise<void> {
         if (stream) {
           // A turn already asked for may still start an item: let the run's turns end (a minute at most) and take every item
           // their calls answered for as the run's, whatever stopped the run.
-          await turnsOver(sessionId, (stored) => RUN_MESSAGES.every((id) => stored.includes(id)),
+          const over = await turnsOver(sessionId, (stored) => RUN_MESSAGES.every((id) => stored.includes(id)),
             () => RUN_MESSAGES.every((id) => turnEnded(stream!.events, id)), Date.now() + Math.min(60_000, turnWaitMs(true)), until);
+          // What a turn still running starts later is not seen, and not closed: a person must look.
+          if (!over) cleanupFailed.push(`turns of the run still running at its end (what they start is not closed): ${RUN_MESSAGES.filter((id) => !turnEnded(stream!.events, id)).join(",")}`);
           const above = (await board()).filter((x) => x.seq > floorAtStart);
           for (const i of itemsStartedBy(turnCalls(stream.events, RUN_MESSAGES), above)) RUN_ITEMS.add(i.item_id);
         }

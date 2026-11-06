@@ -12,17 +12,19 @@
  *   R2 an assistant session that is running, or was active a moment ago, refuses the run before anything is sent
  *   R3 SIGINT stops the run: nothing more is sent, the item the interrupted turn started is closed and its worker's session
  *      deleted, the session the run made is deleted, and the run exits 1 saying it was stopped; in baseline mode, a stop
- *      during a case's oracle reads sends nothing, and one during a turn lets the turn end before its session is deleted; a
+ *      during a case's oracle reads sends nothing, and one during a turn lets the turn end before its session is deleted and
+ *      sends no decision after it; a
  *      stop before the assistant session was asked for asks for none
  *   R4 the identity's says of the last hour, stored before the run, hold the first case until there is room; a say the
  *      server refused for its hourly cap makes the attempt the run's failure. Says of an earlier run, whose assistant session
  *      is gone, are read from its say log, and the run leaves its own there
  *   R5 baseline: a plain session's turn is over once its exec_complete is stored, what it showed is graded (a tool name in an earlier
  *      message fails the case; a sub-agent's message is not the first reply; the final answer's time is when it was shown, not
- *      the turn's end), and the session is deleted and seen gone
+ *      the turn's end), and the session is deleted and seen gone; R5b with two turns, what is graded of the last turn is its
+ *      own (another turn's message delivered again is not its answer)
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
- *      (an earlier turn of a case is held to its own)
+ *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
  */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -140,7 +142,7 @@ class FakeClaw {
       this.sessions.set(sessionId, { status: "running", stale: 0 });
       const content = String(JSON.parse(body).message?.content ?? "");
       this.sent.push({ at: Date.now(), content });
-      send(200, { ok: true, data: { session_id: sessionId } });
+      send(200, { ok: true, data: { session_id: sessionId, message: { message_id: "msg-first" } } });
       setTimeout(() => this.router(content, "msg-first", sessionId), 300);
       return;
     }
@@ -321,6 +323,8 @@ test("R3c SIGINT in baseline mode during a turn: the turn ends before the sessio
   const base = await claw.start();
   claw.router = (_content, id, sessionId) => {
     claw.emit({ type: "AssistantMessage", message_id: id, data: { content: [{ type: "text", text: "Looking." }] } }, Date.now(), sessionId);
+    // After the stop, the turn asks to run a held tool: nothing is sent after a stop, a decision included.
+    setTimeout(() => claw.emit({ type: "permissionRequest", message_id: id, tool_use_id: "tu-1", tool: "mcp__safe__workload_stop" }, Date.now(), sessionId), 1_800);
     setTimeout(() => {
       claw.emit({ type: "executionStats", message_id: id, turns: 1 }, Date.now(), sessionId);
       claw.emit({ type: "exec_complete", message_id: id, final_text: "3 nodes." }, Date.now(), sessionId);
@@ -339,6 +343,7 @@ test("R3c SIGINT in baseline mode during a turn: the turn ends before the sessio
     const deletedAt = claw.callAt[claw.calls.indexOf("DELETE /v1/sessions/plain-1")]!;
     assert.ok(deletedAt >= claw.settledAt.get("msg-first")!, "the turn under way ended before its session was deleted");
     assert.ok(!claw.sessions.has("plain-1"));
+    assert.ok(!claw.calls.includes("POST /v1/sessions/plain-1/messages"), "no decision sent after the stop");
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });
 
@@ -442,6 +447,29 @@ test("R5 baseline: the turn's end, what it showed, and its session", { timeout: 
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });
 
+test("R5b baseline, two turns: what is graded of the last turn is its own", { timeout: 120_000 }, async () => {
+  const claw = new FakeClaw();
+  const base = await claw.start();
+  claw.router = (content, id, sessionId) => {
+    const at = Date.now();
+    if (content === "first") claw.emit({ type: "AssistantMessage", message_id: id, data: { content: [{ type: "text", text: "There are 3 nodes." }] } }, at, sessionId);
+    else {
+      // The second turn shows nothing; the stream delivers the first turn's answer again (a reconnect) while it runs.
+      claw.emit({ type: "AssistantMessage", message_id: "msg-first", data: { content: [{ type: "text", text: "There are 3 nodes." }] } }, at, sessionId);
+    }
+    claw.emit({ type: "executionStats", message_id: id }, at, sessionId);
+    setTimeout(() => claw.emit({ type: "exec_complete", message_id: id, final_text: "" }, Date.now(), sessionId), 200);
+  };
+  const r = runner(base, [{ id: "t-base-004", pipeline: "catalog", area: "general", lang: "en", route: "answer",
+    turns: [{ user: "first" }, { user: "second", after_ms: 1_000 }], latency_budget_s: { first: 5 } }], { EVAL_MODE: "baseline", EVAL_PLUGIN_ID: "9" });
+  const run = await r.done;
+  await claw.stop();
+  try {
+    assert.match(run.out, /FAIL t-base-004#1 .*answered/, "the last turn answered nothing: an earlier turn's answer is not its");
+    assert.match(run.out, /FAIL t-base-004#1 .*first reply <= 5s/, "nor is another turn's message its first reply");
+  } finally { rmSync(r.dir, { recursive: true, force: true }); }
+});
+
 test("R6 a turn with no end on the stream", { timeout: 120_000 }, async () => {
   const claw = new FakeClaw();
   const base = await claw.start();
@@ -473,6 +501,7 @@ test("R6 a turn with no end on the stream", { timeout: 120_000 }, async () => {
     assert.match(run.out, /ERROR t-late-001#1 .*no end of the turn of msg-3 within 2 s of its message: not graded/, "a turn over after the wait is not graded");
     assert.match(run.out, /ERROR t-twoturn-001#1 .*no end of the turn of msg-4 within 2 s of its message: not graded/, "each turn has its own wait");
     assert.equal(run.code, 1, "an attempt that could not be graded fails the run");
+    assert.match(run.out, /cleanup: turns of the run still running at its end \(what they start is not closed\): msg-1/, "the silent turn is reported");
     assert.deepEqual(claw.calls.filter((c) => c.startsWith("DELETE")), ["DELETE /v1/sessions/asst-1"]);
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });

@@ -599,6 +599,9 @@ test("S19 the say cap", () => {
     refused(11, "error", "item_not_found: no such item"), refused(12, "success", "ok"),
     ev(13, { type: "toolUsed", tool: "mcp__assistant__work_create", status: "error", description: "say_rate_limited" })];
   assert.equal(capRefusedSays(events, 5), 1, "only the say refused for the cap, since the attempt began");
+  const late = { ...refused(20, "error", "say_rate_limited: at most 120 messages an hour"), data: { ...refused(20, "error", "say_rate_limited").data, message_id: "m-earlier" } };
+  assert.equal(capRefusedSays([...events, late], 5, new Set(["m-earlier"])), 1, "an earlier attempt's refusal arriving late is not this attempt's");
+  assert.equal(capRefusedSays([...events, late], 5), 2);
 });
 
 test("S20 sharing an identity", async () => {
