@@ -101,15 +101,15 @@ export function sourceTitle(raw: unknown, url: URL): string {
   return redact(cut) || url.host;
 }
 
-/** At a position: `[n]` that does not open a link (`[n](...)`). */
-const CITE_AT = /\[(\d{1,2})\](?!\()/y;
+/** At a position: `[n]`. */
+const CITE_AT = /\[(\d{1,2})\]/y;
 /**
- * What lets a text make a link at all: an address (`://`, `www.`, `mailto:`), an inline link or image (`](`), an HTML tag or an
- * autolink (`<`), a reference definition (`[1]: address` at a line's start). The router is told to put addresses in `sources` and
- * never in the text, so a text with any of them cites nothing: no `[n]` in it can be, or be inside, a link to an address of the
- * model's.
+ * What lets a text make a link at all: an address, protocol-relative ones included (`//`, `www.`, `mailto:`), an inline link or
+ * image or a reference definition, wherever it stands (a `]` before `(` or `:`, spaces allowed: inside a quote or a list too), an
+ * HTML tag or an autolink (`<`). The router is told to put addresses in `sources` and never in the text, so a text with any of them
+ * cites nothing: no `[n]` in it can be, or be inside, a link to an address of the model's.
  */
-const LINK_MAKING = /:\/\/|\bwww\.|mailto:|\]\(|<|^ {0,3}\[[^\]\n]+\]:/im;
+const LINK_MAKING = /\/\/|\bwww\.|mailto:|\]\s*[(:]|</i;
 
 /**
  * The numbers the text cites as `[n]` on their own, outside every bracket, and none at all in a text that can make a link
