@@ -31,6 +31,12 @@ record it.
 - Three GitHub writes, each held for the user's decision like every write of the `github` server: `checks_rerun_failed` (run
   again the failed jobs of a GitHub Actions workflow run; `checks_list` now gives a job's `run_id`), `pr_request_reviewers` (people
   and teams) and `labels_set` (the whole list of an issue's or pull request's labels). None is a router read.
+- An assistant router turn lists the user's own remote connectors itself: `connector_list` (where `CLAW_REMOTE_AGENTS_ENABLED` is on)
+  answers each connector's name, whether it is online, when it was last seen and the agents it offers, with how many there are and
+  how many are online. It only reads the caller's rows, as `GET /v1/remote-agents/connectors` does, and a router may still call it
+  after another lookup has answered. The names are what the connector program reported, so they are untrusted: the call marks the
+  turn as having read untrusted text, as `work_recall` does, and is one of the router's `read_taint` sources, so the rest of the
+  turn cannot act for the user (`work_create`, `work_send`, reviews, schedules and the other acting tools are refused).
 - Citations for the assistant router's answers, behind `CLAW_ASSISTANT_CITATIONS` (default off). The router writes [1], [2] in its
   `say` and names each number's address in `say`'s new `sources` argument; the new `ExecuteRequest.cite` makes Brain keep the sources
   the turn's own lookups returned (`web_search` hits and what the API's GitHub server lists in its results' `_meta["claw/sources"]`:
@@ -850,6 +856,9 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A work item's worker whose item waits for a person (`needs_you`) or is `done` no longer keeps its sandbox for background work: past
+  `WAITING_ITEM_SANDBOX_RELEASE_SECONDS` (API, default 900) of quiet with nothing queued, the orphan sweep stops it, and the next turn
+  starts a fresh one. A review session's leftover test Postgres had held global-cpu sandboxes for up to two hours behind held merges.
 - The GitHub list reads (`issue_search`, `pr_list`, `issue_list`, `repo_list`, `code_search`) answer the whole list a question
   asks for: `{ total_count, shown, complete, next_page?, items }`, pages of 50 by default (up to 100), and an answer of at most
   `GITHUB_LIST_MAX_CHARS` that Brain keeps whole (any other result is still cut to its head and tail at 6000 characters, which
