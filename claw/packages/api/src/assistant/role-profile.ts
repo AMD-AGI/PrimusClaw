@@ -39,6 +39,8 @@ import { AFTER_READ_TOOLS, routerLookups } from "./read-tools.js";
 import { heldForPersonManifest, renderHeldForPerson } from "./holds.js";
 import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
+import { promptImagesOf, renderFilesState } from "./files.js";
+import { turnMessage } from "./inbound.js";
 import { startWorkerRun } from "./run-started.js";
 import { githubEventsEnabled } from "./github-events.js";
 import { jobWatchesEnabled } from "./job-watch.js";
@@ -266,6 +268,14 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
     const held = renderHeldForPerson(await heldForPersonManifest(role.userId));
     if (held) state.push(held);
+    // What the person sent beside their words (`files.ts`): the router is told what came, and is shown the pictures itself (Brain
+    // reads them from this session's uploads), since it has no sandbox to open them in.
+    const files = (await turnMessage((t, p) => db.query(t, p), sessionId, messageId))?.context.files ?? [];
+    if (files.length) {
+      state.push(renderFilesState(files));
+      const images = promptImagesOf(files);
+      if (images.length) task.prompt_images = images;
+    }
     if (CLAW_ASSISTANT_TOOLS) {
       withSystemAppend(task, ROUTER_REVIEW_PROMPT);
       const review = await reviewContextFor(role.userId, sessionId, messageId);

@@ -92,7 +92,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { apiClient, until } from "./assistant-p1-lib.js";
@@ -101,12 +101,12 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   BUILTIN_TOOLS, assistantInUse, capRefusedSays, caseHash, caseSays, cardsOf, cleanupOf, countedSays, countedSaysOf, deleteSessionConfirmed,
-  mergeSays, parseSayLog, endedTurns, storedTurnEnds, streamMissed, filledCase, finalSay, grade, forRecording, identityRefusal, itemsStartedBy,
+  mergeSays, parseSayLog, endedTurns, storedTurnEnds, streamMissed, filledCase, filesFrom, finalSay, grade, forRecording, identityRefusal, itemsStartedBy,
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf,
   sayWaitMs, saysOf, staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern,
   type SayMark, type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
-  type Recording, type Turn, type Vars, type HoldSeen, type HoldSpec,
+  type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
 import * as readTools from "../../src/assistant/read-tools.js";
 
@@ -447,6 +447,29 @@ const attemptOf = async (c: EvalCase, turns: Turn[], o: Observed, tools: string[
 
 // --- One attempt on the assistant path ------------------------------------------------------------------------------
 
+/**
+ * The files of a turn, as a channel sends them: uploaded to the assistant's session (`POST /v1/sessions/:id/upload`, one folder per
+ * turn) and named beside the message (`channel_context.files`, with the path the upload answered).
+ */
+async function uploadFiles(sessionId: string, folder: string, files: readonly TurnFile[]): Promise<Array<Record<string, unknown>>> {
+  const form = new FormData();
+  const named: Array<{ name: string; type: string; size: number }> = [];
+  for (const f of files) {
+    const bytes = readFileSync(join(CASES_DIR, f.fixture));
+    const name = f.name ?? basename(f.fixture);
+    const type = f.media_type ?? "application/octet-stream";
+    form.append("file", new Blob([bytes], { type }), `${folder}/${name}`);
+    named.push({ name, type, size: bytes.length });
+  }
+  const res = await fetch(`${CLAW}/v1/sessions/${sessionId}/upload?ttl_days=1`, {
+    method: "POST", headers: { authorization: `Bearer ${KEY}` }, body: form, signal: AbortSignal.timeout(120_000),
+  });
+  const out = await res.json().catch(() => null) as { uploaded?: Array<{ path?: string }> } | null;
+  const uploaded = new Set((out?.uploaded ?? []).map((u) => u.path));
+  if (res.status !== 200 || named.some((n) => !uploaded.has(`${folder}/${n.name}`))) throw new Error(`upload answered ${res.status}`);
+  return named.map((n) => ({ path: `${folder}/${n.name}`, name: n.name, media_type: n.type, size: n.size }));
+}
+
 async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, stream: LiveStream): Promise<Attempt> {
   // Never into a conversation still going: its messages and items would be taken for this case's.
   if (!(await idle(sessionId, turnWaitMs(true)))) throw new Error(`the assistant session was still running ${turnWaitMs(true) / 1000} s before ${c.id}: nothing sent, not graded`);
@@ -463,9 +486,12 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
       const wait = start + (t.after_ms ?? 0) - Date.now();
       if (wait > 0) await pause(wait);
       live();
+      const files = t.files?.length ? await uploadFiles(sessionId, `sa-eval/${c.id}-${messageIds.length + 1}-${Date.now()}`, t.files) : [];
       const at = Date.now();
       // A message whose answer was lost (or a 5xx) may still have been taken: its turn is waited for at the end, unnamed.
-      const r = await api("POST", `/v1/sessions/${sessionId}/messages`, { content: t.user, messageType: "text" })
+      const r = await api("POST", `/v1/sessions/${sessionId}/messages`, {
+        content: t.user, messageType: "text", ...(files.length ? { channel_context: { files } } : {}),
+      })
         .catch((err) => { UNKNOWN_SENDS.n++; throw err; });
       if (r.status >= 500) UNKNOWN_SENDS.n++;
       const id = r.json?.message_id;
@@ -529,7 +555,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
     mode: MODE, route: routeOf(lastItems, lastRouter, lastSays), cards: cardsOf(lastSays), calls: lastCalls, shown: shown.map((s) => s.text),
     final: final?.text ?? "", firstReplyMs: firstOwn === null ? null : firstOwn - lastSent, finalMs: final ? final.at - lastSent : null,
     replyMs: messageIds.map((id, k) => { const s = says.find((x) => x.turn === id); return s ? s.at - sentAt[k]! : null; }),
-    items, factValues: values, ...(hold ? { hold } : {}),
+    items, factValues: values, delivered: filesFrom(says, lastIds), ...(hold ? { hold } : {}),
   };
   const allCalls = [...turnCalls(stream.events, messageIds)];
   for (const i of items) if (!lastIds.includes(i.item_id)) allCalls.push(...(await read(`item ${i.seq}'s worker calls`, workerCalls(i.item_id), [])));
@@ -880,6 +906,7 @@ async function main(): Promise<void> {
       if (stopSignal) break;
       results.push(r);
       if (c.modes && !c.modes.includes(MODE)) { r.skipped = `${c.modes.join(",")} only`; continue; }
+      if (MODE !== "assistant" && c.turns.some((t) => t.files?.length)) { r.skipped = "files are sent on the assistant path only"; continue; }
       // Placeholders filled everywhere they sit: turns, claims, values, oracle queries and the rubric.
       const filled = filledCase(c, VARS);
       if (filled === null) { r.skipped = `needs ${missingVars(c, VARS).join(", ")}`; continue; }

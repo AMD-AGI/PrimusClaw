@@ -23,6 +23,8 @@ import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approva
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp, mcpUnavailableNote } from "../clients/mcp.js";
 import { buildPrompt, buildProgressiveSkillHint, buildSkillAndMcpHints, listProgressiveSkills, renderSystemHints } from "./prompt.js";
+import { loadPromptImages, promptContent } from "./prompt-images.js";
+import { readObjectBounded } from "../workspace/s3-uploader.js";
 import { SkillStore, LOAD_SKILL_TOOL } from "./skill-store.js";
 import { loadPlatformDefaults, resolveDefaultSkills, skillDescription, LazyDefaultSkills, type DefaultSkill } from "./platform-defaults.js";
 import { metrics } from "../infra/metrics.js";
@@ -483,7 +485,13 @@ export class AgentEngine {
         }
       }
       const unavailable = mcpUnavailableNote(mcpResult.failed);
-      messages.push({ role: "user" as const, content: unavailable ? `${fullPrompt}\n\n${unavailable}` : fullPrompt });
+      const promptText = unavailable ? `${fullPrompt}\n\n${unavailable}` : fullPrompt;
+      // The pictures the person sent with this message, beside its words (an assistant's router turn: it has no sandbox to `read`
+      // them in). Read from this session's own uploads, under the prefix the workspace sync files them at.
+      const promptImages = request.prompt_images?.length
+        ? await loadPromptImages(request.prompt_images, `users/${request.user_id || "default"}/sessions/${request.session_id}/`, readObjectBounded)
+        : null;
+      messages.push({ role: "user" as const, content: promptImages ? promptContent(promptText, promptImages) : promptText });
 
       {
         // Plugin skills of a hooks plugin — write each file from Brain local dir
