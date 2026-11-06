@@ -352,30 +352,33 @@ describe("assistant outbound", { skip }, () => {
       assert.deepEqual(await tally(), [2, 4]);
     });
 
-    test("tells the user once when two refusals come at once on either side of an hour", async () => {
-      const limited = deps({ maxPerHour: 1 });
-      await say("one", {}, limited);
-      // Each refusal's notice reads the hour, and waits there a little for the other: without the user's lock both
-      // would look for a notice before either had stored one, under two different hours.
-      let arrived = 0;
-      let bothThere!: () => void;
-      const both = new Promise<void>((resolve) => { bothThere = resolve; });
-      outbound.setCapNoticeHourForTest(async (hour) => {
-        arrived += 1;
-        const mine = arrived;
-        if (arrived === 2) bothThere();
-        await Promise.race([both, sleep(300)]);
-        return hour + mine - 1;
+    for (const order of ["the earlier hour first", "the later hour first"] as const) {
+      test(`tells the user once when two refusals come at once on either side of an hour, ${order}`, async () => {
+        const limited = deps({ maxPerHour: 1 });
+        await say("one", {}, limited);
+        // Each refusal's notice reads the hour, and waits there a little for the other: without the user's lock both
+        // would look for a notice before either had stored one, under two different hours. The later hour first is a
+        // transaction that started before the hour turned and got the lock after one that started after it.
+        let arrived = 0;
+        let bothThere!: () => void;
+        const both = new Promise<void>((resolve) => { bothThere = resolve; });
+        outbound.setCapNoticeHourForTest(async (hour) => {
+          arrived += 1;
+          const mine = arrived;
+          if (arrived === 2) bothThere();
+          await Promise.race([both, sleep(300)]);
+          return order === "the earlier hour first" ? hour + mine - 1 : hour + 2 - mine;
+        });
+        try {
+          const results = await Promise.allSettled([say("two", {}, limited), say("three", {}, limited)]);
+          assert.ok(results.every((r) => r.status === "rejected" && (r.reason as { code?: string }).code === "say_rate_limited"));
+        } finally {
+          outbound.setCapNoticeHourForTest(null);
+        }
+        assert.equal(arrived, 2, "both refusals reached the notice");
+        assert.equal((await saysRows()).filter((s) => s.fallback).length, 1);
       });
-      try {
-        const results = await Promise.allSettled([say("two", {}, limited), say("three", {}, limited)]);
-        assert.ok(results.every((r) => r.status === "rejected" && (r.reason as { code?: string }).code === "say_rate_limited"));
-      } finally {
-        outbound.setCapNoticeHourForTest(null);
-      }
-      assert.equal(arrived, 2, "both refusals reached the notice");
-      assert.equal((await saysRows()).filter((s) => s.fallback).length, 1);
-    });
+    }
 
     test("is a hard cap under concurrent says", async () => {
       const limited = deps({ maxPerHour: 3 });

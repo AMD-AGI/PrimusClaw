@@ -195,7 +195,7 @@ async function loadItem(q: Querier, itemId: string, userId?: string): Promise<It
 
 /**
  * The cap's notice is stored under the hour it was sent in, by the database's clock, so the only ones that can be less
- * than an hour old are this hour's and the last hour's. Not the stretch since the user reached the cap: under a steady
+ * than an hour old are this hour's and the last hour's (and, to a transaction that waited, the next hour's). Not the stretch since the user reached the cap: under a steady
  * overload the cap lets one message through each time the oldest turns an hour old, and every such stretch would be
  * told again.
  */
@@ -209,22 +209,25 @@ export function setCapNoticeHourForTest(hook: ((hour: number) => number | Promis
 
 /**
  * The cap's notice, unless the user has had one in the last hour: `null` then. Under the lock `say` takes for the user,
- * and with the hour read once the lock is held, so two refusals at once -- on either side of an hour, on two replicas
- * -- see each other's notice instead of storing one each.
+ * so two refusals at once -- on either side of an hour, on two replicas -- see each other's notice instead of storing
+ * one each.
  */
 async function storeCapNotice(input: SayInput, text: string, deps: SayDeps): Promise<Stored | null> {
   return storeSettled(async (q, storeOne) => {
     await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
-    const read = Number((await q("SELECT floor(extract(epoch FROM clock_timestamp()) / 3600)::bigint AS h")).rows[0].h);
+    // The transaction's own time, which is what the notice's created_at will say: one clock for the hour, the age and
+    // the row. A transaction that waited for the lock may be an hour behind one that stored a notice meanwhile, so the
+    // next hour's notice is looked for as well.
+    const read = Number((await q("SELECT floor(extract(epoch FROM now()) / 3600)::bigint AS h")).rows[0].h);
     const hour = capNoticeHourHook ? await capNoticeHourHook(read) : read;
-    const ids = [hour, hour - 1].map((h) => deterministicEventId("assistant.notice", input.userId, capNoticeKey(h)));
+    const id = (h: number) => deterministicEventId("assistant.notice", input.userId, capNoticeKey(h));
     const told = await q(
-      "SELECT 1 FROM claw_assistant_says WHERE say_id = ANY($1::uuid[]) AND created_at > clock_timestamp() - INTERVAL '1 hour'",
-      [ids],
+      "SELECT 1 FROM claw_assistant_says WHERE say_id = ANY($1::uuid[]) AND created_at > now() - INTERVAL '1 hour'",
+      [[hour + 1, hour, hour - 1].map(id)],
     );
     if (told.rowCount) return null;
     return storeOne({
-      type: "assistant.say", fallback: true, item: null, sayId: ids[0],
+      type: "assistant.say", fallback: true, item: null, sayId: id(hour),
       userId: input.userId, sessionId: input.sessionId, text: sayCapNotice(text),
     });
   }, (stored) => announce(stored, deps));
