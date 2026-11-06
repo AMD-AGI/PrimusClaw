@@ -36,12 +36,6 @@ record it.
 - Three GitHub writes, each held for the user's decision like every write of the `github` server: `checks_rerun_failed` (run
   again the failed jobs of a GitHub Actions workflow run; `checks_list` now gives a job's `run_id`), `pr_request_reviewers` (people
   and teams) and `labels_set` (the whole list of an issue's or pull request's labels). None is a router read.
-- An assistant router turn lists the user's own remote connectors itself: `connector_list` (where `CLAW_REMOTE_AGENTS_ENABLED` is on)
-  answers each connector's name, whether it is online, when it was last seen and the agents it offers, with how many there are and
-  how many are online. It only reads the caller's rows, as `GET /v1/remote-agents/connectors` does, and a router may still call it
-  after another lookup has answered. The names are what the connector program reported, so they are untrusted: the call marks the
-  turn as having read untrusted text, as `work_recall` does, and is one of the router's `read_taint` sources, so the rest of the
-  turn cannot act for the user (`work_create`, `work_send`, reviews, schedules and the other acting tools are refused).
 - An assistant's router turn diagnoses a failure itself: of the assistant plugin's servers it is offered SaFE's `workload_logs`,
   `workload_events`, `workload_pod_logs`, `workload_pod_containers`, `node_pod_logs`, `node_reboot_logs`, `cluster_logs` and
   `flavor_avail`, and the agent board's `notification_read` and `milestone_read`; the user's scheduled tasks (`trigger_list` of
@@ -53,6 +47,13 @@ record it.
   value runs to its line's end, or to the closing quote of the string its name is in, and no separator or bracket ends it; Kubernetes environment variables named like a credential; armored private keys, OpenPGP ones
   included, and a key whose BEGIN line the tail cut off, from its first base64 line), and keeps the last 6000 characters of a
   plain-text answer.
+- An assistant router turn answers about the user's development environments itself: `devenv_list` (where
+  `CLAW_REMOTE_AGENTS_ENABLED` is on) lists their own machines (online, last seen, version, agents) and every agent session on them
+  (open through Claw, or the agent's own conversation a connector offers to take over) with its state, folder, last activity, a
+  label and the command that attaches the chat to it; `detail: "activity"` adds what each one is doing in the agent's words.
+  Either read marks the turn as having read untrusted text; such a turn may still put the attach command of one of the user's own
+  sessions to them as a button, and nothing else. The router prompt treats 开发环境 / dev box / my machine as the connector, never as
+  a SaFE workspace, and "connect me to it" as `channel_action` with that attach command. Only the caller's rows are read.
 - Citations for the assistant router's answers, behind `CLAW_ASSISTANT_CITATIONS` (default off). The router writes [1], [2] in its
   `say` and names each number's address in `say`'s new `sources` argument; the new `ExecuteRequest.cite` makes Brain keep the sources
   the turn's own lookups returned (`web_search` hits and what the API's GitHub server lists in its results' `_meta["claw/sources"]`:
