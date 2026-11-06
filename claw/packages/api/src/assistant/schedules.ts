@@ -128,7 +128,13 @@ async function proposingTurn(q: Querier, claims: AssistantTokenClaims): Promise<
   return { userId, zh: hasHan(message.content) };
 }
 
-/** Store the confirmation and its card; the same proposal twice in one turn is the first one. */
+/** The card an identical proposal earlier in this turn stored, with whether it has lapsed: it may have been answered since. */
+const SAME_CARD_SQL = "SELECT *, expires_at <= NOW() AS lapsed FROM claw_assistant_confirmations WHERE dedupe_key = $1";
+
+/**
+ * Store the confirmation and its card; the same proposal twice in one turn is the first one, as it stands now (`proposed` tells the
+ * model when that card is no longer open).
+ */
 async function propose(
   q: Querier, claims: AssistantTokenClaims, userId: string, zh: boolean, kind: ScheduleKind, params: CreateParams | CancelParams, nextRun: Date | null,
 ): Promise<{ row: Record<string, any>; announce: (() => Promise<void>) | null; subscribers: number }> {
@@ -136,7 +142,7 @@ async function propose(
     "SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations WHERE user_id = $1 AND status = 'pending' AND expires_at > NOW()", [userId],
   )).rows[0].n);
   const dedupeKey = createHash("sha256").update(`${claims.sid}\u0000${claims.mid}\u0000${kind}\u0000${JSON.stringify(params)}`).digest("hex");
-  const same = (await q("SELECT * FROM claw_assistant_confirmations WHERE dedupe_key = $1", [dedupeKey])).rows[0] as Record<string, any> | undefined;
+  const same = (await q(SAME_CARD_SQL, [dedupeKey])).rows[0] as Record<string, any> | undefined;
   if (same) return { row: same, announce: null, subscribers: 0 };
   if (pending >= MAX_PENDING_CONFIRMATIONS) {
     throw new ToolRefused("too_many_pending", `the user already has ${MAX_PENDING_CONFIRMATIONS} cards waiting for an answer: ask them to answer those first`);
@@ -150,7 +156,7 @@ async function propose(
     [id, userId, claims.sid, claims.mid, kind, JSON.stringify(params), dedupeKey, CONFIRMATION_TTL],
   )).rows[0] as Record<string, any> | undefined;
   // The same call made twice at once: the other one stored it and shows its card.
-  if (!row) return { row: (await q("SELECT * FROM claw_assistant_confirmations WHERE dedupe_key = $1", [dedupeKey])).rows[0] as Record<string, any>, announce: null, subscribers: 0 };
+  if (!row) return { row: (await q(SAME_CARD_SQL, [dedupeKey])).rows[0] as Record<string, any>, announce: null, subscribers: 0 };
   const ref = confirmationRef(id);
   const card = await recordWriteConfirm(q, {
     userId, sessionId: claims.sid, text: confirmText(kind, params, ref, zh, nextRun),
@@ -163,10 +169,29 @@ async function propose(
 
 function proposed(row: Record<string, any>, subscribers: number, what: string): Record<string, unknown> {
   const ref = confirmationRef(String(row.confirmation_id));
+  if (row.status !== "pending" || row.lapsed === true) return answeredBefore(row, ref, what);
   return {
     ok: true, done: false, confirmation_id: row.confirmation_id, ref, status: row.status,
     note: `nothing has been ${what} yet: the user was shown a card with what would be done and a button; it is done only when they press it, or reply exactly 批准 #${ref}. Tell them to check the card and press it; never say it is done.`
       + (subscribers === 0 ? ` No chat of the user can draw the button right now, so tell them to reply 批准 #${ref}.` : ""),
+  };
+}
+
+/**
+ * The same proposal again in a turn whose card is no longer open: the user already answered it (or it lapsed). Said as it is, so the
+ * model neither tells the user to press a card that is gone nor says a denied one is waiting.
+ */
+function answeredBefore(row: Record<string, any>, ref: string, what: string): Record<string, unknown> {
+  const status = row.status === "pending" ? "expired" : String(row.status);
+  const note = status === "done"
+    ? `done already: the user confirmed this same card (#${ref}) earlier, so it has been ${what}. Tell them in one line; do not propose it again.`
+    : status === "denied"
+      ? `not done: the user said no to this same card (#${ref}). Do not propose it again in this turn; if they still want it they will ask.`
+      : status === "expired"
+        ? `not done: this same card (#${ref}) lapsed unanswered. Nothing has been ${what}; if the user still wants it, they ask again in a new message.`
+        : `not done: the user confirmed this same card (#${ref}) but it failed (${String(row.result?.error ?? "error")}). Tell them.`;
+  return {
+    ok: true, done: status === "done", confirmation_id: row.confirmation_id, ref, status, ...(row.result ? { result: row.result } : {}), note,
   };
 }
 

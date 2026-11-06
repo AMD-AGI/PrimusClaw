@@ -13,12 +13,14 @@
  *   S3  trigger_cancel holds too, and its press really deletes the trigger
  *   S4  a typed approval command (批准 #ref) creates it through confirmation_answer, only from a signed-in message written after the
  *       card was shown; a yes in other words, and an unattended message, let nothing through; a no likewise needs 拒绝 #ref
- *   S5  the limits are asked before a card is shown: an invalid schedule, a full trigger list, no key, a report's turn, a worker
+ *   S5  the limits are asked before a card is shown: an invalid schedule, a full trigger list, no key, a report's turn, a turn that
+ *       has read what others wrote (the brief), a worker
  *   S6  trigger_list shows the user's triggers and the cards waiting; the router's state lists the cards
  *   S7  the tools are offered to a router only with the trigger tools on, and confirmation_answer reaches a card with the review tools
  *       on or off
  *   S8  a lapsed card does nothing when pressed
  *   S9  a card answered after the next run it showed: the trigger starts from the run after, and the answer says so
+ *  S10  the same proposal again in a turn whose card was answered (or lapsed) says what became of it, and shows no new card
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -241,6 +243,11 @@ describe("assistant schedules", { skip }, () => {
       );
     }
     assert.equal(await code(sch.triggerCreateTool(await userTurn(alice, "每天 9 点"), DAILY)), "trigger_limit_reached");
+    // A turn that has read what others wrote (the brief holds run titles and workload names) proposes nothing more, to create or cancel.
+    const read = await userTurn(alice, "看看今天的简报，然后取消 n0");
+    await (await import("../src/assistant/brief.js")).briefTool(read);
+    assert.equal(await code(sch.triggerCreateTool(read, DAILY)), "read_untrusted");
+    assert.equal(await code(sch.triggerCancelTool(read, { trigger_id: "t0" })), "read_untrusted");
     // A worker never has the router's tools.
     const item = await w.createItem(alice, "something");
     assert.equal(await code(sch.triggerCreateTool(await w.workerTurn(item.itemId), DAILY)), "not_allowed");
@@ -309,6 +316,45 @@ describe("assistant schedules", { skip }, () => {
     assert.equal(pressed.body.data.status, "done");
     assert.equal(pressed.body.data.result.first_run_moved, true);
     assert.ok(Date.parse(pressed.body.data.result.next_run) > Date.now());
+  });
+
+  test("S10 the same proposal again after its card was answered says what became of it", async () => {
+    await w.subscribe(alice.userId);
+    const said = () => count("claw_assistant_says");
+    // Denied: not shown again as if it were waiting.
+    const t1 = await userTurn(alice, "每天 9 点");
+    const first = await sch.triggerCreateTool(t1, DAILY) as Record<string, any>;
+    await press("alice", first.confirmation_id, "deny");
+    const denied = await sch.triggerCreateTool(t1, DAILY) as Record<string, any>;
+    assert.deepEqual([denied.confirmation_id, denied.status, denied.done], [first.confirmation_id, "denied", false]);
+    assert.match(denied.note, /said no to this same card/);
+    assert.doesNotMatch(denied.note, /press/);
+    // Done: said as done.
+    const t2 = await userTurn(alice, "每周一 10 点");
+    const weekly = { ...DAILY, name: "weekly", schedule: "0 10 * * 1" };
+    const second = await sch.triggerCreateTool(t2, weekly) as Record<string, any>;
+    await press("alice", second.confirmation_id, "allow");
+    const done = await sch.triggerCreateTool(t2, weekly) as Record<string, any>;
+    assert.deepEqual([done.status, done.done], ["done", true]);
+    assert.match(done.note, /done already/);
+    assert.equal(done.result.trigger.schedule, "0 10 * * 1");
+    assert.equal(await count("claw_triggers"), 1, "asking again creates nothing more");
+    // Lapsed unanswered: said as lapsed, though nobody has pressed it since.
+    const t3 = await userTurn(alice, "每天 8 点");
+    const daily8 = { ...DAILY, name: "eight", schedule: "0 8 * * *" };
+    const third = await sch.triggerCreateTool(t3, daily8) as Record<string, any>;
+    await w.q("UPDATE claw_assistant_confirmations SET expires_at = NOW() - INTERVAL '1 second' WHERE confirmation_id = $1", [third.confirmation_id]);
+    const lapsed = await sch.triggerCreateTool(t3, daily8) as Record<string, any>;
+    assert.deepEqual([lapsed.status, lapsed.done], ["expired", false]);
+    assert.match(lapsed.note, /lapsed unanswered/);
+    // Still open: the card it is.
+    const t4 = await userTurn(alice, "每天 7 点");
+    const daily7 = { ...DAILY, name: "seven", schedule: "0 7 * * *" };
+    const fourth = await sch.triggerCreateTool(t4, daily7) as Record<string, any>;
+    const open = await sch.triggerCreateTool(t4, daily7) as Record<string, any>;
+    assert.deepEqual([open.confirmation_id, open.status, open.done], [fourth.confirmation_id, "pending", false]);
+    assert.match(open.note, /never say it is done/);
+    assert.equal(await said(), 4, "one card per proposal, none for asking again");
   });
 
   test("S8 a card pressed after it lapsed does nothing", async () => {

@@ -116,13 +116,16 @@ export async function tickTriggers(now: Date = new Date()): Promise<void> {
       await recordFire(t.trigger_id, key, t.owner_user_id, "skipped_stale", null, null);
       continue;
     }
+    // A brief starts no run, so the run limits below are not its: a user at their daily run limit still gets the brief, and there
+    // is no earlier run of it to wait for.
+    const brief = t.action === "brief";
     // Counted before this firing's own row is considered, so the limit is the number of runs allowed.
-    const used = Number((await db.query(
+    const used = brief ? null : Number((await db.query(
       `SELECT COUNT(*)::int AS n FROM claw_trigger_fires
         WHERE owner_user_id = $1 AND status = 'started' AND session_id IS NOT NULL AND fired_at > $2`,
       [t.owner_user_id, new Date(now.getTime() - DAY_MS)],
     )).rows[0].n);
-    if (used >= TRIGGER_DAILY_LIMIT_PER_USER) {
+    if (used !== null && used >= TRIGGER_DAILY_LIMIT_PER_USER) {
       // A rolling limit, not a kill switch: this firing is skipped and recorded
       // with its reason, and the next one is judged again once runs age out of
       // the 24-hour window. Nothing is paused.
@@ -130,12 +133,12 @@ export async function tickTriggers(now: Date = new Date()): Promise<void> {
       logger.warn({ triggerId: t.trigger_id }, "trigger.daily_limit_reached");
       continue;
     }
-    if (await previousRunOpen(t)) {
+    if (!brief && await previousRunOpen(t)) {
       await recordFire(t.trigger_id, key, t.owner_user_id, "skipped_overlap", null, null);
       continue;
     }
 
-    const outcome = t.action === "brief" ? await fireBriefTrigger(t, planned)
+    const outcome = brief ? await fireBriefTrigger(t, planned)
       : t.item_id ? await fireIntoItem(t, planned) : await fireTrigger(t, planned);
     if (outcome.status === "started" || outcome.status === "delivered") {
       // A brief runs nothing: it is recorded as delivered, with no session, so it neither counts as a run against the daily

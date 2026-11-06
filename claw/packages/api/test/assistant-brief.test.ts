@@ -13,6 +13,8 @@
  *       time, recorded as delivered; one whose owner has no assistant fails with the reason
  *   B5  the router's brief tool answers the same brief in the user's language, read with the key their messages gave, and the turn
  *       no longer acts for them after it; a worker has no such tool
+ *   B6  a brief starts no run, so a user at their daily run limit still gets it, while a run of theirs due at the same time is
+ *       skipped for the limit
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -169,6 +171,18 @@ describe("assistant brief", { skip }, () => {
     assert.ok(b.sections.filter((x) => x.key !== "safe").every((x) => x.checked));
     const noKey = await brief.composeBrief("alice", { apiKey: null, lang: "en", now });
     assert.equal(noKey.sections.find((x) => x.key === "safe")!.summary, "could not check (no SaFE key of yours)");
+    // Claw's own data failing to read is no different: the section whose query fails (its table is gone here) says so, the rest stand.
+    safeError = null;
+    await w.q("ALTER TABLE claw_assistant_job_watches RENAME TO claw_assistant_job_watches_away");
+    try {
+      const broken = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "en", now });
+      const jobs = broken.sections.find((x) => x.key === "jobs")!;
+      assert.deepEqual([jobs.checked, jobs.summary, jobs.lines], [false, "could not check (error)", []]);
+      assert.ok(broken.sections.filter((x) => x.key !== "jobs").every((x) => x.checked), JSON.stringify(broken.sections));
+      assert.match(broken.text, /^Jobs: could not check \(error\)$/m);
+    } finally {
+      await w.q("ALTER TABLE claw_assistant_job_watches_away RENAME TO claw_assistant_job_watches");
+    }
     // Nothing anywhere: the brief says so in one line rather than inventing work.
     await w.q("TRUNCATE claw_work_items, claw_work_item_subscriptions, claw_work_item_github_events, claw_notification_outbox, claw_github_confirmations, claw_assistant_confirmations, claw_assistant_job_watches, claw_assistant_job_events CASCADE");
     workloads = [];
@@ -268,5 +282,36 @@ describe("assistant brief", { skip }, () => {
     await w.q("DELETE FROM claw_assistants WHERE user_id = 'alice'");
     const out = await fire.fireBriefTrigger(row as never, new Date());
     assert.deepEqual(out, { status: "failed_start", detail: "no_assistant", credentialInvalid: false });
+  });
+
+  test("B6 a user at their daily run limit still gets the brief: it starts no run", async () => {
+    await world();
+    await w.subscribe("alice");
+    const make = async (payload: Record<string, unknown>) => {
+      const r = await app.inject({ method: "POST", url: "/v1/triggers", headers: { "x-test-user": "alice" }, payload });
+      assert.equal(r.statusCode, 200, r.body);
+      return r.json().data.trigger_id as string;
+    };
+    const briefId = await make({ name: "Daily brief", action: "brief", schedule: "30 8 * * 1-5", timezone: "Asia/Shanghai" });
+    const runId = await make({ name: "Daily check", prompt: "Check my open pull requests.", schedule: "0 9 * * *", timezone: "UTC" });
+    // As many runs in the last day as a user may have.
+    const { TRIGGER_DAILY_LIMIT_PER_USER } = await import("../src/config.js");
+    await w.q(
+      `INSERT INTO claw_trigger_fires (trigger_id, fire_key, owner_user_id, session_id, status, fired_at)
+       SELECT 'earlier', 'k' || i, 'alice', 'sess-' || i, 'started', NOW() - INTERVAL '1 hour' FROM generate_series(1, $1) AS i`,
+      [TRIGGER_DAILY_LIMIT_PER_USER],
+    );
+    await w.q("UPDATE claw_triggers SET next_fire_at = $1", [new Date(Date.now() - 30_000)]);
+    const sched = await import("../src/triggers/scheduler.js");
+    await sched.tickTriggers(new Date());
+    const fired = Object.fromEntries((await w.q(
+      "SELECT trigger_id, status, detail FROM claw_trigger_fires WHERE trigger_id = ANY($1)", [[briefId, runId]],
+    )).map((r) => [r.trigger_id, [r.status, r.detail]]));
+    assert.deepEqual(fired[runId], ["skipped_quota", "daily_limit"], "the limit is reached for a run");
+    assert.deepEqual(fired[briefId], ["delivered", null], "the brief is said all the same");
+    assert.equal(dispatched.length, 0);
+    const said = await w.q("SELECT text FROM claw_assistant_says WHERE user_id = 'alice'");
+    assert.equal(said.length, 1);
+    assert.match(said[0].text, /^Daily brief, /);
   });
 });
