@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { APP_RUNS_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
-import { ensureAssistantSchema } from "../assistant/schema.js";
+import { APP_RUNS_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_MODEL_CHOICE, CLAW_ASSISTANT_MODELS, CLAW_GITHUB_REVIEW_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
+import { ensureAssistantSchema, ensureModelChoiceSchema } from "../assistant/schema.js";
 import { sealPlaintextSessionCredentials } from "../auth/sealed-session-credentials.js";
 import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
@@ -2352,6 +2352,8 @@ export async function initDb(): Promise<void> {
     if (CLAW_NOTIFICATIONS_ENABLED) await ensureNotificationSchema(client);
     if (CLAW_REMOTE_AGENTS_ENABLED) await ensureRemoteAgentSchema(client);
     if (CLAW_ASSISTANT_ENABLED) await ensureAssistantSchema(client);
+    // Model choice for the assistant's items (`assistant/model-choice.ts`): its tables only once it is switched on.
+    if (CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_MODEL_CHOICE && CLAW_ASSISTANT_MODELS) await ensureModelChoiceSchema(client);
     if (CLAW_GITHUB_REVIEW_ENABLED) await ensureGithubReviewSchema(client);
     // A2A context/task model: a context is found by its caller and id on every
     // send, which the single-column index above does not narrow.

@@ -28,6 +28,21 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Model choice for the assistant's items, behind `CLAW_ASSISTANT_MODEL_CHOICE` (`on` | off, default off; needs `CLAW_ASSISTANT_ENABLED`
+  and a non-empty `CLAW_ASSISTANT_MODELS`, the allow-list as `name=label,...`). One function decides an item's model: the model the
+  message asked for, else the payer's own review default (reviews), else their own default, else the deployment's default for the kind
+  (`CLAW_ASSISTANT_WORKER_MODEL`, or the new `CLAW_ASSISTANT_REVIEW_MODEL`), else Brain's `DEFAULT_MODEL`. A review asked of someone
+  else uses that person's settings; the model the requester named is set aside and reported in `ignored`. A name off the allow-list is
+  refused with the list; a model other than the deployment's default for the kind is asked of the gateway with the payer's own key
+  (cached five minutes), and one it cannot use falls back to `CLAW_FALLBACK_MODEL` (or the kind's default), recorded as
+  `params.model_asked` and answered as `fell_back_from`; when the gateway cannot be asked, a named model is refused and a default runs.
+  `work_create` and `work_send` take `model`; `review_start` / `review_restart` no longer need the model's name in the message; the new
+  `model_default_set` sets the user's defaults (attended turns only), as do `GET`/`PUT /v1/assistant/settings` (new table
+  `claw_user_model_prefs`); the router is shown the allow-list with labels and the user's defaults. A worker turn's model is the
+  deployment's worker model only when its session names none. A worker, review or router turn the gateway refuses for want of a key
+  binding (403 "No APIM Key binding found", 401 "missing subscription key") is run again once on `CLAW_FALLBACK_MODEL`, and the user is
+  told (with `CLAW_ASSISTANT_KEY_BINDING_URL` when set); new table `claw_assistant_model_fallbacks`. Off, nothing changes: no new tool
+  arguments, tables, routes or prompt lines.
 - The assistant's `review_start` naming another person is handed to the channel that carried the message when that channel declares
   it can start such a review with the reviewer's own credentials (`channel_context.handoffs: ["review_for_other"]`): an
   `assistant.action` named `review_for_other` with a typed `review` (reviewer, pull requests, merge, the person's message), queued

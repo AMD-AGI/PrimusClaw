@@ -312,3 +312,35 @@ async function ensureObserveSchema(client: pg.PoolClient): Promise<void> {
        ON claw_assistant_observations(run_id, tool, md5(args::text))`,
   );
 }
+
+/**
+ * The tables of model choice (`model-choice.ts`, `model-fallback.ts`), created only with `CLAW_ASSISTANT_MODEL_CHOICE` on, so a
+ * deployment that leaves it off has the schema it had before.
+ */
+export async function ensureModelChoiceSchema(client: pg.PoolClient): Promise<void> {
+  // A user's own defaults for their items. No row, or a NULL, is no default: the deployment's applies.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_user_model_prefs (
+      user_id        TEXT PRIMARY KEY,
+      default_model  TEXT,
+      review_model   TEXT,
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  // Each turn the gateway refused for want of a key binding and that was run again on the fallback model: one row per refused turn,
+  // so it is run again once, and the turn run again is known by its own message id (a router's turn takes its model from here).
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_model_fallbacks (
+      session_id        TEXT NOT NULL,
+      message_id        TEXT NOT NULL,
+      rerun_message_id  TEXT,
+      model             TEXT NOT NULL,
+      from_model        TEXT,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (session_id, message_id)
+    )
+  `);
+  await client.query(
+    "CREATE INDEX IF NOT EXISTS idx_assistant_model_fallbacks_rerun ON claw_assistant_model_fallbacks(session_id, rerun_message_id)",
+  );
+}

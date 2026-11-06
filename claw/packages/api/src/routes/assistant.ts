@@ -15,6 +15,8 @@
  *   PUT  /v1/assistant/scopes             {scope, mode}: observe, or auto (only from a person; see `observe.ts`)
  *   POST /v1/assistant/observations       {scope, content, message_id?}: one message of a watched place, to its watcher
  *   GET  /v1/assistant/observations?scope= what the assistant would have done there, message by message
+ *   GET  /v1/assistant/settings           the caller's default models, and the models they may pick (model choice on only)
+ *   PUT  /v1/assistant/settings           {default_model?, review_model?}: a name from those models, or null to clear
  *
  * Talking to the assistant is the existing `POST /v1/sessions/:id/messages`.
  *
@@ -56,6 +58,10 @@ import { requestedItemOf, requesterViewOf } from "../assistant/requester-view.js
 import { verifyActingAsCredentials } from "../auth/identity-token.js";
 import { credentialVerifier } from "../auth/middleware.js";
 import { db } from "../infra/db.js";
+import { resolveUserLlmKey } from "../llm/key-source.js";
+import {
+  allowedModels, isAllowedModel, modelChoiceOn, modelsForKey, platformModel, readModelPrefs, writeModelPrefs,
+} from "../assistant/model-choice.js";
 
 const logger = pino({ name: "assistant" });
 
@@ -183,6 +189,7 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
   });
 
   if (CLAW_ASSISTANT_OBSERVE) registerObserveRoutes(app);
+  if (modelChoiceOn()) registerModelSettingsRoutes(app);
 
   if (!CLAW_ASSISTANT_REVIEW_ITEMS || !CLAW_GITHUB_REVIEW_ENABLED) return;
 
@@ -314,5 +321,52 @@ function registerObserveRoutes(app: FastifyInstance): void {
     const record = await listObservations(userId, scope, limit);
     if (!record) return reply.status(404).send({ ok: false, error: "not_found" });
     return reply.send({ ok: true, data: record });
+  });
+}
+
+/**
+ * The caller's own default models (`assistant/model-choice.ts`): no user in the path, so nobody reads or sets another person's. The models
+ * offered are the allow-list, less what the caller's own key cannot use when the gateway says so (`models_checked`); a default is any name
+ * on the allow-list, since the key may change. What it changes is which allowed model the caller's own items run on, on their own quota.
+ */
+function registerModelSettingsRoutes(app: FastifyInstance): void {
+  const answerWith = async (userId: string, key: string) => {
+    const prefs = await readModelPrefs((t, p) => db.query(t, p), userId);
+    const usable = await modelsForKey(key);
+    const models = allowedModels().filter((m) => usable === null || usable.includes(m.name)).map((m) => ({ name: m.name, label: m.label }));
+    return {
+      default_model: prefs.default_model, review_model: prefs.review_model, updated_at: prefs.updated_at,
+      models, models_checked: usable !== null,
+      platform: { task: platformModel("task"), review: platformModel("review") },
+    };
+  };
+
+  app.get("/v1/assistant/settings", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    reply.header("cache-control", "no-store");
+    return reply.send({ ok: true, data: await answerWith(userId, resolveUserLlmKey(getUser(req))) });
+  });
+
+  app.put("/v1/assistant/settings", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (typeof body !== "object" || Array.isArray(body)) return reply.status(400).send({ ok: false, error: "invalid_request", message: "the body must be a JSON object" });
+    const change: { default_model?: string | null; review_model?: string | null } = {};
+    for (const field of ["default_model", "review_model"] as const) {
+      const v = body[field];
+      if (v === undefined) continue;
+      if (v !== null && (typeof v !== "string" || !isAllowedModel(v))) {
+        return reply.status(400).send({
+          ok: false, error: "model_not_allowed", message: `${field} must be one of the models offered, or null`,
+          data: { field, models: allowedModels().map((m) => m.name) },
+        });
+      }
+      change[field] = v as string | null;
+    }
+    await writeModelPrefs((t, p) => db.query(t, p), userId, change);
+    logger.info({ userId, fields: Object.keys(change) }, "assistant.model_settings_set");
+    return reply.send({ ok: true, data: await answerWith(userId, resolveUserLlmKey(getUser(req))) });
   });
 }

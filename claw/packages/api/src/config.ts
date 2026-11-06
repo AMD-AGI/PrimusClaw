@@ -796,6 +796,23 @@ export const CLAW_ASSISTANT_OBSERVE = envBool("CLAW_ASSISTANT_OBSERVE", false);
 // How long an item in progress may go without any sign of progress before the watchdog puts it in front of
 // its owner, with the reason (`assistant/watchdog.ts`). 0 is off.
 export const CLAW_ASSISTANT_WATCHDOG_SEC = envInt("CLAW_ASSISTANT_WATCHDOG_SEC", 0, { min: 0 });
+// Model choice for the assistant's items (`assistant/model-choice.ts`): an item's model asked for in the message, the user's
+// own defaults, an allow-list, and a fallback when the payer's key cannot use a model. `on` turns it on; anything else (the
+// default) leaves every tool, prompt, table and turn exactly as without it. An empty CLAW_ASSISTANT_MODELS is the same as off.
+export const CLAW_ASSISTANT_MODEL_CHOICE = ["on", "true", "1", "yes"].includes(env("CLAW_ASSISTANT_MODEL_CHOICE", "off").toLowerCase());
+// The models a user may pick, comma-separated, each with the label the assistant and the settings show:
+// `claude-opus-5.5=strongest,claude-sonnet-5.5=default`. A name without `=label` has no label.
+export const CLAW_ASSISTANT_MODELS = env("CLAW_ASSISTANT_MODELS");
+// The model a review item runs on when neither the request nor the reviewer's own settings name one. Blank is the
+// deployment default (DEFAULT_MODEL). Read only with CLAW_ASSISTANT_MODEL_CHOICE on.
+export const CLAW_ASSISTANT_REVIEW_MODEL = env("CLAW_ASSISTANT_REVIEW_MODEL");
+// The model an item falls back to when the payer's key cannot use the one chosen, and the model a turn the gateway refused for
+// want of a key binding is run again on, once. It must be in CLAW_ASSISTANT_MODELS; blank means no fallback.
+export const CLAW_FALLBACK_MODEL = env("CLAW_FALLBACK_MODEL");
+// Where a user binds the key the gateway asked for, named in the notice of a turn run again on the fallback model. Optional.
+export const CLAW_ASSISTANT_KEY_BINDING_URL = env("CLAW_ASSISTANT_KEY_BINDING_URL");
+// The deployment's default model as Brain reads it (the same shared setting): what a turn runs on when nothing names one.
+export const ASSISTANT_DEPLOYMENT_MODEL = env("DEFAULT_MODEL");
 // The address Brain reaches this API at; the assistant MCP service is served under it.
 export const INTERNAL_BACKEND_URL =
   process.env.INTERNAL_BACKEND_URL || `http://127.0.0.1:${process.env.API_PORT || "8200"}`;

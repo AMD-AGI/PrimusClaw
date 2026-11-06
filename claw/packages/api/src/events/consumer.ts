@@ -31,6 +31,7 @@ import { skipsSkillSelection } from "../assistant/role-profile.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
 import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
+import { rerunOnFallback } from "../assistant/model-fallback.js";
 import { a2aPushEnabled } from "../routes/a2a-flags.js";
 import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
 import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
@@ -823,6 +824,7 @@ export const completionPorts = {
   recordRunFinished,
   recordWorkerTurnEnd,
   deliverUnsaidAnswer,
+  rerunOnFallback,
 };
 
 async function handleComplete(
@@ -1183,10 +1185,29 @@ async function handleComplete(
     }
   }
 
+  // 8b. An assistant turn the gateway refused for want of a key binding is run again, once, on the fallback model
+  //     (`assistant/model-fallback.ts`, model choice on only). It is not over for the user, so 9 and 9b record nothing of it.
+  let rerun = false;
+  if (CLAW_ASSISTANT_ENABLED && failed && !interrupted && endedRunIds.length) {
+    try {
+      rerun = await completionPorts.rerunOnFallback({
+        sessionId,
+        runIds: endedRunIds,
+        messageId: messageId ?? undefined,
+        failed: Boolean(failed),
+        interrupted: Boolean(interrupted),
+        finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
+        failureReason: typeof failure_reason === "string" ? failure_reason : undefined,
+      }) === "rerun";
+    } catch (err) {
+      logger.error({ err, sessionId }, "assistant.model_fallback_failed");
+    }
+  }
+
   // 9. A worker's turn that ended without telling the assistant anything it must act on becomes a report
   //    of its own (ready, or failed), so an accepted item is never one that just stopped. Best-effort here
   //    and not allowed to be the only line: the assistant sweep records a run whose end this lost.
-  if (CLAW_ASSISTANT_ENABLED && !interrupted && endedRunIds.length) {
+  if (CLAW_ASSISTANT_ENABLED && !interrupted && endedRunIds.length && !rerun) {
     try {
       await completionPorts.recordWorkerTurnEnd({
         sessionId,
@@ -1204,7 +1225,7 @@ async function handleComplete(
   //     failed or was stopped and said nothing: the user is told it did not go through. Best-effort: a turn whose words
   //     were lost here is a user who heard nothing, which the model could have caused on its own, so this is a repair
   //     and not a promise.
-  if (CLAW_ASSISTANT_ENABLED && endedRunIds.length) {
+  if (CLAW_ASSISTANT_ENABLED && endedRunIds.length && !rerun) {
     try {
       await completionPorts.deliverUnsaidAnswer({
         sessionId,
