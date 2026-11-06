@@ -573,10 +573,22 @@ describe("assistant holds", { skip }, () => {
     await channel();
     await deliver(item2.workerSid, commentHeld(turn2, { actionId: "tu-2", tool_use_id: "tu-2", input: { ...COMMENT, number: 323 } }));
     const card = await outbox();
-    assert.deepEqual(card.map((r) => r.payload.type), ["assistant.say", "approval.requested"]);
+    assert.deepEqual(card.map((r) => r.payload.type), ["assistant.say", "assistant.say", "approval.requested"]);
     assert.ok((card[0].payload.text as string).includes("改了 3 个文件；CI 全绿；没有未解决的线程。"));
-    assert.equal(card[1].payload.title, `需要你批准：#${item2.seq} PR #323 评审并留评论`);
-    assert.equal(card[1].payload.summary, "以你的 GitHub 账号在 AMD-AGI/PrimusClaw#323 上发表一条评论");
+    // The card shows the call cut to a line: the comment it would post is said whole before it.
+    assert.equal(card[1].payload.text, [
+      `#${item2.seq} PR #323 评审并留评论 要做的操作：以你的 GitHub 账号在 AMD-AGI/PrimusClaw#323 上发表一条评论。`,
+      "内容如下：", "---", COMMENT.body, "---", "在下面的卡片上批准或拒绝。",
+    ].join("\n"));
+    assert.equal(card[2].payload.title, `需要你批准：#${item2.seq} PR #323 评审并留评论`);
+    assert.equal(card[2].payload.summary, "以你的 GitHub 账号在 AMD-AGI/PrimusClaw#323 上发表一条评论");
+    // A Brain that explains the call itself keeps its words on the card; the write is still said whole before it.
+    await w.q("TRUNCATE claw_notification_outbox");
+    await deliver(item2.workerSid, commentHeld(turn2, { actionId: "tu-3", tool_use_id: "tu-3", summary: "发表评审评论", input: { ...COMMENT, number: 323, body: "second" } }));
+    const again = await outbox();
+    assert.deepEqual(again.map((r) => r.payload.type), ["assistant.say", "approval.requested"], "the same report is not said twice");
+    assert.ok((again[0].payload.text as string).includes("\nsecond\n"));
+    assert.equal(again[1].payload.summary, "发表评审评论");
   });
 
   test("HD16 an English writer is asked as before, and nothing reported before the hold says nothing first", async () => {

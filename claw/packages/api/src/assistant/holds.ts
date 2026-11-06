@@ -225,7 +225,7 @@ export async function holdForPerson(
 ): Promise<HoldOutcome> {
   const request = requestOf(input.event);
   if (!request) return "not_an_item";
-  const done = await inTransaction(async (q): Promise<HoldOutcome | { subscribers: number; itemId: string; told: { announce: () => Promise<void> } | null }> => {
+  const done = await inTransaction(async (q): Promise<HoldOutcome | { subscribers: number; itemId: string; told: Array<{ announce: () => Promise<void> }> }> => {
     const item = (await q(
       `SELECT item_id, user_id, seq, title, board_state, kind, attention_seq, generation, result_version, params
          FROM claw_work_items WHERE worker_session_id = $1 FOR UPDATE`,
@@ -285,16 +285,24 @@ export async function holdForPerson(
        VALUES ($1, 'waiting', 'hold', $2, $3, $4, $4, jsonb_build_object('tool_use_id', $5::text))`,
       [item.item_id, item.generation, recorded.run_id, question, recorded.tool_use_id],
     );
-    // Queued before the request, in its transaction: the person reads what was found, then is asked.
-    const told = findings ? await storeFindings(q, item, { id: Number(findings.id), summary: findings.summary }, zh) : null;
-    const subscribers = CLAW_NOTIFICATIONS_ENABLED
-      ? await announce(q, item, input.sessionId, request, recorded, questions, window.startedAt, input.event)
+    // Queued before the request, in its transaction: the person reads what was found, then is asked. A card a channel draws shows the
+    // write's target cut to a line, so when one will be drawn for a write that posts a text (a comment, an issue), what it does and the
+    // text, whole, are said here too; without a card the item's needs-you message says them (`outbound.ts`).
+    const cards = CLAW_NOTIFICATIONS_ENABLED ? await cardSubscriptions(q, item.user_id) : [];
+    const told = [
+      findings ? await storeFindings(q, item, { id: Number(findings.id), summary: findings.summary }, zh) : null,
+      cards.length && said?.detail ? await storeHeldWrite(q, item, recorded) : null,
+    ].filter((t): t is { announce: () => Promise<void> } => t !== null);
+    const subscribers = cards.length
+      ? await announce(q, item, input.sessionId, request, recorded, questions, window.startedAt, input.event, cards)
       : 0;
     return { subscribers, itemId: item.item_id, told };
   });
   if (typeof done === "string") return done;
   logger.info({ itemId: done.itemId, kind: request.kind, subscribers: done.subscribers }, "assistant.item_held_for_person");
-  if (done.told) await done.told.announce().catch((err: unknown) => logger.warn({ err, itemId: done.itemId }, "assistant.hold_findings_announce_failed"));
+  for (const t of done.told) {
+    await t.announce().catch((err: unknown) => logger.warn({ err, itemId: done.itemId }, "assistant.hold_notice_announce_failed"));
+  }
   if (done.subscribers > 0) {
     void holdPorts.kickDelivery().catch((err) => logger.error({ err }, "assistant.hold_kick_failed"));
   } else {
@@ -324,16 +332,34 @@ async function storeFindings(
   return storeSystemNotice(q, { userId: item.user_id, sessionId, text, key: `hold_findings:${item.item_id}:${f.id}` });
 }
 
+/** The owner's subscriptions that draw an item's requests as cards: they list the type and the source. */
+async function cardSubscriptions(q: Querier, userId: string): Promise<Array<{ subscription_id: string }>> {
+  return (await q(
+    `SELECT subscription_id FROM claw_notification_subscriptions
+      WHERE owner_user_id = $1 AND enabled AND 'approval.requested' = ANY(event_types) AND $2 = ANY(sources)`,
+    [userId, HOLD_SOURCE],
+  )).rows as Array<{ subscription_id: string }>;
+}
+
+/**
+ * The write a card is about to ask for, said in full ahead of the card: what it does and the text it would post, in the person's
+ * language. The card's target is the call cut to a line, and the person approves exactly what is posted. Once per request.
+ */
+async function storeHeldWrite(q: Querier, item: ItemRow, hold: Hold): Promise<{ announce: () => Promise<void> } | null> {
+  const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id as string | undefined;
+  if (!sessionId || !hold.action) return null;
+  const text = hold.zh
+    ? [`#${item.seq} ${item.title} 要做的操作：${hold.action}。`, ...(hold.detail ? ["内容如下：", "---", hold.detail, "---"] : []), "在下面的卡片上批准或拒绝。"].join("\n")
+    : [`#${item.seq} "${item.title}" asks to: ${hold.action}.`, ...(hold.detail ? ["It would write:", "---", hold.detail, "---"] : []), "Approve or deny it on the card below."].join("\n");
+  // Not attached to the item, for the same reason as the findings (`storeFindings`).
+  return storeSystemNotice(q, { userId: item.user_id, sessionId, text, key: `hold_write:${item.item_id}:${hold.tool_use_id}` });
+}
+
 /** The `approval.requested` of a hold, one outbox row per subscription that lists the type and the source. */
 async function announce(
   q: Querier, item: ItemRow, sessionId: string, request: { toolUseId: string; kind: HoldKind; tool: string }, hold: Hold,
-  questions: HeldQuestion[], startedAt: number, event: Record<string, unknown>,
+  questions: HeldQuestion[], startedAt: number, event: Record<string, unknown>, subs: Array<{ subscription_id: string }>,
 ): Promise<number> {
-  const subs = (await q(
-    `SELECT subscription_id FROM claw_notification_subscriptions
-      WHERE owner_user_id = $1 AND enabled AND 'approval.requested' = ANY(event_types) AND $2 = ANY(sources)`,
-    [item.user_id, HOLD_SOURCE],
-  )).rows as Array<{ subscription_id: string }>;
   if (!subs.length) return 0;
   const eventId = deterministicEventId("approval.requested", sessionId, request.toolUseId);
   const title = String(redactCommandSecrets(item.title));
