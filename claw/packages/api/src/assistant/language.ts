@@ -257,6 +257,9 @@ export async function languageToAnswerIn(
   return null;
 }
 
+/** As many Latin words as make an English sentence the language check leaves alone, however much Chinese is around it. */
+const ENGLISH_SENTENCE_MIN_WORDS = 3;
+
 /** The script an answer due in Chinese cannot be without. */
 const SCRIPT_OF: Record<string, RegExp> = { Chinese: /\p{Script=Han}/u };
 
@@ -266,7 +269,8 @@ const SCRIPT_OF: Record<string, RegExp> = { Chinese: /\p{Script=Han}/u };
  *
  * As careful as the rest of this module, because a wrong refusal costs the user a message: `others` (the user's item titles,
  * which are quoted from elsewhere) are left out first, and what remains must be judged to be another language by `readLanguage`
- * and, for an answer due in Chinese, have no Chinese character at all. Japanese and Korean are not checked: a short Japanese answer
+ * and, for an answer due in Chinese, have no Chinese character at all; for one due in English, have no English function word and fewer
+ * than three English-looking words. Japanese and Korean are not checked: a short Japanese answer
  * may be all kanji and read as Chinese. So an English sentence that
  * quotes a Chinese title passes for English, and a Chinese answer full of English names and terms passes for Chinese.
  * Pure, for the tests.
@@ -280,6 +284,11 @@ export function replyLanguageMismatch(text: string, expected: string, others: re
   if (!found || found === expected) return null;
   const script = SCRIPT_OF[expected];
   if (script) return script.test(wording(own)) ? null : found;
-  // English expected: only a message judged to be in another language, which needs that language's sentences, not a quoted word.
-  return expected === "English" ? found : null;
+  // English expected: only a message judged to be in another language with no English sentence in it at all: no English function word
+  // and fewer than three English-looking words, so an English sentence quoting a Chinese title from anywhere (a pull request, a page)
+  // is not refused, while a Chinese sentence naming a term or two (这个 PR 已经合入了) is.
+  if (expected !== "English") return null;
+  const plain = wording(own);
+  const latin = wordsOf(plain).filter((w) => /^[\p{Script=Latin}']{2,}$/u.test(w)).length;
+  return englishWords(plain) === 0 && latin < ENGLISH_SENTENCE_MIN_WORDS ? found : null;
 }

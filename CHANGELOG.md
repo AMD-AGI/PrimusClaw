@@ -567,12 +567,13 @@ record it.
   longer holds it or makes it review-only.
 - The assistant router answers sooner, in the user's language, and names items the user can recognise (router prompt `router-v10`,
   read section `router-read-v5`, review prompt `router-v13`). `work_create` tells the user at once that the item started, with its
-  number and title (a system message, not counted against the say limit, sent with the item and the turn's message id); its result
-  says `announced`, and the router no longer repeats it. `say` also refuses an item number said without its title (`#6、#8`;
+  number and title (a system message in Chinese or English, not counted against the say limit, sent with the item and the turn's
+  message id; not in another language, where the router says it, nor in a turn that handed a review to the person's channel); its
+  result says `announced`, and the router no longer repeats it. `say` also refuses an item number said without its title (`#6、#8`;
   `bare_item_number`, naming what to write instead; a pull request's, issue's, run's or another repository's number is not an
   item's, nor is the item the message is sent with) and a message plainly in another language than the turn's `[Reply language]`
-  (`reply_language`, Chinese and English only; the user's item titles are set aside first, and an answer due in Chinese passes as
-  long as it has a Chinese character at all). A router turn whose model answered nothing (Brain's empty-turn failure, which is how a declined request
+  (`reply_language`, Chinese and English only; the user's item titles are set aside first, an answer due in Chinese passes as long as
+  it has a Chinese character at all, and one due in English as long as it has an English function word or three English words). A router turn whose model answered nothing (Brain's empty-turn failure, which is how a declined request
   arrives) is told to the user as a request it cannot help with, not as one that did not go through. Every router turn that answers
   the user logs `assistant.router_turn_timing` (first and final reply in ms from the message, replies, the system's own replies,
   items started). The prompt now has the router put a one-line acknowledgement beside its first lookups, make a step's lookups at

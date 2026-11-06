@@ -22,7 +22,7 @@ import { insertSessionRow } from "../routes/sessions.js";
 import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
 import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
-import { recordAssistantSay, recordSystemNotice, SayOutcomeUnknown, SayRefused, type SayDeps } from "./outbound.js";
+import { recordAssistantSay, recordSystemNotice, SayOutcomeUnknown, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
 import { saySources, SAY_SOURCE_OUTCOMES } from "./citations.js";
 import { metrics } from "../infra/metrics.js";
 import { bareItemNumbers, internalTextIn, userWordsOf } from "./internal-text.js";
@@ -276,16 +276,18 @@ function modelArg(raw: unknown): string | undefined {
 }
 
 /** What the user is told the moment an item they asked for has started, in the system's words (`announceStarted`). */
-export function startedNotice(item: { seq: number; title: string }, language: string | null): string {
-  return language === "Chinese"
-    ? `已开始：#${item.seq} ${item.title}。有结果或需要你时我会告诉你。`
-    : `Started #${item.seq} ${item.title}. I'll tell you when it is done or needs you.`;
+export function startedNotice(item: { seq: number; title: string }, language: string | null): string | null {
+  if (language === "Chinese") return `已开始：#${item.seq} ${item.title}。有结果或需要你时我会告诉你。`;
+  if (language === "English") return `Started #${item.seq} ${item.title}. I'll tell you when it is done or needs you.`;
+  // Any other language: the router says it in the user's own words (the result says announced: false).
+  return null;
 }
 
 /**
  * Tell the user at once that the item their message asked for has started, before the router's model writes another word: the
  * first thing a user heard used to wait for the router to write the item's whole brief and then its own line (2026-11-06 baseline:
- * first reply p90 8.3 s). Only in a turn that answers the user (a worker's report starts nothing the user asked for), once per item
+ * first reply p90 8.3 s). Only in a turn that answers the user (a worker's report starts nothing the user asked for) in Chinese or
+ * English (in any other language the router says it), and not in one that handed a review to the person's channel; once per item
  * (`recordSystemNotice`'s key), and as the system's own message, so it is not counted against the say limit and the router still
  * says what this does not (a model that fell back, a question). Best effort: the item is started whether or not this is heard,
  * and the router is told which (`announced`).
@@ -297,8 +299,12 @@ async function announceStarted(
     const prompt = ((await db.query("SELECT prompt FROM claw_tasks WHERE task_id = $1", [claims.task_id])).rows[0]?.prompt as string | null) ?? "";
     if (!prompt.trim() || prompt.startsWith(WORK_EVENT_PREFIX)) return false;
     const language = (await turnReplyLanguage(claims.sid, prompt)) ?? detectLanguage(prompt);
+    const text = startedNotice(item, language);
+    if (!text) return false;
+    // A turn that handed a review to the person's channel says nothing more: the channel answers that message (as say is refused).
+    if (await turnHandedOffReview((t, p) => db.query(t, p), userId, claims.mid)) return false;
     const stored = await recordSystemNotice({
-      userId, sessionId: claims.sid, text: startedNotice(item, language), key: `work_started:${item.itemId}`,
+      userId, sessionId: claims.sid, text, key: `work_started:${item.itemId}`,
       itemId: item.itemId, turnMessageId: claims.mid,
     }, deps);
     return stored !== null;

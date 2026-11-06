@@ -103,6 +103,21 @@ describe("router quality, through the tools", { skip }, () => {
     const second = await w.mod.tools.workCreate(en as never, { title: "Fix flaky api test", brief: "fix it" }, w.sayDeps);
     rows = await says();
     assert.equal(rows.at(-1)!.text, `Started #${second.seq} Fix flaky api test. I'll tell you when it is done or needs you.`);
+    // Another language than Chinese or English: the router says it in the user's words.
+    const ja = await turnFor("このテストを直してください");
+    const fourth = await w.mod.tools.workCreate(ja as never, { title: "テスト修正", brief: "fix it" }, w.sayDeps);
+    assert.equal(fourth.announced, false);
+    assert.equal((await says()).length, 2);
+    // A turn that handed a review to the person's channel says nothing more.
+    const handed = await turnFor("review AMD-AGI/PrimusClaw#1 as Bob, and fix the flaky test");
+    await w.q(
+      `INSERT INTO claw_assistant_review_handoffs (handoff_id, user_id, reviewer_user_id, prs, merge, message_id)
+       VALUES ('h-1', 'alice', 'bob', ARRAY['amd-agi/primusclaw#1'], false, $1)`,
+      [handed.mid],
+    );
+    const fifth = await w.mod.tools.workCreate(handed as never, { title: "Fix flaky web test", brief: "fix it" }, w.sayDeps);
+    assert.equal(fifth.announced, false);
+    assert.equal((await says()).length, 2);
     // A turn a worker's report started announces nothing: nobody asked for this item in it.
     const ev = await turnFor(`[work_event] #${second.seq} (item_id: ${second.item_id}) blocked: needs a follow-up`);
     const third = await w.mod.tools.workCreate(ev as never, { title: "Follow-up", brief: "follow up" }, w.sayDeps);
@@ -190,6 +205,9 @@ describe("router quality, pure", () => {
     // Japanese and Korean are not checked: a short Japanese answer may be all kanji.
     assert.equal(replyLanguageMismatch("了解。", "Japanese"), null);
     assert.equal(replyLanguageMismatch("All done.", "Korean"), null);
+    // An English sentence quoting a Chinese title that is not one of the user's items (a pull request's) is English.
+    assert.equal(replyLanguageMismatch("Review for PR #327 (修复登录超时) passed.", "English"), null);
+    assert.equal(replyLanguageMismatch("这个 PR 已经合入了，CI 也绿了。", "English"), "Chinese");
   });
 });
 
