@@ -40,6 +40,10 @@ export class FakeClaw {
   readonly requests: Array<{ method: string; path: string; auth: string | undefined; client: string | undefined }> = [];
   readonly streamHeaders: Array<Record<string, string | string[] | undefined>> = [];
   duplicatesSeen = 0;
+  /** Whether the connector-side `POST .../connectors/:cid/revoke` exists; false is a Claw from before it. */
+  revokeRoute = true;
+  /** Every revocation asked of this Claw, by either route, and what was asked with. */
+  readonly revocations: Array<{ method: string; id: string; auth: string | undefined }> = [];
   cursor = 0;
   nextSeq = 1;
   private readonly streams = new Set<http.ServerResponse>();
@@ -135,6 +139,18 @@ export class FakeClaw {
     if (this.unavailable > 0) { this.unavailable--; return this.json(res, 503, { ok: false, error: "unavailable" }); }
     const token = (req.headers.authorization ?? "").replace(/^Bearer /, "");
     if (!this.tokens.has(token)) return this.json(res, 401, { ok: false, error: "unauthorized" });
+    const rv = /^\/v1\/remote-agents\/connectors\/([^/]+)(\/revoke)?$/.exec(path);
+    if (rv && (rv[2] ? req.method === "POST" : req.method === "DELETE")) {
+      // As on the real server: the user-side DELETE takes a key, and a connector's access token (`access-N`, from
+      // FakeIdentity) is no credential there; the connector-side route takes either; a Claw from before that route has none.
+      const connectorToken = token.startsWith("access-");
+      if ((!rv[2] && connectorToken) || (rv[2] && !this.revokeRoute && connectorToken)) return this.json(res, 401, { ok: false, error: "authentication_required" });
+      if (rv[2] && !this.revokeRoute) return this.json(res, 404, { message: `Route POST:${path} not found`, error: "Not Found", statusCode: 404 });
+      this.revocations.push({ method: req.method ?? "", id: rv[1]!, auth: req.headers.authorization });
+      if (rv[1] !== this.connectorId || this.revoked) return this.json(res, 404, { ok: false, error: "not_found" });
+      this.revoke();
+      return this.json(res, 200, { ok: true });
+    }
     const m = /^\/v1\/remote-agents\/connectors(?:\/([^/]+)\/(heartbeat|events|commands))?$/.exec(path);
     if (!m) return this.json(res, 404, { ok: false, error: "not_found" });
     if (!m[1]) {

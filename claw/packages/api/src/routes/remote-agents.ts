@@ -253,16 +253,32 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     return reply.send({ ok: true, data: await store.listConnectors(owner, onlineWindowMs) });
   });
 
-  app.delete("/v1/remote-agents/connectors/:cid", async (req, reply) => {
-    const owner = requireOwner(req, reply);
-    if (!owner) return;
+  /** Revoke one of the caller's connectors: the row stays revoked for good, its queued commands go and its sessions close. */
+  async function revoke(req: FastifyRequest, reply: FastifyReply, owner: string) {
     const id = parseRemoteId((req.params as { cid?: string }).cid);
     if (!id || !(await store.revokeConnector(owner, id, clientLabel(req)))) return notFound(reply);
     waker.wake(`c:${id}`);
     return reply.send({ ok: true });
+  }
+
+  app.delete("/v1/remote-agents/connectors/:cid", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    return revoke(req, reply, owner);
   });
 
   // --- connector side --------------------------------------------------------
+
+  // A connector signing out revokes its own row, so it can be sent nothing more. The same as the user-side DELETE,
+  // reachable with the connector's own sign-in (a device sign-in's access token is refused on the user side). The
+  // token names a user, not a connector, so it may revoke any connector of that user: a revocation stops the user's
+  // own machine and reveals nothing, and the owner could do it anyway. 404 for a row that is not the caller's or is
+  // already revoked.
+  app.post(CONNECTOR_SIDE_ROUTES.revoke.url, async (req, reply) => {
+    const owner = requireOwner(req, reply, "connector");
+    if (!owner) return;
+    return revoke(req, reply, owner);
+  });
 
   app.post(CONNECTOR_SIDE_ROUTES.heartbeat.url, async (req, reply) => {
     const owner = requireOwner(req, reply, "connector");

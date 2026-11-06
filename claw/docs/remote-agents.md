@@ -40,6 +40,7 @@ session), or an access token from the identity provider (see
 | `POST .../connectors/:cid/heartbeat` | Every 30 s: `{version?, agents:[{agent_id, kind, name, capabilities?}], cmd_cursor?}`. Replaces the advertised agent list; `cmd_cursor` lets the server forget commands up to it. |
 | `GET .../connectors/:cid/commands` | The command stream; each `id:` is the connector's `cmd_seq`. On every connect the server sends every command it still holds, in order. It holds a command until a heartbeat's `cmd_cursor` covers it, so a `Last-Event-ID` (or `?after=`) is validated but never skips one: the id of the last frame a client received does not prove it acted on it. A connector skips what it already did, by `cmd_seq` or `cmd_id`. |
 | `POST .../connectors/:cid/events` | `{batch_id, events:[{session_id, seq, type, ts, data}]}`. Answers `{acked:{session_id: highest stored seq}, rejected:[{index, session_id, seq, reason}]}`. |
+| `POST .../connectors/:cid/revoke` | Revoke one of the caller's connectors, as the user-side `DELETE /v1/remote-agents/connectors/:cid` does (the row stays revoked, its commands go, its sessions close): what `claw-connector logout` calls with a device sign-in, whose access token the user-side route refuses. The token names a user, not a connector, so it may revoke any of that user's connectors. `404 not_found` for a row that is not the caller's or is already revoked. |
 
 Command frames are `event: command` with `data: {v, cmd_id, type, session_id, ...}`.
 Delivery is at least once: a connector deduplicates on `cmd_id` (or skips `cmd_seq` values it has handled). Types: `session.new`
@@ -91,7 +92,7 @@ absent from a connector that predates them: a client treats absent as unknown, n
 
 ## Connector access tokens
 
-Beside a key or a session, the four connector-side routes (the table above)
+Beside a key or a session, the five connector-side routes (the table above)
 accept `Authorization: Bearer <access token>`: an RFC 9068 JWT that the identity
 provider issued to this API for a connector. It is verified with the shared
 [identity client](identity-client.md), which must be on (`IDENTITY_CLIENT_ENABLED`),
@@ -126,7 +127,7 @@ the mismatch itself; it logs the id every connector is filed under at registrati
 (`remote_agents.connector_registered`, with `owner` and `credential`), for an operator to
 compare with the id of the person's own session.
 
-**It authenticates on those four routes and nowhere else.** On the user-side
+**It authenticates on those five routes and nowhere else.** On the user-side
 routes, and on every other route of the API, a token is not a credential: the
 request is answered as one with no credential (with the identity provider's
 access-token credential switched on, `CLAW_IDENTITY_TOKEN_AUTH_ENABLED`, it is

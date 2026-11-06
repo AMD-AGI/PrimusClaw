@@ -78,7 +78,7 @@ Usage: claw-connector <command> [options]
   pause                    stop every agent now and stay offline until "resume"
   resume                   undo "pause"
   stop                     stop the running connector and every agent it started
-  logout                   stop, revoke the sign-in and delete it
+  logout                   stop, revoke this connector at Claw and the sign-in, and delete the sign-in
   --version, --help
 
 Files: ${"$"}XDG_CONFIG_HOME/claw-connector (agents.toml, credentials.json) and ${"$"}XDG_STATE_HOME/claw-connector
@@ -240,8 +240,8 @@ function cmdHooks(args: string[], ctx: Ctx): number {
 /**
  * Forget the stored connector id, but only when `run` recorded that Claw revoked that row. A revoked row stays
  * revoked for good, so keeping its id would send every later `run` back to exit 3 after a new sign-in. A row that
- * is alive is kept: every registration takes one of the few connector rows a user may have (and `logout` cannot
- * delete a row), so a sign-in that registered a new row each time would use them up and then `run` would fail with
+ * is alive is kept: every registration takes one of the few live connector rows a user may have (`logout` revokes
+ * its row and forgets it), so a sign-in that registered a new row each time would use them up and then `run` would fail with
  * `connector_limit_reached`. A re-login as another account is not a problem either way: Claw answers 404 for a
  * row that is not the caller's and `run` registers anew, and an id stored for another server is never used.
  * Never called for a revocation itself: if `run` forgot its id when it was revoked, the next `run` would register
@@ -444,17 +444,78 @@ async function cmdStop(ctx: Ctx, quiet = false): Promise<number> {
   return EXIT.ok;
 }
 
+/** The connector row `run` stored, as it stored it: which server, which id, and whether Claw revoked it. */
+function storedConnector(ctx: Ctx): { server: string; connector_id: string; revoked: boolean } | null {
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(identityFile(ctx.dirs), "utf8"));
+    if (isObject(raw) && typeof raw.server === "string" && typeof raw.connector_id === "string") {
+      return { server: raw.server, connector_id: raw.connector_id, revoked: raw.revoked === true };
+    }
+  } catch { /* never registered, or unreadable */ }
+  return null;
+}
+
+/** What a person runs to revoke a connector at Claw by hand, with a credential of their own (never one printed here). */
+const revokeByHand = (server: string, cid: string): string =>
+  `curl -fsS -X DELETE -H "Authorization: Bearer <your Claw API key>" ${server}/v1/remote-agents/connectors/${encodeURIComponent(cid)}`;
+
+/**
+ * Stop, revoke this machine's connector at Claw, revoke the sign-in at the identity service, and delete it here.
+ *
+ * The connector row is revoked first, with the sign-in that is about to be deleted: once it is gone nothing on this
+ * machine can. A row left alive is still the user's connector at Claw, and instructions sent to it wait there for the
+ * next sign-in on this machine. So when it cannot be revoked (Claw unreachable, the sign-in already refused, a Claw
+ * from before the connector-side route) the sign-in is still deleted, the person is told the row is alive and how to
+ * revoke it, the stored id is kept (a later `login` reuses the live row instead of taking another), and the exit code
+ * is not 0. A row Claw revoked is forgotten, so the next `run` registers a new one.
+ */
 async function cmdLogout(ctx: Ctx): Promise<number> {
   await cmdStop(ctx, true);
   const file = credentialsFile(ctx.dirs);
   let creds: Credentials | null = null;
-  try { creds = loadCredentials(file); } catch { /* an unreadable file is removed anyway */ }
-  if (creds?.kind === "device" && creds.identity_url && creds.refresh_token) {
+  let credsProblem: string | null = null;
+  try { creds = loadCredentials(file); } catch (e) { credsProblem = errMessage(e); /* an unreadable file is removed anyway */ }
+  const row = storedConnector(ctx);
+  let latest = creds;
+  /** Why the live row was not revoked at Claw; null when it was, or when there is none. */
+  let notRevoked: string | null = null;
+  let rowGone = false;
+  if (row && !row.revoked) {
+    if (!creds) {
+      notRevoked = credsProblem ? `the sign-in on this machine is unreadable (${credsProblem})` : "this machine is not signed in";
+    } else {
+      // Only to the server this sign-in is for, as `run` resolves it (and `run` ignores a stored id for another server):
+      // a key or an access token sent to the server of an earlier sign-in would hand it a credential for this one.
+      let server: string | null = null;
+      try {
+        let cfg: ConnectorConfig | null = null;
+        try { cfg = loadCfg(ctx); } catch (e) { if (!(e instanceof ConfigError)) throw e; }
+        server = serverUrl(ctx, undefined, cfg, creds);
+      } catch { /* no usable server: nothing is sent */ }
+      if (server !== row.server) {
+        notRevoked = `it was registered at ${row.server}, but this sign-in is for ${server ?? "no usable server"}, so nothing was sent to either`;
+      } else try {
+        const tokens = providerFor(creds, (c) => { latest = c; saveCredentials(file, c); }, { fetch: ctx.fetch });
+        const client = new ClawClient({ server: row.server, tokens, fetch: ctx.fetch, requestTimeoutMs: 15_000 });
+        await client.revoke(row.connector_id, creds.kind);
+        rowGone = true;
+        ctx.out(`revoked connector ${row.connector_id} at ${row.server}: Claw sends it nothing more`);
+      } catch (e) {
+        if (e instanceof RevokedError || (e instanceof HttpError && e.status === 404 && e.code === "not_found")) {
+          rowGone = true;
+          ctx.out(`Claw has no live connector ${row.connector_id} for this sign-in (already revoked, or registered by another account)`);
+        } else {
+          notRevoked = errMessage(e);
+        }
+      }
+    }
+  }
+  if (latest?.kind === "device" && latest.identity_url && latest.refresh_token) {
     try {
       const f = ctx.fetch ?? fetch;
-      await f(`${creds.identity_url}/oauth/revoke`, {
+      await f(`${latest.identity_url}/oauth/revoke`, {
         method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ token: creds.refresh_token, token_type_hint: "refresh_token", client_id: creds.client_id ?? DEFAULT_CLIENT_ID }),
+        body: new URLSearchParams({ token: latest.refresh_token, token_type_hint: "refresh_token", client_id: latest.client_id ?? DEFAULT_CLIENT_ID }),
         signal: AbortSignal.timeout(10_000),
       });
     } catch (e) {
@@ -462,7 +523,15 @@ async function cmdLogout(ctx: Ctx): Promise<number> {
     }
   }
   fs.rmSync(file, { force: true });
-  forgetRevokedIdentity(ctx);
+  if (rowGone) fs.rmSync(identityFile(ctx.dirs), { force: true });
+  else forgetRevokedIdentity(ctx);
+  if (row && notRevoked !== null) {
+    ctx.err(`signed out on this machine, but connector ${row.connector_id} was NOT revoked at Claw (${notRevoked}).`);
+    ctx.err("It is still your connector there, and instructions sent to it wait for the next sign-in on this machine. Revoke it with:");
+    ctx.err(`  ${revokeByHand(row.server, row.connector_id)}`);
+    ctx.err("or sign in again and run logout once Claw is reachable.");
+    return EXIT.failure;
+  }
   ctx.out("signed out");
   return EXIT.ok;
 }

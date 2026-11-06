@@ -381,15 +381,21 @@ describe("claw-connector commands", () => {
       await runOnce();
       const id = claw.connectorId;
       assert.equal(claw.registered, 1);
-      // A new sign-in (the refresh token expired, say) and a sign-out followed by a sign-in both keep the row.
-      assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
-      assert.equal(await main(["logout"], ctx(home).c), EXIT.ok);
+      // A new sign-in (the refresh token expired, say) keeps the row.
       assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
       claw.heartbeats.length = 0;
       await runOnce();
       assert.equal(claw.registered, 1, "no second registration: the stored row is still alive");
       assert.equal(claw.connectorId, id);
       assert.equal(storedId(resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv)).connector_id, id);
+      // A sign-out revokes it (a revoked row is not counted against the limit), and the next sign-in registers anew.
+      assert.equal(await main(["logout"], ctx(home).c), EXIT.ok);
+      assert.equal(claw.revokedIds.has(id), true);
+      assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+      claw.heartbeats.length = 0;
+      await runOnce();
+      assert.equal(claw.registered, 2);
+      assert.notEqual(claw.connectorId, id);
     } finally {
       connector?.stop();
       await running;
@@ -443,9 +449,10 @@ describe("claw-connector commands", () => {
         seedIdentity(a.c.dirs, "https://x.example", "stored-connector", revoked);
         assert.equal(await main(["login", "--server", "https://x.example", "--identity-url", id.url], ctx(home).c), EXIT.ok);
         assert.equal(fs.existsSync(identityFile(a.c.dirs)), !revoked, `login device, revoked=${revoked}`);
-        // logout
+        // logout, with Claw out of reach: a revoked row needs nothing of it; a live one cannot be revoked, so its id stays
         seedIdentity(a.c.dirs, "https://x.example", "stored-connector", revoked);
-        assert.equal(await main(["logout"], ctx(home).c), EXIT.ok);
+        const offline = (async () => { throw new Error("offline"); }) as typeof fetch;
+        assert.equal(await main(["logout"], ctx(home, { fetch: offline }).c), revoked ? EXIT.ok : EXIT.failure);
         assert.equal(fs.existsSync(identityFile(a.c.dirs)), !revoked, `logout, revoked=${revoked}`);
         if (!revoked) assert.equal(storedId(a.c.dirs).connector_id, "stored-connector");
       }
@@ -526,21 +533,156 @@ describe("claw-connector commands", () => {
     }
   });
 
-  test("logout revokes the refresh token at the identity service and deletes the sign-in, and keeps a live connector id", async () => {
-    const id = await FakeIdentity.start();
-    try {
+  describe("logout revokes the connector at Claw before it deletes the sign-in", () => {
+    const deviceCreds = (dirs: Dirs, server: string, identityUrl: string, refresh: string) => {
+      fs.mkdirSync(path.dirname(credentialsFile(dirs)), { recursive: true });
+      fs.writeFileSync(credentialsFile(dirs), JSON.stringify({ v: 1, server, kind: "device", identity_url: identityUrl, client_id: "claw-connector", refresh_token: refresh, saved_at: "" }), { mode: 0o600 });
+    };
+
+    test("a key: the row is revoked with the user-side DELETE, then the sign-in and the stored id are deleted", async () => {
+      const claw = await FakeClaw.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+        seedIdentity(a.c.dirs, claw.url, claw.connectorId);
+        assert.equal(await main(["logout"], a.c), EXIT.ok);
+        assert.deepEqual(claw.revocations, [{ method: "DELETE", id: claw.connectorId, auth: "Bearer good-token" }]);
+        assert.equal(claw.revoked, true, "Claw sends the row nothing more");
+        assert.match(a.text(), new RegExp(`revoked connector ${claw.connectorId}[^]*signed out`));
+        assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
+        assert.equal(fs.existsSync(identityFile(a.c.dirs)), false, "a revoked row is forgotten, so the next run registers anew");
+      } finally { await claw.close(); }
+    });
+
+    test("a device sign-in: the row is revoked on the connector-side route with a fresh access token, then the rotated refresh token is revoked", async () => {
+      const claw = await FakeClaw.start();
+      const id = await FakeIdentity.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        id.refreshTokens.add("r9");
+        claw.tokens.add("access-1");
+        deviceCreds(a.c.dirs, claw.url, id.url, "r9");
+        seedIdentity(a.c.dirs, claw.url, claw.connectorId);
+        assert.equal(await main(["logout"], a.c), EXIT.ok, a.errText());
+        assert.deepEqual(claw.revocations, [{ method: "POST", id: claw.connectorId, auth: "Bearer access-1" }]);
+        assert.equal(claw.revoked, true);
+        // The refresh to get the access token rotated r9 into refresh-1: the live one is what must be revoked.
+        assert.deepEqual(id.revokedTokens, ["refresh-1"]);
+        assert.equal(id.refreshTokens.size, 0, "no refresh token of this sign-in is left alive");
+        assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
+        assert.equal(fs.existsSync(identityFile(a.c.dirs)), false);
+      } finally { await claw.close(); await id.close(); }
+    });
+
+    test("Claw unreachable: signed out here, told the row is alive and how to revoke it, exit not 0, and the key is never printed", async () => {
+      const claw = await FakeClaw.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+        seedIdentity(a.c.dirs, claw.url, claw.connectorId);
+        claw.unavailable = 10;
+        assert.equal(await main(["logout"], a.c), EXIT.failure);
+        assert.equal(claw.revoked, false);
+        assert.doesNotMatch(a.text(), /signed out$/m, "it does not claim a clean sign-out");
+        assert.match(a.errText(), new RegExp(`signed out on this machine, but connector ${claw.connectorId} was NOT revoked at Claw`));
+        assert.ok(a.errText().includes(`curl -fsS -X DELETE -H "Authorization: Bearer <your Claw API key>" ${claw.url}/v1/remote-agents/connectors/${claw.connectorId}`), a.errText());
+        assert.doesNotMatch(a.text() + a.errText(), /good-token/);
+        assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false, "the sign-in is deleted all the same");
+        assert.equal(storedId(a.c.dirs).connector_id, claw.connectorId, "the live row's id is kept, so a later sign-in reuses it");
+      } finally { await claw.close(); }
+    });
+
+    test("a device sign-in and a Claw from before the connector-side route: not revoked, said so, exit not 0; the sign-in is still revoked", async () => {
+      const claw = await FakeClaw.start();
+      const id = await FakeIdentity.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        claw.revokeRoute = false;
+        id.refreshTokens.add("r9");
+        claw.tokens.add("access-1");
+        claw.tokens.add("access-2");
+        deviceCreds(a.c.dirs, claw.url, id.url, "r9");
+        seedIdentity(a.c.dirs, claw.url, claw.connectorId);
+        assert.equal(await main(["logout"], a.c), EXIT.failure);
+        assert.equal(claw.revoked, false);
+        assert.match(a.errText(), /was NOT revoked at Claw \(.*401 authentication_required\)/);
+        assert.equal(id.refreshTokens.size, 0, "the sign-in itself is revoked");
+        assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
+        assert.equal(storedId(a.c.dirs).connector_id, claw.connectorId);
+      } finally { await claw.close(); await id.close(); }
+    });
+
+    test("a row stored for another server than this sign-in's: no credential is sent to either server, said so, exit not 0", async () => {
+      const a = await FakeClaw.start();
+      const b = await FakeClaw.start();
+      const id = await FakeIdentity.start();
+      try {
+        for (const kind of ["key", "device"] as const) {
+          const home = tmpdir();
+          const c = ctx(home);
+          // Signed in to A and ran there; then signed in to B.
+          assert.equal(await main(["login", "--server", a.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+          seedIdentity(c.c.dirs, a.url, a.connectorId);
+          if (kind === "key") {
+            b.tokens.add("key-b");
+            assert.equal(await main(["login", "--server", b.url, "--key", "key-b"], ctx(home).c), EXIT.ok);
+          } else {
+            id.refreshTokens.add("rb");
+            deviceCreds(c.c.dirs, b.url, id.url, "rb");
+          }
+          a.requests.length = 0;
+          b.requests.length = 0;
+          assert.equal(await main(["logout"], c.c), EXIT.failure, kind);
+          assert.deepEqual(a.requests, [], `${kind}: nothing reached A, so B's credential was not handed to it`);
+          assert.deepEqual(b.requests, [], `${kind}: nor B, which never had this row`);
+          assert.equal(a.revoked, false);
+          assert.match(c.errText(), new RegExp(`connector ${a.connectorId} was NOT revoked at Claw \\(it was registered at ${a.url}, but this sign-in is for ${b.url}`));
+          assert.ok(c.errText().includes(`${a.url}/v1/remote-agents/connectors/${a.connectorId}`), c.errText());
+          assert.doesNotMatch(c.text() + c.errText(), /key-b|good-token|access-/);
+          assert.equal(storedId(c.c.dirs).connector_id, a.connectorId);
+          assert.equal(fs.existsSync(credentialsFile(c.c.dirs)), false);
+        }
+      } finally { await a.close(); await b.close(); await id.close(); }
+    });
+
+    test("a row Claw already revoked (or never had for this account) is reported and forgotten, and is a clean sign-out", async () => {
+      const claw = await FakeClaw.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+        seedIdentity(a.c.dirs, claw.url, claw.connectorId);
+        claw.revoke();
+        assert.equal(await main(["logout"], a.c), EXIT.ok);
+        assert.match(a.text(), /no live connector[^]*signed out/);
+        assert.equal(fs.existsSync(identityFile(a.c.dirs)), false);
+      } finally { await claw.close(); }
+    });
+
+    test("no sign-in left but a live row stored: told it is alive and how to revoke it, exit not 0", async () => {
       const home = tmpdir();
       const a = ctx(home);
-      fs.mkdirSync(path.join(home, "config"), { recursive: true });
-      id.refreshTokens.add("r9");
-      fs.writeFileSync(credentialsFile(a.c.dirs), JSON.stringify({ v: 1, server: "https://x.example", kind: "device", identity_url: id.url, client_id: "claw-connector", refresh_token: "r9", saved_at: "" }), { mode: 0o600 });
-      seedIdentity(a.c.dirs, "https://x.example");
-      assert.equal(await main(["logout"], a.c), EXIT.ok);
-      assert.equal(storedId(a.c.dirs).connector_id, "stored-connector", "signing out leaves the connector row alone, so the next sign-in reuses it");
-      assert.deepEqual(id.revokedTokens, ["r9"]);
-      assert.equal(id.refreshTokens.has("r9"), false);
-      assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
-    } finally { await id.close(); }
+      seedIdentity(a.c.dirs, "https://claw.example/claw-api", "stored-connector");
+      assert.equal(await main(["logout"], a.c), EXIT.failure);
+      assert.match(a.errText(), /stored-connector was NOT revoked at Claw \(this machine is not signed in\)/);
+      assert.match(a.errText(), /https:\/\/claw\.example\/claw-api\/v1\/remote-agents\/connectors\/stored-connector/);
+    });
+
+    test("nothing registered: nothing to revoke at Claw, and a clean sign-out", async () => {
+      const claw = await FakeClaw.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+        assert.equal(await main(["logout"], a.c), EXIT.ok);
+        assert.deepEqual(claw.revocations, []);
+        assert.equal(a.text(), "signed out");
+      } finally { await claw.close(); }
+    });
   });
 });
 

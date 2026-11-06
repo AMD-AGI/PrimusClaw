@@ -4,7 +4,7 @@
 /**
  * What a connector's access token reaches, asked of the whole router.
  *
- * The token is meant to authenticate on four routes. "Nowhere else" is a claim
+ * The token is meant to authenticate on five routes. "Nowhere else" is a claim
  * about every route the API has, so this does not sample: it registers every
  * route module the server registers (the list is checked against `index.ts`),
  * discovers each route with an `onRoute` hook, and sends the same valid token to
@@ -177,13 +177,14 @@ describe("a connector access token over the whole router", { skip }, () => {
     assert.deepEqual([withToken.statusCode, withToken.json()], [without.statusCode, without.json()]);
   });
 
-  test("the four connector-side routes accept it, and nothing else is true of them", async () => {
+  test("the five connector-side routes accept it, and nothing else is true of them", async () => {
     const cid = randomUUID();
     const expected: Record<string, number> = {
       [`POST ${connectorSide.register.url}`]: 400, // a bad body, which is after authentication
       [`POST ${connectorSide.heartbeat.url}`]: 404, // not this user's connector
       [`POST ${connectorSide.events.url}`]: 404,
       [`GET ${connectorSide.commands.url}`]: 404,
+      [`POST ${connectorSide.revoke.url}`]: 404, // not this user's connector
     };
     for (const r of Object.values(connectorSide)) {
       const res = await app.inject({

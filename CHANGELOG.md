@@ -70,6 +70,13 @@ record it.
   someone else that may merge, the requester's own GitHub account merges their pull request once the reviewer's approval of the head
   is on GitHub, CI is green, no thread is open and the merge state is CLEAN, instead of waiting for the reviewer to confirm a held
   merge; the held merge closes as merged by the requester. One acting user may now be asked about 30 writes at once (was 10).
+- `claw-connector logout` (`connector/`, next release) revokes this machine's connector at Claw before it deletes the sign-in. It
+  said "signed out" and left the connector row alive: still the user's connector, and instructions sent to it waited for the next
+  sign-in on that machine. With a key it calls `DELETE /v1/remote-agents/connectors/:cid`; with a device sign-in, whose access token
+  the user side refuses, the new connector-side `POST /v1/remote-agents/connectors/:cid/revoke` (the same revocation, for any of the
+  caller's connectors). When the row cannot be revoked (Claw unreachable, the sign-in already refused, a Claw without the new route),
+  the sign-in is still deleted, `logout` says the connector is not revoked, prints the `curl` that revokes it, keeps its id, and
+  exits 1.
 - Remote connector presence over time: every change of a connector's presence is recorded, the connector list gives
   `last_seen_at`, `offline_since` and `offline_reason` (`auth_expired`, `no_heartbeat`), and a connector offline for 5 minutes
   is reported once to its owner through their assistant with when it was last seen and the command that brings it back, then

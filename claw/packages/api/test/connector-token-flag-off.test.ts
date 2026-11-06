@@ -63,9 +63,12 @@ describe("which routes are connector-side", () => {
     ["POST", `/v1/remote-agents/connectors/${CID}/heartbeat`, true],
     ["POST", `/v1/remote-agents/connectors/${CID}/events`, true],
     ["GET", `/v1/remote-agents/connectors/${CID}/commands`, true],
+    ["POST", `/v1/remote-agents/connectors/${CID}/revoke`, true],
     // The user's half, and near misses of the connector's.
     ["GET", "/v1/remote-agents/connectors", false],
     ["DELETE", `/v1/remote-agents/connectors/${CID}`, false],
+    ["DELETE", `/v1/remote-agents/connectors/${CID}/revoke`, false],
+    ["GET", `/v1/remote-agents/connectors/${CID}/revoke`, false],
     ["GET", `/v1/remote-agents/connectors/${CID}/heartbeat`, false],
     ["POST", `/v1/remote-agents/connectors/${CID}/commands`, false],
     ["GET", `/v1/remote-agents/connectors/${CID}/events`, false],
