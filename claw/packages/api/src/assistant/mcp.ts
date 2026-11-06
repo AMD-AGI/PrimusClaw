@@ -123,7 +123,7 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims, choic
     {
       prs: z.array(z.string()).describe("Each as owner/repo#number or its URL; only numbers the user wrote."),
       merge: z.boolean().describe("true only when the user clearly asked to merge after the review; otherwise false (review only). Even true merges nothing by itself: the merge waits for the user's confirmation (the card's button or 批准 #<ref>)."),
-      reviewer: z.string().optional().describe("Whose GitHub account reviews: leave out for the user. Someone else's (a user_id from People) is handed to the user's channel when it can start it with that person's credentials (handed_off: say it was handed over, not that it started), and otherwise refused as acting_as_credentials_required: tell the user what the refusal says to do."),
+      reviewer: z.string().optional().describe("Whose GitHub account reviews: leave out for the user. Someone else's (a user_id from People) is handed to the user's channel when it can start it with that person's credentials (handed_off: say it was handed over, not that it started), and otherwise refused as acting_as_credentials_required: tell the user what the refusal says to do. When the user's whole message is 确认 <name> (confirm <name>) answering which reviewer they meant, call it with the prs and merge of their request just before it and that person's user_id."),
       model: z.string().optional().describe(choice ? MODEL_PARAM_CHOICE : "Only when the user named a model."),
       effort: z.enum(["low", "medium", "high"]).optional().describe("Only when the user asked for one."),
     },

@@ -36,7 +36,13 @@ export const CONTEXT_STRING_MAX = 200;
 /** How long a message is kept for the turn that answers it. Far longer than any turn may wait in the queue. */
 const MESSAGE_RETENTION = "7 days";
 
-export interface ChannelPerson { name: string; user_id?: string; email?: string }
+/** At most this many other handles of one person (`ChannelPerson.aliases`). */
+export const PERSON_ALIASES_MAX = 10;
+/**
+ * A person the channel lists beside the message. `aliases`: other handles the channel knows them by (a GitHub login, a chat user name,
+ * the address they sign in with), each a way the message may name them (`reviewerNamed`).
+ */
+export interface ChannelPerson { name: string; user_id?: string; email?: string; aliases?: string[] }
 export interface ChannelAction { name: string; usage?: string; summary?: string }
 /**
  * What a channel can be handed to carry out itself, as typed data (`channel_context.handoffs`). `review_for_other`: a review the person
@@ -76,7 +82,8 @@ export function parseChannelContext(raw: unknown): ChannelContext {
     if (!name) continue;
     const userId = str(p.user_id);
     const email = str(p.email);
-    people.push({ name, ...(userId ? { user_id: userId } : {}), ...(email ? { email } : {}) });
+    const aliases = [...new Set((Array.isArray(p.aliases) ? p.aliases : []).map(str).filter((a): a is string => !!a))].slice(0, PERSON_ALIASES_MAX);
+    people.push({ name, ...(userId ? { user_id: userId } : {}), ...(email ? { email } : {}), ...(aliases.length ? { aliases } : {}) });
   }
   const actions: ChannelAction[] = [];
   for (const a of objects(c.actions)) {
