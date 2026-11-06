@@ -41,7 +41,7 @@
  *   EVAL_OUT          a directory for the results: <mode>.json and <mode>.md
  *   EVAL_RECORD_DIR   a directory for <mode>-recordings.jsonl: every attempt as observed (what the identity was shown
  *                     included), for EVAL_OFFLINE; written only when set, and only together with EVAL_KEEP_TEXT=1
- *   EVAL_JUDGE_URL, EVAL_JUDGE_MODEL, EVAL_JUDGE_KEY_FILE
+ *   EVAL_JUDGE_URL, EVAL_JUDGE_MODEL, EVAL_JUDGE_KEY_FILE, EVAL_JUDGE_MAX_TOKENS (default 1024)
  *                     an Anthropic-compatible gateway, a model and its key: every case is also graded by that model (the
  *                     no-false-denial rule with the turn's calls, and the case's rubric and judge-only facts). Its FAIL fails
  *                     the case and it decides what the denial detectors left to it; it never passes a case a deterministic
@@ -410,6 +410,10 @@ function mcpClient(server: string): Promise<Client> {
 // --- The optional judge ---------------------------------------------------------------------------------------------
 
 /** The judge's verdict; `failed` when it gave none (unreachable, an error status, no PASS or FAIL): the run's, not the assistant's. */
+// The gateway's Sonnet answers with a thinking block first: 200 tokens could leave no text, and the attempt became an error
+// ("judge gave no PASS or FAIL") rather than a grade.
+const JUDGE_MAX_TOKENS = int("EVAL_JUDGE_MAX_TOKENS", 1024, 64, 16_384);
+
 async function judge(c: EvalCase, turns: Turn[], final: string, calls: readonly ToolCall[]): Promise<{ pass: boolean; why: string; failed?: true } | null> {
   const url = process.env.EVAL_JUDGE_URL, model = process.env.EVAL_JUDGE_MODEL, keyFile = process.env.EVAL_JUDGE_KEY_FILE;
   // Every case, not only those with content only a judge can grade: the no-false-denial rule is in every prompt.
@@ -420,7 +424,7 @@ async function judge(c: EvalCase, turns: Turn[], final: string, calls: readonly 
     const res = await fetch(`${url.replace(/\/+$/, "")}/v1/messages`, {
       method: "POST", signal: AbortSignal.timeout(60_000),
       headers: { "content-type": "application/json", "x-api-key": key, authorization: `Bearer ${key}`, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model, max_tokens: 200, messages: [{ role: "user", content: prompt }] }),
+      body: JSON.stringify({ model, max_tokens: JUDGE_MAX_TOKENS, messages: [{ role: "user", content: prompt }] }),
     });
     if (!res.ok) return { pass: false, why: `judge answered ${res.status}`, failed: true };
     const text = String(((await res.json()) as any)?.content?.find((b: any) => b.type === "text")?.text ?? "");
