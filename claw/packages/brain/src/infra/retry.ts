@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { isTransientNatsError } from "./nats-transient.js";
+import { transientNatsErrorIn } from "./nats-transient.js";
 import { sleep } from "@claw/utils";
 import pino from "pino";
 import {
@@ -182,6 +182,27 @@ function parseRetryAfter(raw: string | null): number {
   return deltaSec > 0 ? Math.min(deltaSec, 300) : 5;
 }
 
+/**
+ * How long a run that failed retryably waits before its next attempt.
+ *
+ * Doubling from 5s, the flat delay this replaces, so a first retry is exactly
+ * as quick as before. Flat, a stall longer than a few attempts -- JetStream
+ * without a leader, a provider shedding load -- spent the whole delivery budget
+ * on attempts that met the same stall; doubling spreads the same budget over
+ * the time such a stall actually lasts.
+ *
+ * Capped at a minute: under the nak ceiling the stream's retention is derived
+ * from (TASK_LOCK_NAK_MAX_MS), and well under RETRY_PENDING_KEEPALIVE_GRACE_SEC,
+ * after which the sandbox kept for the retry is stopped as an orphan.
+ */
+export const RETRYABLE_NAK_BASE_MS = 5_000;
+export const RETRYABLE_NAK_MAX_MS = 60_000;
+
+export function retryableNakMs(attempt: number): number {
+  const n = Math.max(1, Math.floor(attempt) || 1);
+  return Math.min(RETRYABLE_NAK_MAX_MS, RETRYABLE_NAK_BASE_MS * 2 ** Math.min(n - 1, 16));
+}
+
 /** Determine if an error is retryable (Brain should nak and re-queue). */
 export function isRetryable(err: unknown): boolean {
   const e = err as { name?: string; status?: number; message?: string; cause?: { message?: string; code?: string } };
@@ -194,8 +215,10 @@ export function isRetryable(err: unknown): boolean {
   if (e?.name === "APIConnectionError" || e?.name === "APIConnectionTimeoutError") return true;
   // NATS reachability (a PubAck that never came, a stream between leaders, a
   // reconnect in progress) by the client's own error code. See
-  // isTransientNatsError for why the message cannot be used for this.
-  if (isTransientNatsError(err)) return true;
+  // isTransientNatsError for why the message cannot be used for this. Through
+  // the cause chain, because the sandbox layer wraps its KV failures in a
+  // sentence of its own (see transientNatsErrorIn).
+  if (transientNatsErrorIn(err)) return true;
   if (typeof e?.status === "number" && [408, 409, 429, 500, 502, 503, 504].includes(e.status)) return true;
   // A DAG handle row that kept moving under a conditional write
   // (`DagHandleContendedError`, brain/src/sandbox/errors.ts). Matched by name

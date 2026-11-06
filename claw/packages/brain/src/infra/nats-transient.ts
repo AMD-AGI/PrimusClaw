@@ -38,3 +38,29 @@ export function isTransientNatsError(err: unknown): boolean {
   if (e.name !== "NatsError") return false;
   return typeof e.code === "string" && TRANSIENT_NATS_CODES.has(e.code);
 }
+
+/**
+ * The transient NatsError behind `err`, wherever it sits in the cause chain.
+ *
+ * A NatsError does not always reach the runner as itself. The sandbox layer
+ * reads and writes its KV buckets on the run's own path and wraps what they
+ * throw in a sentence for the operator (`hands KV is unavailable; ...`,
+ * `... could not be written (TIMEOUT) ...`), keeping the NatsError as `cause`.
+ * Matched on the thrown object alone, the same twenty-second JetStream stall
+ * that `isTransientNatsError` was written for still ended such a run for good:
+ * not retryable (the sentence has no "nats" in it), and reported as the model
+ * timing out (it does have "TIMEOUT").
+ *
+ * Bounded like `provisionTerminalOf`, and stops at a provisioning give-up: that
+ * error is terminal by its own contract whatever it was caused by, and a cause
+ * chain must not turn it back into a redelivery.
+ */
+export function transientNatsErrorIn(err: unknown): unknown {
+  let current: unknown = err;
+  for (let depth = 0; current && typeof current === "object" && depth < 4; depth++) {
+    if ((current as { name?: unknown }).name === "SandboxProvisionTerminalError") return null;
+    if (isTransientNatsError(current)) return current;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return null;
+}

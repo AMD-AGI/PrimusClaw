@@ -30,7 +30,7 @@ import {
   workspaceSyncSemaphore,
   workspaceSigtermSyncSemaphore,
 } from "../workspace/sync-semaphore.js";
-import { isRetryable } from "../infra/retry.js";
+import { isRetryable, retryableNakMs } from "../infra/retry.js";
 import { unregisterSandbox, markHandsIdle } from "../sandbox/keepalive.js";
 import { attributionOf } from "../sandbox/attribution.js";
 import { markRetryPending } from "./retry-pending.js";
@@ -93,7 +93,7 @@ import {
   activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isUserCancelReason,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
-import { isTransientNatsError } from "../infra/nats-transient.js";
+import { transientNatsErrorIn } from "../infra/nats-transient.js";
 import { lockPastSelfFence, pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
 import {
   redactEgressPayload, redactPersistedEvent, type RuntimeSecrets,
@@ -637,8 +637,10 @@ function classifyTaskFailure(rawMsg: string, err?: unknown): {
   // It is Claw's own event bus or lock store that did not answer, the model was
   // never involved, and saying otherwise sends whoever reads the reason to the
   // wrong system. Normally such an error is retried rather than reaching here;
-  // this is what a run that used up its retries on one says.
-  if (isTransientNatsError(err)) {
+  // this is what a run that used up its retries on one says. Wrapped ones too:
+  // the sandbox layer's own sentence around a KV TIMEOUT reads "(TIMEOUT)" and
+  // would be filed as the model's by the pattern below.
+  if (transientNatsErrorIn(err)) {
     return {
       reason: "infra_transient",
       userText: "Claw's internal messaging was briefly unavailable and the run could not continue. Please retry.",
@@ -707,7 +709,7 @@ function classifyRetryableReason(err: unknown): string {
   const causeCode = String(e?.cause?.code || "");
   // First, for the reason classifyTaskFailure gives: "TIMEOUT" is a NatsError's
   // whole message, and the line below would file it as the model's.
-  if (isTransientNatsError(err)) return "nats_transient";
+  if (transientNatsErrorIn(err)) return "nats_transient";
   if (e?.name === "APIConnectionTimeoutError" || /timeout|deadline/i.test(msg)) return "llm_connection_timeout";
   if (e?.name === "APIConnectionError" || /connection error|fetch failed/i.test(msg)) return "llm_connection_error";
   if (typeof e?.status === "number") return `http_${e.status}`;
@@ -4128,7 +4130,11 @@ class TaskRunner {
       retryPendingDeadlineMs,
       retryPendingGraceSec: RETRY_PENDING_KEEPALIVE_GRACE_SEC,
     });
-    await this.nakAfterAttempt(5000);
+    // Backed off by the attempt this was: a claimed run counts its claims, a
+    // fat delivery its deliveries.
+    await this.nakAfterAttempt(retryableNakMs(
+      this.claimed ? this.attempt.claimCount : this.msg.info.deliveryCount,
+    ));
   }
 
   private async handleFatalError(err: any): Promise<void> {
