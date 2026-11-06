@@ -569,6 +569,44 @@ export async function finishConfirmation(
   );
 }
 
+/**
+ * The merges a session holds for the acting user's answer on this head, taken for the requester's own merge (`GithubReview.followPullRequest`)
+ * in one statement, as a click takes one (`claimConfirmation`): a click after this finds them no longer pending. Null, with nothing taken,
+ * when one of the session's held writes is being decided right now: the acting user's answer goes first.
+ */
+export async function claimHeldMerges(db: Queryable, sessionId: string, headSha: string, requesterUserId: string): Promise<string[] | null> {
+  const busy = async (except: string[]): Promise<boolean> => (await db.query(
+    "SELECT 1 FROM claw_github_confirmations WHERE session_id = $1 AND status = 'merging' AND NOT (confirmation_id::text = ANY($2::text[])) LIMIT 1",
+    [sessionId, except],
+  )).rows.length > 0;
+  if (await busy([])) return null;
+  const taken = (await db.query(
+    `UPDATE claw_github_confirmations
+        SET status = 'merging', decided_at = NOW(), decided_by = $3, decided_via = '{"kind":"requester"}'::jsonb
+      WHERE session_id = $1 AND status = 'pending' AND kind = 'merge' AND head_sha = $2 AND expires_at > NOW()
+      RETURNING confirmation_id`,
+    [sessionId, headSha, requesterUserId],
+  )).rows.map((r) => String((r as { confirmation_id: string }).confirmation_id));
+  // A click that claimed one between the look and the update: theirs goes first, and what was taken here is given back.
+  if (await busy(taken)) {
+    for (const id of taken) await reopenConfirmation(db, id);
+    return null;
+  }
+  return taken;
+}
+
+/** The GitHub ids of the approvals this session posted of this head, newest first, from its own audit rows (`posted`). */
+export async function postedApprovalIds(db: Queryable, sessionId: string, repo: string, pr: number, headSha: string): Promise<number[]> {
+  const r = await db.query(
+    `SELECT (posted->>'review_id')::bigint AS id FROM claw_github_audit
+      WHERE session_id = $1 AND lower(repo) = lower($2) AND pr = $3 AND head_sha = $4 AND result = 'ok'
+        AND posted->>'event' = 'APPROVE' AND posted->>'review_id' ~ '^[0-9]{1,18}$'
+      ORDER BY at DESC LIMIT 5`,
+    [sessionId, repo, pr, headSha],
+  );
+  return r.rows.map((row) => Number((row as { id: string | number }).id));
+}
+
 /** Whether this session merged its pull request, or put it in the merge queue: by a confirmation a person allowed, or by a merge made at once. */
 export async function sessionMerged(db: Queryable, sessionId: string): Promise<boolean> {
   const r = await db.query(

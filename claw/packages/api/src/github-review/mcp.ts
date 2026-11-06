@@ -224,6 +224,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
   reviewItemPorts.checkPullRequest = (actor, ref) => service.checkPullRequest(actor, ref);
   // And ask whether the acting user lets others act for them, when a review is asked of them and before each of its turns.
   reviewItemPorts.delegationOf = typeof service.delegationOf === "function" ? (actor, requester) => service.delegationOf(actor, requester) : null;
+  reviewItemPorts.followPullRequest = typeof service.followPullRequest === "function" ? (f) => service.followPullRequest(f) : null;
 
   app.all("/v1/internal/github-review/mcp", async (req, reply) => {
     const header = String(req.headers.authorization ?? "");

@@ -151,6 +151,33 @@ credentials with the request: `x-acting-as-token` (X's delegated identity-provid
 - A review again (below) continues only the last closed review of the same pull request with the same owner and the same
   requester: a new request from R continues R's last request of X, never X's own review or another requester's.
 
+### After the review: the pull request is followed, and the requester merges
+
+Once a review item's turn has ended having posted or held something, the review items' sweep looks at its pull request on GitHub,
+at most once every 90 seconds per item and by one replica at a time (`followReviewItems`, `GithubReview.followPullRequest`; an
+audit row with tool `gh_pr_follow` each time):
+
+- **Merged or closed on GitHub, by anyone.** The item ends (`merged on GitHub` as done, `closed on GitHub without a merge` as stopped),
+  and every write its session still holds for the acting user's answer is closed as `stale` (`result.reason` `pr_merged` /
+  `pr_closed`): nobody is asked to confirm a merge of a pull request that is no longer open, and it no longer counts against
+  `too_many_pending_confirmations`. The requester's view says `merged` for a pull request merged on GitHub.
+- **The requester's merge.** For a review asked of someone else (R asked X) that may merge (not `review_only`: R's message asked for
+  a merge), the merge is R's once X's approval is on GitHub. R wrote the pull request and asked for it to be merged; X's review mode and
+  X's held merge govern what is done with X's account, not what R does with R's own. So the sweep merges it **with R's own GitHub
+  account** (R's own credential: nobody's switch is asked), instead of waiting for X to confirm a held merge, when every one of these
+  holds, read at that moment: the pull request is open and not a draft; R's account is its author and may push; this review session
+  posted an approval of the current head with X's account (the review id on its own audit row), and GitHub still has that review as
+  `APPROVED` on that commit (a push or a dismissal takes it back); CI is green on the head, no review thread is open, and GitHub's merge
+  state is `CLEAN` (a merge queue: it is queued as R, never merged directly); and nobody is answering X's held merge right now (X's
+  answer, or X's write lock on the pull request, goes first). The merge is pinned to the head (`sha`), counts against the hourly write
+  limits, and is made only with `CLAW_GITHUB_WRITES_ENABLED`. X's held merge for that head is then closed as `merged` (or `queued`),
+  decided by R (`decided_via: {"kind": "requester"}`, `result.by: "requester"`), so X's card or `批准 #<ref>` for it answers that it no
+  longer waits, and the item ends as merged by the requester's account. A merge GitHub refuses gives X's held merge back to X, still
+  pending. When a gate is not open yet (CI still running, a thread open, `BEHIND`) nothing is written and the sweep looks again later.
+  R without a bound GitHub account (or a lapsed one) is not merged for: the pull request is read with X's account, as the review read it,
+  for the merged-or-closed check only.
+- A review only, and the acting user's own review, are only read, with the acting user's account (their switch still counts).
+
 ### A review again: it continues the last one
 
 A posted review of an item's session is recorded on its audit row (`claw_github_audit.posted`: the event and each inline finding
@@ -504,7 +531,8 @@ A confirmation lives 24 hours (`CLAW_GITHUB_CONFIRMATION_TTL_SECONDS`), is bound
 commit (a head that moved makes it `stale`) and is used once. There is one pending confirmation for a
 head commit and a write: asking for the same merge, or posting the same review, again shows the same one,
 while a merge and a review, or two reviews that say different things, are different confirmations. One
-acting user is asked about at most ten writes at a time (`too_many_pending_confirmations`).
+acting user is asked about at most thirty writes at a time (`too_many_pending_confirmations`); a held write whose pull request
+is merged or closed on GitHub stops counting as soon as the review items' sweep sees it (above, "After the review").
 
 ### A service answering for the acting user
 

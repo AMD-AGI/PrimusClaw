@@ -25,7 +25,7 @@ import { reviewAgentSettings, reviewTurnsLeft } from "../github-review/review-pr
 import { SEALED_CREDENTIALS_FIELD } from "../auth/sealed-session-credentials.js";
 import { checkSessionCreate, proofForFirstMessageAgain, type AttendedProof } from "../github-review/acting-session.js";
 import { isValidPrRef, type PrRef } from "../github-review/github.js";
-import type { ReviewActor, ReviewContinuation, ToolOutcome } from "../github-review/service.js";
+import type { FollowRequest, ReviewActor, ReviewContinuation, ToolOutcome } from "../github-review/service.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import { closeConfirmationsForStop, type PostedReview } from "../github-review/store.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
@@ -119,9 +119,12 @@ export type DelegationAnswer = "on" | "off" | "not_bound" | "expired" | "unavail
 export const reviewItemPorts: {
   checkPullRequest: ((actor: ReviewActor, ref: PrRef) => Promise<ToolOutcome>) | null;
   delegationOf: ((actorUserId: string, requesterUserId: string) => Promise<DelegationAnswer>) | null;
+  /** What became of a review's pull request, and the requester's merge of it (`GithubReview.followPullRequest`). */
+  followPullRequest: ((f: FollowRequest) => Promise<ToolOutcome>) | null;
 } = {
   checkPullRequest: null,
   delegationOf: null,
+  followPullRequest: null,
 };
 
 export function reviewItemsEnabled(): boolean {
@@ -1043,6 +1046,10 @@ export interface ReviewFacts {
   halted?: { reason: string; message: string } | null;
 }
 
+/** The audit rows of `GithubReview.followPullRequest`, and the details of those that end a review item. */
+export const FOLLOW_TOOL = "gh_pr_follow";
+const FOLLOW_ENDS: ReadonlySet<string> = new Set(["merged", "queued", "already_merged", "closed"]);
+
 export type ReviewState =
   | { boardState: "in_progress"; summary: string; question: string | null }
   | { boardState: "needs_you"; reportKind: "blocked" | "failed"; summary: string; question: string }
@@ -1057,6 +1064,17 @@ export function reviewState(f: ReviewFacts): ReviewState {
   const pr = prName(f.pr);
   const own = f.actingAs === f.ownerUserId;
   const latest = <T extends { at: number }>(xs: T[]): T | null => xs.reduce<T | null>((a, x) => (!a || x.at >= a.at ? x : a), null);
+  // What the sweep found of the pull request on GitHub (`followReviewItems`): merged by the requester's own account after this review's
+  // approval, merged or closed by anyone, which ends the item whatever it still held for an answer.
+  const ended = latest(f.writes.filter((w) => w.tool === FOLLOW_TOOL && w.result === "ok" && FOLLOW_ENDS.has(w.detail)));
+  if (ended) {
+    switch (ended.detail) {
+      case "merged": return { boardState: "done", outcome: "accepted", summary: `${pr} was merged by the requester's account after the approval` };
+      case "queued": return { boardState: "done", outcome: "accepted", summary: `${pr} is in the merge queue` };
+      case "already_merged": return { boardState: "done", outcome: "accepted", summary: `${pr} was merged on GitHub` };
+      default: return { boardState: "done", outcome: "stopped", summary: `${pr} was closed on GitHub without a merge` };
+    }
+  }
   const merged = f.confirmations.find((c) => c.status === "merged" || c.status === "queued")
     ?? f.writes.find((w) => w.tool === "gh_pr_merge" && w.result === "ok" && (w.detail === "merged" || w.detail === "queued"));
   if (merged) {
@@ -1115,7 +1133,7 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
   )).rows as Array<{ status: string; kind: string; at: unknown }>;
   const writes = (await q.query(
     `SELECT tool, result, detail, at FROM claw_github_audit
-      WHERE session_id = $1 AND tool IN ('gh_pr_merge', 'gh_review_submit') AND result <> 'started'`,
+      WHERE session_id = $1 AND tool IN ('gh_pr_merge', 'gh_review_submit', '${FOLLOW_TOOL}') AND result <> 'started'`,
     [sessionId],
   )).rows as Array<{ tool: string; result: string; detail: string; at: unknown }>;
   const turn = (await q.query(
@@ -1261,4 +1279,65 @@ export async function sweepReviewItems(): Promise<number> {
     }
   }
   return changed;
+}
+
+/** How often one review item's pull request is looked at on GitHub, at most. */
+export const REVIEW_FOLLOW_MS = 90_000;
+/** Review items looked at in one tick, the longest unlooked-at first. */
+export const REVIEW_FOLLOW_BATCH = 30;
+
+/**
+ * Every tick, for the open review items whose review has had its turn: what became of the pull request on GitHub
+ * (`GithubReview.followPullRequest`). A pull request merged or closed there ends the item, and what its session still held for the
+ * reviewer's answer is closed with it, so an item does not wait for ever on a confirmation nobody needs. For a review asked of someone
+ * else whose requester asked for a merge, the requester's own account merges it once the reviewer's approval is on GitHub and every
+ * gate is open, instead of asking the reviewer to confirm the merge. One item is looked at by one replica at a time, every
+ * `REVIEW_FOLLOW_MS` at most; a look that fails says so in the log and is tried at the next.
+ */
+export async function followReviewItems(now = Date.now()): Promise<number> {
+  const follow = reviewItemPorts.followPullRequest;
+  if (!CLAW_ASSISTANT_REVIEW_ITEMS || !follow) return 0;
+  const due = now - REVIEW_FOLLOW_MS;
+  const rows = (await db.query(
+    `SELECT w.item_id FROM claw_work_items w
+      WHERE w.kind = 'review' AND w.board_state <> 'done' AND w.outcome IS DISTINCT FROM 'stopped'
+        AND COALESCE(NULLIF(substring(w.params->>'followed_at' from '^[0-9]{1,15}$'), '')::bigint, 0) < $1
+        AND (EXISTS (SELECT 1 FROM claw_github_confirmations c WHERE c.session_id = w.worker_session_id)
+          OR EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = w.worker_session_id AND a.tool IN ('gh_review_submit', 'gh_pr_merge') AND a.result <> 'started'))
+        AND NOT EXISTS (SELECT 1 FROM claw_tasks t WHERE t.session_id = w.worker_session_id AND t.origin = 'chat' AND t.status = ANY($2::text[]))
+        AND NOT EXISTS (SELECT 1 FROM claw_pending_messages m WHERE m.session_id = w.worker_session_id)
+      ORDER BY COALESCE(NULLIF(substring(w.params->>'followed_at' from '^[0-9]{1,15}$'), '')::bigint, 0), w.updated_at
+      LIMIT $3`,
+    [due, SWEEPABLE_RUN_STATUSES, REVIEW_FOLLOW_BATCH],
+  )).rows as Array<{ item_id: string }>;
+  let ended = 0;
+  for (const { item_id } of rows) {
+    // Taken by one replica: the one whose update still finds it due.
+    const taken = (await db.query(
+      `UPDATE claw_work_items SET params = params || jsonb_build_object('followed_at', $2::bigint)
+        WHERE item_id = $1 AND board_state <> 'done'
+          AND COALESCE(NULLIF(substring(params->>'followed_at' from '^[0-9]{1,15}$'), '')::bigint, 0) < $3
+        RETURNING user_id, worker_session_id, params, kind`,
+      [item_id, now, due],
+    )).rows[0] as Record<string, unknown> | undefined;
+    const params = taken ? readParams(taken) : null;
+    if (!taken || !params) continue;
+    const requestedBy = params.requested_by ?? null;
+    try {
+      const out = await follow({
+        sessionId: String(taken.worker_session_id), ref: params.pr, actingUserId: params.acting_as,
+        requesterUserId: requestedBy ?? String(taken.user_id), requesterLabel: params.requester_label ?? undefined,
+        mergeByRequester: requestedBy !== null && requestedBy !== params.acting_as && params.review_only === false,
+      });
+      const status = String(out.body.status ?? "");
+      logger.info({ itemId: item_id, status, reason: out.body.reason ?? null }, "assistant.review_followed");
+      if (!out.isError && FOLLOW_ENDS.has(status)) {
+        await syncReviewItem(item_id);
+        ended += 1;
+      }
+    } catch (err) {
+      logger.warn({ err, itemId: item_id }, "assistant.review_follow_failed");
+    }
+  }
+  return ended;
 }

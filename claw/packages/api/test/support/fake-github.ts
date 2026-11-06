@@ -165,6 +165,11 @@ export class FakeGithub {
     if (/\/rules\/branches\//.test(p)) return this.rulesStatus === 200 ? json(200, this.rules) : json(this.rulesStatus, { message: "nope" });
     if (/\/issues\/\d+\/comments$/.test(p)) return json(200, this.issueComments);
     if (/\/pulls\/\d+\/comments$/.test(p)) return json(200, this.reviewComments);
+    const oneReview = /\/pulls\/\d+\/reviews\/(\d+)$/.exec(p);
+    if (oneReview && method === "GET") {
+      const r = this.reviews.find((x) => String(x.id) === oneReview[1]);
+      return r ? json(200, r) : json(404, { message: "Not Found" });
+    }
     if (/\/pulls\/\d+\/reviews$/.test(p)) {
       if (method === "GET") {
         const per = Number(call.query.per_page ?? 30);

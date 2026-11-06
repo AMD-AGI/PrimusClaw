@@ -48,7 +48,8 @@ export async function currentRequesterView(
            WHERE c.session_id = $1 AND c.kind = 'review' AND c.status = 'submitted'
         ) v WHERE ev IS NOT NULL ORDER BY at DESC LIMIT 1) AS verdict,
        (EXISTS (SELECT 1 FROM claw_github_confirmations WHERE session_id = $1 AND status = 'merged')
-        OR EXISTS (SELECT 1 FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_pr_merge' AND result = 'ok' AND detail = 'merged')) AS merged`,
+        OR EXISTS (SELECT 1 FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_pr_merge' AND result = 'ok' AND detail = 'merged')
+        OR EXISTS (SELECT 1 FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_pr_follow' AND result = 'ok' AND detail IN ('merged', 'already_merged'))) AS merged`,
     [row.worker_session_id],
   )).rows[0] as { verdict: string | null; merged: boolean };
   const status: RequesterView["status"] = row.board_state === "done"

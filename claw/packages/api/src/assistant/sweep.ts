@@ -11,7 +11,7 @@
  */
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { releaseHoldsOfEndedRuns } from "./holds.js";
-import { sweepReviewItems } from "./review-items.js";
+import { followReviewItems, sweepReviewItems } from "./review-items.js";
 import { reconcileOrphanedItems, reconcileWorkerRuns } from "./turn-end.js";
 import { tellSilentItems } from "./silent-sweep.js";
 import { surfaceStuckItems } from "./watchdog.js";
@@ -28,6 +28,8 @@ export async function sweepAssistant(): Promise<void> {
   await reconcileOrphanedItems();
   // Review items report nothing: their state is read off the review's own tables, here as well as at each turn's end and answer.
   await sweepReviewItems();
+  // And what became of their pull requests on GitHub: merged or closed there ends the item; a merge the requester asked for is made.
+  await followReviewItems();
   // An item something is still open behind, with no sign of life past the watchdog's threshold (off by default): in
   // front of the user with the reason, before the announcement below looks for items that need them.
   await surfaceStuckItems();
