@@ -649,6 +649,7 @@ export class AgentEngine {
           questionDispatcher: decisions ?? undefined,
           ...(waitMs !== undefined ? { questionTimeoutMs: waitMs } : {}),
           onCheckpoint: extras?.onCheckpoint,
+          onTurnJournal: extras?.onTurnJournal,
           onCacheUse: extras?.onCacheUse,
           resumeFrom: extras?.resumeCheckpoint,
         });
