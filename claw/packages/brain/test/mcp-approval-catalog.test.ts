@@ -15,6 +15,8 @@
  *   AC5 through the controller a turn uses: with the hand list, workload_resume asks and is denied when nobody answers
  *   AC6 the trigger server is held by name like any catalogued server: its writes and a tool it does not list, wherever it points
  *       (the API's reserved path on another host too)
+ *   AC7 the catalog only ever adds: whatever the spec, every call the spec holds is still held, and nothing the spec does not
+ *       release is released; a server with no rule of its own runs its catalogued reads exactly as it did before
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -112,10 +114,41 @@ test("AC6 the trigger server is held by name: its writes and any tool it does no
       assert.equal(p.requiresApproval(T("trigger_create")), true, label);
       assert.equal(p.requiresApproval(T("trigger_cancel")), true, label);
       assert.equal(p.requiresApproval(T("drop_everything")), true, `${label}: a tool the catalog does not list`);
-      assert.equal(p.requiresApproval(T("trigger_list")), false, `${label}: a catalogued read`);
+      assert.equal(p.requiresApproval(T("trigger_list")), false, `${label}: a catalogued read is not held by the catalog; the spec decides, as before`);
     }
     const released = approvalPolicyFromMcp({ [TRIGGER_MCP_SERVER]: { ...base, url, requires_approval: true, auto_approve: ["trigger_*", "drop_*"] } });
     assert.equal(released.autoApprovalRule(T("trigger_create"), {}), null, `${url}: not releasable`);
     assert.equal(released.autoApprovalRule(T("drop_everything"), {}), null, `${url}: unlisted, not releasable`);
   }
+});
+
+test("AC7 the catalog never makes a call less held than its spec alone", () => {
+  const specs: Array<Record<string, unknown>> = [
+    {}, { requires_approval: false }, { requires_approval: true }, { requires_approval: ["workload_get", "trigger_list"] },
+    { requires_approval: true, auto_approve: ["*_get", "workload_*", "trigger_*", "get_*", "preview_*", "apply_*"] },
+    { requires_approval: true, auto_approve: [{ tool: "workload_resume", when: { dry_run: true } }] }, { requires_approval: "malformed" },
+  ];
+  let compared = 0;
+  for (const server of Object.keys(TOOL_CATALOG)) {
+    const tools = [...Object.keys(TOOL_CATALOG[server]!.tools), "tool_added_tomorrow"];
+    for (const extra of specs) {
+      const spec = { ...base, ...extra };
+      const alone = approvalPolicyFromMcp({ [server]: spec }, { catalog: null });
+      const withCatalog = approvalPolicyFromMcp({ [server]: spec });
+      for (const t of tools) {
+        const name = `mcp__${server}__${t}`;
+        for (const input of [{}, { dry_run: true }]) {
+          const label = `${server} ${JSON.stringify(extra)} ${t} ${JSON.stringify(input)}`;
+          if (alone.requiresApproval(name)) assert.equal(withCatalog.requiresApproval(name), true, `${label}: held by the spec`);
+          if (withCatalog.requiresApproval(name) && withCatalog.autoApprovalRule(name, input) !== null) {
+            assert.notEqual(alone.autoApprovalRule(name, input), null, `${label}: released only where the spec alone releases it`);
+          }
+          // Not held by the spec, and a catalogued read: the catalog leaves it exactly as it was.
+          if (!alone.requiresApproval(name) && catalogClassOf(server, t) === "read") assert.equal(withCatalog.requiresApproval(name), false, label);
+          compared++;
+        }
+      }
+    }
+  }
+  assert.ok(compared > 2000, `${compared} comparisons`);
 });
