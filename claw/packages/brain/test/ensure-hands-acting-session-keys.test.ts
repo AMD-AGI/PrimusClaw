@@ -107,9 +107,18 @@ async function sandboxEnvOf(request: Partial<ExecuteRequest>): Promise<{ created
 
 const everyEnv = (r: Awaited<ReturnType<typeof sandboxEnvOf>>): Array<Record<string, string>> => [r.created.env, r.handsEnvFile];
 
-test("an ordinary session's sandbox is given the owner's platform key (SAFE_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY), as always, in both places", async () => {
+/**
+ * Where an ordinary sandbox's credentials go: the environment file Hands applies, and never the SaFE workload, whose env SaFE returns to
+ * every caller allowed to read the workload (sandbox/workload-env.ts).
+ */
+const handsEnvOnly = (r: Awaited<ReturnType<typeof sandboxEnvOf>>): Array<Record<string, string>> => [r.handsEnvFile];
+
+test("an ordinary session's sandbox is given the owner's platform key (SAFE_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY) in the environment file, and the workload carries none of it", async () => {
   const r = await sandboxEnvOf({});
-  for (const env of everyEnv(r)) assert.deepEqual(KEY_NAMES.map((k) => env[k]), [PLATFORM_KEY, PLATFORM_KEY, PLATFORM_KEY]);
+  assert.deepEqual(KEY_NAMES.map((k) => r.handsEnvFile[k]), [PLATFORM_KEY, PLATFORM_KEY, PLATFORM_KEY]);
+  for (const name of [...KEY_NAMES, "AUTH_CLAW_TOKEN"]) assert.equal(name in r.created.env, false, `${name} is not in the workload's env`);
+  for (const [name, value] of Object.entries(r.created.env)) assert.ok(!value.includes(PLATFORM_KEY), `${name} carries the key`);
+  assert.equal(r.created.env.CLAW_SESSION_ID, "sess-acting", "the session correlation SaFE lookups match on is still there");
 });
 
 test("a session that acts as a user gets a sandbox with none of them, in what the provider creates or in the environment file Hands applies, and the workload is still owned with the key", async () => {
@@ -119,7 +128,7 @@ test("a session that acts as a user gets a sandbox with none of them, in what th
     for (const [name, value] of Object.entries(env)) assert.ok(!value.includes(PLATFORM_KEY) && !value.includes("sk-owner-virtual-key-0001"), `${name} carries a key`);
   }
   assert.equal(r.created.platformKey, PLATFORM_KEY, "Brain still creates and owns the workload with the owner's key: it is not the sandbox's to read");
-  assert.equal(r.created.env.AUTH_CLAW_TOKEN?.length, 64, "the rest of the environment is built as it always was");
+  assert.equal("AUTH_CLAW_TOKEN" in r.created.env, false, "the Hands token travels with the start command, never in the workload");
   assert.equal(r.created.env.CLAW_SESSION_ID, "sess-acting");
 });
 
@@ -134,7 +143,7 @@ test("a sandbox spec cannot plant SAFE_API_KEY in one either", async () => {
 test("the marker is a switch for a true value only: false and absent are an ordinary session", async () => {
   for (const marker of [false, undefined]) {
     const r = await sandboxEnvOf({ withhold_sandbox_keys: marker });
-    assert.equal(r.created.env.SAFE_API_KEY, PLATFORM_KEY, String(marker));
+    assert.equal(r.handsEnvFile.SAFE_API_KEY, PLATFORM_KEY, String(marker));
   }
 });
 
@@ -149,10 +158,13 @@ test("no layer can put a key back: the spec's env and the request's env have the
   } as Partial<ExecuteRequest>;
   // Control: without the mark the layers do reach the sandbox (the request's env has the last word), so the absence below is the mark's.
   const ordinary = await sandboxEnvOf(layers);
-  for (const env of everyEnv(ordinary)) {
+  for (const env of handsEnvOnly(ordinary)) {
     assert.deepEqual([env.ANTHROPIC_API_KEY, env.OPENAI_API_KEY], ["planted-in-session", "planted-in-session"]);
   }
-  for (const env of everyEnv(ordinary)) assert.deepEqual([env.SPEC_KEPT, env.USER_KEPT, env.SESSION_KEPT], ["1", "1", "1"], "control: every layer reaches it");
+  for (const env of handsEnvOnly(ordinary)) assert.deepEqual([env.SPEC_KEPT, env.USER_KEPT, env.SESSION_KEPT], ["1", "1", "1"], "control: every layer reaches it");
+  assert.equal("ANTHROPIC_API_KEY" in ordinary.created.env, false, "no layer's key reaches the workload");
+  assert.deepEqual([ordinary.created.env.SPEC_KEPT, ordinary.created.env.USER_KEPT, ordinary.created.env.SESSION_KEPT], ["1", undefined, undefined],
+    "the workload keeps the spec's plain settings; the owner's and the request's variables are theirs and stay out whatever they are called");
   const marked = await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true });
   for (const env of everyEnv(marked)) {
     for (const name of KEY_NAMES) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
@@ -187,7 +199,7 @@ test("a sandbox that was made with the keys is not reused for a turn that is not
 
   await turn({});
   assert.equal(created.length, 1);
-  assert.equal(created[0]!.env.SAFE_API_KEY, PLATFORM_KEY, "the first turn's sandbox holds the key");
+  assert.equal("SAFE_API_KEY" in created[0]!.env, false, "the key is never in the workload; the first turn's sandbox gets it from the env file");
   await turn({});
   assert.equal(created.length, 1, "control: the same request is served by the sandbox it already has");
 
@@ -216,9 +228,11 @@ test("the owner's stored variables are in an ordinary sandbox and in none of a m
     session_env: { SESSION_KEPT: "1" },
   } as Partial<ExecuteRequest>;
   // Control: without the mark the vault reaches both places, so that the absence below is the mark's and not a renamed variable's.
-  for (const env of everyEnv(await sandboxEnvOf(layers))) {
+  const ordinary = await sandboxEnvOf(layers);
+  for (const env of handsEnvOnly(ordinary)) {
     for (const [name, value] of Object.entries(VAULT)) assert.equal(env[name], value, `control: ${name} reaches an ordinary sandbox`);
   }
+  for (const name of Object.keys(VAULT)) assert.equal(name in ordinary.created.env, false, `${name} never reaches the workload`);
   for (const env of everyEnv(await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true }))) {
     for (const name of Object.keys(VAULT)) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
     for (const [name, value] of Object.entries(env)) {
@@ -251,9 +265,14 @@ test("a change in the owner's stored variables is a change in an ordinary sandbo
 });
 
 test("the deployment's system env is in an ordinary sandbox and in none of a marked one, in either place its environment travels", async () => {
-  for (const env of everyEnv(await sandboxEnvOf({}))) {
+  const ordinary = await sandboxEnvOf({});
+  for (const env of handsEnvOnly(ordinary)) {
     for (const [name, value] of Object.entries(SYSTEM)) assert.equal(env[name], value, `control: ${name} reaches an ordinary sandbox`);
   }
+  for (const name of ["GBRAIN_TOKEN", "LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "GH_TOKEN"]) {
+    assert.equal(name in ordinary.created.env, false, `${name} is a credential and stays out of the workload`);
+  }
+  assert.equal(ordinary.created.env.SYSTEM_PLAIN_SETTING, SYSTEM.SYSTEM_PLAIN_SETTING, "plain configuration is still in the workload");
   for (const env of everyEnv(await sandboxEnvOf({ withhold_sandbox_keys: true }))) {
     for (const name of Object.keys(SYSTEM)) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
     for (const [name, value] of Object.entries(env)) {
@@ -272,9 +291,10 @@ test("a marked sandbox holds what Brain sets for Hands to run and nothing else, 
     user_env: { ...credentials },
     session_env: { ...credentials },
   } as Partial<ExecuteRequest>;
-  for (const env of everyEnv(await sandboxEnvOf(layers))) assert.equal(env.GH_TOKEN, "planted-0001", "control: they reach an ordinary one");
+  for (const env of handsEnvOnly(await sandboxEnvOf(layers))) assert.equal(env.GH_TOKEN, "planted-0001", "control: they reach an ordinary one");
   for (const env of everyEnv(await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true }))) {
-    assert.deepEqual(Object.keys(env).sort(), BRAIN_ONLY);
+    // The Hands token is Brain's too, but it is in neither: it travels with the start command.
+    assert.deepEqual(Object.keys(env).sort(), BRAIN_ONLY.filter((n) => n !== "AUTH_CLAW_TOKEN"));
     for (const [name, value] of Object.entries(env)) assert.ok(!value.startsWith("planted-") && !value.startsWith("system-planted-"), `${name} carries a layer's value`);
   }
 });

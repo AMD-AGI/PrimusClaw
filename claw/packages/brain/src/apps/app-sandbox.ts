@@ -39,6 +39,7 @@ import { ACTIVE_PHASES, TERMINAL_PHASES } from "../sandbox/workload-wait.js";
 import { pollWorkloadUntilRunning, SHUTDOWN_BUFFER_SECONDS } from "../sandbox/safe-workload-provider.js";
 import type { SandboxInstance } from "../sandbox/provider.js";
 import { applyModelKeyEnv } from "../sandbox/params.js";
+import { PLATFORM_CREDENTIAL_ENV } from "../sandbox/workload-env.js";
 import { SandboxProvisionTerminalError, provisionTerminalOf } from "../sandbox/errors.js";
 
 const logger = pino({ name: "app-sandbox" });
@@ -176,24 +177,34 @@ function withoutSessionEnv(env: Record<string, string> | undefined): Record<stri
 }
 
 /**
- * The env the sandbox is created with: the spec's, the run's identity, and the
- * model credential Hands sandboxes get: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
- * (applyModelKeyEnv; platform-owned, so it wins over the spec).
+ * The env the sandbox is created with: the spec's and the run's identity.
+ *
+ * No credential: everything here is stored by SaFE in the workload and returned
+ * to every caller allowed to read it, so the model credential is not set here
+ * (and a `SAFE_API_KEY` a spec supplies is dropped). The application gets the
+ * credential from its start command's execute request instead
+ * (appModelKeyEnv, used by the AppRunner's startApplication).
+ */
+export function appSandboxEnv(run: Pick<AppSandboxRun, "runId" | "sandboxSpec">): Record<string, string> {
+  const env: Record<string, string> = { ...withoutSessionEnv(run.sandboxSpec.env), [APP_RUN_ID_ENV]: run.runId };
+  delete env.SAFE_API_KEY;
+  for (const name of PLATFORM_CREDENTIAL_ENV) delete env[name];
+  return env;
+}
+
+/**
+ * The model credential Hands sandboxes get, `ANTHROPIC_API_KEY` /
+ * `OPENAI_API_KEY` (applyModelKeyEnv), for the application's start command.
  *
  * In SaFE mode that key is the session owner's SaFE platform key. Code in the
  * sandbox can use it to call the SaFE API as the session owner, exactly as it can
  * in a Hands sandbox. The run's AppRunner scrubs it from forwarded output and it
- * is never stored in `claw_app_runs`.
- *
- * Only those two variables carry it: `SAFE_API_KEY` is not set (and one a spec
- * supplies is dropped), and no gateway URL is injected (the SaFE path leaves URLs
- * to the image / the manifest's env, so a manifest can point its agent elsewhere;
- * see ensureHands).
+ * is never stored in `claw_app_runs`. It travels in the execute request's env,
+ * never in the workload (see appSandboxEnv) or the logged command.
  */
-export function appSandboxEnv(run: Pick<AppSandboxRun, "runId" | "sandboxSpec" | "platformKey">): Record<string, string> {
-  const env: Record<string, string> = { ...withoutSessionEnv(run.sandboxSpec.env), [APP_RUN_ID_ENV]: run.runId };
-  delete env.SAFE_API_KEY;
-  applyModelKeyEnv(env, run.platformKey);
+export function appModelKeyEnv(platformKey: string | undefined): Record<string, string> {
+  const env: Record<string, string> = {};
+  applyModelKeyEnv(env, platformKey);
   return env;
 }
 

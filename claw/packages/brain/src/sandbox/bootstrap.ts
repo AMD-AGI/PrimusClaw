@@ -385,22 +385,52 @@ export const HANDS_LOG_PATH = `${HANDS_STATE_DIR}/hands.log`;
 export const HANDS_ENV_FILE = "/tmp/.hands-env";
 
 /**
+ * Where bootstrap keeps a private copy of the per-request environment for a
+ * later in-place restart of Hands.
+ *
+ * Hands reads HANDS_ENV_FILE once and unlinks it, and the environment no longer
+ * travels in the pod spec either (sandbox/workload-env.ts keeps credentials out
+ * of the SaFE workload, where every caller allowed to GET the workload could
+ * read them). A Hands restarted in place (sandbox/hands-restart.ts) therefore
+ * has nowhere else to get it from. The copy sits in the state directory, which
+ * launchCmd keeps at 0700 and which no isolated child can read, and it dies with
+ * the pod. The Hands token is never part of it: that travels in the execute
+ * request's env on every start (see handsStartExecEnv).
+ */
+export const HANDS_RESTART_ENV_FILE = `${HANDS_STATE_DIR}/restart-env`;
+
+/**
+ * Names that never go into the env file or its restart copy.
+ *
+ * Hands reads its token from the launch environment and refuses to take it
+ * from the file (hands/src/runtime/env-file.ts), so writing it to disk would
+ * only leave a credential lying in /tmp for nothing.
+ */
+const ENV_FILE_EXCLUDED = new Set(["AUTH_CLAW_TOKEN", "AUTH_INTERNAL_TOKEN"]);
+
+/** The env-file payload: the composed environment minus what Hands never reads from it. */
+export function envFilePayload(env: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (!ENV_FILE_EXCLUDED.has(k)) out[k] = v;
+  }
+  return out;
+}
+
+/**
  * Deliver the per-request environment to the sandbox as a file.
  *
- * Until now it travelled only in the pod spec, which is fine as long as every
- * pod is created for the request it serves -- and is exactly what a warm pool
- * breaks. A pooled pod is created before anyone knows whose request it will
- * take, so the environment carrying `user_env`, `session_env`, the system env
- * and the LLM keys is decided too late to be part of it, and a pod's
- * environment cannot be changed once it is running. That is the whole reason
- * `AGENT_SANDBOX_WARM_POOL_SIZE` has been pinned to 0: enabling it would have
- * produced sandboxes that look healthy and are missing the user's credentials.
+ * This is the only route the environment's credentials take into a SaFE
+ * sandbox. They used to travel in the pod spec as well, which put every
+ * user's model key, Hands token and stored variables in the SaFE workload's
+ * `env`, readable by anyone allowed to GET that workload. The workload now
+ * carries only names that are not credentials (sandbox/workload-env.ts), and
+ * Hands applies this file to its own process at startup, so every shell it
+ * spawns inherits the full environment as before.
  *
- * Bootstrap already reaches into the sandbox to start Hands, and that happens
- * after the request is known, so the environment can go the same way. Hands
- * reads the file at startup, applies it to its own process, and removes it;
- * every shell it spawns inherits the result, which is where these values were
- * always headed.
+ * It is also what a warm pool needs: a pooled pod is created before anyone
+ * knows whose request it will take, and a running pod's environment cannot be
+ * changed. Bootstrap happens after the request is known.
  *
  * JSON, base64-encoded for transport: values contain newlines, quotes and
  * shell metacharacters, and a `KEY=VALUE` file sourced by the shell does not
@@ -411,13 +441,41 @@ export const HANDS_ENV_FILE = "/tmp/.hands-env";
  * base64 is an encoding, not a mask -- the user's keys would be one decode away
  * in the control-plane log. `printf` is a shell builtin, so the value is not an
  * argv of any process either.
+ *
+ * A private copy is kept at `restartCopy` for an in-place restart (see
+ * HANDS_RESTART_ENV_FILE). `restartCopy` is a parameter so a test can keep the
+ * copy out of the host's /tmp; production callers pass none.
  */
-export function writeEnvFileCmd(env: Record<string, string>): { cmd: string; env: Record<string, string> } {
-  const payload = Buffer.from(JSON.stringify(env), "utf8").toString("base64");
+export function writeEnvFileCmd(
+  env: Record<string, string>,
+  restartCopy: string = HANDS_RESTART_ENV_FILE,
+): { cmd: string; env: Record<string, string> } {
+  const payload = Buffer.from(JSON.stringify(envFilePayload(env)), "utf8").toString("base64");
+  const copyDir = dirOf(restartCopy);
   return {
-    cmd: `printf '%s' "\$${HANDS_ENV_PAYLOAD_ENV}" | (umask 077 && base64 -d > ${HANDS_ENV_FILE}) && chmod 600 ${HANDS_ENV_FILE}`,
+    cmd: `printf '%s' "\$${HANDS_ENV_PAYLOAD_ENV}" | (umask 077 && base64 -d > ${HANDS_ENV_FILE}) && chmod 600 ${HANDS_ENV_FILE}`
+      + ` && mkdir -p ${copyDir} && chmod 700 ${copyDir}`
+      + ` && (umask 077 && cp ${HANDS_ENV_FILE} ${restartCopy}) && chmod 600 ${restartCopy}`,
     env: { [HANDS_ENV_PAYLOAD_ENV]: payload },
   };
+}
+
+/**
+ * Shell snippet, prefixed onto a source when Hands is restarted without a
+ * freshly composed environment: put the private copy back where Hands reads
+ * it.
+ *
+ * A sandbox bootstrapped before the copy existed has none; it still carries
+ * its environment in the pod spec, so an empty object is written instead,
+ * which Hands consumes like any other file and which keeps the source's
+ * consumed-file guard meaningful.
+ */
+export function restoreEnvFileCmd(restartCopy: string = HANDS_RESTART_ENV_FILE): string {
+  return `if [ -f ${restartCopy} ]; then `
+    + `(umask 077 && cp ${restartCopy} ${HANDS_ENV_FILE}) && chmod 600 ${HANDS_ENV_FILE} `
+    + `|| { echo "cannot restore the sandbox environment from ${restartCopy}" >&2; exit 1; }; `
+    + `else (umask 077 && printf '{}' > ${HANDS_ENV_FILE}) `
+    + `|| { echo "cannot write ${HANDS_ENV_FILE}" >&2; exit 1; }; fi; `;
 }
 
 /** The execute-request env for a source's start command: the token, by value. */
@@ -431,9 +489,10 @@ export async function bootstrapHandsInSandbox(
   mcpPort: string,
   handsToken: string,
   /**
-   * The composed sandbox environment. Omitted by callers that have already
-   * placed it in the pod spec and have no warm pool to worry about; passing it
-   * is harmless in that case, since the values agree.
+   * The composed sandbox environment. Omitted only by an in-place restart
+   * (sandbox/hands-restart.ts), which has no request to compose it from: the
+   * private copy the first bootstrap kept is put back instead (see
+   * restoreEnvFileCmd).
    */
   env?: Record<string, string>,
 ): Promise<void> {
@@ -450,9 +509,14 @@ export async function bootstrapHandsInSandbox(
   }
 
   const envToPlace = env && Object.keys(env).length ? env : undefined;
-  const envFile = envToPlace ? HANDS_ENV_FILE : undefined;
+  // Always handed over: with no environment from the caller this is a restart,
+  // and the environment comes from the copy the first bootstrap kept, because
+  // the credentials in it are no longer in the pod spec for Hands to inherit.
+  const envFile = HANDS_ENV_FILE;
   const baseEnv = handsBaseEnv(sessionId, mcpPort, envFile);
-  const sources = handsBinarySources(baseEnv, envFile);
+  const restore = envToPlace ? "" : restoreEnvFileCmd();
+  const sources = handsBinarySources(baseEnv, envFile)
+    .map((s) => (restore ? { ...s, cmd: restore + s.cmd } : s));
   const startEnv = handsStartExecEnv(handsToken);
   const failures: string[] = [];
 

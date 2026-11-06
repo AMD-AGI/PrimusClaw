@@ -499,6 +499,10 @@ test("E1 the environment is exactly what env_map says, with the platform's names
     APP_KEY_MEASUREMENT: KEY_M,
     CLAW_SESSION_ID: "sess-1",
     NODE_NAME: "node-7",
+    // The model credential, with the start command rather than in the workload
+    // (app-sandbox.ts appSandboxEnv); platform-owned, so last.
+    ANTHROPIC_API_KEY: PLATFORM_KEY,
+    OPENAI_API_KEY: PLATFORM_KEY,
   });
 });
 

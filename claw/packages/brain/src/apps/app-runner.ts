@@ -48,6 +48,7 @@ import type {
 } from "../sandbox/provider.js";
 import { provisionTerminalOf } from "../sandbox/errors.js";
 import type { AppSandbox, AppSandboxEnsureOptions, AppSandboxRun } from "./app-sandbox.js";
+import { appModelKeyEnv } from "./app-sandbox.js";
 import {
   AppRunWriteRefused,
   type AppLastExit, type AppRunPatch, type AppRunRecord, type AppRunState, type AppRunStore,
@@ -803,8 +804,12 @@ export class AppRunner {
   private async startApplication(inst: SandboxInstance, stateDir: string, env: Record<string, string>): Promise<void> {
     // The lookups above can outlast the signal; a runner told to let go starts nothing.
     this.assertActive();
+    // The model credential rides with the start command, not in the workload
+    // (see appSandboxEnv). Platform-owned, so laid last: a manifest cannot
+    // replace it.
     const r = await this.deps.sandbox.exec(
-      inst, startCommand(this.rec.manifest, stateDir, this.tag()), EXEC_TIMEOUT, { env },
+      inst, startCommand(this.rec.manifest, stateDir, this.tag()), EXEC_TIMEOUT,
+      { env: { ...env, ...appModelKeyEnv(this.platformKey) } },
     );
     if (r.exitCode !== 0) throw new Error(`start command failed (exit ${r.exitCode}): ${clip(this.scrubbed(r.stderr))}`);
   }
