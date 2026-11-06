@@ -166,8 +166,8 @@ test("no layer can put a key back: the spec's env and the request's env have the
     assert.deepEqual([env.ANTHROPIC_API_KEY, env.OPENAI_API_KEY], ["planted-in-session", "planted-in-session"]);
   }
   for (const env of handsEnvOnly(ordinary)) assert.deepEqual([env.SPEC_KEPT, env.USER_KEPT, env.SESSION_KEPT], ["1", "1", "1"], "control: every layer reaches it");
-  assert.deepEqual(Object.keys(ordinary.created.env).sort(), WORKLOAD_ONLY,
-    "no layer reaches the workload: any of them can hold a credential under any name");
+  assert.deepEqual(Object.keys(ordinary.created.env).sort(), [...WORKLOAD_ONLY, "SPEC_KEPT"].sort(),
+    "of the layers only the spec's plain settings are baked into the workload; no key, none of the owner's or the request's variables");
   const marked = await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true });
   for (const env of everyEnv(marked)) {
     for (const name of KEY_NAMES) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);

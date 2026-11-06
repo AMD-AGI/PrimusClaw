@@ -39,7 +39,7 @@ import { ACTIVE_PHASES, TERMINAL_PHASES } from "../sandbox/workload-wait.js";
 import { pollWorkloadUntilRunning, SHUTDOWN_BUFFER_SECONDS } from "../sandbox/safe-workload-provider.js";
 import type { SandboxInstance } from "../sandbox/provider.js";
 import { applyModelKeyEnv } from "../sandbox/params.js";
-import { PLATFORM_CREDENTIAL_ENV } from "../sandbox/workload-env.js";
+import { PLATFORM_CREDENTIAL_ENV, workloadSpecEnv } from "../sandbox/workload-env.js";
 import { SandboxProvisionTerminalError, provisionTerminalOf } from "../sandbox/errors.js";
 
 const logger = pino({ name: "app-sandbox" });
@@ -184,18 +184,20 @@ function appSpecEnv(spec: Pick<SandboxSpecCreate, "env"> | null | undefined): Re
 }
 
 /**
- * The env the sandbox is created with: the run's identity, which is how a run
- * finds its sandbox again (SaFE's list endpoint filters on `envKey`), and
- * nothing else.
+ * The env the sandbox is created with: the spec's boot-time settings and the
+ * run's identity, which is how a run finds its sandbox again (SaFE's list
+ * endpoint filters on `envKey`).
  *
  * Everything here is stored by SaFE in the workload and returned to every
- * caller allowed to read it, and the spec's env can hold a credential under any
- * name. So the spec's env and the model credential travel with the
- * application's start command instead (appStartEnv); a platform credential a
- * spec supplies (`SAFE_API_KEY`, ...) is dropped there too.
+ * caller allowed to read it. So the model credential is not set here, a
+ * platform credential a spec supplies (`SAFE_API_KEY`, ...) is dropped, and a
+ * spec variable that looks like a credential is left out (workloadSpecEnv);
+ * the spec's whole env, and the model credential, travel with the
+ * application's start command (appStartEnv).
  */
-export function appSandboxEnv(run: Pick<AppSandboxRun, "runId">): Record<string, string> {
-  return { [APP_RUN_ID_ENV]: run.runId };
+export function appSandboxEnv(run: Pick<AppSandboxRun, "runId" | "sandboxSpec">): Record<string, string> {
+  const spec = appSpecEnv(run.sandboxSpec);
+  return { ...workloadSpecEnv(spec, spec, new Set()), [APP_RUN_ID_ENV]: run.runId };
 }
 
 /**

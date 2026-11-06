@@ -54,3 +54,9 @@ test("a credential-looking name is not kept on the strength of a Hands prefix", 
   const env = { ...PLUMBING, ENVD_ACCESS_KEY: "planted", HANDS_API_TOKEN: "planted", CLAW_SECRET: "planted" };
   assert.deepEqual(workloadSpecEnv(env), PLUMBING);
 });
+
+test("the spec's own plain settings are baked into the workload; its credential-looking ones and a value another layer replaced are not", () => {
+  const spec = { BOOT_MODE: "fast", API_TOKEN: "planted", CACHE_URL: "redis://u:planted@c:6379", OVERRIDDEN: "spec" };
+  const env = { ...PLUMBING, ...spec, OVERRIDDEN: "planted-by-user", SYSTEM_SETTING: "planted-system" };
+  assert.deepEqual(workloadSpecEnv(env, spec), { ...PLUMBING, BOOT_MODE: "fast" });
+});

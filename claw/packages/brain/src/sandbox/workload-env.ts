@@ -72,23 +72,43 @@ export function isHandsRuntimeSetting(name: string): boolean {
 /** A name that says it holds a credential; never kept on the strength of a prefix alone. */
 const CREDENTIAL_NAME = /TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|PRIVATE|COOKIE|APIKEY|API_KEY|ACCESS_KEY|(^|_)(KEY|KEYS|PAT|DSN|AUTH)(_|$)/;
 
+/** A URL carrying a password in its userinfo (`scheme://user:pass@host`). */
+const URL_WITH_PASSWORD = /[a-z][a-z0-9+.-]*:\/\/[^/\s:@]*:[^/\s@]+@/i;
+
+/** Whether a name, or its value, says the variable holds a credential. */
+export function looksLikeCredential(name: string, value: string): boolean {
+  return CREDENTIAL_NAME.test(name.toUpperCase()) || URL_WITH_PASSWORD.test(value);
+}
+
 /**
- * The environment to write into the SaFE workload: the allowed names of `env`
- * and Hands' own runtime settings, and never a platform credential.
+ * The environment to write into the SaFE workload: the allowed names of `env`,
+ * Hands' own runtime settings, and the sandbox spec's own boot-time settings;
+ * never a platform credential and never anything that looks like one.
+ *
+ * The spec's env is kept because its contract is "baked into the sandbox at
+ * create time" (protocol SandboxSpecCreate.env): an image entrypoint may need
+ * it before bootstrap runs. It is the spec author's own configuration, and its
+ * documentation says it is stored in the workload. A value a later layer (the
+ * owner's variables, the request's env) replaced is not the spec's and is left
+ * out; so is every other layer -- the deployment's system env and the owner's
+ * stored variables -- whatever it is called.
  *
  * @param env The composed sandbox environment; not modified.
- * @param allowed The names the workload may carry besides Hands' settings.
+ * @param specEnv The sandbox spec's own env, the only layer kept by name.
+ * @param allowed The names the workload may carry besides those.
  */
 export function workloadSpecEnv(
   env: Record<string, string>,
+  specEnv: Record<string, string> = {},
   allowed: ReadonlySet<string> = HANDS_WORKLOAD_ENV_NAMES,
 ): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [name, value] of Object.entries(env)) {
     if (PLATFORM_CREDENTIAL_ENV.has(name)) continue;
-    const kept = allowed.has(name)
-      || (isHandsRuntimeSetting(name) && !CREDENTIAL_NAME.test(name.toUpperCase()));
-    if (kept) out[name] = value;
+    if (allowed.has(name)) { out[name] = value; continue; }
+    if (looksLikeCredential(name, value)) continue;
+    const fromSpec = Object.prototype.hasOwnProperty.call(specEnv, name) && specEnv[name] === value;
+    if (fromSpec || isHandsRuntimeSetting(name)) out[name] = value;
   }
   return out;
 }
