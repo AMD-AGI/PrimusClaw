@@ -686,11 +686,14 @@ export const capRefusedSays = (events: readonly LiveEvent[], since: number, earl
 
 /**
  * Why a run must not start on the identity's assistant session: someone is using it now (a turn is running, or something
- * happened in it less than `quietMs` ago). Two runs on one assistant see each other's messages and items, and a run that
+ * happened in it, its making included, less than `quietMs` ago). Two runs on one assistant see each other's messages and items, and a run that
  * cleans up after another one deletes what that one is using; each parallel run needs an identity of its own. Null: free.
  */
-export function assistantInUse(session: { agent_status?: unknown } | null, lastEventAt: number | null, now: number, quietMs: number): string | null {
+export function assistantInUse(session: { agent_status?: unknown; created_at?: unknown } | null, lastEventAt: number | null, now: number, quietMs: number): string | null {
   if (session?.agent_status === "running") return "a turn is running in the identity's assistant session";
+  // A session made a moment ago is in use too: another run made it, and has not sent anything yet.
+  const made = typeof session?.created_at === "string" ? Date.parse(session.created_at) : NaN;
+  if (Number.isFinite(made) && (lastEventAt === null || made > lastEventAt)) lastEventAt = made;
   if (quietMs > 0 && lastEventAt !== null && now - lastEventAt < quietMs) {
     return `the identity's assistant session was active ${Math.round((now - lastEventAt) / 1000)}s ago (EVAL_QUIET_S=${Math.round(quietMs / 1000)})`;
   }

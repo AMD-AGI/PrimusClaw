@@ -9,7 +9,8 @@
  *      its executionStats comes before the workspace sync); the item it started is closed and its worker's session deleted; each deletion counts only once a GET
  *      answers 404 (a DELETE that answered 200 and left the session is asked again); another session of the identity is
  *      never touched
- *   R2 an assistant session that is running, or was active a moment ago, refuses the run before anything is sent
+ *   R2 an assistant session that is running, was active a moment ago, or was made a moment ago (by another run that has not
+ *      sent anything yet), refuses the run before anything is sent
  *   R3 SIGINT stops the run: nothing more is sent, the item the interrupted turn started is closed and its worker's session
  *      deleted, the session the run made is deleted, and the run exits 1 saying it was stopped; in baseline mode, a stop
  *      during a case's oracle reads sends nothing, and one during a turn lets the turn end before its session is deleted and
@@ -25,6 +26,8 @@
  *   R7 a stream that missed a stored event of the case (a leak in a say it never delivered): an error, not a grade; an item whose
  *      work_create answer the stream missed is still closed with its worker's session; an assistant session still running
  *      before a case: nothing is sent, an error
+ *   R9 a judge that gives no verdict (an error status, no PASS or FAIL) makes the attempt an error of the run, not a FAIL; its
+ *      FAIL fails, its PASS passes. R3e a stop while the stream holds its history back ends the wait at once
  *   R8 a work_create that found someone else's open item with the same title (`deduplicated`): that item is not the run's, and
  *      is neither closed nor stripped of its worker's session
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
@@ -55,7 +58,11 @@ class FakeClaw {
   /** When each turn's exec_complete was stored, by message id. */
   readonly settledAt = new Map<string, number>();
   readonly sent: Array<{ at: number; content: string }> = [];
-  readonly sessions = new Map<string, { status: string; stale: number }>();
+  readonly sessions = new Map<string, { status: string; stale: number; createdAt?: number }>();
+  /** The judge's answers, in order (an HTTP status, or the text of a 200). */
+  judgeAnswers: Array<number | string> = [];
+  /** How long a stream holds back the end of its history. */
+  historyDelayMs = 0;
   readonly items: Item[] = [];
   readonly rows = new Map<string, Row[]>();
   assistant = "asst-1";
@@ -100,6 +107,10 @@ class FakeClaw {
     const send = (status: number, json: unknown): void => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(json)); };
     let m: RegExpExecArray | null;
     if (method === "GET" && path === "/v1/me") return send(200, { name: "sa-eval-bot", email: EMAIL });
+    if (method === "POST" && path === "/judge/v1/messages") {
+      const a = this.judgeAnswers.shift() ?? "PASS: ok";
+      return typeof a === "number" ? send(a, { error: "down" }) : send(200, { content: [{ type: "text", text: a }] });
+    }
     // An oracle read that takes a while (a fact's `/v1/...#pick`).
     if (method === "GET" && path === "/v1/slow-oracle") { setTimeout(() => send(200, { data: { n: 3 } }), 2_000); return; }
     if (method === "GET" && path === "/v1/notification-subscriptions") return send(200, { ok: true, data: [] });
@@ -125,7 +136,10 @@ class FakeClaw {
     }
     if ((m = /^\/v1\/sessions\/([^/]+)$/.exec(path))) {
       const s = this.sessions.get(m[1]!);
-      if (method === "GET") return s ? send(200, { ok: true, data: { session_id: m[1], agent_status: s.status } }) : send(404, { ok: false });
+      if (method === "GET") {
+        return s ? send(200, { ok: true, data: { session_id: m[1], agent_status: s.status, created_at: new Date(s.createdAt ?? Date.now() - 7_200_000).toISOString() } })
+          : send(404, { ok: false });
+      }
       if (method === "DELETE") {
         if (!s) return send(404, { ok: false });
         // A DELETE that answered 200 while the session stayed (the case a GET after it is there to catch).
@@ -159,6 +173,7 @@ class FakeClaw {
       if (url.searchParams.get("mode") === "replay") return send(200, { ok: true, data: this.rows.get(sessionId) ?? [] });
       res.writeHead(200, { "content-type": "text/event-stream" });
       for (const row of this.rows.get(sessionId) ?? []) if (row.event_type !== "exec_complete") res.write(frame(row));
+      if (this.historyDelayMs) await new Promise((r) => setTimeout(r, this.historyDelayMs));
       res.write("event: historyComplete\ndata: {}\n\n");
       const open = this.streams.get(sessionId) ?? new Set<ServerResponse>();
       this.streams.set(sessionId, open.add(res));
@@ -270,6 +285,8 @@ test("R2 an assistant session in use refuses the run before anything is sent", {
   for (const [why, setup, env] of [
     ["running", (c: FakeClaw) => c.sessions.set(c.assistant, { status: "running", stale: 0 }), {}],
     ["active a moment ago", (c: FakeClaw) => { c.sessions.set(c.assistant, { status: "idle", stale: 0 }); c.emit({ type: "AssistantSay", say_id: "x", text: "hi" }); }, {}],
+    // Another run made it a moment ago and has not sent anything yet.
+    ["made a moment ago", (c: FakeClaw) => c.sessions.set(c.assistant, { status: "idle", stale: 0, createdAt: Date.now() - 5_000 }), {}],
   ] as const) {
     const claw = new FakeClaw();
     claw.created = false;
@@ -577,5 +594,48 @@ test("R8 an item work_create only found again is not the run's", { timeout: 120_
     assert.deepEqual(claw.calls.filter((c) => c.includes("/stop") || c.includes("/accept")), [], "not closed");
     assert.ok(!claw.calls.includes("DELETE /v1/sessions/worker-5") && claw.sessions.has("worker-5"), "its worker's session kept");
     assert.match(run.out, /cleanup: open items not tied to the run's calls, left alone: 5/, "said, for a person to look at");
+  } finally { rmSync(r.dir, { recursive: true, force: true }); }
+});
+
+test("R9 a judge that gives no verdict is the run's error, not the assistant's FAIL", { timeout: 120_000 }, async () => {
+  const claw = new FakeClaw();
+  const base = await claw.start();
+  claw.judgeAnswers = [503, "Hmm, hard to say.", "FAIL: wrong count", "PASS: names the count"];
+  claw.router = (_content, id) => claw.turn(id, { say: "There are 3 nodes." });
+  const answer = (id: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: id }] });
+  const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+  writeFileSync(join(dir, "judge-key"), "judge-key-not-a-secret\n");
+  const r = runner(base, ["t-j-001", "t-j-002", "t-j-003", "t-j-004"].map(answer),
+    { EVAL_JUDGE_URL: `${base}/judge`, EVAL_JUDGE_MODEL: "m", EVAL_JUDGE_KEY_FILE: join(dir, "judge-key") }, dir);
+  const run = await r.done;
+  await claw.stop();
+  try {
+    assert.match(run.out, /ERROR t-j-001#1 .*infra: judge answered 503/, run.out);
+    assert.match(run.out, /ERROR t-j-002#1 .*infra: judge gave no PASS or FAIL/);
+    assert.match(run.out, /FAIL t-j-003#1/);
+    assert.match(run.out, /pass t-j-004#1/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("R3e a stop while the stream holds its history back", { timeout: 120_000 }, async () => {
+  const claw = new FakeClaw();
+  const base = await claw.start();
+  claw.historyDelayMs = 20_000;
+  claw.router = (_content, id, sessionId) => {
+    claw.emit({ type: "AssistantMessage", message_id: id, data: { content: [{ type: "text", text: "3 nodes." }] } }, Date.now(), sessionId);
+    claw.emit({ type: "executionStats", message_id: id }, Date.now(), sessionId);
+    claw.emit({ type: "exec_complete", message_id: id, final_text: "3 nodes." }, Date.now(), sessionId);
+  };
+  const r = runner(base, [{ id: "t-base-005", pipeline: "catalog", area: "general", lang: "en", route: "answer", turns: [{ user: "how many?" }] }],
+    { EVAL_MODE: "baseline", EVAL_PLUGIN_ID: "9" });
+  await until(() => claw.calls.includes("GET /v1/chat/sessions/plain-1/messages"), 30_000);
+  const stoppedAt = Date.now();
+  r.child.kill("SIGINT");
+  const run = await r.done;
+  await claw.stop();
+  try {
+    assert.match(run.out, /stopped by SIGINT/, run.out);
+    assert.ok(Date.now() - stoppedAt < 10_000, `the run ended ${Date.now() - stoppedAt} ms after the stop: the stream's wait was cut short`);
+    assert.ok(!claw.sessions.has("plain-1"), "and its session was deleted");
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });

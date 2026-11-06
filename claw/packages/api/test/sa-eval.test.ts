@@ -616,6 +616,9 @@ test("S20 sharing an identity", async () => {
   assert.equal(assistantInUse({ agent_status: "idle" }, 1e9 - 301_000, 1e9, 300_000), null);
   assert.equal(assistantInUse({ agent_status: "idle" }, 1e9 - 1000, 1e9, 0), null, "EVAL_QUIET_S=0 looks only at a running turn");
   assert.equal(assistantInUse({ agent_status: "idle" }, null, 1e9, 300_000), null, "a session with no events is free");
+  assert.match(assistantInUse({ agent_status: "idle", created_at: new Date(1e9 - 10_000).toISOString() }, null, 1e9, 300_000) ?? "", /active 10s ago/,
+    "one made a moment ago is another run's, which has not sent anything yet");
+  assert.equal(assistantInUse({ agent_status: "idle", created_at: new Date(1e9 - 3_600_000).toISOString() }, null, 1e9, 300_000), null);
 
   const fake = (answers: Record<string, number[]>) => {
     const calls: string[] = [];

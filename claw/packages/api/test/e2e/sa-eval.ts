@@ -253,7 +253,8 @@ class LiveStream {
         if (!this.closed) await sleep(2_000);
       }
     })();
-    await Promise.race([historyDone, sleep(60_000)]);
+    // A stop ends the wait as well: the cleanup's own wait follows.
+    await Promise.race([historyDone, sleep(60_000), new Promise<void>((r) => { if (stopSignal) r(); else wakers.add(r); })]);
   }
 
   private async read(ready: () => void): Promise<void> {
@@ -386,7 +387,8 @@ function mcpClient(server: string): Promise<Client> {
 
 // --- The optional judge ---------------------------------------------------------------------------------------------
 
-async function judge(c: EvalCase, turns: Turn[], final: string, calls: readonly ToolCall[]): Promise<{ pass: boolean; why: string } | null> {
+/** The judge's verdict; `failed` when it gave none (unreachable, an error status, no PASS or FAIL): the run's, not the assistant's. */
+async function judge(c: EvalCase, turns: Turn[], final: string, calls: readonly ToolCall[]): Promise<{ pass: boolean; why: string; failed?: true } | null> {
   const url = process.env.EVAL_JUDGE_URL, model = process.env.EVAL_JUDGE_MODEL, keyFile = process.env.EVAL_JUDGE_KEY_FILE;
   // Every case, not only those with content only a judge can grade: the no-false-denial rule is in every prompt.
   if (!url || !model || !keyFile) return null;
@@ -398,10 +400,13 @@ async function judge(c: EvalCase, turns: Turn[], final: string, calls: readonly 
       headers: { "content-type": "application/json", "x-api-key": key, authorization: `Bearer ${key}`, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({ model, max_tokens: 200, messages: [{ role: "user", content: prompt }] }),
     });
-    const text = ((await res.json()) as any)?.content?.find((b: any) => b.type === "text")?.text ?? "";
-    return { pass: /^\s*PASS/i.test(text), why: scrubWith(String(text).trim().slice(0, 300), [KEY, key]) };
+    if (!res.ok) return { pass: false, why: `judge answered ${res.status}`, failed: true };
+    const text = String(((await res.json()) as any)?.content?.find((b: any) => b.type === "text")?.text ?? "");
+    const word = /^\s*(PASS|FAIL)\b/i.exec(text)?.[1]?.toUpperCase();
+    if (!word) return { pass: false, why: "judge gave no PASS or FAIL", failed: true };
+    return { pass: word === "PASS", why: scrubWith(text.trim().slice(0, 300), [KEY, key]) };
   } catch (err) {
-    return { pass: false, why: `judge failed: ${err instanceof Error ? err.message : String(err)}` };
+    return { pass: false, why: `judge failed: ${err instanceof Error ? err.message : String(err)}`, failed: true };
   }
 }
 
@@ -411,7 +416,8 @@ const attemptOf = async (c: EvalCase, turns: Turn[], o: Observed, tools: string[
   const verdict = await judge(c, turns, o.final, o.calls);
   const kept = KEEP_TEXT ? checks : checks.map((x) => (TEXT_DETAIL.test(x.name) && x.detail ? { ...x, detail: "<hidden: EVAL_KEEP_TEXT>" } : x));
   return {
-    ...verdictOf(c, checks, verdict), checks: kept, route: o.route, cards: o.cards, tools, final: KEEP_TEXT ? scrub(o.final) : null, finalChars: o.final.length,
+    // A judge that gave no verdict makes the attempt an error of the run, never a FAIL of the assistant.
+    ...(verdict?.failed ? { pass: false, error: scrub(`infra: ${verdict.why}`) } : verdictOf(c, checks, verdict)), checks: kept, route: o.route, cards: o.cards, tools, final: KEEP_TEXT ? scrub(o.final) : null, finalChars: o.final.length,
     // The judge's reason can quote the answer: kept only with the text.
     firstReplyMs: o.firstReplyMs, finalMs: o.finalMs, items, judge: verdict && (KEEP_TEXT ? verdict : { pass: verdict.pass, why: "" }),
   };
@@ -562,17 +568,17 @@ async function answerHold(spec: HoldSpec, items: readonly ItemSeen[], deadline: 
  * Whether turns of a session are over by `deadlineAt`, as `over` judges the message ids of their stored exec_complete
  * (`storedTurnEnds`). Brain sends exec_complete last, after the workspace sync and the transcript, and a stream never carries
  * it; the stream's end of a turn (`streamed`: its executionStats) only says it is finishing. So the stored events are read
- * once the stream says so, every 10 s whatever it says (a turn whose delivery Brain gave up on has exec_complete alone), and
- * in the last 2 s before the deadline; never after it, so a turn that ends late is late, by this runner's clock.
- * `wait` is the `until` the caller's waits use (one a stop ends, or not).
+ * once the stream says so, every `readEveryMs` whatever it says (10 s in an attempt; a turn whose delivery Brain gave up on
+ * has exec_complete alone), and in the last 2 s before the deadline; never after it, so a turn that ends late is late, by this
+ * runner's clock. `wait` is the `until` the caller's waits use (one a stop ends, or not).
  */
 async function turnsOver(
   sessionId: string, over: (stored: readonly string[]) => boolean, streamed: () => boolean, deadlineAt: number,
-  wait: <T>(probe: () => Promise<T | undefined>, deadlineAt: number, everyMs: number) => Promise<T | null>,
+  wait: <T>(probe: () => Promise<T | undefined>, deadlineAt: number, everyMs: number) => Promise<T | null>, readEveryMs = 10_000,
 ): Promise<boolean> {
   let readAt = 0;
   const probe = async (): Promise<true | undefined> => {
-    if (!streamed() && Date.now() - readAt < 10_000 && deadlineAt - Date.now() > 2_000) return undefined;
+    if (!streamed() && Date.now() - readAt < readEveryMs && deadlineAt - Date.now() > 2_000) return undefined;
     readAt = Date.now();
     return over(storedTurnEnds(await replay(sessionId).catch(() => []))) ? true : undefined;
   };
@@ -704,7 +710,7 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
     // off when the session is deleted, and the call it waits for never runs.
     if (stopSignal) {
       const over = await turnsOver(sessionId, (stored) => mids.every((_, k) => overBy(k)(stored)), () => mids.every((_, k) => streamedBy(k)()),
-        Date.now() + Math.min(60_000, turnWaitMs(false)), until);
+        Date.now() + Math.min(60_000, turnWaitMs(false)), until, 2_000);
       if (!over) log(`a turn of ${c.id} was still running when its session was deleted`);
     }
     stream.close();
@@ -850,7 +856,7 @@ async function main(): Promise<void> {
           // A turn already asked for may still start an item: let the run's turns end (a minute at most) and take every item
           // their calls answered for as the run's, whatever stopped the run.
           const over = await turnsOver(sessionId, (stored) => RUN_MESSAGES.every((id) => stored.includes(id)),
-            () => RUN_MESSAGES.every((id) => turnEnded(stream!.events, id)), Date.now() + Math.min(60_000, turnWaitMs(true)), until);
+            () => RUN_MESSAGES.every((id) => turnEnded(stream!.events, id)), Date.now() + Math.min(60_000, turnWaitMs(true)), until, 2_000);
           // What a turn still running starts later is not seen, and not closed: a person must look. Named by the stored events,
           // which are what says a turn is over.
           if (!over) {
