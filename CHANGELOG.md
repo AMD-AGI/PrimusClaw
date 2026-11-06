@@ -738,6 +738,17 @@ record it.
   like the platform defaults instead of being inlined.
 
 ### Security
+- What the API stores of a conversation now has credentials masked before it is written: session events (`claw_session_events`,
+  as the event consumer, the message route and the A2A route write them), conversation turns (`claw_conversation_turns`) and the
+  words an assistant's router turn answers (`claw_assistant_messages`). The new `redactStoredText` / `redactStoredValue`
+  (`@claw/utils`) add to `redactSecrets` a SaFE API key (`ak-...`), a short `Bearer` token with a digit in it, an armored private
+  key, and a value written after a credential's name (`password=`, `"api_key": "..."`, `token: ...`), leaving code, placeholders and
+  sentences alone (`password = getPassword()`, `password: string`, `${DB_PASSWORD}`, `"Enter your password"`). Identifier fields
+  (`id`, `*_id`, `*Id`: `message_id`, `tool_use_id`, `actionId`, ...) holding one token are stored as they are, whatever their shape,
+  since readers match stored rows on them (a 64-hex A2A `messageId` is not a credential). Only the stored copy
+  is masked: the turn's prompt reaches Brain as written, and a router turn run again on the fallback model is given its prompt as the
+  model first was when that prompt is the stored message. Later turns read their history from the masked rows. Rows written before
+  this change are not rewritten.
 - Claw works with a sandbox Router that runs with `--enable-auth`. With `SANDBOX_ROUTER_AUTH_ENABLED` on, every Hands
   request that goes through the Router's port proxy (`SANDBOX_HANDS_VIA_ROUTER`) presents the sandbox owner's platform key
   in `Authorization`: Brain's MCP client, health checks, shell records and the sweeper, and the API's changes view and

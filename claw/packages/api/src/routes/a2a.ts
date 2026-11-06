@@ -27,6 +27,7 @@ import type { PoolClient } from "pg";
 import { ErrorCode, NatsError } from "nats";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
+import { redactStoredText } from "@claw/utils";
 import {
   type Task, type Message,
   type Part, type StreamResponse,
@@ -773,9 +774,10 @@ async function admitAndOpenA2AContextSend(
       `INSERT INTO claw_session_events (event_id, session_id, event, data)
        VALUES ($1, $2, 'UserMessage', $3::jsonb)
        ON CONFLICT (event_id, session_id) DO NOTHING`,
+      // Masked as stored (`redactStoredText`); the run is published with `text` as the caller sent it.
       [spec.messageId, target.taskId, JSON.stringify({
         type: "UserMessage", message_id: spec.messageId, role: "user",
-        data: { content: [{ type: "text", text }] },
+        data: { content: [{ type: "text", text: redactStoredText(text).text }] },
       })],
     );
     return { kind: "opened", target, taskId };

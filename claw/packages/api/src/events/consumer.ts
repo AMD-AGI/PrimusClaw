@@ -43,6 +43,7 @@ import {
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
 import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
+import { redactStoredValue } from "@claw/utils";
 import pino from "pino";
 import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
 import { metrics } from "../infra/metrics.js";
@@ -429,9 +430,11 @@ export async function consumeEventDelivery(msg: {
     const isAppEvent = event.type === "appEvent";
     const appEvent = appEventIdentity(event);
     try {
+      // The stored copy has credential-shaped content masked (`redactStoredValue`); `event` itself, which the completion below and
+      // every hook after it read, is not touched.
       const insertResult = await db.query(
         `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${isAppEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
-        [eventId, sessionId, (event.type as string) || "message", event],
+        [eventId, sessionId, (event.type as string) || "message", redactStoredValue(event)],
       );
       if (isAppEvent && !insertResult.rowCount) {
         logger.info({ sessionId, appTaskId: appEvent?.appTaskId, appEventId: appEvent?.eventId }, "event-consumer.app_event_duplicate_dropped");
@@ -1168,7 +1171,8 @@ async function handleComplete(
     if (skillsUsedPatched) {
       (event as any).skills_used = skillsUsed;
       if (eventRowId) {
-        await db.query(`UPDATE claw_session_events SET data = $1 WHERE id = $2`, [event, eventRowId]);
+        // The stored copy again, masked as the insert above masked it: `event` itself is the one the turn's handling reads.
+        await db.query(`UPDATE claw_session_events SET data = $1 WHERE id = $2`, [redactStoredValue(event), eventRowId]);
       }
     }
 

@@ -38,6 +38,7 @@ import { applyAppMcpToTask } from "./app-mcp.js";
 import { applySessionRoleToTask, skipsSkillSelection } from "../assistant/role-profile.js";
 import { applyTriggerToolsToTask } from "../triggers/mcp.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
+import { redactStoredValue } from "@claw/utils";
 import pino from "pino";
 
 const logger = pino({ name: "session-dispatch" });
@@ -253,10 +254,12 @@ export async function dispatchTaskToBrain(
     // includes it even if the consumer hasn't yet subscribed.
     // A sandbox-only run is not a conversation turn: nothing is added to the
     // transcript, and so nothing is handed to the model as history later.
+    // The stored copy is masked (`redactStoredValue`); this turn's prompt is
+    // `content`, which goes to Brain as the user wrote it.
     if (!sandboxOnly) {
       await db.query(
         "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id, session_id) DO NOTHING",
-        [messageId, sessionId, "UserMessage", userEvent],
+        [messageId, sessionId, "UserMessage", redactStoredValue(userEvent)],
       );
       sessionDispatchPorts.publishSse(sessionId, JSON.stringify(userEvent));
     }
