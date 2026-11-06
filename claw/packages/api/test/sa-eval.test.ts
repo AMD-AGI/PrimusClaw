@@ -30,6 +30,13 @@
  *       call, in a case that may refuse, or said of a system rather than of itself, it does not
  *   S17 the static check: a tools_must no tool of the arm matches is reported (the router without GitHub: "my open PRs"),
  *       unless blocked; an assistant-only case that runs in baseline; a description written as a value; the seed set is clean
+ *   S18 a turn ends on a stream with its main agent's executionStats or failed status (the stream never carries exec_complete),
+ *       in stored events with its exec_complete; what a plain session showed is its main agent's messages
+ *   S19 the say cap: the wait before a case keeps the hour's counted says and the reserve within the budget; fallbacks are not
+ *       counted; says from the stream, the stored events and an earlier run's log are counted once each; a say refused for the
+ *       cap is counted
+ *   S20 sharing an identity: a running or recently active assistant session refuses the run; a session is deleted only when a GET
+ *       then answers 404, a refusal ends the attempt
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -45,6 +52,7 @@ import {
   type Arms,
   apiQuery, caseSays, cardsOf, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
+  assistantInUse, capRefusedSays, countedSays, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, turnEnded,
 } from "./e2e/sa-eval-lib.js";
 
 const SEED_DIR = join(dirname(fileURLToPath(import.meta.url)), "e2e", "sa-eval-cases");
@@ -534,4 +542,94 @@ test("S17 the static check", () => {
     ...(Array.isArray(m.ROUTER_WEB_TOOLS) ? (m.ROUTER_WEB_TOOLS as string[]) : [])];
   const seedWorker = ["autopilot", "safe", "dispatron", "pulse", "agent-board", "github", "schedules"].map((s) => `mcp__${s}__*`).concat(BUILTIN_TOOLS);
   assert.deepEqual(staticFindings(cases, { router: ownRouter, worker: seedWorker, baseline: seedWorker }).problems, []);
+});
+
+const ev = (at: number, data: Record<string, unknown>, eventId = `e${at}`): LiveEvent => ({ at, eventId, data });
+
+test("S18 turn ends and what a plain session showed", () => {
+  const events = [
+    ev(1, { type: "toolUsed", message_id: "m1", status: "start", tool: "x", actionId: "a" }),
+    ev(2, { type: "executionStats", message_id: "m1", subagent_id: "sub-1" }),
+    ev(3, { type: "AssistantMessage", message_id: "m1", subagent_id: "sub-1", data: { content: [{ type: "text", text: "sub says" }] } }),
+    ev(4, { type: "AssistantMessage", message_id: "m1", data: { content: [{ type: "text", text: "answer one" }] } }),
+  ];
+  assert.ok(!turnEnded(events, "m1"), "a sub-agent's stats do not end the turn");
+  const done = [...events, ev(5, { type: "executionStats", message_id: "m1" })];
+  assert.ok(turnEnded(done, "m1"), "the main agent's executionStats ends it");
+  assert.ok(!turnEnded(done, "m2"));
+  assert.ok(turnEnded([ev(1, { type: "statusUpdate", agentStatus: "failed", message_id: "m2" })], "m2"), "a failed turn ended");
+  assert.ok(!turnEnded([ev(1, { type: "statusUpdate", agentStatus: "running", message_id: "m2" })], "m2"));
+  assert.ok(turnEnded([ev(1, { type: "exec_complete", message_id: "m3" })], "m3"), "a replay's exec_complete still ends one");
+  // One turn whose end arrives twice (stats, then a replayed exec_complete) is one ended turn.
+  const two = [...done, ev(6, { type: "exec_complete", message_id: "m1" }), ev(7, { type: "executionStats", message_id: "m2" })];
+  assert.deepEqual(endedTurns(two).map((e) => e.data.message_id), ["m1", "m2"]);
+  const row = (data: Record<string, unknown>) => ({ event_type: String(data.type), created_at: new Date(0).toISOString(), data });
+  assert.deepEqual(storedTurnEnds([row({ type: "exec_complete", message_id: "m1", failed: true }), row({ type: "executionStats", message_id: "m2" }),
+    row({ type: "exec_complete", message_id: "m3", subagent_id: "s" }), row({ type: "exec_complete", message_id: "m1" })]), ["m1"],
+    "a stored turn end is its main agent's exec_complete, one per turn (a delivery given up on ends with that alone)");
+  assert.deepEqual(messagesOf([...done, ev(8, { type: "AssistantMessage", message_id: "m2", data: { content: [{ type: "text", text: "two" }, { type: "tool_use" }] } })]),
+    ["answer one", "two"], "the main agent's messages only, in order");
+});
+
+test("S19 the say cap", () => {
+  const H = 3_600_000;
+  const now = 10 * H;
+  const at = (n: number, from: number): number[] => Array.from({ length: n }, (_, k) => from + k * 1000);
+  assert.equal(sayWaitMs(at(80, now - H / 2), now, 100, 10), 0, "80 + 10 of 100: go");
+  assert.equal(sayWaitMs(at(90, now - H / 2), now, 100, 10), 0, "exactly at the budget: go");
+  // 95 in the last hour, 10 reserved, 100 allowed: the 5th oldest must leave the hour first.
+  const says = at(95, now - H / 2);
+  assert.equal(sayWaitMs(says, now, 100, 10), says[4]! + H - now + 1000);
+  assert.equal(sayWaitMs(says, says[4]! + H + 1000, 100, 10), 0, "and then it goes");
+  assert.equal(sayWaitMs([...at(50, now - 2 * H), ...at(80, now - 60_000)], now, 100, 10), 0, "says older than an hour do not count");
+  assert.equal(sayWaitMs(at(500, now - 1000), now, 0, 10), 0, "0 turns pacing off");
+  const live = [ev(1, { type: "AssistantSay", say_id: "a" }), ev(2, { type: "AssistantSay", say_id: "b", fallback: true }), ev(3, { type: "toolUsed" })];
+  assert.deepEqual(countedSays(live), [{ id: "a", at: 1 }], "the system's fallback is not counted by the cap");
+  assert.deepEqual(countedSaysOf([
+    { event_type: "AssistantSay", created_at: new Date(5000).toISOString(), data: { type: "AssistantSay", say_id: "p" } },
+    { event_type: "AssistantSay", created_at: new Date(6000).toISOString(), data: { type: "AssistantSay", say_id: "q", fallback: true } },
+    { event_type: "toolUsed", created_at: new Date(7000).toISOString(), data: { type: "toolUsed" } },
+  ]), [{ id: "p", at: 5000 }]);
+  // The same say seen on the stream, in the stored events and in an earlier run's log is one say; one older than the hour is none.
+  assert.deepEqual(mergeSays([[{ id: "a", at: now - 10 }, { id: "old", at: now - H - 1 }], [{ id: "a", at: now - 20 }, { id: "b", at: now - 5 }]], now),
+    [{ id: "a", at: now - 20 }, { id: "b", at: now - 5 }]);
+  assert.deepEqual(parseSayLog(`{"id":"a","at":5}\nnot json\n{"id":"","at":1}\n{"id":"b"}\n\n{"id":"c","at":7}\n`), [{ id: "a", at: 5 }, { id: "c", at: 7 }]);
+  const refused = (atMs: number, status: string, text: string): LiveEvent => ev(atMs, { type: "toolUsed", tool: "mcp__assistant__say", status, description: text });
+  const events = [refused(1, "error", "say_rate_limited: at most 120 messages an hour"), refused(10, "error", "say_rate_limited: at most 120 messages an hour"),
+    refused(11, "error", "item_not_found: no such item"), refused(12, "success", "ok"),
+    ev(13, { type: "toolUsed", tool: "mcp__assistant__work_create", status: "error", description: "say_rate_limited" })];
+  assert.equal(capRefusedSays(events, 5), 1, "only the say refused for the cap, since the attempt began");
+});
+
+test("S20 sharing an identity", async () => {
+  assert.match(assistantInUse({ agent_status: "running" }, null, 1e9, 300_000) ?? "", /running/);
+  assert.match(assistantInUse({ agent_status: "idle" }, 1e9 - 60_000, 1e9, 300_000) ?? "", /active 60s ago/);
+  assert.equal(assistantInUse({ agent_status: "idle" }, 1e9 - 301_000, 1e9, 300_000), null);
+  assert.equal(assistantInUse({ agent_status: "idle" }, 1e9 - 1000, 1e9, 0), null, "EVAL_QUIET_S=0 looks only at a running turn");
+  assert.equal(assistantInUse({ agent_status: "idle" }, null, 1e9, 300_000), null, "a session with no events is free");
+
+  const fake = (answers: Record<string, number[]>) => {
+    const calls: string[] = [];
+    const api = async (method: string, path: string) => {
+      calls.push(`${method} ${path}`);
+      const queue = answers[method]!;
+      return { status: queue.length > 1 ? queue.shift()! : queue[0]!, json: null };
+    };
+    return { api, calls };
+  };
+  const nap = async (): Promise<void> => {};
+  // DELETE answered 200 but the session still reads: not gone until a GET answers 404.
+  const late = fake({ DELETE: [200], GET: [200, 200, 404] });
+  assert.equal(await deleteSessionConfirmed(late.api, "s1", Date.now() + 60_000, 1, nap), true);
+  assert.deepEqual(late.calls, ["DELETE /v1/sessions/s1", "GET /v1/sessions/s1", "DELETE /v1/sessions/s1", "GET /v1/sessions/s1", "DELETE /v1/sessions/s1", "GET /v1/sessions/s1"]);
+  const retry = fake({ DELETE: [503, 200], GET: [404] });
+  assert.equal(await deleteSessionConfirmed(retry.api, "s1", Date.now() + 60_000, 1, nap), true, "a 503 is tried again");
+  assert.deepEqual(retry.calls, ["DELETE /v1/sessions/s1", "DELETE /v1/sessions/s1", "GET /v1/sessions/s1"]);
+  const gone = fake({ DELETE: [404], GET: [404] });
+  assert.equal(await deleteSessionConfirmed(gone.api, "s1", Date.now() + 60_000, 1, nap), true, "gone already");
+  const notOurs = fake({ DELETE: [403], GET: [200] });
+  assert.equal(await deleteSessionConfirmed(notOurs.api, "s1", Date.now() + 60_000, 1, nap), false);
+  assert.deepEqual(notOurs.calls, ["DELETE /v1/sessions/s1"], "a refusal is not asked again");
+  const stays = fake({ DELETE: [200], GET: [200] });
+  assert.equal(await deleteSessionConfirmed(stays.api, "s1", Date.now() + 50, 10, (ms) => new Promise((r) => setTimeout(r, ms))), false, "never seen gone");
 });

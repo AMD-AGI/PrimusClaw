@@ -556,9 +556,149 @@ export function turnCalls(events: readonly LiveEvent[], messageIds: readonly str
   return traceOf(rows).calls;
 }
 
+/**
+ * An event that closes its turn. The API never forwards `exec_complete` to a live stream (`routes/events.ts`), so there a turn
+ * ends with its main agent's `executionStats` (it finished) or its `statusUpdate` to failed; a replay has `exec_complete` as well.
+ * A sub-agent's events close nothing.
+ */
+export const endsTurn = (d: Record<string, any> | undefined): boolean => !!d && !d.subagent_id
+  && (d.type === "exec_complete" || d.type === "executionStats" || (d.type === "statusUpdate" && d.agentStatus === "failed"));
+
 /** A turn that ended, by its message id. */
 export const turnEnded = (events: readonly LiveEvent[], messageId: string): boolean =>
-  events.some((e) => e.data?.type === "exec_complete" && e.data.message_id === messageId);
+  events.some((e) => endsTurn(e.data) && e.data.message_id === messageId);
+
+/** The turns that ended, in order: one event per turn, however many of its closing events arrived. */
+export function endedTurns(events: readonly LiveEvent[]): LiveEvent[] {
+  const seen = new Set<string>();
+  return events.filter((e) => {
+    if (!endsTurn(e.data)) return false;
+    const turn = String(e.data.message_id || e.eventId);
+    if (seen.has(turn)) return false;
+    seen.add(turn);
+    return true;
+  });
+}
+
+/**
+ * The turns a session's stored events (`?mode=replay`) say ended: its main agent's `exec_complete`, one per turn. A turn whose
+ * delivery Brain gave up on ends with that event alone, which a stream never carries; read when a stream showed no end.
+ */
+export function storedTurnEnds(rows: readonly EventRow[]): string[] {
+  const out: string[] = [];
+  for (const r of rows) {
+    const d = r.data ?? {};
+    if ((d.type ?? r.event_type) !== "exec_complete" || d.subagent_id) continue;
+    const id = String(d.message_id ?? "");
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/** What the main agent wrote in a plain session (`AssistantMessage`), in order: what its user was shown. */
+export const messagesOf = (events: readonly LiveEvent[]): string[] => events
+  .filter((e) => e.data?.type === "AssistantMessage" && !e.data.subagent_id)
+  .map((e) => (Array.isArray(e.data.data?.content) ? e.data.data.content : []).filter((b: any) => b?.type === "text").map((b: any) => String(b.text)).join(""))
+  .filter(Boolean);
+
+// --- Sharing an identity with its hourly say cap and with other runs --------------------------------------------------
+
+const HOUR_MS = 3_600_000;
+
+/** A say the cap counts: its id and when it was made (or seen). */
+export interface SayMark { id: string; at: number }
+
+/** The says the cap counts (`claw_assistant_says`, the system's fallbacks excluded), from a live stream. */
+export const countedSays = (events: readonly LiveEvent[]): SayMark[] => events
+  .filter((e) => e.data?.type === "AssistantSay" && e.data.fallback !== true)
+  .map((e) => ({ id: String(e.data.say_id ?? e.eventId), at: e.at }));
+
+/** The same from a session's stored events (`?mode=replay`): the says made before this run was listening. */
+export const countedSaysOf = (rows: readonly EventRow[]): SayMark[] => rows
+  .filter((r) => (r.data?.type ?? r.event_type) === "AssistantSay" && r.data?.fallback !== true)
+  .map((r) => ({ id: String(r.data?.say_id ?? ""), at: Date.parse(r.created_at) }))
+  .filter((m) => m.id && Number.isFinite(m.at));
+
+/** Says of several sources as one list: each id once (at its earliest time), only those of the hour before `now`. */
+export function mergeSays(lists: ReadonlyArray<readonly SayMark[]>, now: number): SayMark[] {
+  const by = new Map<string, number>();
+  for (const list of lists) for (const m of list) if (m.at > now - HOUR_MS && m.at <= now) by.set(m.id, Math.min(by.get(m.id) ?? Infinity, m.at));
+  return [...by].map(([id, at]) => ({ id, at })).sort((a, b) => a.at - b.at);
+}
+
+/**
+ * The says an earlier run on this host saw (EVAL_SAY_LOG, one `{"id","at"}` per line). The cap counts an identity's says
+ * whatever session they were in, and a run deletes the assistant session it made: the next run cannot read them back from
+ * the API. A line that is not a say is left out.
+ */
+export function parseSayLog(text: string): SayMark[] {
+  const out: SayMark[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const m = JSON.parse(line) as Partial<SayMark>;
+      if (typeof m.id === "string" && m.id && typeof m.at === "number" && Number.isFinite(m.at)) out.push({ id: m.id, at: m.at });
+    } catch { /* not a say */ }
+  }
+  return out;
+}
+
+/**
+ * How long to wait before the next case so that the identity's counted says of the last hour, and `reserve` more for the case,
+ * stay within `perHour`: the server refuses a say past CLAW_ASSISTANT_SAY_MAX_PER_HOUR in a rolling hour, and a refused say is
+ * a case lost to the run, not to the assistant. 0 to go now; `perHour` 0 never waits.
+ */
+export function sayWaitMs(says: readonly number[], now: number, perHour: number, reserve: number): number {
+  if (perHour <= 0) return 0;
+  const recent = says.filter((t) => t > now - HOUR_MS && t <= now).sort((a, b) => a - b);
+  const over = recent.length + reserve - perHour;
+  if (over <= 0) return 0;
+  // When the over-th oldest say leaves the hour, enough room is left; a reserve that alone exceeds perHour is refused at start.
+  return recent[Math.min(over, recent.length) - 1]! + HOUR_MS - now + 1_000;
+}
+
+/** The says of the assistant the server refused for its hourly cap since `since`: an attempt with one is the run's failure. */
+export const capRefusedSays = (events: readonly LiveEvent[], since: number): number => events.filter((e) => e.at >= since
+  && e.data?.type === "toolUsed" && e.data.tool === "mcp__assistant__say" && e.data.status === "error"
+  && [e.data.result, e.data.description, e.data.brief].some((x) => typeof x === "string" && x.includes("say_rate_limited"))).length;
+
+/**
+ * Why a run must not start on the identity's assistant session: someone is using it now (a turn is running, or something
+ * happened in it less than `quietMs` ago). Two runs on one assistant see each other's messages and items, and a run that
+ * cleans up after another one deletes what that one is using; each parallel run needs an identity of its own. Null: free.
+ */
+export function assistantInUse(session: { agent_status?: unknown } | null, lastEventAt: number | null, now: number, quietMs: number): string | null {
+  if (session?.agent_status === "running") return "a turn is running in the identity's assistant session";
+  if (quietMs > 0 && lastEventAt !== null && now - lastEventAt < quietMs) {
+    return `the identity's assistant session was active ${Math.round((now - lastEventAt) / 1000)}s ago (EVAL_QUIET_S=${Math.round(quietMs / 1000)})`;
+  }
+  return null;
+}
+
+export interface ApiAnswer { status: number; json: any }
+
+/**
+ * Delete one session the run made, and see that it is gone: DELETE answers 200 (or 404, gone already), and only a GET that
+ * then answers 404 counts. A refusal (401, 403) ends it; anything else is tried again until `deadlineAt`. Only ever called
+ * with an id the run made or was answered for its own item: nothing is deleted by identity.
+ */
+export async function deleteSessionConfirmed(
+  api: (method: string, path: string) => Promise<ApiAnswer>, sessionId: string, deadlineAt: number, everyMs: number,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<boolean> {
+  const path = `/v1/sessions/${encodeURIComponent(sessionId)}`;
+  for (;;) {
+    const del = await api("DELETE", path).catch(() => ({ status: 0, json: null }));
+    // Not the run's to delete (or not its key): asking again changes nothing.
+    if (del.status === 401 || del.status === 403) return false;
+    if (del.status === 200 || del.status === 404) {
+      const got = await api("GET", path).catch(() => ({ status: 0, json: null }));
+      if (got.status === 404) return true;
+    }
+    if (Date.now() + everyMs > deadlineAt) return false;
+    await sleep(everyMs);
+  }
+}
 
 export interface ItemSeen { item_id: string; seq: number; title: string; kind: string; board_state: string; can_accept: boolean; result_version: number; outcome: string | null }
 

@@ -13,8 +13,8 @@
  * Baseline mode sends the same turns to a new plain session with a plugin (a user of the plugin without the
  * assistant), so the two can be compared case by case on the checks that apply to both.
  *
- *   EVAL_CLAW=https://claw.example/api EVAL_KEY_FILE=/path/to/key npx tsx test/e2e/sa-eval.ts
- *   EVAL_MODE=baseline EVAL_PLUGIN_ID=<id> EVAL_CLAW=... EVAL_KEY_FILE=... npx tsx test/e2e/sa-eval.ts
+ *   EVAL_CLAW=https://claw.example/api EVAL_KEY_FILE=/path/to/key node --import tsx test/e2e/sa-eval.ts
+ *   EVAL_MODE=baseline EVAL_PLUGIN_ID=<id> EVAL_CLAW=... EVAL_KEY_FILE=... node --import tsx test/e2e/sa-eval.ts
  *
  *   EVAL_DRY_RUN=1 npx tsx test/e2e/sa-eval.ts                                  # load, check and plan: nothing is sent
  *   EVAL_STATIC=1 npx tsx test/e2e/sa-eval.ts                                   # what cases ask for against what their arm can do
@@ -42,8 +42,10 @@
  *   EVAL_RECORD_DIR   a directory for <mode>-recordings.jsonl: every attempt as observed (what the identity was shown
  *                     included), for EVAL_OFFLINE; written only when set, and only together with EVAL_KEEP_TEXT=1
  *   EVAL_JUDGE_URL, EVAL_JUDGE_MODEL, EVAL_JUDGE_KEY_FILE
- *                     an Anthropic-compatible gateway, a model and its key: each case with a rubric or a judge-only fact
- *                     is also graded by that model, recorded beside the deterministic verdict and never instead of it.
+ *                     an Anthropic-compatible gateway, a model and its key: every case is also graded by that model (the
+ *                     no-false-denial rule with the turn's calls, and the case's rubric and judge-only facts). Its FAIL fails
+ *                     the case and it decides what the denial detectors left to it; it never passes a case a deterministic
+ *                     check failed.
  *   EVAL_VARS_FILE    a JSON object of run variables for `{{name}}` placeholders (nested objects give `{{a.b}}`); EVAL_VAR_<NAME>
  *                     sets one too. A case whose placeholders have no value is skipped and says which.
  *   EVAL_GITHUB_TOKEN_FILE, EVAL_GITHUB_API
@@ -52,6 +54,20 @@
  *                     the plugin whose MCP servers `mcp:` oracles read (default EVAL_PLUGIN_ID), and the hosts their URLs may
  *                     have (comma list, https only; default the host of EVAL_CLAW): the key is sent nowhere else. Only tools on
  *                     the router's list of reads are ever called, so an oracle cannot write
+ *   EVAL_SAY_PER_HOUR, EVAL_SAY_RESERVE
+ *                     the assistant mode's pace (default 100 and 10): before each attempt it waits until the identity's says of
+ *                     the last hour (those stored in its assistant session before the run, and the run's own; the system's
+ *                     fallbacks are not counted, as the server does not count them) plus the reserve are within the first.
+ *                     Keep it below the deployment's CLAW_ASSISTANT_SAY_MAX_PER_HOUR (120): a say the server refuses for its
+ *                     cap makes the attempt an error of the run (`infra: ... say_rate_limited`), not a failure of the assistant.
+ *                     0 turns the pace off. The says of an assistant session a run deleted cannot be read back and still
+ *                     count: each run keeps the hour's says it saw in EVAL_SAY_LOG (default: a file per identity in the
+ *                     host's temporary directory) for the next run on the same host
+ *   EVAL_TURN_WAIT_S  how long a turn may take to end (default 180 for a router turn, 600 for a plain session's): a turn whose
+ *                     end neither the stream nor the session's stored events show by then makes the attempt an error, not a grade
+ *   EVAL_QUIET_S      the assistant mode refuses to start when the identity's assistant session has a turn running, or had any
+ *                     event less than this many seconds ago (default 300; 0 checks only for a running turn): another run, or a
+ *                     person, is using the identity. Each run going at the same time needs an identity of its own
  *
  * EVAL_STATIC reports, without sending anything, every case that can never pass on its arm (a tools_must no tool of the arm
  * matches: the router's from `assistant/read-tools.ts`, the worker's every plugin server, given as EVAL_STATIC_SERVERS or the
@@ -61,11 +77,18 @@
  * The assistant mode works in the key owner's one assistant conversation (it must be a test identity, see above). It
  * runs the cases one at a time, waits for the assistant to be idle before each, and cleans up what it started: every
  * work item its own turns' work_create / review_start answers name is accepted (a result that waits, at the version
- * shown) or stopped, and an assistant session it created is deleted. No other item is touched; a new open item it cannot
- * tie to its calls is reported. Exit 0 when every attempt ran to a verdict and the cleanup is complete; the score is a
- * measurement, not a gate.
+ * shown) or stopped, then its worker's session is deleted, and an assistant session it created is deleted. It deletes
+ * only sessions it made or that its own items name, never by identity, and a session counts as deleted only when a GET
+ * after the DELETE answers 404. No other item is touched; a new open item it cannot tie to its calls is reported. Exit 0
+ * when every attempt ran to a verdict and the cleanup is complete; the score is a measurement, not a gate.
+ *
+ * SIGINT or SIGTERM stops a live run between two steps: nothing more is sent, the turns already sent are let end (a minute
+ * at most, or EVAL_TURN_WAIT_S if shorter) so that the items they start are known, and the cleanup above runs; the run exits 1. A second signal exits at
+ * once without it. Send it to the runner's own process: `npx` (npm exec) does not pass a signal on.
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -74,11 +97,13 @@ import { traceOf, type EventRow, type ToolCall } from "./agent-eval-lib.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
-  BUILTIN_TOOLS, caseHash, caseSays, cardsOf, cleanupOf, filledCase, finalSay, grade, forRecording, identityRefusal, itemsStartedBy, judgePrompt,
-  loadCases, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf, saysOf, staticFindings,
-  verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest, holdAnswers, toolPattern,
-  type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery, type Recording,
-  type Turn, type Vars, type HoldSeen, type HoldSpec,
+  BUILTIN_TOOLS, assistantInUse, capRefusedSays, caseHash, caseSays, cardsOf, cleanupOf, countedSays, countedSaysOf, deleteSessionConfirmed,
+  mergeSays, parseSayLog, endedTurns, storedTurnEnds, filledCase, finalSay, grade, forRecording, identityRefusal, itemsStartedBy, judgePrompt,
+  loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf, sayWaitMs,
+  saysOf, staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest, holdAnswers,
+  toolPattern,
+  type SayMark, type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
+  type Recording, type Turn, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
 import * as readTools from "../../src/assistant/read-tools.js";
 
@@ -110,6 +135,13 @@ const ITEM_WAIT_SEC = int("EVAL_ITEM_WAIT", 300, 10, 3600);
 const KEEP_TEXT = process.env.EVAL_KEEP_TEXT === "1";
 const OUT = process.env.EVAL_OUT;
 const RECORD_DIR = process.env.EVAL_RECORD_DIR;
+const SAY_PER_HOUR = int("EVAL_SAY_PER_HOUR", 100, 0, 100_000);
+const SAY_RESERVE = int("EVAL_SAY_RESERVE", 10, 0, 1_000);
+if (SAY_PER_HOUR && SAY_RESERVE >= SAY_PER_HOUR) { console.error("EVAL_SAY_RESERVE must be below EVAL_SAY_PER_HOUR"); process.exit(2); }
+const QUIET_MS = int("EVAL_QUIET_S", 300, 0, 86_400) * 1000;
+const TURN_WAIT_S = process.env.EVAL_TURN_WAIT_S ? int("EVAL_TURN_WAIT_S", 180, 1, 3600) : null;
+/** How long a turn may take to end: EVAL_TURN_WAIT_S, else 180 s for a router turn and 600 s for a plain session's. */
+const turnWaitMs = (router: boolean): number => (TURN_WAIT_S ?? (router ? 180 : 600)) * 1000;
 // A recording holds what the identity was shown (and so anything an oracle reads back from its data): it is written only
 // when the operator also asks to keep the text, knowingly.
 if (RECORD_DIR && !KEEP_TEXT) { console.error("EVAL_RECORD_DIR writes the answers the identity was shown: set EVAL_KEEP_TEXT=1 as well to say so"); process.exit(2); }
@@ -127,7 +159,7 @@ const scrub = (s: string): string => scrubWith(s, [KEY]);
 const iso = (): string => new Date().toISOString();
 const log = (...a: unknown[]): void => console.log(iso(), ...a.map((x) => (typeof x === "string" ? scrub(x) : x)));
 const recordings: Recording[] = [];
-const sessionsLeft: string[] = [];   // baseline sessions the run made and could not delete: they fail the run
+const sessionsLeft: string[] = [];   // sessions the run made (or its items' workers) and could not delete: they fail the run
 /** Checks whose detail quotes what the identity was shown: kept only with EVAL_KEEP_TEXT. */
 const TEXT_DETAIL = /^(no internal text|items named by title|no false denial)/;
 
@@ -147,7 +179,50 @@ const VARS = runVars();
 /** The router's reads as allow-list entries: the only MCP tools an `mcp:` oracle may call. */
 const ROUTER_READS = Object.keys(readTools.ROUTER_READ_TOOLS).flatMap((s) => readTools.readToolPatterns(s));
 const RUN_ITEMS = new Set<string>();   // ids of the items the run's own turns started: the only items it ever closes
+const CLEARED = new Set<string>();     // of those, the ones closed with their worker's session deleted
+const RUN_MESSAGES: string[] = [];     // every message the run sent to the assistant, to tie items to it after a stop
+const OWN_SESSIONS = new Set<string>(); // the only sessions the run ever deletes: made by it, or answered for its own items
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// --- Stopping -------------------------------------------------------------------------------------------------------
+
+/**
+ * SIGINT or SIGTERM stops the run between two steps: nothing more is sent, the attempt under way ends as interrupted, and
+ * the cleanup runs as after the last case. A second signal exits at once, without it. (npm exec does not pass a signal sent to
+ * it on to the runner: send it to the runner's own process, or start it with `node --import tsx`.)
+ */
+class Interrupted extends Error {}
+let stopSignal: string | null = null;
+const wakers = new Set<() => void>();
+function stopOn(signal: NodeJS.Signals): void {
+  if (stopSignal) { console.error(`${signal} again: exiting now, without cleaning up`); process.exit(130); }
+  stopSignal = signal;
+  log(`${signal}: nothing more is sent; cleaning up what the run started (${signal} again exits at once, without it)`);
+  for (const wake of wakers) wake();
+}
+/** Throws once the run was asked to stop: before anything is sent, and in every wait of an attempt. */
+const live = (): void => { if (stopSignal) throw new Interrupted(`stopped by ${stopSignal}`); };
+/** A pause a stop cuts short. */
+async function pause(ms: number): Promise<void> {
+  live();
+  await new Promise<void>((resolve) => {
+    const done = (): void => { clearTimeout(timer); wakers.delete(done); resolve(); };
+    const timer = setTimeout(done, ms);
+    wakers.add(done);
+  });
+  live();
+}
+/** `until` for an attempt's waits: a stop ends it with Interrupted. */
+const waitFor = <T>(probe: () => Promise<T | undefined> | T | undefined, deadlineAt: number, everyMs: number): Promise<T | null> =>
+  until(async () => { live(); return probe(); }, deadlineAt, everyMs);
+
+// --- The run's own sessions -------------------------------------------------------------------------------------------
+
+/** Delete a session the run made, and see it gone (`deleteSessionConfirmed`); one it did not make is never deleted. */
+async function deleteOwn(sessionId: string): Promise<boolean> {
+  if (!OWN_SESSIONS.has(sessionId)) throw new Error(`session ${sessionId} is not the run's own: not deleted`);
+  return deleteSessionConfirmed(api, sessionId, Date.now() + 60_000, 5_000);
+}
 
 // --- The live stream of a session ---------------------------------------------------------------------------------
 
@@ -235,7 +310,7 @@ async function workerCalls(itemId: string): Promise<ToolCall[]> {
 }
 
 async function idle(sessionId: string, waitMs: number): Promise<boolean> {
-  return (await until(async () => {
+  return (await waitFor(async () => {
     const r = await api("GET", `/v1/sessions/${sessionId}`).catch(() => null);
     return r?.status === 200 && r.json?.data?.agent_status !== "running" ? true : undefined;
   }, Date.now() + waitMs, 2_000)) === true;
@@ -350,16 +425,22 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   const sentAt: number[] = [];
   for (const t of turns) {
     const wait = start + (t.after_ms ?? 0) - Date.now();
-    if (wait > 0) await sleep(wait);
+    if (wait > 0) await pause(wait);
+    live();
     const at = Date.now();
     const r = await api("POST", `/v1/sessions/${sessionId}/messages`, { content: t.user, messageType: "text" });
     const id = r.json?.message_id;
     if (r.status !== 200 || typeof id !== "string") throw new Error(`message answered ${r.status}`);
+    RUN_MESSAGES.push(id);
     messageIds.push(id);
     sentAt.push(at);
   }
-  // The Router's turns for the case's messages end (each is short: it answers or hands the work on).
-  await until(() => (messageIds.every((id) => turnEnded(stream.events, id)) ? true : undefined), Date.now() + 180_000, 500);
+  // The Router's turns for the case's messages end (each is short: it answers or hands the work on). One that has not ended
+  // in time is not graded: what was seen of it is part of a turn.
+  if (!(await turnsOver(sessionId, (stored) => messageIds.every((id) => stored.includes(id)),
+    () => messageIds.every((id) => turnEnded(stream.events, id)), Date.now() + turnWaitMs(true), waitFor))) {
+    throw new Error(`no end of the turn of ${messageIds.join(",")} within ${turnWaitMs(true) / 1000} s: not graded`);
+  }
   // The case's items are only those its own turns started (read from their work_create / review_start answers): an item
   // someone else put on the board meanwhile (a review asked of this identity) is neither graded nor closed here.
   const started = turnCalls(stream.events, messageIds);
@@ -371,11 +452,11 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   if (items.length) {
     // The item's result (or question, or failure; or its end, for a case that stops it), then what was said about it.
     const settled = (is: ItemSeen[]): boolean => is.every((i) => (c.items_closed ? i.board_state === "done" : i.board_state !== "in_progress"));
-    await until(async () => {
+    await waitFor(async () => {
       items = mine(await board().catch(() => items));
       return settled(items) ? true : undefined;
     }, start + (c.item_wait_s ?? ITEM_WAIT_SEC) * 1000, 5_000);
-    await until(() => (items.every((i) => i.board_state === "in_progress"
+    await waitFor(() => (items.every((i) => i.board_state === "in_progress"
       || saysOf(stream.events).some((s) => s.itemId === i.item_id && s.itemState !== "in_progress")) ? true : undefined), Date.now() + 30_000, 1_000);
   }
   // What is graded is the last turn (earlier turns are its context and may start items of their own): its Router turn's
@@ -407,7 +488,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   for (const i of mine(await board().catch(() => items))) {
     RUN_ITEMS.add(i.item_id);
     const seen = items.find((x) => x.item_id === i.item_id) ?? i;
-    cleaned.push({ seq: i.seq, kind: i.kind, board_state: seen.board_state, cleanup: await close(i) });
+    cleaned.push({ seq: i.seq, kind: i.kind, board_state: seen.board_state, cleanup: await closeItem(i) });
   }
   return attemptOf(c, turns, observed, allCalls.map((x) => x.name), cleaned);
 }
@@ -461,6 +542,48 @@ async function answerHold(spec: HoldSpec, items: readonly ItemSeen[], deadline: 
   return seen;
 }
 
+/**
+ * Whether turns of a session are over by `deadlineAt`, as `over` judges the message ids of their stored exec_complete
+ * (`storedTurnEnds`). Brain sends exec_complete last, after the workspace sync and the transcript, and a stream never carries
+ * it; the stream's end of a turn (`streamed`: its executionStats) only says it is finishing. So the stored events are read
+ * once the stream says so, and every 10 s whatever it says (a turn whose delivery Brain gave up on has exec_complete alone).
+ * `wait` is the `until` the caller's waits use (one a stop ends, or not).
+ */
+async function turnsOver(
+  sessionId: string, over: (stored: readonly string[]) => boolean, streamed: () => boolean, deadlineAt: number,
+  wait: <T>(probe: () => Promise<T | undefined>, deadlineAt: number, everyMs: number) => Promise<T | null>,
+): Promise<boolean> {
+  let readAt = 0;
+  const probe = async (): Promise<true | undefined> => {
+    if (!streamed() && Date.now() - readAt < 10_000) return undefined;
+    readAt = Date.now();
+    return over(storedTurnEnds(await replay(sessionId).catch(() => []))) ? true : undefined;
+  };
+  if ((await wait(probe, deadlineAt, 1_000)) === true) return true;
+  // Once more after the deadline: a turn that ended while the last read was waiting is over.
+  return over(storedTurnEnds(await replay(sessionId).catch(() => [])));
+}
+
+/**
+ * Close one of the run's items (`close`), then delete its worker's session and see it gone: a session the server made for the
+ * run's own item, read from that item. An item that did not close keeps its worker.
+ */
+async function closeItem(i: ItemSeen): Promise<string> {
+  const how = await close(i);
+  const r = await until(async () => {
+    const got = await api("GET", `/v1/work-items/${i.item_id}`).catch(() => null);
+    return got?.status === 200 && got.json?.data?.board_state === "done" ? got : undefined;
+  }, Date.now() + 30_000, 2_000);
+  if (!r) return `${how}; still open, its worker's session kept`;
+  CLEARED.add(i.item_id);
+  const sid = r.json.data.worker_session_id;
+  if (typeof sid !== "string" || !sid) return how;
+  OWN_SESSIONS.add(sid);
+  if (await deleteOwn(sid)) return `${how}; worker session deleted`;
+  sessionsLeft.push(sid);
+  return `${how}; worker session ${sid} not deleted`;
+}
+
 async function close(i: ItemSeen): Promise<string> {
   const op = cleanupOf(i);
   if (!op) return "already closed";
@@ -476,61 +599,112 @@ async function close(i: ItemSeen): Promise<string> {
 
 async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
   const values = await factValues(c);
+  live();
   const start = Date.now();
   const created = await api("POST", "/v1/sessions", { name: `sa-eval-${c.id}`, message: { content: turns[0]!.user, pluginId: PLUGIN_ID } });
   const sessionId: string | undefined = created.json?.data?.session_id;
   if (!sessionId) throw new Error(`create answered ${created.status}`);
+  OWN_SESSIONS.add(sessionId);
   const stream = new LiveStream(sessionId, false);
+  let sent = 1;   // the turns sent: the first went with the session
+  const denied = new Set<string>();
+  const ends = (): LiveEvent[] => endedTurns(stream.events);
+  // The cases only read: every approval is denied, so a turn waiting on one does not hang the run.
+  const denyAsked = async (): Promise<void> => {
+    for (const e of stream.events) {
+      const tid = e.data?.tool_use_id;
+      if (e.data?.type !== "permissionRequest" || typeof tid !== "string" || denied.has(tid)) continue;
+      denied.add(tid);
+      await api("POST", `/v1/sessions/${sessionId}/messages`, { messageType: "decision", extData: { tool_use_id: tid, action: "deny" } });
+    }
+  };
   try {
     await stream.open();
-    const denied = new Set<string>();
-    const ends = (): LiveEvent[] => stream.events.filter((e) => e.data?.type === "exec_complete");
-    // The cases only read: every approval is denied, so a turn waiting on one does not hang the run.
+    // One that has not ended in time is not graded: what was seen of it is part of a turn.
     const waitEnds = async (n: number, deadline: number): Promise<void> => {
-      await until(async () => {
-        for (const e of stream.events) {
-          const tid = e.data?.tool_use_id;
-          if (e.data?.type !== "permissionRequest" || typeof tid !== "string" || denied.has(tid)) continue;
-          denied.add(tid);
-          await api("POST", `/v1/sessions/${sessionId}/messages`, { messageType: "decision", extData: { tool_use_id: tid, action: "deny" } });
-        }
-        return ends().length >= n ? true : undefined;
-      }, deadline, 500);
+      const over = await turnsOver(sessionId, (stored) => stored.length >= n, () => ends().length >= n, deadline,
+        (probe, at, every) => waitFor(async () => { await denyAsked(); return probe(); }, at, every));
+      if (!over) throw new Error(`no end of turn ${n} within ${turnWaitMs(false) / 1000} s: not graded`);
     };
-    await waitEnds(1, start + 600_000);
+    await waitEnds(1, start + turnWaitMs(false));
     const sentAt: number[] = [start];
     let lastMid: string | undefined;   // the last turn's message id (a single-turn case: every event is the last turn's)
     const firstText: Array<number | null> = [stream.events.find((e) => e.data?.type === "AssistantMessage")?.at ?? null];
     for (const [k, t] of turns.slice(1).entries()) {
       const wait = start + (t.after_ms ?? 0) - Date.now();
-      if (wait > 0) await sleep(wait);
+      if (wait > 0) await pause(wait);
+      live();
       const at = Date.now();
       const r = await api("POST", `/v1/sessions/${sessionId}/messages`, { content: t.user, messageType: "text", pluginId: PLUGIN_ID });
+      sent++;
       if (r.status !== 200) throw new Error(`message answered ${r.status}`);
       lastMid = typeof r.json?.message_id === "string" ? r.json.message_id : undefined;
       sentAt.push(at);
-      await waitEnds(k + 2, at + 600_000);
+      await waitEnds(k + 2, at + turnWaitMs(false));
       firstText.push(stream.events.find((e) => e.data?.type === "AssistantMessage" && e.at >= at)?.at ?? null);
     }
     await sleep(3_000);
     const rows = await replay(sessionId);
     const all = traceOf(rows);
     const lastCalls = lastMid ? traceOf(rows, lastMid).calls : all.calls;
-    const last = ends().at(-1);
+    // The last turn's end as it streamed; none when only the stored events had it.
+    const last = ends().length >= turns.length ? ends().at(-1) : undefined;
     const finalText = String(last?.data.final_text || all.final || "");
     const lastSent = sentAt.at(-1)!;
     const lastFirst = firstText.at(-1) ?? null;
+    // What the user was shown: the main agent's messages as they streamed (a turn's end on a stream carries no text).
+    const shown = messagesOf(stream.events);
     const observed: Observed = {
-      mode: MODE, calls: lastCalls, shown: ends().map((e) => String(e.data.final_text ?? "")), final: finalText,
+      mode: MODE, calls: lastCalls, shown: shown.length ? shown : [finalText], final: finalText,
       firstReplyMs: lastFirst === null ? null : lastFirst - lastSent, finalMs: last ? last.at - lastSent : null,
       replyMs: firstText.map((a, k) => (a === null ? null : a - sentAt[k]!)), items: [], factValues: values,
     };
     const trace = all;
     return attemptOf(c, turns, observed, trace.calls.map((x) => x.name), []);
   } finally {
+    // Stopped mid-case: the turns already sent are let end first (a minute at most), as in the assistant mode, still denying
+    // what they ask to run; deleting the session would cut them off half done.
+    if (stopSignal) {
+      await turnsOver(sessionId, (stored) => stored.length >= sent, () => ends().length >= sent, Date.now() + Math.min(60_000, turnWaitMs(false)),
+        (probe, at, every) => until(async () => { await denyAsked().catch(() => undefined); return probe(); }, at, every));
+    }
     stream.close();
-    const gone = await until(async () => ((await api("DELETE", `/v1/sessions/${sessionId}`).catch(() => ({ status: 0 }))).status === 200 ? true : undefined), Date.now() + 60_000, 10_000);
-    if (!gone) { log(`could not delete session ${sessionId} of ${c.id}`); sessionsLeft.push(sessionId); }
+    if (!(await deleteOwn(sessionId))) { log(`could not delete session ${sessionId} of ${c.id}`); sessionsLeft.push(sessionId); }
+  }
+}
+
+/**
+ * Before each attempt: wait until the identity's counted says of the last hour (those an earlier run on this host saw, those
+ * stored in the assistant session before the run, and the run's own), with EVAL_SAY_RESERVE more for the attempt, are within
+ * EVAL_SAY_PER_HOUR (`sayWaitMs`). A stop ends the wait.
+ */
+async function paceSays(stream: LiveStream, prior: readonly SayMark[]): Promise<void> {
+  for (let said = false; ;) {
+    const wait = sayWaitMs(mergeSays([prior, countedSays(stream.events)], Date.now()).map((m) => m.at), Date.now(), SAY_PER_HOUR, SAY_RESERVE);
+    if (!wait) return;
+    if (!said) { log(`say cap: waiting ${Math.ceil(wait / 1000)}s for room (EVAL_SAY_PER_HOUR=${SAY_PER_HOUR}, EVAL_SAY_RESERVE=${SAY_RESERVE})`); said = true; }
+    await pause(Math.min(wait, 60_000));
+  }
+}
+
+/** EVAL_SAY_LOG, else a file per identity in the host's temporary directory. */
+const sayLogPath = (identity: string): string => process.env.EVAL_SAY_LOG
+  || join(tmpdir(), `sa-eval-says-${createHash("sha256").update(identity.trim().toLowerCase()).digest("hex").slice(0, 16)}.jsonl`);
+
+function readSayLog(file: string): SayMark[] {
+  try { return parseSayLog(readFileSync(file, "utf8")); } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") log(`say log ${file} could not be read: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+/** The hour's counted says, for the next run on this host (written whole, then renamed into place). */
+function writeSayLog(file: string, says: readonly SayMark[]): void {
+  try {
+    writeFileSync(`${file}.tmp`, says.map((m) => JSON.stringify(m)).join("\n") + (says.length ? "\n" : ""));
+    renameSync(`${file}.tmp`, file);
+  } catch (err) {
+    log(`say log ${file} could not be written (the next run will not see this run's says): ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -555,10 +729,14 @@ async function main(): Promise<void> {
   if (subs.status !== 200 || !Array.isArray(subs.json?.data)) { console.error(`GET /v1/notification-subscriptions answered ${subs.status}: refusing to run blind`); process.exit(2); }
   const refusal = identityRefusal(me.json ?? {}, subs.json.data, process.env);
   if (refusal) { console.error(`refusing to run: ${refusal}`); process.exit(2); }
+  process.on("SIGINT", stopOn);
+  process.on("SIGTERM", stopOn);
   log(`mode=${MODE} plugin=${PLUGIN_ID ?? "-"} cases=${cases.length} k=${K}`);
   let sessionId = "";
   let stream: LiveStream | null = null;
   let createdAssistant = false;   // the run made the identity's assistant session: it is deleted at the end
+  let priorSays: SayMark[] = [];  // the identity's counted says made before the run was listening
+  const sayLog = sayLogPath(String(me.json?.email || me.json?.name || ""));
   // The board's highest number is read before anything is made, so whatever fails after it, everything numbered above it
   // is the run's and is closed below.
   const floorAtStart = MODE === "assistant" ? Math.max(0, ...(await board()).map((i) => i.seq)) : 0;
@@ -567,15 +745,31 @@ async function main(): Promise<void> {
   let leftOpen: number[] = [];
   try {
     if (MODE === "assistant") {
+      live();
       const a = await api("POST", "/v1/assistant", {});
       sessionId = a.json?.data?.session_id;
       if (a.status !== 200 || !sessionId) throw new Error(`POST /v1/assistant answered ${a.status}`);
       createdAssistant = a.json?.data?.created === true;
+      if (createdAssistant) OWN_SESSIONS.add(sessionId);
+      else {
+        // Nobody else may be using it: another run's messages and items would be taken for this one's, and either run's
+        // cleanup would close what the other is still grading. Each parallel run needs an identity of its own.
+        const s = await api("GET", `/v1/sessions/${sessionId}`);
+        if (s.status !== 200) { console.error(`refusing to run: GET of the assistant session answered ${s.status}`); process.exit(2); }
+        const rows = await replay(sessionId).catch(() => null);
+        if (!rows) { console.error("refusing to run: the assistant session's events could not be read"); process.exit(2); }
+        const lastAt = rows.reduce<number | null>((m, x) => { const t = Date.parse(x.created_at); return Number.isFinite(t) && (m === null || t > m) ? t : m; }, null);
+        const busy = assistantInUse(s.json?.data ?? null, lastAt, Date.now(), QUIET_MS);
+        if (busy) { console.error(`refusing to run: ${busy}; another run or a person is using this identity`); process.exit(2); }
+      }
       stream = new LiveStream(sessionId, true);
       await stream.open();
+      // Read after the stream opened, so a say in between is counted twice rather than not at all.
+      priorSays = mergeSays([readSayLog(sayLog), createdAssistant ? [] : countedSaysOf(await replay(sessionId))], Date.now());
     }
-    for (const c of cases) {
+    cases: for (const c of cases) {
       const r: CaseResult = { id: c.id, area: c.area, pipeline: c.pipeline, mode: MODE, hash: c.source?.hash ?? caseHash(c), attempts: [] };
+      if (stopSignal) break;
       results.push(r);
       if (c.modes && !c.modes.includes(MODE)) { r.skipped = `${c.modes.join(",")} only`; continue; }
       // Placeholders filled everywhere they sit: turns, claims, values, oracle queries and the rubric.
@@ -583,26 +777,43 @@ async function main(): Promise<void> {
       if (filled === null) { r.skipped = `needs ${missingVars(c, VARS).join(", ")}`; continue; }
       const turns = filled.turns;
       for (let k = 0; k < K; k++) {
+        if (MODE === "assistant") {
+          try { await paceSays(stream!, priorSays); } catch (err) { if (err instanceof Interrupted) break cases; throw err; }
+        }
         let a: Attempt;
+        const caseStart = Date.now();
         try {
           a = MODE === "assistant" ? await runAssistant(filled, turns, sessionId, stream!) : await runBaseline(filled, turns);
         } catch (err) {
           a = { pass: false, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: null, finalMs: null, items: [], error: scrub(err instanceof Error ? err.message : String(err)) };
         }
+        // A say the server refused for its hourly cap is the run's failure, not the assistant's.
+        const refused = MODE === "assistant" && !a.error ? capRefusedSays(stream!.events, caseStart) : 0;
+        if (refused) a = { ...a, pass: false, error: `infra: ${refused} say(s) refused by the hourly cap (say_rate_limited)` };
+        if (MODE === "assistant") writeSayLog(sayLog, mergeSays([priorSays, countedSays(stream!.events)], Date.now()));
         r.attempts.push(a);
         const failed = a.checks.filter((x) => !x.pass).map((x) => x.name);
         log(`${a.error ? "ERROR" : a.pass ? "pass" : "FAIL"} ${c.id}#${k + 1} route=${a.route ?? "-"} cards=${a.cards ?? "-"} first=${a.firstReplyMs}ms final=${a.finalMs}ms ${a.error ?? failed.join("; ")}`);
+        if (stopSignal) break cases;
       }
     }
+    if (stopSignal) cleanupFailed.push(`the run was stopped by ${stopSignal} before its cases finished`);
   } catch (err) {
     log(`run stopped: ${err instanceof Error ? err.message : String(err)}`);
     cleanupFailed.push("the run stopped before its cases finished");
   } finally {
-    stream?.close();
     // Whatever happened, nothing the run started stays open; what could not be closed fails the run.
     if (MODE === "assistant") {
       try {
-        for (const i of (await board()).filter((x) => RUN_ITEMS.has(x.item_id) && x.board_state !== "done")) log(`closing #${i.seq}: ${await close(i)}`);
+        if (stream) {
+          // A turn already asked for may still start an item: let the run's turns end (a minute at most) and take every item
+          // their calls answered for as the run's, whatever stopped the run.
+          await turnsOver(sessionId, (stored) => RUN_MESSAGES.every((id) => stored.includes(id)),
+            () => RUN_MESSAGES.every((id) => turnEnded(stream!.events, id)), Date.now() + Math.min(60_000, turnWaitMs(true)), until);
+          const above = (await board()).filter((x) => x.seq > floorAtStart);
+          for (const i of itemsStartedBy(turnCalls(stream.events, RUN_MESSAGES), above)) RUN_ITEMS.add(i.item_id);
+        }
+        for (const i of (await board()).filter((x) => RUN_ITEMS.has(x.item_id) && !CLEARED.has(x.item_id))) log(`closing #${i.seq}: ${await closeItem(i)}`);
         await sleep(5_000);
         const after = (await board()).filter((x) => x.seq > floorAtStart && x.board_state !== "done");
         leftOpen = after.filter((x) => RUN_ITEMS.has(x.item_id)).map((x) => x.seq);
@@ -615,14 +826,16 @@ async function main(): Promise<void> {
       }
       log(`items created by the run that are still open: ${leftOpen.length ? leftOpen.join(",") : "none"}`);
       if (leftOpen.length) cleanupFailed.push(`items still open: ${leftOpen.join(",")}`);
+      if (stream) writeSayLog(sayLog, mergeSays([priorSays, countedSays(stream.events)], Date.now()));
+      stream?.close();
       if (createdAssistant) {
-        const gone = await until(async () => ((await api("DELETE", `/v1/sessions/${sessionId}`).catch(() => ({ status: 0 }))).status === 200 ? true : undefined), Date.now() + 60_000, 10_000);
+        const gone = await deleteOwn(sessionId);
         log(gone ? "deleted the assistant session the run created" : `could not delete the assistant session ${sessionId} the run created`);
         if (!gone) cleanupFailed.push("the assistant session the run created was not deleted");
       }
     }
   }
-  if (sessionsLeft.length) cleanupFailed.push(`baseline sessions not deleted: ${sessionsLeft.join(",")}`);
+  if (sessionsLeft.length) cleanupFailed.push(`sessions the run made not deleted: ${sessionsLeft.join(",")}`);
   cleanupFailed = cleanupFailed.map(scrub);
   if (RECORD_DIR) {
     mkdirSync(RECORD_DIR, { recursive: true });
