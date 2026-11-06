@@ -21,6 +21,7 @@ import pino from "pino";
 import { db } from "../infra/db.js";
 import { detectLanguage } from "./language.js";
 import { SAY_TEXT_MAX, recordAssistantSay, recordSystemNotice, SayRefused, type SayDeps } from "./outbound.js";
+import { internalTextIn, userWordsOf } from "./internal-text.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 
 const logger = pino({ name: "assistant-router-turn-end" });
@@ -94,8 +95,16 @@ export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}
   )).rows as Array<{ began: Date; prompt: string }>;
   if (!runs.length) return "skipped";
   const prompts = runs.map((r) => r.prompt);
-  const text = lost ? turnLostNotice(prompts) : answerToDeliver(end.finalText, prompts);
+  let text = lost ? turnLostNotice(prompts) : answerToDeliver(end.finalText, prompts);
   if (!text) return "skipped";
+  // The router's own words with internal text in them (a tool name, an item_id, ...): never shown. The turn is answered with
+  // the system's notice instead, as one that said nothing is (`say` would have refused the same text).
+  const leaked = !lost && internalTextIn(text, userWordsOf(prompts));
+  if (leaked) {
+    logger.warn({ sessionId: end.sessionId, runIds: end.runIds, leaked }, "assistant.unsaid_answer_withheld");
+    text = turnLostNotice(prompts);
+    if (!text) return "skipped";
+  }
   const began = new Date(Math.min(...runs.map((r) => new Date(r.began).getTime())));
   // The system's own messages are not the model's, so they do not count as the turn having spoken.
   const spoke = await db.query(
@@ -103,7 +112,7 @@ export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}
     [router.user_id, began],
   );
   if (spoke.rowCount) return "skipped";
-  if (lost) {
+  if (lost || leaked) {
     // Once per turn: a redelivered completion finds the notice it stored.
     const stored = await recordSystemNotice({
       userId: router.user_id, sessionId: end.sessionId, text, key: `turn_lost:${[...end.runIds].sort().join(",")}`,

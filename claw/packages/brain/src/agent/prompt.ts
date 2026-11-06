@@ -113,20 +113,17 @@ export function buildProgressiveSkillHint(skills: ProgressiveSkill[], sessionDir
   return hint;
 }
 
-export function buildPrompt(
-  userPrompt: string,
+/**
+ * The skill and MCP server hints of a turn: the inlined SKILL.md bodies, the on-demand skill list and the server names. Where they go is
+ * the caller's (`buildPrompt` puts them after the user's message; with `SKILL_HINTS_IN_SYSTEM` the engine puts them in the system message).
+ */
+export function buildSkillAndMcpHints(
   skillContents: Record<string, string>,
   mcpServerNames: string[],
-  model = "",
   sessionDir = "",
-  pluginRulesFromMessage = "",
-  sessionContext?: { sessionId: string; userId: string; parentSessionId?: string; teamRole?: string },
   progressiveSkills: ProgressiveSkill[] = [],
-  /** The bound repository's block (see workspace/repo-binding.ts); "" for a session with none. */
-  repoBlock = "",
-  /** Whether the run has the `load_skill` tool (see buildProgressiveSkillHint); false when its `tools_allowlist` leaves it out. */
   loadSkill = true,
-): string {
+): { skillHint: string; mcpHint: string } {
   let skillHint = "";
   const skillNames = Object.keys(skillContents);
   if (skillNames.length) {
@@ -154,6 +151,34 @@ export function buildPrompt(
   if (mcpServerNames.length) {
     mcpHint = `\n- Available MCP servers: ${mcpServerNames.join(", ")}. Use these tools when relevant.`;
   }
+  return { skillHint, mcpHint };
+}
+
+/** The hints as one block for the system message (`SKILL_HINTS_IN_SYSTEM`); "" when there are none. */
+export function renderSystemHints(hints: { skillHint: string; mcpHint: string }): string {
+  const body = [hints.skillHint, hints.mcpHint].map((h) => h.replace(/^\n+/, "")).filter(Boolean).join("\n");
+  return body ? `[Skills and tools]\n${body}` : "";
+}
+
+export function buildPrompt(
+  userPrompt: string,
+  skillContents: Record<string, string>,
+  mcpServerNames: string[],
+  model = "",
+  sessionDir = "",
+  pluginRulesFromMessage = "",
+  sessionContext?: { sessionId: string; userId: string; parentSessionId?: string; teamRole?: string },
+  progressiveSkills: ProgressiveSkill[] = [],
+  /** The bound repository's block (see workspace/repo-binding.ts); "" for a session with none. */
+  repoBlock = "",
+  /** Whether the run has the `load_skill` tool (see buildProgressiveSkillHint); false when its `tools_allowlist` leaves it out. */
+  loadSkill = true,
+  /** The hints are in the system message (`SKILL_HINTS_IN_SYSTEM`): none of them here. */
+  hintsInSystem = false,
+): string {
+  const { skillHint, mcpHint } = hintsInSystem
+    ? { skillHint: "", mcpHint: "" }
+    : buildSkillAndMcpHints(skillContents, mcpServerNames, sessionDir, progressiveSkills, loadSkill);
 
   // Skip preamble/policy injection for very long user inputs (saves tokens),
   // but ALWAYS append skill/mcp hints — losing them silently disabled the

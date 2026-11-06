@@ -22,6 +22,7 @@ import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
 import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, SayRefused, type SayDeps } from "./outbound.js";
+import { internalTextIn, userWordsOf } from "./internal-text.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 import { assistantPluginId } from "./read-tools.js";
 import { requestedItemOf, requesterViewOf, type RequesterView } from "./requester-view.js";
@@ -130,12 +131,10 @@ async function assistantUser(sessionId: string): Promise<string> {
 
 // --- Router ---------------------------------------------------------------------------
 
-/**
- * The item whose answer woke this router turn (`formatWorkEvent` with kind `answer`), or undefined. A say in that turn that names no
- * item is about it: recorded so, it is the say the silent sweep looks for, and the answer is not announced a second time.
- */
-async function answerItemOfTurn(taskId: string): Promise<string | undefined> {
-  const prompt = (await db.query("SELECT prompt FROM claw_tasks WHERE task_id = $1", [taskId])).rows[0]?.prompt as string | undefined;
+export { internalTextIn } from "./internal-text.js";
+
+/** The item whose answer woke this router turn (`formatWorkEvent` with kind `answer`) in its prompt, or undefined. */
+function answerItemOf(prompt: string | null | undefined): string | undefined {
   return prompt?.match(ANSWER_EVENT_RE)?.[1];
 }
 const ANSWER_EVENT_RE = new RegExp(`^${WORK_EVENT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} #\\d+ \\(item_id: (kwi_[0-9A-Za-z]+)\\) answer:`);
@@ -145,7 +144,20 @@ export async function say(
 ): Promise<{ ok: true; say_id: string; subscribers: number }> {
   requireRole(claims, "router");
   const userId = await assistantUser(claims.sid);
-  const itemId = args.item_id?.trim() ? args.item_id : await answerItemOfTurn(claims.task_id);
+  const run = (await db.query("SELECT prompt FROM claw_tasks WHERE task_id = $1", [claims.task_id])).rows[0] as { prompt: string | null } | undefined;
+  // Refused, not cleaned: the router rewrites it in the user's words, which a filter cannot do for it.
+  if (typeof args.text === "string") {
+    const found = internalTextIn(args.text, userWordsOf([run?.prompt ?? ""]));
+    if (found) {
+      throw new ToolRefused(
+        "internal_text",
+        `the message shows the user ${found}, which is internal. Name a work item as its number and title (#12 修复登录超时), leave out tool names, ids and markers, and call say again`,
+      );
+    }
+  }
+  // A say in the turn an answer woke that names no item is about that item: recorded so, it is the say the silent sweep looks
+  // for, and the answer is not announced a second time.
+  const itemId = args.item_id?.trim() ? args.item_id : answerItemOf(run?.prompt);
   try {
     const out = await recordAssistantSay({
       userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid,

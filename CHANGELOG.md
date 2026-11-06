@@ -520,6 +520,14 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- Assistant: the router's `say` refuses a message that shows the user internal text (a tool name, the `[work_event]` marker,
+  an `item_id`, a run id, or an id of the UUID form the user did not write in the message the turn answers) with
+  `internal_text`, and the router is told to name an item by its number and title (`router-v7`); a turn that ends in plain text
+  with such text in it is answered with the system's notice instead of that text. A run's `tool_stats` (on
+  `executionStats` and the run row) carries `first_ok_ms` / `last_ok_ms`: per tool, when its first and last good call ended, in
+  ms from the start of the run's loop; an assistant turn's first and last `say` and whether it called `work_create` are read
+  from there. Brain's new `SKILL_HINTS_IN_SYSTEM` (default off) puts a turn's skill and MCP server hints in the system message
+  instead of after the user's message.
 - Assistant: the router answers a question itself when a read-only tool can. With `CLAW_ASSISTANT_PLUGIN_ID` set (new; default 0,
   none), a router turn is given that plugin's MCP servers listed in
   `claw/packages/api/src/assistant/read-tools.ts`, cut to their read tools by name (`tools_allowlist`), and no skill, rule or write

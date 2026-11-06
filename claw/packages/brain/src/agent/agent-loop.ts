@@ -271,6 +271,13 @@ export interface ToolStats {
   by_tool: Record<string, number>;
   /** Calls of each tool that came back without an error; see toolOkByName. */
   by_tool_ok?: Record<string, number>;
+  /**
+   * Of each tool that came back without an error, when its first and its last such call ended, in ms from the start of the run's
+   * loop. What latency a person sees is read from these (an assistant's first and last `say`), the same numbers in an evaluation
+   * and in production. Calls of this process only: a run resumed from a checkpoint reports the calls made since.
+   */
+  first_ok_ms?: Record<string, number>;
+  last_ok_ms?: Record<string, number>;
 }
 
 export interface LoopResult {
@@ -820,6 +827,9 @@ class AgentLoopRunner {
    * text can be made to imply.
    */
   private toolOkByName: Record<string, number>;
+  /** See ToolStats.first_ok_ms / last_ok_ms. */
+  private readonly toolFirstOkMs: Record<string, number> = {};
+  private readonly toolLastOkMs: Record<string, number> = {};
   private totalToolCalls: number;
   /**
    * Tools this process has BEGUN, counted before anything can await.
@@ -1093,6 +1103,7 @@ class AgentLoopRunner {
       toolStats: {
         total_calls: this.totalToolCalls, error_calls: this.errorCount,
         by_tool: this.toolCallsByName, by_tool_ok: this.toolOkByName,
+        first_ok_ms: this.toolFirstOkMs, last_ok_ms: this.toolLastOkMs,
       },
       elapsedMs: Date.now() - this.startTime,
     };
@@ -2268,6 +2279,8 @@ class AgentLoopRunner {
       const toolStart = Date.now();
       let resultText: string;
       let toolOutcome: RouteOutcome = { isError: false };
+      /** When the tool returned, from the start of the loop: what `first_ok_ms` / `last_ok_ms` report, not when its hooks finished. */
+      let returnedAt = 0;
       try {
       // `wait` blocks on a background command finishing, which is the run
       // sitting still rather than working -- the case the whole waiting/
@@ -2290,6 +2303,7 @@ class AgentLoopRunner {
             this.router.route(toolName, finalInput, this.signal, outcome, stepCtx))
         : await this.router.route(toolName, finalInput, this.signal, outcome, stepCtx);
       toolOutcome = outcome;
+      returnedAt = Date.now() - this.startTime;
       if (outcome.images?.length) this.imagesByToolId.set(toolId, outcome.images);
         // A sandbox tool that answered is the only evidence the sandbox is up,
         // so it is the only thing that clears the count -- even if the result
@@ -2379,6 +2393,8 @@ class AgentLoopRunner {
       // prefix match counts every one it did not anticipate as a success.
       if (!toolOutcome.isError) {
         this.toolOkByName[toolName] = (this.toolOkByName[toolName] || 0) + 1;
+        this.toolFirstOkMs[toolName] = Math.min(this.toolFirstOkMs[toolName] ?? returnedAt, returnedAt);
+        this.toolLastOkMs[toolName] = Math.max(this.toolLastOkMs[toolName] ?? returnedAt, returnedAt);
       }
     await this.onEvent({
         type: "toolUsed", tool: toolName, actionId: toolId, status: "success",

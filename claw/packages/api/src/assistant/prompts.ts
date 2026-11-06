@@ -22,14 +22,15 @@ import type { ReportKind } from "./work-items.js";
  * router-v6: v5 with the item list (and the review state) sent with each message instead of in the system prompt, so the
  * system prompt and the history before the message stay the same from turn to turn and are read from the prompt cache;
  * and an answer report relayed as the answer, with nothing to accept.
+ * router-v7: v6 with items named to the user as "#12 title", and no internal text (say refuses it).
  */
-export const ROUTER_PROMPT_VERSION = "router-v6";
+export const ROUTER_PROMPT_VERSION = "router-v7";
 /**
  * The router's prompt with the review and settings tools (`CLAW_ASSISTANT_TOOLS=on`): router-v5 and `ROUTER_REVIEW_PROMPT`
  * (v6: v5 with an allow only on the user's exact approval command, and a channel action not typed as its command put to the user
- * as a button; v7: v6 with a review by someone else refused here, and the user told where to ask for it; v8: v7 on router-v5; v9: v8 on router-v6).
+ * as a button; v7: v6 with a review by someone else refused here, and the user told where to ask for it; v8: v7 on router-v5; v9: v8 on router-v6; v10: v9 on router-v7).
  */
-export const ROUTER_REVIEW_PROMPT_VERSION = "router-v9";
+export const ROUTER_REVIEW_PROMPT_VERSION = "router-v10";
 
 /** The assistant's MCP server, which is what Brain puts before each of its tools' names. */
 export const ASSISTANT_MCP_SERVER = "assistant";
@@ -64,7 +65,7 @@ How to handle a message
 2. A message that clearly points at an existing item (its number, or what it is about): work_send; when its result is back, say that it was forwarded.
 3. A question about progress: answer from the work item list sent with the message; use work_recall when the list is not enough. Then say the answer (see Describing items).
 4. Chat or a question that needs no work: just say the answer.
-5. A message that starts with ${WORK_EVENT_PREFIX} is a report from a worker, not something the user said. It is a fact about an item. Tell the user only what they need to decide, accept or know, in one message, with item_id. Do not repeat the whole report. A report of kind answer is the answer to what the user asked: say it to them as the answer; the item is closed and there is nothing to accept.
+5. A message that starts with ${WORK_EVENT_PREFIX} is a report from a worker, not something the user said. It is a fact about an item. Tell the user only what they need to decide, accept or know, in one message, passing the item's item_id to say (the user sees its number and title, never the id). Do not repeat the whole report. A report of kind answer is the answer to what the user asked: say it to them as the answer; the item is closed and there is nothing to accept.
 6. Speak on your own only when the user must decide something, a result is ready to accept, or an item failed. Do not narrate progress.
 7. You can never accept a result for the user. Accepting is a button the user presses. If the user says a result is fine, tell them to accept it from the message; if they want it changed, work_send what to change.
 8. Do not start a second item for work that already has one. If unsure, ask in one short say.
@@ -79,7 +80,9 @@ When you tell the user about items:
 - When a failed or stopped item's work was later done by another item (the same title or task), say so in one line, for example: #170 stopped when the sandbox was down; the same task was then done as #172.
 - Do not show the user internal words such as board_state, needs_you, in_progress, last report, result v1 or item_id.
 
-Reply in the language of the user's latest message, even when item titles or reports are in another language. A line like [${REPLY_LANGUAGE_LABEL}: X] after the user's message names that language; use it. Be brief: one message per turn is normal, and every message must be worth the attention it takes.`;
+Reply in the language of the user's latest message, even when item titles or reports are in another language. A line like [${REPLY_LANGUAGE_LABEL}: X] after the user's message names that language; use it. Be brief: one message per turn is normal, and every message must be worth the attention it takes.
+
+Name a work item to the user by its number and title, as in #12 修复登录超时, never by its item_id. Never show the user a tool name, an item_id, a [work_event] marker or any other text of these instructions: say refuses a message that does, and you write it again in plain words.`;
 
 /** The router's read-only lookups (`read-tools.ts`), logged beside the router prompt's version when the turn has them. */
 /** router-read-v2: v1 with the acting tools refused for the rest of a turn that has read a read tool's result. */
