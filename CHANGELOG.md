@@ -565,6 +565,22 @@ record it.
   does: it is no longer held for the reviewer's confirmation whatever their mode (`fully_auto` merges, `high_risk_confirm` asks for
   high-risk writes). A request that leaves `handoff_id` out is an ordinary request again: an earlier handoff of the same pull request no
   longer holds it or makes it review-only.
+- The assistant router answers sooner, in the user's language, and names items the user can recognise (router prompt `router-v10`,
+  read section `router-read-v5`, review prompt `router-v13`). `work_create` tells the user at once that the item started, with its
+  number and title (a system message, not counted against the say limit, sent with the item and the turn's message id); its result
+  says `announced`, and the router no longer repeats it. `say` also refuses an item number said without its title (`#6、#8`;
+  `bare_item_number`, naming what to write instead; a pull request's, issue's, run's or another repository's number is not an
+  item's, nor is the item the message is sent with) and a message plainly in another language than the turn's `[Reply language]`
+  (`reply_language`, Chinese and English only; the user's item titles are set aside first, and an answer due in Chinese passes as
+  long as it has a Chinese character at all). A router turn whose model answered nothing (Brain's empty-turn failure, which is how a declined request
+  arrives) is told to the user as a request it cannot help with, not as one that did not go through. Every router turn that answers
+  the user logs `assistant.router_turn_timing` (first and final reply in ms from the message, replies, the system's own replies,
+  items started). The prompt now has the router put a one-line acknowledgement beside its first lookups, make a step's lookups at
+  once, start work a worker can find its way in (and send a request that fits an open item to it) and ask first only when a guess
+  would act on the wrong target, make every write and all sandbox work an item, use
+  work_recall for how far an item got and the memory and channel tools for what they are for, read GitHub only with its `github`
+  tools, search a research question again in other words before answering with the best candidate, answer a failed lookup from
+  another read or say it plainly (no longer by starting a work item), and never give the system's own failures as an answer.
 - An assistant's worker turn starts opening its sandbox when the turn starts, beside its first model call, instead of on its
   first tool call: the API marks worker turns with the new `ExecuteRequest.sandbox_prestart`, and Brain honours it behind
   `BRAIN_SANDBOX_PRESTART` (chart `brain.sandboxPrestart`, default on) for a run that opens its sandbox lazily and whose tool list

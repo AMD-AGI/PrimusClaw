@@ -129,7 +129,10 @@ describe("assistant router lookups", { skip }, () => {
     assert.match(system, /- The web: web_search for current facts and news, web_fetch to read one page/);
     assert.match(system, /call them now, in this turn, and say the answer with the numbers/);
     assert.match(system, /never ask whether to hand it to a worker first/);
-    assert.match(system, /If a GitHub or web lookup fails \(an error, not an empty answer\), call work_create in the same turn/);
+    // A failed lookup is answered by another read, or said plainly: a question is not made into a work item (router-read-v5).
+    assert.match(system, /If a lookup fails \(an error, not an empty answer\), answer from another read that gives the same \(a list tool when a search is refused/);
+    assert.match(system, /a question is not turned into a work item because a lookup failed/);
+    assert.ok(!/call work_create in the same turn with the question/.test(system), "a failed lookup no longer starts an item");
     assert.match(system, /a GitHub or web lookup that failed does not count; a failed lookup of the servers above does/);
   });
 

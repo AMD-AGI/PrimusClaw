@@ -73,7 +73,7 @@ describe("assistant model choice, off", { skip }, () => {
     assert.equal(tools.review_start.inputSchema.shape.model.description, "Only when the user named a model.");
     const turn = await w.routerTurn(alice);
     const created = await w.mod.tools.workCreate(turn, { title: "t", brief: "b", model: "claude-opus-5.5" } as never);
-    assert.deepEqual(Object.keys(created).sort(), ["deduplicated", "item_id", "ok", "seq"], "the answer is the one it always was");
+    assert.deepEqual(Object.keys(created).sort(), ["announced", "deduplicated", "item_id", "ok", "seq"], "the answer is the one it always was, and whether the user was told it started");
     const item = await w.item(created.item_id);
     assert.deepEqual(item.params, {});
     assert.equal((await w.q("SELECT model FROM claw_sessions WHERE session_id = $1", [item.worker_session_id]))[0].model, "claude-sonnet-5.5");

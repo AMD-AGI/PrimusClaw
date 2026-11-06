@@ -16,15 +16,18 @@ import { randomUUID } from "node:crypto";
 import { parseSessionRepo } from "@claw/protocol";
 import { readTrustedSessionCredentials, sealedCredentialFields } from "../auth/sealed-session-credentials.js";
 import { CLAW_ASSISTANT_WORKER_MODEL, CLAW_DEPLOY_MODE } from "../config.js";
+import pino from "pino";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
 import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
-import { recordAssistantSay, SayOutcomeUnknown, SayRefused, type SayDeps } from "./outbound.js";
+import { recordAssistantSay, recordSystemNotice, SayOutcomeUnknown, SayRefused, type SayDeps } from "./outbound.js";
 import { saySources, SAY_SOURCE_OUTCOMES } from "./citations.js";
 import { metrics } from "../infra/metrics.js";
-import { internalTextIn, userWordsOf } from "./internal-text.js";
+import { bareItemNumbers, internalTextIn, userWordsOf } from "./internal-text.js";
+import { parseItemRef } from "./item-ref.js";
+import { detectLanguage, languageToAnswerIn, replyLanguageLine, replyLanguageMismatch } from "./language.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 import { assistantPluginId } from "./read-tools.js";
 import { requestedItemOf, requesterViewOf, type RequesterView } from "./requester-view.js";
@@ -39,6 +42,8 @@ import {
   clipOneLine, getWorkItem, insertWorkItem, recentEvents, reopenWorkItem, resolveWorkItem, resolveWorkItemNow, stopWorkItem,
   TITLE_MAX, type ItemLookup, type ResolvedItem,
 } from "./work-items.js";
+
+const logger = pino({ name: "assistant-tools" });
 
 /** A refusal written for the model to read and act on. Anything else thrown is a fault, not an answer. */
 export class ToolRefused extends Error {
@@ -141,6 +146,55 @@ function answerItemOf(prompt: string | null | undefined): string | undefined {
 }
 const ANSWER_EVENT_RE = new RegExp(`^${WORK_EVENT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} #\\d+ \\(item_id: (kwi_[0-9A-Za-z]+)\\) answer:`);
 
+/** How many of the user's items, newest first, a say is checked against for numbers said without their titles. */
+const SAY_ITEMS_CHECKED = 500;
+/** How many of the user's earlier messages say which language they write in, when the one a turn answers does not (as `role-profile.ts`). */
+const LANGUAGE_LOOKBACK = 5;
+
+/**
+ * The language a router turn answers in: the one `role-profile.ts` put beside its message as `[Reply language: X]`, worked out the same
+ * way from the same words (the message the turn answers, else the user's earlier messages, newest first). Null when it cannot be told.
+ */
+export async function turnReplyLanguage(sessionId: string, prompt: string): Promise<string | null> {
+  return languageToAnswerIn(prompt.startsWith(WORK_EVENT_PREFIX) ? null : prompt, async () => (await db.query(
+    `SELECT content FROM claw_conversation_turns
+      WHERE session_id = $1 AND role = 'user' AND deleted_at IS NULL AND NOT starts_with(content, $2)
+      ORDER BY turn_index DESC LIMIT $3`,
+    [sessionId, WORK_EVENT_PREFIX, LANGUAGE_LOOKBACK],
+  )).rows.map((r: { content: string }) => r.content));
+}
+
+/**
+ * What `say` refuses besides internal text, so the router writes it again: an item named by its number alone (`#6、#8`), and a message
+ * plainly in another language than the one the turn answers in. Both are what the user cannot use, and both were common (2026-11-06
+ * baseline: 55 and 18 cases), and the router rewrites them in one more step when told exactly what to write.
+ */
+async function assertSayReadable(
+  claims: AssistantTokenClaims, userId: string, prompt: string, text: string, itemRef: string | undefined,
+): Promise<void> {
+  const items = (await db.query(
+    "SELECT item_id, seq, title FROM claw_work_items WHERE user_id = $1 ORDER BY seq DESC LIMIT $2", [userId, SAY_ITEMS_CHECKED],
+  )).rows as Array<{ item_id: string; seq: number; title: string }>;
+  const ref = itemRef ? parseItemRef(itemRef) : null;
+  const sentWith = ref?.ok ? (ref.ref.by === "seq" ? ref.ref.seq : items.find((i) => i.item_id === (ref.ref as { itemId: string }).itemId)?.seq) : undefined;
+  const bare = bareItemNumbers(text, items, sentWith ?? null);
+  if (bare.length) {
+    const named = bare.slice(0, 5).map((i) => `#${i.seq} ${i.title}`).join(", ");
+    throw new ToolRefused(
+      "bare_item_number",
+      `the message names ${bare.map((i) => `#${i.seq}`).join(", ")} by number alone, which the user cannot recognise: write each item as its number and title (${named}) and call say again`,
+    );
+  }
+  const expected = await turnReplyLanguage(claims.sid, prompt);
+  const found = expected ? replyLanguageMismatch(text, expected, items.map((i) => i.title)) : null;
+  if (expected && found) {
+    throw new ToolRefused(
+      "reply_language",
+      `the message is in ${found}, but this user is answered in ${expected} (${replyLanguageLine(expected)}): write it in ${expected} (names, titles, code and quotes may stay as they are) and call say again`,
+    );
+  }
+}
+
 /**
  * `meta`: the MCP request's `_meta`, where Brain puts the sources the message cites (`citations.ts`); the model's own `sources`
  * argument is never read.
@@ -164,6 +218,7 @@ export async function say(
   // A say in the turn an answer woke that names no item is about that item: recorded so, it is the say the silent sweep looks
   // for, and the answer is not announced a second time.
   const itemId = args.item_id?.trim() ? args.item_id : answerItemOf(run?.prompt);
+  if (typeof args.text === "string") await assertSayReadable(claims, userId, run?.prompt ?? "", args.text, itemId);
   const cited = meta === undefined ? null : saySources(meta, typeof args.text === "string" ? args.text.trim() : "");
   if (cited) for (const outcome of SAY_SOURCE_OUTCOMES) metrics.onAssistantSaySources(outcome, cited.counts[outcome]);
   try {
@@ -220,9 +275,42 @@ function modelArg(raw: unknown): string | undefined {
   return raw.trim();
 }
 
+/** What the user is told the moment an item they asked for has started, in the system's words (`announceStarted`). */
+export function startedNotice(item: { seq: number; title: string }, language: string | null): string {
+  return language === "Chinese"
+    ? `已开始：#${item.seq} ${item.title}。有结果或需要你时我会告诉你。`
+    : `Started #${item.seq} ${item.title}. I'll tell you when it is done or needs you.`;
+}
+
+/**
+ * Tell the user at once that the item their message asked for has started, before the router's model writes another word: the
+ * first thing a user heard used to wait for the router to write the item's whole brief and then its own line (2026-11-06 baseline:
+ * first reply p90 8.3 s). Only in a turn that answers the user (a worker's report starts nothing the user asked for), once per item
+ * (`recordSystemNotice`'s key), and as the system's own message, so it is not counted against the say limit and the router still
+ * says what this does not (a model that fell back, a question). Best effort: the item is started whether or not this is heard,
+ * and the router is told which (`announced`).
+ */
+async function announceStarted(
+  claims: AssistantTokenClaims, userId: string, item: { seq: number; title: string; itemId: string }, deps: SayDeps,
+): Promise<boolean> {
+  try {
+    const prompt = ((await db.query("SELECT prompt FROM claw_tasks WHERE task_id = $1", [claims.task_id])).rows[0]?.prompt as string | null) ?? "";
+    if (!prompt.trim() || prompt.startsWith(WORK_EVENT_PREFIX)) return false;
+    const language = (await turnReplyLanguage(claims.sid, prompt)) ?? detectLanguage(prompt);
+    const stored = await recordSystemNotice({
+      userId, sessionId: claims.sid, text: startedNotice(item, language), key: `work_started:${item.itemId}`,
+      itemId: item.itemId, turnMessageId: claims.mid,
+    }, deps);
+    return stored !== null;
+  } catch (err) {
+    logger.warn({ err, sid: claims.sid, itemId: item.itemId }, "assistant.work_started_notice_failed");
+    return false;
+  }
+}
+
 export async function workCreate(
-  claims: AssistantTokenClaims, args: { title: string; brief: string; repo?: unknown; model?: string },
-): Promise<{ ok: true; item_id: string; seq: number; deduplicated: boolean; model?: string | null; fell_back_from?: string }> {
+  claims: AssistantTokenClaims, args: { title: string; brief: string; repo?: unknown; model?: string }, deps: SayDeps = {},
+): Promise<{ ok: true; item_id: string; seq: number; deduplicated: boolean; announced: boolean; model?: string | null; fell_back_from?: string }> {
   requireRole(claims, "router");
   const title = clipOneLine(args.title, TITLE_MAX);
   const brief = args.brief.trim();
@@ -290,8 +378,9 @@ export async function workCreate(
   });
   // The row is the commitment; running it is only the drain, which the sweeper repeats if this is lost.
   if (created.workerSessionId) await drainSessionIfIdle(created.workerSessionId, created.userId);
+  const announced = created.workerSessionId ? await announceStarted(claims, created.userId, { seq: created.seq, title, itemId: created.itemId }, deps) : false;
   return {
-    ok: true, item_id: created.itemId, seq: created.seq, deduplicated: created.workerSessionId === null,
+    ok: true, item_id: created.itemId, seq: created.seq, deduplicated: created.workerSessionId === null, announced,
     // A replayed call names the item made the first time, whose model was decided then.
     ...(choice && created.workerSessionId ? modelAnswer(choice) : {}),
   };
