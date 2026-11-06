@@ -513,6 +513,10 @@ export async function jobUnwatch(claims: AssistantTokenClaims, args: { watch_id?
   if (!Number.isSafeInteger(id) || id <= 0) throw new ToolRefused("invalid_arguments", "watch_id is the number job_watch_list shows");
   const row = await inTransaction(async (tx) => {
     const { userId } = await assertLiveRun(tx, claims);
+    // Ending a watch the user asked for is theirs to say: a turn that has read text others wrote (a job's state, a brief) cannot.
+    if ((await turnMessage(tx, claims.sid, claims.mid))?.readUntrusted) {
+      throw new ToolRefused("read_untrusted", "this turn has read text others wrote (a job's state, the brief), so it cannot end a watch: ask the user to say it in a new message");
+    }
     return (await tx(
       `UPDATE claw_assistant_job_watches SET state = 'ended', end_reason = 'user', ended_at = NOW()
         WHERE id = $1 AND user_id = $2 AND state = 'active' RETURNING *`,

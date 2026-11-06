@@ -285,6 +285,9 @@ describe("assistant job watches", { skip }, () => {
     const listing = await userTurn(alice, "我在盯哪些作业");
     await jw.jobWatchList(listing);
     assert.equal(await untrusted(listing), true);
+    // And that turn cannot end the watch, whatever the state told it; a new message from the user can.
+    assert.equal(await code(jw.jobUnwatch(listing, { watch_id: String(out.watch_id) })), "read_untrusted");
+    assert.equal((await watchOf(out.watch_id)).state, "active");
     assert.deepEqual(gets, [{ url, key: "pk-alice" }], "the id is URL-encoded into the URL, read with the user's own key");
     assert.equal(reads.length, 0, "SaFE is not asked about it");
     const watch = await watchOf(out.watch_id);
