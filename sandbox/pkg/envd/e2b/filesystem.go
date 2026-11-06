@@ -64,11 +64,17 @@ func createTemp(dir, prefix string, perm os.FileMode) (*os.File, error) {
 
 // files serves the E2B filesystem API for one request.
 //
-// An unsealed request has the same reach as the commands the sandbox runs:
-// envd's file calls run under the uid its commands get, and a command can
-// already read or write any path that uid can. So it is served with E2B's
-// semantics: an absolute path is that path, and a relative one is taken from
-// the workspace, the directory commands start in. files.write("/tmp/x") then
+// An unsealed request has the reach of the commands the sandbox runs: envd's
+// file calls run under the uid its commands get, and a command can already
+// read or write any path that uid can. The one credential envd holds that its
+// commands do not is egress.EnvDProxyGID, an iptables marker group no file is
+// meant to carry; envd can only add it with CAP_SETGID, that is when it runs as
+// root, and its commands then run as root too, with the container's
+// CAP_DAC_OVERRIDE (envd drops only CAP_NET_ADMIN, CAP_NET_RAW and CAP_SETGID
+// from the bounding set), so the group opens nothing to the file API that a
+// command cannot open. So an unsealed request is served with E2B's semantics:
+// an absolute path is that path, and a relative one is taken from the
+// workspace, the directory commands start in. files.write("/tmp/x") then
 // writes the /tmp/x that commands.run("cat /tmp/x") reads.
 //
 // A sealed request (a granted sandbox whose Router token carries an allow-list)
