@@ -101,19 +101,33 @@ export function sourceTitle(raw: unknown, url: URL): string {
   return redact(cut) || url.host;
 }
 
-/** A markdown link, its label holding at most one level of brackets: `[[1]](address)` is a link, not a citation. */
-const MD_LINK = /\[(?:[^[\]\n]|\[[^[\]\n]*\])*\]\([^)\n]*\)/g;
+/** At a position: `[n]` that does not open a link (`[n](...)`). */
+const CITE_AT = /\[(\d{1,2})\](?!\()/y;
 /** A reference definition: `[1]: address` at a line's start makes every `[1]` a link. */
 const REF_DEFINITION = /^ {0,3}\[[^\]\n]+\]:/m;
 
 /**
- * The numbers the text cites as `[n]` on their own: not inside or as a link (`[n](...)`, `[[n]](...)`, `[a [n] b](...)`), and none
- * at all in a text with a reference definition (`[n]: address` makes `[n]` a link to it).
+ * The numbers the text cites as `[n]` on their own: outside every bracket (so never in a link's label, however deep or over however
+ * many lines: `[[[n]]](...)`, `[a [b [n]] c](...)`), not opening a link itself (`[n](...)`), and none at all in a text with a
+ * reference definition (`[n]: address` makes `[n]` a link). An escaped bracket is no bracket; an unclosed `[` leaves what follows
+ * it uncited.
  */
 export function citedNumbers(text: string): Set<number> {
   const out = new Set<number>();
   if (REF_DEFINITION.test(text)) return out;
-  for (const m of text.replace(MD_LINK, " ").matchAll(/\[(\d{1,2})\](?!\()/g)) out.add(Number(m[1]));
+  let depth = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text[i];
+    if (c === "\\") { i += 1; continue; }
+    if (c === "[") {
+      CITE_AT.lastIndex = i;
+      const m = depth === 0 ? CITE_AT.exec(text) : null;
+      if (m) { out.add(Number(m[1])); i += m[0].length - 1; continue; }
+      depth += 1;
+    } else if (c === "]") {
+      depth = Math.max(depth - 1, 0);
+    }
+  }
   return out;
 }
 

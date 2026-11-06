@@ -48,10 +48,12 @@ test("SC1 an entry is kept only when it is well formed and cited in the text; Br
   assert.deepEqual(saySources(undefined, text), { sources: [], counts: { cited: 0, dropped_not_in_turn: 0, dropped_invalid: 0, dropped_over_cap: 0, unreferenced: 0 } });
   assert.deepEqual(saySources({ [CITE_SOURCES_META]: "x", [CITE_DROPPED_META]: { not_in_turn: -3, invalid: "9" } }, text).counts.dropped_not_in_turn, 0);
   for (const linked of ["[[1]](https://evil.example/)", "see [a [1] b](https://evil.example/)", "see [1]\n\n[1]: https://evil.example/",
-    "see [1]\n   [x]: https://evil.example/", "[1](https://evil.example/)"]) {
+    "see [1]\n   [x]: https://evil.example/", "[1](https://evil.example/)", "[[[1]]](https://evil.example/)",
+    "[a [b [1] c] d](https://evil.example)", "[a\n[1]\nb](https://evil.example)", "![1](https://evil.example/x.png)", "see [the docs [1] and more"]) {
     assert.deepEqual([...citedNumbers(linked)], [], `a number that is or is in a link is no citation: ${linked}`);
   }
   assert.deepEqual([...citedNumbers("[[1]](https://evil.example/) and [2]")], [2], "a plain [2] beside a link is still cited");
+  assert.deepEqual([...citedNumbers("[1][2] and \\[3\\] after [x](https://y.example) [4]")], [1, 2, 4], "consecutive ones count; an escaped one does not");
   const sorted = saySources(meta([pr(2), pr(1)]), "[1] [2]").sources.map((s) => s.n);
   assert.deepEqual(sorted, [1, 2]);
 });
