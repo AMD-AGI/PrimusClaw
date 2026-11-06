@@ -30,6 +30,9 @@
  *   S4d only a message that is, whole, such a reply answers an earlier request ("确认下，请 Wei, Lei 帮我 review #304" is a request of its
  *       own); a reply offered to people who share a name carries a handle that tells them apart; a reply that picked nobody does not hide
  *       the request from the next one; the requester is never offered
+ *   S4e a message is read as a reply, or for a reviewer's name, only up to what such a message can be: a long one costs no more than
+ *       reading it (as the person's message, and as the earlier message a reply looks back to), names nobody, and everyone listed is
+ *       offered; the longest reply ever offered is still one
  *   S5  a model must be named by the user
  *   S6  what the review service refuses reaches the model as it said it, with its data
  *   S8  merge=true is never a merge: whatever the message says (a negation, a question, "yes merge it"), a start and a restart the router
@@ -633,6 +636,59 @@ describe("assistant review tools", { skip }, () => {
     const which3 = await refusal(nobody, { prs: ["AMD-AGI/PrimusClaw#307"], merge: false, reviewer: "u-weilei" });
     assert.deepEqual(which3.data?.candidates?.map((c: Recorded) => c.user_id), ["u-weilei"]);
     await w.closeRun(nobody.task_id);
+    assert.equal(calls.start.length, 0);
+  });
+
+  test("S4e a long message costs what reading it costs: none is read as a reply, nor for a name, past what a request can be", async () => {
+    await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
+    const ctx = (people: Recorded[]) => ({ ...DEFAULT_CTX, repos: [], people, handoffs: ["review_for_other"] });
+    const timed = async <T>(what: string, run: () => Promise<T> | T): Promise<T> => {
+      const t0 = performance.now();
+      const out = await run();
+      const ms = performance.now() - t0;
+      assert.ok(ms < 1000, `${what} took ${Math.round(ms)} ms`);
+      return out;
+    };
+    const refusal = async (turn: Claims, args: Recorded) => {
+      try { await rt.reviewStart(turn, args as never); } catch (err) { return err as { code: string; data?: Recorded }; }
+      return assert.fail("accepted");
+    };
+    const ask = { prs: ["AMD-AGI/PrimusClaw#304"], merge: false, reviewer: "u-weilei" };
+
+    // A message that starts like a reply and runs on, as the person's message and as the earlier one a reply looks back to.
+    const padded = await userTurn(alice, `确认 a${" ".repeat(100_000)}b`, { context: ctx([WEI]), agoSec: 60 });
+    assert.equal(await timed("the long message", () => code(rt.reviewStart(padded, ask))), "pr_not_in_message");
+    await w.closeRun(padded.task_id);
+    const reply = await userTurn(alice, "确认 Wei, Lei", { context: ctx([WEI]), agoSec: 30 });
+    assert.equal(await timed("a reply after it", () => code(rt.reviewStart(reply, ask))), "pr_not_in_message");
+    await w.closeRun(reply.task_id);
+
+    // One listed name written inside another's, many times over: longer than any request, so it names nobody, and everyone is offered.
+    const alexC = person("Alex Chen", "u-ac");
+    const alexCW = person("Alex Chen Wu", "u-acw");
+    const many = `Please Alex Chen Wu review PrimusClaw#304 ${"alex chen wu ".repeat(4000)}`;
+    assert.equal(await timed("reviewerNamed", () => rt.reviewerNamed(many, alexC, [alexC, alexCW])), false);
+    assert.equal(rt.reviewerNamed(many, alexCW, [alexC, alexCW]), false);
+    const manyTurn = await userTurn(alice, many, { context: ctx([alexC, alexCW]), agoSec: 20 });
+    const which = await timed("review_start", () => refusal(manyTurn, { ...ask, reviewer: "u-ac" }));
+    assert.equal(which.code, "reviewer_not_named");
+    assert.deepEqual(which.data?.candidates?.map((c: Recorded) => c.user_id), ["u-ac", "u-acw"]);
+    await w.closeRun(manyTurn.task_id);
+    // A request with a long paste after it still names its reviewer.
+    const pasted = `请 Wei, Lei 帮我 review PrimusClaw PR #304，背景：\n${"日志 line ".repeat(450)}`;
+    assert.ok(pasted.length > 3600);
+    assert.equal(rt.reviewerNamed(pasted, WEI, [WEI, ZHANG]), true);
+
+    // The longest reply ever offered, a name and a user id as long as the channel keeps them, is still taken as one.
+    const twins = inbound.parseChannelContext({
+      people: [{ name: "Lei ".repeat(100), user_id: "u".repeat(300) }, { name: "Lei ".repeat(100), user_id: "v".repeat(300) }],
+    }).people as Array<{ name: string; user_id: string }>;
+    for (const p of twins) {
+      const offered = rt.reviewerReply("please review PrimusClaw #304", p, twins);
+      assert.ok(offered.length > 400, `${offered.length}`);
+      assert.equal(rt.isReviewerReply(offered, twins), true, offered);
+      assert.equal(rt.isReviewerReply(offered, twins.filter((o) => o !== p)), false, "it is that person's reply alone");
+    }
     assert.equal(calls.start.length, 0);
   });
 

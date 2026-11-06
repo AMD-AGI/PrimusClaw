@@ -39,7 +39,9 @@ import { deterministicEventId, enqueue, kickDelivery } from "../notifications/ou
 import { recordActionConfirm } from "./outbound.js";
 import { confirmationRef } from "./prompts.js";
 import { REVIEW_HANDOFF_ACTION, type AssistantActionPayload, type AssistantReviewHandoff } from "../notifications/assistant-events.js";
-import { decidedViaOf, parseChannelContext, turnMessage, type AttendedVia, type ChannelPerson, type TurnMessage } from "./inbound.js";
+import {
+  CONTEXT_STRING_MAX, decidedViaOf, parseChannelContext, turnMessage, type AttendedVia, type ChannelPerson, type TurnMessage,
+} from "./inbound.js";
 import {
   parseRestartRequest, parseReviewRequest, recordReviewHandoff, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused, reviewItemsEnabled,
   startReviews,
@@ -221,22 +223,41 @@ export function personHandles(p: ChannelPerson): string[] {
  * or marks between them ("Wei, Lei", "lei.wei"), so `Lei` is not named by `Leila`, nor by `weilei`, and Latin letters next to Chinese
  * still stand on their own ("请Wei, Lei帮我").
  */
-function handleSpans(t: string, words: Array<{ w: string; a: number; b: number }>, h: string): Array<[number, number]> {
+function handleSpans(t: string, words: readonly Word[], h: string): Array<[number, number]> {
   const out: Array<[number, number]> = [];
   if (/^\p{Script=Han}+$/u.test(h)) {
     for (let i = t.indexOf(h); i >= 0; i = t.indexOf(h, i + 1)) out.push([i, i + h.length]);
     return out;
   }
+  // From each word the handle starts with, the words after it while each continues the handle; `at` is how much of it they spell.
   for (let i = 0; i < words.length; i++) {
-    let joined = "";
-    for (let j = i; j < words.length && joined.length < h.length; j++) {
-      if (j > i && !NAME_GAP.test(t.slice(words[j - 1].b, words[j].a))) break;
-      joined += words[j].w;
-      if (joined === h) out.push([words[i].a, words[j].b]);
+    for (let j = i, at = 0; j < words.length && at < h.length; j++) {
+      if ((j > i && !words[j].joined) || !h.startsWith(words[j].w, at)) break;
+      at += words[j].w.length;
+      if (at === h.length) out.push([words[i].a, words[j].b]);
     }
   }
   return out;
 }
+
+/** A word of the lower-cased text (`WORD`), where it stands, and whether only a `NAME_GAP` separates it from the word before. */
+interface Word { w: string; a: number; b: number; joined: boolean }
+
+function wordsOf(t: string): Word[] {
+  const out: Word[] = [];
+  for (const m of t.matchAll(WORD)) {
+    const prev = out.at(-1);
+    out.push({ w: m[0], a: m.index, b: m.index + m[0].length, joined: !!prev && NAME_GAP.test(t.slice(prev.b, m.index)) });
+  }
+  return out;
+}
+
+/**
+ * The longest message read for a reviewer's name. A request is a line or two; a longer message names nobody by itself (it is not cut,
+ * which could leave a shorter listed name where a longer one was written), and the person is offered the short reply that picks them.
+ * Reading a message costs each listed person's every handle, so this bounds what one message can make the process do.
+ */
+export const NAMES_TEXT_MAX = 8 * 1024;
 
 /**
  * Whether the person's own message names this person by something that is theirs alone among the people the channel listed: one of
@@ -244,34 +265,73 @@ function handleSpans(t: string, words: Array<{ w: string; a: number; b: number }
  * or the part of it before the `@`, an alias the channel gave), each only when no one else listed has the same (so two people called
  * Alex Chen, or two who share `Lei`, are told apart only by what differs), and only where it is not part of another listed person's
  * longer handle (`王一涵` in `王一涵娜`, `Alex Chen` in `Alex Chen Wu`). Being listed beside the message is the channel's say that the
- * person is there; this is the person's say that it is them.
+ * person is there; this is the person's say that it is them. A message longer than `NAMES_TEXT_MAX` names nobody.
  */
 export function reviewerNamed(text: string, person: ChannelPerson & { user_id: string }, people: readonly ChannelPerson[]): boolean {
+  if (text.length > NAMES_TEXT_MAX) return false;
   const t = lower(text);
-  const words = [...t.matchAll(WORD)].map((m) => ({ w: m[0], a: m.index, b: m.index + m[0].length }));
+  const words = wordsOf(t);
   const theirs = [...new Set(people.filter((p) => p !== person && p.user_id !== person.user_id).flatMap(personHandles))];
   const taken = new Set(theirs);
-  const inLonger = (h: string, [a, b]: [number, number]): boolean =>
-    theirs.some((o) => o.length > h.length && o.includes(h) && handleSpans(t, words, o).some(([c, d]) => c <= a && b <= d));
-  return personHandles(person).some((h) => !taken.has(h) && handleSpans(t, words, h).some((span) => !inLonger(h, span)));
+  // Where another person's longer handle stands is worked out once for the text, not once for each place a shorter one does, so a
+  // message that writes a name many times costs as much as reading it.
+  const where = new Map<string, (a: number, b: number) => boolean>();
+  const inside = (o: string): ((a: number, b: number) => boolean) => {
+    let f = where.get(o);
+    if (!f) where.set(o, f = withinSpans(handleSpans(t, words, o)));
+    return f;
+  };
+  return personHandles(person).some((h) => {
+    if (taken.has(h)) return false;
+    const spans = handleSpans(t, words, h);
+    if (!spans.length) return false;
+    const longer = theirs.filter((o) => o.length > h.length && o.includes(h)).map(inside);
+    return spans.some(([a, b]) => !longer.some((within) => within(a, b)));
+  });
+}
+
+/** Whether [a, b) lies inside one of these spans: the furthest end among those that start at or before `a`, found by halving. */
+function withinSpans(spans: Array<[number, number]>): (a: number, b: number) => boolean {
+  const sorted = [...spans].sort((x, y) => x[0] - y[0]);
+  const reach: number[] = [];
+  for (const [, d] of sorted) reach.push(Math.max(reach.at(-1) ?? -1, d));
+  return (a, b) => {
+    let lo = 0;
+    let hi = sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (sorted[mid][0] <= a) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo > 0 && reach[lo - 1] >= b;
+  };
 }
 
 /**
  * The listed people with a Claw user id whom the message may mean: any of their handles is written in it, theirs alone or not (`lei`
- * of two people), or, when it writes none, everyone listed. Who to offer the person to pick from when their message names nobody alone.
+ * of two people), or, when it writes none (or is longer than `NAMES_TEXT_MAX`), everyone listed. Who to offer the person to pick from when
+ * their message names nobody alone.
  */
 export function reviewerCandidates(
   text: string, people: readonly ChannelPerson[], requester: string,
 ): Array<ChannelPerson & { user_id: string }> {
-  const t = lower(text);
-  const words = [...t.matchAll(WORD)].map((m) => ({ w: m[0], a: m.index, b: m.index + m[0].length }));
   const linked = people.filter((p): p is ChannelPerson & { user_id: string } => !!p.user_id && p.user_id !== requester);
+  if (text.length > NAMES_TEXT_MAX) return linked.slice(0, MAX_REVIEWER_CANDIDATES);
+  const t = lower(text);
+  const words = wordsOf(t);
   const written = linked.filter((p) => personHandles(p).some((h) => handleSpans(t, words, h).length > 0));
   return (written.length ? written : linked).slice(0, MAX_REVIEWER_CANDIDATES);
 }
 
-const REPLY = /^\s*(?:确认|確認|confirm)[\s:：,，]*(\S[^\n]*?)\s*$/iu;
-const REPLY_TAG = /^(.*?)\s*[(（]([^()（）]+)[)）]$/u;
+/**
+ * The longest a reply (`reviewerReply`) can be: the word, then a name and one handle in brackets, each at most `CONTEXT_STRING_MAX`
+ * long as the channel lists them, with room for spacing. A longer message is not one, and is not read further.
+ */
+const REPLY_MAX_CHARS = "confirm".length + 2 * CONTEXT_STRING_MAX + 32;
+/** Matched against the trimmed message. What separates the word from the name is never also the name's first character, so no input backtracks. */
+const REPLY = /^(?:确认|確認|confirm)[\s:：,，]*([^\s:：,，][^\n]*)$/iu;
+/** A handle in brackets at the end of a reply's name; what comes before it is the name. */
+const REPLY_TAG = /[(（]([^()（）]+)[)）]$/u;
 
 /** The word a reply that picks the reviewer starts with: `确认` in a Chinese message, `confirm` otherwise. */
 const replyWord = (text: string): string => (HAN.test(text) ? "确认" : "confirm");
@@ -279,13 +339,15 @@ const replyWord = (text: string): string => (HAN.test(text) ? "确认" : "confir
 /**
  * Whether the message is, whole, the person's answer to which reviewer they meant: `确认` or `confirm`, then nothing but one listed person's
  * name or handle, and, in brackets after it, at most one more handle of the same person (`确认 Alex Chen (achen2)`): the shape of a reply
- * `reviewerReply` offers. A sentence that merely starts with the word ("确认下，请 Wei, Lei 帮我 review #304") is not one.
+ * `reviewerReply` offers. A sentence that merely starts with the word ("确认下，请 Wei, Lei 帮我 review #304") is not one, nor is a message
+ * longer than any reply can be (`REPLY_MAX_CHARS`), which is not read at all: this runs on the person's message and on several earlier ones.
  */
 export function isReviewerReply(text: string, people: readonly ChannelPerson[]): boolean {
-  const m = REPLY.exec(text);
+  if (text.length > REPLY_MAX_CHARS) return false;
+  const m = REPLY.exec(text.trim());
   if (!m) return false;
   const tagged = REPLY_TAG.exec(m[1]);
-  const [name, tag] = tagged ? [tagged[1], tagged[2]] : [m[1], ""];
+  const [name, tag] = tagged ? [m[1].slice(0, tagged.index).trimEnd(), tagged[1]] : [m[1], ""];
   return people.some((p) => {
     if (!p.user_id) return false;
     const handles = new Set(personHandles(p));
