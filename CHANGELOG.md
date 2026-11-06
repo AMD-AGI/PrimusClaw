@@ -884,6 +884,12 @@ record it.
   a key that may read the unscoped list (an admin's) keeps reaching every workspace.
 - The assistant router sees each person a message names with their address and other handles beside their user id (`People in
   this message`), so it can pick one of two people with the same name from the reply that names them (`确认 Wei, Lei (weil2)`).
+- The sandbox's E2B file API takes an absolute path as that path. `files.write('/tmp/x')` wrote `<workspace>/tmp/x`, so a
+  command reading `/tmp/x` found nothing, and a process `cwd` of `/tmp` ran in `<workspace>/tmp`. An unsealed sandbox's file calls
+  run under the uid its commands get, so the mapping bounded nothing; they now follow E2B (absolute paths as given, relative ones
+  under the workspace, responses name the absolute path). A sealed sandbox keeps its grant's workspace-rooted paths (`/in` is
+  `<workspace>/in`), and a sealed path that would leave the workspace is refused with `permission_denied` "path escapes the
+  sandbox root". Ships in the envd injector image.
 - The GitHub list reads (`issue_search`, `pr_list`, `issue_list`, `repo_list`, `code_search`) answer the whole list a question
   asks for: `{ total_count, shown, complete, next_page?, items }`, pages of 50 by default (up to 100), and an answer of at most
   `GITHUB_LIST_MAX_CHARS` that Brain keeps whole (any other result is still cut to its head and tail at 6000 characters, which
