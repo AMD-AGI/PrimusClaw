@@ -281,9 +281,11 @@ if (DB_SCHEMA) {
 // `connect()` of either pool goes through the check) and the held ones when
 // they are released, and the statement that met it is retried once on a new
 // connection when running it twice is the same as running it once: Postgres
-// said it never ran, or it only reads. For a while after it, a connection of
-// the advisory-lock pool is not handed out until the server it reached says
-// it is the primary: a lock taken on the demoted server fences nothing.
+// said it never ran, or it only reads. And a new connection of either pool is
+// not handed out until the server it reached says it is the primary: for a
+// few seconds the Service can still route one to the demoted server, which
+// grants advisory locks as readily as any other -- a lock taken there fences
+// nothing -- and refuses every write.
 
 /** SQLSTATEs, and socket error codes, that mean this connection is not on the primary any more, or the server is going away under it. */
 const FAILOVER_SQLSTATES = new Set([
@@ -354,15 +356,15 @@ function isStale(client: pg.ClientBase): boolean {
  */
 export function noteFailover(err: unknown): void {
   failoverGeneration += 1;
-  lastFailoverAt = Date.now();
   logger.warn({ code: (err as { code?: unknown })?.code, generation: failoverGeneration }, "db.failover_detected");
 }
 
-/** When this process last saw a failover error; 0 for never. */
-let lastFailoverAt = 0;
-/** How long after a failover error a lock-pool connection is asked whether it reached the primary before it is handed out. */
-const FAILOVER_PRIMARY_CHECK_MS = 60_000;
-/** How many connections a lock-pool checkout tries, a retry delay apart, while they all reach a server in recovery. */
+/**
+ * Connections whose server said, when they were first checked out, that it is not in recovery. A connection stays on
+ * the server it reached, and a primary that is demoted ends its connections, so once is enough.
+ */
+const onPrimary = new WeakSet<pg.ClientBase>();
+/** How many connections a checkout tries, a retry delay apart, while they all reach a server in recovery. */
 const PRIMARY_CHECKOUT_ATTEMPTS = 10;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -372,10 +374,10 @@ type ConnectCallback = (err: Error | undefined, client?: pg.PoolClient, done?: (
 /**
  * Every `connect()` of `p`, whoever calls it (`pool.query` included), hands out a client connected since the last
  * failover: one from before it is destroyed instead, and the next one taken, until a current one comes (a new
- * connection is current, so this ends). With `primaryOnly`, for a while after a failover a client is also asked
- * whether its server is in recovery, and one that is is destroyed and another tried after a pause.
+ * connection is current, so this ends). A client is also asked, the first time it is handed out, whether its server is
+ * in recovery, and one that is is destroyed and another tried after a pause.
  */
-function checkoutsCurrent(p: pg.Pool, primaryOnly: boolean): void {
+function checkoutsCurrent(p: pg.Pool): void {
   const connectAny = p.connect.bind(p) as () => Promise<pg.PoolClient>;
   const connectCurrent = async (): Promise<pg.PoolClient> => {
     for (let standby = 0; ;) {
@@ -384,7 +386,7 @@ function checkoutsCurrent(p: pg.Pool, primaryOnly: boolean): void {
         client.release(new Error("connected before a failover"));
         continue;
       }
-      if (!primaryOnly || Date.now() - lastFailoverAt > FAILOVER_PRIMARY_CHECK_MS) return client;
+      if (onPrimary.has(client)) return client;
       let inRecovery: boolean;
       try {
         inRecovery = (await client.query("SELECT pg_is_in_recovery() AS r")).rows[0].r === true;
@@ -392,13 +394,16 @@ function checkoutsCurrent(p: pg.Pool, primaryOnly: boolean): void {
         client.release(err as Error);
         throw err;
       }
-      if (!inRecovery) return client;
+      if (!inRecovery) {
+        onPrimary.add(client);
+        return client;
+      }
       client.release(new Error("connected to a server in recovery"));
       standby += 1;
       if (standby >= PRIMARY_CHECKOUT_ATTEMPTS) {
         throw Object.assign(new Error("every connection reached a server in recovery"), { code: "25006" });
       }
-      logger.warn({ attempt: standby }, "db.lock_pool_reached_standby");
+      logger.warn({ attempt: standby }, "db.connection_reached_standby");
       await sleep(FAILOVER_RETRY_DELAY_MS);
     }
   };
@@ -411,18 +416,20 @@ function checkoutsCurrent(p: pg.Pool, primaryOnly: boolean): void {
 }
 
 for (const p of [pool, lockPool]) {
-  p.on("connect", (client) => { clientGeneration.set(client, failoverGeneration); });
+  p.on("connect", (client) => {
+    clientGeneration.set(client, failoverGeneration);
+    // A switchover terminates idle and held connections alike, and that is often the first anyone hears of it.
+    client.on("error", (err) => { if (isFailoverError(err)) noteFailover(err); });
+  });
   // A client from before the failover is closed as it is released, so the pool
   // removes it instead of handing it out again (`_release` drops a client that
   // is ending). Covers every holder.
   p.on("release", (_err, client) => {
     if (isStale(client)) client.end().catch(() => {});
   });
-  // A switchover terminates the idle connections too, and that is often the first anyone hears of it.
-  p.on("error", (err) => { if (isFailoverError(err)) noteFailover(err); });
 }
-checkoutsCurrent(pool, false);
-checkoutsCurrent(lockPool, true);
+checkoutsCurrent(pool);
+checkoutsCurrent(lockPool);
 
 /**
  * One statement on the main pool. A statement that met a failover error marks
