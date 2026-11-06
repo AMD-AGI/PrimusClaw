@@ -51,6 +51,7 @@ import type { AssistantTokenClaims } from "./token.js";
 import { attendedTurn, ToolRefused } from "./tools.js";
 import { resolveWorkItemNow } from "./work-items.js";
 import { modelChoiceOn } from "./model-choice.js";
+import { voidStreamedSay } from "./router-speed.js";
 
 export { confirmationRef };
 
@@ -64,6 +65,9 @@ export const reviewToolPorts = {
   decide: (userId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null, guard?: (q: Querier) => Promise<void>) =>
     decideConfirmation(githubReviewService(), db, userId, id, decision, via, guard),
   kick: (): Promise<void> => kickDelivery(),
+  /** Takes back what the turn streamed of a say (`router-speed.ts`). */
+  voidStreamedSay: (sessionId: string, messageId: string | undefined, reason: string): Promise<void> =>
+    voidStreamedSay(sessionId, messageId, reason),
 };
 
 export const MAX_PRS = 10;
@@ -627,6 +631,8 @@ async function handOffReview(
   });
   if (!queued) return null;
   logger.info({ eventId: queued.eventId, prs: prs.length }, "assistant.review_handed_off");
+  // Whatever this turn streamed of a say, or streams from now on, is not said: the channel's answer stands in its place.
+  await reviewToolPorts.voidStreamedSay(claims.sid, claims.mid, "handed_off");
   void reviewToolPorts.kick().catch((err) => logger.error({ err }, "assistant.review_handoff_kick_failed"));
   // What the router may tell the person of it: nothing. The channel answers their message about this review itself, in one message, once
   // it has started it or knows why not: which pull requests, on which model, and how the merge is made, which only the started review

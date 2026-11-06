@@ -1266,6 +1266,10 @@ describe("assistant review tools", { skip }, () => {
         .map((r: Recorded) => r.text as string);
       const text = "请weilei帮我review并合入 PrimusClaw PR #307、#309，Primus-SaFE PR #840";
       const turn = await userTurn(alice, text, { context: ctx });
+      const handoffVoids: Array<[string, string | undefined, string]> = [];
+      const savedVoid = rt.reviewToolPorts.voidStreamedSay;
+      rt.reviewToolPorts.voidStreamedSay = async (sid: string, mid: string | undefined, reason: string) => { handoffVoids.push([sid, mid, reason]); };
+      const voidsOf = (mid: string) => w.events.filter((e) => e.type === "toolTextVoid" && e.message_id === mid);
       // Something else the person asked is said before the handoff, as the prompt asks: that goes through.
       await w.mod.tools.say(turn, { text: "另外，SaFE 现在一切正常。" }, w.sayDeps);
       const out = await rt.reviewStart(turn, {
@@ -1284,6 +1288,13 @@ describe("assistant review tools", { skip }, () => {
         }
       }
       assert.deepEqual(await says(), ["另外，SaFE 现在一切正常。"]);
+      // What was streamed of each refused say is taken back on the turn's stream (2026-11-06 15:11Z: "已把 Primus" stayed as a message),
+      // and so is the turn's say text from the handoff on; the say that went through takes nothing back.
+      assert.deepEqual(handoffVoids, [[alice.routerSid, turn.mid, "handed_off"]]);
+      rt.reviewToolPorts.voidStreamedSay = savedVoid;
+      assert.deepEqual(voidsOf(turn.mid).map((e) => [e.tool, e.reason]), [
+        ["mcp__assistant__say", "handed_off"], ["mcp__assistant__say", "handed_off"], ["mcp__assistant__say", "handed_off"],
+      ]);
       await w.closeRun(turn.task_id);
       assert.equal(await actionsRun(), 1, "the handoff itself was queued, once");
 

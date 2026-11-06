@@ -22,6 +22,7 @@ import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
 import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, SayOutcomeUnknown, SayRefused, type SayDeps } from "./outbound.js";
+import { voidStreamedSay } from "./router-speed.js";
 import { saySources, SAY_SOURCE_OUTCOMES } from "./citations.js";
 import { metrics } from "../infra/metrics.js";
 import { internalTextIn, userWordsOf } from "./internal-text.js";
@@ -147,6 +148,21 @@ const ANSWER_EVENT_RE = new RegExp(`^${WORK_EVENT_PREFIX.replace(/[.*+?^${}()|[\
  */
 export async function say(
   claims: AssistantTokenClaims, args: { text: string; item_id?: string; sources?: unknown }, deps: SayDeps = {}, meta?: unknown,
+): Promise<{ ok: true; say_id: string; subscribers: number }> {
+  try {
+    return await sayOnce(claims, args, deps, meta);
+  } catch (err) {
+    // A refused say never reaches the person: what was streamed of it is taken back, so a channel does not keep it as a message
+    // (2026-11-06 15:11Z: a say refused after a handoff left its first words "已把 Primus" in the person's chat).
+    if (err instanceof ToolRefused && err.code !== "say_outcome_unknown") {
+      await voidStreamedSay(claims.sid, claims.mid, err.code, deps.publishSessionEvent);
+    }
+    throw err;
+  }
+}
+
+async function sayOnce(
+  claims: AssistantTokenClaims, args: { text: string; item_id?: string; sources?: unknown }, deps: SayDeps, meta: unknown,
 ): Promise<{ ok: true; say_id: string; subscribers: number }> {
   requireRole(claims, "router");
   const userId = await assistantUser(claims.sid);

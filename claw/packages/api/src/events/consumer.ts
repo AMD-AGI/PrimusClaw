@@ -44,6 +44,7 @@ import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dis
 import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
 import pino from "pino";
+import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
 import { metrics } from "../infra/metrics.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
@@ -369,8 +370,9 @@ export async function consumeEventDelivery(msg: {
 
     // A streaming tool call's text so far (`toolTextDelta`: an assistant router's `say` while the model writes it). It is a preview
     // for whoever follows the session live, who has it from the stream already; the call's whole input is stored with the call. So
-    // nothing is kept of it: it would be rows nobody reads back, several for every message the assistant says.
-    if (event.type === TOOL_TEXT_DELTA_EVENT) {
+    // nothing is kept of it: it would be rows nobody reads back, several for every message the assistant says. Nor of the event that
+    // takes such a preview back (`toolTextVoid`): it is about the preview only.
+    if (event.type === TOOL_TEXT_DELTA_EVENT || event.type === TOOL_TEXT_VOID_EVENT) {
       msg.ack();
       return;
     }
