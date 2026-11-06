@@ -40,7 +40,8 @@ import {
   type HeldQuestion, type NotificationPayload,
 } from "../notifications/outbox.js";
 import { recordNeedsYouFallback } from "./outbound.js";
-import { quoted, UNTRUSTED_CLOSE, UNTRUSTED_OPEN } from "./prompts.js";
+import { quoted, toldNote, UNTRUSTED_CLOSE, UNTRUSTED_OPEN } from "./prompts.js";
+import { toldNeedAt, toldNeeds } from "./told.js";
 
 const logger = pino({ name: "assistant-holds" });
 
@@ -460,6 +461,8 @@ export interface HeldLine {
   seq: number;
   title: string;
   hold: Hold;
+  /** When the user was told of the item under the hold's attention (`told.ts`), if they were. */
+  toldAt?: Date;
 }
 
 /**
@@ -477,7 +480,12 @@ export async function heldForPersonManifest(userId: string): Promise<HeldLine[]>
       ORDER BY w.seq, h.n`,
     [userId],
   )).rows as Array<{ item_id: string; seq: number; title: string; hold: Hold }>;
-  return rows.map((r) => ({ itemId: r.item_id, seq: Number(r.seq), title: r.title, hold: r.hold }));
+  const lines = rows.map((r) => ({ itemId: r.item_id, seq: Number(r.seq), title: r.title, hold: r.hold }));
+  const told = await toldNeeds((t, p) => db.query(t, p), userId, lines.map((l) => ({ itemId: l.itemId, attentionSeq: Number(l.hold.attention_seq) })));
+  return lines.map((l) => {
+    const toldAt = toldNeedAt(told, { itemId: l.itemId, attentionSeq: Number(l.hold.attention_seq) });
+    return toldAt ? { ...l, toldAt } : l;
+  });
 }
 
 /**
@@ -488,7 +496,7 @@ export async function heldForPersonManifest(userId: string): Promise<HeldLine[]>
 export function renderHeldForPerson(lines: readonly HeldLine[]): string {
   if (!lines.length) return "";
   const list = lines.map((l) => `- #${l.seq} (item_id: ${l.itemId}) ${l.hold.kind === "question" ? "question" : "approval"}`
-    + ` | waits until ${l.hold.expires_at} | ${quoted(l.hold.target)} | item: ${quoted(l.title)}`).join("\n");
+    + ` | waits until ${l.hold.expires_at}${toldNote(l.toldAt)} | ${quoted(l.hold.target)} | item: ${quoted(l.title)}`).join("\n");
   return `Waiting for you in work items (a worker holds a write for the user's decision, or asks them a question; only the user answers it, on the card in their chat or in the console, and nothing you say or call answers it: when they ask what waits for them, or say yes or no to one of these, tell them where it is and that it waits until the time shown):
 ${UNTRUSTED_OPEN}
 ${list}

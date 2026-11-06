@@ -29,21 +29,32 @@ export function mayHandOff(message: TurnMessage | null | undefined): boolean {
   return !!context && context.handoffs.includes("review_for_other") && context.people.some((p) => !!p.user_id);
 }
 
+/** What a held say's delivery records when the handoff carries its text instead: the person still gets it (`told.ts` reads it so). */
+export const CARRIED_BY_HANDOFF = "dropped: the turn handed a review to the channel; carried by the handoff";
+
 /**
  * The turn handed a review over: its held says never go out on their own. Returns their texts, each once, in the order they were said:
- * the handoff carries them (`AssistantReviewHandoff.held_says`), so the channel's one answer still tells the person what they said.
+ * the handoff carries them (`AssistantReviewHandoff.held_says`), so the channel's one answer still tells the person what they said. A say
+ * that takes the place of the turn's first one (`replaces`) stands in that one's place: only the last of them is carried.
  */
 export async function dropHeldSays(q: Querier, messageId: string): Promise<string[]> {
   if (!CLAW_NOTIFICATIONS_ENABLED) return [];   // (no outbox table: nothing is ever held)
   const r = await q(
-    `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'dropped: the turn handed a review to the channel; carried by the handoff'
+    `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = $2
       WHERE last_status = $1 AND delivered_at IS NULL AND dropped_at IS NULL
-      RETURNING id, event_id, payload->>'text' AS text`,
-    [heldStatus(messageId)],
+      RETURNING id, event_id, payload->>'text' AS text, payload->>'replaces' AS replaces`,
+    [heldStatus(messageId), CARRIED_BY_HANDOFF],
   );
-  const rows = (r.rows as Array<{ id: string; event_id: string; text: string | null }>).sort((a, b) => Number(a.id) - Number(b.id));
+  const rows = (r.rows as Array<{ id: string; event_id: string; text: string | null; replaces: string | null }>)
+    .sort((a, b) => Number(a.id) - Number(b.id));
+  // Keyed by the message a say stands for: a later one of the same place overwrites it there (a Map keeps the first key's position).
   const texts = new Map<string, string>();
-  for (const row of rows) if (row.text?.trim() && !texts.has(row.event_id)) texts.set(row.event_id, row.text.trim());
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (!row.text?.trim() || seen.has(row.event_id)) continue;
+    seen.add(row.event_id);
+    texts.set(row.replaces ?? row.event_id, row.text.trim());
+  }
   return [...texts.values()];
 }
 

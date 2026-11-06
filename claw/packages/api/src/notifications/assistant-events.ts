@@ -112,7 +112,13 @@ export interface AssistantSayPayload extends AssistantEventBase {
    * blank line, this text); one that does not shows this as a message of its own.
    */
   amends?: string;
-  /** A system notice's: the message id of the turn it answers (what an `amends` of that turn is matched by). */
+  /**
+   * The `event_id` of the router's first message of this turn, which this one takes the place of: a turn speaks to the user once, and a
+   * later say of it (the answer after a quick "查一下", or a correction) is that whole message again. A channel that still has that message
+   * shows this text in its place; one that does not shows this as a message of its own.
+   */
+  replaces?: string;
+  /** The message id of the turn a system notice answers or a router say belongs to (what an `amends` or a `replaces` is matched by). */
   turn_message_id?: string;
 }
 

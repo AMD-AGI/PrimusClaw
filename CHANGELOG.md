@@ -930,6 +930,16 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- The assistant router speaks once per turn: a later `say` of a turn takes the place of the turn's first message instead of being a
+  second one (`assistant.say` payload and `AssistantSay` event `replaces`, the first say's id, and `turn_message_id` on a router say's
+  payload; matched through the delivery, so only with notifications on). A quick "查一下" is replaced by the answer, and a correction is
+  the whole message again, never "更正上一条…" beside it. A channel that no longer has that message shows the new one on its own, and a
+  turn that hands a review over carries only the last of them in `held_says`.
+- Each thing that waits for the user (a write held for confirmation, a scheduled task's card, what a worker holds) is marked
+  `told` in the router's state once a message the user can still see (not dropped, not replaced by a later say of its turn) named it
+  (its ref) or, for a hold, was about its item under the hold's attention; the router brings it up on its own at most once, instead of ending every reply with the same reminder.
+- The router compares a repeated question's answer with its last one and says what changed and why, and tells a requester they can
+  stop a review they asked someone else to do (handed off or not) with `work_stop` and its item_id (router-v14, review router-v18).
 - A user whose account may not create workloads in the workspace Claw starts their sandbox in (today: anyone not a member of
   the CPU workspace, the first time an assistant item or Teams message needs a sandbox) no longer sees SaFE's raw 403 body,
   with their internal user id and the platform error code, as `Sandbox failure (sandbox_create_failed): Create Hands failed: HTTP
