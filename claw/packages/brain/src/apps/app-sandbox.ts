@@ -39,6 +39,7 @@ import { ACTIVE_PHASES, TERMINAL_PHASES } from "../sandbox/workload-wait.js";
 import { pollWorkloadUntilRunning, SHUTDOWN_BUFFER_SECONDS } from "../sandbox/safe-workload-provider.js";
 import type { SandboxInstance } from "../sandbox/provider.js";
 import { applyModelKeyEnv } from "../sandbox/params.js";
+import { SandboxProvisionTerminalError, provisionTerminalOf } from "../sandbox/errors.js";
 
 const logger = pino({ name: "app-sandbox" });
 
@@ -65,12 +66,29 @@ export interface AppSandboxRun {
   platformKey: string;
 }
 
+/**
+ * What an `ensure` is told about the run being stopped while it waits.
+ *
+ * `signal` is the run's: once it has fired no create is sent, and the wait for a
+ * workload that exists -- one whose create was already under way included -- ends
+ * at once (`sandbox_wait_interrupted`). `reclaimOnAbort`,
+ * read when the abort is seen, says whether that stop ends the run -- a cancel,
+ * the deadline, a terminal row: the workload is stopped, since nothing else will
+ * stop a sandbox that no run is going to use -- or hands it over -- a drain, a
+ * lost lease: the workload is left as it is for the Brain that takes the run
+ * over, which adopts it by `CLAW_APP_RUN_ID`. Absent means every stop ends the run.
+ */
+export interface AppSandboxEnsureOptions {
+  signal?: AbortSignal;
+  reclaimOnAbort?: () => boolean;
+}
+
 export interface AppSandboxDeps {
   /** Persist `claw_app_runs.sandbox_workload_id`. Called as soon as an id exists. */
   recordWorkloadId(runId: string, workloadId: string): Promise<void>;
   fetch?: typeof globalThis.fetch;
   /** Wait for a workload to be Running; defaults to the shared poll. */
-  waitRunning?: (workloadId: string, apiKey: string) => Promise<void>;
+  waitRunning?: (workloadId: string, apiKey: string, abort?: AppSandboxEnsureOptions) => Promise<void>;
   /** Create through the shared path; defaults to the real provider. */
   create?: typeof createSafeWorkloadSandbox;
   /** Stop a workload this call created or found surplus; defaults to the SaFE provider. */
@@ -206,15 +224,35 @@ export function appSandboxInstance(
 /**
  * The run's sandbox: an existing live one, or a fresh one. Returns once the
  * sandbox is Running.
+ *
+ * `abort` is the run's signal (see {@link AppSandboxEnsureOptions}). A run that is
+ * stopped while this waits -- a session deleted seconds after the run was
+ * submitted, with the workload still queued -- must not be left holding a
+ * sandbox it will never use: the workload is stopped here, at once, rather than
+ * waited on until it is Running and stopped (or not) by a finish whose lease has
+ * long run out by then.
  */
-export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps): Promise<AppSandbox> {
+export async function ensureAppSandbox(
+  run: AppSandboxRun,
+  deps: AppSandboxDeps,
+  abort: AppSandboxEnsureOptions = {},
+): Promise<AppSandbox> {
   if (isKubernetesMode()) {
     throw new Error("app sandboxes are created through SaFE; kubernetes mode is not supported");
   }
   if (!run.platformKey) throw new Error("ensureAppSandbox: platformKey is required");
   if (!run.sandboxSpec?.image?.trim()) throw new Error("ensureAppSandbox: sandbox_spec has no image");
   const ns = appSandboxNamespace(run);
-  const wait = deps.waitRunning ?? ((id, key) => pollWorkloadUntilRunning(id, key, undefined, undefined, "app"));
+  const wait = deps.waitRunning ?? ((id, key, s) => pollWorkloadUntilRunning(id, key, undefined, undefined, "app", {
+    signal: s?.signal, reclaimOnAbort: s?.reclaimOnAbort,
+  }));
+  /**
+   * The wait was cut short by a stop that hands the run over: the workload is
+   * the next holder's to adopt, and stopping it would leave that holder nothing.
+   */
+  const handedOver = (err: unknown): boolean =>
+    provisionTerminalOf(err)?.reason === "sandbox_wait_interrupted"
+    && abort.reclaimOnAbort !== undefined && !abort.reclaimOnAbort();
   // An app sandbox has no Hands in it, so there is no Hands URL to give.
   const instanceFor = (id: string): SandboxInstance => appSandboxInstance(run, id);
   const stop = deps.stop ?? ((id: string) => getSafeWorkloadProvider().stop(instanceFor(id)));
@@ -244,14 +282,15 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
     if (run.sandboxWorkloadId !== adopted.id) await deps.recordWorkloadId(run.runId, adopted.id);
     if (adopted.phase !== "running") {
       try {
-        await wait(adopted.id, run.platformKey);
+        await wait(adopted.id, run.platformKey, abort);
       } catch (err) {
         // A workload that cannot be brought to Running (queued past the ceiling, or
-        // gone terminal) is stopped, as on the create path: left live, the next
-        // attempt would find and adopt it again, for ever. The surplus is left for
-        // that next attempt: it is not known to be bad, and stopping it too would
-        // leave the run with nothing.
-        await reclaim(adopted.id, "adopted_wait_failed");
+        // gone terminal), or whose run was cancelled while it waited, is stopped, as
+        // on the create path: left live, the next attempt would find and adopt it
+        // again, for ever. The surplus is left for that next attempt: it is not known
+        // to be bad, and stopping it too would leave the run with nothing. A run
+        // being handed over leaves it to the next holder.
+        if (!handedOver(err)) await reclaim(adopted.id, "adopted_wait_failed");
         throw err;
       }
     }
@@ -268,6 +307,15 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
   const resources = spec.resources;
   if (!resources || Object.keys(resources).length === 0) {
     throw new Error("ensureAppSandbox: sandbox_spec has no resources");
+  }
+  // Last look before the create: a run stopped while the lookup above was in
+  // flight gets no workload at all. After this the create itself is not cut short
+  // (SaFE may accept a create whose answer was dropped, and that workload would
+  // have no recorded id); the wait that follows it is.
+  if (abort.signal?.aborted) {
+    throw new SandboxProvisionTerminalError(
+      "sandbox_wait_interrupted", `app run ${run.runId} was stopped before its sandbox was created`,
+    );
   }
   const create = deps.create ?? createSafeWorkloadSandbox;
   let createdId: string | undefined;
@@ -296,13 +344,25 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
         createdId = id;
         await deps.recordWorkloadId(run.runId, id);
       },
+      // The run's stop ends the wait for Running. The provider stops the workload
+      // itself (its onGiveUp) when `reclaimOnAbort` says the stop ends the run, and
+      // leaves it when it hands the run over.
+      ...(abort.signal ? { signal: abort.signal } : {}),
+      ...(abort.reclaimOnAbort ? { reclaimOnAbort: abort.reclaimOnAbort } : {}),
     });
     logger.info({ runId: run.runId, workloadId: inst.id }, "app_sandbox.created");
     // The handle is built here, as on the adopt path: the provider's carries a Hands
     // URL, and the same run must not get one when created and none when adopted.
     return { instance: instanceFor(inst.id), workloadId: inst.id, created: true };
   } catch (err) {
-    if (createdId !== undefined) await reclaim(createdId, "create_failed");
+    // After a cancel too, although the provider has already stopped the workload
+    // then: a stop that failed there is only logged, and a second one costs nothing.
+    // Never after a hand-over (see handedOver). A create whose id could not be
+    // recorded because the lease had moved on (`not_holder`) is still stopped: the
+    // new holder may have adopted it, and then counts it a lost sandbox and makes
+    // another, but left running it can be left to nobody, when the new holder had
+    // already finished the run before this create landed.
+    if (createdId !== undefined && !handedOver(err)) await reclaim(createdId, "create_failed");
     throw err;
   }
 }

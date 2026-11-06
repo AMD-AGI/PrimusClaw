@@ -47,7 +47,7 @@ import type {
   SandboxExecOptions, SandboxExecResult, SandboxInstance, SandboxStatus,
 } from "../sandbox/provider.js";
 import { provisionTerminalOf } from "../sandbox/errors.js";
-import type { AppSandbox, AppSandboxRun } from "./app-sandbox.js";
+import type { AppSandbox, AppSandboxEnsureOptions, AppSandboxRun } from "./app-sandbox.js";
 import {
   AppRunWriteRefused,
   type AppLastExit, type AppRunPatch, type AppRunRecord, type AppRunState, type AppRunStore,
@@ -180,7 +180,7 @@ export interface AppRunnerSeams {
 /** The sandbox, as the runner uses it. The real one is {@link realAppSandbox}. */
 export interface AppSandboxOps {
   /** An existing live sandbox of the run, or a new one, Running; records its id. */
-  ensure(run: AppSandboxRun): Promise<AppSandbox>;
+  ensure(run: AppSandboxRun, opts?: AppSandboxEnsureOptions): Promise<AppSandbox>;
   instance(run: Pick<AppSandboxRun, "workspaceId" | "platformKey" | "sandboxSpec">, workloadId: string): SandboxInstance;
   status(inst: SandboxInstance): Promise<SandboxStatus>;
   exec(inst: SandboxInstance, command: string, timeout: string, opts?: SandboxExecOptions): Promise<SandboxExecResult>;
@@ -292,6 +292,13 @@ export class AppRunner {
   /** Set when the signal given to `run` fires; cleared by `finishNow`, which ends the run on purpose. */
   private halted = false;
   /**
+   * The signal given to `run`, and whether its abort ends the run; what a sandbox
+   * `ensure` is interrupted by. Cleared by `finishNow`, whose own `ensure` (the
+   * one that reads `final` from shared storage) must not be cut short by the
+   * stop it is carrying out.
+   */
+  private ensureStop: AppSandboxEnsureOptions = {};
+  /**
    * Seeded with the platform key, which is a constructor argument and needs no
    * read: it is in the set from the first moment, whatever the store does.
    */
@@ -328,9 +335,20 @@ export class AppRunner {
    * draining) the runner stops for good: a tick still in flight may finish the
    * call it is in, but it writes nothing to the row and starts nothing, so the
    * Brain that takes the run over is the only one moving it.
+   *
+   * A tick waiting for its sandbox is not left to finish that wait: the signal
+   * reaches the sandbox `ensure`, which sends no create once it has fired and
+   * stops waiting at once. `reclaimOnAbort` is read when the abort is seen and
+   * says what happens to a workload whose wait was cut short: true (a cancel, the
+   * deadline, a terminal row) stops it; false (a drain, a lost lease) leaves it
+   * for the Brain that takes the run over. Absent means true. Without this the
+   * wait ran on until the workload was Running -- minutes for a queued one --
+   * while the run's lease ran out under `finishNow`, which waits for the tick,
+   * and the stop that followed was refused and never made.
    */
-  async run(signal: AbortSignal): Promise<AppRunResult> {
+  async run(signal: AbortSignal, opts: { reclaimOnAbort?: () => boolean } = {}): Promise<AppRunResult> {
     this.halted = signal.aborted;
+    this.ensureStop = { signal, ...(opts.reclaimOnAbort ? { reclaimOnAbort: opts.reclaimOnAbort } : {}) };
     const halt = (): void => { this.halted = true; };
     signal.addEventListener("abort", halt, { once: true });
     try {
@@ -425,6 +443,7 @@ export class AppRunner {
     // first, or its write could land on top of the one below.
     await this.inflight?.catch(() => undefined);
     this.halted = false;
+    this.ensureStop = {};
     this.rec = await this.deps.store.load(this.runId);
     if (this.rec.state !== "finishing" && this.rec.state !== "ended") {
       await this.commit({ state: "finishing", last_exit: { at: this.iso(), cause, final: false } });
@@ -627,7 +646,7 @@ export class AppRunner {
   private async inProvisioning(): Promise<TickResult> {
     let sandbox: AppSandbox;
     try {
-      sandbox = await this.deps.sandbox.ensure(this.sandboxRun());
+      sandbox = await this.deps.sandbox.ensure(this.sandboxRun(), this.ensureStop);
     } catch (err) {
       // A workload that ended while it was being created is a lost sandbox; any
       // other failure (SaFE unreachable) is transient and the next tick retries,
@@ -1056,7 +1075,7 @@ export class AppRunner {
    */
   private async readFinalFromSharedStorage(stateDir: string): Promise<Extract<ExitRead, { kind: "exit" }> | null> {
     if (this.rec.last_exit?.recovery === true) return null;
-    const reader = await this.deps.sandbox.ensure(this.sandboxRun());
+    const reader = await this.deps.sandbox.ensure(this.sandboxRun(), this.ensureStop);
     const exit = await this.readExit(reader.instance, stateDir);
     // A read that failed (the sandbox could not be made, the file could not be
     // read) is retried by the finishing step and is NOT marked done: the mark says

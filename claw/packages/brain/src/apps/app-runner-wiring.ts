@@ -19,9 +19,9 @@ import {
 
 export function realAppSandbox(store: AppRunStore): AppSandboxOps {
   return {
-    ensure: (run) => ensureAppSandbox(run, {
+    ensure: (run, opts) => ensureAppSandbox(run, {
       recordWorkloadId: async (runId, workloadId) => { await store.patch(runId, { sandbox_workload_id: workloadId }); },
-    }),
+    }, opts),
     instance: appSandboxInstance,
     status: (inst) => getSafeWorkloadProvider().get(inst),
     exec: (inst, command, timeout, opts) => getSafeWorkloadProvider().exec(inst, command, timeout, undefined, opts),

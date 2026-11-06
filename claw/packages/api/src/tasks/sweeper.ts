@@ -1051,6 +1051,66 @@ export async function giveUpExhaustedAppFinishes(): Promise<number> {
 /** How many times one run's finishing may be handed to a new worker before it is left for an operator. */
 const APP_FINISH_REQUEUE_MAX = 5;
 
+/** The run states a live AppRunner drives; a run left in one of them with its task closed has nobody driving it. */
+const APP_RUN_DRIVEN_STATES = "('provisioning','starting','running','restarting')";
+
+/**
+ * Move a run whose task was closed while it was still being driven to `finishing`, so that
+ * {@link requeueUnfinishedAppRuns} hands its finish to a live Brain.
+ *
+ * A task is closed under its holder by a deleted session (straight to `cancelled`), by
+ * `reapLostLeases` and by `reapStaleTasks`, and the API renews no lease on a closed task, so
+ * the holder has what was left of its lease to move the run row to `finishing` and stop the
+ * sandbox. A holder that did not -- it died, or it was still waiting for its sandbox to start
+ * when the lease ran out and every write after that was refused (`not_holder`) -- leaves the
+ * run row in a state only a live AppRunner moves, so `requeueUnfinishedAppRuns`, which takes
+ * `finishing` rows only, never saw it. The sandbox then ran to its workload timeout: an app
+ * sandbox carries no `CLAW_SESSION_ID`, so neither session teardown nor the Hands reaper finds
+ * it, and only the run's own finish stops it.
+ *
+ * Only once the lease has been gone for the grace (`LEASE_GONE_SQL`) and the task closed for as
+ * long, the same wait `requeueUnfinishedAppRuns` makes: until then the holder may still be
+ * finishing inside its lease, and a Brain that takes a run over is never preempted. Nothing can
+ * be handing the run over after that: a closed task's lease is never renewed, and the holder's
+ * writes are refused. The finish that follows needs no recorded workload id: its last step
+ * stops every live sandbox carrying the run's `CLAW_APP_RUN_ID`, a queued one included.
+ *
+ * `last_exit` says why (`row_terminal`); the restart history it held is not a finish's, and only
+ * `recovery` (shared storage was already read once) is kept. Not a task with `app_finish_prior`:
+ * that is a finish-only dispatch, whose rows the passes above own.
+ */
+export async function finishAbandonedAppRuns(): Promise<number> {
+  const r = await db.query(
+    `WITH closed AS (
+       SELECT task_id FROM claw_tasks
+        WHERE mode = 'app'
+          AND executor = 'brain'
+          AND status IN ('cancelling','cancelled','failed')
+          AND metadata->'app_finish_prior' IS NULL
+          AND ${LEASE_GONE_SQL}
+          AND (completed_at IS NULL OR completed_at < NOW() - ($1::int * INTERVAL '1 second'))
+          AND task_id IN (SELECT task_id FROM claw_app_runs WHERE state IN ${APP_RUN_DRIVEN_STATES})
+        FOR UPDATE
+     ), prior AS (
+       SELECT r.task_id, r.state FROM claw_app_runs r JOIN closed c ON c.task_id = r.task_id
+     )
+     UPDATE claw_app_runs r
+        SET state = 'finishing',
+            last_exit = jsonb_build_object('at', to_jsonb(NOW()), 'cause', 'row_terminal', 'final', false)
+                        || CASE WHEN r.last_exit->'recovery' = 'true'::jsonb
+                                THEN '{"recovery": true}'::jsonb ELSE '{}'::jsonb END,
+            updated_at = NOW()
+       FROM prior p
+      WHERE r.task_id = p.task_id
+        AND r.state IN ${APP_RUN_DRIVEN_STATES}
+      RETURNING r.task_id, r.sandbox_workload_id, p.state AS prior_state`,
+    [LEASE_LOST_GRACE_SEC],
+  );
+  const rows = r.rows as Array<{ task_id: string; sandbox_workload_id: string | null; prior_state: string }>;
+  if (rows.length) logger.warn({ runs: rows }, "sweeper.abandoned_app_runs_to_finishing");
+  return rows.length;
+}
+
 /**
  * Give a run left in `finishing` by a holder that lost its lease back to a live Brain.
  *
@@ -1071,8 +1131,9 @@ const APP_FINISH_REQUEUE_MAX = 5;
  * back to what it was, so a user's cancel stays a cancel.
  *
  * Only a lease that is dead for the grace -- or a finish-only dispatch that nobody accepted for
- * as long (`FINISH_DISPATCH_UNACCEPTED_SQL`) -- and only `finishing`: a `running`
- * run with a closed task is not a finish to resume. Bounded, so a run whose
+ * as long (`FINISH_DISPATCH_UNACCEPTED_SQL`) -- and only `finishing`. A run whose task was
+ * closed before its holder got it that far is moved to `finishing` first, by
+ * `finishAbandonedAppRuns`, under the same wait. Bounded, so a run whose
  * finish cannot complete is not handed round for ever.
  */
 export async function requeueUnfinishedAppRuns(): Promise<number> {
@@ -2904,6 +2965,8 @@ export async function sweeperTick(): Promise<void> {
   await runContained("sweeper.requeued_doorbell_leases_failed", requeueLostDoorbellLeases);
   await runContained("sweeper.lost_leases_failed", reapLostLeases);
   // After the reapers that close a task: a run they closed mid-finish is handed back here.
+  // First one closed before its holder reached `finishing`, so the requeue below takes it in this tick.
+  await runContained("sweeper.abandoned_app_runs_failed", finishAbandonedAppRuns);
   await runContained("sweeper.app_finish_exhausted_failed", giveUpExhaustedAppFinishes);
   await runContained("sweeper.unfinished_app_runs_failed", requeueUnfinishedAppRuns);
   // After reapLostLeases, so an accepted row whose worker died is closed as
