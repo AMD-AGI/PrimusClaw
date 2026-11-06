@@ -28,6 +28,7 @@
  *      before a case: nothing is sent, an error
  *   R9 a judge that gives no verdict (an error status, no PASS or FAIL) makes the attempt an error of the run, not a FAIL; its
  *      FAIL fails, its PASS passes. R3e a stop while the stream holds its history back ends the wait at once
+ *   R10 an oracle that could not be read makes the attempt the run's error before anything is sent; one that answers is graded
  *   R8 a work_create that found someone else's open item with the same title (`deduplicated`): that item is not the run's, and
  *      is neither closed nor stripped of its worker's session
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
@@ -111,6 +112,9 @@ class FakeClaw {
       const a = this.judgeAnswers.shift() ?? "PASS: ok";
       return typeof a === "number" ? send(a, { error: "down" }) : send(200, { content: [{ type: "text", text: a }] });
     }
+    // Oracles: one that is down, one that answers.
+    if (method === "GET" && path === "/v1/oracle-down") return send(503, { ok: false });
+    if (method === "GET" && path === "/v1/oracle-ok") return send(200, { data: { n: 3 } });
     // An oracle read that takes a while (a fact's `/v1/...#pick`).
     if (method === "GET" && path === "/v1/slow-oracle") { setTimeout(() => send(200, { data: { n: 3 } }), 2_000); return; }
     if (method === "GET" && path === "/v1/notification-subscriptions") return send(200, { ok: true, data: [] });
@@ -637,5 +641,21 @@ test("R3e a stop while the stream holds its history back", { timeout: 120_000 },
     assert.match(run.out, /stopped by SIGINT/, run.out);
     assert.ok(Date.now() - stoppedAt < 10_000, `the run ended ${Date.now() - stoppedAt} ms after the stop: the stream's wait was cut short`);
     assert.ok(!claw.sessions.has("plain-1"), "and its session was deleted");
+  } finally { rmSync(r.dir, { recursive: true, force: true }); }
+});
+
+test("R10 an oracle that could not be read is the run's error, before anything is sent", { timeout: 120_000 }, async () => {
+  const claw = new FakeClaw();
+  const base = await claw.start();
+  claw.router = (_content, id) => claw.turn(id, { say: "There are 3 nodes." });
+  const fact = (id: string, query: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer",
+    turns: [{ user: id }], facts: [{ claim: "the count", oracle: { kind: "api", query } }] });
+  const r = runner(base, [fact("t-o-001", "/v1/oracle-down#data.n"), fact("t-o-002", "/v1/oracle-ok#data.n")]);
+  const run = await r.done;
+  await claw.stop();
+  try {
+    assert.match(run.out, /ERROR t-o-001#1 .*infra: the oracle of fact 1 could not be read \(the Claw API answered 503\): not graded/, run.out);
+    assert.match(run.out, /pass t-o-002#1/, "an oracle that answered is graded: 3 is named");
+    assert.deepEqual(claw.sent.map((x) => x.content), ["t-o-002"], "nothing sent for the case whose oracle could not be read");
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });

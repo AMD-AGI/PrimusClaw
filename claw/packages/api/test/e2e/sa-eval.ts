@@ -323,12 +323,16 @@ async function idle(sessionId: string, waitMs: number): Promise<boolean> {
 /** The values each fact expects, read now with the eval identity: the Claw API, GitHub, or a read tool of the plugin. */
 async function factValues(c: EvalCase): Promise<Array<string[] | null>> {
   const out: Array<string[] | null> = [];
-  for (const f of c.facts ?? []) {
+  for (const [k, f] of (c.facts ?? []).entries()) {
     const o = f.oracle;
     const q = oracleQuery(o);
-    // An oracle that could not be read expects something unnamed: the fact fails, it is never skipped.
-    if (q) out.push(await readOracle(q).catch(() => []));
-    else out.push(o && o.kind !== "api" && o.value !== undefined ? [o.value] : null);
+    if (!q) { out.push(o && o.kind !== "api" && o.value !== undefined ? [o.value] : null); continue; }
+    // An oracle that could not be read (an error status, an outage, a server it may not call) says nothing about the answer:
+    // the attempt is the run's error, before anything is sent; never a pass, never the assistant's FAIL. One that was read and
+    // picked nothing expects something unnamed, and the fact fails.
+    try { out.push(await readOracle(q)); } catch (err) {
+      throw new Error(`infra: the oracle of fact ${k + 1} could not be read (${err instanceof Error ? err.message : String(err)}): not graded`);
+    }
   }
   return out;
 }
@@ -336,7 +340,8 @@ async function factValues(c: EvalCase): Promise<Array<string[] | null>> {
 async function readOracle(q: OracleQuery): Promise<string[]> {
   if (q.via === "claw") {
     const r = await api("GET", q.path);
-    return r.status === 200 ? pick(r.json, q.at) : [];
+    if (r.status !== 200) throw new Error(`the Claw API answered ${r.status}`);
+    return pick(r.json, q.at);
   }
   if (q.via === "github") {
     const tokenFile = process.env.EVAL_GITHUB_TOKEN_FILE;
@@ -345,13 +350,14 @@ async function readOracle(q: OracleQuery): Promise<string[]> {
     const res = await fetch(`${root}${q.path}`, {
       headers: { accept: "application/vnd.github+json", ...(token ? { authorization: `Bearer ${token}` } : {}) }, signal: AbortSignal.timeout(30_000),
     });
-    return res.status === 200 ? pick(await res.json(), q.at) : [];
+    if (res.status !== 200) throw new Error(`GitHub answered ${res.status}`);
+    return pick(await res.json(), q.at);
   }
   if (!oracleMayRun(q, ROUTER_READS)) throw new Error(`mcp:${q.server}/${q.tool} is not one of the router's reads`);
   const client = await mcpClient(q.server);
   const r = await client.callTool({ name: q.tool, arguments: q.args }) as { content?: Array<{ type: string; text?: string }>; isError?: boolean };
   const text = r.content?.find((x) => x.type === "text")?.text ?? "";
-  if (r.isError) return [];
+  if (r.isError) throw new Error(`mcp:${q.server}/${q.tool} answered an error`);
   let json: unknown = text;
   try { json = JSON.parse(text); } catch { /* a plain-text answer: picked as it is */ }
   return pick(json, q.at);
@@ -380,6 +386,8 @@ function mcpClient(server: string): Promise<Client> {
       await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers } }));
       return client;
     })();
+    // A connection that failed is tried again by the next oracle, not remembered as the server's answer.
+    c.catch(() => mcpClients.delete(server));
     mcpClients.set(server, c);
   }
   return c;
