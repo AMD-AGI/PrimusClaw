@@ -161,10 +161,9 @@ export function repoGrounded(text: string, pr: Pick<PrRef, "owner" | "repo">, ch
  * `pull request #12` (a pull request, whatever item has that number).
  */
 export function mentionsItem(text: string, seq: number): boolean {
-  for (const m of text.matchAll(new RegExp(`(?<![A-Za-z0-9_.-])#${seq}(?![0-9])`, "g"))) {
-    if (!/(?:\bprs?|\bpull(?:\s+request)?|拉取请求|合并请求)[\s:：]*$/i.test(text.slice(0, m.index))) return true;
-  }
-  return false;
+  // What comes before each `#` is read backwards from it, as a lookbehind, so a long message is read once and not once per `#`.
+  const pullRequestWord = String.raw`(?:\bprs?|\bpull(?:\s+request)?|拉取请求|合并请求)[\s:：]*#`;
+  return new RegExp(`(?<![A-Za-z0-9_.-])#(?<!${pullRequestWord})${seq}(?![0-9])`, "i").test(text);
 }
 
 /**
@@ -392,11 +391,50 @@ export function reviewerReply(text: string, person: ChannelPerson & { user_id: s
   return `${plain} (${person.user_id})`;
 }
 
-/** The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased. */
+const isAlnum = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+const isOwnerChar = (c: number): boolean => isAlnum(c) || c === 45; // [A-Za-z0-9-]
+const isRepoChar = (c: number): boolean => isOwnerChar(c) || c === 95 || c === 46; // [A-Za-z0-9_.-]
+const isDigit = (c: number): boolean => c >= 48 && c <= 57;
+
+/**
+ * The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased: what
+ * `/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9_.-]+)(?:#|\/pull\/)(\d{1,9})(?![0-9])/g` finds, read in one pass so that a long message
+ * costs its length and not its length squared. An owner runs to the end of its characters wherever it starts in them, and so does
+ * a repository, so a place that names nothing tells the scan to go on after the owner's characters, not from the next character.
+ */
 export function fullRefsIn(text: string): string[] {
   const out: string[] = [];
-  for (const m of text.matchAll(/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9_.-]+)(?:#|\/pull\/)(\d{1,9})(?![0-9])/g)) {
-    out.push(`${m[1]}/${m[2]}#${m[3]}`.toLowerCase());
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    if (!isAlnum(text.charCodeAt(i))) {
+      i++;
+      continue;
+    }
+    let slash = i + 1;
+    while (slash < n && isOwnerChar(text.charCodeAt(slash))) slash++;
+    if (text.charCodeAt(slash) !== 47 /* / */) {
+      i = slash;
+      continue;
+    }
+    let end = slash + 1;
+    while (end < n && isRepoChar(text.charCodeAt(end))) end++;
+    let digits = -1;
+    if (end > slash + 1) {
+      if (text.charCodeAt(end) === 35 /* # */) digits = end + 1;
+      else if (text.startsWith("/pull/", end)) digits = end + 6;
+    }
+    if (digits >= 0) {
+      // 1 to 9 digits, and no tenth: reading ten is enough to tell.
+      let stop = digits;
+      while (stop < n && stop - digits < 10 && isDigit(text.charCodeAt(stop))) stop++;
+      if (stop > digits && stop - digits <= 9) {
+        out.push(`${text.slice(i, slash)}/${text.slice(slash + 1, end)}#${text.slice(digits, stop)}`.toLowerCase());
+        i = stop;
+        continue;
+      }
+    }
+    i = slash;
   }
   return out;
 }
@@ -732,7 +770,9 @@ async function waitingWhenWritten(q: Querier, userId: string, at: Date): Promise
  * through (it can be misread, and the router reads what workers wrote beside it); the card's button still does.
  */
 export function approvalCommand(text: string): string | null {
-  const m = /^\s*(?:批准|approve)\s*[#＃]\s*([0-9a-f]{6}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*[.。!！]*\s*$/i.exec(text);
+  // The closing spaces and punctuation are matched one way only (`\s*[.。!！]*\s*` would let spaces go to either `\s*`, and trying
+  // every split costs a long run of spaces its length squared).
+  const m = /^\s*(?:批准|approve)\s*[#＃]\s*([0-9a-f]{6}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*(?:[.。!！]+\s*)?$/i.exec(text);
   return m ? m[1].toLowerCase() : null;
 }
 
