@@ -343,6 +343,8 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
   if (sup === "systemd") {
     const unit = systemdUnitPath(ctx, d);
     writeFile600(unit, systemdUnit(d, vars));
+    // Recorded before the first start, which may already end in 78: `login` must still find the unit to restart.
+    recordInstalled(ctx, "systemd");
     if (!d.systemdBooted()) { ctx.err("systemd is not this machine's init (no /run/systemd/system): use --supervisor script"); return 1; }
     for (const a of [["--user", "daemon-reload"], ["--user", "enable", UNIT], ["--user", "restart", UNIT]]) {
       const r = d.exec("systemctl", a);
@@ -351,7 +353,6 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
     // Believe the unit is up only when systemd says so.
     const st = d.exec("systemctl", ["--user", "is-active", UNIT]).out.trim();
     if (st !== "active" && st !== "activating") { ctx.err(`the unit did not start (is-active: ${st || "nothing"}); see: journalctl --user -u ${UNIT}`); return 1; }
-    recordInstalled(ctx, "systemd");
     ctx.out(`installed ${unit} and started it (systemctl --user status ${UNIT}; logs: journalctl --user -u ${UNIT})`);
     const linger = d.exec("loginctl", ["show-user", d.user, "-p", "Linger", "--value"]);
     if (linger.out.trim() !== "yes") ctx.out(`to keep it running when you are not logged in and start it at boot, run once: loginctl enable-linger ${d.user}`);
@@ -359,10 +360,10 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
     const plist = launchdPlistPath(d);
     // 0600: the proxy URLs it carries may hold a password. launchd reads a LaunchAgent as its owner.
     writeFile600(plist, launchdPlist(d, vars, runLogFile(ctx.dirs)));
+    recordInstalled(ctx, "launchd");
     d.exec("launchctl", ["bootout", `gui/${d.uid}/${LABEL}`]);
     const r = d.exec("launchctl", ["bootstrap", `gui/${d.uid}`, plist]);
     if (r.code !== 0) { ctx.err(`launchctl bootstrap failed: ${r.out || `exit ${r.code}`}`); return 1; }
-    recordInstalled(ctx, "launchd");
     ctx.out(`installed ${plist} and started it (launchctl print gui/${d.uid}/${LABEL}; log: ${runLogFile(ctx.dirs)})`);
   } else {
     const script = keepaliveFile(ctx.dirs);

@@ -135,6 +135,10 @@ describe("service install / uninstall / status", () => {
     const a = ctx(home, { service: { ...D(), exec: f.exec } }, { XDG_CONFIG_HOME: tmpdir("xdg-") });
     assert.equal(await main(["service", "install", "--supervisor", "systemd"], a.c), EXIT.failure);
     assert.match(a.errText(), /did not start \(is-active: failed\)/);
+    // The unit is enabled even though its first run failed (say, exit 78): a later login must find it to restart.
+    f.calls.length = 0;
+    await main(["login", "--server", "https://claw.example", "--key", "k2"], ctx(home, { service: { ...D(), exec: f.exec } }).c);
+    assert.deepEqual(f.calls, ["systemctl --user restart claw-connector.service"]);
     const { detectSupervisor } = await import("../src/service.js");
     assert.equal(detectSupervisor({ ...(D() as ServiceDeps), exec: fakeExec({ "systemctl --user is-system-running": { code: 1, out: "offline" } }).exec }), "script");
     assert.equal(detectSupervisor({ ...(D({ platform: "darwin" }) as ServiceDeps), exec: fakeExec().exec }), "launchd");
