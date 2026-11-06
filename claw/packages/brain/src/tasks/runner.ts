@@ -272,8 +272,13 @@ async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteReque
  * a completion carrying a generation the row never handed out would close a
  * row this run does not own.
  */
-function runIdentity(request: ExecuteRequest): ExecCompleteRunIdentity {
-  const runClaim = currentFatDelivery()?.runClaim;
+function runIdentity(request: ExecuteRequest, claimedGeneration?: number): ExecCompleteRunIdentity {
+  // A claimed doorbell holds the generation its claim minted, outside any fat
+  // delivery context. Carried so the API closes the row only while that claim
+  // is still the row's: a completion from a holder that stood down (a lost
+  // lease, the lock's self-fence) and was succeeded by another claim no longer
+  // matches, however late the event arrives.
+  const runClaim = currentFatDelivery()?.runClaim ?? claimedGeneration;
   // A fat payload published by an API that predates the field carries no
   // `task_id`, only the lease URL -- and the URL names the row, which is why
   // `resolveRunIdentity` already reads it. Without the same fallback here such
@@ -3535,7 +3540,7 @@ class TaskRunner {
       skill_file_mutations: result.pendingSkillFileMutations,
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
-      ...runIdentity(this.request),
+      ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
     }, { stillMine: () => !this.leaseLost }).catch((err: unknown) => {
       if (err instanceof EmitStoodDownError) throw LEASE_LOST_ABORT_REASON;
       throw err;
@@ -4000,7 +4005,7 @@ class TaskRunner {
       selected_skills: Object.keys(this.request.skills || {}),
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
-      ...runIdentity(this.request),
+      ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
     });
     await deliverAgentDone(
       this.kvCkpt,
@@ -4261,7 +4266,7 @@ class TaskRunner {
       selected_skills: Object.keys(this.request.skills || {}),
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
-      ...runIdentity(this.request),
+      ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
     });
     // Task DAG: tell Backend the task failed so the scheduler can cascade
     // to downstream nodes and (eventually) tear sandboxes down.

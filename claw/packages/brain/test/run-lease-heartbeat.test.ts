@@ -111,15 +111,19 @@ async function runScenario(opts: {
   leaseVerdict?: (n: number) => string;
   /** Side effects to replace on top of the scenario's own. */
   overrides?: Partial<TaskRunnerSideEffects>;
+  /** Run as a claimed doorbell holding this generation. */
+  claimCount?: number;
 }) {
   const renewals: LeaseRenewal[] = [];
   const emitted: string[] = [];
+  const completions: Array<Record<string, unknown>> = [];
   const { msg } = fakeMsg();
   const { kv } = fakeKv();
   const { kv: kvCkpt } = fakeKv();
   const emitter = { async emit(_s: string, evt: Record<string, unknown>, o?: { stillMine?: () => boolean }) {
     if (o?.stillMine && !o.stillMine()) throw new EmitStoodDownError(String(evt.type));
     emitted.push(String(evt.type));
+    if (evt.type === "exec_complete") completions.push(evt);
   } } as unknown as NatsEmitter;
   const noop = <T>(value: T) => (..._a: unknown[]) => Promise.resolve(value) as never;
 
@@ -187,8 +191,11 @@ async function runScenario(opts: {
   const abortCtrl = new AbortController();
   const lockKey = `lock.${SESSION}`;
   activeAbort.set(lockKey, abortCtrl);
-  await runHandleTask(msg, request, SESSION, lockKey, MESSAGE, "u1", abortCtrl);
-  return { renewals, abortCtrl, emitted };
+  await runHandleTask(
+    msg, request, SESSION, lockKey, MESSAGE, "u1", abortCtrl,
+    opts.claimCount === undefined ? null : { claimCount: opts.claimCount },
+  );
+  return { renewals, abortCtrl, emitted, completions };
 }
 
 test("a run with a lease claims it before it starts working", async () => {
@@ -559,4 +566,17 @@ test("a run that passes its self-fence while saving its work does not publish a 
     },
   });
   assert.ok(!emitted.includes("exec_complete"), `published: ${emitted.join(", ")}`);
+});
+
+test("a claimed doorbell's completion names the claim it holds", async () => {
+  // Without it the API closes the row whatever claim now holds it, so a
+  // completion that was already in flight when its holder stood down could
+  // close the row of the brain that took the run over.
+  const { completions } = await runScenario({
+    lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+    claimCount: 3,
+  });
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].run_claim, 3);
+  assert.equal(completions[0].task_id, TASK);
 });
