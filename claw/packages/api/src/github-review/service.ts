@@ -855,15 +855,16 @@ export class GithubReview {
       throw err;
     }
     state = await this.settleMergeState(ctx, ref, pr, state, false);
-    if (state.queueEntry) return { status: "queued", already_queued: true, url: pr.url, head_sha: pr.headSha, queue_entry_id: state.queueEntry.id };
+    // Already in the merge queue (queued by a person): nothing to write, but the reviewer's held merge of this head is closed below as well.
+    const alreadyQueued = state.queueEntry;
     const queue = this.viaQueue(ctx, state);
-    if (!queue && state.mergeStateStatus !== "CLEAN") {
+    if (!alreadyQueued && !queue && state.mergeStateStatus !== "CLEAN") {
       return waiting("merge_state_not_clean", `GitHub's merge state is ${state.mergeStateStatus} (review decision ${state.reviewDecision ?? "none"}), not CLEAN`);
     }
     const method = (["squash", "merge", "rebase"] as const).find((m) => repo.methods.includes(m));
-    if (!queue && !method) return waiting("merge_method_not_allowed", this.methodRefusal(repo).message);
-    if (queue && !state.nodeId) return waiting("unreadable_pull_request", "GitHub did not give the pull request's id");
-    if (!ctx.settings.writesEnabled) {
+    if (!alreadyQueued && !queue && !method) return waiting("merge_method_not_allowed", this.methodRefusal(repo).message);
+    if (!alreadyQueued && queue && !state.nodeId) return waiting("unreadable_pull_request", "GitHub did not give the pull request's id");
+    if (!alreadyQueued && !ctx.settings.writesEnabled) {
       ctx.acc.dryRun = true;
       return { status: "would_merge", url: pr.url, head_sha: pr.headSha, note: "writes are switched off in this deployment: nothing was merged" };
     }
@@ -877,6 +878,12 @@ export class GithubReview {
       const held = await claimHeldMerges(this.deps.db, f.sessionId, pr.headSha, f.requesterUserId);
       if (held === null) return waiting("reviewer_deciding", "the reviewer is deciding the held merge right now");
       claimed.push(...held);
+      if (alreadyQueued) {
+        for (const id of claimed.splice(0)) {
+          await finishConfirmation(this.deps.db, id, "stale", f.requesterUserId, { by: "github", reason: "pr_queued", queue_entry_id: alreadyQueued.id });
+        }
+        return { status: "queued", already_queued: true, url: pr.url, head_sha: pr.headSha, queue_entry_id: alreadyQueued.id };
+      }
       await this.limits(ctx, pr.headSha);
       ctx.acc.write = true;
       let body: Record<string, unknown>;

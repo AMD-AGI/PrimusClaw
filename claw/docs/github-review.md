@@ -168,7 +168,7 @@ audit row with tool `gh_pr_follow` each time):
   holds, read at that moment: the pull request is open and not a draft; R's account is its author and may push; this review session
   posted an approval of the current head with X's account (the review id on its own audit row), and GitHub still has that review as
   `APPROVED` on that commit (a push or a dismissal takes it back); CI is green on the head, no review thread is open, and GitHub's merge
-  state is `CLEAN` (a merge queue: it is queued as R, never merged directly); and nobody is answering X's held merge right now (X's
+  state is `CLEAN` (a merge queue: it is queued as R, never merged directly; a pull request someone already queued is not written to, and X's held merge of that head is closed as `stale`, `pr_queued`); and nobody is answering X's held merge right now (X's
   answer, or X's write lock on the pull request, goes first). The merge is pinned to the head (`sha`), counts against the hourly write
   limits, and is made only with `CLAW_GITHUB_WRITES_ENABLED`. X's held merge for that head is then closed as `merged` (or `queued`),
   decided by R (`decided_via: {"kind": "requester"}`, `result.by: "requester"`), so X's card or `批准 #<ref>` for it answers that it no

@@ -17,6 +17,8 @@
  *   F8  alice has no GitHub account bound: the pull request is read with bob's account, nothing is merged
  *   F9  writes switched off: every gate is read and nothing is merged
  *   F10 a merge queue: the pull request is queued as alice, never merged directly
+ *   F11 already in the merge queue: nothing is written, bob's held merge is closed (not left counting against his limit), and bob
+ *       deciding it right now still goes first
  */
 import assert from "node:assert/strict";
 import { after, afterEach, beforeEach, describe, test } from "node:test";
@@ -238,5 +240,23 @@ describe("F the requester's merge after the reviewer's approval", () => {
     assert.equal(e.gh.enqueues.length, 1);
     assert.equal(e.gh.enqueues[0]!.authorization, `Bearer ${REQUESTER_TOKEN}`);
     assert.equal((await statusOf(held)).status, "queued");
+  });
+
+  test("F11 already in the merge queue: nothing is written and bob's held merge is closed, unless bob is deciding it right now", async () => {
+    await approvedByBob();
+    e.gh.graphql.isInMergeQueue = true;
+    e.gh.graphql.mergeQueueEntry = { id: "MQE_9", position: 2, state: "QUEUED" };
+    const held = await heldForBob();
+    await e.sql("UPDATE claw_github_confirmations SET status = 'merging' WHERE confirmation_id = $1", [held]);
+    let o = await follow();
+    assert.equal(o.body.reason, "reviewer_deciding", o.text);
+    await e.sql("UPDATE claw_github_confirmations SET status = 'pending' WHERE confirmation_id = $1", [held]);
+    o = await follow();
+    assert.equal(o.body.status, "queued", o.text);
+    assert.equal(o.body.already_queued, true);
+    assert.equal(e.gh.enqueues.length, 0);
+    assert.equal(writes().length, 0);
+    const c = await statusOf(held);
+    assert.deepEqual([c.status, c.result.reason], ["stale", "pr_queued"]);
   });
 });
