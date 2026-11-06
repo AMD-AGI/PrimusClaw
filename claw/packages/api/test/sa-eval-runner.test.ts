@@ -26,7 +26,7 @@
  *   R7 a stream that missed a stored event of the case (a leak in a say it never delivered): an error, not a grade; an item whose
  *      work_create answer the stream missed is still closed with its worker's session; an assistant session still running
  *      before a case: nothing is sent, an error
- *   R9 a judge that gives no verdict (an error status, no PASS or FAIL) makes the attempt an error of the run, not a FAIL; its
+ *   R9 a judge that gives no verdict (an error status, no PASS or FAIL twice) makes the attempt an error of the run, not a FAIL; its
  *      FAIL fails, its PASS passes. R3e a stop while the stream holds its history back ends the wait at once
  *   R10 an oracle that could not be read makes the attempt the run's error before anything is sent; one that answers is graded
  *   R11 a read the grade needs that failed (a worker's events, the board through the item wait) makes the attempt the run's
@@ -655,12 +655,13 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
   it("R9 a judge that gives no verdict is the run's error, not the assistant's FAIL", { timeout: 120_000 }, async () => {
     const claw = new FakeClaw();
     const base = await claw.start();
-    claw.judgeAnswers = [503, "Hmm, hard to say.", "FAIL: wrong count", "PASS: names the count"];
+    // An answer without a verdict is asked once more: t-j-002 gets none twice, t-j-005 gets one on the second ask.
+    claw.judgeAnswers = [503, "Hmm, hard to say.", "Still unsure.", "FAIL: wrong count", "PASS: names the count", "Let me think.", "**PASS**: on a second ask"];
     claw.router = (_content, id) => claw.turn(id, { say: "There are 3 nodes." });
     const answer = (id: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: id }] });
     const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
     writeFileSync(join(dir, "judge-key"), "judge-key-not-a-secret\n");
-    const r = runner(base, ["t-j-001", "t-j-002", "t-j-003", "t-j-004"].map(answer),
+    const r = runner(base, ["t-j-001", "t-j-002", "t-j-003", "t-j-004", "t-j-005"].map(answer),
       { EVAL_JUDGE_URL: `${base}/judge`, EVAL_JUDGE_MODEL: "m", EVAL_JUDGE_KEY_FILE: join(dir, "judge-key") }, dir);
     const run = await r.done;
     await claw.stop();
@@ -669,6 +670,8 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.match(run.out, /ERROR t-j-002#1 .*infra: judge gave no PASS or FAIL/);
       assert.match(run.out, /FAIL t-j-003#1/);
       assert.match(run.out, /pass t-j-004#1/);
+      assert.match(run.out, /pass t-j-005#1/);
+      assert.equal(claw.judgeAnswers.length, 0, "every answer was asked for");
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

@@ -56,7 +56,7 @@ import {
   type Arms,
   apiQuery, caseSays, cardsOf, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
-  assistantInUse, capRefusedSays, countedSays, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded,
+  assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded,
 } from "./e2e/sa-eval-lib.js";
 
 const SEED_DIR = join(dirname(fileURLToPath(import.meta.url)), "e2e", "sa-eval-cases");
@@ -649,6 +649,16 @@ test("S20 sharing an identity", async () => {
   assert.equal(await deleteSessionConfirmed(stays.api, "s1", Date.now() + 50, 10, (ms) => new Promise((r) => setTimeout(r, ms))), false, "never seen gone");
 });
 
+test("S22 the judge's verdict", () => {
+  assert.equal(judgeVerdict("PASS: refuses and runs nothing"), "PASS");
+  assert.equal(judgeVerdict("  fail - wrong number"), "FAIL");
+  assert.equal(judgeVerdict("**FAIL**: the reply names no workspace"), "FAIL", "markdown emphasis");
+  assert.equal(judgeVerdict("Verdict: PASS. The reply ..."), "PASS", "a verdict label");
+  assert.equal(judgeVerdict("The reply is fine, so PASS"), undefined, "the verdict must come first");
+  assert.equal(judgeVerdict("PASSWORD reset is not a verdict"), undefined);
+  assert.equal(judgeVerdict(""), undefined);
+});
+
 test("S21 what the stream missed", () => {
   const row = (event_id: string, data: Record<string, unknown>) => ({ event_id, event_type: String(data.type), created_at: new Date(0).toISOString(), data });
   const rows = [
@@ -658,9 +668,10 @@ test("S21 what the stream missed", () => {
     row("claw-4", { type: "exec_complete", message_id: "m1" }),
     row("claw-5", { type: "toolUsed", message_id: "other" }),
     row("claw-6", { type: "AssistantSay", item: { item_id: "i9" }, text: "not ours" }),
+    row("claw-7", { type: "UserMessage", message_id: "m1", role: "user" }),
   ];
   const seen = (...ids: string[]) => ids.map((id) => ev(0, { type: "x" }, id));
-  assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2", "claw-3"), ["m1"], ["i1"]), [], "exec_complete is never streamed; others' events are not the case's");
+  assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2", "claw-3"), ["m1"], ["i1"]), [], "exec_complete and the user's own message are never live on a stream; others' events are not the case's");
   assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-3"), ["m1"], ["i1"]), ["claw-2"], "a say of the case's turn the stream missed");
   assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2"), ["m1"], ["i1"]), ["claw-3"], "a say about the case's item");
   assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2"), ["m1"]), [], "an item the case did not start is not looked at");
