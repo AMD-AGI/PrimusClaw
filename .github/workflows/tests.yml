@@ -32,9 +32,12 @@ on:
       - "CODEOWNERS"
       - ".gitattributes"
 
+# One run per pull request: a new head cancels the previous head's run.
+# Every other event (push to main or deploy/**, tags, schedules, manual runs)
+# gets a group of its own, so it is never cancelled or replaced.
 concurrency:
-  group: tests-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -172,7 +175,10 @@ jobs:
   claw:
     name: ${{ matrix.check }}
     needs: claw-shard
-    if: always()
+    # !cancelled(), not always(): it still reports failed shards, but a run
+    # cancelled because the pull request has a newer head no longer queues
+    # this job for a runner.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
