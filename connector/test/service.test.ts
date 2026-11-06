@@ -52,13 +52,14 @@ const D = (over: Partial<ServiceDeps> = {}): Partial<ServiceDeps> => {
 
 describe("the units", () => {
   test("the systemd unit restarts 5 s after any failure but never after 78, starts run --supervised, and keeps $ and % literal", () => {
-    const unit = systemdUnit({ node: "/opt/node 22/bin/node", cli: "/x/cli.js" } as ServiceDeps, [["PATH", "/a:/b"], ["HTTPS_PROXY", "http://u:p%41$x@h:3128"]]);
+    const unit = systemdUnit({ node: "/opt/node 22/bin/node", cli: "/x/$HOME/cli.js" } as ServiceDeps, [["PATH", "/a:/b"], ["HTTPS_PROXY", "http://u:p%41$x@h:3128"]]);
     assert.match(unit, /^Restart=on-failure$/m);
     assert.match(unit, /^RestartSec=5$/m);
     assert.match(unit, /^RestartPreventExitStatus=78$/m);
     assert.match(unit, /^StartLimitIntervalSec=0$/m);
-    assert.match(unit, /^ExecStart="\/opt\/node 22\/bin\/node" "\/x\/cli\.js" run --supervised$/m);
-    assert.match(unit, /^Environment="HTTPS_PROXY=http:\/\/u:p%%41\$\$x@h:3128"$/m);
+    // ExecStart= expands $VAR, so `$` is doubled there; Environment= does not, so it is written as is. `%` is doubled in both.
+    assert.match(unit, /^ExecStart="\/opt\/node 22\/bin\/node" "\/x\/\$\$HOME\/cli\.js" run --supervised$/m);
+    assert.match(unit, /^Environment="HTTPS_PROXY=http:\/\/u:p%%41\$x@h:3128"$/m);
     assert.match(unit, /^WantedBy=default\.target$/m);
   });
 

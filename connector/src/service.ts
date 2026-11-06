@@ -115,8 +115,12 @@ export function carriedEnv(env: NodeJS.ProcessEnv, extra: string[] = []): { vars
   return { vars, refused, withheld };
 }
 
-/** systemd: a word in ExecStart= or a value in Environment=, double-quoted, with `%` (specifiers) and `$` (variables) kept literal. */
-const sdQuote = (s: string) => `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%").replace(/\$/g, "$$$$")}"`;
+/**
+ * systemd quoting, double-quoted with `%` (specifiers) kept literal. Only ExecStart= expands `$VAR`, so only an
+ * ExecStart= word doubles `$`; an Environment= value is taken as written.
+ */
+const sdEnv = (s: string) => `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
+const sdQuote = (s: string) => sdEnv(s).replace(/\$/g, "$$$$");
 const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const sh = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
@@ -132,7 +136,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=${sdQuote(d.node)} ${sdQuote(d.cli)} run --supervised
-${vars.map(([k, v]) => `Environment=${sdQuote(`${k}=${v}`)}`).join("\n")}
+${vars.map(([k, v]) => `Environment=${sdEnv(`${k}=${v}`)}`).join("\n")}
 Restart=on-failure
 RestartSec=${RESTART_SEC}
 # 78: revoked, sign-in refused, or no usable config. Restarting cannot help; "claw-connector login" can.
