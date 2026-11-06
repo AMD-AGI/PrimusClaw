@@ -184,6 +184,9 @@ describe("assistant role profile", { skip }, () => {
     assert.ok(!/now is \d{4}-/.test(task.system_append), "nor the time of this turn");
     assert.equal(task.skills, undefined);
     assert.equal(task.skip_platform_defaults, true, "no default MCP server or skill list for a router");
+    // Quick by default (`router-speed.ts`): little thinking, and its say published while the model writes it.
+    assert.equal(task.effort, "low");
+    assert.deepEqual(task.stream_tool_text, ["mcp__assistant__say"]);
   });
 
   test("A1c marketplace tools a message named are not resolved for a router, and are for a worker", async () => {
@@ -233,6 +236,8 @@ describe("assistant role profile", { skip }, () => {
     assert.deepEqual({ role: claims.role, item: claims.item_id, gen: claims.gen, sid: claims.sid }, { role: "worker", item: item.itemId, gen: 1, sid: item.workerSid });
     assert.equal(first.tools_allowlist, undefined, "a worker keeps every tool");
     assert.equal(first.max_turns, undefined);
+    assert.equal(first.effort, undefined, "a worker thinks as its session chose, not as a router");
+    assert.equal(first.stream_tool_text, undefined);
     assert.deepEqual(Object.keys(first.mcp_servers).sort(), ["assistant", "mine"]);
     assert.ok(first.system_append.startsWith(`${AGENT_GUIDELINE}\n\n`), "a worker does the user's work, under the working guideline");
     assert.match(first.system_append, /You are a worker on one work item/);
