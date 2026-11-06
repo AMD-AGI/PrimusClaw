@@ -500,93 +500,45 @@ export function redactSecrets(text: string, extraSecrets: string[] = []): Redact
  * closing quote, spaces and all, so `"password": "correct horse battery staple"` goes whole.
  */
 const NAMED_VALUE_START_RE = /(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrt])|(?<=(?:^|[^A-Za-z0-9_.\\-])-{1,2}))(\\["']|["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1([ \t]*[:=][ \t]*|(?<=(?:^|[^A-Za-z0-9_.\\-])-{1,2}[A-Za-z_][A-Za-z0-9_.-]{0,63})[ \t]+)((?:[Bb]asic|[Bb]earer|[Tt]oken)\s+)?(\\["']|["']?)/g;
-/**
- * What an unquoted value is checked at: a line's end, a quote, an escape, and the separators and brackets that may end it. Not a
- * space: `a b` is one value.
- */
-const UNQUOTED_VALUE_STOP = /[\r\n"'\\,;&()[\]{}<>]/;
-/** After `,`, `;` or `&`: another `name=` or `name: ` starts there, so the separator ended the value (`?token=x&page=2`). */
-const NEXT_PAIR_RE = /[ \t]*[A-Za-z_][A-Za-z0-9_.-]{0,63}[ \t]*(?:=|:(?=[\s"']))/y;
-const OPENER_OF: Readonly<Record<string, string>> = { ")": "(", "]": "[", "}": "{", ">": "<" };
-const CLOSER_OF: Readonly<Record<string, string>> = { "(": ")", "[": "]", "{": "}", "<": ">" };
-const noBrackets = (): Record<string, number> => ({ ")": 0, "]": 0, "}": 0, ">": 0 });
-/**
- * What may stand before a credential's name on its line for the line to be an assignment, as `env`, `printenv`, `set` and a
- * shell script print one: indentation, and a shell's or a Dockerfile's keyword; or all of that right after a string opens, as
- * the first line of a log inside a JSON answer does (`{"logs":"export DB_PASSWORD=...`, `["DB_PASSWORD=...`, `msg: "...`). Such a
- * value has no structure after `=`: it is masked to its line's end, or to the closing quote of the string it is in, whatever
- * characters it holds. Group 1 is the quote that opened the string on this line, if one did.
- */
-const ASSIGNMENT_LINE_PREFIX_RE = /^(?:(?:[^\r\n]*?[:,[({=])?[ \t]*(\\?["']))?[ \t]*(?:(?:export|declare(?:[ \t]+-[A-Za-z]+)*|typeset(?:[ \t]+-[A-Za-z]+)*|readonly|local|set|ENV)[ \t]+)?$/;
-
-/** The line a named value is on, as `LineTracker` saw it up to the value's name. */
-interface LineContext {
-  /** The name starts its line (after indentation or a shell keyword): the value runs to the line's end. */
-  assignment: boolean;
-  /**
-   * The quote whose closing ends the line's value as well (an assignment's): `"` for a line that began at a JSON string's `\n` or
-   * `\r`, or the quote that opened a string before the name on the line (`\"` inside a JSON string). Empty when none.
-   */
-  closeQuote: string;
-  /** Per closing bracket, how many of its openers before the name on this line are still open. */
-  open: Record<string, number>;
-}
-const NO_LINE: LineContext = { assignment: false, closeQuote: "", open: noBrackets() };
+/** What ends a JSON scalar (a number, `true`, `false`, `null`) after a quoted key: the next member, or the object or array closing. */
+const JSON_SCALAR_END = /[,}\]]/;
+const JSON_SCALAR_RE = /^(?:-?\d[\d.eE+-]*|true|false|null)$/;
 
 /**
- * Where each line of a text starts, and the brackets opened on it, read forward once: `seek(i)` for `i` that never decreases.
- * A line starts after a real line end or a JSON string's `\n` / `\r`; a backslash before any other character escapes it.
+ * Which string each name of a text is in, read forward once: `closeQuoteAt(i)` for `i` that never decreases. Counted per line
+ * from the quotes before the name: a line starts outside any string after a real line end, and inside a JSON string after that
+ * string's `\n` / `\r` (an odd run of backslashes before `n` or `r`). A `"` after an even run of backslashes opens or closes a
+ * string at the top level; a `\"` (one more than a multiple of four) opens or closes one inside a JSON string. A single quote is
+ * not counted: in prose it is an apostrophe.
  */
 class LineTracker {
   private at = 0;
-  private start = 0;
-  private escapedStart = false;
-  private open = noBrackets();
+  /** 0 outside any string, 1 inside a `"` string, 2 inside a `\"` string within it. */
+  private level = 0;
+  /** The backslashes right before `at`. */
+  private run = 0;
 
   constructor(private readonly text: string) {}
 
-  /** Move to `i`; brackets passed count only when `brackets` is set (not inside a value just masked). */
-  private advance(i: number, brackets: boolean): void {
+  /** The quote that closes the string a name starting at `i` is in: empty when it is in none, `"`, or `\"`. */
+  closeQuoteAt(i: number): string {
     const t = this.text;
     for (; this.at < i; this.at += 1) {
       const c = t[this.at];
       if (c === "\n" || c === "\r") {
-        this.start = this.at + 1;
-        this.escapedStart = false;
-        this.open = noBrackets();
+        this.level = 0;
       } else if (c === "\\") {
-        const next = t[this.at + 1];
-        this.at += 1;
-        if (next === "n" || next === "r") {
-          this.start = this.at + 1;
-          this.escapedStart = true;
-          this.open = noBrackets();
-        }
-      } else if (brackets && CLOSER_OF[c]) {
-        this.open[CLOSER_OF[c]] += 1;
-      } else if (brackets && OPENER_OF[c] && this.open[c] > 0) {
-        this.open[c] -= 1;
+        this.run += 1;
+        continue;
+      } else if ((c === "n" || c === "r") && this.run % 2 === 1) {
+        this.level = 1;
+      } else if (c === '"') {
+        if (this.run % 2 === 0) this.level = this.level === 0 ? 1 : 0;
+        else if (this.run % 4 === 1 && this.level > 0) this.level = this.level === 1 ? 2 : 1;
       }
+      this.run = 0;
     }
-  }
-
-  /** The line of a name that starts at `i`, quoted by `quote` (empty when it is not). */
-  context(i: number, quote: string): LineContext {
-    this.advance(i, true);
-    const prefix = i - this.start <= 64 ? this.text.slice(this.start, i) : null;
-    const assignment = quote === "" && prefix !== null ? ASSIGNMENT_LINE_PREFIX_RE.exec(prefix) : null;
-    // A string opened on this line closes first; else, on a JSON string's line, that string's own closing quote.
-    const opened = assignment?.[1] ?? "";
-    return {
-      assignment: assignment !== null,
-      closeQuote: opened ? (this.escapedStart && opened === '"' ? '\\"' : opened) : this.escapedStart ? '"' : "",
-      open: { ...this.open },
-    };
-  }
-
-  /** Move past a masked value without counting its brackets. */
-  skip(i: number): void {
-    this.advance(i, false);
+    return this.level === 0 ? "" : this.level === 1 ? '"' : '\\"';
   }
 }
 
@@ -613,26 +565,31 @@ function forwardFinder(length: number, at: (i: number) => boolean): (from: numbe
  * backslashes before the quote at the top level; one more than a multiple of four inside a JSON string, where the value's own
  * escaped quote is `\\\"`). Without a closing quote it ends at the line's end, where a JSON string's `\n` counts as one.
  *
- * An unquoted value on an assignment line (`DB_PASSWORD=...`, `export DB_PASSWORD=...`) runs to the line's end, and on a line
- * inside a JSON string to the string's closing quote if that comes first: an `env` line has no structure after `=`, and a
- * generated password holds `&`, `;`, `)` and `>` as often as letters. Elsewhere it ends at the line's end, a quote or an escape,
- * and at a separator or a bracket only where the text around it makes it one: `,`, `;` and `&` only when another `name=` follows
- * (`?token=x&page=2`, `{password=x, user=y}`), a closing bracket only when its opener is before the name on the same line and not
- * inside the value (`connect(password=x)`, but `password=<x>` whole). Trailing spaces are not the value's. Each question is
- * answered from scans that only move forward, so a log of any shape costs its length.
+ * An unquoted value runs to its line's end, or, when its name is inside a string (`LineTracker`: the first line of a log in a
+ * JSON answer, any line of one, a message in quotes), to that string's closing quote if it comes first. No separator or bracket
+ * ends it: a generated password holds `&`, `;`, `,`, `)`, `}` and `>` as often as letters, and an `env` line has no structure
+ * after `=`; what follows a credential on its line goes with it. One exception, exact for JSON: after a quoted key, a number,
+ * `true`, `false` or `null` ends at the next `,`, `}` or `]`. Trailing spaces are not the value's. Each question is answered
+ * from scans that only move forward, so a log of any shape costs its length.
  */
 class NamedValueEnds {
   private readonly realLineEnd: (from: number) => number;
   private readonly lineEnd: (from: number) => number;
-  private readonly unquotedStop: (from: number) => number;
+  private readonly scalarEnd: (from: number) => number;
   private readonly closers = new Map<string, (from: number) => number>();
 
   constructor(private readonly text: string) {
     const t = text;
-    const escapedBreak = (i: number) => t[i] === "\\" && (t[i + 1] === "n" || t[i + 1] === "r");
+    // A JSON string's line break, `\n`, or a string's within it, `\\n`: from the first backslash of the run, so none is left over.
+    const escapedBreak = (i: number) => {
+      if (t[i] !== "\\" || t[i - 1] === "\\") return false;
+      let j = i;
+      while (t[j] === "\\") j += 1;
+      return t[j] === "n" || t[j] === "r";
+    };
     this.realLineEnd = forwardFinder(t.length, (i) => t[i] === "\n" || t[i] === "\r");
     this.lineEnd = forwardFinder(t.length, (i) => t[i] === "\n" || t[i] === "\r" || escapedBreak(i));
-    this.unquotedStop = forwardFinder(t.length, (i) => UNQUOTED_VALUE_STOP.test(t[i]));
+    this.scalarEnd = forwardFinder(t.length, (i) => JSON_SCALAR_END.test(t[i]));
   }
 
   /** The closing quote of this kind at or after `from`: the index its delimiter starts at. */
@@ -653,50 +610,31 @@ class NamedValueEnds {
     return find;
   }
 
-  /** Where the closing `quote` at or after `from` starts (its backslash, for an escaped one). */
-  private closingAt(from: number, quote: string): number {
-    const mark = this.closer(quote)(from);
-    return quote.length === 2 && mark < this.text.length ? mark - 1 : mark;
-  }
-
-  /** The end (exclusive) of the value starting at `from`, opened by `quote` (empty, or a quote with its escape), on `line`. */
-  end(from: number, quote: string, line: LineContext): number {
-    const quoted = /["']$/.test(quote);
-    if (quoted) {
+  /**
+   * The end (exclusive) of the value starting at `from`, opened by `quote` (empty, or a quote with its escape), after a name that
+   * was quoted (`keyQuoted`) and is inside the string `closeQuote` closes (empty: none).
+   */
+  end(from: number, quote: string, keyQuoted: boolean, closeQuote: string): number {
+    const t = this.text;
+    let end: number;
+    if (/["']$/.test(quote)) {
       const mark = this.closer(quote)(from);
       const close = quote.length === 2 ? mark - 1 : mark;
-      if (mark < this.text.length && close >= from && mark < this.realLineEnd(from)) return close;
-    }
-    let end: number;
-    if (quoted) end = this.lineEnd(from);
-    else if (line.assignment) end = line.closeQuote ? Math.min(this.lineEnd(from), this.closingAt(from, line.closeQuote)) : this.lineEnd(from);
-    else end = this.unquotedEnd(from, line);
-    while (end > from && /\s/.test(this.text[end - 1])) end -= 1;
-    return end;
-  }
-
-  /** An unquoted value off an assignment line: to the first quote, escape or line end, or a separator or bracket that ends it. */
-  private unquotedEnd(from: number, line: LineContext): number {
-    const t = this.text;
-    const limit = this.lineEnd(from);
-    const inValue = noBrackets();
-    for (let i = from; ;) {
-      const e = this.unquotedStop(i);
-      if (e >= limit) return limit;
-      const c = t[e];
-      i = e + 1;
-      if (CLOSER_OF[c]) {
-        inValue[CLOSER_OF[c]] += 1;
-      } else if (OPENER_OF[c]) {
-        if (inValue[c] > 0) inValue[c] -= 1;
-        else if (line.open[c] > 0) return e;
-      } else if (c === "," || c === ";" || c === "&") {
-        NEXT_PAIR_RE.lastIndex = e + 1;
-        if (NEXT_PAIR_RE.test(t)) return e;
-      } else {
-        return e;
+      if (mark < t.length && close >= from && mark < this.realLineEnd(from)) return close;
+      end = this.lineEnd(from);
+    } else {
+      end = this.lineEnd(from);
+      if (closeQuote) {
+        const mark = this.closer(closeQuote)(from);
+        end = Math.min(end, closeQuote.length === 2 && mark < t.length ? mark - 1 : mark);
+      }
+      if (keyQuoted) {
+        const scalar = Math.min(end, this.scalarEnd(from));
+        if (JSON_SCALAR_RE.test(t.slice(from, scalar).trim())) end = scalar;
       }
     }
+    while (end > from && /\s/.test(t[end - 1])) end -= 1;
+    return end;
   }
 }
 
@@ -801,16 +739,16 @@ const ENV_PAIR_YAML_RE = /(?:^|\n|\r|\\n|\\r)[ \t]*(?:-[ \t]+)?name:[ \t]*(\\?["
 
 /** The values of Kubernetes environment variables whose name is a credential's (`ENV_PAIR_*_RE`). */
 function maskEnvPairs(text: string): { text: string; hits: number } {
-  type Pair = { from: number; quote: string; line: LineContext };
+  type Pair = { from: number; quote: string; keyQuoted: boolean; closeQuote: string };
   const pairs: Pair[] = [];
   ENV_PAIR_JSON_RE.lastIndex = 0;
   for (let m = ENV_PAIR_JSON_RE.exec(text); m; m = ENV_PAIR_JSON_RE.exec(text)) {
-    if (isSensitiveKey(m[2])) pairs.push({ from: m.index + m[0].length, quote: m[3], line: NO_LINE });
+    if (isSensitiveKey(m[2])) pairs.push({ from: m.index + m[0].length, quote: m[3], keyQuoted: true, closeQuote: "" });
   }
   ENV_PAIR_YAML_RE.lastIndex = 0;
   for (let m = ENV_PAIR_YAML_RE.exec(text); m; m = ENV_PAIR_YAML_RE.exec(text)) {
     if (isSensitiveKey(m[2])) {
-      pairs.push({ from: m.index + m[0].length, quote: m[4], line: { assignment: true, closeQuote: m[3].startsWith("\\") ? '"' : "", open: noBrackets() } });
+      pairs.push({ from: m.index + m[0].length, quote: m[4], keyQuoted: false, closeQuote: m[3].startsWith("\\") ? '"' : "" });
     }
   }
   if (!pairs.length) return { text, hits: 0 };
@@ -821,7 +759,7 @@ function maskEnvPairs(text: string): { text: string; hits: number } {
   let hits = 0;
   for (const p of pairs) {
     if (p.from < kept) continue;
-    const end = ends.end(p.from, p.quote, p.line);
+    const end = ends.end(p.from, p.quote, p.keyQuoted, p.closeQuote);
     const value = text.slice(p.from, end);
     if (!value || NOT_A_VALUE_RE.test(value)) continue;
     hits += 1;
@@ -855,14 +793,13 @@ export function redactLogSecrets(text: string, extraSecrets: string[] = []): Red
     const from = m.index + start.length;
     // `"env": [...]`, `"auth": {...}`: a structure, whose own entries are judged by their own names.
     if (!q2 && !scheme && sep.includes(":") && (out[from] === "[" || out[from] === "{")) continue;
-    const end = ends.end(from, q2, lines.context(m.index, q1));
+    const end = ends.end(from, q2, q1 !== "", lines.closeQuoteAt(m.index));
     const value = out.slice(from, end);
     // Any value but a switch or a placeholder, however short: `password=abc` is a credential too.
     if (!value || NOT_A_VALUE_RE.test(value)) continue;
     hits += 1;
     masked += `${out.slice(kept, m.index)}${q1}${name}${q1}${sep}${scheme}${q2}<redacted>`;
     kept = end;
-    lines.skip(end);
     NAMED_VALUE_START_RE.lastIndex = end;
   }
   const pairs = maskEnvPairs(masked + out.slice(kept));

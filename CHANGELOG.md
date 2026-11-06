@@ -49,9 +49,8 @@ record it.
   `teams-reply-style` rule. Its log reads go to Brain as the new `ExecuteRequest.log_reads` (each read's line-counting
   argument, empty for `workload_pod_containers`, which counts nothing but whose termination messages can hold a log's end):
   Brain asks for at most 40 lines or entries, masks credential-shaped text in the answer before the model, an event or a log
-  line sees it (new `redactLogSecrets` of @claw/utils: `redactSecrets`; values after a credential's name, where an assignment
-  line's value runs to the line's end and elsewhere a separator or a bracket ends a value only where another pair follows or its
-  opener stands before the name; Kubernetes environment variables named like a credential; armored private keys, OpenPGP ones
+  line sees it (new `redactLogSecrets` of @claw/utils: `redactSecrets`; values after a credential's name, where an unquoted
+  value runs to its line's end, or to the closing quote of the string its name is in, and no separator or bracket ends it; Kubernetes environment variables named like a credential; armored private keys, OpenPGP ones
   included, and a key whose BEGIN line the tail cut off, from its first base64 line), and keeps the last 6000 characters of a
   plain-text answer.
 - Citations for the assistant router's answers, behind `CLAW_ASSISTANT_CITATIONS` (default off). The router writes [1], [2] in its

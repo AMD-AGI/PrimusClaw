@@ -205,25 +205,44 @@ test("L14 an assignment line's value runs to the line's end, whatever separators
   }
 });
 
-test("L15 off an assignment line a separator or a bracket ends a value only where the text makes it one", () => {
+test("L15 no separator or bracket ends a value: the rest of its line, or of the string it is in, goes with it", () => {
   for (const [text, want] of [
-    // Another pair follows: a query string, a map's next entry, a cookie's attribute.
-    ["GET /cb?code=1&access_token=Xy7&page=2 200", "GET /cb?code=1&access_token=<redacted>&page=2 200"],
-    ["config {password=Xy7, user=alice}", "config {password=<redacted>, user=alice}"],
-    ["X-Trace: a=1; token=abc; Path=/", "X-Trace: a=1; token=<redacted>; Path=/"],
-    // An opener before the name closes after the value.
-    ["connect(host=db, password=Xy7&k)", "connect(host=db, password=<redacted>)"],
-    // Otherwise they are the value's.
+    // What a generated password holds, wherever the name stands on its line.
     ["job 3: export DB_PASSWORD=Xy7&kLm9", "job 3: export DB_PASSWORD=<redacted>"],
     ["[pod/a] PASSWORD=abc;def&ghi", "[pod/a] PASSWORD=<redacted>"],
+    ["2026-11-06 ERROR DB_PASSWORD=Abc&region=secret", "2026-11-06 ERROR DB_PASSWORD=<redacted>"],
     ["got password=<hunter2> from env", "got password=<redacted>"],
     ["got password=ab)c,d done", "got password=<redacted>"],
+    ['raw password=ab"cd ef', "raw password=<redacted>"],
+    // Structure after the value goes too: masking more of a line is the safe side.
+    ["GET /cb?code=1&access_token=Xy7&page=2 200", "GET /cb?code=1&access_token=<redacted>"],
+    ["connect(host=db, password=Xy7&k) failed", "connect(host=db, password=<redacted>"],
+    // A string the name is in ends it: a message in quotes, and a JSON answer's lines, at any depth.
+    ['log("password=Xy7&k}x") next', 'log("password=<redacted>") next'],
   ] as const) {
     assert.equal(redactLogSecrets(text).text, want, text);
   }
-  const json = JSON.stringify({ logs: "2026-11-06T16:00:00Z DB_PASSWORD=Xy7&kLm9;x\nok" });
-  assert.equal(redactLogSecrets(json).text, JSON.stringify({ logs: "2026-11-06T16:00:00Z DB_PASSWORD=<redacted>\nok" }));
-  for (const text of ["a=1&password=x&".repeat(20_000), `password=${"(&".repeat(50_000)}`, `(${"password=x) ".repeat(20_000)}`]) {
+  for (const [logs, want] of [
+    ["2026-11-06 ERROR DB_PASSWORD=Abc}region=secret", "2026-11-06 ERROR DB_PASSWORD=<redacted>"],
+    ["2026-11-06 ERROR DB_PASSWORD=Abc&region=secret\nok", "2026-11-06 ERROR DB_PASSWORD=<redacted>\nok"],
+    ['{"msg": "token=a&b=c}d", "user": "alice"}', '{"msg": "token=<redacted>", "user": "alice"}'],
+  ] as const) {
+    // Two levels of strings are told apart (a JSON answer's string, and a JSON message in it); deeper ones mask to the second's end.
+    const wraps = [(x: string) => JSON.stringify({ logs: x }), (x: string) => JSON.stringify({ lines: [x, "ok"] }), (x: string) => JSON.stringify({ logs: JSON.stringify({ m: x }) })];
+    for (const wrap of logs.startsWith("{") ? wraps.slice(0, 2) : wraps) {
+      const out = redactLogSecrets(wrap(logs.replace("\\n", "\n"))).text;
+      assert.equal(out, wrap(want.replace("\\n", "\n")), out);
+    }
+  }
+  // After a quoted key, a JSON number or literal ends at the next member; a literal is not a credential.
+  for (const [text, want] of [
+    ['{"password":1234,"user":"alice"}', '{"password":<redacted>,"user":"alice"}'],
+    ['{"password":null,"user":"alice"}', '{"password":null,"user":"alice"}'],
+    [JSON.stringify({ logs: '{"password":1234,"user":"alice"}' }), JSON.stringify({ logs: '{"password":<redacted>,"user":"alice"}' })],
+  ] as const) {
+    assert.equal(redactLogSecrets(text).text, want, text);
+  }
+  for (const text of ["a=1&password=x&".repeat(20_000), `password=${"(&".repeat(50_000)}`, `(${"password=x) ".repeat(20_000)}`, `${'"'.repeat(50_000)}password=x`, `${'\\"'.repeat(50_000)} token=1`]) {
     const t0 = performance.now();
     redactLogSecrets(text);
     assert.ok(performance.now() - t0 < 1500, `${text.slice(0, 40)}: ${Math.round(performance.now() - t0)} ms`);
