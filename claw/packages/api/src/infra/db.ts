@@ -274,13 +274,16 @@ if (DB_SCHEMA) {
 // Seen on a switchover: every replica logged 25006 from the scheduler, the
 // outbox, the event consumer and the assistant's tools at once.
 //
-// So the first failover error any statement meets is taken as news about the
-// whole pool, not about that one client: every connection opened before it is
-// dropped, the idle ones when they are next checked out through
-// `checkoutCurrent` and the held ones when they are released, and the
-// statement that met it is retried once on a new connection when running it
-// twice is the same as running it once: Postgres said it never ran, or it only
-// reads.
+// So the first failover error any statement meets -- or any idle connection,
+// which a switchover terminates -- is taken as news about the whole pool, not
+// about that one client: every connection opened before it is dropped, the
+// idle ones when they are next checked out (whoever checks them out: every
+// `connect()` of either pool goes through the check) and the held ones when
+// they are released, and the statement that met it is retried once on a new
+// connection when running it twice is the same as running it once: Postgres
+// said it never ran, or it only reads. For a while after it, a connection of
+// the advisory-lock pool is not handed out until the server it reached says
+// it is the primary: a lock taken on the demoted server fences nothing.
 
 /** SQLSTATEs, and socket error codes, that mean this connection is not on the primary any more, or the server is going away under it. */
 const FAILOVER_SQLSTATES = new Set([
@@ -351,33 +354,75 @@ function isStale(client: pg.ClientBase): boolean {
  */
 export function noteFailover(err: unknown): void {
   failoverGeneration += 1;
+  lastFailoverAt = Date.now();
   logger.warn({ code: (err as { code?: unknown })?.code, generation: failoverGeneration }, "db.failover_detected");
+}
+
+/** When this process last saw a failover error; 0 for never. */
+let lastFailoverAt = 0;
+/** How long after a failover error a lock-pool connection is asked whether it reached the primary before it is handed out. */
+const FAILOVER_PRIMARY_CHECK_MS = 60_000;
+/** How many connections a lock-pool checkout tries, a retry delay apart, while they all reach a server in recovery. */
+const PRIMARY_CHECKOUT_ATTEMPTS = 10;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+type ConnectCallback = (err: Error | undefined, client?: pg.PoolClient, done?: (release?: unknown) => void) => void;
+
+/**
+ * Every `connect()` of `p`, whoever calls it (`pool.query` included), hands out a client connected since the last
+ * failover: one from before it is destroyed instead, and the next one taken, until a current one comes (a new
+ * connection is current, so this ends). With `primaryOnly`, for a while after a failover a client is also asked
+ * whether its server is in recovery, and one that is is destroyed and another tried after a pause.
+ */
+function checkoutsCurrent(p: pg.Pool, primaryOnly: boolean): void {
+  const connectAny = p.connect.bind(p) as () => Promise<pg.PoolClient>;
+  const connectCurrent = async (): Promise<pg.PoolClient> => {
+    for (let standby = 0; ;) {
+      const client = await connectAny();
+      if (isStale(client)) {
+        client.release(new Error("connected before a failover"));
+        continue;
+      }
+      if (!primaryOnly || Date.now() - lastFailoverAt > FAILOVER_PRIMARY_CHECK_MS) return client;
+      let inRecovery: boolean;
+      try {
+        inRecovery = (await client.query("SELECT pg_is_in_recovery() AS r")).rows[0].r === true;
+      } catch (err) {
+        client.release(err as Error);
+        throw err;
+      }
+      if (!inRecovery) return client;
+      client.release(new Error("connected to a server in recovery"));
+      standby += 1;
+      if (standby >= PRIMARY_CHECKOUT_ATTEMPTS) {
+        throw Object.assign(new Error("every connection reached a server in recovery"), { code: "25006" });
+      }
+      logger.warn({ attempt: standby }, "db.lock_pool_reached_standby");
+      await sleep(FAILOVER_RETRY_DELAY_MS);
+    }
+  };
+  (p as unknown as { connect: (cb?: ConnectCallback) => Promise<pg.PoolClient> | undefined }).connect = (cb?: ConnectCallback) => {
+    const current = connectCurrent();
+    if (!cb) return current;
+    current.then((client) => cb(undefined, client, (release) => client.release(release as Error | boolean | undefined)), (err: Error) => cb(err));
+    return undefined;
+  };
 }
 
 for (const p of [pool, lockPool]) {
   p.on("connect", (client) => { clientGeneration.set(client, failoverGeneration); });
   // A client from before the failover is closed as it is released, so the pool
   // removes it instead of handing it out again (`_release` drops a client that
-  // is ending). Covers every holder, not only the helpers below.
+  // is ending). Covers every holder.
   p.on("release", (_err, client) => {
     if (isStale(client)) client.end().catch(() => {});
   });
+  // A switchover terminates the idle connections too, and that is often the first anyone hears of it.
+  p.on("error", (err) => { if (isFailoverError(err)) noteFailover(err); });
 }
-
-/**
- * A client connected since the last failover: one from before it is
- * destroyed instead of used, and the next one taken, until a current one comes
- * (a new connection is current, so this ends).
- */
-export async function checkoutCurrent(p: pg.Pool = pool): Promise<pg.PoolClient> {
-  for (;;) {
-    const client = await p.connect();
-    if (!isStale(client)) return client;
-    client.release(new Error("connected before a failover"));
-  }
-}
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+checkoutsCurrent(pool, false);
+checkoutsCurrent(lockPool, true);
 
 /**
  * One statement on the main pool. A statement that met a failover error marks
@@ -394,7 +439,7 @@ async function query(text: string, params?: unknown[]): Promise<pg.QueryResult> 
     if (!failedBeforeRunning(err) && !isIdempotentStatement(text)) throw err;
     logger.warn({ code: (err as { code?: unknown }).code }, "db.failover_retry");
     await sleep(FAILOVER_RETRY_DELAY_MS);
-    const client = await checkoutCurrent(pool);
+    const client = await pool.connect();
     try {
       const result = await client.query(text, params);
       client.release();
@@ -456,7 +501,7 @@ export async function inTransaction<T>(
 const rolledBackByFailover = new WeakSet<object>();
 
 async function transactionOnce<T>(run: (query: Querier) => Promise<T>): Promise<T> {
-  const client = await checkoutCurrent(pool);
+  const client = await pool.connect();
   let broken = false;
   let committing = false;
   try {

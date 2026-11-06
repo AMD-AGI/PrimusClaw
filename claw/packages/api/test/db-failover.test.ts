@@ -29,6 +29,8 @@
  *       not to say it again, the web client is told, and the message is stored once
  *   F9  the same, while the database cannot be asked: the Router is told the outcome is unknown and not to say it again,
  *       and the turn's final words are not delivered on top of the stored message
+ *   F10 a caller that checks a connection out of the advisory-lock pool itself gets one made since the failover, and,
+ *       for a while after it, one whose server says it is not in recovery
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -292,5 +294,40 @@ describe("database failover", { skip }, () => {
     );
     assert.equal(ended, "skipped");
     assert.deepEqual((await w.q("SELECT text FROM claw_assistant_says")).map((s) => s.text), ["The deploy is done."]);
+  });
+
+  test("F10 a direct lock-pool checkout after a failover gets a connection made since, on a server not in recovery", async () => {
+    const lockPool = w.h.app.db.db.lockPool;
+    const pidOf = async (client: pg.PoolClient) => Number((await client.query("SELECT pg_backend_pid() AS pid")).rows[0].pid);
+    // Connections the lock pool holds idle from before the switchover.
+    const held = [await lockPool.connect(), await lockPool.connect(), await lockPool.connect()];
+    const old = await Promise.all(held.map(pidOf));
+    for (const client of held) client.release();
+    w.h.app.db.noteFailover(Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" }));
+
+    // While the Service still routes new connections to the demoted server: it is in recovery, twice.
+    const { default: pgModule } = await import("pg");
+    const proto = pgModule.Client.prototype as unknown as { query: (...args: unknown[]) => unknown };
+    const real = proto.query;
+    let asked = 0;
+    proto.query = function (this: unknown, ...args: unknown[]) {
+      if (args[0] === "SELECT pg_is_in_recovery() AS r") {
+        asked += 1;
+        if (asked <= 2) return Promise.resolve({ rows: [{ r: true }] });
+      }
+      return real.apply(this, args);
+    };
+    let client: pg.PoolClient;
+    try {
+      client = await lockPool.connect();
+    } finally {
+      proto.query = real;
+    }
+    try {
+      assert.equal(asked, 3, "asked until a connection reached the primary");
+      assert.ok(!old.includes(await pidOf(client)), "a connection from before the failover was handed out");
+    } finally {
+      client.release();
+    }
   });
 });

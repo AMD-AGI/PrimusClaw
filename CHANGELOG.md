@@ -735,8 +735,10 @@ record it.
   switchover demotes the old primary in place, and a connection still on it answers every read and refuses every write
   (`25006`): `inTransaction` handed such a connection back to the pool after a clean rollback, to fail the next
   transaction too. The first failover error (`25006`, `57P01`-`57P03`, a `08` connection error or a dropped socket) now
-  marks every connection opened before it stale: idle ones are dropped as they are checked out, held ones as they are
-  released. A statement is sent once more on a new connection, after `PG_FAILOVER_RETRY_DELAY_MS` (default 1000), when
+  marks every connection opened before it stale (so does an idle connection the switchover terminates): idle ones are
+  dropped as they are checked out, by any caller of either pool's `connect()` or `query()`, held ones as they are
+  released. For a minute after a failover error, a connection of the advisory-lock pool is handed out only once its
+  server says it is not in recovery, because a lock taken on the demoted server fences nothing. A statement is sent once more on a new connection, after `PG_FAILOVER_RETRY_DELAY_MS` (default 1000), when
   running it twice is the same as running it once: Postgres refused it before it ran (`25006`, `57P03`), or it only
   reads. A transaction that says it may run twice is retried the same way, and also when its connection went before
   its `COMMIT` was sent; every way the assistant stores a message says so. A `say` whose `COMMIT` took effect but whose
