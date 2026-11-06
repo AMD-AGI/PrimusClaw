@@ -1284,16 +1284,26 @@ describe("assistant review tools", { skip }, () => {
         }
       }
       assert.deepEqual(await says(), ["另外，SaFE 现在一切正常。"]);
-      // A turn that ends in plain text delivers none of it, and one that failed after the handoff gives no "did not go through" notice:
-      // the handoff is queued, and the chat answers.
-      const end = { sessionId: alice.routerSid, runIds: [turn.task_id], messageId: turn.mid, failed: false, interrupted: false };
       await w.closeRun(turn.task_id);
+      assert.equal(await actionsRun(), 1, "the handoff itself was queued, once");
+
+      // A turn that handed a review over and said nothing at all: when it ends in plain text, none of it is delivered, and when it failed
+      // after the handoff there is no "did not go through" notice. The handoff is queued, and the chat answers.
+      const quiet = await userTurn(alice, "请 Wei, Lei 帮我 review 合入 Primus-SaFE PR #841", { context: ctx });
+      assert.equal(((await rt.reviewStart(quiet, { prs: ["AMD-AGI/Primus-SaFE#841"], merge: true, reviewer: "u-weilei" })) as Recorded).handed_off, true);
+      await w.closeRun(quiet.task_id);
+      const end = { sessionId: alice.routerSid, runIds: [quiet.task_id], messageId: quiet.mid, failed: false, interrupted: false };
       assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, finalText: "已交给 Wei, Lei，合入需要他确认。" }, w.sayDeps), "skipped");
       assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, failed: true }, w.sayDeps), "skipped");
       // A completion that does not name the message is matched by the message its run was started for.
-      assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, messageId: undefined, failed: true }, w.sayDeps), "skipped");
-      assert.deepEqual(await says(), ["另外，SaFE 现在一切正常。"]);
-      assert.equal(await actionsRun(), 1, "the handoff itself was queued, once");
+      assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, messageId: undefined, interrupted: true }, w.sayDeps), "skipped");
+      assert.deepEqual(await says(), ["另外，SaFE 现在一切正常。"], "nothing beside the chat's own answer");
+      assert.equal(await actionsRun(), 2);
+      // The same failure in a turn that handed nothing over is still told, once (F1): the check is the handoff, not the failure.
+      const plain = await userTurn(alice, "309 怎么样了");
+      await w.closeRun(plain.task_id);
+      assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, runIds: [plain.task_id], messageId: plain.mid, failed: true }, w.sayDeps), "said");
+      await w.q("DELETE FROM claw_assistant_says WHERE fallback");
 
       // The next message's turn speaks as always, and so does another person's turn.
       const next = await userTurn(alice, "309 怎么样了");
