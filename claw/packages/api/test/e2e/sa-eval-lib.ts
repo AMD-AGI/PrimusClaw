@@ -403,6 +403,36 @@ export const CAPABILITY_DENIAL = new RegExp([
   "\\bI have no (?:access|internet|web access|tools?)\\b",
 ].join("|"), "i");
 
+/** The systems a denial can name, and the tools that reach each (a failed call of one of them can make the denial true). */
+const DENIED_SYSTEMS: ReadonlyArray<[RegExp, RegExp]> = [
+  [/github|\bgh\b|pull request|\bPRs?\b|仓库|代码库/i, /^(mcp__github__|bash$)/i],
+  [/联网|上网|互联网|网页|网站|internet|\bweb\b|browse|online/i, /^(web_search|web_fetch)$/],
+  [/safe|workloads?|workspaces?|集群|cluster|节点|\bnodes?\b/i, /^mcp__safe__/],
+  [/dispatron|计划|\bplans?\b/i, /^mcp__dispatron__/],
+  [/autopilot/i, /^mcp__autopilot__/],
+  [/pulse|leaderboard|排行/i, /^mcp__pulse__/],
+  [/看板|\bboard\b|\bissues?\b/i, /^mcp__agent-board__/],
+];
+
+/**
+ * Whether the denial at `at` in `final` may be true: a call of the turn failed, and when the denial's sentence names a system (GitHub,
+ * the web, SaFE, ...), it was a call to that system. A denial that names none is taken as being about whichever call failed. A failure
+ * of one system never excuses denying another ("I cannot access SaFE" after only a Dispatron call failed).
+ */
+export function denialJustified(final: string, at: number, calls: readonly ToolCall[]): boolean {
+  const failed = calls.filter((x) => x.ok === false);
+  if (!failed.length) return false;
+  const stops = /[。！？!?\n]|\.(\s|$)/g;
+  let start = 0, end = final.length;
+  for (const s of final.matchAll(stops)) {
+    if (s.index! < at) start = s.index! + s[0].length;
+    else { end = s.index!; break; }
+  }
+  const sentence = final.slice(start, end);
+  const named = DENIED_SYSTEMS.filter(([words]) => words.test(sentence)).map(([, tools]) => tools);
+  return !named.length || failed.some((x) => named.some((tools) => tools.test(x.name)));
+}
+
 /** With `style.no_ids`: an item named only by its number ("编号 #178", "#178。") rather than by its title. */
 export const BARE_NUMBER = /编号\s*#?\d+|#\d+(?=\s*($|[，。、,.;；:：)）!！?？]))/m;
 
@@ -571,10 +601,10 @@ export function grade(c: EvalCase, o: Observed): Check[] {
     out.push({ name: `no internal text: ${label}`, pass: m === null, detail: m ? m[0] : undefined });
   }
   if (!c.may_deny) {
-    // A denial right after a tool of the turn failed can be true; one with no failed call is the failure this rule is for.
+    // A denial can be true when a call to what it denies failed in the turn; any other denial is the failure this rule is for.
     const m = CAPABILITY_DENIAL.exec(o.final);
-    const failedCall = o.calls.some((x) => x.ok === false);
-    out.push({ name: "no false denial", pass: m === null || failedCall, detail: m ? `${m[0]}${failedCall ? " (after a failed call)" : ""}` : undefined });
+    const justified = m !== null && denialJustified(o.final, m.index, o.calls);
+    out.push({ name: "no false denial", pass: m === null || justified, detail: m ? `${m[0]}${justified ? " (after a failed call to it)" : ""}` : undefined });
   }
   if (c.style?.no_ids) {
     const m = BARE_NUMBER.exec(shownText);

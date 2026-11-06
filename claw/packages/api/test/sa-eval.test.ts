@@ -386,8 +386,15 @@ test("S16 no false denial of a capability", () => {
     assert.ok(denied(text), text);
     assert.ok(CAPABILITY_DENIAL.test(text), text);
   }
-  // Said after a call of the turn failed, it may be true; in a case where refusing is right, it is not this failure.
+  // Said after a call to what it denies failed, it may be true; in a case where refusing is right, it is not this failure.
   assert.ok(!denied("我无法访问 GitHub：令牌被拒绝了。", [call("mcp__github__issue_search", false)]));
+  assert.ok(!denied("I can't access the web right now.", [call("web_fetch", false)]));
+  assert.ok(!denied("我无法访问它，请稍后再试。", [call("mcp__safe__node_list", false)]), "names nothing: any failed call may be the one");
+  // A failure of one system never excuses denying another.
+  assert.ok(denied("我读到了 SaFE 的数据，但我无法访问 GitHub。", [call("mcp__safe__workload_list"), call("mcp__dispatron__get_runs", false)]));
+  assert.ok(denied("我无法访问 SaFE。", [call("mcp__safe__workload_list"), call("mcp__dispatron__get_runs", false)]));
+  assert.ok(!denied("Dispatron 有 3 个运行。我无法访问 SaFE。", [call("mcp__safe__workload_list", false)]), "the sentence of the denial, not the first one");
+  assert.ok(denied("我无法访问 SaFE。Dispatron 那边也有问题。", [call("mcp__dispatron__get_runs", false)]));
   assert.ok(!denied("我不能读取 ~/.ssh 下的文件。", [], { may_deny: true }));
   // A fact about a system, or "found nothing", is not a denial.
   for (const text of ["node-7 无法访问，已经离线 2 小时。", "没有找到失败的运行。", "我查到 3 个开着的 PR。", "I don't see any failed runs today.", "The node cannot reach the registry."]) {
