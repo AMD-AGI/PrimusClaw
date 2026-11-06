@@ -97,7 +97,8 @@ test("T2 starting: state_dir expanded once and persisted, files written, app sta
   assert.equal(start.tag, "wl-1:0");
 
   // The state dir is expanded only the first time, not on every start.
-  const expansions = () => world.execs.filter((e) => e.command.includes("USER_DATA_PATH")).length;
+  // (A file write reads USER_DATA_PATH too, to choose the mode; it is not an expansion.)
+  const expansions = () => world.execs.filter((e) => e.command.includes("USER_DATA_PATH") && !e.command.includes("base64 -d")).length;
   assert.equal(expansions(), 1);
   await h.runner.reconcile();
   assert.equal(expansions(), 1);

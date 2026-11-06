@@ -53,9 +53,10 @@ import {
   type AppLastExit, type AppRunPatch, type AppRunRecord, type AppRunState, type AppRunStore,
 } from "./app-run-store.js";
 import {
-  EXIT_ABSENT, INPUT_FILE, buildAppEnv, expandStateDirCommand, generationTag, isUsableStateDir,
-  killCommand, parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand, stopCommand, writeFileCommand,
-  type ProbeVerdict,
+  BOOTSTRAP_FILE_MODES, EXIT_ABSENT, INPUT_FILE, INPUT_FILE_MODES, buildAppEnv, expandStateDirCommand, generationTag,
+  isUsableStateDir, killCommand, parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand,
+  stopCommand, writeFileCommand,
+  type FileModes, type ProbeVerdict,
 } from "./app-env.js";
 
 const logger = pino({ name: "app-runner" });
@@ -767,17 +768,17 @@ export class AppRunner {
 
   /** `input.json`, the bootstrap file, and (in the start command) the events directory. */
   private async writeFiles(inst: SandboxInstance, stateDir: string): Promise<void> {
-    const put = async (rel: string, content: Buffer, mode: string): Promise<void> => {
+    const put = async (rel: string, content: Buffer, modes: FileModes): Promise<void> => {
       this.assertActive();
       const r = await this.deps.sandbox.exec(
-        inst, writeFileCommand(`${stateDir}/${rel}`, mode), EXEC_TIMEOUT,
+        inst, writeFileCommand(`${stateDir}/${rel}`, modes), EXEC_TIMEOUT,
         { untracked: true, env: { CLAW_FILE_B64: content.toString("base64") } },
       );
       if (r.exitCode !== 0) throw new Error(`writing ${rel} failed (exit ${r.exitCode})`);
     };
-    await put(INPUT_FILE, Buffer.from(JSON.stringify(this.rec.input), "utf8"), "600");
+    await put(INPUT_FILE, Buffer.from(JSON.stringify(this.rec.input), "utf8"), INPUT_FILE_MODES);
     const bootstrap = this.rec.manifest.bootstrap;
-    if (bootstrap) await put(bootstrap.file, Buffer.from(bootstrap.content_b64, "base64"), "700");
+    if (bootstrap) await put(bootstrap.file, Buffer.from(bootstrap.content_b64, "base64"), BOOTSTRAP_FILE_MODES);
   }
 
   private async startApplication(inst: SandboxInstance, stateDir: string, env: Record<string, string>): Promise<void> {

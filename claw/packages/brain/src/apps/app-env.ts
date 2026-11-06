@@ -51,10 +51,37 @@ export function isUsableStateDir(dir: string): boolean {
   return dir.startsWith("/") && dir.length > 1 && !/[\0\n\r]/.test(dir) && !dir.split("/").includes("..");
 }
 
-/** Write base64 `$CLAW_FILE_B64` to `path` atomically. The content rides in the env map. */
-export function writeFileCommand(path: string, mode: string): string {
+/**
+ * The modes of a file the runner writes: `inUserDir` when it lies inside
+ * `$USER_DATA_PATH`, `elsewhere` otherwise.
+ *
+ * The user directory belongs to one user and holds nothing of anyone else's,
+ * but that user's Pods do not all run as one account: an application restarted
+ * in a new sandbox can run as another account of the same group, and must still
+ * read what the runner wrote for it. So inside it a file is readable by the
+ * group, and only by the group; anywhere else it stays the writer's own.
+ */
+export interface FileModes { inUserDir: string; elsewhere: string }
+
+/** `input.json`. It holds the run's input, which carries no credential: those ride in the env map. */
+export const INPUT_FILE_MODES: FileModes = { inUserDir: "640", elsewhere: "600" };
+/** The manifest's bootstrap file, which the application runs. */
+export const BOOTSTRAP_FILE_MODES: FileModes = { inUserDir: "750", elsewhere: "700" };
+
+/**
+ * Write base64 `$CLAW_FILE_B64` to `path` atomically. The content rides in the env map.
+ *
+ * The mode is chosen in the sandbox, which is the only place that knows
+ * `$USER_DATA_PATH`; an unset or root `$USER_DATA_PATH` means `elsewhere`. A
+ * temporary file left by an interrupted write is removed first: written by
+ * another account, it could not be truncated.
+ */
+export function writeFileCommand(path: string, modes: FileModes): string {
   const p = shq(path);
-  return `mkdir -p "$(dirname ${p})" && printf %s "$CLAW_FILE_B64" | base64 -d > ${p}.tmp && chmod ${mode} ${p}.tmp && mv ${p}.tmp ${p}`;
+  return `mkdir -p "$(dirname ${p})" && rm -f ${p}.tmp && printf %s "$CLAW_FILE_B64" | base64 -d > ${p}.tmp && `
+    + `u="\${USER_DATA_PATH%/}" && m=${modes.elsewhere} && `
+    + `if [ -n "$u" ]; then case ${p} in "$u"/*) m=${modes.inUserDir} ;; esac; fi && `
+    + `chmod "$m" ${p}.tmp && mv -f ${p}.tmp ${p}`;
 }
 
 export type ProbeVerdict = "alive" | "dead" | "none";

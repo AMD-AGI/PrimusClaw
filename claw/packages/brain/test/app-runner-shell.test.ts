@@ -24,8 +24,10 @@ import { join } from "node:path";
 import { type AppManifestV1 } from "@claw/protocol";
 
 import { AppRunner } from "../src/apps/app-runner.js";
-import { startCommand, generationTag, expandStateDirCommand } from "../src/apps/app-env.js";
-import { World, MANIFEST, RUN_ID, TOKEN } from "./support/app-runner-world.js";
+import {
+  BOOTSTRAP_FILE_MODES, INPUT_FILE_MODES, startCommand, generationTag, expandStateDirCommand, writeFileCommand,
+} from "../src/apps/app-env.js";
+import { World, MANIFEST, RUN_ID, TOKEN, b64 } from "./support/app-runner-world.js";
 
 const workdirs: string[] = [];
 const pids: number[] = [];
@@ -120,9 +122,11 @@ test("a real run: input and bootstrap are written, the env reaches the process, 
   assert.equal(w.world.rec.state, "ended");
 
   assert.equal(readFileSync(`${w.stateDir}/input.json`, "utf8"), JSON.stringify(w.world.rec.input));
-  assert.equal(statSync(`${w.stateDir}/input.json`).mode & 0o777, 0o600);
+  assert.ok(!readFileSync(`${w.stateDir}/input.json`, "utf8").includes(TOKEN), "credentials ride in the env map, not in input.json");
+  // The state directory is inside USER_DATA_PATH: the user's other accounts may read, nobody else.
+  assert.equal(statSync(`${w.stateDir}/input.json`).mode & 0o777, 0o640);
   assert.equal(readFileSync(`${w.stateDir}/boot/start.sh`, "utf8"), "#!/bin/sh\necho boot\n");
-  assert.equal(statSync(`${w.stateDir}/boot/start.sh`).mode & 0o777, 0o700);
+  assert.equal(statSync(`${w.stateDir}/boot/start.sh`).mode & 0o777, 0o750);
   const env = readFileSync(`${w.stateDir}/env.txt`, "utf8");
   assert.match(env, new RegExp(`^APP_MCP_TOKEN=${TOKEN}$`, "m"));
   assert.match(env, new RegExp(`^APP_STATE_DIR=${w.stateDir}$`, "m"));
@@ -335,4 +339,58 @@ test("starting a new generation removes the previous generation's exit.json; an 
   const again = await w.exec(startCommand(MANIFEST, w.stateDir, generationTag("wl-1", 2)));
   assert.equal(again.stdout.trim(), "already");
   assert.equal(existsSync(`${w.stateDir}/exit.json`), true);
+});
+
+
+// --- the modes of the files the runner writes ---------------------------------
+
+/**
+ * The mode bits of what `writeFileCommand` leaves at `path`, run with `env`. A `USER_DATA_PATH` of
+ * `null` is unset in the shell, not merely empty.
+ */
+async function writtenMode(w: ReturnType<typeof realWorld>, path: string, modes: typeof INPUT_FILE_MODES,
+  env: { USER_DATA_PATH: string | null }): Promise<number> {
+  const unset = env.USER_DATA_PATH === null;
+  const command = (unset ? "unset USER_DATA_PATH; " : "") + writeFileCommand(path, modes);
+  const r = await w.exec(command, { ...(unset ? {} : { USER_DATA_PATH: env.USER_DATA_PATH! }), CLAW_FILE_B64: b64("{}") });
+  assert.equal(r.exitCode, 0, r.stderr);
+  assert.equal(readFileSync(path, "utf8"), "{}");
+  return statSync(path).mode & 0o777;
+}
+
+test("inside USER_DATA_PATH the files are the group's to read; anywhere else, or without it, they stay private", async () => {
+  const w = realWorld("sleep 0");
+  const user = `${w.dir}/users/u1`;
+  const inside = `${user}/.claw-apps/${RUN_ID}`;
+  for (const env of [{ USER_DATA_PATH: user }, { USER_DATA_PATH: `${user}/` }]) {
+    assert.equal(await writtenMode(w, `${inside}/input.json`, INPUT_FILE_MODES, env), 0o640, env.USER_DATA_PATH);
+    assert.equal(await writtenMode(w, `${inside}/boot/start.sh`, BOOTSTRAP_FILE_MODES, env), 0o750, env.USER_DATA_PATH);
+  }
+  const elsewhere: Array<[string, string | null]> = [
+    [`${w.dir}/team/.claw-apps/${RUN_ID}`, user], // a state_dir outside the user directory
+    [`${w.dir}/users/u10/.claw-apps/${RUN_ID}`, user], // a directory whose name only begins like it
+    [inside, null], // USER_DATA_PATH unset
+    [inside, ""], // USER_DATA_PATH empty
+    [inside, "/"], // USER_DATA_PATH the root
+  ];
+  for (const [dir, userDataPath] of elsewhere) {
+    const env = { USER_DATA_PATH: userDataPath };
+    assert.equal(await writtenMode(w, `${dir}/input.json`, INPUT_FILE_MODES, env), 0o600, `${dir} ${userDataPath}`);
+    assert.equal(await writtenMode(w, `${dir}/boot/start.sh`, BOOTSTRAP_FILE_MODES, env), 0o700, `${dir} ${userDataPath}`);
+  }
+});
+
+test("a temporary file left by an interrupted write is replaced, never written through", async () => {
+  const w = realWorld("sleep 0");
+  const { mkdirSync, writeFileSync, symlinkSync, lstatSync } = await import("node:fs");
+  mkdirSync(w.stateDir, { recursive: true });
+  // Left by another account, it could not be truncated; as a link, writing into it would write elsewhere.
+  writeFileSync(`${w.dir}/outside.txt`, "untouched");
+  symlinkSync(`${w.dir}/outside.txt`, `${w.stateDir}/input.json.tmp`);
+  const r = await w.exec(writeFileCommand(`${w.stateDir}/input.json`, INPUT_FILE_MODES), { CLAW_FILE_B64: b64('{"a":1}') });
+  assert.equal(r.exitCode, 0, r.stderr);
+  assert.equal(readFileSync(`${w.dir}/outside.txt`, "utf8"), "untouched");
+  assert.equal(lstatSync(`${w.stateDir}/input.json`).isSymbolicLink(), false);
+  assert.equal(readFileSync(`${w.stateDir}/input.json`, "utf8"), '{"a":1}');
+  assert.equal(existsSync(`${w.stateDir}/input.json.tmp`), false);
 });
