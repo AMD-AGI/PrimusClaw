@@ -104,12 +104,12 @@ export function sourceTitle(raw: unknown, url: URL): string {
 /** At a position: `[n]`. */
 const CITE_AT = /\[(\d{1,2})\]/y;
 /**
- * What lets a text make a link at all: an address, protocol-relative ones included (`//`, `www.`, `mailto:`), an inline link or
- * image or a reference definition, wherever it stands (a `]` before `(` or `:`, spaces allowed: inside a quote or a list too), an
- * HTML tag or an autolink (`<`). The router is told to put addresses in `sources` and never in the text, so a text with any of them
+ * What lets a text make a link at all: an address, protocol-relative ones included (`//`, `www.`, `mailto:`), an e-mail address
+ * (which GFM links by itself), an inline link or image or a reference definition, wherever it stands (a `]` before `(` or `:`,
+ * spaces allowed: inside a quote or a list too), an HTML tag or an autolink (`<`). The router is told to put addresses in `sources` and never in the text, so a text with any of them
  * cites nothing: no `[n]` in it can be, or be inside, a link to an address of the model's.
  */
-const LINK_MAKING = /\/\/|\bwww\.|mailto:|\]\s*[(:]|</i;
+const LINK_MAKING = /\/\/|\bwww\.|mailto:|[\w.+-]@[\w-]+\.[a-z]|\]\s*[(:]|</i;
 
 /**
  * The numbers the text cites as `[n]` on their own, outside every bracket, and none at all in a text that can make a link
