@@ -29,8 +29,8 @@ const meta = (sources: unknown[], dropped?: Record<string, number>) => ({ [CITE_
 const pr = (n: number, extra: Record<string, unknown> = {}) => ({ n, url: PR, title: "AMD-AGI/PrimusClaw#309 perf", kind: "github_pr", ...extra });
 
 test("SC1 an entry is kept only when it is well formed and cited in the text; Brain's drops are counted with the rest", () => {
-  const text = "已合入 [1]，见 [2] 与 [3]；[5](https://x.example) 是链接，[7] [8]";
-  assert.deepEqual([...citedNumbers(text)].sort(), [1, 2, 3, 7, 8], "a link's label [5](...) is not a citation");
+  const text = "已合入 [1]，见 [2] 与 [3]；[7] [8]";
+  assert.deepEqual([...citedNumbers(text)].sort(), [1, 2, 3, 7, 8]);
   const out = saySources(meta([
     pr(1),
     pr(2, { url: "javascript:alert(1)" }),
@@ -49,11 +49,14 @@ test("SC1 an entry is kept only when it is well formed and cited in the text; Br
   assert.deepEqual(saySources({ [CITE_SOURCES_META]: "x", [CITE_DROPPED_META]: { not_in_turn: -3, invalid: "9" } }, text).counts.dropped_not_in_turn, 0);
   for (const linked of ["[[1]](https://evil.example/)", "see [a [1] b](https://evil.example/)", "see [1]\n\n[1]: https://evil.example/",
     "see [1]\n   [x]: https://evil.example/", "[1](https://evil.example/)", "[[[1]]](https://evil.example/)",
-    "[a [b [1] c] d](https://evil.example)", "[a\n[1]\nb](https://evil.example)", "![1](https://evil.example/x.png)", "see [the docs [1] and more"]) {
+    "[a [b [1] c] d](https://evil.example)", "[a\n[1]\nb](https://evil.example)", "![1](https://evil.example/x.png)", "see [the docs [1] and more",
+    "[click](https://evil.example/[1])", '<a href="https://evil.example">[1]</a>', "[1] <https://evil.example>", "[1] see www.evil.example",
+    "[1] mail mailto:x@evil.example", "[1] and [x](relative/page)", "[1] [^2]\n\n[^2]: footnote"]) {
     assert.deepEqual([...citedNumbers(linked)], [], `a number that is or is in a link is no citation: ${linked}`);
   }
-  assert.deepEqual([...citedNumbers("[[1]](https://evil.example/) and [2]")], [2], "a plain [2] beside a link is still cited");
-  assert.deepEqual([...citedNumbers("[1][2] and \\[3\\] after [x](https://y.example) [4]")], [1, 2, 4], "consecutive ones count; an escaped one does not");
+  assert.deepEqual([...citedNumbers("[[1]](https://evil.example/) and [2]")], [], "a text that can make a link cites nothing");
+  assert.deepEqual([...citedNumbers("[1][2] and \\[3\\] and [4] (see [x [5]])")], [1, 2, 4], "consecutive ones count; escaped or bracketed ones do not");
+  assert.deepEqual([...citedNumbers("a \\[ b [4]")], [4], "an escaped bracket opens nothing");
   const sorted = saySources(meta([pr(2), pr(1)]), "[1] [2]").sources.map((s) => s.n);
   assert.deepEqual(sorted, [1, 2]);
 });

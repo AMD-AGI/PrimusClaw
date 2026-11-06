@@ -103,18 +103,21 @@ export function sourceTitle(raw: unknown, url: URL): string {
 
 /** At a position: `[n]` that does not open a link (`[n](...)`). */
 const CITE_AT = /\[(\d{1,2})\](?!\()/y;
-/** A reference definition: `[1]: address` at a line's start makes every `[1]` a link. */
-const REF_DEFINITION = /^ {0,3}\[[^\]\n]+\]:/m;
+/**
+ * What lets a text make a link at all: an address (`://`, `www.`, `mailto:`), an inline link or image (`](`), an HTML tag or an
+ * autolink (`<`), a reference definition (`[1]: address` at a line's start). The router is told to put addresses in `sources` and
+ * never in the text, so a text with any of them cites nothing: no `[n]` in it can be, or be inside, a link to an address of the
+ * model's.
+ */
+const LINK_MAKING = /:\/\/|\bwww\.|mailto:|\]\(|<|^ {0,3}\[[^\]\n]+\]:/im;
 
 /**
- * The numbers the text cites as `[n]` on their own: outside every bracket (so never in a link's label, however deep or over however
- * many lines: `[[[n]]](...)`, `[a [b [n]] c](...)`), not opening a link itself (`[n](...)`), and none at all in a text with a
- * reference definition (`[n]: address` makes `[n]` a link). An escaped bracket is no bracket; an unclosed `[` leaves what follows
- * it uncited.
+ * The numbers the text cites as `[n]` on their own, outside every bracket, and none at all in a text that can make a link
+ * (`LINK_MAKING`). An escaped bracket is no bracket; an unclosed `[` leaves what follows it uncited.
  */
 export function citedNumbers(text: string): Set<number> {
   const out = new Set<number>();
-  if (REF_DEFINITION.test(text)) return out;
+  if (LINK_MAKING.test(text)) return out;
   let depth = 0;
   for (let i = 0; i < text.length; i += 1) {
     const c = text[i];
