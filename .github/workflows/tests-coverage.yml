@@ -87,7 +87,9 @@ jobs:
     # Anything other than a confirmed doc-only verdict runs the suite: a
     # `changes` job that errored leaves the output empty, and skipping on that
     # would satisfy the required check without a single test having run.
-    if: always() && needs.changes.outputs.run_suite != 'false'
+    # !cancelled(), not always(): a run cancelled because the pull request has
+    # a newer head must not go on to run the whole suite.
+    if: ${{ !cancelled() && needs.changes.outputs.run_suite != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

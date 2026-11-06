@@ -175,7 +175,10 @@ jobs:
   claw:
     name: ${{ matrix.check }}
     needs: claw-shard
-    if: always()
+    # !cancelled(), not always(): it still reports failed shards, but a run
+    # cancelled because the pull request has a newer head no longer queues
+    # this job for a runner.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
