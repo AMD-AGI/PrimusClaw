@@ -160,6 +160,10 @@ test("approvalAction says every field a GitHub write sets, and shows the ones it
   assert.equal(say("pr_update", { repo: "o/r", number: 5, title: "New", base: "release" }), 'Change o/r#5: title to "New", base to release');
   assert.equal(say("pr_update", { repo: "o/r", number: 5, title: "New", base: "release" }, true), "修改 o/r#5：标题改为「New」，base 改为 release");
   assert.equal(say("pr_update", { repo: "o/r", number: 5, body: "b", state: "open" }), "Change o/r#5: description to the text below, reopen it");
+  // An empty description clears it, and the words say so: there is no text to show below them.
+  assert.equal(say("pr_update", { repo: "o/r", number: 5, body: "" }), "Change o/r#5: clear the description");
+  assert.equal(say("pr_update", { repo: "o/r", number: 5, body: "  " }, true), "修改 o/r#5：清空正文");
+  assert.equal(say("review_thread_resolve", { thread_id: "PRRT_abc" }), "Mark review thread PRRT_abc resolved");
   assert.equal(say("issue_create", { repo: "o/r", title: "T", labels: ["bug"] }), 'Open an issue "T" in o/r labelled bug as your GitHub account');
   assert.equal(say("pr_create", { repo: "o/r", head: "h", base: "main", title: "T", draft: true }), 'Open a draft pull request "T" in o/r (h → main) as your GitHub account');
   assert.equal(say("pr_create", { repo: "o/r", head: "h", base: "main", title: "T", draft: false }), 'Open a pull request "T" in o/r (h → main) as your GitHub account');

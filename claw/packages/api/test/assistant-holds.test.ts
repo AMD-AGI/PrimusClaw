@@ -27,8 +27,8 @@
  *   HD15 a write held for a person who writes Chinese: what the worker found is said first, then the write is put to them in Chinese,
  *        as what it would do and what it would post, never as the tool's name; with a channel that draws it, the same order
  *   HD16 a person who writes English is asked as before, and a hold with nothing reported before it says nothing first
- *   HD17 the plain words say every field the write sets: a pull request's new title and base, an issue's labels, a draft pull
- *        request; a field the words do not know is still shown, as key=value, on the card and in the needs-you message
+ *   HD17 the plain words say every field the write sets: a pull request's new title and base, or its cleared description, an
+ *        issue's labels, a draft pull request; a field the words do not know is still shown, as key=value, on the card and in the needs-you message
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -628,6 +628,11 @@ describe("assistant holds", { skip }, () => {
     // Closing it with a new base: the base is not dropped behind the close.
     const close = await ask("关 PR #6", "pr_update", { repo: "o/r", number: 6, base: "main", state: "closed" });
     assert.equal(close.pending, "需要你批准：修改 o/r#6：base 改为 main，关闭它");
+
+    // An empty description clears it: said in the words, with no text block that would read as nothing to approve.
+    const cleared = await ask("清 PR #8 正文", "pr_update", { repo: "o/r", number: 8, body: "" });
+    assert.equal(cleared.pending, "需要你批准：修改 o/r#8：清空正文");
+    assert.ok(!cleared.text.includes("内容如下"), cleared.text);
 
     // An issue's labels.
     const issue = await ask("开 issue", "issue_create", { repo: "o/r", title: "Flaky test", body: "It flakes.", labels: ["bug", "flaky-test"] });

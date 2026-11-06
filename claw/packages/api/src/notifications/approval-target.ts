@@ -154,15 +154,18 @@ function githubWords(
       const covers = ["repo", "number"];
       if (set(a.title)) { zh.push(`标题改为「${str(a.title, 200)}」`); en.push(`title to "${str(a.title, 200)}"`); covers.push("title"); }
       if (set(a.base)) { zh.push(`base 改为 ${str(a.base)}`); en.push(`base to ${str(a.base)}`); covers.push("base"); }
-      if (typeof a.body === "string") { zh.push("正文改为下文"); en.push("description to the text below"); }
+      // An empty description clears it: there is no text below to read, so the words say so.
+      if (typeof a.body === "string") {
+        if (a.body.trim()) { zh.push("正文改为下文"); en.push("description to the text below"); } else { zh.push("清空正文"); en.push("clear the description"); }
+      }
       if (a.state === "closed") { zh.push("关闭它"); en.push("close it"); covers.push("state"); }
       if (a.state === "open") { zh.push("重新打开"); en.push("reopen it"); covers.push("state"); }
       return { zh: `修改 ${at}${zh.length ? `：${zh.join("，")}` : ""}`, en: `Change ${at}${en.length ? `: ${en.join(", ")}` : ""}`, covers };
     }
     case "review_thread_reply":
-      return { zh: "以你的 GitHub 账号在一个评审线程里回复", en: "Reply in a review thread as your GitHub account", covers: ["thread_id"] };
+      return { zh: `以你的 GitHub 账号在评审线程 ${str(a.thread_id)} 里回复`, en: `Reply in review thread ${str(a.thread_id)} as your GitHub account`, covers: ["thread_id"] };
     case "review_thread_resolve":
-      return { zh: "把一个评审线程标为已解决", en: "Mark a review thread resolved", covers: ["thread_id"] };
+      return { zh: `把评审线程 ${str(a.thread_id)} 标为已解决`, en: `Mark review thread ${str(a.thread_id)} resolved`, covers: ["thread_id"] };
     case "checks_rerun_failed":
       return { zh: `重跑 ${str(a.repo)} 的 CI 运行 ${str(a.run_id)} 里失败的任务`, en: `Rerun the failed jobs of run ${str(a.run_id)} in ${str(a.repo)}`, covers: ["repo", "run_id"] };
     case "pr_request_reviewers": {
