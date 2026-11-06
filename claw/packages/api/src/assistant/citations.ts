@@ -41,25 +41,60 @@ export function assistantCitationsOn(): boolean {
 
 /** The most addresses of the user's message a turn may confirm as sources by reading them (`userAddresses`). */
 export const USER_ADDRESSES_MAX = 20;
-/** An http or https address written into a message: up to the first character an address does not hold unescaped. */
-const WRITTEN_ADDRESS = /https?:\/\/[\w\-.~:/?#@!$&*+,;=%]+/gi;
+/**
+ * Where an address written into a message ends, as GitHub's autolinks read one: at whitespace or `<`, `>`; and at the full-width
+ * punctuation Chinese text puts right after one (`看 https://x/a，再看`), which an address never holds unencoded.
+ */
+const ADDRESS_END = /[\s<>，。；：！？、（）【】《》「」『』“”‘’]/u;
+/** Where an http or https address starts in a piece of a message. */
+const ADDRESS_START = /https?:\/\//gi;
+/** Characters GitHub's autolinks leave out of an address when it ends with them (sentence punctuation; quotes, which none holds). */
+const TRAILING = new Set([".", ",", ":", ";", "!", "?", "*", "_", "~", "'", '"']);
+/** At most this many places that start an address are read in a message: what one says is bounded work. */
+const ADDRESS_STARTS_MAX = 64;
+
+/**
+ * An address as GitHub's autolinks take it from where it starts to the end of its piece of text: without the punctuation that
+ * ends a sentence, and without a `)` at its end that closes nothing inside it (`(https://x/a)`, `[docs](https://x/a)`). Never cut
+ * anywhere else: `https://x/path_(ticket-12)` stays whole, and an address with a character no address holds is no source at all.
+ */
+function writtenAddress(rest: string): string {
+  let end = rest.length;
+  let open = 0;
+  let close = 0;
+  for (let i = 0; i < end; i += 1) {
+    if (rest[i] === "(") open += 1;
+    else if (rest[i] === ")") close += 1;
+  }
+  while (end > 0) {
+    const c = rest[end - 1];
+    if (TRAILING.has(c)) end -= 1;
+    else if (c === ")" && close > open) { end -= 1; close -= 1; }
+    else break;
+  }
+  return rest.slice(0, end);
+}
 
 /**
  * The addresses the user wrote in the message a turn answers (`prompt`, as the turn was sent it), each one that can be a source
  * (`citeableUrl`), at most `USER_ADDRESSES_MAX`: a page `web_fetch` reads is a source only at one of these or at one a search or
- * GitHub lookup of the turn returned (`ExecuteRequest.cite.user_urls`). A worker's report (`[work_event]`) is not the user's words,
- * and neither is the state Claw adds after them (`TURN_STATE_HEADER`).
+ * GitHub lookup of the turn returned (`ExecuteRequest.cite.user_urls`). Each is the whole address as the user's own client links it
+ * (`writtenAddress`), never a part of one. A worker's report (`[work_event]`) is not the user's words, and neither is the state
+ * Claw adds after them (`TURN_STATE_HEADER`).
  */
 export function userAddresses(prompt: string): string[] {
   if (prompt.startsWith(WORK_EVENT_PREFIX)) return [];
   const out: string[] = [];
-  for (const m of prompt.split(TURN_STATE_HEADER, 1)[0].matchAll(WRITTEN_ADDRESS)) {
-    // A sentence's own punctuation after it is not part of it (trimmed by hand: a `+$` pattern would rescan every run).
-    let end = m[0].length;
-    while (end > 0 && ".,;:!?*".includes(m[0][end - 1])) end -= 1;
-    const address = m[0].slice(0, end);
-    if (citeableUrl(address) && !out.includes(address)) out.push(address);
-    if (out.length >= USER_ADDRESSES_MAX) break;
+  let starts = 0;
+  for (const piece of prompt.split(TURN_STATE_HEADER, 1)[0].split(ADDRESS_END)) {
+    // Every address that starts in the piece runs to its end: `[https://x/a](https://x/a)` holds one that is no source (its
+    // brackets) and one that is.
+    for (const m of piece.matchAll(ADDRESS_START)) {
+      if ((starts += 1) > ADDRESS_STARTS_MAX) return out;
+      const address = writtenAddress(piece.slice(m.index));
+      if (citeableUrl(address) && !out.includes(address)) out.push(address);
+      if (out.length >= USER_ADDRESSES_MAX) return out;
+    }
   }
   return out;
 }

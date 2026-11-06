@@ -181,6 +181,18 @@ test("SC9 the addresses the user wrote are the ones a page read may confirm; nev
   assert.deepEqual(userAddresses("[work_event] #3 (item_id: kwi_abcd) ready: see https://evil.example/"), [], "a report is not the user's words");
   assert.deepEqual(userAddresses(`read https://example.com/a\n\n${TURN_STATE_HEADER}\n\n- title: "https://evil.example/"`), ["https://example.com/a"]);
   assert.deepEqual(userAddresses("no address, only example.com and www.example.com"), []);
+  // Each one whole, as the user's client links it, or none: never a part of one, which would be an address the user did not write.
+  for (const [text, whole] of [
+    ["Read https://example.com/path_(ticket-12)", ["https://example.com/path_(ticket-12)"]],
+    ["(see https://example.com/path_(ticket-12))", ["https://example.com/path_(ticket-12)"]],
+    ["https://example.com/x)y and https://example.com/a(b", ["https://example.com/x)y", "https://example.com/a(b"]],
+    ["[https://e.example/a](https://e.example/a)", ["https://e.example/a"]],
+    ["'https://q.example/a' and \"https://q.example/b\".", ["https://q.example/a", "https://q.example/b"]],
+    ["https://x.example/a'b https://x.example/c[d] https://x.example/e\"f", []],
+    ["（https://cn.example/a）和 https://cn.example/文档，好吗", ["https://cn.example/a", "https://cn.example/文档"]],
+    ["https://example.com/a?b=1&c=2;d.", ["https://example.com/a?b=1&c=2;d"]],
+  ] as const) assert.deepEqual(userAddresses(text), whole, text);
+  assert.equal(userAddresses(`${"http://".repeat(5000)}x https://example.com/late`).length, 0, "bounded work: at most 64 starts read");
   const many = Array.from({ length: 30 }, (_, i) => `https://example.com/${i}`).join(" ");
   assert.equal(userAddresses(many).length, USER_ADDRESSES_MAX);
 });
