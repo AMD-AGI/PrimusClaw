@@ -19,7 +19,7 @@ import pino from "pino";
 import { CLAW_ASSISTANT_SAY_MAX_PER_HOUR, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { publishEvent } from "../events/store.js";
-import { db, inTransaction, type Querier } from "../infra/db.js";
+import { db, inTransaction, isFailoverError, type Querier } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import {
   ASSISTANT_EVENT_TYPES,
@@ -242,6 +242,16 @@ async function refusedByCap(input: SayInput, text: string, refused: SayCapped, d
   return new SayRefused("say_rate_limited", sayCapRefusal(refused.limit, told));
 }
 
+/** A message that is stored after all, and the outbox rows queued with it. `null`: it is not. */
+async function storedSay(sayId: string): Promise<{ subscribers: number } | null> {
+  const row = (await db.query(
+    `SELECT (SELECT COUNT(*) FROM claw_notification_outbox WHERE event_id = $2) AS subscribers
+       FROM claw_assistant_says WHERE say_id = $1`,
+    [sayId, sayId],
+  )).rows[0] as { subscribers: string } | undefined;
+  return row ? { subscribers: Number(row.subscribers) } : null;
+}
+
 /**
  * Record a message the assistant chose to say. Throws {@link SayRefused} for an
  * empty or over-long text, for an item that is not this user's or is not named as
@@ -255,6 +265,8 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
   if (text.length > SAY_TEXT_MAX) throw new SayRefused("text_too_long", `a message is at most ${SAY_TEXT_MAX} characters`);
   const limit = deps.maxPerHour ?? CLAW_ASSISTANT_SAY_MAX_PER_HOUR;
 
+  // One id for every attempt: what tells, after a failover took the COMMIT's answer, whether the message was stored.
+  const sayId = randomUUID();
   let stored: Stored | null;
   try {
     stored = await inTransaction(async (q) => {
@@ -276,11 +288,18 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
         [input.userId],
       )).rows[0].n);
       if (recent >= limit) throw new SayCapped(limit);
-      return store(q, { type: "assistant.say", sayId: randomUUID(), userId: input.userId, sessionId: input.sessionId, text, item });
+      return store(q, { type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item });
     }, { retryOnFailover: true });
   } catch (err) {
     if (err instanceof SayCapped) throw await refusedByCap(input, text, err, deps);
-    throw err;
+    // A failover can end the connection after its COMMIT took effect and before the answer came back. Then the
+    // message is stored and queued, and a fault would have the model say it again, so the database is asked (on a
+    // connection made since). The live event to a web client is not sent: it reads the message from the store.
+    const landed = isFailoverError(err) ? await storedSay(sayId) : null;
+    if (!landed) throw err;
+    logger.warn({ sayId, code: (err as { code?: unknown }).code }, "assistant.say_commit_answer_lost");
+    if (landed.subscribers > 0) void (deps.kick ?? kickDelivery)().catch((kickErr) => logger.error({ err: kickErr }, "assistant.say_kick_failed"));
+    return { say_id: sayId, subscribers: landed.subscribers };
   }
   if (!stored) throw new Error("a fresh say id was already stored");
   await announce(stored, deps, input.turnMessageId);

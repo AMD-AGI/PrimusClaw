@@ -25,6 +25,8 @@
  *   F6  a transaction that asked to be retried and was cut off before its COMMIT runs once more and lands once; one that
  *       did not ask fails
  *   F7  a transaction cut off during its COMMIT is not run again, though it asked: the COMMIT may have taken effect
+ *   F8  the Router's say whose COMMIT took effect and whose answer the failover lost: the Router is told it was said,
+ *       not to say it again, and the message is stored once
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -180,12 +182,15 @@ describe("database failover", { skip }, () => {
     ]);
     assert.equal(read.rows[0].answer, 42);
 
-    const write = w.h.app.db.db.query(
-      "WITH w AS (INSERT INTO failover_probe (note) VALUES ('f5-write') RETURNING id) SELECT pg_sleep(0.4), (SELECT COUNT(*) FROM w) AS n",
-    );
-    await terminateWhenRunning("f5-write");
-    await assert.rejects(write, (err: { code?: string; message?: string }) =>
-      err.code === "57P01" || /^Connection terminated/.test(err.message ?? ""));
+    await Promise.all([
+      assert.rejects(
+        w.h.app.db.db.query(
+          "WITH w AS (INSERT INTO failover_probe (note) VALUES ('f5-write') RETURNING id) SELECT pg_sleep(0.4), (SELECT COUNT(*) FROM w) AS n",
+        ),
+        (err: { code?: string; message?: string }) => err.code === "57P01" || /^Connection terminated/.test(err.message ?? ""),
+      ),
+      terminateWhenRunning("f5-write"),
+    ]);
     assert.equal(await probes(), 0, "a statement that may have taken effect is not run again");
   });
 
@@ -216,13 +221,44 @@ describe("database failover", { skip }, () => {
     await w.q(`CREATE CONSTRAINT TRIGGER failover_slow_commit AFTER INSERT ON failover_slow_commit
       DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION failover_slow_commit()`);
     let runs = 0;
-    const tx = w.h.app.db.inTransaction(async (q) => {
-      runs += 1;
-      await q("INSERT INTO failover_slow_commit VALUES (1)");
-    }, { retryOnFailover: true });
-    await terminateWhenRunning("COMMIT");
-    await assert.rejects(tx, (err: { code?: string; message?: string }) =>
-      err.code === "57P01" || /^Connection terminated/.test(err.message ?? ""));
+    await Promise.all([
+      assert.rejects(
+        w.h.app.db.inTransaction(async (q) => {
+          runs += 1;
+          await q("INSERT INTO failover_slow_commit VALUES (1)");
+        }, { retryOnFailover: true }),
+        (err: { code?: string; message?: string }) => err.code === "57P01" || /^Connection terminated/.test(err.message ?? ""),
+      ),
+      terminateWhenRunning("COMMIT"),
+    ]);
     assert.equal(runs, 1, "a COMMIT that may have taken effect is not followed by a second run");
+  });
+
+  test("F8 the Router's say whose COMMIT took effect and whose answer the failover lost: told it was said, stored once", async () => {
+    const turn = await w.routerTurn(alice);
+    // The connection goes once the COMMIT has taken effect, before its answer is read: what a switchover can do to it.
+    const { default: pgModule } = await import("pg");
+    const proto = pgModule.Client.prototype as unknown as { query: (...args: unknown[]) => unknown };
+    const real = proto.query;
+    let cut = 0;
+    proto.query = function (this: unknown, ...args: unknown[]) {
+      if (args[0] === "COMMIT" && cut === 0) {
+        cut += 1;
+        return (real.apply(this, args) as Promise<unknown>).then(() => {
+          throw Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" });
+        });
+      }
+      return real.apply(this, args);
+    };
+    let out: { ok: boolean; say_id?: string };
+    try {
+      out = await w.mod.tools.say(turn as never, { text: "The deploy is done." }, w.sayDeps);
+    } finally {
+      proto.query = real;
+    }
+    assert.equal(cut, 1, "the COMMIT's answer was lost");
+    assert.equal(out.ok, true, "not a fault: the Router would say it again");
+    const says = await w.q("SELECT say_id, text FROM claw_assistant_says");
+    assert.deepEqual(says.map((s) => [s.say_id, s.text]), [[out.say_id, "The deploy is done."]]);
   });
 });

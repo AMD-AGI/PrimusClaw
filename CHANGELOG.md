@@ -739,9 +739,10 @@ record it.
   released. A statement is sent once more on a new connection, after `PG_FAILOVER_RETRY_DELAY_MS` (default 1000), when
   running it twice is the same as running it once: Postgres refused it before it ran (`25006`, `57P03`), or it only
   reads. A transaction that says it may run twice is retried the same way, and also when its connection went before
-  its `COMMIT` was sent; every way the assistant stores a message says so. A `say` that faulted tells the Router the
-  message was not delivered and to call `say` again; delivering a Router turn's unsaid answer is tried three times
-  before it is given up, instead of once.
+  its `COMMIT` was sent; every way the assistant stores a message says so. A `say` whose `COMMIT` took effect but whose
+  answer the failover lost is looked up and reported as said, so the only `say` that faults is one that was not
+  stored; it tells the Router the message was not delivered and to call `say` again. Delivering a Router turn's unsaid
+  answer is tried three times before it is given up, instead of once.
 - A reply the assistant's hourly cap (`CLAW_ASSISTANT_SAY_MAX_PER_HOUR`) refused is no longer dropped without a word.
   The model's `say` was refused, and so was delivering what it wrote instead, and the user heard nothing for as long as
   the cap held. The first refusal in an hour now tells the user, in their language, that replies are paused and to try
