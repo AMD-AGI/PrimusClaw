@@ -50,8 +50,9 @@ record it.
 - An assistant router turn answers about the user's development environments itself: `devenv_list` (where
   `CLAW_REMOTE_AGENTS_ENABLED` is on) lists their own machines (online, last seen, version, agents) and every agent session on them
   (open through Claw, or the agent's own conversation a connector offers to take over) with its state, folder, last activity, a
-  label and the command that attaches the chat to it; `detail: "activity"` adds what each one is doing in the agent's words and
-  marks the turn as having read untrusted text. The router prompt treats 开发环境 / dev box / my machine as the connector, never as
+  label and the command that attaches the chat to it; `detail: "activity"` adds what each one is doing in the agent's words.
+  Either read marks the turn as having read untrusted text; such a turn may still put the attach command of one of the user's own
+  sessions to them as a button, and nothing else. The router prompt treats 开发环境 / dev box / my machine as the connector, never as
   a SaFE workspace, and "connect me to it" as `channel_action` with that attach command. Only the caller's rows are read.
 - Citations for the assistant router's answers, behind `CLAW_ASSISTANT_CITATIONS` (default off). The router writes [1], [2] in its
   `say` and names each number's address in `say`'s new `sources` argument; the new `ExecuteRequest.cite` makes Brain keep the sources

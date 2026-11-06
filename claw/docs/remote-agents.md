@@ -222,9 +222,11 @@ state (`working`, `waiting_for_you`, `idle`, `in_terminal`), last activity, a la
 (`machine/agent/n`) and the command that attaches the user's chat to it
 (`/agent attach <session id or conversation ref>`). The router passes that command to the
 channel with `channel_action`; a conversation open in a terminal on the machine, or a machine
-that is offline, has none. By default the tool returns nothing an agent wrote; `detail:
-"activity"` adds each session's current step and the end of its last answer, and the turn that
-read them no longer acts for the user.
+that is offline, has none. `detail: "activity"` adds each session's current step and the end of
+its last answer. Names, folders and what agents wrote can be named by anyone, so a turn that has
+read the list no longer acts for the user, with one exception: it may still put
+`/agent attach <ref>` for one of the user's own attachable sessions to them, as a button they
+press (never run at once); any other ref or action is refused.
 
 ## Retention
 

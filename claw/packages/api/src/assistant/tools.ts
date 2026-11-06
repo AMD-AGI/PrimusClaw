@@ -99,7 +99,7 @@ export async function assertLiveRun(
  * `q` is a transaction's: the session row stays held (`assertLiveRun`) until the write it protects is done.
  */
 export async function attendedTurn(
-  q: Querier, claims: AssistantTokenClaims,
+  q: Querier, claims: AssistantTokenClaims, opts: { readUntrustedOk?: boolean } = {},
 ): Promise<{ userId: string; message: TurnMessage; via: AttendedVia }> {
   const { userId } = await assertLiveRun(q, claims);
   const message = await turnMessage(q, claims.sid, claims.mid);
@@ -112,7 +112,7 @@ export async function attendedTurn(
   if (!message.fresh) {
     throw new ToolRefused("attendance_expired", "the user's message is too old to act on now: ask them to confirm in a new message");
   }
-  if (message.readUntrusted) {
+  if (message.readUntrusted && !opts.readUntrustedOk) {
     throw new ToolRefused(
       "read_untrusted",
       "this turn has read what a worker wrote (work_recall), so it no longer acts for the user: tell them what you would do and ask them to confirm in a new message",
