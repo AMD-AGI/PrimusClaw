@@ -728,7 +728,7 @@ describe("assistant outbound", { skip }, () => {
       const ports = { ...silent.silentSweepPorts };
       silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, deps());
       try {
-        const itemId = await seedItem();
+        await seedItem();
         await q("UPDATE claw_work_items SET updated_at = NOW() - interval '1 hour'");
         assert.equal(await silent.tellSilentItems(300), 1, "stored, to nobody");
         const first = await subscribe("u1", ["work_item.needs_you"]);

@@ -724,8 +724,16 @@ export async function recordWriteConfirm(
 /** An item closed by its answer, recently enough that saying it still helps (over `claw_work_items w`). */
 export const ANSWERED_UNSAID_SQL = "w.board_state = 'done' AND w.outcome = 'answered' AND w.closed_at > NOW() - INTERVAL '1 day'";
 
-/** The event type a stored say goes out as: an item's system fallback is `work_item.needs_you`, every other say `assistant.say`. */
-const SAY_EVENT_TYPE_SQL = "CASE WHEN s.fallback AND s.item_id IS NOT NULL THEN 'work_item.needs_you' ELSE 'assistant.say' END";
+/**
+ * The event type a stored say `s` goes out as: `work_item.needs_you` for the fallback `recordNeedsYouFallback` stores, told
+ * by its id -- `deterministicEventId("work_item.needs_you", item_id, attention_seq)`, computed here the same way -- and
+ * `assistant.say` for every other say, a system notice about an item included.
+ */
+const SAY_EVENT_TYPE_SQL = `CASE WHEN s.fallback AND s.item_id IS NOT NULL AND s.item_attention_seq IS NOT NULL
+             AND s.say_id = substr(encode(sha256(
+                   convert_to('work_item.needs_you', 'UTF8') || '\\x00'::bytea || convert_to(s.item_id, 'UTF8')
+                   || '\\x00'::bytea || convert_to(s.item_attention_seq::text, 'UTF8')), 'hex'), 1, 32)::uuid
+           THEN 'work_item.needs_you' ELSE 'assistant.say' END`;
 
 /**
  * A say, `s`, that has not reached its user and is not on its way: not delivered, and no outbox row for it delivered or
@@ -770,7 +778,7 @@ export const UNREACHED_SAY_SQL = `
 export async function resendUnreachedSays(input: { userId: string; itemId?: string }): Promise<number> {
   if (!CLAW_NOTIFICATIONS_ENABLED || !CLAW_ASSISTANT_ENABLED) return 0;
   const says = (await db.query(
-    `SELECT DISTINCT ON (s.item_id) s.say_id::text AS say_id, s.text, s.fallback, s.created_at, s.item_id
+    `SELECT DISTINCT ON (s.item_id) s.say_id::text AS say_id, s.text, (${SAY_EVENT_TYPE_SQL}) AS type, s.created_at, s.item_id
        FROM claw_work_items w
        JOIN claw_assistant_says s ON s.item_id = w.item_id AND s.item_attention_seq = w.attention_seq
       WHERE w.user_id = $1 AND ($2::text IS NULL OR w.item_id = $2) AND (w.board_state = 'needs_you' OR (${ANSWERED_UNSAID_SQL}))
@@ -779,12 +787,12 @@ export async function resendUnreachedSays(input: { userId: string; itemId?: stri
       ORDER BY s.item_id, s.created_at DESC, s.say_id DESC
       LIMIT 100`,
     [input.userId, input.itemId ?? null],
-  )).rows as Array<{ say_id: string; text: string; fallback: boolean; created_at: Date; item_id: string }>;
+  )).rows as Array<{ say_id: string; text: string; type: string; created_at: Date; item_id: string }>;
   let written = 0;
   for (const say of says) {
     const item = await loadItem(db.query, say.item_id, input.userId);
     if (!item) continue;
-    const m: ToStore = say.fallback
+    const m: ToStore = say.type === "work_item.needs_you"
       ? { type: "work_item.needs_you", sayId: say.say_id, userId: input.userId, sessionId: null, text: say.text, item }
       : { type: "assistant.say", sayId: say.say_id, userId: input.userId, sessionId: null, text: say.text, item };
     const subs = (await db.query(
