@@ -81,11 +81,20 @@ function seconds(v: unknown): number | null {
 const int = (v: unknown): number => Number(v ?? 0) || 0;
 
 /**
- * What a failure reason must look like to be named: a code Claw writes (sandbox_create_failed), words of letters joined by
- * underscores. A step that failed can leave an MCP server's error text in the column (`script-runner.ts`), which is another user's
- * and may hold anything; it is counted as other and never repeated.
+ * The failure reasons named by their code: the ones Claw itself writes (`tasks/types.ts` FailureReason, the sandbox reasons of
+ * `infra/db.ts`, the dispatcher's and the sweeper's). Any other value is counted as other and never repeated: a failed script step
+ * leaves its tool's error text in the column (`brain/src/tasks/script-runner.ts`), which is another user's and may say anything,
+ * whatever its shape.
  */
-const REASON_CODE = /^[a-z]{2,24}(?:_[a-z]{2,24}){0,5}$/;
+const KNOWN_REASONS: ReadonlySet<string> = new Set([
+  "agent_error", "brain_timeout", "cancelled", "claim_abandoned", "dag_root_stuck", "dag_validation_failed", "deps_failed",
+  "dispatch_failed", "dispatch_retried", "dispatch_timeout", "duplicate_dispatch_row", "external_timeout", "missing_platform_key",
+  "queue_timeout", "review_turn_budget_used", "run_budget_exhausted", "sandbox_bootstrap_failed", "sandbox_create_failed",
+  "sandbox_died", "sandbox_exited_before_ready", "sandbox_gone", "sandbox_handle_missing", "sandbox_health_failed",
+  "sandbox_pending_timeout", "sandbox_start_timeout", "sandbox_status_unreadable", "sandbox_timed_out", "sandbox_workload_terminal",
+  "script_step_failed", "session_deleted", "threw", "unclaimable", "upstream_timeout", "worker_lost", "workspace_bind_failed",
+  "workspace_unbound",
+]);
 
 export interface SelfStatus {
   window_hours: number;
@@ -218,8 +227,8 @@ export async function readSelfStatus(hours: number = DAY_HOURS, now: number = Da
       const n = int(r.n);
       runs += n;
       runsByStatus[String(r.status)] = (runsByStatus[String(r.status)] ?? 0) + n;
-      // A reason is a code Claw writes (sandbox_create_failed); anything else in the column is not repeated to anyone.
-      const reason = typeof r.failure_reason === "string" ? (REASON_CODE.test(r.failure_reason) ? r.failure_reason : "other") : null;
+      // A reason is named only when it is one of Claw's own codes; anything else in the column is not repeated to anyone.
+      const reason = typeof r.failure_reason === "string" ? (KNOWN_REASONS.has(r.failure_reason) ? r.failure_reason : "other") : null;
       if (r.status === "failed") reasons.set(reason ?? "unknown", (reasons.get(reason ?? "unknown") ?? 0) + n);
       if (r.sandbox === true) {
         sandboxRuns += n;

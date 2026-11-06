@@ -96,6 +96,7 @@ describe("claw_self_status on a database", { skip: postgresSkipReason() }, () =>
     await task(tid(18), "ws_3", "failed", 18, { reason: "brain_timeout", sandbox: "wl-3" });
     await task(tid(17), "ws_4", "failed", 17, { reason: "connect ECONNREFUSED 10.0.0.7:5432 for bob's token sk-abc" });
     await task(tid(16), "ws_5", "failed", 16, { reason: "sk_live_4f9a2b7c" });
+    await task(tid(15), "ws_6", "failed", 15, { reason: "bobs_private_repo_name" });
 
     const item = async (seq: number, min: number, state: string, kind: string | null, outcome: string | null) => w.q(
       `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, last_report_kind, outcome, worker_session_id, created_at)
@@ -136,13 +137,13 @@ describe("claw_self_status on a database", { skip: postgresSkipReason() }, () =>
       assert.deepEqual(s.router_turns.by_status, { completed: 3 + 1 + 1, failed: 1, running: 1 });
       assert.equal(s.router_turns.failed, 1);
       assert.deepEqual(s.items.by_outcome, { succeeded: 1, ready_to_accept: 1, failed: 1, stopped: 1, in_progress: 1 + 1 });
-      assert.equal(s.runs.failed, 5);
-      // A reason that is not a code is never repeated.
+      assert.equal(s.runs.failed, 6);
+      // A reason that is not one of Claw's own codes is never repeated, whatever its shape.
       assert.deepEqual(
         Object.fromEntries(s.runs.top_failure_reasons.map((r: { reason: string; count: number }) => [r.reason, r.count])),
-        { other: 2, unknown: 1, sandbox_start_timeout: 1, brain_timeout: 1 },
+        { other: 3, unknown: 1, sandbox_start_timeout: 1, brain_timeout: 1 },
       );
-      assert.doesNotMatch(JSON.stringify(s), /ECONNREFUSED|sk-abc|sk_live/);
+      assert.doesNotMatch(JSON.stringify(s), /ECONNREFUSED|sk-abc|sk_live|bobs_private/);
       assert.deepEqual(s.sandboxes, { runs_with_sandbox: 3, failed: 1, failure_rate: 0.333 });
     } finally {
       await router.close();
