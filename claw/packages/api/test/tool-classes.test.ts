@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The closed set of MCP tool classes (`src/assistant/tool-catalog.ts`, `src/assistant/tool-classes.ts`): every tool of every
+ * The closed set of MCP tool classes (`mcp-tool-catalog.ts` of `@claw/protocol`, `src/assistant/tool-classes.ts`): every tool of every
  * catalogued server has exactly one class, the router's reads and every approval policy are derived from it, and a spec that
  * lets a write run without a decision is found. Approval is read by Brain's own policy (`approvalPolicyFromMcp`), the code
  * that holds a call in a turn.
@@ -23,7 +23,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 const classes = await import("../src/assistant/tool-classes.js");
-const { TOOL_CATALOG } = await import("../src/assistant/tool-catalog.js");
+const { TOOL_CATALOG } = await import("@claw/protocol");
 const { ROUTER_READ_TOOLS, readToolPatterns } = await import("../src/assistant/read-tools.js");
 const { approvalPolicyFromMcp } = await import("../../brain/src/agent/approval-policy.js");
 const { createTriggerMcpServer } = await import("../src/triggers/mcp.js");
@@ -32,9 +32,13 @@ const { TRIGGER_MCP_SERVER } = await import("@claw/protocol");
 const { approvalSpec, catalogProblems, classOf, listProblems, routerReadsByServer, specProblems, toolsOfClass } = classes;
 type Catalog = import("../src/assistant/tool-classes.js").Catalog;
 
-/** Whether Brain holds `tool` of `server` under `spec`, and whether it then lets a call with no arguments through unasked. */
+/**
+ * Whether the spec alone, as Brain reads a spec, holds `tool` of `server`, and whether it then lets a call with no arguments through
+ * unasked. Alone: without the catalog Brain lays over every spec at run time (brain/test/mcp-approval-catalog.test.ts), which
+ * would hold every catalogued write whatever the spec says and so hide the spec's own gaps this audits.
+ */
 function brain(server: string, spec: Record<string, unknown>) {
-  const policy = approvalPolicyFromMcp({ [server]: spec });
+  const policy = approvalPolicyFromMcp({ [server]: spec }, { catalog: null });
   const name = (tool: string) => `mcp__${server}__${tool}`;
   return {
     held: (tool: string) => policy.requiresApproval(name(tool)),
@@ -82,20 +86,23 @@ describe("MCP tool classes", () => {
       }
       for (const w of toolsOfClass(server, "write")) assert.ok(!allows(readToolPatterns(server), `mcp__${server}__${w}`), `${server}: ${w}`);
     }
-    // What the hand-written list offered (by name or prefix) against the servers as they list their tools today: the same tools.
+    // What the hand-written list (main before this change) offered, applied to each server's tools/list as the live servers
+    // answered it on 2026-11-06: written out here, not computed from the catalog, so a tool the catalog dropped would show.
     const before: Record<string, string[]> = {
-      autopilot: ["get_*", "list_*"],
-      safe: ["cluster_list", "cluster_get", "node_list", "node_get", "node_status", "workload_list", "workload_get", "workspace_list",
-        "workspace_get", "opsjob_list", "opsjob_get", "flavor_list", "flavor_get", "user_self"],
-      dispatron: ["get_*"],
-      pulse: ["leaderboard_*", "upstream_*", "cost_overview"],
-      "agent-board": ["get_*", "list_*", "issue_read", "label_read"],
+      autopilot: ["get_allocation_marker", "get_audit", "get_events", "get_gpupools", "get_host_exclusions", "get_metrics", "get_pods", "get_status",
+        "get_submit_account_exclusions", "get_whoami"],
+      safe: ["cluster_get", "cluster_list", "flavor_get", "flavor_list", "node_get", "node_list", "node_status", "opsjob_get", "opsjob_list", "user_self",
+        "workload_get", "workload_list", "workspace_get", "workspace_list"],
+      dispatron: ["get_alerts", "get_changes", "get_configs", "get_configs_config_id", "get_events", "get_facade_defaults", "get_findings", "get_follow_history",
+        "get_follow_policy_plan_id", "get_follow_status", "get_ka_runs_run_artifacts_name", "get_me", "get_people", "get_plans", "get_plans_plan_id",
+        "get_plans_plan_id_commits", "get_plans_plan_id_day0", "get_plans_plan_id_latest", "get_plans_plan_id_stats", "get_plans_plan_id_trend",
+        "get_problems_problem_id", "get_releases", "get_runs", "get_runs_task_id", "get_runs_task_id_health", "get_runs_task_id_issue",
+        "get_source_commits_sha", "get_source_versions", "get_sources"],
+      pulse: ["cost_overview", "leaderboard_history", "leaderboard_list", "leaderboard_show", "leaderboard_summary", "leaderboard_top", "upstream_issue",
+        "upstream_issues", "upstream_pr", "upstream_prs"],
+      "agent-board": ["get_me", "get_repository_tree", "get_user_orgs", "issue_read", "label_read", "list_issues", "list_my_repos", "list_org_repos"],
     };
-    assert.deepEqual(Object.keys(ROUTER_READ_TOOLS).sort(), Object.keys(before).sort(), "the same servers; the API's own schedules server is not one");
-    for (const [server, patterns] of Object.entries(before)) {
-      const offered = Object.keys(TOOL_CATALOG[server]!.tools).filter((t) => allows(patterns, t)).sort();
-      assert.deepEqual(ROUTER_READ_TOOLS[server], offered, server);
-    }
+    assert.deepEqual(ROUTER_READ_TOOLS, before, "the router is offered exactly what it was offered before, server by server");
     // Kept back, each for a reason the catalog states.
     for (const t of ["apikey_list", "secret_list", "workload_logs", "workload_pod_logs"]) {
       assert.ok(!allows(readToolPatterns("safe"), `mcp__safe__${t}`), t);

@@ -23,7 +23,7 @@ import { routerReadsByServer } from "./tool-classes.js";
 
 /**
  * Per server, the tools that only read and that a router turn is offered, by name: every read of the server's catalogued
- * `tools/list` that the catalog does not keep from the router (`tool-catalog.ts`, derived in `tool-classes.ts`). A tool the
+ * `tools/list` that the catalog does not keep from the router (`mcp-tool-catalog.ts` of `@claw/protocol`, derived in `tool-classes.ts`). A tool the
  * catalog does not classify is offered nowhere, and the tests fail on it; there is no prefix, so a write a server adds under a
  * read's prefix is never offered.
  */

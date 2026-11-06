@@ -10,7 +10,7 @@
  * trigger is held for the user's decision (`requires_approval`), which shows them the whole prompt and schedule:
  * a scheduled run acts on their behalf later with nobody watching. Cancelling is held too: it deletes for good any
  * of the user's triggers, also ones they set up themselves, so a fetched page must not be able to do it unseen. Which tools
- * are held is the catalog's list of this server's writes (`assistant/tool-catalog.ts`): a tool added here and not classified
+ * are held is the catalog's list of this server's writes (`mcp-tool-catalog.ts` of `@claw/protocol`): a tool added here and not classified
  * there fails the tests.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";

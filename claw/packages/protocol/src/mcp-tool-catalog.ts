@@ -3,19 +3,40 @@
 
 /**
  * Every tool of the MCP servers the assistant's plugin and the platform defaults name, as each server's `tools/list` answered,
- * and the reviewed decisions about them. `tool-classes.ts` derives from it what a router turn may call and what an approval
- * policy must hold; nothing is listed by hand anywhere else.
+ * and the reviewed decisions about them: the one closed set both sides read. The API derives from it what a router turn may call
+ * and audits approval specs against it (`api/src/assistant/tool-classes.ts`); Brain holds every write it lists for a decision
+ * whatever a spec says (`brain/src/agent/approval-policy.ts`). Nothing is listed by hand anywhere else.
  *
  * Per tool, `tools` keeps the two annotations that decide its class, as the server gave them:
  *   R   readOnlyHint: true                          a read
  *   W   readOnlyHint: false                         a write
  *   WD  readOnlyHint: false, destructiveHint: true  a write that destroys
  *   U   neither                                     decided in `reviewed`, by a person, from what the tool does
+ * Annotations decide where they say something (a tool that claims both is a write); a review only fills what they leave open.
  * A server that changes an annotation, adds a tool or drops one fails the nightly comparison with its live `tools/list`
- * (`test/e2e/tool-classes-live.ts`) until this file says the same; a tool that is in neither `tools` nor `reviewed` is
- * unclassified, and the tests fail on it.
+ * (`api/test/e2e/tool-classes-live.ts`) until this file says the same; a tool in neither `tools` nor `reviewed` is unclassified,
+ * and the tests fail on it.
  */
-import type { ServerCatalog, ToolHints } from "./tool-classes.js";
+
+export type ToolClass = "read" | "write";
+
+/** The two annotations of a tool that decide its class. */
+export interface ToolHints { readOnlyHint?: boolean; destructiveHint?: boolean }
+
+export interface ServerCatalog {
+  /** The day the server's `tools/list` was last read for this entry. */
+  listedAt: string;
+  /** Every tool the server lists, with the annotations it gave. */
+  tools: Readonly<Record<string, ToolHints>>;
+  /** The class of each tool whose annotations do not decide it. */
+  reviewed: Readonly<Record<string, ToolClass>>;
+  /** Reads a router turn is not offered, each with why. */
+  notForRouter?: Readonly<Record<string, string>>;
+  /** Writes an approval policy may release (`auto_approve`) without a decision, each with why. */
+  releasable?: Readonly<Record<string, string>>;
+}
+
+export type ToolCatalog = Readonly<Record<string, ServerCatalog>>;
 
 const R: ToolHints = { readOnlyHint: true };
 const W: ToolHints = { readOnlyHint: false };
@@ -25,7 +46,7 @@ const U: ToolHints = {};
 /** Reads whose text is a log: it can carry a credential a job printed, and a router turn has no filter for that. */
 const LOG = "log text, which can carry a credential a job printed; a worker reads it";
 
-export const TOOL_CATALOG: Readonly<Record<string, ServerCatalog>> = {
+export const TOOL_CATALOG: ToolCatalog = {
   // SaFE: annotates its reads only, so every write is decided below.
   safe: {
     listedAt: "2026-11-06",
@@ -136,3 +157,26 @@ export const TOOL_CATALOG: Readonly<Record<string, ServerCatalog>> = {
     notForRouter: { trigger_list: "the API adds this server to worker turns only" },
   },
 };
+
+/** The class a tool's annotations give it, or null when they leave it open. */
+export function hintedClass(h: ToolHints | undefined): ToolClass | null {
+  if (!h) return null;
+  if (h.destructiveHint === true || h.readOnlyHint === false) return "write";
+  return h.readOnlyHint === true ? "read" : null;
+}
+
+const own = <T>(o: Readonly<Record<string, T>> | undefined, k: string): T | undefined => (o && Object.hasOwn(o, k) ? o[k] : undefined);
+
+/** A catalogued tool's class, or null when the server or the tool is not catalogued, or nothing classifies it. */
+export function catalogClassOf(server: string, tool: string, catalog: ToolCatalog = TOOL_CATALOG): ToolClass | null {
+  const c = own(catalog, server);
+  if (!c || !own(c.tools, tool)) return null;
+  return hintedClass(c.tools[tool]) ?? own(c.reviewed, tool) ?? null;
+}
+
+/** Whether the catalog knows this server (by its name in `mcpServers`). */
+export const isCataloguedServer = (server: string, catalog: ToolCatalog = TOOL_CATALOG): boolean => own(catalog, server) !== undefined;
+
+/** Whether a catalogued write of this server may be released without a decision (`releasable`). */
+export const isReleasableWrite = (server: string, tool: string, catalog: ToolCatalog = TOOL_CATALOG): boolean =>
+  catalogClassOf(server, tool, catalog) === "write" && own(own(catalog, server)?.releasable, tool) !== undefined;

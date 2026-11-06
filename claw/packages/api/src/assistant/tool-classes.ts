@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Which MCP tools read and which write, from one closed set (`tool-catalog.ts`): each server's `tools/list`, its annotations,
- * and a reviewed class for every tool the annotations leave open. Two lists are derived from it and from nothing else:
+ * Which MCP tools read and which write, from one closed set (`mcp-tool-catalog.ts` of `@claw/protocol`): each server's
+ * `tools/list`, its annotations, and a reviewed class for every tool the annotations leave open. Two lists are derived from it
+ * and from nothing else:
  *
  *  - the reads a router turn may call (`routerReadsByServer`, which `read-tools.ts` serves as ROUTER_READ_TOOLS);
  *  - what an approval policy must hold (`approvalSpec`, `specProblems`): every write, released only where the catalog says a
- *    write is safe to run without a decision.
+ *    write is safe to run without a decision. Brain enforces the same at run time (`approval-policy.ts`): a catalogued write is
+ *    held whatever the spec says, so a spec that fell behind is reported here and nightly, and still never lets a write run.
  *
  * A hand-kept list drifts from the server it describes: a write added to a server and not to a plugin's `requires_approval`
  * runs without asking, and a read never added to the router's list sends a one-lookup question to a worker. Derived from the
@@ -17,45 +19,18 @@
  * Annotations decide where they say something: `readOnlyHint: true` is a read; `readOnlyHint: false` or `destructiveHint: true`
  * is a write (and so is a tool that claims both). A reviewed class may only fill what they leave open, never contradict them.
  */
-import { TOOL_CATALOG } from "./tool-catalog.js";
+import { TOOL_CATALOG, catalogClassOf, hintedClass, type ServerCatalog, type ToolCatalog, type ToolClass, type ToolHints } from "@claw/protocol";
 
-export type ToolClass = "read" | "write";
-
-/** The two annotations of a tool that decide its class. */
-export interface ToolHints { readOnlyHint?: boolean; destructiveHint?: boolean }
-
-export interface ServerCatalog {
-  /** The day the server's `tools/list` was last read for this entry. */
-  listedAt: string;
-  /** Every tool the server lists, with the annotations it gave. */
-  tools: Readonly<Record<string, ToolHints>>;
-  /** The class of each tool whose annotations do not decide it. */
-  reviewed: Readonly<Record<string, ToolClass>>;
-  /** Reads a router turn is not offered, each with why. */
-  notForRouter?: Readonly<Record<string, string>>;
-  /** Writes an approval policy may release (`auto_approve`) without a decision, each with why. */
-  releasable?: Readonly<Record<string, string>>;
-}
-
-export type Catalog = Readonly<Record<string, ServerCatalog>>;
+export { hintedClass };
+export type { ServerCatalog, ToolClass, ToolHints };
+export type Catalog = ToolCatalog;
 
 export interface ToolProblem { server: string; tool: string; problem: string }
-
-/** The class a tool's annotations give it, or null when they leave it open. */
-export function hintedClass(h: ToolHints | undefined): ToolClass | null {
-  if (!h) return null;
-  if (h.destructiveHint === true || h.readOnlyHint === false) return "write";
-  return h.readOnlyHint === true ? "read" : null;
-}
 
 const own = <T>(o: Readonly<Record<string, T>> | undefined, k: string): T | undefined => (o && Object.hasOwn(o, k) ? o[k] : undefined);
 
 /** A listed tool's class, or null when it is not listed or nothing classifies it. */
-export function classOf(server: string, tool: string, catalog: Catalog = TOOL_CATALOG): ToolClass | null {
-  const c = own(catalog, server);
-  if (!c || !own(c.tools, tool)) return null;
-  return hintedClass(c.tools[tool]) ?? own(c.reviewed, tool) ?? null;
-}
+export const classOf = (server: string, tool: string, catalog: Catalog = TOOL_CATALOG): ToolClass | null => catalogClassOf(server, tool, catalog);
 
 /** Everything wrong with the catalog itself: [] when every tool has exactly one class and every decision names a tool it fits. */
 export function catalogProblems(catalog: Catalog = TOOL_CATALOG): ToolProblem[] {

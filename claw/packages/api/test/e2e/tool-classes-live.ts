@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The nightly half of the closed set of MCP tool classes (`src/assistant/tool-catalog.ts`): reads every MCP server a
+ * The nightly half of the closed set of MCP tool classes (`mcp-tool-catalog.ts` of `@claw/protocol`): reads every MCP server a
  * deployment's plugins and platform defaults name, as they are now, and fails on what the catalog does not say.
  *
  *  - Each server's live `tools/list` against its catalog (`listProblems`): a tool the catalog does not list (unclassified), one
  *    it no longer has, a changed annotation. A server the catalog does not know at all is a problem too.
- *  - Each spec's approval fields against the catalog's classes, read by Brain's own policy (`specProblems`): a write it does not
- *    hold, or one it releases without the catalog calling it releasable.
+ *  - Each spec's approval fields against the catalog's classes, read by Brain's own policy on the spec alone (`specProblems`): a
+ *    write it does not hold, or one it releases without the catalog calling it releasable. Brain holds such a write at run time
+ *    anyway (the catalog stands over every spec); this says which spec fell behind so it is fixed where people read it.
  *
  * Read-only: it lists tools and reads plugins, and changes nothing anywhere.
  *
@@ -107,7 +108,8 @@ async function main(): Promise<void> {
     }
   }
   for (const s of sources) {
-    const policy = approvalPolicyFromMcp({ [s.server]: s.spec });
+    // The spec alone: at run time Brain also holds every catalogued write, which would hide what this reports.
+    const policy = approvalPolicyFromMcp({ [s.server]: s.spec }, { catalog: null });
     problems.push(...specProblems(s.server, s.spec, (t) => policy.requiresApproval(`mcp__${s.server}__${t}`)).map((p) => ({ ...p, from: s.from })));
   }
   const result = { checked_at: new Date().toISOString(), sources: sources.map((s) => `${s.from}: ${s.server}`), tools, problems };
