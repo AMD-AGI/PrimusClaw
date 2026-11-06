@@ -11,7 +11,7 @@
  *   Q4 work_create tells the user at once that the item started, in their language, once, only for a turn that answers them
  *   Q5 a router turn its model answered with nothing is told to the user as declined, not as "did not go through"
  *   Q6 each router turn that answers the user logs how soon it was first heard, last heard, and whether it started an item
- *   Q7 the router's prompt says each of the rules of router-v10 and router-read-v5
+ *   Q7 the router's prompt says each of the rules of router-v10 and router-read-v6
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -211,10 +211,10 @@ describe("router quality, pure", () => {
 });
 
 describe("router quality, the prompt", () => {
-  test("Q7 router-v10 and router-read-v5 say each rule", async () => {
+  test("Q7 router-v10 and router-read-v6 say each rule", async () => {
     const p = await import("../src/assistant/prompts.js");
     assert.equal(p.ROUTER_PROMPT_VERSION, "router-v10");
-    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v5");
+    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v6");
     assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v13");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [

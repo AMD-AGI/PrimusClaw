@@ -344,12 +344,48 @@ const THREADS_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
   } } } }
 }`;
 
+/**
+ * Called before each tool runs, with its name and arguments as the server parsed them: what it returns is called with how the call
+ * ended. Null: the call is not made (it could not be written down), and the model is told so.
+ */
+export type GithubToolCallHook = (tool: string, args: Record<string, unknown>) =>
+  Promise<((result: { isError: boolean; text: string }) => Promise<void>) | null>;
+
 export interface GithubToolDeps {
   gh: GithubClient;
   /** The host of GitHub's own pages (`githubWebHost`): the only one a read lists sources on. Default github.com. */
   webHost?: string;
   /** For the one request that leaves GitHub's API: a job log's download address, which GitHub signs and hands out. */
   fetchImpl?: typeof fetch;
+  /** Around every call of every tool, reads and writes alike (mcp.ts: the audit of a call made with a GitHub binding). */
+  onCall?: GithubToolCallHook;
+}
+
+/**
+ * `mcp.tool` with `onCall` around every handler, so no tool registered below (nor one added later) can be called past it. Without a
+ * hook it is the server's own.
+ */
+function registrar(mcp: McpServer, onCall: GithubToolCallHook | undefined): Pick<McpServer, "tool"> {
+  if (!onCall) return mcp;
+  const tool = (...a: unknown[]): unknown => {
+    const name = a[0] as string;
+    const handler = a[a.length - 1] as (args: Record<string, unknown>, extra: unknown) => Promise<ToolResult>;
+    a[a.length - 1] = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> => {
+      const finish = await onCall(name, args ?? {});
+      if (!finish) return { content: [{ type: "text", text: "the call could not be recorded, so nothing was done; try again later" }], isError: true };
+      let result: ToolResult;
+      try {
+        result = await handler(args, extra);
+      } catch (err) {
+        await finish({ isError: true, text: "the call failed" });
+        throw err;
+      }
+      await finish({ isError: result.isError === true, text: result.content[0]?.text ?? "" });
+      return result;
+    };
+    return (mcp.tool as (...b: unknown[]) => unknown).apply(mcp, a);
+  };
+  return { tool: tool as McpServer["tool"] };
 }
 
 /** The last `max` bytes of a body, read as it arrives: a long log is never held whole in this shared process. */
@@ -371,8 +407,9 @@ async function tailBytes(body: ReadableStream<Uint8Array> | null, max: number): 
   return Buffer.concat(kept, size);
 }
 
-export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github.com" }: GithubToolDeps): McpServer {
-  const mcp = new McpServer({ name: "github", version: "1.0.0" });
+export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github.com", onCall }: GithubToolDeps): McpServer {
+  const server = new McpServer({ name: "github", version: "1.0.0" });
+  const mcp = registrar(server, onCall);
   const host = webHost.toLowerCase();
   const on = (list: Array<CiteSource | null>): CiteSource[] => sourcesOn(host, list);
   const each = (v: unknown): Record<string, any>[] => (Array.isArray(v) ? v.filter((x) => x && typeof x === "object") : []);
@@ -667,5 +704,5 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     return { number: a.number, labels: set.map((l: { name?: string }) => l.name) };
   }));
 
-  return mcp;
+  return server;
 }
