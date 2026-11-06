@@ -406,7 +406,8 @@ test("S16 no false denial of a capability", () => {
     "I have no tools for that.", "I can't view GitHub from here.", "I cannot see your pull requests.", "I'm not able to view the web.",
     "I cannot view the latest pull requests on GitHub.", "I'm not connected to GitHub, so I can't pull the open PRs.",
     "I'm unable to retrieve your pull requests from GitHub.", "I don't have a connection to SaFE.", "我连不上 GitHub，没法拉取 PR。",
-    "I have no way to reach the web from here.", "I do not currently have access to GitHub.", "I'm not currently connected to SaFE."]) {
+    "I have no way to reach the web from here.", "I do not currently have access to GitHub.", "I'm not currently connected to SaFE.",
+    "I can't check GitHub for you right now.", "我无法查看你的 GitHub PR。"]) {
     assert.ok(denied(text), text);
     assert.ok(CAPABILITY_DENIAL.test(text) || SELF_INABILITY.test(text), text);
   }
@@ -427,7 +428,9 @@ test("S16 no false denial of a capability", () => {
     "I can't delete that workload on SaFE without your approval.", "我不能直接删除 SaFE 上的 workload，需要你确认。",
     "GitHub returned 20 results; I can't rule out additional open PRs beyond this page.", "I can't be sure every SaFE node reported in time.",
     "GitHub returned 20 results; I'm unable to verify whether there are additional open PRs beyond this page.",
-    "I am not able to determine from the SaFE events why the pod restarted."]) {
+    "I am not able to determine from the SaFE events why the pod restarted.",
+    "GitHub returned 20 results; I can't check whether there are additional open PRs beyond this page.",
+    "I cannot check if more PRs exist on GitHub past the first page.", "GitHub 返回了 20 条；我无法查看是否还有更多 PR。"]) {
     assert.ok(!denied(text), text);
   }
   // A failed shell command excuses a GitHub denial only when it failed at GitHub: a line of its answer is a failure that names

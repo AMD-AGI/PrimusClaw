@@ -412,12 +412,14 @@ export const INTERNAL_TEXT: ReadonlyArray<[string, RegExp]> = [
  * (`grade`); a case where refusing is right says `may_deny`.
  */
 export const CAPABILITY_DENIAL = new RegExp([
-  "我(目前|现在|暂时|这边|这里)?(还)?(无法|不能|没法|没办法|不可以)(直接)?(访问|读取|查看|查询|获取|连接|联网|上网|浏览|打开|拿到)",
+  "我(目前|现在|暂时|这边|这里)?(还)?(无法|不能|没法|没办法|不可以)(直接)?(访问|读取|查看|查询|获取|连接|联网|上网|浏览|打开|拿到)(?!是否|有没有)",
   "我(这边|这里)?(访问|读取|查询|连接|读|查|看)不了", "我(这边|这里)?(访问|连接|拿)不到",
   "我(这边|这里)?(看不到|看不见|没法看|无法看到?)(你的)?\\s*(GitHub|github|仓库|代码库|PR|拉取请求|SaFE|safe|集群|节点|Dispatron|Autopilot|Pulse|网页|看板)",
   "我(这边|这里)?(没有|无)[^，。,.!！?？\\n]{0,12}?(工具|能力|接口|权限)",
   "(无法|不能|没法)(联网|上网)", "没有(联网|上网)(能力|功能|工具)",
-  "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:access|read|browse|reach|connect to|query|look up|fetch|check|open|get to)\\b",
+  "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:access|read|browse|reach|connect to|query|look up|fetch|check|open|get to)\\b"
+    // "I can't check whether there are more PRs beyond this page" is a caveat about what it read, not an inability.
+    + "(?!\\s+(?:\\S+\\s+){0,2}?(?:whether|if)\\b)",
   // "see" and "view" only of a system or the user's data, named within a few words: "I can't see any failed runs" is an answer.
   "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:see|view) (?:[^\\s.!?。，,]+ ){0,6}?"
     + "(?:github\\b|repos?\\b|repositor(?:y|ies)\\b|PRs?\\b|pull requests?\\b|safe\\b|workloads?\\b|clusters?\\b|dispatron\\b|autopilot\\b|pulse\\b|"
@@ -501,6 +503,7 @@ export const SELF_INABILITY = new RegExp([
     + "|unable|can(?:'|’)?t|cannot|can not|have no (?:access|way|tools?|integration|connection)"
     + "|(?:don(?:'|’)?t|do not)(?: (?:currently|yet|really|actually))? have (?:access|permission|a way|the ability|any (?:access|tools?|way)|tools?|an? (?:integration|connection)))\\b"
     // What it could not conclude or promise about what it did read is an answer, not an inability.
+    + "(?!\\s+(?:\\S+\\s+){0,3}?(?:whether|if)\\b)"
     + "(?!\\s+(?:to\\s+)?(?:find|locate|spot|tell|say|confirm|verify|determine|know|see any|see a|recall|remember|rule out|exclude|guarantee|promise|"
     + "be (?:sure|certain)|predict|estimate|explain|reproduce))",
   "我(目前|现在|暂时|这边|这里)?(还)?(连不上|接不上|没有接入|没接入|未接入|没有连接|没连接|未连接|没有权限|没权限)",
