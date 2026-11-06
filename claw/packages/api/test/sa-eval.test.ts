@@ -425,7 +425,9 @@ test("S16 no false denial of a capability", () => {
     "I can't see any failed runs today.", "我看不到失败的运行。", "I can't see any failures on the dashboard.",
     "I can't find any open PRs of yours on GitHub.", "我无法确定 SaFE 上这个节点何时恢复。", "I can't tell why the run failed; its log ends early.",
     "I can't delete that workload on SaFE without your approval.", "我不能直接删除 SaFE 上的 workload，需要你确认。",
-    "GitHub returned 20 results; I can't rule out additional open PRs beyond this page.", "I can't be sure every SaFE node reported in time."]) {
+    "GitHub returned 20 results; I can't rule out additional open PRs beyond this page.", "I can't be sure every SaFE node reported in time.",
+    "GitHub returned 20 results; I'm unable to verify whether there are additional open PRs beyond this page.",
+    "I am not able to determine from the SaFE events why the pod restarted."]) {
     assert.ok(!denied(text), text);
   }
   // A failed shell command excuses a GitHub denial only when it failed at GitHub: a line of its answer is a failure that names

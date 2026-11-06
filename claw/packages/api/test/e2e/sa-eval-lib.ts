@@ -501,7 +501,7 @@ export const SELF_INABILITY = new RegExp([
     + "|unable|can(?:'|’)?t|cannot|can not|have no (?:access|way|tools?|integration|connection)"
     + "|(?:don(?:'|’)?t|do not)(?: (?:currently|yet|really|actually))? have (?:access|permission|a way|the ability|any (?:access|tools?|way)|tools?|an? (?:integration|connection)))\\b"
     // What it could not conclude or promise about what it did read is an answer, not an inability.
-    + "(?!\\s+(?:find|locate|spot|tell|say|confirm|verify|determine|know|see any|see a|recall|remember|rule out|exclude|guarantee|promise|"
+    + "(?!\\s+(?:to\\s+)?(?:find|locate|spot|tell|say|confirm|verify|determine|know|see any|see a|recall|remember|rule out|exclude|guarantee|promise|"
     + "be (?:sure|certain)|predict|estimate|explain|reproduce))",
   "我(目前|现在|暂时|这边|这里)?(还)?(连不上|接不上|没有接入|没接入|未接入|没有连接|没连接|未连接|没有权限|没权限)",
 ].join("|"), "i");
