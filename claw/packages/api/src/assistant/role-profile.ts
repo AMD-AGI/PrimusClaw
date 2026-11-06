@@ -22,6 +22,7 @@ import {
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
+import { readGithubMcpSettings } from "../github-mcp/settings.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
@@ -260,7 +261,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // The system prompt is the same on every turn, so it and the history after it come from the prompt cache. What changes
     // from turn to turn (the item list, what waits for the user, what the channel sent) goes with the message instead.
     const github = lookups.githubTools.length > 0;
-    withSystemAppend(task, renderRouterPrompt({ servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null }));
+    withSystemAppend(task, renderRouterPrompt({ servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null, githubBinding: readGithubMcpSettings().binding }));
     const state = [renderRouterItems(await routerManifest(role.userId), await askedOfOthersManifest(role.userId))];
     // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
     const held = renderHeldForPerson(await heldForPersonManifest(role.userId));
