@@ -12,7 +12,8 @@
  *   W3 a worker that reported a line and wrote the document into its last words: the words become item-<n>-reply.md, announced to
  *      the user; short last words, or a report that already held them, make no file; a second completion writes the same file
  *   W4 github_comment posts nothing by itself: the card shows the exact comment; the press posts that comment as the user once; a
- *      deny posts nothing; a GitHub refusal is the card's failure; a report's turn cannot propose one
+ *      deny posts nothing; a GitHub refusal is the card's failure; a key in the draft is masked on the card and in what is posted
+ *      alike; a report's turn cannot propose one
  *   W5 the router is offered deliver_text always and github_comment with the confirmation cards; both may follow a lookup; a worker
  *      gets deliver_text and not github_comment
  *   W6 a say whose [n] lost its source (an address no lookup returned) is refused, so no bare number reaches the user; one whose
@@ -222,6 +223,20 @@ describe("the router writes itself, and a worker's words reach the user", { skip
     assert.equal(failed.status, "failed");
     assert.equal((failed.result as any)?.error, "no_github_token");
     assert.deepEqual(posted.map((p) => p.number), [322, 324]);
+    postAnswer = () => ({ url: "https://github.com/AMD-AGI/PrimusClaw/pull/322#issuecomment-1" });
+
+    // A key in the draft is masked before the card is stored: the press posts what the card showed, never the key.
+    const t4 = await userTurn("在 AMD-AGI/PrimusClaw#325 留言");
+    const key = `ghp_${"b".repeat(36)}`;
+    await sch.githubCommentTool(t4, { pr: "AMD-AGI/PrimusClaw#325", body: `token was ${key} in the log` });
+    const masked = (await w.q("SELECT confirmation_id, params FROM claw_assistant_confirmations WHERE params->>'number' = '325'"))[0];
+    assert.ok(!JSON.stringify(masked.params).includes(key), "the stored comment holds no key");
+    const shown = (await says()).at(-1);
+    assert.ok(shown.text.includes(masked.params.body), "the card shows exactly what is stored");
+    postAnswer = () => ({ url: "https://github.com/AMD-AGI/PrimusClaw/pull/325#issuecomment-2" });
+    await sch.decideConfirmation({ userId: alice.userId, confirmationId: masked.confirmation_id, decision: "allow", via: "button" });
+    assert.equal(posted.at(-1)?.body, masked.params.body);
+    assert.ok(!posted.at(-1)?.body.includes(key));
 
     // A malformed target, an empty or too long body, a report's turn: refused, no card.
     assert.equal(await code(sch.githubCommentTool(turn, { pr: "PrimusClaw 322", body: "x" })), "invalid_arguments");

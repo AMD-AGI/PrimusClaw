@@ -33,6 +33,7 @@ import { nextFireAfter } from "../triggers/schedule.js";
 import {
   deleteTrigger, insertTrigger, listTriggers, parseTriggerInput, sealTriggerCredentials, triggerView, type TriggerInput,
 } from "../triggers/store.js";
+import { redactPublicJson } from "../events/redaction.js";
 import { CLAW_WRITE_MARK } from "../github-mcp/tools.js";
 import { resolveGithubToken } from "../github-mcp/mcp.js";
 import { readGithubMcpSettings } from "../github-mcp/settings.js";
@@ -302,7 +303,9 @@ export async function githubCommentTool(claims: AssistantTokenClaims, args: { pr
   requireRouter(claims);
   const target = commentTarget(args.pr);
   if (!target) throw new ToolRefused("invalid_arguments", "pr is owner/repo#number or the pull request's https://github.com URL");
-  const body = typeof args.body === "string" ? args.body.trim() : "";
+  // Masked as the card's text is (`outbound.ts`), before it is stored: what is posted is exactly what the user was shown, never a key the
+  // card showed as <redacted>.
+  const body = typeof args.body === "string" ? String(redactPublicJson(args.body.trim()) ?? "") : "";
   if (!body) throw new ToolRefused("invalid_arguments", "body is the whole comment, and it is empty");
   if (body.length > ROUTER_COMMENT_MAX) {
     throw new ToolRefused("comment_too_long", `a comment put on a card is at most ${ROUTER_COMMENT_MAX} characters, so the user can read all of it: write it shorter`);
