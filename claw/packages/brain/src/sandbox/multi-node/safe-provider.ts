@@ -42,6 +42,8 @@ import {
   buildRayJobWorkloadBody,
   inferaFrontendPort,
   inferaSshPortBase,
+  PD_ENGINE_DECODE_PORT,
+  PD_ENGINE_PREFILL_PORT,
   RAYJOB_SERVER_PORT,
   SESSION_ENV,
 } from "./safe-body.js";
@@ -803,6 +805,8 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       return {
         ...base,
         serviceUrl: `http://${host}:${ATOM_ROUTER_PORT}`,
+        prefillUrl: `http://${workloadId}-prefill.${namespace}.svc.cluster.local:${PD_ENGINE_PREFILL_PORT}`,
+        decodeUrl: `http://${workloadId}-decode.${namespace}.svc.cluster.local:${PD_ENGINE_DECODE_PORT}`,
       };
     }
 

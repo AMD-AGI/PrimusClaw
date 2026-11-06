@@ -48,6 +48,10 @@ export interface MultiNodeContext {
   decodeIps?: string[];
   /** infera aggregated: worker pod IPs, rank order (leader first). */
   workerIps?: string[];
+  /** atom/sglangrouter: prefill engine Service URL. */
+  prefillUrl?: string;
+  /** atom/sglangrouter: decode engine Service URL. */
+  decodeUrl?: string;
 }
 
 export interface MultiNodeEnsureOptions {
