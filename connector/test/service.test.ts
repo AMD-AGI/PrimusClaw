@@ -140,6 +140,40 @@ describe("service install / uninstall / status", () => {
     assert.equal(detectSupervisor({ ...(D({ platform: "darwin" }) as ServiceDeps), exec: fakeExec().exec }), "launchd");
   });
 
+  test("login after a revocation starts the installed service again (systemd: restart; launchd: kickstart); with none installed it touches nothing", async () => {
+    for (const [sup, want] of [["systemd", "systemctl --user restart claw-connector.service"], ["launchd", "launchctl kickstart -k gui/1000/com.primusclaw.connector"]] as const) {
+      const home = tmpdir();
+      writeConfig(home, tmpdir("w-"));
+      const f = fakeExec({ "systemctl --user is-active": { code: 0, out: "active" } });
+      const svc = { ...D({ platform: sup === "launchd" ? "darwin" : "linux", home: tmpdir("home-") }), exec: f.exec };
+      await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home, { service: svc }).c);
+      assert.equal(await main(["service", "install", "--supervisor", sup], ctx(home, { service: svc }, { XDG_CONFIG_HOME: tmpdir("xdg-") }).c), EXIT.ok);
+      const c = ctx(home).c;
+      fs.writeFileSync(needsLoginFile(c.dirs), JSON.stringify({ at: "t", reason: "this connector was revoked" }));
+      f.calls.length = 0;
+      const l = ctx(home, { service: svc });
+      assert.equal(await main(["login", "--server", "https://claw.example", "--key", "k2"], l.c), EXIT.ok);
+      assert.deepEqual(f.calls, [want]);
+      assert.match(l.text(), new RegExp(`started the ${sup} service again`));
+    }
+    const other = tmpdir();
+    const f = fakeExec();
+    await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(other, { service: { ...D(), exec: f.exec } }).c);
+    assert.deepEqual(f.calls, [], "no service.json in this state directory: nothing to start");
+  });
+
+  test("the keep-alive check starts nothing while only a person can help: signed out, no config", async () => {
+    const home = tmpdir();
+    const a = ctx(home, { service: D() });
+    assert.equal(await main(["service", "ensure"], a.c), EXIT.needsPerson);
+    assert.match(a.errText(), /not starting: .*agents\.toml/);
+    writeConfig(home, tmpdir("w-"));
+    const b = ctx(home, { service: D() });
+    assert.equal(await main(["service", "ensure"], b.c), EXIT.needsPerson);
+    assert.match(b.errText(), /not starting: not signed in/);
+    assert.equal(fs.existsSync(supervisorPidFile(b.c.dirs)), false);
+  });
+
   test("launchd: a LaunchAgent that restarts any unclean exit and tells run it is under launchd", async () => {
     const home = tmpdir();
     const userHome = tmpdir("home-");
@@ -149,6 +183,7 @@ describe("service install / uninstall / status", () => {
     const a = ctx(home, { service: { ...D({ platform: "darwin", home: userHome }), exec: f.exec } }, { PATH: "/opt/homebrew/bin:/usr/bin" });
     assert.equal(await main(["service", "install"], a.c), EXIT.ok, a.errText());
     const plist = fs.readFileSync(path.join(userHome, "Library", "LaunchAgents", "com.primusclaw.connector.plist"), "utf8");
+    assert.equal(fs.statSync(path.join(userHome, "Library", "LaunchAgents", "com.primusclaw.connector.plist")).mode & 0o777, 0o600, "proxy URLs in it may carry a password");
     assert.match(plist, /<key>SuccessfulExit<\/key><false\/>/);
     assert.match(plist, /<key>CLAW_CONNECTOR_SUPERVISOR<\/key><string>launchd<\/string>/);
     assert.match(plist, /<string>run<\/string><string>--supervised<\/string>/);
@@ -237,6 +272,9 @@ describe("exit 78 and the disconnect record", () => {
     assert.equal(await main(["run", "--supervised"], a.c), EXIT.needsPerson);
     assert.match(a.errText(), /not starting: this connector was revoked/);
     assert.equal(await main(["run", "--supervised"], ctx(home, {}, { CLAW_CONNECTOR_SUPERVISOR: "launchd" }).c), EXIT.ok);
+    const noConfig = ctx(tmpdir(), {}, { CLAW_CONNECTOR_SUPERVISOR: "launchd" });
+    assert.equal(await main(["run", "--supervised"], noConfig.c), EXIT.ok, "under launchd every 78 is a clean exit, or launchd restarts it");
+    assert.match(noConfig.errText(), /agents\.toml/);
     const byHand = ctx(home);
     assert.equal(await main(["run"], byHand.c), EXIT.needsPerson, "a run by hand, or a unit written for the old exit code 3, stops here too");
   });

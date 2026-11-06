@@ -21,7 +21,7 @@ import { parseArgs } from "node:util";
 import type { Ctx, ServiceHelpers } from "./commands.js";
 import { isAlive, processStart } from "./children.js";
 import { needsLogin, recordDisconnect, recentDisconnects } from "./health.js";
-import { keepaliveFile, runLogFile, supervisorPidFile } from "./paths.js";
+import { keepaliveFile, runLogFile, serviceFile, supervisorPidFile } from "./paths.js";
 import { errMessage, isObject, sleep } from "./util.js";
 
 export type Supervisor = "systemd" | "launchd" | "script";
@@ -250,8 +250,9 @@ export async function cmdSupervise(_args: string[], ctx: Ctx): Promise<number> {
 async function ensure(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers): Promise<number> {
   const sup = supervisorPid(ctx);
   if (sup !== null) { ctx.out(`supervisor running (pid ${sup})`); return 0; }
-  const nl = needsLogin(ctx.dirs);
-  if (nl) { ctx.err(`not starting: ${nl.reason}; run: claw-connector login`); return NEEDS_PERSON; }
+  // Not started while only a person can help (no config, no sign-in, revoked): it would exit 78 every time.
+  const problem = h.preflight(ctx);
+  if (problem) { ctx.err(`not starting: ${problem}`); return NEEDS_PERSON; }
   const run = h.runningPid(ctx);
   if (run !== null) {
     // A run started by hand: leave it, the next check after it ends starts the supervisor.
@@ -283,18 +284,40 @@ export async function cmdService(args: string[], ctx: Ctx, h: ServiceHelpers): P
     if (!(SUPERVISORS as readonly string[]).includes(values.supervisor)) { ctx.err(usage); return 2; }
     sup = values.supervisor as Supervisor;
   } else {
-    sup = sub === "install" ? detectSupervisor(d) : installedSupervisor(ctx, d) ?? detectSupervisor(d);
+    sup = sub === "install" ? detectSupervisor(d) : installedSupervisor(ctx) ?? detectSupervisor(d);
   }
   if (sub === "install") return install(ctx, d, h, sup, values.env ?? []);
   if (sub === "uninstall") return uninstall(ctx, d, sup);
   return status(ctx, d, h, values.json === true);
 }
 
-function installedSupervisor(ctx: Ctx, d: ServiceDeps): Supervisor | null {
-  if (fs.existsSync(systemdUnitPath(ctx, d))) return "systemd";
-  if (fs.existsSync(launchdPlistPath(d))) return "launchd";
-  if (fs.existsSync(keepaliveFile(ctx.dirs))) return "script";
+/**
+ * The supervisor `install` set up for this state directory, as it recorded in service.json. Read from the state
+ * directory, never guessed from the home directory: another connector home (or a test) on the same account must
+ * not act on a unit that is not its own.
+ */
+export function installedSupervisor(ctx: Ctx): Supervisor | null {
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(serviceFile(ctx.dirs), "utf8"));
+    if (isObject(raw) && typeof raw.supervisor === "string" && (SUPERVISORS as readonly string[]).includes(raw.supervisor)) return raw.supervisor as Supervisor;
+  } catch { /* not installed */ }
   return null;
+}
+
+/**
+ * After a successful `login`: a service that stopped at exit 78 (systemd does not restart it, launchd saw a clean
+ * exit, the script supervisor ended) is started again, so signing in is the whole fix.
+ */
+export function startAfterLogin(ctx: Ctx, h: ServiceHelpers): void {
+  const sup = installedSupervisor(ctx);
+  if (!sup) return;
+  const d = deps(ctx);
+  if (h.runningPid(ctx) !== null) return;
+  let r: ExecResult;
+  if (sup === "systemd") r = d.exec("systemctl", ["--user", "restart", UNIT]);
+  else if (sup === "launchd") r = d.exec("launchctl", ["kickstart", "-k", `gui/${d.uid}/${LABEL}`]);
+  else { void ensure(ctx, d, h); return; }
+  ctx.out(r.code === 0 ? `started the ${sup} service again` : `could not start the ${sup} service (${r.out || `exit ${r.code}`}); run: claw-connector service install`);
 }
 
 function writeFile600(file: string, body: string, mode = 0o600): void {
@@ -328,19 +351,23 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
     // Believe the unit is up only when systemd says so.
     const st = d.exec("systemctl", ["--user", "is-active", UNIT]).out.trim();
     if (st !== "active" && st !== "activating") { ctx.err(`the unit did not start (is-active: ${st || "nothing"}); see: journalctl --user -u ${UNIT}`); return 1; }
+    recordInstalled(ctx, "systemd");
     ctx.out(`installed ${unit} and started it (systemctl --user status ${UNIT}; logs: journalctl --user -u ${UNIT})`);
     const linger = d.exec("loginctl", ["show-user", d.user, "-p", "Linger", "--value"]);
     if (linger.out.trim() !== "yes") ctx.out(`to keep it running when you are not logged in and start it at boot, run once: loginctl enable-linger ${d.user}`);
   } else if (sup === "launchd") {
     const plist = launchdPlistPath(d);
-    writeFile600(plist, launchdPlist(d, vars, runLogFile(ctx.dirs)), 0o644);
+    // 0600: the proxy URLs it carries may hold a password. launchd reads a LaunchAgent as its owner.
+    writeFile600(plist, launchdPlist(d, vars, runLogFile(ctx.dirs)));
     d.exec("launchctl", ["bootout", `gui/${d.uid}/${LABEL}`]);
     const r = d.exec("launchctl", ["bootstrap", `gui/${d.uid}`, plist]);
     if (r.code !== 0) { ctx.err(`launchctl bootstrap failed: ${r.out || `exit ${r.code}`}`); return 1; }
+    recordInstalled(ctx, "launchd");
     ctx.out(`installed ${plist} and started it (launchctl print gui/${d.uid}/${LABEL}; log: ${runLogFile(ctx.dirs)})`);
   } else {
     const script = keepaliveFile(ctx.dirs);
     writeFile600(script, keepaliveScript(d, vars), 0o700);
+    recordInstalled(ctx, "script");
     const code = await ensure(ctx, d, h);
     if (code !== 0) return code;
     ctx.out(`wrote ${script}. This machine has no systemd: the supervisor restarts the connector 5 s after it dies, but`);
@@ -351,7 +378,12 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
   return 0;
 }
 
+function recordInstalled(ctx: Ctx, sup: Supervisor): void {
+  writeFile600(serviceFile(ctx.dirs), JSON.stringify({ supervisor: sup, installed_at: new Date().toISOString() }));
+}
+
 async function uninstall(ctx: Ctx, d: ServiceDeps, sup: Supervisor): Promise<number> {
+  fs.rmSync(serviceFile(ctx.dirs), { force: true });
   if (sup === "systemd") {
     const unit = systemdUnitPath(ctx, d);
     d.exec("systemctl", ["--user", "disable", "--now", UNIT]);
@@ -381,7 +413,7 @@ async function uninstall(ctx: Ctx, d: ServiceDeps, sup: Supervisor): Promise<num
 }
 
 function status(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, json: boolean): number {
-  const sup = installedSupervisor(ctx, d);
+  const sup = installedSupervisor(ctx);
   let active: string | null = null;
   if (sup === "systemd") active = d.exec("systemctl", ["--user", "is-active", UNIT]).out.trim() || null;
   else if (sup === "launchd") active = d.exec("launchctl", ["print", `gui/${d.uid}/${LABEL}`]).code === 0 ? "loaded" : "not loaded";

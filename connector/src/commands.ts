@@ -19,7 +19,7 @@ import { noAskWarnings } from "./claude-mode.js";
 import { HooksError, hooksStatus, installHooks, settingsFile, uninstallHooks } from "./hooks.js";
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
-import { cmdService, cmdSupervise, type ServiceDeps } from "./service.js";
+import { cmdService, cmdSupervise, startAfterLogin, type ServiceDeps } from "./service.js";
 import {
   auditFile, childrenFile, configFile, credentialsFile, identityFile, pauseFile, pidFile, type Dirs,
 } from "./paths.js";
@@ -107,7 +107,11 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
       case "init": return await cmdInit(rest, ctx);
       case "hooks": return cmdHooks(rest, ctx);
       case "login": return await cmdLogin(rest, ctx);
-      case "run": return await cmdRun(rest, ctx);
+      case "run": {
+        const code = await cmdRun(rest, ctx);
+        // launchd cannot be told "never restart on 78"; it does not restart a clean exit. The reason was printed.
+        return code === EXIT.needsPerson && ctx.env.CLAW_CONNECTOR_SUPERVISOR === "launchd" ? EXIT.ok : code;
+      }
       case "service": return await cmdService(rest, ctx, serviceHelpers);
       case "supervise": return await cmdSupervise(rest, ctx);
       case "status": return cmdStatus(rest, ctx);
@@ -266,6 +270,7 @@ async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
     forgetRevokedIdentity(ctx);
     clearNeedsLogin(ctx.dirs);
     ctx.out("saved a development key. This is for trying things out: a device sign-in is the normal way (omit --key).");
+    startAfterLogin(ctx, serviceHelpers);
     return EXIT.ok;
   }
   const identityRaw = (values["identity-url"] ?? ctx.env.CLAW_IDENTITY_URL ?? cfg?.identityUrl ?? "").trim();
@@ -279,7 +284,8 @@ async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
   });
   forgetRevokedIdentity(ctx);
   clearNeedsLogin(ctx.dirs);
-  ctx.out(`signed in as ${deviceName}. Next: claw-connector run`);
+  ctx.out(`signed in as ${deviceName}. Next: claw-connector service install (or run)`);
+  startAfterLogin(ctx, serviceHelpers);
   return EXIT.ok;
 }
 
@@ -303,8 +309,7 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
     const nl = needsLogin(ctx.dirs);
     if (nl) {
       ctx.err(`not starting: ${nl.reason}${nl.at ? ` (${nl.at})` : ""}. Sign in again (claw-connector login); the service then starts it.`);
-      // launchd cannot be told "never restart on 78"; it does not restart a clean exit.
-      return ctx.env.CLAW_CONNECTOR_SUPERVISOR === "launchd" ? EXIT.ok : EXIT.needsPerson;
+      return EXIT.needsPerson;
     }
   }
   let cfg: ConnectorConfig;

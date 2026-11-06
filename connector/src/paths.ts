@@ -39,3 +39,4 @@ export const needsLoginFile = (d: Dirs) => path.join(d.state, "needs-login.json"
 export const supervisorPidFile = (d: Dirs) => path.join(d.state, "supervisor.pid");
 export const runLogFile = (d: Dirs) => path.join(d.state, "run.log");
 export const keepaliveFile = (d: Dirs) => path.join(d.state, "keepalive.sh");
+export const serviceFile = (d: Dirs) => path.join(d.state, "service.json");

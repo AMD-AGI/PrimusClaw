@@ -359,13 +359,18 @@ the script supervisor `supervisor.pid`, `keepalive.sh` and `run.log`. `CLAW_CONN
 
 - **systemd** (Linux, when systemd is the machine's init): `~/.config/systemd/user/claw-connector.service` with `Restart=on-failure`,
   `RestartSec=5`, `RestartPreventExitStatus=78` and no start limit. Logs: `journalctl --user -u claw-connector`.
-- **launchd** (macOS): `~/Library/LaunchAgents/com.primusclaw.connector.plist` with `KeepAlive` on any unclean exit. launchd cannot
-  exempt one exit code, so after a 78 it starts the connector once more, which sees `needs-login.json` and exits 0 for good.
+- **launchd** (macOS): `~/Library/LaunchAgents/com.primusclaw.connector.plist` (mode 0600) with `KeepAlive` on any unclean exit. launchd cannot
+  exempt one exit code, so a run it started exits 0 instead of 78.
   Log: `run.log` in the state directory.
 - **script** (a container without systemd; an `systemctl` that answers "Running in chroot" counts as none): `claw-connector supervise`
   runs in the background and restarts the connector 5 seconds after it dies; `keepalive.sh` in the state directory starts that
   supervisor unless it is alive (recorded pid and start time) or a sign-in is needed. Nothing restarts the supervisor after the container
   restarts, so call `keepalive.sh` from the container's startup command and from a 5-minute cron job. Log: `run.log`.
+
+A successful `login` starts an installed service again, so after a revocation or a refused key signing in is the whole fix.
+`keepalive.sh` and the script supervisor start nothing while only a person can help (no `agents.toml`, not signed in,
+`needs-login.json`); under launchd every exit 78 is turned into a clean exit, which launchd does not restart. The service
+installed for a state directory is recorded in its `service.json`.
 
 The unit carries `PATH` (so the agents are found), `CLAW_CONNECTOR_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `CLAUDE_CONFIG_DIR`,
 `CODEX_HOME`, the CA and proxy variables and `LANG` from the shell that ran `install`; `--env NAME` adds another, except a name that looks
