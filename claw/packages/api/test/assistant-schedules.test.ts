@@ -21,6 +21,7 @@
  *   S8  a lapsed card does nothing when pressed
  *   S9  a card answered after the next run it showed: the trigger starts from the run after, and the answer says so
  *  S10  the same proposal again in a turn whose card was answered (or lapsed) says what became of it, and shows no new card
+ *  S11  the same proposal again in a turn is the same card even after a run time has passed between the two calls
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -355,6 +356,28 @@ describe("assistant schedules", { skip }, () => {
     assert.deepEqual([open.confirmation_id, open.status, open.done], [fourth.confirmation_id, "pending", false]);
     assert.match(open.note, /never say it is done/);
     assert.equal(await said(), 4, "one card per proposal, none for asking again");
+  });
+
+  test("S11 the same proposal again is the same card even when its next run has moved on between the calls", async (t) => {
+    await w.subscribe(alice.userId);
+    const turn = await userTurn(alice, "每小时提醒我看一下 CI");
+    // An hourly schedule whose run falls a minute or two from now, and the clock just before it and then just after it.
+    const run = Math.ceil(Date.now() / 60_000) * 60_000 + 60_000;
+    const hourly = { ...DAILY, name: "hourly", schedule: `${new Date(run).getUTCMinutes()} * * * *`, timezone: "UTC" };
+    t.mock.timers.enable({ apis: ["Date"], now: run - 1000 });
+    let first: Record<string, any>;
+    let again: Record<string, any>;
+    try {
+      first = await sch.triggerCreateTool(turn, hourly) as Record<string, any>;
+      t.mock.timers.setTime(run + 1000);
+      again = await sch.triggerCreateTool(turn, hourly) as Record<string, any>;
+    } finally {
+      t.mock.timers.reset();
+    }
+    assert.notEqual(again.next_run, first.next_run, "a run time really passed between the two calls");
+    assert.equal(again.confirmation_id, first.confirmation_id);
+    assert.equal(await count("claw_assistant_confirmations"), 1, "one card, so one press can create it at most once");
+    assert.equal(await count("claw_assistant_says"), 1);
   });
 
   test("S8 a card pressed after it lapsed does nothing", async () => {

@@ -141,7 +141,11 @@ async function propose(
   const pending = Number((await q(
     "SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations WHERE user_id = $1 AND status = 'pending' AND expires_at > NOW()", [userId],
   )).rows[0].n);
-  const dedupeKey = createHash("sha256").update(`${claims.sid}\u0000${claims.mid}\u0000${kind}\u0000${JSON.stringify(params)}`).digest("hex");
+  // What the user asked for, not the next run worked out from the clock at each call: the same arguments a moment later, after a
+  // run time has passed, are the same proposal and so the same card.
+  const asked: Record<string, unknown> = { ...params };
+  delete asked.next_run;
+  const dedupeKey = createHash("sha256").update(`${claims.sid}\u0000${claims.mid}\u0000${kind}\u0000${JSON.stringify(asked)}`).digest("hex");
   const same = (await q(SAME_CARD_SQL, [dedupeKey])).rows[0] as Record<string, any> | undefined;
   if (same) return { row: same, announce: null, subscribers: 0 };
   if (pending >= MAX_PENDING_CONFIRMATIONS) {
