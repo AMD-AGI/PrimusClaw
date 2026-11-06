@@ -47,6 +47,9 @@
  *   R16 EVAL_GAP_S: the next case waits that long after the last one ended
  *   R17 EVAL_SEND_TOKEN_CMD: the messages go with the person's signed-in token, everything else with the key; a token that is not
  *      the key's identity refuses the run before anything is sent
+ *   R18 a person who writes to the run's assistant session while the run is on: the item their turn started is not the run's and
+ *      is neither closed nor stripped of its worker's session (it is said as left alone), while the item of the run's own message
+ *      whose answer was lost is still found by its stored text and closed
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -207,6 +210,8 @@ class FakeClaw {
       const content = String(JSON.parse(body).content ?? "");
       this.sent.push({ at: Date.now(), content });
       this.messageAuth.push(String(req.headers.authorization ?? ""));
+      // Stored, with its id, before the answer, as the API does (`sessions/dispatch.ts`): a lost answer still leaves it.
+      this.userMessage(m[1]!, id, content);
       if (this.loseMessageAnswers > 0) { this.loseMessageAnswers--; req.socket.destroy(); }
       else send(200, { ok: true, message_id: id });
       const sessionId = m[1]!;
@@ -254,6 +259,11 @@ class FakeClaw {
    * The router's turn for one message: an optional work_create that starts `item`, a say, and its end as Brain sends it:
    * executionStats, then (after the workspace sync and the transcript, `settleMs` here) exec_complete.
    */
+  /** A message of the session's person, stored as the API stores one (`UserMessage`, with its id and text). */
+  userMessage(sessionId: string, messageId: string, text: string): void {
+    this.emit({ type: "UserMessage", message_id: messageId, role: "user", data: { content: [{ type: "text", text }] } }, Date.now(), sessionId);
+  }
+
   turn(messageId: string, opts: { item?: Item; say?: string; refusedSay?: boolean; end?: boolean; settleMs?: number }): void {
     if (opts.item) {
       this.items.push(opts.item);
@@ -810,6 +820,34 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.ok(claw.calls.includes("POST /v1/work-items/item-1/stop") && !claw.sessions.has("worker-1"), "the lost message's item is the run's: closed, its worker's session deleted");
       const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
       assert.deepEqual(report.cleanup_failed, []);
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it("R18 a person's message in the run's session: the item it started is left alone; the run's own, answer lost, is closed", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.loseMessageAnswers = 1;
+    let person = false;
+    claw.router = (_content, id, sessionId) => {
+      claw.turn(id, { item: item(1, { board_state: "in_progress", can_accept: false }), say: "On it." });
+      if (person) return;
+      person = true;
+      // Meanwhile the identity's person writes to the same session, and their turn starts an item of its own.
+      setTimeout(() => {
+        claw.userMessage(sessionId, "person-1", "and check my disk quota");
+        claw.turn("person-1", { item: item(2, { board_state: "in_progress", can_accept: false }), say: "Checking." });
+      }, 50);
+    };
+    const r = runner(base, [itemCase({ id: "t-p-001", turns: [{ user: "lost" }] })]);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.match(run.out, /ERROR t-p-001#1 /, run.out);
+      assert.ok(claw.calls.includes("POST /v1/work-items/item-1/stop") && !claw.sessions.has("worker-1"), "the run's own item (answer lost) is closed");
+      assert.ok(!claw.calls.some((c) => /item-2\/(stop|accept)/.test(c)), "the person's item is neither stopped nor accepted");
+      assert.ok(claw.sessions.has("worker-2"), "the person's item keeps its worker's session");
+      const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+      assert.ok((report.cleanup_failed as string[]).some((x) => /left alone: 2\b/.test(x)), JSON.stringify(report.cleanup_failed));
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 

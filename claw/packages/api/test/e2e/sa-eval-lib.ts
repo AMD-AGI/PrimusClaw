@@ -707,6 +707,36 @@ export function turnCalls(events: readonly LiveEvent[], messageIds: readonly str
 }
 
 /**
+ * The turns of a session that are the run's own, by message id: the messages it sent and knows by id, and for each message whose
+ * answer was lost, one stored `UserMessage` with that message's text that is not already counted (the server stores a message,
+ * with its id, before it answers). Every other turn of the session -- a person writing to it while the run is on -- is not the
+ * run's, and neither is anything its calls started.
+ */
+export function ownTurnIds(rows: readonly EventRow[], known: readonly string[], lostTexts: readonly string[]): string[] {
+  const ids = new Set(known);
+  const left = [...lostTexts];
+  for (const r of rows) {
+    const d = r.data ?? {};
+    if ((d.type ?? r.event_type) !== "UserMessage") continue;
+    const id = String(d.message_id ?? "");
+    if (!id || ids.has(id)) continue;
+    const content = Array.isArray(d.data?.content) ? d.data.content : [];
+    const text = content.filter((b: any) => b?.type === "text").map((b: any) => String(b.text ?? "")).join("");
+    const k = left.indexOf(text);
+    if (k < 0) continue;
+    left.splice(k, 1);
+    ids.add(id);
+  }
+  return [...ids];
+}
+
+/** The tool calls of these turns in stored events (`?mode=replay`), as `turnCalls` reads them from a stream. */
+export function storedTurnCalls(rows: readonly EventRow[], messageIds: readonly string[]): ToolCall[] {
+  const ids = new Set(messageIds);
+  return withToolFailures(traceOf(rows.filter((r) => ids.has(String(r.data?.message_id ?? "")))).calls);
+}
+
+/**
  * An event that closes its turn. The API never forwards `exec_complete` to a live stream (`routes/events.ts`), so there a turn
  * ends with its main agent's `executionStats` (it finished) or its `statusUpdate` to failed; a replay has `exec_complete` as well.
  * A sub-agent's events close nothing.
