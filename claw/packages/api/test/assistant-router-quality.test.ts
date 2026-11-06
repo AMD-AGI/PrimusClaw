@@ -145,6 +145,7 @@ describe("router quality, through the tools", { skip }, () => {
     assert.equal(added.ok, true);
     const event = w.events.find((e) => e.type === "AssistantSay" && e.say_id === added.say_id);
     assert.equal(event?.amends, notice.id);
+    assert.equal(event?.replaces, undefined, "added to the notice, not in place of the quick line before it");
     // Nor does the turn's own final text go out in its place.
     await w.closeRun(turn.task_id);
     const end = { sessionId: alice.routerSid, runIds: [turn.task_id], messageId: turn.mid, failed: false, interrupted: false };
@@ -264,10 +265,11 @@ describe("router quality, pure", () => {
 describe("router quality, the prompt", () => {
   test("Q7 router-v10 and router-read-v7 say each rule", async () => {
     const p = await import("../src/assistant/prompts.js");
-    // router-v12 (this rule set, a long answer said whole, nothing after the start notice); its review prompt is router-v17.
-    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v13");
+    // router-v14 (this rule set, a long answer said whole, a say after the start notice added to it, one message a turn); its review
+    // prompt is router-v18.
+    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v14");
     assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v8");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v17");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v18");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): a say after it in the turn is added to that same message, so never repeat the start/],

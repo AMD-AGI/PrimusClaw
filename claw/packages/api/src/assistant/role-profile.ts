@@ -28,7 +28,7 @@ import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import { reviewMemoryBlock, routerMemoryParts, workerMemoryBlock } from "./memory-tools.js";
 import {
-  ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
+  ASSISTANT_MCP_SERVER, confirmationRef, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
   ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderModelChoice,
   renderObserverSystem, renderReviewState, renderRouterItems, renderRouterPrompt, renderWorkerSystem, withTurnState,
   ROUTER_DEVENV_PROMPT_VERSION, renderRouterDevenvSection,
@@ -41,6 +41,7 @@ import { heldForPersonManifest, renderHeldForPerson } from "./holds.js";
 import { triggerToolSettings } from "../triggers/mcp.js";
 import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
+import { toldRefs } from "./told.js";
 import { promptImagesOf, renderFilesState } from "./files.js";
 import { turnMessage } from "./inbound.js";
 import { startWorkerRun } from "./run-started.js";
@@ -291,8 +292,10 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       withSystemAppend(task, ROUTER_REVIEW_PROMPT);
       const review = await reviewContextFor(role.userId, sessionId, messageId);
       const ctx = review.message?.context;
+      const told = await toldRefs((t, p) => db.query(t, p), role.userId,
+        review.confirmations.map((c) => ({ ref: confirmationRef(c.id), since: c.created_at })));
       state.push(renderReviewState({
-        confirmations: review.confirmations, reviewMode: review.reviewMode,
+        confirmations: review.confirmations.map((c) => ({ ...c, told_at: told.get(confirmationRef(c.id)) ?? null })), reviewMode: review.reviewMode,
         people: ctx?.people ?? [], actions: ctx?.actions ?? [], repos: ctx?.repos ?? [],
       }));
     }

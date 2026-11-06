@@ -40,7 +40,8 @@ import { readGithubMcpSettings } from "../github-mcp/settings.js";
 import { GithubClient } from "../github-review/github.js";
 import { turnMessage } from "./inbound.js";
 import { recordWriteConfirm, type SayDeps } from "./outbound.js";
-import { confirmationRef } from "./prompts.js";
+import { confirmationRef, toldNote } from "./prompts.js";
+import { toldRefs } from "./told.js";
 import { approvalCommand } from "./review-tools.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
@@ -520,10 +521,11 @@ export function denialCommand(text: string): string | null {
 export async function renderScheduleState(userId: string): Promise<string> {
   const waiting = await pendingConfirmations(userId);
   if (!waiting.length) return "";
+  const told = await toldRefs((t, p) => db.query(t, p), userId, waiting.map((w) => ({ ref: String(w.ref), since: w.created_at as Date })));
   const lines = waiting.map((w) => {
     const p = (w.params ?? {}) as Record<string, unknown>;
     const what = w.kind === "trigger_cancel" ? "cancel scheduled task" : "create scheduled task";
-    return `- ref #${String(w.ref)} | confirmation_id: ${String(w.confirmation_id)} | ${what} "${clip(String(p.name ?? ""), 60).replace(/\s+/g, " ")}" (${String(p.schedule ?? "")}, ${String(p.timezone ?? "")}) | the user lets it through with its card's button or: 批准 #${String(w.ref)}`;
+    return `- ref #${String(w.ref)} | confirmation_id: ${String(w.confirmation_id)} | ${what} "${clip(String(p.name ?? ""), 60).replace(/\s+/g, " ")}" (${String(p.schedule ?? "")}, ${String(p.timezone ?? "")}) | the user lets it through with its card's button or: 批准 #${String(w.ref)}${toldNote(told.get(String(w.ref)))}`;
   });
   return `Scheduled tasks waiting for the user's confirmation (cards shown to them):\n${lines.join("\n")}`;
 }

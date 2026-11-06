@@ -299,7 +299,15 @@ describe("assistant holds", { skip }, () => {
     assert.match(prompt, /Waiting for you in work items/);
     assert.match(prompt, new RegExp(`#${item.seq} \\(item_id: ${item.itemId}\\) approval \\| waits until `));
     assert.match(prompt, /workload_id=sa-eval-fixture-sleep/);
+    // No channel took the card, so its needs-you message went out at once: the router is told not to bring it up again.
+    assert.match(prompt, new RegExp(`#${item.seq} \\(item_id: ${item.itemId}\\) approval \\| waits until [^|]+\\| told: the user was told of this at `));
     assert.equal(task.decision_wait_ms, undefined, "a router turn asks nobody");
+    // Without a message about the item under this attention, it is not marked told.
+    await w.q("DELETE FROM claw_assistant_says WHERE item_id = $1", [item.itemId]);
+    const untold: Record<string, unknown> = { task_id: turn.task_id, message_id: turn.mid, prompt: "anything else?" };
+    await w.mod.role.applySessionRoleToTask(untold, alice.routerSid);
+    assert.match(String(untold.prompt), new RegExp(`#${item.seq} \\(item_id: ${item.itemId}\\) approval \\| waits until`));
+    assert.doesNotMatch(String(untold.prompt), /\| told: /);
 
     const worker = await w.workerTurn(item.itemId);
     const wt: Record<string, unknown> = { task_id: worker.task_id, message_id: worker.mid, prompt: "go on" };

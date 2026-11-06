@@ -387,7 +387,9 @@ export function createAssistantMcpServer(
     }
     mcp.tool(
       "work_stop",
-      "Stop an item the user no longer wants.",
+      "Stop an item the user no longer wants: one of their own, or a review they asked someone else to do (by its item_id under Reviews the user "
+      + "asked someone else to do; the user's message must name its pull request). The requester can always stop a review they asked for, "
+      + "handed off to their chat or not.",
       { item_id: z.string().describe(ITEM_ID_PARAM), reason: z.string() },
       (args) => answer(claims, "work_stop", () => workStop(claims, args)),
     );

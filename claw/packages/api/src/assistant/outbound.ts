@@ -156,9 +156,11 @@ interface ToStoreBase {
 type ToStore =
   | (ToStoreBase & {
     type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; confirmWrite?: AssistantConfirmWrite;
-    sources?: AssistantSaySource[]; files?: AssistantFile[]; amends?: string; suggested?: string[];
+    sources?: AssistantSaySource[]; files?: AssistantFile[]; amends?: string; replaces?: string; suggested?: string[];
     /** A system notice's turn (the message it answers): kept on its payload, so a later say of that turn finds it (`turnAnnouncedStart`). */
     noticeOfTurn?: string;
+    /** A router say's turn, kept on its payload the same way, so a later say of that turn finds it (`turnFirstSay`). */
+    turnMessageId?: string;
   })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow });
 
@@ -174,7 +176,8 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
       ...(m.confirmWrite ? { confirm_write: m.confirmWrite } : {}),
       ...(m.files?.length ? { files: m.files } : {}),
       ...(m.amends ? { amends: m.amends } : {}),
-      ...(m.noticeOfTurn ? { turn_message_id: m.noticeOfTurn } : {}),
+      ...(m.replaces ? { replaces: m.replaces } : {}),
+      ...((m.noticeOfTurn ?? m.turnMessageId) ? { turn_message_id: m.noticeOfTurn ?? m.turnMessageId } : {}),
     };
 }
 
@@ -243,6 +246,7 @@ export async function publishSayEvent(
       ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
       ...(payload.type === "assistant.say" && payload.files ? { files: payload.files } : {}),
       ...(payload.type === "assistant.say" && payload.amends ? { amends: payload.amends } : {}),
+      ...(payload.type === "assistant.say" && payload.replaces ? { replaces: payload.replaces } : {}),
       fallback: payload.type === "work_item.needs_you",
       ts: Date.parse(payload.occurred_at),
     });
@@ -553,9 +557,12 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
         [input.userId],
       )).rows[0].n);
       if (recent >= limit) throw new SayCapped(limit);
+      const replaces = input.turnMessageId && input.turnBegan ? await turnFirstSay(q, input.userId, input.turnBegan, input.turnMessageId) : null;
       return storeOne({
         type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item, sources: input.sources, suggested: input.suggested,
-        ...(notice ? { amends: notice } : {}),
+        ...(input.turnMessageId ? { turnMessageId: input.turnMessageId } : {}),
+        // After the turn's start notice a say adds to that notice (`amends`); otherwise a later say takes the place of the turn's first one.
+        ...(notice ? { amends: notice } : replaces ? { replaces } : {}),
         ...(input.holdForTurn ? { hold: { status: heldStatus(input.holdForTurn), seconds: HOLD_SECONDS } } : {}),
       });
     }, (late) => announce(late, deps, input.turnMessageId, !!input.holdForTurn));
@@ -566,6 +573,25 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
   if (!stored) throw new Error("a fresh say id was already stored");
   await announce(stored, deps, input.turnMessageId, !!input.holdForTurn);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
+}
+
+/**
+ * The router's first message in the turn that answers `messageId` (begun at `since`), by its say id; null when it has said nothing yet.
+ * A later say of the turn takes that message's place (`AssistantSayPayload.replaces`): the release gate found an answer followed by a
+ * second message correcting it ("更正上一条…", 2026-11-06), where the person should have had one message, right. Matched by the turn
+ * kept on the message's delivery, never by time alone: turns of one user can overlap. Without notifications there is no channel to
+ * replace a message in, and no outbox to match by.
+ */
+export async function turnFirstSay(q: Querier, userId: string, since: Date | string, messageId: string): Promise<string | null> {
+  if (!CLAW_NOTIFICATIONS_ENABLED) return null;
+  const row = (await q(
+    `SELECT s.say_id::text AS say_id FROM claw_assistant_says s
+      WHERE s.user_id = $1 AND NOT s.fallback AND s.created_at >= $2
+        AND EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text AND o.payload->>'turn_message_id' = $3)
+      ORDER BY s.created_at, s.say_id LIMIT 1`,
+    [userId, since, messageId],
+  )).rows[0] as { say_id: string } | undefined;
+  return row?.say_id ?? null;
 }
 
 const NEEDS_YOU_TEXT: Record<string, (item: ItemRow) => string> = {
