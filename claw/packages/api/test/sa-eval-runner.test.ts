@@ -20,7 +20,8 @@
  *   R5 baseline: a plain session's turn is over once its exec_complete is stored, what it showed is graded (a tool name in an earlier
  *      message fails the case; a sub-agent's message is not the first reply), and the session is deleted and seen gone
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
- *      on ends with that alone), an error and not a grade when they do not either, or only after the wait
+ *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
+ *      (an earlier turn of a case is held to its own)
  */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -440,6 +441,11 @@ test("R6 a turn with no end on the stream", { timeout: 120_000 }, async () => {
   const claw = new FakeClaw();
   const base = await claw.start();
   claw.router = (content, id) => {
+    if (content === "slow first") {
+      // Over 3 s after its message, past EVAL_TURN_WAIT_S=2, though before a wait counted from the case's last message ends.
+      setTimeout(() => { claw.emit({ type: "executionStats", message_id: id }); claw.emit({ type: "exec_complete", message_id: id, final_text: "first" }); }, 3_000);
+    }
+    if (content === "quick second") claw.turn(id, { say: "second" });
     if (content === "late") {
       // Over 4 s after its message, past EVAL_TURN_WAIT_S=2: late is late, even if the end is stored by the time anyone looks.
       setTimeout(() => { claw.emit({ type: "executionStats", message_id: id }); claw.emit({ type: "exec_complete", message_id: id, final_text: "late" }); }, 4_000);
@@ -452,13 +458,15 @@ test("R6 a turn with no end on the stream", { timeout: 120_000 }, async () => {
     // "silent": nothing at all.
   };
   const turnCase = (id: string, user: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user }] });
-  const r = runner(base, [turnCase("t-silent-001", "silent"), turnCase("t-poison-001", "poisoned"), turnCase("t-late-001", "late")], { EVAL_TURN_WAIT_S: "2" });
+  const r = runner(base, [turnCase("t-silent-001", "silent"), turnCase("t-poison-001", "poisoned"), turnCase("t-late-001", "late"),
+    { ...turnCase("t-twoturn-001", "slow first"), turns: [{ user: "slow first" }, { user: "quick second", after_ms: 2_500 }] }], { EVAL_TURN_WAIT_S: "2" });
   const run = await r.done;
   await claw.stop();
   try {
-    assert.match(run.out, /ERROR t-silent-001#1 .*no end of the turn of msg-1 within 2 s: not graded/, run.out);
+    assert.match(run.out, /ERROR t-silent-001#1 .*no end of the turn of msg-1 within 2 s of its message: not graded/, run.out);
     assert.match(run.out, /pass t-poison-001#1/, "its end was in the stored events: graded on what the user saw");
-    assert.match(run.out, /ERROR t-late-001#1 .*no end of the turn of msg-3 within 2 s: not graded/, "a turn over after the wait is not graded");
+    assert.match(run.out, /ERROR t-late-001#1 .*no end of the turn of msg-3 within 2 s of its message: not graded/, "a turn over after the wait is not graded");
+    assert.match(run.out, /ERROR t-twoturn-001#1 .*no end of the turn of msg-4 within 2 s of its message: not graded/, "each turn has its own wait");
     assert.equal(run.code, 1, "an attempt that could not be graded fails the run");
     assert.deepEqual(claw.calls.filter((c) => c.startsWith("DELETE")), ["DELETE /v1/sessions/asst-1"]);
   } finally { rmSync(r.dir, { recursive: true, force: true }); }

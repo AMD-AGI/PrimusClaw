@@ -423,24 +423,30 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   const start = Date.now();
   const messageIds: string[] = [];
   const sentAt: number[] = [];
-  for (const t of turns) {
-    const wait = start + (t.after_ms ?? 0) - Date.now();
-    if (wait > 0) await pause(wait);
-    live();
-    const at = Date.now();
-    const r = await api("POST", `/v1/sessions/${sessionId}/messages`, { content: t.user, messageType: "text" });
-    const id = r.json?.message_id;
-    if (r.status !== 200 || typeof id !== "string") throw new Error(`message answered ${r.status}`);
-    RUN_MESSAGES.push(id);
-    messageIds.push(id);
-    sentAt.push(at);
+  // The Router's turn for each message ends (each is short: it answers or hands the work on), each within the wait from its own
+  // message, watched from when it is sent; one that has not is not graded: what was seen of it is part of a turn.
+  const over: Array<Promise<boolean>> = [];
+  try {
+    for (const t of turns) {
+      const wait = start + (t.after_ms ?? 0) - Date.now();
+      if (wait > 0) await pause(wait);
+      live();
+      const at = Date.now();
+      const r = await api("POST", `/v1/sessions/${sessionId}/messages`, { content: t.user, messageType: "text" });
+      const id = r.json?.message_id;
+      if (r.status !== 200 || typeof id !== "string") throw new Error(`message answered ${r.status}`);
+      RUN_MESSAGES.push(id);
+      messageIds.push(id);
+      sentAt.push(at);
+      over.push(turnsOver(sessionId, (stored) => stored.includes(id), () => turnEnded(stream.events, id), at + turnWaitMs(true), waitFor));
+    }
+  } finally {
+    // A watch left behind by a failed send or a stop ends on its own; what it answers is not read.
+    for (const w of over) w.catch(() => undefined);
   }
-  // The Router's turns for the case's messages end (each is short: it answers or hands the work on). One that has not ended
-  // in time is not graded: what was seen of it is part of a turn.
-  if (!(await turnsOver(sessionId, (stored) => messageIds.every((id) => stored.includes(id)),
-    () => messageIds.every((id) => turnEnded(stream.events, id)), Date.now() + turnWaitMs(true), waitFor))) {
-    throw new Error(`no end of the turn of ${messageIds.join(",")} within ${turnWaitMs(true) / 1000} s: not graded`);
-  }
+  const ended = await Promise.all(over);
+  const late = messageIds.filter((_, k) => !ended[k]);
+  if (late.length) throw new Error(`no end of the turn of ${late.join(",")} within ${turnWaitMs(true) / 1000} s of its message: not graded`);
   // The case's items are only those its own turns started (read from their work_create / review_start answers): an item
   // someone else put on the board meanwhile (a review asked of this identity) is neither graded nor closed here.
   const started = turnCalls(stream.events, messageIds);
