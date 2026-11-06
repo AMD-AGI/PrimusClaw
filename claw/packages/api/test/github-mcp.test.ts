@@ -376,6 +376,18 @@ describe("B lists a turn sees whole", () => {
     assert.equal(many.by_repo, undefined);
     assert.match(many.note, /not counted for more than 300/);
     assert.equal(seen.length, 1, "nothing more is read past the bound");
+
+    // A search that timed out may say a low total_count: a first page holding that many is not every match, so nothing is counted.
+    seen = [];
+    respond = (url) => url.pathname === "/search/issues"
+      ? json({ total_count: 3, incomplete_results: true, items: all.slice(0, 3) })
+      : json({}, 404);
+    const cut = JSON.parse((await call(c, "issue_search", { query: "is:pr is:open author:@me" })).text);
+    assert.equal(cut.by_repo, undefined, "no per-repository count from a search GitHub cut short");
+    assert.equal(cut.complete, false);
+    assert.match(cut.note, /timed out/);
+    assert.match(cut.note, /by_repo is not counted/);
+    assert.equal(seen.length, 1, "nothing more is read for it");
   });
 
   test("B14 pr_list state merged: only merged ones, most recently merged first, read in update order", async () => {

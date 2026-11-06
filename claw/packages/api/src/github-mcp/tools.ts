@@ -617,18 +617,22 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     const items = (res?.items ?? []).map((i: any) => ({ repo: repoOfUrl(i.repository_url), ...issueLine(i), ...(i.pull_request ? { draft: i.draft === true } : {}) }));
     const total = typeof res?.total_count === "number" ? res.total_count : null;
     const seen = (page - 1) * perPage + items.length;
-    const byRepo = page === 1 && total !== null ? await searchCountByRepo(gh, a.query, items, total) : null;
+    // A search GitHub cut short may report a low total_count, so a page that seems to hold every match may not: no by_repo then.
+    const incomplete = res?.incomplete_results === true;
+    const byRepo = page === 1 && total !== null && !incomplete ? await searchCountByRepo(gh, a.query, items, total) : null;
     const notes = [
-      ...(res?.incomplete_results === true ? ["GitHub's search timed out before it found every match: total_count may be low"] : []),
+      ...(incomplete ? ["GitHub's search timed out before it found every match: total_count may be low"] : []),
       ...(page === 1 && total !== null && !byRepo
-        ? [total > BY_REPO_MAX
+        ? [incomplete
+          ? "by_repo is not counted for a search that timed out; ask again"
+          : total > BY_REPO_MAX
           ? `by_repo is not counted for more than ${BY_REPO_MAX} matches: narrow the query with repo: or org: to count one`
           : "by_repo could not be counted: the matches changed while they were read; ask again"]
         : []),
     ];
     return listAnswer(items, {
       total_count: total,
-      complete: page === 1 && total !== null && items.length >= total && res?.incomplete_results !== true,
+      complete: page === 1 && total !== null && items.length >= total && !incomplete,
       next_page: total !== null && seen < total && items.length === perPage ? page + 1 : null,
       ...(byRepo ? { by_repo: byRepo } : {}),
       ...(notes.length ? { note: notes.join("; ") } : {}),
