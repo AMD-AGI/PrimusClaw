@@ -15,7 +15,9 @@
  *  - `workload`: a SaFE workload of the user's own, read with their SaFE key (the one their messages last gave their assistant): one
  *    SaFE says is someone else's is not theirs to watch, whatever their key may read;
  *  - `run`: a run of the user's in this deployment (a task, such as the root of a run another service planned and submitted for
- *    them), read from Claw's own tables, and only when its session is the user's.
+ *    them), read from Claw's own tables, and only when its session is the user's;
+ *  - and any kind the deployment adds (`CLAW_ASSISTANT_JOB_HTTP_SOURCES`): a job of another service, read over HTTP with the user's
+ *    own platform key, so they are told only what that service would show them; with an `owner` path, only a job of their own.
  *
  * Nothing is lost silently: a job that cannot be read for `READ_FAILURE_REPORT_SEC` is said once per streak, and one that is gone
  * ends its watch with a message that says so.
@@ -23,23 +25,139 @@
 import pino from "pino";
 import { readTrustedSessionCredentials } from "../auth/sealed-session-credentials.js";
 import {
-  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_JOB_EVENTS, CLAW_ASSISTANT_JOB_MAX_WATCHES, CLAW_ASSISTANT_JOB_POLL_SEC, SAFE_API_URL,
+  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_JOB_EVENTS, CLAW_ASSISTANT_JOB_HTTP_SOURCES, CLAW_ASSISTANT_JOB_MAX_WATCHES,
+  CLAW_ASSISTANT_JOB_POLL_SEC, SAFE_API_URL,
 } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
-import { turnMessage } from "./inbound.js";
+import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { recordSystemNotice } from "./outbound.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, ToolRefused } from "./tools.js";
 
 const logger = pino({ name: "assistant-job-watch" });
 
+/** The kinds every deployment has; `jobSources()` adds the deployment's own. */
 export const JOB_SOURCES = ["workload", "run"] as const;
-export type JobSource = (typeof JOB_SOURCES)[number];
+export type JobSource = string;
 /** States a job does not leave: SaFE's ended phases, and a run's ended statuses. */
-export const ENDED_STATES: Readonly<Record<JobSource, ReadonlySet<string>>> = {
+export const ENDED_STATES: Readonly<Record<(typeof JOB_SOURCES)[number], ReadonlySet<string>>> = {
   workload: new Set(["Succeeded", "Failed", "Stopped"]),
   run: new Set(["completed", "failed", "cancelled"]),
 };
+
+/** A kind of job read over HTTP with the user's platform key (`CLAW_ASSISTANT_JOB_HTTP_SOURCES`). */
+export interface HttpJobSource {
+  kind: string;
+  /** What the router is told the kind is for: "a build of the user's (its id)". */
+  description: string;
+  /** The job's URL, `{id}` standing for the id, URL-encoded. */
+  url: string;
+  /** Dotted paths into the answer: the state (required), a line about it, and whose job it is. */
+  state: string;
+  detail: string | null;
+  owner: string | null;
+  ended: ReadonlySet<string>;
+}
+
+const KIND_RE = /^[a-z][a-z0-9_-]{1,31}$/;
+const PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/;
+
+/**
+ * Whether a URL may carry a user's key: https, or plain http only inside the cluster (a `.svc` host); and the id (which the user
+ * chooses) stands once, in the path or the query, after a fixed origin, so no id can send the key to a host of its choosing.
+ */
+function keySafeUrl(raw: string): boolean {
+  const at = raw.indexOf("{id}");
+  if (at < 0 || raw.indexOf("{id}", at + 1) >= 0) return false;
+  const prefix = raw.slice(0, at);
+  // In a fragment the id is never sent: every job would be read at the same address.
+  if (prefix.includes("#")) return false;
+  let u: URL;
+  try {
+    u = new URL(raw.replace("{id}", "x"));
+    if (!prefix.startsWith(`${new URL(`${prefix}x`).origin}/`) || !prefix.startsWith(`${u.origin}/`)) return false;
+  } catch {
+    return false;
+  }
+  if (u.username || u.password) return false;
+  if (u.protocol === "https:") return true;
+  return u.protocol === "http:" && /\.svc(\.cluster\.local)?$/.test(u.hostname);
+}
+
+/**
+ * The deployment's own kinds, from the JSON array the operator gives. Each entry is checked; one that does not parse is left out with
+ * the reason, so a mistake in one never takes the others (or the API) down.
+ */
+export function parseJobHttpSources(raw: string): { sources: HttpJobSource[]; errors: string[] } {
+  const sources: HttpJobSource[] = [];
+  const errors: string[] = [];
+  if (!raw.trim()) return { sources, errors };
+  let list: unknown;
+  try {
+    list = JSON.parse(raw);
+  } catch {
+    return { sources, errors: ["not JSON"] };
+  }
+  if (!Array.isArray(list)) return { sources, errors: ["not a JSON array"] };
+  list.forEach((entry, i) => {
+    const e = (entry && typeof entry === "object" ? entry : {}) as Record<string, unknown>;
+    const kind = typeof e.kind === "string" ? e.kind : "";
+    const why = !KIND_RE.test(kind) ? "kind must be a short lowercase name"
+      : (JOB_SOURCES as readonly string[]).includes(kind) || sources.some((s) => s.kind === kind) ? `kind ${kind} is taken`
+      : typeof e.url !== "string" || !e.url.includes("{id}") ? "url must name the job with {id}"
+      : !keySafeUrl(e.url) ? "url must be https, or http to an in-cluster .svc host, with {id} once after its host: it carries the user's key"
+      : typeof e.state !== "string" || !PATH_RE.test(e.state) ? "state must be a dotted path"
+      : (e.detail !== undefined && (typeof e.detail !== "string" || !PATH_RE.test(e.detail))) ? "detail must be a dotted path"
+      : (e.owner !== undefined && (typeof e.owner !== "string" || !PATH_RE.test(e.owner))) ? "owner must be a dotted path"
+      : !Array.isArray(e.ended) || !e.ended.length || !e.ended.every((x) => typeof x === "string" && x) ? "ended must list the end states"
+      : "";
+    if (why) {
+      errors.push(`entry ${i}: ${why}`);
+      return;
+    }
+    sources.push({
+      kind, description: oneLine(e.description, 120) || `a ${kind} job (its id)`, url: e.url as string, state: e.state as string,
+      detail: (e.detail as string | undefined) ?? null, owner: (e.owner as string | undefined) ?? null, ended: new Set(e.ended as string[]),
+    });
+  });
+  return { sources, errors };
+}
+
+let httpSources: HttpJobSource[] | null = null;
+
+/** The deployment's own kinds, parsed once (the errors are logged then). `setJobHttpSources` replaces them, for a test. */
+export function jobHttpSources(): readonly HttpJobSource[] {
+  if (httpSources === null) {
+    const parsed = parseJobHttpSources(CLAW_ASSISTANT_JOB_HTTP_SOURCES);
+    for (const error of parsed.errors) logger.error({ error }, "assistant.job_http_source_invalid");
+    httpSources = parsed.sources;
+  }
+  return httpSources;
+}
+
+export function setJobHttpSources(sources: HttpJobSource[] | null): void {
+  httpSources = sources;
+}
+
+/** Every kind a watch may be of here. */
+export function jobSources(): string[] {
+  return [...JOB_SOURCES, ...jobHttpSources().map((s) => s.kind)];
+}
+
+/** The states a job of this kind does not leave. */
+export function endedStates(source: string): ReadonlySet<string> {
+  return (ENDED_STATES as Record<string, ReadonlySet<string>>)[source] ?? jobHttpSources().find((s) => s.kind === source)?.ended ?? new Set();
+}
+
+function pick(body: unknown, path: string | null): unknown {
+  if (!path) return undefined;
+  let v: unknown = body;
+  for (const part of path.split(".")) {
+    if (!v || typeof v !== "object") return undefined;
+    v = (v as Record<string, unknown>)[part];
+  }
+  return v;
+}
 export const READ_FAILURE_REPORT_SEC = 600;
 const POLL_BATCH = 50;
 const LABEL_MAX = 80;
@@ -60,7 +178,13 @@ export type JobRead =
 /** What leaves the process: SaFE, read with the user's key. A test stands in for it. */
 export const jobWatchPorts: {
   readWorkload: (workloadId: string, apiKey: string) => Promise<JobRead>;
+  /** One GET of a deployment-added kind's job, with the user's key: its status and JSON (null when the answer is not JSON). */
+  httpGet: (url: string, apiKey: string) => Promise<{ status: number; body: unknown }>;
 } = {
+  httpGet: async (url, apiKey) => {
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" }, signal: AbortSignal.timeout(SAFE_TIMEOUT_MS) });
+    return { status: resp.status, body: resp.ok ? await resp.json().catch(() => null) : null };
+  },
   readWorkload: async (workloadId, apiKey) => {
     if (!SAFE_API_URL) return { kind: "error", code: "safe_not_configured" };
     let resp: Response;
@@ -108,10 +232,41 @@ async function userSafeKey(q: Querier, userId: string): Promise<string | null> {
   return readTrustedSessionCredentials(row?.config).platformKey || null;
 }
 
+/** A job of a deployment-added kind: one GET with the user's key, its state and line picked from the answer. */
+async function readHttpJob(source: HttpJobSource, id: string, key: string): Promise<JobRead> {
+  // Encoded, an id cannot leave its place in the path, except as a dot segment the URL would resolve upwards.
+  if (id === "." || id === "..") return { kind: "gone" };
+  let got: { status: number; body: unknown };
+  try {
+    got = await jobWatchPorts.httpGet(source.url.replace("{id}", encodeURIComponent(id)), key);
+  } catch {
+    return { kind: "error", code: `${source.kind}_unreachable` };
+  }
+  if (got.status === 404 || got.status === 410) return { kind: "gone" };
+  if (got.status === 401 || got.status === 403) return { kind: "error", code: `${source.kind}_refused_${got.status}` };
+  if (got.status < 200 || got.status >= 300) return { kind: "error", code: `${source.kind}_http_${got.status}` };
+  const state = pick(got.body, source.state);
+  if (typeof state !== "string" || !state) return { kind: "error", code: `${source.kind}_unreadable` };
+  const detail = pick(got.body, source.detail);
+  const owner = pick(got.body, source.owner);
+  return {
+    kind: "state", state, detail: typeof detail === "string" && detail ? detail : null,
+    // With an owner path, an answer that names no owner is no proof the job is the user's.
+    ...(source.owner ? { owner: typeof owner === "string" ? owner : "" } : {}),
+  };
+}
+
 export async function readJob(q: Querier, w: { user_id: string; source: string; target: string }): Promise<JobRead> {
   if (w.source === "run") return readRun(q, w.user_id, w.target);
+  const http = w.source === "workload" ? null : jobHttpSources().find((s) => s.kind === w.source);
+  if (w.source !== "workload" && !http) return { kind: "error", code: "source_not_configured" };
   const key = await userSafeKey(q, w.user_id);
   if (!key) return { kind: "error", code: "no_safe_key" };
+  if (http) {
+    const read = await readHttpJob(http, w.target, key);
+    if (read.kind === "state" && read.owner !== undefined && read.owner !== w.user_id) return { kind: "gone" };
+    return read;
+  }
   const read = await jobWatchPorts.readWorkload(w.target, key);
   // Only the user's own workload, whatever their key may read (an operator's reads everyone's): someone else's is not theirs to watch.
   if (read.kind === "state" && read.owner && read.owner !== w.user_id) return { kind: "gone" };
@@ -180,7 +335,7 @@ export async function pollWatch(w: Watch): Promise<"changed" | "ended" | "same" 
     if (ended.rowCount) await tell(w, `job-gone:${w.id}`, words(w).gone(w.label));
     return "gone";
   }
-  const ended = ENDED_STATES[w.source]?.has(read.state) ?? false;
+  const ended = endedStates(w.source).has(read.state);
   if (read.state === w.last_state) {
     await db.query(
       `UPDATE claw_assistant_job_watches SET last_error = NULL, failing_since = NULL, failure_reported = FALSE
@@ -285,12 +440,20 @@ const watchView = (r: Record<string, any>) => ({
  * `job_watch`: watch a job for the user. It is read once first, so a wrong id is refused now and a job that has already ended is
  * answered with its state instead of being watched. Reading only: it needs no confirmation, as answering a question would not.
  */
+/**
+ * A deployment-added kind's state is whatever its job API answered: text no one the user vetted wrote. The turn that reads it reads
+ * it as a worker's words, and no longer acts for the user afterwards (`markUntrustedRead`). SaFE's phases and Claw's run statuses
+ * are their own fixed words.
+ */
+const statesWordedByOthers = (source: string): boolean => !(JOB_SOURCES as readonly string[]).includes(source);
+
 export async function jobWatch(
   claims: AssistantTokenClaims, args: { kind?: unknown; id?: unknown; label?: unknown },
 ): Promise<Record<string, unknown>> {
   requireRouter(claims);
   const source = String(args.kind ?? "") as JobSource;
-  if (!(JOB_SOURCES as readonly string[]).includes(source)) throw new ToolRefused("invalid_arguments", `kind is one of ${JOB_SOURCES.join(", ")}`);
+  const kinds = jobSources();
+  if (!kinds.includes(source)) throw new ToolRefused("invalid_arguments", `kind is one of ${kinds.join(", ")}`);
   const target = oneLine(args.id, 200);
   if (!target) throw new ToolRefused("invalid_arguments", "id names the workload or the run to watch");
   const q: Querier = (t, p) => db.query(t, p);
@@ -303,7 +466,8 @@ export async function jobWatch(
   const read = await readJob(q, { user_id: userId, source, target });
   if (read.kind === "gone") throw new ToolRefused("not_found", `no ${source} with that id is the user's to see: check the id`);
   if (read.kind === "error") throw new ToolRefused("unreadable", `the ${source} could not be read now (${read.code}): tell the user, and try again later`);
-  if (ENDED_STATES[source].has(read.state)) {
+  if (statesWordedByOthers(source)) await markUntrustedRead(q, claims.sid, claims.mid);
+  if (endedStates(source).has(read.state)) {
     // Only the state: the job's own message (or a run's failure reason) is text others wrote, and this turn may still act.
     return { ok: true, watching: false, state: read.state, note: "it has already ended: tell the user its state; nothing is watched" };
   }
@@ -339,6 +503,7 @@ export async function jobWatchList(claims: AssistantTokenClaims): Promise<Record
     `SELECT * FROM claw_assistant_job_watches WHERE user_id = $1 AND (state = 'active' OR ended_at > NOW() - INTERVAL '1 day') ORDER BY id`,
     [userId],
   )).rows as Array<Record<string, any>>;
+  if (rows.some((r) => statesWordedByOthers(String(r.source)))) await markUntrustedRead((t, p) => db.query(t, p), claims.sid, claims.mid);
   return { ok: true, watches: rows.map(watchView) };
 }
 
@@ -348,6 +513,10 @@ export async function jobUnwatch(claims: AssistantTokenClaims, args: { watch_id?
   if (!Number.isSafeInteger(id) || id <= 0) throw new ToolRefused("invalid_arguments", "watch_id is the number job_watch_list shows");
   const row = await inTransaction(async (tx) => {
     const { userId } = await assertLiveRun(tx, claims);
+    // Ending a watch the user asked for is theirs to say: a turn that has read text others wrote (a job's state, a brief) cannot.
+    if ((await turnMessage(tx, claims.sid, claims.mid))?.readUntrusted) {
+      throw new ToolRefused("read_untrusted", "this turn has read text others wrote (a job's state, the brief), so it cannot end a watch: ask the user to say it in a new message");
+    }
     return (await tx(
       `UPDATE claw_assistant_job_watches SET state = 'ended', end_reason = 'user', ended_at = NOW()
         WHERE id = $1 AND user_id = $2 AND state = 'active' RETURNING *`,

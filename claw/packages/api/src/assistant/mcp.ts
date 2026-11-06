@@ -31,7 +31,7 @@ import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
 import { SAY_SUGGESTED_PARAM, suggestedRepliesOn } from "./suggested.js";
 import { REPORT_KINDS } from "./work-items.js";
 import { githubEventsEnabled, prReply, REPLY_BODY_MAX, watchNamedPullRequests, workSubscribe } from "./github-events.js";
-import { jobUnwatch, jobWatch, jobWatchesEnabled, jobWatchList } from "./job-watch.js";
+import { jobHttpSources, jobSources, jobUnwatch, jobWatch, jobWatchesEnabled, jobWatchList } from "./job-watch.js";
 import { briefTool } from "./brief.js";
 import {
   assistantSchedulesOn, githubCommentTool, ROUTER_COMMENT_MAX, scheduleConfirmationAnswer, triggerCancelTool, triggerCreateTool, triggerListTool,
@@ -150,20 +150,25 @@ function registerScheduleTools(mcp: McpServer, claims: AssistantTokenClaims, ans
     + "the call: the user is shown a card with all of it and it is created only when they press it. Each run gets prompt and nothing of this conversation.",
     {
       name: z.string().describe("A short name the user recognises, at most 120 characters."),
-      prompt: z.string().describe("The complete, self-contained instruction each run receives."),
+      prompt: z.string().optional().describe("The complete, self-contained instruction each run receives. Not needed with action brief."),
       schedule: z.string().describe("A five-field cron expression in the user's timezone, e.g. \"0 9 * * *\" for 09:00 every day, \"0 9 * * 1-5\" for weekdays."),
       timezone: z.string().describe("The user's IANA timezone, e.g. \"Asia/Shanghai\"."),
       until: z.string().optional().describe("ISO 8601 time after which it no longer runs."),
       max_runs: z.number().int().optional().describe("Stop after this many runs."),
+      action: z.enum(["run", "brief"]).optional().describe(
+        "run (default): each time, a run of prompt. brief: each time, the user's brief from Claw itself, no run; a schedule firing at most "
+        + "weekly (0 9 * * 1) sends their week, a weekly report (周报); any other, the day.",
+      ),
     },
     (args) => answer(claims, "trigger_create", () => triggerCreateTool(claims, args)),
   );
   mcp.tool(
     "brief",
     "The user's brief now, put together by Claw without a model: their items, the pull requests their items watch, what Claw notified "
-    + "them about, watched jobs and their SaFE workloads. Read-only; afterwards the turn no longer acts for the user.",
-    {},
-    () => answer(claims, "brief", () => briefTool(claims)),
+    + "them about, watched jobs and their SaFE workloads. range week is their week (the last seven days, with what ended and links): "
+    + "what a weekly report is written from. Read-only; afterwards the turn no longer acts for the user.",
+    { range: z.enum(["day", "week"]).optional().describe("day (default): today's brief; week: the last seven days, for a weekly report (周报).") },
+    (args) => answer(claims, "brief", () => briefTool(claims, args)),
   );
   mcp.tool(
     "trigger_cancel",
@@ -189,10 +194,11 @@ function registerScheduleTools(mcp: McpServer, claims: AssistantTokenClaims, ans
 function registerJobWatchTools(mcp: McpServer, claims: AssistantTokenClaims): void {
   mcp.tool(
     "job_watch",
-    "Watch a job for the user and tell them when its state changes and when it ends: a SaFE workload (kind workload) or one of their "
-    + "own runs (kind run, its task id). Reading only. A job that has already ended is answered with its state instead.",
+    "Watch a job for the user and tell them when its state changes and when it ends: a SaFE workload (kind workload), one of their "
+    + "own runs (kind run, its task id)" + jobHttpSources().map((s) => `, ${s.description} (kind ${s.kind})`).join("")
+    + ". Reading only. A job that has already ended is answered with its state instead.",
     {
-      kind: z.enum(["workload", "run"]),
+      kind: z.enum(jobSources() as [string, ...string[]]),
       id: z.string().describe("The workload's id, or the run's task id, exactly as the user or a tool gave it."),
       label: z.string().optional().describe("How the user calls it, at most 80 characters; the id when left out."),
     },

@@ -46,7 +46,7 @@ import { promptImagesOf, renderFilesState } from "./files.js";
 import { turnMessage } from "./inbound.js";
 import { startWorkerRun } from "./run-started.js";
 import { githubEventsEnabled } from "./github-events.js";
-import { jobWatchesEnabled } from "./job-watch.js";
+import { jobHttpSources, jobWatchesEnabled } from "./job-watch.js";
 import { renderRouterProactiveSection, ROUTER_PROACTIVE_PROMPT_VERSION } from "./proactive-prompt.js";
 import { renderRouterWritingSection, ROUTER_WRITING_PROMPT_VERSION } from "./writing-prompt.js";
 import { devenvToolsOn } from "./devenv-tools.js";
@@ -309,7 +309,10 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // Who it is (Clawy, with claw_self_status) and how to count what a lookup returned: the same on every turn, so it stays cached.
     const self = selfStatusOn();
     withSystemAppend(task, renderRouterSelfSection(self));
-    const proactive = { schedules: assistantSchedulesOn(), jobs: jobWatchesEnabled(), pullRequests: githubEventsEnabled() };
+    const proactive = {
+      schedules: assistantSchedulesOn(), jobs: jobWatchesEnabled(), pullRequests: githubEventsEnabled(),
+      jobKinds: jobHttpSources().map((k) => ({ kind: k.kind, description: k.description })),
+    };
     const proactiveSection = renderRouterProactiveSection(proactive);
     if (proactiveSection) withSystemAppend(task, proactiveSection);
     if (proactive.schedules) state.push(await renderScheduleState(role.userId));

@@ -15,6 +15,10 @@
  *       no longer acts for them after it; a worker has no such tool
  *   B6  a brief starts no run, so a user at their daily run limit still gets it, while a run of theirs due at the same time is
  *       skipped for the limit
+ *   B7  only the user's own: what Claw notified someone else of is not in their brief, and a card that lapsed waits for nobody
+ *   B8  the week (range week): seven days of items, events and workloads, what ended and how, pull requests merged with their links;
+ *       from the route (?range=week), the router's tool (range week) and `briefRangeFor` (a schedule firing at most weekly)
+ *   B9  a weekly brief trigger says the week; and a brief is never held back as overlapping a run, whatever runs under its id
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -313,5 +317,113 @@ describe("assistant brief", { skip }, () => {
     const said = await w.q("SELECT text FROM claw_assistant_says WHERE user_id = 'alice'");
     assert.equal(said.length, 1);
     assert.match(said[0].text, /^Daily brief, /);
+  });
+
+  test("B7 only the user's own notifications, and only cards that can still be answered", async () => {
+    await world();
+    // Bob's runs, sent to Bob's own subscription: none of Alice's business.
+    await w.user("bob");
+    const bobSub = await w.subscribe("bob", ["run.completed", "run.failed", "approval.requested"]);
+    for (const [id, type, title] of [["b1", "run.failed", "Bob's secret eval"], ["b2", "run.completed", "Bob's build"], ["b3", "approval.requested", "Bob's delete"]]) {
+      await w.q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload) VALUES ($1, $2, $3::jsonb)", [id, bobSub, JSON.stringify({ type, title, event_id: id })]);
+    }
+    // Cards that lapsed: neither a schedule card nor a held merge waits any more.
+    await w.q(
+      `INSERT INTO claw_assistant_confirmations (confirmation_id, user_id, session_id, message_id, kind, params, dedupe_key, expires_at)
+       VALUES ('c-old', 'alice', $1, 'm', 'trigger_create', '{"name":"Stale card","schedule":"0 9 * * *"}', 'd-old', NOW() - INTERVAL '1 minute')`,
+      [alice.routerSid],
+    );
+    await w.q(
+      `INSERT INTO claw_github_confirmations (confirmation_id, session_id, requester_user_id, actor_user_id, repo, pr, head_sha, status, expires_at)
+       VALUES ('00000000-0000-0000-0000-000000000002', 'rs', 'alice', 'alice', 'AMD-AGI/PrimusClaw', 301, 'def', 'pending', NOW() - INTERVAL '1 minute')`,
+    );
+    const b = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "en", now });
+    const notes = b.sections.find((x) => x.key === "notifications")!;
+    assert.equal(notes.summary, "2 runs finished, 1 failed, 1 approvals asked; 2 writes wait for your confirmation", "Bob's three are not counted");
+    assert.doesNotMatch(b.text, /Bob's|Stale card|#301/, b.text);
+    const bobs = await brief.composeBrief("bob", { apiKey: "pk-bob", lang: "en", now });
+    assert.equal(bobs.sections.find((x) => x.key === "notifications")!.summary, "1 runs finished, 1 failed, 1 approvals asked; 0 writes wait for your confirmation");
+  });
+
+  test("B8 the week: seven days of what happened, what ended and how, and each pull request's link", async () => {
+    await world();
+    // Merged this week, on a pull request an item of Alice's watches.
+    const [sub] = await w.q("SELECT id FROM claw_work_item_subscriptions WHERE user_id = 'alice'");
+    await w.q(
+      `INSERT INTO claw_work_item_github_events (event_id, sub_id, item_id, kind, github_id, created_at) VALUES ('gh:m', $1, 'kwi_3', 'pr_closed', 'merged', NOW() - INTERVAL '3 days')`,
+      [sub.id],
+    );
+    workloads.push(
+      { id: "w-ok", name: "done-yesterday", phase: "Succeeded", createdAt: ago(26 * 60), kind: "PyTorchJob", userId: "alice" },
+      { id: "w-ok-old", name: "done-long-ago", phase: "Succeeded", createdAt: ago(9 * 24 * 60), kind: "PyTorchJob", userId: "alice" },
+    );
+    const week = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "en", timezone: "UTC", now, range: "week" });
+    assert.equal(week.range, "week");
+    const s = Object.fromEntries(week.sections.map((x) => [x.key, x]));
+    assert.equal(s.items.summary, "2 need you, 1 in progress, 2 ended in the last week", "item 5 ended three days ago: in the week, not the day");
+    assert.deepEqual(s.items.lines.slice(2), ["ended: #4 Old thing (accepted)", "ended: #5 Ancient (accepted)"]);
+    assert.deepEqual(s.pull_requests.lines, ["AMD-AGI/PrimusClaw#291: 2 comments, CI failed, merged https://github.com/AMD-AGI/PrimusClaw/pull/291"]);
+    assert.equal(s.safe.summary, "1 succeeded and 2 failed in the last week, 1 pending for over 30 minutes, 1 running");
+    assert.match(week.text, /^Weekly brief, \d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}$/m);
+    const [from, to] = /(\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})/.exec(week.text)!.slice(1);
+    assert.equal((Date.parse(to) - Date.parse(from)) / 86_400_000, 7, "from the day seven days ago: nothing it holds is from before the date it shows");
+    // The day is unchanged by it: no ended lines, no links.
+    const day = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "en", now });
+    assert.equal(day.sections[0].summary, "2 need you, 1 in progress, 1 ended in the last day");
+    assert.ok(!day.text.includes("https://"), day.text);
+    const zh = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "zh", now, range: "week" });
+    assert.match(zh.text, /^周报 \d{4}-\d{2}-\d{2} 至 /);
+    assert.match(zh.text, /事项：2 个等你，1 个进行中，过去一周结束 2 个/);
+    assert.match(zh.text, /已结束：#5 Ancient（accepted）/);
+    assert.match(zh.text, /已合入 https:\/\/github\.com\/AMD-AGI\/PrimusClaw\/pull\/291/);
+
+    const r = await app.inject({ method: "GET", url: "/v1/assistant/brief?range=week&lang=en", headers: { "x-test-user": "alice" } });
+    assert.equal(r.statusCode, 200);
+    assert.equal(r.json().data.range, "week");
+    assert.equal(r.json().data.sections[0].summary, "2 need you, 1 in progress, 2 ended in the last week");
+    assert.equal((await app.inject({ method: "GET", url: "/v1/assistant/brief?range=month", headers: { "x-test-user": "alice" } })).statusCode, 400);
+
+    const turn = await w.routerTurn(alice);
+    await w.q(
+      `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context) VALUES ($1, $2, 'alice', '现在给我本周周报', '{}'::jsonb)`,
+      [alice.routerSid, turn.mid],
+    );
+    const tool = await brief.briefTool(turn, { range: "week" }) as Record<string, any>;
+    assert.deepEqual([tool.range, tool.lang], ["week", "zh"]);
+    assert.match(tool.note, /weekly report/);
+    await assert.rejects(brief.briefTool(turn, { range: "year" }), (err: Error & { code?: string }) => err.code === "invalid_arguments");
+
+    assert.equal(brief.briefRangeFor("0 9 * * 1", "Asia/Shanghai", new Date("2026-11-09T01:00:00Z")), "week", "every Monday");
+    assert.equal(brief.briefRangeFor("0 9 1 * *", "UTC", new Date("2026-12-01T09:00:00Z")), "week", "monthly says the week too");
+    assert.equal(brief.briefRangeFor("0 9 * * *", "Asia/Shanghai", new Date("2026-11-09T01:00:00Z")), "day");
+    assert.equal(brief.briefRangeFor("0 9 * * 1-5", "Asia/Shanghai", new Date("2026-11-09T01:00:00Z")), "day", "Monday after the weekend is still a weekday brief");
+    assert.equal(brief.briefRangeFor("0 9 * * 1,4", "Asia/Shanghai", new Date("2026-11-09T01:00:00Z")), "day");
+  });
+
+  test("B9 a weekly brief trigger says the week, and a brief is never held back as overlapping a run", async () => {
+    await world();
+    await w.subscribe("alice");
+    const created = await app.inject({
+      method: "POST", url: "/v1/triggers", headers: { "x-test-user": "alice" },
+      payload: { name: "周报", action: "brief", schedule: "0 9 * * 1", timezone: "Asia/Shanghai" },
+    });
+    assert.equal(created.statusCode, 200, created.body);
+    const t = created.json().data;
+    // A run open in a session named for this trigger (as one of a trigger that runs would be): a run waits for it, a brief does not.
+    const other = await w.user("zed");
+    await w.q(
+      "UPDATE claw_sessions SET config = config || $2::jsonb, agent_status = 'running' WHERE session_id = $1",
+      [other.routerSid, JSON.stringify({ trigger_id: t.trigger_id })],
+    );
+    const planned = new Date(Date.now() - 30_000);
+    await w.q("UPDATE claw_triggers SET next_fire_at = $2 WHERE trigger_id = $1", [t.trigger_id, planned]);
+    const sched = await import("../src/triggers/scheduler.js");
+    await sched.tickTriggers(new Date());
+    const [fired] = await w.q("SELECT status FROM claw_trigger_fires WHERE trigger_id = $1", [t.trigger_id]);
+    assert.equal(fired?.status, "delivered", "not skipped_overlap");
+    const said = await w.q("SELECT text FROM claw_assistant_says WHERE user_id = 'alice'");
+    assert.equal(said.length, 1);
+    assert.match(said[0].text, /^Weekly brief, /, "a schedule that fires weekly says the week");
+    assert.match(said[0].text, /2 ended in the last week/);
   });
 });

@@ -4,7 +4,8 @@
 /**
  * What the assistant does on its own, as the user's channel reaches it.
  *
- *   GET  /v1/assistant/brief?lang=zh|en&timezone=  the caller's brief, put together now (`assistant/brief.ts`)
+ *   GET  /v1/assistant/brief?lang=zh|en&timezone=&range=day|week  the caller's brief, put together now (`assistant/brief.ts`);
+ *        range=week is their week (the last seven days), for a weekly report
  *   GET  /v1/assistant/confirmations              the cards waiting for the caller's press (`assistant/schedules.ts`)
  *   POST /v1/assistant/confirmations/:id/decision {decision: allow | deny}: the caller's answer to one of them
  *
@@ -23,7 +24,7 @@ import { getAuthMethod } from "../auth/request-credential.js";
 import { classifyAttendedCaller } from "../github-review/attended.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
-import { briefLanguage, composeBrief } from "../assistant/brief.js";
+import { BRIEF_RANGES, briefLanguage, composeBrief, isBriefRange } from "../assistant/brief.js";
 import { assistantSchedulesOn, DecisionRefused, decideConfirmation, pendingConfirmations } from "../assistant/schedules.js";
 
 function requireRealUser(req: FastifyRequest, reply: FastifyReply): NonNullable<ReturnType<typeof getUser>> | null {
@@ -43,10 +44,13 @@ export async function registerAssistantProactiveRoutes(
   app.get("/v1/assistant/brief", async (req, reply) => {
     const user = requireRealUser(req, reply);
     if (!user) return;
-    const query = (req.query ?? {}) as { lang?: string; timezone?: string };
+    const query = (req.query ?? {}) as { lang?: string; timezone?: string; range?: string };
+    if (query.range !== undefined && !isBriefRange(query.range)) {
+      return reply.status(400).send({ ok: false, error: "invalid_request", message: `range must be one of ${BRIEF_RANGES.join(", ")}` });
+    }
     const lang = query.lang === "zh" || query.lang === "en" ? query.lang : await briefLanguage(user.userId);
     const timezone = typeof query.timezone === "string" && query.timezone.length <= 64 ? query.timezone : undefined;
-    const brief = await composeBrief(user.userId, { apiKey: user.platformKey || null, lang, timezone });
+    const brief = await composeBrief(user.userId, { apiKey: user.platformKey || null, lang, timezone, range: query.range === "week" ? "week" : "day" });
     return reply.send({ ok: true, data: brief });
   });
 

@@ -38,6 +38,7 @@ import { CLAW_WRITE_MARK } from "../github-mcp/tools.js";
 import { resolveGithubToken } from "../github-mcp/mcp.js";
 import { readGithubMcpSettings } from "../github-mcp/settings.js";
 import { GithubClient } from "../github-review/github.js";
+import { briefRangeFor } from "./brief.js";
 import { turnMessage } from "./inbound.js";
 import { recordWriteConfirm, type SayDeps } from "./outbound.js";
 import { confirmationRef, toldNote } from "./prompts.js";
@@ -99,6 +100,8 @@ export function localTime(at: Date | string | null, timezone: string): string {
 /** The input a confirmation stores for a create: what the card shows is what is created. */
 interface CreateParams {
   name: string; prompt: string; schedule: string; timezone: string; until: string | null; max_runs: number | null;
+  /** `brief`: the user's brief said through their assistant, no run (`assistant/brief.ts`); absent: a run of the prompt. */
+  action?: "brief";
   /** The next run the card showed: the first one, if the card is answered before it. */
   next_run?: string | null;
 }
@@ -108,6 +111,8 @@ interface CommentParams { repo: string; number: number; body: string }
 
 const createParams = (i: TriggerInput): CreateParams => ({
   name: i.name, prompt: i.prompt, schedule: i.schedule, timezone: i.timezone, until: i.endsAt ? i.endsAt.toISOString() : null, max_runs: i.maxRuns,
+  // Only a brief says so: a run's params, and so its card's dedupe key, are what they always were.
+  ...(i.action === "brief" ? { action: "brief" as const } : {}),
 });
 
 /** What the person is shown: the whole of what would be done, in the language they wrote in. */
@@ -129,6 +134,16 @@ export function confirmText(
   const c = p as CreateParams;
   const bounds = [c.until ? (zh ? `到 ${localTime(c.until, c.timezone)} 为止` : `until ${localTime(c.until, c.timezone)}`) : "",
     c.max_runs ? (zh ? `最多 ${c.max_runs} 次` : `at most ${c.max_runs} runs`) : ""].filter(Boolean).join(zh ? "，" : ", ");
+  if (c.action === "brief") {
+    const week = briefRangeFor(c.schedule, c.timezone, nextRun ?? new Date()) === "week";
+    const what = zh
+      ? (week ? "你这一周的周报（过去七天：结束的事项、合入的 PR、通知、作业和 SaFE）" : "你的每日简报（事项、盯着的 PR、通知、作业和 SaFE）")
+      : (week ? "your weekly brief (the last seven days: items ended, pull requests merged, notifications, jobs and SaFE)"
+        : "your daily brief (items, watched pull requests, notifications, jobs and SaFE)");
+    return zh
+      ? `要创建定时简报「${c.name}」吗？\n时间：${c.schedule}（${c.timezone}），下次 ${localTime(nextRun, c.timezone)}（之后才确认就从再下一次开始）${bounds ? `，${bounds}` : ""}\n每次发给你：${what}。由 Claw 汇总，不运行模型。\n点下面的「创建」确认，或回复 批准 #${ref}。`
+      : `Create the scheduled brief "${c.name}"?\nWhen: ${c.schedule} (${c.timezone}), next ${localTime(nextRun, c.timezone)} (confirmed after that, it starts from the one after)${bounds ? `, ${bounds}` : ""}\nEach time you get ${what}, put together by Claw with no model run.\nPress "Create" below to confirm, or reply approve #${ref}.`;
+  }
   return zh
     ? `要创建定时任务「${c.name}」吗？\n时间：${c.schedule}（${c.timezone}），下次 ${localTime(nextRun, c.timezone)}（之后才确认就从再下一次开始）${bounds ? `，${bounds}` : ""}\n每次运行以你的身份执行：${c.prompt}\n点下面的「创建」确认，或回复 批准 #${ref}。`
     : `Create the scheduled task "${c.name}"?\nWhen: ${c.schedule} (${c.timezone}), next run ${localTime(nextRun, c.timezone)} (confirmed after that, it starts from the run after)${bounds ? `, ${bounds}` : ""}\nEach run acts as you: ${c.prompt}\nPress "Create" below to confirm, or reply approve #${ref}.`;
@@ -242,8 +257,8 @@ export async function triggerListTool(claims: AssistantTokenClaims): Promise<Rec
 
 export async function triggerCreateTool(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   requireRouter(claims);
-  // A brief is a channel's own command; what the router schedules is a run of the prompt.
-  const parsed = parseTriggerInput({ ...args, action: undefined });
+  // A run of the prompt, or (action brief) the user's brief said through their assistant: their own assistant, as this is its turn.
+  const parsed = parseTriggerInput({ ...args, action: args.action ?? undefined });
   if (!parsed.ok) throw new ToolRefused("invalid_arguments", parsed.error);
   if (parsed.input.prompt.length > ROUTER_PROMPT_MAX) {
     throw new ToolRefused("prompt_too_long", `the prompt is at most ${ROUTER_PROMPT_MAX} characters, so the user can read all of it on the card: write it shorter`);
@@ -411,7 +426,7 @@ export async function decideConfirmation(input: {
       return outcome(await close(gone ? "done" : "failed", gone ? { trigger_id: row.params.trigger_id } : { error: "not_found" }), true);
     }
     // Read again as it is now: a time `until` that has passed since the card was shown is no schedule any more.
-    const parsed = parseTriggerInput({ ...row.params, action: "run" });
+    const parsed = parseTriggerInput({ ...row.params, action: row.params.action === "brief" ? "brief" : "run" });
     if (!parsed.ok) return outcome(await close("failed", { error: "invalid_arguments", message: parsed.error }), true);
     let creds = input.creds?.platformKey ? input.creds : null;
     if (!creds) {
