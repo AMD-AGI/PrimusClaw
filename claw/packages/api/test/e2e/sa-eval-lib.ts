@@ -604,8 +604,9 @@ export function judgeVerdict(text: string): "PASS" | "FAIL" | undefined {
 /**
  * The stored events (`?mode=replay`, with their `event_id`, which is the stream's frame id) of the given turns, and of what was
  * said about the given items, that the stream did not deliver: none when it showed everything a case is graded on. A turn's
- * exec_complete and the user's own message are left out: a stream never carries either (Claw stores the UserMessage and
- * publishes it on a subject no stream route subscribes to, `sessions/dispatch.ts`), and the runner wrote the message itself.
+ * exec_complete and the user's own message are left out: the live part of a stream never carries either (Claw stores a
+ * UserMessage and publishes it on core-NATS `sse.events.<session>`, while the stream follows JetStream `events.<session>`; only a
+ * stream's history segment replays it), and the runner wrote the message itself.
  * Events that could not be read are a gap too.
  */
 export function streamMissed(rows: ReadonlyArray<EventRow & { event_id?: unknown }> | null, events: readonly LiveEvent[],

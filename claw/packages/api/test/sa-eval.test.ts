@@ -669,7 +669,7 @@ test("S21 what the stream missed", () => {
     row("claw-7", { type: "UserMessage", message_id: "m1", role: "user" }),
   ];
   const seen = (...ids: string[]) => ids.map((id) => ev(0, { type: "x" }, id));
-  assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2", "claw-3"), ["m1"], ["i1"]), [], "exec_complete and the user's own message are never streamed; others' events are not the case's");
+  assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2", "claw-3"), ["m1"], ["i1"]), [], "exec_complete and the user's own message are never live on a stream; others' events are not the case's");
   assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-3"), ["m1"], ["i1"]), ["claw-2"], "a say of the case's turn the stream missed");
   assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2"), ["m1"], ["i1"]), ["claw-3"], "a say about the case's item");
   assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2"), ["m1"]), [], "an item the case did not start is not looked at");
