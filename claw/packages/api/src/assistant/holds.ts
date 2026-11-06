@@ -34,12 +34,12 @@
 import pino from "pino";
 import { CLAW_NOTIFICATIONS_ENABLED, NOTIFY_LINK_BASE } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
-import { approvalTarget, redactCommandSecrets } from "../notifications/approval-target.js";
+import { approvalAction, approvalTarget, redactCommandSecrets } from "../notifications/approval-target.js";
 import {
   clipSummary, deterministicEventId, enqueue, kickDelivery, onDelivered, waitWindow,
   type HeldQuestion, type NotificationPayload,
 } from "../notifications/outbox.js";
-import { recordNeedsYouFallback } from "./outbound.js";
+import { personWritesChinese, recordNeedsYouFallback, storeSystemNotice } from "./outbound.js";
 import { quoted, toldNote, UNTRUSTED_CLOSE, UNTRUSTED_OPEN } from "./prompts.js";
 import { toldNeedAt, toldNeeds } from "./told.js";
 
@@ -71,6 +71,11 @@ export interface Hold {
   expires_at: string;
   /** The run (`claw_tasks.task_id`) whose turn waits on it, or null when that could not be told: its end ends the wait. */
   run_id: string | null;
+  /** Whether the person writes Chinese (`personWritesChinese`): what they are told of it is in their language. */
+  zh?: boolean;
+  /** For a write: what it would do, in plain words of their language, and the text it would write (`approvalAction`). */
+  action?: string;
+  detail?: string;
 }
 
 /** The entries of `params.holds`, whatever else is there. */
@@ -175,10 +180,17 @@ export function heldQuestions(raw: unknown): HeldQuestion[] {
   return out;
 }
 
-/** The item's question while the hold lasts, in the words a board and a needs-you message show. */
-export function pendingText(kind: HoldKind, target: string): string {
+/**
+ * The item's question while the hold lasts, in the words a board and a needs-you message show: in Chinese for a person who writes it,
+ * a write said as what it would do (`action`), not as the tool's name.
+ */
+export function pendingText(kind: HoldKind, target: string, zh = false, action?: string): string {
+  if (zh) return clip(kind === "question" ? `需要你回答：${target}` : `需要你批准：${action || target}`, PENDING_MAX);
   return clip(kind === "question" ? `Question for you: ${target}` : `Approve or deny: ${target}`, PENDING_MAX);
 }
+
+/** A worker's report, at most this long, said to the person before the write it holds for them (`holdForPerson`). */
+const FINDINGS_MAX = 3000;
 
 interface ItemRow {
   item_id: string;
@@ -213,7 +225,7 @@ export async function holdForPerson(
 ): Promise<HoldOutcome> {
   const request = requestOf(input.event);
   if (!request) return "not_an_item";
-  const done = await inTransaction(async (q): Promise<HoldOutcome | { subscribers: number; itemId: string }> => {
+  const done = await inTransaction(async (q): Promise<HoldOutcome | { subscribers: number; itemId: string; told: Array<{ announce: () => Promise<void> }> }> => {
     const item = (await q(
       `SELECT item_id, user_id, seq, title, board_state, kind, attention_seq, generation, result_version, params
          FROM claw_work_items WHERE worker_session_id = $1 FOR UPDATE`,
@@ -239,13 +251,26 @@ export async function holdForPerson(
     const target = request.kind === "question"
       ? (questions[0]?.question ?? "the worker asks you something")
       : approvalTarget(request.tool, input.event.input);
-    const question = pendingText(request.kind, target);
+    const zh = await personWritesChinese(q, item.user_id, item.title);
+    const said = request.kind === "approval" ? approvalAction(request.tool, input.event.input, zh) : null;
+    const question = pendingText(request.kind, target, zh, said?.action);
     const attention = Number(item.attention_seq) + 1;
     const recorded: Hold = {
       tool_use_id: request.toolUseId.slice(0, 200), kind: request.kind, tool: request.tool.slice(0, 200), target,
       attention_seq: attention, expires_at: new Date(window.expiresAt).toISOString(),
       run_id: await runOf(q, input.sessionId, input.event.message_id),
+      zh, ...(said ? { action: said.action, ...(said.detail ? { detail: said.detail } : {}) } : {}),
     };
+    // What the worker found before it asked (its last progress report since it was last given work): the person is told it first,
+    // then asked, so they decide knowing it (2026-11-06 parity run, G2: a write was asked for and none of the answers were said).
+    const findings = request.kind === "approval" ? (await q(
+      `SELECT e.id, e.summary FROM claw_work_item_events e
+        WHERE e.item_id = $1 AND e.source = 'worker' AND e.kind = 'progress' AND e.generation = $2
+          AND COALESCE(e.summary, '') <> ''
+          AND NOT EXISTS (SELECT 1 FROM claw_work_item_events r WHERE r.item_id = e.item_id AND r.source = 'router' AND r.id > e.id)
+        ORDER BY e.id DESC LIMIT 1`,
+      [item.item_id, item.generation],
+    )).rows[0] as { id: number; summary: string } | undefined : undefined;
     // Another request still waiting (a sub-agent beside this one asked too) waits on under the new attention: it is not over.
     const holds = [...currentHolds(item).map((h) => ({ ...h, attention_seq: attention })), recorded];
     await q(
@@ -260,13 +285,24 @@ export async function holdForPerson(
        VALUES ($1, 'waiting', 'hold', $2, $3, $4, $4, jsonb_build_object('tool_use_id', $5::text))`,
       [item.item_id, item.generation, recorded.run_id, question, recorded.tool_use_id],
     );
-    const subscribers = CLAW_NOTIFICATIONS_ENABLED
-      ? await announce(q, item, input.sessionId, request, recorded, questions, window.startedAt, input.event)
+    // Queued before the request, in its transaction: the person reads what was found, then is asked. A card a channel draws shows the
+    // write's target cut to a line, so when one will be drawn for a write that posts a text (a comment, an issue), what it does and the
+    // text, whole, are said here too; without a card the item's needs-you message says them (`outbound.ts`).
+    const cards = CLAW_NOTIFICATIONS_ENABLED ? await cardSubscriptions(q, item.user_id) : [];
+    const told = [
+      findings ? await storeFindings(q, item, { id: Number(findings.id), summary: findings.summary }, zh) : null,
+      cards.length && said?.detail ? await storeHeldWrite(q, item, recorded) : null,
+    ].filter((t): t is { announce: () => Promise<void> } => t !== null);
+    const subscribers = cards.length
+      ? await announce(q, item, input.sessionId, request, recorded, questions, window.startedAt, input.event, cards)
       : 0;
-    return { subscribers, itemId: item.item_id };
+    return { subscribers, itemId: item.item_id, told };
   });
   if (typeof done === "string") return done;
   logger.info({ itemId: done.itemId, kind: request.kind, subscribers: done.subscribers }, "assistant.item_held_for_person");
+  for (const t of done.told) {
+    await t.announce().catch((err: unknown) => logger.warn({ err, itemId: done.itemId }, "assistant.hold_notice_announce_failed"));
+  }
   if (done.subscribers > 0) {
     void holdPorts.kickDelivery().catch((err) => logger.error({ err }, "assistant.hold_kick_failed"));
   } else {
@@ -277,16 +313,53 @@ export async function holdForPerson(
   return "held";
 }
 
+/**
+ * What the worker found, said to its person in the system's words before the write it holds for them is put to them: stored in the hold's
+ * transaction, ahead of the request, and once per report (the notice's key), so a redelivered request or a second write after the same
+ * report says nothing more. Null when there is no assistant session to say it in, or it was said before.
+ */
+async function storeFindings(
+  q: Querier, item: ItemRow, f: { id: number; summary: string }, zh: boolean,
+): Promise<{ announce: () => Promise<void> } | null> {
+  const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id as string | undefined;
+  if (!sessionId) return null;
+  const summary = f.summary.length > FINDINGS_MAX ? `${f.summary.slice(0, FINDINGS_MAX - 1)}…` : f.summary;
+  const text = zh
+    ? `#${item.seq} ${item.title} 查到的结果：\n${summary}\n\n接下来它要做一个需要你批准的操作，见下一条。`
+    : `#${item.seq} "${item.title}" found:\n${summary}\n\nNext it asks you to approve a write, in the next message.`;
+  // Not attached to the item: a system message attached to it is its needs-you message for that attention (one per attention), and
+  // this one is not; that one follows.
+  return storeSystemNotice(q, { userId: item.user_id, sessionId, text, key: `hold_findings:${item.item_id}:${f.id}` });
+}
+
+/** The owner's subscriptions that draw an item's requests as cards: they list the type and the source. */
+async function cardSubscriptions(q: Querier, userId: string): Promise<Array<{ subscription_id: string }>> {
+  return (await q(
+    `SELECT subscription_id FROM claw_notification_subscriptions
+      WHERE owner_user_id = $1 AND enabled AND 'approval.requested' = ANY(event_types) AND $2 = ANY(sources)`,
+    [userId, HOLD_SOURCE],
+  )).rows as Array<{ subscription_id: string }>;
+}
+
+/**
+ * The write a card is about to ask for, said in full ahead of the card: what it does and the text it would post, in the person's
+ * language. The card's target is the call cut to a line, and the person approves exactly what is posted. Once per request.
+ */
+async function storeHeldWrite(q: Querier, item: ItemRow, hold: Hold): Promise<{ announce: () => Promise<void> } | null> {
+  const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id as string | undefined;
+  if (!sessionId || !hold.action) return null;
+  const text = hold.zh
+    ? [`#${item.seq} ${item.title} 要做的操作：${hold.action}。`, ...(hold.detail ? ["内容如下：", "---", hold.detail, "---"] : []), "在下面的卡片上批准或拒绝。"].join("\n")
+    : [`#${item.seq} "${item.title}" asks to: ${hold.action}.`, ...(hold.detail ? ["It would write:", "---", hold.detail, "---"] : []), "Approve or deny it on the card below."].join("\n");
+  // Not attached to the item, for the same reason as the findings (`storeFindings`).
+  return storeSystemNotice(q, { userId: item.user_id, sessionId, text, key: `hold_write:${item.item_id}:${hold.tool_use_id}` });
+}
+
 /** The `approval.requested` of a hold, one outbox row per subscription that lists the type and the source. */
 async function announce(
   q: Querier, item: ItemRow, sessionId: string, request: { toolUseId: string; kind: HoldKind; tool: string }, hold: Hold,
-  questions: HeldQuestion[], startedAt: number, event: Record<string, unknown>,
+  questions: HeldQuestion[], startedAt: number, event: Record<string, unknown>, subs: Array<{ subscription_id: string }>,
 ): Promise<number> {
-  const subs = (await q(
-    `SELECT subscription_id FROM claw_notification_subscriptions
-      WHERE owner_user_id = $1 AND enabled AND 'approval.requested' = ANY(event_types) AND $2 = ANY(sources)`,
-    [item.user_id, HOLD_SOURCE],
-  )).rows as Array<{ subscription_id: string }>;
   if (!subs.length) return 0;
   const eventId = deterministicEventId("approval.requested", sessionId, request.toolUseId);
   const title = String(redactCommandSecrets(item.title));
@@ -298,9 +371,13 @@ async function announce(
     session_id: sessionId,
     task_id: typeof event.message_id === "string" ? event.message_id : "",
     trigger_id: null,
-    title: clip(`${request.kind === "question" ? "Question" : "Approval needed"}: #${item.seq} ${title}`, 200),
+    title: clip(hold.zh
+      ? `${request.kind === "question" ? "需要你回答" : "需要你批准"}：#${item.seq} ${title}`
+      : `${request.kind === "question" ? "Question" : "Approval needed"}: #${item.seq} ${title}`, 200),
+    // What the write would do, in the person's words, when Brain gave no reason of its own (a channel shows it as the why).
     summary: request.kind === "question" ? "" : clipSummary(redactCommandSecrets(
-      (typeof event.summary === "string" ? event.summary : "") || (typeof event.approval_label === "string" ? event.approval_label : ""))),
+      (typeof event.summary === "string" ? event.summary : "") || (typeof event.approval_label === "string" ? event.approval_label : "")
+      || (hold.action ?? ""))),
     link: `${NOTIFY_LINK_BASE}/sessions/${sessionId}`,
     approval: { tool_use_id: hold.tool_use_id, tool: masked(hold.tool, 200), target: hold.target, expires_at: hold.expires_at },
     source: HOLD_SOURCE,
@@ -412,7 +489,7 @@ async function endHolds(q: Querier, sessionId: string, ending: (h: Hold) => bool
     const next = left[left.length - 1]!;
     await q(
       `UPDATE claw_work_items SET pending_question = $3, params = ${record}, updated_at = NOW() WHERE item_id = $1`,
-      [item.item_id, JSON.stringify(left), pendingText(next.kind, next.target)],
+      [item.item_id, JSON.stringify(left), pendingText(next.kind, next.target, next.zh === true, next.action)],
     );
     for (const h of endedNow) await event(how, h.run_id, h.tool_use_id);
     return false;

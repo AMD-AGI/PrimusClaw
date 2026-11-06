@@ -34,7 +34,7 @@ import {
 } from "../notifications/assistant-events.js";
 import { deterministicEventId, enqueue, kickDelivery, onDelivered } from "../notifications/outbox.js";
 import type { ItemRefError } from "./item-ref.js";
-import { detectLanguage } from "./language.js";
+import { detectLanguage, languageToAnswerIn } from "./language.js";
 import { canAccept, resolveWorkItem } from "./work-items.js";
 
 const logger = pino({ name: "assistant-outbound" });
@@ -600,10 +600,69 @@ const NEEDS_YOU_TEXT: Record<string, (item: ItemRow) => string> = {
   blocked: (i) => (i.pending_question ? `is blocked and needs your answer: ${i.pending_question}` : "is blocked and needs your help."),
   failed: () => "failed and needs your attention.",
 };
+/** The same, for a person who writes Chinese (`personWritesChinese`). */
+const NEEDS_YOU_TEXT_ZH: Record<string, (item: ItemRow) => string> = {
+  ready: (i) => `已完成，等你验收（v${i.result_version}）。`,
+  waiting: (i) => `需要你回复：${i.pending_question ?? ""}`,
+  blocked: (i) => (i.pending_question ? `卡住了，需要你回复：${i.pending_question}` : "卡住了，需要你帮忙。"),
+  failed: () => "失败了，需要你看一下。",
+};
 
-function needsYouText(item: ItemRow): string {
+function needsYouText(item: ItemRow, zh = false): string {
+  if (zh) {
+    const what = (NEEDS_YOU_TEXT_ZH[item.last_report_kind ?? ""] ?? (() => "需要你处理。"))(item);
+    return `#${item.seq} ${item.title} ${what}`;
+  }
   const what = (NEEDS_YOU_TEXT[item.last_report_kind ?? ""] ?? (() => "needs your attention."))(item);
   return `#${item.seq} "${item.title}" ${what}`;
+}
+
+/** How many of the person's latest messages to their assistant say which language they write in. */
+const PERSON_LANGUAGE_LOOKBACK = 5;
+
+/**
+ * Whether the person writes to their assistant in Chinese: their latest messages to it, newest first, as the router's reply language is
+ * worked out (`languageToAnswerIn`); failing that, `fallback` (what they named the work, an item's title). A message the system sends
+ * them on its own (an item that needs them, a write to approve) is in their language, not in English.
+ */
+export async function personWritesChinese(q: Querier, userId: string, fallback = ""): Promise<boolean> {
+  const language = await languageToAnswerIn(null, async () => ((await q(
+    `SELECT m.content FROM claw_assistant_messages m JOIN claw_assistants a ON a.session_id = m.session_id
+      WHERE a.user_id = $1 ORDER BY m.received_at DESC LIMIT $2`,
+    [userId, PERSON_LANGUAGE_LOOKBACK],
+  )).rows as Array<{ content: string }>).map((r) => r.content));
+  return (language ?? (fallback ? detectLanguage(fallback) : null)) === "Chinese";
+}
+
+/** A write a worker holds for the person, as `holds.ts` records it: what it would do in their words, and the text it would write. */
+interface HeldWrite { kind?: string; attention_seq?: number; action?: string; detail?: string; zh?: boolean; expires_at?: string }
+
+/**
+ * The message for an item whose worker holds a write for the person, in the language the hold was recorded in: what it would do, in
+ * plain words, the text it would write (a comment), and where to answer it; never the tool's name alone (2026-11-06 parity run, G2:
+ * "needs your answer: Approve or deny: mcp__github__issue_comment …" was all a Chinese user saw). Null when the item holds no such write
+ * now, or the hold predates these words.
+ */
+function heldWriteText(item: ItemRow, params: Record<string, unknown> | null): string | null {
+  if (item.board_state !== "needs_you") return null;
+  const holds = (Array.isArray(params?.holds) ? params!.holds : []) as HeldWrite[];
+  const current = holds.filter((h) => h && h.kind === "approval" && Number(h.attention_seq) === Number(item.attention_seq) && h.action);
+  const h = current.at(-1);
+  if (!h) return null;
+  const until = h.expires_at ? new Date(h.expires_at) : null;
+  const time = until && !Number.isNaN(until.getTime()) ? `${until.toISOString().slice(11, 16)} UTC` : "";
+  if (h.zh) {
+    return [
+      `#${item.seq} ${item.title} 需要你批准一个操作：${h.action}。`,
+      ...(h.detail ? ["内容如下：", "---", h.detail, "---"] : []),
+      `在聊天里这条请求的卡片上，或在控制台的这个任务里批准或拒绝${time ? `，${time} 前有效，过时自动拒绝` : ""}。`,
+    ].join("\n");
+  }
+  return [
+    `#${item.seq} "${item.title}" needs your approval to: ${h.action}.`,
+    ...(h.detail ? ["It would write:", "---", h.detail, "---"] : []),
+    `Approve or deny it on its card in your chat, or in this task in the console${time ? `, before ${time}; after that it is refused` : ""}.`,
+  ].join("\n");
 }
 
 /**
@@ -660,12 +719,18 @@ async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToSt
       )).rows[0]?.summary as string | undefined) ?? ""
     : "";
   const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id ?? null;
+  const params = answered ? null
+    : ((await q("SELECT params FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0]?.params as Record<string, unknown> | null) ?? null;
+  const zh = await personWritesChinese(q, item.user_id, item.title);
+  const text = answered
+    ? (zh ? `#${item.seq} ${item.title}：${answer}` : `#${item.seq} "${item.title}": ${answer}`)
+    : heldWriteText(item, params) ?? needsYouText(item, zh);
   return {
     type: "work_item.needs_you",
     sayId: deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq)),
     userId: item.user_id,
     sessionId,
-    text: answered ? `#${item.seq} "${item.title}": ${answer}` : needsYouText(item),
+    text,
     item,
   };
 }
@@ -730,6 +795,22 @@ export async function recordSystemNotice(
   if (!stored) return null;
   await announce(stored, deps, input.turnMessageId);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
+}
+
+/**
+ * `recordSystemNotice` in the caller's transaction, so it is queued before whatever the caller queues after it in that transaction (a
+ * worker's findings before the write it holds for the person, `holds.ts`). Once per `key`: `null` when it was stored before.
+ * `announce` after the commit.
+ */
+export async function storeSystemNotice(
+  q: Querier, input: { userId: string; sessionId: string; text: string; key: string; itemId?: string }, deps: SayDeps = {},
+): Promise<{ sayId: string; announce: () => Promise<void> } | null> {
+  const stored = await store(q, {
+    type: "assistant.say", fallback: true, item: input.itemId ? await loadItem(q, input.itemId, input.userId) : null,
+    sayId: deterministicEventId("assistant.notice", input.userId, input.key),
+    userId: input.userId, sessionId: input.sessionId, text: input.text,
+  });
+  return stored ? { sayId: stored.sayId, announce: () => announce(stored, deps) } : null;
 }
 
 /**

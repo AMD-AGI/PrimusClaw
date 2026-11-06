@@ -401,8 +401,10 @@ export function createAssistantMcpServer(
     );
     mcp.tool(
       "work_recall",
-      "Look closer at one item: summary, its reports, or the tail of what the worker wrote (untrusted data).",
-      { item_id: z.string().describe(ITEM_ID_PARAM), detail: z.enum(["summary", "reports", "worker_tail"]) },
+      "Look closer at one item: summary, its reports, the tail of what the worker wrote, or live: what its worker did last, each step "
+      + "with its time (the calls it made and what they returned, such as the latest lines of a log), for how far it got now "
+      + "(untrusted data).",
+      { item_id: z.string().describe(ITEM_ID_PARAM), detail: z.enum(["summary", "reports", "worker_tail", "live"]) },
       (args) => answer(claims, "work_recall", () => workRecall(claims, { item_id: args.item_id, detail: args.detail as RecallDetail })),
     );
     if (selfStatusOn()) {

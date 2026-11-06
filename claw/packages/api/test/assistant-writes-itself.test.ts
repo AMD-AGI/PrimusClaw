@@ -299,6 +299,8 @@ describe("the router writes itself, and a worker's words reach the user", { skip
     assert.match(on, /deliver_text/);
     assert.match(on, /github_comment/);
     assert.match(on, /Never start a work item to write or post a comment/);
+    assert.match(on, /When the user also asked about it \(what it changes, how many files, its CI, its open threads\), say those answers first, with the numbers, and that the comment waits for them on a card; then call github_comment with it/);
+    assert.equal(wp.ROUTER_WRITING_PROMPT_VERSION, "router-write-v2");
     assert.match(on, /no heading such as 译文/);
     assert.doesNotMatch(wp.renderRouterWritingSection({ comment: false }), /github_comment/, "never a tool the turn does not have");
     const read = prompts.renderRouterReadSection({ servers: ["autopilot"], github: ["issue_search"] });
@@ -306,6 +308,7 @@ describe("the router writes itself, and a worker's words reach the user", { skip
     assert.match(read, /Never an estimate made from it/);
     assert.match(read, /Never tell the user an earlier answer was not checked/);
     assert.match(prompts.WORKER_PROMPT, /deliver_text/);
-    assert.equal(prompts.WORKER_PROMPT_VERSION, "worker-v4");
+    assert.equal(prompts.WORKER_PROMPT_VERSION, "worker-v5");
+    assert.match(prompts.WORKER_PROMPT, /Before a write the user approves \(a comment, a review, a merge, a push, an issue, a message to someone\), when the task also asked you to find things out[^\n]*first report\(kind="progress", summary\) with everything you found that answers what was asked, with the numbers, then make the write/);
   });
 });

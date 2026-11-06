@@ -24,6 +24,11 @@
  *        interrupted run is then the sweep's to say, as any interrupted turn is
  *   HD13 the sweep releases a hold whose run ended unseen, after the grace and once, in the same tick that records the run
  *   HD14 a run that told the user something, then waited and went on, has its end recorded: the release is its last word
+ *   HD15 a write held for a person who writes Chinese: what the worker found is said first, then the write is put to them in Chinese,
+ *        as what it would do and what it would post, never as the tool's name; with a channel that draws it, the same order
+ *   HD16 a person who writes English is asked as before, and a hold with nothing reported before it says nothing first
+ *   HD17 the plain words say every field the write sets: a pull request's new title and base, or its cleared description, an
+ *        issue's labels, a draft pull request; a field the words do not know is still shown, as key=value, on the card and in the needs-you message
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -59,7 +64,7 @@ describe("assistant holds", { skip }, () => {
     await w?.stop();
   });
   beforeEach(async () => {
-    await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_sessions, claw_notification_outbox, claw_notification_subscriptions, claw_session_events CASCADE");
+    await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_sessions, claw_notification_outbox, claw_notification_subscriptions, claw_session_events, claw_assistant_messages CASCADE");
     w.drains.length = 0;
     kicks = 0;
     alice = await w.user("alice");
@@ -259,7 +264,8 @@ describe("assistant holds", { skip }, () => {
     const rows = await outbox();
     assert.equal(rows.length, 1);
     assert.equal(rows[0].payload.type, "work_item.needs_you");
-    assert.match(rows[0].payload.text, /Approve or deny: mcp__safe__workload_stop/);
+    // What it would do, with its inputs masked, and where to answer it: not the board's one line.
+    assert.match(rows[0].payload.text, /^#1 "Stop the sleeper" needs your approval to: Run mcp__safe__workload_stop workload_id=sa-eval-fixture-sleep token=<redacted>\.\nApprove or deny it on its card in your chat, or in this task in the console, before \d\d:\d\d UTC; after that it is refused\.$/);
     const says = await w.q("SELECT * FROM claw_assistant_says");
     assert.equal(says.length, 1);
     assert.equal(says[0].item_attention_seq, 1);
@@ -520,5 +526,134 @@ describe("assistant holds", { skip }, () => {
     } finally {
       await app.close();
     }
+  });
+
+  /** A message alice wrote to her assistant, in her words: what tells the system which language she reads. */
+  async function wrote(content: string) {
+    await w.q(
+      `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, attended_via, channel_context)
+       VALUES ($1, $2, 'alice', $3, '{"kind":"person"}'::jsonb, '{}'::jsonb)`,
+      [alice.routerSid, `claw-msg-${++seq}`, content],
+    );
+  }
+  const COMMENT = { repo: "AMD-AGI/PrimusClaw", number: 322, body: "Worth re-checking: citations.ts:91-94 pushes past USER_ADDRESSES_MAX." };
+  const commentHeld = (turn: { mid: string }, over: Record<string, unknown> = {}) => held({
+    tool: "mcp__github__issue_comment", input: COMMENT, summary: "", message_id: turn.mid, ...over,
+  });
+
+  test("HD15 a write held for a person who writes Chinese: what was found first, then the write, in Chinese and in plain words", async () => {
+    await wrote("看一下 AMD-AGI/PrimusClaw#322：改了什么、改了几个文件、CI 什么状态、有没有没解决的线程？然后留一条评论。");
+    const item = await w.createItem(alice, "PR #322 评审并留评论");
+    const turn = await w.workerTurn(item.itemId);
+    const found = "改了 28 个文件（+1821/-42），给助理的回答加引用；CI 42 项：41 成功、1 跳过；未解决的评审线程 0 个。";
+    await w.mod.tools.report(turn, { kind: "progress", summary: found });
+    await subscribe("alice", ["assistant.say", "work_item.needs_you"], ["trigger", "long_run"]);   // draws no request
+    await deliver(item.workerSid, commentHeld(turn));
+
+    const row = await w.item(item.itemId);
+    assert.equal(row.pending_question, "需要你批准：以你的 GitHub 账号在 AMD-AGI/PrimusClaw#322 上发表一条评论");
+    const rows = await outbox();
+    assert.deepEqual(rows.map((r) => r.payload.type), ["assistant.say", "work_item.needs_you"], "what was found, then the request");
+    const first = rows[0].payload.text as string;
+    assert.ok(first.startsWith(`#${item.seq} PR #322 评审并留评论 查到的结果：`), first);
+    assert.ok(first.includes(found), "the worker's findings, whole");
+    const asked = rows[1].payload.text as string;
+    assert.ok(asked.startsWith(`#${item.seq} PR #322 评审并留评论 需要你批准一个操作：以你的 GitHub 账号在 AMD-AGI/PrimusClaw#322 上发表一条评论。`), asked);
+    assert.ok(asked.includes(COMMENT.body), "the comment it would post, whole");
+    assert.ok(/前有效，过时自动拒绝/.test(asked), asked);
+    assert.ok(!asked.includes("mcp__github__issue_comment") && !/Approve or deny|needs your answer/.test(asked), asked);
+
+    // A redelivered request says neither again.
+    await deliver(item.workerSid, commentHeld(turn));
+    assert.equal((await outbox()).length, 2);
+
+    // With a channel that draws the request: the findings are queued before the card, and the card is in Chinese.
+    await w.q("TRUNCATE claw_notification_outbox, claw_notification_subscriptions");
+    const item2 = await w.createItem(alice, "PR #323 评审并留评论");
+    const turn2 = await w.workerTurn(item2.itemId);
+    await w.mod.tools.report(turn2, { kind: "progress", summary: "改了 3 个文件；CI 全绿；没有未解决的线程。" });
+    await channel();
+    await deliver(item2.workerSid, commentHeld(turn2, { actionId: "tu-2", tool_use_id: "tu-2", input: { ...COMMENT, number: 323 } }));
+    const card = await outbox();
+    assert.deepEqual(card.map((r) => r.payload.type), ["assistant.say", "assistant.say", "approval.requested"]);
+    assert.ok((card[0].payload.text as string).includes("改了 3 个文件；CI 全绿；没有未解决的线程。"));
+    // The card shows the call cut to a line: the comment it would post is said whole before it.
+    assert.equal(card[1].payload.text, [
+      `#${item2.seq} PR #323 评审并留评论 要做的操作：以你的 GitHub 账号在 AMD-AGI/PrimusClaw#323 上发表一条评论。`,
+      "内容如下：", "---", COMMENT.body, "---", "在下面的卡片上批准或拒绝。",
+    ].join("\n"));
+    assert.equal(card[2].payload.title, `需要你批准：#${item2.seq} PR #323 评审并留评论`);
+    assert.equal(card[2].payload.summary, "以你的 GitHub 账号在 AMD-AGI/PrimusClaw#323 上发表一条评论");
+    // A Brain that explains the call itself keeps its words on the card; the write is still said whole before it.
+    await w.q("TRUNCATE claw_notification_outbox");
+    await deliver(item2.workerSid, commentHeld(turn2, { actionId: "tu-3", tool_use_id: "tu-3", summary: "发表评审评论", input: { ...COMMENT, number: 323, body: "second" } }));
+    const again = await outbox();
+    assert.deepEqual(again.map((r) => r.payload.type), ["assistant.say", "approval.requested"], "the same report is not said twice");
+    assert.ok((again[0].payload.text as string).includes("\nsecond\n"));
+    assert.equal(again[1].payload.summary, "发表评审评论");
+  });
+
+  test("HD16 an English writer is asked as before, and nothing reported before the hold says nothing first", async () => {
+    await wrote("Look at AMD-AGI/PrimusClaw#322 and leave a comment on it, please.");
+    const item = await w.createItem(alice, "Comment on PR 322");
+    const turn = await w.workerTurn(item.itemId);
+    await subscribe("alice", ["assistant.say", "work_item.needs_you"], ["trigger", "long_run"]);
+    await deliver(item.workerSid, commentHeld(turn));
+    const rows = await outbox();
+    assert.deepEqual(rows.map((r) => r.payload.type), ["work_item.needs_you"], "no report, nothing said before the request");
+    assert.match((await w.item(item.itemId)).pending_question, /^Approve or deny: mcp__github__issue_comment /);
+    const text = rows[0].payload.text as string;
+    assert.ok(text.startsWith(`#${item.seq} "Comment on PR 322" needs your approval to: Post a comment on AMD-AGI/PrimusClaw#322 as your GitHub account.`), text);
+    assert.ok(text.includes(COMMENT.body));
+  });
+
+  test("HD17 the plain words say every field the write sets, and show the ones they do not know", async () => {
+    await wrote("把 AMD-AGI/PrimusClaw#5 的标题和 base 改一下，再开个 issue 和一个草稿 PR。");
+    await subscribe("alice", ["assistant.say", "work_item.needs_you"], ["trigger", "long_run"]);   // draws no request
+    const ask = async (title: string, tool: string, input: Record<string, unknown>) => {
+      await w.q("TRUNCATE claw_notification_outbox");
+      const item = await w.createItem(alice, title);
+      const turn = await w.workerTurn(item.itemId);
+      await deliver(item.workerSid, held({ tool: `mcp__github__${tool}`, input, summary: "", message_id: turn.mid }));
+      const rows = await outbox();
+      assert.deepEqual(rows.map((r) => r.payload.type), ["work_item.needs_you"]);
+      return { pending: (await w.item(item.itemId)).pending_question as string, text: rows[0].payload.text as string, item };
+    };
+
+    // A pull request whose title and base change: both are said, with the new values; the new description is the detail.
+    const update = await ask("改 PR #5", "pr_update", { repo: "o/r", number: 5, title: "Fix the cut", base: "release", body: "New description." });
+    const updated = "修改 o/r#5：标题改为「Fix the cut」，base 改为 release，正文改为下文";
+    assert.equal(update.pending, `需要你批准：${updated}`);
+    assert.ok(update.text.startsWith(`#${update.item.seq} 改 PR #5 需要你批准一个操作：${updated}。\n内容如下：\n---\nNew description.\n---`), update.text);
+    // Closing it with a new base: the base is not dropped behind the close.
+    const close = await ask("关 PR #6", "pr_update", { repo: "o/r", number: 6, base: "main", state: "closed" });
+    assert.equal(close.pending, "需要你批准：修改 o/r#6：base 改为 main，关闭它");
+
+    // An empty description clears it: said in the words, with no text block that would read as nothing to approve.
+    const cleared = await ask("清 PR #8 正文", "pr_update", { repo: "o/r", number: 8, body: "" });
+    assert.equal(cleared.pending, "需要你批准：修改 o/r#8：清空正文");
+    assert.ok(!cleared.text.includes("内容如下"), cleared.text);
+
+    // An issue's labels.
+    const issue = await ask("开 issue", "issue_create", { repo: "o/r", title: "Flaky test", body: "It flakes.", labels: ["bug", "flaky-test"] });
+    assert.equal(issue.pending, "需要你批准：以你的 GitHub 账号在 o/r 新建 issue「Flaky test」，标签：bug, flaky-test");
+
+    // A draft pull request is said to be one; a field the words do not know is shown as the target shows it.
+    const pr = await ask("开草稿 PR", "pr_create", { repo: "o/r", head: "fix/x", base: "main", title: "Fix x", draft: true, maintainer_can_modify: false });
+    const opened = "以你的 GitHub 账号在 o/r 开一个草稿 PR「Fix x」（fix/x → main）（另设 maintainer_can_modify=false）";
+    assert.equal(pr.pending, `需要你批准：${opened}`);
+    assert.ok(pr.text.includes(`需要你批准一个操作：${opened}。`), pr.text);
+
+    // With a channel that draws the request, the text said before the card (there is one: the new description) and the card's
+    // summary carry the same words.
+    await w.q("TRUNCATE claw_notification_outbox, claw_notification_subscriptions");
+    await channel();
+    const item = await w.createItem(alice, "改 PR #7");
+    const turn = await w.workerTurn(item.itemId);
+    await deliver(item.workerSid, held({ tool: "mcp__github__pr_update", input: { repo: "o/r", number: 7, title: "T2", base: "release", body: "D2" }, summary: "", message_id: turn.mid }));
+    const card = await outbox();
+    assert.deepEqual(card.map((r) => r.payload.type), ["assistant.say", "approval.requested"]);
+    assert.equal(card[0].payload.text, `#${item.seq} 改 PR #7 要做的操作：修改 o/r#7：标题改为「T2」，base 改为 release，正文改为下文。\n内容如下：\n---\nD2\n---\n在下面的卡片上批准或拒绝。`);
+    assert.equal(card[1].payload.summary, "修改 o/r#7：标题改为「T2」，base 改为 release，正文改为下文");
   });
 });

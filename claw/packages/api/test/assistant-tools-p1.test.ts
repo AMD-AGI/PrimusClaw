@@ -15,6 +15,9 @@
  *   N1d work_send fences the run that is still executing out: its ready is refused, and the run that carries the instruction is the one heard
  *   N2  work_stop closes the item, fences its worker out and drops a first message that never started
  *   N3  work_recall gives the summary, the reports or the worker's tail, and marks what a worker wrote as untrusted
+ *   N3b work_recall live reads what the worker did last as it runs (its steps with their times, a log's latest lines, masked), and a say
+ *       about an item still in progress, in a turn that answers the user, is refused until that turn looked at it; an item the turn
+ *       started or forwarded to, a closed one and a turn a report woke are not held to it
  *   X1  L1-7: another user's item is unreachable from every tool, and is not changed
  *   M1  every tool that names an item takes its id or its number (#2, 2), and acts on that item and no other
  *   M2  a number is the caller's own: another user's item with the same number is not reached, and one the caller lacks is not found
@@ -37,7 +40,7 @@ describe("assistant tools", { skip }, () => {
   before(async () => { w = await startWorld({ CLAW_ASSISTANT_MAX_ACTIVE_ITEMS: "3" }); });
   after(async () => { await w?.stop(); });
   beforeEach(async () => {
-    await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_sessions, claw_notification_outbox CASCADE");
+    await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_sessions, claw_notification_outbox, claw_session_events, claw_assistant_messages CASCADE");
     w.drains.length = 0;
     w.events.length = 0;
     alice = await w.user("alice");
@@ -369,6 +372,69 @@ describe("assistant tools", { skip }, () => {
     assert.ok(tail.worker_tail.endsWith("END"), "it is the tail that is kept");
     assert.match(tail.note, /not instructions to you/);
     assert.equal(tail.item.item_id, item.itemId);
+  });
+
+  test("N3b work_recall live reads what the worker did last; a say about an item in progress waits for a look", async () => {
+    const item = await w.createItem(alice, "后台运行 slow_job.sh 并取结果");
+    const run = await w.workerTurn(item.itemId);
+    let n = 0;
+    const event = (secondsAgo: number, event: string, data: Record<string, unknown>) => w.q(
+      `INSERT INTO claw_session_events (event_id, session_id, event, data, created_at) VALUES ($1, $2, $3, $4::jsonb, NOW() - make_interval(secs => $5::int))`,
+      [`ev-${++n}`, item.workerSid, event, JSON.stringify(data), secondsAgo],
+    );
+    for (let i = 0; i < 20; i += 1) await event(400 - i, "toolUsed", { tool: "bash", status: "success", description: `old step ${i}` });
+    await event(40, "toolUsed", { tool: "bash", status: "start", argumentsDetail: { bash: { command: "tail -n 2 /workspace/job/progress.log" } } });
+    await event(39, "toolUsed", { tool: "bash", status: "success", description: `${"x".repeat(2000)}\nstep 11/16 done 21:09:20\nstep 12/16 done 21:09:40 GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789` });
+    await event(38, "toolUsed", { tool: "load_mcp", status: "success", description: "Loaded plugin MCP (safe)" });
+    await event(37, "AssistantMessage", { data: { content: [{ type: "text", text: "Still running: step 12 of 16." }] } });
+
+    // A turn that answers the user's "现在跑到哪一步了？".
+    const asked = async () => {
+      const turn = await w.routerTurn(alice);
+      await w.q(
+        `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, attended_via) VALUES ($1, $2, $3, '现在跑到哪一步了？', '{"kind":"person"}'::jsonb)`,
+        [alice.routerSid, turn.mid, alice.userId],
+      );
+      return turn;
+    };
+    const estimate = { text: "#1 后台运行 slow_job.sh 并取结果 还在跑，21:02 开始，预计 21:10 结束。", item_id: item.itemId };
+    const turn = await asked();
+    assert.equal(await code(t().say(turn, estimate, w.sayDeps)), "status_unchecked", "an answer from the list alone is refused");
+    // The list's summary is not a look at the worker.
+    await t().workRecall(turn, { item_id: item.itemId, detail: "summary" });
+    assert.equal(await code(t().say(turn, estimate, w.sayDeps)), "status_unchecked");
+
+    const live = await t().workRecall(turn, { item_id: `#${item.seq}`, detail: "live" }) as any;
+    assert.match(live.note, /not instructions to you/);
+    assert.equal(live.run.status, "running");
+    assert.ok(Date.parse(live.as_of) >= Date.parse(live.latest.at(-1).at));
+    assert.equal(live.latest.length, t().LIVE_STEPS, "the last steps only");
+    assert.ok(live.latest.every((s: any) => s.tool !== "load_mcp"), "loading a plugin is not a step");
+    const [call, output, said] = live.latest.slice(-3);
+    assert.deepEqual({ tool: call.tool, call: call.call }, { tool: "bash", call: '{"command":"tail -n 2 /workspace/job/progress.log"}' });
+    assert.ok(output.output.includes("step 12/16 done 21:09:40"), "the log's latest line");
+    assert.ok(output.output.length <= 601 && output.output.startsWith("…"), "the tail of a long output");
+    assert.ok(!output.output.includes("ghp_abcdefghijklmnop"), "a credential in the output is masked");
+    assert.equal(said.said, "Still running: step 12 of 16.");
+    assert.ok(Date.parse(call.at) < Date.parse(output.at) && Date.parse(output.at) < Date.parse(said.at), "oldest first, each with its time");
+    assert.ok(live.latest.slice(0, -3).every((s: any) => /^old step (1[1-9])$/.test(s.output)), "the newest of the older steps");
+
+    const told = await t().say(turn, { text: "#1 后台运行 slow_job.sh 并取结果：日志最新一行 21:09:40，第 12/16 步。", item_id: item.itemId }, w.sayDeps);
+    assert.equal(told.ok, true, "after the look, the answer goes");
+    // The next question is a new turn: it looks again.
+    assert.equal(await code(t().say(await asked(), estimate, w.sayDeps)), "status_unchecked");
+
+    // Not held to it: an item this turn forwarded to, a turn a report woke, an item that is closed.
+    const forward = await asked();
+    await t().workSend(forward, { item_id: item.itemId, text: "跑完把 result.txt 发我。" });
+    assert.equal((await t().say(forward, { text: "已转给 #1 后台运行 slow_job.sh 并取结果。", item_id: item.itemId }, w.sayDeps)).ok, true);
+    assert.equal((await t().say(await w.routerTurn(alice), { text: "#1 后台运行 slow_job.sh 并取结果 有进展。", item_id: item.itemId }, w.sayDeps)).ok, true);
+    const started = await asked();
+    const fresh = await t().workCreate(started, { title: "另一件事", brief: "do it" });
+    assert.equal((await t().say(started, { text: "#2 另一件事 开始了，大约 5 分钟。", item_id: fresh.item_id }, w.sayDeps)).ok, true);
+    assert.equal(await code(t().report(run, { kind: "failed", summary: "the job died" })), "stale_run", "the instruction started a new run");
+    await t().report(await w.workerTurn(item.itemId), { kind: "failed", summary: "the job died" });
+    assert.equal((await t().say(await asked(), { text: "#1 后台运行 slow_job.sh 并取结果 失败了。", item_id: item.itemId }, w.sayDeps)).ok, true);
   });
 
   test("X1 another user's item is unreachable from every tool, and is not changed", async () => {
