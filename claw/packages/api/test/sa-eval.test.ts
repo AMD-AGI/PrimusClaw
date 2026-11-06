@@ -406,7 +406,7 @@ test("S16 no false denial of a capability", () => {
     "I have no tools for that.", "I can't view GitHub from here.", "I cannot see your pull requests.", "I'm not able to view the web.",
     "I cannot view the latest pull requests on GitHub.", "I'm not connected to GitHub, so I can't pull the open PRs.",
     "I'm unable to retrieve your pull requests from GitHub.", "I don't have a connection to SaFE.", "我连不上 GitHub，没法拉取 PR。",
-    "I have no way to reach the web from here."]) {
+    "I have no way to reach the web from here.", "I do not currently have access to GitHub.", "I'm not currently connected to SaFE."]) {
     assert.ok(denied(text), text);
     assert.ok(CAPABILITY_DENIAL.test(text) || SELF_INABILITY.test(text), text);
   }
@@ -424,7 +424,8 @@ test("S16 no false denial of a capability", () => {
   for (const text of ["node-7 无法访问，已经离线 2 小时。", "没有找到失败的运行。", "我查到 3 个开着的 PR。", "I don't see any failed runs today.", "The node cannot reach the registry.",
     "I can't see any failed runs today.", "我看不到失败的运行。", "I can't see any failures on the dashboard.",
     "I can't find any open PRs of yours on GitHub.", "我无法确定 SaFE 上这个节点何时恢复。", "I can't tell why the run failed; its log ends early.",
-    "I can't delete that workload on SaFE without your approval.", "我不能直接删除 SaFE 上的 workload，需要你确认。"]) {
+    "I can't delete that workload on SaFE without your approval.", "我不能直接删除 SaFE 上的 workload，需要你确认。",
+    "GitHub returned 20 results; I can't rule out additional open PRs beyond this page.", "I can't be sure every SaFE node reported in time."]) {
     assert.ok(!denied(text), text);
   }
   // A failed shell command excuses a GitHub denial only when it failed at GitHub: a line of its answer is a failure that names

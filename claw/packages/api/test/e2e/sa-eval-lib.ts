@@ -422,7 +422,7 @@ export const CAPABILITY_DENIAL = new RegExp([
   "\\bI(?: am|'m)? (?:currently |still )?(?:can(?:'|’)?t|cannot|can not|unable to|not able to)(?: directly)? (?:see|view) (?:[^\\s.!?。，,]+ ){0,6}?"
     + "(?:github\\b|repos?\\b|repositor(?:y|ies)\\b|PRs?\\b|pull requests?\\b|safe\\b|workloads?\\b|clusters?\\b|dispatron\\b|autopilot\\b|pulse\\b|"
     + "(?:the )?web\\b|web ?pages?\\b|internet\\b|(?:the )?board\\b)",
-  "\\bI (?:don(?:'|’)?t|do not) have (?:any )?(?:access|permission|internet|web access|a tool|the tools?|tools?)\\b",
+  "\\bI (?:don(?:'|’)?t|do not)(?: (?:currently|yet|really|actually))? have (?:any )?(?:access|permission|internet|web access|a tool|the tools?|tools?)\\b",
   "\\bI have no (?:access|internet|web access|tools?)\\b",
 ].join("|"), "i");
 
@@ -497,10 +497,12 @@ const CONSENT = /approv|confirm|your (?:go-ahead|ok|permission|consent)|批准|�
  * at, not inabilities, and are left out.
  */
 export const SELF_INABILITY = new RegExp([
-  "\\bI(?:'m|’m| am)? (?:currently |still |really )?(?:not (?:connected|able|allowed|authori[sz]ed|set up|linked|integrated|signed in|logged in|permitted)"
+  "\\bI(?:'m|’m| am)? (?:currently |still |really |actually )?(?:not (?:currently |yet )?(?:connected|able|allowed|authori[sz]ed|set up|linked|integrated|signed in|logged in|permitted)"
     + "|unable|can(?:'|’)?t|cannot|can not|have no (?:access|way|tools?|integration|connection)"
-    + "|don(?:'|’)?t have (?:access|permission|a way|the ability|any (?:access|tools?|way)|tools?|an? (?:integration|connection)))\\b"
-    + "(?!\\s+(?:find|locate|spot|tell|say|confirm|see any|see a|recall|remember))",
+    + "|(?:don(?:'|’)?t|do not)(?: (?:currently|yet|really|actually))? have (?:access|permission|a way|the ability|any (?:access|tools?|way)|tools?|an? (?:integration|connection)))\\b"
+    // What it could not conclude or promise about what it did read is an answer, not an inability.
+    + "(?!\\s+(?:find|locate|spot|tell|say|confirm|verify|determine|know|see any|see a|recall|remember|rule out|exclude|guarantee|promise|"
+    + "be (?:sure|certain)|predict|estimate|explain|reproduce))",
   "我(目前|现在|暂时|这边|这里)?(还)?(连不上|接不上|没有接入|没接入|未接入|没有连接|没连接|未连接|没有权限|没权限)",
 ].join("|"), "i");
 
