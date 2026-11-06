@@ -1689,6 +1689,17 @@ export function openAiBaseUrlFellBack(): boolean {
 }
 
 
+// --- MCP connections (clients/mcp-pool.ts) ---
+// Keep a run's MCP connections open after it ends and reuse them for the same user's next turn, keyed by the user, the
+// server's name and its whole spec (credentials included): two users never share one. false: every turn opens and closes its own.
+export const MCP_POOL_ENABLED = envBool("MCP_POOL_ENABLED", true);
+// A pooled connection nobody used for this long is closed.
+export const MCP_POOL_IDLE_MS = envInt("MCP_POOL_IDLE_MS", 600_000, { min: 1_000 });
+// How long a turn waits for its MCP servers (connected side by side) before the model is called. A server not ready by
+// then is left out of that turn, said to the model, logged as mcp_client.connect_deferred, and keeps connecting for the
+// next turn. 0: wait for every server however long it takes.
+export const MCP_CONNECT_BUDGET_MS = envInt("MCP_CONNECT_BUDGET_MS", 2_000, { min: 0 });
+
 // --- LLM streaming timeouts (SSE-style response body) ---
 // Aligned to LiteLLM gateway's read=600s to avoid client-side aborts that
 // the upstream proxy would still consider in-flight. Long prefill on big

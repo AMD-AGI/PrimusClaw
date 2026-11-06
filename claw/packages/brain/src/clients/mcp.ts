@@ -11,8 +11,9 @@ import { CITE_SOURCES_META } from "@claw/protocol";
 import { redactSecrets } from "@claw/utils";
 import pino from "pino";
 import { Agent, fetch as undiciFetch } from "undici";
-import { mcpToolFilter } from "./mcp-tool-filter.js";
+import { mcpToolFilter, type McpToolFilter } from "./mcp-tool-filter.js";
 import { isTransientFetchError, isTransientHttpStatus } from "../infra/transient-http.js";
+import { McpPoolEntry, type McpConnectionPool } from "./mcp-pool.js";
 
 const logger = pino({ name: "mcp-clients" });
 
@@ -116,6 +117,8 @@ type CallTool = (
 export type McpToolCaller = { callTool: CallTool };
 
 interface McpClientWrapper {
+  /** Whether it may be kept open for a later turn (`mcp-pool.ts`). */
+  persistent: boolean;
   callTool: CallTool;
   listTools: () => Promise<ToolSchema[]>;
   close: () => Promise<void>;
@@ -147,6 +150,23 @@ export function pinnedFetch(pin: unknown): FetchLike | undefined {
     },
   });
   return (url, init) => undiciFetch(url, { ...(init as object), dispatcher }) as unknown as Promise<Response>;
+}
+
+/**
+ * A Streamable HTTP client's fetch, minus the standalone GET stream the SDK opens after `initialize` for messages the server
+ * sends on its own. Brain declares no client capabilities and handles no server notifications, so the stream carries nothing
+ * it reads; and it is a request held open for as long as the connection lives, which a connection kept across turns
+ * (`mcp-pool.ts`) would hold for every user on every server. The SDK reads a 405 as "this server offers no such stream". A GET
+ * that resumes a request's own stream (`last-event-id`) still goes out.
+ */
+function withoutStandaloneSse(base: FetchLike | undefined): FetchLike {
+  const send: FetchLike = base ?? ((url, init) => globalThis.fetch(url, init));
+  return (url, init) => {
+    if ((init?.method ?? "GET").toUpperCase() === "GET" && !new Headers(init?.headers).has("last-event-id")) {
+      return Promise.resolve(new Response(null, { status: 405, statusText: "standalone stream not used" }));
+    }
+    return send(url, init);
+  };
 }
 
 /**
@@ -222,7 +242,8 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
   const fetch = pinnedFetch(spec.pinned_address);
   const tryConnect = async (kind: "sse" | "streamable-http") => {
     const c = makeClient();
-    const opts = { requestInit: { headers }, ...(fetch ? { fetch } : {}) };
+    const f = kind === "streamable-http" ? withoutStandaloneSse(fetch) : fetch;
+    const opts = { requestInit: { headers }, ...(f ? { fetch: f } : {}) };
     const transport = kind === "sse"
       ? new SSEClientTransport(new URL(url), opts)
       : new StreamableHTTPClientTransport(new URL(url), opts);
@@ -254,6 +275,8 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
   }
 
   logger.info({ name, url, type: effectiveType }, "mcp_client.connected");
+  // An SSE connection is a request held open for as long as the connection lives: it is the run's, not the pool's.
+  const persistent = effectiveType === "streamable-http";
 
   // Filled by listTools: the resource tools this server is offered (none for a
   // server without resources, or whose own tools have those names).
@@ -266,6 +289,7 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
   const readOnlyTools = new Set<string>();
 
   return {
+    persistent,
     async callTool(
       toolName: string, args: Record<string, unknown>, outcome?: McpCallOutcome, meta?: Record<string, unknown>,
       signal?: AbortSignal,
@@ -380,9 +404,32 @@ export function mcpUnavailableNote(failed: readonly McpConnectFailure[]): string
   return `[Unavailable this turn: MCP server(s) ${list}. Their tools are not offered. If the request needs one, tell the user that service is unreachable right now rather than that you lack the capability.]`;
 }
 
+/** A server left out of this turn because it was not ready within the turn's budget; it keeps connecting for the next one. */
+export interface McpDeferred { name: string; reason: string }
+
+export interface ConnectPlatformMcpOptions {
+  /**
+   * Keep the connections open after the run, for this user's next turn (`mcp-pool.ts`). Without a pool, or without a user (absent
+   * or `default`), each server is opened for this run and closed by `closeAll`, as before.
+   */
+  pool?: McpConnectionPool;
+  userId?: string;
+  /**
+   * Wait at most this long, for all servers together (they connect side by side), before the run goes on. A server not ready by
+   * then is left out of this run (`deferred`) and logged; with a pool it keeps connecting in the background and the next turn
+   * offers its tools. Absent or 0: wait for every server however long it takes.
+   */
+  budgetMs?: number;
+}
+
+const TIMED_OUT = Symbol("mcp_connect_budget");
+
 /**
  * Connect to all MCP servers from resolved configs.
  * Returns a Map for ToolRouter and combined tool schemas for LLM.
+ *
+ * The servers are connected side by side, not one after another, so the run waits for the slowest server rather than for
+ * the sum of them, and with `budgetMs` for no longer than that.
  *
  * `schemas` is sorted by name (see sortToolSchemasByName), across servers, so
  * neither a server's own listing order nor the order the servers were
@@ -390,18 +437,28 @@ export function mcpUnavailableNote(failed: readonly McpConnectFailure[]): string
  */
 export async function connectPlatformMcp(
   servers: Record<string, Record<string, unknown>>,
+  opts: ConnectPlatformMcpOptions = {},
 ): Promise<{
   clients: Map<string, McpToolCaller>;
   schemas: ToolSchema[];
   /** Servers that could not be connected or listed, with why; their tools are not offered. */
   failed: McpConnectFailure[];
+  /** Servers still connecting when the budget ran out; their tools are not offered in this run. */
+  deferred: McpDeferred[];
+  /** Let go of this run's connections: pooled ones stay open for the next turn, the others are closed. */
   closeAll: () => Promise<void>;
 }> {
+  const started = Date.now();
   const clients = new Map<string, McpToolCaller>();
   const schemas: ToolSchema[] = [];
-  const wrappers: McpClientWrapper[] = [];
   const failed: McpConnectFailure[] = [];
+  const deferred: McpDeferred[] = [];
+  const releases: Array<() => void> = [];
+  const reused: string[] = [];
+  const pool = opts.pool && opts.userId && opts.userId !== "default" ? opts.pool : undefined;
 
+  type Lease = { name: string; spec: Record<string, unknown>; filter: McpToolFilter | null; entry: McpPoolEntry; ready: Promise<void> };
+  const leases: Lease[] = [];
   for (const [name, spec] of Object.entries(servers)) {
     // `enabled_tools` / `disabled_tools` (mcp-tool-filter.ts): read before connecting, so a
     // field nobody can read keeps the server out of the run, said as unavailable.
@@ -411,45 +468,97 @@ export async function connectPlatformMcp(
       failed.push({ name, reason: `its ${filter.invalid} setting cannot be read (expected a non-empty list of tool names)` });
       continue;
     }
-    try {
-      // Connecting is safe to repeat: it opens a client and lists tools, and a
-      // server that was mid-swap when this run started is otherwise dropped
-      // from the run for its whole life.
-      const wrapper = await retryTransientMcp("connect", name, () => connectMcpServer(name, spec));
-      wrappers.push(wrapper);
-      const listed = await wrapper.listTools();
-      const prefix = `mcp__${name}__`;
-      const tools = filter ? listed.filter((t) => filter.allows(t.name.slice(prefix.length))) : listed;
-      if (filter) {
-        const own = new Set(listed.map((t) => t.name.slice(prefix.length)));
-        const unknown = filter.exactNames.filter((n) => !own.has(n));
-        // A name the server does not list is most likely a typo or a renamed tool: say it to the operator.
-        if (unknown.length) logger.warn({ name, unknown }, "mcp_client.tool_filter_names_unknown");
-      }
-      clients.set(name, filter
-        ? {
-            callTool: (toolName, args, outcome, meta, signal) => filter.allows(toolName)
-              ? wrapper.callTool(toolName, args, outcome, meta, signal)
-              : Promise.reject(new Error(`Tool ${toolName} is not enabled on MCP server ${name}`)),
-          }
-        : wrapper);
-      schemas.push(...tools);
-      logger.info({ name, toolCount: tools.length, ...(filter ? { listedCount: listed.length } : {}) }, "mcp_client.tools_loaded");
-    } catch (err) {
-      // Log URL + type so operators can diagnose 4xx / DNS / TLS without
-      // cross-referencing SaFE Tools API responses.
-      logger.warn({ err, name, url: spec.url, type: spec.type || "http" }, "mcp_client.connect_failed");
-      clients.delete(name);
-      failed.push({ name, reason: connectFailureReason(err) });
+    // Connecting is safe to repeat: it opens a client and lists tools, and a
+    // server that was mid-swap when this run started is otherwise dropped
+    // from the run for its whole life.
+    const open = () => retryTransientMcp("connect", name, () => connectMcpServer(name, spec));
+    if (pool) {
+      const lease = pool.acquire(opts.userId!, name, spec, open);
+      if (lease.reused) reused.push(name);
+      releases.push(() => pool.release(lease.entry));
+      leases.push({ name, spec, filter: filter ?? null, entry: lease.entry, ready: lease.ready });
+    } else {
+      const entry = new McpPoolEntry(name, name, name, open);
+      const ready = entry.connect();
+      releases.push(() => entry.retire());
+      leases.push({ name, spec, filter: filter ?? null, entry, ready });
     }
   }
 
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const budget = opts.budgetMs && opts.budgetMs > 0 ? opts.budgetMs : 0;
+  const deadline = budget
+    ? new Promise<typeof TIMED_OUT>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), budget); })
+    : new Promise<never>(() => {});
+  const outcomes = await Promise.all(leases.map((l) => Promise.race([
+    l.ready.then(() => null, (err: unknown) => ({ err })),
+    deadline,
+  ])));
+  if (timer) clearTimeout(timer);
+
+  leases.forEach((l, i) => {
+    const { name, spec, filter, entry } = l;
+    const outcome = outcomes[i];
+    if (outcome === TIMED_OUT && !(entry.kind === "ready" && entry.verifiedAt > 0)) {
+      // Not ready within the budget: this run goes on without it, and the connect goes on without the run.
+      logger.warn({ name, url: spec.url, budgetMs: budget, pooled: !!pool }, "mcp_client.connect_deferred");
+      deferred.push({ name, reason: `did not answer within ${budget} ms; its tools are offered again from the next turn` });
+      l.ready.then(
+        () => logger.info({ name, ms: Date.now() - started }, "mcp_client.deferred_connected"),
+        (err: unknown) => logger.warn({ name, ms: Date.now() - started, err: connectFailureReason(err) }, "mcp_client.deferred_failed"),
+      );
+      return;
+    }
+    if (outcome && outcome !== TIMED_OUT) {
+      // Log URL + type so operators can diagnose 4xx / DNS / TLS without
+      // cross-referencing SaFE Tools API responses.
+      logger.warn({ err: outcome.err, name, url: spec.url, type: spec.type || "http" }, "mcp_client.connect_failed");
+      failed.push({ name, reason: connectFailureReason(outcome.err) });
+      return;
+    }
+    // Ready, or (a health check still running past the budget) the tools it listed last time.
+    const listed = entry.tools;
+    const prefix = `mcp__${name}__`;
+    const tools = filter ? listed.filter((t) => filter.allows(t.name.slice(prefix.length))) : listed;
+    if (filter) {
+      const own = new Set(listed.map((t) => t.name.slice(prefix.length)));
+      const unknown = filter.exactNames.filter((n) => !own.has(n));
+      // A name the server does not list is most likely a typo or a renamed tool: say it to the operator.
+      if (unknown.length) logger.warn({ name, unknown }, "mcp_client.tool_filter_names_unknown");
+    }
+    const caller: McpToolCaller = {
+      callTool: (toolName, args, outcome, meta, signal) => entry.callTool(toolName, args, outcome, meta, signal),
+    };
+    clients.set(name, filter
+      ? {
+          callTool: (toolName, args, outcome, meta, signal) => filter.allows(toolName)
+            ? caller.callTool(toolName, args, outcome, meta, signal)
+            : Promise.reject(new Error(`Tool ${toolName} is not enabled on MCP server ${name}`)),
+        }
+      : caller);
+    schemas.push(...tools);
+    logger.info({ name, toolCount: tools.length, ...(filter ? { listedCount: listed.length } : {}) }, "mcp_client.tools_loaded");
+  });
+
+  logger.info({
+    ms: Date.now() - started,
+    servers: Object.keys(servers).length,
+    pooled: !!pool,
+    reused,
+    deferred: deferred.map((d) => d.name),
+    failed: failed.map((f) => f.name),
+  }, "mcp_client.connect_phase");
+
+  let released = false;
   return {
     clients,
     schemas: sortToolSchemasByName(schemas),
     failed,
+    deferred,
     async closeAll() {
-      for (const w of wrappers) await w.close();
+      if (released) return;
+      released = true;
+      for (const release of releases) release();
     },
   };
 }

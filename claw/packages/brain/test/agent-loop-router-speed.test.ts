@@ -11,7 +11,7 @@ import type { Message, ToolSchema } from "@claw/protocol";
 import type { LlmContentBlock, LlmSession, LlmTurnResult, StreamTurnOptions } from "../src/llm/provider.js";
 import type { ToolRouter } from "../src/tools/router.js";
 import { readTaintSources } from "../src/tools/allowlist.js";
-import { agentLoop, TOOL_TEXT_DELTA_INTERVAL_MS, type LoopOptions } from "../src/agent/agent-loop.js";
+import { agentLoop, TOOL_TEXT_DELTA_INTERVAL_MS, ToolTextThrottle, type LoopOptions } from "../src/agent/agent-loop.js";
 
 type Ev = Record<string, unknown>;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -71,10 +71,10 @@ test("a streamed say's text is published while it is written, at most once per i
       during: async (o) => {
         const say = (text: string) => o!.toolText!.onText({ id: "toolu_say", name: SAY, text });
         say("Hello");
-        say("Hello there");          // inside the interval: not published
+        say("Hello there");          // inside the interval: held, and published when the interval ends
         await sleep(TOOL_TEXT_DELTA_INTERVAL_MS + 50);
-        say("Hello there, 12");
-        say("Hello there, 12 nodes"); // inside the interval again
+        say("Hello there, 12");      // inside the next interval: superseded before it ends
+        say("Hello there, 12 nodes"); // published when the turn ends
       },
     },
     { content: [{ type: "text", text: "ok" }] },
@@ -89,12 +89,68 @@ test("a streamed say's text is published while it is written, at most once per i
   const deltas = events.filter((e) => e.type === "toolTextDelta");
   assert.deepEqual(deltas.map((e) => [e.tool, e.actionId, e.text]), [
     [SAY, "toolu_say", "Hello"],
-    [SAY, "toolu_say", "Hello there, 12"],
+    [SAY, "toolu_say", "Hello there"],
+    [SAY, "toolu_say", "Hello there, 12 nodes"],
   ]);
   // The preview comes before the call: the say itself runs once the step is whole, as every call does.
   const firstStart = events.findIndex((e) => e.type === "toolUsed" && e.status === "start");
-  assert.ok(events.indexOf(deltas[1]) < firstStart);
+  assert.ok(events.indexOf(deltas[2]) < firstStart);
   assert.deepEqual(routed, [SAY]);
+});
+
+test("a say written inside one interval is still published twice: its first text at once, its whole text before it runs", async () => {
+  const { session: s } = session([
+    {
+      content: [use("toolu_say", SAY, { text: "12 nodes are free." })],
+      during: async (o) => {
+        const say = (text: string) => o!.toolText!.onText({ id: "toolu_say", name: SAY, text });
+        say("12");
+        say("12 nodes");
+        say("12 nodes are free.");
+      },
+    },
+    { content: [{ type: "text", text: "ok" }] },
+  ]);
+  const { opts: o, events } = opts({ llmSession: s, streamToolText: [SAY] });
+  await agentLoop([{ role: "user", content: "how many nodes?" }], TOOLS, o);
+  const deltas = events.filter((e) => e.type === "toolTextDelta");
+  assert.deepEqual(deltas.map((e) => e.text), ["12", "12 nodes are free."], "the text written after the first delta was dropped");
+  const firstStart = events.findIndex((e) => e.type === "toolUsed" && e.status === "start");
+  assert.ok(events.indexOf(deltas[1]!) < firstStart, "the last delta came after the say ran");
+});
+
+test("text that stops growing inside an interval is published when the interval ends, not only when the turn does", async () => {
+  let midTurn: string[] = [];
+  const { session: s } = session([
+    {
+      content: [use("toolu_say", SAY, { text: "Searching the web, one moment." })],
+      during: async (o) => {
+        const say = (text: string) => o!.toolText!.onText({ id: "toolu_say", name: SAY, text });
+        say("Searching");
+        say("Searching the web, one moment.");
+        // The model goes quiet (it is still writing something else): the held text must not wait for the turn to end.
+        await sleep(TOOL_TEXT_DELTA_INTERVAL_MS + 150);
+        midTurn = events.filter((e) => e.type === "toolTextDelta").map((e) => String(e.text));
+      },
+    },
+    { content: [{ type: "text", text: "ok" }] },
+  ]);
+  const { opts: o, events } = opts({ llmSession: s, streamToolText: [SAY] });
+  await agentLoop([{ role: "user", content: "search" }], TOOLS, o);
+  assert.deepEqual(midTurn, ["Searching", "Searching the web, one moment."]);
+  // Nothing is published twice.
+  assert.deepEqual(events.filter((e) => e.type === "toolTextDelta").map((e) => e.text), ["Searching", "Searching the web, one moment."]);
+});
+
+test("a failed attempt's held text is not published", async () => {
+  const published: string[] = [];
+  const t = new ToolTextThrottle(new Set([SAY]), 50, async ({ text }) => { published.push(text); });
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "Hel" });
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "Hello" });
+  t.cancel();
+  await sleep(100);
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "Hello again" });
+  assert.deepEqual(published, ["Hel"]);
 });
 
 test("without stream_tool_text, and in a sub-agent's loop, no text is asked for", async () => {
@@ -147,4 +203,36 @@ test("the read-only lookups a request names run side by side; anything else afte
   const serial = await twoLookups(undefined);
   assert.equal(serial.most, 1);
   assert.deepEqual(serial.routed, ["mcp__safe__node_list", "mcp__safe__workload_list", "mcp__assistant__work_create"]);
+});
+
+test("a call's deltas go out in order even when an earlier publish is slow, and all of them before the call runs", async () => {
+  const delivered: string[] = [];
+  // The first publish stalls (a retried JetStream publish); the later, longer texts must not overtake it.
+  const t = new ToolTextThrottle(new Set([SAY]), 20, async ({ text }) => {
+    if (text === "A") await sleep(150);
+    delivered.push(text);
+  });
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "A" });
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "AB" });
+  await sleep(40);
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "ABC" });
+  await t.flush();
+  assert.deepEqual(delivered, ["A", "AB", "ABC"]);
+});
+
+test("a failed attempt's deltas queued behind a slow publish are not sent after it is cancelled", async () => {
+  const delivered: string[] = [];
+  let release!: () => void;
+  const held = new Promise<void>((r) => { release = r; });
+  const t = new ToolTextThrottle(new Set([SAY]), 20, async ({ text }) => {
+    if (text === "A") await held;
+    delivered.push(text);
+  });
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "A" });
+  await sleep(40);
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "AB" }); // queued behind "A"
+  t.cancel();
+  release();
+  await sleep(20);
+  assert.deepEqual(delivered, ["A"]);
 });

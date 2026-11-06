@@ -658,6 +658,20 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- Brain: a turn's MCP servers are connected side by side instead of one after another, and the connections are kept for the same
+  user's next turn (new `clients/mcp-pool.ts`) instead of being opened from nothing (initialize, then tools/list) on every turn. A
+  kept connection is keyed by the user, the server's name and a hash of its whole spec, credentials and headers included, so two
+  users never share one and a changed credential is a new connection; a run without a user opens and closes its own as before.
+  When its tools were last listed more than 30 s ago a turn lists them again beside it, without waiting (it is offered them as last
+  listed), and a failed listing reopens the connection; a call answered 404 (session gone) is sent again on a new connection, a failure is answered from memory for 30 s, and a connection unused for
+  `MCP_POOL_IDLE_MS` (default 600000) is closed. A turn waits at most `MCP_CONNECT_BUDGET_MS` (default 2000) for its servers: one
+  not ready by then is left out of that turn (said to the model like an unreachable one, logged as `mcp_client.connect_deferred`)
+  and keeps connecting, and the next turn offers it. `MCP_POOL_ENABLED=false` turns the pool off. The Streamable HTTP client no
+  longer opens the standalone GET stream for server-initiated messages, which Brain never read; an SSE connection is not kept.
+  One slow server (SaFE's, 4-6 s at times) had held every assistant turn's first word behind it.
+- Brain: a streamed `say`'s text (`toolTextDelta`) that arrives inside the 400 ms interval is published when the interval ends,
+  and whatever is still unpublished when the model's turn ends is published before the call runs. The last delta of a call is now
+  always its whole text; a text written inside one interval had been a single delta of its first fragment.
 - Assistant: a review the router hands to the user's chat (`handed_off`) is answered there in one message, by the chat that starts
   it: the router says nothing about it. From the handoff on, a `say` in that turn is refused (`handed_off`), and neither the turn's
   plain text nor a notice that it failed is delivered for it; the handoff record keeps the turn's `message_id` (new column on

@@ -23,6 +23,7 @@ import { decisionWaitMs, HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp, mcpUnavailableNote } from "../clients/mcp.js";
+import { MCP_POOL_DEFAULTS, McpConnectionPool } from "../clients/mcp-pool.js";
 import { buildPrompt, buildProgressiveSkillHint, buildSkillAndMcpHints, listProgressiveSkills, renderSystemHints } from "./prompt.js";
 import { loadPromptImages, promptContent } from "./prompt-images.js";
 import { readObjectBounded } from "../workspace/s3-uploader.js";
@@ -42,7 +43,7 @@ import {
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
   BASH_APPROVAL_RULES, BASH_APPROVAL_DEFAULTS_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, SKILL_HINTS_IN_SYSTEM, BG_SHELL_ENABLED,
+  MCP_PLATFORM_KEY_ALLOWED_HOSTS, MCP_CONNECT_BUDGET_MS, MCP_POOL_ENABLED, MCP_POOL_IDLE_MS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, SKILL_HINTS_IN_SYSTEM, BG_SHELL_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
@@ -54,6 +55,9 @@ import pino from "pino";
 import { applyReviewProfileBackstop, isReviewProfile, reviewProfileAllowlist, reviewTurnBudgetRefusal } from "./review-profile.js";
 
 const logger = pino({ name: "agent-engine" });
+
+/** This process's MCP connections, kept across turns per user and server spec (`clients/mcp-pool.ts`). */
+const mcpPool = new McpConnectionPool({ ...MCP_POOL_DEFAULTS, idleMs: MCP_POOL_IDLE_MS });
 
 /**
  * Agent engine: self-built agent loop calling the LLM directly (Anthropic
@@ -355,9 +359,15 @@ export class AgentEngine {
       promptLen: fullPrompt.length,
     }, "engine.tools_resolved");
 
+    // The user's connections from earlier turns are reused (`mcp-pool.ts`), the servers are connected side by side, and the run
+    // waits at most MCP_CONNECT_BUDGET_MS for them: a server not ready by then is left out of this turn and offered on the next.
     const mcpResult = Object.keys(mergedMcp).length > 0
-      ? await connectPlatformMcp(mergedMcp)
-      : { clients: new Map(), schemas: [], failed: [], closeAll: async () => {} };
+      ? await connectPlatformMcp(mergedMcp, {
+          pool: MCP_POOL_ENABLED ? mcpPool : undefined,
+          userId: request.user_id,
+          budgetMs: MCP_CONNECT_BUDGET_MS,
+        })
+      : { clients: new Map(), schemas: [], failed: [], deferred: [], closeAll: async () => {} };
     // A server that is down is said, to the user as a progress line and to the
     // model in the prompt, instead of its tools quietly not being there.
     if (mcpResult.failed.length) {
@@ -486,7 +496,8 @@ export class AgentEngine {
           messages.unshift({ role: "system" as const, content: brainSystem });
         }
       }
-      const unavailable = mcpUnavailableNote(mcpResult.failed);
+      // A server still connecting is unavailable to this turn as much as one that is down, and the model has to know which tools it lacks.
+      const unavailable = mcpUnavailableNote([...mcpResult.failed, ...mcpResult.deferred]);
       const promptText = unavailable ? `${fullPrompt}\n\n${unavailable}` : fullPrompt;
       // The pictures the person sent with this message, beside its words (an assistant's router turn: it has no sandbox to `read`
       // them in). Read from this session's own uploads, under the prefix the workspace sync files them at.
