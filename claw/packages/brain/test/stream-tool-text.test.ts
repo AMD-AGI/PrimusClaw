@@ -67,6 +67,7 @@ function toolStream(name: string, parts: string[], id = "toolu_1") {
   };
 }
 
+const CLAUDE = "claude-sonnet-5.5";
 const TOOLS: ToolSchema[] = [
   { name: "mcp__assistant__say", description: "say", input_schema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } },
   { name: "mcp__safe__node_list", description: "nodes", input_schema: { type: "object" } },
@@ -82,7 +83,7 @@ test("a streamed tool is sent with eager input streaming and its text is reporte
   const parts = ['{"te', 'xt": "Nodes: ', "12 rea", 'dy, 3 \\', 'u4e0d', ' busy"}'];
   const { client, bodies } = stub(toolStream("mcp__assistant__say", parts));
   const seen: Array<{ id: string; name: string; text: string }> = [];
-  const res = await buildAnthropicSession(client, "m").streamTurn([{ role: "user", content: "q" }], TOOLS, undefined, {
+  const res = await buildAnthropicSession(client, CLAUDE).streamTurn([{ role: "user", content: "q" }], TOOLS, undefined, {
     toolText: { tools: new Set(["mcp__assistant__say"]), onText: (c) => seen.push(c) },
   });
   assert.deepEqual(seen.map((s) => s.text), ["Nodes: ", "Nodes: 12 rea", "Nodes: 12 ready, 3 ", "Nodes: 12 ready, 3 不", "Nodes: 12 ready, 3 不 busy"]);
@@ -97,15 +98,24 @@ test("without the option, or for a tool it does not name, nothing is reported an
   const parts = ['{"text": "a', 'b"}'];
   for (const options of [undefined, { toolText: { tools: new Set(["mcp__assistant__say"]), onText: () => assert.fail("not named") } }]) {
     const { client, bodies } = stub(toolStream(options ? "mcp__safe__node_list" : "mcp__assistant__say", parts));
-    await buildAnthropicSession(client, "m").streamTurn([{ role: "user", content: "q" }], TOOLS, undefined, options);
+    await buildAnthropicSession(client, CLAUDE).streamTurn([{ role: "user", content: "q" }], TOOLS, undefined, options);
     const sayTool = (bodies[0].tools as Array<Record<string, unknown>>).find((t) => t.name === "mcp__assistant__say")!;
     assert.equal("eager_input_streaming" in sayTool, options !== undefined);
   }
 });
 
+test("a model that is not Claude is asked for nothing new and reports no text", async () => {
+  const { client, bodies } = stub(toolStream("mcp__assistant__say", ['{"text": "a', 'b"}']));
+  const res = await buildAnthropicSession(client, "gpt-4o").streamTurn([{ role: "user", content: "q" }], TOOLS, undefined, {
+    toolText: { tools: new Set(["mcp__assistant__say"]), onText: () => assert.fail("no text from a model that was not asked to stream it") },
+  });
+  assert.ok((bodies[0].tools as Array<Record<string, unknown>>).every((t) => !("eager_input_streaming" in t)));
+  assert.deepEqual((res.content[0] as any).input, { text: "ab" });
+});
+
 test("a reader that throws does not end the turn", async () => {
   const { client } = stub(toolStream("mcp__assistant__say", ['{"text": "x', 'y"}']));
-  const res = await buildAnthropicSession(client, "m").streamTurn([{ role: "user", content: "q" }], TOOLS, undefined, {
+  const res = await buildAnthropicSession(client, CLAUDE).streamTurn([{ role: "user", content: "q" }], TOOLS, undefined, {
     toolText: { tools: new Set(["mcp__assistant__say"]), onText: () => { throw new Error("reader broke"); } },
   });
   assert.deepEqual((res.content[0] as any).input, { text: "xy" });

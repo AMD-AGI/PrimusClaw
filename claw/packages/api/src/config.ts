@@ -94,13 +94,13 @@ export function envBool(key: string, fallback: boolean): boolean {
   return ["true", "1", "yes"].includes(v);
 }
 
-/** CLAW_ASSISTANT_ROUTER_EFFORT: an effort every provider takes, or null for `default`; anything else is reported and read as low. */
+/** CLAW_ASSISTANT_ROUTER_EFFORT: an effort every provider takes, or null for `default`; anything else is reported and read as `default`. */
 function routerEffortSetting(raw: string): ReasoningEffort | null {
   const v = raw.toLowerCase();
   if (v === "default") return null;
   if (isReasoningEffort(v)) return v;
-  settingProblems.push(`CLAW_ASSISTANT_ROUTER_EFFORT=${raw} is not low, medium, high or default; using low`);
-  return "low";
+  settingProblems.push(`CLAW_ASSISTANT_ROUTER_EFFORT=${raw} is not low, medium, high or default; using default`);
+  return null;
 }
 
 export const API_PORT = envInt("API_PORT", 8000);
@@ -802,10 +802,11 @@ export const CLAW_ASSISTANT_TOKEN_KEY = env("CLAW_ASSISTANT_TOKEN_KEY");
 export const CLAW_ASSISTANT_WORKER_MODEL = env("CLAW_ASSISTANT_WORKER_MODEL");
 // LLM calls a router turn may make. A router only classifies, calls a tool and says one line.
 export const CLAW_ASSISTANT_ROUTER_MAX_TURNS = envInt("CLAW_ASSISTANT_ROUTER_MAX_TURNS", 8, { min: 1 });
-// How hard a router turn's model thinks (`ExecuteRequest.effort`): low, medium or high, or `default` for the model's own. Thinking is
-// most of a router turn's time and a router only picks a tool and answers in a line, so low (`assistant/router-speed.ts`). A session
-// that chose an effort of its own keeps it.
-export const CLAW_ASSISTANT_ROUTER_EFFORT = routerEffortSetting(env("CLAW_ASSISTANT_ROUTER_EFFORT", "low"));
+// How hard a router turn's model thinks (`ExecuteRequest.effort`): low, medium or high, or `default` (the default) for the model's own.
+// Thinking is most of a router turn's time on a reasoning model, so `low` makes it quicker (`assistant/router-speed.ts`); it is not the
+// default because a model that takes no reasoning effort (an OpenAI-style deployment's gpt-4o) refuses a request that names one. A
+// session that chose an effort of its own keeps it.
+export const CLAW_ASSISTANT_ROUTER_EFFORT = routerEffortSetting(env("CLAW_ASSISTANT_ROUTER_EFFORT", "default"));
 // `false` stops publishing a router's `say` while the model writes it (`ExecuteRequest.stream_tool_text`, `toolTextDelta` events): a
 // channel that follows the turn shows the words as they come instead of when the step ends.
 export const CLAW_ASSISTANT_STREAM_SAY = envBool("CLAW_ASSISTANT_STREAM_SAY", true);

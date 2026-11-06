@@ -5,8 +5,8 @@
  * What keeps a router turn quick, on top of its cut (`role-profile.ts`).
  *
  * Measured on the live router (2026-11-06): the lookups a turn makes take tenths of a second, and nearly all the rest is the model
- * writing, most of it thinking (about 400 tokens a step at some 150 a second, two or three steps a turn). So a router turn asks for
- * little thinking (`CLAW_ASSISTANT_ROUTER_EFFORT`, low unless the session chose an effort of its own), and its `say` is published
+ * writing, most of it thinking (about 400 tokens a step at some 150 a second, two or three steps a turn). So a router turn can ask for
+ * little thinking (`CLAW_ASSISTANT_ROUTER_EFFORT=low`, unless the session chose an effort of its own), and its `say` is published
  * while the model writes it (`CLAW_ASSISTANT_STREAM_SAY`, `ExecuteRequest.stream_tool_text`), so a channel that follows the turn
  * can show the first words before the step that says them has ended. The message itself is still the `say` that runs when the step
  * is whole; what streams is a preview of it.

@@ -184,9 +184,9 @@ describe("assistant role profile", { skip }, () => {
     assert.ok(!/now is \d{4}-/.test(task.system_append), "nor the time of this turn");
     assert.equal(task.skills, undefined);
     assert.equal(task.skip_platform_defaults, true, "no default MCP server or skill list for a router");
-    // Quick by default (`router-speed.ts`): little thinking, and its say published while the model writes it.
-    assert.equal(task.effort, "low");
+    // Its say published while the model writes it (`router-speed.ts`); the effort is the model's own unless the deployment names one.
     assert.deepEqual(task.stream_tool_text, ["mcp__assistant__say"]);
+    assert.equal(task.effort, undefined);
   });
 
   test("A1c marketplace tools a message named are not resolved for a router, and are for a worker", async () => {

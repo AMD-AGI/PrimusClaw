@@ -133,8 +133,9 @@ async function streamingTurn(
   // Each attempt gets its own budget, not the remainder of the previous one's.
   const t0 = Date.now();
   // Tools whose `text` the caller reads as it is written (`StreamTurnOptions.toolText`). Without eager input streaming the API holds a
-  // call's arguments back and sends them in one piece when the call is whole, so there would be nothing to read before the end.
-  const textTools = options?.toolText?.tools ?? new Set<string>();
+  // call's arguments back and sends them in one piece when the call is whole, so there would be nothing to read before the end. Claude
+  // models only: another model behind an Anthropic-style gateway is not asked to take a field it may not know.
+  const textTools = options?.toolText && /claude/i.test(model) ? options.toolText.tools : new Set<string>();
   const openStream = async (body: PreparedAnthropicRequest) => {
     const ctrl = new AbortController();
     activeCtrl = ctrl;
