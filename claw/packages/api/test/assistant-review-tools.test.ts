@@ -1481,9 +1481,9 @@ describe("assistant review tools", { skip }, () => {
       await client.close(); await server.close();
       return listed;
     };
-    assert.deepEqual(await names(false), ["claw_self_status", "say", "work_create", "work_recall", "work_send", "work_stop"]);
+    assert.deepEqual(await names(false), ["claw_self_status", "deliver_text", "say", "work_create", "work_recall", "work_send", "work_stop"]);
     assert.deepEqual(await names(true), [
-      "channel_action", "claw_self_status", "confirmation_answer", "review_mode_set", "review_restart", "review_start",
+      "channel_action", "claw_self_status", "confirmation_answer", "deliver_text", "review_mode_set", "review_restart", "review_start",
       "say", "work_create", "work_recall", "work_send", "work_stop",
     ]);
   });

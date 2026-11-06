@@ -5,7 +5,7 @@
  * The review-tools evaluation's own parts, offline, with a model that answers from a script: so that a score of 100%
  * against the gateway means the Router did what the case asks, and not that the scoring could not tell.
  *
- *   E1  the Router is given the review prompt and context, and the ten tools
+ *   E1  the Router is given the review prompt and context, and the eleven tools
  *   E2  a case is right only when the writes that went through are exactly the expected calls: a missing, extra or
  *       different argument fails, and a call the tools refused is not counted
  *   E3  the stand-in refuses what the real tools refuse: a report's turn, a number not in the message, a person without leave
@@ -33,10 +33,10 @@ const scripted = (calls: Array<{ name: string; input: Record<string, unknown> }>
   };
 };
 
-test("E1 the Router is given the review prompt and context, and the ten tools", async () => {
+test("E1 the Router is given the review prompt and context, and the eleven tools", async () => {
   const tools = (await reviewRouterTools()).map((t) => t.name.replace("mcp__assistant__", ""));
   assert.deepEqual(tools, [
-    "channel_action", "confirmation_answer", "review_mode_set", "review_restart", "review_start",
+    "channel_action", "confirmation_answer", "deliver_text", "review_mode_set", "review_restart", "review_start",
     "say", "work_create", "work_recall", "work_send", "work_stop",
   ]);
   const system = systemFor(byId("B4"));

@@ -7,7 +7,8 @@
  *
  *   SC5 say's schema has `sources` after `text` with citations on and not at all with them off; the `_meta` Brain sends is what the
  *       outbox payload carries, the model's `sources` argument never is, and the counter counts each outcome; a `sources` the
- *       model got wrong does not refuse the message
+ *       model got wrong in its form does not refuse the message, but a text whose [n] lost its source is refused (it would reach
+ *       the user as a number that links nowhere) and the say that goes out instead is the one counted
  *   SC6 the web client's event carries the same sources as the channel's payload
  *   SC7 a router turn's request cites with say, with the addresses the user wrote, and its prompt says how; a worker turn neither
  */
@@ -76,7 +77,14 @@ describe("say with citations, on a real Postgres", { skip }, () => {
       assert.deepEqual((say.inputSchema as any).properties.sources, { type: "array", items: { type: "string" }, description: SAY_SOURCES_PARAM },
         "the model is shown a list of addresses");
 
-      const text = "#309 已合入 [1]，CI 全绿 [2]。";
+      const lost = await router.callTool({
+        name: "say",
+        arguments: { text: "#309 已合入 [1]，CI 全绿 [2]。", sources: [PR, "https://made-up.example/ci"] },
+        _meta: meta([pr(1), pr(3)], { not_in_turn: 1, invalid: 0, over_cap: 0 }),
+      });
+      assert.equal(lost.isError, true, "[2] lost its address: the user would see a number that links nowhere");
+      assert.match(JSON.stringify(lost.content), /citation_not_found/);
+      const text = "#309 已合入 [1]，CI 全绿。";
       const res = await router.callTool({
         name: "say",
         arguments: { text, sources: [PR, "https://made-up.example/ci"] },
@@ -99,7 +107,7 @@ describe("say with citations, on a real Postgres", { skip }, () => {
     assert.deepEqual(typos.map((p) => [p.text, p.sources]), Array.from({ length: 4 }, () => ["typed wrong [1]", [pr(1)]]));
     assert.equal(rest[4].sources, undefined, "a text with a link of its own cites nothing");
     assert.equal(await counted("suppressed_link_text") - before.suppressed, 1);
-    assert.equal(cited.text, "#309 已合入 [1]，CI 全绿 [2]。", "the text as written");
+    assert.equal(cited.text, "#309 已合入 [1]，CI 全绿。", "the text as written");
     assert.deepEqual(cited.sources, [pr(1)]);
     assert.equal(fabricated.sources, undefined, "the model's own addresses are never sources");
     assert.equal(await counted("cited") - before.cited, 1 + 4);

@@ -47,6 +47,7 @@ import { startWorkerRun } from "./run-started.js";
 import { githubEventsEnabled } from "./github-events.js";
 import { jobWatchesEnabled } from "./job-watch.js";
 import { renderRouterProactiveSection, ROUTER_PROACTIVE_PROMPT_VERSION } from "./proactive-prompt.js";
+import { renderRouterWritingSection, ROUTER_WRITING_PROMPT_VERSION } from "./writing-prompt.js";
 import { devenvToolsOn } from "./devenv-tools.js";
 import { renderRouterSelfSection, ROUTER_SELF_PROMPT_VERSION, selfStatusOn } from "./self-status.js";
 import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
@@ -272,6 +273,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // from turn to turn (the item list, what waits for the user, what the channel sent) goes with the message instead.
     const github = lookups.githubTools.length > 0;
     withSystemAppend(task, renderRouterPrompt({ servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null, githubBinding: readGithubMcpSettings().binding }));
+    // What it writes itself (a document, a draft, a translation), and how a file or a comment of its reaches the user (`writing-prompt.ts`).
+    withSystemAppend(task, renderRouterWritingSection({ comment: assistantSchedulesOn() }));
     const state = [renderRouterItems(await routerManifest(role.userId), await askedOfOthersManifest(role.userId))];
     // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
     const held = renderHeldForPerson(await heldForPersonManifest(role.userId));
@@ -330,7 +333,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
       ...(proactiveSection ? { proactive: ROUTER_PROACTIVE_PROMPT_VERSION } : {}),
       ...(devenv ? { devenv: ROUTER_DEVENV_PROMPT_VERSION } : {}),
-      read: ROUTER_READ_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),
+      read: ROUTER_READ_PROMPT_VERSION, write: ROUTER_WRITING_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),
       ...(cite ? { cite: ROUTER_CITE_PROMPT_VERSION } : {}), self: ROUTER_SELF_PROMPT_VERSION, selfStatus: self,
     }, "assistant.router_turn");
   } else {

@@ -33,6 +33,11 @@ import { nextFireAfter } from "../triggers/schedule.js";
 import {
   deleteTrigger, insertTrigger, listTriggers, parseTriggerInput, sealTriggerCredentials, triggerView, type TriggerInput,
 } from "../triggers/store.js";
+import { redactPublicJson } from "../events/redaction.js";
+import { CLAW_WRITE_MARK } from "../github-mcp/tools.js";
+import { resolveGithubToken } from "../github-mcp/mcp.js";
+import { readGithubMcpSettings } from "../github-mcp/settings.js";
+import { GithubClient } from "../github-review/github.js";
 import { turnMessage } from "./inbound.js";
 import { recordWriteConfirm, type SayDeps } from "./outbound.js";
 import { confirmationRef } from "./prompts.js";
@@ -52,7 +57,13 @@ export const MAX_PENDING_CONFIRMATIONS = 10;
  */
 export const ROUTER_PROMPT_MAX = 1500;
 
-export type ScheduleKind = "trigger_create" | "trigger_cancel";
+/**
+ * What a card holds: a scheduled task to create or cancel, or a comment the router drafted for a pull request or issue
+ * (`githubCommentTool`), posted as the user only when they press it.
+ */
+export type ScheduleKind = "trigger_create" | "trigger_cancel" | "github_comment";
+/** The longest comment the router puts on a card: the card shows all of it, since the user approves exactly what is posted. */
+export const ROUTER_COMMENT_MAX = 4000;
 
 /** The router's schedule tools: whenever a trigger may be made by a model at all. */
 export function assistantSchedulesOn(): boolean {
@@ -91,13 +102,23 @@ interface CreateParams {
   next_run?: string | null;
 }
 interface CancelParams { trigger_id: string; name: string; schedule: string; timezone: string }
+/** A comment to post: where, and its whole text as the card shows it. */
+interface CommentParams { repo: string; number: number; body: string }
 
 const createParams = (i: TriggerInput): CreateParams => ({
   name: i.name, prompt: i.prompt, schedule: i.schedule, timezone: i.timezone, until: i.endsAt ? i.endsAt.toISOString() : null, max_runs: i.maxRuns,
 });
 
 /** What the person is shown: the whole of what would be done, in the language they wrote in. */
-export function confirmText(kind: ScheduleKind, p: CreateParams | CancelParams, ref: string, zh: boolean, nextRun: Date | null): string {
+export function confirmText(
+  kind: ScheduleKind, p: CreateParams | CancelParams | CommentParams, ref: string, zh: boolean, nextRun: Date | null,
+): string {
+  if (kind === "github_comment") {
+    const c = p as CommentParams;
+    return zh
+      ? `要以你的 GitHub 账号在 ${c.repo}#${c.number} 上发这条评论吗？\n---\n${c.body}\n---\n点下面的「发表」确认，或回复 批准 #${ref}。`
+      : `Post this comment on ${c.repo}#${c.number} as your GitHub account?\n---\n${c.body}\n---\nPress "Post" below to confirm, or reply approve #${ref}.`;
+  }
   if (kind === "trigger_cancel") {
     const c = p as CancelParams;
     return zh
@@ -113,7 +134,7 @@ export function confirmText(kind: ScheduleKind, p: CreateParams | CancelParams, 
 }
 
 const allowLabel = (kind: ScheduleKind, zh: boolean): string =>
-  kind === "trigger_create" ? (zh ? "创建" : "Create") : (zh ? "取消它" : "Cancel it");
+  kind === "trigger_create" ? (zh ? "创建" : "Create") : kind === "github_comment" ? (zh ? "发表" : "Post") : (zh ? "取消它" : "Cancel it");
 
 /** The router's turn, live, answering a message the user wrote (not a report), before which it has read nothing untrusted. */
 async function proposingTurn(q: Querier, claims: AssistantTokenClaims): Promise<{ userId: string; zh: boolean }> {
@@ -136,7 +157,8 @@ const SAME_CARD_SQL = "SELECT *, expires_at <= NOW() AS lapsed FROM claw_assista
  * model when that card is no longer open).
  */
 async function propose(
-  q: Querier, claims: AssistantTokenClaims, userId: string, zh: boolean, kind: ScheduleKind, params: CreateParams | CancelParams, nextRun: Date | null,
+  q: Querier, claims: AssistantTokenClaims, userId: string, zh: boolean, kind: ScheduleKind, params: CreateParams | CancelParams | CommentParams,
+  nextRun: Date | null,
 ): Promise<{ row: Record<string, any>; announce: (() => Promise<void>) | null; subscribers: number }> {
   const pending = Number((await q(
     "SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations WHERE user_id = $1 AND status = 'pending' AND expires_at > NOW()", [userId],
@@ -261,6 +283,71 @@ export async function triggerCancelTool(claims: AssistantTokenClaims, args: { tr
   return proposed(out.row, out.subscribers, "cancelled");
 }
 
+/**
+ * The pull request or issue a `pr` argument names: `owner/repo#123`, or its https://github.com URL. Null for anything else.
+ */
+export function commentTarget(raw: unknown): { repo: string; number: number } | null {
+  const s = typeof raw === "string" ? raw.trim() : "";
+  const m = /^(?:https:\/\/github\.com\/)?([A-Za-z0-9-]{1,39})\/([A-Za-z0-9._-]{1,100})(?:#|\/(?:pull|issues)\/)(\d{1,9})\/?$/.exec(s);
+  if (!m || m[2] === "." || m[2] === "..") return null;
+  const number = Number(m[3]);
+  return number > 0 ? { repo: `${m[1]}/${m[2]}`, number } : null;
+}
+
+/**
+ * Put a comment the router drafted to the user as a card: nothing is posted by the call. Pressing the card (or replying 批准 #ref)
+ * posts exactly the text shown, as the user's GitHub account (`githubCommentPorts.post`). So a draft never needs a worker or a
+ * sandbox, and the user sees the words before anything is written under their name.
+ */
+export async function githubCommentTool(claims: AssistantTokenClaims, args: { pr?: unknown; body?: unknown }): Promise<Record<string, unknown>> {
+  requireRouter(claims);
+  const target = commentTarget(args.pr);
+  if (!target) throw new ToolRefused("invalid_arguments", "pr is owner/repo#number or the pull request's https://github.com URL");
+  // Masked as the card's text is (`outbound.ts`), before it is stored: what is posted is exactly what the user was shown, never a key the
+  // card showed as <redacted>.
+  const body = typeof args.body === "string" ? String(redactPublicJson(args.body.trim()) ?? "") : "";
+  if (!body) throw new ToolRefused("invalid_arguments", "body is the whole comment, and it is empty");
+  if (body.length > ROUTER_COMMENT_MAX) {
+    throw new ToolRefused("comment_too_long", `a comment put on a card is at most ${ROUTER_COMMENT_MAX} characters, so the user can read all of it: write it shorter`);
+  }
+  const params: CommentParams = { ...target, body };
+  const out = await inTransaction(async (q) => {
+    const { userId, zh } = await proposingTurn(q, claims);
+    await q("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [userId]);
+    return propose(q, claims, userId, zh, "github_comment", params, null);
+  });
+  if (out.announce) await out.announce();
+  return { ...proposed(out.row, out.subscribers, "posted"), pr: `${target.repo}#${target.number}` };
+}
+
+/** Posting a confirmed comment, behind a seam so a test can stand in for GitHub. */
+export const githubCommentPorts = {
+  /** Post `body` on `repo#number` as `userId`'s GitHub account: the comment's address, or a refusal code. */
+  post: async (userId: string, p: CommentParams): Promise<{ url: string } | { error: string }> => {
+    const settings = readGithubMcpSettings();
+    let cred;
+    try {
+      cred = await resolveGithubToken(db, userId, { binding: settings.binding, purpose: "assistant:github_comment" });
+    } catch {
+      return { error: "github_unavailable" };
+    }
+    if (cred.token === null) return { error: cred.missing === "expired" ? "github_binding_expired" : "no_github_token" };
+    const gh = new GithubClient({ token: cred.token, apiUrl: settings.apiUrl });
+    try {
+      const [owner, name] = p.repo.split("/");
+      const res = await gh.request<{ html_url?: string }>(
+        "POST", `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/issues/${p.number}/comments`,
+        { body: { body: `${p.body}\n\n${CLAW_WRITE_MARK}` } },
+      );
+      return { url: String(res.json?.html_url ?? "") };
+    } catch (err) {
+      const status = (err as { status?: unknown })?.status;
+      logger.warn({ userId, repo: p.repo, status }, "assistant.github_comment_failed");
+      return { error: typeof status === "number" ? `github_${status}` : "github_error" };
+    }
+  },
+};
+
 // --- The answer ------------------------------------------------------------------------------------------------------
 
 /** A refusal of the decision itself, for the route to answer with its status. */
@@ -313,6 +400,11 @@ export async function decideConfirmation(input: {
     )).rows[0] as Record<string, any>;
     if (row.lapsed) return outcome(await close("expired", null), false);
     if (input.decision === "deny") return outcome(await close("denied", null), true);
+    if (row.kind === "github_comment") {
+      const posted = await githubCommentPorts.post(input.userId, row.params as CommentParams);
+      logger.info({ userId: input.userId, via: input.via, ok: "url" in posted }, "assistant.github_comment_decided");
+      return outcome(await close("url" in posted ? "done" : "failed", posted), true);
+    }
     if (row.kind === "trigger_cancel") {
       const gone = await deleteTrigger(input.userId, String(row.params.trigger_id), q);
       return outcome(await close(gone ? "done" : "failed", gone ? { trigger_id: row.params.trigger_id } : { error: "not_found" }), true);

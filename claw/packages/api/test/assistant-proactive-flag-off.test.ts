@@ -28,7 +28,7 @@ test("with the switches off nothing of acting later is offered, started or regis
   const [a, b] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "t", version: "1" });
   await Promise.all([server.connect(a), client.connect(b)]);
-  assert.deepEqual((await client.listTools()).tools.map((x) => x.name).sort(), ["claw_self_status", "say", "work_create", "work_recall", "work_send", "work_stop"]);
+  assert.deepEqual((await client.listTools()).tools.map((x) => x.name).sort(), ["claw_self_status", "deliver_text", "say", "work_create", "work_recall", "work_send", "work_stop"]);
   await client.close();
 
   assert.equal(sch.assistantSchedulesOn(), false);

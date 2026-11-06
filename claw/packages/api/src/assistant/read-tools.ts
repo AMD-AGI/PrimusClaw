@@ -71,8 +71,11 @@ export function readToolPatterns(server: string): string[] {
  * writes, a stop, model defaults, and any tool added later) is refused by Brain for the rest of that turn, because the
  * person's message covers what they wrote, not what the model read afterwards. Named by what is allowed, so a new tool is refused
  * until it is listed here.
+ * `deliver_text` speaks as `say` does, with a file only the user gets (`text-delivery.ts`). `github_comment` writes nothing: it shows
+ * the user the exact comment on a card, and only their press posts it (`schedules.ts`); a draft is written from what was read, so it
+ * must come after the reads.
  */
-export const AFTER_READ_TOOLS = ["say", "work_recall", "memory_recall", "devenv_list", "claw_self_status"] as const;
+export const AFTER_READ_TOOLS = ["say", "work_recall", "memory_recall", "devenv_list", "claw_self_status", "deliver_text", "github_comment"] as const;
 
 /**
  * The GitHub reads a router turn may call (`github-mcp/tools.ts`): finding and reading pull requests, issues, their checks and
