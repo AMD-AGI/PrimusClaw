@@ -738,6 +738,14 @@ export const TRIGGER_MCP_SERVER = "schedules";
 export const TRIGGER_MCP_PATH = "/v1/internal/trigger-mcp";
 export const GITHUB_MCP_SERVER = "github";
 export const GITHUB_MCP_PATH = "/v1/internal/github/mcp";
+/**
+ * The reads of the GitHub tools whose answer is a list (`api/src/github-mcp/tools.ts`), and how many characters such an answer
+ * may take. The tools fit a list into that many, and say how many matches there are and how many they show; Brain keeps an
+ * answer of one of them whole up to it (`truncateToolResult`), where any other result is cut to its head and its tail at a few
+ * thousand characters. A list cut in its middle loses items with nothing to say which: "my open pull requests" answered 15 of 22.
+ */
+export const GITHUB_LIST_TOOLS: readonly string[] = ["issue_search", "pr_list", "issue_list", "repo_list", "code_search"];
+export const GITHUB_LIST_MAX_CHARS = 20_000;
 const PLATFORM_MCP_PATHS: Readonly<Record<string, string>> = {
   [TRIGGER_MCP_SERVER]: TRIGGER_MCP_PATH,
   [GITHUB_MCP_SERVER]: GITHUB_MCP_PATH,

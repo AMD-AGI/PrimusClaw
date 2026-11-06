@@ -60,6 +60,17 @@ test("E1 a session's stored events become what the graders read", () => {
   assert.equal(traceOf(ROWS, "other").calls.length, 0, "another turn's events are not this turn's");
 });
 
+test("E1b a call whose result carries Brain's is_error failed, though its status says it returned", () => {
+  const rows = [
+    row(1, { type: "toolUsed", tool: "mcp__github__issue_search", status: "start", actionId: "s1", argumentsDetail: { mcp__github__issue_search: { query: "repo:o/r is:pr" } } }),
+    row(2, { type: "toolUsed", tool: "mcp__github__issue_search", status: "success", is_error: true, actionId: "s1", description: "GitHub answered 422: ..." }),
+    row(3, { type: "toolUsed", tool: "mcp__github__pr_list", status: "start", actionId: "s2", argumentsDetail: { mcp__github__pr_list: { repo: "o/r" } } }),
+    row(4, { type: "toolUsed", tool: "mcp__github__pr_list", status: "success", actionId: "s2", description: "{\"total_count\":8}" }),
+    row(5, { type: "exec_complete", failed: false, final_text: "8" }),
+  ];
+  assert.deepEqual(traceOf(rows).calls.map((c) => [c.name, c.ok]), [["mcp__github__issue_search", false], ["mcp__github__pr_list", true]]);
+});
+
 test("E2 a turn that never ended is a failure", () => {
   assert.equal(traceOf(ROWS.filter((r) => r.data.type !== "exec_complete")).failed, true);
   assert.equal(traceOf([...ROWS.slice(0, -1), row(15, { type: "exec_complete", failed: true })]).failed, true);

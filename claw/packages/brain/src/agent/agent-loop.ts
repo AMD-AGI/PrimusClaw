@@ -25,6 +25,7 @@ import {
   type RecreateHandsResult,
 } from "./index.js";
 import type { Message, ReasoningEffort, ToolSchema, TokenUsage, EventCallback } from "@claw/protocol";
+import { GITHUB_LIST_MAX_CHARS, GITHUB_LIST_TOOLS, GITHUB_MCP_SERVER } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import { safePreview } from "@claw/utils";
 import {
@@ -487,9 +488,18 @@ export function subAgentTurnCap(requested: number | undefined, parentMaxTurns: n
 export const GITHUB_REVIEW_READ_TOOL = "mcp__github_review__gh_pr_get";
 export const GITHUB_REVIEW_READ_MAX_CHARS = 24_000;
 
+/**
+ * The list reads of the API's `github` server fit a list into GITHUB_LIST_MAX_CHARS and say how many items they hold and how many
+ * there are (`@claw/protocol`), so an answer of theirs is kept whole up to that, with room for the envelope. Under the generic cap,
+ * head and tail, "list my open pull requests" lost the 7 of 22 in the middle with nothing to say which.
+ */
+const GITHUB_LIST_READS = new Set(GITHUB_LIST_TOOLS.map((t) => `mcp__${GITHUB_MCP_SERVER}__${t}`));
+export const GITHUB_LIST_READ_MAX_CHARS = GITHUB_LIST_MAX_CHARS + 1_000;
+
 /** The generic cap, or a tool's own when it pages its answers itself. */
-function resultCapFor(toolName: string | undefined): number {
-  return toolName === GITHUB_REVIEW_READ_TOOL ? GITHUB_REVIEW_READ_MAX_CHARS : TOOL_RESULT_MAX_CHARS;
+export function resultCapFor(toolName: string | undefined): number {
+  if (toolName === GITHUB_REVIEW_READ_TOOL) return GITHUB_REVIEW_READ_MAX_CHARS;
+  return toolName !== undefined && GITHUB_LIST_READS.has(toolName) ? GITHUB_LIST_READ_MAX_CHARS : TOOL_RESULT_MAX_CHARS;
 }
 
 export function truncateToolResult(text: string, toolName?: string, savedAt?: string): string {
@@ -2444,6 +2454,10 @@ class AgentLoopRunner {
     await this.onEvent({
         type: "toolUsed", tool: toolName, actionId: toolId, status: "success",
         description: resultText.slice(0, 2000),
+        // The tool's own error bit, which the counts above read: its answer was a failure (a refused read, a tool that threw),
+        // not data. `status` stays "success" (the call returned, and its text is the tool_result a later turn is rebuilt with);
+        // without this a failed read was recorded in the session as one that read something.
+        ...(toolOutcome.isError ? { is_error: true } : {}),
         // The file a client offers for download (tools/deliver-file.ts).
         ...(toolOutcome.delivery ? { delivery: toolOutcome.delivery } : {}),
       });

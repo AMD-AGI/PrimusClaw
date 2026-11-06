@@ -273,3 +273,40 @@ test("gh_pr_get of the github_review server is cut only past its own bound; the 
   ];
   for (const [tool, text, whole] of cases) assert.equal(truncateToolResult(text, tool) === text, whole, `${tool} ${text.length}`);
 });
+
+test("the list reads of the API's github server are kept whole up to their own bound; the same text from any other tool at the generic cap", async () => {
+  const { GITHUB_LIST_READ_MAX_CHARS } = await import("../src/agent/agent-loop.js");
+  const { GITHUB_LIST_MAX_CHARS, GITHUB_LIST_TOOLS } = await import("@claw/protocol");
+  // What the tools may answer, with its envelope: a list of 22 pull requests is about 7000 characters.
+  const list = "l".repeat(GITHUB_LIST_MAX_CHARS + 200);
+  // [tool, text, kept whole]
+  const cases: Array<[string, string, boolean]> = [
+    ...GITHUB_LIST_TOOLS.map((t): [string, string, boolean] => [`mcp__github__${t}`, list, true]),
+    ["mcp__github__issue_search", "l".repeat(GITHUB_LIST_READ_MAX_CHARS + 1), false],
+    // A read of the same server that is not a list, another server's tool of the same name, and a shell: the generic cap.
+    ["mcp__github__pr_diff", list, false],
+    ["mcp__other__issue_search", list, false],
+    ["bash", list, false],
+  ];
+  for (const [tool, text, whole] of cases) assert.equal(truncateToolResult(text, tool) === text, whole, `${tool} ${text.length}`);
+});
+
+test("a call whose tool answered its own error is recorded with is_error on its result event; one that worked is not", async () => {
+  const session = scriptedSession([
+    { content: [toolUse("t1", "mcp__github__issue_search", { query: "repo:o/r is:pr" }), toolUse("t2", "mcp__github__pr_list", { repo: "o/r" })], stopReason: "tool_use" },
+    { content: [text("done")], stopReason: "end_turn" },
+  ]);
+  const router = {
+    route: async (name: string, _input: unknown, _signal: unknown, outcome?: { isError: boolean }) => {
+      if (name === "mcp__github__issue_search" && outcome) outcome.isError = true;
+      return name === "mcp__github__issue_search" ? "GitHub answered 422: refused" : "{\"total_count\":8}";
+    },
+    spillToolResult: async () => null,
+    setHands: () => {},
+  } as unknown as ToolRouter;
+  const events: Array<Record<string, unknown>> = [];
+  const tools = ["mcp__github__issue_search", "mcp__github__pr_list"].map((name) => ({ name, description: name, input_schema: { type: "object", properties: {} } })) as unknown as ToolSchema[];
+  await agentLoop([{ role: "user", content: "how many" }], tools, opts(router, session, { onEvent: async (e) => { events.push(e as Record<string, unknown>); } }));
+  const ended = events.filter((e) => e.type === "toolUsed" && e.status !== "start").map((e) => [e.tool, e.status, e.is_error]);
+  assert.deepEqual(ended, [["mcp__github__issue_search", "success", true], ["mcp__github__pr_list", "success", undefined]]);
+});

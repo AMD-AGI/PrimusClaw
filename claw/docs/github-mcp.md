@@ -11,9 +11,29 @@ server, hosted by the API. Off by default; nothing is registered or offered whil
 
 | Reads (run without asking) | Writes (each waits for the user's decision) |
 |---|---|
-| `repo_get_file`, `repo_list`, `pr_get`, `pr_list`, `pr_files`, `pr_diff`, `pr_reviews`, `checks_list`, `job_logs`, `issue_get`, `issue_list`, `issue_search`, `review_threads_list`, `code_search` | `issue_comment`, `issue_create`, `pr_create`, `pr_update`, `review_thread_reply`, `review_thread_resolve` |
+| `repo_get_file`, `repo_list`, `pr_get`, `pr_list`, `pr_files`, `pr_diff`, `pr_reviews`, `checks_list`, `job_logs`, `issue_get`, `issue_list`, `issue_search`, `review_threads_list`, `code_search` | `issue_comment`, `issue_create`, `pr_create`, `pr_update`, `review_thread_reply`, `review_thread_resolve`, `checks_rerun_failed`, `pr_request_reviewers`, `labels_set` |
 
 Merging is not a tool here: it belongs to GitHub review (`github-review.md`), which has the gates for it.
+
+## Lists
+
+The list reads (`issue_search`, `pr_list`, `issue_list`, `repo_list`, `code_search`) answer
+`{ total_count, shown, complete, next_page?, note?, items }`: how many matches there are where that is known (a
+search's count, or a list read to its end), how many the answer holds, and whether that is all of them. An answer
+holds at most `GITHUB_LIST_MAX_CHARS` (`@claw/protocol`) of items, and Brain keeps the answer of these tools whole up
+to that bound, where any other tool's result is cut to its head and tail; past it the answer says how many it left
+out. Pages are 50 by default, up to 100.
+
+- `pr_list` `state`: `open` (default) and `all` newest first; `closed` most recently closed first; `merged` only the
+  merged ones, most recently merged first. `author` keeps one person's. Closed and merged ones, and one author's, are
+  read in pages of 100 (at most 5) and ordered or filtered here; reading stops once nothing unread can come first.
+- `checks_list` gives a GitHub Actions job's `run_id`, which `checks_rerun_failed` takes.
+- A search narrowed with `repo:`, `org:` or `user:` that GitHub refuses (422; GitHub refuses some fine-grained tokens
+  such a search even where they read the repository) fails with words that say to list the repository with `pr_list`
+  or `issue_list` instead.
+
+A failed read is the tool's own error (`isError`), and Brain marks its result event `is_error: true` (the event's
+`status` stays `success`: the call returned, and its text is what a later turn is rebuilt with).
 
 ## How it is wired
 

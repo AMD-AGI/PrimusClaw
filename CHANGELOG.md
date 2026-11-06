@@ -28,6 +28,9 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Three GitHub writes, each held for the user's decision like every write of the `github` server: `checks_rerun_failed` (run
+  again the failed jobs of a GitHub Actions workflow run; `checks_list` now gives a job's `run_id`), `pr_request_reviewers` (people
+  and teams) and `labels_set` (the whole list of an issue's or pull request's labels). None is a router read.
 - Citations for the assistant router's answers, behind `CLAW_ASSISTANT_CITATIONS` (default off). The router writes [1], [2] in its
   `say` and names each number's address in `say`'s new `sources` argument; the new `ExecuteRequest.cite` makes Brain keep the sources
   the turn's own lookups returned (`web_search` hits and what the API's GitHub server lists in its results' `_meta["claw/sources"]`:
@@ -785,6 +788,15 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- The GitHub list reads (`issue_search`, `pr_list`, `issue_list`, `repo_list`, `code_search`) answer the whole list a question
+  asks for: `{ total_count, shown, complete, next_page?, items }`, pages of 50 by default (up to 100), and an answer of at most
+  `GITHUB_LIST_MAX_CHARS` that Brain keeps whole (any other result is still cut to its head and tail at 6000 characters, which
+  is how "my 22 open pull requests" was answered with about 15). `pr_list` takes `state: merged` (only merged ones, most
+  recently merged first; "the 3 latest merged" was read in creation order and named one merged before another), orders
+  `closed` by when each closed, and takes `author`. A search narrowed with `repo:`, `org:` or `user:` that GitHub refuses
+  (422, for some fine-grained tokens) says to list the repository with `pr_list` or `issue_list` instead.
+- A tool call whose result was the tool's own error is marked `is_error: true` on its `toolUsed` result event; its `status`
+  is still `success`. A failed GitHub read was recorded as one that read something, and the evaluation counted it so.
 - An app run cancelled while its sandbox is still being created, typically by its session being deleted seconds after
   the run was submitted, no longer leaves that sandbox running until its workload timeout. The run's signal now reaches
   the sandbox ensure: no create is sent once it has fired, and the wait for a workload that exists (one whose create was
