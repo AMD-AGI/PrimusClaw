@@ -255,6 +255,32 @@ describe("notification outbox", { skip }, () => {
       assert.equal(after.failing_since, null, "recovery clears the outage clock");
     });
 
+    test("a 410 drops that event at once and is not a failure of the subscription, even past the disable age", async () => {
+      const sub = await subscribe();
+      const subRow = async () => (await q("SELECT enabled, auto_disabled, consecutive_failures, failing_since FROM claw_notification_subscriptions WHERE subscription_id = $1", [sub.id])).rows[0] as any;
+      // A receiver that has been failing for a day: one more failure would disable it.
+      await q("UPDATE claw_notification_subscriptions SET failing_since = NOW() - interval '25 hours', consecutive_failures = 3");
+      await q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload) VALUES ('ev-gone', $1, '{}'::jsonb)", [sub.id]);
+      status = 410;
+      assert.deepEqual(await deliver(), { delivered: 0, failed: 1 });
+      const r = (await rows())[0];
+      assert.ok(r.dropped_at, "dropped on the first answer, not after a day of retries");
+      assert.deepEqual([r.last_status, r.attempts, r.delivered_at], ["http_410", 1, null]);
+      const sub410 = await subRow();
+      assert.deepEqual([sub410.enabled, sub410.auto_disabled, sub410.consecutive_failures], [true, false, 3], "not counted, not disabled");
+      await makeDue();
+      sent.length = 0;
+      assert.deepEqual(await deliver(), { delivered: 0, failed: 0 }, "never sent again");
+      assert.equal(sent.length, 0);
+
+      // Any other refusal is still the subscription's failure.
+      await q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload) VALUES ('ev-500', $1, '{}'::jsonb)", [sub.id]);
+      status = 500;
+      await deliver();
+      const after = await subRow();
+      assert.deepEqual([after.enabled, after.consecutive_failures], [false, 4]);
+    });
+
     test("a subscription with no success for more than a day is disabled, and its pending rows are then dropped", async () => {
       const sub = await subscribe();
       await q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload) VALUES ('ev-x', $1, '{}'::jsonb)", [sub.id]);

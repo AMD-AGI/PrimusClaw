@@ -358,6 +358,37 @@ function isStale(client: pg.ClientBase): boolean {
 export function noteFailover(err: unknown): void {
   failoverGeneration += 1;
   logger.warn({ code: (err as { code?: unknown })?.code, generation: failoverGeneration }, "db.failover_detected");
+  for (const watcher of [...failoverWatchers]) {
+    try {
+      watcher();
+    } catch (watcherErr) {
+      logger.error({ err: watcherErr }, "db.failover_watcher_failed");
+    }
+  }
+}
+
+const failoverWatchers = new Set<() => void>();
+
+/**
+ * A failover this process noticed after `client` connected, as an error naming it; undefined when there was none.
+ *
+ * For a holder of something that lives on one server -- an advisory lock -- whose connection may still be up: a
+ * failover noticed on any other connection says the server this one reached may have stopped being the primary, and a
+ * lock held there fences nothing on the new one, where another replica can take the same lock. A connection that is
+ * gone is `connectionLost`; this is the one still standing on a server the rest of the process has left. Stays set:
+ * the generation only goes up.
+ */
+export function failoverSince(client: pg.ClientBase): Error | undefined {
+  if (!isStale(client)) return undefined;
+  return new Error(
+    `a database failover was noticed after this connection was made (connection generation ${clientGeneration.get(client)}, now ${failoverGeneration})`,
+  );
+}
+
+/** Be told each time a failover is noticed (`noteFailover`). Returns an unsubscribe. A watcher that throws is logged. */
+export function onFailover(watcher: () => void): () => void {
+  failoverWatchers.add(watcher);
+  return () => failoverWatchers.delete(watcher);
 }
 
 /**

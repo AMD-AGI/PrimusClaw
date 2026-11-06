@@ -16,7 +16,7 @@
  */
 import { randomUUID } from "node:crypto";
 import pino from "pino";
-import { CLAW_ASSISTANT_SAY_MAX_PER_HOUR, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_SAY_MAX_PER_HOUR, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { publishEvent } from "../events/store.js";
 import { HOLD_SECONDS, heldStatus, turnAnnouncedStart, turnToldStart } from "./say-hold.js";
@@ -217,6 +217,7 @@ const ANNOUNCED_HERE_MAX = 1_000;
 async function announce(stored: Stored, deps: SayDeps, turnMessageId?: string, held = false): Promise<void> {
   announcedHere.add(stored.sayId);
   if (announcedHere.size > ANNOUNCED_HERE_MAX) announcedHere.delete(announcedHere.values().next().value as string);
+  if (stored.subscribers === 0 && CLAW_NOTIFICATIONS_ENABLED) await reportUnreachable(stored);
   if (stored.sessionId && !(held && stored.subscribers > 0)) await publishSayEvent(stored.sessionId, stored.sayId, stored.payload, deps, turnMessageId);
   // Not awaited: the caller is a model's tool call, and a slow receiver is not its wait.
   if (stored.subscribers > 0) void (deps.kick ?? kickDelivery)().catch((err) => logger.error({ err }, "assistant.say_kick_failed"));
@@ -248,6 +249,43 @@ export async function publishSayEvent(
   } catch (err) {
     // The message is stored and queued; a web client that missed the live event reads it later.
     logger.error({ err, sayId }, "assistant.say_event_publish_failed");
+  }
+}
+
+/** Where the unreachable-message warning goes: a seam, so a test can see which messages were warned about. */
+export const outboundLog = {
+  unreachable(fields: { user_id: string; item_id: string | null; say_id: string; type: string }): void {
+    logger.warn(
+      fields,
+      "assistant.say_unreachable (stored with no notification subscription for its type: no channel the user reads on was sent it)",
+    );
+  },
+};
+
+/**
+ * A message stored with no subscription to carry it: counted every time, and said in the log -- with the user and the
+ * item -- once per user per clock hour, so one user whose channel is missing (an evaluation identity that says a lot)
+ * does not fill the log. The one said is the hour's earliest such message of that user, decided from the stored rows,
+ * so four replicas agree on it without a lock: at most one line per user an hour, fleet-wide. Never throws: the
+ * message is stored and announced whatever this finds.
+ */
+async function reportUnreachable(stored: Stored): Promise<void> {
+  const { payload } = stored;
+  metrics.onAssistantSayUnreachable(payload.type);
+  try {
+    const first = (await db.query(
+      `SELECT s.say_id::text AS say_id FROM claw_assistant_says s
+        WHERE s.user_id = $1
+          AND s.created_at >= date_trunc('hour', (SELECT created_at FROM claw_assistant_says WHERE say_id = $2::uuid))
+          AND NOT EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text)
+        ORDER BY s.created_at, s.say_id
+        LIMIT 1`,
+      [payload.user_id, stored.sayId],
+    )).rows[0] as { say_id: string } | undefined;
+    if (first?.say_id !== stored.sayId) return;
+    outboundLog.unreachable({ user_id: payload.user_id, item_id: payload.item?.item_id ?? null, say_id: stored.sayId, type: payload.type });
+  } catch (err) {
+    logger.error({ err, sayId: stored.sayId }, "assistant.say_unreachable_check_failed");
   }
 }
 
@@ -701,6 +739,92 @@ export async function recordWriteConfirm(
   });
   if (!stored) return null;
   return { sayId: stored.sayId, subscribers: stored.subscribers, announce: () => announce(stored, deps) };
+}
+
+/** An item closed by its answer, recently enough that saying it still helps (over `claw_work_items w`). */
+export const ANSWERED_UNSAID_SQL = "w.board_state = 'done' AND w.outcome = 'answered' AND w.closed_at > NOW() - INTERVAL '1 day'";
+
+/**
+ * The event type a stored say `s` goes out as: `work_item.needs_you` for the fallback `recordNeedsYouFallback` stores, told
+ * by its id -- `deterministicEventId("work_item.needs_you", item_id, attention_seq)`, computed here the same way -- and
+ * `assistant.say` for every other say, a system notice about an item included.
+ */
+const SAY_EVENT_TYPE_SQL = `CASE WHEN s.fallback AND s.item_id IS NOT NULL AND s.item_attention_seq IS NOT NULL
+             AND s.say_id = substr(encode(sha256(
+                   convert_to('work_item.needs_you', 'UTF8') || '\\x00'::bytea || convert_to(s.item_id, 'UTF8')
+                   || '\\x00'::bytea || convert_to(s.item_attention_seq::text, 'UTF8')), 'hex'), 1, 32)::uuid
+           THEN 'work_item.needs_you' ELSE 'assistant.say' END`;
+
+/**
+ * A say, `s`, that has not reached its user and is not on its way: not delivered, and no outbox row for it delivered or
+ * still queued without a failure. One whose sends all failed or were dropped (a 410, a day of retries) is unreached too.
+ */
+const SAY_UNREACHED_SQL = `s.delivered_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM claw_notification_outbox o
+                WHERE o.event_id = s.say_id::text
+                  AND (o.delivered_at IS NOT NULL OR (o.dropped_at IS NULL AND o.last_status IS NULL)))`;
+
+/**
+ * A subscription, `n`, of the say's owner that can carry the say `s` and was never handed it: enabled, taking its
+ * type, with no outbox row for it. A subscription that was handed it once is not handed it again, so a resend ends.
+ */
+const SAY_SENDABLE_SQL = `EXISTS (
+               SELECT 1 FROM claw_notification_subscriptions n
+                WHERE n.owner_user_id = s.user_id AND n.enabled AND (${SAY_EVENT_TYPE_SQL}) = ANY(n.event_types)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM claw_notification_outbox o2
+                     WHERE o2.event_id = s.say_id::text AND o2.subscription_id = n.subscription_id))`;
+
+/**
+ * The says about an item's current need, over `claw_work_items w`, that reached nobody and that a subscription of the
+ * user's can now be handed: what `resendUnreachedSays` sends.
+ */
+export const UNREACHED_SAY_SQL = `
+          SELECT 1 FROM claw_assistant_says s
+           WHERE s.item_id = w.item_id AND s.item_attention_seq = w.attention_seq
+             AND ${SAY_UNREACHED_SQL}
+             AND ${SAY_SENDABLE_SQL}`;
+
+/**
+ * Send again what was said to a user while no subscription could carry it, now that one can: for each of the user's
+ * items that still needs them (`needs_you`) or was answered within the day (the answer the sweep says), the newest say
+ * about that need that reached nobody and that a subscription can be handed, queued for every enabled subscription that
+ * takes its type and was never handed it. Once per subscription: the outbox row it writes is what marks it handed.
+ * Called when a subscription starts taking the assistant's events, and by the silent sweep for an item whose fallback
+ * was stored when nothing could carry it. `itemId` narrows it to one item. Returns how many outbox rows were written;
+ * the delivery poll sends them (within `POLL_MS`), as nobody is waiting on this call.
+ */
+export async function resendUnreachedSays(input: { userId: string; itemId?: string }): Promise<number> {
+  if (!CLAW_NOTIFICATIONS_ENABLED || !CLAW_ASSISTANT_ENABLED) return 0;
+  const says = (await db.query(
+    `SELECT DISTINCT ON (s.item_id) s.say_id::text AS say_id, s.text, (${SAY_EVENT_TYPE_SQL}) AS type, s.created_at, s.item_id
+       FROM claw_work_items w
+       JOIN claw_assistant_says s ON s.item_id = w.item_id AND s.item_attention_seq = w.attention_seq
+      WHERE w.user_id = $1 AND ($2::text IS NULL OR w.item_id = $2) AND (w.board_state = 'needs_you' OR (${ANSWERED_UNSAID_SQL}))
+        AND ${SAY_UNREACHED_SQL}
+        AND ${SAY_SENDABLE_SQL}
+      ORDER BY s.item_id, s.created_at DESC, s.say_id DESC
+      LIMIT 100`,
+    [input.userId, input.itemId ?? null],
+  )).rows as Array<{ say_id: string; text: string; type: string; created_at: Date; item_id: string }>;
+  let written = 0;
+  for (const say of says) {
+    const item = await loadItem(db.query, say.item_id, input.userId);
+    if (!item) continue;
+    const m: ToStore = say.type === "work_item.needs_you"
+      ? { type: "work_item.needs_you", sayId: say.say_id, userId: input.userId, sessionId: null, text: say.text, item }
+      : { type: "assistant.say", sayId: say.say_id, userId: input.userId, sessionId: null, text: say.text, item };
+    const subs = (await db.query(
+      `SELECT subscription_id FROM claw_notification_subscriptions
+        WHERE owner_user_id = $1 AND enabled AND $2 = ANY(event_types)`,
+      [input.userId, m.type],
+    )).rows;
+    const rows = await enqueue(m.sayId, subs, payloadOf(m, say.created_at));
+    if (rows > 0) logger.info({ userId: input.userId, itemId: say.item_id, sayId: say.say_id, rows }, "assistant.say_resent");
+    written += rows;
+  }
+  return written;
 }
 
 /** Stamp `delivered_at` once a receiver has taken a message. Call once at startup, with the notification worker. */

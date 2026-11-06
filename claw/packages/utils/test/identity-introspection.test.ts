@@ -58,6 +58,23 @@ test("a positive answer is served from the cache for 30 s and then asked again",
   });
 });
 
+test("a caller's maxAgeMs asks again sooner, for that caller only, and still falls back to the cache in an outage", async () => {
+  await withHarness({}, async ({ fake, clock, client }) => {
+    fake.introspect = () => ({ body: activeAnswer() });
+    await introspect(client, TOKEN, { maxAgeMs: 5_000 });
+    assert.equal(fake.count("/oauth/introspect"), 1);
+    clock.advance(4_999);
+    await introspect(client, TOKEN, { maxAgeMs: 5_000 });
+    assert.equal(fake.count("/oauth/introspect"), 1, "inside the caller's age");
+    clock.advance(1);
+    await introspect(client);
+    assert.equal(fake.count("/oauth/introspect"), 1, "another caller still takes the 30 s window");
+    fake.introspect = () => ({ body: { active: false } });
+    assert.equal((await introspect(client, TOKEN, { maxAgeMs: 5_000 })).active, false, "past its age the revocation is seen");
+    assert.equal(fake.count("/oauth/introspect"), 2);
+  });
+});
+
 test("an inactive answer is kept for 5 s, not 30", async () => {
   await withHarness({}, async ({ fake, clock, client }) => {
     fake.introspect = () => ({ body: { active: false } });

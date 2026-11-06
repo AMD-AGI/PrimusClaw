@@ -304,6 +304,8 @@ async function deleteExpiredSessions(
   )).rows as Array<{ session_id: string }>;
 
   let attempted = 0;
+  // Set when a deletion, asking the day's count under the lock every archived deletion takes, found it spent.
+  let daySpent = false;
   for (const { session_id: sessionId } of picked) {
     // At least one per hold, so a budget shorter than one deletion still moves.
     if (attempted > 0 && Date.now() >= limits.deadline) {
@@ -335,10 +337,22 @@ async function deleteExpiredSessions(
             ORDER BY session_id FOR UPDATE`,
           [sessionId],
         );
-        return (await query(
+        if ((await query(
           `SELECT 1 FROM claw_sessions s WHERE s.session_id = $2 AND ${retentionPredicate(1, workItems)}`,
           [s.retentionDays, sessionId],
-        )).rows.length > 0;
+        )).rows.length === 0) return false;
+        // The day's count, asked again where it cannot move: under `ARCHIVED_DELETION_LOCK_ID`, which this
+        // deletion took before anything else (commitSessionDeletion) and which every deletion of an archived
+        // session takes -- a user's own, another replica's pass that a failover left holding a lock on the old
+        // server. The count read before the selection is a plan; this is the place.
+        const n = (await query(
+          `SELECT COUNT(*)::int AS n FROM claw_sessions s WHERE ${COUNTED_TODAY}`,
+        )).rows[0] as { n: number };
+        if (n.n >= s.batch) {
+          daySpent = true;
+          return false;
+        }
+        return true;
       },
     }).catch((err: unknown) => {
       // One session's transaction failing is not a reason to stop the batch;
@@ -347,7 +361,13 @@ async function deleteExpiredSessions(
       return null;
     });
     if (committed === true) report.deleted += 1;
-    else if (committed === false) report.skipped += 1;
+    else if (daySpent) {
+      // Not this session's doing: it stays archived and eligible for the window's next place.
+      progress.deleteLeft += 1;
+      logger.warn({ deleted: report.deleted }, "session_retention.day_spent_under_lock");
+      afterDaySpent(await retentionAllowance(s.batch), progress, limits);
+      return;
+    } else if (committed === false) report.skipped += 1;
   }
   // The day's batch, not the pass's, ended the selection, and there was more
   // to delete than it took.

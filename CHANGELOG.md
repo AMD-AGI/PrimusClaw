@@ -936,6 +936,20 @@ record it.
   to `finishing` once the task's lease has been gone, and the task closed, for `LEASE_LOST_GRACE_SEC`, so the existing
   finish-only dispatch stops its sandboxes and revokes its grant (`sweeper.abandoned_app_runs_to_finishing`); a finish
   that fails every one of its bounded hand-overs is left for an operator, as before.
+- An assistant message no channel can carry is no longer silent: one stored with no notification subscription for its type is counted
+  (`claw_assistant_say_unreachable_total{type}`) and logged as `assistant.say_unreachable` with the user and the item, once per user
+  per clock hour across replicas. The silent sweep takes a message as told only when it was delivered or has an outbox row still queued
+  and not failed, so a fallback stored while nothing could carry it no longer counts; once a subscription takes its type, the sweep sends it. A subscription
+  created or changed to take `assistant.say` or `work_item.needs_you` is sent, once, the newest unreached message of each item that still
+  needs its owner.
+- A receiver's `410 Gone` drops that outbox row at once (`last_status = http_410`) and is not counted against the subscription, so a
+  receiver that cannot reach one of a user's conversations no longer gets that user's subscription disabled.
+- A leader lock held on a connection made before a failover this process noticed is lost (`LeadershipLostError`, the lease, the
+  stall alarm): the demoted server may still answer it, but its lock fences nothing on the new primary.
+- Session retention can no longer spend a place of the day that a user's own delete took: every session deletion takes one advisory
+  lock, and retention asks the day's count again under it before each deletion.
+- A revoked connector grant is refused within `CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS` (default 5; was up to the identity
+  client's 30-second cache). The identity client's `introspect` takes a per-call `maxAgeMs`.
 - A database failover no longer leaves the API on the old primary, and no longer costs the assistant's replies. A
   switchover demotes the old primary in place, and a connection still on it answers every read and refuses every write
   (`25006`): `inTransaction` handed such a connection back to the pool after a clean rollback, to fail the next

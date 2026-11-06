@@ -473,6 +473,19 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
           delivered += 1;
           return;
         }
+        if (code === 410) {
+          // Gone: the receiver says this event has nowhere to go and never will (a person it cannot reach), so it is
+          // dropped now rather than retried for a day. It says nothing against the receiver itself -- which answered,
+          // and on purpose -- so it is not a failure of the subscription: counted as one, a receiver that cannot reach
+          // one of a user's conversations would have that user's whole subscription disabled within a day.
+          await db.query(
+            `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'http_410' WHERE id = $1`,
+            [row.id],
+          );
+          logger.warn({ eventId: row.event_id, subscriptionId: row.subscription_id }, "notification.dropped_gone");
+          failed += 1;
+          return;
+        }
         status = `http_${code}`;
       }
     } catch (err) {

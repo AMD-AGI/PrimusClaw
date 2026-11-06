@@ -601,11 +601,24 @@ export const CLAW_GITHUB_MCP_BINDING_ENABLED = envBool("CLAW_GITHUB_MCP_BINDING_
  *   CLAW_CONNECTOR_TOKEN_INTROSPECT  also ask the identity provider whether the
  *                                    token is still active, so a revoked grant
  *                                    stops at once instead of when the token expires
+ *   CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS
+ *                                    the oldest provider answer a connector token is
+ *                                    judged by, default 5 (0: ask every time). The
+ *                                    identity client keeps an answer for
+ *                                    IDENTITY_INTROSPECTION_CACHE_SECONDS (30) for
+ *                                    every caller; this bounds it for connectors, so
+ *                                    a revoked grant is refused within this many
+ *                                    seconds on every replica. A value out of 0..300
+ *                                    is not believed and the default is used.
  */
-export function connectorTokenSettings(): { audience: string; introspect: boolean } {
+export const CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_DEFAULT_SECONDS = 5;
+
+export function connectorTokenSettings(): { audience: string; introspect: boolean; introspectMaxAgeMs: number } {
+  const maxAge = readIntSetting(process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS, { wholeNumbersOnly: true, min: 0, max: 300 });
   return {
     audience: env("CLAW_CONNECTOR_TOKEN_AUDIENCE", "claw-api"),
     introspect: envBool("CLAW_CONNECTOR_TOKEN_INTROSPECT", false),
+    introspectMaxAgeMs: (maxAge && !("problem" in maxAge) ? maxAge.value : CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_DEFAULT_SECONDS) * 1000,
   };
 }
 

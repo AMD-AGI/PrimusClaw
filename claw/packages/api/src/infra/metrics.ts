@@ -132,6 +132,16 @@ const assistantSaySourcesTotal = new Counter({
   registers: [registry],
 });
 
+// An assistant message stored with no subscription to carry it (`assistant.say` or `work_item.needs_you`): the web
+// client can still show it, but no channel the user reads on was sent it. Counted every time; the log line it also
+// writes is limited to one per user an hour.
+const assistantSayUnreachableTotal = new Counter({
+  name: "claw_assistant_say_unreachable_total",
+  help: "Assistant messages stored with no notification subscription for their type, by type.",
+  labelNames: ["type"] as const,
+  registers: [registry],
+});
+
 // `error` keeps a throw out of loadUsage or queueLength in the denominator;
 // without it a partial outage makes every rollout ratio read healthier.
 const admissionDecisionTotal = new Counter({
@@ -392,5 +402,8 @@ export const metrics = {
     outcome: "cited" | "dropped_not_in_turn" | "dropped_invalid" | "dropped_over_cap" | "unreferenced" | "suppressed_link_text", n: number,
   ): void {
     if (n > 0) assistantSaySourcesTotal.inc({ outcome }, n);
+  },
+  onAssistantSayUnreachable(type: string): void {
+    assistantSayUnreachableTotal.inc({ type });
   },
 };

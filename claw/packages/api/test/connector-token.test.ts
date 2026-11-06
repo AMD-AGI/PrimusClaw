@@ -469,6 +469,36 @@ describe("connector access tokens", { skip }, () => {
       assert.match(r.body.message, /no longer active/);
     });
 
+    test("is refused within the connector max age even while the identity client would keep the active answer longer", async () => {
+      process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT = "true";
+      // The production cache: an active answer kept 30 seconds for every caller.
+      process.env.IDENTITY_INTROSPECTION_CACHE_SECONDS = "30";
+      startIdentityClient(log);
+      process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS = "1";
+      try {
+        const token = mint();
+        const cid = await register(token);
+        const beat = () => asToken(token).post(`/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [AGENT] });
+        assert.equal((await beat()).status, 200);
+        revoked.add(payloadOf(token).jti);
+        assert.equal((await beat()).status, 200, "inside the max age the cached answer stands");
+        await new Promise((r) => setTimeout(r, 1_100));
+        const r = await beat();
+        assert.deepEqual([r.status, r.body.error], [401, "invalid_token"], "past it the provider is asked again");
+      } finally {
+        delete process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS;
+      }
+    });
+
+    test("the connector max age defaults to 5 seconds", async () => {
+      const { connectorTokenSettings } = await import("../src/config.js");
+      delete process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS;
+      assert.equal(connectorTokenSettings().introspectMaxAgeMs, 5_000);
+      process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS = "900";
+      assert.equal(connectorTokenSettings().introspectMaxAgeMs, 5_000, "a value out of range is not believed");
+      delete process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS;
+    });
+
     test("an answer for another subject is no answer for this token", async () => {
       process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT = "true";
       fake.introspect = () => ({ body: activeAnswer({ sub: "someone-else" }) });

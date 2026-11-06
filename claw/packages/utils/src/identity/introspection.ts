@@ -56,6 +56,13 @@ export interface IntrospectOptions {
    * for another.
    */
   params?: Record<string, string>;
+  /**
+   * The oldest cached answer this caller takes, in milliseconds: an answer fetched longer ago is asked again, as if
+   * its fresh window had ended. For a caller that must see a revocation sooner than `positiveTtlMs` allows, without
+   * shortening the cache for every other caller. It narrows freshness only: an answer the upstream cannot refresh
+   * is still served stale as before, inside its stale window.
+   */
+  maxAgeMs?: number;
 }
 
 interface Entry {
@@ -68,6 +75,8 @@ interface Entry {
   expiresAt: number | undefined;
   /** After a failed refresh, do not try again before this instant. */
   retryAt: number;
+  /** When the lookup that produced this answer started. */
+  fetchedAt: number;
 }
 
 const INACTIVE: InactiveIntrospection = Object.freeze({ active: false });
@@ -144,7 +153,8 @@ export class Introspector {
 
     const now = this.deps.now();
     const entry = this.entries.get(key);
-    if (entry && now < entry.freshUntil) {
+    const youngEnough = (e: Entry): boolean => opts.maxAgeMs === undefined || now < e.fetchedAt + Math.max(0, opts.maxAgeMs);
+    if (entry && now < entry.freshUntil && youngEnough(entry)) {
       this.deps.metrics.onCache("introspection", entry.result.active ? "hit" : "hit_negative");
       return entry.result;
     }
@@ -242,10 +252,10 @@ export class Introspector {
       const freshUntil = Math.min(startedAt + this.s.positiveTtlMs, result.expiresAt ?? Infinity);
       // With positive caching off nothing positive is kept, not even for the stale path.
       if (this.s.positiveTtlMs <= 0) return;
-      entry = { result, freshUntil, staleUntil: freshUntil + this.s.staleIfErrorMs, expiresAt: result.expiresAt, retryAt: 0 };
+      entry = { result, freshUntil, staleUntil: freshUntil + this.s.staleIfErrorMs, expiresAt: result.expiresAt, retryAt: 0, fetchedAt: startedAt };
     } else {
       if (this.s.negativeTtlMs <= 0) return;
-      entry = { result, freshUntil: startedAt + this.s.negativeTtlMs, staleUntil: 0, expiresAt: undefined, retryAt: 0 };
+      entry = { result, freshUntil: startedAt + this.s.negativeTtlMs, staleUntil: 0, expiresAt: undefined, retryAt: 0, fetchedAt: startedAt };
     }
     if (this.entries.size >= this.s.maxEntries) {
       const oldest = this.entries.keys().next().value;
