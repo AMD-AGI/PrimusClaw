@@ -23,9 +23,12 @@ on:
 permissions:
   contents: read
 
+# One run per pull request or feature branch: a new head cancels the previous
+# one. Pushes to main and deploy/** get a group of their own and are never
+# cancelled or replaced.
 concurrency:
-  group: public-tree-scan-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/deploy/')) && format('run-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || !(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/deploy/')) }}
 
 jobs:
   public-tree-scan:

@@ -31,9 +31,12 @@ on:
       - "sandbox/sdk-python/**"
       - ".github/workflows/docs.yml"
 
+# One run per pull request: a new head cancels the previous head's run.
+# Every other event (push to main or deploy/**, tags, schedules, manual runs)
+# gets a group of its own, so it is never cancelled or replaced.
 concurrency:
-  group: docs-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

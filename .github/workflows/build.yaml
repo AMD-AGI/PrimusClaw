@@ -33,9 +33,12 @@ on:
 permissions:
   contents: read
 
+# A new pull request head cancels the previous head's run. Pushes stay
+# serialised per ref, as before, so registry pushes do not race, and a push
+# run that has started is never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   detect-changes:
