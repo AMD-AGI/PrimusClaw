@@ -15,8 +15,11 @@
  *   L4 a lock that never frees is an error after the attempts, with the
  *      session's own lock_timeout put back
  *   L5 inside an explicit transaction nothing is retried
- *   E1 the legacy event-id pass rewrites, swaps the constraint and records
- *      itself
+ *   L6 an index of the same name in another schema on the search path does
+ *      not count as the one asked for
+ *   E1 the uniqueness step swaps the constraint first; the legacy pass then
+ *      rewrites, including ids two sessions share, leaves a row whose new id
+ *      its session already has, and records itself
  *   E2 a start that finds the record does not walk the table again
  *
  * The Postgres cases skip without DATABASE_URL; CI sets it, and the last test
@@ -55,8 +58,13 @@ test("K2 a second action or statement is not reduced to an existence test", () =
 test("K3 CREATE INDEX IF NOT EXISTS is recognised; CONCURRENTLY is left alone", () => {
   assert.deepEqual(
     classifyMigrationStatement("CREATE UNIQUE INDEX IF NOT EXISTS uq_x ON t(a, b) WHERE c IN ('p','q')"),
-    { kind: "create_index", index: "uq_x" },
+    { kind: "create_index", index: "uq_x", table: "t" },
   );
+  assert.deepEqual(
+    classifyMigrationStatement("CREATE INDEX IF NOT EXISTS idx_tsv ON claw_memory_entries USING GIN(content_tsv)"),
+    { kind: "create_index", index: "idx_tsv", table: "claw_memory_entries" },
+  );
+  assert.equal(classifyMigrationStatement("CREATE INDEX IF NOT EXISTS i ON s.t(a)").kind, "locking_ddl");
   assert.equal(classifyMigrationStatement("CREATE INDEX CONCURRENTLY IF NOT EXISTS i ON t(a)").kind, "other");
 });
 
@@ -175,6 +183,22 @@ test("startup DDL against a real Postgres", { skip: skip || false }, async (t) =
     await migrator.query("RESET lock_timeout");
   });
 
+  await t.test("L6 a same-named index in another schema is not the one asked for", async () => {
+    await migrator.query("CREATE SCHEMA other");
+    await migrator.query("CREATE TABLE other.x (a INT)");
+    await migrator.query("CREATE INDEX t_dup ON other.x(a)");
+    await migrator.query("SET search_path = other, public");
+    try {
+      await guarded.query("CREATE INDEX IF NOT EXISTS t_dup ON t(a)");
+      const r = await other.query(
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND tablename = 't' AND indexname = 't_dup'",
+      );
+      assert.equal(r.rowCount, 1);
+    } finally {
+      await migrator.query("RESET search_path");
+    }
+  });
+
   await t.test("L5 inside an explicit transaction nothing is retried", async () => {
     await holdReader();
     let attempts = 0;
@@ -227,23 +251,51 @@ test("the legacy event-id pass runs once per database", { skip: skip || false },
   await obs.query(
     `INSERT INTO claw_session_events (event_id, session_id, event) VALUES
        ('PRIMUS_CLAW_EVENTS-11', 's1', 'e'), ('claw-evt-12', 's1', 'e'), ('13', 's2', 'e'),
-       ('claw-14', 's2', 'e'), ('no-digits', 's2', 'e')`,
+       ('claw-14', 's2', 'e'), ('no-digits', 's2', 'e'),
+       ('PRIMUS_CLAW_EVENTS-7', 's1', 'e'), ('claw-evt-7', 's2', 'e'),
+       ('claw-9', 's4', 'e'), ('PRIMUS_CLAW_EVENTS-9', 's4', 'e'),
+       ('claw-evt-8', 's5', 'e'), ('8', 's5', 'e')`,
   );
   for (let i = 0; i < 7; i++) {
     await obs.query("INSERT INTO claw_session_events (event_id, session_id, event) VALUES ($1, 's3', 'e')", [`claw-${100 + i}`]);
   }
 
-  await t.test("E1 rewrites, swaps the constraint and records itself", async () => {
-    assert.equal(await legacy.normalizeLegacyEventIdsOnce({ batch: 3, pauseMs: 0 }), "done");
-    const ids = (await obs.query("SELECT event_id FROM claw_session_events ORDER BY id")).rows.map((r) => r.event_id);
-    assert.deepEqual(ids.slice(0, 5), ["claw-11", "claw-12", "claw-13", "claw-14", "no-digits"]);
+  await t.test("E1 swaps the constraint, then rewrites and records itself", async () => {
+    // Before uniqueness is in place the pass does not start.
+    assert.equal(await legacy.normalizeLegacyEventIdsOnce({ batch: 3, pauseMs: 0 }), "interrupted");
+    await legacy.ensureEventIdUniqueness();
     const old = await obs.query("SELECT 1 FROM pg_constraint WHERE conname = 'claw_session_events_event_id_key'");
     assert.equal(old.rowCount, 0);
     const idx = await obs.query(
       "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('claw_session_events_event_session_idx')",
     );
     assert.equal(idx.rows[0]?.indisvalid, true);
+
+    assert.equal(await legacy.normalizeLegacyEventIdsOnce({ batch: 3, pauseMs: 0 }), "done");
+    const rows = (await obs.query("SELECT event_id, session_id FROM claw_session_events ORDER BY id")).rows
+      .map((r) => `${r.session_id}:${r.event_id}`);
+    assert.deepEqual(rows.slice(0, 11), [
+      "s1:claw-11", "s1:claw-12", "s2:claw-13", "s2:claw-14", "s2:no-digits",
+      // Two sessions' legacy ids that normalise to the same id: both rewritten.
+      "s1:claw-7", "s2:claw-7",
+      // The session already holds claw-9: the legacy spelling stays.
+      "s4:claw-9", "s4:PRIMUS_CLAW_EVENTS-9",
+      // Two legacy spellings of one id in one session: the first wins.
+      "s5:claw-8", "s5:8",
+    ]);
     assert.equal(await legacy.legacyEventIdsDone(), true);
+  });
+
+  await t.test("E3 a migrated database takes no lock for uniqueness", async () => {
+    await obs.query("BEGIN");
+    await obs.query("SELECT 1 FROM claw_session_events LIMIT 1");
+    try {
+      const s = Date.now();
+      await legacy.ensureEventIdUniqueness();
+      assert.ok(Date.now() - s < 1000);
+    } finally {
+      await obs.query("COMMIT");
+    }
   });
 
   await t.test("E2 a later start does not walk the table", async () => {

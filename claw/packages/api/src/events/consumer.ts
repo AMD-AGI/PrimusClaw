@@ -24,7 +24,7 @@ import {
   checkProbationGraduation,
 } from "../marketplace/skill-service.js";
 import { appEventIdentity } from "./app-events.js";
-import { normalizeLegacyEventIdsOnce } from "./legacy-event-ids.js";
+import { ensureEventIdUniqueness, normalizeLegacyEventIdsOnce } from "./legacy-event-ids.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
@@ -166,8 +166,11 @@ export async function startEventConsumer(): Promise<void> {
     });
   } catch { /* consumer may already exist */ }
 
-  // The legacy event-id rewrite: once per database (a marker row records it),
-  // and in the background, so this replica persists events while it runs.
+  // The uniqueness the inserts below arbitrate on: two catalog reads once it is
+  // in place. Then the legacy event-id rewrite: once per database (a marker row
+  // records it), and in the background, so this replica persists events while
+  // it runs.
+  await ensureEventIdUniqueness();
   void normalizeLegacyEventIdsOnce();
 
   const consumer = await js.consumers.get(EVENT_STREAM, consumerName);

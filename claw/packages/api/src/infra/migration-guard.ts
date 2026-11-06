@@ -94,7 +94,7 @@ export function hasTopLevelSeparator(body: string): boolean {
 
 export type MigrationStatement =
   | { kind: "add_column"; table: string; column: string }
-  | { kind: "create_index"; index: string }
+  | { kind: "create_index"; index: string; table: string }
   | { kind: "locking_ddl" }
   | { kind: "other" };
 
@@ -104,7 +104,7 @@ const ADD_COLUMN = new RegExp(
   "i",
 );
 const CREATE_INDEX = new RegExp(
-  `^CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+IF\\s+NOT\\s+EXISTS\\s+${IDENT}\\s+ON\\s`,
+  `^CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+IF\\s+NOT\\s+EXISTS\\s+${IDENT}\\s+ON\\s+(?:ONLY\\s+)?${IDENT}\\s*(?:USING\\s+\\w+\\s*)?(?=\\()`,
   "i",
 );
 // Statements that take a table lock before they can tell whether they have
@@ -123,7 +123,7 @@ export function classifyMigrationStatement(sql: string): MigrationStatement {
   }
   const idx = CREATE_INDEX.exec(s);
   if (idx && !hasTopLevelSeparator(s.slice(idx[0].length))) {
-    return { kind: "create_index", index: idx[1].toLowerCase() };
+    return { kind: "create_index", index: idx[1].toLowerCase(), table: idx[2].toLowerCase() };
   }
   if (LOCKING_DDL.test(s)) return { kind: "locking_ddl" };
   return { kind: "other" };
@@ -145,8 +145,16 @@ async function alreadySatisfied(run: QueryFn, st: MigrationStatement): Promise<b
     return (r.rowCount ?? 0) > 0;
   }
   if (st.kind === "create_index") {
-    const r = await run("SELECT to_regclass($1) IS NOT NULL AS present", [st.index]);
-    return r.rows[0]?.present === true;
+    // Where Postgres itself looks: a relation of that name in the schema of the
+    // table the index is on. A same-named relation elsewhere on the search path
+    // does not satisfy it.
+    const r = await run(
+      `SELECT 1 FROM pg_class c
+        WHERE c.relname = $1
+          AND c.relnamespace = (SELECT t.relnamespace FROM pg_class t WHERE t.oid = to_regclass($2))`,
+      [st.index, st.table],
+    );
+    return (r.rowCount ?? 0) > 0;
   }
   return false;
 }
