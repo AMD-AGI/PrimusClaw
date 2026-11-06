@@ -767,6 +767,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     );
     assert.deepEqual((await remoteItem(sid)).params.cancels.map((c: Recorded) => c.seqs), [undefined, undefined]);
     const [x1, x2] = (await promptIds(sid)).slice(-2);
+    assert.deepEqual((await remoteItem(sid)).params.open_cmd_seqs, [x1, x2]);
     // The first cancel finds nothing running (the connector restarted as x1 ran): x1 ends, x2 is still to run.
     await events("alice", cid, sid, [endOf(null, "cancelled")]);
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_cmd_seqs], ["in_progress", [x2]]);
