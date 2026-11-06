@@ -464,6 +464,58 @@ test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine r
   assert.equal(decode.includes("atomesh"), false);
 });
 
+test("PD engine entrypoints start sshd on the shared port before the engine when a key is given", () => {
+  for (const build of [buildAtomWorkloadBody, buildSGLangRouterWorkloadBody]) {
+    const body = build({
+      ...COMMON,
+      model: "/models/m",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
+      sshAuthorizedKey: "ssh-ed25519 AAAATEST primus-claw-sess-1",
+      sshPortBase: 25032,
+    }) as Record<string, any>;
+    assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, "ssh-ed25519 AAAATEST primus-claw-sess-1");
+    assert.equal(body.env.MN_SSH_PORT, "25032");
+    const router = decodeEp(body.entryPoints[0]);
+    assert.equal(router.includes("sshd"), false);
+    for (const ep of [decodeEp(body.entryPoints[1]), decodeEp(body.entryPoints[2])]) {
+      const sshd = ep.indexOf("/usr/sbin/sshd -p \"${MN_SSH_PORT}\"");
+      assert.ok(sshd >= 0, ep);
+      assert.ok(sshd < ep.indexOf("sglang.launch_server"));
+      assert.match(ep, /PasswordAuthentication=no/);
+      assert.match(ep, /WARN: sshd/);
+    }
+  }
+});
+
+test("PD engine entrypoints carry no sshd without a key", () => {
+  const body = buildSGLangRouterWorkloadBody({
+    ...COMMON,
+    model: "/models/m",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+  }) as Record<string, any>;
+  assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, undefined);
+  assert.equal(body.env.MN_SSH_PORT, undefined);
+  assert.equal(decodeEp(body.entryPoints[1]).includes("sshd"), false);
+});
+
+test("discoverRolePods groups SGLangRouter pods by role name", () => {
+  const workload = {
+    pods: [
+      { podId: "claw-1-597f94c46d-l9q6p", podIP: "172.16.6.11", phase: "Running", resourceId: 0 },
+      { podId: "claw-1-prefill-76bd465cbc-qttfv", podIP: "10.235.225.141", phase: "Running", resourceId: 1 },
+      { podId: "claw-1-decode-554bf5b8c6-8k56h", podIP: "10.235.225.70", phase: "Running", resourceId: 2 },
+    ],
+  };
+  const groups = discoverRolePods(workload, "disaggregated", 25032);
+  assert.deepStrictEqual(groups.prefill.map((p) => p.podIp), ["10.235.225.141"]);
+  assert.deepStrictEqual(groups.decode.map((p) => p.podIp), ["10.235.225.70"]);
+  assert.equal(gpuPodsReady(groups, "disaggregated"), true);
+});
+
 test("buildAtomWorkloadBody rejects a missing model", () => {
   assert.throws(
     () => buildAtomWorkloadBody({

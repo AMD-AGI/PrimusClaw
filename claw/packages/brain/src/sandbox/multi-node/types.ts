@@ -36,15 +36,15 @@ export interface MultiNodeContext {
   headHost?: string;
   /** rayjob: Ray Dashboard auth token, when the dashboard is authenticated. */
   dashboardToken?: string;
-  /** infera: PEM private key authorised on the GPU pods. */
+  /** infera, atom, sglangrouter: PEM private key authorised on the GPU pods. */
   sshPrivateKey?: string;
-  /** infera: path the private key is materialised at inside the sandbox. */
+  /** infera, atom, sglangrouter: path the private key is materialised at inside the sandbox. */
   sshKeyPath?: string;
-  /** infera: SSH base port; decode pods are role-offset (see sandbox/multi-node/safe-body.ts). */
+  /** infera: SSH base port, decode pods role-offset; atom/sglangrouter: the one port of every pod. */
   sshPortBase?: number;
-  /** infera PD: prefill pod IPs, rank order. */
+  /** PD: prefill pod IPs, rank order. */
   prefillIps?: string[];
-  /** infera PD: decode pod IPs, rank order. */
+  /** PD: decode pod IPs, rank order. */
   decodeIps?: string[];
   /** infera aggregated: worker pod IPs, rank order (leader first). */
   workerIps?: string[];

@@ -118,6 +118,44 @@ test("atom and sglangrouter hand off the router service and no control-plane blo
   }
 });
 
+test("atom and sglangrouter with an SSH control plane hand off a cluster block and the legacy SSH env", () => {
+  for (const backend of ["atom", "sglangrouter"] as const) {
+    const ctx: MultiNodeContext = {
+      backend,
+      provider: "safe",
+      name: "msg1",
+      namespace: "ws",
+      nodeCount: 2,
+      gpusPerNode: 8,
+      serviceUrl: "http://msg1.ws.svc.cluster.local:8000",
+      prefillUrl: "http://msg1-prefill.ws.svc.cluster.local:8010",
+      decodeUrl: "http://msg1-decode.ws.svc.cluster.local:8020",
+      sshPrivateKey: PEM,
+      sshKeyPath: "/tmp/primus-claw-mn-ssh-key",
+      sshPortBase: 25032,
+      prefillIps: ["10.0.0.2"],
+      decodeIps: ["10.0.0.3"],
+    };
+    const { env, handoff, byPath } = build(ctx);
+    const c = handoff.cluster;
+    assert.ok(c, backend);
+    assert.equal(c.ssh_key_file, ctx.sshKeyPath);
+    assert.equal(c.ssh_port, 25032);
+    assert.equal(c.known_hosts_file, `${TOPOLOGY_HANDOFF_DIR}/known_hosts`);
+    assert.deepEqual(c.prefill_ips, ["10.0.0.2"]);
+    assert.deepEqual(c.decode_ips, ["10.0.0.3"]);
+    assert.equal(handoff.infera, undefined);
+    assert.deepEqual(validateTopologyHandoff(handoff), [], backend);
+    assert.equal(byPath.get(c.known_hosts_file!)?.mode, "600");
+    assert.ok(!byPath.get(DOC)!.content.includes("SECRETKEYBODY"));
+    assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, ctx.sshKeyPath);
+    assert.equal(env.HYPERLOOM_MN_EXT_SSH_PORT, "25032");
+    assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, "10.0.0.2");
+    assert.equal(env.HYPERLOOM_MN_EXT_DECODE_IPS, "10.0.0.3");
+    assert.equal(env.HYPERLOOM_MN_EXT_WORKER_IPS, undefined);
+  }
+});
+
 test("handoff documents validate against the schema", () => {
   for (const ctx of [RAYJOB, INFERA]) {
     const { handoff, byPath } = build(ctx);

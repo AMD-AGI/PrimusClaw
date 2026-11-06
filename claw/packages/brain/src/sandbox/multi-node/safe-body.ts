@@ -611,6 +611,24 @@ function atomRouterEntrypoint(framework: string): string {
   ].join("\n");
 }
 
+/**
+ * Start sshd for the optimizer's in-place engine relaunch, then fall through.
+ *
+ * The engine images carry sshd but not the SaFE idle scripts, so the key and
+ * daemon are set up here from MN_SSH_AUTHORIZED_KEY / MN_SSH_PORT. Key-only
+ * root login. A failure only warns: the engine still serves, without SSH control.
+ */
+const PD_SSHD_BOOTSTRAP = [
+  "if ! { mkdir -p /root/.ssh /run/sshd && chmod 700 /root/.ssh \\",
+  "    && printf '%s\\n' \"${MN_SSH_AUTHORIZED_KEY}\" > /root/.ssh/authorized_keys \\",
+  "    && chmod 600 /root/.ssh/authorized_keys \\",
+  "    && { [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A; } \\",
+  "    && /usr/sbin/sshd -p \"${MN_SSH_PORT}\" -o PasswordAuthentication=no \\",
+  "      -o KbdInteractiveAuthentication=no -o PermitRootLogin=prohibit-password; }; then",
+  "  echo \"WARN: sshd did not start on port ${MN_SSH_PORT}; the engine runs without SSH control\" >&2",
+  "fi",
+];
+
 /** Split a prompt arg string into shell words. Quotes are already removed. */
 function shellWords(raw: string): string[] {
   return raw.trim().split(/\s+/).filter((word) => word.length > 0);
@@ -620,6 +638,7 @@ function shellWords(raw: string): string[] {
  * Prefill or decode command. Model, TP, transfer backend, IB device, and the
  * extra server flags all come from the prompt. The listen port is the one SaFE
  * injects. Bootstrap ports are the pair this workload's router command uses.
+ * `withSshd` prepends the sshd bootstrap.
  */
 function atomEngineEntrypoint(
   role: "prefill" | "decode",
@@ -629,10 +648,12 @@ function atomEngineEntrypoint(
   ibDevice: string,
   serverArgs: string,
   roleArgs: string,
+  withSshd: boolean,
 ): string {
   const bootstrap = role === "prefill" ? ATOM_PREFILL_BOOTSTRAP_PORT : ATOM_DECODE_BOOTSTRAP_PORT;
   const lines = [
     "set -euo pipefail",
+    ...(withSshd ? PD_SSHD_BOOTSTRAP : []),
     "export SGLANG_HOST_IP=\"${POD_IP:-$(hostname -i | awk '{print $1}')}\"",
     "args=(",
     "  python3 -m sglang.launch_server",
@@ -676,6 +697,10 @@ export interface AtomWorkloadParams extends CommonWorkloadParams {
   pdPrefillTp?: number;
   pdDecodeTp?: number;
   rdmaResource?: string;
+  /** Public key authorised for root SSH on prefill and decode; no sshd without it. */
+  sshAuthorizedKey?: string;
+  /** sshd port shared by every prefill and decode pod. */
+  sshPortBase?: number;
 }
 
 interface PdClusterBodyOptions {
@@ -750,7 +775,13 @@ function buildPdClusterWorkloadBody(
     rdmaResource: p.rdmaResource ?? "1k",
   });
 
+  const sshKey = (p.sshAuthorizedKey ?? "").trim();
+  const withSshd = sshKey.length > 0;
   const env = sanitizeEnv(p.extraEnv);
+  if (withSshd) {
+    env.MN_SSH_AUTHORIZED_KEY = sshKey;
+    env.MN_SSH_PORT = String(p.sshPortBase ?? inferaSshPortBase(p.displayName));
+  }
   applyCorrelationEnv(env, opts.backend, p.sessionId, p.messageId);
 
   // useWorkspaceStorage stays absent: SaFE defaults an absent *bool to true
@@ -767,11 +798,11 @@ function buildPdClusterWorkloadBody(
       b64(opts.routerEntrypoint),
       b64(atomEngineEntrypoint(
         "prefill", model, prefillTp, p.kvTransferBackend,
-        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdPrefillExtraArgs ?? "",
+        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdPrefillExtraArgs ?? "", withSshd,
       )),
       b64(atomEngineEntrypoint(
         "decode", model, decodeTp, p.kvTransferBackend,
-        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdDecodeExtraArgs ?? "",
+        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdDecodeExtraArgs ?? "", withSshd,
       )),
     ],
     env,

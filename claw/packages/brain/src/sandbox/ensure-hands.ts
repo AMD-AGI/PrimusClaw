@@ -2843,7 +2843,7 @@ async function provisionHands(
   const handsUrl = `${handsBaseUrl}/mcp`;
   logger.info({ sessionId, workloadId, handsUrl }, "ensureHands.health_ok");
 
-  // infera drives its GPU pods over SSH, so the key Brain derived for this
+  // infera, atom and sglangrouter drive their GPU pods over SSH, so the key Brain derived for this
   // cluster has to exist as a file here before the optimizer runs.
   if (multiNodeContext && hasSshKeyFile(multiNodeContext)) {
     await writeSandboxSshKey(

@@ -27,12 +27,21 @@ const FULL = {
     decode_ips: [],
     worker_ips: [],
   },
+  cluster: {
+    ssh_key_file: "/k",
+    ssh_port: 2233,
+    known_hosts_file: "/kh",
+    router_ips: [],
+    prefill_ips: ["1.1.1.1"],
+    decode_ips: ["2.2.2.2"],
+  },
 } satisfies TopologyHandoffV1;
 
 test("JSON schema property names equal the type's field names", () => {
   assert.deepEqual(Object.keys(S.properties).sort(), Object.keys(FULL).sort());
   assert.deepEqual(Object.keys(S.properties.ray.properties).sort(), Object.keys(FULL.ray).sort());
   assert.deepEqual(Object.keys(S.properties.infera.properties).sort(), Object.keys(FULL.infera).sort());
+  assert.deepEqual(Object.keys(S.properties.cluster.properties).sort(), Object.keys(FULL.cluster).sort());
 });
 
 test("a document with both blocks is rejected whichever backend it names", () => {
@@ -41,13 +50,15 @@ test("a document with both blocks is rejected whichever backend it names", () =>
 });
 
 test("full documents validate, one per backend", () => {
-  const { ray, infera, ...base } = FULL;
+  const { ray, infera, cluster, ...base } = FULL;
   assert.deepEqual(validateTopologyHandoff({ ...base, backend: "infera", infera }), []);
   assert.deepEqual(validateTopologyHandoff({ ...base, backend: "rayjob", ray }), []);
+  assert.deepEqual(validateTopologyHandoff({ ...base, backend: "sglangrouter", cluster }), []);
+  assert.deepEqual(validateTopologyHandoff({ ...base, backend: "atom", cluster }), []);
 });
 
 test("atom and sglangrouter validate with no control-plane block", () => {
-  const { ray, infera, ...base } = FULL;
+  const { ray, infera, cluster: _cluster, ...base } = FULL;
   for (const backend of ["atom", "sglangrouter"] as const) {
     assert.deepEqual(validateTopologyHandoff({ ...base, backend }), [], backend);
     assert.ok(validateTopologyHandoff({ ...base, backend, ray }).some((p) => p.startsWith("ray")), `${backend} with ray`);
@@ -56,18 +67,23 @@ test("atom and sglangrouter validate with no control-plane block", () => {
 });
 
 test("backend and block must agree", () => {
-  const { ray, infera, ...base } = FULL;
+  const { ray, infera, cluster, ...base } = FULL;
   assert.ok(validateTopologyHandoff({ ...base, backend: "rayjob", infera }).length > 0, "rayjob with infera");
   assert.ok(validateTopologyHandoff({ ...base, backend: "rayjob" }).some((p) => p.startsWith("ray")), "rayjob without ray");
   assert.ok(validateTopologyHandoff({ ...base, backend: "infera", ray }).length > 0, "infera with ray");
   assert.ok(validateTopologyHandoff({ ...base, backend: "infera" }).some((p) => p.startsWith("infera")), "infera without infera");
+  assert.ok(validateTopologyHandoff({ ...base, backend: "rayjob", ray, cluster }).some((p) => p.startsWith("cluster")), "rayjob with cluster");
+  assert.ok(validateTopologyHandoff({ ...base, backend: "infera", infera, cluster }).some((p) => p.startsWith("cluster")), "infera with cluster");
 });
 
 test("the JSON schema states the same backend/block rule", () => {
   const paired = S.allOf.filter((r) => "required" in r.then);
   assert.deepEqual(paired.map((r) => r.if.properties.backend.const), ["rayjob", "infera"]);
   assert.deepEqual(paired.map((r) => r.then.required[0]), ["ray", "infera"]);
-  assert.deepEqual(paired.map((r) => r.then.not.required[0]), ["infera", "ray"]);
+  assert.deepEqual(
+    paired.map((r) => r.then.not.anyOf.map((x) => x.required[0])),
+    [["infera", "cluster"], ["ray", "cluster"]],
+  );
   const open = S.allOf.filter((r) => !("required" in r.then));
   assert.deepEqual(open.map((r) => r.if.properties.backend.const), ["atom", "sglangrouter"]);
 });
@@ -92,6 +108,8 @@ test("rejects unknown fields, wrong schema string and bad numbers", () => {
   assert.ok(validateTopologyHandoff({ ...FULL, gpus_per_node: 1.5 }).length > 0);
   assert.ok(validateTopologyHandoff({ ...FULL, infera: { ...FULL.infera, ssh_port_base: 70000 } }).length > 0);
   assert.ok(validateTopologyHandoff({ ...FULL, ray: { token: "inline" } }).length > 0);
+  assert.ok(validateTopologyHandoff({ ...FULL, cluster: { ...FULL.cluster, ssh_port: 0 } }).length > 0);
+  assert.ok(validateTopologyHandoff({ ...FULL, cluster: { ...FULL.cluster, ssh_key: "inline" } }).length > 0);
   assert.ok(validateTopologyHandoff("nope").length > 0);
 });
 
@@ -110,5 +128,6 @@ test("prototype-chain names are not fields: only own keys count", () => {
   // The backend rule reads own keys too.
   const inheritedInfera = Object.assign(Object.create({ infera: {} }), { ...FULL, backend: "rayjob", infera: undefined });
   delete inheritedInfera.infera;
+  delete inheritedInfera.cluster;
   assert.deepEqual(validateTopologyHandoff(inheritedInfera), []);
 });

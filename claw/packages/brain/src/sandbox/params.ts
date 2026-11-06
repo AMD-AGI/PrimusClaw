@@ -160,8 +160,8 @@ export function resourcesMapToWorkloadArray(map: Record<string, string>): Array<
  * The backends drive the cluster through different control planes: rayjob talks
  * to the head over Ray Dashboard REST (:8265) / GCS (:6379) and needs no pod
  * IPs, infera SSHes into the GPU pods directly and needs their IPs plus a
- * private key, and atom and sglangrouter serve on the router Service with no
- * SSH control plane.
+ * private key, and atom and sglangrouter serve on the router Service and, when
+ * a key was derived, also hand over SSH to their prefill and decode pods.
  * Only the variables the active backend reads are set, since Hyperloom infers
  * the mode from which ones are present.
  *
@@ -201,9 +201,16 @@ export function applyMultiNodeExternalEnv(
     return;
   }
 
-  // atom and sglangrouter launch router, prefill and decode themselves. The
-  // sandbox only needs the router Service; there is no SSH control plane to hand over.
-  if (ctx.backend === "atom" || ctx.backend === "sglangrouter") return;
+  // atom and sglangrouter: the optimizer SSHes into prefill and decode to
+  // relaunch the engine in place; every pod shares one sshd port.
+  if (ctx.backend === "atom" || ctx.backend === "sglangrouter") {
+    if (!hasSshKeyFile(ctx)) return;
+    env.HYPERLOOM_MN_EXT_SSH_KEY = ctx.sshKeyPath!;
+    if (ctx.sshPortBase) env.HYPERLOOM_MN_EXT_SSH_PORT = String(ctx.sshPortBase);
+    if (ctx.prefillIps?.length) env.HYPERLOOM_MN_EXT_PREFILL_IPS = ctx.prefillIps.join(",");
+    if (ctx.decodeIps?.length) env.HYPERLOOM_MN_EXT_DECODE_IPS = ctx.decodeIps.join(",");
+    return;
+  }
 
   // infera: the optimizer SSHes into the GPU pods to relaunch the engine, so it
   // needs the key path plus at least one role's pod IPs.
@@ -228,7 +235,7 @@ export const TOPOLOGY_HANDOFF_PATH = `${TOPOLOGY_HANDOFF_DIR}/topology.json`;
 const TOPOLOGY_KNOWN_HOSTS_PATH = `${TOPOLOGY_HANDOFF_DIR}/known_hosts`;
 
 /**
- * True when Brain writes the infera SSH key file. The one condition for both the
+ * True when Brain writes the cluster SSH key file. The one condition for both the
  * write and the `ssh_key_file` field, so the document never names a file that
  * was not written.
  */
@@ -278,6 +285,16 @@ export function buildTopologyHandoff(ctx: MultiNodeContext): TopologyHandoffBuil
     // is usable by `ssh -o UserKnownHostsFile=...` without the reader creating it.
     files.push({ path: infera.known_hosts_file, content: "", mode: "600" });
     handoff.infera = infera;
+  } else if (hasSshKeyFile(ctx)) {
+    const cluster: NonNullable<TopologyHandoffV1["cluster"]> = {
+      ssh_key_file: ctx.sshKeyPath,
+      prefill_ips: [...(ctx.prefillIps ?? [])],
+      decode_ips: [...(ctx.decodeIps ?? [])],
+    };
+    if (ctx.sshPortBase) cluster.ssh_port = ctx.sshPortBase;
+    cluster.known_hosts_file = TOPOLOGY_KNOWN_HOSTS_PATH;
+    files.push({ path: cluster.known_hosts_file, content: "", mode: "600" });
+    handoff.cluster = cluster;
   }
 
   files.push({
