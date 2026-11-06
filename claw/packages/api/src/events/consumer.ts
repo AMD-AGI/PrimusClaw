@@ -49,6 +49,9 @@ import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
 import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
 
+/** Brain's event for a streaming tool call's text so far (`ExecuteRequest.stream_tool_text`); never stored. */
+export const TOOL_TEXT_DELTA_EVENT = "toolTextDelta";
+
 export { recordCompletionTurns } from "./completion-turns.js";
 // Re-exported: this predicate lived here until it gained a second caller, and
 // moving it to the event store it queries would otherwise break its importers.
@@ -362,6 +365,14 @@ export async function consumeEventDelivery(msg: {
       return;
     }
     logger.info({ sessionId, type: event.type, seq: (msg as any).seq }, "event-consumer.msg_received");
+
+    // A streaming tool call's text so far (`toolTextDelta`: an assistant router's `say` while the model writes it). It is a preview
+    // for whoever follows the session live, who has it from the stream already; the call's whole input is stored with the call. So
+    // nothing is kept of it: it would be rows nobody reads back, several for every message the assistant says.
+    if (event.type === TOOL_TEXT_DELTA_EVENT) {
+      msg.ack();
+      return;
+    }
 
     // Dropped rather than persisted: everything below writes conversation
     // content, and the session it belongs to is gone. Acked because there is
@@ -1222,26 +1233,44 @@ async function handleComplete(
     }
   }
   // 9b. A router turn that answered the user in plain text and said nothing: the text is what it meant to say. One that
-  //     failed or was stopped and said nothing: the user is told it did not go through. Best-effort: a turn whose words
-  //     were lost here is a user who heard nothing, which the model could have caused on its own, so this is a repair
-  //     and not a promise.
+  //     failed or was stopped and said nothing: the user is told it did not go through. A fault is tried again, a few
+  //     times over a few seconds -- long enough to outlast a database failover, whose first seconds are exactly when a
+  //     model's `say` fails and its turn ends here -- and is not allowed to fail the completion, which is stored and
+  //     processed by now. Delivering twice is not a risk: a retry finds what the first attempt stored.
   if (CLAW_ASSISTANT_ENABLED && endedRunIds.length && !rerun) {
-    try {
-      await completionPorts.deliverUnsaidAnswer({
-        sessionId,
-        runIds: endedRunIds,
-        messageId: messageId ?? undefined,
-        failed: Boolean(failed),
-        interrupted: Boolean(interrupted),
-        fromSweeper: (event as any).completion_source === "sweeper",
-        finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
-      });
-    } catch (err) {
-      logger.error({ err, sessionId }, "assistant.unsaid_answer_failed");
+    const unsaid = {
+      sessionId,
+      runIds: endedRunIds,
+      messageId: messageId ?? undefined,
+      failed: Boolean(failed),
+      interrupted: Boolean(interrupted),
+      fromSweeper: (event as any).completion_source === "sweeper",
+      finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
+    };
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await completionPorts.deliverUnsaidAnswer(unsaid);
+        break;
+      } catch (err) {
+        if (attempt >= UNSAID_ANSWER_ATTEMPTS) {
+          logger.error({ err, sessionId, runIds: endedRunIds, attempts: attempt }, "assistant.unsaid_answer_failed");
+          break;
+        }
+        logger.warn({ err, sessionId, attempt }, "assistant.unsaid_answer_retry");
+        await new Promise((resolve) => setTimeout(resolve, unsaidAnswerRetryDelayMs * attempt));
+      }
     }
   }
 
   logger.info({ sessionId, failed, userId }, "exec_complete.handled");
+}
+
+/** How often a router turn's unsaid answer is tried when delivering it faults, and the first pause between tries. */
+const UNSAID_ANSWER_ATTEMPTS = 3;
+let unsaidAnswerRetryDelayMs = 2_000;
+/** For tests: the pause between tries of an unsaid answer. */
+export function setUnsaidAnswerRetryDelayForTest(ms: number): void {
+  unsaidAnswerRetryDelayMs = ms;
 }
 
 const SUMMARIZE_THRESHOLD = 80_000;

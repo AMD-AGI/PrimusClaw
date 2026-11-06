@@ -48,7 +48,9 @@ const result = (data: unknown, isError = false): ToolResult => ({
 });
 
 /** A refusal is an answer the model can act on; a fault is not, and says nothing about its cause. */
-async function answer(claims: AssistantTokenClaims, name: string, run: () => Promise<unknown>): Promise<ToolResult> {
+async function answer(
+  claims: AssistantTokenClaims, name: string, run: () => Promise<unknown>, faultMessage = "the call failed; try once more",
+): Promise<ToolResult> {
   try {
     return result(await run());
   } catch (err) {
@@ -57,9 +59,12 @@ async function answer(claims: AssistantTokenClaims, name: string, run: () => Pro
       return result({ ok: false, error: err.code, message: err.message, ...(err.data ? { data: err.data } : {}) }, true);
     }
     logger.error({ err, sid: claims.sid, tool: name }, "assistant.tool_failed");
-    return result({ ok: false, error: "internal_error", message: "the call failed; try once more" }, true);
+    return result({ ok: false, error: "internal_error", message: faultMessage }, true);
   }
 }
+
+/** What the Router is told when `say` faulted: nothing reached the user, and only another `say` can. */
+export const SAY_FAULT_MESSAGE = "the message was NOT delivered: the user has not seen it. Call say again with the same text";
 
 const MEMORY_ID_PARAM = "The entry's number, such as 12 or #12.";
 const QUOTE_PARAM = "The part of the user's message in this turn that says it, copied exactly.";
@@ -195,7 +200,7 @@ export function createAssistantMcpServer(
         text: z.string().describe("What to tell the user, in the language they use."),
         item_id: z.string().optional().describe(ITEM_ID_PARAM),
       },
-      (args) => answer(claims, "say", () => say(claims, args)),
+      (args) => answer(claims, "say", () => say(claims, args), SAY_FAULT_MESSAGE),
     );
     mcp.tool(
       "work_create",

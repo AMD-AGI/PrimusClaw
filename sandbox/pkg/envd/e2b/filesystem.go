@@ -5,6 +5,7 @@ package e2b
 
 import (
 	"io"
+	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
@@ -35,6 +36,31 @@ const (
 	fileTypeDir  = 2
 	fileTypeLink = 3
 )
+
+// newDirPerm and newFilePerm are what a directory or file created here asks
+// for, left for the process umask to narrow, as mkdir(1) and a shell
+// redirection do: under umask 022 that is 0755 and 0644, and under the umask
+// 002 a sandbox runs with it is 0775 and 0664, so a file written into a
+// directory operators share through a setgid group is writable by that group,
+// as one a command in the sandbox writes there is.
+const (
+	newDirPerm  os.FileMode = 0o777
+	newFilePerm os.FileMode = 0o666
+)
+
+// createTemp is os.CreateTemp with perm in place of its fixed 0600, so the
+// file an upload is renamed into place from has the mode any new file gets.
+func createTemp(dir, prefix string, perm os.FileMode) (*os.File, error) {
+	for range 10000 {
+		name := filepath.Join(dir, prefix+strconv.FormatUint(uint64(rand.Uint32()), 10))
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, perm)
+		if os.IsExist(err) {
+			continue
+		}
+		return f, err
+	}
+	return nil, &os.PathError{Op: "createtemp", Path: filepath.Join(dir, prefix+"*"), Err: os.ErrExist}
+}
 
 type files struct {
 	workspace string
@@ -130,7 +156,7 @@ func (f *files) makeDir(userPath string) (fileEntry, error) {
 	if err != nil {
 		return fileEntry{}, err
 	}
-	if err := os.MkdirAll(full, 0o755); err != nil {
+	if err := os.MkdirAll(full, newDirPerm); err != nil {
 		return fileEntry{}, fsErr(err)
 	}
 	return f.stat(userPath)
@@ -159,7 +185,7 @@ func (f *files) move(src, dst string) (fileEntry, error) {
 	if err != nil {
 		return fileEntry{}, err
 	}
-	if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(to), newDirPerm); err != nil {
 		return fileEntry{}, fsErr(err)
 	}
 	if err := os.Rename(from, to); err != nil {
@@ -217,10 +243,10 @@ func (f *files) write(userPath string, r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(full), newDirPerm); err != nil {
 		return fsErr(err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(full), ".e2b-upload-*")
+	tmp, err := createTemp(filepath.Dir(full), ".e2b-upload-", newFilePerm)
 	if err != nil {
 		return fsErr(err)
 	}
@@ -240,9 +266,6 @@ func (f *files) write(userPath string, r io.Reader) error {
 		return rpcErr("resource_exhausted", "file exceeds 32MB")
 	}
 	if err := tmp.Close(); err != nil {
-		return fsErr(err)
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
 		return fsErr(err)
 	}
 	if err := os.Rename(tmpName, full); err != nil {

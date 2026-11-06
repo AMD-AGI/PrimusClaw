@@ -103,6 +103,11 @@ export function parseRepoRef(input: unknown): Pick<PrRef, "owner" | "repo"> | nu
   return { owner: m[1], repo: m[2] };
 }
 
+/** Whether a user or organization login is one a request path may be built from. */
+export function isValidOwner(input: unknown): input is string {
+  return typeof input === "string" && OWNER_RE.test(input);
+}
+
 /** Whether every part of a reference is something a request path may be built from: the one check that `parsePrRef` and a session's bound target share. */
 export function isValidPrRef(ref: PrRef): boolean {
   return OWNER_RE.test(ref.owner) && REPO_RE.test(ref.repo) && ref.repo !== "." && ref.repo !== ".."

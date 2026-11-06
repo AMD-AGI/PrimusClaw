@@ -19,6 +19,17 @@ import (
 
 const maxUploadSize = 32 << 20 // 32 MB
 
+// newDirPerm and newFilePerm are what a directory or file envd creates asks
+// for, left for the process umask to narrow, as mkdir(1) and a shell
+// redirection do: under umask 022 that is 0755 and 0644, and under the umask
+// 002 a sandbox runs with it is 0775 and 0664, so an upload into a directory
+// operators share through a setgid group is writable by that group, as a file
+// a command in the sandbox writes there is.
+const (
+	newDirPerm  os.FileMode = 0o777
+	newFilePerm os.FileMode = 0o666
+)
+
 // Trust model for the file endpoints in this file.
 //
 // Every handler below takes a caller-supplied path and hands it to the filesystem, so
@@ -106,12 +117,12 @@ func (s *Server) uploadJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(abs), newDirPerm); err != nil {
 		httpError(w, "failed to create directories: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	mode := os.FileMode(0644)
+	mode := newFilePerm
 	if req.Mode != "" {
 		if m, err := strconv.ParseUint(req.Mode, 8, 32); err == nil {
 			mode = os.FileMode(m)
@@ -152,7 +163,7 @@ func (s *Server) uploadMultipart(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(abs), newDirPerm); err != nil {
 		httpError(w, "failed to create directories: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

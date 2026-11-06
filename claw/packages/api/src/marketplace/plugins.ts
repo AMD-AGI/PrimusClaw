@@ -19,7 +19,7 @@ import path from "node:path";
 import pino from "pino";
 import { S3_API_ENDPOINT, S3_PLUGINS_BUCKET } from "../config.js";
 import { MarketplaceDb, type JsonObject } from "../infra/db.js";
-import { getS3Client } from "../infra/s3-client.js";
+import { getS3Client, S3_LIST_PAGE_KEYS } from "../infra/s3-client.js";
 import {
   AccessDeniedError,
   BadGatewayError,
@@ -811,6 +811,7 @@ async function s3ListKeysUnderPrefix(prefix: string): Promise<string[]> {
         Bucket: S3_PLUGINS_BUCKET,
         Prefix: prefix,
         ContinuationToken,
+        MaxKeys: S3_LIST_PAGE_KEYS,
       }),
     );
     for (const o of out.Contents ?? []) {

@@ -32,6 +32,28 @@ let _s3: S3Client | null = null;
 const MAX_SOCKETS = 256;
 
 /**
+ * How many keys one ListObjectsV2 request asks for.
+ *
+ * Every listing in this package walks a prefix a page at a time, and the
+ * request timeout below applies to each page, not to the walk. Left unset, a
+ * page is the API's own maximum of a thousand keys, and how long a page takes
+ * to come back grows with the keys in it: a MinIO store answers a listing by
+ * reading each object's metadata off its drives. One such store was measured
+ * at 37-48 ms a key, so a full page took 45-48 seconds against a thirty-second
+ * timeout -- every walk of a prefix holding more than about six hundred objects
+ * failed on its first request, having listed nothing, and failed the same way
+ * on every retry. The session cleanup is where that stays visible: the walk
+ * that deletes a deleted session's files never reaches a delete, so the row is
+ * pending for good and the files stay in the bucket.
+ *
+ * A hundred keys is a few seconds at that rate, which leaves the timeout room
+ * for a store several times slower than measured. The cost is more requests for
+ * a large prefix, each of them small; the time to walk the whole prefix is the
+ * same, because it is set by the keys and not by the pages.
+ */
+export const S3_LIST_PAGE_KEYS = 100;
+
+/**
  * The object store, for the paths that have to be able to end.
  *
  * One factory rather than one per caller, because the timeouts are the reason it

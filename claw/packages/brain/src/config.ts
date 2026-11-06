@@ -919,6 +919,18 @@ export const RUN_LEASE_TTL_MS = envInt(
  */
 export const BRAIN_LAZY_SANDBOX = envBool("BRAIN_LAZY_SANDBOX", true);
 
+/**
+ * Honour `ExecuteRequest.sandbox_prestart`: a run the API marks as one that
+ * will use its sandbox (an assistant's worker turn) starts opening it when the
+ * run starts, so the pod comes up while the first model call is running instead
+ * of after it. A run that never asks for it after all gives it back at its end
+ * like any other: a ready sandbox is parked for the session's next message, and
+ * one still being created is reclaimed. Only a lazily opened run is affected,
+ * and only one whose tool list has a sandbox tool. Set to 0 to open every such
+ * sandbox on the first tool call again.
+ */
+export const BRAIN_SANDBOX_PRESTART = envBool("BRAIN_SANDBOX_PRESTART", true);
+
 // Post-task idle reclaim window. After GET /api/jobs is empty and the
 // workload is Running, Brain waits this long from quiescedAt then CAS-es
 // ready→closing and destroyHands. Operators set SANDBOX_IDLE_REUSE_SECONDS

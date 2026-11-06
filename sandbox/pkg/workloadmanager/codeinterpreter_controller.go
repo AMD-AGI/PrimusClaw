@@ -349,11 +349,17 @@ func shellSingleQuote(s string) string {
 // The initContainer copies envd and tmux to /shared/bin/ before the main container
 // starts; buildPodTemplate puts pathSetupScript (and the extra-CA check) ahead of it.
 //
+// The build steps and envd, and so every command envd starts, run under umask
+// 002, as they do in a sandbox SaFE renders: a file or directory a session
+// creates is writable by the group of the directory it lands in, which keeps a
+// directory operators share through a setgid group shared; elsewhere that
+// group is the creator's primary group.
+//
 // Example output:
 //
-//	mkdir -p /app/work && pip install numpy -q && exec /shared/bin/envd --port=8080 --workspace=/app/work
+//	umask 002 && mkdir -p /app/work && pip install numpy -q && exec /shared/bin/envd --port=8080 --workspace=/app/work
 func buildStartupScript(steps []runtimev1alpha1.SandboxBuildStep, workspace string) string {
-	var parts []string
+	parts := []string{"umask 002"}
 	// Create workspace directory — it may not exist in the base image.
 	// We intentionally do NOT cd into it: the container keeps the image's default
 	// WORKDIR, which may be meaningful for custom images. EnvD's --workspace flag
@@ -666,7 +672,7 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 	// ENOENT. Leaving it empty lets the image's default WORKDIR take effect.
 	//
 	// The actual workspace is handled by the startup script:
-	//   mkdir -p <workspace> && ... && exec /shared/bin/envd --workspace=<workspace>
+	//   umask 002 && mkdir -p <workspace> && ... && exec /shared/bin/envd --workspace=<workspace>
 	var secCtx *corev1.SecurityContext
 	if egressEnabled() {
 		// Egress transparent proxy requires CAP_NET_ADMIN + CAP_NET_RAW for iptables REDIRECT.

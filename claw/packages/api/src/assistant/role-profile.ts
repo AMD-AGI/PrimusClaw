@@ -7,7 +7,7 @@
  * The role lives in `claw_assistants` and `claw_work_items`, server-side tables a caller cannot write. A
  * field on the session would not do: `config`, `team_role` and `parent_session_id` are caller input.
  *
- * A router turn is cut down to the assistant tools (`tools_allowlist`, which Brain enforces), given its
+ * A router turn is cut down to the assistant tools and its read-only lookups (`tools_allowlist`, which Brain enforces; `read-tools.ts`), given its
  * prompt and the current list of work items, and kept short. An observer turn is cut the same way, without the list. A worker turn gets its prompt and the one tool
  * it reports through. Both get a bearer for the assistant MCP service that names this turn.
  *
@@ -34,11 +34,12 @@ import {
 } from "./prompts.js";
 import { allowedModels, modelChoiceOn, platformModel, readModelPrefs } from "./model-choice.js";
 import { rerunModelOf } from "./model-fallback.js";
-import { AFTER_READ_TOOLS, routerReadTools } from "./read-tools.js";
+import { AFTER_READ_TOOLS, routerLookups } from "./read-tools.js";
 import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
 import { startWorkerRun } from "./run-started.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
+import { applyRouterTurnSpeed } from "./router-speed.js";
 
 const logger = pino({ name: "assistant-role" });
 
@@ -224,25 +225,32 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     logger.info({ sessionId, taskId, scope: role.scope, prompt: OBSERVER_PROMPT_VERSION }, "assistant.observer_turn");
   } else if (role.role === "router") {
     claims = { ...base, role: "router" };
-    // The read-only tools of the deployment's assistant plugin (`read-tools.ts`), and nothing else of it: no skills, rules or write
-    // tools. A plugin the message named is not one the read list can vouch for, so it gives the router nothing.
-    const read = await routerReadTools(role.userId);
-    task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN, ...(read?.allowlist ?? [])];
+    // What the router may look up itself (`read-tools.ts`): the read-only tools of the deployment's assistant plugin, and nothing
+    // else of it (no skills, rules or write tools; a plugin the message named is not one the read list can vouch for, so it gives
+    // the router nothing); the reads of the user's own GitHub; and the web.
+    const lookups = await routerLookups(role.userId, sessionId);
+    const read = lookups.plugin;
+    task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN, ...lookups.allowlist];
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
-    // Only the assistant's own server and the plugin's read servers: any other is a connection made and a tool never offered.
-    task.mcp_servers = {};
+    // Only the assistant's own server, the plugin's read servers and the user's GitHub: any other is a connection made and a tool
+    // never offered. The GitHub entry is built here from the session, as `githubMcpServers` builds a worker's.
+    task.mcp_servers = { ...lookups.githubServers };
     for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
     if (read) {
       task.plugin_id = read.pluginId;
       task.plugin_tools = read.pluginTools;
-      // Once it has read one of their results, the turn no longer acts for the person: Brain refuses the acting tools.
-      task.read_taint = { sources: read.allowlist, allow_after: AFTER_READ_TOOLS.map((t) => `${TOOL_NAME_PREFIX}${t}`) };
     }
+    // Once it has read one of their results, the turn no longer acts for the person: Brain refuses the acting tools. A GitHub or
+    // web lookup that failed read nothing, and leaves the turn free to start the work instead.
+    task.read_taint = {
+      sources: lookups.allowlist, allow_after: AFTER_READ_TOOLS.map((t) => `${TOOL_NAME_PREFIX}${t}`), clean_failures: lookups.cleanFailures,
+    };
     // Neither the deployment's default MCP servers nor its default skills: the hint that lists them would follow the user's message.
     task.skip_platform_defaults = true;
     // The system prompt is the same on every turn, so it and the history after it come from the prompt cache. What changes
     // from turn to turn (the item list, what waits for the user, what the channel sent) goes with the message instead.
-    withSystemAppend(task, renderRouterPrompt(read?.servers ?? []));
+    const github = lookups.githubTools.length > 0;
+    withSystemAppend(task, renderRouterPrompt({ servers: read?.servers ?? [], github: lookups.githubTools }));
     const state = [renderRouterItems(await routerManifest(role.userId), await askedOfOthersManifest(role.userId))];
     if (CLAW_ASSISTANT_TOOLS) {
       withSystemAppend(task, ROUTER_REVIEW_PROMPT);
@@ -271,13 +279,15 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       const rerun = await rerunModelOf(sessionId, messageId);
       if (rerun) task.model = rerun;
     }
+    // Little thinking, and the say streamed while it is written (`router-speed.ts`).
+    applyRouterTurnSpeed(task);
     await addReplyLanguage(task, sessionId);
     // Even with no words (a turn the system starts): the list is what the prompt says to answer from.
     task.prompt = withTurnState(stringField(task, "prompt"), state);
     logger.info({
       sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION, base: ROUTER_PROMPT_VERSION,
       ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
-      ...(read ? { read: ROUTER_READ_PROMPT_VERSION, readServers: read.servers, pluginId: read.pluginId } : {}),
+      read: ROUTER_READ_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),
     }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);
@@ -287,6 +297,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // model only fills in for a session that names none. Off, it is every worker turn's model, as it always was.
     if (CLAW_ASSISTANT_WORKER_MODEL && !(modelChoiceOn() && stringField(task, "model"))) task.model = CLAW_ASSISTANT_WORKER_MODEL;
     withSystemAppend(task, renderWorkerSystem({ seq: started.seq, title: started.title }));
+    // A worker does its item's work in the sandbox, so Brain opens it beside the turn's first model call rather than after it.
+    task.sandbox_prestart = true;
     const memory = await workerMemoryBlock(role.userId, started.itemId, sessionId);
     if (memory) withSystemAppend(task, memory);
     logger.info({ sessionId, taskId, itemId: started.itemId, generation: started.generation, prompt: WORKER_PROMPT_VERSION }, "assistant.worker_turn");

@@ -402,9 +402,15 @@ export interface ExecuteRequest {
    * `sources` or `allow_after` may be called for the rest of the run; any other is refused by Brain before it is run. Entries are
    * written like `tools_allowlist` (an exact name, or a prefix ending in `*`). The API sets it on an assistant's router turn that has
    * read-only tools: after it has read such a result, the turn no longer acts for the user (no review, setting or memory write).
+   * `clean_failures`: the sources whose failures are said in Claw's own words only (fixed text, numbers, and the call's own
+   * arguments; never a status text, body, error message, certificate field or redirect target a remote sent): a call of one of
+   * these that failed read nothing and does not mark the run. A failure of any other source marks it. A call of one of these that
+   * threw is told to the model as having failed, without the thrown message.
+   * Under this rule the results earlier runs got from `sources` are not replayed from `history`: each is replaced with a fixed
+   * placeholder, so what one turn read is not in context in the next, which can act.
    * Absent: no such rule.
    */
-  read_taint?: { sources: string[]; allow_after: string[] };
+  read_taint?: { sources: string[]; allow_after: string[]; clean_failures?: string[] };
 
   // ── Legacy chat fields (Phase 4 removes; do not use in new task code) ─
   /** @deprecated Use `sandbox_spec.image`. Kept for legacy chat NATS path. */
@@ -442,6 +448,13 @@ export interface ExecuteRequest {
    * from the session's `effort`, which its creator chose (`POST /v1/sessions`, `PATCH /v1/sessions/:id`).
    */
   effort?: ReasoningEffort;
+  /**
+   * Tools (by full name) whose `text` argument is published while the model writes it: a `toolTextDelta` event (`tool`,
+   * `actionId`, `text` so far) at most every few hundred milliseconds per call, top-level loop only. An assistant router's `say`,
+   * so a channel can show the words before the turn's step ends. The call runs as before; a delta is a preview, not the message.
+   * Absent: none.
+   */
+  stream_tool_text?: string[];
   /**
    * "5m": the rolling prompt-cache markers of this run's turns (sub-agents included) are written for five minutes, the anchor keeps
    * Brain's `LLM_CACHE_TTL`. For a run nobody waits on between turns; absent, every marker is written at `LLM_CACHE_TTL`. The API sets it
@@ -511,6 +524,14 @@ export interface ExecuteRequest {
   plugin_tools?: unknown[] | null;
   /** Tool name allow-list applied on top of plugin_tools (script-mode hardening). */
   tools_allowlist?: string[];
+  /**
+   * `true`: this run will almost certainly use its sandbox, so Brain starts opening it when the run starts, beside the first model
+   * call, instead of when the first tool asks for it. A run that then never asks gives it back the way any run does at its end (parked
+   * for the session's next message, or reclaimed if it was still being created). Brain ignores it where it opens the sandbox up front
+   * anyway, where `tools_allowlist` leaves no sandbox tool, and when its own `BRAIN_SANDBOX_PRESTART` is off. The API sets it on an
+   * assistant's worker turns. Absent, or anything but `true`: the sandbox opens on the first tool call, as before the field.
+   */
+  sandbox_prestart?: boolean;
   /** Pass-through MCP server configs (resolved at admission time). */
   mcp_servers?: Record<string, Record<string, unknown>>;
 

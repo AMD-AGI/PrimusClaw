@@ -42,7 +42,7 @@ const MAX_STALL_MESSAGES = 16;
 const LOGGED_TEXT_LIMIT = 2000;
 
 /**
- * Gap between status reads.
+ * Gap between status reads once a wait has gone on for a while.
  *
  * A constant rather than a setting. The two loops this replaces both polled every
  * 5s -- one hardcoded, one from RAY_JOB_POLL_INTERVAL_MS, which no deployment set
@@ -52,6 +52,33 @@ const LOGGED_TEXT_LIMIT = 2000;
  * worth exposing, and those are configured.
  */
 const POLL_INTERVAL_MS = 5000;
+
+/**
+ * Gap between status reads at the start of a wait, and how long the start lasts.
+ *
+ * A sandbox is usually Running a few seconds after its create (measured on the
+ * CPU sandbox workspace, 480 sandboxes over four days: 4.2s p50, 6.8s p90), and a
+ * read every POLL_INTERVAL_MS finds it there up to that much later -- on the path
+ * the first tool call of every cold run waits on. So a wait reads every
+ * POLL_FAST_MS for its first POLL_FAST_WINDOW_MS and then backs off to the old
+ * interval, on the old grid: a workload still queued or pulling its image by then
+ * is read exactly as often as before, and no workload is seen later than it was.
+ * What that costs the platform is bounded per wait, not per minute of waiting:
+ * at most POLL_FAST_WINDOW_MS / POLL_FAST_MS reads of one workload's status where
+ * there were four, all in the wait's first seconds.
+ */
+const POLL_FAST_MS = 1000;
+const POLL_FAST_WINDOW_MS = 20_000;
+
+/**
+ * The gap before the next status read, `elapsedMs` into the wait: POLL_FAST_MS
+ * during the window, then whatever reaches the next multiple of POLL_INTERVAL_MS
+ * (never less than POLL_FAST_MS). Exported for its test.
+ */
+export function nextPollGapMs(elapsedMs: number): number {
+  if (elapsedMs < POLL_FAST_WINDOW_MS) return POLL_FAST_MS;
+  return Math.max(POLL_FAST_MS, POLL_INTERVAL_MS - (elapsedMs % POLL_INTERVAL_MS));
+}
 
 /**
  * Phases from which a workload will never become ready.
@@ -104,6 +131,7 @@ export interface WorkloadWaitDeps {
   fetchImpl?: typeof fetch;
   sleepImpl?: (ms: number) => Promise<void>;
   nowImpl?: () => number;
+  /** A fixed gap between reads, in place of the schedule of `nextPollGapMs`. */
   pollMs?: number;
   /** Per-request timeout for one status read. */
   requestTimeoutMs?: number;
@@ -115,6 +143,13 @@ export interface WorkloadWaitDeps {
   startTimeoutMs?: number;
   /** Consecutive 404s that mean the workload is gone. */
   notFoundLimit?: number;
+  /**
+   * How long those 404s must span as well. Defaults to the span the limit had when
+   * every read was POLL_INTERVAL_MS apart (or `pollMs` apart, when that is given), so
+   * that reading faster at the start of a wait does not also give up on a workload
+   * the platform has not synced yet sooner than it used to.
+   */
+  notFoundWindowMs?: number;
   /** Minimum gap between progress events. */
   notifyIntervalMs?: number;
   /**
@@ -287,12 +322,14 @@ export async function waitForWorkloadReady(
   const doFetch = deps?.fetchImpl ?? fetch;
   const doSleep = deps?.sleepImpl ?? sleep;
   const now = deps?.nowImpl ?? Date.now;
-  const POLL_MS = deps?.pollMs ?? POLL_INTERVAL_MS;
+  const FIXED_POLL_MS = deps?.pollMs;
   const REQUEST_TIMEOUT_MS = deps?.requestTimeoutMs ?? 15_000;
   const UNREADABLE_TIMEOUT_MS = deps?.unreadableTimeoutMs ?? SANDBOX_POLL_TIMEOUT_MS;
   const PENDING_TIMEOUT_MS = deps?.pendingTimeoutMs ?? SANDBOX_PENDING_TIMEOUT_MS;
   const START_TIMEOUT_MS = deps?.startTimeoutMs ?? SANDBOX_START_TIMEOUT_MS;
   const NOT_FOUND_LIMIT = deps?.notFoundLimit ?? 12;
+  const NOT_FOUND_WINDOW_MS = deps?.notFoundWindowMs
+    ?? Math.max(0, NOT_FOUND_LIMIT - 1) * (FIXED_POLL_MS ?? POLL_INTERVAL_MS);
   const NOTIFY_INTERVAL_MS = deps?.notifyIntervalMs ?? 600_000;
   const WAIT_NOTICE_GAP_MS = deps?.waitNoticeGapMs ?? 30_000;
   const UNSCHEDULABLE_TIMEOUT_MS = opts.unschedulableTimeoutMs ?? 0;
@@ -301,6 +338,13 @@ export async function waitForWorkloadReady(
   const pollStart = now();
   let lastNotifyMs = 0;
   let consecutiveNotFound = 0;
+  // When the current run of 404s began; meaningful only while consecutiveNotFound > 0.
+  let notFoundSince = 0;
+  // What the last `poll_status` line said, and when, so a read every second does
+  // not also log every second: a line is written when the status changes, and
+  // otherwise no more often than the old poll interval.
+  let lastStatusLog = "";
+  let lastStatusLogMs = 0;
   let lastReadableMs = pollStart;
   let lastProblem = "";
   // When the workload was first seen queued. Measured only while it is still
@@ -354,7 +398,7 @@ export async function waitForWorkloadReady(
 
   while (true) {
     if (signal?.aborted) return await interrupted("");
-    await sleepUnlessAborted(doSleep, POLL_MS, signal);
+    await sleepUnlessAborted(doSleep, FIXED_POLL_MS ?? nextPollGapMs(now() - pollStart), signal);
     if (signal?.aborted) return await interrupted("");
     const elapsed = ((now() - pollStart) / 1000).toFixed(1);
 
@@ -382,8 +426,9 @@ export async function waitForWorkloadReady(
       });
       if (!resp.ok) {
         if (resp.status === 404) {
+          if (consecutiveNotFound === 0) notFoundSince = now();
           consecutiveNotFound++;
-          if (consecutiveNotFound >= NOT_FOUND_LIMIT) {
+          if (consecutiveNotFound >= NOT_FOUND_LIMIT && now() - notFoundSince >= NOT_FOUND_WINDOW_MS) {
             return await giveUp(
               "sandbox_gone",
               "",
@@ -429,7 +474,12 @@ export async function waitForWorkloadReady(
     }
 
     const ready = Boolean(phase) && isReady(detail);
-    logger.info({ workloadId, phase, queuePosition, ready, elapsed }, `${logPrefix}.poll_status`);
+    const statusLog = `${phase}|${queuePosition}|${ready}`;
+    if (statusLog !== lastStatusLog || now() - lastStatusLogMs >= POLL_INTERVAL_MS) {
+      lastStatusLog = statusLog;
+      lastStatusLogMs = now();
+      logger.info({ workloadId, phase, queuePosition, ready, elapsed }, `${logPrefix}.poll_status`);
+    }
 
     if (ready) {
       await opts.onReady?.({ phase, queuePosition }).catch(() => {});

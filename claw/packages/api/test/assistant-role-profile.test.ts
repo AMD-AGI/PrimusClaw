@@ -6,7 +6,7 @@
  * (the fat dispatch, a queued message replayed, and a doorbell claimed), over a real Postgres. Skipped without
  * DATABASE_URL, and a skip is not a pass.
  *
- *   A1  a router turn is cut to the assistant tools, kept short, and carries a bearer naming its own run
+ *   A1  a router turn is cut to the assistant tools and the web lookups, kept short, and carries a bearer naming its own run
  *   A2  a doorbell router turn is given all of that at the claim, and the row holds none of it
  *   A3  a queued router message replayed on the wire is given it after its run exists, so the bearer names that run
  *   A4  a worker turn gets its prompt, its item and the generation it started under, and keeps what the request brought
@@ -36,6 +36,8 @@ let UNTRUSTED_CLOSE = "";
 const words = (prompt: string): string => prompt.split(`\n\n${TURN_STATE_HEADER}\n\n`)[0];
 
 const skip = postgresSkipReason();
+/** A router's tools with no assistant plugin and no GitHub: the assistant's own, and Brain's web search and fetch. */
+const ROUTER_TOOLS = ["mcp__assistant__*", "web_search", "web_fetch"];
 
 describe("assistant role profile", { skip }, () => {
   let w: World;
@@ -165,7 +167,7 @@ describe("assistant role profile", { skip }, () => {
   test("A1 a router turn is cut to the assistant tools and carries a bearer naming its own run", async () => {
     const { published, result } = await send(alice.routerSid, "alice", { doorbell: false });
     const task = JSON.parse(published[0]);
-    assert.deepEqual(task.tools_allowlist, ["mcp__assistant__*"]);
+    assert.deepEqual(task.tools_allowlist, ROUTER_TOOLS);
     assert.equal(task.max_turns, 8);
     assert.deepEqual(Object.keys(task.mcp_servers), ["assistant"]);
     const claims = verify(task);
@@ -175,6 +177,7 @@ describe("assistant role profile", { skip }, () => {
     assert.equal(task.task_id, result.runId);
     assert.ok(claims.exp > Math.floor(Date.now() / 1000) + 3600, "outlives the longest turn the row allows");
     assert.ok(task.system_append.startsWith("You are the user's personal assistant."));
+    assert.equal(task.sandbox_prestart, undefined, "a router has no sandbox tool to open one for");
     assert.ok(!task.system_append.includes(AGENT_GUIDELINE), "a router only dispatches: the working guideline is not its");
     // The item list goes with the message, with #299's plain status and times: the system prompt is the same on every turn.
     assert.match(task.prompt, new RegExp(`Work items \\(open ones[^)]*\\):\\n.*\\n<untrusted_data>\\n#1 \\(item_id: ${item.itemId}\\) \\[in_progress\\] \\(status: in progress; created \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC\\) title: "Fix the build"`));
@@ -182,6 +185,9 @@ describe("assistant role profile", { skip }, () => {
     assert.ok(!/now is \d{4}-/.test(task.system_append), "nor the time of this turn");
     assert.equal(task.skills, undefined);
     assert.equal(task.skip_platform_defaults, true, "no default MCP server or skill list for a router");
+    // Its say published while the model writes it (`router-speed.ts`); the effort is the model's own unless the deployment names one.
+    assert.deepEqual(task.stream_tool_text, ["mcp__assistant__say"]);
+    assert.equal(task.effort, undefined);
   });
 
   test("A1c marketplace tools a message named are not resolved for a router, and are for a worker", async () => {
@@ -209,7 +215,7 @@ describe("assistant role profile", { skip }, () => {
     // An item made after the send and before the claim is in the list the turn is given: the list is the claim's.
     await w.createItem(alice, "Added while it waited");
     const request = await claim();
-    assert.deepEqual(request.tools_allowlist, ["mcp__assistant__*"]);
+    assert.deepEqual(request.tools_allowlist, ROUTER_TOOLS);
     assert.equal(request.max_turns, 8);
     const claims = verify(request);
     assert.equal(claims.task_id, result.runId, "the bearer names the claimed run");
@@ -220,7 +226,7 @@ describe("assistant role profile", { skip }, () => {
 
   test("A3 a queued router message replayed on the wire is profiled after its run is opened", async () => {
     const { task, runId } = await replayed(alice.routerSid, "alice");
-    assert.deepEqual(task.tools_allowlist, ["mcp__assistant__*"]);
+    assert.deepEqual(task.tools_allowlist, ROUTER_TOOLS);
     assert.equal(verify(task).task_id, runId, "the run opened for the replay, not the absence of one");
     assert.equal(verify(task).mid, "claw-pending-1");
   });
@@ -231,10 +237,13 @@ describe("assistant role profile", { skip }, () => {
     assert.deepEqual({ role: claims.role, item: claims.item_id, gen: claims.gen, sid: claims.sid }, { role: "worker", item: item.itemId, gen: 1, sid: item.workerSid });
     assert.equal(first.tools_allowlist, undefined, "a worker keeps every tool");
     assert.equal(first.max_turns, undefined);
+    assert.equal(first.effort, undefined, "a worker thinks as its session chose, not as a router");
+    assert.equal(first.stream_tool_text, undefined);
     assert.deepEqual(Object.keys(first.mcp_servers).sort(), ["assistant", "mine"]);
     assert.ok(first.system_append.startsWith(`${AGENT_GUIDELINE}\n\n`), "a worker does the user's work, under the working guideline");
     assert.match(first.system_append, /You are a worker on one work item/);
     assert.match(first.system_append, /item #1: Fix the build$/);
+    assert.equal(first.sandbox_prestart, true, "a worker's sandbox opens beside its first model call");
     assert.equal((await w.item(item.itemId)).generation, 1);
 
     await w.q("UPDATE claw_tasks SET status = 'completed' WHERE session_id = $1", [item.workerSid]);
@@ -329,7 +338,7 @@ describe("assistant role profile", { skip }, () => {
     const router = await drained(alice.routerSid);
     assert.equal(router.askedForSkills, false);
     assert.equal(router.published.length, 1);
-    assert.deepEqual(router.published[0].tools_allowlist, ["mcp__assistant__*"]);
+    assert.deepEqual(router.published[0].tools_allowlist, ROUTER_TOOLS);
     assert.equal((await drained("plain")).askedForSkills, true);
   });
 

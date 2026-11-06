@@ -48,12 +48,14 @@ import {
   S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, S3_API_ENDPOINT,
   BRAIN_WORKSPACE_SNAPSHOT_ENABLED,
   RETRY_PENDING_KEEPALIVE_GRACE_SEC,
-  TASK_MAX_DELIVER, BRAIN_LAZY_SANDBOX,
+  TASK_MAX_DELIVER, BRAIN_LAZY_SANDBOX, BRAIN_SANDBOX_PRESTART,
   RUN_LEASE_HEARTBEAT_MS, RUN_LEASE_TTL_MS,
   LOCK_REFRESH_INTERVAL_MS,
   SANDBOX_HANDS_RESTART_ENABLED,
 } from "../config.js";
 import { ensureHands } from "../sandbox/ensure-hands.js";
+import { parseToolAllowlist } from "../tools/allowlist.js";
+import { allowsSandboxUse } from "../tools/hands.js";
 import { isMultiNodeRequest } from "../sandbox/multi-node/prompt-flags.js";
 import { applyReviewProfileBackstop, reviewTurnBudgetRefusal } from "../agent/review-profile.js";
 import { gpuWorkspaceFor } from "../sandbox/workspace-select.js";
@@ -1063,6 +1065,25 @@ type PostTaskParkOutcome = RunEndedParkOutcome | "no_sandbox";
  */
 export type RunClaim = { claimCount: number } | null;
 
+/**
+ * Whether a run that opens its sandbox lazily starts opening it as soon as it
+ * starts (`ExecuteRequest.sandbox_prestart`): only when the API asked for it, the
+ * deployment allows it, and the run's tool list leaves it a tool that can reach a
+ * sandbox -- a run cut to MCP tools has nothing that would use one. Exported for
+ * its test; `enabled` is BRAIN_SANDBOX_PRESTART.
+ */
+export function wantsSandboxPrestart(
+  request: ExecuteRequest,
+  enabled: boolean = BRAIN_SANDBOX_PRESTART,
+): boolean {
+  if (!enabled || request.sandbox_prestart !== true) return false;
+  const allowlist = parseToolAllowlist(request.tools_allowlist);
+  return !allowlist || allowsSandboxUse((name) => allowlist.allows(name));
+}
+
+/** Why a prestarted open was given up: the run ended without anything asking for its sandbox. */
+const PRESTART_UNUSED_REASON = new Error("sandbox_prestart_unused");
+
 class TaskRunner {
   // Injected singletons (bound once via bindTaskRunnerDeps in main()).
   private readonly kv: KV;
@@ -1289,6 +1310,24 @@ class TaskRunner {
   // which may happen much later than the read on a deferred run.
   private pendingResumeCkpt: TaskCheckpoint | null = null;
   private handsAttach: Promise<HandsClient> | null = null;
+  /**
+   * Whether anything in this run has asked for its sandbox: the up-front open, or
+   * a tool, a sub-agent or the engine's own setup through `attachHands`.
+   *
+   * Separate from whether a sandbox is open, because a prestarted one
+   * (`prestartSandbox`) is open before anything asks, and may never be asked for.
+   * Until it is, it holds nothing of this run's -- no file the run wrote, no shell
+   * it started -- so every path that saves or stops the run's work in its sandbox
+   * reads `workHands()`, which is null until this is set, and finds what a lazy
+   * run that never opened one finds.
+   */
+  private sandboxClaimed = false;
+  /**
+   * The open started ahead of the first tool call, while it may still be the
+   * run's only open: its abort, which gives that open up, and its settlement,
+   * which never rejects. See `prestartSandbox` and `retireUnclaimedPrestart`.
+   */
+  private prestart: { abort: AbortController; settled: Promise<void> } | null = null;
   /**
    * Why this run cannot have a sandbox, once opening one has ended on one of
    * SANDBOX_UNAVAILABLE_REASONS. Every later attempt to open it is refused with
@@ -1558,15 +1597,16 @@ class TaskRunner {
     // the normal-priority semaphore so a burst across sessions cannot
     // saturate shared-filesystem IO.
     const now = Date.now();
+    const workHands = this.workHands();
     if (
       WORKSPACE_PERSIST_BASE
       && this.userIdHex
-      && this.hands
+      && workHands
       && !this.pendingSync
       && now - this.lastSyncAt > WORKSPACE_SYNC_INTERVAL_MS
     ) {
       this.lastSyncAt = now;
-      const frozenHands = this.hands;
+      const frozenHands = workHands;
       const frozenUidHex = this.userIdHex;
       const turnSnapshot = state.turns_completed;
       this.pendingSync = workspaceSyncSemaphore
@@ -2458,12 +2498,13 @@ class TaskRunner {
     // DAG shells end with the node; conversation shells survive turns and cancellations.
     const isDagNode = !!(this.request.dag_root_task_id || this.request.dag_node_id);
     const reason: ReclaimCause | null = cause ?? (isDagNode ? "dag_node_terminal" : null);
-    if (this.shellsReaped || !reason || !this.hands) return;
+    const hands = this.workHands();
+    if (this.shellsReaped || !reason || !hands) return;
     // Names the operation this reap belongs to, so every shell it ends is
     // attributable to one decision rather than to a class of them.
     const reclaimOp = `${this.request.task_id ?? this.sessionId}:${reason}`;
     try {
-      const report = await this.hands.reapShells(reason, reclaimOp);
+      const report = await hands.reapShells(reason, reclaimOp);
       this.shellsReaped = true;
       if (report.shells.length > 0) {
         // `surviving` is the honest half: a shell that ignored both signals is
@@ -2516,9 +2557,9 @@ class TaskRunner {
    * left unset rather than blanked, so attachHands can fill it in later
    * without the two writes fighting (internal-tasks COALESCEs).
    */
-  private async startWithoutSandbox(): Promise<void> {
+  private async startWithoutSandbox(prestarting = false): Promise<void> {
     logger.info(
-      { sessionId: this.sessionId, messageId: this.messageId },
+      { sessionId: this.sessionId, messageId: this.messageId, prestarting },
       "task.sandbox_deferred",
     );
     await this.onEvent({ type: "statusUpdate", agentStatus: "running" });
@@ -2528,11 +2569,14 @@ class TaskRunner {
     // never be. Said explicitly so the two can be distinguished: `deferred`
     // is followed by `ready` if and when a tool asks for one, and by nothing
     // at all for a turn that only talks.
+    // A prestarted run says so, because what follows `deferred` differs: `ready`
+    // once the sandbox is up, whether or not a tool ever asks for it.
     await this.onEvent({
       type: "sandboxStatus",
       status: "deferred",
-      reason: "no_tool_called_yet",
-      message: "this turn has not opened a sandbox; one opens on the first tool call",
+      ...(prestarting
+        ? { reason: "opening_ahead", message: "this turn is opening a sandbox beside its first model call" }
+        : { reason: "no_tool_called_yet", message: "this turn has not opened a sandbox; one opens on the first tool call" }),
       message_id: this.messageId,
     }).catch(() => { /* a status event must not fail the run */ });
     await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
@@ -2548,6 +2592,16 @@ class TaskRunner {
    * (SANDBOX_UNAVAILABLE_REASONS), which is: see `sandboxUnavailable`.
    */
   private readonly attachHands = (): Promise<HandsClient> => {
+    this.sandboxClaimed = true;
+    return this.openOnce();
+  };
+
+  /**
+   * The open behind `attachHands`, shared with `prestartSandbox`, which opens the
+   * sandbox without asking for it. `prestart` is passed only by that one: it can
+   * give the open up, and is never fired once anything has asked.
+   */
+  private openOnce(prestart?: AbortController): Promise<HandsClient> {
     if (this.sandboxUnavailable) return Promise.reject(this.sandboxUnavailable);
     // The in-flight attach is consulted before the assigned client, because
     // openSandbox assigns `this.hands` and only then restores /workspace from
@@ -2559,14 +2613,102 @@ class TaskRunner {
     // cached and how a rebuild is not undone: `recreateHands` replaces
     // `this.hands` without coming through here, so a retained promise would keep
     // handing out the sandbox the rebuild has already destroyed.
-    this.handsAttach = this.openSandbox().catch(async (err: unknown) => {
+    this.handsAttach = this.openSandbox(prestart).catch(async (err: unknown) => {
       await this.settleUnavailableOpen(err);
       throw err;
     }).finally(() => {
       this.handsAttach = null;
     });
     return this.handsAttach;
-  };
+  }
+
+  /**
+   * The sandbox as this run's own work sees it: null until something in the run
+   * has asked for it (`sandboxClaimed`). A sandbox opened ahead of time and never
+   * used holds none of the run's files or shells, so the paths that save or stop
+   * them -- the workspace syncs and the shell reap -- skip it, as they skip a lazy
+   * run that opened none. The release at the end still finds it, through the
+   * identity the open recorded, and parks it like any other.
+   */
+  private workHands(): HandsClient | null {
+    return this.sandboxClaimed ? this.hands : null;
+  }
+
+  /**
+   * Start opening the sandbox now, beside the first model call, rather than on the
+   * first tool call that asks for it.
+   *
+   * Only for a run the API marked as one that will use it (`wantsSandboxPrestart`)
+   * and that would otherwise open it lazily: an up-front run has opened it already.
+   * It is the same open a tool would start -- the one `attachHands` hands out -- so
+   * a tool that asks while it is in flight waits for it rather than starting a
+   * second, and a failure is not cached: it is logged here, and the next tool that
+   * asks gets a fresh attempt, exactly as after a tool's own failed open. A failure
+   * that says the platform has no sandbox for this run is latched as always
+   * (`settleUnavailableOpen`), and the tools that ask later are told that.
+   *
+   * A run that ends without asking gives it back in `retireUnclaimedPrestart`.
+   */
+  private prestartSandbox(): void {
+    const abort = new AbortController();
+    logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "task.sandbox_prestart");
+    const settled = this.openOnce(abort).then(
+      () => undefined,
+      (err: unknown) => {
+        logger.warn(
+          { err: (err as Error)?.message ?? String(err), sessionId: this.sessionId,
+            messageId: this.messageId, claimed: this.sandboxClaimed },
+          "task.sandbox_prestart_failed",
+        );
+      },
+    );
+    this.prestart = { abort, settled };
+  }
+
+  /**
+   * Settle a prestarted open that nothing in the run asked for, before the run's
+   * ending reads any sandbox state.
+   *
+   * Called once the engine has returned or thrown, so nothing will ask any more.
+   * A run whose engine did ask has an ordinary attached sandbox and nothing here
+   * applies. Otherwise the open is given up where it can be -- the wait for the
+   * workload to be scheduled and become ready, and a reuse probe -- and waited for
+   * where it cannot, so the run's ending sees one of two states and never a third
+   * in which a sandbox comes up after it:
+   *
+   *   - the open finished: the sandbox is this run's, with nothing of the run's in
+   *     it. The release parks it for the session's next message, as it parks any
+   *     run's, and the idle reclaim ends it if no message comes.
+   *   - the open did not: the workload it was creating has been stopped (the wait
+   *     reclaims what it created when it is given up), and its PENDING entry is
+   *     reaped here -- the same reap a failed run makes, gated the same way.
+   *
+   * An abort of the run itself (a cancel, a restart, a successor taking over, a
+   * deadline) has already reached the open through its signal, with the reclaim
+   * rule that abort carries, so the open is only waited for then: a restart's
+   * PENDING workload is the successor's to adopt, not this run's to reap.
+   *
+   * Never throws: it runs ahead of the run's own ending, which must not be
+   * replaced by a failure to clean up after a sandbox the run never used.
+   */
+  private async retireUnclaimedPrestart(): Promise<void> {
+    const prestart = this.prestart;
+    if (!prestart || this.sandboxClaimed) return;
+    this.prestart = null;
+    try {
+      const runAborted = this.abortCtrl.signal.aborted;
+      if (!runAborted) prestart.abort.abort(PRESTART_UNUSED_REASON);
+      await prestart.settled;
+      logger.info(
+        { sessionId: this.sessionId, messageId: this.messageId, opened: this.hands !== null,
+          workloadId: this.handsWorkloadId, runAborted },
+        "task.sandbox_prestart_unused",
+      );
+      if (!this.hands && !runAborted) await this.reapOwnPendingHands();
+    } catch (e) {
+      logger.warn({ err: e, sessionId: this.sessionId }, "task.sandbox_prestart_retire_failed");
+    }
+  }
 
   /**
    * An open that ended because the platform cannot give this run a sandbox: stop
@@ -2606,7 +2748,7 @@ class TaskRunner {
     }
   }
 
-  private async openSandbox(): Promise<HandsClient> {
+  private async openSandbox(prestart?: AbortController): Promise<HandsClient> {
     // Multi-node: provision the GPU cluster before the Hands sandbox, via
     // whichever mechanism the deploy mode dictates (see multi-node/factory.ts).
     if (isMultiNodeRequest(this.request) && !this.multiNodeContext) {
@@ -2638,9 +2780,14 @@ class TaskRunner {
     // `runRebuild` sets it too, which is now the same statement rather than a
     // deliberate re-stamp.
     this.sandboxAsked = true;
+    // A prestarted open can also be given up on its own (`retireUnclaimedPrestart`).
+    // The run's signal carries no abort reason then, which `abortReclaimsSandbox`
+    // reads as a cancel: what the wait was creating is reclaimed while the run still
+    // holds its lock, since nobody else will adopt a sandbox the run never used.
     const { handsUrl, created, token: handsToken, identity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
-      { signal: this.abortCtrl.signal, reclaimOnAbort: () => this.abortReclaimsSandbox(),
+      { signal: prestart ? AbortSignal.any([this.abortCtrl.signal, prestart.signal]) : this.abortCtrl.signal,
+        reclaimOnAbort: () => this.abortReclaimsSandbox(),
         attemptId: this.attempt.attemptId },
     );
     logger.info({ sessionId: this.sessionId, messageId: this.messageId, created, handsUrl }, "task.sandbox_ready");
@@ -2964,7 +3111,7 @@ class TaskRunner {
       // Capture the current hands client; recreateHands may swap `hands`
       // mid-run after a sandbox rebuild, but for this checkpoint we want
       // the live reference that exists at fire time.
-      const currentHands = this.hands;
+      const currentHands = this.workHands();
       if (!currentHands) return;
       this.inflightCkptInProgress = true;
       // Fire-and-forget: never block the agent loop on checkpoint sync.
@@ -3009,7 +3156,7 @@ class TaskRunner {
           onProgress: this.onScriptProgress,
         }, this.onEvent);
       } else {
-        result = await this.engine.execute(this.request, this.onEvent, this.abortCtrl.signal, this.hands, {
+        result = await this.engine.execute(this.request, this.onEvent, this.abortCtrl.signal, this.workHands(), {
           recreateHands: this.recreateHands,
           onCheckpoint: this.onCheckpoint,
           onCacheUse: this.onCacheUse,
@@ -3199,7 +3346,7 @@ class TaskRunner {
     //    /workspace to upload and no sandbox GC to outlive. Logged rather than
     //    passed over silently, because "nothing was uploaded" otherwise reads
     //    exactly like an upload that failed.
-    const hands = this.hands;
+    const hands = this.workHands();
     let syncOk = false;
     if (!hands) {
       logger.info(
@@ -3503,10 +3650,11 @@ class TaskRunner {
       // and its timestamp were lost for want of a workspace that did not
       // exist. Without hands there is simply nothing to sync, and
       // `sigtermSyncResult` stays "skipped", which is what it means.
-      if (this.hands && WORKSPACE_PERSIST_BASE && this.userIdHex) {
+      const workHands = this.workHands();
+      if (workHands && WORKSPACE_PERSIST_BASE && this.userIdHex) {
         try {
           await workspaceSigtermSyncSemaphore.run(() =>
-            fx().syncWorkspace(this.hands!, this.sessionId, this.userIdHex!, ckptState.turns_completed,
+            fx().syncWorkspace(workHands, this.sessionId, this.userIdHex!, ckptState.turns_completed,
               { kind: "sigterm" }),
           );
           syncedFlag = true;
@@ -3535,8 +3683,8 @@ class TaskRunner {
       // started. Writing to the session prefix is what the terminal path
       // already does, and it is where resolveResumeState's fall-through reads
       // from, so the resumed run finds these files.
-      if (!syncedFlag && this.hands) {
-        const hands = this.hands;
+      if (!syncedFlag && workHands) {
+        const hands = workHands;
         try {
           // The measurement of the repositories is capped like the shared-disk SIGTERM
           // sync's: with the shared disk unset, which is the default, this is the
@@ -4495,14 +4643,24 @@ class TaskRunner {
       await this.executeAppRun();
       return;
     }
-    if (this.needsSandboxUpFront(this.pendingResumeCkpt)) {
+    const upFront = this.needsSandboxUpFront(this.pendingResumeCkpt);
+    const prestart = !upFront && wantsSandboxPrestart(this.request);
+    if (upFront) {
       await this.attachHands();
     } else {
-      await this.startWithoutSandbox();
+      await this.startWithoutSandbox(prestart);
     }
     await this.reconcileBackgroundStarts();
+    // After the reconciliation, which reads the session's existing sandbox binding
+    // and must not find this run's own provisioning in its place.
+    if (prestart) this.prestartSandbox();
 
-    const result = await this.executeEngine();
+    let result: ExecuteResult;
+    try {
+      result = await this.executeEngine();
+    } finally {
+      await this.retireUnclaimedPrestart();
+    }
 
     // MCP SDK 1.12 does not propagate AbortSignal through callTool.
     //

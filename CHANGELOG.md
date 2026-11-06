@@ -28,6 +28,14 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Quicker assistant router turns. A router turn can ask for low reasoning effort (`CLAW_ASSISTANT_ROUTER_EFFORT`: low | medium |
+  high | `default`, the default, for the model's own; set `low` where the router runs on a reasoning model such as Claude; a session
+  that chose an effort keeps it), and its `say` is published while the model writes it (`CLAW_ASSISTANT_STREAM_SAY`, default on): the
+  new `ExecuteRequest.stream_tool_text` names tools whose `text` argument Brain streams (Anthropic `eager_input_streaming`, Claude
+  models only) and publishes as `toolTextDelta` events (`tool`, `actionId`, the text so far, at most every 400 ms per call, top-level
+  loop only). The call itself still runs when the step is whole; the deltas are a preview for
+  whoever follows the session live and are not stored. The router's read-only lookups (`read_taint.sources`) now run side by side
+  within a step, as Brain's sandbox reads do.
 - Model choice for the assistant's items, behind `CLAW_ASSISTANT_MODEL_CHOICE` (`on` | off, default off; needs `CLAW_ASSISTANT_ENABLED`
   and a non-empty `CLAW_ASSISTANT_MODELS`, the allow-list as `name=label,...`). One function decides an item's model: the model the
   message asked for, else the payer's own review default (reviews), else their own default, else the deployment's default for the kind
@@ -525,11 +533,20 @@ record it.
   plain text nor a notice that it failed is delivered for it; the handoff record keeps the turn's `message_id` (new column on
   `claw_assistant_review_handoffs`). `POST /v1/assistant/reviews` and the restart route answer each created item's `review_only`, and
   `merge_needs_confirmation` when its merge waits for the acting user's own confirmation whatever their review mode, so a channel tells
-  the person how the merge is made from what was started (`router-v11`).
+  the person how the merge is made from what was started (`router-v12`).
 - Assistant: a review handed to the user's chat merges as the reviewer's own review mode says, as a review asked of them in the chat
   does: it is no longer held for the reviewer's confirmation whatever their mode (`fully_auto` merges, `high_risk_confirm` asks for
   high-risk writes). A request that leaves `handoff_id` out is an ordinary request again: an earlier handoff of the same pull request no
   longer holds it or makes it review-only.
+- An assistant's worker turn starts opening its sandbox when the turn starts, beside its first model call, instead of on its
+  first tool call: the API marks worker turns with the new `ExecuteRequest.sandbox_prestart`, and Brain honours it behind
+  `BRAIN_SANDBOX_PRESTART` (chart `brain.sandboxPrestart`, default on) for a run that opens its sandbox lazily and whose tool list
+  has a sandbox tool. The first tool that asks joins the open already under way. A turn that never asks gives the sandbox back by
+  the ordinary ending: a ready one is parked for the session's next message (and its untouched workspace is not uploaded), one
+  still being created is given up, its workload stopped and its PENDING entry reaped, before the turn reports. Router, observer
+  and ordinary chat turns are unchanged. Brain also reads a provisioning workload's status every second for the first 20 s of
+  the wait, then backs off to every 5 s, instead of every 5 s throughout; a run of 404s must still span 55 s before the
+  workload is given up as gone.
 - Assistant: the router's `say` refuses a message that shows the user internal text (a tool name, the `[work_event]` marker,
   an `item_id`, a run id, or an id of the UUID form the user did not write in the message the turn answers) with
   `internal_text`, and the router is told to name an item by its number and title (`router-v7`); a turn that ends in plain text
@@ -741,6 +758,34 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A database failover no longer leaves the API on the old primary, and no longer costs the assistant's replies. A
+  switchover demotes the old primary in place, and a connection still on it answers every read and refuses every write
+  (`25006`): `inTransaction` handed such a connection back to the pool after a clean rollback, to fail the next
+  transaction too. The first failover error (`25006`, `57P01`-`57P03`, a `08` connection error or a dropped socket) now
+  marks every connection opened before it stale (so does an idle connection the switchover terminates): idle ones are
+  dropped as they are checked out, by any caller of either pool's `connect()` or `query()`, held ones as they are
+  released. A new connection of either pool is handed out only once its server says it is not in recovery (asked once
+  per connection), because for a few seconds the Service can route one to the demoted server, which refuses every write
+  and grants advisory locks that fence nothing. A statement is sent once more on a new connection, after `PG_FAILOVER_RETRY_DELAY_MS` (default 1000), when
+  running it twice is the same as running it once: Postgres refused it before it ran (`25006`, `57P03`), or it only
+  reads. A transaction that says it may run twice is retried the same way, and also when its connection went before
+  its `COMMIT` was sent; every way the assistant stores a message says so. A message whose `COMMIT` took effect but
+  whose answer the failover lost (a `say`, the cap's notice, a system notice, a needs-you message) is looked up,
+  announced and reported as stored; one not found then, or that cannot be looked up, is looked up again in the
+  background over the next minute and announced once found (an error on the `COMMIT` proves nothing either way), and a
+  `say` like that is reported as
+  `say_outcome_unknown`, and the Router ends the turn with the words instead of saying them again (they are delivered
+  only if the turn has not spoken). So the only `say` that faults is one that was not stored; it tells the Router the
+  message was not delivered and to call `say` again. Delivering a Router turn's unsaid answer is tried three times
+  before it is given up, instead of once.
+- A reply the assistant's hourly cap (`CLAW_ASSISTANT_SAY_MAX_PER_HOUR`) refused is no longer dropped without a word.
+  The model's `say` was refused, and so was delivering what it wrote instead, and the user heard nothing for as long as
+  the cap held. The first refusal in an hour now tells the user, in their language, that replies are paused and to try
+  again later (a notice in the system's words, not counted against the cap; at most one an hour, by the database's
+  clock and under the user's say lock, so a client that keeps writing at the cap gets one notice and not one per
+  message; a notice that failed to be stored is tried again in the background); the model is told the message was not delivered
+  and not to call `say` again in the turn; and every refusal is counted in `claw_assistant_say_rate_limited_total`, by
+  whether the user was sent the notice.
 - Deleting a session that has no `hands.<sid>` binding and no key on its cleanup notification -- every session the
   retention pass deletes, and every sweeper replay of a delete that already finished -- is a finished teardown with
   nothing to address (`session.cleanup_nothing_addressable`), not `no_platform_key`. Claw holds no handle to anything
