@@ -75,3 +75,28 @@ test("L7 a name right after a JSON string's escaped line end is a name; one insi
   assert.equal(r.text.includes("Hunter2-not-real-pw"), false, r.text);
   assert.ok(r.text.includes("mytoken: keep-this-value"), "a name that only ends in a credential word is judged whole");
 });
+
+test("L8 a value with spaces goes whole: quoted to its closing quote, unquoted to its line's end", () => {
+  const phrase = "correct horse battery staple";
+  for (const [text, want] of [
+    [`{"password":"${phrase}"}`, `{"password":"<redacted>"}`],
+    [`password: '${phrase}' (from vault)`, `password: '<redacted>' (from vault)`],
+    [`export DB_PASSWORD=${phrase}\nnext`, "export DB_PASSWORD=<redacted>\nnext"],
+    [`"api_key": "a \\"quoted\\" ${phrase}", "user": "alice"`, `"api_key": "<redacted>", "user": "alice"`],
+    [`token: "password=${phrase}" then`, `token: "<redacted>" then`],
+  ] as const) {
+    assert.equal(redactLogSecrets(text).text, want, text);
+  }
+  const json = JSON.stringify({ lines: [`config {"token": "${phrase}"}`, `password: ${phrase}`] });
+  const r = redactLogSecrets(json);
+  for (const word of phrase.split(" ")) assert.equal(r.text.includes(word), false, `${word}: ${r.text}`);
+  assert.doesNotThrow(() => JSON.parse(r.text), "still JSON");
+});
+
+test("L9 a log of unclosed quotes after credential names costs its length", () => {
+  const text = 'password: "x '.repeat(20_000);
+  const t0 = performance.now();
+  const r = redactLogSecrets(text);
+  assert.ok(performance.now() - t0 < 2000, "linear, not quadratic");
+  assert.equal(r.text.includes(" x "), false);
+});

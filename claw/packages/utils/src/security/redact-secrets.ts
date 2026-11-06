@@ -492,12 +492,37 @@ export function redactSecrets(text: string, extraSecrets: string[] = []): Redact
 }
 
 /**
- * A value written after a credential's name in a log line: `PASSWORD=...`, `"api_key": "..."`, `Authorization: Basic ...`, also
- * inside a JSON string (`\\"token\\": \\"...\\"`). The name starts where a name can (not inside another one; after a JSON
- * string's `\\n`, `\\r` or `\\t`) and is judged by `isSensitiveKey`; the value is one run without spaces, quotes, backslashes,
- * separators or brackets, after an optional scheme word.
+ * Where a value written after a credential's name starts in a log line: `PASSWORD=`, `"api_key": "`, `Authorization: `, also
+ * inside a JSON string (`\\"token\\": \\"`). The name starts where a name can (not inside another one; after a JSON string's `\\n`,
+ * `\\r` or `\\t`) and is judged by `isSensitiveKey`. Where the value ends is `namedValueEnd`'s to find: a quoted value runs to its
+ * closing quote, spaces and all, so `"password": "correct horse battery staple"` goes whole.
  */
-const NAMED_VALUE_RE = /(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrt]))(\\?["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1(\s*[:=]\s*)(\\?["']?)((?:(?:Basic|Bearer|Token)\s+)?[^\s"'\\,;{}()[\]<>]{4,})/g;
+const NAMED_VALUE_START_RE = /(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrt]))(\\?["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1(\s*[:=]\s*)(\\?["']?)/g;
+/** Where an unquoted value ends: a line's end, a quote, an escape, a separator, a closing bracket. Not a space: `a b` is one value. */
+const UNQUOTED_VALUE_END = /[\r\n"'\\,;&)\]}>]/;
+
+/**
+ * The end (exclusive) of the value starting at `from`, quoted with `quote` (`"`, `'`, `\"`, `\'`) or not (`""`). A quoted value
+ * ends at its closing quote on the same line (a quote escaped inside it is part of it); without one, and for an unquoted value, at
+ * the line's end, where a JSON string's `\n` counts as one, or at what ends an unquoted value. Trailing spaces are not the value's.
+ */
+function namedValueEnd(text: string, from: number, quote: string): number {
+  const limit = text.length;
+  if (quote) {
+    for (let i = from; i < limit && text[i] !== "\n" && text[i] !== "\r"; i += 1) {
+      if (text.startsWith(quote, i) && !(quote.length === 1 && text[i - 1] === "\\")) return i;
+    }
+  }
+  let end = limit;
+  for (let i = from; i < limit; i += 1) {
+    const c = text[i];
+    if (c === "\n" || c === "\r" || (c === "\\" && (text[i + 1] === "n" || text[i + 1] === "r"))) { end = i; break; }
+    if (!quote && UNQUOTED_VALUE_END.test(c)) { end = i; break; }
+  }
+  while (end > from && /\s/.test(text[end - 1])) end -= 1;
+  return end;
+}
+
 /** Values a credential's name is followed by that are not a credential: a switch, a placeholder, a mask. */
 const NOT_A_VALUE_RE = /^(?:true|false|null|none|nil|undefined|enabled|disabled|yes|no|on|off|required|optional|\*+|x+|\.+)$/i;
 /** A private key, armored. Its lines may be real line ends or a JSON string's `\n`. */
@@ -517,11 +542,22 @@ export function redactLogSecrets(text: string, extraSecrets: string[] = []): Red
     hits += 1;
     return "<redacted private key>";
   });
-  out = out.replace(NAMED_VALUE_RE, (whole, q1: string, name: string, sep: string, q2: string, value: string) => {
-    if (NOT_A_VALUE_RE.test(value) || !isSensitiveKey(name)) return whole;
+  let masked = "";
+  let kept = 0;
+  NAMED_VALUE_START_RE.lastIndex = 0;
+  for (let m = NAMED_VALUE_START_RE.exec(out); m; m = NAMED_VALUE_START_RE.exec(out)) {
+    const [start, q1, name, sep, q2] = m;
+    if (!isSensitiveKey(name)) continue;
+    const from = m.index + start.length;
+    const end = namedValueEnd(out, from, q2);
+    const value = out.slice(from, end);
+    if (value.length < 4 || NOT_A_VALUE_RE.test(value)) continue;
     hits += 1;
-    return `${q1}${name}${q1}${sep}${q2}<redacted>`;
-  });
+    masked += `${out.slice(kept, m.index)}${q1}${name}${q1}${sep}${q2}<redacted>`;
+    kept = end;
+    NAMED_VALUE_START_RE.lastIndex = end;
+  }
+  out = masked + out.slice(kept);
   return { text: out, hits };
 }
 

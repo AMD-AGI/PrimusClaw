@@ -141,4 +141,9 @@ test("LR3 the rule: what it accepts, the bound, the mask, and the end of a long 
   const whole = rule.filter(json);
   assert.ok(whole.startsWith('{"logs":"line 000'), "JSON is not cut");
   assert.ok(!whole.includes(FAKE_PW));
+  // A plain-text log that starts with a bracket is plain text: it is cut to its end like any other.
+  const bracketed = text.split("\n").map((l) => `[INFO] ${l}`).join("\n");
+  const cut = rule.filter(bracketed);
+  assert.ok(cut.length < 700, `${cut.length}`);
+  assert.match(cut, /^\[\d+ earlier characters of this log are not shown\]\n\[INFO\] line \d{3} /);
 });

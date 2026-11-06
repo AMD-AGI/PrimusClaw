@@ -19,6 +19,17 @@
  */
 import { redactLogSecrets } from "@claw/utils";
 
+/** Whether an answer is JSON (left whole: its newest lines may come first), not a plain-text log that starts with `[` or `{`. */
+function isJson(text: string): boolean {
+  if (!/^\s*[[{]/.test(text)) return false;
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export interface LogReads {
   /** Whether `name` is one of the run's log reads. */
   has(name: string): boolean;
@@ -53,8 +64,9 @@ export function parseLogReads(raw: unknown): LogReads | null {
       return { ...input, [arg]: Number.isFinite(n) && n >= 1 && n < lines ? Math.floor(n) : lines };
     },
     filter(text) {
-      const masked = redactLogSecrets(typeof text === "string" ? text : String(text ?? "")).text;
-      if (masked.length <= chars || /^\s*[[{]/.test(masked)) return masked;
+      const raw = typeof text === "string" ? text : String(text ?? "");
+      const masked = redactLogSecrets(raw).text;
+      if (masked.length <= chars || isJson(raw)) return masked;
       const end = masked.slice(-chars);
       const cut = end.indexOf("\n");
       const kept = cut >= 0 && cut < end.length - 1 ? end.slice(cut + 1) : end;
