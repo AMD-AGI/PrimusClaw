@@ -68,6 +68,10 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   // When the item's worker was first shown the user's memory beyond the item (the index, or an entry recalled): its session
   // keeps what it read from run to run, so from then on it never answers on GitHub without asking (`memory-tools.ts`).
   await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS memory_reached_at TIMESTAMPTZ");
+  // The assistant session the item was started from (`insertWorkItem`): what the system says about the item on its own (the silent
+  // sweep's fallback, an answer said whole) goes there, and only to the user's current session when that one was deleted
+  // (`needsYouMessage`, outbound.ts). Null on an item made before the column, and on a remote item.
+  await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS router_session_id TEXT");
   // One open review of a pull request at a time, whoever asked: two sessions reviewing it could both write to it.
   // GitHub's names are not case sensitive, and neither is this.
   await client.query(
@@ -126,6 +130,9 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_assistant_says_user ON claw_assistant_says(user_id, created_at DESC)",
   );
+  // The assistant session the say was published to, for the web client (null: none). A say shown there told a user who has no channel
+  // that carries it, and the silent sweep does not say it again (`silent-sweep.ts`).
+  await client.query("ALTER TABLE claw_assistant_says ADD COLUMN IF NOT EXISTS session_id TEXT");
   // At most one system fallback per time an item needed the user. Ordinary says
   // are not limited: the assistant may speak about one item more than once.
   await client.query(

@@ -22,13 +22,18 @@
  * (`resendUnreachedSays`). Until one does, the item is not picked, so it does not hold a place in the
  * batch that another item could use.
  *
- * With notifications off nothing has a channel, and a stored fallback is what the web client shows: there
- * it counts as told.
+ * A say that was shown in an assistant session (`claw_assistant_says.session_id`) told a user who has no channel that takes it: the
+ * web client is the one place it can reach them, and it did. Without this, every item a user without a channel was told about was
+ * told again by the sweep, into whichever session was theirs by then (2026-11-06 parity run: #119, #120 and #121 said twice, #119
+ * and #120 into the session that replaced the deleted one they were said in).
+ *
+ * With notifications off nothing has a channel, and a stored fallback, or any say shown in a session, is what the web client
+ * shows: there it counts as told.
  */
 import pino from "pino";
 import { CLAW_ASSISTANT_SILENT_SWEEP_SEC, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
-import { ANSWERED_UNSAID_SQL, recordNeedsYouFallback, resendUnreachedSays, UNREACHED_SAY_SQL } from "./outbound.js";
+import { ANSWERED_UNSAID_SQL, recordNeedsYouFallback, resendUnreachedSays, SAY_EVENT_TYPE_SQL, UNREACHED_SAY_SQL } from "./outbound.js";
 
 const logger = pino({ name: "assistant-silent-sweep" });
 
@@ -42,8 +47,11 @@ export const silentSweepPorts = { recordNeedsYouFallback, resendUnreachedSays };
 const told = (notifications: boolean): string => notifications
   ? `s.delivered_at IS NOT NULL OR EXISTS (
        SELECT 1 FROM claw_notification_outbox o
-        WHERE o.event_id = s.say_id::text AND o.dropped_at IS NULL AND o.last_status IS NULL)`
-  : "s.delivered_at IS NOT NULL OR s.fallback";
+        WHERE o.event_id = s.say_id::text AND o.dropped_at IS NULL AND o.last_status IS NULL)
+     OR (s.session_id IS NOT NULL AND NOT EXISTS (
+       SELECT 1 FROM claw_notification_subscriptions n
+        WHERE n.owner_user_id = s.user_id AND n.enabled AND (${SAY_EVENT_TYPE_SQL}) = ANY(n.event_types)))`
+  : "s.delivered_at IS NOT NULL OR s.fallback OR s.session_id IS NOT NULL";
 
 /** Returns how many announcements were made. */
 export async function tellSilentItems(

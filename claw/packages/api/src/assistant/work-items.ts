@@ -330,8 +330,9 @@ export async function insertWorkItem(
     holdFor?: "too_many_in_request";
   },
 ): Promise<InsertWorkItemResult> {
-  const locked = await q.query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [input.userId]);
+  const locked = await q.query("SELECT session_id FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [input.userId]);
   if (!locked.rowCount) return { ok: false, error: "no_assistant" };
+  const routerSessionId = String((locked.rows[0] as { session_id: string }).session_id);
   const counts = (await q.query(
     `SELECT COUNT(*) FILTER (WHERE ${RUNNING} AND NOT (params ? 'requested_by'))::int AS active,
             COUNT(*) FILTER (WHERE ${RUNNING} AND params ? 'requested_by')::int AS others,
@@ -358,11 +359,11 @@ export async function insertWorkItem(
   const params = queued ? { ...(input.params ?? {}), queued: { since: new Date().toISOString(), reason: queued } } : input.params;
   const itemId = newWorkItemId();
   await q.query(
-    `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo, kind, params)
-     VALUES ($1, $2, $3, $4, 'in_progress', $5, $6::jsonb, $7, $8::jsonb)`,
+    `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo, kind, params, router_session_id)
+     VALUES ($1, $2, $3, $4, 'in_progress', $5, $6::jsonb, $7, $8::jsonb, $9)`,
     [
       itemId, input.userId, counts.next, clipOneLine(input.title, TITLE_MAX), input.workerSessionId,
-      input.repo === undefined ? null : JSON.stringify(input.repo), input.kind ?? "task", JSON.stringify(params ?? {}),
+      input.repo === undefined ? null : JSON.stringify(input.repo), input.kind ?? "task", JSON.stringify(params ?? {}), routerSessionId,
     ],
   );
   await q.query(

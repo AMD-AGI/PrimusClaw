@@ -48,6 +48,12 @@ record it.
 - A difference or percentage between two results is computed from the unrounded values: the router no longer subtracts the rounded
   figures of two reports itself (2026-11-06 parity run, M2: 678.7 where the data gives 678.6) but asks the item that has the data, and
   a worker rounds only the figure it reports (`worker-v6`).
+- An item's result is no longer said twice. The silent sweep took a say shown in the assistant session as having told nobody when the
+  user had no channel subscription, and said the result again about five minutes later, into whichever session was the user's by then
+  (2026-11-06 parity run: #119 and #120 into the session that replaced the deleted one, #121 into its own). A say shown in a session
+  (`claw_assistant_says.session_id`) now tells a user with no channel that takes it. What the system says about an item on its own goes
+  to the session the item was started from (`claw_work_items.router_session_id`); when the user deleted that session, once to the
+  one they have now, marked as from an earlier conversation.
 - A follow-up that starts a new item ("去掉 cancelled 再算一次") no longer leaves its worker without the file the user sent earlier: a new item
   gets a copy of the files the user sent in the last 24 hours of the conversation (`files_from_earlier_messages`), the router is told
   they will go with it, and it forwards a follow-up to the item that did the work while that item is open (`router-v15`).

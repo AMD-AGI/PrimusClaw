@@ -184,11 +184,11 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
 /** Store the message and queue it for every subscription that asked for its type. `null`: it was stored before. */
 async function store(q: Querier, m: ToStore): Promise<Stored | null> {
   const inserted = (await q(
-    `INSERT INTO claw_assistant_says (say_id, user_id, item_id, item_attention_seq, text, fallback)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO claw_assistant_says (say_id, user_id, item_id, item_attention_seq, text, fallback, session_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (say_id) DO NOTHING
      RETURNING created_at`,
-    [m.sayId, m.userId, m.item?.item_id ?? null, m.item?.attention_seq ?? null, m.text, m.type === "work_item.needs_you" || m.fallback === true],
+    [m.sayId, m.userId, m.item?.item_id ?? null, m.item?.attention_seq ?? null, m.text, m.type === "work_item.needs_you" || m.fallback === true, m.sessionId],
   )).rows[0];
   if (!inserted) return null;
   const payload = payloadOf(m, inserted.created_at);
@@ -707,6 +707,29 @@ export async function turnHandedOffReview(q: Querier, userId: string, messageId:
   )).rows.length > 0;
 }
 
+/** What a message about an item from a session the user deleted starts with: it is said in the session they have now, once. */
+export const MOVED_PREFIX_ZH = "（之前的对话里开始的事项）";
+export const MOVED_PREFIX_EN = "(From an earlier conversation) ";
+
+/**
+ * Where the system says something about an item on its own: the assistant session the item was started from. When the user deleted
+ * that session (a new one took its place), the session they have now, and `moved`: the message says where the item came from. It is
+ * still said once (its id is the item's and the need's), and only when nothing told the user before (the silent sweep's `told`). An
+ * item made before its session was recorded goes to the current session, as before.
+ */
+async function itemSession(q: Querier, itemId: string): Promise<{ sessionId: string | null; moved: boolean }> {
+  const row = (await q(
+    `SELECT w.router_session_id AS own, a.session_id AS current,
+            EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = w.router_session_id AND s.deleted_at IS NULL) AS own_live
+       FROM claw_work_items w LEFT JOIN claw_assistants a ON a.user_id = w.user_id
+      WHERE w.item_id = $1`,
+    [itemId],
+  )).rows[0] as { own: string | null; current: string | null; own_live: boolean } | undefined;
+  if (!row) return { sessionId: null, moved: false };
+  if (!row.own || row.own_live || row.own === row.current) return { sessionId: row.own && row.own_live ? row.own : row.current, moved: false };
+  return { sessionId: row.current, moved: row.current !== null };
+}
+
 /** The system's message for an item that needs the user or was answered (`recordNeedsYouFallback`), or null when it is neither. */
 async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToStore, { type: "work_item.needs_you" }> | null> {
   const item = await loadItem(q, itemId);
@@ -718,18 +741,19 @@ async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToSt
         "SELECT summary FROM claw_work_item_events WHERE item_id = $1 AND kind = 'answer' ORDER BY id DESC LIMIT 1", [item.item_id],
       )).rows[0]?.summary as string | undefined) ?? ""
     : "";
-  const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id ?? null;
+  const where = await itemSession(q, item.item_id);
   const params = answered ? null
     : ((await q("SELECT params FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0]?.params as Record<string, unknown> | null) ?? null;
   const zh = await personWritesChinese(q, item.user_id, item.title);
-  const text = answered
+  const said = answered
     ? (zh ? `#${item.seq} ${item.title}：${answer}` : `#${item.seq} "${item.title}": ${answer}`)
     : heldWriteText(item, params) ?? needsYouText(item, zh);
+  const text = where.moved ? `${zh ? MOVED_PREFIX_ZH : MOVED_PREFIX_EN}${said}` : said;
   return {
     type: "work_item.needs_you",
     sayId: deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq)),
     userId: item.user_id,
-    sessionId,
+    sessionId: where.sessionId,
     text,
     item,
   };
@@ -856,7 +880,7 @@ export const ANSWERED_UNSAID_SQL = "w.board_state = 'done' AND w.outcome = 'answ
  * by its id -- `deterministicEventId("work_item.needs_you", item_id, attention_seq)`, computed here the same way -- and
  * `assistant.say` for every other say, a system notice about an item included.
  */
-const SAY_EVENT_TYPE_SQL = `CASE WHEN s.fallback AND s.item_id IS NOT NULL AND s.item_attention_seq IS NOT NULL
+export const SAY_EVENT_TYPE_SQL = `CASE WHEN s.fallback AND s.item_id IS NOT NULL AND s.item_attention_seq IS NOT NULL
              AND s.say_id = substr(encode(sha256(
                    convert_to('work_item.needs_you', 'UTF8') || '\\x00'::bytea || convert_to(s.item_id, 'UTF8')
                    || '\\x00'::bytea || convert_to(s.item_attention_seq::text, 'UTF8')), 'hex'), 1, 32)::uuid
