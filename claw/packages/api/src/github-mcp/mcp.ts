@@ -33,7 +33,7 @@ import { mintSessionToolToken, verifySessionToolToken } from "../github-review/t
 import {
   GITHUB_MCP_PATH, GITHUB_MCP_TOKEN_TTL_SECONDS, GITHUB_TOKEN_ENV_NAME, readGithubMcpSettings, type GithubMcpSettings,
 } from "./settings.js";
-import { buildGithubToolServer, READ_TOOLS } from "./tools.js";
+import { buildGithubToolServer, githubWebHost, READ_TOOLS } from "./tools.js";
 
 const logger = pino({ name: "github-mcp" });
 
@@ -130,7 +130,9 @@ export async function registerGithubMcpRoutes(app: FastifyInstance, opts: Github
       return refuse(reply, 503, "unavailable");
     }
     if (!token) return refuse(reply, 403, "no_github_token");
-    const mcp = buildGithubToolServer({ gh: new GithubClient({ token, apiUrl: s.apiUrl, fetchImpl: opts.fetchImpl }), fetchImpl: opts.fetchImpl });
+    const mcp = buildGithubToolServer({
+      gh: new GithubClient({ token, apiUrl: s.apiUrl, fetchImpl: opts.fetchImpl }), fetchImpl: opts.fetchImpl, webHost: githubWebHost(s.apiUrl),
+    });
     // Stateless, like the review tools: one server and transport per request.
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as unknown as () => string });
     reply.hijack();

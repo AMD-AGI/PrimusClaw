@@ -13,6 +13,7 @@
  * every tool that is not listed in READ_TOOLS for the user's decision, including any added here later.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { CITE_SOURCES_META, type CiteSource } from "@claw/protocol";
 import pino from "pino";
 import { z } from "zod";
 import { GithubError, GithubGraphqlError, isValidOwner, parseRepoRef, repoPath, type GithubClient } from "../github-review/github.js";
@@ -40,7 +41,48 @@ export const MAX_ANSWER_CHARS = 60_000;
 const MAX_PATCH_CHARS = 4_000;
 export const MAX_LOG_BYTES = 8 * 1024 * 1024;
 
-type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
+type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean; _meta?: Record<string, unknown> };
+
+/**
+ * The host GitHub's own pages are on, for the API at `apiUrl`: github.com for api.github.com, and the API's own host otherwise
+ * (GitHub Enterprise Server serves its pages and its API from one host).
+ */
+export function githubWebHost(apiUrl: string): string {
+  try {
+    const host = new URL(apiUrl).host.toLowerCase();
+    return host === "api.github.com" ? "github.com" : host;
+  } catch {
+    return "github.com";
+  }
+}
+
+/** The most sources one result lists. */
+const MAX_SOURCES = 100;
+
+/**
+ * What a read returned, as sources a turn may cite (`ExecuteRequest.cite`): GitHub's own pages only, an https address on `webHost`.
+ * A check's or a status's details address is the integration's choice and is a source only when it is one of GitHub's own pages.
+ */
+function sourcesOn(webHost: string, sources: Array<CiteSource | null>): CiteSource[] {
+  const out: CiteSource[] = [];
+  for (const s of sources) {
+    if (!s || typeof s.url !== "string" || out.length >= MAX_SOURCES) continue;
+    try {
+      const u = new URL(s.url);
+      if (u.protocol === "https:" && u.host.toLowerCase() === webHost && !u.username && !u.password) out.push(s);
+    } catch { /* not an address */ }
+  }
+  return out;
+}
+
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/** A pull request or an issue (an `issueSummary` / `prSummary`) of `repo`, as a source. */
+function itemSource(repo: string | undefined, i: Record<string, any> | null | undefined, pr?: boolean): CiteSource | null {
+  if (!i || typeof i.url !== "string") return null;
+  const isPr = pr ?? i.is_pull_request === true;
+  return { url: i.url, title: `${repo ? `${repo}#` : "#"}${i.number ?? ""} ${str(i.title)}`.trim(), kind: isPr ? "github_pr" : "github_issue" };
+}
 
 /** An argument the tool cannot use; its message is for the model. */
 class BadInput extends Error {}
@@ -85,10 +127,21 @@ function readFailure(err: unknown): string {
   return "the call failed; try once more";
 }
 
-async function answer(tool: string, run: () => Promise<unknown>): Promise<ToolResult> {
+/** `sources`: what a read's answer lists as sources, put in the result's `_meta` where only Brain reads it, never the model. */
+async function answer(tool: string, run: () => Promise<unknown>, sources?: (value: any) => CiteSource[]): Promise<ToolResult> {
   try {
     const value = await run();
-    return { content: [{ type: "text", text: cut(typeof value === "string" ? value : JSON.stringify(value)) }] };
+    let listed: CiteSource[] = [];
+    try {
+      listed = sources ? sources(value) : [];
+    } catch (err) {
+      // The read answered; only its sources are lost.
+      logger.warn({ tool, errorClass: (err as Error)?.constructor?.name }, "github_mcp.sources_failed");
+    }
+    return {
+      content: [{ type: "text", text: cut(typeof value === "string" ? value : JSON.stringify(value)) }],
+      ...(listed.length ? { _meta: { [CITE_SOURCES_META]: listed } } : {}),
+    };
   } catch (err) {
     if ((READ_TOOLS as readonly string[]).includes(tool)) {
       logger.warn({
@@ -164,6 +217,8 @@ const THREADS_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
 
 export interface GithubToolDeps {
   gh: GithubClient;
+  /** The host of GitHub's own pages (`githubWebHost`): the only one a read lists sources on. Default github.com. */
+  webHost?: string;
   /** For the one request that leaves GitHub's API: a job log's download address, which GitHub signs and hands out. */
   fetchImpl?: typeof fetch;
 }
@@ -187,8 +242,12 @@ async function tailBytes(body: ReadableStream<Uint8Array> | null, max: number): 
   return Buffer.concat(kept, size);
 }
 
-export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps): McpServer {
+export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github.com" }: GithubToolDeps): McpServer {
   const mcp = new McpServer({ name: "github", version: "1.0.0" });
+  const host = webHost.toLowerCase();
+  const on = (list: Array<CiteSource | null>): CiteSource[] => sourcesOn(host, list);
+  const each = (v: unknown): Record<string, any>[] => (Array.isArray(v) ? v.filter((x) => x && typeof x === "object") : []);
+  const repoName = (input: string): string => { const r = parseRepoRef(input); return r ? `${r.owner}/${r.repo}` : ""; };
 
   // ---- reads ----
   mcp.tool("repo_get_file", "Read a file, or list a directory, of a repository at a ref (default branch when no ref).", {
@@ -223,11 +282,12 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
       repo: r.full_name, private: r.private, archived: r.archived, fork: r.fork, default_branch: r.default_branch,
       description: r.description, url: r.html_url, pushed_at: r.pushed_at, open_issues_and_prs: r.open_issues_count,
     }));
-  }));
+  }, (v) => on(each(v).map((r) => (typeof r.url === "string" ? { url: r.url, title: str(r.repo), kind: "github_repo" as const } : null)))));
 
   mcp.tool("pr_get", "A pull request: title, state, author, branches, head sha, mergeability, size and description.", {
     repo: REPO, number: NUMBER,
-  }, (a) => answer("pr_get", async () => prSummary((await gh.get<any>(repoPath(repoOf(a.repo), `/pulls/${a.number}`))).json)));
+  }, (a) => answer("pr_get", async () => prSummary((await gh.get<any>(repoPath(repoOf(a.repo), `/pulls/${a.number}`))).json),
+    (v) => on([itemSource(repoName(a.repo), v, true)])));
 
   mcp.tool("pr_list", "List pull requests of a repository, newest first.", {
     repo: REPO, state: z.enum(["open", "closed", "all"]).optional(), head: z.string().optional().describe("owner:branch"),
@@ -238,7 +298,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
     if (a.base) q.base = a.base;
     const list = (await gh.get<any[]>(repoPath(repoOf(a.repo), "/pulls"), q)).json ?? [];
     return list.map((p) => { const { body: _b, ...rest } = prSummary(p); return rest; });
-  }));
+  }, (v) => on(each(v).map((p) => itemSource(repoName(a.repo), p, true)))));
 
   mcp.tool("pr_files", "The files a pull request changes, with each file's patch (long patches are cut).", {
     repo: REPO, number: NUMBER, page: PAGE,
@@ -276,7 +336,10 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
       combined_state: status?.state,
       statuses: (status?.statuses ?? []).map((s: any) => ({ context: s.context, state: s.state, description: s.description, url: s.target_url })),
     };
-  }));
+  }, (v) => on([
+    ...each(v?.check_runs).map((c) => (typeof c.url === "string" ? { url: c.url, title: `${repoName(a.repo)} ${str(c.name)}`.trim(), kind: "github_check" as const } : null)),
+    ...each(v?.statuses).map((s) => (typeof s.url === "string" ? { url: s.url, title: `${repoName(a.repo)} ${str(s.context)}`.trim(), kind: "github_check" as const } : null)),
+  ])));
 
   mcp.tool("job_logs", "The end of a GitHub Actions job's log (the id of its check run).", {
     repo: REPO, job_id: z.number().int().min(1), tail_lines: z.number().int().min(1).max(2000).optional().describe("Default 200"),
@@ -306,7 +369,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
       ...issueSummary(issue), body: issue?.body ?? "",
       latest_comments: comments.slice(-30).map((c) => ({ id: c.id, author: login(c.user), created_at: c.created_at, url: c.html_url, body: c.body })),
     };
-  }));
+  }, (v) => on([itemSource(repoName(a.repo), v)])));
 
   mcp.tool("issue_list", "List issues of a repository (pull requests are included and marked).", {
     repo: REPO, state: z.enum(["open", "closed", "all"]).optional(), labels: z.string().optional().describe("Comma-separated label names"),
@@ -315,7 +378,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
     const q: Record<string, string | number> = { state: a.state ?? "open", per_page: a.per_page ?? 20, page: a.page ?? 1 };
     if (a.labels) q.labels = a.labels;
     return ((await gh.get<any[]>(repoPath(repoOf(a.repo), "/issues"), q)).json ?? []).map(issueSummary);
-  }));
+  }, (v) => on(each(v).map((i) => itemSource(repoName(a.repo), i)))));
 
   mcp.tool("issue_search", "Search pull requests and issues across GitHub, as the user, with GitHub's search syntax: `is:pr is:open author:@me` (the user's open pull requests), `is:pr is:open review-requested:@me`, `is:issue is:open assignee:@me`; narrow with `repo:owner/name` or `org:name`. Returns the total count and the matches, most recently updated first.", {
     query: z.string().min(1).max(256).describe("GitHub search syntax; @me is the user"),
@@ -326,7 +389,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
       total_count: res?.total_count, incomplete_results: res?.incomplete_results,
       items: (res?.items ?? []).map((i: any) => ({ repo: repoOfUrl(i.repository_url), ...issueSummary(i), ...(i.pull_request ? { draft: i.draft === true } : {}) })),
     };
-  }));
+  }, (v) => on(each(v?.items).map((i) => itemSource(typeof i.repo === "string" ? i.repo : undefined, i)))));
 
   mcp.tool("review_threads_list", "The review threads of a pull request: id (for review_thread_reply / review_thread_resolve), resolved or not, file, line and comments.", {
     repo: REPO, number: NUMBER,
@@ -349,7 +412,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
       total_count: res?.total_count,
       items: (res?.items ?? []).map((i: any) => ({ repo: i.repository?.full_name, path: i.path, url: i.html_url })),
     };
-  }));
+  }, (v) => on(each(v?.items).map((i) => (typeof i.url === "string" ? { url: i.url, title: `${str(i.repo)} ${str(i.path)}`.trim(), kind: "github_file" as const } : null)))));
 
   // ---- writes: each waits for the user's decision ----
   mcp.tool("issue_comment", "Post a comment on an issue or a pull request's conversation. Waits for the user's approval.", {

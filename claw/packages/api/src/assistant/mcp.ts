@@ -34,6 +34,8 @@ import { modelChoiceOn } from "./model-choice.js";
 import { assistantMemoryOn, memoryForget, memoryRecall, memorySave, memoryUndo, memoryUpdate } from "./memory-tools.js";
 import { channelAction, confirmationAnswer, MAX_PRS, reviewModeSet, reviewRestart, reviewStart } from "./review-tools.js";
 import { observeEveryTool, recordObservation } from "./observe.js";
+import { assistantCitationsOn } from "./citations.js";
+import { CITE_MAX_PER_CALL } from "@claw/protocol";
 
 const logger = pino({ name: "assistant-mcp" });
 
@@ -172,9 +174,15 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims, choic
   );
 }
 
+/** What `say`'s `sources` says to the model (`CLAW_ASSISTANT_CITATIONS`). */
+export const SAY_SOURCES_PARAM = `Only when the text cites a lookup of this turn as [1], [2]: the address each number stands for, in order (the first is [1]), `
+  + "copied exactly from what the lookup returned (a web_search result's url, a GitHub result's url, or the URL web_fetch read when a search or "
+  + `GitHub result or the user's message gave it). At most ${CITE_MAX_PER_CALL}. `
+  + "An address no lookup of this turn returned is dropped. Write it after text.";
+
 export function createAssistantMcpServer(
   claims: AssistantTokenClaims, reviewTools: boolean = CLAW_ASSISTANT_TOOLS, memoryTools: boolean = assistantMemoryOn(),
-  modelChoice: boolean = modelChoiceOn(),
+  modelChoice: boolean = modelChoiceOn(), citations: boolean = assistantCitationsOn(),
 ): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
   if (claims.role === "observer") {
@@ -199,8 +207,13 @@ export function createAssistantMcpServer(
       {
         text: z.string().describe("What to tell the user, in the language they use."),
         item_id: z.string().optional().describe(ITEM_ID_PARAM),
+        // After text: the text is what streams while the model writes it (`stream_tool_text`), and only once the fields before it are whole.
+        // Never read here (Brain sends the sources in `_meta`), so one the model got wrong is no reason to refuse what it says: the
+        // schema it is shown stays the same, and a `sources` that does not fit it is read as none.
+        ...(citations ? { sources: z.array(z.string()).optional().catch(undefined).describe(SAY_SOURCES_PARAM) } : {}),
       },
-      (args) => answer(claims, "say", () => say(claims, args), SAY_FAULT_MESSAGE),
+      // The sources come from Brain, in the request's `_meta` (`citations.ts`); never from the model's `sources` argument.
+      (args, extra) => answer(claims, "say", () => say(claims, args, {}, citations ? extra._meta ?? {} : undefined), SAY_FAULT_MESSAGE),
     );
     mcp.tool(
       "work_create",

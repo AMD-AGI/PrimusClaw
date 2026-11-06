@@ -26,6 +26,7 @@ import {
   type AssistantItemSnapshot,
   type AssistantConfirmAction,
   type AssistantSayPayload,
+  type AssistantSaySource,
   type WorkItemNeedsYouPayload,
 } from "../notifications/assistant-events.js";
 import { deterministicEventId, enqueue, kickDelivery, onDelivered } from "../notifications/outbox.js";
@@ -72,6 +73,8 @@ export interface SayInput {
    * handed a review to the person's channel says nothing more (`turnHandedOffReview`): its say is refused.
    */
   turnMessageId?: string;
+  /** What the message cites, already checked (`citations.ts`): carried by its event to the channel and the web client. */
+  sources?: AssistantSaySource[];
 }
 
 export interface SayDeps {
@@ -129,7 +132,9 @@ interface ToStoreBase {
 }
 
 type ToStore =
-  | (ToStoreBase & { type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction })
+  | (ToStoreBase & {
+    type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; sources?: AssistantSaySource[];
+  })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow });
 
 /** What a stored message is, to a receiver and to the web client. */
@@ -137,7 +142,10 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
   const base = { event_id: m.sayId, occurred_at: new Date(createdAt).toISOString(), user_id: m.userId, text: redact(m.text) };
   return m.type === "work_item.needs_you"
     ? { ...base, type: m.type, fallback: true, item: snapshot(m.item) }
-    : { ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}) };
+    : {
+      ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}),
+      ...(m.sources?.length ? { sources: m.sources } : {}),
+    };
 }
 
 /** Store the message and queue it for every subscription that asked for its type. `null`: it was stored before. */
@@ -185,6 +193,7 @@ async function announce(stored: Stored, deps: SayDeps, turnMessageId?: string): 
         ...(turnMessageId ? { turn_message_id: turnMessageId } : {}),
         text: payload.text,
         ...(payload.item ? { item: payload.item } : {}),
+        ...(payload.type === "assistant.say" && payload.sources ? { sources: payload.sources } : {}),
         fallback: payload.type === "work_item.needs_you",
         ts: Date.parse(payload.occurred_at),
       });
@@ -454,7 +463,7 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
         [input.userId],
       )).rows[0].n);
       if (recent >= limit) throw new SayCapped(limit);
-      return storeOne({ type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item });
+      return storeOne({ type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item, sources: input.sources });
     }, (late) => announce(late, deps, input.turnMessageId));
   } catch (err) {
     if (err instanceof SayCapped) throw await refusedByCap(input, text, err, deps);

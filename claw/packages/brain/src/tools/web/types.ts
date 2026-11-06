@@ -66,6 +66,12 @@ export interface SearchHit {
  */
 export interface WebToolOutcome {
   isError: boolean;
+  /**
+   * What the call read, as sources (`tools/citations.ts`): the pages a search answered with, the page a fetch read whole. Set only
+   * by this code, from what it parsed, never from the text it returns. Each one a `CiteSource`, in the type the router's
+   * `RouteOutcome` takes them in, which also holds what an MCP server listed.
+   */
+  sources?: unknown[];
 }
 
 /** Provider interface — each backend implements this. */
