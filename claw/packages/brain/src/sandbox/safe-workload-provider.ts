@@ -20,6 +20,7 @@ import {
   SANDBOX_NAMESPACE,
   SANDBOX_WORKLOAD_PRIORITY,
   SANDBOX_UNSCHEDULABLE_TIMEOUT_MS,
+  SANDBOX_PENDING_TIMEOUT_MS,
   AUTH_INTERNAL_TOKEN,
 } from "../config.js";
 import {
@@ -150,6 +151,9 @@ export class SafeWorkloadProvider implements SandboxProvider {
       // The sandbox a run opens gives up early on an admitted workload that no
       // node will run; see SANDBOX_UNSCHEDULABLE_TIMEOUT_MS.
       unschedulableTimeoutMs: SANDBOX_UNSCHEDULABLE_TIMEOUT_MS,
+      // A node being added for it is a wait for capacity: the queue's ceiling,
+      // not the start one (see scaleUpTimeoutMs).
+      scaleUpTimeoutMs: SANDBOX_PENDING_TIMEOUT_MS,
       // For a cancelled run, which the failure path does not reap, and for an
       // unschedulable one, which has nothing to wait for or learn from: no pod
       // ever ran, so the platform has no account of it that the failure path
@@ -336,7 +340,7 @@ export async function pollWorkloadUntilRunning(
   /** Event-name prefix of the wait's logs (`<prefix>.poll_error`); `hands` unless another owner says so. */
   logPrefix = "hands",
   /** The run's cancel signal, and what to do with the workload when the wait is given up. */
-  wait?: Pick<WorkloadWaitOptions, "signal" | "onGiveUp" | "reclaimOnAbort" | "unschedulableTimeoutMs">,
+  wait?: Pick<WorkloadWaitOptions, "signal" | "onGiveUp" | "reclaimOnAbort" | "unschedulableTimeoutMs" | "scaleUpTimeoutMs">,
 ): Promise<void> {
   await onEvent?.({ type: "sandboxStatus", event: "phase", phase: "Creating", status: "creating", log: "" });
 
@@ -373,6 +377,7 @@ export async function pollWorkloadUntilRunning(
     reclaimOnAbort: wait?.reclaimOnAbort,
     onGiveUp: wait?.onGiveUp,
     unschedulableTimeoutMs: wait?.unschedulableTimeoutMs,
+    scaleUpTimeoutMs: wait?.scaleUpTimeoutMs,
     deps,
   });
 }

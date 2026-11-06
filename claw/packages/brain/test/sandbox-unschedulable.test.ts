@@ -132,6 +132,7 @@ async function run(bodies: Body[], o: {
   unschedulableTimeoutMs?: number;
   pendingTimeoutMs?: number;
   startTimeoutMs?: number;
+  scaleUpTimeoutMs?: number;
   waitNoticeGapMs?: number;
 }) {
   const clock = fakeClock();
@@ -144,6 +145,7 @@ async function run(bodies: Body[], o: {
     await waitForWorkloadReady({
       workloadId: o.workloadId ?? "wl-1", apiKey: "key", logPrefix: "test", isReady: isRunning,
       unschedulableTimeoutMs: o.unschedulableTimeoutMs,
+      scaleUpTimeoutMs: o.scaleUpTimeoutMs,
       onProgress: async (p) => { progress.push({ ...p, at: clock.now() } as Progress); },
       onTerminal: async (t) => { terminal.push(t); },
       onGiveUp: async (g) => { gaveUp.push(g); },
@@ -574,14 +576,18 @@ test("a read that says nothing about the workload leaves a scale-up in force", {
   assert.equal(cleared.ended, "sandbox_unschedulable");
 });
 
-test("a scale-up that was seen is out of the short limit's clock and the start ceiling, and the queue ceiling still applies", { timeout: 5000 }, async () => {
-  // A node being added is a wait for capacity whichever phase the platform reports:
-  // NotReady runs on the 3-hour queue ceiling, not the 15-minute start one.
+test("a scale-up that was seen is out of the short limit's clock, and the ceilings of the phase still apply unless the caller set one for it", { timeout: 5000 }, async () => {
   const notReady = await run([scaleUpEvent(), failedScheduling()], {
     unschedulableTimeoutMs: 300_000, startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000,
   });
-  assert.equal(notReady.ended, "sandbox_pending_timeout");
-  assert.equal(notReady.clock.value, 10_800_000 + 10_000);
+  assert.equal(notReady.ended, "sandbox_start_timeout");
+  assert.equal(notReady.clock.value, 905_000 + 5_000);
+  // The run's sandbox sets scaleUpTimeoutMs: NotReady with a node being added runs on it, not on the start ceiling.
+  const sandbox = await run([scaleUpEvent(), failedScheduling()], {
+    unschedulableTimeoutMs: 300_000, startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000, scaleUpTimeoutMs: 10_800_000,
+  });
+  assert.equal(sandbox.ended, "sandbox_pending_timeout");
+  assert.equal(sandbox.clock.value, 10_800_000 + 10_000);
   const pending = await run([scaleUpEvent("Pending"), failedScheduling("Pending")], {
     unschedulableTimeoutMs: 300_000, startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000,
   });
@@ -624,7 +630,10 @@ const gated = (decision = ""): Body => ({
 });
 const GATED_SCALING = `TriggeredScaleUp: pod triggered scale-up: job 271406 queued in pool ${POOL}`;
 const GATED_REFUSED = `NotTriggerScaleUp: pod didn't trigger scale-up: pool ${POOL}: NoHeadroom: the pods need 1 new node(s)`;
-const REAL_CEILINGS = { unschedulableTimeoutMs: 300_000, startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000 };
+/** The run's sandbox, as SafeWorkloadProvider waits for it. */
+const REAL_CEILINGS = {
+  unschedulableTimeoutMs: 300_000, startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000, scaleUpTimeoutMs: 10_800_000,
+};
 
 test("a gated sandbox the autoscaler is buying a node for waits past 5 minutes and past the start ceiling, until its node comes", { timeout: 10_000 }, async () => {
   // 30s with only the gate said, then the scale-up; the 8-GPU node takes two hours to come.
@@ -648,13 +657,26 @@ test("a gated sandbox whose node never comes ends at the 3-hour ceiling, counted
   assert.match(r.endedMessage, /still waiting for the platform to add a node after 10805\.0s \(phase=notready\)/);
 });
 
-test("a queue followed by a node being added is one wait for capacity, on one 3-hour clock", { timeout: 10_000 }, async () => {
-  // An hour in SaFE's queue (Pending), then admitted with a node being added (NotReady): the
-  // ceiling is three hours from the first read, not three hours more.
-  const hour = 60 * 60 * 1000 / 5000;
-  const r = await run([...repeat(hour, queued(2)), gated(GATED_SCALING)], REAL_CEILINGS);
+test("the ceiling for a node being added counts from the scale-up, not from a queue before it", { timeout: 10_000 }, async () => {
+  // Nearly three hours in SaFE's queue (Pending), then admitted with a node being added
+  // (NotReady): the node purchase gets its own three hours, not the queue's last minutes.
+  const queue = 10_700_000 / 5000;
+  const r = await run([...repeat(queue, queued(2)), gated(GATED_SCALING)], REAL_CEILINGS);
   assert.equal(r.ended, "sandbox_pending_timeout");
-  assert.equal(r.clock.value, 5_000 + 10_800_000 + 5_000);
+  assert.equal(r.clock.value, 10_705_000 + 10_800_000 + 5_000);
+});
+
+test("a multi-node cluster (no start ceiling, no scale-up ceiling) still waits indefinitely while a node is added", { timeout: 10_000 }, async () => {
+  // As multi-node/safe-provider.ts waits: startTimeoutMs 0 (MULTI_NODE_START_TIMEOUT_SECONDS
+  // default), no scaleUpTimeoutMs. Five hours of TriggeredScaleUp, past every sandbox ceiling,
+  // then the nodes come and it runs; nothing ends it on the way.
+  const fiveHours = 5 * 60 * 60 * 1000 / 5000;
+  const r = await run([...repeat(fiveHours, gated(GATED_SCALING)), takenNotReady, running], {
+    startTimeoutMs: 0, pendingTimeoutMs: 10_800_000,
+  });
+  assert.equal(r.ended, null);
+  assert.ok(r.clock.value > 5 * 60 * 60 * 1000, String(r.clock.value));
+  assert.deepEqual(r.gaveUp, []);
 });
 
 test("when the autoscaler refuses a gated sandbox, its reason is passed on without its identifiers, and the short limit ends it", { timeout: 10_000 }, async () => {

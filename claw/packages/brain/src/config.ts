@@ -1087,6 +1087,10 @@ export const SANDBOX_POLL_TIMEOUT_MS = envInt("SANDBOX_POLL_TIMEOUT_MS", 60 * 60
 // single-node (SafeWorkloadProvider) and multi-node clusters. Independent of the
 // unreadable backstop above (which only fires when SaFE stops answering). Set to
 // 0 to queue forever. Stored in ms; configured in seconds like the sibling above.
+// The sandbox a run opens (SafeWorkloadProvider, not hosted applications or
+// multi-node clusters) also uses it, on a clock of its own, for a dispatched
+// workload while the platform reports a node being added for it
+// (`TriggeredScaleUp`); see WorkloadWaitOptions.scaleUpTimeoutMs.
 //
 // Task and DAG runs carry a renewable API-side lease, so this Pending ceiling
 // does not have to fit under BRAIN_TASK_TIMEOUT_SEC. That timeout now covers
@@ -1106,8 +1110,10 @@ export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECOND
 // that is still pulling. Without this the wait ended only at the workload's own
 // timeout, hours later, with the user's Stop doing nothing (it is also honoured
 // now, see waitForWorkloadReady). The clock RESETS if the workload falls back to
-// Pending, and does not run while the platform reports a node being added for the
-// sandbox (`TriggeredScaleUp`): that wait is on SANDBOX_PENDING_TIMEOUT_SECONDS. Set it above the slowest legitimate image pull for the deployment.
+// Pending. For the sandbox a run opens it also does not run while the platform
+// reports a node being added for it (`TriggeredScaleUp`): that wait is on
+// SANDBOX_PENDING_TIMEOUT_SECONDS. Multi-node clusters keep their own start ceiling
+// (MULTI_NODE_START_TIMEOUT_SECONDS) throughout. Set it above the slowest legitimate image pull for the deployment.
 // 0 waits indefinitely. Stored in ms; configured in seconds like the siblings.
 export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 15 * 60) * 1000;
 
@@ -1139,8 +1145,9 @@ export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 
 // queue moves, and for a GPU sandbox can be hours), nor an admitted one with a
 // node being added (which can take longer than this): both are waits for capacity
 // and run on SANDBOX_PENDING_TIMEOUT_SECONDS, whichever phase the platform reports
-// (a sandbox being given a node is often NotReady already), never on
-// SANDBOX_START_TIMEOUT_SECONDS; the user is told why they are waiting. When the
+// (a sandbox being given a node is often NotReady already; that wait is clocked
+// from the first read of the scale-up), never on SANDBOX_START_TIMEOUT_SECONDS;
+// the user is told why they are waiting. When the
 // autoscaler refuses (`NotTriggerScaleUp`), the reason it gives is passed on, with
 // its identifiers taken out. A cluster whose nodes scale up without the
 // platform saying so should raise this or set 0. Applies to the sandbox a run
