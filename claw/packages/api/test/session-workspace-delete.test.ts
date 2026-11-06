@@ -392,3 +392,117 @@ test("resolving the blank owner does not resolve a dangerous one", async () => {
   );
   assert.deepEqual(s3.listed, [], "a refusal that listed anything has already widened the delete");
 });
+
+/**
+ * A store whose listing takes longer the more keys a page holds, as MinIO's
+ * does: it answers a listing by reading each object's metadata off its drives.
+ * A page that would outlast the client's own request timeout fails the way the
+ * SDK fails it, with nothing listed -- which is what the configured timeout does
+ * to such a request on a real endpoint.
+ */
+function stubSlowListingS3(
+  objects: string[],
+  msPerKey: number,
+  requestTimeoutMs: number,
+): { pages: Array<number | undefined>; deleted: string[] } {
+  const remaining = new Set(objects);
+  const pages: Array<number | undefined> = [];
+  const deleted: string[] = [];
+  S3Client.prototype.send = (async function (this: S3Client, command: unknown) {
+    if (command instanceof ListObjectsV2Command) {
+      const { Prefix = "", ContinuationToken, MaxKeys } = command.input;
+      pages.push(MaxKeys);
+      // The API's own default when a request names no page size.
+      const asked = MaxKeys ?? 1000;
+      if (asked * msPerKey >= requestTimeoutMs) {
+        const err = new Error(`a request has exceeded the configured ${requestTimeoutMs} ms requestTimeout.`);
+        err.name = "TimeoutError";
+        throw err;
+      }
+      const matching = [...remaining].filter((k) => k.startsWith(Prefix)).sort()
+        .filter((k) => ContinuationToken === undefined || k > ContinuationToken);
+      const page = matching.slice(0, asked);
+      const truncated = matching.length > page.length;
+      return {
+        Contents: page.map((Key) => ({ Key })),
+        IsTruncated: truncated,
+        NextContinuationToken: truncated ? page[page.length - 1] : undefined,
+      };
+    }
+    if (command instanceof DeleteObjectCommand) {
+      const key = command.input.Key ?? "";
+      remaining.delete(key);
+      deleted.push(key);
+      return {};
+    }
+    throw new Error("unexpected S3 command");
+  }) as typeof S3Client.prototype.send;
+  return { pages, deleted };
+}
+
+test("a workspace larger than one page is deleted on a store that lists slowly", async () => {
+  // Measured on a production MinIO: 1000 keys in 45-48 s, so a page of the
+  // API's default size outlasted the client's thirty-second timeout. Every
+  // cleanup of a session with more files than that failed on its first
+  // listing, deleted nothing, and failed the same way on every retry -- the
+  // row stayed pending for good, the stuck report fired every pass, and the
+  // files of a deleted session stayed in the bucket.
+  const probe = stubS3([]);
+  await deleteSessionWorkspaceObjects("u-1", "sess-probe");
+  const { requestTimeout } = await handlerTimeouts(probe.clients[0]);
+  assert.ok(requestTimeout && requestTimeout > 0, "the client has a request timeout to fit inside");
+
+  const keys = Array.from({ length: 1_250 }, (_, i) =>
+    `users/u-1/sessions/sess-abc/workspace/f${String(i).padStart(4, "0")}`);
+  const s3 = stubSlowListingS3(keys, 48, requestTimeout);
+
+  const outcome = await deleteSessionWorkspaceObjects("u-1", "sess-abc");
+
+  assert.equal(outcome.failed, 0);
+  assert.equal(outcome.complete, true);
+  assert.equal(outcome.deleted, keys.length, "every object of the workspace is gone");
+  assert.deepEqual(new Set(s3.deleted), new Set(keys));
+  assert.ok(s3.pages.length > 2, "the walk follows the continuation token across pages");
+  for (const maxKeys of s3.pages) {
+    assert.ok(maxKeys !== undefined && maxKeys * 48 < requestTimeout,
+      `every listing asks for a page the store can answer inside the timeout (asked ${maxKeys})`);
+  }
+});
+
+test("every listing in this package asks for a bounded page", async () => {
+  // The closed set, rather than the callers someone remembered: the file list,
+  // the archive download, the upload sweep and the plugin walk page through
+  // prefixes the same way the delete does, and on the same store a full page
+  // times out there too. A listing added later without a page size is the same
+  // defect again.
+  const { readdirSync, readFileSync, statSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const root = fileURLToPath(new URL("../src", import.meta.url));
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name);
+      if (statSync(path).isDirectory()) walk(path);
+      else if (name.endsWith(".ts")) files.push(path);
+    }
+  };
+  walk(root);
+
+  let listings = 0;
+  const unbounded: string[] = [];
+  for (const file of files) {
+    const src = readFileSync(file, "utf8");
+    for (let at = src.indexOf("new ListObjectsV2Command("); at >= 0;
+      at = src.indexOf("new ListObjectsV2Command(", at + 1)) {
+      listings += 1;
+      // The input is an object literal; its closing brace ends the arguments.
+      const input = src.slice(at, src.indexOf("})", at) + 2);
+      if (!/\bMaxKeys\s*:/.test(input)) {
+        unbounded.push(`${file.slice(root.length + 1)}:${src.slice(0, at).split("\n").length}`);
+      }
+    }
+  }
+  assert.ok(listings >= 6, `the scan found the listings it is meant to check (found ${listings})`);
+  assert.deepEqual(unbounded, [], "a listing without MaxKeys asks for the API's thousand-key default");
+});

@@ -3,7 +3,7 @@
 
 import { ListObjectsV2Command, DeleteObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { db } from "../infra/db.js";
-import { getS3Client } from "../infra/s3-client.js";
+import { getS3Client, S3_LIST_PAGE_KEYS } from "../infra/s3-client.js";
 import { sessionWorkspacePrefix } from "../workspace/prefix.js";
 import { LEADER_LOCK_IDS, withLeaderLock } from "../infra/leader-lock.js";
 import {
@@ -140,7 +140,7 @@ interface ListedPage {
 export const uploadStore = {
   async list(prefix: string, continuationToken?: string): Promise<ListedPage> {
     const resp = await getS3Client().send(new ListObjectsV2Command({
-      Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: continuationToken,
+      Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: continuationToken, MaxKeys: S3_LIST_PAGE_KEYS,
     }));
     return {
       objects: (resp.Contents || []).flatMap((o) => (
