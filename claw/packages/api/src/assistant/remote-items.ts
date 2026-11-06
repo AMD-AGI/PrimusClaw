@@ -87,6 +87,8 @@ export interface RemoteParams {
   waiting: string[];
   /** The newest session event this item has applied (`claw_remote_events.id`). */
   last_event_id: number;
+  /** The session event that ended the item (a turn's end, a refusal, the session closing); 0 while open, or when stopped from Claw. */
+  closed_event_id?: number;
 }
 
 export const langOf = (text: string): RemoteLang => (/\p{Script=Han}/u.test(text) ? "zh" : "en");
@@ -193,10 +195,15 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
     }
     // An item that ended is opened again for the next instruction; one under way counts one more.
     const turns = open.board_state === "done" ? 1 : Math.max(0, Number(open.params?.open_turns) || 0) + 1;
-    // An item that ended skipped what the session posted since; from this prompt on, that is the new instruction's.
+    // An item that ended skipped what the session posted since. What came after this prompt was queued is this prompt's, but never
+    // the event that ended the item, nor any before it (a turn that ended as this prompt was queued is the one before it). An item
+    // stopped from Claw is not rewound: the end its cancel brings is still to come, or has passed, and it is no new turn's.
+    const closedBy = Number(open.params?.closed_event_id) || 0;
     const patch = {
       asked, origin: p.origin, lang, open_turns: turns,
-      ...(open.board_state === "done" ? { waiting: [], last_event_id: last } : {}),
+      ...(open.board_state === "done"
+        ? { waiting: [], closed_event_id: 0, ...(closedBy > 0 ? { last_event_id: Math.max(last, closedBy) } : {}) }
+        : {}),
     };
     await q(
       `UPDATE claw_work_items
@@ -355,6 +362,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         const answer = tailOf(whole, ANSWER_EVENT_MAX);
         const summary = [said, tailOf(answer, SUMMARY_MAX)].filter(Boolean).join(" ") || (p.lang === "zh" ? "已结束，没有回答文字" : "ended with no answer text");
         board = "done";
+        p.closed_event_id = e.id;
         p.waiting = [];
         await write(
           `board_state = 'done', outcome = 'answered', last_report_kind = 'answer', summary = $2, pending_question = NULL,
@@ -369,6 +377,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         p.open_turns = Math.max(0, (Number(p.open_turns) || 0) - 1);
         if (p.open_turns > 0) continue;
         board = "done";
+        p.closed_event_id = e.id;
         p.waiting = [];
         const summary = p.lang === "zh" ? `指令被拒绝：${reason}` : `the instruction was refused: ${reason}`;
         await write(
@@ -380,6 +389,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       } else if (e.type === REMOTE_EVENT_SESSION_CLOSED) {
         if (board === "done") continue;
         board = "done";
+        p.closed_event_id = e.id;
         const summary = p.lang === "zh" ? "会话已关闭" : "the session closed";
         const unfinished = (Number(p.open_turns) || 0) > 0;
         p.open_turns = 0;

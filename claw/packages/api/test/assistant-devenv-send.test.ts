@@ -25,7 +25,8 @@
  *       item; a prompt the connector refused before queueing it is one fewer; one refused at its start (refusal and turn_end) is one
  *   F8  the item's stop button (`POST /v1/work-items/:id/stop`) cancels the agent's turn on the machine, as work_stop does
  *   F9  what the session posts after a prompt is queued is that prompt's, even when it reaches Claw before the prompt's item is
- *       written: a first prompt's item, and a finished item reopened, both end with it
+ *       written: a first prompt's item, and a finished item reopened, both end with it; but the turn before it, ending as it was
+ *       queued, never ends it
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -440,6 +441,17 @@ describe("development environment items and devenv_send", { skip }, () => {
     await note("next one", since);
     item = await remoteItem(sid);
     assert.deepEqual([item.board_state, item.summary, item.params.open_turns, item.title], ["done", "second answer", 0, "laptop claude: next one"]);
+
+    // A prompt queued just as the turn before it ends: that end closes the item first, and is not taken as the new prompt's end.
+    await note("third one", await items.remoteEventMark(sid));
+    since = await items.remoteEventMark(sid);
+    await events("alice", cid, sid, [chunk("third answer"), end()]);
+    assert.equal((await remoteItem(sid)).board_state, "done");
+    await note("fourth one", since);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.params.open_turns, item.title], ["in_progress", 1, "laptop claude: fourth one"]);
+    await events("alice", cid, sid, [chunk("fourth answer"), end()]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "fourth answer"]);
   });
 
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {
