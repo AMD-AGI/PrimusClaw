@@ -52,5 +52,6 @@ index	idx_pending_session	-
 index	uq_pending_session_dedupe	-
 index	idx_sessions_user	-
 index	idx_sessions_parent	-
+index	idx_sessions_deleted_walk	-
 index	uq_edges_from_to	-
 index	claw_answer_feedback_pkey	-

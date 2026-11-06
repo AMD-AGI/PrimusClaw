@@ -55,9 +55,30 @@ const commonPoolConfig: pg.PoolConfig = {
   // commit/rollback cannot pin a pooled connection (and, for the latter, hold
   // row locks). Thresholds sit well above normal query/tx durations and are
   // env-overridable.
+  //
+  // The tcp_keepalives_* settings are the server's side of the same idea, for
+  // the one hold that is idle by design: `withLeaderLock` keeps a lockPool
+  // connection idle for a whole scan while the scan's work goes through the main
+  // pool. If the replica dies without its socket being closed (a node or network
+  // failure, a pod whose network is torn down before the FIN gets out), the
+  // server keeps that backend, and the session-scoped advisory lock on it, until
+  // its own keepalive gives up -- with the server's defaults (0 = the OS's,
+  // typically 7200s idle) that is over two hours, and on a daily scan every
+  // replica that asks in that window skips until the next day. Measured on a
+  // rolling update: the retention lock stayed with a dead pod's idle backend and
+  // no new pod could take it. With these defaults the server probes after 60s
+  // idle and drops the backend, and the lock with it, about two minutes after the
+  // peer went away. Ignored on a Unix-socket connection.
   options:
     `-c statement_timeout=${Number(process.env.PG_STATEMENT_TIMEOUT_MS) || 30000} ` +
-    `-c idle_in_transaction_session_timeout=${Number(process.env.PG_IDLE_TX_TIMEOUT_MS) || 60000}`,
+    `-c idle_in_transaction_session_timeout=${Number(process.env.PG_IDLE_TX_TIMEOUT_MS) || 60000} ` +
+    `-c tcp_keepalives_idle=${Number(process.env.PG_TCP_KEEPALIVES_IDLE_S) || 60} ` +
+    `-c tcp_keepalives_interval=${Number(process.env.PG_TCP_KEEPALIVES_INTERVAL_S) || 10} ` +
+    `-c tcp_keepalives_count=${Number(process.env.PG_TCP_KEEPALIVES_COUNT) || 6}`,
+  // And the client's side: a server that vanished without a FIN is noticed by
+  // the socket rather than only by the next query's timeout.
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 60_000,
   ssl:
     DATABASE_URL.includes("svc.cluster.local") ||
     DATABASE_URL.includes("ssl=true") ||
@@ -1559,6 +1580,15 @@ export async function initDb(): Promise<void> {
       `CREATE INDEX IF NOT EXISTS idx_sessions_cleanup_oldest
          ON claw_sessions(deleted_at) WHERE cleanup_state = 'pending'`,
     ).catch(() => {});
+    // The retention purge's walk over deleted sessions (sessions/retention.ts),
+    // in exactly its keyset order, so each page is an index range read from the
+    // cursor rather than a scan and sort of every deleted session.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_sessions_deleted_walk",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sessions_deleted_walk
+         ON claw_sessions(deleted_at, session_id) WHERE deleted_at IS NOT NULL`,
+    );
     // Sessions deleted before this existed had their cleanup attempted exactly
     // once, inside the request, and whatever failed there was logged and left.
     // The objects of those sessions are still in the bucket, which is the leak
