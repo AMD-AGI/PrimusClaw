@@ -266,8 +266,33 @@ async function refusedByCap(input: SayInput, text: string, refused: SayCapped, d
     told = false;
     metrics.onAssistantSayRateLimited("failed");
     logger.error({ err, userId: input.userId }, "assistant.say_cap_notice_failed");
+    capNoticeLater(input, text, deps);
   }
   return new SayRefused("say_rate_limited", sayCapRefusal(refused.limit, told));
+}
+
+/**
+ * The cap's notice when storing it failed (a failover, most likely): tried again in the background, a few times over
+ * the next minute, until it is stored and announced or the user is found told. Safe to repeat: each try is the same
+ * locked check-and-store. The timers do not hold the process open.
+ */
+function capNoticeLater(input: SayInput, text: string, deps: SayDeps): void {
+  const attempt = (i: number): void => {
+    setTimeout(() => {
+      storeCapNotice(input, text, deps).then(
+        async (notice) => {
+          if (!notice) return;
+          logger.warn({ userId: input.userId, sayId: notice.sayId }, "assistant.say_cap_notice_sent_later");
+          await announce(notice, deps);
+        },
+        (err) => {
+          if (i + 1 < SETTLE_LATER_DELAYS.length) attempt(i + 1);
+          else logger.error({ err, userId: input.userId }, "assistant.say_cap_notice_never_sent");
+        },
+      ).catch((err) => logger.error({ err, userId: input.userId }, "assistant.say_cap_notice_announce_failed"));
+    }, SETTLE_LATER_DELAYS[i] * FAILOVER_RETRY_DELAY_MS).unref();
+  };
+  attempt(0);
 }
 
 /**

@@ -36,6 +36,7 @@
  *       and the Router hears the user was told
  *   F12 the same while the database cannot be asked: the notice is announced once the database answers, and the next
  *       refusal does not send another
+ *   F13 the cap's notice whose COMMIT failed and did not take effect: it is stored and announced shortly after, once
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -376,5 +377,46 @@ describe("database failover", { skip }, () => {
     assert.equal(await refused("Third."), "say_rate_limited");
     assert.equal(w.events.length, 1, "the next refusal finds the notice and sends no other");
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_says WHERE fallback"))[0].n, 1);
+  });
+
+  test("F13 the cap's notice whose COMMIT failed without taking effect: stored and announced shortly after, once", async () => {
+    const turn = await w.routerTurn(alice);
+    const capped = { ...w.sayDeps, maxPerHour: 1 };
+    assert.equal((await w.mod.tools.say(turn as never, { text: "First." }, capped)).ok, true);
+    w.events.length = 0;
+    const refused = (text: string) => w.mod.tools.say(turn as never, { text }, capped).then(
+      () => ({ code: "said", message: "" }), (err: { code?: string; message?: string }) => ({ code: err.code, message: err.message ?? "" }));
+    // The notice's COMMIT is lost with the connection before it took effect: rolled back, and reported as 57P01.
+    const { default: pgModule } = await import("pg");
+    const proto = pgModule.Client.prototype as unknown as { query: (...args: unknown[]) => unknown };
+    const real = proto.query;
+    let cut = 0;
+    proto.query = function (this: unknown, ...args: unknown[]) {
+      if (args[0] === "COMMIT" && cut === 0) {
+        cut += 1;
+        return (real.apply(this, ["ROLLBACK"]) as Promise<unknown>).then(() => {
+          throw Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" });
+        });
+      }
+      return real.apply(this, args);
+    };
+    let out: { code?: string; message: string };
+    try {
+      out = await refused("Second.");
+    } finally {
+      proto.query = real;
+    }
+    assert.equal(cut, 1);
+    assert.equal(out.code, "say_rate_limited");
+    assert.doesNotMatch(out.message, /has been told/, "the Router is not told the user heard of it");
+    const deadline = Date.now() + 5_000;
+    const notices = async () => w.q("SELECT say_id FROM claw_assistant_says WHERE fallback");
+    while (!w.events.length && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    const [notice] = await notices();
+    assert.ok(notice, "the notice is stored after all");
+    assert.deepEqual(w.events.map((e) => e.say_id), [notice.say_id], "and announced, once");
+    assert.equal((await refused("Third.")).code, "say_rate_limited");
+    assert.equal(w.events.length, 1, "the next refusal finds it and sends no other");
+    assert.equal((await notices()).length, 1);
   });
 });
