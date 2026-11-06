@@ -234,13 +234,14 @@ describe("assistant outbound", { skip }, () => {
       assert.deepEqual((await saysRows()).map((s) => s.text), ["one"]);
     });
 
-    test("must have text of at most 600 characters", async () => {
+    test("must have text of at most SAY_TEXT_MAX (9000) characters: a long answer whole, never more", async () => {
+      assert.equal(outbound.SAY_TEXT_MAX, 9000);
       const cases: Array<{ text: string; code?: string }> = [
         { text: "", code: "empty_text" },
         { text: " \n\t ", code: "empty_text" },
-        { text: "x".repeat(601), code: "text_too_long" },
-        { text: "x".repeat(600) },
-        { text: `  ${"y".repeat(600)}  ` },
+        { text: "x".repeat(9001), code: "text_too_long" },
+        { text: "x".repeat(9000) },
+        { text: `  ${"y".repeat(9000)}  ` },
       ];
       for (const c of cases) {
         if (c.code) await assert.rejects(say(c.text), (e: any) => e.code === c.code, c.code);

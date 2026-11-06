@@ -13,7 +13,9 @@
  *   pipeline         real | catalog | public | sim | team | capture   (where the case came from)
  *   area             safe | dispatron | autopilot | pulse | agent-board | github | review | merge | memory | items | settings | chitchat | general
  *   lang             zh | en | mixed                                   (the user's language)
- *   turns            [{user, after_ms}]                                 one or more user messages; after_ms from the first
+ *   turns            [{user, after_ms, files?}]                         one or more user messages; after_ms from the first; files
+ *                    [{fixture, name?, media_type?}] are sent with the message as a channel sends them (uploaded to the assistant's
+ *                    session, named in channel_context.files); fixture is a path relative to the cases directory
  *   route            answer | item | review | confirm | clarify         expected handling of the last turn
  *   tools_must       tool names the last turn must each call; `*` matches anything, `a|b` either
  *   tools_must_not   tool names the last turn must not call (read-only questions list work_create)
@@ -26,7 +28,7 @@
  *                    the answer should say belongs in the rubric. A fact without a value or a runnable query is graded by the
  *                    judge, with the oracle's text as what it is checked against.
  *   cards            none | accept | confirm                            what the user may be shown to press in the last turn
- *   style            {reply_lang: follow_user, max_chars, no_ids}
+ *   style            {reply_lang: follow_user, max_chars, min_chars, no_ids}   min_chars: the final answer is at least that long (whole)
  *   latency_budget_s {first, final, each}                               seconds from the last turn's sending (each: per turn)
  *   source           {kind: real|synthetic|public, hash, ref}
  *   notes            why the case exists
@@ -37,7 +39,9 @@
  * a tool the case must call cannot be reached on its arm yet: the static check reports it instead of failing on it),
  * `may_deny` (saying it cannot do something is a right answer here: a refusal of an unsafe request),
  * `hold` (assistant mode: the case's item holds a request for its person, a write to approve or a question, and the
- * runner answers it as the person's channel does, see {@link HoldSpec}).
+ * runner answers it as the person's channel does, see {@link HoldSpec}), `delivers` ([{name?, type?}]: files the last turn's
+ * items must hand the user, each matched by a name pattern and a media type prefix, from the files the assistant's messages
+ * carry). A case with files runs on the assistant path only.
  *
  * Placeholders fill turns, claims, values, oracle queries and the rubric: `{NAME}` is an environment variable, `{{name}}`
  * (also `{{a.b}}`) a run variable from EVAL_VARS_FILE or EVAL_VAR_<NAME>. A case with a placeholder that has no value
@@ -64,7 +68,9 @@ export type Route = "answer" | "item" | "review" | "confirm" | "clarify";
 export type Mode = "assistant" | "baseline";
 export type Cards = "none" | "accept" | "confirm";
 
-export interface Turn { user: string; after_ms?: number }
+export interface TurnFile { fixture: string; name?: string; media_type?: string }
+export interface Turn { user: string; after_ms?: number; files?: TurnFile[] }
+export interface Delivers { name?: string; type?: string }
 export interface Oracle { kind: "static" | "api" | "fixture"; value?: string; query?: string }
 export interface Fact { claim: string; oracle?: Oracle }
 
@@ -79,7 +85,7 @@ export interface EvalCase {
   tools_must_not?: string[];
   facts?: Fact[];
   cards?: Cards;
-  style?: { reply_lang?: "follow_user"; max_chars?: number; no_ids?: boolean };
+  style?: { reply_lang?: "follow_user"; max_chars?: number; min_chars?: number; no_ids?: boolean };
   latency_budget_s?: { first?: number; final?: number; each?: number };
   source?: { kind: string; hash?: string; ref?: string };
   notes?: string;
@@ -92,6 +98,7 @@ export interface EvalCase {
   blocked?: string;
   may_deny?: boolean;
   hold?: HoldSpec;
+  delivers?: Delivers[];
 }
 
 /**
@@ -132,6 +139,14 @@ export function problemsOf(c: Partial<EvalCase>): string[] {
   if (!c.id || typeof c.id !== "string") out.push("no id");
   if (!Array.isArray(c.turns) || !c.turns.length || c.turns.some((t) => typeof t?.user !== "string" || !t.user.trim())) out.push("no turns");
   else if (c.turns.slice(1).some((t) => !(Number(t.after_ms) > 0))) out.push("a later turn without after_ms");
+  for (const f of (Array.isArray(c.turns) ? c.turns : []).flatMap((t) => t?.files ?? [])) {
+    if (typeof f?.fixture !== "string" || !f.fixture || f.fixture.startsWith("/") || f.fixture.split("/").includes("..")) {
+      out.push(`a file without a fixture inside the cases directory (${String(f?.fixture)})`);
+    }
+  }
+  if (c.delivers !== undefined && (!Array.isArray(c.delivers) || c.delivers.some((d) => !d || (typeof d.name !== "string" && typeof d.type !== "string")))) {
+    out.push("delivers needs a name or a type for each file");
+  }
   if (c.route !== undefined && !ROUTES.includes(c.route)) out.push(`route ${c.route}`);
   if (c.cards !== undefined && !CARDS.includes(c.cards)) out.push(`cards ${c.cards}`);
   if (c.hold !== undefined) {
@@ -524,6 +539,8 @@ export const BARE_NUMBER = /编号\s*#?\d+|#\d+(?=\s*($|[，。、,.;；:：)）
 /** One event of a session as it arrived on the live stream (`at`: when this runner received it). */
 export interface LiveEvent { at: number; eventId: string; data: Record<string, any> }
 
+export interface SaidFile { name: string; content_type: string; item_id: string | null }
+
 export interface Say {
   at: number;
   sayId: string;
@@ -534,6 +551,8 @@ export interface Say {
   canAccept: boolean;
   confirm: boolean;
   fallback: boolean;
+  /** The files the message hands the user (a worker's deliveries), with the item whose worker delivered each. */
+  files: SaidFile[];
 }
 
 export const saysOf = (events: readonly LiveEvent[]): Say[] => events
@@ -546,7 +565,14 @@ export const saysOf = (events: readonly LiveEvent[]): Say[] => events
     // A card the person presses: a channel's command to run (`confirm_action`) or a write the router proposed (`confirm_write`).
     confirm: !!e.data.confirm_action || !!e.data.confirm_write,
     fallback: e.data.fallback === true,
+    files: (Array.isArray(e.data.files) ? e.data.files : []).filter((f: any) => f && typeof f.name === "string").map((f: any) => ({
+      name: String(f.name), content_type: String(f.content_type ?? ""), item_id: typeof f.item_id === "string" ? f.item_id : null,
+    })),
   }));
+
+/** The files the user was handed by these items' messages, in order. */
+export const filesFrom = (says: readonly Say[], itemIds: readonly string[]): SaidFile[] =>
+  says.flatMap((s) => s.files).filter((f) => f.item_id !== null && itemIds.includes(f.item_id));
 
 /** The tool calls of the turns that answered these messages (live events carry the turn's message id). */
 export function turnCalls(events: readonly LiveEvent[], messageIds: readonly string[]): ToolCall[] {
@@ -804,6 +830,8 @@ export interface Observed {
   factValues: Array<string[] | null>;
   /** A case with `hold`: what the runner saw of it (assistant mode only). */
   hold?: HoldSeen;
+  /** The files the last turn's items handed the user (assistant mode; absent in baseline). */
+  delivered?: SaidFile[];
 }
 
 /** The longest an item may take to hold its request for the person, from Brain asking: what a person waits for the card. */
@@ -875,6 +903,14 @@ export function grade(c: EvalCase, o: Observed): Check[] {
     out.push({ name: `reply in ${c.lang}`, pass: letters > 0 && (c.lang === "zh" ? ratio >= 0.2 : ratio < 0.05), detail: `cjk ${ratio.toFixed(2)}` });
   }
   if (c.style?.max_chars !== undefined) out.push({ name: `<= ${c.style.max_chars} chars`, pass: o.final.length <= c.style.max_chars, detail: `${o.final.length}` });
+  if (c.style?.min_chars !== undefined) out.push({ name: `>= ${c.style.min_chars} chars`, pass: o.final.length >= c.style.min_chars, detail: `${o.final.length}` });
+  for (const d of c.delivers ?? []) {
+    const name = `delivers ${d.name ?? "*"} ${d.type ?? "*"}`;
+    if (o.mode === "baseline" || o.delivered === undefined) { skip(name); continue; }
+    const re = d.name ? new RegExp(d.name, "i") : null;
+    const hit = o.delivered.find((f) => (!re || re.test(f.name)) && (!d.type || f.content_type.startsWith(d.type)));
+    out.push({ name, pass: hit !== undefined, detail: o.delivered.map((f) => `${f.name} ${f.content_type}`).join(", ") || "no file" });
+  }
   const b = c.latency_budget_s ?? {};
   if (b.first !== undefined) out.push({ name: `first reply <= ${b.first}s`, pass: o.firstReplyMs !== null && o.firstReplyMs <= b.first * 1000, detail: `${o.firstReplyMs}ms` });
   if (b.final !== undefined) out.push({ name: `final <= ${b.final}s`, pass: o.finalMs !== null && o.finalMs <= b.final * 1000, detail: `${o.finalMs}ms` });

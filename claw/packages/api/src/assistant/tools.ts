@@ -20,7 +20,8 @@ import pino from "pino";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
-import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
+import { markUntrustedRead, turnMessage, type AttendedVia, type ChannelFile, type TurnMessage } from "./inbound.js";
+import { handFilesToWorker, workerFilesNote } from "./files.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, recordSystemNotice, SayOutcomeUnknown, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
 import { voidStreamedSay } from "./router-speed.js";
@@ -289,6 +290,26 @@ async function itemModelFor(claims: AssistantTokenClaims, asked: string | undefi
   }
 }
 
+/**
+ * The files of the message this router turn answers, copied into the worker's session before its message is queued
+ * (`files.ts`): what the worker is told about, and the names of those that could not be copied, for the router to tell the user.
+ * None for a turn that answers no message of the user's (a report's).
+ */
+async function filesForWorker(
+  q: Querier, claims: AssistantTokenClaims, userId: string, workerSessionId: string,
+): Promise<{ note: string; attached: number; notAttached: string[] }> {
+  const files: ChannelFile[] = (await turnMessage(q, claims.sid, claims.mid))?.context.files ?? [];
+  if (!files.length) return { note: "", attached: 0, notAttached: [] };
+  const handed = await handFilesToWorker({ userId, routerSessionId: claims.sid, workerSessionId, files });
+  return { note: workerFilesNote(handed.attached), attached: handed.attached.length, notAttached: handed.failed.map((f) => f.name) };
+}
+
+/** What a work call's answer says of the files: how many went to the worker, and which did not (the router tells the user). */
+function filesAnswer(files: { attached: number; notAttached: string[] } | null): Record<string, unknown> {
+  if (!files || (!files.attached && !files.notAttached.length)) return {};
+  return { files_attached: files.attached, ...(files.notAttached.length ? { files_not_attached: files.notAttached } : {}) };
+}
+
 /** A `model` argument as the tools take it: absent, or a non-empty string. */
 function modelArg(raw: unknown): string | undefined {
   if (raw === undefined || raw === null || raw === "") return undefined;
@@ -338,7 +359,10 @@ async function announceStarted(
 
 export async function workCreate(
   claims: AssistantTokenClaims, args: { title: string; brief: string; repo?: unknown; model?: string }, deps: SayDeps = {},
-): Promise<{ ok: true; item_id: string; seq: number; deduplicated: boolean; announced: boolean; model?: string | null; fell_back_from?: string }> {
+): Promise<{
+  ok: true; item_id: string; seq: number; deduplicated: boolean; announced: boolean; model?: string | null; fell_back_from?: string;
+  files_attached?: number; files_not_attached?: string[];
+}> {
   requireRole(claims, "router");
   const title = clipOneLine(args.title, TITLE_MAX);
   const brief = args.brief.trim();
@@ -362,7 +386,7 @@ export async function workCreate(
           AND created_at > NOW() - $3::interval`,
       [userId, title, DUPLICATE_CREATE_WINDOW],
     )).rows[0] as { item_id: string; seq: number } | undefined;
-    if (same) return { itemId: same.item_id, seq: Number(same.seq), userId, workerSessionId: null };
+    if (same) return { itemId: same.item_id, seq: Number(same.seq), userId, workerSessionId: null, files: null };
 
     const router = (await query("SELECT config FROM claw_sessions WHERE session_id = $1", [claims.sid])).rows[0] as
       { config: unknown } | undefined;
@@ -398,11 +422,16 @@ export async function workCreate(
         ? "too many unfinished items: ask the user which to stop or finish first"
         : "the user has no assistant");
     }
+    // The files of the user's message are in the worker's session before its first message can run.
+    const files = await filesForWorker(query, claims, userId, workerSessionId);
     const queued = await queueServerMessage(q, {
-      sessionId: workerSessionId, userId, content: brief, dedupeKey: `start:${item.itemId}`,
+      sessionId: workerSessionId, userId, content: `${brief}${files.note}`, dedupeKey: `start:${item.itemId}`,
     });
     if (!queued.ok) throw new ToolRefused(queued.error, "the worker could not be started");
-    return { itemId: item.itemId, seq: item.seq, userId, workerSessionId };
+    return {
+      itemId: item.itemId, seq: item.seq, userId, workerSessionId,
+      files: { attached: files.attached, notAttached: files.notAttached },
+    };
   });
   // The row is the commitment; running it is only the drain, which the sweeper repeats if this is lost.
   if (created.workerSessionId) await drainSessionIfIdle(created.workerSessionId, created.userId);
@@ -416,12 +445,16 @@ export async function workCreate(
     ok: true, item_id: created.itemId, seq: created.seq, deduplicated: created.workerSessionId === null, announced,
     // A replayed call names the item made the first time, whose model was decided then.
     ...(choice && created.workerSessionId ? modelAnswer(choice) : {}),
+    ...filesAnswer(created.files),
   };
 }
 
 export async function workSend(
   claims: AssistantTokenClaims, args: { item_id: string; text: string; model?: string },
-): Promise<{ ok: true; item_id: string; seq: number; status: "in_progress"; model?: string | null; fell_back_from?: string }> {
+): Promise<{
+  ok: true; item_id: string; seq: number; status: "in_progress"; model?: string | null; fell_back_from?: string;
+  files_attached?: number; files_not_attached?: string[];
+}> {
   requireRole(claims, "router");
   const text = args.text.trim();
   if (!text) throw new ToolRefused("invalid_arguments", "work_send needs text");
@@ -445,7 +478,7 @@ export async function workSend(
         LIMIT 1`,
       [item.item_id, text, claims.task_id],
     );
-    if (replayed.rowCount) return { userId, item, workerSessionId: null };
+    if (replayed.rowCount) return { userId, item, workerSessionId: null, files: null };
     if (!await reopenWorkItem(q, { userId, itemId: item.item_id, text })) {
       throw new ToolRefused("item_closed", "that item is finished or stopped; start a new item instead");
     }
@@ -456,12 +489,18 @@ export async function workSend(
         [item.item_id, JSON.stringify(modelParams(choice))],
       );
     }
-    const queued = await queueServerMessage(q, { sessionId: item.worker_session_id, userId, content: text });
+    // The files of the user's message are in the worker's session before the instruction can run (a running sandbox gets them when
+    // the next turn attaches to it).
+    const files = await filesForWorker(query, claims, userId, item.worker_session_id);
+    const queued = await queueServerMessage(q, { sessionId: item.worker_session_id, userId, content: `${text}${files.note}` });
     if (!queued.ok) throw new ToolRefused(queued.error, "the instruction could not be delivered");
-    return { userId, item, workerSessionId: item.worker_session_id };
+    return { userId, item, workerSessionId: item.worker_session_id, files };
   });
   if (sent.workerSessionId) await drainSessionIfIdle(sent.workerSessionId, sent.userId);
-  return { ok: true, item_id: sent.item.item_id, seq: sent.item.seq, status: "in_progress", ...(choice && sent.workerSessionId ? modelAnswer(choice) : {}) };
+  return {
+    ok: true, item_id: sent.item.item_id, seq: sent.item.seq, status: "in_progress", ...(choice && sent.workerSessionId ? modelAnswer(choice) : {}),
+    ...filesAnswer(sent.files),
+  };
 }
 
 /**

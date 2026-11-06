@@ -75,6 +75,23 @@ export interface AssistantConfirmWrite {
   expires_at: string;
 }
 
+/**
+ * A file a work item's worker delivered (`deliver_file`), for a channel to offer as a download. The download is Claw's own link,
+ * `GET /v1/sessions/{session_id}/deliveries/{id}`, which answers only the signed-in owner of that session (the item's worker
+ * session, which is the user's). `data_base64` is a small image itself (`DELIVERY_INLINE_TYPES`, at most
+ * `DELIVERY_INLINE_MAX_BYTES`), for a channel that shows it without fetching the link.
+ */
+export interface AssistantFile {
+  /** The work item whose worker delivered it. */
+  item_id: string;
+  session_id: string;
+  id: string;
+  name: string;
+  size: number;
+  content_type: string;
+  data_base64?: string;
+}
+
 /** Something the assistant chose to say to the user. */
 export interface AssistantSayPayload extends AssistantEventBase {
   type: "assistant.say";
@@ -82,6 +99,8 @@ export interface AssistantSayPayload extends AssistantEventBase {
   /** Present only when the message cites any (`CLAW_ASSISTANT_CITATIONS`); a receiver that does not read it shows the text alone. */
   sources?: AssistantSaySource[];
   confirm_write?: AssistantConfirmWrite;
+  /** Files the user gets with the message (a worker's deliveries, `deliveries.ts`): one download each. */
+  files?: AssistantFile[];
 }
 
 /** The system's own message, sent when an item has needed the user for a while and nobody has said so. */

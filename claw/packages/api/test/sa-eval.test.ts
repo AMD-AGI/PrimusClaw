@@ -39,6 +39,8 @@
  *       a turn's exec_complete aside; stored events that could not be read are a gap
  *   S20 sharing an identity: a running or recently active assistant session refuses the run; a session is deleted only when a GET
  *       then answers 404, a refusal ends the attempt
+ *   S23 files: a turn's files must name a fixture inside the cases directory; the files the assistant's messages hand the user are
+ *       read with the item that delivered each; `delivers` and `min_chars` are graded, and skipped in baseline
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -52,7 +54,7 @@ import * as readTools from "../src/assistant/read-tools.js";
 import {
   BUILTIN_TOOLS, CAPABILITY_DENIAL, SELF_INABILITY, fill, oracleMcpTarget, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
   type Arms,
-  apiQuery, caseSays, cardsOf, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
+  apiQuery, caseSays, cardsOf, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
   assistantInUse, capRefusedSays, countedSays, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded,
 } from "./e2e/sa-eval-lib.js";
@@ -663,4 +665,30 @@ test("S21 what the stream missed", () => {
   assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2"), ["m1"], ["i1"]), ["claw-3"], "a say about the case's item");
   assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2"), ["m1"]), [], "an item the case did not start is not looked at");
   assert.deepEqual(streamMissed(null, [], ["m1"]), ["(the stored events could not be read)"]);
+});
+
+test("S23 files in, files and long answers out", () => {
+  assert.deepEqual(parseCases(JSON.stringify(caseOf({ turns: [{ user: "q", files: [{ fixture: "fixtures/a.pdf" }] }] }))).bad, []);
+  for (const fixture of ["/etc/passwd", "../x.pdf", "a/../../x", ""]) {
+    const bad = parseCases(JSON.stringify(caseOf({ turns: [{ user: "q", files: [{ fixture }] }] }))).bad;
+    assert.equal(bad.length, 1, fixture);
+  }
+  assert.equal(parseCases(JSON.stringify(caseOf({ delivers: [{}] }))).bad.length, 1);
+
+  const says = saysOf([
+    say(1, "m1", "#3 delivered a file: chart.png", { files: [{ name: "chart.png", content_type: "image/png", item_id: "i1" }] }),
+    say(2, "", "#4 delivered a file: other.csv", { files: [{ name: "other.csv", content_type: "text/csv", item_id: "i9" }] }),
+    say(3, "m1", "no file"),
+  ]);
+  assert.deepEqual(says[0].files, [{ name: "chart.png", content_type: "image/png", item_id: "i1" }]);
+  assert.deepEqual(says[2].files, []);
+  assert.deepEqual(filesFrom(says, ["i1"]).map((f) => f.name), ["chart.png"], "only the case's own items' files");
+
+  const c = caseOf({ delivers: [{ name: "\\.png$", type: "image/" }], style: { min_chars: 700 } });
+  const delivered = filesFrom(says, ["i1"]);
+  assert.deepEqual(failed(c, observed({ delivered, final: "x".repeat(700) })), []);
+  assert.deepEqual(failed(c, observed({ delivered: [], final: "x".repeat(699) })), [">= 700 chars", "delivers \\.png$ image/"]);
+  assert.deepEqual(failed(caseOf({ delivers: [{ type: "application/vnd.openxmlformats" }] }), observed({ delivered })), ["delivers * application/vnd.openxmlformats"]);
+  const baseline = grade(c, observed({ mode: "baseline", route: undefined, cards: undefined, final: "x".repeat(700) }));
+  assert.ok(baseline.find((x) => x.name.startsWith("delivers"))?.skipped, "baseline has no files to grade, and says so");
 });

@@ -24,6 +24,7 @@ import { db, FAILOVER_RETRY_DELAY_MS, inTransaction, isFailoverError, neverCommi
 import { metrics } from "../infra/metrics.js";
 import {
   ASSISTANT_EVENT_TYPES,
+  type AssistantFile,
   type AssistantItemSnapshot,
   type AssistantConfirmAction,
   type AssistantConfirmWrite,
@@ -38,8 +39,12 @@ import { canAccept, resolveWorkItem } from "./work-items.js";
 
 const logger = pino({ name: "assistant-outbound" });
 
-/** The longest message the assistant may say: about a hundred words. */
-export const SAY_TEXT_MAX = 600;
+/**
+ * The longest message the assistant may say, and the longest answer the system says for it: three chat messages of 3000
+ * characters, which is how a channel shows a long one (whole, never cut). The prompt still asks for about a hundred words
+ * (`SAY_BRIEF_CHARS`) unless the user asked for more; this is the bound, not the norm.
+ */
+export const SAY_TEXT_MAX = 9000;
 
 export type SayRefusal = "empty_text" | "text_too_long" | "item_not_found" | ItemRefError | "say_rate_limited" | "handed_off" | "already_announced";
 
@@ -144,7 +149,7 @@ interface ToStoreBase {
 type ToStore =
   | (ToStoreBase & {
     type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; confirmWrite?: AssistantConfirmWrite;
-    sources?: AssistantSaySource[];
+    sources?: AssistantSaySource[]; files?: AssistantFile[];
   })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow });
 
@@ -157,6 +162,7 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
       ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}),
       ...(m.sources?.length ? { sources: m.sources } : {}),
       ...(m.confirmWrite ? { confirm_write: m.confirmWrite } : {}),
+      ...(m.files?.length ? { files: m.files } : {}),
     };
 }
 
@@ -221,6 +227,7 @@ export async function publishSayEvent(
       // must see the card the channel draws, not only its words.
       ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
       ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
+      ...(payload.type === "assistant.say" && payload.files ? { files: payload.files } : {}),
       fallback: payload.type === "work_item.needs_you",
       ts: Date.parse(payload.occurred_at),
     });
@@ -527,24 +534,8 @@ function needsYouText(item: ItemRow): string {
  */
 export async function recordNeedsYouFallback(input: { itemId: string }, deps: SayDeps = {}): Promise<SayOutcome | null> {
   const stored = await storeSettled(async (q, storeOne) => {
-    const item = await loadItem(q, input.itemId);
-    const answered = item?.board_state === "done" && item.outcome === "answered";
-    if (!item || (item.board_state !== "needs_you" && !answered)) return null;
-    // An answer is said whole, from the report (the item's own summary is cut to a line).
-    const answer = answered
-      ? ((await q(
-          "SELECT summary FROM claw_work_item_events WHERE item_id = $1 AND kind = 'answer' ORDER BY id DESC LIMIT 1", [item.item_id],
-        )).rows[0]?.summary as string | undefined) ?? ""
-      : "";
-    const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id ?? null;
-    return storeOne({
-      type: "work_item.needs_you",
-      sayId: deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq)),
-      userId: item.user_id,
-      sessionId,
-      text: answered ? `#${item.seq} "${item.title}": ${answer}` : needsYouText(item),
-      item,
-    });
+    const m = await needsYouMessage(q, input.itemId);
+    return m ? storeOne(m) : null;
   }, (late) => announce(late, deps));
   if (!stored) return null;
   await announce(stored, deps);
@@ -574,6 +565,65 @@ export async function turnHandedOffReview(q: Querier, userId: string, messageId:
   )).rows.length > 0;
 }
 
+/** The system's message for an item that needs the user or was answered (`recordNeedsYouFallback`), or null when it is neither. */
+async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToStore, { type: "work_item.needs_you" }> | null> {
+  const item = await loadItem(q, itemId);
+  const answered = item?.board_state === "done" && item.outcome === "answered";
+  if (!item || (item.board_state !== "needs_you" && !answered)) return null;
+  // An answer is said whole, from the report (the item's own summary is cut to a line).
+  const answer = answered
+    ? ((await q(
+        "SELECT summary FROM claw_work_item_events WHERE item_id = $1 AND kind = 'answer' ORDER BY id DESC LIMIT 1", [item.item_id],
+      )).rows[0]?.summary as string | undefined) ?? ""
+    : "";
+  const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id ?? null;
+  return {
+    type: "work_item.needs_you",
+    sayId: deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq)),
+    userId: item.user_id,
+    sessionId,
+    text: answered ? `#${item.seq} "${item.title}": ${answer}` : needsYouText(item),
+    item,
+  };
+}
+
+/**
+ * The answer that just closed an item, whole, in the system's words, stored in the transaction of the report that closed it
+ * (`reports.ts`): the router is told it was sent in full only when it is stored for sending, never before. The same message,
+ * under the same id, as the silent sweep's (`recordNeedsYouFallback`), so it is said once. Null when the item is not answered
+ * or the message was stored before. `announce` after the commit; `settle` instead when the COMMIT met a failover and its answer
+ * was lost (it may have taken effect): the message is looked up in the background and announced if it is there and no session
+ * event holds it yet, as a say's is (`settleLater`), since the report sent again is then a duplicate that announces nothing.
+ */
+export async function storeAnswerWhole(
+  q: Querier, itemId: string, deps: SayDeps = {},
+): Promise<{ sayId: string; announce: () => Promise<void>; settle: () => void } | null> {
+  const m = await needsYouMessage(q, itemId);
+  if (!m || m.item.board_state !== "done") return null;
+  const stored = await store(q, m);
+  return stored
+    ? {
+      sayId: stored.sayId,
+      announce: () => announce(stored, deps),
+      settle: () => settleLater(m, async (late) => {
+        // The COMMIT may have rolled back and the report sent again landed on another replica, which stored and announced it:
+        // `announcedHere` is this process's alone, so what the session's stream already holds is not published a second time.
+        if (late.sessionId && await eventInSession(late.sessionId, late.sayId)) return;
+        await announce(late, deps);
+      }),
+    }
+    : null;
+}
+
+/** Whether the session's stream holds the message's event (published by any replica, persisted by the event consumer). */
+async function eventInSession(sessionId: string, sayId: string): Promise<boolean> {
+  const r = await db.query(
+    "SELECT 1 FROM claw_session_events WHERE session_id = $1 AND event = 'AssistantSay' AND data->>'say_id' = $2 LIMIT 1",
+    [sessionId, sayId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
 /**
  * A message in the system's own words, not the model's: stored as a fallback, so it is neither counted against the say
  * limit nor taken for the turn having spoken. Once per `key`: a second call stores nothing and returns `null`.
@@ -583,12 +633,15 @@ export async function recordSystemNotice(
     userId: string; sessionId: string; text: string; key: string;
     /** The item it is about, attached as a say's is; and the message of the turn it answers, as on a say's event. */
     itemId?: string; turnMessageId?: string;
+    /** Files the user gets with it (a worker's deliveries, `deliveries.ts`). */
+    files?: AssistantFile[];
   }, deps: SayDeps = {},
 ): Promise<SayOutcome | null> {
   const stored = await storeSettled(async (q, storeOne) => storeOne({
     type: "assistant.say", fallback: true, item: input.itemId ? await loadItem(q, input.itemId, input.userId) : null,
     sayId: deterministicEventId("assistant.notice", input.userId, input.key),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
+    ...(input.files?.length ? { files: input.files } : {}),
   }), (late) => announce(late, deps, input.turnMessageId));
   if (!stored) return null;
   await announce(stored, deps, input.turnMessageId);

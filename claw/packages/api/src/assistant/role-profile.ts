@@ -22,6 +22,7 @@ import {
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
+import { readGithubMcpSettings } from "../github-mcp/settings.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
@@ -38,6 +39,8 @@ import { AFTER_READ_TOOLS, routerLookups } from "./read-tools.js";
 import { heldForPersonManifest, renderHeldForPerson } from "./holds.js";
 import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
+import { promptImagesOf, renderFilesState } from "./files.js";
+import { turnMessage } from "./inbound.js";
 import { startWorkerRun } from "./run-started.js";
 import { githubEventsEnabled } from "./github-events.js";
 import { jobWatchesEnabled } from "./job-watch.js";
@@ -260,11 +263,19 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // The system prompt is the same on every turn, so it and the history after it come from the prompt cache. What changes
     // from turn to turn (the item list, what waits for the user, what the channel sent) goes with the message instead.
     const github = lookups.githubTools.length > 0;
-    withSystemAppend(task, renderRouterPrompt({ servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null }));
+    withSystemAppend(task, renderRouterPrompt({ servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null, githubBinding: readGithubMcpSettings().binding }));
     const state = [renderRouterItems(await routerManifest(role.userId), await askedOfOthersManifest(role.userId))];
     // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
     const held = renderHeldForPerson(await heldForPersonManifest(role.userId));
     if (held) state.push(held);
+    // What the person sent beside their words (`files.ts`): the router is told what came, and is shown the pictures itself (Brain
+    // reads them from this session's uploads), since it has no sandbox to open them in.
+    const files = (await turnMessage((t, p) => db.query(t, p), sessionId, messageId))?.context.files ?? [];
+    if (files.length) {
+      state.push(renderFilesState(files));
+      const images = promptImagesOf(files);
+      if (images.length) task.prompt_images = images;
+    }
     if (CLAW_ASSISTANT_TOOLS) {
       withSystemAppend(task, ROUTER_REVIEW_PROMPT);
       const review = await reviewContextFor(role.userId, sessionId, messageId);

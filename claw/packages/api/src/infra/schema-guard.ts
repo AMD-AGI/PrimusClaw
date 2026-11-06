@@ -251,6 +251,12 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["say_id", "user_id", "item_id", "item_attention_seq", "text", "fallback", "created_at", "delivered_at"],
   },
   {
+    table: "claw_work_item_delivery_checks",
+    // What the delivery announcement records and its sweep reads: absent, every report's file announcement fails on the record.
+    onlyWhenAssistant: true,
+    columns: ["item_id", "event_id", "checked_at"],
+  },
+  {
     table: "claw_work_item_subscriptions",
     // What the GitHub event loop claims and advances: absent, nothing an item watches is read.
     onlyWhenAssistant: true,
