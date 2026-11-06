@@ -38,8 +38,18 @@ import { clipOneLine, TITLE_MAX } from "./work-items.js";
 const logger = pino({ name: "assistant-remote-items" });
 
 export const REMOTE_EVENT_TURN_END = "turn_end";
+export const REMOTE_EVENT_COMMAND_REJECTED = "command_rejected";
 /** The events that move a remote item. */
-const MOVING = [REMOTE_EVENT_TURN_END, REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED];
+const MOVING = [
+  REMOTE_EVENT_TURN_END, REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED,
+  REMOTE_EVENT_COMMAND_REJECTED,
+];
+/**
+ * Why a connector refuses a prompt before it is queued (`connector/src/session.ts` `enqueuePrompt`): that prompt never gets a
+ * `turn_end`, so its refusal is its end. A prompt refused when its turn starts (the attach preflight) also posts a `turn_end`,
+ * which ends it, so its refusal is not counted twice.
+ */
+const PROMPT_REFUSED_UNQUEUED = new Set(["too_many_queued_prompts", "session_closed"]);
 
 /** How much of an instruction an item keeps (its title is shorter), and of an answer its summary and its event. */
 const ASKED_MAX = 120;
@@ -200,7 +210,7 @@ async function answerOf(q: Querier, sessionId: string, endId: number): Promise<s
 
 /** What a remote item's end says to the user, in the language they asked in (the system's own words around the agent's). */
 export function remoteNotice(
-  kind: "done" | "waiting" | "closed", p: Pick<RemoteParams, "machine" | "agent_id" | "asked" | "lang" | "session_id">,
+  kind: "done" | "waiting" | "closed" | "refused", p: Pick<RemoteParams, "machine" | "agent_id" | "asked" | "lang" | "session_id">,
   seq: number, detail: string,
 ): string {
   const zh = p.lang === "zh";
@@ -209,6 +219,9 @@ export function remoteNotice(
     return zh
       ? `${who} 在等你批准：${detail}（#${seq} ${p.asked}）。发 /agent attach ${p.session_id} 切过去处理。`
       : `${who} is waiting for your approval: ${detail} (#${seq} ${p.asked}). Send /agent attach ${p.session_id} to answer it there.`;
+  }
+  if (kind === "refused") {
+    return zh ? `${who} 没有接下 #${seq}（${p.asked}）：${detail}` : `${who} refused #${seq} (${p.asked}): ${detail}`;
   }
   if (kind === "closed") {
     return zh ? `${who} 的会话已关闭，#${seq}（${p.asked}）没有做完。` : `The session of ${who} closed before #${seq} (${p.asked}) finished.`;
@@ -310,9 +323,10 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
             { kind: "progress", summary: p.lang === "zh" ? "已批准，继续" : "answered, going on" });
         }
       } else if (e.type === REMOTE_EVENT_TURN_END) {
-        p.open_turns = Math.max(0, (Number(p.open_turns) || 0) - 1);
-        if (p.open_turns > 0) continue;
         const stop = flat(e.data.stopReason, 40);
+        // A cancel ends the running turn and drops every queued prompt with no turn_end of their own: nothing sent before it is open.
+        p.open_turns = stop === "cancelled" ? 0 : Math.max(0, (Number(p.open_turns) || 0) - 1);
+        if (p.open_turns > 0) continue;
         const said = stopWords(stop, flat(e.data.error, 200), p.lang);
         const whole = await answerOf(q, sessionId, e.id);
         const answer = tailOf(whole, ANSWER_EVENT_MAX);
@@ -326,6 +340,20 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
           { kind: "answer", summary: [said, answer].filter(Boolean).join(" ") || summary, result: { stop_reason: stop || null, remote_event_id: e.id } },
         );
         tell(`end:${e.id}`, remoteNotice("done", p, item.seq, [said, tailLines(whole, NOTICE_ANSWER_MAX)].filter(Boolean).join(" ") || summary));
+      } else if (e.type === REMOTE_EVENT_COMMAND_REJECTED) {
+        const reason = flat(e.data.reason, 80);
+        if (e.data.type !== "prompt" || !PROMPT_REFUSED_UNQUEUED.has(reason)) continue;
+        p.open_turns = Math.max(0, (Number(p.open_turns) || 0) - 1);
+        if (p.open_turns > 0) continue;
+        board = "done";
+        p.waiting = [];
+        const summary = p.lang === "zh" ? `指令被拒绝：${reason}` : `the instruction was refused: ${reason}`;
+        await write(
+          `board_state = 'done', outcome = 'dropped', last_report_kind = 'dropped', summary = $2, pending_question = NULL,
+           closed_at = NOW(), attention_seq = attention_seq + $3::int`,
+          [summary, p.origin === "assistant" ? 1 : 0], { kind: "dropped", summary },
+        );
+        tell(`refused:${e.id}`, remoteNotice("refused", p, item.seq, reason));
       } else if (e.type === REMOTE_EVENT_SESSION_CLOSED) {
         if (board === "done") continue;
         board = "done";

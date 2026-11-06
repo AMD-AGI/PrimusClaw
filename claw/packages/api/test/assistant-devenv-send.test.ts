@@ -21,6 +21,9 @@
  *   F5  work_send refuses a development environment item (devenv_send sends to it); work_stop closes it and cancels the agent's turn;
  *       work_recall's worker_tail is the agent's answer
  *   F6  the router's prompt sends instructions with devenv_send and follows development environment items
+ *   F7  every prompt sent ends, though not every one gets a turn_end: a cancel (one turn_end, its queued prompts dropped) closes the
+ *       item; a prompt the connector refused before queueing it is one fewer; one refused at its start (refusal and turn_end) is one
+ *   F8  the item's stop button (`POST /v1/work-items/:id/stop`) cancels the agent's turn on the machine, as work_stop does
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -60,9 +63,13 @@ describe("development environment items and devenv_send", { skip }, () => {
     app = Fastify();
     app.addHook("preHandler", async (req) => {
       const id = req.headers["x-test-user"];
-      if (typeof id === "string") (req as any).user = { userId: id, userName: id, platformKey: "", virtualKey: "", roles: ["default"] };
+      if (typeof id !== "string") return;
+      (req as any).user = { userId: id, userName: id, platformKey: "", virtualKey: "", roles: ["default"] };
+      (req as any).authMethod = "identity_token";
     });
     await registerRemoteAgentRoutes(app, { pingMs: 150, pollMs: 40, retentionDays: 0 });
+    const { registerAssistantRoutes } = await import("../src/routes/assistant.js");
+    await registerAssistantRoutes(app);
     await app.listen({ port: 0, host: "127.0.0.1" });
     base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
   });
@@ -355,6 +362,58 @@ describe("development environment items and devenv_send", { skip }, () => {
     // The turn's end that the cancel brings changes nothing more.
     await events("alice", cid, sid, [end("cancelled")]);
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).outcome], ["done", "stopped"]);
+  });
+
+  test("F7 a cancel closes the item however many prompts were queued; a refused prompt is one fewer, never two", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const sid = await chatSession("alice", cid);
+    const prompt = async (text: string) => assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text })).status, 202);
+    const rejected = (reason: string): [string, Recorded] => ["command_rejected", { type: "prompt", cmd_id: "c", reason }];
+
+    // Two prompts typed, then stop: the connector drops the queued one with no turn_end, and the running one ends cancelled.
+    await prompt("first");
+    await prompt("second");
+    assert.equal((await remoteItem(sid)).params.open_turns, 2);
+    await events("alice", cid, sid, [chunk("half done"), end("cancelled")]);
+    let item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome, item.params.open_turns], ["done", "answered", 0]);
+    assert.match(item.summary, /已取消|cancelled/);
+
+    // Three more: the third is refused as one too many (no turn_end of its own); the two that ran end the item.
+    await prompt("a");
+    await prompt("b");
+    await prompt("c");
+    await events("alice", cid, sid, [rejected("too_many_queued_prompts"), end()]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_turns], ["in_progress", 1]);
+    await events("alice", cid, sid, [chunk("b done"), end()]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "b done"]);
+
+    // A prompt refused when its turn starts posts its refusal and a turn_end: that is one prompt, not two.
+    await prompt("x");
+    await prompt("y");
+    await events("alice", cid, sid, [rejected("attach_busy"), end("error")]);
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_turns], ["in_progress", 1]);
+    await events("alice", cid, sid, [end()]);
+    assert.equal((await remoteItem(sid)).board_state, "done");
+
+    // The only prompt open refused before it was queued: the item ends, dropped, saying why.
+    await prompt("z");
+    await events("alice", cid, sid, [rejected("too_many_queued_prompts")]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome, item.params.open_turns], ["done", "dropped", 0]);
+    assert.match(item.summary, /too_many_queued_prompts/);
+  });
+
+  test("F8 the item's stop button cancels the agent's turn on the machine", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const out = await tools.devenvSend(await userTurn(alice, "跑 make test"), { text: "跑 make test" });
+    const sid = String(out.session_id);
+    const r = await post("alice", `/v1/work-items/${String(out.item_id)}/stop`, {});
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).outcome], ["done", "stopped"]);
+    assert.deepEqual((await queued(cid)).map((c: Recorded) => c.type), ["session.new", "prompt", "cancel"]);
   });
 
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {

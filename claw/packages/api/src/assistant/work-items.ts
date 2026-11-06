@@ -480,8 +480,14 @@ export async function stopWorkItem(input: {
   const item = itemView(current);
   if (refused) return { status: "conflict", error: refused, item };
   if (!stopped && current.outcome !== "stopped") return { status: "conflict", error: "item_closed", item };
-  // A remote item has no run of Claw's to stop: its agent's turn is cancelled on its machine (`cancelRemoteItem`).
-  if (item.kind !== "remote") await stopSessionRuns(current.worker_session_id as string);
+  // A remote item has no run of Claw's to stop: its agent's turn is cancelled on its machine, whoever pressed stop (the router's
+  // work_stop, the item's stop button). Loaded here to keep the two modules acyclic.
+  if (item.kind === "remote") {
+    const { cancelRemoteItem } = await import("./remote-items.js");
+    await cancelRemoteItem(input.userId, item.params);
+  } else {
+    await stopSessionRuns(current.worker_session_id as string);
+  }
   return { status: "ok", item };
 }
 

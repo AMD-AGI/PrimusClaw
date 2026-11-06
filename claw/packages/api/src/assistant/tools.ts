@@ -41,7 +41,7 @@ import {
   assertAllowedModel, isAllowedModel, modelAnswer, modelChoiceOn, ModelChoiceRefused, modelParams, resolveItemModel, writeModelPrefs, type ResolvedModel,
 } from "./model-choice.js";
 import { ingestReport } from "./reports.js";
-import { cancelRemoteItem, remoteAnswerTail } from "./remote-items.js";
+import { remoteAnswerTail } from "./remote-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import {
   clipOneLine, getWorkItem, insertWorkItem, recentEvents, reopenWorkItem, resolveWorkItem, resolveWorkItemNow, stopWorkItem,
@@ -590,8 +590,6 @@ export async function workStop(
     },
   });
   if (stopped.status === "not_found") throw new ToolRefused("item_not_found", "no such item");
-  // An agent on the user's machine: its turn is cancelled too, as the stop button of an attached chat does.
-  if (stopped.status === "ok" && stopped.item.kind === "remote") await cancelRemoteItem(userId, stopped.item.params);
   if (stopped.status === "conflict") {
     // A review whose merge is being made, or was made: say exactly that, so the user is told the truth and nothing is undone.
     if (stopped.error === "merge_in_progress") throw new ToolRefused(stopped.error, "the merge is being made right now and cannot be stopped");
