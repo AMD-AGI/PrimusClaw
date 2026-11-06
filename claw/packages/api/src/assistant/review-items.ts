@@ -1498,6 +1498,7 @@ async function startQueuedOf(owner: string): Promise<Array<{ itemId: string; ses
       const sessionId = row.worker_session_id as string;
       // The owner can write into their own review's session while it waits (its id is theirs): that ran it, as their own message runs
       // any session of theirs. It no longer waits, takes its slot, and gets no first message of the server's on top of the owner's.
+      // (Over any limit, its request's ten included: the owner's message runs whatever the counts say, and is counted from now on.)
       const ran = Number(((await query(
         `SELECT (SELECT COUNT(*) FROM claw_tasks WHERE session_id = $1) + (SELECT COUNT(*) FROM claw_pending_messages WHERE session_id = $1) AS n`,
         [sessionId],
