@@ -9,7 +9,9 @@
  * (`isPlatformMcpServer`). A page `web_fetch` read whole only confirms a source: it is kept when its address is one of those or one
  * the user wrote in the message the turn answers (`user_urls`), so what a page or a search result's text says cannot lead the model
  * to an address of its choosing and make it a source. A plugin's server, a page's body and the model's own words are never read
- * for addresses.
+ * for addresses, with one exception: a server the request names in `link_servers` (the agent board's Gitea) answers with JSON objects that
+ * carry their own page as `html_url`, and that field of a top-level object (or of each element of a top-level array) is kept when it
+ * starts with the prefix the request gives for that server (`keepLinks`). An address in a body, a comment or a title is never read.
  *
  * A call of a citing tool (the router's `say`) gives its `sources` as addresses; each is looked up among the kept ones by a
  * normalized form (`citeKey`), and the kept entry is what is sent on, the tool's own address and not the model's copy of it. What is
@@ -46,6 +48,11 @@ export function citeKey(raw: unknown): string | null {
   return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}${url.search}`;
 }
 
+/** The longest result `keepLinks` parses: a larger one (or one cut short) keeps nothing. */
+export const LINK_RESULT_MAX = 512 * 1024;
+/** The most objects of one result `keepLinks` reads. */
+const LINK_OBJECTS_MAX = 100;
+
 /** At most `CITE_TITLE_MAX` code points of `s`, whitespace runs as one space. */
 function clipTitle(s: string): string {
   return Array.from(s.replace(/\s+/g, " ").trim()).slice(0, CITE_TITLE_MAX).join("");
@@ -73,9 +80,10 @@ export class RunCitations {
   private readonly kept = new Map<string, CiteSource>();
 
   /** `userKeys`: the `citeKey` of each address the user wrote in the message the turn answers (`cite.user_urls`). */
+  /** `linkServers`: per server, the prefix the `html_url` of its result objects must start with to be kept (`keepLinks`). */
   constructor(
     private readonly citing: ReadonlySet<string>, private readonly sourceServers: ReadonlySet<string>,
-    private readonly userKeys: ReadonlySet<string> = new Set(),
+    private readonly userKeys: ReadonlySet<string> = new Set(), private readonly linkServers: ReadonlyMap<string, string> = new Map(),
   ) {}
 
   /** Whether a call of `name` cites: its `sources` argument is looked up, and the result sent in the request's `_meta`. */
@@ -106,6 +114,43 @@ export class RunCitations {
         logger.info({ tool: name, host: new URL(key).host }, "cite.fetch_not_confirmed");
         continue;
       }
+      if (this.kept.size >= RUN_SOURCES_MAX) {
+        logger.warn({ tool: name, max: RUN_SOURCES_MAX }, "cite.run_sources_full");
+        return;
+      }
+      this.kept.set(key, source);
+    }
+  }
+
+  /**
+   * Keep the pages a call of a link server returned (`link_servers`): the `html_url` of each top-level object of its JSON result,
+   * when it starts with the server's prefix, titled by the object's own `title`, `full_name` or `name`. A result that is not JSON,
+   * is cut short or is larger than `LINK_RESULT_MAX` keeps nothing.
+   */
+  keepLinks(name: string, text: string): void {
+    if (!name.startsWith("mcp__") || typeof text !== "string" || !text || text.length > LINK_RESULT_MAX) return;
+    const prefix = this.linkServers.get(name.split("__")[1] ?? "");
+    if (!prefix) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return;
+    }
+    const objects = (Array.isArray(parsed) ? parsed : [parsed]).slice(0, LINK_OBJECTS_MAX);
+    const sources: CiteSource[] = [];
+    for (const o of objects) {
+      if (!o || typeof o !== "object" || Array.isArray(o)) continue;
+      const r = o as { html_url?: unknown; title?: unknown; full_name?: unknown; name?: unknown };
+      if (typeof r.html_url !== "string") continue;
+      const title = [r.title, r.full_name, r.name].find((t): t is string => typeof t === "string" && t.trim() !== "");
+      const source = webSource(r.html_url, title);
+      // (the address as parsed: `https://host/board/../x` is not under `https://host/board/`)
+      if (source?.url.startsWith(prefix)) sources.push({ ...source, kind: "board" });
+    }
+    for (const source of sources) {
+      const key = citeKey(source.url);
+      if (!key || this.kept.has(key)) continue;
       if (this.kept.size >= RUN_SOURCES_MAX) {
         logger.warn({ tool: name, max: RUN_SOURCES_MAX }, "cite.run_sources_full");
         return;
@@ -153,7 +198,7 @@ export class RunCitations {
  */
 export function parseCite(raw: unknown, servers: Record<string, unknown>): RunCitations | null {
   if (!raw || typeof raw !== "object") return null;
-  const r = raw as { tools?: unknown; source_servers?: unknown; user_urls?: unknown };
+  const r = raw as { tools?: unknown; source_servers?: unknown; user_urls?: unknown; link_servers?: unknown };
   const names = (v: unknown): string[] => (Array.isArray(v) ? v.filter((n): n is string => typeof n === "string" && n.trim() !== "").map((n) => n.trim()) : []);
   const tools = names(r.tools);
   if (!tools.length) return null;
@@ -164,5 +209,23 @@ export function parseCite(raw: unknown, servers: Record<string, unknown>): RunCi
     return ok;
   });
   const userKeys = names(r.user_urls).slice(0, USER_URLS_MAX).map(citeKey).filter((k): k is string => k !== null);
-  return new RunCitations(new Set(tools), new Set(trusted), new Set(userKeys));
+  return new RunCitations(new Set(tools), new Set(trusted), new Set(userKeys), parseLinkServers(r.link_servers));
+}
+
+/**
+ * `cite.link_servers`: server name to the prefix its pages' addresses have. A prefix must be an https address that can be a source
+ * and end its path with `/`, so `https://host/board/` never matches `https://host/boarding`; anything else is left out.
+ */
+function parseLinkServers(raw: unknown): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [server, prefix] of Object.entries(raw as Record<string, unknown>)) {
+    const url = citeableUrl(prefix);
+    if (!server.trim() || !url || url.protocol !== "https:" || !url.pathname.endsWith("/") || url.search || url.hash || prefix !== url.toString()) {
+      logger.warn({ server }, "cite.link_server_invalid");
+      continue;
+    }
+    out.set(server.trim(), url.toString());
+  }
+  return out;
 }

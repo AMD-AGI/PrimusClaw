@@ -70,7 +70,7 @@ describe("say with citations, on a real Postgres", { skip }, () => {
     const router = await connect(w.mod.token.mintAssistantToken(await w.routerTurn(alice) as never, TOKEN_KEY));
     try {
       const say = (await router.listTools()).tools.find((t) => t.name === "say")!;
-      assert.deepEqual(Object.keys((say.inputSchema as any).properties), ["text", "item_id", "sources"], "sources after text");
+      assert.deepEqual(Object.keys((say.inputSchema as any).properties), ["text", "item_id", "sources", "suggested"], "sources after text");
       assert.deepEqual((say.inputSchema as any).required, ["text"]);
       const { SAY_SOURCES_PARAM } = await import("../src/assistant/mcp.js");
       assert.deepEqual((say.inputSchema as any).properties.sources, { type: "array", items: { type: "string" }, description: SAY_SOURCES_PARAM },
@@ -109,7 +109,7 @@ describe("say with citations, on a real Postgres", { skip }, () => {
     // Off: the same server offers no sources and reads no _meta.
     const { createAssistantMcpServer } = await import("../src/assistant/mcp.js");
     const turn = await w.routerTurn(alice);
-    const server = createAssistantMcpServer(turn as never, false, false, false, false);
+    const server = createAssistantMcpServer(turn as never, false, false, false, false, false, false);
     const [a, b] = InMemoryTransport.createLinkedPair();
     await server.connect(a);
     const plain = new Client({ name: "t", version: "1" }, { capabilities: {} });

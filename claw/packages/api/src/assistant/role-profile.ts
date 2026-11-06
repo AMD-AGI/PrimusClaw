@@ -262,7 +262,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       sources: lookups.allowlist, allow_after: AFTER_READ_TOOLS.map((t) => `${TOOL_NAME_PREFIX}${t}`), clean_failures: lookups.cleanFailures,
     };
     // Its say may cite what the lookups returned (`citations.ts`): Brain keeps their sources and hands say the ones it names.
-    const cite = routerCite(lookups.githubServers, stringField(task, "prompt"));
+    const cite = routerCite(lookups.githubServers, stringField(task, "prompt"), undefined, read?.servers ?? []);
     if (cite) task.cite = cite;
     else delete task.cite;
     // Neither the deployment's default MCP servers nor its default skills: the hint that lists them would follow the user's message.

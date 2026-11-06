@@ -91,6 +91,8 @@ export interface SayInput {
    */
   turnBegan?: Date | string;
   amendNotice?: boolean;
+  /** The replies it suggests, already checked (`suggested.ts`): carried by its event as `suggested_replies`. */
+  suggested?: string[];
 }
 
 export interface SayDeps {
@@ -154,7 +156,7 @@ interface ToStoreBase {
 type ToStore =
   | (ToStoreBase & {
     type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; confirmWrite?: AssistantConfirmWrite;
-    sources?: AssistantSaySource[]; files?: AssistantFile[]; amends?: string;
+    sources?: AssistantSaySource[]; files?: AssistantFile[]; amends?: string; suggested?: string[];
     /** A system notice's turn (the message it answers): kept on its payload, so a later say of that turn finds it (`turnAnnouncedStart`). */
     noticeOfTurn?: string;
   })
@@ -168,6 +170,7 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
     : {
       ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}),
       ...(m.sources?.length ? { sources: m.sources } : {}),
+      ...(m.suggested?.length ? { suggested_replies: m.suggested.map(redact) } : {}),
       ...(m.confirmWrite ? { confirm_write: m.confirmWrite } : {}),
       ...(m.files?.length ? { files: m.files } : {}),
       ...(m.amends ? { amends: m.amends } : {}),
@@ -232,6 +235,7 @@ export async function publishSayEvent(
       text: payload.text,
       ...(payload.item ? { item: payload.item } : {}),
       ...(payload.type === "assistant.say" && payload.sources ? { sources: payload.sources } : {}),
+      ...(payload.type === "assistant.say" && payload.suggested_replies ? { suggested_replies: payload.suggested_replies } : {}),
       // What the message puts to the person to press, as a channel gets it: a web client, and an evaluation reading the session,
       // must see the card the channel draws, not only its words.
       ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
@@ -512,7 +516,7 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
       )).rows[0].n);
       if (recent >= limit) throw new SayCapped(limit);
       return storeOne({
-        type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item, sources: input.sources,
+        type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item, sources: input.sources, suggested: input.suggested,
         ...(notice ? { amends: notice } : {}),
         ...(input.holdForTurn ? { hold: { status: heldStatus(input.holdForTurn), seconds: HOLD_SECONDS } } : {}),
       });
