@@ -166,6 +166,19 @@ describe("router quality, through the tools", { skip }, () => {
     assert.equal(w.events.find((e) => e.type === "AssistantSay" && e.say_id === added.say_id)?.amends, notice.id);
   });
 
+  test("Q4d a newer turn's start notice is never added to by an older turn: the older turn is superseded and its say refused", async () => {
+    await w.q("DELETE FROM claw_notification_subscriptions");   // (the time-matched case: no delivery row carries a notice's turn)
+    const older = await turnFor("帮我看一下 CI");
+    const newer = await turnFor("帮我新建一个任务：整理发布说明");
+    const created = await w.mod.tools.workCreate(newer as never, { title: "整理发布说明", brief: "do it" }, w.sayDeps);
+    assert.equal(created.announced, true);
+    await assert.rejects(w.mod.tools.say(older as never, { text: "CI 是绿的。" }, w.sayDeps), (err: any) => {
+      assert.equal(err.code, "turn_superseded");
+      return true;
+    });
+    assert.equal(w.events.filter((e) => e.type === "AssistantSay" && e.amends).length, 0);
+  });
+
   test("Q5 a turn whose model answered nothing is told as declined; any other failure as not gone through", async () => {
     const ended = async (prompt: string, finalText: string) => {
       const turn = await turnFor(prompt);
