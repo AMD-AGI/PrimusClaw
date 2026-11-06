@@ -373,7 +373,7 @@ A successful `login` starts an installed service again, so after a revocation or
 installed for a state directory is recorded in its `service.json`.
 
 The unit carries `PATH` (so the agents are found), `CLAW_CONNECTOR_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `CLAUDE_CONFIG_DIR`,
-`CODEX_HOME`, the CA and proxy variables and `LANG` from the shell that ran `install`; `--env NAME` adds another, except a name that looks
+`CODEX_HOME`, the CA and proxy variables and `LANG` from the shell that ran `install` (a proxy URL with a password in it only when named with `--env`, e.g. `--env HTTPS_PROXY`); `--env NAME` adds another, except a name that looks
 like a credential (`KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`), which is never written into a unit. Run `install` again after
 changing any of them, or after moving Node. With a service installed, `claw-connector stop` stops the connector until the next login,
 boot or keep-alive check; to stay offline use `pause`, or `service uninstall`.

@@ -62,6 +62,16 @@ describe("the units", () => {
     assert.match(unit, /^WantedBy=default\.target$/m);
   });
 
+  test("a proxy URL with a password is withheld unless named with --env", () => {
+    const env = { HTTPS_PROXY: "http://u:pw@proxy:3128", https_proxy: "http://u:pw@proxy:3128", HTTP_PROXY: "http://proxy:3128" };
+    const plain = carriedEnv(env);
+    assert.deepEqual(plain.vars, [["HTTP_PROXY", "http://proxy:3128"]]);
+    assert.deepEqual(plain.withheld, ["HTTPS_PROXY", "https_proxy"]);
+    const asked = carriedEnv(env, ["HTTPS_PROXY"]);
+    assert.deepEqual(asked.vars, [["HTTPS_PROXY", "http://u:pw@proxy:3128"], ["HTTP_PROXY", "http://proxy:3128"]]);
+    assert.deepEqual(asked.withheld, ["https_proxy"]);
+  });
+
   test("only the listed variables are carried, and never one named like a credential, even when asked for", () => {
     const { vars, refused } = carriedEnv({ PATH: "/bin", CLAW_CONNECTOR_KEY: "ak-secret", ANTHROPIC_API_KEY: "sk", FOO: "1", GH_TOKEN: "t" }, ["FOO", "GH_TOKEN", "ANTHROPIC_API_KEY"]);
     assert.deepEqual(vars, [["PATH", "/bin"], ["FOO", "1"]]);

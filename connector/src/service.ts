@@ -91,17 +91,28 @@ export function detectSupervisor(d: ServiceDeps): Supervisor {
   return ["running", "degraded", "starting", "initializing"].includes(state) ? "systemd" : "script";
 }
 
-/** The variables a unit sets: the carried ones that are set here, plus any `--env NAME`, never one that looks like a secret. */
-export function carriedEnv(env: NodeJS.ProcessEnv, extra: string[] = []): { vars: Array<[string, string]>; refused: string[] } {
+/** A proxy URL with a user name or password in it (`http://user:pass@host`). */
+export const hasUserinfo = (v: string): boolean => {
+  try { const u = new URL(v); return u.username !== "" || u.password !== ""; } catch { return /\/\/[^/]*@/.test(v); }
+};
+
+/**
+ * The variables a unit sets: the carried ones that are set here, plus any `--env NAME`, never one that looks like a
+ * secret. A proxy URL that carries a password is left out (`withheld`) unless named with `--env`: the unit file is
+ * 0600, but a password is not written into it without being asked.
+ */
+export function carriedEnv(env: NodeJS.ProcessEnv, extra: string[] = []): { vars: Array<[string, string]>; refused: string[]; withheld: string[] } {
   const vars: Array<[string, string]> = [];
   const refused: string[] = [];
-  for (const name of [...CARRIED_ENV, ...extra]) {
-    if (vars.some(([n]) => n === name)) continue;
+  const withheld: string[] = [];
+  for (const name of new Set([...CARRIED_ENV, ...extra])) {
     if (!(CARRIED_ENV as readonly string[]).includes(name) && SECRET_NAME.test(name)) { refused.push(name); continue; }
     const v = env[name];
-    if (v !== undefined && v !== "") vars.push([name, v]);
+    if (v === undefined || v === "") continue;
+    if (/proxy$/i.test(name) && hasUserinfo(v) && !extra.includes(name)) { withheld.push(name); continue; }
+    vars.push([name, v]);
   }
-  return { vars, refused };
+  return { vars, refused, withheld };
 }
 
 /** systemd: a word in ExecStart= or a value in Environment=, double-quoted, with `%` (specifiers) and `$` (variables) kept literal. */
@@ -331,8 +342,9 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
   const problem = h.preflight(ctx);
   if (problem) { ctx.err(`cannot install the service yet: ${problem}`); return NEEDS_PERSON; }
   if (!fs.existsSync(d.cli)) { ctx.err(`${d.cli} does not exist (a source checkout needs "npm run build" first)`); return 1; }
-  const { vars, refused } = carriedEnv(ctx.env, extra);
+  const { vars, refused, withheld } = carriedEnv(ctx.env, extra);
   for (const r of refused) ctx.err(`--env ${r}: not carried into the service (it looks like a credential)`);
+  for (const w of withheld) ctx.err(`${w}: not carried into the service because it holds a password; if the connector needs it, install again with --env ${w} (it is then written into the 0600 unit file)`);
   // The service must be the one run: one started by hand would make every start of the service fail "already running".
   const manual = h.runningPid(ctx);
   if (manual !== null && supervisorPid(ctx) === null) {
