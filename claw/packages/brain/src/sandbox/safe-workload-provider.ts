@@ -18,6 +18,7 @@ import {
   SANDBOX_DEFAULT_TIMEOUT_SECONDS,
   AGENT_SANDBOX_MAX_SESSION_SECONDS,
   SANDBOX_NAMESPACE,
+  SANDBOX_CPU_NAMESPACE,
   SANDBOX_WORKLOAD_PRIORITY,
   SANDBOX_UNSCHEDULABLE_TIMEOUT_MS,
   SANDBOX_PENDING_TIMEOUT_MS,
@@ -25,7 +26,10 @@ import {
 } from "../config.js";
 import {
   classifyWorkloadTerminalReason,
+  SANDBOX_WORKSPACE_FORBIDDEN,
   SandboxExecRouteUnavailableError,
+  SandboxProvisionTerminalError,
+  sandboxWorkspaceForbiddenText,
   SandboxGoneError,
   SandboxRuntimeTerminalError,
   SandboxStopUnavailable,
@@ -128,6 +132,16 @@ export class SafeWorkloadProvider implements SandboxProvider {
     });
     if (!resp.ok) {
       const errBody = (await resp.text()).slice(0, 300);
+      if (resp.status === 403) {
+        // The account may not create workloads here. Retrying cannot change
+        // that, and SaFE's body names the user id and an internal error code,
+        // so the body stays in this log and the user is told what to do.
+        logger.warn({ status: resp.status, workspace: ns, body: errBody }, "safe-workload.create_forbidden");
+        throw new SandboxProvisionTerminalError(
+          SANDBOX_WORKSPACE_FORBIDDEN,
+          sandboxWorkspaceForbiddenText(ns, !!SANDBOX_CPU_NAMESPACE && ns === SANDBOX_CPU_NAMESPACE.trim()),
+        );
+      }
       throw new Error(`Create Hands failed: HTTP ${resp.status} ${errBody}`);
     }
     const result = (await resp.json()) as Record<string, unknown>;
