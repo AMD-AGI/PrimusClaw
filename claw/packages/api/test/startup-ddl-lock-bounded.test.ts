@@ -134,8 +134,11 @@ test("startup DDL against a real Postgres", { skip: skip || false }, async (t) =
     const pid = (await migrator.query("SELECT pg_backend_pid() AS pid")).rows[0].pid as number;
     await holdReader();
     let migration: Promise<unknown> | undefined;
+    // Enough attempts to outlast the reader below, so what is measured is the
+    // wait between slices and not a budget running out.
+    const patient = lockBoundedMigrationClient(migrator, { ...POLICY, attempts: 100 });
     try {
-      migration = guarded.query("ALTER TABLE t ADD COLUMN IF NOT EXISTS b INT");
+      migration = patient.query("ALTER TABLE t ADD COLUMN IF NOT EXISTS b INT");
       migration.catch(() => {});
       // Until the migration is actually queued on the table lock.
       for (let i = 0; ; i++) {
