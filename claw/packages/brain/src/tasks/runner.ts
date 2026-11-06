@@ -94,7 +94,7 @@ import {
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
 import { isTransientNatsError } from "../infra/nats-transient.js";
-import { pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
+import { lockPastSelfFence, pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
 import {
   redactEgressPayload, redactPersistedEvent, type RuntimeSecrets,
 } from "../events/redaction.js";
@@ -117,6 +117,13 @@ const sc = StringCodec();
  * step finishes, which is always written at once.
  */
 const SCRIPT_PROGRESS_REFRESH_MS = 5 * 60 * 1000;
+
+/**
+ * How often a run checks, locally, whether it has passed its lock's self-fence.
+ * Small against the refresh interval the fence keeps in hand, so the check's own
+ * granularity cannot eat that margin.
+ */
+export const SELF_FENCE_CHECK_MS = 1_000;
 
 /**
  * The v4 seal key, decoded once.
@@ -487,6 +494,8 @@ export interface TaskRunnerSideEffects {
   /** Publish a task message again, as a new message on the same subject. */
   republishTask: (subject: string, data: Uint8Array) => Promise<void>;
   refreshTaskLock: typeof refreshTaskLock;
+  /** Local, no I/O: whether this run must stop before another brain may take its lock. */
+  lockPastSelfFence: typeof lockPastSelfFence;
   releaseTaskLock: typeof releaseTaskLock;
   flushTranscript: typeof flushTranscript;
   /** Constructing the client is itself a seam: it opens an MCP transport. */
@@ -525,6 +534,7 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
     await getDeps().emitter.nc.jetstream().publish(subject, data);
   },
   refreshTaskLock,
+  lockPastSelfFence,
   releaseTaskLock,
   // Hoisted function declaration: the binding exists before this const runs.
   flushTranscript,
@@ -1188,6 +1198,7 @@ class TaskRunner {
   private readonly transcriptStartedAt: number;
 
   private keepAlive!: ReturnType<typeof setInterval>;
+  private selfFence?: ReturnType<typeof setInterval>;
   private cancelDeadline: () => void = () => {};
   private readonly transcriptLog: Array<Record<string, unknown>> = [];
 
@@ -4652,6 +4663,26 @@ class TaskRunner {
         logger.warn({ err: err?.message || String(err), sessionId: this.sessionId }, "task.kv_ttl_get_failed");
       });
     }, LOCK_REFRESH_INTERVAL_MS);
+
+    // The renewal above only reports once its write has answered, and a write
+    // to an unreachable NATS answers late or never -- while another brain may
+    // take a lock that names its run once it has gone unwritten for
+    // TASK_LOCK_DEAD_HOLDER_MS. So the deadline is also watched locally, on a
+    // timer short enough that this run stops (and runs no further tool) before
+    // that moment: `lockPastSelfFence` fires one refresh interval ahead of it,
+    // counted from when the last successful renewal was sent.
+    this.selfFence = setInterval(() => {
+      if (!fx().lockPastSelfFence(this.lockKey)) return;
+      this.leaseLost = true;
+      if (this.abortCtrl.signal.aborted) return;
+      logger.error(
+        { sessionId: this.sessionId, messageId: this.messageId, lockKey: this.lockKey },
+        "task.lock_self_fenced",
+      );
+      metrics.onLockSelfFenced();
+      this.abortCtrl.abort(LEASE_LOST_ABORT_REASON);
+    }, SELF_FENCE_CHECK_MS);
+    this.selfFence.unref?.();
   }
 
   private async executeRun(): Promise<void> {
@@ -4964,6 +4995,7 @@ class TaskRunner {
     if (outcome) metrics.onTask(outcome, (Date.now() - runStartedAt) / 1000);
     this.cancelDeadline();
     clearInterval(this.keepAlive);
+    if (this.selfFence) clearInterval(this.selfFence);
     if (leaseTimer) clearInterval(leaseTimer);
     endRun(this.runIdentity.key);
     activeAbort.delete(this.lockKey);

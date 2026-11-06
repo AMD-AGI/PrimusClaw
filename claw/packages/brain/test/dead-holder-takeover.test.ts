@@ -15,19 +15,26 @@
 //   D3 a fresh lock, a lock of another run, and an unfenced caller all wait
 //   D4 a holder that renews between the read and the takeover keeps its lock
 //   D5 a lock written by a pod from before the run id was recorded is never taken
+//   D6 a holder that is alive but cut off from NATS (renewals fail as transport
+//      errors, not conflicts) gives its lock up one refresh interval before
+//      another brain may take it over -- never after
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { KV } from "nats";
 
 import {
-  acquireTaskLock, bindTaskLockKv, deadHolderTakeover, refreshTaskLock, releaseTaskLock,
+  acquireTaskLock, bindTaskLockKv, deadHolderTakeover, lockPastSelfFence, lockSelfFenceMs,
+  lockSelfFenceTooTight, refreshTaskLock, releaseTaskLock,
 } from "../src/tasks/lock.js";
-import { TASK_LOCK_DEAD_HOLDER_MS } from "../src/config.js";
+import { LOCK_REFRESH_INTERVAL_MS, TASK_LOCK_DEAD_HOLDER_MS } from "../src/config.js";
 
 const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
 const dec = (b: Uint8Array) => JSON.parse(new TextDecoder().decode(b));
 
 interface Stored { value: Uint8Array; revision: number; created: Date }
+
+/** How much later than the request the store stamps a write (a slow PubAck). */
+let stampDelayMs = 0;
 
 /** A one-key KV with real create/update CAS semantics and a settable write time. */
 function storeKv(initial: Stored | null) {
@@ -36,13 +43,13 @@ function storeKv(initial: Stored | null) {
   const kv = {
     create: async (_k: string, value: Uint8Array) => {
       if (cur) throw new Error("wrong last sequence: key exists");
-      cur = { value, revision: 1, created: new Date() };
+      cur = { value, revision: 1, created: new Date(Date.now() + stampDelayMs) };
       writes.push({ op: "create", value: dec(value) });
       return 1;
     },
     update: async (_k: string, value: Uint8Array, rev: number) => {
       if (!cur || cur.revision !== rev) throw new Error(`wrong last sequence: ${cur?.revision ?? 0}`);
-      cur = { value, revision: rev + 1, created: new Date() };
+      cur = { value, revision: rev + 1, created: new Date(Date.now() + stampDelayMs) };
       writes.push({ op: "update", rev, value: dec(value) });
       return rev + 1;
     },
@@ -129,4 +136,71 @@ test("D5 a lock written by a pod from before the run id was recorded is never ta
   bindTaskLockKv(s.kv);
   assert.equal(await acquireTaskLock("sess-legacy", 1, { taskId: "t-run", takeOverDeadHolder: true }), false);
   assert.equal(s.writes.length, 0);
+});
+
+test("D6 a holder cut off from NATS stops before anybody may take its lock", async (t) => {
+  // The defaults the fleet runs with: the fence is one refresh interval inside
+  // the takeover window, and leaves room for two renewals.
+  assert.equal(lockSelfFenceMs(), TASK_LOCK_DEAD_HOLDER_MS - LOCK_REFRESH_INTERVAL_MS);
+  assert.equal(lockSelfFenceTooTight(), false);
+  assert.equal(lockSelfFenceTooTight(25_000, 300_000, 10_000), true, "a fence under two renewals is reported");
+  assert.equal(lockSelfFenceMs(0), null, "no takeover, nothing to stay ahead of");
+
+  const realNow = Date.now;
+  let now = 5_000_000;
+  Date.now = () => now;
+  t.after(() => { Date.now = realNow; stampDelayMs = 0; });
+
+  const s = storeKv(null);
+  bindTaskLockKv(s.kv);
+  // Every write lands two seconds after it was sent, so the store's stamp --
+  // which the takeover counts from -- is later than anything the holder saw.
+  stampDelayMs = 2_000;
+  assert.equal(await acquireTaskLock("sess-cut", 9, { taskId: "t-cut" }), true);
+  now += LOCK_REFRESH_INTERVAL_MS;
+  assert.equal(await refreshTaskLock("sess-cut"), "renewed");
+  const lastSent = now;
+
+  // Partitioned: every NATS call now fails at the transport, which says
+  // nothing about ownership. The process itself is fine.
+  const cut = async () => { throw Object.assign(new Error("TIMEOUT"), { code: "TIMEOUT" }); };
+  const kvAny = s.kv as unknown as Record<string, unknown>;
+  kvAny.update = cut;
+  kvAny.get = cut;
+
+  // What another brain, handed this run by the API, would conclude at `at`.
+  const held = { ...dec(s.current!.value), holderId: "the-holder-as-seen-by-someone-else" };
+  const takeoverPossible = (at: number) =>
+    deadHolderTakeover(held, s.current!.created, { taskId: "t-cut", takeOverDeadHolder: true }, at).ok;
+
+  let fencedAt: number | null = null;
+  let takeoverAt: number | null = null;
+  for (let at = lastSent; at <= lastSent + 3 * TASK_LOCK_DEAD_HOLDER_MS; at += 250) {
+    if (fencedAt === null && lockPastSelfFence("sess-cut", at)) fencedAt = at;
+    if (takeoverAt === null && takeoverPossible(at)) takeoverAt = at;
+  }
+  assert.ok(fencedAt !== null && takeoverAt !== null);
+  assert.ok(
+    fencedAt + LOCK_REFRESH_INTERVAL_MS <= takeoverAt,
+    `the holder stops at +${fencedAt - lastSent} ms, a takeover is possible at +${takeoverAt - lastSent} ms`,
+  );
+
+  // The renewal's own verdict agrees: a failure before the fence is "error"
+  // (keep going, the lock is still ours), at the fence it is "expired" -- long
+  // before the proof deadline that applied before the takeover existed.
+  now = fencedAt - 1_000;
+  assert.equal(await refreshTaskLock("sess-cut"), "error");
+  now = fencedAt;
+  assert.equal(await refreshTaskLock("sess-cut"), "expired");
+
+  // A lock that names no run cannot be taken over, so it keeps the old,
+  // longer deadline.
+  const plain = storeKv(null);
+  bindTaskLockKv(plain.kv);
+  now = 9_000_000;
+  assert.equal(await acquireTaskLock("sess-plain", 1), true);
+  (plain.kv as unknown as Record<string, unknown>).update = cut;
+  now += TASK_LOCK_DEAD_HOLDER_MS;
+  assert.equal(lockPastSelfFence("sess-plain", now), false);
+  assert.equal(await refreshTaskLock("sess-plain"), "error");
 });

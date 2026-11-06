@@ -143,6 +143,68 @@ export function lockProofDeadlineMs(
 }
 
 /**
+ * How long a run whose lock names its run (`task`) may go without proving it
+ * still holds that lock, now that another brain can take such a lock over.
+ *
+ * A dead-holder takeover (see {@link deadHolderTakeover}) may happen once the
+ * entry has gone unwritten for `deadHolderMs` by the store's clock. A holder
+ * that is alive but cut off -- from NATS and from the API both -- reaches that
+ * moment too, and before the takeover existed the only ordering that kept it
+ * alone was "the holder gives up at the proof deadline, one renewal before the
+ * bucket TTL frees the entry". The takeover moves the second half forward to
+ * `deadHolderMs`, so the first has to move with it: the holder stands down one
+ * refresh interval before anybody else may take its lock.
+ *
+ * Measured from when the last successful renewal was SENT (see
+ * `lockProvenAt`), which is no later than the store's timestamp on that write,
+ * so the holder's clock can only make it stop earlier than this, never later.
+ * Null when there is no takeover to stay ahead of.
+ */
+export function lockSelfFenceMs(
+  deadHolderMs: number = TASK_LOCK_DEAD_HOLDER_MS,
+  ttlMs: number = BRAIN_REGISTRY_TTL_MS,
+  refreshMs: number = LOCK_REFRESH_INTERVAL_MS,
+): number | null {
+  if (deadHolderMs <= 0) return null;
+  return Math.min(lockProofDeadlineMs(ttlMs, refreshMs), deadHolderMs - refreshMs);
+}
+
+/**
+ * Whether the self-fence is too tight for a healthy run: it has to hold at
+ * least two renewals, or one renewal that fails while NATS is merely slow stops
+ * a run nobody is about to take over. Reported at startup, like the checks in
+ * index.ts beside it. (That it is strictly earlier than the takeover holds by
+ * construction: it is at most `deadHolderMs - refreshMs`.)
+ */
+export function lockSelfFenceTooTight(
+  deadHolderMs: number = TASK_LOCK_DEAD_HOLDER_MS,
+  ttlMs: number = BRAIN_REGISTRY_TTL_MS,
+  refreshMs: number = LOCK_REFRESH_INTERVAL_MS,
+): boolean {
+  const fence = lockSelfFenceMs(deadHolderMs, ttlMs, refreshMs);
+  return fence !== null && fence < 2 * refreshMs;
+}
+
+/** How long a held lock has gone unproven, or null when this process does not hold it. */
+function unprovenForMs(lockKey: string, now: number): number | null {
+  const proven = lockProvenAt.get(lockKey);
+  return proven === undefined ? null : now - proven;
+}
+
+/**
+ * Whether this process must stop working under `lockKey` because another brain
+ * may soon take it over: the lock names its run, and it has gone unproven past
+ * {@link lockSelfFenceMs}. Purely local -- no I/O -- so a run can ask it on a
+ * short timer while its renewals hang on an unreachable NATS.
+ */
+export function lockPastSelfFence(lockKey: string, now: number = Date.now()): boolean {
+  const fence = lockSelfFenceMs();
+  if (fence === null || !lockTasks.has(lockKey)) return false;
+  const unproven = unprovenForMs(lockKey, now);
+  return unproven !== null && unproven >= fence;
+}
+
+/**
  * Whether the lock can expire between two renewals of a perfectly healthy run.
  *
  * The interval has to leave room for a second attempt inside the TTL, and the
@@ -423,9 +485,9 @@ export function deadHolderTakeover(
   return staleMs >= thresholdMs ? { ok: true, staleMs } : { ok: false };
 }
 
-function recordAcquired(lockKey: string, rev: number, value: LockValue): void {
+function recordAcquired(lockKey: string, rev: number, value: LockValue, sentAt: number): void {
   lockRevisions.set(lockKey, rev);
-  lockProvenAt.set(lockKey, Date.now());
+  lockProvenAt.set(lockKey, sentAt);
   if (value.seq !== undefined) lockSeqs.set(lockKey, value.seq);
   if (value.task !== undefined) lockTasks.set(lockKey, value.task);
   else lockTasks.delete(lockKey);
@@ -448,7 +510,7 @@ export async function acquireTaskLock(
   try {
     // kv.create returns the revision number assigned by NATS server.
     const rev = await getKv().create(`lock.${lockKey}`, sc.encode(JSON.stringify(value)));
-    recordAcquired(lockKey, Number(rev), value);
+    recordAcquired(lockKey, Number(rev), value, value.acquiredAt);
     return true;
   } catch {
     // Key exists. Unlike the pre-INV13 implementation we do NOT steal even
@@ -478,7 +540,7 @@ export async function acquireTaskLock(
           // it is alive after all, the write fails, and the lock stays its.
           try {
             const rev = await getKv().update(`lock.${lockKey}`, sc.encode(JSON.stringify(value)), entry.revision);
-            recordAcquired(lockKey, Number(rev), value);
+            recordAcquired(lockKey, Number(rev), value, value.acquiredAt);
             logger.warn(
               { lockKey, taskId: opts.taskId, previousHolder: holderInfo, previousPod: held?.pod, staleMs: takeover.staleMs },
               "lock.dead_holder_taken_over",
@@ -555,7 +617,10 @@ export async function refreshTaskLock(lockKey: string): Promise<LockRenewal> {
     // revision a later run of the key is renewing from.
     if (lockAcquisitions.get(lockKey) === value.acq) {
       lockRevisions.set(lockKey, Number(newRev));
-      lockProvenAt.set(lockKey, Date.now());
+      // When it was sent, not when it was answered: the store stamped the
+      // write somewhere in between, and the self-fence below must not count
+      // from later than that stamp.
+      lockProvenAt.set(lockKey, value.lastRenewedAt);
     }
     return "renewed";
   } catch (e) {
@@ -630,7 +695,7 @@ async function renewOverOwnCommittedWrite(
     const newRev = await getKv().update(key, sc.encode(JSON.stringify(value)), entry.revision);
     if (lockAcquisitions.get(lockKey) !== value.acq) return "lost";
     lockRevisions.set(lockKey, Number(newRev));
-    lockProvenAt.set(lockKey, Date.now());
+    lockProvenAt.set(lockKey, value.lastRenewedAt);
     logger.info({ lockKey, revision: Number(newRev) }, "lock.refresh_adopted_own_write");
     return "renewed";
   } catch (e) {
@@ -650,9 +715,13 @@ function renewalFailed(lockKey: string, e: unknown): LockRenewal {
   // revision is kept instead: a CAS with a stale one cannot take a lock from
   // anybody, it can only fail (and be read back, above), and the release path
   // reads the entry's own revision rather than this map.
-  const staleForMs = Date.now() - (lockProvenAt.get(lockKey) ?? Date.now());
-  const expired = staleForMs >= lockProofDeadlineMs();
-  logger.warn({ err: e, lockKey, staleForMs, expired }, "lock.refresh_failed");
+  const now = Date.now();
+  const staleForMs = now - (lockProvenAt.get(lockKey) ?? now);
+  // A lock that names its run can be taken over well before the proof
+  // deadline, so for it the holder gives up at the self-fence instead.
+  const fenced = lockPastSelfFence(lockKey, now);
+  const expired = fenced || staleForMs >= lockProofDeadlineMs();
+  logger.warn({ err: e, lockKey, staleForMs, expired, fenced }, "lock.refresh_failed");
   return expired ? "expired" : "error";
 }
 

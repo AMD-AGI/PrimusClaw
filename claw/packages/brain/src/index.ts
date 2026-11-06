@@ -76,6 +76,7 @@ import { abortRunsOfDeletedSession, interruptRunsAt } from "./tasks/interrupt.js
 import { markSessionDeleted } from "./infra/deleted-sessions.js";
 import {
   bindTaskLockKv, lockContentionNakMs, lockExpiresBetweenRenewals,
+  lockSelfFenceMs, lockSelfFenceTooTight,
 } from "./tasks/lock.js";
 import { bindTaskRunnerDeps } from "./tasks/runner.js";
 import { handleTask, bindTaskDispatchKv, inflightTasks, handleClaimedRequest, isFinishOnlyDelivery } from "./tasks/dispatch.js";
@@ -495,6 +496,18 @@ function validateStartupConfig(): void {
       { deadHolderMs: TASK_LOCK_DEAD_HOLDER_MS, refreshIntervalMs: LOCK_REFRESH_INTERVAL_MS },
       "startup.dead_holder_window_too_short (TASK_LOCK_DEAD_HOLDER_MS must be at least "
       + "3 x LOCK_REFRESH_INTERVAL_MS, or a live holder's lock can be taken over)",
+    );
+  }
+
+  // A holder cut off from NATS and the API stops at its self-fence, one refresh
+  // interval before the takeover above may happen (tasks/lock.ts
+  // lockSelfFenceMs). Below two renewals that fence would stop healthy runs on
+  // a single slow write.
+  if (lockSelfFenceTooTight()) {
+    logger.error(
+      { deadHolderMs: TASK_LOCK_DEAD_HOLDER_MS, selfFenceMs: lockSelfFenceMs(), refreshIntervalMs: LOCK_REFRESH_INTERVAL_MS },
+      "startup.lock_self_fence_too_tight (TASK_LOCK_DEAD_HOLDER_MS - LOCK_REFRESH_INTERVAL_MS must be at least "
+      + "2 x LOCK_REFRESH_INTERVAL_MS)",
     );
   }
 

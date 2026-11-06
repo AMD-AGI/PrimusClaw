@@ -18,6 +18,7 @@ import type { ExecuteRequest, ExecuteResult } from "@claw/protocol";
 import {
   bindTaskRunnerDeps,
   runHandleTask,
+  SELF_FENCE_CHECK_MS,
   type TaskRunnerSideEffects,
 } from "../src/tasks/runner.js";
 import type { Engine, ExecuteExtras } from "../src/agent/index.js";
@@ -95,6 +96,8 @@ interface ScenarioControls {
    * a task id alone cannot tell this attempt from the delivery before it.
    */
   attemptId: () => string | null;
+  /** The signal the runner handed the engine: what stops the turn. */
+  signal: AbortSignal;
 }
 
 async function runScenario(opts: {
@@ -106,6 +109,8 @@ async function runScenario(opts: {
     extras: ExecuteExtras | undefined, ctl: ScenarioControls,
   ) => Promise<ExecuteResult>;
   leaseVerdict?: (n: number) => string;
+  /** Side effects to replace on top of the scenario's own. */
+  overrides?: Partial<TaskRunnerSideEffects>;
 }) {
   const renewals: LeaseRenewal[] = [];
   const { msg } = fakeMsg();
@@ -152,12 +157,13 @@ async function runScenario(opts: {
     releaseTaskLock: noop(undefined),
     flushTranscript: (() => Promise.resolve()) as never,
     makeHandsClient: (() => ({ close: async () => {} })) as never,
+    ...opts.overrides,
   } as unknown as TaskRunnerSideEffects;
 
   const engine: Engine = {
-    async execute(_req, _onEvent, _signal, _hands, extras) {
+    async execute(_req, _onEvent, signal, _hands, extras) {
       return opts.engineBehavior
-        ? opts.engineBehavior(extras, { kv, releaseHands, attemptId: () => attemptId })
+        ? opts.engineBehavior(extras, { kv, releaseHands, attemptId: () => attemptId, signal: signal! })
         : result();
     },
   };
@@ -498,4 +504,36 @@ test("but a run whose row is merely running is left alone", async () => {
   });
 
   assert.equal(abortCtrl.signal.aborted, false, "a live row is not a stop");
+});
+
+test("a run past its lock's self-fence stops on the local check, without waiting for a hung renewal", async (t) => {
+  // Cut off from NATS and from the API: the lock renewal never answers, and the
+  // lease renewals fail at the transport, which is "not a verdict". The only
+  // thing that can stop this run before another brain takes its lock over is
+  // the local fence (tasks/lock.ts lockSelfFenceMs).
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let fenced = false;
+  let abortReason: unknown;
+  let toolsAfterFence = 0;
+  await runScenario({
+    lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+    overrides: {
+      refreshTaskLock: (() => new Promise(() => {})) as never,
+      lockPastSelfFence: (() => fenced) as never,
+      postRunLease: (() => Promise.reject(new Error("connect ECONNREFUSED"))) as never,
+    },
+    async engineBehavior(_extras, ctl) {
+      t.mock.timers.tick(SELF_FENCE_CHECK_MS * 5);
+      assert.equal(ctl.signal.aborted, false, "inside the fence the run carries on");
+      fenced = true;
+      t.mock.timers.tick(SELF_FENCE_CHECK_MS);
+      // The engine checks its signal before every tool call; one that ran here
+      // would be a second writer beside the brain about to take over.
+      if (!ctl.signal.aborted) toolsAfterFence++;
+      abortReason = ctl.signal.reason;
+      return result();
+    },
+  });
+  assert.equal(toolsAfterFence, 0, "the turn was stopped within one check of the fence");
+  assert.equal(abortReason, LEASE_LOST_ABORT_REASON);
 });

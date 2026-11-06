@@ -196,6 +196,12 @@ const deadHolderLockTakeoverTotal = new Counter({
   registers: [registry],
 });
 
+const lockSelfFencedTotal = new Counter({
+  name: "claw_brain_lock_self_fenced_total",
+  help: "Runs that stopped because their task lock had gone unrenewed for long enough that another brain could soon take it over (the holder gives up first).",
+  registers: [registry],
+});
+
 const lockReleaseSkippedTotal = new Counter({
   name: "claw_brain_lock_release_skipped_total",
   help: "Session-lock release calls that detected we are no longer the holder (INV-13 protection fired).",
@@ -967,6 +973,9 @@ export const metrics = {
   },
   onDeadHolderLockTakenOver(): void {
     deadHolderLockTakeoverTotal.inc();
+  },
+  onLockSelfFenced(): void {
+    lockSelfFencedTotal.inc();
   },
   onLockReleaseSkipped(reason: "not_holder" | "cas_lost" | "legacy_format"): void {
     lockReleaseSkippedTotal.inc({ reason });
