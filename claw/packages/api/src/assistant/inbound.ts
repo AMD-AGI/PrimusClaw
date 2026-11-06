@@ -24,6 +24,7 @@ import { CLAW_ASSISTANT_ATTENDED_TTL_SEC } from "../config.js";
 import { classifyAttendedCaller } from "../github-review/attended.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import type { DecidedVia } from "../github-review/store.js";
+import { redactStoredText } from "@claw/utils";
 import { db, type Querier } from "../infra/db.js";
 import { stopTurnRuns } from "../tasks/chat-run.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
@@ -121,7 +122,8 @@ export function decidedViaOf(via: AttendedVia): DecidedVia | null {
 
 /**
  * Write down a message the user sent to their own assistant, inside the transaction that accepts it. Nothing for any
- * other session: the row is what makes a router turn able to act, and only a router turn reads it.
+ * other session: the row is what makes a router turn able to act, and only a router turn reads it. The words are stored
+ * with credential-shaped content masked (`redactStoredText`); the turn's prompt is the queued message, which is not.
  */
 export async function recordAssistantMessage(tx: PoolClient, m: {
   sessionId: string; messageId: string; userId: string; userName?: string; content: string; attendedVia: AttendedVia | null; context: ChannelContext;
@@ -131,7 +133,7 @@ export async function recordAssistantMessage(tx: PoolClient, m: {
      SELECT $1, $2, $3, $7, $4, $5::jsonb, $6::jsonb
       WHERE EXISTS (SELECT 1 FROM claw_assistants WHERE session_id = $1 AND user_id = $3)
      ON CONFLICT (session_id, message_id) DO NOTHING`,
-    [m.sessionId, m.messageId, m.userId, m.content, m.attendedVia ? JSON.stringify(m.attendedVia) : null, JSON.stringify(m.context),
+    [m.sessionId, m.messageId, m.userId, redactStoredText(m.content).text, m.attendedVia ? JSON.stringify(m.attendedVia) : null, JSON.stringify(m.context),
       m.userName?.slice(0, CONTEXT_STRING_MAX) || null],
   );
   if (inserted.rowCount) {
