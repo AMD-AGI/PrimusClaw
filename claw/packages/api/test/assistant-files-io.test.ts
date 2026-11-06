@@ -18,6 +18,9 @@
  *   F6  an answer longer than a usual message is given whole (up to REPORT_ANSWER_MAX) and said to the user whole by the system, at once,
  *       with its line breaks; the router is told it was sent; any other report stays at REPORT_SUMMARY_MAX
  *   F7  say takes a long answer whole, up to SAY_TEXT_MAX, and refuses past it; a router turn that ended in plain text is cut only there
+ *   F8  no delivered file is lost: every one is announced however many there are; a report whose announcement the store failed is
+ *       announced by the sweep (and recorded, so the next sweep reads nothing); a file delivered after the item's last report is
+ *       announced when the run ends; the listing reads every page
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -44,6 +47,8 @@ describe("assistant files in, results out", { skip }, () => {
   let stored: Map<string, { size: number; at: Date; bytes?: Buffer }>;
   let listed: string[];
   let read: string[];
+  /** The store's own listing, before the test stands in for it. */
+  let storeList: typeof import("../src/assistant/deliveries.js").deliveryPorts.list;
 
   before(async () => {
     w = await startWorld();
@@ -56,6 +61,7 @@ describe("assistant files in, results out", { skip }, () => {
       if (refuseCopy(from)) throw Object.assign(new Error("NoSuchKey"), { name: "NoSuchKey" });
       copies.push({ from, to });
     };
+    storeList = deliveries.deliveryPorts.list;
     deliveries.deliveryPorts.list = async (prefix) => {
       listed.push(prefix);
       return [...stored].filter(([k]) => k.startsWith(prefix)).map(([key, o]) => ({ key, size: o.size, at: o.at }));
@@ -68,7 +74,7 @@ describe("assistant files in, results out", { skip }, () => {
   after(async () => { await w?.stop(); });
   beforeEach(async () => {
     await w.q(`TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants,
-      claw_sessions, claw_notification_outbox, claw_notification_subscriptions, claw_assistant_messages CASCADE`);
+      claw_sessions, claw_notification_outbox, claw_notification_subscriptions, claw_assistant_messages, claw_work_item_delivery_checks CASCADE`);
     w.drains.length = 0;
     alice = await w.user("alice");
     copies = [];
@@ -272,5 +278,71 @@ describe("assistant files in, results out", { skip }, () => {
     const { answerToDeliver } = w.mod.routerTurnEnd;
     assert.equal(answerToDeliver(long, ["hi"]), long, "a plain-text end within the bound is delivered whole");
     assert.equal(answerToDeliver("b".repeat(9500), ["hi"])!.length, 9000);
+  });
+  test("F8 no delivered file is lost", async () => {
+    const item = await w.createItem(alice, "Charts");
+    const base = `${prefix(item.workerSid)}.deliveries/`;
+    const id = (n: number) => `${String(n).padStart(8, "0")}-0000-4000-8000-000000000000`;
+    for (let n = 1; n <= 12; n++) stored.set(`${base}${id(n)}/chart-${n}.png`, { size: 100 + n, at: new Date(Date.now() - (20 - n) * 1000) });
+
+    // Twelve files: twelve messages, oldest first, and the report recorded as announced.
+    const turn = await w.workerTurn(item.itemId);
+    await w.mod.tools.report(turn, { kind: "ready", summary: "twelve charts" });
+    const names = async () => (await w.q("SELECT text FROM claw_assistant_says ORDER BY created_at, text")).map((r) => String(r.text).split(": ")[1]?.split(" (")[0]);
+    assert.equal((await names()).length, 12);
+    assert.ok((await names()).includes("chart-1.png"), "the oldest one too");
+    const ready = (await w.itemEvents(item.itemId)).filter((e) => e.kind === "ready").at(-1)!;
+    assert.equal(Number((await w.q("SELECT event_id FROM claw_work_item_delivery_checks WHERE item_id = $1", [item.itemId]))[0].event_id), Number(ready.id));
+    await w.closeRun(turn.task_id);
+
+    // A report whose announcement the store failed: nothing recorded, and the sweep announces it once the report has settled.
+    stored.set(`${base}${id(13)}/late.csv`, { size: 3, at: new Date() });
+    const realList = deliveries.deliveryPorts.list;
+    deliveries.deliveryPorts.list = async () => { throw Object.assign(new Error("store down"), { name: "ServiceUnavailable" }); };
+    await w.q("UPDATE claw_work_items SET board_state = 'in_progress' WHERE item_id = $1", [item.itemId]);
+    const again = await w.workerTurn(item.itemId);
+    assert.equal((await w.mod.tools.report(again, { kind: "blocked", summary: "which week?", question: "Which week?" })).status, "recorded");
+    deliveries.deliveryPorts.list = realList;
+    assert.ok(!(await names()).includes("late.csv"));
+    assert.equal(await deliveries.announceMissedDeliveries(), 0, "not before the report has settled");
+    await w.q("UPDATE claw_work_item_events SET created_at = NOW() - INTERVAL '5 minutes' WHERE item_id = $1", [item.itemId]);
+    const { sweepAssistant } = await import("../src/assistant/sweep.js");
+    await sweepAssistant();   // the sweeper's tick, as it runs
+    assert.ok((await names()).includes("late.csv"));
+    listed = [];
+    assert.equal(await deliveries.announceMissedDeliveries(), 0);
+    assert.deepEqual(listed, [], "an item announced through its newest report is not listed again");
+    await w.closeRun(again.task_id);
+
+    // A file delivered after the item's last report: the run's end announces it.
+    await w.q("UPDATE claw_work_items SET board_state = 'in_progress' WHERE item_id = $1", [item.itemId]);
+    const last = await w.workerTurn(item.itemId);
+    await w.mod.tools.report(last, { kind: "answer", summary: "done" });
+    stored.set(`${base}${id(14)}/after.txt`, { size: 5, at: new Date() });
+    await w.q("UPDATE claw_tasks SET status = 'completed', completed_at = NOW() WHERE task_id = $1", [last.task_id]);
+    await w.mod.turnEnd.recordRunEnd(item.workerSid, last.task_id, "finished", { finalText: "bye" });
+    assert.ok((await names()).includes("after.txt"));
+  });
+
+  test("F8b the store's listing is read page after page", async () => {
+    const { S3Client, ListObjectsV2Command } = await import("@aws-sdk/client-s3");
+    const original = S3Client.prototype.send;
+    const tokens: Array<string | undefined> = [];
+    S3Client.prototype.send = (async function (command: unknown) {
+      if (!(command instanceof ListObjectsV2Command)) throw new Error("unexpected");
+      tokens.push(command.input.ContinuationToken);
+      const page = tokens.length;
+      return {
+        Contents: [{ Key: `p/${page}`, Size: page, LastModified: new Date() }],
+        IsTruncated: page < 3, NextContinuationToken: page < 3 ? `t${page}` : undefined,
+      };
+    }) as typeof S3Client.prototype.send;
+    try {
+      const keys = (await storeList("p/")).map((o) => o.key);
+      assert.deepEqual(keys, ["p/1", "p/2", "p/3"]);
+      assert.deepEqual(tokens, [undefined, "t1", "t2"]);
+    } finally {
+      S3Client.prototype.send = original;
+    }
   });
 });

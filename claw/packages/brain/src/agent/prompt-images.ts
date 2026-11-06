@@ -16,11 +16,17 @@
 import { IMAGE_MAX_BYTES, imageMediaType, imageWellFormed } from "@claw/protocol";
 import pino from "pino";
 import type { ToolImage } from "../clients/hands.js";
+import { HISTORY_IMAGE_MAX_BASE64 } from "../llm/tool-images.js";
 
 const logger = pino({ name: "prompt-images" });
 
 /** At most this many images go with one prompt; the rest are named in a line. */
 export const PROMPT_IMAGES_MAX = 4;
+/**
+ * At most this much base64 of images goes with one prompt: what the conversation keeps of images at all (`boundHistoryImages`, which
+ * runs only after a tool result), so a message with several large pictures neither outgrows a checkpoint nor the request.
+ */
+export const PROMPT_IMAGES_MAX_BASE64 = HISTORY_IMAGE_MAX_BASE64;
 
 /** The upload directory a prompt image must be under (as `POST /v1/sessions/:id/upload` stores it). */
 const UPLOADS = ".uploads/";
@@ -55,6 +61,7 @@ export async function loadPromptImages(
   read: (key: string, maxBytes: number) => Promise<Buffer | null | "too_large">,
 ): Promise<PromptImages> {
   const out: PromptImages = { images: [], notes: [] };
+  let base64 = 0;
   if (!Array.isArray(paths)) return out;
   for (const raw of paths) {
     const path = promptImagePath(raw);
@@ -87,7 +94,13 @@ export async function loadPromptImages(
       out.notes.push(`[image ${shown(path)} not shown: it is not a whole PNG, JPEG, GIF or WebP image]`);
       continue;
     }
-    out.images.push({ mediaType, data: bytes.toString("base64") });
+    const data = bytes.toString("base64");
+    if (base64 + data.length > PROMPT_IMAGES_MAX_BASE64) {
+      out.notes.push(`[image ${shown(path)} not shown: the images of one message are shown up to ${PROMPT_IMAGES_MAX_BASE64} bytes of base64 together]`);
+      continue;
+    }
+    base64 += data.length;
+    out.images.push({ mediaType, data });
   }
   return out;
 }

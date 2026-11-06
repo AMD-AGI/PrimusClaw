@@ -9,7 +9,7 @@
  *       image block with the bytes the session's upload holds, read at `users/<owner>/sessions/<id>/.uploads/<path>`
  *   PI2 only the session's own `.uploads/`: a path outside it (absolute, `..`, another directory, a backslash) is never read
  *   PI3 an image that cannot be shown is a line, never a block: missing, too large, not an image, a damaged PNG, a failed read
- *   PI4 at most PROMPT_IMAGES_MAX images go with one prompt; the rest are named
+ *   PI4 at most PROMPT_IMAGES_MAX images go with one prompt, and at most PROMPT_IMAGES_MAX_BASE64 of them together; the rest are named
  *   PI5 the OpenAI wire sends the picture as an image part, never its base64 as text
  *   PI6 no prompt_images: the prompt is the same text it always was
  */
@@ -24,11 +24,11 @@ import { startWorld, fakeHands, baseRequest } from "./support/platform-defaults-
 // The fake model endpoint first: Brain reads where the model is when its config is first imported.
 const world = await startWorld();
 const { AgentEngine } = await import("../src/agent/engine.js");
-const { loadPromptImages, promptContent, promptImagePath, PROMPT_IMAGES_MAX } = await import("../src/agent/prompt-images.js");
+const { loadPromptImages, promptContent, promptImagePath, PROMPT_IMAGES_MAX, PROMPT_IMAGES_MAX_BASE64 } = await import("../src/agent/prompt-images.js");
 const { toOpenAiMessages } = await import("../src/llm/openai-provider.js");
 
-/** A whole 1x1 PNG: IHDR, IDAT and IEND with good CRCs. */
-function png(): Buffer {
+/** A whole 1x1 PNG: IHDR, IDAT and IEND with good CRCs; `pad` bytes more in a private ancillary chunk (still whole). */
+function png(pad = 0): Buffer {
   const chunk = (type: string, data: Buffer) => {
     const len = Buffer.alloc(4);
     len.writeUInt32BE(data.length);
@@ -43,7 +43,8 @@ function png(): Buffer {
   ihdr[8] = 8; ihdr[9] = 2;
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(Buffer.from([0, 255, 0, 0]))), chunk("IEND", Buffer.alloc(0)),
+    chunk("IHDR", ihdr), ...(pad ? [chunk("zzPd", Buffer.alloc(pad, 7))] : []),
+    chunk("IDAT", zlib.deflateSync(Buffer.from([0, 255, 0, 0]))), chunk("IEND", Buffer.alloc(0)),
   ]);
 }
 const PNG = png();
@@ -94,6 +95,14 @@ test("PI4 at most PROMPT_IMAGES_MAX images go with one prompt", async () => {
   const content = promptContent("look", out) as Array<Record<string, unknown>>;
   assert.equal(content[0].type, "text");
   assert.equal(content.filter((b) => b.type === "image").length, PROMPT_IMAGES_MAX);
+
+  // Large pictures: as many as fit together, the rest named (each alone is within IMAGE_MAX_BYTES).
+  const big = png(2_400_000);
+  const several = await loadPromptImages([".uploads/t/a.png", ".uploads/t/b.png", ".uploads/t/c.png"], "users/u1/sessions/s1/", async () => big);
+  const each = big.toString("base64").length;
+  assert.equal(several.images.length, Math.floor(PROMPT_IMAGES_MAX_BASE64 / each));
+  assert.ok(several.images.reduce((n, i) => n + i.data.length, 0) <= PROMPT_IMAGES_MAX_BASE64);
+  assert.ok(several.notes.length >= 1 && several.notes.every((n) => /shown up to \d+ bytes of base64 together/.test(n)));
 });
 
 test("PI5 the OpenAI wire sends the picture as an image part, never its base64 as text", () => {

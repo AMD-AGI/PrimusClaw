@@ -111,7 +111,7 @@ export async function ingestReport(
   const recorded: WorkReport = report.kind === "ready"
     ? { ...report, result: { ...(report.result as Record<string, unknown> | undefined), run_id: run.runId } }
     : report;
-  interface Written { outcome: IngestOutcome; wake: { sessionId: string; userId: string } | null }
+  interface Written { outcome: IngestOutcome; wake: { sessionId: string; userId: string } | null; eventId?: number }
   let written: Written;
   try {
     written = await inTransaction(async (query): Promise<Written> => {
@@ -129,7 +129,7 @@ export async function ingestReport(
           version: applied.resultVersion, summary: recorded.summary, question: recorded.question ?? null,
         })
         : null;
-      return { outcome: { status: "applied", boardState: applied.boardState, wokeRouter: wake !== null }, wake };
+      return { outcome: { status: "applied", boardState: applied.boardState, wokeRouter: wake !== null }, wake, eventId: applied.eventId };
     });
   } catch (err) {
     if (source === "turn_end" && (err as { code?: string })?.code === UNIQUE_VIOLATION) {
@@ -141,7 +141,8 @@ export async function ingestReport(
   const applied = written.outcome.status === "applied";
   // Before the router runs, so the user has the answer and the files first and the router's line follows them.
   if (applied && answerSentWhole(recorded.kind, recorded.summary)) await sayAnswerWhole(run.itemId);
-  if ((applied && recorded.kind !== "progress") || source === "turn_end") await announceDeliveries(run.itemId);
+  if (applied && recorded.kind !== "progress") await announceDeliveries(run.itemId, written.eventId);
+  else if (source === "turn_end") await announceDeliveries(run.itemId);
   if (written.wake) await drainSessionIfIdle(written.wake.sessionId, written.wake.userId);
   return written.outcome;
 }
@@ -158,10 +159,13 @@ async function sayAnswerWhole(itemId: string): Promise<void> {
   }
 }
 
-/** The worker's delivered files, to the user (`deliveries.ts`). Never fails the report: the next one tries again. */
-async function announceDeliveries(itemId: string): Promise<void> {
+/**
+ * The worker's delivered files, to the user (`deliveries.ts`), recorded as announced through `eventId` when given. Never fails the
+ * report: what this did not announce, the run's end or the sweep does.
+ */
+export async function announceDeliveries(itemId: string, eventId?: number): Promise<void> {
   try {
-    await announceItemDeliveries(itemId);
+    await announceItemDeliveries(itemId, {}, eventId);
   } catch (err) {
     logger.warn({ err, itemId }, "assistant.item_deliveries_not_announced");
   }

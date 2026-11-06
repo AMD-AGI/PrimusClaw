@@ -13,6 +13,11 @@
  * The object store is the record (Brain's copy is written before `deliver_file` answers, so before any report after it),
  * and the message id is derived from the delivery's id, so a second report, a retry or a redelivery announces nothing twice.
  * A message about a file is a fallback (not counted against the say limit, not taken for the router having spoken).
+ *
+ * Nothing announced is lost to a store that did not answer: the report's announcement records how far it got
+ * (`claw_work_item_delivery_checks`, through the report's event id) only once every file is announced, and the sweep
+ * (`announceMissedDeliveries`) announces again for any item with a newer report. A worker's run end announces too, which
+ * covers a file delivered after the item's last report.
  */
 import { GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { DELIVERY_DIR, DELIVERY_ID_RE, DELIVERY_INLINE_MAX_BYTES, DELIVERY_INLINE_TYPES, deliveryContentType } from "@claw/protocol";
@@ -28,9 +33,17 @@ import { recordSystemNotice, type SayDeps } from "./outbound.js";
 
 const logger = pino({ name: "assistant-deliveries" });
 
-/** At most this many of an item's files are announced after one report (the newest; a worker told to zip more does). */
-export const ITEM_DELIVERIES_MAX = 10;
-const LIST_MAX_KEYS = 1000;
+/**
+ * At most this many files are announced in one call, oldest first; the rest wait for the next call (a report, a run's end, the
+ * sweep), which is why a call that leaves some does not record its report as done.
+ */
+export const ANNOUNCE_BATCH_MAX = 50;
+/** A listing of more than this many pages (1000 keys each) is not a session's deliveries: the rest is left and logged. */
+const LIST_MAX_PAGES = 20;
+/** Reports this recent whose files were not announced are announced by the sweep; at most this many items a tick. */
+const SWEEP_WINDOW = "1 day";
+const SWEEP_SETTLE = "1 minute";
+const SWEEP_BATCH = 20;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** One delivered copy in the store, as listed. */
@@ -38,10 +51,18 @@ export interface StoredDelivery { id: string; name: string; size: number; at: Da
 
 /** The store, behind a seam so a test can stand in for it. */
 export const deliveryPorts = {
-  /** Every object under `prefix` (one page of at most LIST_MAX_KEYS: a session does not deliver more). */
+  /** Every object under `prefix`, page after page (at most LIST_MAX_PAGES). */
   list: async (prefix: string): Promise<Array<{ key: string; size: number; at: Date }>> => {
-    const listed = await getS3Client().send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: prefix, MaxKeys: LIST_MAX_KEYS }));
-    return (listed.Contents ?? []).filter((o) => o.Key).map((o) => ({ key: o.Key!, size: o.Size ?? 0, at: o.LastModified ?? new Date(0) }));
+    const out: Array<{ key: string; size: number; at: Date }> = [];
+    let token: string | undefined;
+    for (let page = 0; page < LIST_MAX_PAGES; page++) {
+      const listed = await getS3Client().send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: token }));
+      for (const o of listed.Contents ?? []) if (o.Key) out.push({ key: o.Key, size: o.Size ?? 0, at: o.LastModified ?? new Date(0) });
+      token = listed.IsTruncated ? listed.NextContinuationToken : undefined;
+      if (!token) return out;
+    }
+    logger.warn({ prefix: prefix.length, pages: LIST_MAX_PAGES }, "assistant.deliveries_listing_cut");
+    return out;
   },
   /** One small object's bytes. */
   read: async (key: string): Promise<Buffer> => {
@@ -99,11 +120,12 @@ async function assistantFile(itemId: string, ownerId: string, sessionId: string,
 }
 
 /**
- * Announce the item's delivered files that have not been announced: one system message each, newest ITEM_DELIVERIES_MAX.
- * Returns how many were announced now. Throws only for a fault of the store or the database, which the caller logs: the
- * next report announces what this one did not.
+ * Announce the item's delivered files that have not been announced, oldest first, one system message each (at most
+ * ANNOUNCE_BATCH_MAX in one call). With `throughEventId` (the report that asked), the item is recorded as announced through
+ * that report once nothing is left, so the sweep does not ask again. Returns how many were announced now. Throws for a fault of
+ * the store or the database: the caller logs it, and the next report, run end or sweep announces what this one did not.
  */
-export async function announceItemDeliveries(itemId: string, deps: SayDeps = {}): Promise<number> {
+export async function announceItemDeliveries(itemId: string, deps: SayDeps = {}, throughEventId?: number): Promise<number> {
   const item = (await db.query(
     `SELECT w.user_id, w.seq, w.title, w.worker_session_id, a.session_id AS router_session_id
        FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id
@@ -115,17 +137,16 @@ export async function announceItemDeliveries(itemId: string, deps: SayDeps = {})
     { user_id: string | null } | undefined;
   // The worker's session is the user's: one that is not names no file of theirs.
   if (!owner || owner.user_id !== item.user_id) return 0;
-  const deliveries = (await sessionDeliveries(item.user_id, item.worker_session_id)).slice(-ITEM_DELIVERIES_MAX);
-  if (!deliveries.length) return 0;
+  const deliveries = await sessionDeliveries(item.user_id, item.worker_session_id);
   // The ones already announced are left out before anything else is read for them (the message id is the delivery's).
   const keyOf = (d: StoredDelivery) => `delivery:${d.id}`;
-  const announced = new Set(((await db.query(
-    "SELECT say_id::text AS say_id FROM claw_assistant_says WHERE say_id = ANY($1::uuid[])",
-    [deliveries.map((d) => deterministicEventId("assistant.notice", item.user_id, keyOf(d)))],
-  )).rows as Array<{ say_id: string }>).map((r) => r.say_id));
+  const idOf = (d: StoredDelivery) => deterministicEventId("assistant.notice", item.user_id, keyOf(d));
+  const announced = deliveries.length ? new Set(((await db.query(
+    "SELECT say_id::text AS say_id FROM claw_assistant_says WHERE say_id = ANY($1::uuid[])", [deliveries.map(idOf)],
+  )).rows as Array<{ say_id: string }>).map((r) => r.say_id)) : new Set<string>();
+  const pending = deliveries.filter((d) => !announced.has(idOf(d)));
   let told = 0;
-  for (const d of deliveries) {
-    if (announced.has(deterministicEventId("assistant.notice", item.user_id, keyOf(d)))) continue;
+  for (const d of pending.slice(0, ANNOUNCE_BATCH_MAX)) {
     const file = await assistantFile(itemId, item.user_id, item.worker_session_id, d);
     const stored = await recordSystemNotice({
       userId: item.user_id, sessionId: item.router_session_id, key: keyOf(d),
@@ -133,6 +154,50 @@ export async function announceItemDeliveries(itemId: string, deps: SayDeps = {})
     }, deps);
     if (stored) told += 1;
   }
+  if (throughEventId !== undefined && pending.length <= ANNOUNCE_BATCH_MAX) {
+    await db.query(
+      `INSERT INTO claw_work_item_delivery_checks (item_id, event_id) VALUES ($1, $2)
+       ON CONFLICT (item_id) DO UPDATE SET event_id = GREATEST(claw_work_item_delivery_checks.event_id, EXCLUDED.event_id),
+                                           checked_at = NOW()`,
+      [itemId, throughEventId],
+    );
+  }
   if (told) logger.info({ itemId, told }, "assistant.item_deliveries_announced");
+  return told;
+}
+
+/**
+ * The sweep's part: every task item touched in the last SWEEP_WINDOW whose newest report (of any kind but progress), settled for
+ * SWEEP_SETTLE, is newer than what its files were announced through, is announced again. Returns how many files were announced.
+ */
+export async function announceMissedDeliveries(deps: SayDeps = {}): Promise<number> {
+  // Led by the items touched in the window (a report updates its item), each with its newest report through the item's own index:
+  // never a scan of every item's log.
+  const due = (await db.query(
+    `SELECT w.item_id, ev.id AS event_id
+       FROM claw_work_items w
+       CROSS JOIN LATERAL (
+         SELECT e.id, e.created_at FROM claw_work_item_events e
+          WHERE e.item_id = w.item_id
+            AND e.kind IN ('waiting', 'ready', 'answer', 'blocked', 'failed', 'dropped')
+            AND e.source IN ('worker', 'turn_end', 'sweep', 'watchdog')
+          ORDER BY e.id DESC LIMIT 1
+       ) ev
+       LEFT JOIN claw_work_item_delivery_checks c ON c.item_id = w.item_id
+      WHERE w.kind = 'task' AND w.updated_at > NOW() - $1::interval
+        AND ev.created_at > NOW() - $1::interval AND ev.created_at < NOW() - $2::interval
+        AND ev.id > COALESCE(c.event_id, 0)
+      ORDER BY ev.id
+      LIMIT $3`,
+    [SWEEP_WINDOW, SWEEP_SETTLE, SWEEP_BATCH],
+  )).rows as Array<{ item_id: string; event_id: string | number }>;
+  let told = 0;
+  for (const row of due) {
+    try {
+      told += await announceItemDeliveries(row.item_id, deps, Number(row.event_id));
+    } catch (err) {
+      logger.warn({ err: (err as Error)?.name, itemId: row.item_id }, "assistant.item_deliveries_sweep_failed");
+    }
+  }
   return told;
 }

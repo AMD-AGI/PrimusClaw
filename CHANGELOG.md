@@ -48,13 +48,15 @@ record it.
   files to the assistant's session and names them beside the message (`channel_context.files`: `path` below `.uploads/`, `name`,
   `media_type`, `size`; at most 10, only paths inside the session's own uploads). The router turn that answers the message is told what
   came and is shown the images itself: the new `prompt_images` field of the execute request names them, and Brain reads them from the
-  session's uploads and sends them with the prompt as image blocks (whole PNG, JPEG, GIF or WebP up to 3.5 MB, at most 4; the checks
+  session's uploads and sends them with the prompt as image blocks (whole PNG, JPEG, GIF or WebP up to 3.5 MB, at most 4 and 6 MiB of base64 together; the checks
   are now one module, `@claw/protocol` `images.ts`, shared with Hands' `read`; the OpenAI wire sends them as image parts). Every item
   the turn starts or instructs (`work_create`, `work_send`) gets a server-side copy of every file in its worker's session before its
   message is queued, and the worker is told where; a copy the store refused is answered as `files_not_attached`. A worker's
-  `deliver_file` reaches the user: after a report that says something (any kind but progress, or the end of its turn) each delivered
-  file still downloadable is announced once, as an `assistant.say` in the system's words carrying `files` (`item_id`, `session_id`,
-  `id`, `name`, `size`, `content_type`, a small image inline) for a channel to draw as a download. Long answers are said whole: `say`
+  `deliver_file` reaches the user: after a report that says something (any kind but progress), at a worker run's end and from the
+  assistant sweep, each delivered file still downloadable is announced once, oldest first, as an `assistant.say` in the system's words
+  carrying `files` (`item_id`, `session_id`, `id`, `name`, `size`, `content_type`, a small image inline) for a channel to draw as a
+  download; a report records how far its files were announced in the new table `claw_work_item_delivery_checks`, so a store that did
+  not answer is retried by the sweep. Long answers are said whole: `say`
   takes up to 9000 characters (the router is still asked for about 600 unless the user needs more), an `answer` report up to 8800
   (other kinds stay at 600), and an answer longer than 600 is sent to the user whole by the system at once (the router is told it was
   sent); a plain-text router ending is cut only past 9000. The super-agent evaluation sends a turn's `files` as a channel does and grades
