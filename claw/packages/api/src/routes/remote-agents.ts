@@ -37,6 +37,7 @@ import { redactPublicJson } from "../events/redaction.js";
 import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
+import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
 const logger = pino({ name: "remote-agents" });
 
@@ -169,6 +170,8 @@ async function serveSse(
 export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: RemoteAgentOptions = {}): Promise<void> {
   if (!CLAW_REMOTE_AGENTS_ENABLED) return;
   const waker = opts.waker ?? new Waker();
+  // Commands the assistant issues for the user (`devenv_send`) wake this replica's command streams as a route's do.
+  store.setCommandWaker((connectorId) => waker.wake(`c:${connectorId}`));
   const pingMs = opts.pingMs ?? REMOTE_AGENT_TIMING.pingMs;
   const pollMs = opts.pollMs ?? IDLE_POLL_MS;
   const onlineWindowMs = opts.onlineWindowMs ?? REMOTE_AGENT_TIMING.onlineWindowMs;
@@ -283,6 +286,11 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const events = batch.value.events.map((e) => ({ ...e, data: redactPublicJson(e.data) as Record<string, unknown> }));
     const result = await store.ingestEvents(connector as { connector_id: string; owner_user_id: string }, events, getAuthMethod(req));
     for (const sid of result.touched) waker.wake(`s:${sid}`);
+    // The assistant's view of the work (`assistant/remote-items.ts`): after the events are stored, and never a reason to refuse them.
+    // Every session the batch was for, not only those that gained an event: a retry of a batch whose events were stored but not
+    // applied (the item's write failed) applies them then.
+    const posted = [...new Set([...result.touched, ...Object.keys(result.acked)])];
+    if (posted.length) await noteRemoteEvents(owner, posted);
     const rejected = [...batch.value.rejected, ...result.rejected].sort((a, b) => a.index - b.index);
     return reply.send({ ok: true, data: { batch_id: batch.value.batchId, acked: result.acked, rejected } });
   });
@@ -420,10 +428,28 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const payload = type === "decision"
       ? { ...parsed.value, by: owner, client: clientLabel(req) }
       : parsed.value;
-    const out = await store.issueCommand({
-      owner, client: clientLabel(req), connectorId: session.connector_id, agentId: session.agent_id, sessionId,
-      type, cmdId, payload, auditDetail: spec.audit(parsed.value), closesSession: spec.closesSession, commandsPerMinute,
-    });
+    const send = async () => {
+      const since = type === "prompt" || type === "cancel" ? await remoteEventMark(sessionId).catch(() => undefined) : undefined;
+      const queued = await store.issueCommand({
+        owner, client: clientLabel(req), connectorId: session.connector_id, agentId: session.agent_id, sessionId,
+        type, cmdId, payload, auditDetail: spec.audit(parsed.value), closesSession: spec.closesSession, commandsPerMinute,
+      });
+      if (queued.status !== "queued") return queued;
+      // A stop pressed in the attached chat (queued now, not a retry): its turn_end ends what was sent before it, not a prompt after it.
+      if (type === "cancel" && since !== undefined) {
+        await noteRemoteCancel(owner, sessionId, since).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
+      }
+      // A prompt typed into an attached chat is an item the assistant can name ("did it finish?"), told to nobody: the chat shows it.
+      if (type === "prompt") {
+        await noteRemotePrompt({
+          owner, sessionId, connectorId: session.connector_id, agentId: session.agent_id, text: (parsed.value as { text: string }).text, origin: "chat",
+          since,
+        }).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
+      }
+      return queued;
+    };
+    // A prompt and a stop are queued and noted one at a time per session, so the item counts them in the order the connector runs them.
+    const out = type === "prompt" || type === "cancel" ? await inRemoteSessionOrder(sessionId, send) : await send();
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");
     if (out.status === "duplicate") {
       const same = out.row.type === type && out.row.session_id === sessionId

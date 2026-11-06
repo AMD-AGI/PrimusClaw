@@ -18,6 +18,11 @@ import {
 
 export type Row = Record<string, any>;
 
+/** Wakes this replica's command stream of a connector (`routes/remote-agents.ts` sets it); others poll within seconds. */
+let commandWaker: (connectorId: string) => void = () => {};
+export function setCommandWaker(wake: (connectorId: string) => void): void { commandWaker = wake; }
+export function wakeConnector(connectorId: string): void { commandWaker(connectorId); }
+
 const direct: Querier = (text, params) => db.query(text, params);
 const secs = (ms: number) => ms / 1000;
 

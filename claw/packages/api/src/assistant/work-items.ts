@@ -32,8 +32,11 @@ export type ReportKind = (typeof REPORT_KINDS)[number];
 
 export type Outcome = "accepted" | "answered" | "dropped" | "stopped";
 
-/** `task`: a worker that reports does it. `review`: a GitHub review on someone's behalf, whose state is read off what it did (`review-items.ts`). */
-export const ITEM_KINDS = ["task", "review"] as const;
+/**
+ * `task`: a worker that reports does it. `review`: a GitHub review on someone's behalf, whose state is read off what it did (`review-items.ts`).
+ * `remote`: an agent on one of the user's own machines, read off what its session did (`remote-items.ts`).
+ */
+export const ITEM_KINDS = ["task", "review", "remote"] as const;
 export type ItemKind = (typeof ITEM_KINDS)[number];
 
 export interface WorkReport {
@@ -211,7 +214,7 @@ export function itemView(row: Record<string, unknown>): WorkItemView {
     result_version: Number(row.result_version),
     accepted_version: row.accepted_version == null ? null : Number(row.accepted_version),
     can_accept: canAccept(row as { board_state: string; last_report_kind: string | null }),
-    kind: row.kind === "review" ? "review" : "task",
+    kind: row.kind === "review" || row.kind === "remote" ? row.kind : "task",
     params: row.params !== null && typeof row.params === "object" ? row.params as Record<string, unknown> : {},
     updated_at: row.updated_at as Date,
   };
@@ -477,7 +480,14 @@ export async function stopWorkItem(input: {
   const item = itemView(current);
   if (refused) return { status: "conflict", error: refused, item };
   if (!stopped && current.outcome !== "stopped") return { status: "conflict", error: "item_closed", item };
-  await stopSessionRuns(current.worker_session_id as string);
+  // A remote item has no run of Claw's to stop: its agent's turn is cancelled on its machine, whoever pressed stop (the router's
+  // work_stop, the item's stop button). Loaded here to keep the two modules acyclic.
+  if (item.kind === "remote") {
+    const { cancelRemoteItem } = await import("./remote-items.js");
+    await cancelRemoteItem(input.userId, item.params);
+  } else {
+    await stopSessionRuns(current.worker_session_id as string);
+  }
   return { status: "ok", item };
 }
 

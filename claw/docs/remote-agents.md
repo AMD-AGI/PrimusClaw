@@ -250,6 +250,50 @@ read the list no longer acts for the user, with one exception: it may still put
 `/agent attach <ref>` for one of the user's own attachable sessions to them, as a button they
 press (never run at once); any other ref or action is refused.
 
+### Development environment items
+
+Work on the user's machines is on their work item list (`kind = 'remote'`, one item per session, filed
+under the worker session id `remote:<session id>`), so the assistant can name it: "did it finish?". Claw
+writes the item from what passes through it: a `prompt` command opens it (in progress, titled with the
+machine, the agent and the start of the instruction), a `permissionRequest` puts it in front of the user
+until its `permission_resolved`, the `turn_end` of the last prompt open closes it as answered with the end of
+the agent's answer as its summary, and a `session_closed` closes it. Prompts and cancels for a session are
+queued and noted one at a time, in the order the connector runs them: the end a cancel brings ends what was
+sent before it, never a prompt sent after it, and a prompt the connector refused before queueing it
+(`too_many_queued_prompts`, `session_closed`) counts as ended. Known gap: the connector's `turn_end` does not
+yet name the prompt it ends, so two stops in quick succession, with a turn ending on its own while the first
+cancel is on its way, can leave an item in progress until its next turn ends. History a session had before its first prompt (a
+conversation taken over replays it) is not applied, and each event is applied once. A prompt the user typed
+into a chat attached to the session is told to nobody (the chat showed it, and the silent sweep skips these
+items); one the assistant sent is told once when it ends or waits for an approval. The router's item list
+says, for each, the agent, the session, whether its machine is online now, and the machine's name as quoted
+data, but not the item's summary or question: those are the agent's own words (its answer, a tool's title).
+`work_recall(item, "worker_tail")` reads the end of the agent's answer, and the turn that does has read
+untrusted text. `work_send` refuses these items; `work_stop` and the item's stop button
+(`POST /v1/work-items/:id/stop`) close one and cancel the agent's turn.
+
+### Sending an instruction (`devenv_send`)
+
+`devenv_send{text, agent?, target?, cwd?}` sends an instruction to an agent on one of the user's own
+machines. It chooses the machine and agent itself, among the caller's connectors only: the one the user
+named (by machine name, session label or session id), else the only online machine offering that agent;
+more than one is `which_machine`, an offline one is `connector_offline`. It continues an idle session of
+that agent open through Claw, else opens a new one in the agent's first root (or the folder named, which
+must be under a root); a session working on something is never sent another (`busy`). The prompt goes
+through the same checks as the user's own route (session limit, command rate, audit with the prompt's hash
+only), under a command id derived from the card (`cmdKey("card", confirmationId)`), so pressing it twice
+sends nothing twice.
+
+Nothing is ever sent from the turn, not even one answering the user's own message sent signed in: a command
+run on the user's machine is theirs to let through. Every instruction is put to them as a card (a held write,
+`claw_assistant_confirmations` kind `devenv_send`, showing the text, the machine, the session and the
+folder, answered by `POST /v1/assistant/confirmations/:id/decision` signed in, or by replying `批准 #<ref>`),
+and is sent only then, after checking again that the machine is online and the session idle. The tool's
+answer carries `why_card`: `confirm_first`, or why the turn could not have acted anyway (`read_untrusted`,
+`not_attended`). Where cards are off (`CLAW_TRIGGERS_ENABLED` and `CLAW_TRIGGER_TOOLS_ENABLED` not both on) it is
+refused with `cards_off`. A turn answering no message (a worker's report) cannot even propose it. What a machine
+reported reaches the model only after the choice, and the turn has read it from then on.
+
 ## Retention
 
 A closed session is deleted with all of its events `CLAW_REMOTE_AGENTS_RETENTION_DAYS`

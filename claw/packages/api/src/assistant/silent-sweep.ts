@@ -56,6 +56,9 @@ export async function tellSilentItems(
   const items = (await db.query(
     `SELECT w.item_id, w.user_id, ${fallbackStored} AS fallback_stored FROM claw_work_items w
       WHERE (w.board_state = 'needs_you' OR (${ANSWERED_UNSAID}))
+        -- A remote item tells the user itself, and only of what the assistant sent (\`remote-items.ts\`): what they typed into an
+        -- attached chat they watched, and is not to be said again.
+        AND w.kind <> 'remote'
         AND w.updated_at < NOW() - make_interval(secs => $1::int)
         AND NOT EXISTS (
           SELECT 1 FROM claw_assistant_says s
