@@ -45,6 +45,8 @@
  *       as typed data (an `assistant.action` carrying `review`), once, after the same grounding; nothing is made here, and a channel
  *       that did not say so, or that takes no actions, gets the refusal of S7 as before; the handoff is written down with its id
  *       (`claw_assistant_review_handoffs`), which the payload carries for the channel to echo
+ *   S7c a turn that handed a review over says nothing more: its say is refused, and neither its plain text nor a failure notice is
+ *       delivered; a say before the handoff, the next message's turn and another person's turn speak as always
  *   R1  review_restart takes a review the user pointed at, and only a review
  *   R1b an item number is read whole: #11 does not point at #1, nor repo#1 at item #1
  *   C1  confirmation_answer allows only when the message is the exact approval command (批准 #<ref> / approve #<ref>) naming a
@@ -1211,7 +1213,10 @@ describe("assistant review tools", { skip }, () => {
       assert.equal(out.handed_off, true);
       assert.deepEqual([out.reviewer, out.prs, out.merge, out.set_aside], ["Wei Lei", ["AMD-AGI/PrimusClaw#254", "AMD-AGI/PrimusClaw#257"], true, ["model"]]);
       assert.match(out.note, /nothing has started yet/);
-      assert.match(out.note, /Wei Lei must confirm the merge/);
+      // The router is told to say nothing of it: the chat answers the message about it, merge included, once it knows.
+      assert.match(out.note, /answers the user's message about it itself, in one message/);
+      assert.match(out.note, /end the turn without say/);
+      assert.doesNotMatch(out.note, /must confirm|will merge|merges nothing/, "the router is not handed a merge outcome to repeat");
       // A replayed call in the same turn queues nothing more.
       await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#257", "AMD-AGI/PrimusClaw#254"], merge: true, reviewer: "u-weilei" });
       const rows = await handoffs();
@@ -1228,9 +1233,9 @@ describe("assistant review tools", { skip }, () => {
         },
       });
       // Written down with the event, under the id the payload carries: what `POST /v1/assistant/reviews` reads when the channel starts it.
-      assert.deepEqual(await w.q("SELECT handoff_id, user_id, reviewer_user_id, prs, merge, used_at FROM claw_assistant_review_handoffs"), [{
+      assert.deepEqual(await w.q("SELECT handoff_id, user_id, reviewer_user_id, prs, merge, used_at, message_id FROM claw_assistant_review_handoffs"), [{
         handoff_id: out.event_id, user_id: alice.userId, reviewer_user_id: "u-weilei",
-        prs: ["amd-agi/primusclaw#254", "amd-agi/primusclaw#257"], merge: true, used_at: null,
+        prs: ["amd-agi/primusclaw#254", "amd-agi/primusclaw#257"], merge: true, used_at: null, message_id: turn.mid,
       }]);
       assert.equal(await count("claw_work_items"), 0, "nothing was made here: the channel starts it");
       assert.equal(await count("claw_sessions", "config ? 'acting_as'"), 0);
@@ -1244,6 +1249,69 @@ describe("assistant review tools", { skip }, () => {
       assert.equal(((await rt.reviewStart(own, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false })) as Recorded).handed_off, undefined);
       assert.equal(calls.start.length, 1);
       assert.equal((await handoffs()).length, 1);
+    } finally {
+      rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
+        calls.start.push({ user, method, request });
+        return startAnswer(request);
+      }) as never;
+    }
+  });
+
+  test("S7c a turn that handed a review over says nothing more: the chat's own answer is the one message", async () => {
+    rt.reviewToolPorts.startReviews = saved.startReviews as never; // the real service: a handoff never reaches it
+    try {
+      await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
+      const ctx = { ...DEFAULT_CTX, repos: [], people: [{ name: "Wei, Lei", user_id: "u-weilei" }], handoffs: ["review_for_other"] };
+      const says = async () => (await w.q("SELECT text, fallback FROM claw_assistant_says WHERE user_id = $1 ORDER BY created_at", [alice.userId]))
+        .map((r: Recorded) => r.text as string);
+      const text = "请weilei帮我review并合入 PrimusClaw PR #307、#309，Primus-SaFE PR #840";
+      const turn = await userTurn(alice, text, { context: ctx });
+      // Something else the person asked is said before the handoff, as the prompt asks: that goes through.
+      await w.mod.tools.say(turn, { text: "另外，SaFE 现在一切正常。" }, w.sayDeps);
+      const out = await rt.reviewStart(turn, {
+        prs: ["AMD-AGI/PrimusClaw#307", "AMD-AGI/PrimusClaw#309", "AMD-AGI/Primus-SaFE#840"], merge: true, reviewer: "u-weilei",
+      }) as Recorded;
+      assert.equal(out.handed_off, true);
+      // What the router said beside it in the exchange this guards, and anything else: refused, nothing stored or sent.
+      for (const words of [
+        "已把这 3 个 PR 的评审和合入交给 Wei, Lei。合入也需要他本人确认，不会自动合。", "已交给对方了。", "另外 #307 之前的评审结论是需要修改。",
+      ]) {
+        try {
+          await w.mod.tools.say(turn, { text: words }, w.sayDeps);
+          assert.fail(`said: ${words}`);
+        } catch (err) {
+          assert.equal((err as { code?: string }).code, "handed_off", String(err));
+        }
+      }
+      assert.deepEqual(await says(), ["另外，SaFE 现在一切正常。"]);
+      await w.closeRun(turn.task_id);
+      assert.equal(await actionsRun(), 1, "the handoff itself was queued, once");
+
+      // A turn that handed a review over and said nothing at all: when it ends in plain text, none of it is delivered, and when it failed
+      // after the handoff there is no "did not go through" notice. The handoff is queued, and the chat answers.
+      const quiet = await userTurn(alice, "请 Wei, Lei 帮我 review 合入 Primus-SaFE PR #841", { context: ctx });
+      assert.equal(((await rt.reviewStart(quiet, { prs: ["AMD-AGI/Primus-SaFE#841"], merge: true, reviewer: "u-weilei" })) as Recorded).handed_off, true);
+      await w.closeRun(quiet.task_id);
+      const end = { sessionId: alice.routerSid, runIds: [quiet.task_id], messageId: quiet.mid, failed: false, interrupted: false };
+      assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, finalText: "已交给 Wei, Lei，合入需要他确认。" }, w.sayDeps), "skipped");
+      assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, failed: true }, w.sayDeps), "skipped");
+      // A completion that does not name the message is matched by the message its run was started for.
+      assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, messageId: undefined, interrupted: true }, w.sayDeps), "skipped");
+      assert.deepEqual(await says(), ["另外，SaFE 现在一切正常。"], "nothing beside the chat's own answer");
+      assert.equal(await actionsRun(), 2);
+      // The same failure in a turn that handed nothing over is still told, once (F1): the check is the handoff, not the failure.
+      const plain = await userTurn(alice, "309 怎么样了");
+      await w.closeRun(plain.task_id);
+      assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, runIds: [plain.task_id], messageId: plain.mid, failed: true }, w.sayDeps), "said");
+      await w.q("DELETE FROM claw_assistant_says WHERE fallback");
+
+      // The next message's turn speaks as always, and so does another person's turn.
+      const next = await userTurn(alice, "309 怎么样了");
+      await w.mod.tools.say(next, { text: "还在审。" }, w.sayDeps);
+      await w.closeRun(next.task_id);
+      const bobs = await userTurn(bob, "你好");
+      await w.mod.tools.say(bobs, { text: "你好！" }, w.sayDeps);
+      assert.deepEqual(await says(), ["另外，SaFE 现在一切正常。", "还在审。"]);
     } finally {
       rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
         calls.start.push({ user, method, request });

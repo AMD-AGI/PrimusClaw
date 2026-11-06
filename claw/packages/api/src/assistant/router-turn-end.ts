@@ -16,11 +16,14 @@
  * Only for a turn that answers the user. A turn that a worker's report started may end without a word on purpose
  * (the prompt says to speak only when the user must decide something), and what a model writes then is not for them;
  * an item that needs the user and was not announced is the silent sweep's.
+ *
+ * Nor for a turn that handed a review to the person's channel (`turnHandedOffReview`): the channel answers that message itself, in
+ * one message, so neither the turn's plain text nor a notice that it failed is said beside it.
  */
 import pino from "pino";
 import { db } from "../infra/db.js";
 import { detectLanguage } from "./language.js";
-import { SAY_TEXT_MAX, recordAssistantSay, recordSystemNotice, SayRefused, type SayDeps } from "./outbound.js";
+import { SAY_TEXT_MAX, recordAssistantSay, recordSystemNotice, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
 import { internalTextIn, userWordsOf } from "./internal-text.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 
@@ -89,14 +92,22 @@ export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}
     { user_id: string } | undefined;
   if (!router) return "skipped";
   const runs = (await db.query(
-    `SELECT COALESCE(started_at, created_at) AS began, COALESCE(prompt, input->>'prompt', '') AS prompt
+    `SELECT COALESCE(started_at, created_at) AS began, COALESCE(prompt, input->>'prompt', '') AS prompt, metadata->>'message_id' AS message_id
        FROM claw_tasks WHERE session_id = $1 AND task_id = ANY($2::text[]) AND origin = 'chat'`,
     [end.sessionId, end.runIds],
-  )).rows as Array<{ began: Date; prompt: string }>;
+  )).rows as Array<{ began: Date; prompt: string; message_id: string | null }>;
   if (!runs.length) return "skipped";
   const prompts = runs.map((r) => r.prompt);
   let text = lost ? turnLostNotice(prompts) : answerToDeliver(end.finalText, prompts);
   if (!text) return "skipped";
+  // The message the turn answered, as the completion names it, or as its runs were started for it (a sweeper's completion may not say).
+  const answered = new Set([end.messageId, ...runs.map((r) => r.message_id)].filter((m): m is string => !!m));
+  for (const messageId of answered) {
+    if (await turnHandedOffReview((t, p) => db.query(t, p), router.user_id, messageId)) {
+      logger.info({ sessionId: end.sessionId, runIds: end.runIds, lost }, "assistant.unsaid_answer_handed_off");
+      return "skipped";
+    }
+  }
   // The router's own words with internal text in them (a tool name, an item_id, ...): never shown. The turn is answered with
   // the system's notice instead, as one that said nothing is (`say` would have refused the same text).
   const leaked = !lost && internalTextIn(text, userWordsOf(prompts));

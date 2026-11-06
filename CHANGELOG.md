@@ -71,9 +71,9 @@ record it.
   once after the same grounding, and the router is answered `handed_off`. A channel that does not declare it, or a user with no
   subscription to `assistant.action`, gets the `acting_as_credentials_required` refusal as before. The handoff is recorded
   (`claw_assistant_review_handoffs`) and its id handed over (`review.handoff_id`); `POST /v1/assistant/reviews` takes it back as
-  `handoff_id` and reads the record, not the body: such a review merges only once the reviewer confirms the merge, only reviews when the
-  router read no merge, and starts once per handoff; a request for a handed-over pull request without the id is held the same. The
-  reviewer must be named in the person's message, not only listed by the channel (`reviewer_not_named`).
+  `handoff_id` and reads the record, not the body: such a review only reviews when the router read no merge, and starts once per
+  handoff; when it may merge, it merges as the reviewer's own review mode says. The reviewer must be named in the person's message, not
+  only listed by the channel (`reviewer_not_named`).
 - Archived sessions can be deleted on a schedule: `SESSION_RETENTION_DAYS` (default 0, off) makes the API's daily
   maintenance delete a session that many days after it was archived, through the same commit as a user's delete (queued
   messages dropped, turns, events and summaries stamped deleted) with its S3 workspace and checkpoint prefixes removed by
@@ -542,6 +542,16 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- Assistant: a review the router hands to the user's chat (`handed_off`) is answered there in one message, by the chat that starts
+  it: the router says nothing about it. From the handoff on, a `say` in that turn is refused (`handed_off`), and neither the turn's
+  plain text nor a notice that it failed is delivered for it; the handoff record keeps the turn's `message_id` (new column on
+  `claw_assistant_review_handoffs`). `POST /v1/assistant/reviews` and the restart route answer each created item's `review_only`, and
+  `merge_needs_confirmation` when its merge waits for the acting user's own confirmation whatever their review mode, so a channel tells
+  the person how the merge is made from what was started (`router-v12`).
+- Assistant: a review handed to the user's chat merges as the reviewer's own review mode says, as a review asked of them in the chat
+  does: it is no longer held for the reviewer's confirmation whatever their mode (`fully_auto` merges, `high_risk_confirm` asks for
+  high-risk writes). A request that leaves `handoff_id` out is an ordinary request again: an earlier handoff of the same pull request no
+  longer holds it or makes it review-only.
 - An assistant's worker turn starts opening its sandbox when the turn starts, beside its first model call, instead of on its
   first tool call: the API marks worker turns with the new `ExecuteRequest.sandbox_prestart`, and Brain honours it behind
   `BRAIN_SANDBOX_PRESTART` (chart `brain.sandboxPrestart`, default on) for a run that opens its sandbox lazily and whose tool list

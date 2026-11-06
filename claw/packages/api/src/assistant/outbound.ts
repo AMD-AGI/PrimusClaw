@@ -38,7 +38,7 @@ const logger = pino({ name: "assistant-outbound" });
 /** The longest message the assistant may say: about a hundred words. */
 export const SAY_TEXT_MAX = 600;
 
-export type SayRefusal = "empty_text" | "text_too_long" | "item_not_found" | ItemRefError | "say_rate_limited";
+export type SayRefusal = "empty_text" | "text_too_long" | "item_not_found" | ItemRefError | "say_rate_limited" | "handed_off";
 
 /** A say that was not stored. `code` is what the caller tells the model. */
 export class SayRefused extends Error {
@@ -67,7 +67,10 @@ export interface SayInput {
    * aborts the say. The place for the check that the caller still holds the turn.
    */
   guard?: (q: Querier) => Promise<void>;
-  /** The message id of the turn that says it: on the session's event, it is what tells a reader which message this answers. */
+  /**
+   * The message id of the turn that says it: on the session's event, it is what tells a reader which message this answers. A turn that
+   * handed a review to the person's channel says nothing more (`turnHandedOffReview`): its say is refused.
+   */
   turnMessageId?: string;
 }
 
@@ -431,6 +434,9 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
   try {
     stored = await storeSettled(async (q, storeOne) => {
       await input.guard?.(q);
+      if (await turnHandedOffReview(q, input.userId, input.turnMessageId)) {
+        throw new SayRefused("handed_off", HANDED_OFF_REFUSAL);
+      }
       // One say at a time per user: the cap counts stored rows, and without this a burst
       // all count the same number and all insert.
       await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
@@ -504,6 +510,25 @@ export async function recordNeedsYouFallback(input: { itemId: string }, deps: Sa
   if (!stored) return null;
   await announce(stored, deps);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
+}
+
+/** What the router is told when its turn handed a review to the person's channel and then tried to speak. */
+export const HANDED_OFF_REFUSAL = "this turn handed a review to the user's chat, which answers this message about it itself, in one message: "
+  + "nothing was sent. Say nothing more in this turn: end it.";
+
+/**
+ * Whether the router turn answering this message of the person handed a review to their channel (`recordReviewHandoff` with its
+ * `messageId`, `review-items.ts`). The channel then answers that message about the review itself, in one message: whether it started,
+ * on which model, and how its merge is made, which only the started review knows. So the turn says nothing more: its say is refused,
+ * and a turn that ends in plain text, or fails, delivers nothing (`deliverUnsaidAnswer`). Anything else the person asked is said before
+ * the handoff, which the router's prompt asks.
+ */
+export async function turnHandedOffReview(q: Querier, userId: string, messageId: string | undefined): Promise<boolean> {
+  if (!messageId) return false;
+  return (await q(
+    "SELECT 1 FROM claw_assistant_review_handoffs WHERE user_id = $1 AND message_id = $2 LIMIT 1",
+    [userId, messageId],
+  )).rows.length > 0;
 }
 
 /**

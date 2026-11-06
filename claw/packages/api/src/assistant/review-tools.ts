@@ -19,7 +19,8 @@
  * button), and a channel action runs at once only when the message is its command typed whole; otherwise it is put to the person
  * as that command with a button, and runs only when they press it. So `merge=true` on a review this router starts or restarts never
  * merges by itself: the review's session holds its merge for the person's confirmation (`config.merge_needs_confirmation`), which only
- * that command or the card's button gives.
+ * that command or the card's button gives. A review of someone else's account is not started here: it is handed to the person's channel
+ * (`handOffReview`), which starts it as a review asked of that person, merging as their own review setting says.
  *
  * Everything past that is the review's own gates, which these call rather than repeat: creating, stopping and restarting
  * a review item is `review-items.ts`; answering a held write is the decision route's own `decideConfirmation`
@@ -587,10 +588,11 @@ export async function reviewStart(
  * handed over: the caller refuses it as it always did.
  *
  * The handoff is written down (`recordReviewHandoff`) with the event, and its id travels in the payload (`review.handoff_id`) for the
- * channel to echo. The router's `merge` is its reading of a sentence, so `POST /v1/assistant/reviews` reads that record, not the
- * channel's body: such a review merges only once the reviewer confirms that very merge (`merge_needs_confirmation`), never when the
- * router did not read a merge, and is started from one handoff once. Whether the reviewer lets anyone act for them, and every other gate
- * of the review, are the review service's, when the channel asks it.
+ * channel to echo. `POST /v1/assistant/reviews` reads that record, not the channel's body: such a review never merges when the router did
+ * not read a merge, and is started from one handoff once. When it may merge, it merges as the reviewer's own review setting says, as a
+ * review the person asked of them in the chat would (a reviewer who chose to confirm high-risk writes is asked; one who chose fully
+ * automatic merges is not). Whether the reviewer lets anyone act for them, and every other gate of the review, are the review service's,
+ * when the channel asks it.
  */
 async function handOffReview(
   claims: AssistantTokenClaims, prs: PrRef[], reviewer: { userId: string; name: string }, merge: boolean, note: string,
@@ -615,7 +617,7 @@ async function handOffReview(
       merge,
       requester_note: note.slice(0, REQUESTER_NOTE_MAX_CHARS),
     };
-    await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge });
+    await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge, messageId: claims.mid });
     const payload: AssistantActionPayload = {
       type: "assistant.action", event_id: eventId, occurred_at: new Date().toISOString(), user_id: userId,
       message_id: claims.mid, channel_message_id: channelMessageId, action: { name: REVIEW_HANDOFF_ACTION, args: "" }, review,
@@ -626,10 +628,14 @@ async function handOffReview(
   if (!queued) return null;
   logger.info({ eventId: queued.eventId, prs: prs.length }, "assistant.review_handed_off");
   void reviewToolPorts.kick().catch((err) => logger.error({ err }, "assistant.review_handoff_kick_failed"));
+  // What the router may tell the person of it: nothing. The channel answers their message about this review itself, in one message, once
+  // it has started it or knows why not: which pull requests, on which model, and how the merge is made, which only the started review
+  // knows (`CreatedReview.merge_needs_confirmation`). A word from the router beside it would be a second answer, written before any of
+  // that is known, so this turn's `say` is refused from here on (`turnHandedOffReview`).
   return {
     ok: true, handed_off: true, event_id: queued.eventId, reviewer: reviewer.name || reviewer.userId,
     prs: prs.map((p) => `${p.owner}/${p.repo}#${p.number}`), merge,
-    note: `nothing has started yet: the user's channel starts this review as ${reviewer.name || "that person"}, on their own credentials, and tells the user itself whether it started (or why not). ${merge ? `Even then it merges nothing by itself: ${reviewer.name || "that person"} must confirm the merge. ` : ""}Say only that it was handed over; do not say it has started, will merge, or name items.`,
+    note: `nothing has started yet. The user's chat starts this review as ${reviewer.name || "that person"}, and answers the user's message about it itself, in one message: whether it started, which model it runs on, and how the merge is made. Do not tell the user anything about this review: end the turn without say (any say in this turn is refused now).`,
   };
 }
 
