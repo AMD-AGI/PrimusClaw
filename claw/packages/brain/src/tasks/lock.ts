@@ -9,7 +9,7 @@ import { isRevisionConflict } from "@claw/utils";
 import { metrics } from "../infra/metrics.js";
 import {
   BRAIN_REGISTRY_TTL_MS, LOCK_REFRESH_INTERVAL_MS, RUN_GATE_KEY,
-  TASK_LOCK_NAK_BASE_MS, TASK_LOCK_NAK_MAX_MS,
+  TASK_LOCK_DEAD_HOLDER_MS, TASK_LOCK_NAK_BASE_MS, TASK_LOCK_NAK_MAX_MS,
 } from "../config.js";
 
 const logger = pino({ name: "task-lock" });
@@ -68,6 +68,14 @@ interface LockValue {
    * whether the entry is its own stored write (see refreshTaskLock).
    */
   acq?: string;
+  /**
+   * The run (claw_tasks.task_id) this lock was taken for, when the caller knew
+   * it. What lets another brain that the API has handed that same run tell the
+   * lock of a holder lost with its node from a lock some other run of the key
+   * still holds (`acquireTaskLock`'s takeover). Absent on locks from pods
+   * before this field, which are therefore never taken over.
+   */
+  task?: string;
   acquiredAt: number;
   lastRenewedAt: number;
 }
@@ -101,6 +109,10 @@ const lockSeqs = new Map<string, number>();
 // lockKey -> the acquisition (LockValue.acq) the local entries belong to.
 const lockAcquisitions = new Map<string, string>();
 
+// lockKey -> the run the lock was taken for (LockValue.task), carried by every
+// renewal for the same reason as the stream sequence above.
+const lockTasks = new Map<string, string>();
+
 // lockKey -> when this pod last proved it still holds the lock. The bucket
 // expires an entry nobody refreshes, so this is the only local evidence of how
 // close the claim is to lapsing while renewals are failing.
@@ -111,6 +123,7 @@ function forgetLock(lockKey: string): void {
   lockRevisions.delete(lockKey);
   lockSeqs.delete(lockKey);
   lockAcquisitions.delete(lockKey);
+  lockTasks.delete(lockKey);
   lockProvenAt.delete(lockKey);
 }
 
@@ -366,23 +379,76 @@ export function gateBindingError(request: ExecuteRequest): string | null {
     + "the workspace bookkeeping in the API is failing.";
 }
 
-export async function acquireTaskLock(lockKey: string, seq?: number): Promise<boolean> {
+/**
+ * How a caller that the API has handed a run may treat a lock it finds held.
+ *
+ * `taskId` names the run; `takeOverDeadHolder` says the API has already fenced
+ * every earlier attempt at it (a claimed doorbell: the claim bumped the row's
+ * `claim_count`, so the previous holder's lease renewals and settlement are
+ * refused from here on). Only then may a lock left by a holder lost with its
+ * node be taken over -- see {@link deadHolderTakeover}.
+ */
+export interface AcquireOptions {
+  taskId?: string;
+  takeOverDeadHolder?: boolean;
+}
+
+/**
+ * Whether a held lock is a dead holder's that this caller may take over, and
+ * how long it has gone unrenewed.
+ *
+ * All of these, or the lock stays where it is:
+ *   - the takeover is on (TASK_LOCK_DEAD_HOLDER_MS > 0) and the caller holds a
+ *     fenced claim on a named run (`takeOverDeadHolder` + `taskId`);
+ *   - the lock was taken for that very run. A lock some other run of the key
+ *     holds -- the previous turn of the same session, say -- is never taken,
+ *     however stale: the API has not declared that run's holder dead;
+ *   - it is not this process's own;
+ *   - nobody has written it for TASK_LOCK_DEAD_HOLDER_MS, by the store's own
+ *     timestamp. A live holder rewrites it every LOCK_REFRESH_INTERVAL_MS.
+ *
+ * Exported for the unit test that pins each condition.
+ */
+export function deadHolderTakeover(
+  held: Partial<LockValue> | null,
+  writtenAt: Date | undefined,
+  opts: AcquireOptions,
+  now: number = Date.now(),
+  thresholdMs: number = TASK_LOCK_DEAD_HOLDER_MS,
+): { ok: true; staleMs: number } | { ok: false } {
+  if (thresholdMs <= 0 || !opts.takeOverDeadHolder || !opts.taskId) return { ok: false };
+  if (!held || held.task !== opts.taskId || held.holderId === BRAIN_HOLDER_ID) return { ok: false };
+  if (!(writtenAt instanceof Date) || Number.isNaN(writtenAt.getTime())) return { ok: false };
+  const staleMs = now - writtenAt.getTime();
+  return staleMs >= thresholdMs ? { ok: true, staleMs } : { ok: false };
+}
+
+function recordAcquired(lockKey: string, rev: number, value: LockValue): void {
+  lockRevisions.set(lockKey, rev);
+  lockProvenAt.set(lockKey, Date.now());
+  if (value.seq !== undefined) lockSeqs.set(lockKey, value.seq);
+  if (value.task !== undefined) lockTasks.set(lockKey, value.task);
+  else lockTasks.delete(lockKey);
+  lockAcquisitions.set(lockKey, value.acq!);
+}
+
+export async function acquireTaskLock(
+  lockKey: string, seq?: number, opts: AcquireOptions = {},
+): Promise<boolean> {
   const acq = randomUUID();
   const value: LockValue = {
     holderId: BRAIN_HOLDER_ID,
     seq,
     pod: incarnationPod(),
     acq,
+    task: opts.taskId || undefined,
     acquiredAt: Date.now(),
     lastRenewedAt: Date.now(),
   };
   try {
     // kv.create returns the revision number assigned by NATS server.
     const rev = await getKv().create(`lock.${lockKey}`, sc.encode(JSON.stringify(value)));
-    lockRevisions.set(lockKey, Number(rev));
-    lockProvenAt.set(lockKey, Date.now());
-    if (seq !== undefined) lockSeqs.set(lockKey, seq);
-    lockAcquisitions.set(lockKey, acq);
+    recordAcquired(lockKey, Number(rev), value);
     return true;
   } catch {
     // Key exists. Unlike the pre-INV13 implementation we do NOT steal even
@@ -397,13 +463,32 @@ export async function acquireTaskLock(lockKey: string, seq?: number): Promise<bo
         // Always overwritten below on both the try and catch paths, so no
         // initial value is needed here.
         let holderInfo: string;
+        let held: Partial<LockValue> | null = null;
         try {
-          const v = JSON.parse(sc.decode(entry.value)) as Partial<LockValue>;
-          holderInfo = String(v.holderId ?? "(none)");
+          held = JSON.parse(sc.decode(entry.value)) as Partial<LockValue>;
+          holderInfo = String(held.holderId ?? "(none)");
         } catch {
           // Legacy plain-string lock from a pre-INV13 brain pod in a
           // rolling-upgrade window; render it as such for the log.
           holderInfo = `legacy:${sc.decode(entry.value)}`;
+        }
+        const takeover = deadHolderTakeover(held, entry.created, opts);
+        if (takeover.ok) {
+          // A CAS on the revision just read: if the holder renewed in between
+          // it is alive after all, the write fails, and the lock stays its.
+          try {
+            const rev = await getKv().update(`lock.${lockKey}`, sc.encode(JSON.stringify(value)), entry.revision);
+            recordAcquired(lockKey, Number(rev), value);
+            logger.warn(
+              { lockKey, taskId: opts.taskId, previousHolder: holderInfo, previousPod: held?.pod, staleMs: takeover.staleMs },
+              "lock.dead_holder_taken_over",
+            );
+            metrics.onDeadHolderLockTakenOver();
+            return true;
+          } catch (e) {
+            logger.info({ err: e, lockKey }, "lock.dead_holder_takeover_lost_race");
+            return false;
+          }
         }
         logger.info({ lockKey, holder: holderInfo }, "lock.held_by_other");
       }
@@ -455,6 +540,7 @@ export async function refreshTaskLock(lockKey: string): Promise<LockRenewal> {
     seq: lockSeqs.get(lockKey),
     pod: incarnationPod(),
     acq: lockAcquisitions.get(lockKey),
+    task: lockTasks.get(lockKey),
     acquiredAt: 0,
     lastRenewedAt: Date.now(),
   };

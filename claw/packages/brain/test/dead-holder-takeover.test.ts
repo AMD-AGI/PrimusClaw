@@ -1,0 +1,132 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+// A brain lost with its node leaves its runs' `lock.<key>` behind, and nothing
+// ever restarts under its name to give them back. The API hands such a run to
+// another brain once its lease has gone unrenewed; that brain may then take the
+// lock over -- but only the lock of that very run, only one nobody has rewritten
+// for TASK_LOCK_DEAD_HOLDER_MS, and only with a CAS that a live holder's
+// renewal defeats.
+//
+// Coverage:
+//   D1 each condition of the takeover, one at a time
+//   D2 a stale lock of the run this pod was handed is taken over, by CAS on the
+//      revision read, and renewals carry the run on
+//   D3 a fresh lock, a lock of another run, and an unfenced caller all wait
+//   D4 a holder that renews between the read and the takeover keeps its lock
+//   D5 a lock written by a pod from before the run id was recorded is never taken
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import type { KV } from "nats";
+
+import {
+  acquireTaskLock, bindTaskLockKv, deadHolderTakeover, refreshTaskLock, releaseTaskLock,
+} from "../src/tasks/lock.js";
+import { TASK_LOCK_DEAD_HOLDER_MS } from "../src/config.js";
+
+const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
+const dec = (b: Uint8Array) => JSON.parse(new TextDecoder().decode(b));
+
+interface Stored { value: Uint8Array; revision: number; created: Date }
+
+/** A one-key KV with real create/update CAS semantics and a settable write time. */
+function storeKv(initial: Stored | null) {
+  let cur = initial;
+  const writes: Array<{ op: string; rev?: number; value: Record<string, unknown> }> = [];
+  const kv = {
+    create: async (_k: string, value: Uint8Array) => {
+      if (cur) throw new Error("wrong last sequence: key exists");
+      cur = { value, revision: 1, created: new Date() };
+      writes.push({ op: "create", value: dec(value) });
+      return 1;
+    },
+    update: async (_k: string, value: Uint8Array, rev: number) => {
+      if (!cur || cur.revision !== rev) throw new Error(`wrong last sequence: ${cur?.revision ?? 0}`);
+      cur = { value, revision: rev + 1, created: new Date() };
+      writes.push({ op: "update", rev, value: dec(value) });
+      return rev + 1;
+    },
+    get: async () => (cur ? { ...cur, operation: "PUT" } : null),
+    delete: async () => { cur = null; },
+  } as unknown as KV;
+  return {
+    kv, writes,
+    get current() { return cur; },
+    set(next: Stored | null) { cur = next; },
+  };
+}
+
+const deadHolder = (task: string | undefined, agoMs: number, revision = 7): Stored => ({
+  value: enc({ holderId: "dead-holder", pod: "brain-lost", acq: "a1", ...(task ? { task } : {}), acquiredAt: 0, lastRenewedAt: 0 }),
+  revision,
+  created: new Date(Date.now() - agoMs),
+});
+
+test("D1 each condition of the takeover, one at a time", () => {
+  const now = 1_000_000;
+  const held = { holderId: "dead-holder", task: "t1" };
+  const old = new Date(now - 61_000);
+  const fenced = { taskId: "t1", takeOverDeadHolder: true };
+  assert.deepEqual(deadHolderTakeover(held, old, fenced, now, 60_000), { ok: true, staleMs: 61_000 });
+  assert.equal(deadHolderTakeover(held, new Date(now - 59_000), fenced, now, 60_000).ok, false, "fresh");
+  assert.equal(deadHolderTakeover(held, old, { taskId: "t1" }, now, 60_000).ok, false, "unfenced caller");
+  assert.equal(deadHolderTakeover(held, old, { takeOverDeadHolder: true }, now, 60_000).ok, false, "no run named");
+  assert.equal(deadHolderTakeover({ ...held, task: "t2" }, old, fenced, now, 60_000).ok, false, "another run's lock");
+  assert.equal(deadHolderTakeover({ holderId: "dead-holder" }, old, fenced, now, 60_000).ok, false, "pre-field lock");
+  assert.equal(deadHolderTakeover(null, old, fenced, now, 60_000).ok, false, "unparseable lock");
+  assert.equal(deadHolderTakeover(held, undefined, fenced, now, 60_000).ok, false, "no write time");
+  assert.equal(deadHolderTakeover(held, old, fenced, now, 0).ok, false, "switched off");
+  assert.equal(TASK_LOCK_DEAD_HOLDER_MS, 60_000, "the default the API's grace is derived against");
+});
+
+test("D2 a stale lock of the run this pod was handed is taken over, by CAS on the revision read", async () => {
+  const s = storeKv(deadHolder("t-run", TASK_LOCK_DEAD_HOLDER_MS + 5_000, 7));
+  bindTaskLockKv(s.kv);
+  assert.equal(await acquireTaskLock("sess-lost", 42, { taskId: "t-run", takeOverDeadHolder: true }), true);
+  assert.equal(s.writes.length, 1);
+  assert.equal(s.writes[0].op, "update");
+  assert.equal(s.writes[0].rev, 7, "a CAS on the revision that was read");
+  assert.equal(s.writes[0].value.task, "t-run");
+  assert.notEqual(s.writes[0].value.holderId, "dead-holder");
+  // Renewals carry on from the taken-over revision and keep the run id.
+  assert.equal(await refreshTaskLock("sess-lost"), "renewed");
+  assert.equal(s.writes[1].rev, 8);
+  assert.equal(s.writes[1].value.task, "t-run");
+  await releaseTaskLock("sess-lost");
+});
+
+test("D3 a fresh lock, a lock of another run, and an unfenced caller all wait", async () => {
+  for (const [label, stored, opts] of [
+    ["fresh", deadHolder("t-run", TASK_LOCK_DEAD_HOLDER_MS - 10_000), { taskId: "t-run", takeOverDeadHolder: true }],
+    ["another run", deadHolder("t-other", TASK_LOCK_DEAD_HOLDER_MS + 60_000), { taskId: "t-run", takeOverDeadHolder: true }],
+    ["unfenced", deadHolder("t-run", TASK_LOCK_DEAD_HOLDER_MS + 60_000), { taskId: "t-run" }],
+  ] as const) {
+    const s = storeKv(stored);
+    bindTaskLockKv(s.kv);
+    assert.equal(await acquireTaskLock("sess-wait", 1, opts), false, label);
+    assert.equal(s.writes.length, 0, `${label}: nothing written`);
+    assert.equal(dec(s.current!.value).holderId, "dead-holder", label);
+  }
+});
+
+test("D4 a holder that renews between the read and the takeover keeps its lock", async () => {
+  const s = storeKv(deadHolder("t-run", TASK_LOCK_DEAD_HOLDER_MS + 5_000, 7));
+  const realGet = (s.kv as unknown as { get: () => Promise<unknown> }).get;
+  (s.kv as unknown as { get: () => Promise<unknown> }).get = async () => {
+    const seen = await realGet();
+    // The holder was only slow: its renewal lands after our read.
+    s.set({ ...deadHolder("t-run", 0, 8) });
+    return seen;
+  };
+  bindTaskLockKv(s.kv);
+  assert.equal(await acquireTaskLock("sess-alive", 1, { taskId: "t-run", takeOverDeadHolder: true }), false);
+  assert.equal(s.current!.revision, 8, "the live holder's write stands");
+  assert.equal(dec(s.current!.value).holderId, "dead-holder");
+});
+
+test("D5 a lock written by a pod from before the run id was recorded is never taken", async () => {
+  const s = storeKv(deadHolder(undefined, 10 * 60_000));
+  bindTaskLockKv(s.kv);
+  assert.equal(await acquireTaskLock("sess-legacy", 1, { taskId: "t-run", takeOverDeadHolder: true }), false);
+  assert.equal(s.writes.length, 0);
+});

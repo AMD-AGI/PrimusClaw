@@ -18,9 +18,13 @@
  *      reaper grace (eleven minutes on 2026-11-06)
  *   C4 JetStream stalls for twenty seconds mid-turn (2026-11-06's trigger): the
  *      turn waits it out -- no failure, no stand-down, no crashed brain
+ *   C5 Brain lost with its node (SIGKILL, never restarted under its name): a
+ *      surviving brain takes the turn over within two minutes, at production
+ *      timings -- where it used to wait out the lease, the lock TTL and the
+ *      reaper's grace (eleven minutes)
  *
  * Every scenario asserts the turn completed, exactly once (one `exec_complete`
- * event, one row), and within 60 seconds of the disruption.
+ * event, one row), and within 60 seconds of the disruption (C5: 120 seconds).
  *
  * Needs a nats-server binary (CLAW_CHAOS_NATS_SERVER) and a Postgres server it
  * may create a database on (DATABASE_URL); skipped without them, and run by
@@ -84,14 +88,16 @@ function followEvents(c: Cluster, sessionId: string) {
   };
 }
 
-async function assertCompletedOnce(c: Cluster, sessionId: string, runId: string, disruptedAt: number, label: string) {
-  const row = await waitTerminal(c, runId, STALL_BUDGET_MS + 60_000).catch((e) => {
+async function assertCompletedOnce(
+  c: Cluster, sessionId: string, runId: string, disruptedAt: number, label: string, budgetMs = STALL_BUDGET_MS,
+) {
+  const row = await waitTerminal(c, runId, budgetMs + 60_000).catch((e) => {
     throw new Error(`${label}: ${(e as Error).message}\n${c.logs()}`);
   });
   assert.equal(row.status, "completed", `${label}: ${row.status} (${row.failure_reason})\n${c.logs()}`);
   assert.equal(row.failure_reason, null);
   const tookMs = row.completed_at!.getTime() - disruptedAt;
-  assert.ok(tookMs < STALL_BUDGET_MS, `${label}: completed ${tookMs}ms after the disruption`);
+  assert.ok(tookMs < budgetMs, `${label}: completed ${tookMs}ms after the disruption`);
   // Exactly once: the completion event is what the event consumer turns into
   // the session's terminal state and what downstream readers count as the
   // answer, so two of them is a duplicated turn.
@@ -186,6 +192,51 @@ test("rolling restarts do not cost the turns that are running", { skip, timeout:
       assert.equal(brain.grep(/task\.lease_lost\.stood_down/).length, 0, "no healthy run stood down");
       assert.equal(c.model.calls - callsBefore, 1, "the turn was not restarted either");
     });
+  } finally {
+    await c.close();
+  }
+});
+
+/**
+ * C5: a node goes down with a brain on it. The pod is rescheduled under a new
+ * name, so nothing ever restarts as the dead process's BRAIN_ID and C3's
+ * hand-back cannot happen. Before this, the turn waited for its lease, the
+ * dead holder's `lock.<key>` to age out of the registry bucket (five minutes)
+ * and the reaper's grace on top -- 675 s measured on 2026-11-06. Production
+ * timings throughout (lease, heartbeat, sweeper tick, lock TTL): the harness
+ * overrides none of them, so the two minutes asserted here is what a real
+ * fleet gets.
+ */
+test("a brain lost with its node is taken over by another brain within two minutes", { skip, timeout: 10 * 60_000 }, async () => {
+  const LOST_NODE_BUDGET_MS = 120_000;
+  const c = await startCluster({ natsServer: NATS_SERVER, adminDbUrl: ADMIN_DB });
+  try {
+    await c.startApi("api-1");
+    await api(c, "POST", "/v1/internal/brain/doorbell-semantics", { semantics: 1 }, { authorization: "Bearer chaos-internal-token" });
+    await c.startBrain("brain-a");
+    await c.startBrain("brain-b");
+    // Long enough that the dead brain's lease and lock are both renewed several
+    // times before it dies, as a real run's are.
+    c.model.holdMs = 40_000;
+    const callsBefore = c.model.calls;
+    const { sessionId, runId } = await startTurn(c, "c5");
+    await until("C5 model streaming", async () => c.model.calls > callsBefore, 60_000);
+    await sleep(25_000);
+    const owner = (await runRow(c, runId))!.lease_owner!;
+    assert.ok(owner === "brain-a" || owner === "brain-b", `owner ${owner}`);
+    const survivor = owner === "brain-a" ? "brain-b" : "brain-a";
+    // From here the turn is short, so the time measured is the takeover's.
+    c.model.holdMs = 4_000;
+    const disruptedAt = Date.now();
+    await c.brains.get(owner)!.stop("SIGKILL");
+    const { row, tookMs } = await assertCompletedOnce(c, sessionId, runId, disruptedAt, "C5", LOST_NODE_BUDGET_MS);
+    assert.ok(row.claim_count >= 2, "resumed by a second claim");
+    assert.ok(c.brains.get(survivor)!.alive, "the survivor is still running");
+    assert.ok(
+      c.brains.get(survivor)!.grep(/lock\.dead_holder_taken_over/).length > 0,
+      `the survivor took the dead holder's lock over\n${c.logs()}`,
+    );
+    process.stdout.write(`# C5 recovered ${tookMs}ms after the brain was lost (owner ${owner}, survivor ${survivor})\n`);
   } finally {
     await c.close();
   }

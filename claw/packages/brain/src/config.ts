@@ -831,6 +831,29 @@ export const LOCK_REFRESH_INTERVAL_MS = envInt(
 );
 
 /**
+ * How long a run's `lock.<key>` may go unrenewed before a brain that has been
+ * handed the same run by the API may take the lock over.
+ *
+ * A brain lost with its node is never restarted under its pod name, so the
+ * previous-incarnation hand-back cannot happen, and without this its runs
+ * waited for the entry to age out of the registry bucket (BRAIN_REGISTRY_TTL_MS,
+ * five minutes) on top of the API's reaper grace: eleven minutes on
+ * 2026-11-06. The takeover needs both halves to agree that the holder is gone:
+ * the API requeued the run only after the holder's lease went unrenewed for its
+ * TTL plus DOORBELL_DEAD_LEASE_GRACE_SEC, and this pod finds the lock -- for
+ * that very run -- not rewritten for this long, about six missed renewals at
+ * the default interval. A live holder that is merely cut off from NATS keeps
+ * renewing its lease over HTTP, so the API never hands its run out; one cut
+ * off from the API keeps renewing its lock, so this pod never takes it.
+ *
+ * The API's requeue must not come before this, or the first claim finds the
+ * lock still too fresh and has to defer; the API's defaults (lease 45 s,
+ * heartbeat 15 s, grace 30 s) requeue no earlier than 60 s after the last
+ * renewal the holder could have made. Zero turns the takeover off.
+ */
+export const TASK_LOCK_DEAD_HOLDER_MS = envInt("TASK_LOCK_DEAD_HOLDER_MS", 60_000, { min: 0 });
+
+/**
  * Deletion tombstones live apart from the registry because the two want
  * opposite TTLs: `lock.<key>` should expire quickly so a dead worker's claim is
  * released, while a tombstone has to outlive everything that could still ask

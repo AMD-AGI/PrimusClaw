@@ -38,7 +38,7 @@ import {
   BRAIN_BUNDLED_HANDS_BINARY,
   BRAIN_VERSION,
   BRAIN_REGISTRY_BUCKET, BRAIN_REGISTRY_TTL_MS, BRAIN_TOMBSTONES_BUCKET,
-  LOCK_REFRESH_INTERVAL_MS,
+  LOCK_REFRESH_INTERVAL_MS, TASK_LOCK_DEAD_HOLDER_MS,
   MULTI_NODE_IDLE_RECLAIM_MS, MULTI_NODE_SWEEPER_INTERVAL_MS,
   BRAIN_CHECKPOINTS_BUCKET, BRAIN_CHECKPOINTS_TTL_MS,
   LLM_API_STYLE,
@@ -484,6 +484,17 @@ function validateStartupConfig(): void {
       },
       "startup.lock_renewal_too_slow (LOCK_REFRESH_INTERVAL_MS x 2 must fit inside "
       + "BRAIN_REGISTRY_TTL_MS, or two copies of one turn can run at once)",
+    );
+  }
+
+  // A dead-holder takeover reads "not rewritten for this long" as "gone", so the
+  // window has to hold several renewals: at fewer than three, one slow write
+  // under a healthy run looks like a death to the brain the API handed the run.
+  if (TASK_LOCK_DEAD_HOLDER_MS > 0 && TASK_LOCK_DEAD_HOLDER_MS < LOCK_REFRESH_INTERVAL_MS * 3) {
+    logger.error(
+      { deadHolderMs: TASK_LOCK_DEAD_HOLDER_MS, refreshIntervalMs: LOCK_REFRESH_INTERVAL_MS },
+      "startup.dead_holder_window_too_short (TASK_LOCK_DEAD_HOLDER_MS must be at least "
+      + "3 x LOCK_REFRESH_INTERVAL_MS, or a live holder's lock can be taken over)",
     );
   }
 
