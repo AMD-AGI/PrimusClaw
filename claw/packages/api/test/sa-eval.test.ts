@@ -409,7 +409,8 @@ test("S16 no false denial of a capability", () => {
   for (const text of ["node-7 无法访问，已经离线 2 小时。", "没有找到失败的运行。", "我查到 3 个开着的 PR。", "I don't see any failed runs today.", "The node cannot reach the registry."]) {
     assert.ok(!denied(text), text);
   }
-  // A failed shell command excuses a GitHub denial only when it failed at GitHub: a GitHub client ran, and its answer says GitHub.
+  // A failed shell command excuses a GitHub denial only when it failed at GitHub: a GitHub client ran, and a line of its answer is
+  // a failure that names GitHub.
   const bash = (command: string, answer = ""): ToolCall => ({ ...call("bash", false), input: { command }, result: answer });
   const excused: Array<[string, string]> = [
     ["gh pr list --author @me", "HTTP 401: Bad credentials (https://api.github.com/graphql)"],
@@ -422,6 +423,9 @@ test("S16 no false denial of a capability", () => {
   for (const [cmd, answer] of excused) assert.ok(!denied("I can't access GitHub.", [bash(cmd, answer)]), cmd);
   const notGithub: Array<[string, string]> = [
     ["python missing.py", "python: can't open file 'missing.py'"],
+    // A GitHub URL a local command printed, beside another command's failure.
+    ["git remote -v && cat README-missing", "origin\thttps://github.com/o/r.git (fetch)\norigin\thttps://github.com/o/r.git (push)\ncat: README-missing: No such file or directory"],
+    ["gh --version; false", "gh version 2.97.0 (2026-10-01)\nhttps://github.com/cli/cli/releases/tag/v2.97.0"],
     ["echo git status; false", "git status"],
     ["git status", "fatal: not a git repository (or any of the parent directories): .git"],
     ["cd /tmp && git status && git push origin HEAD", "fatal: not a git repository (or any of the parent directories): .git"],

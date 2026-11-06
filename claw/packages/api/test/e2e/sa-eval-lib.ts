@@ -441,10 +441,11 @@ const GITHUB_CLIENTS = new Set(["gh", "git", "curl", "wget"]);
 
 /**
  * Whether a failed shell call failed at GitHub: one of its commands (split at `;`, `&&`, `||`, `|` and new lines) runs a program
- * that can talk to GitHub (gh, git, curl, wget), and what the call answered says GitHub (github.com, api.github, "GitHub", or
- * gh's own `gh:` prefix). The answer is the evidence the remote was reached: a local `git status` that failed, a push a failed
- * step before it kept from running (`git status && git push`), or text that only mentions git (`echo git status`) say nothing
- * about GitHub.
+ * that can talk to GitHub (gh, git, curl, wget), and one line of what the call answered is a failure that names GitHub (`fatal:
+ * unable to access 'https://github.com/…'`, `remote: Repository not found` beside a github.com URL, `HTTP 401: Bad credentials
+ * (https://api.github.com/…)`, gh's `gh auth login`, GitHub's JSON error with docs.github.com). That line is the evidence a remote
+ * operation was tried and failed; a GitHub URL printed by a local command (`git remote -v`) next to another command's failure,
+ * a local `git status` that failed, or text that only mentions git, are not.
  */
 export function shellFailedAtGithub(command: string, answer: string): boolean {
   const runs = command.split(/;|&&|\|\||\||\n/).some((part) => {
@@ -452,8 +453,10 @@ export function shellFailedAtGithub(command: string, answer: string): boolean {
     while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!) || ["sudo", "env", "time", "command", "exec", "("].includes(words[0]!))) words.shift();
     return GITHUB_CLIENTS.has((words[0] ?? "").replace(/^\(+/, "").split("/").pop() ?? "");
   });
-  return runs && /github\.com|api\.github|\bgithub\b|(^|\s)gh:/i.test(answer);
+  return runs && answer.split("\n").some((line) => GITHUB_NAMED.test(line) && GITHUB_FAILED.test(line));
 }
+const GITHUB_NAMED = /github\.com|api\.github|github cli|gh auth|^\s*gh:/i;
+const GITHUB_FAILED = /\b(fatal|error|denied|not found|unable|could not|failed|forbidden|unauthori[sz]ed|bad credentials|rate limit|HTTP [45]\d\d)\b|"message"\s*:/i;
 
 /**
  * Every denial in `final` that the turn's calls do not make true, as the words that said it ([] when there is none). A denial may
