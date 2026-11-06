@@ -48,8 +48,7 @@
  *       not read is explained; another tool's text is not read that way
  *   S27 run variables from a JSON object: nested objects as `a.b`, null as no value
  *   S28 a label for the kind of answer, or settings written as code, is a description, not a value; a number, a name, a path or a time is a value
- *   S29 the run's own turns of a session: the messages it knows by id, and for each lost answer one stored message with its text; a
- *      person's message is not one, and neither are the calls of its turn
+ *   S29 the stored calls of the run's own turns (the messages it knows by id): a person's turn in the same session is not one
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -66,7 +65,7 @@ import {
   apiQuery, caseSays, cardsOf, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
   assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded,
-  bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, ownTurnIds, storedTurnCalls,
+  bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
 } from "./e2e/sa-eval-lib.js";
 
 const SEED_DIR = join(dirname(fileURLToPath(import.meta.url)), "e2e", "sa-eval-cases");
@@ -818,17 +817,14 @@ test("S28 labels and settings written as values are descriptions", () => {
   }
 });
 
-test("S29 the run's own turns: known ids, and one stored message per lost answer, found by its text; a person's turn is not one", () => {
+test("S29 the stored calls of the run's own turns: a person's turn in the same session, even with the same text, is not one", () => {
   const msg = (id: string, text: string) => ({ event_type: "UserMessage", created_at: "2026-11-06T10:00:00Z", data: { type: "UserMessage", message_id: id, role: "user", data: { content: [{ type: "text", text }] } } });
   const created = (id: string, item: string) => [
     { event_type: "toolUsed", created_at: "2026-11-06T10:00:01Z", data: { type: "toolUsed", message_id: id, tool: "mcp__assistant__work_create", status: "start", actionId: `a-${id}` } },
     { event_type: "toolUsed", created_at: "2026-11-06T10:00:02Z", data: { type: "toolUsed", message_id: id, tool: "mcp__assistant__work_create", status: "success", actionId: `a-${id}`, result: JSON.stringify({ ok: true, item_id: item, seq: 1 }) } },
   ];
-  const rows = [msg("m1", "first"), ...created("m1", "i1"), msg("m2", "lost"), ...created("m2", "i2"), msg("p1", "and check my quota"), ...created("p1", "i3"), msg("p2", "lost")];
-  // m2's answer was lost: the first stored message with its text is the run's; a second one with the same text (p2) is not.
-  const own = ownTurnIds(rows, ["m1"], ["lost"]);
-  assert.deepEqual(own.sort(), ["m1", "m2"]);
-  assert.deepEqual(ownTurnIds(rows, ["m1"], []), ["m1"], "nothing lost: only the known ids");
-  const items = storedTurnCalls(rows, own).filter((c) => c.ok).flatMap((c) => [...c.result.matchAll(/"item_id":"([^"]+)"/g)].map((m) => m[1]));
-  assert.deepEqual(items.sort(), ["i1", "i2"], "the person's turn (p1) started i3, which is not the run's");
+  const rows = [msg("m1", "first"), ...created("m1", "i1"), msg("m2", "second"), ...created("m2", "i2"), msg("p1", "first"), ...created("p1", "i3")];
+  const items = (ids: string[]) => storedTurnCalls(rows, ids).filter((c) => c.ok).flatMap((c) => [...c.result.matchAll(/"item_id":"([^"]+)"/g)].map((m) => m[1])).sort();
+  assert.deepEqual(items(["m1", "m2"]), ["i1", "i2"], "the person's turn (p1) started i3, which is not the run's");
+  assert.deepEqual(items([]), [], "no message known: nothing is the run's");
 });

@@ -122,7 +122,7 @@ import {
   mergeSays, parseSayLog, endedTurns, storedTurnEnds, streamMissed, filledCase, filesFrom, finalSay, grade, forRecording, identityRefusal, itemsStartedBy,
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   sayWaitMs, saysOf, staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
-  holdAnswers, toolPattern, judgeVerdict, oracleValues, withToolFailures, flatVars, ownTurnIds, storedTurnCalls,
+  holdAnswers, toolPattern, judgeVerdict, oracleValues, withToolFailures, flatVars, storedTurnCalls,
   type SayMark, type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
@@ -582,8 +582,8 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
       const r = await api("POST", `/v1/sessions/${sessionId}/messages`, {
         content: t.user, messageType: "text", ...(files.length ? { channel_context: { files } } : {}),
       }, SEND_TOKEN_CMD ? sendToken() : KEY)
-        .catch((err) => { session.unknownSends++; session.lostTexts.push(t.user); throw err; });
-      if (r.status >= 500) { session.unknownSends++; session.lostTexts.push(t.user); }
+        .catch((err) => { session.unknownSends++; throw err; });
+      if (r.status >= 500) session.unknownSends++;
       const id = r.json?.message_id;
       if (r.status !== 200 || typeof id !== "string") throw new Error(`message answered ${r.status}`);
       RUN_MESSAGES.push(id);
@@ -947,8 +947,6 @@ interface AssistantSession {
   /** The messages the run sent to it, and how many more whose answer was lost (taken or not, the run cannot say). */
   messages: string[];
   unknownSends: number;
-  /** The text of each message whose answer was lost: its turn is the run's once a stored `UserMessage` with that text names it. */
-  lostTexts: string[];
 }
 
 /**
@@ -982,7 +980,7 @@ async function openAssistant(first: boolean): Promise<AssistantSession> {
   // Read after the stream opened, so a say in between is counted twice rather than not at all (and an event in between is
   // taken as before the run: nothing was sent yet).
   const before = created ? [] : await replay(id);
-  const session: AssistantSession = { id, stream, created, before, historyAtStart: new Set(), historyEnds: new Set(), messages: [], unknownSends: 0, lostTexts: [] };
+  const session: AssistantSession = { id, stream, created, before, historyAtStart: new Set(), historyEnds: new Set(), messages: [], unknownSends: 0 };
   for (const r of before as Array<EventRow & { event_id?: unknown }>) session.historyAtStart.add(String(r.event_id ?? ""));
   for (const t of storedTurnEnds(before)) session.historyEnds.add(t);
   return session;
@@ -1021,9 +1019,9 @@ async function closeSession(session: AssistantSession, floorAtStart: number, lef
 }
 
 /**
- * Close every item of the run still open: those its attempts saw, and (with `session`) every one a turn of that session started while
- * the run was on, from the stream and from the stored events after the run began: a work_create answer the stream missed, or the turn
- * of a message whose answer was lost, still ties its item. An open item above the run's first board number that is tied to nothing is
+ * Close every item of the run still open: those its attempts saw, and (with `session`) every one a turn of the run's own messages started,
+ * from the stream and from the stored events after the run began (a work_create answer the stream missed still ties its item). A
+ * turn of anyone else's message in the session, or of a message whose answer was lost, ties nothing. An open item above the run's first board number that is tied to nothing is
  * left alone and said.
  */
 async function closeRunItems(floorAtStart: number, leftOpen: number[], session: AssistantSession | null): Promise<string[]> {
@@ -1036,10 +1034,11 @@ async function closeRunItems(floorAtStart: number, leftOpen: number[], session: 
       const rows = await until(async () => replay(session.id).catch(() => undefined), Date.now() + 30_000, 3_000);
       if (!rows) issues.push("the stored events could not be read to tie the run's items to its turns");
       const after = (rows ?? []).filter((r) => !session.historyAtStart.has(String((r as { event_id?: unknown }).event_id ?? "")));
-      // Only the run's own turns tie items: its messages, and those whose answer was lost, found by their text. A turn of a
-      // message someone else sent to the session meanwhile is not the run's, and the items it started are left alone.
-      const own = ownTurnIds(after, session.messages, session.lostTexts);
-      const calls = [...turnCalls(session.stream.events, own), ...storedTurnCalls(after, own)];
+      // Only the turns of the messages the run sent and knows by id tie items. A turn of a message someone else sent to the
+      // session meanwhile is not the run's; nor, as far as anything shows, is a message whose answer was lost: the server
+      // may or may not have taken it, and a person's message with the same text would look the same. Their items are left
+      // alone and said below.
+      const calls = [...turnCalls(session.stream.events, session.messages), ...storedTurnCalls(after, session.messages)];
       const above = open.filter((x) => x.seq > floorAtStart);
       for (const i of itemsStartedBy(calls, above, RUN_ITEMS)) RUN_ITEMS.add(i.item_id);
     }
@@ -1057,7 +1056,10 @@ async function closeRunItems(floorAtStart: number, leftOpen: number[], session: 
     // New open items the run cannot tie to its own calls are left alone, and said: on a test identity nobody else
     // makes items, so they are most likely the run's own whose answer could not be read, and a person must look.
     const foreign = after.filter((x) => !RUN_ITEMS.has(x.item_id)).map((x) => x.seq);
-    if (foreign.length) issues.push(`open items not tied to the run's calls, left alone: ${foreign.join(",")}`);
+    if (foreign.length) {
+      const lost = session?.unknownSends ? ` (${session.unknownSends} message(s) of the run whose answer was lost may have started some: check and close those)` : "";
+      issues.push(`open items not tied to the run's calls, left alone: ${foreign.join(",")}${lost}`);
+    }
   } catch (err) {
     issues.push(`the board could not be read to close the run's items: ${err instanceof Error ? err.message : String(err)}`);
   }

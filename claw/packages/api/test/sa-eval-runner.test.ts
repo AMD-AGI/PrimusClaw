@@ -32,7 +32,8 @@
  *   R11 a read the grade needs that failed (a worker's events, the board through the item wait) makes the attempt the run's
  *      error, its item still closed; in the final cleanup, a board that answers again after a while is read again and the
  *      run's items are closed (R11b: one the attempt never saw, tied by its work_create answer on that same read)
- *   R12 a message whose answer was lost: the attempt is an error, and the item its turn started is still the run's and closed; a
+ *   R12 a message whose answer was lost: the attempt is an error, and the item its turn started is left alone and said (nothing
+ *      shows the server took that message: a person's message with the same text would look the same); a
  *      baseline session whose creation answer was lost is asked for again with the same idempotency key, and deleted;
  *      an item that cannot be read to delete its worker's session fails the cleanup; R12d a stop while the creation is asked
  *      for again: not asked again, and the session that may be left is said
@@ -48,8 +49,7 @@
  *   R17 EVAL_SEND_TOKEN_CMD: the messages go with the person's signed-in token, everything else with the key; a token that is not
  *      the key's identity refuses the run before anything is sent
  *   R18 a person who writes to the run's assistant session while the run is on: the item their turn started is not the run's and
- *      is neither closed nor stripped of its worker's session (it is said as left alone), while the item of the run's own message
- *      whose answer was lost is still found by its stored text and closed
+ *      is neither closed nor stripped of its worker's session (it is said as left alone), while the run's own item is closed
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -807,7 +807,7 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 
-  it("R12 a message whose answer was lost: its turn's item is still the run's", { timeout: 120_000 }, async () => {
+  it("R12 a message whose answer was lost: its turn's item is left alone and said", { timeout: 120_000 }, async () => {
     const claw = new FakeClaw();
     const base = await claw.start();
     claw.loseMessageAnswers = 1;
@@ -817,16 +817,15 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
     await claw.stop();
     try {
       assert.match(run.out, /ERROR t-l-001#1 /, run.out);
-      assert.ok(claw.calls.includes("POST /v1/work-items/item-1/stop") && !claw.sessions.has("worker-1"), "the lost message's item is the run's: closed, its worker's session deleted");
+      assert.ok(!claw.calls.some((c) => /item-1\/(stop|accept)/.test(c)) && claw.sessions.has("worker-1"), "the lost message's item is not taken for the run's");
       const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
-      assert.deepEqual(report.cleanup_failed, []);
+      assert.ok((report.cleanup_failed as string[]).some((x) => /left alone: 1 \(1 message\(s\) of the run whose answer was lost/.test(x)), JSON.stringify(report.cleanup_failed));
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 
-  it("R18 a person's message in the run's session: the item it started is left alone; the run's own, answer lost, is closed", { timeout: 120_000 }, async () => {
+  it("R18 a person's message in the run's session: the item it started is left alone; the run's own is closed", { timeout: 120_000 }, async () => {
     const claw = new FakeClaw();
     const base = await claw.start();
-    claw.loseMessageAnswers = 1;
     let person = false;
     claw.router = (_content, id, sessionId) => {
       claw.turn(id, { item: item(1, { board_state: "in_progress", can_accept: false }), say: "On it." });
@@ -838,12 +837,11 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
         claw.turn("person-1", { item: item(2, { board_state: "in_progress", can_accept: false }), say: "Checking." });
       }, 50);
     };
-    const r = runner(base, [itemCase({ id: "t-p-001", turns: [{ user: "lost" }] })]);
+    const r = runner(base, [itemCase({ id: "t-p-001" })]);
     const run = await r.done;
     await claw.stop();
     try {
-      assert.match(run.out, /ERROR t-p-001#1 /, run.out);
-      assert.ok(claw.calls.includes("POST /v1/work-items/item-1/stop") && !claw.sessions.has("worker-1"), "the run's own item (answer lost) is closed");
+      assert.ok(claw.calls.some((c) => /item-1\/(stop|accept)/.test(c)) && !claw.sessions.has("worker-1"), "the run's own item is closed");
       assert.ok(!claw.calls.some((c) => /item-2\/(stop|accept)/.test(c)), "the person's item is neither stopped nor accepted");
       assert.ok(claw.sessions.has("worker-2"), "the person's item keeps its worker's session");
       const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
