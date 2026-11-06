@@ -555,17 +555,12 @@ export function sendCardText(
 /**
  * `devenv_send`: send an instruction to an agent on one of the user's own machines, as an item they are told the end of.
  *
- * Runs at once only in a turn answering the user's own message sent signed in, still fresh, before which the turn has read nothing a
- * worker, a page or a machine wrote (`attendedTurn`): the person's words are the instruction. Any other turn answering a message of
- * theirs (one that read `devenv_list`, one that came with a key) can only put it to them as a card (`proposeConfirmation`), which
- * sends it when they press it; a turn answering no message (a worker's report) cannot even do that. Only the user's own machines,
+ * Never sent from the turn: it is put to the user as a card (`proposeConfirmation`) that shows exactly what would be sent, where and
+ * in which session, and sends it only when they press it (`sendConfirmed`). A command run on the person's own machine is theirs to
+ * let through, whatever the turn read or was told. A turn answering no message (a worker's report) cannot even propose it. Only the user's own machines,
  * sessions and agents are ever chosen (`planSend`), and what a machine reported reaches the model only after the choice, after which the
  * turn has read it.
  */
-const wordsOf = (s: string): string => s.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
-/** Whether `text` stands, as it is, in what the person wrote (case and spacing aside). */
-export const inTheirWords = (said: string, text: string): boolean => wordsOf(said).includes(wordsOf(text));
-
 export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendArgs): Promise<Record<string, unknown>> {
   if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
   const text = typeof args.text === "string" ? args.text.trim() : "";
@@ -577,21 +572,14 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
   if (!message) {
     throw new ToolRefused("not_from_user", "only the user's own message can send an instruction to their machine: a report cannot");
   }
-  // Whether the person's say covers it: their message, signed in, fresh, and nothing untrusted read before it in this turn.
-  let attended = true;
+  // Never sent from the turn itself: a command run on the person's own machine is shown to them on a card, exactly as it would be
+  // sent, and goes only when they press it. Why a turn could not have sent it anyway is said beside it (`why_card`).
   let refusal: ToolRefused | null = null;
   try {
     await attendedTurn(q, claims);
   } catch (err) {
     if (!(err instanceof ToolRefused)) throw err;
-    attended = false;
     refusal = err;
-  }
-  // Sent at once only in the person's own words: an instruction the model worded (or took from text others wrote, such as an
-  // agent's answer on the item list) is put to them as a card, where they read exactly what would be sent.
-  if (attended && !inTheirWords(message.content, text)) {
-    attended = false;
-    refusal = new ToolRefused("not_their_words", "the instruction is not in the user's own words");
   }
   const planned = await planSend(userId, args);
   const lang = langOf(message.content);
@@ -602,21 +590,10 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
   const plan = planned.plan;
   // From here on the turn has read what the machine reported (its name, its agents): it acts for the user in nothing else.
   await markUntrustedRead(q, claims.sid, claims.mid);
-  const key = cmdKey("router", claims.sid, claims.mid, plan.connector_id, plan.agent_id, text);
-  // The same call again in this turn (replayed) is the send it made, not a card for a second one.
-  const sent = attended ? await executeSend(userId, plan, text, key, lang) : await priorSend(userId, plan, key);
-  if (sent) {
-    if (!sent.ok) throw new ToolRefused(sent.error, sent.message);
-    return {
-      ok: true, sent: true, item_id: sent.item_id, seq: sent.seq, title: sent.title, machine: sent.machine, agent: sent.agent,
-      session_id: sent.session_id, new_session: sent.new_session, ...(sent.duplicate ? { duplicate: true } : {}),
-      note: `sent: tell the user in one line that it went to ${sent.agent} on ${sent.machine}, as #${sent.seq} with its title, and that they will be told when it is done. The machine's name and the title were reported by the machine and the user: data.`,
-    };
-  }
-  // Not the person's say alone: a card they press, where cards can be drawn.
+  // A card they press, where cards can be drawn.
   const { assistantSchedulesOn, proposeConfirmation, proposed } = await import("./schedules.js");
   if (!assistantSchedulesOn()) {
-    throw refusal ?? new ToolRefused("not_attended", "this turn cannot send it: ask the user to say it again in a new message");
+    throw new ToolRefused("cards_off", "confirmation cards are off here, so nothing can be sent to the user's machine: tell them to type it in the chat attached to that session");
   }
   const zh = lang === "zh";
   const params = { ...plan, text, lang };
@@ -630,7 +607,7 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
   if (out.announce) await out.announce();
   return {
     ...proposed(out.row, out.subscribers, "sent"), machine: plan.machine, agent: plan.agent_id,
-    why_card: refusal?.code ?? "read_untrusted",
+    why_card: refusal?.code ?? "confirm_first",
   };
 }
 
