@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
-import { filterToolSchemas, parseReadTaint, parseToolAllowlist } from "../tools/allowlist.js";
+import { filterToolSchemas, forgetEarlierReads, parseReadTaint, parseToolAllowlist } from "../tools/allowlist.js";
 import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
@@ -453,7 +453,8 @@ export class AgentEngine {
       router.readTaint = parseReadTaint(request.read_taint);
       const allToolSchemas = filterToolSchemas([...router.getToolSchemas(), ...mcpResult.schemas], toolAllowlist);
 
-      const messages = [...(request.history || [])];
+      // Under a read taint, what earlier runs read with its sources is not replayed: this run may act until it reads.
+      const messages = router.readTaint ? forgetEarlierReads(request.history ?? [], router.readTaint) : [...(request.history || [])];
       const brainSystemParts = [rules, request.rules_text, request.system_append, systemHints].filter(Boolean);
       if (brainSystemParts.length) {
         const brainSystem = brainSystemParts.join("\n\n");

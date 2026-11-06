@@ -433,7 +433,7 @@ REMINDER: You MUST include the sources above in your response to the user using 
 
 Key rules:
 - `web_search_tool_result` blocks with an array `content` → `Links: ${JSON.stringify(content)}`.
-- `web_search_tool_result` with **non-array** `content` → in-band error: push string `"Web search error: <error_code>"` (e.g. rate limit, quota). Log the error but do **not** throw.
+- `web_search_tool_result` with **non-array** `content` → in-band error: push string `"Web search error: <error_code>"` (e.g. rate limit, quota) beside the links of the other results. When no result has links, the search failed: the native backend counts as failed (the next backend is tried) and the failure is said as `anthropic: search error <error_code>` for a known code, without the model's text around it.
 - `text` blocks → append as-is (model may explain query refinements between searches).
 - `server_tool_use` blocks → skip (delimiter only, URLs not extracted from them).
 - `null` / `undefined` entries → skip.
@@ -633,6 +633,7 @@ Please call web_fetch again with the redirected URL and the same prompt if you s
 
   > **Why local DNS checks**: V2 Brain runs in a controlled cluster and cannot assume an external domain-reputation preflight service is reachable, so SSRF protection is enforced locally via DNS resolution plus IP-range checks. If operators later deploy an egress proxy with allowlisting, these DNS checks become defense-in-depth.
 - **Egress proxy guard**: if axios returns `403` with header `X-Proxy-Error: blocked-by-allowlist`, surface a structured `EGRESS_BLOCKED` error.
+- **Failure text**: a failed fetch (and a failed `web_search`) is told to the model in Brain's own fixed words, with at most an HTTP status, a known error code's meaning and the host the model asked for; never a status text, a body, a certificate's names, an address a name resolved to or any part of a redirect target. A failed call counts as having read nothing (an assistant router turn's `read_taint.clean_failures`), so its text must hold nothing a server chose. The error itself goes to the log.
 - **LRU cache**: 15 min TTL, 50 MB cap. Cache only the fetched/decoded page content keyed by normalized final URL + response content type + `raw` mode. Do **not** cache summarized output by URL alone; if summary caching is added later, its key must include `prompt`, summarization model, guideline tier, and truncation settings.
 - **Output budget**: regardless of `max_bytes`, the returned tool result is capped by `WEB_FETCH_MAX_OUTPUT_CHARS` (default 50,000 chars) with a `[Content truncated due to length...]` marker. This prevents a single URL from consuming the main loop context when `prompt` is empty or summarization is disabled.
 

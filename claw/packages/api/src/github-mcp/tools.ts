@@ -15,14 +15,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import pino from "pino";
 import { z } from "zod";
-import { GithubError, parseRepoRef, repoPath, type GithubClient } from "../github-review/github.js";
+import { GithubError, GithubGraphqlError, isValidOwner, parseRepoRef, repoPath, type GithubClient } from "../github-review/github.js";
 
 const logger = pino({ name: "github-mcp-tools" });
 
 /** The tools that only read. Everything else this server offers writes, and waits for the user. */
 export const READ_TOOLS = [
-  "repo_get_file", "pr_get", "pr_list", "pr_files", "pr_diff", "checks_list", "job_logs",
-  "issue_get", "issue_list", "review_threads_list", "code_search",
+  "repo_get_file", "repo_list", "pr_get", "pr_list", "pr_files", "pr_diff", "pr_reviews", "checks_list", "job_logs",
+  "issue_get", "issue_list", "issue_search", "review_threads_list", "code_search",
 ] as const;
 
 /**
@@ -49,12 +49,56 @@ function cut(text: string, max = MAX_ANSWER_CHARS): string {
   return text.length <= max ? text : `${text.slice(0, max)}\n[cut: ${text.length - max} more characters]`;
 }
 
+/** What GitHub's answer with each status means, in these tools' own words. */
+const GITHUB_STATUS_MEANS: Record<number, string> = {
+  400: "the request was refused as malformed",
+  401: "the user's GitHub token was refused (expired or revoked); they can replace it in their Claw settings",
+  403: "the user's GitHub token may not read this (a missing permission, or an organization that requires SSO authorization)",
+  404: "not found, or the user's GitHub token cannot see it",
+  409: "a conflict (for example, an empty repository)",
+  410: "it is gone (deleted, or turned off for this repository)",
+  422: "the request was refused as invalid (for a search: check the syntax, and that the users and repositories it names exist and are visible)",
+  451: "unavailable for legal reasons",
+};
+
+/**
+ * A read's failure, in these tools' own words: the status GitHub answered with and what it means, never GitHub's message.
+ *
+ * A failed read reads nothing anyone else wrote, which is what lets an assistant's router turn go on and start the work a lookup
+ * could not do (`assistant/read-tools.ts`, `cleanFailures`). That holds only while the failure's text is all Claw's: GitHub's
+ * message, a GraphQL error and a transport error can each carry what someone else chose (a name, a query, an address), so none
+ * of them is passed on. They are logged, with GitHub's request id. `BadInput` is these tools' own, fixed, text.
+ */
+function readFailure(err: unknown): string {
+  if (err instanceof BadInput) return err.message;
+  if (err instanceof GithubGraphqlError) {
+    return "GitHub refused the request: the repository, pull request or thread may not exist, or the user's GitHub token cannot see it";
+  }
+  if (err instanceof GithubError) {
+    if (err.status === 0) return "GitHub could not be reached (the request failed or timed out); try once more";
+    if (err.rateLimited) {
+      return `GitHub answered ${err.status}: rate limited${err.retryAfterSeconds ? `; retry after ${err.retryAfterSeconds} seconds` : ""}`;
+    }
+    if (err.status >= 500) return `GitHub answered ${err.status}: GitHub could not answer (or its answer was too large to read); try once more`;
+    return `GitHub answered ${err.status}: ${GITHUB_STATUS_MEANS[err.status] ?? "the request was refused"}`;
+  }
+  return "the call failed; try once more";
+}
+
 async function answer(tool: string, run: () => Promise<unknown>): Promise<ToolResult> {
   try {
     const value = await run();
     return { content: [{ type: "text", text: cut(typeof value === "string" ? value : JSON.stringify(value)) }] };
   } catch (err) {
-    // GithubError's message is GitHub's own, redacted with the token by the client.
+    if ((READ_TOOLS as readonly string[]).includes(tool)) {
+      logger.warn({
+        tool, errorClass: (err as Error)?.constructor?.name, status: (err as GithubError)?.status, requestId: (err as GithubError)?.requestId,
+        err: (err as Error)?.message,
+      }, "github_mcp.read_failed");
+      return { content: [{ type: "text", text: readFailure(err) }], isError: true };
+    }
+    // A write's failure says what GitHub said (its message, redacted with the token by the client): a worker acts on it, and
+    // no router turn calls a write.
     if (err instanceof GithubError || err instanceof BadInput) {
       return { content: [{ type: "text", text: err.message }], isError: true };
     }
@@ -83,6 +127,9 @@ function refOf(input: string): string {
 }
 
 const login = (u: unknown): string | undefined => (u && typeof u === "object" ? (u as { login?: string }).login : undefined);
+
+/** `owner/name` of a search hit, from its `repository_url` (`<api>/repos/owner/name`). */
+const repoOfUrl = (u: unknown): string | undefined => (typeof u === "string" ? /\/repos\/([^/]+\/[^/]+)$/.exec(u)?.[1] : undefined);
 
 function prSummary(p: Record<string, any>) {
   return {
@@ -159,6 +206,25 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
     return bytes.toString("utf8");
   }));
 
+  mcp.tool("repo_list", "List repositories, most recently pushed first: with no owner, the ones the user can reach (their own, ones they collaborate on and their organizations'); with owner, that user's or organization's.", {
+    owner: z.string().optional().describe("A user or organization login; leave out for the user's own"), per_page: PER_PAGE, page: PAGE,
+  }, (a) => answer("repo_list", async () => {
+    const q: Record<string, string | number> = { sort: "pushed", per_page: a.per_page ?? 20, page: a.page ?? 1 };
+    let list: any[] | null;
+    if (!a.owner) {
+      list = (await gh.get<any[]>("/user/repos", q)).json;
+    } else {
+      if (!isValidOwner(a.owner)) throw new BadInput("owner must be a user or organization login");
+      // An organization's list holds the private repositories the user may see; a user's login answers 404 there.
+      const org = await gh.get<any[]>(`/orgs/${encodeURIComponent(a.owner)}/repos`, q, [404]);
+      list = org.status === 404 ? (await gh.get<any[]>(`/users/${encodeURIComponent(a.owner)}/repos`, q)).json : org.json;
+    }
+    return (list ?? []).map((r) => ({
+      repo: r.full_name, private: r.private, archived: r.archived, fork: r.fork, default_branch: r.default_branch,
+      description: r.description, url: r.html_url, pushed_at: r.pushed_at, open_issues_and_prs: r.open_issues_count,
+    }));
+  }));
+
   mcp.tool("pr_get", "A pull request: title, state, author, branches, head sha, mergeability, size and description.", {
     repo: REPO, number: NUMBER,
   }, (a) => answer("pr_get", async () => prSummary((await gh.get<any>(repoPath(repoOf(a.repo), `/pulls/${a.number}`))).json)));
@@ -187,6 +253,13 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
 
   mcp.tool("pr_diff", "The whole unified diff of a pull request.", { repo: REPO, number: NUMBER }, (a) => answer("pr_diff", async () =>
     (await gh.getText(repoPath(repoOf(a.repo), `/pulls/${a.number}`), "application/vnd.github.diff")).text));
+
+  mcp.tool("pr_reviews", "The reviews of a pull request: who reviewed, their verdict (APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED), when, on which commit, and what they wrote.", {
+    repo: REPO, number: NUMBER,
+  }, (a) => answer("pr_reviews", async () => {
+    const reviews = (await gh.get<any[]>(repoPath(repoOf(a.repo), `/pulls/${a.number}/reviews`), { per_page: 100 })).json ?? [];
+    return reviews.map((r) => ({ id: r.id, author: login(r.user), state: r.state, submitted_at: r.submitted_at, commit: r.commit_id, body: r.body ?? "" }));
+  }));
 
   mcp.tool("checks_list", "The CI of a commit, branch or tag: every check run (its id is the job id job_logs takes) and every commit status.", {
     repo: REPO, ref: z.string().describe("A commit sha (a pull request's head_sha), branch or tag"),
@@ -242,6 +315,17 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
     const q: Record<string, string | number> = { state: a.state ?? "open", per_page: a.per_page ?? 20, page: a.page ?? 1 };
     if (a.labels) q.labels = a.labels;
     return ((await gh.get<any[]>(repoPath(repoOf(a.repo), "/issues"), q)).json ?? []).map(issueSummary);
+  }));
+
+  mcp.tool("issue_search", "Search pull requests and issues across GitHub, as the user, with GitHub's search syntax: `is:pr is:open author:@me` (the user's open pull requests), `is:pr is:open review-requested:@me`, `is:issue is:open assignee:@me`; narrow with `repo:owner/name` or `org:name`. Returns the total count and the matches, most recently updated first.", {
+    query: z.string().min(1).max(256).describe("GitHub search syntax; @me is the user"),
+    sort: z.enum(["updated", "created", "comments"]).optional().describe("Default updated"), per_page: PER_PAGE, page: PAGE,
+  }, (a) => answer("issue_search", async () => {
+    const res = (await gh.get<any>("/search/issues", { q: a.query, sort: a.sort ?? "updated", order: "desc", per_page: a.per_page ?? 20, page: a.page ?? 1 })).json;
+    return {
+      total_count: res?.total_count, incomplete_results: res?.incomplete_results,
+      items: (res?.items ?? []).map((i: any) => ({ repo: repoOfUrl(i.repository_url), ...issueSummary(i), ...(i.pull_request ? { draft: i.draft === true } : {}) })),
+    };
   }));
 
   mcp.tool("review_threads_list", "The review threads of a pull request: id (for review_thread_reply / review_thread_resolve), resolved or not, file, line and comments.", {

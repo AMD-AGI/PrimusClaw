@@ -6,7 +6,7 @@
  * (the fat dispatch, a queued message replayed, and a doorbell claimed), over a real Postgres. Skipped without
  * DATABASE_URL, and a skip is not a pass.
  *
- *   A1  a router turn is cut to the assistant tools, kept short, and carries a bearer naming its own run
+ *   A1  a router turn is cut to the assistant tools and the web lookups, kept short, and carries a bearer naming its own run
  *   A2  a doorbell router turn is given all of that at the claim, and the row holds none of it
  *   A3  a queued router message replayed on the wire is given it after its run exists, so the bearer names that run
  *   A4  a worker turn gets its prompt, its item and the generation it started under, and keeps what the request brought
@@ -36,6 +36,8 @@ let UNTRUSTED_CLOSE = "";
 const words = (prompt: string): string => prompt.split(`\n\n${TURN_STATE_HEADER}\n\n`)[0];
 
 const skip = postgresSkipReason();
+/** A router's tools with no assistant plugin and no GitHub: the assistant's own, and Brain's web search and fetch. */
+const ROUTER_TOOLS = ["mcp__assistant__*", "web_search", "web_fetch"];
 
 describe("assistant role profile", { skip }, () => {
   let w: World;
@@ -165,7 +167,7 @@ describe("assistant role profile", { skip }, () => {
   test("A1 a router turn is cut to the assistant tools and carries a bearer naming its own run", async () => {
     const { published, result } = await send(alice.routerSid, "alice", { doorbell: false });
     const task = JSON.parse(published[0]);
-    assert.deepEqual(task.tools_allowlist, ["mcp__assistant__*"]);
+    assert.deepEqual(task.tools_allowlist, ROUTER_TOOLS);
     assert.equal(task.max_turns, 8);
     assert.deepEqual(Object.keys(task.mcp_servers), ["assistant"]);
     const claims = verify(task);
@@ -209,7 +211,7 @@ describe("assistant role profile", { skip }, () => {
     // An item made after the send and before the claim is in the list the turn is given: the list is the claim's.
     await w.createItem(alice, "Added while it waited");
     const request = await claim();
-    assert.deepEqual(request.tools_allowlist, ["mcp__assistant__*"]);
+    assert.deepEqual(request.tools_allowlist, ROUTER_TOOLS);
     assert.equal(request.max_turns, 8);
     const claims = verify(request);
     assert.equal(claims.task_id, result.runId, "the bearer names the claimed run");
@@ -220,7 +222,7 @@ describe("assistant role profile", { skip }, () => {
 
   test("A3 a queued router message replayed on the wire is profiled after its run is opened", async () => {
     const { task, runId } = await replayed(alice.routerSid, "alice");
-    assert.deepEqual(task.tools_allowlist, ["mcp__assistant__*"]);
+    assert.deepEqual(task.tools_allowlist, ROUTER_TOOLS);
     assert.equal(verify(task).task_id, runId, "the run opened for the replay, not the absence of one");
     assert.equal(verify(task).mid, "claw-pending-1");
   });
@@ -329,7 +331,7 @@ describe("assistant role profile", { skip }, () => {
     const router = await drained(alice.routerSid);
     assert.equal(router.askedForSkills, false);
     assert.equal(router.published.length, 1);
-    assert.deepEqual(router.published[0].tools_allowlist, ["mcp__assistant__*"]);
+    assert.deepEqual(router.published[0].tools_allowlist, ROUTER_TOOLS);
     assert.equal((await drained("plain")).askedForSkills, true);
   });
 
