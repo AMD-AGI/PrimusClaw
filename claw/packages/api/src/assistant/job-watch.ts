@@ -29,7 +29,7 @@ import {
   CLAW_ASSISTANT_JOB_POLL_SEC, SAFE_API_URL,
 } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
-import { turnMessage } from "./inbound.js";
+import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { recordSystemNotice } from "./outbound.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, ToolRefused } from "./tools.js";
@@ -61,8 +61,6 @@ export interface HttpJobSource {
 
 const KIND_RE = /^[a-z][a-z0-9_-]{1,31}$/;
 const PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/;
-/** A job state an HTTP kind may report ("running", "SUCCEEDED", "in-progress"): one short token, so it can carry no instruction. */
-const HTTP_STATE_RE = /^[A-Za-z0-9_.:-]{1,40}$/;
 
 /**
  * Whether a URL may carry a user's key: https, or plain http only inside the cluster (a `.svc` host); and the id (which the user
@@ -248,8 +246,7 @@ async function readHttpJob(source: HttpJobSource, id: string, key: string): Prom
   if (got.status === 401 || got.status === 403) return { kind: "error", code: `${source.kind}_refused_${got.status}` };
   if (got.status < 200 || got.status >= 300) return { kind: "error", code: `${source.kind}_http_${got.status}` };
   const state = pick(got.body, source.state);
-  // The state reaches the router's turn, which may still act: only a state's name (one token), never text the job's API words freely.
-  if (typeof state !== "string" || !HTTP_STATE_RE.test(state)) return { kind: "error", code: `${source.kind}_unreadable` };
+  if (typeof state !== "string" || !state) return { kind: "error", code: `${source.kind}_unreadable` };
   const detail = pick(got.body, source.detail);
   const owner = pick(got.body, source.owner);
   return {
@@ -443,6 +440,13 @@ const watchView = (r: Record<string, any>) => ({
  * `job_watch`: watch a job for the user. It is read once first, so a wrong id is refused now and a job that has already ended is
  * answered with its state instead of being watched. Reading only: it needs no confirmation, as answering a question would not.
  */
+/**
+ * A deployment-added kind's state is whatever its job API answered: text no one the user vetted wrote. The turn that reads it reads
+ * it as a worker's words, and no longer acts for the user afterwards (`markUntrustedRead`). SaFE's phases and Claw's run statuses
+ * are their own fixed words.
+ */
+const statesWordedByOthers = (source: string): boolean => !(JOB_SOURCES as readonly string[]).includes(source);
+
 export async function jobWatch(
   claims: AssistantTokenClaims, args: { kind?: unknown; id?: unknown; label?: unknown },
 ): Promise<Record<string, unknown>> {
@@ -462,6 +466,7 @@ export async function jobWatch(
   const read = await readJob(q, { user_id: userId, source, target });
   if (read.kind === "gone") throw new ToolRefused("not_found", `no ${source} with that id is the user's to see: check the id`);
   if (read.kind === "error") throw new ToolRefused("unreadable", `the ${source} could not be read now (${read.code}): tell the user, and try again later`);
+  if (statesWordedByOthers(source)) await markUntrustedRead(q, claims.sid, claims.mid);
   if (endedStates(source).has(read.state)) {
     // Only the state: the job's own message (or a run's failure reason) is text others wrote, and this turn may still act.
     return { ok: true, watching: false, state: read.state, note: "it has already ended: tell the user its state; nothing is watched" };
@@ -498,6 +503,7 @@ export async function jobWatchList(claims: AssistantTokenClaims): Promise<Record
     `SELECT * FROM claw_assistant_job_watches WHERE user_id = $1 AND (state = 'active' OR ended_at > NOW() - INTERVAL '1 day') ORDER BY id`,
     [userId],
   )).rows as Array<Record<string, any>>;
+  if (rows.some((r) => statesWordedByOthers(String(r.source)))) await markUntrustedRead((t, p) => db.query(t, p), claims.sid, claims.mid);
   return { ok: true, watches: rows.map(watchView) };
 }
 
