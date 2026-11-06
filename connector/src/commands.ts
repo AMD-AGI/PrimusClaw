@@ -17,7 +17,9 @@ import {
 import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
 import { noAskWarnings } from "./claude-mode.js";
 import { HooksError, hooksStatus, installHooks, settingsFile, uninstallHooks } from "./hooks.js";
-import { Connector, type ConnectorTiming } from "./connector.js";
+import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
+import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
+import { cmdService, cmdSupervise, startAfterLogin, type ServiceDeps } from "./service.js";
 import {
   auditFile, childrenFile, configFile, credentialsFile, identityFile, pauseFile, pidFile, type Dirs,
 } from "./paths.js";
@@ -40,9 +42,16 @@ export interface Ctx {
   /** Claude Code's managed settings file and the effective uid, as the Claude adapter sees them (tests set them). */
   claudeManagedSettings?: string;
   euid?: number | null;
+  /** How `service` runs systemctl/launchctl, which program a unit starts, and where the units go (tests set them). */
+  service?: Partial<ServiceDeps>;
 }
 
-export const EXIT = { ok: 0, failure: 1, usage: 2, revoked: 3 } as const;
+/**
+ * `needsPerson` (78, EX_CONFIG) means "starting again will not help": the connector was revoked, Claw or the identity
+ * service refused the sign-in, or there is no usable config or sign-in. A supervisor (the units `service install`
+ * writes) restarts on any other failure and never on this one. `revoked` is the same code, kept as its own name.
+ */
+export const EXIT = { ok: 0, failure: 1, usage: 2, needsPerson: 78, revoked: 78 } as const;
 
 const HELP = `claw-connector ${VERSION}: connect the coding agents on this machine to Claw (outbound HTTPS only).
 
@@ -59,8 +68,13 @@ Usage: claw-connector <command> [options]
                            directories, else $CLAUDE_CONFIG_DIR or ~/.claude); only its own entries are ever changed
   login                    sign in (device flow); --server URL --identity-url URL [--name HOST]
                            development only: --key <api key>  (or CLAW_CONNECTOR_KEY)
-  run                      connect and serve (Ctrl-C or SIGTERM stops it and every agent it started)
-  status [--json]          what is running, signed in, paused
+  run                      connect and serve (Ctrl-C or SIGTERM stops it and every agent it started). Exit code 78:
+                           revoked, sign-in refused, or no usable config; starting it again will not help
+  service install|uninstall|status [--supervisor systemd|launchd|script] [--env NAME ...]
+                           keep "run" up: started at login/boot, restarted 5 s after it dies, never restarted
+                           after exit 78. systemd --user on Linux, launchd on macOS; "script" (containers without
+                           systemd) writes a keep-alive script for a startup hook and a 5-minute cron line
+  status [--json]          what is running, signed in, paused, the last disconnect and why
   pause                    stop every agent now and stay offline until "resume"
   resume                   undo "pause"
   stop                     stop the running connector and every agent it started
@@ -93,7 +107,13 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
       case "init": return await cmdInit(rest, ctx);
       case "hooks": return cmdHooks(rest, ctx);
       case "login": return await cmdLogin(rest, ctx);
-      case "run": return await cmdRun(rest, ctx);
+      case "run": {
+        const code = await cmdRun(rest, ctx);
+        // launchd cannot be told "never restart on 78"; it does not restart a clean exit. The reason was printed.
+        return code === EXIT.needsPerson && ctx.env.CLAW_CONNECTOR_SUPERVISOR === "launchd" ? EXIT.ok : code;
+      }
+      case "service": return await cmdService(rest, ctx, serviceHelpers);
+      case "supervise": return await cmdSupervise(rest, ctx);
       case "status": return cmdStatus(rest, ctx);
       case "pause": return await cmdPause(ctx);
       case "resume": return cmdResume(ctx);
@@ -248,7 +268,9 @@ async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
   if (key) {
     saveCredentials(file, { v: 1, server, kind: "key", key, saved_at: new Date().toISOString() });
     forgetRevokedIdentity(ctx);
+    clearNeedsLogin(ctx.dirs);
     ctx.out("saved a development key. This is for trying things out: a device sign-in is the normal way (omit --key).");
+    startAfterLogin(ctx, serviceHelpers);
     return EXIT.ok;
   }
   const identityRaw = (values["identity-url"] ?? ctx.env.CLAW_IDENTITY_URL ?? cfg?.identityUrl ?? "").trim();
@@ -261,7 +283,9 @@ async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
     refresh_token: tok.refresh_token, device_name: deviceName, saved_at: new Date().toISOString(),
   });
   forgetRevokedIdentity(ctx);
-  ctx.out(`signed in as ${deviceName}. Next: claw-connector run`);
+  clearNeedsLogin(ctx.dirs);
+  ctx.out(`signed in as ${deviceName}. Next: claw-connector service install (or run)`);
+  startAfterLogin(ctx, serviceHelpers);
   return EXIT.ok;
 }
 
@@ -275,11 +299,30 @@ function runningPid(ctx: Ctx): number | null {
   return null;
 }
 
-async function cmdRun(_args: string[], ctx: Ctx): Promise<number> {
-  const cfg = loadCfg(ctx);
-  if (cfg.agents.length === 0) { ctx.err("agents.toml defines no agents; add an [[agents]] table"); return EXIT.failure; }
-  const creds = loadCredentials(credentialsFile(ctx.dirs));
-  if (!creds) { ctx.err("not signed in: run  claw-connector login"); return EXIT.failure; }
+async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
+  // --supervised only names a run a supervisor started (`service install`), in `ps` and the log. Every run honours
+  // needs-login.json, which only `login` clears: a revoked or refused connector is not started again and again, by
+  // these units or by a unit written by hand earlier for the old revoked code 3 (it now restarts on 78, and each
+  // restart ends here without contacting Claw).
+  parseArgs({ args, strict: true, options: { supervised: { type: "boolean" } } });
+  {
+    const nl = needsLogin(ctx.dirs);
+    if (nl) {
+      ctx.err(`not starting: ${nl.reason}${nl.at ? ` (${nl.at})` : ""}. Sign in again (claw-connector login); the service then starts it.`);
+      return EXIT.needsPerson;
+    }
+  }
+  let cfg: ConnectorConfig;
+  let creds: Credentials | null;
+  try {
+    cfg = loadCfg(ctx);
+    creds = loadCredentials(credentialsFile(ctx.dirs));
+  } catch (e) {
+    if (e instanceof ConfigError || e instanceof CredentialsError) { ctx.err(e.message); return EXIT.needsPerson; }
+    throw e;
+  }
+  if (cfg.agents.length === 0) { ctx.err("agents.toml defines no agents; add an [[agents]] table"); return EXIT.needsPerson; }
+  if (!creds) { ctx.err("not signed in: run  claw-connector login"); return EXIT.needsPerson; }
   const running = runningPid(ctx);
   if (running !== null) { ctx.err(`already running (pid ${running}); use "claw-connector stop" first`); return EXIT.failure; }
   const server = serverUrl(ctx, undefined, cfg, creds)!;
@@ -293,10 +336,25 @@ async function cmdRun(_args: string[], ctx: Ctx): Promise<number> {
   for (const w of noAsk(ctx, cfg)) ctx.out(`warning: ${w}`);
   try {
     const result = await connector.run();
-    if (result === "revoked") { ctx.err("this connector was revoked: every agent was stopped. Run login again to connect it anew."); return EXIT.revoked; }
+    if (result === "revoked") {
+      markNeedsLogin(ctx.dirs, "this connector was revoked");
+      ctx.err("this connector was revoked: every agent was stopped. Run login again to connect it anew.");
+      return EXIT.revoked;
+    }
+    if (result === "auth_failed") {
+      markNeedsLogin(ctx.dirs, `Claw refused the sign-in (${connector.authFailure})`);
+      ctx.err(`Claw keeps refusing this sign-in (${connector.authFailure}): every agent was stopped. Run login again.`);
+      return EXIT.needsPerson;
+    }
     return EXIT.ok;
   } catch (e) {
-    if (e instanceof HttpError || e instanceof TransportError || e instanceof RevokedError || e instanceof GrantRevokedError) { ctx.err(`error: ${e.message}`); return EXIT.failure; }
+    // Refused at start (a deleted key, a sign-in the identity service ended): retrying cannot help.
+    if (isAuthRefusal(e) || e instanceof RevokedError || e instanceof GrantRevokedError || e instanceof CredentialsError) {
+      markNeedsLogin(ctx.dirs, e instanceof GrantRevokedError || e instanceof RevokedError ? e.message : `Claw refused the sign-in (${errMessage(e)})`);
+      ctx.err(`error: ${errMessage(e)}. Run login again.`);
+      return EXIT.needsPerson;
+    }
+    if (e instanceof HttpError || e instanceof TransportError) { ctx.err(`error: ${e.message}`); return EXIT.failure; }
     throw e;
   }
 }
@@ -334,12 +392,17 @@ function cmdStatus(args: string[], ctx: Ctx): number {
     problems: [credsProblem, configProblem].filter((x): x is string => !!x),
     /** Agents whose sessions will be refused as things stand (Claude's own settings start them in a mode that never asks). */
     warnings,
+    /** Why the connection last went down, and whether only a new sign-in can bring it back. */
+    last_disconnect: recentDisconnects(ctx.dirs, 1)[0] ?? null,
+    needs_login: needsLogin(ctx.dirs),
   };
   if (values.json) { ctx.out(JSON.stringify(status, null, 2)); return EXIT.ok; }
   ctx.out(`connector:  ${status.running ? `running (pid ${status.running})` : "not running"}${status.paused ? ", PAUSED" : ""}`);
   ctx.out(`signed in:  ${creds ? `${creds.kind} to ${creds.server}` : "no"}`);
   ctx.out(`agents:     ${agents.map((a) => (unattended.includes(a) ? `${a} (no per-step approval)` : a)).join(", ") || "none configured"}`);
   ctx.out(`adapters:   ${status.adapters.length ? status.adapters.map((a) => `${a.agent} pid ${a.pid}`).join(", ") : "none running"}`);
+  if (status.last_disconnect) ctx.out(`last down:  ${status.last_disconnect.at} ${status.last_disconnect.reason}${status.last_disconnect.detail ? ` (${status.last_disconnect.detail})` : ""}`);
+  if (status.needs_login) ctx.out(`problem:    needs a new sign-in: ${status.needs_login.reason}; run: claw-connector login`);
   for (const p of status.problems) ctx.out(`problem:    ${p}`);
   for (const w of status.warnings) ctx.out(`warning:    ${w}`);
   return EXIT.ok;
@@ -403,3 +466,19 @@ async function cmdLogout(ctx: Ctx): Promise<number> {
   ctx.out("signed out");
   return EXIT.ok;
 }
+
+/** What `service` borrows from the other commands. */
+const serviceHelpers = {
+  runningPid,
+  stop: (ctx: Ctx) => cmdStop(ctx, true),
+  preflight: (ctx: Ctx): string | null => {
+    try {
+      const cfg = loadCfg(ctx);
+      if (cfg.agents.length === 0) return "agents.toml defines no agents; add an [[agents]] table";
+      if (!loadCredentials(credentialsFile(ctx.dirs))) return "not signed in: run  claw-connector login";
+    } catch (e) { return errMessage(e); }
+    const nl = needsLogin(ctx.dirs);
+    return nl ? `${nl.reason}: run  claw-connector login  first` : null;
+  },
+};
+export type ServiceHelpers = typeof serviceHelpers;

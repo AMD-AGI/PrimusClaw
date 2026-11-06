@@ -14,6 +14,7 @@ import { ChildRegistry, processStart } from "./children.js";
 import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-client.js";
 import type { ConnectorConfig } from "./config.js";
 import { GrantRevokedError, TransientAuthError } from "./credentials.js";
+import { recordDisconnect } from "./health.js";
 import { SessionManager, type Command } from "./manager.js";
 import { Outbox } from "./outbox.js";
 import {
@@ -42,6 +43,14 @@ export interface ConnectorTiming extends SessionTiming {
   attachCliMs: number;
   /** A session whose transcript was written this recently is still in someone's hands. */
   recentWriteMs: number;
+  /**
+   * Claw refused the credential (401 that is not `revoked`, or 403) this many times in a row, on the heartbeat or the
+   * command stream: the key was deleted or lost its scope, and only a person can fix that. The run ends as
+   * `auth_failed` instead of staying up and offline for good.
+   */
+  authFailLimit: number;
+  /** ...and only once the refusals have gone on this long, so a burst (a gateway or identity-service hiccup) never ends a run. */
+  authFailWindowMs: number;
 }
 
 export const DEFAULT_TIMING: ConnectorTiming = {
@@ -56,6 +65,8 @@ export const DEFAULT_TIMING: ConnectorTiming = {
   catalogMs: 120_000,
   attachCliMs: 8_000,
   recentWriteMs: 10_000,
+  authFailLimit: 4,
+  authFailWindowMs: 120_000,
 };
 
 interface IdentityState {
@@ -124,7 +135,10 @@ export interface ConnectorDeps {
   timing?: Partial<ConnectorTiming>;
 }
 
-export type RunResult = "stopped" | "revoked";
+export type RunResult = "stopped" | "revoked" | "auth_failed";
+
+/** Claw answered, and refused the credential itself (not a revocation of the row, which is {@link RevokedError}). */
+export const isAuthRefusal = (e: unknown): boolean => e instanceof HttpError && (e.status === 401 || e.status === 403);
 
 /** Failures that pass by themselves: no connection, a provider that is down or busy. */
 export function isTransient(e: unknown): boolean {
@@ -144,6 +158,13 @@ export class Connector {
   /** The connector row itself was revoked (not just the sign-in): recorded in connector.json for `login`. */
   private rowRevoked = false;
   private paused = false;
+  /** The credential was refused `authFailLimit` times in a row (see {@link ConnectorTiming.authFailLimit}). */
+  private authFailed = false;
+  private authFailures = 0;
+  private authFirstAt = 0;
+  private authWhy = "";
+  /** The last event on the command stream, to tell why the server ended it (`superseded`, `token_expired`, a release). */
+  private lastFrame = "";
   private wakeSender: (() => void) | null = null;
   private wakeHeartbeat: (() => void) | null = null;
   private streamCtl: AbortController | null = null;
@@ -298,6 +319,23 @@ export class Connector {
     await this.manager.killAll("revoked");
   }
 
+  /** One more refusal of the credential; the run ends once `authFailLimit` come in a row. Returns whether it ended. */
+  private async authRefused(e: unknown): Promise<boolean> {
+    if (this.authFailures++ === 0) this.authFirstAt = Date.now();
+    if (this.authFailed) return true;
+    if (this.authFailures < this.timing.authFailLimit || Date.now() - this.authFirstAt < this.timing.authFailWindowMs) return false;
+    this.authFailed = true;
+    this.authWhy = errMessage(e);
+    this.d.log.error("Claw keeps refusing this sign-in: stopping every agent; run login again", { why: this.authWhy, refusals: this.authFailures });
+    this.d.audit.record("auth_failed", { why: this.authWhy });
+    this.ctl.abort();
+    this.streamCtl?.abort();
+    await this.manager.killAll("stopped");
+    return true;
+  }
+
+  get authFailure(): string { return this.authWhy; }
+
   private isRevocation(e: unknown): boolean {
     return e instanceof RevokedError || e instanceof GrantRevokedError;
   }
@@ -371,15 +409,18 @@ export class Connector {
       if (this.paused) continue;
       try {
         await this.heartbeat();
+        this.authFailures = 0;
         this.writeIdentity();
       } catch (e) {
         if (this.isRevocation(e)) return void (await this.onRevoked(e));
+        if (isAuthRefusal(e) && await this.authRefused(e)) return;
         this.d.log.warn("heartbeat failed", { error: errMessage(e) });
       }
     }
   }
 
   private onFrame(f: SseFrame, reconnect: boolean): void {
+    if (f.event) this.lastFrame = f.event;
     switch (f.event) {
       case "ready":
         // A card that was waiting when the connection dropped is shown again.
@@ -424,14 +465,24 @@ export class Connector {
       try {
         const sig = AbortSignal.any([this.ctl.signal, this.streamCtl.signal]);
         let got = false;
+        this.lastFrame = "";
         for await (const f of this.d.client.commands(this.cid, { lastEventId: this.ledger.highestSeen || undefined, signal: sig, watchdogMs: this.timing.watchdogMs })) {
-          if (!got) { got = true; attempt = 0; }
+          if (!got) { got = true; attempt = 0; this.authFailures = 0; }
           this.onFrame(f, reconnect);
           if (f.event === "ready") reconnect = true;
+        }
+        // The server ended the stream on purpose: a Claw release or restart, another run of this connector
+        // (`superseded`), or an access token that ran out (`token_expired`). Said once, so a log shows why.
+        if (!this.ctl.signal.aborted && !this.paused) {
+          const why = this.lastFrame === "superseded" || this.lastFrame === "token_expired" ? this.lastFrame : "the server closed the stream (a Claw release or restart)";
+          this.d.log.info("command stream ended by the server; reconnecting", { why });
+          recordDisconnect(this.d.dirs, { reason: "server_closed", detail: why });
         }
       } catch (e) {
         if (this.isRevocation(e)) return void (await this.onRevoked(e));
         if (this.ctl.signal.aborted) break;
+        if (isAuthRefusal(e) && await this.authRefused(e)) return;
+        recordDisconnect(this.d.dirs, { reason: "stream_lost", detail: errMessage(e) });
         if (e instanceof HttpError && e.status === 404) {
           // The stored id is not this account's (or was removed): register again.
           try { await this.identify(true); await this.firstHeartbeat(); } catch (again) {
@@ -458,21 +509,38 @@ export class Connector {
       this.emit(p.session_id, "permission_resolved", { actionId: p.action_id, optionId: null, outcome: "cancelled", by: "connector_restart" });
     }
     const pidf = pidFile(this.d.dirs);
+    // A pid file left behind means the previous run never reached its own clean-up: it was killed (SIGKILL, OOM),
+    // crashed, or the machine went down under it. Its last heartbeat is when connector.json was last written.
+    let leftover = false;
+    try { fs.readFileSync(pidf); leftover = true; } catch { /* none: the previous run cleaned up, or there was none */ }
+    if (leftover) {
+      let last: string | undefined;
+      try { last = fs.statSync(identityFile(this.d.dirs)).mtime.toISOString(); } catch { /* never registered */ }
+      recordDisconnect(this.d.dirs, { reason: "process_died", detail: `the previous run ended without shutting down (killed, crashed, or the machine restarted)${last ? `; last heartbeat ${last}` : ""}`, ...(last ? { at: last } : {}) });
+    }
     fs.writeFileSync(pidf, JSON.stringify({ pid: process.pid, start: processStart(process.pid) ?? "" }), { mode: 0o600 });
     this.paused = fs.existsSync(pauseFile(this.d.dirs));
+    let result: RunResult = "stopped";
+    let failure = "";
     try {
       const up = await this.startup();
-      if (up !== "ok") return up;
+      if (up !== "ok") return (result = up);
       this.d.audit.record("connector_online", {
         connector_id: this.cid, agents: this.d.config.agents.map((a) => a.id), paused: this.paused,
         unattended_agents: this.d.config.agents.filter((a) => a.unattended).map((a) => a.id),
       });
       await Promise.all([this.sender(), this.heartbeater(), this.streamLoop(), this.pauseWatcher()]);
+      result = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : "stopped";
+    } catch (e) {
+      failure = errMessage(e);
+      throw e;
     } finally {
       await this.manager.killAll(this.revoked ? "revoked" : "stopped").catch(() => undefined);
+      const reason = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : failure ? "failed" : this.paused ? "stopped_while_paused" : result;
+      recordDisconnect(this.d.dirs, { reason, detail: this.authWhy || failure || undefined });
       fs.rmSync(pidf, { force: true });
     }
-    return this.revoked ? "revoked" : "stopped";
+    return result;
   }
 
   /** For tests: wait until every event is acknowledged. */
