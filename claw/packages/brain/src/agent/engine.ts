@@ -9,6 +9,7 @@ import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
 import { filterToolSchemas, forgetEarlierReads, parseReadTaint, parseToolAllowlist, readTaintSources } from "../tools/allowlist.js";
 import { parseCite } from "../tools/citations.js";
+import { parseLogReads } from "../tools/log-reads.js";
 import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
@@ -466,6 +467,7 @@ export class AgentEngine {
       router.readTaint = parseReadTaint(request.read_taint);
       // `cite`: the sources this run's lookups return, kept for the tools that cite them (`tools/citations.ts`).
       router.citations = parseCite(request.cite, mergedMcp);
+      router.logReads = parseLogReads(request.log_reads);
       const allToolSchemas = filterToolSchemas([...router.getToolSchemas(), ...mcpResult.schemas], toolAllowlist);
 
       // Under a read taint, what earlier runs read with its sources is not replayed: this run may act until it reads.

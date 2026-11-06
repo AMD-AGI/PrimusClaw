@@ -43,9 +43,6 @@ const W: ToolHints = { readOnlyHint: false };
 const WD: ToolHints = { readOnlyHint: false, destructiveHint: true };
 const U: ToolHints = {};
 
-/** Reads whose text is a log: it can carry a credential a job printed, and a router turn has no filter for that. */
-const LOG = "log text, which can carry a credential a job printed; a worker reads it";
-
 export const TOOL_CATALOG: ToolCatalog = {
   // SaFE: annotates its reads only, so every write is decided below.
   safe: {
@@ -80,11 +77,7 @@ export const TOOL_CATALOG: ToolCatalog = {
       apikey_current: "the user's own API keys: a router has no use for them",
       apikey_list: "the user's own API keys: a router has no use for them",
       secret_list: "the user's secrets, by name: nothing a chat answer needs",
-      cluster_logs: LOG, node_pod_logs: LOG, node_reboot_logs: LOG, workload_logs: LOG, workload_pod_logs: LOG,
       node_export: "an export of the node list in bulk: node_list answers the questions a chat asks",
-      workload_events: "a failure diagnosis, which reads events and logs together: a worker's",
-      workload_pod_containers: "a failure diagnosis, which reads events and logs together: a worker's",
-      flavor_avail: "a capacity search across clusters, slower than a router turn's budget: a worker's",
     },
   },
   // Autopilot's admin MCP: get_* read; preview_* answer what an apply would do; apply_* change the fleet.
@@ -145,8 +138,6 @@ export const TOOL_CATALOG: ToolCatalog = {
     reviewed: {},
     notForRouter: {
       attachment_read: "an attachment is a file: a worker reads it",
-      milestone_read: "not one of the board questions a chat asks yet; add it here with a router case",
-      notification_read: "not one of the board questions a chat asks yet; add it here with a router case",
     },
   },
   // The API's own scheduled-task tools (`triggers/mcp.ts`, server `schedules`), listed by the tests from the server itself.
@@ -154,7 +145,8 @@ export const TOOL_CATALOG: ToolCatalog = {
     listedAt: "2026-11-06",
     tools: { trigger_cancel: U, trigger_create: U, trigger_list: U },
     reviewed: { trigger_cancel: "write", trigger_create: "write", trigger_list: "read" },
-    notForRouter: { trigger_list: "the API adds this server to worker turns only" },
+    // A router turn reads trigger_list only through its own `schedules` entry (`ROUTER_TRIGGER_READ_TOOLS` of the API), never as a plugin server.
+    notForRouter: { trigger_list: "not a plugin server: a router turn is given it by the API itself, where it minted the bearer" },
   },
 };
 

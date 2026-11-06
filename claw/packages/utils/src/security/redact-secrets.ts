@@ -492,6 +492,40 @@ export function redactSecrets(text: string, extraSecrets: string[] = []): Redact
 }
 
 /**
+ * A value written after a credential's name in a log line: `PASSWORD=...`, `"api_key": "..."`, `Authorization: Basic ...`, also
+ * inside a JSON string (`\\"token\\": \\"...\\"`). The name starts where a name can (not inside another one; after a JSON
+ * string's `\\n`, `\\r` or `\\t`) and is judged by `isSensitiveKey`; the value is one run without spaces, quotes, backslashes,
+ * separators or brackets, after an optional scheme word.
+ */
+const NAMED_VALUE_RE = /(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrt]))(\\?["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1(\s*[:=]\s*)(\\?["']?)((?:(?:Basic|Bearer|Token)\s+)?[^\s"'\\,;{}()[\]<>]{4,})/g;
+/** Values a credential's name is followed by that are not a credential: a switch, a placeholder, a mask. */
+const NOT_A_VALUE_RE = /^(?:true|false|null|none|nil|undefined|enabled|disabled|yes|no|on|off|required|optional|\*+|x+|\.+)$/i;
+/** A private key, armored. Its lines may be real line ends or a JSON string's `\n`. */
+const PRIVATE_KEY_BLOCK_RE = /-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY-----[\s\S]*?-----END \1PRIVATE KEY-----/g;
+
+/**
+ * `redactSecrets`, and then what a log carries that a transcript pass does not mask: a value written after a credential's name
+ * (`DB_PASSWORD=...`, `"api_key": "..."`), and an armored private key. For text a log read returned, before a model sees it (an
+ * assistant's router reads logs with `ExecuteRequest.log_reads`): a job prints its environment and its configuration, and names
+ * are the one thing such a value carries. Not for transcripts: there `token = getToken()` and `password: required` are code and
+ * prose, and the name pass is the one `redactSecrets` keeps out of free text on purpose.
+ */
+export function redactLogSecrets(text: string, extraSecrets: string[] = []): RedactResult {
+  const first = redactSecrets(text, extraSecrets);
+  let hits = first.hits;
+  let out = first.text.replace(PRIVATE_KEY_BLOCK_RE, () => {
+    hits += 1;
+    return "<redacted private key>";
+  });
+  out = out.replace(NAMED_VALUE_RE, (whole, q1: string, name: string, sep: string, q2: string, value: string) => {
+    if (NOT_A_VALUE_RE.test(value) || !isSensitiveKey(name)) return whole;
+    hits += 1;
+    return `${q1}${name}${q1}${sep}${q2}<redacted>`;
+  });
+  return { text: out, hits };
+}
+
+/**
  * Redact `text`, then truncate it to `max` characters for logging.
  *
  * The order is the point. Truncating first can cut a secret in half, leaving a
