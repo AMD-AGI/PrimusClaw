@@ -9,28 +9,24 @@
  * `GET /api/v1/workloads/{id}` to every caller allowed to read that workload,
  * not only its owner, and it is kept for finished workloads too. A sandbox's
  * composed environment holds the owner's platform key (as ANTHROPIC_API_KEY,
- * OPENAI_API_KEY and SAFE_API_KEY), the per-sandbox Hands token, and the
- * owner's stored variables; written there, each of them was one GET away from
- * other users of the workspace.
+ * OPENAI_API_KEY and SAFE_API_KEY), the per-sandbox Hands token, the
+ * deployment's system env, the sandbox spec's env and the owner's stored
+ * variables; written there, each of them was one GET away from other users of
+ * the workspace.
+ *
+ * So the workload carries an allow list, not a filtered copy: a deny list only
+ * knows the credentials someone thought to name, and any layer can hold one
+ * under a name nobody would guess. What is allowed is what Brain itself sets
+ * and needs to be readable from outside the sandbox: the session id SaFE
+ * lookups match on, and the plain plumbing Hands is started with.
  *
  * The full environment still reaches Hands, and through it every command the
  * model runs: bootstrap hands it over as a private file over the execute
  * channel (sandbox/bootstrap.ts writeEnvFileCmd), which is authenticated as the
- * owner and per sandbox. The workload keeps only what is not a credential, so
- * that what the container itself starts with (image entrypoints, an operator's
- * shell) still sees the ordinary configuration.
- *
- * A credential is recognised three ways, any of which removes the variable:
- *   - it is one the platform sets (PLATFORM_CREDENTIAL_ENV);
- *   - the caller said where it came from (`withhold`): the owner's stored
- *     variables and the request's session env are the user's own and are
- *     treated as secret whatever they are called;
- *   - its name or its value looks like one (isCredentialEnvName,
- *     hasCredentialInValue), which covers the deployment's system env and the
- *     sandbox spec's own env.
+ * owner and per sandbox.
  */
 
-/** Variables the platform itself fills with a credential. */
+/** Platform variables that carry a credential. Never in a workload. */
 export const PLATFORM_CREDENTIAL_ENV: ReadonlySet<string> = new Set([
   "AUTH_CLAW_TOKEN",
   "AUTH_INTERNAL_TOKEN",
@@ -40,47 +36,33 @@ export const PLATFORM_CREDENTIAL_ENV: ReadonlySet<string> = new Set([
   "SAFE_API_KEY",
 ]);
 
-/** Name fragments that mark a credential anywhere in the name. */
-const CREDENTIAL_FRAGMENTS = [
-  "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "CREDENTIAL",
-  "PRIVATE", "COOKIE", "APIKEY", "API_KEY", "ACCESS_KEY", "SIGNING",
-];
-
-/** Name segments that mark a credential when they stand alone between underscores. */
-const CREDENTIAL_SEGMENT = /(^|_)(KEY|KEYS|PAT|DSN|AUTH|PWD|PASS)(_|$)/;
-
-/** Whether a variable's name says it holds a credential. */
-export function isCredentialEnvName(name: string): boolean {
-  const upper = name.toUpperCase();
-  return CREDENTIAL_FRAGMENTS.some((f) => upper.includes(f)) || CREDENTIAL_SEGMENT.test(upper);
-}
-
-/** A URL carrying a password in its userinfo (`scheme://user:pass@host`). */
-const URL_WITH_PASSWORD = /[a-z][a-z0-9+.-]*:\/\/[^/\s:@]*:[^/\s@]+@/i;
-
-/** Whether a variable's value carries a credential whatever it is called. */
-export function hasCredentialInValue(value: string): boolean {
-  return URL_WITH_PASSWORD.test(value);
-}
+/**
+ * The only variables a Hands sandbox's workload carries. `CLAW_SESSION_ID` is
+ * the discovery index (SaFE's list endpoint filters on `envKey`, see
+ * multi-node/safe-provider.ts findSessionWorkloads); the rest are plain
+ * settings Brain sets for Hands.
+ */
+export const HANDS_WORKLOAD_ENV_NAMES: ReadonlySet<string> = new Set([
+  "CLAW_SESSION_ID",
+  "MCP_PORT",
+  "WORKSPACE_PATH",
+  "SAFE_API_URL",
+]);
 
 /**
- * The environment to write into the SaFE workload: `env` without anything that
- * is, or may be, a credential.
+ * The environment to write into the SaFE workload: only the allowed names of
+ * `env`, and never a platform credential even if one were allowed by mistake.
  *
  * @param env The composed sandbox environment; not modified.
- * @param withhold Names whose source makes them secret regardless of name.
+ * @param allowed The names the workload may carry.
  */
 export function workloadSpecEnv(
   env: Record<string, string>,
-  withhold: Iterable<string> = [],
+  allowed: ReadonlySet<string> = HANDS_WORKLOAD_ENV_NAMES,
 ): Record<string, string> {
-  const secret = new Set(withhold);
   const out: Record<string, string> = {};
   for (const [name, value] of Object.entries(env)) {
-    if (PLATFORM_CREDENTIAL_ENV.has(name)) continue;
-    if (secret.has(name)) continue;
-    if (isCredentialEnvName(name)) continue;
-    if (typeof value === "string" && hasCredentialInValue(value)) continue;
+    if (!allowed.has(name) || PLATFORM_CREDENTIAL_ENV.has(name)) continue;
     out[name] = value;
   }
   return out;

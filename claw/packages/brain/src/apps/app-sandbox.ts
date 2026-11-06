@@ -39,7 +39,7 @@ import { ACTIVE_PHASES, TERMINAL_PHASES } from "../sandbox/workload-wait.js";
 import { pollWorkloadUntilRunning, SHUTDOWN_BUFFER_SECONDS } from "../sandbox/safe-workload-provider.js";
 import type { SandboxInstance } from "../sandbox/provider.js";
 import { applyModelKeyEnv } from "../sandbox/params.js";
-import { PLATFORM_CREDENTIAL_ENV, workloadSpecEnv } from "../sandbox/workload-env.js";
+import { PLATFORM_CREDENTIAL_ENV } from "../sandbox/workload-env.js";
 import { SandboxProvisionTerminalError, provisionTerminalOf } from "../sandbox/errors.js";
 
 const logger = pino({ name: "app-sandbox" });
@@ -184,35 +184,31 @@ function appSpecEnv(spec: Pick<SandboxSpecCreate, "env"> | null | undefined): Re
 }
 
 /**
- * The env the sandbox is created with: the spec's plain settings and the run's
- * identity.
+ * The env the sandbox is created with: the run's identity, which is how a run
+ * finds its sandbox again (SaFE's list endpoint filters on `envKey`), and
+ * nothing else.
  *
- * No credential: everything here is stored by SaFE in the workload and returned
- * to every caller allowed to read it. So the model credential is not set here,
- * a platform credential a spec supplies (`SAFE_API_KEY`, ...) is dropped, and the
- * spec's own credentials (workloadSpecEnv) travel with the application's start
- * command instead (appStartEnv).
+ * Everything here is stored by SaFE in the workload and returned to every
+ * caller allowed to read it, and the spec's env can hold a credential under any
+ * name. So the spec's env and the model credential travel with the
+ * application's start command instead (appStartEnv); a platform credential a
+ * spec supplies (`SAFE_API_KEY`, ...) is dropped there too.
  */
-export function appSandboxEnv(run: Pick<AppSandboxRun, "runId" | "sandboxSpec">): Record<string, string> {
-  return { ...workloadSpecEnv(appSpecEnv(run.sandboxSpec)), [APP_RUN_ID_ENV]: run.runId };
+export function appSandboxEnv(run: Pick<AppSandboxRun, "runId">): Record<string, string> {
+  return { [APP_RUN_ID_ENV]: run.runId };
 }
 
 /**
- * The execute env of the application's start command: the spec's credentials
- * the workload left out, then the application's own env (as the start
- * command's env always overlaid the pod's), then the model credential, which is
- * platform-owned and so laid last.
+ * The execute env of the application's start command: the spec's env, then the
+ * application's own env (as the start command's env always overlaid the
+ * pod's), then the model credential, which is platform-owned and so laid last.
  */
 export function appStartEnv(
   spec: Pick<SandboxSpecCreate, "env"> | null | undefined,
   appEnv: Record<string, string>,
   platformKey: string | undefined,
 ): Record<string, string> {
-  const specEnv = appSpecEnv(spec);
-  const inWorkload = workloadSpecEnv(specEnv);
-  const specCredentials: Record<string, string> = {};
-  for (const [name, value] of Object.entries(specEnv)) if (!(name in inWorkload)) specCredentials[name] = value;
-  return { ...specCredentials, ...appEnv, ...appModelKeyEnv(platformKey) };
+  return { ...appSpecEnv(spec), ...appEnv, ...appModelKeyEnv(platformKey) };
 }
 
 /**

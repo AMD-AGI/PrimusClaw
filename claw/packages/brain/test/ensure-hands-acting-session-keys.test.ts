@@ -48,6 +48,9 @@ before(() => seedSystemEnv(SYSTEM));
 const BRAIN_ONLY = ["AUTH_CLAW_TOKEN", "CLAW_SESSION_ID", "MCP_PORT", "SAFE_API_URL", "WORKSPACE_PATH"];
 
 const PLATFORM_KEY = "ak-owner-platform-key-0001";
+
+/** All that any sandbox's SaFE workload env holds: the session id SaFE lookups match on and Hands' plain plumbing. */
+const WORKLOAD_ONLY = ["CLAW_SESSION_ID", "MCP_PORT", "SAFE_API_URL", "WORKSPACE_PATH"];
 const KEY_NAMES = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SAFE_API_KEY"];
 
 let restores: Array<() => void> = [];
@@ -119,6 +122,7 @@ test("an ordinary session's sandbox is given the owner's platform key (SAFE_API_
   for (const name of [...KEY_NAMES, "AUTH_CLAW_TOKEN"]) assert.equal(name in r.created.env, false, `${name} is not in the workload's env`);
   for (const [name, value] of Object.entries(r.created.env)) assert.ok(!value.includes(PLATFORM_KEY), `${name} carries the key`);
   assert.equal(r.created.env.CLAW_SESSION_ID, "sess-acting", "the session correlation SaFE lookups match on is still there");
+  assert.deepEqual(Object.keys(r.created.env).sort(), WORKLOAD_ONLY);
 });
 
 test("a session that acts as a user gets a sandbox with none of them, in what the provider creates or in the environment file Hands applies, and the workload is still owned with the key", async () => {
@@ -162,9 +166,8 @@ test("no layer can put a key back: the spec's env and the request's env have the
     assert.deepEqual([env.ANTHROPIC_API_KEY, env.OPENAI_API_KEY], ["planted-in-session", "planted-in-session"]);
   }
   for (const env of handsEnvOnly(ordinary)) assert.deepEqual([env.SPEC_KEPT, env.USER_KEPT, env.SESSION_KEPT], ["1", "1", "1"], "control: every layer reaches it");
-  assert.equal("ANTHROPIC_API_KEY" in ordinary.created.env, false, "no layer's key reaches the workload");
-  assert.deepEqual([ordinary.created.env.SPEC_KEPT, ordinary.created.env.USER_KEPT, ordinary.created.env.SESSION_KEPT], ["1", undefined, undefined],
-    "the workload keeps the spec's plain settings; the owner's and the request's variables are theirs and stay out whatever they are called");
+  assert.deepEqual(Object.keys(ordinary.created.env).sort(), WORKLOAD_ONLY,
+    "no layer reaches the workload: any of them can hold a credential under any name");
   const marked = await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true });
   for (const env of everyEnv(marked)) {
     for (const name of KEY_NAMES) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
@@ -269,10 +272,7 @@ test("the deployment's system env is in an ordinary sandbox and in none of a mar
   for (const env of handsEnvOnly(ordinary)) {
     for (const [name, value] of Object.entries(SYSTEM)) assert.equal(env[name], value, `control: ${name} reaches an ordinary sandbox`);
   }
-  for (const name of ["GBRAIN_TOKEN", "LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "GH_TOKEN"]) {
-    assert.equal(name in ordinary.created.env, false, `${name} is a credential and stays out of the workload`);
-  }
-  assert.equal(ordinary.created.env.SYSTEM_PLAIN_SETTING, SYSTEM.SYSTEM_PLAIN_SETTING, "plain configuration is still in the workload");
+  assert.deepEqual(Object.keys(ordinary.created.env).sort(), WORKLOAD_ONLY, "none of the system env is in the workload");
   for (const env of everyEnv(await sandboxEnvOf({ withhold_sandbox_keys: true }))) {
     for (const name of Object.keys(SYSTEM)) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
     for (const [name, value] of Object.entries(env)) {

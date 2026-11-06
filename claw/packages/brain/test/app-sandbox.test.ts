@@ -119,7 +119,7 @@ test("an app sandbox carries the session, component and run labels, via the shar
   assert.equal(p.timeoutSec, 600);
   assert.equal(p.namespace, "ws-1");
   assert.equal(p.platformKey, "pk");
-  assert.equal(p.env.FROM_SPEC, "1");
+  assert.equal(p.env.FROM_SPEC, undefined, "the spec's env travels with the start command, not in the workload");
   assert.equal(p.env.CLAW_APP_RUN_ID, "run-1");
   // Session teardown deletes what it finds by this env: an app sandbox must not carry it.
   assert.equal(p.env.CLAW_SESSION_ID, undefined);
@@ -265,7 +265,9 @@ test("a manifest cannot put the session env on an app sandbox: session teardown 
   const r = run();
   await ensureAppSandbox({ ...r, sandboxSpec: { ...r.sandboxSpec, env: { CLAW_SESSION_ID: "sess-1", KEEP: "1" } } }, { fetch: safe.fetch, recordWorkloadId: async () => {} });
   assert.equal(safe.created[0]!.env.CLAW_SESSION_ID, undefined);
-  assert.equal(safe.created[0]!.env.KEEP, "1");
+  const start = appStartEnv({ env: { CLAW_SESSION_ID: "sess-1", KEEP: "1" } }, {}, undefined);
+  assert.equal(start.CLAW_SESSION_ID, undefined, "nor from the start command: only buildAppEnv sets it, to the run's own session");
+  assert.equal(start.KEEP, "1");
 });
 
 test("a created instance and an adopted one are the same handle: no Hands URL either way", async () => {
@@ -445,16 +447,12 @@ test("the node name comes from the workload detail, and is null when there is no
 
 // ── model credentials: the keys a Hands sandbox gets ─────────────
 
-test("an app sandbox's workload carries no credential: no model variables and no SAFE_API_KEY", async () => {
-  // SaFE stores a workload's env and returns it to every caller allowed to read
-  // the workload; the owner's key must not be there.
+test("an app sandbox's workload carries only the run id: no model variables, no SAFE_API_KEY, none of the spec's env", async () => {
+  // SaFE stores a workload's env and returns it to every caller allowed to read the workload; the spec's env can hold a credential
+  // under any name.
   const safe = fakeSafe();
   await ensureAppSandbox(run({ platformKey: "ak-owner" }), { fetch: safe.fetch, recordWorkloadId: async () => {} });
-  const env = safe.created[0]!.env;
-  for (const k of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SAFE_API_KEY"]) assert.ok(!(k in env), k);
-  assert.ok(!JSON.stringify(env).includes("ak-owner"), "the key appears nowhere in the workload's env");
-  assert.equal(env.FROM_SPEC, "1");
-  assert.equal(env.CLAW_APP_RUN_ID, "run-1");
+  assert.deepEqual(safe.created[0]!.env, { CLAW_APP_RUN_ID: "run-1" });
 });
 
 test("the start command gets the two model variables Hands gets, and no SAFE_API_KEY", () => {
@@ -466,31 +464,18 @@ test("the start command gets the two model variables Hands gets, and no SAFE_API
   assert.deepEqual(appModelKeyEnv(undefined), {});
 });
 
-test("a spec's own credentials stay out of the workload and reach the start command; its plain settings stay in the workload", async () => {
+test("the spec's env reaches the start command under the app's own env, with the model key last; a spec cannot plant a platform credential", async () => {
   const safe = fakeSafe();
   const r = run({ platformKey: "ak-owner" });
-  r.sandboxSpec = { ...r.sandboxSpec, env: { API_TOKEN: "spec-secret", DB_URL: "postgres://u:spec-pw@db/x", PLAIN: "1" } };
+  r.sandboxSpec = { ...r.sandboxSpec, env: { SERVICE_CONFIG: "spec-secret", PLAIN: "1", ANTHROPIC_API_KEY: "spec-key", SAFE_API_KEY: "planted" } };
   await ensureAppSandbox(r, { fetch: safe.fetch, recordWorkloadId: async () => {} });
-  const env = safe.created[0]!.env;
-  assert.ok(!("API_TOKEN" in env) && !("DB_URL" in env), "no credential of the spec's in the workload");
-  assert.equal(env.PLAIN, "1");
-  const start = appStartEnv(r.sandboxSpec, { APP_SETTING: "a", PLAIN: "from-app" }, "ak-owner");
+  assert.deepEqual(safe.created[0]!.env, { CLAW_APP_RUN_ID: "run-1" }, "none of it in the workload");
+  const start = appStartEnv(r.sandboxSpec, { APP_SETTING: "a", PLAIN: "from-app", ANTHROPIC_API_KEY: "app-key" }, "ak-owner");
   assert.deepEqual(start, {
-    API_TOKEN: "spec-secret", DB_URL: "postgres://u:spec-pw@db/x", APP_SETTING: "a", PLAIN: "from-app",
+    SERVICE_CONFIG: "spec-secret", PLAIN: "from-app", APP_SETTING: "a",
     ANTHROPIC_API_KEY: "ak-owner", OPENAI_API_KEY: "ak-owner",
   });
-  const planted = appStartEnv({ env: { ANTHROPIC_API_KEY: "spec-key", SAFE_API_KEY: "planted" } }, { ANTHROPIC_API_KEY: "app-key" }, "ak-owner");
-  assert.equal(planted.ANTHROPIC_API_KEY, "ak-owner", "the platform's key is laid last");
-  assert.ok(!("SAFE_API_KEY" in planted), "a spec cannot plant SAFE_API_KEY");
-});
-
-test("a spec can supply neither a model key nor SAFE_API_KEY to the workload", async () => {
-  const safe = fakeSafe();
-  const r = run({ platformKey: "ak-owner" });
-  r.sandboxSpec = { ...r.sandboxSpec, env: { ANTHROPIC_API_KEY: "spec-key", SAFE_API_KEY: "planted" } };
-  await ensureAppSandbox(r, { fetch: safe.fetch, recordWorkloadId: async () => {} });
-  assert.ok(!("ANTHROPIC_API_KEY" in safe.created[0]!.env));
-  assert.ok(!("SAFE_API_KEY" in safe.created[0]!.env));
+  assert.ok(!("SAFE_API_KEY" in start), "a spec cannot plant SAFE_API_KEY");
 });
 
 test("the gateway URLs are the image's or the manifest's: Brain injects none, and a spec's pass through", async () => {
@@ -502,7 +487,8 @@ test("the gateway URLs are the image's or the manifest's: Brain injects none, an
   r.sandboxSpec = { ...r.sandboxSpec, env: { OPENAI_BASE_URL: "https://own.example/v1" } };
   const safe2 = fakeSafe();
   await ensureAppSandbox(r, { fetch: safe2.fetch, recordWorkloadId: async () => {} });
-  assert.equal(safe2.created[0]!.env.OPENAI_BASE_URL, "https://own.example/v1");
+  assert.equal(appStartEnv(r.sandboxSpec, {}, "ak-owner").OPENAI_BASE_URL, "https://own.example/v1",
+    "it passes through with the start command, as the rest of the spec's env does");
 });
 
 test("the model key is in the run's scrub set", () => {
