@@ -218,13 +218,14 @@ export class World {
     const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
     const dir = STATE_DIR;
 
-    if (command.includes("USER_DATA_PATH") && command.includes("printf %s")) {
-      return this.stateDirExit === null ? ok(dir) : { exitCode: this.stateDirExit, stdout: "", stderr: "" };
-    }
+    // Before the expansion's shape: a file write also reads USER_DATA_PATH, to choose the mode.
     if (command.includes("base64 -d")) {
       const path = /> '([^']+)'\.tmp/.exec(command)![1]!;
       this.files.set(path, Buffer.from(opts!.env!.CLAW_FILE_B64!, "base64").toString("utf8"));
       return ok();
+    }
+    if (command.includes("USER_DATA_PATH") && command.includes("printf %s")) {
+      return this.stateDirExit === null ? ok(dir) : { exitCode: this.stateDirExit, stdout: "", stderr: "" };
     }
     if (command.includes("kill -KILL")) {
       const want = /= '([^']*)'/.exec(command)![1]!;
