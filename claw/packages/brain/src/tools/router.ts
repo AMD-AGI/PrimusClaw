@@ -10,6 +10,7 @@ import { callBackendMcpTool } from "../clients/backend-mcp.js";
 import type { McpToolCaller } from "../clients/mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
+import type { RunCitations } from "./citations.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import { MEMORY_TOOLS, MEMORY_TOOL_SCHEMAS, callMemoryTool } from "./memory-tools.js";
 import {
@@ -95,6 +96,11 @@ export type RouteOutcome = {
   images?: ToolImage[];
   /** A `deliver_file` that copied its file: what the terminal event tells the client. */
   delivery?: Delivery;
+  /**
+   * The sources the call returned, as its own code produced them (Brain's web tools, an MCP result's `_meta["claw/sources"]`):
+   * what `ExecuteRequest.cite` keeps, when it believes the tool (`RunCitations.producedBy`). Never read from the result's text.
+   */
+  sources?: unknown[];
 };
 
 /**
@@ -215,6 +221,8 @@ export class ToolRouter {
   private toolAllowlist: ToolAllowlist | null = null;
   /** The run's `read_taint` (`allowlist.ts`): set by the engine, null when the request has none. */
   readTaint: ReadTaint | null = null;
+  /** The run's `cite` (`citations.ts`): set by the engine on the top-level router, null when the request has none. */
+  citations: RunCitations | null = null;
 
   /**
    * Whom `a2a_call` acts for and how long the run has: the session's owner (an identity
@@ -416,36 +424,41 @@ export class ToolRouter {
       return refuse(outcome, toolNotAllowedMessage(name));
     }
     const taint = this.readTaint;
-    if (!taint) return this.routeAllowed(name, input, signal, outcome, ctx);
-    const tainted = taint.refusal(name);
+    const cite = this.citations;
+    if (!taint && !cite) return this.routeAllowed(name, input, signal, outcome, ctx);
+    const tainted = taint?.refusal(name);
     if (tainted) return refuse(outcome, tainted);
-    // Whether the call failed can decide whether it read anything (`ReadTaint.ran`), so the bit is read here even when the caller
-    // passed no outcome. A call that threw failed.
+    // Whether the call failed can decide whether it read anything (`ReadTaint.ran`) and whether its sources are kept, so the bit
+    // is read here even when the caller passed no outcome. A call that threw failed.
     const answered: RouteOutcome = outcome ?? { isError: false };
+    // A citing call's sources, as the run's lookups returned them; sent where the model's arguments cannot reach.
+    const meta = cite?.metaFor(name, input);
     let failed = true;
     try {
-      const text = await this.routeAllowed(name, input, signal, answered, ctx);
+      const text = await this.routeAllowed(name, input, signal, answered, ctx, meta);
       failed = answered.isError;
+      if (!failed) cite?.keep(name, answered.sources);
       return text;
     } catch (err) {
       // A thrown message is not the source's own fixed words: it is whatever the transport or the server put in it (an HTTP
       // body, a JSON-RPC error's message). A failure that leaves the turn unmarked must hold nothing anyone else wrote, so the
       // model is told only that the call failed; the message goes to the log. An abort is the run ending, and is left as it is.
-      if (!taint.failsClean(name) || signal?.aborted) throw err;
+      if (!taint?.failsClean(name) || signal?.aborted) throw err;
       logger.warn({ tool: name, err: err instanceof Error ? err.message : String(err) }, "read_taint.clean_failure_threw");
       throw new Error(`${name} failed before it answered (what went wrong is not shown in this conversation)`);
     } finally {
-      taint.ran(name, failed);
+      taint?.ran(name, failed);
     }
   }
 
-  /** `route()` for a call the allow-list and the read taint let through. */
+  /** `route()` for a call the allow-list and the read taint let through. `meta`: an MCP call's request `_meta` (`citations.ts`). */
   private async routeAllowed(
     name: string,
     input: Record<string, unknown>,
     signal?: AbortSignal,
     outcome?: RouteOutcome,
     ctx?: { stepIdentity?: string },
+    meta?: Record<string, unknown>,
   ): Promise<string> {
     if (LOOP_INTERCEPTED_TOOLS.has(name)) {
       throw new Error(`${name} must be handled by engine loop, not router`);
@@ -616,7 +629,7 @@ export class ToolRouter {
       const [, server, ...rest] = name.split("__");
       const client = this.platformMcp.get(server);
       if (!client) throw new Error(`Unknown MCP server: ${server}`);
-      return client.callTool(rest.join("__"), input, outcome);
+      return client.callTool(rest.join("__"), input, outcome, meta);
     }
 
     throw new Error(`Unknown tool: ${name}`);

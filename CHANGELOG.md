@@ -28,6 +28,15 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Citations for the assistant router's answers, behind `CLAW_ASSISTANT_CITATIONS` (default off). The router writes [1], [2] in its
+  `say` and names each number's address in `say`'s new `sources` argument; the new `ExecuteRequest.cite` makes Brain keep the sources
+  the turn's own lookups returned (`web_search` hits, a page `web_fetch` read whole, and what the API's GitHub server lists in its
+  results' `_meta["claw/sources"]`: pull requests, issues, repositories, files, and checks on GitHub's own pages) and send `say` only
+  the entries that match, in the MCP request's `_meta`, where the model cannot write; an address no lookup returned is dropped and
+  counted. The API checks them again (numbers cited in the text, http(s) addresses without credentials or anything redaction would
+  mask, titles cut to one plain line of 80 code points with markup, addresses and hidden characters removed) and the
+  `assistant.say` payload and `AssistantSay` event carry them as `sources: [{ n, url, title, kind }]`. The text is never changed,
+  so a streamed say stays a prefix of the message. New counter `claw_assistant_say_sources_total{outcome}`.
 - Quicker assistant router turns. A router turn can ask for low reasoning effort (`CLAW_ASSISTANT_ROUTER_EFFORT`: low | medium |
   high | `default`, the default, for the model's own; set `low` where the router runs on a reasoning model such as Claude; a session
   that chose an effort keeps it), and its `say` is published while the model writes it (`CLAW_ASSISTANT_STREAM_SAY`, default on): the

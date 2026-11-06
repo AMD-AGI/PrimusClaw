@@ -7,6 +7,7 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ToolSchema } from "@claw/protocol";
 import { isIP } from "node:net";
+import { CITE_SOURCES_META } from "@claw/protocol";
 import { redactSecrets } from "@claw/utils";
 import pino from "pino";
 import { Agent, fetch as undiciFetch } from "undici";
@@ -98,14 +99,20 @@ function resourceToolSchemas(server: string): Array<{ name: string; description:
   ];
 }
 
-/** Filled by a call with what the server answered beside its text: whether the result was the tool's own error. */
-export type McpCallOutcome = { isError: boolean };
+/**
+ * Filled by a call with what the server answered beside its text: whether the result was the tool's own error, and the sources it
+ * listed under its result's `_meta["claw/sources"]` (kept only for a server the run trusts for them: `tools/citations.ts`).
+ */
+export type McpCallOutcome = { isError: boolean; sources?: unknown[] };
+
+/** `meta`: the request's `_meta`, which the server reads beside the arguments and the model never writes (`tools/citations.ts`). */
+type CallTool = (name: string, args: Record<string, unknown>, outcome?: McpCallOutcome, meta?: Record<string, unknown>) => Promise<string>;
 
 /** A connected server's tools, as a run calls them. */
-export type McpToolCaller = { callTool: (name: string, args: Record<string, unknown>, outcome?: McpCallOutcome) => Promise<string> };
+export type McpToolCaller = { callTool: CallTool };
 
 interface McpClientWrapper {
-  callTool: (name: string, args: Record<string, unknown>, outcome?: McpCallOutcome) => Promise<string>;
+  callTool: CallTool;
   listTools: () => Promise<ToolSchema[]>;
   close: () => Promise<void>;
 }
@@ -209,7 +216,7 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
   const resourceTools = new Set<string>();
 
   return {
-    async callTool(toolName: string, args: Record<string, unknown>, outcome?: McpCallOutcome): Promise<string> {
+    async callTool(toolName: string, args: Record<string, unknown>, outcome?: McpCallOutcome, meta?: Record<string, unknown>): Promise<string> {
       if (resourceTools.has(toolName)) {
         if (toolName === LIST_RESOURCES) {
           const cursor = typeof args.cursor === "string" && args.cursor ? args.cursor : undefined;
@@ -223,9 +230,11 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
         const read = await client.readResource({ uri: args.uri });
         return read.contents.map((c) => renderResourceContents(c as McpContentBlock)).join("\n");
       }
-      const result = await client.callTool({ name: toolName, arguments: args });
+      const result = await client.callTool({ name: toolName, arguments: args, ...(meta ? { _meta: meta } : {}) });
       // The tool's own error bit (`isError`), which its text alone cannot carry: what it answered is a failure, not data it read.
       if (outcome && result.isError === true) outcome.isError = true;
+      const sources = (result._meta as Record<string, unknown> | undefined)?.[CITE_SOURCES_META];
+      if (outcome && Array.isArray(sources)) outcome.sources = sources;
       return renderMcpContent(result.content, result.structuredContent);
     },
     async listTools(): Promise<ToolSchema[]> {
@@ -355,8 +364,8 @@ export async function connectPlatformMcp(
       }
       clients.set(name, filter
         ? {
-            callTool: (toolName, args, outcome) => filter.allows(toolName)
-              ? wrapper.callTool(toolName, args, outcome)
+            callTool: (toolName, args, outcome, meta) => filter.allows(toolName)
+              ? wrapper.callTool(toolName, args, outcome, meta)
               : Promise.reject(new Error(`Tool ${toolName} is not enabled on MCP server ${name}`)),
           }
         : wrapper);

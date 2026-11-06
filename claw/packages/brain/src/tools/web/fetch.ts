@@ -31,6 +31,7 @@ import {
 import { isPreapprovedHost } from "./preapproved.js";
 import { summarizeContent, MAX_MARKDOWN_LENGTH } from "./summarize.js";
 import type { WebToolContext, WebToolOutcome } from "./types.js";
+import { webSource } from "../citations.js";
 
 const logger = pino({ name: "web-fetch" });
 
@@ -457,9 +458,17 @@ export class WebFetchService {
       return fail(`Error: domain ${parsed.hostname} is blocked by WEB_FETCH_DOMAIN_DENYLIST`);
     }
 
+    // The page this call read whole, as a source (`tools/citations.ts`): only a page it returned, never a redirect it reported, an
+    // error or content it would not read.
+    const read = (finalUrl: string): void => {
+      const source = outcome && webSource(finalUrl);
+      if (outcome && source) outcome.sources = [source];
+    };
+
     const ck = cacheKey(parsed.toString(), raw ? "raw" : "", raw);
     const cached = cache.get(ck);
     if (cached && !prompt) {
+      read(cached.finalUrl);
       return buildOutput(cached.finalUrl, cached.statusCode, cached.contentType, cached.body.length, cached.body, false);
     }
 
@@ -491,6 +500,8 @@ export class WebFetchService {
     } else {
       content = bodyStr;
     }
+
+    read(result.finalUrl);
 
     // Cache the fetched/decoded content (not summarized)
     cache.set(ck, {

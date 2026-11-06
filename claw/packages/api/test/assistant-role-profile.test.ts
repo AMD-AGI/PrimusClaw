@@ -188,6 +188,9 @@ describe("assistant role profile", { skip }, () => {
     // Its say published while the model writes it (`router-speed.ts`); the effort is the model's own unless the deployment names one.
     assert.deepEqual(task.stream_tool_text, ["mcp__assistant__say"]);
     assert.equal(task.effort, undefined);
+    // Citations are off by default: no `cite`, and the prompt asks for links as before (`assistant-say-citations-db.test.ts` has them on).
+    assert.equal(task.cite, undefined);
+    assert.ok(!task.system_append.includes("Citing what you looked up"));
   });
 
   test("A1c marketplace tools a message named are not resolved for a router, and are for a worker", async () => {

@@ -22,7 +22,9 @@ import {
   BRAVE_API_KEY,
   SERPER_API_KEY,
 } from "../../config.js";
+import type { CiteSource } from "@claw/protocol";
 import type { WebToolContext, WebToolOutcome, WebSearchProvider, SearchHit } from "./types.js";
+import { webSource } from "../citations.js";
 
 const logger = pino({ name: "web-search" });
 
@@ -102,6 +104,7 @@ async function executeAnthropicSearch(
   input: WebSearchInput,
   ctx: WebToolContext,
   fail: (text: string) => string,
+  outcome?: WebToolOutcome,
 ): Promise<string> {
   const query = (input.query ?? "").trim();
   if (query.length < 2) return fail("Error: query must be at least 2 characters.");
@@ -165,7 +168,30 @@ async function executeAnthropicSearch(
     throw new BackendFailure(code ? `search error ${code}` : "search error");
   }
 
+  if (outcome) outcome.sources = searchSources(nativeSearchHits(blocks));
   return formatWebSearchResult(query, blocks);
+}
+
+/** The pages the native search tool answered with: every `web_search_tool_result` block's results, in order. */
+export function nativeSearchHits(blocks: any[]): SearchHit[] {
+  const hits: SearchHit[] = [];
+  for (const block of blocks ?? []) {
+    if (block?.type !== "web_search_tool_result" || !Array.isArray(block.content)) continue;
+    for (const r of block.content) {
+      if (r && typeof r.url === "string") hits.push({ title: typeof r.title === "string" ? r.title : "", url: r.url });
+    }
+  }
+  return hits;
+}
+
+/** A search's hits as sources: each one whose address can be a source, once. */
+export function searchSources(hits: readonly SearchHit[]): CiteSource[] {
+  const out: CiteSource[] = [];
+  for (const hit of hits) {
+    const source = webSource(hit.url, hit.title);
+    if (source && !out.some((s) => s.url === source.url)) out.push(source);
+  }
+  return out;
 }
 
 // ── Format result ──
@@ -435,7 +461,7 @@ export class WebSearchService {
     // Anthropic native path (Claude engine only)
     if (WEB_SEARCH_PROVIDER === "anthropic") {
       try {
-        return await executeAnthropicSearch(searchInput, this.ctx, fail);
+        return await executeAnthropicSearch(searchInput, this.ctx, fail, outcome);
       } catch (err: unknown) {
         lastError = `anthropic: ${backendFailure(err)}`;
         logger.warn({ err: err instanceof Error ? err.message : String(err) }, "anthropic_search_failed, trying fallbacks");
@@ -463,6 +489,7 @@ export class WebSearchService {
           });
         }
 
+        if (outcome) outcome.sources = searchSources(hits);
         return formatThirdPartyResults(searchInput.query, hits);
       } catch (err: unknown) {
         lastError = `${provider.name}: ${backendFailure(err)}`;

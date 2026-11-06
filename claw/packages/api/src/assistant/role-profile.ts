@@ -28,7 +28,7 @@ import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import { reviewMemoryBlock, routerMemoryParts, workerMemoryBlock } from "./memory-tools.js";
 import {
   ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
-  ROUTER_READ_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderModelChoice,
+  ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderModelChoice,
   renderObserverSystem, renderReviewState, renderRouterItems, renderRouterPrompt, renderWorkerSystem, withTurnState,
   type AskedOfOtherLine, type ManifestItem,
 } from "./prompts.js";
@@ -40,6 +40,7 @@ import { reviewContextFor } from "./review-tools.js";
 import { startWorkerRun } from "./run-started.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 import { applyRouterTurnSpeed } from "./router-speed.js";
+import { routerCite } from "./citations.js";
 
 const logger = pino({ name: "assistant-role" });
 
@@ -245,12 +246,16 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     task.read_taint = {
       sources: lookups.allowlist, allow_after: AFTER_READ_TOOLS.map((t) => `${TOOL_NAME_PREFIX}${t}`), clean_failures: lookups.cleanFailures,
     };
+    // Its say may cite what the lookups returned (`citations.ts`): Brain keeps their sources and hands say the ones it names.
+    const cite = routerCite(lookups.githubServers);
+    if (cite) task.cite = cite;
+    else delete task.cite;
     // Neither the deployment's default MCP servers nor its default skills: the hint that lists them would follow the user's message.
     task.skip_platform_defaults = true;
     // The system prompt is the same on every turn, so it and the history after it come from the prompt cache. What changes
     // from turn to turn (the item list, what waits for the user, what the channel sent) goes with the message instead.
     const github = lookups.githubTools.length > 0;
-    withSystemAppend(task, renderRouterPrompt({ servers: read?.servers ?? [], github: lookups.githubTools }));
+    withSystemAppend(task, renderRouterPrompt({ servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null }));
     const state = [renderRouterItems(await routerManifest(role.userId), await askedOfOthersManifest(role.userId))];
     if (CLAW_ASSISTANT_TOOLS) {
       withSystemAppend(task, ROUTER_REVIEW_PROMPT);
@@ -288,6 +293,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION, base: ROUTER_PROMPT_VERSION,
       ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
       read: ROUTER_READ_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),
+      ...(cite ? { cite: ROUTER_CITE_PROMPT_VERSION } : {}),
     }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);

@@ -47,10 +47,24 @@ export interface AssistantConfirmAction {
   channel_message_id: string;
 }
 
+/**
+ * A source the message cites (`assistant/citations.ts`): `n` is the number its text writes as `[n]`. Each comes from a lookup the turn
+ * made (a web page it found or read, an object of the user's GitHub), never from the model's own words. `title` is a plain line,
+ * already cut and stripped of markup, but what someone else wrote: shown as text only.
+ */
+export interface AssistantSaySource {
+  n: number;
+  url: string;
+  title: string;
+  kind: "web" | "github_pr" | "github_issue" | "github_repo" | "github_check" | "github_file";
+}
+
 /** Something the assistant chose to say to the user. */
 export interface AssistantSayPayload extends AssistantEventBase {
   type: "assistant.say";
   confirm_action?: AssistantConfirmAction;
+  /** Present only when the message cites any (`CLAW_ASSISTANT_CITATIONS`); a receiver that does not read it shows the text alone. */
+  sources?: AssistantSaySource[];
 }
 
 /** The system's own message, sent when an item has needed the user for a while and nobody has said so. */

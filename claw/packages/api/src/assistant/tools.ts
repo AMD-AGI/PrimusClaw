@@ -22,6 +22,8 @@ import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
 import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, SayOutcomeUnknown, SayRefused, type SayDeps } from "./outbound.js";
+import { saySources, SAY_SOURCE_OUTCOMES } from "./citations.js";
+import { metrics } from "../infra/metrics.js";
 import { internalTextIn, userWordsOf } from "./internal-text.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 import { assistantPluginId } from "./read-tools.js";
@@ -139,8 +141,12 @@ function answerItemOf(prompt: string | null | undefined): string | undefined {
 }
 const ANSWER_EVENT_RE = new RegExp(`^${WORK_EVENT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} #\\d+ \\(item_id: (kwi_[0-9A-Za-z]+)\\) answer:`);
 
+/**
+ * `meta`: the MCP request's `_meta`, where Brain puts the sources the message cites (`citations.ts`); the model's own `sources`
+ * argument is never read.
+ */
 export async function say(
-  claims: AssistantTokenClaims, args: { text: string; item_id?: string }, deps: SayDeps = {},
+  claims: AssistantTokenClaims, args: { text: string; item_id?: string; sources?: unknown }, deps: SayDeps = {}, meta?: unknown,
 ): Promise<{ ok: true; say_id: string; subscribers: number }> {
   requireRole(claims, "router");
   const userId = await assistantUser(claims.sid);
@@ -158,9 +164,12 @@ export async function say(
   // A say in the turn an answer woke that names no item is about that item: recorded so, it is the say the silent sweep looks
   // for, and the answer is not announced a second time.
   const itemId = args.item_id?.trim() ? args.item_id : answerItemOf(run?.prompt);
+  const cited = meta === undefined ? null : saySources(meta, typeof args.text === "string" ? args.text.trim() : "");
+  if (cited) for (const outcome of SAY_SOURCE_OUTCOMES) metrics.onAssistantSaySources(outcome, cited.counts[outcome]);
   try {
     const out = await recordAssistantSay({
       userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid,
+      ...(cited?.sources.length ? { sources: cited.sources } : {}),
       guard: async (q) => {
         if ((await assertLiveRun(q, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");
       },
