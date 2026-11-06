@@ -70,7 +70,7 @@ import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/containe
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
-import { provisionTerminalOf, sandboxUnavailableOf } from "../sandbox/errors.js";
+import { SANDBOX_WORKSPACE_FORBIDDEN, provisionTerminalOf, sandboxUnavailableOf } from "../sandbox/errors.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
 import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
@@ -4174,8 +4174,15 @@ class TaskRunner {
     // dedicated sandboxStatus event already carries the structured reason;
     // upstream LLM failures get the new classifier so the chat panel does
     // not display a raw provider JSON body.
+    // A refused workspace is already written for the person reading it (see
+    // `sandboxWorkspaceForbiddenText`); the code prefix would only add noise.
     const taskFailure = sandboxReason
-      ? { reason: sandboxReason, userText: `Sandbox failure (${sandboxReason}): ${rawMsg.slice(0, 500)}` }
+      ? {
+        reason: sandboxReason,
+        userText: sandboxReason === SANDBOX_WORKSPACE_FORBIDDEN
+          ? rawMsg.slice(0, 500)
+          : `Sandbox failure (${sandboxReason}): ${rawMsg.slice(0, 500)}`,
+      }
       : classifyTaskFailure(rawMsg, err);
     const finalText = taskFailure.userText;
     // Partial progress fields. agentLoop's `result` is unavailable on the

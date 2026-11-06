@@ -181,3 +181,34 @@ test("an answer that is not the documented shape is refused, not guessed at", ()
   ];
   for (const [name, [w, c, u]] of rows) assert.equal(buildMe(USER, w, c, u), null, name);
 });
+
+test("sandbox.cpu says whether the caller can have a sandbox in the deployment's CPU workspace", () => {
+  // The account SaFE lists only crusoe-spur-vk for: `available` stays true (the
+  // console names crusoe-spur-vk on every turn), but an assistant or Teams turn,
+  // which names no workspace, goes to global-cpu and is refused there.
+  const vkOnly = list(ws("crusoe-spur-vk", { scopes: ["Train", "Sandbox"], gpuProduct: "MI355X", isDefault: true }));
+  const withCpu = list(
+    ws("crusoe-spur-vk", { scopes: ["Train", "Sandbox"], gpuProduct: "MI355X", isDefault: true }),
+    ws("global-cpu", { scopes: ["Authoring", "Sandbox"] }),
+  );
+  const cpuWithoutSandbox = list(ws("global-cpu", { scopes: ["Authoring"] }), ws("b", { scopes: ["Sandbox"] }));
+  const creating = list({ clusterId: "c", phase: "Creating" });
+  const rows: [string, unknown, unknown, unknown][] = [
+    ["not a member", vkOnly, READY, { workspaceId: "global-cpu", available: false, reason: "no_access" }],
+    ["a member", withCpu, READY, { workspaceId: "global-cpu", available: true }],
+    ["a member, no Ready cluster", withCpu, creating, { workspaceId: "global-cpu", available: false }],
+    ["listed without the Sandbox scope", cpuWithoutSandbox, READY, { workspaceId: "global-cpu", available: false, reason: "no_access" }],
+  ];
+  for (const [name, workspaces, clusters, cpu] of rows) {
+    assert.deepEqual(buildMe(USER, workspaces, clusters, NONE_MANAGED, "global-cpu", "global-cpu")?.sandbox.cpu, cpu, name);
+  }
+  const notMember = buildMe(USER, vkOnly, READY, NONE_MANAGED, "global-cpu", "global-cpu");
+  assert.equal(notMember?.sandbox.available, true, "the console's own answer is unchanged");
+  assert.equal(notMember?.sandbox.defaultWorkspaceId, "crusoe-spur-vk");
+});
+
+test("a deployment without a CPU sandbox workspace sends no sandbox.cpu", () => {
+  const me = buildMe(USER, list(ws("w", { scopes: ["Sandbox"] })), READY, NONE_MANAGED, "w", "");
+  assert.equal(me?.sandbox.cpu, undefined);
+  assert.deepEqual(me?.sandbox, { available: true, defaultWorkspaceId: "w" });
+});

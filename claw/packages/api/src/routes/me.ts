@@ -10,7 +10,8 @@
  *
  *   {
  *     "userId": "...", "name"?: "...", "email"?: "...", "roles": ["..."],
- *     "sandbox": { "available": true, "defaultWorkspaceId"?: "...", "gpuProduct"?: "..." },
+ *     "sandbox": { "available": true, "defaultWorkspaceId"?: "...", "gpuProduct"?: "...",
+ *                  "cpu"?: { "workspaceId": "...", "available": false, "reason"?: "no_access" } },
  *     "workspaces": [ { "id", "name", "scopes": [], "gpuProduct"?, "flavorId"?,
  *                       "clusterId"?, "isDefault"?, "admin": false } ]
  *   }
@@ -37,6 +38,15 @@
  *     over Brain's default: a default that disagreed with Brain's would send every
  *     console sandbox to the workspace the deployment moved away from.
  *     `gpuProduct` is that workspace's.
+ *   - `sandbox.cpu` -- only when the deployment names a CPU sandbox workspace
+ *     (SANDBOX_CPU_NAMESPACE). That is where Brain starts every sandbox a turn does
+ *     not name a workspace for -- an assistant item, a Teams message, a worker --
+ *     so `available: true` above (which any Sandbox workspace earns, the console
+ *     names one on every turn) does not say those turns can have one. `available`
+ *     here is a Ready cluster AND the CPU workspace among the caller's Sandbox
+ *     workspaces; when it is not among them, `reason` is `no_access`: SaFE lists
+ *     only the workspaces an account may use, and creating a workload there is
+ *     refused for the same account.
  *   - `workspaces[].admin` -- the caller manages that workspace. System-wide admin
  *     roles are reported in `roles`; they do not turn every `admin` on.
  *
@@ -84,12 +94,20 @@ export interface MeWorkspace {
   admin: boolean;
 }
 
+/** Whether the caller can have a sandbox in the deployment's CPU sandbox workspace. */
+export interface MeCpuSandbox {
+  workspaceId: string;
+  available: boolean;
+  /** Present when `available` is false because the caller has no Sandbox access to the workspace. */
+  reason?: "no_access";
+}
+
 export interface Me {
   userId: string;
   name?: string;
   email?: string;
   roles: string[];
-  sandbox: { available: boolean; defaultWorkspaceId?: string; gpuProduct?: string };
+  sandbox: { available: boolean; defaultWorkspaceId?: string; gpuProduct?: string; cpu?: MeCpuSandbox };
   workspaces: MeWorkspace[];
 }
 
@@ -135,6 +153,8 @@ export function buildMe(
   userBody: unknown,
   /** The deployment's default sandbox workspace; a parameter so the rule is testable without the environment. */
   deploymentDefaultWorkspaceId: string = SANDBOX_CPU_NAMESPACE || SANDBOX_NAMESPACE,
+  /** The deployment's CPU sandbox workspace (SANDBOX_CPU_NAMESPACE); empty when it keeps none. */
+  cpuWorkspaceId: string = SANDBOX_CPU_NAMESPACE,
 ): Me | null {
   const workspaceItems = itemsOf(workspacesBody);
   const clusterItems = itemsOf(clustersBody);
@@ -170,6 +190,12 @@ export function buildMe(
   if (defaultSandbox) {
     sandbox.defaultWorkspaceId = defaultSandbox.id;
     if (defaultSandbox.gpuProduct) sandbox.gpuProduct = defaultSandbox.gpuProduct;
+  }
+  const cpuId = cpuWorkspaceId.trim();
+  if (cpuId) {
+    const hasCpu = sandboxWorkspaces.some((w) => w.id === cpuId);
+    sandbox.cpu = { workspaceId: cpuId, available: anyReadyCluster && hasCpu };
+    if (!hasCpu) sandbox.cpu.reason = "no_access";
   }
   return { ...identityOf(user), sandbox, workspaces };
 }

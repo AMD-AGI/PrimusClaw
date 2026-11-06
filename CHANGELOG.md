@@ -899,6 +899,13 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A user whose account may not create workloads in the workspace Claw starts their sandbox in (today: anyone not a member of
+  the CPU workspace, the first time an assistant item or Teams message needs a sandbox) no longer sees SaFE's raw 403 body,
+  with their internal user id and the platform error code, as `Sandbox failure (sandbox_create_failed): Create Hands failed: HTTP
+  403 {...}`. The run now fails with `sandbox_workspace_forbidden` and a sentence naming the workspace and the next step (ask a
+  SaFE administrator to add the account); the body stays in the Brain log. The refusal is terminal, and a lazy sandbox is not
+  opened again in the same turn. `GET /v1/me` gains `sandbox.cpu` (`{ workspaceId, available, reason?: "no_access" }`) when
+  `SANDBOX_CPU_NAMESPACE` is set, so a client can tell an account that has no CPU sandbox workspace before it is refused.
 - A work item's worker whose item waits for a person (`needs_you`) or is `done` no longer keeps its sandbox for background work: past
   `WAITING_ITEM_SANDBOX_RELEASE_SECONDS` (API, default 900) of quiet with nothing queued, the orphan sweep stops it, and the next turn
   starts a fresh one. A review session's leftover test Postgres had held global-cpu sandboxes for up to two hours behind held merges.

@@ -906,7 +906,7 @@ test("the setting reads in seconds, defaults to five minutes, and 0 turns it off
 test("the endings that mean the platform has no sandbox are a closed, named set", () => {
   assert.deepEqual(
     [...SANDBOX_UNAVAILABLE_REASONS].sort(),
-    ["sandbox_pending_timeout", "sandbox_start_timeout", "sandbox_unschedulable"],
+    ["sandbox_pending_timeout", "sandbox_start_timeout", "sandbox_unschedulable", "sandbox_workspace_forbidden"],
   );
   for (const reason of SANDBOX_UNAVAILABLE_REASONS) {
     assert.equal(sandboxUnavailableOf(new SandboxProvisionTerminalError(reason, "m"))?.reason, reason);

@@ -85,7 +85,37 @@ export const SANDBOX_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set([
   "sandbox_unschedulable",
   "sandbox_start_timeout",
   "sandbox_pending_timeout",
+  // Not a wait, but the same answer to "what does a second try buy": the
+  // platform refused the account, and it refuses it again a second later.
+  "sandbox_workspace_forbidden",
 ]);
+
+/**
+ * The platform refused to create the sandbox workload because the caller's
+ * account may not create workloads in that workspace (SaFE answers 403, in
+ * practice "not allowed to create workload, workspace: [<ws>]" for a user who
+ * is not a member of it).
+ */
+export const SANDBOX_WORKSPACE_FORBIDDEN = "sandbox_workspace_forbidden";
+
+/**
+ * What the user is told when the platform will not let their account start a
+ * sandbox in `workspace`.
+ *
+ * Written for the person, not the operator: SaFE's answer carries the account's
+ * internal user id and a platform error code, neither of which tells anyone what
+ * to do, and both of which end up verbatim in a chat or a Teams message when the
+ * raw body is passed through. The body is logged where it is received instead.
+ * `cpu` says the workspace is the deployment's CPU sandbox workspace, which is
+ * the one an assistant or Teams turn lands in without naming any.
+ */
+export function sandboxWorkspaceForbiddenText(workspace: string, cpu: boolean): string {
+  const which = cpu ? "CPU sandbox workspace" : "sandbox workspace";
+  const target = workspace ? `the ${workspace} workspace` : "the workspace sandboxes start in";
+  return `You do not have a ${which} yet: your account may not start sandboxes in ${target}.`
+    + ` Ask a SaFE administrator to add your account to ${target}, then try again.`
+    + " Anything that does not need a sandbox still works.";
+}
 
 /** The give-up behind `err` when it is one of SANDBOX_UNAVAILABLE_REASONS, else null. */
 export function sandboxUnavailableOf(err: unknown): SandboxProvisionTerminalError | null {

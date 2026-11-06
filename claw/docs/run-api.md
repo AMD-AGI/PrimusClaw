@@ -104,6 +104,7 @@ never became usable records one of the provisioning codes --
 `sandbox_workload_terminal`, `sandbox_exited_before_ready`, `sandbox_container_failed`,
 `sandbox_envd_exited`, `sandbox_timed_out`, `sandbox_pending_timeout`,
 `sandbox_status_unreadable`, `sandbox_gone`, `sandbox_create_failed`,
+`sandbox_workspace_forbidden`,
 `sandbox_image_missing`, `sandbox_auth_missing`, `sandbox_template_missing`,
 `sandbox_health_failed`, `sandbox_bootstrap_failed` -- and nothing in it executed.
 
