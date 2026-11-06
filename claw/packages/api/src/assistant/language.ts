@@ -256,3 +256,22 @@ export async function languageToAnswerIn(
   }
   return null;
 }
+
+/**
+ * Whether a message the assistant is about to send is plainly in another language than the one it was told to answer in
+ * (`[Reply language: X]`): the language it is in, or null when it is in that language or cannot be told apart from it.
+ *
+ * Asked only of an answer due in Chinese, and refused only when it has no Chinese character at all once the user's item titles
+ * (`others`, quoted from elsewhere) are left out: an answer to a Chinese message with none is in another language, whatever it
+ * quotes. The other way cannot be told safely: an English sentence may quote a Chinese title of anything (a pull request, a page)
+ * at any length, and a short Japanese answer may be all kanji, so an answer due in English, Japanese or Korean is never refused
+ * here (the prompt asks for it). Pure, for the tests.
+ */
+export function replyLanguageMismatch(text: string, expected: string, others: readonly string[] = []): string | null {
+  if (expected !== "Chinese") return null;
+  let own = text;
+  for (const o of others) if (o.trim()) own = own.split(o).join(" ");
+  if (/\p{Script=Han}/u.test(wording(own))) return null;
+  const found = readLanguage(own).language;
+  return found && found !== expected ? found : null;
+}

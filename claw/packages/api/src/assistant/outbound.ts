@@ -545,15 +545,19 @@ export async function turnHandedOffReview(q: Querier, userId: string, messageId:
  * limit nor taken for the turn having spoken. Once per `key`: a second call stores nothing and returns `null`.
  */
 export async function recordSystemNotice(
-  input: { userId: string; sessionId: string; text: string; key: string }, deps: SayDeps = {},
+  input: {
+    userId: string; sessionId: string; text: string; key: string;
+    /** The item it is about, attached as a say's is; and the message of the turn it answers, as on a say's event. */
+    itemId?: string; turnMessageId?: string;
+  }, deps: SayDeps = {},
 ): Promise<SayOutcome | null> {
-  const stored = await storeSettled((_q, storeOne) => storeOne({
-    type: "assistant.say", fallback: true, item: null,
+  const stored = await storeSettled(async (q, storeOne) => storeOne({
+    type: "assistant.say", fallback: true, item: input.itemId ? await loadItem(q, input.itemId, input.userId) : null,
     sayId: deterministicEventId("assistant.notice", input.userId, input.key),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
-  }), (late) => announce(late, deps));
+  }), (late) => announce(late, deps, input.turnMessageId));
   if (!stored) return null;
-  await announce(stored, deps);
+  await announce(stored, deps, input.turnMessageId);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
 }
 

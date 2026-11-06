@@ -78,15 +78,87 @@ export function answerToDeliver(finalText: string | undefined, prompts: readonly
  * What the user is told when the turn answering them failed or was stopped before it said anything, in the language
  * of what they wrote. The system's words, so they say nothing of what the turn may have done before it stopped.
  */
-export function turnLostNotice(prompts: readonly string[]): string | null {
+export function turnLostNotice(prompts: readonly string[], why: TurnLostWhy = "failed"): string | null {
   const own = prompts.filter((p) => !p.startsWith(WORK_EVENT_PREFIX));
   if (!own.length) return null;
-  return detectLanguage(own.join("\n")) === "Chinese"
+  const chinese = detectLanguage(own.join("\n")) === "Chinese";
+  if (why === "declined") {
+    return chinese
+      ? "这个请求我不能处理：它可能涉及访问内部地址、凭据或其他不安全的操作，所以我没有执行。换个问题或说明你想达到的目的，我可以继续帮你。进行中的事项不受影响。"
+      : "I can't help with that request: it may involve reaching internal addresses, credentials or something else unsafe, so I did not do it. Ask something else or tell me what you want to achieve, and I'll help. Your work items are not affected.";
+  }
+  return chinese
     ? "刚才这条没有处理成功，请再说一次。进行中的事项不受影响。"
     : "That message did not go through; please say it again. Your work items are not affected.";
 }
 
+/** Why a turn that answers the user ended without a word: it failed, or the model declined to answer at all. */
+export type TurnLostWhy = "failed" | "declined";
+
+/**
+ * What Brain ends a run with when its model answered nothing twice in a row (or on its last turn): no text and no tool call
+ * (`EmptyAgentTurnError` in `brain/src/agent/agent-loop.ts`, whose words are the run's final text). On a router turn that is the
+ * model declining the request (a refusal comes back empty), not a fault: asking again gets the same, so the user is told it was
+ * declined instead of being asked to say it again (2026-11-06 baseline, real-general-sec-136).
+ */
+export const EMPTY_TURN_TEXT_RE = /\bended (?:its|its last allowed) turn without any text or tool call\b/i;
+
+/** Why the turn ended silent, from how it ended. Pure, for the tests. */
+export function lostWhy(end: Pick<RouterTurnEnd, "failed" | "interrupted" | "fromSweeper" | "finalText">): TurnLostWhy {
+  return end.failed && !end.interrupted && !end.fromSweeper && EMPTY_TURN_TEXT_RE.test(end.finalText ?? "") ? "declined" : "failed";
+}
+
 export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}): Promise<"said" | "skipped"> {
+  const out = await deliverUnsaid(end, deps);
+  // After the delivery, so the timing counts what it sent; never in its way.
+  try {
+    const timing = await routerTurnTiming(end);
+    if (timing) logger.info({ sessionId: end.sessionId, runIds: end.runIds, ...timing }, "assistant.router_turn_timing");
+  } catch (err) {
+    logger.warn({ err, sessionId: end.sessionId }, "assistant.router_turn_timing_failed");
+  }
+  return out;
+}
+
+/**
+ * How quickly a router turn that answered the user was heard (B7): from the user's message (the run's creation) to the first message
+ * the user got from this turn, and to the last; how many there were, how many were the system's own (a started item's notice, a
+ * notice for a lost turn); and whether the turn started an item. One log line per turn (`assistant.router_turn_timing`), the
+ * measurement the first-reply target (p90 under 5 s) is read from. Null for a turn that is not a router's answer to the user.
+ */
+export async function routerTurnTiming(end: Pick<RouterTurnEnd, "sessionId" | "runIds" | "failed" | "interrupted">): Promise<{
+  first_reply_ms: number | null; final_reply_ms: number | null; replies: number; system_replies: number; items_started: number;
+  failed: boolean; interrupted: boolean;
+} | null> {
+  const router = (await db.query("SELECT user_id FROM claw_assistants WHERE session_id = $1", [end.sessionId])).rows[0] as
+    { user_id: string } | undefined;
+  if (!router) return null;
+  const runs = (await db.query(
+    `SELECT created_at, COALESCE(prompt, input->>'prompt', '') AS prompt
+       FROM claw_tasks WHERE session_id = $1 AND task_id = ANY($2::text[]) AND origin = 'chat'`,
+    [end.sessionId, end.runIds],
+  )).rows as Array<{ created_at: Date; prompt: string }>;
+  if (!runs.length || runs.every((r) => r.prompt.startsWith(WORK_EVENT_PREFIX))) return null;
+  const asked = new Date(Math.min(...runs.map((r) => new Date(r.created_at).getTime())));
+  // Now, not the run's completion: the message delivered for a turn that ended silent is stored just after it.
+  const ended = new Date();
+  const says = (await db.query(
+    `SELECT created_at, fallback FROM claw_assistant_says
+      WHERE user_id = $1 AND created_at >= $2 AND created_at <= $3 ORDER BY created_at`,
+    [router.user_id, asked, ended],
+  )).rows as Array<{ created_at: Date; fallback: boolean }>;
+  const items = Number((await db.query(
+    "SELECT count(*)::int AS n FROM claw_work_items WHERE user_id = $1 AND created_at >= $2 AND created_at <= $3",
+    [router.user_id, asked, ended],
+  )).rows[0].n);
+  const ms = (d: Date | undefined) => (d ? new Date(d).getTime() - asked.getTime() : null);
+  return {
+    first_reply_ms: ms(says[0]?.created_at), final_reply_ms: ms(says.at(-1)?.created_at), replies: says.length,
+    system_replies: says.filter((x) => x.fallback).length, items_started: items, failed: end.failed, interrupted: end.interrupted,
+  };
+}
+
+async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" | "skipped"> {
   const lost = end.failed || end.interrupted || end.fromSweeper;
   const router = (await db.query("SELECT user_id FROM claw_assistants WHERE session_id = $1", [end.sessionId])).rows[0] as
     { user_id: string } | undefined;
@@ -98,7 +170,8 @@ export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}
   )).rows as Array<{ began: Date; prompt: string; message_id: string | null }>;
   if (!runs.length) return "skipped";
   const prompts = runs.map((r) => r.prompt);
-  let text = lost ? turnLostNotice(prompts) : answerToDeliver(end.finalText, prompts);
+  const why = lostWhy(end);
+  let text = lost ? turnLostNotice(prompts, why) : answerToDeliver(end.finalText, prompts);
   if (!text) return "skipped";
   // The message the turn answered, as the completion names it, or as its runs were started for it (a sweeper's completion may not say).
   const answered = new Set([end.messageId, ...runs.map((r) => r.message_id)].filter((m): m is string => !!m));
@@ -128,7 +201,7 @@ export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}
     const stored = await recordSystemNotice({
       userId: router.user_id, sessionId: end.sessionId, text, key: `turn_lost:${[...end.runIds].sort().join(",")}`,
     }, deps);
-    if (stored) logger.warn({ sessionId: end.sessionId, runIds: end.runIds }, "assistant.turn_lost_notice_delivered");
+    if (stored) logger.warn({ sessionId: end.sessionId, runIds: end.runIds, why: lost ? why : "leaked" }, "assistant.turn_lost_notice_delivered");
     return stored ? "said" : "skipped";
   }
   try {
