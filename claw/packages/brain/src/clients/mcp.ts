@@ -12,6 +12,7 @@ import { redactSecrets } from "@claw/utils";
 import pino from "pino";
 import { Agent, fetch as undiciFetch } from "undici";
 import { mcpToolFilter } from "./mcp-tool-filter.js";
+import { isTransientFetchError, isTransientHttpStatus } from "../infra/transient-http.js";
 
 const logger = pino({ name: "mcp-clients" });
 
@@ -154,6 +155,46 @@ export function pinnedFetch(pin: unknown): FetchLike | undefined {
  * StreamableHTTP connect fails with a 405-like error, retry once using SSE
  * before giving up.
  */
+/**
+ * An MCP failure that says the server was briefly unreachable, not that the
+ * call was wrong: the connection was refused or reset, or a proxy answered
+ * 502/503/504 (the SDK's HTTP errors carry the status as a numeric `code`).
+ * This is what an API pod swap looks like to a run that is mid-tool-call.
+ */
+export function isTransientMcpError(err: unknown): boolean {
+  if (isTransientFetchError(err)) return true;
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "number" && isTransientHttpStatus(code);
+}
+
+/**
+ * Waits before re-sending a call that is safe to repeat. The servers Claw runs
+ * itself are stateless over streamable HTTP (no session survives a pod swap or
+ * needs to), so a repeat is a new, complete request to whichever replica the
+ * Service now routes to.
+ */
+export const MCP_TRANSIENT_DELAYS_MS: readonly number[] = [500, 1_500, 3_000];
+
+async function retryTransientMcp<T>(
+  what: string,
+  name: string,
+  call: () => Promise<T>,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call();
+    } catch (err) {
+      if (attempt >= MCP_TRANSIENT_DELAYS_MS.length || !isTransientMcpError(err)) throw err;
+      logger.warn({ name, what, attempt: attempt + 1, err: String((err as Error)?.message ?? err) }, "mcp_client.transient_retry");
+      await sleep(MCP_TRANSIENT_DELAYS_MS[attempt]!);
+    }
+  }
+}
+
+/** Test seam: the retry policy over a stand-in call, with the sleeps it would take. */
+export const __mcpRetryForTest = retryTransientMcp;
+
 async function connectMcpServer(name: string, spec: Record<string, unknown>): Promise<McpClientWrapper> {
   const url = spec.url as string;
   const type = (spec.type as string) || "http";
@@ -214,23 +255,31 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
   // Filled by listTools: the resource tools this server is offered (none for a
   // server without resources, or whose own tools have those names).
   const resourceTools = new Set<string>();
+  // Filled by listTools: the tools the server itself declares read-only
+  // (`annotations.readOnlyHint`). Only these, and the resource reads, are
+  // re-sent after a transient failure. Anything else may have done its work
+  // before the connection dropped, and sending it again could do it twice; it
+  // fails to the model as before, which can see what happened and decide.
+  const readOnlyTools = new Set<string>();
 
   return {
     async callTool(toolName: string, args: Record<string, unknown>, outcome?: McpCallOutcome, meta?: Record<string, unknown>): Promise<string> {
       if (resourceTools.has(toolName)) {
         if (toolName === LIST_RESOURCES) {
           const cursor = typeof args.cursor === "string" && args.cursor ? args.cursor : undefined;
-          const page = await client.listResources(cursor ? { cursor } : {});
+          const page = await retryTransientMcp(toolName, name, () => client.listResources(cursor ? { cursor } : {}));
           return JSON.stringify({
             resources: page.resources.map((r) => ({ uri: r.uri, name: r.name, description: r.description, mimeType: r.mimeType })),
             ...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),
           });
         }
         if (typeof args.uri !== "string" || !args.uri) throw new Error("read_resource needs a uri");
-        const read = await client.readResource({ uri: args.uri });
+        const uri = args.uri;
+        const read = await retryTransientMcp(toolName, name, () => client.readResource({ uri }));
         return read.contents.map((c) => renderResourceContents(c as McpContentBlock)).join("\n");
       }
-      const result = await client.callTool({ name: toolName, arguments: args, ...(meta ? { _meta: meta } : {}) });
+      const send = () => client.callTool({ name: toolName, arguments: args, ...(meta ? { _meta: meta } : {}) });
+      const result = readOnlyTools.has(toolName) ? await retryTransientMcp(toolName, name, send) : await send();
       // The tool's own error bit (`isError`), which its text alone cannot carry: what it answered is a failure, not data it read.
       if (outcome && result.isError === true) outcome.isError = true;
       const sources = (result._meta as Record<string, unknown> | undefined)?.[CITE_SOURCES_META];
@@ -238,8 +287,10 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
       return renderMcpContent(result.content, result.structuredContent);
     },
     async listTools(): Promise<ToolSchema[]> {
-      const result = await client.listTools();
+      const result = await retryTransientMcp("tools/list", name, () => client.listTools());
       const own = new Set(result.tools.map((t) => t.name));
+      readOnlyTools.clear();
+      for (const t of result.tools) if (t.annotations?.readOnlyHint === true) readOnlyTools.add(t.name);
       const tools = result.tools.map((t) => ({
         name: t.name,
         description: t.description || `[${name}] ${t.name}`,
@@ -351,7 +402,10 @@ export async function connectPlatformMcp(
       continue;
     }
     try {
-      const wrapper = await connectMcpServer(name, spec);
+      // Connecting is safe to repeat: it opens a client and lists tools, and a
+      // server that was mid-swap when this run started is otherwise dropped
+      // from the run for its whole life.
+      const wrapper = await retryTransientMcp("connect", name, () => connectMcpServer(name, spec));
       wrappers.push(wrapper);
       const listed = await wrapper.listTools();
       const prefix = `mcp__${name}__`;

@@ -49,8 +49,40 @@ interface LockValue {
    * unknown holder rather than as a match.
    */
   seq?: number;
+  /**
+   * The pod this process runs in, when its BRAIN_ID is that pod's name.
+   *
+   * A container that crashes and is restarted in place keeps its pod name and
+   * gets a new holder id, so this is what lets the restarted process recognise
+   * the locks its previous incarnation died holding and give them back at once
+   * (`releaseLocksOfPreviousIncarnation`), instead of every run on the pod
+   * waiting out the registry TTL. Absent everywhere else -- a local brain whose
+   * id several processes may share must never be able to release another's.
+   */
+  pod?: string;
+  /**
+   * Minted by each `acquireTaskLock` and carried by every renewal of that
+   * acquisition. The holder id is per process, so it cannot tell two runs of
+   * the same lock key in one process apart, and the stream sequence may be
+   * absent; this can. A renewal that conflicted reads it back to decide
+   * whether the entry is its own stored write (see refreshTaskLock).
+   */
+  acq?: string;
   acquiredAt: number;
   lastRenewedAt: number;
+}
+
+/**
+ * This process's pod name, if and only if it is also its BRAIN_ID.
+ *
+ * The chart sets BRAIN_ID to $(POD_NAME), which names exactly one live process
+ * at a time; nothing else is trusted to. Read from the environment each call so
+ * a test can set it.
+ */
+export function incarnationPod(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const pod = (env.POD_NAME ?? "").trim();
+  const brainId = (env.BRAIN_ID ?? "").trim();
+  return pod && pod === brainId ? pod : undefined;
 }
 
 // In-process map of lockKey -> last-known NATS KV revision. Populated on a
@@ -66,6 +98,9 @@ const lockRevisions = new Map<string, number>();
 // every 10s and would otherwise drop the field on the first renewal.
 const lockSeqs = new Map<string, number>();
 
+// lockKey -> the acquisition (LockValue.acq) the local entries belong to.
+const lockAcquisitions = new Map<string, string>();
+
 // lockKey -> when this pod last proved it still holds the lock. The bucket
 // expires an entry nobody refreshes, so this is the only local evidence of how
 // close the claim is to lapsing while renewals are failing.
@@ -75,6 +110,7 @@ const lockProvenAt = new Map<string, number>();
 function forgetLock(lockKey: string): void {
   lockRevisions.delete(lockKey);
   lockSeqs.delete(lockKey);
+  lockAcquisitions.delete(lockKey);
   lockProvenAt.delete(lockKey);
 }
 
@@ -331,9 +367,12 @@ export function gateBindingError(request: ExecuteRequest): string | null {
 }
 
 export async function acquireTaskLock(lockKey: string, seq?: number): Promise<boolean> {
+  const acq = randomUUID();
   const value: LockValue = {
     holderId: BRAIN_HOLDER_ID,
     seq,
+    pod: incarnationPod(),
+    acq,
     acquiredAt: Date.now(),
     lastRenewedAt: Date.now(),
   };
@@ -343,6 +382,7 @@ export async function acquireTaskLock(lockKey: string, seq?: number): Promise<bo
     lockRevisions.set(lockKey, Number(rev));
     lockProvenAt.set(lockKey, Date.now());
     if (seq !== undefined) lockSeqs.set(lockKey, seq);
+    lockAcquisitions.set(lockKey, acq);
     return true;
   } catch {
     // Key exists. Unlike the pre-INV13 implementation we do NOT steal even
@@ -413,6 +453,8 @@ export async function refreshTaskLock(lockKey: string): Promise<LockRenewal> {
   const value: LockValue = {
     holderId: BRAIN_HOLDER_ID,
     seq: lockSeqs.get(lockKey),
+    pod: incarnationPod(),
+    acq: lockAcquisitions.get(lockKey),
     acquiredAt: 0,
     lastRenewedAt: Date.now(),
   };
@@ -422,32 +464,110 @@ export async function refreshTaskLock(lockKey: string): Promise<LockRenewal> {
       sc.encode(JSON.stringify(value)),
       rev,
     );
-    lockRevisions.set(lockKey, Number(newRev));
-    lockProvenAt.set(lockKey, Date.now());
+    // Recorded only while the local entry is still this acquisition's: a
+    // renewal answered after its run released the key must not overwrite the
+    // revision a later run of the key is renewing from.
+    if (lockAcquisitions.get(lockKey) === value.acq) {
+      lockRevisions.set(lockKey, Number(newRev));
+      lockProvenAt.set(lockKey, Date.now());
+    }
     return "renewed";
   } catch (e) {
-    // A CAS conflict means somebody else has the lock -- likely the TTL expired
-    // while our event loop was paused and a competitor grabbed it. The revision
-    // we remember is theirs now, so forgetting it is the honest record.
+    // A CAS conflict means the entry moved since the revision we remember. That
+    // is usually somebody else taking the lock -- the TTL expired while our
+    // event loop was paused and a competitor grabbed it -- but not always: a
+    // renewal whose PubAck timed out may still have been stored, and then the
+    // entry moved because of *us*. That is exactly what a JetStream stall looks
+    // like from here (2026-11-06: two TIMEOUTs, then "wrong last sequence" on
+    // five healthy runs, each of which stood down and stalled for eleven minutes
+    // with nobody else holding its lock). So the entry is read back before
+    // anything is concluded, and the lock is only given up when it names
+    // another holder.
     if (isRevisionConflict(e)) {
+      // A renewal that outlived its run: the key was released and acquired
+      // again in this process while this CAS was in flight, so the local
+      // record is the later run's. Nothing here is this renewal's to read
+      // back, adopt or forget.
+      if (lockAcquisitions.get(lockKey) !== value.acq) {
+        logger.warn({ lockKey }, "lock.refresh_stale_renewal_ignored");
+        return "lost";
+      }
+      const outcome = await renewOverOwnCommittedWrite(lockKey, value);
+      if (outcome !== "lost") return outcome === "renewed" ? "renewed" : renewalFailed(lockKey, e);
       logger.warn({ err: e, lockKey }, "lock.refresh_cas_lost");
-      forgetLock(lockKey);
+      // Forgotten only if the local record is still this acquisition's: the
+      // read-back awaited, and a later run of the key may have taken it since.
+      if (lockAcquisitions.get(lockKey) === value.acq) forgetLock(lockKey);
       return "lost";
     }
-    // A transport error is not that. Forgetting the revision here used to end
-    // renewals for the rest of the run: every later tick found no revision,
-    // returned "not_held" without attempting anything, and said nothing -- so
-    // one NATS blip left the lock to expire under a healthy run, and the
-    // redelivery that took it over five minutes later ran the same task against
-    // the same sandbox while the original carried on. The revision is kept
-    // instead: a CAS with a stale one cannot take a lock from anybody, it can
-    // only fail, and the release path reads the entry's own revision rather
-    // than this map.
-    const staleForMs = Date.now() - (lockProvenAt.get(lockKey) ?? Date.now());
-    const expired = staleForMs >= lockProofDeadlineMs();
-    logger.warn({ err: e, lockKey, staleForMs, expired }, "lock.refresh_failed");
-    return expired ? "expired" : "error";
+    return renewalFailed(lockKey, e);
   }
+}
+
+/**
+ * After a revision conflict: is the entry still ours, and if so renew it.
+ *
+ * Ours means this process's holder id *and* this acquisition's id. The holder
+ * id is unique per process, so a match cannot be a different pod; the
+ * acquisition id keeps a later run of the same lock key in this same process
+ * from being mistaken for this one (and, through the local check around the
+ * write, keeps a renewal that outlived its run from writing at all). Anything
+ * else -- another holder, a value that does not parse, an entry that is gone --
+ * is the conflict meaning what it always meant.
+ *
+ * `error` is a read or a write that did not answer, which says nothing about
+ * ownership; the caller treats it like any other transport failure.
+ */
+async function renewOverOwnCommittedWrite(
+  lockKey: string,
+  value: LockValue,
+): Promise<"renewed" | "lost" | "error"> {
+  const key = `lock.${lockKey}`;
+  let entry: KvEntry | null;
+  try {
+    entry = await getKv().get(key);
+  } catch {
+    return "error";
+  }
+  if (!entry || isTombstone(entry)) return "lost";
+  let held: Partial<LockValue>;
+  try {
+    held = JSON.parse(sc.decode(entry.value)) as Partial<LockValue>;
+  } catch {
+    return "lost";
+  }
+  if (held.holderId !== BRAIN_HOLDER_ID || !value.acq || held.acq !== value.acq) return "lost";
+  // Asked again after the read: the run this renewal belongs to may have
+  // released the key, and another run taken it, while the read was in flight.
+  if (lockAcquisitions.get(lockKey) !== value.acq) return "lost";
+  try {
+    const newRev = await getKv().update(key, sc.encode(JSON.stringify(value)), entry.revision);
+    if (lockAcquisitions.get(lockKey) !== value.acq) return "lost";
+    lockRevisions.set(lockKey, Number(newRev));
+    lockProvenAt.set(lockKey, Date.now());
+    logger.info({ lockKey, revision: Number(newRev) }, "lock.refresh_adopted_own_write");
+    return "renewed";
+  } catch (e) {
+    // A second conflict inside one renewal is somebody else writing, not a
+    // timed-out write of ours: nothing of ours was in flight in between.
+    return isRevisionConflict(e) ? "lost" : "error";
+  }
+}
+
+/** A renewal that did not land and established nothing about ownership. */
+function renewalFailed(lockKey: string, e: unknown): LockRenewal {
+  // Forgetting the revision here used to end renewals for the rest of the run:
+  // every later tick found no revision, returned "not_held" without attempting
+  // anything, and said nothing -- so one NATS blip left the lock to expire under
+  // a healthy run, and the redelivery that took it over five minutes later ran
+  // the same task against the same sandbox while the original carried on. The
+  // revision is kept instead: a CAS with a stale one cannot take a lock from
+  // anybody, it can only fail (and be read back, above), and the release path
+  // reads the entry's own revision rather than this map.
+  const staleForMs = Date.now() - (lockProvenAt.get(lockKey) ?? Date.now());
+  const expired = staleForMs >= lockProofDeadlineMs();
+  logger.warn({ err: e, lockKey, staleForMs, expired }, "lock.refresh_failed");
+  return expired ? "expired" : "error";
 }
 
 export async function releaseTaskLock(lockKey: string): Promise<void> {
@@ -521,4 +641,45 @@ export async function releaseTaskLock(lockKey: string): Promise<void> {
   } finally {
     forgetLock(lockKey);
   }
+}
+
+/**
+ * Give back the locks this pod's previous process died holding.
+ *
+ * Called once at start, before anything is claimed, so nothing this process
+ * holds can be among them: a lock naming this pod under a different holder id
+ * is the previous incarnation's, and that process is gone. Deleted with a CAS
+ * on the revision just read, so a lock that changed hands in between is left
+ * to whoever has it. Returns how many were released; never throws -- a start
+ * that cannot do this is no worse off than before it existed, its runs simply
+ * wait out the TTL.
+ */
+export async function releaseLocksOfPreviousIncarnation(pod: string): Promise<number> {
+  let released = 0;
+  try {
+    const kv = getKv();
+    const keys: string[] = [];
+    for await (const key of await kv.keys("lock.>")) keys.push(key);
+    for (const key of keys) {
+      try {
+        const entry = await kv.get(key);
+        if (!entry || isTombstone(entry)) continue;
+        let held: Partial<LockValue>;
+        try {
+          held = JSON.parse(sc.decode(entry.value)) as Partial<LockValue>;
+        } catch {
+          continue;
+        }
+        if (held.pod !== pod || held.holderId === BRAIN_HOLDER_ID) continue;
+        await kv.delete(key, { previousSeq: entry.revision } as any);
+        released++;
+        logger.warn({ key, pod, previousHolder: held.holderId }, "lock.previous_incarnation_released");
+      } catch (err) {
+        logger.warn({ err, key }, "lock.previous_incarnation_release_failed");
+      }
+    }
+  } catch (err) {
+    logger.warn({ err, pod }, "lock.previous_incarnation_scan_failed");
+  }
+  return released;
 }

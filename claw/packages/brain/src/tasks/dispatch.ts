@@ -653,13 +653,40 @@ async function handleResolvedRequest(
     msg, request, sessionId, lockKey, messageId, userId, abortCtrl,
     claimedDoorbell ? { claimCount: claimGeneration ?? 0 } : null,
   );
-  inflightHandleTasks.add(taskPromise);
-  taskPromise.finally(() => {
-    inflightHandleTasks.delete(taskPromise);
+  trackInflight(taskPromise, () => {
     // The one place every dispatched run passes through on its way out. The
     // controller itself is cleared on several paths inside the run, and
     // spreading this over those is how the two got out of step before.
     forgetRunAddresses(lockKey);
   });
   await taskPromise;
+}
+
+/**
+ * Hold a run in the drain set until it settles, then run `onSettled`.
+ *
+ * The run's own rejection is not this function's to report -- the caller
+ * awaits the same promise and its delivery handler logs it -- but whatever
+ * this attaches has to be handled here. It used to be
+ * `taskPromise.finally(cleanup)` as a bare statement: `finally` returns a new
+ * promise that rejects with the run's error, and nothing awaited that one. So
+ * every run that failed by throwing was reported twice, once as `task.unhandled`
+ * by the delivery handler and once as an unhandled rejection, and Node's
+ * default for the second is to kill the process. On 2026-11-06 a single
+ * JetStream publish timing out inside a failing run's terminal path took a
+ * brain pod down that way, with every other run on it.
+ *
+ * Exported for the test that pins it; production calls it only from handleTask.
+ */
+export function trackInflight(task: Promise<void>, onSettled: () => void): void {
+  inflightHandleTasks.add(task);
+  const settle = () => {
+    inflightHandleTasks.delete(task);
+    try {
+      onSettled();
+    } catch (err) {
+      logger.error({ err }, "task.inflight_cleanup_failed");
+    }
+  };
+  void task.then(settle, settle);
 }

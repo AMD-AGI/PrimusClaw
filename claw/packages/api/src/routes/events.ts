@@ -214,7 +214,11 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       const appEventOrder = new AppEventOrder();
 
       // 1. Push history from DB — one SSE frame per row.
-      const afterEventId = req.query.after || null;
+      // `Last-Event-ID` too: it is what a browser's EventSource sends when it
+      // reconnects by itself -- after a pod drain ended the stream with a
+      // `retry:` (infra/graceful-shutdown.ts), say -- to the same URL, which
+      // has no `?after=`. Without it the reconnect replays the whole history.
+      const afterEventId = req.query.after || lastEventIdOf(req.headers["last-event-id"]) || null;
       const historyRows = afterEventId
         ? (await db.query(
             "SELECT event_id, event, data FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL AND event_id > $2 ORDER BY id",
@@ -273,4 +277,12 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       return reply;
     },
   );
+}
+
+/** The `Last-Event-ID` header, if it is one of the ids this stream hands out. */
+export function lastEventIdOf(header: string | string[] | undefined): string | null {
+  const value = Array.isArray(header) ? header[0] : header;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9_.:-]{1,200}$/.test(trimmed) ? trimmed : null;
 }

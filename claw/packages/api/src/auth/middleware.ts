@@ -88,6 +88,7 @@ export function devAuthBypassEnabled(): boolean {
 // authenticate today.
 const ANONYMOUS_PATHS = new Set([
   "/health",
+  "/ready",
   "/metrics",
   "/.well-known/agent-card.json",
   "/.well-known/agent.json",

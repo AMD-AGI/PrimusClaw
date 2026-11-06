@@ -61,6 +61,12 @@ api:
   # claw/docs/platform-access.md before turning this on.
   requiredPlatformRoles: []
   port: 8200
+  # How an api pod leaves a rolling update (see api-deployment.yaml): it sleeps
+  # in preStop while it leaves the endpoints, then drains its requests and
+  # event streams for up to SHUTDOWN_DEADLINE_MS (75s). The grace period has to
+  # hold both.
+  terminationGracePeriodSeconds: 90
+  preStopSleepSeconds: 10
   # Where a client outside the cluster reaches the API, as CLAW_PUBLIC_URL --
   # "https://claw.example.com/claw-api". A2A agent cards advertise it, and the
   # ingress strips its path prefix before the API sees the request, so without

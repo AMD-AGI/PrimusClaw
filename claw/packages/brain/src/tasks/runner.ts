@@ -93,6 +93,7 @@ import {
   activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isUserCancelReason,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
+import { isTransientNatsError } from "../infra/nats-transient.js";
 import { pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
 import {
   redactEgressPayload, redactPersistedEvent, type RuntimeSecrets,
@@ -608,13 +609,26 @@ function checkpointS3Prefix(userId: string, sessionId: string, messageId: string
  * e32c683c-9809-40c1-a1a7-0cee3565465b. Keep vendor request_id in the
  * surfaced text so support can still trace upstream incidents.
  */
-function classifyTaskFailure(rawMsg: string): {
+function classifyTaskFailure(rawMsg: string, err?: unknown): {
   reason: string;
   userText: string;
 } {
   const msg = String(rawMsg || "");
   const reqIdMatch = msg.match(/"request_id"\s*:\s*"(req_[A-Za-z0-9_]+)"/);
   const reqIdSuffix = reqIdMatch ? ` (vendor request_id: ${reqIdMatch[1]})` : "";
+
+  // Before every message pattern below: a NatsError's message is the bare word
+  // "TIMEOUT", which the timeout pattern would read as the model timing out.
+  // It is Claw's own event bus or lock store that did not answer, the model was
+  // never involved, and saying otherwise sends whoever reads the reason to the
+  // wrong system. Normally such an error is retried rather than reaching here;
+  // this is what a run that used up its retries on one says.
+  if (isTransientNatsError(err)) {
+    return {
+      reason: "infra_transient",
+      userText: "Claw's internal messaging was briefly unavailable and the run could not continue. Please retry.",
+    };
+  }
 
   // First, because the sentence below mentions a deadline and would otherwise
   // be classified as an upstream timeout -- telling the user to retry a run
@@ -676,6 +690,9 @@ function classifyRetryableReason(err: unknown): string {
   const msg = String(e?.message || err || "");
   const causeMsg = String(e?.cause?.message || "");
   const causeCode = String(e?.cause?.code || "");
+  // First, for the reason classifyTaskFailure gives: "TIMEOUT" is a NatsError's
+  // whole message, and the line below would file it as the model's.
+  if (isTransientNatsError(err)) return "nats_transient";
   if (e?.name === "APIConnectionTimeoutError" || /timeout|deadline/i.test(msg)) return "llm_connection_timeout";
   if (e?.name === "APIConnectionError" || /connection error|fetch failed/i.test(msg)) return "llm_connection_error";
   if (typeof e?.status === "number") return `http_${e.status}`;
@@ -4138,7 +4155,7 @@ class TaskRunner {
     // not display a raw provider JSON body.
     const taskFailure = sandboxReason
       ? { reason: sandboxReason, userText: `Sandbox failure (${sandboxReason}): ${rawMsg.slice(0, 500)}` }
-      : classifyTaskFailure(rawMsg);
+      : classifyTaskFailure(rawMsg, err);
     const finalText = taskFailure.userText;
     // Partial progress fields. agentLoop's `result` is unavailable on the
     // failure path, so we fall back to the latest checkpoint state captured
