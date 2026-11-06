@@ -42,7 +42,7 @@
  * argument that matters, or leave the tool unlisted.
  */
 import pino from "pino";
-import { isTriggerMcpServer } from "@claw/protocol";
+import { isPlatformMcpServer } from "@claw/protocol";
 
 const logger = pino({ name: "approval-policy" });
 
@@ -50,8 +50,8 @@ export interface ApprovalPolicy {
   /** True when at least one server declares a rule. */
   readonly active: boolean;
   /**
-   * True when a server other than the platform's trigger server (`isTriggerMcpServer`) declares one. Only such a rule makes the
-   * turn one whose every tool HITL_ENABLED asks about; the trigger server's rule holds its own tools alone.
+   * True when a server other than one the API adds itself (`isPlatformMcpServer`: trigger tools, GitHub tools) declares one. Only such a rule makes the
+   * turn one whose every tool HITL_ENABLED asks about; such a server's rule holds its own tools alone.
    */
   readonly operatorActive: boolean;
   /** `toolName` is the model-visible name, `mcp__<server>__<tool>`. */
@@ -150,7 +150,7 @@ interface ServerRule {
    * nothing.
    */
   autos: Array<AutoMatcher | null>;
-  /** False for the platform's trigger server, whose rule holds its own tools and turns nothing else on. */
+  /** False for a server the API adds itself, whose rule holds its own tools and turns nothing else on. */
   operator: boolean;
 }
 
@@ -189,7 +189,7 @@ export function approvalPolicyFromMcp(
       autos.push(match);
     }
     if (holds.length === 0) continue;
-    rules.push({ prefix, holds: (bare) => holds.some((h) => h(bare)), autos, operator: !isTriggerMcpServer(name, spec) });
+    rules.push({ prefix, holds: (bare) => holds.some((h) => h(bare)), autos, operator: !isPlatformMcpServer(name, spec) });
   }
   const held = (r: ServerRule, toolName: string): boolean =>
     toolName.startsWith(r.prefix) && r.holds!(toolName.slice(r.prefix.length));

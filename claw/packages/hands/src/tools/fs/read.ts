@@ -4,6 +4,7 @@
 import fs from "node:fs";
 import { z } from "zod";
 import { guardPath } from "../../runtime/path-guard.js";
+import { readImage } from "./read-image.js";
 
 /** Lines one call returns when no limit is given; the rest is paged with offset. */
 export const READ_DEFAULT_LINES = 2000;
@@ -80,7 +81,7 @@ function formatCell(cell: Record<string, unknown>, index: number): string {
 
 export const read = {
   name: "read",
-  description: `Read a file from the workspace. Lines come numbered as N|text; at most ${READ_DEFAULT_LINES} lines per call, page with offset and limit. Automatically detects .ipynb and formats notebook cells.`,
+  description: `Read a file from the workspace. Lines come numbered as N|text; at most ${READ_DEFAULT_LINES} lines per call, page with offset and limit. Automatically detects .ipynb and formats notebook cells. A PNG, JPEG, GIF or WebP image is returned as the image itself, so you can look at it.`,
   zodSchema: schema,
   execute: async (args: { path: string; offset?: number; limit?: number; line_numbers?: boolean; notebook_cell_index?: number }) => {
     let safePath: string;
@@ -100,6 +101,9 @@ export const read = {
       }
     }
 
+    const image = readImage(safePath, args.path);
+    if (image) return image;
+
     let content: string;
     try { content = fs.readFileSync(safePath, "utf-8"); } catch (e: any) {
       return { content: [{ type: "text" as const, text: `Error reading ${args.path}: ${e.message}` }] };
@@ -108,12 +112,16 @@ export const read = {
     if (args.line_numbers === false && !args.offset && !args.limit) {
       return { content: [{ type: "text" as const, text: content }] };
     }
+    // A newline ends a line, it does not start one: "a\nb\n" is two lines, not two and an empty third.
     const lines = content.split("\n");
+    const endsWithNewline = lines.length > 1 && lines[lines.length - 1] === "";
+    if (endsWithNewline) lines.pop();
     const start = Math.max(0, (args.offset ?? 1) - 1);
     const end = Math.min(lines.length, start + (args.limit && args.limit > 0 ? args.limit : READ_DEFAULT_LINES));
     const page = lines.slice(start, end);
+    // Raw text keeps the file's own final newline when the page reaches the end.
     const body = args.line_numbers === false
-      ? page.join("\n")
+      ? page.join("\n") + (endsWithNewline && end === lines.length && page.length > 0 ? "\n" : "")
       : page.map((l, i) => `${start + i + 1}|${l}`).join("\n");
     const more = end < lines.length
       ? `\n[lines ${start + 1}-${end} of ${lines.length}; call read with offset=${end + 1} for more]`

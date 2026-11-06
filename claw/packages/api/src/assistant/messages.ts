@@ -15,8 +15,10 @@
  * The dedupe key makes a replayed tool call or a redelivered event leave one row.
  */
 import pino from "pino";
-import { CLAW_DEPLOY_MODE, RUN_DOORBELL_DISPATCH } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_DEPLOY_MODE, RUN_DOORBELL_DISPATCH } from "../config.js";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
+import { actingUserOf } from "../github-review/acting-as.js";
+import type { AttendedProof } from "../github-review/acting-session.js";
 import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import { db, type StatementRunner } from "../infra/db.js";
 import { insertPendingMessage, submitMessagePorts } from "../sessions/submit-message.js";
@@ -31,12 +33,18 @@ export interface ServerMessage {
   content: string;
   /** Names this message for a retry: a second one with the same key into the same session is not queued. */
   dedupeKey?: string;
+  /**
+   * The person's say, for a session that acts as a user (`config.acting_as`): only the request that created it can give it
+   * (`checkSessionCreate`). Without it such a session is refused, as every route refuses a turn in it to a key a sandbox holds
+   * (`github-review/acting-turns.ts`): the server queuing a message is a way to start a turn too.
+   */
+  attended?: AttendedProof;
 }
 
 export type QueuedServerMessage =
   | { ok: true; pendingId: number | null; deduplicated: boolean }
   /** The session holds no credentials of its owner to run a turn with (it never received a message from them). */
-  | { ok: false; error: "session_not_found" | "no_credentials" };
+  | { ok: false; error: "session_not_found" | "no_credentials" | "acting_session_unattended" };
 
 export async function queueServerMessage(q: StatementRunner, m: ServerMessage): Promise<QueuedServerMessage> {
   const session = (await q.query(
@@ -44,6 +52,7 @@ export async function queueServerMessage(q: StatementRunner, m: ServerMessage): 
     [m.sessionId],
   )).rows[0] as { config: unknown } | undefined;
   if (!session) return { ok: false, error: "session_not_found" };
+  if (actingUserOf(session.config) !== null && !m.attended) return { ok: false, error: "acting_session_unattended" };
   const creds = readTrustedSessionCredentials(session.config);
   // The same rule a message from the owner is held to (`assertSessionCredentialsForDispatch`): on SaFE the
   // platform key is what owns the workload, so a turn without one is not started under a shared identity.
@@ -57,9 +66,25 @@ export async function queueServerMessage(q: StatementRunner, m: ServerMessage): 
   });
   const inserted = await insertPendingMessage(q, {
     sessionId: m.sessionId, content: m.content, userId: m.userId, toolIds: [], secrets,
-    sessionEnv: {}, dedupeKey: m.dedupeKey,
+    sessionEnv: {}, dedupeKey: m.dedupeKey, pluginId: await workerPluginId(q, m.sessionId),
   });
   return { ok: true, pendingId: inserted.id, deduplicated: inserted.deduplicated };
+}
+
+/**
+ * The plugin a task item's worker runs with (`work_create` records it on the item), for every message the server puts on its
+ * session: the first task, an instruction forwarded to it, news from GitHub. Undefined for any other session, and for a worker
+ * whose item records none.
+ */
+async function workerPluginId(q: StatementRunner, sessionId: string): Promise<number | undefined> {
+  // The table is the assistant's, created only when it is on; a trigger queues into any session through here.
+  if (!CLAW_ASSISTANT_ENABLED) return undefined;
+  const row = (await q.query(
+    "SELECT params->>'plugin_id' AS plugin_id FROM claw_work_items WHERE worker_session_id = $1 AND kind = 'task'",
+    [sessionId],
+  )).rows[0] as { plugin_id: string | null } | undefined;
+  const id = Number(row?.plugin_id);
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
 }
 
 /**

@@ -66,6 +66,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "agent_gate_message_id",
       // Absent, the read that gives a turn its model fails, and so does every turn.
       "model",
+      // The same for the turn's effort, read with the model.
+      "effort",
       // Absent, every message to a session and every drain of its queue fails.
       "pending_drain_until",
     ],
@@ -202,8 +204,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
   {
     table: "claw_memory_entries",
     // The reason this guard exists, found the long way round. `kind` separates
-    // the rows decay is allowed to forget from the KB rows it must not touch,
-    // and the ALTER that adds it discards its error like every other. When the
+    // the user's rows from the KB rows memory must not touch, and the ALTER
+    // that adds it discards its error like every other. When the
     // column was absent the daily decay threw `column "kind" does not exist`
     // into a cron log nobody reads, and the only visible symptom was that
     // memory never faded -- a job silently not running, for months, with no
@@ -211,7 +213,14 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: [
       "id", "user_id", "category", "content", "importance",
       "access_count", "created_at", "last_accessed", "deleted_at", "kind",
+      "mtype", "title", "why", "how_to_apply", "status", "pinned", "token_count", "evidence_quote", "source_kind",
+      "recorded_at", "last_confirmed_at", "expires_at", "prev_title", "prev_body", "work_item_id",
     ],
+  },
+  {
+    table: "claw_memory_events",
+    // Every memory write and delete records here in the same transaction: absent, each one fails.
+    columns: ["id", "user_id", "entry_id", "op", "actor", "session_id", "reason", "title", "evidence_quote", "created_at"],
   },
   {
     table: "claw_assistants",
@@ -227,7 +236,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: [
       "item_id", "user_id", "seq", "title", "summary", "board_state", "last_report_kind",
       "pending_question", "outcome", "worker_session_id", "generation", "result_version",
-      "accepted_version", "attention_seq", "repo", "created_at", "updated_at", "closed_at",
+      "accepted_version", "attention_seq", "repo", "created_at", "updated_at", "closed_at", "kind", "params",
+      "memory_reached_at",
     ],
   },
   {
@@ -239,6 +249,39 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     table: "claw_assistant_says",
     onlyWhenAssistant: true,
     columns: ["say_id", "user_id", "item_id", "item_attention_seq", "text", "fallback", "created_at", "delivered_at"],
+  },
+  {
+    table: "claw_work_item_subscriptions",
+    // What the GitHub event loop claims and advances: absent, nothing an item watches is read.
+    onlyWhenAssistant: true,
+    columns: [
+      "id", "item_id", "user_id", "owner", "repo", "number", "reply_allowed", "state", "end_reason", "since", "cursor_at",
+      "polled_at", "last_error", "failing_since", "failure_reported", "trust_reported", "created_at", "ended_at",
+    ],
+  },
+  {
+    table: "claw_work_item_github_events",
+    onlyWhenAssistant: true,
+    columns: [
+      "event_id", "sub_id", "item_id", "kind", "github_id", "author", "url", "body", "path", "line", "reply_to", "head_sha", "occurred_at",
+      "created_at", "delivered_at", "delivery_key", "tried_at", "dropped_at", "drop_reason",
+    ],
+  },
+  {
+    table: "claw_work_item_pr_replies",
+    onlyWhenAssistant: true,
+    columns: ["event_id", "item_id", "sub_id", "run_id", "generation", "body", "state", "attempt_at", "attempt", "url", "comment_id", "created_at", "posted_at"],
+  },
+  {
+    table: "claw_assistant_scopes",
+    // What makes a session an observer, whose every tool only records: absent, the role lookup fails and so does the turn.
+    onlyWhenAssistant: true,
+    columns: ["user_id", "scope", "mode", "session_id", "mode_set_at", "mode_set_via", "created_at", "updated_at"],
+  },
+  {
+    table: "claw_assistant_observations",
+    onlyWhenAssistant: true,
+    columns: ["id", "user_id", "scope", "session_id", "run_id", "tool", "args", "created_at"],
   },
 ];
 

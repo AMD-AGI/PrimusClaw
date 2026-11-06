@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 process.env.ASK_USER_QUESTION_ENABLED = "true";
 process.env.ASK_USER_QUESTION_TIMEOUT_MS = "2000";
 delete process.env.BASH_APPROVAL_RULES;
+process.env.BASH_APPROVAL_DEFAULTS_ENABLED = "false";
 
 import { startWorld, fakeHands, baseRequest } from "./support/platform-defaults-world.js";
 

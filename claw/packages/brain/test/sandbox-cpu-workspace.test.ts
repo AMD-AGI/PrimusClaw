@@ -3,13 +3,12 @@
 
 /**
  * A deployment with a CPU workspace: a sandbox that asks for no GPU goes there, one
- * that asks for a GPU never does, and each workspace is reached through the Router
- * of its own cluster.
+ * that asks for a GPU never does, and both workspaces are reached through the one Router.
  *
  * The rule is pinned three ways, because it is applied in three places that have to
  * agree: the pure function, the namespace a request's spec fingerprint folds in (the
  * same function picks the namespace the workload is created in), and the instance an
- * app sandbox is addressed by. The Router half is pinned where a request is sent.
+ * app sandbox is addressed by. The one Router serves both workspaces.
  */
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -18,7 +17,6 @@ import type { ExecuteRequest } from "@claw/protocol";
 process.env.SANDBOX_NAMESPACE = "gpu-ws";
 process.env.SANDBOX_CPU_NAMESPACE = "cpu-ws";
 process.env.SANDBOX_ROUTER_URL = "http://gpu-r1.test,http://gpu-r2.test";
-process.env.SANDBOX_CPU_ROUTER_URL = "http://cpu-r1.test, http://cpu-r2.test/";
 process.env.SANDBOX_HANDS_VIA_ROUTER = "true";
 delete process.env.CLAW_DEPLOY_MODE;
 
@@ -27,7 +25,7 @@ const { requestSpecFingerprint } = await import("../src/sandbox/ensure-hands.js"
 const { resolveSandboxAction } = await import("../src/sandbox/params.js");
 const { appSandboxInstance } = await import("../src/apps/app-sandbox.js");
 const {
-  sandboxRouterBasesFor, sandboxRouterBases, handsViaRouter, safeHandsBaseUrl, routerBaseForPortProxy,
+  sandboxRouterBases, handsViaRouter, safeHandsBaseUrl, routerBaseForPortProxy,
   withRouterFailover, resetRouterPreferenceForTest,
 } = await import("../src/sandbox/sandbox-router.js");
 const { SafeWorkloadProvider } = await import("../src/sandbox/safe-workload-provider.js");
@@ -132,39 +130,31 @@ test("an app sandbox is addressed in the workspace the rule picks", () => {
   assert.equal(sandboxNamespaceForResources(undefined, { gpu: "0" }), "cpu-ws");
 });
 
-// --- each workspace through the Router of its own cluster -----------------------
+// --- every workspace through the one Router ----------------------------------
 
-test("the Router bases follow the namespace; the CPU Router serves only the CPU workspace", () => {
-  assert.deepEqual(sandboxRouterBasesFor("cpu-ws"), ["http://cpu-r1.test", "http://cpu-r2.test"]);
-  assert.deepEqual(sandboxRouterBasesFor(" cpu-ws "), ["http://cpu-r1.test", "http://cpu-r2.test"]);
-  for (const ns of ["gpu-ws", "ws-x", "", undefined, null]) {
-    assert.deepEqual(sandboxRouterBasesFor(ns), ["http://gpu-r1.test", "http://gpu-r2.test"], String(ns));
-  }
-  assert.deepEqual(sandboxRouterBases(), ["http://gpu-r1.test", "http://gpu-r2.test"], "the default list is unchanged");
+test("one Router list serves every workspace", () => {
+  assert.deepEqual(sandboxRouterBases(), ["http://gpu-r1.test", "http://gpu-r2.test"]);
 });
 
-test("Hands URLs and the port-proxy base are built on the Router of the sandbox's namespace", () => {
-  assert.equal(handsViaRouter("cpu-ws"), true);
-  assert.equal(handsViaRouter("gpu-ws"), true);
+test("Hands URLs and the port-proxy base are built on the one Router for every workspace", () => {
+  assert.equal(handsViaRouter(), true);
   assert.equal(
     safeHandsBaseUrl("cpu-ws", "wl-1", "9100"),
-    "http://cpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/wl-1/invocations/proxy/9100",
+    "http://gpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/wl-1/invocations/proxy/9100",
   );
   assert.equal(
     safeHandsBaseUrl("gpu-ws", "wl-2", "9100"),
     "http://gpu-r1.test/v1/namespaces/gpu-ws/code-interpreters/wl-2/invocations/proxy/9100",
   );
-  assert.equal(routerBaseForPortProxy("cpu-ws"), "http://cpu-r1.test");
-  assert.equal(routerBaseForPortProxy("gpu-ws"), "http://gpu-r1.test");
+  assert.equal(routerBaseForPortProxy(), "http://gpu-r1.test");
   assert.equal(handsBehindRouterProxy(), true);
 });
 
-test("exec goes to the Router of the instance's namespace, and a refusal moves only within that Router's list", async () => {
+test("exec for any workspace goes to the one Router, and a refusal moves within its list", async () => {
   const seen: string[] = [];
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     seen.push(`${init?.method} ${String(input)}`);
-    const host = new URL(String(input)).host;
-    if (host === "cpu-r1.test" || host === "gpu-r1.test") {
+    if (new URL(String(input)).host === "gpu-r1.test") {
       throw Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("refused"), { code: "ECONNREFUSED" }) });
     }
     return { ok: true, status: 200, json: async () => ({ exit_code: 0, stdout: "hi\n", stderr: "" }) } as Response;
@@ -172,53 +162,50 @@ test("exec goes to the Router of the instance's namespace, and a refusal moves o
   const inst = (namespace: string, id: string) => ({ provider: "safe-workload" as const, id, sandboxName: id, namespace, handsBaseUrl: "", platformKey: "pk" });
   const provider = new SafeWorkloadProvider();
   await provider.exec(inst("cpu-ws", "wl-c"), "echo hi", "5s");
+  resetRouterPreferenceForTest();
   await provider.exec(inst("gpu-ws", "wl-g"), "echo hi", "5s");
   assert.deepEqual(seen, [
-    "POST http://cpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/wl-c/invocations/api/execute",
-    "POST http://cpu-r2.test/v1/namespaces/cpu-ws/code-interpreters/wl-c/invocations/api/execute",
+    "POST http://gpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/wl-c/invocations/api/execute",
+    "POST http://gpu-r2.test/v1/namespaces/cpu-ws/code-interpreters/wl-c/invocations/api/execute",
     "POST http://gpu-r1.test/v1/namespaces/gpu-ws/code-interpreters/wl-g/invocations/api/execute",
     "POST http://gpu-r2.test/v1/namespaces/gpu-ws/code-interpreters/wl-g/invocations/api/execute",
   ]);
 });
 
-test("a stored Hands URL fails over inside its own Router's list, whichever Router it is on", async () => {
+test("a stored Hands URL fails over inside the Router list; a direct URL passes through", async () => {
   const seen: string[] = [];
   const f = withRouterFailover(async (input: string) => {
     seen.push(String(input));
-    const host = new URL(String(input)).host;
-    if (host === "cpu-r1.test" || host === "gpu-r1.test") {
+    if (new URL(String(input)).host === "gpu-r1.test") {
       throw Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("refused"), { code: "ECONNREFUSED" }) });
     }
     return "ok";
   });
-  await f("http://cpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/w/invocations/proxy/9100/health");
-  await f("http://gpu-r1.test/v1/namespaces/gpu-ws/code-interpreters/w/invocations/proxy/9100/health");
+  await f("http://gpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/w/invocations/proxy/9100/health");
   await f("http://w.cpu-ws.svc.cluster.local:9100/health");
   assert.deepEqual(seen, [
-    "http://cpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/w/invocations/proxy/9100/health",
-    "http://cpu-r2.test/v1/namespaces/cpu-ws/code-interpreters/w/invocations/proxy/9100/health",
-    "http://gpu-r1.test/v1/namespaces/gpu-ws/code-interpreters/w/invocations/proxy/9100/health",
-    "http://gpu-r2.test/v1/namespaces/gpu-ws/code-interpreters/w/invocations/proxy/9100/health",
+    "http://gpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/w/invocations/proxy/9100/health",
+    "http://gpu-r2.test/v1/namespaces/cpu-ws/code-interpreters/w/invocations/proxy/9100/health",
     "http://w.cpu-ws.svc.cluster.local:9100/health",
   ]);
 });
 
-test("the app MCP probe fails over inside the list of the Router its URL is on, never to the other cluster's", async () => {
+test("the app MCP probe fails over inside the Router list", async () => {
   const seen: string[] = [];
   globalThis.fetch = (async (input: unknown) => {
     seen.push(String(input));
-    if (new URL(String(input)).host === "cpu-r1.test") {
+    if (new URL(String(input)).host === "gpu-r1.test") {
       throw Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("refused"), { code: "ECONNREFUSED" }) });
     }
     return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { status: 200, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
   const verdict = await probeAppMcp({
-    url: "http://cpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/wl-1/invocations/proxy/9000/mcp",
+    url: "http://gpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/wl-1/invocations/proxy/9000/mcp",
     tokenHeader: "x-mcp-token", token: "t", sandboxSessionId: "wl-1", bearer: "b",
   });
   assert.deepEqual(verdict, { kind: "ok" });
   assert.deepEqual(seen, [
-    "http://cpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/wl-1/invocations/proxy/9000/mcp",
-    "http://cpu-r2.test/v1/namespaces/cpu-ws/code-interpreters/wl-1/invocations/proxy/9000/mcp",
+    "http://gpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/wl-1/invocations/proxy/9000/mcp",
+    "http://gpu-r2.test/v1/namespaces/cpu-ws/code-interpreters/wl-1/invocations/proxy/9000/mcp",
   ]);
 });

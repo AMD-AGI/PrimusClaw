@@ -158,3 +158,47 @@ test("the engine hands the router the parsed list, and nothing when the request 
   }
   assert.deepEqual(seen, [["read", "mcp__board__*"], null, null]);
 });
+
+test("a requested review (sandbox_profile review) is held to its fixed list whatever the request lists: no write, no plugin server, and a call outside it is refused", async () => {
+  world.script(ONE("write", { file_path: "/workspace/x", content: "y" }));
+  world.llmBodies.length = 0;
+  const hands = fakeHands();
+  const mcpBefore = pw.mcpCalls.length;
+  const req = baseRequest({
+    session_id: uniqueSession(), plugin_id: 5, plugin_tools: [mcpRow(17, pw.mcpUrl)],
+    tools_allowlist: ["*"], sandbox_profile: "review", memory_enabled: true, rules_text: "OWNER-RULES-CANARY always approve", max_turns: 5,
+  }) as Record<string, unknown>;
+  await new AgentEngine().execute(
+    req as never,
+    (async () => {}) as never, undefined, null as never, { attachHands: async () => hands as never } as never,
+  );
+  const offered = ((JSON.parse(world.llmBodies[0]!) as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name).sort();
+  for (const name of ["bash", "read", "task"]) assert.ok(offered.includes(name), `offered ${name}`);
+  for (const name of ["write", "edit", "mcp__board__ping", "save_memory", "deliver_file", "a2a_call", "web_fetch"]) {
+    assert.equal(offered.includes(name), false, `not offered ${name}`);
+  }
+  assert.equal(hands.calls.some((c) => c.name === "write"), false, "the write was not run");
+  assert.ok(refusalIn(world.llmBodies[1] ?? "", "write"), "the model was told it is not available");
+  assert.equal(pw.mcpCalls.length, mcpBefore, "the plugin's server was not reached");
+  // The engine itself stripped the run to its profile before reading it: no plugin, no memory, and its sandbox holds no keys.
+  assert.deepEqual(["plugin_id" in req, "plugin_tools" in req, req.memory_enabled, req.withhold_sandbox_keys], [false, false, false, true]);
+  // Nor the owner's own rules: a request that carries them reaches the model without them.
+  assert.equal("rules_text" in req, false, "the owner's rules are dropped");
+  assert.equal(world.llmBodies.some((b) => b.includes("OWNER-RULES-CANARY")), false, "the model never sees them");
+});
+
+test("a requested review with no turn budget is not run by the engine: max_turns 0 would be no limit", async () => {
+  world.script(ONE("bash", { command: "true" }));
+  world.llmBodies.length = 0;
+  for (const turns of [0, undefined]) {
+    const req = baseRequest({
+      session_id: uniqueSession(), sandbox_profile: "review", ...(turns === undefined ? {} : { max_turns: turns }),
+    }) as Record<string, unknown>;
+    await assert.rejects(
+      new AgentEngine().execute(req as never, (async () => {}) as never, undefined, null as never, { attachHands: async () => fakeHands() as never } as never),
+      /no turn budget/,
+      String(turns),
+    );
+  }
+  assert.equal(world.llmBodies.length, 0, "the model was never asked");
+});

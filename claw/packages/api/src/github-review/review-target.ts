@@ -33,3 +33,33 @@ export function reviewTargetOf(config: unknown): ReviewTargetParse {
 export function isReviewTarget(ref: PrRef, target: PrRef): boolean {
   return ref.owner.toLowerCase() === target.owner.toLowerCase() && ref.repo.toLowerCase() === target.repo.toLowerCase() && ref.number === target.number;
 }
+
+/**
+ * `config.review_only` of a session: true when whoever created it asked for a review and nothing more. Like the target, written only at
+ * creation and enforced by the tools: such a session's `gh_pr_merge` is refused (`review_only`), whatever its model was told, so it can
+ * review and approve but never merge, nor approve on the way to a merge. Absent is false; anything but a boolean is refused at creation.
+ */
+export function parseReviewOnly(value: unknown): { ok: true; reviewOnly: boolean } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true, reviewOnly: false };
+  return typeof value === "boolean" ? { ok: true, reviewOnly: value } : { ok: false, error: "config.review_only must be true or false" };
+}
+
+/** Whether a session's stored config asks for a review only. A stored value that is not a boolean reads as review only: the caller refuses less, never more. */
+export function reviewOnlyOf(config: unknown): boolean {
+  const value = config !== null && typeof config === "object" ? (config as Record<string, unknown>).review_only : undefined;
+  const parsed = parseReviewOnly(value);
+  return parsed.ok ? parsed.reviewOnly : true;
+}
+
+/**
+ * `config.merge_needs_confirmation` of a session: written by the server, never by a caller, on the session of a review the assistant's
+ * router started or restarted (`review_start`, `review_restart`). Natural language never approves a merge, and the router's `merge=true`
+ * is read from a sentence, so such a session merges nothing, and approves nothing GitHub's auto-merge or merge queue would merge, until the acting user
+ * has confirmed that very write: the tools hold it (`confirmation_required`) whatever its risk and the acting user's review mode, and it is
+ * made only from the card's button or the exact command `批准 #<ref>` / `approve #<ref>` (C2). Absent or `false` is no such session;
+ * any other stored value reads as one: the caller refuses more, never less.
+ */
+export function mergeNeedsConfirmationOf(config: unknown): boolean {
+  const value = config !== null && typeof config === "object" ? (config as Record<string, unknown>).merge_needs_confirmation : undefined;
+  return value !== undefined && value !== null && value !== false;
+}

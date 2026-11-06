@@ -22,8 +22,10 @@ import { publishEvent } from "../events/store.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
   ASSISTANT_EVENT_TYPES,
-  type AssistantEventPayload,
   type AssistantItemSnapshot,
+  type AssistantConfirmAction,
+  type AssistantSayPayload,
+  type WorkItemNeedsYouPayload,
 } from "../notifications/assistant-events.js";
 import { deterministicEventId, enqueue, kickDelivery, onDelivered } from "../notifications/outbox.js";
 import type { ItemRefError } from "./item-ref.js";
@@ -83,9 +85,10 @@ interface ItemRow {
   pending_question: string | null;
   result_version: number;
   attention_seq: number;
+  outcome: string | null;
 }
 
-const ITEM_COLUMNS = "item_id, user_id, seq, title, board_state, last_report_kind, pending_question, result_version, attention_seq";
+const ITEM_COLUMNS = "item_id, user_id, seq, title, board_state, last_report_kind, pending_question, result_version, attention_seq, outcome";
 
 const snapshot = (item: ItemRow): AssistantItemSnapshot => ({
   item_id: item.item_id,
@@ -102,7 +105,7 @@ const redact = (text: string): string => String(redactPublicJson(text) ?? "");
 interface Stored {
   sayId: string;
   sessionId: string | null;
-  payload: AssistantEventPayload;
+  payload: AssistantSayPayload | WorkItemNeedsYouPayload;
   subscribers: number;
 }
 
@@ -114,7 +117,7 @@ interface ToStoreBase {
 }
 
 type ToStore =
-  | (ToStoreBase & { type: "assistant.say"; item: ItemRow | null })
+  | (ToStoreBase & { type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow });
 
 /** Store the message and queue it for every subscription that asked for its type. `null`: it was stored before. */
@@ -124,14 +127,14 @@ async function store(q: Querier, m: ToStore): Promise<Stored | null> {
      VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (say_id) DO NOTHING
      RETURNING created_at`,
-    [m.sayId, m.userId, m.item?.item_id ?? null, m.item?.attention_seq ?? null, m.text, m.type === "work_item.needs_you"],
+    [m.sayId, m.userId, m.item?.item_id ?? null, m.item?.attention_seq ?? null, m.text, m.type === "work_item.needs_you" || m.fallback === true],
   )).rows[0];
   if (!inserted) return null;
 
   const base = { event_id: m.sayId, occurred_at: new Date(inserted.created_at).toISOString(), user_id: m.userId, text: redact(m.text) };
-  const payload: AssistantEventPayload = m.type === "work_item.needs_you"
+  const payload: AssistantSayPayload | WorkItemNeedsYouPayload = m.type === "work_item.needs_you"
     ? { ...base, type: m.type, fallback: true, item: snapshot(m.item) }
-    : { ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}) };
+    : { ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}) };
 
   // The subscription's `sources` is about what started a run; an assistant message is not one.
   const subs = CLAW_NOTIFICATIONS_ENABLED
@@ -239,20 +242,62 @@ function needsYouText(item: ItemRow): string {
 export async function recordNeedsYouFallback(input: { itemId: string }, deps: SayDeps = {}): Promise<SayOutcome | null> {
   const stored = await inTransaction(async (q) => {
     const item = await loadItem(q, input.itemId);
-    if (!item || item.board_state !== "needs_you") return null;
+    const answered = item?.board_state === "done" && item.outcome === "answered";
+    if (!item || (item.board_state !== "needs_you" && !answered)) return null;
+    // An answer is said whole, from the report (the item's own summary is cut to a line).
+    const answer = answered
+      ? ((await q(
+          "SELECT summary FROM claw_work_item_events WHERE item_id = $1 AND kind = 'answer' ORDER BY id DESC LIMIT 1", [item.item_id],
+        )).rows[0]?.summary as string | undefined) ?? ""
+      : "";
     const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id ?? null;
     return store(q, {
       type: "work_item.needs_you",
       sayId: deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq)),
       userId: item.user_id,
       sessionId,
-      text: needsYouText(item),
+      text: answered ? `#${item.seq} "${item.title}": ${answer}` : needsYouText(item),
       item,
     });
   });
   if (!stored) return null;
   await announce(stored, deps);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
+}
+
+/**
+ * A message in the system's own words, not the model's: stored as a fallback, so it is neither counted against the say
+ * limit nor taken for the turn having spoken. Once per `key`: a second call stores nothing and returns `null`.
+ */
+export async function recordSystemNotice(
+  input: { userId: string; sessionId: string; text: string; key: string }, deps: SayDeps = {},
+): Promise<SayOutcome | null> {
+  const stored = await inTransaction((q) => store(q, {
+    type: "assistant.say", fallback: true, item: null,
+    sayId: deterministicEventId("assistant.notice", input.userId, input.key),
+    userId: input.userId, sessionId: input.sessionId, text: input.text,
+  }));
+  if (!stored) return null;
+  await announce(stored, deps);
+  return { say_id: stored.sayId, subscribers: stored.subscribers };
+}
+
+/**
+ * A channel action put to the person instead of run (`channel_action`): a message in the system's own words naming the exact
+ * command, carrying the action for a channel to draw as a button. The channel runs it only when the person presses it. Stored
+ * in the caller's transaction, as a fallback (not counted against the say limit, not taken for the turn having spoken), once per
+ * `key`: `null` when it was stored before. `announce` after the commit.
+ */
+export async function recordActionConfirm(
+  q: Querier, input: { userId: string; sessionId: string; key: string; text: string; action: AssistantConfirmAction }, deps: SayDeps = {},
+): Promise<{ sayId: string; subscribers: number; announce: () => Promise<void> } | null> {
+  const stored = await store(q, {
+    type: "assistant.say", fallback: true, item: null, confirmAction: input.action,
+    sayId: deterministicEventId("assistant.confirm_action", input.userId, input.key),
+    userId: input.userId, sessionId: input.sessionId, text: input.text,
+  });
+  if (!stored) return null;
+  return { sayId: stored.sayId, subscribers: stored.subscribers, announce: () => announce(stored, deps) };
 }
 
 /** Stamp `delivered_at` once a receiver has taken a message. Call once at startup, with the notification worker. */

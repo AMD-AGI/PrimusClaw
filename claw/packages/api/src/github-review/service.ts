@@ -31,13 +31,13 @@ import { MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, type InstructionChanges, 
 import { PAGE_MAX_CHARS, SECTIONS, conversationText, diffRanges, diffText, filesText, fitPage, isSection, type Comment, type Section } from "./pages.js";
 import { isReviewInstructionPath, selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
-import { isReviewTarget } from "./review-target.js";
+import { isReviewTarget, reviewOnlyOf } from "./review-target.js";
 import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  acquireWriteLock, countPendingConfirmations, getReviewMode, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
-  type Confirmation, type DecidedVia, type HeldReview, type Queryable, type ReviewComment, type ReviewEvent, type ReviewMode,
+  acquireWriteLock, writeLockKey, countPendingConfirmations, getReviewMode, headReviewFacts, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
+  type ClaimResult, type Confirmation, type DecidedVia, type HeldReview, type PostedFinding, type PostedReview, type Queryable, type ReviewComment, type ReviewEvent, type ReviewMode,
 } from "./store.js";
 
 const logger = pino({ name: "github-review" });
@@ -52,6 +52,13 @@ export interface ReviewActor {
   requesterLabel?: string;
   /** The one pull request the session may touch (`config.review_target`, see review-target.ts); none means any pull request of an allowed owner. */
   reviewTarget?: PrRef | null;
+  /** `config.review_only` (review-target.ts): the session reviews and never merges, so `gh_pr_merge` is refused (`review_only`). */
+  reviewOnly?: boolean;
+  /**
+   * `config.merge_needs_confirmation` (review-target.ts): a review the assistant's router started. Its merge, and an approval that GitHub's
+   * auto-merge would turn into one, is always held for the acting user's confirmation (C2), whatever the risk and their review mode.
+   */
+  mergeNeedsConfirmation?: boolean;
 }
 
 export interface ToolOutcome {
@@ -81,6 +88,33 @@ export interface ReviewDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Where the structured log lines go; the process's logger by default. */
   logger?: { info(fields: Record<string, unknown>, message: string): void };
+  /** Whether the requester stopped the review this session is (assistant/review-items.ts); an approval or a merge is then not made. */
+  sessionStopped?: (sessionId: string) => Promise<boolean>;
+  /**
+   * The last review this session's review item continues (assistant/review-items.ts `params.continues`), or null when it is a first review
+   * or not a review item. Set only while review items are on; without it nothing below about a re-review happens.
+   */
+  continuationOf?: (sessionId: string) => Promise<ReviewContinuation | null>;
+  /** Keep what a posted review said, with its threads, on its audit row (`posted`): for review items only, so that a re-review can continue it. */
+  recordPosted?: boolean;
+}
+
+/** What a re-review is given of the review before it: the head it read and its findings, each with the thread GitHub opened for it. */
+export interface ReviewContinuation {
+  sinceHeadSha: string;
+  findings: Array<Pick<PostedFinding, "path" | "line" | "thread_id" | "note"> & { resolved: boolean }>;
+}
+
+/**
+ * How much of a pull request a re-review reads, decided here and not by the model: only what changed since the last review's head
+ * (`delta`), nothing new (`unchanged`), or all of it again (`full`) when that change cannot be read as a plain continuation of the last
+ * head, is large, or touches security, CI or release paths.
+ */
+export interface ContinuationScope {
+  scope: "delta" | "unchanged" | "full";
+  reason: "head_unchanged" | "small_delta" | "history_rewritten" | "base_merged" | "large_delta" | "security_path";
+  files: RiskFile[];
+  evidence: string[];
 }
 
 interface Ctx {
@@ -98,6 +132,8 @@ interface Ctx {
     write: boolean; dryRun: boolean; reviewPath?: string; reviewPathReason?: string; reviewMode?: ReviewMode;
     /** The audit row has been marked as a write, so it already counts against the limits. */
     reserved?: boolean;
+    /** What a posted review said, kept for a review item (`ReviewDeps.recordPosted`). */
+    posted?: PostedReview;
   };
   /** The call is not held to the session's request budget (a person's answer to a held write, see `decide`). */
   skipBudget?: boolean;
@@ -154,6 +190,13 @@ interface PullState {
   nodeId: string;
   /** The pull request's entry in the merge queue when it is already in one, as GitHub reports it; null when it is not. */
   queueEntry: QueueEntry | null;
+  /** Someone turned GitHub's auto-merge on for the pull request, so an approval that completes its requirements merges it. */
+  autoMerge: boolean;
+}
+
+/** GitHub merges the pull request by itself once its requirements are met: auto-merge is on, or it already waits in the merge queue. */
+function mergesByItself(state: Pick<PullState, "autoMerge" | "queueEntry">): boolean {
+  return state.autoMerge || state.queueEntry !== null;
 }
 
 /** What one `gh_pr_get` read from GitHub, kept for the pages of the same head (see `reviewRead`). */
@@ -172,7 +215,21 @@ interface ReviewRead {
   reviewPathReason: string;
   /** `how_to_read` of the overview: the deep review's sandbox path reads the diff from its checkout instead of in pages. */
   howToRead: string;
+  /** A re-review's findings of the last review with their notes: words a model wrote after reading the pull request, so under `untrusted`. */
+  previousNotes?: Array<{ n: number; thread_id: string | null; path: string; line: number; note: string }>;
 }
+
+/** Most files GitHub lists in one compare; a compare with this many may have been cut, so it is read as a large change. */
+const COMPARE_MAX_FILES = 300;
+/** The thread ids GitHub gives (`PRRT_...`); anything else is not looked up. */
+const THREAD_ID_RE = /^[A-Za-z0-9_=-]{1,100}$/;
+/** The threads of the newest reviews, with the review each began in: how a posted review's inline comments are matched to their threads. */
+const POSTED_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){
+  reviewThreads(last:100){nodes{id isResolved path line comments(first:1){nodes{pullRequestReview{databaseId}}}}}}}}`;
+const THREAD_QUERY = `query($id:ID!){node(id:$id){... on PullRequestReviewThread{id isResolved
+  pullRequest{number repository{nameWithOwner}} comments(first:1){nodes{author{login}}}}}}`;
+const RESOLVE_THREAD_MUTATION = `mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}`;
+const NOTE_CHARS = 200;
 
 /** A merge queue entry as GitHub reports it (`MergeQueueEntry`): the id, the place in the queue and its state (QUEUED, AWAITING_CHECKS, MERGEABLE, UNMERGEABLE, LOCKED). */
 interface QueueEntry {
@@ -218,7 +275,7 @@ const REVIEW_PAGE = 100;
 const MAX_REVIEW_PAGES = 10;
 
 const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){
-  id mergeStateStatus mergeable reviewDecision headRefOid isMergeQueueEnabled isInMergeQueue mergeQueueEntry{id position state}
+  id mergeStateStatus mergeable reviewDecision headRefOid isMergeQueueEnabled isInMergeQueue mergeQueueEntry{id position state} autoMergeRequest{enabledAt}
   reviewThreads(first:100){totalCount nodes{isResolved}}}}}`;
 
 /** What a page served from a session's read asks of GitHub: the repository as it is now (the gates of `readRepo`) and the head. */
@@ -336,6 +393,11 @@ export class GithubReview {
     const { repo, pr } = await this.load(ctx, ref);
     const change = await this.collectChange(ctx, ref, pr);
     const risk = assessRisk(this.riskInput(pr, repo, change));
+    // A re-review reads, in `files` and `diff`, only what changed since the last one when the code says that is enough; the risk, the holds
+    // and every gate of a write stay those of the whole pull request.
+    const continuation = this.deps.continuationOf ? await this.deps.continuationOf(ctx.actor.sessionId) : null;
+    const scope = continuation ? await this.continuationScope(ctx, ref, repo, pr, change, continuation) : null;
+    const shown = scope && scope.scope !== "full" ? scope.files : change.files;
     const state = await this.readState(ctx, ref, pr, repo);
     // At the base commit the head was compared with (instructionChanges), not wherever the branch is by now.
     const instructions = await selectReviewInstructions(ctx.client, ref, pr.baseRef, pr.baseSha, ctx.settings.deepReview);
@@ -376,28 +438,112 @@ export class GithubReview {
       },
       files_complete: change.complete,
       review_path: {
-        path: choice.path, reason: choice.reason, advice: reviewPathAdvice(choice, ctx.settings.deepReview),
+        path: choice.path, reason: choice.reason,
+        // A re-review that reads only the change since the last head reads it here, whatever the path: the checkout's whole diff is the
+        // pull request's, which the review instructions read on the sandbox path and this review must not review again.
+        advice: continuation && scope && scope.scope !== "full" ? this.continuationAdvice(continuation, scope, choice.path) : reviewPathAdvice(choice, ctx.settings.deepReview),
         max_files_for_diff_only: ctx.settings.fastMaxFiles, max_changed_lines_for_diff_only: ctx.settings.fastMaxChangedLines,
         // The code reaches the sandbox anonymously and pinned to this head; the token is never part of it.
         sandbox_recipe: recipe, sandbox_recipe_usage: recipe ? SANDBOX_RECIPE_USAGE : null,
         sandbox_recipe_note: choice.path === "sandbox" && !recipe ? "the base branch name is not one the checkout recipe will put in a command: review from this result alone" : null,
       },
       review_instructions_source: { source: instructions.source, path: instructions.skillPath ?? null, base_sha: instructions.baseSha ?? null, note: instructions.note ?? null },
+      ...(continuation && scope ? { continuation: this.continuationBlock(continuation, scope) } : {}),
     };
+    const previousNotes = continuation
+      ? continuation.findings.map((f, i) => ({ n: i + 1, thread_id: f.thread_id, path: f.path, line: f.line, note: ctx.client.redact(f.note) }))
+      : undefined;
     const conversation = conversationText(clip(pr.title, 300), clip(pr.body, 8000), comments);
-    const readId = createHash("sha256").update(JSON.stringify([pr.headSha, pr.baseRef, instructions.text, conversation, diffText(change.files)])).digest("hex").slice(0, 16);
+    // A re-review's read also says what it continues; a first review's is digested exactly as before.
+    const digested = [pr.headSha, pr.baseRef, instructions.text, conversation, diffText(shown), ...(continuation && scope ? [overview.continuation, previousNotes] : [])];
+    const readId = createHash("sha256").update(JSON.stringify(digested)).digest("hex").slice(0, 16);
+    // A delta is read in pages here: the checkout holds the whole pull request, which this review does not read again.
+    const howToRead = ctx.settings.deepReview && choice.path === "sandbox" && recipe && (!scope || scope.scope === "full") ? HOW_TO_READ_FROM_CHECKOUT : HOW_TO_READ;
     return {
-      readId, pr, files: change.files, overview: { ...overview, read_id: readId }, instructions: instructions.text, conversation,
+      readId, pr, files: shown, overview: { ...overview, read_id: readId }, instructions: instructions.text, conversation,
       riskReasons: risk.evidence.map((e) => `evidence: ${e}`), reviewPath: choice.path, reviewPathReason: choice.reason,
-      howToRead: ctx.settings.deepReview && choice.path === "sandbox" && recipe ? HOW_TO_READ_FROM_CHECKOUT : HOW_TO_READ,
+      howToRead: continuation && scope ? `${this.continuationHowTo(continuation, scope)} ${howToRead}` : howToRead,
+      ...(previousNotes ? { previousNotes } : {}),
     };
+  }
+
+  /**
+   * The scope of a re-review (see {@link ContinuationScope}). The change since the last head is GitHub's compare of the two commits, which is
+   * a plain continuation only when it says `ahead`: after a force push or a rebase the last head is no ancestor, the "delta" would be
+   * another change altogether, and the whole pull request is read again. The size limits are the review path's own (review-path.ts).
+   */
+  private async continuationScope(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change, c: ReviewContinuation): Promise<ContinuationScope> {
+    const since = c.sinceHeadSha.toLowerCase();
+    if (since === pr.headSha) return { scope: "unchanged", reason: "head_unchanged", files: [], evidence: [] };
+    const full = (reason: ContinuationScope["reason"], evidence: string[] = []): ContinuationScope => ({ scope: "full", reason, files: change.files, evidence });
+    if (!SHA_RE.test(since)) return full("history_rewritten");
+    const a = await ctx.client.get<{ status?: string; files?: Array<Record<string, unknown>>; commits?: Array<{ parents?: unknown[] }> }>(
+      repoPath(ref, `/compare/${since}...${pr.headSha}`), undefined, [404]);
+    if (a.status === 404 || a.json?.status !== "ahead") return full("history_rewritten");
+    const files: RiskFile[] = (a.json.files ?? []).map((f) => ({
+      path: String(f.filename ?? ""), status: String(f.status ?? ""), additions: Number(f.additions ?? 0), deletions: Number(f.deletions ?? 0),
+      patch: typeof f.patch === "string" ? f.patch : undefined,
+      previousPath: typeof f.previous_filename === "string" && f.previous_filename ? f.previous_filename : undefined,
+    }));
+    // After "Update branch" (the base merged into the head) the compare is still `ahead`, but what it holds is the base's change, not the
+    // pull request's: its files are not the pull request's, and an inline comment on one is refused. A merge commit since the last head, or a
+    // changed file the pull request does not change, means the delta is not the author's own, and the whole pull request is read again.
+    if ((a.json.commits ?? []).some((cm) => Array.isArray(cm.parents) && cm.parents.length > 1)) {
+      return full("base_merged", ["a merge commit since the last review"]);
+    }
+    const prPaths = new Set(change.files.map((f) => f.path));
+    const outside = files.filter((f) => !prPaths.has(f.path)).map((f) => f.path);
+    if (outside.length > 0) return full("base_merged", [`${outside.length} changed files since the last review are not files of this pull request`]);
+    const lines = files.reduce((n, f) => n + f.additions + f.deletions, 0);
+    if (files.length >= COMPARE_MAX_FILES || files.length > ctx.settings.fastMaxFiles || lines > ctx.settings.fastMaxChangedLines) {
+      return full("large_delta", [`${files.length} files and ${lines} changed lines since the last review`]);
+    }
+    const risk = assessRisk({
+      files, changedFiles: files.length, filesComplete: true, additions: files.reduce((n, f) => n + f.additions, 0), deletions: files.reduce((n, f) => n + f.deletions, 0),
+      fork: pr.fork, authorAssociation: pr.authorAssociation, baseRef: pr.baseRef, defaultBranch: repo.defaultBranch, repoConfig: change.repoConfig,
+    });
+    if (risk.categories.some((k) => k === "security" || k === "ci_release")) return full("security_path", risk.evidence.slice(0, 5));
+    return { scope: "delta", reason: "small_delta", files, evidence: [] };
+  }
+
+  private continuationBlock(c: ReviewContinuation, scope: ContinuationScope): Record<string, unknown> {
+    return {
+      since_head_sha: c.sinceHeadSha, scope: scope.scope, reason: scope.reason, evidence: scope.evidence,
+      delta_files: scope.scope === "full" ? [] : scope.files.map((f) => f.path),
+      // The last review's findings by number and thread; where each is (a path the pull request named) and what it said are under
+      // `untrusted.previous_findings`, by the same number.
+      findings: c.findings.map((f, i) => ({ n: i + 1, thread_id: f.thread_id, resolved: f.resolved })),
+    };
+  }
+
+  private continuationAdvice(c: ReviewContinuation, scope: ContinuationScope, path: string): string {
+    const since = c.sinceHeadSha.toLowerCase();
+    const checkout = path === "sandbox"
+      ? ` The sandbox_recipe checks the head out to read around the change and run the tests closest to it; there the change is \`git diff ${since} HEAD\`, not \`.pr-review/pr.diff\`, which is the whole pull request: do not review that file.`
+      : " Do not start a sandbox for it.";
+    return scope.scope === "unchanged"
+      ? `Nothing changed since the last review: check its findings at this head and review nothing else.${checkout}`
+      : `This re-review covers only the change since ${since.slice(0, 12)}: the \`diff\` section, read in pages, overrides the review instructions' step that reads the whole diff from the checkout.${checkout}`;
+  }
+
+  private continuationHowTo(c: ReviewContinuation, scope: ContinuationScope): string {
+    const since = c.sinceHeadSha.slice(0, 12);
+    const check = "First check each finding in `continuation.findings` (where it is and what it said: `untrusted.previous_findings`, same `n`) at this head: "
+      + "one that is fixed has its thread resolved with gh_thread_resolve (only these threads can be); one that is not is said again in your review.";
+    switch (scope.scope) {
+      case "unchanged": return `This is a re-review and the head is still ${since}, the one reviewed last time. ${check} There is no new change to review.`;
+      case "delta": return `This is a re-review of only what changed since ${since}: \`files\` and \`diff\` hold that change, not the whole pull request. ${check} `
+        + "Then review that change; the rest was reviewed last time.";
+      default: return `This is a re-review, and the whole pull request is reviewed again (${scope.reason}). ${check}`;
+    }
   }
 
   /** The overview, with the index of the sections and the ones in `inline` whole in it. */
   private overviewBody(read: ReviewRead, file: string | null, inline: Inline, redact: (t: string) => string): Record<string, unknown> {
     const sections = Object.fromEntries(PAGED_SECTIONS.map((s) => [s, { chars: this.sectionText(read, s, file, redact).length, inline: s in inline }]));
     const untrusted = { title: clip(read.pr.title, 300), ...(inline.files !== undefined ? { files: inline.files } : {}),
-      ...(inline.conversation !== undefined ? { conversation: inline.conversation } : {}), ...(inline.diff !== undefined ? { diff: inline.diff } : {}) };
+      ...(inline.conversation !== undefined ? { conversation: inline.conversation } : {}), ...(inline.diff !== undefined ? { diff: inline.diff } : {}),
+      ...(read.previousNotes?.length ? { previous_findings: read.previousNotes } : {}) };
     return {
       ...read.overview, how_to_read: read.howToRead, sections,
       ...(inline.instructions !== undefined ? { review_instructions: inline.instructions } : {}),
@@ -498,8 +644,11 @@ export class GithubReview {
       const review = () => this.submit(ctx, ref, headSha, {
         event: event as ReviewEvent, text, rawComments: args.comments, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null,
       });
-      // A comment approves nothing and is never held, so it does not wait for an approval or a merge being decided.
-      return ok(this.withMode(ctx, event === "APPROVE" ? await this.oneAtATime(ctx, ref, review) : await review()), (t) => ctx.client.redact(t));
+      // A comment approves nothing and is never held, so it does not wait for an approval or a merge being decided. Except where reviews
+      // are items (`recordPosted`): a restart reads what the old session posted and stops it under this lock, so a review still being
+      // posted is either in what the next one continues or refused as stopped, never posted after it was read.
+      const locked = event === "APPROVE" || this.deps.recordPosted === true;
+      return ok(this.withMode(ctx, locked ? await this.oneAtATime(ctx, ref, review) : await review()), (t) => ctx.client.redact(t));
     });
   }
 
@@ -525,6 +674,7 @@ export class GithubReview {
     const comments = this.checkComments(o.rawComments, change);
     await this.requireEvent(ctx, repo, o.event);
     if (o.event === "APPROVE") {
+      if (!o.confirmation) await this.requireSecondPass(ctx, ref, headSha);
       const risk = await this.requireApprovable(ctx, ref, repo, pr, change, o.flags, o.judgement);
       if (!o.confirmation && risk.level === "high") {
         const review: HeldReview = { event: o.event, body: o.text, comments };
@@ -538,7 +688,7 @@ export class GithubReview {
     return { status: result.status, head_sha: headSha, ...result.detail };
   }
 
-  /** `gh_pr_merge`: approve (when needed) and merge, if every gate is open. */
+  /** `gh_pr_merge`: merge what this session approved, if every gate is open; a merge a person confirmed approves first when needed. */
   mergePr(actor: ReviewActor, args: Record<string, unknown>): Promise<ToolOutcome> {
     return this.run(actor, "gh_pr_merge", args, async (ctx, ref) => {
       const headSha = this.pinned(args.head_sha);
@@ -558,9 +708,14 @@ export class GithubReview {
    * refused at once, nothing written, and may be made again.
    */
   private async oneAtATime<T>(ctx: Ctx, ref: PrRef, body: () => Promise<T>): Promise<T> {
-    const key = `${ctx.actor.actorUserId}|${`${ref.owner}/${ref.repo}`.toLowerCase()}#${ref.number}`;
+    const key = writeLockKey(ctx.actor.actorUserId, ref);
     const holder = await acquireWriteLock(this.deps.db, key, WRITE_LOCK_SECONDS);
     if (!holder) throw new Refusal("write_in_progress", "another approval or merge of this pull request with this account is being decided; nothing was written, try again in a moment");
+    // Asked under the lock a stop takes too (store.ts closeConfirmationsForStop): a stop either saw this write coming, or this sees the stop.
+    if (this.deps.sessionStopped && await this.deps.sessionStopped(ctx.actor.sessionId)) {
+      await releaseWriteLock(this.deps.db, key, holder).catch(() => undefined);
+      throw new Refusal("review_stopped", "the person who asked for this review stopped it; nothing was written");
+    }
     // Renewed while the call works, however long GitHub takes; only a call that died lets it lapse.
     const renew = setInterval(() => { void renewWriteLock(this.deps.db, key, holder, WRITE_LOCK_SECONDS).catch(() => undefined); }, (WRITE_LOCK_SECONDS * 1000) / 4);
     renew.unref?.();
@@ -587,6 +742,38 @@ export class GithubReview {
   // -------------------------------------------------- confirmations
 
   /**
+   * Before a review is started for someone: that the pull request is one the review tools would take, read with the acting user's
+   * account as every tool reads it (the owner list, the acting user's say, a public repository that is not archived, an open pull request
+   * that is not a draft). A refusal here costs no session and no turn, where the same refusal from the session's first tool call costs both.
+   * Not held to any session's request budget: there is no session yet, and it writes nothing.
+   */
+  /**
+   * Whether the acting user lets others act for them, asked of the identity service now: what a review someone asked of them is checked
+   * against when it is made and before every turn it is about to take (`assistant/review-items.ts`). The credential the answer comes with
+   * is dropped unused. `off` is the switch turned off; `not_bound` and `expired` are no GitHub account to act with; `unavailable` is the
+   * identity service not answering, which is never taken as yes.
+   */
+  async delegationOf(actorUserId: string, requesterUserId: string): Promise<"on" | "off" | "not_bound" | "expired" | "unavailable"> {
+    try {
+      const cred = await this.deps.resolveCredential({ userId: actorUserId, provider: GITHUB_PROVIDER, requesterUserId, purpose: "delegation_check" });
+      if (cred.expiresAt !== null && cred.expiresAt <= this.now()) return "expired";
+      return cred.delegation ? "on" : "off";
+    } catch (err) {
+      if (err instanceof IdentityCredentialRefusedError && err.code === "not_bound") return "not_bound";
+      if (err instanceof IdentityCredentialRefusedError && err.code === "expired") return "expired";
+      return "unavailable";
+    }
+  }
+
+  checkPullRequest(actor: ReviewActor, ref: PrRef): Promise<ToolOutcome> {
+    return this.run(actor, "gh_pr_check", { pr: `${ref.owner}/${ref.repo}#${ref.number}` }, async (ctx) => {
+      const { pr } = await this.load(ctx, ref);
+      this.requireOpen(pr);
+      return ok({ status: "ok", title: pr.title, head_sha: pr.headSha, url: pr.url }, (t) => ctx.client.redact(t));
+    }, { skipBudget: true, ref });
+  }
+
+  /**
    * The acting user's answer to a held write, a merge or a review. Only the actor can give it (the
    * caller checks that and passes `deciderUserId`); on allow, every gate of that write is
    * read again and it is made with the actor's own account.
@@ -598,7 +785,9 @@ export class GithubReview {
    * of the merge. A service has no say of its own: the person it names is the only
    * one whose answer it can give.
    */
-  async decide(deciderUserId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null = null): Promise<{ http: number; body: Record<string, unknown> }> {
+  async decide(
+    deciderUserId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null = null, guard?: () => Promise<void>,
+  ): Promise<{ http: number; body: Record<string, unknown> }> {
     const row = await getConfirmation(this.deps.db, id);
     if (!row) return { http: 404, body: { ok: false, error: "not_found" } };
     if (row.actorUserId !== deciderUserId) return { http: 403, body: { ok: false, error: "only_the_acting_user_can_decide" } };
@@ -607,13 +796,29 @@ export class GithubReview {
     if (via) {
       (this.deps.logger ?? logger).info({ confirmation_id: id, subject: deciderUserId, client_id: via.clientId, act_sub: via.actorSub, decision }, "github_review.decision_by_service");
     }
-    if (decision === "deny") {
+    // The claim is where the answer is given. A caller's `guard` (the assistant's tool: its turn is still live) is asked once the
+    // row is ours and before anything follows from it, so a turn stopped before the claim committed decides nothing: the
+    // confirmation is given back, or closed when it can no longer be answered. A stop after that is a stop after the answer.
+    const claim = async (): Promise<ClaimResult> => {
       const claimed = await claimConfirmation(this.deps.db, id, deciderUserId, via);
+      if (!claimed.ok || !guard) return claimed;
+      try {
+        await guard();
+      } catch (err) {
+        if (!(await reopenConfirmation(this.deps.db, id))) {
+          await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { ...by, reason: "decider_not_acting" });
+        }
+        throw err;
+      }
+      return claimed;
+    };
+    if (decision === "deny") {
+      const claimed = await claim();
       if (!claimed.ok) return { http: 200, body: { ok: true, status: claimed.reason === "expired" ? "expired" : "refused", reason: claimed.reason } };
       await finishConfirmation(this.deps.db, id, "denied", deciderUserId, via ? by : { by: "actor" });
       return { http: 200, body: { ok: true, status: "denied" } };
     }
-    const claimed = await claimConfirmation(this.deps.db, id, deciderUserId, via);
+    const claimed = await claim();
     if (!claimed.ok) {
       return { http: 200, body: { ok: true, status: claimed.reason === "expired" ? "expired" : "refused", reason: claimed.reason } };
     }
@@ -621,7 +826,7 @@ export class GithubReview {
     // Who asked stays who asked: the audit row and the review's footer name them.
     const actor: ReviewActor = {
       sessionId: confirmation.sessionId, requesterUserId: confirmation.requesterUserId, actorUserId: deciderUserId,
-      requesterLabel: await this.requesterLabel(confirmation.sessionId),
+      ...await this.sessionFacts(confirmation.sessionId),
     };
     const ref = parsePrRef(`${confirmation.repo}#${confirmation.pr}`);
     if (!ref) {
@@ -676,14 +881,19 @@ export class GithubReview {
     return { http: 200, body: { ok: true, status: final, reason, message: message || null, ...(wrote ? { wrote: true } : {}) } };
   }
 
-  /** How the session names its owner in a review's footer; none when the session cannot be read. */
-  private async requesterLabel(sessionId: string): Promise<string | undefined> {
+  /**
+   * How the session names its owner in a review's footer (none when the session cannot be read), and whether it asked for a review only
+   * (yes when the read fails: a held write is decided for a session whose say on merging is unknown as one that may not merge). A held merge
+   * of a session that asked for a review only cannot exist, since its `gh_pr_merge` is refused before anything is held; this is the second lock.
+   */
+  private async sessionFacts(sessionId: string): Promise<{ requesterLabel?: string; reviewOnly: boolean }> {
     try {
-      const r = await this.deps.db.query("SELECT config->>'acting_as_requester' AS label FROM claw_sessions WHERE session_id = $1", [sessionId]);
-      const label = (r.rows[0] as { label?: unknown } | undefined)?.label;
-      return typeof label === "string" && label ? label : undefined;
+      const r = await this.deps.db.query("SELECT COALESCE(config->'requested_by'->>'label', config->>'acting_as_requester') AS label, config->'review_only' AS review_only FROM claw_sessions WHERE session_id = $1", [sessionId]);
+      const row = r.rows[0] as { label?: unknown; review_only?: unknown } | undefined;
+      const label = row?.label;
+      return { requesterLabel: typeof label === "string" && label ? label : undefined, reviewOnly: reviewOnlyOf({ review_only: row?.review_only }) };
     } catch {
-      return undefined;
+      return { reviewOnly: true };
     }
   }
 
@@ -767,7 +977,7 @@ export class GithubReview {
         githubRequests: client?.requests ?? 0, githubRequestIds: client?.requestIds ?? [], githubStatus: client?.lastStatus || undefined,
         riskReasons: acc.riskReasons, confirmationId: acc.confirmationId, dryRun: acc.dryRun, write: acc.write,
         result: outcome.isError ? "refused" : "ok", detail: String(outcome.body.reason ?? outcome.body.status ?? ""),
-        reviewPath: acc.reviewPath, reviewPathReason: acc.reviewPathReason, reviewMode: acc.reviewMode,
+        reviewPath: acc.reviewPath, reviewPathReason: acc.reviewPathReason, reviewMode: acc.reviewMode, posted: acc.posted ?? null,
       });
     } catch {
       // The row was written before the work; a failure to finish it leaves it 'started', which counts against limits and reads as unfinished.
@@ -1024,6 +1234,17 @@ export class GithubReview {
     return { ...risk, level: reasons.length > 0 ? "high" : "low", reasons };
   }
 
+  /**
+   * A review the assistant's router started (`ReviewActor.mergeNeedsConfirmation`) merges only once the acting user has confirmed that very
+   * write: the router's `merge=true` came from reading a sentence, and natural language never approves a merge. So the merge is held, whatever
+   * the risk and the acting user's review mode, and made only from the card's button or the exact command (`decide`, with the confirmation).
+   */
+  private confirmedMergesOnly(ctx: Ctx, risk: RiskResult): RiskResult {
+    if (!ctx.actor.mergeNeedsConfirmation) return risk;
+    const reason = `the review was started through ${ctx.cred.login}'s assistant, so a merge is made only once ${ctx.cred.login} confirms it (the button on its card, or 批准 #<ref>)`;
+    return { ...risk, level: "high", reasons: [...risk.reasons, reason] };
+  }
+
   /** The audit row keeps why a write was held and what the rules saw, the evidence marked as such. */
   private auditedReasons(risk: RiskResult): string[] {
     return [...risk.reasons, ...risk.evidence.filter((e) => !risk.reasons.includes(e)).map((e) => `evidence: ${e}`)];
@@ -1056,6 +1277,7 @@ export class GithubReview {
     const g = await ctx.client.graphql<{ repository?: { pullRequest?: {
       id?: string; mergeStateStatus?: string; mergeable?: string; reviewDecision?: string | null; headRefOid?: string; isMergeQueueEnabled?: boolean | null;
       isInMergeQueue?: boolean | null; mergeQueueEntry?: { id?: string | null; position?: number | null; state?: string | null } | null;
+      autoMergeRequest?: { enabledAt?: string | null } | null;
       reviewThreads?: { totalCount?: number; nodes?: Array<{ isResolved?: boolean }> };
     } | null } | null }>(THREADS_QUERY, { owner: ref.owner, name: ref.repo, number: ref.number });
     const p = g.repository?.pullRequest;
@@ -1074,6 +1296,7 @@ export class GithubReview {
       queueEntry: p.isInMergeQueue === true || p.mergeQueueEntry
         ? { id: p.mergeQueueEntry?.id ?? null, position: p.mergeQueueEntry?.position ?? null, state: p.mergeQueueEntry?.state ?? null }
         : null,
+      autoMerge: p.autoMergeRequest != null,
     };
   }
 
@@ -1126,8 +1349,14 @@ export class GithubReview {
     // The reviewer's own flags and judgement count here as they do at the merge.
     const risk = await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, read, flags, judgement)));
     ctx.acc.riskReasons = this.auditedReasons(risk);
-    this.requireGreen(await this.readState(ctx, ref, pr, repo), pr.headSha);
-    return risk;
+    const state = await this.readState(ctx, ref, pr, repo);
+    // A session asked for a review only may approve, but not an approval that would merge: with auto-merge on, or in the merge queue, it can.
+    if (ctx.actor.reviewOnly && mergesByItself(state)) {
+      throw new Refusal("review_only", "this session was asked for a review only, and auto-merge is on for this pull request (or it is in the merge queue), so an approval could merge it: nothing was posted. Post the review as COMMENT or REQUEST_CHANGES instead.");
+    }
+    this.requireGreen(state, pr.headSha);
+    // An approval that GitHub's auto-merge or merge queue would turn into a merge is that merge: a review the assistant started holds it for the acting user.
+    return mergesByItself(state) ? this.confirmedMergesOnly(ctx, risk) : risk;
   }
 
   private checkComments(raw: unknown, change: Change | null): ReviewComment[] {
@@ -1153,6 +1382,32 @@ export class GithubReview {
     });
     if (problems.length) throw new Refusal("comments_outside_diff", "some inline comments cannot be placed; nothing was posted", { problems });
     return out;
+  }
+
+  /** Whether a review's body carries the marker of an approval this session (`runId`) posted on this head. */
+  private isOwnApproval(ctx: Ctx, headSha: string, body: unknown): boolean {
+    const runId = this.runId(ctx, headSha);
+    return typeof body === "string" && [RUN_MARKER_PREFIX, LEGACY_RUN_MARKER_PREFIX].some((p) => body.includes(`<!-- ${p}:${runId}:APPROVE:`));
+  }
+
+  /**
+   * The deep review's second pass, enforced rather than asked for: on the sandbox path an approval, and a merge, need a sub-agent of this
+   * session that finished after the session read this head (store.ts `headReviewFacts`). A head this session never read is refused: there
+   * is no path to judge by, and an approval of a change nobody read is no review. A person's answer to a held write is not asked again.
+   */
+  private async requireSecondPass(ctx: Ctx, ref: PrRef, headSha: string): Promise<void> {
+    if (!ctx.settings.deepReview) return;
+    const facts = await headReviewFacts(this.deps.db, ctx.actor.sessionId, `${ref.owner}/${ref.repo}`, ref.number, headSha);
+    if (!facts.read) {
+      throw new Refusal("head_not_read", `this session has not read head ${headSha} of this pull request: call gh_pr_get with the pull request, review it as its review_instructions say, then try again. Nothing was approved or merged.`);
+    }
+    if (facts.sandbox && !facts.secondPass) {
+      throw new Refusal("second_pass_required", "this review is on the sandbox path, so an approval or a merge needs the second pass first, and this session has not run it on this head. "
+        + "Start it now with the `task` tool: `subagent_type` `explore`, `tools` [\"bash\", \"read\", \"grep\", \"glob\", \"ls\"], and the prompt step 8 of the review instructions describes, "
+        + `starting with the head commit ${headSha} (a second pass whose prompt does not name it is not counted), then the checkout, origin/<base>, .pr-review/pr.diff, what you read, the callers you did not open, what you ran and your findings. `
+        + "Verify what it returns, say in the review body what it added, then call this tool again. Nothing was approved or merged. "
+        + "A second pass that ended in the last few seconds may not be recorded yet: then call again in a moment.");
+    }
   }
 
   private runId(ctx: Ctx, headSha: string): string {
@@ -1231,7 +1486,84 @@ export class GithubReview {
     await this.limits(ctx, pr.headSha);
     ctx.acc.write = true;
     const posted = await ctx.client.request<{ id?: number; html_url?: string; state?: string }>("POST", repoPath(ref, `/pulls/${ref.number}/reviews`), { body: payload });
-    return { status: "submitted", detail: { review_id: posted.json?.id ?? null, url: posted.json?.html_url ?? null, event, comments: comments.length, github_request_id: posted.requestId } };
+    const reviewId = typeof posted.json?.id === "number" ? posted.json.id : null;
+    if (this.deps.recordPosted) ctx.acc.posted = { event, review_id: reviewId, findings: await this.postedFindings(ctx, ref, reviewId, comments) };
+    return { status: "submitted", detail: { review_id: reviewId, url: posted.json?.html_url ?? null, event, comments: comments.length, github_request_id: posted.requestId } };
+  }
+
+  /**
+   * The inline comments of a review just posted, each with the thread GitHub opened for it: the threads that began in this review, matched
+   * by file and line. The review is posted whatever this finds, so a read that fails leaves the threads unknown (null), never the call refused.
+   */
+  private async postedFindings(ctx: Ctx, ref: PrRef, reviewId: number | null, comments: ReviewComment[]): Promise<PostedFinding[]> {
+    const note = (body: string): string => ctx.client.redact(body).replace(/\s+/g, " ").trim().slice(0, NOTE_CHARS);
+    let threads: Array<{ id?: string; path?: string; line?: number | null; comments?: { nodes?: Array<{ pullRequestReview?: { databaseId?: number | null } | null }> } }> = [];
+    if (comments.length && reviewId !== null) {
+      try {
+        const g = await ctx.client.graphql<{ repository?: { pullRequest?: { reviewThreads?: { nodes?: typeof threads } } | null } | null }>(
+          POSTED_THREADS_QUERY, { owner: ref.owner, name: ref.repo, number: ref.number });
+        threads = (g.repository?.pullRequest?.reviewThreads?.nodes ?? []).filter((t) => t.comments?.nodes?.[0]?.pullRequestReview?.databaseId === reviewId);
+      } catch (err) {
+        (this.deps.logger ?? logger).info({ session_id: ctx.actor.sessionId, err: err instanceof GithubError ? err.status : "error" }, "github_review.posted_threads_unread");
+      }
+    }
+    const used = new Set<string>();
+    return comments.map((c) => {
+      const t = threads.find((x) => typeof x.id === "string" && !used.has(x.id) && x.path === c.path && x.line === c.line);
+      if (t?.id) used.add(t.id);
+      return { path: c.path, line: c.line, thread_id: t?.id && THREAD_ID_RE.test(t.id) ? t.id : null, note: note(c.body) };
+    });
+  }
+
+  /**
+   * `gh_thread_resolve`: a re-review resolves the thread of one of the last review's findings that is now fixed. Only a thread the last
+   * review recorded (`ReviewDeps.continuationOf`), opened by the acting user's own account, on this pull request, at the head the session
+   * read: never another person's thread and never one a model names from what it read. Not a review or a merge, so not counted in their
+   * hourly limits; held to the session's request budget like any call.
+   */
+  resolveThread(actor: ReviewActor, args: Record<string, unknown>): Promise<ToolOutcome> {
+    return this.run(actor, "gh_thread_resolve", args, async (ctx, ref) => {
+      const headSha = this.pinned(args.head_sha);
+      const threadId = typeof args.thread_id === "string" ? args.thread_id.trim() : "";
+      if (!THREAD_ID_RE.test(threadId)) throw new Refusal("invalid_thread", "pass the thread_id of a finding in continuation.findings");
+      const continuation = this.deps.continuationOf ? await this.deps.continuationOf(ctx.actor.sessionId) : null;
+      if (!continuation?.findings.some((f) => f.thread_id === threadId)) {
+        throw new Refusal("thread_not_recorded", "only the thread of a finding the last review recorded (continuation.findings) can be resolved");
+      }
+      // Under the lock a restart and a stop take (and asking there whether the review was stopped): a restart either waits for this
+      // resolve or this resolve sees that the review it belongs to was stopped, and never lands after the next review was told what is open.
+      return this.oneAtATime(ctx, ref, async () => {
+        const { pr } = await this.load(ctx, ref);
+        this.requireOpen(pr);
+        this.requireHead(pr, headSha);
+        const g = await ctx.client.graphql<{ node?: {
+          id?: string; isResolved?: boolean; pullRequest?: { number?: number; repository?: { nameWithOwner?: string } } | null;
+          comments?: { nodes?: Array<{ author?: { login?: string } | null }> };
+        } | null }>(THREAD_QUERY, { id: threadId });
+        const t = g.node;
+        if (!t || t.pullRequest?.number !== ref.number || String(t.pullRequest?.repository?.nameWithOwner ?? "").toLowerCase() !== `${ref.owner}/${ref.repo}`.toLowerCase()) {
+          throw new Refusal("thread_not_on_pull_request", "that thread is not one of this pull request's");
+        }
+        const author = String(t.comments?.nodes?.[0]?.author?.login ?? "");
+        if (!ctx.cred.login.trim() || author.toLowerCase() !== ctx.cred.login.toLowerCase()) {
+          throw new Refusal("not_own_thread", "that thread was not opened by the acting user's account, and another person's thread is theirs to resolve");
+        }
+        const redact = (x: string): string => ctx.client.redact(x);
+        if (t.isResolved === true) return ok({ status: "already_resolved", thread_id: threadId, head_sha: headSha }, redact);
+        // With GitHub's auto-merge on, or the pull request in the merge queue, the last open conversation resolved can be what merges it. A session
+        // that may not merge by itself (a review only, or one the assistant started, whose merge waits for the acting user's confirmation) leaves it open.
+        if ((ctx.actor.reviewOnly || ctx.actor.mergeNeedsConfirmation) && mergesByItself(await this.readMergeFacts(ctx, ref))) {
+          throw new Refusal("auto_merge_on", "auto-merge is on for this pull request (or it is in the merge queue), so resolving a conversation could merge it, and this session "
+            + "does not merge by itself: nothing was resolved. Leave the thread open and say in your review that the finding is fixed.");
+        }
+        if (!ctx.settings.writesEnabled) {
+          ctx.acc.dryRun = true;
+          return ok({ status: "dry_run", thread_id: threadId, note: "writes are switched off in this deployment; nothing was resolved" }, redact);
+        }
+        await ctx.client.graphql(RESOLVE_THREAD_MUTATION, { id: threadId });
+        return ok({ status: "resolved", thread_id: threadId, head_sha: headSha }, redact);
+      });
+    });
   }
 
   // ------------------------------------------------------------- merge
@@ -1240,6 +1572,10 @@ export class GithubReview {
     ctx: Ctx, ref: PrRef, headSha: string,
     opts: { method?: "squash" | "merge" | "rebase"; flags: string[]; judgement: ReviewerJudgement | null; confirmation: Confirmation | null },
   ): Promise<Record<string, unknown>> {
+    // Before anything is read: a session that was asked for a review only has nothing to merge, and no approval is written on the way.
+    if (ctx.actor.reviewOnly) {
+      throw new Refusal("review_only", "this session was asked for a review only: it never merges, and nothing was approved or merged. Post the review with gh_review_submit and stop.");
+    }
     const { repo, pr } = await this.load(ctx, ref);
     this.requireOpen(pr);
     this.requireHead(pr, headSha);
@@ -1252,10 +1588,11 @@ export class GithubReview {
     if (!repo.push) {
       throw new Refusal("no_merge_permission", `${ctx.cred.login} has no write permission on ${repo.fullName}: the review stands as comments and nothing was merged`);
     }
+    if (!opts.confirmation) await this.requireSecondPass(ctx, ref, headSha);
 
     const change = await this.collectChange(ctx, ref, pr);
     const risk = opts.confirmation ? assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement))
-      : await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement)));
+      : this.confirmedMergesOnly(ctx, await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement))));
     ctx.acc.riskReasons = this.auditedReasons(risk);
     let state = await this.readState(ctx, ref, pr, repo);
     // A branch with a merge queue takes the pull request through it (see `viaQueue`); the queue, not this call, chooses the merge method.
@@ -1276,8 +1613,15 @@ export class GithubReview {
     }
 
     let approved = false;
-    const reviews = await this.listReviews<{ user?: { login?: string }; state?: string; commit_id?: string }>(ctx, ref);
-    const already = reviews.some((r) => r.user?.login?.toLowerCase() === ctx.cred.login.toLowerCase() && r.state === "APPROVED" && String(r.commit_id ?? "").toLowerCase() === headSha);
+    const reviews = await this.listReviews<{ user?: { login?: string }; state?: string; commit_id?: string; body?: string }>(ctx, ref);
+    const approvals = reviews.filter((r) => r.user?.login?.toLowerCase() === ctx.cred.login.toLowerCase() && r.state === "APPROVED" && String(r.commit_id ?? "").toLowerCase() === headSha);
+    const already = approvals.length > 0;
+    // A merge no person confirmed stands on this session's own approval of this head, the review it wrote; it never writes one for itself.
+    if (!opts.confirmation && ctx.settings.writesEnabled && !approvals.some((r) => this.isOwnApproval(ctx, headSha, r.body))) {
+      throw new Refusal("review_not_submitted", `this session has not approved head ${headSha} of this pull request itself, so nothing was approved or merged. `
+        + "gh_pr_merge never approves on its own: finish the review, post it with gh_review_submit (APPROVE, the body the review instructions ask for, "
+        + "the same risk_judgement), and call gh_pr_merge again. If gh_review_submit answered confirmation_required, the person decides; do not merge.");
+    }
     if (!already) {
       if (!ctx.settings.writesEnabled) {
         ctx.acc.dryRun = true;

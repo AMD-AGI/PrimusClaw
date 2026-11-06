@@ -414,6 +414,32 @@ func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.
 	return info, nil
 }
 
+// Locate reports the cluster, workspace, and owner of any live SaFE Workload named name.
+// A missing, deleting, or finished Workload, or a name that is not a DNS label, is store.ErrNotFound.
+func (c *SafeWorkloadCreator) Locate(ctx context.Context, name string) (cluster, namespace, ownerID string, err error) {
+	if c == nil || c.dynamic == nil || !dnsLabel(name, 63) {
+		return "", "", "", store.ErrNotFound
+	}
+	obj, err := c.dynamic.Resource(workloadGVR).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return "", "", "", store.ErrNotFound
+	}
+	if err != nil {
+		return "", "", "", err
+	}
+	if obj.GetDeletionTimestamp() != nil {
+		return "", "", "", store.ErrNotFound
+	}
+	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
+	switch phase {
+	case "Failed", "Succeeded", "Stopped":
+		return "", "", "", store.ErrNotFound
+	}
+	workspace, _, _ := unstructured.NestedString(obj.Object, "spec", "workspace")
+	labels := obj.GetLabels()
+	return labels[safeClusterIDLabel], workspace, labels[safeUserIDLabel], nil
+}
+
 // signingSecretName is one Secret per sandbox. SaFE copies this name into the workspace.
 func signingSecretName(sandboxID string) string {
 	return sandboxID

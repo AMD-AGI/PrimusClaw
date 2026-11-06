@@ -381,6 +381,30 @@ export interface ExecuteRequest {
    * its prompt and saves none from it. Absent means a session like any other, as before the field existed.
    */
   withhold_sandbox_keys?: boolean;
+  /**
+   * `"review"`: a review one person asked another to make, run as the reviewer (the API's `review-profile.ts`). The run gets a fixed
+   * profile whatever else the request carries: the review tools and the sandbox's file and shell tools only (Brain applies the same
+   * allow-list again), no skills, memory, plugins, stored variables or extra MCP servers, and it is marked `withhold_sandbox_keys`. Its
+   * sandbox is built in the deployment's CPU sandbox workspace (SANDBOX_CPU_NAMESPACE; AGENT_SANDBOX_NAMESPACE in Kubernetes mode), never
+   * a workspace the request names, a multi-node cluster's or a GPU workspace, and is created with `useWorkspaceStorage: false`, so SaFE
+   * mounts neither the owner's directory nor the workspace's volumes. Absent: a session like any other.
+   */
+  sandbox_profile?: "review";
+  /**
+   * `true`: this run is not given the deployment's platform defaults (`PLATFORM_DEFAULTS_FILE`): no default MCP server is connected
+   * and no default skill is listed or fetched. Everything else is as for any run: what the request itself carries (its MCP servers,
+   * its plugin) is still there. The API sets it for an assistant's router and observer turns, which only route and answer and whose
+   * prompt must not end with a skill list. Absent, or anything but `true`: a run like any other.
+   */
+  skip_platform_defaults?: boolean;
+  /**
+   * Once this run has called a tool that matches `sources` (a tool whose result is text other people wrote), only tools matching
+   * `sources` or `allow_after` may be called for the rest of the run; any other is refused by Brain before it is run. Entries are
+   * written like `tools_allowlist` (an exact name, or a prefix ending in `*`). The API sets it on an assistant's router turn that has
+   * read-only tools: after it has read such a result, the turn no longer acts for the user (no review, setting or memory write).
+   * Absent: no such rule.
+   */
+  read_taint?: { sources: string[]; allow_after: string[] };
 
   // ── Legacy chat fields (Phase 4 removes; do not use in new task code) ─
   /** @deprecated Use `sandbox_spec.image`. Kept for legacy chat NATS path. */
@@ -415,7 +439,7 @@ export interface ExecuteRequest {
   /**
    * How hard the model is asked to think on every LLM turn of this run, its sub-agents included (Anthropic: `output_config.effort`;
    * OpenAI: `reasoning_effort`). Absent means the model's own default, which is what every run had before the field. The API sets it
-   * for a session that reviews a pull request on someone's behalf, when an operator set `CLAW_GITHUB_REVIEW_EFFORT`.
+   * from the session's `effort`, which its creator chose (`POST /v1/sessions`, `PATCH /v1/sessions/:id`).
    */
   effort?: ReasoningEffort;
   /**
@@ -521,13 +545,6 @@ export interface TokenUsage {
   turns: number;
 }
 
-/** Pending memory entry from save_memory tool (Brain → API via exec_complete). */
-export interface PendingMemory {
-  category: string;
-  content: string;
-  importance: number;
-}
-
 /** Pending skill entry from save_skill tool (Brain → API via exec_complete). */
 export interface PendingSkill {
   skill_name: string;
@@ -560,6 +577,12 @@ export interface ToolStats {
    * did the work. Absent on results produced before this existed.
    */
   by_tool_ok?: Record<string, number>;
+  /**
+   * Of each tool that came back without an error, when its first and its last such call returned, in ms from the start of the
+   * run's loop (calls of this process only: a run resumed from a checkpoint reports those since). Absent on older results.
+   */
+  first_ok_ms?: Record<string, number>;
+  last_ok_ms?: Record<string, number>;
 }
 
 /** Artifact emitted by an executed Task (uploaded blob reference). */
@@ -626,7 +649,6 @@ export interface ExecuteResult {
    * that an earlier attempt filled alone.
    */
   platformFacts?: ExecutePlatformFacts;
-  pendingMemories: PendingMemory[];
   pendingSkills: PendingSkill[];
   /** Sub-file mutations queued by add/update/remove_skill_file tool calls. */
   pendingSkillFileMutations?: PendingSkillFileMutation[];
@@ -666,20 +688,27 @@ export interface UserInfo {
 export type EventCallback = (payload: Record<string, unknown>) => void | Promise<void>;
 
 /**
- * The MCP server the API adds to a turn for the model's trigger tools, and the API path it is served on. Its
- * `requires_approval` holds those tools for the user and nothing else: Brain does not count it as an operator's
- * approval policy, which would let HITL_ENABLED ask about every other call of the turn, turns nobody is watching
- * included. Brain knows it by both name and path, so an operator's own server that happens to share the name
- * still counts as a policy.
+ * The MCP servers the API adds to a turn itself, and the API paths they are served on: the model's trigger tools and
+ * the owner's GitHub tools. Their `requires_approval` holds those servers' own tools for the user and nothing else:
+ * Brain does not count it as an operator's approval policy, which would let HITL_ENABLED ask about every other call
+ * of the turn, turns nobody is watching included. Brain knows them by both name and path, so an operator's own
+ * server that happens to share a name still counts as a policy.
  */
 export const TRIGGER_MCP_SERVER = "schedules";
 export const TRIGGER_MCP_PATH = "/v1/internal/trigger-mcp";
+export const GITHUB_MCP_SERVER = "github";
+export const GITHUB_MCP_PATH = "/v1/internal/github/mcp";
+const PLATFORM_MCP_PATHS: Readonly<Record<string, string>> = {
+  [TRIGGER_MCP_SERVER]: TRIGGER_MCP_PATH,
+  [GITHUB_MCP_SERVER]: GITHUB_MCP_PATH,
+};
 
-/** Whether an MCP server entry is the one the API adds for the trigger tools. */
-export function isTriggerMcpServer(name: string, spec: Record<string, unknown> | undefined): boolean {
-  if (name !== TRIGGER_MCP_SERVER || typeof spec?.url !== "string") return false;
+/** Whether an MCP server entry is one the API adds itself (the trigger tools, the GitHub tools). */
+export function isPlatformMcpServer(name: string, spec: Record<string, unknown> | undefined): boolean {
+  const path = Object.hasOwn(PLATFORM_MCP_PATHS, name) ? PLATFORM_MCP_PATHS[name] : undefined;
+  if (!path || typeof spec?.url !== "string") return false;
   try {
-    return new URL(spec.url).pathname === TRIGGER_MCP_PATH;
+    return new URL(spec.url).pathname === path;
   } catch {
     return false;
   }

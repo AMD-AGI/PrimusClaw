@@ -7,20 +7,21 @@ import os from "node:os";
 import path from "node:path";
 import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
-import { filterToolSchemas, parseToolAllowlist } from "../tools/allowlist.js";
-import { agentLoop } from "./agent-loop.js";
+import { filterToolSchemas, parseReadTaint, parseToolAllowlist } from "../tools/allowlist.js";
+import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
 import { loadRules } from "./rules.js";
 import { bindRepo, renderRepoBlock } from "../workspace/repo-binding.js";
 import { repoSkillsToList } from "../workspace/repo-skills.js";
-import { normalizeMcpConfigs } from "../clients/mcp-config.js";
+import { normalizeMcpConfigs, originsSendingPlaceholder } from "../clients/mcp-config.js";
+import { DEFAULT_BASH_APPROVAL_RULES } from "./bash-approval-defaults.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
 import { HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp, mcpUnavailableNote } from "../clients/mcp.js";
-import { buildPrompt, buildProgressiveSkillHint, listProgressiveSkills } from "./prompt.js";
+import { buildPrompt, buildProgressiveSkillHint, buildSkillAndMcpHints, listProgressiveSkills, renderSystemHints } from "./prompt.js";
 import { SkillStore, LOAD_SKILL_TOOL } from "./skill-store.js";
 import { loadPlatformDefaults, resolveDefaultSkills, skillDescription, LazyDefaultSkills, type DefaultSkill } from "./platform-defaults.js";
 import { metrics } from "../infra/metrics.js";
@@ -36,8 +37,8 @@ import {
   ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, LLM_API_STYLE,
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
-  BASH_APPROVAL_RULES, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, BG_SHELL_ENABLED,
+  BASH_APPROVAL_RULES, BASH_APPROVAL_DEFAULTS_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
+  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, SKILL_HINTS_IN_SYSTEM, BG_SHELL_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
@@ -46,6 +47,7 @@ import type { ExecuteExtras } from "./index.js";
 import { untheadedRunIdentity, type RunIdentity } from "../tasks/run-identity.js";
 import { HookRunner, registryHasAny } from "./hooks.js";
 import pino from "pino";
+import { applyReviewProfileBackstop, isReviewProfile, reviewProfileAllowlist, reviewTurnBudgetRefusal } from "./review-profile.js";
 
 const logger = pino({ name: "agent-engine" });
 
@@ -87,6 +89,11 @@ export class AgentEngine {
     hands?: HandsClient | null,
     extras?: ExecuteExtras,
   ): Promise<ExecuteResult> {
+    // Before anything reads the request: a requested review keeps only what its fixed profile allows (`review-profile.ts`).
+    applyReviewProfileBackstop(request);
+    // And it runs only with a positive turn budget: 0 is no limit below (`runHandleTask` refuses it before a sandbox is opened).
+    const noBudget = reviewTurnBudgetRefusal(request);
+    if (noBudget !== null) throw new Error(noBudget);
     // Which wire protocol Brain speaks to the LLM is a deployment-wide
     // choice (LLM_API_STYLE); apiKey still honors per-request BYOK/platform
     // key overrides via resolveRequestLlmKey on top of that provider's
@@ -161,10 +168,16 @@ export class AgentEngine {
     // enter a run, and every run of Brain comes through it, a turn, a queued turn, a task of a DAG;
     // a sub-agent starts from the schemas of the run that made it, so it has none either. Read as
     // truthy, not `=== true`: a mark that is not a boolean is still a mark.
-    const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
+    // A run marked `skip_platform_defaults` (an assistant's router or observer turn) has none either; what its own request carries
+    // stays. Read as `=== true`: it is not a safety mark, so a value that is not a boolean leaves the run as it was.
+    const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys && request.skip_platform_defaults !== true
+      ? loadPlatformDefaults()
+      : null;
     // Marketplace and plugin servers are third parties' at URLs nobody vetted, so the requester's
-    // platform key fills their `<SAFE_API_KEY>` only on a host the operator trusts
-    // (MCP_PLATFORM_KEY_ALLOWED_HOSTS). A request's own servers are the requester's choice of where
+    // platform key fills their `<SAFE_API_KEY>` only where the operator trusts it: a host listed in
+    // MCP_PLATFORM_KEY_ALLOWED_HOSTS, or, in a run given the defaults, an origin the defaults file
+    // itself sends the key to (a plugin commonly ships the platform servers the defaults file mounts,
+    // under the same names, and replaces them). A request's own servers are the requester's choice of where
     // their own key goes. A `pinned_address` is the API's record of where it vetted a request's
     // server; one in a tool or plugin config is the author's, and would connect a trusted host name
     // to an address of their choosing, so it is dropped.
@@ -181,10 +194,14 @@ export class AgentEngine {
     const defaultMcp = Object.fromEntries(
       Object.entries(defaults?.mcpServers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name) && !Object.hasOwn(requestMcp, name)),
     );
+    const platformKeyHosts = new Set([
+      ...MCP_PLATFORM_KEY_ALLOWED_HOSTS,
+      ...originsSendingPlaceholder(defaults?.mcpServers ?? {}, "SAFE_API_KEY"),
+    ]);
     const mergedMcp = {
       ...normalizeMcpConfigs(defaultMcp, envOverrides, defaults?.mcpEnvAllow),
       ...normalizeMcpConfigs(requestMcp, envOverrides),
-      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, MCP_PLATFORM_KEY_ALLOWED_HOSTS),
+      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, platformKeyHosts),
     };
 
     const allSkills: Record<string, string> = {};
@@ -221,7 +238,10 @@ export class AgentEngine {
     // The tools the run may use at all (`tools_allowlist`), read once for everything below that asks:
     // the prompt (is `load_skill` among them?), the router and the schemas the model is offered.
     // No field, or an empty one, is no restriction.
-    const toolAllowlist = parseToolAllowlist(request.tools_allowlist);
+    // A requested review (`sandbox_profile`) is held to its fixed list whatever the request lists (`review-profile.ts`).
+    const toolAllowlist = isReviewProfile(request)
+      ? reviewProfileAllowlist(parseToolAllowlist(request.tools_allowlist))
+      : parseToolAllowlist(request.tools_allowlist);
     // A run whose list leaves `load_skill` out (any list written before the tool existed) is not offered
     // it, and the router refuses it. Its prompt must not send the model there: it gets the skill hint
     // from before the tool, which reads SKILL.md with `read`.
@@ -308,7 +328,12 @@ export class AgentEngine {
       progressiveSkills,
       repoBlock,
       loadSkillAllowed,
+      SKILL_HINTS_IN_SYSTEM,
     );
+    // With SKILL_HINTS_IN_SYSTEM the same hints go to the system message instead, built from the same inputs.
+    const systemHints = SKILL_HINTS_IN_SYSTEM
+      ? renderSystemHints(buildSkillAndMcpHints(inlineSkills, Object.keys(mergedMcp), sessionDir, progressiveSkills, loadSkillAllowed))
+      : "";
 
     logger.info({
       sessionId,
@@ -332,19 +357,21 @@ export class AgentEngine {
     // only when some server declares one: without a rule the loop gets no
     // controller and behaves exactly as before.
     const approval = approvalPolicyFromMcp(mergedMcp);
-    // Bash commands a rule holds, from plugin / marketplace tool configs and
-    // the deployment's BASH_APPROVAL_RULES. Same gate, same semantics.
+    // Bash commands a rule holds, from plugin / marketplace tool configs, the
+    // deployment's BASH_APPROVAL_RULES and the built-in GitHub write rules.
+    // Same gate, same semantics.
     const bashPolicy = bashApprovalPolicyFrom([
       ...[...pluginLayer.bashApproval, ...resolved.bashApproval].map((value) => ({ source: "tool_config", value })),
       { source: "BASH_APPROVAL_RULES", value: bashApprovalFromEnvValue(BASH_APPROVAL_RULES) },
+      { source: "defaults", value: BASH_APPROVAL_DEFAULTS_ENABLED ? DEFAULT_BASH_APPROVAL_RULES : undefined, platform: true },
     ]);
     // With a2a_call on, an allow that answers a peer's approval request is held for the user
     // (a2aApprovalHold). Nothing else changes: calls the policies do not name stay as they were.
-    // The trigger tools' hold is the platform's in the same way: it holds trigger_create and
-    // trigger_cancel, and must not make HITL_ENABLED ask about every call of a worker or doorbell
-    // turn that nobody is watching.
-    const policyActive = approval.operatorActive || bashPolicy.active;
-    const anyApproval = approval.active || policyActive || A2A_CLIENT_ENABLED;
+    // The trigger tools' hold and the built-in bash rules are the platform's in the same way: they
+    // hold what they name, and must not make HITL_ENABLED ask about every call of a worker or
+    // doorbell turn that nobody is watching.
+    const policyActive = approval.operatorActive || bashPolicy.operatorActive;
+    const anyApproval = approval.active || bashPolicy.active || A2A_CLIENT_ENABLED;
     // The channel decisions arrive on. Approvals need it, and so does the
     // question tool, which waits for its answer on the same subject: a
     // deployment that turns questions on without any approval policy gets the
@@ -406,9 +433,11 @@ export class AgentEngine {
       router.lazySkillWriter = lazySkills;
       // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
       if (progressiveSkills.length) router.skillStore = new SkillStore(progressiveSkills, `${sessionDir}/.skills`);
-      // A session that acts as a user (`withhold_sandbox_keys`) has no `save_memory`: what its model writes into the requester's long-term
-      // memory is what a stranger's text made it write, and every later session of the requester would read it.
-      router.memoryEnabled = request.memory_enabled !== false && !request.withhold_sandbox_keys;
+      // Offered only when the API said so: a request without the field is not the user's conversation. A session that acts as a
+      // user (`withhold_sandbox_keys`) never has them: what its model writes into the requester's long-term memory is what a
+      // stranger's text made it write, and every later session of the requester would read it.
+      router.memoryEnabled = request.memory_enabled === true && !request.withhold_sandbox_keys;
+      router.memoryTurn = { sessionId: request.session_id, messageId: request.message_id };
       router.skillEvolutionEnabled = request.skill_evolution_enabled === true;
       // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
       const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
@@ -421,10 +450,11 @@ export class AgentEngine {
       // run, both read from the one parsed list. No field, or an empty one, is
       // no restriction and leaves both exactly as they were.
       router.setToolAllowlist(toolAllowlist);
+      router.readTaint = parseReadTaint(request.read_taint);
       const allToolSchemas = filterToolSchemas([...router.getToolSchemas(), ...mcpResult.schemas], toolAllowlist);
 
       const messages = [...(request.history || [])];
-      const brainSystemParts = [rules, request.rules_text, request.system_append].filter(Boolean);
+      const brainSystemParts = [rules, request.rules_text, request.system_append, systemHints].filter(Boolean);
       if (brainSystemParts.length) {
         const brainSystem = brainSystemParts.join("\n\n");
         if (messages.length && messages[0].role === "system") {
@@ -534,7 +564,6 @@ export class AgentEngine {
             errorCount: 0,
             toolStats: { total_calls: 0, error_calls: 0, by_tool: {} },
             elapsedMs: 0,
-            pendingMemories: [],
             pendingSkills: [],
             skillsUsed: {},
           };
@@ -545,6 +574,8 @@ export class AgentEngine {
       //    Turn budget: request.max_turns (per-task override) → MAX_TURNS env → default.
       //    0 or negative disables the cap in agent-loop.
       const maxTurns = request.max_turns ?? MAX_TURNS;
+      const turnPool: TurnPool | undefined = isReviewProfile(request) ? { left: maxTurns, used: 0 } : undefined;
+      if (turnPool) extras?.onTurnPool?.(turnPool);
       logger.info({
         sessionId,
         maxTurns,
@@ -563,6 +594,11 @@ export class AgentEngine {
           ...(isReasoningEffort(request.effort) ? { effort: request.effort } : {}),
           ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
           ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),
+          ...(request.withhold_sandbox_keys ? { actingReview: true } : {}),
+          // A requested review's sub-agents take their turns from its budget, and are charged with it (`TurnPool`).
+          // Its sub-agents run on its own model (`subAgentsOnRunModel`), and the runner sees the pool, so a run stopped or failed midway
+          // is charged what it took (`TaskRunner` `reportedTurns`).
+          ...(turnPool ? { turnPool, subAgentsOnRunModel: true } : {}),
           apiUrl,
           apiKey,
           maxTurns,
@@ -633,7 +669,6 @@ export class AgentEngine {
         errorCount: loopResult.errorCount,
         toolStats: loopResult.toolStats,
         elapsedMs: loopResult.elapsedMs,
-        pendingMemories: router.pendingMemories,
         pendingSkills: router.pendingSkills,
         pendingSkillFileMutations: router.pendingSkillFileMutations,
         skillsUsed,

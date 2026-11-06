@@ -597,9 +597,8 @@ test("B1 a claimed run carries the conversation, rebuilt from the turns table", 
     [
       ["user", "how do I list pods"],
       ["assistant", "kubectl get pods"],
-      ["user", "and the nodes?"],
     ],
-    "both stored turns, in order, then this turn's prompt",
+    "both stored turns, in order, and not this turn's prompt: Brain adds that itself",
   );
 });
 
@@ -646,8 +645,8 @@ test("B1 another session's turns never leak into this run", async () => {
   assert.ok(typeof claimed === "object" && "request" in claimed);
   assert.deepEqual(
     (claimed.request.history ?? []).map((m) => m.content),
-    ["mine"],
-    "only this session's history, plus this turn",
+    [],
+    "none of the other session's turns, and not this turn's prompt",
   );
 });
 

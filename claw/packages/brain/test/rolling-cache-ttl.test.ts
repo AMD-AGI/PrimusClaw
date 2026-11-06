@@ -72,7 +72,8 @@ test("a run's sub_agent_max_turns bounds its sub-agent; a deployment's lower SUB
 
 test("through the engine: a sub-agent of a run with sub_agent_max_turns 2 stops after two turns; without it, it runs on", async () => {
   // The sub-agent calls bash on every turn it is given; the parent's next request is the first after the sub-agent ended.
-  for (const [over, subTurns] of [[{ sub_agent_max_turns: 2 }, 2], [{}, 4], [{ sub_agent_max_turns: "2" }, 4]] as const) {
+  // Capped, it is asked once more for its findings (a third request, which runs nothing).
+  for (const [over, subTurns] of [[{ sub_agent_max_turns: 2 }, 3], [{}, 4], [{ sub_agent_max_turns: "2" }, 4]] as const) {
     world.script([
       { tool: "task", input: { description: "d", prompt: "p" } },
       { tool: "bash", input: { command: "true" } },
@@ -90,5 +91,6 @@ test("through the engine: a sub-agent of a run with sub_agent_max_turns 2 stops 
     const firstUser = (raw: string) => JSON.stringify((JSON.parse(raw) as { messages: Array<{ content: unknown }> }).messages[0]?.content);
     const sub = world.llmBodies.filter((b) => firstUser(b) === JSON.stringify("p") || firstUser(b).includes('"p"'));
     assert.equal(sub.length, subTurns, `${JSON.stringify(over)}: ${world.llmBodies.length} requests`);
+    assert.equal(sub.at(-1)!.includes("You have used every turn you were given"), subTurns === 3, `${JSON.stringify(over)}: the cap notice`);
   }
 });

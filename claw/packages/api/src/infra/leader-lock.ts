@@ -87,6 +87,7 @@ export const LEADER_LOCK_IDS = {
   orphanHandles: 8_264_179_233_101,
   uploadSweep: 8_264_179_233_102,
   sessionCleanup: 8_264_179_233_103,
+  sessionRetention: 8_264_179_233_104,
 } as const;
 
 /**

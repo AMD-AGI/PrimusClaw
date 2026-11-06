@@ -321,5 +321,8 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+        # The workloadmanager Service targets this port.
+        - protocol: TCP
+          port: 8081
         - protocol: TCP
           port: 8082

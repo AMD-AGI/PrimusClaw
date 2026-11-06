@@ -269,6 +269,16 @@ interface Manifest {
   listed: number;
 }
 
+/**
+ * Whether a recorded name can only ever be a key under the session's prefix. The
+ * record sits in a directory the sandbox can write, and a prune by name turns
+ * each entry into a DeleteObject key, so a name that is empty, absolute or walks
+ * a `.`/`..` segment makes the whole record untrusted.
+ */
+function isWorkspaceRelative(path: string): boolean {
+  return path !== "" && !path.startsWith("/") && !path.split("/").some((seg) => seg === "" || seg === "." || seg === "..");
+}
+
 /** The manifest for this prefix, or null when there is none or it is not whole. */
 async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Manifest | null> {
   let raw: string | null;
@@ -304,6 +314,7 @@ async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Manif
       listed = listed === undefined ? at : Math.min(listed, at);
       for (const [path, e] of Object.entries(shard.files ?? {})) {
         if (!Array.isArray(e) || e.length !== 4 || e.some((x) => typeof x !== "string")) return null;
+        if (!isWorkspaceRelative(path)) return null;
         files.set(path, e as Entry);
       }
     }
@@ -548,7 +559,9 @@ export async function planUploadDelta(
   let refreshed = 0;
   for (const path of files) {
     const st = stats.get(path);
-    if (!st) { pending.add(path); continue; }
+    // Uploaded, and still named in the record with stats that never match, so a
+    // prune by name finds its object once the file is gone.
+    if (!st) { pending.add(path); entries.set(path, ["", "", "", ""]); continue; }
     const old = prev?.get(rel(path));
     // ctime too: mtime can be put back by `tar x`, `cp -p`, `touch -r`, and ctime cannot.
     if (old && old[0] === st.size && old[1] === st.mtime && old[2] === st.ctime) {

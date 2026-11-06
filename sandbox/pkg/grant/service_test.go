@@ -11,8 +11,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -27,7 +29,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
@@ -101,13 +105,17 @@ func (r *failOnceReclaimer) Reclaim(_ context.Context, _ SandboxRef) error {
 	return nil
 }
 
-func testService(t *testing.T, now time.Time) (*Service, *ecdsa.PrivateKey, *memRecord, *memReclaimer) {
+func testService(t *testing.T, now time.Time, intercept ...interceptor.Funcs) (*Service, *ecdsa.PrivateKey, *memRecord, *memReclaimer) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
+	builder := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{})
+	if len(intercept) == 1 {
+		builder = builder.WithInterceptorFuncs(intercept[0])
+	}
+	cl := builder.Build()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -383,7 +391,22 @@ func TestIssueRejectsBadWorkspace(t *testing.T) {
 
 func TestReserveStopsAtCap(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	svc, priv, _, _ := testService(t, now)
+	// A grant read slower than the conflict retry interval lets concurrent
+	// callers read the same resourceVersion, as a busy API server does.
+	var inFlight, maxInFlight atomic.Int32
+	slowRead := interceptor.Funcs{Get: func(ctx context.Context, c ctrlclient.WithWatch, key ctrlclient.ObjectKey, obj ctrlclient.Object, opts ...ctrlclient.GetOption) error {
+		if _, ok := obj.(*runtimev1alpha1.SandboxGrant); !ok {
+			return c.Get(ctx, key, obj, opts...)
+		}
+		n := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for m := maxInFlight.Load(); n > m && !maxInFlight.CompareAndSwap(m, n); m = maxInFlight.Load() {
+		}
+		err := c.Get(ctx, key, obj, opts...)
+		time.Sleep(time.Millisecond)
+		return err
+	}}
+	svc, priv, _, _ := testService(t, now, slowRead)
 	req := sampleRequest(now.Add(time.Hour))
 	req.Roles["measurement"] = RoleRequest{Templates: []string{"runner"}, MaxSandboxes: 16, MaxGPUs: 128}
 	req.Attestation = signGrant(t, priv, req)
@@ -413,6 +436,43 @@ func TestReserveStopsAtCap(t *testing.T) {
 	wg.Wait()
 	if okN != 16 || denyN != 16 {
 		t.Fatalf("ok=%d deny=%d", okN, denyN)
+	}
+	if got := maxInFlight.Load(); got != 1 {
+		t.Fatalf("%d grant reads overlapped; writes of one grant must queue", got)
+	}
+}
+
+func TestReserveOutlastsAnotherReplica(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	// Another replica writes the grant between each of our first five reads
+	// and our update, which is more conflicts than retry.DefaultRetry absorbs.
+	var interfere atomic.Int32
+	otherReplica := interceptor.Funcs{Get: func(ctx context.Context, c ctrlclient.WithWatch, key ctrlclient.ObjectKey, obj ctrlclient.Object, opts ...ctrlclient.GetOption) error {
+		if err := c.Get(ctx, key, obj, opts...); err != nil {
+			return err
+		}
+		if _, ok := obj.(*runtimev1alpha1.SandboxGrant); !ok || interfere.Add(-1) < 0 {
+			return nil
+		}
+		other := &runtimev1alpha1.SandboxGrant{}
+		if err := c.Get(ctx, key, other); err != nil {
+			return err
+		}
+		other.Labels = map[string]string{"other-replica-write": strconv.Itoa(int(interfere.Load()))}
+		return c.Update(ctx, other)
+	}}
+	svc, priv, _, _ := testService(t, now, otherReplica)
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	interfere.Store(5)
+	if err := svc.Reserve(context.Background(), req.GrantID, "measurement", "sbx-1", "sess-1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if left := interfere.Load(); left >= 0 {
+		t.Fatalf("other replica wrote only %d of 5 times", 5-left)
 	}
 }
 

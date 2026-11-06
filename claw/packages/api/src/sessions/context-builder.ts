@@ -1,12 +1,12 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import type { Message } from "@claw/protocol";
 import { coerceToolInput } from "@claw/utils";
 
-import { getMemoryEntries, getProfileEntry, getMemoryPreference } from "../memory/service.js";
-import { CLAW_MEMORY_ENABLED } from "../config.js";
+import { buildMemoryCatalogue, memoryAccess, memoryAvailable } from "../memory/service.js";
 import { sessionWithholdsMemory } from "../github-review/session-tools.js";
 import pino from "pino";
 import { estimateTokens } from "../shared/tokens.js";
@@ -129,11 +129,42 @@ function selectHistoryTokens(
 
 /** Build history from conversation turns (sliding window, newest first until budget). */
 export async function buildHistory(sessionId: string, maxTokens = 100_000): Promise<Message[]> {
+  const fromTurn = await assistantHistoryStart(sessionId);
   const turns = (await db.query(
-    "SELECT role, content, tool_calls, tool_results, token_count FROM claw_conversation_turns WHERE session_id = $1 AND deleted_at IS NULL ORDER BY turn_index DESC",
-    [sessionId],
-  )).rows;
+    `SELECT role, content, tool_calls, tool_results, token_count FROM claw_conversation_turns
+      WHERE session_id = $1 AND deleted_at IS NULL AND turn_index >= $2 ORDER BY turn_index DESC`,
+    [sessionId, fromTurn],
+  )).rows as Array<{ role: string; content: string; tool_calls?: unknown; tool_results?: unknown; token_count?: number }>;
+  // A window that starts at a reply starts with a turn whose question it does not hold: begin at the user's turn.
+  while (fromTurn > 0 && turns.length && turns[turns.length - 1].role !== "user") turns.pop();
   return reconstructHistory(turns, maxTokens);
+}
+
+/** The turns an assistant's router or observer is given: the last `ASSISTANT_HISTORY_TURNS` at least, and fewer than one `STEP` more. */
+export const ASSISTANT_HISTORY_TURNS = 40;
+export const ASSISTANT_HISTORY_STEP = 20;
+
+/**
+ * The first stored turn an assistant's router or observer session is given as history, or 0 for every other session.
+ *
+ * A router's session never ends, and what it needs of the past is in its item list and memory, which every turn is given; its
+ * history is only the recent conversation. The window starts on a multiple of `ASSISTANT_HISTORY_STEP`, so it moves once every
+ * that many turns, not on every turn: in between, every turn's history begins with the same messages, and the model provider reads
+ * them from its prompt cache instead of processing them again. The token budget still applies inside the window, but it does not
+ * bound a router (whose turns are mostly tool calls, which it does not count).
+ */
+export async function assistantHistoryStart(sessionId: string): Promise<number> {
+  if (!CLAW_ASSISTANT_ENABLED) return 0;
+  const row = (await db.query(
+    `SELECT (SELECT COALESCE(MAX(turn_index), 0) FROM claw_conversation_turns WHERE session_id = $1 AND deleted_at IS NULL) AS last
+      WHERE EXISTS (SELECT 1 FROM claw_assistants WHERE session_id = $1)
+         OR EXISTS (SELECT 1 FROM claw_assistant_scopes WHERE session_id = $1)`,
+    [sessionId],
+  )).rows[0] as { last: number | string } | undefined;
+  if (!row) return 0;
+  const last = Number(row.last);
+  const from = last - ASSISTANT_HISTORY_TURNS + 1;
+  return from > 1 ? Math.floor(from / ASSISTANT_HISTORY_STEP) * ASSISTANT_HISTORY_STEP : 0;
 }
 
 /** Tolerant JSONB → array parser. Accepts already-parsed arrays, JSON strings,
@@ -146,11 +177,9 @@ function parseJsonbArray(v: unknown): any[] {
   return [];
 }
 
-const MEMORY_BUDGET = 3_000;
-
-/** Tells the agent that save_memory will not persist, so it does not claim otherwise. */
+/** Tells the agent that the memory tools are not there, so it does not claim to remember. */
 export const MEMORY_OFF_NOTICE =
-  "## Long-term Memory\nLong-term memory is turned off for this user, so save_memory does not store anything. " +
+  "## Long-term Memory\nLong-term memory is turned off for this user, so nothing is remembered between conversations. " +
   "If the user asks you to remember something, say that memory is off and that they can turn it on in the chat settings.";
 
 export async function buildSystemContextParts(
@@ -158,92 +187,39 @@ export async function buildSystemContextParts(
   userId: string,
   rulesText = "",
   systemAppend = "",
-  recordMemoryAccess = true,
 ): Promise<{
   parts: string[];
-  profileTokens: number;
   memoryTokens: number;
   summaryTokens: number;
   rulesTokens: number;
 }> {
   const parts: string[] = [];
-  let profileTokens = 0;
   let memoryTokens = 0;
   let summaryTokens = 0;
   let rulesTokens = 0;
 
-  // Long-term memory injection (profile + entries) is gated by CLAW_MEMORY_ENABLED.
-  // When OFF: skip both DB queries and emit nothing — system prompt drops these sections.
-  // A second gate, per user: memory is opt-in, so a user who has not turned it on
-  // gets neither injection nor a way to write (see insertMemoryEntry). If the
-  // preference cannot be read, treat it as off.
-  // A session that acts as a user gets none of its requester's memory, and not the notice about it either.
-  const memoryOn = CLAW_MEMORY_ENABLED && !(await sessionWithholdsMemory(sessionId));
-  let memoryOptIn = false;
-  if (memoryOn) {
-    try {
-      memoryOptIn = await getMemoryPreference(userId);
-    } catch (err: any) {
-      logger.error({ err, userId }, "memory.preference_read_failed");
-    }
-    if (!memoryOptIn) {
+  // Long-term memory: the catalogue of the user's entries, one line each, for a session memory serves (the
+  // user's own chat; see memoryAccess). A user who has not opted in is told it is off, except in a session that
+  // acts as a user, which hears nothing about the requester's memory. The profile earlier versions generated is
+  // no longer injected: the user and feedback entries say the same, visibly.
+  if (memoryAvailable() && !(await sessionWithholdsMemory(sessionId))) {
+    const access = await memoryAccess(sessionId, userId);
+    if (!access.optedIn) {
       parts.push(MEMORY_OFF_NOTICE);
-    }
-  }
-  if (memoryOn && memoryOptIn) {
-    // 1. User profile
-    try {
-      const profileContent = await getProfileEntry(userId);
-      if (profileContent) {
-        const block = `## User Profile\n${profileContent}`;
-        parts.push(block);
-        profileTokens = estimateTokens(block);
-      }
-    } catch (err: any) {
-      if (!isMissingRelationError(err)) {
-        logger.error({ err, userId }, "memory.profile_query_failed");
-      }
-    }
-
-    // 2. Long-term memory (top-K by importance, excluding user_profile)
-    try {
-      const memories = (await getMemoryEntries(userId, 30))
-        .filter((m: any) => m.category !== "user_profile");
-
-      if (memories.length) {
-        const selected: any[] = [];
-        let accumulated = 0;
-        for (const m of memories) {
-          const line = `- [${m.category}] ${m.content}`;
-          const lineTokens = estimateTokens(line);
-          if (accumulated + lineTokens > MEMORY_BUDGET) break;
-          selected.push(m);
-          accumulated += lineTokens;
-        }
-
-        if (selected.length) {
-          const memoryBlock = selected.map((m: any) => `- [${m.category}] ${m.content}`).join("\n");
-          const block = `## Long-term Memory\n${memoryBlock}`;
-          parts.push(block);
-          memoryTokens = estimateTokens(block);
+    } else if (access.serves) {
+      try {
+        const catalogue = await buildMemoryCatalogue(userId);
+        if (catalogue) {
+          parts.push(catalogue.text);
+          memoryTokens = catalogue.tokens;
           logger.info({
-            userId, injected: selected.length, total: memories.length,
-            categories: selected.map((m: any) => m.category),
-            truncated: selected.length < memories.length,
+            userId, listed: catalogue.listed, total: catalogue.total, dueForReview: catalogue.dueForReview, tokens: catalogue.tokens,
           }, "memory.injected");
-          // access_count update: best-effort on local PG, skipped for remote
-          const ids = selected.map((m: any) => m.id).filter((id: any) => typeof id === "number");
-          if (recordMemoryAccess && ids.length) {
-            db.query(
-              "UPDATE claw_memory_entries SET access_count = access_count + 1, last_accessed = NOW() WHERE id = ANY($1)",
-              [ids]
-            ).catch((err) => logger.warn({ err, userId }, "memory.access_update_failed"));
-          }
         }
-      }
-    } catch (err: any) {
-      if (!isMissingRelationError(err)) {
-        logger.error({ err, userId }, "memory.query_failed");
+      } catch (err: any) {
+        if (!isMissingRelationError(err)) {
+          logger.error({ err, userId }, "memory.query_failed");
+        }
       }
     }
   }
@@ -266,7 +242,7 @@ export async function buildSystemContextParts(
     rulesTokens = estimateTokens(block);
   }
 
-  return { parts, profileTokens, memoryTokens, summaryTokens, rulesTokens };
+  return { parts, memoryTokens, summaryTokens, rulesTokens };
 }
 
 function extractUserMessageText(event: any): string {
@@ -319,7 +295,7 @@ export async function getContextUsageSnapshot(
   rulesText = "",
   systemAppend = "",
 ): Promise<ContextUsageSnapshot> {
-  const system = await buildSystemContextParts(sessionId, userId, rulesText, systemAppend, false);
+  const system = await buildSystemContextParts(sessionId, userId, rulesText, systemAppend);
 
   const lastCompleteRow = (await db.query(
     "SELECT COALESCE(MAX(id), 0) AS id FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL AND event = 'exec_complete'",
@@ -347,7 +323,7 @@ export async function getContextUsageSnapshot(
   const history = selectHistoryTokens(turns, historyBudget);
 
   const breakdown: ContextUsageBreakdown = {
-    system_prompt: system.profileTokens + system.memoryTokens,
+    system_prompt: system.memoryTokens,
     tools: CONTEXT_TOOL_SCHEMA_TOKENS,
     rules: system.rulesTokens,
     skills: 0,
@@ -377,7 +353,13 @@ export async function getContextUsageSnapshot(
   };
 }
 
-/** Build full messages array: system(profile+memory+summary+rules) + history + user(prompt). */
+/**
+ * The history Brain is handed for a turn: system (memory + summary + rules), then the stored turns that fit.
+ *
+ * It never holds this turn's prompt. Brain appends the prompt itself (brain/src/agent/engine.ts), wrapped with the
+ * skills and tools it resolved, so a history that also ended with it showed the model every message twice. `prompt`
+ * is taken only to reserve its share of the budget.
+ */
 export async function buildMessages(
   sessionId: string,
   prompt: string,
@@ -399,8 +381,5 @@ export async function buildMessages(
   // History (sliding window)
   const history = await buildHistory(sessionId, Math.max(remaining, 10_000));
   messages.push(...history);
-
-  // New user prompt
-  messages.push({ role: "user", content: prompt });
   return messages;
 }

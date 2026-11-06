@@ -586,9 +586,10 @@ describe("assistant work items", { skip }, () => {
         [[3, "waiting", "Which one?", false, 0], [2, "ready", null, true, 1]]);
       assert.deepEqual((await as("u1").get("/v1/work-items?state=in_progress")).body.data.map((r: any) => r.item_id), [a.itemId]);
       assert.deepEqual(Object.keys(needs.body.data[0]).sort(), [
-        "accepted_version", "board_state", "can_accept", "item_id", "last_report_kind", "outcome",
-        "pending_question", "result_version", "seq", "summary", "title", "updated_at",
+        "accepted_version", "board_state", "can_accept", "item_id", "kind", "last_report_kind", "outcome",
+        "params", "pending_question", "result_version", "seq", "summary", "title", "updated_at",
       ]);
+      assert.deepEqual([needs.body.data[0].kind, needs.body.data[0].params], ["task", {}], "a task item says so, with no params");
     });
 
     test("an unknown state is a 400", async () => {

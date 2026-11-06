@@ -301,7 +301,7 @@ function redactValue(
   runtimeSecrets: RuntimeSecrets,
   key?: string,
 ): unknown {
-  if (key && isSensitiveKey(key) && value !== null && value !== undefined && value !== "") {
+  if (key && isSensitiveKey(key, value) && value !== null && value !== undefined && value !== "") {
     return "<redacted>";
   }
   if (typeof value === "string") return redactString(value, runtimeSecrets);
@@ -350,7 +350,7 @@ function redactToolArguments(
   seen: WeakSet<object>,
   runtimeSecrets: RuntimeSecrets,
 ): unknown {
-  if (!isSensitiveKey(toolName)) return redactValue(input, seen, runtimeSecrets, toolName);
+  if (!isSensitiveKey(toolName, input)) return redactValue(input, seen, runtimeSecrets, toolName);
   return maskLeaves(input, seen);
 }
 

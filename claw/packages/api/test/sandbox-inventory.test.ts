@@ -262,3 +262,13 @@ test("retention is read from the entry's value, never from its key", async () =>
   }));
   assert.equal(inventory.sessions[0].retained, false);
 });
+
+test("the health probe is handed the entry's owner key, for a Router that authenticates", async () => {
+  const seen: Array<string | undefined> = [];
+  await collectSandboxInventory(deps({
+    handsKeys: async () => ["hands.sess-1"],
+    handsGet: async () => READY,
+    probeHealth: async (_handsUrl, platformKey) => { seen.push(platformKey); return true; },
+  }));
+  assert.deepEqual(seen, [JSON.parse(READY).platformKey]);
+});

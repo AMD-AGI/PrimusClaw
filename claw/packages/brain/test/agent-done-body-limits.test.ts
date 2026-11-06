@@ -30,7 +30,7 @@ const REQUEST = {
 
 function result(over: Partial<ExecuteResult> = {}): ExecuteResult {
   return {
-    finalText: "ok", turns: 1, pendingMemories: [], pendingSkills: [],
+    finalText: "ok", turns: 1, pendingSkills: [],
     skillsUsed: {}, errorCount: 0, abortReason: "completed",
     ...over,
   } as ExecuteResult;

@@ -107,8 +107,9 @@ describe("scheduled triggers", { skip }, () => {
     assert.equal(input.requestTimeout, 60, "the per-run limit travels with the dispatch");
     const s = (await q("SELECT user_id, config FROM claw_sessions")).rows[0] as any;
     assert.equal(s.user_id, "u1");
-    assert.equal(s.config.platform_key, "pk-creator");
-    assert.equal(s.config._server_managed_credentials, true);
+    const { readTrustedSessionCredentials } = await import("../src/auth/session-credentials.js");
+    assert.equal(readTrustedSessionCredentials(s.config).platformKey, "pk-creator");
+    assert.equal(JSON.stringify(s.config).includes("pk-creator"), false, "sealed, never in the clear");
     assert.equal(s.config.trigger_id, id);
     const f = (await q("SELECT status, session_id FROM claw_trigger_fires")).rows[0] as any;
     assert.equal(f.status, "started");
@@ -205,6 +206,23 @@ describe("scheduled triggers", { skip }, () => {
              ('trg-turn', $1, 'run', 'running', 'chat', $2::jsonb, 'w1')`,
       [fireRow.session_id, JSON.stringify({ message_id: fireRow.message_id })]);
     await sched.enforceRunTimeLimit(new Date(NOW.getTime() + 120_000));
+    assert.equal(interrupts.length, 1);
+    assert.equal(((await q("SELECT status FROM claw_tasks WHERE task_id = 'trg-turn'")).rows[0] as any).status, "cancelling");
+  });
+
+  test("the time limit stops the trigger's turn when the gate names a turn that ended beside it", async () => {
+    const id = (await create()).json().data.trigger_id;
+    await makeDue(id);
+    await sched.tickTriggers(NOW);
+    const fireRow = (await q("SELECT session_id, message_id FROM claw_trigger_fires")).rows[0] as any;
+    // A user turn overlapped the trigger's, took the gate by name, and has ended:
+    // the trigger's turn is the one still holding the session.
+    await q("UPDATE claw_sessions SET agent_status = 'running', agent_gate_message_id = 'claw-user-turn' WHERE session_id = $1", [fireRow.session_id]);
+    await q(`INSERT INTO claw_tasks (task_id, session_id, name, status, origin, metadata, lease_owner) VALUES
+             ('trg-turn', $1, 'run', 'running', 'chat', $2::jsonb, 'w1'),
+             ('user-turn', $1, 'run', 'completed', 'chat', '{"message_id":"claw-user-turn"}'::jsonb, NULL)`,
+      [fireRow.session_id, JSON.stringify({ message_id: fireRow.message_id })]);
+    assert.equal(await sched.enforceRunTimeLimit(new Date(NOW.getTime() + 120_000)), 1);
     assert.equal(interrupts.length, 1);
     assert.equal(((await q("SELECT status FROM claw_tasks WHERE task_id = 'trg-turn'")).rows[0] as any).status, "cancelling");
   });

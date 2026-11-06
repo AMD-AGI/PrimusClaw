@@ -10,11 +10,12 @@ import { db, MarketplaceDb } from "../infra/db.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
 
 import { buildMessages } from "../sessions/context-builder.js";
-import { sessionModelFromRow } from "../sessions/session-model.js";
+import { sessionEffortFromRow, sessionModelFromRow } from "../sessions/session-model.js";
 import { sessionRepoFromRow } from "../sessions/session-repo.js";
 import { withPendingDrainClaim } from "../sessions/drain-claim.js";
 import { WORK_EVENT_PREFIX } from "../assistant/prompts.js";
-import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
+import { memoryAccess } from "../memory/service.js";
+import { scanMemoryContent } from "../memory/gates.js";
 import {
   saveSkill, recordSkillFeedback,
   selectSkillsForTask,
@@ -25,11 +26,12 @@ import {
 import { appEventIdentity } from "./app-events.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { CLAW_ASSISTANT_ENABLED, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { skipsSkillSelection } from "../assistant/role-profile.js";
+import { reviewProfileSession } from "../github-review/session-tools.js";
 import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
 import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
-import { sessionWithholdsMemory } from "../github-review/session-tools.js";
+import { rerunOnFallback } from "../assistant/model-fallback.js";
 import { a2aPushEnabled } from "../routes/a2a-flags.js";
 import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
 import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
@@ -813,17 +815,16 @@ export const eventNotificationPorts = {
  * substituted). Production reads every one from here.
  */
 export const completionPorts = {
-  insertMemoryEntry,
   saveSkill,
   recordSkillFeedback,
   checkProbationGraduation,
   maybeSummarize: (sessionId: string, userId: string) => maybeSummarize(sessionId, userId),
-  maybeExtractMemory,
   maybeRecordTaskPattern,
   enqueueEvolutionJob,
   recordRunFinished,
   recordWorkerTurnEnd,
   deliverUnsaidAnswer,
+  rerunOnFallback,
 };
 
 async function handleComplete(
@@ -942,9 +943,6 @@ async function handleComplete(
   // run.completed / run.failed notification. Everything below that is such a
   // side effect is gated on this one answer, or follows the early return.
   const sandboxOnly = messageId !== null && await isSandboxOnlyRun(sessionId, messageId);
-  // A session that acts as a user saves nothing to its requester's memory, from the model's `save_memory` or from what is extracted
-  // from its conversation, which is what strangers wrote (`sessionWithholdsMemory`).
-  const memoryWithheld = await sessionWithholdsMemory(sessionId);
   const gateOpened = await releaseSessionGateIfLastRun(
     sessionId, gateTurn, Boolean(failed),
     provenance !== "foreign" ? provenance : null,
@@ -953,34 +951,11 @@ async function handleComplete(
   // 3. Save conversation turns.
   await recordCompletionTurns(sessionId, event, messageId, stillHeld);
 
-  // 4. Process explicit save_memory events (from Brain's save_memory tool).
-  // Gated by CLAW_MEMORY_ENABLED. When OFF: drop the payload, warn for audit.
-  // Brain's save_memory tool stays in the schema, so the LLM may still call it;
-  // this is the silent-discard contract documented in the feature flag.
-  let explicitMemorySaved = false;
-  const memoriesToSave = sandboxOnly || memoryWithheld ? [] : (event as any).memories_to_save || [];
-  if (!CLAW_MEMORY_ENABLED) {
-    if (memoriesToSave.length) {
-      logger.warn({ sessionId, count: memoriesToSave.length }, "memory.write_skipped_flag_off");
-    }
-  } else {
-    for (const mem of memoriesToSave) {
-      const blocked = scanMemoryContent(mem.content);
-      if (blocked) { logger.warn({ reason: blocked }, "memory.blocked"); continue; }
-      try {
-        if (await completionPorts.insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" })) {
-          explicitMemorySaved = true;
-        } else {
-          logger.warn({ sessionId }, "memory.write_skipped_user_opted_out");
-        }
-      } catch (err) {
-        logger.error({ err, sessionId }, "memory.save_failed");
-      }
-    }
-    if (explicitMemorySaved) {
-      maybeUpdateUserProfile(userId).catch(err =>
-        logger.error({ err, userId }, "memory.profile_update_failed"));
-    }
+  // 4. Memory is written during the turn, through the API's checks (routes/internal-memory.ts). A Brain from
+  // before that still sends what its save_memory buffered; it bypassed every check, so it is dropped.
+  const legacyMemories = (event as any).memories_to_save;
+  if (Array.isArray(legacyMemories) && legacyMemories.length) {
+    logger.warn({ sessionId, count: legacyMemories.length }, "memory.legacy_save_dropped");
   }
 
   // 4 + 4.5. Skill writes (save_skill tool, skill_file mutations).
@@ -1165,18 +1140,17 @@ async function handleComplete(
 
   // 7a. Best-effort background tasks (setImmediate fire-and-forget).
   //     These produce signal but losing one occurrence is acceptable —
-  //     summary/memory will be regenerated on the next exec_complete, and
+  //     a summary will be regenerated on the next exec_complete, and
   //     pattern occurrences accumulate over many sessions.
-  //     Memory extraction gated by CLAW_MEMORY_ENABLED; pattern recording
-  //     gated by CLAW_SKILL_EVOLUTION_ENABLED. Summary stays unconditional.
+  //     Pattern recording gated by CLAW_SKILL_EVOLUTION_ENABLED. Summary
+  //     stays unconditional. Memory is never extracted in the background.
+  // A review someone asked of the owner learns nothing for the owner: no pattern, no skill evolution from what a stranger's pull request
+  // made its model do (`github-review/review-profile.ts`). A session whose profile cannot be read is treated as one.
+  const learns = !(await reviewProfileSession(sessionId).catch(() => ({ userId: "" })));
   setImmediate(() => {
     completionPorts.maybeSummarize(sessionId, userId).catch(err =>
       logger.error({ err, sessionId }, "summarize_failed"));
-    if (CLAW_MEMORY_ENABLED && !explicitMemorySaved && !memoryWithheld) {
-      completionPorts.maybeExtractMemory(sessionId, userId).catch(err =>
-        logger.error({ err, sessionId }, "memory.extraction_failed"));
-    }
-    if (CLAW_SKILL_EVOLUTION_ENABLED) {
+    if (CLAW_SKILL_EVOLUTION_ENABLED && learns) {
       completionPorts.maybeRecordTaskPattern(sessionId, userId, event).catch(err =>
         logger.error({ err, sessionId }, "skill.pattern_record_failed"));
     }
@@ -1187,7 +1161,7 @@ async function handleComplete(
   //     expensive to lose (LLM-decided multi-mutation batches), so it goes
   //     into a real DB-backed queue. marketplace/evolve-worker.ts polls and runs jobs
   //     with retries and crash recovery. Gated by CLAW_SKILL_EVOLUTION_ENABLED.
-  if (CLAW_SKILL_EVOLUTION_ENABLED) {
+  if (CLAW_SKILL_EVOLUTION_ENABLED && learns) {
     try {
       await completionPorts.enqueueEvolutionJob(sessionId, userId, event as Record<string, unknown>);
     } catch (err) {
@@ -1211,10 +1185,29 @@ async function handleComplete(
     }
   }
 
+  // 8b. An assistant turn the gateway refused for want of a key binding is run again, once, on the fallback model
+  //     (`assistant/model-fallback.ts`, model choice on only). It is not over for the user, so 9 and 9b record nothing of it.
+  let rerun = false;
+  if (CLAW_ASSISTANT_ENABLED && failed && !interrupted && endedRunIds.length) {
+    try {
+      rerun = await completionPorts.rerunOnFallback({
+        sessionId,
+        runIds: endedRunIds,
+        messageId: messageId ?? undefined,
+        failed: Boolean(failed),
+        interrupted: Boolean(interrupted),
+        finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
+        failureReason: typeof failure_reason === "string" ? failure_reason : undefined,
+      }) === "rerun";
+    } catch (err) {
+      logger.error({ err, sessionId }, "assistant.model_fallback_failed");
+    }
+  }
+
   // 9. A worker's turn that ended without telling the assistant anything it must act on becomes a report
   //    of its own (ready, or failed), so an accepted item is never one that just stopped. Best-effort here
   //    and not allowed to be the only line: the assistant sweep records a run whose end this lost.
-  if (CLAW_ASSISTANT_ENABLED && !interrupted && endedRunIds.length) {
+  if (CLAW_ASSISTANT_ENABLED && !interrupted && endedRunIds.length && !rerun) {
     try {
       await completionPorts.recordWorkerTurnEnd({
         sessionId,
@@ -1227,9 +1220,12 @@ async function handleComplete(
     } catch (err) {
       logger.error({ err, sessionId }, "assistant.turn_end_failed");
     }
-    // 9b. A router turn that answered the user in plain text and said nothing: the text is what it meant to say.
-    //     Best-effort: a turn whose words were lost here is a user who heard nothing, which the model could have
-    //     caused on its own, so this is a repair and not a promise.
+  }
+  // 9b. A router turn that answered the user in plain text and said nothing: the text is what it meant to say. One that
+  //     failed or was stopped and said nothing: the user is told it did not go through. Best-effort: a turn whose words
+  //     were lost here is a user who heard nothing, which the model could have caused on its own, so this is a repair
+  //     and not a promise.
+  if (CLAW_ASSISTANT_ENABLED && endedRunIds.length && !rerun) {
     try {
       await completionPorts.deliverUnsaidAnswer({
         sessionId,
@@ -1347,11 +1343,14 @@ async function drainNextPendingMessage(sessionId: string, userId: string): Promi
   // A worker's report queued for the assistant waits behind what its user sent: the user is waiting for an answer,
   // and the report is on the board already, where the turn answering the user reads it.
   const pending = (await db.query(
-  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo FROM claw_pending_messages WHERE session_id = $1 ORDER BY starts_with(content, $2), created_at LIMIT 1",
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT effort FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_effort, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo FROM claw_pending_messages WHERE session_id = $1 ORDER BY starts_with(content, $2), created_at LIMIT 1",
   [sessionId, WORK_EVENT_PREFIX],
 )).rows[0];
 
 if (pending) {
+  // A review someone asked of the session's owner runs only while the owner still lets others act for them, asked now, and while its
+  // turn budget has room; otherwise it is halted here and nothing is sent (`gateRequestedReviewTurn`).
+  if (!(await (await import("../assistant/review-items.js")).gateRequestedReviewTurn(sessionId))) return;
   const pendingUserId = pending.user_id || userId;
   const history = await buildMessages(sessionId, pending.content, pendingUserId);
 
@@ -1416,7 +1415,7 @@ if (pending) {
     message_id: pendingMessageId,
     prompt: pending.content,
     history,
-    memory_enabled: await isMemoryActive(pendingUserId),
+    memory_enabled: (await memoryAccess(sessionId, pendingUserId)).serves,
     skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
     user_id: pendingUserId,
     llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
@@ -1438,6 +1437,8 @@ if (pending) {
   // a session with no choice, so Brain falls back on its own default.
   const pendingModel = sessionModelFromRow({ model: pending.session_model });
   if (pendingModel) task.model = pendingModel;
+  const pendingEffort = sessionEffortFromRow({ effort: pending.session_effort });
+  if (pendingEffort) task.effort = pendingEffort;
   // The session's bound repository, as the immediate path attaches it.
   const pendingRepo = sessionRepoFromRow({ repo: pending.session_repo }, sessionId);
   if (pendingRepo) task.repo = pendingRepo;

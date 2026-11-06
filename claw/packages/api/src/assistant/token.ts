@@ -14,10 +14,11 @@
 import { createHmac } from "node:crypto";
 import { constantTimeEquals } from "@claw/utils";
 
-export type AssistantRole = "router" | "worker";
+/** `observer`: a turn of a group's or a repository's watcher, whose every tool only records what it would do (`observe.ts`). */
+export type AssistantRole = "router" | "worker" | "observer";
 
 export interface AssistantTokenClaims {
-  /** The session the turn runs in: the assistant's Router session or an item's Worker session. */
+  /** The session the turn runs in: the assistant's Router session, an item's Worker session or a scope's observer session. */
   sid: string;
   role: AssistantRole;
   /** Worker only: the item the session works on, and the generation this run started under. */
@@ -69,7 +70,7 @@ function isNonEmptyString(v: unknown): v is string {
 function parseClaims(raw: unknown): AssistantTokenClaims | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const c = raw as Record<string, unknown>;
-  if (c.role !== "router" && c.role !== "worker") return null;
+  if (c.role !== "router" && c.role !== "worker" && c.role !== "observer") return null;
   if (!isNonEmptyString(c.sid) || !isNonEmptyString(c.mid) || !isNonEmptyString(c.task_id)) return null;
   if (!Number.isInteger(c.exp)) return null;
   if (c.role === "worker") {
@@ -79,7 +80,7 @@ function parseClaims(raw: unknown): AssistantTokenClaims | null {
       mid: c.mid, task_id: c.task_id, exp: c.exp as number,
     };
   }
-  return { sid: c.sid, role: "router", mid: c.mid, task_id: c.task_id, exp: c.exp as number };
+  return { sid: c.sid, role: c.role, mid: c.mid, task_id: c.task_id, exp: c.exp as number };
 }
 
 export function verifyAssistantToken(

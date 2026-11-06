@@ -445,6 +445,11 @@ export async function runScript(
             );
             handsArgs = { ...args, [timeoutField]: timeoutSec };
           }
+          // `read` numbers its lines for the model; a script's read feeds a
+          // capture that `${captures.x.field}` parses, so it keeps the raw text.
+          if (step.name === "read" && handsArgs.line_numbers === undefined) {
+            handsArgs = { ...handsArgs, line_numbers: false };
+          }
           // The step's position: a replay re-enters at the same one, which is
           // what lets a background start there recognise its own retry.
           const out = await ctx.hands.callToolFull(
@@ -573,7 +578,6 @@ export async function runScript(
         finalText: "",
         tokenUsage: zeroTokens(),
         turns: 0,
-        pendingMemories: [],
         pendingSkills: [],
         skillsUsed: {},
         errorCount: toolStats.error_calls,
@@ -620,7 +624,6 @@ export async function runScript(
     finalText: lastResultText,
     tokenUsage: zeroTokens(),
     turns: 0,
-    pendingMemories: [],
     pendingSkills: [],
     skillsUsed: {},
     errorCount: toolStats.error_calls,
@@ -644,7 +647,6 @@ function failResult(
     finalText: "",
     tokenUsage: zeroTokens(),
     turns: 0,
-    pendingMemories: [],
     pendingSkills: [],
     skillsUsed: {},
     errorCount: toolStats.error_calls,

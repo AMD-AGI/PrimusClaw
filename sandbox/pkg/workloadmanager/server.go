@@ -30,10 +30,10 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
-	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
@@ -48,7 +48,8 @@ type AuditConfig struct {
 type Config struct {
 	Port       int
 	EnableAuth bool
-	SafeAPIURL string
+	// Identity validates caller credentials on /v1 when EnableAuth is set.
+	Identity   *identity.Client
 	Namespace  string
 	GCInterval time.Duration
 	DefaultTTL time.Duration
@@ -119,7 +120,6 @@ type Server struct {
 	workloads  *SafeWorkloadCreator // nil until the SaFE Workload client is attached
 	router     *gin.Engine
 	wg         sync.WaitGroup
-	safeClient *safe.Client     // SaFE API Key verification client (nil when auth disabled)
 	auditStore audit.AuditStore // nil when audit disabled
 	builder    *builder.Builder // nil when image building not configured
 }
@@ -127,17 +127,6 @@ type Server struct {
 // New creates a new Workload Manager server.
 func New(cfg Config, st store.Store) *Server {
 	s := &Server{cfg: cfg, store: st}
-
-	// Initialize SaFE API Key client (when auth is enabled)
-	if cfg.EnableAuth {
-		if cfg.SafeAPIURL == "" {
-			log.Error("WM: --enable-auth requires --safe-api-url to be set")
-		} else {
-			s.safeClient = safe.NewClient(cfg.SafeAPIURL)
-			log.Info("WM: SaFE API Key authentication enabled", "safeAPIURL", cfg.SafeAPIURL)
-		}
-	}
-
 	s.setupRoutes()
 	return s
 }
@@ -270,12 +259,11 @@ func (s *Server) setupRoutes() {
 	v1 := s.router.Group("/v1")
 	v1.Use(s.loggingMiddleware())
 
-	// SaFE API Key authentication middleware (defense-in-depth)
-	// When --enable-auth is set, WM also verifies API Keys on direct access.
-	// For requests proxied from Router (with X-User-Id header), the existing header is trusted.
-	if s.cfg.EnableAuth && s.safeClient != nil {
-		v1.Use(s.safeAuthMiddleware())
-		log.Info("WM: SaFE API Key auth middleware enabled on /v1/ routes")
+	// Caller authentication (defense-in-depth). When --enable-auth is set, WM
+	// verifies the caller credential itself; a missing identity client fails closed.
+	if s.cfg.EnableAuth {
+		v1.Use(s.callerAuthMiddleware())
+		log.Info("WM: caller auth middleware enabled on /v1/ routes")
 	}
 
 	// CodeInterpreter sandbox session endpoints (control plane).
@@ -313,7 +301,7 @@ func (s *Server) setupRoutes() {
 	v1.GET("/sandbox/sessions/:namespace/:name/logs", s.handleGetLogs)
 
 	// Internal APIs — called by EnvD within the cluster.
-	// Uses a separate route group to bypass safeAuthMiddleware.
+	// Uses a separate route group to bypass callerAuthMiddleware.
 	// Authenticated via Router-signed JWT (same RSA key pair used for Router→EnvD auth).
 	// Dual-read: EnvD embeds the session id from its annotation (sess_* or ns/name).
 	internal := s.router.Group("/v1/internal", s.internalJWTMiddleware())

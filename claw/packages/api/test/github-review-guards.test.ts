@@ -23,7 +23,7 @@ import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "../src/github
 import type { ToolOutcome } from "../src/github-review/service.js";
 import { setReviewMode } from "../src/github-review/store.js";
 import { BASE_TIP, HEAD } from "./support/fake-github.js";
-import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, reviewEnv as makeEnv, unbound, type ReviewEnv } from "./support/review-env.js";
+import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, ownApproval, reviewEnv as makeEnv, reviewedHead, unbound, type ReviewEnv } from "./support/review-env.js";
 
 /**
  * The requester (`u-alice`, the author of the pull request) asks for the account of the acting user (`u-bob`, the committer), who has
@@ -43,6 +43,14 @@ const LOW = { level: "low", reason: "an ordinary change, nothing for a person to
 const submit = (over: Record<string, unknown> = {}) => e.service.submitReview(e.actor, { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Looks fine.", risk_judgement: LOW, ...over });
 const merge = (over: Record<string, unknown> = {}) => e.service.mergePr(e.actor, { pr: PR, head_sha: HEAD, risk_judgement: LOW, ...over });
 const puts = () => e.gh.calls.filter((c) => c.method === "PUT");
+/** This session's own approval of the head, as gh_review_submit leaves it on GitHub: what a merge nobody confirmed stands on. */
+const approvedHere = () => { e.gh.reviews.push(ownApproval(e.actor.sessionId)); };
+/** The review as the instructions ask for it: this session's APPROVE through the tool, then the merge. */
+const approveThenMerge = async (over: Record<string, unknown> = {}): Promise<ToolOutcome> => {
+  const approval = await submit({ event: "APPROVE", ...over });
+  assert.equal(approval.body.status, "submitted", approval.text);
+  return merge(over);
+};
 const reason = (o: ToolOutcome) => String(o.body.reason ?? o.body.status);
 const rows = () => e.sql("SELECT * FROM claw_github_confirmations ORDER BY created_at, confirmation_id");
 /** A change the rules call high risk: a workflow file is edited. */
@@ -62,7 +70,7 @@ describe("K the acting user's review mode, their own setting in Claw, whoever as
     // No setting is high_risk_confirm. fully_auto holds only what the repository itself requires.
     const held = always || ((mode ?? "high_risk_confirm") === "high_risk_confirm" && (said === "high" || workflow));
     test(`K ${mode ?? "no mode set"}, ${who}, judged ${said}${workflow ? ", a workflow change" : ""}${always ? `, the repository's ${LEGACY_REPO_CONFIG_STEM}.yml says confirm_merge: always` : ""} -> ${held ? "held" : "merged"}`, async () => {
-      e = await env({}, { actor });
+      e = await env({}, { actor, approved: true });
       if (mode) await setReviewMode(e.db, "u-bob", mode);
       if (workflow) highRisk();
       if (always) e.gh.contents[`.github/${LEGACY_REPO_CONFIG_STEM}.yml`] = "confirm_merge: always\n";
@@ -151,7 +159,7 @@ describe("K the acting user's review mode, their own setting in Claw, whoever as
     e = await env({}, { cred: { delegation: false } });
     await setReviewMode(e.db, "u-bob", "fully_auto");
     assert.equal(reason(await merge()), "delegation_off", "fully_auto does not let others ask: that is delegation's");
-    const [audit] = await e.sql("SELECT review_mode FROM claw_github_audit");
+    const [audit] = await e.sql("SELECT review_mode FROM claw_github_audit WHERE tool = 'gh_pr_merge'");
     assert.equal(audit?.review_mode, "fully_auto", "a refused call records the mode too");
     await e.sql("DELETE FROM claw_github_audit");
     assert.equal(reason(await e.service.mergePr(e.actor, { pr: "not a pull request", head_sha: HEAD })), "invalid_pull_request");
@@ -165,7 +173,7 @@ describe("H what is held for the acting user", () => {
       ["a COMMENT review", () => submit({ event: "COMMENT" }), ["POST reviews"]],
       ["a REQUEST_CHANGES review", () => submit({ event: "REQUEST_CHANGES" }), ["POST reviews"]],
       ["an APPROVE review", () => submit({ event: "APPROVE" }), ["POST reviews"]],
-      ["a merge", () => merge(), ["POST reviews", "PUT merge"]],
+      ["an approval, then a merge", () => approveThenMerge(), ["POST reviews", "PUT merge"]],
     ] as const) {
       e = await env();
       e.gh.pr.user = { login: "alice" };
@@ -350,9 +358,11 @@ describe("H what is held for the acting user", () => {
     highRisk();
     for (let n = 1; n <= 10; n++) {
       e.actor = { ...e.actor, sessionId: `s-${n}` };
+      await reviewedHead(e);
       assert.equal((await submit({ event: "APPROVE", body: `Review ${n}.` })).body.status, "confirmation_required", `review ${n}`);
     }
     e.actor = { ...e.actor, sessionId: "s-11" };
+    await reviewedHead(e);
     assert.equal(reason(await submit({ event: "APPROVE", body: "One too many." })), "too_many_pending_confirmations");
     assert.equal(reason(await merge()), "too_many_pending_confirmations");
     assert.equal((await rows()).length, 10);
@@ -389,7 +399,7 @@ describe("A the author of the pull request asks", () => {
     e.gh.onReview = (r) => { if (r.event === "APPROVE") e.gh.graphql.mergeStateStatus = "CLEAN"; };
     e.gh.graphql.mergeStateStatus = "BLOCKED";
     await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-1', 'u-alice', $1::jsonb)", [JSON.stringify({ acting_as: "u-bob", acting_as_requester: "Alice A" })]);
-    const o = await merge();
+    const o = await approveThenMerge();
     assert.equal(o.body.status, "merged", o.text);
     assert.deepEqual(stages(e), ["POST reviews", "PUT merge"]);
     assert.equal(e.gh.writes[0]?.body.event, "APPROVE");
@@ -429,16 +439,16 @@ describe("Q a base branch with a merge queue", () => {
   const ways: Array<[string, () => void]> = [["a merge_queue ruleset rule", byRule], ["classic branch protection (isMergeQueueEnabled)", byClassic]];
   const enqueueStage = ["POST reviews", "POST graphql"];
 
-  test("Q1 a merge into a branch with a queue approves and then puts the pull request in the queue, pinned to the head the review read, as the acting user: the answer is queued, never merged, whoever asked and however the queue shows", async () => {
+  test("Q1 a merge into a branch with a queue, after this session's approval, puts the pull request in the queue, pinned to the head the review read, as the acting user: the answer is queued, never merged, whoever asked and however the queue shows", async () => {
     for (const [way, setup] of ways) {
       for (const [who, over] of [["someone else's account", {}], ["the requester's own account", own]] as const) {
         const name = `${way}, ${who}`;
         e = await env({}, over);
         setup();
-        const o = await merge();
+        const o = await approveThenMerge();
         assert.equal(o.isError, false, `${name}: ${o.text}`);
         assert.equal(o.body.status, "queued", name);
-        assert.deepEqual([o.body.queue_entry_id, o.body.queue_position, o.body.queue_state, o.body.approved_by_this_call, o.body.url], ["MQE_kwDOdemo1", 3, "QUEUED", true, "https://github.com/AMD-AGI/demo/pull/7"], name);
+        assert.deepEqual([o.body.queue_entry_id, o.body.queue_position, o.body.queue_state, o.body.approved_by_this_call, o.body.url], ["MQE_kwDOdemo1", 3, "QUEUED", false, "https://github.com/AMD-AGI/demo/pull/7"], name);
         assert.equal(o.body.merge_sha, undefined, name);
         assert.match(String(o.body.note), /not merged/, name);
         assert.deepEqual(stages(e), enqueueStage, `${name}: an approval, then the queue, and no PUT merge`);
@@ -458,7 +468,7 @@ describe("Q a base branch with a merge queue", () => {
     for (const [way, setup] of ways) {
       e = await env();
       setup();
-      assert.equal((await merge()).body.status, "queued", way);
+      assert.equal((await approveThenMerge()).body.status, "queued", way);
       highRisk();
       const again = await merge();
       assert.equal(again.isError, false, way);
@@ -514,7 +524,7 @@ describe("Q a base branch with a merge queue", () => {
       e = await env();
       setup();
       e.gh.onEnqueue = () => { e.gh.graphql.headRefOid = "3".repeat(40); };
-      o = await merge();
+      o = await approveThenMerge();
       assert.equal(o.isError, true, way);
       assert.equal(reason(o), "head_moved", `${way}: ${o.text}`);
       assert.equal(o.body.current_head_sha, "3".repeat(40), way);
@@ -535,16 +545,16 @@ describe("Q a base branch with a merge queue", () => {
     assert.equal((await rows())[0]?.status, "stale");
   });
 
-  test("Q7 a queue GitHub refuses (repository settings, permissions) is refused as enqueue_refused with GitHub's own message: never queued, never merged, the approval said to be on the pull request", async () => {
+  test("Q7 a queue GitHub refuses (repository settings, permissions) is refused as enqueue_refused with GitHub's own message: never queued, never merged", async () => {
     for (const [way, setup] of ways) {
       e = await env();
       setup();
       e.gh.enqueueRefusal = "Pull request is not in a mergeable state to be added to the merge queue";
-      const o = await merge();
+      const o = await approveThenMerge();
       assert.equal(o.isError, true, way);
       assert.equal(reason(o), "enqueue_refused", `${way}: ${o.text}`);
       assert.match(String(o.body.message), /Pull request is not in a mergeable state to be added to the merge queue/, way);
-      assert.equal(o.body.approved_by_this_call, true, way);
+      assert.equal(o.body.approved_by_this_call, false, `${way}: the approval is this session's review, not this call's`);
       assert.notEqual(o.body.status, "queued", way);
       assert.deepEqual(stages(e), enqueueStage, way);
       assert.equal(e.gh.count(/\/merge$/), 0, way);
@@ -554,7 +564,7 @@ describe("Q a base branch with a merge queue", () => {
 
   test("Q7b a queue request that goes out counts as a write even when no approval was needed: the approval is on the pull request already, the queue refuses, and the call says it wrote", async () => {
     byRule();
-    e.gh.reviews = [{ id: 1, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "earlier" }];
+    approvedHere();
     e.gh.enqueueRefusal = "Merge queue is not enabled for this branch";
     const o = await merge();
     assert.equal(reason(o), "enqueue_refused", o.text);
@@ -577,6 +587,7 @@ describe("Q a base branch with a merge queue", () => {
   test("Q9 an answer that carries no queue entry is not queued: enqueue_unconfirmed, with the pull request left for a person to look at", async () => {
     byRule();
     e.gh.enqueueEntry = null;
+    approvedHere();
     const o = await merge();
     assert.equal(o.isError, true);
     assert.equal(reason(o), "enqueue_unconfirmed", o.text);
@@ -585,6 +596,7 @@ describe("Q a base branch with a merge queue", () => {
 
   test("Q10 an HTTP failure of the queue request is no queued and no merged either: the call fails with the status and nothing is claimed", async () => {
     byRule();
+    approvedHere();
     const real = e.gh.fetch;
     const flaky = async (input: URL | string | Request, init: RequestInit = {}): Promise<Response> => {
       if (String(init.body ?? "").includes("enqueuePullRequest")) { await real(input, init); return new Response(JSON.stringify({ message: "Bad Gateway" }), { status: 502, headers: { "content-type": "application/json" } }); }
@@ -622,7 +634,7 @@ describe("Q a base branch with a merge queue", () => {
       [503, "Service Unavailable", {}, "github_error"],
     ];
     for (const [status, message, headers, code] of cases) {
-      e = await env();
+      e = await env({}, { approved: true });
       byClassic();
       const svc = e.service as any;
       const original = svc.deps.fetchImpl;
@@ -647,6 +659,7 @@ describe("Q a base branch with a merge queue", () => {
       e.gh.repo.allow_squash_merge = false;
       e.gh.repo.allow_merge_commit = false;
       e.gh.repo.allow_rebase_merge = false;
+      approvedHere();
       assert.equal((await merge({ method: "squash" })).body.status, "queued", way);
     }
     e = await env();
@@ -678,7 +691,7 @@ describe("Q a base branch with a merge queue", () => {
       e.gh.graphql.reviewThreads = { totalCount: 1, nodes: [{ isResolved: false }] };
       assert.equal(reason(await merge()), "threads_unresolved", way);
       assert.equal(e.gh.writes.length, 0, way);
-      e = await env();
+      e = await env({}, { approved: true });
       setup();
       e.gh.graphql.mergeStateStatus = "BLOCKED";
       assert.equal(reason(await merge()), "merge_state_not_clean", way);
@@ -709,7 +722,7 @@ describe("Q a base branch with a merge queue", () => {
     for (const [name, setup] of cases) {
       e = await env();
       setup();
-      const o = await merge();
+      const o = await approveThenMerge();
       assert.equal(o.body.status, "merged", `${name}: ${o.text}`);
       assert.deepEqual(stages(e), ["POST reviews", "PUT merge"], name);
       assert.equal(e.gh.enqueues.length, 0, name);
@@ -719,6 +732,7 @@ describe("Q a base branch with a merge queue", () => {
 
   test("Q16 the rules are read once for a merge, by the queue and the CI gate together; rules GitHub would not give are not read as 'no queue' (the CI gate refuses them before anything is written) and a classic queue still shows", async () => {
     byRule();
+    approvedHere();
     assert.equal((await merge()).body.status, "queued");
     assert.equal(e.gh.count(/\/rules\/branches\//), 1);
     e = await env();
@@ -743,6 +757,7 @@ describe("Q a base branch with a merge queue", () => {
 
   test("Q19 the merge state read asks GitHub for what queuing needs: the pull request's id, whether a queue is on, whether it is in one, and its entry", async () => {
     byClassic();
+    approvedHere();
     assert.equal((await merge()).body.status, "queued");
     const reads = e.gh.calls.filter((c) => c.path === "/graphql" && !e.gh.enqueues.includes(c)).map((c) => String(c.body.query));
     assert.equal(reads.length > 0, true);
@@ -897,7 +912,7 @@ describe("B a session bound to one pull request", () => {
       assert.equal(e.gh.calls.length, 0);
       assert.equal(e.resolved.length, 0);
       assert.deepEqual(await rows(), []);
-      const audit = await e.sql("SELECT result, detail, write FROM claw_github_audit");
+      const audit = await e.sql("SELECT result, detail, write FROM claw_github_audit WHERE NOT (tool = 'gh_pr_get' AND result = 'ok')");
       assert.equal(audit.length, tools.length * others.length);
       assert.equal(audit.every((a) => a.result === "refused" && a.detail === "review_target_mismatch" && a.write === false), true);
     }
@@ -989,7 +1004,7 @@ describe("N names: the footer, the marker and the repository's configuration fil
       ["both, the neutral one says always", { [CONFIG]: always, [OLD_CONFIG]: "confirm_merge: risk\n" }, true],
     ];
     for (const [name, contents, held] of cases) {
-      e = await fresh();
+      e = await env({}, { approved: true });
       e.gh.contents = contents;
       const o = await merge();
       assert.equal(o.body.status, held ? "confirmation_required" : "merged", `${name}: ${o.text}`);

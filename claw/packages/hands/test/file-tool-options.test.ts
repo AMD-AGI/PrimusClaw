@@ -4,7 +4,8 @@
 /**
  * The file tools' options that bring them level with what a coding agent
  * expects: numbered and paged `read`, `edit` with `replace_all`, and `grep` that
- * searches dot-directories, can match case and can be narrowed by a glob.
+ * searches dot-directories, can match case, can be narrowed by a glob, and
+ * returns lines, file paths or counts, cut at head_limit.
  */
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -17,6 +18,7 @@ import { read, READ_DEFAULT_LINES } from "../src/tools/fs/read.js";
 import { edit } from "../src/tools/fs/edit.js";
 import { grep, GREP_SKIP, GREP_MAX_FILE_BYTES } from "../src/tools/fs/grep.js";
 import { WORKSPACE_EXCLUDES } from "@claw/protocol";
+import { WORKSPACE } from "../src/config.js";
 
 let dir: string;
 
@@ -50,6 +52,21 @@ test("read pages a long file and says where to continue", async () => {
   const rest = textOf(await read.execute({ path: p, offset: READ_DEFAULT_LINES + 1 }));
   assert.ok(rest.includes(`${total - 7}|line ${total - 7}`));
   assert.doesNotMatch(rest, /call read with offset/);
+});
+
+test("read counts the lines a file has: a final newline ends the last line, it is not one more", async () => {
+  const total = READ_DEFAULT_LINES * 10;
+  const p = put("big.log", Array.from({ length: total }, (_, i) => `line ${i + 1}\n`).join(""));
+  const first = textOf(await read.execute({ path: p }));
+  assert.match(first, new RegExp(`lines 1-${READ_DEFAULT_LINES} of ${total};`), "the count names the file's own lines");
+  const last = textOf(await read.execute({ path: p, offset: total - 1 }));
+  assert.equal(last, `${total - 1}|line ${total - 1}\n${total}|line ${total}`, "no empty line after the last");
+  assert.equal(textOf(await read.execute({ path: put("two.txt", "a\nb\n") })), "1|a\n2|b");
+  assert.equal(textOf(await read.execute({ path: put("blank-end.txt", "a\n\n") })), "1|a\n2|", "a real blank last line stays");
+  assert.equal(textOf(await read.execute({ path: put("nl.txt", "\n") })), "1|");
+  // A raw page that reaches the end keeps the file's final newline; one that stops short does not add it.
+  assert.equal(textOf(await read.execute({ path: put("raw.txt", "a\nb\nc\n"), offset: 2, line_numbers: false })), "b\nc\n");
+  assert.equal(textOf(await read.execute({ path: path.join(dir, "raw.txt"), offset: 1, limit: 2, line_numbers: false })), "a\nb\n[lines 1-2 of 3; call read with offset=3 for more]");
 });
 
 test("read with line_numbers=false returns the file byte for byte", async () => {
@@ -165,4 +182,47 @@ test("grep glob narrows the files searched, by name at any depth or by path", as
   const py = textOf(await grep.execute({ pattern: "needle", path: dir, glob: "src/**/*.py" }));
   assert.match(py, /b\.py/);
   assert.doesNotMatch(py, /a\.ts|c\.md/);
+});
+
+test("grep output_mode files_with_matches lists each matching file once", async () => {
+  put("a.ts", "needle\nneedle\n");
+  put("b.ts", "nothing\n");
+  put("sub/c.md", "a needle\n");
+  const out = textOf(await grep.execute({ pattern: "needle", path: dir, output_mode: "files_with_matches" }));
+  const rel = (f: string) => path.relative(WORKSPACE, path.join(dir, f));
+  assert.deepEqual(out.split("\n").sort(), [rel("a.ts"), rel("sub/c.md")].sort());
+});
+
+test("grep output_mode count gives matching lines per file", async () => {
+  put("a.ts", "needle\nx\nneedle\nneedle\n");
+  put("b.ts", "needle\n");
+  put("c.ts", "nothing\n");
+  const out = textOf(await grep.execute({ pattern: "needle", path: dir, output_mode: "count" }));
+  const counts = Object.fromEntries(out.split("\n").map((l) => [path.basename(l.slice(0, l.lastIndexOf(":"))), Number(l.slice(l.lastIndexOf(":") + 1))]));
+  assert.deepEqual(counts, { "a.ts": 3, "b.ts": 1 });
+});
+
+test("grep head_limit keeps the first N entries and says there are more", async () => {
+  put("log.txt", Array.from({ length: 50 }, (_, i) => `hit ${i + 1}`).join("\n"));
+  const three = textOf(await grep.execute({ pattern: "hit", path: dir, context: 0, head_limit: 3 }));
+  assert.deepEqual(three.split("\n").filter((l) => /^\s+\d+:/.test(l)).map((l) => l.trim()), ["1:hit 1", "2:hit 2", "3:hit 3"]);
+  assert.match(three, /\[showing the first 3 matching lines \(head_limit\); there are more\]/);
+
+  const exact = textOf(await grep.execute({ pattern: "hit 4[0-9]", path: dir, context: 0, head_limit: 10 }));
+  assert.equal(exact.split("\n").filter((l) => /^\s+\d+:/.test(l)).length, 10);
+  assert.doesNotMatch(exact, /head_limit/, "exactly N matches is not truncated");
+
+  for (let i = 0; i < 5; i++) put(`f${i}.md`, "hit\n");
+  const files = textOf(await grep.execute({ pattern: "hit", path: dir, output_mode: "files_with_matches", head_limit: 2 }));
+  assert.equal(files.split("\n").filter((l) => !l.startsWith("[")).length, 2);
+  assert.match(files, /\[showing the first 2 files \(head_limit\); there are more\]/);
+  const counted = textOf(await grep.execute({ pattern: "hit", path: dir, output_mode: "count", head_limit: 6 }));
+  assert.equal(counted.split("\n").filter((l) => !l.startsWith("[")).length, 6);
+  assert.doesNotMatch(counted, /head_limit/, "six files and a limit of six");
+});
+
+test("grep default output is unchanged: content with two lines of context", async () => {
+  const p = put("a.txt", "one\ntwo\nneedle\nfour\nfive\nsix\n");
+  const rel = path.relative(WORKSPACE, p);
+  assert.equal(textOf(await grep.execute({ pattern: "needle", path: p })), `${rel}:\n  1-one\n  2-two\n  3:needle\n  4-four\n  5-five\n`);
 });

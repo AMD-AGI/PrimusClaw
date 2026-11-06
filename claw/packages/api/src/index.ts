@@ -8,7 +8,9 @@ import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
-  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
+  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
+  SESSION_PURGE_DAYS, SESSION_RETENTION_BATCH, SESSION_RETENTION_DAYS, SESSION_RETENTION_DRY_RUN,
+  SESSION_RETENTION_HOLD_BUDGET_SEC, SESSION_RETENTION_LOCK_RETRY_MIN,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
@@ -19,6 +21,7 @@ import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
+import { registerSessionDeliveryRoutes } from "./routes/session-deliveries.js";
 import { registerAnswerFeedbackRoutes } from "./routes/answer-feedback.js";
 import { registerImageRoutes } from "./routes/images.js";
 import { registerEventRoutes } from "./routes/events.js";
@@ -31,6 +34,8 @@ import { registerPluginRoutes } from "./routes/plugins.js";
 import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
 import { registerAssistantRoutes } from "./routes/assistant.js";
 import { registerAssistantMcpRoutes } from "./assistant/mcp.js";
+import { registerAssistantGithubEventRoutes } from "./routes/assistant-github-events.js";
+import { startGithubEventWatch } from "./assistant/github-events.js";
 import { assertAssistantTokenKey } from "./assistant/token.js";
 import { registerTriggerMcpRoutes } from "./triggers/mcp.js";
 import { assertTriggerToolsConfig } from "./triggers/token.js";
@@ -45,6 +50,8 @@ import { registerSandboxAdminRoutes } from "./routes/sandbox-admin.js";
 import { registerTerminalRoutes } from "./routes/terminal.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
 import { registerGithubReviewRoutes } from "./github-review/mcp.js";
+import { registerGithubMcpRoutes } from "./github-mcp/mcp.js";
+import { githubMcpConfigErrors, readGithubMcpSettings } from "./github-mcp/settings.js";
 import { githubReviewConfigErrors, readGithubReviewSettings } from "./github-review/settings.js";
 import { identityClient } from "./auth/identity.js";
 import { identityTokenSettings } from "./auth/identity-token.js";
@@ -54,6 +61,7 @@ import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "./routes/internal-runs.js";
 import { registerInternalAppRoutes } from "./routes/internal-apps.js";
 import { registerInternalWorkspaceRoutes } from "./routes/internal-workspaces.js";
+import { registerInternalMemoryRoutes } from "./routes/internal-memory.js";
 import { registerTaskDagRoutes } from "./routes/task-dags.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
 import { registerRunRoutes } from "./runs/routes.js";
@@ -67,7 +75,7 @@ import { startEventConsumer } from "./events/consumer.js";
 import { startEvolveWorker } from "./marketplace/evolve-worker.js";
 import { startUploadSweeper } from "./sessions/upload-sweeper.js";
 import { archiveIdleSessions } from "./sessions/archive.js";
-import { decayMemory } from "./memory/service.js";
+import { DEFAULT_RETENTION_RUN, runSessionRetentionOnce } from "./sessions/retention.js";
 import { cleanupOrphanSkillFiles, cleanupOldPatterns } from "./marketplace/skill-service.js";
 import { registry as metricsRegistry } from "./infra/metrics.js";
 import { assertRolloutConfigAtStartup } from "./startup/rollout-config.js";
@@ -175,6 +183,14 @@ function assertGithubReviewConfig(): void {
   throw new Error(`CLAW_GITHUB_REVIEW_ENABLED is true but GitHub review cannot be offered: ${errors.join("; ")}`);
 }
 
+/** Refuse to serve the GitHub tools without the secret that signs their token. */
+function assertGithubMcpConfig(): void {
+  const errors = githubMcpConfigErrors(readGithubMcpSettings());
+  if (errors.length === 0) return;
+  logger.error({ errors }, "startup.github_mcp_refused");
+  throw new Error(`CLAW_GITHUB_MCP_ENABLED is true but the GitHub tools cannot be offered: ${errors.join("; ")}`);
+}
+
 async function main() {
   validateStartupConfig();
   assertNoSharedIdentityBypass();
@@ -190,6 +206,7 @@ async function main() {
   startIdentityClient(logger);
   // Off unless CLAW_GITHUB_REVIEW_ENABLED. A deployment that asked for it and cannot offer its gates does not start.
   assertGithubReviewConfig();
+  assertGithubMcpConfig();
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
   // not a runtime surprise on the first PUT /v1/users/me/env-vars/* call.
@@ -299,6 +316,7 @@ async function main() {
   app.addHook("preHandler", authMiddleware);
 
   await registerSessionRoutes(app);
+  await registerSessionDeliveryRoutes(app);
   await registerAnswerFeedbackRoutes(app);
   await registerImageRoutes(app);
   await registerEventRoutes(app);
@@ -314,11 +332,15 @@ async function main() {
   await registerRemoteAgentRoutes(app);
   // Off unless CLAW_ASSISTANT_ENABLED: the module registers nothing otherwise.
   await registerAssistantRoutes(app);
+  // The pull requests a work item watches; nothing unless CLAW_ASSISTANT_ENABLED and CLAW_ASSISTANT_GITHUB_EVENTS.
+  await registerAssistantGithubEventRoutes(app);
   // The assistant's own MCP service, under /v1/internal/; registers nothing unless CLAW_ASSISTANT_ENABLED.
   await registerAssistantMcpRoutes(app);
   await registerTriggerMcpRoutes(app);
   // Off unless CLAW_GITHUB_REVIEW_ENABLED: nothing is registered otherwise.
   await registerGithubReviewRoutes(app);
+  // Off unless CLAW_GITHUB_MCP_ENABLED: nothing is registered otherwise.
+  await registerGithubMcpRoutes(app);
   await registerSystemEnvVarRoutes(app);
   await registerSandboxAdminRoutes(app);
   await registerTerminalRoutes(app);
@@ -327,6 +349,7 @@ async function main() {
   await registerInternalRunRoutes(app);
   await registerInternalAppRoutes(app);
   await registerInternalWorkspaceRoutes(app);
+  await registerInternalMemoryRoutes(app);
   await registerTaskDagRoutes(app);
   await registerTaskRoutes(app);
   await registerRunRoutes(app);
@@ -369,22 +392,36 @@ async function main() {
   // The assistant's messages go out through the same outbox, so both switches have to be on.
   if (CLAW_NOTIFICATIONS_ENABLED && CLAW_ASSISTANT_ENABLED) registerAssistantDeliveryHook();
   if (a2aPushEnabled()) startA2aPushWorker();
+  // Reads the pull requests work items watch and hands what is new to their workers; does nothing unless both switches are on.
+  startGithubEventWatch();
 
   // Daily maintenance crons (every 24h, first run 1 min after startup).
-  // Memory decay gated by CLAW_MEMORY_ENABLED, skill cleanups gated by
-  // CLAW_SKILL_EVOLUTION_ENABLED — when OFF, old data is fully frozen so
-  // toggling the flag back ON restores prior state without value loss.
+  // Skill cleanups gated by CLAW_SKILL_EVOLUTION_ENABLED — when OFF, old data
+  // is fully frozen so toggling the flag back ON restores prior state without
+  // value loss. Memory has none: nothing about it changes on a timer.
   const runMaintenance = () => {
-    if (CLAW_MEMORY_ENABLED) {
-      decayMemory().catch(err => logger.error({ err }, "memory.decay_failed"));
-    }
-    archiveIdleSessions(SESSION_AUTO_ARCHIVE_DAYS).catch(err => logger.error({ err }, "session_archive.failed"));
+    // Archive first, then retention: a session archived today is days away from
+    // the retention window either way, and the order keeps one pass's log readable.
+    archiveIdleSessions(SESSION_AUTO_ARCHIVE_DAYS)
+      .catch(err => logger.error({ err }, "session_archive.failed"))
+      .then(() => runSessionRetentionOnce({
+        retentionDays: SESSION_RETENTION_DAYS,
+        purgeDays: SESSION_PURGE_DAYS,
+        batch: SESSION_RETENTION_BATCH,
+        dryRun: SESSION_RETENTION_DRY_RUN,
+      }, {
+        ...DEFAULT_RETENTION_RUN,
+        holdBudgetMs: SESSION_RETENTION_HOLD_BUDGET_SEC * 1000,
+        lockRetryDelayMs: SESSION_RETENTION_LOCK_RETRY_MIN * 60 * 1000,
+      }))
+      .catch(err => logger.error({ err }, "session_retention.failed"));
     if (CLAW_SKILL_EVOLUTION_ENABLED) {
       cleanupOrphanSkillFiles().catch(err => logger.error({ err }, "skill_files.cleanup_failed"));
       cleanupOldPatterns().catch(err => logger.error({ err }, "skill_patterns.cleanup_failed"));
     }
   };
-  if (CLAW_MEMORY_ENABLED || CLAW_SKILL_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0) {
+  if (CLAW_SKILL_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0
+    || SESSION_RETENTION_DAYS > 0 || SESSION_PURGE_DAYS > 0) {
     setTimeout(() => {
       runMaintenance();
       setInterval(runMaintenance, 24 * 60 * 60 * 1000);

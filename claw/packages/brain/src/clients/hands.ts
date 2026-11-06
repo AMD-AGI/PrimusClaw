@@ -398,10 +398,29 @@ export interface ShellClassProbe {
  */
 const UNREADABLE_SHELL_CLASS: ShellClassProbe = { shellClass: "running", collectorLive: false };
 
+/** An image a tool answered with (`read` of a picture), base64 as the MCP block carried it. */
+export interface ToolImage {
+  mediaType: string;
+  data: string;
+}
+
 export interface DispatchOutcome {
   text: string;
   isError: boolean;
   structured?: unknown;
+  /** Absent when the tool answered with text only. */
+  images?: ToolImage[];
+}
+
+/** The image blocks of an MCP tool result; anything not shaped like one is left out. */
+export function toolImages(content: unknown): ToolImage[] | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const images = content
+    .filter((c): c is { type: "image"; data: string; mimeType: string } =>
+      !!c && c.type === "image" && typeof c.data === "string" && c.data !== ""
+      && typeof c.mimeType === "string" && c.mimeType.startsWith("image/"))
+    .map((c) => ({ mediaType: c.mimeType, data: c.data }));
+  return images.length ? images : undefined;
 }
 
 /**
@@ -1031,9 +1050,11 @@ export class HandsClient {
     }
     // The caller is told the id it sent, or the one minted for it -- never the
     // wire form, which is Brain's business and an id nothing else can reproduce.
+    const images = toolImages(result.content);
     return {
       text: restorePublicShellId(texts || "", wired.shell_id, fixed.shell_id),
       isError,
+      ...(images ? { images } : {}),
       structured: restoreStructuredShellId(
         (result as { structuredContent?: unknown; structured?: unknown }).structuredContent
           ?? (result as { structured?: unknown }).structured,

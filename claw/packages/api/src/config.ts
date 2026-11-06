@@ -416,6 +416,8 @@ export const S3_API_ENDPOINT = env("S3_API_ENDPOINT") || S3_ENDPOINT;
 // --- Upload TTL sweeper (S3 `.uploads/` per-session cleanup) ---
 // TTL for per-session upload artifacts in days. 0 disables the sweeper.
 export const UPLOAD_TTL_DAYS = envInt("UPLOAD_TTL_DAYS", 7);
+/** How long the download of a file the agent delivered (`deliver_file`) keeps working, counted from the delivery. */
+export const DELIVERY_TTL_DAYS = envInt("DELIVERY_TTL_DAYS", 7, { min: 1 });
 // Sweep cadence in minutes.
 export const UPLOAD_SWEEP_INTERVAL_MIN = envInt("UPLOAD_SWEEP_INTERVAL_MIN", 60);
 
@@ -425,6 +427,30 @@ export const UPLOAD_SWEEP_INTERVAL_MIN = envInt("UPLOAD_SWEEP_INTERVAL_MIN", 60)
 // `claw_sessions.status`; the session stays readable and a new message to it
 // makes it active again.
 export const SESSION_AUTO_ARCHIVE_DAYS = envInt("SESSION_AUTO_ARCHIVE_DAYS", 7, { min: 0 });
+
+// --- Archived-session retention ---
+// An archived session is deleted this many days after it was archived, by the
+// same daily pass and through the same deletion path as a user's delete (the
+// conversation rows are stamped deleted, the S3 workspace and checkpoint
+// prefixes are removed by the cleanup sweeper). 0 disables it. See
+// sessions/retention.ts for which archived sessions are never taken.
+export const SESSION_RETENTION_DAYS = envInt("SESSION_RETENTION_DAYS", 0, { min: 0 });
+// The soft-deleted conversation rows of a session deleted more than this many
+// days ago (turns, events, summaries) are removed for good. 0 disables it.
+export const SESSION_PURGE_DAYS = envInt("SESSION_PURGE_DAYS", 0, { min: 0 });
+// How many sessions one daily pass deletes, and separately how many deleted
+// sessions it purges the rows of.
+export const SESSION_RETENTION_BATCH = envInt("SESSION_RETENTION_BATCH", 500, { min: 1 });
+// Count and log what the pass would delete and purge, and change nothing.
+export const SESSION_RETENTION_DRY_RUN = envBool("SESSION_RETENTION_DRY_RUN", false);
+// A pass that finds another replica (or a dead one's not yet dropped backend)
+// holding the retention lock asks again after this many minutes, up to twelve
+// times, instead of waiting for the next day.
+export const SESSION_RETENTION_LOCK_RETRY_MIN = envInt("SESSION_RETENTION_LOCK_RETRY_MIN", 10, { min: 1 });
+// One hold of the retention lock stops after this many seconds and the pass
+// continues in a fresh hold half a minute later, until the day's batch is spent.
+// Kept under the leader lock's ten-minute stall alarm.
+export const SESSION_RETENTION_HOLD_BUDGET_SEC = envInt("SESSION_RETENTION_HOLD_BUDGET_SEC", 300, { min: 1 });
 
 // --- Memory / Skill LLM ---
 export const MEMORY_LLM_MODEL = env("MEMORY_LLM_MODEL", env("DEFAULT_MODEL", "claude-opus-4-6"));
@@ -443,8 +469,16 @@ export const ANTHROPIC_BASE_URL = env("ANTHROPIC_BASE_URL");
 export const MAX_SELECTED_SKILLS = envInt("MAX_SELECTED_SKILLS", 3);
 
 // --- Phase-2 feature flags (default OFF; opt-in per deployment) ---
-// When false: long-term memory read+write+decay paths are short-circuited.
+// When false: long-term memory read and write paths are short-circuited.
 export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
+// Long-term memory limits. The catalogue is what every turn of an opted-in user carries (one line per entry);
+// a write past the entry limit is refused, never made room for by dropping another entry.
+export const CLAW_MEMORY_MAX_ENTRIES = envInt("CLAW_MEMORY_MAX_ENTRIES", 100, { min: 1 });
+export const CLAW_MEMORY_CATALOGUE_MAX_LINES = envInt("CLAW_MEMORY_CATALOGUE_MAX_LINES", 40, { min: 1 });
+export const CLAW_MEMORY_CATALOGUE_MAX_TOKENS = envInt("CLAW_MEMORY_CATALOGUE_MAX_TOKENS", 1500, { min: 100 });
+// Days after which a project / reference entry leaves the catalogue until the user confirms it again.
+export const CLAW_MEMORY_PROJECT_REVIEW_DAYS = envInt("CLAW_MEMORY_PROJECT_REVIEW_DAYS", 30, { min: 1 });
+export const CLAW_MEMORY_REFERENCE_REVIEW_DAYS = envInt("CLAW_MEMORY_REFERENCE_REVIEW_DAYS", 90, { min: 1 });
 // When false: skill selection, save, mutation, feedback, evolution, pattern
 // recording, evolve worker, and skill-files cleanup are all short-circuited.
 export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLED", false);
@@ -479,6 +513,28 @@ export const CLAW_ASSISTANT_ENABLED = envBool("CLAW_ASSISTANT_ENABLED", false);
 export const CLAW_ASSISTANT_ROUTER_MODEL = env("CLAW_ASSISTANT_ROUTER_MODEL");
 // Work items one user may have unfinished (not on the done board) at once.
 export const CLAW_ASSISTANT_MAX_ACTIVE_ITEMS = envInt("CLAW_ASSISTANT_MAX_ACTIVE_ITEMS", 20, { min: 1 });
+// On-behalf GitHub reviews as work items of the assistant (`POST /v1/assistant/reviews`). Needs
+// CLAW_ASSISTANT_ENABLED and CLAW_GITHUB_REVIEW_ENABLED as well; off, the routes do not exist.
+export const CLAW_ASSISTANT_REVIEW_ITEMS = envBool("CLAW_ASSISTANT_REVIEW_ITEMS", false);
+// `on` gives the assistant the user's long-term memory: the router a one-line index and the memory tools
+// (recall, and save/update/forget/undo for a signed-in message that names the entry), a task item's worker a
+// read-only index, a review item's session the entries bound to its item. Needs CLAW_ASSISTANT_ENABLED and
+// CLAW_MEMORY_ENABLED as well; anything else leaves every assistant turn exactly as without memory.
+export const CLAW_ASSISTANT_MEMORY_TOOLS = env("CLAW_ASSISTANT_MEMORY_TOOLS", "off").trim().toLowerCase() === "on";
+// GitHub events for work items: an item watches a pull request, and new comments, reviews and failed CI
+// reach its worker without anybody mentioning it (`assistant/github-events.ts`). Needs CLAW_ASSISTANT_ENABLED
+// as well; off, there are no subscription routes, no tools for them and nothing polls.
+export const CLAW_ASSISTANT_GITHUB_EVENTS = envBool("CLAW_ASSISTANT_GITHUB_EVENTS", false);
+// How often a watched pull request is read. The time an event takes to reach its worker is at most this.
+export const CLAW_ASSISTANT_GITHUB_POLL_SEC = envInt("CLAW_ASSISTANT_GITHUB_POLL_SEC", 30, { min: 10 });
+// Pull requests one user's items may watch at once.
+export const CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS = envInt("CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS", 20, { min: 1 });
+// Bot accounts (such as `some-review-app[bot]`) whose comments on a watched pull request reach the worker. A bot has no
+// permission on a repository to ask GitHub about, so without this every bot is held back; list only bots that do not
+// repeat what others wrote. Comma-separated logins; empty by default.
+export const CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS: ReadonlySet<string> = new Set(
+  env("CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+);
 
 // --- Remote agents (default OFF) ---
 // When false: no remote-agent tables, no routes, and nothing polls. A connector
@@ -492,6 +548,10 @@ export const CLAW_REMOTE_AGENTS_RETENTION_DAYS = envInt("CLAW_REMOTE_AGENTS_RETE
 // When false: no tables, no routes, no MCP server offered to a session, and a session
 // that asks for `config.acting_as` is refused. See docs/github-review.md.
 export const CLAW_GITHUB_REVIEW_ENABLED = envBool("CLAW_GITHUB_REVIEW_ENABLED", false);
+
+// --- GitHub tools for every session whose owner stored a GH_TOKEN (default OFF) ---
+// When false: no route, and no `github` MCP server is offered to a session. See claw/docs/github-mcp.md.
+export const CLAW_GITHUB_MCP_ENABLED = envBool("CLAW_GITHUB_MCP_ENABLED", false);
 
 /**
  * How a connector's access token is checked (see auth/connector-token.ts). Read
@@ -733,6 +793,38 @@ export const CLAW_ASSISTANT_WORKER_MODEL = env("CLAW_ASSISTANT_WORKER_MODEL");
 export const CLAW_ASSISTANT_ROUTER_MAX_TURNS = envInt("CLAW_ASSISTANT_ROUTER_MAX_TURNS", 8, { min: 1 });
 // How long an item may need the user with nobody having told them before the system tells them.
 export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWEEP_SEC", 300, { min: 1 });
+// `on` gives the router the review and settings tools (review_start, review_restart, confirmation_answer,
+// review_mode_set, channel_action); anything else leaves it the five tools of a conversation.
+export const CLAW_ASSISTANT_TOOLS = env("CLAW_ASSISTANT_TOOLS", "off").trim().toLowerCase() === "on";
+// The marketplace plugin whose MCP servers the assistant reads from and its workers run with, when the message names
+// none (a chat client that talks to the assistant sends no plugin). Blank or 0: none, and a router turn has no read tools.
+// A router turn is offered only the read tools `assistant/read-tools.ts` lists of it; a worker gets the whole plugin.
+export const CLAW_ASSISTANT_PLUGIN_ID = envInt("CLAW_ASSISTANT_PLUGIN_ID", 0, { min: 0 });
+// How long after the assistant received a signed-in message a turn answering it may still act for the person.
+export const CLAW_ASSISTANT_ATTENDED_TTL_SEC = envInt("CLAW_ASSISTANT_ATTENDED_TTL_SEC", 600, { min: 1 });
+// Group chats and repositories the assistant watches, recording what it would do without doing it
+// (`assistant/observe.ts`). Off: the routes do not exist. Needs CLAW_ASSISTANT_ENABLED.
+export const CLAW_ASSISTANT_OBSERVE = envBool("CLAW_ASSISTANT_OBSERVE", false);
+// How long an item in progress may go without any sign of progress before the watchdog puts it in front of
+// its owner, with the reason (`assistant/watchdog.ts`). 0 is off.
+export const CLAW_ASSISTANT_WATCHDOG_SEC = envInt("CLAW_ASSISTANT_WATCHDOG_SEC", 0, { min: 0 });
+// Model choice for the assistant's items (`assistant/model-choice.ts`): an item's model asked for in the message, the user's
+// own defaults, an allow-list, and a fallback when the payer's key cannot use a model. `on` turns it on; anything else (the
+// default) leaves every tool, prompt, table and turn exactly as without it. An empty CLAW_ASSISTANT_MODELS is the same as off.
+export const CLAW_ASSISTANT_MODEL_CHOICE = ["on", "true", "1", "yes"].includes(env("CLAW_ASSISTANT_MODEL_CHOICE", "off").toLowerCase());
+// The models a user may pick, comma-separated, each with the label the assistant and the settings show:
+// `claude-opus-5.5=strongest,claude-sonnet-5.5=default`. A name without `=label` has no label.
+export const CLAW_ASSISTANT_MODELS = env("CLAW_ASSISTANT_MODELS");
+// The model a review item runs on when neither the request nor the reviewer's own settings name one. Blank is the
+// deployment default (DEFAULT_MODEL). Read only with CLAW_ASSISTANT_MODEL_CHOICE on.
+export const CLAW_ASSISTANT_REVIEW_MODEL = env("CLAW_ASSISTANT_REVIEW_MODEL");
+// The model an item falls back to when the payer's key cannot use the one chosen, and the model a turn the gateway refused for
+// want of a key binding is run again on, once. It must be in CLAW_ASSISTANT_MODELS; blank means no fallback.
+export const CLAW_FALLBACK_MODEL = env("CLAW_FALLBACK_MODEL");
+// Where a user binds the key the gateway asked for, named in the notice of a turn run again on the fallback model. Optional.
+export const CLAW_ASSISTANT_KEY_BINDING_URL = env("CLAW_ASSISTANT_KEY_BINDING_URL");
+// The deployment's default model as Brain reads it (the same shared setting): what a turn runs on when nothing names one.
+export const ASSISTANT_DEPLOYMENT_MODEL = env("DEFAULT_MODEL");
 // The address Brain reaches this API at; the assistant MCP service is served under it.
 export const INTERNAL_BACKEND_URL =
   process.env.INTERNAL_BACKEND_URL || `http://127.0.0.1:${process.env.API_PORT || "8200"}`;

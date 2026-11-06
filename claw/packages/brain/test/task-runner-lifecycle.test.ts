@@ -89,7 +89,6 @@ function result(over: Partial<ExecuteResult> = {}): ExecuteResult {
     finalText: "done",
     tokenUsage: { input_tokens: 1, output_tokens: 2, cache_read: 0, cache_create: 0 },
     turns: 1,
-    pendingMemories: [],
     pendingSkills: [],
     skillsUsed: {},
     errorCount: 0,
@@ -1830,5 +1829,59 @@ test("a failure while a resumed sandbox comes back reports the work it resumed w
   assert.deepEqual(r.completion?.tool_stats,
     { total_calls: 9, error_calls: 2, by_tool: { bash: 7 } },
     "zeroes here would say the run had done nothing before it died");
+  assert.equal(r.completion?.turns, 4);
+});
+
+test("a requested review stopped or failed inside a sub-agent reports the turns its pool gave, not only the parent's checkpointed ones", async () => {
+  // A checkpoint counts the parent's finished turns; a `task` runs inside one of them. The API charges the review's budget with the
+  // `exec_complete` turns, so a run stopped by the requester mid-`task` must report what the pool gave, sub-agents' turns included.
+  const review = { sandbox_profile: "review", max_turns: 50 } as Partial<ExecuteRequest>;
+  let abort: AbortController | undefined;
+  const stopped = await runScenario({
+    request: review,
+    onStart: (ctrl) => { abort = ctrl; },
+    engineBehavior: async (_signal, extras) => {
+      extras?.onTurnPool?.({ left: 41, used: 9 });
+      abort?.abort();
+      throw new Error("stream closed");
+    },
+  });
+  assert.equal(stopped.completion?.interrupted, true);
+  assert.equal(stopped.completion?.turns, 9);
+  assert.match(String(stopped.completion?.final_text), /Interrupted by user after 9 turns/);
+
+  const failed = await runScenario({
+    request: review,
+    engineBehavior: async (_signal, extras) => {
+      extras?.onTurnPool?.({ left: 43, used: 7 });
+      throw new Error("model endpoint refused the request");
+    },
+  });
+  assert.equal(failed.completion?.failed, true);
+  assert.equal(failed.completion?.turns, 7);
+
+  // Behind a resumed checkpoint that says more, the checkpoint stands.
+  const resumed = await runScenario({
+    request: review,
+    deliveryCount: 2,
+    seedCheckpoint: {},
+    onStart: (ctrl) => { abort = ctrl; },
+    engineBehavior: async (_signal, extras) => {
+      extras?.onTurnPool?.({ left: 48, used: 2 });
+      abort?.abort();
+      throw new Error("stream closed");
+    },
+  });
+  assert.equal(resumed.completion?.turns, 4);
+});
+
+test("an ordinary run stopped midway reports its checkpointed turns as before", async () => {
+  let abort: AbortController | undefined;
+  const r = await runScenario({
+    deliveryCount: 2,
+    seedCheckpoint: {},
+    onStart: (ctrl) => { abort = ctrl; },
+    engineBehavior: async () => { abort?.abort(); throw new Error("stream closed"); },
+  });
   assert.equal(r.completion?.turns, 4);
 });

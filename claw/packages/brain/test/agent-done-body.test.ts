@@ -29,7 +29,6 @@ function baseResult(over: Partial<ExecuteResult> = {}): ExecuteResult {
   return {
     finalText: "done",
     turns: 4,
-    pendingMemories: [],
     pendingSkills: [],
     skillsUsed: {},
     errorCount: 2,

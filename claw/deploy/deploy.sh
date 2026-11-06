@@ -749,12 +749,23 @@ if grep -q '"secretKeyRef"' "$CLAW_EXTRA_VALUES_FILE"; then
   done
 fi
 
+# NetworkPolicies (networkPolicy in the chart's values.yaml) are per cluster
+# lists of CIDRs and namespaces, so they come from a values file of their own:
+# NETWORK_POLICY_VALUES_FILE=<path> in the environment or values.<ns>.env.
+# Unset leaves them off, as the chart default does.
+CLAW_NP_VALUES_ARGS=()
+if [ -n "${NETWORK_POLICY_VALUES_FILE:-}" ]; then
+  [ -f "$NETWORK_POLICY_VALUES_FILE" ] || fail "NETWORK_POLICY_VALUES_FILE=$NETWORK_POLICY_VALUES_FILE does not exist."
+  CLAW_NP_VALUES_ARGS=(-f "$NETWORK_POLICY_VALUES_FILE")
+  log "NetworkPolicies from $NETWORK_POLICY_VALUES_FILE"
+fi
+
 if $DRY_RUN; then
   helm upgrade --install primus-claw "$CLAW_CHART_DIR" \
-    -n "$NAMESPACE" --create-namespace -f "$CLAW_VALUES_FILE" -f "$CLAW_EXTRA_VALUES_FILE" --dry-run --debug >/dev/null
+    -n "$NAMESPACE" --create-namespace -f "$CLAW_VALUES_FILE" -f "$CLAW_EXTRA_VALUES_FILE" ${CLAW_NP_VALUES_ARGS[@]+"${CLAW_NP_VALUES_ARGS[@]}"} --dry-run --debug >/dev/null
 else
   helm upgrade --install primus-claw "$CLAW_CHART_DIR" \
-    -n "$NAMESPACE" --create-namespace -f "$CLAW_VALUES_FILE" -f "$CLAW_EXTRA_VALUES_FILE" --wait --timeout 300s
+    -n "$NAMESPACE" --create-namespace -f "$CLAW_VALUES_FILE" -f "$CLAW_EXTRA_VALUES_FILE" ${CLAW_NP_VALUES_ARGS[@]+"${CLAW_NP_VALUES_ARGS[@]}"} --wait --timeout 300s
 fi
 
 log "Claw chart applied."

@@ -17,6 +17,7 @@ import { looksLikeCacheRejection } from "./cache-rejection.js";
 import { requiredArgToolNames } from "./tool-schema.js";
 import { parseToolArguments, sanitizeToolUseInputs } from "./tool-input.js";
 import { PROMPT_CACHE_OPTIONS, renderOpenAiCacheMarkers } from "./openai-cache.js";
+import { toolResultText } from "./tool-images.js";
 import type {
   LlmContentBlock,
   LlmProvider,
@@ -45,6 +46,8 @@ function normalizeStopReason(finishReason: string | null): string | null {
     default: return finishReason;
   }
 }
+
+const IMAGE_NOT_SENT = "[image not shown: this model is reached over an API that takes no image in a tool result]";
 
 /**
  * Canonical content-block messages -> OpenAI wire messages. This is the only
@@ -87,7 +90,8 @@ export function toOpenAiMessages(messages: Message[]): ChatCompletionMessagePara
       out.push({
         role: "tool",
         tool_call_id: String(tr.tool_use_id),
-        content: typeof tr.content === "string" ? tr.content : JSON.stringify(tr.content ?? ""),
+        // A role:"tool" message carries text only, so an image a tool answered with is named, not sent.
+        content: toolResultText(tr.content, IMAGE_NOT_SENT),
       });
     }
     const rest = blocks.filter((b) => b.type !== "tool_result");

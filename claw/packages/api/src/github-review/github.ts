@@ -95,6 +95,14 @@ export function parsePrRef(input: unknown): PrRef | null {
   return isValidPrRef(ref) ? ref : null;
 }
 
+/** `owner/name`, or null: the same characters a pull request reference may name its repository with. */
+export function parseRepoRef(input: unknown): Pick<PrRef, "owner" | "repo"> | null {
+  if (typeof input !== "string") return null;
+  const m = /^([^/\s]+)\/([^/\s]+)$/.exec(input.trim());
+  if (!m || !OWNER_RE.test(m[1]) || !REPO_RE.test(m[2]) || m[2] === "." || m[2] === "..") return null;
+  return { owner: m[1], repo: m[2] };
+}
+
 /** Whether every part of a reference is something a request path may be built from: the one check that `parsePrRef` and a session's bound target share. */
 export function isValidPrRef(ref: PrRef): boolean {
   return OWNER_RE.test(ref.owner) && REPO_RE.test(ref.repo) && ref.repo !== "." && ref.repo !== ".."
@@ -148,9 +156,9 @@ export class GithubClient {
   }
 
   async request<T = unknown>(
-    method: "GET" | "POST" | "PUT",
+    method: "GET" | "POST" | "PUT" | "PATCH",
     path: string,
-    opts: { query?: Record<string, string | number>; body?: unknown; accept?: string; allow?: number[] } = {},
+    opts: { query?: Record<string, string | number>; body?: unknown; accept?: string; allow?: number[]; redirect?: "manual" } = {},
   ): Promise<GithubAnswer<T>> {
     if (!path.startsWith("/")) throw new TypeError("path must start with /");
     const url = new URL(this.apiUrl + path);
@@ -170,7 +178,7 @@ export class GithubClient {
         method,
         headers,
         body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
-        redirect: "error",
+        redirect: opts.redirect ?? "error",
         signal: AbortSignal.timeout(this.timeoutMs),
       });
       text = await readCapped(resp, this.maxBodyBytes);

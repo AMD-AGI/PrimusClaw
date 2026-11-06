@@ -1,13 +1,14 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { agentLoop } from "./agent-loop.js";
+import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { ToolRouter, INHERIT_MODEL, type WebToolServices } from "../tools/router.js";
 import type { HandsClient } from "../clients/hands.js";
 import type { HookRunner } from "./hooks.js";
 import type { Message, ReasoningEffort, ToolSchema, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import { filterToolSchemas, type ToolAllowlist } from "../tools/allowlist.js";
+import { MEMORY_TOOLS } from "../tools/memory-tools.js";
 import { SUB_AGENT_EXPLORE_MODEL, SUB_AGENT_MODELS } from "../config.js";
 import { modelRefusalStatus } from "./summary-completer.js";
 import { metrics } from "../infra/metrics.js";
@@ -37,16 +38,18 @@ const PROFILE_ALLOW: Record<SubagentType, string[] | "all"> = {
 
 /**
  * Tools sub-agents never get, regardless of profile. They are either
- * Brain↔Hands plumbing (upload/download) or break isolation (save_memory /
- * save_skill write to global knowledge; task would allow uncontrolled
+ * Brain↔Hands plumbing (upload/download) or break isolation (the memory tools
+ * and save_skill write to global knowledge; task would allow uncontrolled
  * recursion beyond SUB_AGENT_MAX_DEPTH).
  */
 const DENY_LIST = new Set([
-  "save_memory",
+  ...MEMORY_TOOLS,
   "save_skill",
   "task",
   "upload_to_s3",
   "download_from_s3",
+  // Handing a file to the user is the main agent's to do: a sub-agent's events are folded away from the chat.
+  "deliver_file",
 ]);
 
 /** The profiles that only read and search: the ones a lighter default model is for. */
@@ -138,6 +141,8 @@ export interface RunSubagentOptions {
    * sub-agent's own loop for the calls that loop handles itself.
    */
   toolAllowlist?: ToolAllowlist | null;
+  /** The parent run's shared turn budget (`LoopOptions.turnPool`), forwarded so the sub-agent's turns are taken from it. */
+  turnPool?: TurnPool;
 }
 
 export interface SubagentResult {
@@ -266,6 +271,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
     // Forwarded, never re-derived: these waits belong to the parent's run.
     runIdentity: opts.runIdentity,
     toolAllowlist: opts.toolAllowlist,
+    ...(opts.turnPool ? { turnPool: opts.turnPool } : {}),
   });
 
   let result;

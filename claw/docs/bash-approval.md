@@ -19,6 +19,11 @@ only makes the honest, common case ask first.
 - A plugin tool's `config.bash_approval` (or `bashApproval`), on any tool
   type. Rules apply to the sessions that mount that tool.
 - The deployment's `BASH_APPROVAL_RULES` environment variable (a JSON list).
+- Built in: the GitHub write rules of the pack below (`git push` in its force / delete forms, and the
+  writing `gh pr`, `gh issue`, `gh release`, `gh api`, `gh repo` and `gh workflow` commands), on unless
+  `BASH_APPROVAL_DEFAULTS_ENABLED=false`. A model can reach GitHub from the sandbox with the user's own
+  token, and the GitHub MCP tools hold the same writes for a person (see `github-mcp.md`); without these
+  the shell would be the way around that. A plain `git push` of a branch is not held.
 
 All sources are combined. Absent, `null` or `false` means no rule.
 
@@ -79,12 +84,15 @@ approval request.
 
 | Rule | Held | Runs without asking |
 |---|---|---|
-| `git push` | `git push` in any form, `git -C dir push`, `git --git-dir=... push`; the **force / delete** forms (`--force`, `-f`, `--force-with-lease`, `--delete`, `-d`, `--mirror`, `--prune`, `+ref`, `:ref`) are labelled separately | `status`, `log`, `diff`, `fetch`, `pull`, `clone`, `checkout`, `branch`, `commit`, `stash` (also `stash push`), `remote`, `config` |
+| `git push` | `git push` in any form, `git -C dir push`, `git --git-dir=... push`; the **force / delete** forms (`--force`, `-f`, `--force-with-lease`, `--delete`, `-d`, `--mirror`, `--prune`, `+ref`, `:ref`) and a push to **`main` / `master`** (`origin main`, `HEAD:main`, `HEAD:refs/heads/master`) or to a branch the command does not name (no refspec, `HEAD`, `--all`, the matching refspec `:`, a `*` pattern: any of them can be `main`) are labelled separately | `status`, `log`, `diff`, `fetch`, `pull`, `clone`, `checkout`, `branch`, `commit`, `stash` (also `stash push`), `remote`, `config` |
 | `gh pr` | `create`, `merge`, `close`, `review`, `ready`, `edit`, `reopen`, `comment`, `update-branch` | `view`, `list`, `checks`, `diff`, `status`, `checkout` |
+| `gh issue` | `create`, `close`, `comment`, `edit`, `delete`, `reopen`, `transfer`, `lock`, `unlock`, `pin`, `unpin`, `develop` | `view`, `list`, `status` |
 | `gh release` | `create`, `edit`, `delete`, `upload`, `delete-asset` | `list`, `view`, `download` |
-| `gh api` | `-X` / `--method` `POST`, `PUT`, `PATCH`, `DELETE`; and any call with `-f`, `-F`, `--field`, `--raw-field` or `--input` and no explicit `GET` (`gh` sends those as a POST) | `GET` calls, including `-X GET ... -f q=...` |
+| `gh api` | `-X` / `--method` `POST`, `PUT`, `PATCH`, `DELETE`; any call with `-f`, `-F`, `--field`, `--raw-field` or `--input` and no explicit `GET` (`gh` sends those as a POST); and `gh api graphql` when the query is a `mutation` or is read from a file or stdin (`-F query=@file`, `--input`) | `GET` calls, including `-X GET ... -f q=...`; `gh api graphql -f query='{ ... }'` reads |
 | `gh repo` | `create`, `delete`, `edit`, `rename`, `archive`, `unarchive`, `fork`, `sync` | `view`, `clone`, `list` |
 | `gh workflow` | `run`, `enable`, `disable` | `list`, `view` |
+| `gh secret` / `variable` / `label` / `run` / `gist` / `ssh-key` / `gpg-key` / `cache` | `secret` and `variable` `set` / `delete`; `label` `create` / `edit` / `delete` / `clone`; `run` `rerun` / `cancel` / `delete`; `gist` `create` / `edit` / `delete` / `rename`; key `add` / `delete`; `cache delete` | `list`, `view`, `get`, `watch`, `download` (and every `gh ruleset` command, which only reads) |
+| `curl` / `wget` to GitHub's API | `POST`, `PUT`, `PATCH`, `DELETE` (stated, or implied by a body or an upload) to `api.github.com` or `uploads.github.com` | `GET` / `HEAD`, and every other host |
 | `kubectl` | `apply`, `delete`, `patch`, `scale`, `exec`, `create`, `replace`, `edit`, `label`, `annotate`, `cordon`, `uncordon`, `drain`, `taint`, `set`, `run`, `cp`, `debug`, `expose`, `autoscale`, `rollout restart/undo/pause/resume` | `get`, `describe`, `logs`, `top`, `config`, `rollout status`, `rollout history` |
 | `helm` | `install`, `upgrade`, `uninstall`, `delete`, `rollback`, `push` | `list`, `template`, `status`, `get`, `lint`, `show`, `repo` |
 | `rm` | a recursive `rm` (`-r`, `-R`, `-rf`, `-fr`, `--recursive`, in any spelling) unless **every** target is spelled out as `/workspace/<something>`: an absolute path elsewhere, `~`, `$HOME`, `/workspace` itself, `/workspace/*`, any path with a `..` segment, and any **relative** path (`rm -rf node_modules`, `cd / && rm -rf usr`) are held | `rm file`, `rm -f /tmp/x.log` (not recursive), `rm -rf /workspace/app/build`, `rm -r /workspace/a /workspace/b` |
@@ -103,9 +111,17 @@ Things this pack does not do, beyond the limits above:
   words are matched after the shell's quotes are removed.
 - A recursive delete of a `/tmp` path is held, because it is outside `/workspace`. Delete the `rm` rule, or
   narrow it, if scratch cleanup should not ask.
-- A GraphQL read through `gh api graphql -f query=...` is a POST to GitHub and is held.
-- It does not cover `gh issue`, `gh gist`, `gh secret`, `gh run`, `git` aliases, other HTTP clients (add an
-  `http` rule), `docker push`, or a script that does any of this.
+- A GraphQL mutation is recognised by the word `mutation` in the command; a query held in a shell variable
+  (`-f query="$Q"`) is not seen. A `gh api graphql` call with options before the word `graphql` is judged as
+  an ordinary `gh api` call (held when it has fields).
+- A push to `main` is recognised by its destination as written. The built-in rules let a push that names a
+  feature branch run (`git push origin feat/x`, `git push -u origin HEAD:feat/x`) and hold one that does not
+  name its destination (`git push`, `git push -u origin HEAD`). Git configuration that changes where a push
+  goes (`remote.<name>.push`, `push.default=matching`) is not visible in the command text.
+- An `http` rule's `url_prefix` is compared after the scheme and any `user:token@` before the host are
+  dropped, so `https://x-access-token:...@api.github.com/...` is a call to `api.github.com`.
+- It does not cover `git` aliases, other HTTP clients (add an `http` rule), a GitHub Enterprise API host
+  (add it to the `curl` / `wget` rule's `url_prefix`), `docker push`, or a script that does any of this.
 
 The held call's request goes to whoever can answer it. With `CLAW_NOTIFICATIONS_ENABLED`, a subscription that
 lists `approval.requested` in its `event_types` is also sent a signed `approval.requested` webhook for each

@@ -21,28 +21,38 @@ export interface SessionToolClaims {
 
 const VERSION = 1;
 
-function sign(secret: string, body: string): string {
-  return createHmac("sha256", secret).update(`claw-github-review.v${VERSION}.${body}`).digest("base64url");
+/**
+ * What a token is for, signed into it: a token minted for one MCP service proves nothing to another, even
+ * where a deployment gives both the same secret.
+ */
+export type SessionToolPurpose = "claw-github-review" | "claw-github-mcp";
+
+function sign(secret: string, body: string, purpose: SessionToolPurpose): string {
+  return createHmac("sha256", secret).update(`${purpose}.v${VERSION}.${body}`).digest("base64url");
 }
 
-export function mintSessionToolToken(claims: SessionToolClaims, secret: string, ttlSeconds: number, nowMs: number = Date.now()): string {
+export function mintSessionToolToken(
+  claims: SessionToolClaims, secret: string, ttlSeconds: number, nowMs: number = Date.now(), purpose: SessionToolPurpose = "claw-github-review",
+): string {
   if (!secret) throw new Error("no secret to sign with");
   const body = Buffer.from(JSON.stringify({
     v: VERSION, sid: claims.sessionId, req: claims.requesterUserId, act: claims.actorUserId,
     exp: Math.floor(nowMs / 1000) + ttlSeconds,
   }), "utf8").toString("base64url");
-  return `${body}.${sign(secret, body)}`;
+  return `${body}.${sign(secret, body, purpose)}`;
 }
 
 export type SessionTokenVerdict =
   | { ok: true; claims: SessionToolClaims }
   | { ok: false; reason: "malformed" | "bad_signature" | "expired" };
 
-export function verifySessionToolToken(presented: string, secret: string, nowMs: number = Date.now()): SessionTokenVerdict {
+export function verifySessionToolToken(
+  presented: string, secret: string, nowMs: number = Date.now(), purpose: SessionToolPurpose = "claw-github-review",
+): SessionTokenVerdict {
   const dot = presented.lastIndexOf(".");
   if (dot <= 0 || !secret) return { ok: false, reason: "malformed" };
   const body = presented.slice(0, dot);
-  if (!constantTimeEquals(presented.slice(dot + 1), sign(secret, body))) return { ok: false, reason: "bad_signature" };
+  if (!constantTimeEquals(presented.slice(dot + 1), sign(secret, body, purpose))) return { ok: false, reason: "bad_signature" };
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));

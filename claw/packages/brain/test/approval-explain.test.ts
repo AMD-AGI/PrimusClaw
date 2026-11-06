@@ -480,3 +480,31 @@ test("a credential value repeated in ANOTHER argument is hidden there too, in th
   assert.match(prompt, /"reason":"rotate \[hidden\] now"/);
   assert.deepEqual(maskArguments({ a: "keep hunter2" }, ["hunter2"]), { a: "keep [hidden]" });
 });
+
+test("maskArguments and summaryPrompt keep a credential's id and name, and hide its value", () => {
+  // K1b: the summary model was handed apikey_id as [hidden] and wrote
+  // "Soft-delete the API key whose id is [hidden]".
+  const input = { apikey_id: 192, apikey_name: "claw5-gate-allow", api_key: "plainvalue-without-shape" };
+  const out = maskArguments(input, credentialValues(input)) as Record<string, unknown>;
+  assert.equal(out.apikey_id, 192);
+  assert.equal(out.apikey_name, "claw5-gate-allow");
+  assert.equal(out.api_key, "[hidden]");
+  assert.deepEqual(credentialValues(input), ["plainvalue-without-shape"]);
+  const prompt = summaryPrompt("mcp__safe__apikey_delete", input, {});
+  assert.ok(prompt.includes('"apikey_id":192'), prompt);
+  assert.ok(prompt.includes("claw5-gate-allow"), prompt);
+  assert.ok(!prompt.includes("plainvalue-without-shape"), prompt);
+});
+
+test("maskArguments and credentialValues hide a Vault secret_id and a map of passwords keyed by name", () => {
+  const uuid = "6a1c2f3e-0b4d-4e5f-8a9b-0c1d2e3f4a5b";
+  const input = { secret_id: uuid, VAULT_SECRET_ID: uuid, passwords_by_name: { prod: "XkjQmzPl" }, apikey_name: { prod: "Zq81mmLp" } };
+  const values = credentialValues(input);
+  assert.ok(values.includes(uuid), String(values));
+  assert.ok(values.includes("XkjQmzPl"), String(values));
+  assert.ok(values.includes("Zq81mmLp"), String(values));
+  const out = maskArguments(input, values) as Record<string, unknown>;
+  for (const key of Object.keys(input)) assert.equal(out[key], "[hidden]", key);
+  const prompt = summaryPrompt("mcp__vault__approle_login", input, {});
+  for (const secret of [uuid, "XkjQmzPl", "Zq81mmLp"]) assert.ok(!prompt.includes(secret), prompt);
+});

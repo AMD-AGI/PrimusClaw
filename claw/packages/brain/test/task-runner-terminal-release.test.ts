@@ -328,7 +328,6 @@ test("R3 the same when only the handoff failed, with no handler to wrap", async 
       finalText: "done",
       tokenUsage: { input_tokens: 1, output_tokens: 1, cache_read: 0, cache_create: 0 },
       turns: 1,
-      pendingMemories: [],
       pendingSkills: [],
       skillsUsed: {},
       errorCount: 0,

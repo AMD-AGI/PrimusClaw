@@ -33,6 +33,7 @@ chmod +x "$tmp/repo/sandbox/deploy/scripts/install.sh"
 
 cat >"$tmp/repo/claw/deploy/deploy.sh" <<'EOF'
 #!/usr/bin/env bash
+printf 'SANDBOX_ROUTER_AUTH_ENABLED=%s\n' "${SANDBOX_ROUTER_AUTH_ENABLED:-}" >"$CAPTURE.claw"
 exit 0
 EOF
 chmod +x "$tmp/repo/claw/deploy/deploy.sh"
@@ -55,6 +56,8 @@ grep -qx 'ALLOW_INSECURE_NO_AUTH=' "$capture"
 grep -qx 'EGRESS_ENABLED=false' "$capture"
 grep -qx 'EGRESS_EXTRA_BLOCKED_CIDRS=10.0.0.0/8,192.168.0.0/16' "$capture"
 grep -qx 'SANDBOX_EXTRA_CA_CONFIGMAP=' "$capture"
+# A Router installed with auth tells Claw so.
+grep -qx 'SANDBOX_ROUTER_AUTH_ENABLED=true' "$capture.claw"
 
 capture="$tmp/extra-ca.env"
 env "${common_env[@]}" CAPTURE="$capture" SAFE_API_URL="https://auth.example" \
@@ -107,6 +110,12 @@ env "${common_env[@]}" CAPTURE="$capture" \
   bash "$tmp/repo/deploy/deploy.sh" --yes --skip-litellm --skip-sandbox-check --insecure-sandbox >/dev/null
 grep -qx 'SAFE_API_URL=' "$capture"
 grep -qx 'ALLOW_INSECURE_NO_AUTH=true' "$capture"
+grep -qx 'SANDBOX_ROUTER_AUTH_ENABLED=false' "$capture.claw"
+
+capture="$tmp/explicit-router-auth.env"
+env "${common_env[@]}" CAPTURE="$capture" SAFE_API_URL="https://safe.example" SANDBOX_ROUTER_AUTH_ENABLED=false \
+  bash "$tmp/repo/deploy/deploy.sh" --yes --skip-litellm --skip-sandbox-check >/dev/null
+grep -qx 'SANDBOX_ROUTER_AUTH_ENABLED=false' "$capture.claw"
 
 if env "${common_env[@]}" CAPTURE="$tmp/missing.env" \
   bash "$tmp/repo/deploy/deploy.sh" --yes --skip-litellm --skip-sandbox-check >/dev/null 2>&1; then

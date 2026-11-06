@@ -28,6 +28,141 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Model choice for the assistant's items, behind `CLAW_ASSISTANT_MODEL_CHOICE` (`on` | off, default off; needs `CLAW_ASSISTANT_ENABLED`
+  and a non-empty `CLAW_ASSISTANT_MODELS`, the allow-list as `name=label,...`). One function decides an item's model: the model the
+  message asked for, else the payer's own review default (reviews), else their own default, else the deployment's default for the kind
+  (`CLAW_ASSISTANT_WORKER_MODEL`, or the new `CLAW_ASSISTANT_REVIEW_MODEL`), else Brain's `DEFAULT_MODEL`. A review asked of someone
+  else uses that person's settings; the model the requester named is set aside and reported in `ignored`. A name off the allow-list is
+  refused with the list; a model other than the deployment's default for the kind is asked of the gateway with the payer's own key
+  (cached five minutes), and one it cannot use falls back to `CLAW_FALLBACK_MODEL` (or the kind's default), recorded as
+  `params.model_asked` and answered as `fell_back_from`; when the gateway cannot be asked, a named model is refused and a default runs.
+  `work_create` and `work_send` take `model`; `review_start` / `review_restart` no longer need the model's name in the message; the new
+  `model_default_set` sets the user's defaults (attended turns only), as do `GET`/`PUT /v1/assistant/settings` (new table
+  `claw_user_model_prefs`); the router is shown the allow-list with labels and the user's defaults. A worker turn's model is the
+  deployment's worker model only when its session names none. A worker, review or router turn the gateway refuses for want of a key
+  binding (403 "No APIM Key binding found", 401 "missing subscription key") is run again once on `CLAW_FALLBACK_MODEL`, and the user is
+  told (with `CLAW_ASSISTANT_KEY_BINDING_URL` when set); new table `claw_assistant_model_fallbacks`. Off, nothing changes: no new tool
+  arguments, tables, routes or prompt lines.
+- The assistant's `review_start` naming another person is handed to the channel that carried the message when that channel declares
+  it can start such a review with the reviewer's own credentials (`channel_context.handoffs: ["review_for_other"]`): an
+  `assistant.action` named `review_for_other` with a typed `review` (reviewer, pull requests, merge, the person's message), queued
+  once after the same grounding, and the router is answered `handed_off`. A channel that does not declare it, or a user with no
+  subscription to `assistant.action`, gets the `acting_as_credentials_required` refusal as before. The handoff is recorded
+  (`claw_assistant_review_handoffs`) and its id handed over (`review.handoff_id`); `POST /v1/assistant/reviews` takes it back as
+  `handoff_id` and reads the record, not the body: such a review merges only once the reviewer confirms the merge, only reviews when the
+  router read no merge, and starts once per handoff; a request for a handed-over pull request without the id is held the same. The
+  reviewer must be named in the person's message, not only listed by the channel (`reviewer_not_named`).
+- Archived sessions can be deleted on a schedule: `SESSION_RETENTION_DAYS` (default 0, off) makes the API's daily
+  maintenance delete a session that many days after it was archived, through the same commit as a user's delete (queued
+  messages dropped, turns, events and summaries stamped deleted) with its S3 workspace and checkpoint prefixes removed by
+  the existing cleanup sweeper. Never taken: sessions made through the Anthropic-compatible API, sessions with a run in
+  flight (their own or a team member's), open tasks or queued messages, and the worker session of any work item; each
+  is checked again under the session's row lock before it is deleted. `SESSION_PURGE_DAYS` (default 0, off) removes for
+  good the stamped rows of sessions deleted more than that many days ago. `SESSION_RETENTION_BATCH` (default 500) bounds
+  each pass; `SESSION_RETENTION_DRY_RUN=true` only logs the counts (`session_retention.dry_run`). Archiving now records
+  `claw_sessions.archived_at` (a new nullable column; a session archived before it existed counts from `updated_at`).
+- A review asked of someone else (`POST /v1/assistant/reviews` with `acting_as` naming another person) is that person's: their item, their session sealed with their own keys (brought as `x-acting-as-token` and `x-acting-as-api-key`), their quota; their delegation switch is asked at creation and before every queued turn; the session runs with a fixed review profile and, on SaFE, a sandbox in `SANDBOX_CPU_NAMESPACE` created with `useWorkspaceStorage: false`; the requester sees four facts only. `POST /v1/sessions` refuses `requested_by`, `sandbox_profile`, `requester_note` and `acting_as` naming anyone but the caller (a deployment with `CLAW_ASSISTANT_REVIEW_ITEMS` off has no way to ask a review of someone else). New settings `CLAW_REVIEW_FOR_OTHERS_*`. The assistant's `review_start` refuses a review by someone else (`acting_as_credentials_required`; the user is sent to the review agent named by `CLAW_GITHUB_REVIEW_AGENT_NAME`); the requester's assistant lists the reviews they asked of others read-only (four facts), and `work_recall` / `work_stop` act on them with only those facts in the answer. A review the assistant's router starts or restarts merges nothing by itself, whatever its `merge` says: its session (`config.merge_needs_confirmation`, kept by every restart) holds its merge, and an approval GitHub's auto-merge or merge queue would turn into one, for the acting user's confirmation whatever the risk and review mode, made only from the card's button or `批准 #<ref>` / `approve #<ref>`; while auto-merge is on or the pull request is in the merge queue, such a session (and a review-only one) resolves no thread (`gh_thread_resolve` answers `auto_merge_on`).
+- The user's long-term memory in the assistant, behind `CLAW_ASSISTANT_MEMORY_TOOLS` (`on` | `off`, default off; needs
+  `CLAW_ASSISTANT_ENABLED` and `CLAW_MEMORY_ENABLED`, and the user's own opt-in). A router turn is shown the one-line
+  index and offered `memory_recall`, `memory_save`, `memory_update`, `memory_forget` and `memory_undo`; each write acts only
+  for a turn that answers the person's own signed-in, recent message (the review tools' attended check: a worker's report,
+  a message sent with a key, a stale one or a turn that has read a worker's words is refused; reading works), on an entry whose number is in that message or
+  in what the assistant said to them just before, quoting that message, and never in a conversation marked
+  `memory: "off"`. A task item's worker is shown a read-only index and may only recall; a review item's session is shown
+  only the entries bound to its item, and so is a task item's worker while any of its pull request subscriptions allows
+  answers without asking (`reply_allowed`): no index in its prompt, and `memory_recall`, asked again on every call,
+  reaches only entries bound to its item. A worker's session keeps what it read from run to run, so once
+  an item's worker has been shown the index or recalled an entry beyond its item, `pr_reply` refuses that item for good
+  (`memory_reached`; it answers by asking, through the github tools) (`claw_work_items.memory_reached_at`, a new column
+  required at start-up). An entry can be bound to one work item (`claw_memory_entries.work_item_id`, a new
+  column required at start-up); bound entries are left out of the chat's catalogue, and a save is checked for a duplicate
+  or a near one only against entries of the same binding. Workers started from a session marked `memory: "off"` are
+  marked so too, and an assistant's watcher of a group or a repository is never served the chat's memory. The chat's
+  own memory tools and
+  their fixed forget and undo phrases are unchanged.
+- A work item can watch a GitHub pull request, behind `CLAW_ASSISTANT_GITHUB_EVENTS` (default off; needs
+  `CLAW_ASSISTANT_ENABLED`). New comments, reviews, review comments, a failed CI on the head commit and the pull request
+  closing reach the item's worker as one queued message, without anybody mentioning it and without going through the
+  router. A small loop reads each watched pull request every `CLAW_ASSISTANT_GITHUB_POLL_SEC` (default 30, at least 10)
+  with the owner's own `GH_TOKEN`; each event is stored once under GitHub's id and delivered in the transaction that
+  queues the message, at most 6 deliveries per item in 10 minutes (the rest wait, they are not dropped). A pull request
+  that cannot be read for 10 minutes puts the item in front of the user; neither that nor any other report of the watch's own
+  replaces a result waiting for the user (it is told once the result is sent back), and the pull request closing does not take
+  such a result back. New routes `POST/GET
+  /v1/work-items/:id/subscriptions` and `DELETE /v1/work-items/:id/subscriptions/:sub_id`; the router gets
+  `work_subscribe`, the worker `pr_reply`, which answers one event on the pull request as the owner, once per event,
+  and only where the owner allowed it themselves (`reply: true`, which needs an identity-provider sign-in; a key or
+  ending the subscription takes it away); an answer carrying the owner's token, one of their stored values or
+  anything shaped like a credential is refused. Only comments and reviews by people who can write to the repository
+  (their permission on it, asked of GitHub: admin, maintain or write) or by the owner's own account reach the worker;
+  others are recorded and dropped. When the owner's token cannot see who may write (no push access, as on an upstream a
+  fork's pull request goes to), others' comments are held back as `author_unverifiable` and the owner is asked once
+  whether to keep watching; a permission GitHub would not give (a rate limit) is asked again, never judged. Bots reach
+  the worker only when listed in `CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS` (default empty). Comments the `github` tools write
+  end with an invisible `<!-- claw:github-tool -->` mark, so an answer the owner approved there does not come back to the
+  worker as news. One poll asks GitHub five things; one user's watched pull requests share 1200 requests an hour (each is
+  read less often the more there are), and nothing of theirs is read while GitHub reports less than a fifth of their
+  token's hour left. Every stored value is looked for in an answer, a value shorter than 8 characters as a whole word,
+  and the refusal names the variable. Events still waiting when the user stops watching are dropped. A failed CI is passed on as counts, run ids and conclusions, never the runs' names. Reviews on someone's behalf are never subscribed. New tables `claw_work_item_subscriptions`,
+  `claw_work_item_github_events` and `claw_work_item_pr_replies` (required at start-up when the assistant is on);
+  `CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS` (default 20) caps what one user watches.
+- A review item reviewed again continues the last review (with `CLAW_ASSISTANT_REVIEW_ITEMS`): what a review posted is
+  recorded with its threads (`claw_github_audit.posted`, a new column; `params.record` on the item), a restart or a new
+  request after the requester's closed item gives the fresh session the open findings to check first, and `gh_pr_get`
+  reads only the change since the last head unless it was rewritten, merged the base branch in, is large or touches
+  security or CI paths. Such a
+  session is offered `gh_thread_resolve` for the recorded threads of the acting user's own findings. See
+  `claw/docs/github-review.md`, "A review again".
+- `run.completed` and `run.failed` notifications carry `message_id`, the message whose turn the run was (a trigger's
+  run names the message the trigger sent; `null` for a task that has none). A client that sent that message and
+  already showed its answer can now tell the run's end is that turn's by the id: a run is closed after its last
+  answer, often more than a minute after, so matching by time sent a second "Run completed" card to the chat that had
+  just shown the answer.
+- The assistant can watch a group chat or a repository and record what it would do there without doing it, behind
+  `CLAW_ASSISTANT_OBSERVE` (default off; needs `CLAW_ASSISTANT_ENABLED`): `POST /v1/assistant/observations` hands one
+  message of a place (`group:<channel>:<id>` or `repo:<owner>/<repo>`) to a watcher session of the caller's own, whose
+  every assistant tool only writes a record (`claw_assistant_observations`); `GET /v1/assistant/observations?scope=`
+  reads it back message by message; `GET`/`PUT /v1/assistant/scopes` list and switch a place between `observe` (the
+  default) and `auto`, which only a person's sign-in (or a service in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`) can
+  set. Acting in `auto` is not built yet: a place in `auto` is still only recorded. New tables `claw_assistant_scopes`
+  and `claw_assistant_observations`, required at start-up when the assistant is on.
+- A watchdog for work items, behind `CLAW_ASSISTANT_WATCHDOG_SEC` (default 0, off): an item in progress with a run or a
+  queued instruction behind it and no sign of life for longer than the threshold is moved to "needs you" with the
+  reason (no progress, a worker with no heartbeat, an instruction no run took up), which wakes the assistant; it runs
+  in the assistant's existing sweep and stops nothing.
+- On-behalf GitHub reviews as work items of the assistant, behind `CLAW_ASSISTANT_REVIEW_ITEMS` (default off; needs
+  `CLAW_ASSISTANT_ENABLED` and `CLAW_GITHUB_REVIEW_ENABLED`): `POST /v1/assistant/reviews` and `POST
+  /v1/assistant/reviews/:id/restart`; `claw_work_items.kind` (`task` | `review`) and `params` (new columns, required at
+  start-up when the assistant is on) on every board row; one open review per pull request across users; stopping a review
+  item denies what its session holds for an answer. See `claw/docs/github-review.md`, "As an item of the assistant".
+  `POST /v1/sessions` now checks `acting_as`, `review_target`, `review_only`, the model and the effort through the same
+  function (`github-review/acting-session.ts`); its answers are unchanged.
+- The assistant's review and settings tools, behind `CLAW_ASSISTANT_TOOLS=on` (default off): `review_start`,
+  `review_restart`, `confirmation_answer`, `review_mode_set` (towards `high_risk_confirm` only) and `channel_action`
+  (an `assistant.action` outbox event when the user typed the command whole; otherwise an `assistant.say` carrying the
+  command as `confirm_action`, for the channel to run only when the user presses its button). A held write is let through
+  only by the exact command `批准 #<ref>` / `approve #<ref>` naming it, or the card's button. They act only in a router turn
+  that answers the user's own signed-in message
+  (recorded in the new `claw_assistant_messages` when the message is accepted, with how it was authenticated), received
+  at most `CLAW_ASSISTANT_ATTENDED_TTL_SEC` (600) seconds before, that has not read a worker's words; and only on what
+  that message names. A user's message now stops a router turn that is reading a worker's report, and a router turn
+  that answered the user and failed without a word is followed by one system notice. See `claw/docs/github-review.md`.
+- GitHub tools as an MCP server hosted by the API, off by default (`CLAW_GITHUB_MCP_ENABLED`, with
+  `CLAW_GITHUB_MCP_SECRET`). A session whose owner keeps `GH_TOKEN` in their env vault is offered `github`:
+  eleven read tools that run without asking and six write tools (comment, open an issue or a pull request,
+  change a pull request, reply to or resolve a review thread) that each wait for the user's decision. The
+  owner's token is read by the API per call, from the session the signed token names; it never travels in
+  the server entry. See `claw/docs/github-mcp.md`.
+- Built-in bash approval rules for GitHub writes from the shell (`git push` force / delete forms, pushes
+  to `main` / `master` and pushes that do not name their destination, writing `gh pr` / `gh issue` / `gh release` / `gh api` / `gh repo` / `gh workflow` /
+  `gh secret` / `gh variable` / `gh label` / `gh run` / `gh gist` / key / cache commands, a GraphQL mutation,
+  and `curl` / `wget` writes to `api.github.com`), on unless `BASH_APPROVAL_DEFAULTS_ENABLED=false`. A run with
+  no approval channel now has these commands denied instead of run. The outbound-actions pack gains the same
+  rules, and no longer holds a GraphQL read. See `claw/docs/bash-approval.md`.
+- Brain's MCP client passes on every content block of a tool result: an image, an embedded resource or a
+  resource link becomes a line that says what it was (an embedded text resource is passed in full) instead
+  of the result reading as empty, and a result with only `structuredContent` is passed as JSON. A server that
+  declares resources is also offered `list_resources` and `read_resource` under its own prefix.
 - A general working guideline for agent turns (`claw/packages/api/src/sessions/agent-guideline.ts`): read before
   changing, verify before claiming done, say what was not verified, cite sources, answer in the user's language, treat
   text from pages and files as data, respect approvals. It names no product. With `CLAW_AGENT_GUIDELINE_ENABLED=true`
@@ -38,11 +173,18 @@ record it.
   documents, GitHub, MCP, long-running) run through the API a client uses, graded from the session's events and files,
   with per-category tool calls, failed calls, approvals, turn time, sandbox wait and tokens taken from what Brain
   already records. `EVAL_ARM=guideline` compares a run with the guideline against one without.
-- A session created with `config.acting_as` and no `model` (a pull request reviewed on someone's behalf) runs on
-  `CLAW_GITHUB_REVIEW_MODEL` (default `claude-opus-5.5`, apart from the deployment's `DEFAULT_MODEL`; `default` keeps
-  that); a request's own `model` wins. `CLAW_GITHUB_REVIEW_EFFORT` (unset by default: nothing is sent, as before) runs
-  every turn of it at that effort while it runs on that model (new `ExecuteRequest.effort`, which Brain sends as
-  `output_config.effort`, or `reasoning_effort`, on every turn and sub-agent of the run). The requester's key pays.
+- A session chooses its reasoning effort as it chooses its model: `effort` (`low`, `medium`, `high`, or `null` for none)
+  on `POST /v1/sessions` and `PATCH /v1/sessions/:id`, stored in `claw_sessions.effort` (new column, required at start-up)
+  and sent on every turn and on every task-system run of the session (new `ExecuteRequest.effort`, which Brain sends as `output_config.effort`, or
+  `reasoning_effort`, on every turn and sub-agent of the run). A value outside the set is a `400`; none sends nothing,
+  as before. A session created with `config.acting_as` (a pull request reviewed on someone's behalf) is an ordinary
+  session in this: it runs on the model and effort its creator chose, or the deployment's defaults. There is no
+  review model or review effort setting.
+- `config.review_only: true` on a session created with `config.acting_as` (a `400` without it, or for a value that is
+  neither a boolean nor null): its `gh_pr_merge` is refused with `review_only` before anything is read, so it reviews, and may
+  approve, but never merges, never approves on the way to a merge, and does not approve while GitHub's auto-merge is
+  on for the pull request or it is in the merge queue (`review_only` as well); a held merge of such a session is refused at
+  the acting user's allow as well.
 - A deep review behind `CLAW_GITHUB_REVIEW_DEEP_ENABLED`, on by default (`false` turns it off, and then the review
   instructions, path advice and thresholds are exactly the previous ones). On, any change of a non-test source file,
   or of more than 200 lines (`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES`, 600 with it off), takes the sandbox path (`source_change`), and the
@@ -297,6 +439,10 @@ record it.
 - `@primusclaw/connector` 0.1.1 is the first version published by the release workflow, with a build-provenance
   attestation (`gh attestation verify` on the tarball attached to the release, and the provenance shown on npmjs.com). It has
   the same code as 0.1.0, which was published by hand: no behaviour change.
+- `@primusclaw/connector` 0.1.2: `claw-connector status` (text, and a `warnings` field in `--json`) and the start-up line of
+  `run` warn per agent when the machine's Claude Code settings default to `bypassPermissions` (user `settings.json` or the
+  managed settings file) and the agent has no `approval = "never"`, so every session of that agent would be closed with
+  `mode_not_enforced`. Before, such a machine showed online and nothing said so before the first session (#247).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
@@ -374,6 +520,27 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- Assistant: the router's `say` refuses a message that shows the user internal text (a tool name, the `[work_event]` marker,
+  an `item_id`, a run id, or an id of the UUID form the user did not write in the message the turn answers) with
+  `internal_text`, and the router is told to name an item by its number and title (`router-v7`); a turn that ends in plain text
+  with such text in it is answered with the system's notice instead of that text. A run's `tool_stats` (on
+  `executionStats` and the run row) carries `first_ok_ms` / `last_ok_ms`: per tool, when its first and last good call ended, in
+  ms from the start of the run's loop; an assistant turn's first and last `say` and whether it called `work_create` are read
+  from there. Brain's new `SKILL_HINTS_IN_SYSTEM` (default off) puts a turn's skill and MCP server hints in the system message
+  instead of after the user's message.
+- Assistant: the router answers a question itself when a read-only tool can. With `CLAW_ASSISTANT_PLUGIN_ID` set (new; default 0,
+  none), a router turn is given that plugin's MCP servers listed in
+  `claw/packages/api/src/assistant/read-tools.ts`, cut to their read tools by name (`tools_allowlist`), and no skill, rule or write
+  tool of it; its prompt (`router-read-v1`) says to answer such a question with those tools and to start a work item only for work
+  that produces or changes something. A plugin named on the message gives the router no read tools: the list vouches only for
+  servers the operator configured. A work item's worker runs with the message's plugin, else that one, on every turn (recorded on the item as
+  `params.plugin_id`). A worker that only found something out reports `kind="answer"` (`worker-v2`): the item closes as `answered`
+  and the router passes the answer on, with nothing to accept; an answer the router does not say is said by the silent sweep.
+  Once a router turn has called one of its read tools, Brain refuses the assistant's acting tools for the rest of that turn
+  (new `ExecuteRequest.read_taint`): the user's message covers what they wrote, not what the model read afterwards. A router or observer turn is marked `skip_platform_defaults` (new
+  `ExecuteRequest` field), so Brain connects no default MCP server and lists no default skill after the message. The router's system
+  prompt is now the same on every turn (`router-v6`): the item list, the review state and the memory entries go with the message,
+  and its history is its last 40 to 59 turns from a start that moves every 20, so the provider's prompt cache keeps both.
 - GitHub review: whether an `APPROVE` or a merge made with someone else's account waits for that person's
   confirmation is now decided by the reviewing model's `risk_judgement` (`high` holds, `low` lets it through the
   other gates), not by the rule pack (`claw/packages/api/src/github-review/risk.ts`, `assessRisk`; rule pack
@@ -429,6 +596,13 @@ record it.
   like the platform defaults instead of being inlined.
 
 ### Security
+- Claw works with a sandbox Router that runs with `--enable-auth`. With `SANDBOX_ROUTER_AUTH_ENABLED` on, every Hands
+  request that goes through the Router's port proxy (`SANDBOX_HANDS_VIA_ROUTER`) presents the sandbox owner's platform key
+  in `Authorization`: Brain's MCP client, health checks, shell records and the sweeper, and the API's changes view and
+  sandbox census. Before, they carried only the Hands token, which such a Router answers with 401, so the Router could
+  not authenticate while Hands was reached through it. Hands still reads its own token from `X-Hands-Token`; the Router
+  strips `Authorization` before forwarding. With the setting off nothing changes. `deploy/deploy.sh` now sets
+  `SANDBOX_ROUTER_AUTH_ENABLED` for Claw from the Sandbox it installs (`true` unless `--insecure-sandbox`).
 - A session that acts as a user (`config.acting_as`, GitHub review on; its turns carry `withhold_sandbox_keys`) is no longer
   given the deployment's platform defaults (`PLATFORM_DEFAULTS_FILE`): no default MCP server and no default skill. The default
   servers are called with the requester's own key (`<SAFE_API_KEY>`), so a pull request's text that a review turn reads could
@@ -557,6 +731,29 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- Deleting a session that has no `hands.<sid>` binding and no key on its cleanup notification -- every session the
+  retention pass deletes, and every sweeper replay of a delete that already finished -- is a finished teardown with
+  nothing to address (`session.cleanup_nothing_addressable`), not `no_platform_key`. Claw holds no handle to anything
+  such a session could own, and parking it did nothing, so each one only logged `session.cleanup_incomplete_parked`
+  and counted `claw_brain_session_cleanup_incomplete_total` once per Brain replica, firing the sandbox-teardown alert.
+  A binding without a key, or a KV store that cannot be read, is still reported as incomplete.
+- The daily session retention no longer stalls for a day after a rolling update. A replica killed mid-pass could leave
+  its idle Postgres backend, and the retention advisory lock on it, alive on the server for the OS keepalive's two hours,
+  and every new replica skipped until the next day. API connections now set server-side TCP keepalives
+  (`PG_TCP_KEEPALIVES_IDLE_S`, `PG_TCP_KEEPALIVES_INTERVAL_S`, `PG_TCP_KEEPALIVES_COUNT`, defaults 60/10/6), so such a
+  backend and its locks go about two minutes after the peer, and a retention pass that finds the lock held asks again
+  every `SESSION_RETENTION_LOCK_RETRY_MIN` minutes (default 10), up to twelve times.
+- The purge of deleted sessions' rows (`SESSION_PURGE_DAYS`) removes rows again: choosing the sessions to purge was one
+  query that Postgres planned as a scan of the whole events table, which hit the statement timeout on every pass
+  (`session_retention.purge_pass_failed`). It now walks deleted sessions a page at a time, along a new index
+  (`idx_sessions_deleted_walk`, built concurrently at startup), and asks each on its own, by index. And a retention pass
+  no longer holds its lock past the stall alarm (`leader.hold_exceeded`): each hold stops after
+  `SESSION_RETENTION_HOLD_BUDGET_SEC` seconds (default 300) and the pass continues in a new hold 30 seconds later, until
+  the day's `SESSION_RETENTION_BATCH` is spent.
+- An on-behalf review of a pull request that changes two or more `SKILL.md` files can approve again: Brain's
+  skill-read guard (`BRAIN_BLOCK_SKILL_SUBAGENTS`) turned its second pass away, since that pass names the files the
+  review read, and an approval needs the second pass. The guard no longer applies to a session that acts as a user
+  (`withhold_sandbox_keys`); every other run keeps it.
 - A session's queue is drained by one drain at a time (a lease on the session row, the new column
   `claw_sessions.pending_drain_until`, added on start). Two drains running together -- a turn's completion and the
   sweeper's, or two workers' reports waking an idle assistant a moment apart -- each started a turn: the second

@@ -361,7 +361,7 @@ export const metrics = {
   onDoorbellLeaseRequeued(rows: number): void {
     if (rows > 0) doorbellLeaseRequeuedTotal.inc(rows);
   },
-  onWorkItemStaleRejected(source: "worker" | "turn_end" | "sweep"): void {
+  onWorkItemStaleRejected(source: "worker" | "turn_end" | "sweep" | "watchdog"): void {
     workItemStaleRejectedTotal.inc({ source });
   },
 };

@@ -156,7 +156,8 @@ test("an empty last turn after a report, or in a sub-agent, still ends normally"
     { ...options(reported.session, events), maxTurns: 2 });
   assert.equal(result.finalText, "report: all green");
 
-  const sub = scripted([empty]);
+  // A sub-agent that ends on its cap is asked once more for its findings (see subagent-turn-cap-report.test.ts).
+  const sub = scripted([empty, empty]);
   const subResult = await agentLoop(prompt, [] as ToolSchema[],
     { ...options(sub.session, [], 1), maxTurns: 1 });
   assert.equal(subResult.finalText, "");

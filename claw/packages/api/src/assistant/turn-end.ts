@@ -20,6 +20,7 @@ import { db } from "../infra/db.js";
 import { SWEEPABLE_RUN_STATUSES } from "../tasks/chat-run.js";
 import { REPORT_SUMMARY_MAX } from "./report.js";
 import { ingestReport } from "./reports.js";
+import { syncReviewItemOfSession } from "./review-items.js";
 import { REPORT_KINDS, reportTransition, type WorkReport } from "./work-items.js";
 
 const logger = pino({ name: "assistant-turn-end" });
@@ -140,6 +141,8 @@ export interface WorkerTurnEnd {
  */
 export async function recordWorkerTurnEnd(end: WorkerTurnEnd): Promise<void> {
   if (end.interrupted) return;
+  // A review item reports nothing: its state is what its session did, read now that the turn is over.
+  if (await syncReviewItemOfSession(end.sessionId)) return;
   for (const runId of end.runIds) {
     await recordRunEnd(end.sessionId, runId, end.failed ? "failed" : "finished", {
       finalText: end.finalText, failureReason: end.failureReason,
@@ -194,7 +197,7 @@ export async function reconcileWorkerRuns(): Promise<number> {
  * $1 the statuses of a run that is not over; $2 the grace, in seconds.
  */
 const ORPHANED_ITEM = `
-  w.board_state = 'in_progress'
+  w.board_state = 'in_progress' AND w.kind = 'task'
   AND w.updated_at < NOW() - make_interval(secs => $2::int)
   AND NOT EXISTS (
     SELECT 1 FROM claw_work_item_events e

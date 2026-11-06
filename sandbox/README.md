@@ -49,14 +49,16 @@ Minimum changes before running untrusted code or accepting untrusted callers:
 ```yaml
 security:
   allowInsecureNoAuth: false     # leave false; the control plane enforces it
+controlplane:
+  config:
+    identity:
+      introspectUrl: https://<identity>/oauth/introspect   # client Secret: identity.clientSecret
 router:
   config:
     enableAuth: true
-    safeApiUrl: https://<your-safe-api>
 workloadmanager:
   config:
     enableAuth: true
-    safeApiUrl: https://<your-safe-api>
 egress:
   enabled: true                  # transparent proxy + SSRF protection
   # 169.254.0.0/16 and 100.64.0.0/10 are blocked without any setting; use
@@ -284,8 +286,9 @@ To reach a user-started service (Jupyter, Streamlit, REST API, MCP server, etc.)
 not silently install an unauthenticated control plane.
 
 ```bash
-# Recommended: authenticate against SaFE.
-SAFE_API_URL=https://<your-safe-api> deploy/scripts/install.sh
+# Recommended: authenticate /v1 callers through identity provider introspection.
+# The client Secret (client_id, client_secret) must exist in the release namespace.
+IDENTITY_INTROSPECT_URL=https://<identity>/oauth/introspect deploy/scripts/install.sh
 
 # Development clusters only: install without authentication.
 ALLOW_INSECURE_NO_AUTH=true deploy/scripts/install.sh

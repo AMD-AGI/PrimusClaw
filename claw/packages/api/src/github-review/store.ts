@@ -106,6 +106,9 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
       updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`,
   `CREATE INDEX IF NOT EXISTS idx_github_audit_session ON claw_github_audit(session_id)`,
+  // What a review that was posted said, for the review item it belongs to (assistant/review-items.ts reviewRecord): its event and each inline
+  // finding with the thread GitHub made for it. Written only for a review item's session; null for every other call.
+  `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS posted JSONB`,
 ];
 
 export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<void> {
@@ -113,6 +116,11 @@ export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<v
 }
 
 // ---------------------------------------------------------------- write lock
+
+/** The lock on one acting user's approvals and merges of one pull request: the key the tools and a stop of a review item share. */
+export function writeLockKey(actorUserId: string, ref: { owner: string; repo: string; number: number }): string {
+  return `${actorUserId}|${`${ref.owner}/${ref.repo}`.toLowerCase()}#${ref.number}`;
+}
 
 /**
  * Takes the lock on one acting user's approvals and merges of one pull request, or answers null when another call holds it. Between
@@ -203,7 +211,14 @@ export interface AuditFinish {
   reviewPath?: string;
   reviewPathReason?: string;
   reviewMode?: string;
+  /** A posted review's record (`PostedReview`), for a review item's session only. */
+  posted?: PostedReview | null;
 }
+
+/** One inline finding of a posted review: where it is, the thread GitHub opened for it (null when that could not be read) and its first words. */
+export interface PostedFinding { path: string; line: number; thread_id: string | null; note: string }
+/** What a posted review said, as `claw_github_audit.posted` keeps it. */
+export interface PostedReview { event: string; review_id: number | null; findings: PostedFinding[] }
 
 export async function auditStart(db: Queryable, a: AuditStart): Promise<number> {
   const r = await db.query(
@@ -220,12 +235,14 @@ export async function auditFinish(db: Queryable, id: number, f: AuditFinish): Pr
         SET repo = COALESCE($2, repo), pr = COALESCE($3, pr), head_sha = COALESCE($4, head_sha),
             github_requests = $5, github_request_ids = $6::jsonb, github_status = $7,
             risk_reasons = $8::jsonb, confirmation_id = $9, dry_run = $10, write = $11,
-            result = $12, detail = $13, review_path = $14, review_path_reason = $15, review_mode = COALESCE($16, review_mode)
+            result = $12, detail = $13, review_path = $14, review_path_reason = $15, review_mode = COALESCE($16, review_mode),
+            posted = COALESCE($17::jsonb, posted)
       WHERE id = $1`,
     [
       id, f.repo ?? null, f.pr ?? null, f.headSha ?? null, f.githubRequests, JSON.stringify(f.githubRequestIds.slice(-20)),
       f.githubStatus ?? null, JSON.stringify(f.riskReasons ?? []), f.confirmationId ?? null, f.dryRun, f.write,
       f.result, (f.detail ?? "").slice(0, 500), f.reviewPath ?? null, f.reviewPathReason ?? null, f.reviewMode ?? null,
+      f.posted ? JSON.stringify(f.posted) : null,
     ],
   );
 }
@@ -271,6 +288,41 @@ export async function recentWrites(
   );
   const row = r.rows[0] as { n: number; present: boolean };
   return { count: Number(row.n), pairPresent: row.present === true };
+}
+
+/**
+ * What this session did with one head commit of a pull request before an approval or a merge of it: whether it read it with `gh_pr_get`
+ * (`read`), whether any of those reads chose the sandbox path, and whether a sub-agent of the session that was given this head commit (its
+ * short form, in the first 2000 characters of its prompt that Brain's `subagentStart` keeps) used a tool, did not fail and ended after the
+ * first of those reads (`secondPass`). Both events are Brain's, as the event consumer stored them; neither the model nor the pull request's
+ * text can write one.
+ */
+export async function headReviewFacts(
+  db: Queryable, sessionId: string, repo: string, pr: number, headSha: string,
+): Promise<{ read: boolean; sandbox: boolean; secondPass: boolean }> {
+  const r = await db.query(
+    `WITH reads AS (
+       SELECT MIN(at) AS first_at, COALESCE(BOOL_OR(review_path = 'sandbox'), FALSE) AS sandbox
+         FROM claw_github_audit
+        WHERE session_id = $1 AND tool = 'gh_pr_get' AND result = 'ok' AND lower(repo) = lower($2) AND pr = $3 AND head_sha = $4
+     )
+     SELECT first_at IS NOT NULL AS read, sandbox,
+            EXISTS (
+              SELECT 1 FROM claw_session_events ev
+                JOIN claw_session_events st
+                  ON st.session_id = ev.session_id AND st.event = 'subagentStart' AND st.deleted_at IS NULL
+                 AND st.data->>'subagent_id' = ev.data->>'subagent_id'
+               WHERE ev.session_id = $1 AND ev.event = 'subagentEnd' AND ev.deleted_at IS NULL AND ev.created_at >= reads.first_at
+                 AND COALESCE(ev.data->>'failed', 'false') <> 'true'
+                 AND CASE WHEN jsonb_typeof(ev.data->'tool_stats'->'total_calls') = 'number'
+                          THEN (ev.data->'tool_stats'->>'total_calls')::numeric > 0 ELSE FALSE END
+                 AND position(left($4, 7) IN lower(COALESCE(st.data->>'prompt', ''))) > 0
+            ) AS second_pass
+       FROM reads`,
+    [sessionId, repo, pr, headSha],
+  );
+  const row = r.rows[0] as { read: boolean; sandbox: boolean; second_pass: boolean };
+  return { read: row.read === true, sandbox: row.sandbox === true, secondPass: row.second_pass === true };
 }
 
 // ---------------------------------------------------------- confirmations
@@ -420,22 +472,31 @@ export async function getConfirmation(db: Queryable, id: string): Promise<Confir
   return r.rows[0] ? toConfirmation(r.rows[0] as Record<string, unknown>) : null;
 }
 
+/** The caller (`$1`) is the acting user, or the requester of a session they own; never the requester of someone else's session. */
+const VISIBLE_TO_CALLER = `(claw_github_confirmations.actor_user_id = $1
+   OR (claw_github_confirmations.requester_user_id = $1
+       AND EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = claw_github_confirmations.session_id AND s.user_id = $1)))`;
+
 /**
- * Confirmations a caller may see: those of the sessions they own and those that
- * ask them. Pending ones that have run out are closed on the way, so nobody is
- * shown a card that can no longer be answered.
+ * Confirmations a caller may see: those that ask them (they are the acting user),
+ * and those they requested in a session they own. A review someone else asked of
+ * the acting user runs in the acting user's session with the asker as requester:
+ * its confirmations (the session, the review the model drafted as the acting user,
+ * the reasons, the checks) are the acting user's alone, and the asker sees only the
+ * item's `requester_view`. Pending ones that have run out are closed on the way, so
+ * nobody is shown a card that can no longer be answered.
  */
 export async function listConfirmations(
   db: Queryable, callerUserId: string, filter: { sessionId?: string; status?: ConfirmationStatus },
 ): Promise<Confirmation[]> {
   await db.query(
     `UPDATE claw_github_confirmations SET status = 'expired'
-      WHERE status = 'pending' AND expires_at <= NOW() AND (requester_user_id = $1 OR actor_user_id = $1)`,
+      WHERE status = 'pending' AND expires_at <= NOW() AND ${VISIBLE_TO_CALLER}`,
     [callerUserId],
   );
   const r = await db.query(
     `SELECT * FROM claw_github_confirmations
-      WHERE (requester_user_id = $1 OR actor_user_id = $1)
+      WHERE ${VISIBLE_TO_CALLER}
         AND ($2::text IS NULL OR session_id = $2)
         AND ($3::text IS NULL OR status = $3)
       ORDER BY created_at DESC LIMIT 50`,
@@ -506,4 +567,54 @@ export async function finishConfirmation(
       WHERE confirmation_id = $1 AND status IN ('pending', 'merging')`,
     [id, status, deciderUserId, JSON.stringify(result)],
   );
+}
+
+/** Whether this session merged its pull request, or put it in the merge queue: by a confirmation a person allowed, or by a merge made at once. */
+export async function sessionMerged(db: Queryable, sessionId: string): Promise<boolean> {
+  const r = await db.query(
+    `SELECT EXISTS (SELECT 1 FROM claw_github_confirmations WHERE session_id = $1 AND status IN ('merged', 'queued'))
+         OR EXISTS (SELECT 1 FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_pr_merge' AND result = 'ok' AND detail IN ('merged', 'queued'))
+         AS merged`,
+    [sessionId],
+  );
+  return (r.rows[0] as { merged?: boolean } | undefined)?.merged === true;
+}
+
+/**
+ * The requester stopped this session's work: every write it holds for someone's answer is denied, so that a card left in a chat cannot
+ * still make it. Run in the stop's own transaction. Answers why the stop must not go ahead instead, having denied nothing the caller
+ * keeps (it rolls back): the pull request was merged (`already_merged`), or a person's allow is being carried out right now
+ * (`merge_in_progress`), which the session's interrupt would not stop.
+ *
+ * The deny comes before the look for one being carried out: a decision that claims a row after this statement finds it denied, and one
+ * that claimed it before is seen as `merging`.
+ */
+export async function closeConfirmationsForStop(
+  db: Queryable, sessionId: string, stoppedBy: string, write: { actorUserId: string; pr: { owner: string; repo: string; number: number } },
+): Promise<"already_merged" | "merge_in_progress" | null> {
+  if (await sessionMerged(db, sessionId)) return "already_merged";
+  // A merge or an approval the session is making right now holds this lock for as long as it works, and no confirmation says so. The
+  // stop takes the lock in its own transaction, so a write that asks for it meanwhile waits for the stop and then finds the review stopped
+  // (`GithubReview.oneAtATime`); one that holds it now is being made, and the stop says so instead of claiming it stopped anything.
+  const key = writeLockKey(write.actorUserId, write.pr);
+  const taken = await db.query(
+    `INSERT INTO claw_github_write_locks (lock_key, holder, expires_at) VALUES ($1, $2, NOW() + INTERVAL '2 minutes')
+     ON CONFLICT (lock_key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
+       WHERE claw_github_write_locks.expires_at <= NOW()
+     RETURNING holder`,
+    [key, `stop:${sessionId}`],
+  );
+  if (!taken.rows.length) return "merge_in_progress";
+  // Released when the transaction commits; a waiter then takes it and reads the stop.
+  await db.query("DELETE FROM claw_github_write_locks WHERE lock_key = $1 AND holder = $2", [key, `stop:${sessionId}`]);
+  await db.query(
+    `UPDATE claw_github_confirmations
+        SET status = 'denied', decided_at = NOW(), decided_by = $2, result = '{"by":"requester","reason":"stopped"}'::jsonb
+      WHERE session_id = $1 AND status = 'pending'`,
+    [sessionId, stoppedBy],
+  );
+  const merging = await db.query("SELECT 1 FROM claw_github_confirmations WHERE session_id = $1 AND status = 'merging' LIMIT 1", [sessionId]);
+  if (merging.rows.length > 0) return "merge_in_progress";
+  // A decision that finished between the first look and the deny.
+  return (await sessionMerged(db, sessionId)) ? "already_merged" : null;
 }

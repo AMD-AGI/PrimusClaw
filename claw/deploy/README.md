@@ -112,7 +112,6 @@ exist before the first session runs, or workspace sync has nowhere to write.
 | `SAFE_API_URL`                 | SaFE platform base URL                   | `https://cluster.example.com`                |
 | `SANDBOX_NAMESPACE`            | SaFE sandbox namespace; the default workspace of a sandbox, also the one `GET /v1/me` names as `sandbox.defaultWorkspaceId` when the caller has it | `example-sandbox`                                     |
 | `SANDBOX_CPU_NAMESPACE`        | Optional. A separate SaFE workspace for sandboxes that ask for no GPU (`gpu` absent or 0); `SANDBOX_NAMESPACE` is then the GPU workspace. A sandbox that asks for a GPU never goes here, even when a request names this workspace, and neither does a multi-node cluster; the Hands sandbox of a multi-node run goes next to its cluster, whatever it asks for. A workspace a request names still wins otherwise. `GET /v1/me` names this one as the default, and the API stamps no default workspace on tasks (Brain picks per sandbox). Set it on api and brain (`EXTRA_ENV_API_` / `EXTRA_ENV_BRAIN_`) | unset: one workspace for every sandbox |
-| `SANDBOX_CPU_ROUTER_URL`       | Optional, brain. Router base(s) of the cluster that `SANDBOX_CPU_NAMESPACE` is on, same format as `SANDBOX_ROUTER_URL`. A Router answers only for the sandboxes of its own cluster, so set it when the CPU workspace is on another cluster than the GPU one | unset: `SANDBOX_ROUTER_URL` serves both |
 | `ANTHROPIC_BASE_URL`           | LLM gateway URL                          | `https://cluster.example.com/llm-gateway`   |
 | `S3_ENDPOINT`                  | MinIO / S3 endpoint                      | `http://minio.minio.svc.cluster.local:9000`          |
 | `S3_SANDBOX_ENDPOINT`          | S3 endpoint as sandboxes reach it, for presigned URLs (default: `S3_API_ENDPOINT`) | `https://cluster.example.com` |
@@ -146,6 +145,43 @@ exist before the first session runs, or workspace sync has nowhere to write.
 | `grantSigningKey.enabled` | Mounts the Secret `grantSigningKey.secretName` (default `primus-claw-grant-signing-key`, key `signing-key.pem`) read-only into api at `/var/run/claw/grant` with `GRANT_SIGNING_KEY_FILE` pointing at it, and sets `AGENT_SANDBOX_GRANT_URL` (`grantSigningKey.url`) in api and brain. Set it with `GRANT_SIGNING_KEY_ENABLED` in `values.<ns>.env`, which `upgrade.sh` re-renders from; a bare `helm upgrade --set` is dropped by the next `upgrade.sh`. The mount path is the chart's own, so `EXTRA_SECRET_MOUNTS_API` cannot take it. Off by default. |
 | `api.extraEnv` / `brain.extraEnv`, `api.extraVolumes` / `brain.extraVolumes`, `api.extraVolumeMounts` / `brain.extraVolumeMounts` | Generic pass-through for settings with no dedicated key: Kubernetes `EnvVar`, `Volume` and `VolumeMount` lists appended to the api or brain pod. `extraEnv` renders after every other env entry of the container. `upgrade.sh` and `deploy.sh` build them from `EXTRA_ENV_API_<NAME>` / `EXTRA_ENV_BRAIN_<NAME>` (plain value), `EXTRA_SECRET_ENV_API_<NAME>` / `EXTRA_SECRET_ENV_BRAIN_<NAME>` (`<secret>:<key>`, rendered as `valueFrom.secretKeyRef`; refused when the name is set twice in one container, by `EXTRA_ENV_*` or by the chart's own render, before anything is applied) and `EXTRA_CONFIGMAP_MOUNTS_API` / `EXTRA_CONFIGMAP_MOUNTS_BRAIN` (`<configmap>:<mount-path>`, read-only) and `EXTRA_SECRET_MOUNTS_API` / `EXTRA_SECRET_MOUNTS_BRAIN` (`<secret>:<mount-path>`, read-only) in `values.<ns>.env`, and refuse a mount path used twice in one container or already mounted there by the chart (`charts/claw/mount-paths.json`) before anything is applied; a bare `helm upgrade --set` is dropped by the next `upgrade.sh`. Empty by default. |
 | `postgres.sslNoVerify` | Sends `POSTGRES_SSLMODE=no-verify` to api, keeping the PG connection encrypted while skipping server-certificate validation. Off by default, so api validates the certificate. Turn it on (`PG_SSL_NO_VERIFY=true`, recorded in `values.<ns>.env` so `upgrade.sh` keeps it) against a PGO-managed database, whose CA is absent from the image trust store; the alternative is adding that CA to the trust store and leaving this off. |
+
+### NetworkPolicies
+
+Off by default. Under an engine that enforces NetworkPolicies (Calico, Cilium,
+kube-router, ...), `networkPolicy` in `charts/claw/values.yaml` renders:
+
+| Policy | Namespace | What it does |
+|---|---|---|
+| `default-deny` | release | Nothing in or out of any pod unless allowed below. |
+| `allow-ingress-pod-network` | release | Ingress from `networkPolicy.ingressCIDRs` (typically the pod network). |
+| `allow-egress` | release | Own namespace; `egressNamespaces` (any port); `egressNamespacePorts`; DNS (kube-dns and `dnsIPs`); `egressCIDRs`; public addresses (outside `privateCIDRs`, so no cloud metadata) on `publicEgressPorts`. |
+| `claw-sandbox-egress` | each of `sandboxEgress.namespaces` | Egress of the Hands pods only: DNS, `sandboxEgress.egressPods` (the agent-sandbox control plane), `sandboxEgress.egressCIDRs`, public addresses on `sandboxEgress.publicEgressPorts`. The Kubernetes API, in-cluster databases and cloud metadata are not reachable. |
+
+Ingress is by CIDR on purpose: a gateway on the host network has no pod
+identity (it arrives from the node address, or from the node's overlay address
+on another node), and an engine that learns a new pod's address a second or two
+after it starts (kube-router) refuses a selector-matched client's first
+connection. `deploy.sh` reads the lists from the values file named by
+`NETWORK_POLICY_VALUES_FILE`; `upgrade.sh` does not touch NetworkPolicies.
+
+```yaml
+# NETWORK_POLICY_VALUES_FILE, example values for a flannel cluster
+networkPolicy:
+  enabled: true
+  ingressCIDRs: [10.244.0.0/16]
+  dnsIPs: [169.254.20.10]
+  egressNamespaces: [primus-safe, primus-identity, agent-sandbox-system]
+  egressNamespacePorts: [{namespace: minio, ports: [9000]}]
+  egressCIDRs: [{cidr: 192.0.2.0/24, ports: [80, 443, 6443]}]
+  publicEgressPorts: [80, 443, 5671, 22]
+  sandboxEgress:
+    enabled: true
+    namespaces: [default]
+    egressPods:
+      - {namespace: agent-sandbox-system, podLabels: {app: agent-sandbox-controlplane}, ports: [8080, 8081]}
+    egressCIDRs: [{cidr: 192.0.2.0/24, ports: [80, 443]}]
+```
 
 ### PostgreSQL Connection
 
@@ -353,6 +389,7 @@ Requires `boto3` (`pip install boto3`). See `deploy/minio-lifecycle.py` for user
 | `nats-values.yaml` | NATS Helm values |
 | `minio-lifecycle.py` | S3 bucket lifecycle rules script (boto3) |
 | `charts/claw/dashboards/claw-brain.json` | Grafana dashboard for the Brain metrics (installed by the chart when `grafanaDashboard.enabled`, or imported by hand) |
+| `charts/claw/templates/networkpolicy.yaml` | NetworkPolicies for the release namespace and the sandbox namespaces (`networkPolicy.enabled`, `networkPolicy.sandboxEgress.enabled`; see NetworkPolicies) |
 | `charts/claw/templates/servicemonitor.yaml` | Prometheus Operator ServiceMonitors for API and Brain (`serviceMonitor.enabled`) |
 | `charts/claw/values.schema.json` | JSON Schema for the Doorbell switch and the eight admission ceilings, enforced by `helm lint`/`template`/`upgrade` |
 | `charts/claw/templates/admission-preflight.yaml` | Render-time refusal of a soft ceiling above its hard ceiling, and of any ceiling set while Doorbell dispatch is off |

@@ -44,6 +44,8 @@ let app: FastifyInstance;
 let dbStub: DbStub | null = null;
 
 before(async () => {
+  process.env.USER_ENV_ENCRYPTION_KEY ??= Buffer.alloc(32, 7).toString("base64");
+  (await import("../src/crypto/user-env.js")).initUserEnvCrypto();
   stubDb = (await import("./support/db-stub.js")).stubDb;
   const { workbenchRegistry } = await import("../src/workbenches/registry.js");
   const { registerWorkbenchRunRoutes } = await import("../src/workbenches/routes.js");

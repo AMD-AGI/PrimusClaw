@@ -41,6 +41,7 @@ export function bindClusterReclaimForTest(
 import { metrics } from "../infra/metrics.js";
 import { drainKeys } from "../infra/kv-keys.js";
 import { checkHandsHealth } from "./hands-health.js";
+import { rememberRouterCredential } from "./sandbox-router.js";
 import { releaseHandlesForWorkload } from "./handles.js";
 import {
   getHandsKv,
@@ -1111,6 +1112,7 @@ async function sweepStaleHandsPass(): Promise<void> {
       const handsUrl = (info.handsUrl as string) || "";
       if (!handsUrl) continue;
 
+      rememberRouterCredential(handsUrl, info.platformKey);
       const health = await checkHandsHealth(handsUrl, SWEEPER_HEALTH_TIMEOUT_MS);
       if (health.ok) { sweeperFailureCounts.delete(sessionId); continue; }
 

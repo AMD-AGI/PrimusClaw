@@ -7,14 +7,17 @@
  * classified once in `handleComplete`; here each side effect is watched, with
  * an ordinary run as the control that the same event does trigger it.
  *
- * The flags are set before the modules load: the memory, skill-evolution and
+ * The flags are set before the modules load: the skill-evolution and
  * notification steps are compiled out when their flag is off, and a test that
- * left them off would pass for that reason alone.
+ * left them off would pass for that reason alone. Memory is not among the side
+ * effects: it is written during the turn, never at its completion.
  */
 
 process.env.CLAW_NOTIFICATIONS_ENABLED = "1";
 process.env.CLAW_MEMORY_ENABLED = "1";
 process.env.CLAW_SKILL_EVOLUTION_ENABLED = "1";
+// For the requested review below: its session is told apart only while GitHub review is on.
+process.env.CLAW_GITHUB_REVIEW_ENABLED = "1";
 
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach } from "node:test";
@@ -87,12 +90,10 @@ beforeEach(async () => {
   calls = [];
   const spy = (name: string, result: unknown = undefined) => async () => { calls.push(name); return result; };
   Object.assign(completionPorts, originalPorts, {
-    insertMemoryEntry: spy("insertMemoryEntry", true),
     saveSkill: spy("saveSkill"),
     recordSkillFeedback: spy("recordSkillFeedback"),
     checkProbationGraduation: spy("checkProbationGraduation"),
     maybeSummarize: spy("maybeSummarize"),
-    maybeExtractMemory: spy("maybeExtractMemory"),
     maybeRecordTaskPattern: spy("maybeRecordTaskPattern"),
     enqueueEvolutionJob: spy("enqueueEvolutionJob"),
     recordRunFinished: spy("recordRunFinished", 1),
@@ -119,7 +120,6 @@ function completion(extra: Record<string, unknown>): Record<string, unknown> {
   return {
     type: "exec_complete", session_id: SESSION, task_id: "run-1", message_id: "m1", user_id: "u-1",
     prompt: "[sandbox start]", error_count: 0, skills_used: {}, selected_skills: ["sk"],
-    memories_to_save: [{ content: "a fact", kind: "fact" }],
     skills_to_save: [{ skill_name: "sk", content: "body" }],
     ...extra,
   };
@@ -137,7 +137,7 @@ async function consume(event: Record<string, unknown>): Promise<void> {
 }
 
 const SIDE_EFFECTS = [
-  "insertMemoryEntry", "saveSkill", "recordSkillFeedback", "checkProbationGraduation", "maybeSummarize",
+  "saveSkill", "recordSkillFeedback", "checkProbationGraduation", "maybeSummarize",
   "maybeRecordTaskPattern", "enqueueEvolutionJob", "recordRunFinished",
 ];
 
@@ -169,13 +169,14 @@ for (const [name, event] of OUTCOMES) {
   });
 }
 
-test("CONTROL: an ordinary run with nothing saved explicitly still extracts memory; a sandbox-only run does not", async () => {
+
+test("a review someone asked of the owner learns nothing for the owner: no task pattern and no skill evolution from its run", async () => {
   await seed(false);
-  await consume(completion({ final_text: "done", memories_to_save: [] }));
-  assert.ok(calls.includes("maybeExtractMemory"), `saw ${calls.join(",")}`);
-  await h.reset();
-  calls = [];
-  await seed(true);
-  await consume(completion({ final_text: "done", memories_to_save: [] }));
-  assert.deepEqual(calls, []);
+  await h.sql("UPDATE claw_sessions SET config = $2::jsonb WHERE session_id = $1",
+    [SESSION, JSON.stringify({ acting_as: "u-1", requested_by: { user_id: "u-2", label: "U2" }, sandbox_profile: "review" })]);
+  await consume(completion({ final_text: "done", failed: false }));
+  assert.equal(calls.includes("maybeRecordTaskPattern"), false, calls.join(","));
+  assert.equal(calls.includes("enqueueEvolutionJob"), false, calls.join(","));
+  assert.ok(calls.includes("maybeSummarize"), "the rest of the completion is as for any run");
+  assert.ok(calls.includes("recordRunFinished"));
 });

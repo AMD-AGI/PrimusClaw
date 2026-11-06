@@ -65,11 +65,59 @@ test("camelCase credential names are sensitive", () => {
 test("a credential word is sensitive as a prefix as well as a suffix", () => {
   // Widening only the leading boundary would still have missed these: the word
   // is qualified on the right rather than the left.
-  assertSensitive(["apiKeyId", "secretName", "passwordHint", "tokenValue", "credentialsPath"], true);
+  assertSensitive(["passwordHint", "tokenValue", "credentialsPath", "apiKeySecret"], true);
 });
 
 test("acronym runs split into words", () => {
-  assertSensitive(["APIKey", "apikey", "APIKeyId"], true);
+  assertSensitive(["APIKey", "apikey", "APIKeyValue"], true);
+});
+
+test("a key that names a credential by id, name or prefix is not itself a credential", () => {
+  // An approval card for apikey_delete {"apikey_id": 192} showed the id as
+  // [REDACTED], so the approver could not see which key was being deleted.
+  assertSensitive([
+    "apikey_id", "apiKeyId", "APIKeyId", "apikey_name", "apiKeyName", "api_key_prefix",
+    "apikey_uuid", "access_key_id", "accessKeyId", "credential_id", "credentialName",
+    "token_name", "tokenPrefix",
+  ], false);
+  for (const value of [192, "claw5-gate-allow", null, undefined, true]) {
+    assert.equal(isSensitiveKey("apikey_id", value), false, `apikey_id = ${String(value)}`);
+  }
+});
+
+test("an id-named key whose value IS the credential stays masked", () => {
+  // Vault AppRole secret_id, Consul/Nomad ACL SecretID and their env spellings
+  // are the login secret itself, a plain UUID the shape scan cannot see.
+  assertSensitive([
+    "secret_id", "SecretID", "secretId", "VAULT_SECRET_ID", "ROLE_SECRET_ID", "secret_ids",
+    "secretName", "secret_name", "password_id", "token_id", "tokenId", "auth_token_id",
+    "openai_api_key_id", "AWS_SECRET_ACCESS_KEY", "id_token", "idToken", "api_key_id_secret",
+    "apikey", "api_key", "apiKey", "client_secret", "access_token", "password",
+  ], true);
+  for (const key of ["secret_id", "SecretID", "VAULT_SECRET_ID"]) {
+    assert.equal(isSensitiveKey(key, "6a1c2f3e-0b4d-4e5f-8a9b-0c1d2e3f4a5b"), true, key);
+  }
+  // A bare identifier word was never a credential and still is not.
+  assertSensitive(["id", "name", "prefix", "uuid", "key_id"], false);
+});
+
+test("a container under an identifier-tailed key keeps masking its whole subtree", () => {
+  // passwords_by_name {prod: "..."} is a map of passwords: the parent must be
+  // sensitive, because the child keys (prod, "7") are not.
+  for (const key of ["passwords_by_name", "secrets_by_id", "credentials_by_name", "api_keys_by_name", "access_tokens_by_id"]) {
+    assert.equal(isSensitiveKey(key), true, key);
+    assert.equal(isSensitiveKey(key, { prod: "XkjQmzPl" }), true, key);
+  }
+  // Even a listed identifier key is a label only as a scalar: an object or
+  // array under it can hold anything, and is masked as a whole.
+  assert.equal(isSensitiveKey("apikey_name", { prod: "XkjQmzPl" }), true);
+  assert.equal(isSensitiveKey("apikey_id", ["XkjQmzPl"]), true);
+  assert.equal(isSensitiveKey("credential_id", {}), true);
+  // Bare `tokens` is the usage counter, so tokens_by_id was not sensitive on
+  // main either; this change leaves it where it was.
+  assert.equal(isSensitiveKey("tokens_by_id", { prod: "XkjQmzPl" }), false);
+  // A tool whose name ends in an identifier word still masks its arguments.
+  assert.equal(isSensitiveKey("mcp__vault__secret_by_id", { path: "x" }), true);
 });
 
 test("token counters are not credentials", () => {

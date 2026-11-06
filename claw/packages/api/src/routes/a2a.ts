@@ -21,7 +21,6 @@ import { a2aContextTasksEnabled, identityCallerMayUseA2a } from "./a2a-flags.js"
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
-import { isMemoryActive } from "../memory/service.js";
 import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import type { PoolClient } from "pg";
@@ -822,10 +821,10 @@ async function publishContextRun(
     if (beforePublish) await beforePublish();
     // The turns the context already has, so a follow-up in it is a conversation
     // and not a fresh start. Memory and the user's profile come with it, as for
-    // a turn sent from the web client. The last message is this prompt, which
-    // Brain adds itself.
+    // a turn sent from the web client. This prompt is not part of it: Brain
+    // adds it itself.
     const { buildMessages } = await import("../sessions/context-builder.js");
-    const history = (await buildMessages(target.taskId, text, auth.userId)).slice(0, -1);
+    const history = await buildMessages(target.taskId, text, auth.userId);
     await publishA2AExecuteTask(target.taskId, text, auth, spec, history);
   } catch (err) {
     await rollbackA2AAdmission(target, entry.taskId, err);
@@ -893,8 +892,11 @@ async function assertParentWritable(
   auth: A2AAuthContext,
   q: StatementRunner,
 ): Promise<void> {
+  // Held until the attach commits, for the reason `resolveParentAuthorisation`
+  // in routes/sessions.ts gives: a deletion of the parent waits for it, or it
+  // waits for the deletion and then finds the parent gone.
   const parent = (await q.query(
-    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR KEY SHARE",
     [parentSessionId],
   )).rows[0] as { user_id?: string | null } | undefined;
   const caller: UserInfo = {
@@ -921,7 +923,8 @@ async function publishA2AExecuteTask(
     message_id: spec.messageId,
     prompt: text,
     history,
-    memory_enabled: await isMemoryActive(auth.userId || "a2a"),
+    // A peer agent's message is not the user's word: no memory tools (memory/service.ts memoryAccess).
+    memory_enabled: false,
     skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
     user_id: auth.userId || "a2a",
     platform_key: auth.platformKey,
@@ -2030,7 +2033,7 @@ async function handleLegacyInvoke(
   // compensation and a `taskId` that does not exist.
   try {
     const payload: Record<string, unknown> = {
-      session_id: target.taskId, prompt: text, history: [], memory_enabled: await isMemoryActive("a2a"),
+      session_id: target.taskId, prompt: text, history: [], memory_enabled: false,
       skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED, user_id: "a2a",
     };
     if (CLAW_AGENT_GUIDELINE_ENABLED) withAgentGuideline(payload);

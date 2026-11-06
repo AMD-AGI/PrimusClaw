@@ -30,7 +30,7 @@ func TestWaitRunningRemoteClusterSkipsPodIP(t *testing.T) {
 		"kind":       "Workload",
 		"metadata": map[string]any{
 			"name":   name,
-			"labels": map[string]any{safeClusterIDLabel: "crusoe"},
+			"labels": map[string]any{safeClusterIDLabel: "cluster-a"},
 		},
 		"status": map[string]any{
 			"phase":     "Running",
@@ -41,11 +41,11 @@ func TestWaitRunningRemoteClusterSkipsPodIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	creator := NewSafeWorkloadCreator(dc, nil)
-	creator.SetRemoteClusters([]string{"crusoe"})
+	creator.SetRemoteClusters([]string{"cluster-a"})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	ip, node, cluster, err := creator.waitRunning(ctx, name, "crusoe-spur-vk")
-	if err != nil || ip != "" || node != "node-a" || cluster != "crusoe" {
+	ip, node, cluster, err := creator.waitRunning(ctx, name, "ws-a")
+	if err != nil || ip != "" || node != "node-a" || cluster != "cluster-a" {
 		t.Fatalf("ip=%q node=%q cluster=%q err=%v", ip, node, cluster, err)
 	}
 }
@@ -60,9 +60,9 @@ func TestSessionSkipsRemoteWorkload(t *testing.T) {
 		"kind":       "Workload",
 		"metadata": map[string]any{
 			"name":   name,
-			"labels": map[string]any{safeClusterIDLabel: "crusoe", ownerSessionIDLabel: name},
+			"labels": map[string]any{safeClusterIDLabel: "cluster-a", ownerSessionIDLabel: name},
 		},
-		"spec":   map[string]any{"workspace": "crusoe-spur-vk"},
+		"spec":   map[string]any{"workspace": "ws-a"},
 		"status": map[string]any{"phase": "Running"},
 	}}
 	if _, err := dc.Resource(workloadGVR).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
@@ -72,9 +72,40 @@ func TestSessionSkipsRemoteWorkload(t *testing.T) {
 	if _, err := creator.Session(context.Background(), name); err != nil {
 		t.Fatalf("local session: %v", err)
 	}
-	creator.SetRemoteClusters([]string{"crusoe"})
+	creator.SetRemoteClusters([]string{"cluster-a"})
 	if info, err := creator.Session(context.Background(), name); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("remote session info=%+v err=%v", info, err)
+	}
+}
+
+func TestLocateAnyWorkload(t *testing.T) {
+	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
+		workloadGVR: "WorkloadList",
+	})
+	for name, phase := range map[string]string{"claw-brain-1": "Running", "claw-done": "Succeeded"} {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "amd.com/v1",
+			"kind":       "Workload",
+			"metadata": map[string]any{
+				"name":   name,
+				"labels": map[string]any{safeClusterIDLabel: "cluster-a", safeUserIDLabel: "u1"},
+			},
+			"spec":   map[string]any{"workspace": "ws-a"},
+			"status": map[string]any{"phase": phase},
+		}}
+		if _, err := dc.Resource(workloadGVR).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	creator := NewSafeWorkloadCreator(dc, nil)
+	cluster, ns, owner, err := creator.Locate(context.Background(), "claw-brain-1")
+	if err != nil || cluster != "cluster-a" || ns != "ws-a" || owner != "u1" {
+		t.Fatalf("cluster=%q ns=%q owner=%q err=%v", cluster, ns, owner, err)
+	}
+	for _, name := range []string{"claw-done", "missing", "Not_A_Label"} {
+		if _, _, _, err := creator.Locate(context.Background(), name); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("%s: err=%v", name, err)
+		}
 	}
 }
 

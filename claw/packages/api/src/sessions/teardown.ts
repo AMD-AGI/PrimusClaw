@@ -567,10 +567,22 @@ export interface TeardownInput {
  * the time this is due the inline attempt has either finished, in which case the
  * row is `done` and no longer selected, or written a schedule of its own.
  *
+ * `onlyIf` is for a caller that chose the session from a scan rather than
+ * from a request -- the retention pass in sessions/retention.ts. It is asked
+ * after the session row is locked, inside the same transaction, so what it
+ * checks of that row cannot change between its answer and the commit: a run of
+ * the session cannot start and it cannot be unarchived, both of which write
+ * that row. Rows of other sessions it reads (a team member's) it locks itself. When it
+ * answers false nothing is written and this returns false.
+ *
+ * @returns true when the deletion committed, false when `onlyIf` declined it.
  * @throws {TeardownRefused} when the transaction did not commit, in which case
  *         the session and every row it has are exactly as they were.
  */
-export async function commitSessionDeletion(sessionId: string): Promise<void> {
+export async function commitSessionDeletion(
+  sessionId: string,
+  opts: { onlyIf?: (query: Querier) => Promise<boolean> } = {},
+): Promise<boolean> {
   let queueExits: Array<{
     prior_status: string;
     origin: string | null;
@@ -579,6 +591,13 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
   }>;
   try {
     queueExits = await inTransaction(async (query: Querier) => {
+      // Before anything is written, so that what it checks -- the queue among
+      // it -- is still there to be seen. Under the session lock, taken here
+      // first for that reason; the lock taken again below is then a no-op.
+      if (opts.onlyIf) {
+        await query("SELECT 1 FROM claw_sessions WHERE session_id = $1 FOR UPDATE", [sessionId]);
+        if (!(await opts.onlyIf(query))) throw DECLINED;
+      }
       await query("DELETE FROM claw_pending_messages WHERE session_id = $1", [sessionId]);
       // The prior state, locked before the transition writes over it. The
       // doorbell queue-exit metric below is taken from what these rows were,
@@ -663,6 +682,7 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
       return cancelled.rows as typeof queueExits;
     });
   } catch (err) {
+    if (err === DECLINED) return false;
     throw new TeardownRefused(
       `session ${sessionId} was not confirmed deleted: the transaction that hides it `
       + `and drops its rows did not commit (${errorText(err)}). Retry the delete -- `
@@ -675,7 +695,11 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
       metrics.observeQueueExit("chat", row.queued_since, "cancelled");
     }
   }
+  return true;
 }
+
+/** Thrown inside the transaction to roll it back when `onlyIf` declines. */
+const DECLINED = Symbol("session deletion declined by its precondition");
 
 /** The tables whose rows a deleted session hides behind `deleted_at`. */
 const CONTENT_TABLES = [

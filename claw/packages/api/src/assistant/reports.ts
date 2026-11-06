@@ -14,12 +14,12 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import pino from "pino";
-import { inTransaction, type Querier } from "../infra/db.js";
+import { inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import { queueServerMessage, drainSessionIfIdle } from "./messages.js";
 import { formatWorkEvent } from "./prompts.js";
 import {
-  applyWorkerReport, type BoardState, type ReportSource, type WorkReport,
+  applyWorkerReport, type BoardState, type ReportKind, type ReportSource, type WorkReport,
 } from "./work-items.js";
 
 const logger = pino({ name: "assistant-reports" });
@@ -63,6 +63,34 @@ async function repeatsLastReport(query: Querier, run: ReportRun, report: WorkRep
     && isDeepStrictEqual(last.result ?? null, report.result ?? null);
 }
 
+/**
+ * Queue the message that tells the item's owner's assistant what happened, in the caller's transaction, deduplicated on the event it is
+ * about. Null when there is no assistant to tell or the message could not be queued: what happened stands, and the sweep tells the user
+ * an item that needs them even if the Router cannot be woken.
+ */
+export async function queueRouterWake(q: StatementRunner, e: {
+  itemId: string; userId: string; eventId: number; kind: ReportKind; version: number; summary: string; question: string | null;
+}): Promise<{ sessionId: string; userId: string } | null> {
+  const target = (await q.query(
+    `SELECT w.seq, a.session_id AS router_session_id
+       FROM claw_work_items w LEFT JOIN claw_assistants a ON a.user_id = w.user_id
+      WHERE w.item_id = $1`,
+    [e.itemId],
+  )).rows[0] as { seq: number; router_session_id: string | null } | undefined;
+  if (!target?.router_session_id) return null;
+  const queued = await queueServerMessage(q, {
+    sessionId: target.router_session_id,
+    userId: e.userId,
+    content: formatWorkEvent({
+      itemId: e.itemId, seq: Number(target.seq), kind: e.kind, version: e.version, summary: e.summary, question: e.question,
+    }),
+    dedupeKey: `wi-evt:${e.eventId}`,
+  });
+  if (queued.ok) return { sessionId: target.router_session_id, userId: e.userId };
+  logger.warn({ itemId: e.itemId, error: queued.error }, "assistant.wake_not_queued");
+  return null;
+}
+
 export async function ingestReport(
   run: ReportRun, report: WorkReport, source: ReportSource,
   /** Runs first inside the transaction; throwing aborts the report. The worker's tool asks whether its turn is live. */
@@ -84,29 +112,12 @@ export async function ingestReport(
         source, runId: run.runId, report: recorded,
       });
       if (!applied.applied) return { outcome: { status: "stale" }, wake: null };
-      let wake: Written["wake"] = null;
-      if (applied.wake) {
-        const target = (await query(
-          `SELECT w.seq, w.item_id, a.session_id AS router_session_id
-             FROM claw_work_items w LEFT JOIN claw_assistants a ON a.user_id = w.user_id
-            WHERE w.item_id = $1`,
-          [run.itemId],
-        )).rows[0] as { seq: number; item_id: string; router_session_id: string | null } | undefined;
-        if (target?.router_session_id) {
-          const queued = await queueServerMessage(q, {
-            sessionId: target.router_session_id,
-            userId: applied.userId,
-            content: formatWorkEvent({
-              itemId: target.item_id, seq: Number(target.seq), kind: recorded.kind, version: applied.resultVersion,
-              summary: recorded.summary, question: recorded.question ?? null,
-            }),
-            dedupeKey: `wi-evt:${applied.eventId}`,
-          });
-          if (queued.ok) wake = { sessionId: target.router_session_id, userId: applied.userId };
-          // The report stands; the sweep tells the user an item that needs them even if the Router cannot be woken.
-          else logger.warn({ itemId: run.itemId, error: queued.error }, "assistant.wake_not_queued");
-        }
-      }
+      const wake = applied.wake
+        ? await queueRouterWake(q, {
+          itemId: run.itemId, userId: applied.userId, eventId: applied.eventId, kind: recorded.kind,
+          version: applied.resultVersion, summary: recorded.summary, question: recorded.question ?? null,
+        })
+        : null;
       return { outcome: { status: "applied", boardState: applied.boardState, wokeRouter: wake !== null }, wake };
     });
   } catch (err) {

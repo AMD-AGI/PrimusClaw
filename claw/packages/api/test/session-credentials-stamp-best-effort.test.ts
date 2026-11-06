@@ -49,6 +49,8 @@ let originalConnect: typeof db.pool.connect;
 let pristinePorts: Record<string, unknown>;
 
 before(async () => {
+  process.env.USER_ENV_ENCRYPTION_KEY ??= Buffer.alloc(32, 7).toString("base64");
+  (await import("../src/crypto/user-env.js")).initUserEnvCrypto();
   h = await startHarness();
   originalQuery = db.query;
   pristinePorts = { ...sessionDispatchPorts };
@@ -200,7 +202,7 @@ test("the failed stamp is reported, and reports no credential", async () => {
   // all. Any per-statement failure would do for the branch; only this one can
   // show what logging the raw error would have leaked.
   await h.sql(`ALTER TABLE claw_sessions ADD CONSTRAINT reject_credentials
-    CHECK (config->>'platform_key' IS DISTINCT FROM '${PLATFORM_KEY}')`);
+    CHECK (NOT config ? 'sealed_credentials')`);
   const app = await appWithRoutes();
   let status = 0;
   try {

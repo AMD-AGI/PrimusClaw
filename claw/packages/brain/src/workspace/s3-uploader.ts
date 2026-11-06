@@ -30,6 +30,7 @@ import {
   type GitLimits,
   type GitReport,
 } from "./git-dirs.js";
+import { DELIVERY_DIR } from "@claw/protocol";
 import pino from "pino";
 
 const logger = pino({ name: "s3-uploader" });
@@ -343,12 +344,13 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
  * tag or by an unrelated prefix, and the upload sweeper only touches
  * `.uploads/`.
  *
- * Four things are deliberately never deleted here:
+ * Five things are deliberately never deleted here:
  *
  *   - `.uploads/`, which has its own expiry.
  *   - `.zip-cache/`, likewise.
  *   - `.transcripts/`, which Brain writes to and no sandbox ever has, so every
  *     prune sees the whole directory as stale.
+ *   - `.deliveries/`, likewise: the copies `deliver_file` gave the user.
  *   - `claw-<timestamp>/` archive directories, which are the point-in-time
  *     copies of past runs. They are supposed to outlive the current workspace.
  *
@@ -497,6 +499,7 @@ export function isPruneExempt(rel: string): boolean {
   return rel.startsWith(".uploads/")
     || rel.startsWith(".zip-cache/")
     || rel.startsWith(TRANSCRIPT_PREFIX)
+    || rel.startsWith(`${DELIVERY_DIR}/`)
     || isArchiveRelPath(rel);
 }
 
@@ -901,11 +904,12 @@ function isArchiveRelPath(rel: string): boolean {
  * run. Transcripts already sitting in the flat location are deliberately not
  * named here, and the prune no longer spares them either: shape cannot tell one
  * from a `results.jsonl` a user's own run wrote, so neither filter guesses and
- * both leave them as the workspace files they became. `.skills/` is intentionally
+ * both leave them as the workspace files they became. `.deliveries/` is the
+ * same as `.transcripts/`: written by Brain, never the sandbox's. `.skills/` is intentionally
  * NOT in this list; per-session skill state is restored from S3.
  */
 function isInternalRelPath(rel: string): boolean {
-  return rel === ".hands-binary" || rel.startsWith(TRANSCRIPT_PREFIX);
+  return rel === ".hands-binary" || rel.startsWith(TRANSCRIPT_PREFIX) || rel.startsWith(`${DELIVERY_DIR}/`);
 }
 
 /**
@@ -1037,6 +1041,58 @@ export async function syncWorkspaceFromS3(
   );
   await putBackGitDirs();
   return downloaded;
+}
+
+/**
+ * Put the user's uploads into a sandbox that was not restored from S3.
+ *
+ * A file uploaded while the session's sandbox is up reaches S3 only, and the
+ * restore above runs only into a new sandbox, so a turn that reuses the sandbox
+ * would be told about a file /workspace/.uploads/ does not have. Every object
+ * under `.uploads/` is offered with its size, and Hands fetches only the ones it
+ * does not already hold at that size, so a sandbox that has them all costs one
+ * listing. Returns how many objects were offered; failures are logged, not
+ * thrown: a missing upload is the agent's to report, not a reason to fail a turn.
+ */
+export async function syncUploadsFromS3(
+  hands: HandsClient,
+  sessionId: string,
+  userId: string,
+): Promise<number> {
+  const s3Prefix = `users/${userId}/sessions/${sessionId}/`;
+  const s3 = getS3Client();
+  const files: Array<{ local_path: string; presigned_url: string; size: number }> = [];
+  let continuationToken: string | undefined;
+  do {
+    const resp = await s3.send(new ListObjectsV2Command({
+      Bucket: S3_BUCKET, Prefix: `${s3Prefix}.uploads/`, ContinuationToken: continuationToken,
+    }));
+    for (const obj of resp.Contents || []) {
+      if (!obj.Key) continue;
+      files.push({
+        local_path: `/workspace/${obj.Key.slice(s3Prefix.length)}`,
+        presigned_url: await presignGet(obj.Key),
+        size: obj.Size ?? 0,
+      });
+    }
+    continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (continuationToken);
+  if (!files.length) return 0;
+  const raw = await hands.callTool("download_from_s3", { files });
+  let failed: DownloadBatchResult["failed"] | null = null;
+  try {
+    const parsed = JSON.parse(raw) as DownloadBatchResult;
+    if (Array.isArray(parsed.failed)) failed = parsed.failed;
+  } catch { /* reported below */ }
+  if (failed === null) {
+    logger.warn({ sessionId, offered: files.length }, "s3.uploads_sync.unparseable");
+  } else if (failed.length) {
+    logger.warn({ sessionId, offered: files.length, failed: failed.length, sample: failed.slice(0, 3) },
+      "s3.uploads_sync.failed");
+  } else {
+    logger.info({ sessionId, offered: files.length }, "s3.uploads_synced");
+  }
+  return files.length;
 }
 
 // ===== Recovery: copy a checkpoint prefix back to the session prefix =====

@@ -145,6 +145,7 @@ test("the schema, the routes and the session tools are wired behind the flag, an
   assert.match(read("packages/api/src/index.ts"), /githubReviewConfigErrors\(settings, identityClient\(\) !== null, identityTokenSettings\(\)\.ownKeyClientIds\)/);
   assert.match(read("packages/api/src/github-review/mcp.ts"), /if \(!\(opts\.enabled \?\? CLAW_GITHUB_REVIEW_ENABLED\)\) return;/);
   assert.match(read("packages/api/src/github-review/session-tools.ts"), /if \(!CLAW_GITHUB_REVIEW_ENABLED\) return \{\};/);
-  assert.match(read("packages/api/src/routes/sessions.ts"), /config\.acting_as is not enabled on this deployment/);
+  assert.match(read("packages/api/src/github-review/acting-session.ts"), /config\.acting_as is not enabled on this deployment/);
+  assert.match(read("packages/api/src/routes/sessions.ts"), /checkSessionCreate\(/);
   assert.match(read("packages/api/src/sessions/app-mcp.ts"), /githubReviewMcpServers\(sessionId\)/);
 });

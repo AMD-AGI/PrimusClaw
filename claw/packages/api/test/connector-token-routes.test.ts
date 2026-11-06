@@ -31,6 +31,7 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 /** Which module exports each `register*Routes` that `index.ts` calls on the app. */
 const REGISTRARS: Record<string, string> = {
   registerSessionRoutes: "routes/sessions.js",
+  registerSessionDeliveryRoutes: "routes/session-deliveries.js",
   registerEventRoutes: "routes/events.js",
   registerAnthropicManagedAgentsRoutes: "routes/anthropic-managed-agents.js",
   registerAdminRoutes: "routes/admin.js",
@@ -42,9 +43,11 @@ const REGISTRARS: Record<string, string> = {
   registerNotificationSubscriptionRoutes: "routes/notification-subscriptions.js",
   registerRemoteAgentRoutes: "routes/remote-agents.js",
   registerAssistantRoutes: "routes/assistant.js",
+  registerAssistantGithubEventRoutes: "routes/assistant-github-events.js",
   registerAssistantMcpRoutes: "assistant/mcp.js",
   registerTriggerMcpRoutes: "triggers/mcp.js",
   registerGithubReviewRoutes: "github-review/mcp.js",
+  registerGithubMcpRoutes: "github-mcp/mcp.js",
   registerAnswerFeedbackRoutes: "routes/answer-feedback.js",
   registerImageRoutes: "routes/images.js",
   registerSystemEnvVarRoutes: "routes/system-env-vars.js",
@@ -55,6 +58,7 @@ const REGISTRARS: Record<string, string> = {
   registerInternalRunRoutes: "routes/internal-runs.js",
   registerInternalAppRoutes: "routes/internal-apps.js",
   registerInternalWorkspaceRoutes: "routes/internal-workspaces.js",
+  registerInternalMemoryRoutes: "routes/internal-memory.js",
   registerTaskDagRoutes: "routes/task-dags.js",
   registerTaskRoutes: "routes/tasks.js",
   registerRunRoutes: "runs/routes.js",

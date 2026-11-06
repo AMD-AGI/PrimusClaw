@@ -25,6 +25,8 @@ const user: UserInfo = {
 };
 
 before(async () => {
+  process.env.USER_ENV_ENCRYPTION_KEY ??= Buffer.alloc(32, 7).toString("base64");
+  (await import("../src/crypto/user-env.js")).initUserEnvCrypto();
   h = await startHarness();
   // `claw_sessions.config` is declared by the scenario harness DDL (it matches
   // initDb's base CREATE TABLE); this suite only writes to it.
@@ -55,6 +57,14 @@ function input(caller: UserInfo | null): DispatchInput {
 async function config(): Promise<Record<string, unknown> | null> {
   const [row] = await h.sql("SELECT config FROM claw_sessions WHERE session_id = 'session-1'");
   return row.config as Record<string, unknown> | null;
+}
+
+/** The config with the sealed keys opened: what a reader sees, and that nothing else holds them. */
+async function stamped(): Promise<{ rest: Record<string, unknown>; keys: { platformKey: string; llmApiKey: string } }> {
+  const cfg = (await config()) ?? {};
+  const { sealed_credentials: sealed, ...rest } = cfg;
+  assert.equal(typeof sealed, "string", "the keys are sealed");
+  return { rest, keys: readTrustedSessionCredentials(cfg) };
 }
 
 function dispatchPorts(doorbell: boolean, expectedKey: string): string[] {
@@ -115,9 +125,10 @@ for (const doorbell of [false, true]) {
 
     assert.equal(result.kind, "dispatched");
     assert.deepEqual(steps, ["stamp", "event", "open", "publish"]);
-    assert.deepEqual(await config(), {
-      model: "test-model", resources: { cpu: 2 }, platform_key: user.platformKey,
-      llm_api_key: user.virtualKey, _server_managed_credentials: true,
+    // The caller's own `platform_key` is removed with the plain fields: only the sealed keys remain.
+    assert.deepEqual(await stamped(), {
+      rest: { model: "test-model", resources: { cpu: 2 }, _server_managed_credentials: true },
+      keys: { platformKey: user.platformKey, llmApiKey: user.virtualKey },
     });
   });
 
@@ -130,14 +141,15 @@ for (const doorbell of [false, true]) {
     const result = await dispatchTaskToBrain(input(rotated), async () => assert.fail("unexpected rollback"));
 
     assert.equal(result.kind, "dispatched");
-    assert.deepEqual(await config(), {
-      platform_key: rotated.platformKey, llm_api_key: null, _server_managed_credentials: true,
+    assert.deepEqual(await stamped(), {
+      rest: { _server_managed_credentials: true },
+      keys: { platformKey: rotated.platformKey, llmApiKey: "" },
     });
   });
 
   test(`${path} chat dispatches the turn when the credential write fails`, async () => {
     await h.sql(`ALTER TABLE claw_sessions ADD CONSTRAINT reject_credentials
-      CHECK (config->>'platform_key' IS DISTINCT FROM 'platform-first')`);
+      CHECK (NOT config ? 'sealed_credentials')`);
     // The stamp is the only thing that fails, and the turn is published anyway:
     // `task.platform_key` is what the run is created with, so the workload is
     // still owned by its submitter. The expected key is therefore the empty one

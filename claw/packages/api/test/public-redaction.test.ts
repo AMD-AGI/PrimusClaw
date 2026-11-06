@@ -105,3 +105,36 @@ test("publicTaskRow masks the sealed credentials blob on a doorbell spec", () =>
   assert.equal(encoded.includes("hello"), true);
   assert.equal((safe.input as { credentials: string }).credentials, "[REDACTED]");
 });
+
+test("redactPublicJson shows which API key a held call names, and hides the key itself", () => {
+  // The permissionRequest for apikey_delete carried input {"apikey_id": 192};
+  // the approval card showed it as "[REDACTED]".
+  const safe = redactPublicJson({
+    type: "permissionRequest",
+    tool: "mcp__safe__apikey_delete",
+    input: { apikey_id: 192, apikey_name: "claw5-gate-allow", key_prefix: "ak-1a2b" },
+    result: { apikey: "plain-key-value-no-shape", api_key: "another-plain-value" },
+  }) as { input: Record<string, unknown>; result: Record<string, unknown> };
+  assert.deepEqual(safe.input, { apikey_id: 192, apikey_name: "claw5-gate-allow", key_prefix: "ak-1a2b" });
+  assert.equal(safe.result.apikey, "[REDACTED]");
+  assert.equal(safe.result.api_key, "[REDACTED]");
+});
+
+test("redactPublicJson masks a Vault secret_id and a map of passwords keyed by name", () => {
+  const uuid = "6a1c2f3e-0b4d-4e5f-8a9b-0c1d2e3f4a5b";
+  const safe = redactPublicJson({
+    type: "permissionRequest",
+    input: {
+      secret_id: uuid,
+      SecretID: uuid,
+      VAULT_SECRET_ID: uuid,
+      passwords_by_name: { prod: "XkjQmzPl" },
+      secrets_by_id: { "7": "XkjQmzPl" },
+      apikey_id: ["XkjQmzPl"],
+    },
+  }) as { input: Record<string, unknown> };
+  const encoded = JSON.stringify(safe);
+  assert.ok(!encoded.includes(uuid), encoded);
+  assert.ok(!encoded.includes("XkjQmzPl"), encoded);
+  for (const key of Object.keys(safe.input)) assert.equal(safe.input[key], "[REDACTED]", key);
+});

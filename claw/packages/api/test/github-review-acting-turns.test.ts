@@ -18,7 +18,8 @@
  *   A5  the Anthropic-compatible events route
  *   A6  a task, a batch and a retry (and a hosted application run, which is a task with a mode)
  *   A7  a session whose `acting_as` is not a well-formed id is not offered the tools, is not gated and keeps its sandbox's keys: one reading decides all three
- *   A8  every place in the source that can start a turn is either gated or on a list with the reason it needs no gate
+ *   A8  every place in the source that can start a turn is either gated or on a list with the reason it needs no gate; the server's own
+ *       queued message (`queueServerMessage`) is one, gated by the proof only the create's credential check makes
  */
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
@@ -116,7 +117,7 @@ const send = async (user: Caller, method: string | null, req: { method: "POST" |
 };
 
 /** A session as the create route makes it, so that the row is what the create route writes: acting as `actingAs` when one is given. */
-const session = async (actingAs: string | null = "u-bob"): Promise<string> => {
+const session = async (actingAs: string | null = "u-alice"): Promise<string> => {
   const r = await send(ALICE, "identity_token", { method: "POST", url: "/v1/sessions", payload: { name: "review", config: actingAs === null ? { notify_on_finish: true } : { acting_as: actingAs } } });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   return r.body.data.session_id as string;
@@ -311,7 +312,7 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   const PRIMITIVES = [
     /\bdispatchTaskToBrain\b/, /\bdispatchPendingMessage\b/, /INSERT INTO claw_pending_messages/, /\bexpandDag\b/, /\bcreateSingleTask\b/, /\bretryTask\b/,
     /\badmitAppRun\b/, /\bopenChatRun\b/, /\bhandOffAssembledRun\b/, /publish\(`decision\./, /\bapplySessionGateTransition\b/,
-    /\bsubmitSessionMessage\b/,
+    /\bsubmitSessionMessage\b/, /\bqueueServerMessage\(/,
   ];
   /** Files that ask `actingTurnRefusal` (or `actingTurnRefusalFor`), and in how many places. */
   const GATED: Record<string, number> = {
@@ -333,7 +334,14 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
     "tasks/lifecycle.ts": "retryTask, which routes/tasks.ts (gated) calls",
     "tasks/app-run.ts": "admitAppRun, reached through routes/app-run-create.ts from routes/tasks.ts (gated)",
     "routes/app-run-create.ts": "called by routes/tasks.ts after its gate",
-    "triggers/fire.ts": "a trigger starts a NEW session of its owner, which has no acting_as",
+    "triggers/fire.ts": "a trigger starts a NEW session of its owner, which has no acting_as, or fires into an item through queueServerMessage, which refuses an acting session without the proof (below)",
+    "assistant/messages.ts": "queueServerMessage: refuses a session with config.acting_as unless it is handed the attended proof (below)",
+    "assistant/tools.ts": "work_create makes sessions without acting_as; work_send into a review item's session is refused by queueServerMessage, which it gives no proof",
+    "assistant/reports.ts": "wakes the user's router session, which never carries acting_as",
+    "assistant/github-events.ts": "hands GitHub events to a task item's worker through queueServerMessage, which it gives no proof, so an acting session is refused; a review item cannot subscribe and its stored events are dropped before that",
+    "assistant/observe.ts": "queues a place's message on the caller's own watcher session, made without acting_as; queueServerMessage, given no proof, refuses one that carries it",
+    "assistant/review-items.ts": "queues a review session's first message with the proof that routes/assistant.ts's request passed checkSessionCreate (below)",
+    "assistant/model-fallback.ts": "runs a refused turn again: a worker's or the router's through queueServerMessage, which refuses an acting session without the proof, and a review's first message through review-items.ts with proofForFirstMessageAgain (below)",
     "routes/a2a.ts": "A2A sessions are made by A2A for its caller (a2a_caller_id) and never carry config.acting_as",
     "routes/a2a-v2.ts": "the same sessions: the decision it forwards answers a turn of one of them",
     "infra/metrics.ts": "the name of a metric label, not a call",
@@ -358,7 +366,27 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   }
   const sessions = stripComments(readFileSync(join(src, "routes/sessions.ts"), "utf8"));
   assert.equal((sessions.match(/sandboxOnly: true/g) ?? []).length, 1, "exactly one dispatch of the sessions route is the sandbox start");
-  assert.equal((sessions.match(/classifyAttendedCaller\(/g) ?? []).length, 1, "and the create asks the classifier");
+  assert.equal((sessions.match(/\bcheckSessionCreate\(/g) ?? []).length, 1, "and the create asks the one check every create of an acting session goes through");
+  const actingSession = stripComments(readFileSync(join(src, "github-review/acting-session.ts"), "utf8"));
+  assert.equal((actingSession.match(/classifyAttendedCaller\(/g) ?? []).length, 1, "which asks the classifier");
+  // The proof that lets the server queue a turn into an acting session: made in one place, after the classifier said yes; asked for by
+  // queueServerMessage; handed in by the review items alone, which have it from that check.
+  const proofMade = [...found.keys(), "github-review/acting-session.ts"].filter((f) => /as AttendedProof\b/.test(stripComments(readFileSync(join(src, f), "utf8"))));
+  assert.deepEqual(proofMade, ["github-review/acting-session.ts"], "the attended proof is made in acting-session.ts and nowhere else");
+  assert.match(actingSession, /if \(!caller\.ok\) return[\s\S]*?attended = \{ via: caller\.via \} as AttendedProof;/, "and only after the classifier said yes");
+  // The one other proof: the same first message queued again, once its first turn was refused before its model ran, made only when the
+  // database shows that session ran that one turn, it failed and its words are the same; asked for by the review items alone.
+  assert.equal((actingSession.match(/as AttendedProof\b/g) ?? []).length, 2, "two places make a proof: the create's check and the first message's re-run");
+  assert.match(actingSession, /Number\(row\.turns\) !== 1[\s\S]*?row\.status !== "failed" \|\| row\.words !== content\) return null;\s*return \{ via: null \} as AttendedProof;/,
+    "the re-run's proof only for a session whose one turn failed with the same words");
+  const rerunProof = [...found.keys()].filter((f) => /\bproofForFirstMessageAgain\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
+  assert.deepEqual(rerunProof, ["assistant/review-items.ts"], "only the review items ask for the re-run's proof");
+  const messages = stripComments(readFileSync(join(src, "assistant/messages.ts"), "utf8"));
+  assert.match(messages, /if \(actingUserOf\(session\.config\) !== null && !m\.attended\) return \{ ok: false, error: "acting_session_unattended" \};/, "queueServerMessage refuses an acting session without the proof");
+  const handsProof = [...found.keys()].filter((f) => /\battended: \w+\.attended\b/.test(stripComments(readFileSync(join(src, f), "utf8"))));
+  assert.deepEqual(handsProof, ["assistant/review-items.ts"], "only the review items hand queueServerMessage the proof");
+  const reviewItems = stripComments(readFileSync(join(src, "assistant/review-items.ts"), "utf8"));
+  assert.equal((reviewItems.match(/\bcheckSessionCreate\(/g) ?? []).length, 1, "and they have it from the same check as the create route");
   // The message route is the one caller that holds a request, and it passes the gate in: a message accepted without it is open to the sandbox's key.
   assert.equal((sessions.match(/\bsubmitSessionMessage\(\{[\s\S]*?\n    \}\);/g) ?? []).filter((call) => /\brefuse: \(tx\) => actingTurnRefusalFor\(req, sessionId, tx\)/.test(call)).length, 1, "the message route passes its gate to submitSessionMessage");
   // The three routes of routes/tasks.ts that start work say so; the ones that read or stop do not.

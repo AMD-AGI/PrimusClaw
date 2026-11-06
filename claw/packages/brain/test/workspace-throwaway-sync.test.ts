@@ -99,7 +99,6 @@ let tickCheckpoint = false;
 const RESULT: ExecuteResult = {
   finalText: "done",
   turns: 1,
-  pendingMemories: [],
   pendingSkills: [],
   skillsUsed: {},
   errorCount: 0,

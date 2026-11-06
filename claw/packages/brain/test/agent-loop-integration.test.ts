@@ -144,9 +144,13 @@ test("routes a tool call, feeds the result back, and stops on end_turn", async (
   // `by_tool` counts the attempt; `by_tool_ok` counts the result coming back
   // without an error, which is the only one of the two that says the work
   // happened.
-  assert.deepEqual(result.toolStats, {
+  // The two time maps say when the good call returned; a tool with no good call has no entry.
+  const { first_ok_ms, last_ok_ms, ...counts } = result.toolStats;
+  assert.deepEqual(counts, {
     total_calls: 1, error_calls: 0, by_tool: { read: 1 }, by_tool_ok: { read: 1 },
   });
+  assert.deepEqual(Object.keys(first_ok_ms ?? {}), ["read"]);
+  assert.equal(first_ok_ms?.read, last_ok_ms?.read);
 
   assert.deepEqual(router.calls, [{ name: "read", input: { path: "/a.txt" } }]);
 

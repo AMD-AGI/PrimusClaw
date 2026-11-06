@@ -46,6 +46,9 @@ export async function startAdmissionCluster(
   process.env.RUN_DOORBELL_DISPATCH ??= "true";
   for (const [key, value] of Object.entries(env)) process.env[key] = value;
 
+  // As at boot (index.ts): before `initDb`, which seals session credentials.
+  (await import("../../src/crypto/user-env.js")).initUserEnvCrypto();
+
   let app: AdmissionModules | undefined;
   try {
     app = {

@@ -45,11 +45,16 @@ export async function readHandsTarget(
   try {
     const entry = await bucket.get(handsSessionKey(sessionId));
     if (!entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return null;
-    const info = JSON.parse(new TextDecoder().decode(entry.value)) as { status?: unknown; handsUrl?: unknown; token?: unknown };
+    const info = JSON.parse(new TextDecoder().decode(entry.value)) as {
+      status?: unknown; handsUrl?: unknown; token?: unknown; platformKey?: unknown;
+    };
     // Only a ready entry: a pending one is a sandbox on its way, not one to ask.
     if (info.status !== "ready") return null;
     if (typeof info.handsUrl !== "string" || !info.handsUrl || typeof info.token !== "string" || !info.token) return null;
-    return { url: info.handsUrl, token: info.token };
+    return {
+      url: info.handsUrl, token: info.token,
+      ...(typeof info.platformKey === "string" && info.platformKey ? { platformKey: info.platformKey } : {}),
+    };
   } catch {
     // An unreadable registry is not a sandbox that is there.
     return null;

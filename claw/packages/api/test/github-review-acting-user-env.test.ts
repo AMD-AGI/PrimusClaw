@@ -164,7 +164,7 @@ const session = async (actingAs: string | null): Promise<string> => {
 };
 
 /** Both kinds, so that every path is shown to be the mark's doing and not an empty vault's. */
-const KINDS: Array<[string, string | null, boolean]> = [["a session that acts as a user", "u-bob", true], ["an ordinary session", null, false]];
+const KINDS: Array<[string, string | null, boolean]> = [["a session that acts as a user", "u-alice", true], ["an ordinary session", null, false]];
 
 /** Whether any secret of the vault is anywhere in this: a wire message, a row, a request. Field names do not matter, values do. */
 const holdsVault = (thing: unknown): boolean => SECRETS.some((secret) => JSON.stringify(thing).includes(secret));
@@ -231,7 +231,8 @@ test("E2b a message the server queues on a session by itself is frozen without t
     await plantVault();
     const id = await session(actingAs);
     await h.sql("UPDATE claw_sessions SET config = config || $2::jsonb WHERE session_id = $1", [id, JSON.stringify({ platform_key: "pk", llm_api_key: "vk", _server_managed_credentials: true })]);
-    const queued = await queueServerMessage(db, { sessionId: id, userId: ALICE.userId, content: "a worker's first task" });
+    // A session that acts as a user takes a server's message only with the person's proof (`checkSessionCreate`); a review item has it.
+    const queued = await queueServerMessage(db, { sessionId: id, userId: ALICE.userId, content: "a worker's first task", attended: { via: null } as never });
     assert.equal(queued.ok, true, `${what}: ${JSON.stringify(queued)}`);
     const rows = await h.sql("SELECT * FROM claw_pending_messages WHERE session_id = $1", [id]);
     assert.equal(rows.length, 1, `${what}: queued`);
@@ -433,6 +434,8 @@ test("E9 every place in the source that reads the vault or puts it on a request 
     "tasks/dispatcher.ts": "a task of a DAG lifts it out of its input; none for a session that withholds its keys (E8)",
     "tasks/template-renderer.ts": "a template reads the task's input, which holds the vault of a run made before the session was marked; the render context leaves it out for a session that withholds its keys (E8b)",
     "tasks/run-spec.ts": "strips it from a run's stored spec, for every session",
+    "github-review/review-profile.ts": "only removes it: the fixed profile of a review asked of someone else takes it off every turn and task (github-review-requested-review.test.ts, P1)",
+    "assistant/github-events.ts": "pr_reply reads the owner's vault only to refuse an answer that would publish one of its values; nothing read is put on a request or a turn, and a review item (acting session) never has a subscription",
     "crypto/user-env.ts": "the vault's own reader and cipher",
     "routes/user-env-vars.ts": "the owner's routes to edit the vault, not a request to Brain",
     "infra/db.ts": "the column of the queued message and the table of the vault, as schema",

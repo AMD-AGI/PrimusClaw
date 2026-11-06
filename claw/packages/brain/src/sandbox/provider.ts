@@ -44,6 +44,9 @@ export interface SandboxCreateParams {
   /** kubernetes/BYOK: stable user identity (byok-<fp>) forwarded to the Router
    *  for ownership + audit. Unused by safe-workload. */
   userId?: string;
+  /** safe-workload: `false` creates the workload without the workspace's storage (SaFE's `useWorkspaceStorage`: no owner
+   *  directory, no workspace volumes). Absent: SaFE's default, which mounts both. Sent only when false. */
+  useWorkspaceStorage?: false;
 }
 
 /** Handle to a provisioned sandbox, provider-agnostic. */

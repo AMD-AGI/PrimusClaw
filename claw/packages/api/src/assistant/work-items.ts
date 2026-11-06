@@ -16,6 +16,9 @@
  * report is the caller's job, in the same transaction, from `wake`.
  */
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS } from "../config.js";
+import { closeConfirmationsForStop } from "../github-review/store.js";
+import { reviewAgentSettings } from "../github-review/review-profile.js";
+import { freezeRequesterView } from "./requester-view.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { ITEM_REF_HINT, parseItemRef, type ItemRefError } from "./item-ref.js";
 import { stopSessionRuns } from "../tasks/chat-run.js";
@@ -24,10 +27,14 @@ import { newWorkItemId } from "../tasks/ids.js";
 export const BOARD_STATES = ["in_progress", "needs_you", "done"] as const;
 export type BoardState = (typeof BOARD_STATES)[number];
 
-export const REPORT_KINDS = ["progress", "waiting", "ready", "blocked", "failed", "dropped"] as const;
+export const REPORT_KINDS = ["progress", "waiting", "ready", "answer", "blocked", "failed", "dropped"] as const;
 export type ReportKind = (typeof REPORT_KINDS)[number];
 
-export type Outcome = "accepted" | "dropped" | "stopped";
+export type Outcome = "accepted" | "answered" | "dropped" | "stopped";
+
+/** `task`: a worker that reports does it. `review`: a GitHub review on someone's behalf, whose state is read off what it did (`review-items.ts`). */
+export const ITEM_KINDS = ["task", "review"] as const;
+export type ItemKind = (typeof ITEM_KINDS)[number];
 
 export interface WorkReport {
   kind: ReportKind;
@@ -76,12 +83,16 @@ export function reportTransition(report: Pick<WorkReport, "kind" | "question">):
     case "waiting": return question ? { ...NEEDS_YOU, question } : QUIET;
     case "blocked": return { ...NEEDS_YOU, question };
     case "ready": return { ...NEEDS_YOU, newResult: true };
+    // A task that only found something out: the answer is the whole result, so the item closes and the router passes it on.
+    // There is no version to accept (`canAccept` is for a ready result only). It is a new thing for the user to hear, so the
+    // attention counter goes up: a router that does not say it leaves it to the silent sweep (`silent-sweep.ts`).
+    case "answer": return { ...QUIET, boardState: "done", wake: true, needsAttention: true, outcome: "answered" };
     case "failed": return NEEDS_YOU;
     case "dropped": return { ...QUIET, boardState: "done", wake: true, outcome: "dropped" };
   }
 }
 
-export type ReportSource = "worker" | "turn_end" | "sweep";
+export type ReportSource = "worker" | "turn_end" | "sweep" | "watchdog";
 
 export interface ApplyReport {
   itemId: string;
@@ -162,7 +173,7 @@ export async function applyWorkerReport(q: StatementRunner, input: ApplyReport):
 // --- What the user sees ---------------------------------------------------------------
 
 const ITEM_COLUMNS = `item_id, seq, title, summary, board_state, last_report_kind, pending_question,
-  outcome, result_version, accepted_version, worker_session_id, created_at, updated_at, closed_at`;
+  outcome, result_version, accepted_version, worker_session_id, created_at, updated_at, closed_at, kind, params`;
 
 export interface WorkItemView {
   item_id: string;
@@ -176,6 +187,9 @@ export interface WorkItemView {
   result_version: number;
   accepted_version: number | null;
   can_accept: boolean;
+  kind: ItemKind;
+  /** What a review was asked with (`review-items.ts`); `{}` for a task. */
+  params: Record<string, unknown>;
   updated_at: Date;
 }
 
@@ -197,6 +211,8 @@ export function itemView(row: Record<string, unknown>): WorkItemView {
     result_version: Number(row.result_version),
     accepted_version: row.accepted_version == null ? null : Number(row.accepted_version),
     can_accept: canAccept(row as { board_state: string; last_report_kind: string | null }),
+    kind: row.kind === "review" ? "review" : "task",
+    params: row.params !== null && typeof row.params === "object" ? row.params as Record<string, unknown> : {},
     updated_at: row.updated_at as Date,
   };
 }
@@ -273,32 +289,50 @@ export async function recentEvents(itemId: string, limit = 20): Promise<Array<Re
 
 export type InsertWorkItemResult =
   | { ok: true; itemId: string; seq: number }
-  | { ok: false; error: "too_many_active_items" | "no_assistant" };
+  | { ok: false; error: "too_many_active_items" | "too_many_requested_reviews" | "too_many_from_requester" | "no_assistant" };
 
 /**
  * The item row and its `created` event. Must run inside the transaction that also
  * creates the worker session: the user's assistant row is locked first, so two
  * creates for one user take their numbers and meet the limit one after the other.
+ *
+ * Two kinds of open item are counted apart, under the same lock and in the same
+ * statement: the user's own (the per-user limit), and reviews others asked of the
+ * user (`requestedBy`, the user's review-agent limits: in all, and per requester).
+ * Neither can take the other's room, so what others ask never fills the user's board.
  */
 export async function insertWorkItem(
   q: StatementRunner,
-  input: { userId: string; title: string; workerSessionId: string; repo?: unknown },
+  input: {
+    userId: string; title: string; workerSessionId: string; repo?: unknown; kind?: ItemKind; params?: Record<string, unknown>;
+    /** Who asked for this review, when it is not the user's own. */
+    requestedBy?: string | null;
+  },
 ): Promise<InsertWorkItemResult> {
   const locked = await q.query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [input.userId]);
   if (!locked.rowCount) return { ok: false, error: "no_assistant" };
   const counts = (await q.query(
-    `SELECT COUNT(*) FILTER (WHERE board_state <> 'done')::int AS active, COALESCE(MAX(seq), 0)::int + 1 AS next
+    `SELECT COUNT(*) FILTER (WHERE board_state <> 'done' AND NOT (params ? 'requested_by'))::int AS active,
+            COUNT(*) FILTER (WHERE board_state <> 'done' AND params ? 'requested_by')::int AS others,
+            COUNT(*) FILTER (WHERE board_state <> 'done' AND params->>'requested_by' = $2)::int AS requester,
+            COALESCE(MAX(seq), 0)::int + 1 AS next
        FROM claw_work_items WHERE user_id = $1`,
-    [input.userId],
-  )).rows[0] as { active: number; next: number };
-  if (counts.active >= CLAW_ASSISTANT_MAX_ACTIVE_ITEMS) return { ok: false, error: "too_many_active_items" };
+    [input.userId, input.requestedBy ?? null],
+  )).rows[0] as { active: number; others: number; requester: number; next: number };
+  if (input.requestedBy) {
+    const limits = reviewAgentSettings(input.userId);
+    if (counts.others >= limits.othersMaxActive) return { ok: false, error: "too_many_requested_reviews" };
+    if (counts.requester >= limits.perRequesterMaxActive) return { ok: false, error: "too_many_from_requester" };
+  } else if (counts.active >= CLAW_ASSISTANT_MAX_ACTIVE_ITEMS) {
+    return { ok: false, error: "too_many_active_items" };
+  }
   const itemId = newWorkItemId();
   await q.query(
-    `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo)
-     VALUES ($1, $2, $3, $4, 'in_progress', $5, $6::jsonb)`,
+    `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo, kind, params)
+     VALUES ($1, $2, $3, $4, 'in_progress', $5, $6::jsonb, $7, $8::jsonb)`,
     [
       itemId, input.userId, counts.next, clipOneLine(input.title, TITLE_MAX), input.workerSessionId,
-      input.repo === undefined ? null : JSON.stringify(input.repo),
+      input.repo === undefined ? null : JSON.stringify(input.repo), input.kind ?? "task", JSON.stringify(input.params ?? {}),
     ],
   );
   await q.query(
@@ -313,7 +347,15 @@ export async function insertWorkItem(
 export type DecisionResult =
   | { status: "ok"; item: WorkItemView }
   | { status: "not_found" }
-  | { status: "conflict"; error: "version_mismatch" | "not_acceptable" | "item_closed"; item: WorkItemView };
+  | { status: "conflict"; error: "version_mismatch" | "not_acceptable" | "item_closed" | StopRefusal; item: WorkItemView };
+
+/** Why a review item cannot be stopped: its merge is being made, or was made. Saying so is the truth; nothing is undone. */
+export type StopRefusal = "merge_in_progress" | "already_merged";
+
+/** Thrown inside the stop's transaction, which it rolls back: nothing was stopped and no confirmation was denied. */
+class StopRefused extends Error {
+  constructor(readonly reason: StopRefusal) { super(reason); }
+}
 
 /**
  * Accept the result the user was shown. It succeeds only if that result is still
@@ -351,6 +393,11 @@ export async function acceptWorkItem(userId: string, itemId: string, version: nu
  * a crash between the two leaves an item that says stopped, never a worker that
  * was stopped for an item still on the board. Stopping an item that is already
  * stopped sends the interrupt again, which is how a stop that failed is retried.
+ *
+ * A review item's session may have a merge or an approval held for someone's
+ * answer. Interrupting the session leaves that card answerable for a day, so the
+ * held writes are denied in the same transaction (`closeConfirmationsForStop`);
+ * one that is already being made, or a merge that was made, refuses the stop.
  */
 export async function stopWorkItem(input: {
   userId: string;
@@ -360,8 +407,17 @@ export async function stopWorkItem(input: {
   /** Runs first inside the transaction; throwing stops nothing. The router's tool asks whether its turn is still live. */
   guard?: (query: Querier) => Promise<void>;
 }): Promise<DecisionResult> {
+  let refused: StopRefusal | null = null;
   const stopped = await inTransaction(async (query) => {
     await input.guard?.(query);
+    const open = (await query(
+      "SELECT kind, params, worker_session_id FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND board_state <> 'done' FOR UPDATE",
+      [input.itemId, input.userId],
+    )).rows[0] as { kind: string; params: { acting_as: string; pr: { owner: string; repo: string; number: number } }; worker_session_id: string } | undefined;
+    if (open?.kind === "review") {
+      const refusal = await closeConfirmationsForStop({ query }, open.worker_session_id, input.userId, { actorUserId: open.params.acting_as, pr: open.params.pr });
+      if (refusal) throw new StopRefused(refusal);
+    }
     const rows = (await query(
       `WITH upd AS (
          UPDATE claw_work_items
@@ -381,11 +437,18 @@ export async function stopWorkItem(input: {
     // A first message still waiting for the worker's session must not start a
     // turn on an item the user has already stopped.
     if (row) await query("DELETE FROM claw_pending_messages WHERE session_id = $1", [row.worker_session_id]);
+    // A review someone else asked for: what they may see of it is written as it closes.
+    if (row && open?.kind === "review") await freezeRequesterView({ query }, input.itemId);
     return row;
+  }).catch((err: unknown) => {
+    if (!(err instanceof StopRefused)) throw err;
+    refused = err.reason;
+    return undefined;
   });
   const current = stopped ?? await getWorkItem(input.userId, input.itemId);
   if (!current) return { status: "not_found" };
   const item = itemView(current);
+  if (refused) return { status: "conflict", error: refused, item };
   if (!stopped && current.outcome !== "stopped") return { status: "conflict", error: "item_closed", item };
   await stopSessionRuns(current.worker_session_id as string);
   return { status: "ok", item };
@@ -402,7 +465,8 @@ export async function stopWorkItem(input: {
  */
 export async function reopenWorkItem(
   q: StatementRunner,
-  input: { userId: string; itemId: string; text?: string },
+  /** `source` is who sent it back: the router forwarding the user's words, or a GitHub event on a pull request it watches. */
+  input: { userId: string; itemId: string; text?: string; source?: "router" | "github" },
 ): Promise<WorkItemView | null> {
   const rows = (await q.query(
     `WITH upd AS (
@@ -413,11 +477,11 @@ export async function reopenWorkItem(
     RETURNING ${ITEM_COLUMNS}, generation
      ), ev AS (
        INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
-       SELECT item_id, 'progress', 'router', generation, $3 FROM upd
+       SELECT item_id, 'progress', $4, generation, $3 FROM upd
     RETURNING id
      )
      SELECT upd.* FROM upd, ev`,
-    [input.itemId, input.userId, input.text ?? null],
+    [input.itemId, input.userId, input.text ?? null, input.source ?? "router"],
   )).rows as Array<Record<string, unknown>>;
   return rows[0] ? itemView(rows[0]) : null;
 }

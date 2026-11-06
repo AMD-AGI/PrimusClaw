@@ -416,21 +416,23 @@ workflow, fails if the workflow file stops having that shape, or if its environm
 
 1. Set the new version in `package.json` and `src/version.ts` (`scripts/check-pack.mjs` fails if they disagree) and merge that to `main`.
 2. Write the release notes from the PR descriptions, not from commit subjects: every change states in its PR what a user will now observe.
-   For the PRs that touched `connector/` since the previous release (`prev` is its tag, or for the first workflow release the commit 0.1.0 was
-   published from):
+   For the PRs that touched `connector/` since the previous release (`prev` is the newest `connector-v*` tag, the previous release's;
+   `next` is the version merged in step 1, read from `package.json` on `main`):
    ```sh
-   prev=connector-v0.1.0
    git fetch origin main --tags
+   prev=$(git tag --list 'connector-v*' --sort=-version:refname | head -n 1)
+   next=$(git show origin/main:connector/package.json | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')
+   [ "$prev" != "connector-v$next" ] || echo "connector-v$next is already released: step 1 is not merged yet" >&2
    for n in $(git log --first-parent --format=%s "$prev"..origin/main -- connector/ | grep -o '(#[0-9]*)$' | tr -d '(#)'); do
      gh pr view "$n" --repo AMD-AGI/PrimusClaw --json number,title,body --jq '"## #\(.number) \(.title)\n\n\(.body)\n"'
    done > notes.md
    ```
    Edit `notes.md` into the notes a user of the package wants to read.
 3. Publish the release on the merged commit (not as a pre-release):
-   `gh release create connector-v0.1.1 --target <sha-on-main> --title "claw-connector 0.1.1" --notes-file notes.md`
+   `gh release create "connector-v$next" --target <sha-on-main> --title "claw-connector $next" --notes-file notes.md`
 4. The `package` job runs and writes a summary: the commit, whether the release workflow at that commit equals the one on `main`, and the
    tarball's name, sha256 and files. A reviewer opens the run, checks that the tagged commit is the reviewed one on `main` and that the
    workflow file is `main`'s (if the summary says it is different, read the diff first), and approves `publish`. The job then attests the
    tarball, attaches it to the release and publishes it.
-5. Check it: `npm view @primusclaw/connector version`, and `gh attestation verify primusclaw-connector-0.1.1.tgz --repo AMD-AGI/PrimusClaw`
+5. Check it: `npm view @primusclaw/connector version`, and `gh attestation verify "primusclaw-connector-$next.tgz" --repo AMD-AGI/PrimusClaw`
    on the tarball attached to the release.

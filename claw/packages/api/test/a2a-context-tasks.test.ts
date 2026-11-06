@@ -226,6 +226,11 @@ describe("the A2A context/task model", { skip }, () => {
       const turns = payload.history.filter((m) => m.role !== "system").map((m) => `${m.role}:${m.content}`);
       assert.deepEqual(turns, ["user:what is a wavefront?", "assistant:64 lanes"]);
       assert.equal(payload.prompt, "and on RDNA?");
+      // What Brain sends the model is the history, then the prompt (brain/test/model-input-prompt-once.test.ts):
+      // the new message is in it once, and the earlier one is not lost to make room for it.
+      const modelInput = [...payload.history.map((m) => String(m.content)), payload.prompt];
+      assert.equal(modelInput.filter((t) => t.includes("and on RDNA?")).length, 1);
+      assert.equal(modelInput.filter((t) => t.includes("what is a wavefront?")).length, 1);
     });
   });
 

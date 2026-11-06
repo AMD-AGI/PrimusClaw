@@ -58,7 +58,7 @@ const state = (turn: number): CheckpointState => ({
 const finalResult = (turns: number): ExecuteResult => ({
   finalText: "done",
   tokenUsage: { input_tokens: 1, output_tokens: 2, cache_read: 0, cache_create: 0 },
-  turns, pendingMemories: [], pendingSkills: [], skillsUsed: {}, errorCount: 0,
+  turns, pendingSkills: [], skillsUsed: {}, errorCount: 0,
   toolStats: { total_calls: 0, error_calls: 0, by_tool: {} }, elapsedMs: 5,
 } as unknown as ExecuteResult);
 

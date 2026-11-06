@@ -27,7 +27,7 @@ export function redactPublicJson(value: unknown): unknown {
     // An absent value has nothing to leak, and replacing it would turn a null
     // a client tests for into a string. Matches brain's redactValue.
     const empty = child === null || child === undefined || child === "";
-    safe[key] = isSensitiveKey(key) && !empty ? "[REDACTED]" : redactPublicJson(child);
+    safe[key] = isSensitiveKey(key, child) && !empty ? "[REDACTED]" : redactPublicJson(child);
   }
   return safe;
 }

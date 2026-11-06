@@ -42,7 +42,7 @@ async function run(over: Record<string, unknown>) {
 test("T1 skill tools reach the model only with skill_evolution_enabled", async () => {
   const off = await run({});
   assert.ok(!off.tools.includes("save_skill"), "offered with self-evolution off");
-  assert.ok(off.tools.includes("save_memory"), "the tool list is the real one");
+  assert.ok(off.tools.includes("bash"), "the tool list is the real one");
   const on = await run({ skill_evolution_enabled: true });
   for (const name of ["save_skill", "add_skill_file", "update_skill_file", "remove_skill_file"]) {
     assert.ok(on.tools.includes(name), `${name} missing with self-evolution on`);

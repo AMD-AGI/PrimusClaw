@@ -25,13 +25,18 @@
 #   INSTALL_RUNTIMECLASS=false                # apply Kata RuntimeClass (kata-qemu)
 #   INGRESS_HOST=                             # existing public host, e.g. sandbox.example.com; unset skips the Ingress
 #   INGRESS_CLASS=higress                     # Ingress class for that host
+#   HIGRESS_NAMESPACE=higress-system          # namespace of the Higress gateway (INGRESS_CLASS=higress)
 #   INSTALL_DEFAULT_TEMPLATES=false           # apply CodeInterpreter examples
 #   TEMPLATES_VARIANT=default                 # default | kata (both use default-templates.yaml)
-#   SAFE_API_URL=                             # set to enable SaFE authentication (recommended)
+#   IDENTITY_INTROSPECT_URL=                  # set to enable /v1 authentication (recommended)
+#   SAFE_API_URL=                             # SaFE API URL for the grant identity check
 #   ALLOW_INSECURE_NO_AUTH=false              # true = install WITHOUT auth (dev clusters only)
 #   EGRESS_ENABLED=true                       # enable EnvD egress enforcement
 #   EGRESS_EXTRA_BLOCKED_CIDRS=               # comma-separated additional CIDRs
 #                                             # one of the two above MUST be provided
+#   CONTROLPLANE_INGRESS_CIDRS=               # comma-separated CIDRs the control plane also admits
+#                                             # (host-network gateways, node overlay addresses; see
+#                                             # controlplane.networkPolicy in values.yaml). Unset = pods only
 #   SANDBOX_EXTRA_CA_CONFIGMAP=               # ConfigMap of PEM CA certs mounted into every sandbox
 #   SANDBOX_EXTRA_CA_NAMESPACES=default       # comma-separated sandbox namespaces the ConfigMap must exist in
 #   SANDBOX_EXTRA_CA_REQUIRED=false           # true = the envd-injector image carries the CA (EXTRA_CA_CERT_URLS)
@@ -57,6 +62,7 @@ ENVD_KEY_SRC_NAMESPACE="${ENVD_KEY_SRC_NAMESPACE:-agent-sandbox-system}"
 INSTALL_RUNTIMECLASS="${INSTALL_RUNTIMECLASS:-false}"
 INGRESS_HOST="${INGRESS_HOST:-}"
 INGRESS_CLASS="${INGRESS_CLASS:-higress}"
+HIGRESS_NAMESPACE="${HIGRESS_NAMESPACE:-higress-system}"
 INSTALL_DEFAULT_TEMPLATES="${INSTALL_DEFAULT_TEMPLATES:-false}"
 TEMPLATES_VARIANT="${TEMPLATES_VARIANT:-default}"
 AUTO_INSTALL_HELM="${AUTO_INSTALL_HELM:-true}"
@@ -66,6 +72,7 @@ HELM_INSTALL_DIR="${HELM_INSTALL_DIR:-${HOME}/.local/bin}"
 DRY_RUN="${DRY_RUN:-false}"
 EGRESS_ENABLED="${EGRESS_ENABLED:-true}"
 EGRESS_EXTRA_BLOCKED_CIDRS="${EGRESS_EXTRA_BLOCKED_CIDRS:-}"
+CONTROLPLANE_INGRESS_CIDRS="${CONTROLPLANE_INGRESS_CIDRS:-}"
 SANDBOX_EXTRA_CA_CONFIGMAP="${SANDBOX_EXTRA_CA_CONFIGMAP:-}"
 SANDBOX_EXTRA_CA_NAMESPACES="${SANDBOX_EXTRA_CA_NAMESPACES:-default}"
 SANDBOX_EXTRA_CA_REQUIRED="${SANDBOX_EXTRA_CA_REQUIRED:-false}"
@@ -239,6 +246,53 @@ EOF
     fi
     rm -f "${manifest}"
     ok "router Ingress https://${INGRESS_HOST}/sandboxes"
+    if [[ "${INGRESS_CLASS}" == "higress" ]]; then
+        apply_router_idle_timeout
+    fi
+}
+
+# Raises the Higress stream idle timeout on the router Ingress routes to 1800 s,
+# so a create that waits on an image pull is not cut by the gateway default.
+apply_router_idle_timeout() {
+    dns_name_ok "${HIGRESS_NAMESPACE}" label \
+        || err "HIGRESS_NAMESPACE must be a DNS label, got ${HIGRESS_NAMESPACE}"
+    local manifest
+    manifest="$(mktemp /tmp/sandbox-idle-timeout.XXXXXX.yaml)"
+    cat >"${manifest}" <<EOF
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: agent-sandbox-public-idle-timeout
+  namespace: ${HIGRESS_NAMESPACE}
+  labels:
+    app: agent-sandbox
+spec:
+  workloadSelector:
+    labels:
+      app: higress-gateway
+      higress: ${HIGRESS_NAMESPACE}-higress-gateway
+  configPatches:
+  - applyTo: HTTP_ROUTE
+    match:
+      context: GATEWAY
+      routeConfiguration:
+        vhost:
+          route:
+            name: ${NAMESPACE}/agent-sandbox-public
+    patch:
+      operation: MERGE
+      value:
+        route:
+          idle_timeout: 1800s
+EOF
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "  [dry-run] kubectl apply -f ${manifest}"
+        cat "${manifest}"
+    else
+        kubectl apply -f "${manifest}"
+    fi
+    rm -f "${manifest}"
+    ok "router idle timeout 1800s (${HIGRESS_NAMESPACE}/agent-sandbox-public-idle-timeout)"
 }
 
 # ── Idempotency guard: skip when Sandbox is already installed ─────────────────
@@ -408,17 +462,28 @@ VALUES_FILE="$(mktemp /tmp/agent-sandbox-values.XXXXXX.json)"
 chmod 600 "${VALUES_FILE}"
 EGRESS_ENABLED_FOR_VALUES="${EGRESS_ENABLED}" \
 EGRESS_CIDRS_FOR_VALUES="${EGRESS_EXTRA_BLOCKED_CIDRS}" \
+INGRESS_CIDRS_FOR_VALUES="${CONTROLPLANE_INGRESS_CIDRS}" \
 python3 - "${VALUES_FILE}" <<'PY'
+import ipaddress
 import json
 import os
 import sys
 
 enabled = os.environ["EGRESS_ENABLED_FOR_VALUES"].lower() == "true"
 cidrs = ",".join(item.strip() for item in os.environ["EGRESS_CIDRS_FOR_VALUES"].split(",") if item.strip())
+values = {"egress": {"enabled": enabled, "extraBlockedCIDRs": cidrs}}
+ingress = [item.strip() for item in os.environ["INGRESS_CIDRS_FOR_VALUES"].split(",") if item.strip()]
+for item in ingress:
+    try:
+        ipaddress.ip_network(item, strict=True)
+    except ValueError as exc:
+        sys.exit(f"CONTROLPLANE_INGRESS_CIDRS: {item!r} is not a CIDR: {exc}")
+# Unset leaves the chart default (pods only). This installer does not reuse the
+# release's values, so a re-run must name them again.
+if ingress:
+    values["controlplane"] = {"networkPolicy": {"extraIngressCIDRs": ingress}}
 with open(sys.argv[1], "w", encoding="utf-8") as f:
-    json.dump({
-        "egress": {"enabled": enabled, "extraBlockedCIDRs": cidrs},
-    }, f)
+    json.dump(values, f)
 PY
 trap 'rm -f "${VALUES_FILE:-}"' EXIT
 
@@ -462,12 +527,17 @@ fi
 # acknowledged, and this installer will not pick a side on the operator's behalf.
 if [[ -n "${SAFE_API_URL:-}" ]]; then
     HELM_ARGS+=(
-        --set "router.config.enableAuth=true"
         --set "router.config.safeApiUrl=${SAFE_API_URL}"
-        --set "workloadmanager.config.enableAuth=true"
         --set "workloadmanager.config.safeApiUrl=${SAFE_API_URL}"
     )
-    ok "authentication ENABLED against ${SAFE_API_URL}"
+fi
+if [[ -n "${IDENTITY_INTROSPECT_URL:-}" ]]; then
+    HELM_ARGS+=(
+        --set "router.config.enableAuth=true"
+        --set "workloadmanager.config.enableAuth=true"
+        --set "controlplane.config.identity.introspectUrl=${IDENTITY_INTROSPECT_URL}"
+    )
+    ok "authentication ENABLED against ${IDENTITY_INTROSPECT_URL}"
 elif [[ "${ALLOW_INSECURE_NO_AUTH:-false}" == "true" ]]; then
     HELM_ARGS+=( --set "security.allowInsecureNoAuth=true" )
     warn "authentication DISABLED (ALLOW_INSECURE_NO_AUTH=true)."
@@ -476,7 +546,7 @@ elif [[ "${ALLOW_INSECURE_NO_AUTH:-false}" == "true" ]]; then
 else
     err "refusing to install without an explicit authentication choice.
     Either enable authentication:
-        SAFE_API_URL=https://<your-safe-api> $0
+        IDENTITY_INTROSPECT_URL=https://<identity>/oauth/introspect $0
     or acknowledge an unauthenticated development install:
         ALLOW_INSECURE_NO_AUTH=true $0
     See the 'Production hardening' section of sandbox/README.md."

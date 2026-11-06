@@ -92,4 +92,6 @@ export type FailureReason =
   | "claim_abandoned"
   /** Claimed chat run that promised a workspace binding and did not have one. */
   | "workspace_unbound"
+  /** A requested review with no model turn left (`github-review/review-profile.ts`): not run, since `max_turns` 0 is no limit to Brain. */
+  | "review_turn_budget_used"
   | string; // plugin-defined codes are also accepted

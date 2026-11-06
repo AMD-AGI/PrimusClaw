@@ -349,6 +349,14 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	return createdResponse(ref, token), http.StatusCreated, nil
 }
 
+// spentDetail is the 410 body of a spent key: the sandbox id, then the stored end reason.
+func spentDetail(ref runtimev1alpha1.GrantSandboxRef) string {
+	if ref.EndReason == "" {
+		return ref.ID
+	}
+	return ref.ID + ": " + ref.EndReason
+}
+
 // replayPoll is the first wait before a queued idempotency key is read again.
 // The wait doubles up to replayPollMax.
 var (
@@ -364,7 +372,7 @@ func (s *Service) replay(ctx context.Context, grantID string, ref runtimev1alpha
 		return SandboxResponse{}, 0, err
 	}
 	if ref.State == runtimev1alpha1.SandboxEnded {
-		return SandboxResponse{}, 0, grant.Op(http.StatusGone, "idempotency_key_spent", ref.ID)
+		return SandboxResponse{}, 0, grant.Op(http.StatusGone, "idempotency_key_spent", spentDetail(ref))
 	}
 	token, err := s.addAccessToken(ctx, grantID, ref.ID)
 	if err != nil {

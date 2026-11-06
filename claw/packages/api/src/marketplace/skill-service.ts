@@ -3,7 +3,7 @@
 
 import { db } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { scanMemoryContent } from "../memory/service.js";
+import { scanMemoryContent } from "../memory/gates.js";
 import {
   EVOLVE_EVIDENCE_GOOD_COUNT, EVOLVE_EVIDENCE_BAD_COUNT, MAX_SELECTED_SKILLS,
   CLAW_SKILL_EVOLUTION_ENABLED,

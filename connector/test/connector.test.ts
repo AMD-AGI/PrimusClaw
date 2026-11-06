@@ -914,17 +914,22 @@ describe("Cursor extension requests are never left unanswered", () => {
     await h.turnEnd(sid);
     assert.deepEqual(h.adapterLog().find((l) => l.planAnswer)!.planAnswer, { outcome: { outcome: "accepted" } });
   });
-  test("a rejected plan, and a plan nobody answers", async () => {
-    const h = await make({ timing: { permissionTtlMs: 300 } });
+  // No short time-to-live here: the harness's (60 s) outlasts every wait below (8 s each), so a slow runner can make this test time out, never turn the rejection into a timeout's cancel.
+  test("a rejected plan answers rejected", async () => {
+    const h = await make();
     const sid = await h.newSession();
     h.prompt(sid, "plan");
     const perm = await h.permission(sid);
     h.decide(sid, perm.data.actionId, "plan-reject");
     await h.turnEnd(sid);
     assert.equal(h.adapterLog().find((l) => l.planAnswer)!.planAnswer.outcome.outcome, "rejected");
+  });
+  test("a plan nobody answers is answered cancelled after the time-to-live", async () => {
+    const h = await make({ timing: { permissionTtlMs: 300 } });
+    const sid = await h.newSession();
     h.prompt(sid, "plan");
-    await h.turnEnd(sid, 2);
-    assert.deepEqual(h.adapterLog().filter((l) => l.planAnswer)[1]!.planAnswer, { outcome: { outcome: "cancelled" } });
+    await h.turnEnd(sid);
+    assert.deepEqual(h.adapterLog().find((l) => l.planAnswer)!.planAnswer, { outcome: { outcome: "cancelled" } });
   });
   test("a single-choice question is a card with the question's own option ids; a skip answers skipped", async () => {
     const h = await make();

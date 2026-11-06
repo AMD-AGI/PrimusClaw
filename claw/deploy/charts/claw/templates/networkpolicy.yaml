@@ -1,0 +1,156 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+{{- /* See networkPolicy in values.yaml. */}}
+{{- $np := .Values.networkPolicy }}
+{{- define "claw.netpol.dns" }}
+    - to:
+        {{- range .dnsIPs }}
+        - ipBlock:
+            cidr: {{ printf "%s/32" . | quote }}
+        {{- end }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+{{- end }}
+{{- define "claw.netpol.cidrs" }}
+{{- range .egressCIDRs }}
+    - to:
+        - ipBlock:
+            cidr: {{ required "networkPolicy egressCIDRs[].cidr is required" .cidr | quote }}
+      ports:
+        {{- range (required "networkPolicy egressCIDRs[].ports is required" .ports) }}
+        - {protocol: TCP, port: {{ . }}}
+        {{- end }}
+{{- end }}
+{{- end }}
+{{- define "claw.netpol.public" }}
+{{- if .ports }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- range .privateCIDRs }}
+              - {{ . | quote }}
+              {{- end }}
+      ports:
+        {{- range .ports }}
+        - {protocol: TCP, port: {{ . }}}
+        {{- end }}
+{{- end }}
+{{- end }}
+{{- if $np.enabled }}
+---
+# Nothing in or out unless one of the policies below allows it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: primus-claw
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+{{- if $np.ingressCIDRs }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-pod-network
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: primus-claw
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- range $np.ingressCIDRs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: primus-claw
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    # Own namespace: NATS, PostgreSQL, API <-> Brain.
+    - to:
+        - podSelector: {}
+    {{- if $np.egressNamespaces }}
+    - to:
+        {{- range $np.egressNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+    {{- end }}
+    {{- range $np.egressNamespacePorts }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ required "networkPolicy.egressNamespacePorts[].namespace is required" .namespace | quote }}
+      ports:
+        {{- range (required "networkPolicy.egressNamespacePorts[].ports is required" .ports) }}
+        - {protocol: TCP, port: {{ . }}}
+        {{- end }}
+    {{- end }}
+{{- include "claw.netpol.dns" $np }}
+{{- include "claw.netpol.cidrs" $np }}
+{{- include "claw.netpol.public" (dict "ports" $np.publicEgressPorts "privateCIDRs" $np.privateCIDRs) }}
+{{- end }}
+{{- $sb := $np.sandboxEgress }}
+{{- if $sb.enabled }}
+{{- if not $sb.namespaces }}
+{{- fail "networkPolicy.sandboxEgress.enabled needs networkPolicy.sandboxEgress.namespaces" }}
+{{- end }}
+{{- range $ns := $sb.namespaces }}
+---
+# Egress of Claw's sandboxes (Hands) in {{ $ns }}: DNS, the services they need,
+# the listed private destinations and the public internet. Cloud metadata, the
+# Kubernetes API and in-cluster databases are not reachable.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: claw-sandbox-egress
+  namespace: {{ $ns | quote }}
+  labels:
+    app: primus-claw
+spec:
+  podSelector:
+    matchLabels:
+      {{- toYaml $sb.podLabels | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+{{- include "claw.netpol.dns" $np }}
+    {{- range $sb.egressPods }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ required "networkPolicy.sandboxEgress.egressPods[].namespace is required" .namespace | quote }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .podLabels | nindent 14 }}
+      ports:
+        {{- range .ports }}
+        - {protocol: TCP, port: {{ . }}}
+        {{- end }}
+    {{- end }}
+{{- include "claw.netpol.cidrs" $sb }}
+{{- include "claw.netpol.public" (dict "ports" $sb.publicEgressPorts "privateCIDRs" $np.privateCIDRs) }}
+{{- end }}
+{{- end }}

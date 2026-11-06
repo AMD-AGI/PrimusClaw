@@ -25,6 +25,9 @@ const KEY_NAMES = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SAFE_API_KEY"];
 
 before(async () => (await import("./support/dag-handle-kv.js")).bindDagHandles());
 
+const SYSTEM = { GBRAIN_TOKEN: "system-planted-0001", LANGFUSE_SECRET_KEY: "system-planted-0002", GH_TOKEN: "system-planted-0003" };
+before(async () => (await import("./support/system-env.js")).seedSystemEnv(SYSTEM));
+
 let restores: Array<(() => void) | void> = [];
 let realFetch: typeof globalThis.fetch;
 afterEach(() => {
@@ -111,8 +114,7 @@ test("no layer can put the key back: the spec's env and the request's env have i
   assert.deepEqual([ordinary!.ANTHROPIC_API_KEY, ordinary!.OPENAI_API_KEY], ["planted-in-session", "the-users-own"], "control: without the mark they reach the sandbox");
   for (const env of await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true })) {
     for (const name of KEY_NAMES) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
-    assert.deepEqual([env.SPEC_KEPT, env.SESSION_KEPT], ["1", "1"], "and nothing else is taken out of the layers that are applied");
-    assert.equal("USER_KEPT" in env, false, "the user's own variables are not one of them: none is composed in (see the test of the stored variables)");
+    for (const name of ["SPEC_KEPT", "USER_KEPT", "SESSION_KEPT"]) assert.equal(name in env, false, `${name}: no layer is applied to it at all`);
   }
 });
 
@@ -126,6 +128,16 @@ test("the owner's stored variables are not in a marked sandbox either, and are i
     for (const [name, value] of Object.entries(env)) {
       for (const secret of Object.values(vault)) assert.ok(!value.includes(secret), `${name} carries a stored variable`);
     }
-    assert.equal(env.SESSION_KEPT, "1", "the request's own env is not the vault");
+    assert.equal("SESSION_KEPT" in env, false, "nor is the request's own env");
+  }
+});
+
+test("the deployment's system env is in an ordinary sandbox and in none of a marked one; what it holds is Brain's own and the LLM base URLs", async () => {
+  const [ordinary] = await sandboxEnvOf({});
+  for (const [name, value] of Object.entries(SYSTEM)) assert.equal(ordinary![name], value, `control: ${name} reaches an ordinary sandbox`);
+  for (const env of await sandboxEnvOf({ withhold_sandbox_keys: true })) {
+    for (const name of Object.keys(SYSTEM)) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
+    const own = new Set(["AUTH_CLAW_TOKEN", "CLAW_SESSION_ID", "MCP_PORT", "WORKSPACE_PATH", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL"]);
+    for (const name of Object.keys(env)) assert.ok(own.has(name), `${name} is not one Brain sets`);
   }
 });

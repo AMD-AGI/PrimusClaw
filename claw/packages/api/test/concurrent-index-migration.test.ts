@@ -303,8 +303,8 @@ test("every index initDb builds concurrently goes through the wrapper", () => {
   const INIT = SRC.slice(SRC.indexOf("export async function initDb"));
   assert.equal([...INIT.matchAll(/await ensureConcurrentIndex\(/g)].length, 0,
     "no call site in the migration may let a raised build abort it");
-  assert.equal([...INIT.matchAll(/await ensureConcurrentIndexOrWarn\(/g)].length, 4,
-    "the three it had, and idx_events_session_recent (the app-event index goes through buildAppEventIndex, which delegates)");
+  assert.equal([...INIT.matchAll(/await ensureConcurrentIndexOrWarn\(/g)].length, 5,
+    "the three it had, idx_events_session_recent and idx_sessions_deleted_walk (the app-event index goes through buildAppEventIndex, which delegates)");
   assert.match(INIT, /await buildAppEventIndex\(/);
   assert.match(CHAT_TURN_FN, /await ensureConcurrentIndex\(/,
     "the chat-turn builder is the exception, and catches the throw itself");

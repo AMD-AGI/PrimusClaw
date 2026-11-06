@@ -28,6 +28,8 @@ import assert from "node:assert/strict";
 process.env.TASK_DISPATCH_STAGE_TIMEOUT_MS = "200";
 process.env.SAFE_PLATFORM_KEY = "pk-CLUSTER-SHARED";
 process.env.CLAW_DEPLOY_MODE = "safe";
+process.env.USER_ENV_ENCRYPTION_KEY ??= Buffer.alloc(32, 7).toString("base64");
+(await import("../src/crypto/user-env.js")).initUserEnvCrypto();
 
 const { db } = await import("../src/infra/db.js");
 const { dispatchTask, taskPublisher } = await import("../src/tasks/dispatcher.js");
@@ -165,7 +167,7 @@ test("C4 the refusal is its own failure reason, not agent_error", async () => {
   );
 });
 
-test("C5 the patch every entry point writes carries the marker", () => {
+test("C5 the patch every entry point writes carries the marker, and the keys only sealed", () => {
   const patch = sessionCredentialPatch({
     userId: "u-1",
     userName: "u",
@@ -173,12 +175,15 @@ test("C5 the patch every entry point writes carries the marker", () => {
     platformKey: "pk-user-1",
     virtualKey: "vk-1",
   });
+  assert.deepEqual(Object.keys(patch).sort(), ["_server_managed_credentials", "sealed_credentials"]);
   assert.equal(patch._server_managed_credentials, true);
-  assert.equal(patch.platform_key, "pk-user-1");
-  assert.equal(patch.llm_api_key, "vk-1");
+  assert.equal(JSON.stringify(patch).includes("pk-user-1"), false);
+  assert.equal(JSON.stringify(patch).includes("vk-1"), false);
+  assert.deepEqual(readTrustedSessionCredentials(patch), { platformKey: "pk-user-1", llmApiKey: "vk-1" });
 });
 
-test("C5a an absent credential explicitly clears a stale session value", () => {
+test("C5a an absent credential replaces a stale session value", () => {
+  const stale = sessionCredentialPatch({ userId: "u-1", userName: "u", roles: [], platformKey: "pk-old", virtualKey: "vk-old" });
   const patch = sessionCredentialPatch({
     userId: "u-1",
     userName: "u",
@@ -186,8 +191,7 @@ test("C5a an absent credential explicitly clears a stale session value", () => {
     platformKey: "",
     virtualKey: "",
   });
-  assert.equal(patch.platform_key, null);
-  assert.equal(patch.llm_api_key, null);
+  assert.deepEqual(readTrustedSessionCredentials({ ...stale, ...patch }), { platformKey: "", llmApiKey: "" });
 });
 
 test("C5b only server-managed session credentials are readable", () => {

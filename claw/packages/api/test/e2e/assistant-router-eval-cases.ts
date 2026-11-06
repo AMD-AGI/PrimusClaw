@@ -151,6 +151,8 @@ export interface EvalCase {
   says?: "required" | "optional";
   /** The item the `say` must be attached to. */
   sayItem?: number;
+  /** What no reply may say: a claim the list contradicts (an item told as still waiting after it closed). */
+  sayNot?: RegExp;
   /** The language the user's words are in, which the reply must be in. */
   lang?: "zh" | "en";
   /** Why the label is what it is, for the cases a reader could argue with. */
@@ -255,6 +257,13 @@ export const CASES: readonly EvalCase[] = [
   { id: "pro-10", kind: "progress", lang: "zh", text: "OOM 那个能复现了吗？", expect: NOTHING },
   { id: "pro-11", kind: "progress", lang: "en", text: "How many items are open right now?", expect: NOTHING },
   { id: "pro-12", kind: "progress", lang: "zh", text: "#2 的 review 结论是什么？", expect: NOTHING },
+  {
+    id: "pro-13", kind: "progress", lang: "zh", text: "现在有哪些进行中的事项",
+    history: [{ user: "[work_event] #5 (item_id: " + itemIdOf(5) + ") ready v1: notes written and merged into docs/releases/0.9.2.md", calls: [say("#5 release notes 已完成，等你点接受。", 5)] }],
+    expect: NOTHING,
+    sayNot: /#5[^。；;!！\n]*?(等你|等待你|待你|还没接受|未接受|尚未接受|waiting for you|awaiting)/i,
+    why: "the conversation still says #5 waits for acceptance, but the list shows it accepted and closed: an answer, nothing to send or stop",
+  },
 
   // --- Chat, or a question that needs no work: say only ----------------------------------------------------
   { id: "chat-01", kind: "chat", lang: "en", text: "hi", expect: NOTHING },

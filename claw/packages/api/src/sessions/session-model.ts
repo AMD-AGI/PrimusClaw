@@ -16,6 +16,8 @@
  * printable.
  */
 
+import { isReasoningEffort, REASONING_EFFORTS, type ReasoningEffort } from "@claw/protocol";
+
 export const SESSION_MODEL_MAX_LENGTH = 128;
 
 /** A gateway model name: letters, digits and the separators real names use. */
@@ -63,4 +65,24 @@ export function parseSessionModel(raw: unknown): SessionModelParse {
 export function sessionModelFromRow(row: { model?: unknown } | null | undefined): string | undefined {
   const model = row?.model;
   return typeof model === "string" && model !== "" ? model : undefined;
+}
+
+export type SessionEffortParse =
+  | { ok: true; effort: ReasoningEffort | null }
+  | { ok: false; error: string };
+
+/**
+ * Check an `effort` field a client sent: how hard the session's model is asked to think on every turn, sub-agents included. `null` means
+ * no choice, as for `model`; an absent field is the caller's to read. Unlike a model name this is a closed set, so a value outside it is
+ * refused here rather than by the gateway.
+ */
+export function parseSessionEffort(raw: unknown): SessionEffortParse {
+  if (raw === null) return { ok: true, effort: null };
+  if (!isReasoningEffort(raw)) return { ok: false, error: `effort must be one of ${REASONING_EFFORTS.join(", ")} or null` };
+  return { ok: true, effort: raw };
+}
+
+/** The effort to put on a turn's execute request, from a `claw_sessions` row: undefined for a session with no choice, as for the model. */
+export function sessionEffortFromRow(row: { effort?: unknown } | null | undefined): ReasoningEffort | undefined {
+  return isReasoningEffort(row?.effort) ? row.effort : undefined;
 }

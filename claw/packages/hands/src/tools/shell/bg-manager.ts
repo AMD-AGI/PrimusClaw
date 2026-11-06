@@ -64,6 +64,13 @@ const BG_SHELL_BUFFER_BYTES = parseInt(process.env.BG_SHELL_BUFFER_BYTES || "104
 const GROUP_DRAIN_POLL_MS = 1_000;
 
 const BG_SHELL_REAP_DELAY_MS = parseInt(process.env.BG_SHELL_REAP_DELAY_MS || "60000", 10);
+/**
+ * How many finished shells may keep output nobody has read past the reap
+ * delay. A finished shell whose output was read is dropped after the delay as
+ * before; one whose output was not stays until it is read or newer unread ones
+ * push it past this many.
+ */
+const BG_SHELL_MAX_UNREAD_RETAINED = parseInt(process.env.BG_SHELL_MAX_UNREAD_RETAINED || "32", 10);
 const DEFAULT_REAP_GRACE_MS = 2_000;
 
 /**
@@ -306,20 +313,53 @@ export function spawnBackground(
     owner: string, run: string, shell: BgShell, key: string,
   ): void {
     const durable = persistOutcome(owner, run, shell);
-    const t = setTimeout(() => {
+    const reap = () => {
       const current = shells.get(key);
       // An outcome that never reached the record exists only in this entry, so
       // dropping it is the loss itself rather than the tidy-up it is otherwise.
-      if (durable && current && current.shell.status !== "running") {
-        shells.delete(key);
-        if (filesRecords()) releaseOutput(owner, recordRun(run), shell.id);
+      if (!durable || !current || current.shell.status === "running") return;
+      // Output nobody has read yet is kept until it is read. The reader is
+      // often not the turn that started the shell: a session woken because the
+      // shell finished, or a person asking later, polls minutes after the exit,
+      // and dropping the buffer one reap delay after it answered that poll with
+      // the outcome and none of what the command printed.
+      if (hasUnreadOutput(current.shell) && keepsUnreadOutput(key)) {
+        const again = setTimeout(reap, BG_SHELL_REAP_DELAY_MS);
+        again.unref?.();
+        return;
       }
-    }, BG_SHELL_REAP_DELAY_MS);
+      shells.delete(key);
+      if (filesRecords()) releaseOutput(owner, recordRun(run), shell.id);
+    };
+    const t = setTimeout(reap, BG_SHELL_REAP_DELAY_MS);
     t.unref?.();
   }
   attachSpawned(owner, run, shell);
 
   return { shell, resolution: "first_call" };
+}
+
+/** Whether `shell` holds bytes no poll or wait has handed to a caller yet. */
+function hasUnreadOutput(shell: BgShell): boolean {
+  return shell.stdoutReadOffset < shell.stdoutBytes || shell.stderrReadOffset < shell.stderrBytes;
+}
+
+/**
+ * Whether the finished entry at `key` is among the most recent ones still
+ * holding unread output, so its buffer may stay past the reap delay.
+ *
+ * Bounded because the concurrency cap counts running shells only: a run that
+ * starts shell after shell and never reads them would otherwise hold every
+ * buffer for the sandbox's life. The newest are kept, since those are the ones
+ * a woken or later turn is about to ask for.
+ */
+function keepsUnreadOutput(key: string): boolean {
+  if (BG_SHELL_MAX_UNREAD_RETAINED <= 0) return false;
+  const retained = [...shells.entries()]
+    .filter(([, e]) => e.shell.status !== "running" && hasUnreadOutput(e.shell))
+    .sort(([, a], [, b]) => (b.shell.endedAt ?? 0) - (a.shell.endedAt ?? 0))
+    .slice(0, BG_SHELL_MAX_UNREAD_RETAINED);
+  return retained.some(([k]) => k === key);
 }
 
 /**

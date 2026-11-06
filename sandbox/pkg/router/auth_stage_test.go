@@ -65,7 +65,7 @@ func TestTheTwoUnauthorizedStagesAreDistinguishable(t *testing.T) {
 	proxyToUpstream(t, envd.URL).ServeHTTP(fromEnvD, httptest.NewRequest(http.MethodGet, "/proxy", nil))
 
 	s, _ := newTestRouterWithAuth(t, func(http.ResponseWriter, *http.Request) {
-		t.Fatal("SaFE must not be called without a credential")
+		t.Fatal("identity must not be called without a credential")
 	})
 	fromCaller := httptest.NewRecorder()
 	s.engine.ServeHTTP(fromCaller, httptest.NewRequest(http.MethodGet, "/v1/test", nil))
@@ -98,26 +98,26 @@ func TestCallerRejectionsCarryAStableCode(t *testing.T) {
 			code:   "caller_credentials_missing",
 		},
 		{
-			name: "api key SaFE refuses",
+			name: "credential identity refuses",
 			req: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
 				r.Header.Set("Authorization", "Bearer ak-nope")
 				return r
 			},
-			safe:   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusUnauthorized) },
+			safe:   inactiveAnswer,
 			status: http.StatusUnauthorized,
-			code:   "caller_api_key_invalid",
+			code:   "caller_credential_invalid",
 		},
 		{
-			name: "cookie SaFE refuses",
+			name: "identity cannot answer",
 			req: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
-				r.AddCookie(&http.Cookie{Name: "Token", Value: "stale"})
+				r.Header.Set("Authorization", "Bearer ak-unknown")
 				return r
 			},
-			safe:   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusUnauthorized) },
-			status: http.StatusUnauthorized,
-			code:   "caller_cookie_invalid",
+			safe:   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
+			status: http.StatusServiceUnavailable,
+			code:   "caller_auth_unavailable",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

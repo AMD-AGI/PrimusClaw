@@ -8,7 +8,8 @@
  *   T1  a turn that answers the user in plain text and says nothing: the text is delivered through say, once, naming the turn
  *   T2  a turn that said something is left alone, whatever else it wrote; a message of the system's own does not count as having spoken
  *   T3  a turn that a worker's report started may end silent on purpose: what it wrote is not delivered
- *   T4  a turn that failed, was interrupted, was written by the sweeper, or wrote nothing delivers nothing
+ *   T4  a turn that failed, was interrupted or was written by the sweeper delivers none of its words, only the system's notice, once;
+ *       a turn that wrote nothing delivers nothing
  *   T5  a text too long for say is cut to fit; a refusal (the hourly cap) is not a fault and stores nothing
  *   T6  only an assistant's router session is looked at
  *   T7  the completion handler asks for it when a router turn ends, and the user's say is there afterwards
@@ -93,13 +94,22 @@ describe("assistant router turn end", { skip }, () => {
     assert.equal((await says()).length, 0);
   });
 
-  test("T4 a turn that failed, was interrupted, was written by the sweeper, or wrote nothing delivers nothing", async () => {
+  test("T4 a turn that failed, was interrupted or was written by the sweeper delivers none of its words, only the system's notice; one that wrote nothing delivers nothing", async () => {
     const turn = await endedTurn("How is the build going?");
+    for (const extra of [{ finalText: "" }, { finalText: "   \n " }, {}]) assert.equal(await end(turn, extra), "skipped", JSON.stringify(extra));
+    assert.equal((await says()).length, 0);
     for (const extra of [
       { failed: true, finalText: "partial" }, { interrupted: true, finalText: "partial" }, { fromSweeper: true, finalText: "[Task timed out]" },
-      { finalText: "" }, { finalText: "   \n " }, {},
-    ]) assert.equal(await end(turn, extra), "skipped", JSON.stringify(extra));
-    assert.equal((await says()).length, 0);
+    ]) {
+      await w.q("TRUNCATE claw_assistant_says");
+      const lost = await endedTurn("How is the build going?");
+      assert.equal(await end(lost, extra), "said", JSON.stringify(extra));
+      assert.equal(await end(lost, extra), "skipped", `once: ${JSON.stringify(extra)}`);
+      const [notice, ...more] = await says();
+      assert.equal(more.length, 0);
+      assert.equal(notice.fallback, true, "the system's words, not the model's");
+      assert.match(notice.text, /did not go through/);
+    }
   });
 
   test("T5 a text too long for say is cut to fit, and a refusal stores nothing and is not a fault", async () => {

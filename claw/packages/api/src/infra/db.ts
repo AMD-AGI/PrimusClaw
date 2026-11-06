@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { APP_RUNS_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
-import { ensureAssistantSchema } from "../assistant/schema.js";
+import { APP_RUNS_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_MODEL_CHOICE, CLAW_ASSISTANT_MODELS, CLAW_GITHUB_REVIEW_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
+import { ensureAssistantSchema, ensureModelChoiceSchema } from "../assistant/schema.js";
+import { sealPlaintextSessionCredentials } from "../auth/sealed-session-credentials.js";
 import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
@@ -54,9 +55,30 @@ const commonPoolConfig: pg.PoolConfig = {
   // commit/rollback cannot pin a pooled connection (and, for the latter, hold
   // row locks). Thresholds sit well above normal query/tx durations and are
   // env-overridable.
+  //
+  // The tcp_keepalives_* settings are the server's side of the same idea, for
+  // the one hold that is idle by design: `withLeaderLock` keeps a lockPool
+  // connection idle for a whole scan while the scan's work goes through the main
+  // pool. If the replica dies without its socket being closed (a node or network
+  // failure, a pod whose network is torn down before the FIN gets out), the
+  // server keeps that backend, and the session-scoped advisory lock on it, until
+  // its own keepalive gives up -- with the server's defaults (0 = the OS's,
+  // typically 7200s idle) that is over two hours, and on a daily scan every
+  // replica that asks in that window skips until the next day. Measured on a
+  // rolling update: the retention lock stayed with a dead pod's idle backend and
+  // no new pod could take it. With these defaults the server probes after 60s
+  // idle and drops the backend, and the lock with it, about two minutes after the
+  // peer went away. Ignored on a Unix-socket connection.
   options:
     `-c statement_timeout=${Number(process.env.PG_STATEMENT_TIMEOUT_MS) || 30000} ` +
-    `-c idle_in_transaction_session_timeout=${Number(process.env.PG_IDLE_TX_TIMEOUT_MS) || 60000}`,
+    `-c idle_in_transaction_session_timeout=${Number(process.env.PG_IDLE_TX_TIMEOUT_MS) || 60000} ` +
+    `-c tcp_keepalives_idle=${Number(process.env.PG_TCP_KEEPALIVES_IDLE_S) || 60} ` +
+    `-c tcp_keepalives_interval=${Number(process.env.PG_TCP_KEEPALIVES_INTERVAL_S) || 10} ` +
+    `-c tcp_keepalives_count=${Number(process.env.PG_TCP_KEEPALIVES_COUNT) || 6}`,
+  // And the client's side: a server that vanished without a FIN is noticed by
+  // the socket rather than only by the next query's timeout.
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 60_000,
   ssl:
     DATABASE_URL.includes("svc.cluster.local") ||
     DATABASE_URL.includes("ssl=true") ||
@@ -1194,8 +1216,14 @@ export async function initDb(): Promise<void> {
     // value for every session created before the column existed and for one that
     // never chose: such a turn carries no model and Brain uses its DEFAULT_MODEL.
     await addCol("model", "TEXT");
+    // The reasoning effort this session's turns ask for (low, medium, high). NULL: none is sent and the model's own default applies.
+    await addCol("effort", "TEXT");
     // Until when a drain of the session's queue is under way (`sessions/drain-claim.ts`). NULL: none is.
     await addCol("pending_drain_until", "TIMESTAMPTZ");
+    // When the session was last archived, which is what SESSION_RETENTION_DAYS
+    // counts from (sessions/retention.ts). NULL for one archived before this
+    // column existed, which retention reads as its updated_at instead.
+    await addCol("archived_at", "TIMESTAMPTZ");
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_user ON claw_sessions(user_id, created_at DESC)").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_context ON claw_sessions(context_id) WHERE context_id != ''").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_a2a_caller ON claw_sessions(a2a_caller_id) WHERE a2a_caller_id != ''").catch(() => {});
@@ -1326,6 +1354,36 @@ export async function initDb(): Promise<void> {
       CREATE UNIQUE INDEX IF NOT EXISTS unique_user_profile
       ON claw_memory_entries(user_id) WHERE category = 'user_profile'
     `).catch(() => {});
+    // Memory v2 (memory/service.ts). A row without `mtype` predates it and is shown under its category's type.
+    for (const [col, type] of [
+      ["mtype", "TEXT"], ["title", "TEXT"], ["why", "TEXT"], ["how_to_apply", "TEXT"],
+      ["status", "TEXT NOT NULL DEFAULT 'active'"], ["pinned", "BOOLEAN NOT NULL DEFAULT FALSE"], ["token_count", "INT"],
+      ["evidence_quote", "TEXT"], ["source_kind", "TEXT"], ["recorded_at", "TIMESTAMPTZ"], ["last_confirmed_at", "TIMESTAMPTZ"],
+      ["expires_at", "TIMESTAMPTZ"], ["prev_title", "TEXT"], ["prev_body", "TEXT"],
+      // The assistant's work item an entry is about (`assistant/memory-tools.ts`): shown to that item's worker and
+      // the router, and kept out of every other conversation's catalogue. No foreign key: the assistant's tables
+      // exist only where the assistant is on.
+      ["work_item_id", "TEXT"],
+    ] as const) {
+      await client.query(`ALTER TABLE claw_memory_entries ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
+    }
+    // What happened to each entry, for audit and undo. A deleted entry's events keep that it existed and lose
+    // what it said (title and quote are cleared), and a refused write never records what it carried.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_memory_events (
+        id              BIGSERIAL PRIMARY KEY,
+        user_id         TEXT NOT NULL,
+        entry_id        INT,
+        op              TEXT NOT NULL,
+        actor           TEXT NOT NULL,
+        session_id      TEXT,
+        reason          TEXT,
+        title           TEXT,
+        evidence_quote  TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_memory_events_entry ON claw_memory_events(user_id, entry_id)");
 
     // Per-user opt-in for long-term memory. No row means off.
     await client.query(`
@@ -1522,6 +1580,15 @@ export async function initDb(): Promise<void> {
       `CREATE INDEX IF NOT EXISTS idx_sessions_cleanup_oldest
          ON claw_sessions(deleted_at) WHERE cleanup_state = 'pending'`,
     ).catch(() => {});
+    // The retention purge's walk over deleted sessions (sessions/retention.ts),
+    // in exactly its keyset order, so each page is an index range read from the
+    // cursor rather than a scan and sort of every deleted session.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_sessions_deleted_walk",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sessions_deleted_walk
+         ON claw_sessions(deleted_at, session_id) WHERE deleted_at IS NOT NULL`,
+    );
     // Sessions deleted before this existed had their cleanup attempted exactly
     // once, inside the request, and whatever failed there was logged and left.
     // The objects of those sessions are still in the bucket, which is the leak
@@ -1540,6 +1607,14 @@ export async function initDb(): Promise<void> {
           SET cleanup_state = 'pending', cleanup_next_at = NOW()
         WHERE deleted_at IS NOT NULL AND cleanup_state IS NULL`,
     ).catch(() => {});
+
+    // Keys that sessions stamped by earlier builds hold in plain config fields
+    // are sealed here; matches nothing once done (sealed-session-credentials.ts).
+    // Not fatal: the reader still accepts the plain fields, and the next start retries.
+    await sealPlaintextSessionCredentials(client).then(
+      (n) => { if (n > 0) logger.info({ sessions: n }, "db.session_credentials_sealed"); },
+      (err) => logger.warn({ err: (err as Error)?.message }, "db.session_credentials_seal_failed"),
+    );
 
     // Per-session recency lookup. The sweeper's stuck-session reaper asks
     // "has this session emitted an event lately", which without this index is a
@@ -2307,6 +2382,8 @@ export async function initDb(): Promise<void> {
     if (CLAW_NOTIFICATIONS_ENABLED) await ensureNotificationSchema(client);
     if (CLAW_REMOTE_AGENTS_ENABLED) await ensureRemoteAgentSchema(client);
     if (CLAW_ASSISTANT_ENABLED) await ensureAssistantSchema(client);
+    // Model choice for the assistant's items (`assistant/model-choice.ts`): its tables only once it is switched on.
+    if (CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_MODEL_CHOICE && CLAW_ASSISTANT_MODELS) await ensureModelChoiceSchema(client);
     if (CLAW_GITHUB_REVIEW_ENABLED) await ensureGithubReviewSchema(client);
     // A2A context/task model: a context is found by its caller and id on every
     // send, which the single-column index above does not narrow.

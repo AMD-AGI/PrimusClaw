@@ -153,7 +153,7 @@ async function post(headers: Record<string, string>, url: string, payload: unkno
 }
 const bearer = (jwt: string) => ({ authorization: `Bearer ${jwt}` });
 const sessions = async (): Promise<number> => Number((await h.sql("SELECT count(*)::int AS n FROM claw_sessions"))[0]?.n);
-const START = { name: "review", config: { acting_as: "u-bob" }, message: { content: "review it" } };
+const START = { name: "review", config: { acting_as: "u-alice" }, message: { content: "review it" } };
 
 test("O1 a key alone, in either header, cannot start such a session or send it a turn, with the setting on as it is here", async () => {
   for (const headers of [{ "x-api-key": "ak-alice" }, { authorization: "Bearer ak-alice" }]) {
@@ -178,7 +178,7 @@ test("O2 a named service's token with the requester's own key creates the sessio
   const id = r.body.data.session_id as string;
   const row = (await h.sql("SELECT user_id, config FROM claw_sessions WHERE session_id = $1", [id]))[0] as { user_id: string; config: Record<string, unknown> };
   assert.equal(row.user_id, "u-alice", "the requester owns it");
-  assert.equal((row.config as { acting_as: string }).acting_as, "u-bob");
+  assert.equal((row.config as { acting_as: string }).acting_as, "u-alice");
   assert.equal(published.length, 1);
   assert.deepEqual([published[0]?.platform_key, published[0]?.llm_api_key], ["ak-alice", "vk-alice"], "the turn runs on the requester's own keys");
   assert.equal(published[0]?.withhold_sandbox_keys, true, "and its sandbox holds none of them");
@@ -204,7 +204,7 @@ test("O4 without a key, or from a service that is not named for it, the token is
   // A service that may answer for the user but was not named to bring a key (here: nobody is), with a key beside its token.
   process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = "";
   for (const key of [{ "x-api-key": "ak-alice" }, {}]) {
-    const r = await post({ ...bearer(token("u-alice", SERVICE)), ...key }, "/v1/sessions", { name: "review", config: { acting_as: "u-bob" } });
+    const r = await post({ ...bearer(token("u-alice", SERVICE)), ...key }, "/v1/sessions", { name: "review", config: { acting_as: "u-alice" } });
     assert.equal(r.status, 200, `the attended check is the service's own, and it passes: ${JSON.stringify(r.body)}`);
     const id = r.body.data.session_id as string;
     await h.sql("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL WHERE session_id = $1", [id]);

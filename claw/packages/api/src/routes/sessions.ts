@@ -8,13 +8,12 @@ import { singleflightCreate, type FlightResult } from "../shared/singleflight.js
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { submitSessionMessage } from "../sessions/submit-message.js";
-import { CLAW_GITHUB_REVIEW_ENABLED, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { attendedViaOfRequest, parseChannelContext, preemptReportTurn, recordAssistantMessage } from "../assistant/inbound.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
-import { parseActingAs } from "../github-review/acting-as.js";
-import { parseReviewTarget } from "../github-review/review-target.js";
-import { classifyAttendedCaller } from "../github-review/attended.js";
+import { checkSessionCreate } from "../github-review/acting-session.js";
+import { REQUESTED_REVIEW_CONFIG_KEYS } from "../github-review/requested-by.js";
 import { loadUserEnvForSession, withholdsSandboxKeys } from "../github-review/session-tools.js";
-import { readGithubReviewSettings } from "../github-review/settings.js";
 import {
   forceIdleAfterInterrupt, queuedMessageId, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
@@ -33,7 +32,7 @@ import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
 import { archiveSession, unarchiveSession } from "../sessions/archive.js";
 import { getChangesPatch, getChangesSummary, type ChangesFailure } from "../sessions/changes-service.js";
-import { parseSessionModel } from "../sessions/session-model.js";
+import { parseSessionEffort, parseSessionModel } from "../sessions/session-model.js";
 import { vetRequestMcpServers } from "../sessions/request-mcp-servers.js";
 import {
   isUserEnvKeyAllowed,
@@ -89,6 +88,8 @@ export interface NewSessionRow {
    * the check.
    */
   model?: string | null;
+  /** The reasoning effort this session's turns ask for, or null/absent for none. Already validated by `parseSessionEffort`. */
+  effort?: string | null;
 }
 
 // A value rather than a boolean, carrying the parent it was issued for, so a
@@ -115,12 +116,12 @@ export async function insertSessionRow(
   }
   await q.query(
     `INSERT INTO claw_sessions
-     (session_id, name, user_id, mode, agent_status, agent_gate_message_id, agent_id, system_prompt, status, config, parent_session_id, team_role, model, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $10, 'agent_default', $6, 'active', $7::jsonb, $8, $9, $11, NOW(), NOW())`,
+     (session_id, name, user_id, mode, agent_status, agent_gate_message_id, agent_id, system_prompt, status, config, parent_session_id, team_role, model, effort, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $10, 'agent_default', $6, 'active', $7::jsonb, $8, $9, $11, $12, NOW(), NOW())`,
     [
       row.sessionId, row.name, row.userId, row.mode, row.agentStatus,
       row.systemPrompt, JSON.stringify(row.config), row.parentSid, row.role,
-      row.gateMessageId ?? null, row.model ?? null,
+      row.gateMessageId ?? null, row.model ?? null, row.effort ?? null,
     ],
   );
 }
@@ -141,8 +142,14 @@ export async function resolveParentAuthorisation(
   if (!user) {
     return { statusCode: 401, response: { ok: false, error: "authentication required" } };
   }
+  // `FOR KEY SHARE` holds the parent against a deletion committing before the
+  // child does: a deletion locks the parent `FOR UPDATE` and then checks its
+  // team members (the retention pass refuses a parent with a running member),
+  // and a member inserted after that check would be missed. Waiting here instead
+  // re-reads `deleted_at` once the deletion commits, so the create is refused.
+  // Ordinary writes to the parent take a weaker lock and are not held up.
   const parent = (await q.query(
-    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR KEY SHARE",
     [parentSid],
   )).rows[0] as { user_id?: string | null } | undefined;
   if (!parent) return { statusCode: 404, response: { ok: false, error: "parent_session_not_found" } };
@@ -289,13 +296,15 @@ const ZIP_PRESIGN_EXPIRES_SEC = 3600;
 //   .git        - a repository's object store, which the snapshot carries so
 //                 unpushed commits survive a sandbox restart: thousands of
 //                 files, none of them the user's artifacts
+//   .deliveries - the copies `deliver_file` made, each served by its own route
+//                 (routes/session-deliveries.ts); the original is in the listing
 //
 // `.transcripts/` is deliberately absent. It is written by Brain rather than by
 // the sandbox, so the sync treats it as internal -- but it is the user's record
 // of what their run did, and it was downloadable from this listing for every
 // release before it moved into a directory. Hiding it here would take a feature
 // away as a side effect of a storage-layout change.
-const INTERNAL_PREFIXES_RE = /(?:^|\/)(\.zip-cache|\.uploads|\.skills|\.git)\//;
+const INTERNAL_PREFIXES_RE = /(?:^|\/)(\.zip-cache|\.uploads|\.skills|\.git|\.deliveries)\//;
 
 /**
  * Whether an object under the session prefix is hidden from the user's files.
@@ -306,6 +315,18 @@ const INTERNAL_PREFIXES_RE = /(?:^|\/)(\.zip-cache|\.uploads|\.skills|\.git)\//;
  */
 export function isHiddenSessionFile(rel: string): boolean {
   return INTERNAL_PREFIXES_RE.test(rel);
+}
+
+const DELIVERY_SEGMENT_RE = /(?:^|\/)\.deliveries(?:\/|$)/;
+
+/**
+ * Whether a path or object key is a delivered copy. Those are served by their
+ * own route to a signed-in owner only (routes/session-deliveries.ts), and by no
+ * file route: here the owner's key is enough, and the sandbox holds that key.
+ * Asked of the whole key, so a folder download of a parent cannot include them.
+ */
+export function isDeliveryPath(pathOrKey: string): boolean {
+  return DELIVERY_SEGMENT_RE.test(pathOrKey);
 }
 
 function zipKeyFor(sessionPrefix: string, taskId: string): string {
@@ -494,7 +515,7 @@ async function listS3KeysUnderPrefix(
     for (const obj of res.Contents || []) {
       if (!obj.Key || obj.Size === undefined || obj.Size <= 0) continue;
       const rel = obj.Key.slice(prefix.length);
-      if (isHiddenSessionFile(rel)) continue;
+      if (isHiddenSessionFile(rel) || isDeliveryPath(obj.Key)) continue;
       entries.push({ key: obj.Key, size: obj.Size });
     }
     ct = res.IsTruncated ? res.NextContinuationToken : undefined;
@@ -1100,9 +1121,14 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       "platform_key",
       "llm_api_key",
       "virtual_key",
+      "sealed_credentials",
       "_server_managed_credentials",
       // Set below from the verified caller, never taken from the request.
       "acting_as_requester",
+      // Who asked for a review of someone else, and the profile it runs with: written only by the review items
+      // (`assistant/review-items.ts`), from the authenticated caller. A session made here that carried them would
+      // pass for a review the acting user was asked to make.
+      ...REQUESTED_REVIEW_CONFIG_KEYS,
     ];
     const suppliedReservedKey = reservedConfigKeys.find((key) =>
       Object.prototype.hasOwnProperty.call(sessionConfig, key)
@@ -1123,57 +1149,25 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       return reply.status(400).send({ ok: false, error: parsedRepo.error });
     }
 
-    // The user whose GitHub account this session's review tools act as. A reference
-    // only; checked here, before any row exists, and refused while the feature is
-    // off so that a session never silently goes without the tools it asked for.
-    const parsedActingAs = parseActingAs(sessionConfig.acting_as);
-    if (!parsedActingAs.ok) {
-      return reply.status(400).send({ ok: false, error: parsedActingAs.error });
+    // `acting_as`, `review_target`, `review_only`, the model and the effort, and for a session that acts as a user the person's own
+    // credential: checked here, before any row or run exists, by the one function every create of such a session goes through.
+    const checked = checkSessionCreate({ config: sessionConfig, model: body.model, effort: body.effort, user: user ?? null, method: getAuthMethod(req) });
+    if (!checked.ok) {
+      if (checked.log) logger.warn({ userId: user?.userId, method: getAuthMethod(req) ?? "none", clientId: user?.delegation?.clientId?.slice(0, 128) }, checked.log);
+      return reply.status(checked.status).send({ ok: false, error: checked.error });
     }
-    if (parsedActingAs.actingAs !== null) {
-      if (!CLAW_GITHUB_REVIEW_ENABLED) {
-        return reply.status(400).send({ ok: false, error: "config.acting_as is not enabled on this deployment" });
-      }
-      if (!user) {
-        return reply.status(401).send({ ok: false, error: "authentication required" });
-      }
-      // A session that acts as a user is the person's say, and the key a sandbox holds (or a sign-in that key can complete) must not be
-      // able to start one: a model injected in any ordinary session of the user would otherwise review and merge with their account
-      // on its own. The same credentials as answering a held merge (github-review/attended.ts).
-      const caller = classifyAttendedCaller(getAuthMethod(req), user, readGithubReviewSettings().decisionClientIds);
-      if (!caller.ok) {
-        logger.warn({ userId: user.userId, method: getAuthMethod(req) ?? "none", clientId: user.delegation?.clientId?.slice(0, 128) }, `github_review.acting_as_refused_${caller.error}`);
-        return reply.status(403).send({ ok: false, error: caller.error });
-      }
-      // The requester's name for the review footer, from the verified caller.
-      sessionConfig.acting_as_requester = (user.userName || user.userId).slice(0, 100);
+    // A review of someone else's account is that person's work, made only by `POST /v1/assistant/reviews`, which checks their say and
+    // their credentials and puts it on their board. Here a session may act only as its own creator, whatever else is switched on: a
+    // session the requester owns would hold the other person's review tools outside every one of those checks.
+    if (checked.actingAs !== null && user && checked.actingAs !== user.userId) {
+      logger.warn({ userId: user.userId }, "github_review.acting_as_other_refused");
+      return reply.status(403).send({
+        ok: false, error: "acting_as_must_be_self",
+        message: "a review of another person's account is asked with POST /v1/assistant/reviews",
+      });
     }
-    // The one pull request the session's review tools may touch. It is only ever set here, and it binds nothing without `acting_as`, which
-    // is why asking for it without one is refused rather than silently ignored.
-    const parsedTarget = parseReviewTarget(sessionConfig.review_target);
-    if (!parsedTarget.ok) {
-      return reply.status(400).send({ ok: false, error: parsedTarget.error });
-    }
-    if (parsedTarget.target !== null && parsedActingAs.actingAs === null) {
-      return reply.status(400).send({ ok: false, error: "config.review_target needs config.acting_as" });
-    }
-
-    // The model this session's turns ask for. Checked here, before any row or
-    // run exists, so a malformed name leaves nothing behind. Absent and null both
-    // mean no choice; whether the gateway serves the name is its answer to give,
-    // on the first turn that uses it.
-    let sessionModel: string | null = null;
-    if (body.model !== undefined) {
-      const parsedModel = parseSessionModel(body.model);
-      if (!parsedModel.ok) {
-        return reply.status(400).send({ ok: false, error: parsedModel.error });
-      }
-      sessionModel = parsedModel.model;
-    }
-    // A session that reviews on someone's behalf runs on the review model unless its creator named one: the requester's key pays.
-    if (sessionModel === null && parsedActingAs.actingAs !== null) {
-      sessionModel = readGithubReviewSettings().reviewModel;
-    }
+    const sessionModel = checked.model;
+    const sessionEffort = checked.effort;
 
     if (parentSid && !user) {
       return reply.status(401).send({ ok: false, error: "authentication required" });
@@ -1377,6 +1371,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           parentSid, role,
           gateMessageId: firstMessageId,
           model: sessionModel,
+          effort: sessionEffort,
         };
         // A create with no parent grows no existing tree; every create that
         // names one adds a node to it, so it is decided against the ceiling
@@ -1398,7 +1393,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             data: {
               session_id: sessionId, name, user_id: userId, mode: dispMode,
               agent_status: "idle", parent_session_id: parentSid, team_role: role,
-              model: sessionModel,
+              model: sessionModel, effort: sessionEffort,
             },
           };
           if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 200, response);
@@ -1489,7 +1484,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           data: {
             session_id: sessionId, name, user_id: userId, mode: dispMode,
             agent_status: "running", parent_session_id: parentSid, team_role: role,
-            model: sessionModel,
+            model: sessionModel, effort: sessionEffort,
             message: {
               message_id: dispatch.messageId,
               dispatched: true,
@@ -1635,7 +1630,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     return { ok: true, data: rows.map(mapSessionForDisplay) };
   });
 
-  // --- Update Session (rename, choose the model) ---
+  // --- Update Session (rename, choose the model or the effort) ---
   //
   // Either field alone, or both. `name` is the old contract unchanged. `model`
   // is the model this session's turns ask the gateway for: a string sets it, null
@@ -1648,10 +1643,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     const body = (req.body ?? {}) as Record<string, unknown>;
     const wantsName = body.name !== undefined;
     const wantsModel = body.model !== undefined;
+    const wantsEffort = body.effort !== undefined;
     const newName = ((body.name as string) || "").trim();
-    // With no `model` in the body this is exactly the rename it always was,
+    // With no `model` or `effort` in the body this is exactly the rename it always was,
     // including its refusal of a blank name.
-    if ((wantsName || !wantsModel) && !newName) {
+    if ((wantsName || (!wantsModel && !wantsEffort)) && !newName) {
       return reply.status(400).send({ ok: false, error: "name is required" });
     }
     let newModel: string | null = null;
@@ -1661,6 +1657,14 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         return reply.status(400).send({ ok: false, error: parsedModel.error });
       }
       newModel = parsedModel.model;
+    }
+    let newEffort: string | null = null;
+    if (wantsEffort) {
+      const parsedEffort = parseSessionEffort(body.effort);
+      if (!parsedEffort.ok) {
+        return reply.status(400).send({ ok: false, error: parsedEffort.error });
+      }
+      newEffort = parsedEffort.effort;
     }
 
     const row = (await db.query(
@@ -1675,7 +1679,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     if (!canAccessSession(row.user_id, userId) && !(!row.user_id && user && isSystemAdmin(user))) {
       return reply.status(403).send({
         ok: false,
-        error: wantsModel ? "only the session owner can update it" : "only the session owner can rename",
+        error: wantsModel || wantsEffort ? "only the session owner can update it" : "only the session owner can rename",
       });
     }
 
@@ -1689,17 +1693,21 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       params.push(newModel);
       sets.push(`model = $${params.length}`);
     }
+    if (wantsEffort) {
+      params.push(newEffort);
+      sets.push(`effort = $${params.length}`);
+    }
     params.push(sessionId);
     const updated = (await db.query(
       `UPDATE claw_sessions SET ${sets.join(", ")}, updated_at = NOW() `
-        + `WHERE session_id = $${params.length} AND deleted_at IS NULL RETURNING name, model`,
+        + `WHERE session_id = $${params.length} AND deleted_at IS NULL RETURNING name, model, effort`,
       params,
     )).rows[0];
     // Deleted between the read above and the write: there is nothing to report.
     if (!updated) return reply.status(404).send({ ok: false, error: "session not found" });
     return {
       ok: true,
-      data: { session_id: sessionId, name: updated.name, model: updated.model ?? null },
+      data: { session_id: sessionId, name: updated.name, model: updated.model ?? null, effort: updated.effort ?? null },
     };
   });
 
@@ -1891,7 +1899,19 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       // A turn in a session that acts as a user is the person's say, like creating it: the key a sandbox holds is the owner's own and
       // reaches this route, so it must not be able to put work in front of a model that holds the person's GitHub account.
       refuse: (tx) => actingTurnRefusalFor(req, sessionId, tx),
+      // A message to the user's own assistant is written down with how it was authenticated, for the turn that answers it.
+      ...(CLAW_ASSISTANT_ENABLED ? {
+        accepted: (tx: PoolClient, messageId: string) => recordAssistantMessage(tx, {
+          sessionId, messageId, userId, userName: user?.userName, content,
+          attendedVia: attendedViaOfRequest(req),
+          context: parseChannelContext(body.channel_context),
+        }),
+      } : {}),
     });
+    if (CLAW_ASSISTANT_ENABLED && submitted.kind === "queued" && submitted.drain === "awaiting_turn") {
+      // What the user says next goes before a worker's report the assistant is still reading.
+      await preemptReportTurn(sessionId).catch((err) => logger.warn({ err, sessionId }, "assistant.report_turn_preempt_failed"));
+    }
     switch (submitted.kind) {
       case "session_not_found":
         return reply.status(404).send({ ok: false, error: "session not found" });
@@ -2159,6 +2179,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     const filePath = rawPath.replace(/\/(download|stream)$/, "");
 
     if (filePath.includes("..")) return reply.status(400).send({ ok: false, error: "invalid path" });
+    if (isDeliveryPath(filePath)) return reply.status(404).send({ ok: false, error: "file not found" });
 
     const scope = await requireSessionScope(req, reply, sessionId);
     if (!scope) return reply;

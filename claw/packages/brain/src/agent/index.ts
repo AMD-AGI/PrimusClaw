@@ -204,6 +204,11 @@ export interface ExecuteExtras {
   /** Where `decision.<sessionId>` answers arrive; without it a tool that
    *  requires approval is denied rather than run unasked. */
   natsConnection?: import("nats").NatsConnection;
+  /**
+   * Handed a requested review's turn pool (`agent-loop.ts` `TurnPool`) before its loop starts, so a run that ends by interrupt or failure
+   * reports the turns it and its sub-agents took, not only the parent's checkpointed ones.
+   */
+  onTurnPool?: (pool: import("./agent-loop.js").TurnPool) => void;
 }
 
 export interface Engine {

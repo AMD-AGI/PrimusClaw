@@ -1627,7 +1627,8 @@ export async function releaseSessionGateIfUnoccupied(
         -- always has a name in it. NULL is the older shape -- a session gated
         -- before the column existed -- and refusing to release that would hand
         -- it to reapStuckSessions an hour later for no gain.
-        AND (agent_gate_message_id IS NULL OR agent_gate_message_id = $2)
+        AND (agent_gate_message_id IS NULL OR agent_gate_message_id = $2
+             OR ${gateNamesEndedTurnSql("$1", "agent_gate_message_id")})
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = $1
@@ -1868,7 +1869,8 @@ export async function forceIdleAfterInterrupt(
         SET agent_status = 'idle', agent_gate_message_id = NULL, updated_at = NOW()
       WHERE session_id = $1
         AND agent_status = 'running'
-        AND (NOT $2::boolean OR agent_gate_message_id = $3)
+        AND (NOT $2::boolean OR agent_gate_message_id = $3
+             OR ${gateNamesEndedTurnSql("$1", "agent_gate_message_id")})
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = $1
@@ -1932,7 +1934,21 @@ export function gateNamesEndedTurnSql(sessionId: string, marker: string): string
            AND NOT EXISTS (SELECT 1 ${named} AND h.status NOT IN ('completed','failed','cancelled')))`;
 }
 
-/** Take the session gate for one turn, naming the turn that holds it. */
+/**
+ * SQL: the gate names an ended turn and nothing else occupies the session, so
+ * nobody is left to release it. Unlike a release, a take must also see the
+ * session empty: an ended marker over a run still going names that run's gate
+ * in all but name, and taking it would dispatch a second turn beside it. The
+ * actor's own row is not occupying -- a drain writes its row before it takes.
+ */
+function gateIsStaleSql(sessionId: string, marker: string, actor: string): string {
+  return `(${gateNamesEndedTurnSql(sessionId, marker)}
+           AND NOT EXISTS (SELECT 1 FROM claw_tasks o
+                            WHERE o.session_id = ${sessionId}
+                              AND o.status IN ('queued','preparing','running','cancelling')
+                              AND o.metadata->>'message_id' IS DISTINCT FROM ${actor}))`;
+}
+
 /**
  * The one statement that may write `agent_gate_message_id`.
  *
@@ -2036,7 +2052,8 @@ export async function applySessionGateTransition(input: {
         WHERE session_id = $1 AND deleted_at IS NULL
           AND ($4::boolean
                OR agent_gate_message_id IS NULL
-               OR agent_gate_message_id = $2)`,
+               OR agent_gate_message_id = $2
+               ${input.force === true ? "" : `OR ${gateIsStaleSql("$1", "agent_gate_message_id", "$2")}`})`,
       [input.sessionId, input.actor, input.status, input.force === true, ...alsoVals],
     );
     return (r.rowCount ?? 0) > 0;

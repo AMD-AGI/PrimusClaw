@@ -25,20 +25,26 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { IdentityUnavailableError } from "@claw/utils";
 import pino from "pino";
 import { z } from "zod";
+import {
+  confirmationOfStoppedReview, denyForStoppedReview, reviewContinuationOf, reviewItemPorts, reviewItemServiceDeps, reviewItemsEnabled, reviewSessionStopped, syncReviewItemOfSession,
+} from "../assistant/review-items.js";
 import { identityClient } from "../auth/identity.js";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
-import { db } from "../infra/db.js";
+import { db, inTransaction, type Querier } from "../infra/db.js";
 import { parseActingAs } from "./acting-as.js";
 import { classifyAttendedCaller } from "./attended.js";
-import { reviewTargetOf } from "./review-target.js";
+import { mergeNeedsConfirmationOf, reviewOnlyOf, reviewTargetOf } from "./review-target.js";
 import { SECTIONS } from "./pages.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
 import { HOLD_GUIDANCE } from "./risk.js";
-import { REVIEW_MODES, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type Queryable, type ReviewMode } from "./store.js";
+import {
+  REVIEW_MODES, getConfirmation, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type DecidedVia, type Queryable, type ReviewMode,
+} from "./store.js";
 import { verifySessionToolToken } from "./token.js";
+import { requesterLabelOf, requesterOf } from "./requested-by.js";
 
 const logger = pino({ name: "github-review-mcp" });
 
@@ -66,8 +72,11 @@ function toResult(outcome: ToolOutcome): { content: Array<{ type: "text"; text: 
   return { content: [{ type: "text" as const, text: outcome.text }], ...(outcome.isError ? { isError: true } : {}) };
 }
 
-/** The four tools, bound to one session's actor. */
-export function buildReviewToolServer(service: GithubReview, actor: ReviewActor): McpServer {
+/**
+ * The four tools, bound to one session's actor; and a fifth, `gh_thread_resolve`, for a re-review that has the last review's threads to
+ * resolve (`resolvable`): no other session is offered it.
+ */
+export function buildReviewToolServer(service: GithubReview, actor: ReviewActor, opts: { resolvable?: boolean } = {}): McpServer {
   const mcp = new McpServer({ name: "github-review", version: "1.0.0" });
   mcp.tool(
     "gh_pr_get",
@@ -117,7 +126,8 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
   );
   mcp.tool(
     "gh_pr_merge",
-    "Approve (when needed) and merge the pull request if every gate is open: CI green on the head commit, no unresolved thread, merge state CLEAN, "
+    "Merge the pull request after your own APPROVE review of this head (gh_review_submit). It never approves for you: a merge that is not held answers "
+    + "review_not_submitted without that review, and only a held merge the acting user confirms is approved on their say. It merges only if every gate is open: CI green on the head commit, no unresolved thread, merge state CLEAN, "
     + "the acting user allowing it (refused when they wrote the pull request), and not held: a merge you judge high (`risk_judgement`), one with no judgement, "
     + "and one with a hard hold answer confirmation_required and wait for them (under the acting user's fully_auto review_mode only repo_holds do). "
     + "A branch that is merged through a merge queue gets the pull request put in the queue instead (status queued, never merged): the queue runs its own checks and merges it, and this tool does not follow it. "
@@ -131,6 +141,19 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
     },
     async (a) => toResult(await service.mergePr(actor, a)),
   );
+  if (opts.resolvable) {
+    mcp.tool(
+      "gh_thread_resolve",
+      "Resolve the thread of one finding of the last review of this pull request that is fixed at this head: only the threads in gh_pr_get's "
+      + "`continuation.findings` can be, and only after you checked the fix. A finding that is not fixed keeps its thread open and is said again in your review.",
+      {
+        pr: z.string().describe(PR_HELP),
+        thread_id: z.string().describe("The thread_id of the finding, from continuation.findings"),
+        head_sha: z.string().describe("The head_sha from gh_pr_get, the head you checked the fix at"),
+      },
+      async (a) => toResult(await service.resolveThread(actor, a)),
+    );
+  }
   return mcp;
 }
 
@@ -141,18 +164,66 @@ function refuse(reply: FastifyReply, status: number, error: string): FastifyRepl
 const CONFIRMATION_STATUSES = new Set<string>(["pending", "merging", "merged", "queued", "submitted", "denied", "stale", "expired", "refused"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export async function registerGithubReviewRoutes(app: FastifyInstance, opts: GithubReviewRouteOptions = {}): Promise<void> {
-  if (!(opts.enabled ?? CLAW_GITHUB_REVIEW_ENABLED)) return;
-  const settings = opts.settings ?? (() => readGithubReviewSettings());
-  const database: Queryable = opts.db ?? db;
-  const service = opts.service ?? new GithubReview({
-    settings, db: database,
+function newGithubReview(settings: () => GithubReviewSettings, database: Queryable): GithubReview {
+  return new GithubReview({
+    settings, db: database, sessionStopped: reviewSessionStopped,
+    ...reviewItemServiceDeps(),
     resolveCredential: async (req) => {
       const client = identityClient();
       if (!client) throw new IdentityUnavailableError("credential", "not_configured");
       return client.resolveExternalCredential(req);
     },
   });
+}
+
+let processService: GithubReview | null = null;
+
+/**
+ * The process's one review service: the routes' and the assistant's (`confirmation_answer`) are the same object, so the
+ * limits it keeps in memory (writes in flight per pull request) count both.
+ */
+export function githubReviewService(): GithubReview {
+  processService ??= newGithubReview(() => readGithubReviewSettings(), db);
+  return processService;
+}
+
+/**
+ * The acting user's answer to a held write, as everyone who takes one gives it: the decision route and the assistant's
+ * `confirmation_answer` both call this, so neither can skip a step the other takes. The caller has already decided who is
+ * answering (`deciderUserId`) and how they were present (`via`); only the acting user can answer, here as in `decide`. A `guard`
+ * that throws decides nothing.
+ * A write held by a review its requester stopped is not made, whatever the answer (`confirmationOfStoppedReview`), and
+ * the review item of the session, if it is one, closes with the answer.
+ */
+export async function decideConfirmation(
+  service: GithubReview, database: Queryable, deciderUserId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null,
+  guard?: (query: Querier) => Promise<void>,
+): Promise<{ http: number; body: Record<string, unknown> }> {
+  // The caller's own condition, asked last before anything is decided (the assistant's tool: its turn is still live).
+  if (guard) await inTransaction(guard);
+  if (await confirmationOfStoppedReview(id)) {
+    const row = await getConfirmation(database, id);
+    if (row && row.actorUserId !== deciderUserId) return { http: 403, body: { ok: false, error: "only_the_acting_user_can_decide" } };
+    // Answered meanwhile: `decide` below says how it ended, instead of a stop that denied nothing.
+    if (await denyForStoppedReview(id)) return { http: 200, body: { ok: true, status: "denied", reason: "review_stopped" } };
+  }
+  // Asked again where the answer is given (`decide` claims the row, then asks): a stop that lands between the two checks decides nothing.
+  const answer = await service.decide(deciderUserId, id, decision, via, guard ? () => inTransaction(guard) : undefined);
+  const decided = await getConfirmation(database, id).catch(() => null);
+  if (decided) await syncReviewItemOfSession(decided.sessionId).catch((err) => logger.warn({ err }, "github_review.review_item_sync_failed"));
+  return answer;
+}
+
+export async function registerGithubReviewRoutes(app: FastifyInstance, opts: GithubReviewRouteOptions = {}): Promise<void> {
+  if (!(opts.enabled ?? CLAW_GITHUB_REVIEW_ENABLED)) return;
+  const settings = opts.settings ?? (() => readGithubReviewSettings());
+  const database: Queryable = opts.db ?? db;
+  const service = opts.service ?? (opts.settings || opts.db ? newGithubReview(settings, database) : githubReviewService());
+
+  // The review items of the assistant check a pull request with this same service before they make a session for it.
+  reviewItemPorts.checkPullRequest = (actor, ref) => service.checkPullRequest(actor, ref);
+  // And ask whether the acting user lets others act for them, when a review is asked of them and before each of its turns.
+  reviewItemPorts.delegationOf = typeof service.delegationOf === "function" ? (actor, requester) => service.delegationOf(actor, requester) : null;
 
   app.all("/v1/internal/github-review/mcp", async (req, reply) => {
     const header = String(req.headers.authorization ?? "");
@@ -174,7 +245,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     }
     // The token proves what was true when it was minted; the session says what is true now.
     const acting = parseActingAs(row?.config?.acting_as);
-    if (!row || row.user_id !== claims.requesterUserId || !acting.ok || acting.actingAs !== claims.actorUserId) {
+    if (!row || requesterOf(row) !== claims.requesterUserId || !acting.ok || acting.actingAs !== claims.actorUserId) {
       return refuse(reply, 403, "session_mismatch");
     }
     // A target that is there and cannot be read is not "no target": the session does not get the tools.
@@ -183,10 +254,12 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
       logger.warn({ sessionId: claims.sessionId }, "github_review.review_target_unreadable");
       return refuse(reply, 403, "review_target_invalid");
     }
-    const label = typeof row.config?.acting_as_requester === "string" ? row.config.acting_as_requester : undefined;
+    const label = requesterLabelOf(row.config);
+    const continuation = reviewItemsEnabled() ? await reviewContinuationOf(claims.sessionId).catch(() => null) : null;
     const mcp = buildReviewToolServer(service, {
       sessionId: claims.sessionId, requesterUserId: claims.requesterUserId, actorUserId: claims.actorUserId, requesterLabel: label, reviewTarget: target.target,
-    });
+      reviewOnly: reviewOnlyOf(row.config), mergeNeedsConfirmation: mergeNeedsConfirmationOf(row.config),
+    }, { resolvable: continuation?.findings.some((f) => f.thread_id !== null && !f.resolved) === true });
     // Stateless, like the platform's own MCP endpoint: one server and transport per request.
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as unknown as () => string });
     reply.hijack();
@@ -226,7 +299,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     const decision = ((req.body ?? {}) as { decision?: unknown }).decision;
     if (decision !== "allow" && decision !== "deny") return refuse(reply, 400, "decision must be allow or deny");
     if (!UUID_RE.test(req.params.id)) return refuse(reply, 404, "not_found");
-    const answer = await service.decide(user.userId, req.params.id, decision, caller.via);
+    const answer = await decideConfirmation(service, database, user.userId, req.params.id, decision, caller.via);
     return reply.status(answer.http).send(answer.body);
   });
 

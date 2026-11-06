@@ -19,6 +19,7 @@ package main
 import (
 	"testing"
 
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	"sigs.k8s.io/agent-sandbox/pkg/router"
 )
 
@@ -29,19 +30,18 @@ func TestCheckAuthPosture(t *testing.T) {
 	tests := []struct {
 		name       string
 		enableAuth bool
-		safeAPIURL string
+		identity   bool
 		allowEnv   string
 		wantErr    bool
 	}{
 		{
-			name:       "auth enabled with a SaFE URL is accepted",
+			name:       "auth enabled with an identity client is accepted",
 			enableAuth: true,
-			safeAPIURL: "https://safe.example.com",
+			identity:   true,
 		},
 		{
-			name:       "auth enabled without a SaFE URL is refused",
+			name:       "auth enabled without an identity client is refused",
 			enableAuth: true,
-			safeAPIURL: "",
 			wantErr:    true,
 		},
 		{
@@ -71,7 +71,10 @@ func TestCheckAuthPosture(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("ALLOW_INSECURE_NO_AUTH", tc.allowEnv)
-			cfg := router.Config{EnableAuth: tc.enableAuth, SafeAPIURL: tc.safeAPIURL}
+			cfg := router.Config{EnableAuth: tc.enableAuth}
+			if tc.identity {
+				cfg.Identity = identity.NewClient("http://identity.example/oauth/introspect", "id", "secret", "")
+			}
 			err := checkAuthPosture(&cfg)
 			if tc.wantErr && err == nil {
 				t.Fatalf("expected an error, got nil")

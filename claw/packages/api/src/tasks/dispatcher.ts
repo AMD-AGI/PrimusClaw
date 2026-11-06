@@ -17,16 +17,18 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { taskSubject } from "@claw/protocol";
-import type { ExecuteRequest, ScriptStep, TaskMode } from "@claw/protocol";
+import type { ExecuteRequest, ReasoningEffort, ScriptStep, TaskMode } from "@claw/protocol";
 import {
   MissingPlatformKeyError,
   readTrustedSessionCredentials,
 } from "../auth/session-credentials.js";
 import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_DEPLOY_MODE, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
+import { sessionEffortFromRow } from "../sessions/session-model.js";
 import { actingSessionTurnFields, withholdsSandboxKeys } from "../github-review/session-tools.js";
+import { usesReviewProfile } from "../github-review/requested-by.js";
+import { applyReviewProfile, ReviewTurnBudgetUsedError, reviewTurnsLeft } from "../github-review/review-profile.js";
 import { defaultTaskWorkspaceId } from "./default-workspace.js";
-import { isMemoryActive } from "../memory/service.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { db } from "../infra/db.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
@@ -148,6 +150,10 @@ async function loadSessionCredentials(sessionId: string): Promise<{
   workspace_id: string;
   llm_api_key: string;
   withhold_sandbox_keys: boolean;
+  /** For a review someone asked of the session's owner: the model turns it may still take; null for every other session. */
+  review_turns_left: number | null;
+  /** The reasoning effort the session chose (`claw_sessions.effort`), or none. */
+  effort: ReasoningEffort | undefined;
 }> {
   // `claw_sessions` only ships `user_id` in the canonical schema; the legacy
   // `platform_key` / `workspace_id` columns are optional add-ons in some
@@ -180,6 +186,8 @@ async function loadSessionCredentials(sessionId: string): Promise<{
   if (CLAW_DEPLOY_MODE !== "kubernetes" && !credentials.platformKey) {
     throw new MissingPlatformKeyError(`session ${sessionId}`);
   }
+  // Read now, as a chat turn reads it (sessions/dispatch.ts): a run of the session asks for the effort the session has.
+  const effort = sessionEffortFromRow((await db.query("SELECT effort FROM claw_sessions WHERE session_id = $1", [sessionId])).rows[0]);
   return {
     user_id: row.user_id ?? "",
     platform_key: credentials.platformKey,
@@ -188,6 +196,8 @@ async function loadSessionCredentials(sessionId: string): Promise<{
     workspace_id: sessionWorkspaceId || defaultTaskWorkspaceId(process.env, CLAW_DEPLOY_MODE === "kubernetes"),
     llm_api_key: credentials.llmApiKey,
     withhold_sandbox_keys: withholdsSandboxKeys(cfg),
+    review_turns_left: usesReviewProfile(cfg) ? (await reviewTurnsLeft(sessionId, row.user_id ?? "")).left : null,
+    effort,
   };
 }
 
@@ -405,11 +415,18 @@ function buildExecuteRequest(opts: {
   session: Awaited<ReturnType<typeof loadSessionCredentials>>;
   internalToken: string;
   filesWorkspaceId: string;
-  memoryEnabled: boolean;
   /** From `pluginToolsForRun`; undefined leaves the field off the message. */
   pluginTools: unknown[] | null | undefined;
 }): ExecuteRequest {
-  const { updated, rendered, session, internalToken, filesWorkspaceId, memoryEnabled, pluginTools } = opts;
+  const request = executeRequestOf(opts);
+  // A task in a review someone asked of the owner runs with the same fixed profile as its turns (`github-review/review-profile.ts`). One
+  // whose turn budget is used up throws here, before anything is published, and is failed `review_turn_budget_used`.
+  if (opts.session.review_turns_left !== null) applyReviewProfile(request as unknown as Record<string, unknown>, opts.session.review_turns_left);
+  return request;
+}
+
+function executeRequestOf(opts: Parameters<typeof buildExecuteRequest>[0]): ExecuteRequest {
+  const { updated, rendered, session, internalToken, filesWorkspaceId, pluginTools } = opts;
   const sandboxSpecForBrain = (rendered.sandbox_spec ?? "none") as ExecuteRequest["sandbox_spec"];
   // Lift per-user env snapshot from task.input back to the top-level
   // ExecuteRequest field Brain expects. expandDag embedded it under
@@ -450,18 +467,20 @@ function buildExecuteRequest(opts: {
     workspace_id: extractSandboxNamespace(sandboxSpecForBrain) || session.workspace_id || undefined,
     platform_key: session.platform_key || "",
     llm_api_key: session.llm_api_key || undefined,
-    ...(session.withhold_sandbox_keys ? { withhold_sandbox_keys: true, ...actingSessionTurnFields(updated.model ?? undefined) } : {}),
+    ...(session.withhold_sandbox_keys ? { withhold_sandbox_keys: true, ...actingSessionTurnFields() } : {}),
     user_id: session.user_id || "",
     user_env: userEnvForReq,
     plugin_id: updated.plugin_id ?? undefined,
     ...(pluginTools !== undefined ? { plugin_tools: pluginTools } : {}),
     prompt: rendered.prompt ?? undefined,
     history: [],
-    memory_enabled: memoryEnabled,
+    // A task, DAG node or application run is not the user's conversation: no memory tools.
+    memory_enabled: false,
     skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
     script: rendered.script as ExecuteRequest["script"] | undefined,
     tools_allowlist: (updated.tools_allowlist as string[]) ?? undefined,
     model: updated.model ?? undefined,
+    ...(session.effort ? { effort: session.effort } : {}),
     files_workspace_id: filesWorkspaceId,
     files_workspace_required: true,
     // Legacy fields removed -- new schema uses sandbox_spec exclusively.
@@ -488,6 +507,7 @@ async function resolveDispatchFailure(
   logger.error({ taskId, err: msg }, "task.dispatch_failed");
   const bindFailure = isWorkspaceBindingError(e);
   const credentialFailure = e instanceof MissingPlatformKeyError;
+  const reviewBudgetUsed = e instanceof ReviewTurnBudgetUsedError;
   // The one failure here that is worth another attempt on its own. Everything
   // else is either the task's own fault (an unrenderable template, a session
   // that does not exist) or already covered: a NATS publish that failed leaves
@@ -523,7 +543,9 @@ async function resolveDispatchFailure(
   await transitionStatus(taskId, ["preparing"], "failed", {
     failure_reason: credentialFailure
       ? "missing_platform_key"
-      : bindFailure
+      : reviewBudgetUsed
+        ? "review_turn_budget_used"
+        : bindFailure
         ? "workspace_bind_failed"
         : "agent_error",
     error_message: msg,
@@ -631,7 +653,6 @@ export async function dispatchPreparedRow(locked: ClawTaskRow): Promise<Dispatch
     );
     const req = buildExecuteRequest({
       updated, rendered, session, internalToken, filesWorkspaceId,
-      memoryEnabled: await isMemoryActive(session.user_id || ""),
       pluginTools: await pluginToolsForRun(updated, session.user_id || ""),
     });
     // Scripts and apps run no model turn.

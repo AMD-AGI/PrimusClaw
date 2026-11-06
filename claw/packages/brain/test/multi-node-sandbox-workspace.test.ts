@@ -5,11 +5,10 @@
  * A multi-node run's Hands sandbox is placed next to its cluster, whatever it asks for.
  *
  * With a CPU workspace (SANDBOX_CPU_NAMESPACE) a sandbox that asks for no GPU goes there, and
- * that workspace may be on another cluster (SANDBOX_CPU_ROUTER_URL). A multi-node run's
+ * that workspace may be on another cluster. A multi-node run's
  * cluster is always in the GPU workspace, and the optimizer in Hands drives it through the
  * Ray head's service and the Infera pods' IPs, which resolve only on the cluster's own
- * cluster. So the sandbox of such a run goes to the cluster's namespace, and is reached
- * through the Router of that namespace, not the CPU one.
+ * cluster. So the sandbox of such a run goes to the cluster's namespace.
  *
  * Driven through the real `ensureHands` with a stub provider: what the provider was asked to
  * create, the Hands URL and health probe that were built, and the record the sandbox is
@@ -24,7 +23,6 @@ import { bindDagHandles } from "./support/dag-handle-kv.js";
 process.env.SANDBOX_NAMESPACE = "gpu-ws";
 process.env.SANDBOX_CPU_NAMESPACE = "cpu-ws";
 process.env.SANDBOX_ROUTER_URL = "http://gpu-r1.test";
-process.env.SANDBOX_CPU_ROUTER_URL = "http://cpu-r1.test";
 process.env.SANDBOX_HANDS_VIA_ROUTER = "true";
 delete process.env.CLAW_DEPLOY_MODE;
 
@@ -144,7 +142,6 @@ async function place(
 }
 
 const gpuRouter = (ns: string) => `http://gpu-r1.test/v1/namespaces/${ns}/code-interpreters/wl-created/invocations/proxy/`;
-const cpuRouter = (ns: string) => `http://cpu-r1.test/v1/namespaces/${ns}/code-interpreters/wl-created/invocations/proxy/`;
 
 type Row = {
   name: string;
@@ -158,7 +155,7 @@ type Row = {
 };
 
 const ROWS: Row[] = [
-  // The defect: the sandbox asks for no GPU, so it was sent to the CPU workspace and its Router.
+  // The defect: the sandbox asks for no GPU, so it was sent to the CPU workspace.
   { name: "multi-node, CPU-only sandbox, request names nothing: the cluster's namespace", resources: CPU_ONLY, workspace: undefined, cluster: "gpu-ws", namespace: "gpu-ws", router: gpuRouter },
   { name: "multi-node, CPU-only sandbox, request names ''", resources: CPU_ONLY, workspace: "", cluster: "gpu-ws", namespace: "gpu-ws", router: gpuRouter },
   { name: "multi-node, gpu 0 sandbox, request names the CPU workspace (the console's default)", resources: CPU_ONLY_GPU_ZERO, workspace: "cpu-ws", cluster: "gpu-ws", namespace: "gpu-ws", router: gpuRouter },
@@ -166,8 +163,8 @@ const ROWS: Row[] = [
   // Unchanged: a sandbox that asks for a GPU was already there.
   { name: "multi-node, GPU sandbox: the cluster's namespace, as before", resources: WITH_GPU, workspace: undefined, cluster: "gpu-ws", namespace: "gpu-ws", router: gpuRouter },
   // Unchanged: no cluster, no change to where a sandbox goes.
-  { name: "single-node, CPU-only sandbox: the CPU workspace, through the CPU Router", resources: CPU_ONLY, workspace: undefined, namespace: "cpu-ws", router: cpuRouter },
-  { name: "single-node, GPU sandbox: the GPU workspace, through the GPU Router", resources: WITH_GPU, workspace: undefined, namespace: "gpu-ws", router: gpuRouter },
+  { name: "single-node, CPU-only sandbox: the CPU workspace", resources: CPU_ONLY, workspace: undefined, namespace: "cpu-ws", router: gpuRouter },
+  { name: "single-node, GPU sandbox: the GPU workspace", resources: WITH_GPU, workspace: undefined, namespace: "gpu-ws", router: gpuRouter },
 ];
 
 for (const row of ROWS) {

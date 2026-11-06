@@ -72,6 +72,8 @@ export function manifestOf(items: readonly FixtureItem[]): ManifestItem[] {
   return items.map((i) => ({
     itemId: itemIdOf(i.seq), seq: i.seq, title: i.title, boardState: i.boardState, summary: i.summary,
     lastReportKind: i.lastReportKind, resultVersion: i.resultVersion, pendingQuestion: i.pendingQuestion,
+    // How a closed item ended, as the store records it: a dropped report closes it as dropped, anything else closed was accepted.
+    outcome: i.boardState !== "done" ? null : i.lastReportKind === "dropped" ? "dropped" : "accepted",
   }));
 }
 
@@ -473,9 +475,11 @@ export interface Score {
   sayItemOk: boolean;
   /** The reply is in the user's language. */
   langOk: boolean;
+  /** No reply says what the case's `sayNot` forbids. */
+  contentOk: boolean;
   /** The user was told by the turn's end (plain text, no say) and not by a say. */
   rescued: boolean;
-  /** dispatch, speech, item and language all right. */
+  /** dispatch, speech, item, language and content all right. */
   turnOk: boolean;
   actual: Effects;
   /** Counting calls the tools refused as well: what the model first reached for. */
@@ -508,9 +512,10 @@ export function scoreCase(c: EvalCase, t: Trace): Score {
   const sayItemOk = c.sayItem == null || says.some((x) => x.ref?.seq === c.sayItem);
   const texts = [...says.map((x) => String(x.input.text ?? "")), ...delivered];
   const langOk = !c.lang || texts.every((s) => (c.lang === "zh" ? CJK.test(s) : !CJK.test(s)));
+  const contentOk = !c.sayNot || texts.every((s) => !c.sayNot!.test(s));
   return {
-    id: c.id, kind: c.kind, dispatchOk, spokeOk, sayItemOk, langOk, rescued: delivered.length > 0,
-    turnOk: dispatchOk && spokeOk && sayItemOk && langOk,
+    id: c.id, kind: c.kind, dispatchOk, spokeOk, sayItemOk, langOk, contentOk, rescued: delivered.length > 0,
+    turnOk: dispatchOk && spokeOk && sayItemOk && langOk && contentOk,
     actual, attempted, spoke: says.length + delivered.length,
     inexactRefs: t.calls.filter((x) => x.ref && !x.ref.exact).length,
     refusals: t.calls.filter((x) => x.refused).map((x) => `${x.tool}:${(x.result as { error?: string }).error}`),

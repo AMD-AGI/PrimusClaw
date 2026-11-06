@@ -95,8 +95,8 @@ export function clipIntent(text: unknown, secrets: readonly string[] = []): stri
 /** Whether an argument NAME reads as a credential: the rule events are redacted with, plus a bare `pwd`, which
  *  the event rule leaves out because `PWD` is the shell's working directory in an environment, but which as the
  *  name of a tool argument is a password far more often than a path. */
-function isCredentialName(key: string): boolean {
-  return isSensitiveKey(key) || key.toLowerCase() === "pwd";
+function isCredentialName(key: string, value: unknown): boolean {
+  return isSensitiveKey(key, value) || key.toLowerCase() === "pwd";
 }
 
 const MIN_SECRET_CHARS = 4;
@@ -112,7 +112,7 @@ export function credentialValues(value: unknown, underSecret = false, depth = 0,
     for (const v of value.slice(0, 100)) credentialValues(v, underSecret, depth + 1, out);
   } else if (typeof value === "object") {
     for (const [k, v] of Object.entries(value as Record<string, unknown>).slice(0, 100)) {
-      credentialValues(v, underSecret || isCredentialName(k), depth + 1, out);
+      credentialValues(v, underSecret || isCredentialName(k, v), depth + 1, out);
     }
   }
   return out;
@@ -139,7 +139,7 @@ export function maskArguments(value: unknown, secrets: readonly string[] = [], d
   if (Array.isArray(value)) return value.slice(0, MAX_ITEMS).map((v) => maskArguments(v, secrets, depth + 1));
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>).slice(0, MAX_ITEMS)) {
-    out[k] = isCredentialName(k) ? HIDDEN : maskArguments(v, secrets, depth + 1);
+    out[k] = isCredentialName(k, v) ? HIDDEN : maskArguments(v, secrets, depth + 1);
   }
   return out;
 }

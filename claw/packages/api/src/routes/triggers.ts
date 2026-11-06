@@ -10,7 +10,7 @@
  * them from.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { assertSessionCredentialsForDispatch } from "../auth/session-credentials.js";
+import { assertSessionCredentialsForDispatch, stampSessionCredentials } from "../auth/session-credentials.js";
 import { getUser } from "../auth/middleware.js";
 import { TRIGGER_MIN_INTERVAL_MINUTES } from "../config.js";
 import { db } from "../infra/db.js";
@@ -114,13 +114,22 @@ export async function registerTriggerRoutes(app: FastifyInstance): Promise<void>
     if (!user) return;
     const id = (req.params as any).id as string;
     const cur = (await db.query(
-      "SELECT schedule, timezone FROM claw_triggers WHERE trigger_id = $1 AND owner_user_id = $2",
-      [id, user.userId])).rows[0] as { schedule: string; timezone: string } | undefined;
+      "SELECT schedule, timezone, item_id FROM claw_triggers WHERE trigger_id = $1 AND owner_user_id = $2",
+      [id, user.userId])).rows[0] as { schedule: string; timezone: string; item_id: string | null } | undefined;
     if (!cur) return reply.status(404).send({ ok: false, error: "not_found" });
     try {
       assertSessionCredentialsForDispatch("trigger", user);
     } catch {
       return reply.status(400).send({ ok: false, error: "no platform key on this request" });
+    }
+    // A trigger bound to an item fires into the item's worker session, on the
+    // credentials stamped there rather than `credential_enc`, so those are what
+    // a resume has to renew for the next firing to start.
+    if (cur.item_id) {
+      const worker = (await db.query(
+        "SELECT worker_session_id FROM claw_work_items WHERE item_id = $1 AND user_id = $2",
+        [cur.item_id, user.userId])).rows[0] as { worker_session_id: string | null } | undefined;
+      if (worker?.worker_session_id) await stampSessionCredentials(worker.worker_session_id, user);
     }
     // From the next FUTURE time: a paused trigger does not catch up on resume.
     const r = await db.query(

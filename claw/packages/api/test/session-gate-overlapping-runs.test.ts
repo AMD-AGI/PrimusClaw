@@ -159,3 +159,85 @@ test("a named turn whose replay is still open has not ended", async () => {
   await seedRun(h, USER.taskId, SESSION, { status: "running", messageId: USER.messageId });
   assert.equal(await liveRunVerdict(USER), "turn_superseded");
 });
+
+/**
+ * Every other way a run ends has to hand the gate back on the same terms as the
+ * completion does. Each case leaves the wake named on the gate, already ended,
+ * and the user's run the last one in the session; the path under test ends that
+ * run and must open the gate, or the session waits for `reapStuckSessions`.
+ */
+async function wakeEndedUserLast(userStatus: string, extra: Partial<Parameters<typeof seedRun>[3]> = {}): Promise<void> {
+  await seedSession(h, SESSION, { gateOwner: WAKE.messageId });
+  await seedRun(h, WAKE.taskId, SESSION, { status: "completed", messageId: WAKE.messageId });
+  await seedRun(h, USER.taskId, SESSION, { status: userStatus, messageId: USER.messageId, ...extra });
+}
+
+test("a Stop on the run still going opens a gate naming the turn that ended", async () => {
+  const { releaseSessionGateIfUnoccupied } = await import("../src/tasks/chat-run.js");
+  await wakeEndedUserLast("cancelled");
+  await releaseSessionGateIfUnoccupied(SESSION, USER.messageId);
+  assert.deepEqual(await gate(), { status: "idle", owner: null });
+});
+
+test("forcing idle after an interrupt opens a gate naming the turn that ended", async () => {
+  const { forceIdleAfterInterrupt } = await import("../src/tasks/chat-run.js");
+  await wakeEndedUserLast("cancelled");
+  assert.equal(await forceIdleAfterInterrupt(SESSION, USER.messageId), true);
+  assert.deepEqual(await gate(), { status: "idle", owner: null });
+});
+
+test("a queue timeout of the last run opens a gate naming the turn that ended", async () => {
+  const { reapExpiredQueuedRuns, sweeperPorts } = await import("../src/tasks/sweeper.js");
+  const original = { ...sweeperPorts };
+  Object.assign(sweeperPorts, { publishSessionEvent: async () => {} });
+  try {
+    await wakeEndedUserLast("queued", { dispatch: "doorbell", queuedAgoSec: 3 * 60 * 60 });
+    assert.equal(await reapExpiredQueuedRuns(), 1);
+    assert.deepEqual(await gate(), { status: "idle", owner: null });
+  } finally {
+    Object.assign(sweeperPorts, original);
+  }
+});
+
+test("a reconciled dispatch of the last run opens a gate naming the turn that ended", async () => {
+  const { reconcileAmbiguousDispatches } = await import("../src/tasks/sweeper.js");
+  await wakeEndedUserLast("failed");
+  await h.sql(
+    `UPDATE claw_tasks SET dispatch_reconcile_at = NOW() - INTERVAL '1 minute',
+                           dispatch_reconcile_action = 'idle_existing_session'
+      WHERE task_id = $1`,
+    [USER.taskId],
+  );
+  assert.equal(await reconcileAmbiguousDispatches(), 1);
+  assert.deepEqual(await gate(), { status: "idle", owner: null });
+});
+
+test("an ended marker over an empty session does not refuse an unforced take", async () => {
+  const { takeSessionGateIfUnowned } = await import("../src/tasks/chat-run.js");
+  await seedSession(h, SESSION, { agentStatus: "idle", gateOwner: WAKE.messageId });
+  await seedRun(h, WAKE.taskId, SESSION, { status: "completed", messageId: WAKE.messageId });
+  await seedRun(h, "run-next", SESSION, { status: "queued", messageId: "claw-next" });
+  assert.equal(await takeSessionGateIfUnowned(SESSION, "claw-next"), true);
+  assert.deepEqual(await gate(), { status: "running", owner: "claw-next" });
+});
+
+test("an ended marker over a run still going keeps refusing an unforced take", async () => {
+  const { takeSessionGateIfUnowned } = await import("../src/tasks/chat-run.js");
+  await wakeEndedUserLast("running");
+  assert.equal(await takeSessionGateIfUnowned(SESSION, "claw-next"), false);
+  assert.deepEqual(await gate(), { status: "running", owner: WAKE.messageId });
+});
+
+test("the stuck-session reaper clears the marker along with the status", async () => {
+  const { reapStuckSessions, sweeperPorts } = await import("../src/tasks/sweeper.js");
+  const original = { ...sweeperPorts };
+  Object.assign(sweeperPorts, { deliverySettlement: async () => null });
+  try {
+    await seedSession(h, SESSION, { gateOwner: WAKE.messageId, updatedAgoSec: 7 * 24 * 60 * 60 });
+    await seedRun(h, WAKE.taskId, SESSION, { status: "failed", messageId: WAKE.messageId });
+    assert.equal(await reapStuckSessions(), 1);
+    assert.deepEqual(await gate(), { status: "idle", owner: null });
+  } finally {
+    Object.assign(sweeperPorts, original);
+  }
+});

@@ -22,13 +22,13 @@ import {
 } from "./attribution.js";
 import {
   HANDS_MCP_URL, SAFE_API_URL, SANDBOX_NAMESPACE, AUTH_INTERNAL_TOKEN,
-  ANTHROPIC_BASE_URL, OPENAI_BASE_URL, isKubernetesMode, AGENT_SANDBOX_NAMESPACE,
+  ANTHROPIC_BASE_URL, OPENAI_BASE_URL, isKubernetesMode, AGENT_SANDBOX_NAMESPACE, SANDBOX_CPU_NAMESPACE,
   HANDS_HEALTH_MAX_TRIES, HANDS_HEALTH_INTERVAL_MS,
 } from "../config.js";
 import { getSystemEnv } from "../infra/system-env.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
 import { checkHandsHealth } from "./hands-health.js";
-import { safeHandsBaseUrl } from "./sandbox-router.js";
+import { rememberRouterCredential, safeHandsBaseUrl } from "./sandbox-router.js";
 import type { HandsHealthResult } from "./hands-health.js";
 import { destroyHands } from "./reaper.js";
 import {
@@ -39,8 +39,11 @@ import {
   writeTopologyHandoff,
   hasSshKeyFile,
   applyPlatformKeyEnv,
-  withholdKeyEnv,
+  withholdSandboxEnv,
+  handleEnvRecord,
+  handleServesEnvOf,
   sandboxUserEnv,
+  withoutGpuKeys,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
@@ -67,7 +70,8 @@ import {
   type ContainerProbeOutcome,
   type HandsProbeEntry,
 } from "./container-probe.js";
-import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
+import { sandboxSpecFingerprint, evaluateReuse, type ReuseVerdict } from "./spec-fingerprint.js";
+import { isReviewProfile } from "../agent/review-profile.js";
 import { metrics } from "../infra/metrics.js";
 import { handsSessionKey } from "./hands-key.js";
 import { readHandsEntry, retentionStore, type HandsBinding } from "./registry.js";
@@ -84,6 +88,8 @@ const SANDBOX_IMAGE_RE = /(?:^|\s)sandboximage:\s*(\S+)/im;
 export function resolveSandboxImageFromRequest(request: ExecuteRequest): string {
   const direct = String(request.sandbox_image ?? "").trim();
   if (direct) return direct;
+  // A requested review's prompt holds what the requester wrote: it never picks the image the review runs in.
+  if (isReviewProfile(request)) return "";
   const fromPrompt = SANDBOX_IMAGE_RE.exec(String(request.prompt ?? ""))?.[1]?.trim();
   return fromPrompt || "";
 }
@@ -141,9 +147,28 @@ function effectiveWorkloadResources(
   request: ExecuteRequest,
   params: { resources: Record<string, string> },
 ): Array<Record<string, string | number>> | null {
-  return Object.keys(params.resources).length > 0
+  const resources = Object.keys(params.resources).length > 0
     ? resourcesMapToWorkloadArray(params.resources)
     : resourcesJsonToWorkloadArray(request.resources);
+  // A requested review's sandbox is a CPU sandbox in the CPU workspace: a GPU it asked for is not given (it would queue there for ever).
+  return isReviewProfile(request) && resources ? resources.map(withoutGpu) : resources;
+}
+
+function withoutGpu(entry: Record<string, string | number>): Record<string, string | number> {
+  return withoutGpuKeys(entry);
+}
+
+/**
+ * Where a requested review's sandbox goes (`sandbox_profile: "review"`): the deployment's existing CPU sandbox workspace, whatever the
+ * request names; Kubernetes mode's own sandbox namespace there. A SaFE deployment without a CPU workspace has no place for it, and the run
+ * is refused a sandbox rather than given one in a workspace that would hold the owner's storage (the API offers such a review no sandbox
+ * tools in the first place).
+ */
+export function reviewSandboxNamespace(kubernetes: boolean, cpuNamespace: string, agentNamespace: string): string {
+  if (kubernetes) return agentNamespace;
+  const cpu = cpuNamespace.trim();
+  if (!cpu) throw new Error("a requested review has no sandbox on this deployment: SANDBOX_CPU_NAMESPACE is not set");
+  return cpu;
 }
 
 /**
@@ -179,10 +204,10 @@ export function requestSpecFingerprint(
     userEnv: sandboxUserEnv(request),
     sessionEnv: request.session_env,
   });
-  // As the sandbox is built (provisionHands): a session that acts as a user has none of the key variables, so a change in one of
+  // As the sandbox is built (provisionHands): a session that acts as a user has none of the layers' variables, so a change in one of
   // them is not a change in the sandbox, and its key is not one that was injected.
   const withholdKeys = request.withhold_sandbox_keys === true;
-  if (withholdKeys) withholdKeyEnv(env);
+  if (withholdKeys) withholdSandboxEnv(env);
   const labels = action.params.labels ?? {};
   // The resources the SaFE create will use; the namespace depends on whether they ask
   // for a GPU, so it is read once and reused for the fingerprint below.
@@ -206,6 +231,7 @@ export function requestSpecFingerprint(
       // not per-request and so is not folded in there.
       llmKey: withholdKeys ? undefined : resolveRequestLlmKey(request),
       withholdKeys,
+      ...(isReviewProfile(request) ? { profile: "review" } : {}),
     });
   }
   const resources: Record<string, string> = {};
@@ -221,6 +247,7 @@ export function requestSpecFingerprint(
     labels,
     namespace,
     withholdKeys,
+    ...(isReviewProfile(request) ? { profile: "review" } : {}),
   });
 }
 
@@ -238,12 +265,13 @@ function sandboxNamespaceFor(
   resources?: unknown,
   multiNodeContext?: MultiNodeContext,
 ): string {
+  // First: a requested review's sandbox ignores the workspace the request names, a multi-node cluster and the GPU choice alike.
+  if (isReviewProfile(request)) return reviewSandboxNamespace(isKubernetesMode(), SANDBOX_CPU_NAMESPACE, AGENT_SANDBOX_NAMESPACE);
   if (isKubernetesMode()) return request.workspace_id?.trim() || AGENT_SANDBOX_NAMESPACE;
   // A multi-node run's sandbox goes where its cluster is, whatever the sandbox asks for.
   // The optimizer in it drives the cluster through the Ray head's service and the Infera
   // pods' IPs, which resolve only on the cluster's own cluster; a CPU-only sandbox placed
-  // by its resources would land in the CPU workspace, which may be on another one. The
-  // Router follows the namespace (`sandboxRouterBasesFor`), so it is the cluster's.
+  // by its resources would land in the CPU workspace, which may be on another one.
   const clusterNamespace = multiNodeContext?.namespace?.trim();
   if (clusterNamespace) return clusterNamespace;
   // SaFE mode: a deployment with a CPU workspace chooses by what the sandbox asks for
@@ -440,6 +468,7 @@ async function probeHandleSandbox(
   token?: string,
   signal?: AbortSignal,
 ): Promise<HandleSandboxState> {
+  rememberRouterCredential(handsUrl, identity && "platformKey" in identity ? identity.platformKey : undefined);
   const health = await checkHandsHealth(handsUrl, REUSE_HEALTH_TIMEOUT_MS, signal);
   if (health.ok) return { state: "serving", detail: health.detail };
   // Without both of these there is nothing to probe or restart WITH: the
@@ -1769,6 +1798,7 @@ async function reuseOwnDagHandle(
   }
 
   const identity = identityFromHandleInfo(own);
+  rememberRouterCredential(own.hands_url, own.platform_key);
 
   // Half-created, or built for something else. `makeOnProvisioned` registers the
   // handle the moment SaFE assigns an id -- deliberately, because a cancel
@@ -1796,12 +1826,14 @@ async function reuseOwnDagHandle(
         ? "no_token_recorded"
         : !handleImageMatches(own, action)
           ? "image_changed"
-          : null;
+          : !handleServesEnvOf(own, request)
+            ? "env_not_withheld"
+            : null;
   if (unusable) {
     const refused = await releaseOwnHandleSandbox(
       a, dagRoot, action.handle, own, identity, ownKey, unusable,
-      // Only a spec change reaches here over a sandbox that is alive.
-      unusable === "image_changed",
+      // Only a spec change (its image, or an environment this request must not have) reaches here over a sandbox that is alive.
+      unusable === "image_changed" || unusable === "env_not_withheld",
     );
     if (!refused) return null;
     throw new Error(
@@ -1926,6 +1958,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
   if (!recorded) return null;
   const { binding, info } = recorded;
   const identity = reuseIdentity(info);
+  rememberRouterCredential(info.handsUrl, identity.platformKey);
   const hasToken = typeof info.token === "string" && info.token.length > 0;
   if (typeof info.terminalReason === "string" && info.terminalReason) {
     // The previous sandbox is already finished: this turn is new work, not a
@@ -2019,7 +2052,12 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
     return null;
   }
 
-  const verdict = evaluateReuse(info.specFingerprint, requestedSpec);
+  // A session that acts as a user is served only by a sandbox recorded as built for one: the leniency for a sandbox with no or an older
+  // fingerprint is for what the session already had, and such a sandbox can hold the environment this one must not.
+  const evaluated = evaluateReuse(info.specFingerprint, requestedSpec);
+  const verdict: ReuseVerdict = request.withhold_sandbox_keys === true && evaluated.reason !== "spec_match"
+    ? { reuse: false, reason: "spec_changed", recorded: String(info.specFingerprint ?? ""), requested: requestedSpec }
+    : evaluated;
   if (!verdict.reuse) {
     logger.info(
       { sessionId, recorded: verdict.recorded, requested: verdict.requested },
@@ -2312,6 +2350,7 @@ export async function registerReusedDagHandle(
       namespace: identity.namespace,
       session_id: identity.sessionId,
       user_id: identity.userId,
+      ...handleEnvRecord(request),
     }, { mayTakeFrom: retainedTaker(kv) });
   } catch (e) {
     // Not swallowed. Adopting a sandbox whose ownership could not be recorded
@@ -2494,6 +2533,12 @@ async function provisionHands(
 ): Promise<EnsureHandsResult> {
   const kv = getHandsKv();
 
+  // Multi-node writes a credential into the sandbox (infera's SSH key for its GPU pods) that no environment rule can take back out, and
+  // a session that acts as a user runs code strangers wrote.
+  if (multiNodeContext && request.withhold_sandbox_keys === true) {
+    throw new Error("a session that acts as a user cannot be given a multi-node sandbox");
+  }
+
   // Local dev mode: Hands is running locally — treat as "not created" (no
   // lifecycle, no need to restore workspace from S3).
   //
@@ -2566,7 +2611,13 @@ async function provisionHands(
         `sandbox_spec.use='${action.handle}' has no registered handle for dag ${dagRoot}`,
       );
     }
+    if (!handleServesEnvOf(info, request)) {
+      throw new Error(
+        `sandbox_spec.use='${action.handle}' names a sandbox that was not built for a session that acts as a user`,
+      );
+    }
     const identity = identityFromHandleInfo(info);
+    rememberRouterCredential(info.hands_url, info.platform_key);
     // A registered handle is not necessarily a living Hands endpoint. Probe
     // and restart against this handle's identity, never the shared session key.
     await assertDagHandleAlive(
@@ -2701,13 +2752,13 @@ async function provisionHands(
     sessionEnv: request.session_env ?? {},
   });
   // A session that acts as a user's GitHub account: its model reads text strangers
-  // wrote, and whatever the sandbox's environment holds the model can print. Its
-  // owner's stored variables are not composed in at all (`sandboxUserEnv`), and the
-  // key variables are taken out of the composed result, so that no layer can have
-  // put one there (the spec's env, the user's own variables, the request's).
+  // wrote and runs their code, and whatever the sandbox's environment holds that
+  // code can read. Its sandbox keeps only what Brain set for Hands to run
+  // (`withholdSandboxEnv`): no key, and nothing of the spec's env, the deployment's
+  // system env, the owner's stored variables or the request's own env.
   // `apiKey` is still what the workload is created and owned with (below); only a
   // copy a process in the sandbox could read is withheld.
-  if (request.withhold_sandbox_keys) withholdKeyEnv(env);
+  if (request.withhold_sandbox_keys) withholdSandboxEnv(env);
 
   // ── kubernetes/BYOK mode: agent-sandbox provider path (design §16.5). ──
   // safe mode falls through to the SaFE Workload path below (unchanged).
@@ -2791,6 +2842,9 @@ async function provisionHands(
       onEvent,
       signal: options.signal,
       reclaimOnAbort: options.reclaimOnAbort,
+      // A requested review's sandbox gets none of the workspace's storage: SaFE then mounts neither the owner's directory nor the
+      // workspace's volumes. Sent as false, never left out (SaFE reads an absent field as true).
+      ...(isReviewProfile(request) ? { useWorkspaceStorage: false } : {}),
     });
   } catch (err) {
     await hold.release();
@@ -2806,6 +2860,7 @@ async function provisionHands(
   // The cluster DNS name unless Hands is reached through the Router, in which
   // case the Router's port proxy for this sandbox (see sandbox-router.ts).
   const handsBaseUrl = safeHandsBaseUrl(nsForSandbox, workloadId, mcpPort);
+  rememberRouterCredential(handsBaseUrl, apiKey);
 
   logger.info({ sessionId, workloadId, handsBaseUrl }, "ensureHands.bootstrap_start");
   await bootstrapHandsInSandbox(
@@ -2978,6 +3033,7 @@ async function provisionHands(
         // deployment default when the field is missing, so a workspace-scoped
         // sandbox would be polled where it is not and expire while still live.
         namespace: nsForSandbox,
+        ...handleEnvRecord(request),
       }, { mayTakeFrom: retainedTaker(kv) });
     } catch (e) {
       // Was non-fatal, on the reasoning that a DAG can still complete without
@@ -3725,6 +3781,7 @@ async function ensureHandsAgentSandbox(
           hands_url: handsUrl,
           token: handsToken,
           image: workloadImage,
+          ...handleEnvRecord(request),
         }, { mayTakeFrom: retainedTaker(kv) });
       } catch (e) {
         // Same reasoning as the SaFE path, rollback included: the sandbox is

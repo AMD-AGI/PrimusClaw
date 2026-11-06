@@ -5,6 +5,8 @@
 // destination applies it). Here because Hands' recursive grep skips the same trees:
 // they are large, not work, and one list cannot drift from the other.
 
+import { DELIVERY_DIR } from "./deliveries.js";
+
 /**
  * Dropped from every destination.
  *
@@ -62,6 +64,8 @@ export const WORKSPACE_EXCLUDES = [
   // is what makes "no sandbox writes here" a fact rather than an assumption.
   ".transcripts",
   TOOL_RESULTS_DIR,
+  // The same as `.transcripts`, for the copies `deliver_file` makes (./deliveries.ts).
+  DELIVERY_DIR,
   // Historical bootstrap artefact (~100MB) from Brain releases that wrote the
   // Hands binary into /workspace. Current Brain puts it under /tmp; kept
   // because old workspaces still have one.

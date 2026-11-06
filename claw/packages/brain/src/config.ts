@@ -166,6 +166,9 @@ export const TOOLS_API_URL = `${SAFE_API_URL}/claw-api/v1/tools`;
  * uses this + `/v1/namespaces/...`; when empty, uses `${SAFE_API_URL}/sandbox` + same path
  * (public ingress).
  *
+ * Names the managing (global) Router, which serves every workspace and forwards a
+ * sandbox in another cluster to that cluster's Router.
+ *
  * May list several bases, comma-separated, all fronting the same Router (for example one
  * per gateway node of a remote cluster). Requests go to the one that last answered and move
  * to the next only when a connection could not be opened, so a request is never sent twice.
@@ -183,23 +186,18 @@ export const SANDBOX_ROUTER_URL = env("SANDBOX_ROUTER_URL", "");
  */
 export const SANDBOX_CPU_NAMESPACE = env("SANDBOX_CPU_NAMESPACE");
 /**
- * The Router base(s) of the sandboxes in SANDBOX_CPU_NAMESPACE, same format as
- * SANDBOX_ROUTER_URL. A Router answers only for the sandboxes of its own cluster, so
- * a CPU workspace on another cluster than SANDBOX_NAMESPACE needs its own. Empty
- * means SANDBOX_ROUTER_URL serves it too (and the CPU workspace is on the same cluster).
- */
-export const SANDBOX_CPU_ROUTER_URL = env("SANDBOX_CPU_ROUTER_URL");
-/**
  * Reach Hands through the Router's port proxy instead of the sandbox's cluster DNS name.
  *
  * Off by default because the DNS name is the shorter path wherever it resolves, which is
  * every deployment whose sandboxes run in its own cluster. Turn it on when they run in
  * another cluster, where that name does not resolve and the Router is the only way in.
- * Has no effect without SANDBOX_ROUTER_URL (or, for the CPU workspace, SANDBOX_CPU_ROUTER_URL).
+ * Has no effect without SANDBOX_ROUTER_URL.
  *
- * Requires a Router running without `--enable-auth`. Routed Hands requests carry the
- * per-sandbox Hands token (in Authorization and X-Hands-Token), not a SaFE API key, so a
- * Router with auth on refuses them with 401 and the Hands health check fails loudly.
+ * Routed Hands requests carry the per-sandbox Hands token in X-Hands-Token. A Router
+ * running with `--enable-auth` also needs a SaFE key it accepts: with
+ * SANDBOX_ROUTER_AUTH_ENABLED on, `Authorization` carries the sandbox owner's platform
+ * key (see `rememberRouterCredential` in sandbox/sandbox-router.ts); with it off, such a
+ * Router refuses them with 401 and the Hands health check fails loudly.
  */
 export const SANDBOX_HANDS_VIA_ROUTER = envBool("SANDBOX_HANDS_VIA_ROUTER", false);
 
@@ -209,14 +207,15 @@ export const SANDBOX_HANDS_VIA_ROUTER = envBool("SANDBOX_HANDS_VIA_ROUTER", fals
  * defined in this file depend on it and that module imports this one.
  */
 export function handsBehindRouterProxy(): boolean {
-  return SANDBOX_HANDS_VIA_ROUTER
-    && (/[^\s,]/.test(SANDBOX_ROUTER_URL) || /[^\s,]/.test(SANDBOX_CPU_ROUTER_URL));
+  return SANDBOX_HANDS_VIA_ROUTER && /[^\s,]/.test(SANDBOX_ROUTER_URL);
 }
 /**
  * Whether the sandbox Router runs with `--enable-auth`. It decides what an
  * application's session-level MCP carries as `token`: with auth on, the
  * `<SAFE_API_KEY>` placeholder (the Router authenticates the session owner);
- * with auth off, the run's MCP token. Must match the API's setting.
+ * with auth off, the run's MCP token. With it on, routed Hands requests also
+ * present the sandbox owner's platform key to the Router. Must match the API's
+ * setting.
  */
 export const SANDBOX_ROUTER_AUTH_ENABLED = envBool("SANDBOX_ROUTER_AUTH_ENABLED", false);
 export const SANDBOX_NAMESPACE = env("SANDBOX_NAMESPACE", "default");
@@ -1711,6 +1710,15 @@ export const BRAIN_WORKSPACE_SNAPSHOT_ENABLED = envBool("BRAIN_WORKSPACE_SNAPSHO
 // --- Todo Write ---
 export const TODO_WRITE_ENABLED = envBool("TODO_WRITE_ENABLED", true);
 
+// --- Deliver File ---
+// `deliver_file`: the agent hands a workspace file to the user as a download
+// (tools/deliver-file.ts). The cap is what Hands reads into memory to upload it.
+// Off by default in kubernetes mode: the download answers only an interactive sign-in
+// (a SaFE cookie or an identity-provider token), and a BYOK key is not one because the
+// sandbox holds the same key. Turn it on there when users sign in with identity tokens.
+export const DELIVER_FILE_ENABLED = envBool("DELIVER_FILE_ENABLED", !isKubernetesMode());
+export const DELIVER_FILE_MAX_BYTES = envInt("DELIVER_FILE_MAX_BYTES", 100 * 1024 * 1024, { min: 1 });
+
 // --- Plan Mode ---
 export const EXIT_PLAN_MODE_ENABLED = envBool("EXIT_PLAN_MODE_ENABLED", true);
 
@@ -1853,7 +1861,7 @@ export const WAIT_DEFAULT_SEC = envInt("WAIT_DEFAULT_SEC", 100, { min: 1 });
 
 // --- HITL ---
 export const HITL_ENABLED = envBool("HITL_ENABLED", false);
-export const HITL_AUTO_ALLOW = env("HITL_AUTO_ALLOW", "read,glob,grep,ls,load_skill,todo_write,web_search,save_memory");
+export const HITL_AUTO_ALLOW = env("HITL_AUTO_ALLOW", "read,glob,grep,ls,load_skill,todo_write,web_search,save_memory,update_memory,recall_memory,forget_memory");
 export const HITL_DECISION_TIMEOUT_MS = envInt("HITL_DECISION_TIMEOUT_MS", 300_000);
 export const HITL_DECISION_DEFAULT = env("HITL_DECISION_DEFAULT", "allow");
 /**
@@ -1878,6 +1886,11 @@ export const HITL_SUMMARY_MODEL = env("HITL_SUMMARY_MODEL", "").trim();
  * Unset means none; set but unparsable holds every bash command.
  */
 export const BASH_APPROVAL_RULES = process.env.BASH_APPROVAL_RULES;
+/**
+ * The built-in rules that hold GitHub writes made from the shell (agent/bash-approval-defaults.ts),
+ * on unless set to false. They add to BASH_APPROVAL_RULES and to a plugin's rules, never replace them.
+ */
+export const BASH_APPROVAL_DEFAULTS_ENABLED = envBool("BASH_APPROVAL_DEFAULTS_ENABLED", true);
 
 // --- Rules ---
 export const RULES_ENABLED = envBool("RULES_ENABLED", false);
@@ -1889,13 +1902,18 @@ export const RULES_DIR = env("RULES_DIR", "/app/rules");
 // unreadable means the feature is off and chats are built exactly as before.
 export const PLATFORM_DEFAULTS_FILE = env("PLATFORM_DEFAULTS_FILE");
 // Comma-separated hosts a marketplace tool's or a plugin's MCP server must name
-// for its `<SAFE_API_KEY>` to expand to the caller's platform key. Those servers
+// for its `<SAFE_API_KEY>` to expand to the caller's platform key, besides the
+// origins the defaults file's own servers send `<SAFE_API_KEY>` to. Those servers
 // are written by third parties at any URL; anywhere else the key expands to "".
 export const MCP_PLATFORM_KEY_ALLOWED_HOSTS: ReadonlySet<string> = new Set(
   env("MCP_PLATFORM_KEY_ALLOWED_HOSTS").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
 );
 // Whether the file's `skills` apply. Off: only its MCP servers are mounted.
 export const PROGRESSIVE_SKILLS_ENABLED = envBool("PROGRESSIVE_SKILLS_ENABLED", false);
+// Where a turn's skill and MCP server hints go. Off (default): after the user's message, in the execution policy's
+// placeholders, as always. On: in the system message, so the user's message is the last thing the model reads and the
+// hints are part of the cached prefix. Affects every session; switch it on only after an evaluation shows no regression.
+export const SKILL_HINTS_IN_SYSTEM = envBool("SKILL_HINTS_IN_SYSTEM", false);
 // Budget for the downloaded skill files (plugin skills and marketplace tool_ids
 // skills) Brain keeps in memory between turns, so a skill version is fetched once
 // per process instead of once per turn (see tools/skill-cache.ts). Counted as
