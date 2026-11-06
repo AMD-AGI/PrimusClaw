@@ -16,6 +16,9 @@
  *   F3b the copies run side by side under one deadline, so a store that stops answering holds the work call's transaction that long at
  *       most: a copy not done by then is a file not attached, and the others still go
  *   F4  work_send does the same for an item that already has a worker; a turn that answers no message of the user's sends no files
+ *   F4b a follow-up that starts a new item ("去掉 cancelled 再算一次", no file with it) hands that item the files the user sent earlier in
+ *       the conversation, and the router is told it will: within the last day, newest first, each once, only this session's; a
+ *       forward to an item that has them sends nothing again
  *   F5  a worker's delivered files reach the user after its report: one message each, carrying the file (a small image inline), never
  *       twice; a progress report announces nothing; an expired or malformed object is not a file
  *   F6  an answer longer than a usual message is given whole (up to REPORT_ANSWER_MAX) and said to the user whole by the system, at once,
@@ -235,6 +238,52 @@ describe("assistant files in, results out", { skip }, () => {
     const out2 = await w.mod.tools.workSend(plain, { item_id: item.itemId, text: "Also check main." });
     assert.deepEqual(copies, []);
     assert.equal(out2.files_attached, undefined);
+  });
+
+  test("F4b a follow-up that starts a new item hands it the files the user sent earlier", async () => {
+    const JOBS = { files: [{ path: "teams/m1/jobs.csv", name: "jobs.csv", media_type: "text/csv", size: 90_000 }] };
+    const first = await turnWith(JOBS, "附件 jobs.csv 是 GPU 作业记录，按 workspace 汇总 GPU 小时。");
+    const done = await w.mod.tools.workCreate(first, { title: "jobs.csv 汇总 GPU 小时", brief: "汇总 jobs.csv。" });
+    assert.equal(done.files_attached, 1);
+    assert.equal(done.files_from_earlier_messages, undefined, "the message's own file is not an earlier one");
+    await w.closeRun(first.task_id);
+    // Another session's file, and one of this session sent more than a day ago: neither goes.
+    await w.q(
+      `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context, received_at)
+       VALUES ($1, 'old-msg', $2, 'old', $3::jsonb, NOW() - interval '25 hours'), ('other-session', 'x-msg', $2, 'x', $4::jsonb, NOW())`,
+      [alice.routerSid, alice.userId,
+        JSON.stringify({ files: [{ path: "teams/m0/stale.csv", name: "stale.csv" }] }),
+        JSON.stringify({ files: [{ path: "teams/mx/theirs.csv", name: "theirs.csv" }] })],
+    );
+    copies = [];
+
+    const follow = await turnWith({}, "去掉 cancelled 的再算一次。");
+    // The router is told the file is there for the new item, so it does not ask for it again.
+    const task: Record<string, unknown> = { task_id: follow.task_id, message_id: follow.mid, prompt: "去掉 cancelled 的再算一次。" };
+    await w.mod.role.applySessionRoleToTask(task, alice.routerSid);
+    const prompt = String(task.prompt);
+    assert.ok(prompt.includes("Files the user sent earlier in this conversation"), prompt.slice(-2000));
+    assert.ok(prompt.includes("\"jobs.csv\"") && !prompt.includes("stale.csv") && !prompt.includes("theirs.csv"));
+    assert.ok(!prompt.includes("Files the user sent with this message"));
+
+    const out = await w.mod.tools.workCreate(follow, { title: "jobs.csv 去掉 cancelled 再算", brief: "去掉 cancelled 后再汇总 jobs.csv。" });
+    const workerSid = (await w.item(out.item_id)).worker_session_id as string;
+    assert.deepEqual(copies, [
+      { from: `${prefix(alice.routerSid)}.uploads/teams/m1/jobs.csv`, to: `${prefix(workerSid)}.uploads/teams/m1/jobs.csv` },
+    ], "the earlier file, and only it");
+    assert.equal(out.files_attached, 1);
+    assert.equal(out.files_from_earlier_messages, 1);
+    const content = String((await w.pending(workerSid))[0].content);
+    assert.ok(content.startsWith("去掉 cancelled 后再汇总 jobs.csv。"));
+    assert.ok(content.includes("earlier in this conversation") && content.includes('\n- "/workspace/.uploads/teams/m1/jobs.csv"\n'), content);
+
+    // Forwarded to the item that worked on it instead, nothing is copied again: its worker has it.
+    copies = [];
+    const again = await turnWith({}, "再算一次，这次只看 train-b。");
+    assert.equal((await w.item(done.item_id)).board_state, "in_progress");
+    const sent = await w.mod.tools.workSend(again, { item_id: done.item_id, text: "只看 train-b 再算一次。" });
+    assert.equal(sent.files_attached, undefined);
+    assert.deepEqual(copies, []);
   });
 
   test("F5 a worker's delivered files reach the user once each, after a report that says something", async () => {

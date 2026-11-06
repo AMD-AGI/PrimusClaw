@@ -42,7 +42,7 @@ import { triggerToolSettings } from "../triggers/mcp.js";
 import { askedOfOthers } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
 import { toldRefs } from "./told.js";
-import { promptImagesOf, renderFilesState } from "./files.js";
+import { earlierFilesOf, promptImagesOf, renderFilesState } from "./files.js";
 import { turnMessage } from "./inbound.js";
 import { startWorkerRun } from "./run-started.js";
 import { githubEventsEnabled } from "./github-events.js";
@@ -282,9 +282,12 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     if (held) state.push(held);
     // What the person sent beside their words (`files.ts`): the router is told what came, and is shown the pictures itself (Brain
     // reads them from this session's uploads), since it has no sandbox to open them in.
-    const files = (await turnMessage((t, p) => db.query(t, p), sessionId, messageId))?.context.files ?? [];
+    const message = await turnMessage((t, p) => db.query(t, p), sessionId, messageId);
+    const files = message?.context.files ?? [];
+    // And what they sent earlier in the conversation, which a new item gets too (`earlierFilesOf`): a follow-up is about those.
+    const earlier = message ? await earlierFilesOf((t, p) => db.query(t, p), sessionId, messageId, files) : [];
+    if (files.length || earlier.length) state.push(renderFilesState(files, earlier));
     if (files.length) {
-      state.push(renderFilesState(files));
       const images = promptImagesOf(files);
       if (images.length) task.prompt_images = images;
     }

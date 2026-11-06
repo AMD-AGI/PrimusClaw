@@ -39,6 +39,16 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A follow-up that starts a new item ("去掉 cancelled 再算一次") no longer leaves its worker without the file the user sent earlier: a new item
+  gets a copy of the files the user sent in the last 24 hours of the conversation (`files_from_earlier_messages`), the router is told
+  they will go with it, and it forwards a follow-up to the item that did the work while that item is open (`router-v15`).
+- A write a worker holds for its person is no longer put to them before what was found: the worker reports what it found first
+  (`worker-v5`), that report is said to the person ahead of the request, and the request says what the write would do in plain words
+  (the comment it would post, whole) in the person's language, never as the tool's name alone. A comment the router drafts itself is
+  put on its card after the answers the user asked for (`router-write-v2`).
+- How far an item got is read now, not estimated: `work_recall(item, "live")` shows the worker's last steps with their times (a log's
+  latest lines included), and a `say` that names an item still in progress, in a turn answering the user, is refused until that turn
+  looked at the item.
 - A router turn that said only a line that it was on it ("查一下 Autopilot 的状态。") before its lookup answered, and then wrote its
   answer as plain text, no longer leaves the person with that line alone: the completion skipped the text because the turn had
   spoken. When the turn's stored `toolUsed` events show that every say that went out came before its last lookup ended (answered or
