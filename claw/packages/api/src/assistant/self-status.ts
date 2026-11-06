@@ -80,6 +80,13 @@ function seconds(v: unknown): number | null {
 
 const int = (v: unknown): number => Number(v ?? 0) || 0;
 
+/**
+ * What a failure reason must look like to be named: a code Claw writes (sandbox_create_failed), words of letters joined by
+ * underscores. A step that failed can leave an MCP server's error text in the column (`script-runner.ts`), which is another user's
+ * and may hold anything; it is counted as other and never repeated.
+ */
+const REASON_CODE = /^[a-z]{2,24}(?:_[a-z]{2,24}){0,5}$/;
+
 export interface SelfStatus {
   window_hours: number;
   since: string;
@@ -211,7 +218,8 @@ export async function readSelfStatus(hours: number = DAY_HOURS, now: number = Da
       const n = int(r.n);
       runs += n;
       runsByStatus[String(r.status)] = (runsByStatus[String(r.status)] ?? 0) + n;
-      const reason = typeof r.failure_reason === "string" ? r.failure_reason : null;
+      // A reason is a code Claw writes (sandbox_create_failed); anything else in the column is not repeated to anyone.
+      const reason = typeof r.failure_reason === "string" ? (REASON_CODE.test(r.failure_reason) ? r.failure_reason : "other") : null;
       if (r.status === "failed") reasons.set(reason ?? "unknown", (reasons.get(reason ?? "unknown") ?? 0) + n);
       if (r.sandbox === true) {
         sandboxRuns += n;
