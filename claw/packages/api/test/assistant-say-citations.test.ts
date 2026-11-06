@@ -53,7 +53,7 @@ test("SC1 an entry is kept only when it is well formed and cited in the text; Br
     "[click](https://evil.example/[1])", '<a href="https://evil.example">[1]</a>', "[1] <https://evil.example>", "[1] see www.evil.example",
     "[1] mail mailto:x@evil.example", "[1] and [x](relative/page)", "[1] [^2]\n\n[^2]: footnote", "> [1]: //evil.example\n> [1]",
     "- [1]: evil.example\n- [1]", "[1] [x] (//evil.example)", '<a href="page">[1]</a>', "[1] and [x] (page)", "[1] owner@evil.com",
-    "[1]owner@evil.example.org"]) {
+    "[1]owner@evil.example.org", "[1] see //evil.example/x"]) {
     assert.deepEqual([...citedNumbers(linked)], [], `a number that is or is in a link is no citation: ${linked}`);
   }
   assert.deepEqual([...citedNumbers("[[1]](https://evil.example/) and [2]")], [], "a text that can make a link cites nothing");
