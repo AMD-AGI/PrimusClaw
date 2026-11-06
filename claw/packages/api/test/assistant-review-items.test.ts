@@ -878,6 +878,26 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual(await keysOf(d.session_id), { platformKey: "pk-bob", llmApiKey: "vk-bob" });
   }));
 
+  test("Q7b a review that waits for a slot is halted with the rest when the say is withdrawn: it stops waiting, says so, and never starts from the queue", () => withEnv({ ...ROOMY, CLAW_REVIEW_FOR_OTHERS_PER_REQUESTER_MAX_ACTIVE: "1" }, async () => {
+    const running = await askedOfBob({ prs: [PR(1)] });
+    const r = await start("alice", { prs: [PR(2)], acting_as: "bob", acting_as_name: "Bob B" });
+    const waiting = r.body.data.items[0];
+    assert.deepEqual([r.status, waiting.queued], [200, { reason: "too_many_from_requester" }]);
+    delegation.bob = "off";
+    assert.equal(await ri.gateRequestedReviewTurn(running.session_id), false);
+    const item = await w.item(waiting.item_id);
+    assert.deepEqual([item.params.queued, item.params.halted?.reason], [undefined, "delegation_off"], "halted, and no longer waiting");
+    assert.deepEqual([item.board_state, item.last_report_kind], ["needs_you", "failed"]);
+    assert.match(item.summary, /^AMD-AGI\/PrimusClaw#2 not run: reviewer turned off reviews for others$/, "the halt is put in front of the owner, not \"queued\"");
+    // The reviewer turns delegation back on and a slot frees: the halted review is not started by the queue without a new request.
+    delete delegation.bob;
+    const { stopWorkItem } = await import("../src/assistant/work-items.js");
+    assert.equal((await stopWorkItem({ userId: "bob", itemId: running.item_id, source: "user" })).status, "ok");
+    assert.equal(await ri.startQueuedReviews(), 0);
+    assert.equal(await count("claw_pending_messages", `session_id = '${waiting.session_id}'`), 0, "nothing of it is queued to run");
+    assert.equal((await w.item(waiting.item_id)).params.halted?.reason, "delegation_off", "the halt reason stands");
+  }));
+
   test("Q8 a requested review's turns are budgeted: per review and per reviewer per day, and an exhausted one does not run", async () => {
     const env = { CLAW_REVIEW_FOR_OTHERS_TURNS_PER_ITEM: "10", CLAW_REVIEW_FOR_OTHERS_TURNS_PER_DAY: "15" };
     const saved = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));

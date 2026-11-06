@@ -109,7 +109,8 @@ The item limits (the owner's unfinished items, and the review-agent limits below
 and waits for a slot, answered with `queued: {reason}` (the limit's code, `too_many_active_items`, `too_many_requested_reviews` or
 `too_many_from_requester`). Its session gets no message until then; every tick the sweeper starts the waiting reviews of each owner
 that now fit, oldest first, and one that would fit while others of its kind wait is queued behind them. A queued review holds no slot,
-counts as open for the hourly limits and for one review per pull request, and is stopped like any other. Only past 20 waiting items
+counts as open for the hourly limits and for one review per pull request, and is stopped like any other. One halted while it waits
+(the reviewer's say withdrawn halts every review asked of them) stops waiting: its owner sees the halt, and only a restart runs it. Only past 20 waiting items
 of one owner is the limit's refusal answered (`409 too_many_active_items`, with `data.scope` for the review-agent limits).
 
 The item's state is read off the audit and confirmation tables, never from the model: a merge, a queued merge or a posted

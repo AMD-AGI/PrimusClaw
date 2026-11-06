@@ -995,7 +995,9 @@ async function haltRequestedReviews(ownerUserId: string, sessionIds: string[], h
       );
     }
     return (await query(
-      `UPDATE claw_work_items SET params = params || jsonb_build_object('halted', $2::jsonb), updated_at = NOW()
+      // A review that waits for a slot stops waiting too: a halted review never starts from the queue (`startQueuedReviews`), and its
+      // owner is shown the halt rather than "queued".
+      `UPDATE claw_work_items SET params = (params - 'queued') || jsonb_build_object('halted', $2::jsonb), updated_at = NOW()
         WHERE worker_session_id = ANY($1::text[]) AND kind = 'review' AND board_state <> 'done' RETURNING item_id`,
       [sessionIds, JSON.stringify(halted)],
     )).rows.map((r) => (r as { item_id: string }).item_id);
@@ -1108,7 +1110,7 @@ export type ReviewState =
  */
 export function reviewState(f: ReviewFacts): ReviewState {
   const pr = prName(f.pr);
-  if (f.queued) return { boardState: "in_progress", summary: `${pr} is queued: it starts by itself when a slot is free`, question: null };
+  if (f.queued && !f.halted) return { boardState: "in_progress", summary: `${pr} is queued: it starts by itself when a slot is free`, question: null };
   const own = f.actingAs === f.ownerUserId;
   const latest = <T extends { at: number }>(xs: T[]): T | null => xs.reduce<T | null>((a, x) => (!a || x.at >= a.at ? x : a), null);
   // What the sweep found of the pull request on GitHub (`followReviewItems`): merged by the requester's own account after this review's
@@ -1443,13 +1445,20 @@ async function startQueuedOf(owner: string): Promise<Array<{ itemId: string; ses
     )).rows.map((r) => [(r as { by: string }).by, Number((r as { n: number }).n)]));
     const waiting = (await query(
       `SELECT item_id, user_id, kind, worker_session_id, params FROM claw_work_items
-        WHERE user_id = $1 AND kind = 'review' AND ${WAITING} ORDER BY seq FOR UPDATE`,
+        WHERE user_id = $1 AND kind = 'review' AND ${WAITING} AND NOT (params ? 'halted') ORDER BY seq FOR UPDATE`,
       [owner],
     )).rows as Array<Record<string, unknown>>;
     const out: Array<{ itemId: string; sessionId: string; started: boolean }> = [];
     for (const row of waiting) {
       const params = readParams(row);
-      if (!params) continue;
+      if (!params) {
+        // Unreadable, it can never start: it stops waiting (so it holds no queue place) and is put in front of its owner as not run.
+        await query(
+          `UPDATE claw_work_items SET params = (params - 'queued') || jsonb_build_object('halted', $2::jsonb), updated_at = NOW() WHERE item_id = $1`,
+          [row.item_id, JSON.stringify({ reason: "unreadable", message: "it could not be read to start it from the queue" })],
+        );
+        continue;
+      }
       const by = params.requested_by ?? null;
       const itemId = row.item_id as string;
       const sessionId = row.worker_session_id as string;
