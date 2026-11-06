@@ -731,6 +731,20 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A database failover no longer leaves the API on the old primary, and no longer costs the assistant's replies. A
+  switchover demotes the old primary in place, and a connection still on it answers every read and refuses every write
+  (`25006`): `inTransaction` handed such a connection back to the pool after a clean rollback, to fail the next
+  transaction too. The first failover error (`25006`, `57P01`-`57P03`, a `08` connection error or a dropped socket) now
+  marks every connection opened before it stale: idle ones are dropped as they are checked out, held ones as they are
+  released. A statement Postgres refused before it ran (`25006`, `57P03`) is sent once more on a new connection after
+  `PG_FAILOVER_RETRY_DELAY_MS` (default 1000); so is a transaction that says it may run twice, which every way the
+  assistant stores a message does. A `say` that faulted tells the Router the message was not delivered and to call `say`
+  again; delivering a Router turn's unsaid answer is tried three times before it is given up, instead of once.
+- A reply the assistant's hourly cap (`CLAW_ASSISTANT_SAY_MAX_PER_HOUR`) refused is no longer dropped without a word. The
+  model's `say` was refused, and so was delivering what it wrote instead, and the user heard nothing for as long as the
+  cap held. A turn that answers the user's own message and ends with its reply refused, or with no words because `say`
+  was, now stores a notice in the system's words that the reply was held back (once per turn, not counted against the
+  cap); a turn a worker's report started is left alone as before.
 - Deleting a session that has no `hands.<sid>` binding and no key on its cleanup notification -- every session the
   retention pass deletes, and every sweeper replay of a delete that already finished -- is a finished teardown with
   nothing to address (`session.cleanup_nothing_addressable`), not `no_platform_key`. Claw holds no handle to anything

@@ -1222,26 +1222,44 @@ async function handleComplete(
     }
   }
   // 9b. A router turn that answered the user in plain text and said nothing: the text is what it meant to say. One that
-  //     failed or was stopped and said nothing: the user is told it did not go through. Best-effort: a turn whose words
-  //     were lost here is a user who heard nothing, which the model could have caused on its own, so this is a repair
-  //     and not a promise.
+  //     failed or was stopped and said nothing: the user is told it did not go through. A fault is tried again, a few
+  //     times over a few seconds -- long enough to outlast a database failover, whose first seconds are exactly when a
+  //     model's `say` fails and its turn ends here -- and is not allowed to fail the completion, which is stored and
+  //     processed by now. Delivering twice is not a risk: a retry finds what the first attempt stored.
   if (CLAW_ASSISTANT_ENABLED && endedRunIds.length && !rerun) {
-    try {
-      await completionPorts.deliverUnsaidAnswer({
-        sessionId,
-        runIds: endedRunIds,
-        messageId: messageId ?? undefined,
-        failed: Boolean(failed),
-        interrupted: Boolean(interrupted),
-        fromSweeper: (event as any).completion_source === "sweeper",
-        finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
-      });
-    } catch (err) {
-      logger.error({ err, sessionId }, "assistant.unsaid_answer_failed");
+    const unsaid = {
+      sessionId,
+      runIds: endedRunIds,
+      messageId: messageId ?? undefined,
+      failed: Boolean(failed),
+      interrupted: Boolean(interrupted),
+      fromSweeper: (event as any).completion_source === "sweeper",
+      finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
+    };
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await completionPorts.deliverUnsaidAnswer(unsaid);
+        break;
+      } catch (err) {
+        if (attempt >= UNSAID_ANSWER_ATTEMPTS) {
+          logger.error({ err, sessionId, runIds: endedRunIds, attempts: attempt }, "assistant.unsaid_answer_failed");
+          break;
+        }
+        logger.warn({ err, sessionId, attempt }, "assistant.unsaid_answer_retry");
+        await new Promise((resolve) => setTimeout(resolve, unsaidAnswerRetryDelayMs * attempt));
+      }
     }
   }
 
   logger.info({ sessionId, failed, userId }, "exec_complete.handled");
+}
+
+/** How often a router turn's unsaid answer is tried when delivering it faults, and the first pause between tries. */
+const UNSAID_ANSWER_ATTEMPTS = 3;
+let unsaidAnswerRetryDelayMs = 2_000;
+/** For tests: the pause between tries of an unsaid answer. */
+export function setUnsaidAnswerRetryDelayForTest(ms: number): void {
+  unsaidAnswerRetryDelayMs = ms;
 }
 
 const SUMMARIZE_THRESHOLD = 80_000;

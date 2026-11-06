@@ -261,8 +261,133 @@ if (DB_SCHEMA) {
   lockPool.on("connect", setSearchPath);
 }
 
+// A failover leaves connections on the server that stopped being the primary.
+//
+// Patroni demotes the old leader in place: its backends are terminated
+// (57P01), and for a moment the Service can still route a new connection to it
+// while it comes back up as a replica. Such a connection is healthy as far as
+// the socket goes -- it answers every SELECT -- and refuses every write with
+// 25006 for as long as it lives. `pool.query` destroys the client a statement
+// failed on, but a transaction that failed was rolled back cleanly and its
+// client went back to the pool, still on the replica, to fail the next
+// transaction too; and the idle clients next to it were never asked at all.
+// Seen on a switchover: every replica logged 25006 from the scheduler, the
+// outbox, the event consumer and the assistant's tools at once.
+//
+// So the first failover error any statement meets is taken as news about the
+// whole pool, not about that one client: every connection opened before it is
+// dropped, the idle ones when they are next checked out through
+// `checkoutCurrent` and the held ones when they are released, and the
+// statement that met it is retried once on a new connection when Postgres has
+// said it never ran.
+
+/** SQLSTATEs that mean this connection is not on the primary any more, or the server is going away under it. */
+const FAILOVER_SQLSTATES = new Set([
+  "25006", // read_only_sql_transaction: the server is a replica now
+  "57P01", // admin_shutdown: a switchover terminated the backend
+  "57P02", // crash_shutdown
+  "57P03", // cannot_connect_now: shutting down or starting up
+  "08000", "08001", "08003", "08004", "08006", // connection_exception and its kinds
+]);
+
+/**
+ * Of those, the ones where the statement provably did not take effect: refused
+ * by a read-only server, or never let in. A 57P01 or a dropped socket can land
+ * after a COMMIT took effect and before its answer, so those are not retried.
+ */
+const NOT_RUN_SQLSTATES = new Set(["25006", "57P03"]);
+
+/** A Postgres or socket error that means the connection is not, or soon will not be, on the primary. */
+export function isFailoverError(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null | undefined;
+  if (!e || typeof e !== "object") return false;
+  if (typeof e.code === "string" && FAILOVER_SQLSTATES.has(e.code)) return true;
+  return typeof e.message === "string" && /^Connection terminated/.test(e.message);
+}
+
+/** A failover error Postgres raised before the statement could take effect, so running it again is safe whatever it was. */
+export function failedBeforeRunning(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  return typeof code === "string" && NOT_RUN_SQLSTATES.has(code);
+}
+
+/** How long a retry after a failover waits, so the Service has moved to the new primary. */
+const FAILOVER_RETRY_DELAY_MS = envInt("PG_FAILOVER_RETRY_DELAY_MS", 1000, { min: 0 });
+
+let failoverGeneration = 0;
+const clientGeneration = new WeakMap<pg.ClientBase, number>();
+
+/** Whether this client was connected before the last failover this process saw. A client it never tagged is not. */
+function isStale(client: pg.ClientBase): boolean {
+  const born = clientGeneration.get(client);
+  return born !== undefined && born < failoverGeneration;
+}
+
+/**
+ * Record that a failover happened: every connection either pool holds now is
+ * from before it. Safe to call for each error of a burst; each call only makes
+ * the connections opened since the previous one stale too.
+ */
+export function noteFailover(err: unknown): void {
+  failoverGeneration += 1;
+  logger.warn({ code: (err as { code?: unknown })?.code, generation: failoverGeneration }, "db.failover_detected");
+}
+
+for (const p of [pool, lockPool]) {
+  p.on("connect", (client) => { clientGeneration.set(client, failoverGeneration); });
+  // A client from before the failover is closed as it is released, so the pool
+  // removes it instead of handing it out again (`_release` drops a client that
+  // is ending). Covers every holder, not only the helpers below.
+  p.on("release", (_err, client) => {
+    if (isStale(client)) client.end().catch(() => {});
+  });
+}
+
+/**
+ * A client connected since the last failover: one from before it is
+ * destroyed instead of used, and the next one taken, until a current one comes
+ * (a new connection is current, so this ends).
+ */
+export async function checkoutCurrent(p: pg.Pool = pool): Promise<pg.PoolClient> {
+  for (;;) {
+    const client = await p.connect();
+    if (!isStale(client)) return client;
+    client.release(new Error("connected before a failover"));
+  }
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * One statement on the main pool. A statement that met a failover error marks
+ * the pool's connections stale; one that Postgres refused before it ran is
+ * sent once more, on a connection made since, after a pause long enough for
+ * the Service to point at the new primary.
+ */
+async function query(text: string, params?: unknown[]): Promise<pg.QueryResult> {
+  try {
+    return await pool.query(text, params);
+  } catch (err) {
+    if (!isFailoverError(err)) throw err;
+    noteFailover(err);
+    if (!failedBeforeRunning(err)) throw err;
+    logger.warn({ code: (err as { code?: unknown }).code }, "db.failover_retry");
+    await sleep(FAILOVER_RETRY_DELAY_MS);
+    const client = await checkoutCurrent(pool);
+    try {
+      const result = await client.query(text, params);
+      client.release();
+      return result;
+    } catch (retryErr) {
+      if (isFailoverError(retryErr)) noteFailover(retryErr);
+      client.release(retryErr as Error);
+      throw retryErr;
+    }
+  }
+}
+
 export const db = {
-  query: (text: string, params?: unknown[]) => pool.query(text, params),
+  query,
   pool,
   lockPool,
 };
@@ -284,8 +409,24 @@ export type Querier = (text: string, params?: unknown[]) => Promise<pg.QueryResu
  * failed, because a connection that may still have a transaction open would
  * otherwise be handed to the next caller, whose first statement joins it.
  */
-export async function inTransaction<T>(run: (query: Querier) => Promise<T>): Promise<T> {
-  const client = await pool.connect();
+export async function inTransaction<T>(
+  run: (query: Querier) => Promise<T>,
+  opts: { retryOnFailover?: boolean } = {},
+): Promise<T> {
+  try {
+    return await transactionOnce(run);
+  } catch (err) {
+    // Only for a caller that said `run` may run twice: the database is as it was (Postgres refused the
+    // statement before it ran, and the transaction rolled back), but what `run` did besides is not ours to know.
+    if (!opts.retryOnFailover || !failedBeforeRunning(err)) throw err;
+    logger.warn({ code: (err as { code?: unknown }).code }, "db.failover_retry");
+    await sleep(FAILOVER_RETRY_DELAY_MS);
+    return transactionOnce(run);
+  }
+}
+
+async function transactionOnce<T>(run: (query: Querier) => Promise<T>): Promise<T> {
+  const client = await checkoutCurrent(pool);
   let broken = false;
   try {
     try {
@@ -297,6 +438,12 @@ export async function inTransaction<T>(run: (query: Querier) => Promise<T>): Pro
       await client.query("COMMIT");
       return result;
     } catch (err) {
+      // A connection on a server that is no longer the primary rolls back
+      // cleanly and would go back to the pool to fail the next transaction too.
+      if (isFailoverError(err)) {
+        noteFailover(err);
+        broken = true;
+      }
       await client.query("ROLLBACK").catch((rollbackErr: unknown) => {
         broken = true;
         logger.warn({ err: (rollbackErr as Error)?.message }, "db.rollback_failed");

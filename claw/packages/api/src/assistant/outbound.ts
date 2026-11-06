@@ -181,6 +181,19 @@ async function loadItem(q: Querier, itemId: string, userId?: string): Promise<It
 }
 
 /**
+ * Whether the user has had `limit` of the assistant's messages in the last hour, which is when `say` refuses another.
+ * The system's own messages are not counted: they are what is left when the assistant has failed to speak.
+ */
+export async function sayCapReached(q: Querier, userId: string, limit: number = CLAW_ASSISTANT_SAY_MAX_PER_HOUR): Promise<boolean> {
+  const recent = Number((await q(
+    `SELECT COUNT(*) AS n FROM claw_assistant_says
+      WHERE user_id = $1 AND NOT fallback AND created_at > NOW() - INTERVAL '1 hour'`,
+    [userId],
+  )).rows[0].n);
+  return recent >= limit;
+}
+
+/**
  * Record a message the assistant chose to say. Throws {@link SayRefused} for an
  * empty or over-long text, for an item that is not this user's or is not named as
  * an item is (`item-ref.ts`), and for a user who
@@ -204,15 +217,9 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
       item = await loadItem(q, named.item.item_id, input.userId);
       if (!item) throw new SayRefused("item_not_found", "no such item");
     }
-    // The system's own messages are not counted: they are what is left when the assistant has failed to speak.
-    const recent = Number((await q(
-      `SELECT COUNT(*) AS n FROM claw_assistant_says
-        WHERE user_id = $1 AND NOT fallback AND created_at > NOW() - INTERVAL '1 hour'`,
-      [input.userId],
-    )).rows[0].n);
-    if (recent >= limit) throw new SayRefused("say_rate_limited", `at most ${limit} messages an hour`);
+    if (await sayCapReached(q, input.userId, limit)) throw new SayRefused("say_rate_limited", `at most ${limit} messages an hour`);
     return store(q, { type: "assistant.say", sayId: randomUUID(), userId: input.userId, sessionId: input.sessionId, text, item });
-  });
+  }, { retryOnFailover: true });
   if (!stored) throw new Error("a fresh say id was already stored");
   await announce(stored, deps, input.turnMessageId);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
@@ -259,7 +266,7 @@ export async function recordNeedsYouFallback(input: { itemId: string }, deps: Sa
       text: answered ? `#${item.seq} "${item.title}": ${answer}` : needsYouText(item),
       item,
     });
-  });
+  }, { retryOnFailover: true });
   if (!stored) return null;
   await announce(stored, deps);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
@@ -276,7 +283,7 @@ export async function recordSystemNotice(
     type: "assistant.say", fallback: true, item: null,
     sayId: deterministicEventId("assistant.notice", input.userId, input.key),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
-  }));
+  }), { retryOnFailover: true });
   if (!stored) return null;
   await announce(stored, deps);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
