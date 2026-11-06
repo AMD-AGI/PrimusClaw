@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { agentLoop, type TurnPool } from "./agent-loop.js";
-import { ToolRouter, INHERIT_MODEL, type WebToolServices } from "../tools/router.js";
+import { fitShellSchemas, ToolRouter, INHERIT_MODEL, type WebToolServices } from "../tools/router.js";
 import type { HandsClient } from "../clients/hands.js";
 import type { HookRunner } from "./hooks.js";
 import type { Message, ReasoningEffort, ToolSchema, EventCallback } from "@claw/protocol";
@@ -163,14 +163,14 @@ export interface SubagentResult {
  * Pick the effective tool schemas for this sub-agent: the parent's, narrowed by
  * the run's tools_allowlist first so that nothing below can widen them again.
  */
-function filterSchemas(
+export function filterSchemas(
   parentSchemas: ToolSchema[],
   profile: SubagentType,
   explicitAllow?: string[],
   runAllowlist?: ToolAllowlist | null,
 ): ToolSchema[] {
   const profileAllow = PROFILE_ALLOW[profile];
-  return filterToolSchemas(parentSchemas, runAllowlist).filter((s) => {
+  return fitShellSchemas(filterToolSchemas(parentSchemas, runAllowlist).filter((s) => {
     const name = s.name;
     // Universal deny.
     if (DENY_LIST.has(name)) return false;
@@ -182,7 +182,7 @@ function filterSchemas(
     if (profileAllow === "all") return true;
     if (name.startsWith("mcp__")) return true;
     return profileAllow.includes(name);
-  });
+  }));
 }
 
 /**

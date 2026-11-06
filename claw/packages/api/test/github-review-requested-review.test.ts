@@ -40,7 +40,7 @@ let items: typeof import("../src/assistant/review-items.js");
 const ALICE = { userId: "u-alice", userName: "Alice A" };
 const BOB = { userId: "u-bob", userName: "Bob B" };
 const REQUESTED = { acting_as: "u-bob", requested_by: { user_id: "u-alice", label: "Alice A" }, sandbox_profile: "review" };
-const PROFILE_TOOLS = ["mcp__github_review__*", "read", "glob", "grep", "ls", "bash", "bash_output", "kill_shell", "task", "todo_write"];
+const PROFILE_TOOLS = ["mcp__github_review__*", "read", "glob", "grep", "ls", "bash", "bash_output", "wait", "kill_shell", "task", "todo_write"];
 
 before(async () => {
   const harness = await import("./scenario-harness.js");
