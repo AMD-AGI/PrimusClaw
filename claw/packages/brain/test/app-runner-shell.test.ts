@@ -344,10 +344,15 @@ test("starting a new generation removes the previous generation's exit.json; an 
 
 // --- the modes of the files the runner writes ---------------------------------
 
-/** The mode bits of what `writeFileCommand` leaves at `path`, run with `env`. */
+/**
+ * The mode bits of what `writeFileCommand` leaves at `path`, run with `env`. A `USER_DATA_PATH` of
+ * `null` is unset in the shell, not merely empty.
+ */
 async function writtenMode(w: ReturnType<typeof realWorld>, path: string, modes: typeof INPUT_FILE_MODES,
-  env: Record<string, string>): Promise<number> {
-  const r = await w.exec(writeFileCommand(path, modes), { ...env, CLAW_FILE_B64: b64("{}") });
+  env: { USER_DATA_PATH: string | null }): Promise<number> {
+  const unset = env.USER_DATA_PATH === null;
+  const command = (unset ? "unset USER_DATA_PATH; " : "") + writeFileCommand(path, modes);
+  const r = await w.exec(command, { ...(unset ? {} : { USER_DATA_PATH: env.USER_DATA_PATH! }), CLAW_FILE_B64: b64("{}") });
   assert.equal(r.exitCode, 0, r.stderr);
   assert.equal(readFileSync(path, "utf8"), "{}");
   return statSync(path).mode & 0o777;
@@ -361,10 +366,11 @@ test("inside USER_DATA_PATH the files are the group's to read; anywhere else, or
     assert.equal(await writtenMode(w, `${inside}/input.json`, INPUT_FILE_MODES, env), 0o640, env.USER_DATA_PATH);
     assert.equal(await writtenMode(w, `${inside}/boot/start.sh`, BOOTSTRAP_FILE_MODES, env), 0o750, env.USER_DATA_PATH);
   }
-  const elsewhere: Array<[string, string]> = [
+  const elsewhere: Array<[string, string | null]> = [
     [`${w.dir}/team/.claw-apps/${RUN_ID}`, user], // a state_dir outside the user directory
     [`${w.dir}/users/u10/.claw-apps/${RUN_ID}`, user], // a directory whose name only begins like it
-    [inside, ""], // USER_DATA_PATH unset
+    [inside, null], // USER_DATA_PATH unset
+    [inside, ""], // USER_DATA_PATH empty
     [inside, "/"], // USER_DATA_PATH the root
   ];
   for (const [dir, userDataPath] of elsewhere) {
