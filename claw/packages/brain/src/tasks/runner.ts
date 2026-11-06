@@ -14,7 +14,7 @@ import {
   type RecreateHandsResult,
 } from "../agent/index.js";
 import type { TurnPool } from "../agent/agent-loop.js";
-import type { NatsEmitter } from "../events/emitter.js";
+import { EmitStoodDownError, type NatsEmitter } from "../events/emitter.js";
 import {
   HandsClient, isHandsNetworkError,
   type OutstandingReconciliation, type ReclaimCause,
@@ -1463,14 +1463,17 @@ class TaskRunner {
     this.platformKey = request.platform_key || "";
   }
 
-  private readonly onEvent = async (evt: Record<string, unknown>): Promise<void> => {
+  private readonly onEvent = async (
+    evt: Record<string, unknown>, opts: { stillMine?: () => boolean } = {},
+  ): Promise<void> => {
     const safeEvent = redactPersistedEvent(
       evt,
       runtimeSecrets(this.request, this.platformKey),
     );
     if (this.messageId) safeEvent.message_id = this.messageId;
     this.transcriptLog.push({ ts: Date.now(), ...safeEvent });
-    await this.emitter.emit(this.sessionId, safeEvent);
+    if (opts.stillMine) await this.emitter.emit(this.sessionId, safeEvent, { stillMine: opts.stillMine });
+    else await this.emitter.emit(this.sessionId, safeEvent);
   };
 
   /**
@@ -3486,6 +3489,13 @@ class TaskRunner {
       tokenUsage: result.tokenUsage, toolStats: result.toolStats, failed: false,
     });
 
+    // The run may have stood down while it was saving its work: a lost lease,
+    // or the lock's self-fence, after which another brain may hold this run.
+    // A success published from here would then close the successor's row, so
+    // it is not published -- not first, and not on a retry once the stand-down
+    // arrives mid-publish. The ending is the stand-down's, as if the abort had
+    // been seen before this method was entered.
+    if (this.leaseLost) throw LEASE_LOST_ABORT_REASON;
     await this.onEvent({
       type: "exec_complete",
       session_id: this.sessionId,
@@ -3505,6 +3515,9 @@ class TaskRunner {
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
       ...runIdentity(this.request),
+    }, { stillMine: () => !this.leaseLost }).catch((err: unknown) => {
+      if (err instanceof EmitStoodDownError) throw LEASE_LOST_ABORT_REASON;
+      throw err;
     });
     // Persist the user-visible completion event before handing task state to
     // Backend. If Brain dies after the callback, outbox replay can safely skip

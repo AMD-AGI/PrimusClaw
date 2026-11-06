@@ -33,6 +33,14 @@ function sanitizeJson(str: string): string {
  */
 export const EMIT_RETRY_DELAYS_MS: readonly number[] = [250, 500, 1_000, 2_000, 3_000, 4_000, 5_000, 5_000];
 
+/** A publish not sent because its sender stood down first (see `emit`'s `stillMine`). */
+export class EmitStoodDownError extends Error {
+  constructor(type: string) {
+    super(`not published: ${type} (the run stood down)`);
+    this.name = "EmitStoodDownError";
+  }
+}
+
 /** Publishes events via JetStream for persistence + real-time SSE delivery. */
 export class NatsEmitter {
   private js!: JetStreamClient;
@@ -64,11 +72,19 @@ export class NatsEmitter {
    * was emitting. Only reachability errors are retried; anything else (a payload
    * over the limit, a permissions refusal) is thrown at once, as before.
    */
-  async emit(sessionId: string, event: Record<string, unknown>, opts: { msgID?: string } = {}): Promise<void> {
+  /**
+   * `stillMine`: asked before every attempt. A publish whose sender has since
+   * stood down -- a completion for a run another brain may now hold -- is not
+   * sent, or re-sent, after the answer turns false.
+   */
+  async emit(
+    sessionId: string, event: Record<string, unknown>, opts: { msgID?: string; stillMine?: () => boolean } = {},
+  ): Promise<void> {
     const subject = eventSubject(sessionId);
     const payload = sc.encode(sanitizeJson(JSON.stringify(event)));
     const msgID = opts.msgID ?? randomUUID();
     for (let attempt = 0; ; attempt++) {
+      if (opts.stillMine && !opts.stillMine()) throw new EmitStoodDownError(String(event.type ?? ""));
       try {
         await this.js.publish(subject, payload, { msgID });
         break;

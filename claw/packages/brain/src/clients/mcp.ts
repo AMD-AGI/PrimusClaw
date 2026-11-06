@@ -107,7 +107,10 @@ function resourceToolSchemas(server: string): Array<{ name: string; description:
 export type McpCallOutcome = { isError: boolean; sources?: unknown[] };
 
 /** `meta`: the request's `_meta`, which the server reads beside the arguments and the model never writes (`tools/citations.ts`). */
-type CallTool = (name: string, args: Record<string, unknown>, outcome?: McpCallOutcome, meta?: Record<string, unknown>) => Promise<string>;
+/** `signal`: the run's abort signal, so a run that has to stop (a lost or self-fenced lock) stops waiting on the call. */
+type CallTool = (
+  name: string, args: Record<string, unknown>, outcome?: McpCallOutcome, meta?: Record<string, unknown>, signal?: AbortSignal,
+) => Promise<string>;
 
 /** A connected server's tools, as a run calls them. */
 export type McpToolCaller = { callTool: CallTool };
@@ -263,7 +266,10 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
   const readOnlyTools = new Set<string>();
 
   return {
-    async callTool(toolName: string, args: Record<string, unknown>, outcome?: McpCallOutcome, meta?: Record<string, unknown>): Promise<string> {
+    async callTool(
+      toolName: string, args: Record<string, unknown>, outcome?: McpCallOutcome, meta?: Record<string, unknown>,
+      signal?: AbortSignal,
+    ): Promise<string> {
       if (resourceTools.has(toolName)) {
         if (toolName === LIST_RESOURCES) {
           const cursor = typeof args.cursor === "string" && args.cursor ? args.cursor : undefined;
@@ -278,7 +284,11 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
         const read = await retryTransientMcp(toolName, name, () => client.readResource({ uri }));
         return read.contents.map((c) => renderResourceContents(c as McpContentBlock)).join("\n");
       }
-      const send = () => client.callTool({ name: toolName, arguments: args, ...(meta ? { _meta: meta } : {}) });
+      const send = () => client.callTool(
+        { name: toolName, arguments: args, ...(meta ? { _meta: meta } : {}) },
+        undefined,
+        signal ? { signal } : undefined,
+      );
       const result = readOnlyTools.has(toolName) ? await retryTransientMcp(toolName, name, send) : await send();
       // The tool's own error bit (`isError`), which its text alone cannot carry: what it answered is a failure, not data it read.
       if (outcome && result.isError === true) outcome.isError = true;
@@ -418,8 +428,8 @@ export async function connectPlatformMcp(
       }
       clients.set(name, filter
         ? {
-            callTool: (toolName, args, outcome, meta) => filter.allows(toolName)
-              ? wrapper.callTool(toolName, args, outcome, meta)
+            callTool: (toolName, args, outcome, meta, signal) => filter.allows(toolName)
+              ? wrapper.callTool(toolName, args, outcome, meta, signal)
               : Promise.reject(new Error(`Tool ${toolName} is not enabled on MCP server ${name}`)),
           }
         : wrapper);

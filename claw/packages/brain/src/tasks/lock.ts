@@ -118,6 +118,12 @@ const lockTasks = new Map<string, string>();
 // close the claim is to lapsing while renewals are failing.
 const lockProvenAt = new Map<string, number>();
 
+// Locks whose run another brain may take over once they go unwritten: those
+// acquired on a fenced doorbell claim (`takeOverDeadHolder`), which is the only
+// kind of run a successor can be handed with this lock's `task` on it. Only
+// these stand down at the self-fence; any other lock keeps the proof deadline.
+const lockFenceable = new Set<string>();
+
 /** Drop all local memory of a lock we no longer hold. */
 function forgetLock(lockKey: string): void {
   lockRevisions.delete(lockKey);
@@ -125,6 +131,7 @@ function forgetLock(lockKey: string): void {
   lockAcquisitions.delete(lockKey);
   lockTasks.delete(lockKey);
   lockProvenAt.delete(lockKey);
+  lockFenceable.delete(lockKey);
 }
 
 /**
@@ -193,13 +200,14 @@ function unprovenForMs(lockKey: string, now: number): number | null {
 
 /**
  * Whether this process must stop working under `lockKey` because another brain
- * may soon take it over: the lock names its run, and it has gone unproven past
+ * may soon take it over: the lock names a run handed out on a fenced doorbell
+ * claim (the only kind a successor can be given), and it has gone unproven past
  * {@link lockSelfFenceMs}. Purely local -- no I/O -- so a run can ask it on a
  * short timer while its renewals hang on an unreachable NATS.
  */
 export function lockPastSelfFence(lockKey: string, now: number = Date.now()): boolean {
   const fence = lockSelfFenceMs();
-  if (fence === null || !lockTasks.has(lockKey)) return false;
+  if (fence === null || !lockFenceable.has(lockKey)) return false;
   const unproven = unprovenForMs(lockKey, now);
   return unproven !== null && unproven >= fence;
 }
@@ -485,9 +493,13 @@ export function deadHolderTakeover(
   return staleMs >= thresholdMs ? { ok: true, staleMs } : { ok: false };
 }
 
-function recordAcquired(lockKey: string, rev: number, value: LockValue, sentAt: number): void {
+function recordAcquired(
+  lockKey: string, rev: number, value: LockValue, sentAt: number, fenceable: boolean,
+): void {
   lockRevisions.set(lockKey, rev);
   lockProvenAt.set(lockKey, sentAt);
+  if (fenceable && value.task !== undefined) lockFenceable.add(lockKey);
+  else lockFenceable.delete(lockKey);
   if (value.seq !== undefined) lockSeqs.set(lockKey, value.seq);
   if (value.task !== undefined) lockTasks.set(lockKey, value.task);
   else lockTasks.delete(lockKey);
@@ -510,7 +522,7 @@ export async function acquireTaskLock(
   try {
     // kv.create returns the revision number assigned by NATS server.
     const rev = await getKv().create(`lock.${lockKey}`, sc.encode(JSON.stringify(value)));
-    recordAcquired(lockKey, Number(rev), value, value.acquiredAt);
+    recordAcquired(lockKey, Number(rev), value, value.acquiredAt, opts.takeOverDeadHolder === true);
     return true;
   } catch {
     // Key exists. Unlike the pre-INV13 implementation we do NOT steal even
@@ -540,7 +552,7 @@ export async function acquireTaskLock(
           // it is alive after all, the write fails, and the lock stays its.
           try {
             const rev = await getKv().update(`lock.${lockKey}`, sc.encode(JSON.stringify(value)), entry.revision);
-            recordAcquired(lockKey, Number(rev), value, value.acquiredAt);
+            recordAcquired(lockKey, Number(rev), value, value.acquiredAt, opts.takeOverDeadHolder === true);
             logger.warn(
               { lockKey, taskId: opts.taskId, previousHolder: holderInfo, previousPod: held?.pod, staleMs: takeover.staleMs },
               "lock.dead_holder_taken_over",

@@ -156,7 +156,8 @@ test("D6 a holder cut off from NATS stops before anybody may take its lock", asy
   // Every write lands two seconds after it was sent, so the store's stamp --
   // which the takeover counts from -- is later than anything the holder saw.
   stampDelayMs = 2_000;
-  assert.equal(await acquireTaskLock("sess-cut", 9, { taskId: "t-cut" }), true);
+  // Acquired on a fenced doorbell claim: the kind of run a successor can be handed.
+  assert.equal(await acquireTaskLock("sess-cut", 9, { taskId: "t-cut", takeOverDeadHolder: true }), true);
   now += LOCK_REFRESH_INTERVAL_MS;
   assert.equal(await refreshTaskLock("sess-cut"), "renewed");
   const lastSent = now;
@@ -193,14 +194,20 @@ test("D6 a holder cut off from NATS stops before anybody may take its lock", asy
   now = fencedAt;
   assert.equal(await refreshTaskLock("sess-cut"), "expired");
 
-  // A lock that names no run cannot be taken over, so it keeps the old,
-  // longer deadline.
-  const plain = storeKv(null);
-  bindTaskLockKv(plain.kv);
-  now = 9_000_000;
-  assert.equal(await acquireTaskLock("sess-plain", 1), true);
-  (plain.kv as unknown as Record<string, unknown>).update = cut;
-  now += TASK_LOCK_DEAD_HOLDER_MS;
-  assert.equal(lockPastSelfFence("sess-plain", now), false);
-  assert.equal(await refreshTaskLock("sess-plain"), "error");
+  // A lock no successor can be handed -- no run named, or a run not on a
+  // fenced doorbell claim (a fat delivery) -- cannot be taken over, so it
+  // keeps the old, longer deadline.
+  for (const [key, opts] of [
+    ["sess-plain", {}],
+    ["sess-fat", { taskId: "t-fat" }],
+  ] as const) {
+    const plain = storeKv(null);
+    bindTaskLockKv(plain.kv);
+    now = 9_000_000;
+    assert.equal(await acquireTaskLock(key, 1, opts), true);
+    (plain.kv as unknown as Record<string, unknown>).update = cut;
+    now += TASK_LOCK_DEAD_HOLDER_MS;
+    assert.equal(lockPastSelfFence(key, now), false, key);
+    assert.equal(await refreshTaskLock(key), "error", key);
+  }
 });

@@ -629,7 +629,7 @@ export class ToolRouter {
       const [, server, ...rest] = name.split("__");
       const client = this.platformMcp.get(server);
       if (!client) throw new Error(`Unknown MCP server: ${server}`);
-      return client.callTool(rest.join("__"), input, outcome, meta);
+      return client.callTool(rest.join("__"), input, outcome, meta, signal);
     }
 
     throw new Error(`Unknown tool: ${name}`);
