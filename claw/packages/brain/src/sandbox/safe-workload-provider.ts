@@ -32,7 +32,7 @@ import {
 import { resourcesMapToWorkloadArray } from "./params.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
 import { sandboxWorkloadName } from "./workload-naming.js";
-import { fetchThroughRouters, rememberRouterCredential, safeHandsBaseUrl, sandboxRouterBasesFor } from "./sandbox-router.js";
+import { fetchThroughRouters, rememberRouterCredential, safeHandsBaseUrl, sandboxRouterBases } from "./sandbox-router.js";
 import { waitForWorkloadReady, type WorkloadWaitDeps, type WorkloadWaitOptions } from "./workload-wait.js";
 import { describeWaiting } from "./workload-stall.js";
 import type {
@@ -216,7 +216,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
     opts?: SandboxExecOptions,
   ): Promise<SandboxExecResult> {
     const ns = inst.namespace?.trim() || SANDBOX_NAMESPACE;
-    const routers = sandboxRouterBasesFor(ns);
+    const routers = sandboxRouterBases();
     const path = `/v1/namespaces/${ns}/code-interpreters/${inst.id}/invocations/api/execute`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",

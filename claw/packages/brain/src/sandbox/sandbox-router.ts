@@ -22,8 +22,6 @@ import pino from "pino";
 import { routedHandsSessionId } from "@claw/protocol";
 import {
   SAFE_API_URL,
-  SANDBOX_CPU_NAMESPACE,
-  SANDBOX_CPU_ROUTER_URL,
   SANDBOX_HANDS_VIA_ROUTER,
   SANDBOX_ROUTER_AUTH_ENABLED,
   SANDBOX_ROUTER_URL,
@@ -54,30 +52,18 @@ function normalizeBase(raw: string): string {
   }
 }
 
+// The managing Router serves every workspace: it forwards a sandbox in another
+// cluster to that cluster's Router.
 const CONFIGURED_BASES = parseRouterBases(SANDBOX_ROUTER_URL);
-// The Router of the CPU workspace's cluster, when that is another cluster than the
-// one CONFIGURED_BASES fronts (a Router answers only for its own cluster's sandboxes).
-const CPU_BASES = parseRouterBases(SANDBOX_CPU_ROUTER_URL);
 
 /** The configured Router bases, in configured order; empty when none is set. */
 export function sandboxRouterBases(): readonly string[] {
   return CONFIGURED_BASES;
 }
 
-/**
- * The Router bases for a sandbox in `namespace`: SANDBOX_CPU_ROUTER_URL for the CPU
- * workspace when one is set, SANDBOX_ROUTER_URL for every other namespace (and for
- * all of them when no CPU Router is configured, which is today's behaviour).
- */
-export function sandboxRouterBasesFor(namespace?: string | null): readonly string[] {
-  const ns = namespace?.trim() ?? "";
-  if (ns !== "" && ns === SANDBOX_CPU_NAMESPACE.trim() && CPU_BASES.length > 0) return CPU_BASES;
-  return CONFIGURED_BASES;
-}
-
-/** Whether Hands of a sandbox in `namespace` is reached through the Router rather than by cluster DNS. */
-export function handsViaRouter(namespace?: string | null): boolean {
-  return SANDBOX_HANDS_VIA_ROUTER && sandboxRouterBasesFor(namespace).length > 0;
+/** Whether Hands is reached through the Router rather than by cluster DNS. */
+export function handsViaRouter(): boolean {
+  return SANDBOX_HANDS_VIA_ROUTER && CONFIGURED_BASES.length > 0;
 }
 
 /**
@@ -85,20 +71,19 @@ export function handsViaRouter(namespace?: string | null): boolean {
  * `handsViaRouter()`, the sandbox's cluster DNS name otherwise (unchanged).
  */
 export function safeHandsBaseUrl(namespace: string, workloadId: string, port: string): string {
-  if (!handsViaRouter(namespace)) return `http://${workloadId}.${namespace}.svc.cluster.local:${port}`;
-  const base = orderedBases(sandboxRouterBasesFor(namespace))[0];
+  if (!handsViaRouter()) return `http://${workloadId}.${namespace}.svc.cluster.local:${port}`;
+  const base = orderedBases(CONFIGURED_BASES)[0];
   return `${base}/v1/namespaces/${encodeURIComponent(namespace)}/code-interpreters/`
     + `${encodeURIComponent(workloadId)}/invocations/proxy/${port}`;
 }
 
 /**
- * The Router base a port-proxy URL is built on: the configured Router for the
- * sandbox's namespace (the one that last answered, when several are listed), else
- * the public ingress `${SAFE_API_URL}/sandbox` that `exec` falls back to. Null when
- * neither is set.
+ * The Router base a port-proxy URL is built on: the configured Router (the one
+ * that last answered, when several are listed), else the public ingress
+ * `${SAFE_API_URL}/sandbox` that `exec` falls back to. Null when neither is set.
  */
-export function routerBaseForPortProxy(namespace?: string | null): string | null {
-  const configured = orderedBases(sandboxRouterBasesFor(namespace))[0];
+export function routerBaseForPortProxy(): string | null {
+  const configured = orderedBases(CONFIGURED_BASES)[0];
   if (configured) return configured;
   const api = SAFE_API_URL.trim().replace(/\/+$/, "");
   return api ? `${api}/sandbox` : null;
@@ -262,17 +247,13 @@ export function withRouterFailover<F extends (input: any, init?: any) => Promise
   fetchImpl: F,
   bases?: () => readonly string[],
 ): F {
-  // Each list fronts one Router, so a URL fails over only within the list it belongs
-  // to: the other list is another cluster's Router, which would answer 404 for it.
-  const lists = (): ReadonlyArray<readonly string[]> =>
-    bases ? [bases()] : [CONFIGURED_BASES, CPU_BASES];
   const wrapped = (input: unknown, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : null;
     if (url === null) return fetchImpl(input, init);
     const routerKey = routerCredentialFor(url);
     if (routerKey) init = withRouterAuthorization(init, routerKey);
-    for (const list of lists()) {
-      if (list.length < 2) continue;
+    const list = bases ? bases() : CONFIGURED_BASES;
+    if (list.length >= 2) {
       const base = list.find((b) => url === b || url.startsWith(`${b}/`) || url.startsWith(`${b}?`));
       if (base) return fetchThroughRouters(list, url.slice(base.length), init, (u, i) => fetchImpl(u, i));
     }

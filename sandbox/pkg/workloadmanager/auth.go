@@ -1,119 +1,75 @@
 // SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// SaFE user authentication middleware for Workload Manager.
+// Caller authentication middleware for Workload Manager.
 // When --enable-auth is set, the WM validates user identity on all /v1/ endpoints.
 //
 // In the standard deployment, Router is the unified entry point. WM still
-// verifies the original SaFE credential itself: the WM Service is reachable
+// verifies the original credential itself: the WM Service is reachable
 // inside the cluster, so identity headers alone are never authentication.
+// Credentials are validated through identity provider token introspection (RFC 7662).
 package workloadmanager
 
 import (
-	"net/http"
-	"strings"
+	"errors"
 
 	"github.com/gin-gonic/gin"
 
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
-	"sigs.k8s.io/agent-sandbox/pkg/safe"
 )
 
 const (
-	// UserIDHeader is the header carrying the verified user ID (SaFE camelCase convention).
+	// UserIDHeader is the header carrying the verified user ID (platform camelCase convention).
 	UserIDHeader = "userId"
-	// UserNameHeader is the header carrying the verified user name (SaFE camelCase convention).
+	// UserNameHeader is the header carrying the verified user name (platform camelCase convention).
 	UserNameHeader = "userName"
 )
 
-// safeAuthMiddleware verifies a SaFE cookie or API key on every /v1/ request.
-// Caller-supplied identity and role headers are overwritten only after the
-// credential has been verified.
-func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
+// callerAuthMiddleware verifies the caller's bearer credential on every /v1/ request.
+// Caller-supplied identity and role headers are erased first and set only from a
+// verified credential. A missing or inactive credential is 401; an identity
+// provider that cannot answer is 503.
+func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Erase spoofable identity before authentication. Router forwards the
-		// original SaFE credential, so WM can derive these values independently.
 		c.Request.Header.Del(UserIDHeader)
 		c.Request.Header.Del(UserNameHeader)
 		c.Request.Header.Del(UserRoleHeader)
 
-		if tokenCookie, err := c.Cookie("Token"); err == nil && tokenCookie != "" {
-			userType, _ := c.Cookie("userType")
-			user, verifyErr := s.safeClient.VerifyCookie(c.Request.Context(), tokenCookie, userType)
-			if verifyErr != nil {
-				log.Warn("WM: SaFE cookie verification failed",
-					"error", verifyErr,
-					"remote_addr", c.ClientIP(),
-				)
-				c.JSON(http.StatusUnauthorized, gin.H{
-					"error": "cookie verification failed: invalid or expired credential",
-				})
-				c.Abort()
-				return
-			}
-			setVerifiedUser(c, user)
-			c.Next()
+		credential := identity.BearerCredential(c.GetHeader("Authorization"))
+		if credential == "" {
+			abortCaller(c, identity.MissingCredential)
 			return
 		}
 
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "missing Authorization header, expected: Bearer ak-<key>",
-			})
-			c.Abort()
-			return
-		}
-
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "invalid Authorization format, expected: Bearer ak-<key>",
-			})
-			c.Abort()
-			return
-		}
-		token := parts[1]
-
-		if !safe.IsAPIKey(token) {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "invalid API key format: must start with \"ak-\"",
-			})
-			c.Abort()
-			return
-		}
-
-		user, err := s.safeClient.VerifyAPIKey(c.Request.Context(), token)
+		tok, err := s.cfg.Identity.Introspect(c.Request.Context(), credential)
 		if err != nil {
-			log.Warn("WM: SaFE API Key verification failed",
-				"error", err,
-				"remote_addr", c.ClientIP(),
-			)
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "API key verification failed: " + err.Error(),
-			})
-			c.Abort()
+			if errors.Is(err, identity.ErrInactive) {
+				log.Warn("WM: caller credential refused", "remote_addr", c.ClientIP())
+			}
+			abortCaller(c, identity.RejectionFor(err))
 			return
 		}
 
-		setVerifiedUser(c, user)
-
-		log.Debug("WM: SaFE auth OK",
-			"userId", user.UserID,
-			"role", resolveRoleFromSaFERoles(user.Roles),
-			"path", c.Request.URL.Path,
-		)
-
+		setVerifiedUser(c, tok)
+		log.Debug("WM: auth OK", "userId", tok.Subject,
+			"role", identity.PlatformRole(tok.Roles), "path", c.Request.URL.Path)
 		c.Next()
 	}
 }
 
-func setVerifiedUser(c *gin.Context, user *safe.UserInfo) {
-	role := resolveRoleFromSaFERoles(user.Roles)
-	c.Request.Header.Set(UserIDHeader, user.UserID)
-	c.Request.Header.Set(UserNameHeader, user.UserName)
+// abortCaller answers a rejected caller.
+func abortCaller(c *gin.Context, r identity.Rejection) {
+	c.AbortWithStatusJSON(r.Status, gin.H{"error": r.Message, "code": r.Code})
+}
+
+// setVerifiedUser writes the verified identity to request headers and the Gin context.
+func setVerifiedUser(c *gin.Context, tok identity.Token) {
+	role := identity.PlatformRole(tok.Roles)
+	c.Request.Header.Set(UserIDHeader, tok.Subject)
+	c.Request.Header.Set(UserNameHeader, tok.Email)
 	c.Request.Header.Set(UserRoleHeader, role)
-	c.Set("userId", user.UserID)
-	c.Set("userName", user.UserName)
+	c.Set("userId", tok.Subject)
+	c.Set("userName", tok.Email)
 	c.Set("userRole", role)
 }

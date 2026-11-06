@@ -166,6 +166,9 @@ export const TOOLS_API_URL = `${SAFE_API_URL}/claw-api/v1/tools`;
  * uses this + `/v1/namespaces/...`; when empty, uses `${SAFE_API_URL}/sandbox` + same path
  * (public ingress).
  *
+ * Names the managing (global) Router, which serves every workspace and forwards a
+ * sandbox in another cluster to that cluster's Router.
+ *
  * May list several bases, comma-separated, all fronting the same Router (for example one
  * per gateway node of a remote cluster). Requests go to the one that last answered and move
  * to the next only when a connection could not be opened, so a request is never sent twice.
@@ -183,19 +186,12 @@ export const SANDBOX_ROUTER_URL = env("SANDBOX_ROUTER_URL", "");
  */
 export const SANDBOX_CPU_NAMESPACE = env("SANDBOX_CPU_NAMESPACE");
 /**
- * The Router base(s) of the sandboxes in SANDBOX_CPU_NAMESPACE, same format as
- * SANDBOX_ROUTER_URL. A Router answers only for the sandboxes of its own cluster, so
- * a CPU workspace on another cluster than SANDBOX_NAMESPACE needs its own. Empty
- * means SANDBOX_ROUTER_URL serves it too (and the CPU workspace is on the same cluster).
- */
-export const SANDBOX_CPU_ROUTER_URL = env("SANDBOX_CPU_ROUTER_URL");
-/**
  * Reach Hands through the Router's port proxy instead of the sandbox's cluster DNS name.
  *
  * Off by default because the DNS name is the shorter path wherever it resolves, which is
  * every deployment whose sandboxes run in its own cluster. Turn it on when they run in
  * another cluster, where that name does not resolve and the Router is the only way in.
- * Has no effect without SANDBOX_ROUTER_URL (or, for the CPU workspace, SANDBOX_CPU_ROUTER_URL).
+ * Has no effect without SANDBOX_ROUTER_URL.
  *
  * Routed Hands requests carry the per-sandbox Hands token in X-Hands-Token. A Router
  * running with `--enable-auth` also needs a SaFE key it accepts: with
@@ -211,8 +207,7 @@ export const SANDBOX_HANDS_VIA_ROUTER = envBool("SANDBOX_HANDS_VIA_ROUTER", fals
  * defined in this file depend on it and that module imports this one.
  */
 export function handsBehindRouterProxy(): boolean {
-  return SANDBOX_HANDS_VIA_ROUTER
-    && (/[^\s,]/.test(SANDBOX_ROUTER_URL) || /[^\s,]/.test(SANDBOX_CPU_ROUTER_URL));
+  return SANDBOX_HANDS_VIA_ROUTER && /[^\s,]/.test(SANDBOX_ROUTER_URL);
 }
 /**
  * Whether the sandbox Router runs with `--enable-auth`. It decides what an

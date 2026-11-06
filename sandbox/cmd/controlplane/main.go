@@ -63,14 +63,15 @@ var scheme = runtime.NewScheme()
 // an explicit ALLOW_INSECURE_NO_AUTH=true acknowledgement.
 func checkAuthPosture(cfg *router.Config) error {
 	if cfg.EnableAuth {
-		if cfg.SafeAPIURL == "" {
-			return fmt.Errorf("ENABLE_AUTH=true requires SAFE_API_URL to be set")
+		if cfg.Identity == nil {
+			return fmt.Errorf("ENABLE_AUTH=true requires IDENTITY_INTROSPECT_URL, " +
+				"IDENTITY_CLIENT_ID and IDENTITY_CLIENT_SECRET to be set")
 		}
 		return nil
 	}
 	if os.Getenv("ALLOW_INSECURE_NO_AUTH") != "true" {
 		return fmt.Errorf("authentication is disabled: set ENABLE_AUTH=true together with " +
-			"SAFE_API_URL, or acknowledge the risk explicitly with ALLOW_INSECURE_NO_AUTH=true")
+			"the identity introspection client, or acknowledge the risk explicitly with ALLOW_INSECURE_NO_AUTH=true")
 	}
 	log.Warn("AUTHENTICATION IS DISABLED (ALLOW_INSECURE_NO_AUTH=true): any client that can " +
 		"reach the Router or Workload Manager can create sandboxes and execute code inside them. " +
@@ -133,6 +134,9 @@ func main() {
 	var deprecatedSessionTimeout time.Duration
 	var namespaceSelector string
 	var deprecatedEnableIdleGC bool
+	// Accepted and ignored: caller authentication uses identity introspection.
+	// SAFE_API_URL (environment) still feeds the grant identity check.
+	var deprecatedSafeAPIURL string
 
 	routerPort = 8080
 	wmPort = 8081
@@ -140,8 +144,10 @@ func main() {
 	flag.IntVar(&routerPort, "router-port", routerPort, "HTTP listen port for the Router API")
 	flag.IntVar(&wmPort, "wm-port", wmPort, "HTTP listen port for the internal Workload Manager API")
 	flag.IntVar(&routerCfg.MaxConcurrentRequests, "max-concurrent-requests", routerCfg.MaxConcurrentRequests, "Max concurrent Router requests")
-	flag.BoolVar(&routerCfg.EnableAuth, "enable-auth", routerCfg.EnableAuth, "Enable SaFE API Key authentication")
-	flag.StringVar(&routerCfg.SafeAPIURL, "safe-api-url", routerCfg.SafeAPIURL, "SaFE API server URL")
+	flag.BoolVar(&routerCfg.EnableAuth, "enable-auth", routerCfg.EnableAuth,
+		"Require an identity provider credential on /v1 (default true; IDENTITY_INTROSPECT_URL and client credentials)")
+	flag.StringVar(&deprecatedSafeAPIURL, "safe-api-url", "",
+		"Deprecated and ignored for authentication: /v1 credentials are checked by identity introspection")
 	flag.StringVar(&namespaceSelector, "namespace-selector", "",
 		"Label selector (kubectl -l syntax) of the namespaces the Router and Workload Manager serve; "+
 			"empty serves every namespace. Overridden by "+nsadmission.EnvVar)
@@ -200,12 +206,24 @@ func main() {
 	if v := os.Getenv("AGENT_SANDBOX_NAMESPACE"); v != "" {
 		wmCfg.Namespace = v
 	}
-	if v := os.Getenv("ENABLE_AUTH"); v == "true" {
+	// ENABLE_AUTH overrides --enable-auth when set. The flag defaults to on.
+	switch os.Getenv("ENABLE_AUTH") {
+	case "true":
 		routerCfg.EnableAuth = true
+	case "false":
+		routerCfg.EnableAuth = false
 	}
-	if v := os.Getenv("SAFE_API_URL"); v != "" {
-		routerCfg.SafeAPIURL = v
+	if deprecatedSafeAPIURL != "" {
+		fmt.Fprintln(os.Stderr,
+			"WARNING: --safe-api-url is ignored. /v1 credentials are checked by identity introspection "+
+				"(IDENTITY_INTROSPECT_URL); the grant identity check reads SAFE_API_URL from the environment.")
 	}
+	callerIdentity, err := identity.FromEnv()
+	if err != nil {
+		log.Error("identity client config is invalid", "error", err)
+		os.Exit(1)
+	}
+	routerCfg.Identity = callerIdentity
 	// Parsed before anything starts: a selector that does not parse must stop
 	// the process, not degrade to admitting every namespace.
 	nsSelector, err := namespaceSelectorFromEnv(namespaceSelector)
@@ -243,7 +261,7 @@ func main() {
 	routerCfg.WorkloadManagerURL = fmt.Sprintf("http://127.0.0.1:%d", wmPort)
 	wmCfg.Port = wmPort
 	wmCfg.EnableAuth = routerCfg.EnableAuth
-	wmCfg.SafeAPIURL = routerCfg.SafeAPIURL
+	wmCfg.Identity = routerCfg.Identity
 
 	if err := checkAuthPosture(&routerCfg); err != nil {
 		log.Error("insecure configuration refused", "error", err)
@@ -430,6 +448,11 @@ func main() {
 		os.Exit(1)
 	}
 	workloads.SetRemoteClusters(routerServer.RemoteClusterIDs())
+	routerServer.WithWorkloadLocator(workloads.Locate)
+	if err := routerServer.ConfigureUpstreamOnly(os.Getenv(router.EnvUpstreamOnly)); err != nil {
+		log.Error("dataplane upstream-only config failed", "error", err)
+		os.Exit(1)
+	}
 
 	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, dynamicClient, apiServer, st, workloads, wmCfg.Namespace)
 	if err != nil {

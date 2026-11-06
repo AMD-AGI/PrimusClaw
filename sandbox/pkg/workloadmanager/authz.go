@@ -64,21 +64,6 @@ func resolveRole(c *gin.Context) string {
 	return role
 }
 
-// resolveRoleFromSaFERoles picks the highest-priority role from SaFE roles array.
-// Priority: system-admin > system-admin-readonly > default.
-func resolveRoleFromSaFERoles(roles []string) string {
-	best := RoleDefault
-	for _, r := range roles {
-		switch r {
-		case RoleSystemAdmin:
-			return RoleSystemAdmin // highest, return immediately
-		case RoleSystemAdminReadonly:
-			best = RoleSystemAdminReadonly
-		}
-	}
-	return best
-}
-
 // ─── Permission Checks ──────────────────────────────────────────────────────
 
 // canViewAll returns true if the user can view all resources (system-admin or system-admin-readonly).
