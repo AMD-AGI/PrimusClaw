@@ -90,7 +90,11 @@ export class ToolTextThrottle {
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Per call, the publish sent last: each waits for the one before it, so a slow (retried) publish is never overtaken. */
   private readonly chains = new Map<string, Promise<void>>();
+  /** Per call, how many of its publishes are started or queued and not yet settled. */
+  private readonly inflight = new Map<string, number>();
   private closed = false;
+  /** The attempt failed: what is still queued behind a slow publish is not sent either. */
+  private cancelled = false;
   readonly options: StreamTurnOptions;
 
   constructor(
@@ -124,7 +128,13 @@ export class ToolTextThrottle {
     this.lastAt.set(id, Date.now());
     this.published.set(id, text);
     // In order: a reader shows the last delta it got, and an earlier prefix arriving after the whole text would roll it back.
-    this.chains.set(id, (this.chains.get(id) ?? Promise.resolve()).then(() => this.publish({ id, name, text })).catch(() => {}));
+    // A publish with nothing before it in flight starts now; one queued behind another is dropped if the attempt is cancelled first.
+    const send = () => (this.cancelled ? undefined : this.publish({ id, name, text }));
+    const queued = this.inflight.get(id) ?? 0;
+    this.inflight.set(id, queued + 1);
+    const prev = this.chains.get(id);
+    const started = queued && prev ? prev.then(send) : new Promise<void>((resolve) => resolve(send()));
+    this.chains.set(id, started.catch(() => {}).finally(() => this.inflight.set(id, (this.inflight.get(id) ?? 1) - 1)));
   }
 
   /** The turn is whole: publish what is pending now, and wait for every publish so far. */
@@ -136,9 +146,10 @@ export class ToolTextThrottle {
     await Promise.all([...this.chains.values()]);
   }
 
-  /** The attempt failed: publish nothing more of it. */
+  /** The attempt failed: publish nothing more of it, including what is queued behind a publish still in flight. */
   cancel(): void {
     this.closed = true;
+    this.cancelled = true;
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();
     this.pending.clear();

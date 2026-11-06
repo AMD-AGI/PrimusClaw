@@ -78,6 +78,8 @@ export class McpPoolEntry {
   verifiedAt = 0;
   /** Out of the pool: closed as soon as nobody holds it and nothing is connecting. */
   retired = false;
+  /** A later turn of the same user sent this server another spec while this one was in use: closed when it is let go. */
+  superseded = false;
   /** Times a connection was opened (initialize + tools/list), for the logs and the tests. */
   opens = 0;
   private conn: McpConn | undefined;
@@ -255,7 +257,9 @@ export class McpConnectionPool {
       this.entries.set(key, entry);
       // The same user's earlier connection to this server under a spec that is no longer sent (a per-turn token) is never used again.
       for (const other of this.entries.values()) {
-        if (other !== entry && other.slot === slot && other.refs === 0) this.remove(other, "superseded");
+        if (other === entry || other.slot !== slot) continue;
+        if (other.refs === 0) this.remove(other, "superseded");
+        else other.superseded = true;
       }
       this.trim();
     }
@@ -265,7 +269,8 @@ export class McpConnectionPool {
     const ready = failure && Date.now() - failure.at < this.opts.failBackoffMs
       ? Promise.reject(failure.err)
       : entry.prepare(this.opts.healthMs);
-    ready.catch(() => {});
+    // A connect that finishes after its turn let go (it was deferred) and turned out not to be keepable (SSE) is closed then.
+    ready.then(() => { if (entry.refs === 0 && entry.persistent === false) this.remove(entry, "not_poolable"); }, () => {});
     return { entry, ready, reused };
   }
 
@@ -274,6 +279,7 @@ export class McpConnectionPool {
     entry.lastUsedAt = Date.now();
     if (entry.refs > 0) return;
     if (entry.persistent === false) this.remove(entry, "not_poolable");
+    else if (entry.superseded) this.remove(entry, "superseded");
     else if (entry.retired) void entry.closeNow();
   }
 

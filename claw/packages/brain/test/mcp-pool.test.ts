@@ -235,7 +235,12 @@ test("R8 an idle connection is closed, and a superseded spec's connection with i
     await sleep(80);
     pool.sweep();
     assert.equal(pool.size, 1);
+    // A third spec while the second is in use: the second is closed when its run lets go, not kept for reuse.
+    const t3 = await connectPlatformMcp({ fx: spec(s.url, "turn-3") }, { pool, userId: "alice" });
+    assert.equal(pool.size, 2);
     await t2.closeAll();
+    assert.equal(pool.size, 1, "a superseded spec's connection was kept after its run let go");
+    await t3.closeAll();
     await sleep(80);
     pool.sweep();
     assert.equal(pool.size, 0);

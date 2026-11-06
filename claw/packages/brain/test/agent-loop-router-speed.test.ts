@@ -219,3 +219,20 @@ test("a call's deltas go out in order even when an earlier publish is slow, and 
   await t.flush();
   assert.deepEqual(delivered, ["A", "AB", "ABC"]);
 });
+
+test("a failed attempt's deltas queued behind a slow publish are not sent after it is cancelled", async () => {
+  const delivered: string[] = [];
+  let release!: () => void;
+  const held = new Promise<void>((r) => { release = r; });
+  const t = new ToolTextThrottle(new Set([SAY]), 20, async ({ text }) => {
+    if (text === "A") await held;
+    delivered.push(text);
+  });
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "A" });
+  await sleep(40);
+  t.options.toolText!.onText({ id: "a", name: SAY, text: "AB" }); // queued behind "A"
+  t.cancel();
+  release();
+  await sleep(20);
+  assert.deepEqual(delivered, ["A"]);
+});
