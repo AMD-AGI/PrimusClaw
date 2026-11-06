@@ -28,14 +28,21 @@ export function mayHandOff(message: TurnMessage | null | undefined): boolean {
   return !!context && context.handoffs.includes("review_for_other") && context.people.some((p) => !!p.user_id);
 }
 
-/** The turn handed a review over: its held says never go out. The number of deliveries dropped. */
-export async function dropHeldSays(q: Querier, messageId: string): Promise<number> {
+/**
+ * The turn handed a review over: its held says never go out on their own. Returns their texts, each once, in the order they were said:
+ * the handoff carries them (`AssistantReviewHandoff.held_says`), so the channel's one answer still tells the person what they said.
+ */
+export async function dropHeldSays(q: Querier, messageId: string): Promise<string[]> {
   const r = await q(
-    `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'dropped: the turn handed a review to the channel'
-      WHERE last_status = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
+    `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'dropped: the turn handed a review to the channel; carried by the handoff'
+      WHERE last_status = $1 AND delivered_at IS NULL AND dropped_at IS NULL
+      RETURNING id, event_id, payload->>'text' AS text`,
     [heldStatus(messageId)],
   );
-  return r.rowCount ?? 0;
+  const rows = (r.rows as Array<{ id: string; event_id: string; text: string | null }>).sort((a, b) => Number(a.id) - Number(b.id));
+  const texts = new Map<string, string>();
+  for (const row of rows) if (row.text?.trim() && !texts.has(row.event_id)) texts.set(row.event_id, row.text.trim());
+  return [...texts.values()];
 }
 
 /**
@@ -55,15 +62,17 @@ export async function releaseHeldSays(q: Querier, messageId: string): Promise<Ar
 }
 
 /**
- * Whether the turn that began at `since` has had an item's start told to the user in the system's words (`announceStarted` in
- * `tools.ts`: "已开始：#N 标题。…" / "Started #N title. …", a system notice about the item). Its router then says nothing more in that
- * turn: the gate found a second message ("任务已建好…") beside that notice every time (2026-11-06).
+ * The system's start notice of an item told in the turn that began at `since` (`announceStarted` in `tools.ts`: "已开始：#N 标题。…" /
+ * "Started #N title. …", a system notice about the item), by its say id; null when there is none. A router say after it in the turn
+ * adds to that message (`AssistantSayPayload.amends`) instead of being a second one: the gate found a second message ("任务已建好…")
+ * beside that notice every time (2026-11-06), and refusing it lost what else it said.
  */
-export async function turnAnnouncedStart(q: Querier, userId: string, since: Date | string): Promise<boolean> {
-  return (await q(
-    `SELECT 1 FROM claw_assistant_says
+export async function turnAnnouncedStart(q: Querier, userId: string, since: Date | string): Promise<string | null> {
+  const row = (await q(
+    `SELECT say_id::text AS say_id FROM claw_assistant_says
       WHERE user_id = $1 AND fallback AND item_id IS NOT NULL AND created_at >= $2
-        AND (text LIKE '已开始：#%' OR text LIKE 'Started #%') LIMIT 1`,
+        AND (text LIKE '已开始：#%' OR text LIKE 'Started #%') ORDER BY created_at DESC LIMIT 1`,
     [userId, since],
-  )).rows.length > 0;
+  )).rows[0] as { say_id: string } | undefined;
+  return row?.say_id ?? null;
 }

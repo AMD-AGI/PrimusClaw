@@ -615,17 +615,19 @@ async function handOffReview(
     // One handoff per message, reviewer, pull requests and merge: a replayed call queues nothing more.
     const key = [reviewer.userId, merge ? "merge" : "review", ...prs.map((p) => `${p.owner}/${p.repo}#${p.number}`.toLowerCase()).sort()].join("\u0000");
     const eventId = deterministicEventId("assistant.review_handoff", claims.mid, key);
+    await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge, messageId: claims.mid });
+    // What the turn said before this, held until it ended (`say-hold.ts`), does not go out on its own: the channel's answer is the
+    // one message, and it carries these words (`held_says`), so nothing the person asked besides the review is lost.
+    const held = await dropHeldSays(q, claims.mid);
+    if (held.length) logger.info({ eventId, held: held.length }, "assistant.held_says_joined_to_handoff");
     const review: AssistantReviewHandoff = {
       handoff_id: eventId,
       reviewer: { user_id: reviewer.userId, name: reviewer.name },
       prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
       merge,
       requester_note: note.slice(0, REQUESTER_NOTE_MAX_CHARS),
+      ...(held.length ? { held_says: held } : {}),
     };
-    await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge, messageId: claims.mid });
-    // What the turn said before this, held until it ended (`say-hold.ts`), never goes out: the channel's answer is the one message.
-    const dropped = await dropHeldSays(q, claims.mid);
-    if (dropped) logger.info({ eventId, dropped }, "assistant.held_says_dropped_for_handoff");
     const payload: AssistantActionPayload = {
       type: "assistant.action", event_id: eventId, occurred_at: new Date().toISOString(), user_id: userId,
       message_id: claims.mid, channel_message_id: channelMessageId, action: { name: REVIEW_HANDOFF_ACTION, args: "" }, review,

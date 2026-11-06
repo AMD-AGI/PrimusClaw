@@ -245,7 +245,7 @@ async function sayOnce(
   if (cited) for (const outcome of SAY_SOURCE_OUTCOMES) metrics.onAssistantSaySources(outcome, cited.counts[outcome]);
   try {
     const out = await recordAssistantSay({
-      userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid, holdForTurn, turnBegan: run?.began,
+      userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid, holdForTurn, turnBegan: run?.began, amendNotice: true,
       ...(cited?.sources.length ? { sources: cited.sources } : {}),
       guard: async (q) => {
         if ((await assertLiveRun(q, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");
@@ -331,8 +331,8 @@ export function startedNotice(item: { seq: number; title: string }, language: st
  * first reply p90 8.3 s). Only in a turn that answers the user (a worker's report starts nothing the user asked for) in Chinese or
  * English (in any other language the router says it), and not in one that handed a review to the person's channel; once per item
  * (`recordSystemNotice`'s key), and as the system's own message, so it is not counted against the say limit. It is the turn's one
- * message: a say after it in the turn is refused (`turnAnnouncedStart`), and a start whose model fell back is not announced, so the
- * router says the start and the fallback in one line. Best effort: the item is started whether or not this is heard, and the router
+ * message: a say after it in the turn is added to it (`amends`, `turnAnnouncedStart`), and a start whose model fell back is not
+ * announced, so the router says the start and the fallback in one line. Best effort: the item is started whether or not this is heard, and the router
  * is told which (`announced`).
  */
 async function announceStarted(
@@ -436,7 +436,7 @@ export async function workCreate(
   // The row is the commitment; running it is only the drain, which the sweeper repeats if this is lost.
   if (created.workerSessionId) await drainSessionIfIdle(created.workerSessionId, created.userId);
   // A model that fell back is something the user must hear with the start: the router says the start itself then, in one line
-  // (announced: false), since after the system's notice it says nothing more in the turn (`turnAnnouncedStart`).
+  // (announced: false), rather than as an addition to the system's notice (`turnAnnouncedStart`).
   const fellBack = !!(choice && modelAnswer(choice).fell_back_from);
   const announced = created.workerSessionId && !fellBack
     ? await announceStarted(claims, created.userId, { seq: created.seq, title, itemId: created.itemId }, deps)
