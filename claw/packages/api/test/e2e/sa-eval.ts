@@ -454,7 +454,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   // The case's items are only those its own turns started (read from their work_create / review_start answers): an item
   // someone else put on the board meanwhile (a review asked of this identity) is neither graded nor closed here.
   const started = turnCalls(stream.events, messageIds);
-  const mine = (all: ItemSeen[]): ItemSeen[] => itemsStartedBy(started, all.filter((i) => i.seq > floor));
+  const mine = (all: ItemSeen[]): ItemSeen[] => itemsStartedBy(started, all.filter((i) => i.seq > floor), RUN_ITEMS);
   let items = mine(await board());
   for (const i of items) RUN_ITEMS.add(i.item_id);
   // A request the case's item holds for its person: answered the way that person's channel answers it.
@@ -481,7 +481,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
   const lastId = messageIds.at(-1)!;
   const lastSent = sentAt.at(-1)!;
   const lastRouter = turnCalls(stream.events, [lastId]);
-  const lastItems = itemsStartedBy(lastRouter, items);
+  const lastItems = itemsStartedBy(lastRouter, items, RUN_ITEMS);
   const lastIds = lastItems.map((i) => i.item_id);
   const lastCalls = [...lastRouter];
   for (const i of lastItems) lastCalls.push(...(await workerCalls(i.item_id).catch(() => [])));
@@ -860,7 +860,7 @@ async function main(): Promise<void> {
           // From the stream and from the stored events: a work_create answer the stream missed still ties its item to the run.
           const above = (await board()).filter((x) => x.seq > floorAtStart);
           const storedCalls = traceOf((await replay(sessionId).catch(() => [])).filter((r) => RUN_MESSAGES.includes(String(r.data?.message_id ?? "")))).calls;
-          for (const i of itemsStartedBy([...turnCalls(stream.events, RUN_MESSAGES), ...storedCalls], above)) RUN_ITEMS.add(i.item_id);
+          for (const i of itemsStartedBy([...turnCalls(stream.events, RUN_MESSAGES), ...storedCalls], above, RUN_ITEMS)) RUN_ITEMS.add(i.item_id);
         }
         for (const i of (await board()).filter((x) => RUN_ITEMS.has(x.item_id) && !CLEARED.has(x.item_id))) log(`closing #${i.seq}: ${await closeItem(i)}`);
         await sleep(5_000);

@@ -260,6 +260,10 @@ test("S12 last turn, plan, recordings", () => {
   const items = [item({ item_id: "i1", seq: 7 }), item({ item_id: "i2", seq: 8 }), item({ item_id: "i3", seq: 9 })];
   assert.deepEqual(itemsStartedBy([created, refused, call("mcp__assistant__say")], items).map((i) => i.seq), [8]);
   assert.deepEqual(itemsStartedBy([{ ...call("mcp__assistant__work_send"), result: "{\"item_id\":\"i3\"}" }], items), []);   // sent to, not started
+  // work_create found an open item with the same title: it was there before, and is the run's only if the run already knew it.
+  const dedup = { ...call("mcp__assistant__work_create"), result: "{\"ok\":true,\"item_id\":\"i2\",\"seq\":8,\"deduplicated\":true}" };
+  assert.deepEqual(itemsStartedBy([dedup], items), [], "another's item is not the run's");
+  assert.deepEqual(itemsStartedBy([dedup], items, new Set(["i2"])).map((i) => i.seq), [8], "the run's own, found again");
   const plan = planOf([caseOf({ id: "a", route: "answer", facts: [{ claim: "n", oracle: { kind: "api", query: "/v1/me#name" } }, { claim: "j" }] }),
     caseOf({ id: "b", modes: ["assistant"] })], "baseline", {});
   assert.match(plan[0]!, /^a {2}1 turn\(s\) {2}route=answer .*facts=api,judge/);

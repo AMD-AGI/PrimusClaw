@@ -25,6 +25,8 @@
  *   R7 a stream that missed a stored event of the case (a leak in a say it never delivered): an error, not a grade; an item whose
  *      work_create answer the stream missed is still closed with its worker's session; an assistant session still running
  *      before a case: nothing is sent, an error
+ *   R8 a work_create that found someone else's open item with the same title (`deduplicated`): that item is not the run's, and
+ *      is neither closed nor stripped of its worker's session
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -552,5 +554,28 @@ test("R7b an assistant session still running before a case: nothing is sent", { 
     assert.match(run.out, /pass t-a-001#1/, run.out);
     assert.match(run.out, /ERROR t-a-002#1 .*the assistant session was still running 2 s before t-a-002: nothing sent/);
     assert.deepEqual(claw.sent.map((x) => x.content), ["t-a-001"]);
+  } finally { rmSync(r.dir, { recursive: true, force: true }); }
+});
+
+test("R8 an item work_create only found again is not the run's", { timeout: 120_000 }, async () => {
+  const claw = new FakeClaw();
+  const base = await claw.start();
+  claw.router = (_content, id) => {
+    // Someone else opened item 5 with the same title a moment ago; work_create answers with it, deduplicated.
+    const theirs = item(5, { board_state: "in_progress", can_accept: false });
+    claw.items.push(theirs);
+    claw.sessions.set(theirs.worker_session_id, { status: "running", stale: 0 });
+    claw.emit({ type: "toolUsed", message_id: id, tool: "mcp__assistant__work_create", status: "start", actionId: `a-${id}` });
+    claw.emit({ type: "toolUsed", message_id: id, tool: "mcp__assistant__work_create", status: "success", actionId: `a-${id}`,
+      result: JSON.stringify({ ok: true, item_id: theirs.item_id, seq: theirs.seq, deduplicated: true }) });
+    claw.turn(id, { say: "That task is already under way." });
+  };
+  const r = runner(base, [itemCase({ item_wait_s: 1 })]);
+  const run = await r.done;
+  await claw.stop();
+  try {
+    assert.deepEqual(claw.calls.filter((c) => c.includes("/stop") || c.includes("/accept")), [], "not closed");
+    assert.ok(!claw.calls.includes("DELETE /v1/sessions/worker-5") && claw.sessions.has("worker-5"), "its worker's session kept");
+    assert.match(run.out, /cleanup: open items not tied to the run's calls, left alone: 5/, "said, for a person to look at");
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });

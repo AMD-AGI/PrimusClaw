@@ -735,17 +735,22 @@ export function routeOf(items: readonly ItemSeen[], calls: readonly ToolCall[], 
 /**
  * The items a turn started: those whose id or number a successful work_create / review_start / review_restart call of
  * the turn answered with (`{"item_id": ..., "seq": ...}`), among the case's items. A call whose answer cannot be read
- * still makes the route an item (`routeOf`); it just names no item here.
+ * still makes the route an item (`routeOf`); it just names no item here. An answer `"deduplicated": true` names an open
+ * item that was there before (work_create finds one with the same title): it counts only when that item is already in
+ * `known` (the run's own), since another's would otherwise be closed, and its worker's session deleted, as the run's.
  */
-export function itemsStartedBy(calls: readonly ToolCall[], items: readonly ItemSeen[]): ItemSeen[] {
+export function itemsStartedBy(calls: readonly ToolCall[], items: readonly ItemSeen[], known: ReadonlySet<string> = new Set()): ItemSeen[] {
   const ids = new Set<string>();
   const seqs = new Set<number>();
+  const found = new Set<string>();   // named only by a deduplicated answer
+  const foundSeqs = new Set<number>();
   for (const c of calls) {
     if (c.ok !== true || !/(^|__)(work_create|review_start|review_restart)$/.test(c.name)) continue;
-    for (const m of c.result.matchAll(/"item_id"\s*:\s*"([^"]+)"/g)) ids.add(m[1]!);
-    for (const m of c.result.matchAll(/"seq"\s*:\s*(\d+)/g)) seqs.add(Number(m[1]));
+    const dedup = /"deduplicated"\s*:\s*true/.test(c.result);
+    for (const m of c.result.matchAll(/"item_id"\s*:\s*"([^"]+)"/g)) (dedup ? found : ids).add(m[1]!);
+    for (const m of c.result.matchAll(/"seq"\s*:\s*(\d+)/g)) (dedup ? foundSeqs : seqs).add(Number(m[1]));
   }
-  return items.filter((i) => ids.has(i.item_id) || seqs.has(i.seq));
+  return items.filter((i) => ids.has(i.item_id) || seqs.has(i.seq) || ((found.has(i.item_id) || foundSeqs.has(i.seq)) && known.has(i.item_id)));
 }
 
 /** What the user was offered to press, as a channel draws it: Accept on a result that waits, Run on a command to confirm. */
