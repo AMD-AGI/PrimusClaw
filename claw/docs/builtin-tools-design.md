@@ -433,7 +433,7 @@ REMINDER: You MUST include the sources above in your response to the user using 
 
 Key rules:
 - `web_search_tool_result` blocks with an array `content` → `Links: ${JSON.stringify(content)}`.
-- `web_search_tool_result` with **non-array** `content` → in-band error: push string `"Web search error: <error_code>"` (e.g. rate limit, quota). Log the error but do **not** throw.
+- `web_search_tool_result` with **non-array** `content` → in-band error: push string `"Web search error: <error_code>"` (e.g. rate limit, quota) beside the links of the other results. When no result has links, the search failed: the native backend counts as failed (the next backend is tried) and the failure is said as `anthropic: search error <error_code>` for a known code, without the model's text around it.
 - `text` blocks → append as-is (model may explain query refinements between searches).
 - `server_tool_use` blocks → skip (delimiter only, URLs not extracted from them).
 - `null` / `undefined` entries → skip.

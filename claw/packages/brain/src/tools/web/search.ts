@@ -70,8 +70,11 @@ function domainMatchesAny(domain: string, denylist: string[]): boolean {
 
 // ── Backend failures ──
 
-/** A backend this deployment has no key for: its message is this file's own. */
-class BackendNotConfigured extends Error {}
+/** A backend that failed in a way this file names itself (no key for it, the search tool's own error code): its message is this file's own. */
+class BackendFailure extends Error {}
+
+/** The error codes the native search tool answers with (`web_search_tool_result_error`). Any other is said as "search error". */
+const SEARCH_TOOL_ERROR_CODES = new Set(["too_many_requests", "invalid_input", "max_uses_exceeded", "query_too_long", "unavailable"]);
 
 /**
  * A backend's failure, in this file's own words: by the error's class, its HTTP status or its code, never by its message. A
@@ -79,7 +82,7 @@ class BackendNotConfigured extends Error {}
  * (`WebToolOutcome`). The message goes to the log.
  */
 function backendFailure(err: unknown): string {
-  if (err instanceof BackendNotConfigured) return err.message;
+  if (err instanceof BackendFailure) return err.message;
   const e = err as { status?: unknown; response?: { status?: unknown }; code?: unknown } | null;
   const status = typeof e?.status === "number" ? e.status : e?.response?.status;
   if (typeof status === "number" && Number.isInteger(status)) return `HTTP ${status}`;
@@ -152,7 +155,17 @@ async function executeAnthropicSearch(
       cache_create: rawUsage.cache_creation_input_tokens ?? 0,
     });
 
-  return formatWebSearchResult(query, finalMsg.content as any[]);
+  // The search tool failed and found nothing: a failure of this backend, like one that threw (the next backend is tried), said
+  // by its error code alone. What the model wrote around it is not passed on: a failed search counts as having read nothing.
+  const blocks = (finalMsg.content ?? []) as any[];
+  const results = blocks.filter((b) => b?.type === "web_search_tool_result");
+  const errors = results.filter((b) => !Array.isArray(b.content)).map((b) => b.content?.error_code);
+  if (errors.length && !results.some((b) => Array.isArray(b.content) && b.content.length > 0)) {
+    const code = errors.find((c) => SEARCH_TOOL_ERROR_CODES.has(c));
+    throw new BackendFailure(code ? `search error ${code}` : "search error");
+  }
+
+  return formatWebSearchResult(query, blocks);
 }
 
 // ── Format result ──
@@ -212,7 +225,7 @@ class TavilyProvider implements WebSearchProvider {
     blockedDomains?: string[];
     freshness?: string;
   }): Promise<SearchHit[]> {
-    if (!TAVILY_API_KEY) throw new BackendNotConfigured("TAVILY_API_KEY not configured");
+    if (!TAVILY_API_KEY) throw new BackendFailure("TAVILY_API_KEY not configured");
     const { default: axios } = await import("axios");
 
     const freshnessMap: Record<string, number> = { day: 1, week: 7, month: 30, year: 365 };
@@ -244,7 +257,7 @@ class BraveProvider implements WebSearchProvider {
     blockedDomains?: string[];
     freshness?: string;
   }): Promise<SearchHit[]> {
-    if (!BRAVE_API_KEY) throw new BackendNotConfigured("BRAVE_API_KEY not configured");
+    if (!BRAVE_API_KEY) throw new BackendFailure("BRAVE_API_KEY not configured");
     const { default: axios } = await import("axios");
 
     let q = query;
@@ -294,7 +307,7 @@ class SerperProvider implements WebSearchProvider {
     blockedDomains?: string[];
     freshness?: string;
   }): Promise<SearchHit[]> {
-    if (!SERPER_API_KEY) throw new BackendNotConfigured("SERPER_API_KEY not configured");
+    if (!SERPER_API_KEY) throw new BackendFailure("SERPER_API_KEY not configured");
     const { default: axios } = await import("axios");
 
     let q = query;
