@@ -28,11 +28,14 @@
  *   F8  the Router's say whose COMMIT took effect and whose answer the failover lost: the Router is told it was said,
  *       not to say it again, the web client is told, and the message is stored once
  *   F9  the same, while the database cannot be asked: the Router is told the outcome is unknown and not to say it again,
- *       and the turn's final words are not delivered on top of the stored message
+ *       the turn's final words are not delivered on top of the stored message, and the message is announced once the
+ *       database answers
  *   F10 a caller that checks a connection out of the advisory-lock pool itself gets one made since the failover, and
  *       one whose server says it is not in recovery
  *   F11 the say cap's notice whose COMMIT took effect and whose answer the failover lost: the web client is told, once,
  *       and the Router hears the user was told
+ *   F12 the same while the database cannot be asked: the notice is announced once the database answers, and the next
+ *       refusal does not send another
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -295,7 +298,13 @@ describe("database failover", { skip }, () => {
       w.sayDeps,
     );
     assert.equal(ended, "skipped");
-    assert.deepEqual((await w.q("SELECT text FROM claw_assistant_says")).map((s) => s.text), ["The deploy is done."]);
+    const [stored] = await w.q("SELECT say_id, text FROM claw_assistant_says");
+    assert.equal(stored.text, "The deploy is done.");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_says"))[0].n, 1);
+    // Looked up again in the background once the database answers, and announced: the web client is told, once.
+    const deadline = Date.now() + 5_000;
+    while (!w.events.some((e) => e.say_id === stored.say_id) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(w.events.map((e) => e.say_id), [stored.say_id]);
   });
 
   test("F10 a direct lock-pool checkout after a failover gets a connection made since, on a server not in recovery", async () => {
@@ -347,5 +356,25 @@ describe("database failover", { skip }, () => {
     const notices = await w.q("SELECT say_id, text FROM claw_assistant_says WHERE fallback");
     assert.deepEqual(notices.map((n) => n.text), [w.mod.outbound.sayCapNotice("Second.")]);
     assert.deepEqual(w.events.map((e) => e.say_id), [notices[0].say_id], "the web client is told, once");
+  });
+
+  test("F12 the cap's notice whose COMMIT answer was lost while the database cannot be asked: announced later, once", async () => {
+    const turn = await w.routerTurn(alice);
+    const capped = { ...w.sayDeps, maxPerHour: 1 };
+    assert.equal((await w.mod.tools.say(turn as never, { text: "First." }, capped)).ok, true);
+    w.events.length = 0;
+    const refused = (text: string) => w.mod.tools.say(turn as never, { text }, capped).then(
+      () => "said", (err: { code?: string }) => err.code ?? String(err));
+    const { out, cut } = await commitAnswerLost(() => refused("Second."), (text) => /FROM claw_assistant_says WHERE say_id/.test(text));
+    assert.equal(cut, 1);
+    assert.equal(out, "say_rate_limited");
+    const [notice] = await w.q("SELECT say_id FROM claw_assistant_says WHERE fallback");
+    assert.ok(notice, "the notice is stored");
+    const deadline = Date.now() + 5_000;
+    while (!w.events.some((e) => e.say_id === notice.say_id) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(w.events.map((e) => e.say_id), [notice.say_id], "announced once the database answered");
+    assert.equal(await refused("Third."), "say_rate_limited");
+    assert.equal(w.events.length, 1, "the next refusal finds the notice and sends no other");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_says WHERE fallback"))[0].n, 1);
   });
 });

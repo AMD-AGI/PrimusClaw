@@ -172,7 +172,7 @@ export async function say(
     if (err instanceof SayOutcomeUnknown) {
       throw new ToolRefused(
         "say_outcome_unknown",
-        "it is not known whether the user got this message: the database failed over as it was stored. Do not call say again with it; end the turn with the same text as your final words, and it is delivered if it was not",
+        "it is not known whether the user got this message: the database failed over as it was stored, and it is delivered later if it was. Do not call say again with it; end the turn with the same text as your final words, and it is delivered if it was not",
       );
     }
     throw err;

@@ -212,7 +212,7 @@ export function setCapNoticeHourForTest(hook: ((hour: number) => number | Promis
  * and with the hour read once the lock is held, so two refusals at once -- on either side of an hour, on two replicas
  * -- see each other's notice instead of storing one each.
  */
-async function storeCapNotice(input: SayInput, text: string): Promise<Stored | null> {
+async function storeCapNotice(input: SayInput, text: string, deps: SayDeps): Promise<Stored | null> {
   return storeSettled(async (q, storeOne) => {
     await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
     const read = Number((await q("SELECT floor(extract(epoch FROM clock_timestamp()) / 3600)::bigint AS h")).rows[0].h);
@@ -227,7 +227,7 @@ async function storeCapNotice(input: SayInput, text: string): Promise<Stored | n
       type: "assistant.say", fallback: true, item: null, sayId: ids[0],
       userId: input.userId, sessionId: input.sessionId, text: sayCapNotice(text),
     });
-  });
+  }, (stored) => announce(stored, deps));
 }
 
 /** What the user is told when the cap first refuses the assistant a message: short, in the language of that message. */
@@ -253,7 +253,7 @@ function sayCapRefusal(limit: number, told: boolean): string {
 async function refusedByCap(input: SayInput, text: string, refused: SayCapped, deps: SayDeps): Promise<SayRefused> {
   let told = true;
   try {
-    const notice = await storeCapNotice(input, text);
+    const notice = await storeCapNotice(input, text, deps);
     metrics.onAssistantSayRateLimited(notice ? "sent" : "already_sent");
     if (notice) {
       logger.warn({ userId: input.userId, limit: refused.limit, sayId: notice.sayId }, "assistant.say_cap_notice_sent");
@@ -301,15 +301,44 @@ async function storedAfterAll(m: ToStore): Promise<Stored | null> {
   }
 }
 
+/** How long after an unknown outcome a message is looked up again in the background: in retry delays. */
+const SETTLE_LATER_DELAYS = [5, 15, 45];
+
+/**
+ * A message whose outcome the database could not tell, looked up again in the background, a few times over the next
+ * minute, and announced if it is stored after all. The timers do not hold the process open.
+ */
+function settleLater(m: ToStore, announceStored: (stored: Stored) => Promise<void>): void {
+  const attempt = (i: number): void => {
+    setTimeout(() => {
+      storedAfterAll(m).then(
+        async (stored) => {
+          if (!stored) return;
+          logger.warn({ sayId: m.sayId }, "assistant.say_settled_later");
+          await announceStored(stored);
+        },
+        () => {
+          if (i + 1 < SETTLE_LATER_DELAYS.length) attempt(i + 1);
+          else logger.error({ sayId: m.sayId }, "assistant.say_outcome_never_settled");
+        },
+      ).catch((err) => logger.error({ err, sayId: m.sayId }, "assistant.say_settle_failed"));
+    }, SETTLE_LATER_DELAYS[i] * FAILOVER_RETRY_DELAY_MS).unref();
+  };
+  attempt(0);
+}
+
 /**
  * A transaction that ends by storing one message, with what a failover can leave unsettled settled: a COMMIT that took
  * effect and whose answer was lost. The message `run` stored is then looked up ({@link storedAfterAll}) and, when it is
  * there, returned as if the COMMIT had answered, for the caller to announce -- a message stored and never announced is
- * one a web client never sees, and one a later call finds stored and takes as told. Retried on a failover the way
- * `inTransaction` retries a transaction that says it may run twice.
+ * one a web client never sees, and one a later call finds stored and takes as told. When the database cannot be asked,
+ * {@link SayOutcomeUnknown} is thrown and the message is looked up again later (`settleLater`), to be announced with
+ * `announceStored` if it is there. Retried on a failover the way `inTransaction` retries a transaction that says it may
+ * run twice.
  */
 async function storeSettled(
   run: (q: Querier, storeOne: (m: ToStore) => Promise<Stored | null>) => Promise<Stored | null>,
+  announceStored: (stored: Stored) => Promise<void>,
 ): Promise<Stored | null> {
   let inserted: ToStore | null = null;
   try {
@@ -324,7 +353,13 @@ async function storeSettled(
   } catch (err) {
     const pending = inserted as ToStore | null;
     if (!pending || !isFailoverError(err)) throw err;
-    const stored = await storedAfterAll(pending);
+    let stored: Stored | null;
+    try {
+      stored = await storedAfterAll(pending);
+    } catch (unknown) {
+      settleLater(pending, announceStored);
+      throw unknown;
+    }
     if (!stored) throw err;
     logger.warn({ sayId: stored.sayId, code: (err as { code?: unknown }).code }, "assistant.say_commit_answer_lost");
     return stored;
@@ -368,7 +403,7 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
       )).rows[0].n);
       if (recent >= limit) throw new SayCapped(limit);
       return storeOne({ type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item });
-    });
+    }, (late) => announce(late, deps, input.turnMessageId));
   } catch (err) {
     if (err instanceof SayCapped) throw await refusedByCap(input, text, err, deps);
     throw err;
@@ -419,7 +454,7 @@ export async function recordNeedsYouFallback(input: { itemId: string }, deps: Sa
       text: answered ? `#${item.seq} "${item.title}": ${answer}` : needsYouText(item),
       item,
     });
-  });
+  }, (late) => announce(late, deps));
   if (!stored) return null;
   await announce(stored, deps);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
@@ -436,7 +471,7 @@ export async function recordSystemNotice(
     type: "assistant.say", fallback: true, item: null,
     sayId: deterministicEventId("assistant.notice", input.userId, input.key),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
-  }));
+  }), (late) => announce(late, deps));
   if (!stored) return null;
   await announce(stored, deps);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
