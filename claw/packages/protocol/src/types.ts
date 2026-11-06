@@ -524,6 +524,14 @@ export interface ExecuteRequest {
   plugin_tools?: unknown[] | null;
   /** Tool name allow-list applied on top of plugin_tools (script-mode hardening). */
   tools_allowlist?: string[];
+  /**
+   * `true`: this run will almost certainly use its sandbox, so Brain starts opening it when the run starts, beside the first model
+   * call, instead of when the first tool asks for it. A run that then never asks gives it back the way any run does at its end (parked
+   * for the session's next message, or reclaimed if it was still being created). Brain ignores it where it opens the sandbox up front
+   * anyway, where `tools_allowlist` leaves no sandbox tool, and when its own `BRAIN_SANDBOX_PRESTART` is off. The API sets it on an
+   * assistant's worker turns. Absent, or anything but `true`: the sandbox opens on the first tool call, as before the field.
+   */
+  sandbox_prestart?: boolean;
   /** Pass-through MCP server configs (resolved at admission time). */
   mcp_servers?: Record<string, Record<string, unknown>>;
 

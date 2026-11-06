@@ -528,6 +528,15 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- An assistant's worker turn starts opening its sandbox when the turn starts, beside its first model call, instead of on its
+  first tool call: the API marks worker turns with the new `ExecuteRequest.sandbox_prestart`, and Brain honours it behind
+  `BRAIN_SANDBOX_PRESTART` (chart `brain.sandboxPrestart`, default on) for a run that opens its sandbox lazily and whose tool list
+  has a sandbox tool. The first tool that asks joins the open already under way. A turn that never asks gives the sandbox back by
+  the ordinary ending: a ready one is parked for the session's next message (and its untouched workspace is not uploaded), one
+  still being created is given up, its workload stopped and its PENDING entry reaped, before the turn reports. Router, observer
+  and ordinary chat turns are unchanged. Brain also reads a provisioning workload's status every second for the first 20 s of
+  the wait, then backs off to every 5 s, instead of every 5 s throughout; a run of 404s must still span 55 s before the
+  workload is given up as gone.
 - Assistant: the router's `say` refuses a message that shows the user internal text (a tool name, the `[work_event]` marker,
   an `item_id`, a run id, or an id of the UUID form the user did not write in the message the turn answers) with
   `internal_text`, and the router is told to name an item by its number and title (`router-v7`); a turn that ends in plain text

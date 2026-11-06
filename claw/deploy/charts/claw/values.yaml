@@ -257,6 +257,12 @@ brain:
   # "false" to open one for every run, which is the switch to reach for if a
   # sandbox-dependent path turns out to have been missed.
   lazySandbox: "true"
+  # With lazySandbox on: a run the API marks as one that will use its sandbox
+  # (an assistant's worker turn) starts opening it when the run starts, beside
+  # the first model call, instead of on the first tool call. A run that never
+  # uses it gives it back at its end like any other. "false" opens every such
+  # sandbox on the first tool call again.
+  sandboxPrestart: "true"
   # Tag workspace objects with origin=workspace as they are uploaded, which is
   # what the bucket's lifecycle rules select on. An escape hatch rather than a
   # rollout gate: the tag rides on the presigned URL and needs nothing from the
