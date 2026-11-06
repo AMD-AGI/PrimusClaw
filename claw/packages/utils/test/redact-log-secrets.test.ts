@@ -100,3 +100,32 @@ test("L9 a log of unclosed quotes after credential names costs its length", () =
   assert.ok(performance.now() - t0 < 2000, "linear, not quadratic");
   assert.equal(r.text.includes(" x "), false);
 });
+
+test("L10 a quote escaped inside a value is part of it, at the top level and inside a JSON string", () => {
+  const inner = JSON.stringify({ password: 'part "inside" tail', user: "alice" });
+  for (const text of [inner, JSON.stringify({ logs: inner }), JSON.stringify({ lines: [`config ${inner}`] })]) {
+    const r = redactLogSecrets(text);
+    for (const word of ["part", "inside", "tail"]) assert.equal(r.text.includes(word), false, `${word}: ${r.text}`);
+    assert.ok(r.text.includes("alice"), r.text);
+    assert.doesNotThrow(() => JSON.parse(r.text), "still JSON");
+  }
+  // A value that ends in a backslash: its escaped backslash does not escape the closing quote.
+  const r = redactLogSecrets(JSON.stringify({ password: "ends in \\", user: "alice" }));
+  assert.equal(r.text, '{"password":"<redacted>","user":"alice"}');
+});
+
+test("L11 a private key cut before its END line is masked to the end; unmatched BEGIN lines cost the text's length", () => {
+  const r = redactLogSecrets("ok\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAfakefakefake\nZm9vYmFy");
+  assert.equal(r.text, "ok\n<redacted private key>");
+  for (const text of [
+    "-----BEGIN RSA PRIVATE KEY-----".repeat(16_000),
+    `${"-----BEGIN RSA PRIVATE KEY-----x".repeat(8_000)}-----END EC PRIVATE KEY-----`,
+    'password: \\"a\\\\\\" '.repeat(20_000),
+    `${'"token": "'}${"\\\\".repeat(100_000)}`,
+    "password=no, ".repeat(20_000),
+  ]) {
+    const t0 = performance.now();
+    redactLogSecrets(text);
+    assert.ok(performance.now() - t0 < 1500, `${text.slice(0, 40)}: ${Math.round(performance.now() - t0)} ms`);
+  }
+});
