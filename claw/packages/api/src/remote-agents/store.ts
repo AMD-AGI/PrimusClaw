@@ -221,9 +221,14 @@ export async function pruneClosedSessions(days: number, batch = 100): Promise<nu
   }
 }
 
+/**
+ * A command stream is open, and is the connector's current one. Why the previous stream ended (`stream_end_reason`) is the
+ * previous stream's: it is cleared, so a connector that reconnected after its token expired and later loses its heartbeat
+ * is offline for the heartbeat, not for a sign-in (`offlineReason`). `stream_closed_at` stays: it is still when it was last seen.
+ */
 export async function markStreamOpen(connectorId: string, streamConn: string): Promise<void> {
   await direct(
-    "UPDATE claw_remote_connectors SET stream_conn = $2, stream_seen_at = NOW() WHERE connector_id = $1",
+    "UPDATE claw_remote_connectors SET stream_conn = $2, stream_seen_at = NOW(), stream_end_reason = NULL WHERE connector_id = $1",
     [connectorId, streamConn],
   );
 }

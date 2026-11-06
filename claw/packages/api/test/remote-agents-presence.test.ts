@@ -11,6 +11,7 @@
  *   P3  a short break (a Claw release cuts every stream for seconds) is recorded and told nothing
  *   P4  replaced by an online connector of the same name, or revoked by the owner: nothing told
  *   P5  a connector whose sign-in ran out is told to sign in again, not just to run
+ *   P5b a stream ended on an expired token that reconnected, then lost its heartbeat, is offline for the heartbeat
  *   P6  only one replica sweeps at a time
  *   P7  a notice (offline or back online) that could not be stored is tried again by the next sweep and said once
  *   P8  every notice goes to the connector's owner and nobody else
@@ -180,6 +181,29 @@ describe("remote connector presence", { skip }, () => {
     assert.match(text, /登录已过期或被撤销/);
     assert.match(text, /`claw-connector login`.*`claw-connector run`/);
     assert.equal((await row(id)).offline_reason, "auth_expired");
+  });
+
+  test("P5b a stream that ended on an expired token and came back: when its heartbeat later stops, the cause is the heartbeat, not the sign-in", async () => {
+    const store = await import("../src/remote-agents/store.js");
+    const id = await connector("alice", "dev-box", true);
+    await sweep();
+    // The access token expires, the server ends the stream, and the connector reconnects with a fresh one (the real store calls).
+    await store.markStreamClosed(id, "c1", "token_expired");
+    await store.markStreamOpen(id, "c2");
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() WHERE connector_id = $1", [id]);
+    assert.equal((await sweep()).transitions, 0, "healthy throughout");
+    // Then the machine goes: the heartbeat goes stale before the server sees the stream close (or the replica that held it died).
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '3 minutes' WHERE connector_id = $1", [id]);
+    await sweep();
+    assert.deepEqual(await transitions(id), ["->online", "online>offline:no_heartbeat"]);
+    assert.equal((await row(id)).offline_reason, "no_heartbeat");
+    const [listed] = await store.listConnectors("alice", WINDOW_MS);
+    assert.deepEqual([listed.online, listed.offline_reason], [false, "no_heartbeat"]);
+    await offlineFor(id, 5);
+    await sweep();
+    const [text] = await says("alice");
+    assert.doesNotMatch(text, /登录已过期或被撤销/, "not told to sign in again");
+    assert.doesNotMatch(text, /`claw-connector login`/);
   });
 
   test("P6 only one replica sweeps at a time", async () => {
