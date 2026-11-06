@@ -492,7 +492,7 @@ export async function inTransaction<T>(
     // Only for a caller that said `run` may run twice: the database is as it was (Postgres refused the statement
     // before it ran, or the connection went before COMMIT was sent, and the transaction rolled back), but what `run`
     // did besides is not ours to know.
-    if (!opts.retryOnFailover || !(failedBeforeRunning(err) || rolledBackByFailover.has(err as object))) throw err;
+    if (!opts.retryOnFailover || !neverCommitted(err)) throw err;
     logger.warn({ code: (err as { code?: unknown }).code }, "db.failover_retry");
     await sleep(FAILOVER_RETRY_DELAY_MS);
     return transactionOnce(run);
@@ -506,6 +506,14 @@ export async function inTransaction<T>(
  * was lost.
  */
 const rolledBackByFailover = new WeakSet<object>();
+
+/**
+ * Whether a failover error that ended a transaction proves it did not take effect: Postgres refused a statement before
+ * it ran, or the error came before the COMMIT was sent. An error on the COMMIT itself proves nothing either way.
+ */
+export function neverCommitted(err: unknown): boolean {
+  return failedBeforeRunning(err) || (typeof err === "object" && err !== null && rolledBackByFailover.has(err));
+}
 
 async function transactionOnce<T>(run: (query: Querier) => Promise<T>): Promise<T> {
   const client = await pool.connect();

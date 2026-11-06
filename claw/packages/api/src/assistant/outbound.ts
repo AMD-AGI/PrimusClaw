@@ -19,7 +19,7 @@ import pino from "pino";
 import { CLAW_ASSISTANT_SAY_MAX_PER_HOUR, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { publishEvent } from "../events/store.js";
-import { db, FAILOVER_RETRY_DELAY_MS, inTransaction, isFailoverError, type Querier } from "../infra/db.js";
+import { db, FAILOVER_RETRY_DELAY_MS, inTransaction, isFailoverError, neverCommitted, type Querier } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import {
   ASSISTANT_EVENT_TYPES,
@@ -161,8 +161,17 @@ async function store(q: Querier, m: ToStore): Promise<Stored | null> {
   return { sayId: m.sayId, sessionId: m.sessionId, payload, subscribers };
 }
 
+/**
+ * Messages this process has announced lately, newest last: what keeps a message looked up again in the background
+ * (`settleLater`) from being announced a second time when something else here stored and announced it meanwhile.
+ */
+const announcedHere = new Set<string>();
+const ANNOUNCED_HERE_MAX = 1_000;
+
 /** After the commit: the web client's copy of the message, and the delivery that cannot wait for the poll. */
 async function announce(stored: Stored, deps: SayDeps, turnMessageId?: string): Promise<void> {
+  announcedHere.add(stored.sayId);
+  if (announcedHere.size > ANNOUNCED_HERE_MAX) announcedHere.delete(announcedHere.values().next().value as string);
   if (stored.sessionId) {
     const { payload } = stored;
     try {
@@ -296,8 +305,8 @@ function capNoticeLater(input: SayInput, text: string, deps: SayDeps): void {
 }
 
 /**
- * A say a failover left unsettled: its COMMIT went out and no answer came back, and the database could not be asked
- * whether it took effect. The message may be stored; a second say of it may be a second message.
+ * A say a failover left unsettled: its COMMIT went out and no answer came back, and the database could not tell
+ * whether it took effect. The message may be stored, or be yet; a second say of it may be a second message.
  */
 export class SayOutcomeUnknown extends Error {
   constructor(readonly sayId: string) {
@@ -310,8 +319,9 @@ export class SayOutcomeUnknown extends Error {
 const SAY_LOOKUP_ATTEMPTS = 3;
 
 /**
- * The message `m`, if it is stored after all, as `store` would have returned it; `null` if it is not. Asked on
- * connections made since the failover, a few times over its first seconds; {@link SayOutcomeUnknown} if no answer came.
+ * The message `m`, if it is stored after all, as `store` would have returned it; `null` if it is not stored now. Asked
+ * on connections made since the failover, a few times over its first seconds; {@link SayOutcomeUnknown} if no answer
+ * came.
  */
 async function storedAfterAll(m: ToStore): Promise<Stored | null> {
   for (let attempt = 1; ; attempt += 1) {
@@ -334,21 +344,24 @@ const SETTLE_LATER_DELAYS = [5, 15, 45];
 
 /**
  * A message whose outcome the database could not tell, looked up again in the background, a few times over the next
- * minute, and announced if it is stored after all. The timers do not hold the process open.
+ * minute, and announced once it is found stored. Not found by the last look, it was not. The timers do not hold the
+ * process open.
  */
 function settleLater(m: ToStore, announceStored: (stored: Stored) => Promise<void>): void {
   const attempt = (i: number): void => {
     setTimeout(() => {
+      const again = () => {
+        if (i + 1 < SETTLE_LATER_DELAYS.length) attempt(i + 1);
+        else logger.warn({ sayId: m.sayId }, "assistant.say_not_stored_after_all");
+      };
       storedAfterAll(m).then(
         async (stored) => {
-          if (!stored) return;
+          if (!stored) return again();
+          if (announcedHere.has(m.sayId)) return;
           logger.warn({ sayId: m.sayId }, "assistant.say_settled_later");
           await announceStored(stored);
         },
-        () => {
-          if (i + 1 < SETTLE_LATER_DELAYS.length) attempt(i + 1);
-          else logger.error({ sayId: m.sayId }, "assistant.say_outcome_never_settled");
-        },
+        again,
       ).catch((err) => logger.error({ err, sayId: m.sayId }, "assistant.say_settle_failed"));
     }, SETTLE_LATER_DELAYS[i] * FAILOVER_RETRY_DELAY_MS).unref();
   };
@@ -380,7 +393,9 @@ async function storeSettled(
     }, { retryOnFailover: true });
   } catch (err) {
     const pending = inserted as ToStore | null;
-    if (!pending || !isFailoverError(err)) throw err;
+    if (!pending || !isFailoverError(err) || neverCommitted(err)) throw err;
+    // The COMMIT itself met the failover. It may have taken effect, or may yet: a backend whose client lost the
+    // connection can still be finishing it. A row found is stored; a row not found is not proof of the opposite.
     let stored: Stored | null;
     try {
       stored = await storedAfterAll(pending);
@@ -388,7 +403,10 @@ async function storeSettled(
       settleLater(pending, announceStored);
       throw unknown;
     }
-    if (!stored) throw err;
+    if (!stored) {
+      settleLater(pending, announceStored);
+      throw new SayOutcomeUnknown(pending.sayId);
+    }
     logger.warn({ sayId: stored.sayId, code: (err as { code?: unknown }).code }, "assistant.say_commit_answer_lost");
     return stored;
   }

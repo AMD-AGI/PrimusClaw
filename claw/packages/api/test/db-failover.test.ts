@@ -37,6 +37,8 @@
  *   F12 the same while the database cannot be asked: the notice is announced once the database answers, and the next
  *       refusal does not send another
  *   F13 the cap's notice whose COMMIT failed and did not take effect: it is stored and announced shortly after, once
+ *   F14 the Router's say whose COMMIT failed and is not found right after, then lands: the Router is told the outcome is
+ *       unknown (not to say it again), and the message is announced once it is found
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -344,7 +346,9 @@ describe("database failover", { skip }, () => {
   });
 
   test("F11 the cap's notice whose COMMIT took effect and whose answer the failover lost: announced, once", async () => {
-    const turn = await w.routerTurn(alice);
+    // A user of its own: a cap notice's id is the user's and the hour's, and this process remembers what it announced.
+    const user = await w.user("f11-user");
+    const turn = await w.routerTurn(user);
     const capped = { ...w.sayDeps, maxPerHour: 1 };
     assert.equal((await w.mod.tools.say(turn as never, { text: "First." }, capped)).ok, true);
     w.events.length = 0;
@@ -360,7 +364,9 @@ describe("database failover", { skip }, () => {
   });
 
   test("F12 the cap's notice whose COMMIT answer was lost while the database cannot be asked: announced later, once", async () => {
-    const turn = await w.routerTurn(alice);
+    // A user of its own: a cap notice's id is the user's and the hour's, and this process remembers what it announced.
+    const user = await w.user("f12-user");
+    const turn = await w.routerTurn(user);
     const capped = { ...w.sayDeps, maxPerHour: 1 };
     assert.equal((await w.mod.tools.say(turn as never, { text: "First." }, capped)).ok, true);
     w.events.length = 0;
@@ -380,7 +386,9 @@ describe("database failover", { skip }, () => {
   });
 
   test("F13 the cap's notice whose COMMIT failed without taking effect: stored and announced shortly after, once", async () => {
-    const turn = await w.routerTurn(alice);
+    // A user of its own: a cap notice's id is the user's and the hour's, and this process remembers what it announced.
+    const user = await w.user("f13-user");
+    const turn = await w.routerTurn(user);
     const capped = { ...w.sayDeps, maxPerHour: 1 };
     assert.equal((await w.mod.tools.say(turn as never, { text: "First." }, capped)).ok, true);
     w.events.length = 0;
@@ -418,5 +426,50 @@ describe("database failover", { skip }, () => {
     assert.equal((await refused("Third.")).code, "say_rate_limited");
     assert.equal(w.events.length, 1, "the next refusal finds it and sends no other");
     assert.equal((await notices()).length, 1);
+    // The lookup that went on in the background finds the notice too, and does not announce it again.
+    await new Promise((r) => setTimeout(r, 15 * 300 + 500));
+    assert.equal(w.events.length, 1, "announced once, not again by the background lookup");
+  });
+
+  test("F14 a say whose COMMIT failed and is not found at once, then lands: unknown to the Router, announced when found", async () => {
+    const turn = await w.routerTurn(alice);
+    // The connection goes during the COMMIT, and the server finishes it later: here the COMMIT is rolled back and the
+    // same row is written a little later, as the backend that outlived its client would.
+    const { default: pgModule } = await import("pg");
+    const proto = pgModule.Client.prototype as unknown as { query: (...args: unknown[]) => unknown };
+    const real = proto.query;
+    let row: unknown[] | undefined;
+    let cut = 0;
+    proto.query = function (this: unknown, ...args: unknown[]) {
+      if (typeof args[0] === "string" && args[0].includes("INSERT INTO claw_assistant_says") && !row) row = args[1] as unknown[];
+      if (args[0] === "COMMIT" && cut === 0) {
+        cut += 1;
+        return (real.apply(this, ["ROLLBACK"]) as Promise<unknown>).then(() => {
+          throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+        });
+      }
+      return real.apply(this, args);
+    };
+    let out: { code?: string; message?: string };
+    try {
+      out = await w.mod.tools.say(turn as never, { text: "The deploy is done." }, w.sayDeps).then(
+        () => ({ code: "said" }), (err: { code?: string; message?: string }) => ({ code: err.code, message: err.message }));
+    } finally {
+      proto.query = real;
+    }
+    assert.equal(cut, 1);
+    assert.equal(out.code, "say_outcome_unknown", "not a fault that asks for the say again");
+    assert.ok(row, "the say was being stored");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_says"))[0].n, 0);
+    // Past the first background lookup, which finds nothing yet: the commit lands only after it.
+    await new Promise((r) => setTimeout(r, 5 * 300 + 500));
+    assert.equal(w.events.length, 0);
+    await w.q(
+      `INSERT INTO claw_assistant_says (say_id, user_id, item_id, item_attention_seq, text, fallback) VALUES ($1, $2, $3, $4, $5, $6)`,
+      row,
+    );
+    const deadline = Date.now() + 8_000;
+    while (!w.events.length && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(w.events.map((e) => e.say_id), [(row as unknown[])[0]], "announced once it was found");
   });
 });

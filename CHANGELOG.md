@@ -744,8 +744,9 @@ record it.
   reads. A transaction that says it may run twice is retried the same way, and also when its connection went before
   its `COMMIT` was sent; every way the assistant stores a message says so. A message whose `COMMIT` took effect but
   whose answer the failover lost (a `say`, the cap's notice, a system notice, a needs-you message) is looked up,
-  announced and reported as stored; one that cannot be looked up then is looked up again in the background over the
-  next minute and announced if it is there, and a `say` like that is reported as
+  announced and reported as stored; one not found then, or that cannot be looked up, is looked up again in the
+  background over the next minute and announced once found (an error on the `COMMIT` proves nothing either way), and a
+  `say` like that is reported as
   `say_outcome_unknown`, and the Router ends the turn with the words instead of saying them again (they are delivered
   only if the turn has not spoken). So the only `say` that faults is one that was not stored; it tells the Router the
   message was not delivered and to call `say` again. Delivering a Router turn's unsaid answer is tried three times
