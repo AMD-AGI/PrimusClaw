@@ -282,13 +282,14 @@ if (DB_SCHEMA) {
 // twice is the same as running it once: Postgres said it never ran, or it only
 // reads.
 
-/** SQLSTATEs that mean this connection is not on the primary any more, or the server is going away under it. */
+/** SQLSTATEs, and socket error codes, that mean this connection is not on the primary any more, or the server is going away under it. */
 const FAILOVER_SQLSTATES = new Set([
   "25006", // read_only_sql_transaction: the server is a replica now
   "57P01", // admin_shutdown: a switchover terminated the backend
   "57P02", // crash_shutdown
   "57P03", // cannot_connect_now: shutting down or starting up
   "08000", "08001", "08003", "08004", "08006", // connection_exception and its kinds
+  "ECONNRESET", "EPIPE", "ETIMEDOUT", // the socket went: what a server that went away without a word looks like
 ]);
 
 /**
@@ -332,7 +333,7 @@ export function isIdempotentStatement(text: string): boolean {
 }
 
 /** How long a retry after a failover waits, so the Service has moved to the new primary. */
-const FAILOVER_RETRY_DELAY_MS = envInt("PG_FAILOVER_RETRY_DELAY_MS", 1000, { min: 0 });
+export const FAILOVER_RETRY_DELAY_MS = envInt("PG_FAILOVER_RETRY_DELAY_MS", 1000, { min: 0 });
 
 let failoverGeneration = 0;
 const clientGeneration = new WeakMap<pg.ClientBase, number>();

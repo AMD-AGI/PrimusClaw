@@ -740,14 +740,17 @@ record it.
   running it twice is the same as running it once: Postgres refused it before it ran (`25006`, `57P03`), or it only
   reads. A transaction that says it may run twice is retried the same way, and also when its connection went before
   its `COMMIT` was sent; every way the assistant stores a message says so. A `say` whose `COMMIT` took effect but whose
-  answer the failover lost is looked up and reported as said, so the only `say` that faults is one that was not
-  stored; it tells the Router the message was not delivered and to call `say` again. Delivering a Router turn's unsaid
-  answer is tried three times before it is given up, instead of once.
+  answer the failover lost is looked up, announced and reported as said; one that cannot be looked up is reported as
+  `say_outcome_unknown`, and the Router ends the turn with the words instead of saying them again (they are delivered
+  only if the turn has not spoken). So the only `say` that faults is one that was not stored; it tells the Router the
+  message was not delivered and to call `say` again. Delivering a Router turn's unsaid answer is tried three times
+  before it is given up, instead of once.
 - A reply the assistant's hourly cap (`CLAW_ASSISTANT_SAY_MAX_PER_HOUR`) refused is no longer dropped without a word.
   The model's `say` was refused, and so was delivering what it wrote instead, and the user heard nothing for as long as
   the cap held. The first refusal in an hour now tells the user, in their language, that replies are paused and to try
-  again later (a notice in the system's words, not counted against the cap; at most one an hour, so a client that
-  keeps writing at the cap gets one notice and not one per message); the model is told the message was not delivered
+  again later (a notice in the system's words, not counted against the cap; at most one an hour, by the database's
+  clock and under the user's say lock, so a client that keeps writing at the cap gets one notice and not one per
+  message); the model is told the message was not delivered
   and not to call `say` again in the turn; and every refusal is counted in `claw_assistant_say_rate_limited_total`, by
   whether the user was sent the notice.
 - Deleting a session that has no `hands.<sid>` binding and no key on its cleanup notification -- every session the

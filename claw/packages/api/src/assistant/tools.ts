@@ -21,7 +21,7 @@ import { insertSessionRow } from "../routes/sessions.js";
 import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
 import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
-import { recordAssistantSay, SayRefused, type SayDeps } from "./outbound.js";
+import { recordAssistantSay, SayOutcomeUnknown, SayRefused, type SayDeps } from "./outbound.js";
 import { internalTextIn, userWordsOf } from "./internal-text.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 import { assistantPluginId } from "./read-tools.js";
@@ -168,6 +168,13 @@ export async function say(
     return { ok: true, ...out };
   } catch (err) {
     if (err instanceof SayRefused) throw new ToolRefused(err.code, err.message);
+    // Saying it again could be a second message; the turn's final words are delivered only if the turn has not spoken.
+    if (err instanceof SayOutcomeUnknown) {
+      throw new ToolRefused(
+        "say_outcome_unknown",
+        "it is not known whether the user got this message: the database failed over as it was stored. Do not call say again with it; end the turn with the same text as your final words, and it is delivered if it was not",
+      );
+    }
     throw err;
   }
 }

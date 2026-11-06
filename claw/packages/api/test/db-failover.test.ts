@@ -26,7 +26,9 @@
  *       did not ask fails
  *   F7  a transaction cut off during its COMMIT is not run again, though it asked: the COMMIT may have taken effect
  *   F8  the Router's say whose COMMIT took effect and whose answer the failover lost: the Router is told it was said,
- *       not to say it again, and the message is stored once
+ *       not to say it again, the web client is told, and the message is stored once
+ *   F9  the same, while the database cannot be asked: the Router is told the outcome is unknown and not to say it again,
+ *       and the turn's final words are not delivered on top of the stored message
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -234,31 +236,61 @@ describe("database failover", { skip }, () => {
     assert.equal(runs, 1, "a COMMIT that may have taken effect is not followed by a second run");
   });
 
-  test("F8 the Router's say whose COMMIT took effect and whose answer the failover lost: told it was said, stored once", async () => {
-    const turn = await w.routerTurn(alice);
-    // The connection goes once the COMMIT has taken effect, before its answer is read: what a switchover can do to it.
+  /**
+   * A switchover between a COMMIT taking effect and its answer: the first COMMIT runs, and then the connection is
+   * reported gone. `alsoFail` statements fail the same way while `run` lasts.
+   */
+  async function commitAnswerLost<T>(run: () => Promise<T>, alsoFail: (text: string) => boolean = () => false): Promise<{ out: T; cut: number }> {
     const { default: pgModule } = await import("pg");
     const proto = pgModule.Client.prototype as unknown as { query: (...args: unknown[]) => unknown };
     const real = proto.query;
+    const gone = () => Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" });
     let cut = 0;
     proto.query = function (this: unknown, ...args: unknown[]) {
       if (args[0] === "COMMIT" && cut === 0) {
         cut += 1;
-        return (real.apply(this, args) as Promise<unknown>).then(() => {
-          throw Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" });
-        });
+        return (real.apply(this, args) as Promise<unknown>).then(() => { throw gone(); });
+      }
+      if (cut > 0 && typeof args[0] === "string" && alsoFail(args[0])) {
+        const callback = args.find((a) => typeof a === "function") as ((err: Error) => void) | undefined;
+        if (callback) { setImmediate(() => callback(gone())); return undefined; }
+        return Promise.reject(gone());
       }
       return real.apply(this, args);
     };
-    let out: { ok: boolean; say_id?: string };
     try {
-      out = await w.mod.tools.say(turn as never, { text: "The deploy is done." }, w.sayDeps);
+      return { out: await run(), cut };
     } finally {
       proto.query = real;
     }
+  }
+
+  test("F8 the Router's say whose COMMIT took effect and whose answer the failover lost: told it was said, stored once", async () => {
+    const turn = await w.routerTurn(alice);
+    const { out, cut } = await commitAnswerLost(() => w.mod.tools.say(turn as never, { text: "The deploy is done." }, w.sayDeps));
     assert.equal(cut, 1, "the COMMIT's answer was lost");
     assert.equal(out.ok, true, "not a fault: the Router would say it again");
     const says = await w.q("SELECT say_id, text FROM claw_assistant_says");
     assert.deepEqual(says.map((s) => [s.say_id, s.text]), [[out.say_id, "The deploy is done."]]);
+    assert.deepEqual(w.events.map((e) => e.say_id), [out.say_id], "the web client is told, once");
+  });
+
+  test("F9 the same while the database cannot be asked: the outcome is unknown, and the message is not sent twice", async () => {
+    const turn = await w.routerTurn(alice);
+    await w.q("UPDATE claw_tasks SET prompt = 'Is the deploy done?' WHERE task_id = $1", [turn.task_id]);
+    const { out, cut } = await commitAnswerLost(
+      () => w.mod.tools.say(turn as never, { text: "The deploy is done." }, w.sayDeps).then(
+        () => "said", (err: { code?: string }) => err.code ?? String(err)),
+      (text) => /FROM claw_assistant_says WHERE say_id/.test(text),
+    );
+    assert.equal(cut, 1);
+    assert.equal(out, "say_outcome_unknown", "a refusal that says not to say it again, not a fault that asks to");
+    // The Router ends the turn with the words, as it is told to: they are not delivered on top of the stored message.
+    const ended = await w.mod.routerTurnEnd.deliverUnsaidAnswer(
+      { sessionId: alice.routerSid, runIds: [turn.task_id], failed: false, interrupted: false, finalText: "The deploy is done." },
+      w.sayDeps,
+    );
+    assert.equal(ended, "skipped");
+    assert.deepEqual((await w.q("SELECT text FROM claw_assistant_says")).map((s) => s.text), ["The deploy is done."]);
   });
 });

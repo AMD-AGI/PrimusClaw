@@ -335,7 +335,7 @@ describe("assistant outbound", { skip }, () => {
       assert.deepEqual(await tally(), [1, 3]);
 
       // A notice sent in the last clock hour, less than an hour ago, counts as well.
-      const hour = Math.floor(Date.now() / 3_600_000);
+      const hour = Number((await q("SELECT floor(extract(epoch FROM clock_timestamp()) / 3600)::bigint AS h")).rows[0].h);
       const noticeId = (h: number) => outbox.deterministicEventId("assistant.notice", "u1", `say_capped:${h}`);
       await q("UPDATE claw_assistant_says SET say_id = $1, created_at = NOW() - interval '30 minutes' WHERE fallback", [noticeId(hour - 1)]);
       await assert.rejects(say("eight", {}, limited), capped);
@@ -350,6 +350,31 @@ describe("assistant outbound", { skip }, () => {
       assert.deepEqual((await notices()).map((s) => s.text), [outbound.sayCapNotice("three"), outbound.sayCapNotice("构建好了")]);
       assert.match(outbound.sayCapNotice("构建好了"), /稍后再试/);
       assert.deepEqual(await tally(), [2, 4]);
+    });
+
+    test("tells the user once when two refusals come at once on either side of an hour", async () => {
+      const limited = deps({ maxPerHour: 1 });
+      await say("one", {}, limited);
+      // Each refusal's notice reads the hour, and waits there a little for the other: without the user's lock both
+      // would look for a notice before either had stored one, under two different hours.
+      let arrived = 0;
+      let bothThere!: () => void;
+      const both = new Promise<void>((resolve) => { bothThere = resolve; });
+      outbound.setCapNoticeHourForTest(async (hour) => {
+        arrived += 1;
+        const mine = arrived;
+        if (arrived === 2) bothThere();
+        await Promise.race([both, sleep(300)]);
+        return hour + mine - 1;
+      });
+      try {
+        const results = await Promise.allSettled([say("two", {}, limited), say("three", {}, limited)]);
+        assert.ok(results.every((r) => r.status === "rejected" && (r.reason as { code?: string }).code === "say_rate_limited"));
+      } finally {
+        outbound.setCapNoticeHourForTest(null);
+      }
+      assert.equal(arrived, 2, "both refusals reached the notice");
+      assert.equal((await saysRows()).filter((s) => s.fallback).length, 1);
     });
 
     test("is a hard cap under concurrent says", async () => {

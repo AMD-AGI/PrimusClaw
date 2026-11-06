@@ -19,7 +19,7 @@ import pino from "pino";
 import { CLAW_ASSISTANT_SAY_MAX_PER_HOUR, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { publishEvent } from "../events/store.js";
-import { db, inTransaction, isFailoverError, type Querier } from "../infra/db.js";
+import { db, FAILOVER_RETRY_DELAY_MS, inTransaction, isFailoverError, type Querier } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import {
   ASSISTANT_EVENT_TYPES,
@@ -129,6 +129,14 @@ type ToStore =
   | (ToStoreBase & { type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow });
 
+/** What a stored message is, to a receiver and to the web client. */
+function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | WorkItemNeedsYouPayload {
+  const base = { event_id: m.sayId, occurred_at: new Date(createdAt).toISOString(), user_id: m.userId, text: redact(m.text) };
+  return m.type === "work_item.needs_you"
+    ? { ...base, type: m.type, fallback: true, item: snapshot(m.item) }
+    : { ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}) };
+}
+
 /** Store the message and queue it for every subscription that asked for its type. `null`: it was stored before. */
 async function store(q: Querier, m: ToStore): Promise<Stored | null> {
   const inserted = (await q(
@@ -139,11 +147,7 @@ async function store(q: Querier, m: ToStore): Promise<Stored | null> {
     [m.sayId, m.userId, m.item?.item_id ?? null, m.item?.attention_seq ?? null, m.text, m.type === "work_item.needs_you" || m.fallback === true],
   )).rows[0];
   if (!inserted) return null;
-
-  const base = { event_id: m.sayId, occurred_at: new Date(inserted.created_at).toISOString(), user_id: m.userId, text: redact(m.text) };
-  const payload: AssistantSayPayload | WorkItemNeedsYouPayload = m.type === "work_item.needs_you"
-    ? { ...base, type: m.type, fallback: true, item: snapshot(m.item) }
-    : { ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}) };
+  const payload = payloadOf(m, inserted.created_at);
 
   // The subscription's `sources` is about what started a run; an assistant message is not one.
   const subs = CLAW_NOTIFICATIONS_ENABLED
@@ -190,18 +194,40 @@ async function loadItem(q: Querier, itemId: string, userId?: string): Promise<It
 }
 
 /**
- * The cap's notice is stored under the clock hour it was sent in, so the only ones that can be less than an hour old
- * are this hour's and the last hour's. Not the stretch since the user reached the cap: under a steady overload the
- * cap lets one message through each time the oldest turns an hour old, and every such stretch would be told again.
+ * The cap's notice is stored under the hour it was sent in, by the database's clock, so the only ones that can be less
+ * than an hour old are this hour's and the last hour's. Not the stretch since the user reached the cap: under a steady
+ * overload the cap lets one message through each time the oldest turns an hour old, and every such stretch would be
+ * told again.
  */
 const capNoticeKey = (hour: number) => `say_capped:${hour}`;
 
-async function capNoticeWithinHour(userId: string, hour: number): Promise<boolean> {
-  const ids = [hour, hour - 1].map((h) => deterministicEventId("assistant.notice", userId, capNoticeKey(h)));
-  return Boolean((await db.query(
-    "SELECT 1 FROM claw_assistant_says WHERE say_id = ANY($1::uuid[]) AND created_at > NOW() - INTERVAL '1 hour' LIMIT 1",
-    [ids],
-  )).rowCount);
+/** For tests: what the hour read from the database is taken as, so that two notices can be put on either side of an hour. */
+let capNoticeHourHook: ((hour: number) => number | Promise<number>) | null = null;
+export function setCapNoticeHourForTest(hook: ((hour: number) => number | Promise<number>) | null): void {
+  capNoticeHourHook = hook;
+}
+
+/**
+ * The cap's notice, unless the user has had one in the last hour: `null` then. Under the lock `say` takes for the user,
+ * and with the hour read once the lock is held, so two refusals at once -- on either side of an hour, on two replicas
+ * -- see each other's notice instead of storing one each.
+ */
+async function storeCapNotice(input: SayInput, text: string): Promise<Stored | null> {
+  return inTransaction(async (q) => {
+    await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
+    const read = Number((await q("SELECT floor(extract(epoch FROM clock_timestamp()) / 3600)::bigint AS h")).rows[0].h);
+    const hour = capNoticeHourHook ? await capNoticeHourHook(read) : read;
+    const ids = [hour, hour - 1].map((h) => deterministicEventId("assistant.notice", input.userId, capNoticeKey(h)));
+    const told = await q(
+      "SELECT 1 FROM claw_assistant_says WHERE say_id = ANY($1::uuid[]) AND created_at > clock_timestamp() - INTERVAL '1 hour'",
+      [ids],
+    );
+    if (told.rowCount) return null;
+    return store(q, {
+      type: "assistant.say", fallback: true, item: null, sayId: ids[0],
+      userId: input.userId, sessionId: input.sessionId, text: sayCapNotice(text),
+    });
+  }, { retryOnFailover: true });
 }
 
 /** What the user is told when the cap first refuses the assistant a message: short, in the language of that message. */
@@ -227,13 +253,12 @@ function sayCapRefusal(limit: number, told: boolean): string {
 async function refusedByCap(input: SayInput, text: string, refused: SayCapped, deps: SayDeps): Promise<SayRefused> {
   let told = true;
   try {
-    const hour = Math.floor(Date.now() / 3_600_000);
-    // Two refusals at once both find no notice and store the same one: the second store finds the first's and stores nothing.
-    const notice = (await capNoticeWithinHour(input.userId, hour)) ? null : await recordSystemNotice({
-      userId: input.userId, sessionId: input.sessionId, text: sayCapNotice(text), key: capNoticeKey(hour),
-    }, deps);
+    const notice = await storeCapNotice(input, text);
     metrics.onAssistantSayRateLimited(notice ? "sent" : "already_sent");
-    if (notice) logger.warn({ userId: input.userId, limit: refused.limit, sayId: notice.say_id }, "assistant.say_cap_notice_sent");
+    if (notice) {
+      logger.warn({ userId: input.userId, limit: refused.limit, sayId: notice.sayId }, "assistant.say_cap_notice_sent");
+      await announce(notice, deps);
+    }
   } catch (err) {
     told = false;
     metrics.onAssistantSayRateLimited("failed");
@@ -242,14 +267,38 @@ async function refusedByCap(input: SayInput, text: string, refused: SayCapped, d
   return new SayRefused("say_rate_limited", sayCapRefusal(refused.limit, told));
 }
 
-/** A message that is stored after all, and the outbox rows queued with it. `null`: it is not. */
-async function storedSay(sayId: string): Promise<{ subscribers: number } | null> {
-  const row = (await db.query(
-    `SELECT (SELECT COUNT(*) FROM claw_notification_outbox WHERE event_id = $2) AS subscribers
-       FROM claw_assistant_says WHERE say_id = $1`,
-    [sayId, sayId],
-  )).rows[0] as { subscribers: string } | undefined;
-  return row ? { subscribers: Number(row.subscribers) } : null;
+/**
+ * A say a failover left unsettled: its COMMIT went out and no answer came back, and the database could not be asked
+ * whether it took effect. The message may be stored; a second say of it may be a second message.
+ */
+export class SayOutcomeUnknown extends Error {
+  constructor(readonly sayId: string) {
+    super("it is not known whether the message was stored");
+    this.name = "SayOutcomeUnknown";
+  }
+}
+
+/** How often the database is asked whether an unsettled say was stored, before it is called unknown. */
+const SAY_LOOKUP_ATTEMPTS = 3;
+
+/**
+ * The message `m`, if it is stored after all, as `store` would have returned it; `null` if it is not. Asked on
+ * connections made since the failover, a few times over its first seconds; {@link SayOutcomeUnknown} if no answer came.
+ */
+async function storedAfterAll(m: ToStore): Promise<Stored | null> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const row = (await db.query(
+        `SELECT created_at, (SELECT COUNT(*) FROM claw_notification_outbox WHERE event_id = $2) AS subscribers
+           FROM claw_assistant_says WHERE say_id = $1`,
+        [m.sayId, m.sayId],
+      )).rows[0] as { created_at: Date; subscribers: string } | undefined;
+      return row ? { sayId: m.sayId, sessionId: m.sessionId, payload: payloadOf(m, row.created_at), subscribers: Number(row.subscribers) } : null;
+    } catch (err) {
+      if (!isFailoverError(err) || attempt >= SAY_LOOKUP_ATTEMPTS) throw new SayOutcomeUnknown(m.sayId);
+      await new Promise((resolve) => setTimeout(resolve, FAILOVER_RETRY_DELAY_MS));
+    }
+  }
 }
 
 /**
@@ -267,6 +316,7 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
 
   // One id for every attempt: what tells, after a failover took the COMMIT's answer, whether the message was stored.
   const sayId = randomUUID();
+  let storing: ToStore | null = null;
   let stored: Stored | null;
   try {
     stored = await inTransaction(async (q) => {
@@ -288,18 +338,18 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
         [input.userId],
       )).rows[0].n);
       if (recent >= limit) throw new SayCapped(limit);
-      return store(q, { type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item });
+      storing = { type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item };
+      return store(q, storing);
     }, { retryOnFailover: true });
   } catch (err) {
     if (err instanceof SayCapped) throw await refusedByCap(input, text, err, deps);
-    // A failover can end the connection after its COMMIT took effect and before the answer came back. Then the
-    // message is stored and queued, and a fault would have the model say it again, so the database is asked (on a
-    // connection made since). The live event to a web client is not sent: it reads the message from the store.
-    const landed = isFailoverError(err) ? await storedSay(sayId) : null;
-    if (!landed) throw err;
+    // A failover can end the connection after its COMMIT took effect and before the answer came back. Then the message
+    // is stored and queued, and a fault would have the model say it again: the database is asked, and a message it
+    // has is announced and answered as said.
+    if (!storing || !isFailoverError(err)) throw err;
+    stored = await storedAfterAll(storing);
+    if (!stored) throw err;
     logger.warn({ sayId, code: (err as { code?: unknown }).code }, "assistant.say_commit_answer_lost");
-    if (landed.subscribers > 0) void (deps.kick ?? kickDelivery)().catch((kickErr) => logger.error({ err: kickErr }, "assistant.say_kick_failed"));
-    return { say_id: sayId, subscribers: landed.subscribers };
   }
   if (!stored) throw new Error("a fresh say id was already stored");
   await announce(stored, deps, input.turnMessageId);
