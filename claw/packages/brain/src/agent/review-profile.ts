@@ -21,7 +21,7 @@ import { parseToolAllowlist, type ToolAllowlist } from "../tools/allowlist.js";
 export const REVIEW_SERVER_NAME = "github_review";
 /** The whole of what a requested review may use. */
 export const REVIEW_PROFILE_TOOLS: readonly string[] = [
-  `mcp__${REVIEW_SERVER_NAME}__*`, "read", "glob", "grep", "ls", "bash", "bash_output", "kill_shell", "task", "todo_write",
+  `mcp__${REVIEW_SERVER_NAME}__*`, "read", "glob", "grep", "ls", "bash", "bash_output", "wait", "kill_shell", "task", "todo_write",
 ];
 
 export function isReviewProfile(request: Pick<ExecuteRequest, "sandbox_profile">): boolean {

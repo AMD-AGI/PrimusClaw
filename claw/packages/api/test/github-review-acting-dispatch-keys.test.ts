@@ -163,7 +163,7 @@ test("D2 a task of a DAG is marked for a session that acts as a user, and its ke
 
 /** What `POST /v1/assistant/reviews` writes for a review alice asked of bob. */
 const REQUESTED = { acting_as: "u-bob", requested_by: { user_id: "u-alice", label: "Alice" }, sandbox_profile: "review" };
-const PROFILE_TOOLS = ["mcp__github_review__*", "read", "glob", "grep", "ls", "bash", "bash_output", "kill_shell", "task", "todo_write"];
+const PROFILE_TOOLS = ["mcp__github_review__*", "read", "glob", "grep", "ls", "bash", "bash_output", "wait", "kill_shell", "task", "todo_write"];
 
 test("D5 a turn of a review someone asked of the owner is claimed with the fixed review profile, from the live row; the owner's own review is not", async () => {
   const { request } = await claim("u-bob", "claude-opus-5.5", undefined, REQUESTED);

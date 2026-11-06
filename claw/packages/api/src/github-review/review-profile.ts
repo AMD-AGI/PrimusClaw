@@ -21,7 +21,7 @@ import { db, type StatementRunner } from "../infra/db.js";
 /** The review tools' server; `session-tools.ts` names it for the turn under the same name. */
 export const GITHUB_REVIEW_SERVER_NAME = "github_review";
 
-export const REVIEW_PROFILE_SANDBOX_TOOLS: readonly string[] = ["read", "glob", "grep", "ls", "bash", "bash_output", "kill_shell", "task", "todo_write"];
+export const REVIEW_PROFILE_SANDBOX_TOOLS: readonly string[] = ["read", "glob", "grep", "ls", "bash", "bash_output", "wait", "kill_shell", "task", "todo_write"];
 export const REVIEW_PROFILE_GITHUB_TOOLS = `mcp__${GITHUB_REVIEW_SERVER_NAME}__*`;
 
 /** What a review asked of another person may use: the review tools, and the sandbox's tools only where there is a sandbox for it. */

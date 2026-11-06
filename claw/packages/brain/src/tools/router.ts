@@ -43,6 +43,57 @@ const BASH_TIMEOUT_CEILING_SEC = toolTimeoutCeilingSec("bash");
 /** The same, for the tool whose whole purpose is to wait longer than bash may. */
 const WAIT_TIMEOUT_CEILING_SEC = toolTimeoutCeilingSec("wait");
 
+/**
+ * How a model that backgrounds a command gets back to it: `wait` (block until it ends) and `bash_output` (look at it), only one of
+ * them, or not at all.
+ *
+ * The bash schema names that tool, so it has to be one the run is offered: a run whose allow-list keeps `bash` but not `wait` (a
+ * requested review, a sub-agent profile, a list a request carries) was told "then call wait", called it, and was refused, a turn spent
+ * on nothing each time. `fitShellSchemas` picks the variant from what is actually offered after every filter.
+ */
+export type BackgroundFollow = "wait" | "wait_only" | "bash_output" | null;
+
+function bashSchema(follow: BackgroundFollow): ToolSchema {
+  const head = "Execute a shell command in the workspace directory. Blocks until the command exits; if it hits the timeout the whole process group is killed and only the output so far comes back";
+  const cap = `Timeout in seconds (default ${BASH_FOREGROUND_DEFAULT_SEC}, capped at ${BASH_TIMEOUT_CEILING_SEC}): a higher value is reduced to the cap`;
+  if (follow === null) {
+    return { name: "bash", description: `${head}, so give a long command a timeout to match rather than splitting it up. When you need to wait — for a job to finish, for a file to appear — wait once for the whole interval in a single call and raise \`timeout\` to cover it. Every call is a separate model request that re-sends the entire conversation, so three chained sleeps cost three times what one longer sleep costs and tell you nothing extra.`,
+      input_schema: {
+        type: "object", properties: {
+          command: { type: "string", description: "Shell command to execute" },
+          timeout: { type: "number", description: `${cap}. The default is a default, not a budget — there is no background mode in this session, so a command or a wait that needs longer should say so here, up to the cap, in one call.` },
+        }, required: ["command"],
+      }};
+  }
+  const then = follow !== "bash_output"
+    ? { tail: "then call wait to block until it finishes", timeout: "run_in_background plus wait",
+      start: follow === "wait" ? "Follow with wait to block until it finishes, or bash_output to look at it without waiting." : "Follow with wait to block until it finishes." }
+    : { tail: "then read what it printed, and its exit status once it ends, with bash_output", timeout: "run_in_background plus bash_output", start: "Follow with bash_output to read what it printed and, once it has finished, its exit status." };
+  return { name: "bash", description: `${head}. For anything that may outlast the timeout — servers, training runs, long builds, watchers — pass run_in_background=true instead of raising the timeout, ${then.tail}.`,
+    input_schema: {
+      type: "object", properties: {
+        command: { type: "string", description: "Shell command to execute" },
+        timeout: { type: "number", description: `${cap}, so use ${then.timeout} for anything longer instead of raising this.` },
+        run_in_background: { type: "boolean", description: `Return a shell_id immediately and keep the command running. ${then.start}` },
+        shell_id: { type: "string", description: "Name this shell instead of taking a generated id (advanced). Private to this conversation, so a plain name like 'server' is fine." },
+        background_kind: { type: "string", enum: ["background", "monitor"], description: "Only with run_in_background=true. monitor shells skip stall-prompt notifications." },
+      }, required: ["command"],
+    }};
+}
+
+/**
+ * The offered schemas with `bash` told only of the background tools that are among them: `wait` and `bash_output` as offered, and no
+ * background mode at all when neither is (a shell nothing offered can read is a shell the model cannot use). Apply it to the final
+ * list, after every allow-list, profile and deny-list filter.
+ */
+export function fitShellSchemas(schemas: ToolSchema[]): ToolSchema[] {
+  if (!BG_SHELL_ENABLED) return schemas;
+  const names = new Set(schemas.map((s) => s.name));
+  if (!names.has("bash") || (names.has("wait") && names.has("bash_output"))) return schemas;
+  const fitted = bashSchema(names.has("wait") ? "wait_only" : names.has("bash_output") ? "bash_output" : null);
+  return schemas.map((s) => (s.name === "bash" ? fitted : s));
+}
+
 /** Sub-file path validation (matches API skill-service.validateSubFilePath). */
 const ALLOWED_SUB_DIRS = ["references", "templates", "scripts", "assets"];
 function validateSubFilePath(filePath: string): string | null {
@@ -686,22 +737,7 @@ export class ToolRouter {
           file_path: { type: "string" },
         }, required: ["skill_name", "file_path"],
       }},
-      { name: "bash", description: BG_SHELL_ENABLED
-        ? "Execute a shell command in the workspace directory. Blocks until the command exits; if it hits the timeout the whole process group is killed and only the output so far comes back. For anything that may outlast the timeout — servers, training runs, long builds, watchers — pass run_in_background=true instead of raising the timeout, then call wait to block until it finishes."
-        : "Execute a shell command in the workspace directory. Blocks until the command exits; if it hits the timeout the whole process group is killed and only the output so far comes back, so give a long command a timeout to match rather than splitting it up. When you need to wait — for a job to finish, for a file to appear — wait once for the whole interval in a single call and raise `timeout` to cover it. Every call is a separate model request that re-sends the entire conversation, so three chained sleeps cost three times what one longer sleep costs and tell you nothing extra.",
-        input_schema: {
-        type: "object", properties: {
-          command: { type: "string", description: "Shell command to execute" },
-          timeout: { type: "number", description: BG_SHELL_ENABLED
-            ? `Timeout in seconds (default ${BASH_FOREGROUND_DEFAULT_SEC}, capped at ${BASH_TIMEOUT_CEILING_SEC}): a higher value is reduced to the cap, so use run_in_background plus wait for anything longer instead of raising this.`
-            : `Timeout in seconds (default ${BASH_FOREGROUND_DEFAULT_SEC}, capped at ${BASH_TIMEOUT_CEILING_SEC}): a higher value is reduced to the cap. The default is a default, not a budget — there is no background mode in this deployment, so a command or a wait that needs longer should say so here, up to the cap, in one call.` },
-          ...(BG_SHELL_ENABLED ? {
-            run_in_background: { type: "boolean", description: "Return a shell_id immediately and keep the command running. Follow with wait to block until it finishes, or bash_output to look at it without waiting." },
-            shell_id: { type: "string", description: "Name this shell instead of taking a generated id (advanced). Private to this conversation, so a plain name like 'server' is fine." },
-            background_kind: { type: "string", enum: ["background", "monitor"], description: "Only with run_in_background=true. monitor shells skip stall-prompt notifications." },
-          } : {}),
-        }, required: ["command"],
-      }},
+      bashSchema(BG_SHELL_ENABLED ? "wait" : null),
 
       ...(BG_SHELL_ENABLED ? [
         { name: "bash_output", description: "Read output from a background shell started with bash(run_in_background=true). Returns only what the shell printed since your previous poll, plus the exit status once it has finished. Shells stay readable across turns of this conversation until the sandbox goes away.", input_schema: {
