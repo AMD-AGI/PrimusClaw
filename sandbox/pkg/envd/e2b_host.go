@@ -16,7 +16,10 @@ func (s *Server) startE2BCommand(argv []string, dir string, env map[string]strin
 	if root == "" {
 		root = "/home/sandbox"
 	}
-	cleaned, err := e2brpc.SandboxPath(root, dir)
+	// Sealed requests never start a command, so the working directory is
+	// taken as E2B takes it: an absolute cwd is that directory, a relative
+	// one is under the workspace.
+	cleaned, err := e2brpc.CommandPath(root, dir)
 	if err != nil {
 		return e2brpc.Command{}, err
 	}

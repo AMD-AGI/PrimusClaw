@@ -23,6 +23,7 @@ import (
 
 func TestConnectStartFilesAndSignal(t *testing.T) {
 	ws := t.TempDir()
+	out := ws + "/out"
 	mux := http.NewServeMux()
 	Mount(mux, ws, execStarter(ws))
 	srv := httptest.NewServer(mux)
@@ -33,59 +34,52 @@ func TestConnectStartFilesAndSignal(t *testing.T) {
 		t.Fatalf("stdout=%q code=%d", stdout, code)
 	}
 
-	wrote := postRaw(t, srv.URL+"/files?path=/out/a.txt", "text/plain", []byte("hi"))
+	wrote := postRaw(t, srv.URL+"/files?path="+out+"/a.txt", "text/plain", []byte("hi"))
 	wroteBody, _ := io.ReadAll(wrote.Body)
 	_ = wrote.Body.Close()
 	if wrote.StatusCode != http.StatusOK || !strings.Contains(string(wroteBody), `"name":"a.txt"`) || !strings.HasPrefix(strings.TrimSpace(string(wroteBody)), "[") {
 		t.Fatalf("upload %d %s", wrote.StatusCode, wroteBody)
 	}
-	got := getRaw(t, srv.URL+"/files?path=/out/a.txt")
+	got := getRaw(t, srv.URL+"/files?path="+out+"/a.txt")
 	if got != "hi" {
 		t.Fatalf("download %q", got)
 	}
 
-	stat := postRaw(t, srv.URL+"/filesystem.Filesystem/Stat", "application/proto", appendString(nil, 1, "/out/a.txt"))
+	stat := postRaw(t, srv.URL+"/filesystem.Filesystem/Stat", "application/proto", appendString(nil, 1, out+"/a.txt"))
 	if stat.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(stat.Body)
 		t.Fatalf("stat %d %s", stat.StatusCode, body)
 	}
 	statBody, _ := io.ReadAll(stat.Body)
 	_ = stat.Body.Close()
-	if !bytes.Contains(statBody, []byte("/out/a.txt")) {
+	if !bytes.Contains(statBody, []byte(out+"/a.txt")) {
 		t.Fatalf("stat body %x", statBody)
 	}
 
-	mk := postRaw(t, srv.URL+"/filesystem.Filesystem/MakeDir", "application/proto", appendString(nil, 1, "/out/dir"))
+	mk := postRaw(t, srv.URL+"/filesystem.Filesystem/MakeDir", "application/proto", appendString(nil, 1, out+"/dir"))
 	if mk.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(mk.Body)
 		t.Fatalf("mkdir %d %s", mk.StatusCode, body)
 	}
 	_ = mk.Body.Close()
-	listed := postRaw(t, srv.URL+"/filesystem.Filesystem/ListDir", "application/proto", appendString(nil, 1, "/out"))
+	listed := postRaw(t, srv.URL+"/filesystem.Filesystem/ListDir", "application/proto", appendString(nil, 1, out))
 	listBody, _ := io.ReadAll(listed.Body)
 	_ = listed.Body.Close()
 	if listed.StatusCode != http.StatusOK || !bytes.Contains(listBody, []byte("a.txt")) || !bytes.Contains(listBody, []byte("dir")) {
 		t.Fatalf("list %d %q", listed.StatusCode, listBody)
 	}
-	moved := postRaw(t, srv.URL+"/filesystem.Filesystem/Move", "application/proto", protoMove("/out/a.txt", "/out/b.txt"))
+	moved := postRaw(t, srv.URL+"/filesystem.Filesystem/Move", "application/proto", protoMove(out+"/a.txt", out+"/b.txt"))
 	if moved.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(moved.Body)
 		t.Fatalf("move %d %s", moved.StatusCode, body)
 	}
 	_ = moved.Body.Close()
-	removed := postRaw(t, srv.URL+"/filesystem.Filesystem/Remove", "application/proto", appendString(nil, 1, "/out/b.txt"))
+	removed := postRaw(t, srv.URL+"/filesystem.Filesystem/Remove", "application/proto", appendString(nil, 1, out+"/b.txt"))
 	if removed.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(removed.Body)
 		t.Fatalf("remove %d %s", removed.StatusCode, body)
 	}
 	_ = removed.Body.Close()
-
-	escaped := postRaw(t, srv.URL+"/filesystem.Filesystem/Stat", "application/proto", appendString(nil, 1, "/../../etc/passwd"))
-	if escaped.StatusCode != http.StatusNotFound {
-		body, _ := io.ReadAll(escaped.Body)
-		t.Fatalf("escape %d %s", escaped.StatusCode, body)
-	}
-	_ = escaped.Body.Close()
 
 	headerOnly := postHeader(t, srv.URL+"/process.Process/Start", "application/proto", protoStart("sh", "-c", "printf no"), map[string]string{
 		"X-Sandbox-Sealed":  "true",
@@ -129,11 +123,105 @@ func TestFilesystemErrorOmitsTheContainerPath(t *testing.T) {
 	Mount(mux, ws, execStarter(ws))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
-	resp := postRaw(t, srv.URL+"/filesystem.Filesystem/Stat", "application/proto", appendString(nil, 1, "/in/sub"))
+	resp := postRaw(t, srv.URL+"/filesystem.Filesystem/Stat", "application/proto", appendString(nil, 1, "in/sub"))
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusNotFound || strings.Contains(string(body), ws) || strings.Contains(string(body), "/app") {
 		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
+// An unsealed sandbox serves E2B's path semantics: an absolute path is that
+// path, so a file written to /tmp/x is the /tmp/x a command reads. It used to
+// land under the workspace, so files.write("/tmp/x") followed by
+// commands.run("cat /tmp/x") found nothing.
+func TestUnsealedAbsolutePathIsThatPath(t *testing.T) {
+	ws := t.TempDir()
+	other := t.TempDir()
+	mux := http.NewServeMux()
+	Mount(mux, ws, execStarter(ws))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	target := other + "/x.txt"
+	wrote := postRaw(t, srv.URL+"/files?path="+target, "text/plain", []byte("written-by-files"))
+	body, _ := io.ReadAll(wrote.Body)
+	_ = wrote.Body.Close()
+	if wrote.StatusCode != http.StatusOK || !strings.Contains(string(body), `"path":"`+target+`"`) {
+		t.Fatalf("upload %d %s", wrote.StatusCode, body)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "written-by-files" {
+		t.Fatalf("file at %s: %q %v", target, got, err)
+	}
+	if _, err := os.Stat(ws + target); !os.IsNotExist(err) {
+		t.Fatalf("upload was mapped under the workspace: %v", err)
+	}
+	if stdout, code := runProto(t, srv.URL, protoStart("cat", target)); code != 0 || stdout != "written-by-files" {
+		t.Fatalf("cat %s: stdout=%q code=%d", target, stdout, code)
+	}
+	if got := getRaw(t, srv.URL+"/files?path="+target); got != "written-by-files" {
+		t.Fatalf("download %q", got)
+	}
+
+	// A relative path is taken from the workspace, and is reported as the
+	// absolute path it names.
+	stat := postRaw(t, srv.URL+"/files?path=rel/a.txt", "text/plain", []byte("rel"))
+	statBody, _ := io.ReadAll(stat.Body)
+	_ = stat.Body.Close()
+	if stat.StatusCode != http.StatusOK || !strings.Contains(string(statBody), `"path":"`+ws+`/rel/a.txt"`) {
+		t.Fatalf("relative upload %d %s", stat.StatusCode, statBody)
+	}
+	if got, err := os.ReadFile(ws + "/rel/a.txt"); err != nil || string(got) != "rel" {
+		t.Fatalf("relative file: %q %v", got, err)
+	}
+
+	// A command started with an absolute cwd runs there.
+	cfg := processConfig{Cmd: "pwd", Cwd: other}
+	if stdout, code := runProto(t, srv.URL, appendMessage(nil, 1, encodeProcessConfig(cfg))); code != 0 || strings.TrimSpace(stdout) != other {
+		t.Fatalf("pwd with cwd %s: stdout=%q code=%d", other, stdout, code)
+	}
+}
+
+// A sealed sandbox keeps its grant's paths rooted at the workspace: the
+// grant's "/in" is "<workspace>/in". A path that leaves the workspace gets an
+// error that says so, and a path outside the allow-list is refused, never
+// mapped elsewhere.
+func TestSealedPathsStayUnderTheWorkspace(t *testing.T) {
+	ws := t.TempDir()
+	mux := http.NewServeMux()
+	Mount(mux, ws, execStarter(ws))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r.WithContext(e2bapi.WithRequestPolicy(r.Context(), e2bapi.RequestPolicy{
+			Sealed: true, Inputs: []string{"/in"}, Outputs: []string{"/"},
+		})))
+	}))
+	defer srv.Close()
+
+	wrote := postRaw(t, srv.URL+"/files?path=/in/a.txt", "text/plain", []byte("sealed"))
+	body, _ := io.ReadAll(wrote.Body)
+	_ = wrote.Body.Close()
+	if wrote.StatusCode != http.StatusOK || !strings.Contains(string(body), `"path":"/in/a.txt"`) {
+		t.Fatalf("sealed upload %d %s", wrote.StatusCode, body)
+	}
+	if got, err := os.ReadFile(ws + "/in/a.txt"); err != nil || string(got) != "sealed" {
+		t.Fatalf("sealed file under the workspace: %q %v", got, err)
+	}
+	if got := getRaw(t, srv.URL+"/files?path=/in/a.txt"); got != "sealed" {
+		t.Fatalf("sealed download %q", got)
+	}
+
+	escaped := postRaw(t, srv.URL+"/filesystem.Filesystem/Stat", "application/json", []byte(`{"path":"../outside"}`))
+	escBody, _ := io.ReadAll(escaped.Body)
+	_ = escaped.Body.Close()
+	if escaped.StatusCode != http.StatusForbidden || !strings.Contains(string(escBody), "escapes the sandbox root") {
+		t.Fatalf("sealed escape %d %s", escaped.StatusCode, escBody)
+	}
+
+	outside := postRaw(t, srv.URL+"/files?path=/tmp/sealed-outside.txt", "text/plain", []byte("x"))
+	outBody, _ := io.ReadAll(outside.Body)
+	_ = outside.Body.Close()
+	if outside.StatusCode != http.StatusForbidden || !strings.Contains(string(outBody), "sealed_denied") {
+		t.Fatalf("sealed write outside the allow-list %d %s", outside.StatusCode, outBody)
 	}
 }
 
@@ -323,7 +411,7 @@ func TestStdinAndSignal(t *testing.T) {
 
 func execStarter(ws string) Starter {
 	return func(argv []string, dir string, env map[string]string, withStdin bool) (Command, error) {
-		cleaned, err := SandboxPath(ws, dir)
+		cleaned, err := CommandPath(ws, dir)
 		if err != nil {
 			return Command{}, err
 		}
