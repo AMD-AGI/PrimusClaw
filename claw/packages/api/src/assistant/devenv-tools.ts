@@ -510,17 +510,16 @@ export async function executeSend(
   // Queued and noted in the session's order (`inRemoteSessionOrder`): a stop pressed meanwhile is counted before or after it, never between.
   const issued = await inRemoteSessionOrder(target, async () => {
     const since = await remoteEventMark(target);
-    const promptCmdId = `k:${cmdId}`;
     const out = await issueCommand({
       owner: userId, client: "assistant", connectorId: plan.connector_id, agentId: plan.agent_id, sessionId: target, type: "prompt",
-      cmdId: promptCmdId, payload: parsed.value, auditDetail: REMOTE_COMMANDS.prompt.audit(parsed.value),
+      cmdId: `k:${cmdId}`, payload: parsed.value, auditDetail: REMOTE_COMMANDS.prompt.audit(parsed.value),
       closesSession: false, commandsPerMinute: REMOTE_AGENT_LIMITS.commandsPerMinute,
     });
     // The item the user is told the end of. A repeat (`duplicate`) found the first one's.
     if (out.status === "queued") {
       await noteRemotePrompt({
         owner: userId, sessionId: target, connectorId: plan.connector_id, agentId: plan.agent_id, text, origin: "assistant", lang, since,
-        cmdId: promptCmdId,
+        cmdSeq: Number(out.row.cmd_seq),
       });
     }
     return out;

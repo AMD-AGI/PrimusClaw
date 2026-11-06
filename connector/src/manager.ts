@@ -13,10 +13,14 @@ export interface Command {
   cmd_id: string;
   type: string;
   session_id: string;
+  /** The frame's id on the command stream (`cmd_seq`), when it came from there. */
+  cmd_seq?: number;
   [k: string]: unknown;
 }
 
 const MAX_ACTIVE_SESSIONS = 10;
+
+const cmdSeqOf = (cmd: Command): number | null => (Number.isSafeInteger(cmd.cmd_seq) ? cmd.cmd_seq! : null);
 
 export class SessionManager {
   readonly sessions = new Map<string, Session>();
@@ -78,8 +82,8 @@ export class SessionManager {
     }
     switch (type) {
       case "prompt":
-        if (typeof cmd.text !== "string" || cmd.text === "") { s.rejectCommand("prompt", cmdId, "text_required"); return false; }
-        s.enqueuePrompt(cmd.text, cmdId, handled);
+        if (typeof cmd.text !== "string" || cmd.text === "") { s.rejectCommand("prompt", cmdId, "text_required", cmdSeqOf(cmd)); return false; }
+        s.enqueuePrompt(cmd.text, cmdId, handled, cmdSeqOf(cmd));
         return true;
       case "cancel":
         await s.cancel();

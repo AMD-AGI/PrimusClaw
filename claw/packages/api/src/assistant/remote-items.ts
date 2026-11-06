@@ -13,9 +13,10 @@
  *  - the events its connector posts (`noteRemoteEvents`): a permission request puts the item in front of the user, its answer takes it
  *    back, a turn's end closes it with the end of the agent's answer as its summary, a closed session closes it.
  *
- * Which prompt a turn's end ends: a connector that names it (`turn_end.cmd_id`, and `command_rejected.cmd_id` for a prompt it dropped
- * unrun) is followed by name (`open_cmds`). One that does not (an older connector) is counted (`open_turns`, with the
- * cancels pending), as it always was.
+ * Which prompt a turn's end ends: a connector that names it (`turn_end.cmd_seq`, and `command_rejected.cmd_seq` for a prompt it
+ * dropped unrun) is followed by name (`open_cmd_seqs`). The command's `cmd_seq`, not its `cmd_id`: an id is text a client may choose
+ * (an `Idempotency-Key`), which a credential scrub on the way may mask, and a number never is. One that does not name it (an older
+ * connector) is counted (`open_turns`, with the cancels pending), as it always was.
  *
  * Who is told: an instruction the assistant sent (`origin: "assistant"`) is the user's errand, and its end, or a permission it waits
  * on, is said to them once (`recordSystemNotice`, keyed by the event). One the user typed into an attached chat is not: they are
@@ -90,11 +91,11 @@ export interface RemoteParams {
   /** Instructions sent and not yet ended: the item closes when the last one ends. */
   open_turns: number;
   /**
-   * The command ids of those instructions, while every one of them is known (from the item's first prompt, or from it reopening):
-   * a turn's end that names its prompt ends that one only. Null once a turn's end came that named none (an older connector), and
-   * absent on items from before it was kept: the item is then counted (`open_turns`) until it next reopens.
+   * The `cmd_seq` of those instructions, while every one of them is known (from the item's first prompt, or from it reopening): a
+   * turn's end that names its prompt ends that one only. Null once a turn's end or a refusal came that named none (an older
+   * connector), and absent on items from before it was kept: the item is then counted (`open_turns`) until it next reopens.
    */
-  open_cmds?: string[] | null;
+  open_cmd_seqs?: number[] | null;
   /** Permission requests asked and not yet answered. */
   waiting: string[];
   /** The newest session event this item has applied (`claw_remote_events.id`). */
@@ -152,8 +153,8 @@ export interface NotePrompt {
   origin: RemoteOrigin;
   /** The language the user asked in; the instruction's own when not given. */
   lang?: RemoteLang;
-  /** The prompt's command id (`claw_remote_commands.cmd_id`), which a connector names in that prompt's `turn_end`. */
-  cmdId: string;
+  /** The prompt's command number (`claw_remote_commands.cmd_seq`), which a connector names in that prompt's `turn_end`. */
+  cmdSeq: number;
   /**
    * The session's newest event before the prompt was queued (`remoteEventMark`): what the session posts after it is this prompt's,
    * even when it reached Claw before this note did (the connector may run a short turn, or refuse the prompt, that fast). Not
@@ -246,7 +247,7 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
     if (!open) {
       const params: RemoteParams = {
         connector_id: p.connectorId, session_id: p.sessionId, agent_id: p.agentId, machine, asked, origin: p.origin, lang,
-        open_turns: 1, open_cmds: [p.cmdId], waiting: [], last_event_id: last,
+        open_turns: 1, open_cmd_seqs: [p.cmdSeq], waiting: [], last_event_id: last,
       };
       const seq = Number((await q(
         "SELECT COALESCE(MAX(seq), 0)::int + 1 AS next FROM claw_work_items WHERE user_id = $1", [p.owner],
@@ -283,10 +284,11 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
     }
     // A prompt sent while a cancel is pending runs after it.
     if (cancels.length) cancels[cancels.length - 1].n += 1;
-    // Its id joins those open, while all of them are known; an item that ended starts over from this one.
-    const openCmds = open.board_state === "done" ? [p.cmdId] : Array.isArray(open.params?.open_cmds) ? [...open.params.open_cmds, p.cmdId] : null;
+    // Its number joins those open, while all of them are known; an item that ended starts over from this one.
+    const openSeqs = open.board_state === "done" ? [p.cmdSeq]
+      : Array.isArray(open.params?.open_cmd_seqs) ? [...open.params.open_cmd_seqs, p.cmdSeq] : null;
     const patch = {
-      asked, origin: p.origin, lang, open_turns: turns, cancels, open_cmds: openCmds,
+      asked, origin: p.origin, lang, open_turns: turns, cancels, open_cmd_seqs: openSeqs,
       ...(open.board_state === "done" ? { waiting: [], closed_event_id: 0, last_event_id: from } : {}),
     };
     await q(
@@ -440,27 +442,27 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
     };
     for (const e of events) {
       p.last_event_id = e.id;
-      // A connector that names the prompt a turn's end ends (`cmd_id`, null for a cancel that found nothing running) is followed by
-      // name, while the item knows every prompt open by its id. A turn's end that names none (an older connector) makes the item count
-      // them instead, as it did before names were kept. A refusal names its prompt whichever connector sent it.
-      const cmd = typeof e.data.cmd_id === "string" ? e.data.cmd_id : "";
-      const named = e.type === REMOTE_EVENT_TURN_END && Object.hasOwn(e.data, "cmd_id");
+      // A connector that names the prompt a turn's end ends (`cmd_seq`, null for a cancel that found nothing running) is followed by
+      // name, while the item knows every prompt open by its number. A turn's end, or a refusal of a prompt that never runs, that names
+      // none (an older connector) makes the item count them instead, as it did before names were kept.
+      const seq = Number.isSafeInteger(e.data.cmd_seq) ? Number(e.data.cmd_seq) : null;
       const reason = e.type === REMOTE_EVENT_COMMAND_REJECTED && e.data.type === "prompt" ? flat(e.data.reason, 80) : "";
       // A refusal ends its prompt only when the prompt never runs; one refused as its turn starts ends with that turn's end.
       const refusedUnrun = PROMPT_REFUSED_UNQUEUED.has(reason) || reason === PROMPT_DROPPED_BY_CANCEL;
-      if (e.type === REMOTE_EVENT_TURN_END && !named) p.open_cmds = null;
-      if (Array.isArray(p.open_cmds) && (named || refusedUnrun)) {
+      const named = (e.type === REMOTE_EVENT_TURN_END && Object.hasOwn(e.data, "cmd_seq")) || (refusedUnrun && seq !== null);
+      if ((e.type === REMOTE_EVENT_TURN_END || refusedUnrun) && !named) p.open_cmd_seqs = null;
+      if (Array.isArray(p.open_cmd_seqs) && named) {
         if (board === "done") continue;
         // Cancels pending are counted only for a connector that does not name its prompts.
-        if (named) p.cancels = [];
-        if (!cmd || !p.open_cmds.includes(cmd)) continue;
-        p.open_cmds = p.open_cmds.filter((c) => c !== cmd);
-        p.open_turns = p.open_cmds.length;
+        if (e.type === REMOTE_EVENT_TURN_END) p.cancels = [];
+        if (seq === null || !p.open_cmd_seqs.includes(seq)) continue;
+        p.open_cmd_seqs = p.open_cmd_seqs.filter((c) => c !== seq);
+        p.open_turns = p.open_cmd_seqs.length;
         if (p.open_turns > 0) continue;
         board = "done";
         p.closed_event_id = e.id;
         p.waiting = [];
-        if (named) await closeAnswered(e);
+        if (e.type === REMOTE_EVENT_TURN_END) await closeAnswered(e);
         else await closeRefused(e, reason);
         continue;
       }
