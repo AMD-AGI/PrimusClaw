@@ -161,9 +161,10 @@ export function repoGrounded(text: string, pr: Pick<PrRef, "owner" | "repo">, ch
  * `pull request #12` (a pull request, whatever item has that number).
  */
 export function mentionsItem(text: string, seq: number): boolean {
-  // What comes before each `#` is read backwards from it, as a lookbehind, so a long message is read once and not once per `#`.
-  const pullRequestWord = String.raw`(?:\bprs?|\bpull(?:\s+request)?|拉取请求|合并请求)[\s:：]*#`;
-  return new RegExp(`(?<![A-Za-z0-9_.-])#(?<!${pullRequestWord})${seq}(?![0-9])`, "i").test(text);
+  // What comes before each `#` is read backwards from it, as a lookbehind, so a long message is read once and not once per `#`. Only
+  // the pull-request word is read case aside (`(?i:`), not the number.
+  const pullRequestWord = String.raw`(?i:\bprs?|\bpull(?:\s+request)?|拉取请求|合并请求)[\s:：]*#`;
+  return new RegExp(`(?<![A-Za-z0-9_.-])#(?<!${pullRequestWord})${seq}(?![0-9])`).test(text);
 }
 
 /**

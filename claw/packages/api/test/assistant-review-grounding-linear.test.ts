@@ -101,7 +101,7 @@ test("L2 fullRefsIn names what it named before", () => {
 });
 
 test("L2 approvalCommand lets through what it let through before", () => {
-  const space = [" ", "  ", "\t", "\n", " ", "　", ""];
+  const space = [" ", "  ", "\t", "\n", "\u00a0", "\u3000", ""];
   const close = [".", "。", "!", "！", "..", "x", "#", ""];
   const ids = ["a3f9c2", "A3F9C2", "a3f9c2d1-5b7e-4c1a-9f00-000000000224", "a3f9c", "a3f9c2d", "g3f9c2"];
   for (const s of [
@@ -121,16 +121,17 @@ test("L2 approvalCommand lets through what it let through before", () => {
 
 test("L2 mentionsItem points where it pointed before", () => {
   const pieces = ["#", "#5", "#12", "#1", "5", "12", "pr", "PR", "prs", "Prs", "pull", "Pull", "request", "REQUEST", " ", "  ", "\t", "\n",
-    ":", "：", "拉取请求", "合并请求", "a", "_", ".", "-", "中", "x", "repo", " "];
+    ":", "：", "拉取请求", "合并请求", "a", "_", ".", "-", "中", "x", "repo", "\u00a0", "#NaN", "#nan", "#Infinity", "#INFINITY"];
   for (const [s, seq] of [
     ["PR #5 and #12", 12], ["PR #12", 12], ["pull request #12", 12], ["pull   request:#12", 12], ["xpr #12", 12], ["中pr #12", 12],
     ["拉取请求 #12", 12], ["合并请求：#12", 12], ["repo#12", 12], ["#123", 12], ["#12", 12], ["prs: #12", 12], ["pullrequest #12", 12],
     ["pull request\n#12", 12], ["PULL #12", 12], ["pr#12", 12], ["", 12],
-  ] as const) assert.equal(mentionsItem(s, seq), mentionsItemBefore(s, seq), JSON.stringify(s));
+    ["#NaN", NaN], ["#NAN", NaN], ["#Infinity", Infinity], ["#infinity", Infinity], ["#1e+21", 1e21], ["#1E21", 1e21],
+  ] as const) assert.equal(mentionsItem(s, seq), mentionsItemBefore(s, seq), `${JSON.stringify(s)} #${seq}`);
   for (let seed = 1; seed <= CASES; seed++) {
     const r = random(seed);
     const s = textOf(r, pieces, 12);
-    const seq = pick(r, [1, 5, 12]);
+    const seq = pick(r, [1, 5, 12, NaN, Infinity]);
     assert.equal(mentionsItem(s, seq), mentionsItemBefore(s, seq), `seed ${seed}: ${JSON.stringify(s)} #${seq}`);
   }
 });
