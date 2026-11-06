@@ -23,13 +23,15 @@ const NONE_MANAGED = { managedWorkspaces: [] };
 
 test("the default sandbox workspace is the CPU one, though the GPU workspace is listed first", () => {
   const me = buildMe(USER, list(ws("gpu-ws", { gpuProduct: "MI355X" }), ws("cpu-ws")), READY, NONE_MANAGED);
-  assert.deepEqual(me?.sandbox, { available: true, defaultWorkspaceId: "cpu-ws" });
+  assert.deepEqual(me?.sandbox, {
+    available: true, defaultWorkspaceId: "cpu-ws", cpu: { workspaceId: "cpu-ws", available: true },
+  });
 });
 
 test("a caller without the CPU workspace gets the GPU workspace, then the first one, as before", () => {
   assert.deepEqual(
     buildMe(USER, list(ws("a"), ws("gpu-ws", { gpuProduct: "MI355X" })), READY, NONE_MANAGED)?.sandbox,
-    { available: true, defaultWorkspaceId: "a" },
+    { available: true, defaultWorkspaceId: "a", cpu: { workspaceId: "cpu-ws", available: false, reason: "no_access" } },
     "only the CPU workspace is preferred; the GPU one is not a second preference",
   );
 });
