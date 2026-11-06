@@ -636,4 +636,172 @@ describe("assistant outbound", { skip }, () => {
       assert.equal((await patch(["assistant.shout"])).statusCode, 400);
     });
   });
+  describe("a message no channel can carry", () => {
+    const counter = () => h.app.metrics.registry.getSingleMetric("claw_assistant_say_unreachable_total")!;
+    const unreachable = async (type: string) => (await counter().get()).values.find((v) => v.labels.type === type)?.value ?? 0;
+    let warned: Array<Record<string, unknown>> = [];
+    let realWarn: typeof outbound.outboundLog.unreachable;
+    beforeEach(() => {
+      warned = [];
+      realWarn = outbound.outboundLog.unreachable;
+      outbound.outboundLog.unreachable = (fields) => { warned.push(fields); };
+    });
+    const restore = () => { outbound.outboundLog.unreachable = realWarn; };
+
+    test("is counted every time, and warned about once per user an hour, with the user and the item", async () => {
+      try {
+        const before = await unreachable("assistant.say");
+        const itemId = await seedItem();
+        const first = await say("about it", { itemId });
+        assert.equal(first.subscribers, 0);
+        await say("again");
+        await outbound.recordAssistantSay({ userId: "u2", sessionId: "assistant-u2", text: "hello" }, deps());
+        assert.equal(await unreachable("assistant.say") - before, 3, "every one is counted");
+        assert.deepEqual(warned, [
+          { user_id: "u1", item_id: itemId, say_id: first.say_id, type: "assistant.say" },
+          { user_id: "u2", item_id: null, say_id: warned[1]?.say_id, type: "assistant.say" },
+        ], "one line per user, the first of the hour, naming the user and the item");
+
+        // An hour on, the user is warned about again.
+        await q("UPDATE claw_assistant_says SET created_at = date_trunc('hour', NOW()) - interval '1 minute'");
+        const later = await say("a new hour");
+        assert.equal(warned.length, 3);
+        assert.equal(warned[2].say_id, later.say_id);
+
+        // A message a subscription carries is neither counted nor warned about.
+        await subscribe("u1", ["assistant.say"]);
+        const counted = await unreachable("assistant.say");
+        assert.equal((await say("carried")).subscribers, 1);
+        assert.equal(await unreachable("assistant.say"), counted);
+        assert.equal(warned.length, 3);
+      } finally { restore(); }
+    });
+
+    test("is not taken for told by the silent sweep: an unreached fallback is sent once a subscription takes it", async () => {
+      const silent = await import("../src/assistant/silent-sweep.js");
+      const ports = { ...silent.silentSweepPorts };
+      silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, deps());
+      try {
+        const itemId = await seedItem();
+        await q("UPDATE claw_work_items SET updated_at = NOW() - interval '1 hour'");
+        assert.equal(await silent.tellSilentItems(300), 1, "the fallback is stored");
+        const [fallback] = (await saysRows()).filter((x) => x.fallback);
+        assert.equal(fallback.item_id, itemId);
+        assert.equal((await outboxRows()).length, 0, "nothing could carry it");
+        assert.equal(await silent.tellSilentItems(300), 0, "with nothing to carry it, the item is not picked again");
+
+        const sub = await subscribe("u1", ["work_item.needs_you"]);
+        assert.equal(await silent.tellSilentItems(300), 1, "an undelivered fallback is not told");
+        const rows = await outboxRows();
+        assert.deepEqual(rows.map((r) => [r.event_id, r.subscription_id, r.payload.type, r.payload.item.item_id]),
+          [[fallback.say_id, sub, "work_item.needs_you", itemId]]);
+        assert.equal(await silent.tellSilentItems(300), 0, "once: its outbox row now tells it");
+        assert.equal((await outboxRows()).length, 1);
+      } finally {
+        Object.assign(silent.silentSweepPorts, ports);
+        restore();
+      }
+    });
+
+    test("is sent by the type a subscription takes: with only assistant.say taken, the model's say goes and the item is not picked again", async () => {
+      const silent = await import("../src/assistant/silent-sweep.js");
+      const ports = { ...silent.silentSweepPorts };
+      silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, deps());
+      try {
+        const itemId = await seedItem();
+        const said = await say("#1 is ready for your review.", { itemId });
+        await q("UPDATE claw_work_items SET updated_at = NOW() - interval '1 hour'");
+        assert.equal(await silent.tellSilentItems(300), 1, "the fallback is stored, newer than the say");
+        const sub = await subscribe("u1", ["assistant.say"]);
+        assert.equal(await silent.tellSilentItems(300), 1);
+        assert.deepEqual((await outboxRows()).map((r) => [r.event_id, r.subscription_id, r.payload.type]),
+          [[said.say_id, sub, "assistant.say"]], "the say the subscription takes, not the newer fallback it does not");
+        assert.equal(await silent.tellSilentItems(300), 0, "told now: not picked again");
+      } finally {
+        Object.assign(silent.silentSweepPorts, ports);
+        restore();
+      }
+    });
+
+    test("a fallback whose only send was refused 410 goes to a subscription added later, and only to it", async () => {
+      const silent = await import("../src/assistant/silent-sweep.js");
+      const ports = { ...silent.silentSweepPorts };
+      silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, deps());
+      try {
+        const itemId = await seedItem();
+        await q("UPDATE claw_work_items SET updated_at = NOW() - interval '1 hour'");
+        assert.equal(await silent.tellSilentItems(300), 1, "stored, to nobody");
+        const first = await subscribe("u1", ["work_item.needs_you"]);
+        assert.equal(await silent.tellSilentItems(300), 1, "handed to the first subscription");
+        status = 410;
+        await deliver();
+        const [gone] = await outboxRows();
+        assert.deepEqual([gone.subscription_id, gone.last_status, gone.dropped_at !== null], [first, "http_410", true]);
+        assert.equal(await silent.tellSilentItems(300), 0, "nothing new can carry it: not picked");
+
+        const second = await subscribe("u1", ["work_item.needs_you"]);
+        assert.equal(await silent.tellSilentItems(300), 1, "a dropped send is not a told user");
+        const rows = await outboxRows();
+        assert.deepEqual(rows.map((r) => r.subscription_id), [first, second], "the refusing subscription is not handed it again");
+        assert.equal(rows[1].event_id, gone.event_id);
+        assert.equal(await silent.tellSilentItems(300), 0, "queued now: told");
+      } finally {
+        Object.assign(silent.silentSweepPorts, ports);
+        restore();
+      }
+    });
+
+    test("an answer the sweep said while nothing could carry it is sent when a subscription takes it", async () => {
+      const silent = await import("../src/assistant/silent-sweep.js");
+      const ports = { ...silent.silentSweepPorts };
+      silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, deps());
+      try {
+        const itemId = await seedItem({ board_state: "done", last_report_kind: "answer" });
+        await q("UPDATE claw_work_items SET outcome = 'answered', closed_at = NOW(), updated_at = NOW() - interval '1 hour' WHERE item_id = $1", [itemId]);
+        await q(
+          "INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary) VALUES ($1, 'answer', 'worker', 1, 'It is 42.')",
+          [itemId],
+        );
+        assert.equal(await silent.tellSilentItems(300), 1, "the answer is said, to nobody");
+        assert.equal((await outboxRows()).length, 0);
+        assert.equal(await silent.tellSilentItems(300), 0);
+
+        const post = await app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: { url: "https://93.184.216.34/a", event_types: ["work_item.needs_you"] } });
+        assert.equal(post.statusCode, 201, post.body);
+        const rows = await outboxRows();
+        assert.equal(rows.length, 1);
+        assert.deepEqual([rows[0].payload.type, rows[0].payload.item.item_id], ["work_item.needs_you", itemId]);
+        assert.match(rows[0].payload.text, /It is 42\./);
+        assert.equal(await silent.tellSilentItems(300), 0, "told now");
+      } finally {
+        Object.assign(silent.silentSweepPorts, ports);
+        restore();
+      }
+    });
+
+    test("is sent to a subscription when it starts taking the assistant's events, once, for items that still need the user", async () => {
+      const post = (payload: unknown) => app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: payload as object });
+      try {
+        const waiting = await seedItem();
+        const moved = await seedItem();
+        const said = await say("#1 is ready for your review.", { itemId: waiting });
+        await say("#2 is ready too.", { itemId: moved });
+        await q("UPDATE claw_work_items SET board_state = 'in_progress' WHERE item_id = $1", [moved]);
+        assert.equal((await outboxRows()).length, 0);
+
+        const plain = await post({ url: "https://93.184.216.34/a" });
+        assert.equal(plain.statusCode, 201, plain.body);
+        assert.equal((await outboxRows()).length, 0, "a subscription without the assistant's events gets nothing");
+
+        const id = plain.json().data.subscription_id;
+        const patch = () => app.inject({ method: "PATCH", url: `/v1/notification-subscriptions/${id}`, payload: { event_types: ["assistant.say"] } });
+        assert.equal((await patch()).statusCode, 200);
+        const rows = await outboxRows();
+        assert.deepEqual(rows.map((r) => [r.event_id, r.subscription_id, r.payload.type, r.payload.text, r.payload.item.item_id]),
+          [[said.say_id, id, "assistant.say", "#1 is ready for your review.", waiting]], "only the item that still needs the user");
+        assert.equal((await patch()).statusCode, 200);
+        assert.equal((await outboxRows()).length, 1, "once");
+      } finally { restore(); }
+    });
+  });
 });

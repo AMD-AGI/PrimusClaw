@@ -583,10 +583,28 @@ export interface TeardownInput {
  * that row. Rows of other sessions it reads (a team member's) it locks itself. When it
  * answers false nothing is written and this returns false.
  *
+ * Every deletion -- a user's own or retention's -- takes
+ * {@link ARCHIVED_DELETION_LOCK_ID} first, for its transaction: retention's daily
+ * limit counts every archived session deleted in the last 24 hours (nothing on
+ * the row says who deleted it), and asks that count again under this lock, in
+ * `onlyIf`, so a user's delete committed while retention was deciding is in it.
+ * Every deletion and not only an archived one, because a session can be
+ * archived between a check and the deletion that follows it. The hold is one
+ * short transaction.
+ * Taken before the session row, by every holder, so the two cannot wait on each
+ * other in the opposite order.
+ *
  * @returns true when the deletion committed, false when `onlyIf` declined it.
  * @throws {TeardownRefused} when the transaction did not commit, in which case
  *         the session and every row it has are exactly as they were.
  */
+/**
+ * Serialises session deletions, for retention's daily count of archived ones; see
+ * {@link commitSessionDeletion}. Shares one namespace with every advisory lock in
+ * this database (`LEADER_LOCK_IDS`, `SCHEMA_MIGRATION_LOCK_ID`).
+ */
+export const ARCHIVED_DELETION_LOCK_ID = 8_264_179_233_105;
+
 export async function commitSessionDeletion(
   sessionId: string,
   opts: { onlyIf?: (query: Querier) => Promise<boolean> } = {},
@@ -599,6 +617,7 @@ export async function commitSessionDeletion(
   }>;
   try {
     queueExits = await inTransaction(async (query: Querier) => {
+      await query("SELECT pg_advisory_xact_lock($1)", [ARCHIVED_DELETION_LOCK_ID]);
       // Before anything is written, so that what it checks -- the queue among
       // it -- is still there to be seen. Under the session lock, taken here
       // first for that reason; the lock taken again below is then a no-op.

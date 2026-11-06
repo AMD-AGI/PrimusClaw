@@ -20,6 +20,8 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { randomBytes } from "node:crypto";
 import { CLAW_NOTIFICATIONS_ENABLED, NOTIFY_WEBHOOK_ALLOWED_HOSTS } from "../config.js";
+import pino from "pino";
+import { resendUnreachedSays } from "../assistant/outbound.js";
 import { getUser } from "../auth/middleware.js";
 import { encryptUserEnvValue } from "../crypto/user-env.js";
 import { db } from "../infra/db.js";
@@ -36,6 +38,25 @@ const MAX_SUBSCRIPTIONS_PER_USER = 5;
 // It is not in the default set either, so only a receiver that can draw such a request gets one.
 const EVENT_TYPES: string[] = ["run.completed", "run.failed", "approval.requested", ...ASSISTANT_EVENT_TYPES];
 const SOURCES = ["trigger", "long_run", "assistant_item"];
+const logger = pino({ name: "notification-subscriptions" });
+/** The assistant's events a say goes out as. */
+const SAY_TYPES = ["assistant.say", "work_item.needs_you"];
+
+/**
+ * A subscription that now takes the assistant's messages: what was said to its owner while nothing could carry it, about
+ * an item that still needs them, is sent to it once (`resendUnreachedSays`). Never fails the request: the subscription is
+ * saved, and the silent sweep sends the same messages on its next pass.
+ */
+async function resendAfterSubscribing(userId: string, row: Record<string, unknown>): Promise<void> {
+  const types = (row.event_types as string[] | null) ?? [];
+  if (row.enabled !== true || !types.some((t) => SAY_TYPES.includes(t))) return;
+  try {
+    await resendUnreachedSays({ userId });
+  } catch (err) {
+    logger.warn({ err, userId }, "notification.resend_unreached_failed");
+  }
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function requireRealUser(req: FastifyRequest, reply: FastifyReply): string | null {
@@ -98,6 +119,7 @@ export async function registerNotificationSubscriptionRoutes(app: FastifyInstanc
        RETURNING *`,
       [id, userId, guard.url.toString(), encryptUserEnvValue(secret), types ?? null, sources ?? null],
     )).rows[0];
+    await resendAfterSubscribing(userId, row);
     // The only time the secret leaves the server.
     return reply.status(201).send({ ok: true, data: { ...view(row), secret } });
   });
@@ -137,6 +159,7 @@ export async function registerNotificationSubscriptionRoutes(app: FastifyInstanc
       [id, userId, types ?? null, sources ?? null, body.enabled ?? null],
     )).rows[0];
     if (!row) return reply.status(404).send({ ok: false, error: "not_found" });
+    await resendAfterSubscribing(userId, row);
     return reply.send({ ok: true, data: view(row) });
   });
 

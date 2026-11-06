@@ -138,9 +138,12 @@ command.
 
 **Revocation.** A token is checked locally, so a revoked grant is honoured until its
 token expires (minutes). Set `CLAW_CONNECTOR_TOKEN_INTROSPECT=true` to also ask the
-provider, on each request, whether the token is still active (the identity client
-caches an answer for a few seconds, `IDENTITY_INTROSPECTION_CACHE_SECONDS`); a revoked
-grant is then refused at once. A provider that cannot be asked is `503`, never a yes.
+provider, on each request, whether the token is still active; a revoked grant is then
+refused within `CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS` (5 by default) on every
+replica. The identity client keeps an answer for `IDENTITY_INTROSPECTION_CACHE_SECONDS`
+(30) for every caller; a connector token is judged by none older than this. A provider
+that cannot be asked is `503`, never a yes, unless the client still holds an active
+answer for the token inside its stale window (`IDENTITY_STALE_IF_ERROR_SECONDS`).
 
 **An open command stream** is authenticated once, when it opens, so it also ends with
 its token: at the token's `exp` the server sends `event: token_expired` (no `id`) and
@@ -154,6 +157,7 @@ bounds it. A stream opened with a key or a session has no such end.
 |---|---|---|
 | `CLAW_CONNECTOR_TOKEN_AUDIENCE` | `claw-api` | The `aud` a token must name |
 | `CLAW_CONNECTOR_TOKEN_INTROSPECT` | off | Ask the provider on each request whether the token is still active |
+| `CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS` | `5` | The oldest provider answer a connector token is judged by (0: ask every time; 0..300) |
 
 The audit trail records, in `detail.credential`, how the caller was authenticated
 for the connector-side actions it keeps (`connector.registered`,
