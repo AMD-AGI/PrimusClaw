@@ -174,8 +174,15 @@ describe("development environment items and devenv_send", { skip }, () => {
     await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "run make test" });
     const again = await remoteItem(sid);
     assert.deepEqual([again.item_id, again.seq, again.board_state, again.title, again.outcome], [item.item_id, item.seq, "in_progress", "laptop claude: run make test", null]);
-    await events("alice", cid, sid, [chunk("312 passed"), end()]);
-    assert.equal((await remoteItem(sid)).summary, "312 passed");
+    // Stored without being applied (as if the item's write had failed), then the connector's retry of that same batch applies them.
+    const n = seqs.get(sid) ?? 0;
+    const batch = [chunk("312 passed"), end()].map(([type, data], i) => ({ index: i, session_id: sid, seq: n + 1 + i, type, ts: Date.now(), data }));
+    seqs.set(sid, n + 2);
+    await store.ingestEvents({ connector_id: cid, owner_user_id: "alice" }, batch as never);
+    assert.equal((await remoteItem(sid)).board_state, "in_progress");
+    const retried = await post("alice", `/v1/remote-agents/connectors/${cid}/events`, { batch_id: "retry", events: batch.map(({ index: _i, ...e }) => e) });
+    assert.equal(retried.status, 200, JSON.stringify(retried.body));
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "312 passed"]);
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_items WHERE user_id = 'alice'"))[0].n, 1, "one item per session");
 
     // Bob, without an assistant, types into his own chat: nothing of his is filed anywhere, and alice's item is untouched.
@@ -214,7 +221,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     await events("alice", cid, sid, [ask("act-1", "Run make test")]);
     item = await remoteItem(sid);
     assert.deepEqual([item.board_state, item.pending_question], ["needs_you", "等你批准：Run make test"]);
-    await events("alice", cid, sid, [["permission_resolved", { actionId: "act-1", optionId: "allow" }], chunk("All 312 tests passed, 0 failed.")]);
+    await events("alice", cid, sid, [["permission_resolved", { actionId: "act-1", optionId: "allow" }], chunk("All 312 tests passed,\n0 failed.")]);
     assert.equal((await remoteItem(sid)).board_state, "in_progress");
     await events("alice", cid, sid, [end()]);
     item = await remoteItem(sid);
@@ -222,7 +229,8 @@ describe("development environment items and devenv_send", { skip }, () => {
     const told = await says("alice");
     assert.equal(told.length, 2, JSON.stringify(told));
     assert.match(told[0].text, /^laptop 上的 claude 在等你批准：Run make test（#\d+ 跑 make test）。发 \/agent attach /);
-    assert.match(told[1].text, /^laptop 上的 claude 做完了 #\d+：跑 make test\nAll 312 tests passed, 0 failed\.$/);
+    // The summary is one line; the message keeps the answer's line breaks.
+    assert.match(told[1].text, /^laptop 上的 claude 做完了 #\d+：跑 make test\nAll 312 tests passed,\n0 failed\.$/);
     assert.ok(told.every((s: Recorded) => s.item_id === item.item_id && s.fallback));
     await events("alice", cid, sid, [end()]);
     assert.equal((await says("alice")).length, 2, "said once");
@@ -260,7 +268,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     const shown = (await w.q("SELECT payload FROM claw_notification_outbox WHERE payload ? 'confirm_write'"))[0].payload;
     assert.equal(shown.confirm_write.kind, "devenv_send");
     assert.equal(shown.confirm_write.allow_label, "发送");
-    assert.match(shown.text, /^要让 laptop 上的 claude（新会话）执行这条指令吗？\n跑 make test\n/);
+    assert.match(shown.text, /^要让 laptop 上的 claude 执行这条指令吗？\n跑 make test\n会话：新会话；目录：\/home\/u\/repo\n/);
     assert.match(await schedules.renderScheduleState("alice"), /send to "claude" on the machine "laptop": "跑 make test"/);
 
     const decided = await schedules.decideConfirmation({ userId: "alice", confirmationId: card.confirmation_id, decision: "allow", via: "button" });
@@ -280,10 +288,24 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal((await schedules.decideConfirmation({ userId: "alice", confirmationId: card2.confirmation_id, decision: "deny", via: "button" })).status, "denied");
     assert.equal((await queued(cid)).length, 2);
 
+    // The agent's own conversation on the machine, taken over: the card says so, with the folder, and pressing it does exactly that.
+    await store.recordHeartbeat(cid, "alice", { version: "0.1.3", cmdCursor: null, agents: [{ ...CLAUDE, capabilities: { ...CLAUDE.capabilities,
+      resumable: [{ ref: "c0ffee00-0000-4000-8000-0000000000aa", title: "fix the api test", cwd: "/home/u/repo/api", updated_at: Math.floor(Date.now() / 1000), state: "idle" }] } }] as never });
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [cid]);
+    const resumeTurn = await userTurn(alice, "让 laptop/claude/2 接着修", false);
+    const resumed = await tools.devenvSend(resumeTurn, { text: "接着修", target: "c0ffee00-0000-4000-8000-0000000000aa" });
+    assert.equal(resumed.done, false);
+    const resumeCard = (await w.q("SELECT payload FROM claw_notification_outbox WHERE payload ? 'confirm_write' ORDER BY id DESC LIMIT 1"))[0].payload;
+    assert.match(resumeCard.text, /会话：接管它在那台机器上已有的对话 laptop\/claude\/\d+（带着那段对话的上下文）；目录：\/home\/u\/repo\/api\n/);
+    const card3 = (await w.q("SELECT * FROM claw_assistant_confirmations WHERE user_id = 'alice' AND status = 'pending'"))[0];
+    assert.equal((await schedules.decideConfirmation({ userId: "alice", confirmationId: card3.confirmation_id, decision: "allow", via: "button" })).status, "done");
+    const takeOver = (await queued(cid)).filter((c: Recorded) => c.type === "session.new").at(-1);
+    assert.deepEqual([takeOver.payload.resume_ref, takeOver.payload.cwd], ["c0ffee00-0000-4000-8000-0000000000aa", "/home/u/repo/api"]);
+
     // A worker's report starts a turn that answers no message: not even a card.
     const report = await w.routerTurn(alice);
     await assert.rejects(tools.devenvSend(report, { text: "rm -rf build" }), (e: Recorded) => e.code === "not_from_user");
-    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations"))[0].n, 2);
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations"))[0].n, 3);
   });
 
   test("F4 only the user's own machines; two that fit is a question; an offline one says so", async () => {

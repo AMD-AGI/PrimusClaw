@@ -92,6 +92,13 @@ const tailOf = (v: string, max: number): string => {
   return chars.length > max ? `…${chars.slice(chars.length - (max - 1)).join("")}` : one;
 };
 
+/** The end of an answer as the user reads it in a message: its line breaks kept (a list, a table), other control characters dropped. */
+const tailLines = (v: string, max: number): string => {
+  const text = v.replace(/\r\n?/g, "\n").replace(/[\u0000-\u0009\u000b-\u001f\u007f]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+  const chars = Array.from(text);
+  return chars.length > max ? `…${chars.slice(chars.length - (max - 1)).join("")}` : text;
+};
+
 /** The item's title: machine, agent, and the start of what it was asked. */
 export function remoteTitle(machine: string, agent: string, asked: string, lang: RemoteLang): string {
   return clipOneLine(lang === "zh" ? `${machine} ${agent}：${asked}` : `${machine} ${agent}: ${asked}`, TITLE_MAX);
@@ -307,7 +314,8 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         if (p.open_turns > 0) continue;
         const stop = flat(e.data.stopReason, 40);
         const said = stopWords(stop, flat(e.data.error, 200), p.lang);
-        const answer = tailOf(await answerOf(q, sessionId, e.id), ANSWER_EVENT_MAX);
+        const whole = await answerOf(q, sessionId, e.id);
+        const answer = tailOf(whole, ANSWER_EVENT_MAX);
         const summary = [said, tailOf(answer, SUMMARY_MAX)].filter(Boolean).join(" ") || (p.lang === "zh" ? "已结束，没有回答文字" : "ended with no answer text");
         board = "done";
         p.waiting = [];
@@ -317,7 +325,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
           [summary, p.origin === "assistant" ? 1 : 0],
           { kind: "answer", summary: [said, answer].filter(Boolean).join(" ") || summary, result: { stop_reason: stop || null, remote_event_id: e.id } },
         );
-        tell(`end:${e.id}`, remoteNotice("done", p, item.seq, [said, tailOf(answer, NOTICE_ANSWER_MAX)].filter(Boolean).join(" ") || summary));
+        tell(`end:${e.id}`, remoteNotice("done", p, item.seq, [said, tailLines(whole, NOTICE_ANSWER_MAX)].filter(Boolean).join(" ") || summary));
       } else if (e.type === REMOTE_EVENT_SESSION_CLOSED) {
         if (board === "done") continue;
         board = "done";

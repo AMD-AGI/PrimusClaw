@@ -287,7 +287,10 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const result = await store.ingestEvents(connector as { connector_id: string; owner_user_id: string }, events, getAuthMethod(req));
     for (const sid of result.touched) waker.wake(`s:${sid}`);
     // The assistant's view of the work (`assistant/remote-items.ts`): after the events are stored, and never a reason to refuse them.
-    if (result.touched.length) await noteRemoteEvents(owner, result.touched);
+    // Every session the batch was for, not only those that gained an event: a retry of a batch whose events were stored but not
+    // applied (the item's write failed) applies them then.
+    const posted = [...new Set([...result.touched, ...Object.keys(result.acked)])];
+    if (posted.length) await noteRemoteEvents(owner, posted);
     const rejected = [...batch.value.rejected, ...result.rejected].sort((a, b) => a.index - b.index);
     return reply.send({ ok: true, data: { batch_id: batch.value.batchId, acked: result.acked, rejected } });
   });

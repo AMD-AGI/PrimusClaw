@@ -528,12 +528,22 @@ export async function executeSend(
 
 const cmdKey = (...parts: string[]): string => createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 40);
 
-/** The card's text: what would be sent, to which agent on which machine. */
-export function sendCardText(plan: Pick<SendPlan, "machine" | "agent_id" | "label" | "session_id">, text: string, ref: string, zh: boolean): string {
-  const where = plan.session_id ? (zh ? `（继续会话 ${plan.label}）` : ` (continuing ${plan.label})`) : (zh ? "（新会话）" : " (a new session)");
+/**
+ * The card's text: what would be sent, to which agent on which machine, in which session (one open through Claw it continues, the
+ * agent's own conversation on that machine it takes over with that conversation's history, or a new one) and in which folder. All of
+ * it is what pressing the card does (`sendConfirmed` sends the plan the card was made from), so nothing about it is a surprise.
+ */
+export function sendCardText(
+  plan: Pick<SendPlan, "machine" | "agent_id" | "label" | "session_id" | "resume_ref" | "cwd">, text: string, ref: string, zh: boolean,
+): string {
+  const where = plan.session_id
+    ? (zh ? `继续会话 ${plan.label}` : `continuing the session ${plan.label}`)
+    : plan.resume_ref
+      ? (zh ? `接管它在那台机器上已有的对话 ${plan.label}（带着那段对话的上下文）` : `taking over its own conversation ${plan.label} on that machine (with that conversation's history)`)
+      : (zh ? "新会话" : "a new session");
   return zh
-    ? `要让 ${plan.machine} 上的 ${plan.agent_id}${where}执行这条指令吗？\n${text}\n点下面的「发送」确认，或回复 批准 #${ref}。`
-    : `Send this to ${plan.agent_id} on ${plan.machine}${where}?\n${text}\nPress "Send" below to confirm, or reply approve #${ref}.`;
+    ? `要让 ${plan.machine} 上的 ${plan.agent_id} 执行这条指令吗？\n${text}\n会话：${where}；目录：${plan.cwd}\n点下面的「发送」确认，或回复 批准 #${ref}。`
+    : `Send this to ${plan.agent_id} on ${plan.machine}?\n${text}\nSession: ${where}; folder: ${plan.cwd}\nPress "Send" below to confirm, or reply approve #${ref}.`;
 }
 
 /**
