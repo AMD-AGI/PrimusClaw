@@ -71,15 +71,22 @@ CLAW_CONNECTOR_KEY='replace-with-your-claw-api-key' claw-connector login --serve
 
 The key is stored as it is in `credentials.json` (mode 0600) and is for trying things out; the device sign-in is the normal way.
 
-**4. Run**
+**4. Keep it running**
 
 ```sh
-claw-connector run
+claw-connector service install
+claw-connector service status
 ```
 
-It prints `connecting claude to https://claw.example.com/claw-api as "<machine name>"` and stays in the foreground: keep it in a
-terminal tab, `tmux` or `screen`. Ctrl-C stops it and every agent it started. From another terminal, `claw-connector status` shows
-whether it is running and signed in.
+This starts the connector now and keeps it up: at login and after a reboot, and again 5 seconds after it dies for any reason, except
+one that only you can fix (the connector was revoked, or Claw refused the sign-in), which leaves it stopped until you run `login` again.
+It uses `systemd --user` on Linux and launchd on macOS. On Linux, run `loginctl enable-linger $USER` once (`service install` says so
+when it is needed) so it also runs while you are logged out. In a container without systemd, `service install` starts a small
+supervisor and writes `keepalive.sh`; have the container's startup command and a 5-minute cron job run that script (it does nothing
+when the supervisor is up) so a restarted container comes back by itself. See [Keeping it running](#keeping-it-running).
+
+To try it in the foreground instead, `claw-connector run` prints `connecting claude to https://claw.example.com/claw-api as
+"<machine name>"` and stays up until Ctrl-C, which stops it and every agent it started.
 
 **5. See it in Clawy**
 
@@ -324,8 +331,9 @@ session stops the agent process; it never deletes the conversation.
 | `init [--approval ask\|never \| AGENT=ask\|never] [--no-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). Also installs the Claude Code session hooks (`--no-hooks` skips that). |
 | `hooks install\|uninstall\|status` | The `SessionStart`/`SessionEnd` hooks alone; `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
-| `run` | Connect and serve. Exit code 3 means the connector was revoked. |
-| `status [--json]` | Running or not, paused, signed in, agents, adapter processes, and a `warning:` line for each agent whose sessions will be refused because Claude's own settings default to `bypassPermissions` (see [Running without per-step approval](#running-without-per-step-approval)). |
+| `run [--supervised]` | Connect and serve. Exit code 78 means starting it again will not help: the connector was revoked, Claw or the identity service refused the sign-in (at start, or for two minutes in a row while running), or there is no usable `agents.toml` or sign-in; the reason is kept in `needs-login.json`, and until `login` removes it `run` exits 78 at once without contacting Claw. `--supervised` marks a run the service started. Any other non-zero exit is worth a restart. A unit written by hand for 0.1.2 and older (`RestartPreventExitStatus=3`): replace it with `claw-connector service install`, which writes the same file. |
+| `service install\|uninstall\|status [--supervisor systemd\|launchd\|script] [--env NAME ...]` | Keep `run` up (see [Keeping it running](#keeping-it-running)). `install` stops a `run` started by hand so the service takes over; `status` also lists the last five disconnects and why. |
+| `status [--json]` | Running or not, paused, signed in, agents, adapter processes, the last disconnect and its reason (`last down:`), a `problem:` line when a new sign-in is needed, and a `warning:` line for each agent whose sessions will be refused because Claude's own settings default to `bypassPermissions` (see [Running without per-step approval](#running-without-per-step-approval)). |
 | `pause` / `resume` | Stop every agent within a second and stay offline, or undo that. |
 | `stop` | Stop the running connector and every agent it started. |
 | `logout` | Stop, ask the identity service to revoke the sign-in, delete it from this machine. The stored connector id stays, so the next sign-in reuses the same connector. |
@@ -342,7 +350,33 @@ the connector sees it within a heartbeat, stops every agent and exits without re
 refused). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME/claw-connector/`): `connector.json` (the connector's identity and the
 commands handled), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
 decisions, every command received, every permission request and answer, every automatic approval, mode changes),
-`logs/`, `children.json`, `connector.pid`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
+`logs/`, `children.json`, `connector.pid`, `disconnects.jsonl`, `needs-login.json` (only after a run that needs a new sign-in), and with
+the script supervisor `supervisor.pid`, `keepalive.sh` and `run.log`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
+
+## Keeping it running
+
+`service install` picks the supervisor (override with `--supervisor`):
+
+- **systemd** (Linux, when systemd is the machine's init): `~/.config/systemd/user/claw-connector.service` with `Restart=on-failure`,
+  `RestartSec=5`, `RestartPreventExitStatus=78` and no start limit. Logs: `journalctl --user -u claw-connector`.
+- **launchd** (macOS): `~/Library/LaunchAgents/com.primusclaw.connector.plist` with `KeepAlive` on any unclean exit. launchd cannot
+  exempt one exit code, so after a 78 it starts the connector once more, which sees `needs-login.json` and exits 0 for good.
+  Log: `run.log` in the state directory.
+- **script** (a container without systemd; an `systemctl` that answers "Running in chroot" counts as none): `claw-connector supervise`
+  runs in the background and restarts the connector 5 seconds after it dies; `keepalive.sh` in the state directory starts that
+  supervisor unless it is alive (recorded pid and start time) or a sign-in is needed. Nothing restarts the supervisor after the container
+  restarts, so call `keepalive.sh` from the container's startup command and from a 5-minute cron job. Log: `run.log`.
+
+The unit carries `PATH` (so the agents are found), `CLAW_CONNECTOR_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`, the CA and proxy variables and `LANG` from the shell that ran `install`; `--env NAME` adds another, except a name that looks
+like a credential (`KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`), which is never written into a unit. Run `install` again after
+changing any of them, or after moving Node. With a service installed, `claw-connector stop` stops the connector until the next login,
+boot or keep-alive check; to stay offline use `pause`, or `service uninstall`.
+
+**Why it went down.** Every disconnect is appended to `disconnects.jsonl` in the state directory: `server_closed` (a Claw release or
+restart, `superseded` by another run, `token_expired`; reconnected at once), `stream_lost` (the network, with the error), `stopped`,
+`revoked`, `auth_failed`, `failed`, and `process_died` (the previous run never shut down: killed, crashed or the machine restarted;
+dated by its last heartbeat). `status` shows the latest, `service status` the last five.
 
 ## Restarts and crashes
 

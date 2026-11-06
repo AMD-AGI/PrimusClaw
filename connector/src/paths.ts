@@ -34,3 +34,8 @@ export const pauseFile = (d: Dirs) => path.join(d.state, "paused");
 export const auditFile = (d: Dirs) => path.join(d.state, "audit.jsonl");
 export const outboxDir = (d: Dirs) => path.join(d.state, "outbox");
 export const logDir = (d: Dirs) => path.join(d.state, "logs");
+export const disconnectsFile = (d: Dirs) => path.join(d.state, "disconnects.jsonl");
+export const needsLoginFile = (d: Dirs) => path.join(d.state, "needs-login.json");
+export const supervisorPidFile = (d: Dirs) => path.join(d.state, "supervisor.pid");
+export const runLogFile = (d: Dirs) => path.join(d.state, "run.log");
+export const keepaliveFile = (d: Dirs) => path.join(d.state, "keepalive.sh");
