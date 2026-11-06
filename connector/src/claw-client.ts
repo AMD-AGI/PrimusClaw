@@ -101,6 +101,18 @@ export class ClawClient {
   }
 
   /**
+   * Revoke connector `cid` at Claw, for `logout`: Claw sends it nothing more and closes its sessions. A key is a user's
+   * credential and uses the user-side DELETE; a device sign-in's access token is refused there, and uses the
+   * connector-side route made for this. Throws {@link HttpError} 404 `not_found` when Claw has no live row by that id
+   * for this sign-in (already revoked, or another account's).
+   */
+  async revoke(cid: string, kind: "key" | "device"): Promise<void> {
+    const id = encodeURIComponent(cid);
+    if (kind === "key") await this.json("DELETE", `/v1/remote-agents/connectors/${id}`);
+    else await this.json("POST", `/v1/remote-agents/connectors/${id}/revoke`);
+  }
+
+  /**
    * Hold the command stream. Yields every frame (a `ping` too, since it is
    * proof of life). Ends normally when the server closes it; throws
    * {@link TransportError} when the network fails or nothing arrives for

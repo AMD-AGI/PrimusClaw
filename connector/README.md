@@ -94,7 +94,8 @@ In Clawy (or any chat client built on Claw), send `/agents`. The agents of this 
 A session started there runs on this machine, inside one of your `roots`, and each permission request comes back as a card in the chat.
 
 To disconnect: `claw-connector pause` (stay offline until `resume`), `claw-connector stop`, or `claw-connector logout` (also
-asks the identity service to revoke the device sign-in; a saved key is deleted from this machine, not revoked at Claw).
+revokes this machine's connector at Claw, so it can be sent nothing more, and asks the identity service to revoke the device
+sign-in; a saved key is deleted from this machine, not revoked at Claw).
 
 ## agents.toml
 
@@ -336,7 +337,7 @@ session stops the agent process; it never deletes the conversation.
 | `status [--json]` | Running or not, paused, signed in, agents, adapter processes, the last disconnect and its reason (`last down:`), a `problem:` line when a new sign-in is needed, and a `warning:` line for each agent whose sessions will be refused because Claude's own settings default to `bypassPermissions` (see [Running without per-step approval](#running-without-per-step-approval)). |
 | `pause` / `resume` | Stop every agent within a second and stay offline, or undo that. |
 | `stop` | Stop the running connector and every agent it started. |
-| `logout` | Stop, ask the identity service to revoke the sign-in, delete it from this machine. The stored connector id stays, so the next sign-in reuses the same connector. |
+| `logout` | Stop, revoke this machine's connector at Claw (with a key, `DELETE /v1/remote-agents/connectors/:cid`; with a device sign-in, the connector-side `POST .../connectors/:cid/revoke`), ask the identity service to revoke the sign-in, and delete it from this machine. The next sign-in registers a new connector. When Claw cannot be reached or refuses (a Claw from before the connector-side route refuses a device sign-in), the sign-in is still deleted, but `logout` says the connector was not revoked, prints the `curl` that revokes it with a Claw API key of yours, keeps its id (so a later sign-in reuses it), and exits 1. |
 
 **Kill switch.** Every adapter is started in its own process group and recorded (pid and start time) in
 `children.json`. `stop`, `pause`, a revocation and Ctrl-C signal exactly those groups: a process that is not recorded, or

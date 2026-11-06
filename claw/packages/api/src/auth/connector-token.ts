@@ -11,7 +11,7 @@
  * purpose. It is verified here with the shared identity client; nothing in this
  * file reads a signature or a key.
  *
- *   - It authenticates on the four connector-side routes and nowhere else. On
+ *   - It authenticates on the five connector-side routes and nowhere else. On
  *     any other route this path does not run, the bearer value is not an `ak-`
  *     key, and the request is refused like any request with no credential.
  *   - The caller is the token's `sub`. Its roles are `default`: whatever

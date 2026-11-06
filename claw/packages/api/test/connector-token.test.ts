@@ -180,6 +180,23 @@ describe("connector access tokens", { skip }, () => {
       assert.equal((await stream.nextEvent("ready")).json().connector_id, cid);
     });
 
+    test("revokes its own connector when it signs out: the row is revoked for good and no longer reachable, and the owner sees it gone", async () => {
+      const token = mint({ sub: "u1" });
+      const cid = await register(token);
+      const t = asToken(token);
+      assert.deepEqual([(await t.post(`/v1/remote-agents/connectors/${cid}/revoke`)).status], [200]);
+      const row = (await q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [cid])).rows[0];
+      assert.notEqual(row.revoked_at, null);
+      const hb = await t.post(`/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [AGENT] });
+      assert.deepEqual([hb.status, hb.body.error], [401, "revoked"]);
+      assert.deepEqual((await asKey("u1").get("/v1/remote-agents/connectors")).body.data, []);
+      // Once revoked there is nothing left to revoke, as with the user-side DELETE.
+      const again = await t.post(`/v1/remote-agents/connectors/${cid}/revoke`);
+      assert.deepEqual([again.status, again.body.error], [404, "not_found"]);
+      const audit = (await q("SELECT action FROM claw_remote_audit WHERE connector_id = $1 AND action = 'connector.revoked'", [cid])).rows;
+      assert.equal(audit.length, 1);
+    });
+
     test("either signature algorithm the provider uses verifies", async () => {
       for (const k of [es, rs]) {
         const r = await asToken(mint({}, { key: k })).post("/v1/remote-agents/connectors", { name: `via-${k.alg}` });
@@ -354,12 +371,15 @@ describe("connector access tokens", { skip }, () => {
         await intruder.post(`/v1/remote-agents/connectors/${id}/heartbeat`, { agents: [AGENT] }),
         await intruder.post(`/v1/remote-agents/connectors/${id}/events`, { batch_id: "b", events: [] }),
         await intruder.get(`/v1/remote-agents/connectors/${id}/commands`),
+        await intruder.post(`/v1/remote-agents/connectors/${id}/revoke`),
       ].map((r) => [r.status, r.body]);
       assert.deepEqual(await probe(cid), await probe(NO_CONNECTOR));
       assert.equal((await probe(cid))[0]![0], 404);
+      assert.equal((await probe(cid))[3]![0], 404);
       // Nothing was changed on the owner's side.
-      const row = (await q("SELECT heartbeat_at FROM claw_remote_connectors WHERE connector_id = $1", [cid])).rows[0];
+      const row = (await q("SELECT heartbeat_at, revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [cid])).rows[0];
       assert.equal(row.heartbeat_at, null);
+      assert.equal(row.revoked_at, null);
     });
   });
 
