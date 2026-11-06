@@ -23,7 +23,7 @@
 import pino from "pino";
 import { db } from "../infra/db.js";
 import { detectLanguage } from "./language.js";
-import { SAY_TEXT_MAX, recordAssistantSay, recordSystemNotice, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
+import { SAY_TEXT_MAX, publishSayEvent, recordAssistantSay, recordSystemNotice, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
 import { internalTextIn, userWordsOf } from "./internal-text.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 import { releaseHeldSays } from "./say-hold.js";
@@ -173,7 +173,12 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
   // What the turn said while it might still hand a review over (`say-hold.ts`) goes out now: it ended. (A handoff dropped it already.)
   const held = new Set([end.messageId, ...runs.map((r) => r.message_id)].filter((m): m is string => !!m));
   let released = 0;
-  for (const messageId of held) released += await releaseHeldSays((t, p) => db.query(t, p), messageId);
+  for (const messageId of held) {
+    for (const say of await releaseHeldSays((t, p) => db.query(t, p), messageId)) {
+      released += 1;
+      await publishSayEvent(end.sessionId, say.sayId, say.payload, deps, messageId);   // the web client's copy, held with it
+    }
+  }
   if (released) {
     logger.info({ sessionId: end.sessionId, released }, "assistant.held_says_released");
     await (deps.kick ?? kickDelivery)().catch((err) => logger.warn({ err }, "assistant.held_says_kick_failed"));

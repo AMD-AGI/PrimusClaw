@@ -191,35 +191,43 @@ async function store(q: Querier, m: ToStore): Promise<Stored | null> {
 const announcedHere = new Set<string>();
 const ANNOUNCED_HERE_MAX = 1_000;
 
-/** After the commit: the web client's copy of the message, and the delivery that cannot wait for the poll. */
-async function announce(stored: Stored, deps: SayDeps, turnMessageId?: string): Promise<void> {
+/**
+ * After the commit: the web client's copy of the message, and the delivery that cannot wait for the poll. A say whose deliveries are
+ * held (`say-hold.ts`) is not shown to the web client either until they are released (`publishSayEvent` then), and never if the turn
+ * hands a review over: the session must not show a message the channel never gets.
+ */
+async function announce(stored: Stored, deps: SayDeps, turnMessageId?: string, held = false): Promise<void> {
   announcedHere.add(stored.sayId);
   if (announcedHere.size > ANNOUNCED_HERE_MAX) announcedHere.delete(announcedHere.values().next().value as string);
-  if (stored.sessionId) {
-    const { payload } = stored;
-    try {
-      await (deps.publishSessionEvent ?? publishEvent)(stored.sessionId, {
-        type: "AssistantSay",
-        session_id: stored.sessionId,
-        say_id: stored.sayId,
-        ...(turnMessageId ? { turn_message_id: turnMessageId } : {}),
-        text: payload.text,
-        ...(payload.item ? { item: payload.item } : {}),
-        ...(payload.type === "assistant.say" && payload.sources ? { sources: payload.sources } : {}),
-        // What the message puts to the person to press, as a channel gets it: a web client, and an evaluation reading the session,
-        // must see the card the channel draws, not only its words.
-        ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
-        ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
-        fallback: payload.type === "work_item.needs_you",
-        ts: Date.parse(payload.occurred_at),
-      });
-    } catch (err) {
-      // The message is stored and queued; a web client that missed the live event reads it later.
-      logger.error({ err, sayId: stored.sayId }, "assistant.say_event_publish_failed");
-    }
-  }
+  if (stored.sessionId && !(held && stored.subscribers > 0)) await publishSayEvent(stored.sessionId, stored.sayId, stored.payload, deps, turnMessageId);
   // Not awaited: the caller is a model's tool call, and a slow receiver is not its wait.
   if (stored.subscribers > 0) void (deps.kick ?? kickDelivery)().catch((err) => logger.error({ err }, "assistant.say_kick_failed"));
+}
+
+/** The session's `AssistantSay` event for a stored message (`announce`; a held say's when it is released, `router-turn-end.ts`). */
+export async function publishSayEvent(
+  sessionId: string, sayId: string, payload: AssistantSayPayload | WorkItemNeedsYouPayload, deps: SayDeps, turnMessageId?: string,
+): Promise<void> {
+  try {
+    await (deps.publishSessionEvent ?? publishEvent)(sessionId, {
+      type: "AssistantSay",
+      session_id: sessionId,
+      say_id: sayId,
+      ...(turnMessageId ? { turn_message_id: turnMessageId } : {}),
+      text: payload.text,
+      ...(payload.item ? { item: payload.item } : {}),
+      ...(payload.type === "assistant.say" && payload.sources ? { sources: payload.sources } : {}),
+      // What the message puts to the person to press, as a channel gets it: a web client, and an evaluation reading the session,
+      // must see the card the channel draws, not only its words.
+      ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
+      ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
+      fallback: payload.type === "work_item.needs_you",
+      ts: Date.parse(payload.occurred_at),
+    });
+  } catch (err) {
+    // The message is stored and queued; a web client that missed the live event reads it later.
+    logger.error({ err, sayId }, "assistant.say_event_publish_failed");
+  }
 }
 
 async function loadItem(q: Querier, itemId: string, userId?: string): Promise<ItemRow | null> {
@@ -486,13 +494,13 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
         type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item, sources: input.sources,
         ...(input.holdForTurn ? { hold: { status: heldStatus(input.holdForTurn), seconds: HOLD_SECONDS } } : {}),
       });
-    }, (late) => announce(late, deps, input.turnMessageId));
+    }, (late) => announce(late, deps, input.turnMessageId, !!input.holdForTurn));
   } catch (err) {
     if (err instanceof SayCapped) throw await refusedByCap(input, text, err, deps);
     throw err;
   }
   if (!stored) throw new Error("a fresh say id was already stored");
-  await announce(stored, deps, input.turnMessageId);
+  await announce(stored, deps, input.turnMessageId, !!input.holdForTurn);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
 }
 

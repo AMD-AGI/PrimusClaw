@@ -1282,6 +1282,8 @@ describe("assistant review tools", { skip }, () => {
       assert.equal(before.length, 1);
       assert.equal(before[0].held, true, "not due while the turn may still hand a review over");
       assert.equal(before[0].last_status, `held_for_turn:${turn.mid}`);
+      const shown = (text: string) => w.events.filter((e) => e.type === "AssistantSay" && e.text === text).length;
+      assert.equal(shown("已交给 Wei, Lei 了。"), 0, "nor shown to the session (the web client) while held");
       const out = await rt.reviewStart(turn, {
         prs: ["AMD-AGI/PrimusClaw#307", "AMD-AGI/PrimusClaw#309", "AMD-AGI/Primus-SaFE#840"], merge: true, reviewer: "u-weilei",
       }) as Recorded;
@@ -1300,6 +1302,7 @@ describe("assistant review tools", { skip }, () => {
       assert.deepEqual(await says(), ["已交给 Wei, Lei 了。"]);
       const after = await deliveries("已交给 Wei, Lei 了。");
       assert.ok(after[0].dropped_at && !after[0].delivered_at, "the handoff dropped the say held before it: the chat's answer is the one message");
+      assert.equal(shown("已交给 Wei, Lei 了。"), 0, "and the session never shows it");
       // What was streamed of each refused say is taken back on the turn's stream (2026-11-06 15:11Z: "已把 Primus" stayed as a message),
       // and so is the turn's say text from the handoff on; the say that went through takes nothing back.
       assert.deepEqual(handoffVoids, [[alice.routerSid, turn.mid, "handed_off"]]);
@@ -1341,6 +1344,7 @@ describe("assistant review tools", { skip }, () => {
       const asked = await userTurn(alice, "Wei, Lei 在吗", { context: ctx });
       await w.mod.tools.say(asked, { text: "他今天在。" }, w.sayDeps);
       assert.equal((await deliveries("他今天在。"))[0].held, true);
+      assert.equal(shown("他今天在。"), 0);
       await w.closeRun(asked.task_id);
       const kicksBefore = w.kicks();
       assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, runIds: [asked.task_id], messageId: asked.mid }, w.sayDeps), "skipped");
@@ -1349,6 +1353,9 @@ describe("assistant review tools", { skip }, () => {
       assert.equal(released.last_status, null);
       assert.ok(!released.dropped_at);
       assert.ok(w.kicks() > kicksBefore, "and delivery is kicked");
+      const releasedEvent = w.events.filter((e) => e.type === "AssistantSay" && e.text === "他今天在。");
+      assert.equal(releasedEvent.length, 1, "the session shows it once, when it is released");
+      assert.equal(releasedEvent[0].turn_message_id, asked.mid);
     } finally {
       rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
         calls.start.push({ user, method, request });

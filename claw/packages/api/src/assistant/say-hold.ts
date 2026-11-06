@@ -14,6 +14,7 @@
  */
 import type { Querier } from "../infra/db.js";
 import type { TurnMessage } from "./inbound.js";
+import type { AssistantSayPayload } from "../notifications/assistant-events.js";
 
 export const HOLD_SECONDS = 120;
 
@@ -37,14 +38,20 @@ export async function dropHeldSays(q: Querier, messageId: string): Promise<numbe
   return r.rowCount ?? 0;
 }
 
-/** The turn ended without handing a review over: its held says are due now. The number of deliveries released. */
-export async function releaseHeldSays(q: Querier, messageId: string): Promise<number> {
+/**
+ * The turn ended without handing a review over: its held says are due now. Returns each released say once (its id and what its
+ * deliveries carry), for its session event, which was held with it (`outbound.ts`, `announce`).
+ */
+export async function releaseHeldSays(q: Querier, messageId: string): Promise<Array<{ sayId: string; payload: AssistantSayPayload }>> {
   const r = await q(
     `UPDATE claw_notification_outbox SET next_attempt_at = NOW(), last_status = NULL
-      WHERE last_status = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
+      WHERE last_status = $1 AND delivered_at IS NULL AND dropped_at IS NULL
+      RETURNING event_id, payload`,
     [heldStatus(messageId)],
   );
-  return r.rowCount ?? 0;
+  const says = new Map<string, AssistantSayPayload>();
+  for (const row of r.rows as Array<{ event_id: string; payload: AssistantSayPayload }>) says.set(row.event_id, row.payload);
+  return [...says].map(([sayId, payload]) => ({ sayId, payload }));
 }
 
 /**
