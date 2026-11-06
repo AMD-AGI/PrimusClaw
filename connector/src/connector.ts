@@ -444,7 +444,8 @@ export class Connector {
       this.d.audit.record("command_dropped", { reason: "malformed_frame", id: f.id });
       return;
     }
-    const cmd = data as Command;
+    // The command's `cmd_seq` (the frame's id) goes with it: a prompt's turn_end names it, and a number is never masked as a credential.
+    const cmd = { ...data, cmd_seq: seq } as Command;
     if (this.ledger.seen(seq, cmd.cmd_id)) return; // delivered again after a reconnect; already done
     this.ledger.begin(seq, cmd.cmd_id);
     // Not awaited: the stream must keep being read while a slow command (starting an adapter) runs.

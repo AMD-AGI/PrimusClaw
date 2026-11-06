@@ -13,6 +13,11 @@
  *  - the events its connector posts (`noteRemoteEvents`): a permission request puts the item in front of the user, its answer takes it
  *    back, a turn's end closes it with the end of the agent's answer as its summary, a closed session closes it.
  *
+ * Which prompt a turn's end ends: a connector that names it (`turn_end.cmd_seq`, and `command_rejected.cmd_seq` for a prompt it
+ * dropped unrun) is followed by name (`open_cmd_seqs`). The command's `cmd_seq`, not its `cmd_id`: an id is text a client may choose
+ * (an `Idempotency-Key`), which a credential scrub on the way may mask, and a number never is. One that does not name it (an older
+ * connector) is counted (`open_turns`, with the cancels pending), as it always was.
+ *
  * Who is told: an instruction the assistant sent (`origin: "assistant"`) is the user's errand, and its end, or a permission it waits
  * on, is said to them once (`recordSystemNotice`, keyed by the event). One the user typed into an attached chat is not: they are
  * watching it, and their chat showed it. Either way the item is on the list the router reads every turn.
@@ -50,6 +55,8 @@ const MOVING = [
  * which ends it, so its refusal is not counted twice.
  */
 const PROMPT_REFUSED_UNQUEUED = new Set(["too_many_queued_prompts", "session_closed"]);
+/** A queued prompt a cancel dropped unrun: refused by name by a connector that names its prompts, never by one that does not. */
+const PROMPT_DROPPED_BY_CANCEL = "cancelled";
 
 /** How much of an instruction an item keeps (its title is shorter), and of an answer its summary and its event. */
 const ASKED_MAX = 120;
@@ -83,6 +90,12 @@ export interface RemoteParams {
   lang: RemoteLang;
   /** Instructions sent and not yet ended: the item closes when the last one ends. */
   open_turns: number;
+  /**
+   * The `cmd_seq` of those instructions, while every one of them is known (from the item's first prompt, or from it reopening): a
+   * turn's end that names its prompt ends that one only. Null once a turn's end or a refusal came that named none (an older
+   * connector), and absent on items from before it was kept: the item is then counted (`open_turns`) until it next reopens.
+   */
+  open_cmd_seqs?: number[] | null;
   /** Permission requests asked and not yet answered. */
   waiting: string[];
   /** The newest session event this item has applied (`claw_remote_events.id`). */
@@ -101,10 +114,23 @@ export interface PendingCancel {
   before: number;
   /** Prompts sent after it (and before the next cancel): they run once it is done. */
   n: number;
+  /**
+   * The `cmd_seq` of the prompts open when it was sent (the item's `open_cmd_seqs` then): its end ends every one of them still open,
+   * named or not. A prompt whose turn's end never comes (the connector restarted mid-turn: the prompt is not delivered again and the
+   * session's queue starts empty) is then ended by the next stop, whose cancel finds nothing running and names no prompt. Absent on
+   * a cancel noted before it was kept: what it had open is then every prompt open but the last ones sent after it (`n`, its own and
+   * those of the cancels after it), which are the newest the item has.
+   */
+  seqs?: number[];
 }
 
 const pendingCancels = (p: Partial<RemoteParams> | null | undefined): PendingCancel[] =>
-  Array.isArray(p?.cancels) ? p!.cancels!.map((c) => ({ after: Number(c.after) || 0, before: Number(c.before) || 0, n: Number(c.n) || 0 })) : [];
+  Array.isArray(p?.cancels)
+    ? p!.cancels!.map((c) => ({
+      after: Number(c.after) || 0, before: Number(c.before) || 0, n: Number(c.n) || 0,
+      ...(Array.isArray(c.seqs) ? { seqs: c.seqs.filter((x) => Number.isSafeInteger(x)) } : {}),
+    }))
+    : [];
 
 export const langOf = (text: string): RemoteLang => (/\p{Script=Han}/u.test(text) ? "zh" : "en");
 
@@ -140,6 +166,8 @@ export interface NotePrompt {
   origin: RemoteOrigin;
   /** The language the user asked in; the instruction's own when not given. */
   lang?: RemoteLang;
+  /** The prompt's command number (`claw_remote_commands.cmd_seq`), which a connector names in that prompt's `turn_end`. */
+  cmdSeq: number;
   /**
    * The session's newest event before the prompt was queued (`remoteEventMark`): what the session posts after it is this prompt's,
    * even when it reached Claw before this note did (the connector may run a short turn, or refuse the prompt, that fast). Not
@@ -175,16 +203,19 @@ export async function noteRemoteCancel(owner: string, sessionId: string, mark: n
     )).rows[0] as { item_id: string; params: RemoteParams } | undefined;
     if (!item) return;
     const cancels = pendingCancels(item.params);
-    // Its end already posted (with no cancel before it still pending): it ended what was open then, and nothing is pending.
+    const openSeqs = Array.isArray(item.params?.open_cmd_seqs) ? item.params.open_cmd_seqs : null;
+    // Its end already posted (with no cancel before it still pending): it ended what was open then, and nothing is pending. Followed
+    // by name, only once that end was applied: one posted and not yet applied is this cancel's, and ends what was open before it.
     if (!cancels.length && (await q(
-      `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND id > $2 AND type = 'turn_end' AND data->>'stopReason' = 'cancelled' LIMIT 1`,
-      [sessionId, mark],
+      `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND id > $2 AND type = 'turn_end' AND data->>'stopReason' = 'cancelled'
+          AND ($3::bigint IS NULL OR id <= $3::bigint) LIMIT 1`,
+      [sessionId, mark, openSeqs ? Number(item.params?.last_event_id) || 0 : null],
     )).rows[0]) return;
     // What may be running when it reaches the agent: with an earlier cancel pending, one of the prompts sent after that one; else
     // one of those open now. At most one runs; queued ones are dropped with no end of theirs.
     const last = cancels.at(-1);
     const before = Math.min(1, last ? last.n : Math.max(0, Number(item.params?.open_turns) || 0));
-    cancels.push({ after: mark, before, n: 0 });
+    cancels.push({ after: mark, before, n: 0, seqs: openSeqs ? [...openSeqs] : [] });
     await q("UPDATE claw_work_items SET params = params || $2::jsonb, updated_at = NOW() WHERE item_id = $1",
       [item.item_id, JSON.stringify({ cancels })]);
   });
@@ -232,7 +263,7 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
     if (!open) {
       const params: RemoteParams = {
         connector_id: p.connectorId, session_id: p.sessionId, agent_id: p.agentId, machine, asked, origin: p.origin, lang,
-        open_turns: 1, waiting: [], last_event_id: last,
+        open_turns: 1, open_cmd_seqs: [p.cmdSeq], waiting: [], last_event_id: last,
       };
       const seq = Number((await q(
         "SELECT COALESCE(MAX(seq), 0)::int + 1 AS next FROM claw_work_items WHERE user_id = $1", [p.owner],
@@ -269,8 +300,11 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
     }
     // A prompt sent while a cancel is pending runs after it.
     if (cancels.length) cancels[cancels.length - 1].n += 1;
+    // Its number joins those open, while all of them are known; an item that ended starts over from this one.
+    const openSeqs = open.board_state === "done" ? [p.cmdSeq]
+      : Array.isArray(open.params?.open_cmd_seqs) ? [...open.params.open_cmd_seqs, p.cmdSeq] : null;
     const patch = {
-      asked, origin: p.origin, lang, open_turns: turns, cancels,
+      asked, origin: p.origin, lang, open_turns: turns, cancels, open_cmd_seqs: openSeqs,
       ...(open.board_state === "done" ? { waiting: [], closed_event_id: 0, last_event_id: from } : {}),
     };
     await q(
@@ -397,8 +431,73 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         [item.item_id, ev.kind, ev.summary, ev.question ?? null, ev.result === undefined ? null : JSON.stringify(ev.result)],
       );
     };
+    // The item ends with this turn's end: answered, with the end of the agent's answer.
+    const closeAnswered = async (e: MovingEvent) => {
+      const stop = flat(e.data.stopReason, 40);
+      const said = stopWords(stop, flat(e.data.error, 200), p.lang);
+      const whole = await answerOf(q, sessionId, e.id);
+      const answer = tailOf(whole, ANSWER_EVENT_MAX);
+      const summary = [said, tailOf(answer, SUMMARY_MAX)].filter(Boolean).join(" ") || (p.lang === "zh" ? "已结束，没有回答文字" : "ended with no answer text");
+      await write(
+        `board_state = 'done', outcome = 'answered', last_report_kind = 'answer', summary = $2, pending_question = NULL,
+         closed_at = NOW(), attention_seq = attention_seq + $3::int`,
+        [summary, p.origin === "assistant" ? 1 : 0],
+        { kind: "answer", summary: [said, answer].filter(Boolean).join(" ") || summary, result: { stop_reason: stop || null, remote_event_id: e.id } },
+      );
+      tell(`end:${e.id}`, remoteNotice("done", p, item.seq, [said, tailLines(whole, NOTICE_ANSWER_MAX)].filter(Boolean).join(" ") || summary));
+    };
+    // The item ends with the refusal of the last prompt open, which never ran.
+    const closeRefused = async (e: MovingEvent, reason: string) => {
+      const summary = p.lang === "zh" ? `指令被拒绝：${reason}` : `the instruction was refused: ${reason}`;
+      await write(
+        `board_state = 'done', outcome = 'dropped', last_report_kind = 'dropped', summary = $2, pending_question = NULL,
+         closed_at = NOW(), attention_seq = attention_seq + $3::int`,
+        [summary, p.origin === "assistant" ? 1 : 0], { kind: "dropped", summary },
+      );
+      tell(`refused:${e.id}`, remoteNotice("refused", p, item.seq, reason));
+    };
     for (const e of events) {
       p.last_event_id = e.id;
+      // A connector that names the prompt a turn's end ends (`cmd_seq`, null for a cancel that found nothing running) is followed by
+      // name, while the item knows every prompt open by its number. A turn's end, or a refusal of a prompt that never runs, that names
+      // none (an older connector) makes the item count them instead, as it did before names were kept.
+      const seq = Number.isSafeInteger(e.data.cmd_seq) ? Number(e.data.cmd_seq) : null;
+      const reason = e.type === REMOTE_EVENT_COMMAND_REJECTED && e.data.type === "prompt" ? flat(e.data.reason, 80) : "";
+      // A refusal ends its prompt only when the prompt never runs; one refused as its turn starts ends with that turn's end.
+      const refusedUnrun = PROMPT_REFUSED_UNQUEUED.has(reason) || reason === PROMPT_DROPPED_BY_CANCEL;
+      const named = (e.type === REMOTE_EVENT_TURN_END && Object.hasOwn(e.data, "cmd_seq")) || (refusedUnrun && seq !== null);
+      if ((e.type === REMOTE_EVENT_TURN_END || refusedUnrun) && !named) p.open_cmd_seqs = null;
+      if (Array.isArray(p.open_cmd_seqs) && named) {
+        if (board === "done") continue;
+        const ended = new Set<number>(seq !== null ? [seq] : []);
+        // The end a cancel brings (`cancelled`, after the oldest cancel pending was sent): nothing sent before that cancel is left to
+        // run, so every prompt open when it was sent ends with it, whether it names the turn it cancelled or none (it found nothing
+        // running: a prompt whose turn's end never came, lost when the connector restarted mid-turn, ends here). A cancel pending
+        // that does not have the cancelled prompt open was sent before that prompt and its end is not coming any more (the turn it
+        // was sent for finished on its own as it was on its way): it is passed over, and what it had open the later one has too.
+        const pending = pendingCancels(p);
+        if (e.type === REMOTE_EVENT_TURN_END && flat(e.data.stopReason, 40) === "cancelled" && pending.length && e.id > pending[0].after) {
+          if (seq !== null) while (pending.length && pending[0].seqs && !pending[0].seqs.includes(seq)) pending.shift();
+          const sentAfter = pending.reduce((sum, c) => sum + c.n, 0);
+          const head = pending.shift();
+          const open = p.open_cmd_seqs;
+          for (const c of head ? head.seqs ?? open.slice(0, Math.max(0, open.length - sentAfter)) : []) ended.add(c);
+          p.cancels = pending;
+        }
+        const left = p.open_cmd_seqs.filter((c) => !ended.has(c));
+        if (left.length === p.open_cmd_seqs.length) continue;
+        p.open_cmd_seqs = left;
+        p.open_turns = left.length;
+        if (p.open_turns > 0) continue;
+        board = "done";
+        p.closed_event_id = e.id;
+        p.waiting = [];
+        // Nothing is open for a cancel still pending to end: the next prompt starts over.
+        p.cancels = [];
+        if (e.type === REMOTE_EVENT_TURN_END) await closeAnswered(e);
+        else await closeRefused(e, reason);
+        continue;
+      }
       // The end a cancel sent from here brings: what was open before the cancel is over, and only the prompts sent after it remain.
       // Before it, a turn that was running when the cancel was sent may still end on its own (it finished as the cancel was on its
       // way): that end is the turn's from before the cancel, never one sent after it. A further end with none of those left means the
@@ -453,20 +552,10 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
           ? (stop === "cancelled" ? afterCancel : Math.max(0, afterCancel - 1))
           : stop === "cancelled" ? 0 : Math.max(0, (Number(p.open_turns) || 0) - 1);
         if (p.open_turns > 0) continue;
-        const said = stopWords(stop, flat(e.data.error, 200), p.lang);
-        const whole = await answerOf(q, sessionId, e.id);
-        const answer = tailOf(whole, ANSWER_EVENT_MAX);
-        const summary = [said, tailOf(answer, SUMMARY_MAX)].filter(Boolean).join(" ") || (p.lang === "zh" ? "已结束，没有回答文字" : "ended with no answer text");
         board = "done";
         p.closed_event_id = e.id;
         p.waiting = [];
-        await write(
-          `board_state = 'done', outcome = 'answered', last_report_kind = 'answer', summary = $2, pending_question = NULL,
-           closed_at = NOW(), attention_seq = attention_seq + $3::int`,
-          [summary, p.origin === "assistant" ? 1 : 0],
-          { kind: "answer", summary: [said, answer].filter(Boolean).join(" ") || summary, result: { stop_reason: stop || null, remote_event_id: e.id } },
-        );
-        tell(`end:${e.id}`, remoteNotice("done", p, item.seq, [said, tailLines(whole, NOTICE_ANSWER_MAX)].filter(Boolean).join(" ") || summary));
+        await closeAnswered(e);
       } else if (e.type === REMOTE_EVENT_COMMAND_REJECTED) {
         const reason = flat(e.data.reason, 80);
         if (e.data.type !== "prompt" || !PROMPT_REFUSED_UNQUEUED.has(reason)) continue;
@@ -475,13 +564,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         board = "done";
         p.closed_event_id = e.id;
         p.waiting = [];
-        const summary = p.lang === "zh" ? `指令被拒绝：${reason}` : `the instruction was refused: ${reason}`;
-        await write(
-          `board_state = 'done', outcome = 'dropped', last_report_kind = 'dropped', summary = $2, pending_question = NULL,
-           closed_at = NOW(), attention_seq = attention_seq + $3::int`,
-          [summary, p.origin === "assistant" ? 1 : 0], { kind: "dropped", summary },
-        );
-        tell(`refused:${e.id}`, remoteNotice("refused", p, item.seq, reason));
+        await closeRefused(e, reason);
       } else if (e.type === REMOTE_EVENT_SESSION_CLOSED) {
         if (board === "done") continue;
         board = "done";

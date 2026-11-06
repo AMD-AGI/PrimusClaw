@@ -102,7 +102,7 @@ export class Session {
    */
   private twinSeen = false;
   private turnRunning = false;
-  private queue: Array<{ text: string; cmdId: string | null; started: () => void }> = [];
+  private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void }> = [];
   private launching: Promise<void> | null = null;
   private idle: NodeJS.Timeout | undefined;
   private readonly book: PermissionBook;
@@ -579,10 +579,10 @@ export class Session {
    * the session closed): only then does the connector count the command as handled, so a restart before that
    * delivers it again instead of losing it.
    */
-  enqueuePrompt(text: string, cmdId: string | null, started: () => void = () => {}): void {
-    if (this.closed) { this.rejectCommand("prompt", cmdId, "session_closed"); return started(); }
-    if (this.queue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts"); return started(); }
-    this.queue.push({ text, cmdId, started });
+  enqueuePrompt(text: string, cmdId: string | null, started: () => void = () => {}, cmdSeq: number | null = null): void {
+    if (this.closed) { this.rejectCommand("prompt", cmdId, "session_closed", cmdSeq); return started(); }
+    if (this.queue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts", cmdSeq); return started(); }
+    this.queue.push({ text, cmdId, cmdSeq, started });
     if (!this.turnRunning) void this.pump();
   }
 
@@ -599,7 +599,7 @@ export class Session {
     try {
       while (this.queue.length && !this.closed) {
         const next = this.queue.shift()!;
-        await this.runTurn(next.text, next.started, next.cmdId);
+        await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq);
       }
     } finally {
       this.turnRunning = false;
@@ -607,14 +607,15 @@ export class Session {
     }
   }
 
-  private async runTurn(text: string, started: () => void, cmdId: string | null): Promise<void> {
+  /** Every `turn_end` of the turn names its prompt: `cmd_id`, and `cmd_seq` (a number, which no credential scrub ever masks). */
+  private async runTurn(text: string, started: () => void, cmdId: string | null, cmdSeq: number | null): Promise<void> {
     if (this.agent.attach) {
       const refused = await this.preflight();
       if (refused) {
         started();
         this.audit("prompt_refused", { reason: refused.reason, detail: refused.detail.slice(0, 300) });
-        this.rejectCommand("prompt", cmdId, refused.reason);
-        this.emit("turn_end", { stopReason: "error", error: refused.reason });
+        this.rejectCommand("prompt", cmdId, refused.reason, cmdSeq);
+        this.emit("turn_end", { stopReason: "error", error: refused.reason, cmd_id: cmdId, cmd_seq: cmdSeq });
         return;
       }
     }
@@ -622,7 +623,7 @@ export class Session {
       await this.ensureAdapter();
     } catch (e) {
       started();
-      this.emit("turn_end", { stopReason: "error", error: e instanceof SessionRefusal ? e.reason : "adapter_unavailable" });
+      this.emit("turn_end", { stopReason: "error", error: e instanceof SessionRefusal ? e.reason : "adapter_unavailable", cmd_id: cmdId, cmd_seq: cmdSeq });
       return this.refuse(e);
     }
     const a = this.adapter!;
@@ -634,10 +635,10 @@ export class Session {
       started();
       const res = await reply;
       const usage = isObject(res.usage) ? res.usage : undefined;
-      this.emit("turn_end", { stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}) });
+      this.emit("turn_end", { stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });
     } catch (e) {
       this.audit("turn_failed", { error: errMessage(e) });
-      this.emit("turn_end", { stopReason: "error", error: errMessage(e).slice(0, 300) });
+      this.emit("turn_end", { stopReason: "error", error: errMessage(e).slice(0, 300), cmd_id: cmdId, cmd_seq: cmdSeq });
     } finally {
       // At once, before the look at who holds the conversation open: the test below it for a terminal that writes
       // next is the size, and it must start from the turn's end, not from a moment later.
@@ -716,16 +717,22 @@ export class Session {
     this.touch();
   }
 
-  /** `cancel`: stop the turn, drop what was queued, answer every waiting permission request `cancelled`. */
+  /**
+   * `cancel`: stop the turn, drop what was queued, answer every waiting permission request `cancelled`. Each prompt dropped
+   * unrun is refused by name (`command_rejected`, reason `cancelled`, with its `cmd_id` and `cmd_seq`): it never gets a `turn_end`.
+   */
   async cancel(): Promise<void> {
-    const queued = this.queue.length;
+    const dropped = this.queue.map((q) => [q.cmdId, q.cmdSeq] as const);
+    const queued = dropped.length;
     this.dropQueued();
+    for (const [cmdId, cmdSeq] of dropped) this.rejectCommand("prompt", cmdId, "cancelled", cmdSeq);
     const wasRunning = this.turnRunning;
     if (wasRunning && this.adapter && this.acpId) await this.adapter.notify("session/cancel", { sessionId: this.acpId }).catch(() => undefined);
     for (const actionId of this.book.cancelAll()) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "cancel" });
     this.audit("cancelled", { turn_running: wasRunning, queued_dropped: queued });
-    // A running turn ends with its own `turn_end` (stopReason cancelled). With none running, say so once.
-    if (!wasRunning) this.emit("turn_end", { stopReason: "cancelled" });
+    // A running turn ends with its own `turn_end` (stopReason cancelled, naming its prompt). With none running, say so once,
+    // naming no prompt: it ended none.
+    if (!wasRunning) this.emit("turn_end", { stopReason: "cancelled", cmd_id: null, cmd_seq: null });
   }
 
   // --- ending ----------------------------------------------------------------------------
@@ -766,9 +773,10 @@ export class Session {
     await this.close(r.reason);
   }
 
-  rejectCommand(type: string, cmdId: string | null, reason: string): void {
+  /** A command refused; a prompt's refusal names it by `cmd_seq` too, as its turn_end would. */
+  rejectCommand(type: string, cmdId: string | null, reason: string, cmdSeq: number | null = null): void {
     this.audit("command_rejected", { type, cmd_id: cmdId, reason });
-    this.emit("command_rejected", { type, cmd_id: cmdId, reason });
+    this.emit("command_rejected", { type, cmd_id: cmdId, reason, ...(cmdSeq !== null ? { cmd_seq: cmdSeq } : {}) });
   }
 }
 

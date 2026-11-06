@@ -453,24 +453,40 @@ describe("permissions", () => {
     assert.deepEqual([r.data.actionId, r.data.optionId, r.data.outcome, r.data.by], [perm.data.actionId, null, "cancelled", "cancel"]);
     assert.equal(fileExists(path.join(h.work, "c.txt")), false);
   });
-  test("cancel stops a running turn (session/cancel is sent) and drops the prompts queued behind it", async () => {
+  test("cancel stops a running turn (session/cancel is sent) and drops the prompts queued behind it, refusing each by name", async () => {
     const h = await make();
     const sid = await h.newSession();
-    h.prompt(sid, "hang");
-    h.prompt(sid, "say never");
+    const hang = h.prompt(sid, "hang", { cmd_id: "p-hang" });
+    const never = h.prompt(sid, "say never", { cmd_id: "p-never" });
     await h.claw.until("the turn to be running", () => h.adapterLog().some((l) => l.prompt === "hang"));
-    h.claw.issue("cancel", sid);
+    h.claw.issue("cancel", sid, { cmd_id: "c-1" });
     const end = await h.turnEnd(sid);
-    assert.equal(end.data.stopReason, "cancelled");
+    assert.deepEqual([end.data.stopReason, end.data.cmd_id, end.data.cmd_seq], ["cancelled", "p-hang", hang], "the end names the prompt it ends");
     assert.ok(h.adapterLog().some((l) => l.method === "session/cancel"));
     await sleep(100);
     assert.ok(!h.adapterLog().some((l) => l.prompt === "say never"));
+    // The dropped prompt never gets a turn_end: it is refused by name, before the running turn's end.
+    const refused = h.claw.eventsOf(sid, "command_rejected");
+    assert.deepEqual(refused.map((e) => [e.data.type, e.data.cmd_id, e.data.cmd_seq, e.data.reason]), [["prompt", "p-never", never, "cancelled"]]);
+    assert.ok(refused[0]!.seq < end.seq);
+    assert.equal(h.turnEnds(sid).length, 1);
   });
-  test("a cancel with nothing running still answers once", async () => {
+  test("a cancel with nothing running still answers once, naming no prompt", async () => {
     const h = await make();
     const sid = await h.newSession();
-    h.claw.issue("cancel", sid);
-    assert.equal((await h.turnEnd(sid)).data.stopReason, "cancelled");
+    h.claw.issue("cancel", sid, { cmd_id: "c-idle" });
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.stopReason, "cancelled");
+    assert.ok(Object.hasOwn(end.data, "cmd_seq") && end.data.cmd_seq === null && end.data.cmd_id === null, "names no prompt, and says so");
+    assert.deepEqual(h.claw.eventsOf(sid, "command_rejected"), []);
+  });
+  test("each turn's end names the prompt it ends, in order", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const one = h.prompt(sid, "say one", { cmd_id: "p-1" });
+    const two = h.prompt(sid, "say two", { cmd_id: "p-2" });
+    await h.turnEnd(sid, 2);
+    assert.deepEqual(h.turnEnds(sid).map((e) => [e.data.stopReason, e.data.cmd_id, e.data.cmd_seq]), [["end_turn", "p-1", one], ["end_turn", "p-2", two]]);
   });
   test("nobody answers: after the time-to-live the adapter is answered cancelled, the card is closed and the turn ends", async () => {
     const h = await make({ timing: { permissionTtlMs: 250 } });

@@ -517,7 +517,10 @@ export async function executeSend(
     });
     // The item the user is told the end of. A repeat (`duplicate`) found the first one's.
     if (out.status === "queued") {
-      await noteRemotePrompt({ owner: userId, sessionId: target, connectorId: plan.connector_id, agentId: plan.agent_id, text, origin: "assistant", lang, since });
+      await noteRemotePrompt({
+        owner: userId, sessionId: target, connectorId: plan.connector_id, agentId: plan.agent_id, text, origin: "assistant", lang, since,
+        cmdSeq: Number(out.row.cmd_seq),
+      });
     }
     return out;
   });
