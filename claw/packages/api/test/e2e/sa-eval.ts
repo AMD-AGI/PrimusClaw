@@ -48,9 +48,10 @@
  *                     sets one too. A case whose placeholders have no value is skipped and says which.
  *   EVAL_GITHUB_TOKEN_FILE, EVAL_GITHUB_API
  *                     the eval identity's GitHub token and API root (default https://api.github.com) for `gh:` oracles
- *   EVAL_ORACLE_PLUGIN_ID
- *                     the plugin whose MCP servers `mcp:` oracles read (default EVAL_PLUGIN_ID); only tools on the router's list
- *                     of reads are ever called, so an oracle cannot write
+ *   EVAL_ORACLE_PLUGIN_ID, EVAL_ORACLE_MCP_HOSTS
+ *                     the plugin whose MCP servers `mcp:` oracles read (default EVAL_PLUGIN_ID), and the hosts their URLs may
+ *                     have (comma list, https only; default the host of EVAL_CLAW): the key is sent nowhere else. Only tools on
+ *                     the router's list of reads are ever called, so an oracle cannot write
  *
  * EVAL_STATIC reports, without sending anything, every case that can never pass on its arm (a tools_must no tool of the arm
  * matches: the router's from `assistant/read-tools.ts`, the worker's every plugin server, given as EVAL_STATIC_SERVERS or the
@@ -74,8 +75,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   BUILTIN_TOOLS, caseHash, caseSays, cardsOf, cleanupOf, filledCase, finalSay, grade, forRecording, identityRefusal, itemsStartedBy, judgePrompt,
-  loadCases, missingVars, needsJudge, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf, saysOf, staticFindings,
-  verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest, holdAnswers, toolPattern,
+  loadCases, oracleMcpTarget, missingVars, needsJudge, oracleMayRun, oracleQuery, parseRecordings, pick, planOf, renderTable, routeOf, saysOf,
+  staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest, holdAnswers, toolPattern,
   type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery, type Recording,
   type Turn, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
@@ -290,11 +291,14 @@ function mcpClient(server: string): Promise<Client> {
         .filter((t) => String(t.type).toLowerCase() === "mcp").map((t) => t.config?.mcpServers?.[server]).filter(Boolean);
       const spec = specs[0];
       if (!spec || typeof spec.url !== "string") throw new Error(`plugin ${id} has no MCP server ${server}`);
-      const fill = (v: unknown): string => String(v).split("<SAFE_API_KEY>").join(KEY);
-      const headers: Record<string, string> = Object.fromEntries(Object.entries((spec.headers as Record<string, unknown>) ?? {}).map(([k, v]) => [k, fill(v)]));
-      headers.authorization = `Bearer ${typeof spec.token === "string" && spec.token ? fill(spec.token) : KEY}`;
+      // The key goes only where the operator said MCP oracles may send it: a host of EVAL_ORACLE_MCP_HOSTS (default: the Claw
+      // API's own host), and only where the spec asks for it by the placeholder Brain fills with the caller's key. A spec that
+      // names another host, or a plugin that points a known server name somewhere else, gets nothing and its oracle fails.
+      const target = oracleMcpTarget(spec, (process.env.EVAL_ORACLE_MCP_HOSTS || new URL(CLAW).host).split(","), KEY);
+      if (typeof target === "string") throw new Error(`MCP server ${server} of plugin ${id}: ${target}`);
+      const { url, headers } = target;
       const client = new Client({ name: "sa-eval-oracle", version: "1.0.0" });
-      await client.connect(new StreamableHTTPClientTransport(new URL(spec.url), { requestInit: { headers } }));
+      await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers } }));
       return client;
     })();
     mcpClients.set(server, c);

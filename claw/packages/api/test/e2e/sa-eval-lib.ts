@@ -339,6 +339,24 @@ export function oracleQuery(o: Oracle | undefined): OracleQuery | null {
   return { via: "mcp", server: mcp[1]!, tool: mcp[2]!, args, at: mcp[4]! };
 }
 
+/**
+ * Where an `mcp:` oracle may connect, and with what: the server's URL when it is https on one of `hosts`, and its headers with the
+ * key put only where the spec asks for it by Brain's placeholder (`<SAFE_API_KEY>`, in `token` or a header). A spec without a token
+ * gets no authorization. A string says why the server may not be read: a plugin that points a known server name at another host
+ * never receives the key.
+ */
+export function oracleMcpTarget(spec: Record<string, unknown>, hosts: readonly string[], key: string): { url: URL; headers: Record<string, string> } | string {
+  let url: URL;
+  try { url = new URL(String(spec.url ?? "")); } catch { return "no valid url"; }
+  const allowed = hosts.map((h) => h.trim().toLowerCase()).filter(Boolean);
+  if (url.protocol !== "https:" || !allowed.includes(url.host.toLowerCase())) return `${url.host || "its host"} is not an allowed host`;
+  const fill = (v: unknown): string => String(v).split("<SAFE_API_KEY>").join(key);
+  const raw = spec.headers && typeof spec.headers === "object" ? spec.headers as Record<string, unknown> : {};
+  const headers: Record<string, string> = Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, fill(v)]));
+  if (typeof spec.token === "string" && spec.token) headers.authorization = `Bearer ${fill(spec.token)}`;
+  return { url, headers };
+}
+
 /** Brain's allow-list matching: an exact name, or a prefix before a trailing `*`. */
 const allowedBy = (allow: readonly string[], name: string): boolean => allow.some((p) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : name === p));
 
@@ -409,7 +427,7 @@ export const CAPABILITY_DENIAL = new RegExp([
  */
 const DENIED_SYSTEMS: ReadonlyArray<[RegExp, (c: ToolCall) => boolean]> = [
   [/github|\bgh\b|pull request|\bPRs?\b|仓库|代码库/i, (c) => /^mcp__github__/.test(c.name)
-    || (/^bash$/i.test(c.name) && /(^|[\s;&|(])(gh|git)\s|github\.com/i.test(String(c.input?.command ?? "")))],
+    || (/^bash$/i.test(c.name) && shellReachesGithub(String(c.input?.command ?? "")))],
   [/联网|上网|互联网|网页|网站|internet|\bweb\b|browse|online/i, (c) => /^(web_search|web_fetch)$/.test(c.name)],
   [/safe|workloads?|workspaces?|集群|cluster|节点|\bnodes?\b/i, (c) => /^mcp__safe__/.test(c.name)],
   [/dispatron|计划|\bplans?\b/i, (c) => /^mcp__dispatron__/.test(c.name)],
@@ -417,6 +435,20 @@ const DENIED_SYSTEMS: ReadonlyArray<[RegExp, (c: ToolCall) => boolean]> = [
   [/pulse|leaderboard|排行/i, (c) => /^mcp__pulse__/.test(c.name)],
   [/看板|\bboard\b|\bissues?\b/i, (c) => /^mcp__agent-board__/.test(c.name)],
 ];
+
+/**
+ * Whether a shell command itself went to GitHub: one of its commands (split at `;`, `&&`, `||`, `|` and new lines) runs `gh` or
+ * `git`, or fetches a github.com address with curl or wget. Text that only mentions them (`echo git status`) does not count.
+ */
+export function shellReachesGithub(command: string): boolean {
+  return command.split(/;|&&|\|\||\||\n/).some((part) => {
+    const words = part.trim().split(/\s+/).filter(Boolean);
+    while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!) || ["sudo", "env", "time", "command", "exec", "("].includes(words[0]!))) words.shift();
+    const program = (words[0] ?? "").replace(/^\(+/, "").split("/").pop() ?? "";
+    if (program === "gh" || program === "git") return true;
+    return (program === "curl" || program === "wget") && words.some((w) => /(^|[/"'@])(api\.)?github\.com([/:"']|$)/i.test(w));
+  });
+}
 
 /**
  * Every denial in `final` that the turn's calls do not make true, as the words that said it ([] when there is none). A denial may

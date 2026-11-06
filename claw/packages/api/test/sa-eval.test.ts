@@ -41,7 +41,7 @@ import { fileURLToPath } from "node:url";
 import type { ToolCall } from "./e2e/agent-eval-lib.js";
 import * as readTools from "../src/assistant/read-tools.js";
 import {
-  BUILTIN_TOOLS, CAPABILITY_DENIAL, fill, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
+  BUILTIN_TOOLS, CAPABILITY_DENIAL, fill, oracleMcpTarget, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
   type Arms,
   apiQuery, caseSays, cardsOf, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
@@ -362,6 +362,15 @@ test("S15 runnable oracles, and what the judge is shown", () => {
   assert.ok(oracleMayRun(oracleQuery({ kind: "api", query: "mcp:autopilot/get_status#x" })!, reads));
   assert.ok(!oracleMayRun(oracleQuery({ kind: "api", query: "mcp:safe/workload_delete?id=w#x" })!, reads));
   assert.ok(oracleMayRun(oracleQuery({ kind: "api", query: "/v1/me#x" })!, []));
+  // Where an MCP oracle may send the key: https on an allowed host, and only into Brain's placeholder.
+  const hosts = ["claw.example"];
+  const ok = oracleMcpTarget({ url: "https://claw.example/safe/mcp", token: "<SAFE_API_KEY>", headers: { "X-Via": "eval", "X-Key": "<SAFE_API_KEY>" } }, hosts, "ak-1");
+  assert.ok(typeof ok !== "string");
+  assert.deepEqual(ok.headers, { "X-Via": "eval", "X-Key": "ak-1", authorization: "Bearer ak-1" });
+  assert.deepEqual((oracleMcpTarget({ url: "https://claw.example/x" }, hosts, "ak-1") as { headers: object }).headers, {}, "no token: no key");
+  for (const url of ["https://evil.example/mcp", "http://claw.example/mcp", "https://claw.example.evil.example/mcp", "not a url", ""]) {
+    assert.equal(typeof oracleMcpTarget({ url, token: "<SAFE_API_KEY>" }, hosts, "ak-1"), "string", url);
+  }
   // A described read is the judge's: it is shown the claim and the description. Before, such a fact without a rubric was never judged.
   const described = caseOf({ facts: [{ claim: "covers every open PR", oracle: { kind: "api", query: "github search is:pr is:open author:me -> numbers" } }] });
   assert.equal(needsJudge(described), true);
@@ -405,6 +414,11 @@ test("S16 no false denial of a capability", () => {
   assert.ok(denied("I can't access GitHub.", [bash("python missing.py")]));
   assert.ok(!denied("I can't access GitHub.", [bash("gh pr list --author @me")]));
   assert.ok(!denied("我无法访问 GitHub。", [bash("cd repo && git fetch origin")]));
+  assert.ok(!denied("I can't access GitHub.", [bash("GH_TOKEN=x /usr/bin/gh api user")]));
+  assert.ok(!denied("I can't access GitHub.", [bash("curl -sf https://api.github.com/repos/o/r")]));
+  for (const cmd of ["echo git status; false", "printf 'gh pr list'", "grep -r github.com docs", "cat .gitignore"]) {
+    assert.ok(denied("I can't access GitHub.", [bash(cmd)]), cmd);
+  }
   // Every denial is checked, and a sentence that names two systems needs a failed call to each.
   assert.ok(denied("I cannot access Dispatron. I cannot access SaFE.", [call("mcp__dispatron__get_runs", false)]));
   assert.ok(!denied("I cannot access Dispatron. I cannot access SaFE.", [call("mcp__dispatron__get_runs", false), call("mcp__safe__node_list", false)]));
