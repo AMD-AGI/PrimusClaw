@@ -1312,6 +1312,9 @@ describe("assistant review tools", { skip }, () => {
       ]);
       await w.closeRun(turn.task_id);
       assert.equal(await actionsRun(), 1, "the handoff itself was queued, once");
+      // What the turn said before the handoff is carried by it, so the chat's one answer still says it.
+      const handed = (await w.q("SELECT payload FROM claw_notification_outbox WHERE payload->>'type' = 'assistant.action'"))[0]?.payload;
+      assert.deepEqual(handed.review.held_says, ["已交给 Wei, Lei 了。"]);
 
       // A turn that handed a review over and said nothing at all: when it ends in plain text, none of it is delivered, and when it failed
       // after the handoff there is no "did not go through" notice. The handoff is queued, and the chat answers.
@@ -1357,6 +1360,32 @@ describe("assistant review tools", { skip }, () => {
       assert.equal(releasedEvent.length, 1, "the session shows it once, when it is released");
       assert.equal(releasedEvent[0].turn_message_id, asked.mid);
     } finally {
+      rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
+        calls.start.push({ user, method, request });
+        return startAnswer(request);
+      }) as never;
+    }
+  });
+
+
+  test("S7d \"hand it over, and by the way Y?\": the answer to Y is carried by the handoff, so the chat's one answer has it", async () => {
+    rt.reviewToolPorts.startReviews = saved.startReviews as never;
+    const savedVoid = rt.reviewToolPorts.voidStreamedSay;
+    rt.reviewToolPorts.voidStreamedSay = async () => {};
+    try {
+      await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
+      const ctx = { ...DEFAULT_CTX, repos: [], people: [{ name: "Wei, Lei", user_id: "u-weilei" }], handoffs: ["review_for_other"] };
+      const turn = await userTurn(alice, "请 Wei, Lei 帮我 review 合入 AMD-AGI/PrimusClaw#308，顺便问一下 SaFE 现在有几个节点？", { context: ctx });
+      await w.mod.tools.say(turn, { text: "SaFE 现在有 12 个节点在线。" }, w.sayDeps);
+      assert.equal(((await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#308"], merge: true, reviewer: "u-weilei" })) as Recorded).handed_off, true);
+      const rows = await w.q(
+        "SELECT payload, dropped_at, delivered_at FROM claw_notification_outbox WHERE payload->>'type' IN ('assistant.say', 'assistant.action') ORDER BY id",
+      ) as Recorded[];
+      const live = rows.filter((r) => !r.dropped_at);
+      assert.deepEqual(live.map((r) => r.payload.type), ["assistant.action"], "one message reaches the chat: the handoff's answer");
+      assert.deepEqual(live[0].payload.review.held_says, ["SaFE 现在有 12 个节点在线。"], "and it carries the answer to Y");
+    } finally {
+      rt.reviewToolPorts.voidStreamedSay = savedVoid;
       rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
         calls.start.push({ user, method, request });
         return startAnswer(request);

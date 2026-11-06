@@ -19,7 +19,7 @@ import pino from "pino";
 import { CLAW_ASSISTANT_SAY_MAX_PER_HOUR, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { publishEvent } from "../events/store.js";
-import { HOLD_SECONDS, heldStatus, turnAnnouncedStart } from "./say-hold.js";
+import { HOLD_SECONDS, heldStatus, turnAnnouncedStart, turnToldStart } from "./say-hold.js";
 import { db, FAILOVER_RETRY_DELAY_MS, inTransaction, isFailoverError, neverCommitted, type Querier } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import {
@@ -84,8 +84,13 @@ export interface SayInput {
   sources?: AssistantSaySource[];
   /** Its deliveries are held until this turn (a message id) ends or hands a review over (`say-hold.ts`). */
   holdForTurn?: string;
-  /** When the turn that says it began: a turn whose item's start the system told the user says nothing more (`turnAnnouncedStart`). */
+  /**
+   * When the turn that says it began. After the system's start notice in that turn (`turnAnnouncedStart`) a message is refused
+   * (`already_announced`: the turn's unsaid final text), unless `amendNotice`: then it is stored as an addition to that notice
+   * (`amends`), which the channel shows in the same message.
+   */
   turnBegan?: Date | string;
+  amendNotice?: boolean;
 }
 
 export interface SayDeps {
@@ -149,7 +154,9 @@ interface ToStoreBase {
 type ToStore =
   | (ToStoreBase & {
     type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; confirmWrite?: AssistantConfirmWrite;
-    sources?: AssistantSaySource[]; files?: AssistantFile[];
+    sources?: AssistantSaySource[]; files?: AssistantFile[]; amends?: string;
+    /** A system notice's turn (the message it answers): kept on its payload, so a later say of that turn finds it (`turnAnnouncedStart`). */
+    noticeOfTurn?: string;
   })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow });
 
@@ -163,6 +170,8 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
       ...(m.sources?.length ? { sources: m.sources } : {}),
       ...(m.confirmWrite ? { confirm_write: m.confirmWrite } : {}),
       ...(m.files?.length ? { files: m.files } : {}),
+      ...(m.amends ? { amends: m.amends } : {}),
+      ...(m.noticeOfTurn ? { turn_message_id: m.noticeOfTurn } : {}),
     };
 }
 
@@ -228,6 +237,7 @@ export async function publishSayEvent(
       ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
       ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
       ...(payload.type === "assistant.say" && payload.files ? { files: payload.files } : {}),
+      ...(payload.type === "assistant.say" && payload.amends ? { amends: payload.amends } : {}),
       fallback: payload.type === "work_item.needs_you",
       ts: Date.parse(payload.occurred_at),
     });
@@ -477,9 +487,13 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
       if (await turnHandedOffReview(q, input.userId, input.turnMessageId)) {
         throw new SayRefused("handed_off", HANDED_OFF_REFUSAL);
       }
-      if (input.turnBegan && await turnAnnouncedStart(q, input.userId, input.turnBegan)) {
+      // The turn's unsaid final text after a start notice is refused whether or not a channel got the notice (`turnToldStart`); a say
+      // of the router's is added to the notice, matched by the turn on its delivery (`turnAnnouncedStart`), or is a message of its own.
+      if (!input.amendNotice && input.turnBegan && await turnToldStart(q, input.userId, input.turnBegan)) {
         throw new SayRefused("already_announced", ALREADY_ANNOUNCED_REFUSAL);
       }
+      const notice = input.amendNotice && input.turnBegan && input.turnMessageId
+        ? await turnAnnouncedStart(q, input.userId, input.turnBegan, input.turnMessageId) : null;
       // One say at a time per user: the cap counts stored rows, and without this a burst
       // all count the same number and all insert.
       await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
@@ -499,6 +513,7 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
       if (recent >= limit) throw new SayCapped(limit);
       return storeOne({
         type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item, sources: input.sources,
+        ...(notice ? { amends: notice } : {}),
         ...(input.holdForTurn ? { hold: { status: heldStatus(input.holdForTurn), seconds: HOLD_SECONDS } } : {}),
       });
     }, (late) => announce(late, deps, input.turnMessageId, !!input.holdForTurn));
@@ -642,6 +657,7 @@ export async function recordSystemNotice(
     sayId: deterministicEventId("assistant.notice", input.userId, input.key),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
     ...(input.files?.length ? { files: input.files } : {}),
+    ...(input.turnMessageId ? { noticeOfTurn: input.turnMessageId } : {}),
   }), (late) => announce(late, deps, input.turnMessageId));
   if (!stored) return null;
   await announce(stored, deps, input.turnMessageId);
