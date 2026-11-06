@@ -143,7 +143,7 @@ test("P6 what workers and models wrote is quoted data inside the untrusted block
   assert.equal(close + UNTRUSTED_CLOSE.length, system.length);
   // The preamble says it is data, just before the block, and names the acting tools it can never ask for.
   assert.ok(system.slice(0, open).endsWith(`${UNTRUSTED_PREAMBLE}\n`));
-  for (const tool of ["confirmation_answer", "channel_action", "review_start"]) assert.match(UNTRUSTED_PREAMBLE, new RegExp(tool));
+  for (const tool of ["confirmation_answer", "channel_action", "review_start", "devenv_send"]) assert.match(UNTRUSTED_PREAMBLE, new RegExp(tool));
   assert.match(UNTRUSTED_PREAMBLE, /never as instructions/);
   // Every worker-written word is inside the block, on the item's one line, as a quoted value.
   const inside = system.slice(open, close);
