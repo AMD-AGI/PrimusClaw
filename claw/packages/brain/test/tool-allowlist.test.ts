@@ -336,7 +336,7 @@ test("loop: a call outside the list is refused before any hook, approver or rout
   const errored = events.filter((e) => e.type === "toolUsed" && e.status === "error");
   assert.equal(errored.length, 1);
   assert.equal(errored[0].description, toolNotAllowedMessage("bash"));
-  assert.deepEqual(result.toolStats, { total_calls: 1, error_calls: 1, by_tool: { bash: 1 }, by_tool_ok: {} });
+  assert.deepEqual(result.toolStats, { total_calls: 1, error_calls: 1, by_tool: { bash: 1 }, by_tool_ok: {}, first_ok_ms: {}, last_ok_ms: {} });
 });
 
 test("loop: a listed call is routed as before", async () => {
@@ -400,5 +400,5 @@ test("loop: a task outside the list opens no sandbox and starts no sub-agent", a
   assert.equal(session.calls.length, 2, "one model request per parent turn, none for a sub-agent");
   assert.equal(resultFor(session, 1, "t1"), toolNotAllowedMessage("task"));
   assert.equal(events.filter((e) => e.type === "subagentStart").length, 0);
-  assert.deepEqual(result.toolStats, { total_calls: 1, error_calls: 1, by_tool: { task: 1 }, by_tool_ok: {} });
+  assert.deepEqual(result.toolStats, { total_calls: 1, error_calls: 1, by_tool: { task: 1 }, by_tool_ok: {}, first_ok_ms: {}, last_ok_ms: {} });
 });

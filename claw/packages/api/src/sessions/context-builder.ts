@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import type { Message } from "@claw/protocol";
 import { coerceToolInput } from "@claw/utils";
@@ -128,11 +129,42 @@ function selectHistoryTokens(
 
 /** Build history from conversation turns (sliding window, newest first until budget). */
 export async function buildHistory(sessionId: string, maxTokens = 100_000): Promise<Message[]> {
+  const fromTurn = await assistantHistoryStart(sessionId);
   const turns = (await db.query(
-    "SELECT role, content, tool_calls, tool_results, token_count FROM claw_conversation_turns WHERE session_id = $1 AND deleted_at IS NULL ORDER BY turn_index DESC",
-    [sessionId],
-  )).rows;
+    `SELECT role, content, tool_calls, tool_results, token_count FROM claw_conversation_turns
+      WHERE session_id = $1 AND deleted_at IS NULL AND turn_index >= $2 ORDER BY turn_index DESC`,
+    [sessionId, fromTurn],
+  )).rows as Array<{ role: string; content: string; tool_calls?: unknown; tool_results?: unknown; token_count?: number }>;
+  // A window that starts at a reply starts with a turn whose question it does not hold: begin at the user's turn.
+  while (fromTurn > 0 && turns.length && turns[turns.length - 1].role !== "user") turns.pop();
   return reconstructHistory(turns, maxTokens);
+}
+
+/** The turns an assistant's router or observer is given: the last `ASSISTANT_HISTORY_TURNS` at least, and fewer than one `STEP` more. */
+export const ASSISTANT_HISTORY_TURNS = 40;
+export const ASSISTANT_HISTORY_STEP = 20;
+
+/**
+ * The first stored turn an assistant's router or observer session is given as history, or 0 for every other session.
+ *
+ * A router's session never ends, and what it needs of the past is in its item list and memory, which every turn is given; its
+ * history is only the recent conversation. The window starts on a multiple of `ASSISTANT_HISTORY_STEP`, so it moves once every
+ * that many turns, not on every turn: in between, every turn's history begins with the same messages, and the model provider reads
+ * them from its prompt cache instead of processing them again. The token budget still applies inside the window, but it does not
+ * bound a router (whose turns are mostly tool calls, which it does not count).
+ */
+export async function assistantHistoryStart(sessionId: string): Promise<number> {
+  if (!CLAW_ASSISTANT_ENABLED) return 0;
+  const row = (await db.query(
+    `SELECT (SELECT COALESCE(MAX(turn_index), 0) FROM claw_conversation_turns WHERE session_id = $1 AND deleted_at IS NULL) AS last
+      WHERE EXISTS (SELECT 1 FROM claw_assistants WHERE session_id = $1)
+         OR EXISTS (SELECT 1 FROM claw_assistant_scopes WHERE session_id = $1)`,
+    [sessionId],
+  )).rows[0] as { last: number | string } | undefined;
+  if (!row) return 0;
+  const last = Number(row.last);
+  const from = last - ASSISTANT_HISTORY_TURNS + 1;
+  return from > 1 ? Math.floor(from / ASSISTANT_HISTORY_STEP) * ASSISTANT_HISTORY_STEP : 0;
 }
 
 /** Tolerant JSONB → array parser. Accepts already-parsed arrays, JSON strings,

@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
-import { filterToolSchemas, parseToolAllowlist } from "../tools/allowlist.js";
+import { filterToolSchemas, parseReadTaint, parseToolAllowlist } from "../tools/allowlist.js";
 import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
@@ -21,7 +21,7 @@ import { HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp, mcpUnavailableNote } from "../clients/mcp.js";
-import { buildPrompt, buildProgressiveSkillHint, listProgressiveSkills } from "./prompt.js";
+import { buildPrompt, buildProgressiveSkillHint, buildSkillAndMcpHints, listProgressiveSkills, renderSystemHints } from "./prompt.js";
 import { SkillStore, LOAD_SKILL_TOOL } from "./skill-store.js";
 import { loadPlatformDefaults, resolveDefaultSkills, skillDescription, LazyDefaultSkills, type DefaultSkill } from "./platform-defaults.js";
 import { metrics } from "../infra/metrics.js";
@@ -38,7 +38,7 @@ import {
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
   BASH_APPROVAL_RULES, BASH_APPROVAL_DEFAULTS_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, BG_SHELL_ENABLED,
+  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, SKILL_HINTS_IN_SYSTEM, BG_SHELL_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
@@ -168,7 +168,11 @@ export class AgentEngine {
     // enter a run, and every run of Brain comes through it, a turn, a queued turn, a task of a DAG;
     // a sub-agent starts from the schemas of the run that made it, so it has none either. Read as
     // truthy, not `=== true`: a mark that is not a boolean is still a mark.
-    const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
+    // A run marked `skip_platform_defaults` (an assistant's router or observer turn) has none either; what its own request carries
+    // stays. Read as `=== true`: it is not a safety mark, so a value that is not a boolean leaves the run as it was.
+    const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys && request.skip_platform_defaults !== true
+      ? loadPlatformDefaults()
+      : null;
     // Marketplace and plugin servers are third parties' at URLs nobody vetted, so the requester's
     // platform key fills their `<SAFE_API_KEY>` only where the operator trusts it: a host listed in
     // MCP_PLATFORM_KEY_ALLOWED_HOSTS, or, in a run given the defaults, an origin the defaults file
@@ -324,7 +328,12 @@ export class AgentEngine {
       progressiveSkills,
       repoBlock,
       loadSkillAllowed,
+      SKILL_HINTS_IN_SYSTEM,
     );
+    // With SKILL_HINTS_IN_SYSTEM the same hints go to the system message instead, built from the same inputs.
+    const systemHints = SKILL_HINTS_IN_SYSTEM
+      ? renderSystemHints(buildSkillAndMcpHints(inlineSkills, Object.keys(mergedMcp), sessionDir, progressiveSkills, loadSkillAllowed))
+      : "";
 
     logger.info({
       sessionId,
@@ -441,10 +450,11 @@ export class AgentEngine {
       // run, both read from the one parsed list. No field, or an empty one, is
       // no restriction and leaves both exactly as they were.
       router.setToolAllowlist(toolAllowlist);
+      router.readTaint = parseReadTaint(request.read_taint);
       const allToolSchemas = filterToolSchemas([...router.getToolSchemas(), ...mcpResult.schemas], toolAllowlist);
 
       const messages = [...(request.history || [])];
-      const brainSystemParts = [rules, request.rules_text, request.system_append].filter(Boolean);
+      const brainSystemParts = [rules, request.rules_text, request.system_append, systemHints].filter(Boolean);
       if (brainSystemParts.length) {
         const brainSystem = brainSystemParts.join("\n\n");
         if (messages.length && messages[0].role === "system") {

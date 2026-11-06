@@ -15,7 +15,7 @@
  * The dedupe key makes a replayed tool call or a redelivered event leave one row.
  */
 import pino from "pino";
-import { CLAW_DEPLOY_MODE, RUN_DOORBELL_DISPATCH } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_DEPLOY_MODE, RUN_DOORBELL_DISPATCH } from "../config.js";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { actingUserOf } from "../github-review/acting-as.js";
 import type { AttendedProof } from "../github-review/acting-session.js";
@@ -66,9 +66,25 @@ export async function queueServerMessage(q: StatementRunner, m: ServerMessage): 
   });
   const inserted = await insertPendingMessage(q, {
     sessionId: m.sessionId, content: m.content, userId: m.userId, toolIds: [], secrets,
-    sessionEnv: {}, dedupeKey: m.dedupeKey,
+    sessionEnv: {}, dedupeKey: m.dedupeKey, pluginId: await workerPluginId(q, m.sessionId),
   });
   return { ok: true, pendingId: inserted.id, deduplicated: inserted.deduplicated };
+}
+
+/**
+ * The plugin a task item's worker runs with (`work_create` records it on the item), for every message the server puts on its
+ * session: the first task, an instruction forwarded to it, news from GitHub. Undefined for any other session, and for a worker
+ * whose item records none.
+ */
+async function workerPluginId(q: StatementRunner, sessionId: string): Promise<number | undefined> {
+  // The table is the assistant's, created only when it is on; a trigger queues into any session through here.
+  if (!CLAW_ASSISTANT_ENABLED) return undefined;
+  const row = (await q.query(
+    "SELECT params->>'plugin_id' AS plugin_id FROM claw_work_items WHERE worker_session_id = $1 AND kind = 'task'",
+    [sessionId],
+  )).rows[0] as { plugin_id: string | null } | undefined;
+  const id = Number(row?.plugin_id);
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
 }
 
 /**

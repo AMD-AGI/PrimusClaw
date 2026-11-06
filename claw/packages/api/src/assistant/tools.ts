@@ -22,6 +22,9 @@ import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
 import { markUntrustedRead, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, SayRefused, type SayDeps } from "./outbound.js";
+import { internalTextIn, userWordsOf } from "./internal-text.js";
+import { WORK_EVENT_PREFIX } from "./prompts.js";
+import { assistantPluginId } from "./read-tools.js";
 import { requestedItemOf, requesterViewOf, type RequesterView } from "./requester-view.js";
 import { parseReport } from "./report.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
@@ -128,14 +131,36 @@ async function assistantUser(sessionId: string): Promise<string> {
 
 // --- Router ---------------------------------------------------------------------------
 
+export { internalTextIn } from "./internal-text.js";
+
+/** The item whose answer woke this router turn (`formatWorkEvent` with kind `answer`) in its prompt, or undefined. */
+function answerItemOf(prompt: string | null | undefined): string | undefined {
+  return prompt?.match(ANSWER_EVENT_RE)?.[1];
+}
+const ANSWER_EVENT_RE = new RegExp(`^${WORK_EVENT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} #\\d+ \\(item_id: (kwi_[0-9A-Za-z]+)\\) answer:`);
+
 export async function say(
   claims: AssistantTokenClaims, args: { text: string; item_id?: string }, deps: SayDeps = {},
 ): Promise<{ ok: true; say_id: string; subscribers: number }> {
   requireRole(claims, "router");
   const userId = await assistantUser(claims.sid);
+  const run = (await db.query("SELECT prompt FROM claw_tasks WHERE task_id = $1", [claims.task_id])).rows[0] as { prompt: string | null } | undefined;
+  // Refused, not cleaned: the router rewrites it in the user's words, which a filter cannot do for it.
+  if (typeof args.text === "string") {
+    const found = internalTextIn(args.text, userWordsOf([run?.prompt ?? ""]));
+    if (found) {
+      throw new ToolRefused(
+        "internal_text",
+        `the message shows the user ${found}, which is internal. Name a work item as its number and title (#12 修复登录超时), leave out tool names, ids and markers, and call say again`,
+      );
+    }
+  }
+  // A say in the turn an answer woke that names no item is about that item: recorded so, it is the say the silent sweep looks
+  // for, and the answer is not announced a second time.
+  const itemId = args.item_id?.trim() ? args.item_id : answerItemOf(run?.prompt);
   try {
     const out = await recordAssistantSay({
-      userId, sessionId: claims.sid, text: args.text, itemId: args.item_id, turnMessageId: claims.mid,
+      userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid,
       guard: async (q) => {
         if ((await assertLiveRun(q, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");
       },
@@ -229,7 +254,13 @@ export async function workCreate(
       role: "",
       model: choice ? choice.model : CLAW_ASSISTANT_WORKER_MODEL || null,
     }, { parentSid: null });
-    const item = await insertWorkItem(q, { userId, title, workerSessionId, repo, ...(choice ? { params: modelParams(choice) } : {}) });
+    // The plugin the worker runs with, every turn of it (`queueServerMessage` reads it off the item): the one the user's message
+    // to the assistant named, else the assistant's (`CLAW_ASSISTANT_PLUGIN_ID`). None leaves the worker a plain session, as before.
+    const routerRun = (await query("SELECT plugin_id FROM claw_tasks WHERE task_id = $1", [claims.task_id])).rows[0] as
+      { plugin_id: number | null } | undefined;
+    const pluginId = assistantPluginId(routerRun?.plugin_id);
+    const params = { ...(choice ? modelParams(choice) : {}), ...(pluginId !== null ? { plugin_id: pluginId } : {}) };
+    const item = await insertWorkItem(q, { userId, title, workerSessionId, repo, ...(Object.keys(params).length ? { params } : {}) });
     if (!item.ok) {
       throw new ToolRefused(item.error, item.error === "too_many_active_items"
         ? "too many unfinished items: ask the user which to stop or finish first"

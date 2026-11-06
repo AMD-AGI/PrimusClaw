@@ -290,7 +290,7 @@ async function boundItemLabels(userId: string): Promise<Map<string, string>> {
 }
 
 /** A memory read that fails costs the turn its memory, never the turn: it is background. Said in the log, not hidden. */
-async function orNothing(what: string, sessionId: string, read: () => Promise<string | null>): Promise<string | null> {
+async function orNothing<T>(what: string, sessionId: string, read: () => Promise<T | null>): Promise<T | null> {
   try {
     return await read();
   } catch (err) {
@@ -308,12 +308,22 @@ async function sessionWithoutMemory(sessionId: string): Promise<boolean> {
 
 /** The router's memory section and the user's index, or null where the assistant has no memory. */
 export async function routerMemoryBlock(userId: string, sessionId: string): Promise<string | null> {
+  const parts = await routerMemoryParts(userId, sessionId);
+  return parts && (parts.entries ? `${parts.prompt}\n\n${parts.entries}` : parts.prompt);
+}
+
+/**
+ * The router's memory in its two parts: what the memory tools are and how to use them (`prompt`, the same on every turn), and the
+ * user's entries as of now (`entries`, empty when memory is off), which a turn is given with its message so that a save does not
+ * change the system prompt of every later turn.
+ */
+export async function routerMemoryParts(userId: string, sessionId: string): Promise<{ prompt: string; entries: string } | null> {
   if (!assistantMemoryOn()) return null;
   return orNothing("router", sessionId, async () => {
     if (await sessionWithoutMemory(sessionId)) return null;
-    if (!(await getMemoryPreference(userId))) return ROUTER_MEMORY_OFF;
+    if (!(await getMemoryPreference(userId))) return { prompt: ROUTER_MEMORY_OFF, entries: "" };
     const catalogue = await buildMemoryCatalogue(userId, { preamble: ROUTER_MEMORY_PREAMBLE, boundItems: await boundItemLabels(userId) });
-    return `${ROUTER_MEMORY_PROMPT}\n\n${catalogue?.text ?? "## Long-term Memory\n(no entries yet)"}`;
+    return { prompt: ROUTER_MEMORY_PROMPT, entries: catalogue?.text ?? "## Long-term Memory\n(no entries yet)" };
   });
 }
 

@@ -73,6 +73,31 @@ export function parseToolAllowlist(raw: unknown): ToolAllowlist | null {
   return buildAllowlist(patterns);
 }
 
+/**
+ * `ExecuteRequest.read_taint`, read once per run: null when absent or unreadable as a rule with sources. Each call of a run asks
+ * `refusal(name)` before it runs: null lets it through, a text refuses it. A call matching `sources` marks the run (before it runs,
+ * so a call made in the same step as the read, decided before its result was seen, is the only one that can pass).
+ */
+export interface ReadTaint {
+  refusal(toolName: string): string | null;
+}
+
+export function parseReadTaint(raw: unknown): ReadTaint | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as { sources?: unknown; allow_after?: unknown };
+  const sources = Array.isArray(r.sources) && r.sources.length ? parseToolAllowlist(r.sources) : null;
+  if (!sources || !sources.patterns.length) return null;
+  const allowAfter = Array.isArray(r.allow_after) && r.allow_after.length ? parseToolAllowlist(r.allow_after) : null;
+  let readBy: string | null = null;
+  return {
+    refusal(name) {
+      if (sources.allows(name)) { readBy ??= name; return null; }
+      if (readBy === null || allowAfter?.allows(name)) return null;
+      return `Error: '${name}' was not run. This turn has read text other people wrote (with ${readBy}), so it can no longer act for the user. Tell the user what you would do and ask them to confirm it in a new message.`;
+    },
+  };
+}
+
 /** The schemas a run may offer its model: all of them when there is no allowlist. */
 export function filterToolSchemas<T extends { name: string }>(
   schemas: T[],

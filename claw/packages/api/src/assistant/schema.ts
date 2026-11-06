@@ -34,10 +34,10 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
       summary            TEXT NOT NULL DEFAULT '',
       -- in_progress | needs_you | done
       board_state        TEXT NOT NULL,
-      -- progress | waiting | ready | blocked | failed | dropped
+      -- progress | waiting | ready | answer | blocked | failed | dropped
       last_report_kind   TEXT,
       pending_question   TEXT,
-      -- accepted | dropped | stopped, only on a done item
+      -- accepted | answered | dropped | stopped, only on a done item
       outcome            TEXT,
       worker_session_id  TEXT NOT NULL,
       -- Fencing token: bumped when a new turn starts, so a report from a turn
@@ -85,7 +85,7 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
     CREATE TABLE IF NOT EXISTS claw_work_item_events (
       id          BIGSERIAL PRIMARY KEY,
       item_id     TEXT NOT NULL,
-      -- created | run_started | progress | waiting | ready | blocked | failed | dropped | accepted | stopped
+      -- created | run_started | progress | waiting | ready | answer | blocked | failed | dropped | accepted | stopped
       kind        TEXT NOT NULL,
       -- worker | turn_end | sweep | watchdog | user | router | policy (a review's state, read off what it did)
       source      TEXT NOT NULL,

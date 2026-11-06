@@ -1910,6 +1910,10 @@ export const MCP_PLATFORM_KEY_ALLOWED_HOSTS: ReadonlySet<string> = new Set(
 );
 // Whether the file's `skills` apply. Off: only its MCP servers are mounted.
 export const PROGRESSIVE_SKILLS_ENABLED = envBool("PROGRESSIVE_SKILLS_ENABLED", false);
+// Where a turn's skill and MCP server hints go. Off (default): after the user's message, in the execution policy's
+// placeholders, as always. On: in the system message, so the user's message is the last thing the model reads and the
+// hints are part of the cached prefix. Affects every session; switch it on only after an evaluation shows no regression.
+export const SKILL_HINTS_IN_SYSTEM = envBool("SKILL_HINTS_IN_SYSTEM", false);
 // Budget for the downloaded skill files (plugin skills and marketplace tool_ids
 // skills) Brain keeps in memory between turns, so a skill version is fetched once
 // per process instead of once per turn (see tools/skill-cache.ts). Counted as

@@ -85,9 +85,10 @@ interface ItemRow {
   pending_question: string | null;
   result_version: number;
   attention_seq: number;
+  outcome: string | null;
 }
 
-const ITEM_COLUMNS = "item_id, user_id, seq, title, board_state, last_report_kind, pending_question, result_version, attention_seq";
+const ITEM_COLUMNS = "item_id, user_id, seq, title, board_state, last_report_kind, pending_question, result_version, attention_seq, outcome";
 
 const snapshot = (item: ItemRow): AssistantItemSnapshot => ({
   item_id: item.item_id,
@@ -241,14 +242,21 @@ function needsYouText(item: ItemRow): string {
 export async function recordNeedsYouFallback(input: { itemId: string }, deps: SayDeps = {}): Promise<SayOutcome | null> {
   const stored = await inTransaction(async (q) => {
     const item = await loadItem(q, input.itemId);
-    if (!item || item.board_state !== "needs_you") return null;
+    const answered = item?.board_state === "done" && item.outcome === "answered";
+    if (!item || (item.board_state !== "needs_you" && !answered)) return null;
+    // An answer is said whole, from the report (the item's own summary is cut to a line).
+    const answer = answered
+      ? ((await q(
+          "SELECT summary FROM claw_work_item_events WHERE item_id = $1 AND kind = 'answer' ORDER BY id DESC LIMIT 1", [item.item_id],
+        )).rows[0]?.summary as string | undefined) ?? ""
+      : "";
     const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id ?? null;
     return store(q, {
       type: "work_item.needs_you",
       sayId: deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq)),
       userId: item.user_id,
       sessionId,
-      text: needsYouText(item),
+      text: answered ? `#${item.seq} "${item.title}": ${answer}` : needsYouText(item),
       item,
     });
   });

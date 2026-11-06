@@ -29,6 +29,12 @@ import { postgresSkipReason } from "./support/pg-cluster.js";
 import { startWorld, TOKEN_KEY, type World } from "./support/assistant-world.js";
 import { AGENT_GUIDELINE } from "../src/sessions/agent-guideline.js";
 
+// Imported in `before`, after the world has set the environment: `prompts.ts` reads the config the world sets.
+let TURN_STATE_HEADER = "";
+let UNTRUSTED_CLOSE = "";
+/** A router turn's message without the state Claw puts after it (`withTurnState`). */
+const words = (prompt: string): string => prompt.split(`\n\n${TURN_STATE_HEADER}\n\n`)[0];
+
 const skip = postgresSkipReason();
 
 describe("assistant role profile", { skip }, () => {
@@ -42,6 +48,7 @@ describe("assistant role profile", { skip }, () => {
   before(async () => {
     w = await startWorld({ CLAW_SKILL_EVOLUTION_ENABLED: "true", MAX_SELECTED_SKILLS: "1", CLAW_AGENT_GUIDELINE_ENABLED: "true" });
     dispatch = await import("../src/sessions/dispatch.js");
+    ({ TURN_STATE_HEADER, UNTRUSTED_CLOSE } = await import("../src/assistant/prompts.js"));
   });
   after(async () => { await w?.stop(); });
   beforeEach(async () => {
@@ -169,8 +176,12 @@ describe("assistant role profile", { skip }, () => {
     assert.ok(claims.exp > Math.floor(Date.now() / 1000) + 3600, "outlives the longest turn the row allows");
     assert.ok(task.system_append.startsWith("You are the user's personal assistant."));
     assert.ok(!task.system_append.includes(AGENT_GUIDELINE), "a router only dispatches: the working guideline is not its");
-    assert.match(task.system_append, new RegExp(`Work items \\(open ones[^)]*\\):\\n.*\\n<untrusted_data>\\n#1 \\(item_id: ${item.itemId}\\) \\[in_progress\\] \\(status: in progress; created \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC\\) title: "Fix the build"`));
+    // The item list goes with the message, with #299's plain status and times: the system prompt is the same on every turn.
+    assert.match(task.prompt, new RegExp(`Work items \\(open ones[^)]*\\):\\n.*\\n<untrusted_data>\\n#1 \\(item_id: ${item.itemId}\\) \\[in_progress\\] \\(status: in progress; created \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC\\) title: "Fix the build"`));
+    assert.ok(!task.system_append.includes("Fix the build"), "no item in the system prompt");
+    assert.ok(!/now is \d{4}-/.test(task.system_append), "nor the time of this turn");
     assert.equal(task.skills, undefined);
+    assert.equal(task.skip_platform_defaults, true, "no default MCP server or skill list for a router");
   });
 
   test("A1c marketplace tools a message named are not resolved for a router, and are for a worker", async () => {
@@ -183,7 +194,8 @@ describe("assistant role profile", { skip }, () => {
   test("A1b the item list is the user's own", async () => {
     await w.createItem(bob, "Bob's secret project");
     const task = JSON.parse((await send(alice.routerSid, "alice", { doorbell: false })).published[0]);
-    assert.match(task.system_append, /Fix the build/);
+    assert.match(task.prompt, /Fix the build/);
+    assert.doesNotMatch(task.prompt, /Bob's secret/);
     assert.doesNotMatch(task.system_append, /Bob's secret/);
   });
 
@@ -202,7 +214,8 @@ describe("assistant role profile", { skip }, () => {
     const claims = verify(request);
     assert.equal(claims.task_id, result.runId, "the bearer names the claimed run");
     assert.equal(claims.task_id, request.task_id);
-    assert.match(request.system_append, /#2 \(item_id: kwi_\w+\) \[in_progress\] \(status: in progress; created [^)]+ UTC\) title: "Added while it waited"/);
+    assert.match(request.prompt, /#2 \(item_id: kwi_\w+\) \[in_progress\] \(status: in progress; created [^)]+ UTC\) title: "Added while it waited"/);
+    assert.ok(!request.system_append.includes("Added while it waited"));
   });
 
   test("A3 a queued router message replayed on the wire is profiled after its run is opened", async () => {
@@ -329,7 +342,8 @@ describe("assistant role profile", { skip }, () => {
     for (const [content, language] of [[english, "English"], [chinese, "Chinese"]] as const) {
       const { result, published } = await send(alice.routerSid, "alice", { doorbell: false, content });
       const task = JSON.parse(published[0]);
-      assert.equal(task.prompt, `${content}${line(language)}`);
+      assert.equal(words(task.prompt), `${content}${line(language)}`);
+      assert.ok(task.prompt.endsWith(UNTRUSTED_CLOSE), "and the item list after it");
       const [row] = await w.q("SELECT prompt, input FROM claw_tasks WHERE task_id = $1", [result.runId]);
       assert.equal(row.prompt, content, "the run row holds the user's words");
       assert.ok(!JSON.stringify(row.input).includes("Reply language"));
@@ -340,7 +354,7 @@ describe("assistant role profile", { skip }, () => {
     const { result } = await send(alice.routerSid, "alice", { doorbell: true, content: chinese });
     const [stored] = await w.q("SELECT prompt, input FROM claw_tasks WHERE task_id = $1", [result.runId]);
     assert.ok(!JSON.stringify(stored).includes("Reply language"), "the row holds none of it");
-    assert.equal((await claim()).prompt, `${chinese}${line("Chinese")}`);
+    assert.equal(words((await claim()).prompt), `${chinese}${line("Chinese")}`);
     await w.q("DELETE FROM claw_tasks");
 
     // The queue's replay.
@@ -352,7 +366,7 @@ describe("assistant role profile", { skip }, () => {
         task: { session_id: alice.routerSid, message_id: "claw-pending-1", prompt: english },
       });
     } finally { stub.restore(); }
-    assert.equal(JSON.parse(stub.published[0]!).prompt, `${english}${line("English")}`);
+    assert.equal(words(JSON.parse(stub.published[0]!).prompt), `${english}${line("English")}`);
   });
 
   test("A9c when the turn completes, the conversation holds the user's words and none of the reply-language line, on every route", async () => {
@@ -378,12 +392,13 @@ describe("assistant role profile", { skip }, () => {
       await reset();
       const { published } = await send(alice.routerSid, "alice", { doorbell: false, content });
       const request = JSON.parse(published[0]);
-      assert.ok(request.prompt.endsWith(`[Reply language: ${language}]`));
+      assert.ok(words(request.prompt).endsWith(`[Reply language: ${language}]`));
       await completeAsBrain(request, "On it.");
       assert.deepEqual(await stored(), [["user", content], ["assistant", "On it."]], `fat dispatch, ${language}`);
       const next = JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: "ok" })).published[0]);
       assert.deepEqual(next.history.map((m: any) => [m.role, m.content]), [["user", content], ["assistant", "On it."]], "what Brain is given as history: the stored turns, and not the prompt it adds itself");
       assert.ok(!JSON.stringify(next.history).match(line));
+      assert.ok(!JSON.stringify(next.history).includes(TURN_STATE_HEADER), "nor the item list it was given with the message");
     }
 
     // The doorbell claim.
@@ -427,7 +442,7 @@ describe("assistant role profile", { skip }, () => {
 
   test("A9b a message that shows no language gets no line of its own; a worker's and a plain session's get none", async () => {
     const task = JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: "#1" })).published[0]);
-    assert.equal(task.prompt, "#1", "nothing to go on, and nobody wrote before");
+    assert.equal(words(task.prompt), "#1", "nothing to go on, and nobody wrote before");
     for (const sessionId of [item.workerSid, "plain"]) {
       const sent = JSON.parse((await send(sessionId, "alice", { doorbell: false, content: "Can you check why the nightly build is red?" })).published[0]);
       assert.equal(sent.prompt, "Can you check why the nightly build is red?", sessionId);
@@ -439,7 +454,7 @@ describe("assistant role profile", { skip }, () => {
       await w.q("INSERT INTO claw_conversation_turns (session_id, turn_index, role, content, message_id) VALUES ($1, (SELECT COALESCE(MAX(turn_index), 0) + 1 FROM claw_conversation_turns WHERE session_id = $1), $2, $3, $4)", [alice.routerSid, prompt, content, `m-${Math.random()}`]);
     };
     const report = `[work_event] #1 (item_id: ${item.itemId}) ready v1: Opened PR 12 for the build, and it is ready to review`;
-    const prompt = async () => JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: report })).published[0]).prompt;
+    const prompt = async () => words(JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: report })).published[0]).prompt);
 
     assert.equal(await prompt(), report, "a user who has written nothing has no language to name");
 
@@ -465,7 +480,7 @@ describe("assistant role profile", { skip }, () => {
     const second = await w.createItem(alice, "Second item");
     const task = JSON.parse((await send(alice.routerSid, "alice", { doorbell: false })).published[0]);
     for (const i of [item, second]) {
-      assert.ok(task.system_append.includes(`#${i.seq} (item_id: ${i.itemId}) [in_progress]`), `#${i.seq} with its id`);
+      assert.ok(task.prompt.includes(`#${i.seq} (item_id: ${i.itemId}) [in_progress]`), `#${i.seq} with its id`);
     }
     assert.match(task.system_append, /Wherever a tool takes item_id, pass the item_id shown beside the item/);
     assert.match(task.system_append, /without a say in the same step, wait for their results, and only then call say/);

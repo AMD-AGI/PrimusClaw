@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * An item needs the user and nobody has said so.
+ * An item needs the user and nobody has said so, or an item's answer (`answer`, which closes it) was never said.
  *
  * The assistant is a model: it can be slow, fail, or answer a report without saying anything, and the say it
  * did make can fail to reach anyone. A result nobody hears about is the one outcome the assistant exists to
@@ -22,6 +22,8 @@ import { recordNeedsYouFallback } from "./outbound.js";
 const logger = pino({ name: "assistant-silent-sweep" });
 
 const BATCH = 50;
+/** An item closed by its answer, recently enough that saying it still helps. */
+const ANSWERED_UNSAID = "w.board_state = 'done' AND w.outcome = 'answered' AND w.closed_at > NOW() - INTERVAL '1 day'";
 
 /** The announcement, behind a seam so a test can see which items the sweep chose to announce. */
 export const silentSweepPorts = { recordNeedsYouFallback };
@@ -30,7 +32,7 @@ export const silentSweepPorts = { recordNeedsYouFallback };
 export async function tellSilentItems(thresholdSeconds: number = CLAW_ASSISTANT_SILENT_SWEEP_SEC): Promise<number> {
   const items = (await db.query(
     `SELECT w.item_id FROM claw_work_items w
-      WHERE w.board_state = 'needs_you'
+      WHERE (w.board_state = 'needs_you' OR (${ANSWERED_UNSAID}))
         AND w.updated_at < NOW() - make_interval(secs => $1::int)
         AND NOT EXISTS (
           SELECT 1 FROM claw_assistant_says s
