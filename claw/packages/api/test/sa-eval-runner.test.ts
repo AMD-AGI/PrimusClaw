@@ -18,7 +18,8 @@
  *      server refused for its hourly cap makes the attempt the run's failure. Says of an earlier run, whose assistant session
  *      is gone, are read from its say log, and the run leaves its own there
  *   R5 baseline: a plain session's turn is over once its exec_complete is stored, what it showed is graded (a tool name in an earlier
- *      message fails the case; a sub-agent's message is not the first reply), and the session is deleted and seen gone
+ *      message fails the case; a sub-agent's message is not the first reply; the final answer's time is when it was shown, not
+ *      the turn's end), and the session is deleted and seen gone
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own)
@@ -414,20 +415,24 @@ test("R5 baseline: the turn's end, what it showed, and its session", { timeout: 
     const text = (t: string) => ({ type: "AssistantMessage", message_id: id, data: { content: [{ type: "text", text: t }] } });
     // A sub-agent answers at once, the main agent only 1.5 s later: the user's first reply is the main agent's.
     claw.emit({ ...text("sub-agent notes"), subagent_id: "sub-1" }, Date.now(), sessionId);
+    // The final answer is shown at 1.5 s; the turn's executionStats comes 2 s after it, its exec_complete 1.5 s after that.
     setTimeout(() => {
       claw.emit(text("Calling mcp__safe__node_list for you."), Date.now(), sessionId);
       claw.emit(text("There are 3 nodes."), Date.now(), sessionId);
-      claw.emit({ type: "executionStats", message_id: id, turns: 1 }, Date.now(), sessionId);
-      setTimeout(() => claw.emit({ type: "exec_complete", message_id: id, final_text: "There are 3 nodes." }, Date.now(), sessionId), 1_500);
+      setTimeout(() => {
+        claw.emit({ type: "executionStats", message_id: id, turns: 1 }, Date.now(), sessionId);
+        setTimeout(() => claw.emit({ type: "exec_complete", message_id: id, final_text: "There are 3 nodes." }, Date.now(), sessionId), 1_500);
+      }, 2_000);
     }, 1_500);
   };
   const r = runner(base, [{ id: "t-base-001", pipeline: "catalog", area: "general", lang: "en", route: "answer", turns: [{ user: "how many nodes?" }],
-    latency_budget_s: { first: 1 } }], { EVAL_MODE: "baseline", EVAL_PLUGIN_ID: "9" });
+    latency_budget_s: { first: 1, final: 3 } }], { EVAL_MODE: "baseline", EVAL_PLUGIN_ID: "9" });
   const run = await r.done;
   await claw.stop();
   try {
     assert.match(run.out, /FAIL t-base-001#1 .*no internal text: tool name/, run.out);
     assert.match(run.out, /FAIL t-base-001#1 .*first reply <= 1s/, "the sub-agent's message is not the user's first reply");
+    assert.doesNotMatch(run.out, /final <= 3s/, "the final answer was shown at 1.5 s: on time, though the turn ended later");
     const deletedAt = claw.callAt[claw.calls.indexOf("DELETE /v1/sessions/plain-1")]!;
     assert.ok(deletedAt >= claw.settledAt.get("msg-first")!, "the session is deleted only after its turn's exec_complete was stored");
     assert.equal(run.code, 0, "a failed case is a measurement: the run itself completed and cleaned up");

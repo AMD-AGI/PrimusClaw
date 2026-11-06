@@ -659,11 +659,13 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
     const finalText = String(last?.data.final_text || all.final || "");
     const lastSent = sentAt.at(-1)!;
     const lastFirst = firstText.at(-1) ?? null;
-    // What the user was shown: the main agent's messages as they streamed (a turn's end on a stream carries no text).
+    // What the user was shown: the main agent's messages as they streamed (a turn's end on a stream carries no text). The final
+    // answer was shown with the last turn's last one, which can be well before the turn's end (the workspace sync follows it).
     const shown = messagesOf(stream.events);
+    const lastShown = stream.events.filter((e) => replied(e) && e.at >= lastSent).at(-1)?.at ?? last?.at;
     const observed: Observed = {
       mode: MODE, calls: lastCalls, shown: shown.length ? shown : [finalText], final: finalText,
-      firstReplyMs: lastFirst === null ? null : lastFirst - lastSent, finalMs: last ? last.at - lastSent : null,
+      firstReplyMs: lastFirst === null ? null : lastFirst - lastSent, finalMs: lastShown === undefined ? null : lastShown - lastSent,
       replyMs: firstText.map((a, k) => (a === null ? null : a - sentAt[k]!)), items: [], factValues: values,
     };
     const trace = all;
