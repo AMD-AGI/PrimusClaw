@@ -32,7 +32,14 @@ export function recordDisconnect(dirs: Dirs, d: Omit<Disconnect, "at"> & { at?: 
     let lines: string[] | null = null;
     try {
       fs.writeSync(fd, JSON.stringify({ at: d.at ?? new Date().toISOString(), reason: d.reason, ...(d.detail ? { detail: d.detail.slice(0, 300) } : {}) }) + "\n");
-      if (fs.fstatSync(fd).size > MAX_BYTES) lines = fs.readFileSync(fd, "utf8").split("\n").filter(Boolean);
+      const size = fs.fstatSync(fd).size;
+      if (size > MAX_BYTES) {
+        // From offset 0: after the append the descriptor's position is at the end.
+        const buf = Buffer.alloc(size);
+        let got = 0;
+        while (got < size) { const n = fs.readSync(fd, buf, got, size - got, got); if (n === 0) break; got += n; }
+        lines = buf.subarray(0, got).toString("utf8").split("\n").filter(Boolean);
+      }
     } finally { fs.closeSync(fd); }
     if (lines) {
       const tmp = `${file}.${process.pid}.tmp`;

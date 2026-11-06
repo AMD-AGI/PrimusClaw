@@ -401,5 +401,20 @@ describe("the disconnect record", () => {
     const size = Buffer.byteLength(fs.readFileSync(path.join(dirs.state, "disconnects.jsonl"), "utf8"));
     assert.ok(size <= 128 * 1024, `size ${size}`);
     assert.match(recentDisconnects(dirs, 1)[0]?.detail ?? "", /^699 /);
+    // Every record kept is a whole one, and the newer half survives: right after a trim nothing recent is lost.
+    const kept = recentDisconnects(dirs, 10_000);
+    assert.ok(kept.length > 200, `kept ${kept.length}`);
+    const nums = kept.map((k) => Number(k.detail?.split(" ")[0]));
+    assert.deepEqual(nums, nums.map((_, i) => nums[0]! + i), "contiguous, oldest first");
+    let trimmedAt = -1;
+    const fresh = ctx(tmpdir()).c.dirs;
+    for (let i = 0; i < 700 && trimmedAt < 0; i++) {
+      recordDisconnect(fresh, { reason: "stream_lost", detail: `${i} ${"x".repeat(200)}` });
+      if (recentDisconnects(fresh, 10_000).length < i + 1) trimmedAt = i;
+    }
+    assert.ok(trimmedAt > 0, "a trim happened");
+    const after = recentDisconnects(fresh, 10_000);
+    assert.ok(after.length >= trimmedAt / 2 - 1, `kept ${after.length} of ${trimmedAt + 1}`);
+    assert.match(after.at(-1)?.detail ?? "", new RegExp(`^${trimmedAt} `), "the record that caused the trim is kept");
   });
 });
