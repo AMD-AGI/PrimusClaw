@@ -125,7 +125,8 @@ Name a work item to the user by its number and title, as in #12 修复登录超�
  * searched again in other words before an answer or a question, and a failed lookup answered by another read or said plainly,
  * never turned into a work item.
  * router-read-v6: v5, and where a GitHub binding counts (`CLAW_GITHUB_MCP_BINDING_ENABLED`) a user without GitHub tools is told the one
- * step that connects it (`/github bind`), not only that it is not linked.
+ * step that connects it (`/github bind`), not only that it is not linked; worded so that a bound user whose binding could not be read
+ * (the identity provider down: the turn then has no GitHub tools either) is not told that they never connected it.
  */
 export const ROUTER_READ_PROMPT_VERSION = "router-read-v6";
 
@@ -157,7 +158,7 @@ const GITHUB_SEARCH = "mcp__github__issue_search finds pull requests and issues 
 /** The GitHub line of the read section: the reads the turn has, by their full names. */
 function githubLookups(tools: readonly string[], binding = false): string {
   if (!tools.length && binding) {
-    return "- GitHub: no GitHub tools in this conversation: the user has not connected GitHub yet. For a question about their GitHub, say in one line that they connect it once by sending /github bind to Clawy in Teams (or by keeping a GH_TOKEN in their Claw settings) and then ask again; never that you cannot use GitHub. A public page can still be read with web_fetch.";
+    return "- GitHub: no GitHub tools in this conversation: the user has not connected GitHub yet, or their connection could not be read just now. For a question about their GitHub, say in one line that their GitHub is not connected here or could not be read just now, and that if they have not connected it they do so once by sending /github bind to Clawy in Teams (or by keeping a GH_TOKEN in their Claw settings) and then ask again; never that you cannot use GitHub. A public page can still be read with web_fetch.";
   }
   if (!tools.length) {
     return "- GitHub: no GitHub tools in this conversation (the user may not have linked a GitHub token in their Claw settings). For a question about their GitHub, say that in one line; a public page can still be read with web_fetch.";

@@ -283,10 +283,14 @@ describe("D8 configuration and the router's words", () => {
     assert.deepEqual(githubMcpConfigErrors({ ...on, binding: false }), [], "without the binding nothing more is needed");
   });
 
-  test("D8b a router turn without GitHub tools names /github bind where a binding counts, and says what it said before where not", () => {
+  test("D8b a router turn without GitHub tools names /github bind where a binding counts (never as a fact to a user whose binding could not be read), and says what it said before where not", () => {
     const withBinding = renderRouterReadSection({ servers: [], github: [], githubBinding: true });
     assert.match(withBinding, /\/github bind/);
     assert.doesNotMatch(withBinding, /may not have linked a GitHub token/);
+    // The turn has no GitHub tools either when the identity provider could not be asked (githubMcpServers offers none then): a bound
+    // user is not told as a fact that they never connected GitHub.
+    assert.match(withBinding, /could not be read just now/);
+    assert.match(withBinding, /if they have not connected it/);
     const without = renderRouterReadSection({ servers: [], github: [] });
     assert.doesNotMatch(without, /\/github bind/);
     assert.match(without, /may not have linked a GitHub token/);
