@@ -403,34 +403,38 @@ export const CAPABILITY_DENIAL = new RegExp([
   "\\bI have no (?:access|internet|web access|tools?)\\b",
 ].join("|"), "i");
 
-/** The systems a denial can name, and the tools that reach each (a failed call of one of them can make the denial true). */
-const DENIED_SYSTEMS: ReadonlyArray<[RegExp, RegExp]> = [
-  [/github|\bgh\b|pull request|\bPRs?\b|仓库|代码库/i, /^(mcp__github__|bash$)/i],
-  [/联网|上网|互联网|网页|网站|internet|\bweb\b|browse|online/i, /^(web_search|web_fetch)$/],
-  [/safe|workloads?|workspaces?|集群|cluster|节点|\bnodes?\b/i, /^mcp__safe__/],
-  [/dispatron|计划|\bplans?\b/i, /^mcp__dispatron__/],
-  [/autopilot/i, /^mcp__autopilot__/],
-  [/pulse|leaderboard|排行/i, /^mcp__pulse__/],
-  [/看板|\bboard\b|\bissues?\b/i, /^mcp__agent-board__/],
+/**
+ * The systems a denial can name, and which failed call reaches each: an MCP server's tool, Brain's web tools, or a shell command that
+ * itself went to GitHub (`gh`, `git`, a github.com address; a failed `python x.py` is not a failed GitHub call).
+ */
+const DENIED_SYSTEMS: ReadonlyArray<[RegExp, (c: ToolCall) => boolean]> = [
+  [/github|\bgh\b|pull request|\bPRs?\b|仓库|代码库/i, (c) => /^mcp__github__/.test(c.name)
+    || (/^bash$/i.test(c.name) && /(^|[\s;&|(])(gh|git)\s|github\.com/i.test(String(c.input?.command ?? "")))],
+  [/联网|上网|互联网|网页|网站|internet|\bweb\b|browse|online/i, (c) => /^(web_search|web_fetch)$/.test(c.name)],
+  [/safe|workloads?|workspaces?|集群|cluster|节点|\bnodes?\b/i, (c) => /^mcp__safe__/.test(c.name)],
+  [/dispatron|计划|\bplans?\b/i, (c) => /^mcp__dispatron__/.test(c.name)],
+  [/autopilot/i, (c) => /^mcp__autopilot__/.test(c.name)],
+  [/pulse|leaderboard|排行/i, (c) => /^mcp__pulse__/.test(c.name)],
+  [/看板|\bboard\b|\bissues?\b/i, (c) => /^mcp__agent-board__/.test(c.name)],
 ];
 
 /**
- * Whether the denial at `at` in `final` may be true: a call of the turn failed, and when the denial's sentence names a system (GitHub,
- * the web, SaFE, ...), it was a call to that system. A denial that names none is taken as being about whichever call failed. A failure
- * of one system never excuses denying another ("I cannot access SaFE" after only a Dispatron call failed).
+ * Every denial in `final` that the turn's calls do not make true, as the words that said it ([] when there is none). A denial may
+ * be true only when a call of the turn failed; when its sentence names systems (GitHub, the web, SaFE, ...), each one it names
+ * needs a failed call of its own, so a failure of one system never excuses denying another; a denial that names none is taken as
+ * being about whichever call failed. Every denial is checked, not only the first.
  */
-export function denialJustified(final: string, at: number, calls: readonly ToolCall[]): boolean {
+export function falseDenials(final: string, calls: readonly ToolCall[]): string[] {
   const failed = calls.filter((x) => x.ok === false);
-  if (!failed.length) return false;
-  const stops = /[。！？!?\n]|\.(\s|$)/g;
-  let start = 0, end = final.length;
-  for (const s of final.matchAll(stops)) {
-    if (s.index! < at) start = s.index! + s[0].length;
-    else { end = s.index!; break; }
+  const sentences = [...final.matchAll(/[^。！？!?\n]+?(?:[。！？!?\n]|\.(?=\s|$)|$)/g)].map((m) => ({ at: m.index!, text: m[0] }));
+  const out: string[] = [];
+  for (const m of final.matchAll(new RegExp(CAPABILITY_DENIAL.source, "gi"))) {
+    const sentence = sentences.find((x) => m.index! >= x.at && m.index! < x.at + x.text.length)?.text ?? final;
+    const named = DENIED_SYSTEMS.filter(([words]) => words.test(sentence)).map(([, reaches]) => reaches);
+    const justified = failed.length > 0 && (named.length === 0 || named.every((reaches) => failed.some(reaches)));
+    if (!justified) out.push(m[0]);
   }
-  const sentence = final.slice(start, end);
-  const named = DENIED_SYSTEMS.filter(([words]) => words.test(sentence)).map(([, tools]) => tools);
-  return !named.length || failed.some((x) => named.some((tools) => tools.test(x.name)));
+  return out;
 }
 
 /** With `style.no_ids`: an item named only by its number ("编号 #178", "#178。") rather than by its title. */
@@ -602,9 +606,8 @@ export function grade(c: EvalCase, o: Observed): Check[] {
   }
   if (!c.may_deny) {
     // A denial can be true when a call to what it denies failed in the turn; any other denial is the failure this rule is for.
-    const m = CAPABILITY_DENIAL.exec(o.final);
-    const justified = m !== null && denialJustified(o.final, m.index, o.calls);
-    out.push({ name: "no false denial", pass: m === null || justified, detail: m ? `${m[0]}${justified ? " (after a failed call to it)" : ""}` : undefined });
+    const unjustified = falseDenials(o.final, o.calls);
+    out.push({ name: "no false denial", pass: unjustified.length === 0, detail: unjustified[0] });
   }
   if (c.style?.no_ids) {
     const m = BARE_NUMBER.exec(shownText);

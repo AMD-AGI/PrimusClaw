@@ -400,6 +400,15 @@ test("S16 no false denial of a capability", () => {
   for (const text of ["node-7 无法访问，已经离线 2 小时。", "没有找到失败的运行。", "我查到 3 个开着的 PR。", "I don't see any failed runs today.", "The node cannot reach the registry."]) {
     assert.ok(!denied(text), text);
   }
+  // A failed shell command excuses a GitHub denial only when it went to GitHub itself.
+  const bash = (command: string): ToolCall => ({ ...call("bash", false), input: { command } });
+  assert.ok(denied("I can't access GitHub.", [bash("python missing.py")]));
+  assert.ok(!denied("I can't access GitHub.", [bash("gh pr list --author @me")]));
+  assert.ok(!denied("我无法访问 GitHub。", [bash("cd repo && git fetch origin")]));
+  // Every denial is checked, and a sentence that names two systems needs a failed call to each.
+  assert.ok(denied("I cannot access Dispatron. I cannot access SaFE.", [call("mcp__dispatron__get_runs", false)]));
+  assert.ok(!denied("I cannot access Dispatron. I cannot access SaFE.", [call("mcp__dispatron__get_runs", false), call("mcp__safe__node_list", false)]));
+  assert.ok(denied("我无法访问 SaFE 和 Dispatron。", [call("mcp__dispatron__get_runs", false)]));
   const check = grade(c, observed({ final: "我读不了 GitHub" })).find((x) => x.name === "no false denial");
   assert.equal(check?.detail, "我读不了");
 });
