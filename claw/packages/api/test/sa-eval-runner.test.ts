@@ -418,8 +418,10 @@ test("R5 baseline: the turn's end, what it showed, and its session", { timeout: 
   const base = await claw.start();
   claw.router = (_content, id, sessionId) => {
     const text = (t: string) => ({ type: "AssistantMessage", message_id: id, data: { content: [{ type: "text", text: t }] } });
-    // A sub-agent answers at once, the main agent only 1.5 s later: the user's first reply is the main agent's.
+    // A sub-agent answers at once, and the main agent writes an empty text block; its first words come only 1.5 s later: that
+    // is the user's first reply.
     claw.emit({ ...text("sub-agent notes"), subagent_id: "sub-1" }, Date.now(), sessionId);
+    claw.emit(text(""), Date.now(), sessionId);
     // The final answer is shown at 1.5 s; the turn's executionStats comes 2 s after it, its exec_complete 1.5 s after that.
     setTimeout(() => {
       claw.emit(text("Calling mcp__safe__node_list for you."), Date.now(), sessionId);
@@ -454,8 +456,10 @@ test("R5b baseline, two turns: what is graded of the last turn is its own", { ti
     const at = Date.now();
     if (content === "first") claw.emit({ type: "AssistantMessage", message_id: id, data: { content: [{ type: "text", text: "There are 3 nodes." }] } }, at, sessionId);
     else {
-      // The second turn shows nothing; the stream delivers the first turn's answer again (a reconnect) while it runs.
+      // The second turn shows nothing (a sub-agent's text is not shown); the stream delivers the first turn's answer again (a
+      // reconnect) while it runs.
       claw.emit({ type: "AssistantMessage", message_id: "msg-first", data: { content: [{ type: "text", text: "There are 3 nodes." }] } }, at, sessionId);
+      claw.emit({ type: "AssistantMessage", message_id: id, subagent_id: "sub-1", data: { content: [{ type: "text", text: "hidden notes" }] } }, at, sessionId);
     }
     claw.emit({ type: "executionStats", message_id: id }, at, sessionId);
     setTimeout(() => claw.emit({ type: "exec_complete", message_id: id, final_text: "" }, Date.now(), sessionId), 200);
@@ -465,7 +469,7 @@ test("R5b baseline, two turns: what is graded of the last turn is its own", { ti
   const run = await r.done;
   await claw.stop();
   try {
-    assert.match(run.out, /FAIL t-base-004#1 .*answered/, "the last turn answered nothing: an earlier turn's answer is not its");
+    assert.match(run.out, /FAIL t-base-004#1 .*answered/, "the last turn answered nothing: an earlier turn's answer, or a sub-agent's text, is not its");
     assert.match(run.out, /FAIL t-base-004#1 .*first reply <= 5s/, "nor is another turn's message its first reply");
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });
@@ -474,6 +478,8 @@ test("R6 a turn with no end on the stream", { timeout: 120_000 }, async () => {
   const claw = new FakeClaw();
   const base = await claw.start();
   claw.router = (content, id) => {
+    // executionStats on the stream, but its exec_complete is never stored: not over.
+    if (content === "stats only") claw.emit({ type: "executionStats", message_id: id });
     if (content === "slow first") {
       // Over 3 s after its message, past EVAL_TURN_WAIT_S=2, though before a wait counted from the case's last message ends.
       setTimeout(() => { claw.emit({ type: "executionStats", message_id: id }); claw.emit({ type: "exec_complete", message_id: id, final_text: "first" }); }, 3_000);
@@ -492,7 +498,8 @@ test("R6 a turn with no end on the stream", { timeout: 120_000 }, async () => {
   };
   const turnCase = (id: string, user: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user }] });
   const r = runner(base, [turnCase("t-silent-001", "silent"), turnCase("t-poison-001", "poisoned"), turnCase("t-late-001", "late"),
-    { ...turnCase("t-twoturn-001", "slow first"), turns: [{ user: "slow first" }, { user: "quick second", after_ms: 2_500 }] }], { EVAL_TURN_WAIT_S: "2" });
+    { ...turnCase("t-twoturn-001", "slow first"), turns: [{ user: "slow first" }, { user: "quick second", after_ms: 2_500 }] },
+    turnCase("t-stats-001", "stats only")], { EVAL_TURN_WAIT_S: "2" });
   const run = await r.done;
   await claw.stop();
   try {
@@ -501,7 +508,8 @@ test("R6 a turn with no end on the stream", { timeout: 120_000 }, async () => {
     assert.match(run.out, /ERROR t-late-001#1 .*no end of the turn of msg-3 within 2 s of its message: not graded/, "a turn over after the wait is not graded");
     assert.match(run.out, /ERROR t-twoturn-001#1 .*no end of the turn of msg-4 within 2 s of its message: not graded/, "each turn has its own wait");
     assert.equal(run.code, 1, "an attempt that could not be graded fails the run");
-    assert.match(run.out, /cleanup: turns of the run still running at its end \(what they start is not closed\): msg-1/, "the silent turn is reported");
+    assert.match(run.out, /ERROR t-stats-001#1 .*no end of the turn of msg-6 within 2 s of its message: not graded/, "executionStats alone is not the end");
+    assert.match(run.out, /cleanup: turns of the run still running at its end \(what they start is not closed\): msg-1,msg-6\n/, "the turns still running are named by the stored events");
     assert.deepEqual(claw.calls.filter((c) => c.startsWith("DELETE")), ["DELETE /v1/sessions/asst-1"]);
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });

@@ -622,8 +622,9 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
   const streamedBy = (k: number) => (): boolean => (mids[k] ? turnEnded(stream.events, mids[k]!) : endedTurns(stream.events).length >= k + 1);
   // A reply is the main agent's message in that turn: a sub-agent's is not shown to the user, and would make a slow reply
   // look on time; another turn's (a message the stream delivered again after a reconnect) is not this turn's.
+  // A message with no text shows nothing.
   const repliesOf = (k: number): LiveEvent[] => stream.events.filter((e) => e.data?.type === "AssistantMessage" && !e.data.subagent_id
-    && (mids[k] ? e.data.message_id === mids[k] : e.at >= sentAt[k]! && !mids.includes(idOf(e.data.message_id))));
+    && messagesOf([e]).length > 0 && (mids[k] ? e.data.message_id === mids[k] : e.at >= sentAt[k]! && !mids.includes(idOf(e.data.message_id))));
   try {
     await stream.open();
     // The cases only read: every approval is denied, so a turn waiting on one does not hang the run. One that has not ended
@@ -656,14 +657,17 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
     await sleep(3_000);
     const rows = await replay(sessionId);
     const all = traceOf(rows);
-    const lastMid = turns.length > 1 ? mids.at(-1) : null;   // a single-turn case: every event is the last turn's
-    const lastTrace = lastMid ? traceOf(rows, lastMid) : all;
     const last = turns.length - 1;
+    const lastMid = mids[last];
+    const lastTrace = lastMid ? traceOf(rows, lastMid) : all;
     // What the user was shown: the main agent's messages as they streamed (a turn's end on a stream carries no text). The
     // final answer is the last turn's own, shown with its last message, which can be well before the turn's end (the
-    // workspace sync follows it); a last turn that showed nothing has no final answer, whatever an earlier turn said.
+    // workspace sync follows it). Without one streamed, it is the main agent's final text its stored exec_complete has; never
+    // a sub-agent's, nor an earlier turn's.
     const lastReplies = repliesOf(last);
-    const finalText = lastReplies.length ? messagesOf(lastReplies).at(-1) ?? "" : String(lastTrace.final || "");
+    const storedFinal = rows.filter((r) => (r.data?.type ?? r.event_type) === "exec_complete" && !r.data?.subagent_id
+      && (!lastMid || r.data?.message_id === lastMid)).at(-1)?.data?.final_text;
+    const finalText = lastReplies.length ? messagesOf(lastReplies).at(-1) ?? "" : (typeof storedFinal === "string" ? storedFinal : "");
     const shown = messagesOf(stream.events);
     const firstText = turns.map((_, k) => repliesOf(k)[0]?.at ?? null);
     const observed: Observed = {
@@ -826,8 +830,12 @@ async function main(): Promise<void> {
           // their calls answered for as the run's, whatever stopped the run.
           const over = await turnsOver(sessionId, (stored) => RUN_MESSAGES.every((id) => stored.includes(id)),
             () => RUN_MESSAGES.every((id) => turnEnded(stream!.events, id)), Date.now() + Math.min(60_000, turnWaitMs(true)), until);
-          // What a turn still running starts later is not seen, and not closed: a person must look.
-          if (!over) cleanupFailed.push(`turns of the run still running at its end (what they start is not closed): ${RUN_MESSAGES.filter((id) => !turnEnded(stream!.events, id)).join(",")}`);
+          // What a turn still running starts later is not seen, and not closed: a person must look. Named by the stored events,
+          // which are what says a turn is over.
+          if (!over) {
+            const stored = storedTurnEnds(await replay(sessionId).catch(() => []));
+            cleanupFailed.push(`turns of the run still running at its end (what they start is not closed): ${RUN_MESSAGES.filter((id) => !stored.includes(id)).join(",") || "(the stored events could not be read)"}`);
+          }
           const above = (await board()).filter((x) => x.seq > floorAtStart);
           for (const i of itemsStartedBy(turnCalls(stream.events, RUN_MESSAGES), above)) RUN_ITEMS.add(i.item_id);
         }
