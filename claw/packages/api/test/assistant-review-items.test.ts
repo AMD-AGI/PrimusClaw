@@ -407,6 +407,23 @@ describe("assistant review items", { skip }, () => {
     assert.equal(await count("claw_pending_messages"), 1);
   }));
 
+  test("V6c a queued review restarted once a slot is free starts as any restart does, and holds its slot", () => withHourlyRoom(async () => {
+    await w.user("alice");
+    for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);
+    const running = await one("alice");
+    const waiting = (await start("alice", { prs: [PR(301)] })).body.data.items[0];
+    assert.equal(waiting.queued?.reason, "too_many_active_items");
+    const { stopWorkItem } = await import("../src/assistant/work-items.js");
+    assert.equal((await stopWorkItem({ userId: "alice", itemId: running.item_id, source: "user" })).status, "ok");
+    const alice = { userId: "alice", userName: "Name alice", platformKey: "pk-alice", virtualKey: "vk-alice", roles: ["default"] };
+    const again = await ri.restartReview(alice, "identity_token", waiting.item_id, ri.parseRestartRequest({}));
+    assert.equal(again.item.queued, undefined, "it fit, so it started");
+    assert.equal((await w.item(again.item.item_id)).params.queued, undefined, "and the new item is not marked as waiting");
+    assert.equal(await count("claw_pending_messages", `session_id = '${again.item.session_id}'`), 1, "its first message is queued");
+    // It holds the slot it took: the next review waits.
+    assert.equal((await start("alice", { prs: [PR(302)] })).body.data.items[0].queued?.reason, "too_many_active_items");
+  }));
+
   test("V7 GitHub is asked first: a pull request it refuses, or an outage, makes nothing", async () => {
     checkAnswer = (pr) => pr.number === 2
       ? { isError: true, body: { status: "refused", reason: "github_not_found", message: "Not Found" } }

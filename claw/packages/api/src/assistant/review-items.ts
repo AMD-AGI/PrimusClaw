@@ -900,7 +900,8 @@ export async function restartReview(
     choice ? choice.model : "model" in change ? change.model : was.model, "effort" in change ? change.effort : was.effort, mergeNeedsConfirmation);
   // The old words are sent again only if they still say what is asked: a review that now merges, or now does not, gets new ones.
   const brief = change.message ?? (reviewOnly === was.review_only ? was.brief : defaultBrief(was.pr, reviewOnly));
-  const { halted: _halted, ...kept } = was;
+  // (a restart is made as any start is: neither why the old one was halted nor that it waited for a slot carries over)
+  const { halted: _halted, queued: _queued, ...kept } = was;
   const plan: Planned = {
     pr: was.pr, sessionId: randomUUID(), attended: checked.attended,
     config: requestedBy ? asRequested(checked.config, { user_id: requestedBy, label: was.requester_label ?? requestedBy }) : checked.config,
