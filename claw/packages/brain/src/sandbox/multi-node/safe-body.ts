@@ -562,6 +562,10 @@ export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string,
 /** Router Service port. SaFE rejects any other Atom targetPort. */
 export const ATOM_ROUTER_PORT = 8000;
 
+/** Engine HTTP ports SaFE assigns to the prefill and decode Services. */
+export const PD_ENGINE_PREFILL_PORT = 8010;
+export const PD_ENGINE_DECODE_PORT = 8020;
+
 /** Mooncake bootstrap ports published on the prefill and decode Services. */
 const ATOM_PREFILL_BOOTSTRAP_PORT = 8998;
 const ATOM_DECODE_BOOTSTRAP_PORT = 9098;

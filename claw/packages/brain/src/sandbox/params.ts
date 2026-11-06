@@ -182,6 +182,9 @@ export function applyMultiNodeExternalEnv(
   // The handoff file is the contract; its content and the files it points at are
   // written once the sandbox is healthy (see `buildTopologyHandoff`).
   env.TOPOLOGY_HANDOFF_FILE = TOPOLOGY_HANDOFF_PATH;
+  // Engine URLs are not part of the handoff file; Hyperloom reads them from the env.
+  if (ctx.prefillUrl) env.HYPERLOOM_MN_EXT_PREFILL_URL = ctx.prefillUrl;
+  if (ctx.decodeUrl) env.HYPERLOOM_MN_EXT_DECODE_URL = ctx.decodeUrl;
 
   if (!(opts.legacyTopologyEnv ?? LEGACY_TOPOLOGY_ENV)) return;
 

@@ -79,6 +79,26 @@ test("sglangrouter env points at the router and does not hand over an SSH contro
   assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, undefined);
 });
 
+test("sglangrouter env carries the prefill and decode engine URLs with or without legacy env", () => {
+  const ctx: MultiNodeContext = {
+    backend: "sglangrouter",
+    provider: "safe",
+    name: "msg1",
+    namespace: "test-workspace",
+    nodeCount: 2,
+    gpusPerNode: 8,
+    serviceUrl: "http://msg1.test-workspace.svc.cluster.local:8000",
+    prefillUrl: "http://msg1-prefill.test-workspace.svc.cluster.local:8010",
+    decodeUrl: "http://msg1-decode.test-workspace.svc.cluster.local:8020",
+  };
+  for (const legacyTopologyEnv of [true, false]) {
+    const env: Record<string, string> = {};
+    applyMultiNodeExternalEnv(env, ctx, { legacyTopologyEnv });
+    assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_URL, ctx.prefillUrl);
+    assert.equal(env.HYPERLOOM_MN_EXT_DECODE_URL, ctx.decodeUrl);
+  }
+});
+
 test("atom env points at the router and does not hand over an SSH control plane", () => {
   const env: Record<string, string> = { SAFE_API_URL: "https://safe.example" };
   const ctx: MultiNodeContext = {
