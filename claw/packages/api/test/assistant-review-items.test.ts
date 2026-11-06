@@ -407,6 +407,22 @@ describe("assistant review items", { skip }, () => {
     assert.equal(await count("claw_pending_messages"), 1);
   }));
 
+  test("V6d a queued review its owner writes into while it waits ran: it stops waiting, gets no server message, and is not halted", () => withHourlyRoom(async () => {
+    await w.user("alice");
+    for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);
+    await one("alice");
+    const waiting = (await start("alice", { prs: [PR(301)] })).body.data.items[0];
+    assert.equal(waiting.queued?.reason, "too_many_active_items");
+    const run = await w.openRun(waiting.session_id);   // (the owner's own message into the session they hold the id of)
+    await ri.startQueuedReviews();
+    const item = await w.item(waiting.item_id);
+    assert.deepEqual([item.params.queued, item.params.halted], [undefined, undefined]);
+    assert.equal(await count("claw_pending_messages", `session_id = '${waiting.session_id}'`), 0, "no first message of the server's on top");
+    await w.closeRun(run.taskId, "completed");
+    // It holds its slot now: the next review waits.
+    assert.equal((await start("alice", { prs: [PR(302)] })).body.data.items[0].queued?.reason, "too_many_active_items");
+  }));
+
   test("V6c a queued review restarted once a slot is free starts as any restart does, and holds its slot", () => withHourlyRoom(async () => {
     await w.user("alice");
     for (let i = 0; i < 3; i++) await w.createItem(await w.user("alice"), `task ${i}`);

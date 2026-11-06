@@ -1451,12 +1451,33 @@ async function startQueuedOf(owner: string): Promise<Array<{ itemId: string; ses
       const params = readParams(row);
       if (!params) continue;
       const by = params.requested_by ?? null;
+      const itemId = row.item_id as string;
+      const sessionId = row.worker_session_id as string;
+      // The owner can write into their own review's session while it waits (its id is theirs): that ran it, as their own message runs
+      // any session of theirs. It no longer waits, takes its slot, and gets no first message of the server's on top of the owner's.
+      const ran = Number(((await query(
+        `SELECT (SELECT COUNT(*) FROM claw_tasks WHERE session_id = $1) + (SELECT COUNT(*) FROM claw_pending_messages WHERE session_id = $1) AS n`,
+        [sessionId],
+      )).rows[0] as { n: number | string }).n) > 0;
+      if (ran) {
+        await query("UPDATE claw_work_items SET params = params - 'queued', updated_at = NOW() WHERE item_id = $1", [itemId]);
+        await query(
+          "INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary) SELECT item_id, 'progress', 'user', generation, 'started by its owner while it waited' FROM claw_work_items WHERE item_id = $1",
+          [itemId],
+        );
+        if (by) {
+          counts.others += 1;
+          perRequester.set(by, (perRequester.get(by) ?? 0) + 1);
+        } else {
+          counts.own += 1;
+        }
+        out.push({ itemId, sessionId, started: false });
+        continue;
+      }
       const fits = by
         ? counts.others < limits.othersMaxActive && (perRequester.get(by) ?? 0) < limits.perRequesterMaxActive
         : counts.own < CLAW_ASSISTANT_MAX_ACTIVE_ITEMS;
       if (!fits) continue;   // (one of another kind, or of another requester, may still fit)
-      const itemId = row.item_id as string;
-      const sessionId = row.worker_session_id as string;
       const proof = await proofForQueuedFirstMessage(q, sessionId);
       const sent = proof ? await queueServerMessage(q, {
         sessionId, userId: owner, content: firstMessage({ pr: params.pr, sessionId, config: {}, attended: proof, params }),
