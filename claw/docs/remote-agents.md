@@ -174,11 +174,29 @@ connector replaces the older, which receives `event: superseded` and ends. When 
 connector is revoked its stream receives `event: revoked` and ends, and every
 connector-side route answers `401 revoked`.
 
+**Presence over time.** Every 15 s one API replica (an advisory lock picks it) compares
+each connector with the presence it last recorded and writes every change it sees to
+`claw_remote_connector_transitions`. `GET /v1/remote-agents/connectors` gives each
+connector `last_seen_at` (its last heartbeat or stream activity) and, while offline,
+`offline_since` (when it was last seen before it went) and `offline_reason`:
+`auth_expired` when the server ended its last stream because its token expired or its
+grant was revoked, `no_heartbeat` otherwise.
+
+When the assistant is on, a connector that stays offline for 5 minutes, counted from when
+the sweep first found it offline, is reported once to its owner through their assistant:
+when it was last seen, why it went, and the command that brings it back
+(`claw-connector run`, after `claw-connector login` when its sign-in ran out). When it
+comes back after that, the owner is told once that it has. Short breaks (a Claw release
+cuts every stream for a few seconds) and a Claw outage (the sweep is down with it) are
+never reported. Nothing is said about a connector its owner revoked, one replaced by an
+online connector of the same name, or one that was already offline when presence was
+first recorded for it. Transitions are kept as long as closed sessions are (Retention).
+
 ## User side
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/remote-agents/connectors` | The caller's connectors, with `online` and their agents. |
+| `GET /v1/remote-agents/connectors` | The caller's connectors, with `online`, `last_seen_at`, `offline_since`, `offline_reason` and their agents. |
 | `DELETE .../connectors/:cid` | Revoke: closes its sessions, drops its queued commands. |
 | `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?, resume_ref?}`. `409 connector_offline` unless online. |
 | `GET .../sessions`, `GET .../sessions/:id` | List, and read one with `connector_online`. |
@@ -232,7 +250,8 @@ press (never run at once); any other ref or action is refused.
 
 A closed session is deleted with all of its events `CLAW_REMOTE_AGENTS_RETENTION_DAYS`
 days (default 30) after it closed; each API replica checks hourly. Zero or less keeps
-them for ever. Live sessions are never deleted, and neither is the audit trail.
+them for ever. Live sessions are never deleted, and neither is the audit trail. Presence
+transitions older than the same number of days go in the same sweep.
 
 ## Audit
 
