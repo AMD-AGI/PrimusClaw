@@ -37,7 +37,7 @@ import { redactPublicJson } from "../events/redaction.js";
 import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
-import { noteRemoteEvents, noteRemotePrompt } from "../assistant/remote-items.js";
+import { noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
 const logger = pino({ name: "remote-agents" });
 
@@ -428,6 +428,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const payload = type === "decision"
       ? { ...parsed.value, by: owner, client: clientLabel(req) }
       : parsed.value;
+    const since = type === "prompt" ? await remoteEventMark(sessionId).catch(() => undefined) : undefined;
     const out = await store.issueCommand({
       owner, client: clientLabel(req), connectorId: session.connector_id, agentId: session.agent_id, sessionId,
       type, cmdId, payload, auditDetail: spec.audit(parsed.value), closesSession: spec.closesSession, commandsPerMinute,
@@ -439,13 +440,14 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       if (!same) return fail(reply, 409, type === "decision" ? "already_decided" : "idempotency_key_reused");
       return reply.send({ ok: true, data: { cmd_id: cmdId, duplicate: true } });
     }
-    waker.wake(`c:${session.connector_id}`);
     // A prompt typed into an attached chat is an item the assistant can name ("did it finish?"), told to nobody: the chat shows it.
     if (type === "prompt") {
       await noteRemotePrompt({
         owner, sessionId, connectorId: session.connector_id, agentId: session.agent_id, text: (parsed.value as { text: string }).text, origin: "chat",
+        since,
       }).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "remote_agents.item_note_failed"));
     }
+    waker.wake(`c:${session.connector_id}`);
     return reply.status(202).send({
       ok: true, data: { cmd_id: cmdId, cmd_seq: Number(out.row.cmd_seq), connector_online: !!connector.online },
     });

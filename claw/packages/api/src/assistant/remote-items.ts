@@ -123,6 +123,18 @@ export interface NotePrompt {
   origin: RemoteOrigin;
   /** The language the user asked in; the instruction's own when not given. */
   lang?: RemoteLang;
+  /**
+   * The session's newest event before the prompt was queued (`remoteEventMark`): what the session posts after it is this prompt's,
+   * even when it reached Claw before this note did (the connector may run a short turn, or refuse the prompt, that fast). Not
+   * known: the newest event now.
+   */
+  since?: number;
+}
+
+/** The newest event a remote session has posted so far: taken before a prompt is queued, as its `NotePrompt.since`. */
+export async function remoteEventMark(sessionId: string): Promise<number> {
+  if (!remoteItemsOn()) return 0;
+  return Number((await db.query("SELECT COALESCE(MAX(id), 0) AS id FROM claw_remote_events WHERE session_id = $1", [sessionId])).rows[0].id);
 }
 
 /**
@@ -133,6 +145,13 @@ export interface NotePrompt {
  */
 export async function noteRemotePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number } | null> {
   if (!remoteItemsOn()) return null;
+  const noted = await notePrompt(p);
+  // What the session posted between the prompt being queued and this note found no item open for it: it is applied now.
+  if (noted) await noteRemoteEvents(p.owner, [p.sessionId]);
+  return noted;
+}
+
+async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number } | null> {
   return inTransaction(async (q) => {
     const assistant = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [p.owner])).rows[0];
     if (!assistant) return null;
@@ -147,11 +166,11 @@ export async function noteRemotePrompt(p: NotePrompt): Promise<{ itemId: string;
       "SELECT item_id, seq, board_state, params FROM claw_work_items WHERE worker_session_id = $1 AND user_id = $2 FOR UPDATE",
       [worker, p.owner],
     )).rows[0] as { item_id: string; seq: number; board_state: string; params: RemoteParams } | undefined;
+    // What the session said before this prompt was queued (a conversation taken over replays its history) is not this prompt's.
+    const last = p.since !== undefined ? Math.max(0, Number(p.since) || 0) : Number((await q(
+      "SELECT COALESCE(MAX(id), 0) AS id FROM claw_remote_events WHERE session_id = $1", [p.sessionId],
+    )).rows[0].id);
     if (!open) {
-      // What the session said before its first prompt (a conversation taken over replays its history) is not this item's.
-      const last = Number((await q(
-        "SELECT COALESCE(MAX(id), 0) AS id FROM claw_remote_events WHERE session_id = $1", [p.sessionId],
-      )).rows[0].id);
       const params: RemoteParams = {
         connector_id: p.connectorId, session_id: p.sessionId, agent_id: p.agentId, machine, asked, origin: p.origin, lang,
         open_turns: 1, waiting: [], last_event_id: last,
@@ -174,7 +193,11 @@ export async function noteRemotePrompt(p: NotePrompt): Promise<{ itemId: string;
     }
     // An item that ended is opened again for the next instruction; one under way counts one more.
     const turns = open.board_state === "done" ? 1 : Math.max(0, Number(open.params?.open_turns) || 0) + 1;
-    const patch = { asked, origin: p.origin, lang, open_turns: turns, ...(open.board_state === "done" ? { waiting: [] } : {}) };
+    // An item that ended skipped what the session posted since; from this prompt on, that is the new instruction's.
+    const patch = {
+      asked, origin: p.origin, lang, open_turns: turns,
+      ...(open.board_state === "done" ? { waiting: [], last_event_id: last } : {}),
+    };
     await q(
       `UPDATE claw_work_items
           SET board_state = CASE WHEN board_state = 'needs_you' THEN 'needs_you' ELSE 'in_progress' END,

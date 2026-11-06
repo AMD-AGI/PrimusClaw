@@ -24,6 +24,8 @@
  *   F7  every prompt sent ends, though not every one gets a turn_end: a cancel (one turn_end, its queued prompts dropped) closes the
  *       item; a prompt the connector refused before queueing it is one fewer; one refused at its start (refusal and turn_end) is one
  *   F8  the item's stop button (`POST /v1/work-items/:id/stop`) cancels the agent's turn on the machine, as work_stop does
+ *   F9  what the session posts after a prompt is queued is that prompt's, even when it reaches Claw before the prompt's item is
+ *       written: a first prompt's item, and a finished item reopened, both end with it
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -414,6 +416,30 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).outcome], ["done", "stopped"]);
     assert.deepEqual((await queued(cid)).map((c: Recorded) => c.type), ["session.new", "prompt", "cancel"]);
+  });
+
+  test("F9 a turn that ended before its prompt's item was written still ends the item", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const sid = await chatSession("alice", cid);
+    await events("alice", cid, sid, [chunk("history"), end()]);
+    const note = (text: string, since: number) =>
+      items.noteRemotePrompt({ owner: "alice", sessionId: sid, connectorId: cid, agentId: "claude", text, origin: "chat", since });
+
+    // The prompt is queued, the connector answers at once, and only then is the item written.
+    let since = await items.remoteEventMark(sid);
+    await events("alice", cid, sid, [chunk("fast answer"), end()]);
+    await note("quick one", since);
+    let item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.summary, item.params.open_turns], ["done", "fast answer", 0]);
+
+    // The same for the next prompt, on the item that had ended: it is reopened and ended by what came first.
+    since = await items.remoteEventMark(sid);
+    await events("alice", cid, sid, [chunk("second answer"), end()]);
+    assert.equal((await remoteItem(sid)).summary, "fast answer", "an ended item does not take a turn it was not open for");
+    await note("next one", since);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.summary, item.params.open_turns, item.title], ["done", "second answer", 0, "laptop claude: next one"]);
   });
 
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {
