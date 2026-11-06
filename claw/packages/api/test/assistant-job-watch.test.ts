@@ -249,9 +249,11 @@ describe("assistant job watches", { skip }, () => {
       { kind: "twice", url: "https://jobs.example/api/{id}/{id}", state: "s", ended: ["x"] },
       { kind: "svcid", url: "http://{id}.svc/api", state: "s", ended: ["x"] },
       { kind: "query", url: "https://jobs.example/api?run={id}", state: "s", ended: ["x"] },
+      { kind: "fragment", url: "https://jobs.example/api#{id}", state: "s", ended: ["x"] },
     ]));
     assert.deepEqual(parsed.sources.map((x) => x.kind), ["build", "own", "query"]);
-    assert.equal(parsed.errors.length, 11, parsed.errors.join("; "));
+    assert.equal(parsed.errors.length, 12, parsed.errors.join("; "));
+    assert.match(parsed.errors.at(-1)!, /^entry 14:/, "an id in the fragment is never sent");
     for (const kind of ["hostid", "subid", "portid", "userid", "twice", "svcid"]) {
       assert.ok(parsed.errors.some((e) => e.startsWith(`entry ${["build", "own", "leaky", "noid", "run", "creds", "noend", "hostid", "subid", "portid", "userid", "twice", "svcid", "query"].indexOf(kind)}:`)), kind);
     }

@@ -70,6 +70,8 @@ function keySafeUrl(raw: string): boolean {
   const at = raw.indexOf("{id}");
   if (at < 0 || raw.indexOf("{id}", at + 1) >= 0) return false;
   const prefix = raw.slice(0, at);
+  // In a fragment the id is never sent: every job would be read at the same address.
+  if (prefix.includes("#")) return false;
   let u: URL;
   try {
     u = new URL(raw.replace("{id}", "x"));
