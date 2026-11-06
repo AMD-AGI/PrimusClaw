@@ -99,14 +99,14 @@ test("trigger_create is still held for the user", async () => {
 });
 
 test("an operator's own policy still makes HITL_ENABLED ask about the other tools", async () => {
-  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { operatorPolicy: "board", decision: "allow" });
-  assert.deepEqual(r.asked, [`mcp__${TRIGGER_MCP_SERVER}__ping`], "HITL_ENABLED asks once an operator policy is in play");
+  const r = await run("mcp__scratch__ping", { operatorPolicy: "board", decision: "allow" });
+  assert.deepEqual(r.asked, ["mcp__scratch__ping"], "HITL_ENABLED asks once an operator policy is in play");
   assert.equal(r.ran, 1, "and the allowed call runs");
 });
 
 test("an operator's server that only shares the trigger server's name is still a policy", async () => {
-  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { operatorPolicy: TRIGGER_MCP_SERVER, trigger: false, decision: "allow" });
-  assert.deepEqual(r.asked, [`mcp__${TRIGGER_MCP_SERVER}__ping`], "known by name and path, not by name alone");
+  const r = await run("mcp__scratch__ping", { operatorPolicy: TRIGGER_MCP_SERVER, trigger: false, decision: "allow" });
+  assert.deepEqual(r.asked, ["mcp__scratch__ping"], "known by name and path, not by name alone");
   assert.equal(r.ran, 1);
 });
 
@@ -126,7 +126,7 @@ test("a GitHub write is still held for the user, and a released read runs", asyn
 });
 
 test("an operator's server named github at another path is still a policy", async () => {
-  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { operatorPolicy: GITHUB_MCP_SERVER, decision: "allow" });
-  assert.deepEqual(r.asked, [`mcp__${TRIGGER_MCP_SERVER}__ping`]);
+  const r = await run("mcp__scratch__ping", { operatorPolicy: GITHUB_MCP_SERVER, decision: "allow" });
+  assert.deepEqual(r.asked, ["mcp__scratch__ping"]);
   assert.equal(r.ran, 1);
 });
