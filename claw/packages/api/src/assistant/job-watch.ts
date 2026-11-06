@@ -61,6 +61,8 @@ export interface HttpJobSource {
 
 const KIND_RE = /^[a-z][a-z0-9_-]{1,31}$/;
 const PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/;
+/** A job state an HTTP kind may report ("running", "SUCCEEDED", "in-progress"): one short token, so it can carry no instruction. */
+const HTTP_STATE_RE = /^[A-Za-z0-9_.:-]{1,40}$/;
 
 /**
  * Whether a URL may carry a user's key: https, or plain http only inside the cluster (a `.svc` host); and the id (which the user
@@ -246,7 +248,8 @@ async function readHttpJob(source: HttpJobSource, id: string, key: string): Prom
   if (got.status === 401 || got.status === 403) return { kind: "error", code: `${source.kind}_refused_${got.status}` };
   if (got.status < 200 || got.status >= 300) return { kind: "error", code: `${source.kind}_http_${got.status}` };
   const state = pick(got.body, source.state);
-  if (typeof state !== "string" || !state) return { kind: "error", code: `${source.kind}_unreadable` };
+  // The state reaches the router's turn, which may still act: only a state's name (one token), never text the job's API words freely.
+  if (typeof state !== "string" || !HTTP_STATE_RE.test(state)) return { kind: "error", code: `${source.kind}_unreadable` };
   const detail = pick(got.body, source.detail);
   const owner = pick(got.body, source.owner);
   return {
