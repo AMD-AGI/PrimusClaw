@@ -62,11 +62,18 @@ export interface HttpJobSource {
 const KIND_RE = /^[a-z][a-z0-9_-]{1,31}$/;
 const PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 
-/** Whether a URL may carry a user's key: https, or plain http only inside the cluster (a `.svc` host). */
+/**
+ * Whether a URL may carry a user's key: https, or plain http only inside the cluster (a `.svc` host); and the id (which the user
+ * chooses) stands once, in the path or the query, after a fixed origin, so no id can send the key to a host of its choosing.
+ */
 function keySafeUrl(raw: string): boolean {
+  const at = raw.indexOf("{id}");
+  if (at < 0 || raw.indexOf("{id}", at + 1) >= 0) return false;
+  const prefix = raw.slice(0, at);
   let u: URL;
   try {
     u = new URL(raw.replace("{id}", "x"));
+    if (!prefix.startsWith(`${new URL(`${prefix}x`).origin}/`) || !prefix.startsWith(`${u.origin}/`)) return false;
   } catch {
     return false;
   }
@@ -96,7 +103,7 @@ export function parseJobHttpSources(raw: string): { sources: HttpJobSource[]; er
     const why = !KIND_RE.test(kind) ? "kind must be a short lowercase name"
       : (JOB_SOURCES as readonly string[]).includes(kind) || sources.some((s) => s.kind === kind) ? `kind ${kind} is taken`
       : typeof e.url !== "string" || !e.url.includes("{id}") ? "url must name the job with {id}"
-      : !keySafeUrl(e.url) ? "url must be https, or http to an in-cluster .svc host: it carries the user's key"
+      : !keySafeUrl(e.url) ? "url must be https, or http to an in-cluster .svc host, with {id} once after its host: it carries the user's key"
       : typeof e.state !== "string" || !PATH_RE.test(e.state) ? "state must be a dotted path"
       : (e.detail !== undefined && (typeof e.detail !== "string" || !PATH_RE.test(e.detail))) ? "detail must be a dotted path"
       : (e.owner !== undefined && (typeof e.owner !== "string" || !PATH_RE.test(e.owner))) ? "owner must be a dotted path"
@@ -225,6 +232,8 @@ async function userSafeKey(q: Querier, userId: string): Promise<string | null> {
 
 /** A job of a deployment-added kind: one GET with the user's key, its state and line picked from the answer. */
 async function readHttpJob(source: HttpJobSource, id: string, key: string): Promise<JobRead> {
+  // Encoded, an id cannot leave its place in the path, except as a dot segment the URL would resolve upwards.
+  if (id === "." || id === "..") return { kind: "gone" };
   let got: { status: number; body: unknown };
   try {
     got = await jobWatchPorts.httpGet(source.url.replace("{id}", encodeURIComponent(id)), key);

@@ -593,7 +593,7 @@ export const CLAW_ASSISTANT_JOB_POLL_SEC = envInt("CLAW_ASSISTANT_JOB_POLL_SEC",
 // Jobs one user may have watched at once.
 export const CLAW_ASSISTANT_JOB_MAX_WATCHES = envInt("CLAW_ASSISTANT_JOB_MAX_WATCHES", 20, { min: 1 });
 // More kinds of job to watch, each read over HTTP with the user's own platform key: a JSON array of
-// {kind, description, url, state, detail?, owner?, ended}. `url` names the job with `{id}` (https, or plain http only to an in-cluster
+// {kind, description, url, state, detail?, owner?, ended}. `url` names the job with `{id}`, once and after its host (https, or plain http only to an in-cluster
 // `*.svc` host); `state`, `detail` and `owner` are dotted paths into the JSON answer; `ended` lists the states a job does not leave.
 // `owner`, when set, is compared with the user's id: a job of someone else's is not theirs to watch. An entry that does not parse is
 // left out and logged at start-up. Empty by default: workloads and runs only. (`assistant/job-watch.ts`)

@@ -241,9 +241,20 @@ describe("assistant job watches", { skip }, () => {
       { kind: "run", url: "https://jobs.example/api/{id}", state: "s", ended: ["x"] },
       { kind: "creds", url: "https://u:p@jobs.example/api/{id}", state: "s", ended: ["x"] },
       { kind: "noend", url: "https://jobs.example/api/{id}", state: "s", ended: [] },
+      // The id the user gives must never choose where the key goes.
+      { kind: "hostid", url: "https://{id}", state: "s", ended: ["x"] },
+      { kind: "subid", url: "https://{id}.jobs.example/api", state: "s", ended: ["x"] },
+      { kind: "portid", url: "https://jobs.example:{id}/api", state: "s", ended: ["x"] },
+      { kind: "userid", url: "https://{id}@jobs.example/api", state: "s", ended: ["x"] },
+      { kind: "twice", url: "https://jobs.example/api/{id}/{id}", state: "s", ended: ["x"] },
+      { kind: "svcid", url: "http://{id}.svc/api", state: "s", ended: ["x"] },
+      { kind: "query", url: "https://jobs.example/api?run={id}", state: "s", ended: ["x"] },
     ]));
-    assert.deepEqual(parsed.sources.map((x) => x.kind), ["build", "own"]);
-    assert.equal(parsed.errors.length, 5, parsed.errors.join("; "));
+    assert.deepEqual(parsed.sources.map((x) => x.kind), ["build", "own", "query"]);
+    assert.equal(parsed.errors.length, 11, parsed.errors.join("; "));
+    for (const kind of ["hostid", "subid", "portid", "userid", "twice", "svcid"]) {
+      assert.ok(parsed.errors.some((e) => e.startsWith(`entry ${["build", "own", "leaky", "noid", "run", "creds", "noend", "hostid", "subid", "portid", "userid", "twice", "svcid", "query"].indexOf(kind)}:`)), kind);
+    }
     assert.match(parsed.errors[0], /https, or http to an in-cluster \.svc host/, "plain http off the cluster would carry the key in the clear");
     assert.deepEqual(jw.parseJobHttpSources("{oops").errors, ["not JSON"]);
     jw.setJobHttpSources(parsed.sources);
@@ -287,6 +298,12 @@ describe("assistant job watches", { skip }, () => {
     assert.equal(await code(jw.jobWatch(await userTurn(alice, "watch b-odd"), { kind: "build", id: "b-odd" })), "unreadable");
     answers.set("http://builds.ci.svc:8080/api/builds/b-403", { status: 403, body: null });
     assert.equal(await code(jw.jobWatch(await userTurn(alice, "watch b-403"), { kind: "build", id: "b-403" })), "unreadable");
+    // An id that would walk up the path is no job, and nothing is fetched for it; one with a slash or a host stays in its segment.
+    const before = gets.length;
+    assert.equal(await code(jw.jobWatch(await userTurn(alice, "watch .."), { kind: "build", id: ".." })), "not_found");
+    assert.equal(gets.length, before);
+    await code(jw.jobWatch(await userTurn(alice, "watch it"), { kind: "build", id: "../x?y=https://evil.example/" }));
+    assert.equal(gets.at(-1)?.url, "http://builds.ci.svc:8080/api/builds/..%2Fx%3Fy%3Dhttps%3A%2F%2Fevil.example%2F");
 
     // With an owner path: only the user's own job.
     answers.set("https://jobs.example/api/j-bob", { status: 200, body: { status: "running", owner_id: "bob" } });
@@ -306,7 +323,7 @@ describe("assistant job watches", { skip }, () => {
     await Promise.all([server.connect(x), client.connect(y)]);
     const tool = (await client.listTools()).tools.find((tt) => tt.name === "job_watch")!;
     await client.close();
-    assert.deepEqual((tool.inputSchema.properties as any).kind.enum, ["workload", "run", "build", "own"]);
+    assert.deepEqual((tool.inputSchema.properties as any).kind.enum, ["workload", "run", "build", "own", "query"]);
     assert.match(String(tool.description), /a build of the user's \(its id\) \(kind build\)/);
     const { renderRouterProactiveSection } = await import("../src/assistant/proactive-prompt.js");
     assert.match(
