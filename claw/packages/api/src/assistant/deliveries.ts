@@ -26,7 +26,7 @@ import { CLAW_NOTIFICATIONS_ENABLED, DELIVERY_TTL_DAYS, S3_BUCKET } from "../con
 import { redactPublicJson } from "../events/redaction.js";
 import { publishEvent } from "../events/store.js";
 import { db } from "../infra/db.js";
-import { getS3Client } from "../infra/s3-client.js";
+import { getS3Client, S3_LIST_PAGE_KEYS } from "../infra/s3-client.js";
 import type { AssistantFile } from "../notifications/assistant-events.js";
 import { deterministicEventId } from "../notifications/outbox.js";
 import { sessionWorkspacePrefix } from "../workspace/prefix.js";
@@ -40,8 +40,11 @@ const logger = pino({ name: "assistant-deliveries" });
  * sweep), which is why a call that leaves some does not record its report as done.
  */
 export const ANNOUNCE_BATCH_MAX = 50;
-/** A listing of more than this many pages (1000 keys each) is not a session's deliveries: the rest is left and logged. */
-const LIST_MAX_PAGES = 20;
+/**
+ * A listing of more than this many pages (S3_LIST_PAGE_KEYS each: 20,000 objects) is not a session's deliveries: the rest is left
+ * and logged.
+ */
+const LIST_MAX_PAGES = 200;
 /** Reports this recent whose files were not announced are announced by the sweep; at most this many items a tick. */
 const SWEEP_WINDOW = "1 day";
 const SWEEP_SETTLE = "1 minute";
@@ -60,7 +63,9 @@ export const deliveryPorts = {
     const out: Array<{ key: string; size: number; at: Date }> = [];
     let token: string | undefined;
     for (let page = 0; page < LIST_MAX_PAGES; page++) {
-      const listed = await getS3Client().send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: token }));
+      const listed = await getS3Client().send(new ListObjectsV2Command({
+        Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: token, MaxKeys: S3_LIST_PAGE_KEYS,
+      }));
       for (const o of listed.Contents ?? []) if (o.Key) out.push({ key: o.Key, size: o.Size ?? 0, at: o.LastModified ?? new Date(0) });
       token = listed.IsTruncated ? listed.NextContinuationToken : undefined;
       if (!token) return out;
