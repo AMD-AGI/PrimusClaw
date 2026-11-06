@@ -50,8 +50,13 @@
  * session takes a fraction of a second, so a daily batch of thousands held the
  * lock past the leader lock's stall alarm (a 5000-session pass held it 13.5
  * minutes). A hold stops at its time budget and the pass continues in a fresh
- * hold a little later, until the day's batch is spent; the batch stays the
- * daily limit.
+ * hold a little later, until the day's batch is spent.
+ *
+ * The batch is a limit on the day and not on a pass, because a pass is not a
+ * day: every replica starts one a minute after it boots and every 24 hours
+ * after that, so one rollout of four replicas is four passes. Each hold reads
+ * what is left of the day from the deletions already made -- see
+ * {@link retentionAllowance} -- which is the one record every replica shares.
  */
 import pino from "pino";
 
@@ -126,6 +131,36 @@ export function newRetentionProgress(s: RetentionSettings): RetentionProgress {
   return { deleteLeft: s.batch, purgeLeft: s.batch, deleteDone: false, purgeDone: false };
 }
 
+/**
+ * How many sessions retention may still delete today, counted across the fleet.
+ *
+ * The batch was a limit per pass, and passes are per replica and per boot: one
+ * rollout of four replicas ran four, each with a whole batch of its own. With a
+ * batch of 5000 that deleted 22,781 sessions on one day and 16,535 in the 53
+ * minutes after a single rollout, and every one of them is a row the cleanup
+ * sweeper has to walk the object store for. It takes twenty a pass, so that
+ * backlog took about four hours to drain, and a user's own delete that did not
+ * finish inline waited behind it.
+ *
+ * So what is left of the day is read from the deletions themselves: the batch,
+ * less the sessions deleted in the last 24 hours that retention could have
+ * taken (archived, and not the Anthropic-compatible API's, which its clients
+ * delete themselves). Asked at the start of every hold, under the lock, so an
+ * earlier hold of this pass and a pass another replica ran are both already in
+ * it. It also counts an archived session a user deleted themselves -- nothing on
+ * the row says who deleted it -- which can only make a day's retention smaller,
+ * and how much deletion one day adds is what the limit is for.
+ */
+async function retentionAllowance(batch: number): Promise<number> {
+  const r = await db.query(
+    `SELECT COUNT(*)::int AS n FROM claw_sessions s
+      WHERE s.deleted_at > NOW() - INTERVAL '1 day'
+        AND s.status = 'archived'
+        AND NOT COALESCE(s.config ? 'primus_anthropic_compat', false)`,
+  );
+  return Math.max(0, batch - (r.rows[0] as { n: number }).n);
+}
+
 /** The bound on one hold: when it ends, and where it starts from. */
 interface HoldLimits {
   deadline: number;
@@ -180,6 +215,9 @@ async function deleteExpiredSessions(
     [s.retentionDays],
   );
   report.eligible = (counted.rows[0] as { n: number }).n;
+  if (report.eligible > 0 && progress.deleteLeft > 0) {
+    progress.deleteLeft = Math.min(progress.deleteLeft, await retentionAllowance(s.batch));
+  }
   if (report.eligible === 0 || progress.deleteLeft <= 0) {
     progress.deleteDone = true;
     return;
@@ -412,8 +450,9 @@ const pause = (ms: number) => new Promise<void>((resolve) => { setTimeout(resolv
  *
  * A pass that finds the lock taken asks again after `lockRetryDelayMs`, up to
  * `lockRetries` times, rather than skipping until the next day. The holder is
- * usually another replica in its own pass, and then the later attempt runs a
- * second, short pass over what is left, which is harmless. But it can also be a
+ * usually another replica in its own pass, and then the later attempt finds the
+ * day's batch already spent by it (see {@link retentionAllowance}) and deletes
+ * only what that pass left of it. But it can also be a
  * replica that is gone and whose backend the server has not dropped yet -- a
  * pod killed mid-pass by a rolling update -- and the replica that replaced it
  * starts its pass a minute after boot, well inside that window. Skipping then

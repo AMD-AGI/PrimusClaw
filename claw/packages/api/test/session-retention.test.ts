@@ -20,6 +20,7 @@
  *   T5 the S3 workspace and checkpoint prefixes are removed by the existing cleanup sweep
  *   T6 the purge removes stamped rows of sessions deleted past the window, and nothing else
  *   T7 archiving stamps archived_at, re-archiving keeps it, unarchiving clears it
+ *   T8 the batch is the day's limit across passes and replicas, not each pass's
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -353,5 +354,37 @@ describe("session retention", { skip }, () => {
     assert.equal(await archive.unarchiveSession("owner"), true);
     const back = (await rows("SELECT status, archived_at FROM claw_sessions WHERE session_id = 'owner'"))[0];
     assert.deepEqual([back.status, back.archived_at], ["active", null]);
+  });
+
+  test("T8 the batch is the day's limit across passes and replicas, not each pass's", async () => {
+    // Every replica runs a pass a minute after it boots, so one rollout of four
+    // replicas was four passes, each deleting a whole batch: a batch of 5000
+    // deleted 16,535 sessions in the hour after one rollout, and the cleanup
+    // sweeper was hours behind on all of them.
+    for (let i = 1; i <= 4; i += 1) await seed({ id: `exp-${i}`, archivedDays: 40 + i });
+    // Deleted today by their owners: an archived session counts against the day,
+    // since nothing on the row says who deleted it; a compatible-API session does
+    // not, since its client deletes its own and retention never takes one.
+    await seed({ id: "user-gone", archivedDays: 40, deletedDays: 0 });
+    await seed({ id: "compat-gone", archivedDays: 40, compat: true, deletedDays: 0 });
+    const batch = { ...SETTINGS, batch: 3 };
+
+    const first = await retention.runSessionRetention(batch);
+    assert.deepEqual([first.eligible, first.deleted], [4, 2], "the batch less the one deleted today");
+    assert.deepEqual(await deletedIds(), ["compat-gone", "exp-3", "exp-4", "user-gone"], "oldest first");
+
+    // Another replica's pass the same day, with a fresh batch of its own.
+    const second = await retention.runSessionRetention(batch);
+    assert.deepEqual([second.eligible, second.deleted], [2, 0], "the day's batch is spent");
+    const dry = await retention.runSessionRetention({ ...batch, dryRun: true });
+    assert.equal(dry.deleted, 0, "a dry run reports what today's pass would delete");
+    assert.deepEqual(await deletedIds(), ["compat-gone", "exp-3", "exp-4", "user-gone"]);
+
+    // A day later the window has moved past those deletions.
+    await q("UPDATE claw_sessions SET deleted_at = NOW() - INTERVAL '25 hours' WHERE deleted_at IS NOT NULL");
+    const nextDay = await retention.runSessionRetention(batch);
+    assert.deepEqual([nextDay.eligible, nextDay.deleted], [2, 2]);
+    assert.deepEqual(await deletedIds(),
+      ["compat-gone", "exp-1", "exp-2", "exp-3", "exp-4", "user-gone"]);
   });
 });
