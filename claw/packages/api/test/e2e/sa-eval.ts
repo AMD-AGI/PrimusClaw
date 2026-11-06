@@ -89,7 +89,7 @@
  * the cleanup above runs; the run exits 1, and says so if a turn was still running at its end. A second signal exits at
  * once without it. Send it to the runner's own process: `npx` (npm exec) does not pass a signal on.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -185,6 +185,8 @@ const RUN_ITEMS = new Set<string>();   // ids of the items the run's own turns s
 const CLEARED = new Set<string>();     // of those, the ones closed with their worker's session deleted
 const RUN_MESSAGES: string[] = [];     // every message the run sent to the assistant, to tie items to it after a stop
 const OWN_SESSIONS = new Set<string>(); // the only sessions the run ever deletes: made by it, or answered for its own items
+const CLEANUP_ISSUES: string[] = [];   // what closing an item could not finish: it fails the run
+const UNKNOWN_SENDS = { n: 0 };        // messages to the assistant whose answer was lost: taken or not, the run cannot say
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // --- Stopping -------------------------------------------------------------------------------------------------------
@@ -462,7 +464,10 @@ async function runAssistant(c: EvalCase, turns: Turn[], sessionId: string, strea
       if (wait > 0) await pause(wait);
       live();
       const at = Date.now();
-      const r = await api("POST", `/v1/sessions/${sessionId}/messages`, { content: t.user, messageType: "text" });
+      // A message whose answer was lost (or a 5xx) may still have been taken: its turn is waited for at the end, unnamed.
+      const r = await api("POST", `/v1/sessions/${sessionId}/messages`, { content: t.user, messageType: "text" })
+        .catch((err) => { UNKNOWN_SENDS.n++; throw err; });
+      if (r.status >= 500) UNKNOWN_SENDS.n++;
       const id = r.json?.message_id;
       if (r.status !== 200 || typeof id !== "string") throw new Error(`message answered ${r.status}`);
       RUN_MESSAGES.push(id);
@@ -620,8 +625,12 @@ async function closeItem(i: ItemSeen): Promise<string> {
   const r = await until(async () => {
     const got = await api("GET", `/v1/work-items/${i.item_id}`).catch(() => null);
     return got?.status === 200 && got.json?.data?.board_state === "done" ? got : undefined;
-  }, Date.now() + 30_000, 2_000);
-  if (!r) return `${how}; still open, its worker's session kept`;
+  }, Date.now() + 15_000, 1_000);
+  if (!r) {
+    const why = `#${i.seq} not seen closed (${how}): its worker's session kept`;
+    CLEANUP_ISSUES.push(why);
+    return why;
+  }
   CLEARED.add(i.item_id);
   const sid = r.json.data.worker_session_id;
   if (typeof sid !== "string" || !sid) return how;
@@ -648,7 +657,25 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
   const values = await factValues(c);
   live();
   const start = Date.now();
-  const created = await api("POST", "/v1/sessions", { name: `sa-eval-${c.id}`, message: { content: turns[0]!.user, pluginId: PLUGIN_ID } });
+  // With an idempotency key, asked again (the same key) when the answer was lost or a 5xx: the API answers a repeat with the
+  // session the first request made, so the run always knows the session it made, and deletes it.
+  const key = randomUUID();
+  const create = async (): Promise<{ status: number; json: any } | undefined> => {
+    try {
+      const res = await fetch(`${CLAW}/v1/sessions`, {
+        method: "POST", signal: AbortSignal.timeout(30_000),
+        headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json", "idempotency-key": key },
+        body: JSON.stringify({ name: `sa-eval-${c.id}`, message: { content: turns[0]!.user, pluginId: PLUGIN_ID } }),
+      });
+      const json = await res.json().catch(() => null);
+      return res.status >= 500 ? undefined : { status: res.status, json };
+    } catch { return undefined; }
+  };
+  const created = await until(create, Date.now() + 60_000, 5_000);
+  if (!created) {
+    CLEANUP_ISSUES.push(`the session of ${c.id} was asked for and never confirmed (idempotency key ${key}): one may be left`);
+    throw new Error("the session's creation could not be confirmed in 60 s: not graded");
+  }
   const sessionId: string | undefined = created.json?.data?.session_id;
   if (!sessionId) throw new Error(`create answered ${created.status}`);
   OWN_SESSIONS.add(sessionId);
@@ -695,7 +722,7 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
       if (r.status !== 200) throw new Error(`message answered ${r.status}`);
       await waitTurn(mids.length - 1);
     }
-    await sleep(3_000);
+    // Every turn's exec_complete is stored (`waitTurn`), and Brain sends it last: the stored events are complete.
     let rows = await replay(sessionId);
     // Graded is what the stream showed, so only when it showed every stored event of the case's turns (15 s to catch up).
     const sentIds = mids.filter((m): m is string => !!m);
@@ -808,6 +835,8 @@ async function main(): Promise<void> {
   let stream: LiveStream | null = null;
   let createdAssistant = false;   // the run made the identity's assistant session: it is deleted at the end
   let priorSays: SayMark[] = [];  // the identity's counted says made before the run was listening
+  const historyAtStart = new Set<string>();   // the assistant session's events from before the run (none for one it made)
+  const historyEnds = new Set<string>();      // and the turns they ended
   const sayLog = sayLogPath(String(me.json?.email || me.json?.name || ""));
   // The board's highest number is read before anything is made, so whatever fails after it, everything numbered above it
   // is the run's and is closed below.
@@ -836,8 +865,12 @@ async function main(): Promise<void> {
       }
       stream = new LiveStream(sessionId, true);
       await stream.open();
-      // Read after the stream opened, so a say in between is counted twice rather than not at all.
-      priorSays = mergeSays([readSayLog(sayLog), createdAssistant ? [] : countedSaysOf(await replay(sessionId))], Date.now());
+      // Read after the stream opened, so a say in between is counted twice rather than not at all (and an event in between is
+      // taken as before the run: nothing was sent yet).
+      const before = createdAssistant ? [] : await replay(sessionId);
+      for (const r of before as Array<EventRow & { event_id?: unknown }>) historyAtStart.add(String(r.event_id ?? ""));
+      for (const id of storedTurnEnds(before)) historyEnds.add(id);
+      priorSays = mergeSays([readSayLog(sayLog), countedSaysOf(before)], Date.now());
     }
     cases: for (const c of cases) {
       const r: CaseResult = { id: c.id, area: c.area, pipeline: c.pipeline, mode: MODE, hash: c.source?.hash ?? caseHash(c), attempts: [] };
@@ -881,25 +914,34 @@ async function main(): Promise<void> {
         if (stream) {
           // A turn already asked for may still start an item: let the run's turns end (a minute at most) and take every item
           // their calls answered for as the run's, whatever stopped the run.
-          const over = await turnsOver(sessionId, (stored) => RUN_MESSAGES.every((id) => stored.includes(id)),
-            () => RUN_MESSAGES.every((id) => turnEnded(stream!.events, id)), Date.now() + Math.min(60_000, turnWaitMs(true)), until, 2_000);
+          // A message whose answer was lost has a turn the run cannot name: it waits for as many more turns ended since it began.
+          const ended = (stored: readonly string[]): boolean => RUN_MESSAGES.every((id) => stored.includes(id))
+            && stored.filter((id) => !historyEnds.has(id)).length >= RUN_MESSAGES.length + UNKNOWN_SENDS.n;
+          const over = await turnsOver(sessionId, ended, () => !UNKNOWN_SENDS.n && RUN_MESSAGES.every((id) => turnEnded(stream!.events, id)),
+            Date.now() + Math.min(60_000, turnWaitMs(true)), until, 2_000);
           // What a turn still running starts later is not seen, and not closed: a person must look. Named by the stored events,
           // which are what says a turn is over.
           if (!over) {
             const stored = storedTurnEnds(await replay(sessionId).catch(() => []));
-            cleanupFailed.push(`turns of the run still running at its end (what they start is not closed): ${RUN_MESSAGES.filter((id) => !stored.includes(id)).join(",") || "(the stored events could not be read)"}`);
+            const open = RUN_MESSAGES.filter((id) => !stored.includes(id));
+            if (UNKNOWN_SENDS.n) open.push(`${UNKNOWN_SENDS.n} message(s) whose answer was lost`);
+            cleanupFailed.push(`turns of the run still running at its end (what they start is not closed): ${open.join(",") || "(the stored events could not be read)"}`);
           }
         }
         // One read of the board, again for up to 30 s, both to tie items to the run's turns and to close them.
         const open = await boardWithin(30_000);
         if (!open) throw new Error("the board could not be read for 30 s");
         if (stream) {
-          // From the stream and from the stored events: a work_create answer the stream missed still ties its item to the run.
+          // Every item a turn of the session started while the run was on is the run's (nobody else was using the session: the
+          // start refused one in use), from the stream and from the stored events after the run began: a work_create answer the
+          // stream missed, or the turn of a message whose answer was lost (the run never learned its id), still ties its item.
           const rows = await until(async () => replay(sessionId).catch(() => undefined), Date.now() + 30_000, 3_000);
           if (!rows) cleanupFailed.push("the stored events could not be read to tie the run's items to its turns");
-          const storedCalls = traceOf((rows ?? []).filter((r) => RUN_MESSAGES.includes(String(r.data?.message_id ?? "")))).calls;
+          const after = (rows ?? []).filter((r) => !historyAtStart.has(String((r as { event_id?: unknown }).event_id ?? "")));
+          const calls = [...traceOf(stream.events.map((e) => ({ event_type: String(e.data.type ?? ""), created_at: new Date(e.at).toISOString(), data: e.data }))).calls,
+            ...traceOf(after).calls];
           const above = open.filter((x) => x.seq > floorAtStart);
-          for (const i of itemsStartedBy([...turnCalls(stream.events, RUN_MESSAGES), ...storedCalls], above, RUN_ITEMS)) RUN_ITEMS.add(i.item_id);
+          for (const i of itemsStartedBy(calls, above, RUN_ITEMS)) RUN_ITEMS.add(i.item_id);
         }
         // Each item on its own: one that cannot be closed does not keep the others open.
         for (const i of open.filter((x) => RUN_ITEMS.has(x.item_id) && !CLEARED.has(x.item_id))) {
@@ -907,7 +949,7 @@ async function main(): Promise<void> {
             cleanupFailed.push(`#${i.seq} could not be closed: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
-        await sleep(5_000);
+        // Each closed item was seen done (`closeItem`): the board is read again at once.
         const final = await boardWithin(30_000);
         if (!final) throw new Error("the board could not be read for 30 s");
         const after = final.filter((x) => x.seq > floorAtStart && x.board_state !== "done");
@@ -931,6 +973,7 @@ async function main(): Promise<void> {
     }
   }
   if (sessionsLeft.length) cleanupFailed.push(`sessions the run made not deleted: ${sessionsLeft.join(",")}`);
+  cleanupFailed.push(...new Set(CLEANUP_ISSUES));
   cleanupFailed = cleanupFailed.map(scrub);
   if (RECORD_DIR) {
     mkdirSync(RECORD_DIR, { recursive: true });
