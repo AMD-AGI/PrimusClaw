@@ -287,6 +287,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // model only fills in for a session that names none. Off, it is every worker turn's model, as it always was.
     if (CLAW_ASSISTANT_WORKER_MODEL && !(modelChoiceOn() && stringField(task, "model"))) task.model = CLAW_ASSISTANT_WORKER_MODEL;
     withSystemAppend(task, renderWorkerSystem({ seq: started.seq, title: started.title }));
+    // A worker does its item's work in the sandbox, so Brain opens it beside the turn's first model call rather than after it.
+    task.sandbox_prestart = true;
     const memory = await workerMemoryBlock(role.userId, started.itemId, sessionId);
     if (memory) withSystemAppend(task, memory);
     logger.info({ sessionId, taskId, itemId: started.itemId, generation: started.generation, prompt: WORKER_PROMPT_VERSION }, "assistant.worker_turn");

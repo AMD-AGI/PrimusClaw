@@ -175,6 +175,7 @@ describe("assistant role profile", { skip }, () => {
     assert.equal(task.task_id, result.runId);
     assert.ok(claims.exp > Math.floor(Date.now() / 1000) + 3600, "outlives the longest turn the row allows");
     assert.ok(task.system_append.startsWith("You are the user's personal assistant."));
+    assert.equal(task.sandbox_prestart, undefined, "a router has no sandbox tool to open one for");
     assert.ok(!task.system_append.includes(AGENT_GUIDELINE), "a router only dispatches: the working guideline is not its");
     // The item list goes with the message, with #299's plain status and times: the system prompt is the same on every turn.
     assert.match(task.prompt, new RegExp(`Work items \\(open ones[^)]*\\):\\n.*\\n<untrusted_data>\\n#1 \\(item_id: ${item.itemId}\\) \\[in_progress\\] \\(status: in progress; created \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC\\) title: "Fix the build"`));
@@ -235,6 +236,7 @@ describe("assistant role profile", { skip }, () => {
     assert.ok(first.system_append.startsWith(`${AGENT_GUIDELINE}\n\n`), "a worker does the user's work, under the working guideline");
     assert.match(first.system_append, /You are a worker on one work item/);
     assert.match(first.system_append, /item #1: Fix the build$/);
+    assert.equal(first.sandbox_prestart, true, "a worker's sandbox opens beside its first model call");
     assert.equal((await w.item(item.itemId)).generation, 1);
 
     await w.q("UPDATE claw_tasks SET status = 'completed' WHERE session_id = $1", [item.workerSid]);
