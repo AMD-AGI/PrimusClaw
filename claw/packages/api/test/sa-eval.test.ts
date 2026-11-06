@@ -409,8 +409,8 @@ test("S16 no false denial of a capability", () => {
   for (const text of ["node-7 无法访问，已经离线 2 小时。", "没有找到失败的运行。", "我查到 3 个开着的 PR。", "I don't see any failed runs today.", "The node cannot reach the registry."]) {
     assert.ok(!denied(text), text);
   }
-  // A failed shell command excuses a GitHub denial only when it failed at GitHub: a GitHub client ran, and a line of its answer is
-  // a failure that names GitHub.
+  // A failed shell command excuses a GitHub denial only when it failed at GitHub: a line of its answer is a failure that names
+  // GitHub, whatever program reached it.
   const bash = (command: string, answer = ""): ToolCall => ({ ...call("bash", false), input: { command }, result: answer });
   const excused: Array<[string, string]> = [
     ["gh pr list --author @me", "HTTP 401: Bad credentials (https://api.github.com/graphql)"],
@@ -419,6 +419,8 @@ test("S16 no false denial of a capability", () => {
     ["git remote show origin", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 403"],
     ["git --git-dir /repo/.git fetch", "remote: Repository not found.\nfatal: repository 'https://github.com/o/r/' not found"],
     ["curl -s https://api.github.com/repos/o/r", '{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest"}'],
+    ["python3 list_prs.py", 'requests.exceptions.HTTPError: 401 Client Error: Unauthorized for url: https://api.github.com/search/issues'],
+    ["node prs.mjs", 'Error: GitHub answered 403 for https://api.github.com/repos/o/r/pulls'],
   ];
   for (const [cmd, answer] of excused) assert.ok(!denied("I can't access GitHub.", [bash(cmd, answer)]), cmd);
   const notGithub: Array<[string, string]> = [

@@ -427,7 +427,7 @@ export const CAPABILITY_DENIAL = new RegExp([
  */
 const DENIED_SYSTEMS: ReadonlyArray<[RegExp, (c: ToolCall) => boolean]> = [
   [/github|\bgh\b|pull request|\bPRs?\b|仓库|代码库/i, (c) => /^mcp__github__/.test(c.name)
-    || (/^bash$/i.test(c.name) && shellFailedAtGithub(String(c.input?.command ?? ""), c.result))],
+    || (/^bash$/i.test(c.name) && shellFailedAtGithub(c.result))],
   [/联网|上网|互联网|网页|网站|internet|\bweb\b|browse|online/i, (c) => /^(web_search|web_fetch)$/.test(c.name)],
   [/safe|workloads?|workspaces?|集群|cluster|节点|\bnodes?\b/i, (c) => /^mcp__safe__/.test(c.name)],
   [/dispatron|计划|\bplans?\b/i, (c) => /^mcp__dispatron__/.test(c.name)],
@@ -436,24 +436,16 @@ const DENIED_SYSTEMS: ReadonlyArray<[RegExp, (c: ToolCall) => boolean]> = [
   [/看板|\bboard\b|\bissues?\b/i, (c) => /^mcp__agent-board__/.test(c.name)],
 ];
 
-/** Programs that can talk to GitHub from a shell. */
-const GITHUB_CLIENTS = new Set(["gh", "git", "curl", "wget"]);
-
 /**
- * Whether a failed shell call failed at GitHub: one of its commands (split at `;`, `&&`, `||`, `|` and new lines) runs a program
- * that can talk to GitHub (gh, git, curl, wget), and one line of what the call answered is a failure that names GitHub (`fatal:
- * unable to access 'https://github.com/…'`, `remote: Repository not found` beside a github.com URL, `HTTP 401: Bad credentials
- * (https://api.github.com/…)`, gh's `gh auth login`, GitHub's JSON error with docs.github.com). That line is the evidence a remote
- * operation was tried and failed; a GitHub URL printed by a local command (`git remote -v`) next to another command's failure,
- * a local `git status` that failed, or text that only mentions git, are not.
+ * Whether a failed shell call failed at GitHub: one line of what it answered is a failure that names GitHub (`fatal: unable to
+ * access 'https://github.com/…'`, `remote: Repository not found` beside a github.com URL, `HTTP 401: Bad credentials
+ * (https://api.github.com/…)`, gh's `gh: …` errors, GitHub's JSON error with docs.github.com), whatever program reached it (gh,
+ * git, curl, a Python or Node script). That line is the evidence a remote operation was tried and failed; a GitHub URL printed by
+ * a local command (`git remote -v`) beside another command's failure, a local `git status` that failed, or text that only
+ * mentions git, are not.
  */
-export function shellFailedAtGithub(command: string, answer: string): boolean {
-  const runs = command.split(/;|&&|\|\||\||\n/).some((part) => {
-    const words = part.trim().split(/\s+/).filter(Boolean);
-    while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!) || ["sudo", "env", "time", "command", "exec", "("].includes(words[0]!))) words.shift();
-    return GITHUB_CLIENTS.has((words[0] ?? "").replace(/^\(+/, "").split("/").pop() ?? "");
-  });
-  return runs && answer.split("\n").some((line) => GITHUB_NAMED.test(line) && GITHUB_FAILED.test(line));
+export function shellFailedAtGithub(answer: string): boolean {
+  return answer.split("\n").some((line) => GITHUB_NAMED.test(line) && GITHUB_FAILED.test(line));
 }
 const GITHUB_NAMED = /github\.com|api\.github|github cli|gh auth|^\s*gh:/i;
 const GITHUB_FAILED = /\b(fatal|error|denied|not found|unable|could not|failed|forbidden|unauthori[sz]ed|bad credentials|rate limit|HTTP [45]\d\d)\b|"message"\s*:/i;
