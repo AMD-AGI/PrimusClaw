@@ -44,7 +44,7 @@ import {
   CONTEXT_STRING_MAX, decidedViaOf, parseChannelContext, turnMessage, type AttendedVia, type ChannelPerson, type TurnMessage,
 } from "./inbound.js";
 import {
-  MAX_REVIEWS_PER_REQUEST, parseRestartRequest, parseReviewRequest, recordReviewHandoff, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused,
+  parseRestartRequest, parseReviewRequest, recordReviewHandoff, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused,
   reviewItemsEnabled, REVIEWS_STARTED_AT_ONCE, startReviews,
 } from "./review-items.js";
 import type { AssistantTokenClaims } from "./token.js";
@@ -72,8 +72,12 @@ export const reviewToolPorts = {
     voidStreamedSay(sessionId, messageId, reason),
 };
 
-/** One review_start may name as many pull requests as one request for reviews: the first ten start, the rest wait for a slot. */
-export const MAX_PRS = MAX_REVIEWS_PER_REQUEST;
+/**
+ * One review_start may name as many pull requests as one request for reviews (`MAX_REVIEWS_PER_REQUEST`): the first ten start, the rest
+ * wait for a slot. A literal, since review-items.js may not be initialised yet when this module is (they import each other); a test holds
+ * the two equal.
+ */
+export const MAX_PRS = 30;
 /** At most this many people are offered when the message names no reviewer alone. */
 const MAX_REVIEWER_CANDIDATES = 5;
 /** How long after the person's request their answer naming the reviewer (`确认 <name>`) still answers it. */
