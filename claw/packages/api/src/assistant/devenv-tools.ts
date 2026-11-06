@@ -57,7 +57,7 @@ const tail = (v: string, max: number): string | null => {
   return one.length > max ? `…${one.slice(one.length - (max - 1))}` : one;
 };
 const iso = (v: unknown): string | null => {
-  if (v instanceof Date) return v.toISOString();
+  if (v instanceof Date) return Number.isNaN(v.getTime()) ? null : v.toISOString();
   if (typeof v === "string" && !Number.isNaN(Date.parse(v))) return new Date(v).toISOString();
   return null;
 };
@@ -164,7 +164,8 @@ function resumableOf(agent: Row): Array<{ ref: string; title: string | null; cwd
     const ref = r.ref.trim();
     // What the channel passes on as a resume_ref, and nothing that could forge another argument.
     if (!/^[A-Za-z0-9._:-]{1,128}$/.test(ref)) continue;
-    const at = typeof r.updated_at === "number" && Number.isFinite(r.updated_at) ? new Date(r.updated_at * 1000).toISOString() : null;
+    // A time a JavaScript date cannot hold (the connector chose it) is no time, not a failed list.
+    const at = typeof r.updated_at === "number" ? iso(new Date(r.updated_at * 1000)) : null;
     out.push({ ref, title: flat(r.title, TITLE_MAX), cwd: typeof r.cwd === "string" ? r.cwd : null, updated_at: at, state: typeof r.state === "string" ? r.state : "unknown" });
   }
   return out;

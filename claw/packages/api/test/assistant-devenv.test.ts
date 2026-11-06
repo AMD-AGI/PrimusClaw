@@ -228,13 +228,15 @@ describe("devenv_list", { skip }, () => {
         { ref: "eva10000-0000-4000-8000-000000000001", title: "t1", cwd: "/w/a", updated_at: now() - 600, state: "idle" },
         { ref: "eva10000-0000-4000-8000-000000000002", title: "t2", cwd: "/w/b", updated_at: now() - 60, state: "live" },
         { ref: "--forged arg", title: "bad", cwd: "/w/c", updated_at: now(), state: "idle" },
+        { ref: "eva10000-0000-4000-8000-000000000003", title: "far", cwd: "/w/d", updated_at: 1e300, state: "live" },
       ] },
       { id: "codex", kind: "codex", name: "Codex" },
     ] });
     let b = (await call(await w.routerTurn(alice))).body;
     assert.deepEqual(b.attach_default, { label: "devbox/claude/2", ref: "eva10000-0000-4000-8000-000000000001", attach_command: "/agent attach eva10000-0000-4000-8000-000000000001" },
       "the one conversation that is not in a terminal");
-    assert.equal(b.machines[0].sessions.length, 2, "a ref that could forge an argument is not listed");
+    assert.equal(b.machines[0].sessions.length, 3, "a ref that could forge an argument is not listed");
+    assert.equal(b.machines[0].sessions.find((x: Recorded) => x.cwd === "/w/d").last_activity, null, "a time no date can hold is no time");
 
     const sid = await session("alice", box, "codex", "/w/x", [end()]);
     b = (await call(await w.routerTurn(alice))).body;
