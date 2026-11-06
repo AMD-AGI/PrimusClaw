@@ -33,6 +33,10 @@ record it.
   someone else that may merge, the requester's own GitHub account merges their pull request once the reviewer's approval of the head
   is on GitHub, CI is green, no thread is open and the merge state is CLEAN, instead of waiting for the reviewer to confirm a held
   merge; the held merge closes as merged by the requester. One acting user may now be asked about 30 writes at once (was 10).
+- Remote connector presence over time: every change of a connector's presence is recorded, the connector list gives
+  `last_seen_at`, `offline_since` and `offline_reason` (`auth_expired`, `no_heartbeat`), and a connector offline for 5 minutes
+  is reported once to its owner through their assistant with when it was last seen and the command that brings it back, then
+  once more when it is back. The seconds-long breaks a Claw release causes are never reported.
 - Three GitHub writes, each held for the user's decision like every write of the `github` server: `checks_rerun_failed` (run
   again the failed jobs of a GitHub Actions workflow run; `checks_list` now gives a job's `run_id`), `pr_request_reviewers` (people
   and teams) and `labels_set` (the whole list of an issue's or pull request's labels). None is a router read.

@@ -82,12 +82,25 @@ export async function registerConnector(
   });
 }
 
+/** When the connector was last known to be alive, as a column of `claw_remote_connectors c`. */
+export const LAST_SEEN_SQL = "GREATEST(c.heartbeat_at, c.stream_seen_at, c.stream_closed_at)";
+
+/**
+ * The caller's connectors that are not revoked, with their agents and presence: `online`, `last_seen_at`, and, while
+ * offline, `offline_since` (when it was last seen before it went) and `offline_reason` (`presence.ts`).
+ */
 export async function listConnectors(owner: string, onlineWindowMs: number): Promise<Row[]> {
-  const connectors = (await direct(
-    `SELECT c.connector_id, c.name, c.version, c.heartbeat_at, c.created_at, ${ONLINE_SQL}
+  const rows = (await direct(
+    `SELECT c.connector_id, c.name, c.version, c.heartbeat_at, c.created_at, ${ONLINE_SQL},
+            ${LAST_SEEN_SQL} AS last_seen_at, c.presence_state, c.offline_since, c.offline_reason, c.stream_end_reason
        FROM claw_remote_connectors c WHERE c.owner_user_id = $2 AND c.revoked_at IS NULL ORDER BY c.created_at`,
     [secs(onlineWindowMs), owner],
   )).rows;
+  const connectors = rows.map(({ presence_state, offline_since, offline_reason, stream_end_reason, ...c }) => ({
+    ...c,
+    offline_since: c.online ? null : (presence_state === "offline" && offline_since ? offline_since : c.last_seen_at ?? null),
+    offline_reason: c.online ? null : (presence_state === "offline" && offline_reason ? offline_reason : offlineReason(stream_end_reason)),
+  }));
   const agents = (await direct(
     "SELECT connector_id, agent_id, kind, name, capabilities FROM claw_remote_agents WHERE owner_user_id = $1 ORDER BY agent_id", [owner],
   )).rows;
@@ -95,6 +108,14 @@ export async function listConnectors(owner: string, onlineWindowMs: number): Pro
     ...c,
     agents: agents.filter((a) => a.connector_id === c.connector_id).map(({ connector_id: _c, ...a }) => a),
   }));
+}
+
+/**
+ * Why a connector that is not revoked is offline, from how its last command stream ended: the server ended it because
+ * its credential expired or was withdrawn (`auth_expired`), or it went otherwise and no heartbeat followed (`no_heartbeat`).
+ */
+export function offlineReason(streamEndReason: unknown): "auth_expired" | "no_heartbeat" {
+  return streamEndReason === "token_expired" || streamEndReason === "revoked" ? "auth_expired" : "no_heartbeat";
 }
 
 /** Revoke one connector and close its sessions. False when it is not the caller's, or already revoked. */
@@ -223,10 +244,15 @@ export async function touchStream(connectorId: string, streamConn: string): Prom
   );
 }
 
-export async function markStreamClosed(connectorId: string, streamConn: string): Promise<void> {
+/**
+ * The current stream has ended. `reason` is the last frame the server sent it (`token_expired`, `revoked`), or
+ * `closed` when the connection simply went; kept with the time, so presence can say when it was last seen and why.
+ */
+export async function markStreamClosed(connectorId: string, streamConn: string, reason = "closed"): Promise<void> {
   await direct(
-    "UPDATE claw_remote_connectors SET stream_seen_at = NULL WHERE connector_id = $1 AND stream_conn = $2",
-    [connectorId, streamConn],
+    `UPDATE claw_remote_connectors SET stream_seen_at = NULL, stream_closed_at = NOW(), stream_end_reason = $3
+      WHERE connector_id = $1 AND stream_conn = $2`,
+    [connectorId, streamConn, reason],
   );
 }
 

@@ -44,7 +44,7 @@ describe("remote agents", { skip }, () => {
         };
       }
     });
-    await register(app, { pingMs: 150, pollMs: 40, waker, retentionDays: 0, ...opts });
+    await register(app, { pingMs: 150, pollMs: 40, waker, retentionDays: 0, presenceSweepMs: 0, ...opts });
     await app.listen({ port: 0, host: "127.0.0.1" });
     apps.push(app);
     return `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
@@ -159,6 +159,30 @@ describe("remote agents", { skip }, () => {
       await stream.closed();
       for (let i = 0; i < 50 && (await state()).online; i++) await new Promise((r) => setTimeout(r, 20));
       assert.equal((await state()).online, false, "stream gone");
+    });
+
+    test("the list says when an offline connector was last seen and why it went, and nothing of either while online", async () => {
+      const state = async () => (await as("u1").get("/v1/remote-agents/connectors")).body.data[0];
+      const { cid, stream } = await online1();
+      const up = await state();
+      assert.equal(up.online, true);
+      assert.ok(up.last_seen_at, "last seen");
+      assert.equal(up.offline_since, null);
+      assert.equal(up.offline_reason, null);
+      const before = Date.now();
+      await stream.closed();
+      for (let i = 0; i < 50 && (await state()).online; i++) await new Promise((r) => setTimeout(r, 20));
+      const down = await state();
+      assert.equal(down.online, false);
+      assert.equal(down.offline_reason, "no_heartbeat");
+      assert.ok(Math.abs(new Date(down.offline_since).getTime() - before) < 5_000, `offline since the stream closed: ${down.offline_since}`);
+      assert.equal(down.offline_since, down.last_seen_at);
+      const row = (await q("SELECT stream_end_reason FROM claw_remote_connectors WHERE connector_id = $1", [cid])).rows[0];
+      assert.equal(row.stream_end_reason, "closed");
+      // Never seen at all: no time to name.
+      await connector("u2");
+      const never = (await as("u2").get("/v1/remote-agents/connectors")).body.data[0];
+      assert.deepEqual([never.online, never.last_seen_at, never.offline_since, never.offline_reason], [false, null, null, "no_heartbeat"]);
     });
 
     test("a heartbeat older than the window is offline, however open the stream", async () => {
