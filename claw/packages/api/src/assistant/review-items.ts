@@ -478,6 +478,12 @@ export interface CreatedReview {
    */
   merge_needs_confirmation?: true;
   /**
+   * Present on a review asked of someone else that may merge: once the reviewer's approval of the head is on GitHub and the gates are
+   * open, the requester's own GitHub account merges it when it wrote the pull request (`followReviewItems`), without the reviewer
+   * confirming the merge. A channel that tells the person how the merge will be made reads it here.
+   */
+  merge_by_requester?: true;
+  /**
    * With model choice on (`model-choice.ts`): the model the review runs on (null: the deployment's default), and the one it was to run
    * on when the payer's key could not use it. Absent with model choice off.
    */
@@ -566,6 +572,7 @@ async function insertReview(q: StatementRunner, owner: UserInfo, plan: Planned):
   return {
     item_id: item.itemId, seq: item.seq, title: name, session_id: plan.sessionId, pr: plan.pr, message_id: queued.pendingId === null ? null : queuedMessageId(queued.pendingId),
     review_only: plan.params.review_only, ...(plan.params.merge_needs_confirmation === true ? { merge_needs_confirmation: true as const } : {}),
+    ...(plan.params.requested_by && !plan.params.review_only ? { merge_by_requester: true as const } : {}),
   };
 }
 

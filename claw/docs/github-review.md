@@ -178,6 +178,9 @@ audit row with tool `gh_pr_follow` each time):
   for the merged-or-closed check only.
 - A review only, and the acting user's own review, are only read, with the acting user's account (their switch still counts).
 
+`POST /v1/assistant/reviews` answers `merge_by_requester: true` on each item of a review asked of someone else that may merge, so the
+channel that started it can tell the requester how the merge will be made.
+
 ### A review again: it continues the last one
 
 A posted review of an item's session is recorded on its audit row (`claw_github_audit.posted`: the event and each inline finding

@@ -1125,6 +1125,7 @@ describe("assistant review items", { skip }, () => {
   test("FW1 the requester's merge after the reviewer's approval ends the item merged, and the requester's view says merged", async () => {
     const r = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
     const it = r.body.data.items[0];
+    assert.equal(it.merge_by_requester, true, "the channel is told the requester's account merges after the approval");
     const item = await w.item(it.item_id);
     await turnRan(item.worker_session_id);
     await audit(item.worker_session_id, "gh_review_submit", "ok", "submitted", "bob");
@@ -1149,6 +1150,7 @@ describe("assistant review items", { skip }, () => {
   test("FW2 merged or closed on GitHub ends an item whatever it still held; a review only is followed without the requester's merge", async () => {
     const r = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: true });
     const it = r.body.data.items[0];
+    assert.equal("merge_by_requester" in it, false, "a review only is not merged by anyone");
     const item = await w.item(it.item_id);
     await turnRan(item.worker_session_id);
     await audit(item.worker_session_id, "gh_review_submit", "ok", "submitted", "bob");
