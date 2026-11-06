@@ -9,6 +9,12 @@ With `CLAW_GITHUB_MCP_ENABLED=true`, every session whose owner keeps a GitHub to
 (`PUT /v1/env/user/GH_TOKEN`, the same variable the sandbox's `gh` and `git` use) is offered a `github` MCP
 server, hosted by the API. Off by default; nothing is registered or offered while it is off.
 
+With `CLAW_GITHUB_MCP_BINDING_ENABLED=true` as well, an owner who keeps no `GH_TOKEN` is served with the GitHub
+account they bound at the identity provider (`/github bind` in Teams, the binding [GitHub review](github-review.md)
+uses), so binding once is enough for the tools too. The vault comes first: an owner who keeps a `GH_TOKEN` is served
+with it. Off by default: switching it on changes what a binding is used for, so the people who bound one have to be
+told (Clawy's `/github status` and its binding card say it).
+
 | Reads (run without asking) | Writes (each waits for the user's decision) |
 |---|---|
 | `repo_get_file`, `repo_list`, `pr_get`, `pr_list`, `pr_files`, `pr_diff`, `pr_reviews`, `checks_list`, `job_logs`, `issue_get`, `issue_list`, `issue_search`, `review_threads_list`, `code_search` | `issue_comment`, `issue_create`, `pr_create`, `pr_update`, `review_thread_reply`, `review_thread_resolve`, `checks_rerun_failed`, `pr_request_reviewers`, `labels_set` |
@@ -44,6 +50,16 @@ A failed read is the tool's own error (`isError`), and Brain marks its result ev
 - The entry holds no GitHub credential. On every call the API checks the token, reads the session row again
   (still there, the same owner, not acting as another user) and reads the owner's `GH_TOKEN` from the vault for
   that request. Whose token is used comes from the session, never from a tool argument.
+- With a binding, the API asks the identity provider for it on every request, for the owner themselves and named
+  `github_mcp:<tool>` in the provider's audit trail, and never keeps it. At dispatch it is asked for once to learn whether
+  there is one that works (`github_mcp:offer`); an expired one is not offered. Every call made with it is written to
+  GitHub review's audit log (`claw_github_audit`, tool `github_mcp.<tool>`, the arguments summarised, a body only as its
+  length) before it runs, and finished after; a call whose row cannot be written is not made. Writes wait for the user
+  exactly as with a `GH_TOKEN`.
+- `GET /v1/github/connection` answers the signed-in user which token their tools would use now: `reads_with` is
+  `env`, `binding` or null (`missing`: `none` or `expired`), with the bound `login`, and `binding_reads` says whether a
+  binding counts here at all. A channel reads it to offer `/github bind` before it sends a question that needs GitHub. It
+  exists only while the tools are on.
 - A session that acts as another user (`config.acting_as`) is not offered these tools.
 - An assistant's router turn gets the same entry, cut by its `tools_allowlist` to the reads a question needs
   (`assistant/read-tools.ts`: no write, no whole diff, no job log), and under its `read_taint`: once a read has answered,
@@ -61,6 +77,7 @@ A failed read is the tool's own error (`isError`), and Brain marks its result ev
 | `CLAW_GITHUB_MCP_SECRET` | none | HMAC key of the session token, 32 characters or more; the API does not start without it while the switch is on |
 | `CLAW_GITHUB_MCP_URL` | `<INTERNAL_BACKEND_URL>/v1/internal/github/mcp` | Where Brain reaches the tools |
 | `CLAW_GITHUB_API_URL` | `https://api.github.com` | Shared with GitHub review |
+| `CLAW_GITHUB_MCP_BINDING_ENABLED` | `false` | An owner with no `GH_TOKEN` is served with their GitHub binding; the API does not start with it on unless `IDENTITY_CLIENT_ENABLED` and `CLAW_GITHUB_REVIEW_ENABLED` are on too |
 
 The tools call GitHub's REST and GraphQL API themselves rather than GitHub's own remote MCP server, so they need
 nothing reachable but `CLAW_GITHUB_API_URL`.

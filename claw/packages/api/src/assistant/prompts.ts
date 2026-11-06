@@ -12,7 +12,7 @@
  * only `say` reaches the user, and there is no accept tool at all.
  */
 import { REPLY_LANGUAGE_LABEL } from "./language.js";
-import { REPORT_SUMMARY_MAX } from "./report.js";
+import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
 import type { ReportKind } from "./work-items.js";
 
 /**
@@ -29,26 +29,38 @@ import type { ReportKind } from "./work-items.js";
  * an item, work_recall for how far an item got, the memory and channel tools for what they are for, the system's own failures never
  * given as an answer or a reason, a declined request said in a line, and every say in the reply language (say refuses another, and
  * an item number without its title).
+ * router-v11: v10 with a long answer said whole (up to SAY_MAX_CHARS, shown as up to three messages) instead of cut short, and an
+ * answer the system already sent in full not said again.
  */
-export const ROUTER_PROMPT_VERSION = "router-v10";
+export const ROUTER_PROMPT_VERSION = "router-v11";
 /**
  * The router's prompt with the review and settings tools (`CLAW_ASSISTANT_TOOLS=on`): router-v5 and `ROUTER_REVIEW_PROMPT`
  * (v6: v5 with an allow only on the user's exact approval command, and a channel action not typed as its command put to the user
  * as a button; v7: v6 with a review by someone else refused here, and the user told where to ask for it; v8: v7 on router-v5; v9: v8 on router-v6; v10: v9 on router-v7;
  * v11: v10 on router-v8; v12: v11 with nothing said about a review handed to the user's chat, which answers the message about it
- * itself, and how a started review merges told from its result; v13: v12 on router-v10).
+ * itself, and how a started review merges told from its result; v13: v12 on router-v10;
+ * v14: v13 on router-v11).
  */
-export const ROUTER_REVIEW_PROMPT_VERSION = "router-v13";
+export const ROUTER_REVIEW_PROMPT_VERSION = "router-v14";
 
 /** The assistant's MCP server, which is what Brain puts before each of its tools' names. */
 export const ASSISTANT_MCP_SERVER = "assistant";
 /** A tool is called by its full name, and the model is told so: a name without this is not a tool, and Brain turns it away. */
 export const TOOL_NAME_PREFIX = `mcp__${ASSISTANT_MCP_SERVER}__`;
-/** worker-v2: worker-v1 with report(kind="answer") for a task that only finds something out. */
-export const WORKER_PROMPT_VERSION = "worker-v2";
+/**
+ * worker-v2: worker-v1 with report(kind="answer") for a task that only finds something out.
+ * worker-v3: v2 with an answer given whole (up to REPORT_ANSWER_MAX; longer goes in a file), and every file the user should get
+ * handed over with deliver_file before the report.
+ */
+export const WORKER_PROMPT_VERSION = "worker-v3";
 
-/** The longest `say` text: about 100 words. A longer one is refused so the Router writes it shorter. */
-export const SAY_MAX_CHARS = 600;
+/**
+ * The longest `say` text (the API's `SAY_TEXT_MAX`): a channel shows a long one as up to three messages, whole. The norm is
+ * `SAY_BRIEF_CHARS`; the bound is for the answer the user asked to have in full.
+ */
+export const SAY_MAX_CHARS = 9000;
+/** What a `say` usually is: about 100 words. */
+export const SAY_BRIEF_CHARS = 600;
 
 export const WORK_EVENT_PREFIX = "[work_event]";
 
@@ -57,7 +69,7 @@ export const ROUTER_PROMPT = `You are the user's personal assistant. You talk to
 Nothing you write as plain text reaches the user. The only way to speak to the user is the say tool. If you do not call say, the user hears nothing.
 
 Tools (call each by its full name: ${TOOL_NAME_PREFIX} followed by the name below, for example ${TOOL_NAME_PREFIX}say)
-- say(text, item_id?): send the user a message. At most ${SAY_MAX_CHARS} characters (about 100 words); a longer text is refused, so write it shorter. Pass item_id when the message is about one work item, so the user can act on that item from the message.
+- say(text, item_id?): send the user a message. Keep it to about ${SAY_BRIEF_CHARS} characters (100 words). When the user needs a long answer (a list they asked for, a full result), say it whole, never cut short: up to ${SAY_MAX_CHARS} characters, which they get as up to three messages. Pass item_id when the message is about one work item, so the user can act on that item from the message.
 - work_create(title, brief, repo?): start a new work item and give it to a worker. title is at most 40 characters. brief is everything the worker needs, written as a self-contained task, because the worker cannot see this conversation: a few lines with the request and the names, links and constraints from the conversation, not a plan. It returns the new item's item_id and number.
 - work_send(item_id, text): forward a new instruction or the user's answer to the worker of an existing item. The item goes back to in_progress.
 - work_stop(item_id, reason): stop an item the user no longer wants.
@@ -74,7 +86,7 @@ How to handle a message
 3. A question about progress: answer from the work item list sent with the message. When the user asks how far an item got, what it is doing now or which of several is done, the list (in progress) is not enough: call work_recall(item, "reports") for each item asked about, all in one step, then say the answer (see Describing items).
 4. Chat or a question that needs no work: just say the answer.
    A request you will not carry out (it is unsafe, not allowed, or asks for internal addresses or secrets): say so in one short line, and what you can do instead. Never leave the user's message without an answer.
-5. A message that starts with ${WORK_EVENT_PREFIX} is a report from a worker, not something the user said. It is a fact about an item. Tell the user only what they need to decide, accept or know, in one message, passing the item's item_id to say (the user sees its number and title, never the id). Do not repeat the whole report. A report of kind answer is the answer to what the user asked: say it to them as the answer; the item is closed and there is nothing to accept.
+5. A message that starts with ${WORK_EVENT_PREFIX} is a report from a worker, not something the user said. It is a fact about an item. Tell the user only what they need to decide, accept or know, in one message, passing the item's item_id to say (the user sees its number and title, never the id). Do not repeat the whole report. A report of kind answer is the answer to what the user asked: say it to them as the answer; the item is closed and there is nothing to accept. When the report says the answer was already sent to the user in full, do not say it again: say nothing, or one short line only if they need to know something more.
 6. Speak on your own only when the user must decide something, a result is ready to accept, or an item failed. Do not narrate progress.
 7. You can never accept a result for the user. Accepting is a button the user presses. If the user says a result is fine, tell them to accept it from the message; if they want it changed, work_send what to change.
 8. Do not start a second item for work that already has one. If unsure, ask in one short say.
@@ -124,8 +136,11 @@ Name a work item to the user by its number and title, as in #12 修复登录超�
  * router-read-v5: v3 with GitHub read only by its own tools (never web_fetch of api.github.com, never another server's), research
  * searched again in other words before an answer or a question, and a failed lookup answered by another read or said plainly,
  * never turned into a work item.
+ * router-read-v6: v5, and where a GitHub binding counts (`CLAW_GITHUB_MCP_BINDING_ENABLED`) a user without GitHub tools is told the one
+ * step that connects it (`/github bind`), not only that it is not linked; worded so that a bound user whose binding could not be read
+ * (the identity provider down: the turn then has no GitHub tools either) is not told that they never connected it.
  */
-export const ROUTER_READ_PROMPT_VERSION = "router-read-v5";
+export const ROUTER_READ_PROMPT_VERSION = "router-read-v6";
 
 /**
  * The read section's citing (`CLAW_ASSISTANT_CITATIONS`), logged beside it when on.
@@ -141,6 +156,8 @@ export interface RouterLookupsShown {
   github: readonly string[];
   /** say cites its lookups (`citations.ts`); absent or false, it puts the links in its text, as before. */
   cite?: boolean;
+  /** A GitHub account bound with `/github bind` gives the user these tools (`CLAW_GITHUB_MCP_BINDING_ENABLED`). */
+  githubBinding?: boolean;
 }
 
 /** How say cites what a lookup returned, with citing on. */
@@ -151,7 +168,10 @@ When say tells the user something a lookup of this turn returned (a web page, a 
 const GITHUB_SEARCH = "mcp__github__issue_search finds pull requests and issues anywhere with GitHub search syntax (is:pr is:open author:@me is the user's open pull requests; add repo:owner/name or org:name to narrow; total_count is the number).";
 
 /** The GitHub line of the read section: the reads the turn has, by their full names. */
-function githubLookups(tools: readonly string[]): string {
+function githubLookups(tools: readonly string[], binding = false): string {
+  if (!tools.length && binding) {
+    return "- GitHub: no GitHub tools in this conversation: the user has not connected GitHub yet, or their connection could not be read just now. For a question about their GitHub, say in one line that their GitHub is not connected here or could not be read just now, and that if they have not connected it they do so once by sending /github bind to Clawy in Teams (or by keeping a GH_TOKEN in their Claw settings) and then ask again; never that you cannot use GitHub. A public page can still be read with web_fetch.";
+  }
   if (!tools.length) {
     return "- GitHub: no GitHub tools in this conversation (the user may not have linked a GitHub token in their Claw settings). For a question about their GitHub, say that in one line; a public page can still be read with web_fetch.";
   }
@@ -163,7 +183,7 @@ function githubLookups(tools: readonly string[]): string {
 /** What the router is told about its lookups: what each reaches, and that a question they answer is answered here, now. */
 export function renderRouterReadSection(lookups: RouterLookupsShown): string {
   const reach = [
-    githubLookups(lookups.github),
+    githubLookups(lookups.github, lookups.githubBinding),
     "- The web: web_search for current facts and news, web_fetch to read one page, whenever they are in your tool list.",
     ...(lookups.servers.length
       ? [`- The read tools of these servers: ${lookups.servers.map((s) => oneLine(s)).join(", ")}, called by their full name (mcp__<server>__<tool>).`]
@@ -233,7 +253,9 @@ Report as you go, and keep reports few:
 - report(kind="ready", summary, result?) when the work is done and can be checked. Put what to look at in result.refs (a pull request url, a commit sha, a run id) and say in the summary what was done and how you checked it. A result the user cannot check is not ready.
 - report(kind="failed", summary) when the work cannot be done; say why.
 - report(kind="dropped", summary) when the work turns out not to be needed.
-summary is at most ${REPORT_SUMMARY_MAX} characters. A report that is refused tells you why: fix it and report again.
+summary is at most ${REPORT_SUMMARY_MAX} characters, except an answer's: an answer is given whole, up to ${REPORT_ANSWER_MAX} characters, never cut short. An answer longer than that goes into a file you deliver (below), with the gist in the summary. A report that is refused tells you why: fix it and report again.
+
+Files: the user cannot open your workspace. Every file the user asked for or should keep (a report, a chart, a spreadsheet, a document) is handed over with deliver_file before you report; the user gets a download for each file you deliver. A path in a summary is not a file they have. Files the user sent are named in the task, under /workspace/.uploads/.
 
 Finish every run with a report of kind answer, ready, blocked, failed or dropped. Ending without one is read as ready with your last message as the summary, so say plainly in that message what was done.
 
@@ -436,8 +458,15 @@ export function renderWorkerSystem(item: { seq: number; title: string }): string
 /** The message that wakes the Router for a worker's report. It starts with the marker the Router prompt names. */
 export function formatWorkEvent(e: {
   itemId: string; seq: number; kind: ReportKind; version?: number; summary: string; question?: string | null;
+  /** The answer was already sent to the user whole (`answerSentWhole`): the router is told so, with its beginning only. */
+  sentInFull?: boolean;
 }): string {
   const head = `${WORK_EVENT_PREFIX} #${e.seq} (item_id: ${e.itemId}) ${e.kind}${e.kind === "ready" && e.version ? ` v${e.version}` : ""}`;
+  if (e.sentInFull) {
+    const summary = oneLine(e.summary);
+    const start = Array.from(summary).slice(0, SAY_BRIEF_CHARS).join("");
+    return `${head}: (already sent to the user in full; this is its beginning) ${start}${start.length < summary.length ? "…" : ""}`;
+  }
   return `${head}: ${oneLine(e.summary)}${e.question ? `\nQuestion for the user: ${oneLine(e.question)}` : ""}`;
 }
 

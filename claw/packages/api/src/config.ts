@@ -573,6 +573,10 @@ export const CLAW_GITHUB_REVIEW_ENABLED = envBool("CLAW_GITHUB_REVIEW_ENABLED", 
 // --- GitHub tools for every session whose owner stored a GH_TOKEN (default OFF) ---
 // When false: no route, and no `github` MCP server is offered to a session. See claw/docs/github-mcp.md.
 export const CLAW_GITHUB_MCP_ENABLED = envBool("CLAW_GITHUB_MCP_ENABLED", false);
+// --- ... and, for an owner who keeps none, the GitHub account they bound (`/github bind`) at the identity provider (default OFF) ---
+// When false: only GH_TOKEN counts, as before. When true the API also needs IDENTITY_CLIENT_ENABLED and CLAW_GITHUB_REVIEW_ENABLED
+// (whose audit log every call made with a binding is written to). See claw/docs/github-mcp.md.
+export const CLAW_GITHUB_MCP_BINDING_ENABLED = envBool("CLAW_GITHUB_MCP_BINDING_ENABLED", false);
 
 /**
  * How a connector's access token is checked (see auth/connector-token.ts). Read

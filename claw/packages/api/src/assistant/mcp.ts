@@ -26,6 +26,7 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS 
 import { db } from "../infra/db.js";
 import { ASSISTANT_MCP_PATH } from "./role-profile.js";
 import { PASS_REASONS, SAY_MAX_CHARS } from "./prompts.js";
+import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
 import { REPORT_KINDS } from "./work-items.js";
 import { githubEventsEnabled, prReply, REPLY_BODY_MAX, watchNamedPullRequests, workSubscribe } from "./github-events.js";
 import { jobUnwatch, jobWatch, jobWatchesEnabled, jobWatchList } from "./job-watch.js";
@@ -402,7 +403,9 @@ export function createAssistantMcpServer(
       "Tell the assistant how the work stands. Nobody else reads your output.",
       {
         kind: z.enum(REPORT_KINDS),
-        summary: z.string().describe("What happened or what is needed; at most 600 characters."),
+        summary: z.string().describe(
+          `What happened or what is needed; at most ${REPORT_SUMMARY_MAX} characters. For kind answer, the whole answer, up to ${REPORT_ANSWER_MAX}.`,
+        ),
         question: z.string().optional().describe("One concrete question for the user; only with waiting or blocked."),
         result: z.object({
           refs: z.array(z.object({

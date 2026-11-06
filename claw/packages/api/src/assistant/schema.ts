@@ -133,6 +133,16 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
        ON claw_assistant_says(item_id, item_attention_seq) WHERE fallback`,
   );
 
+  // How far an item's delivered files have been announced (`deliveries.ts`): through the report event `event_id`. A report whose
+  // announcement failed (the store did not answer) is newer than this, and the sweep announces its files again.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_work_item_delivery_checks (
+      item_id     TEXT PRIMARY KEY,
+      event_id    BIGINT NOT NULL,
+      checked_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
   // GitHub events for work items (`github-events.ts`): which pull request an item watches, what was seen on it,
   // and what the item's worker answered. Used only while CLAW_ASSISTANT_GITHUB_EVENTS is on.
   await client.query(`
