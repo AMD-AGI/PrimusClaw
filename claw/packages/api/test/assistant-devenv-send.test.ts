@@ -753,6 +753,20 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_cmd_seqs], ["in_progress", [v1]]);
     await events("alice", cid, sid, [chunk("v1 done"), endOf(v1)]);
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).summary], ["done", "v1 done"]);
+
+    // The same across an upgrade: a cancel noted before the prompts it had open were kept with it is counted when its end comes.
+    await send({ type: "prompt", text: "x1" });
+    await send({ type: "cancel" });
+    await w.q(
+      `UPDATE claw_work_items SET params = jsonb_set(params, '{cancels}', (SELECT jsonb_agg(c - 'seqs') FROM jsonb_array_elements(params->'cancels') c))
+        WHERE worker_session_id = $1`,
+      [`remote:${sid}`],
+    );
+    assert.equal((await remoteItem(sid)).params.cancels[0].seqs, undefined);
+    await events("alice", cid, sid, [endOf(null, "cancelled")]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.params.open_turns, item.params.open_cmd_seqs], ["done", 0, null],
+      "a cancel from before the upgrade ends what it had open, counted");
   });
 
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {
