@@ -15,8 +15,13 @@
  * the run was closed, a run interrupted from the web UI). They record under the same unique key, one record
  * per run, so neither can double what the other did.
  */
+import { createHash } from "node:crypto";
+import { deliveryContentType, deliveryKeyPrefix } from "@claw/protocol";
 import pino from "pino";
+import { redactPublicJson } from "../events/redaction.js";
 import { db } from "../infra/db.js";
+import { sessionWorkspacePrefix } from "../workspace/prefix.js";
+import { TEXT_DELIVERY_MAX_BYTES, textDeliveryPorts } from "./text-delivery.js";
 import { SWEEPABLE_RUN_STATUSES } from "../tasks/chat-run.js";
 import { REPORT_SUMMARY_MAX } from "./report.js";
 import { announceDeliveries, ingestReport } from "./reports.js";
@@ -110,6 +115,45 @@ function endReport(
   };
 }
 
+/** Final words at least this long that no report carried are handed to the user as a file (`deliverUnreadFinalWords`). */
+export const FINAL_WORDS_FILE_MIN = 1200;
+
+/** A delivery id made from the run, so a second completion of the same run writes the same file and announces it once. */
+function runDeliveryId(runId: string): string {
+  const h = createHash("sha256").update(`final-words\u0000${runId}`).digest("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
+/**
+ * A worker that wrote what the user asked for into its last message (a document it could not save, a long answer) after or instead of
+ * reporting it: nobody reads that message, and the report the router reads holds a line at most (2026-11-06, F1: "the text is in my
+ * final reply", and the user never got it). When those final words are long and no report of the run carried them, they become a file
+ * of the item (`item-<n>-reply.md`), announced to the user as every delivery of the item is. Returns whether a file was written.
+ */
+export async function deliverUnreadFinalWords(itemId: string, workerSessionId: string, runId: string, finalText: string | undefined): Promise<boolean> {
+  const text = (finalText ?? "").trim();
+  if (text.length < FINAL_WORDS_FILE_MIN) return false;
+  const row = (await db.query(
+    `SELECT w.seq, s.user_id,
+            (SELECT r.summary FROM claw_work_item_events r
+              WHERE r.item_id = w.item_id AND r.run_id = $3 AND r.kind <> 'run_started' AND r.source = 'worker'
+              ORDER BY r.id DESC LIMIT 1) AS reported
+       FROM claw_work_items w JOIN claw_sessions s ON s.session_id = w.worker_session_id
+      WHERE w.item_id = $1 AND w.worker_session_id = $2 AND s.user_id = w.user_id`,
+    [itemId, workerSessionId, runId],
+  )).rows[0] as { seq: number; user_id: string; reported: string | null } | undefined;
+  if (!row) return false;
+  // A report that already holds most of it (an answer given whole) said it: the words are not unread.
+  if ((row.reported ?? "").length * 2 >= text.length) return false;
+  const name = `item-${Number(row.seq)}-reply.md`;
+  const body = Buffer.from(String(redactPublicJson(text) ?? ""), "utf8").subarray(0, TEXT_DELIVERY_MAX_BYTES);
+  await textDeliveryPorts.put(
+    `${deliveryKeyPrefix(sessionWorkspacePrefix(row.user_id, workerSessionId), runDeliveryId(runId))}${name}`, body, deliveryContentType(name),
+  );
+  logger.info({ itemId, runId, bytes: body.length }, "assistant.final_words_delivered");
+  return true;
+}
+
 /** Record how one run ended, if that tells the assistant something it was not already told. */
 export async function recordRunEnd(
   workerSessionId: string, runId: string, outcome: TurnEndOutcome,
@@ -117,6 +161,14 @@ export async function recordRunEnd(
 ): Promise<"recorded" | "skipped"> {
   const record = await runRecord(workerSessionId, runId);
   if (!record) return "skipped";
+  if (outcome === "finished") {
+    try {
+      await deliverUnreadFinalWords(record.item_id, workerSessionId, runId, detail.finalText);
+    } catch (err) {
+      // The report below still tells the assistant how the run ended; the words are in the worker's session.
+      logger.warn({ err, itemId: record.item_id }, "assistant.final_words_not_delivered");
+    }
+  }
   if (record.told || record.continuing) {
     // Nothing to report, but a file the run delivered after its last report (or one a report's announcement missed) is the user's.
     await announceDeliveries(record.item_id);

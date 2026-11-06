@@ -24,6 +24,7 @@ import pino from "pino";
 import { db } from "../infra/db.js";
 import { detectLanguage } from "./language.js";
 import { SAY_TEXT_MAX, publishSayEvent, recordAssistantSay, recordSystemNotice, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
+import { citedNumbers } from "./citations.js";
 import { internalTextIn, userWordsOf } from "./internal-text.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 import { releaseHeldSays } from "./say-hold.js";
@@ -61,12 +62,24 @@ function asMessage(text: string): string {
 }
 
 /**
+ * The text without the [n] it cites: plain text carries no sources (only `say` does), so each [n] would reach the user as a number that
+ * links nowhere (citations follow-up #8). Only the numbers the text cites on their own (`citedNumbers`), each with the space before it;
+ * one right after a name (`a[1]`) is left.
+ */
+export function withoutBareCitations(text: string): string {
+  const cited = citedNumbers(text);
+  if (!cited.size) return text;
+  // After a space, or after anything but a name or a closing bracket: `a[1]` is an index, not a citation.
+  return text.replace(/(?:[ \t]|(?<![A-Za-z_\])]))\[(\d{1,2})\](?![(:])/g, (whole, n: string) => (cited.has(Number(n)) ? "" : whole));
+}
+
+/**
  * What a turn that ended in plain text is to say, if anything: the text, as a message, for a turn that answers the user.
  * A turn that only a worker's report started may end silent on purpose, and the text it wrote then is not for the user.
  * Pure, so the evaluation asks the same question the completion handler does.
  */
 export function answerToDeliver(finalText: string | undefined, prompts: readonly string[]): string | null {
-  const text = asMessage(finalText ?? "");
+  const text = asMessage(withoutBareCitations(finalText ?? ""));
   // Every run started by a report, or no run at all, is nothing to answer.
   if (!text || prompts.every((p) => p.startsWith(WORK_EVENT_PREFIX))) return null;
   return text;

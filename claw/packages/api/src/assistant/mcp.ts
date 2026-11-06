@@ -34,8 +34,9 @@ import { githubEventsEnabled, prReply, REPLY_BODY_MAX, watchNamedPullRequests, w
 import { jobUnwatch, jobWatch, jobWatchesEnabled, jobWatchList } from "./job-watch.js";
 import { briefTool } from "./brief.js";
 import {
-  assistantSchedulesOn, scheduleConfirmationAnswer, triggerCancelTool, triggerCreateTool, triggerListTool,
+  assistantSchedulesOn, githubCommentTool, ROUTER_COMMENT_MAX, scheduleConfirmationAnswer, triggerCancelTool, triggerCreateTool, triggerListTool,
 } from "./schedules.js";
+import { deliverText, TEXT_DELIVERY_MAX_BYTES } from "./text-delivery.js";
 import { type AssistantTokenClaims, verifyAssistantToken } from "./token.js";
 import {
   modelDefaultSet, report, say, ToolRefused, workCreate, workRecall, workSend, workStop, type RecallDetail,
@@ -290,6 +291,24 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims, choic
   );
 }
 
+/**
+ * `deliver_text` (`text-delivery.ts`): a file the model wrote whole, handed to the user with no sandbox. The router's reaches the user
+ * at once; a worker's with its next report.
+ */
+function registerDeliverText(mcp: McpServer, claims: AssistantTokenClaims): void {
+  mcp.tool(
+    "deliver_text",
+    "Give the user a text file you write yourself (a document, a report, a draft, a translation, a table as CSV, code): they get it "
+    + `as a download. No sandbox is needed. text is the whole content, at most ${TEXT_DELIVERY_MAX_BYTES / 1024} KB.`,
+    {
+      name: z.string().describe("The file name with its extension, no folders: k8s-scheduler.md, summary.txt, data.csv."),
+      text: z.string().describe("The whole content of the file."),
+      caption: z.string().optional().describe("One line shown with the file; optional."),
+    },
+    (args) => answer(claims, "deliver_text", () => deliverText(claims, args)),
+  );
+}
+
 /** What `say`'s `sources` says to the model (`CLAW_ASSISTANT_CITATIONS`). */
 export const SAY_SOURCES_PARAM = `Only when the text cites a lookup of this turn as [1], [2]: the address each number stands for, in order (the first is [1]), `
   + "copied exactly from what the lookup returned (a web_search result's url, a GitHub result's url, an agent board issue's or board's html_url, or the URL web_fetch read when a search or "
@@ -334,6 +353,7 @@ export function createAssistantMcpServer(
       // The sources come from Brain, in the request's `_meta` (`citations.ts`); never from the model's `sources` argument.
       (args, extra) => answer(claims, "say", () => say(claims, args, {}, citations ? extra._meta ?? {} : undefined), SAY_FAULT_MESSAGE),
     );
+    registerDeliverText(mcp, claims);
     mcp.tool(
       "work_create",
       "Start a new work item and give it to a worker. Returns its item_id and number.",
@@ -411,7 +431,20 @@ export function createAssistantMcpServer(
       );
     }
     if (reviewTools) registerReviewTools(mcp, claims, modelChoice);
-    if (assistantSchedulesOn()) registerScheduleTools(mcp, claims, !reviewTools);
+    if (assistantSchedulesOn()) {
+      registerScheduleTools(mcp, claims, !reviewTools);
+      mcp.tool(
+        "github_comment",
+        "Put a comment you drafted on a GitHub pull request or issue to the user as a card: nothing is posted by the call. It is posted "
+        + "as the user's GitHub account, exactly as shown, only when they press the card or reply 批准 #<ref>. Use it when the user "
+        + "asks you to comment, after you have read what the comment is about; never start a work item just to post a comment.",
+        {
+          pr: z.string().describe("owner/repo#number, or the pull request's or issue's https://github.com URL."),
+          body: z.string().describe(`The whole comment in Markdown, at most ${ROUTER_COMMENT_MAX} characters; name files and lines as path:line.`),
+        },
+        (args) => answer(claims, "github_comment", () => githubCommentTool(claims, args)),
+      );
+    }
     if (jobWatchesEnabled()) registerJobWatchTools(mcp, claims);
     // An observer is offered them too, as every router tool, and each call only records (`observeEveryTool`); were one
     // ever to run, `memory-tools.ts` refuses every role but the router's (and the worker's recall).
@@ -438,6 +471,7 @@ export function createAssistantMcpServer(
       },
       (args) => answer(claims, "report", () => report(claims, args)),
     );
+    registerDeliverText(mcp, claims);
     if (githubEventsEnabled()) {
       mcp.tool(
         "pr_reply",

@@ -447,6 +447,7 @@ export class WebFetchService {
       WEB_FETCH_MAX_BYTES,
     );
     const raw = !!(input.raw as boolean);
+    const part = pagePart(input);
 
     let parsed: URL;
     try { parsed = validateUrl(url); }
@@ -469,7 +470,8 @@ export class WebFetchService {
     const cached = cache.get(ck);
     if (cached && !prompt) {
       read(cached.finalUrl);
-      return buildOutput(cached.finalUrl, cached.statusCode, cached.contentType, cached.body.length, cached.body, false);
+      const shown = selectPart(cached.body, part);
+      return buildOutput(cached.finalUrl, cached.statusCode, cached.contentType, cached.body.length, shown.text, false, undefined, shown.note);
     }
 
     let result: FetchResult;
@@ -518,6 +520,10 @@ export class WebFetchService {
         "Use the configured browser/Playwright MCP tool to inspect it.";
     }
 
+    // The part of the page asked for (`find`, `offset`), and what the reader is told about the rest. A page larger than one answer
+    // is read in parts: the part that holds a word, or from an offset on, instead of its first part only.
+    const shown = selectPart(content, part, WEB_FETCH_SUMMARIZE && prompt && !raw ? MAX_MARKDOWN_LENGTH : WEB_FETCH_MAX_OUTPUT_CHARS);
+
     // Fast path: preapproved markdown, no prompt, small enough
     if (
       !prompt &&
@@ -526,8 +532,9 @@ export class WebFetchService {
       isPreapprovedHost(parsed.hostname, parsed.pathname) &&
       content.length < MAX_MARKDOWN_LENGTH
     ) {
-      return buildOutput(result.finalUrl, result.statusCode, ct, result.body.length, content, false) + jsWarning;
+      return buildOutput(result.finalUrl, result.statusCode, ct, result.body.length, shown.text, false, undefined, shown.note) + jsWarning;
     }
+    content = shown.text;
 
     // Summarize if enabled and prompt is set
     let summarized = false;
@@ -548,8 +555,71 @@ export class WebFetchService {
       }
     }
 
-    return buildOutput(result.finalUrl, result.statusCode, ct, result.body.length, content, summarized, prompt) + jsWarning;
+    return buildOutput(result.finalUrl, result.statusCode, ct, result.body.length, content, summarized, prompt, shown.note) + jsWarning;
   }
+}
+
+// ── Reading a large page in parts ──
+
+/** Around each place `find` matches, this much of the page before and after it is shown. */
+export const FIND_CONTEXT_CHARS = 1500;
+/** At most this many places are shown for one `find`. */
+export const FIND_MAX_MATCHES = 20;
+
+export interface PagePart { offset: number; find: string }
+
+/** What a call asks to read of a page: from `offset` (a character of the converted page), or around each match of `find`. */
+export function pagePart(input: Record<string, unknown>): PagePart {
+  const n = Number(input.offset);
+  const offset = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  const find = typeof input.find === "string" ? input.find.trim().slice(0, 200) : "";
+  return { offset, find };
+}
+
+/**
+ * The part of `content` a call reads, at most `max` characters, and a note that says what part it is and how to read the rest. With
+ * `find`: the text around each place it appears (case-insensitive), joined where they overlap, in page order; none found is said, with
+ * the page's length. Otherwise: `max` characters from `offset`. A page that fits whole, read from its start, has no note.
+ *
+ * The feature-gate page of Kubernetes converts to several hundred thousand characters; its first 50,000 end in the letter C, so
+ * `SchedulerQueueingHints` could not be read at all and the answer was given from a blog post (2026-11-06 parity run, R1).
+ */
+export function selectPart(content: string, part: PagePart, max: number = WEB_FETCH_MAX_OUTPUT_CHARS): { text: string; note: string } {
+  const total = content.length;
+  if (part.find) {
+    const hay = content.toLowerCase();
+    const needle = part.find.toLowerCase();
+    const spans: Array<[number, number]> = [];
+    let matches = 0;
+    for (let at = hay.indexOf(needle); at >= 0 && matches < FIND_MAX_MATCHES; at = hay.indexOf(needle, at + needle.length)) {
+      matches += 1;
+      const span: [number, number] = [Math.max(0, at - FIND_CONTEXT_CHARS), Math.min(total, at + needle.length + FIND_CONTEXT_CHARS)];
+      const last = spans.at(-1);
+      if (last && span[0] <= last[1]) last[1] = span[1];
+      else spans.push(span);
+    }
+    if (!matches) {
+      return { text: "", note: `"${part.find}" does not appear on this page (${total} characters). Read it with offset, or find another word.` };
+    }
+    let text = "";
+    let shownUpTo = 0;
+    for (const [a, b] of spans) {
+      const piece = `[characters ${a}-${b} of ${total}]\n${content.slice(a, b)}\n\n`;
+      if (text.length + piece.length > max) break;
+      text += piece;
+      shownUpTo = b;
+    }
+    if (!text) text = `[characters ${spans[0][0]}-${spans[0][0] + max} of ${total}]\n${content.slice(spans[0][0], spans[0][0] + max)}`;
+    const more = matches >= FIND_MAX_MATCHES || shownUpTo < spans.at(-1)![1] ? " There may be more matches: narrow find, or read on with offset." : "";
+    return { text, note: `Showing the page around ${matches} match${matches > 1 ? "es" : ""} of "${part.find}" (the page has ${total} characters).${more}` };
+  }
+  const start = Math.min(part.offset, total);
+  const end = Math.min(total, start + max);
+  if (start === 0 && end === total) return { text: content, note: "" };
+  const rest = end < total
+    ? ` Call web_fetch again with offset=${end} to read on, or with find set to a word of the part you need.`
+    : " That is the end of the page.";
+  return { text: content.slice(start, end), note: `Showing characters ${start}-${end} of ${total}.${rest}` };
 }
 
 // ── Build output header ──
@@ -562,6 +632,7 @@ function buildOutput(
   content: string,
   summarized: boolean,
   prompt?: string,
+  part = "",
 ): string {
   let header = `URL: ${url}\nStatus: ${statusCode}\nContent-Type: ${contentType}\nLength: ${byteLength} bytes`;
   if (byteLength > WEB_FETCH_MAX_BYTES) {
@@ -570,6 +641,7 @@ function buildOutput(
   if (summarized) {
     header += `\nSummarized: yes (${WEB_FETCH_SUMMARIZE_MODEL}, prompt="${(prompt ?? "").slice(0, 80)}")`;
   }
+  if (part) header += `\nPart: ${part}`;
   header += "\n---\n";
 
   let body = content;

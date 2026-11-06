@@ -69,21 +69,21 @@ export interface AssistantConfirmWrite {
   confirmation_id: string;
   /** The short id the person may type back. */
   ref: string;
-  kind: "trigger_create" | "trigger_cancel";
+  kind: "trigger_create" | "trigger_cancel" | "github_comment";
   /** What the button that lets it through says, in the language of the text. */
   allow_label: string;
   expires_at: string;
 }
 
 /**
- * A file a work item's worker delivered (`deliver_file`), for a channel to offer as a download. The download is Claw's own link,
- * `GET /v1/sessions/{session_id}/deliveries/{id}`, which answers only the signed-in owner of that session (the item's worker
- * session, which is the user's). `data_base64` is a small image itself (`DELIVERY_INLINE_TYPES`, at most
+ * A file a work item's worker delivered (`deliver_file`, `deliver_text`), or one the router wrote (`deliver_text`), for a channel to
+ * offer as a download. The download is Claw's own link, `GET /v1/sessions/{session_id}/deliveries/{id}`, which answers only the
+ * signed-in owner of that session (the item's worker session, or the assistant's own, both the user's). `data_base64` is a small image itself (`DELIVERY_INLINE_TYPES`, at most
  * `DELIVERY_INLINE_MAX_BYTES`), for a channel that shows it without fetching the link.
  */
 export interface AssistantFile {
-  /** The work item whose worker delivered it. */
-  item_id: string;
+  /** The work item whose worker delivered it; absent for a file the router wrote itself (`text-delivery.ts`). */
+  item_id?: string;
   session_id: string;
   id: string;
   name: string;

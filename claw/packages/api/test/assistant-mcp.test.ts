@@ -88,8 +88,8 @@ describe("assistant MCP service", { skip }, () => {
     const worker = await connect(bearer(await w.workerTurn(item.itemId)));
     try {
       const routerTools = (await router.listTools()).tools;
-      assert.deepEqual(routerTools.map((t) => t.name).sort(), ["claw_self_status", "say", "work_create", "work_recall", "work_send", "work_stop"]);
-      assert.deepEqual((await worker.listTools()).tools.map((t) => t.name), ["report"]);
+      assert.deepEqual(routerTools.map((t) => t.name).sort(), ["claw_self_status", "deliver_text", "say", "work_create", "work_recall", "work_send", "work_stop"]);
+      assert.deepEqual((await worker.listTools()).tools.map((t) => t.name).sort(), ["deliver_text", "report"]);
       // The names Brain gives them are what the router's allowlist pattern selects.
       for (const t of routerTools) assert.ok(`mcp__assistant__${t.name}`.startsWith("mcp__assistant__"));
       const sayTool = routerTools.find((t) => t.name === "say")!;

@@ -13,7 +13,7 @@
  * refused: a late call from the past must not speak to the user or change what a newer turn has decided.
  */
 import { randomUUID } from "node:crypto";
-import { parseSessionRepo } from "@claw/protocol";
+import { CITE_DROPPED_META, CITE_SOURCES_META, parseSessionRepo } from "@claw/protocol";
 import { readTrustedSessionCredentials, sealedCredentialFields } from "../auth/sealed-session-credentials.js";
 import { CLAW_ASSISTANT_WORKER_MODEL, CLAW_DEPLOY_MODE } from "../config.js";
 import pino from "pino";
@@ -26,7 +26,7 @@ import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, recordSystemNotice, SayOutcomeUnknown, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
 import { voidStreamedSay } from "./router-speed.js";
 import { mayHandOff } from "./say-hold.js";
-import { saySources, SAY_SOURCE_OUTCOMES } from "./citations.js";
+import { citedNumbers, saySources, SAY_SOURCE_OUTCOMES } from "./citations.js";
 import { suggestedReplies } from "./suggested.js";
 import { metrics } from "../infra/metrics.js";
 import { bareItemNumbers, internalTextIn, userWordsOf } from "./internal-text.js";
@@ -243,6 +243,16 @@ async function sayOnce(
   // A turn that may still hand a review to the person's channel: what it says goes out when it ends, or never if it hands one over.
   const holdForTurn = claims.mid && mayHandOff(await turnMessage((t, p) => db.query(t, p), claims.sid, claims.mid)) ? claims.mid : undefined;
   const cited = meta === undefined ? null : saySources(meta, typeof args.text === "string" ? args.text.trim() : "");
+  // Refused before anything is counted: the say that goes out instead is the one counted.
+  // Only when Brain said what it kept (a Brain that sends nothing has checked nothing, and the text goes out as before).
+  const checked = !!meta && typeof meta === "object" && (CITE_SOURCES_META in meta || CITE_DROPPED_META in meta);
+  const unlinked = cited && checked && typeof args.text === "string" ? uncitedNumbers(args.text.trim(), args.sources, cited.sources) : [];
+  if (unlinked.length) {
+    throw new ToolRefused(
+      "citation_not_found",
+      `the text cites ${unlinked.map((n) => `[${n}]`).join(" ")} but no lookup of this turn returned the address given for ${unlinked.length > 1 ? "them" : "it"}, so the user would see a number that links nowhere. An address can be cited only as a web_search result's url, a GitHub result's url, or an address the user wrote; a page you fetched at an address you made up is not one (web_search for it first, then cite the result's url). Fix the sources or take those numbers out of the text, and call say again`,
+    );
+  }
   if (cited) for (const outcome of SAY_SOURCE_OUTCOMES) metrics.onAssistantSaySources(outcome, cited.counts[outcome]);
   const suggested = suggestedReplies(args.suggested, userWordsOf([run?.prompt ?? ""]));
   try {
@@ -266,6 +276,17 @@ async function sayOnce(
     }
     throw err;
   }
+}
+
+/**
+ * The numbers a say's text cites as [n] (`citedNumbers`) that carry no source once the turn's lookups were checked: [] unless the model
+ * meant to cite (it passed `sources`). The text of a say that writes [n] with nothing behind it reaches the user as a bare number
+ * (2026-11-06, R1 and R2: [1]-[4] written, the pages fetched at addresses no lookup gave, every source dropped as not_in_turn).
+ */
+export function uncitedNumbers(text: string, asked: unknown, kept: ReadonlyArray<{ n: number }>): number[] {
+  if (!Array.isArray(asked) || !asked.length) return [];
+  const have = new Set(kept.map((s) => s.n));
+  return [...citedNumbers(text)].filter((n) => !have.has(n)).sort((a, b) => a - b);
 }
 
 /** A session config marked as one where no one's personal memory is kept or shown. */

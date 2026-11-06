@@ -31,8 +31,8 @@ test("no memory tools are offered and no turn reads the user's memory", async ()
     return names;
   };
   const exp = Math.floor(Date.now() / 1000) + 600;
-  assert.deepEqual(await tools({ sid: "s", role: "router", mid: "m", task_id: "t", exp }), ["claw_self_status", "say", "work_create", "work_recall", "work_send", "work_stop"]);
-  assert.deepEqual(await tools({ sid: "s", role: "worker", item_id: "i", gen: 1, mid: "m", task_id: "t", exp }), ["report"]);
+  assert.deepEqual(await tools({ sid: "s", role: "router", mid: "m", task_id: "t", exp }), ["claw_self_status", "deliver_text", "say", "work_create", "work_recall", "work_send", "work_stop"]);
+  assert.deepEqual(await tools({ sid: "s", role: "worker", item_id: "i", gen: 1, mid: "m", task_id: "t", exp }), ["deliver_text", "report"]);
 
   assert.equal(mt.assistantMemoryOn(), false);
   let statements = 0;

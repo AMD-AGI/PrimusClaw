@@ -812,9 +812,11 @@ export class ToolRouter {
       } as ToolSchema] : []),
 
       ...(WEB_FETCH_ENABLED ? [{
-        name: "web_fetch", description: "Fetch a URL and return its content. Use after web_search to read a specific page. Does not execute JavaScript. If `prompt` is set and summarization is enabled, content is condensed by a small fast model before returning.", input_schema: {
+        name: "web_fetch", description: "Fetch a URL and return its content. Use after web_search to read a specific page. Does not execute JavaScript. If `prompt` is set and summarization is enabled, content is condensed by a small fast model before returning. A page longer than one answer is read in parts: set find to a word of the part you need (a feature's or a product's name) to get the page around each place it appears, or offset to read on from where the last part ended.", input_schema: {
           type: "object", properties: {
             url: { type: "string", description: "Absolute http(s) URL" },
+            find: { type: "string", description: "Optional: return only the page around each place this text appears (case-insensitive), for a large page such as a reference table or a compatibility matrix." },
+            offset: { type: "number", description: "Optional: the character of the page to start from, as a previous answer's Part line gives it (default 0)." },
             prompt: { type: "string", description: "Optional task to apply to the fetched content (e.g. 'extract the API examples'). Triggers Haiku summarization when enabled." },
             max_bytes: { type: "number", description: "1024-10485760 (default 10 MiB). HTTP body cutoff." },
             raw: { type: "boolean", description: "true → bypass Markdown conversion AND summarization (default false)" },

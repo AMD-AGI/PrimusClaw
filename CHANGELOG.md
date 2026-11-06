@@ -28,6 +28,23 @@ record it.
 ## [Unreleased]
 
 ### Added
+- The assistant writes text itself and hands it over with no sandbox: `deliver_text(name, text, caption?)` (router and worker) stores a
+  text file (markdown, plain text, CSV, JSON, YAML, code; at most 256 KB, redacted as a message is) as a delivery of the calling
+  session, which the user downloads from Claw's own link. A router's file reaches the user at once, a worker's with its next report.
+  The router is told that writing, drafting and translating are its own, not a work item's (`router-write-v1`).
+- `github_comment(pr, body)` (router, with the confirmation cards on): a comment the router drafted is put to the user as a card that
+  shows it whole; pressing it (or `批准 #<ref>`) posts exactly that comment as the user's GitHub account. Nothing is posted by the call,
+  and no work item or sandbox is needed to comment.
+- `web_fetch` reads a page larger than one answer in parts: `find` returns the page around each place a text appears, `offset` reads on
+  from a character; a page cut short says how long it is and the offset to read on.
+
+### Fixed
+- A worker that left what the user asked for in its last words (after a one-line report, or with no report) no longer loses it: final
+  words of 1200 characters or more that no report of the run held are delivered as `item-<n>-reply.md`.
+- A `say` whose `[n]` lost its source (the page was fetched at an address no lookup returned) is refused with what to do, instead of
+  reaching the user as a number that links nowhere; a turn that ended in plain text is said without its bare `[n]`.
+- The router answers a list item by item from the result (`owner/repo#number`), gives numbers exactly as returned (no estimates), and
+  never tells the user an earlier answer was unchecked (`router-read-v8`).
 - A review item's pull request is followed after its turn (`gh_pr_follow`, the review items' sweep, at most every 90 s per item):
   merged or closed on GitHub ends the item and closes what its session still held for the reviewer's answer. For a review asked of
   someone else that may merge, the requester's own GitHub account merges their pull request once the reviewer's approval of the head
