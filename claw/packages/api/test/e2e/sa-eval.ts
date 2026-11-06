@@ -546,7 +546,8 @@ async function answerHold(spec: HoldSpec, items: readonly ItemSeen[], deadline: 
  * Whether turns of a session are over by `deadlineAt`, as `over` judges the message ids of their stored exec_complete
  * (`storedTurnEnds`). Brain sends exec_complete last, after the workspace sync and the transcript, and a stream never carries
  * it; the stream's end of a turn (`streamed`: its executionStats) only says it is finishing. So the stored events are read
- * once the stream says so, and every 10 s whatever it says (a turn whose delivery Brain gave up on has exec_complete alone).
+ * once the stream says so, every 10 s whatever it says (a turn whose delivery Brain gave up on has exec_complete alone), and
+ * in the last 2 s before the deadline; never after it, so a turn that ends late is late, by this runner's clock.
  * `wait` is the `until` the caller's waits use (one a stop ends, or not).
  */
 async function turnsOver(
@@ -555,13 +556,11 @@ async function turnsOver(
 ): Promise<boolean> {
   let readAt = 0;
   const probe = async (): Promise<true | undefined> => {
-    if (!streamed() && Date.now() - readAt < 10_000) return undefined;
+    if (!streamed() && Date.now() - readAt < 10_000 && deadlineAt - Date.now() > 2_000) return undefined;
     readAt = Date.now();
     return over(storedTurnEnds(await replay(sessionId).catch(() => []))) ? true : undefined;
   };
-  if ((await wait(probe, deadlineAt, 1_000)) === true) return true;
-  // Once more after the deadline: a turn that ended while the last read was waiting is over.
-  return over(storedTurnEnds(await replay(sessionId).catch(() => [])));
+  return (await wait(probe, deadlineAt, 1_000)) === true;
 }
 
 /**
@@ -629,7 +628,9 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
     await waitEnds(1, start + turnWaitMs(false));
     const sentAt: number[] = [start];
     let lastMid: string | undefined;   // the last turn's message id (a single-turn case: every event is the last turn's)
-    const firstText: Array<number | null> = [stream.events.find((e) => e.data?.type === "AssistantMessage")?.at ?? null];
+    // A reply is the main agent's message: a sub-agent's is not shown to the user, and would make a slow reply look on time.
+    const replied = (e: LiveEvent): boolean => e.data?.type === "AssistantMessage" && !e.data.subagent_id;
+    const firstText: Array<number | null> = [stream.events.find(replied)?.at ?? null];
     for (const [k, t] of turns.slice(1).entries()) {
       const wait = start + (t.after_ms ?? 0) - Date.now();
       if (wait > 0) await pause(wait);
@@ -641,7 +642,7 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
       lastMid = typeof r.json?.message_id === "string" ? r.json.message_id : undefined;
       sentAt.push(at);
       await waitEnds(k + 2, at + turnWaitMs(false));
-      firstText.push(stream.events.find((e) => e.data?.type === "AssistantMessage" && e.at >= at)?.at ?? null);
+      firstText.push(stream.events.find((e) => replied(e) && e.at >= at)?.at ?? null);
     }
     await sleep(3_000);
     const rows = await replay(sessionId);

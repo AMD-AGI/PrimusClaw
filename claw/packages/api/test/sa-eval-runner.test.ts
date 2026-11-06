@@ -18,9 +18,9 @@
  *      server refused for its hourly cap makes the attempt the run's failure. Says of an earlier run, whose assistant session
  *      is gone, are read from its say log, and the run leaves its own there
  *   R5 baseline: a plain session's turn is over once its exec_complete is stored, what it showed is graded (a tool name in an earlier
- *      message fails the case), and the session is deleted and seen gone
+ *      message fails the case; a sub-agent's message is not the first reply), and the session is deleted and seen gone
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
- *      on ends with that alone), an error and not a grade when they do not either
+ *      on ends with that alone), an error and not a grade when they do not either, or only after the wait
  */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -411,17 +411,22 @@ test("R5 baseline: the turn's end, what it showed, and its session", { timeout: 
   const base = await claw.start();
   claw.router = (_content, id, sessionId) => {
     const text = (t: string) => ({ type: "AssistantMessage", message_id: id, data: { content: [{ type: "text", text: t }] } });
-    claw.emit(text("Calling mcp__safe__node_list for you."), Date.now(), sessionId);
-    claw.emit(text("There are 3 nodes."), Date.now(), sessionId);
-    claw.emit({ type: "executionStats", message_id: id, turns: 1 }, Date.now(), sessionId);
-    setTimeout(() => claw.emit({ type: "exec_complete", message_id: id, final_text: "There are 3 nodes." }, Date.now(), sessionId), 1_500);
+    // A sub-agent answers at once, the main agent only 1.5 s later: the user's first reply is the main agent's.
+    claw.emit({ ...text("sub-agent notes"), subagent_id: "sub-1" }, Date.now(), sessionId);
+    setTimeout(() => {
+      claw.emit(text("Calling mcp__safe__node_list for you."), Date.now(), sessionId);
+      claw.emit(text("There are 3 nodes."), Date.now(), sessionId);
+      claw.emit({ type: "executionStats", message_id: id, turns: 1 }, Date.now(), sessionId);
+      setTimeout(() => claw.emit({ type: "exec_complete", message_id: id, final_text: "There are 3 nodes." }, Date.now(), sessionId), 1_500);
+    }, 1_500);
   };
-  const r = runner(base, [{ id: "t-base-001", pipeline: "catalog", area: "general", lang: "en", route: "answer", turns: [{ user: "how many nodes?" }] }],
-    { EVAL_MODE: "baseline", EVAL_PLUGIN_ID: "9" });
+  const r = runner(base, [{ id: "t-base-001", pipeline: "catalog", area: "general", lang: "en", route: "answer", turns: [{ user: "how many nodes?" }],
+    latency_budget_s: { first: 1 } }], { EVAL_MODE: "baseline", EVAL_PLUGIN_ID: "9" });
   const run = await r.done;
   await claw.stop();
   try {
     assert.match(run.out, /FAIL t-base-001#1 .*no internal text: tool name/, run.out);
+    assert.match(run.out, /FAIL t-base-001#1 .*first reply <= 1s/, "the sub-agent's message is not the user's first reply");
     const deletedAt = claw.callAt[claw.calls.indexOf("DELETE /v1/sessions/plain-1")]!;
     assert.ok(deletedAt >= claw.settledAt.get("msg-first")!, "the session is deleted only after its turn's exec_complete was stored");
     assert.equal(run.code, 0, "a failed case is a measurement: the run itself completed and cleaned up");
@@ -435,6 +440,10 @@ test("R6 a turn with no end on the stream", { timeout: 120_000 }, async () => {
   const claw = new FakeClaw();
   const base = await claw.start();
   claw.router = (content, id) => {
+    if (content === "late") {
+      // Over 4 s after its message, past EVAL_TURN_WAIT_S=2: late is late, even if the end is stored by the time anyone looks.
+      setTimeout(() => { claw.emit({ type: "executionStats", message_id: id }); claw.emit({ type: "exec_complete", message_id: id, final_text: "late" }); }, 4_000);
+    }
     if (content === "poisoned") {
       // Brain gave up on the delivery: exec_complete alone, which the stream never carries.
       claw.emit({ type: "AssistantSay", say_id: `say-${id}`, turn_message_id: id, text: "Sorry, that did not go through." });
@@ -443,12 +452,13 @@ test("R6 a turn with no end on the stream", { timeout: 120_000 }, async () => {
     // "silent": nothing at all.
   };
   const turnCase = (id: string, user: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user }] });
-  const r = runner(base, [turnCase("t-silent-001", "silent"), turnCase("t-poison-001", "poisoned")], { EVAL_TURN_WAIT_S: "2" });
+  const r = runner(base, [turnCase("t-silent-001", "silent"), turnCase("t-poison-001", "poisoned"), turnCase("t-late-001", "late")], { EVAL_TURN_WAIT_S: "2" });
   const run = await r.done;
   await claw.stop();
   try {
     assert.match(run.out, /ERROR t-silent-001#1 .*no end of the turn of msg-1 within 2 s: not graded/, run.out);
     assert.match(run.out, /pass t-poison-001#1/, "its end was in the stored events: graded on what the user saw");
+    assert.match(run.out, /ERROR t-late-001#1 .*no end of the turn of msg-3 within 2 s: not graded/, "a turn over after the wait is not graded");
     assert.equal(run.code, 1, "an attempt that could not be graded fails the run");
     assert.deepEqual(claw.calls.filter((c) => c.startsWith("DELETE")), ["DELETE /v1/sessions/asst-1"]);
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
