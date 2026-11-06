@@ -73,18 +73,15 @@ export async function releaseHeldSays(q: Querier, messageId: string): Promise<Ar
 export async function turnAnnouncedStart(q: Querier, userId: string, since: Date | string, messageId: string): Promise<string | null> {
   // Without notifications there is no channel to show the notice in, and no outbox table to find it by: a say is a message of its own.
   if (!CLAW_NOTIFICATIONS_ENABLED) return null;
-  // Of this very turn (the message it answers, kept on the notice's delivery). Only notices made since this turn began are candidates,
-  // and a user has one assistant session (claw_assistants: user_id is its key) whose turns never overlap while alive: a newer turn
-  // supersedes this one, and a superseded turn's say is refused (`turn_superseded`, Q4d) before this is asked. So a notice no channel got
-  // (no delivery row to carry its turn) is taken by time, safely. Read from the user's recent messages first (their index), then their
-  // deliveries.
+  // Of this very turn: the message it answers, kept on the notice's delivery. A notice no channel got has no delivery to say whose it
+  // is, and turns of one user can overlap (an ended gate lets an older run speak), so it is never matched by time: a say after it is
+  // then a message of its own, which loses nothing (and there is no channel that would join the two). Read from the user's recent
+  // messages first (their index), then their deliveries.
   const row = (await q(
     `SELECT s.say_id::text AS say_id FROM claw_assistant_says s
       WHERE s.user_id = $1 AND s.fallback AND s.item_id IS NOT NULL AND s.created_at >= $2
         AND (s.text LIKE '已开始：#%' OR s.text LIKE 'Started #%')
-        AND (EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text AND o.payload->>'turn_message_id' = $3)
-             -- (a notice no channel got carries its turn only on its session event; then it is taken by time, as the session shows it)
-             OR NOT EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text))
+        AND EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text AND o.payload->>'turn_message_id' = $3)
       ORDER BY s.created_at DESC LIMIT 1`,
     [userId, since, messageId],
   )).rows[0] as { say_id: string } | undefined;

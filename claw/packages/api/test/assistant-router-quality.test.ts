@@ -156,27 +156,15 @@ describe("router quality, through the tools", { skip }, () => {
     assert.equal((await w.mod.tools.say(next as never, { text: `#${created.seq} Kubernetes 调度器简介 在进行。` }, w.sayDeps)).ok, true);
   });
 
-  test("Q4c with no channel subscribed, a say after the start notice is still marked as adding to it (for the session)", async () => {
+  test("Q4c a start notice no channel got is never what a say is added to: no turn to match it by, so the say is its own, nothing lost", async () => {
     await w.q("DELETE FROM claw_notification_subscriptions");
     const turn = await turnFor("帮我新建一个任务：整理发布说明");
     const created = await w.mod.tools.workCreate(turn as never, { title: "整理发布说明", brief: "do it" }, w.sayDeps);
     assert.equal(created.announced, true);
-    const notice = (await w.q(`SELECT say_id::text AS id FROM claw_assistant_says WHERE text LIKE '已开始：#${created.seq} %'`))[0] as { id: string };
     const added = await w.mod.tools.say(turn as never, { text: "顺便：会按版本分组。" }, w.sayDeps);
-    assert.equal(w.events.find((e) => e.type === "AssistantSay" && e.say_id === added.say_id)?.amends, notice.id);
-  });
-
-  test("Q4d a newer turn's start notice is never added to by an older turn: the older turn is superseded and its say refused", async () => {
-    await w.q("DELETE FROM claw_notification_subscriptions");   // (the time-matched case: no delivery row carries a notice's turn)
-    const older = await turnFor("帮我看一下 CI");
-    const newer = await turnFor("帮我新建一个任务：整理发布说明");
-    const created = await w.mod.tools.workCreate(newer as never, { title: "整理发布说明", brief: "do it" }, w.sayDeps);
-    assert.equal(created.announced, true);
-    await assert.rejects(w.mod.tools.say(older as never, { text: "CI 是绿的。" }, w.sayDeps), (err: any) => {
-      assert.equal(err.code, "turn_superseded");
-      return true;
-    });
-    assert.equal(w.events.filter((e) => e.type === "AssistantSay" && e.amends).length, 0);
+    assert.equal(added.ok, true, "stored, not refused");
+    const event = w.events.find((e) => e.type === "AssistantSay" && e.say_id === added.say_id);
+    assert.ok(event && event.amends === undefined);
   });
 
   test("Q5 a turn whose model answered nothing is told as declined; any other failure as not gone through", async () => {
