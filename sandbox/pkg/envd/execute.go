@@ -507,20 +507,30 @@ func (w *sseFieldWriter) Write(p []byte) (int, error) {
 // without it Go's exec.CommandContext (Go 1.21+) may kill the entire
 // process group when the HTTP request context closes.
 func stripEnvDProxyGroup(cmd *exec.Cmd) {
-	uid := uint32(os.Getuid())
-	gid := uint32(os.Getgid())
-	groups := []uint32{gid}
-	if current, err := syscall.Getgroups(); err == nil {
-		groups = withoutEnvDProxyGroup(current)
-	}
+	current, err := syscall.Getgroups()
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-		Credential: &syscall.Credential{
-			Uid:    uid,
-			Gid:    gid,
-			Groups: groups,
-		},
+		Setpgid:    true,
+		Credential: childCredential(os.Getuid(), os.Getgid(), current, err),
 	}
+}
+
+// childCredential is the credential a child of EnvD starts with, or nil when
+// the child keeps EnvD's own. A credential costs a setgroups(2) in the child,
+// which a user namespace whose /proc/self/setgroups is "deny" refuses: that is
+// the root-mapped namespace an unprivileged runtime such as apptainer
+// --fakeroot gives a root container, and there a credential fails every
+// command with "fork/exec ...: operation not permitted". So a credential is
+// asked for only when there is a group to leave out, or when EnvD's groups
+// could not be read and the child is narrowed to its primary group.
+func childCredential(uid, gid int, groups []int, err error) *syscall.Credential {
+	kept := []uint32{uint32(gid)}
+	if err == nil {
+		kept = withoutEnvDProxyGroup(groups)
+		if len(kept) == len(groups) {
+			return nil
+		}
+	}
+	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: kept}
 }
 
 func withoutEnvDProxyGroup(groups []int) []uint32 {
