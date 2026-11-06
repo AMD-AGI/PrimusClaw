@@ -54,12 +54,33 @@ export function isCiteSourceKind(v: unknown): v is CiteSourceKind {
 }
 
 /**
- * The address `raw` names, when it can be a source: an absolute http or https URL, with a host, without credentials, without
- * whitespace or control characters, at most `CITE_URL_MAX` characters. Null for anything else.
+ * Query and fragment parameters that carry a credential (a pre-signed address's signature, an OAuth code or token, an API key): a
+ * name matches by one of its words (`X-Amz-Signature`, `sig`, `api_key`) or, written as one, by a word inside it (`accessToken`,
+ * `AWSAccessKeyId`). An address with one is never a source: shown to people, anyone could use it.
+ */
+const SECRET_PARAM_PARTS = new Set(["sig", "key", "code", "sid", "pass", "pwd", "auth", "jwt", "session", "bearer"]);
+const SECRET_PARAM_WORDS = ["signature", "token", "secret", "password", "passwd", "credential", "apikey", "accesskey", "privatekey", "authorization", "sessionid"];
+
+/** Whether `url` carries a credential in a query or fragment parameter (`SECRET_PARAM_*`). */
+export function carriesSecret(url: URL): boolean {
+  for (const part of [url.search, url.hash]) {
+    for (const name of new URLSearchParams(part.replace(/^[?#]/, "")).keys()) {
+      const low = name.toLowerCase();
+      const compact = low.replace(/[^a-z0-9]/g, "");
+      if (SECRET_PARAM_WORDS.some((w) => compact.includes(w)) || low.split(/[^a-z0-9]+/).some((p) => SECRET_PARAM_PARTS.has(p))) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The address `raw` names, when it can be a source: an absolute http or https URL, with a host, without credentials (neither as
+ * a user nor as a parameter, `carriesSecret`), without whitespace, control or format characters, at most `CITE_URL_MAX` characters. Null
+ * for anything else.
  */
 export function citeableUrl(raw: unknown): URL | null {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > CITE_URL_MAX) return null;
-  if (/[\s\u0000-\u001f\u007f-\u009f]/.test(raw)) return null;
+  if (/[\s\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}]/u.test(raw)) return null;
   let url: URL;
   try {
     url = new URL(raw);
@@ -67,6 +88,6 @@ export function citeableUrl(raw: unknown): URL | null {
     return null;
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") return null;
-  if (!url.hostname || url.username || url.password) return null;
+  if (!url.hostname || url.username || url.password || carriesSecret(url)) return null;
   return url;
 }

@@ -39,10 +39,11 @@ test("SC1 an entry is kept only when it is well formed and cited in the text; Br
     pr(5),
     pr(7, { url: `${PR}?access_token=ghp_${"a".repeat(36)}` }),
     pr(8, { url: "https://user:pw@github.com/x" }),
+    pr(8, { url: "https://bucket.example/r?X-Amz-Signature=QXdlc29tZVZlcnlTZWNyZXRTaWduYXR1cmU%3D" }),
     pr(0), pr(9), pr(2.5), { url: PR, kind: "github_pr" }, "https://github.com/x", null,
   ], { not_in_turn: 2, invalid: 1, over_cap: 1 }), text);
   assert.deepEqual(out.sources, [pr(1)]);
-  assert.deepEqual(out.counts, { cited: 1, dropped_not_in_turn: 2, dropped_invalid: 1 + 11, dropped_over_cap: 1, unreferenced: 1 });
+  assert.deepEqual(out.counts, { cited: 1, dropped_not_in_turn: 2, dropped_invalid: 1 + 12, dropped_over_cap: 1, unreferenced: 1 });
   assert.deepEqual(saySources(undefined, text), { sources: [], counts: { cited: 0, dropped_not_in_turn: 0, dropped_invalid: 0, dropped_over_cap: 0, unreferenced: 0 } });
   assert.deepEqual(saySources({ [CITE_SOURCES_META]: "x", [CITE_DROPPED_META]: { not_in_turn: -3, invalid: "9" } }, text).counts.dropped_not_in_turn, 0);
   const sorted = saySources(meta([pr(2), pr(1)]), "[1] [2]").sources.map((s) => s.n);
@@ -60,8 +61,22 @@ test("SC2 a title is one plain line with no markup, no address and no hidden cha
   assert.equal(sourceTitle(42, url), "github.com");
   const long = sourceTitle("合".repeat(500), url);
   assert.equal(Array.from(long).length, SAY_SOURCE_TITLE_MAX, "cut by code point, never through one");
-  assert.equal(sourceTitle("emoji 😀".repeat(40), url).endsWith("\ud83d"), false);
-  assert.doesNotMatch(sourceTitle(`token ghp_${"b".repeat(36)} in a title`, url), /ghp_b{36}/, "redacted");
+  assert.equal(sourceTitle(`a${"\u{1F600}".repeat(100)}`, url), `a${"\u{1F600}".repeat(79)}`, "never half of a character");
+  assert.doesNotMatch(sourceTitle(`token ghp_${"b".repeat(36)} in a title`, url), /b{36}/, "redacted, before the markup could take its shape");
+  // Shorter than a token-like run: only masking before the markup is stripped catches it.
+  assert.doesNotMatch(sourceTitle(`token ghp_${"b".repeat(20)} in a title`, url), /b{20}/, "masked while it still has its shape");
+  for (let cp = 0; cp <= 0xffff; cp += 1) {
+    const ch = String.fromCharCode(cp);
+    if (!/[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/u.test(ch)) continue;
+    assert.equal(sourceTitle(`left${ch}right`, url), "left right", `U+${cp.toString(16).padStart(4, "0")} goes`);
+  }
+  assert.equal(sourceTitle("left\u206aright \u{E0041}tag", url), "left right tag", "format characters past the ones named, astral ones too");
+  for (const [title, shown] of [
+    ["- [Click](https://evil.example)", "Click"], ["> quoted", "quoted"], ["1. first", "first"], ["+ * - nested", "nested"],
+    ["## - # title", "title"], ["&lt;b&gt;bold&lt;/b&gt; &#91;x&#93;", "b bold /b x"], ["2026: a year", "2026: a year"],
+  ]) assert.equal(sourceTitle(title, url), shown, title);
+  assert.equal(sourceTitle("signed QXdlc29tZVZlcnlTZWNyZXRTaWduYXR1cmU%3D link", url), "signed link", "a token-like run goes");
+  assert.equal(sourceTitle("o/r src/teams_agent/very/long/path/to/activity.py", url), "o/r src/teams agent/very/long/path/to/activity.py");
 });
 
 test("SC3 all of a message's sources fit the budget, and the longest message with them stays under 16 KiB", () => {

@@ -46,9 +46,19 @@ test("C1 addresses compare by their normalized form; what cannot be a source has
   assert.equal(citeKey("https://example.com/p?q=1#x"), "https://example.com/p?q=1", "the query is kept");
   assert.notEqual(citeKey("https://example.com/p?q=1"), citeKey("https://example.com/p?q=2"));
   for (const bad of [
-    "javascript:alert(1)", "ftp://example.com/x", "https://user:pw@example.com/", "https://example.com/a b", "https://ex\u202eample.com/",
+    "javascript:alert(1)", "ftp://example.com/x", "https://user:pw@example.com/", "https://example.com/a b", "https://ex\u202eample.com/", "https://example.com/a\u206ab", "https://example.com/a\u200bb",
     "/relative", "", 42, null, `https://example.com/${"a".repeat(1100)}`,
   ]) assert.equal(citeKey(bad), null, String(bad));
+  // An address that carries a credential is never a source, whichever lookup returned it.
+  for (const secret of [
+    "https://bucket.example/r?X-Amz-Signature=abc", "https://bucket.example/r?X-Amz-Credential=a%2Fb", "https://b.example/r?X-Amz-Security-Token=t",
+    "https://acct.blob.core.windows.net/c/b?sv=2024&sig=abc", "https://x.example/cb?code=abc&state=s", "https://x.example/?access_token=abc",
+    "https://x.example/?accessToken=abc", "https://x.example/?api_key=abc", "https://x.example/?apiKey=abc", "https://x.example/?key=abc",
+    "https://s3.example/o?AWSAccessKeyId=AKIA&Expires=1", "https://x.example/cb#access_token=abc&token_type=bearer",
+    "https://x.example/?client_secret=abc", "https://x.example/?password=abc",
+  ]) assert.equal(citeKey(secret), null, secret);
+  for (const ok of ["https://example.com/search?q=primus+claw&page=2", "https://docs.example/guide#section-2",
+    "https://github.com/o/r/pull/1#issuecomment-123", "https://example.com/a?design=1&keyboard=us&signal=on"]) assert.ok(citeKey(ok), ok);
 });
 
 test("C2 sources are kept only from a producer the run believes: Brain's web tools and a trusted server", () => {

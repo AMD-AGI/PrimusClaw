@@ -11,10 +11,12 @@
  * stored with the message and sent to the channel (`AssistantSayPayload.sources`):
  *
  *  - each entry's number is 1..`CITE_MAX_PER_CALL`, once, and appears in the text as `[n]` (not as a link's label `[n](...)`);
- *  - its address can be a source (`citeableUrl`: http or https, a host, no credentials) and has nothing a redaction would mask;
+ *  - its address can be a source (`citeableUrl`: http or https, a host, no credentials as a user or a parameter) and has nothing
+ *    a redaction would mask;
  *  - its title is a page's or a pull request's own words, which anyone may have written: it is cut to one plain line of
- *    `SAY_SOURCE_TITLE_MAX` code points with every control and direction character, HTML tag, markup and link character and
- *    address taken out, and redacted, so a channel shows it as text and never as markup, a link or an instruction. No summary of a page is kept.
+ *    `SAY_SOURCE_TITLE_MAX` code points with every control, format and direction character, HTML tag and character reference,
+ *    markup and link character, leading block marker (heading, list, quote), address and token-like run taken out, and redacted
+ *    before and after, so a channel shows it as text and never as markup, a link or an instruction. No summary of a page is kept.
  *  - all of them together stay under `SAY_SOURCES_MAX_BYTES`, so a message with its sources fits a channel's request.
  *
  * The text is never changed: it may already be on the user's screen (`stream_tool_text`).
@@ -60,11 +62,15 @@ export interface SaySources {
 }
 
 /**
- * Controls, invisible and direction characters, none of which is part of a title a person reads: C0, DEL and C1; the soft hyphen;
- * the Arabic letter mark; the Mongolian vowel separator; zero-width and direction marks; the line and paragraph separators;
- * embeddings and overrides; the word joiner and the isolates; the BOM; the interlinear annotation characters.
+ * Every character that is not part of a title a person reads, by its Unicode category: controls (C0, DEL, C1), format characters
+ * (zero-width, direction marks, embeddings, overrides, isolates, the BOM, ...), lone surrogates, private use, unassigned, and the
+ * line and paragraph separators.
  */
-const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufff9-\ufffb]/g;
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}]/gu;
+/** An HTML character reference (`&lt;`, `&#60;`), which a renderer would turn back into markup. */
+const ENTITY = /&#?[a-z0-9]+;/gi;
+/** What makes a line a block in markdown, at its start: a heading, a list item, a quote. */
+const BLOCK = /^(?:#+|[-+*>]+|\d+[.)])(?:\s+|$)/;
 /** An HTML tag. */
 const TAG = /<[^>]*>/g;
 /** A markdown link: its label stays. */
@@ -74,6 +80,8 @@ const LINK = /\[([^\]]*)\]\([^)]*\)/g;
  * keeps its parentheses (`perf(api): ...`). A `#` is a heading only at the start, and goes there.
  */
 const MARKUP = /[\[\]<>*_~|`\\]/g;
+/** A run of 32 or more token characters (a key, a signature, a hash) in a title: never part of a title worth showing. */
+const TOKEN_RUN = /[A-Za-z0-9+=_%-]{32,}/g;
 /** An address written into a title. */
 const ADDRESS = /\b[a-z][a-z0-9+.-]*:\/\/\S*|\bwww\.\S+/gi;
 
@@ -81,8 +89,12 @@ const redact = (text: string): string => String(redactPublicJson(text) ?? "");
 
 /** A source's title as it may be shown: one plain line, no markup and no address, at most `SAY_SOURCE_TITLE_MAX` code points. */
 export function sourceTitle(raw: unknown, url: URL): string {
-  const plain = (typeof raw === "string" ? raw : "")
-    .replace(INVISIBLE, " ").replace(TAG, " ").replace(LINK, " $1 ").replace(ADDRESS, " ").replace(MARKUP, " ").replace(/\s+/g, " ").trim().replace(/^#+\s*/, "");
+  // Redacted first, while a credential still has its own shape (the markup below takes its `_` and its prefix with it), and again
+  // last, on what is shown.
+  let plain = redact((typeof raw === "string" ? raw : "").replace(INVISIBLE, " "))
+    .replace(TAG, " ").replace(ENTITY, " ").replace(LINK, " $1 ").replace(ADDRESS, " ").replace(TOKEN_RUN, " ").replace(MARKUP, " ")
+    .replace(/\s+/g, " ").trim();
+  for (let block = plain.match(BLOCK); block; block = plain.match(BLOCK)) plain = plain.slice(block[0].length).trimStart();
   const cut = Array.from(plain).slice(0, SAY_SOURCE_TITLE_MAX).join("").trim();
   return redact(cut) || url.host;
 }
