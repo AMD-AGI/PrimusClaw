@@ -39,7 +39,7 @@ import { deterministicEventId, enqueue, kickDelivery } from "../notifications/ou
 import { recordActionConfirm } from "./outbound.js";
 import { confirmationRef } from "./prompts.js";
 import { REVIEW_HANDOFF_ACTION, type AssistantActionPayload, type AssistantReviewHandoff } from "../notifications/assistant-events.js";
-import { decidedViaOf, turnMessage, type AttendedVia, type ChannelPerson, type TurnMessage } from "./inbound.js";
+import { decidedViaOf, parseChannelContext, turnMessage, type AttendedVia, type ChannelPerson, type TurnMessage } from "./inbound.js";
 import {
   parseRestartRequest, parseReviewRequest, recordReviewHandoff, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused, reviewItemsEnabled,
   startReviews,
@@ -68,6 +68,8 @@ export const MAX_PRS = 10;
 const MAX_REVIEWER_CANDIDATES = 5;
 /** How long after the person's request their answer naming the reviewer (`确认 <name>`) still answers it. */
 const REVIEWER_ANSWER_WINDOW = "10 minutes";
+/** How many replies (`确认 <name>`) in a row may stand between a request and the reply that answers it. */
+const REVIEWER_REPLIES_SKIPPED_MAX = 5;
 const ACTION_ARGS_MAX = 200;
 /** How far back a repository the user reviewed in counts as one they meant when they give only a number. */
 const RECENT_REPO_WINDOW = "7 days";
@@ -258,22 +260,52 @@ export function reviewerNamed(text: string, person: ChannelPerson & { user_id: s
  * The listed people with a Claw user id whom the message may mean: any of their handles is written in it, theirs alone or not (`lei`
  * of two people), or, when it writes none, everyone listed. Who to offer the person to pick from when their message names nobody alone.
  */
-export function reviewerCandidates(text: string, people: readonly ChannelPerson[]): Array<ChannelPerson & { user_id: string }> {
+export function reviewerCandidates(
+  text: string, people: readonly ChannelPerson[], requester: string,
+): Array<ChannelPerson & { user_id: string }> {
   const t = lower(text);
   const words = [...t.matchAll(WORD)].map((m) => ({ w: m[0], a: m.index, b: m.index + m[0].length }));
-  const linked = people.filter((p): p is ChannelPerson & { user_id: string } => !!p.user_id);
+  const linked = people.filter((p): p is ChannelPerson & { user_id: string } => !!p.user_id && p.user_id !== requester);
   const written = linked.filter((p) => personHandles(p).some((h) => handleSpans(t, words, h).length > 0));
   return (written.length ? written : linked).slice(0, MAX_REVIEWER_CANDIDATES);
 }
 
-/** The person's answer to which reviewer they meant: the whole message is `确认 <name>` or `confirm <name>`; the name, or null. */
-export function reviewerConfirmation(text: string): string | null {
-  const m = /^\s*(?:确认|確認|confirm)[\s:：,，]*(\S[^\n]*?)\s*$/iu.exec(text);
-  return m ? m[1] : null;
+const REPLY = /^\s*(?:确认|確認|confirm)[\s:：,，]*(\S[^\n]*?)\s*$/iu;
+const REPLY_TAG = /^(.*?)\s*[(（]([^()（）]+)[)）]$/u;
+
+/** The word a reply that picks the reviewer starts with: `确认` in a Chinese message, `confirm` otherwise. */
+const replyWord = (text: string): string => (HAN.test(text) ? "确认" : "confirm");
+
+/**
+ * Whether the message is, whole, the person's answer to which reviewer they meant: `确认` or `confirm`, then nothing but one listed person's
+ * name or handle, and, in brackets after it, at most one more handle of the same person (`确认 Alex Chen (achen2)`): the shape of a reply
+ * `reviewerReply` offers. A sentence that merely starts with the word ("确认下，请 Wei, Lei 帮我 review #304") is not one.
+ */
+export function isReviewerReply(text: string, people: readonly ChannelPerson[]): boolean {
+  const m = REPLY.exec(text);
+  if (!m) return false;
+  const tagged = REPLY_TAG.exec(m[1]);
+  const [name, tag] = tagged ? [tagged[1], tagged[2]] : [m[1], ""];
+  return people.some((p) => {
+    if (!p.user_id) return false;
+    const handles = new Set(personHandles(p));
+    return handles.has(flat(name)) && (!tag || handles.has(flat(tag)));
+  });
 }
 
-/** The reply that answers which reviewer: `确认 <name>` in a Chinese message, `confirm <name>` otherwise. */
-export const reviewerReply = (text: string, name: string): string => `${HAN.test(text) ? "确认" : "confirm"} ${name}`;
+/**
+ * The exact reply that picks this person among those listed: `确认 <name>` when their name is theirs alone (`reviewerNamed`), otherwise
+ * the name with the first handle of theirs that tells them apart, in brackets: their address's local part, an alias, their address,
+ * their user id (`确认 Alex Chen (achen2)`), so two people with one name, or with the same words in another order, can each be picked.
+ */
+export function reviewerReply(text: string, person: ChannelPerson & { user_id: string }, people: readonly ChannelPerson[]): string {
+  const plain = `${replyWord(text)} ${person.name}`;
+  if (reviewerNamed(plain, person, people)) return plain;
+  for (const h of [person.email?.split("@")[0], ...(person.aliases ?? []), person.email]) {
+    if (h && reviewerNamed(`${plain} (${h})`, person, people)) return `${plain} (${h})`;
+  }
+  return `${plain} (${person.user_id})`;
+}
 
 /** The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased. */
 export function fullRefsIn(text: string): string[] {
@@ -322,30 +354,32 @@ function refuseUngrounded(code: string, message: string): never {
 }
 
 /**
- * The request a reviewer's name answers (`确认 <name>`): the person's own signed-in message just before it in this session, sent at most
+ * The request a reviewer's name answers (`确认 <name>`): the person's own last signed-in message before it in this session that is not
+ * itself such a reply (`isReviewerReply`, so a second reply after one that picked nobody still answers the request), sent at most
  * `REVIEWER_ANSWER_WINDOW` earlier. Null when there is none.
  */
 async function requestAnswered(q: Querier, sessionId: string, message: TurnMessage): Promise<string | null> {
-  const row = (await q(
-    `SELECT content FROM claw_assistant_messages
+  const rows = (await q(
+    `SELECT content, channel_context FROM claw_assistant_messages
       WHERE session_id = $1 AND message_id <> $2 AND attended_via IS NOT NULL
         AND received_at <= $3 AND received_at > $3::timestamptz - $4::interval
-      ORDER BY received_at DESC LIMIT 1`,
-    [sessionId, message.messageId, message.receivedAt, REVIEWER_ANSWER_WINDOW],
-  )).rows[0] as { content: string } | undefined;
-  return row?.content ?? null;
+      ORDER BY received_at DESC LIMIT $5`,
+    [sessionId, message.messageId, message.receivedAt, REVIEWER_ANSWER_WINDOW, REVIEWER_REPLIES_SKIPPED_MAX + 1],
+  )).rows as Array<{ content: string; channel_context: unknown }>;
+  return rows.find((r) => !isReviewerReply(r.content, parseChannelContext(r.channel_context).people))?.content ?? null;
 }
 
 /**
  * The message names no listed person alone as the reviewer: nothing starts, and the router asks which person, offering each one the
  * message may mean as the exact short reply that picks them (`确认 <name>`), never a sentence to type again.
  */
-function refuseWhichReviewer(code: string, text: string, people: readonly ChannelPerson[]): never {
-  const candidates = reviewerCandidates(text, people).map((p) => ({ user_id: p.user_id, name: p.name, reply: reviewerReply(text, p.name) }));
+function refuseWhichReviewer(code: string, text: string, people: readonly ChannelPerson[], requester: string): never {
+  const candidates = reviewerCandidates(text, people, requester)
+    .map((p) => ({ user_id: p.user_id, name: p.name, reply: reviewerReply(text, p, people) }));
   const how = "Say in one short line that nothing has started and ask which person they mean. Do not describe what was checked or say that a name was not recognised, and never ask them to write their request again";
   throw new ToolRefused(code, candidates.length
     ? `${how}: offer each person under data.candidates by its exact reply (data.candidates[].reply), which the user can send as it is. When they send one, call review_start again with the same prs and merge, and that person's user_id as reviewer.`
-    : `${how}: tell them they can answer with just ${reviewerReply(text, "<name>")}. When they do, call review_start again with the same prs and merge, and the user_id People then lists for that name.`,
+    : `${how}: tell them they can answer with just ${replyWord(text)} <name>. When they do, call review_start again with the same prs and merge, and the user_id People then lists for that name.`,
   { candidates });
 }
 
@@ -365,7 +399,9 @@ export async function reviewStart(
     // `确认 <name>` answers the question which reviewer the person meant, for a review by someone else: the pull requests (and the model)
     // are those of the request it answers, the person's message just before it; who reviews is read from the answer.
     const forOther = !!args.reviewer && args.reviewer !== userId;
-    const answered = forOther && reviewerConfirmation(message.content) !== null ? await requestAnswered(q, claims.sid, message) : null;
+    // Only a message that is such a reply, whole, and does not itself name every pull request.
+    const answered = forOther && isReviewerReply(message.content, message.context.people)
+      && !prs.every((pr) => prGrounded(message.content, pr)) ? await requestAnswered(q, claims.sid, message) : null;
     const asked = answered ?? message.content;
     const recent = await recentReviewRepos(q, userId);
     for (const pr of prs) {
@@ -393,7 +429,7 @@ export async function reviewStart(
     }
     const named = !person && people.some((p) => !p.user_id && (lower(p.name) === reviewer || (p.email !== undefined && lower(p.email) === reviewer)));
     if (named) refuseUngrounded("reviewer_not_linked", "that person has not linked their account, so nobody can review as them: tell the user");
-    return refuseWhichReviewer(person ? "reviewer_not_named" : "reviewer_not_in_message", message.content, people);
+    return refuseWhichReviewer(person ? "reviewer_not_named" : "reviewer_not_in_message", message.content, people, userId);
   });
   // A review asked of someone else runs on their own credentials, which only the channel that carried the message can bring. When it
   // said it can be handed one, it is: the channel starts it as the reviewer and tells the person how it went. Otherwise it is refused

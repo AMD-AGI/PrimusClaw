@@ -27,6 +27,9 @@
  *       Chinese or not ("请weilei帮我review并合入 …"); a handle another listed person shares, or one inside another's longer name, names
  *       neither, and then nothing starts: the router is given the people the message may mean, each with the exact short reply that
  *       picks them (`确认 <name>`), and that reply alone, answering the request just before it, starts the request with that reviewer
+ *   S4d only a message that is, whole, such a reply answers an earlier request ("确认下，请 Wei, Lei 帮我 review #304" is a request of its
+ *       own); a reply offered to people who share a name carries a handle that tells them apart; a reply that picked nobody does not hide
+ *       the request from the next one; the requester is never offered
  *   S5  a model must be named by the user
  *   S6  what the review service refuses reaches the model as it said it, with its data
  *   S8  merge=true is never a merge: whatever the message says (a negation, a question, "yes merge it"), a start and a restart the router
@@ -568,6 +571,69 @@ describe("assistant review tools", { skip }, () => {
     await w.closeRun(late.task_id);
     assert.equal(calls.start.length, 0, "a review by someone else is never started here");
     assert.ok(sub);
+  });
+
+  test("S4d a reply answers the request before it only when the message is that reply whole, and every offered reply picks its person", async () => {
+    await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
+    const ctx = (people: Recorded[]) => ({ ...DEFAULT_CTX, repos: [], people, handoffs: ["review_for_other"] });
+    const handed = async () => (await w.q(
+      "SELECT payload->'review' AS review FROM claw_notification_outbox WHERE payload->>'type' = 'assistant.action' ORDER BY id",
+    )).map((r: Recorded) => r.review);
+    const refusal = async (turn: Claims, args: Recorded) => {
+      try { await rt.reviewStart(turn, args as never); } catch (err) { return err as { code: string; message: string; data?: Recorded }; }
+      return assert.fail("accepted");
+    };
+    const lastHanded = async () => {
+      const r = (await handed()).at(-1);
+      return [r.reviewer.user_id, r.prs.map((x: Recorded) => `${x.repo}#${x.number}`)];
+    };
+
+    // A sentence that starts with 确认 / Confirm and names everything itself is a request of its own, whatever came just before it.
+    const earlier = await userTurn(alice, "PrimusClaw 的 CI 怎么样了", { context: ctx([]), agoSec: 120 });
+    await w.closeRun(earlier.task_id);
+    for (const text of ["确认下，请Wei, Lei帮我review PrimusClaw PR #304", "Confirm, please have Lei Wei review PrimusClaw #304"]) {
+      const own = await userTurn(alice, text, { context: ctx([WEI]), agoSec: 100 });
+      assert.equal(((await rt.reviewStart(own, { prs: ["AMD-AGI/PrimusClaw#304"], merge: false, reviewer: "u-weilei" })) as Recorded).handed_off, true, text);
+      assert.deepEqual(await lastHanded(), ["u-weilei", ["PrimusClaw#304"]]);
+      await w.closeRun(own.task_id);
+    }
+    assert.equal(rt.isReviewerReply("确认下，请Wei, Lei帮我review PR #304", [WEI]), false);
+    assert.equal(rt.isReviewerReply("确认 Wei, Lei", [WEI]), true);
+    assert.equal(rt.isReviewerReply("确认 Wei, Lei (u-other)", [WEI]), false);
+
+    // Two people called Alex Chen: each is offered with what tells them apart, and that reply picks that one.
+    const alex1 = person("Alex Chen", "u-alex1", { email: "alex.chen@amd.com" });
+    const alex2 = person("Alex Chen", "u-alex2", { email: "achen2@amd.com" });
+    const ask = await userTurn(alice, "请Alex Chen帮我review PrimusClaw PR #305", { context: ctx([alex1, alex2]), agoSec: 80 });
+    const which = await refusal(ask, { prs: ["AMD-AGI/PrimusClaw#305"], merge: false, reviewer: "u-alex2" });
+    assert.deepEqual(which.data?.candidates?.map((c: Recorded) => c.reply), ["确认 Alex Chen (alex.chen@amd.com)", "确认 Alex Chen (achen2)"]);
+    await w.closeRun(ask.task_id);
+    const pick = await userTurn(alice, "确认 Alex Chen (achen2)", { context: ctx([alex1, alex2]), agoSec: 70 });
+    assert.equal(await code(rt.reviewStart(pick, { prs: ["AMD-AGI/PrimusClaw#305"], merge: false, reviewer: "u-alex1" })), "reviewer_not_named");
+    assert.equal(((await rt.reviewStart(pick, { prs: ["AMD-AGI/PrimusClaw#305"], merge: false, reviewer: "u-alex2" })) as Recorded).handed_off, true);
+    assert.deepEqual(await lastHanded(), ["u-alex2", ["PrimusClaw#305"]]);
+    await w.closeRun(pick.task_id);
+
+    // "Wei, Lei" and "Lei Wei" have the same handles: told apart by user id. A reply that picked nobody does not hide the request.
+    const leiWei = person("Lei Wei", "u-leiwei");
+    const ask2 = await userTurn(alice, "请weilei帮我review PrimusClaw PR #306", { context: ctx([WEI, leiWei, person("Alice A", alice.userId)]), agoSec: 60 });
+    const which2 = await refusal(ask2, { prs: ["AMD-AGI/PrimusClaw#306"], merge: false, reviewer: "u-weilei" });
+    assert.deepEqual(which2.data?.candidates?.map((c: Recorded) => c.reply), ["确认 Wei, Lei (u-weilei)", "确认 Lei Wei (u-leiwei)"],
+      "both offered, each told apart, and never the requester");
+    await w.closeRun(ask2.task_id);
+    const vague = await userTurn(alice, "确认 Wei Lei", { context: ctx([WEI, leiWei]), agoSec: 50 });
+    assert.equal(await code(rt.reviewStart(vague, { prs: ["AMD-AGI/PrimusClaw#306"], merge: false, reviewer: "u-weilei" })), "reviewer_not_named");
+    await w.closeRun(vague.task_id);
+    const exact = await userTurn(alice, "确认 Wei, Lei (u-weilei)", { context: ctx([WEI, leiWei]), agoSec: 40 });
+    assert.equal(((await rt.reviewStart(exact, { prs: ["AMD-AGI/PrimusClaw#306"], merge: false, reviewer: "u-weilei" })) as Recorded).handed_off, true);
+    assert.deepEqual(await lastHanded(), ["u-weilei", ["PrimusClaw#306"]]);
+    await w.closeRun(exact.task_id);
+    // Nobody written: everyone listed is offered, except the requester.
+    const nobody = await userTurn(alice, "请帮我找个人review PrimusClaw PR #307", { context: ctx([person("Alice A", alice.userId), WEI]) });
+    const which3 = await refusal(nobody, { prs: ["AMD-AGI/PrimusClaw#307"], merge: false, reviewer: "u-weilei" });
+    assert.deepEqual(which3.data?.candidates?.map((c: Recorded) => c.user_id), ["u-weilei"]);
+    await w.closeRun(nobody.task_id);
+    assert.equal(calls.start.length, 0);
   });
 
   test("S5 a model must be named by the user", async () => {

@@ -199,8 +199,9 @@ They act only for the person, never for a key or a report:
   listed: their name with its words in any order, run together or not (`Wei, Lei`, `lei wei`, `weilei`), a word of it, their user id,
   their email or its part before the `@`, or one of the `aliases` the channel gave (a GitHub login, a chat user name). A handle two
   listed people share, or one inside another's longer name (`王一涵` in `王一涵娜`), names neither: nothing starts, and the assistant
-  offers each person the message may mean as the exact reply that picks them (`确认 Wei, Lei`), which, sent within ten minutes of the
-  request, starts that request with that reviewer.
+  offers each person the message may mean (never the user) as the exact reply that picks them (`确认 Wei, Lei`; with what tells them
+  apart in brackets when two share a name, `确认 Alex Chen (achen2)`). A message that is that reply and nothing else, sent within ten
+  minutes of the request, starts that request with that reviewer; a sentence that only starts with 确认 is a request of its own.
 - **`merge=true` never merges.** Whether the user asked for a merge is the router's reading of a sentence, and natural language
   never approves one. So every review the router starts or restarts (`review_start`, `review_restart`, whatever `merge` says) is
   made with `config.merge_needs_confirmation` (kept by every later restart of it): its `gh_pr_merge`, and a `gh_review_submit`
