@@ -216,8 +216,3 @@ EXPOSE 8100 8200 9100
 # Debian installs tini to /usr/bin/tini (not /sbin/tini like Alpine).
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
 CMD ["api"]
-
-# The build this image is (deploy/build.sh passes its TAG; empty when built otherwise): what the assistant's
-# claw_self_status names as the version running. Last, so a new tag changes no layer before it.
-ARG CLAW_BUILD=""
-ENV CLAW_BUILD=$CLAW_BUILD

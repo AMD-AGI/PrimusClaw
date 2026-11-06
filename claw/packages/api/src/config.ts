@@ -851,7 +851,7 @@ export const CLAW_ASSISTANT_SUGGESTED_REPLIES = envBool("CLAW_ASSISTANT_SUGGESTE
 // `false` takes `claw_self_status` from the router (`assistant/self-status.ts`): how the assistant itself has been running over the last
 // day, read from Claw's own tables. On by default: it reads only counts, never a message, a session's settings or a user.
 export const CLAW_ASSISTANT_SELF_STATUS = envBool("CLAW_ASSISTANT_SELF_STATUS", true);
-// The build this image is, baked in by `deploy/build.sh` (its TAG); what `claw_self_status` names as the version running.
+// The build running, when the deployment says it; else `claw_self_status` reads the tag `deploy/build.sh` wrote into the image.
 export const CLAW_BUILD = env("CLAW_BUILD", "").trim();
 // How long an item may need the user with nobody having told them before the system tells them.
 export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWEEP_SEC", 300, { min: 1 });

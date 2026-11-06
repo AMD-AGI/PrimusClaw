@@ -6,15 +6,19 @@
  *
  *   S1  the router is told that Clawy is itself, and how to count what a lookup returned; a worker has no claw_self_status
  *   S3  the time floor of a ULID id sorts at or below every id made at that time or later, and above every one made before
+ *   S5  the build is CLAW_BUILD when set, else the tag build.sh wrote into the image, else unknown; never what is not a tag
  *   S4  it reads no session settings, no message text and no error message, and every scan is bounded
  *
  * S2 is in assistant-self-status-db.test.ts: on a real Postgres, with the assistant's configuration set before it is read.
  */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
-import { renderRouterSelfSection, ulidFloor } from "../src/assistant/self-status.js";
+import { buildOf, renderRouterSelfSection, ulidFloor } from "../src/assistant/self-status.js";
 import { ulid } from "../src/tasks/ids.js";
 
 const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -63,4 +67,17 @@ test("S4 it reads no session settings, no message text, no error message, and bo
     assert.ok(reading.length > 0, table);
     for (const st of reading) assert.match(st, /LIMIT/, `${table} is read with a limit`);
   }
+});
+
+test("S5 the build: CLAW_BUILD, else the image's BUILD file, else unknown, and never what is not a tag", () => {
+  const dir = mkdtempSync(join(tmpdir(), "claw-build-"));
+  const file = pathToFileURL(join(dir, "BUILD"));
+  assert.equal(buildOf("", file), null, "no file");
+  writeFileSync(file, "202611070012\n");
+  assert.equal(buildOf("", file), "202611070012");
+  assert.equal(buildOf("from-env", file), "from-env");
+  writeFileSync(file, "a tag; rm -rf /\n");
+  assert.equal(buildOf("", file), null);
+  // The path the image has: packages/api/BUILD, two levels above src/assistant and dist/assistant.
+  assert.equal(new URL("../../BUILD", pathToFileURL("/app/packages/api/dist/assistant/self-status.js")).pathname, "/app/packages/api/BUILD");
 });

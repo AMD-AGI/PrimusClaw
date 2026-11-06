@@ -56,6 +56,12 @@ fi
 
 log "Building $IMG ..."
 
+# The build this image is, for what the assistant's claw_self_status names as the version running: written into the
+# build context as packages/api/BUILD (ignored by git), which reaches the image with packages/, and removed once the
+# context is packed.
+BUILD_FILE="$HARNESS_ROOT/packages/api/BUILD"
+printf '%s\n' "$TAG" > "$BUILD_FILE"
+
 if [ "$USE_KANIKO" = "true" ]; then
   # ── In-cluster kaniko build from the LOCAL working tree (no docker) ───────
   # Package the current build context (incl. uncommitted changes) as a tar.gz,
@@ -79,11 +85,9 @@ if [ "$USE_KANIKO" = "true" ]; then
   # passthrough the only route left is tls.insecureSkipVerify, which turns off
   # certificate verification for every outbound connection the image makes --
   # so the supported remedy was unreachable and the unsupported one was not.
-  # The image says which build it is (CLAW_BUILD, what the assistant's claw_self_status names as the version running).
-  KANIKO_BUILD_ARGS="        - \"--build-arg=CLAW_BUILD=${TAG}\""
+  KANIKO_BUILD_ARGS=""
   if [ -n "${EXTRA_CA_CERT_URLS:-}" ]; then
-    KANIKO_BUILD_ARGS="${KANIKO_BUILD_ARGS}
-        - \"--build-arg=EXTRA_CA_CERT_URLS=${EXTRA_CA_CERT_URLS}\""
+    KANIKO_BUILD_ARGS="        - \"--build-arg=EXTRA_CA_CERT_URLS=${EXTRA_CA_CERT_URLS}\""
   fi
 
   REGISTRY_HOST="${REGISTRY%%/*}"
@@ -131,6 +135,7 @@ if [ "$USE_KANIKO" = "true" ]; then
   if [ "$ctx_bytes" -gt "$KANIKO_CONTEXT_MAX_BYTES" ]; then
     fail "build context $((ctx_bytes / 1024))KB exceeds the sanity ceiling ($((KANIKO_CONTEXT_MAX_BYTES / 1024))KB). Something is in the context that should not be -- check for node_modules or large binaries, or raise KANIKO_CONTEXT_MAX_BYTES."
   fi
+  rm -f "$BUILD_FILE"
 
   # Split across ConfigMaps rather than fitting into one.
   #
@@ -278,9 +283,9 @@ else
       --exclude='./.env' --exclude='./.env.*' --exclude='deploy/values.*.env' \
       -C "$HARNESS_ROOT" -cf - . \
     | docker build --no-cache --progress=plain --network host \
-        --build-arg "CLAW_BUILD=$TAG" \
         ${EXTRA_CA_CERT_URLS:+--build-arg "EXTRA_CA_CERT_URLS=$EXTRA_CA_CERT_URLS"} \
         -t "$IMG" -f Dockerfile -
+  rm -f "$BUILD_FILE"
 
   docker push "$IMG"
   log "Built and pushed: $IMG"

@@ -13,6 +13,7 @@
  * says when a limit was reached), and the two tables without an index on their creation time (`claw_tasks`, `claw_work_items`)
  * are read by their primary key, whose ULID begins with the time it was made (`tasks/ids.ts`).
  */
+import { readFileSync } from "node:fs";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_SELF_STATUS, CLAW_BUILD } from "../config.js";
 import { inTransaction, type Querier } from "../infra/db.js";
 
@@ -54,6 +55,21 @@ export const SELF_STATUS_LATENCY_SAMPLE = 2_000;
 const REPLY_WINDOW_MIN = 10;
 const STATEMENT_TIMEOUT_MS = 5_000;
 const PROCESS_STARTED_AT = new Date(Date.now() - Math.round(process.uptime() * 1000)).toISOString();
+
+/**
+ * The build running: CLAW_BUILD when the deployment sets it, else the tag `deploy/build.sh` wrote into the image as packages/api/BUILD
+ * (beside src/ and dist/, two levels up from this file in either), else null. Read once: an image does not change under a process.
+ */
+export function buildOf(fromEnv: string = CLAW_BUILD, file: URL = new URL("../../BUILD", import.meta.url)): string | null {
+  if (fromEnv) return fromEnv;
+  try {
+    const tag = readFileSync(file, "utf8").trim();
+    return /^[\w.+-]{1,64}$/.test(tag) ? tag : null;
+  } catch {
+    return null;
+  }
+}
+const BUILD = buildOf();
 
 const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -241,11 +257,11 @@ export async function readSelfStatus(hours: number = DAY_HOURS, now: number = Da
       `first_reply covers the latest ${SELF_STATUS_LATENCY_SAMPLE} messages at most, each older than ${REPLY_WINDOW_MIN} minutes; a message with no reply within ${REPLY_WINDOW_MIN} minutes is unanswered.`,
       "Counts are over every user of this deployment.",
     ];
-    if (!CLAW_BUILD) notes.push("This image was built without CLAW_BUILD, so its build is not known here; api_started_at says when it started.");
+    if (!BUILD) notes.push("This image does not say which build it is, so the version is not known here; api_started_at says when it started.");
     return {
       window_hours: h,
       since,
-      version: { build: CLAW_BUILD || null, api_started_at: PROCESS_STARTED_AT },
+      version: { build: BUILD, api_started_at: PROCESS_STARTED_AT },
       messages: { received, at_least: received >= SELF_STATUS_ROW_CAP },
       first_reply: {
         judged, answered, handed_to_chat: handed, unanswered, unanswered_rate: rate(unanswered, judged),
