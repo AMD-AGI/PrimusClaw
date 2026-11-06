@@ -127,13 +127,19 @@ describe("router quality, through the tools", { skip }, () => {
 
   test("Q4b after the system's start notice the router's say is added to that message, not a second one; the unsaid final text is not sent", async () => {
     // 2026-11-06 gate: "已开始：#N …" from the system, then the router's own "任务已建好…" beside it, every time.
+    await w.subscribe(alice.userId);   // (a channel that gets the notice: what the addition is matched to)
     const turn = await turnFor("帮我新建一个任务：写一份 Kubernetes 调度器简介");
     // A line before the item is made is not a repeat of a notice that has not been told yet.
     assert.equal((await w.mod.tools.say(turn as never, { text: "好的，这就建。" }, w.sayDeps)).ok, true);
     const created = await w.mod.tools.workCreate(turn as never, { title: "Kubernetes 调度器简介", brief: "write it" }, w.sayDeps);
     assert.equal(created.announced, true);
+    // Another turn's start notice, told after this turn's own, so the newest (another session of the same user's, or an overlapping
+    // turn): never what this turn's words are added to.
+    const ci = await w.createItem(alice, "修 CI");
+    await w.mod.outbound.recordSystemNotice({ userId: alice.userId, sessionId: alice.routerSid, text: `已开始：#${ci.seq} 修 CI。`,
+      key: `work_started:${ci.itemId}`, itemId: ci.itemId, turnMessageId: "another-turn" }, w.sayDeps);
     // The router's own words after it (here: the answer to something else the user asked) are kept, as an addition to the notice.
-    const notice = (await w.q("SELECT say_id::text AS id FROM claw_assistant_says WHERE text LIKE '已开始：#%'"))[0] as { id: string };
+    const notice = (await w.q(`SELECT say_id::text AS id FROM claw_assistant_says WHERE text LIKE '已开始：#${created.seq} %'`))[0] as { id: string };
     const added = await w.mod.tools.say(turn as never, { text: "顺便：调度器简介会用中文写。" }, w.sayDeps);
     assert.equal(added.ok, true);
     const event = w.events.find((e) => e.type === "AssistantSay" && e.say_id === added.say_id);
@@ -142,7 +148,7 @@ describe("router quality, through the tools", { skip }, () => {
     await w.closeRun(turn.task_id);
     const end = { sessionId: alice.routerSid, runIds: [turn.task_id], messageId: turn.mid, failed: false, interrupted: false };
     assert.equal(await w.mod.routerTurnEnd.deliverUnsaidAnswer({ ...end, finalText: "任务已建好。" }, w.sayDeps), "skipped");
-    assert.deepEqual((await says()).map((r: any) => r.text), [
+    assert.deepEqual((await says()).map((r: any) => r.text).filter((t: string) => !t.includes("修 CI")), [
       "好的，这就建。", `已开始：#${created.seq} Kubernetes 调度器简介。有结果或需要你时我会告诉你。`, "顺便：调度器简介会用中文写。",
     ]);
     // The next turn speaks as always.

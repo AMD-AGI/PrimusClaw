@@ -107,6 +107,8 @@ export interface AssistantSayPayload extends AssistantEventBase {
    * blank line, this text); one that does not shows this as a message of its own.
    */
   amends?: string;
+  /** A system notice's: the message id of the turn it answers (what an `amends` of that turn is matched by). */
+  turn_message_id?: string;
 }
 
 /** The system's own message, sent when an item has needed the user for a while and nobody has said so. */

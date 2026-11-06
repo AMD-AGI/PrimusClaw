@@ -155,6 +155,8 @@ type ToStore =
   | (ToStoreBase & {
     type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; confirmWrite?: AssistantConfirmWrite;
     sources?: AssistantSaySource[]; files?: AssistantFile[]; amends?: string;
+    /** A system notice's turn (the message it answers): kept on its payload, so a later say of that turn finds it (`turnAnnouncedStart`). */
+    noticeOfTurn?: string;
   })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow });
 
@@ -169,6 +171,7 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
       ...(m.confirmWrite ? { confirm_write: m.confirmWrite } : {}),
       ...(m.files?.length ? { files: m.files } : {}),
       ...(m.amends ? { amends: m.amends } : {}),
+      ...(m.noticeOfTurn ? { turn_message_id: m.noticeOfTurn } : {}),
     };
 }
 
@@ -484,7 +487,8 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
       if (await turnHandedOffReview(q, input.userId, input.turnMessageId)) {
         throw new SayRefused("handed_off", HANDED_OFF_REFUSAL);
       }
-      const notice = input.turnBegan ? await turnAnnouncedStart(q, input.userId, input.turnBegan) : null;
+      const notice = input.turnBegan && input.turnMessageId
+        ? await turnAnnouncedStart(q, input.userId, input.turnBegan, input.turnMessageId) : null;
       if (notice && !input.amendNotice) throw new SayRefused("already_announced", ALREADY_ANNOUNCED_REFUSAL);
       // One say at a time per user: the cap counts stored rows, and without this a burst
       // all count the same number and all insert.
@@ -649,6 +653,7 @@ export async function recordSystemNotice(
     sayId: deterministicEventId("assistant.notice", input.userId, input.key),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
     ...(input.files?.length ? { files: input.files } : {}),
+    ...(input.turnMessageId ? { noticeOfTurn: input.turnMessageId } : {}),
   }), (late) => announce(late, deps, input.turnMessageId));
   if (!stored) return null;
   await announce(stored, deps, input.turnMessageId);

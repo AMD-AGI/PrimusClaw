@@ -67,12 +67,16 @@ export async function releaseHeldSays(q: Querier, messageId: string): Promise<Ar
  * adds to that message (`AssistantSayPayload.amends`) instead of being a second one: the gate found a second message ("任务已建好…")
  * beside that notice every time (2026-11-06), and refusing it lost what else it said.
  */
-export async function turnAnnouncedStart(q: Querier, userId: string, since: Date | string): Promise<string | null> {
+export async function turnAnnouncedStart(q: Querier, userId: string, since: Date | string, messageId: string): Promise<string | null> {
+  // Of this very turn (the message it answers, kept on the notice's delivery): another turn of the same user's, in another session or
+  // overlapping this one, has notices of its own. Read from the user's recent messages first (their index), then their deliveries.
   const row = (await q(
-    `SELECT say_id::text AS say_id FROM claw_assistant_says
-      WHERE user_id = $1 AND fallback AND item_id IS NOT NULL AND created_at >= $2
-        AND (text LIKE '已开始：#%' OR text LIKE 'Started #%') ORDER BY created_at DESC LIMIT 1`,
-    [userId, since],
+    `SELECT s.say_id::text AS say_id FROM claw_assistant_says s
+      WHERE s.user_id = $1 AND s.fallback AND s.item_id IS NOT NULL AND s.created_at >= $2
+        AND (s.text LIKE '已开始：#%' OR s.text LIKE 'Started #%')
+        AND EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text AND o.payload->>'turn_message_id' = $3)
+      ORDER BY s.created_at DESC LIMIT 1`,
+    [userId, since, messageId],
   )).rows[0] as { say_id: string } | undefined;
   return row?.say_id ?? null;
 }
