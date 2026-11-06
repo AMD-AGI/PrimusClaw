@@ -56,7 +56,8 @@ record it.
   assistant sweep, each delivered file still downloadable is announced once, oldest first, as an `assistant.say` in the system's words
   carrying `files` (`item_id`, `session_id`, `id`, `name`, `size`, `content_type`, a small image inline) for a channel to draw as a
   download; a report records how far its files were announced in the new table `claw_work_item_delivery_checks`, so a store that did
-  not answer is retried by the sweep. Long answers are said whole: `say`
+  not answer is retried by the sweep, and a file's message that neither a channel's outbox nor the session holds is published
+  again. A delivered file's name is said inside a code span. Long answers are said whole: `say`
   takes up to 9000 characters (the router is still asked for about 600 unless the user needs more), an `answer` report up to 8800
   (other kinds stay at 600), and an answer longer than 600 is sent to the user whole by the system at once (the router is told it was
   sent); a plain-text router ending is cut only past 9000. The super-agent evaluation sends a turn's `files` as a channel does and grades

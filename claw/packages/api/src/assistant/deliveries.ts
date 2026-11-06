@@ -22,7 +22,9 @@
 import { GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { DELIVERY_DIR, DELIVERY_ID_RE, DELIVERY_INLINE_MAX_BYTES, DELIVERY_INLINE_TYPES, deliveryContentType } from "@claw/protocol";
 import pino from "pino";
-import { DELIVERY_TTL_DAYS, S3_BUCKET } from "../config.js";
+import { CLAW_NOTIFICATIONS_ENABLED, DELIVERY_TTL_DAYS, S3_BUCKET } from "../config.js";
+import { redactPublicJson } from "../events/redaction.js";
+import { publishEvent } from "../events/store.js";
 import { db } from "../infra/db.js";
 import { getS3Client } from "../infra/s3-client.js";
 import type { AssistantFile } from "../notifications/assistant-events.js";
@@ -44,6 +46,8 @@ const LIST_MAX_PAGES = 20;
 const SWEEP_WINDOW = "1 day";
 const SWEEP_SETTLE = "1 minute";
 const SWEEP_BATCH = 20;
+/** A delivery's message stored this long ago whose event is nowhere is taken as never published, and published again. */
+const REPUBLISH_SETTLE = "1 minute";
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** One delivered copy in the store, as listed. */
@@ -96,11 +100,19 @@ function sizeText(size: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/**
+ * A file's name as a channel shows it in markdown: inside a code span, so a name a worker chose (from what it read) draws no link or
+ * formatting in the user's chat; one line, its backticks turned to quotes.
+ */
+function codeName(name: string): string {
+  return `\`${name.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/`/g, "'")}\``;
+}
+
 /** The message that carries one file, in the language of the item's title. */
 export function deliveryText(item: { seq: number; title: string }, file: { name: string; size: number }): string {
   return detectLanguage(item.title) === "Chinese"
-    ? `#${item.seq} ${item.title} 交付了文件：${file.name}（${sizeText(file.size)}）`
-    : `#${item.seq} ${item.title} delivered a file: ${file.name} (${sizeText(file.size)})`;
+    ? `#${item.seq} ${item.title} 交付了文件：${codeName(file.name)}（${sizeText(file.size)}）`
+    : `#${item.seq} ${item.title} delivered a file: ${codeName(file.name)} (${sizeText(file.size)})`;
 }
 
 /** The file as a channel gets it: what the download route needs, and a small image itself. */
@@ -120,10 +132,41 @@ async function assistantFile(itemId: string, ownerId: string, sessionId: string,
 }
 
 /**
+ * What became of each delivery's message, by its say id: `carried` once something durable holds it for the user (an outbox row a
+ * channel delivers from, or the `AssistantSay` event persisted in the session); `settled` once it is old enough that a publish of
+ * its event would have been persisted by now. A message stored but carried by nothing (its event was never published: the publish
+ * failed, or the process died after the commit, and the user has no channel subscription) is published again.
+ */
+async function messagesOf(sayIds: string[], routerSessionId: string): Promise<Map<string, { carried: boolean; settled: boolean }>> {
+  if (!sayIds.length) return new Map();
+  const outbox = CLAW_NOTIFICATIONS_ENABLED
+    ? "EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text) OR "
+    : "";
+  const rows = (await db.query(
+    `SELECT s.say_id::text AS say_id, s.created_at < NOW() - $3::interval AS settled,
+            ${outbox}EXISTS (SELECT 1 FROM claw_session_events e
+                       WHERE e.session_id = $2 AND e.event = 'AssistantSay' AND e.created_at >= s.created_at
+                         AND e.data->>'say_id' = s.say_id::text) AS carried
+       FROM claw_assistant_says s WHERE s.say_id = ANY($1::uuid[])`,
+    [sayIds, routerSessionId, REPUBLISH_SETTLE],
+  )).rows as Array<{ say_id: string; settled: boolean; carried: boolean }>;
+  return new Map(rows.map((r) => [r.say_id, { carried: r.carried === true, settled: r.settled === true }]));
+}
+
+/** The web client's copy of a delivery's message, as `announce` publishes it (`outbound.ts`). */
+function sayEvent(sessionId: string, sayId: string, text: string, file: AssistantFile): Record<string, unknown> {
+  return {
+    type: "AssistantSay", session_id: sessionId, say_id: sayId, text: String(redactPublicJson(text) ?? ""), files: [file],
+    fallback: false, ts: Date.now(),
+  };
+}
+
+/**
  * Announce the item's delivered files that have not been announced, oldest first, one system message each (at most
  * ANNOUNCE_BATCH_MAX in one call). With `throughEventId` (the report that asked), the item is recorded as announced through
- * that report once nothing is left, so the sweep does not ask again. Returns how many were announced now. Throws for a fault of
- * the store or the database: the caller logs it, and the next report, run end or sweep announces what this one did not.
+ * that report once every file's message is held by something durable, so the sweep does not ask again. Returns how many were
+ * announced now. Throws for a fault of the store or the database: the caller logs it, and the next report, run end or sweep
+ * announces what this one did not.
  */
 export async function announceItemDeliveries(itemId: string, deps: SayDeps = {}, throughEventId?: number): Promise<number> {
   const item = (await db.query(
@@ -138,23 +181,51 @@ export async function announceItemDeliveries(itemId: string, deps: SayDeps = {},
   // The worker's session is the user's: one that is not names no file of theirs.
   if (!owner || owner.user_id !== item.user_id) return 0;
   const deliveries = await sessionDeliveries(item.user_id, item.worker_session_id);
-  // The ones already announced are left out before anything else is read for them (the message id is the delivery's).
+  // What became of each one's message is read before anything else is read for it (the message id is the delivery's).
   const keyOf = (d: StoredDelivery) => `delivery:${d.id}`;
   const idOf = (d: StoredDelivery) => deterministicEventId("assistant.notice", item.user_id, keyOf(d));
-  const announced = deliveries.length ? new Set(((await db.query(
-    "SELECT say_id::text AS say_id FROM claw_assistant_says WHERE say_id = ANY($1::uuid[])", [deliveries.map(idOf)],
-  )).rows as Array<{ say_id: string }>).map((r) => r.say_id)) : new Set<string>();
-  const pending = deliveries.filter((d) => !announced.has(idOf(d)));
+  const known = await messagesOf(deliveries.map(idOf), item.router_session_id);
+  const textOf = (d: StoredDelivery) => deliveryText({ seq: Number(item.seq), title: item.title }, d);
   let told = 0;
-  for (const d of pending.slice(0, ANNOUNCE_BATCH_MAX)) {
+  let open = 0;   // files whose message nothing durable holds yet
+  let done = 0;
+  for (const d of deliveries) {
+    const message = known.get(idOf(d));
+    if (message?.carried) continue;
+    if (done >= ANNOUNCE_BATCH_MAX) { open += 1; continue; }
+    done += 1;
+    if (message && !message.settled) { open += 1; continue; }   // (stored a moment ago: its event may still be on its way)
     const file = await assistantFile(itemId, item.user_id, item.worker_session_id, d);
+    if (message) {
+      // Stored, and carried by nothing: its event was never published. Published again; held once the stream has it.
+      try {
+        await (deps.publishSessionEvent ?? publishEvent)(item.router_session_id, sayEvent(item.router_session_id, idOf(d), textOf(d), file));
+        told += 1;
+      } catch (err) {
+        logger.warn({ err: (err as Error)?.name, itemId }, "assistant.delivery_republish_failed");
+        open += 1;
+      }
+      continue;
+    }
+    let published = true;
     const stored = await recordSystemNotice({
-      userId: item.user_id, sessionId: item.router_session_id, key: keyOf(d),
-      text: deliveryText({ seq: Number(item.seq), title: item.title }, d), files: [file],
-    }, deps);
+      userId: item.user_id, sessionId: item.router_session_id, key: keyOf(d), text: textOf(d), files: [file],
+    }, {
+      ...deps,
+      publishSessionEvent: async (sessionId, event) => {
+        try {
+          await (deps.publishSessionEvent ?? publishEvent)(sessionId, event);
+        } catch (err) {
+          published = false;
+          throw err;
+        }
+      },
+    });
     if (stored) told += 1;
+    // Held by a channel's outbox row, or by its event in the stream; with neither, the sweep publishes it again.
+    if (!stored || (stored.subscribers === 0 && !published)) open += 1;
   }
-  if (throughEventId !== undefined && pending.length <= ANNOUNCE_BATCH_MAX) {
+  if (throughEventId !== undefined && open === 0) {
     await db.query(
       `INSERT INTO claw_work_item_delivery_checks (item_id, event_id) VALUES ($1, $2)
        ON CONFLICT (item_id) DO UPDATE SET event_id = GREATEST(claw_work_item_delivery_checks.event_id, EXCLUDED.event_id),
@@ -162,7 +233,7 @@ export async function announceItemDeliveries(itemId: string, deps: SayDeps = {},
       [itemId, throughEventId],
     );
   }
-  if (told) logger.info({ itemId, told }, "assistant.item_deliveries_announced");
+  if (told) logger.info({ itemId, told, open }, "assistant.item_deliveries_announced");
   return told;
 }
 

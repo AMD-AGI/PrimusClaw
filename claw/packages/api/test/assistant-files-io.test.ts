@@ -21,6 +21,9 @@
  *   F8  no delivered file is lost: every one is announced however many there are; a report whose announcement the store failed is
  *       announced by the sweep (and recorded, so the next sweep reads nothing); a file delivered after the item's last report is
  *       announced when the run ends; the listing reads every page
+ *   F9  nor to a message nothing durable holds: for a user with no channel subscription a delivery's message is held only by its event
+ *       in the session; one whose publish failed (or never happened) is not recorded as announced, and is published again by the
+ *       sweep once settled, with its file, once
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -209,8 +212,10 @@ describe("assistant files in, results out", { skip }, () => {
     const says = await w.q("SELECT say_id::text, text, fallback, item_id FROM claw_assistant_says ORDER BY created_at, text");
     assert.equal(says.length, 2, "one message per file, and none for what is not a delivery");
     assert.ok(says.every((s) => s.fallback === true && s.item_id === null), "the system's own words, about no item's acceptance");
-    assert.ok(says.some((s) => s.text.includes("chart.png")) && says.some((s) => s.text.includes("report.docx")));
+    assert.ok(says.some((s) => s.text.includes("`chart.png`")) && says.some((s) => s.text.includes("`report.docx`")), "names in a code span");
     assert.ok(says.every((s) => s.text.startsWith(`#${item.seq} 周报图表 交付了文件`)), "in the language of the item");
+    assert.equal(deliveries.deliveryText({ seq: 1, title: "x" }, { name: "[a](https://evil.example)`b\n", size: 1 }),
+      "#1 x delivered a file: `[a](https://evil.example)'b ` (1 B)", "a name draws no link");
     const payloads = (await w.q("SELECT payload FROM claw_notification_outbox ORDER BY id")).map((r) => r.payload);
     const chart = payloads.find((p) => p.files?.[0]?.name === "chart.png");
     assert.deepEqual(chart.files, [{
@@ -280,6 +285,7 @@ describe("assistant files in, results out", { skip }, () => {
     assert.equal(answerToDeliver("b".repeat(9500), ["hi"])!.length, 9000);
   });
   test("F8 no delivered file is lost", async () => {
+    await w.subscribe("alice");   // (a channel's outbox row holds each message; F9 is the user without one)
     const item = await w.createItem(alice, "Charts");
     const base = `${prefix(item.workerSid)}.deliveries/`;
     const id = (n: number) => `${String(n).padStart(8, "0")}-0000-4000-8000-000000000000`;
@@ -288,7 +294,7 @@ describe("assistant files in, results out", { skip }, () => {
     // Twelve files: twelve messages, oldest first, and the report recorded as announced.
     const turn = await w.workerTurn(item.itemId);
     await w.mod.tools.report(turn, { kind: "ready", summary: "twelve charts" });
-    const names = async () => (await w.q("SELECT text FROM claw_assistant_says ORDER BY created_at, text")).map((r) => String(r.text).split(": ")[1]?.split(" (")[0]);
+    const names = async () => (await w.q("SELECT text FROM claw_assistant_says ORDER BY created_at, text")).map((r) => String(r.text).split(": ")[1]?.split(" (")[0]?.replace(/`/g, ""));
     assert.equal((await names()).length, 12);
     assert.ok((await names()).includes("chart-1.png"), "the oldest one too");
     const ready = (await w.itemEvents(item.itemId)).filter((e) => e.kind === "ready").at(-1)!;
@@ -344,5 +350,39 @@ describe("assistant files in, results out", { skip }, () => {
     } finally {
       S3Client.prototype.send = original;
     }
+  });
+  test("F9 a delivery's message that nothing durable holds is published again", async () => {
+    const item = await w.createItem(alice, "Report");
+    const base = `${prefix(item.workerSid)}.deliveries/`;
+    stored.set(`${base}${DELIVERY_A}/report.docx`, { size: 4096, at: new Date() });
+    // No subscription, and the session's stream refuses the event: the message is stored and carried by nothing.
+    const turn = await w.workerTurn(item.itemId);
+    await w.mod.tools.report(turn, { kind: "ready", summary: "report delivered" });
+    assert.equal((await w.q("SELECT * FROM claw_assistant_says")).length, 1);
+    assert.equal((await w.q("SELECT * FROM claw_work_item_delivery_checks")).length, 0, "not recorded as announced");
+    const published: Array<Record<string, any>> = [];
+    const deps = { publishSessionEvent: async (_sid: string, e: Record<string, unknown>) => { published.push(e); } };
+    await w.q("UPDATE claw_work_item_events SET created_at = NOW() - INTERVAL '5 minutes' WHERE item_id = $1", [item.itemId]);
+    assert.equal(await deliveries.announceMissedDeliveries(deps), 0, "not while it may still be on its way");
+    assert.deepEqual(published, []);
+    await w.q("UPDATE claw_assistant_says SET created_at = NOW() - INTERVAL '5 minutes'");
+    assert.equal(await deliveries.announceMissedDeliveries(deps), 1);
+    assert.equal(published.length, 1);
+    assert.equal(published[0].type, "AssistantSay");
+    assert.equal(published[0].say_id, (await w.q("SELECT say_id::text AS id FROM claw_assistant_says"))[0].id);
+    assert.deepEqual(published[0].files.map((f: any) => [f.name, f.session_id, f.id]), [["report.docx", item.workerSid, DELIVERY_A]]);
+    assert.equal((await w.q("SELECT * FROM claw_assistant_says")).length, 1, "the same message, not a second one");
+    assert.equal((await w.q("SELECT * FROM claw_work_item_delivery_checks")).length, 1, "recorded once the stream has it");
+    assert.equal(await deliveries.announceMissedDeliveries(deps), 0);
+    assert.equal(published.length, 1);
+
+    // Once the session holds the event, it is carried, whatever the record says.
+    await w.q("TRUNCATE claw_work_item_delivery_checks");
+    await w.q(
+      "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ('ev-1', $1, 'AssistantSay', $2::jsonb)",
+      [alice.routerSid, JSON.stringify(published[0])],
+    );
+    assert.equal(await deliveries.announceMissedDeliveries(deps), 0);
+    assert.equal(published.length, 1, "a message the session holds is not published again");
   });
 });
