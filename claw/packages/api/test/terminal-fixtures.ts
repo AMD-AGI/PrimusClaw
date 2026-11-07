@@ -39,6 +39,12 @@ export interface FakeSafe {
   upgradeDelayMs: number;
   /** Called when a shell connects, so a test can make it talk or hang up. */
   onShell: ((conn: ShellConnection) => void) | null;
+  /**
+   * When set, the caller is an ordinary user, as SaFE treats one: a workload
+   * list without `workspaceId` is a 403, and so is one in a workspace not named
+   * here; `/api/v1/users/self` lists these as the caller's workspaces.
+   */
+  memberOf: string[] | null;
   close(): Promise<void>;
 }
 
@@ -48,7 +54,7 @@ export async function startFakeSafe(): Promise<FakeSafe> {
   const wss = new WebSocketServer({ noServer: true });
   const safe: FakeSafe = {
     url: "", port: 0, key: SAFE_KEY, workloads: {}, list: [], containers: {}, calls: [], shells: [],
-    refuseShell: null, upgradeDelayMs: 0, onShell: null, close: async () => {},
+    refuseShell: null, upgradeDelayMs: 0, onShell: null, memberOf: null, close: async () => {},
   };
   const authorised = (header: string | undefined) => header === `Bearer ${safe.key}`;
 
@@ -70,9 +76,17 @@ export async function startFakeSafe(): Promise<FakeSafe> {
       const w = safe.workloads[decodeURIComponent(m[1])];
       return w ? send(200, w) : send(404, {});
     }
+    if (url.pathname === "/api/v1/users/self") {
+      return send(200, { id: "u-1", workspaces: (safe.memberOf ?? []).map((id) => ({ id, name: id })) });
+    }
     if (url.pathname === "/api/v1/workloads") {
       const want = url.searchParams.get("envValue");
-      return send(200, { totalCount: safe.list.length, items: safe.list.filter((w) => w.__env === want).map(({ __env, ...w }) => w) });
+      const ws = url.searchParams.get("workspaceId");
+      if (safe.memberOf && (!ws || !safe.memberOf.includes(ws))) {
+        return send(403, { errorCode: "Primus.00004", errorMessage: `is not allowed to list workload, workspace: [${ws ?? ""}]` });
+      }
+      const items = safe.list.filter((w) => w.__env === want && (!ws || w.workspaceId === ws)).map(({ __env, ...w }) => w);
+      return send(200, { totalCount: items.length, items });
     }
     return send(404, {});
   });

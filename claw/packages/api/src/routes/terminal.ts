@@ -4,7 +4,9 @@
 /**
  * A shell in a session's sandbox, for the browser.
  *
- *   GET  /v1/sessions/:id/terminal          is there a shell to connect to?
+ *   GET  /v1/sessions/:id/terminal          is there a shell to connect to? (`state`; with
+ *                                           `cause: "sandbox_gone"` when the session's
+ *                                           sandbox was reclaimed: start a new one)
  *   POST /v1/sessions/:id/terminal/ticket   a one-time ticket for the socket
  *   GET  /v1/sessions/:id/terminal/ws       WebSocket: the shell itself
  *
@@ -81,11 +83,15 @@ export const terminalPorts = {
     try {
       const entry = await kv.get(handsSessionKey(sessionId));
       if (!entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return null;
-      const info = JSON.parse(new TextDecoder().decode(entry.value)) as { provider?: unknown; workloadId?: unknown };
+      const info = JSON.parse(new TextDecoder().decode(entry.value)) as {
+        provider?: unknown; workloadId?: unknown; namespace?: unknown;
+      };
       if (info.provider === "agent-sandbox") return { provider: "agent-sandbox", workloadId: "" };
-      return typeof info.workloadId === "string" && info.workloadId
-        ? { provider: "safe-workload", workloadId: info.workloadId }
-        : null;
+      if (typeof info.workloadId !== "string" || !info.workloadId) return null;
+      // Brain records the workload's SaFE workspace as `namespace`.
+      return typeof info.namespace === "string" && info.namespace
+        ? { provider: "safe-workload", workloadId: info.workloadId, workspaceId: info.namespace }
+        : { provider: "safe-workload", workloadId: info.workloadId };
     } catch {
       return null;
     }
@@ -347,7 +353,7 @@ export async function registerTerminalRoutes(app: FastifyInstance): Promise<void
     if (resolved.state === "ready") {
       return { state: "ready", target: { pod: resolved.target.pod, container: resolved.target.container } };
     }
-    return { state: resolved.state, message: resolved.message };
+    return { state: resolved.state, message: resolved.message, ...(resolved.cause ? { cause: resolved.cause } : {}) };
   });
 
   app.post<{ Params: { id: string }; Body: { cols?: unknown; rows?: unknown } | undefined }>(
@@ -367,7 +373,9 @@ export async function registerTerminalRoutes(app: FastifyInstance): Promise<void
       const resolved = await resolveOrReply(caller, req.params.id, reply);
       if (!resolved) return reply;
       if (resolved.state !== "ready") {
-        return reply.status(409).send(failure("terminal_not_ready", resolved.message, { state: resolved.state }));
+        return reply.status(409).send(failure("terminal_not_ready", resolved.message, {
+          state: resolved.state, ...(resolved.cause ? { cause: resolved.cause } : {}),
+        }));
       }
       let ticket: string;
       try {
