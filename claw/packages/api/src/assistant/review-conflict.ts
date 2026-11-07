@@ -9,8 +9,12 @@
  * assistant, in their language: which pull request, that its branch has conflicts, and that the author resolves them before the review can
  * merge it. Once per item and head commit (the notice's key): a push that still conflicts is told again, a second block on the same head is not.
  *
- * R is told only what R may know of the item (`requester-view.ts`): the pull request R named and GitHub's merge state, which anyone who can
- * read the pull request sees; nothing of the reviewer's session.
+ * What R is told is within what R may know of the item (`requester-view.ts`, which lists it): the pull request R named and one fact GitHub
+ * shows on it to anyone who can read it, read through the reviewer's session as the view's `findings` and `merged` are; nothing of the
+ * session itself (no summary, question or session id).
+ *
+ * Off the report's path: `ingestReport` starts it after its commit and does not wait for it (`checkConflictLater`), so a slow read or
+ * notice never delays a report.
  */
 import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
@@ -31,6 +35,21 @@ export function conflictText(pr: string, url: string, zh: boolean): string {
 /** The ports a test stands in for: what reaches R. */
 export const reviewConflictPorts = { recordSystemNotice };
 
+/** The checks started and not finished yet, for a test to wait on (`conflictChecksSettled`). */
+const inflight = new Set<Promise<boolean>>();
+
+/** Start `tellRequesterOfConflict` for the item without waiting for it: the report it follows is already committed and answered. */
+export function checkConflictLater(itemId: string): void {
+  const p = tellRequesterOfConflict(itemId);
+  inflight.add(p);
+  void p.finally(() => inflight.delete(p));
+}
+
+/** Resolves when every check started so far has finished (tests). */
+export async function conflictChecksSettled(): Promise<void> {
+  await Promise.all([...inflight]);
+}
+
 /**
  * After a report that left a review item needing its owner: when the item was asked by someone else and the latest merge its session tried
  * was refused on a conflict, tell the one who asked. True when told now. Never throws: the report stands whatever this does.
@@ -39,10 +58,14 @@ export async function tellRequesterOfConflict(itemId: string): Promise<boolean> 
   if (!CLAW_ASSISTANT_ENABLED || !CLAW_GITHUB_REVIEW_ENABLED) return false;
   try {
     const q: Querier = (t, p) => db.query(t, p);
+    // Only a review someone else asked to be merged: a review only never merges, and the owner's own review has no one else to tell.
     const item = (await q(
-      "SELECT item_id, user_id, kind, board_state, params, worker_session_id FROM claw_work_items WHERE item_id = $1", [itemId],
-    )).rows[0] as { item_id: string; user_id: string; kind: string; board_state: string; params: Record<string, unknown> | null; worker_session_id: string | null } | undefined;
-    if (!item || item.kind !== "review" || item.board_state !== "needs_you" || !item.worker_session_id) return false;
+      `SELECT item_id, user_id, params, worker_session_id FROM claw_work_items
+        WHERE item_id = $1 AND kind = 'review' AND board_state = 'needs_you' AND params ? 'requested_by'
+          AND COALESCE(params->>'review_only', 'false') <> 'true'`,
+      [itemId],
+    )).rows[0] as { item_id: string; user_id: string; params: Record<string, unknown> | null; worker_session_id: string | null } | undefined;
+    if (!item?.worker_session_id) return false;
     const requester = requestedByOfItem(item.params);
     if (!requester || requester === item.user_id) return false;
     // The session's latest merge, whatever came of it: a conflict that a later merge got past (or failed on for another reason) is not told.

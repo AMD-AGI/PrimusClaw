@@ -9,7 +9,8 @@
  *       assistant, in the language she writes in, which pull request and that the author resolves the conflict; once per head commit
  *       (a second block on the same head is not told again, a new head that still conflicts is)
  *   C2  nothing is told to alice when the block is not a conflict (BEHIND, a merge that later went through, no merge tried), when the
- *       item is bob's own (no requested_by), or when it does not need bob
+ *       item is bob's own (no requested_by), when it does not need bob, or when alice asked for a review only (no merge)
+ * The check runs after the report is answered, not waited for (`checkConflictLater`): the tests wait for it (`conflictChecksSettled`).
  * The audit rows are written as the review service writes them; that it records GitHub's merge state on a refused merge is
  * github-review-service.test.ts M8c.
  */
@@ -24,11 +25,13 @@ type Row = Record<string, any>;
 
 describe("a review stopped by a conflict tells the one who asked", { skip }, () => {
   let w: World;
+  let conflict: typeof import("../src/assistant/review-conflict.js");
   let alice: { userId: string; routerSid: string };
   let bob: { userId: string; routerSid: string };
 
   before(async () => {
     w = await startWorld({ CLAW_GITHUB_REVIEW_ENABLED: "true", CLAW_GITHUB_REVIEW_MCP_SECRET: "t".repeat(40) });
+    conflict = await import("../src/assistant/review-conflict.js");
   });
   after(async () => { await w?.stop(); });
   beforeEach(async () => {
@@ -47,12 +50,12 @@ describe("a review stopped by a conflict tells the one who asked", { skip }, () 
   type Review = { itemId: string; workerSid: string; pr: number };
   /** bob's review item for AMD-AGI/demo#N, asked by `requestedBy` (none: bob's own); the first one made is #7. */
   let made = 0;
-  async function reviewFor(requestedBy: string | null): Promise<Review> {
+  async function reviewFor(requestedBy: string | null, extra: Record<string, unknown> = {}): Promise<Review> {
     // A pull request and a title of its own each: one open review per pull request, and work_create gives the open item of a title back.
     made += 1;
     const pr = 6 + made;
     const item = await w.createItem(bob, `Review+merge AMD-AGI/demo#${pr}`);
-    const params = { pr: { owner: "AMD-AGI", repo: "demo", number: pr }, ...(requestedBy ? { requested_by: requestedBy, requester_label: `Name ${requestedBy}` } : {}) };
+    const params = { pr: { owner: "AMD-AGI", repo: "demo", number: pr }, review_only: false, ...(requestedBy ? { requested_by: requestedBy, requester_label: `Name ${requestedBy}` } : {}), ...extra };
     await w.q("UPDATE claw_work_items SET kind = 'review', params = params || $2::jsonb WHERE item_id = $1", [item.itemId, JSON.stringify(params)]);
     return { ...item, pr };
   }
@@ -71,6 +74,7 @@ describe("a review stopped by a conflict tells the one who asked", { skip }, () 
     await w.mod.reports.ingestReport({ itemId: item.itemId, workerSessionId: turn.sid, generation: Number(turn.gen), runId: turn.task_id },
       { kind: "blocked", summary: `GitHub will not merge it (${n})`, question: "The branch has conflicts; what now?" }, "worker");
     await w.closeRun(turn.task_id);
+    await conflict.conflictChecksSettled();
   }
   const toldAlice = async (): Promise<Row[]> => w.q("SELECT text FROM claw_assistant_says WHERE user_id = 'alice' ORDER BY created_at");
 
@@ -122,6 +126,12 @@ describe("a review stopped by a conflict tells the one who asked", { skip }, () 
     const turn = await w.workerTurn(going.itemId);
     await w.mod.reports.ingestReport({ itemId: going.itemId, workerSessionId: turn.sid, generation: Number(turn.gen), runId: turn.task_id },
       { kind: "progress", summary: "looking at it" }, "worker");
+    await conflict.conflictChecksSettled();
+    assert.deepEqual(await toldAlice(), []);
+    // A review only (no merge was asked): nothing, even on a conflict.
+    const only = await reviewFor("alice", { review_only: true });
+    await merged(only, "refused", "merge_state_not_clean", "DIRTY");
+    await blocked(only);
     assert.deepEqual(await toldAlice(), []);
   });
 });
