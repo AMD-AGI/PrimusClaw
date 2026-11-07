@@ -16,7 +16,8 @@
  *   F6  a message the route queues behind a running turn hears the line 3.5 s after it came in, before its run opens, and the
  *       answer of the run that later carries it takes the line's place
  *   F5  a turn that starts an item after the line: the start notice takes the line's place, and the router's words after it are added
- *       to that same message (one message in the channel, as without the line)
+ *       to that same message (one message in the channel, as without the line); but never once the line's message shows something
+ *       else: after the router's say took its place, or for a second item's notice, the notice is its own message, as without the line
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -266,5 +267,30 @@ describe("assistant first ack by the clock", { skip }, () => {
     assert.equal(n2.payload.replaces, undefined);
     const a2 = await w.mod.tools.say(plain as never, { text: "顺便：按版本分组。" }, w.sayDeps);
     assert.equal(w.events.find((e) => e.type === "AssistantSay" && e.say_id === a2.say_id)?.amends, n2.event_id);
+  });
+  test("F5b the notice never overwrites what took the line's place: a router say before it, or the first item's notice", async () => {
+    await w.subscribe("alice");
+    const notices = async () => w.q("SELECT event_id, payload FROM claw_notification_outbox WHERE payload->>'text' LIKE '已开始：#%' ORDER BY created_at, event_id");
+    // The line, the router's say (in the line's place), then the item: the notice is its own message, the say stays.
+    const a = await w.routerTurn(alice);
+    await w.q("UPDATE claw_tasks SET prompt = $2, started_at = NOW() WHERE task_id = $1", [a.task_id, "帮我新建一个任务：整理周报"]);
+    await message(alice.routerSid, a.mid, "帮我新建一个任务：整理周报");
+    assert.equal(await first(alice.routerSid, a.mid), "said");
+    const said = await w.mod.tools.say(a as never, { text: "好的，这就建一个整理周报的任务。" }, w.sayDeps);
+    assert.equal(w.events.find((e) => e.type === "AssistantSay" && e.say_id === said.say_id)?.replaces, ack.lookupAckSayId("alice", a.mid));
+    assert.equal((await w.mod.tools.workCreate(a as never, { title: "整理周报", brief: "do it" }, w.sayDeps)).announced, true);
+    assert.equal((await notices())[0].payload.replaces, undefined, "the router's words stay in the line's place");
+    // The line, then two items: the first notice takes the line's place, the second is its own message.
+    await w.q("TRUNCATE claw_notification_outbox, claw_assistant_says");
+    const b = await w.routerTurn(alice);
+    await w.q("UPDATE claw_tasks SET prompt = $2, started_at = NOW() WHERE task_id = $1", [b.task_id, "帮我建两个任务：修 CI 和写文档"]);
+    await message(alice.routerSid, b.mid, "帮我建两个任务：修 CI 和写文档");
+    assert.equal(await first(alice.routerSid, b.mid), "said");
+    await w.mod.tools.workCreate(b as never, { title: "修 CI", brief: "fix it" }, w.sayDeps);
+    await w.mod.tools.workCreate(b as never, { title: "写文档", brief: "write it" }, w.sayDeps);
+    const two = await notices();
+    assert.equal(two.length, 2);
+    assert.equal(two[0].payload.replaces, ack.lookupAckSayId("alice", b.mid));
+    assert.equal(two[1].payload.replaces, undefined, "the second item's notice does not overwrite the first's");
   });
 });

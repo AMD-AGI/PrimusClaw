@@ -665,12 +665,23 @@ export async function turnFirstSay(q: Querier, userId: string, since: Date | str
   return row?.say_id ?? null;
 }
 
-/** The server's "on it" for the turn answering `messageId` (`lookup-ack.ts`, its id derived from the message), as `replaces`, when it was said. */
+/**
+ * The server's "on it" for the turn answering `messageId` (`lookup-ack.ts`, its id derived from the message), as `replaces`, while its
+ * message still shows that line: it was said and nothing of this user was stored after it. Once anything was (the router's say, which
+ * took the line's place; an earlier start notice of the turn, a second item), the notice is a message of its own, as without the line,
+ * so nothing the person was shown is overwritten. Read without the turn: a say of another session in between only keeps the notice its
+ * own message.
+ */
 async function turnAckReplaced(q: Querier, userId: string, messageId: string): Promise<{ replaces?: string }> {
   if (!CLAW_NOTIFICATIONS_ENABLED) return {};
   const ack = deterministicEventId("assistant.notice", userId, `lookup_ack:${messageId}`);
-  const said = await q("SELECT 1 FROM claw_assistant_says WHERE say_id = $1::uuid AND user_id = $2", [ack, userId]);
-  return said.rowCount ? { replaces: ack } : {};
+  const showing = await q(
+    `SELECT 1 FROM claw_assistant_says a
+      WHERE a.say_id = $1::uuid AND a.user_id = $2
+        AND NOT EXISTS (SELECT 1 FROM claw_assistant_says l WHERE l.user_id = $2 AND l.say_id <> a.say_id AND l.created_at >= a.created_at)`,
+    [ack, userId],
+  );
+  return showing.rowCount ? { replaces: ack } : {};
 }
 
 const NEEDS_YOU_TEXT: Record<string, (item: ItemRow) => string> = {
