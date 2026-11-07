@@ -363,9 +363,12 @@ function placeIn(cwd: string, root: string): string | null {
   return `${root.replace(/[\\/]+$/, "")}${sep}${c.slice(r.length + 1).split("\\").join(sep)}`;
 }
 
-/** Whether two folders a session or a request names are the same one (Windows paths compare as Windows does). */
-const samePlace = (a: string | null, b: string): boolean =>
-  a !== null && (a === b || (isWindowsFolder(a) && isWindowsFolder(b) && windowsForm(a).toLowerCase() === windowsForm(b).toLowerCase()));
+/**
+ * Whether a session's folder `a` is the folder `placed` (as placeIn spelled it under its root). Only a folder under a Windows root
+ * compares as Windows does; under a POSIX root (`//srv/share` included) the two must be equal.
+ */
+const samePlace = (a: string | null, placed: string): boolean =>
+  a !== null && (a === placed || (isWindowsPath(placed) && isWindowsFolder(a) && windowsForm(a).toLowerCase() === windowsForm(placed).toLowerCase()));
 
 type PlanOutcome =
   | { ok: true; plan: SendPlan }

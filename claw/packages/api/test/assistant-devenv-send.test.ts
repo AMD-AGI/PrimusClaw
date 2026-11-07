@@ -410,6 +410,16 @@ describe("development environment items and devenv_send", { skip }, () => {
     const again = await tools.planSend("alice", { text: "dir", agent: "claude", cwd: "c:/Users/Alice/repo/web" });
     assert.ok(again.ok, JSON.stringify(again));
     assert.equal(again.plan.session_id, open);
+
+    // A POSIX root that starts with two slashes is POSIX: its folders compare exactly, case and all.
+    const posix = await machine("alice", "nfsbox", { agents: [{ ...CLAUDE, capabilities: { roots: ["//srv/share/proj"] } }] });
+    const lower = await chatSession("alice", posix, "//srv/share/proj/web");
+    const exact = await tools.planSend("alice", { text: "ls", target: "nfsbox", agent: "claude", cwd: "//srv/share/proj/web" });
+    assert.ok(exact.ok, JSON.stringify(exact));
+    assert.equal(exact.plan.session_id, lower);
+    const other = await tools.planSend("alice", { text: "ls", target: "nfsbox", agent: "claude", cwd: "//srv/share/proj/Web" });
+    assert.ok(other.ok, JSON.stringify(other));
+    assert.deepEqual([other.plan.session_id, other.plan.cwd], [null, "//srv/share/proj/Web"]);
   });
 
   test("F5 work_send refuses a development environment item; work_stop closes it and cancels its turn; worker_tail is the answer", async () => {
