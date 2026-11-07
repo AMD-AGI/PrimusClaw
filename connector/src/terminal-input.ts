@@ -36,6 +36,10 @@ export function tmuxRunner(cli: string, socket: string, timeoutMs = 5_000): Tmux
     run: (args, input) => new Promise((resolve, reject) => {
       const child = execFile(cli, ["-S", socket, ...args], { timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 4 * 1024 * 1024, encoding: "utf8", windowsHide: true },
         (err, stdout) => (err ? reject(err) : resolve(stdout)));
+      // A client that exits before reading its input (a server that is gone, a refused command) closes the pipe under
+      // this write. Its EPIPE is that run's failure, which the callback above already reports; unheard, it would be an
+      // unhandled 'error' event and end the process.
+      child.stdin?.on("error", () => {});
       child.stdin?.end(input ?? "");
     }),
   };
