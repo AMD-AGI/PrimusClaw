@@ -108,6 +108,13 @@ describe("say with citations, on a real Postgres", { skip }, () => {
       });
       assert.equal(unlinked.isError, true, "an encoded list Brain could not read is not let through with numbers that link nowhere");
       assert.match(JSON.stringify(unlinked.content), /citation_not_found/);
+      // Any other string is read as no sources, as before: one plain address Brain did not keep, or a broken list, is not refused.
+      for (const sources of ["https://made-up.example/x", "[not json"]) {
+        const plain = await router.callTool({
+          name: "say", arguments: { text: "plain [1]", sources }, _meta: meta([], { not_in_turn: 1, invalid: 0, over_cap: 0 }),
+        });
+        assert.equal(plain.isError, undefined, `${sources}: ${JSON.stringify(plain.content)}`);
+      }
     } finally { await router.close(); }
 
     const [cited, fabricated, ...rest] = await payloads();
@@ -119,7 +126,7 @@ describe("say with citations, on a real Postgres", { skip }, () => {
     assert.deepEqual(cited.sources, [pr(1)]);
     assert.equal(fabricated.sources, undefined, "the model's own addresses are never sources");
     assert.equal(await counted("cited") - before.cited, 1 + 4);
-    assert.equal(await counted("dropped_not_in_turn") - before.missing, 1);
+    assert.equal(await counted("dropped_not_in_turn") - before.missing, 1 + 2, "and the two plain strings Brain did not keep");
     assert.equal(await counted("unreferenced") - before.unreferenced, 1);
 
     // Off: the same server offers no sources and reads no _meta.

@@ -49,6 +49,13 @@ import { observeEveryTool, recordObservation } from "./observe.js";
 import { assistantCitationsOn } from "./citations.js";
 import { readSelfStatus, selfStatusOn } from "./self-status.js";
 import { CITE_MAX_PER_CALL, citeSourcesAsked } from "@claw/protocol";
+
+/** `sources` given as one string that is a JSON-encoded list: that list (`citeSourcesAsked`); any other value as it came. */
+function encodedList(v: unknown): unknown {
+  if (typeof v !== "string") return v;
+  const asked = citeSourcesAsked(v);
+  return asked.length === 1 && asked[0] === v ? v : asked;
+}
 import { devenvList, devenvPair, devenvSend, devenvToolsOn } from "./devenv-tools.js";
 
 const logger = pino({ name: "assistant-mcp" });
@@ -356,9 +363,9 @@ export function createAssistantMcpServer(
         // After text: the text is what streams while the model writes it (`stream_tool_text`), and only once the fields before it are whole.
         // Never read here (Brain sends the sources in `_meta`), so one the model got wrong is no reason to refuse what it says: the
         // schema it is shown stays the same, and a `sources` that does not fit it is read as none.
-        // A list sent JSON-encoded as one string is the list it encodes (`citeSourcesAsked`), as Brain reads it: then a [n] it does not
-        // link is refused (`uncitedNumbers`) instead of reaching the user as a bare number.
-        ...(citations ? { sources: z.preprocess((v) => (typeof v === "string" ? citeSourcesAsked(v) : v), z.array(z.string())).optional().catch(undefined).describe(SAY_SOURCES_PARAM) } : {}),
+        // A list sent JSON-encoded as one string is the list it encodes (`encodedList`), as Brain reads it: then a [n] it does not
+        // link is refused (`uncitedNumbers`) instead of reaching the user as a bare number. Any other string is read as none, as before.
+        ...(citations ? { sources: z.preprocess(encodedList, z.array(z.string())).optional().catch(undefined).describe(SAY_SOURCES_PARAM) } : {}),
         // Checked by `say` (`suggested.ts`), never a reason to refuse it: one that does not fit the schema is read as none.
         ...(suggested ? { suggested: z.array(z.string()).optional().catch(undefined).describe(SAY_SUGGESTED_PARAM) } : {}),
       },
