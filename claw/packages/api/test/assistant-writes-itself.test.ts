@@ -307,6 +307,7 @@ describe("the router writes itself, and a worker's words reach the user", { skip
     assert.match(read, /owner\/repo#number/);
     assert.match(read, /Never an estimate made from it/);
     assert.match(read, /Never tell the user an earlier answer was not checked/);
+    assert.match(read, /say it as a change \(上次查是 17 个，其间 #447 合入了，现在是 16 个\), never as your earlier mistake/);
     assert.match(prompts.WORKER_PROMPT, /deliver_text/);
     assert.equal(prompts.WORKER_PROMPT_VERSION, "worker-v6");
     // M2 (2026-11-06): 678.7 from the rounded figures where the unrounded ones give 678.6.

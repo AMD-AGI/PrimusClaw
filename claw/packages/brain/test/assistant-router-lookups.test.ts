@@ -364,6 +364,7 @@ test("LK6b an earlier turn's replaced lookup still tells the model it ran and an
   assert.ok(!text.includes('"ready":5'), "what it returned is not replayed");
   assert.match(text, /\bran\b[^.]*\banswered\b/, "it says the lookup ran and answered in its turn");
   assert.match(text, /never call that answer unchecked/, "it rules out disowning that answer");
+  assert.match(text, /a different result now is a change since, never that answer's error/, "a difference is a change, not a mistake");
   assert.match(text, /look it up again/, "a new answer looks it up again");
   assert.match(text, /compares with that answer/, "and is compared with the earlier one");
 });

@@ -101,6 +101,9 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- An assistant whose new lookup differs from its earlier answer says what changed since, not that the earlier answer was its mistake
+  (`router-read-v12`, and the placeholder that stands for an earlier turn's result): a pull request merged between two asks was
+  told as "上次我多算了 1 个，抱歉".
 - A fresh connector install trusts the CAs the machine trusts: a Claw behind a company CA no longer fails `doctor`, `login`, `pair`
   and `run` until `NODE_USE_SYSTEM_CA=1` is set. On Node.js 22.19+ / 24.5+ the connector adds the system store to Node's own list
   (and `NODE_EXTRA_CA_CERTS`) before its first connection and passes `NODE_USE_SYSTEM_CA=1` to the programs it starts;
