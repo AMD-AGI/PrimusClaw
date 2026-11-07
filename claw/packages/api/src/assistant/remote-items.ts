@@ -429,14 +429,15 @@ function terminalRefusal(error: string, mode: string, lang: RemoteLang): string 
 }
 
 /**
- * A turn the connector ended because it restarted mid-turn (connector manager.ts `recover`): the session is back, so the person is told
- * what happened and how to carry on rather than the code. Anything else is said by its code, as before.
+ * A turn the connector ended because it restarted mid-turn (connector manager.ts `recover`): the person is told what happened and how to
+ * carry on rather than the code. It never says the session is back: `recover` ends the turn of a session that is no longer active too
+ * (it then sends no `session_recovered`). Anything else is said by its code, as before.
  */
 function interruption(error: string, lang: RemoteLang): string | null {
   if (error !== "connector_restarted") return null;
   return lang === "zh"
-    ? "（被打断：那台机器上的连接器重启了，这一轮没有做完；会话已经重新接上，再发一次这条指令，或发“继续”让它接着做）"
-    : "(interrupted: the connector on that machine restarted, so this turn did not finish; the session is back, so send the instruction again, or say \"continue\", to carry on)";
+    ? "（被打断：那台机器上的连接器重启了，这一轮没有做完；再发一次这条指令，或发“继续”让它接着做）"
+    : "(interrupted: the connector on that machine restarted, so this turn did not finish; send the instruction again, or say \"continue\", to carry on)";
 }
 
 function stopWords(stop: string, error: string, lang: RemoteLang, mode = ""): string {

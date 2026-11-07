@@ -325,7 +325,8 @@ describe("development environment items and devenv_send", { skip }, () => {
     got = await pushed(itemId);
     assert.equal(got.length, 5, JSON.stringify(got.map((g) => g.text)));
     assert.equal(got[4].remote.kind, "error");
-    assert.match(got[4].text, /接着写\n（被打断：那台机器上的连接器重启了，这一轮没有做完；会话已经重新接上，再发一次这条指令，或发“继续”让它接着做）/);
+    assert.match(got[4].text, /接着写\n（被打断：那台机器上的连接器重启了，这一轮没有做完；再发一次这条指令，或发“继续”让它接着做）/);
+    assert.doesNotMatch(got[4].text, /重新接上/);
     assert.doesNotMatch(got[4].text, /connector_restarted/);
 
     // One the machine refuses, and a session that closes before it finished: errors, each once.
