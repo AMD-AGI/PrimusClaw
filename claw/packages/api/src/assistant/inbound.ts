@@ -79,6 +79,12 @@ export interface ChannelAttached {
   phase: "watching" | "attached";
   busy: boolean;
   conversation?: string;
+  /**
+   * Where the chat box goes while attached (Clawy's `/agent mode card|chat`): `card`, the chat box stays with the assistant and the
+   * session card's own text box (or a reply quoting that card) goes to the session; `chat`, what is typed goes to the session. Absent:
+   * not said (a Clawy from before it), read as `chat`.
+   */
+  chat_box?: "card" | "chat";
 }
 
 function parseAttached(raw: unknown): ChannelAttached | null | undefined {
@@ -94,6 +100,7 @@ function parseAttached(raw: unknown): ChannelAttached | null | undefined {
     phase: a.phase === "watching" ? "watching" : "attached",
     busy: a.busy === true,
     ...opt("conversation", str(a.conversation)),
+    ...(a.chat_box === "card" || a.chat_box === "chat" ? { chat_box: a.chat_box } : {}),
   };
 }
 
