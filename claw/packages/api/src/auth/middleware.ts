@@ -18,6 +18,7 @@ import { constantTimeEquals } from "@claw/utils";
 import { verifyConnectorToken } from "./connector-token.js";
 import { verifyConnectorGrant } from "./connector-grant.js";
 import { verifyIdentityAccessToken } from "./identity-token.js";
+import { safeFailureOf } from "./delegated-keys.js";
 import { recordRequestCredential } from "./request-credential.js";
 import { platformAccessRefusal } from "./platform-access.js";
 import pino from "pino";
@@ -248,20 +249,26 @@ function verificationFailureSpec(
   unreachableMessage: string,
   invalidLegacyError: string,
 ): AuthErrorSpec {
-  if (e instanceof AuthUpstreamUnreachableError) {
+  // One reading for every credential SaFE is asked about (delegated-keys.ts): SaFE that cannot be reached, that
+  // answers 5xx, or that answers 2xx with something that is not an answer has not judged the credential. A 401 for
+  // that tells a person (and a connector, which stops for good after a run of them) that a good key is invalid.
+  const failure = safeFailureOf(e);
+  if (failure.status === "unavailable") {
     return {
       status: 503,
       legacyError: "authentication_service_unavailable",
       anthropicType: "api_error",
-      message: unreachableMessage,
+      // SaFE's own error text stays in the log (verificationFailureLogFields), not in the answer.
+      message: e instanceof AuthUpstreamUnreachableError ? unreachableMessage
+        : "SaFE could not verify the credential now (it answered with an error); this is not an invalid-credential response.",
     };
   }
-  if (e instanceof AuthServiceMisconfiguredError) {
+  if (failure.status === "misconfigured") {
     return {
       status: 500,
       legacyError: "authentication_misconfigured",
       anthropicType: "api_error",
-      message: (e as Error).message,
+      message: failure.message,
     };
   }
   return {

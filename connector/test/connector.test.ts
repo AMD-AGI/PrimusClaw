@@ -133,11 +133,14 @@ describe("start-up when the network or a provider is not ready", () => {
     await claw.until("a few attempts", () => claw.requests.length >= 3);
     assert.equal(await h.stop(), "stopped");
   });
-  test("a refused credential or a missing scope is not retried: the run ends with the error", async () => {
-    const h = await make({ token: "wrong", start: false });
+  test("a refused credential at start ends the run as auth_failed after authFailLimit refusals over authFailWindowMs, not on the first", async () => {
+    const h = await make({ token: "wrong", start: false, timing: { backoffMinMs: 5, backoffMaxMs: 10, authFailLimit: 3, authFailWindowMs: 60 } });
+    const t0 = Date.now();
     h.start();
-    await assert.rejects(h.running!, (e: any) => e.status === 401);
-    assert.ok(h.claw.requests.length <= 2, "no retry loop");
+    assert.equal(await h.running!, "auth_failed");
+    assert.ok(Date.now() - t0 >= 60, "not before authFailWindowMs");
+    // Each register is asked twice (a fresh token once on a 401): at least authFailLimit refusals, and no endless loop.
+    assert.ok(h.claw.requests.length >= 6 && h.claw.requests.length <= 60, `${h.claw.requests.length} requests`);
   });
 });
 
