@@ -33,7 +33,8 @@ import { redactDeep } from "./redact.js";
 import type { SessionStore } from "./session-store.js";
 import { errMessage, isObject, sleep, truncateBytes, type Logger } from "./util.js";
 
-export type Emit = (sessionId: string, type: string, data: Record<string, unknown>) => void;
+/** `after`: the event is written (and posted) only once that has settled, e.g. the record it depends on is on disk. */
+export type Emit = (sessionId: string, type: string, data: Record<string, unknown>, after?: Promise<unknown>) => void;
 
 export interface SessionTiming {
   /** A session with no activity for this long loses its adapter process (the session itself stays and resumes on demand). */
@@ -163,8 +164,8 @@ export class Session {
 
   // --- helpers -----------------------------------------------------------------
 
-  private emit(type: string, data: Record<string, unknown>): void {
-    this.env.emit(this.id, type, data);
+  private emit(type: string, data: Record<string, unknown>, after?: Promise<unknown>): void {
+    this.env.emit(this.id, type, data, after);
   }
 
   private audit(kind: string, detail: Record<string, unknown> = {}): void {
@@ -212,7 +213,7 @@ export class Session {
     // `unused`: a new conversation of this connector's own making that no message has reached yet (see neverPrompted).
     this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString(), unused: true });
     this.audit("session_started", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
-    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
+    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended }, this.env.store.written());
     this.announced = true;
     this.touch();
   }
@@ -240,7 +241,7 @@ export class Session {
     if (this.closed) return;
     this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString() });
     this.audit("session_attached", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
-    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
+    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended }, this.env.store.written());
     this.touch();
   }
 
@@ -708,7 +709,8 @@ export class Session {
       this.env.store.addPending(this.id, p.actionId);
       this.env.store.markWaiting(this.id, true, permission);
       this.audit("permission_requested", { action_id: p.actionId, tool: info.tool, tool_kind: info.kind, options: options.map((o) => o.optionId) });
-      this.emit("permissionRequest", p.payload);
+      // Shown once the card is on record: a crash after that closes it on the next run (`takePending`).
+      this.emit("permissionRequest", p.payload, this.env.store.written());
     });
   }
 

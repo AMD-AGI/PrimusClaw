@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { main } from "./commands.js";
 import { resolveDirs } from "./paths.js";
@@ -8,6 +9,18 @@ import type { Connector } from "./connector.js";
 import { probeAgents } from "./probe.js";
 
 let connector: Connector | null = null;
+
+/** A yes/no question at the terminal; only offered when both ends are one (a script or a pipe gets the default, no). */
+const ask = process.stdin.isTTY && process.stdout.isTTY
+  ? async (question: string): Promise<boolean> => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    // Ctrl-D or Ctrl-C at the question is a no, not a crash. readline takes Ctrl-C as a keystroke (SIGINT on the
+    // interface, not the process): without this the question would never settle and init would end silently.
+    const ac = new AbortController();
+    rl.on("SIGINT", () => { process.stdout.write("\n"); ac.abort(); });
+    try { return /^\s*y(es)?\s*$/i.test(await rl.question(question, { signal: ac.signal })); } catch { return false; } finally { rl.close(); }
+  }
+  : undefined;
 let stopping = false;
 
 /**
@@ -27,6 +40,7 @@ main(process.argv.slice(2), {
   env: process.env,
   out: (l) => process.stdout.write(l + "\n"),
   err: (l) => process.stderr.write(l + "\n"),
+  ask,
   probe: probeAgents,
   installAdapters: true,
   onConnector: (c) => {

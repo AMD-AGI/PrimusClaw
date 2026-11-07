@@ -22,6 +22,7 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -33,7 +34,8 @@ import { hooksStatus } from "./hooks.js";
 import { REMOTE_AGENT_LIMITS } from "./protocol.js";
 import { redactText } from "./redact.js";
 import { checkCwd, resolveCwd } from "./roots.js";
-import { SESSION_ID_RE, localPidDomain, readTerminals } from "./terminals.js";
+import { within } from "./statefile.js";
+import { SESSION_ID_RE, localPidDomain, readTerminals, readTerminalsAsync } from "./terminals.js";
 import { errMessage, isObject, type Logger } from "./util.js";
 
 /** idle: nothing holds it open. live: a process (a terminal) does. attached: this connector holds it. unknown: the check could not be made. */
@@ -173,11 +175,26 @@ export class AttachSupport {
       this.lastHookError = "";
       return readTerminals(this.configDir, this.localDomain, this.now());
     } catch (e) {
-      const msg = errMessage(e);
-      if (msg !== this.lastHookError) this.d.log.warn("the terminal hook rows could not be read; the other checks decide", { agent: this.agent.id, error: msg });
-      this.lastHookError = msg;
-      return [];
+      return this.terminalRowsFailed(e);
     }
+  }
+
+  /** {@link terminalRows}, off the event loop (the heartbeat's look). */
+  private async terminalRowsAsync(): Promise<LiveEntry[]> {
+    try {
+      const rows = await readTerminalsAsync(this.configDir, this.localDomain, this.now());
+      this.lastHookError = "";
+      return rows;
+    } catch (e) {
+      return this.terminalRowsFailed(e);
+    }
+  }
+
+  private terminalRowsFailed(e: unknown): LiveEntry[] {
+    const msg = errMessage(e);
+    if (msg !== this.lastHookError) this.d.log.warn("the terminal hook rows could not be read; the other checks decide", { agent: this.agent.id, error: msg });
+    this.lastHookError = msg;
+    return [];
   }
 
   // --- what exists -------------------------------------------------------------------
@@ -255,13 +272,18 @@ export class AttachSupport {
    * refresh (a new one starts in the background when it is old); the state is read fresh, but never holds the
    * heartbeat for more than `capMs`.
    */
+  private looking: Promise<LiveEntry[] | null> | null = null;
+
   async resumable(capMs = 3_000): Promise<Resumable[]> {
     if (!this.waitedOnce) {
       // Only the very first report waits (briefly) for a list; a list that cannot be had must not slow every heartbeat.
       this.waitedOnce = true;
       await within(this.refreshCatalog().then(() => true), 5_000, false);
     } else if (this.now() - this.listedAt > this.d.catalogMs) void this.refreshCatalog();
-    const live = await within(this.liveEntries().catch(() => null), capMs, null);
+    // One look at a time: a look still waiting on a stalled disk is shared, not started again by every heartbeat (each
+    // would hold a thread of the pool until the disk answers).
+    this.looking ??= this.liveEntries().catch(() => null).finally(() => { this.looking = null; });
+    const live = await within(this.looking, capMs, null);
     const attached = this.d.attachedRefs();
     return this.listed.slice(0, MAX_REPORTED).map((l) => {
       const holders = live?.filter((e) => e.sessionId.toLowerCase() === l.ref) ?? [];
@@ -287,8 +309,9 @@ export class AttachSupport {
    * {@link UNKNOWN_RELIST_MS} (a change inside that time is listed when it is up). The first look only learns what is there.
    */
   async poll(): Promise<boolean> {
-    const print = this.fingerprint();
-    const projects = this.projectsPrint();
+    // Read off the event loop (this runs every few seconds, and the Claude config directory may be on a network disk).
+    const print = await this.fingerprint();
+    const projects = await this.projectsPrint();
     if (print === this.lastPrint && projects === this.lastProjects && !this.relistDue) return false;
     const first = this.lastPrint === null;
     const looked = print !== this.lastPrint || projects !== this.lastProjects;
@@ -298,10 +321,10 @@ export class AttachSupport {
     this.lastPrint = print;
     this.lastProjects = projects;
     let rows: LiveEntry[] | null;
-    try { rows = readRegistry(this.configDir, this.localDomain, this.now()); } catch { rows = null; }
+    try { rows = await readRegistryAsync(this.configDir, this.localDomain, this.now()); } catch { rows = null; }
     // Once per change: a list that still lacks the conversation afterwards is not asked again until something changes. The
     // first look asks too, for a terminal opened between the list made at start and this look.
-    if (looked && (newTranscript || (rows !== null && this.unlistedLive(rows)))) this.relistDue = true;
+    if (looked && (newTranscript || (rows !== null && await this.unlistedLive(rows)))) this.relistDue = true;
     let relisted = false;
     if (this.relistDue && this.now() - this.lastUnknownList >= UNKNOWN_RELIST_MS) {
       this.relistDue = false;
@@ -329,41 +352,43 @@ export class AttachSupport {
    * turned into "-") with their modification times: one changes when a conversation is started in it. At most
    * {@link MAX_WATCHED_PROJECT_DIRS} of them, so a huge config directory is not walked every few seconds.
    */
-  private projectsPrint(): string {
+  private async projectsPrint(): Promise<string> {
     const projects = path.join(this.configDir, "projects");
     const prefixes = this.agent.roots.map((r) => r.replace(/[^A-Za-z0-9]/g, "-"));
     const parts: string[] = [];
     try {
-      parts.push(`projects:${fs.statSync(projects).mtimeMs}`);
-      for (const name of fs.readdirSync(projects).sort()) {
+      parts.push(`projects:${(await fsp.stat(projects)).mtimeMs}`);
+      for (const name of (await fsp.readdir(projects)).sort()) {
         if (!prefixes.some((p) => name.startsWith(p))) continue;
         if (parts.length > MAX_WATCHED_PROJECT_DIRS) break;
-        try { parts.push(`${name}:${fs.statSync(path.join(projects, name)).mtimeMs}`); } catch { /* removed meanwhile */ }
+        try { parts.push(`${name}:${(await fsp.stat(path.join(projects, name))).mtimeMs}`); } catch { /* removed meanwhile */ }
       }
     } catch { parts.push("no-projects"); }
     return parts.join("|");
   }
 
-  private fingerprint(): string {
+  private async fingerprint(): Promise<string> {
     const parts: string[] = [];
     const dir = path.join(this.configDir, "sessions");
     try {
-      for (const name of fs.readdirSync(dir).sort()) {
+      for (const name of (await fsp.readdir(dir)).sort()) {
         if (!name.endsWith(".json")) continue;
-        try { parts.push(`${name}:${fs.statSync(path.join(dir, name)).mtimeMs}`); } catch { /* removed meanwhile */ }
+        try { parts.push(`${name}:${(await fsp.stat(path.join(dir, name))).mtimeMs}`); } catch { /* removed meanwhile */ }
       }
     } catch { parts.push("no-sessions"); }
     return parts.join("|");
   }
 
   /** Whether a process holds open a conversation in the roots, with a transcript on disk, that the last list did not have. */
-  private unlistedLive(rows: LiveEntry[]): boolean {
-    return rows.some((e) => {
+  private async unlistedLive(rows: LiveEntry[]): Promise<boolean> {
+    for (const e of rows) {
       const ref = e.sessionId.toLowerCase();
-      if (e.foreign || !SESSION_REF_RE.test(ref) || !e.cwd || this.listed.some((l) => l.ref === ref)) return false;
-      if (!checkCwd(e.cwd, this.agent.roots).ok) return false;
-      return fs.existsSync(path.join(this.configDir, "projects", e.cwd.replace(/[^A-Za-z0-9]/g, "-"), `${ref}.jsonl`));
-    });
+      if (e.foreign || !SESSION_REF_RE.test(ref) || !e.cwd || this.listed.some((l) => l.ref === ref)) continue;
+      if (!checkCwd(e.cwd, this.agent.roots).ok) continue;
+      const transcript = path.join(this.configDir, "projects", e.cwd.replace(/[^A-Za-z0-9]/g, "-"), `${ref}.jsonl`);
+      if (await fsp.access(transcript).then(() => true, () => false)) return true;
+    }
+    return false;
   }
 
   // --- the twin check ----------------------------------------------------------------
@@ -413,7 +438,7 @@ export class AttachSupport {
     let registry: LiveEntry[] = [];
     let registryError = "";
     try {
-      registry = readRegistry(this.configDir, this.localDomain);
+      registry = await readRegistryAsync(this.configDir, this.localDomain);
     } catch (e) {
       registryError = errMessage(e);
     }
@@ -431,7 +456,7 @@ export class AttachSupport {
       throw new TwinCheckError(`cannot tell which sessions are open: "${this.agent.attach?.cli ?? "claude"} agents --json" failed (${cliError}) and the session registry could not be read (${registryError})`);
     }
     // The hook rows add to whatever the other two say (the same process may be in both, which changes nothing).
-    return [...this.terminalRows(), ...out];
+    return [...await this.terminalRowsAsync(), ...out];
   }
 
   /**
@@ -510,15 +535,6 @@ function isTwin(e: LiveEntry, want: string, ownPgid: number | null | undefined):
   return e.foreign || !(ownPgid != null && processGroup(e.pid) === ownPgid);
 }
 
-/** `p`'s answer, or `late` if it takes longer than `ms`; the timer never keeps the process alive. */
-function within<T>(p: Promise<T>, ms: number, late: T): Promise<T> {
-  return new Promise<T>((resolve) => {
-    const t = setTimeout(() => resolve(late), ms);
-    t.unref?.();
-    void p.then((v) => { clearTimeout(t); resolve(v); }, () => { clearTimeout(t); resolve(late); });
-  });
-}
-
 // --- sources ---------------------------------------------------------------------------
 
 function run(file: string, args: string[], env: NodeJS.ProcessEnv, timeoutMs: number): Promise<string> {
@@ -569,17 +585,54 @@ export function readRegistry(configDir: string, localDomain: string | null, now 
       if (age < UNREADABLE_GRACE_MS) throw new TwinCheckError(`${file} is unreadable (${errMessage(e).split("\n")[0]})`);
       continue;
     }
-    if (!isObject(doc) || typeof doc.pid !== "number" || !Number.isInteger(doc.pid) || typeof doc.sessionId !== "string") continue;
-    const domain = typeof doc.pidDomain === "string" ? doc.pidDomain : null;
-    const foreign = domain !== null && localDomain !== null && domain !== localDomain;
-    if (!foreign) {
-      if (!isAlive(doc.pid)) continue;
-      if (process.platform === "linux" && typeof doc.procStart === "string" && processStart(doc.pid) !== doc.procStart) continue;
-    }
-    out.push({ pid: doc.pid, sessionId: doc.sessionId, status: typeof doc.status === "string" ? doc.status : null, foreign,
-      waitingFor: typeof doc.waitingFor === "string" ? doc.waitingFor : null, cwd: typeof doc.cwd === "string" ? doc.cwd : null });
+    const entry = registryEntry(doc, localDomain);
+    if (entry) out.push(entry);
   }
   return out;
+}
+
+/**
+ * {@link readRegistry}, off the event loop: the heartbeat's look ({@link AttachSupport.liveEntries}) reads the Claude
+ * config directory, which may be on a network disk that stalls, and a stalled read must not stop the heartbeat.
+ */
+export async function readRegistryAsync(configDir: string, localDomain: string | null, now = Date.now()): Promise<LiveEntry[]> {
+  const dir = path.join(configDir, "sessions");
+  let names: string[];
+  try {
+    names = await fsp.readdir(dir);
+  } catch (e) {
+    throw new TwinCheckError(`${dir}: ${errMessage(e)}`);
+  }
+  const out: LiveEntry[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const file = path.join(dir, name);
+    let doc: unknown;
+    try {
+      doc = JSON.parse(await fsp.readFile(file, "utf8"));
+    } catch (e) {
+      let age = Infinity;
+      try { age = now - (await fsp.stat(file)).mtimeMs; } catch { /* gone meanwhile */ }
+      if (age < UNREADABLE_GRACE_MS) throw new TwinCheckError(`${file} is unreadable (${errMessage(e).split("\n")[0]})`);
+      continue;
+    }
+    const entry = registryEntry(doc, localDomain);
+    if (entry) out.push(entry);
+  }
+  return out;
+}
+
+/** One registry row, if it names a process that still holds the session (see {@link readRegistry}). */
+function registryEntry(doc: unknown, localDomain: string | null): LiveEntry | null {
+  if (!isObject(doc) || typeof doc.pid !== "number" || !Number.isInteger(doc.pid) || typeof doc.sessionId !== "string") return null;
+  const domain = typeof doc.pidDomain === "string" ? doc.pidDomain : null;
+  const foreign = domain !== null && localDomain !== null && domain !== localDomain;
+  if (!foreign) {
+    if (!isAlive(doc.pid)) return null;
+    if (process.platform === "linux" && typeof doc.procStart === "string" && processStart(doc.pid) !== doc.procStart) return null;
+  }
+  return { pid: doc.pid, sessionId: doc.sessionId, status: typeof doc.status === "string" ? doc.status : null, foreign,
+    waitingFor: typeof doc.waitingFor === "string" ? doc.waitingFor : null, cwd: typeof doc.cwd === "string" ? doc.cwd : null };
 }
 
 /** The process group of a process, or null when it cannot be read. */

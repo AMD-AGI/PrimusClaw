@@ -8,6 +8,7 @@
  * the connection down with it.
  */
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { disconnectsFile, needsLoginFile, type Dirs } from "./paths.js";
 import { isObject } from "./util.js";
@@ -23,30 +24,39 @@ export interface Disconnect {
 /** Past this size the file is cut to its newer half: a week of Claw releases is a few hundred short lines. */
 const MAX_BYTES = 128 * 1024;
 
-export function recordDisconnect(dirs: Dirs, d: Omit<Disconnect, "at"> & { at?: string }): void {
-  const file = disconnectsFile(dirs);
+/**
+ * Appends one disconnect, off the event loop (a stream drop can coincide with a stalled network disk); one at a time,
+ * in order, so the size check and the cut never race another append of this process. Never rejects.
+ */
+export function recordDisconnect(dirs: Dirs, d: Omit<Disconnect, "at"> & { at?: string }): Promise<void> {
+  const line = JSON.stringify({ at: d.at ?? new Date().toISOString(), reason: d.reason, ...(d.detail ? { detail: d.detail.slice(0, 300) } : {}) }) + "\n";
+  const next = disconnectWrites.then(() => appendDisconnect(disconnectsFile(dirs), line)).catch(() => { /* best effort */ });
+  disconnectWrites = next;
+  return next;
+}
+let disconnectWrites: Promise<void> = Promise.resolve();
+
+async function appendDisconnect(file: string, line: string): Promise<void> {
+  await fsp.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  // One descriptor for the append, the size and the read, so all three see the same file.
+  const fh = await fsp.open(file, "a+", 0o600);
+  let lines: string[] | null = null;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    // One descriptor for the append, the size and the read, so all three see the same file.
-    const fd = fs.openSync(file, "a+", 0o600);
-    let lines: string[] | null = null;
-    try {
-      fs.writeSync(fd, JSON.stringify({ at: d.at ?? new Date().toISOString(), reason: d.reason, ...(d.detail ? { detail: d.detail.slice(0, 300) } : {}) }) + "\n");
-      const size = fs.fstatSync(fd).size;
-      if (size > MAX_BYTES) {
-        // From offset 0: after the append the descriptor's position is at the end.
-        const buf = Buffer.alloc(size);
-        let got = 0;
-        while (got < size) { const n = fs.readSync(fd, buf, got, size - got, got); if (n === 0) break; got += n; }
-        lines = buf.subarray(0, got).toString("utf8").split("\n").filter(Boolean);
-      }
-    } finally { fs.closeSync(fd); }
-    if (lines) {
-      const tmp = `${file}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, lines.slice(Math.floor(lines.length / 2)).join("\n") + "\n", { mode: 0o600 });
-      fs.renameSync(tmp, file);
+    await fh.write(line);
+    const size = (await fh.stat()).size;
+    if (size > MAX_BYTES) {
+      // From offset 0: after the append the descriptor's position is at the end.
+      const buf = Buffer.alloc(size);
+      let got = 0;
+      while (got < size) { const { bytesRead } = await fh.read(buf, got, size - got, got); if (bytesRead === 0) break; got += bytesRead; }
+      lines = buf.subarray(0, got).toString("utf8").split("\n").filter(Boolean);
     }
-  } catch { /* best effort */ }
+  } finally { await fh.close(); }
+  if (lines) {
+    const tmp = `${file}.${process.pid}.tmp`;
+    await fsp.writeFile(tmp, lines.slice(Math.floor(lines.length / 2)).join("\n") + "\n", { mode: 0o600 });
+    await fsp.rename(tmp, file);
+  }
 }
 
 /** The newest `n` disconnects, oldest first. */

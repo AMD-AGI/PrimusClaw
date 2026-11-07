@@ -70,6 +70,23 @@ export const AGENT_SECRETS = [
 /** The connector's own credential: it lives in credentials.json and is never copied anywhere. */
 const NEVER_CARRIED = new Set(["CLAW_CONNECTOR_KEY"]);
 
+/**
+ * libuv's thread pool size for the connector's run. File system calls and DNS lookups share that pool, four threads by
+ * default. A state or Claude config directory on a network disk that stops answering holds a thread for every call made
+ * to it (statefile.ts keeps that to about one per file); four of them would leave no thread for the DNS lookup of the
+ * next heartbeat, and the machine would drop off Claw although its network is fine.
+ *
+ * The pool reads the variable once, when it starts, and Node's ES module loader has already started it (reading the
+ * program's own files) before any line of the program runs. So it is set where the run is started, never by the run
+ * itself: the systemd unit, the launchd plist, and the supervisor's spawn of each run. A value the user set is kept.
+ */
+export const THREADPOOL_SIZE = "16";
+export function withThreadPool(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return env.UV_THREADPOOL_SIZE ? env : { ...env, UV_THREADPOOL_SIZE: THREADPOOL_SIZE };
+}
+const poolVars = (vars: Array<[string, string]>): Array<[string, string]> =>
+  vars.some(([k]) => k === "UV_THREADPOOL_SIZE") ? vars : [...vars, ["UV_THREADPOOL_SIZE", THREADPOOL_SIZE]];
+
 export interface ExecResult { code: number | null; out: string }
 
 export interface ServiceDeps {
@@ -286,7 +303,7 @@ StartLimitIntervalSec=0
 Type=simple
 ExecStart=${sdQuote(d.node)} ${sdQuote(d.cli)} run --supervised
 ExecStop=${sdQuote(d.node)} ${sdQuote(d.cli)} stop
-${vars.map(([k, v]) => `Environment=${sdEnv(`${k}=${v}`)}`).join("\n")}
+${poolVars(vars).map(([k, v]) => `Environment=${sdEnv(`${k}=${v}`)}`).join("\n")}
 Restart=on-failure
 RestartSec=${RESTART_SEC}
 # 78: revoked, sign-in refused, or no usable config. Restarting cannot help; "claw-connector login" can.
@@ -302,7 +319,7 @@ WantedBy=default.target
 }
 
 export function launchdPlist(d: ServiceDeps, vars: Array<[string, string]>, log: string): string {
-  const env = [...vars, ["CLAW_CONNECTOR_SUPERVISOR", "launchd"] as [string, string]];
+  const env = [...poolVars(vars), ["CLAW_CONNECTOR_SUPERVISOR", "launchd"] as [string, string]];
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Written by "claw-connector service install"; remove with "claw-connector service uninstall". -->
@@ -384,7 +401,7 @@ export async function supervise(ctx: Ctx, o: SuperviseOptions = {}): Promise<num
   o.signal?.addEventListener("abort", () => onSig("SIGTERM"), { once: true });
   try {
     for (let round = 0; !stopping; round++) {
-      child = spawn(cmd, args, { stdio: ["ignore", "inherit", "inherit"], env: ctx.env });
+      child = spawn(cmd, args, { stdio: ["ignore", "inherit", "inherit"], env: withThreadPool(ctx.env) });
       const c = child;
       const { code, signal } = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
         c.once("exit", (code, signal) => resolve({ code, signal }));
@@ -397,7 +414,7 @@ export async function supervise(ctx: Ctx, o: SuperviseOptions = {}): Promise<num
       if (code === NEEDS_PERSON) { ctx.err(`${at} supervisor: the connector needs a new sign-in (exit 78); not restarting until: claw-connector login`); return NEEDS_PERSON; }
       const how = signal ? `killed by ${signal}` : `exit ${code}`;
       // A run killed outright never wrote why; say it here, so status shows it.
-      if (signal) recordDisconnect(ctx.dirs, { reason: "process_died", detail: `the connector was ${how}; restarted by the supervisor` });
+      if (signal) await recordDisconnect(ctx.dirs, { reason: "process_died", detail: `the connector was ${how}; restarted by the supervisor` });
       ctx.err(`${at} supervisor: the connector ended (${how}); restarting in ${restartMs / 1000} s`);
       await sleep(restartMs, wake.signal);
     }

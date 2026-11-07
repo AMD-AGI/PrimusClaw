@@ -11,6 +11,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { SnapshotFile, STATE_WRITE_WAIT_MS, type WriteReport } from "./statefile.js";
 import { sleep } from "./util.js";
 
 export interface ChildRecord {
@@ -45,16 +46,26 @@ export const isAlive = (pid: number): boolean => {
 
 export class ChildRegistry {
   private recs = new Map<number, ChildRecord>();
+  /** Set for the running connector: the file is then written off the event loop (statefile.ts). The CLI writes it at once. */
+  private readonly out: SnapshotFile | null;
 
-  constructor(private readonly file: string) {
+  constructor(private readonly file: string, opts: { background?: boolean; report?: WriteReport } = {}) {
     this.recs = new Map(readRecords(file).map((r) => [r.pid, r]));
+    this.out = opts.background ? new SnapshotFile(file, opts.report) : null;
   }
 
   private save(): void {
+    const data = JSON.stringify([...this.recs.values()]);
+    if (this.out) return this.out.save(data);
     fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
     const tmp = `${this.file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify([...this.recs.values()]), { mode: 0o600 });
+    fs.writeFileSync(tmp, data, { mode: 0o600 });
     fs.renameSync(tmp, this.file);
+  }
+
+  /** Whether what was saved so far is on disk (always, when written at once). */
+  flushed(ms: number = STATE_WRITE_WAIT_MS): Promise<boolean> {
+    return this.out ? this.out.settled(ms) : Promise.resolve(true);
   }
 
   add(rec: Omit<ChildRecord, "start" | "started_at"> & { start?: string }): ChildRecord {

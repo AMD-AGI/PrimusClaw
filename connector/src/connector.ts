@@ -7,6 +7,7 @@
  * the machine's owner pauses it.
  */
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { Audit } from "./audit.js";
 import { AttachSupport, fitResumable } from "./attach.js";
@@ -15,6 +16,7 @@ import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-clie
 import type { ConnectorConfig } from "./config.js";
 import { GrantRevokedError, TransientAuthError } from "./credentials.js";
 import { recordDisconnect } from "./health.js";
+import { SnapshotFile, STATE_WRITE_WAIT_MS, within, type WriteReport } from "./statefile.js";
 import { SessionManager, type Command } from "./manager.js";
 import { Outbox } from "./outbox.js";
 import {
@@ -227,12 +229,24 @@ export class Connector {
   private lastHealthAsk = 0;
   private streamCtl: AbortController | null = null;
   private readonly ctl = new AbortController();
+  /** connector.json, written off the event loop: a heartbeat never waits for the disk (see statefile.ts). */
+  private readonly identityOut: SnapshotFile;
 
   constructor(private readonly d: ConnectorDeps) {
     this.timing = { ...DEFAULT_TIMING, ...d.timing };
-    this.outbox = new Outbox({ dir: outboxDir(d.dirs) });
-    this.registry = new ChildRegistry(childrenFile(d.dirs));
-    this.store = new SessionStore(sessionsFile(d.dirs));
+    // Said once a slow write finishes, never while it is stuck: the log is usually a file on the same disk.
+    // At most once a minute for each file: a disk that refuses every write (full) is retried every second.
+    const said = new Map<string, number>();
+    const report: WriteReport = (what, { ms, error }) => {
+      const now = Date.now();
+      if (now - (said.get(what) ?? 0) < 60_000) return;
+      said.set(what, now);
+      d.log.warn(error ? "a state write failed" : "a state write was slow (is the state directory on a network disk that stalled?)", { what, ms, ...(error ? { error } : {}) });
+    };
+    this.identityOut = new SnapshotFile(identityFile(d.dirs), report);
+    this.outbox = new Outbox({ dir: outboxDir(d.dirs), report });
+    this.registry = new ChildRegistry(childrenFile(d.dirs), { background: true, report });
+    this.store = new SessionStore(sessionsFile(d.dirs), report);
     for (const a of d.config.agents) {
       if (!a.attach) continue;
       this.attach.set(a.id, new AttachSupport(a, {
@@ -244,14 +258,14 @@ export class Connector {
     const env: SessionEnv = {
       config: d.config, audit: d.audit, registry: this.registry, store: this.store, attach: this.attach, timing: this.timing,
       logDir: logDir(d.dirs), version: d.version, log: d.log,
-      emit: (sid, type, data) => this.emit(sid, type, data),
+      emit: (sid, type, data, after) => this.emit(sid, type, data, after),
     };
     this.manager = new SessionManager(env);
   }
 
   /** Every event leaves through here: scrubbed of credential shapes, numbered, written to disk, then posted. */
-  private emit(sessionId: string, type: string, data: Record<string, unknown>): void {
-    this.outbox.append(sessionId, type, redactDeep(data));
+  private emit(sessionId: string, type: string, data: Record<string, unknown>, after?: Promise<unknown>): void {
+    this.outbox.append(sessionId, type, redactDeep(data), undefined, after);
     if (type === "session_closed") this.outbox.markClosed(sessionId);
     this.wakeSender?.();
   }
@@ -297,12 +311,10 @@ export class Connector {
     return null;
   }
 
+  /** Saves connector.json in the background; `identityOut.settled()` says whether it landed. */
   private writeIdentity(): void {
     const st: IdentityState = { server: this.d.server, connector_id: this.cid, cursor: this.ledger.cursor, handled: this.ledger.recentIds, ...(this.rowRevoked ? { revoked: true } : {}) };
-    const file = identityFile(this.d.dirs);
-    fs.mkdirSync(this.d.dirs.state, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify(st), { mode: 0o600 });
-    fs.renameSync(`${file}.tmp`, file);
+    this.identityOut.save(JSON.stringify(st));
   }
 
   /** Use the connector id this machine already has, or register a new one. */
@@ -316,6 +328,8 @@ export class Connector {
     this.cid = await this.d.client.register(this.d.config.name, this.d.version);
     this.ledger = new CommandLedger();
     this.writeIdentity();
+    // Waited for (a bounded time): an id that never reached the disk is registered again by the next start.
+    if (!(await this.identityOut.settled())) this.d.log.warn("connector.json is not written yet; going on (a restart before it is would register this machine again)");
     this.d.audit.record("connector_registered", { connector_id: this.cid, name: this.d.config.name });
   }
 
@@ -393,7 +407,8 @@ export class Connector {
     this.d.audit.record("revoked", { why });
     if (e instanceof RevokedError && this.cid) {
       this.rowRevoked = true;
-      try { this.writeIdentity(); } catch (we) { this.d.log.warn("could not record the revocation in connector.json", { error: errMessage(we) }); }
+      // Not waited for here (the agents stop first); the end of `run` gives it a bounded time to land.
+      this.writeIdentity();
     }
     this.ctl.abort();
     this.streamCtl?.abort();
@@ -422,8 +437,16 @@ export class Connector {
   }
 
   private async pauseWatcher(): Promise<void> {
+    // One listener for the whole run (not one per look, which would pile up over days).
+    const stopped = new Promise<null>((r) => {
+      if (this.ctl.signal.aborted) r(null);
+      else this.ctl.signal.addEventListener("abort", () => r(null), { once: true });
+    });
     while (!this.ctl.signal.aborted) {
-      const want = fs.existsSync(pauseFile(this.d.dirs));
+      // Looked at off the event loop: a state directory that stopped answering stalls this loop alone, not the heartbeat,
+      // and a look that never returns does not keep `run` from stopping (the wait ends with the run's signal).
+      const want = await Promise.race([fsp.access(pauseFile(this.d.dirs)).then(() => true, () => false), stopped]);
+      if (want === null || this.ctl.signal.aborted) break;
       if (want && !this.paused) {
         this.paused = true;
         this.d.audit.record("paused");
@@ -504,7 +527,8 @@ export class Connector {
       if (this.outbox.size < this.timing.batchMax) await sleep(this.timing.batchMs, this.ctl.signal);
       if (this.ctl.signal.aborted) break;
       const batch = this.outbox.pending(this.timing.batchMax);
-      if (batch.length === 0) continue;
+      // Queued but not written yet (the disk is slow): looked at again shortly.
+      if (batch.length === 0) { await sleep(this.timing.batchMs, this.ctl.signal); continue; }
       try {
         const ack = await this.d.client.postEvents(this.cid, `b-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`, batch);
         this.outbox.ack(ack.acked);
@@ -595,7 +619,7 @@ export class Connector {
     // only then can the cursor sent to the server pass it.
     void this.manager.handle(cmd, () => {
       this.ledger.end(seq, cmd.cmd_id);
-      try { this.writeIdentity(); } catch { /* best effort; the next heartbeat writes it again */ }
+      this.writeIdentity();
     });
   }
 
@@ -624,7 +648,7 @@ export class Connector {
         if (!this.ctl.signal.aborted && !this.paused) {
           const why = restart ? "restart" : this.lastFrame === "superseded" || this.lastFrame === "token_expired" ? this.lastFrame : "the server closed the stream (a Claw release or restart)";
           this.d.log.info("command stream ended by the server; reconnecting", { why });
-          recordDisconnect(this.d.dirs, { reason: "server_closed", detail: why });
+          void recordDisconnect(this.d.dirs, { reason: "server_closed", detail: why });
           // At once, but only once in a while: a stream that lands on another replica that is also leaving gets the
           // usual backoff, so a release never turns into a burst of reconnects.
           if (restart && Date.now() - lastRestartAt >= RESTART_RECONNECT_GAP_MS) { lastRestartAt = Date.now(); attempt = 0; continue; }
@@ -633,7 +657,7 @@ export class Connector {
         if (this.isRevocation(e)) return void (await this.onRevoked(e));
         if (this.ctl.signal.aborted) break;
         if (isAuthRefusal(e) && await this.authRefused(e)) return;
-        recordDisconnect(this.d.dirs, { reason: "stream_lost", detail: errMessage(e) });
+        void recordDisconnect(this.d.dirs, { reason: "stream_lost", detail: errMessage(e) });
         if (e instanceof HttpError && e.status === 404) {
           // The stored id is not this account's (or was removed): register again.
           try { await this.identify(true); await this.firstHeartbeat(); } catch (again) {
@@ -676,7 +700,7 @@ export class Connector {
     if (leftover) {
       let last: string | undefined;
       try { last = fs.statSync(identityFile(this.d.dirs)).mtime.toISOString(); } catch { /* never registered */ }
-      recordDisconnect(this.d.dirs, { reason: "process_died", detail: `the previous run ended without shutting down (killed, crashed, or the machine restarted)${last ? `; last heartbeat ${last}` : ""}`, ...(last ? { at: last } : {}) });
+      await recordDisconnect(this.d.dirs, { reason: "process_died", detail: `the previous run ended without shutting down (killed, crashed, or the machine restarted)${last ? `; last heartbeat ${last}` : ""}`, ...(last ? { at: last } : {}) });
     }
     fs.writeFileSync(pidf, JSON.stringify({ pid: process.pid, start: processStart(process.pid) ?? "" }), { mode: 0o600 });
     this.paused = fs.existsSync(pauseFile(this.d.dirs));
@@ -702,7 +726,12 @@ export class Connector {
       // Stopped or restarted (not revoked, not refused): what is in flight is the next run's to end or carry on.
       await this.manager.killAll(this.revoked ? "revoked" : "stopped", !this.revoked && !this.authFailed).catch(() => undefined);
       const reason = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : failure ? "failed" : this.paused ? "stopped_while_paused" : result;
-      recordDisconnect(this.d.dirs, { reason, detail: this.authWhy || failure || undefined });
+      const disconnected = recordDisconnect(this.d.dirs, { reason, detail: this.authWhy || failure || undefined });
+      // What is still being written gets a bounded time to land; a disk that does not answer does not keep the process.
+      const landed = await within(Promise.all([
+        this.identityOut.settled(STATE_WRITE_WAIT_MS), this.store.flushed(), this.registry.flushed(), this.outbox.flush(), this.d.audit.flush?.(), disconnected,
+      ]).then(([id, st, reg]) => id && st && reg), STATE_WRITE_WAIT_MS, false);
+      if (!landed) this.d.log.warn("the state directory did not take the last writes in time (connector.json may be behind)");
       fs.rmSync(pidf, { force: true });
     }
     return result;

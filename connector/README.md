@@ -385,8 +385,8 @@ is noticed even if it has exited by the next prompt: that prompt goes to a fresh
 while the agent is starting refuses the takeover (`session_live`) and stops the agent. A terminal that opens and closes the
 conversation between two reads, which is shorter than anything that can take a turn, is not seen.
 
-The first thing asked is the terminal itself. `claw-connector init` (or `claw-connector hooks install`) adds two Claude Code
-hooks, `SessionStart` and `SessionEnd`, to the user-level `settings.json` of the Claude config directory. Each runs a tiny
+The first thing asked is the terminal itself. `claw-connector hooks install` (or `claw-connector init`, when you say yes at
+its question or pass `--hooks`) adds two Claude Code hooks, `SessionStart` and `SessionEnd`, to the user-level `settings.json` of the Claude config directory. Each runs a tiny
 program that keeps one row per terminal session, `<config dir>/claw-connector-terminals/<pid>.json`: the session id and the
 process that holds it, with that process's start time. Claude Code runs the same hooks for sessions started by an ACP adapter
 (this connector's own included) and by `claude -p`; they are told apart by `CLAUDE_CODE_ENTRYPOINT` in the hook's environment
@@ -434,7 +434,7 @@ session stops the agent process; it never deletes the conversation.
 
 | Command | |
 |---|---|
-| `init [--approval ask\|never \| AGENT=ask\|never] [--no-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). Also installs the Claude Code session hooks (`--no-hooks` skips that). |
+| `init [--approval ask\|never \| AGENT=ask\|never] [--hooks \| --no-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). At a terminal it then asks before adding the Claude Code session hooks to Claude's `settings.json`; `--hooks` adds them without asking, `--no-hooks` skips them, and with nobody to answer (a script, a pipe) they are not added and the `hooks install` command is printed instead. |
 | `hooks install\|uninstall\|status` | The `SessionStart`/`SessionEnd` hooks alone; `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
 | `run [--supervised]` | Connect and serve. Exit code 78 means starting it again will not help: the connector was revoked, Claw or the identity service refused the sign-in (at start, or for two minutes in a row while running), or there is no usable `agents.toml` or sign-in; the reason is kept in `needs-login.json`, and until `login` removes it `run` exits 78 at once without contacting Claw. `--supervised` marks a run the service started. Any other non-zero exit is worth a restart. A unit written by hand for 0.1.2 and older (`RestartPreventExitStatus=3`): replace it with `claw-connector service install`, which writes the same file. |

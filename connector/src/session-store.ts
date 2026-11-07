@@ -3,7 +3,7 @@
 
 /** Sessions the connector has created, so a later `resume` (or a restart) can find the adapter's own session id. */
 import fs from "node:fs";
-import path from "node:path";
+import { SnapshotFile, STATE_WRITE_WAIT_MS, type WriteReport } from "./statefile.js";
 
 export interface SessionRecord {
   agent_id: string;
@@ -39,10 +39,17 @@ export class SessionStore {
   private readonly pendingFile: string;
   private turns: Record<string, TurnRecord> = {};
   private readonly turnsFile: string;
+  /** The files are written off the event loop (see statefile.ts); read synchronously once, at start. */
+  private readonly recsOut: SnapshotFile;
+  private readonly pendingOut: SnapshotFile;
+  private readonly turnsOut: SnapshotFile;
 
-  constructor(private readonly file: string) {
+  constructor(file: string, report?: WriteReport) {
     this.pendingFile = `${file}.pending`;
     this.turnsFile = `${file}.turns`;
+    this.recsOut = new SnapshotFile(file, report);
+    this.pendingOut = new SnapshotFile(this.pendingFile, report);
+    this.turnsOut = new SnapshotFile(this.turnsFile, report);
     try {
       const raw: unknown = JSON.parse(fs.readFileSync(this.turnsFile, "utf8"));
       if (raw && typeof raw === "object" && !Array.isArray(raw)) {
@@ -99,10 +106,22 @@ export class SessionStore {
   }
 
   private savePending(): void {
-    fs.mkdirSync(path.dirname(this.pendingFile), { recursive: true, mode: 0o700 });
-    const tmp = `${this.pendingFile}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(this.pending), { mode: 0o600 });
-    fs.renameSync(tmp, this.pendingFile);
+    this.pendingOut.save(JSON.stringify(this.pending));
+  }
+
+  /**
+   * Resolves once everything saved so far has been written (or the write failed), however long the disk takes: an
+   * event that depends on a record (`session_started`, a `permissionRequest`) waits for it, so what a phone was shown
+   * is always what the next run can find after a crash.
+   */
+  written(): Promise<boolean> {
+    return this.flushed(Infinity);
+  }
+
+  /** Whether everything saved so far is on disk (false when a write failed, or after `ms`). */
+  async flushed(ms: number = STATE_WRITE_WAIT_MS): Promise<boolean> {
+    const all = await Promise.all([this.recsOut.settled(ms), this.pendingOut.settled(ms), this.turnsOut.settled(ms)]);
+    return all.every(Boolean);
   }
 
   /**
@@ -140,10 +159,7 @@ export class SessionStore {
   }
 
   private saveTurns(): void {
-    fs.mkdirSync(path.dirname(this.turnsFile), { recursive: true, mode: 0o700 });
-    const tmp = `${this.turnsFile}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(this.turns), { mode: 0o600 });
-    fs.renameSync(tmp, this.turnsFile);
+    this.turnsOut.save(JSON.stringify(this.turns));
   }
 
   ids(): string[] {
@@ -151,9 +167,6 @@ export class SessionStore {
   }
 
   private save(): void {
-    fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
-    const tmp = `${this.file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(this.recs), { mode: 0o600 });
-    fs.renameSync(tmp, this.file);
+    this.recsOut.save(JSON.stringify(this.recs));
   }
 }

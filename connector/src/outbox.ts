@@ -11,10 +11,17 @@
  * acknowledges them, so a dropped connection, a failed POST or a restart loses
  * nothing and, because the server stores each `(session, seq)` once, duplicates
  * nothing either.
+ *
+ * The disk is written off the event loop ({@link DiskQueue}): a state directory on a network file system that stops
+ * answering must not stop the heartbeat. Writes happen in order, one at a time; an event is handed out to be posted
+ * (`pending`) only once its line is written, so a number the server has seen is always one a restart will not reuse.
+ * While the disk is stuck, events wait in memory (shedding as usual past the cap) and go once it answers.
  */
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { REMOTE_AGENT_LIMITS } from "./protocol.js";
+import { DiskQueue, writeWhole, type WriteReport } from "./statefile.js";
 
 export interface OutEvent {
   session_id: string;
@@ -38,9 +45,14 @@ export interface OutboxOptions {
   /** Unacknowledged bytes one session may hold before droppable events are shed. */
   maxBytesPerSession?: number;
   now?: () => number;
+  /** Told of a disk write that failed or was slow. */
+  report?: WriteReport;
 }
 
 interface Meta { lastSeq: number; acked: number }
+
+/** How long after a refused write an event's line is tried again. */
+export const RETRY_MS = 1_000;
 
 /** How long the number of a closed session is remembered. */
 export const TOMBSTONE_MS = 30 * 24 * 3600 * 1000;
@@ -62,11 +74,16 @@ export class Outbox {
   private readonly meta = new Map<string, Meta>();
   private readonly bytes = new Map<string, number>();
   private readonly closed = new Set<string>();
+  /** Events queued whose line is not written yet: not handed out to be posted until it is. */
+  private readonly unwritten = new Set<OutEvent>();
+  private readonly disk: DiskQueue;
 
+  /** The constructor reads the directory synchronously: it runs once, before anything else is under way. */
   constructor(opts: OutboxOptions) {
     this.dir = opts.dir;
     this.maxBytes = opts.maxBytesPerSession ?? 5 * 1024 * 1024;
     this.now = opts.now ?? Date.now;
+    this.disk = new DiskQueue(opts.report);
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     this.load();
   }
@@ -74,10 +91,14 @@ export class Outbox {
   private eventsFile = (sid: string) => path.join(this.dir, `${safeName(sid)}.jsonl`);
   private metaFile = (sid: string) => path.join(this.dir, `${safeName(sid)}.meta.json`);
 
-  private writeMeta(sid: string): void {
-    const tmp = this.metaFile(sid) + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(this.meta.get(sid)), { mode: 0o600 });
-    fs.renameSync(tmp, this.metaFile(sid));
+  /** The session's high-water mark as it is when the write runs (never lower than when it was asked for). */
+  private writeMeta(sid: string): Promise<void> {
+    return writeWhole(this.metaFile(sid), JSON.stringify(this.meta.get(sid) ?? { lastSeq: 0, acked: 0 }));
+  }
+
+  /** Resolves once every write asked for so far has been made (or has failed). */
+  flush(): Promise<void> {
+    return this.disk.idle();
   }
 
   /** Rebuild the queue from disk. The highest sequence number ever used is the larger of the meta file and the log itself. */
@@ -126,19 +147,41 @@ export class Outbox {
   }
 
   /** Assign the next sequence number, persist the event, queue it. */
-  append(sessionId: string, type: string, data: Record<string, unknown>, ts: number = this.now()): OutEvent {
+  /** `after`: the line is written (and the event handed out) only once that has settled, e.g. a record the event depends on. */
+  append(sessionId: string, type: string, data: Record<string, unknown>, ts: number = this.now(), after?: Promise<unknown>): OutEvent {
     const meta = this.meta.get(sessionId) ?? { lastSeq: 0, acked: 0 };
     const ev: OutEvent = { session_id: sessionId, seq: meta.lastSeq + 1, type, ts, data: fitData(data) };
     meta.lastSeq = ev.seq;
     this.meta.set(sessionId, meta);
     const line = JSON.stringify(ev);
-    fs.appendFileSync(this.eventsFile(sessionId), line + "\n", { mode: 0o600 });
-    // The meta file is rewritten on every acknowledgement; between acknowledgements the log's own lines carry the high-water mark.
-    if (ev.seq === 1) this.writeMeta(sessionId);
+    this.unwritten.add(ev);
+    this.persist(ev, line, after);
     this.queue.push(ev);
     this.bytes.set(sessionId, (this.bytes.get(sessionId) ?? 0) + line.length);
     if ((this.bytes.get(sessionId) ?? 0) > this.maxBytes) this.shed(sessionId);
     return ev;
+  }
+
+  /**
+   * Write an event's line, then hand it out to be posted. A write the disk refused (full, gone) is tried again after
+   * {@link RETRY_MS}: posted unwritten, its number could come back after a restart, and the server would drop the
+   * event that reused it. An event shed or dropped meanwhile is not written any more.
+   */
+  private persist(ev: OutEvent, line: string, after?: Promise<unknown>): void {
+    const sid = ev.session_id;
+    void this.disk.run(`appending to ${this.eventsFile(sid)}`, async () => {
+      if (after) await after.catch(() => undefined);
+      if (!this.unwritten.has(ev)) return;
+      try {
+        await fsp.appendFile(this.eventsFile(sid), line + "\n", { mode: 0o600 });
+        // The meta file is rewritten on every acknowledgement; between acknowledgements the log's own lines carry the high-water mark.
+        if (ev.seq === 1) await this.writeMeta(sid);
+        this.unwritten.delete(ev);
+      } catch (e) {
+        setTimeout(() => this.persist(ev, line), RETRY_MS).unref?.();
+        throw e;
+      }
+    });
   }
 
   /** Drop the oldest droppable events of a session until it is back under its cap. */
@@ -150,6 +193,8 @@ export class Outbox {
       if (ev.session_id === sessionId && total > this.maxBytes && DROPPABLE_TYPES.has(ev.type)) {
         total -= JSON.stringify(ev).length;
         dropped++;
+        // Shed before its line was written: it is not written any more (the meta file keeps its number).
+        this.unwritten.delete(ev);
         continue;
       }
       keep.push(ev);
@@ -161,17 +206,28 @@ export class Outbox {
   }
 
   private rewrite(sessionId: string): void {
-    // The log may be about to lose lines the high-water mark was read from (a shed chunk, a refused event): write it down first.
-    this.writeMeta(sessionId);
-    const mine = this.queue.filter((e) => e.session_id === sessionId);
-    const tmp = this.eventsFile(sessionId) + ".tmp";
-    fs.writeFileSync(tmp, mine.map((e) => JSON.stringify(e) + "\n").join(""), { mode: 0o600 });
-    fs.renameSync(tmp, this.eventsFile(sessionId));
+    void this.disk.run(`rewriting ${this.eventsFile(sessionId)}`, () => this.rewriteNow(sessionId));
   }
 
-  /** The oldest events not yet acknowledged, in the order they were appended. */
+  /**
+   * The session's log as the queue holds it when this runs: the events whose lines are written (those still waiting
+   * are appended after this, in order). The log may be about to lose lines the high-water mark was read from (a shed
+   * chunk, a refused event): that is written down first.
+   */
+  private async rewriteNow(sessionId: string): Promise<void> {
+    await this.writeMeta(sessionId);
+    const mine = this.queue.filter((e) => e.session_id === sessionId && !this.unwritten.has(e));
+    await writeWhole(this.eventsFile(sessionId), mine.map((e) => JSON.stringify(e) + "\n").join(""));
+  }
+
+  /** The oldest events not yet acknowledged, in the order they were appended, up to the first not yet written. */
   pending(max: number): OutEvent[] {
-    return this.queue.slice(0, max);
+    const out: OutEvent[] = [];
+    for (const ev of this.queue) {
+      if (out.length >= max || this.unwritten.has(ev)) break;
+      out.push(ev);
+    }
+    return out;
   }
 
   get size(): number {
@@ -207,15 +263,18 @@ export class Outbox {
     const meta = this.meta.get(sid) ?? { lastSeq: 0, acked: 0 };
     meta.acked = Math.max(meta.acked, ackedUpTo);
     this.meta.set(sid, meta);
-    this.writeMeta(sid);
     const left = this.queue.filter((e) => e.session_id === sid);
     if (left.length === 0) {
-      fs.writeFileSync(this.eventsFile(sid), "", { mode: 0o600 });
       this.bytes.set(sid, 0);
-      if (this.closed.has(sid)) this.forget(sid);
-    } else if (left.length < this.queue.length / 2 || meta.acked > 1000) {
-      this.rewrite(sid);
+      if (this.closed.has(sid)) return this.forget(sid);
     }
+    const rewrite = left.length > 0 && (left.length < this.queue.length / 2 || meta.acked > 1000);
+    // What the log holds is decided when the write runs: an event appended since is never cut from it.
+    void this.disk.run(`settling ${this.eventsFile(sid)}`, async () => {
+      if (rewrite || this.queue.some((e) => e.session_id === sid)) return rewrite ? this.rewriteNow(sid) : this.writeMeta(sid);
+      await this.writeMeta(sid);
+      await fsp.writeFile(this.eventsFile(sid), "", { mode: 0o600 });
+    });
   }
 
   /** A closed session needs no more numbers once its events are acknowledged. */
@@ -231,9 +290,13 @@ export class Outbox {
    * repeat. What stays is the small meta file, a tombstone, removed after {@link TOMBSTONE_MS}.
    */
   private forget(sid: string): void {
-    fs.rmSync(this.eventsFile(sid), { force: true });
-    if (this.meta.has(sid)) this.writeMeta(sid);
     this.bytes.delete(sid);
     this.closed.delete(sid);
+    void this.disk.run(`forgetting ${this.eventsFile(sid)}`, async () => {
+      // A later event for the same session (appended since) keeps its log.
+      if (this.queue.some((e) => e.session_id === sid)) return this.writeMeta(sid);
+      await fsp.rm(this.eventsFile(sid), { force: true });
+      if (this.meta.has(sid)) await this.writeMeta(sid);
+    });
   }
 }

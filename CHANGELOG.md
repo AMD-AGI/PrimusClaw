@@ -108,6 +108,17 @@ record it.
   often. A deleted record is now an absent one. And a fleet count that is briefly unreadable is waited out
   (`SANDBOX_ADMISSION_STALE_WAIT_MS`, default one keepalive interval plus 15s) before a new sandbox is refused; a refusal after
   the wait, and a fleet genuinely at its ceiling, say in plain words what happened and that a retry later will work.
+- `claw-connector init` (`connector/`, next release) no longer merges the Claude Code session hooks into the user's Claude
+  `settings.json` without asking. At a terminal it asks first (`[y/N]`); with nobody to answer (a script, a pipe) it leaves the file
+  alone and prints `claw-connector hooks install`. `--hooks` adds them without asking, `--no-hooks` skips them.
+- The connector (`connector/`, next release) keeps its heartbeat through a stalled state directory (CephFS, NFS). Writes to
+  `connector.json`, `sessions.json`, `children.json`, the outbox, the audit trail, the adapter log and the disconnect record, the
+  pause-file check and the heartbeat's look at the Claude config directory no longer block the event loop: they run off it, one at
+  a time per file, and a write that must land is waited for a bounded time. An event is posted only once its line is written (a restart still never reuses a number), so while the
+  disk does not answer events wait and the machine stays online; the run is started with libuv's pool at 16 threads (in the
+  systemd unit, the launchd plist and the supervisor's spawn) so stuck calls cannot starve DNS. A test blocks connector.json's temporary file, the audit trail and the outbox log with FIFOs: heartbeats go on, and the
+  turn's events arrive once the disk answers. Against production Claw, a connector whose state files were blocked for 75 s stayed
+  online throughout; 0.1.4 under the same block went offline (`no_heartbeat`) and stayed stuck.
 - A user with no development environment session can connect from the assistant: `devenv_list` gives each agent on an online machine
   its own `attach_command` (`/agent attach MACHINE/AGENT`, which attaches its open session or starts one in its first folder), the
   attach button accepts it, and with no session anywhere and one such agent `attach_default` is that agent (`new_session: true`).
