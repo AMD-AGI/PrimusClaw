@@ -109,6 +109,15 @@ the API). The connector in this repository reports these keys, none of which nam
 A client should show `unattended` wherever it shows a session's mode, so nobody is surprised that nothing asks. The keys are
 absent from a connector that predates them: a client treats absent as unknown, not as "asks".
 
+**Health.** In connectors newer than 0.1.5 every agent's `capabilities` also carries `health`: `{checked_at, problems: [{code, severity, scope,
+detail, fix}]}`, what the connector's own checks (`claw-connector doctor`) found with the environment its agents get, re-checked
+every 15 minutes and when `doctor` signals the connector. `scope` is `agent` (about this agent) or `machine` (repeated in every agent of the
+connector; a client shows it once per machine). `severity` is `fail` (sessions will not work until it is fixed) or `warn`.
+`detail` and `fix` are English lines for a client that does not know the `code`; `fix` is a command or edit for the machine.
+The codes: `node_too_old`, `agent_cli_missing`, `agent_not_signed_in`, `root_missing`, `root_not_writable`, `proxy_mismatch`,
+`proxy_invalid`, `no_service`, `linger_off`, `keepalive_not_scheduled` (and from `doctor` alone: `claw_unreachable`, `claw_tls_untrusted`, `service_path_missing`, `config_invalid`, `not_signed_in`, `needs_login`). An empty `problems` means the checks passed; an absent
+`health` means unknown (an older connector, or the first check not done yet). `devenv_list` relays the problems to the assistant.
+
 ## Connector access tokens
 
 Beside a key or a session, the five connector-side routes (the table above)

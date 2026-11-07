@@ -164,8 +164,11 @@ describe("doctor: the adapter's modes against agents.toml, before any phone sess
 
   test("root with approval = never: ok, bypassPermissions offered", async () => {
     const t = setup("never");
-    assert.equal(await main(["doctor"], t.c), EXIT.ok, t.out.join("\n"));
+    await main(["doctor"], t.c);   // (exit 1 here: the machine checks find no sign-in; the adapter's verdict is the line, and ok in --json)
     assert.ok(t.out.some((l) => /^cc: ok \(modes: .*bypassPermissions/.test(l)), t.out.join("\n"));
+    const j = setup("never");
+    await main(["doctor", "--json"], j.c);
+    assert.equal(JSON.parse(j.out.join("\n")).ok, true);
   });
 
   test("a mismatch is a problem with the fix, exit 1, and --json says the same", async () => {

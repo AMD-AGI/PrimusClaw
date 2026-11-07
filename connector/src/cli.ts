@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { fileURLToPath } from "node:url";
 import { main } from "./commands.js";
 import { resolveDirs } from "./paths.js";
 import type { Connector } from "./connector.js";
@@ -22,6 +23,7 @@ const onSignal = () => {
 
 main(process.argv.slice(2), {
   dirs: resolveDirs(),
+  cli: fileURLToPath(import.meta.url),
   env: process.env,
   out: (l) => process.stdout.write(l + "\n"),
   err: (l) => process.stderr.write(l + "\n"),
@@ -30,5 +32,8 @@ main(process.argv.slice(2), {
   onConnector: (c) => {
     connector = c;
     for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(sig, onSignal);
+    // `claw-connector doctor` asks a running connector to check the machine again. SIGWINCH, whose default is to do nothing,
+    // so the same ask sent to an older connector that does not listen is harmless.
+    process.on("SIGWINCH", () => c.recheckHealth());
   },
 }).then((code) => process.exit(code), (e) => { process.stderr.write(`fatal: ${e instanceof Error ? e.stack : String(e)}\n`); process.exit(1); });

@@ -11,7 +11,7 @@ import { AdapterStore, adapterStore, adaptersDir, installAll, pinnedOf, useAdapt
 import { fileAudit } from "./audit.js";
 import { ChildRegistry, isAlive, processStart } from "./children.js";
 import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-client.js";
-import { ConfigError, PRESETS, SAMPLE_ACTIVE, SAMPLE_AGENTS, loadConfig, sampleApprovals, sampleConfig, type Approval, type ConnectorConfig } from "./config.js";
+import { ConfigError, PRESETS, SAMPLE_ACTIVE, SAMPLE_AGENTS, loadConfig, sampleApprovals, sampleConfig, type AgentConfig, type Approval, type ConnectorConfig } from "./config.js";
 import {
   CredentialsError, DEFAULT_CLIENT_ID, GrantRevokedError, loadCredentials, providerFor, saveCredentials, type Credentials,
 } from "./credentials.js";
@@ -20,12 +20,14 @@ import { applyRootSandbox, bypassUnavailableWarnings } from "./claude-mode.js";
 import { HooksError, hooksStatus, installHooks, settingsFile, uninstallHooks } from "./hooks.js";
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
+import { checkAll, defaultDeps, formatReport, runProbe, shq, writeReport, type DoctorDeps, type Problem, type Report } from "./doctor.js";
 import { cmdService, cmdSupervise, startAfterLogin, type ServiceDeps } from "./service.js";
 import {
-  auditFile, childrenFile, configFile, credentialsFile, identityFile, logDir, pauseFile, pidFile, stopRequestFile, type Dirs,
+  auditFile, childrenFile, configFile, credentialsFile, doctorFile, identityFile, logDir, pauseFile, pidFile, stopRequestFile, type Dirs,
 } from "./paths.js";
 import { UrlError, errMessage, isObject, secureUrl, sleep, stderrLogger } from "./util.js";
 import { VERSION } from "./version.js";
+import { redactDeep } from "./redact.js";
 import { probeAgents, probeLines, type ProbeFn } from "./probe.js";
 
 export interface Ctx {
@@ -36,6 +38,15 @@ export interface Ctx {
   fetch?: typeof fetch;
   hostname?: string;
   timing?: Partial<ConnectorTiming>;
+  /** What `doctor` and a running connector's health checks use to look at the machine (tests replace it, and then a
+   *  running connector checks in place instead of in a child process). */
+  doctor?: DoctorDeps;
+  /** This program's entry point (`cli.js`), which a running connector starts again for `health-check`. */
+  cli?: string;
+  /** What `health-check` reads its agents from (default: this process's stdin). */
+  stdin?: () => Promise<string>;
+  /** How `doctor` asks a running connector (its pid) to check again (default: SIGWINCH). */
+  askRecheck?: (pid: number) => void;
   /** Called with the connector once it exists, so a signal handler can stop it. */
   onConnector?: (c: Connector) => void;
   /** The file the terminal hooks run (default: `terminal-hook.js` next to this program) and the node that runs it. */
@@ -92,8 +103,12 @@ Usage: claw-connector <command> [options]
                            systemd) writes a keep-alive script for a startup hook and a 5-minute cron line
   status [--json]          what is running, signed in, paused, the last disconnect and why
   doctor [--agent ID] [--json]
-                           start each agent's adapter, open a session (no prompt) and check that it offers the
-                           modes agents.toml needs, so a phone session is not refused; init runs it too
+                           check this machine before a phone session fails on it, one fix per problem: Node, each
+                           agent's program on PATH (and on the installed service's PATH), Claude Code / Codex signed
+                           in, the roots writable, the proxy variables, Claw's certificate, the service and Claw
+                           itself; then start each agent's adapter, open a session (no prompt) and check that it
+                           offers the modes agents.toml needs. Exit 1 when something stops sessions. A running
+                           connector repeats the machine checks and shows them in the chat; init runs the adapter check
   pause                    stop every agent now and stay offline until "resume"
   resume                   undo "pause"
   stop                     stop the running connector and every agent it started
@@ -139,6 +154,7 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
       case "supervise": return await cmdSupervise(rest, ctx);
       case "status": return cmdStatus(rest, ctx);
       case "doctor": return await cmdDoctor(rest, ctx);
+      case "health-check": return await cmdHealthCheck(ctx, ctx.stdin ?? readStdin);
       case "pause": return await cmdPause(ctx);
       case "resume": return cmdResume(ctx);
       case "stop": return await cmdStop(ctx);
@@ -207,27 +223,6 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
     } catch (e) { ctx.out(`could not check the agents yet: ${errMessage(e)}; after editing agents.toml run: claw-connector doctor`); }
   }
   return EXIT.ok;
-}
-
-// --- doctor ----------------------------------------------------------------------------
-
-async function cmdDoctor(args: string[], ctx: Ctx): Promise<number> {
-  const { values } = parseArgs({ args, strict: true, options: { agent: { type: "string" }, json: { type: "boolean" } } });
-  const notes: string[] = [];
-  const cfg = loadCfg(ctx, notes);
-  const agents = values.agent ? cfg.agents.filter((a) => a.id === values.agent) : cfg.agents;
-  if (agents.length === 0) { ctx.err(values.agent ? `no agent ${JSON.stringify(values.agent)} in agents.toml` : "agents.toml defines no agents; add an [[agents]] table"); return EXIT.failure; }
-  const warnings = noAsk(ctx, { ...cfg, agents });
-  const results = await (ctx.probe ?? probeAgents)(agents, { logDir: logDir(ctx.dirs), version: VERSION });
-  const ok = results.every((r) => r.ok);
-  if (values.json) {
-    ctx.out(JSON.stringify({ version: VERSION, ok, notes, warnings, agents: results }, null, 2));
-  } else {
-    for (const n of notes) ctx.out(`note: ${n}`);
-    for (const w of warnings) ctx.out(`warning: ${w}`);
-    for (const l of probeLines(results)) ctx.out(l);
-  }
-  return ok ? EXIT.ok : EXIT.failure;
 }
 
 /**
@@ -401,7 +396,7 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   const client = new ClawClient({ server, tokens, fetch: ctx.fetch });
   const log = stderrLogger();
   const audit = fileAudit(auditFile(ctx.dirs));
-  const connector = new Connector({ config: cfg, dirs: ctx.dirs, client, server, audit, log, version: VERSION, timing: ctx.timing });
+  const connector = new Connector({ config: cfg, dirs: ctx.dirs, client, server, audit, log, version: VERSION, timing: ctx.timing, health: runHealth(ctx, cfg) });
   // In the background: the connection to Claw does not wait for a download; a session that needs one does.
   if (ctx.installAdapters) for (const { pkg, env } of pinnedOf(cfg.agents, ctx.env)) void adapterStore()?.install(pkg, env, (l) => ctx.out(`adapters: ${l}`));
   ctx.onConnector?.(connector);
@@ -435,6 +430,103 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
     if (e instanceof HttpError || e instanceof TransportError) { ctx.err(`error: ${e.message}`); return EXIT.failure; }
     throw e;
   }
+}
+
+// --- doctor -------------------------------------------------------------------------------
+
+async function cmdDoctor(args: string[], ctx: Ctx): Promise<number> {
+  const { values } = parseArgs({ args, strict: true, options: { agent: { type: "string" }, json: { type: "boolean" } } });
+  const before: Problem[] = [];
+  const notes: string[] = [];
+  let cfg: ConnectorConfig | null = null;
+  let creds: Credentials | null = null;
+  try { cfg = loadCfg(ctx, notes); } catch (e) {
+    const missing = !fs.existsSync(configFile(ctx.dirs));
+    // A root that is gone is the one problem of agents.toml whose fix is not an edit of it: say which folder to create.
+    const roots = e instanceof ConfigError ? e.problems.map((p) => /^agent (\S+): root (.+) does not exist$/.exec(p)) : [];
+    if (roots.length && roots.every((m) => m !== null)) {
+      for (const m of roots) before.push({ code: "root_missing", severity: "fail", agent: m![1], detail: `${m![2]} (a root of agent ${m![1]}) does not exist`, fix: `mkdir -p ${shq(m![2])}  (or change roots in ${configFile(ctx.dirs)})` });
+    } else before.push({ code: "config_invalid", severity: "fail", detail: errMessage(e), fix: missing ? "claw-connector init" : `edit ${configFile(ctx.dirs)}` });
+  }
+  const agents = cfg ? (values.agent ? cfg.agents.filter((a) => a.id === values.agent) : cfg.agents) : [];
+  if (cfg && agents.length === 0) {
+    if (values.agent) { ctx.err(`no agent ${JSON.stringify(values.agent)} in agents.toml`); return EXIT.failure; }
+    before.push({ code: "config_invalid", severity: "fail", detail: "agents.toml defines no agents", fix: `add an [[agents]] table to ${configFile(ctx.dirs)}  (claw-connector init writes a sample)` });
+  }
+  try { creds = loadCredentials(credentialsFile(ctx.dirs)); } catch (e) { before.push({ code: "not_signed_in", severity: "fail", detail: errMessage(e), fix: "claw-connector login" }); }
+  if (!creds && !before.some((p) => p.code === "not_signed_in")) before.push({ code: "not_signed_in", severity: "fail", detail: "this connector is not signed in to Claw", fix: "claw-connector login" });
+  const nl = needsLogin(ctx.dirs);
+  if (nl) before.push({ code: "needs_login", severity: "fail", detail: `needs a new sign-in: ${nl.reason}`, fix: "claw-connector login" });
+  let server: string | null = null;
+  try { server = serverUrl(ctx, undefined, cfg, creds); } catch { /* an invalid URL: the sign-in or config problem above says so */ }
+  // First the machine (quick), then each agent's adapter (starts it: slower).
+  const report = await checkAll({ dirs: ctx.dirs, agents, by: "doctor", server, before }, ctx.doctor ?? defaultDeps(ctx.env));
+  writeReport(ctx.dirs, report);
+  const warnings = cfg ? noAsk(ctx, { ...cfg, agents }) : [];
+  // (an adapter's own error text may carry a credential: masked before it is printed)
+  const results = agents.length ? redactDeep(await (ctx.probe ?? probeAgents)(agents, { logDir: logDir(ctx.dirs), version: VERSION })) : [];
+  const adaptersOk = results.every((r) => r.ok);
+  const machineOk = !report.problems.some((p) => p.severity === "fail");
+  if (values.json) {
+    // `ok`: every adapter opens a session in the mode agents.toml needs; `environment`: the machine checks (doctor.ts).
+    ctx.out(JSON.stringify({ version: VERSION, ok: adaptersOk, machine_ok: machineOk, notes, warnings, agents: results, environment: report }, null, 2));
+  } else {
+    ctx.out(`claw-connector ${VERSION} doctor${cfg ? ` (${cfg.name})` : ""}`);
+    for (const l of formatReport(report)) ctx.out(l);
+    if (results.length) {
+      ctx.out("");
+      ctx.out("each agent's adapter (a session opened without a prompt):");
+      for (const n of notes) ctx.out(`note: ${n}`);
+      for (const w of warnings) ctx.out(`warning: ${w}`);
+      for (const l of probeLines(results)) ctx.out(l);
+    }
+  }
+  const running = runningPid(ctx);
+  if (running !== null) {
+    // Ask the running connector to check again (SIGWINCH: an older connector that does not listen ignores it).
+    try { (ctx.askRecheck ?? ((pid: number) => process.kill(pid, "SIGWINCH")))(running); if (!values.json) ctx.out("The running connector checks the machine again now and shows the result in the chat."); } catch { /* gone meanwhile */ }
+  }
+  return adaptersOk && machineOk ? EXIT.ok : EXIT.failure;
+}
+
+/** How long the child that checks the machine for a running connector may take. */
+const HEALTH_CHILD_MS = 60_000;
+
+/**
+ * The checks a running connector repeats with its own environment (what its agents get), for the chat. They run in a child
+ * process (`health-check`) in a process group of its own, killed at HEALTH_CHILD_MS or at a stop: a check that hangs on a
+ * stalled disk hangs there, never in this process's event loop or thread pool. (A test passes `ctx.doctor` and checks in place.)
+ */
+function runHealth(ctx: Ctx, cfg: ConnectorConfig): (signal: AbortSignal) => Promise<Report> {
+  if (ctx.doctor) return () => checkAll({ dirs: ctx.dirs, agents: cfg.agents, by: "run" }, ctx.doctor!);
+  // The entry point this process runs (cli.ts sets it); in the bundle every module's import.meta.url is dist/cli.js too.
+  const cli = ctx.cli ?? ctx.service?.cli ?? fileURLToPath(import.meta.url);
+  const node = ctx.node ?? process.execPath;
+  return async (signal) => {
+    // The agents as this run loaded them (a root removed since is what the check is for: agents.toml read afresh would refuse it).
+    const r = await runProbe(node, [cli, "health-check"], ctx.env, signal, HEALTH_CHILD_MS, JSON.stringify({ agents: cfg.agents }));
+    const v: unknown = JSON.parse(r.out.slice(r.out.indexOf("{")));
+    if (!isObject(v) || typeof v.checked_at !== "string" || !Array.isArray(v.problems)) throw new Error(`health-check answered ${r.code === null ? "nothing in time" : `exit ${r.code}`}`);
+    return v as unknown as Report;
+  };
+}
+
+/**
+ * `health-check` (not for people: what `runHealth` starts): the running connector's checks of the agents it sends on stdin
+ * (`{agents}`, as that run loaded them), as JSON on stdout.
+ */
+async function cmdHealthCheck(ctx: Ctx, stdin: () => Promise<string>): Promise<number> {
+  const v: unknown = JSON.parse(await stdin());
+  const agents = isObject(v) && Array.isArray(v.agents) ? (v.agents as AgentConfig[]) : [];
+  // (its probes stay in this process's group, which the connector kills whole: see defaultDeps)
+  ctx.out(JSON.stringify(await checkAll({ dirs: ctx.dirs, agents, by: "run" }, defaultDeps(ctx.env, { ownGroup: false }))));
+  return EXIT.ok;
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const c of process.stdin) chunks.push(c as Buffer);
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 // --- status / pause / resume / stop / logout -------------------------------------------
@@ -473,6 +565,8 @@ function cmdStatus(args: string[], ctx: Ctx): number {
     /** Why the connection last went down, and whether only a new sign-in can bring it back. */
     last_disconnect: recentDisconnects(ctx.dirs, 1)[0] ?? null,
     needs_login: needsLogin(ctx.dirs),
+    /** The last `doctor` report's problems (null: doctor never ran). */
+    doctor: lastDoctor(ctx),
   };
   if (values.json) { ctx.out(JSON.stringify(status, null, 2)); return EXIT.ok; }
   ctx.out(`connector:  ${status.running ? `running (pid ${status.running})` : "not running"}${status.paused ? ", PAUSED" : ""}`);
@@ -483,7 +577,17 @@ function cmdStatus(args: string[], ctx: Ctx): number {
   if (status.needs_login) ctx.out(`problem:    needs a new sign-in: ${status.needs_login.reason}; run: claw-connector login`);
   for (const p of status.problems) ctx.out(`problem:    ${p}`);
   for (const w of status.warnings) ctx.out(`warning:    ${w}`);
+  if (status.doctor) ctx.out(`doctor:     ${status.doctor.problems.length ? `${status.doctor.problems.length} problem(s) at ${status.doctor.checked_at}; run: claw-connector doctor` : `no problems at ${status.doctor.checked_at}`}`);
+  else ctx.out("doctor:     never run; run: claw-connector doctor");
   return EXIT.ok;
+}
+
+function lastDoctor(ctx: Ctx): { checked_at: string; problems: Array<{ code: string; agent?: string; fix: string }> } | null {
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(doctorFile(ctx.dirs), "utf8"));
+    if (!isObject(raw) || typeof raw.checked_at !== "string" || !Array.isArray(raw.problems)) return null;
+    return { checked_at: raw.checked_at, problems: raw.problems.filter(isObject).map((p) => ({ code: String(p.code), ...(typeof p.agent === "string" ? { agent: p.agent } : {}), fix: String(p.fix) })) };
+  } catch { return null; }
 }
 
 async function cmdPause(ctx: Ctx): Promise<number> {

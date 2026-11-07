@@ -23,6 +23,8 @@
  *   D8  a user with no session connects through an agent: each agent on an online machine (not one that only takes over existing
  *       conversations, one that reports a folder, on a machine the channel can find by name) carries `/agent attach MACHINE/AGENT`,
  *       put to them as a button after the read; with no session anywhere and one such agent it is attach_default (new_session)
+ *   D9  what each machine's connector health checks found (`capabilities.health`) reaches the router as the machine's problems:
+ *       failures first, a machine-wide one once, each with its fix; a connector that reports no health has no problems field
  *   R1  readSession: the state, step, answer and question of a session from its events (pure)
  */
 import assert from "node:assert/strict";
@@ -83,14 +85,14 @@ describe("devenv_list", { skip }, () => {
     const client = await connect(claims, devenv);
     try { return (await client.listTools()).tools.map((t) => t.name); } finally { await client.close(); }
   }
-  type Agent = { id: string; kind: string; name: string; resumable?: Recorded[]; roots?: string[]; watch?: boolean };
+  type Agent = { id: string; kind: string; name: string; resumable?: Recorded[]; roots?: string[]; watch?: boolean; health?: Recorded };
   async function machine(owner: string, name: string, opts: { online?: boolean; agents?: Agent[] } = {}) {
     const row = await store.registerConnector(owner, name, "0.1.2", null, 10);
     assert.ok(row);
     await store.recordHeartbeat(row.connector_id, owner, {
       version: "0.1.3", cmdCursor: null,
       agents: (opts.agents ?? []).map((a) => ({ agent_id: a.id, kind: a.kind, name: a.name,
-        capabilities: { ...(a.resumable ? { resumable: a.resumable } : {}), ...(a.roots ? { roots: a.roots } : {}), ...(a.watch ? { watch_live: true } : {}) } })),
+        capabilities: { ...(a.resumable ? { resumable: a.resumable } : {}), ...(a.roots ? { roots: a.roots } : {}), ...(a.watch ? { watch_live: true } : {}), ...(a.health ? { health: a.health } : {}) } })),
     });
     if (opts.online) await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [row.connector_id]);
     else await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '1 hour' WHERE connector_id = $1", [row.connector_id]);
@@ -497,6 +499,31 @@ describe("devenv_list", { skip }, () => {
     for (const [n, a] of [["agent", `attach ${sid} x`], ["agents", `attach ${sid}`], ["agent", "detach"], ["brief", "off"], ["agent", "attach"]]) {
       assert.equal(tools.attachRefOf(n, a), null, `${n} ${a}`);
     }
+  });
+
+  test("D9 a machine's health problems reach the router with their fix, failures first, a machine-wide one once", async () => {
+    const alice = await w.user("alice");
+    const machineWide = { code: "no_service", severity: "warn", scope: "machine", detail: "not installed as a service", fix: "claw-connector service install" };
+    await machine("alice", "laptop", { online: true, agents: [
+      { id: "claude", kind: "claude", name: "Claude Code", health: { checked_at: "2026-11-07T08:00:00.000Z", problems: [machineWide] } },
+      { id: "codex", kind: "codex", name: "Codex", health: { checked_at: "2026-11-07T08:00:01.000Z", problems: [
+        { code: "agent_not_signed_in", severity: "fail", scope: "agent", detail: "Codex is not signed in on this machine", fix: "codex login" },
+        machineWide,
+        { code: "BAD CODE", severity: "fail", scope: "agent", detail: "x", fix: "y" },
+      ] } },
+    ] });
+    await machine("alice", "desktop", { online: true, agents: [{ id: "claude", kind: "claude", name: "Claude Code" }] });
+    const r = await call(await userTurn(alice, "我的开发机正常吗"));
+    assert.equal(r.isError, false, JSON.stringify(r.body));
+    const [laptop, desktop] = r.body.machines;
+    assert.deepEqual(laptop.problems, [
+      { agent: "codex", code: "agent_not_signed_in", severity: "fail", detail: "Codex is not signed in on this machine", fix: "codex login" },
+      { agent: null, code: "no_service", severity: "warn", detail: "not installed as a service", fix: "claw-connector service install" },
+    ]);
+    assert.equal(laptop.health_checked_at, "2026-11-07T08:00:01.000Z");
+    assert.equal("problems" in desktop, false, "no health reported: unknown, not \"no problems\"");
+    const prompts = await import("../src/assistant/prompts.js");
+    assert.match(prompts.renderRouterDevenvSection({ actions: true }), /A machine with problems[^\n]*Codex 未登录：在那台机器上运行 codex login/);
   });
 });
 
