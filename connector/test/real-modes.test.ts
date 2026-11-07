@@ -4,8 +4,10 @@
 /**
  * A phone session against the REAL claude-agent-acp adapter, through `run`, as whoever runs the test: CI runs this
  * file once as the runner's own user and once as root (tests.yml, "Connector real adapter"), so it covers
- * {root, non-root} x {approval = "never", approval = "ask"}. Opening a session needs no model and no credentials
- * (no prompt is sent), and also with the user's own Claude settings defaulting to bypassPermissions. Skipped unless CLAW_REAL_CLAUDE_ACP names the adapter's dist/index.js
+ * {root, non-root} x {approval = "never", approval = "ask"}. Opening a session needs no model (no prompt is sent), and
+ * also with the user's own Claude settings defaulting to bypassPermissions. It does need a sign-in the adapter can see:
+ * one it reports as none is refused before the session is announced (agent_auth_required), so the agent gets an API key
+ * variable that is never used, and one more test checks that refusal without it. Skipped unless CLAW_REAL_CLAUDE_ACP names the adapter's dist/index.js
  * (npm i @agentclientprotocol/claude-agent-acp@0.99.0).
  */
 import assert from "node:assert/strict";
@@ -22,16 +24,18 @@ const skip = ADAPTER ? false : "set CLAW_REAL_CLAUDE_ACP to run against the real
 const euid = process.geteuid?.() ?? null;
 const who = euid === 0 ? "root" : `uid ${euid}`;
 
-// What the connector itself inherits reaches the adapter: an IS_SANDBOX here would hide the root case.
-const saved = process.env.IS_SANDBOX;
-before(() => { delete process.env.IS_SANDBOX; });
-after(() => { if (saved !== undefined) process.env.IS_SANDBOX = saved; });
+// What the connector itself inherits reaches the adapter: an IS_SANDBOX here would hide the root case, and a sign-in of
+// the machine running the tests would hide the signed-out one.
+const INHERITED = ["IS_SANDBOX", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"];
+const saved = Object.fromEntries(INHERITED.map((k) => [k, process.env[k]]));
+before(() => { for (const k of INHERITED) delete process.env[k]; });
+after(() => { for (const [k, v] of Object.entries(saved)) if (v !== undefined) process.env[k] = v; });
 
 /**
  * `userBypass`: the user's own Claude settings default to bypassPermissions; `sandbox`: the connector itself runs with
  * IS_SANDBOX=1 (a container that sets it for everything), so root may use bypass too.
  */
-async function openSession(approval: "never" | "ask", o: { userBypass?: boolean; sandbox?: boolean } = {}) {
+async function openSession(approval: "never" | "ask", o: { userBypass?: boolean; sandbox?: boolean; signedOut?: boolean } = {}) {
   const base = tmpdir("rm-");
   const home = path.join(base, "home");
   const work = path.join(base, "work");
@@ -51,6 +55,7 @@ approval = "${approval}"
 [agents.env]
 CLAUDE_CONFIG_DIR = ${JSON.stringify(claude)}
 HOME = ${JSON.stringify(base)}
+${o.signedOut ? "" : `ANTHROPIC_API_KEY = "sk-ant-api03-unused-by-a-test-that-sends-no-prompt"`}
 `);
   const out: string[] = [];
   const c: Ctx = {
@@ -107,5 +112,12 @@ describe(`the real Claude adapter as ${who}`, { skip }, () => {
     const r = await openSession("never", { userBypass: true });
     assert.equal(r.ev.type, "session_started", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
     assert.equal(r.ev.data.currentMode, "bypassPermissions");
+  });
+
+  test("not signed in at all: refused before it is announced, agent_auth_required, with the Claude sign-in command", { timeout: 300_000 }, async () => {
+    const r = await openSession("ask", { signedOut: true });
+    assert.equal(r.ev.type, "session_closed", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
+    assert.equal(r.ev.data.reason, "agent_auth_required");
+    assert.match(r.ev.data.hint, /\/login/);
   });
 });

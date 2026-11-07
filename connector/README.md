@@ -139,7 +139,9 @@ id = "codex"
 preset = "codex"
 roots = ["~/work/repo-a", "~/work/repo-b"]
 [agents.env]                       # passed to the adapter; the model settings live here, never in Claw
-OPENAI_API_KEY = "..."             # or leave your own environment / CODEX_HOME to supply it
+OPENAI_API_KEY = "..."             # or leave your own environment / CODEX_HOME to supply it; with only a key, the
+                                   # connector signs Codex in with it (Codex keeps it in its auth.json, like
+                                   # "codex login --with-api-key")
 
 [[agents]]
 id = "mine"
@@ -172,7 +174,10 @@ connector's state directory, and the install is tried again in the background te
 `claude-attach` does not start new conversations: it takes over Claude Code conversations that already exist on this
 machine (see [Taking over an existing conversation](#taking-over-an-existing-conversation)).
 
-An agent with no `roots` is never offered. A configuration problem is reported at start-up, not skipped.
+An agent with no `roots` is never offered. A configuration problem is reported at start-up, not skipped. A root that does
+not exist, or whose disk does not answer (a network mount that is down or not mounted yet), is not a configuration problem:
+`run` warns about it and keeps going, and that root's sessions are refused (`cwd_not_found`, `root_unavailable`) until it is
+back. Reading `agents.toml` never touches a root.
 
 ## Running without per-step approval
 
@@ -239,7 +244,24 @@ All of these run on your machine and fail closed.
 
 - **Directories.** A session's working directory is resolved (symlinks included) and must be inside one of the agent's
   `roots`; otherwise no process is started and the session is closed with `cwd_outside_roots`. The agent runs in the
-  resolved path.
+  resolved path. A folder can be given the way people type it: `~` and `~/x` are the agent's home directory (its
+  `[agents.env]` `HOME`, else the connector's), and a relative name (`repo`, `repo/sub`) is looked up under each root and
+  taken when exactly one has it (`cwd_ambiguous` when several do); a root's own last segment names that root. A relative
+  name never climbs out (`..`). Every look at the disk on the way to opening a session is asynchronous with a 10-second
+  limit, so a root on a stalled network mount refuses its own sessions (`root_unavailable`), never those under a healthy
+  root, and never freezes the connector or its heartbeat. A restored session whose root does not answer is kept: its
+  commands are rejected `root_unavailable` until it does, and `close` still closes it.
+- **Signed in before ready.** A new session of an agent that reports its sign-in (Claude Code does) and reports none is
+  refused at once with `agent_auth_required`, instead of opening and failing at its first message; a session that
+  already exists is kept and its prompts say why. A prompt refused for the same reason later
+  (an expired login) ends its turn with `error: "agent_auth_required"` and the fix, and the next prompt starts the agent
+  afresh, so a sign-in done on the machine meanwhile is picked up. An adapter that needs a sign-in and offers an
+  `api-key` method (Codex) is told to `authenticate` with it when its environment has `OPENAI_API_KEY` or `CODEX_API_KEY`;
+  the key itself is never sent, the adapter reads its own environment.
+- **Why, in one sentence.** Every refusal (`session_closed`, `command_rejected`, and a `turn_end` that failed for a known
+  reason) carries its stable `reason` code and a `hint`: one English sentence of what to do about it (sign in with which
+  command, which folder to pick, `claw-connector doctor`), with no path and nothing secret, for a client to show beside
+  its own translation of the code.
 - **Ask mode, read back.** After the adapter creates a session, the connector sets the agent's ask mode and reads the
   mode back from the adapter. Your own agent settings may start an adapter in a mode that never asks (bypass, full
   access); an adapter that does not confirm the ask mode, or that warns it will not invoke its permission callback, is
@@ -259,6 +281,9 @@ All of these run on your machine and fail closed.
   which cannot write. `approval = "never"` selects `agent` and starts `agent --force acp` (`--force` is a root flag of the
   Cursor CLI, "force allow commands unless explicitly denied"; it is accepted before or after `acp`). Cursor
   has no `session/resume`; the connector uses `session/load` and marks the replayed history `replay: true`.
+  A Cursor agent that asks therefore answers and plans but changes no file: its capabilities say `edits: false` with an
+  `edits_hint`, `read_only_modes` lists `ask` and `plan` (each such mode in `session_started` carries `read_only: true`),
+  `run` prints a note, and the sample `agents.toml` says so above the Cursor block.
 - **Permissions.** Each permission request becomes a card with the options **the adapter offered**, passed through with
   their own ids and kinds (`allow_once`, `allow_always`, `reject_once`). An answer must be one of those ids; any other is refused
   and the request stays open. An unanswered request is answered `cancelled` after 10 minutes, and a cancel,

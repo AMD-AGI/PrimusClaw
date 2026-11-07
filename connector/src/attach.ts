@@ -32,7 +32,7 @@ import type { AgentConfig } from "./config.js";
 import { hooksStatus } from "./hooks.js";
 import { REMOTE_AGENT_LIMITS } from "./protocol.js";
 import { redactText } from "./redact.js";
-import { checkCwd } from "./roots.js";
+import { checkCwd, resolveCwd } from "./roots.js";
 import { SESSION_ID_RE, localPidDomain, readTerminals } from "./terminals.js";
 import { errMessage, isObject, type Logger } from "./util.js";
 
@@ -188,12 +188,21 @@ export class AttachSupport {
     return this.refreshing;
   }
 
+  /** Where the listing adapter starts: the first root that is there now (a root may be missing), else the home directory. */
+  private async listingDir(): Promise<string> {
+    for (const r of this.agent.roots) {
+      const v = await resolveCwd(r, [r], { home: os.homedir(), timeoutMs: 5_000 });
+      if (v.ok) return v.real;
+    }
+    return os.homedir();
+  }
+
   private async doRefresh(): Promise<void> {
     let adapter: AdapterProcess | null = null;
     this.noteHooks();
     try {
       adapter = await AdapterProcess.start({
-        cfg: this.agent, registry: this.d.registry, sessionId: `list-${this.agent.id}`, cwd: this.agent.roots[0] ?? os.homedir(),
+        cfg: this.agent, registry: this.d.registry, sessionId: `list-${this.agent.id}`, cwd: await this.listingDir(),
         hooks: NO_HOOKS, logFile: path.join(this.d.logDir, `adapter-${this.agent.id}.log`), version: this.d.version, initTimeoutMs: 30_000,
       });
       const caps = adapter.caps.sessionCapabilities as Record<string, unknown> | undefined;
@@ -204,7 +213,9 @@ export class AttachSupport {
         const res = await adapter.request("session/list", cursor ? { cursor } : {}, 30_000);
         for (const s of Array.isArray(res.sessions) ? res.sessions : []) {
           if (!isObject(s) || typeof s.sessionId !== "string" || !SESSION_REF_RE.test(s.sessionId) || typeof s.cwd !== "string") continue;
-          const where = checkCwd(s.cwd, this.agent.roots);
+          // Absolute paths only (a listed session's own directory), looked at without blocking: a stalled mount skips it.
+          if (!path.isAbsolute(s.cwd)) continue;
+          const where = await resolveCwd(s.cwd, this.agent.roots, { home: os.homedir(), timeoutMs: 5_000 });
           if (!where.ok) continue;
           const at = typeof s.updatedAt === "string" ? Date.parse(s.updatedAt) : NaN;
           found.set(s.sessionId.toLowerCase(), {

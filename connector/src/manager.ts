@@ -5,7 +5,9 @@
 import type { AgentConfig } from "./config.js";
 import { SESSION_REF_RE } from "./attach.js";
 import { Session, type SessionEnv } from "./session.js";
-import { checkCwd } from "./roots.js";
+import os from "node:os";
+import { withHint } from "./hints.js";
+import { resolveCwd } from "./roots.js";
 import { REMOTE_COMMAND_TYPES, isRemoteCommandType } from "./protocol.js";
 import { sha256, errMessage } from "./util.js";
 
@@ -42,6 +44,17 @@ export class SessionManager {
 
   private agent(id: unknown): AgentConfig | undefined {
     return typeof id === "string" ? this.env.config.agents.find((a) => a.id === id) : undefined;
+  }
+
+  /** The folder a phone asked for, as this agent would see it: `~` is the home its adapter runs with. */
+  private where(cwd: unknown, agent: AgentConfig) {
+    return resolveCwd(typeof cwd === "string" ? cwd : "", agent.roots, { home: agent.env.HOME?.trim() || os.homedir(), timeoutMs: this.env.timing.rootCheckMs });
+  }
+
+  /** A session refused before it had a process: audited, and closed with its reason and what to do about it. */
+  private refuseNew(sid: string, reason: string, agent: AgentConfig | null, extra: Record<string, unknown> = {}): void {
+    this.env.audit.record("session_refused", { session_id: sid, ...(agent ? { agent_id: agent.id } : {}), reason, ...extra });
+    this.env.emit(sid, "session_closed", withHint({ reason }, agent));
   }
 
   /**
@@ -86,8 +99,22 @@ export class SessionManager {
       return false;
     }
     const s = await this.lookup(sid);
-    if (!s) {
-      this.env.emit(sid, "session_closed", { reason: "unknown_session" });
+    if (s === null) {
+      this.env.emit(sid, "session_closed", { reason: "unknown_session", hint: "the session has already ended on that machine: start a new one" });
+      return false;
+    }
+    if (!(s instanceof Session)) {
+      // Closing needs no disk: the record is closed and the phone told, whatever the folder's state.
+      if (type === "close") {
+        this.env.store.patch(sid, { status: "closed" });
+        this.env.audit.record("session_closed", { session_id: sid, reason: "closed" });
+        this.env.emit(sid, "session_closed", { reason: "closed" });
+        return false;
+      }
+      // Its folder's disk does not answer now: this command is refused, the session stays for when it does.
+      const seq = cmdSeqOf(cmd);
+      this.env.audit.record("command_rejected", { type, cmd_id: cmdId, reason: s.unavailable });
+      this.env.emit(sid, "command_rejected", withHint({ type, cmd_id: cmdId, reason: s.unavailable, ...(seq !== null ? { cmd_seq: seq } : {}) }, s.agent));
       return false;
     }
     switch (type) {
@@ -123,32 +150,17 @@ export class SessionManager {
     // brought back read-only: it must not become a takeover because the terminal has closed in the meantime.
     if (this.env.store.get(sid)?.read_only) { await this.lookup(sid); return; }
     const agent = this.agent(cmd.agent_id);
-    if (!agent) {
-      this.env.audit.record("session_refused", { session_id: sid, reason: "unknown_agent", agent_id: String(cmd.agent_id).slice(0, 64) });
-      this.env.emit(sid, "session_closed", { reason: "unknown_agent" });
-      return;
-    }
+    if (!agent) return this.refuseNew(sid, "unknown_agent", null, { agent_id: String(cmd.agent_id).slice(0, 64) });
     const ref = cmd.resume_ref;
     if (agent.attach) return this.attachNew(cmd, agent);
-    if (ref !== undefined && ref !== null) {
-      // Starting a new session would answer a request to continue an old one with a different conversation.
-      this.env.audit.record("session_refused", { session_id: sid, agent_id: agent.id, reason: "resume_not_supported" });
-      this.env.emit(sid, "session_closed", { reason: "resume_not_supported" });
-      return;
-    }
-    const verdict = checkCwd(typeof cmd.cwd === "string" ? cmd.cwd : "", agent.roots);
-    if (!verdict.ok) {
-      // The directory is outside everything this agent may touch: no process is started.
-      this.env.audit.record("session_refused", { session_id: sid, agent_id: agent.id, reason: verdict.reason, cwd: String(cmd.cwd).slice(0, 300) });
-      this.env.emit(sid, "session_closed", { reason: verdict.reason });
-      return;
-    }
+    // Starting a new session would answer a request to continue an old one with a different conversation.
+    if (ref !== undefined && ref !== null) return this.refuseNew(sid, "resume_not_supported", agent);
+    const verdict = await this.where(cmd.cwd, agent);
+    // The directory is outside everything this agent may touch (or cannot be read now): no process is started.
+    if (!verdict.ok) return this.refuseNew(sid, verdict.reason, agent, { cwd: String(cmd.cwd).slice(0, 300) });
+    if (this.sessions.has(sid)) return; // the same command, delivered again while the folder was being looked at
     const active = [...this.sessions.values()].filter((s) => !s.closed).length;
-    if (active >= MAX_ACTIVE_SESSIONS) {
-      this.env.audit.record("session_refused", { session_id: sid, agent_id: agent.id, reason: "too_many_sessions" });
-      this.env.emit(sid, "session_closed", { reason: "too_many_sessions" });
-      return;
-    }
+    if (active >= MAX_ACTIVE_SESSIONS) return this.refuseNew(sid, "too_many_sessions", agent);
     const s = new Session(sid, agent, verdict.real, this.env);
     this.sessions.set(sid, s);
     await s.create(typeof cmd.mode === "string" ? cmd.mode : null);
@@ -161,10 +173,7 @@ export class SessionManager {
    */
   private async attachNew(cmd: Command, agent: AgentConfig): Promise<void> {
     const sid = cmd.session_id;
-    const refuse = (reason: string, extra: Record<string, unknown> = {}) => {
-      this.env.audit.record("session_refused", { session_id: sid, agent_id: agent.id, reason, ...extra });
-      this.env.emit(sid, "session_closed", { reason });
-    };
+    const refuse = (reason: string, extra: Record<string, unknown> = {}) => this.refuseNew(sid, reason, agent, extra);
     const ref = typeof cmd.resume_ref === "string" ? cmd.resume_ref : "";
     if (!ref) return refuse("resume_ref_required");
     if (!SESSION_REF_RE.test(ref)) return refuse("invalid_resume_ref");
@@ -182,7 +191,7 @@ export class SessionManager {
     try {
       const found = await support.resolve(want);
       if (!found.ok) return refuse(found.reason);
-      const asked = checkCwd(typeof cmd.cwd === "string" ? cmd.cwd : "", agent.roots);
+      const asked = await this.where(cmd.cwd, agent);
       if (!asked.ok) return refuse(asked.reason, { cwd: String(cmd.cwd).slice(0, 300) });
       if (asked.real !== found.item.cwd) return refuse("cwd_mismatch", { cwd: String(cmd.cwd).slice(0, 300) });
       // Registered before anything is awaited, so from here the session itself is the claim.
@@ -203,21 +212,27 @@ export class SessionManager {
     return out;
   }
 
-  /** A session this process knows, or one it made earlier (before a restart) and can bring back. */
-  private async lookup(sid: string): Promise<Session | null> {
+  /**
+   * A session this process knows, or one it made earlier (before a restart) and can bring back; `unavailable` when its
+   * folder's disk does not answer now (the session is kept for later).
+   */
+  private async lookup(sid: string): Promise<Session | null | { unavailable: string; agent: AgentConfig }> {
     const have = this.sessions.get(sid);
     if (have) return have;
     const rec = this.env.store.get(sid);
     if (!rec || rec.status !== "active") return null;
     const agent = this.agent(rec.agent_id);
     // The policy is read again: a directory that left the whitelist since stays out.
-    const verdict = agent ? checkCwd(rec.cwd, agent.roots) : null;
+    const verdict = agent ? await this.where(rec.cwd, agent) : null;
     if (!agent || !verdict?.ok) {
+      // A root that does not answer now may answer later: the session stays, this command is refused.
+      if (agent && verdict && !verdict.ok && verdict.reason === "root_unavailable") return { unavailable: verdict.reason, agent };
       this.env.store.patch(sid, { status: "closed" });
-      this.env.audit.record("session_refused", { session_id: sid, reason: agent ? "cwd_outside_roots" : "unknown_agent" });
-      this.env.emit(sid, "session_closed", { reason: agent ? "cwd_outside_roots" : "unknown_agent" });
+      this.refuseNew(sid, agent ? (verdict && !verdict.ok ? verdict.reason : "cwd_outside_roots") : "unknown_agent", agent ?? null);
       return null;
     }
+    const raced = this.sessions.get(sid);
+    if (raced) return raced;
     const s = new Session(sid, agent, verdict.real, this.env, rec.acp_session_id, rec.mode);
     this.sessions.set(sid, s);
     // It stays read-only: a prompt to it after a restart is refused as before, never a takeover by surprise.

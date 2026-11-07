@@ -25,6 +25,7 @@ import { AdapterProcess, type AcpParams, type AdapterHooks } from "./adapter.js"
 import type { ChildRegistry } from "./children.js";
 import type { AgentConfig, ConnectorConfig } from "./config.js";
 import { claudeSessionMeta } from "./claude-mode.js";
+import { hintFor, withHint } from "./hints.js";
 import {
   PermissionBook, boundedInput, matchAutoAllow, normalizeOptions, type OfferedOption,
 } from "./permissions.js";
@@ -47,10 +48,15 @@ export interface SessionTiming {
   spectateMs: number;
   /** ... and looks this often whether the terminal still has it open; once it has not, the read-only session ends. */
   spectateCheckMs: number;
+  /** One look at a session's folder or root may take this long before it is `root_unavailable` (a stalled network mount). */
+  rootCheckMs: number;
+  /** How long a new session waits for an adapter that reports its sign-in to say which one it is. */
+  authWaitMs: number;
 }
 
 export const DEFAULT_SESSION_TIMING: SessionTiming = {
   idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000, spectateMs: 1_000, spectateCheckMs: 5_000,
+  rootCheckMs: 10_000, authWaitMs: 3_000,
 };
 
 /**
@@ -186,7 +192,7 @@ export class Session {
   }
 
   private shownModes(): Array<ModeInfo & { unattended: boolean }> {
-    return this.modes.filter((m) => this.modeAllowed(m.id)).map((m) => ({ ...m, unattended: !this.agent.askingModes.includes(m.id) }));
+    return this.modes.filter((m) => this.modeAllowed(m.id)).map((m) => ({ ...m, unattended: !this.agent.askingModes.includes(m.id), ...(this.agent.readOnlyModes.includes(m.id) ? { read_only: true } : {}) }));
   }
 
   // --- starting ----------------------------------------------------------------
@@ -401,19 +407,20 @@ export class Session {
     this.modeSeen = [];
     try {
       if (how === "new") {
-        const res = await adapter.request("session/new", { cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) });
+        const res = await this.signedIn(adapter, () => adapter.request("session/new", { cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }));
         if (typeof res.sessionId !== "string") throw new SessionRefusal("adapter_protocol", "session/new returned no session id");
         this.acpId = res.sessionId;
         this.absorb(res);
+        await this.refuseSignedOut(adapter);
       } else {
         if (!this.acpId) throw new SessionRefusal("adapter_cannot_resume", "no adapter session to resume");
         const caps = adapter.caps.sessionCapabilities as AcpParams | undefined;
         if (caps?.resume) {
           // `resume` does not replay the history, and the adapter's own settings apply again: the mode is re-locked below.
-          this.absorb(await adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }));
+          this.absorb(await this.signedIn(adapter, () => adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) })));
         } else if (adapter.caps.loadSession) {
           this.replaying = true;
-          try { this.absorb(await adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) })); } finally { this.replaying = false; }
+          try { this.absorb(await this.signedIn(adapter, () => adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }))); } finally { this.replaying = false; }
         } else {
           throw new SessionRefusal("adapter_cannot_resume", "the adapter can neither resume nor load a session");
         }
@@ -424,6 +431,44 @@ export class Session {
       await this.dropAdapter();
       throw e instanceof SessionRefusal ? e : mapAdapterError(e);
     }
+  }
+
+  /**
+   * `open` (a `session/new`), signing the adapter in first when it needs that and can do it by itself: an adapter that
+   * answers "Authentication required" and offers an `api-key` method, while its environment holds a key it reads
+   * (codex-acp: OPENAI_API_KEY or CODEX_API_KEY), is told to `authenticate` with it and asked once more. Without this a
+   * Codex agent set up with only an API key never opened a session. The key itself is never sent: the adapter reads
+   * its own environment. (codex-acp then keeps the key in its auth.json, as `codex login --with-api-key` does.)
+   */
+  private async signedIn(adapter: AdapterProcess, open: () => Promise<AcpParams>): Promise<AcpParams> {
+    try {
+      return await open();
+    } catch (e) {
+      const method = adapter.apiKeyMethod();
+      if (mapAdapterError(e).reason !== "agent_auth_required" || !method || !this.hasApiKey()) throw e;
+      this.audit("agent_authenticate", { method });
+      try { await adapter.request("authenticate", { methodId: method }); } catch (ae) {
+        throw new SessionRefusal("agent_auth_required", `authenticate ${method} failed: ${errMessage(ae)}`);
+      }
+      return await open();
+    }
+  }
+
+  /** Whether the adapter's environment (the connector's, with the agent's `[agents.env]` over it) holds an OpenAI/Codex key. */
+  private hasApiKey(): boolean {
+    const env = { ...process.env, ...this.agent.env };
+    return ["CODEX_API_KEY", "OPENAI_API_KEY"].some((k) => typeof env[k] === "string" && env[k]!.trim() !== "");
+  }
+
+  /**
+   * An adapter that reports its sign-in (claude-agent-acp) and says there is none: the session would open, say it is
+   * ready and fail at its first message with "Authentication required". A new session is refused now instead, with the
+   * fix. A session that already exists (resumed after an idle recycle or a restart) is not: its prompts say why and it
+   * stays, so it carries on once someone signs in on the machine.
+   */
+  private async refuseSignedOut(adapter: AdapterProcess): Promise<void> {
+    const st = await adapter.waitAuthStatus(this.env.timing.authWaitMs);
+    if (st?.kind === "none") throw new SessionRefusal("agent_auth_required", `the agent reports that it is not signed in${st.label ? ` (${st.label})` : ""}`);
   }
 
   /** Take the modes and the mode config option out of a `session/new|resume|load` answer. */
@@ -759,8 +804,12 @@ export class Session {
       await this.ensureAdapter();
     } catch (e) {
       started();
-      this.emit("turn_end", { stopReason: "error", error: e instanceof SessionRefusal ? e.reason : "adapter_unavailable", cmd_id: cmdId, cmd_seq: cmdSeq });
+      const reason = e instanceof SessionRefusal ? e.reason : "adapter_unavailable";
+      const hint = hintFor(reason, this.agent);
+      this.emit("turn_end", { stopReason: "error", error: reason, ...(hint ? { hint } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });
       this.env.store.endTurn(this.id);
+      // Not signed in (yet): the session stays, and the next message tries again once someone has signed in there.
+      if (reason === "agent_auth_required") return;
       return this.refuse(e);
     }
     const a = this.adapter!;
@@ -779,7 +828,15 @@ export class Session {
       this.endTurn({ stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });
     } catch (e) {
       if (!this.stopping) this.audit("turn_failed", { error: errMessage(e) });
-      this.endTurn({ stopReason: "error", error: errMessage(e).slice(0, 300), cmd_id: cmdId, cmd_seq: cmdSeq });
+      const r = mapAdapterError(e);
+      if (r.reason === "agent_auth_required") {
+        // Signed out since the session opened (an expired login): say so with the fix, and start the agent afresh for
+        // the next message, so a sign-in done on the machine meanwhile is picked up.
+        this.endTurn({ stopReason: "error", error: r.reason, message: errMessage(e).slice(0, 300), hint: hintFor(r.reason, this.agent), cmd_id: cmdId, cmd_seq: cmdSeq });
+        if (this.adapter === a) await this.dropAdapter();
+      } else {
+        this.endTurn({ stopReason: "error", error: errMessage(e).slice(0, 300), cmd_id: cmdId, cmd_seq: cmdSeq });
+      }
     } finally {
       // At once, before the look at who holds the conversation open: the test below it for a terminal that writes
       // next is the size, and it must start from the turn's end, not from a moment later.
@@ -863,6 +920,8 @@ export class Session {
       if (this.adapter && !this.adapter.exited) await this.enforceMode(this.targetMode);
       else await this.launch("resume");
     } catch (e) {
+      // Not signed in (yet): the resume is refused with the fix and the session stays, as for a prompt.
+      if (e instanceof SessionRefusal && e.reason === "agent_auth_required") return this.rejectCommand("resume", cmdId, e.reason);
       return this.refuse(e);
     }
     this.audit("session_resumed", { mode: this.currentMode, unattended: this.unattended });
@@ -916,7 +975,7 @@ export class Session {
     await this.dropAdapter();
     this.env.store.patch(this.id, { status: "closed" });
     this.audit("session_closed", { reason });
-    this.emit("session_closed", { reason });
+    this.emit("session_closed", withHint({ reason }, this.agent));
   }
 
   /** A session that cannot be opened (or kept safe) is closed with the reason, never left half-open. */
@@ -930,7 +989,7 @@ export class Session {
   /** A command refused; a prompt's refusal names it by `cmd_seq` too, as its turn_end would. */
   rejectCommand(type: string, cmdId: string | null, reason: string, cmdSeq: number | null = null): void {
     this.audit("command_rejected", { type, cmd_id: cmdId, reason });
-    this.emit("command_rejected", { type, cmd_id: cmdId, reason, ...(cmdSeq !== null ? { cmd_seq: cmdSeq } : {}) });
+    this.emit("command_rejected", withHint({ type, cmd_id: cmdId, reason, ...(cmdSeq !== null ? { cmd_seq: cmdSeq } : {}) }, this.agent));
   }
 }
 

@@ -112,14 +112,27 @@ describe("working directory whitelist", () => {
     assert.equal(h.claw.eventsOf(sid, "session_closed")[0]!.data.reason, "cwd_outside_roots");
     assert.deepEqual(h.adapterLog(), []);
   });
-  test("an unknown agent and a relative path are refused", async () => {
+  test("an unknown agent and a relative path that is in no root are refused, each with what to do", async () => {
     const h = await make();
     await h.online();
     const a = h.claw.newSession("nope", h.work);
     const b = h.claw.newSession("fake", "relative/dir");
     await h.claw.until("both refused", () => h.claw.eventsOf(a, "session_closed").length && h.claw.eventsOf(b, "session_closed").length);
     assert.equal(h.claw.eventsOf(a)[0]!.data.reason, "unknown_agent");
-    assert.equal(h.claw.eventsOf(b)[0]!.data.reason, "cwd_not_absolute");
+    assert.match(h.claw.eventsOf(a)[0]!.data.hint, /no longer offers this agent/);
+    assert.equal(h.claw.eventsOf(b)[0]!.data.reason, "cwd_not_found");
+    assert.match(h.claw.eventsOf(b)[0]!.data.hint, /does not exist on that machine/);
+  });
+
+  test("a folder named the way people type it (its name, ~/...) opens in that folder", async () => {
+    const h = await make();
+    await h.online();
+    fs.mkdirSync(path.join(h.work, "my-repo"));
+    const sid = h.claw.newSession("fake", "my-repo");
+    await h.claw.until("started", () => h.claw.eventsOf(sid, "session_started")[0] ?? h.claw.eventsOf(sid, "session_closed")[0]);
+    const st = h.claw.eventsOf(sid, "session_started")[0];
+    assert.ok(st, JSON.stringify(h.claw.eventsOf(sid)));
+    assert.equal(st.data.cwd, fs.realpathSync(path.join(h.work, "my-repo")));
   });
 });
 
@@ -1174,4 +1187,119 @@ test("a fake server shared by two connectors on separate homes keeps their state
   const a = await make({ claw });
   await a.online();
   assert.ok(a.dirs.state !== tmpdir());
+});
+
+describe("a first session that would fail at its first message", () => {
+  const answer = (h: Harness, sid: string) => h.claw.until("an answer", () => h.claw.eventsOf(sid, "session_started")[0] ?? h.claw.eventsOf(sid, "session_closed")[0]);
+
+  test("an agent that reports it is not signed in is refused at once, agent_auth_required, with the sign-in command", async () => {
+    const h = await make({ env: { FAKE_AUTH_STATUS: "none" } });
+    await h.online();
+    const sid = h.claw.newSession("fake", h.work);
+    const got = await answer(h, sid);
+    assert.equal(got.type, "session_closed", "never announced as ready");
+    assert.equal(got.data.reason, "agent_auth_required");
+    assert.match(got.data.hint, /not signed in on that machine/);
+    assert.ok(!h.claw.eventsOf(sid, "session_started").length);
+  });
+
+  test("one that reports a sign-in opens as before; one that reports nothing opens after a short wait", async () => {
+    const h = await make({ env: { FAKE_AUTH_STATUS: "api_key" } });
+    await h.online();
+    assert.equal((await answer(h, h.claw.newSession("fake", h.work))).type, "session_started");
+    const quiet = await make({ env: { FAKE_AUTH_STATUS: "api_key", FAKE_AUTH_STATUS_DELAY_MS: "60000" }, timing: { authWaitMs: 200 } });
+    await quiet.online();
+    assert.equal((await answer(quiet, quiet.claw.newSession("fake", quiet.work))).type, "session_started");
+  });
+
+  test("an API-key-only Codex-like agent is signed in with authenticate(api-key) and opens; without a key it says how to sign in", async () => {
+    const h = await make({ env: { FAKE_API_KEY_AUTH: "1", OPENAI_API_KEY: "sk-test-only" } });
+    await h.online();
+    const sid = h.claw.newSession("fake", h.work);
+    assert.equal((await answer(h, sid)).type, "session_started", JSON.stringify(h.claw.eventsOf(sid)));
+    const methods = h.adapterLog().map((l) => l.method).filter(Boolean);
+    assert.deepEqual(methods.slice(0, 4), ["initialize", "session/new", "authenticate", "session/new"]);
+    assert.doesNotMatch(JSON.stringify(h.adapterLog()), /sk-test-only/, "the key is never sent; the adapter reads its own environment");
+    const none = await make({ env: { FAKE_API_KEY_AUTH: "1", OPENAI_API_KEY: "", CODEX_API_KEY: "" } });
+    await none.online();
+    const s2 = none.claw.newSession("fake", none.work);
+    const got = await answer(none, s2);
+    assert.equal(got.data.reason, "agent_auth_required");
+    assert.ok(!none.adapterLog().some((l) => l.method === "authenticate"), "no key: nothing to authenticate with");
+  });
+
+  test("a sign-in that lapses after the session opened: the turn ends agent_auth_required with the fix, and the session stays", async () => {
+    const h = await make({ env: { FAKE_PROMPT_AUTH: "1" } });
+    const sid = await h.newSession();
+    h.prompt(sid, "hello");
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.stopReason, "error");
+    assert.equal(end.data.error, "agent_auth_required");
+    assert.match(end.data.hint, /not signed in/);
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0);
+  });
+
+  test("signed out after the session opened: every message says why and the session stays, also once the adapter is started again", async () => {
+    const status = path.join(tmpdir("auth-"), "status");
+    fs.writeFileSync(status, "api_key");
+    const h = await make({ env: { FAKE_AUTH_STATUS: "file", FAKE_AUTH_STATUS_FILE: status, FAKE_PROMPT_AUTH: "1" } });
+    const sid = await h.newSession();
+    fs.writeFileSync(status, "none");
+    for (let n = 1; n <= 3; n++) {
+      h.prompt(sid, `hello ${n}`);
+      const end = await h.turnEnd(sid, n);
+      assert.equal(end.data.error, "agent_auth_required", JSON.stringify(end.data));
+    }
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0, "kept: it works again once someone signs in there");
+    // A "resume" from the phone brings it back too: only a new session is refused for a missing sign-in.
+    h.claw.issue("resume", sid, {});
+    await h.claw.until("resumed", () => h.claw.eventsOf(sid, "session_resumed")[0] ?? h.claw.eventsOf(sid, "session_closed")[0]);
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0, JSON.stringify(h.claw.eventsOf(sid).slice(-3)));
+    // After a restart the restored session is resumed, not refused, too.
+    await h.stop();
+    h.connect();
+    h.start();
+    h.prompt(sid, "after restart");
+    assert.equal((await h.turnEnd(sid, 4)).data.error, "agent_auth_required");
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0);
+  });
+
+  test("an adapter whose resume needs a sign-in it no longer has: the message says why and the session stays", async () => {
+    const h = await make({ env: { FAKE_RESUME_AUTH: "1" } });
+    const sid = await h.newSession();
+    await h.stop();
+    h.connect();
+    h.start();
+    h.prompt(sid, "after restart");
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.error, "agent_auth_required", JSON.stringify(end.data));
+    assert.match(end.data.hint, /not signed in/);
+    // A "resume" from the phone is refused the same way, with the fix, and the session stays.
+    h.claw.issue("resume", sid, {});
+    const rej = await h.claw.until("resume refused", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.type === "resume") ?? h.claw.eventsOf(sid, "session_closed")[0]);
+    assert.equal(rej.type, "command_rejected", JSON.stringify(rej.data));
+    assert.equal(rej.data.reason, "agent_auth_required");
+    assert.match(rej.data.hint, /not signed in/);
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0);
+  });
+
+  test("a refused command carries a hint too", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    h.claw.issue("set_mode", sid, { mode_id: "bypassPermissions" });
+    const rej = await h.claw.until("rejected", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.equal(rej.data.reason, "mode_not_allowed");
+    assert.match(rej.data.hint, /approval = "never"/);
+  });
+});
+
+describe("read-only agents", () => {
+  test("an agent whose sessions start in a mode that changes no file says so in its capabilities and modes", async () => {
+    const h = await make({ preset: "cursor", askMode: "ask", safeModes: ["ask", "plan"] });
+    await h.online();
+    const caps = h.claw.heartbeats[0].agents[0].capabilities;
+    assert.equal(caps.edits, false);
+    assert.match(caps.edits_hint, /approval = "never"/);
+    assert.deepEqual(caps.read_only_modes, ["ask", "plan"]);
+  });
 });

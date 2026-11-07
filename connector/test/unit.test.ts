@@ -7,7 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import test, { describe } from "node:test";
 import { ConfigError, PRESETS, parseConfig } from "../src/config.js";
-import { checkCwd, relativeInside } from "../src/roots.js";
+import { checkCwd, relativeInside, resolveCwd, rootProblems } from "../src/roots.js";
+import { hintFor } from "../src/hints.js";
 import { globMatches } from "../src/glob.js";
 import { redactDeep, redactText } from "../src/redact.js";
 import { SseParser } from "../src/sse.js";
@@ -24,7 +25,6 @@ describe("agents.toml", () => {
     ["not toml", "this is = = not toml", /not valid TOML/],
     ["no roots", `[[agents]]\nid = "a"\npreset = "claude"\n`, /roots is required/],
     ["empty roots", `[[agents]]\nid = "a"\npreset = "claude"\nroots = []\n`, /roots is required/],
-    ["a root that does not exist", `[[agents]]\nid = "a"\npreset = "claude"\nroots = ["/no/such/dir/here"]\n`, /does not exist/],
     ["the filesystem root", `[[agents]]\nid = "a"\npreset = "claude"\nroots = ["/"]\n`, /filesystem root/],
     ["unknown preset", `[[agents]]\nid = "a"\npreset = "nope"\nroots = ["${root}"]\n`, /unknown preset/],
     ["no preset and no command", `[[agents]]\nid = "a"\nroots = ["${root}"]\n`, /needs a preset or a command/],
@@ -38,6 +38,10 @@ describe("agents.toml", () => {
     ["auto_allow absolute glob", base(`auto_allow = [{ kind = "edit", path_glob = "/etc/**" }]\n`), /relative/],
     ["allow_unsafe_modes not a boolean", `allow_unsafe_modes = "yes"\n`, /true or false/],
   ];
+  test("a root that does not exist (yet) is accepted: reading agents.toml never touches a root, which may be a network mount", () => {
+    const cfg = parseConfig(`[[agents]]\nid = "a"\npreset = "claude"\nroots = ["/no/such/dir/here"]\n`);
+    assert.deepEqual(cfg.agents[0]!.roots, ["/no/such/dir/here"]);
+  });
   for (const [name, text, re] of refused) {
     test(`refused: ${name}`, () => {
       assert.throws(() => parseConfig(text), (e) => e instanceof ConfigError && re.test(e.message), name);
@@ -201,6 +205,96 @@ describe("the directory whitelist", () => {
       if (v.ok) assert.equal(v.real, fs.realpathSync(cwd));
     });
   }
+  // The same table through what a phone's folder goes through now: everything absolute behaves the same.
+  for (const [name, cwd, ok, reason] of cases) {
+    if (!path.isAbsolute(cwd)) continue;
+    test(`resolveCwd: ${name}`, async () => {
+      const v = await resolveCwd(cwd, [root], { home: top });
+      assert.equal(v.ok, ok, JSON.stringify(v));
+      if (!v.ok) assert.equal(v.reason, reason);
+      if (v.ok) assert.equal(v.real, fs.realpathSync(cwd));
+    });
+  }
+
+  describe("what people type on a phone", () => {
+    const home = path.join(top, "home");
+    const work2 = path.join(top, "work2");
+    fs.mkdirSync(path.join(home, "proj"), { recursive: true });
+    fs.mkdirSync(path.join(work2, "repo"), { recursive: true });
+    fs.mkdirSync(path.join(work2, "only-here", "sub"), { recursive: true });
+    const roots = [root, work2, home];
+    const typed: Array<[string, string, string | null, string?]> = [
+      ["~ is the agent's home", "~", home],
+      ["~/x is a folder in it", "~/proj", path.join(home, "proj")],
+      ["a folder name found under exactly one root", "only-here", path.join(work2, "only-here")],
+      ["a relative path under one root", "only-here/sub", path.join(work2, "only-here", "sub")],
+      ["a root's own name is that root", "work2", work2],
+      ["a name two roots have is ambiguous", "repo", null, "cwd_ambiguous"],
+      ["a name no root has", "missing-repo", null, "cwd_not_found"],
+      ["a relative path may not climb out", "../elsewhere", null, "cwd_outside_roots"],
+      ["~otheruser is not this agent's home", "~root/x", null, "cwd_not_absolute"],
+      ["a symlink inside that escapes, by name", "link-out", null, "cwd_not_found"],
+      ["a folder under ~ that does not exist", "~/nope", null, "cwd_not_found"],
+      ["surrounding spaces are ignored", "  ~/proj ", path.join(home, "proj")],
+    ];
+    for (const [name, cwd, want, reason] of typed) {
+      test(name, async () => {
+        const v = await resolveCwd(cwd, roots, { home });
+        if (want) assert.deepEqual(v, { ok: true, real: fs.realpathSync(want) });
+        else assert.deepEqual(v, { ok: false, reason });
+      });
+    }
+    test("~ outside every root is still refused", async () => {
+      assert.deepEqual(await resolveCwd("~", [root], { home }), { ok: false, reason: "cwd_outside_roots" });
+    });
+    test("a folder under a root that is not there (a mount not mounted yet) is root_unavailable, not a missing folder", async () => {
+      assert.deepEqual(await resolveCwd(path.join(top, "mnt", "x"), [path.join(top, "mnt")], { home }), { ok: false, reason: "root_unavailable" });
+      assert.deepEqual(await resolveCwd("x", [path.join(top, "mnt")], { home }), { ok: false, reason: "root_unavailable" });
+    });
+    test("a root on a mount that stops answering: root_unavailable in time, the event loop keeps running, and the next look does not pile up", async () => {
+      let calls = 0;
+      const hung = { realpath: (p: string) => { calls++; return p.startsWith(path.join(top, "dead")) ? new Promise<string>(() => {}) : fs.promises.realpath(p); }, stat: fs.promises.stat } as unknown as Pick<typeof fs.promises, "realpath" | "stat">;
+      let ticks = 0;
+      const tick = setInterval(() => ticks++, 10);
+      const t0 = Date.now();
+      const v = await resolveCwd(path.join(top, "dead", "x"), [path.join(top, "dead")], { home, timeoutMs: 150, fs: hung });
+      clearInterval(tick);
+      assert.deepEqual(v, { ok: false, reason: "root_unavailable" });
+      assert.ok(Date.now() - t0 < 2000);
+      assert.ok(ticks >= 5, "timers ran while the look was hanging (heartbeats keep going)");
+      const before = calls;
+      assert.deepEqual(await resolveCwd(path.join(top, "dead", "x"), [path.join(top, "dead")], { home, timeoutMs: 150, fs: hung }), { ok: false, reason: "root_unavailable" });
+      assert.equal(calls, before, "the stalled root is not asked again while its first look hangs");
+    });
+    test("one stalled or missing root takes out only its own folders: a folder under a healthy root opens, and a deleted one there is cwd_not_found", async () => {
+      const dead = path.join(top, "dead2");
+      const hung = { realpath: (p: string) => (p.startsWith(dead) ? new Promise<string>(() => {}) : fs.promises.realpath(p)), stat: fs.promises.stat } as unknown as Pick<typeof fs.promises, "realpath" | "stat">;
+      const both = [dead, work2];
+      assert.deepEqual(await resolveCwd("only-here", both, { home, timeoutMs: 100, fs: hung }), { ok: true, real: fs.realpathSync(path.join(work2, "only-here")) });
+      assert.deepEqual(await resolveCwd(path.join(work2, "repo"), both, { home, timeoutMs: 100, fs: hung }), { ok: true, real: fs.realpathSync(path.join(work2, "repo")) });
+      assert.deepEqual(await resolveCwd(path.join(dead, "x"), both, { home, timeoutMs: 100, fs: hung }), { ok: false, reason: "root_unavailable" });
+      const missing = [path.join(top, "mnt-missing"), work2];
+      assert.deepEqual(await resolveCwd(path.join(work2, "deleted"), missing, { home }), { ok: false, reason: "cwd_not_found" });
+      assert.deepEqual(await resolveCwd(path.join(top, "mnt-missing", "x"), missing, { home }), { ok: false, reason: "root_unavailable" });
+    });
+    test("a root that is missing is reported once per agent, not fatal", async () => {
+      const ps = await rootProblems([{ id: "a", roots: [root, path.join(top, "mnt")] }]);
+      assert.equal(ps.length, 1);
+      assert.match(ps[0]!, /a: root .*mnt does not exist \(yet\); its sessions are refused until it does/);
+    });
+  });
+
+  test("every refusal reason a phone can see has a hint, and a sign-in hint names that agent's own command", () => {
+    for (const r of ["cwd_not_absolute", "cwd_not_found", "cwd_outside_roots", "cwd_ambiguous", "root_unavailable", "mode_unavailable", "mode_not_enforced",
+      "adapter_start_failed", "too_many_sessions", "unknown_agent", "resume_ref_required", "session_live", "invalid_cwd", "cwd_not_directory"]) {
+      assert.ok(hintFor(r), r);
+    }
+    assert.match(hintFor("agent_auth_required", { command: "npx", args: ["-y", "@agentclientprotocol/claude-agent-acp@0.99.0"] })!, /claude.*\/login|ANTHROPIC_API_KEY/);
+    assert.match(hintFor("agent_auth_required", { command: "npx", args: ["-y", "@agentclientprotocol/codex-acp@2.3.0"] })!, /codex login/);
+    assert.match(hintFor("agent_auth_required", { command: "agent", args: ["acp"] })!, /agent login/);
+    assert.equal(hintFor("closed"), null);
+  });
+
   test("several roots: any one is enough, and a missing root grants nothing", () => {
     assert.equal(checkCwd(outside, [root, outside]).ok, true);
     assert.equal(checkCwd(outside, [path.join(top, "gone")]).ok, false);

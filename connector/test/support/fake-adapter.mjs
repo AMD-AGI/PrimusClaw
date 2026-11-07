@@ -22,6 +22,7 @@ let nextId = 1;
 let nextOut = 1000;
 const waiting = new Map();
 
+let signedIn = false;
 const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\n");
 const reply = (id, result) => send({ id, result });
 const fail = (id, code, message) => send({ id, error: { code, message } });
@@ -131,8 +132,19 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
   const { id, method, params } = msg;
   log({ method, params: method === "session/prompt" ? undefined : params });
   switch (method) {
-    case "initialize":
-      return reply(id, { protocolVersion: 1, agentInfo: { name: "fake" }, authMethods: [], agentCapabilities: { loadSession: true, sessionCapabilities: env.FAKE_NO_RESUME === "1" ? { close: {} } : { resume: {}, close: {}, list: {} } } });
+    case "initialize": {
+      // FAKE_AUTH_STATUS: report a sign-in as claude-agent-acp does (`_auth/status_update`, a moment after initialize).
+      // FAKE_API_KEY_AUTH: sign in only through `authenticate {methodId: "api-key"}` with OPENAI_API_KEY set, as codex-acp.
+      const authMethods = env.FAKE_API_KEY_AUTH === "1" ? [{ id: "api-key", name: "API Key", _meta: { "api-key": { provider: "openai" } } }, { id: "chat-gpt", name: "ChatGPT" }] : [];
+      reply(id, { protocolVersion: 1, agentInfo: { name: "fake" }, authMethods, agentCapabilities: { loadSession: true, ...(env.FAKE_AUTH_STATUS ? { _meta: { authStatus: {} } } : {}), sessionCapabilities: env.FAKE_NO_RESUME === "1" ? { close: {} } : { resume: {}, close: {}, list: {} } } });
+      // FAKE_AUTH_STATUS_FILE: the status is read from that file when the process starts (a sign-in that changes later).
+      const kind = env.FAKE_AUTH_STATUS_FILE ? fs.readFileSync(env.FAKE_AUTH_STATUS_FILE, "utf8").trim() : env.FAKE_AUTH_STATUS;
+      if (env.FAKE_AUTH_STATUS) setTimeout(() => send({ method: "_auth/status_update", params: { authStatus: { kind, label: kind === "none" ? "Not logged in" : "API key" } } }), Number(env.FAKE_AUTH_STATUS_DELAY_MS || 50));
+      return;
+    }
+    case "authenticate":
+      if (params?.methodId === "api-key" && env.OPENAI_API_KEY) { signedIn = true; return reply(id, {}); }
+      return fail(id, -32603, "no api key");
     case "session/list": {
       // The shape of a real adapter's answer: {sessionId, cwd, title, updatedAt}, newest first, paged by an opaque cursor.
       // FAKE_SESSIONS_FILE: the list as it is on disk now (a test adds a conversation between two lists).
@@ -143,6 +155,7 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
     }
     case "session/new": {
       if (env.FAKE_AUTH_REQUIRED) return fail(id, -32000, "Authentication required");
+      if (env.FAKE_API_KEY_AUTH === "1" && !signedIn) return fail(id, -32000, "Authentication required");
       const sessionId = "acp-" + nextId++;
       // Like claude-agent-acp 0.99.0: a client that sets allowDangerouslySkipPermissions to false gets no bypass at all,
       // and a session the user's settings start in bypassPermissions starts in default instead.
@@ -155,6 +168,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       return reply(id, { sessionId, modes: modesOf(s), configOptions: configOptions(s) });
     }
     case "session/resume": case "session/load": {
+      // A sign-in that lapsed before an existing session comes back (Codex's resume needs one).
+      if (env.FAKE_RESUME_AUTH === "1") return fail(id, -32000, "Authentication required");
       const s = sessions.get(params.sessionId) ?? { cwd: params.cwd, mode: START_MODE, cancelled: false };
       sessions.set(params.sessionId, s);
       // The trap measured on a real adapter: resuming puts the user's own configured mode back.
@@ -182,6 +197,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       return reply(id, { configOptions: configOptions(s) });
     }
     case "session/prompt":
+      // A sign-in that lapsed after the session opened (an expired login): the prompt is refused, as claude-agent-acp does.
+      if (env.FAKE_PROMPT_AUTH === "1") return fail(id, -32000, "Authentication required");
       return void prompt(id, params).catch((e) => fail(id, -32603, String(e)));
     case "session/cancel": {
       const s = sessions.get(params.sessionId);

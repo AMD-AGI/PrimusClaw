@@ -37,10 +37,20 @@ export interface AdapterStart {
   initTimeoutMs?: number;
 }
 
+/** The sign-in an adapter reports it uses (`_auth/status_update`, claude-agent-acp); `kind: "none"` is a known sign-out. */
+export interface AuthStatus { kind: string; label?: string }
+
+export const AUTH_STATUS_METHOD = "_auth/status_update";
+
 export class AdapterProcess {
   caps: AcpParams = {};
+  /** The ways to sign in the adapter offered at `initialize` (`authMethods`), for `authenticate`. */
+  authMethods: AcpParams[] = [];
+  /** The last sign-in it reported, if it reports one; see {@link waitAuthStatus}. */
+  authStatus: AuthStatus | null = null;
   exited = false;
   private conn!: acp.ClientConnection;
+  private authWaiters: Array<() => void> = [];
 
   private constructor(readonly child: ChildProcess, readonly pid: number, private readonly registry: ChildRegistry) {}
 
@@ -100,7 +110,14 @@ export class AdapterProcess {
         if (ctx.method.startsWith("cursor/")) return (await o.hooks.onExtension(ctx.method, (ctx.params ?? {}) as AcpParams)) as never;
         throw acp.RequestError.methodNotFound(ctx.method);
       })
-      .onNotification("*", async (ctx) => { o.hooks.onNotification(ctx.method, (ctx.params ?? {}) as AcpParams); });
+      .onNotification("*", async (ctx) => {
+        const params = (ctx.params ?? {}) as AcpParams;
+        if (ctx.method === AUTH_STATUS_METHOD && params.authStatus && typeof params.authStatus.kind === "string") {
+          a.authStatus = { kind: params.authStatus.kind, ...(typeof params.authStatus.label === "string" ? { label: params.authStatus.label } : {}) };
+          for (const w of a.authWaiters.splice(0)) w();
+        }
+        o.hooks.onNotification(ctx.method, params);
+      });
 
     a.conn = app.connect(acp.ndJsonStream(Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>, Readable.toWeb(child.stdout!) as ReadableStream<Uint8Array>));
     try {
@@ -109,11 +126,49 @@ export class AdapterProcess {
         o.initTimeoutMs ?? 120_000, "initialize",
       );
       a.caps = ((init as AcpParams).agentCapabilities ?? {}) as AcpParams;
+      const methods = (init as AcpParams).authMethods;
+      a.authMethods = Array.isArray(methods) ? methods.filter((m: unknown) => typeof m === "object" && m !== null) : [];
     } catch (e) {
       await a.kill();
       throw e;
     }
     return a;
+  }
+
+  /** Whether the adapter says it reports its sign-in (`agentCapabilities._meta.authStatus`). */
+  get reportsAuth(): boolean {
+    const meta = this.caps._meta as AcpParams | undefined;
+    return !!meta && typeof meta === "object" && meta.authStatus !== undefined;
+  }
+
+  /**
+   * The sign-in the adapter reports, waiting up to `ms` for its first report (claude-agent-acp sends it shortly after
+   * `initialize`, and again for each new session). Null when it reports nothing in that time: not known, not "none".
+   */
+  async waitAuthStatus(ms: number): Promise<AuthStatus | null> {
+    if (this.authStatus || !this.reportsAuth || ms <= 0) return this.authStatus;
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(t);
+        // A waiter that timed out leaves the list, so a long-lived adapter does not collect them.
+        const i = this.authWaiters.indexOf(done);
+        if (i >= 0) this.authWaiters.splice(i, 1);
+        resolve();
+      };
+      const t = setTimeout(done, ms);
+      t.unref?.();
+      this.authWaiters.push(done);
+    });
+    return this.authStatus;
+  }
+
+  /** The id of an `authenticate` method that signs in with an API key the adapter reads from its own environment. */
+  apiKeyMethod(): string | null {
+    for (const m of this.authMethods) {
+      const id = typeof m.id === "string" ? m.id : typeof m.methodId === "string" ? m.methodId : null;
+      if (id === "api-key") return id;
+    }
+    return null;
   }
 
   request(method: string, params: AcpParams, timeoutMs = 60_000): Promise<AcpParams> {
