@@ -63,6 +63,9 @@ export class ChildRegistry {
     fs.renameSync(tmp, this.file);
   }
 
+  /** Stops retrying a failed write on its own (the connector has stopped). */
+  close(): void { this.out?.close(); }
+
   /** Whether what was saved so far is on disk (always, when written at once). */
   flushed(ms: number = STATE_WRITE_WAIT_MS): Promise<boolean> {
     return this.out ? this.out.settled(ms) : Promise.resolve(true);

@@ -103,6 +103,7 @@ export class SnapshotFile {
   private running: Promise<void> | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private retries = 0;
+  private closed = false;
   private readonly waiters: Array<{ upTo: number; resolve: (ok: boolean) => void }> = [];
 
   /** `durable`: each write is flushed to the disk before it replaces the file ({@link writeWhole}). */
@@ -149,9 +150,16 @@ export class SnapshotFile {
     else this.retries = 0;
   }
 
+  /** No more retries on its own (the connector that owns the file has stopped); `save` and `settled` still write. */
+  close(): void {
+    this.closed = true;
+    if (this.retryTimer !== null) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
+
   /** After a failed write with nothing newer to write: the same content again, later. */
   private retryLater(): void {
-    if (this.retryTimer !== null) return;
+    if (this.retryTimer !== null || this.closed) return;
     const ms = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** Math.min(this.retries, 10));
     this.retries += 1;
     this.retryTimer = setTimeout(() => {
