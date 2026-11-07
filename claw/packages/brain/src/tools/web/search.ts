@@ -391,6 +391,8 @@ function htmlText(s: string): string {
     .replace(/&#x([0-9a-f]{1,6});/gi, (_, h: string) => codePoint(parseInt(h, 16)))
     .replace(/&#(\d{1,7});/g, (_, d: string) => codePoint(Number(d)))
     .replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+    // What an entity spelled out may form a tag again: angle brackets are not kept in a title or a snippet.
+    .replace(/[<>]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }

@@ -264,7 +264,9 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
       if (keep.length) supported += 1;
       const trailing = line.slice(c.start, c.end).match(/\s*$/)?.[0] ?? "";
       const group = keep.length ? keep.map((n) => `[${n}]`).join("") : mark;
-      line = `${line.slice(0, c.start).replace(keep.length ? /$/ : /\s+$/, "")}${group}${trailing}${line.slice(c.end)}`;
+      // The mark follows the statement's last word; kept numbers stay where they were.
+      const head = keep.length ? line.slice(0, c.start) : line.slice(0, c.start).replace(/\s+$/, "");
+      line = `${head}${group}${trailing}${line.slice(c.end)}`;
     }
     lines[ln] = line;
   }

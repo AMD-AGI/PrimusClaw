@@ -76,6 +76,8 @@ test("DG1 the native search fails: DuckDuckGo's links are the hits and the sourc
   assert.match(text, /\[vLLM inference on ROCm & MI300X\]\(https:\/\/rocm\.docs\.amd\.com\/vllm\.html\): Run vLLM on AMD — docs/);
   assert.deepEqual((outcome.sources as Array<{ url: string }>).map((s) => s.url), ["https://rocm.docs.amd.com/vllm.html", "https://docs.vllm.ai/en/latest/"]);
   assert.doesNotMatch(text, /Buy GPUs|duckduckgo\.com/);
+  assert.deepEqual(parseDuckDuckGoHtml(`<a class="result__a" href="https://x.example/">a &lt;script&gt;b</a>`).map((h) => h.title), ["a scriptb"],
+    "no tag is formed again from what an entity spelled out");
   assert.equal(asked.length, 1);
   assert.equal(asked[0].params.q, "vllm rocm");
 });
