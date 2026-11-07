@@ -349,7 +349,7 @@ test("C7 a session delete is forgotten by every brain and torn down by one", { s
     }
 
     const count = (brain: string, msg: string, sessionId: string) =>
-      c.brains.get(brain)!.grep(new RegExp(`"msg":"${msg.replace(/\./g, "\\.")}"`)).filter((l) => l.includes(sessionId)).length;
+      c.brains.get(brain)!.grep(/"msg":"session\./).filter((l) => l.includes(`"msg":"${msg}"`) && l.includes(sessionId)).length;
     const teardowns = (sessionId: string) => BRAINS.map((b) =>
       count(b, "session.cleanup_done", sessionId) + count(b, "session.cleanup_failed", sessionId)
       + count(b, "session.cleanup_incomplete_parked", sessionId));
