@@ -55,7 +55,9 @@
 import type { KV } from "nats";
 import type { S3Client } from "@aws-sdk/client-s3";
 import { ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
-import { cleanupSubject, encodeCleanupPayload, parkHandsHandle, type ParkOutcome } from "@claw/protocol";
+import {
+  GRANT_CALL_TIMEOUT_MS, cleanupSubject, encodeCleanupPayload, parkHandsHandle, type ParkOutcome,
+} from "@claw/protocol";
 import pino from "pino";
 
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -66,6 +68,7 @@ import { metrics } from "../infra/metrics.js";
 import { releaseSessionRefs, workspaceForSession } from "../workspace/store.js";
 import { sc, nc, kv, kvTombstones, jsm, EVENT_STREAM } from "../infra/nats.js";
 import { rememberSessionDeleted } from "./deleted-cache.js";
+import { appGrantSigner } from "../grants/app-grant.js";
 import { S3_BUCKET, envInt } from "../config.js";
 
 const logger = pino({ name: "session-teardown" });
@@ -518,6 +521,64 @@ async function deleteGateLocks(sessionId: string): Promise<boolean> {
 }
 
 /**
+ * Revoke the sandbox grants of the session's hosted application runs.
+ *
+ * A grant is what the application creates its own sandboxes with -- GPU ones,
+ * typically -- and revoking it is what reclaims them: Agent Sandbox marks the
+ * grant revoked (its keys fail at once) and deletes every sandbox made under it.
+ * Brain revokes it too, as a step of finishing the run, but that step used to
+ * wait for the application's SIGTERM grace, fifteen minutes by default, during
+ * which a deleted session held its GPUs. Nothing about a deleted session needs
+ * those sandboxes, so the grant goes here, with the rest of the session.
+ *
+ * The row is stamped first, so a Brain still running the application does not
+ * extend or re-sign a grant that is being revoked; a revoke that then fails
+ * leaves the step unfinished and the sweeper repeats it. Repeating is safe: the
+ * service answers a revoked or unknown grant with success. A run already `ended`
+ * had its grant revoked by the Brain that ended it, and is not asked about again.
+ *
+ * Without a signing key this process cannot reach the grant service, and there is
+ * then nothing here to do: the Brain's finishing step is the only revoke.
+ *
+ * @returns whether every grant was confirmed revoked.
+ */
+export async function revokeSessionAppGrants(sessionId: string, deadline?: number): Promise<boolean> {
+  const signer = teardownGrantSigner.current();
+  if (!signer) return true;
+  const rows = (await db.query(
+    `UPDATE claw_app_runs SET grant_revoked_at = COALESCE(grant_revoked_at, NOW()), updated_at = NOW()
+      WHERE session_id = $1 AND grant_id IS NOT NULL AND state <> 'ended'
+      RETURNING task_id, grant_id`,
+    [sessionId],
+  )).rows as Array<{ task_id: string; grant_id: string }>;
+  let complete = true;
+  for (const row of rows) {
+    // Bounded by the caller's budget, and never below a second: a revoke cut
+    // short has still marked the grant revoked on the service, whose reaper
+    // finishes reclaiming its sandboxes; the retry only confirms it.
+    const timeoutMs = deadline === undefined
+      ? GRANT_CALL_TIMEOUT_MS
+      : Math.max(1_000, Math.min(GRANT_CALL_TIMEOUT_MS, deadline - Date.now()));
+    try {
+      await signer.revoke(row.grant_id, AbortSignal.timeout(timeoutMs));
+      logger.info({ sessionId, taskId: row.task_id, grantId: row.grant_id }, "session.app_grant_revoked");
+    } catch (err) {
+      complete = false;
+      logger.warn(
+        { sessionId, taskId: row.task_id, grantId: row.grant_id, err: errorText(err) },
+        "session.app_grant_revoke_failed",
+      );
+    }
+  }
+  return complete;
+}
+
+/** Where the cleanup gets its grant client; a seam so a test can stand in for the service. */
+export const teardownGrantSigner = {
+  current: (): Pick<NonNullable<ReturnType<typeof appGrantSigner>>, "revoke"> | null => appGrantSigner(),
+};
+
+/**
  * The steps of the cleanup that leave this process, in one object.
  *
  * A seam, because the order is the part that was wrong and the part no test
@@ -540,6 +601,7 @@ export const teardownPorts = {
     await jsm.streams.purge(EVENT_STREAM, { filter: `events.${sessionId}` } as never);
   },
   deleteGateLocks,
+  revokeAppGrants: revokeSessionAppGrants,
   deleteWorkspaceObjects: deleteSessionWorkspaceObjects,
   releaseWorkspaceRefs: releaseSessionRefs,
   parkHands: (sessionId: string): Promise<ParkOutcome> =>
@@ -882,6 +944,9 @@ function cleanupSteps(input: TeardownInput, deadline?: number): CleanupStep[] {
     // themselves. Every reader treats a lock as a live run on those files,
     // including the collector that would otherwise never reclaim the directory.
     { label: "lock_release", run: () => teardownPorts.deleteGateLocks(sessionId) },
+    // The hosted application runs' grants, and the sandboxes made under them.
+    // Before the slow steps, because what it frees is GPUs; see revokeSessionAppGrants.
+    { label: "app_grants", run: () => teardownPorts.revokeAppGrants(sessionId, deadline) },
     {
       label: "events_purge",
       run: async () => {
