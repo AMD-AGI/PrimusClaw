@@ -731,6 +731,171 @@ describe("crash safety", () => {
     assert.deepEqual([ev.data.optionId, ev.data.outcome, ev.data.by], [null, "cancelled", "connector_restart"]);
     assert.ok(h.audit().some((a) => a.kind === "permission_orphaned" && a.action_id === "orphan-action"));
   });
+  test("a turn waiting for permission when the connector restarts goes on after it: the dead card closes, the agent asks again, and the prompt's own turn_end ends it", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const seq = h.prompt(sid, "write p.txt");
+    const perm = await h.permission(sid);
+    // What a crash leaves on disk at this moment: the running turn, marked waiting, and its card.
+    const turns = JSON.parse(fs.readFileSync(path.join(h.dirs.state, "sessions.json.turns"), "utf8"));
+    assert.equal(turns[sid].cmd_seq, seq);
+    assert.equal(turns[sid].waiting, true);
+    assert.equal(turns[sid].waiting_permission, true);
+    await h.stop(); // a supervisor's restart (SIGTERM): nothing is ended by the run that goes away
+    assert.deepEqual(h.turnEnds(sid), [], "no turn_end from the run that stopped");
+    assert.deepEqual(h.claw.eventsOf(sid, "permission_resolved"), [], "the card is closed by the next run, which knows why");
+    h.connect();
+    h.start();
+    const closed = await h.claw.until("the dead card closed", () => h.claw.eventsOf(sid, "permission_resolved").find((e) => e.data.actionId === perm.data.actionId));
+    assert.equal(closed.data.by, "connector_restart");
+    const back = await h.claw.until("session_recovered", () => h.claw.eventsOf(sid, "session_recovered")[0]);
+    assert.deepEqual([back.data.interrupted, back.data.continuing, back.data.cmd_seq], [true, true, seq]);
+    const again = await h.permission(sid, 2);
+    assert.notEqual(again.data.actionId, perm.data.actionId, "a new card");
+    assert.ok(h.adapterLog().some((l) => typeof l.prompt === "string" && l.prompt.startsWith("[claw-connector]")), "the agent was told to go on");
+    h.decide(sid, again.data.actionId, "allow-once");
+    const end = await h.turnEnd(sid);
+    assert.deepEqual([end.data.stopReason, end.data.cmd_seq], ["end_turn", seq], "the original prompt ends, once");
+    assert.equal(fs.readFileSync(path.join(h.work, "continued.txt"), "utf8"), "hello\n");
+    await sleep(200);
+    assert.equal(h.turnEnds(sid).length, 1);
+  });
+  test("a turn cut off by a crash while the agent was working ends with connector_restarted, naming its prompt; the session says it is back once and answers the next prompt", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const flag = path.join(h.work, "never");
+    const seq = h.prompt(sid, `wait ${flag}`);
+    await h.claw.until("the turn to be running", () => h.adapterLog().some((l) => l.prompt === `wait ${flag}`));
+    await h.claw.until("the turn recorded", () => fs.existsSync(path.join(h.dirs.state, "sessions.json.turns")));
+    await h.stop();
+    h.connect();
+    h.start();
+    const end = await h.turnEnd(sid);
+    assert.deepEqual([end.data.stopReason, end.data.error, end.data.cmd_seq], ["error", "connector_restarted", seq]);
+    const back = await h.claw.until("session_recovered", () => h.claw.eventsOf(sid, "session_recovered")[0]);
+    assert.deepEqual([back.data.interrupted, back.data.continuing], [true, false]);
+    assert.ok(back.seq < end.seq, "why the turn ended comes before its end");
+    assert.ok(!h.adapterLog().some((l) => typeof l.prompt === "string" && l.prompt.startsWith("[claw-connector]")), "a working turn is not re-run by itself");
+    h.prompt(sid, "say after");
+    await h.turnEnd(sid, 2);
+    assert.ok(h.messages(sid).includes("after"));
+    assert.equal(h.claw.eventsOf(sid, "session_recovered").length, 1);
+  });
+  test("a crash leaves the same records: a turn found on disk at start, waiting, but older than a card lives, is ended and not continued", async () => {
+    const h = await make({ start: false, timing: { permissionTtlMs: 1_000 } });
+    const sid = "44444444-4444-4444-8444-444444444444";
+    h.connector.store.put(sid, { agent_id: "fake", acp_session_id: "acp-x", cwd: h.work, status: "active", mode: "default", created_at: new Date().toISOString() });
+    h.connector.store.beginTurn({ session_id: sid, cmd_id: "c-1", cmd_seq: 7, started_at: new Date().toISOString(), waiting: true, waiting_permission: true });
+    fs.writeFileSync(path.join(h.dirs.state, "connector.json"), "{}");
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(path.join(h.dirs.state, "connector.json"), old, old);
+    h.connect({ timing: { permissionTtlMs: 1_000 } });
+    h.start();
+    const end = await h.turnEnd(sid);
+    assert.deepEqual([end.data.error, end.data.cmd_seq], ["connector_restarted", 7]);
+    assert.ok(h.audit().some((a) => a.kind === "turn_interrupted" && a.waiting === true));
+    assert.deepEqual(h.adapterLog(), [], "nothing was started");
+  });
+  /** A session of the fake agent recorded by an earlier run, with a turn that was waiting for a tool call's permission a moment ago. */
+  const crashedWhileAsking = (h: Harness, sid: string, cwd = h.work, mode = "default") => {
+    h.connector.store.put(sid, { agent_id: "fake", acp_session_id: "acp-x", cwd, status: "active", mode, created_at: new Date().toISOString() });
+    h.connector.store.beginTurn({ session_id: sid, cmd_id: "c-9", cmd_seq: 9, started_at: new Date().toISOString(), waiting: true, waiting_permission: true });
+    // Its last heartbeat a moment ago (connector.json's mtime), so only the rule under test keeps the turn from going on.
+    // (Opened once, created when missing and kept when there: one file handle, no check-then-write.)
+    const fd = fs.openSync(path.join(h.dirs.state, "connector.json"), fs.constants.O_RDWR | fs.constants.O_CREAT, 0o600);
+    try {
+      if (fs.fstatSync(fd).size === 0) fs.writeSync(fd, "{}");
+      fs.futimesSync(fd, new Date(), new Date());
+    } finally { fs.closeSync(fd); }
+  };
+  test("a turn waiting on a plan card (not a tool call's permission) is ended at a restart, not carried on", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const seq = h.prompt(sid, "plan");
+    await h.permission(sid);
+    await h.stop();
+    h.connect();
+    h.start();
+    const end = await h.turnEnd(sid);
+    assert.deepEqual([end.data.error, end.data.cmd_seq], ["connector_restarted", seq]);
+    await sleep(200);
+    assert.ok(!h.adapterLog().some((l) => typeof l.prompt === "string" && l.prompt.startsWith("[claw-connector]")));
+  });
+  test("an agent that may run without asking (approval = never) is never carried on after a restart", async () => {
+    const h = await make({ start: false, approval: "never", askMode: "bypassPermissions" });
+    const sid = "66666666-6666-4666-8666-666666666666";
+    crashedWhileAsking(h, sid, h.work, "default");
+    h.connect();
+    h.start();
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.error, "connector_restarted");
+    assert.deepEqual(h.adapterLog(), [], "nothing was started");
+  });
+  test("with the kill switch on at start (paused), a turn that was waiting is ended, nothing is started", async () => {
+    const h = await make({ start: false });
+    const sid = "77777777-7777-4777-8777-777777777777";
+    crashedWhileAsking(h, sid);
+    fs.writeFileSync(path.join(h.dirs.state, "paused"), "x");
+    h.connect();
+    h.start();
+    await h.claw.until("the turn ended", () => h.audit().some((a) => a.kind === "turn_interrupted" && a.session_id === sid));
+    await sleep(300);
+    assert.deepEqual(h.adapterLog(), [], "nothing was started while paused");
+    assert.deepEqual(h.connector.store.listTurns(), []);
+  });
+  test("revoked at start: nothing is carried on and the turn stays recorded", async () => {
+    const h = await make();
+    await h.online();
+    await h.stop();
+    const sid = "88888888-8888-4888-8888-888888888888";
+    crashedWhileAsking(h, sid);
+    h.claw.revoked = true; // the row this connector registered
+    h.connect();
+    assert.equal(await h.start(), "revoked");
+    assert.deepEqual(h.adapterLog(), []);
+    assert.ok(!h.audit().some((a) => a.kind === "turn_continued"));
+  });
+  test("a carried-on turn that cannot start again (its folder left the roots) is ended by the refusal and forgotten", async () => {
+    const h = await make({ start: false });
+    const sid = "99999999-9999-4999-8999-999999999999";
+    crashedWhileAsking(h, sid, tmpdir("cc-gone-"));
+    h.connect();
+    h.start();
+    await h.claw.until("the session refused", () => h.claw.eventsOf(sid, "session_closed")[0]);
+    await h.claw.until("the record forgotten", () => h.connector.store.listTurns().length === 0);
+    assert.deepEqual(h.adapterLog(), []);
+  });
+  test("a prompt queued behind the running turn when the connector restarts is delivered again, not lost", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const flag = path.join(h.work, "never2");
+    h.prompt(sid, `wait ${flag}`);
+    await h.claw.until("the turn to be running", () => h.adapterLog().some((l) => l.prompt === `wait ${flag}`));
+    const queued = h.prompt(sid, "say queued-before-restart");
+    await sleep(300);
+    await h.stop();
+    h.connect();
+    h.start();
+    await h.claw.until("the queued prompt to run after the restart", () => h.messages(sid).includes("queued-before-restart"));
+    const ends = await h.claw.until("its turn_end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === queued));
+    assert.equal(ends.data.stopReason, "end_turn");
+  });
+  test("an idle session used lately is told once after a restart that it is back; an old or closed one is not", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    h.prompt(sid, "say hi");
+    await h.turnEnd(sid);
+    const old = "55555555-5555-4555-8555-555555555555";
+    h.connector.store.put(old, { agent_id: "fake", acp_session_id: "acp-old", cwd: h.work, status: "active", mode: "default", created_at: "2026-01-01T00:00:00.000Z", used_at: "2026-01-01T00:00:00.000Z" });
+    await h.stop();
+    h.connect();
+    h.start();
+    const back = await h.claw.until("session_recovered", () => h.claw.eventsOf(sid, "session_recovered")[0]);
+    assert.deepEqual([back.data.interrupted, back.data.continuing], [false, false]);
+    assert.deepEqual(h.turnEnds(sid).length, 1, "no turn_end for a turn that had ended");
+    await sleep(300);
+    assert.deepEqual(h.claw.eventsOf(old, "session_recovered"), []);
+  });
   test("a pending card is forgotten as soon as it is answered, so a later crash does not close it twice", async () => {
     const h = await make();
     const sid = await h.newSession();
