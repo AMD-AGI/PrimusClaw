@@ -640,6 +640,15 @@ describe("attach end to end", () => {
     assert.equal(hb.agents[0].capabilities.takeover, true, "the phone is told a takeover can be asked for");
   });
 
+  test("a holder proven by its registry row (this machine's pid domain, the same process start) is ended too, without the command's word", async () => {
+    const h = await attachHarness({ live: [], cliMode: "fail", timing: { recentWriteMs: 100, takeoverWaitMs: 5_000, spectateMs: 20, spectateCheckMs: 60_000 } });
+    const term = openTerminal(h.attachDir);
+    const sid = await h.attach(REF, h.work, { takeover: true });
+    assert.equal(closedReason(h, sid), undefined, `taken over (${closedReason(h, sid)})`);
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.took_over, true);
+    assert.ok(!(await import("../src/children.js")).isAlive(term.pid), "the terminal's process was ended");
+  });
+
   test("a takeover is refused, and nothing is resumed, when the terminal cannot be ended", async () => {
     // Another host shares the config directory: its process cannot be ended from here.
     const far = await attachHarness({ live: [], timing: { recentWriteMs: 100, takeoverWaitMs: 2_000 } });
@@ -649,6 +658,19 @@ describe("attach end to end", () => {
     await far.claw.until("refused", () => closedReason(far, sid1) !== undefined);
     assert.equal(closedReason(far, sid1), "session_live_elsewhere");
     assert.ok(!adapterMethods(far).includes("session/resume"));
+
+    // A row that names a live local pid but not this machine's pid domain proves nothing: that pid is not signalled.
+    const unproven = await attachHarness({ live: [], timing: { recentWriteMs: 100, takeoverWaitMs: 2_000 } });
+    const bystander = sleeper();
+    fs.mkdirSync(path.join(unproven.attachDir, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(unproven.attachDir, "sessions", `${bystander.pid}.json`), JSON.stringify({ pid: bystander.pid, sessionId: REF, status: "busy", kind: "interactive" }));
+    const sid0 = await unproven.attach(REF, unproven.work, { takeover: true });
+    await unproven.claw.until("refused", () => closedReason(unproven, sid0) !== undefined);
+    assert.equal(closedReason(unproven, sid0), "takeover_failed");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(bystander.exitCode, null, "a process that is not proven to hold it is never signalled");
+    assert.equal(bystander.signalCode, null);
+    assert.ok(!adapterMethods(unproven).includes("session/resume"));
 
     // A terminal that does not exit when asked: refused once the wait is over; it is not killed harder.
     const stubborn = await attachHarness({ timing: { recentWriteMs: 100, takeoverWaitMs: 1_000 } });

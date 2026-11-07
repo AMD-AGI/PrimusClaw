@@ -35,7 +35,7 @@ import { REMOTE_AGENT_LIMITS } from "./protocol.js";
 import { redactText } from "./redact.js";
 import { checkCwd, resolveCwd } from "./roots.js";
 import { within } from "./statefile.js";
-import { SESSION_ID_RE, localPidDomain, readTerminals, readTerminalsAsync } from "./terminals.js";
+import { SESSION_ID_RE, localPidDomain, readTerminals, readTerminalsAsync, terminalsDir } from "./terminals.js";
 import { errMessage, isObject, type Logger } from "./util.js";
 
 /** idle: nothing holds it open. live: a process (a terminal) does. attached: this connector holds it. unknown: the check could not be made. */
@@ -451,6 +451,13 @@ export class AttachSupport {
     const foreign = holders.find((e) => e.foreign);
     if (foreign) return { ok: false, reason: "session_live_elsewhere", detail: describeTwin(foreign) };
     const pids = [...new Set(holders.map((e) => e.pid))].filter((pid) => pid > 1 && pid !== process.pid);
+    // Only a process proven to be the local one that holds it is ever signalled: a pid read from a shared directory may
+    // name another host's process, and the same number here is someone else's.
+    const proven = await this.provenLocalHolders(want);
+    const unproven = pids.find((pid) => !proven.has(pid));
+    if (unproven !== undefined) {
+      return { ok: false, reason: "takeover_failed", detail: `cannot tell that process ${unproven} on this machine is the one holding it` };
+    }
     for (const pid of pids) {
       const owner = processUid(pid);
       if (owner !== null && typeof process.getuid === "function" && owner !== process.getuid()) {
@@ -480,6 +487,35 @@ export class AttachSupport {
       await pause(250);
     }
     return { ok: true, ended: pids };
+  }
+
+  /**
+   * The local processes that provably hold `want` open: those Claude Code's own `claude agents --json` lists for it (it only
+   * lists processes of this pid namespace that are alive), and those whose registry or hook row names this machine's pid
+   * domain and the start time of the process that has that pid now. A row without either proof is not enough to signal a pid.
+   */
+  private async provenLocalHolders(want: string): Promise<Set<number>> {
+    const out = new Set<number>();
+    const env = { ...this.d.env, ...this.agent.env, CLAUDE_CONFIG_DIR: this.configDir };
+    try {
+      for (const e of parseAgentsJson(await run(this.agent.attach?.cli ?? "claude", ["agents", "--json"], env, this.d.cliTimeoutMs))) {
+        if (e.sessionId.toLowerCase() === want) out.add(e.pid);
+      }
+    } catch { /* the rows below may still prove it */ }
+    if (this.localDomain === null) return out;
+    for (const dir of [path.join(this.configDir, "sessions"), terminalsDir(this.configDir)]) {
+      let names: string[] = [];
+      try { names = fs.readdirSync(dir); } catch { continue; }
+      for (const name of names) {
+        if (!name.endsWith(".json")) continue;
+        let doc: unknown;
+        try { doc = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")); } catch { continue; }
+        if (!isObject(doc) || typeof doc.pid !== "number" || !Number.isInteger(doc.pid) || typeof doc.sessionId !== "string") continue;
+        if (doc.sessionId.toLowerCase() !== want || doc.pidDomain !== this.localDomain) continue;
+        if (typeof doc.procStart === "string" && doc.procStart && processStart(doc.pid) === doc.procStart) out.add(doc.pid);
+      }
+    }
+    return out;
   }
 
   /** Every live process that holds a session open. Throws {@link TwinCheckError} when neither source can be read. */
