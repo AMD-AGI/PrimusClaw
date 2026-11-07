@@ -377,6 +377,51 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match((off as Recorded).message, /offline/);
   });
 
+  test("F17 a Windows machine's roots are folders: drive and share roots, either separator, any case, its own spelling sent", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const roots = ["C:\\Users\\alice\\repo", "\\\\fileserver\\share\\proj"];
+    const cid = await machine("alice", "winbox", { agents: [{ ...CLAUDE, capabilities: { roots } }] });
+    const plan = async (cwd?: string) => {
+      const out = await tools.planSend("alice", { text: "dir", agent: "claude", ...(cwd === undefined ? {} : { cwd }) });
+      return out.ok ? out.plan.cwd : `${out.code}: ${out.message}`;
+    };
+    // Nothing named: the agent's first root, which was refused as no folder at all before.
+    assert.equal(await plan(), "C:\\Users\\alice\\repo");
+    // A folder inside a root, however it is typed: sent as the root spells it, with the root's separator.
+    assert.equal(await plan("C:\\Users\\alice\\repo\\api"), "C:\\Users\\alice\\repo\\api");
+    assert.equal(await plan("c:/users/alice/repo/api/"), "C:\\Users\\alice\\repo\\api");
+    assert.equal(await plan("C:\\Users\\alice\\repo\\"), "C:\\Users\\alice\\repo");
+    assert.equal(await plan("\\\\FileServer\\Share\\proj\\web"), "\\\\fileserver\\share\\proj\\web");
+    assert.equal(await plan("//FileServer/Share/proj/web"), "\\\\fileserver\\share\\proj\\web");
+    // Outside every root, a sibling sharing a prefix, another drive, a POSIX path: no agent may work there.
+    for (const outside of ["C:\\Users\\alice\\repo2", "D:\\Users\\alice\\repo", "C:\\Users", "/home/u/repo", "Users\\alice\\repo"]) {
+      assert.match(await plan(outside), /^which_agent: no agent there may work in/, outside);
+    }
+
+    // The product path: pressed, the card opens the session in that folder on the machine.
+    const sent = await sendByCard(await userTurn(alice, "在 winbox 的 repo/api 里 dir"), { text: "dir", agent: "claude", cwd: "c:/users/alice/repo/api" });
+    assert.equal(sent.status, "done", JSON.stringify(sent));
+    const cmds = await queued(cid);
+    assert.deepEqual(cmds.map((c: Recorded) => [c.type, c.payload.cwd ?? null]), [["session.new", "C:\\Users\\alice\\repo\\api"], ["prompt", null]]);
+
+    // An idle session already open in that folder continues, whichever way the folder is typed.
+    const open = await chatSession("alice", cid, "C:\\Users\\alice\\repo\\web");
+    const again = await tools.planSend("alice", { text: "dir", agent: "claude", cwd: "c:/Users/Alice/repo/web" });
+    assert.ok(again.ok, JSON.stringify(again));
+    assert.equal(again.plan.session_id, open);
+
+    // A POSIX root that starts with two slashes is POSIX: its folders compare exactly, case and all.
+    const posix = await machine("alice", "nfsbox", { agents: [{ ...CLAUDE, capabilities: { roots: ["//srv/share/proj"] } }] });
+    const lower = await chatSession("alice", posix, "//srv/share/proj/web");
+    const exact = await tools.planSend("alice", { text: "ls", target: "nfsbox", agent: "claude", cwd: "//srv/share/proj/web" });
+    assert.ok(exact.ok, JSON.stringify(exact));
+    assert.equal(exact.plan.session_id, lower);
+    const other = await tools.planSend("alice", { text: "ls", target: "nfsbox", agent: "claude", cwd: "//srv/share/proj/Web" });
+    assert.ok(other.ok, JSON.stringify(other));
+    assert.deepEqual([other.plan.session_id, other.plan.cwd], [null, "//srv/share/proj/Web"]);
+  });
+
   test("F5 work_send refuses a development environment item; work_stop closes it and cancels its turn; worker_tail is the answer", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "laptop");
