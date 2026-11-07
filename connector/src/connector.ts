@@ -828,6 +828,8 @@ export class Connector {
         this.identityOut.settled(STATE_WRITE_WAIT_MS), this.store.flushed(), this.registry.flushed(), this.outbox.flush(), this.d.audit.flush?.(), disconnected,
       ]).then(([id, st, reg]) => id && st && reg), STATE_WRITE_WAIT_MS, false);
       if (!landed) this.d.log.warn("the state directory did not take the last writes in time (connector.json may be behind)");
+      // A write still failing is not retried after this run: the next run (in this process or another) owns the files.
+      this.identityOut.close(); this.store.close(); this.registry.close();
       fs.rmSync(pidf, { force: true });
     }
     return result;
