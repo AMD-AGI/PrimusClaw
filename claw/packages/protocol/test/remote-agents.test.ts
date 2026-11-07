@@ -147,6 +147,18 @@ test("registration, heartbeat and session bodies", () => {
   }
 });
 
+test("a takeover is a yes or a no, and only with a reference to the session it takes over", () => {
+  const base = { connector_id: "0f8fad5b-d9cb-469f-a165-70867728950e", agent_id: "a1", cwd: "/w" };
+  const ref = "1f8fad5b-d9cb-469f-a165-70867728950e";
+  const ok = (body: Record<string, unknown>) => { const r = parseSessionNew(body); return r.ok ? r.value.takeover : r.error; };
+  assert.equal(ok({ ...base, resume_ref: ref, takeover: true }), true);
+  assert.equal(ok({ ...base, resume_ref: ref, takeover: false }), false);
+  assert.equal(ok({ ...base, resume_ref: ref }), false, "absent is no");
+  assert.equal(ok({ ...base, resume_ref: ref, takeover: null }), false);
+  assert.equal(ok({ ...base, takeover: true }), "takeover_needs_resume_ref", "there is nothing to take over without a reference");
+  for (const bad of ["true", 1, {}, ["x"]]) assert.equal(ok({ ...base, resume_ref: ref, takeover: bad }), "invalid_takeover", JSON.stringify(bad));
+});
+
 test("a heartbeat's capabilities are carried as the connector wrote them, whatever they say about approval", () => {
   const capabilities = { ask_mode: "m", modes: ["a"], unattended: true, unattended_allowed: false, protocol: 1, nested: { x: [1, { y: null }] } };
   const parsed = parseHeartbeat({ agents: [{ agent_id: "a1", kind: "k", name: "n", capabilities }] });

@@ -35,7 +35,7 @@ import { REMOTE_AGENT_LIMITS } from "./protocol.js";
 import { redactText } from "./redact.js";
 import { checkCwd, resolveCwd } from "./roots.js";
 import { within } from "./statefile.js";
-import { SESSION_ID_RE, localPidDomain, readTerminals, readTerminalsAsync } from "./terminals.js";
+import { SESSION_ID_RE, localPidDomain, readTerminals, readTerminalsAsync, terminalsDir } from "./terminals.js";
 import { errMessage, isObject, type Logger } from "./util.js";
 
 /** idle: nothing holds it open. live: a process (a terminal) does. attached: this connector holds it. unknown: the check could not be made. */
@@ -87,6 +87,10 @@ export interface LiveEntry {
 export type Verdict =
   | { ok: true }
   | { ok: false; reason: "session_live" | "recently_written" | "twin_check_failed"; detail: string };
+
+export type EndVerdict =
+  | { ok: true; ended: number[] }
+  | { ok: false; reason: "session_live_elsewhere" | "takeover_not_permitted" | "takeover_failed" | "terminal_did_not_exit" | "recently_written" | "twin_check_failed"; detail: string };
 
 export type Resolved = { ok: true; item: Listed } | { ok: false; reason: "unknown_session" | "catalog_unavailable" };
 
@@ -425,6 +429,115 @@ export class AttachSupport {
     return { ok: true };
   }
 
+  /**
+   * Taking over a conversation a terminal has open, after the person confirmed it on the phone: every local process that
+   * holds `ref` open is asked to end (SIGTERM; Claude Code writes the end of its transcript, drops its registry row and
+   * exits, measured on 2.1.319 in about a second), and this waits until none is left and the transcript has been quiet
+   * for `recentWriteMs`, so that the resume that follows goes through the full check like any other. It fails closed: a
+   * holder this machine cannot see (another host or container sharing the directory) cannot be ended, a process of
+   * another user is not touched, and one that is still there after `waitMs` is a refusal, never a second writer.
+   */
+  async endHolders(ref: string, o: { ownPgid?: number | null; waitMs: number; sleep?: (ms: number) => Promise<void> }): Promise<EndVerdict> {
+    if (!SESSION_REF_RE.test(ref)) return { ok: false, reason: "twin_check_failed", detail: "not a session id" };
+    const want = ref.toLowerCase();
+    const pause = o.sleep ?? ((ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); t.unref?.(); }));
+    let live: LiveEntry[];
+    try {
+      live = await this.liveEntries();
+    } catch (e) {
+      return { ok: false, reason: "twin_check_failed", detail: errMessage(e) };
+    }
+    const holders = live.filter((e) => isTwin(e, want, o.ownPgid));
+    const foreign = holders.find((e) => e.foreign);
+    if (foreign) return { ok: false, reason: "session_live_elsewhere", detail: describeTwin(foreign) };
+    const pids = [...new Set(holders.map((e) => e.pid))].filter((pid) => pid > 1 && pid !== process.pid);
+    // Only a process proven to be the local one that holds it is ever signalled: a pid read from a shared directory may
+    // name another host's process, and the same number here is someone else's.
+    const proven = await this.provenLocalHolders(want);
+    const unproven = pids.find((pid) => !proven.has(pid));
+    if (unproven !== undefined) {
+      return { ok: false, reason: "takeover_failed", detail: `cannot tell that process ${unproven} on this machine is the one holding it` };
+    }
+    for (const pid of pids) {
+      const owner = processUid(pid);
+      if (owner !== null && typeof process.getuid === "function" && owner !== process.getuid()) {
+        return { ok: false, reason: "takeover_not_permitted", detail: `process ${pid} belongs to another user` };
+      }
+    }
+    for (const pid of pids) {
+      try { process.kill(pid, "SIGTERM"); } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === "ESRCH") continue;
+        return { ok: false, reason: code === "EPERM" ? "takeover_not_permitted" : "takeover_failed", detail: `process ${pid}: ${errMessage(e)}` };
+      }
+    }
+    // `waitMs` is for the processes to exit; the quiet the transcript then needs (`recentWriteMs`) is waited on top of it, so a
+    // terminal that is slow to exit is not refused as `recently_written` once it has.
+    const exitBy = this.now() + o.waitMs;
+    let quietBy: number | null = null;
+    // Gone, and the transcript quiet: the terminal may write its last lines on the way out.
+    for (;;) {
+      const left = pids.filter((pid) => isAlive(pid) && !isZombie(pid));
+      const file = this.transcriptFile(want);
+      let age = Infinity;
+      try { if (file) age = this.now() - fs.statSync(file).mtimeMs; } catch { /* no transcript to look at */ }
+      if (!left.length && age >= this.d.recentWriteMs) break;
+      if (left.length && this.now() >= exitBy) {
+        return { ok: false, reason: "terminal_did_not_exit", detail: `process ${left.join(", ")} did not exit within ${Math.round(o.waitMs / 1000)} s` };
+      }
+      if (!left.length) {
+        quietBy ??= this.now() + this.d.recentWriteMs + 2_000;
+        if (this.now() >= quietBy) return { ok: false, reason: "recently_written", detail: "its transcript is still being written" };
+      }
+      await pause(250);
+    }
+    return { ok: true, ended: pids };
+  }
+
+  /**
+   * The local processes that provably hold `want` open: those Claude Code's own `claude agents --json` lists for it (it only
+   * lists processes of this pid namespace that are alive), and those whose registry or hook row names this machine's pid
+   * domain and the start time of the process that has that pid now. A row without either proof is not enough to signal a pid.
+   */
+  private async provenLocalHolders(want: string): Promise<Set<number>> {
+    const proven = await this.provenHolderPids(want);
+    // ... and only one that works inside this agent's roots: a takeover never reaches a process outside what it may touch.
+    return new Set([...proven.keys()].filter((pid) => {
+      let cwd = proven.get(pid) ?? null;
+      if (process.platform === "linux") {
+        try { cwd = fs.realpathSync(`/proc/${pid}/cwd`); } catch { cwd = null; }
+      }
+      return cwd !== null && checkCwd(cwd, this.agent.roots).ok;
+    }));
+  }
+
+  /** The proven holders of `want` (see {@link provenLocalHolders}), each with the directory its row reports (null: none). */
+  private async provenHolderPids(want: string): Promise<Map<number, string | null>> {
+    const out = new Map<number, string | null>();
+    const env = { ...this.d.env, ...this.agent.env, CLAUDE_CONFIG_DIR: this.configDir };
+    try {
+      for (const e of parseAgentsJson(await run(this.agent.attach?.cli ?? "claude", ["agents", "--json"], env, this.d.cliTimeoutMs))) {
+        if (e.sessionId.toLowerCase() === want) out.set(e.pid, typeof e.cwd === "string" ? e.cwd : null);
+      }
+    } catch { /* the rows below may still prove it */ }
+    if (this.localDomain === null) return out;
+    for (const dir of [path.join(this.configDir, "sessions"), terminalsDir(this.configDir)]) {
+      let names: string[] = [];
+      try { names = fs.readdirSync(dir); } catch { continue; }
+      for (const name of names) {
+        if (!name.endsWith(".json")) continue;
+        let doc: unknown;
+        try { doc = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")); } catch { continue; }
+        if (!isObject(doc) || typeof doc.pid !== "number" || !Number.isInteger(doc.pid) || typeof doc.sessionId !== "string") continue;
+        if (doc.sessionId.toLowerCase() !== want || doc.pidDomain !== this.localDomain) continue;
+        if (typeof doc.procStart === "string" && doc.procStart && processStart(doc.pid) === doc.procStart) {
+          out.set(doc.pid, typeof doc.cwd === "string" ? doc.cwd : out.get(doc.pid) ?? null);
+        }
+      }
+    }
+    return out;
+  }
+
   /** Every live process that holds a session open. Throws {@link TwinCheckError} when neither source can be read. */
   async liveEntries(): Promise<LiveEntry[]> {
     const env = { ...this.d.env, ...this.agent.env, CLAUDE_CONFIG_DIR: this.configDir };
@@ -533,6 +646,28 @@ function describeTwin(e: LiveEntry): string {
 function isTwin(e: LiveEntry, want: string, ownPgid: number | null | undefined): boolean {
   if (e.sessionId.toLowerCase() !== want) return false;
   return e.foreign || !(ownPgid != null && processGroup(e.pid) === ownPgid);
+}
+
+/** An exited process its parent has not reaped yet (Linux): it holds nothing open any more. */
+function isZombie(pid: number): boolean {
+  if (process.platform !== "linux") return false;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+  } catch {
+    return false;
+  }
+}
+
+/** The real user id of a process (Linux), or null where that cannot be read. */
+function processUid(pid: number): number | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const m = /^Uid:\s+(\d+)/m.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"));
+    return m ? Number(m[1]) : null;
+  } catch {
+    return null;
+  }
 }
 
 // --- sources ---------------------------------------------------------------------------

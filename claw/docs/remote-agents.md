@@ -98,6 +98,12 @@ mark from the session's newest `session_started`/`session_resumed`: `GET .../ses
 `prompt`, `set_mode` and `decision` are refused with 409 `session_read_only` before anything is queued (`cancel`, `resume`
 and `close` are not). The connector refuses them as well (`read_only_live_session`).
 
+`POST /v1/remote-agents/sessions` also takes `takeover: true` next to a `resume_ref` (400 `takeover_needs_resume_ref` without
+one, 400 `invalid_takeover` when it is not a boolean): the person confirmed that whatever holds that conversation open on the
+machine is to be ended so that this session continues it. Claw forwards it in `session.new` and records it in the
+`session.created` audit row; it does not interpret it. Because it ends a process, it is a live command: the `session.new` carries `takeover_until` (now + the live-command TTL) and is dropped, like a `prompt`, when nobody collects it within that TTL; the connector refuses one past its deadline (`takeover_expired`). A connector that can do this says `takeover: true` in the agent's
+capabilities; one that cannot ignores the field, and the session is watched read-only as above.
+
 ## Whether a session asks before it acts
 
 Whether an agent asks the user before it writes a file or runs a command is the machine owner's choice,

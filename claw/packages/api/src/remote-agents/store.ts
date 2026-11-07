@@ -294,8 +294,10 @@ export const DELIVERY_UNCONFIRMED = "delivery_unconfirmed";
  * is dead after minutes: it was accepted because the connector looked online, so one still uncollected
  * was sent into a connection that had died unnoticed (a closed laptop counts as online for up to the
  * online window), and delivering it when the machine wakes hours later would run it with nobody watching,
- * which is the case the `connector_offline` refusal exists to prevent. `cancel`, `close` and `decision`
- * are safe to deliver late and keep only the day.
+ * which is the case the `connector_offline` refusal exists to prevent. A `session.new` is one of those
+ * too ({@link LIVE_COMMAND_TYPES}), and for a takeover (`takeover`) this matters most: delivered late, it
+ * would end a terminal the person may be using by then. `cancel`, `close` and `decision` are safe to
+ * deliver late and keep only the day.
  */
 const expiredSql = (typesParam: number, secsParam: number): string =>
   `(created_at < NOW() - interval '1 day'
@@ -848,6 +850,8 @@ export async function createSession(p: {
   owner: string; client: string | null; connectorId: string; agentId: string; cwd: string; mode: string | null;
   /** Forwarded to the connector as given; never stored on the row (the connector keeps what it needs). */
   resumeRef?: string | null;
+  /** With `resumeRef`: end whatever holds that session open on the machine first (the person confirmed it). */
+  takeover?: boolean;
   maxActive: number; commandsPerMinute: number;
   /** The connector presence window, which orders the sessions closed to make room (an offline machine's first). */
   onlineWindowMs?: number;
@@ -873,10 +877,13 @@ export async function createSession(p: {
     const cmdId = randomUUID();
     await enqueueCommand(q, {
       connectorId: p.connectorId, cmdId, sessionId, type: "session.new",
-      payload: { agent_id: p.agentId, cwd: p.cwd, mode: p.mode, ...(p.resumeRef ? { resume_ref: p.resumeRef } : {}) },
+      // A takeover is carried out only while the confirmation is fresh: the server drops it after the live TTL
+      // (`expiredSql`), and `takeover_until` lets the connector refuse one that reaches it later anyway.
+      payload: { agent_id: p.agentId, cwd: p.cwd, mode: p.mode, ...(p.resumeRef ? { resume_ref: p.resumeRef, ...(p.takeover
+        ? { takeover: true, takeover_until: Date.now() + REMOTE_AGENT_TIMING.liveCommandTtlMs } : {}) } : {}) },
     });
     const base = { owner: p.owner, actor: p.owner, client: p.client, connectorId: p.connectorId, agentId: p.agentId, sessionId };
-    await writeAudit(q, { ...base, action: "session.created", detail: { cwd: p.cwd, mode: p.mode, ...(p.resumeRef ? { resume_ref: p.resumeRef } : {}) } });
+    await writeAudit(q, { ...base, action: "session.created", detail: { cwd: p.cwd, mode: p.mode, ...(p.resumeRef ? { resume_ref: p.resumeRef, ...(p.takeover ? { takeover: true } : {}) } : {}) } });
     await writeAudit(q, { ...base, action: "command.issued", detail: { type: "session.new", cmd_id: cmdId } });
     for (const v of victims) {
       // Closed as `/agent close` closes it: its connector is told (a close is delivered late too), and the row is closed now.
