@@ -14,7 +14,7 @@ import { appMcpSeams } from "./app-mcp.js";
 import { httpAppRunStore, type AppRunRecord, type AppRunStore } from "./app-run-store.js";
 import { createEventTailer } from "./event-tailer.js";
 import {
-  appSandboxInstance, ensureAppSandbox, findLiveAppSandboxes, readSandboxNodeName,
+  appSandboxInstance, appSandboxWorkspaces, ensureAppSandbox, findLiveAppSandboxes, readSandboxNodeName,
 } from "./app-sandbox.js";
 
 export function realAppSandbox(store: AppRunStore): AppSandboxOps {
@@ -26,7 +26,8 @@ export function realAppSandbox(store: AppRunStore): AppSandboxOps {
     status: (inst) => getSafeWorkloadProvider().get(inst),
     exec: (inst, command, timeout, opts) => getSafeWorkloadProvider().exec(inst, command, timeout, undefined, opts),
     stop: (inst) => getSafeWorkloadProvider().stop(inst),
-    liveIds: async (runId, platformKey) => (await findLiveAppSandboxes(runId, platformKey)).map((w) => w.id),
+    liveIds: async (runId, platformKey, run) =>
+      (await findLiveAppSandboxes(runId, platformKey, undefined, run ? appSandboxWorkspaces(run) : [])).map((w) => w.id),
     nodeName: (workloadId, platformKey) => readSandboxNodeName(workloadId, platformKey),
   };
 }

@@ -120,15 +120,101 @@ export function appSandboxLabels(run: Pick<AppSandboxRun, "runId" | "sessionId" 
   };
 }
 
+/** A workload list SaFE answered with something other than 200; `status` says which. */
+export class AppSandboxLookupRefused extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+/**
+ * The workspaces an app run's sandbox can be in, for a key that may not list them all: the one it is
+ * created in (`appSandboxNamespace`), and the run's own workspace and the spec's `namespace` when they
+ * differ (a deployment whose CPU/GPU workspace settings changed since the create). Empty when none is known.
+ */
+export function appSandboxWorkspaces(run: Pick<AppSandboxRun, "workspaceId" | "sandboxSpec">): string[] {
+  const out: string[] = [];
+  const specNamespace = (run.sandboxSpec as { namespace?: unknown } | null | undefined)?.namespace;
+  for (const ws of [appSandboxNamespace(run), run.workspaceId, specNamespace]) {
+    const id = typeof ws === "string" ? ws.trim() : "";
+    if (id && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/** The workspaces SaFE says the key's user belongs to. Throws when it will not say: unknown is not none. */
+async function keyWorkspaces(apiKey: string, fetchImpl: typeof globalThis.fetch): Promise<string[]> {
+  const resp = await fetchImpl(`${SAFE_API_URL}/api/v1/users/self`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
+  });
+  if (resp.status !== 200) throw new AppSandboxLookupRefused(resp.status, `app sandbox lookup failed: users/self HTTP ${resp.status}`);
+  const body = await resp.json().catch(() => null) as { workspaces?: unknown } | null;
+  if (!body || !Array.isArray(body.workspaces)) throw new Error("app sandbox lookup failed: users/self named no workspace list");
+  const out: string[] = [];
+  for (const w of body.workspaces) {
+    const id = w && typeof w === "object" ? (w as { id?: unknown }).id : undefined;
+    if (typeof id === "string" && id.trim() && !out.includes(id.trim())) out.push(id.trim());
+  }
+  return out;
+}
+
 /**
  * Live workloads of this run. Throws when the list cannot be read: "could not
  * look" must never be read as "there is none", or a SaFE blip creates a second
  * sandbox.
+ *
+ * SaFE lists every workspace's workloads only for an admin; any other key gets
+ * 403 for a list that names no workspace. So the unscoped list is asked first --
+ * an admin's key sees every workspace, exactly as before -- and only its 403 moves
+ * the lookup to `workspaces` (the run's, `appSandboxWorkspaces`), or, when the run
+ * knows none, to every workspace the key's user belongs to (`users/self`), one
+ * list per workspace. A key can only have created the run's sandbox in a
+ * workspace it may use, so those are the whole of where it can be. A workspace
+ * that answers 403 is one the key cannot have created it in, and is skipped: it
+ * does not hide what the others hold. Every other failure in any workspace, or a
+ * 403 in all of them, fails the lookup.
  */
 export async function findLiveAppSandboxes(
   runId: string,
   apiKey: string,
   fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+  workspaces: readonly string[] = [],
+): Promise<Array<{ id: string; phase: string }>> {
+  try {
+    return await findLiveAppSandboxesIn(runId, apiKey, fetchImpl, undefined);
+  } catch (err) {
+    if (!(err instanceof AppSandboxLookupRefused) || err.status !== 403) throw err;
+  }
+  const named = [...new Set(workspaces.map((w) => w.trim()).filter(Boolean))];
+  const scopes = named.length ? named : await keyWorkspaces(apiKey, fetchImpl);
+  const found: Array<{ id: string; phase: string }> = [];
+  const refused: string[] = [];
+  for (const ws of scopes) {
+    try {
+      for (const w of await findLiveAppSandboxesIn(runId, apiKey, fetchImpl, ws)) {
+        if (!found.some((f) => f.id === w.id)) found.push(w);
+      }
+    } catch (err) {
+      if (!(err instanceof AppSandboxLookupRefused) || err.status !== 403) throw err;
+      refused.push(ws);
+    }
+  }
+  if (refused.length > 0) {
+    logger.warn({ runId, refused, read: scopes.length - refused.length }, "app_sandbox.lookup_workspace_refused");
+    if (refused.length === scopes.length) {
+      throw new AppSandboxLookupRefused(403, `app sandbox lookup failed: HTTP 403 in every workspace (${refused.join(", ")})`);
+    }
+  }
+  return found;
+}
+
+/** One list of the run's live workloads: unscoped when `workspaceId` is undefined, else in that workspace. */
+async function findLiveAppSandboxesIn(
+  runId: string,
+  apiKey: string,
+  fetchImpl: typeof globalThis.fetch,
+  workspaceId: string | undefined,
 ): Promise<Array<{ id: string; phase: string }>> {
   const found: Array<{ id: string; phase: string }> = [];
   let seen = 0;
@@ -142,12 +228,13 @@ export async function findLiveAppSandboxes(
       limit: String(LIST_PAGE_SIZE),
       offset: String(page * LIST_PAGE_SIZE),
     });
+    if (workspaceId !== undefined) query.set("workspaceId", workspaceId);
     const resp = await fetchImpl(`${SAFE_API_URL}/api/v1/workloads?${query}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
     });
     if (resp.status !== 200) {
-      throw new Error(`app sandbox lookup failed: HTTP ${resp.status}`);
+      throw new AppSandboxLookupRefused(resp.status, `app sandbox lookup failed: HTTP ${resp.status}`);
     }
     const parsed = parseWorkloadListPage(await resp.json().catch(() => null));
     if (!parsed) throw new Error("app sandbox lookup failed: unrecognised workload list");
@@ -298,7 +385,7 @@ export async function ensureAppSandbox(
     }
   };
 
-  const live = await findLiveAppSandboxes(run.runId, run.platformKey, deps.fetch);
+  const live = await findLiveAppSandboxes(run.runId, run.platformKey, deps.fetch, appSandboxWorkspaces(run));
   if (live.length > 0) {
     // `live` is newest first. More than one means an earlier create was never seen
     // by the run (so it was never recorded or stopped). Which one is the run's:
