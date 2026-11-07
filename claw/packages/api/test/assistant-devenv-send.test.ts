@@ -42,7 +42,9 @@
  *       older connector) makes the item count again, as before; a stop whose cancel finds nothing running (the connector restarted
  *       mid-turn, and that turn's end never comes) ends every instruction sent before it
  *   F17 a machine revoked while a card that would send to it waits: the card closes (expired, `connector_revoked`), the router's
- *       pending cards no longer name it, a press afterwards sends nothing; another machine's card, and another user's revoke, are untouched
+ *       pending cards no longer name it, a press afterwards sends nothing; another machine's card, and another user's revoke, are untouched;
+ *       a card proposed while the machine is being revoked is refused (no_machine), never left waiting; a revoke never waits for a card
+ *       that is being pressed (the press holds the card while its send waits for the machine: a cycle Postgres cannot see)
  *   F20 an agent that only takes over existing conversations (kind attach) is never chosen for a new session, which its connector would
  *       refuse: with another agent there, that one; alone, a question listing its conversations, else no_agent saying why
  *   F21 at the limit of open sessions a new one closes the longest unused idle session of the user's (never one working, waiting for
@@ -523,6 +525,71 @@ describe("development environment items and devenv_send", { skip }, () => {
     const again = await fetch(`${base}/v1/remote-agents/connectors/${desktop}`, { method: "DELETE", headers: { "x-test-user": "bob" } });
     assert.equal(again.status, 404);
     assert.equal((await w.q("SELECT status FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toDesktop.confirmation_id]))[0].status, "pending");
+  });
+
+  test("F17b a card drawn while its machine is being revoked: the turn is refused, no card is left waiting", async () => {
+    const { inTransaction } = await import("../src/infra/db.js");
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    // A revoke holds the machine's row (as `revokeConnector` does) while the turn plans against it.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let held!: () => void;
+    const isHeld = new Promise<void>((r) => { held = r; });
+    const revoke = inTransaction(async (q) => {
+      await q("UPDATE claw_remote_connectors SET revoked_at = NOW(), stream_seen_at = NULL WHERE connector_id = $1", [laptop]);
+      held();
+      await gate;
+      await tools.closeCardsOfConnector(q, "alice", laptop);
+    });
+    await isHeld;
+    const sent = tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" })
+      .then((v) => v, (e) => e);
+    // The turn is seen waiting on the machine's row; a turn that never takes it would draw its card meanwhile.
+    for (let i = 0; i < 100; i++) {
+      const waiting = await w.q("SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%claw_remote_connectors%FOR SHARE%'");
+      if (waiting.length) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    release();
+    await revoke;
+    const out = await sent;
+    assert.equal((out as Recorded).code, "no_machine", JSON.stringify(out));
+    assert.deepEqual(await schedules.pendingConfirmations("alice"), [], "no card waits for the revoked machine");
+    assert.deepEqual(await queued(laptop), []);
+  });
+
+  test("F17c a revoke while a card of that machine is being pressed: the revoke finishes, it does not wait for the press", async () => {
+    const { inTransaction } = await import("../src/infra/db.js");
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const card = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
+    assert.equal(card.done, false, JSON.stringify(card));
+    // The press holds the card's row (as `decideConfirmation` does) while its send waits for the machine's.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let held!: () => void;
+    const isHeld = new Promise<void>((r) => { held = r; });
+    const press = inTransaction(async (q) => {
+      await q("SELECT 1 FROM claw_assistant_confirmations WHERE confirmation_id = $1 FOR UPDATE", [card.confirmation_id]);
+      held();
+      await gate;
+    });
+    await isHeld;
+    try {
+      const r = await Promise.race([
+        fetch(`${base}/v1/remote-agents/connectors/${laptop}`, { method: "DELETE", headers: { "x-test-user": "alice" } }),
+        new Promise<null>((r) => setTimeout(() => r(null), 5000)),
+      ]);
+      assert.ok(r, "the revoke waited for the card being pressed");
+      assert.equal(r.status, 200, await r.text());
+      assert.ok((await w.q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [laptop]))[0].revoked_at);
+    } finally {
+      release();
+      await press;
+    }
   });
 
   test("F4 only the user's own machines; two that fit is a question; an offline one says so", async () => {

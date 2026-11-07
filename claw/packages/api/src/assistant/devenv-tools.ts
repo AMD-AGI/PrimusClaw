@@ -796,6 +796,14 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
   const out = await inTransaction(async (tx) => {
     await assertLiveRun(tx, claims);
     await tx("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [userId]);
+    // Read again under the machine's row lock: `planSend` read it before, and a revoke that committed since has already closed
+    // the cards it found (`closeCardsOfConnector`), so a card drawn now would wait for a machine that is gone. A revoke still
+    // running waits for this one instead, and closes the card it draws.
+    const live = (await tx(
+      "SELECT 1 FROM claw_remote_connectors WHERE connector_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL FOR SHARE",
+      [plan.connector_id, userId],
+    )).rows[0];
+    if (!live) throw new ToolRefused("no_machine", `the machine ${plan.machine} was removed from the user's development environments: nothing was sent`);
     return proposeConfirmation(tx, claims, userId, "devenv_send", params, {
       text: (ref) => sendCardText(plan, text, ref, zh), allowLabel: zh ? "发送" : "Send",
     });
@@ -814,13 +822,21 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
  * transaction (`revokeConnector`). Returns the ids closed.
  */
 export async function closeCardsOfConnector(q: Querier, owner: string, connectorId: string): Promise<string[]> {
+  // A card being pressed right now is skipped, never waited for: the press holds the card's lock while its send waits for the
+  // machine's, which this revoke holds, and the press waits on that send outside the database, so Postgres could not see the
+  // cycle and both would hang. That press finishes on its own after this revoke commits, with whatever its send decided: a send
+  // that had not yet read the machine finds it revoked and fails the card; one that had read it queues a command no revoked
+  // connector can fetch.
   // A Claw whose assistant never ran has no cards table, and its revoke must still work (a failed statement would abort the revoke).
   if (!(await q("SELECT to_regclass('claw_assistant_confirmations') IS NOT NULL AS present")).rows[0]?.present) return [];
   const closed = await q(
     `UPDATE claw_assistant_confirmations
         SET status = 'expired', decided_via = 'connector_revoked', decided_at = NOW(),
             result = jsonb_build_object('error', 'no_machine', 'message', 'that machine was removed before the card was answered: nothing was sent')
-      WHERE user_id = $1 AND kind = 'devenv_send' AND status = 'pending' AND params->>'connector_id' = $2
+      WHERE confirmation_id IN (
+              SELECT confirmation_id FROM claw_assistant_confirmations
+               WHERE user_id = $1 AND kind = 'devenv_send' AND status = 'pending' AND params->>'connector_id' = $2
+                 FOR UPDATE SKIP LOCKED)
       RETURNING confirmation_id`,
     [owner, connectorId],
   );
