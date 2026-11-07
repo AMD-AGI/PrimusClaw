@@ -25,6 +25,7 @@
  * they press it.
  */
 import { createHash } from "node:crypto";
+import pino from "pino";
 import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -36,6 +37,8 @@ import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { inRemoteSessionOrder, langOf, noteRemotePrompt, remoteEventMark, remoteWorkerSessionId, type RemoteLang } from "./remote-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
+
+const logger = pino({ name: "assistant-devenv" });
 
 /** Whether the router is offered `devenv_list`. */
 export const devenvToolsOn = (): boolean => CLAW_REMOTE_AGENTS_ENABLED;
@@ -330,21 +333,41 @@ export function pairingText(command: string, minutes: number, zh: boolean): stri
       + `You will be told here when it is connected.\n\`\`\`\n${command}\n\`\`\``;
 }
 
-/** What connects a machine for a user with none: a pairing made now when this turn may make one, else the setup commands. */
-async function connectNew(claims: AssistantTokenClaims, zh: boolean): Promise<NonNullable<DevenvList["connect_a_machine"]>> {
+/**
+ * Whether this list may make the user a pairing itself: a router turn answering a message the user sent signed in, recently, that
+ * has read nothing untrusted before this list (the list marks the turn as soon as it reads). Every other turn gets what it got
+ * before: the setup commands, and devenv_pair left to the router.
+ */
+async function mayPairHere(claims: AssistantTokenClaims): Promise<boolean> {
+  if (claims.role !== "router") return false;
   try {
-    const p = await devenvPair(claims) as { command: string; expires_in_minutes: number };
-    return { commands: [p.command], text: pairingText(p.command, p.expires_in_minutes, zh), pairing: { expires_in_minutes: p.expires_in_minutes, single_use: true } };
+    await attendedTurn((text, params) => db.query(text, params), claims);
+    return true;
   } catch (err) {
-    // Not a turn answering the user's own message, no public address here, too many codes this minute: the setup commands.
-    if (err instanceof ToolRefused) return connectAMachine(zh);
+    if (err instanceof ToolRefused) return false;
     throw err;
   }
 }
 
-const SETUP_NOTE = " The user has no machine connected: give them connect_a_machine.text as it is, its command in a code block "
-  + "(the command is exact; never change, shorten or add to it, and never give other connector commands). When it has pairing, it is "
-  + "a one-time pairing command made for them now: do not call devenv_pair for another.";
+/** What connects a machine for a user with none: a pairing made now when this turn may make one, else the setup commands. */
+async function connectNew(claims: AssistantTokenClaims, zh: boolean, mayPair: boolean): Promise<NonNullable<DevenvList["connect_a_machine"]>> {
+  if (!mayPair) return connectAMachine(zh);
+  try {
+    const p = await devenvPair(claims) as { command: string; expires_in_minutes: number };
+    return { commands: [p.command], text: pairingText(p.command, p.expires_in_minutes, zh), pairing: { expires_in_minutes: p.expires_in_minutes, single_use: true } };
+  } catch (err) {
+    // No public address here, too many codes this minute, or the pairing could not be written: the setup commands, and the list
+    // is still answered.
+    if (!(err instanceof ToolRefused)) logger.warn({ err, sid: claims.sid }, "assistant.devenv_list_pairing_failed");
+    return connectAMachine(zh);
+  }
+}
+
+const SETUP_NOTE = " The user has no machine connected: to connect one, call devenv_pair and give them its one command as it is; only "
+  + "if devenv_pair is refused, give them connect_a_machine.text as it is (the commands are exact; do not change or shorten them).";
+const PAIRED_NOTE = " The user has no machine connected: connect_a_machine is a one-time pairing command made for them now. Give them "
+  + "connect_a_machine.text as it is, its command in a code block (exact: never change, shorten or add to it, never give other "
+  + "connector commands), and do not call devenv_pair for another.";
 const OUTDATED_NOTE = " A machine whose version_status is outdated or unsupported needs its connector upgraded (unsupported: no new session "
   + "starts on it): give the user its upgrade_command as it is.";
 
@@ -365,11 +388,14 @@ export async function devenvList(
   const detail = args.detail === undefined || args.detail === "" ? "status" : args.detail;
   if (detail !== "status" && detail !== "activity") throw new ToolRefused("invalid_arguments", "detail is status or activity");
   const { userId } = await inTransaction((q) => assertLiveRun(q, claims));
+  // Asked before the read below marks the turn.
+  const mayPair = await mayPairHere(claims);
   // Before any of it is passed on: from here on this turn has read what a connector and its agents reported.
   await markUntrustedRead((text, params) => db.query(text, params), claims.sid, claims.mid);
   const { machines, attachable } = await collect(userId, detail === "activity", onlineWindowMs);
   const message = machines.length ? null : await turnMessage((text, params) => db.query(text, params), claims.sid, claims.mid);
   const old = machines.some((m) => m.version_status === "outdated" || m.version_status === "unsupported");
+  const connect = machines.length ? null : await connectNew(claims, langOf(message?.content ?? "") === "zh", mayPair);
   // "Connect me" without naming one: the one session open through Claw, else the one conversation that can be taken over, else
   // (no session at all) the one agent that can start one. One open in a terminal is never the default: it can only be watched,
   // and "connect me" means to work with it.
@@ -385,8 +411,9 @@ export async function devenvList(
     attach_default: pick
       ? { label: pick.label, ref: pick.ref, attach_command: attachCommand(pick.ref), ...(pick.opened_in === "agent" ? { new_session: true } : {}) }
       : null,
-    ...(machines.length ? {} : { connect_a_machine: await connectNew(claims, langOf(message?.content ?? "") === "zh") }),
-    note: (detail === "activity" ? ACTIVITY_NOTE : STATUS_NOTE) + (machines.length ? "" : SETUP_NOTE) + (old ? OUTDATED_NOTE : ""),
+    ...(connect ? { connect_a_machine: connect } : {}),
+    note: (detail === "activity" ? ACTIVITY_NOTE : STATUS_NOTE) + (connect ? (connect.pairing ? PAIRED_NOTE : SETUP_NOTE) : "")
+      + (old ? OUTDATED_NOTE : ""),
   };
 }
 

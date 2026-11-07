@@ -102,10 +102,12 @@ record it.
 
 ### Fixed
 - "连接我的开发环境" with no machine connected answers the one-line pairing command, every time. devenv_list with no machine, in a
-  turn answering the user's own message, makes the pairing itself and gives it in `connect_a_machine` (`commands` the one line, `text`
-  in the user's language with it in a code block, `pairing` its minutes); the four setup commands are given only where pairing is
-  refused (no `CLAW_PUBLIC_URL`, too many codes, a report). Before, the list carried the four setup commands and the router copied them
-  in 5 of 7 fresh sessions instead of calling devenv_pair. Router prompt router-devenv-v9.
+  router turn answering a message the user sent signed in, recently, that has read nothing untrusted before the list, makes the
+  pairing itself and gives it in `connect_a_machine` (`commands` the one line, `text` in the user's language with it in a code block,
+  `pairing` its minutes). Any other turn (a report, a message with a key, an old or tainted one), and where pairing is refused (no
+  `CLAW_PUBLIC_URL`, too many codes), gets what it got before: the four setup commands, with devenv_pair left to the router. Before,
+  the list always carried the four setup commands and the router copied them in 5 of 7 fresh sessions instead of calling devenv_pair.
+  Router prompt router-devenv-v9.
 - An assistant whose new lookup differs from its earlier answer says what changed since, not that the earlier answer was its mistake
   (`router-read-v12`, and the placeholder that stands for an earlier turn's result): a pull request merged between two asks was
   told as "上次我多算了 1 个，抱歉".
