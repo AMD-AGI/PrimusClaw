@@ -474,8 +474,10 @@ export function createAssistantMcpServer(
         + "the machine, so afterwards the turn acts for the user only to connect the chat to one of these sessions (channel_action "
         + "with its attach_command). detail: \"status\" (default) for which machines and sessions there are; \"activity\" also "
         + "gives what each session is doing in the agent's words (its step, the end of its last answer). With no machine at all, "
-        + "connect_a_machine is what connects one: with pairing, a one-line pairing command made for the user now, said as it is.",
-        { detail: z.enum(["status", "activity"]).optional() },
+        + "connect_a_machine is what connects one: with pairing, a one-line pairing command made for the user now, said as it is. "
+        + "Every machine is listed; a machine with many sessions lists its latest few and counts them all (session_count, "
+        + "sessions_by_state, sessions_not_shown): machine (its name) lists every session of that one machine.",
+        { detail: z.enum(["status", "activity"]).optional(), machine: z.string().max(200).optional() },
         (args) => answer(claims, "devenv_list", () => devenvList(claims, args)),
       );
       mcp.tool(

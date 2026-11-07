@@ -40,7 +40,7 @@ import { rerunModelOf } from "./model-fallback.js";
 import { AFTER_READ_TOOLS, routerLookups } from "./read-tools.js";
 import { heldForPersonManifest, renderHeldForPerson } from "./holds.js";
 import { triggerToolSettings } from "../triggers/mcp.js";
-import { askedOfOthers } from "./requester-view.js";
+import { askedOfOthers, askedOfOthersTotals, type AskedOfOthersTotals } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
 import { toldRefs } from "./told.js";
 import { earlierFilesOf, promptImagesOf, renderFilesState } from "./files.js";
@@ -174,6 +174,11 @@ async function itemWatches(userId: string, itemIds: string[]): Promise<Map<strin
 /** The reviews the user asked of others, in the same window as their own items: the four facts each, read-only. */
 export async function askedOfOthersManifest(userId: string): Promise<AskedOfOtherLine[]> {
   return (await askedOfOthers(db, userId, MANIFEST_CLOSED_WINDOW, MANIFEST_MAX_ITEMS)).map((a) => ({ itemId: a.item_id, view: a.view }));
+}
+
+/** The counts of those reviews in the same window, without the list's limit (`renderRouterItems` says them before the latest). */
+export async function askedOfOthersTotalsManifest(userId: string): Promise<AskedOfOthersTotals> {
+  return askedOfOthersTotals(db, userId, MANIFEST_CLOSED_WINDOW);
 }
 
 function reviewOf(params: unknown): NonNullable<ManifestItem["review"]> {
@@ -310,7 +315,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     ));
     // What it writes itself (a document, a draft, a translation), and how a file or a comment of its reaches the user (`writing-prompt.ts`).
     withSystemAppend(task, renderRouterWritingSection({ comment: assistantSchedulesOn() }));
-    const state = [renderRouterItems(await routerManifest(role.userId), await askedOfOthersManifest(role.userId))];
+    const asked = await askedOfOthersManifest(role.userId);
+    const state = [renderRouterItems(await routerManifest(role.userId), asked, new Date(), asked.length ? await askedOfOthersTotalsManifest(role.userId) : undefined)];
     // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
     const held = renderHeldForPerson(await heldForPersonManifest(role.userId));
     if (held) state.push(held);

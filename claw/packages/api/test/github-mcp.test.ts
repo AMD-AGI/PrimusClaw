@@ -258,7 +258,7 @@ describe("B the reads a question needs", () => {
     assert.equal(seen.length, 1);
     const url = new URL(seen[0].url);
     assert.deepEqual([url.origin + url.pathname, seen[0].authorization], [`${API}/search/issues`, `Bearer ${GH_TOKEN}`]);
-    assert.deepEqual(Object.fromEntries(url.searchParams), { q: "is:pr is:open author:@me", sort: "updated", order: "desc", per_page: "50", page: "1" });
+    assert.deepEqual(Object.fromEntries(url.searchParams), { q: "is:pr is:open author:@me -base:release-gate-fixture/base", sort: "updated", order: "desc", per_page: "50", page: "1" });
     const found = JSON.parse(r.text);
     assert.deepEqual([found.total_count, found.shown, found.complete], [3, 3, true]);
     assert.deepEqual(found.items.map((i: any) => [i.repo, i.number, i.is_pull_request, i.draft]), [
@@ -497,9 +497,91 @@ describe("B lists a turn sees whole", () => {
     const c = await connect(token());
     const prs = JSON.parse((await call(c, "pr_list", { repo: "o/r" })).text);
     assert.deepEqual([prs.total_count, prs.complete, prs.items.length], [7, true, 7]);
-    assert.deepEqual(Object.fromEntries(new URL(seen[0].url).searchParams), { state: "open", sort: "created", direction: "desc", per_page: "50", page: "1" });
+    // Read 100 at a time, so that what is filtered out (a release-gate fixture) is counted out of the whole list, not out of a page.
+    assert.deepEqual(Object.fromEntries(new URL(seen[0].url).searchParams), { state: "open", sort: "created", direction: "desc", per_page: "100", page: "1" });
     const issues = JSON.parse((await call(c, "issue_list", { repo: "o/r", per_page: 10 })).text);
     assert.deepEqual([issues.total_count, issues.complete, issues.next_page, issues.items.length], [null, false, 2, 10]);
+  });
+
+  test("B23 pr_list leaves the release-gate fixtures out of the list and its count, and lists them when asked", async () => {
+    // As on 2026-11-07 06:09: #381 "release-gate fixture, do not merge" was counted as one of "3 still open", and fixtures that
+    // merged into the fixture branch as merged work. A person's own "[do not merge]" pull request stays.
+    const open = [
+      pr(381, { title: "release-gate fixture, do not merge", head: { ref: "release-gate-fixture/head" }, base: { ref: "release-gate-fixture/base" } }),
+      pr(380, { title: "[do not merge] try the new router", head: { ref: "wip/router" } }),
+      pr(294, { title: "Default the chart model" }),
+    ];
+    const merged = [
+      pr(413, { title: "handoff e2e fixture 23, do not merge into main", state: "closed", head: { ref: "handoff-e2e-fixture/23" }, base: { ref: "release-gate-fixture/base" }, merged_at: "2026-11-07T06:52:39Z", updated_at: "2026-11-07T06:52:40Z" }),
+      pr(378, { state: "closed", merged_at: "2026-11-07T05:55:10Z", updated_at: "2026-11-07T05:55:12Z" }),
+      pr(377, { title: "a fixture renamed by hand, do not merge", state: "closed", head: { ref: "x/y" }, merged_at: "2026-11-07T05:50:00Z", updated_at: "2026-11-07T05:50:00Z" }),
+    ];
+    respond = (url) => (url.pathname === "/repos/o/r/pulls" ? json(url.searchParams.get("state") === "open" ? open : merged) : json({}, 404));
+    const c = await connect(token());
+    const found = JSON.parse((await call(c, "pr_list", { repo: "o/r" })).text);
+    assert.deepEqual(found.items.map((p: any) => p.number), [380, 294]);
+    assert.deepEqual([found.total_count, found.complete, found.fixtures_excluded], [2, true, 1]);
+    assert.match(found.note, /1 release-gate fixture .*include_fixtures: true lists them/);
+    const all = JSON.parse((await call(c, "pr_list", { repo: "o/r", include_fixtures: true })).text);
+    assert.deepEqual([all.items.map((p: any) => p.number), all.total_count, all.fixtures_excluded], [[381, 380, 294], 3, undefined]);
+    const done = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged" })).text);
+    assert.deepEqual([done.items.map((p: any) => p.number), done.total_count, done.fixtures_excluded], [[378], 1, 2]);
+  });
+
+  test("B24 issue_search leaves the fixtures out in the search itself, so total_count and by_repo count without them", async () => {
+    respond = (url) => (url.pathname === "/search/issues" ? json({ total_count: 1, incomplete_results: false, items: [hit(12)] }) : json({}, 404));
+    const c = await connect(token());
+    const found = JSON.parse((await call(c, "issue_search", { query: "is:pr is:open author:@me" })).text);
+    assert.equal(new URL(seen[0].url).searchParams.get("q"), "is:pr is:open author:@me -base:release-gate-fixture/base");
+    assert.match(String(found.fixtures_excluded), /left out of the search and its counts/);
+    for (const [args, q] of [
+      [{ query: "is:pr is:open author:@me", include_fixtures: true }, "is:pr is:open author:@me"],
+      [{ query: "is:pr base:release-gate-fixture/base" }, "is:pr base:release-gate-fixture/base"],
+      [{ query: "is:pr fixture in:title" }, "is:pr fixture in:title"],
+    ] as const) {
+      seen = [];
+      const r = JSON.parse((await call(c, "issue_search", args)).text);
+      assert.equal(new URL(seen[0].url).searchParams.get("q"), q, JSON.stringify(args));
+      assert.equal(r.fixtures_excluded, undefined);
+    }
+  });
+
+  test("B25 pr_list since reads the whole window and counts it: \"what merged this week\" is a total, not the latest page", async () => {
+    // 250 merged in the week, one a minute back from Saturday noon, then older ones: GitHub pages them 100 at a time.
+    const week = Date.UTC(2026, 10, 2);
+    const at = (i: number) => new Date(Date.UTC(2026, 10, 7, 12) - i * 40 * 60_000).toISOString();
+    const page = (n: number) => Array.from({ length: 100 }, (_, i) => {
+      const t = at(n * 100 + i);
+      return pr(10_000 - (n * 100 + i), { state: "closed", merged_at: t, closed_at: t, updated_at: t });
+    });
+    respond = (url) => (url.pathname === "/repos/o/r/pulls" ? json(page(Number(url.searchParams.get("page")) - 1)) : json({}, 404));
+    const inWeek = Array.from({ length: 500 }, (_, i) => at(i)).filter((t) => Date.parse(t) >= week).length;
+    const found = JSON.parse((await call(await connect(token()), "pr_list", { repo: "o/r", state: "merged", since: "2026-11-02", per_page: 20 })).text);
+    assert.equal(found.total_count, inWeek, "every one merged since Monday, counted");
+    assert.equal(found.since, "2026-11-02T00:00:00.000Z");
+    assert.deepEqual([found.shown, found.complete, found.next_page], [20, false, 2]);
+    assert.ok(found.items.every((p: any) => Date.parse(p.merged_at) >= week));
+    assert.equal(seen.length, Math.ceil((inWeek + 1) / 100), "read until the window is passed, and no further");
+    const bad = await call(await connect(token()), "pr_list", { repo: "o/r", state: "merged", since: "last week" });
+    assert.equal(bad.isError, true);
+    assert.match(bad.text, /since must be an ISO date/);
+  });
+
+  test("B26 a list that is not all of its matches says so in the answer, with what to do before a count", async () => {
+    const { partialLine } = await import("../src/github-mcp/tools.js");
+    respond = (url) => (url.pathname === "/repos/o/r/pulls"
+      ? json(Array.from({ length: 100 }, (_, i) => {
+          const t = new Date(Date.UTC(2026, 10, 7, 6) - i * 60_000).toISOString();
+          return pr(400 - i, { state: "closed", merged_at: t, closed_at: t, updated_at: t });
+        }))
+      : json({}, 404));
+    const part = JSON.parse((await call(await connect(token()), "pr_list", { repo: "o/r", state: "merged", per_page: 20 })).text);
+    assert.deepEqual([part.complete, part.total_count, part.shown], [false, null, 20]);
+    assert.equal(part.partial, partialLine(20, null));
+    assert.match(part.partial, /not all of them\. Before you give a count.*read next_page until complete is true.*covers only these 20/);
+    respond = (url) => (url.pathname === "/repos/o/r/pulls" ? json([pr(1), pr(2)]) : json({}, 404));
+    const whole = JSON.parse((await call(await connect(token()), "pr_list", { repo: "o/r" })).text);
+    assert.deepEqual([whole.complete, whole.partial], [true, undefined]);
   });
 
   test("B22 the list reads still name each item they answer as a source, now from the answer's items", async () => {

@@ -233,17 +233,19 @@ export function listAnswer(
   items: readonly unknown[],
   meta: {
     total_count?: number | null; complete: boolean; next_page?: number | null; note?: string; by_repo?: Record<string, number>;
-    refs_by_repo?: Record<string, string[]>;
+    refs_by_repo?: Record<string, string[]>; since?: string; fixtures_excluded?: number | string;
   },
 ): Record<string, unknown> {
   const head = {
     total_count: meta.total_count ?? null, shown: 0, complete: false, ...(meta.by_repo ? { by_repo: meta.by_repo } : {}),
     ...(meta.refs_by_repo ? { refs_by_repo: meta.refs_by_repo } : {}),
+    ...(meta.since ? { since: meta.since } : {}),
+    ...(meta.fixtures_excluded !== undefined && meta.fixtures_excluded !== 0 ? { fixtures_excluded: meta.fixtures_excluded } : {}),
     ...(meta.note ? { note: meta.note } : {}),
   };
   const kept: unknown[] = [];
-  // The envelope's own size, with room for the fields filled in below.
-  let size = JSON.stringify(head).length + 160;
+  // The envelope's own size, with room for the fields filled in below (the partial line among them).
+  let size = JSON.stringify(head).length + 160 + PARTIAL_ROOM;
   for (const item of items) {
     const n = JSON.stringify(item).length + 1;
     if (size + n > GITHUB_LIST_MAX_CHARS) break;
@@ -254,11 +256,26 @@ export function listAnswer(
   const complete = meta.complete && !cutBySize;
   return {
     ...head, shown: kept.length, complete,
+    ...(complete ? {} : { partial: partialLine(kept.length, meta.total_count ?? null) }),
     ...(cutBySize ? { not_shown: items.length - kept.length, cut: "the answer holds no more: ask for fewer per page, or narrow the query" } : {}),
     ...(!complete && !cutBySize && meta.next_page ? { next_page: meta.next_page } : {}),
     items: kept,
   };
 }
+
+/**
+ * What a list that is not all of its matches says beside them, in the answer itself. Read as if whole, 20 of the merged pull requests
+ * answered "17 merged in the last 11 hours" and "only 3 open" (2026-11-07 06:09, the owner's 研发进度): the router had complete: false
+ * and a note, and counted the page. So the answer names its own scope, and what to do before a count.
+ */
+export function partialLine(shown: number, total: number | null): string {
+  return `items holds ${shown} of ${total === null ? "an unknown number of" : total} matches, not all of them. Before you give a count, `
+    + "a total or \"all\"/\"only N\", read next_page until complete is true (or narrow: since, state, author, a repository); if you "
+    + `answer from these alone, say in the answer that it covers only these ${shown} (最近 ${shown} 条里 / of the ${shown} most recent)`
+    + (total === null ? "" : `, and give ${total} as the total`);
+}
+/** Room the envelope keeps for `partialLine`. */
+const PARTIAL_ROOM = 420;
 
 /**
  * One page of a list GitHub pages itself (`per_page`, `page`): a page shorter than asked is the list's end, which gives the
@@ -285,41 +302,70 @@ type PullState = "open" | "closed" | "merged" | "all";
  * once enough have closed (merged) at or after that time, nothing unread can come before them.
  */
 async function scanPulls(
-  gh: GithubClient, r: { owner: string; repo: string }, filter: Record<string, string>, state: PullState, author: string | null,
+  gh: GithubClient, r: { owner: string; repo: string }, filter: Record<string, string>, state: PullState,
+  opts: { author: string | null; includeFixtures: boolean; since: number | null; sinceText?: string },
   perPage: number, page: number,
 ): Promise<Record<string, unknown>> {
+  const { author, includeFixtures, since } = opts;
   const ordered = state === "closed" || state === "merged";
-  const timeOf = (p: Record<string, any>): number => Date.parse(String(state === "merged" ? p.merged_at : p.closed_at)) || 0;
+  const timeOf = (p: Record<string, any>): number =>
+    Date.parse(String(state === "merged" ? p.merged_at : state === "closed" ? p.closed_at : p.created_at)) || 0;
   const latestFirst = (x: Record<string, any>, y: Record<string, any>): number => timeOf(y) - timeOf(x);
   const want = page * perPage;
   const kept: Record<string, any>[] = [];
   let ended = false;
   let settled = false;
+  // With since: every one in the window has been read (an unread one was updated, or created, before it).
+  let windowRead = false;
+  let fixtures = 0;
   let read = 0;
   let oldestRead = Infinity;
-  for (let n = 1; n <= MAX_SCAN_PAGES && !ended && !settled; n++) {
+  for (let n = 1; n <= MAX_SCAN_PAGES && !ended && !settled && !windowRead; n++) {
     const q = { ...filter, state: state === "merged" ? "closed" : state, sort: ordered ? "updated" : "created", direction: "desc", per_page: 100, page: n };
     const list = (await gh.get<any[]>(repoPath(r, "/pulls"), q)).json ?? [];
     read += list.length;
     for (const p of list) {
       if (author !== null && login(p.user)?.toLowerCase() !== author.toLowerCase()) continue;
       if (state === "merged" && !p.merged_at) continue;
+      if (since !== null && timeOf(p) < since) continue;
+      if (!includeFixtures && isGateFixture(p)) { fixtures++; continue; }
       kept.push(p);
     }
-    if (list.length) oldestRead = Math.min(oldestRead, Date.parse(String(list[list.length - 1].updated_at)) || 0);
+    const last = list[list.length - 1];
+    if (last) oldestRead = Math.min(oldestRead, Date.parse(String(last.updated_at)) || 0);
     ended = list.length < 100;
-    if (ordered && !ended && kept.length >= want) settled = timeOf([...kept].sort(latestFirst)[want - 1]) >= oldestRead;
+    // A pull request not read yet was updated no later than the oldest read (closed and merged ones are read in update order, and
+    // close or merge no later than they are updated), or, in creation order, created no later than the last one read.
+    if (since !== null && last) windowRead = (ordered ? oldestRead : Date.parse(String(last.created_at)) || 0) < since;
+    // Without a window, the reading stops once the page asked for is settled; with one, it reads the whole window, to count it.
+    if (since === null && ordered && !ended && kept.length >= want) settled = timeOf([...kept].sort(latestFirst)[want - 1]) >= oldestRead;
   }
+  const known = ended || windowRead;
   const all = ordered ? [...kept].sort(latestFirst) : kept;
   const what = state === "all" ? "" : `${state === "merged" ? "closed" : state} `;
   return listAnswer(all.slice((page - 1) * perPage, want).map(prLine), {
-    total_count: ended ? all.length : null,
-    complete: ended && page === 1 && all.length <= perPage,
-    next_page: !ended || all.length > want ? page + 1 : null,
-    note: ended ? undefined
-      : `read the ${read} most recently ${ordered ? "updated" : "created"} ${what}pull requests, not all of them: how many there are in all is not known`
-        + (ordered && !settled ? `, and older ones may have ${state === "merged" ? "merged" : "closed"} later than some shown` : ""),
+    total_count: known ? all.length : null,
+    complete: known && page === 1 && all.length <= perPage,
+    next_page: !known || all.length > want ? page + 1 : null,
+    ...(opts.sinceText ? { since: opts.sinceText } : {}),
+    ...(fixtures ? { fixtures_excluded: fixtures } : {}),
+    note: [
+      ...(known ? [] : [
+        `read the ${read} most recently ${ordered ? "updated" : "created"} ${what}pull requests, not all of them: how many there are in all is not known`
+          + (ordered && !settled ? `, and older ones may have ${state === "merged" ? "merged" : "closed"} later than some shown` : ""),
+      ]),
+      ...(fixtures ? [`${fixtures} release-gate fixture pull request(s) of those read are left out (test fixtures, never the project's work); include_fixtures: true lists them`] : []),
+    ].join("; ") || undefined,
   });
+}
+
+/** `since` as a time, or a refusal: a date the model wrote is checked, never guessed at. */
+function sinceOf(text: string | undefined): number | null {
+  if (text === undefined || text.trim() === "") return null;
+  const t = text.trim();
+  const ms = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?)?$/.test(t) ? Date.parse(/T/.test(t) && !/(Z|[+-]\d{2}:\d{2})$/.test(t) ? `${t}Z` : t) : NaN;
+  if (!Number.isFinite(ms)) throw new BadInput("since must be an ISO date or time, such as 2026-11-02 or 2026-11-02T00:00:00Z");
+  return ms;
 }
 
 /** The workflow run of a GitHub Actions check run, from its details address (`.../actions/runs/<run>/job/<job>`), or null. */
@@ -471,6 +517,36 @@ const SCOPED_SEARCH_REFUSED = "GitHub answered 422: a search narrowed with repo:
 /** The most pages of 100 a list reads to filter or order it: past them it says it did not read to the end. */
 const MAX_SCAN_PAGES = 5;
 
+/**
+ * Release-gate fixtures: pull requests a release gate opens against its own fixture branches (`release-gate-fixture/base`, heads under
+ * `release-gate-fixture/` or `<name>-e2e-fixture/`), titled "..., do not merge". They are nobody's work, and a "merged" one merged into
+ * the fixture branch, not into the project: listed with the rest they were counted as "3 still open" and as merged work (2026-11-07
+ * 06:09). Lists and searches leave them out unless asked (`include_fixtures`). A person's own "[do not merge]" pull request is theirs:
+ * the title alone excludes only together with the word fixture.
+ */
+export const FIXTURE_BASE = "release-gate-fixture/base";
+const FIXTURE_REF_RE = /^(?:release-gate-fixture|[A-Za-z0-9._-]+-e2e-fixture)\//;
+
+export function isGateFixture(p: Record<string, any>): boolean {
+  const refs = [p?.head?.ref, p?.base?.ref].filter((r): r is string => typeof r === "string");
+  const title = typeof p?.title === "string" ? p.title : "";
+  return refs.some((r) => FIXTURE_REF_RE.test(r)) || (/\bfixture\b/i.test(title) && /\bdo not merge\b/i.test(title));
+}
+
+/** The search qualifier that leaves the fixtures out of an issue_search (it leaves issues, which have no base, as they are). */
+export const FIXTURE_SEARCH_EXCLUSION = `-base:${FIXTURE_BASE}`;
+
+/** The query issue_search sends: the user's, with the fixtures left out unless asked for or the query already names a base. */
+export function searchQueryOf(query: string, includeFixtures: boolean): string {
+  if (includeFixtures || /(^|\s)-?base:/i.test(query) || /fixture/i.test(query)) return query;
+  return `${query} ${FIXTURE_SEARCH_EXCLUSION}`;
+}
+
+const INCLUDE_FIXTURES = z.boolean().optional()
+  .describe("true also lists release-gate fixture pull requests (test fixtures, titled \"fixture, do not merge\"); left out by default");
+const SINCE = z.string().max(40).optional()
+  .describe("An ISO date or time (2026-11-02, or 2026-11-02T00:00:00Z): only those created (open, all), closed (closed) or merged (merged) at or after it, all of them counted; use it for \"this week\" or \"since Monday\"");
+
 const REPO = z.string().describe("The repository, owner/name");
 const NUMBER = z.number().int().min(1).describe("The pull request or issue number");
 const PER_PAGE = z.number().int().min(1).max(100).optional().describe("Default 50");
@@ -601,24 +677,26 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
   },
     (v) => on([itemSource(repoName(a.repo), v, true)])));
 
-  mcp.tool("pr_list", "List pull requests of a repository. state open (the default) or all: newest first; closed: most recently closed first; merged: only the merged ones, most recently merged first (use it for \"what merged last\"). author keeps one person's. Says how many there are (total_count) and whether every one is shown (complete).", {
+  mcp.tool("pr_list", "List pull requests of a repository. state open (the default) or all: newest first; closed: most recently closed first; merged: only the merged ones, most recently merged first (use it for \"what merged last\"). author keeps one person's; since keeps a time window and counts all of it (\"what merged this week\": state merged, since the week's first day). Release-gate fixture pull requests are left out unless include_fixtures. Says how many there are (total_count) and whether every one is shown (complete); when complete is false, items are not all of them.", {
     repo: REPO, state: z.enum(["open", "closed", "merged", "all"]).optional(),
     author: z.string().optional().describe("A user login: only the pull requests this person opened"),
-    head: z.string().optional().describe("owner:branch"), base: z.string().optional(), per_page: PER_PAGE, page: PAGE,
+    head: z.string().optional().describe("owner:branch"), base: z.string().optional(), since: SINCE, include_fixtures: INCLUDE_FIXTURES,
+    per_page: PER_PAGE, page: PAGE,
   }, (a) => answer("pr_list", async () => {
     const r = repoOf(a.repo);
     const state = a.state ?? "open";
     const perPage = a.per_page ?? LIST_PER_PAGE;
     const page = a.page ?? 1;
     if (a.author !== undefined && !isValidOwner(a.author)) throw new BadInput("author must be a user login");
+    const since = sinceOf(a.since);
     const filter: Record<string, string> = {};
     if (a.head) filter.head = a.head;
     if (a.base) filter.base = a.base;
-    if ((state === "open" || state === "all") && a.author === undefined) {
-      const list = (await gh.get<any[]>(repoPath(r, "/pulls"), { ...filter, state, sort: "created", direction: "desc", per_page: perPage, page })).json ?? [];
-      return pageAnswer(list.map(prLine), perPage, page);
-    }
-    return scanPulls(gh, r, filter, state, a.author ?? null, perPage, page);
+    // Read 100 at a time and filtered here (the fixtures, a window, an author): a page of GitHub's own with a fixture taken out of it
+    // would count one short, and say nothing of the ones left out.
+    return scanPulls(gh, r, filter, state, {
+      author: a.author ?? null, includeFixtures: a.include_fixtures === true, since, ...(since !== null ? { sinceText: new Date(since).toISOString() } : {}),
+    }, perPage, page);
   }, (v) => on(each(v?.items).map((p) => itemSource(repoName(a.repo), p, true)))));
 
   mcp.tool("pr_files", "The files a pull request changes, with each file's patch (long patches are cut).", {
@@ -707,13 +785,16 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
 
   mcp.tool("issue_search", "Search pull requests and issues across GitHub, as the user, with GitHub's search syntax: `is:pr is:open author:@me` (the user's open pull requests), `is:pr is:open review-requested:@me`, `is:issue is:open assignee:@me`; narrow with `repo:owner/name` or `org:name` (some tokens are refused such a search: then list the repository with pr_list or issue_list). Returns the total count (total_count), how many are in each repository (by_repo, up to " + BY_REPO_MAX + " matches), the matches, most recently updated first, and whether every match is shown (complete); list them all from `items`, and count from total_count and by_repo.", {
     query: z.string().min(1).max(256).describe("GitHub search syntax; @me is the user"),
-    sort: z.enum(["updated", "created", "comments"]).optional().describe("Default updated"), per_page: PER_PAGE, page: PAGE,
+    sort: z.enum(["updated", "created", "comments"]).optional().describe("Default updated"), include_fixtures: INCLUDE_FIXTURES,
+    per_page: PER_PAGE, page: PAGE,
   }, (a) => answer("issue_search", async () => {
     const perPage = a.per_page ?? LIST_PER_PAGE;
     const page = a.page ?? 1;
+    // The release-gate fixtures are left out by GitHub's search itself, so total_count and by_repo count without them.
+    const query = searchQueryOf(a.query, a.include_fixtures === true);
     let res: any;
     try {
-      res = (await gh.get<any>("/search/issues", { q: a.query, sort: a.sort ?? "updated", order: "desc", per_page: perPage, page })).json;
+      res = (await gh.get<any>("/search/issues", { q: query, sort: a.sort ?? "updated", order: "desc", per_page: perPage, page })).json;
     } catch (err) {
       if (err instanceof GithubError && err.status === 422 && SCOPED_SEARCH_RE.test(a.query)) {
         logger.warn({ tool: "issue_search", status: err.status, requestId: err.requestId }, "github_mcp.scoped_search_refused");
@@ -726,7 +807,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     const seen = (page - 1) * perPage + items.length;
     // A search GitHub cut short may report a low total_count, so a page that seems to hold every match may not: no by_repo then.
     const incomplete = res?.incomplete_results === true;
-    const counted = page === 1 && total !== null && !incomplete ? await searchCountByRepo(gh, a.query, items, total) : null;
+    const counted = page === 1 && total !== null && !incomplete ? await searchCountByRepo(gh, query, items, total) : null;
     const byRepo = counted && "byRepo" in counted ? counted.byRepo : null;
     const notes = [
       ...(incomplete ? ["GitHub's search timed out before it found every match: total_count may be low"] : []),
@@ -739,6 +820,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
       next_page: total !== null && seen < total && items.length === perPage ? page + 1 : null,
       ...(byRepo ? { by_repo: byRepo } : {}),
       refs_by_repo: refsByRepo(items, byRepo),
+      ...(query !== a.query ? { fixtures_excluded: `release-gate fixture pull requests (base ${FIXTURE_BASE}) are left out of the search and its counts; include_fixtures: true counts them` } : {}),
       ...(notes.length ? { note: notes.join("; ") } : {}),
     });
   }, (v) => on(each(v?.items).map((i) => itemSource(typeof i.repo === "string" ? i.repo : undefined, i)))));

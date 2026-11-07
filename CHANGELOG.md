@@ -111,6 +111,14 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- The assistant no longer answers a partial read as if it were all of it (N8, 2026-11-07: "17 merged, only 3 open" from 20 of the merged
+  pull requests with a release-gate fixture among the open ones; "19 of the 20 merged" when 82 reviews had been handed over; the second
+  dev machine said to be unreachable when the list showed one of two). GitHub list answers that are not complete say so in `partial`, and
+  the router reads the rest (next page, `pr_list since` for a time window, which counts all of it) or says the scope in its first line,
+  with totals only from a count of the whole (router-read-v15). `pr_list` and `issue_search` leave release-gate fixture pull requests
+  out of their items and counts unless `include_fixtures`. The reviews asked of others are counted in all before the latest 20 are
+  listed. `devenv_list` lists every machine with its latest 6 sessions and the counts of all of them, and `machine` lists one machine's
+  every session.
 - A worker asked to make a write (push a branch and open a pull request, post a comment) makes it when it gets there and lets the hold
   put it to the user on a card, instead of first reporting a question that only asks whether to make it ("Confirm I should push and
   open the PR?"), which asked a user who had already asked for it again in words, and once more on the card after their yes (G0
