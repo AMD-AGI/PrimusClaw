@@ -42,6 +42,12 @@ record it.
   `POST /v1/remote-agents/sessions`, `devenv_send` and a pressed `devenv_send` card answer `409 connector_outdated` with the version
   and the command, instead of a session that fails on the old connector. A connector that reports no version is not refused, and a
   session already open on an old connector continues.
+- The assistant drives development environments from plain words end to end: `devenv_send` takes
+  `new_session` (新开一个会话在 ~/repo 里看看 opens a new session, never an idle one) and reads a folder
+  written with `~` in the home folder the agent's roots are in; the router names a session by when it was
+  last used (切到昨天那个会话), and answers 回到助理 in a chat that is already with it without running anything.
+  `test/e2e/assistant-devenv-eval.ts` measures these sentences, in Chinese and English, against the router's
+  real prompt and tools. Router prompt router-devenv-v6.
 - A development environment session is pushed only when it needs you, finishes or fails, each once: an instruction the assistant sent
   to an agent on your machine says nothing while it works, one message when the agent waits on a permission request (`assistant.say`
   `remote.ask`: the request with its options and when it runs out, for a channel to put to you as buttons), one when it finished, and
