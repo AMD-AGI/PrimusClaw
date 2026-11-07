@@ -35,3 +35,17 @@ test("SC2 a condition that is not a JSON object of lists adds nothing; a long li
   assert.equal(await htmlToMarkdown(`<td data-show-cond="broken">plain</td>`), "plain");
   assert.equal(await htmlToMarkdown("<p>no conditions</p>"), "no conditions");
 });
+
+test("SC3 an element Turndown converts itself keeps its own Markdown; a condition's words cannot carry markup or lines", async () => {
+  const cond = `data-show-cond='{"gpu": ["amd-instinct-mi300x"]}'`;
+  for (const [withCond, plain] of [
+    [`<ul><li ${cond}>A</li><li>B</li></ul>`, "<ul><li>A</li><li>B</li></ul>"],
+    [`<p><a href="https://x.example/y" ${cond}>link</a></p>`, `<p><a href="https://x.example/y">link</a></p>`],
+    [`<h2 ${cond}>Title</h2>`, "<h2>Title</h2>"],
+    [`<pre ${cond}><code>x = 1</code></pre>`, "<pre><code>x = 1</code></pre>"],
+    [`<p ${cond}>para</p>`, "<p>para</p>"],
+  ]) assert.equal(await htmlToMarkdown(withCond), await htmlToMarkdown(plain), withCond);
+  assert.equal(showCondition(JSON.stringify({ "gpu\n---\n[x](https://evil.example)": ["mi300x\n---", "[a](b)"] })),
+    "(shown only for gpu --- xhttps://evil.example: mi300x ---, ab)", "one line, no brackets: never a link or a delimiter line");
+  assert.equal(showCondition(JSON.stringify({ gpu: ["x".repeat(5000)] })), null, "an attribute past the cap is not read");
+});
