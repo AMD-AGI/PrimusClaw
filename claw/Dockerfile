@@ -209,6 +209,15 @@ RUN /app/hands-binary --self-check
 COPY deploy/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# The tag this image is published under, for the assistant's claw_self_status
+# (packages/api/src/assistant/self-status.ts reads CLAW_BUILD first). CI passes
+# the yyyymmddHHMM tag it pushes (.github/workflows/build.yaml); without it the
+# running API reports its build as unknown. Empty by default: deploy/build.sh
+# writes packages/api/BUILD instead, which buildOf reads when CLAW_BUILD is
+# empty. Declared last so a new tag invalidates no earlier layer.
+ARG CLAW_BUILD=""
+ENV CLAW_BUILD=${CLAW_BUILD}
+
 # API : 8200   Brain : 8100   Hands : 9100
 EXPOSE 8100 8200 9100
 

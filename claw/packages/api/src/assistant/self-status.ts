@@ -57,7 +57,7 @@ const STATEMENT_TIMEOUT_MS = 5_000;
 const PROCESS_STARTED_AT = new Date(Date.now() - Math.round(process.uptime() * 1000)).toISOString();
 
 /**
- * The build running: CLAW_BUILD when the deployment sets it, else the tag `deploy/build.sh` wrote into the image as packages/api/BUILD
+ * The build running: CLAW_BUILD (set in the image by CI to the tag it publishes, see claw/Dockerfile), else the tag `deploy/build.sh` wrote into the image as packages/api/BUILD
  * (beside src/ and dist/, two levels up from this file in either), else null. Read once: an image does not change under a process.
  */
 export function buildOf(fromEnv: string = CLAW_BUILD, file: URL = new URL("../../BUILD", import.meta.url)): string | null {
