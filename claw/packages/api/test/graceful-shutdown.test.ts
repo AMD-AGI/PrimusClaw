@@ -14,6 +14,7 @@
  *   G3 while draining, /ready is 503, /health stays 200, and responses ask for a new connection
  *   G4 nothing that never finishes holds the exit past the deadline
  *   G5 the session event stream resumes from Last-Event-ID
+ *   G6 a route's own last frame (the command stream's `event: reconnect`), written on `closing`, comes before the end
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
@@ -68,6 +69,13 @@ async function rig(opts: { deadlineMs?: number; delayMs?: number } = {}): Promis
     reply.hijack();
     reply.raw.writeHead(200, { "Content-Type": "text/event-stream", Connection: "keep-alive" });
     reply.raw.write("id: claw-1\nevent: x\ndata: {}\n\n");
+  });
+  // The shape routes/remote-agents.ts's command stream uses: its own frame when the process starts closing.
+  app.get("/commands", async (_req, reply) => {
+    reply.hijack();
+    reply.raw.writeHead(200, { "Content-Type": "text/event-stream", Connection: "keep-alive" });
+    reply.raw.write("event: ready\ndata: {}\n\n");
+    shutdown.closing.addEventListener("abort", () => { reply.raw.write("event: reconnect\ndata: {}\n\n"); }, { once: true });
   });
   await app.listen({ host: "127.0.0.1", port: 0 });
   servers.push(app.server);
@@ -165,4 +173,23 @@ test("G5 the session event stream resumes from Last-Event-ID", () => {
   assert.equal(lastEventIdOf(["claw-7", "claw-8"]), "claw-7");
   assert.equal(lastEventIdOf(undefined), null);
   assert.equal(lastEventIdOf("x'; DROP TABLE"), null, "only ids this stream hands out");
+});
+
+test("G6 a route's own last frame, written when the shutdown signals `closing`, reaches the client before the end", { timeout: 30_000 }, async () => {
+  const r = await rig();
+  let received = "";
+  let ended = false;
+  await new Promise<void>((resolve, reject) => {
+    http.get(`${r.base}/commands`, { agent: false }, (res) => {
+      res.setEncoding("utf8");
+      res.on("data", (c) => { received += c; if (received.includes("ready")) resolve(); });
+      res.on("end", () => { ended = true; });
+    }).on("error", reject);
+  });
+  assert.equal(r.shutdown.closing.aborted, false);
+  await r.shutdown.begin("SIGTERM");
+  await until(() => ended);
+  assert.equal(r.shutdown.closing.aborted, true);
+  assert.ok(received.endsWith(`event: reconnect\ndata: {}\n\n${SSE_RECONNECT_FRAME}`), JSON.stringify(received));
+  assert.deepEqual(r.exits, [0]);
 });

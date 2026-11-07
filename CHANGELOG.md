@@ -83,6 +83,11 @@ record it.
   session.
 - Connector: a supervised connector stopped by a signal that did not come from `claw-connector stop` (a bare `kill`) exits 75 and is
   started again; before, it exited 0, which the supervisor took for a stop on purpose, and the machine stayed offline.
+- A Claw release no longer takes development environments offline. An API replica that is shutting down sends every connector
+  command stream it holds `event: reconnect` before it ends them, and keeps those connectors online (`stream_end_reason` `restart`)
+  while they open the stream on another replica, so a rolling update is neither an offline transition in
+  `claw_remote_connector_transitions` nor a reason to tell anyone; a connector that does not come back is offline once the 90 s
+  online window has passed, as before. Live releases had shown each connector offline for 2-7 s.
 - Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
   忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
   not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with
@@ -746,6 +751,10 @@ record it.
   development environment item no longer stays `in_progress` after its last instruction when stops and turn ends cross (#365);
   `claw-connector logout` revokes the connector at the Claw it registered with before it deletes the sign-in, and exits 1 with
   the remedy when it cannot (#367).
+- `@primusclaw/connector` 0.1.5: on `event: reconnect` (a Claw replica shutting down for a release) the connector opens its command
+  stream again at once, without the reconnect backoff and without waiting for the end of the response a gateway may hold (up to the
+  75 s watchdog before); `disconnects.jsonl` records it as `server_closed` / `restart`. A second such frame within 5 s takes the
+  usual backoff, so a release never becomes a burst of reconnects.
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,

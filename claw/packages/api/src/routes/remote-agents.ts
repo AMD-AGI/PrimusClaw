@@ -62,6 +62,12 @@ export interface RemoteAgentOptions {
   presenceSweepMs?: number;
   /** How long a connector stays offline before its owner is told. */
   offlineNoticeMs?: number;
+  /**
+   * Aborted when this process starts to shut down (`GracefulShutdown.closing`). Every command stream then sends
+   * `event: reconnect` and ends, and its connector is kept online (`markStreamClosed`'s `restart`) while it opens a
+   * stream on another replica, so a Claw release is neither an offline transition nor a notice.
+   */
+  closing?: AbortSignal;
 }
 
 /**
@@ -113,6 +119,8 @@ interface SseStream {
   key: string;
   first?: string[];
   pingFrame: () => string;
+  /** The last frame a stream sends when the process shuts down (`RemoteAgentOptions.closing`); without it the stream just ends. */
+  closingFrame?: () => string;
   /** Frames to send now, and whether more are already waiting; `stop` is a last frame that ends the stream. */
   poll: () => Promise<{ frames: string[]; more?: boolean; stop?: string }>;
   onPing?: () => Promise<void>;
@@ -123,7 +131,7 @@ interface SseStream {
 const MAX_WRITE_BACKLOG = 4 * 1024 * 1024;
 
 async function serveSse(
-  req: FastifyRequest, reply: FastifyReply, waker: Waker, t: { pingMs: number; pollMs: number }, s: SseStream,
+  req: FastifyRequest, reply: FastifyReply, waker: Waker, t: { pingMs: number; pollMs: number; closing?: AbortSignal }, s: SseStream,
 ): Promise<FastifyReply> {
   reply.hijack();
   const res = reply.raw;
@@ -141,8 +149,15 @@ async function serveSse(
     if (res.writableEnded || res.destroyed) return;
     try { res.write(frame); } catch { gone.abort(); }
   };
+  // The process is shutting down: say so (synchronously, before `GracefulShutdown` ends the response) and stop.
+  const onClosing = () => {
+    if (s.closingFrame) write(s.closingFrame());
+    gone.abort();
+  };
   try {
     for (const f of s.first ?? []) write(f);
+    if (t.closing?.aborted) onClosing();
+    else t.closing?.addEventListener("abort", onClosing, { once: true });
     let nextPing = Date.now() + t.pingMs;
     while (!gone.signal.aborted) {
       const out = await s.poll();
@@ -161,6 +176,7 @@ async function serveSse(
     // The client reconnects and resumes from its cursor; nothing here is lost.
     logger.warn({ err: (err as Error)?.message }, "remote_agents.stream_failed");
   } finally {
+    t.closing?.removeEventListener("abort", onClosing);
     await s.onClose?.().catch((err) => logger.warn({ err: (err as Error)?.message }, "remote_agents.stream_close_failed"));
     if (!res.writableEnded) res.end();
   }
@@ -179,7 +195,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   const maxConnectors = opts.maxConnectorsPerUser ?? REMOTE_AGENT_LIMITS.maxConnectorsPerUser;
   const maxActiveSessions = opts.maxActiveSessionsPerUser ?? REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser;
   const maxStreams = opts.maxStreamsPerUser ?? 20;
-  const timing = { pingMs, pollMs };
+  const timing = { pingMs, pollMs, closing: opts.closing };
 
   // Closed sessions and their events would otherwise be kept for ever. Every replica sweeps; the
   // delete is idempotent, so two sweeping at once only share the work. The timer neither keeps
@@ -342,6 +358,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
         key: `c:${cid}`,
         first: [sseFrame("ready", { v: REMOTE_AGENT_PROTOCOL_VERSION, connector_id: cid, server_time: new Date().toISOString() })],
         pingFrame: () => sseFrame("ping", { t: Date.now() }),
+        // A Claw release: reconnect now (to another replica), not after a backoff. Its connector stays online meanwhile.
+        closingFrame: () => { endReason = "restart"; return sseFrame("reconnect", { connector_id: cid }); },
         async poll() {
           // A stream opened with an access token ends when the token does (the
           // connector reconnects with a fresh one), and when the provider says

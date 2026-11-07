@@ -54,7 +54,7 @@ describe("claw-connector commands", () => {
     assert.match(u.errText(), /unknown command/);
     const v = ctx(home);
     assert.equal(await main(["--version"], v.c), EXIT.ok);
-    assert.equal(v.text(), "0.1.4");
+    assert.equal(v.text(), "0.1.5");
     assert.equal(await main(["--help"], ctx(home).c), EXIT.ok);
   });
 
