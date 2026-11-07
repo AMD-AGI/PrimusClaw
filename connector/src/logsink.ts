@@ -9,34 +9,26 @@
  * turns a failed write to a file-backed stdout into an 'error' event that nobody handles, and the process dies: on
  * 2026-11-07 run.log sat on an NFS share at its quota, and a connector died on the first line it printed (and earlier a
  * supervisor and its connector died together, leaving the machine offline until someone came by). A log line is never
- * worth the connection. So each line is written here: to its file descriptor first; when that fails, to a fallback file
- * on this machine's temporary directory (another disk, as a rule); when that fails too, it is dropped and counted. A file
- * that failed is tried again after {@link RETRY_PRIMARY_MS}, and the first line that lands there again says what happened
- * meanwhile, so the log comes back to its place once there is room.
+ * worth the connection. So each line is written here, and a line that cannot be written is kept in memory instead (the
+ * newest {@link HELD_LINES}; older ones are dropped and counted). The file is tried again after {@link RETRY_PRIMARY_MS};
+ * once it takes a line, a note says what happened meanwhile and the lines held are written after it.
+ *
+ * Nothing else is opened or written on the way: no fallback file another account could redirect, no second disk that
+ * could stall the process.
  */
 import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import tty from "node:tty";
 
-/** After a failed write, lines go to the fallback for this long before the original destination is tried again. */
+/** After a failed write, the descriptor is left alone for this long before it is tried again. */
 export const RETRY_PRIMARY_MS = 30_000;
-/** The fallback file is not written past this size: it sits on a temporary directory that may be small. */
-export const FALLBACK_MAX_BYTES = 64 * 1024 * 1024;
-
-/** Where lines go when stdout or stderr cannot be written: one file per user, shared by the supervisor and its runs. */
-export function fallbackLogFile(env: NodeJS.ProcessEnv = process.env): string {
-  const who = typeof process.getuid === "function" ? String(process.getuid()) : (env.USERNAME ?? env.USER ?? "user");
-  return path.join(os.tmpdir(), `claw-connector-${who}`, "fallback.log");
-}
+/** Lines kept in memory while the descriptor fails; older ones are dropped and counted. */
+export const HELD_LINES = 500;
 
 export interface LineSinkOptions {
   /** The descriptor the lines are meant for (1 or 2). */
   fd: number;
   /** The stream over that descriptor (process.stdout or process.stderr): a pipe or a terminal is written through it. */
   stream?: NodeJS.WriteStream;
-  /** Where lines go while the descriptor fails; null drops them. Default {@link fallbackLogFile}. */
-  fallback?: string | null;
   now?: () => number;
   /** Writes `data` to `fd` whole or throws (the tests make it fail). Default fs.writeSync in a loop. */
   writeFd?: (fd: number, data: string) => void;
@@ -56,15 +48,13 @@ const codeOf = (e: unknown): string => {
 };
 
 /**
- * A function that writes one line and never throws, never ends the process. Descriptors on a file (or a character
- * device) are written synchronously, as Node does for them, so a failure is known at once and the line goes to the
- * fallback; a pipe or a terminal goes through the stream, and once that stream has failed (a reader gone) everything
- * after goes to the fallback.
+ * A function that writes one line and never throws, never ends the process. A descriptor on a file (or a character
+ * device) is written synchronously, as Node writes it, so a failure is known at once; a pipe or a terminal goes through
+ * its stream, and once that stream has failed (its reader gone) the lines after it are dropped and counted.
  */
 export function lineSink(o: LineSinkOptions): (line: string) => void {
   const now = o.now ?? Date.now;
   const writeFd = o.writeFd ?? writeAll;
-  const fallback = o.fallback === undefined ? fallbackLogFile() : o.fallback;
   let direct = o.stream === undefined;
   if (!direct) {
     try {
@@ -77,60 +67,38 @@ export function lineSink(o: LineSinkOptions): (line: string) => void {
   o.stream?.on("error", () => { streamBroken = true; });
 
   let failedAt: number | null = null;
+  let since = "";
   let failure = "";
-  let firstFailureAt = "";
-  let toFallback = 0;
+  const held: string[] = [];
   let dropped = 0;
-  let fbFd: number | null = null;
-  let fbBytes = 0;
-  let fbBroken = false;
 
-  const writeFallback = (data: string): void => {
-    if (fallback === null || fbBroken) { dropped += 1; return; }
-    try {
-      if (fbFd === null) {
-        fs.mkdirSync(path.dirname(fallback), { recursive: true, mode: 0o700 });
-        fbFd = fs.openSync(fallback, "a", 0o600);
-        fbBytes = fs.fstatSync(fbFd).size;
-        const note = `${new Date(now()).toISOString()} claw-connector (pid ${process.pid}): fd ${o.fd} cannot be written (${failure}); its lines go here until it can\n`;
-        writeAll(fbFd, note);
-        fbBytes += Buffer.byteLength(note);
-      }
-      if (fbBytes + Buffer.byteLength(data) > FALLBACK_MAX_BYTES) { dropped += 1; return; }
-      writeAll(fbFd, data);
-      fbBytes += Buffer.byteLength(data);
-      toFallback += 1;
-    } catch {
-      fbBroken = true;
-      dropped += 1;
-    }
-  };
-
-  const fail = (e: unknown, data: string): void => {
-    if (failedAt === null) firstFailureAt = new Date(now()).toISOString();
-    failedAt = now();
-    failure = codeOf(e);
-    writeFallback(data);
+  const hold = (data: string): void => {
+    held.push(data);
+    if (held.length > HELD_LINES) { held.shift(); dropped += 1; }
   };
 
   return (line: string): void => {
     const data = line + "\n";
     if (!direct) {
-      if (streamBroken) { failure = "the stream failed"; writeFallback(data); return; }
-      try { o.stream!.write(data); } catch (e) { streamBroken = true; failure = codeOf(e); writeFallback(data); }
+      if (streamBroken) { dropped += 1; return; }
+      try { o.stream!.write(data); } catch { streamBroken = true; dropped += 1; }
       return;
     }
-    if (failedAt !== null && now() - failedAt < RETRY_PRIMARY_MS) { writeFallback(data); return; }
+    if (failedAt !== null && now() - failedAt < RETRY_PRIMARY_MS) { hold(data); return; }
     try {
       if (failedAt !== null) {
-        writeFd(o.fd, `${new Date(now()).toISOString()} claw-connector: this log could not be written from ${firstFailureAt} (${failure}): ${toFallback} line(s) went to ${fallback ?? "nowhere"}, ${dropped} dropped\n`);
+        writeFd(o.fd, `${new Date(now()).toISOString()} claw-connector: this log could not be written from ${since} (${failure}); the last ${held.length} line(s) follow, ${dropped} older one(s) dropped\n`);
+        // Each held line leaves the list only once written: a failure halfway keeps the rest for the next try.
+        while (held.length > 0) { writeFd(o.fd, held[0]!); held.shift(); }
         failedAt = null;
-        toFallback = 0;
         dropped = 0;
       }
       writeFd(o.fd, data);
     } catch (e) {
-      fail(e, data);
+      if (failedAt === null) since = new Date(now()).toISOString();
+      failedAt = now();
+      failure = codeOf(e);
+      hold(data);
     }
   };
 }

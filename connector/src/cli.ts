@@ -16,7 +16,7 @@ import { setLogLine } from "./util.js";
 inheritSystemCa(process.env, trustSystemCAs(process.env));
 
 // Every line the connector prints goes through these: a log file that cannot be written (a quota used up, a full disk)
-// sends its lines elsewhere instead of ending the process (logsink.ts).
+// holds its lines in memory until it can be written again, instead of ending the process (logsink.ts).
 const out = lineSink({ fd: 1, stream: process.stdout });
 const err = lineSink({ fd: 2, stream: process.stderr });
 setLogLine(err);

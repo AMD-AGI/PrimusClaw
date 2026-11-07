@@ -168,9 +168,14 @@ export class SnapshotFile {
       // A directory that is gone (removed on purpose: a reinstall, a test's cleanup) is not made again by a retry; the
       // next save writes it as before.
       this.running = fsp.access(path.dirname(this.file)).then(() => {
+        if (this.closed) { this.running = null; return; }
         this.failed = this.written;
         return this.drain();
-      }, () => { this.running = null; });
+      }, (e: NodeJS.ErrnoException) => {
+        this.running = null;
+        // Gone (ENOENT): left alone. Anything else (the disk not answering): tried again later.
+        if (e.code !== "ENOENT") this.retryLater();
+      });
     }, ms);
     this.retryTimer.unref?.();
   }
