@@ -322,9 +322,25 @@ jobs:
         working-directory: connector
 
       # Real child processes and sockets: a stand-in Claw and a stand-in ACP
-      # adapter, no database and no network beyond the loopback.
-      - run: npm test
+      # adapter, no database and no network beyond the loopback. TMPDIR is a
+      # directory of this step's own, so the check after the run sees only what
+      # the suite made: every directory a test makes is removed when its file
+      # ends (test/support/tmp.ts), and one left behind fails the job. tsx's and
+      # node's own caches are reused across runs and are not the suite's.
+      - name: npm test, leaving nothing in TMPDIR
         working-directory: connector
+        run: |
+          set -euo pipefail
+          export TMPDIR="$RUNNER_TEMP/connector-tmp"
+          mkdir -p "$TMPDIR"
+          npm test
+          left="$(find "$TMPDIR" -mindepth 1 -maxdepth 1 ! -name 'tsx-*' ! -name node-compile-cache -printf '%f\n' | sort)"
+          if [ -n "$left" ]; then
+            echo "::error::the connector tests left $(printf '%s\n' "$left" | wc -l) entries in TMPDIR ($(printf '%s\n' "$left" | grep -c '^cc-' || true) of them cc-*)"
+            printf '%s\n' "$left" | head -50
+            exit 1
+          fi
+          echo "TMPDIR is clean after the run: $(ls -A "$TMPDIR" | tr '\n' ' ')"
 
       - name: The bundle builds and runs
         working-directory: connector
