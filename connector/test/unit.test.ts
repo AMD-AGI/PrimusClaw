@@ -286,7 +286,8 @@ describe("the directory whitelist", () => {
 
   test("every refusal reason a phone can see has a hint, and a sign-in hint names that agent's own command", () => {
     for (const r of ["cwd_not_absolute", "cwd_not_found", "cwd_outside_roots", "cwd_ambiguous", "root_unavailable", "mode_unavailable", "mode_not_enforced",
-      "adapter_start_failed", "too_many_sessions", "unknown_agent", "resume_ref_required", "session_live", "invalid_cwd", "cwd_not_directory"]) {
+      "adapter_start_failed", "too_many_sessions", "unknown_agent", "resume_ref_required", "session_live", "invalid_cwd", "cwd_not_directory",
+      "terminal_did_not_exit", "session_live_elsewhere", "takeover_not_permitted", "takeover_failed"]) {
       assert.ok(hintFor(r), r);
     }
     assert.match(hintFor("agent_auth_required", { command: "npx", args: ["-y", "@agentclientprotocol/claude-agent-acp@0.99.0"] })!, /claude.*\/login|ANTHROPIC_API_KEY/);
