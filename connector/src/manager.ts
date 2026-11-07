@@ -104,6 +104,13 @@ export class SessionManager {
       return false;
     }
     if (!(s instanceof Session)) {
+      // Closing needs no disk: the record is closed and the phone told, whatever the folder's state.
+      if (type === "close") {
+        this.env.store.patch(sid, { status: "closed" });
+        this.env.audit.record("session_closed", { session_id: sid, reason: "closed" });
+        this.env.emit(sid, "session_closed", { reason: "closed" });
+        return false;
+      }
       // Its folder's disk does not answer now: this command is refused, the session stays for when it does.
       const seq = cmdSeqOf(cmd);
       this.env.audit.record("command_rejected", { type, cmd_id: cmdId, reason: s.unavailable });

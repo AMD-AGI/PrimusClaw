@@ -424,7 +424,6 @@ export class Session {
         } else {
           throw new SessionRefusal("adapter_cannot_resume", "the adapter can neither resume nor load a session");
         }
-        await this.refuseSignedOut(adapter);
       }
       await this.enforceMode(this.targetMode);
       if (this.closed) throw new SessionRefusal("session_closed");
@@ -463,7 +462,9 @@ export class Session {
 
   /**
    * An adapter that reports its sign-in (claude-agent-acp) and says there is none: the session would open, say it is
-   * ready and fail at its first message with "Authentication required". It is refused now instead, with the fix.
+   * ready and fail at its first message with "Authentication required". A new session is refused now instead, with the
+   * fix. A session that already exists (resumed after an idle recycle or a restart) is not: its prompts say why and it
+   * stays, so it carries on once someone signs in on the machine.
    */
   private async refuseSignedOut(adapter: AdapterProcess): Promise<void> {
     const st = await adapter.waitAuthStatus(this.env.timing.authWaitMs);
@@ -807,6 +808,8 @@ export class Session {
       const hint = hintFor(reason, this.agent);
       this.emit("turn_end", { stopReason: "error", error: reason, ...(hint ? { hint } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });
       this.env.store.endTurn(this.id);
+      // Not signed in (yet): the session stays, and the next message tries again once someone has signed in there.
+      if (reason === "agent_auth_required") return;
       return this.refuse(e);
     }
     const a = this.adapter!;

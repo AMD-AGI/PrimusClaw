@@ -137,7 +137,9 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       // FAKE_API_KEY_AUTH: sign in only through `authenticate {methodId: "api-key"}` with OPENAI_API_KEY set, as codex-acp.
       const authMethods = env.FAKE_API_KEY_AUTH === "1" ? [{ id: "api-key", name: "API Key", _meta: { "api-key": { provider: "openai" } } }, { id: "chat-gpt", name: "ChatGPT" }] : [];
       reply(id, { protocolVersion: 1, agentInfo: { name: "fake" }, authMethods, agentCapabilities: { loadSession: true, ...(env.FAKE_AUTH_STATUS ? { _meta: { authStatus: {} } } : {}), sessionCapabilities: env.FAKE_NO_RESUME === "1" ? { close: {} } : { resume: {}, close: {}, list: {} } } });
-      if (env.FAKE_AUTH_STATUS) setTimeout(() => send({ method: "_auth/status_update", params: { authStatus: { kind: env.FAKE_AUTH_STATUS, label: env.FAKE_AUTH_STATUS === "none" ? "Not logged in" : "API key" } } }), Number(env.FAKE_AUTH_STATUS_DELAY_MS || 50));
+      // FAKE_AUTH_STATUS_FILE: the status is read from that file when the process starts (a sign-in that changes later).
+      const kind = env.FAKE_AUTH_STATUS_FILE ? fs.readFileSync(env.FAKE_AUTH_STATUS_FILE, "utf8").trim() : env.FAKE_AUTH_STATUS;
+      if (env.FAKE_AUTH_STATUS) setTimeout(() => send({ method: "_auth/status_update", params: { authStatus: { kind, label: kind === "none" ? "Not logged in" : "API key" } } }), Number(env.FAKE_AUTH_STATUS_DELAY_MS || 50));
       return;
     }
     case "authenticate":
@@ -166,6 +168,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       return reply(id, { sessionId, modes: modesOf(s), configOptions: configOptions(s) });
     }
     case "session/resume": case "session/load": {
+      // A sign-in that lapsed before an existing session comes back (Codex's resume needs one).
+      if (env.FAKE_RESUME_AUTH === "1") return fail(id, -32000, "Authentication required");
       const s = sessions.get(params.sessionId) ?? { cwd: params.cwd, mode: START_MODE, cancelled: false };
       sessions.set(params.sessionId, s);
       // The trap measured on a real adapter: resuming puts the user's own configured mode back.

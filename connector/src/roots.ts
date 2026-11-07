@@ -109,33 +109,37 @@ export async function resolveCwd(cwd: string, roots: string[], o: ResolveOptions
       ...roots.filter((r) => path.basename(r) === clean),
     ])];
   }
-  let realRoots: string[];
-  try {
-    realRoots = (await Promise.all(roots.map((r) => realpathOf(r, ms, o.fs).catch((e) => { if (e instanceof Stalled) throw e; return null; })))).filter((r): r is string => r !== null);
-  } catch { return { ok: false, reason: "root_unavailable" }; }
+  // Each root on its own: one that is missing or stalled takes out its own folders, never those under a healthy root.
+  const realRoots: string[] = [];
+  const down: string[] = [];
+  await Promise.all(roots.map(async (r) => {
+    try { realRoots.push(await realpathOf(r, ms, o.fs)); } catch { down.push(path.resolve(r)); }
+  }));
+  const underDown = (p: string) => down.some((r) => inside(path.resolve(p), r));
   const hits = new Map<string, true>();
-  let missing = false;
-  try {
-    for (const c of candidates) {
-      let real: string;
-      try { real = await realpathOf(c, ms, o.fs); } catch (e) { if (e instanceof Stalled) throw e; missing = true; continue; }
-      if (!(await isDir(real, ms, o.fs))) { if (candidates.length === 1) return { ok: false, reason: "cwd_not_directory" }; continue; }
-      if (realRoots.some((r) => inside(real, r))) hits.set(real, true);
-      else if (candidates.length === 1) return { ok: false, reason: "cwd_outside_roots" };
-    }
-  } catch { return { ok: false, reason: "root_unavailable" }; }
-  if (hits.size === 1) return { ok: true, real: [...hits.keys()][0]! };
+  let unavailable = false;
+  for (const c of candidates) {
+    // A folder under a root that is not there (a mount not mounted yet, or not answering) is not looked at at all.
+    if (underDown(c)) { unavailable = true; continue; }
+    let real: string;
+    try { real = await realpathOf(c, ms, o.fs); } catch (e) { if (e instanceof Stalled) unavailable = true; continue; }
+    let dir: boolean;
+    try { dir = await isDir(real, ms, o.fs); } catch { unavailable = true; continue; }
+    if (!dir) { if (candidates.length === 1) return { ok: false, reason: "cwd_not_directory" }; continue; }
+    if (realRoots.some((r) => inside(real, r))) hits.set(real, true);
+    else if (candidates.length === 1) return { ok: false, reason: "cwd_outside_roots" };
+  }
   if (hits.size > 1) return { ok: false, reason: "cwd_ambiguous" };
-  // A root that does not exist (a network mount not mounted yet) makes a folder under it look missing.
-  if (realRoots.length < roots.length && missing) return { ok: false, reason: "root_unavailable" };
-  return { ok: false, reason: "cwd_not_found" };
+  // A name found under a healthy root while another root cannot be read could be ambiguous; the healthy one is taken.
+  if (hits.size === 1) return { ok: true, real: [...hits.keys()][0]! };
+  return { ok: false, reason: unavailable ? "root_unavailable" : "cwd_not_found" };
 }
 
 /**
  * The roots of these agents that cannot be used now, one sentence each, for `run` to print. A root that is missing or
  * does not answer is not a configuration error: a network mount may come back, and its sessions work again then.
  */
-export async function rootProblems(agents: Array<{ id: string; roots: string[] }>, timeoutMs = 5_000): Promise<string[]> {
+export async function rootProblems(agents: Array<{ id: string; roots: string[] }>, timeoutMs = 10_000): Promise<string[]> {
   const out: string[] = [];
   await Promise.all(agents.flatMap((a) => a.roots.map(async (r) => {
     try {

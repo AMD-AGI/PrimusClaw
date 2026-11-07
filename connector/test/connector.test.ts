@@ -1239,6 +1239,44 @@ describe("a first session that would fail at its first message", () => {
     assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0);
   });
 
+  test("signed out after the session opened: every message says why and the session stays, also once the adapter is started again", async () => {
+    const status = path.join(tmpdir("auth-"), "status");
+    fs.writeFileSync(status, "api_key");
+    const h = await make({ env: { FAKE_AUTH_STATUS: "file", FAKE_AUTH_STATUS_FILE: status, FAKE_PROMPT_AUTH: "1" } });
+    const sid = await h.newSession();
+    fs.writeFileSync(status, "none");
+    for (let n = 1; n <= 3; n++) {
+      h.prompt(sid, `hello ${n}`);
+      const end = await h.turnEnd(sid, n);
+      assert.equal(end.data.error, "agent_auth_required", JSON.stringify(end.data));
+    }
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0, "kept: it works again once someone signs in there");
+    // A "resume" from the phone brings it back too: only a new session is refused for a missing sign-in.
+    h.claw.issue("resume", sid, {});
+    await h.claw.until("resumed", () => h.claw.eventsOf(sid, "session_resumed")[0] ?? h.claw.eventsOf(sid, "session_closed")[0]);
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0, JSON.stringify(h.claw.eventsOf(sid).slice(-3)));
+    // After a restart the restored session is resumed, not refused, too.
+    await h.stop();
+    h.connect();
+    h.start();
+    h.prompt(sid, "after restart");
+    assert.equal((await h.turnEnd(sid, 4)).data.error, "agent_auth_required");
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0);
+  });
+
+  test("an adapter whose resume needs a sign-in it no longer has: the message says why and the session stays", async () => {
+    const h = await make({ env: { FAKE_RESUME_AUTH: "1" } });
+    const sid = await h.newSession();
+    await h.stop();
+    h.connect();
+    h.start();
+    h.prompt(sid, "after restart");
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.error, "agent_auth_required", JSON.stringify(end.data));
+    assert.match(end.data.hint, /not signed in/);
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0);
+  });
+
   test("a refused command carries a hint too", async () => {
     const h = await make();
     const sid = await h.newSession();

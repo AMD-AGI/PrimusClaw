@@ -247,10 +247,13 @@ All of these run on your machine and fail closed.
   resolved path. A folder can be given the way people type it: `~` and `~/x` are the agent's home directory (its
   `[agents.env]` `HOME`, else the connector's), and a relative name (`repo`, `repo/sub`) is looked up under each root and
   taken when exactly one has it (`cwd_ambiguous` when several do); a root's own last segment names that root. A relative
-  name never climbs out (`..`). Every look at the disk is asynchronous with a 10-second limit, so a root on a stalled
-  network mount refuses its own sessions (`root_unavailable`) and never freezes the connector or its heartbeat.
-- **Signed in before ready.** An agent that reports its sign-in (Claude Code does) and reports none is refused at once with
-  `agent_auth_required`, instead of opening and failing at its first message. A prompt refused for the same reason later
+  name never climbs out (`..`). Every look at the disk on the way to opening a session is asynchronous with a 10-second
+  limit, so a root on a stalled network mount refuses its own sessions (`root_unavailable`), never those under a healthy
+  root, and never freezes the connector or its heartbeat. A restored session whose root does not answer is kept: its
+  commands are rejected `root_unavailable` until it does, and `close` still closes it.
+- **Signed in before ready.** A new session of an agent that reports its sign-in (Claude Code does) and reports none is
+  refused at once with `agent_auth_required`, instead of opening and failing at its first message; a session that
+  already exists is kept and its prompts say why. A prompt refused for the same reason later
   (an expired login) ends its turn with `error: "agent_auth_required"` and the fix, and the next prompt starts the agent
   afresh, so a sign-in done on the machine meanwhile is picked up. An adapter that needs a sign-in and offers an
   `api-key` method (Codex) is told to `authenticate` with it when its environment has `OPENAI_API_KEY` or `CODEX_API_KEY`;

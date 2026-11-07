@@ -148,9 +148,15 @@ export class AdapterProcess {
   async waitAuthStatus(ms: number): Promise<AuthStatus | null> {
     if (this.authStatus || !this.reportsAuth || ms <= 0) return this.authStatus;
     await new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(t);
+        // A waiter that timed out leaves the list, so a long-lived adapter does not collect them.
+        const i = this.authWaiters.indexOf(done);
+        if (i >= 0) this.authWaiters.splice(i, 1);
+        resolve();
+      };
       const t = setTimeout(done, ms);
       t.unref?.();
-      function done() { clearTimeout(t); resolve(); }
       this.authWaiters.push(done);
     });
     return this.authStatus;

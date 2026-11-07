@@ -188,12 +188,21 @@ export class AttachSupport {
     return this.refreshing;
   }
 
+  /** Where the listing adapter starts: the first root that is there now (a root may be missing), else the home directory. */
+  private async listingDir(): Promise<string> {
+    for (const r of this.agent.roots) {
+      const v = await resolveCwd(r, [r], { home: os.homedir(), timeoutMs: 5_000 });
+      if (v.ok) return v.real;
+    }
+    return os.homedir();
+  }
+
   private async doRefresh(): Promise<void> {
     let adapter: AdapterProcess | null = null;
     this.noteHooks();
     try {
       adapter = await AdapterProcess.start({
-        cfg: this.agent, registry: this.d.registry, sessionId: `list-${this.agent.id}`, cwd: this.agent.roots[0] ?? os.homedir(),
+        cfg: this.agent, registry: this.d.registry, sessionId: `list-${this.agent.id}`, cwd: await this.listingDir(),
         hooks: NO_HOOKS, logFile: path.join(this.d.logDir, `adapter-${this.agent.id}.log`), version: this.d.version, initTimeoutMs: 30_000,
       });
       const caps = adapter.caps.sessionCapabilities as Record<string, unknown> | undefined;

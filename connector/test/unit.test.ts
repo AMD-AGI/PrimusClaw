@@ -266,6 +266,17 @@ describe("the directory whitelist", () => {
       assert.deepEqual(await resolveCwd(path.join(top, "dead", "x"), [path.join(top, "dead")], { home, timeoutMs: 150, fs: hung }), { ok: false, reason: "root_unavailable" });
       assert.equal(calls, before, "the stalled root is not asked again while its first look hangs");
     });
+    test("one stalled or missing root takes out only its own folders: a folder under a healthy root opens, and a deleted one there is cwd_not_found", async () => {
+      const dead = path.join(top, "dead2");
+      const hung = { realpath: (p: string) => (p.startsWith(dead) ? new Promise<string>(() => {}) : fs.promises.realpath(p)), stat: fs.promises.stat } as unknown as Pick<typeof fs.promises, "realpath" | "stat">;
+      const both = [dead, work2];
+      assert.deepEqual(await resolveCwd("only-here", both, { home, timeoutMs: 100, fs: hung }), { ok: true, real: fs.realpathSync(path.join(work2, "only-here")) });
+      assert.deepEqual(await resolveCwd(path.join(work2, "repo"), both, { home, timeoutMs: 100, fs: hung }), { ok: true, real: fs.realpathSync(path.join(work2, "repo")) });
+      assert.deepEqual(await resolveCwd(path.join(dead, "x"), both, { home, timeoutMs: 100, fs: hung }), { ok: false, reason: "root_unavailable" });
+      const missing = [path.join(top, "mnt-missing"), work2];
+      assert.deepEqual(await resolveCwd(path.join(work2, "deleted"), missing, { home }), { ok: false, reason: "cwd_not_found" });
+      assert.deepEqual(await resolveCwd(path.join(top, "mnt-missing", "x"), missing, { home }), { ok: false, reason: "root_unavailable" });
+    });
     test("a root that is missing is reported once per agent, not fatal", async () => {
       const ps = await rootProblems([{ id: "a", roots: [root, path.join(top, "mnt")] }]);
       assert.equal(ps.length, 1);
