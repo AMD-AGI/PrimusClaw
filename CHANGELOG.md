@@ -655,6 +655,10 @@ record it.
   `run` warn per agent when the machine's Claude Code settings default to `bypassPermissions` (user `settings.json` or the
   managed settings file) and the agent has no `approval = "never"`, so every session of that agent would be closed with
   `mode_not_enforced`. Before, such a machine showed online and nothing said so before the first session (#247).
+- `@primusclaw/connector` 0.1.4: every `turn_end` of a prompt's turn names the prompt it ends (`cmd_seq`, `cmd_id`), so a
+  development environment item no longer stays `in_progress` after its last instruction when stops and turn ends cross (#365);
+  `claw-connector logout` revokes the connector at the Claw it registered with before it deletes the sign-in, and exits 1 with
+  the remedy when it cannot (#367).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
