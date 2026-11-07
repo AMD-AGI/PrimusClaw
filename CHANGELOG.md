@@ -115,6 +115,8 @@ record it.
   and says so. Two folders on one machine were two machines of one name. A name chosen with `--name` or an agents.toml is kept.
 - A paired machine whose configuration is on the container's own file system is told to keep it elsewhere and then ask the chat for a
   new pairing command, not to "run init and login again", which it never did.
+- `GET /v1/remote-agents/connectors` says of each machine whether it was connected with a pairing code (`paired`), so a client can
+  tell how to connect it again: a new pairing command, not `claw-connector login`.
 - "让开发机上的 claude 跑 make test" with no machine connected answers the same one-line pairing command, not the four setup steps.
   devenv_send refused `no_machine` because the user has no machine at all now carries in `data.connect_a_machine` the pairing made
   for them (`commands` the one line, `text_zh` and `text_en` with it in a code block, `pairing` its minutes), under the same gate

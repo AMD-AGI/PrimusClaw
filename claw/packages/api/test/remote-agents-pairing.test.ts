@@ -109,7 +109,7 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     const cid = reg.body.data.connector_id as string;
     assert.equal((await heartbeat(token, cid)).status, 200);
     const mine = await call("GET", "/v1/remote-agents/connectors", { user: "alice" });
-    assert.deepEqual(mine.body.data.map((x: any) => [x.connector_id, x.name]), [[cid, "laptop"]]);
+    assert.deepEqual(mine.body.data.map((x: any) => [x.connector_id, x.name, x.paired]), [[cid, "laptop", true]], "listed as paired");
     assert.deepEqual((await call("GET", "/v1/remote-agents/connectors", { user: "bob" })).body.data, []);
     const audit = (await q("SELECT action, detail FROM claw_remote_audit WHERE owner_user_id = 'alice' ORDER BY id")).rows;
     assert.deepEqual(audit.map((a) => a.action), ["pairing.created", "pairing.claimed", "connector.registered"]);
