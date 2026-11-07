@@ -804,7 +804,9 @@ export class Session {
       } catch { /* fall through to notifications */ }
     }
     const deadline = Date.now() + this.env.timing.modeConfirmMs;
-    while (Date.now() < deadline) {
+    // Not past the end of the session or of its adapter (refused meanwhile, or killed by a stop): nothing can confirm a
+    // mode then, and a look that went on would end the opening, and the command, long after the run that took it.
+    while (Date.now() < deadline && !this.closed && this.adapter === a) {
       const last = this.modeSeen[this.modeSeen.length - 1];
       if (last !== undefined) return last;
       await sleep(25);
@@ -1330,6 +1332,8 @@ export class Session {
 
   /** A session that cannot be opened (or kept safe) is closed with the reason, never left half-open. */
   private async refuse(e: unknown): Promise<void> {
+    // Already closed (refused while it was opening): the opening's own failure that follows is not a second refusal.
+    if (this.closed) return;
     const r = e instanceof SessionRefusal ? e : mapAdapterError(e);
     this.env.log.warn("session refused", { session: this.id, reason: r.reason, message: r.message });
     this.audit("session_refused", { reason: r.reason, message: r.message.slice(0, 300) });

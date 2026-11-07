@@ -103,7 +103,8 @@ export async function cleanupTmp(): Promise<void> {
 }
 
 after(cleanupTmp);
-// A crash, or a process.exit before the hooks ran; also catches a directory a late writer recreated after `after`.
+// A crash, or a process.exit before the hooks ran. A directory a late writer recreates after `after` is not looked at
+// again: it is left for the CI step to report, as something still writing after its test has ended.
 process.on("exit", () => {
   try { killRecordedAdapters(); } catch { /* the directories go regardless */ }
   removeAll();

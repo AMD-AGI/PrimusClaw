@@ -77,6 +77,11 @@ export class SessionManager {
     return next;
   }
 
+  /** Resolves once every command taken so far has been carried out (a stopping run waits for them). */
+  idle(): Promise<void> {
+    return Promise.all([...this.chains.values()]).then(() => undefined);
+  }
+
   private async dispatch(cmd: Command, handled: () => void): Promise<void> {
     let deferred = false;
     try {

@@ -1294,7 +1294,11 @@ describe("the conversations already on the machine show up by themselves", () =>
     const old = { sessionId: REF, cwd: work, title: "Old one", updatedAt: "2026-10-29T10:00:00.000Z" };
     fs.writeFileSync(listFile, JSON.stringify([old]));
     const h = await Harness.create({
-      work, env: { FAKE_SESSIONS_FILE: listFile }, attach: { sessions: [] }, timing: { heartbeatMs: 60_000, sessionsWatchMs: 100, catalogMs: 600_000 }, start: false,
+      work, env: { FAKE_SESSIONS_FILE: listFile }, attach: { sessions: [] }, start: false,
+      // Only the watcher may wake a heartbeat here: the timer is a minute away, and so is the stream's watchdog. With the
+      // tests' 700 ms watchdog a stalled event loop (a busy runner; this process is the stand-in Claw too) reopened the
+      // stream, and its `ready` frame woke a heartbeat the watcher was blamed for (CI 2026-11-07: 3 where 2 were taken).
+      timing: { heartbeatMs: 60_000, watchdogMs: 60_000, sessionsWatchMs: 100, catalogMs: 600_000 },
     });
     hs.push(h);
     const project = path.join(h.attachDir, "projects", real.replace(/[^A-Za-z0-9]/g, "-"));
@@ -1311,6 +1315,7 @@ describe("the conversations already on the machine show up by themselves", () =>
     // Appending to a transcript is no new conversation and lists nothing again.
     fs.appendFileSync(path.join(project, `${REF}.jsonl`), "{}\n");
     await new Promise((r) => setTimeout(r, 500));
+    assert.equal(h.claw.streamHeaders.length, 1, "the stream was never reopened (its ready frame wakes a heartbeat too)");
     assert.equal(h.claw.heartbeats.length, before, "nothing changed that the phone is shown");
     fs.writeFileSync(listFile, JSON.stringify([{ sessionId: REF2, cwd: work, title: "Ran and ended", updatedAt: "2026-10-29T11:00:00.000Z" }, old]));
     fs.writeFileSync(path.join(project, `${REF2}.jsonl`), "{}\n");
