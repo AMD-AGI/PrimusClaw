@@ -25,7 +25,7 @@ In Clawy (or another chat client built on Claw), say **连接我的开发环境*
 with a one-time code in it, for example:
 
 ```sh
-npm install -g @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
+npm install -g --no-update-notifier @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
 ```
 
 Run it in a terminal on the machine, in the folder the agents may work in. That is the whole setup: it installs the connector,

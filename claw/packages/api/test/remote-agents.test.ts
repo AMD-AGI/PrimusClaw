@@ -158,6 +158,7 @@ describe("remote agents", { skip }, () => {
       await connector("u2");
       const list = (await as("u1").get("/v1/remote-agents/connectors")).body.data;
       assert.equal(list.length, 5);
+      assert.ok(list.every((c: any) => c.paired === false), "signed in, not paired");
       assert.equal((await as("u1").del(`/v1/remote-agents/connectors/${list[0].connector_id}`)).status, 200);
       await connector("u1", "again");
     });

@@ -551,7 +551,7 @@ describe("development environment items and devenv_send", { skip }, () => {
         assert.equal(e.code, "no_machine", e.message);
         return { message: String(e.message), connect: e.data.connect_a_machine as Recorded };
       };
-      const line = /^npm install -g @primusclaw\/connector@latest && claw-connector pair ([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}) --server https:\/\/claw\.example\.com\/claw-api$/;
+      const line = /^npm install -g --no-update-notifier @primusclaw\/connector@latest && claw-connector pair ([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}) --server https:\/\/claw\.example\.com\/claw-api$/;
       const steps = /claw-connector (init|login)|service install/;
 
       const zh = await refused(await userTurn(alice, "让开发机上的 claude 跑一下 make test"), "跑一下 make test");
@@ -1697,7 +1697,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v10");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v11");
     // The plain-words control: a new session, a session named by when it was used, back to the assistant with nothing to run.
     assert.match(section, /new_session: true when they ask for a new session/);
     assert.match(section, /昨天那个会话/);

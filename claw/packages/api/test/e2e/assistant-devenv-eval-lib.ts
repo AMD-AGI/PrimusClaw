@@ -16,7 +16,7 @@ import {
 } from "../../src/assistant/prompts.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
 import { messagesLlm, promptFor, userTurn, type Block, type Llm, type Message, type ModelResponse, type ToolSchema } from "./assistant-router-eval-lib.js";
-import { PAIRED_NOTE, pairingText, sendConnectMessage, STATUS_NOTE } from "../../src/assistant/devenv-tools.js";
+import { ALL_OFFLINE_NOTE, allOfflineText, PAIRED_NOTE, pairingText, RESTART_COMMAND, sendConnectMessage, STATUS_NOTE } from "../../src/assistant/devenv-tools.js";
 import { CHANNEL_ACTIONS, DEVENV_LIST, ITEM_DEVENV, MANIFEST, NOW, PAIR_COMMAND, type DevenvCase, type Want } from "./assistant-devenv-eval-cases.js";
 
 export { messagesLlm, type Llm, type ToolSchema };
@@ -49,6 +49,21 @@ export const noMachineList = (zh: boolean) => ({
   connect_a_machine: { commands: [PAIR_COMMAND], text: pairingText(PAIR_COMMAND, 10, zh), pairing: PAIRING },
   note: STATUS_NOTE + PAIRED_NOTE,
 });
+/** A user whose one machine is offline (`devenvList`, every machine offline): how to bring it back and a pairing for a new one. */
+export const OFFLINE_MACHINE = "routeguard-eval";
+export const allOfflineList = (zh: boolean) => ({
+  ok: true, detail: "status", total: 1, online: 0,
+  machines: [{ machine: OFFLINE_MACHINE, online: false, last_seen: "2026-11-07T07:40:00.000Z", version: "0.1.7",
+    agents: [{ agent: "claude", kind: "claude", name: "Claude Code", attach_command: null, why_not: "the machine is offline" }],
+    sessions: [{ label: `${OFFLINE_MACHINE}/claude/1`, agent: "claude", agent_name: "Claude Code", cwd: "/root/work", opened_in: "chat",
+      state: "idle", last_activity: "2026-11-07T07:39:00.000Z", ref: null, attach_command: null, why_not: "the machine is offline" }] }],
+  attach_default: null,
+  connect_a_machine: {
+    commands: [RESTART_COMMAND, PAIR_COMMAND], text: allOfflineText([OFFLINE_MACHINE], pairingText(PAIR_COMMAND, 10, zh), zh),
+    pairing: PAIRING, all_offline: true,
+  },
+  note: STATUS_NOTE + ALL_OFFLINE_NOTE,
+});
 export const noMachineSend = () => {
   const made = { commands: [PAIR_COMMAND], text: { zh: pairingText(PAIR_COMMAND, 10, true), en: pairingText(PAIR_COMMAND, 10, false) }, pairing: PAIRING };
   return {
@@ -61,11 +76,25 @@ export const noMachineSend = () => {
 export class DevenvStub {
   private untrusted = false;
   private n = 0;
-  constructor(private readonly world: { none?: boolean; zh?: boolean } = {}) {}
+  constructor(private readonly world: { none?: boolean; offline?: boolean; zh?: boolean } = {}) {}
   call(tool: string, input: Record<string, unknown>): { result: unknown; refused: boolean; code?: string } {
     const refuse = (code: string, message: string, extra: Record<string, unknown> = {}) => ({ result: { ok: false, error: code, message, ...extra }, refused: true, code });
     const ok = (result: unknown) => ({ result, refused: false });
     const str = (k: string) => (typeof input[k] === "string" ? (input[k] as string).trim() : "");
+    if (this.world.offline) {
+      switch (tool) {
+        case "devenv_list":
+          this.untrusted = true;
+          return ok({ ...allOfflineList(this.world.zh === true), detail: input.detail === "activity" ? "activity" : "status" });
+        case "devenv_send":
+          this.untrusted = true;
+          return refuse("connector_offline", `the machine ${OFFLINE_MACHINE} is offline (last seen 2026-11-07T07:40:00.000Z): nothing was sent; running claw-connector there brings it back`, { choices: [OFFLINE_MACHINE] });
+        case "devenv_pair":
+          return ok({ command: PAIR_COMMAND.replace("K7QM-4XRT-9WCD", `P${++this.n}QM-4XRT-9WCD`), expires_at: "2026-11-07T09:10:00.000Z", expires_in_minutes: 10, single_use: true });
+        default:
+          break;
+      }
+    }
     if (this.world.none) {
       switch (tool) {
         case "devenv_list":
@@ -164,7 +193,7 @@ function history(c: DevenvCase): Message[] {
 }
 
 export async function runDevenvCase(c: DevenvCase, o: { llm: Llm; tools: ToolSchema[]; maxTurns?: number }): Promise<Trace> {
-  const stub = new DevenvStub({ none: c.world === "none", zh: c.lang === "zh" });
+  const stub = new DevenvStub({ none: c.world === "none", offline: c.world === "offline", zh: c.lang === "zh" });
   const system = devenvSystem();
   const messages: Message[] = [...history(c), { role: "user", content: userTurn(await devenvPrompt(c)) }];
   const trace: Trace = { calls: [], turns: 0, said: "" };

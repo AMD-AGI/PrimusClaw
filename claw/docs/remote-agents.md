@@ -220,12 +220,22 @@ router's `devenv_pair` tool, or `devenv_list` itself when the person has no mach
 pairing command; both only in a turn answering a message they sent signed in, recently); the client calls `POST /v1/remote-agents/pairings` as that person and shows the answer's `command`:
 
 ```
-npm install -g @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
+npm install -g --no-update-notifier @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
 ```
 
 Running it on the machine is the approval. `claw-connector pair` posts `{code, name}` to `POST /v1/remote-agents/pairings/claim`,
 which is anonymous (the code is the credential), writes `agents.toml` if there is none (the agents found on the machine, working in
 the folder the command was run in), saves the answer's grant (mode 0600) and starts the connector as a service.
+
+A machine whose name nobody chose (no `--name`, no `agents.toml`: the hostname) also sends `alternate_name`, the hostname and the
+folder (or the user, in the home directory). When another live machine of the person's already has the hostname (case aside), the
+claim pairs it under the alternate, numbered (`-2`, ...) if that is taken too, and answers the name in `data.name`; the connector
+writes that name into `agents.toml`. `GET /v1/remote-agents/connectors` says of each machine whether it was paired (`paired`):
+connecting it again is a new pairing command, not `claw-connector login`.
+
+When every machine of the person's is offline, `devenv_list` carries `connect_a_machine` with `all_offline: true`: its `text` is
+one line that brings the offline machine back (`claw-connector service install` on it), then the pairing command for a new one (or,
+where the turn may not pair, the setup commands), and the router gives it as it is, in one reply.
 
 - **Code**: 12 characters of Crockford base32 (60 bits), shown as `XXXX-XXXX-XXXX`; case, dashes and O/I/L-for-0/1 do not matter.
   Good for 10 minutes and one claim; a person has at most 3 live, and a new one retires the oldest. Only its SHA-256 is stored

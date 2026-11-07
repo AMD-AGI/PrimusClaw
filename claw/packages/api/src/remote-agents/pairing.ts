@@ -67,7 +67,7 @@ export const hashGrant = (token: string): string => sha256(`grant:${token}`);
 /** The one line a person runs on the machine. Installs (or updates) the connector, then pairs and starts it. */
 export function pairCommand(server: string, code: string): string {
   const url = server.replace(/\/+$/, "");
-  return `npm install -g ${CONNECTOR_PACKAGE}@latest && claw-connector pair ${code} --server ${url}`;
+  return `npm install -g --no-update-notifier ${CONNECTOR_PACKAGE}@latest && claw-connector pair ${code} --server ${url}`;
 }
 
 export async function ensurePairingSchema(q: Querier): Promise<void> {
@@ -134,16 +134,39 @@ export async function createPairing(owner: string, client: string | null, now: D
   return { code, expires_at: expires.toISOString() };
 }
 
-export type ClaimOutcome = { ok: true; token: string; grantId: string; owner: string } | { ok: false; error: "invalid_code" };
+export type ClaimOutcome = { ok: true; token: string; grantId: string; owner: string; name: string | null } | { ok: false; error: "invalid_code" };
+
+const cleanName = (v: unknown): string => (typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, NAME_MAX) : "");
+
+/**
+ * The name a machine pairs under. A connector that chose no name itself (`pair` without --name or an agents.toml) sends its
+ * hostname and an `alternate` (hostname plus its folder or user): when another live machine of the owner's already has the
+ * hostname (two folders on one machine, two containers with one hostname), the alternate is used, numbered if that is taken too.
+ * Without an alternate the name is kept as it is (the connector's agents.toml says it, and it registers under it).
+ */
+async function pairedName(q: Querier, owner: string, name: string, alternate: string): Promise<string> {
+  if (!name || !alternate || alternate.toLowerCase() === name.toLowerCase()) return name;
+  const taken = new Set(((await q(
+    "SELECT lower(name) AS n FROM claw_remote_connectors WHERE owner_user_id = $1 AND revoked_at IS NULL", [owner],
+  )).rows as Array<{ n: string }>).map((r) => r.n));
+  if (!taken.has(name.toLowerCase())) return name;
+  for (let i = 1; i < 100; i++) {
+    const tail = i === 1 ? "" : `-${i}`;
+    const candidate = `${alternate.slice(0, NAME_MAX - tail.length)}${tail}`;
+    if (!taken.has(candidate.toLowerCase())) return candidate;
+  }
+  return name;
+}
 
 /**
  * Trade a code for a connector grant. One answer for a code that never existed, has run out or was used: whoever holds a
  * wrong code learns nothing from which it was.
  */
-export async function claimPairing(rawCode: unknown, deviceName: unknown, now: Date = new Date()): Promise<ClaimOutcome> {
+export async function claimPairing(rawCode: unknown, deviceName: unknown, now: Date = new Date(), alternateName: unknown = null): Promise<ClaimOutcome> {
   const code = normalizeCode(rawCode);
   if (!code) return { ok: false, error: "invalid_code" };
-  const name = typeof deviceName === "string" ? deviceName.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, NAME_MAX) : "";
+  const asked = cleanName(deviceName);
+  const alternate = cleanName(alternateName);
   const token = `${GRANT_PREFIX}${randomBytes(32).toString("base64url")}`;
   const grantId = randomUUID();
   return inTransaction(async (q) => {
@@ -153,6 +176,9 @@ export async function claimPairing(rawCode: unknown, deviceName: unknown, now: D
       [hashCode(code), now, grantId],
     )).rows[0] as { owner_user_id: string } | undefined;
     if (!row) return { ok: false, error: "invalid_code" } as const;
+    // Under the owner's lock, as a registration counts their machines (`store.ts`): two pairings at once do not both take a name.
+    await q("SELECT pg_advisory_xact_lock(7001, hashtext($1))", [`pairings:${row.owner_user_id}`]);
+    const name = await pairedName(q, row.owner_user_id, asked, alternate);
     await q(
       "INSERT INTO claw_remote_grants (grant_id, owner_user_id, token_hash, device_name, created_at) VALUES ($1, $2, $3, $4, $5)",
       [grantId, row.owner_user_id, hashGrant(token), name || null, now],
@@ -161,7 +187,7 @@ export async function claimPairing(rawCode: unknown, deviceName: unknown, now: D
       owner: row.owner_user_id, actor: row.owner_user_id, client: "connector", action: "pairing.claimed",
       detail: { grant_id: grantId, device_name: name || null },
     });
-    return { ok: true, token, grantId, owner: row.owner_user_id } as const;
+    return { ok: true, token, grantId, owner: row.owner_user_id, name: name || null } as const;
   });
 }
 

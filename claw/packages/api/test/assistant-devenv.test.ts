@@ -458,7 +458,7 @@ describe("devenv_list", { skip }, () => {
       const alice = await w.user("alice");
       const zh = (await call(await userTurn(alice, "连接我的开发环境"))).body;
       assert.equal(zh.total, 0);
-      const line = /^npm install -g @primusclaw\/connector@latest && claw-connector pair ([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}) --server https:\/\/claw\.example\.com\/claw-api$/;
+      const line = /^npm install -g --no-update-notifier @primusclaw\/connector@latest && claw-connector pair ([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}) --server https:\/\/claw\.example\.com\/claw-api$/;
       assert.equal(zh.connect_a_machine.commands.length, 1, "one line, not the setup steps");
       const m = line.exec(zh.connect_a_machine.commands[0]);
       assert.ok(m, zh.connect_a_machine.commands[0]);
@@ -483,6 +483,59 @@ describe("devenv_list", { skip }, () => {
         if (v === undefined) delete process.env[k]; else process.env[k] = v;
       }
     }
+  });
+
+  test("D8e every machine offline: one reply brings the offline one back AND gives the pairing command for a new one", async () => {
+    const keep = { pub: process.env.CLAW_PUBLIC_URL, iss: process.env.IDENTITY_ISSUER_URL };
+    process.env.CLAW_PUBLIC_URL = "https://claw.example.com/claw-api";
+    process.env.IDENTITY_ISSUER_URL = "https://id.example.com";
+    try {
+      const alice = await w.user("alice");
+      await machine("alice", "routeguard-eval", { agents: [{ id: "claude", kind: "claude", name: "Claude Code" }] });
+      const zh = (await call(await userTurn(alice, "连接我的开发环境"))).body;
+      assert.deepEqual([zh.total, zh.online], [1, 0]);
+      const c = zh.connect_a_machine;
+      assert.ok(c, "a user whose machines are all offline is told how to connect one");
+      assert.equal(c.all_offline, true);
+      const line = /^npm install -g --no-update-notifier @primusclaw\/connector@latest && claw-connector pair [0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4} --server https:\/\/claw\.example\.com\/claw-api$/;
+      assert.equal(c.commands[0], "claw-connector service install", "the restart, first");
+      assert.ok(line.test(c.commands[1]), c.commands[1]);
+      assert.deepEqual(c.pairing, { expires_in_minutes: 10, single_use: true });
+      const [restart, ...rest] = c.text.split("\n");
+      assert.equal(restart, "你的开发机 routeguard-eval 离线：在那台机器上运行 `claw-connector service install` 就能让它重新上线。");
+      assert.match(rest[0], /^要连接一台新机器：在要连接的机器上/);
+      assert.ok(c.text.includes("```\n" + c.commands[1] + "\n```"), c.text);
+      assert.doesNotMatch(c.text, /上次|还是/, "never another conversation's story");
+      assert.match(zh.note, /Every machine of the user's is offline[^]*bring the offline machine back AND how to connect a new one[^]*Do not call devenv_pair/);
+      assert.match(zh.note, /Never say it is "still" offline/);
+      // English, and two offline machines.
+      await machine("alice", "desk", { agents: [] });
+      const en = (await call(await userTurn(alice, "connect my dev environment"))).body;
+      assert.match(en.connect_a_machine.text, /^Your machines routeguard-eval, desk are offline: run `claw-connector service install` on each to bring them back\.\nTo connect a new machine instead: On the machine you want to connect/);
+      // One online machine: nothing to pair, the list as before.
+      const bob = await w.user("bob");
+      await machine("bob", "laptop", { online: true, agents: [{ id: "claude", kind: "claude", name: "Claude Code" }] });
+      await machine("bob", "old", { agents: [] });
+      const some = (await call(await userTurn(bob, "连接我的开发环境"))).body;
+      assert.equal(some.connect_a_machine, undefined);
+      assert.doesNotMatch(some.note, /Every machine of the user's is offline/);
+    } finally {
+      for (const [k, v] of [["CLAW_PUBLIC_URL", keep.pub], ["IDENTITY_ISSUER_URL", keep.iss]] as const) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+  });
+
+  test("D8f every machine offline in a turn that may not pair: the restart line and the setup commands", async () => {
+    const alice = await w.user("alice");
+    await machine("alice", "box", { agents: [] });
+    const report = await w.routerTurn(alice);
+    const b = (await call(report)).body;
+    assert.equal(b.connect_a_machine.all_offline, true);
+    assert.equal(b.connect_a_machine.pairing, undefined);
+    assert.equal(b.connect_a_machine.commands[0], "claw-connector service install");
+    assert.ok(b.connect_a_machine.commands.length > 2, "the setup steps follow");
+    assert.match(b.connect_a_machine.text, /^Your machine box is offline: run `claw-connector service install` on it to bring it back\.\nTo connect a new machine instead: /);
   });
 
   test("D8c no machine and no pairing for this turn (a report, a key, an old message, no public address, the limit): the setup commands", async () => {

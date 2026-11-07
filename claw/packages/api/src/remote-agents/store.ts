@@ -204,7 +204,9 @@ export const LAST_SEEN_SQL = "GREATEST(c.heartbeat_at, c.stream_seen_at, c.strea
 export async function listConnectors(owner: string, onlineWindowMs: number): Promise<Row[]> {
   const rows = (await direct(
     `SELECT c.connector_id, c.name, c.version, c.heartbeat_at, c.created_at, ${ONLINE_SQL},
-            ${LAST_SEEN_SQL} AS last_seen_at, c.presence_state, c.offline_since, c.offline_reason, c.stream_end_reason
+            ${LAST_SEEN_SQL} AS last_seen_at, c.presence_state, c.offline_since, c.offline_reason, c.stream_end_reason,
+            -- Connected with a pairing code (a connector grant), not a login: connecting it again is a new pairing command.
+            EXISTS (SELECT 1 FROM claw_remote_grants g WHERE g.connector_id = c.connector_id) AS paired
        FROM claw_remote_connectors c WHERE c.owner_user_id = $2 AND c.revoked_at IS NULL ORDER BY c.created_at`,
     [secs(onlineWindowMs), owner],
   )).rows;
