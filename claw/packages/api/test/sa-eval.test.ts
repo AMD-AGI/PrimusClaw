@@ -259,9 +259,11 @@ test("S9b the review-as-X set, the multi-turn scripts and the recent-issue cases
   const sim = of("sim");
   assert.ok(sim.length >= 15, `${sim.length} multi-turn scripts`);
   for (const c of sim) assert.ok(c.turns.length >= 3 && c.turns.length <= 6, `${c.id}: ${c.turns.length} turns`);
-  // Every new case is graded by something a run can decide: a fact with a value or a runnable oracle, a tool it must or must not
-  // call, or that every item it started is closed.
-  for (const c of [...review, ...sim, ...cases.filter((x) => /-y8-/.test(x.id))]) {
+  const recent = cases.filter((x) => /-y8-/.test(x.id));
+  assert.ok(recent.length >= 15, `${recent.length} recent-issue cases`);
+  // Every new case has a fact a run decides (a value to find in the answer, or an oracle the runner reads), or is graded on every
+  // item it started being closed; tools_must alone does not count.
+  for (const c of [...review, ...sim, ...recent]) {
     const decidable = (c.facts ?? []).some((f) => (f.oracle?.kind !== "api" && f.oracle?.value !== undefined) || oracleQuery({ kind: "api", query: (f.oracle?.query ?? "").replace(/\{\{[\w.]+\}\}|\{[A-Z_]+\}/g, "x") }));
     assert.ok(decidable || c.items_closed, `${c.id}: no fact a run can decide`);
   }
