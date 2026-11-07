@@ -81,8 +81,8 @@ export class ClawClient {
     }
   }
 
-  private async json(method: string, path: string, body?: unknown): Promise<Record<string, unknown>> {
-    const res = await this.send(method, path, body);
+  private async json(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const res = await this.send(method, path, body, signal);
     if (!res.ok) throw new HttpError(res.status, await errorCode(res), path);
     const parsed: unknown = await res.json().catch(() => null);
     return isObject(parsed) && isObject(parsed.data) ? parsed.data : {};
@@ -101,6 +101,19 @@ export class ClawClient {
   async postEvents(cid: string, batchId: string, events: OutEvent[]): Promise<EventsAck> {
     const d = await this.json("POST", `/v1/remote-agents/connectors/${cid}/events`, { batch_id: batchId, events });
     return { acked: (isObject(d.acked) ? d.acked : {}) as Record<string, number>, rejected: (Array.isArray(d.rejected) ? d.rejected : []) as EventsAck["rejected"] };
+  }
+
+  /**
+   * Whether command `cmdId`, received late (after a stall, held in the network, or past the live TTL), may still be carried out:
+   * Claw's answer, `live` or why not (`session_closed`, `cancelled`, `expired`, `gone`). `received_late`: it was already older than
+   * the live TTL when it came (only then may Claw call it `expired`). Throws {@link RevokedError} when this connector was revoked,
+   * and {@link HttpError} 404 with a code other than `not_found` from a Claw that has no such route.
+   */
+  async confirmCommand(cid: string, cmdId: string, q: { why: string; received_late: boolean }, signal?: AbortSignal): Promise<string> {
+    const timeout = AbortSignal.timeout(this.o.requestTimeoutMs ?? 20_000);
+    const d = await this.json("POST", `/v1/remote-agents/connectors/${encodeURIComponent(cid)}/commands/${encodeURIComponent(cmdId)}/confirm`, q,
+      signal ? AbortSignal.any([signal, timeout]) : timeout);
+    return typeof d.status === "string" ? d.status : "unknown";
   }
 
   /**

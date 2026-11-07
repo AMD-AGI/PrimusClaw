@@ -9,7 +9,7 @@ import os from "node:os";
 import { withHint } from "./hints.js";
 import { resolveCwd } from "./roots.js";
 import { REMOTE_COMMAND_TYPES, isRemoteCommandType } from "./protocol.js";
-import { sha256, errMessage } from "./util.js";
+import { sha256, errMessage, verdictOf, type MayRun } from "./util.js";
 
 export interface Command {
   cmd_id: string;
@@ -61,19 +61,30 @@ export class SessionManager {
    * Commands of one session run one after another; sessions run side by side.
    * `handled` is called exactly once, when the command counts as carried out: for most that is when the
    * handler returns; for a prompt it is when the prompt reaches the adapter (see Session.enqueuePrompt).
+   * `now`: run at once, not after the session's earlier commands (a `cancel` or `close` that must not wait behind a command whose
+   * confirmation with Claw is still being asked, connector.ts `confirmLive`); the session's later commands still follow its chain.
    */
-  handle(cmd: Command, handled: () => void = () => {}): Promise<void> {
+  handle(cmd: Command, handled: () => void = () => {}, mayRun?: MayRun, now = false): Promise<void> {
     const sid = cmd.session_id;
     let done = false;
     const once = () => { if (!done) { done = true; handled(); } };
-    const prev = this.chains.get(sid) ?? Promise.resolve();
-    const next = prev.then(() => this.dispatch(cmd, once)).catch((e) => {
+    const prev = now ? Promise.resolve() : this.chains.get(sid) ?? Promise.resolve();
+    // `mayRun` (connector.ts `gateFor`) is asked in the session's turn, so what comes after it waits for the answer; refused, the
+    // command is handled without running. A prompt carries it on and asks again when it reaches the agent (Session.enqueuePrompt).
+    const next = prev.then(async () => {
+      const verdict = mayRun ? await verdictOf(mayRun) : "run";
+      if (verdict === "drop") return once();
+      if (verdict === "keep") return; // the connector is stopping: not handled, so it is delivered to the next run
+      return this.dispatch(cmd, once, mayRun);
+    }).catch((e) => {
       this.env.log.error("command failed", { type: cmd.type, session: sid, error: errMessage(e) });
       this.env.audit.record("command_failed", { type: cmd.type, session_id: sid, cmd_id: cmd.cmd_id, error: errMessage(e).slice(0, 300) });
       once();
     });
-    this.chains.set(sid, next);
-    void next.finally(() => { if (this.chains.get(sid) === next) this.chains.delete(sid); });
+    // Run ahead, but what the session receives after it still waits for it (and for what was already in the chain).
+    const tail = now ? Promise.all([this.chains.get(sid), next]).then(() => undefined) : next;
+    this.chains.set(sid, tail);
+    void tail.finally(() => { if (this.chains.get(sid) === tail) this.chains.delete(sid); });
     return next;
   }
 
@@ -82,17 +93,17 @@ export class SessionManager {
     return Promise.all([...this.chains.values()]).then(() => undefined);
   }
 
-  private async dispatch(cmd: Command, handled: () => void): Promise<void> {
+  private async dispatch(cmd: Command, handled: () => void, mayRun?: MayRun): Promise<void> {
     let deferred = false;
     try {
-      deferred = await this.run(cmd, handled);
+      deferred = await this.run(cmd, handled, mayRun);
     } finally {
       if (!deferred) handled();
     }
   }
 
   /** Returns true when `handled` will be called later by the session itself (a prompt). */
-  private async run(cmd: Command, handled: () => void): Promise<boolean> {
+  private async run(cmd: Command, handled: () => void, mayRun?: MayRun): Promise<boolean> {
     const { type, session_id: sid, cmd_id: cmdId } = cmd;
     // What a prompt says is never written to the audit trail, only its hash and size.
     const detail = type === "prompt" && typeof cmd.text === "string" ? { sha256: sha256(cmd.text), length: cmd.text.length } : {};
@@ -125,7 +136,7 @@ export class SessionManager {
     switch (type) {
       case "prompt":
         if (typeof cmd.text !== "string" || cmd.text === "") { s.rejectCommand("prompt", cmdId, "text_required", cmdSeqOf(cmd)); return false; }
-        s.enqueuePrompt(cmd.text, cmdId, handled, cmdSeqOf(cmd));
+        s.enqueuePrompt(cmd.text, cmdId, handled, cmdSeqOf(cmd), mayRun);
         return true;
       case "cancel":
         await s.cancel();

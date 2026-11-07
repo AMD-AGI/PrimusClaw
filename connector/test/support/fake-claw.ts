@@ -59,6 +59,33 @@ export class FakeClaw {
   readonly revocations: Array<{ method: string; id: string; auth: string | undefined }> = [];
   cursor = 0;
   nextSeq = 1;
+  /** Sessions closed on Claw's side (the person closed one, or removed the machine): their commands are no longer live. */
+  readonly closedSessions = new Set<string>();
+  /** What `POST .../commands/:cmd_id/confirm` answers for a command, instead of judging it. */
+  readonly commandStatus = new Map<string, string>();
+  /** Every confirmation asked, in order, and what was answered. */
+  readonly confirmations: Array<{ cmd_id: string; status: string }> = [];
+  /** Every confirmation asked, answered or not yet. */
+  readonly confirmAsked: string[] = [];
+  /** What each confirmation asked was sent with (`why`, `received_late`), in order. */
+  readonly confirmBodies: Array<{ cmd_id: string; body: any }> = [];
+  /** Whether `POST .../commands/:cmd_id/confirm` exists; false is a Claw from before it (404 from the router, not `not_found`). */
+  confirmRoute = true;
+  /**
+   * The network holds what the next command stream's first frames (its `ready` and the commands sent on connect) carry for this
+   * long: they are made (and stamped) at once, and written this much later.
+   */
+  streamDelayMs = 0;
+  /** Whether command frames carry `sent_at`; false is a Claw from before it (and before the confirm route). */
+  sentAt = true;
+  /** Every frame after the `ready` of the next command stream reaches the connector this much later (a buffering link). */
+  streamLagMs = 0;
+  /** Answer the next N confirmations with 503 (Claw, or the network to it, not there yet). */
+  failConfirms = 0;
+  /** Hold every confirmation's answer until `releaseConfirms` (a slow Claw). */
+  holdConfirms = false;
+  private heldConfirms: Array<() => void> = [];
+  releaseConfirms(): void { const h = this.heldConfirms; this.heldConfirms = []; for (const f of h) f(); }
   private readonly streams = new Set<http.ServerResponse>();
   private readonly sockets = new Set<import("node:net").Socket>();
   private server!: http.Server;
@@ -84,7 +111,7 @@ export class FakeClaw {
 
   issue(type: string, sessionId: string, payload: Record<string, unknown> = {}): number {
     const seq = this.nextSeq++;
-    this.commands.push({ seq, payload: { ...payload, cmd_id: payload.cmd_id ?? randomUUID(), type, session_id: sessionId, v: 1 } });
+    this.commands.push({ seq, payload: { issued_at: Date.now(), ...payload, cmd_id: payload.cmd_id ?? randomUUID(), type, session_id: sessionId, v: 1 } });
     this.wake();
     return seq;
   }
@@ -118,8 +145,20 @@ export class FakeClaw {
   get revoked(): boolean { return this.revokedIds.has(this.connectorId); }
   set revoked(v: boolean) { if (v) this.revokedIds.add(this.connectorId); else this.revokedIds.delete(this.connectorId); }
 
+  /** As Claw judges a command a connector asks about: live while held and its session open (`store.commandLiveness`). */
+  liveness(cmdId: string): string {
+    const set = this.commandStatus.get(cmdId);
+    if (set) return set;
+    const c = this.commands.find((x) => x.payload.cmd_id === cmdId);
+    if (!c || c.seq <= this.cursor) return "gone";
+    if (this.closedSessions.has(String(c.payload.session_id)) && c.payload.type !== "close" && c.payload.type !== "cancel") return "session_closed";
+    return "live";
+  }
+
   revoke(): void {
     this.revoked = true;
+    // As on the real server: a revoked connector's sessions close with it.
+    for (const c of this.commands) this.closedSessions.add(String(c.payload.session_id));
     for (const r of this.streams) { try { r.write(`event: revoked\ndata: {}\n\n`); r.end(); } catch { /* gone */ } }
     this.streams.clear();
   }
@@ -180,6 +219,25 @@ export class FakeClaw {
       this.revoke();
       return this.json(res, 200, { ok: true });
     }
+    const cf = /^\/v1\/remote-agents\/connectors\/([^/]+)\/commands\/([^/]+)\/confirm$/.exec(path);
+    if (cf && req.method === "POST") {
+      if (!this.confirmRoute) return this.json(res, 404, { message: `Route POST:${path} not found`, error: "Not Found", statusCode: 404 });
+      if (this.failConfirms > 0) { this.failConfirms--; this.confirmAsked.push(decodeURIComponent(cf[2]!)); this.wake(); return this.json(res, 503, { ok: false, error: "unavailable" }); }
+      if (this.revokedIds.has(cf[1]!)) return this.json(res, 401, { ok: false, error: "revoked" });
+      if (cf[1] !== this.connectorId) return this.json(res, 404, { ok: false, error: "not_found" });
+      const cmdId = decodeURIComponent(cf[2]!);
+      this.confirmBodies.push({ cmd_id: cmdId, body: await this.readBody(req) });
+      this.confirmAsked.push(cmdId);
+      this.wake();
+      const answer = () => {
+        const status = this.liveness(cmdId);
+        this.confirmations.push({ cmd_id: cmdId, status });
+        this.wake();
+        try { this.json(res, 200, { ok: true, data: { cmd_id: cmdId, status } }); } catch { /* the connector went */ }
+      };
+      if (this.holdConfirms) { this.heldConfirms.push(answer); return; }
+      return answer();
+    }
     const m = /^\/v1\/remote-agents\/connectors(?:\/([^/]+)\/(heartbeat|events|commands))?$/.exec(path);
     if (!m) return this.json(res, 404, { ok: false, error: "not_found" });
     if (!m[1]) {
@@ -222,21 +280,36 @@ export class FakeClaw {
       case "commands": {
         this.streamHeaders.push(req.headers);
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-        res.write(`event: ready\ndata: ${JSON.stringify({ v: 1, connector_id: this.connectorId })}\n\n`);
+        const delay = this.streamDelayMs;
+        this.streamDelayMs = 0;
+        const held: string[] = [];
+        let released = delay <= 0;
+        const lag = this.streamLagMs;
+        this.streamLagMs = 0;
+        const out = (chunk: string) => { if (lag > 0) setTimeout(() => { if (!res.destroyed) res.write(chunk); }, lag); else res.write(chunk); };
+        let readySent = false;
+        const write = (chunk: string) => {
+          if (!released) held.push(chunk);
+          else if (!readySent) { readySent = true; res.write(chunk); } else out(chunk);
+        };
+        if (!released) setTimeout(() => { released = true; if (!res.destroyed) for (const c of held) res.write(c); }, delay);
+        write(`event: ready\ndata: ${JSON.stringify({ v: 1, connector_id: this.connectorId, server_time: new Date().toISOString() })}\n\n`);
         this.streams.add(res);
         res.on("close", () => { this.streams.delete(res); this.wake(); });
         let sent = 0;
+        // `sent_at` stamped as the frame is written, as the real server does: how long the frame then takes is the connector's to see.
+        const frame = (c: { seq: number; payload: Record<string, unknown> }) => `id: ${c.seq}\nevent: command\ndata: ${JSON.stringify(this.sentAt ? { sent_at: Date.now(), ...c.payload } : c.payload)}\n\n`;
         const pump = () => {
           if (res.destroyed || res.writableEnded) return;
           for (const c of this.commands) {
             if (c.seq <= this.cursor || c.seq <= sent) continue;
             sent = c.seq;
-            res.write(`id: ${c.seq}\nevent: command\ndata: ${JSON.stringify(c.payload)}\n\n`);
+            write(frame(c));
           }
         };
         // Everything still held is sent on every connect, in order; a cursor in the heartbeat is what forgets one.
-        for (const c of this.commands) if (c.seq > this.cursor) { sent = c.seq; res.write(`id: ${c.seq}\nevent: command\ndata: ${JSON.stringify(c.payload)}\n\n`); }
-        const pinger = setInterval(() => { if (!this.muted) res.write(`event: ping\ndata: {}\n\n`); }, this.pingMs);
+        for (const c of this.commands) if (c.seq > this.cursor) { sent = c.seq; write(frame(c)); }
+        const pinger = setInterval(() => { if (!this.muted) write(`event: ping\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`); }, this.pingMs);
         const poller = setInterval(pump, 10);
         res.on("close", () => { clearInterval(pinger); clearInterval(poller); });
         return;

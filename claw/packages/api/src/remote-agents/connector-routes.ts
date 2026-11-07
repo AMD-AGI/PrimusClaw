@@ -13,6 +13,8 @@ export const CONNECTOR_SIDE_ROUTES = {
   heartbeat: { method: "POST", url: "/v1/remote-agents/connectors/:cid/heartbeat" },
   events: { method: "POST", url: "/v1/remote-agents/connectors/:cid/events" },
   commands: { method: "GET", url: "/v1/remote-agents/connectors/:cid/commands" },
+  /** Before carrying out a command it received late (after its machine slept or stalled): may it still run? (`store.commandLiveness`) */
+  confirm: { method: "POST", url: "/v1/remote-agents/connectors/:cid/commands/:cmd_id/confirm" },
   /** `claw-connector logout`: a device sign-in has no credential the user-side DELETE accepts. */
   revoke: { method: "POST", url: "/v1/remote-agents/connectors/:cid/revoke" },
 } as const;

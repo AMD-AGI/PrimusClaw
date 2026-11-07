@@ -123,6 +123,16 @@ describe("remote agents", { skip }, () => {
   const post = (user: string, cid: string, events: unknown[], batch = "b1") =>
     as(user).post(`/v1/remote-agents/connectors/${cid}/events`, { batch_id: batch, events });
   const online1 = async () => { nextSeq = new Map(); return online(); };
+  /** A frame's `issued_at`, checked to be when Claw queued it (its clock, ms; the database and this test share a host). */
+  const issuedAt = (frame: { issued_at?: unknown }): number => {
+    assert.ok(typeof frame.issued_at === "number" && Math.abs(Date.now() - frame.issued_at) < 60_000, `issued_at ${String(frame.issued_at)}`);
+    return frame.issued_at;
+  };
+  /** A frame's `sent_at`, checked to be when this replica wrote it (its clock, ms). */
+  const sentAt = (frame: { sent_at?: unknown }): number => {
+    assert.ok(typeof frame.sent_at === "number" && Math.abs(Date.now() - frame.sent_at) < 60_000, `sent_at ${String(frame.sent_at)}`);
+    return frame.sent_at;
+  };
   // (The tests of what was never delivered read Claw's own ends of turns: the `user_prompt` each prompt also records is not one.)
   /** The presence sweep recorded the connector going offline `minutesAgo` (its laptop closed), as it does every 15 s. */
   const wentOffline = (cid: string, minutesAgo: number) => q(
@@ -505,13 +515,13 @@ describe("remote agents", { skip }, () => {
       assert.equal(created.id, "1");
       assert.deepEqual(created.json(), {
         agent_id: "a1", cwd: "/work/repo", mode: null,
-        v: 1, cmd_id: created.json().cmd_id, type: "session.new", session_id: sid,
+        v: 1, cmd_id: created.json().cmd_id, type: "session.new", session_id: sid, issued_at: issuedAt(created.json()), sent_at: sentAt(created.json()),
       });
       const sent = await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "do it" });
       assert.equal(sent.status, 202);
       const prompt = await stream.nextEvent("command");
       assert.equal(prompt.id, "2");
-      assert.deepEqual(prompt.json(), { text: "do it", v: 1, cmd_id: sent.body.data.cmd_id, type: "prompt", session_id: sid });
+      assert.deepEqual(prompt.json(), { text: "do it", v: 1, cmd_id: sent.body.data.cmd_id, type: "prompt", session_id: sid, issued_at: issuedAt(prompt.json()), sent_at: sentAt(prompt.json()) });
     });
 
     test("a session that names an existing session passes the reference to the connector as given, and a malformed one is refused", async () => {
@@ -522,7 +532,7 @@ describe("remote agents", { skip }, () => {
       const cmd = (await stream.nextEvent("command")).json();
       assert.deepEqual(cmd, {
         agent_id: "a1", cwd: "/work/repo", mode: null, resume_ref: ref,
-        v: 1, cmd_id: cmd.cmd_id, type: "session.new", session_id: made.body.data.session_id,
+        v: 1, cmd_id: cmd.cmd_id, type: "session.new", session_id: made.body.data.session_id, issued_at: issuedAt(cmd), sent_at: sentAt(cmd),
       });   // (no takeover unless asked for: the connector then only watches a conversation a terminal has open)
       assert.equal("resume_ref" in made.body.data, false, "the row does not keep it: the connector does");
       const audited = (await as("u1").get(`/v1/remote-agents/audit?session_id=${made.body.data.session_id}`)).body.data;
@@ -1255,7 +1265,7 @@ describe("remote agents", { skip }, () => {
       const frame = (await stream.nextEvent("command")).json();
       assert.deepEqual(frame, {
         action_id: "act-1", option_id: "allow-once", by: "u1", client: null,
-        v: 1, cmd_id: "dec:" + sid + ":act-1", type: "decision", session_id: sid,
+        v: 1, cmd_id: "dec:" + sid + ":act-1", type: "decision", session_id: sid, issued_at: issuedAt(frame), sent_at: sentAt(frame),
       });
     });
 
@@ -1576,6 +1586,114 @@ describe("remote agents", { skip }, () => {
       assert.equal((await q("SELECT COUNT(*) AS n FROM claw_remote_commands WHERE connector_id = $1", [cid])).rows[0].n, "0", "queued commands dropped");
       // The intruder is told nothing different from a missing id.
       assert.deepEqual((await heartbeat("u2", cid)).body, { ok: false, error: "not_found" });
+    });
+
+    test("a command received late is confirmed before it runs: live while its session is open, refused once it closed or was cancelled, 401 once revoked", async () => {
+      const { cid, stream } = await online1();
+      const sid = await session("u1", cid);
+      const opened = (await stream.nextEvent("command")).json();
+      assert.equal(opened.type, "session.new");
+      // Each frame says when Claw queued it, on Claw's clock, so a connector can tell one older than the live TTL.
+      issuedAt(opened);
+      const confirm = (cmdId: string, user = "u1", body?: Record<string, unknown>) =>
+        as(user).post(`/v1/remote-agents/connectors/${cid}/commands/${encodeURIComponent(cmdId)}/confirm`, body);
+      const sent = async (body: Record<string, unknown>) => {
+        assert.equal((await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, body)).status, 202);
+        return (await stream.nextEvent("command")).json();
+      };
+      const p1 = await sent({ type: "prompt", text: "ls" });
+      assert.deepEqual((await confirm(p1.cmd_id)).body, { ok: true, data: { cmd_id: p1.cmd_id, status: "live" } });
+      assert.equal((await confirm(opened.cmd_id)).body.data.status, "live");
+      // Another user asking about this connector is told nothing different from a missing one.
+      assert.deepEqual((await confirm(p1.cmd_id, "u2")).body, { ok: false, error: "not_found" });
+      assert.equal((await confirm("never-issued")).body.data.status, "gone");
+      // A set_mode and a resume queued before a cancel are still wanted (the connector's cancel drops only queued prompts).
+      const m1 = await sent({ type: "set_mode", mode_id: "ask" });
+      const r1 = await sent({ type: "resume" });
+      // A cancel queued after it: the prompt is no longer wanted; the cancel itself always is.
+      const c1 = await sent({ type: "cancel" });
+      assert.equal((await confirm(p1.cmd_id)).body.data.status, "cancelled");
+      assert.equal((await confirm(c1.cmd_id)).body.data.status, "live");
+      assert.equal((await confirm(m1.cmd_id)).body.data.status, "live", "a set_mode queued before the cancel is not cancelled");
+      assert.equal((await confirm(r1.cmd_id)).body.data.status, "live", "nor a resume");
+      // A withdraw (takes back the prompts that have not started) after a prompt: the prompt is not wanted either.
+      const pw = await sent({ type: "prompt", text: "taken back" });
+      const w1 = await sent({ type: "withdraw" });
+      assert.equal((await confirm(pw.cmd_id)).body.data.status, "cancelled");
+      assert.equal((await confirm(w1.cmd_id)).body.data.status, "live");
+      await q("DELETE FROM claw_remote_commands WHERE cmd_id = ANY($1::text[])", [[pw.cmd_id, w1.cmd_id]]);
+      // Past the live TTL, a prompt that reached the connector that late is expired.
+      await q("UPDATE claw_remote_commands SET created_at = NOW() - interval '6 minutes' WHERE cmd_id = $1", [p1.cmd_id]);
+      assert.equal((await confirm(p1.cmd_id)).body.data.status, "expired");
+      assert.equal((await confirm(p1.cmd_id, "u1", { received_late: true, why: "old" })).body.data.status, "expired");
+      await q("DELETE FROM claw_remote_commands WHERE cmd_id = ANY($1::text[])", [[m1.cmd_id, r1.cmd_id]]);
+      // The person closes the session: what would make its agent act is dead at once (deleted from the queue, refused when asked
+      // about); the close is delivered.
+      const p2 = await sent({ type: "prompt", text: "rm -rf build" });
+      assert.equal((await confirm(p2.cmd_id)).body.data.status, "live");
+      const closed = await sent({ type: "close" });
+      assert.deepEqual((await q("SELECT type FROM claw_remote_commands WHERE connector_id = $1 AND session_id = $2 ORDER BY cmd_seq", [cid, sid])).rows.map((r) => r.type),
+        ["cancel", "close"]);
+      assert.equal((await confirm(p2.cmd_id)).body.data.status, "gone");
+      assert.equal((await confirm(opened.cmd_id)).body.data.status, "gone");
+      assert.equal((await confirm(closed.cmd_id)).body.data.status, "live");
+      const refused = (await q("SELECT detail FROM claw_remote_audit WHERE action = 'command.refused_late' ORDER BY id")).rows.map((r) => [r.detail.cmd_id, r.detail.status]);
+      // Only commands Claw holds are audited: an id it never issued (or no longer holds) writes nothing, so the route cannot fill the trail.
+      assert.deepEqual(refused, [[p1.cmd_id, "cancelled"], [pw.cmd_id, "cancelled"], [p1.cmd_id, "expired"], [p1.cmd_id, "expired"]]);
+      // A session its machine reported closed.
+      const sid3 = await session("u1", cid);
+      assert.equal((await stream.nextEvent("command")).json().session_id, sid3);
+      assert.equal((await as("u1").post(`/v1/remote-agents/sessions/${sid3}/commands`, { type: "prompt", text: "ls" })).status, 202);
+      const p4 = (await stream.nextEvent("command")).json();
+      assert.equal((await post("u1", cid, [ev(sid3, "session_closed", { reason: "adapter_exited" })])).status, 200);
+      // Its machine closed it: the prompt queued before is deleted with the session's other acting commands, so it is never sent
+      // again and, asked about, it is `gone` (the connector drops it and says so either way).
+      assert.deepEqual((await q("SELECT type FROM claw_remote_commands WHERE session_id = $1", [sid3])).rows, []);
+      assert.equal((await confirm(p4.cmd_id)).body.data.status, "gone");
+      assert.ok((await q("SELECT detail FROM claw_remote_audit WHERE action = 'command.confirmed'")).rows.some((r) => r.detail.cmd_id === p1.cmd_id), "a live answer is recorded");
+      // The machine is removed: whatever it still holds in a buffer is answered 401 revoked, which stops it.
+      const sid2 = await session("u1", cid);
+      const p3 = await (async () => {
+        assert.equal((await stream.nextEvent("command")).json().session_id, sid2);
+        assert.equal((await as("u1").post(`/v1/remote-agents/sessions/${sid2}/commands`, { type: "prompt", text: "ls" })).status, 202);
+        return (await stream.nextEvent("command")).json();
+      })();
+      // Answered under the connector row's lock, the one a revocation takes: one in progress is waited for, and once it has
+      // committed the answer is 401 `revoked`, never `live`.
+      const revoking = await h.connect();
+      try {
+        await revoking.query("BEGIN");
+        await revoking.query("UPDATE claw_remote_connectors SET revoked_at = NOW() WHERE connector_id = $1", [cid]);
+        let settled = false;
+        const asked = confirm(p3.cmd_id).finally(() => { settled = true; });
+        await new Promise((r) => setTimeout(r, 400));
+        assert.equal(settled, false, "the answer waits for the revocation in progress");
+        await revoking.query("COMMIT");
+        const r = await asked;
+        assert.deepEqual([r.status, r.body], [401, { ok: false, error: "revoked" }], "never live once the revocation committed");
+      } finally {
+        await revoking.query("ROLLBACK").catch(() => undefined); // (a failed assertion leaves no lock behind; the cluster closes it)
+      }
+      assert.deepEqual([(await confirm(p3.cmd_id)).status, (await confirm(p3.cmd_id)).body], [401, { ok: false, error: "revoked" }]);
+    });
+
+    test("a prompt received in time and queued on the machine behind a turn longer than the TTL is live when asked about after a stall; expired only if it came late", async () => {
+      // FS-Q2 review (2026-11-07): the connector read P2 at once and queued it behind P1, a turn of more than 5 minutes; a short
+      // stall meanwhile made it ask, and Claw answered `expired` by P2's age, so P2 was dropped though it was delivered in time.
+      const { cid, stream } = await online1();
+      const sid = await session("u1", cid);
+      assert.equal((await stream.nextEvent("command")).json().type, "session.new");
+      const confirm = (cmdId: string, body?: Record<string, unknown>) =>
+        as("u1").post(`/v1/remote-agents/connectors/${cid}/commands/${encodeURIComponent(cmdId)}/confirm`, body);
+      assert.equal((await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "queued behind a long turn" })).status, 202);
+      const pq = (await stream.nextEvent("command")).json();
+      await q("UPDATE claw_remote_commands SET created_at = NOW() - interval '7 minutes' WHERE cmd_id = $1", [pq.cmd_id]);
+      assert.equal((await confirm(pq.cmd_id, { received_late: false, why: "stall" })).body.data.status, "live", "received in time: never expired");
+      assert.equal((await confirm(pq.cmd_id, { received_late: true, why: "old" })).body.data.status, "expired", "it came past the TTL");
+      assert.equal((await confirm(pq.cmd_id)).body.data.status, "expired", "a connector that does not say is taken to have got it late");
+      assert.equal((await confirm(pq.cmd_id, { received_late: false, why: "Not a reason!" })).body.data.status, "live", "a malformed why is ignored");
+      const late = (await q("SELECT detail FROM claw_remote_audit WHERE action IN ('command.confirmed', 'command.refused_late') AND detail->>'cmd_id' = $1 ORDER BY id", [pq.cmd_id])).rows.map((r) => [r.detail.status, r.detail.received_late, r.detail.why ?? null]);
+      assert.deepEqual(late, [["live", false, "stall"], ["expired", true, "old"], ["expired", true, null], ["live", false, null]]);
     });
 
     test("an idle stream reads the database only every few seconds, and a write through this process still reaches it at once", async () => {

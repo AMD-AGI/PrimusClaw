@@ -74,3 +74,17 @@ export function secureUrl(raw: string, what: string): string {
   }
   return raw.replace(/\/+$/, "");
 }
+
+/**
+ * Whether a command may still act, asked when it is about to (connector.ts `gateFor`): `run` at once on the usual path, or Claw's
+ * answer after a stall. `drop`: refused, and reported already; the caller only counts the command as handled. `keep`: no answer
+ * because the connector is stopping; the command is neither run nor counted as handled, so the next run gets it again.
+ */
+export type Verdict = "run" | "drop" | "keep";
+export type MayRun = () => Verdict | Promise<Verdict>;
+
+/** `mayRun`'s answer, awaited only when it is one to wait for: the usual path asks nothing and waits for no I/O. */
+export const verdictOf = async (mayRun: MayRun): Promise<Verdict> => {
+  const r = mayRun();
+  return typeof r === "string" ? r : await r;
+};
