@@ -14,7 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { loadConfig, type ConnectorConfig } from "./config.js";
+import { parseConfig, type ConnectorConfig } from "./config.js";
 import { saveCredentials } from "./credentials.js";
 import { clearNeedsLogin } from "./health.js";
 import { configFile, credentialsFile, identityFile } from "./paths.js";
@@ -82,9 +82,12 @@ export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise
   const code = positionals[0]?.trim();
   if (!code || positionals.length > 1) { ctx.err(USAGE); return 2; }
   const cfgFile = configFile(ctx.dirs);
+  // Read once, with no separate existence check: whatever is there now is what `pair` keeps.
   let cfg: ConnectorConfig | null = null;
-  if (fs.existsSync(cfgFile)) {
-    try { cfg = loadConfig(cfgFile, { hostname: ctx.hostname ?? os.hostname() }); } catch (e) { ctx.err(`${cfgFile}: ${errMessage(e)}`); return 78; }
+  let text: string | null = null;
+  try { text = fs.readFileSync(cfgFile, "utf8"); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+  if (text !== null) {
+    try { cfg = parseConfig(text, { hostname: ctx.hostname ?? os.hostname() }); } catch (e) { ctx.err(`${cfgFile}: ${errMessage(e)}`); return 78; }
   }
   const rawServer = values.server ?? ctx.env.CLAW_URL ?? cfg?.server ?? null;
   if (!rawServer) { ctx.err(`pair needs --server <Claw API URL>\n${USAGE}`); return 2; }
@@ -132,9 +135,15 @@ export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise
     if (none) agents = ["claude"];
     const root = defaultRoot(ctx.cwd ?? process.cwd());
     fs.mkdirSync(path.dirname(cfgFile), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(cfgFile, pairedConfig({ server, name, agents, root }), { mode: 0o600, flag: "wx" });
-    ctx.out(`wrote ${cfgFile}: ${agents.join(", ")}, working in ${root}, asking before every write and command`);
-    if (none) ctx.out("no claude, codex or cursor-agent on PATH: claude is offered; install Claude Code, or edit the file for another agent");
+    try {
+      // "wx": created only if it is still not there, in one step.
+      fs.writeFileSync(cfgFile, pairedConfig({ server, name, agents, root }), { mode: 0o600, flag: "wx" });
+      ctx.out(`wrote ${cfgFile}: ${agents.join(", ")}, working in ${root}, asking before every write and command`);
+      if (none) ctx.out("no claude, codex or cursor-agent on PATH: claude is offered; install Claude Code, or edit the file for another agent");
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      ctx.out(`${cfgFile} appeared meanwhile; left as it is`);
+    }
   } else {
     ctx.out(`kept ${cfgFile} as it is (${cfg.agents.map((a) => a.id).join(", ") || "no agents"})`);
   }
