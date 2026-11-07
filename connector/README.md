@@ -432,9 +432,11 @@ state, unacknowledged events and their sequence numbers are on disk; a session r
 The turn an agent is running is on disk too, from the moment its prompt reaches the agent until its `turn_end`. The next run
 (after a crash, a kill, a pod restart, `stop`, or an upgrade) finds it and:
 
-- carries it on when the agent was waiting for a person's permission and the connector was away no longer than a card lives
-  (10 minutes): the agent is told the connector restarted and to go on, so it asks again and a new card comes; the prompt's own
-  `turn_end` still ends it. It only asks, so nothing runs that nobody approved;
+- carries it on when the agent was waiting for a person's permission for a tool call (not a plan or a question card), the agent
+  always asks (no `approval = "never"`, no `allow_unsafe_modes`) and its session was in a mode that asks, the connector is not
+  paused, and it was away no longer than a card lives (10 minutes): the agent is told the connector restarted and to go on, so
+  it asks again and a new card comes; the prompt's own `turn_end` still ends it. It only asks, so nothing runs that nobody
+  approved. Nothing is carried on before the run has signed in (a revoked connector carries on nothing);
 - otherwise ends it with `turn_end` `{"stopReason": "error", "error": "connector_restarted"}`, naming its prompt (`cmd_id`,
   `cmd_seq`), so a phone stops waiting for it. The agent is not re-run by itself; the next message resumes the conversation.
 

@@ -541,17 +541,13 @@ export class Connector {
     // Adapters a crashed earlier run left recorded are stopped first (only if they are still the processes we started).
     await this.registry.killAll();
     // A card whose adapter died with the previous run can never be answered: close it, so a phone does not keep a dead button.
-    const waiting = new Set<string>();
     for (const p of this.store.takePending()) {
-      waiting.add(p.session_id);
       this.d.audit.record("permission_orphaned", { session_id: p.session_id, action_id: p.action_id });
       this.emit(p.session_id, "permission_resolved", { actionId: p.action_id, optionId: null, outcome: "cancelled", by: "connector_restart" });
     }
-    // The turns the previous run left running end, or (one that was waiting for a person) go on and ask again; the sessions
-    // used lately are told they are back. How long the machine was away is from its last heartbeat (connector.json).
+    // How long the machine was away, from its last heartbeat (connector.json), read before this run writes it.
     let downForMs: number | null = null;
     try { downForMs = Math.max(0, Date.now() - fs.statSync(identityFile(this.d.dirs)).mtimeMs); } catch { /* never registered */ }
-    this.manager.recover({ turns: this.store.takeTurns(), waiting, downForMs });
     const pidf = pidFile(this.d.dirs);
     // A pid file left behind means the previous run never reached its own clean-up: it was killed (SIGKILL, OOM),
     // crashed, or the machine went down under it. Its last heartbeat is when connector.json was last written.
@@ -570,6 +566,9 @@ export class Connector {
       const up = await this.startup();
       if (up !== "ok") return (result = up);
       await this.manager.restoreReadOnly();
+      // Signed in and not revoked: the turns the previous run left running end, or (one that was waiting for a person's
+      // approval) go on and ask again, never while paused; the sessions used lately are told they are back.
+      this.manager.recover({ downForMs, mayContinue: !this.paused && !fs.existsSync(pauseFile(this.d.dirs)) });
       this.d.audit.record("connector_online", {
         connector_id: this.cid, agents: this.d.config.agents.map((a) => a.id), paused: this.paused,
         unattended_agents: this.d.config.agents.filter((a) => a.unattended).map((a) => a.id),

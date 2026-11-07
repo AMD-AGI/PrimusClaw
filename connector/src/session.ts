@@ -621,11 +621,11 @@ export class Session {
     }
     return this.askPerson(options, {
       tool: str(toolCall.title, 200), kind: str(toolCall.kind, 64), input: boundedInput(toolCall.rawInput), toolCallId: str(toolCall.toolCallId, 128),
-    }, (optionId) => (optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }));
+    }, (optionId) => (optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }), true);
   }
 
   /** Put a question on the phone and wait for the answer, a cancel or the timeout. `shape` turns the answer into what the adapter expects. */
-  private askPerson(options: OfferedOption[], info: Record<string, unknown>, shape: (optionId: string | null) => AcpParams): Promise<AcpParams> {
+  private askPerson(options: OfferedOption[], info: Record<string, unknown>, shape: (optionId: string | null) => AcpParams, permission = false): Promise<AcpParams> {
     return new Promise<AcpParams>((resolve) => {
       const p = this.book.open(options, (actionId) => redactDeep({ actionId, ...info, options, timeout_ms: this.book.ttl }) as Record<string, unknown>, (optionId) => {
         if (!this.stopping) {
@@ -635,7 +635,7 @@ export class Session {
         resolve(shape(optionId));
       });
       this.env.store.addPending(this.id, p.actionId);
-      this.env.store.markWaiting(this.id, true);
+      this.env.store.markWaiting(this.id, true, permission);
       this.audit("permission_requested", { action_id: p.actionId, tool: info.tool, tool_kind: info.kind, options: options.map((o) => o.optionId) });
       this.emit("permissionRequest", p.payload);
     });
@@ -751,6 +751,7 @@ export class Session {
         this.audit("prompt_refused", { reason: refused.reason, detail: refused.detail.slice(0, 300) });
         this.rejectCommand("prompt", cmdId, refused.reason, cmdSeq);
         this.emit("turn_end", { stopReason: "error", error: refused.reason, cmd_id: cmdId, cmd_seq: cmdSeq });
+        this.env.store.endTurn(this.id); // (a turn carried on after a restart that could not start again ends here)
         return;
       }
     }
@@ -759,6 +760,7 @@ export class Session {
     } catch (e) {
       started();
       this.emit("turn_end", { stopReason: "error", error: e instanceof SessionRefusal ? e.reason : "adapter_unavailable", cmd_id: cmdId, cmd_seq: cmdSeq });
+      this.env.store.endTurn(this.id);
       return this.refuse(e);
     }
     const a = this.adapter!;

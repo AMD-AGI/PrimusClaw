@@ -5,7 +5,6 @@
 import type { AgentConfig } from "./config.js";
 import { SESSION_REF_RE } from "./attach.js";
 import { Session, type SessionEnv } from "./session.js";
-import type { TurnRecord } from "./session-store.js";
 import { checkCwd } from "./roots.js";
 import { REMOTE_COMMAND_TYPES, isRemoteCommandType } from "./protocol.js";
 import { sha256, errMessage } from "./util.js";
@@ -247,30 +246,41 @@ export class SessionManager {
    * After a restart (a crash, a kill, a supervisor's restart, an upgrade): every turn the previous run left running is
    * ended or carried on, and every session used lately is told it is back (`session_recovered`), once.
    *
-   * A turn whose agent was waiting for a person's permission, cut off no longer ago than a card lives, goes on with
-   * {@link CONTINUE_PROMPT} under the same prompt (`cmd_id`, `cmd_seq`): the agent asks again, so the card comes back,
-   * and the prompt's own `turn_end` still ends it. It only asks, so nothing runs that a person has not approved. Any
-   * other turn ends with `turn_end` `error: "connector_restarted"`, naming its prompt, so the phone stops waiting for it;
-   * whether the agent finished what it was doing is in the conversation, which the next message resumes.
+   * A turn whose agent was waiting for a person's permission for a tool call, cut off no longer ago than a card lives, in a
+   * session of an agent that always asks, goes on with {@link CONTINUE_PROMPT} under the same prompt (`cmd_id`,
+   * `cmd_seq`): the agent asks again, so the card comes back, and the prompt's own `turn_end` still ends it. Not while
+   * the kill switch is on (`mayContinue`). Any other turn ends with `turn_end` `error: "connector_restarted"`, naming its
+   * prompt, so the phone stops waiting for it; whether the agent finished what it was doing is in the conversation, which
+   * the next message resumes.
    */
-  recover(o: { turns: TurnRecord[]; waiting: ReadonlySet<string>; downForMs: number | null; now?: number }): void {
+  recover(o: { downForMs: number | null; mayContinue: boolean; now?: number }): void {
     const now = o.now ?? Date.now();
     const told = new Set<string>();
-    for (const t of o.turns) {
+    for (const t of this.env.store.listTurns()) {
       const sid = t.session_id;
       const rec = this.env.store.get(sid);
       const active = rec?.status === "active";
-      const waiting = Boolean(t.waiting) || o.waiting.has(sid);
+      const agent = rec ? this.agent(rec.agent_id) : undefined;
+      // Only a tool call's permission request (a plan or a question card is no approval of what follows), only an agent that
+      // can never run without asking (no `approval = "never"`, no `allow_unsafe_modes`: its session is forced into a mode
+      // that asks and read back, and a "will not ask" warning closes it), and only a session last seen in such a mode.
+      const asks = agent !== undefined && !agent.allowUnsafeModes && rec?.mode !== null && rec?.mode !== undefined && agent.askingModes.includes(rec.mode);
+      const waiting = Boolean(t.waiting_permission);
       const recent = o.downForMs !== null && o.downForMs <= this.env.timing.permissionTtlMs;
-      if (active && waiting && recent) {
+      if (o.mayContinue && active && asks && waiting && recent) {
         this.env.audit.record("turn_continued", { session_id: sid, cmd_id: t.cmd_id, cmd_seq: t.cmd_seq, down_ms: o.downForMs });
         this.env.emit(sid, "session_recovered", { reason: "connector_restart", interrupted: true, continuing: true, cmd_id: t.cmd_id, cmd_seq: t.cmd_seq });
-        void this.handle({ cmd_id: t.cmd_id ?? `continue-${t.cmd_seq ?? sid}`, type: "prompt", session_id: sid, text: CONTINUE_PROMPT, ...(t.cmd_seq !== null ? { cmd_seq: t.cmd_seq } : {}) });
+        // The record stays until the continuation reaches the agent (which records it afresh): a crash before that finds it again.
+        // A continuation dropped before it gets there (refused, the session gone) is ended by that refusal; its record goes too.
+        void this.handle({ cmd_id: t.cmd_id ?? `continue-${t.cmd_seq ?? sid}`, type: "prompt", session_id: sid, text: CONTINUE_PROMPT, ...(t.cmd_seq !== null ? { cmd_seq: t.cmd_seq } : {}) }, () => {
+          if (this.env.store.turn(sid)?.started_at === t.started_at) this.env.store.endTurn(sid);
+        });
       } else {
         this.env.audit.record("turn_interrupted", { session_id: sid, cmd_id: t.cmd_id, cmd_seq: t.cmd_seq, waiting, down_ms: o.downForMs });
         // Before the turn_end: a phone reading the turn hears why it ended in the same place it hears that it ended.
         if (active) this.env.emit(sid, "session_recovered", { reason: "connector_restart", interrupted: true, continuing: false, cmd_id: t.cmd_id, cmd_seq: t.cmd_seq });
         this.env.emit(sid, "turn_end", { stopReason: "error", error: "connector_restarted", cmd_id: t.cmd_id, cmd_seq: t.cmd_seq });
+        this.env.store.endTurn(sid);
       }
       told.add(sid);
     }

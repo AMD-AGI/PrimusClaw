@@ -740,6 +740,7 @@ describe("crash safety", () => {
     const turns = JSON.parse(fs.readFileSync(path.join(h.dirs.state, "sessions.json.turns"), "utf8"));
     assert.equal(turns[sid].cmd_seq, seq);
     assert.equal(turns[sid].waiting, true);
+    assert.equal(turns[sid].waiting_permission, true);
     await h.stop(); // a supervisor's restart (SIGTERM): nothing is ended by the run that goes away
     assert.deepEqual(h.turnEnds(sid), [], "no turn_end from the run that stopped");
     assert.deepEqual(h.claw.eventsOf(sid, "permission_resolved"), [], "the card is closed by the next run, which knows why");
@@ -784,7 +785,7 @@ describe("crash safety", () => {
     const h = await make({ start: false, timing: { permissionTtlMs: 1_000 } });
     const sid = "44444444-4444-4444-8444-444444444444";
     h.connector.store.put(sid, { agent_id: "fake", acp_session_id: "acp-x", cwd: h.work, status: "active", mode: "default", created_at: new Date().toISOString() });
-    h.connector.store.beginTurn({ session_id: sid, cmd_id: "c-1", cmd_seq: 7, started_at: new Date().toISOString(), waiting: true });
+    h.connector.store.beginTurn({ session_id: sid, cmd_id: "c-1", cmd_seq: 7, started_at: new Date().toISOString(), waiting: true, waiting_permission: true });
     fs.writeFileSync(path.join(h.dirs.state, "connector.json"), "{}");
     const old = new Date(Date.now() - 60_000);
     fs.utimesSync(path.join(h.dirs.state, "connector.json"), old, old);
@@ -794,6 +795,72 @@ describe("crash safety", () => {
     assert.deepEqual([end.data.error, end.data.cmd_seq], ["connector_restarted", 7]);
     assert.ok(h.audit().some((a) => a.kind === "turn_interrupted" && a.waiting === true));
     assert.deepEqual(h.adapterLog(), [], "nothing was started");
+  });
+  /** A session of the fake agent recorded by an earlier run, with a turn that was waiting for a tool call's permission a moment ago. */
+  const crashedWhileAsking = (h: Harness, sid: string, cwd = h.work, mode = "default") => {
+    h.connector.store.put(sid, { agent_id: "fake", acp_session_id: "acp-x", cwd, status: "active", mode, created_at: new Date().toISOString() });
+    h.connector.store.beginTurn({ session_id: sid, cmd_id: "c-9", cmd_seq: 9, started_at: new Date().toISOString(), waiting: true, waiting_permission: true });
+    // Its last heartbeat a moment ago (connector.json's mtime), so only the rule under test keeps the turn from going on.
+    const id = path.join(h.dirs.state, "connector.json");
+    if (!fs.existsSync(id)) fs.writeFileSync(id, "{}");
+    else fs.utimesSync(id, new Date(), new Date());
+  };
+  test("a turn waiting on a plan card (not a tool call's permission) is ended at a restart, not carried on", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const seq = h.prompt(sid, "plan");
+    await h.permission(sid);
+    await h.stop();
+    h.connect();
+    h.start();
+    const end = await h.turnEnd(sid);
+    assert.deepEqual([end.data.error, end.data.cmd_seq], ["connector_restarted", seq]);
+    await sleep(200);
+    assert.ok(!h.adapterLog().some((l) => typeof l.prompt === "string" && l.prompt.startsWith("[claw-connector]")));
+  });
+  test("an agent that may run without asking (approval = never) is never carried on after a restart", async () => {
+    const h = await make({ start: false, approval: "never", askMode: "bypassPermissions" });
+    const sid = "66666666-6666-4666-8666-666666666666";
+    crashedWhileAsking(h, sid, h.work, "default");
+    h.connect();
+    h.start();
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.error, "connector_restarted");
+    assert.deepEqual(h.adapterLog(), [], "nothing was started");
+  });
+  test("with the kill switch on at start (paused), a turn that was waiting is ended, nothing is started", async () => {
+    const h = await make({ start: false });
+    const sid = "77777777-7777-4777-8777-777777777777";
+    crashedWhileAsking(h, sid);
+    fs.writeFileSync(path.join(h.dirs.state, "paused"), "x");
+    h.connect();
+    h.start();
+    await h.claw.until("the turn ended", () => h.audit().some((a) => a.kind === "turn_interrupted" && a.session_id === sid));
+    await sleep(300);
+    assert.deepEqual(h.adapterLog(), [], "nothing was started while paused");
+    assert.deepEqual(h.connector.store.listTurns(), []);
+  });
+  test("revoked at start: nothing is carried on and the turn stays recorded", async () => {
+    const h = await make();
+    await h.online();
+    await h.stop();
+    const sid = "88888888-8888-4888-8888-888888888888";
+    crashedWhileAsking(h, sid);
+    h.claw.revoked = true; // the row this connector registered
+    h.connect();
+    assert.equal(await h.start(), "revoked");
+    assert.deepEqual(h.adapterLog(), []);
+    assert.ok(!h.audit().some((a) => a.kind === "turn_continued"));
+  });
+  test("a carried-on turn that cannot start again (its folder left the roots) is ended by the refusal and forgotten", async () => {
+    const h = await make({ start: false });
+    const sid = "99999999-9999-4999-8999-999999999999";
+    crashedWhileAsking(h, sid, tmpdir("cc-gone-"));
+    h.connect();
+    h.start();
+    await h.claw.until("the session refused", () => h.claw.eventsOf(sid, "session_closed")[0]);
+    await h.claw.until("the record forgotten", () => h.connector.store.listTurns().length === 0);
+    assert.deepEqual(h.adapterLog(), []);
   });
   test("a prompt queued behind the running turn when the connector restarts is delivered again, not lost", async () => {
     const h = await make();

@@ -29,8 +29,8 @@ record it.
 
 ### Added
 - The connector picks up after a restart (a crash, a kill, a pod restart, `stop`, an upgrade): the turn an agent was running is kept
-  on disk, and the next run either carries it on (the agent was waiting for a person's permission: it asks again and a new card
-  comes, under the same prompt) or ends it with `turn_end` `error: "connector_restarted"`, so a phone stops waiting; prompts queued
+  on disk, and the next run either carries it on (the agent was waiting for a person's permission for a tool call, always asks, and
+  the connector is not paused: it asks again and a new card comes, under the same prompt) or ends it with `turn_end` `error: "connector_restarted"`, so a phone stops waiting; prompts queued
   behind it are delivered again after a supervisor's restart instead of being dropped; and each session used in the last 4 hours
   gets one `session_recovered` event, which a chat shows as "recovered".
 - A conversation open in a terminal on your machine that has waited a minute for you (Claude Code's own "waiting": a permission or a

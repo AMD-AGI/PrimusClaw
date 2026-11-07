@@ -25,8 +25,10 @@ export interface TurnRecord {
   cmd_id: string | null;
   cmd_seq: number | null;
   started_at: string;
-  /** The agent was waiting for a person's answer to a permission request. */
+  /** The agent was waiting for a person's answer: a permission request, a plan or a question card. */
   waiting?: boolean;
+  /** ... and at least one of those was a permission request for a tool call (not a plan or a question). */
+  waiting_permission?: boolean;
 }
 
 export class SessionStore {
@@ -110,12 +112,18 @@ export class SessionStore {
     this.saveTurns();
   }
 
-  /** The turn's agent is waiting for a person (`true`), or no longer (`false`). */
-  markWaiting(sessionId: string, waiting: boolean): void {
+  /** The turn's agent is waiting for a person (`true`; `permission`: a tool call's permission request), or no longer (`false`). */
+  markWaiting(sessionId: string, waiting: boolean, permission = false): void {
     const t = this.turns[sessionId];
-    if (!t || Boolean(t.waiting) === waiting) return;
-    this.turns[sessionId] = { ...t, waiting };
+    if (!t) return;
+    const next = { ...t, waiting, waiting_permission: waiting && (permission || Boolean(t.waiting_permission)) };
+    if (Boolean(t.waiting) === next.waiting && Boolean(t.waiting_permission) === next.waiting_permission) return;
+    this.turns[sessionId] = next;
     this.saveTurns();
+  }
+
+  turn(sessionId: string): TurnRecord | undefined {
+    return this.turns[sessionId];
   }
 
   endTurn(sessionId: string): void {
@@ -124,12 +132,9 @@ export class SessionStore {
     this.saveTurns();
   }
 
-  /** Return the turns that were running and forget them. */
-  takeTurns(): TurnRecord[] {
-    const out = Object.values(this.turns);
-    this.turns = {};
-    if (out.length) this.saveTurns();
-    return out;
+  /** The turns recorded as running. Each stays until it is ended ({@link endTurn}) or a new turn of its session replaces it. */
+  listTurns(): TurnRecord[] {
+    return Object.values(this.turns).map((t) => ({ ...t }));
   }
 
   private saveTurns(): void {
