@@ -112,6 +112,23 @@ test("C3 a citing call gets the kept entry for each address it names, numbered b
   assert.deepEqual(many[CITE_DROPPED_META], { not_in_turn: 0, invalid: 0, over_cap: 2 });
 });
 
+test("C3b sources sent JSON-encoded as one string are the list it encodes (parity R1/R2: every [n] linked nowhere)", () => {
+  const cite = new RunCitations(new Set([SAY]), new Set(["github"]));
+  cite.keep("mcp__github__pr_get", [{ url: PR, title: "AMD-AGI/PrimusClaw#309 perf", kind: "github_pr" }]);
+  cite.keep("web_search", [webSource("https://example.com/news#top", "News")]);
+  // As the router sent it live on 2026-11-07 13:16Z: `sources` a string holding the JSON list.
+  const meta = cite.metaFor(SAY, { text: "a [1] b [2] c [3]", sources: JSON.stringify([PR, "https://made-up.example/x", "https://example.com/news"]) })!;
+  assert.deepEqual(meta[CITE_SOURCES_META], [
+    { n: 1, url: PR, title: "AMD-AGI/PrimusClaw#309 perf", kind: "github_pr" },
+    { n: 3, url: "https://example.com/news", title: "News", kind: "web" },
+  ]);
+  assert.deepEqual(meta[CITE_DROPPED_META], { not_in_turn: 1, invalid: 0, over_cap: 0 });
+  // One address as a plain string is one entry; a string that only looks like a list is one (invalid) entry.
+  assert.deepEqual(cite.metaFor(SAY, { sources: PR })![CITE_SOURCES_META], [{ n: 1, url: PR, title: "AMD-AGI/PrimusClaw#309 perf", kind: "github_pr" }]);
+  assert.deepEqual(cite.metaFor(SAY, { sources: "[not json" })![CITE_DROPPED_META], { not_in_turn: 0, invalid: 1, over_cap: 0 });
+  assert.deepEqual(cite.metaFor(SAY, { sources: JSON.stringify({ url: PR }) })![CITE_DROPPED_META], { not_in_turn: 0, invalid: 1, over_cap: 0 });
+});
+
 test("C4 a source server is trusted only when the run's entry of that name is the API's own", () => {
   assert.equal(parseCite(undefined, {}), null);
   assert.equal(parseCite({ tools: [] }, {}), null);

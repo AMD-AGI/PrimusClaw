@@ -100,6 +100,14 @@ describe("say with citations, on a real Postgres", { skip }, () => {
       }
       const linked = await router.callTool({ name: "say", arguments: { text: "merged [1], see www.example.com" }, _meta: meta([pr(1)]) });
       assert.equal(linked.isError, undefined);
+      // `sources` JSON-encoded as one string (parity R1/R2, 2026-11-07): read as the list it encodes, so a [n] Brain could not link is
+      // refused rather than shown as a bare number.
+      const encoded = JSON.stringify([PR, "https://made-up.example/ci"]);
+      const unlinked = await router.callTool({
+        name: "say", arguments: { text: "encoded [1] and [2]", sources: encoded }, _meta: meta([], { not_in_turn: 0, invalid: 1, over_cap: 0 }),
+      });
+      assert.equal(unlinked.isError, true, "an encoded list Brain could not read is not let through with numbers that link nowhere");
+      assert.match(JSON.stringify(unlinked.content), /citation_not_found/);
     } finally { await router.close(); }
 
     const [cited, fabricated, ...rest] = await payloads();
