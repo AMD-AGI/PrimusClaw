@@ -33,7 +33,7 @@ export interface ReviewEvalCase {
   /** People whose account does not let anyone act for them: the review service refuses them. */
   noConsent?: string[];
   /** Where pull requests stand on GitHub, by owner/repo#number; one not listed is open. pr_state and review_start answer from it. */
-  github?: Record<string, { state: "merged"; merged_at: string; merge_commit: string; merged_by: string } | { state: "closed"; closed_at: string }>;
+  github?: Record<string, { state: "merged"; merged_at: string; merge_commit: string } | { state: "closed"; closed_at: string }>;
   /** Tools the Router must not call at all in the case, not even a call the tools refuse (a refused write still reads as one asked for). */
   notCalled?: string[];
   expect: ExpectedCall[];
@@ -60,8 +60,8 @@ const task = (seq: number, title: string): ManifestItem => ({
 
 /** Parity G3 (2026-11-06, 2026-11-07): the two pull requests were merged an hour before the request. */
 const G3_MERGED = {
-  [`${REPO}#306`]: { state: "merged", merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", merged_by: "zoroyihan7" },
-  [`${REPO}#308`]: { state: "merged", merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53", merged_by: "zoroyihan7" },
+  [`${REPO}#306`]: { state: "merged", merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6" },
+  [`${REPO}#308`]: { state: "merged", merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53" },
 } as const;
 
 export const REVIEW_CASES: ReviewEvalCase[] = [

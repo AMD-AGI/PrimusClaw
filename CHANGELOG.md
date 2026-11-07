@@ -114,7 +114,7 @@ record it.
 - A development environment turn cut off because its connector restarted mid-turn is told on the assistant's item as an
   interruption with what to do (send the instruction again, or say "continue"), not as the bare code `connector_restarted`.
 - A request to review or merge pull requests that are already merged, or closed, is answered from a read: the assistant first calls
-  `pr_state`, which only reads where each pull request stands (open; merged with when, by whom and its merge commit; closed with when),
+  `pr_state`, which only reads where each pull request stands (open; merged with when and its merge commit; closed with when),
   and answers a merged or closed one itself without calling `review_start` at all; only the open ones are started. A person with no
   GitHub here is read for as anyone is, so a public pull request's state is still found. `review_start` still refuses a merged one
   (`already_merged`) and now a closed one too (`already_closed`).

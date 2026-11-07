@@ -255,7 +255,7 @@ const MODEL_PARAM_CHOICE = `${MODEL_PARAM_ASKED}; left out, the user's own defau
 function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims, choice: boolean): void {
   mcp.tool(
     "pr_state",
-    `Where each pull request stands on GitHub, read only: open, merged (merged_at, merge_commit, merged_by) or closed without a merge (closed_at); unknown when it could not be read. Up to ${MAX_PRS}. Call it before review_start, with every pull request the user named.`,
+    `Where each pull request stands on GitHub, read only: open, merged (merged_at, merge_commit) or closed without a merge (closed_at); unknown when it could not be read. Up to ${MAX_PRS}. Call it before review_start, with every pull request the user named.`,
     { prs: z.array(z.string()).describe("Each as owner/repo#number or its URL.") },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     (args) => answer(claims, "pr_state", () => prState(claims, args)),

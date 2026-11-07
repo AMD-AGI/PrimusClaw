@@ -33,12 +33,11 @@ const READ_TIMEOUT_MS = 5_000;
 /** Pull requests read at once. */
 const READ_PARALLEL = 10;
 
-/** A pull request GitHub says is merged: when, by whom, and its merge commit. */
+/** A pull request GitHub says is merged: when, and its merge commit. Not by whom: a login is text an account chose. */
 export interface MergedPull {
   pr: string;
   merged_at: string;
   merge_commit: string | null;
-  merged_by: string | null;
 }
 
 /** A pull request GitHub says was closed without being merged: when. */
@@ -48,9 +47,10 @@ export interface ClosedPull {
 }
 
 /**
- * Where a pull request stands on GitHub, as `pr_state` answers the router: `open`, `merged` (with when, by whom and its merge
- * commit), `closed` (closed without a merge, with when) or `unknown` (it could not be read: no GitHub, a failed read, no such pull
- * request). Only these fields: nothing anyone wrote on it (its title, its description), so reading it is not reading untrusted text.
+ * Where a pull request stands on GitHub, as `pr_state` answers the router: `open`, `merged` (with when and its merge commit),
+ * `closed` (closed without a merge, with when) or `unknown` (it could not be read: no GitHub, a failed read, no such pull request).
+ * Only these fields, each checked for its shape (a time, a commit id): nothing anyone wrote or chose on GitHub (a title, a
+ * description, a login), so reading it is not reading untrusted text, and a turn that read it may still act for the person.
  */
 export type PullState =
   | { pr: string; state: "open"; draft: boolean }
@@ -66,15 +66,18 @@ export interface PrStateDeps {
 }
 
 const nameOf = (p: PrRef): string => `${p.owner}/${p.repo}#${p.number}`;
-const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+/** A GitHub timestamp (`2026-11-06T09:50:16Z`), or null: nothing else is passed on as a time. */
+const time = (v: unknown): string | null => (typeof v === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(v) ? v : null);
+/** A commit id (hex, SHA-1 or SHA-256), or null. */
+const commit = (v: unknown): string | null => (typeof v === "string" && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(v) ? v : null);
 
 /** What one pull request's JSON says about where it stands. */
 function stateOf(p: PrRef, pr: Record<string, any> | null | undefined): PullState {
   const name = nameOf(p);
   if (!pr || typeof pr !== "object") return { pr: name, state: "unknown", reason: "read_failed" };
-  const mergedAt = str(pr.merged_at);
-  if (mergedAt) return { pr: name, state: "merged", merged_at: mergedAt, merge_commit: str(pr.merge_commit_sha), merged_by: str(pr.merged_by?.login) };
-  if (pr.state === "closed") return { pr: name, state: "closed", closed_at: str(pr.closed_at) };
+  const mergedAt = time(pr.merged_at);
+  if (mergedAt) return { pr: name, state: "merged", merged_at: mergedAt, merge_commit: commit(pr.merge_commit_sha) };
+  if (pr.state === "closed" && pr.merged !== true) return { pr: name, state: "closed", closed_at: time(pr.closed_at) };
   if (pr.state === "open") return { pr: name, state: "open", draft: pr.draft === true };
   return { pr: name, state: "unknown", reason: "read_failed" };
 }

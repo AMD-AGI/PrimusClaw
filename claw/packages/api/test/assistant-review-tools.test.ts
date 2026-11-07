@@ -92,7 +92,7 @@ describe("assistant review tools", { skip }, () => {
   const calls: { start: Recorded[]; restart: Recorded[]; decide: Recorded[] } = { start: [], restart: [], decide: [] };
   let startAnswer: (request: Recorded) => Promise<unknown>;
   /** What GitHub says is merged, and closed without a merge, by `owner/repo#number`, and the pull requests each check was asked about. */
-  let mergedOnGithub: Record<string, { merged_at: string; merge_commit: string; merged_by: string }> = {};
+  let mergedOnGithub: Record<string, { merged_at: string; merge_commit: string }> = {};
   let closedOnGithub: Record<string, { closed_at: string }> = {};
   const stateReads: string[][] = [];
 
@@ -746,8 +746,8 @@ describe("assistant review tools", { skip }, () => {
 
   test("S9 a pull request already merged is said so first: nothing starts, nothing is handed over, nobody is asked about", async () => {
     mergedOnGithub = {
-      "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-05T09:12:44Z", merge_commit: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", merged_by: "zoroyihan7" },
-      "AMD-AGI/PrimusClaw#308": { merged_at: "2026-11-05T10:01:02Z", merge_commit: "0f9e8d7c6b5a40f9e8d7c6b5a40f9e8d7c6b5a40", merged_by: "zoroyihan7" },
+      "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-05T09:12:44Z", merge_commit: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0" },
+      "AMD-AGI/PrimusClaw#308": { merged_at: "2026-11-05T10:01:02Z", merge_commit: "0f9e8d7c6b5a40f9e8d7c6b5a40f9e8d7c6b5a40" },
     };
     const prs = ["https://github.com/AMD-AGI/PrimusClaw/pull/306", "https://github.com/AMD-AGI/PrimusClaw/pull/308"];
     const text = `请 eval-reviewer 帮我 review 并合入下面 2 个 PR：\n${prs.join("\n")}`;
@@ -786,7 +786,7 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(await code(rt.reviewStart(turn, { prs, merge: true, reviewer: "eval-reviewer" })), "reviewer_not_in_message");
 
     // A listed person the message names, from a channel that takes handoffs: nothing is handed over for a merged pull request.
-    mergedOnGithub = { "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-05T09:12:44Z", merge_commit: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", merged_by: "zoroyihan7" } };
+    mergedOnGithub = { "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-05T09:12:44Z", merge_commit: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0" } };
     await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
     const named = await userTurn(alice, `请 Wei Lei 帮我 review 并合入：\n${prs[0]}`, { context: ctx });
     assert.equal(await code(rt.reviewStart(named, { prs: [prs[0]], merge: true, reviewer: "u-weilei" })), "already_merged");
@@ -810,7 +810,7 @@ describe("assistant review tools", { skip }, () => {
     assert.match(refusal.message, /closed on GitHub without a merge[\s\S]*nothing was started or handed over/);
     assert.equal(calls.start.length, 0, "no review started");
     // Merged and closed together: already_merged, carrying both.
-    mergedOnGithub = { "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", merged_by: "zoroyihan7" } };
+    mergedOnGithub = { "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6" } };
     const both = await userTurn(alice, "帮我 review 并合入 AMD-AGI/PrimusClaw#306 和 AMD-AGI/PrimusClaw#311");
     await assert.rejects(rt.reviewStart(both, { prs: ["AMD-AGI/PrimusClaw#306", "AMD-AGI/PrimusClaw#311"], merge: true }), (err: any) => { refusal = err; return true; });
     assert.equal(refusal.code, "already_merged");
@@ -820,8 +820,8 @@ describe("assistant review tools", { skip }, () => {
 
   test("S11 pr_state only reads where each pull request stands: nothing starts, is handed over or written", async () => {
     mergedOnGithub = {
-      "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", merged_by: "zoroyihan7" },
-      "AMD-AGI/PrimusClaw#308": { merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53", merged_by: "zoroyihan7" },
+      "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6" },
+      "AMD-AGI/PrimusClaw#308": { merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53" },
     };
     closedOnGithub = { "AMD-AGI/PrimusClaw#311": { closed_at: "2026-11-06T11:00:00Z" } };
     const prs = ["https://github.com/AMD-AGI/PrimusClaw/pull/306", "https://github.com/AMD-AGI/PrimusClaw/pull/308"];
@@ -834,8 +834,8 @@ describe("assistant review tools", { skip }, () => {
       const answer = await rt.prState(turn, { prs }) as Recorded;
       assert.equal(answer.ok, true);
       assert.deepEqual(answer.prs, [
-        { pr: "AMD-AGI/PrimusClaw#306", state: "merged", merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", merged_by: "zoroyihan7" },
-        { pr: "AMD-AGI/PrimusClaw#308", state: "merged", merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53", merged_by: "zoroyihan7" },
+        { pr: "AMD-AGI/PrimusClaw#306", state: "merged", merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6" },
+        { pr: "AMD-AGI/PrimusClaw#308", state: "merged", merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53" },
       ]);
       await w.closeRun(turn.task_id);
     }
@@ -854,8 +854,8 @@ describe("assistant review tools", { skip }, () => {
   test("S9b a turn that cannot act still says a merged pull request its message names: a key's message, a stale one", async () => {
     // The parity case G3 as the eval runner sends it: the message came with a key, so the turn cannot act for the person.
     mergedOnGithub = {
-      "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", merged_by: "zoroyihan7" },
-      "AMD-AGI/PrimusClaw#308": { merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53", merged_by: "zoroyihan7" },
+      "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6" },
+      "AMD-AGI/PrimusClaw#308": { merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53" },
     };
     const prs = ["https://github.com/AMD-AGI/PrimusClaw/pull/306", "https://github.com/AMD-AGI/PrimusClaw/pull/308"];
     const text = `请 eval-reviewer 帮我 review 并合入下面 2 个 PR：\n${prs.join("\n")}`;
@@ -871,7 +871,7 @@ describe("assistant review tools", { skip }, () => {
     mergedOnGithub = {};
     assert.equal(await code(rt.reviewStart(viaKey, { prs, merge: true })), "not_attended");
     await w.closeRun(viaKey.task_id);
-    mergedOnGithub = { "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", merged_by: "zoroyihan7" } };
+    mergedOnGithub = { "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6" } };
     // A signed-in message too old to act on: the same.
     const old = await userTurn(alice, `审一下并合入 ${prs[0]}`, { agoSec: 601 });
     assert.equal(await code(rt.reviewStart(old, { prs: [prs[0]], merge: true })), "already_merged");

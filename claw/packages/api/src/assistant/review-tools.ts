@@ -591,7 +591,7 @@ async function refuseMerged(userId: string, sessionId: string, prs: readonly PrR
   const open = prs.length - merged.length - closed.length;
   const are = (n: number) => (n === 1 ? "is" : "are");
   const said = [
-    ...(merged.length ? [`${merged.map((m) => m.pr).join(", ")} ${are(merged.length)} already merged on GitHub (data.merged: when, by whom, the merge commit)`] : []),
+    ...(merged.length ? [`${merged.map((m) => m.pr).join(", ")} ${are(merged.length)} already merged on GitHub (data.merged: when, the merge commit)`] : []),
     ...(closed.length ? [`${closed.map((c) => c.pr).join(", ")} ${are(closed.length)} closed on GitHub without a merge (data.closed: when)`] : []),
   ];
   throw new ToolRefused(
