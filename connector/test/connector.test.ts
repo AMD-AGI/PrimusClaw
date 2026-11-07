@@ -914,6 +914,24 @@ describe("crash safety", () => {
       await (read ?? fs.promises.readFile(fifo));
     }
   });
+  test("a turn record whose write fails keeps its prompt unhandled, and is written again until it lands", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const tmpFile = path.join(h.dirs.state, "sessions.json.turns.tmp");
+    fs.mkdirSync(tmpFile); // the temporary file cannot be written: every write of the record fails at once
+    try {
+      const flag = path.join(h.work, "never4");
+      const seq = h.prompt(sid, `wait ${flag}`);
+      await h.claw.until("the prompt to reach the agent", () => h.adapterLog().some((l) => l.prompt === `wait ${flag}`));
+      const n = h.claw.heartbeats.length;
+      await h.claw.until("three more heartbeats", () => h.claw.heartbeats.length >= n + 3);
+      await sleep(1_200); // past one retry, which fails too
+      assert.ok(h.claw.cursor < seq, `the server still holds the command (cursor ${h.claw.cursor}, prompt ${seq})`);
+      fs.rmdirSync(tmpFile);
+      await h.claw.until("the cursor to pass the prompt once the record is written", () => h.claw.cursor >= seq, 5_000);
+      assert.equal(JSON.parse(fs.readFileSync(path.join(h.dirs.state, "sessions.json.turns"), "utf8"))[sid].cmd_seq, seq);
+    } finally { fs.rmSync(tmpFile, { recursive: true, force: true }); }
+  });
   test("a prompt queued behind the running turn when the connector restarts is delivered again, not lost", async () => {
     const h = await make();
     const sid = await h.newSession();

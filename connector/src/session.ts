@@ -847,12 +847,10 @@ export class Session {
     try {
       const reply = a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });
       const now = new Date().toISOString();
-      // Recorded before the prompt counts as handled: from here a restart finds this turn instead of losing it. The
-      // record is written off the event loop, so the command counts as handled (and the heartbeat's cursor passes it)
-      // only once the record has landed; until then a restart is sent the command again.
+      // Recorded before the prompt counts as handled: from here a restart finds this turn instead of losing it.
       this.env.store.beginTurn({ session_id: this.id, cmd_id: cmdId, cmd_seq: cmdSeq, started_at: now });
       this.env.store.patch(this.id, { used_at: now, unused: false });
-      void this.env.store.written().then(started, started);
+      void this.handledOnceRecorded(started, now);
       const res = await reply;
       const usage = isObject(res.usage) ? res.usage : undefined;
       this.endTurn({ stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });
@@ -876,6 +874,21 @@ export class Session {
         else if (await watch.finish()) this.twinSeen = true;
       }
     }
+  }
+
+  /**
+   * The turn record is written off the event loop, so the prompt counts as handled (and the heartbeat's cursor passes
+   * it) only once the record has landed: until then a restart is sent the prompt again instead of finding neither the
+   * command nor the turn. A write that failed is tried again every second. Once the turn has ended (its record is gone
+   * or replaced) or the session closed, the record no longer matters; a connector that stops leaves the prompt unhandled.
+   */
+  private async handledOnceRecorded(started: () => void, startedAt: string): Promise<void> {
+    while (!(await this.env.store.written())) {
+      if (this.stopping) return;
+      if (this.closed || this.env.store.turn(this.id)?.started_at !== startedAt) break;
+      await sleep(1_000);
+    }
+    if (!this.stopping) started();
   }
 
   /**
