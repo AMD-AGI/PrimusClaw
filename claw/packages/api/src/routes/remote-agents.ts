@@ -398,7 +398,10 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       connectorId = parseRemoteId(req.query.connector_id);
       if (!connectorId) return fail(reply, 400, "invalid_connector_id");
     }
-    return reply.send({ ok: true, data: await store.listSessions(owner, connectorId, 100) });
+    const sessions = await store.listSessions(owner, connectorId, 100);
+    // What each active session waits on its user for (a permission request not yet answered): a client lists those first.
+    const waiting = await store.sessionsWaiting(owner, sessions.filter((s) => s.status === "active").map((s) => String(s.session_id)));
+    return reply.send({ ok: true, data: sessions.map((s) => ({ ...s, waiting: waiting.get(String(s.session_id)) ?? [] })) });
   });
 
   app.get("/v1/remote-agents/sessions/:id", async (req, reply) => {

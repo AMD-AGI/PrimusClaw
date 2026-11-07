@@ -41,6 +41,12 @@
  *       masked as a credential on the way (a credential-shaped Idempotency-Key) still ends by its number; an end naming no prompt (an
  *       older connector) makes the item count again, as before; a stop whose cancel finds nothing running (the connector restarted
  *       mid-turn, and that turn's end never comes) ends every instruction sent before it
+ *   N1  only three things are ever pushed of an instruction the assistant sent, each once, each saying which session and which kind:
+ *       it needs the user (the permission request whole: its options and when it runs out, so a channel puts it to them as buttons;
+ *       the same request sent again after a reconnect is not pushed again), it finished, it failed (a turn that ended in an error, an
+ *       instruction the machine refused, a session that closed before it finished); nothing else (an approval answered is not news)
+ *   N2  the sessions list says what each active session waits on its user for now: a request asked and not yet answered, once even
+ *       when sent again; not one answered, nor one from a turn that has ended; nothing of anyone else's
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -225,6 +231,108 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal(await remoteItem(bobSid), undefined);
     assert.equal((await post("bob", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "x" })).status, 404);
     assert.equal((await remoteItem(sid)).title, "laptop claude: run make test");
+  });
+
+  /** What was pushed of `itemId` (each say queued for the user's subscription), oldest first. */
+  const pushed = async (itemId: string) => (await w.q(
+    `SELECT o.payload FROM claw_notification_outbox o JOIN claw_assistant_says s ON s.say_id::text = o.event_id
+      WHERE s.item_id = $1 ORDER BY o.id`, [itemId],
+  )).map((r: Recorded) => r.payload as Recorded);
+
+  test("N1 an instruction the assistant sent is pushed only when it needs the user, finishes, or fails, each once", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop");
+    const out = await sendByCard(await userTurn(alice, "让开发机上的 claude 跑 make test"), { text: "跑 make test", agent: "claude" });
+    assert.equal(out.status, "done", JSON.stringify(out));
+    const sid = String(out.session_id);
+    const itemId = String(out.item_id);
+    const options = [
+      { optionId: "allow", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" },
+      { name: "no id" }, "junk",
+    ];
+    // Work going on is not news: nothing is pushed while the agent works.
+    await events("alice", cid, sid, [chunk("running…"), ["tool_call", { update: { sessionUpdate: "tool_call", title: "make test" } }]]);
+    assert.deepEqual(await pushed(itemId), []);
+
+    // It needs the user: one push, the request whole; the same request sent again after a reconnect is not pushed again.
+    await events("alice", cid, sid, [["permissionRequest", { actionId: "act-1", tool: "Run make test", kind: "execute", options, timeout_ms: 600_000 }]]);
+    await events("alice", cid, sid, [["permissionRequest", { actionId: "act-1", tool: "Run make test", kind: "execute", options, timeout_ms: 600_000, resent: true }]]);
+    let got = await pushed(itemId);
+    assert.equal(got.length, 1, JSON.stringify(got));
+    assert.equal(got[0].type, "assistant.say");
+    assert.match(got[0].text, /^laptop 上的 claude 在等你批准：Run make test/);
+    const remote = got[0].remote;
+    assert.deepEqual([remote.kind, remote.session_id, remote.machine, remote.agent], ["needs_you", sid, "laptop", "claude"]);
+    assert.deepEqual([remote.ask.action_id, remote.ask.tool], ["act-1", "Run make test"]);
+    assert.deepEqual(remote.ask.options, [
+      { optionId: "allow", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" },
+    ], "only the options that can be answered");
+    const left = Date.parse(remote.ask.expires_at) - Date.now();
+    assert.ok(left > 590_000 && left <= 600_000, `runs out when the connector stops waiting (${left} ms)`);
+    assert.equal((await remoteItem(sid)).board_state, "needs_you");
+
+    // Answered: the agent goes on, and that is not news either; then it finishes: one push, kind done.
+    await events("alice", cid, sid, [["permission_resolved", { actionId: "act-1", optionId: "allow" }], chunk("312 passed")]);
+    assert.equal((await pushed(itemId)).length, 1);
+    await events("alice", cid, sid, [end()]);
+    await events("alice", cid, sid, [end()]);
+    got = await pushed(itemId);
+    assert.equal(got.length, 2, JSON.stringify(got));
+    assert.deepEqual([got[1].remote.kind, got[1].remote.session_id, got[1].remote.ask], ["done", sid, undefined]);
+    assert.match(got[1].text, /^laptop 上的 claude 做完了 #\d+：跑 make test\nrunning…312 passed$/);
+
+    // The next instruction fails on the machine: one push, kind error, said as an error.
+    await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
+    const next = await sendByCard(await userTurn(alice, "再跑一次"), { text: "再跑一次" });
+    assert.deepEqual([next.status, next.session_id], ["done", sid]);
+    await events("alice", cid, sid, [["turn_end", { stopReason: "error", error: "adapter_unavailable" }]]);
+    got = await pushed(itemId);
+    assert.equal(got.length, 3, JSON.stringify(got));
+    assert.equal(got[2].remote.kind, "error");
+    assert.match(got[2].text, /^laptop 上的 claude 出错了，#\d+ 没有做完：再跑一次\n（出错：adapter_unavailable）/);
+
+    // One the machine refuses, and a session that closes before it finished: errors, each once.
+    await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
+    await sendByCard(await userTurn(alice, "第三次"), { text: "第三次" });
+    await events("alice", cid, sid, [["command_rejected", { type: "prompt", reason: "too_many_queued_prompts" }]]);
+    await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
+    await sendByCard(await userTurn(alice, "第四次"), { text: "第四次" });
+    await events("alice", cid, sid, [["session_closed", { reason: "agent_exited" }]]);
+    got = await pushed(itemId);
+    assert.deepEqual(got.map((g) => g.remote?.kind), ["needs_you", "done", "error", "error", "error"], JSON.stringify(got.map((g) => g.text)));
+    assert.match(got[3].text, /没有接下/);
+    assert.match(got[4].text, /会话已关闭/);
+    assert.ok(got.every((g) => g.remote.session_id === sid));
+  });
+
+  test("N2 the sessions list says what each active session waits on its user for now", async () => {
+    await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const a = await chatSession("alice", cid);
+    const b = await chatSession("alice", cid, "/home/u/repo/b");
+    const list = async (user = "alice") => {
+      const r = await fetch(`${base}/v1/remote-agents/sessions`, { headers: { "x-test-user": user } });
+      assert.equal(r.status, 200);
+      return new Map(((await r.json()) as Recorded).data.map((s: Recorded) => [s.session_id, s.waiting]));
+    };
+    assert.deepEqual([(await list()).get(a), (await list()).get(b)], [[], []]);
+    // a asks; the same request is sent again after a reconnect; b answers its own.
+    await events("alice", cid, a, [ask("act-a", "Run make test")]);
+    await events("alice", cid, a, [["permissionRequest", { actionId: "act-a", tool: "Run make test", options: [{ optionId: "allow" }], resent: true }]]);
+    await events("alice", cid, b, [ask("act-b", "Edit main.go"), ["permission_resolved", { actionId: "act-b", optionId: "allow" }]]);
+    let now = await list();
+    assert.deepEqual((now.get(a) as Recorded[]).map((x) => [x.action_id, x.tool]), [["act-a", "Run make test"]]);
+    assert.ok(Date.parse((now.get(a) as Recorded[])[0].asked_at) > 0);
+    assert.deepEqual(now.get(b), []);
+    // Replayed history is not a request; an ask its turn ended without answering is moot.
+    await events("alice", cid, b, [["permissionRequest", { actionId: "old", tool: "x", options: [{ optionId: "allow" }], replay: true }]]);
+    await events("alice", cid, a, [end()]);
+    now = await list();
+    assert.deepEqual([now.get(a), now.get(b)], [[], []]);
+    // Bob sees none of it.
+    await w.user("bob");
+    assert.equal((await list("bob")).size, 0);
   });
 
   test("F2 devenv_send in the user's own signed-in turn is a card; pressed, it sends, files the item, and tells them its end once", async () => {

@@ -29,6 +29,7 @@ import {
   type AssistantConfirmAction,
   type AssistantConfirmWrite,
   type AssistantHeldWrite,
+  type AssistantRemoteNotice,
   type AssistantSayPayload,
   type AssistantSaySource,
   type WorkItemNeedsYouPayload,
@@ -168,6 +169,8 @@ type ToStore =
     noticeOfTurn?: string;
     /** A router say's turn, kept on its payload the same way, so a later say of that turn finds it (`turnFirstSay`). */
     turnMessageId?: string;
+    /** A development environment session's own message (`remote-items.ts`). */
+    remote?: AssistantRemoteNotice;
   })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow; heldWrite?: AssistantHeldWrite });
 
@@ -185,7 +188,22 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
       ...(m.amends ? { amends: m.amends } : {}),
       ...(m.replaces ? { replaces: m.replaces } : {}),
       ...((m.noticeOfTurn ?? m.turnMessageId) ? { turn_message_id: m.noticeOfTurn ?? m.turnMessageId } : {}),
+      ...(m.remote ? { remote: redactedRemote(m.remote) } : {}),
     };
+}
+
+/** A session's notice as a receiver gets it: what the agent and its connector wrote is redacted as the text is. */
+function redactedRemote(r: AssistantRemoteNotice): AssistantRemoteNotice {
+  return {
+    kind: r.kind, session_id: r.session_id, machine: redact(r.machine), agent: redact(r.agent),
+    ...(r.ask ? {
+      ask: {
+        action_id: r.ask.action_id, tool: redact(r.ask.tool),
+        options: r.ask.options.map((o) => ({ optionId: o.optionId, name: redact(o.name), kind: o.kind })),
+        ...(r.ask.expires_at ? { expires_at: r.ask.expires_at } : {}),
+      },
+    } : {}),
+  };
 }
 
 /** Store the message and queue it for every subscription that asked for its type. `null`: it was stored before. */
@@ -290,6 +308,7 @@ async function sendSayEvent(
     ...(payload.type === "assistant.say" && payload.files ? { files: payload.files } : {}),
     ...(payload.type === "assistant.say" && payload.amends ? { amends: payload.amends } : {}),
     ...(payload.type === "assistant.say" && payload.replaces ? { replaces: payload.replaces } : {}),
+    ...(payload.type === "assistant.say" && payload.remote ? { remote: payload.remote } : {}),
     // A write the item's worker holds for the person: the card a channel draws from its `approval.requested`, for a reader of the session.
     ...(payload.type === "work_item.needs_you" && payload.held_write ? { held_write: payload.held_write } : {}),
     fallback: payload.type === "work_item.needs_you",
@@ -943,6 +962,8 @@ export async function recordSystemNotice(
     itemId?: string; turnMessageId?: string;
     /** Files the user gets with it (a worker's deliveries, `deliveries.ts`). */
     files?: AssistantFile[];
+    /** A development environment session's own message: which session, and which kind (`remote-items.ts`). */
+    remote?: AssistantRemoteNotice;
   }, deps: SayDeps = {},
 ): Promise<SayOutcome | null> {
   const stored = await storeSettled(async (q, storeOne) => storeOne({
@@ -951,6 +972,7 @@ export async function recordSystemNotice(
     userId: input.userId, sessionId: input.sessionId, text: input.text,
     ...(input.files?.length ? { files: input.files } : {}),
     ...(input.turnMessageId ? { noticeOfTurn: input.turnMessageId } : {}),
+    ...(input.remote ? { remote: input.remote } : {}),
   }), (late) => announce(late, deps, input.turnMessageId));
   if (!stored) return null;
   await announce(stored, deps, input.turnMessageId);

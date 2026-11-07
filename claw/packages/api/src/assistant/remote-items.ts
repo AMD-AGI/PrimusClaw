@@ -18,8 +18,12 @@
  * (an `Idempotency-Key`), which a credential scrub on the way may mask, and a number never is. One that does not name it (an older
  * connector) is counted (`open_turns`, with the cancels pending), as it always was.
  *
- * Who is told: an instruction the assistant sent (`origin: "assistant"`) is the user's errand, and its end, or a permission it waits
- * on, is said to them once (`recordSystemNotice`, keyed by the event). One the user typed into an attached chat is not: they are
+ * Who is told: an instruction the assistant sent (`origin: "assistant"`) is the user's errand, and only three things are ever said of it,
+ * each once (`recordSystemNotice`, keyed by the event): it finished (`done`), it needs the user (`needs_you`: a permission request,
+ * carried whole so a channel can put its options to them as buttons), or it failed (`error`: the turn ended in an error or a refusal,
+ * the machine refused the instruction, or the session ended first). Nothing else: no progress, no "answered, going on", and a stop the
+ * user asked for is not news to them. Each message names its session and kind (`AssistantRemoteNotice`), so a channel that shows the
+ * session itself (a chat attached to it) can tell it already did. One the user typed into an attached chat is not said: they are
  * watching it, and their chat showed it. Either way the item is on the list the router reads every turn.
  *
  * What an agent wrote (its answer, a tool's title) and what a connector reported (the machine's name) were written by no one the
@@ -37,6 +41,7 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { findSession, issueCommand, wakeConnector } from "../remote-agents/store.js";
 import { newWorkItemId } from "../tasks/ids.js";
+import type { AssistantRemoteAsk, AssistantRemoteNotice } from "../notifications/assistant-events.js";
 import { recordSystemNotice } from "./outbound.js";
 import { clipOneLine, TITLE_MAX } from "./work-items.js";
 
@@ -325,7 +330,7 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
   });
 }
 
-interface MovingEvent { id: number; type: string; data: Record<string, unknown> }
+interface MovingEvent { id: number; type: string; occurred_at: string; data: Record<string, unknown> }
 
 /** What the agent answered in the turn that ended with event `endId`: its message chunks since the turn before it ended. */
 async function answerOf(q: Querier, sessionId: string, endId: number): Promise<string> {
@@ -340,13 +345,25 @@ async function answerOf(q: Querier, sessionId: string, endId: number): Promise<s
   return rows.reverse().map((r) => r.text).join("");
 }
 
+export type RemoteNoticeKind = "done" | "waiting" | "closed" | "refused" | "failed";
+
+/** Which of the three kinds of news a session's message is (`AssistantRemoteNotice.kind`). */
+export const remoteNoticeKind = (kind: RemoteNoticeKind): AssistantRemoteNotice["kind"] =>
+  kind === "done" ? "done" : kind === "waiting" ? "needs_you" : "error";
+
+/** How a turn ended badly enough to be an error, not a finish: the agent failed or refused (`stopReason`, ACP and the connector's own). */
+const FAILED_STOPS = new Set(["error", "refusal"]);
+
 /** What a remote item's end says to the user, in the language they asked in (the system's own words around the agent's). */
 export function remoteNotice(
-  kind: "done" | "waiting" | "closed" | "refused", p: Pick<RemoteParams, "machine" | "agent_id" | "asked" | "lang" | "session_id">,
+  kind: RemoteNoticeKind, p: Pick<RemoteParams, "machine" | "agent_id" | "asked" | "lang" | "session_id">,
   seq: number, detail: string,
 ): string {
   const zh = p.lang === "zh";
   const who = zh ? `${p.machine} 上的 ${p.agent_id}` : `${p.agent_id} on ${p.machine}`;
+  if (kind === "failed") {
+    return zh ? `${who} 出错了，#${seq} 没有做完：${p.asked}\n${detail}` : `${who} failed on #${seq}: ${p.asked}\n${detail}`;
+  }
   if (kind === "waiting") {
     return zh
       ? `${who} 在等你批准：${detail}（#${seq} ${p.asked}）。发 /agent attach ${p.session_id} 切过去处理。`
@@ -368,7 +385,31 @@ function stopWords(stop: string, error: string, lang: RemoteLang): string {
   return stop === "cancelled" ? "(cancelled)" : stop === "error" ? `(failed: ${error || "unknown"})` : `(ended: ${stop})`;
 }
 
-interface Notice { userId: string; routerSid: string; itemId: string; key: string; text: string }
+interface Notice { userId: string; routerSid: string; itemId: string; key: string; text: string; remote: AssistantRemoteNotice }
+
+/** The options a permission request offered, as its connector posted them: ids kept as given, words cut to one line. */
+function offeredOptions(v: unknown): AssistantRemoteAsk["options"] {
+  if (!Array.isArray(v)) return [];
+  const out: AssistantRemoteAsk["options"] = [];
+  for (const o of v.slice(0, 8)) {
+    if (!o || typeof o !== "object") continue;
+    const r = o as Record<string, unknown>;
+    if (typeof r.optionId !== "string" || !r.optionId || r.optionId.length > 128) continue;
+    out.push({ optionId: r.optionId, name: flat(r.name, 80), kind: flat(r.kind, 32) });
+  }
+  return out;
+}
+
+/** The permission request event `e` as a channel puts it to the person; null when it offered nothing that can be answered. */
+function askOf(e: MovingEvent, actionId: string, tool: string): AssistantRemoteAsk | null {
+  const options = offeredOptions(e.data.options);
+  if (!options.length) return null;
+  const timeout = Number(e.data.timeout_ms);
+  const at = Date.parse(e.occurred_at);
+  const expires = Number.isFinite(timeout) && timeout > 0 && timeout <= 24 * 3_600_000 && Number.isFinite(at)
+    ? new Date(at + timeout).toISOString() : null;
+  return { action_id: actionId, tool, options, ...(expires ? { expires_at: expires } : {}) };
+}
 
 /**
  * The owner's sessions gained events: each one's item takes the moving ones it has not applied, in order (its `last_event_id`), so
@@ -384,7 +425,7 @@ export async function noteRemoteEvents(owner: string, sessionIds: readonly strin
       if (notices === null) continue;
       changed += 1;
       for (const n of notices) {
-        await recordSystemNotice({ userId: n.userId, sessionId: n.routerSid, text: n.text, key: n.key, itemId: n.itemId })
+        await recordSystemNotice({ userId: n.userId, sessionId: n.routerSid, text: n.text, key: n.key, itemId: n.itemId, remote: n.remote })
           .catch((err) => logger.warn({ err, itemId: n.itemId }, "assistant.remote_notice_failed"));
       }
     } catch (err) {
@@ -404,20 +445,25 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
     )).rows[0] as { item_id: string; seq: number; board_state: string; attention_seq: number; params: RemoteParams; router_sid: string } | undefined;
     if (!item) return null;
     const events = (await q(
-      `SELECT id, type, data FROM claw_remote_events
+      `SELECT id, type, occurred_at, data FROM claw_remote_events
         WHERE session_id = $1 AND id > $2 AND type = ANY($3::text[]) AND COALESCE(data->>'replay', '') <> 'true'
         ORDER BY id LIMIT $4`,
       [sessionId, Number(item.params.last_event_id) || 0, MOVING, EVENTS_PER_PASS],
-    )).rows.map((r) => ({ id: Number(r.id), type: String(r.type), data: (r.data ?? {}) as Record<string, unknown> })) as MovingEvent[];
+    )).rows.map((r) => ({
+      id: Number(r.id), type: String(r.type), occurred_at: new Date(r.occurred_at).toISOString(), data: (r.data ?? {}) as Record<string, unknown>,
+    })) as MovingEvent[];
     if (!events.length) return null;
 
     const p: RemoteParams = { ...item.params, waiting: Array.isArray(item.params.waiting) ? [...item.params.waiting] : [] };
     let board = item.board_state;
     const notices: Notice[] = [];
     // Said only of an instruction the assistant sent: the user typed theirs into an attached chat, which showed it.
-    const tell = (key: string, text: string) => {
+    const tell = (key: string, kind: RemoteNoticeKind, text: string, ask?: AssistantRemoteAsk) => {
       if (p.origin !== "assistant") return;
-      notices.push({ userId: owner, routerSid: item.router_sid, itemId: item.item_id, key: `remote:${item.item_id}:${key}`, text });
+      const remote: AssistantRemoteNotice = {
+        kind: remoteNoticeKind(kind), session_id: sessionId, machine: p.machine, agent: p.agent_id, ...(ask ? { ask } : {}),
+      };
+      notices.push({ userId: owner, routerSid: item.router_sid, itemId: item.item_id, key: `remote:${item.item_id}:${key}`, text, remote });
     };
     // Each change is one statement on the row and one event row, in order.
     const write = async (set: string, values: unknown[], ev: { kind: string; summary: string | null; question?: string | null; result?: unknown }) => {
@@ -444,7 +490,10 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         [summary, p.origin === "assistant" ? 1 : 0],
         { kind: "answer", summary: [said, answer].filter(Boolean).join(" ") || summary, result: { stop_reason: stop || null, remote_event_id: e.id } },
       );
-      tell(`end:${e.id}`, remoteNotice("done", p, item.seq, [said, tailLines(whole, NOTICE_ANSWER_MAX)].filter(Boolean).join(" ") || summary));
+      // A turn that failed is an error, said as one; one that ended (or the agent cancelled by itself) finished. The user's own stop is
+      // not said: their stop button closed the item before its end came, and an attached chat's stop is theirs to see.
+      const kind: RemoteNoticeKind = FAILED_STOPS.has(stop) ? "failed" : "done";
+      tell(`end:${e.id}`, kind, remoteNotice(kind, p, item.seq, [said, tailLines(whole, NOTICE_ANSWER_MAX)].filter(Boolean).join(" ") || summary));
     };
     // The item ends with the refusal of the last prompt open, which never ran.
     const closeRefused = async (e: MovingEvent, reason: string) => {
@@ -454,7 +503,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
          closed_at = NOW(), attention_seq = attention_seq + $3::int`,
         [summary, p.origin === "assistant" ? 1 : 0], { kind: "dropped", summary },
       );
-      tell(`refused:${e.id}`, remoteNotice("refused", p, item.seq, reason));
+      tell(`refused:${e.id}`, "refused", remoteNotice("refused", p, item.seq, reason));
     };
     for (const e of events) {
       p.last_event_id = e.id;
@@ -527,14 +576,15 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         const actionId = flat(e.data.actionId, 128);
         if (!actionId || p.waiting.includes(actionId)) continue;
         p.waiting.push(actionId);
-        const what = flat(e.data.tool, 120) || (p.lang === "zh" ? "一个操作" : "an action");
+        const tool = flat(e.data.tool, 120);
+        const what = tool || (p.lang === "zh" ? "一个操作" : "an action");
         const question = p.lang === "zh" ? `等你批准：${what}` : `Waiting for your approval: ${what}`;
         board = "needs_you";
         await write(
           "board_state = 'needs_you', last_report_kind = 'waiting', pending_question = $2, attention_seq = attention_seq + $3::int",
           [question, p.origin === "assistant" ? 1 : 0], { kind: "waiting", summary: question, question },
         );
-        tell(`ask:${e.id}`, remoteNotice("waiting", p, item.seq, what));
+        tell(`ask:${e.id}`, "waiting", remoteNotice("waiting", p, item.seq, what), askOf(e, actionId, what) ?? undefined);
       } else if (e.type === REMOTE_EVENT_PERMISSION_RESOLVED) {
         const actionId = flat(e.data.actionId, 128);
         p.waiting = p.waiting.filter((a) => a !== actionId);
@@ -579,7 +629,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
            closed_at = NOW(), attention_seq = attention_seq + $3::int`,
           [summary, unfinished && p.origin === "assistant" ? 1 : 0], { kind: "dropped", summary },
         );
-        if (unfinished) tell(`closed:${e.id}`, remoteNotice("closed", p, item.seq, ""));
+        if (unfinished) tell(`closed:${e.id}`, "closed", remoteNotice("closed", p, item.seq, ""));
       }
     }
     await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, JSON.stringify(p)]);
