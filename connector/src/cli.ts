@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { fileURLToPath } from "node:url";
 import { main } from "./commands.js";
 import { resolveDirs } from "./paths.js";
 import type { Connector } from "./connector.js";
@@ -22,6 +23,7 @@ const onSignal = () => {
 
 main(process.argv.slice(2), {
   dirs: resolveDirs(),
+  cli: fileURLToPath(import.meta.url),
   env: process.env,
   out: (l) => process.stdout.write(l + "\n"),
   err: (l) => process.stderr.write(l + "\n"),

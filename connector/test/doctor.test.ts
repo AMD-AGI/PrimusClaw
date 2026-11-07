@@ -163,6 +163,10 @@ roots = [${JSON.stringify(work)}]
     const dirs = resolveDirs({ CLAW_CONNECTOR_HOME: tmpdir("doc-") } as NodeJS.ProcessEnv);
     const env = { PATH: bin, CLAUDE_CONFIG_DIR: tmpdir("doc-cc-") };
     assert.ok(codes(await checkAll({ dirs, agents: cfg.agents, by: "run" }, deps(env))).includes("claude:agent_not_signed_in"));
+    // An apiKeyHelper in Claude's own settings too.
+    fs.writeFileSync(path.join(env.CLAUDE_CONFIG_DIR, "settings.json"), JSON.stringify({ apiKeyHelper: "/usr/local/bin/key" }));
+    assert.ok(!codes(await checkAll({ dirs, agents: cfg.agents, by: "run" }, deps(env))).includes("claude:agent_not_signed_in"));
+    fs.rmSync(path.join(env.CLAUDE_CONFIG_DIR, "settings.json"));
     for (const k of ["ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK"]) {
       assert.ok(!codes(await checkAll({ dirs, agents: cfg.agents, by: "run" }, deps({ ...env, [k]: "1" }))).includes("claude:agent_not_signed_in"), k);
     }
@@ -183,6 +187,12 @@ roots = [${JSON.stringify(work)}]
     assert.match(p.fix, /set GW_TOKEN for this agent/);
     const withKey = await checkAll({ dirs, agents: cfg.agents, by: "run" }, deps({ PATH: bin, CODEX_HOME: cx, GW_TOKEN: "t" }));
     assert.ok(!codes(withKey).includes("codex:agent_not_signed_in"));
+    // An env_key that is a pasted key, not a name, is never repeated.
+    fs.writeFileSync(path.join(cx, "config.toml"), `model_provider = "gw"\n[model_providers.gw]\nenv_key = "sk-not-a-name/123"\n`);
+    const pasted = await checkAll({ dirs, agents: cfg.agents, by: "run" }, deps({ PATH: bin, CODEX_HOME: cx }));
+    assert.ok(!JSON.stringify(pasted).includes("sk-not-a-name"), JSON.stringify(pasted.problems));
+    assert.match(pasted.problems.find((x) => x.code === "agent_not_signed_in")?.detail ?? "", /env_key that is not a variable name/);
+    fs.writeFileSync(path.join(cx, "config.toml"), `model_provider = "gw"\n[model_providers.gw]\nbase_url = "https://gw.test"\nenv_key = "GW_TOKEN"\n`);
     // The agent's own [agents.env] counts: that is the environment its adapter gets.
     const ownEnv = parseConfig(`[[agents]]\nid = "codex"\npreset = "codex"\nroots = [${JSON.stringify(tmpdir("doc-w-"))}]\nenv = { GW_TOKEN = "t" }\n`);
     assert.ok(!codes(await checkAll({ dirs, agents: ownEnv.agents, by: "run" }, deps({ PATH: bin, CODEX_HOME: cx }))).includes("codex:agent_not_signed_in"));
@@ -401,7 +411,7 @@ wait
     fs.writeFileSync(path.join(home, "config", "agents.toml"), `[[agents]]\nid = "fake"\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(ADAPTER)}]\nask_mode = "default"\nroots = [${JSON.stringify(work)}]\n`);
     // The child is this source tree's cli.ts under tsx (production: node and the bundled cli.js).
     const c: Ctx = { dirs: resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv), env: { PATH: process.env.PATH, HOME: base, CLAW_CONNECTOR_HOME: home },
-      out: () => {}, err: () => {}, hostname: "ci", node: TSX, service: { cli: CLI_TS } };
+      out: () => {}, err: () => {}, hostname: "ci", node: TSX, cli: CLI_TS };
     let connector: any;
     let running: Promise<number> | undefined;
     try {

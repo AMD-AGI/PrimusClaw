@@ -41,6 +41,8 @@ export interface Ctx {
   /** What `doctor` and a running connector's health checks use to look at the machine (tests replace it, and then a
    *  running connector checks in place instead of in a child process). */
   doctor?: DoctorDeps;
+  /** This program's entry point (`cli.js`), which a running connector starts again for `health-check`. */
+  cli?: string;
   /** What `health-check` reads its agents from (default: this process's stdin). */
   stdin?: () => Promise<string>;
   /** How `doctor` asks a running connector (its pid) to check again (default: SIGWINCH). */
@@ -497,7 +499,8 @@ const HEALTH_CHILD_MS = 60_000;
  */
 function runHealth(ctx: Ctx, cfg: ConnectorConfig): (signal: AbortSignal) => Promise<Report> {
   if (ctx.doctor) return () => checkAll({ dirs: ctx.dirs, agents: cfg.agents, by: "run" }, ctx.doctor!);
-  const cli = ctx.service?.cli ?? fileURLToPath(import.meta.url);
+  // The entry point this process runs (cli.ts sets it); in the bundle every module's import.meta.url is dist/cli.js too.
+  const cli = ctx.cli ?? ctx.service?.cli ?? fileURLToPath(import.meta.url);
   const node = ctx.node ?? process.execPath;
   return async (signal) => {
     // The agents as this run loaded them (a root removed since is what the check is for: agents.toml read afresh would refuse it).

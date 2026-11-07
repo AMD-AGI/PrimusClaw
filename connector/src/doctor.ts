@@ -256,6 +256,10 @@ async function claudeSignedIn(env: NodeJS.ProcessEnv, d: DoctorDeps): Promise<bo
   const keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"];
   // A key or a cloud provider in the environment works whatever `claude auth status` says about an account sign-in.
   if (keys.some((k) => set(env, k))) return true;
+  const dir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(d.home, ".claude");
+  // An apiKeyHelper or a key in Claude's own settings works whatever `claude auth status` says about an account sign-in.
+  const settings = await readJson(path.join(dir, "settings.json"));
+  if (settings && (typeof settings.apiKeyHelper === "string" || (isObject(settings.env) && keys.some((k) => typeof (settings.env as Record<string, unknown>)[k] === "string")))) return true;
   const claude = await which("claude", env.PATH);
   if (claude) {
     const r = await d.probe(claude, ["auth", "status", "--json"], env);
@@ -264,10 +268,7 @@ async function claudeSignedIn(env: NodeJS.ProcessEnv, d: DoctorDeps): Promise<bo
       if (isObject(v) && typeof v.loggedIn === "boolean") return v.loggedIn;
     } catch { /* an older claude without `auth status`: fall through to the files */ }
   }
-  const dir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(d.home, ".claude");
   if (await fileExists(path.join(dir, ".credentials.json"))) return true;
-  const settings = await readJson(path.join(dir, "settings.json"));
-  if (settings && (typeof settings.apiKeyHelper === "string" || (isObject(settings.env) && keys.some((k) => typeof (settings.env as Record<string, unknown>)[k] === "string")))) return true;
   if (d.platform === "darwin") return null;
   return false;
 }
@@ -287,6 +288,8 @@ async function codexAuth(env: NodeJS.ProcessEnv, d: DoctorDeps): Promise<{ ok: t
   if (name !== "openai" && provider && provider.requires_openai_auth !== true) {
     const key = typeof provider.env_key === "string" ? provider.env_key : null;
     if (!key || set(env, key)) return { ok: true };
+    // A value that is not a variable name (a key pasted in by mistake) is never repeated into a report.
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)) return { ok: false, detail: `Codex's model provider "${name.slice(0, 64)}" has an env_key that is not a variable name`, fix: `set env_key in ${path.join(home, "config.toml")} to the NAME of the variable that holds the key` };
     return { ok: false, detail: `Codex uses the model provider "${name}", which reads ${key}, and ${key} is not set where the connector runs`, fix: `set ${key} for this agent: add it to the agent's env in agents.toml, or export it before starting the connector` };
   }
   if (set(env, "OPENAI_API_KEY")) return { ok: true };
