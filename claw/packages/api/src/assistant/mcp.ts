@@ -43,7 +43,7 @@ import {
 } from "./tools.js";
 import { modelChoiceOn } from "./model-choice.js";
 import { assistantMemoryOn, memoryForget, memoryRecall, memorySave, memoryUndo, memoryUpdate } from "./memory-tools.js";
-import { channelAction, confirmationAnswer, MAX_PRS, reviewModeSet, reviewRestart, reviewStart } from "./review-tools.js";
+import { channelAction, confirmationAnswer, MAX_PRS, prState, reviewModeSet, reviewRestart, reviewStart } from "./review-tools.js";
 import { REVIEWS_STARTED_AT_ONCE } from "./review-items.js";
 import { observeEveryTool, recordObservation } from "./observe.js";
 import { assistantCitationsOn } from "./citations.js";
@@ -253,6 +253,13 @@ const MODEL_PARAM_CHOICE = `${MODEL_PARAM_ASKED}; left out, the user's own defau
 
 /** The tools that act for the person (`review-tools.ts`); each refuses unless the turn answers their signed-in message. */
 function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims, choice: boolean): void {
+  mcp.tool(
+    "pr_state",
+    `Where each pull request stands on GitHub, read only: open, merged (merged_at, merge_commit, merged_by) or closed without a merge (closed_at); unknown when it could not be read. Up to ${MAX_PRS}. Call it before review_start, with every pull request the user named.`,
+    { prs: z.array(z.string()).describe("Each as owner/repo#number or its URL.") },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    (args) => answer(claims, "pr_state", () => prState(claims, args)),
+  );
   mcp.tool(
     "review_start",
     `Start a review of each pull request the user named, as a work item each, all in one call (up to ${MAX_PRS}; the first ${REVIEWS_STARTED_AT_ONCE} start, the rest wait for a slot and start by themselves). Merges only with merge=true.`,

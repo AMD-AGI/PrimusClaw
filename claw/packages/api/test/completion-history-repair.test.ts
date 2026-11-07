@@ -192,7 +192,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function deliverTool(messageId: string, actionId: string, status: "start" | "success") {
+async function deliverTool(messageId: string, actionId: string, status: "start" | "success" | "error") {
   await consumeSuccessfully({
     type: "toolUsed", message_id: messageId, actionId, tool: "run_command", status,
     description: `${actionId} result`, full_output: "large output excluded from history",
@@ -244,6 +244,22 @@ test("late worker completion repairs the original turn, tools, and summary witho
   }
   assert.deepEqual(await sideEffects(), beforeEffects);
   assert.deepEqual(completionEffectQueries(), []);
+});
+
+test("a call that failed or was refused (status error) keeps its answer in the turn the history is rebuilt from", async () => {
+  // Brain records a call whose tool answered its own error (a refused review_start: already_merged) as "error", not "success"
+  // (parity G3, 2026-11-07); the model still read that answer, so the turn keeps it beside the call.
+  await deliverTool(MESSAGE, "refused-tool", "start");
+  await deliverTool(MESSAGE, "refused-tool", "error");
+  await deliverTool(MESSAGE, "worked-tool", "start");
+  await deliverTool(MESSAGE, "worked-tool", "success");
+  await consumeSuccessfully(completion());
+  const answered = (await turns()).at(-1)!;
+  assert.deepEqual((answered.tool_calls as Array<{ actionId: string }>).map((t) => t.actionId), ["refused-tool", "worked-tool"]);
+  const results = answered.tool_results as Array<{ actionId: string; status: string; description: string }>;
+  assert.deepEqual(results.map((t) => [t.actionId, t.status, t.description]), [
+    ["refused-tool", "error", "refused-tool result"], ["worked-tool", "success", "worked-tool result"],
+  ]);
 });
 
 test("a worker result cannot be replaced by later synthetic or genuine duplicates", async () => {

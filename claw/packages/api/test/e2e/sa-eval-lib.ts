@@ -181,8 +181,9 @@ export function heldRequest(rows: readonly EventRow[], toolUseId: string): { ts:
 }
 
 /**
- * Whether the held call ran after its answer: a successful result of that very call (the same id). A denied call ends with
- * Brain's `decisionResult` and, at most, an error result. Null while neither has happened.
+ * Whether the held call ran after its answer: a result of that very call (the same id) that the tool itself answered, whether it
+ * worked ("success") or its tool answered an error (Brain's "error" with `is_error`). A denied call ends with Brain's `decisionResult`
+ * and, at most, an error result without `is_error`. Null while neither has happened.
  */
 export function heldCallRan(rows: readonly EventRow[], toolUseId: string): boolean | null {
   let ended = false;
@@ -190,7 +191,7 @@ export function heldCallRan(rows: readonly EventRow[], toolUseId: string): boole
     const d = r.data ?? {};
     const type = d.type ?? r.event_type;
     if (type === "toolUsed" && d.actionId === toolUseId && d.status !== "start") {
-      if (d.status === "success") return true;
+      if (d.status === "success" || (d.status === "error" && d.is_error === true)) return true;
       ended = true;
     }
     if (type === "decisionResult" && (d.tool_use_id === toolUseId || d.actionId === toolUseId) && d.decision !== "allow" && d.action !== "allow") ended = true;

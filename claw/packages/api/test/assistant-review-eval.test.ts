@@ -10,6 +10,8 @@
  *       different argument fails, and a call the tools refused is not counted
  *   E3  the stand-in refuses what the real tools refuse: a report's turn, a number not in the message, a person without leave
  *   E4  every case has an id of its own and states what it expects
+ *   E5  parity G3: a review and merge asked of merged pull requests is right only when pr_state is read and review_start is not
+ *       called at all, not even a call the tools refuse; a closed one the same; with one merged and one open, only the open one starts
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -33,10 +35,10 @@ const scripted = (calls: Array<{ name: string; input: Record<string, unknown> }>
   };
 };
 
-test("E1 the Router is given the review prompt and context, and the eleven tools", async () => {
+test("E1 the Router is given the review prompt and context, and the twelve tools", async () => {
   const tools = (await reviewRouterTools()).map((t) => t.name.replace("mcp__assistant__", ""));
   assert.deepEqual(tools, [
-    "channel_action", "confirmation_answer", "deliver_text", "review_mode_set", "review_restart", "review_start",
+    "channel_action", "confirmation_answer", "deliver_text", "pr_state", "review_mode_set", "review_restart", "review_start",
     "say", "work_create", "work_recall", "work_send", "work_stop",
   ]);
   const system = systemFor(byId("B4"));
@@ -89,4 +91,42 @@ test("E4 every case has an id of its own and states what it expects", () => {
   assert.equal(new Set(ids).size, ids.length);
   assert.ok(REVIEW_CASES.filter((c) => c.kind === "replay").length >= 12);
   for (const c of REVIEW_CASES) assert.ok(Array.isArray(c.expect), c.id);
+});
+
+test("E5 parity G3: merged or closed pull requests are answered from pr_state, with no review_start at all", async () => {
+  const tools = await reviewRouterTools();
+  const g3 = byId("G3-merged");
+  const prs = ["AMD-AGI/PrimusClaw#306", "AMD-AGI/PrimusClaw#308"];
+  // What the router is told: pr_state first, and no review_start for a merged or closed pull request.
+  assert.match(systemFor(g3), /first call pr_state with every pull request the user named/);
+  assert.match(systemFor(g3), /A pull request it says is merged gets no review_start/);
+  assert.match(systemFor(g3), /One it says is closed \(closed without a merge\) gets no review_start either/);
+  // The stand-in answers pr_state as the real tool does: where each stands, merged with when and its merge commit.
+  const states = (standIn(g3)("pr_state", { prs }).result as { prs: Array<Record<string, unknown>> }).prs;
+  assert.deepEqual(states.map((x) => [x.pr, x.state, x.merged_at, x.merge_commit]), [
+    ["AMD-AGI/PrimusClaw#306", "merged", "2026-11-06T09:50:16Z", "428a33dc26ef33c1a53fea29ebd8e87d67915ed6"],
+    ["AMD-AGI/PrimusClaw#308", "merged", "2026-11-06T09:50:33Z", "a13084055d8c4a58d972f832a2eb301d0542ca53"],
+  ]);
+  // Read, then answered: right.
+  const answered = await runReviewCase(g3, scripted([{ name: "pr_state", input: { prs } }, { name: "say", input: { text: "都已合入" } }]), tools);
+  assert.equal(scoreReviewCase(g3, answered).ok, true);
+  assert.ok(!answered.calls.some((x) => x.tool === "review_start"));
+  // review_start called anyway: wrong, though the tool refused it (already_merged) and nothing went through.
+  const asked = await runReviewCase(g3, scripted([{ name: "review_start", input: { prs, merge: true, reviewer: "eval-reviewer" } }]), tools);
+  assert.equal(asked.calls[0].refused, true);
+  assert.equal((asked.calls[0].result as { error: string }).error, "already_merged");
+  assert.deepEqual(scoreReviewCase(g3, asked), { ok: false, writes: [] });
+  // A closed one: the same.
+  const closed = byId("G3-closed");
+  const closedState = (standIn(closed)("pr_state", { prs: ["AMD-AGI/PrimusClaw#311"] }).result as { prs: Array<Record<string, unknown>> }).prs[0];
+  assert.deepEqual([closedState.state, closedState.closed_at], ["closed", "2026-11-06T11:00:00Z"]);
+  const closedAsked = await runReviewCase(closed, scripted([{ name: "review_start", input: { prs: ["AMD-AGI/PrimusClaw#311"], merge: true } }]), tools);
+  assert.equal((closedAsked.calls[0].result as { error: string }).error, "already_closed");
+  assert.equal(scoreReviewCase(closed, closedAsked).ok, false);
+  // One merged, one open: only the open one starts.
+  const mixed = byId("G3-mixed");
+  const onlyOpen = await runReviewCase(mixed, scripted([{ name: "review_start", input: { prs: ["AMD-AGI/PrimusClaw#312"], merge: true } }]), tools);
+  assert.equal(scoreReviewCase(mixed, onlyOpen).ok, true);
+  const both = await runReviewCase(mixed, scripted([{ name: "review_start", input: { prs: ["AMD-AGI/PrimusClaw#306", "AMD-AGI/PrimusClaw#312"], merge: true } }]), tools);
+  assert.equal(scoreReviewCase(mixed, both).ok, false);
 });

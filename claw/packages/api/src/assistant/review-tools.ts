@@ -54,7 +54,7 @@ import { resolveWorkItemNow } from "./work-items.js";
 import { modelChoiceOn } from "./model-choice.js";
 import { voidStreamedSay } from "./router-speed.js";
 import { dropHeldSays } from "./say-hold.js";
-import { mergedPulls, type MergedPull } from "./pr-state.js";
+import { pullStates, type PullState } from "./pr-state.js";
 
 export { confirmationRef };
 
@@ -99,8 +99,8 @@ export const reviewToolPorts = {
   decide: (userId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null, guard?: (q: Querier) => Promise<void>) =>
     decideConfirmation(githubReviewService(), db, userId, id, decision, via, guard),
   kick: (): Promise<void> => kickDelivery(),
-  /** Which of the pull requests a review request names GitHub says are merged, read as the person (`pr-state.ts`). */
-  mergedPulls: (userId: string, sessionId: string, prs: readonly PrRef[]): Promise<MergedPull[]> => mergedPulls(userId, sessionId, prs),
+  /** Where each pull request a review request names stands on GitHub (open, merged, closed), read as the person (`pr-state.ts`). */
+  pullStates: (userId: string, sessionId: string, prs: readonly PrRef[]): Promise<PullState[]> => pullStates(userId, sessionId, prs),
   /** Takes back what the turn streamed of a say (`router-speed.ts`). */
   voidStreamedSay: (sessionId: string, messageId: string | undefined, reason: string): Promise<void> =>
     voidStreamedSay(sessionId, messageId, reason),
@@ -579,20 +579,47 @@ async function askerNaming(claims: AssistantTokenClaims, prs: readonly PrRef[]):
 const ASKS_WHICH_REVIEWER: ReadonlySet<string> = new Set(["reviewer_not_named", "reviewer_not_in_message", "reviewer_not_linked"]);
 
 /**
- * Nothing is started, handed over or asked about for a pull request that is already merged: the person is told when it merged and its
- * merge commit instead (`pr-state.ts`). Only pull requests the message grounded reach here.
+ * Nothing is started, handed over or asked about for a pull request that is already merged, or closed without a merge: the person is
+ * told when it merged and its merge commit (or when it was closed) instead (`pr-state.ts`). Only pull requests the message grounded
+ * reach here. The router reads the same with `pr_state` before it calls review_start; this is what holds when it did not.
  */
 async function refuseMerged(userId: string, sessionId: string, prs: readonly PrRef[]): Promise<void> {
-  const merged = await reviewToolPorts.mergedPulls(userId, sessionId, prs);
-  if (!merged.length) return;
-  const open = prs.length - merged.length;
+  const states = await reviewToolPorts.pullStates(userId, sessionId, prs);
+  const merged = states.filter((s): s is Extract<PullState, { state: "merged" }> => s.state === "merged").map(({ state: _s, ...m }) => m);
+  const closed = states.filter((s): s is Extract<PullState, { state: "closed" }> => s.state === "closed").map(({ state: _s, ...c }) => c);
+  if (!merged.length && !closed.length) return;
+  const open = prs.length - merged.length - closed.length;
+  const are = (n: number) => (n === 1 ? "is" : "are");
+  const said = [
+    ...(merged.length ? [`${merged.map((m) => m.pr).join(", ")} ${are(merged.length)} already merged on GitHub (data.merged: when, by whom, the merge commit)`] : []),
+    ...(closed.length ? [`${closed.map((c) => c.pr).join(", ")} ${are(closed.length)} closed on GitHub without a merge (data.closed: when)`] : []),
+  ];
   throw new ToolRefused(
-    "already_merged",
-    `${merged.map((m) => m.pr).join(", ")} ${merged.length === 1 ? "is" : "are"} already merged on GitHub (data.merged: when, by whom, the merge commit), so nothing was started or handed over. `
-      + "Tell the user each one is already merged, with merged_at and the short merge commit, and that no review was asked for; ask nothing about the reviewer. "
-      + (open ? `The other ${open} ${open === 1 ? "is" : "are"} not merged: say that only those would be reviewed, and call review_start with only them if the user's message still asks for it.` : "Offer the next step: nothing more is needed, or a review after the merge if they want one."),
-    { merged },
+    merged.length ? "already_merged" : "already_closed",
+    `${said.join("; ")}, so nothing was started or handed over. `
+      + "Tell the user each one is already merged, with merged_at and the short merge commit, or closed, with when, and that no review was asked for; ask nothing about the reviewer. "
+      + (open ? `The other ${open} ${are(open)} neither merged nor closed: say that only those would be reviewed, and call review_start with only them if the user's message still asks for it.` : "Offer the next step: nothing more is needed, or a review after the merge if they want one."),
+    { ...(merged.length ? { merged } : {}), ...(closed.length ? { closed } : {}) },
   );
+}
+
+/**
+ * `pr_state`: where each pull request stands on GitHub (open, merged with when and its merge commit, closed with when), read as the
+ * person and only read. The router calls it before review_start, so a request about a pull request that is merged or closed is
+ * answered without any write being asked for (parity G3, 2026-11-07). It returns no text anyone wrote on the pull request, so a turn
+ * that read it may still act for the person.
+ */
+export async function prState(claims: AssistantTokenClaims, args: { prs: unknown }): Promise<Record<string, unknown>> {
+  requireRouter(claims);
+  const prs = parsePrs(args.prs);
+  const userId = await inTransaction(async (q) => (await assertLiveRun(q, claims)).userId);
+  const states = await reviewToolPorts.pullStates(userId, claims.sid, prs);
+  const unread = states.filter((s) => s.state === "unknown").length;
+  return {
+    ok: true,
+    prs: states,
+    ...(unread ? { note: `${unread} could not be read on GitHub (state unknown): for those, call review_start as before, which reads them again.` } : {}),
+  };
 }
 
 // --- Tools ------------------------------------------------------------------------------------------------------

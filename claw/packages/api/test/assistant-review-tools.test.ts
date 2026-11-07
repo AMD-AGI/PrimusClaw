@@ -49,6 +49,9 @@
  *       delivered; a say before the handoff, the next message's turn and another person's turn speak as always
  *   S9  a pull request GitHub says is already merged is said so before anything else: nothing starts or is handed over, the reviewer is
  *       not asked about, and the refusal carries when it merged and its merge commit (2026-11-06 parity run, G3)
+ *   S9c one GitHub says is closed without a merge is refused the same way (already_closed), with when it was closed
+ *   S11 pr_state only reads: it answers where each pull request stands (merged with when and its merge commit, closed, open), starts,
+ *       hands over and writes nothing, works in a turn that cannot act, and is the router's alone (2026-11-07 parity run, G3)
  *   R1  review_restart takes a review the user pointed at, and only a review
  *   R1b an item number is read whole: #11 does not point at #1, nor repo#1 at item #1
  *   C1  confirmation_answer allows only when the message is the exact approval command (批准 #<ref> / approve #<ref>) naming a
@@ -88,8 +91,9 @@ describe("assistant review tools", { skip }, () => {
   let saved: Record<string, unknown>;
   const calls: { start: Recorded[]; restart: Recorded[]; decide: Recorded[] } = { start: [], restart: [], decide: [] };
   let startAnswer: (request: Recorded) => Promise<unknown>;
-  /** What GitHub says is merged, by `owner/repo#number`, and the pull requests each check was asked about. */
+  /** What GitHub says is merged, and closed without a merge, by `owner/repo#number`, and the pull requests each check was asked about. */
   let mergedOnGithub: Record<string, { merged_at: string; merge_commit: string; merged_by: string }> = {};
+  let closedOnGithub: Record<string, { closed_at: string }> = {};
   const stateReads: string[][] = [];
 
   before(async () => {
@@ -112,10 +116,11 @@ describe("assistant review tools", { skip }, () => {
       return { http: 200, body: { ok: true, status: decision === "allow" ? "merged" : "denied" } };
     }) as never;
     rt.reviewToolPorts.kick = async () => undefined;
-    rt.reviewToolPorts.mergedPulls = (async (_userId: string, _sid: string, prs: Array<{ owner: string; repo: string; number: number }>) => {
+    rt.reviewToolPorts.pullStates = (async (_userId: string, _sid: string, prs: Array<{ owner: string; repo: string; number: number }>) => {
       const names = prs.map((p) => `${p.owner}/${p.repo}#${p.number}`);
       stateReads.push(names);
-      return names.filter((n) => mergedOnGithub[n]).map((n) => ({ pr: n, ...mergedOnGithub[n] }));
+      return names.map((n) => (mergedOnGithub[n] ? { pr: n, state: "merged", ...mergedOnGithub[n] }
+        : closedOnGithub[n] ? { pr: n, state: "closed", ...closedOnGithub[n] } : { pr: n, state: "open", draft: false }));
     }) as never;
   });
   after(async () => { Object.assign(rt.reviewToolPorts, saved); await w?.stop(); });
@@ -125,7 +130,7 @@ describe("assistant review tools", { skip }, () => {
       claw_github_review_settings, claw_assistant_review_handoffs CASCADE`);
     w.drains.length = 0;
     calls.start.length = 0; calls.restart.length = 0; calls.decide.length = 0;
-    mergedOnGithub = {}; stateReads.length = 0;
+    mergedOnGithub = {}; closedOnGithub = {}; stateReads.length = 0;
     startAnswer = async (request) => request.prs.map((p: Recorded, i: number) => ({ item_id: `kwi_s${i}`, seq: i + 1, pr: p.pr }));
     alice = await w.user("alice");
     bob = await w.user("bob");
@@ -793,6 +798,57 @@ describe("assistant review tools", { skip }, () => {
     const open = await userTurn(alice, `请 Wei Lei 帮我 review 并合入：\n${prs[0]}`, { context: ctx });
     assert.equal(((await rt.reviewStart(open, { prs: [prs[0]], merge: true, reviewer: "u-weilei" })) as Recorded).handed_off, true);
     assert.equal(await actionsRun(), 1);
+  });
+
+  test("S9c a pull request closed without a merge is refused as already_closed: nothing starts, nobody is asked about", async () => {
+    closedOnGithub = { "AMD-AGI/PrimusClaw#311": { closed_at: "2026-11-06T11:00:00Z" } };
+    const turn = await userTurn(alice, "帮我 review 并合入 https://github.com/AMD-AGI/PrimusClaw/pull/311");
+    let refusal: any;
+    await assert.rejects(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#311"], merge: true }), (err: any) => { refusal = err; return true; });
+    assert.equal(refusal.code, "already_closed");
+    assert.deepEqual(refusal.data, { closed: [{ pr: "AMD-AGI/PrimusClaw#311", closed_at: "2026-11-06T11:00:00Z" }] });
+    assert.match(refusal.message, /closed on GitHub without a merge[\s\S]*nothing was started or handed over/);
+    assert.equal(calls.start.length, 0, "no review started");
+    // Merged and closed together: already_merged, carrying both.
+    mergedOnGithub = { "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", merged_by: "zoroyihan7" } };
+    const both = await userTurn(alice, "帮我 review 并合入 AMD-AGI/PrimusClaw#306 和 AMD-AGI/PrimusClaw#311");
+    await assert.rejects(rt.reviewStart(both, { prs: ["AMD-AGI/PrimusClaw#306", "AMD-AGI/PrimusClaw#311"], merge: true }), (err: any) => { refusal = err; return true; });
+    assert.equal(refusal.code, "already_merged");
+    assert.deepEqual(Object.keys(refusal.data).sort(), ["closed", "merged"]);
+    assert.equal(calls.start.length, 0);
+  });
+
+  test("S11 pr_state only reads where each pull request stands: nothing starts, is handed over or written", async () => {
+    mergedOnGithub = {
+      "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", merged_by: "zoroyihan7" },
+      "AMD-AGI/PrimusClaw#308": { merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53", merged_by: "zoroyihan7" },
+    };
+    closedOnGithub = { "AMD-AGI/PrimusClaw#311": { closed_at: "2026-11-06T11:00:00Z" } };
+    const prs = ["https://github.com/AMD-AGI/PrimusClaw/pull/306", "https://github.com/AMD-AGI/PrimusClaw/pull/308"];
+    const text = `请 eval-reviewer 帮我 review 并合入下面 2 个 PR：\n${prs.join("\n")}`;
+    const ctx = { ...DEFAULT_CTX, people: [{ name: "Wei Lei", user_id: "u-weilei" }], handoffs: ["review_for_other"] };
+    await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
+    // The parity case as the eval runner sends it (a key's message, which cannot act) and as a person sends it: the same answer.
+    for (const how of [{ via: null, context: { channel: "api" } }, { context: ctx }]) {
+      const turn = await userTurn(alice, text, how);
+      const answer = await rt.prState(turn, { prs }) as Recorded;
+      assert.equal(answer.ok, true);
+      assert.deepEqual(answer.prs, [
+        { pr: "AMD-AGI/PrimusClaw#306", state: "merged", merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", merged_by: "zoroyihan7" },
+        { pr: "AMD-AGI/PrimusClaw#308", state: "merged", merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53", merged_by: "zoroyihan7" },
+      ]);
+      await w.closeRun(turn.task_id);
+    }
+    const mixed = await userTurn(alice, "看看 #311 和 #312");
+    assert.deepEqual(((await rt.prState(mixed, { prs: ["AMD-AGI/PrimusClaw#311", "AMD-AGI/PrimusClaw#312"] })) as Recorded).prs.map((x: Recorded) => x.state), ["closed", "open"]);
+    assert.equal(calls.start.length, 0, "no review started");
+    assert.equal(await actionsRun(), 0, "nothing handed to the channel");
+    assert.equal(await count("claw_assistant_review_handoffs"), 0);
+    assert.equal(await count("claw_work_items"), 0, "no item made");
+    // Bad input is refused as review_start refuses it; a worker cannot call it.
+    assert.equal(await code(rt.prState(mixed, { prs: [] })), "invalid_arguments");
+    assert.equal(await code(rt.prState(mixed, { prs: ["not a pr"] })), "invalid_arguments");
+    assert.equal(await code(rt.prState({ ...mixed, role: "worker" } as Claims, { prs: ["AMD-AGI/PrimusClaw#311"] })), "not_allowed");
   });
 
   test("S9b a turn that cannot act still says a merged pull request its message names: a key's message, a stale one", async () => {
@@ -1612,8 +1668,8 @@ describe("assistant review tools", { skip }, () => {
     };
     assert.deepEqual(await names(false), ["claw_self_status", "deliver_text", "say", "work_create", "work_recall", "work_send", "work_stop"]);
     assert.deepEqual(await names(true), [
-      "channel_action", "claw_self_status", "confirmation_answer", "deliver_text", "review_mode_set", "review_restart", "review_start",
-      "say", "work_create", "work_recall", "work_send", "work_stop",
+      "channel_action", "claw_self_status", "confirmation_answer", "deliver_text", "pr_state", "review_mode_set", "review_restart",
+      "review_start", "say", "work_create", "work_recall", "work_send", "work_stop",
     ]);
   });
 });

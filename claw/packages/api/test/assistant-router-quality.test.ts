@@ -302,12 +302,12 @@ describe("router quality, the prompt", () => {
     // live, a follow-up with the earlier files, progress from what the job wrote now with its age, a derived number from the unrounded
     // values; router-v17: a translation said alone, in the language asked for; router-v18: the tool for a worker's report, a request to
     // remember and a channel setting named outright; router-v19: the quick line before deliver_text, trigger_create, review_mode_set and
-    // devenv_); its review prompt is router-v23; router-read-v9 adds
+    // devenv_); its review prompt is router-v24; router-read-v9 adds
     // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
     // now from the source that states them.
     assert.equal(p.ROUTER_PROMPT_VERSION, "router-v19");
     assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v14");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v23");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v24");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): a say after it in the turn is added to that same message, so never repeat the start/],
