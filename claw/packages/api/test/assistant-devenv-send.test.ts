@@ -309,6 +309,15 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal(got[2].remote.kind, "error");
     assert.match(got[2].text, /^laptop 上的 claude 出错了，#\d+ 没有做完：再跑一次\n（出错：adapter_unavailable）/);
 
+    // One the connector would not type into a terminal in an unsafe mode: said in words, with the terminal's mode.
+    await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
+    await sendByCard(await userTurn(alice, "从手机输入"), { text: "从手机输入" });
+    await events("alice", cid, sid, [["turn_end", { stopReason: "error", error: "terminal_mode_not_allowed", terminal_mode: "bypassPermissions" }]]);
+    got = await pushed(itemId);
+    assert.equal(got.length, 4, JSON.stringify(got.map((g) => g.text)));
+    assert.equal(got[3].remote.kind, "error");
+    assert.match(got[3].text, /从手机输入\n（没有输入：终端会话处于 bypassPermissions，按你的审批设置不能从手机直接输入；在终端切到安全模式/);
+
     // One the machine refuses, and a session that closes before it finished: errors, each once.
     await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
     await sendByCard(await userTurn(alice, "第三次"), { text: "第三次" });
@@ -317,9 +326,9 @@ describe("development environment items and devenv_send", { skip }, () => {
     await sendByCard(await userTurn(alice, "第四次"), { text: "第四次" });
     await events("alice", cid, sid, [["session_closed", { reason: "agent_exited" }]]);
     got = await pushed(itemId);
-    assert.deepEqual(got.map((g) => g.remote?.kind), ["needs_you", "done", "error", "error", "error"], JSON.stringify(got.map((g) => g.text)));
-    assert.match(got[3].text, /没有接下/);
-    assert.match(got[4].text, /会话已关闭/);
+    assert.deepEqual(got.map((g) => g.remote?.kind), ["needs_you", "done", "error", "error", "error", "error"], JSON.stringify(got.map((g) => g.text)));
+    assert.match(got[4].text, /没有接下/);
+    assert.match(got[5].text, /会话已关闭/);
     assert.ok(got.every((g) => g.remote.session_id === sid));
   });
 

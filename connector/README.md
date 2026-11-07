@@ -344,7 +344,17 @@ product: the agent's `kind` is the label `attach`.
 **You do not have to add this agent.** Every agent made from the `claude` preset brings one with the same roots, adapter,
 approval and environment, named `<id>-sessions`, so the conversations already on the machine show up on the phone by
 themselves. `existing_sessions = false` on the `claude` agent turns that off; an explicit `claude-attach` agent reading the same
-Claude config directory replaces it.
+Claude config directory replaces it. `terminal_input` and `tmux_cli` (below) set on the `claude` agent are that derived agent's:
+`terminal_input = false` there keeps the watch and turns only the typing off.
+
+```toml
+[[agents]]
+id = "claude"
+preset = "claude"
+roots = ["~/work"]
+# terminal_input = false        # conversations open in a tmux pane are watched only, never typed into (default: true)
+# tmux_cli = "tmux"             # the tmux command used to type (default: tmux, from PATH)
+```
 
 Each entry also says, for a conversation a terminal holds open, what Claude Code says that terminal is doing (`activity`:
 `working`, `waiting` for the person at it, or `idle`; with `waiting`, `waiting_for` in its words, such as "input needed"). The
@@ -441,7 +451,22 @@ become spaces), so nothing in a message can act as a key or end the paste. Its t
 transcript records the end of the terminal's turn, when the turn is stopped there (`cancelled`), or once Claude Code has said it is
 idle for 5 seconds; a message that does not appear in the transcript within 20 seconds ends as `terminal_input_unconfirmed`. A
 `cancel` presses Esc in the terminal, which stops the turn there. A mode change is refused (`terminal_session`): the terminal keeps
-its own mode. The audit log records each message typed (`terminal_input`: the pid, the pane, its length, line count and a digest,
+its own mode.
+
+**The agent's approval policy applies to what is typed, as it does to a phone session.** A message runs in the terminal's own
+permission mode, so it is typed only when that mode is one this agent allows from the phone: one of its `safe_modes` (for Claude
+Code `default`, shown as "manual mode", and `plan`), or any mode once the owner set `approval = "never"` on the agent (or
+`allow_unsafe_modes = true` in the file); for a read-only agent (its `ask_mode` cannot write) only a read-only mode. The mode is read
+from the line Claude Code draws below its input box (`⏸ manual mode on`, `⏵⏵ accept edits on`, `⏵⏵ bypass permissions on`,
+`⏵⏵ auto mode on`, `⏵⏵ don't ask on`, `⏸ plan mode on`), on the same screen that shows the box empty and again right before the
+keys go: the transcript records a mode only with the next prompt, so a switch with shift+tab at an idle terminal is not in it.
+In any other mode the message is refused and nothing is typed (`command_rejected` and `turn_end` with `terminal_mode_not_allowed`
+and `terminal_mode` naming the mode); the terminal is never switched to another mode for it. When that line names no mode (another
+screen in its place for 3 seconds, or a Claude Code too old to name its default mode) it is refused as `terminal_mode_unknown`.
+So with `approval = "ask"` (the default) and a terminal in `auto`, `acceptEdits` or `bypassPermissions` mode, switch the terminal
+to manual or plan mode, or set `approval = "never"` on the agent, to type into it from the phone. A message that starts with `!`
+(Claude Code runs the rest as a shell command, with no question) or `/` (a slash command such as `/permissions` or `/add-dir`) is
+never typed, in any mode (`terminal_command_refused`). The audit log records each message typed (`terminal_input`: the pid, the pane, its length, line count and a digest,
 never its words). The heartbeat marks such a conversation `input: "terminal"` and the agent's capabilities say `terminal_input: true`.
 
 Only the terminal of this connector's own user is typed into, and only one that is proven: exactly one local process holds the
@@ -451,7 +476,8 @@ and that tmux server reports a pane whose process is that process or one of its 
 again: the same process (same start time) still runs in that pane, and Claude Code's registry row for it still names this
 conversation (a `/resume` or `/clear` in that terminal moves it to another one: the message is refused, `terminal_switched`). Anything less (a plain terminal, `screen`,
 another user's tmux, two terminals on one conversation, a holder on another machine, not Linux) is watched read-only as above, and
-`session_started` says why (`read_only_why`). The owner turns it off with `terminal_input = false` on the agent. Claude Code's
+`session_started` says why (`read_only_why`). The owner turns it off with `terminal_input = false` on the agent (on a `claude`
+agent, for the `<id>-sessions` agent derived from it). Claude Code's
 own messaging between sessions was not used for this: a message sent that way arrives as a message from another session, not as
 the person's own input. A second `claude --resume` process was not either: two writers fork the conversation.
 
