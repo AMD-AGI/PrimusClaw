@@ -323,7 +323,7 @@ describe("router quality, the prompt", () => {
       // Parity K2 (2026-11-07): "why are these 3 nodes unhealthy" answered from allocation phases (all Ready) and a guess at the page,
       // without reading any node's health.
       ["health is read from the health fields", /Why something is unhealthy, failing or marked bad \(nodes on a page or dashboard\): read the health itself, for each one, not only a phase or state \(Ready is not healthy\)/],
-      ["Autopilot node health is node_status", /For Autopilot nodes that is get_metrics with chart node_status \(each node's bad reasons and the age of its last health reading, vk_not_ready\), node_health for when it changed, and get_events of each node/],
+      ["Autopilot node health is node_status", /For Autopilot nodes that is get_metrics with chart node_status \(each node's bad reasons and the age of its last health reading, vk_not_ready\), get_metrics with chart node_health and a range for when it changed, and get_events of each node/],
       ["a premise that does not hold is said first", /When they show nothing unhealthy now, say in the first line that the premise does not hold now, with what you read/],
       ["progress is read live", /When the user asks how far an item got, what it is doing now, or when it will finish, look now: call work_recall\(item, "live"\)/],
       ["progress is never estimated", /Never work out how far it got or when it ends from when it started or how long it was expected to take/],
