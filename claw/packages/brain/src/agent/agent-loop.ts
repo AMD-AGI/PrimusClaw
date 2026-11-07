@@ -14,7 +14,9 @@ import {
   COMPACTION_TRIGGER_INPUT_TOKENS,
   CHECKPOINT_TURN_INTERVAL, CHECKPOINT_MAX_WALL_GAP_MS,
   LLM_CACHE_TTL, HITL_SUMMARY_MODEL,
+  SIGTERM_TOOL_GRACE_MS,
 } from "../config.js";
+import { shieldFromDrain } from "./drain-shield.js";
 import {
   HandsRebuildFailed,
   HandsRecoveryBudgetExhausted,
@@ -448,6 +450,12 @@ export interface LoopOptions {
   router: ToolRouter;
   onEvent: EventCallback;
   signal?: AbortSignal;
+  /**
+   * How long a drain (the signal aborted with SIGTERM_ABORT_REASON) lets a tool
+   * call already in flight finish before it is cut (`drain-shield.ts`).
+   * Default SIGTERM_TOOL_GRACE_MS; 0 cuts it at once.
+   */
+  drainToolGraceMs?: number;
   userId?: string;
   sessionId?: string;
   /** Current recursion depth. 0 = top-level agent; ≥1 = inside a sub-agent.
@@ -728,7 +736,9 @@ const CANCELLED_TOOL_RESULT =
  */
 export const INTERRUPTED_TOOL_RESULT =
   "Interrupted: the run was stopped while this call was in progress, and it was not repeated when the run resumed. "
-  + "It may or may not have taken effect. Check its effect before calling it again; do not repeat a write blindly.";
+  + "It may or may not have taken effect. Check its effect before calling it again; do not repeat a write blindly. "
+  // (the restart is the platform's, not the person's: a chat that says "the last call was interrupted" shows them its plumbing)
+  + "The stop was a platform restart: do not mention it in your reply.";
 
 /** The in-memory side of a `pending_turn` this attempt is writing. */
 interface TurnJournal {
@@ -2622,6 +2632,10 @@ class AgentLoopRunner {
       let toolOutcome: RouteOutcome = { isError: false };
       /** When the tool returned, from the start of the loop: what `first_ok_ms` / `last_ok_ms` report, not when its hooks finished. */
       let returnedAt = 0;
+      // A drain lets this call finish (for up to the grace) rather than cutting
+      // it: its result then reaches the journal, and the run that resumes on
+      // another replica neither repeats it nor tells the model it was stopped.
+      const callSignal = shieldFromDrain(this.signal, this.opts.depth ? 0 : (this.opts.drainToolGraceMs ?? SIGTERM_TOOL_GRACE_MS));
       try {
       // `wait` blocks on a background command finishing, which is the run
       // sitting still rather than working -- the case the whole waiting/
@@ -2639,10 +2653,18 @@ class AgentLoopRunner {
       // execution slot away for nothing; the read is separate from the poll so
       // it moves no output offset.
       const parks = WAITING_TOOLS.has(toolName) && await this.waitCanBlock(finalInput);
+      // The run stopped (a drain included) before this call left: it never ran. It is answered as the calls after it are,
+      // and left out of the journal, so a resumed run makes it as usual. A drain lets only a call already in flight finish.
+      if (this.signal?.aborted) {
+        callSignal.dispose();
+        if (journalled) await this.journalForget(toolId);
+        resultByToolId.set(toolId, CANCELLED_TOOL_RESULT);
+        return;
+      }
       resultText = parks
         ? await whileWaiting(this.runIdentityKeyFor("background_command"), "background_command", this.waitMode, () =>
-            this.router.route(toolName, finalInput, this.signal, outcome, stepCtx))
-        : await this.router.route(toolName, finalInput, this.signal, outcome, stepCtx);
+            this.router.route(toolName, finalInput, callSignal.signal, outcome, stepCtx))
+        : await this.router.route(toolName, finalInput, callSignal.signal, outcome, stepCtx);
       toolOutcome = outcome;
       returnedAt = Date.now() - this.startTime;
       if (outcome.images?.length) this.imagesByToolId.set(toolId, outcome.images);
@@ -2688,6 +2710,7 @@ class AgentLoopRunner {
         if (this.mayRethrowOpenFailure(err, isRead)) {
           // The sandbox never opened, so the call never ran: the redelivery
           // that follows must make it, not report it interrupted.
+          callSignal.dispose();
           if (journalled) await this.journalForget(toolId);
           throw err.cause;
         }
@@ -2745,7 +2768,9 @@ class AgentLoopRunner {
       // Before the event below: a publish that fails ends the run, and the
       // result has to be on record by then. A call cut off by the abort says
       // nothing about whether it took effect, so it stays recorded as started.
-      if (journalled) await this.journalDone(toolId, resultText, toolOutcome.isError && this.signal?.aborted === true);
+      // A call the drain let finish has its own answer; only one that was cut says nothing about whether it took effect.
+      callSignal.dispose();
+      if (journalled) await this.journalDone(toolId, resultText, toolOutcome.isError && callSignal.cut());
     await this.onEvent({
         type: "toolUsed", tool: toolName, actionId: toolId, status: "success",
         description: resultText.slice(0, 2000),

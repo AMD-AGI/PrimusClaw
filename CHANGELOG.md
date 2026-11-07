@@ -102,6 +102,12 @@ record it.
   while they open the stream on another replica, so a rolling update is neither an offline transition in
   `claw_remote_connector_transitions` nor a reason to tell anyone; a connector that does not come back is offline once the 90 s
   online window has passed, as before. Live releases had shown each connector offline for 2-7 s.
+- A Brain rollout no longer cuts a tool call in flight. A drain used to abort every run at once: Hands killed the foreground command
+  with its request, the run resumed on another replica told the call was interrupted, and the model said so in the chat and ran the
+  command again (one chat turn, cut twice by one rollout, ran its `sleep 90` three times and showed both explanations). A drain now
+  lets a call already in flight finish, for up to `SIGTERM_TOOL_GRACE_MS` (default the foreground ceiling plus 20 s, at most 180 s,
+  inside the chart's 300 s grace), and the resumed run continues from its recorded result. A call still running then is cut as
+  before, and the model is told not to mention the restart.
 - Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
   忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
   not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with
