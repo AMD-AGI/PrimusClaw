@@ -301,9 +301,10 @@ describe("router quality, the prompt", () => {
     // router-v16 (this rule set, a long answer said whole, a say after the start notice added to it, one message a turn, progress read
     // live, a follow-up with the earlier files, progress from what the job wrote now with its age, a derived number from the unrounded
     // values; router-v17: a translation said alone, in the language asked for); its review prompt is router-v21; router-read-v9 adds
-    // "how many" answered with the list, and a pull request that does not exist said so.
+    // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
+    // now from the source that states them.
     assert.equal(p.ROUTER_PROMPT_VERSION, "router-v17");
-    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v9");
+    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v10");
     assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v21");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
@@ -313,6 +314,11 @@ describe("router quality, the prompt", () => {
       ["GitHub only by its tools", /read with these mcp__github__ tools only: never with web_fetch of api\.github\.com or a github\.com page they read, and never with another server's tools \(the agent board is not GitHub\)/],
       ["research again in other words", /search again with other words \(other names, the other language, the one distinctive detail alone\), two or three times/],
       ["answer with the best candidate", /answer with the best candidate you found and say which detail you could not confirm/],
+      // Parity R1/R2 (2026-11-07): the patch version from a releases page that lagged stable.txt, a distribution list from a page
+      // about an older ROCm.
+      ["a current fact is read now, never remembered", /A current fact \(the latest or stable version of something, when it was released, which hardware, operating systems or versions it supports\): read it now from the source that states it, never from what you remember/],
+      ["the latest version from the release record", /The latest version comes from the project's own release record \(for Kubernetes https:\/\/dl\.k8s\.io\/release\/stable\.txt; for a project released on GitHub its latest release[^\n]*https:\/\/github\.com\/<owner>\/<repo>\/releases\/latest[^\n]*not from a page that lists releases, which can lag behind it/],
+      ["support from that version's own matrix", /What a version supports comes from that version's own compatibility matrix or system requirements page: when a page says it describes an older version, read the one for the version you are answering about, and if you cannot, say which version your answer comes from/],
       ["progress is read live", /When the user asks how far an item got, what it is doing now, or when it will finish, look now: call work_recall\(item, "live"\)/],
       ["progress is never estimated", /Never work out how far it got or when it ends from when it started or how long it was expected to take/],
       ["progress from what the job wrote now", /files_now, when it is there, is newer than the worker's steps[^\n]*answer from its latest line/],

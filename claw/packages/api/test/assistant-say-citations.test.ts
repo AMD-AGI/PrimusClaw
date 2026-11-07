@@ -26,7 +26,7 @@ const {
   saySources, sourceTitle, citedNumbers, makesLink, routerCite, citeLinkServers, userAddresses, SAY_SOURCES_MAX_BYTES, SAY_SOURCE_TITLE_MAX, USER_ADDRESSES_MAX,
 } = await import("../src/assistant/citations.js");
 const { TURN_STATE_HEADER } = await import("../src/assistant/prompts.js");
-const { renderRouterReadSection } = await import("../src/assistant/prompts.js");
+const { renderRouterReadSection, ROUTER_CITE_PROMPT_VERSION } = await import("../src/assistant/prompts.js");
 const { CITE_DROPPED_META, CITE_SOURCES_META, GITHUB_MCP_SERVER } = await import("@claw/protocol");
 
 const PR = "https://github.com/AMD-AGI/PrimusClaw/pull/309";
@@ -137,6 +137,10 @@ test("SC4 a router turn cites with say, from the API's GitHub server when it has
   const off = renderRouterReadSection({ servers: [], github: ["pr_get"] });
   assert.match(on, /Citing what you looked up/);
   assert.match(on, /sources\[0\] is \[1\]/);
+  // router-cite-v4: a page fetched at an address the router knew is never a source (Brain keeps a fetch only at an address a lookup
+  // or the user gave), so an official page it wants to cite is found with web_search beside the fetch.
+  assert.match(on, /neither can one fetched at an address you knew yourself: to cite an official page you know \(a compatibility matrix, a release page\), search for it in the first step, beside fetching it, and cite it at the address the search gave/);
+  assert.equal(ROUTER_CITE_PROMPT_VERSION, "router-cite-v4");
   assert.doesNotMatch(on, /with the links for what came from the web/);
   assert.match(off, /with the links for what came from the web/);
   assert.doesNotMatch(off, /Citing what you looked up|sources\[0\]/);

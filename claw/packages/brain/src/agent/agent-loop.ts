@@ -50,6 +50,7 @@ import { randomUUID } from "node:crypto";
 import { getProvider } from "../llm/index.js";
 import type { LlmSession, StreamTurnOptions } from "../llm/provider.js";
 import { looksLikeToolArgumentsRejection, sanitizeToolUseInputs } from "../llm/tool-input.js";
+import { offeredToolName } from "../tools/offered-name.js";
 
 const logger = pino({ name: "agent-loop" });
 
@@ -1999,6 +2000,9 @@ class AgentLoopRunner {
     // for information the next turn with text carries anyway.
 
     const toolUses = content.filter((b: any) => b.type === "tool_use");
+    // A short name for an offered MCP tool (`say` for `mcp__assistant__say`) is that tool: renamed in place, before anything
+    // reads the call, so the checks below, the router and the history all see the name the model was given (`offered-name.ts`).
+    this.nameOfferedTools(toolUses);
     const saidSomething = content.some(
       (b: any) => b.type === "text" && typeof b.text === "string" && b.text.trim() !== "",
     );
@@ -2804,6 +2808,18 @@ class AgentLoopRunner {
       return false;
     }
     return true;
+  }
+
+  /** Rename each call made by an offered MCP tool's short name to that tool's full name (`offeredToolName`). */
+  private nameOfferedTools(toolUses: any[]): void {
+    let offered: string[] | null = null;
+    for (const tc of toolUses) {
+      offered ??= this.effectiveTools.map((t) => t.name);
+      const full = offeredToolName(tc.name, offered);
+      if (!full) continue;
+      logger.warn({ sessionId: this.sessionId, toolName: tc.name, offered: full }, "tool.short_name_resolved");
+      tc.name = full;
+    }
   }
 
   /**
