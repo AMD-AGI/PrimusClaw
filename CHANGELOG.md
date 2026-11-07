@@ -101,6 +101,9 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- The brief's SaFE section works for members who are not administrators. SaFE refuses them a workload list across workspaces
+  (403), so every such brief said "SaFE 没有回答：safe_http_403". After a 403 the brief now lists the user's own workspaces and reads
+  each one (at most 20); a workspace that refuses is left out, and SaFE is unreadable only when every one refuses.
 - A machine paired from the chat (`claw-connector pair`) and then disconnected is told, wherever the connector says what to do next
   (the revocation itself, `run` started again by the service or by hand, the supervisor's log line, `status`, `service status`,
   `doctor`'s fix, a sign-in refused at start), to ask the
