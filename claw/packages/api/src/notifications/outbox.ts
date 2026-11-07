@@ -413,16 +413,18 @@ export function receiverDown(status: string): boolean {
 }
 
 /**
- * A subscription whose receiver just answered 2xx after failing: every row of it that waits out a backoff from an earlier failure is
- * due now, so what queued during an outage goes out with the probe's success instead of when each row's own wait runs out. Rows
- * never tried (a held say, `say-hold.ts`) and a first send another replica holds are not touched. Returns how many were released.
+ * A subscription whose receiver just answered 2xx after failing: every row of it that waits out a long backoff from an earlier
+ * failure is due now, so what queued during an outage goes out with the probe's success instead of when each row's own wait runs
+ * out. Not touched: a row never tried (a held say, `say-hold.ts`), and any row due within `CLAIM_LEASE_SECONDS` -- which is every
+ * row a replica has claimed and may be sending right now (its lease), so releasing it cannot send it twice; such a row goes within
+ * that time anyway. Returns how many were released.
  */
 async function releaseWaiting(subscriptionId: string): Promise<number> {
   const r = await db.query(
     `UPDATE claw_notification_outbox SET next_attempt_at = NOW()
       WHERE subscription_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL
-        AND attempts > 0 AND last_status IS NOT NULL AND next_attempt_at > NOW()`,
-    [subscriptionId],
+        AND attempts > 0 AND last_status IS NOT NULL AND next_attempt_at > NOW() + make_interval(secs => $2)`,
+    [subscriptionId, CLAIM_LEASE_SECONDS],
   );
   return r.rowCount ?? 0;
 }

@@ -271,12 +271,18 @@ describe("notification outbox", { skip }, () => {
       assert.ok(probe[1] > outbox.PROBE_SECONDS - 2 && probe[1] <= outbox.PROBE_SECONDS, `the oldest row is the probe: waits ${probe[1]}s`);
       for (const [id, w] of rest) assert.ok(w > 298 && w <= 300, `${id} keeps the backoff: waits ${w}s`);
 
+      // A fourth row another replica has just claimed for a retry: leased, so it may be on the wire now.
+      await q(
+        `INSERT INTO claw_notification_outbox (event_id, subscription_id, payload, attempts, last_status, next_attempt_at)
+         VALUES ('ev-leased', $1, '{}'::jsonb, 5, 'http_503', NOW() + interval '120 seconds')`,
+        [sub.id],
+      );
       status = 200;
       sent.length = 0;
       await q("UPDATE claw_notification_outbox SET next_attempt_at = NOW() - interval '1 second' WHERE event_id = 'ev-0'");
       await outbox.kickDelivery({ transport, resolve: pub, allowedHosts: new Set() });
       assert.deepEqual(sent.map((r) => r.headers[EVENT_ID_HEADER]), ["ev-0", "ev-1", "ev-2"],
-        "the probe's 2xx releases the rest, sent in the same kick and in order, not 300 s later");
+        "the probe's 2xx releases the rest, sent in the same kick and in order, not 300 s later; a leased row is not sent twice");
       assert.equal(((await q("SELECT COUNT(*)::int AS n FROM claw_notification_outbox WHERE delivered_at IS NOT NULL")).rows[0] as any).n, 3);
     });
 
