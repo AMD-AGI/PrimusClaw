@@ -470,7 +470,8 @@ the connector sees it within a heartbeat, stops every agent and exits without re
 
 `~/.config/claw-connector/` (or `$XDG_CONFIG_HOME/claw-connector/`, or `$CLAW_CONNECTOR_CONFIG_DIR`): `agents.toml`, `credentials.json`
 (0600; a file other users can read is refused), and `service-env.json` (0600, the agents' sign-in variables `service install` kept). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME/claw-connector/`): `connector.json` (the connector's identity and the
-commands handled), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
+commands handled), `connector-id.json` (the identity alone, written once and flushed to the disk: a `connector.json` damaged
+by a crash falls back to it instead of registering the machine as a new connector), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
 decisions, every command received, every permission request and answer, every automatic approval, mode changes),
 `logs/`, `children.json`, `connector.pid`, `disconnects.jsonl`, `needs-login.json` (only after a run that needs a new sign-in), `doctor.json`
 (the last `doctor` report), and with the script supervisor `supervisor.pid`, `keepalive.sh`, `keepalive-last` (when it last ran) and `run.log`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.

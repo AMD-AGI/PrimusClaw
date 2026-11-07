@@ -24,7 +24,7 @@ import { checkAll, defaultDeps, formatReport, runProbe, shq, writeReport, type D
 import { applyServiceEnv, cmdService, cmdSupervise, ephemeralWhere, loadServiceEnv, startAfterLogin, type ServiceDeps } from "./service.js";
 import { cmdPair } from "./pair.js";
 import {
-  auditFile, childrenFile, configFile, credentialsFile, doctorFile, identityFile, logDir, pauseFile, pidFile, serviceEnvFile, stopRequestFile, type Dirs,
+  auditFile, childrenFile, configFile, credentialsFile, doctorFile, forgetIdentity, identityFile, logDir, pauseFile, pidFile, serviceEnvFile, stopRequestFile, type Dirs,
 } from "./paths.js";
 import { UrlError, errMessage, isObject, secureUrl, sleep, stderrLogger } from "./util.js";
 import { VERSION } from "./version.js";
@@ -455,7 +455,7 @@ function forgetRevokedIdentity(ctx: Ctx): void {
   const file = identityFile(ctx.dirs);
   let revoked = false;
   try { const raw: unknown = JSON.parse(fs.readFileSync(file, "utf8")); revoked = isObject(raw) && raw.revoked === true; } catch { /* none, or unreadable: run starts over from it */ }
-  if (revoked) fs.rmSync(file, { force: true });
+  if (revoked) forgetIdentity(ctx.dirs);
 }
 
 async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
@@ -867,7 +867,7 @@ async function cmdLogout(ctx: Ctx): Promise<number> {
     }
   }
   fs.rmSync(file, { force: true });
-  if (rowGone) fs.rmSync(identityFile(ctx.dirs), { force: true });
+  if (rowGone) forgetIdentity(ctx.dirs);
   else forgetRevokedIdentity(ctx);
   if (row && notRevoked !== null) {
     ctx.err(`signed out on this machine, but connector ${row.connector_id} was NOT revoked at Claw (${notRevoked}).`);

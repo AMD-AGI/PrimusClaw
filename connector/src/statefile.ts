@@ -48,12 +48,39 @@ export async function timed(what: string, op: () => Promise<unknown>, report?: W
   }
 }
 
-/** Write `data` to `file` whole: a temporary file, then a rename, so a reader sees the old content or the new. */
-export async function writeWhole(file: string, data: string, mode = 0o600): Promise<void> {
-  await fsp.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+/**
+ * Write `data` to `file` whole: a temporary file, then a rename, so a reader sees the old content or the new.
+ *
+ * `durable` also flushes the data to the disk before the rename (and the rename after it), so that holds after the machine
+ * went down too. Without it a rename can reach the disk before the data it names (a network file system's client, ext4
+ * without auto_da_alloc): after a crash the file is there but empty or garbage. connector.json read that way made a
+ * machine register again as a new connector (2026-11-07, a node reboot). A flush costs tens of milliseconds on some
+ * disks, so only the files that name the connector take it, not the outbox and session files written per event.
+ */
+export async function writeWhole(file: string, data: string, mode = 0o600, durable = false): Promise<void> {
+  const dir = path.dirname(file);
+  await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
   const tmp = `${file}.tmp`;
-  await fsp.writeFile(tmp, data, { mode });
+  if (!durable) {
+    await fsp.writeFile(tmp, data, { mode });
+    await fsp.rename(tmp, file);
+    return;
+  }
+  const fh = await fsp.open(tmp, "w", mode);
+  try {
+    await fh.writeFile(data);
+    // A file system (or a special file) that cannot flush on request says so with EINVAL/ENOTSUP: written as before then.
+    await fh.sync().catch((e: NodeJS.ErrnoException) => { if (e.code !== "EINVAL" && e.code !== "ENOTSUP") throw e; });
+  } finally {
+    await fh.close();
+  }
   await fsp.rename(tmp, file);
+  // The rename itself, best effort: a directory cannot be opened for this everywhere (Windows), and the content is safe
+  // either way (a rename that did not last leaves the previous, whole, file).
+  try {
+    const d = await fsp.open(dir, "r");
+    try { await d.sync(); } finally { await d.close(); }
+  } catch { /* not supported here */ }
 }
 
 /**
@@ -69,7 +96,8 @@ export class SnapshotFile {
   private running: Promise<void> | null = null;
   private readonly waiters: Array<{ upTo: number; resolve: (ok: boolean) => void }> = [];
 
-  constructor(readonly file: string, private readonly report?: WriteReport) {}
+  /** `durable`: each write is flushed to the disk before it replaces the file ({@link writeWhole}). */
+  constructor(readonly file: string, private readonly report?: WriteReport, private readonly durable = false) {}
 
   save(data: string): void {
     this.latest = data;
@@ -97,7 +125,7 @@ export class SnapshotFile {
   private async drain(): Promise<void> {
     while (this.written < this.saved && this.failed < this.saved) {
       const upTo = this.saved;
-      const ok = await timed(`writing ${this.file}`, () => writeWhole(this.file, this.latest), this.report);
+      const ok = await timed(`writing ${this.file}`, () => writeWhole(this.file, this.latest, 0o600, this.durable), this.report);
       if (ok) this.written = upTo;
       else this.failed = upTo;
       for (let i = this.waiters.length - 1; i >= 0; i--) {
