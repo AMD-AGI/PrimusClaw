@@ -776,6 +776,24 @@ test("R5e a session check that cannot answer is an ordinary cancel, not a failed
   assert.equal(world.rec.state, "ended");
 });
 
+test("R5e2 the row's own session_deleted is enough, when the tombstone cannot answer", async () => {
+  const { SESSION_DELETED_STOP_GRACE_SEC } = await import("../src/apps/app-runner.js");
+  const world = new World({ ...MANIFEST, stop_grace_sec: 900 }, { grant_id: "gr-01arz3ndektsv4rrffq69g5fav" });
+  world.onTerm = () => undefined;
+  const revokedAt: number[] = [];
+  const grant: AppGrantRunHooks = { env: async () => ({}), revoke: async () => { revokedAt.push(world.now()); }, extend: noopAppGrant.extend };
+  const runner = new AppRunner(RUN_ID, PLATFORM_KEY, {
+    store: world.store, sandbox: world.sandbox, grant, now: world.now, sleep: world.sleep, tickMs: 5000,
+    sessionDeleted: async () => { throw new Error("tombstone bucket unavailable"); },
+  });
+  for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
+  world.rec = { ...world.rec, session_deleted: true };
+  const cancelledAt = world.now();
+  await runner.finishNow("cancelled");
+  assert.deepEqual(revokedAt, [cancelledAt], "revoked at once, from the row's word alone");
+  assert.ok(world.stoppedAt[0]! - cancelledAt <= (SESSION_DELETED_STOP_GRACE_SEC + 10) * 1000);
+});
+
 test("R5f a run its user cancelled gets no sandbox, read from the row just before the create", async () => {
   const world = new World(MANIFEST);
   let loads = 0;

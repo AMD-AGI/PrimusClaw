@@ -551,25 +551,25 @@ export async function revokeSessionAppGrants(sessionId: string, deadline?: numbe
       RETURNING task_id, grant_id`,
     [sessionId],
   )).rows as Array<{ task_id: string; grant_id: string }>;
+  if (rows.length === 0) return true;
+  // All at once, under one bound: the caller's budget, and never below a second.
+  // A revoke cut short has still marked the grant revoked on the service, whose
+  // reaper finishes reclaiming its sandboxes; the retry only confirms it.
+  const timeoutMs = deadline === undefined
+    ? GRANT_CALL_TIMEOUT_MS
+    : Math.max(1_000, Math.min(GRANT_CALL_TIMEOUT_MS, deadline - Date.now()));
+  const signal = AbortSignal.timeout(timeoutMs);
+  const results = await Promise.allSettled(rows.map((row) => signer.revoke(row.grant_id, signal)));
   let complete = true;
-  for (const row of rows) {
-    // Bounded by the caller's budget, and never below a second: a revoke cut
-    // short has still marked the grant revoked on the service, whose reaper
-    // finishes reclaiming its sandboxes; the retry only confirms it.
-    const timeoutMs = deadline === undefined
-      ? GRANT_CALL_TIMEOUT_MS
-      : Math.max(1_000, Math.min(GRANT_CALL_TIMEOUT_MS, deadline - Date.now()));
-    try {
-      await signer.revoke(row.grant_id, AbortSignal.timeout(timeoutMs));
-      logger.info({ sessionId, taskId: row.task_id, grantId: row.grant_id }, "session.app_grant_revoked");
-    } catch (err) {
-      complete = false;
-      logger.warn(
-        { sessionId, taskId: row.task_id, grantId: row.grant_id, err: errorText(err) },
-        "session.app_grant_revoke_failed",
-      );
+  results.forEach((result, i) => {
+    const { task_id: taskId, grant_id: grantId } = rows[i]!;
+    if (result.status === "fulfilled") {
+      logger.info({ sessionId, taskId, grantId }, "session.app_grant_revoked");
+      return;
     }
-  }
+    complete = false;
+    logger.warn({ sessionId, taskId, grantId, err: errorText(result.reason) }, "session.app_grant_revoke_failed");
+  });
   return complete;
 }
 

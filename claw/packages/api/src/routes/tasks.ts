@@ -217,7 +217,8 @@ async function requireTaskAccess(
  * behind the delete; what is answered is the outcome.
  */
 export function deletedSessionTaskView(row: ClawTaskRow): Record<string, unknown> {
-  return {
+  // Through the same redaction as every other task answer: `error_message` is free text.
+  return redactPublicJson({
     task_id: row.task_id,
     session_id: row.session_id,
     dag_root_task_id: row.dag_root_task_id,
@@ -230,7 +231,7 @@ export function deletedSessionTaskView(row: ClawTaskRow): Record<string, unknown
     started_at: row.started_at,
     completed_at: row.completed_at,
     session_deleted: true,
-  };
+  }) as Record<string, unknown>;
 }
 
 async function loadPluginRow(pluginId: number) {

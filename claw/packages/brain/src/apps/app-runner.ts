@@ -1027,7 +1027,7 @@ export class AppRunner {
     const run: AppGrantRun = this.grantRun(rec);
     const cause = rec.last_exit?.cause ?? "exit";
     const cancelled = cause === "cancelled" || cause === "deadline" || cause === "row_terminal";
-    const sessionGone = cancelled && await this.sessionDeleted(rec.session_id);
+    const sessionGone = cancelled && await this.sessionDeleted(rec);
     const revokeGrant = async (): Promise<void> => {
       await this.grant.revoke(run);
       // Recorded on the row as well, so extendGrant refuses it from here on (and
@@ -1113,7 +1113,7 @@ export class AppRunner {
    */
   private async closedBeforeCreate(): Promise<boolean> {
     const fresh = await this.deps.store.load(this.runId);
-    const closed = runClosedForUser(fresh) || await this.sessionDeleted(fresh.session_id);
+    const closed = runClosedForUser(fresh) || await this.sessionDeleted(fresh);
     if (closed) {
       logger.info(
         { runId: this.runId, state: fresh.state, taskStatus: fresh.task_status, sessionDeleted: fresh.session_deleted === true },
@@ -1123,12 +1123,16 @@ export class AppRunner {
     return closed;
   }
 
-  /** Whether the run's session was deleted; latched, and false when it cannot be told. */
-  private async sessionDeleted(sessionId: string): Promise<boolean> {
+  /**
+   * Whether the run's session was deleted: the row says so (the database), or the
+   * Brain's tombstone does. Latched; false only when neither can tell.
+   */
+  private async sessionDeleted(rec: Pick<AppRunRecord, "session_id" | "session_deleted">): Promise<boolean> {
     if (this.sessionGone) return true;
-    if (!this.deps.sessionDeleted || !sessionId) return false;
+    if (rec.session_deleted === true) return (this.sessionGone = true);
+    if (!this.deps.sessionDeleted || !rec.session_id) return false;
     try {
-      this.sessionGone = await this.deps.sessionDeleted(sessionId);
+      this.sessionGone = await this.deps.sessionDeleted(rec.session_id);
     } catch (err) {
       logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.session_deleted_check_failed");
     }
