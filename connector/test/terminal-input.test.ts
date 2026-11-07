@@ -71,7 +71,7 @@ after(async () => {
 });
 
 /** A tmux server on a socket of its own, with the stand-in interface in its one pane, working in `work`. */
-function terminal(work: string, claudeDir: string): { socket: string; pid: number; row: string; transcript: string; tmux: (...a: string[]) => string } {
+function terminal(work: string, claudeDir: string, workMs = 300): { socket: string; pid: number; row: string; transcript: string; tmux: (...a: string[]) => string } {
   const dir = tmpdir("cc-tmux-");
   const socket = path.join(dir, "sock");
   servers.push(socket);
@@ -82,7 +82,7 @@ function terminal(work: string, claudeDir: string): { socket: string; pid: numbe
   fs.mkdirSync(path.dirname(row), { recursive: true });
   const tmux = (...a: string[]) => execFileSync("tmux", ["-S", socket, ...a], { encoding: "utf8" });
   // The pane's own environment is what the connector reads: the test's own TMUX (if any) is not passed on.
-  const env = { ...process.env, FAKE_TRANSCRIPT: transcript, FAKE_ROW: row, FAKE_SESSION: REF, FAKE_WORK_MS: "300" } as Record<string, string>;
+  const env = { ...process.env, FAKE_TRANSCRIPT: transcript, FAKE_ROW: row, FAKE_SESSION: REF, FAKE_WORK_MS: String(workMs) } as Record<string, string>;
   delete env.TMUX; delete env.TMUX_PANE;
   execFileSync("tmux", ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-x", "120", "-y", "30", "-c", work,
     `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_TERMINAL)}`], { env });
@@ -210,6 +210,28 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     h.claw.issue("set_mode", sid, { mode_id: "plan" });
     const rejected = await h.claw.until("the mode change refused", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.type === "set_mode"));
     assert.equal(rejected.data.reason, "terminal_session");
+  });
+
+  test("a restart during a typed message's turn ends that turn by name and never types the message again", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 60_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir, 4_000);
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "a long one");
+    await until("it is typed", () => typed(t.transcript).includes("a long one"));
+    await h.stop();
+    h.connect({ timing: { spectateMs: 20, spectateCheckMs: 60_000 } as never });
+    h.start();
+    const end = await h.claw.until("the turn ended by the restart", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq));
+    assert.equal(end.data.error, "connector_restarted");
+    await new Promise((r) => setTimeout(r, 1_500));
+    assert.deepEqual(typed(t.transcript).filter((x) => x === "a long one").length, 1, "typed once, not again after the restart");
   });
 
   test("the owner can turn it off: then the same conversation is only watched", async () => {

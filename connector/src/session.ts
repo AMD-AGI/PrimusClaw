@@ -451,23 +451,30 @@ export class Session {
         const finished = new Promise<void>((resolve) => {
           this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve };
         });
+        // At most once: the turn is recorded and the prompt counted as handled BEFORE the keys go, so a restart in between
+        // ends this turn (`connector_restarted`, SessionManager.recover) instead of Claw delivering it again and the terminal
+        // getting it twice. A person's terminal gets a message once or not at all.
+        const startedAt = new Date().toISOString();
+        this.env.store.beginTurn({ session_id: this.id, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, started_at: startedAt });
+        this.env.store.patch(this.id, { used_at: startedAt });
+        await this.env.store.flushed(2_000);
+        next.started();
+        if (this.closed || this.stopping) { this.terminalTurn = null; this.env.store.endTurn(this.id); continue; }
         try {
           await term.type(text);
         } catch (e) {
           this.terminalTurn = null;
-          next.started();
+          this.env.store.endTurn(this.id);
           this.audit("terminal_input_refused", { reason: "terminal_input_failed", detail: errMessage(e).slice(0, 300), cmd_id: next.cmdId });
           this.rejectCommand("prompt", next.cmdId, "terminal_input_failed", next.cmdSeq);
           this.emit("turn_end", { stopReason: "error", error: "terminal_input_failed", cmd_id: next.cmdId, cmd_seq: next.cmdSeq });
           continue;
         }
-        next.started();
         // What was typed is the person's own message; the trail keeps its size and a digest, not the words.
         this.audit("terminal_input", {
           acp_session_id: this.acpId, pid: term.ref.pid, pane: term.ref.pane, cmd_id: next.cmdId, length: text.length,
           lines: text.split("\n").length, sha256: createHash("sha256").update(text).digest("hex").slice(0, 16),
         });
-        this.env.store.patch(this.id, { used_at: new Date().toISOString() });
         await finished;
       }
     } finally {
@@ -503,6 +510,8 @@ export class Session {
     const turn = this.terminalTurn;
     if (!turn) return;
     this.terminalTurn = null;
+    // (Not when the connector is going away: the record is left for the next run, which ends the turn by name.)
+    if (!this.stopping) this.env.store.endTurn(this.id);
     this.audit("terminal_turn_end", { stop_reason: stopReason, ...(error ? { error } : {}), cmd_id: turn.cmdId });
     this.emit("turn_end", { stopReason, ...(error ? { error } : {}), cmd_id: turn.cmdId, cmd_seq: turn.cmdSeq });
     turn.done();
