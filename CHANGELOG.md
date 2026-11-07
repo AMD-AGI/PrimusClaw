@@ -953,6 +953,11 @@ record it.
   only watching it (#451, connector part), and a tmux client that exits before reading that input fails the run instead of
   crashing the connector on EPIPE (#473); a 401 during Claw's auth outage no longer stops the connector for good (#453); `doctor`
   checks that an API-key Codex agent is signed in, as its sessions open (#462).
+- `@primusclaw/connector` 0.1.10: a prompt from the chat can be typed into a local tmux terminal even when the shared Claude
+  directory keeps session rows of another pid domain (#487); the agent's own writes between turns no longer refuse the next
+  prompt as `recently_written` (#472); `pair` on a hostname that is already another of the person's machines pairs under the
+  hostname and the agents' folder, and a paired machine's service hint asks the chat for a new pairing command (#477, connector
+  part).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
