@@ -216,9 +216,10 @@ the folder the command was run in), saves the answer's grant (mode 0600) and sta
   Good for 10 minutes and one claim; a person has at most 3 live, and a new one retires the oldest. Only its SHA-256 is stored
   (`claw_remote_pairings`). A wrong, expired, retired and used code all get the same `400 invalid_code`. At most 6 codes a minute
   per person, by any route (the HTTP route and the assistant's `devenv_pair`; counted from the audit trail). Wrong claims are
-  throttled per client address, the first `X-Forwarded-For` entry (behind the ingress the socket address is the ingress's, shared
-  by everyone): 10 a minute, and only failures count, so nobody's wrong codes lock out a right one; and 600 a minute per replica
-  from everyone. Without `CLAW_PUBLIC_URL` there is no command to give: `503 pairing_unavailable`.
+  throttled per caller: the whole `X-Forwarded-For` chain as received together with the socket address (behind the ingress the
+  socket address alone is the ingress's, shared by everyone, and the first entry alone is the caller's say; the chain ends with the
+  address the proxy saw). 10 a minute, only failures count, and each wrong claim is answered after 500 ms, so nobody's wrong codes
+  lock out a right one; there is no ceiling shared by all callers. Without `CLAW_PUBLIC_URL` there is no command to give: `503 pairing_unavailable`.
 - **Grant**: `cpg_` and 43 base64url characters, stored as its SHA-256 (`claw_remote_grants`). The global auth hook judges a
   `Bearer cpg_...` before every other credential path, so it never reaches SaFE or the identity provider. It authenticates as the
   person, with the `default` role, on the connector-side routes and nowhere else (anything else: `403 connector_grant_not_accepted`).

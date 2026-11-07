@@ -43,7 +43,7 @@ describe("pairing a machine with a one-time code", { skip }, () => {
       return authMiddleware(req, reply);
     });
     await registerRemoteAgentRoutes(app, {
-      pingMs: 150, pollMs: 40, retentionDays: 0, presenceSweepMs: 0, pairing: { publicUrl: SERVER, claimsPerMinute: 1000, codesPerMinute: 1000 },
+      pingMs: 150, pollMs: 40, retentionDays: 0, presenceSweepMs: 0, pairing: { publicUrl: SERVER, claimsPerMinute: 1000, codesPerMinute: 1000, wrongClaimDelayMs: 0 },
     });
     await app.listen({ port: 0, host: "127.0.0.1" });
     base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
@@ -225,19 +225,23 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     const limited = Fastify();
     limited.addHook("preHandler", async (req) => { (req as any).user = { userId: "carol", userName: "carol", platformKey: "", virtualKey: "", roles: ["default"] }; });
     const { registerPairingRoutes } = await import("../src/remote-agents/pairing-routes.js");
-    await registerPairingRoutes(limited, { publicUrl: SERVER, claimsPerMinute: 2, codesPerMinute: 2 });
-    const inject = (url: string, payload: unknown, from = "203.0.113.7") =>
-      limited.inject({ method: "POST", url, payload: payload as object, headers: { "x-forwarded-for": `${from}, 10.0.0.1` } });
+    await registerPairingRoutes(limited, { publicUrl: SERVER, claimsPerMinute: 2, codesPerMinute: 2, wrongClaimDelayMs: 50 });
+    // As the ingress passes requests on: it appends the address it saw to whatever X-Forwarded-For the caller sent.
+    const inject = (url: string, payload: unknown, chain = "203.0.113.7") =>
+      limited.inject({ method: "POST", url, payload: payload as object, headers: { "x-forwarded-for": chain } });
     const good = (await inject("/v1/remote-agents/pairings", {})).json().data.code as string;
     assert.equal((await inject("/v1/remote-agents/pairings", {})).statusCode, 201);
     assert.equal((await inject("/v1/remote-agents/pairings", {})).statusCode, 429, "a third code in a minute");
     // The limit is the person's, whichever route asks (the assistant's devenv_pair calls the same function).
     await assert.rejects(pairing.createPairing("carol", null, new Date(), 2), pairing.PairingRateLimited);
-    // Someone posting wrong codes from one address is held back there...
-    assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" })).statusCode, 400);
-    assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" })).statusCode, 400);
-    assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" })).statusCode, 429);
-    // ...and nobody else is: behind the ingress every request has the same socket address, and the forwarded one tells them apart.
+    // An attacker writes the victim's address first; the ingress appends the attacker's own. Their wrong claims fill their own key...
+    const forged = "198.51.100.9, 203.0.113.66";
+    const t0 = Date.now();
+    assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" }, forged)).statusCode, 400);
+    assert.ok(Date.now() - t0 >= 45, "a wrong claim is answered only after the delay");
+    assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" }, forged)).statusCode, 400);
+    assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" }, forged)).statusCode, 429);
+    // ...and never the victim's, whose chain ends with the address the ingress saw for them.
     assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: good }, "198.51.100.9")).statusCode, 201);
     const noServer = Fastify();
     noServer.addHook("preHandler", async (req) => { (req as any).user = { userId: "dave", userName: "dave", platformKey: "", virtualKey: "", roles: ["default"] }; });

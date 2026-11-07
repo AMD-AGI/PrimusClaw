@@ -7,12 +7,14 @@
  *   POST /v1/remote-agents/pairings        the signed-in person: a new code and the command line that uses it.
  *   POST /v1/remote-agents/pairings/claim  anonymous (the code is the credential): `{code, name}` → `{token}`, once.
  *
- * Every refusal of a claim is the same `invalid_code`. Wrong codes are throttled per client address (only failures count, so a
- * person with a right code is never held back by someone else's wrong ones) and, as a ceiling, per replica. The address is the
- * first `X-Forwarded-For` entry when there is one: behind the ingress `req.ip` is the ingress's own hop, which every caller shares.
- * That entry is the client's say, so a caller can spread its guesses over made-up addresses: what bounds guessing is the code
- * (60 bits, ten minutes, one claim) and the per-replica ceiling, not this key; what this key buys is that nobody else's junk
- * claims can lock a real one out.
+ * Every refusal of a claim is the same `invalid_code`. Wrong claims are throttled per caller, and only failures count, so a person
+ * with a right code is never held back by anyone else's wrong ones. The caller is the whole forwarded chain as received together
+ * with the socket address (`callerKey`): behind the ingress the socket address alone is the ingress's own hop, which everyone
+ * shares, and the first `X-Forwarded-For` entry alone is whatever the caller wrote. A proxy that appends puts the caller's real
+ * address at the end of the chain and one that overwrites leaves only it, so nobody can make their key another caller's (short of
+ * sharing their address). A caller can make up new keys by varying the entries it writes: what bounds guessing is the code (60
+ * bits, ten minutes, one claim), and each wrong claim is answered only after {@link WRONG_CLAIM_DELAY_MS}. There is no ceiling
+ * shared by all callers: it would be one more way to lock everyone out.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import pino from "pino";
@@ -27,16 +29,16 @@ const logger = pino({ name: "remote-agents-pairing" });
 export interface PairingRouteOptions {
   /** The Claw API address a connector is told to use (CLAW_PUBLIC_URL by default). */
   publicUrl?: string;
-  /** Wrong claims one client address may make per minute. */
+  /** Wrong claims one caller may make per minute. */
   claimsPerMinute?: number;
-  /** Wrong claims this replica takes per minute from everyone together. */
-  claimFailuresPerMinute?: number;
+  /** How long a wrong claim waits before it is answered. */
+  wrongClaimDelayMs?: number;
   /** Codes one person may ask for per minute. */
   codesPerMinute?: number;
 }
 
 const CLAIM_PER_MINUTE = 10;
-const CLAIM_FAILURES_PER_MINUTE = 600;
+export const WRONG_CLAIM_DELAY_MS = 500;
 
 /** Failures counted in a fixed one-minute window per key, in this process: `full(key)` before, `count(key)` after a failure. */
 function failureWindow(perMinute: number): { full: (key: string, now?: number) => boolean; count: (key: string, now?: number) => void } {
@@ -55,11 +57,11 @@ function failureWindow(perMinute: number): { full: (key: string, now?: number) =
   };
 }
 
-/** The client's address as the ingress passed it on (the first `X-Forwarded-For` entry), else the socket's. */
-export function clientAddress(req: FastifyRequest): string {
+/** Who is claiming, as far as this process can tell (see the module's comment): the forwarded chain and the socket address. */
+export function callerKey(req: FastifyRequest): string {
   const h = req.headers["x-forwarded-for"];
-  const first = (Array.isArray(h) ? h[0] : h)?.split(",")[0]?.trim();
-  return first && first.length <= 64 ? first : req.ip;
+  const chain = (Array.isArray(h) ? h.join(",") : h ?? "").replace(/\s+/g, "").slice(0, 512);
+  return `${chain}|${req.ip}`;
 }
 
 const fail = (reply: FastifyReply, status: number, error: string) => reply.status(status).send({ ok: false, error });
@@ -71,8 +73,8 @@ function clientLabel(req: FastifyRequest): string | null {
 }
 
 export async function registerPairingRoutes(app: FastifyInstance, opts: PairingRouteOptions = {}): Promise<void> {
-  const perAddress = failureWindow(opts.claimsPerMinute ?? CLAIM_PER_MINUTE);
-  const perReplica = failureWindow(opts.claimFailuresPerMinute ?? CLAIM_FAILURES_PER_MINUTE);
+  const perCaller = failureWindow(opts.claimsPerMinute ?? CLAIM_PER_MINUTE);
+  const wrongDelay = opts.wrongClaimDelayMs ?? WRONG_CLAIM_DELAY_MS;
   const server = (opts.publicUrl ?? process.env.CLAW_PUBLIC_URL ?? "").trim().replace(/\/+$/, "");
 
   app.post("/v1/remote-agents/pairings", async (req, reply) => {
@@ -97,13 +99,13 @@ export async function registerPairingRoutes(app: FastifyInstance, opts: PairingR
   });
 
   app.post("/v1/remote-agents/pairings/claim", async (req, reply) => {
-    const addr = `ip:${clientAddress(req)}`;
-    if (perAddress.full(addr) || perReplica.full("all")) return fail(reply, 429, "rate_limited");
+    const caller = callerKey(req);
+    if (perCaller.full(caller)) return fail(reply, 429, "rate_limited");
     const body = (req.body ?? {}) as { code?: unknown; name?: unknown };
     const out = await claimPairing(body.code, body.name);
     if (!out.ok) {
-      perAddress.count(addr);
-      perReplica.count("all");
+      perCaller.count(caller);
+      if (wrongDelay > 0) await new Promise((r) => setTimeout(r, wrongDelay));
       return fail(reply, 400, out.error);
     }
     logger.info({ owner: out.owner, grantId: out.grantId }, "remote_agents.pairing_claimed");
