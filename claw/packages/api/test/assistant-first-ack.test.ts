@@ -15,6 +15,8 @@
  *   F5  a say the router started and that was refused does not hold the line back; one still being written does
  *   F6  a message the route queues behind a running turn hears the line 3.5 s after it came in, before its run opens, and the
  *       answer of the run that later carries it takes the line's place
+ *   F5  a turn that starts an item after the line: the start notice takes the line's place, and the router's words after it are added
+ *       to that same message (one message in the channel, as without the line)
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -233,5 +235,36 @@ describe("assistant first ack by the clock", { skip }, () => {
     }, w.sayDeps);
     const answer = (await w.q("SELECT payload FROM claw_notification_outbox WHERE payload->>'text' = '已发到你的 Teams。'"))[0];
     assert.equal(answer.payload.replaces, ack.lookupAckSayId("alice", t.mid), "one message: the answer edits the line");
+  });
+  test("F5 an item started after the line: the start notice takes its place, and what the router adds goes to that message", async () => {
+    await w.subscribe("alice");
+    const turn = await w.routerTurn(alice);
+    const content = "帮我新建一个任务：写一份 ROCm 7.2 升级说明";
+    await w.q("UPDATE claw_tasks SET prompt = $2, started_at = NOW() WHERE task_id = $1", [turn.task_id, content]);
+    await message(alice.routerSid, turn.mid, content);
+    assert.equal(await first(alice.routerSid, turn.mid), "said");
+    const ackId = ack.lookupAckSayId("alice", turn.mid);
+    const created = await w.mod.tools.workCreate(turn as never, { title: "ROCm 7.2 升级说明", brief: "write it" }, w.sayDeps);
+    assert.equal(created.announced, true);
+    const notice = (await w.q("SELECT payload FROM claw_notification_outbox WHERE payload->>'text' LIKE '已开始：#%'"))[0];
+    assert.equal(notice?.payload.replaces, ackId, "the start notice edits the line: one message");
+    const added = await w.mod.tools.say(turn as never, { text: "顺便：会写清楚回滚步骤。" }, w.sayDeps);
+    assert.equal(added.ok, true);
+    const event = w.events.find((e) => e.type === "AssistantSay" && e.say_id === added.say_id);
+    assert.equal(event?.amends, ackId, "added to the message the notice now is (the line's)");
+    const out = await w.q("SELECT payload FROM claw_notification_outbox ORDER BY created_at, event_id");
+    assert.equal(out.filter((o) => !o.payload.replaces && !o.payload.amends).length, 1, "one new message in the channel: the line");
+    // Without the line, the notice is its own message and the addition names it, as before.
+    await w.q("TRUNCATE claw_notification_outbox, claw_assistant_says");
+    w.events.length = 0;
+    const plain = await w.routerTurn(alice);
+    await w.q("UPDATE claw_tasks SET prompt = $2, started_at = NOW() WHERE task_id = $1", [plain.task_id, "帮我新建一个任务：整理发布说明"]);
+    await message(alice.routerSid, plain.mid, "帮我新建一个任务：整理发布说明");
+    const c2 = await w.mod.tools.workCreate(plain as never, { title: "整理发布说明", brief: "do it" }, w.sayDeps);
+    assert.equal(c2.announced, true);
+    const n2 = (await w.q("SELECT event_id, payload FROM claw_notification_outbox WHERE payload->>'text' LIKE '已开始：#%'"))[0];
+    assert.equal(n2.payload.replaces, undefined);
+    const a2 = await w.mod.tools.say(plain as never, { text: "顺便：按版本分组。" }, w.sayDeps);
+    assert.equal(w.events.find((e) => e.type === "AssistantSay" && e.say_id === a2.say_id)?.amends, n2.event_id);
   });
 });

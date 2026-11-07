@@ -396,7 +396,7 @@ async function announceStarted(
     if (await turnHandedOffReview((t, p) => db.query(t, p), userId, claims.mid)) return false;
     const stored = await recordSystemNotice({
       userId, sessionId: claims.sid, text, key: `work_started:${item.itemId}`,
-      itemId: item.itemId, turnMessageId: claims.mid,
+      itemId: item.itemId, turnMessageId: claims.mid, replacesTurnAck: true,
     }, deps);
     return stored !== null;
   } catch (err) {

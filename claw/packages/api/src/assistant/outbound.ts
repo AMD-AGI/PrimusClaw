@@ -665,6 +665,14 @@ export async function turnFirstSay(q: Querier, userId: string, since: Date | str
   return row?.say_id ?? null;
 }
 
+/** The server's "on it" for the turn answering `messageId` (`lookup-ack.ts`, its id derived from the message), as `replaces`, when it was said. */
+async function turnAckReplaced(q: Querier, userId: string, messageId: string): Promise<{ replaces?: string }> {
+  if (!CLAW_NOTIFICATIONS_ENABLED) return {};
+  const ack = deterministicEventId("assistant.notice", userId, `lookup_ack:${messageId}`);
+  const said = await q("SELECT 1 FROM claw_assistant_says WHERE say_id = $1::uuid AND user_id = $2", [ack, userId]);
+  return said.rowCount ? { replaces: ack } : {};
+}
+
 const NEEDS_YOU_TEXT: Record<string, (item: ItemRow) => string> = {
   ready: (i) => `is ready for your review (v${i.result_version}).`,
   waiting: (i) => `needs your answer: ${i.pending_question ?? ""}`,
@@ -970,6 +978,11 @@ export async function recordSystemNotice(
     files?: AssistantFile[];
     /** A development environment session's own message: which session, and which kind (`remote-items.ts`). */
     remote?: AssistantRemoteNotice;
+    /**
+     * Takes the place of the server's "on it" for `turnMessageId` (`lookup-ack.ts`), when one was said: an item's start notice is the
+     * turn's message, and without this the person would read the line and the notice as two messages.
+     */
+    replacesTurnAck?: boolean;
   }, deps: SayDeps = {},
 ): Promise<SayOutcome | null> {
   const stored = await storeSettled(async (q, storeOne) => storeOne({
@@ -979,6 +992,7 @@ export async function recordSystemNotice(
     ...(input.files?.length ? { files: input.files } : {}),
     ...(input.turnMessageId ? { noticeOfTurn: input.turnMessageId } : {}),
     ...(input.remote ? { remote: input.remote } : {}),
+    ...(input.replacesTurnAck && input.turnMessageId ? await turnAckReplaced(q, input.userId, input.turnMessageId) : {}),
   }), (late) => announce(late, deps, input.turnMessageId));
   if (!stored) return null;
   await announce(stored, deps, input.turnMessageId);
