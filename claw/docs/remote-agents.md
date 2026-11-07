@@ -209,7 +209,7 @@ for the connector-side actions it keeps (`connector.registered`,
 
 The first connection of a machine needs no sign-in on it. The person asks their own client (Clawy: "连接我的开发环境", or the
 router's `devenv_pair` tool, or `devenv_list` itself when the person has no machine yet: its `connect_a_machine` is then this
-pairing command, made in a turn answering a message they sent signed in that has read nothing untrusted before); the client calls `POST /v1/remote-agents/pairings` as that person and shows the answer's `command`:
+pairing command; both only in a turn answering a message they sent signed in, recently); the client calls `POST /v1/remote-agents/pairings` as that person and shows the answer's `command`:
 
 ```
 npm install -g @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api

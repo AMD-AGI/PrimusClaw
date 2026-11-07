@@ -334,14 +334,13 @@ export function pairingText(command: string, minutes: number, zh: boolean): stri
 }
 
 /**
- * Whether this list may make the user a pairing itself: a router turn answering a message the user sent signed in, recently, that
- * has read nothing untrusted before this list (the list marks the turn as soon as it reads). Every other turn gets what it got
- * before: the setup commands, and devenv_pair left to the router.
+ * Whether this list may make the user a pairing itself: when devenv_pair may ({@link pairingTurn}). Every other turn gets the setup
+ * commands, and devenv_pair refuses there too.
  */
 async function mayPairHere(claims: AssistantTokenClaims): Promise<boolean> {
   if (claims.role !== "router") return false;
   try {
-    await attendedTurn((text, params) => db.query(text, params), claims);
+    await pairingTurn((text, params) => db.query(text, params), claims);
     return true;
   } catch (err) {
     if (err instanceof ToolRefused) return false;
@@ -388,7 +387,6 @@ export async function devenvList(
   const detail = args.detail === undefined || args.detail === "" ? "status" : args.detail;
   if (detail !== "status" && detail !== "activity") throw new ToolRefused("invalid_arguments", "detail is status or activity");
   const { userId } = await inTransaction((q) => assertLiveRun(q, claims));
-  // Asked before the read below marks the turn.
   const mayPair = await mayPairHere(claims);
   // Before any of it is passed on: from here on this turn has read what a connector and its agents reported.
   await markUntrustedRead((text, params) => db.query(text, params), claims.sid, claims.mid);
@@ -1088,6 +1086,20 @@ export async function sendConfirmed(userId: string, confirmationId: string, para
 }
 
 /**
+ * A turn that may be given a pairing code: one answering a message the user sent signed in, recently (`attendedTurn`). It may have
+ * read untrusted text (devenv_list itself marks the turn before it pairs): after a read the turn can only speak to the user
+ * (`AFTER_READ_TOOLS`), so the code reaches no one else, and it connects nothing until the user runs it on a machine of theirs.
+ */
+async function pairingTurn(q: Querier, claims: AssistantTokenClaims): Promise<{ userId: string }> {
+  const { userId } = await assertLiveRun(q, claims);
+  if (!(await turnMessage(q, claims.sid, claims.mid))) {
+    throw new ToolRefused("not_from_user", "only the user's own message can ask for a pairing code: a report cannot");
+  }
+  await attendedTurn(q, claims, { readUntrustedOk: true });
+  return { userId };
+}
+
+/**
  * `devenv_pair`: a one-time code for connecting a new machine, inside the one command line that uses it
  * (`remote-agents/pairing.ts`). Only in a turn that answers the user's own message: a report or an event never mints one.
  * The code is shown to the user alone, in their own chat, and connects nothing until they run the line on a machine, so it
@@ -1096,10 +1108,7 @@ export async function sendConfirmed(userId: string, confirmationId: string, para
 export async function devenvPair(claims: AssistantTokenClaims): Promise<Record<string, unknown>> {
   if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
   const q: Querier = (t, p) => db.query(t, p);
-  const { userId } = await assertLiveRun(q, claims);
-  if (!(await turnMessage(q, claims.sid, claims.mid))) {
-    throw new ToolRefused("not_from_user", "only the user's own message can ask for a pairing code: a report cannot");
-  }
+  const { userId } = await pairingTurn(q, claims);
   const server = (process.env.CLAW_PUBLIC_URL ?? "").trim().replace(/\/+$/, "");
   if (!server) throw new ToolRefused("pairing_unavailable", "pairing is not set up here (no public Claw address): tell the user to run claw-connector login on the machine");
   const { createPairing, pairCommand, PAIRING_TTL_MS, PairingRateLimited } = await import("../remote-agents/pairing.js");
