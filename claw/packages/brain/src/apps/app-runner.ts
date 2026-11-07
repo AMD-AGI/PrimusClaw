@@ -186,8 +186,8 @@ export interface AppSandboxOps {
   status(inst: SandboxInstance): Promise<SandboxStatus>;
   exec(inst: SandboxInstance, command: string, timeout: string, opts?: SandboxExecOptions): Promise<SandboxExecResult>;
   stop(inst: SandboxInstance): Promise<void>;
-  /** Ids of the run's live sandboxes by label, including one never recorded on the row. */
-  liveIds(runId: string, platformKey: string): Promise<string[]>;
+  /** Ids of the run's live sandboxes by label, in the run's workspace, including one never recorded on the row. */
+  liveIds(run: Pick<AppSandboxRun, "runId" | "workspaceId" | "sandboxSpec">, platformKey: string): Promise<string[]>;
   nodeName(workloadId: string, platformKey: string): Promise<string | null>;
 }
 
@@ -1134,7 +1134,7 @@ export class AppRunner {
    * time limit.
    */
   private async stopSandboxes(recorded: SandboxInstance | null): Promise<void> {
-    const ids = new Set(await this.deps.sandbox.liveIds(this.runId, this.platformKey));
+    const ids = new Set(await this.deps.sandbox.liveIds(this.sandboxRun(), this.platformKey));
     if (recorded) ids.add(recorded.id);
     const failures: unknown[] = [];
     for (const id of ids) {

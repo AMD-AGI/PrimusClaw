@@ -98,6 +98,8 @@ type resolvedTemplate struct {
 	Outputs      []string
 	AcceptedEnvs []string
 	Pending      time.Duration
+	// Workspace is the SaFE workspace the template names, empty when it names none.
+	Workspace string
 }
 
 // resolveTemplate matches an expanded name, or a short name with one expansion.
@@ -159,6 +161,7 @@ func resolvedFrom(id, alias string, gpus int32, body specBody) resolvedTemplate 
 		Outputs:      body.Outputs,
 		AcceptedEnvs: body.AcceptedEnvs,
 		Pending:      pending,
+		Workspace:    strings.TrimSpace(body.Workspace),
 	}
 }
 
@@ -193,6 +196,7 @@ type specBody struct {
 	Inputs            []string `json:"inputs"`
 	Outputs           []string `json:"outputs"`
 	PendingTimeoutSec int64    `json:"pendingTimeoutSec"`
+	Workspace         string   `json:"workspace"`
 }
 
 func parseSpec(spec string) (specBody, error) {

@@ -115,6 +115,11 @@ func testPlane(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32) (
 
 func testPlaneWithSpec(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string) (*Service, *fakeRunner, map[string]string) {
 	t.Helper()
+	return testPlaneInWorkspaces(t, maxSec, perGPU, maxSandboxes, spec, []string{"top-models"})
+}
+
+func testPlaneInWorkspaces(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string) (*Service, *fakeRunner, map[string]string) {
+	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	scheme := runtime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
@@ -136,7 +141,7 @@ func testPlaneWithSpec(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes 
 	})
 	req := grant.IssueRequest{
 		GrantID:     "gr-01jb7m9k2x",
-		Owner:       grant.OwnerRequest{UserID: "u-123", Workspaces: []string{"top-models"}},
+		Owner:       grant.OwnerRequest{UserID: "u-123", Workspaces: workspaces},
 		PlatformKey: "ak-test",
 		Issuer:      grant.IssuerRequest{SessionID: "s-8f2a", AppRunID: "ar-01ja"},
 		Roles: map[string]grant.RoleRequest{
@@ -877,5 +882,42 @@ func TestKillWithoutRunner(t *testing.T) {
 	got, err := svc.Get(context.Background(), key, created.SandboxID)
 	if err != nil || got.State != runtimev1alpha1.SandboxRunning {
 		t.Fatalf("got=%+v err=%v", got, err)
+	}
+}
+
+// A grant that lists the app's workspace first must still place a template's
+// sandbox in the workspace that template names (hosting, 2026-11-07: measurement
+// sandboxes of a top-models template landed in crusoe-spur-vk).
+func TestGrantSandboxRunsInTheTemplateWorkspace(t *testing.T) {
+	svc, runner, keys := testPlaneInWorkspaces(t, 600, []int32{1}, 2, `{"workspace":"top-models"}`, []string{"crusoe-spur-vk", "top-models"})
+	if _, _, err := svc.Create(context.Background(), keys["measurement"], CreateBody{TemplateID: "runner", Timeout: 60}); err != nil {
+		t.Fatalf("create=%v", err)
+	}
+	if len(runner.created) != 1 || runner.created[0].Workspace != "top-models" {
+		t.Fatalf("created=%+v, want one sandbox in top-models", runner.created)
+	}
+}
+
+// A template that names no workspace keeps the grant's first one.
+func TestGrantSandboxWithoutTemplateWorkspaceUsesTheFirstListed(t *testing.T) {
+	svc, runner, keys := testPlaneInWorkspaces(t, 600, []int32{1}, 2, `{}`, []string{"top-models", "crusoe-spur-vk"})
+	if _, _, err := svc.Create(context.Background(), keys["measurement"], CreateBody{TemplateID: "runner", Timeout: 60}); err != nil {
+		t.Fatalf("create=%v", err)
+	}
+	if len(runner.created) != 1 || runner.created[0].Workspace != "top-models" {
+		t.Fatalf("created=%+v, want one sandbox in top-models", runner.created)
+	}
+}
+
+// A template workspace outside the grant's list was never attested: refused, nothing created.
+func TestGrantSandboxTemplateWorkspaceOutsideTheGrantIsRefused(t *testing.T) {
+	svc, runner, keys := testPlaneInWorkspaces(t, 600, []int32{1}, 2, `{"workspace":"other-ws"}`, []string{"crusoe-spur-vk", "top-models"})
+	_, _, err := svc.Create(context.Background(), keys["measurement"], CreateBody{TemplateID: "runner", Timeout: 60})
+	var oe *grant.OpError
+	if !errors.As(err, &oe) || oe.Status != http.StatusForbidden || oe.Reason != "workspace_not_allowed" {
+		t.Fatalf("create=%v, want 403 workspace_not_allowed", err)
+	}
+	if len(runner.created) != 0 {
+		t.Fatalf("created=%+v, want none", runner.created)
 	}
 }

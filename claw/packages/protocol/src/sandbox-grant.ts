@@ -340,14 +340,22 @@ export function buildSandboxGrant(material: SandboxGrantMaterial, now: Date): Bu
   };
 }
 
-/** Workspace ids named by the run and its templates, in a stable order. */
+/**
+ * Workspace ids named by the run and its templates. The first is where a grant
+ * sandbox goes when its template names none: `sandboxWorkspace`, else
+ * `workspaceId`. An Agent Sandbox that does not read the template's workspace
+ * places every grant sandbox in the first listed one, so this order must hold
+ * whichever side decides. The templates' workspaces follow in template
+ * order, and the app's workspace last.
+ */
 export function grantWorkspaces(
   workspaceId: string | null | undefined,
   sandboxWorkspace: string | null | undefined,
   templates: Array<Record<string, unknown>>,
 ): string[] {
-  const found = [workspaceId, sandboxWorkspace];
+  const found = [sandboxWorkspace || workspaceId];
   for (const t of templates) if (typeof t.workspace === "string") found.push(t.workspace);
+  found.push(workspaceId);
   return unique(found);
 }
 
@@ -422,10 +430,11 @@ function whole(value: unknown): number | undefined {
   return value;
 }
 
+/** Non-empty values, first occurrence kept, in the order given: the first workspace is the default one. */
 function unique(values: Array<string | null | undefined>): string[] {
   const seen = new Set<string>();
   for (const v of values) if (v && !seen.has(v)) seen.add(v);
-  return [...seen].sort();
+  return [...seen];
 }
 
 function truncateSeconds(d: Date): Date {

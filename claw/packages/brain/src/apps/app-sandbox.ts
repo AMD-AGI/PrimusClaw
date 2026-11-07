@@ -128,12 +128,16 @@ export function appSandboxLabels(run: Pick<AppSandboxRun, "runId" | "sessionId" 
 export async function findLiveAppSandboxes(
   runId: string,
   apiKey: string,
+  workspaceId: string,
   fetchImpl: typeof globalThis.fetch = globalThis.fetch,
 ): Promise<Array<{ id: string; phase: string }>> {
   const found: Array<{ id: string; phase: string }> = [];
   let seen = 0;
   for (let page = 0; page < LIST_MAX_PAGES; page++) {
     const query = new URLSearchParams({
+      // SaFE authorizes a list against its workspace: without one only a
+      // system-admin may list, and every other user's run is refused with a 403.
+      workspaceId,
       envKey: APP_RUN_ID_ENV,
       envValue: runId,
       phase: ACTIVE_PHASES,
@@ -229,8 +233,15 @@ export function appModelKeyEnv(platformKey: string | undefined): Record<string, 
   return env;
 }
 
-const appSandboxNamespace = (run: Pick<AppSandboxRun, "workspaceId" | "sandboxSpec">): string =>
-  sandboxNamespaceForResources(run.workspaceId, run.sandboxSpec?.resources);
+/**
+ * The workspace the app container runs in: the run's `resources.workspace`, which
+ * admission checked the caller may use. The CPU/GPU rule of chat sandboxes does not
+ * move it, or the app would land in a workspace the caller never named. A run with
+ * no workspace (none is admitted that way today) falls back to that rule.
+ */
+export function appSandboxNamespace(run: Pick<AppSandboxRun, "workspaceId" | "sandboxSpec">): string {
+  return run.workspaceId?.trim() || sandboxNamespaceForResources(undefined, run.sandboxSpec?.resources);
+}
 
 /**
  * The handle of an app sandbox whose workload id is already known: a run being
@@ -298,7 +309,7 @@ export async function ensureAppSandbox(
     }
   };
 
-  const live = await findLiveAppSandboxes(run.runId, run.platformKey, deps.fetch);
+  const live = await findLiveAppSandboxes(run.runId, run.platformKey, ns, deps.fetch);
   if (live.length > 0) {
     // `live` is newest first. More than one means an earlier create was never seen
     // by the run (so it was never recorded or stopped). Which one is the run's:

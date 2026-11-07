@@ -49,6 +49,7 @@ test("reissue and extend use the resolved image and both workspaces", async () =
   for (const material of seen) {
     assert.equal(material.templates[0]!.image, "from-request:1");
     assert.equal(material.templates[0]!.workspace, "ws-sbx");
-    assert.deepEqual(material.workspaces, ["ws-app", "ws-sbx"]);
+    // The sandbox workspace first: that is where a grant sandbox goes.
+    assert.deepEqual(material.workspaces, ["ws-sbx", "ws-app"]);
   }
 });
