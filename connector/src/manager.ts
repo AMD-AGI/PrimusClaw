@@ -9,7 +9,7 @@ import os from "node:os";
 import { withHint } from "./hints.js";
 import { resolveCwd } from "./roots.js";
 import { REMOTE_COMMAND_TYPES, isRemoteCommandType } from "./protocol.js";
-import { sha256, errMessage, allowed, type MayRun } from "./util.js";
+import { sha256, errMessage, verdictOf, type MayRun } from "./util.js";
 
 export interface Command {
   cmd_id: string;
@@ -70,7 +70,9 @@ export class SessionManager {
     // `mayRun` (connector.ts `gateFor`) is asked in the session's turn, so what comes after it waits for the answer; refused, the
     // command is handled without running. A prompt carries it on and asks again when it reaches the agent (Session.enqueuePrompt).
     const next = prev.then(async () => {
-      if (mayRun && !(await allowed(mayRun))) return once();
+      const verdict = mayRun ? await verdictOf(mayRun) : "run";
+      if (verdict === "drop") return once();
+      if (verdict === "keep") return; // the connector is stopping: not handled, so it is delivered to the next run
       return this.dispatch(cmd, once, mayRun);
     }).catch((e) => {
       this.env.log.error("command failed", { type: cmd.type, session: sid, error: errMessage(e) });

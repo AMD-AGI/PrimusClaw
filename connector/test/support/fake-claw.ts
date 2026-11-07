@@ -65,6 +65,12 @@ export class FakeClaw {
   readonly commandStatus = new Map<string, string>();
   /** Every confirmation asked, in order, and what was answered. */
   readonly confirmations: Array<{ cmd_id: string; status: string }> = [];
+  /** Every confirmation asked, answered or not yet. */
+  readonly confirmAsked: string[] = [];
+  /** Hold every confirmation's answer until `releaseConfirms` (a slow Claw). */
+  holdConfirms = false;
+  private heldConfirms: Array<() => void> = [];
+  releaseConfirms(): void { const h = this.heldConfirms; this.heldConfirms = []; for (const f of h) f(); }
   private readonly streams = new Set<http.ServerResponse>();
   private readonly sockets = new Set<import("node:net").Socket>();
   private server!: http.Server;
@@ -203,10 +209,16 @@ export class FakeClaw {
       if (this.revokedIds.has(cf[1]!)) return this.json(res, 401, { ok: false, error: "revoked" });
       if (cf[1] !== this.connectorId) return this.json(res, 404, { ok: false, error: "not_found" });
       const cmdId = decodeURIComponent(cf[2]!);
-      const status = this.liveness(cmdId);
-      this.confirmations.push({ cmd_id: cmdId, status });
+      this.confirmAsked.push(cmdId);
       this.wake();
-      return this.json(res, 200, { ok: true, data: { cmd_id: cmdId, status } });
+      const answer = () => {
+        const status = this.liveness(cmdId);
+        this.confirmations.push({ cmd_id: cmdId, status });
+        this.wake();
+        try { this.json(res, 200, { ok: true, data: { cmd_id: cmdId, status } }); } catch { /* the connector went */ }
+      };
+      if (this.holdConfirms) { this.heldConfirms.push(answer); return; }
+      return answer();
     }
     const m = /^\/v1\/remote-agents\/connectors(?:\/([^/]+)\/(heartbeat|events|commands))?$/.exec(path);
     if (!m) return this.json(res, 404, { ok: false, error: "not_found" });

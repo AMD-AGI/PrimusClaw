@@ -70,13 +70,15 @@ export function secureUrl(raw: string, what: string): string {
 }
 
 /**
- * Whether a command may still act, asked when it is about to (connector.ts `gateFor`): true at once on the usual path, or Claw's
- * answer after a stall. A refusal has been reported already; the caller only counts the command as handled.
+ * Whether a command may still act, asked when it is about to (connector.ts `gateFor`): `run` at once on the usual path, or Claw's
+ * answer after a stall. `drop`: refused, and reported already; the caller only counts the command as handled. `keep`: no answer
+ * because the connector is stopping; the command is neither run nor counted as handled, so the next run gets it again.
  */
-export type MayRun = () => boolean | Promise<boolean>;
+export type Verdict = "run" | "drop" | "keep";
+export type MayRun = () => Verdict | Promise<Verdict>;
 
 /** `mayRun`'s answer, awaited only when it is one to wait for: the usual path asks nothing and waits for no I/O. */
-export const allowed = async (mayRun: MayRun): Promise<boolean> => {
+export const verdictOf = async (mayRun: MayRun): Promise<Verdict> => {
   const r = mayRun();
-  return r === true || (r !== false && await r);
+  return typeof r === "string" ? r : await r;
 };

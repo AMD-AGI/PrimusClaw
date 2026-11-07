@@ -28,7 +28,7 @@ import { redactDeep } from "./redact.js";
 import { DEFAULT_SESSION_TIMING, type SessionEnv, type SessionTiming } from "./session.js";
 import { SessionStore } from "./session-store.js";
 import type { SseFrame } from "./sse.js";
-import { backoffMs, errMessage, isObject, sleep, type Logger } from "./util.js";
+import { backoffMs, errMessage, isObject, sleep, type Logger, type MayRun, type Verdict } from "./util.js";
 import { agentHealth, RECHECK_MS, type AgentHealth, type Report } from "./doctor.js";
 
 /**
@@ -755,19 +755,23 @@ export class Connector {
    * late (`late`) or a stall has happened since it was read or last confirmed: then Claw is asked (`confirmLive`). Once refused,
    * always refused.
    */
-  private gateFor(cmd: Command, late: "stall" | "old" | null): () => boolean | Promise<boolean> {
+  private gateFor(cmd: Command, late: "stall" | "old" | null): MayRun {
     let seen = this.stallEpoch;
     let why: "stall" | "old" | null = late;
     let refused = false;
     return () => {
-      if (refused) return false;
+      if (refused) return "drop";
       this.tick();
       if (this.stallEpoch !== seen) why ??= "stall";
-      if (!why) return true;
+      if (!why) return "run";
       const asking = why;
       why = null;
       seen = this.stallEpoch;
-      return this.confirmLive(cmd, asking).then((ok) => { if (!ok) refused = true; return ok; });
+      return this.confirmLive(cmd, asking).then((v) => {
+        if (v === "drop") refused = true;
+        if (v === "keep") why ??= asking; // asked again if it is ever about to act in this run
+        return v;
+      });
     };
   }
 
@@ -805,10 +809,11 @@ export class Connector {
   }
 
   /**
-   * Ask Claw whether `cmd`, received late, may still run; true only for `live`. Anything else (its session closed, cancelled,
+   * Ask Claw whether `cmd`, received late, may still run: `run` only for `live`. Anything else (its session closed, cancelled,
    * expired, gone, this connector revoked, or no answer) drops it: audited, and said in its session, so whoever waits on it is told.
+   * With no answer because this run is stopping (not revoked), `keep`: not run and not handled, so the next run gets it again.
    */
-  private async confirmLive(cmd: Command, why: "stall" | "old"): Promise<boolean> {
+  private async confirmLive(cmd: Command, why: "stall" | "old"): Promise<Verdict> {
     let status: string | null = null;
     let error = "";
     for (let attempt = 0; attempt < CONFIRM_ATTEMPTS && status === null; attempt++) {
@@ -827,17 +832,20 @@ export class Connector {
     const seq = Number.isSafeInteger(cmd.cmd_seq) ? cmd.cmd_seq : undefined;
     // Revoked or stopping while the answer was on its way: not run, whatever Claw said before that.
     if (this.revoked) status = "connector_revoked";
-    else if (status === "live" && this.ctl.signal.aborted) status = null;
+    else if (this.ctl.signal.aborted && (status === null || status === "live")) {
+      this.d.audit.record("command_deferred", { type: cmd.type, cmd_id: cmd.cmd_id, cmd_seq: seq, why, reason: "stopping" });
+      return "keep";
+    }
     if (status === "live") {
       this.d.audit.record("command_confirmed", { type: cmd.type, cmd_id: cmd.cmd_id, cmd_seq: seq, why });
-      return true;
+      return "run";
     }
     const said = status ?? "unconfirmed";
     this.d.log.warn("a command received late was dropped: Claw did not confirm it is still live", { type: cmd.type, cmd_seq: seq, status: said, why, ...(error ? { error } : {}) });
     this.d.audit.record("command_dropped", { reason: "not_live", status: said, why, type: cmd.type, cmd_id: cmd.cmd_id, cmd_seq: seq, ...(error ? { error: error.slice(0, 300) } : {}) });
     if (cmd.type === "session.new") this.emit(cmd.session_id, "session_closed", { reason: "command_not_live", status: said });
     else this.emit(cmd.session_id, "command_rejected", { type: cmd.type, cmd_id: cmd.cmd_id, reason: "command_not_live", status: said, ...(seq !== undefined ? { cmd_seq: seq } : {}) });
-    return false;
+    return "drop";
   }
 
   private async streamLoop(): Promise<void> {

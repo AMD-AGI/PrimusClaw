@@ -33,7 +33,7 @@ import {
 } from "./permissions.js";
 import { redactDeep } from "./redact.js";
 import type { SessionStore } from "./session-store.js";
-import { allowed, errMessage, isObject, sleep, truncateBytes, type Logger, type MayRun } from "./util.js";
+import { errMessage, isObject, sleep, truncateBytes, verdictOf, type Logger, type MayRun } from "./util.js";
 
 /** `after`: the event is written (and posted) only once that has settled, e.g. the record it depends on is on disk. */
 export type Emit = (sessionId: string, type: string, data: Record<string, unknown>, after?: Promise<unknown>) => void;
@@ -467,7 +467,10 @@ export class Session {
         if (!ready) { refused(told === WAIT_WHY.gone ? "terminal_gone" : told === WAIT_WHY.other ? "terminal_switched" : "terminal_busy", told); continue; }
         // Still live (connector.ts `gateFor`: Claw is asked if the connector stalled since the message came): if not, it was
         // reported as refused already and is only dropped here.
-        if (next.mayRun && !(await allowed(next.mayRun))) {
+        const verdict = next.mayRun ? await verdictOf(next.mayRun) : "run";
+        // Stopping: left unhandled, as `shutdown` leaves the queue, so Claw delivers it again to the next run.
+        if (verdict === "keep") break;
+        if (verdict === "drop") {
           if (this.terminalQueue[0] === next) this.terminalQueue.shift();
           next.started();
           continue;
@@ -1057,7 +1060,10 @@ export class Session {
         const next = this.queue.shift()!;
         // Still live as it reaches the agent (connector.ts `gateFor`): asked of Claw only if the connector stalled since the
         // prompt came. Refused, it was reported already and is only counted as handled here.
-        if (next.mayRun && !(await allowed(next.mayRun))) { next.started(); continue; }
+        const verdict = next.mayRun ? await verdictOf(next.mayRun) : "run";
+        // Stopping: back at the front and not counted as handled (as `shutdown` keeps the queue), so the next run gets it again.
+        if (verdict === "keep") { this.queue.unshift(next); break; }
+        if (verdict === "drop") { next.started(); continue; }
         if (this.closed) { this.rejectCommand("prompt", next.cmdId, "session_closed", next.cmdSeq); next.started(); break; }
         await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq);
       }
