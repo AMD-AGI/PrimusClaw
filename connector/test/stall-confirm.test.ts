@@ -363,5 +363,20 @@ describe("a command whose frame was held in the network", () => {
     assert.equal(h.claw.confirmBodies.length, 1, "the session.new held 1.7 s was asked about");
     assert.ok(["delayed", "network"].includes(h.claw.confirmBodies[0]!.body.why), h.claw.confirmBodies[0]!.body.why);
   });
+
+  test("a stream that keeps lagging for longer than the pings Claw's clock is read from: its frames are still confirmed (`delayed`)", async () => {
+    // (Round 9: once the `ready` reading aged out of the last 8 pings, pings lagging as much as the commands set Claw's clock back
+    // by the lag, and a command held as long looked prompt.)
+    const timing = { transitMs: 1_000, watchdogMs: 10_000 };
+    const h = await Harness.create({ timing });
+    await h.stop();
+    h.claw.streamLagMs = 2_000; // after the ready, every frame (pings, commands) arrives 2 s late
+    h.connect({ timing });
+    h.start();
+    await sleep(3_500); // more than 8 lagged pings (one every 100 ms) have been read
+    const sid = h.claw.newSession("fake", h.work);
+    await h.claw.until("session_started", () => h.claw.eventsOf(sid, "session_started")[0]);
+    assert.deepEqual(h.claw.confirmBodies.map((c) => c.body.why), ["delayed"]);
+  });
 });
 

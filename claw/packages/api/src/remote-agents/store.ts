@@ -774,6 +774,12 @@ export async function ingestEvents(
   const owner = connector.owner_user_id;
   return inTransaction(async (q) => {
     await lock(q, `ingest:${connector.connector_id}`);
+    // A batch that closes sessions takes the connector row's lock first, as every other close does (`issueCommand`, a reclaim,
+    // `revokeIn`), before any session row: a late confirmation (`commandLiveness`, under the same lock) then never answers `live`
+    // for a command of a session this batch has closed.
+    if (events.some((e) => e.type === REMOTE_EVENT_SESSION_CLOSED)) {
+      await q("SELECT 1 FROM claw_remote_connectors WHERE connector_id = $1 FOR UPDATE", [connector.connector_id]);
+    }
     const ids = [...new Set(events.map((e) => e.session_id))];
     const owned = new Map<string, string>();
     if (ids.length) {

@@ -386,18 +386,19 @@ the person may have closed the session or removed the machine, and been told tha
   terminal) is confirmed when it reaches the agent.
 - The network, the same way: a command frame whose `sent_at` is more than 3 s before the connector read it (Claw's clock as its
   `ready` and `ping` frames give it, the largest offset seen on the stream, since a held-back frame only makes it look smaller) is
-  confirmed (`why: "delayed"`); the `ready` reading adds the time since the stream was asked for, so Claw's clock is never taken
-  as earlier than it is. So is every command read while a heartbeat has had no answer for more than 3 s, and within 5 s after a
+  confirmed (`why: "delayed"`); the `ready` reading adds the time since the stream was asked for and is kept for the life of the
+  stream (pings, which a lagging link delays as much as commands, can only raise the offset), so Claw's clock is never taken as
+  earlier than it is. So is every command read while a heartbeat has had no answer for more than 3 s, and within 5 s after a
   heartbeat answered late or failed, a `ready` that took more than 3 s, or the command stream reconnecting (`why: "network"`),
-  and every command still waiting to act then. After a stall Claw's clock is measured afresh, and until the next `ping` a frame's age cannot be told, so
-  it is confirmed too. On the usual path (no stall, no network trouble, a frame that came at once) nothing is asked.
+  and every command still waiting to act then. After a stall the pings are measured afresh and the `ready` bound is moved on by
+  the time the monotonic clock missed (a sleep). On the usual path (no stall, no network trouble, a frame that came at once) nothing is asked.
 - Claw calls a command `expired` only when it reached the connector past the live TTL (`received_late`). A prompt received in
   time and queued on the machine behind a turn longer than the TTL is confirmed after a stall like any other, and runs if its
   session is still open.
 - With no answer (no network yet after a wake, Claw down) the connector asks again with its usual backoff for up to 10 minutes,
   and the command waits in its session meanwhile; one that was already past the live TTL when it came gets only a few tries. A
   `cancel` or `close` of that session never waits behind it: it ends the confirmations being asked there (a `close` all of them,
-  a `cancel` those of prompts; each is dropped and said as below, `status` `session_closed` or `cancelled`), runs at once, and
+  a `cancel` those of prompts; each is dropped and said as below, `status` `session_closed` or `cancelled`), is carried out straight away, and
   what came before it in the session that has not acted yet is dropped the same way when its turn comes. A
   Claw with no confirm route (a 404 from its router, not its own `not_found`) cannot say, and the command runs as it did before
   the route existed (audited `command_unconfirmable`), so the API and the connector can ship in either order.

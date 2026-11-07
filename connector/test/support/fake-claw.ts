@@ -76,6 +76,8 @@ export class FakeClaw {
    * long: they are made (and stamped) at once, and written this much later.
    */
   streamDelayMs = 0;
+  /** Every frame after the `ready` of the next command stream reaches the connector this much later (a buffering link). */
+  streamLagMs = 0;
   /** Answer the next N confirmations with 503 (Claw, or the network to it, not there yet). */
   failConfirms = 0;
   /** Hold every confirmation's answer until `releaseConfirms` (a slow Claw). */
@@ -280,7 +282,14 @@ export class FakeClaw {
         this.streamDelayMs = 0;
         const held: string[] = [];
         let released = delay <= 0;
-        const write = (chunk: string) => { if (!released) held.push(chunk); else res.write(chunk); };
+        const lag = this.streamLagMs;
+        this.streamLagMs = 0;
+        const out = (chunk: string) => { if (lag > 0) setTimeout(() => { if (!res.destroyed) res.write(chunk); }, lag); else res.write(chunk); };
+        let readySent = false;
+        const write = (chunk: string) => {
+          if (!released) held.push(chunk);
+          else if (!readySent) { readySent = true; res.write(chunk); } else out(chunk);
+        };
         if (!released) setTimeout(() => { released = true; if (!res.destroyed) for (const c of held) res.write(c); }, delay);
         write(`event: ready\ndata: ${JSON.stringify({ v: 1, connector_id: this.connectorId, server_time: new Date().toISOString() })}\n\n`);
         this.streams.add(res);

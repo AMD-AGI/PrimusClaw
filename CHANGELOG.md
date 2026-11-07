@@ -126,7 +126,11 @@ record it.
   to 10 minutes, the command waiting in its session, before it reports it `unconfirmed`; a Claw without the confirm route (404
   from its router) leaves the command to run as before, so the API and the connector ship in either order. A `set_mode`,
   `resume` or `decision` queued before a `cancel` is no longer refused as `cancelled`, and a confirmation for an id Claw does not
-  hold writes no audit row.
+  hold writes no audit row. A `ready` that took more than 3 s also opens that window, and its clock reading is kept as an upper bound
+  for the life of the stream, so neither a held `ready` nor a link that keeps lagging makes a held frame look prompt. A `cancel`
+  or `close` never waits behind a confirmation Claw does not answer: it ends those in its session (dropped and said as
+  `cancelled` / `session_closed`), is carried out straight away, and what came before it there is dropped the same way when its
+  turn comes. A session its machine reports closed drops its queued acting commands, under the connector row's lock.
 - "连接我的开发环境" with no machine connected answers the one-line pairing command, every time. devenv_list with no machine, in a
   router turn answering a message the user sent signed in, recently, makes the pairing itself and gives it in `connect_a_machine`
   (`commands` the one line, `text` in the user's language with it in a code block, `pairing` its minutes). Any other turn (a report,

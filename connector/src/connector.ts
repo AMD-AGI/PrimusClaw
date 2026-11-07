@@ -328,12 +328,18 @@ export class Connector {
   private confirmFirst = new Set<string>();
   /**
    * Claw's clock minus this machine's monotonic one ({@link localNow}), from the command stream's `ready` and `ping` frames: the
-   * largest of the last {@link CLOCK_SAMPLES} seen on this stream, since a frame that was held back makes it look smaller, never
-   * larger (and an old sample ages out, so a clock that was stepped back is followed). Null until one is seen, and again after a
-   * stall (the monotonic clock may not have run through a sleep).
+   * largest of the stream's `ready` bound ({@link readyBound}) and its last {@link CLOCK_SAMPLES} pings, since a frame that was
+   * held back makes a ping's reading smaller, never larger (an old ping ages out, so a clock that was stepped back is followed).
+   * Null until a `ready` or ping is seen.
    */
   private clockOffsetMs: number | null = null;
   private clockSamples: number[] = [];
+  /**
+   * The stream's `ready` reading, an upper bound (`observeClock`), kept for as long as the stream lasts: frames held on this stream
+   * for longer than {@link CLOCK_SAMPLES} pings cannot pull the offset below it. Moved on by the time a sleep kept from the
+   * monotonic clock (`tick`).
+   */
+  private readyBound: number | null = null;
   /**
    * The confirmations being asked, by session and command (`confirmLive`): a `close` of the session ends every one of them, and
    * a `cancel` those of its prompts, at once (they are dropped and said so), instead of waiting behind them.
@@ -914,6 +920,8 @@ export class Connector {
     // Both clocks: the monotonic one goes on while the process is stopped (SIGSTOP), but on some systems not while the machine is
     // asleep; the wall clock jumps over a sleep. A wall clock set forward by hand only makes a command be confirmed, never run.
     const gap = Math.max(mono - this.tickMono, wall - this.tickWall);
+    // What the monotonic clock missed of the gap (a sleep it did not count; the wall clock jumped over it).
+    const missed = Math.max(0, (wall - this.tickWall) - (mono - this.tickMono));
     this.tickMono = mono;
     this.tickWall = wall;
     if (gap > this.timing.stallMs) {
@@ -921,7 +929,11 @@ export class Connector {
       this.confirmWhy = "stall";
       this.stallEpoch++;
       this.epochWhy = "stall";
-      this.resetClock(); // the monotonic clock may have stood still through a sleep: measured again from the next ping
+      // The monotonic clock may have stood still through a sleep: what it missed (the wall clock's gap beyond its own) moves
+      // Claw's clock on by as much. The pings are measured again; the `ready` bound is kept, moved on.
+      this.clockSamples = [];
+      if (this.readyBound !== null) this.readyBound += missed;
+      this.clockOffsetMs = this.readyBound;
       this.d.log.warn("this process could not run for a while (stopped, or the machine slept): commands received now are confirmed with Claw before they run", { gap_ms: Math.round(gap) });
       this.d.audit.record("stall_detected", { gap_ms: Math.round(gap) });
     }
@@ -952,20 +964,26 @@ export class Connector {
    * Claw's clock from a `ready` (`server_time`, ISO) or `ping` (`t`, ms) frame: the offset is the largest seen on this stream. `bound`:
    * the most time the frame can have taken (a `ready`: since the stream was asked for), added so that the reading is an upper bound.
    */
-  private observeClock(f: SseFrame, field: "server_time" | "t", bound = 0): void {
+  private observeClock(f: SseFrame, field: "server_time" | "t", bound?: number): void {
     try {
       const raw = (JSON.parse(f.data ?? "null") as Record<string, unknown> | null)?.[field];
       const t = typeof raw === "number" ? raw : Date.parse(String(raw ?? ""));
       if (!Number.isFinite(t)) return;
-      this.clockSamples.push(t - this.localNow() + Math.max(0, bound));
-      if (this.clockSamples.length > CLOCK_SAMPLES) this.clockSamples.shift();
-      this.clockOffsetMs = Math.max(...this.clockSamples);
+      const sample = t - this.localNow();
+      if (bound !== undefined) {
+        this.readyBound = sample + Math.max(0, bound);
+      } else {
+        this.clockSamples.push(sample);
+        if (this.clockSamples.length > CLOCK_SAMPLES) this.clockSamples.shift();
+      }
+      this.clockOffsetMs = Math.max(...this.clockSamples, ...(this.readyBound !== null ? [this.readyBound] : []));
     } catch { /* no clock in it */ }
   }
 
   private resetClock(): void {
     this.clockOffsetMs = null;
     this.clockSamples = [];
+    this.readyBound = null;
   }
 
   /** Whether `cmd` was older than the live TTL as it came (`issued_at`, Claw's clock): such a command is `old`. */
