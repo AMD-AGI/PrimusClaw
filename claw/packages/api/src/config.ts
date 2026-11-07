@@ -949,3 +949,10 @@ export const CLAW_ASSISTANT_LOOKUP_ACK = envBool("CLAW_ASSISTANT_LOOKUP_ACK", tr
 // How long after a router turn's first lookup starts the server waits for the router's own line before it says its own (milliseconds):
 // a model that writes its line beside the lookup, in the same step, is not answered twice.
 export const CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS = envInt("CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS", 600, { min: 0 });
+// Whom the server tells "on it" when a router turn answering them has said nothing CLAW_ASSISTANT_FIRST_ACK_MS after it began, whatever the
+// turn is doing (thinking, the assistant's own tools, a slow start), as the lookup line above is said for a lookup
+// (`assistant/lookup-ack.ts`): `*` for everyone, or a comma-separated list of user ids; blank, the default, for no one. Measured on the
+// evaluation identities first (2026-11-06 baseline: first reply p90 7.28 s, 21 turns that only answered at their end).
+export const CLAW_ASSISTANT_FIRST_ACK_USERS = env("CLAW_ASSISTANT_FIRST_ACK_USERS");
+// How long after a router turn began (its run row) the server waits for the router's first word before it says its own (milliseconds).
+export const CLAW_ASSISTANT_FIRST_ACK_MS = envInt("CLAW_ASSISTANT_FIRST_ACK_MS", 3500, { min: 0 });

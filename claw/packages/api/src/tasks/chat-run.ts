@@ -38,7 +38,7 @@ import { createHash, randomBytes } from "node:crypto";
 import pino from "pino";
 import { DOORBELL_SEMANTICS_VERSION, interruptSubject } from "@claw/protocol";
 import type { RunLease } from "@claw/protocol";
-import { RUN_FAT_PREPARING_RECONCILE } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_FIRST_ACK_USERS, RUN_FAT_PREPARING_RECONCILE } from "../config.js";
 import type { PoolClient } from "pg";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { nc } from "../infra/nats.js";
@@ -665,6 +665,13 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
     // reference nothing releases.
     if (!row) return null;
     if (status === "queued") metrics.onQueueEntered(input.queueEntryCause ?? "direct");
+    // A router turn that has said nothing a few seconds from now is told on it by the server (`assistant/lookup-ack.ts`). Imported when
+    // first needed: the assistant's modules import this one.
+    if (CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_FIRST_ACK_USERS && (input.origin ?? "chat") === "chat") {
+      void import("../assistant/lookup-ack.js")
+        .then((ack) => ack.armFirstAck(input.sessionId, input.messageId))
+        .catch((err) => logger.warn({ err, sessionId: input.sessionId }, "chat_run.first_ack_arm_failed"));
+    }
     // On the insert's own transaction when there is one: a reference committed
     // beside a row that rolls back is one nothing can ever reclaim.
     const workspaceId = input.recordWorkspaceUse === false

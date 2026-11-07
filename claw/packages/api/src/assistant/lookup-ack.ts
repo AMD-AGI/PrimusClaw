@@ -21,9 +21,18 @@
  * Only with notifications on (`CLAW_NOTIFICATIONS_ENABLED`): the answer takes the line's place by its delivery (`turnFirstSay` matches a
  * message to its turn through the outbox), and without them the line would stay beside the answer as a second message. A deployment
  * without channels shows the router's `say` while it is written (`stream_tool_text`) instead.
+ *
+ * The same line by the clock (`ackFirstReply`): a turn that has said nothing `CLAW_ASSISTANT_FIRST_ACK_MS` after it began is told on it
+ * too, whatever it is doing. A lookup is not the only slow first step: 21 turns of the 2026-11-06 baseline never said a word and were
+ * answered only at their end (`router-turn-end.ts`), and others thought, or called the assistant's own tools (deliver_text,
+ * trigger_create, review_mode_set), for 7 to 22 s before their first say. Same exclusions, same key (one line per turn, whichever says
+ * it first), and the answer takes its place the same way. Only for the people `CLAW_ASSISTANT_FIRST_ACK_USERS` names.
  */
 import pino from "pino";
-import { CLAW_ASSISTANT_LOOKUP_ACK, CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
+import {
+  CLAW_ASSISTANT_FIRST_ACK_MS, CLAW_ASSISTANT_FIRST_ACK_USERS, CLAW_ASSISTANT_LOOKUP_ACK, CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS,
+  CLAW_NOTIFICATIONS_ENABLED,
+} from "../config.js";
 import { db, type Querier } from "../infra/db.js";
 import { deterministicEventId } from "../notifications/outbox.js";
 import { turnMessage } from "./inbound.js";
@@ -140,6 +149,63 @@ export async function ackBeforeLookup(sessionId: string, event: Record<string, u
   if (!stored) return "said_before";
   logger.info({ sessionId, messageId, tool }, "assistant.lookup_ack_said");
   return "said";
+}
+
+/** What the server says when the turn has said nothing by the deadline, in the language of the person's message. Pure, for the tests. */
+export function firstAckText(userWords: string): string {
+  return detectLanguage(userWords) === "Chinese" ? "收到，我看一下。" : "On it: looking into it now.";
+}
+
+/** Whether `userId` is one the clock's line is said to: `*` names everyone, otherwise the comma-separated ids. Pure, for the tests. */
+export function firstAckFor(userId: string, users: string = CLAW_ASSISTANT_FIRST_ACK_USERS): boolean {
+  const names = users.split(",").map((u) => u.trim()).filter(Boolean);
+  return names.includes("*") || names.includes(userId);
+}
+
+/** Whether the clock's line is said to anyone: someone named, and a channel's delivery for the answer to take its place in. */
+export const firstAckOn = (): boolean => CLAW_ASSISTANT_FIRST_ACK_USERS.trim() !== "" && CLAW_NOTIFICATIONS_ENABLED;
+
+export interface FirstAckDeps extends SayDeps {
+  enabled?: boolean;
+  users?: string;
+}
+
+/**
+ * Say "on it" for the router turn answering `messageId` if it has still said nothing: called once the deadline has passed. Returns what
+ * it did, for the tests and the log: `said`, or why not.
+ */
+export async function ackFirstReply(sessionId: string, messageId: string, deps: FirstAckDeps = {}): Promise<string> {
+  if (!(deps.enabled ?? firstAckOn())) return "off";
+  if (!messageId) return "no_message";
+  const q: Querier = (text, params) => db.query(text, params);
+  const userId = await routerUser(q, sessionId);
+  if (!userId) return "not_a_router";
+  if (!firstAckFor(userId, deps.users)) return "not_named";
+  const message = await turnMessage(q, sessionId, messageId);
+  if (!message) return "no_message";
+  if (mayHandOff(message)) return "may_hand_off";
+  const why = await reasonToStaySilent(q, sessionId, userId, messageId);
+  if (why) return why;
+  const stored = await recordSystemNotice({
+    userId, sessionId, text: firstAckText(message.content), key: lookupAckKey(messageId), turnMessageId: messageId,
+  }, deps);
+  if (!stored) return "said_before";
+  logger.info({ sessionId, messageId }, "assistant.first_ack_said");
+  return "said";
+}
+
+/**
+ * Called when a chat run is opened (`openChatRun`): after `delayMs` the turn is told on it if it has said nothing by then. A timer of
+ * this process, never awaited and never throwing: a restart in between loses one line, which the turn's own answer still follows.
+ */
+export function armFirstAck(sessionId: string, messageId: string, delayMs: number = CLAW_ASSISTANT_FIRST_ACK_MS, deps: FirstAckDeps = {}): void {
+  if (!(deps.enabled ?? firstAckOn()) || !messageId) return;
+  const timer = setTimeout(() => {
+    void ackFirstReply(sessionId, messageId, deps)
+      .then((out) => { if (out !== "said") logger.debug({ sessionId, messageId, out }, "assistant.first_ack_skipped"); })
+      .catch((err) => logger.warn({ err, sessionId, messageId }, "assistant.first_ack_failed"));
+  }, delayMs);
+  timer.unref?.();
 }
 
 /** The event consumer's call: never awaited by it and never throwing into it. */

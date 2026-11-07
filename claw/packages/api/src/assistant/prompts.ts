@@ -51,8 +51,10 @@ import type { ChannelAttached } from "./inbound.js";
  * router-v18: v17 with the tool for three kinds of request named outright (2026-11-06 nightly): what a worker reported on an item is
  * work_recall reports, a request to remember is a memory tool and never a setting tool, a daily brief or a pause is a channel action and
  * never a scheduled task.
+ * router-v19: v18 with the quick line said before deliver_text, trigger_create, review_mode_set and the devenv_ tools as well (2026-11-06
+ * baseline: cat-items-wr-004 first spoke after deliver_text at 17.1 s, cat-settings-wr-001 after review_mode_set at 11.5 s).
  */
-export const ROUTER_PROMPT_VERSION = "router-v18";
+export const ROUTER_PROMPT_VERSION = "router-v19";
 /**
  * The router's prompt with the review and settings tools (`CLAW_ASSISTANT_TOOLS=on`): router-v5 and `ROUTER_REVIEW_PROMPT`
  * (v6: v5 with an allow only on the user's exact approval command, and a channel action not typed as its command put to the user
@@ -66,9 +68,9 @@ export const ROUTER_PROMPT_VERSION = "router-v18";
  * with the requester told they can stop a review they asked someone else to do, handed off or not, and how; v19: v18 on router-v15;
  * v20: v19 on router-v16; v21: v20 on router-v17, with review_start called before anything is asked about the request, since it
  * reads each pull request first and refuses one that is already merged, which is then said with when it merged and its merge commit
- * (2026-11-06 parity run, G3); v22: v21 on router-v18).
+ * (2026-11-06 parity run, G3); v22: v21 on router-v18; v23: v22 on router-v19).
  */
-export const ROUTER_REVIEW_PROMPT_VERSION = "router-v22";
+export const ROUTER_REVIEW_PROMPT_VERSION = "router-v23";
 
 /** The assistant's MCP server, which is what Brain puts before each of its tools' names. */
 export const ASSISTANT_MCP_SERVER = "assistant";
@@ -144,7 +146,7 @@ Which assistant tool
 - A setting the channel lists under Channel actions (a daily brief, pausing notifications for a while): channel_action, whether the user typed its command or said it in words. A daily brief or a pause of notifications is never a scheduled task (trigger_create) and never a work item; when the channel lists no such action, say in one line that it cannot be changed from this chat.
 
 Being quick
-- When answering takes a lookup or more than one step, put one short line that you are on it (查一下 / Checking now) in the first step, as a say beside the lookups, then say the answer when they are back: the answer takes that line's place, in the same message. Not before a work call: the system confirms work_create for you, and other work calls are said after their result.
+- When answering takes a lookup or more than one step, put one short line that you are on it (查一下 / Checking now) in the first step, as a say beside the lookups, then say the answer when they are back: the answer takes that line's place, in the same message. Not before a work call: the system confirms work_create for you, and other work calls are said after their result. Before deliver_text, trigger_create, review_mode_set or a devenv_ tool, say that line first, in the same step: each takes seconds, and the user hears nothing until you speak.
 - Make every lookup a step needs in that one step, side by side, instead of one per step.
 
 Asked again
