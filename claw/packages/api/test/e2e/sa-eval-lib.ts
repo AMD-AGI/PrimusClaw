@@ -511,8 +511,11 @@ export const INTERNAL_TEXT: ReadonlyArray<[string, RegExp]> = [
   ["work_event marker", /\[work_event\]/],
   ["item id field", /\bitem_id\b/],
   ["uuid", /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i],
-  ["claw message id", /\bclaw-(pending-)?\d+\b/],
-  ["prompt leak", /system prompt|<\/?(system|tool_result|function_calls)>/i],
+  // Not a sandbox workload's name (`claw-<ms>-sandbox`), which SaFE lists among the person's own workloads.
+  ["claw message id", /\bclaw-(pending-)?\d+\b(?!-sandbox)/],
+  // The prompt's own tags, or the assistant speaking of its own prompt; "system prompt" as a subject (what one is, how a model
+  // server takes one) is not a leak.
+  ["prompt leak", /\b(?:my|the assistant's)\s+system\s+prompt\b|我的系统提示词?|<\/?(system|tool_result|function_calls)>/i],
 ];
 /**
  * An answer in which the assistant says that it itself cannot reach something: it cannot access, read, browse or query a
@@ -637,14 +640,47 @@ export const BARE_NUMBER = /编号\s*#?\d+|#\d+(?=\s*($|[，。、,.;；:：)）
 const NOT_AN_ITEM = /\b(?:PRs?|pull requests?|pulls?|issues?|runs?|topics?|jobs?|builds?|plans?|workflows?)\b|[\w.-]+\/[\w.-]+$|拉取请求|合并请求|议题|话题|主题|运行|作业|构建|流水线/gi;
 const AN_ITEM = /\b(?:items?|tasks?)\b|事项|任务/i;
 
-/** The first item named only by its number (`BARE_NUMBER`) that is not something else's number (`NOT_AN_ITEM`); null when none is. */
+/** A line that is an entry of a list: led by a bullet ("- ", "* ", "• "), an ordinal ("1. ", "2、") or a number ("#294 ..."). */
+const LIST_ENTRY = /^\s*(?:[-*•·]\s+|\d+[.)、]\s*|#\d+)/;
+const LIST_HEADING = /^\s*#{1,6}\s|[:：][\s*_`]*$/;
+/** The start of a list entry's line up to its number: nothing, or only its bullet or ordinal. */
+const ENTRY_START = /^\s*(?:[-*•·]\s+|\d+[.)、]\s*)?$/;
+
+/**
+ * The heading of the list whose entry starts with the number at `at`: the first line above it that is neither an entry nor
+ * blank, when that line is a heading (`LIST_HEADING`); null otherwise. In "开着的 PR：\n- #294\n- #296" both numbers are
+ * entries of a list of pull requests.
+ */
+function listHeading(text: string, at: number): string | null {
+  const lines = text.slice(0, at).split("\n");
+  if (!ENTRY_START.test(lines.pop() ?? "")) return null;
+  for (let k = lines.length - 1, seen = 0; k >= 0 && seen < 40; k--, seen++) {
+    if (!lines[k]!.trim() || LIST_ENTRY.test(lines[k]!)) continue;
+    // A heading introduces its list: it ends with a colon, or is a markdown heading. Any other line ends the list above it.
+    return LIST_HEADING.test(lines[k]!) ? lines[k]! : null;
+  }
+  return null;
+}
+
+/** Whether a clause says a number after it is something else's (`NOT_AN_ITEM`), with no item named after that. */
+const namesOther = (clause: string): boolean => {
+  const other = [...clause.matchAll(NOT_AN_ITEM)].at(-1);
+  return !!other && !AN_ITEM.test(clause.slice(other.index! + other[0].length));
+};
+
+/**
+ * The first item named only by its number (`BARE_NUMBER`) that is not something else's number (`NOT_AN_ITEM` earlier in its
+ * clause, or in the heading of the list it is an entry of); null when none is.
+ */
 export function bareItemNumber(text: string): string | null {
   const re = new RegExp(BARE_NUMBER.source, "gm");
   for (let m = re.exec(text); m; m = re.exec(text)) {
     if (m[0].startsWith("编号")) return m[0];
     const clause = text.slice(Math.max(0, m.index - 120), m.index).split(/[。!！?？\n;；]|\.\s/).at(-1) ?? "";
-    const other = [...clause.matchAll(NOT_AN_ITEM)].at(-1);
-    if (!other || AN_ITEM.test(clause.slice(other.index! + other[0].length))) return m[0];
+    if (namesOther(clause)) continue;
+    const heading = listHeading(text, m.index);
+    if (heading !== null && namesOther(heading)) continue;
+    return m[0];
   }
   return null;
 }
@@ -752,10 +788,19 @@ export function storedTurnEnds(rows: readonly EventRow[]): string[] {
   return out;
 }
 
-/** The judge's verdict: PASS or FAIL as its first word, allowing markdown emphasis and a "Verdict:" label before it. */
+const VERDICT_FIRST = /^[\s*_#>`"']*(?:(?:final\s+)?verdict\s*[:：]\s*)?[*_`]*(PASS|FAIL)\b/i;
+
+/**
+ * The judge's verdict: PASS or FAIL as its first word, allowing markdown emphasis and a "Verdict:" label before it; or, from a
+ * judge that reasons first, as the first word of its last line. A PASS or FAIL inside a sentence is never one.
+ */
 export function judgeVerdict(text: string): "PASS" | "FAIL" | undefined {
-  return /^[\s*_#>`"']*(?:verdict\s*[:：]\s*)?[*_`]*(PASS|FAIL)\b/i.exec(text)?.[1]?.toUpperCase() as "PASS" | "FAIL" | undefined;
+  const last = text.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+  return (VERDICT_FIRST.exec(text) ?? VERDICT_FIRST.exec(last))?.[1]?.toUpperCase() as "PASS" | "FAIL" | undefined;
 }
+
+/** What a judge's second ask adds when its first answer had no verdict. */
+export const JUDGE_RETRY_NOTE = "\n\nYour last answer had no verdict. Answer with exactly one line that starts with PASS or FAIL.";
 
 /**
  * The stored events (`?mode=replay`, with their `event_id`, which is the stream's frame id) of the given turns, and of what was
@@ -1124,7 +1169,8 @@ export interface Attempt {
   finalChars: number;
   firstReplyMs: number | null;
   finalMs: number | null;
-  items: Array<Pick<ItemSeen, "seq" | "kind" | "board_state"> & { cleanup: string }>;
+  /** Every item the case's turns started; `last`: the graded (last) turn started it (earlier turns are context). */
+  items: Array<Pick<ItemSeen, "seq" | "kind" | "board_state"> & { cleanup: string; last?: boolean }>;
   judge?: { pass: boolean; why: string } | null;
   /** Not fully graded, so not a pass: content only a judge can grade and no judge graded it, or an oracle not read (offline). */
   unjudged?: true;
