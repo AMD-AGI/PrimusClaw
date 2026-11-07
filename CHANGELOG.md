@@ -121,6 +121,9 @@ record it.
   by side, so a lookup followed by an answer read as an answer written beside (before) the lookup. History now replays each call, then
   its result, then the turn's text, in the order they ran. The router's answer about what it can do no longer labels any part of
   itself read-only (只读) (`router-read-v11`).
+- The brief's SaFE section works for members who are not administrators. SaFE refuses them a workload list across workspaces
+  (403), so every such brief said "SaFE 没有回答：safe_http_403". After a 403 the brief now lists the user's own workspaces and reads
+  each one (at most 20); a workspace that refuses is left out, and SaFE is unreadable only when every one refuses.
 - A machine paired from the chat (`claw-connector pair`) and then disconnected is told, wherever the connector says what to do next
   (the revocation itself, `run` started again by the service or by hand, the supervisor's log line, `status`, `service status`,
   `doctor`'s fix, a sign-in refused at start), to ask the
