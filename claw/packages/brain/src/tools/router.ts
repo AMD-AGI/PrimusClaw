@@ -12,6 +12,7 @@ import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
 import type { RunCitations } from "./citations.js";
 import type { LogReads } from "./log-reads.js";
+import { callWithWorkspaceFanout, fansOut } from "./workspace-fanout.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import { MEMORY_TOOLS, MEMORY_TOOL_SCHEMAS, callMemoryTool } from "./memory-tools.js";
 import {
@@ -688,6 +689,8 @@ export class ToolRouter {
       if (!client) throw new Error(`Unknown MCP server: ${server}`);
       // A log read (`log_reads`): asked for no more than its bound, and its answer masked before anything reads it.
       if (this.logReads?.has(name)) return this.logReads.filter(await client.callTool(rest.join("__"), this.logReads.bound(name, input), outcome, meta, signal));
+      // SaFE's workload list without a workspace, refused to a member: read across the workspaces they may use (`workspace-fanout.ts`).
+      if (fansOut(name)) return callWithWorkspaceFanout(client, name, rest.join("__"), input, outcome, meta, signal);
       return client.callTool(rest.join("__"), input, outcome, meta, signal);
     }
 
