@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import test, { after, describe } from "node:test";
 import {
-  AttachSupport, MAX_REPORTED, SESSION_REF_RE, cleanTitle, fitResumable, localPidDomain, parseAgentsJson, processGroup, readRegistry,
+  AttachSupport, MAX_REPORTED, SESSION_REF_RE, cleanTitle, fitResumable, liveActivity, localPidDomain, parseAgentsJson, processGroup, readRegistry,
   TwinCheckError, type Resumable,
 } from "../src/attach.js";
 import { ChildRegistry, processStart } from "../src/children.js";
@@ -745,5 +745,124 @@ describe("attach end to end", () => {
     await h.attach(REF);
     const runs = fs.readFileSync(h.cliLog, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
     assert.ok(runs.length > 0 && runs.every((r) => r.args === "agents --json" && r.config === h.attachDir));
+  });
+});
+
+describe("the conversations already on the machine show up by themselves", () => {
+  const root = os.tmpdir();
+  const ids = (toml: string) => parseConfig(toml).agents.map((a) => [a.id, a.kind, a.attach?.cli ?? null]);
+
+  test("a claude agent brings one that lists its existing conversations, unless told not to or one already does", () => {
+    const claude = (extra = "", id = "cc") => `[[agents]]\nid = "${id}"\npreset = "claude"\nroots = ["${root}"]\n${extra}`;
+    assert.deepEqual(ids(claude()), [["cc", "claude", null], ["cc-sessions", "attach", "claude"]]);
+    const got = parseConfig(claude(`approval = "never"\nname = "Claude on my box"\n[agents.env]\nCLAUDE_CONFIG_DIR = "/x/cfg"\n`)).agents;
+    const [src, derived] = [got[0]!, got[1]!];
+    assert.deepEqual([derived.roots, derived.env, derived.askMode, derived.unattended, derived.allowUnsafeModes, derived.command, derived.args],
+      [src.roots, src.env, src.askMode, src.unattended, src.allowUnsafeModes, src.command, src.args], "the same roots, environment, adapter and approval");
+    assert.equal(derived.name, "Claude on my box (existing sessions)");
+    assert.notEqual(derived.env, src.env, "not the same object: editing one does not change the other");
+    assert.deepEqual(ids(claude(`existing_sessions = false\n`)), [["cc", "claude", null]], "the owner can turn it off");
+    assert.deepEqual(ids(`${claude()}\n[[agents]]\nid = "mine"\npreset = "claude-attach"\nroots = ["${root}"]\n`), [["cc", "claude", null], ["mine", "attach", "claude"]],
+      "a claude-attach agent on the same config directory already lists them");
+    assert.deepEqual(ids(`${claude(`[agents.env]\nCLAUDE_CONFIG_DIR = "/other"\n`)}\n[[agents]]\nid = "mine"\npreset = "claude-attach"\nroots = ["${root}"]\n`).map((r) => r[0]),
+      ["cc", "mine", "cc-sessions"], "one on another config directory does not");
+    assert.deepEqual(ids(`${claude()}\n[[agents]]\nid = "cc-sessions"\npreset = "codex"\nroots = ["${root}"]\n`).map((r) => r[0]), ["cc", "cc-sessions"],
+      "an agent of the owner's with that id wins");
+    assert.deepEqual(ids(`[[agents]]\nid = "x"\npreset = "codex"\nroots = ["${root}"]\n`), [["x", "codex", null]], "only Claude");
+    assert.throws(() => parseConfig(`[[agents]]\nid = "x"\npreset = "codex"\nexisting_sessions = true\nroots = ["${root}"]\n`), /existing_sessions only applies/);
+    assert.throws(() => parseConfig(claude(`existing_sessions = "no"\n`)), /existing_sessions must be true or false/);
+    const same = path.join(os.homedir(), ".claude-same-test");
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = same;
+    try {
+      assert.deepEqual(ids(`${claude()}\n[[agents]]\nid = "mine"\npreset = "claude-attach"\nroots = ["${root}"]\n[agents.env]\nCLAUDE_CONFIG_DIR = "${same}/"\n`).map((r) => r[0]),
+        ["cc", "mine"], "the same directory spelled differently (the connector's default here, written out there) is the same directory");
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev;
+    }
+    assert.ok(parseConfig(claude("", "a".repeat(64))).agents[1]!.id.length <= 64);
+  });
+
+  test("what a terminal says it is doing: waiting for its person wins, then working, then idle", () => {
+    const rows = parseAgentsJson(JSON.stringify([
+      { pid: 1, sessionId: REF, status: "waiting", waitingFor: "input needed", cwd: "/w" }, { pid: 2, sessionId: REF, status: "busy" },
+    ]));
+    assert.deepEqual([rows[0]!.waitingFor, rows[0]!.cwd, rows[1]!.waitingFor], ["input needed", "/w", null]);
+    assert.deepEqual(liveActivity(rows), { activity: "waiting", waiting_for: "input needed" });
+    assert.deepEqual(liveActivity([rows[1]!]), { activity: "working" });
+    assert.deepEqual(liveActivity(parseAgentsJson(JSON.stringify([{ pid: 3, sessionId: REF, status: "idle" }]))), { activity: "idle" });
+    assert.deepEqual(liveActivity(parseAgentsJson(JSON.stringify([{ pid: 3, sessionId: REF, status: "shell" }]))), {}, "a status it does not know says nothing");
+    assert.deepEqual(liveActivity([{ pid: 4, sessionId: REF, status: "waiting", waitingFor: `token sk-ant-api03-${"x".repeat(40)}\nnext`, foreign: false }]).waiting_for?.includes("sk-ant"), false, "scrubbed");
+  });
+
+  test("the heartbeat says a conversation open in a terminal is waiting for its person, and what for", async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF2, status: "waiting", waitingFor: "input needed" }, { pid: process.pid, sessionId: REF, status: "busy" }] });
+    await h.online();
+    const hb = await h.claw.until("a heartbeat with the list", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
+    assert.deepEqual(hb.agents[0].capabilities.resumable.map((r: any) => [r.ref, r.state, r.activity ?? null, r.waiting_for ?? null]),
+      [[REF, "live", "working", null], [REF2, "live", "waiting", "input needed"]]);
+  });
+
+  test("a conversation a terminal has just opened is reported within seconds, not at the next heartbeat", async () => {
+    const work = tmpdir("cc-work-");
+    const real = fs.realpathSync(work);
+    const listFile = path.join(tmpdir("cc-list-"), "sessions.json");
+    fs.writeFileSync(listFile, JSON.stringify([{ sessionId: REF, cwd: work, title: "Old one", updatedAt: "2026-10-29T10:00:00.000Z" }]));
+    const h = await Harness.create({
+      work, env: { FAKE_SESSIONS_FILE: listFile }, attach: { sessions: [] },
+      // The heartbeat is a minute away: only the watcher can bring the new conversation in time.
+      timing: { heartbeatMs: 60_000, sessionsWatchMs: 100, catalogMs: 600_000 },
+    });
+    hs.push(h);
+    await h.claw.until("the first heartbeat", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
+    const before = h.claw.heartbeats.length;
+    await new Promise((r) => setTimeout(r, 400));   // (the watcher has taken its first look)
+    // A terminal opens a new conversation in the roots: Claude Code writes its transcript and its registry row.
+    const project = path.join(h.attachDir, "projects", real.replace(/[^A-Za-z0-9]/g, "-"));
+    fs.mkdirSync(project, { recursive: true });
+    fs.writeFileSync(path.join(project, `${REF2}.jsonl`), "{}\n");
+    fs.writeFileSync(listFile, JSON.stringify([
+      { sessionId: REF2, cwd: work, title: "Just opened", updatedAt: "2026-10-29T11:00:00.000Z" },
+      { sessionId: REF, cwd: work, title: "Old one", updatedAt: "2026-10-29T10:00:00.000Z" },
+    ]));
+    const term = sleeper();
+    fs.mkdirSync(path.join(h.attachDir, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(h.attachDir, "sessions", `${term.pid}.json`), JSON.stringify({
+      pid: term.pid, sessionId: REF2, cwd: real, status: "waiting", waitingFor: "input needed", kind: "interactive",
+      procStart: processStart(term.pid!), pidDomain: localPidDomain(),
+    }));
+    const hb = await h.claw.until("a heartbeat with the new conversation", () => h.claw.heartbeats.slice(before)
+      .find((b) => b.agents[0].capabilities.resumable?.some((r: any) => r.ref === REF2)), 5_000);
+    const row = hb.agents[0].capabilities.resumable.find((r: any) => r.ref === REF2);
+    assert.deepEqual([row.title, row.state, row.activity, row.waiting_for], ["Just opened", "live", "waiting", "input needed"]);
+    await stop(term);
+  });
+
+  test("so is one a terminal ran and already ended (claude -p): a new transcript in a project folder inside the roots", async () => {
+    const work = tmpdir("cc-work-");
+    const real = fs.realpathSync(work);
+    const listFile = path.join(tmpdir("cc-list-"), "sessions.json");
+    const old = { sessionId: REF, cwd: work, title: "Old one", updatedAt: "2026-10-29T10:00:00.000Z" };
+    fs.writeFileSync(listFile, JSON.stringify([old]));
+    const h = await Harness.create({
+      work, env: { FAKE_SESSIONS_FILE: listFile }, attach: { sessions: [] }, timing: { heartbeatMs: 60_000, sessionsWatchMs: 100, catalogMs: 600_000 }, start: false,
+    });
+    hs.push(h);
+    const project = path.join(h.attachDir, "projects", real.replace(/[^A-Za-z0-9]/g, "-"));
+    fs.mkdirSync(project, { recursive: true });
+    fs.writeFileSync(path.join(project, `${REF}.jsonl`), "{}\n");
+    h.start();
+    await h.claw.until("the first heartbeat", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
+    await new Promise((r) => setTimeout(r, 400));
+    const before = h.claw.heartbeats.length;
+    // Appending to a transcript is no new conversation and lists nothing again.
+    fs.appendFileSync(path.join(project, `${REF}.jsonl`), "{}\n");
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(h.claw.heartbeats.length, before, "nothing changed that the phone is shown");
+    fs.writeFileSync(listFile, JSON.stringify([{ sessionId: REF2, cwd: work, title: "Ran and ended", updatedAt: "2026-10-29T11:00:00.000Z" }, old]));
+    fs.writeFileSync(path.join(project, `${REF2}.jsonl`), "{}\n");
+    const hb = await h.claw.until("a heartbeat with the ended conversation", () => h.claw.heartbeats.slice(before)
+      .find((b) => b.agents[0].capabilities.resumable?.some((r: any) => r.ref === REF2)), 5_000);
+    assert.deepEqual(hb.agents[0].capabilities.resumable.map((r: any) => [r.title, r.state]), [["Ran and ended", "idle"], ["Old one", "idle"]]);
   });
 });

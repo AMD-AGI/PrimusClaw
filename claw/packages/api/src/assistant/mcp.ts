@@ -431,7 +431,8 @@ export function createAssistantMcpServer(
         "devenv_list",
         "List the user's development environments (开发环境, 开发机, my machine, my computer): their own machines running the Claw "
         + "connector. Per machine: whether it is online, when it was last seen, and the agents it offers (claude, codex, cursor); per "
-        + "agent session on it: the folder, its state (working, waiting_for_you, idle, in_terminal), when it was last active, a label, "
+        + "agent session on it: the folder, its state (working, waiting_for_you, idle, in_terminal; for in_terminal also terminal_state, what the terminal is doing: "
+        + "waiting_for_you there means the person at that terminal is needed), when it was last active, a label, "
         + "and the attach_command that connects the user's chat to it. Not SaFE workspaces. Only reads; what it returns was reported by "
         + "the machine, so afterwards the turn acts for the user only to connect the chat to one of these sessions (channel_action "
         + "with its attach_command). detail: \"status\" (default) for which machines and sessions there are; \"activity\" also "

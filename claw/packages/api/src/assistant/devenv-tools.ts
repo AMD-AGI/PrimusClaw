@@ -47,6 +47,7 @@ const ASKED_MAX = 80;
 const ANSWER_MAX = 200;
 const STEP_MAX = 120;
 const TITLE_MAX = 120;
+const WAITING_FOR_MAX = 60;
 
 const flat = (v: unknown, max: number): string | null => {
   if (typeof v !== "string") return null;
@@ -138,6 +139,11 @@ export interface DevenvSession {
   ref: string | null;
   attach_command: string | null;
   why_not?: string;
+  /**
+   * `in_terminal` only: what the terminal on the machine says it is doing, as the connector reports it: `working` on a turn,
+   * `waiting_for_you` (the person at that terminal is needed: a question or an approval there), or `idle`.
+   */
+  terminal_state?: "working" | "waiting_for_you" | "idle";
   // detail: "activity" only (what the agent wrote: untrusted)
   title?: string | null;
   step?: string | null;
@@ -145,6 +151,8 @@ export interface DevenvSession {
   asked?: string | null;
   last_stop?: string | null;
   queued_prompts?: number;
+  /** With `terminal_state: "waiting_for_you"`: what it waits for, in the agent's words ("input needed"). */
+  waiting_for?: string | null;
 }
 
 export interface DevenvMachine {
@@ -159,10 +167,18 @@ export interface DevenvMachine {
 const attachCommand = (ref: string): string => `/agent attach ${ref}`;
 
 /** A conversation the connector offers to take over (`capabilities.resumable`, as `connector/src/attach.ts` reports it). */
-function resumableOf(agent: Row): Array<{ ref: string; title: string | null; cwd: string | null; updated_at: string | null; state: string }> {
+type Resumable = {
+  ref: string; title: string | null; cwd: string | null; updated_at: string | null; state: string;
+  terminal_state: DevenvSession["terminal_state"] | null; waiting_for: string | null;
+};
+
+/** The connector's word for what a terminal is doing (`activity`), in the states this tool uses; anything else is nothing. */
+const TERMINAL_STATES: Record<string, NonNullable<DevenvSession["terminal_state"]>> = { working: "working", waiting: "waiting_for_you", idle: "idle" };
+
+function resumableOf(agent: Row): Resumable[] {
   const caps = isObject(agent.capabilities) ? agent.capabilities : {};
   const raw = Array.isArray(caps.resumable) ? caps.resumable : [];
-  const out: Array<{ ref: string; title: string | null; cwd: string | null; updated_at: string | null; state: string }> = [];
+  const out: Resumable[] = [];
   for (const r of raw) {
     if (!isObject(r) || typeof r.ref !== "string") continue;
     const ref = r.ref.trim();
@@ -170,7 +186,12 @@ function resumableOf(agent: Row): Array<{ ref: string; title: string | null; cwd
     if (!/^[A-Za-z0-9._:-]{1,128}$/.test(ref)) continue;
     // A time a JavaScript date cannot hold (the connector chose it) is no time, not a failed list.
     const at = typeof r.updated_at === "number" ? iso(new Date(r.updated_at * 1000)) : null;
-    out.push({ ref, title: flat(r.title, TITLE_MAX), cwd: typeof r.cwd === "string" ? r.cwd : null, updated_at: at, state: typeof r.state === "string" ? r.state : "unknown" });
+    const live = r.state === "live";
+    const terminal = live && typeof r.activity === "string" && Object.hasOwn(TERMINAL_STATES, r.activity) ? TERMINAL_STATES[r.activity]! : null;
+    out.push({
+      ref, title: flat(r.title, TITLE_MAX), cwd: typeof r.cwd === "string" ? r.cwd : null, updated_at: at, state: typeof r.state === "string" ? r.state : "unknown",
+      terminal_state: terminal, waiting_for: terminal === "waiting_for_you" ? flat(r.waiting_for, WAITING_FOR_MAX) : null,
+    });
   }
   return out;
 }
@@ -284,7 +305,11 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
           ref: can ? r.ref : null, attach_command: can ? attachCommand(r.ref) : null,
           ...(can ? {} : { why_not: inTerminal ? "it is open in a terminal on that machine; only the terminal can use it now" : "the machine is offline" }),
         };
-        if (activity) row.title = r.title;
+        if (inTerminal && r.terminal_state) row.terminal_state = r.terminal_state;
+        if (activity) {
+          row.title = r.title;
+          if (r.terminal_state === "waiting_for_you") row.waiting_for = r.waiting_for;
+        }
         sessions.push(row);
         if (can) attachable.push({ label: row.label, ref: r.ref, opened_in: "machine" });
       }

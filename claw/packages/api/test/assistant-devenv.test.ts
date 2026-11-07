@@ -195,6 +195,25 @@ describe("devenv_list", { skip }, () => {
     assert.match(b.note, /not SaFE\s+workspaces/);
   });
 
+  test("D1b a conversation open in a terminal says what that terminal is doing; what it waits for is the agent's words, activity only", async () => {
+    const alice = await w.user("alice");
+    await machine("alice", "laptop", { online: true, agents: [{ id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)", resumable: [
+      { ref: "c0ffee00-0000-4000-8000-00000000000a", title: "needs me", cwd: "/w/a", updated_at: now() - 5, state: "live", activity: "waiting", waiting_for: "input needed" },
+      { ref: "c0ffee00-0000-4000-8000-00000000000b", title: "busy", cwd: "/w/b", updated_at: now() - 10, state: "live", activity: "working" },
+      { ref: "c0ffee00-0000-4000-8000-00000000000c", title: "odd", cwd: "/w/c", updated_at: now() - 20, state: "live", activity: "constructor" },
+      { ref: "c0ffee00-0000-4000-8000-00000000000d", title: "closed", cwd: "/w/d", updated_at: now() - 30, state: "idle", activity: "waiting", waiting_for: "x" },
+    ] }] });
+    const status = (await call(await userTurn(alice, "我的开发环境上有哪些会话"))).body;
+    assert.deepEqual(status.machines[0].sessions.map((s: Recorded) => [s.cwd, s.state, s.terminal_state ?? null, s.waiting_for ?? null]), [
+      ["/w/a", "in_terminal", "waiting_for_you", null],
+      ["/w/b", "in_terminal", "working", null],
+      ["/w/c", "in_terminal", null, null],
+      ["/w/d", "idle", null, null],
+    ], "the state is the connector's word mapped to ours, or nothing; what it waits for is not in a status read");
+    const act = (await call(await userTurn(alice, "哪个会话在等我"), { detail: "activity" })).body;
+    assert.deepEqual(act.machines[0].sessions.map((s: Recorded) => s.waiting_for ?? null), ["input needed", null, null, null]);
+  });
+
   test("D2 detail activity says what each session is doing in the agent's words, and the turn has read untrusted text", async () => {
     const alice = await w.user("alice");
     const { working, waiting, idle } = await aliceWorld();

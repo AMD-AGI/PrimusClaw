@@ -60,6 +60,7 @@ describe("agents.toml", () => {
       ["claude", "claude", "default", ["default", "plan"]],
       ["codex", "codex", "read-only", ["read-only"]],
       ["cursor", "cursor", "ask", ["ask", "plan"]],
+      ["claude-sessions", "attach", "default", ["default", "plan"]],
     ]);
     assert.match(cfg.agents[0]!.args.join(" "), /claude-agent-acp@\d/);
     assert.match(cfg.agents[1]!.args.join(" "), /codex-acp@\d/);
@@ -99,7 +100,7 @@ describe("agents.toml", () => {
   test("approval is per agent: one agent can run unattended while the next still asks, and the file-level switch is only a default", () => {
     const two = (top: string, a: string, b: string) => parseConfig(
       `${top}[[agents]]\nid = "a"\npreset = "claude"\nroots = [${JSON.stringify(root)}]\n${a}\n[[agents]]\nid = "b"\npreset = "cursor"\nroots = [${JSON.stringify(root)}]\n${b}\n`);
-    const row = (c: ReturnType<typeof parseConfig>) => c.agents.map((x) => [x.id, x.allowUnsafeModes, x.unattended]);
+    const row = (c: ReturnType<typeof parseConfig>) => c.agents.filter((x) => !x.attach).map((x) => [x.id, x.allowUnsafeModes, x.unattended]);
     assert.deepEqual(row(two("", `approval = "never"`, "")), [["a", true, true], ["b", false, false]]);
     assert.deepEqual(row(two("allow_unsafe_modes = true\n", "", "")), [["a", true, false], ["b", true, false]], "allowed, still starting in the asking mode");
     assert.deepEqual(row(two("allow_unsafe_modes = true\n", "", `approval = "ask"`)), [["a", true, false], ["b", false, false]], "an agent's own setting beats the default");
