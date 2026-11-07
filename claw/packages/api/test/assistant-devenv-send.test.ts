@@ -44,7 +44,8 @@
  *   F17 a machine revoked while a card that would send to it waits: the card closes (expired, `connector_revoked`), the router's
  *       pending cards no longer name it, a press afterwards sends nothing; another machine's card, and another user's revoke, are untouched;
  *       a card proposed while the machine is being revoked is refused (no_machine), never left waiting; a revoke never waits for a card
- *       that is being pressed (the press holds the card while its send waits for the machine: a cycle Postgres cannot see)
+ *       that is being pressed (the press holds the card while its send waits for the machine: a cycle Postgres cannot see); a machine
+ *       whose offline row is replaced by registering again under its name closes its cards the same way
  *   F20 an agent that only takes over existing conversations (kind attach) is never chosen for a new session, which its connector would
  *       refuse: with another agent there, that one; alone, a question listing its conversations, else no_agent saying why
  *   F21 at the limit of open sessions a new one closes the longest unused idle session of the user's (never one working, waiting for
@@ -525,6 +526,27 @@ describe("development environment items and devenv_send", { skip }, () => {
     const again = await fetch(`${base}/v1/remote-agents/connectors/${desktop}`, { method: "DELETE", headers: { "x-test-user": "bob" } });
     assert.equal(again.status, 404);
     assert.equal((await w.q("SELECT status FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toDesktop.confirmation_id]))[0].status, "pending");
+  });
+
+  test("F17e a machine replaced by registering again under its name: its waiting card closes as on a revoke", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const desktop = await machine("alice", "desktop");
+    const toLaptop = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
+    const toDesktop = await tools.devenvSend(await userTurn(alice, "让 desktop 上的 claude 跑 lint"), { text: "跑 lint", target: "desktop" });
+    assert.equal(toLaptop.done, false, JSON.stringify(toLaptop));
+    assert.equal(toDesktop.done, false, JSON.stringify(toDesktop));
+    // laptop lost its local state: its row is an hour old and offline, and it registers afresh under the same name.
+    await w.q("UPDATE claw_remote_connectors SET created_at = NOW() - interval '1 hour', heartbeat_at = NOW() - interval '1 hour', stream_seen_at = NULL WHERE connector_id = $1", [laptop]);
+    const again = await post("alice", "/v1/remote-agents/connectors", { name: "laptop" });
+    assert.equal(again.status, 201, JSON.stringify(again.body));
+    assert.ok((await w.q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [laptop]))[0].revoked_at, "the old row was replaced");
+    const card = (await w.q("SELECT * FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toLaptop.confirmation_id]))[0];
+    assert.deepEqual([card.status, card.decided_via, card.result?.error], ["expired", "connector_revoked", "no_machine"]);
+    assert.deepEqual((await schedules.pendingConfirmations("alice")).map((c) => c.confirmation_id), [toDesktop.confirmation_id],
+      "the other machine's card still waits");
+    assert.doesNotMatch(await schedules.renderScheduleState("alice"), /on the machine "laptop"/);
   });
 
   test("F17b a card drawn while its machine is being revoked: the turn is refused, no card is left waiting", async () => {

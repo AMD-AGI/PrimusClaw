@@ -71,6 +71,8 @@ const withCredential = (detail: Record<string, unknown>, credential: string | nu
 export async function registerConnector(
   owner: string, name: string, version: string | null, client: string | null, maxPerUser: number,
   credential: string | null = null, onlineWindowMs: number | null = null,
+  /** What else ends with a row replaced here, in this transaction (as `revokeConnector`'s `alsoInTransaction`). */
+  alsoOnReplace?: (q: Querier, connectorId: string) => Promise<void>,
 ): Promise<(Row & { replaced: string[] }) | null> {
   return inTransaction(async (q) => {
     await lock(q, `connectors:${owner}`);
@@ -89,7 +91,9 @@ export async function registerConnector(
         [secs(onlineWindowMs), owner, name],
       )).rows.map((r) => String(r.connector_id));
       for (const id of stale) {
-        if (await revokeIn(q, owner, id, client, { reason: "replaced_by_same_name" })) replaced.push(id);
+        if (!(await revokeIn(q, owner, id, client, { reason: "replaced_by_same_name" }))) continue;
+        await alsoOnReplace?.(q, id);
+        replaced.push(id);
       }
     }
     const n = Number((await q(

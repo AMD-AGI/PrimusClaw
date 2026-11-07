@@ -256,6 +256,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!body.ok) return fail(reply, 400, body.error);
     const row = await store.registerConnector(
       owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req), onlineWindowMs,
+      // A replaced row is revoked: the cards that would send to it close with it, as on the revoke route.
+      (q, id) => closeCardsOfConnector(q, owner, id).then(() => undefined),
     );
     if (!row) return fail(reply, 409, "connector_limit_reached");
     // Offline rows under the same name (a connector that lost its state and registered again) were revoked in its place.
