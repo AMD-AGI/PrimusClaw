@@ -10,8 +10,9 @@
  * log itself, as it is at the question.
  *
  * Read the way the session's changes are (`changes-service.ts`): from the sandbox the registry already names, never one made or woken
- * for the purpose, with one short command that takes no input. Hidden files and dependency trees are not read; what is read is cut to
- * its tail and masked as a command's output is (`redactCommandSecrets`). It is data written by the worker's job, never instructions.
+ * for the purpose, with one short command that takes no input. Hidden files and dependency trees are not read; what is read is masked
+ * as a command's output is (`redactCommandSecrets`), whole lines at a time, and only then cut to its tail. It is data written by the
+ * worker's job, never instructions.
  */
 import pino from "pino";
 import { kv } from "../infra/nats.js";
@@ -26,8 +27,11 @@ const logger = pino({ name: "assistant-live-files" });
 export const LIVE_FILES_MAX = 3;
 /** Only files written within this many minutes: a job that is running writes as it goes. */
 const LIVE_FILES_MINUTES = 60;
-/** Bytes read from the end of each file, and the characters of it kept. */
-const LIVE_FILE_READ_BYTES = 4096;
+/**
+ * Bytes read from the end of each file, and the characters of it kept. Far more is read than kept: the text is masked whole lines at a
+ * time, before it is cut, so a cut never separates a secret from the name that marks it.
+ */
+const LIVE_FILE_READ_BYTES = 16384;
 export const LIVE_FILE_TAIL_CHARS = 1200;
 /** The router is waiting: well inside Hands' own limit. */
 const LIVE_FILES_TIMEOUT_SEC = 8;
@@ -90,9 +94,10 @@ export function parseLiveFiles(output: string): LiveFiles {
     }
     const tail = /^@@TAIL ([A-Za-z0-9+/=]*)$/.exec(line);
     if (tail && pending) {
-      // A cut at the start of the bytes read can split a character or a line: the first, partial line is dropped when there are more.
+      // Only whole lines are kept: when the file is longer than what was read, the first, partial line is dropped, and a last line
+      // longer than all of it is not shown at all (its start, which may name a secret, was not read).
       let text = b64(tail[1]).replace(/\r/g, "");
-      if (pending.size > LIVE_FILE_READ_BYTES && text.includes("\n")) text = text.slice(text.indexOf("\n") + 1);
+      if (pending.size > LIVE_FILE_READ_BYTES) text = text.includes("\n") ? text.slice(text.indexOf("\n") + 1) : "";
       text = redactCommandSecrets(text).replace(/\s+$/, "");
       files.push({ ...pending, tail: text.length > LIVE_FILE_TAIL_CHARS ? `…${text.slice(-LIVE_FILE_TAIL_CHARS)}` : text });
       pending = null;

@@ -101,6 +101,23 @@ describe("a running worker's files, read now", () => {
     }
   });
 
+  test("a secret is masked before the text is cut: a line whose start was not read is not shown", () => {
+    const dir = mkdtempSync(join(tmpdir(), "claw-live-files-cut-"));
+    try {
+      // One line longer than all that is read: its start, which names the secret, is past the bytes read.
+      writeFileSync(join(dir, "one-line.log"), `MY_PASSWORD={"value":"${"x".repeat(20_000)}S3cr3tToken0123456789"}`);
+      // Whole lines within what is read: masked by the name that marks them, then cut to the tail.
+      writeFileSync(join(dir, "lines.log"), `${"y".repeat(20_000)}\nMY_PASSWORD={"value":"${"z".repeat(1500)}S3cr3tToken0123456789"}\nstep 5/16\n`);
+      const out = parseLiveFiles(execFileSync("bash", ["-c", liveFilesScript(dir)], { encoding: "utf8" }));
+      assert.equal(out.status, "read");
+      if (out.status !== "read") return;
+      const byPath = Object.fromEntries(out.files.map((f) => [f.path, f]));
+      assert.equal(byPath["one-line.log"].tail, "", "nothing of a line read only in part");
+      assert.ok(byPath["lines.log"].tail.endsWith("step 5/16"));
+      assert.ok(!JSON.stringify(out).includes("S3cr3tToken"), "the secret is masked, whatever the cut");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test("an empty or missing workspace reads as no files", () => {
     const out = parseLiveFiles(run(join(root, "does-not-exist")));
     assert.deepEqual(out.status === "read" ? out.files : null, []);
