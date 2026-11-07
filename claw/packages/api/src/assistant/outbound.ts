@@ -694,6 +694,27 @@ export async function recordNeedsYouFallback(input: { itemId: string }, deps: Sa
   return { say_id: stored.sayId, subscribers: stored.subscribers };
 }
 
+/**
+ * Show again, in the item's session, the system's message about its current need that was stored but shown in no session (its
+ * publish failed, or the user had no session then): the silent sweep's, for a user no channel tells (`silent-sweep.ts`). The same
+ * message, under the same id, so a client shows it once. True when it is shown now.
+ */
+export async function reshowFallback(input: { itemId: string }, deps: SayDeps = {}): Promise<boolean> {
+  await ensureLiveAssistant(input.itemId);
+  const item = await loadItem((t, p) => db.query(t, p), input.itemId);
+  if (!item) return false;
+  const sayId = deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq));
+  const said = (await db.query(
+    "SELECT text, created_at FROM claw_assistant_says WHERE say_id = $1 AND fallback AND session_id IS NULL", [sayId],
+  )).rows[0] as { text: string; created_at: Date } | undefined;
+  if (!said) return false;
+  const where = await itemSession((t, p) => db.query(t, p), item.item_id);
+  if (!where?.sessionId) return false;
+  const m: ToStore = { type: "work_item.needs_you", sayId, userId: item.user_id, sessionId: where.sessionId, text: said.text, item };
+  await publishSayEvent(where.sessionId, sayId, payloadOf(m, said.created_at), deps);
+  return ((await db.query("SELECT session_id FROM claw_assistant_says WHERE say_id = $1", [sayId])).rows[0]?.session_id ?? null) !== null;
+}
+
 /** What the router is told when the system already told the user, in this turn, that the item they asked for started. */
 export const ALREADY_ANNOUNCED_REFUSAL = "the system has already told the user in this turn that the item started (its number and title): "
   + "nothing was sent, as a second message would repeat it. Say nothing more in this turn: end it.";

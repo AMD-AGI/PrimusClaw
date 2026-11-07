@@ -829,10 +829,11 @@ describe("assistant outbound", { skip }, () => {
       );
       return itemId;
     }
-    async function sweep(): Promise<number> {
+    async function sweep(d = deps()): Promise<number> {
       const silent = await import("../src/assistant/silent-sweep.js");
       const ports = { ...silent.silentSweepPorts };
-      silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, deps());
+      silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, d);
+      silent.silentSweepPorts.reshowFallback = (i) => outbound.reshowFallback(i, d);
       try { return await silent.tellSilentItems(300); } finally { Object.assign(silent.silentSweepPorts, ports); }
     }
     const shown = () => events.filter((e) => e.event.type === "AssistantSay").map((e) => ({ session: e.sessionId, text: String(e.event.text) }));
@@ -865,6 +866,22 @@ describe("assistant outbound", { skip }, () => {
       assert.equal(await sweep(), 1);
       assert.equal(await sweep(), 0, "once");
       assert.deepEqual(shown().map((e) => e.session), [own.sessionId]);
+    });
+
+    test("the system's own message whose publish failed is shown again until it is, then never", async () => {
+      const own = await assistantOf();
+      await answeredItem("后台运行 slow_job.sh", "RESULT=86972");
+      const down = deps({ publishSessionEvent: async () => { throw new Error("nats is down"); } });
+      assert.equal(await sweep(down), 1, "stored");
+      assert.equal(shown().length, 0);
+      assert.equal(await sweep(down), 0, "still down: not shown, not counted");
+      assert.equal(await sweep(), 1, "shown now");
+      assert.equal(await sweep(), 0, "once");
+      const told = shown();
+      assert.equal(told.length, 1);
+      assert.equal(told[0].session, own.sessionId);
+      assert.match(told[0].text, /RESULT=86972/);
+      assert.equal((await saysRows()).filter((x) => x.fallback).length, 1, "one message, shown under its one id");
     });
 
     test("one said in a session deleted before its event was published told nobody", async () => {

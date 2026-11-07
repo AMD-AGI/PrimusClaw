@@ -27,13 +27,17 @@
  * told again by the sweep, into whichever session was theirs by then (2026-11-06 parity run: #119, #120 and #121 said twice, #119
  * and #120 into the session that replaced the deleted one they were said in).
  *
- * With notifications off nothing has a channel, and a stored fallback, or any say shown in a session, is what the web client
- * shows: there it counts as told.
+ * With notifications off nothing has a channel, and a say shown in a session is what the web client shows: there it counts as told.
+ *
+ * The system's own message stored but shown in no session (its publish failed, or there was no session) is shown again, for a user with
+ * no channel that takes it, until it is (`reshowFallback`): it is stored once, so storing it again cannot tell them.
  */
 import pino from "pino";
 import { CLAW_ASSISTANT_SILENT_SWEEP_SEC, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
-import { ANSWERED_UNSAID_SQL, recordNeedsYouFallback, resendUnreachedSays, SAY_EVENT_TYPE_SQL, UNREACHED_SAY_SQL } from "./outbound.js";
+import {
+  ANSWERED_UNSAID_SQL, recordNeedsYouFallback, resendUnreachedSays, reshowFallback, SAY_EVENT_TYPE_SQL, UNREACHED_SAY_SQL,
+} from "./outbound.js";
 
 const logger = pino({ name: "assistant-silent-sweep" });
 
@@ -41,7 +45,7 @@ const BATCH = 50;
 const ANSWERED_UNSAID = ANSWERED_UNSAID_SQL;
 
 /** The announcement, behind a seam so a test can see which items the sweep chose to announce. */
-export const silentSweepPorts = { recordNeedsYouFallback, resendUnreachedSays };
+export const silentSweepPorts = { recordNeedsYouFallback, resendUnreachedSays, reshowFallback };
 
 /** Whether a say already told the user, over `claw_assistant_says s`; see the header. */
 const told = (notifications: boolean): string => notifications
@@ -51,7 +55,21 @@ const told = (notifications: boolean): string => notifications
      OR (s.session_id IS NOT NULL AND NOT EXISTS (
        SELECT 1 FROM claw_notification_subscriptions n
         WHERE n.owner_user_id = s.user_id AND n.enabled AND (${SAY_EVENT_TYPE_SQL}) = ANY(n.event_types)))`
-  : "s.delivered_at IS NOT NULL OR s.fallback OR s.session_id IS NOT NULL";
+  : "s.delivered_at IS NOT NULL OR s.session_id IS NOT NULL";
+
+/**
+ * The system's own message about the item's current need, stored and shown in no session (its publish failed, or no session was
+ * there), for a user whose assistant has a session to show it in and who has no channel that takes it: it is shown again
+ * (`reshowFallback`), as nothing else would ever tell them. Over `claw_work_items w`.
+ */
+const unshownFallback = (notifications: boolean): string => `EXISTS (
+          SELECT 1 FROM claw_assistant_says s
+           WHERE s.item_id = w.item_id AND s.item_attention_seq = w.attention_seq AND s.fallback
+             AND s.session_id IS NULL AND s.delivered_at IS NULL AND (${SAY_EVENT_TYPE_SQL}) = 'work_item.needs_you'
+             AND EXISTS (SELECT 1 FROM claw_assistants a WHERE a.user_id = w.user_id)${notifications ? `
+             AND NOT EXISTS (
+               SELECT 1 FROM claw_notification_subscriptions n
+                WHERE n.owner_user_id = w.user_id AND n.enabled AND 'work_item.needs_you' = ANY(n.event_types))` : ""})`;
 
 /** Returns how many announcements were made. */
 export async function tellSilentItems(
@@ -62,7 +80,7 @@ export async function tellSilentItems(
           SELECT 1 FROM claw_assistant_says f
            WHERE f.item_id = w.item_id AND f.item_attention_seq = w.attention_seq AND f.fallback)`;
   const items = (await db.query(
-    `SELECT w.item_id, w.user_id, ${fallbackStored} AS fallback_stored FROM claw_work_items w
+    `SELECT w.item_id, w.user_id, ${fallbackStored} AS fallback_stored, ${unshownFallback(notifications)} AS unshown FROM claw_work_items w
       WHERE (w.board_state = 'needs_you' OR (${ANSWERED_UNSAID}))
         -- A remote item tells the user itself, and only of what the assistant sent (\`remote-items.ts\`): what they typed into an
         -- attached chat they watched, and is not to be said again.
@@ -72,17 +90,19 @@ export async function tellSilentItems(
           SELECT 1 FROM claw_assistant_says s
            WHERE s.item_id = w.item_id AND s.item_attention_seq = w.attention_seq
              AND (${told(notifications)})
-        )${notifications ? `
-        AND (NOT ${fallbackStored} OR EXISTS (${UNREACHED_SAY_SQL}))` : ""}
+        )
+        AND (NOT ${fallbackStored} OR ${unshownFallback(notifications)}${notifications ? ` OR EXISTS (${UNREACHED_SAY_SQL})` : ""})
       ORDER BY w.updated_at
       LIMIT $2`,
     [thresholdSeconds, BATCH],
-  )).rows as Array<{ item_id: string; user_id: string; fallback_stored: boolean }>;
+  )).rows as Array<{ item_id: string; user_id: string; fallback_stored: boolean; unshown: boolean }>;
   let toldNow = 0;
   for (const item of items) {
     try {
       if (item.fallback_stored) {
-        if (await silentSweepPorts.resendUnreachedSays({ userId: item.user_id, itemId: item.item_id })) toldNow += 1;
+        const shown = item.unshown && await silentSweepPorts.reshowFallback({ itemId: item.item_id });
+        const sent = notifications && await silentSweepPorts.resendUnreachedSays({ userId: item.user_id, itemId: item.item_id });
+        if (shown || sent) toldNow += 1;
       } else if (await silentSweepPorts.recordNeedsYouFallback({ itemId: item.item_id })) {
         toldNow += 1;
       }
