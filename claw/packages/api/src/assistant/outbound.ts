@@ -996,15 +996,24 @@ export async function recordSystemNotice(
     replacesTurnAck?: boolean;
   }, deps: SayDeps = {},
 ): Promise<SayOutcome | null> {
-  const stored = await storeSettled(async (q, storeOne) => storeOne({
-    type: "assistant.say", fallback: true, item: input.itemId ? await loadItem(q, input.itemId, input.userId) : null,
-    sayId: deterministicEventId("assistant.notice", input.userId, input.key),
-    userId: input.userId, sessionId: input.sessionId, text: input.text,
-    ...(input.files?.length ? { files: input.files } : {}),
-    ...(input.turnMessageId ? { noticeOfTurn: input.turnMessageId } : {}),
-    ...(input.remote ? { remote: input.remote } : {}),
-    ...(input.replacesTurnAck && input.turnMessageId ? await turnAckReplaced(q, input.userId, input.turnMessageId) : {}),
-  }), (late) => announce(late, deps, input.turnMessageId));
+  const stored = await storeSettled(async (q, storeOne) => {
+    let replaced: { replaces?: string } = {};
+    if (input.replacesTurnAck && input.turnMessageId) {
+      // Under the user's say lock, as a say is stored: two notices of one turn (two items started at once), or a notice and the
+      // router's say, never both find the line still showing and both take its place.
+      await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
+      replaced = await turnAckReplaced(q, input.userId, input.turnMessageId);
+    }
+    return storeOne({
+      type: "assistant.say", fallback: true, item: input.itemId ? await loadItem(q, input.itemId, input.userId) : null,
+      sayId: deterministicEventId("assistant.notice", input.userId, input.key),
+      userId: input.userId, sessionId: input.sessionId, text: input.text,
+      ...(input.files?.length ? { files: input.files } : {}),
+      ...(input.turnMessageId ? { noticeOfTurn: input.turnMessageId } : {}),
+      ...(input.remote ? { remote: input.remote } : {}),
+      ...replaced,
+    });
+  }, (late) => announce(late, deps, input.turnMessageId));
   if (!stored) return null;
   await announce(stored, deps, input.turnMessageId);
   return { say_id: stored.sayId, subscribers: stored.subscribers };

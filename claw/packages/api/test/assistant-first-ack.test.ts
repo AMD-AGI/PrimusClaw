@@ -17,7 +17,8 @@
  *       answer of the run that later carries it takes the line's place
  *   F5  a turn that starts an item after the line: the start notice takes the line's place, and the router's words after it are added
  *       to that same message (one message in the channel, as without the line); but never once the line's message shows something
- *       else: after the router's say took its place, or for a second item's notice, the notice is its own message, as without the line
+ *       else: after the router's say took its place, or for a second item's notice, the notice is its own message, as without the line;
+ *       two notices stored at once included
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -292,5 +293,22 @@ describe("assistant first ack by the clock", { skip }, () => {
     assert.equal(two.length, 2);
     assert.equal(two[0].payload.replaces, ack.lookupAckSayId("alice", b.mid));
     assert.equal(two[1].payload.replaces, undefined, "the second item's notice does not overwrite the first's");
+  });
+  test("F5c two start notices of one turn stored at once: only one takes the line's place", async () => {
+    await w.subscribe("alice");
+    for (let round = 0; round < 8; round += 1) {
+      await w.q("TRUNCATE claw_notification_outbox, claw_assistant_says");
+      const t = await w.routerTurn(alice);
+      await w.q("UPDATE claw_tasks SET prompt = $2, started_at = NOW() WHERE task_id = $1", [t.task_id, "帮我建两个任务"]);
+      await message(alice.routerSid, t.mid, "帮我建两个任务");
+      assert.equal(await first(alice.routerSid, t.mid), "said");
+      const notice = (n: number) => w.mod.outbound.recordSystemNotice({
+        userId: "alice", sessionId: alice.routerSid, text: `已开始：#${n} 任务 ${n}。`, key: `work_started:race-${round}-${n}`,
+        turnMessageId: t.mid, replacesTurnAck: true,
+      }, w.sayDeps);
+      await Promise.all([notice(1), notice(2)]);
+      const replacing = await w.q("SELECT 1 FROM claw_notification_outbox WHERE payload->>'replaces' = $1", [ack.lookupAckSayId("alice", t.mid)]);
+      assert.equal(replacing.length, 1, `round ${round}: one notice in the line's place, the other its own message`);
+    }
   });
 });
