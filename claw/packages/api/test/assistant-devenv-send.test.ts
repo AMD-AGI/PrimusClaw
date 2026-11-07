@@ -505,9 +505,13 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations"))[0].n, 3);
   });
 
-  test("F4b no machine gives the exact commands that connect one; a connector below the minimum starts no session", async () => {
+  test("F4b no machine and no pairing here gives the exact commands that connect one; a connector below the minimum starts no session", async () => {
     const alice = await w.user("alice");
+    const pub = process.env.CLAW_PUBLIC_URL;
+    delete process.env.CLAW_PUBLIC_URL;
     const none = await tools.devenvSend(await userTurn(alice, "让开发机上的 claude 跑 make"), { text: "make" }).catch((e) => e);
+    if (pub !== undefined) process.env.CLAW_PUBLIC_URL = pub;
+    assert.match((none as Recorded).message, /no pairing command can be made in this turn \(pairing_unavailable\), so do not call devenv_pair/);
     assert.equal((none as Recorded).code, "no_machine");
     const setup = (none as Recorded).data.connect_a_machine;
     assert.equal(setup.commands[0], "npm install -g @primusclaw/connector");
@@ -530,6 +534,79 @@ describe("development environment items and devenv_send", { skip }, () => {
     const sent = await tools.executeSend("alice", plan, "make", "k-outdated", "en");
     assert.deepEqual([sent.ok, (sent as Recorded).error], [false, "connector_outdated"]);
     assert.deepEqual(await queued(laptop), []);
+  });
+
+  test("F4c no machine at all, asked by the user: no_machine carries the one-line pairing command, never the setup steps", async () => {
+    const keep = { pub: process.env.CLAW_PUBLIC_URL, iss: process.env.IDENTITY_ISSUER_URL };
+    process.env.CLAW_PUBLIC_URL = "https://claw.example.com/claw-api";
+    process.env.IDENTITY_ISSUER_URL = "https://id.example.com";
+    const real = tools.devenvToolPorts.pairingTurn;
+    try {
+      await w.q("DELETE FROM claw_remote_pairings");
+      const pairing = await import("../src/remote-agents/pairing.js");
+      const codes = async () => Number((await w.q("SELECT COUNT(*) AS n FROM claw_remote_pairings WHERE owner_user_id = 'alice'"))[0].n);
+      const alice = await w.user("alice");
+      const refused = async (claims: Claims, text: string) => {
+        const e = await tools.devenvSend(claims, { text, agent: "claude" }).then((r) => assert.fail(JSON.stringify(r)), (x) => x) as Recorded;
+        assert.equal(e.code, "no_machine", e.message);
+        return { message: String(e.message), connect: e.data.connect_a_machine as Recorded };
+      };
+      const line = /^npm install -g @primusclaw\/connector@latest && claw-connector pair ([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}) --server https:\/\/claw\.example\.com\/claw-api$/;
+      const steps = /claw-connector (init|login)|service install/;
+
+      const zh = await refused(await userTurn(alice, "让开发机上的 claude 跑一下 make test"), "跑一下 make test");
+      assert.equal(zh.connect.commands.length, 1, "one line, not the setup steps");
+      const m = line.exec(zh.connect.commands[0]);
+      assert.ok(m, zh.connect.commands[0]);
+      assert.deepEqual(zh.connect.pairing, { expires_in_minutes: 10, single_use: true });
+      assert.match(zh.connect.text_zh, /^在要连接的机器上/);
+      assert.match(zh.connect.text_en, /^On the machine you want to connect/);
+      for (const t of [zh.connect.text_zh, zh.connect.text_en]) {
+        assert.ok(t.includes("```\n" + zh.connect.commands[0] + "\n```"), t);
+        assert.doesNotMatch(t, steps, "no setup steps beside it");
+      }
+      assert.match(zh.message, /nothing was sent[^]*one-time pairing command made for them now[^]*do not call devenv_pair or devenv_list for another/);
+      assert.equal(await codes(), 1, "one code for the one ask");
+      // The code is the user's and works once; nothing was put to them as a card.
+      const claimed = await pairing.claimPairing(m![1], "laptop");
+      assert.ok(claimed.ok && claimed.owner === "alice", JSON.stringify(claimed));
+      assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations"))[0].n, 0);
+
+      // A message that came with a key: nobody is attending, so no code, and the model is not sent to devenv_pair for one.
+      const key = await refused(await userTurn(alice, "让开发机上的 claude 跑 ls", false), "ls");
+      assert.equal(key.connect.pairing, undefined);
+      assert.equal(key.connect.commands.length, 4);
+      assert.match(key.message, /no pairing command can be made in this turn \(not_attended\), so do not call devenv_pair/);
+      // A report answers no message of the user's: refused before any of this.
+      await assert.rejects(tools.devenvSend(await w.routerTurn(alice), { text: "ls" }), (e: Recorded) => e.code === "not_from_user");
+      assert.equal(await codes(), 1);
+
+      // Too many codes this minute: the setup commands, and still not devenv_pair.
+      // (the one made above counts toward the limit too)
+      for (let i = 1; i < pairing.CODES_PER_MINUTE; i++) await pairing.createPairing("alice", "test");
+      const limited = await refused(await userTurn(alice, "让开发机上的 claude 跑 ls"), "ls");
+      assert.equal(limited.connect.pairing, undefined);
+      assert.match(limited.connect.text_zh, /claw-connector init/);
+      assert.match(limited.message, /\(rate_limited\), so do not call devenv_pair; they can ask again in a minute/);
+      await w.q("DELETE FROM claw_remote_pairings");
+
+      // The pairing check itself failing (the database): still a no_machine answer with the setup commands, not a fault.
+      tools.devenvToolPorts.pairingTurn = async () => { throw new Error("connection terminated unexpectedly"); };
+      const fault = await refused(await userTurn(alice, "have the claude on my dev box run ls"), "ls");
+      assert.equal(fault.connect.pairing, undefined);
+      assert.equal(fault.connect.commands.length, 4);
+      assert.doesNotMatch(fault.message, /do not call devenv_pair/);
+      assert.equal(await codes(), 0);
+
+      // The router is told so: no_machine with pairing is said as it is, with nothing called after it.
+      const section = prompts.renderRouterDevenvSection({ actions: true, send: true });
+      assert.match(section, /no_machine \(say so; when it has data\.connect_a_machine, give its text_zh or text_en[^)]*with pairing it is a one-line pairing command made for them now[^)]*neither devenv_pair nor devenv_list\)/);
+    } finally {
+      tools.devenvToolPorts.pairingTurn = real;
+      for (const [k, v] of [["CLAW_PUBLIC_URL", keep.pub], ["IDENTITY_ISSUER_URL", keep.iss]] as const) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
   });
 
   test("F17 a machine revoked with its card waiting: the card closes, the router no longer puts it to them, a press sends nothing", async () => {
@@ -1620,7 +1697,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v9");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v10");
     // The plain-words control: a new session, a session named by when it was used, back to the assistant with nothing to run.
     assert.match(section, /new_session: true when they ask for a new session/);
     assert.match(section, /昨天那个会话/);

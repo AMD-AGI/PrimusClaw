@@ -101,6 +101,13 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- "让开发机上的 claude 跑 make test" with no machine connected answers the same one-line pairing command, not the four setup steps.
+  devenv_send refused `no_machine` because the user has no machine at all now carries in `data.connect_a_machine` the pairing made
+  for them (`commands` the one line, `text_zh` and `text_en` with it in a code block, `pairing` its minutes), under the same gate
+  as devenv_list and devenv_pair; any other turn, and where pairing is refused, still gets the setup commands. Where no pairing can
+  be made for the turn (`not_from_user`, `not_attended`, `attendance_expired`, `pairing_unavailable`, `rate_limited`), neither
+  devenv_list's note nor devenv_send's message sends the model to devenv_pair any more, and a pairing check that itself fails
+  (the database) leaves devenv_list answered with the setup commands instead of failing it. Router prompt router-devenv-v10.
 - "连接我的开发环境" with no machine connected answers the one-line pairing command, every time. devenv_list with no machine, in a
   router turn answering a message the user sent signed in, recently, makes the pairing itself and gives it in `connect_a_machine`
   (`commands` the one line, `text` in the user's language with it in a code block, `pairing` its minutes). Any other turn (a report,

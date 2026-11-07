@@ -16,7 +16,8 @@ import {
 } from "../../src/assistant/prompts.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
 import { messagesLlm, promptFor, userTurn, type Block, type Llm, type Message, type ModelResponse, type ToolSchema } from "./assistant-router-eval-lib.js";
-import { CHANNEL_ACTIONS, DEVENV_LIST, ITEM_DEVENV, MANIFEST, NOW, type DevenvCase, type Want } from "./assistant-devenv-eval-cases.js";
+import { PAIRED_NOTE, pairingText, sendConnectMessage, STATUS_NOTE } from "../../src/assistant/devenv-tools.js";
+import { CHANNEL_ACTIONS, DEVENV_LIST, ITEM_DEVENV, MANIFEST, NOW, PAIR_COMMAND, type DevenvCase, type Want } from "./assistant-devenv-eval-cases.js";
 
 export { messagesLlm, type Llm, type ToolSchema };
 
@@ -38,14 +39,50 @@ export interface Call { turn: number; tool: string; input: Record<string, unknow
 
 const AGENTS = ["claude", "codex"];
 
-/** The tools, answered as the real ones answer in the fixture's world. */
+/**
+ * What the tools answer a user with no machine, in a turn answering their own message (`devenvList`, `devenvSend`): the pairing made
+ * for them, with the real tools' own words.
+ */
+const PAIRING = { expires_in_minutes: 10, single_use: true as const };
+export const noMachineList = (zh: boolean) => ({
+  ok: true, detail: "status", total: 0, online: 0, machines: [], attach_default: null,
+  connect_a_machine: { commands: [PAIR_COMMAND], text: pairingText(PAIR_COMMAND, 10, zh), pairing: PAIRING },
+  note: STATUS_NOTE + PAIRED_NOTE,
+});
+export const noMachineSend = () => {
+  const made = { commands: [PAIR_COMMAND], text: { zh: pairingText(PAIR_COMMAND, 10, true), en: pairingText(PAIR_COMMAND, 10, false) }, pairing: PAIRING };
+  return {
+    message: `the user has no development environment connected: nothing was sent. ${sendConnectMessage(made)}`,
+    data: { connect_a_machine: { commands: made.commands, text_en: made.text.en, text_zh: made.text.zh, pairing: PAIRING } },
+  };
+};
+
+/** The tools, answered as the real ones answer in the fixture's world (`none`: the user has no machine connected). */
 export class DevenvStub {
   private untrusted = false;
   private n = 0;
+  constructor(private readonly world: { none?: boolean; zh?: boolean } = {}) {}
   call(tool: string, input: Record<string, unknown>): { result: unknown; refused: boolean; code?: string } {
     const refuse = (code: string, message: string, extra: Record<string, unknown> = {}) => ({ result: { ok: false, error: code, message, ...extra }, refused: true, code });
     const ok = (result: unknown) => ({ result, refused: false });
     const str = (k: string) => (typeof input[k] === "string" ? (input[k] as string).trim() : "");
+    if (this.world.none) {
+      switch (tool) {
+        case "devenv_list":
+          this.untrusted = true;
+          return ok({ ...noMachineList(this.world.zh === true), detail: input.detail === "activity" ? "activity" : "status" });
+        case "devenv_send": {
+          if (!str("text")) return refuse("invalid_arguments", "devenv_send needs text: the instruction as the user said it");
+          const { message, data } = noMachineSend();
+          return refuse("no_machine", message, { data });
+        }
+        case "devenv_pair":
+          // Another code: the one the list or the refusal carried was enough.
+          return ok({ command: PAIR_COMMAND.replace("K7QM-4XRT-9WCD", `P${++this.n}QM-4XRT-9WCD`), expires_at: "2026-11-07T09:10:00.000Z", expires_in_minutes: 10, single_use: true });
+        default:
+          break;
+      }
+    }
     switch (tool) {
       case "say":
         return str("text") ? ok({ ok: true, say_id: `say_${++this.n}`, subscribers: 1 }) : refuse("empty_text", "say needs text");
@@ -127,7 +164,7 @@ function history(c: DevenvCase): Message[] {
 }
 
 export async function runDevenvCase(c: DevenvCase, o: { llm: Llm; tools: ToolSchema[]; maxTurns?: number }): Promise<Trace> {
-  const stub = new DevenvStub();
+  const stub = new DevenvStub({ none: c.world === "none", zh: c.lang === "zh" });
   const system = devenvSystem();
   const messages: Message[] = [...history(c), { role: "user", content: userTurn(await devenvPrompt(c)) }];
   const trace: Trace = { calls: [], turns: 0, said: "" };
@@ -193,6 +230,8 @@ export function scoreDevenv(c: DevenvCase, t: Trace): Score {
   const extra = t.calls.filter((call) => !call.refused && c.forbid.includes(call.tool) && !allowed.has(call.tool));
   if (extra.length) why.push(`made ${extra.map((x) => x.tool).join(", ")}`);
   const said = t.said.trim();
+  for (const r of c.says ?? []) if (!r.test(said)) why.push(`did not say ${r.source.slice(0, 60)}`);
+  for (const r of c.never ?? []) if (r.test(said)) why.push(`said ${r.source.slice(0, 60)}`);
   if (!said) why.push("the user was told nothing");
   else if (c.lang === "zh" ? !HAN.test(said) : HAN.test(said.replace(/[　-〿]/g, "").replace(/\/agent \S+ \S+/g, "")) && !/[a-z]{4,}/i.test(said)) {
     why.push(`answered in the wrong language: ${said.slice(0, 80)}`);
