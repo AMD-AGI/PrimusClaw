@@ -15,6 +15,7 @@
  *   A5  a turn answering the person that looked things up and ended with no word and no text is told so once, in its language; not one
  *       that said something, started an item, made no lookup, or that a report started
  *   A6  the router's turn asks Brain for a text reply at its turn cap (`report_at_turn_cap`)
+ *   A7  the event consumer says it for a lookup's start event from Brain, and stores the event as before
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -185,6 +186,30 @@ describe("assistant lookup ack and silent turns", { skip }, () => {
     await w.closeRun(item.task_id, "completed", undefined, 0);
     assert.equal(await end(item), "skipped");
     assert.equal((await says()).length, 0);
+  });
+
+  test("A7 the event consumer says it for a lookup's start event from Brain", async (t0) => {
+    const t = await turn("SaFE 上有几个 workspace");
+    // No NATS here: no session of this world is a deleted one.
+    const realTombstone = { ...w.mod.consumer.tombstoneReader };
+    Object.assign(w.mod.consumer.tombstoneReader, { has: async () => false });
+    t0.after(() => { Object.assign(w.mod.consumer.tombstoneReader, realTombstone); });
+    const verdicts: string[] = [];
+    await w.mod.consumer.consumeEventDelivery({
+      subject: `events.${alice.routerSid}`,
+      data: new TextEncoder().encode(JSON.stringify({ ...start(t.mid, "mcp__safe__workspace_list"), ts: Date.now() })),
+      seq: 9_000 + seq,
+      ack: () => { verdicts.push("ack"); },
+      nak: (ms?: number) => { verdicts.push(`nak:${ms ?? ""}`); },
+    } as never);
+    assert.deepEqual(verdicts, ["ack"], "the event is stored and acked as before");
+    const deadline = Date.now() + 5_000;
+    let rows = await says();
+    while (!rows.length && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+      rows = await says();
+    }
+    assert.deepEqual(rows.map((s) => s.text), ["收到，我查一下。"]);
   });
 
   test("A6 a router turn asks Brain for a text reply at its turn cap", async () => {
