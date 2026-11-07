@@ -482,6 +482,11 @@ export const SESSION_AUTO_ARCHIVE_DAYS = envInt("SESSION_AUTO_ARCHIVE_DAYS", 7, 
 // prefixes are removed by the cleanup sweeper). 0 disables it. See
 // sessions/retention.ts for which archived sessions are never taken.
 export const SESSION_RETENTION_DAYS = envInt("SESSION_RETENTION_DAYS", 0, { min: 0 });
+// For this many seconds after a session is deleted, GET /v1/tasks/:id still
+// answers for its tasks with how they ended (status, failure reason, times) and
+// nothing they carried -- so a caller that deleted a session with a run in it can
+// see the run's final state. 0 answers 404 at once, as before.
+export const DELETED_SESSION_TASK_READ_SEC = envInt("DELETED_SESSION_TASK_READ_SEC", 86_400, { min: 0 });
 // The soft-deleted conversation rows of a session deleted more than this many
 // days ago (turns, events, summaries) are removed for good. 0 disables it.
 export const SESSION_PURGE_DAYS = envInt("SESSION_PURGE_DAYS", 0, { min: 0 });

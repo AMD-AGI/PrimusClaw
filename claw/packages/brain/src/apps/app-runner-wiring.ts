@@ -13,6 +13,7 @@ import {
 import { appMcpSeams } from "./app-mcp.js";
 import { httpAppRunStore, type AppRunRecord, type AppRunStore } from "./app-run-store.js";
 import { createEventTailer } from "./event-tailer.js";
+import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import {
   appSandboxInstance, appSandboxNamespace, ensureAppSandbox, findLiveAppSandboxes, readSandboxNodeName,
 } from "./app-sandbox.js";
@@ -88,5 +89,16 @@ export function createAppRunner(runId: string, platformKey: string, claimCount: 
   const sandbox = realAppSandbox(store);
   return new AppRunner(runId, platformKey, {
     store, sandbox, claimCount, grant: boundGrant, seams: { ...eventForwardingSeams(store, sandbox, publish), ...boundSeams },
+    sessionDeleted: sessionWasDeleted,
   });
+}
+
+/**
+ * The deletion tombstone, as the dispatcher reads it: this replica's memory of a
+ * cleanup notification first, then the durable bucket a takeover Brain has to ask.
+ * Imported when asked, because the dispatcher imports the task runner that imports this.
+ */
+async function sessionWasDeleted(sessionId: string): Promise<boolean> {
+  if (isSessionDeletedLocally(sessionId)) return true;
+  return (await import("../tasks/dispatch.js")).sessionWasDeleted(sessionId);
 }

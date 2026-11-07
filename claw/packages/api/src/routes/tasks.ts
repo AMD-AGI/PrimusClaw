@@ -42,6 +42,7 @@ import { enrichPluginToolsInline, pluginSandboxImage } from "../marketplace/plug
 import { publicTaskRow, redactPublicJson } from "../events/redaction.js";
 import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { ClawTaskRow } from "../tasks/types.js";
+import { DELETED_SESSION_TASK_READ_SEC } from "../config.js";
 
 /**
  * The sandbox a plugin-less single task should get.
@@ -136,6 +137,14 @@ interface CreateTaskBody {
   workspace_throwaway?: boolean;
 }
 
+/**
+ * Whether the caller may use this session; `"deleted"` when it may only read what
+ * is left of a deleted one.
+ *
+ * `readDeletedSec` admits a session deleted at most that many seconds ago, for a
+ * read and nothing else; the same owner rule applies, read off the row the delete
+ * left in place.
+ */
 async function requireSessionAccess(
   req: FastifyRequest,
   reply: FastifyReply,
@@ -143,11 +152,20 @@ async function requireSessionAccess(
   write: boolean,
   ownerOnly = false,
   startsWork = false,
-): Promise<boolean> {
-  const session = (await db.query(
-    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
-    [sessionId],
-  )).rows[0] as { user_id?: string | null } | undefined;
+  readDeletedSec = 0,
+): Promise<boolean | "deleted"> {
+  const within = write || startsWork ? 0 : readDeletedSec;
+  const session = (within > 0
+    ? await db.query(
+      `SELECT user_id, deleted_at IS NOT NULL AS deleted FROM claw_sessions
+        WHERE session_id = $1
+          AND (deleted_at IS NULL OR deleted_at > NOW() - ($2::int * INTERVAL '1 second'))`,
+      [sessionId, within],
+    )
+    : await db.query(
+      "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+      [sessionId],
+    )).rows[0] as { user_id?: string | null; deleted?: boolean } | undefined;
   if (!session) {
     reply.status(404).send({ ok: false, error: "session_not_found" });
     return false;
@@ -169,7 +187,7 @@ async function requireSessionAccess(
     reply.status(403).send({ ok: false, error: unattended });
     return false;
   }
-  return true;
+  return session.deleted ? "deleted" : true;
 }
 
 async function requireTaskAccess(
@@ -187,6 +205,33 @@ async function requireTaskAccess(
   }
   if (!await requireSessionAccess(req, reply, task.session_id, write, ownerOnly, startsWork)) return null;
   return task;
+}
+
+/**
+ * How a task of a recently deleted session ended, and nothing it carried.
+ *
+ * A session's delete closes its runs (`cancelled`, `session_deleted`) and hides the
+ * session in the same transaction, so before this a caller that deleted a session
+ * with a run in it could never see that run's final state: the task answered 404
+ * from the moment of the delete. The prompt, input, output and the rest stay
+ * behind the delete; what is answered is the outcome.
+ */
+export function deletedSessionTaskView(row: ClawTaskRow): Record<string, unknown> {
+  // Through the same redaction as every other task answer: `error_message` is free text.
+  return redactPublicJson({
+    task_id: row.task_id,
+    session_id: row.session_id,
+    dag_root_task_id: row.dag_root_task_id,
+    mode: row.mode,
+    origin: row.origin,
+    status: row.status,
+    failure_reason: row.failure_reason,
+    error_message: row.error_message,
+    created_at: row.created_at,
+    started_at: row.started_at,
+    completed_at: row.completed_at,
+    session_deleted: true,
+  }) as Record<string, unknown>;
 }
 
 async function loadPluginRow(pluginId: number) {
@@ -466,9 +511,13 @@ export async function registerTaskReadRoutes(app: FastifyInstance): Promise<void
   app.get<{ Params: { taskId: string } }>(
     "/v1/tasks/:taskId",
     async (req, reply) => {
-      const row = await requireTaskAccess(req, reply, req.params.taskId, false);
-      if (!row) return reply;
-      return { ok: true, item: publicTaskRow(row) };
+      const task = await getTask(req.params.taskId);
+      if (!task) return reply.status(404).send({ ok: false, error: "not_found" });
+      const access = await requireSessionAccess(
+        req, reply, task.session_id, false, false, false, DELETED_SESSION_TASK_READ_SEC,
+      );
+      if (!access) return reply;
+      return { ok: true, item: access === "deleted" ? deletedSessionTaskView(task) : publicTaskRow(task) };
     },
   );
 

@@ -80,6 +80,7 @@ function healthyPorts(): string[] {
   teardownPorts.notifyCleanup = () => { ran.push("cleanup_notify"); return true; };
   teardownPorts.parkHands = async () => { ran.push("hands_park"); return "parked"; };
   teardownPorts.deleteGateLocks = async () => { ran.push("lock_release"); return true; };
+  teardownPorts.revokeAppGrants = async () => { ran.push("app_grants"); return true; };
   teardownPorts.purgeSessionEvents = async () => { ran.push("events_purge"); };
   teardownPorts.deleteWorkspaceObjects = async () => {
     ran.push("workspace_objects");
@@ -405,7 +406,7 @@ test("a cleanup with no budget set runs every step, however slow", async () => {
   };
 
   assert.deepEqual(await runSessionCleanup({ sessionId: SID, ownerId: "u-1" }), []);
-  assert.equal(ran.length, 7, "every step ran, with the slow one no reason to stop");
+  assert.equal(ran.length, 8, "every step ran, with the slow one no reason to stop");
 });
 
 // ── The record the sweeper reads ─────────────────────────────────────────────
