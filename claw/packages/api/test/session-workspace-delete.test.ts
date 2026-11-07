@@ -219,6 +219,42 @@ test("refusing an id is a failure, not an empty workspace", async () => {
 const originalSend = S3Client.prototype.send;
 after(() => { S3Client.prototype.send = originalSend; });
 
+/**
+ * Answer one ListObjectsV2 request the way S3 does: everything under the
+ * prefix without a delimiter, or the direct children -- objects and the
+ * common prefixes that stand for the directories below -- with one. Paginated
+ * by `MaxKeys` over the merged, sorted entries, with the last entry returned
+ * as the continuation token.
+ */
+function listLevel(
+  objects: string[],
+  input: { Prefix?: string; Delimiter?: string; MaxKeys?: number; ContinuationToken?: string },
+): {
+  Contents: Array<{ Key: string }>;
+  CommonPrefixes: Array<{ Prefix: string }>;
+  IsTruncated: boolean;
+  NextContinuationToken?: string;
+} {
+  const { Prefix = "", Delimiter, MaxKeys = 1000, ContinuationToken } = input;
+  const entries = new Map<string, "key" | "prefix">();
+  for (const key of objects) {
+    if (!key.startsWith(Prefix)) continue;
+    const cut = Delimiter ? key.indexOf(Delimiter, Prefix.length) : -1;
+    if (cut >= 0) entries.set(key.slice(0, cut + Delimiter!.length), "prefix");
+    else entries.set(key, "key");
+  }
+  const sorted = [...entries.keys()].sort()
+    .filter((e) => ContinuationToken === undefined || e > ContinuationToken);
+  const page = sorted.slice(0, MaxKeys);
+  const truncated = sorted.length > page.length;
+  return {
+    Contents: page.filter((e) => entries.get(e) === "key").map((Key) => ({ Key })),
+    CommonPrefixes: page.filter((e) => entries.get(e) === "prefix").map((P) => ({ Prefix: P })),
+    IsTruncated: truncated,
+    NextContinuationToken: truncated ? page[page.length - 1] : undefined,
+  };
+}
+
 function stubS3(
   objects: string[],
   onList?: () => Promise<void>,
@@ -237,7 +273,7 @@ function stubS3(
       const prefix = command.input.Prefix ?? "";
       listed.push(prefix);
       await onList?.();
-      return { Contents: objects.filter((k) => k.startsWith(prefix)).map((Key) => ({ Key })) };
+      return listLevel(objects.filter((k) => !deleted.includes(k)), command.input);
     }
     if (command instanceof DeleteObjectCommand) {
       await onDelete?.();
@@ -276,11 +312,14 @@ test("a session with no owner id is deleted where its files were written", async
 
   const { deleted, failed } = await deleteSessionWorkspaceObjects("", "sess-abc");
 
+  const roots = ["users/default/sessions/sess-abc/", "checkpoints/default/sess-abc/"];
   assert.deepEqual(
-    s3.listed,
-    ["users/default/sessions/sess-abc/", "checkpoints/default/sess-abc/"],
+    s3.listed.filter((p) => roots.includes(p)),
+    roots,
     "the fallback has to reach both prefixes a session's objects are written under",
   );
+  assert.ok(s3.listed.every((p) => roots.some((r) => p.startsWith(r))),
+    "nothing outside the session's two prefixes is listed");
   assert.deepEqual(s3.deleted, ["users/default/sessions/sess-abc/workspace/main.py"]);
   assert.equal(deleted, 1);
   assert.equal(failed, 0);
@@ -393,6 +432,13 @@ test("resolving the blank owner does not resolve a dangerous one", async () => {
   assert.deepEqual(s3.listed, [], "a refusal that listed anything has already widened the delete");
 });
 
+/** The error the SDK raises when a request outlasts its `requestTimeout`. */
+function requestTimedOut(requestTimeoutMs: number): Error {
+  const err = new Error(`a request has exceeded the configured ${requestTimeoutMs} ms requestTimeout.`);
+  err.name = "TimeoutError";
+  return err;
+}
+
 /**
  * A store whose listing takes longer the more keys a page holds, as MinIO's
  * does: it answers a listing by reading each object's metadata off its drives.
@@ -410,24 +456,12 @@ function stubSlowListingS3(
   const deleted: string[] = [];
   S3Client.prototype.send = (async function (this: S3Client, command: unknown) {
     if (command instanceof ListObjectsV2Command) {
-      const { Prefix = "", ContinuationToken, MaxKeys } = command.input;
+      const { MaxKeys } = command.input;
       pages.push(MaxKeys);
       // The API's own default when a request names no page size.
       const asked = MaxKeys ?? 1000;
-      if (asked * msPerKey >= requestTimeoutMs) {
-        const err = new Error(`a request has exceeded the configured ${requestTimeoutMs} ms requestTimeout.`);
-        err.name = "TimeoutError";
-        throw err;
-      }
-      const matching = [...remaining].filter((k) => k.startsWith(Prefix)).sort()
-        .filter((k) => ContinuationToken === undefined || k > ContinuationToken);
-      const page = matching.slice(0, asked);
-      const truncated = matching.length > page.length;
-      return {
-        Contents: page.map((Key) => ({ Key })),
-        IsTruncated: truncated,
-        NextContinuationToken: truncated ? page[page.length - 1] : undefined,
-      };
+      if (asked * msPerKey >= requestTimeoutMs) throw requestTimedOut(requestTimeoutMs);
+      return listLevel([...remaining], { ...command.input, MaxKeys: asked });
     }
     if (command instanceof DeleteObjectCommand) {
       const key = command.input.Key ?? "";
@@ -467,6 +501,114 @@ test("a workspace larger than one page is deleted on a store that lists slowly",
     assert.ok(maxKeys !== undefined && maxKeys * 48 < requestTimeout,
       `every listing asks for a page the store can answer inside the timeout (asked ${maxKeys})`);
   }
+});
+
+/**
+ * A store whose first page costs what the walk behind it costs, as MinIO's does.
+ *
+ * MinIO answers a listing out of a metadata cache it fills by walking the
+ * drives, and the first page waits for that cache's first block, which is
+ * thousands of entries -- so a recursive listing of a prefix holding fewer
+ * than that does not come back until the whole subtree has been read, however
+ * few keys the request asked for. A listing with a delimiter walks one level.
+ * Pages after the first come from the cache and cost little.
+ */
+function stubWalkingListingS3(
+  objects: string[],
+  msPerEntryWalked: number,
+  requestTimeoutMs: number,
+): { listings: Array<{ prefix: string; delimiter?: string; ms: number }>; deleted: string[] } {
+  const remaining = new Set(objects);
+  const listings: Array<{ prefix: string; delimiter?: string; ms: number }> = [];
+  const deleted: string[] = [];
+  S3Client.prototype.send = (async function (this: S3Client, command: unknown) {
+    if (command instanceof ListObjectsV2Command) {
+      const { Prefix = "", Delimiter, ContinuationToken } = command.input;
+      const level = listLevel([...remaining], { ...command.input, MaxKeys: Number.MAX_SAFE_INTEGER });
+      const walked = Delimiter
+        ? level.Contents.length + level.CommonPrefixes.length
+        : [...remaining].filter((k) => k.startsWith(Prefix)).length;
+      const ms = ContinuationToken === undefined ? walked * msPerEntryWalked : 0;
+      listings.push({ prefix: Prefix, delimiter: Delimiter, ms });
+      if (ms >= requestTimeoutMs) throw requestTimedOut(requestTimeoutMs);
+      return listLevel([...remaining], command.input);
+    }
+    if (command instanceof DeleteObjectCommand) {
+      const key = command.input.Key ?? "";
+      remaining.delete(key);
+      deleted.push(key);
+      return {};
+    }
+    throw new Error("unexpected S3 command");
+  }) as typeof S3Client.prototype.send;
+  return { listings, deleted };
+}
+
+test("a deep workspace is deleted on a store whose first page costs the whole walk", async () => {
+  // Measured on the production MinIO (2026-11-07) for a deleted session that
+  // stayed pending: 4,470 objects in 978 directories, thirteen deep. Its first
+  // hundred-key page took 161 s -- the whole subtree, not the page -- so every
+  // cleanup timed out on its first listing three times over, deleted nothing,
+  // and the stuck report fired every minute. Walked a directory at a time the
+  // same prefix took 979 listings, none over 7.5 s.
+  const probe = stubS3([]);
+  await deleteSessionWorkspaceObjects("u-1", "sess-probe");
+  const { requestTimeout } = await handlerTimeouts(probe.clients[0]);
+  assert.ok(requestTimeout && requestTimeout > 0, "the client has a request timeout to fit inside");
+
+  const keys: string[] = [];
+  for (let a = 0; a < 20; a++) {
+    for (let b = 0; b < 15; b++) {
+      for (let c = 0; c < 15; c++) {
+        keys.push(`users/u-1/sessions/sess-abc/workspace/repo/d${a}/e${b}/f${c}.ts`);
+      }
+    }
+  }
+  // A neighbour whose name extends this session's: never listed, never deleted.
+  keys.push("users/u-1/sessions/sess-abcdef/workspace/keep.ts");
+  const s3 = stubWalkingListingS3(keys, 36, requestTimeout);
+
+  const outcome = await deleteSessionWorkspaceObjects("u-1", "sess-abc");
+
+  assert.equal(outcome.failed, 0);
+  assert.equal(outcome.complete, true);
+  assert.equal(outcome.deleted, keys.length - 1, "every object of the workspace is gone");
+  assert.ok(!s3.deleted.includes("users/u-1/sessions/sess-abcdef/workspace/keep.ts"));
+  for (const listing of s3.listings) {
+    assert.ok(listing.ms < requestTimeout,
+      `every listing fits inside the request timeout (${listing.prefix} took ${listing.ms} ms)`);
+    assert.ok(listing.prefix.startsWith("users/u-1/sessions/sess-abc/")
+      || listing.prefix.startsWith("checkpoints/u-1/sess-abc/"),
+      `nothing outside the session's prefixes is listed (${listing.prefix})`);
+  }
+});
+
+test("a walk stopped by its deadline has deleted what it reached, so the next one goes further", async (t) => {
+  // The sweeper gives a pass half a tick. A directory walk that stops there
+  // must have deleted something -- otherwise the cleanup reports no progress
+  // and backs off, which is the stuck row again by another route -- and the
+  // next pass, listing from the top, must find less than the last one did.
+  let now = 1_700_000_000_000;
+  t.mock.method(Date, "now", () => now);
+  const keys: string[] = [];
+  for (let a = 0; a < 10; a++) {
+    for (let c = 0; c < 20; c++) keys.push(`users/u-1/sessions/sess-abc/workspace/d${a}/f${c}`);
+  }
+  const s3 = stubWalkingListingS3(keys, 0, 30_000);
+  const realSend = S3Client.prototype.send;
+  S3Client.prototype.send = (async function (this: S3Client, command: unknown) {
+    if (command instanceof ListObjectsV2Command) now += 100;
+    return realSend.call(this, command as never);
+  }) as typeof S3Client.prototype.send;
+
+  const passes: number[] = [];
+  for (let pass = 0; pass < 50 && s3.deleted.length < keys.length; pass++) {
+    const outcome = await deleteSessionWorkspaceObjects("u-1", "sess-abc", now + 350);
+    passes.push(outcome.deleted);
+    if (!outcome.complete) assert.ok(outcome.deleted > 0, `pass ${pass} stopped having deleted nothing`);
+  }
+  assert.equal(new Set(s3.deleted).size, keys.length, "the passes together delete everything");
+  assert.ok(passes.length > 1, "the deadline did cut the walk short");
 });
 
 test("every listing in this package asks for a bounded page", async () => {
