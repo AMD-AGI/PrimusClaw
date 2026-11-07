@@ -28,6 +28,12 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A development environment session is pushed only when it needs you, finishes or fails, each once: an instruction the assistant sent
+  to an agent on your machine says nothing while it works, one message when the agent waits on a permission request (`assistant.say`
+  `remote.ask`: the request with its options and when it runs out, for a channel to put to you as buttons), one when it finished, and
+  one when it failed (an error or a refusal, the machine refusing the instruction, or the session closing first, now said as an error
+  rather than as a finish). Each message carries `remote: {kind, session_id, machine, agent}` so a channel that already shows the
+  session can tell. `GET /v1/remote-agents/sessions` lists, per active session, the requests it waits on its user for (`waiting`).
 - Brain's `SKILL_HINTS_IN_SYSTEM_USERS` (default none): comma-separated user ids whose turns put the skill and MCP server hints in
   the system message, as `SKILL_HINTS_IN_SYSTEM` does for everyone, so the change can be measured on one identity on a live
   deployment before it is switched on for all. `engine.tools_resolved` logs `hintsInSystem` for each turn.
@@ -59,6 +65,11 @@ record it.
   `close` to its connector and a `session.reclaimed` audit; `session_limit_reached` now means every open session is in use. Before,
   sessions were never closed unless the user closed them, so ordinary use hit the limit in about a week. `POST
   /v1/remote-agents/sessions` returns the closed ones as `reclaimed`.
+- A machine whose connector runs on Windows can be sent instructions from the assistant: its roots (`C:\Users\a\repo`, a share
+  `\\server\share\proj`) were dropped as not absolute, so `devenv_send` answered `no_folder` for every one of them. They are folders
+  now, and a folder asked for under one compares as Windows does (either separator, any case, a trailing separator or not) and is sent
+  as the root spells it with the root's separator; an idle session open there continues however the folder is typed. POSIX roots compare
+  exactly, as before.
 - Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
   忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
   not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with

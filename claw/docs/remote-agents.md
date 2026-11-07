@@ -213,7 +213,7 @@ first recorded for it. Transitions are kept as long as closed sessions are (Rete
 | `GET /v1/remote-agents/connectors` | The caller's connectors, with `online`, `last_seen_at`, `offline_since`, `offline_reason` and their agents. |
 | `DELETE .../connectors/:cid` | Revoke: closes its sessions, drops its queued commands. |
 | `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?, resume_ref?}`. `409 connector_offline` unless online. |
-| `GET .../sessions`, `GET .../sessions/:id` | List, and read one with `connector_online`. |
+| `GET .../sessions`, `GET .../sessions/:id` | List (each active session with `waiting`: the permission requests it waits on its user for now, asked since its last turn ended and not answered, so a client lists those first), and read one with `connector_online`. |
 | `POST .../sessions/:id/commands` | `{type: prompt\|cancel\|set_mode\|resume\|close, ...}`. `Idempotency-Key` makes a retry queue one command. |
 | `POST .../sessions/:id/decisions` | `{action_id, option_id}`, an option the agent offered. Answered twice, counted once: a different second choice is `409 already_decided`, even after the connector has acknowledged the first, because the audit trail remembers it. |
 | `GET .../sessions/:id/events` | History, a `historyComplete` marker, then live events, in the frame format of `/v1/chat/sessions/:id/messages`; resume with `Last-Event-ID` or `?after=`; when both are sent `Last-Event-ID` wins, because a browser reconnecting to the same URL changes only that header. `?mode=replay` returns JSON pages. |
@@ -295,7 +295,12 @@ stops in quick succession, with a turn ending on its own while the first cancel 
 item in progress until its next turn ends. History a session had before its first prompt (a
 conversation taken over replays it) is not applied, and each event is applied once. A prompt the user typed
 into a chat attached to the session is told to nobody (the chat showed it, and the silent sweep skips these
-items); one the assistant sent is told once when it ends or waits for an approval. The router's item list
+items); one the assistant sent is told only three things, each once: it finished, it needs the user (a
+permission request, its options carried as `remote.ask` on the `assistant.say` so a channel puts them to the
+user as buttons, answered with `POST .../sessions/:id/decisions` as an attached chat's card is), or it failed
+(the turn ended in `error` or `refusal`, the machine refused the instruction, or the session closed before it
+finished). Each such message carries `remote: {kind: done|needs_you|error, session_id, machine, agent, ask?}`,
+so a channel that already shows that session (a chat attached to it) can tell it did. The router's item list
 says, for each, the agent, the session, whether its machine is online now, and the machine's name as quoted
 data, but not the item's summary or question: those are the agent's own words (its answer, a tool's title).
 `work_recall(item, "worker_tail")` reads the end of the agent's answer, and the turn that does has read

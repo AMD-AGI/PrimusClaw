@@ -680,3 +680,43 @@ export async function permissionState(sessionId: string, actionId: string): Prom
   )).rows.length > 0;
   return { options, resolved: answered };
 }
+
+/** At most this many waiting requests are listed per session (an agent asks one at a time; more is a connector out of step). */
+const WAITING_PER_SESSION = 5;
+
+/**
+ * The permission requests each of the owner's active sessions `sessionIds` waits on now, oldest first: asked since the session's last
+ * turn ended (an ask from before is moot: that turn is over), not replayed history, and not answered (`permission_resolved`). A request
+ * a connector sent again after a reconnect is the same request, listed once. What a sessions list puts first: a session that needs
+ * its user (`GET /v1/remote-agents/sessions` `waiting`). `tool` is what the agent wrote (untrusted). Nothing of anyone else's.
+ */
+export async function sessionsWaiting(
+  owner: string, sessionIds: readonly string[],
+): Promise<Map<string, Array<{ action_id: string; tool: string; asked_at: string }>>> {
+  const out = new Map<string, Array<{ action_id: string; tool: string; asked_at: string }>>();
+  if (!sessionIds.length) return out;
+  const rows = (await direct(
+    `SELECT s.session_id::text AS session_id, w.action_id, w.tool, w.asked_at
+       FROM claw_remote_sessions s
+       CROSS JOIN LATERAL (
+         SELECT DISTINCT ON (r.data->>'actionId') r.data->>'actionId' AS action_id, LEFT(COALESCE(r.data->>'tool', ''), 200) AS tool,
+                r.occurred_at AS asked_at, r.id
+           FROM claw_remote_events r
+          WHERE r.session_id = s.session_id AND r.type = $3 AND COALESCE(r.data->>'actionId', '') <> ''
+            AND COALESCE(r.data->>'replay', '') <> 'true'
+            AND r.id > COALESCE((SELECT MAX(t.id) FROM claw_remote_events t WHERE t.session_id = s.session_id AND t.type = 'turn_end'), 0)
+            AND NOT EXISTS (SELECT 1 FROM claw_remote_events d
+                             WHERE d.session_id = s.session_id AND d.type = $4 AND d.data->>'actionId' = r.data->>'actionId')
+          ORDER BY r.data->>'actionId', r.id
+       ) w
+      WHERE s.owner_user_id = $1 AND s.session_id = ANY($2::uuid[]) AND s.status = 'active'
+      ORDER BY s.session_id, w.id`,
+    [owner, [...sessionIds], REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED],
+  )).rows as Array<{ session_id: string; action_id: string; tool: string; asked_at: Date }>;
+  for (const r of rows) {
+    const list = out.get(r.session_id) ?? [];
+    if (list.length < WAITING_PER_SESSION) list.push({ action_id: r.action_id, tool: r.tool, asked_at: new Date(r.asked_at).toISOString() });
+    out.set(r.session_id, list);
+  }
+  return out;
+}

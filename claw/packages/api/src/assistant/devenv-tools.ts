@@ -384,11 +384,46 @@ function agentsNamed(c: Row, asked: string): Row[] {
   return exact.length ? exact : agents.filter((a) => [a.agent_id, a.kind, a.name].some((v) => lowerFlat(v).includes(asked)));
 }
 
+/** A Windows path: a drive (`C:\` or `C:/`) or a share (`\\server\share`), as a connector on Windows reports its roots. */
+const WINDOWS_ABSOLUTE = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/;
+const isWindowsPath = (p: string): boolean => WINDOWS_ABSOLUTE.test(p);
+/** A folder typed for a Windows root: a Windows path, or a share written with forward slashes (`//server/share/proj`). */
+const isWindowsFolder = (p: string): boolean => isWindowsPath(p) || /^\/\/[^\\/]+[\\/][^\\/]+/.test(p);
+/** `p` with its separators made one backslash each and none at the end: how two Windows paths are compared (case aside). */
+const windowsForm = (p: string): string => p.replace(/[\\/]+/g, "\\").replace(/\\+$/, "");
+
 const rootsOf = (agent: Row): string[] => {
   const caps = isObject(agent.capabilities) ? agent.capabilities : {};
-  return (Array.isArray(caps.roots) ? caps.roots : []).filter((r: unknown): r is string => typeof r === "string" && r.startsWith("/"));
+  return (Array.isArray(caps.roots) ? caps.roots : [])
+    .filter((r: unknown): r is string => typeof r === "string" && (r.startsWith("/") || isWindowsPath(r)));
 };
-const within = (cwd: string, root: string): boolean => cwd === root || cwd.startsWith(root.endsWith("/") ? root : `${root}/`);
+
+/**
+ * The folder `cwd` names inside `root`, written as the root writes paths; null when it is not inside it. A POSIX root compares
+ * exactly. A Windows root compares as Windows does: either separator, any case, a trailing separator or not; and the folder comes
+ * back with the root's own spelling and separator (`c:/users/a/repo/api` under `C:\Users\a\repo` is `C:\Users\a\repo\api`), the
+ * same rule Clawy's join_path keeps.
+ */
+function placeIn(cwd: string, root: string): string | null {
+  if (!isWindowsPath(root)) {
+    const posix = root.endsWith("/") ? root : `${root}/`;
+    return cwd === root || cwd.startsWith(posix) ? cwd : null;
+  }
+  if (!isWindowsFolder(cwd)) return null;
+  const r = windowsForm(root);
+  const c = windowsForm(cwd);
+  if (c.toLowerCase() === r.toLowerCase()) return root;
+  if (!c.toLowerCase().startsWith(`${r.toLowerCase()}\\`)) return null;
+  const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
+  return `${root.replace(/[\\/]+$/, "")}${sep}${c.slice(r.length + 1).split("\\").join(sep)}`;
+}
+
+/**
+ * Whether a session's folder `a` is the folder `placed` (as placeIn spelled it under its root). Only a folder under a Windows root
+ * compares as Windows does; under a POSIX root (`//srv/share` included) the two must be equal.
+ */
+const samePlace = (a: string | null, placed: string): boolean =>
+  a !== null && (a === placed || (isWindowsPath(placed) && isWindowsFolder(a) && windowsForm(a).toLowerCase() === windowsForm(placed).toLowerCase()));
 
 type PlanOutcome =
   | { ok: true; plan: SendPlan }
@@ -403,7 +438,9 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
   const agentAsked = lowerFlat(args.agent);
   const target = (typeof args.target === "string" ? args.target : "").trim();
   const targetLower = target.toLowerCase();
-  const cwdAsked = typeof args.cwd === "string" && args.cwd.trim() ? args.cwd.trim().replace(/\/+$/, "") || "/" : null;
+  // A trailing slash dropped (not a Windows drive's own: `C:/` is a root, `C:` is not a path); placeIn compares Windows paths whole.
+  const cwdTyped = typeof args.cwd === "string" ? args.cwd.trim() : "";
+  const cwdAsked = !cwdTyped ? null : isWindowsPath(cwdTyped) ? cwdTyped : cwdTyped.replace(/\/+$/, "") || "/";
   const [connectors, open] = await Promise.all([
     listConnectors(userId, onlineWindowMs),
     sessionActivity(userId, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser),
@@ -473,8 +510,11 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
     }
   }
   if (!machines.length) return { ok: false, code: "no_machine", read: false, message: "the user has no development environment connected: running claw-connector on a machine connects it" };
-  const pairs = machines.flatMap((c) => agentsNamed(c, agentAsked).map((a) => ({ c, a })))
-    .filter((p) => !cwdAsked || rootsOf(p.a).some((r) => within(cwdAsked, r)));
+  // Each agent with the folder it would work in: the one asked for, placed under the first of its roots that holds it; else its first root.
+  const pairs = machines.flatMap((c) => agentsNamed(c, agentAsked).map((a) => {
+    const placed = cwdAsked ? rootsOf(a).map((r) => placeIn(cwdAsked, r)).find((x) => x !== null) ?? null : null;
+    return { c, a, placed };
+  })).filter((p) => !cwdAsked || p.placed !== null);
   if (!pairs.length) {
     const offered = machines.flatMap((c) => (Array.isArray(c.agents) ? c.agents : []).map((a: Row) => `${nameOf(c)}/${String(a.agent_id)}`));
     return {
@@ -487,8 +527,9 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
   // An agent that only takes over the agent's own conversations on that machine (`kind: attach`) cannot start a session: its
   // connector refuses one without a conversation to take over. It is chosen only to continue its idle session open through Claw;
   // its conversations are taken over by naming one (target).
-  const continues = (c: Row, a: Row) => named.some((n) => n.c === c && n.session_id && n.agent?.agent_id === a.agent_id && !n.busy && (!cwdAsked || n.cwd === cwdAsked));
-  const online = reachable.filter((p) => String(p.a.kind) !== "attach" || continues(p.c, p.a));
+  const continues = (p: (typeof reachable)[number]) => named.some((n) => n.c === p.c && n.session_id && n.agent?.agent_id === p.a.agent_id
+    && !n.busy && (!cwdAsked || (p.placed !== null && samePlace(n.cwd, p.placed))));
+  const online = reachable.filter((p) => String(p.a.kind) !== "attach" || continues(p));
   if (!online.length) {
     const conversations = named.filter((n) => n.resume_ref && !n.busy && n.c.online === true && reachable.some((p) => p.c === n.c && p.a === n.agent));
     const which = reachable.map((p) => `${nameOf(p.c)}/${String(p.a.agent_id)}`).join(", ");
@@ -512,11 +553,11 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
       message: machinesNamed.size > 1 ? "more than one machine has that agent: ask which" : "that machine has more than one agent: ask which",
     };
   }
-  const { c, a } = online[0];
-  const cwd = cwdAsked ?? rootsOf(a)[0] ?? null;
+  const { c, a, placed } = online[0];
+  const cwd = placed ?? rootsOf(a)[0] ?? null;
   if (!cwd) return { ok: false, code: "no_folder", read: true, choices: [`${nameOf(c)}/${String(a.agent_id)}`], message: "that agent names no folder it may work in" };
   // An idle session of that agent open through Claw, in that folder, continues; else a new one.
-  const idle = named.find((n) => n.c === c && n.session_id && n.agent?.agent_id === a.agent_id && !n.busy && (!cwdAsked || n.cwd === cwdAsked));
+  const idle = named.find((n) => n.c === c && n.session_id && n.agent?.agent_id === a.agent_id && !n.busy && (!cwdAsked || samePlace(n.cwd, cwd)));
   if (idle) return fromSession(idle);
   return { ok: true, plan: {
     connector_id: String(c.connector_id), machine: nameOf(c), agent_id: String(a.agent_id), agent_name: flat(a.name, NAME_MAX),

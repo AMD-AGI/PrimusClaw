@@ -6,8 +6,8 @@
  * worker without anybody mentioning it.
  *
  * Watching is a small deterministic loop, not a model. Every `CLAW_ASSISTANT_GITHUB_POLL_SEC` it reads each
- * watched pull request with its owner's own GitHub token (the `GH_TOKEN` of their env vault, the credential the
- * `github` tools already use), keeps what is new since the subscription began, and stores each thing once, under
+ * watched pull request with its owner's own GitHub token, the credential the `github` tools use (the `GH_TOKEN` of
+ * their env vault, else the account they bound with `/github bind` while CLAW_GITHUB_MCP_BINDING_ENABLED is on), keeps what is new since the subscription began, and stores each thing once, under
  * an id GitHub's own id decides: a comment read twice, by two replicas or two polls, is one row. The events of an
  * item are then put on its worker's queue as one message, in the same transaction that marks them delivered, and
  * the worker is started. The model only judges what to do about them.
@@ -37,7 +37,7 @@ import {
 import { redactSecrets } from "@claw/utils";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { readGithubMcpSettings } from "../github-mcp/settings.js";
-import { loadGithubToken } from "../github-mcp/mcp.js";
+import { resolveGithubToken, type ResolveBinding } from "../github-mcp/mcp.js";
 import { CLAW_WRITE_MARK } from "../github-mcp/tools.js";
 import { GithubClient, GithubError, parsePrRef, repoPath, type PrRef } from "../github-review/github.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -118,14 +118,29 @@ export function githubEventsEnabled(): boolean {
 
 /** What leaves the process, behind a seam: the owner's token and GitHub itself. */
 export const githubEventPorts: {
-  loadToken: (userId: string) => Promise<string | null>;
+  /**
+   * The owner's GitHub token for `purpose`, as the `github` tools resolve it (`resolveGithubToken`): `GH_TOKEN`, else their
+   * `/github bind` binding when bindings are on; null when they have neither (or the binding ran out). Throws when the identity
+   * provider cannot be asked: that is not knowing, never "no token".
+   */
+  loadToken: (userId: string, purpose: string) => Promise<string | null>;
   apiUrl: () => string;
   fetchImpl: typeof fetch | undefined;
+  /** Whether a binding counts (`CLAW_GITHUB_MCP_BINDING_ENABLED`), and how one is read: seams for a test. */
+  binding: () => boolean;
+  resolveBinding: ResolveBinding | undefined;
 } = {
-  loadToken: (userId) => loadGithubToken(db, userId),
+  loadToken: async (userId, purpose) => (await resolveGithubToken(db, userId, {
+    binding: githubEventPorts.binding(), purpose, resolve: githubEventPorts.resolveBinding,
+  })).token,
   apiUrl: () => readGithubMcpSettings().apiUrl,
   fetchImpl: undefined,
+  binding: () => readGithubMcpSettings().binding,
+  resolveBinding: undefined,
 };
+
+/** What a token is asked for, in the identity provider's audit trail of a binding. */
+const PURPOSE = { poll: "github_events:poll", reply: "github_events:pr_reply", watch: "github_events:auto_watch" } as const;
 
 const github = (token: string): GithubClient =>
   new GithubClient({ token, apiUrl: githubEventPorts.apiUrl(), fetchImpl: githubEventPorts.fetchImpl });
@@ -359,7 +374,15 @@ export async function watchNamedPullRequests(
   if (!githubEventsEnabled()) return out;
   const refs = pullRequestsNamedIn(texts.join("\n"));
   if (!refs.length || refs.length > AUTO_WATCH_MAX) return out;
-  if (!await githubEventPorts.loadToken(userId)) {
+  let token: string | null;
+  try {
+    token = await githubEventPorts.loadToken(userId, PURPOSE.watch);
+  } catch (err) {
+    logger.warn({ itemId, errorClass: (err as Error)?.constructor?.name }, "assistant.github_auto_watch_token_unknown");
+    out.not_watched.push(...refs.map((ref) => ({ pr: prName(ref), error: "github_unavailable" })));
+    return out;
+  }
+  if (!token) {
     out.not_watched.push(...refs.map((ref) => ({ pr: prName(ref), error: "no_github_token" })));
     return out;
   }
@@ -712,7 +735,7 @@ async function recordReadFailure(sub: Subscription, code: string): Promise<void>
   const out = await fileWatchReport(sub, {
     kind: "blocked",
     summary: `GitHub has not been readable for ${prName(sub)} for over ${Math.round(READ_FAILURE_REPORT_SEC / 60)} minutes (${code}), so new comments and CI results on it are not reaching this item.`,
-    question: "Should I keep watching (after the GitHub token GH_TOKEN is fixed), or stop watching this pull request?",
+    question: "Should I keep watching (after the GitHub token GH_TOKEN or the /github bind connection is fixed), or stop watching this pull request?",
   });
   // A newer run moved the item on, or a result waits for the user: tried again at the next poll, against the item as it is then.
   if (out === "applied") {
@@ -731,7 +754,13 @@ export async function pollSubscription(sub: Subscription): Promise<{ stored: num
     );
     return { stored: 0, unverifiable: 0 };
   }
-  const token = await githubEventPorts.loadToken(sub.user_id);
+  let token: string | null;
+  try {
+    token = await githubEventPorts.loadToken(sub.user_id, PURPOSE.poll);
+  } catch {
+    await recordReadFailure(sub, "github_unavailable");
+    return { stored: 0, unverifiable: 0 };
+  }
   if (!token) {
     await recordReadFailure(sub, "no_github_token");
     return { stored: 0, unverifiable: 0 };
@@ -1132,11 +1161,17 @@ export async function prReply(
     "UPDATE claw_work_item_pr_replies SET state = 'posted', url = $2, comment_id = $3, posted_at = NOW() WHERE event_id = $1",
     [eventId, url, commentId],
   );
-  const token = await githubEventPorts.loadToken(target.user_id);
+  let token: string | null;
+  try {
+    token = await githubEventPorts.loadToken(target.user_id, PURPOSE.reply);
+  } catch {
+    if (!retry) await release();
+    throw new ToolRefused("github_unavailable", "the user's GitHub account could not be read just now; call again in a minute");
+  }
   if (!token) {
     // Nothing was sent by this attempt; an earlier one that may have been is still looked for by the next.
     if (!retry) await release();
-    throw new ToolRefused("no_github_token", "the user keeps no GitHub token (GH_TOKEN), so nothing can be posted");
+    throw new ToolRefused("no_github_token", "the user has no GitHub token (GH_TOKEN) and no GitHub account bound with /github bind, so nothing can be posted");
   }
   // What the owner keeps (the env vault the worker's sandbox is given, and the token answers are posted with) never leaves in an answer,
   // whatever a comment talked the worker into writing; nor does anything shaped like a credential.
