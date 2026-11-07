@@ -32,7 +32,7 @@ import { metrics } from "../infra/metrics.js";
 import { bareItemNumbers, internalTextIn, userWordsOf } from "./internal-text.js";
 import { parseItemRef } from "./item-ref.js";
 import { detectLanguage, languageToAnswerIn, replyLanguageLine, replyLanguageMismatch } from "./language.js";
-import { WORK_EVENT_PREFIX } from "./prompts.js";
+import { earlierConversationItemOf, WORK_EVENT_PREFIX } from "./prompts.js";
 import { redactCommandSecrets } from "../notifications/approval-target.js";
 import { assistantPluginId } from "./read-tools.js";
 import { requestedItemOf, requesterViewOf, routerView, type RequesterView } from "./requester-view.js";
@@ -266,6 +266,7 @@ async function sayOnce(
   try {
     const out = await recordAssistantSay({
       userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid, holdForTurn, turnBegan: run?.began, amendNotice: true,
+      fromEarlierConversationItem: earlierConversationItemOf(run?.prompt),
       ...(cited?.sources.length ? { sources: cited.sources } : {}),
       ...(suggested.length ? { suggested } : {}),
       guard: async (q) => {

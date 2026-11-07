@@ -555,15 +555,34 @@ export function formatWorkEvent(e: {
   itemId: string; seq: number; kind: ReportKind; version?: number; summary: string; question?: string | null;
   /** The answer was already sent to the user whole (`answerSentWhole`): the router is told so, with its beginning only. */
   sentInFull?: boolean;
+  /** The item was started in an assistant session the user deleted since (`queueRouterWake`): the router is told to say so. */
+  fromEarlierConversation?: boolean;
 }): string {
   const head = `${WORK_EVENT_PREFIX} #${e.seq} (item_id: ${e.itemId}) ${e.kind}${e.kind === "ready" && e.version ? ` v${e.version}` : ""}`;
+  const earlier = e.fromEarlierConversation ? `\n${EARLIER_CONVERSATION_LINE}` : "";
   if (e.sentInFull) {
     const summary = oneLine(e.summary);
     const start = Array.from(summary).slice(0, SAY_BRIEF_CHARS).join("");
-    return `${head}: (already sent to the user in full; this is its beginning) ${start}${start.length < summary.length ? "…" : ""}`;
+    return `${head}: (already sent to the user in full; this is its beginning) ${start}${start.length < summary.length ? "…" : ""}${earlier}`;
   }
-  return `${head}: ${oneLine(e.summary)}${e.question ? `\nQuestion for the user: ${oneLine(e.question)}` : ""}`;
+  return `${head}: ${oneLine(e.summary)}${e.question ? `\nQuestion for the user: ${oneLine(e.question)}` : ""}${earlier}`;
 }
+
+/**
+ * The line a report about an item from a deleted assistant session ends with (`formatWorkEvent`): the user is in another conversation
+ * now, and a result said there without where it came from reads as out of nowhere (2026-11-07 parity run, v369 B-talk). The same words
+ * the system's own message starts with (`MOVED_PREFIX_ZH`/`_EN` in `outbound.ts`), which `say` adds when the router leaves them out.
+ */
+export const EARLIER_CONVERSATION_LINE =
+  "This item was started in an earlier conversation the user has since deleted: begin what you say about it with "
+  + "（之前的对话里开始的事项） when you write Chinese, or (From an earlier conversation) in English.";
+
+/** The item a report that woke this router turn is about, when that report says the item came from a deleted session; else undefined. */
+export function earlierConversationItemOf(prompt: string | null | undefined): string | undefined {
+  if (!prompt?.startsWith(WORK_EVENT_PREFIX) || !prompt.split("\n").includes(EARLIER_CONVERSATION_LINE)) return undefined;
+  return prompt.match(WORK_EVENT_ITEM_RE)?.[1];
+}
+const WORK_EVENT_ITEM_RE = new RegExp(`^${WORK_EVENT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} #\\d+ \\(item_id: (kwi_[0-9A-Za-z]+)\\)`);
 
 /** The prompt of a watcher's turns (`observe.ts`): a place's messages, decided on and recorded, never acted on. */
 /**

@@ -55,6 +55,12 @@ record it.
   channel that takes it. What the system says about an item on its own goes to the session the item was started from
   (`claw_work_items.router_session_id`); when the user deleted that session, once to the one they have now (made, as their next visit
   would, when none was made yet), marked as from an earlier conversation.
+- A result whose router could not be woken is said at once, not about five minutes later by the silent sweep. A session made again after
+  the user deleted one holds no credentials until their first message in it, so the wake was refused (`assistant.wake_not_queued
+  error=no_credentials`) and only the sweep said the result (2026-11-07 parity run, v369 B-short). The system now says it with the report,
+  in its own words and under the sweep's id, so it is still said once. When the user has spoken in the new session, the router is told
+  the item came from an earlier conversation, and its message about the item starts with （之前的对话里开始的事项）, as the system's own
+  does (v369 B-talk: said with no marker).
 - A follow-up that starts a new item ("去掉 cancelled 再算一次") no longer leaves its worker without the file the user sent earlier: a new item
   gets a copy of the files the user sent in the last 24 hours of the conversation (`files_from_earlier_messages`), the router is told
   they will go with it, and it forwards a follow-up to the item that did the work while that item is open (`router-v15`).

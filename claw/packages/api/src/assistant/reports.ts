@@ -18,7 +18,7 @@ import { inTransaction, isFailoverError, neverCommitted, type Querier, type Stat
 import { metrics } from "../infra/metrics.js";
 import { announceItemDeliveries } from "./deliveries.js";
 import { queueServerMessage, drainSessionIfIdle } from "./messages.js";
-import { storeAnswerWhole, type SayDeps } from "./outbound.js";
+import { recordNeedsYouFallback, storeAnswerWhole, type SayDeps } from "./outbound.js";
 import { formatWorkEvent, SAY_BRIEF_CHARS } from "./prompts.js";
 import {
   applyWorkerReport, type BoardState, type ReportKind, type ReportSource, type WorkReport,
@@ -74,38 +74,74 @@ export function answerSentWhole(kind: ReportKind, summary: string): boolean {
   return kind === "answer" && summary.length > SAY_BRIEF_CHARS;
 }
 
-/** How the answer said whole is published (`storeAnswerWhole`), behind a seam so a test can see it without a session stream. */
-export const reportPorts: { sayDeps: SayDeps } = { sayDeps: {} };
+/**
+ * How the answer said whole is published (`storeAnswerWhole`), and the system's message for a report whose wake was refused
+ * (`tellUnwoken`), behind a seam so a test can see them without a session stream.
+ */
+export const reportPorts: {
+  sayDeps: SayDeps;
+  tellUnwoken: (input: { itemId: string }, deps: SayDeps) => Promise<unknown>;
+} = { sayDeps: {}, tellUnwoken: recordNeedsYouFallback };
+
+/**
+ * What waking the item's owner's assistant came to (`queueRouterWake`): queued in the router's session; refused, as a session that
+ * holds none of its owner's credentials yet is (a session made again after a delete, before the user's first message in it); or no
+ * assistant to wake.
+ */
+export type RouterWake =
+  | { status: "queued"; sessionId: string; userId: string }
+  | { status: "refused"; error: string }
+  | { status: "none" };
 
 /**
  * Queue the message that tells the item's owner's assistant what happened, in the caller's transaction, deduplicated on the event it is
- * about. Null when there is no assistant to tell or the message could not be queued: what happened stands, and the sweep tells the user
- * an item that needs them even if the Router cannot be woken.
+ * about. Not queued when there is no assistant to tell, or the message is refused: what happened stands, and the caller tells the user
+ * itself when it was refused (`tellUnwoken`), as the router cannot be woken to.
+ *
+ * An item started in an assistant session the user has since deleted is told to the session they have now: the message says so
+ * (`fromEarlierConversation`), so the router says where the item came from, as the system's own message about it does.
  */
 export async function queueRouterWake(q: StatementRunner, e: {
   itemId: string; userId: string; eventId: number; kind: ReportKind; version: number; summary: string; question: string | null;
   /** The answer is stored for sending whole in this same transaction (`storeAnswerWhole`): the router is told so. */
   sentInFull?: boolean;
-}): Promise<{ sessionId: string; userId: string } | null> {
+}): Promise<RouterWake> {
   const target = (await q.query(
-    `SELECT w.seq, a.session_id AS router_session_id
+    `SELECT w.seq, a.session_id AS router_session_id, w.router_session_id AS own_session_id,
+            EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = w.router_session_id AND s.deleted_at IS NULL) AS own_live
        FROM claw_work_items w LEFT JOIN claw_assistants a ON a.user_id = w.user_id
       WHERE w.item_id = $1`,
     [e.itemId],
-  )).rows[0] as { seq: number; router_session_id: string | null } | undefined;
-  if (!target?.router_session_id) return null;
+  )).rows[0] as { seq: number; router_session_id: string | null; own_session_id: string | null; own_live: boolean } | undefined;
+  if (!target?.router_session_id) return { status: "none" };
+  const fromEarlierConversation = target.own_session_id !== null && target.own_session_id !== target.router_session_id && !target.own_live;
   const queued = await queueServerMessage(q, {
     sessionId: target.router_session_id,
     userId: e.userId,
     content: formatWorkEvent({
       itemId: e.itemId, seq: Number(target.seq), kind: e.kind, version: e.version, summary: e.summary, question: e.question,
-      sentInFull: e.sentInFull === true,
+      sentInFull: e.sentInFull === true, fromEarlierConversation,
     }),
     dedupeKey: `wi-evt:${e.eventId}`,
   });
-  if (queued.ok) return { sessionId: target.router_session_id, userId: e.userId };
+  if (queued.ok) return { status: "queued", sessionId: target.router_session_id, userId: e.userId };
   logger.warn({ itemId: e.itemId, error: queued.error }, "assistant.wake_not_queued");
-  return null;
+  return { status: "refused", error: queued.error };
+}
+
+/**
+ * After the commit of a report whose wake was refused (`queueRouterWake`): the router cannot say it, so the system says it now, in its
+ * own words (`recordNeedsYouFallback`), rather than leaving it to the silent sweep minutes later (2026-11-07 parity run, v369 B-short:
+ * a session made again after a delete holds no credentials until the user's first message in it, and the answer came 5 minutes late).
+ * It is the sweep's own message under the same id, so it is said once whoever says it first; an item that does not need the user and
+ * was not answered (a progress report) has none. Never fails the report: what this did not say, the sweep does.
+ */
+export async function tellUnwoken(itemId: string): Promise<void> {
+  try {
+    await reportPorts.tellUnwoken({ itemId }, reportPorts.sayDeps);
+  } catch (err) {
+    logger.warn({ err, itemId }, "assistant.unwoken_not_told");
+  }
 }
 
 export async function ingestReport(
@@ -118,7 +154,7 @@ export async function ingestReport(
     ? { ...report, result: { ...(report.result as Record<string, unknown> | undefined), run_id: run.runId } }
     : report;
   interface Written {
-    outcome: IngestOutcome; wake: { sessionId: string; userId: string } | null; eventId?: number;
+    outcome: IngestOutcome; wake: RouterWake | null; eventId?: number;
     answer?: { announce: () => Promise<void> } | null;
   }
   let written: Written;
@@ -148,7 +184,7 @@ export async function ingestReport(
         })
         : null;
       return {
-        outcome: { status: "applied", boardState: applied.boardState, wokeRouter: wake !== null }, wake, eventId: applied.eventId, answer,
+        outcome: { status: "applied", boardState: applied.boardState, wokeRouter: wake?.status === "queued" }, wake, eventId: applied.eventId, answer,
       };
     });
   } catch (err) {
@@ -165,9 +201,11 @@ export async function ingestReport(
   const applied = written.outcome.status === "applied";
   // Before the router runs, so the user has the answer and the files first and the router's line follows them.
   if (written.answer) await written.answer.announce();
+  // The router cannot be woken to say it: the system says it now, after the answer said whole (which this then finds stored).
+  if (written.wake?.status === "refused") await tellUnwoken(run.itemId);
   if (applied && recorded.kind !== "progress") await announceDeliveries(run.itemId, written.eventId);
   else if (source === "turn_end") await announceDeliveries(run.itemId);
-  if (written.wake) await drainSessionIfIdle(written.wake.sessionId, written.wake.userId);
+  if (written.wake?.status === "queued") await drainSessionIfIdle(written.wake.sessionId, written.wake.userId);
   return written.outcome;
 }
 
