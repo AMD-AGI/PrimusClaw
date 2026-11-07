@@ -49,10 +49,29 @@ export function writeAudit(q: Querier, e: AuditEntry): Promise<unknown> {
   );
 }
 
+/**
+ * How long a connector whose command stream has just ended still counts as online, when its heartbeat is fresh: the time it takes to
+ * open the next one. A replica that shuts down gracefully keeps its streams' connectors online itself (`markStreamClosed`'s
+ * `restart`); one that crashed or was killed, an ingress or gateway restart, or a token refresh ends a stream with no such word, and
+ * the connector is back within seconds (2-7 s measured over four releases on 2026-11-07). A session asked for in that gap is queued
+ * and delivered on the new stream instead of refused with `connector_offline` and "restart the connector". Never longer than the
+ * online window itself.
+ */
+export const STREAM_GRACE_SECS = 45;
+
+/**
+ * Whether a connector is online, as a boolean SQL expression on `claw_remote_connectors c`: not revoked, its last heartbeat at most
+ * the window old (`$<windowParam>`, in seconds), and its command stream open, or closed less than {@link STREAM_GRACE_SECS} ago.
+ * Every place that decides presence uses it (`presence.ts`, `assistant/remote-items.ts`), so they cannot disagree.
+ */
+export const onlineSql = (windowParam: number): string => `COALESCE(c.revoked_at IS NULL
+  AND c.heartbeat_at > NOW() - make_interval(secs => $${windowParam}::float8)
+  AND (c.stream_seen_at > NOW() - make_interval(secs => $${windowParam}::float8)
+       OR (c.stream_seen_at IS NULL
+           AND c.stream_closed_at > NOW() - make_interval(secs => LEAST($${windowParam}::float8, ${STREAM_GRACE_SECS})))), FALSE)`;
+
 /** `online` as a column of `claw_remote_connectors c`; `$1` is the window in seconds. */
-const ONLINE_COND = `COALESCE(c.revoked_at IS NULL
-  AND c.heartbeat_at > NOW() - make_interval(secs => $1::float8)
-  AND c.stream_seen_at > NOW() - make_interval(secs => $1::float8), FALSE)`;
+const ONLINE_COND = onlineSql(1);
 const ONLINE_SQL = `${ONLINE_COND} AS online`;
 
 /** A connector row (revoked or not) that belongs to `owner`, with its presence. */
@@ -211,9 +230,18 @@ async function revokeIn(q: Querier, owner: string, connectorId: string, client: 
   return true;
 }
 
-/** Record a heartbeat: refresh presence, replace the advertised agents, forget acknowledged commands. */
-export async function recordHeartbeat(connectorId: string, owner: string, hb: RemoteHeartbeat): Promise<void> {
-  await inTransaction(async (q) => {
+/**
+ * Record a heartbeat: refresh presence, replace the advertised agents, forget acknowledged commands, and end what was never
+ * delivered (`expireUndelivered`). Returns the sessions that gained an event by it, for the caller to tell their readers and items.
+ */
+export async function recordHeartbeat(connectorId: string, owner: string, hb: RemoteHeartbeat): Promise<Undelivered[]> {
+  return inTransaction(async (q) => {
+    // Every beat also clears what has expired, acknowledged or not: a connector that reconnects
+    // after a long absence may send no cursor, and must not leave its stale prompts behind.
+    await pruneCommands(q, connectorId, hb.cmdCursor ?? 0);
+    // What is left is not acknowledged. One too old to deliver, queued before its machine went away, is ended now, judged by the
+    // beat before this one (whether the machine had already missed one when it was queued), which this beat is about to replace.
+    const undelivered = await expireUndelivered(q, { connectorId });
     await q(
       "UPDATE claw_remote_connectors SET heartbeat_at = NOW(), version = COALESCE($2, version) WHERE connector_id = $1",
       [connectorId, hb.version],
@@ -229,15 +257,32 @@ export async function recordHeartbeat(connectorId: string, owner: string, hb: Re
         [connectorId, a.agent_id, owner, a.kind, a.name, JSON.stringify(a.capabilities)],
       );
     }
-    // Every beat also clears what has expired, acknowledged or not: a connector that reconnects
-    // after a long absence may send no cursor, and must not leave its stale prompts behind.
-    await pruneCommands(q, connectorId, hb.cmdCursor ?? 0);
+    return undelivered;
   });
 }
 
-/** The commands that are accepted only while the connector is online (`needsOnline`). */
-const LIVE_COMMAND_TYPES: string[] = REMOTE_COMMAND_TYPES.filter((t) => REMOTE_COMMANDS[t].needsOnline);
+/**
+ * The commands that are accepted only while the connector is online (`needsOnline`), and `session.new`, which is refused the same
+ * way (`connector_offline`): a session nobody could see being opened must not start hours later, when the machine wakes.
+ */
+const LIVE_COMMAND_TYPES: string[] = [...REMOTE_COMMAND_TYPES.filter((t) => REMOTE_COMMANDS[t].needsOnline), "session.new"];
 const LIVE_COMMAND_TTL_SECS = REMOTE_AGENT_TIMING.liveCommandTtlMs / 1000;
+/**
+ * How much longer than {@link LIVE_COMMAND_TTL_SECS} a command waits before a sweep calls it undelivered: a command sent just before
+ * it expired is acknowledged by the connector's next heartbeat, at most two beats later, and must not be called lost meanwhile.
+ */
+export const UNDELIVERED_SLACK_SECS = (2 * REMOTE_AGENT_TIMING.heartbeatMs) / 1000;
+
+/** A session that gained an event because a command of it was never delivered (`expireUndelivered`). */
+export interface Undelivered { owner: string; session_id: string }
+
+/**
+ * What Claw writes in a session (`turn_end.error`) for a prompt its machine never acknowledged and can no longer be sent: the machine
+ * went away after it was queued. Claw cannot tell whether it took the prompt just before it went (a connector acknowledges one only on
+ * its next heartbeat, after it reaches the agent), so it says neither: the prompt may not have run, and an end of the machine's own
+ * that comes later still counts (`assistant/remote-items.ts`).
+ */
+export const DELIVERY_UNCONFIRMED = "delivery_unconfirmed";
 
 /**
  * Whether a queued command is too old to be carried out, as a SQL condition on `claw_remote_commands`.
@@ -257,16 +302,102 @@ const expiredSql = (typesParam: number, secsParam: number): string =>
     OR (type = ANY($${typesParam}::text[]) AND created_at < NOW() - make_interval(secs => $${secsParam}::float8)))`;
 
 /**
- * Forget commands the connector has handled, plus any that have expired ({@link expiredSql}).
+ * Forget commands the connector has handled, plus any a day old. A live command too old to deliver ({@link expiredSql}) is not
+ * deleted here: {@link expireUndelivered} deletes it and says so in the session, so nobody waits for an answer that cannot come.
  *
  * A prompt is stored here until it is delivered, and the audit trail keeps only
  * its hash, so this table must not become a second archive of what people typed.
  */
 export async function pruneCommands(q: Querier, connectorId: string, upTo: number): Promise<void> {
   await q(
-    `DELETE FROM claw_remote_commands WHERE connector_id = $1 AND (cmd_seq <= $2 OR ${expiredSql(3, 4)})`,
-    [connectorId, upTo, LIVE_COMMAND_TYPES, LIVE_COMMAND_TTL_SECS],
+    "DELETE FROM claw_remote_commands WHERE connector_id = $1 AND (cmd_seq <= $2 OR created_at < NOW() - interval '1 day')",
+    [connectorId, upTo],
   );
+}
+
+/**
+ * Delete the live commands ({@link LIVE_COMMAND_TYPES}) that were never delivered and now never will be (older than
+ * `liveCommandTtlMs` plus `slackSecs`: {@link commandsAfter} no longer sends them; their machine went away after they were queued;
+ * their session has heard nothing from it since), of one connector or of all, and write in each
+ * session what that means, as an event of Claw's own every reader already understands:
+ *  - a `prompt`: `turn_end {stopReason: "error", error: "delivery_unconfirmed", cmd_seq}`, which ends that prompt's turn by name (the
+ *    item, `assistant/remote-items.ts`; a chat attached to the session, which otherwise waits hours for a turn's end). Claw cannot
+ *    tell whether the machine took it just before it went, so it never says the prompt did not run, and the machine's own end of it,
+ *    if that comes, still counts.
+ *  - a `session.new`: no event, and the session is left open: the machine may be starting it. Its prompts say what is known.
+ *  - a `set_mode` or `resume`: nothing waits on its answer; it is dropped, as before.
+ * Typically a laptop closed within the online window: the command was accepted because the machine still looked online.
+ *
+ * Claw's events take a negative `seq` (minus the command's `cmd_seq`, unique within a connector and so within its session): a
+ * connector numbers a session's events from 1 up, so they never meet one of its own, and a repeat is ignored.
+ */
+export async function expireUndelivered(
+  q: Querier, opts: { connectorId?: string | null; slackSecs?: number; onlineWindowMs?: number } = {},
+): Promise<Undelivered[]> {
+  // A command still held is one the connector has not acknowledged, which is not the same as one it never got: a prompt sent
+  // behind a running turn is acknowledged only when that turn ends and it reaches the agent (connector.ts), which may be long
+  // after. So a command is called undelivered only when its machine went away after it was queued (offline now, or recorded
+  // offline since by the presence sweep), its session has heard nothing from the machine since (a turn that went on running
+  // after it was queued shows the machine had it), and no turn was running when it was queued (one sent before it, since the
+  // last turn's end, had been acknowledged): a prompt waiting behind a silent turn is the machine's, wherever the machine goes.
+  const gone = (await q(
+    `DELETE FROM claw_remote_commands m USING claw_remote_connectors c
+      WHERE c.connector_id = m.connector_id AND ($1::uuid IS NULL OR m.connector_id = $1::uuid)
+        AND m.type = ANY($2::text[]) AND m.created_at < NOW() - make_interval(secs => $3::float8)
+        AND (NOT ${onlineSql(4)}
+             OR EXISTS (SELECT 1 FROM claw_remote_connector_transitions t
+                         WHERE t.connector_id = m.connector_id AND t.to_state <> 'online' AND t.at > m.created_at))
+        AND NOT EXISTS (SELECT 1 FROM claw_remote_events e
+                         WHERE e.session_id = m.session_id AND e.seq > 0 AND e.created_at > m.created_at)
+        AND NOT EXISTS (
+          -- A turn was running when it was queued, however silent: a prompt of the session sent since its last turn's end had
+          -- reached the agent (acknowledged: no longer queued). This one waits behind that turn on the machine.
+          SELECT 1 FROM claw_remote_audit a
+           WHERE a.owner_user_id = c.owner_user_id AND a.session_id = m.session_id AND a.action = 'command.issued'
+             AND a.detail->>'type' = 'prompt' AND a.detail->>'cmd_id' <> m.cmd_id AND a.ts < m.created_at
+             AND a.ts > COALESCE((SELECT MAX(t.created_at) FROM claw_remote_events t
+                                   WHERE t.session_id = m.session_id AND t.type = 'turn_end' AND t.seq > 0 AND t.created_at < m.created_at),
+                                 '-infinity'::timestamptz)
+             AND NOT EXISTS (SELECT 1 FROM claw_remote_commands o WHERE o.connector_id = m.connector_id AND o.cmd_id = a.detail->>'cmd_id')
+             -- (refused by the machine: it never ran, so nothing runs ahead of this one)
+             AND NOT EXISTS (SELECT 1 FROM claw_remote_events r
+                              WHERE r.session_id = m.session_id AND r.type = 'command_rejected' AND r.data->>'cmd_id' = a.detail->>'cmd_id')
+             -- (gone because Claw ended it here, not because the machine took it)
+             AND NOT EXISTS (SELECT 1 FROM claw_remote_audit x
+                              WHERE x.owner_user_id = c.owner_user_id AND x.connector_id = m.connector_id AND x.action = 'command.expired'
+                                AND x.detail->>'cmd_id' = a.detail->>'cmd_id'))
+      RETURNING m.connector_id::text AS connector_id, c.owner_user_id AS owner, m.session_id::text AS session_id, m.type, m.cmd_seq,
+                m.cmd_id`,
+    [opts.connectorId ?? null, LIVE_COMMAND_TYPES, LIVE_COMMAND_TTL_SECS + (opts.slackSecs ?? UNDELIVERED_SLACK_SECS),
+      (opts.onlineWindowMs ?? REMOTE_AGENT_TIMING.onlineWindowMs) / 1000],
+  )).rows.sort((a, b) => Number(a.cmd_seq) - Number(b.cmd_seq)) as Array<{
+    connector_id: string; owner: string; session_id: string | null; type: string; cmd_seq: string; cmd_id: string;
+  }>;
+  const touched = new Map<string, Undelivered>();
+  const note = async (r: (typeof gone)[number], type: string, data: Record<string, unknown>) => {
+    const added = await q(
+      `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
+       SELECT session_id, $2, $3, NOW(), $4::jsonb FROM claw_remote_sessions WHERE session_id = $1 AND connector_id = $5
+       ON CONFLICT (session_id, seq) DO NOTHING`,
+      [r.session_id, -Number(r.cmd_seq), type, JSON.stringify({ ...data, by: "claw" }), r.connector_id],
+    );
+    if (added.rowCount) touched.set(r.session_id!, { owner: r.owner, session_id: r.session_id! });
+  };
+  for (const r of gone) {
+    // A prompt's turn is ended, said as unconfirmed. A session.new gets no end: the machine may be starting that session, and its
+    // prompts say what is known. A set_mode or resume is dropped, as before.
+    if (r.session_id && r.type === "prompt") {
+      await note(r, "turn_end", { stopReason: "error", error: DELIVERY_UNCONFIRMED, cmd_seq: Number(r.cmd_seq) });
+    }
+    await writeAudit(q, {
+      owner: r.owner, actor: "claw", connectorId: r.connector_id, sessionId: r.session_id, action: "command.expired",
+      detail: { type: r.type, cmd_id: r.cmd_id, cmd_seq: Number(r.cmd_seq), reason: DELIVERY_UNCONFIRMED },
+    });
+  }
+  if (touched.size) {
+    await q("UPDATE claw_remote_sessions SET updated_at = NOW() WHERE session_id = ANY($1::uuid[])", [[...touched.keys()]]);
+  }
+  return [...touched.values()];
 }
 
 /**
@@ -681,8 +812,7 @@ async function reclaimable(q: Querier, owner: string, need: number, onlineWindow
   // row is then read again as it is (Postgres re-checks a row that changed while it waited), and a session it moved is kept.
   const rows = (await q(
     `SELECT s.session_id::text AS session_id, s.connector_id::text AS connector_id, s.agent_id, s.updated_at,
-            COALESCE(c.revoked_at IS NULL AND c.heartbeat_at > NOW() - make_interval(secs => $2::float8)
-              AND c.stream_seen_at > NOW() - make_interval(secs => $2::float8), FALSE) AS online,
+            ${onlineSql(2)} AS online,
             ${READ_ONLY_SQL} AS read_only
        FROM claw_remote_sessions s JOIN claw_remote_connectors c ON c.connector_id = s.connector_id
       WHERE s.owner_user_id = $1 AND s.status = 'active'

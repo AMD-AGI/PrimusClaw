@@ -24,7 +24,7 @@
 import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
-import { LAST_SEEN_SQL, offlineReason } from "./store.js";
+import { LAST_SEEN_SQL, offlineReason, onlineSql } from "./store.js";
 
 const logger = pino({ name: "remote-agents-presence" });
 
@@ -110,9 +110,7 @@ export async function sweepPresence(onlineWindowMs: number, noticeAfterMs: numbe
     const rows = (await q(
       `SELECT c.connector_id::text AS connector_id, c.owner_user_id, c.name, c.revoked_at, c.presence_state, c.offline_notice,
               c.offline_since, c.offline_reason, c.presence_episode, c.stream_end_reason, ${LAST_SEEN_SQL} AS last_seen_at,
-              COALESCE(c.revoked_at IS NULL
-                AND c.heartbeat_at > NOW() - make_interval(secs => $1::float8)
-                AND c.stream_seen_at > NOW() - make_interval(secs => $1::float8), FALSE) AS online,
+              ${onlineSql(1)} AS online,
               COALESCE(c.presence_since <= NOW() - make_interval(secs => $2::float8), FALSE) AS notice_due
          FROM claw_remote_connectors c
         WHERE c.revoked_at IS NULL OR c.presence_state IS DISTINCT FROM 'revoked'
@@ -183,9 +181,7 @@ export async function sweepPresence(onlineWindowMs: number, noticeAfterMs: numbe
         // Set up again under a new registration, and that one is online: nothing has gone.
         const replaced = (await q(
           `SELECT 1 FROM claw_remote_connectors c
-            WHERE c.owner_user_id = $1 AND c.name = $2 AND c.connector_id <> $3 AND c.revoked_at IS NULL
-              AND c.heartbeat_at > NOW() - make_interval(secs => $4::float8)
-              AND c.stream_seen_at > NOW() - make_interval(secs => $4::float8)
+            WHERE c.owner_user_id = $1 AND c.name = $2 AND c.connector_id <> $3 AND ${onlineSql(4)}
             LIMIT 1`,
           [r.owner_user_id, r.name, r.connector_id, onlineWindowMs / 1000],
         )).rows.length > 0;

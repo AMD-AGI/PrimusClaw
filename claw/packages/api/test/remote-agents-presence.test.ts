@@ -8,7 +8,8 @@
  *
  *   P1  the first sweep records a baseline: an online connector is online, one already offline is never told about
  *   P2  offline for five minutes is told once, with when it was last seen and the command; back online is told once
- *   P3  a short break (a Claw release cuts every stream for seconds) is recorded and told nothing
+ *   P3  a break within the reconnect grace (a Claw release cuts every stream for seconds) is not even recorded; a longer
+ *       short one is recorded and told nothing
  *   P4  replaced by an online connector of the same name, or revoked by the owner: nothing told
  *   P5  a connector whose sign-in ran out is told to sign in again, not just to run
  *   P5b a stream ended on an expired token that reconnected, then lost its heartbeat, is offline for the heartbeat
@@ -64,9 +65,17 @@ describe("remote connector presence", { skip }, () => {
     );
     return id;
   }
-  /** The command stream closed (a release, a killed process): offline at once. */
+  /**
+   * The command stream closed (a killed process) a minute ago and did not come back: offline, the grace for a reconnect
+   * (`STREAM_GRACE_SECS`) having passed.
+   */
   const streamGone = (id: string, reason = "closed") => w.q(
-    "UPDATE claw_remote_connectors SET stream_seen_at = NULL, stream_closed_at = NOW(), stream_end_reason = $2 WHERE connector_id = $1", [id, reason],
+    `UPDATE claw_remote_connectors SET stream_seen_at = NULL, stream_closed_at = NOW() - interval '1 minute', stream_end_reason = $2
+      WHERE connector_id = $1`, [id, reason],
+  );
+  /** The command stream closed just now (a Claw release cuts every stream; the connector is back within seconds). */
+  const streamCut = (id: string) => w.q(
+    "UPDATE claw_remote_connectors SET stream_seen_at = NULL, stream_closed_at = NOW(), stream_end_reason = 'closed' WHERE connector_id = $1", [id],
   );
   const streamBack = (id: string) => w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [id]);
   /** As if the sweep had found it offline `minutes` ago. */
@@ -102,7 +111,7 @@ describe("remote connector presence", { skip }, () => {
     const id = await connector("alice", "dev-box", true);
     await sweep();
     await streamGone(id);
-    const seen = (await row(id)).stream_closed_at as Date;
+    const seen = (await row(id)).heartbeat_at as Date;   // (its last sign of life: the beat after the stream went)
     const down = await sweep();
     assert.deepEqual(await transitions(id), ["->online", "online>offline:no_heartbeat"]);
     assert.deepEqual(down.notices, [], "not before five minutes");
@@ -138,6 +147,11 @@ describe("remote connector presence", { skip }, () => {
   test("P3 a short break is recorded and told nothing, the way a Claw release looks", async () => {
     const id = await connector("alice", "dev-box", true);
     await sweep();
+    // A stream that has just ended, with a fresh heartbeat, is a connector on its way to the next one: still online, no row.
+    await streamCut(id);
+    assert.equal((await sweep()).transitions, 0, "within the reconnect grace");
+    assert.deepEqual(await transitions(id), ["->online"]);
+    await streamBack(id);
     for (let i = 0; i < 3; i++) {
       await streamGone(id);
       await sweep();
