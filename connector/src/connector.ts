@@ -815,6 +815,10 @@ export class Connector {
     } finally {
       // Stopped or restarted (not revoked, not refused): what is in flight is the next run's to end or carry on.
       await this.manager.killAll(this.revoked ? "revoked" : "stopped", !this.revoked && !this.authFailed).catch(() => undefined);
+      // A command still being carried out (a session that was opening) ends now that its adapter is gone. It is waited for,
+      // so that what it writes as it ends (the session's last events, connector.json) lands before the flush below and
+      // never after this run has returned (CI 2026-11-07: a refused session's command rewrote a state directory removed after the run).
+      await within(this.manager.idle(), STATE_WRITE_WAIT_MS, undefined);
       const reason = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : failure ? "failed" : this.paused ? "stopped_while_paused" : result;
       const disconnected = recordDisconnect(this.d.dirs, { reason, detail: this.authWhy || failure || undefined });
       // What is still being written gets a bounded time to land; a disk that does not answer does not keep the process.
