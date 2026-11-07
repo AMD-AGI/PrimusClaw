@@ -825,6 +825,9 @@ record it.
   a turn that was waiting for a tool approval and shows its card again (an agent that always asks, not paused, offline for less than
   the card's lifetime), ends any other running turn with `connector_restarted`, keeps the prompts that were queued, and says
   `session_recovered` for a session used in the last 4 h (#419).
+- `@primusclaw/connector` 0.1.7: `claw-connector pair <code> --server <url>` signs a machine in with a one-time code from the chat
+  (#421); setup no longer touches a network mount that may hang, the npm install of the adapters runs without the agents' keys,
+  and a session that never received a message survives a connector restart (#435). (0.1.6, as published, also carried #430 and #425.)
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
