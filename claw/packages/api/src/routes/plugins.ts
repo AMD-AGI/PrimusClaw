@@ -14,6 +14,7 @@ import {
   NotConfiguredError,
   NotFoundError,
   PluginDuplicateError,
+  PluginNameTakenError,
   ResourceDuplicateError,
   ServiceError,
   ToolDuplicateError,
@@ -58,6 +59,11 @@ function mapServiceError(reply: FastifyReply, e: unknown): ReturnType<FastifyRep
   if (e instanceof ConflictError) return reply.status(409).send(authErrorPayload("conflict", e.message));
   if (e instanceof BadRequestError) return reply.status(400).send(authErrorPayload("bad_request", e.message));
   if (e instanceof BadGatewayError) return reply.status(502).send(authErrorPayload("bad_gateway", e.message));
+  // Before UpsertPermissionError, which it extends: a name owned by someone
+  // else is a collision the caller fixes by renaming, not a missing permission.
+  if (e instanceof PluginNameTakenError) {
+    return reply.status(409).send(authErrorPayload("plugin_name_taken", e.message));
+  }
   if (e instanceof UpsertPermissionError) return reply.status(403).send(authErrorPayload("forbidden", e.message));
   if (e instanceof UpsertConflictError) return reply.status(409).send(authErrorPayload("conflict", e.message));
   if (e instanceof UpsertToolTypeChangeError) {
