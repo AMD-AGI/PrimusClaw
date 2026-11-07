@@ -96,7 +96,21 @@ describe("claw-connector pair", () => {
       await claw.until("registered again", () => claw.online);
       claw.revoke();
       assert.equal(await again, EXIT.revoked);
-      assert.match(rv.errText(), /Pair it again/);
+      assert.match(rv.errText(), /this connector was revoked: every agent was stopped. Pair it again: ask the chat for a new pairing command/);
+      // Started again afterwards (by the service, or by hand), and asked for its status: still told to pair, never to log in,
+      // which a paired machine never did. A machine signed in with login is still told to log in.
+      const rerun = ctx(home);
+      assert.equal(await main(["run"], rerun.c), EXIT.needsPerson);
+      assert.match(rerun.errText(), /not starting: .*Pair it again: ask the chat for a new pairing command \("连接我的开发环境"\)/s);
+      assert.doesNotMatch(rerun.errText(), /claw-connector login/);
+      const st = ctx(home);
+      assert.equal(await main(["status"], st.c), EXIT.ok);
+      assert.match(st.text(), /needs a new sign-in: .*; ask the chat for a new pairing command/);
+      assert.doesNotMatch(st.text(), /claw-connector login/);
+      saveCredentials(credentialsFile(a.c.dirs), { v: 1, server: claw.url, kind: "key", key: "k", saved_at: "" });
+      const keyed = ctx(home);
+      assert.equal(await main(["run"], keyed.c), EXIT.needsPerson);
+      assert.match(keyed.errText(), /not starting: .*Sign in again \(claw-connector login\)/s);
     } finally {
       connector?.stop();
       await running;

@@ -13,7 +13,7 @@ import { ChildRegistry, isAlive, processStart } from "./children.js";
 import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-client.js";
 import { ConfigError, PRESETS, SAMPLE_ACTIVE, SAMPLE_AGENTS, loadConfig, sampleApprovals, sampleConfig, type AgentConfig, type Approval, type ConnectorConfig } from "./config.js";
 import {
-  CredentialsError, DEFAULT_CLIENT_ID, GrantRevokedError, loadCredentials, providerFor, saveCredentials, type Credentials,
+  CredentialsError, DEFAULT_CLIENT_ID, GrantRevokedError, loadCredentials, providerFor, reconnectAdvice, reconnectFix, reconnectStep, saveCredentials, type Credentials,
 } from "./credentials.js";
 import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
 import { applyRootSandbox, bypassUnavailableWarnings } from "./claude-mode.js";
@@ -423,7 +423,7 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   {
     const nl = needsLogin(ctx.dirs);
     if (nl) {
-      ctx.err(`not starting: ${nl.reason}${nl.at ? ` (${nl.at})` : ""}. Sign in again (claw-connector login); the service then starts it.`);
+      ctx.err(`not starting: ${nl.reason}${nl.at ? ` (${nl.at})` : ""}. ${reconnectAdvice(credentialsFile(ctx.dirs))} The service then starts it.`);
       return EXIT.needsPerson;
     }
   }
@@ -459,7 +459,7 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   try {
     const result = await connector.run();
     // A machine paired from the chat has no login to run again: a new pairing code is what connects it.
-    const again = creds.kind === "grant" ? "Pair it again: ask the chat for a new command (\"连接我的开发环境\") and run it here." : "Run login again to connect it anew.";
+    const again = reconnectAdvice(credentialsFile(ctx.dirs));
     if (result === "revoked") {
       markNeedsLogin(ctx.dirs, "this connector was revoked");
       ctx.err(`this connector was revoked: every agent was stopped. ${again}`);
@@ -479,7 +479,7 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
     // Refused at start (a deleted key, a sign-in the identity service ended): retrying cannot help.
     if (isAuthRefusal(e) || e instanceof RevokedError || e instanceof GrantRevokedError || e instanceof CredentialsError) {
       markNeedsLogin(ctx.dirs, e instanceof GrantRevokedError || e instanceof RevokedError ? e.message : `Claw refused the sign-in (${errMessage(e)})`);
-      ctx.err(`error: ${errMessage(e)}. Run login again.`);
+      ctx.err(`error: ${errMessage(e)}. ${reconnectAdvice(credentialsFile(ctx.dirs))}`);
       return EXIT.needsPerson;
     }
     if (e instanceof HttpError || e instanceof TransportError) { ctx.err(`error: ${e.message}`); return EXIT.failure; }
@@ -511,7 +511,7 @@ async function cmdDoctor(args: string[], ctx: Ctx): Promise<number> {
   try { creds = loadCredentials(credentialsFile(ctx.dirs)); } catch (e) { before.push({ code: "not_signed_in", severity: "fail", detail: errMessage(e), fix: "claw-connector login" }); }
   if (!creds && !before.some((p) => p.code === "not_signed_in")) before.push({ code: "not_signed_in", severity: "fail", detail: "this connector is not signed in to Claw", fix: "claw-connector login" });
   const nl = needsLogin(ctx.dirs);
-  if (nl) before.push({ code: "needs_login", severity: "fail", detail: `needs a new sign-in: ${nl.reason}`, fix: "claw-connector login" });
+  if (nl) before.push({ code: "needs_login", severity: "fail", detail: `needs a new sign-in: ${nl.reason}`, fix: reconnectFix(credentialsFile(ctx.dirs)) });
   let server: string | null = null;
   try { server = serverUrl(ctx, undefined, cfg, creds); } catch { /* an invalid URL: the sign-in or config problem above says so */ }
   // First the machine (quick), then each agent's adapter (starts it: slower).
@@ -629,7 +629,7 @@ function cmdStatus(args: string[], ctx: Ctx): number {
   ctx.out(`agents:     ${agents.map((a) => (unattended.includes(a) ? `${a} (no per-step approval)` : a)).join(", ") || "none configured"}`);
   ctx.out(`adapters:   ${status.adapters.length ? status.adapters.map((a) => `${a.agent} pid ${a.pid}`).join(", ") : "none running"}`);
   if (status.last_disconnect) ctx.out(`last down:  ${status.last_disconnect.at} ${status.last_disconnect.reason}${status.last_disconnect.detail ? ` (${status.last_disconnect.detail})` : ""}`);
-  if (status.needs_login) ctx.out(`problem:    needs a new sign-in: ${status.needs_login.reason}; run: claw-connector login`);
+  if (status.needs_login) ctx.out(`problem:    needs a new sign-in: ${status.needs_login.reason}; ${reconnectStep(credentialsFile(ctx.dirs))}`);
   for (const p of status.problems) ctx.out(`problem:    ${p}`);
   for (const w of status.warnings) ctx.out(`warning:    ${w}`);
   if (status.doctor) ctx.out(`doctor:     ${status.doctor.problems.length ? `${status.doctor.problems.length} problem(s) at ${status.doctor.checked_at}; run: claw-connector doctor` : `no problems at ${status.doctor.checked_at}`}`);
@@ -802,7 +802,7 @@ const serviceHelpers = {
       if (!loadCredentials(credentialsFile(ctx.dirs))) return "not signed in: run  claw-connector login";
     } catch (e) { return errMessage(e); }
     const nl = needsLogin(ctx.dirs);
-    return nl ? `${nl.reason}: run  claw-connector login  first` : null;
+    return nl ? `${nl.reason}; first ${reconnectStep(credentialsFile(ctx.dirs))}` : null;
   },
 };
 export type ServiceHelpers = typeof serviceHelpers;

@@ -27,8 +27,9 @@ import { parseArgs } from "node:util";
 import { parse as parseToml } from "smol-toml";
 import type { Ctx, ServiceHelpers } from "./commands.js";
 import { isAlive, processStart } from "./children.js";
+import { reconnectFix, reconnectStep } from "./credentials.js";
 import { needsLogin, recordDisconnect, recentDisconnects } from "./health.js";
-import { keepaliveFile, keepaliveStampFile, runLogFile, serviceEnvFile, serviceFile, supervisorPidFile } from "./paths.js";
+import { credentialsFile, keepaliveFile, keepaliveStampFile, runLogFile, serviceEnvFile, serviceFile, supervisorPidFile } from "./paths.js";
 import { errMessage, isObject, sleep } from "./util.js";
 
 export type Supervisor = "systemd" | "launchd" | "script";
@@ -411,7 +412,7 @@ export async function supervise(ctx: Ctx, o: SuperviseOptions = {}): Promise<num
       const at = new Date().toISOString();
       if (stopping) return 0;
       if (code === 0) { ctx.err(`${at} supervisor: the connector stopped on purpose (exit 0); not restarting`); return 0; }
-      if (code === NEEDS_PERSON) { ctx.err(`${at} supervisor: the connector needs a new sign-in (exit 78); not restarting until: claw-connector login`); return NEEDS_PERSON; }
+      if (code === NEEDS_PERSON) { ctx.err(`${at} supervisor: the connector needs a new sign-in (exit 78); not restarting until: ${reconnectFix(credentialsFile(ctx.dirs))}`); return NEEDS_PERSON; }
       const how = signal ? `killed by ${signal}` : `exit ${code}`;
       // A run killed outright never wrote why; say it here, so status shows it.
       if (signal) await recordDisconnect(ctx.dirs, { reason: "process_died", detail: `the connector was ${how}; restarted by the supervisor` });
@@ -820,7 +821,7 @@ function status(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, json: boolean): num
   ctx.out(`service:    ${sup ? `${sup} (${active})` : "not installed; run: claw-connector service install"}`);
   ctx.out(`connector:  ${st.running !== null ? `running (pid ${st.running})` : "not running"}`);
   if (st.agent_env.length) ctx.out(`agent env:  ${st.agent_env.join(", ")} (from ${serviceEnvFile(ctx.dirs)})`);
-  if (st.needs_login) ctx.out(`problem:    needs a new sign-in: ${st.needs_login.reason}; run: claw-connector login`);
+  if (st.needs_login) ctx.out(`problem:    needs a new sign-in: ${st.needs_login.reason}; ${reconnectStep(credentialsFile(ctx.dirs))}`);
   for (const x of st.recent_disconnects) ctx.out(`down:       ${x.at} ${x.reason}${x.detail ? ` (${x.detail})` : ""}`);
   return 0;
 }
