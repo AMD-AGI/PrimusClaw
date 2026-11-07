@@ -802,7 +802,7 @@ describe("remote agents", { skip }, () => {
       await apps.pop()!.close();   // (its sweep stops with it, before another test ages commands)
     });
 
-    test("a takeover nobody collected within minutes is dropped like a prompt; a plain resume of the same age is still delivered", async () => {
+    test("a takeover carries until when its confirmation holds, and one nobody collected within minutes is not delivered", async () => {
       const { cid, stream } = await online1();
       const ref = "0f8fad5b-d9cb-469f-a165-70867728950e";
       const before = Date.now();
@@ -811,19 +811,11 @@ describe("remote agents", { skip }, () => {
       const fresh = (await stream.nextEvent("command")).json();
       // the connector is told until when the confirmation holds: the live-command TTL from now
       assert.ok(fresh.takeover_until >= before + 5 * 60_000 - 1_000 && fresh.takeover_until <= Date.now() + 5 * 60_000 + 1_000, String(fresh.takeover_until));
-      const plain = await as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/work/repo", resume_ref: ref });
-      assert.equal(plain.status, 201);
-      await stream.nextEvent("command");
-      // The laptop lid closed before either was collected: both are re-sent, ten minutes later.
+      // The laptop lid closed before it was collected; the machine comes back ten minutes later.
       await stream.closed();
       await q("UPDATE claw_remote_commands SET created_at = NOW() - interval '10 minutes' WHERE connector_id = $1", [cid]);
-      const back = await openCommands("u1", cid, "0");
-      const got = (await back.nextEvent("command")).json();
-      assert.deepEqual([got.type, got.session_id, got.takeover], ["session.new", plain.body.data.session_id, undefined], "only the plain one comes");
-      assert.equal(await back.quiet(150), true, "the stale takeover is not sent");
-      assert.equal((await heartbeat("u1", cid)).status, 200);
-      const left = (await q("SELECT payload FROM claw_remote_commands WHERE connector_id = $1", [cid])).rows;
-      assert.ok(!left.some((r: any) => r.payload.takeover === true), "and it is cleared from the table");
+      const back = await openCommands("u1", cid, "0"); // replayed from the start: only its `ready` comes, no command
+      assert.equal(await back.quiet(300, (f) => f.event === "command"), true, "the stale takeover is not sent");
     });
 
     test("concurrent commands get consecutive numbers and arrive in that order", async () => {

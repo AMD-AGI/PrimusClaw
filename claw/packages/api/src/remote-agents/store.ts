@@ -294,16 +294,14 @@ export const DELIVERY_UNCONFIRMED = "delivery_unconfirmed";
  * is dead after minutes: it was accepted because the connector looked online, so one still uncollected
  * was sent into a connection that had died unnoticed (a closed laptop counts as online for up to the
  * online window), and delivering it when the machine wakes hours later would run it with nobody watching,
- * which is the case the `connector_offline` refusal exists to prevent. A `session.new` that takes over a
- * conversation a terminal has open (`takeover`) is one of those too: delivered late, it would end a terminal
- * the person may be using by then, so it has the same few minutes. `cancel`, `close`, `decision` and any
- * other `session.new` are safe to deliver late and keep only the day. (A payload without `takeover` must
- * read as false, not NULL: under `NOT` a NULL would hide every plain `session.new`.)
+ * which is the case the `connector_offline` refusal exists to prevent. A `session.new` is one of those
+ * too ({@link LIVE_COMMAND_TYPES}), and for a takeover (`takeover`) this matters most: delivered late, it
+ * would end a terminal the person may be using by then. `cancel`, `close` and `decision` are safe to
+ * deliver late and keep only the day.
  */
 const expiredSql = (typesParam: number, secsParam: number): string =>
   `(created_at < NOW() - interval '1 day'
-    OR ((type = ANY($${typesParam}::text[]) OR (type = 'session.new' AND COALESCE(payload->>'takeover', '') = 'true'))
-        AND created_at < NOW() - make_interval(secs => $${secsParam}::float8)))`;
+    OR (type = ANY($${typesParam}::text[]) AND created_at < NOW() - make_interval(secs => $${secsParam}::float8)))`;
 
 /**
  * Forget commands the connector has handled, plus any a day old. A live command too old to deliver ({@link expiredSql}) is not
