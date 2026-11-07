@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test, { describe } from "node:test";
-import { main, EXIT, type Ctx } from "../src/commands.js";
+import { main, COMMANDS, EXIT, type Ctx } from "../src/commands.js";
 import { withThreadPool } from "../src/service.js";
 import { PRESETS, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
@@ -66,6 +66,47 @@ describe("claw-connector commands", () => {
     assert.equal(await main(["--version"], v.c), EXIT.ok);
     assert.equal(v.text(), "0.1.7");
     assert.equal(await main(["--help"], ctx(home).c), EXIT.ok);
+  });
+
+  // Derived from the command table, so a command added later is covered without touching this test.
+  const commandNames = Object.keys(COMMANDS);
+  test("every subcommand answers -h and --help with its own help, exit 0, and does nothing else", async () => {
+    assert.ok(commandNames.length >= 14, `the command table lists ${commandNames.length} commands`);
+    for (const name of commandNames) {
+      for (const flag of ["--help", "-h"]) {
+        // Also after other arguments, e.g. `hooks install --help` or `pair CODE --server URL -h`.
+        for (const argv of [[name, flag], [name, "install", "--json", flag]]) {
+          const home = tmpdir();
+          const r = ctx(home, { stdin: async () => { throw new Error(`${argv.join(" ")} read stdin`); } });
+          assert.equal(await main(argv, r.c), EXIT.ok, `${argv.join(" ")}: ${r.errText()}`);
+          assert.equal(r.errText(), "", argv.join(" "));
+          assert.ok(r.text().startsWith(`Usage: claw-connector ${name}`), `${argv.join(" ")} printed ${JSON.stringify(r.text().slice(0, 80))}`);
+          assert.deepEqual(fs.readdirSync(home), [], `${argv.join(" ")} wrote into the connector home`);
+        }
+      }
+      const h = ctx(tmpdir());
+      assert.equal(await main(["help", name], h.c), EXIT.ok);
+      assert.ok(h.text().startsWith(`Usage: claw-connector ${name}`), `help ${name}`);
+    }
+    // The overall help lists every command meant for people, each at the start of its entry.
+    const all = ctx(tmpdir());
+    assert.equal(await main(["--help"], all.c), EXIT.ok);
+    for (const [name, c] of Object.entries(COMMANDS)) {
+      assert.equal(new RegExp(`^  ${name.replace(/-/g, "\\-")}(\\s|$)`, "m").test(all.text()), !c.hidden, `overall help and ${name}`);
+    }
+    // After `--` a "--help" is an argument, not a request for help: `stop -- --help` is a usage error.
+    assert.equal(await main(["stop", "--", "--help"], ctx(tmpdir()).c), EXIT.usage);
+  });
+
+  test("an unknown option is a usage error (exit 2) for every subcommand, with that command's usage", async () => {
+    for (const name of commandNames) {
+      const home = tmpdir();
+      const r = ctx(home, { stdin: async () => { throw new Error(`${name} read stdin`); } });
+      assert.equal(await main([name, "--no-such-option"], r.c), EXIT.usage, `${name}: ${r.errText()}`);
+      assert.match(r.errText(), /usage: claw-connector/i, name);
+      assert.equal(r.text(), "", name);
+      assert.deepEqual(fs.readdirSync(home), [], `${name} --no-such-option wrote into the connector home`);
+    }
   });
 
   test("init writes a sample once and never overwrites it; the sample is a valid file once its root exists", async () => {
