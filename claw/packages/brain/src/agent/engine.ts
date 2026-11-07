@@ -14,7 +14,8 @@ import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
 import { loadRules } from "./rules.js";
-import { bindRepo, renderRepoBlock } from "../workspace/repo-binding.js";
+import { bindRepo, renderRepoBlock, repoWithoutSandbox } from "../workspace/repo-binding.js";
+import { sandboxUnavailableOf } from "../sandbox/errors.js";
 import { repoSkillsToList } from "../workspace/repo-skills.js";
 import { normalizeMcpConfigs, originsSendingPlaceholder } from "../clients/mcp-config.js";
 import { DEFAULT_BASH_APPROVAL_RULES } from "./bash-approval-defaults.js";
@@ -141,6 +142,24 @@ export class AgentEngine {
     if (!attached && !attach) {
       throw new Error("HandsClient is required for the agent engine");
     }
+    /**
+     * The sandbox for setup the run can do without: null, rather than a failed
+     * run, when the platform has no sandbox for it (SANDBOX_UNAVAILABLE_REASONS --
+     * an account refused the workspace, a sandbox that never got a node). Such a
+     * run can still answer from the conversation, the web and its MCP tools, and
+     * the tools that do need a sandbox each say why there is none. Any other open
+     * failure still fails the run, as before.
+     */
+    const sandboxIfAvailable = async (): Promise<{ hands: HandsClient } | { unavailable: string }> => {
+      try {
+        return { hands: await sandbox() };
+      } catch (err) {
+        const why = sandboxUnavailableOf(err);
+        if (!why) throw err;
+        logger.warn({ sessionId, reason: why.reason }, "engine.setup_without_sandbox");
+        return { unavailable: why.message };
+      }
+    };
     // Plugin work root: local staging on Brain for S3 downloads (skills,
     // rules, hooks). Must be writable by the Brain process; use os.tmpdir()
     // instead of BRAIN_SESSION_ROOT which may point at a read-only path
@@ -150,9 +169,12 @@ export class AgentEngine {
     // only when the request actually carries something for it to install —
     // they no-op on an empty tool list / absent plugin id.
     const toolIds = marketplaceToolIds(request);
+    // Without a sandbox a marketplace skill is still read into the prompt; only
+    // its files are not copied anywhere a tool could open them.
+    const toolIdsSandbox = toolIds.length ? await sandboxIfAvailable() : null;
     const resolved = await resolveToolIds(
       toolIds, platformKey, onEvent, sessionDir,
-      toolIds.length ? await sandbox() : undefined,
+      toolIdsSandbox && "hands" in toolIdsSandbox ? toolIdsSandbox.hands : undefined,
     );
     const hasPlugin = typeof request.plugin_id === "number" && request.plugin_id > 0
       && Array.isArray(request.plugin_tools) && request.plugin_tools.length > 0;
@@ -292,9 +314,15 @@ export class AgentEngine {
     // there before the conversation starts and the model has to be told what it
     // is standing in. A failure of the setup itself is not this run's failure; it
     // comes back as a reason and goes into the prompt. A sandbox that cannot be
-    // opened at all fails the run, as it does for any other turn that needs one.
+    // opened at all fails the run, as it does for any other turn that needs one --
+    // except when the platform has no sandbox for this run at all: the model is
+    // then told the repository is not there and why, and the turn goes on.
     // No `repo` on the request, no sandbox here and no block: the turn is what it was.
-    const binding = request.repo ? await bindRepo(await sandbox(), request.repo, { signal, background: BG_SHELL_ENABLED }) : null;
+    const repoSandbox = request.repo ? await sandboxIfAvailable() : null;
+    const binding = !request.repo || !repoSandbox ? null
+      : "hands" in repoSandbox
+        ? await bindRepo(repoSandbox.hands, request.repo, { signal, background: BG_SHELL_ENABLED })
+        : repoWithoutSandbox(request.repo, repoSandbox.unavailable);
     // The repository's own skills, listed after everything else (the list's cap
     // drops them first) and served by load_skill like the others; a name already
     // in use belongs to whoever has it. Their staged copies live under the run's
