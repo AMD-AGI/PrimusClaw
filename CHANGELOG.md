@@ -46,6 +46,19 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A user with no development environment session can connect from the assistant: `devenv_list` gives each agent on an online machine
+  its own `attach_command` (`/agent attach MACHINE/AGENT`, which attaches its open session or starts one in its first folder), the
+  attach button accepts it, and with no session anywhere and one such agent `attach_default` is that agent (`new_session: true`).
+  Before, "connect me to my dev box" with no session open had nothing to attach and nothing it could press.
+- `devenv_send` no longer chooses an agent that only takes over existing conversations (`kind: attach`) for a new session, which its
+  connector refused (`resume_ref_required`) with nothing said to the user: it is chosen only to continue its own idle session, and
+  when it is all that fits, the refusal says so (`which_agent` listing its conversations, else `no_agent`).
+  Router prompt router-devenv-v4.
+- Opening a remote session at the limit of open sessions (10) closes the user's sessions nobody is using to make room (none for half
+  an hour, no command waiting, no turn under way, no approval waiting; or nothing for a day), an offline machine's first, each with a
+  `close` to its connector and a `session.reclaimed` audit; `session_limit_reached` now means every open session is in use. Before,
+  sessions were never closed unless the user closed them, so ordinary use hit the limit in about a week. `POST
+  /v1/remote-agents/sessions` returns the closed ones as `reclaimed`.
 - Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
   忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
   not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with
