@@ -185,8 +185,10 @@ Name a work item to the user by its number and title, as in #12 修复登录超�
  * router-read-v10: v9 with current facts read now from the source that states them (the latest version from the project's own
  * release record, such as stable.txt or its latest release; support from that version's own compatibility matrix), never from
  * memory or a page about an older version.
+ * router-read-v11: v10 with no part of an answer about what the router can do labelled read-only (只读): "马上查询（只读）" as a
+ * heading still read as a limit (2026-11-07 E230 #2, 1 of 2 asks on router-read-v10).
  */
-export const ROUTER_READ_PROMPT_VERSION = "router-read-v10";
+export const ROUTER_READ_PROMPT_VERSION = "router-read-v11";
 
 /**
  * The read section's citing (`CLAW_ASSISTANT_CITATIONS`), logged beside it when on.
@@ -246,7 +248,7 @@ export function renderRouterAbilities(servers: readonly string[], github: boolea
     "anything that needs code, a shell, a checkout, a run or many steps",
   ];
   return `What you can do
-When the user asks what you can do, or whether you can do something, answer from this, plainly and in a few lines. Never call yourself read-only, and never say you cannot write, change or send something listed here.
+When the user asks what you can do, or whether you can do something, answer from this, plainly and in a few lines. Never call yourself read-only, and never say you cannot write, change or send something listed here. Never label any part of the answer read-only either (no 只读 or read-only as a heading, in brackets or beside the lookups): looking things up is simply 查询 / looking up, and the user only needs to know that changes go through a work item that asks them first.
 - Look things up at once, in this turn: the lookups above.
 - Change things, through a work item: ${changes.join("; ")}. Its worker asks the user on a card before each write runs, so say yes: you can, and it will ask them to approve the change first. Start the item when they ask for the change.
 - Never give the system's own failures as a limit of what you can do: not a sandbox that would not start, a permission error, a status code (such as 403), a missing token of the system or another item's failure, even when the item list shows one. Such a failure is its item's to tell; a new item is started all the same.`;

@@ -101,6 +101,11 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- An assistant asked again about something it had just looked up no longer disowns its own answer ("上一条我是在查询结果返回之前就
+  写了答案，请不要采信"). A turn with tool calls was handed back to the model as one message, its final text first and every call side
+  by side, so a lookup followed by an answer read as an answer written beside (before) the lookup. History now replays each call, then
+  its result, then the turn's text, in the order they ran. The router's answer about what it can do no longer labels any part of
+  itself read-only (只读) (`router-read-v11`).
 - A machine paired from the chat (`claw-connector pair`) and then disconnected is told, wherever the connector says what to do next
   (the revocation itself, `run` started again by the service or by hand, the supervisor's log line, `status`, `service status`,
   `doctor`'s fix, a sign-in refused at start), to ask the
