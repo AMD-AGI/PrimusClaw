@@ -1771,6 +1771,10 @@ export async function initDb(): Promise<void> {
     // processed_at marks completion: NULL = pending, NOT NULL = handleComplete done.
     await client.query("ALTER TABLE claw_session_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ DEFAULT NULL").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_events_unprocessed ON claw_session_events(event) WHERE processed_at IS NULL AND deleted_at IS NULL").catch(() => {});
+    // A processed completion whose run notification (`run.completed` / `run.failed`) could not be recorded: what it
+    // still owes, written by the same statement as `processed_at`, and cleared once recorded. The event is redelivered
+    // until then (events/consumer.ts, `processCompletionEvent`).
+    await client.query("ALTER TABLE claw_session_events ADD COLUMN IF NOT EXISTS run_notification_owed JSONB DEFAULT NULL").catch(() => {});
 
     // An application's progress event is forwarded at least once (hosting design
     // 5.7); the consumer stores it once per (session, app run, CloudEvents id).

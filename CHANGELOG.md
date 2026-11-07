@@ -108,6 +108,10 @@ record it.
   its `run.completed` was measured from the claim that resumed it, which clears and restamps `started_at`, so a 70-second run
   resumed three seconds before its end ran "three seconds" and no notification was recorded (release claw-rel-1917, 2026-11-07).
   A run is now measured across every claim from its run-time anchor, less the time it spent queued.
+- A run's `run.completed` / `run.failed` is no longer lost when the outbox write fails at the run's end (an API drain closing
+  the database pool under it): the completion was stamped processed regardless, so its redelivery acked and the notification was
+  never recorded. What it still owes is now stored with the processed stamp, and the event is redelivered until the notification
+  is recorded -- once, by its run-derived key -- without running the rest of the completion again.
 - A connector no longer stops for good (exit 78, `needs-login.json`, offline until someone runs `login`) because Claw's sign-in
   service was down. On 2026-11-07 09:50-10:15Z, while SaFE was failing, Claw answered a mix of no answer, 503
   `authentication_service_unavailable` and 401 `invalid_api_key` for a key that was fine, and the connector took four 401s as a
