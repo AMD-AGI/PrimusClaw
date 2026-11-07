@@ -22,10 +22,11 @@ import type { KV } from "nats";
 import pino from "pino";
 import {
   CeilingDisagreement, bindSlot, claimProvisionalSlot, isFleetStale, markFleetStale,
-  releaseSlot, type RosterConfig, type RosterStore,
+  releaseSlot, type ClaimResult, type RosterConfig, type RosterStore,
 } from "./admission-roster.js";
 import type { CapacitySettings } from "./keepalive-capacity.js";
 import { rosterDeps } from "./roster-store.js";
+import { SANDBOX_ADMISSION_STALE_WAIT_MS } from "../config.js";
 
 const logger = pino({ name: "sandbox-admission" });
 
@@ -199,31 +200,113 @@ const NO_HOLD: AdmissionHold = {
 };
 
 /**
+ * How long a claim waits for a stale fleet count, and how often it looks again.
+ * Mutable only so tests can shorten it.
+ */
+const staleWait = { ms: SANDBOX_ADMISSION_STALE_WAIT_MS, pollMs: 2_000 };
+
+export function setAdmissionStaleWaitForTest(ms: number, pollMs = 2_000): () => void {
+  const before = { ...staleWait };
+  staleWait.ms = ms;
+  staleWait.pollMs = pollMs;
+  return () => { Object.assign(staleWait, before); };
+}
+
+type ClaimOutcome = ClaimResult;
+
+/**
+ * Claim a slot, waiting out a fleet count that is briefly unreadable.
+ *
+ * Staleness is a reading, not a verdict: the next sweep that reads the fleet
+ * whole clears it, and that sweep is at most one keepalive interval away. A
+ * claim refused at once turned that interval into a user's task failing, so the
+ * claim is retried until the count is readable again or the wait runs out --
+ * and only then refused. Nothing is claimed while the count is stale, so the
+ * ceiling is never checked against a number nobody could read; a claim made
+ * after the wait is the same compare-and-set an immediate one would have been.
+ */
+async function claimOnceCounted(
+  sessionId: string, store: RosterStore, config: RosterConfig, signal?: AbortSignal,
+): Promise<ClaimOutcome> {
+  const deadline = Date.now() + staleWait.ms;
+  let waiting = false;
+  for (;;) {
+    // Checked before every claim, not only between waits: a run that was
+    // cancelled while it waited must not come back holding a slot -- and then
+    // a sandbox -- it no longer needs.
+    throwIfAborted(signal);
+    let outcome: ClaimOutcome;
+    if (localStaleLatch) {
+      outcome = {
+        ok: false, reason: "stale",
+        staleReason: "this replica could not reconcile the keepalive roster",
+      };
+    } else {
+      outcome = await claimProvisionalSlot(store, config);
+      if (outcome.ok || outcome.reason !== "stale") {
+        if (waiting) logger.info({ sessionId }, "admission.stale_cleared");
+        return outcome;
+      }
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return outcome;
+    if (!waiting) {
+      waiting = true;
+      logger.warn(
+        { sessionId, reason: outcome.staleReason, waitMs: staleWait.ms },
+        "admission.stale_waiting",
+      );
+    }
+    await pause(Math.min(staleWait.pollMs, remaining), signal);
+  }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : new Error("sandbox admission aborted");
+  }
+}
+
+/** A wait an abort ends at once, so a cancelled run is not held for the rest of it. */
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/**
  * Reserve capacity for a sandbox that does not exist yet.
  *
  * Returns a hold the caller binds and releases. Throws
  * {@link SandboxCapacityRefused} where the fleet is at its ceiling; nothing is
- * provisioned in that case.
+ * provisioned in that case. A fleet count that is briefly unreadable is waited
+ * out first; `signal` ends that wait, and an aborted signal throws its reason
+ * with nothing claimed.
  */
-export async function admitSandbox(sessionId: string): Promise<AdmissionHold> {
+export async function admitSandbox(
+  sessionId: string, signal?: AbortSignal,
+): Promise<AdmissionHold> {
   if (!roster) return NO_HOLD;
   const { store, config } = roster;
 
   assertFleetCensused(sessionId);
-  if (localStaleLatch) {
-    throw new SandboxCapacityRefused(
-      "sandbox admission refused: this replica could not reconcile the keepalive "
-      + "roster and could not record that it had not, so the count a claim would "
-      + "be checked against is unknown here",
-    );
-  }
-  const claim = await claimProvisionalSlot(store, config);
+  const claim = await claimOnceCounted(sessionId, store, config, signal);
   if (!claim.ok && claim.reason === "stale") {
-    logger.warn({ sessionId, reason: claim.staleReason }, "admission.roster_stale");
+    logger.warn(
+      { sessionId, reason: claim.staleReason, waitedMs: staleWait.ms },
+      "admission.roster_stale",
+    );
     throw new SandboxCapacityRefused(
-      "sandbox admission refused: the keepalive roster could not be reconciled "
-      + `(${claim.staleReason}), so the fleet count it would be checked against is `
-      + "incomplete",
+      "sandbox admission refused: the sandbox fleet count could not be confirmed "
+      + `for ${Math.round(staleWait.ms / 1000)}s (${claim.staleReason}), so no new `
+      + "sandbox could be started safely. This is temporary; retrying the task in a "
+      + "minute or two should succeed.",
     );
   }
   if (!claim.ok) {
@@ -232,8 +315,10 @@ export async function admitSandbox(sessionId: string): Promise<AdmissionHold> {
       "admission.at_capacity",
     );
     throw new SandboxCapacityRefused(
-      `sandbox admission refused: the keepalive roster holds ${claim.rosterSize} of `
-      + `${config.ceiling} targets, with ${claim.reserveRemaining} reserved for reconciliation`,
+      `sandbox admission refused: all sandbox slots are in use (${claim.rosterSize} `
+      + `of ${config.ceiling}, with ${claim.reserveRemaining} reserved for sandboxes `
+      + "already running). A slot frees when another task's sandbox is released; "
+      + "retry the task later.",
     );
   }
 
