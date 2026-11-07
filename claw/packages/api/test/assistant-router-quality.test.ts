@@ -305,7 +305,7 @@ describe("router quality, the prompt", () => {
     // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
     // now from the source that states them.
     assert.equal(p.ROUTER_PROMPT_VERSION, "router-v18");
-    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v12");
+    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v13");
     assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v22");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
@@ -320,6 +320,11 @@ describe("router quality, the prompt", () => {
       ["a current fact is read now, never remembered", /A current fact \(the latest or stable version of something, when it was released, which hardware, operating systems or versions it supports\): read it now from the source that states it, never from what you remember/],
       ["the latest version from the release record", /The latest version comes from the project's own release record \(for Kubernetes https:\/\/dl\.k8s\.io\/release\/stable\.txt; for a project released on GitHub its latest release[^\n]*https:\/\/github\.com\/<owner>\/<repo>\/releases\/latest[^\n]*not from a page that lists releases, which can lag behind it/],
       ["support from that version's own matrix", /What a version supports comes from that version's own compatibility matrix or system requirements page: when a page says it describes an older version, read the one for the version you are answering about, and if you cannot, say which version your answer comes from/],
+      // Parity K2 (2026-11-07): "why are these 3 nodes unhealthy" answered from allocation phases (all Ready) and a guess at the page,
+      // without reading any node's health.
+      ["health is read from the health fields", /Why something is unhealthy, failing or marked bad \(nodes on a page or dashboard\): read the health itself, for each one, not only a phase or state \(Ready is not healthy\)/],
+      ["Autopilot node health is node_status", /For Autopilot nodes that is get_metrics with chart node_status \(each node's bad reasons and the age of its last health reading, vk_not_ready\), get_metrics with chart node_health and a range for when it changed, and get_events of each node/],
+      ["a premise that does not hold is said first", /When they show nothing unhealthy now, say in the first line that the premise does not hold now, with what you read/],
       ["progress is read live", /When the user asks how far an item got, what it is doing now, or when it will finish, look now: call work_recall\(item, "live"\)/],
       ["progress is never estimated", /Never work out how far it got or when it ends from when it started or how long it was expected to take/],
       ["progress from what the job wrote now", /files_now, when it is there, is newer than the worker's steps[^\n]*answer from its latest line/],
