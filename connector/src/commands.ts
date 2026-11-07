@@ -7,10 +7,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { AdapterStore, adapterStore, adaptersDir, installAll, pinnedOf, useAdapterStore } from "./adapter-install.js";
 import { fileAudit } from "./audit.js";
 import { ChildRegistry, isAlive, processStart } from "./children.js";
 import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-client.js";
-import { ConfigError, SAMPLE_AGENTS, loadConfig, sampleApprovals, sampleConfig, type Approval, type ConnectorConfig } from "./config.js";
+import { ConfigError, PRESETS, SAMPLE_ACTIVE, SAMPLE_AGENTS, loadConfig, sampleApprovals, sampleConfig, type Approval, type ConnectorConfig } from "./config.js";
 import {
   CredentialsError, DEFAULT_CLIENT_ID, GrantRevokedError, loadCredentials, providerFor, saveCredentials, type Credentials,
 } from "./credentials.js";
@@ -53,6 +54,11 @@ export interface Ctx {
   probe?: ProbeFn;
   /** How `service` runs systemctl/launchctl, which program a unit starts, and where the units go (tests set them). */
   service?: Partial<ServiceDeps>;
+  /**
+   * Install the pinned adapters into the state directory (adapter-install.ts): at init, service install, the start of
+   * run, and when a session needs one. The command line sets it; a test leaves it off, so nothing is downloaded.
+   */
+  installAdapters?: boolean;
 }
 
 /**
@@ -122,6 +128,7 @@ function serverUrl(ctx: Ctx, flag: string | undefined, cfg: ConnectorConfig | nu
 
 export async function main(argv: string[], ctx: Ctx): Promise<number> {
   const [cmd, ...rest] = argv;
+  useAdapterStore(new AdapterStore(adaptersDir(ctx.dirs.state), { autoInstall: ctx.installAdapters === true }));
   try {
     switch (cmd) {
       case undefined: case "help": case "--help": case "-h": ctx.out(HELP); return cmd ? EXIT.ok : EXIT.usage;
@@ -137,7 +144,7 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
         // launchd cannot be told "never restart on 78"; it does not restart a clean exit. The reason was printed.
         return code === EXIT.needsPerson && ctx.env.CLAW_CONNECTOR_SUPERVISOR === "launchd" ? EXIT.ok : code;
       }
-      case "service": return await cmdService(rest, ctx, serviceHelpers);
+      case "service": if (rest[0] === "install") await installAdapters(ctx, false); return await cmdService(rest, ctx, serviceHelpers);
       case "supervise": return await cmdSupervise(rest, ctx);
       case "status": return cmdStatus(rest, ctx);
       case "doctor": return await cmdDoctor(rest, ctx);
@@ -199,6 +206,8 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
     if (!fs.existsSync(dir)) ctx.out(`no Claude Code directory at ${dir}; once you use Claude Code, run: claw-connector hooks install`);
     else installForInit(ctx, dir);
   }
+  // Installed first, so the probe below (and the first phone session) starts the adapter without a download.
+  await installAdapters(ctx, true);
   if (ctx.probe && !values["no-probe"]) {
     try {
       const cfg = loadCfg(ctx);
@@ -228,6 +237,22 @@ async function cmdDoctor(args: string[], ctx: Ctx): Promise<number> {
     for (const l of probeLines(results)) ctx.out(l);
   }
   return ok ? EXIT.ok : EXIT.failure;
+}
+
+/**
+ * `init` and `service install`: install the pinned adapters of the configured agents now, in the foreground, so the
+ * first phone session does not wait for a download. `init` falls back to the sample's enabled presets while the roots
+ * in agents.toml do not exist yet. Only from the command line (`ctx.installAdapters`); a failure is said, not fatal.
+ */
+async function installAdapters(ctx: Ctx, initFallback: boolean): Promise<void> {
+  const store = adapterStore();
+  if (!store || !ctx.installAdapters) return;
+  let agents: Array<{ command: string; args: string[]; env: Record<string, string> }>;
+  try { agents = loadCfg(ctx).agents; } catch {
+    if (!initFallback) return;
+    agents = SAMPLE_ACTIVE.map((id) => ({ command: PRESETS[id]!.command, args: PRESETS[id]!.args, env: {} }));
+  }
+  await installAll(store, agents, ctx.env, (l) => ctx.out(`adapters: ${l}`));
 }
 
 function installForInit(ctx: Ctx, dir: string): void {
@@ -386,6 +411,8 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   const log = stderrLogger();
   const audit = fileAudit(auditFile(ctx.dirs));
   const connector = new Connector({ config: cfg, dirs: ctx.dirs, client, server, audit, log, version: VERSION, timing: ctx.timing });
+  // In the background: the connection to Claw does not wait for a download; a session that needs one does.
+  if (ctx.installAdapters) for (const { pkg, env } of pinnedOf(cfg.agents, ctx.env)) void adapterStore()?.install(pkg, env, (l) => ctx.out(`adapters: ${l}`));
   ctx.onConnector?.(connector);
   ctx.out(`connecting ${cfg.agents.map((a) => (a.unattended ? `${a.id} (no per-step approval)` : a.id)).join(", ")} to ${server} as "${cfg.name}"`);
   for (const n of notes) ctx.out(`note: ${n}`);

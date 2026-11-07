@@ -36,7 +36,7 @@ record it.
   that connector is revoked (`/agent off`, logout, `DELETE .../connectors/:cid`): it then answers 401 `revoked`. The owner is told once,
   through their assistant, which machine was paired and how to disconnect it. New tables `claw_remote_pairings`, `claw_remote_grants`
   (created with the remote-agents schema). The router's `devenv_pair` tool answers "连接我的开发环境" with no machine yet, "add a machine",
-  "pair my laptop" with that command line, said as given; it is never sent by devenv_send or by a report. Router prompt router-devenv-v6.
+  "pair my laptop" with that command line, said as given; it is never sent by devenv_send or by a report. Router prompt router-devenv-v7.
 - Connecting a machine is said with the exact commands, for every client. `GET /v1/remote-agents/setup` gives the connector's npm
   package (`@primusclaw/connector`), the four commands (`npm install -g`, `claw-connector init`, `claw-connector login --server <this
   API's CLAW_PUBLIC_URL> --identity-url <CLAW_CONNECTOR_IDENTITY_URL, else IDENTITY_ISSUER_URL>`, `claw-connector service install`) and
@@ -51,6 +51,12 @@ record it.
   `POST /v1/remote-agents/sessions`, `devenv_send` and a pressed `devenv_send` card answer `409 connector_outdated` with the version
   and the command, instead of a session that fails on the old connector. A connector that reports no version is not refused, and a
   session already open on an old connector continues.
+- The assistant drives development environments from plain words end to end: `devenv_send` takes
+  `new_session` (新开一个会话在 ~/repo 里看看 opens a new session, never an idle one) and reads a folder
+  written with `~` in the home folder the agent's roots are in; the router names a session by when it was
+  last used (切到昨天那个会话), and answers 回到助理 in a chat that is already with it without running anything.
+  `test/e2e/assistant-devenv-eval.ts` measures these sentences, in Chinese and English, against the router's
+  real prompt and tools. Router prompt router-devenv-v6.
 - A development environment session is pushed only when it needs you, finishes or fails, each once: an instruction the assistant sent
   to an agent on your machine says nothing while it works, one message when the agent waits on a permission request (`assistant.say`
   `remote.ask`: the request with its options and when it runs out, for a channel to put to you as buttons), one when it finished, and
@@ -111,6 +117,12 @@ record it.
   while they open the stream on another replica, so a rolling update is neither an offline transition in
   `claw_remote_connector_transitions` nor a reason to tell anyone; a connector that does not come back is offline once the 90 s
   online window has passed, as before. Live releases had shown each connector offline for 2-7 s.
+- A Brain rollout no longer cuts a tool call in flight. A drain used to abort every run at once: Hands killed the foreground command
+  with its request, the run resumed on another replica told the call was interrupted, and the model said so in the chat and ran the
+  command again (one chat turn, cut twice by one rollout, ran its `sleep 90` three times and showed both explanations). A drain now
+  lets a call already in flight finish, for up to `SIGTERM_TOOL_GRACE_MS` (default the foreground ceiling plus 20 s, at most 180 s,
+  inside the chart's 300 s grace), and the resumed run continues from its recorded result. A call still running then is cut as
+  before, and the model is told not to mention the restart.
 - Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
   忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
   not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with

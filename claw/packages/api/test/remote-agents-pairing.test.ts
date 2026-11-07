@@ -189,7 +189,7 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     // The binding is part of the registration's own transaction: what it commits already names the new row.
     const store = await import("../src/remote-agents/store.js");
     const grantId = (await q("SELECT grant_id::text AS id FROM claw_remote_grants")).rows[0].id as string;
-    const row = await store.registerConnector("alice", "laptop", "0.1.6", null, 10, "connector_grant", 90_000, grantId);
+    const row = await store.registerConnector("alice", "laptop", "0.1.6", null, 10, "connector_grant", 90_000, undefined, grantId);
     assert.ok(row);
     assert.equal((await q("SELECT connector_id::text AS c FROM claw_remote_grants WHERE grant_id = $1", [grantId])).rows[0].c, row!.connector_id);
   });
