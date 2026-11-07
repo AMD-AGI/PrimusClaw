@@ -133,6 +133,10 @@ record it.
   by side, so a lookup followed by an answer read as an answer written beside (before) the lookup. History now replays each call, then
   its result, then the turn's text, in the order they ran. The router's answer about what it can do no longer labels any part of
   itself read-only (只读) (`router-read-v11`).
+- Asking the assistant how many nodes SaFE has no longer answers 0 for members who are not administrators. SaFE answers their
+  `node_list` without a workspace with an empty list (200, `totalCount: 0`) rather than a 403, so the answer read "no nodes" while
+  the workspaces they use have several. Brain now reads such an empty answer again per workspace of `user_self`, as it already does
+  for the 403 of `workload_list`, and says which workspaces the count covers; `limit: -1` still returns every node.
 - The brief's SaFE section works for members who are not administrators. SaFE refuses them a workload list across workspaces
   (403), so every such brief said "SaFE 没有回答：safe_http_403". After a 403 the brief now lists the user's own workspaces and reads
   each one (at most 20); a workspace that refuses is left out, and SaFE is unreadable only when every one refuses.
