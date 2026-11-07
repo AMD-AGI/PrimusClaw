@@ -562,7 +562,8 @@ export async function commandsAfter(connectorId: string, cursor: number, limit: 
  *  - `expired`: it reached the connector already older than a command of its kind may be carried out ({@link expiredSql}). One the
  *    connector received in time (`receivedLate` false) and that then waited on the machine, queued behind a long turn or for a
  *    terminal, is never expired: the TTL is for commands that were never collected, not for ones collected in time.
- *  - `gone`: Claw holds no such command for this connector any more (ended by Claw, or never this connector's).
+ *  - `gone`: Claw holds no such command for this connector any more (ended by Claw, or never this connector's), and the connector
+ *    named no session of its own that closed (for one it did, `session_closed`: closing deletes the session's acting commands).
  * `connector_revoked`: the connector was revoked (the route answers it 401 `revoked`, as every connector-side route does).
  *
  * Answered under the connector row's lock, the one a revocation (`revokeIn`) and every queued command (`enqueueCommand`: a `close`,
@@ -580,12 +581,15 @@ const ENDING_COMMAND_TYPES = ["cancel", "close", "withdraw"];
 /**
  * Whether command `cmdId`, which connector `connectorId` received and has not carried out, may still be carried out. `receivedLate`:
  * the connector says the command was already past the live TTL when it came (only then can it be `expired`); `why` is the
- * connector's reason for asking, for the audit trail. An answer about a command Claw holds is audited (`command.confirmed`, or
- * `command.refused_late` with what was refused and why, never the text of a prompt); one about an id it does not hold is not, so
- * the route cannot be used to fill the audit trail.
+ * connector's reason for asking, for the audit trail; `sessionId` the session the connector says the command is of, which answers
+ * about one Claw no longer holds: `session_closed` when that session is this connector's and closed (its acting commands were
+ * deleted with it, {@link dropActingCommandsOf}), else `gone` (a connector naming another of its sessions only refuses its own
+ * command). An answer about a command Claw holds is audited (`command.confirmed`, or `command.refused_late` with what was refused
+ * and why, never the text of a prompt); one about an id it does not hold is not, so the route cannot be used to fill the trail.
  */
 export async function commandLiveness(
-  owner: string, connectorId: string, cmdId: string, client: string | null, ask: { receivedLate: boolean; why: string | null } = { receivedLate: true, why: null },
+  owner: string, connectorId: string, cmdId: string, client: string | null,
+  ask: { receivedLate: boolean; why: string | null; sessionId?: string | null } = { receivedLate: true, why: null },
 ): Promise<{ status: CommandLiveness; cmd_seq: number | null; session_id: string | null }> {
   return inTransaction(async (q) => {
     const conn = (await q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1 FOR UPDATE", [connectorId])).rows[0];
@@ -601,7 +605,14 @@ export async function commandLiveness(
       [connectorId, cmdId, LIVE_COMMAND_TYPES, LIVE_COMMAND_TTL_SECS, ENDING_COMMAND_TYPES],
     )).rows[0];
     let status: CommandLiveness;
-    if (!row) status = "gone";
+    if (!row) {
+      // (The route passes only a uuid.)
+      const closed = ask.sessionId ? (await q(
+        "SELECT 1 FROM claw_remote_sessions WHERE session_id = $1::uuid AND connector_id = $2 AND status <> 'active'",
+        [ask.sessionId, connectorId],
+      )).rows.length > 0 : false;
+      status = closed ? "session_closed" : "gone";
+    }
     else if (ENDING_COMMAND_TYPES.includes(String(row.type))) status = "live";
     else if (row.session_id && row.session_status !== "active") status = "session_closed";
     else if (row.expired && ask.receivedLate) status = "expired";
@@ -622,8 +633,8 @@ export async function commandLiveness(
 /**
  * The commands of a session that would make its agent act ({@link LIVE_COMMAND_TYPES} and `decision`), deleted when the session
  * closes on Claw's side: the person was told it ended, so nothing they sent it before may run after. Its `close` and any `cancel`
- * stay, to be delivered. A connector that already received one (a frame held in a socket while its machine was asleep) asks before
- * it carries it out ({@link commandLiveness}) and is told `session_closed`.
+ * stay, to be delivered. A connector that already received one (a frame held in a socket while its machine was asleep, or one
+ * queued behind a turn) asks before it carries it out ({@link commandLiveness}) and, naming the session, is told `session_closed`.
  */
 async function dropActingCommandsOf(q: Querier, sessionIds: string[]): Promise<void> {
   if (!sessionIds.length) return;

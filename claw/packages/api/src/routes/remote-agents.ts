@@ -466,7 +466,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       await store.markStreamOpen(cid, streamConn);
       return serveSse(req, reply, waker, timing, {
         key: `c:${cid}`,
-        first: [sseFrame("ready", { v: REMOTE_AGENT_PROTOCOL_VERSION, connector_id: cid, server_time: new Date().toISOString() })],
+        // `ping_ms`: how often this stream pings, so a connector can tell a stream the network holds from a quiet one.
+        first: [sseFrame("ready", { v: REMOTE_AGENT_PROTOCOL_VERSION, connector_id: cid, server_time: new Date().toISOString(), ping_ms: pingMs })],
         pingFrame: () => sseFrame("ping", { t: Date.now() }),
         // A Claw release: reconnect now (to another replica), not after a backoff. Its connector stays online meanwhile.
         closingFrame: () => { endReason = "restart"; return sseFrame("reconnect", { connector_id: cid }); },
@@ -507,7 +508,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
    * can sit in a buffer through that, and the person may meanwhile have closed the session or removed the machine and been told
    * so. Answered with the command's status (`store.commandLiveness`); only `live` may run. A revoked connector gets 401 `revoked`,
    * as on every connector-side route. The body (optional): `received_late` (boolean; the command was past the live TTL when it
-   * came, the only case it can be `expired`; taken as true when absent) and `why` (the connector's reason, for the audit trail).
+   * came, the only case it can be `expired`; taken as true when absent), `why` (the connector's reason, for the audit trail) and
+   * `session_id` (the command's session: once that closed, Claw no longer holds the command, and answers `session_closed`, not
+   * `gone`, only when told whose it was).
    */
   app.post<{ Params: { cid: string; cmd_id: string } }>(CONNECTOR_SIDE_ROUTES.confirm.url, async (req, reply) => {
     const owner = requireOwner(req, reply, "connector");
@@ -518,11 +521,12 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (typeof cmdId !== "string" || cmdId.length < 1 || cmdId.length > 128 || /[\u0000-\u001f\u007f]/u.test(cmdId)) {
       return fail(reply, 400, "invalid_cmd_id");
     }
-    const body = (req.body ?? {}) as { received_late?: unknown; why?: unknown };
+    const body = (req.body ?? {}) as { received_late?: unknown; why?: unknown; session_id?: unknown };
     if (typeof body !== "object" || Array.isArray(body)) return fail(reply, 400, "invalid_body");
     const receivedLate = body.received_late !== false;
     const why = typeof body.why === "string" && /^[a-z_]{1,32}$/u.test(body.why) ? body.why : null;
-    const r = await store.commandLiveness(owner, connector.connector_id as string, cmdId, clientLabel(req), { receivedLate, why });
+    const sessionId = parseRemoteId(body.session_id);
+    const r = await store.commandLiveness(owner, connector.connector_id as string, cmdId, clientLabel(req), { receivedLate, why, sessionId });
     // Revoked between the check above and the lock the answer is given under.
     if (r.status === "connector_revoked") return fail(reply, 401, "revoked");
     if (r.status !== "live") logger.info({ owner, connectorId: connector.connector_id, cmdSeq: r.cmd_seq, status: r.status }, "remote_agents.command_refused_late");

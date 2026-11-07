@@ -25,6 +25,8 @@ export class FakeClaw {
   readonly revokedIds = new Set<string>();
   pingMs = 100;
   muted = false;
+  /** The `ready` frame says how often this Claw pings (`ping_ms`), as the real one does; false: a Claw from before that. */
+  readyPingMs = true;
   /** Answer the next N event posts with 503. */
   failPosts = 0;
   /** Answer the next N requests, whatever they are, with 503. */
@@ -145,13 +147,18 @@ export class FakeClaw {
   get revoked(): boolean { return this.revokedIds.has(this.connectorId); }
   set revoked(v: boolean) { if (v) this.revokedIds.add(this.connectorId); else this.revokedIds.delete(this.connectorId); }
 
-  /** As Claw judges a command a connector asks about: live while held and its session open (`store.commandLiveness`). */
-  liveness(cmdId: string): string {
+  /**
+   * As Claw judges a command a connector asks about: live while held and its session open (`store.commandLiveness`). Claw deletes
+   * the acting commands of a session it closes, so it answers `session_closed` for one only when the connector names the session.
+   */
+  liveness(cmdId: string, sessionId?: unknown): string {
     const set = this.commandStatus.get(cmdId);
     if (set) return set;
     const c = this.commands.find((x) => x.payload.cmd_id === cmdId);
     if (!c || c.seq <= this.cursor) return "gone";
-    if (this.closedSessions.has(String(c.payload.session_id)) && c.payload.type !== "close" && c.payload.type !== "cancel") return "session_closed";
+    if (this.closedSessions.has(String(c.payload.session_id)) && c.payload.type !== "close" && c.payload.type !== "cancel") {
+      return sessionId === c.payload.session_id ? "session_closed" : "gone";
+    }
     return "live";
   }
 
@@ -226,11 +233,12 @@ export class FakeClaw {
       if (this.revokedIds.has(cf[1]!)) return this.json(res, 401, { ok: false, error: "revoked" });
       if (cf[1] !== this.connectorId) return this.json(res, 404, { ok: false, error: "not_found" });
       const cmdId = decodeURIComponent(cf[2]!);
-      this.confirmBodies.push({ cmd_id: cmdId, body: await this.readBody(req) });
+      const body = await this.readBody(req);
+      this.confirmBodies.push({ cmd_id: cmdId, body });
       this.confirmAsked.push(cmdId);
       this.wake();
       const answer = () => {
-        const status = this.liveness(cmdId);
+        const status = this.liveness(cmdId, (body as { session_id?: unknown } | null)?.session_id);
         this.confirmations.push({ cmd_id: cmdId, status });
         this.wake();
         try { this.json(res, 200, { ok: true, data: { cmd_id: cmdId, status } }); } catch { /* the connector went */ }
@@ -293,7 +301,7 @@ export class FakeClaw {
           else if (!readySent) { readySent = true; res.write(chunk); } else out(chunk);
         };
         if (!released) setTimeout(() => { released = true; if (!res.destroyed) for (const c of held) res.write(c); }, delay);
-        write(`event: ready\ndata: ${JSON.stringify({ v: 1, connector_id: this.connectorId, server_time: new Date().toISOString() })}\n\n`);
+        write(`event: ready\ndata: ${JSON.stringify({ v: 1, connector_id: this.connectorId, server_time: new Date().toISOString(), ...(this.readyPingMs ? { ping_ms: this.pingMs } : {}) })}\n\n`);
         this.streams.add(res);
         res.on("close", () => { this.streams.delete(res); this.wake(); });
         let sent = 0;

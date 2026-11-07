@@ -25,6 +25,10 @@ import { ADAPTER, onCleanup, tmpdir } from "./support/harness.js";
 const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "cli.ts");
 /** How long the network holds what Claw sends: as the verifier's probe, well inside the 75 s watchdog and the 90 s online window. */
 const HOLD_MS = Number(process.env.HOLD_MS ?? 20_000);
+/** A hold well inside a heartbeat (30 s) and the watchdog: the verifier's ~10 s, nothing but missed pings to see it by. */
+const HOLD_SHORT_MS = 9_500;
+/** How long the running turn goes on into the hold: past the stand-in Claw's ping (200 ms) plus `transitMs` (3 s). */
+const QUIET_TURN_MS = 5_000;
 
 /** A TCP proxy; while held, the bytes from Claw to the connector are queued and then delivered in order (TCP retransmission). */
 async function proxy(target: number) {
@@ -142,6 +146,50 @@ describe("a command frame held in the network while the connector keeps running"
     await sleep(500);
     assert.deepEqual(received(m), []);
     assert.deepEqual(audit(m).filter((r) => r.kind === "turn_started"), []);
+  });
+
+  test("a prompt that came on time and waits behind a turn, while the stream is held and its session closed: refused, not run", async () => {
+    // The bypass found after #469 (2026-11-07): P2 came on time and queued behind a long turn; then the network held every byte
+    // from Claw for ~10 s, the process running all along, and the person closed the session. No stall, no late heartbeat (one
+    // every 30 s), no late frame, no reconnect: the turn ended and P2 ran without asking. Now a stream that misses its pings (Claw
+    // pings every `ping_ms`, 200 ms here) for longer than that plus `transitMs` (3 s) is network trouble, and P2 is asked about.
+    const m = await machine();
+    const sid = await openSession(m);
+    const flag = path.join(m.work, "turn-done");
+    m.claw.issue("prompt", sid, { text: `wait ${flag}` });
+    await m.claw.until("the long turn running", () => received(m).includes(`wait ${flag}`), 15_000);
+    const seq = m.claw.issue("prompt", sid, { text: "ls" });
+    const cmd = String(m.claw.commands.find((c) => c.seq === seq)!.payload.cmd_id);
+    await m.claw.until("P2 read, queued behind the turn", () => audit(m).some((r) => r.kind === "command" && r.cmd_id === cmd), 10_000);
+    m.px.hold();
+    const heldAt = Date.now();
+    m.claw.closedSessions.add(sid); // /agent close: Claw closed it and told the person; the frames saying so are held
+    await sleep(QUIET_TURN_MS);
+    fs.writeFileSync(flag, ""); // the turn ends: P2 is about to reach the agent
+    await sleep(Math.max(0, HOLD_SHORT_MS - (Date.now() - heldAt)));
+    assert.deepEqual(received(m).filter((p) => p === "ls"), [], "P2 did not run while the stream was held");
+    m.px.release();
+    const rejected = await m.claw.until("P2 refused in the session", () => m.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_id === cmd), 20_000);
+    assert.deepEqual([rejected.data.reason, rejected.data.status], ["command_not_live", "session_closed"]);
+    assert.deepEqual(m.claw.confirmations, [{ cmd_id: cmd, status: "session_closed" }]);
+    assert.deepEqual(m.claw.confirmBodies.map((c) => [c.cmd_id, c.body.why, c.body.received_late, c.body.session_id]), [[cmd, "network", false, sid]]);
+    assert.ok(audit(m).some((r) => r.kind === "network_trouble" && r.reason === "stream_quiet"));
+    await sleep(500);
+    assert.deepEqual(received(m).filter((p) => p === "ls"), []);
+  });
+
+  test("a prompt that came on time and waits behind a turn while pings keep coming runs when the turn ends, with no question to Claw", async () => {
+    const m = await machine();
+    const sid = await openSession(m);
+    const flag = path.join(m.work, "turn-done");
+    m.claw.issue("prompt", sid, { text: `wait ${flag}` });
+    await m.claw.until("the long turn running", () => received(m).includes(`wait ${flag}`), 15_000);
+    m.claw.issue("prompt", sid, { text: "queued on time" });
+    await sleep(QUIET_TURN_MS); // as long as the held case waits, the stream moving
+    fs.writeFileSync(flag, "");
+    await m.claw.until("the queued prompt run", () => received(m).includes("queued on time"), 15_000);
+    assert.deepEqual(m.claw.confirmAsked, [], "nothing late, nothing asked");
+    assert.deepEqual(audit(m).filter((r) => r.kind === "network_trouble"), []);
   });
 
   test("a prompt that comes promptly runs at once, with no question to Claw", async () => {
