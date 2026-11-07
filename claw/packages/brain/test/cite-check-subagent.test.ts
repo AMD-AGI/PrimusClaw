@@ -96,7 +96,9 @@ function routerOver(file: string | null) {
       if (file === null) return { text: `Error: ENOENT: no such file or directory, stat '${String(input.path)}'`, isError: false };
       if (file === "BIG") return { text: "[note] 1 file(s) over 8 MB not searched.", isError: false };
       const re = new RegExp(String(input.pattern), input.case_sensitive ? "" : "i");
-      return { text: file.split("\n").some((l) => re.test(l)) ? String(input.path) : "(no matches)", isError: false };
+      const n = file.split("\n").filter((l) => re.test(l)).length;
+      // As Hands answers a count: the path relative to the workspace, a colon and the number of matching lines.
+      return { text: n ? `${String(input.path).replace(/^\/workspace\//, "")}:${n}` : "(no matches)", isError: false };
     },
   } as unknown as HandsClient;
   return { router: new ToolRouter(hands), searches };
@@ -110,6 +112,14 @@ test("CS2 deliver_file of a cited report is refused; other files are not refused
   assert.equal(await report.router.route("deliver_file", { path: "/workspace/report.md" }, undefined, outcome), CITED_FILE_REFUSAL);
   assert.equal(outcome.isError, true);
   assert.equal(report.searches.length, 2, "the whole file is searched for a list of sources and for a citation");
+
+  // A name that looks like a note is still the file's.
+  const bracket = routerOver(REPORT);
+  bracket.router.citeCheck = check;
+  assert.equal(await bracket.router.route("deliver_file", { path: "/workspace/[1].md" }, undefined, { isError: false }), CITED_FILE_REFUSAL);
+  const noted = routerOver(REPORT);
+  noted.router.citeCheck = check;
+  assert.equal(await noted.router.route("deliver_file", { path: "/workspace/[note] 1 file.md" }, undefined, { isError: false }), CITED_FILE_REFUSAL);
 
   // Past any read limit, and under another extension: still the same report.
   const long = routerOver(["vLLM supports MI300X [1].", ...Array.from({ length: 5000 }, (_, i) => `filler ${i}`), `[1]: vLLM on ROCm — ${A}`].join("\n"));

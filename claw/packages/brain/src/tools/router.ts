@@ -501,8 +501,8 @@ export class ToolRouter {
   }
 
   /**
-   * Whether the sandbox file at `path` is a cited report: the sandbox's own `grep` (which reads the whole file) finds both a line of a
-   * list of sources and a line that cites a number (`CITED_FILE_PATTERNS`). A file the search cannot read is not one: `deliver_file`
+   * Whether the sandbox file at `path` is a cited report: the sandbox's own `grep` (which reads the whole file) counts both a line of
+   * a list of sources and a line that cites a number (`CITED_FILE_PATTERNS`). A file the search cannot read is not one: `deliver_file`
    * then answers for it as it would.
    */
   private async sandboxFileIsCitedReport(path: string, signal?: AbortSignal): Promise<boolean> {
@@ -510,13 +510,13 @@ export class ToolRouter {
       const found: RouteOutcome = { isError: false };
       let text: string;
       try {
-        text = await this.routeAllowed("grep", { pattern, path, output_mode: "files_with_matches", case_sensitive: true }, signal, found);
+        text = await this.routeAllowed("grep", { pattern, path, output_mode: "count", case_sensitive: true }, signal, found);
       } catch {
         return false;
       }
-      // A match is the file's path on a line of its own; a note (a file too large to search, a scan cut short) or a refusal is not.
-      const matched = text.split("\n").map((l) => l.trim()).some((l) =>
-        l !== "" && l !== "(no matches)" && !l.startsWith("[") && !l.includes("[scan aborted") && !/^(Error|Invalid|Pattern)\b/.test(l));
+      // A match is the file's count line, `<path>:<n>` with n > 0, whatever the path's name; no note (a file too large to search, a
+      // scan cut short) ends that way. A refusal that did is read as a match: the file then goes through deliver_text, never unchecked.
+      const matched = text.split("\n").some((l) => Number(l.trim().match(/.:(\d+)$/)?.[1] ?? 0) > 0);
       if (found.isError || !matched) return false;
     }
     return true;
