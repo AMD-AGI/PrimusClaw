@@ -43,7 +43,7 @@ describe("pairing a machine with a one-time code", { skip }, () => {
       return authMiddleware(req, reply);
     });
     await registerRemoteAgentRoutes(app, {
-      pingMs: 150, pollMs: 40, retentionDays: 0, presenceSweepMs: 0, pairing: { publicUrl: SERVER, claimsPerMinute: 1000, codesPerMinute: 1000, wrongClaimDelayMs: 0 },
+      pingMs: 150, pollMs: 40, retentionDays: 0, presenceSweepMs: 0, pairing: { publicUrl: SERVER, claimsPerMinute: 1000, codesPerMinute: 1000 },
     });
     await app.listen({ port: 0, host: "127.0.0.1" });
     base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
@@ -225,7 +225,7 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     const limited = Fastify();
     limited.addHook("preHandler", async (req) => { (req as any).user = { userId: "carol", userName: "carol", platformKey: "", virtualKey: "", roles: ["default"] }; });
     const { registerPairingRoutes } = await import("../src/remote-agents/pairing-routes.js");
-    await registerPairingRoutes(limited, { publicUrl: SERVER, claimsPerMinute: 2, codesPerMinute: 2, wrongClaimDelayMs: 50 });
+    await registerPairingRoutes(limited, { publicUrl: SERVER, claimsPerMinute: 2, codesPerMinute: 2 });
     // As the ingress passes requests on: it appends the address it saw to whatever X-Forwarded-For the caller sent.
     const inject = (url: string, payload: unknown, chain = "203.0.113.7") =>
       limited.inject({ method: "POST", url, payload: payload as object, headers: { "x-forwarded-for": chain } });
@@ -236,9 +236,7 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     await assert.rejects(pairing.createPairing("carol", null, new Date(), 2), pairing.PairingRateLimited);
     // An attacker writes the victim's address first; the ingress appends the attacker's own. Their wrong claims fill their own key...
     const forged = "198.51.100.9, 203.0.113.66";
-    const t0 = Date.now();
     assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" }, forged)).statusCode, 400);
-    assert.ok(Date.now() - t0 >= 45, "a wrong claim is answered only after the delay");
     assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" }, forged)).statusCode, 400);
     assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" }, forged)).statusCode, 429);
     // ...and never the victim's, whose chain ends with the address the ingress saw for them.
@@ -293,6 +291,24 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     await q("DELETE FROM claw_remote_connectors WHERE connector_id = $1", [c2]);
     const r = await register(t2, "box");
     assert.deepEqual([r.status, r.body.error], [401, "revoked"]);
+  });
+
+  test("P11 what claims may spend is bounded apart from their keys: the table of callers, and claims at the database at once", async () => {
+    const routes = await import("../src/remote-agents/pairing-routes.js");
+    const w = routes.failureWindow(1, 3);
+    for (let i = 0; i < 10; i++) w.count(`k${i}`, 1_000);
+    assert.equal(w.size(), 3, "made-up keys do not grow the table past its bound");
+    assert.ok(w.full("k9", 1_000) && !w.full("k0", 1_000), "the oldest went first");
+    const gate = new routes.Gate(1, 1);
+    assert.equal(await gate.enter(), true);
+    let second = false;
+    const waiting = gate.enter().then((v) => { second = v; });
+    assert.equal(await gate.enter(), false, "beyond the queue: refused (busy), not waited for");
+    gate.leave();
+    await waiting;
+    assert.equal(second, true, "the waiting one goes in when one leaves");
+    gate.leave();
+    assert.equal(await gate.enter(), true);
   });
 
   test("P8 codes are read as typed: case, dashes and the letters base32 reads as digits", () => {

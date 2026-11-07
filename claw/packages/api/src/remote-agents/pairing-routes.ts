@@ -11,10 +11,11 @@
  * with a right code is never held back by anyone else's wrong ones. The caller is the whole forwarded chain as received together
  * with the socket address (`callerKey`): behind the ingress the socket address alone is the ingress's own hop, which everyone
  * shares, and the first `X-Forwarded-For` entry alone is whatever the caller wrote. A proxy that appends puts the caller's real
- * address at the end of the chain and one that overwrites leaves only it, so nobody can make their key another caller's (short of
- * sharing their address). A caller can make up new keys by varying the entries it writes: what bounds guessing is the code (60
- * bits, ten minutes, one claim), and each wrong claim is answered only after {@link WRONG_CLAIM_DELAY_MS}. There is no ceiling
- * shared by all callers: it would be one more way to lock everyone out.
+ * address at the end of the chain and one that overwrites leaves only it, so nobody can make their key another caller's. A caller
+ * can make up new keys by varying the entries it writes, so what this process spends on claims is bounded apart from the keys:
+ * the table of keys holds at most {@link MAX_CALLERS} (the oldest go first), and at most {@link CLAIM_CONCURRENCY} claims reach the
+ * database at once, with at most {@link CLAIM_QUEUE} waiting; beyond that a claim is answered `503 busy`, which passes once the
+ * flood does. What bounds guessing is the code (60 bits, ten minutes, one claim).
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import pino from "pino";
@@ -31,17 +32,25 @@ export interface PairingRouteOptions {
   publicUrl?: string;
   /** Wrong claims one caller may make per minute. */
   claimsPerMinute?: number;
-  /** How long a wrong claim waits before it is answered. */
-  wrongClaimDelayMs?: number;
+  /** Claims that reach the database at once, and claims that may wait for that. */
+  claimConcurrency?: number;
+  claimQueue?: number;
   /** Codes one person may ask for per minute. */
   codesPerMinute?: number;
 }
 
 const CLAIM_PER_MINUTE = 10;
-export const WRONG_CLAIM_DELAY_MS = 500;
+export const MAX_CALLERS = 10_000;
+export const CLAIM_CONCURRENCY = 4;
+export const CLAIM_QUEUE = 64;
 
-/** Failures counted in a fixed one-minute window per key, in this process: `full(key)` before, `count(key)` after a failure. */
-function failureWindow(perMinute: number): { full: (key: string, now?: number) => boolean; count: (key: string, now?: number) => void } {
+/**
+ * Failures counted in a fixed one-minute window per key, in this process: `full(key)` before, `count(key)` after a failure. At most
+ * `maxKeys` keys are kept: past that, expired windows go, then the oldest.
+ */
+export function failureWindow(perMinute: number, maxKeys: number = MAX_CALLERS): {
+  full: (key: string, now?: number) => boolean; count: (key: string, now?: number) => void; size: () => number;
+} {
   const seen = new Map<string, { start: number; n: number }>();
   const live = (key: string, now: number) => {
     const w = seen.get(key);
@@ -50,11 +59,34 @@ function failureWindow(perMinute: number): { full: (key: string, now?: number) =
   return {
     full: (key, now = Date.now()) => (live(key, now)?.n ?? 0) >= perMinute,
     count: (key, now = Date.now()) => {
-      if (seen.size > 10_000) for (const [k, v] of seen) if (now - v.start >= 60_000) seen.delete(k);
       const w = live(key, now);
-      if (w) w.n += 1; else seen.set(key, { start: now, n: 1 });
+      if (w) { w.n += 1; return; }
+      seen.delete(key);
+      if (seen.size >= maxKeys) {
+        for (const [k, v] of seen) if (now - v.start >= 60_000) seen.delete(k);
+        for (const k of seen.keys()) { if (seen.size < maxKeys) break; seen.delete(k); }
+      }
+      seen.set(key, { start: now, n: 1 });
     },
+    size: () => seen.size,
   };
+}
+
+/** At most `concurrency` holders at once and `queue` waiting; `enter` answers false when the queue is full too. */
+export class Gate {
+  private active = 0;
+  private readonly waiting: Array<() => void> = [];
+  constructor(private readonly concurrency: number, private readonly queue: number) {}
+  async enter(): Promise<boolean> {
+    if (this.active < this.concurrency) { this.active += 1; return true; }
+    if (this.waiting.length >= this.queue) return false;
+    await new Promise<void>((r) => this.waiting.push(r));
+    return true;
+  }
+  leave(): void {
+    const next = this.waiting.shift();
+    if (next) next(); else this.active -= 1;
+  }
 }
 
 /** Who is claiming, as far as this process can tell (see the module's comment): the forwarded chain and the socket address. */
@@ -74,7 +106,7 @@ function clientLabel(req: FastifyRequest): string | null {
 
 export async function registerPairingRoutes(app: FastifyInstance, opts: PairingRouteOptions = {}): Promise<void> {
   const perCaller = failureWindow(opts.claimsPerMinute ?? CLAIM_PER_MINUTE);
-  const wrongDelay = opts.wrongClaimDelayMs ?? WRONG_CLAIM_DELAY_MS;
+  const gate = new Gate(opts.claimConcurrency ?? CLAIM_CONCURRENCY, opts.claimQueue ?? CLAIM_QUEUE);
   const server = (opts.publicUrl ?? process.env.CLAW_PUBLIC_URL ?? "").trim().replace(/\/+$/, "");
 
   app.post("/v1/remote-agents/pairings", async (req, reply) => {
@@ -102,10 +134,11 @@ export async function registerPairingRoutes(app: FastifyInstance, opts: PairingR
     const caller = callerKey(req);
     if (perCaller.full(caller)) return fail(reply, 429, "rate_limited");
     const body = (req.body ?? {}) as { code?: unknown; name?: unknown };
-    const out = await claimPairing(body.code, body.name);
+    if (!(await gate.enter())) return fail(reply, 503, "busy");
+    let out: Awaited<ReturnType<typeof claimPairing>>;
+    try { out = await claimPairing(body.code, body.name); } finally { gate.leave(); }
     if (!out.ok) {
       perCaller.count(caller);
-      if (wrongDelay > 0) await new Promise((r) => setTimeout(r, wrongDelay));
       return fail(reply, 400, out.error);
     }
     logger.info({ owner: out.owner, grantId: out.grantId }, "remote_agents.pairing_claimed");

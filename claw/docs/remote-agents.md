@@ -218,8 +218,9 @@ the folder the command was run in), saves the answer's grant (mode 0600) and sta
   per person, by any route (the HTTP route and the assistant's `devenv_pair`; counted from the audit trail). Wrong claims are
   throttled per caller: the whole `X-Forwarded-For` chain as received together with the socket address (behind the ingress the
   socket address alone is the ingress's, shared by everyone, and the first entry alone is the caller's say; the chain ends with the
-  address the proxy saw). 10 a minute, only failures count, and each wrong claim is answered after 500 ms, so nobody's wrong codes
-  lock out a right one; there is no ceiling shared by all callers. Without `CLAW_PUBLIC_URL` there is no command to give: `503 pairing_unavailable`.
+  address the proxy saw). 10 a minute, only failures count, so nobody's wrong codes lock out a right one. What
+  a flood of made-up keys can spend is bounded apart from the keys: at most 10,000 callers are remembered (oldest first out), and at
+  most 4 claims reach the database at once with 64 waiting; beyond that `503 busy`, which passes with the flood. Without `CLAW_PUBLIC_URL` there is no command to give: `503 pairing_unavailable`.
 - **Grant**: `cpg_` and 43 base64url characters, stored as its SHA-256 (`claw_remote_grants`). The global auth hook judges a
   `Bearer cpg_...` before every other credential path, so it never reaches SaFE or the identity provider. It authenticates as the
   person, with the `default` role, on the connector-side routes and nowhere else (anything else: `403 connector_grant_not_accepted`).
