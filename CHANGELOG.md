@@ -113,7 +113,8 @@ record it.
 ### Fixed
 - A router turn that has read text Claw did not write is refused other writes with a message that no longer names `work_recall`
   whatever it read, and, where development environments are on, says what it may still do: put the attach command of the user's own
-  session, or of an agent on their own online machine (which starts a new session there), as a button, and `devenv_send` as a card.
+  session, or of an agent on their own online machine (its newest open session, or a new one when it has none), as a button, and
+  `devenv_send` as a card (`new_session: true` for a new session even when one is open).
   After a `devenv_list`, the old wording sent the router looking for a read it never made, and it told the user it could not open a
   session on their own machine (2026-11-07 daily gaps, N9).
 - A worker asked to make a write (push a branch and open a pull request, post a comment) makes it when it gets there and lets the hold
