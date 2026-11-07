@@ -208,6 +208,16 @@ never reported. Nothing is said about a connector its owner revoked, one replace
 online connector of the same name, or one that was already offline when presence was
 first recorded for it. Transitions are kept as long as closed sessions are (Retention).
 
+**A terminal that waits for its person.** A connector reports what each conversation a terminal
+holds open is doing there (`capabilities.resumable`, `state: "live"`, `activity`: `working`,
+`waiting`, `idle`, and with `waiting` its `waiting_for`). On the same 15 s sweep, a conversation
+that has been `waiting` for a minute, counted from when the sweep first saw it wait, on a machine
+that is online, is said once to its owner through their assistant: the machine, the agent, what it
+waits for and the conversation's title. Someone at that terminal answers within the minute and is
+never told; working and finishing in a terminal are never pushed (the person there sees them). The
+episode ends when the conversation stops waiting or its machine goes offline, and a later wait is
+told again once (`claw_remote_terminal_waits`).
+
 ## User side
 
 | Route | Purpose |

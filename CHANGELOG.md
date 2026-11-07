@@ -28,6 +28,9 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A conversation open in a terminal on your machine that has waited a minute for you (Claude Code's own "waiting": a permission or a
+  question) is pushed once through your assistant: the machine, the agent, what it waits for and the conversation's title. Answered at
+  the terminal within the minute, it is never pushed; a terminal working or finishing is never pushed. A later wait is told again once.
 - A development environment session is pushed only when it needs you, finishes or fails, each once: an instruction the assistant sent
   to an agent on your machine says nothing while it works, one message when the agent waits on a permission request (`assistant.say`
   `remote.ask`: the request with its options and when it runs out, for a channel to put to you as buttons), one when it finished, and
