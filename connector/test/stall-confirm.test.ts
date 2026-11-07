@@ -13,26 +13,29 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import test, { after, describe } from "node:test";
+import test, { describe } from "node:test";
 import { fileURLToPath } from "node:url";
 import { REMOTE_AGENT_TIMING } from "../src/protocol.js";
 import { processStart } from "../src/children.js";
 import { sleep } from "../src/util.js";
 import { FakeClaw } from "./support/fake-claw.js";
-import { ADAPTER, Harness, tmpdir } from "./support/harness.js";
+import { ADAPTER, Harness, onCleanup, tmpdir } from "./support/harness.js";
 
 const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "cli.ts");
 /** Longer than the connector's `stallMs` (5 s by default), as a closed lid is. */
 const STOPPED_MS = 6_500;
 
 interface Machine { claw: FakeClaw; child: ChildProcess; home: string; work: string; log: string; exited: Promise<number | null> }
-const machines: Machine[] = [];
-after(async () => {
-  for (const m of machines) {
-    if (processStart(m.child.pid!) !== null) { try { process.kill(m.child.pid!, "SIGCONT"); } catch { /* gone */ } m.child.kill("SIGKILL"); }
-    await m.claw.close();
+/** The connector process ended (continued first if it is still stopped), and its stand-in Claw closed, before its home goes. */
+async function shutDown(m: Machine): Promise<void> {
+  if (processStart(m.child.pid!) !== null) {
+    try { process.kill(m.child.pid!, "SIGCONT"); } catch { /* gone */ }
+    m.child.kill("SIGTERM");
+    if (await Promise.race([m.exited.then(() => true), sleep(10_000).then(() => false)]) === false) m.child.kill("SIGKILL");
   }
-});
+  await Promise.race([m.exited, sleep(5_000)]);
+  await m.claw.close();
+}
 
 /** The real `claw-connector run` in its own process, signed in with a key, its agent the stand-in adapter that logs each prompt. */
 async function machine(): Promise<Machine> {
@@ -61,7 +64,7 @@ FAKE_LOG = ${JSON.stringify(log)}
   const child = spawn(process.execPath, ["--import", "tsx", cli, "run"], { env, stdio: "ignore" });
   const exited = new Promise<number | null>((resolve) => child.once("exit", (code) => resolve(code)));
   const m = { claw, child, home, work, log, exited };
-  machines.push(m);
+  onCleanup(() => shutDown(m));
   await claw.until("the connector online", () => claw.online && claw.heartbeats.length > 0, 30_000);
   return m;
 }
@@ -149,11 +152,8 @@ describe("a command held in the socket while the connector was stopped", { timeo
 });
 
 describe("a command older than the live TTL", () => {
-  const hs: Harness[] = [];
-  after(async () => { for (const h of hs) await h.close(); });
   test("is confirmed first, whatever the stall clock says: expired is dropped, live runs", async () => {
     const h = await Harness.create();
-    hs.push(h);
     const sid = await h.newSession();
     const old = Date.now() - REMOTE_AGENT_TIMING.liveCommandTtlMs - 60_000;
     const stale = h.prompt(sid, "stale", { issued_at: old, cmd_id: "c-stale" });
@@ -172,7 +172,6 @@ describe("a command older than the live TTL", () => {
   });
   test("a close or a cancel is never held up by a question", async () => {
     const h = await Harness.create();
-    hs.push(h);
     const sid = await h.newSession();
     h.claw.issue("close", sid, { issued_at: 1 });
     await h.claw.until("closed", () => h.claw.eventsOf(sid, "session_closed")[0]);
