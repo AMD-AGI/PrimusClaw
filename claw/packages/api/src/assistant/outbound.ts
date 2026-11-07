@@ -714,7 +714,7 @@ interface HeldWrite { kind?: string; attention_seq?: number; action?: string; de
  * now, or the hold predates these words.
  */
 /** The write the item's worker holds for the person now, as `holds.ts` recorded it, or null. */
-function currentHeldWrite(item: ItemRow, params: Record<string, unknown> | null): HeldWrite | null {
+function currentHeldWrite(item: Pick<ItemRow, "board_state" | "attention_seq">, params: Record<string, unknown> | null): HeldWrite | null {
   if (item.board_state !== "needs_you") return null;
   const holds = (Array.isArray(params?.holds) ? params!.holds : []) as HeldWrite[];
   const current = holds.filter((h) => h && h.kind === "approval" && Number(h.attention_seq) === Number(item.attention_seq) && h.action);
@@ -734,7 +734,8 @@ function heldWriteCard(item: ItemRow, params: Record<string, unknown> | null, wo
   };
 }
 
-function heldWriteText(item: ItemRow, params: Record<string, unknown> | null): string | null {
+/** Exported for its test: the text the person reads for a held write (`approval-target.test.ts`). */
+export function heldWriteText(item: Pick<ItemRow, "seq" | "title" | "board_state" | "attention_seq">, params: Record<string, unknown> | null): string | null {
   const h = currentHeldWrite(item, params);
   if (!h) return null;
   const until = h.expires_at ? new Date(h.expires_at) : null;
