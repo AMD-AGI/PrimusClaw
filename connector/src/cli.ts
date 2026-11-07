@@ -7,6 +7,11 @@ import { main } from "./commands.js";
 import { resolveDirs } from "./paths.js";
 import type { Connector } from "./connector.js";
 import { probeAgents } from "./probe.js";
+import { inheritSystemCa, trustSystemCAs } from "./system-ca.js";
+
+// Before any connection: trust the CAs this machine trusts as well as Node's own list (system-ca.ts), and hand the same
+// trust to the processes the connector starts.
+inheritSystemCa(process.env, trustSystemCAs(process.env));
 
 let connector: Connector | null = null;
 
