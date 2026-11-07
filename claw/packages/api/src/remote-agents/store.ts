@@ -10,9 +10,10 @@
  */
 import { randomUUID } from "node:crypto";
 import { db, inTransaction, type Querier } from "../infra/db.js";
+import { redactPublicJson } from "../events/redaction.js";
 import {
   REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES,
-  REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED,
+  REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED, REMOTE_EVENT_USER_PROMPT,
   type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteEventRejection, type RemoteHeartbeat,
 } from "@claw/protocol";
 
@@ -22,6 +23,10 @@ export type Row = Record<string, any>;
 let commandWaker: (connectorId: string) => void = () => {};
 export function setCommandWaker(wake: (connectorId: string) => void): void { commandWaker = wake; }
 export function wakeConnector(connectorId: string): void { commandWaker(connectorId); }
+
+/** Wakes this replica's readers of a session's events (`routes/remote-agents.ts` sets it); others poll within seconds. */
+let sessionWaker: (sessionId: string) => void = () => {};
+export function setSessionWaker(wake: (sessionId: string) => void): void { sessionWaker = wake; }
 
 const direct: Querier = (text, params) => db.query(text, params);
 const secs = (ms: number) => ms / 1000;
@@ -248,6 +253,14 @@ export async function revokeConnector(
  * closes once).
  */
 export const REVOKED_CLOSE_SEQ = -Number.MAX_SAFE_INTEGER;
+
+/**
+ * The `seq` of the `user_prompt` Claw writes for the prompt it queued as command `cmdSeq` ({@link issueCommand}): negative, so it
+ * never meets a connector's own numbering; offset by 2^52, so it never meets the `-cmd_seq` of the `turn_end` that
+ * `expireUndelivered` may write for the same prompt; above {@link REVOKED_CLOSE_SEQ}; one per prompt.
+ */
+export const USER_PROMPT_SEQ_OFFSET = 2 ** 52;
+export const userPromptSeq = (cmdSeq: number): number => -(USER_PROMPT_SEQ_OFFSET + cmdSeq);
 
 /** Why Claw closed a session whose connector was revoked: `replaced` when the same machine registered again in its place. */
 export const SESSION_CLOSED_CONNECTOR_REVOKED = "connector_revoked";
@@ -801,7 +814,7 @@ export interface IssueRequest {
  * cannot both take it.
  */
 export async function issueCommand(r: IssueRequest): Promise<IssueOutcome> {
-  return goneAsStatus(() => inTransaction(async (q): Promise<IssueOutcome> => {
+  const out = await goneAsStatus(() => inTransaction(async (q): Promise<IssueOutcome> => {
     await lock(q, `commands:${r.owner}`);
     // A repeat of a command already queued is answered with the original and
     // does not count against the limit, so a client may retry freely.
@@ -825,8 +838,29 @@ export async function issueCommand(r: IssueRequest): Promise<IssueOutcome> {
     if (r.closesSession) {
       await q("UPDATE claw_remote_sessions SET status = 'closed', updated_at = NOW() WHERE session_id = $1", [r.sessionId]);
     }
+    if (r.type === "prompt") await notePrompt(q, r, Number(queued.row.cmd_seq));
     return { status: "queued", row: queued.row } as IssueOutcome;
   }));
+  if (out.status === "queued" && r.type === "prompt") sessionWaker(r.sessionId);
+  return out;
+}
+
+/**
+ * What the person sent, as an event of the session (`user_prompt`), in the same transaction that queues it, so it is stored once
+ * per queued prompt and before anything the agent says about it. An agent reports only its own side; this is how every reader of
+ * the session (a web page beside a Teams chat, another device) sees what was asked. Stored where the agent's output is, masked the
+ * way the agent's output is at ingest, and deleted with the session like the rest of its events; the audit trail still keeps only
+ * a hash. Nothing that follows a turn reads this type, so it neither opens nor ends one.
+ */
+async function notePrompt(q: Querier, r: IssueRequest, cmdSeq: number): Promise<void> {
+  const text = typeof r.payload.text === "string" ? r.payload.text : "";
+  if (!text) return;
+  const data = redactPublicJson({ text, cmd_id: r.cmdId, cmd_seq: cmdSeq, client: r.client, by: "claw" });
+  await q(
+    `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
+     VALUES ($1, $2, $3, NOW(), $4::jsonb) ON CONFLICT (session_id, seq) DO NOTHING`,
+    [r.sessionId, userPromptSeq(cmdSeq), REMOTE_EVENT_USER_PROMPT, JSON.stringify(data)],
+  );
 }
 
 /** `run`, with a `ConnectorGone` it threw (its transaction rolled back) answered as `{ status: "gone" }`. */

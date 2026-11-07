@@ -236,6 +236,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   const waker = opts.waker ?? new Waker();
   // Commands the assistant issues for the user (`devenv_send`) wake this replica's command streams as a route's do.
   store.setCommandWaker((connectorId) => waker.wake(`c:${connectorId}`));
+  store.setSessionWaker((sessionId) => waker.wake(`s:${sessionId}`));
   const pingMs = opts.pingMs ?? REMOTE_AGENT_TIMING.pingMs;
   const pollMs = opts.pollMs ?? IDLE_POLL_MS;
   const onlineWindowMs = opts.onlineWindowMs ?? REMOTE_AGENT_TIMING.onlineWindowMs;

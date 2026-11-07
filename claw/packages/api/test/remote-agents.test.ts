@@ -123,6 +123,7 @@ describe("remote agents", { skip }, () => {
   const post = (user: string, cid: string, events: unknown[], batch = "b1") =>
     as(user).post(`/v1/remote-agents/connectors/${cid}/events`, { batch_id: batch, events });
   const online1 = async () => { nextSeq = new Map(); return online(); };
+  // (The tests of what was never delivered read Claw's own ends of turns: the `user_prompt` each prompt also records is not one.)
   /** The presence sweep recorded the connector going offline `minutesAgo` (its laptop closed), as it does every 15 s. */
   const wentOffline = (cid: string, minutesAgo: number) => q(
     `INSERT INTO claw_remote_connector_transitions (connector_id, owner_user_id, from_state, to_state, reason, at)
@@ -627,14 +628,14 @@ describe("remote agents", { skip }, () => {
       assert.deepEqual(await types(), ["prompt", "cancel"]);
       // The stale prompt's turn is ended, said as unconfirmed (Claw cannot tell whether the machine took it), so a chat or an item
       // waiting on it is not left waiting. The session is left open: the machine may be starting it.
-      const evs = (await q("SELECT seq, type, data FROM claw_remote_events WHERE session_id = $1 ORDER BY id", [sid])).rows;
+      const evs = (await q("SELECT seq, type, data FROM claw_remote_events WHERE type <> 'user_prompt' AND session_id = $1 ORDER BY id", [sid])).rows;
       assert.deepEqual(evs.map((e: any) => [Number(e.seq), e.type, e.data]),
         [[-2, "turn_end", { stopReason: "error", error: "delivery_unconfirmed", cmd_seq: 2, by: "claw" }]]);
       assert.equal((await as("u1").get(`/v1/remote-agents/sessions/${sid}`)).body.data.status, "active");
       const audit = (await q("SELECT detail FROM claw_remote_audit WHERE connector_id = $1 AND action = 'command.expired' ORDER BY id", [cid])).rows;
       assert.deepEqual(audit.map((a: any) => a.detail.type), ["session.new", "prompt", "set_mode", "resume"]);
       assert.equal((await heartbeat("u1", cid)).status, 200);
-      assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_events WHERE session_id = $1", [sid])).rows[0].n, 1, "said once");
+      assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_events WHERE type <> 'user_prompt' AND session_id = $1", [sid])).rows[0].n, 1, "said once");
     });
 
     test("a prompt a started session never received ends its turn by name; one just past its time is given the heartbeat's slack", async () => {
@@ -652,13 +653,13 @@ describe("remote agents", { skip }, () => {
       await q("UPDATE claw_remote_commands SET created_at = NOW() - interval '330 seconds' WHERE connector_id = $1 AND payload->>'text' = 'late'", [cid]);
       // Still online, never away: either may be waiting behind a long turn on the machine. Kept, however old.
       assert.equal((await heartbeat("u1", cid, { cmd_cursor: 1 })).status, 200);
-      assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_events WHERE session_id = $1", [sid])).rows[0].n, 1);
+      assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_events WHERE type <> 'user_prompt' AND session_id = $1", [sid])).rows[0].n, 1);
       assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_commands WHERE connector_id = $1 AND type = 'prompt'", [cid])).rows[0].n, 2);
       // The laptop had closed (its last beat) before they were queued; the sweep recorded it, and it comes back.
       await q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '11 minutes' WHERE connector_id = $1", [cid]);
       await wentOffline(cid, 4);
       assert.equal((await heartbeat("u1", cid, { cmd_cursor: 1 })).status, 200);
-      const evs = (await q("SELECT seq, type, data FROM claw_remote_events WHERE session_id = $1 ORDER BY id", [sid])).rows;
+      const evs = (await q("SELECT seq, type, data FROM claw_remote_events WHERE type <> 'user_prompt' AND session_id = $1 ORDER BY id", [sid])).rows;
       assert.deepEqual(evs.map((e: any) => [Number(e.seq), e.type]), [[1, "session_started"], [-2, "turn_end"]]);
       assert.deepEqual(evs[1].data, { stopReason: "error", error: "delivery_unconfirmed", cmd_seq: 2, by: "claw" });
       assert.equal((await as("u1").get(`/v1/remote-agents/sessions/${sid}`)).body.data.status, "active", "the session itself goes on");
@@ -683,7 +684,7 @@ describe("remote agents", { skip }, () => {
       await q("UPDATE claw_remote_events SET created_at = NOW() - interval '30 minutes' WHERE session_id = $1", [sid]);
       // A silent tool call for twenty minutes on a machine that never went away: nothing ends.
       assert.equal((await heartbeat("u1", cid, { cmd_cursor: 2 })).status, 200);
-      assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_events WHERE session_id = $1 AND seq < 0", [sid])).rows[0].n, 0);
+      assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_events WHERE type <> 'user_prompt' AND session_id = $1 AND seq < 0", [sid])).rows[0].n, 0);
       // The turn said something after they were queued, and then the laptop closed: the machine had them. Nothing ends either.
       assert.equal((await post("u1", cid, [ev(sid, "agent_message_chunk", { update: {} })])).status, 200);
       await wentOffline(cid, 1);
@@ -725,7 +726,7 @@ describe("remote agents", { skip }, () => {
       await q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '9 minutes' WHERE connector_id = $1", [cid]);
       const ended = await inTransaction((tx) => st.expireUndelivered(tx));
       assert.equal(ended.length, 1);
-      const ends = (await q("SELECT data FROM claw_remote_events WHERE session_id = $1 AND seq < 0 ORDER BY id", [sid])).rows;
+      const ends = (await q("SELECT data FROM claw_remote_events WHERE type <> 'user_prompt' AND session_id = $1 AND seq < 0 ORDER BY id", [sid])).rows;
       assert.deepEqual(ends.map((e: any) => [e.data.error, e.data.cmd_seq]), [["delivery_unconfirmed", 4], ["delivery_unconfirmed", 5]]);
     });
 
@@ -746,7 +747,7 @@ describe("remote agents", { skip }, () => {
       await q("UPDATE claw_remote_commands SET created_at = NOW() - interval '10 minutes' WHERE connector_id = $1", [cid]);
       await q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '610 seconds' WHERE connector_id = $1", [cid]);
       await inTransaction((tx) => st.expireUndelivered(tx));
-      const ends = (await q("SELECT session_id::text AS s, type, data FROM claw_remote_events WHERE seq < 0 ORDER BY id")).rows;
+      const ends = (await q("SELECT session_id::text AS s, type, data FROM claw_remote_events WHERE type <> 'user_prompt' AND seq < 0 ORDER BY id")).rows;
       assert.deepEqual(ends.map((e: any) => [e.s, e.type, e.data.error ?? e.data.reason]), [[sid, "turn_end", "delivery_unconfirmed"]],
         "the session it may be starting gets no end");
       assert.equal((await as("u1").get(`/v1/remote-agents/sessions/${fresh.body.data.session_id}`)).body.data.status, "active");
@@ -776,7 +777,7 @@ describe("remote agents", { skip }, () => {
       await q("UPDATE claw_remote_commands SET created_at = NOW() - interval '7 minutes' WHERE connector_id = $1", [cid]);
       await q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '8 minutes', stream_seen_at = NULL WHERE connector_id = $1", [cid]);
       assert.equal((await inTransaction((tx) => st.expireUndelivered(tx))).length, 1, "not held as if behind the first");
-      const ends = (await q("SELECT data FROM claw_remote_events WHERE session_id = $1 AND seq < 0 ORDER BY id", [sid])).rows;
+      const ends = (await q("SELECT data FROM claw_remote_events WHERE type <> 'user_prompt' AND session_id = $1 AND seq < 0 ORDER BY id", [sid])).rows;
       assert.deepEqual(ends.map((e: any) => e.data.cmd_seq), [2, 3]);
     });
 
@@ -816,7 +817,7 @@ describe("remote agents", { skip }, () => {
       let evs: any[] = [];
       for (let i = 0; i < 100 && !evs.length; i++) {
         await new Promise((r) => setTimeout(r, 30));
-        evs = (await q("SELECT type, data FROM claw_remote_events WHERE session_id = $1", [sid])).rows;
+        evs = (await q("SELECT type, data FROM claw_remote_events WHERE type <> 'user_prompt' AND session_id = $1", [sid])).rows;
       }
       assert.deepEqual(evs.map((e: any) => [e.type, e.data.error]), [["turn_end", "delivery_unconfirmed"]], "no heartbeat needed");
       assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_commands WHERE connector_id = $1", [cid])).rows[0].n, 0);
@@ -1031,6 +1032,50 @@ describe("remote agents", { skip }, () => {
       const live = await s.next();
       assert.equal(live.event, "turn_end");
       assert.equal((await s.next((f) => !!f.comment, 1500)).comment, true, "a keepalive follows while idle");
+    });
+
+    test("what the person sent is in the session's events, from any client, once, masked, before the answer, and a connector cannot post one", async () => {
+      const { cid, stream } = await online1();
+      const sid = await session("u1", cid);
+      const reader = await SseClient.open(`${base}/v1/remote-agents/sessions/${sid}/events`, { "x-test-user": "u1" });
+      streams.push(reader);
+      assert.equal((await reader.next()).event, "historyComplete");
+      // Sent from Teams (a client label, an Idempotency-Key): a reader elsewhere is told at once, not on its next poll.
+      const sent = await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`,
+        { type: "prompt", text: "what is 2+2? use Authorization: Bearer supersecretvalue123456" }, { "idempotency-key": "teams-1", "x-claw-client": "teams" });
+      assert.equal(sent.status, 202);
+      const live = (await reader.next(undefined, 1000)).json();
+      assert.deepEqual([live.type, live.data.cmd_id, live.data.cmd_seq, live.data.client, live.data.by], ["user_prompt", "k:teams-1", sent.body.data.cmd_seq, "teams", "claw"]);
+      assert.match(live.data.text, /^what is 2\+2\? use .*<redacted>$/);
+      assert.ok(!JSON.stringify(live).includes("supersecretvalue"), "masked as the agent's output is");
+      assert.ok(live.seq < 0, "Claw's own numbering, never a connector's");
+      // A retry queues nothing and says nothing twice; the agent's answer comes after it.
+      const again = await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`,
+        { type: "prompt", text: "what is 2+2? use Authorization: Bearer supersecretvalue123456" }, { "idempotency-key": "teams-1", "x-claw-client": "teams" });
+      assert.equal(again.body.data.duplicate, true);
+      await post("u1", cid, [ev(sid, "agent_message_chunk", { text: "4" }), ev(sid, "turn_end", { stopReason: "end_turn" })]);
+      // The command the connector receives is unchanged: the text as typed.
+      const cmd = (await stream.next((f) => f.event === "command" && f.json().type === "prompt")).json();
+      assert.deepEqual([cmd.type, cmd.text], ["prompt", "what is 2+2? use Authorization: Bearer supersecretvalue123456"]);
+      // The assistant's own instruction is recorded the same way, and a stop is not a prompt.
+      const { issueCommand } = await import("../src/remote-agents/store.js");
+      const out = await issueCommand({
+        owner: "u1", client: "assistant", connectorId: cid, agentId: "a1", sessionId: sid, type: "prompt", cmdId: "k:asst-1",
+        payload: { text: "run the tests" }, auditDetail: {}, closesSession: false, commandsPerMinute: 60,
+      });
+      assert.equal(out.status, "queued");
+      assert.equal((await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, { type: "cancel" })).status, 202);
+      const replay = (await as("u1").get(`/v1/remote-agents/sessions/${sid}/events?mode=replay`)).body.data;
+      assert.deepEqual(replay.map((r: any) => [r.type, r.data.text ?? null, r.data.client ?? null]), [
+        ["user_prompt", replay[0].data.text, "teams"], ["agent_message_chunk", "4", null], ["turn_end", null, null], ["user_prompt", "run the tests", "assistant"],
+      ]);
+      // The audit trail still keeps no text.
+      const audit = (await q("SELECT detail FROM claw_remote_audit WHERE session_id = $1 AND action = 'command.issued'", [sid])).rows;
+      assert.ok(!JSON.stringify(audit).includes("what is 2+2") && !JSON.stringify(audit).includes("run the tests"));
+      // Only Claw writes one: a connector's is refused by name, and the rest of its batch is kept.
+      const forged = await post("u1", cid, [ev(sid, "user_prompt", { text: "I never said this" }), ev(sid, "agent_message_chunk", { text: "ok" })], "b2");
+      assert.deepEqual(forged.body.data.rejected.map((r: any) => r.reason), ["reserved_type"]);
+      assert.deepEqual((await q("SELECT COUNT(*)::int AS n FROM claw_remote_events WHERE session_id = $1 AND type = 'user_prompt'", [sid])).rows[0].n, 2);
     });
 
     test("what a connector says about a session running without per-step approval reaches the user's client unchanged", async () => {

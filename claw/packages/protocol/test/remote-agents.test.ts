@@ -98,6 +98,7 @@ test("event batches: the envelope refuses the batch, an event refuses only itsel
     ["seq a string", { ...ok, seq: "1" }, "invalid_seq"],
     ["type with a newline", { ...ok, type: "a\nb" }, "invalid_type"],
     ["type too long", { ...ok, type: "a".repeat(65) }, "invalid_type"],
+    ["a type only Claw writes (what the person sent)", { ...ok, type: "user_prompt" }, "reserved_type"],
     ["ts negative", { ...ok, ts: -1 }, "invalid_ts"],
     ["ts not finite", { ...ok, ts: null }, "invalid_ts"],
     ["data null", { ...ok, data: null }, "invalid_data"],

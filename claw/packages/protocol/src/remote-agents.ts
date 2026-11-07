@@ -129,6 +129,13 @@ export function connectorVersionStatus(
 export const REMOTE_EVENT_PERMISSION_REQUEST = "permissionRequest";
 export const REMOTE_EVENT_PERMISSION_RESOLVED = "permission_resolved";
 export const REMOTE_EVENT_SESSION_CLOSED = "session_closed";
+/**
+ * What the person sent a session (a `prompt` command), written by Claw itself when it queues the prompt: `{text, cmd_id, cmd_seq,
+ * client, by: "claw"}` with a negative `seq`. An agent's events carry only its own side, so without it a window opened on the
+ * session elsewhere (another device, the web page beside a Teams chat) shows answers to questions it cannot see. A connector may
+ * not post it: a frame of this type is always Claw's account of what was sent.
+ */
+export const REMOTE_EVENT_USER_PROMPT = "user_prompt";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AGENT_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
@@ -267,6 +274,7 @@ export function parseEventBatch(body: unknown): Parsed<RemoteEventBatch> {
     if (!sessionId) return refuse("invalid_session_id");
     if (!Number.isSafeInteger(raw.seq) || (raw.seq as number) < 1) return refuse("invalid_seq");
     if (typeof raw.type !== "string" || !LABEL_RE.test(raw.type)) return refuse("invalid_type");
+    if (raw.type === REMOTE_EVENT_USER_PROMPT) return refuse("reserved_type");
     if (typeof raw.ts !== "number" || !Number.isFinite(raw.ts) || raw.ts < 0 || raw.ts > 8.64e15) return refuse("invalid_ts");
     if (!isObject(raw.data)) return refuse("invalid_data");
     if (jsonBytes(raw.data) > REMOTE_AGENT_LIMITS.maxEventBytes) return refuse("event_too_large");
