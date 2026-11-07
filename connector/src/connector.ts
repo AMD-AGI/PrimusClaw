@@ -639,6 +639,12 @@ export class Connector {
           try { await this.identify(true); await this.firstHeartbeat(); } catch (again) {
             if (this.isRevocation(again)) return void (await this.onRevoked(again));
             this.d.log.warn("could not register again", { error: errMessage(again) });
+            if (isConnectorLimit(again)) {
+              // As at start-up: said once, then tried again slowly instead of every few seconds.
+              this.d.log.error(CONNECTOR_LIMIT_HINT, { error: errMessage(again) });
+              recordDisconnect(this.d.dirs, { reason: "connector_limit_reached", detail: CONNECTOR_LIMIT_HINT });
+              await sleep(this.timing.limitRetryMs, this.ctl.signal);
+            }
           }
         }
         this.d.log.warn("command stream lost; reconnecting", { error: errMessage(e), attempt });

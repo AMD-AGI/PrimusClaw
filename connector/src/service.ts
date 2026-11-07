@@ -184,10 +184,14 @@ export const hasUserinfo = (v: string): boolean => {
  * The names of the variables Codex's own config.toml reads a key from (`env_key` of a `model_providers` entry), which
  * a Codex agent needs as much as OPENAI_API_KEY. Unreadable or absent: none.
  */
-export function codexEnvKeys(env: NodeJS.ProcessEnv, home: string): string[] {
+export async function codexEnvKeys(env: NodeJS.ProcessEnv, home: string, timeoutMs = 5_000): Promise<string[]> {
   const dir = env.CODEX_HOME?.trim() || path.join(home, ".codex");
   try {
-    const doc = parseToml(fs.readFileSync(path.join(dir, "config.toml"), "utf8")) as Record<string, unknown>;
+    // Bounded: CODEX_HOME may sit on a network mount that stopped answering, and install must not hang on it.
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timed out")), timeoutMs); timer.unref?.(); });
+    const text = await Promise.race([fs.promises.readFile(path.join(dir, "config.toml"), "utf8"), late]).finally(() => clearTimeout(timer));
+    const doc = parseToml(text) as Record<string, unknown>;
     const providers = isObject(doc.model_providers) ? doc.model_providers : {};
     return Object.values(providers).flatMap((p) => (isObject(p) && typeof p.env_key === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(p.env_key) ? [p.env_key] : []));
   } catch { return []; }
@@ -567,7 +571,7 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
   const problem = h.preflight(ctx);
   if (problem) { ctx.err(`cannot install the service yet: ${problem}`); return NEEDS_PERSON; }
   if (!fs.existsSync(d.cli)) { ctx.err(`${d.cli} does not exist (a source checkout needs "npm run build" first)`); return 1; }
-  const { vars, secrets, refused, withheld } = carriedEnv(ctx.env, extra, [...AGENT_SECRETS, ...codexEnvKeys(ctx.env, d.home)]);
+  const { vars, secrets, refused, withheld } = carriedEnv(ctx.env, extra, [...AGENT_SECRETS, ...await codexEnvKeys(ctx.env, d.home)]);
   for (const r of refused) ctx.err(`--env ${r}: not carried into the service (it is the connector's own key, kept in credentials.json)`);
   for (const w of withheld) {
     ctx.err(/[\r\n]/.test(ctx.env[w] ?? "")
@@ -645,12 +649,14 @@ function scheduleKeepalive(ctx: Ctx, d: ServiceDeps, script: string): void {
       for (const l of want) ctx.out(`  ${l}`);
       return;
     }
-    ctx.err("could not write your crontab (crontab -); add the lines below by hand");
+    ctx.err("could not write your crontab (crontab - failed): until these lines are in it, NOTHING starts the connector again after a reboot. Add them by hand (crontab -e):");
+    for (const l of want) ctx.err(`  ${l}`);
+  } else {
+    ctx.out("No cron daemon runs here: after a reboot or a container restart NOTHING starts the connector again.");
+    ctx.out("Run this from the container's startup command (it does nothing while the connector is up; ~/.bashrc works too, then it");
+    ctx.out("comes back when you next open a shell):");
+    ctx.out(`  sh ${sh(script)} >/dev/null 2>&1`);
   }
-  ctx.out("No cron daemon runs here: after a reboot or a container restart NOTHING starts the connector again.");
-  ctx.out("Run this from the container's startup command (it does nothing while the connector is up; ~/.bashrc works too, then it");
-  ctx.out("comes back when you next open a shell):");
-  ctx.out(`  sh ${sh(script)} >/dev/null 2>&1`);
   const where = ephemeralWhere(ctx.dirs.config);
   if (where) ctx.out(`Note: ${where}`);
 }
@@ -708,14 +714,11 @@ function mountOf(p: string, mounts: Mount[]): Mount | null {
  * A dev pod's home directory is often such a place: everything in it is gone when the pod is recreated.
  */
 export function ephemeralWhere(configDir: string, mounts: Mount[] = readMounts()): string | null {
-  let real = configDir;
-  for (let p = configDir; ; p = path.dirname(p)) {
-    try { real = path.join(fs.realpathSync(p), path.relative(p, configDir)); break; } catch { if (p === path.dirname(p)) break; }
-  }
-  const m = mountOf(real, mounts);
+  // Only /proc/self/mountinfo is read: a look at a network mount (a stalled one) could hang init or install. The path
+  // is taken as written; a configuration reached through a link onto another disk is rare and only misses this note.
+  const m = mountOf(path.resolve(configDir), mounts);
   if (!m || !EPHEMERAL_FS.has(m.fstype)) return null;
-  const persistent = [...new Set(mounts.filter((x) => PERSISTENT_FS.test(x.fstype) && !x.point.startsWith("/proc") && !x.point.startsWith("/sys")).map((x) => x.point))]
-    .filter((pt) => { try { fs.accessSync(pt, fs.constants.W_OK); return true; } catch { return false; } }).slice(0, 3);
+  const persistent = [...new Set(mounts.filter((x) => PERSISTENT_FS.test(x.fstype) && !x.point.startsWith("/proc") && !x.point.startsWith("/sys")).map((x) => x.point))].slice(0, 3);
   return `agents.toml and the sign-in are in ${configDir}, on the container's own file system (${m.fstype}), which is lost when the container is recreated. `
     + `Keep them on storage that outlives it: export CLAW_CONNECTOR_CONFIG_DIR=<a directory of yours on ${persistent.length ? persistent.join(" or ") : "a persistent volume"}>/claw-connector `
     + `in your shell profile and the container's startup command, then run init and login again (the state directory, with its pid and lock files, stays where it is).`;

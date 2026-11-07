@@ -209,7 +209,8 @@ export class Session {
       return this.refuse(e);
     }
     if (this.closed) return;
-    this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString() });
+    // `unused`: a new conversation of this connector's own making that no message has reached yet (see neverPrompted).
+    this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString(), unused: true });
     this.audit("session_started", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
     this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
     this.announced = true;
@@ -415,14 +416,26 @@ export class Session {
       } else {
         if (!this.acpId) throw new SessionRefusal("adapter_cannot_resume", "no adapter session to resume");
         const caps = adapter.caps.sessionCapabilities as AcpParams | undefined;
-        if (caps?.resume) {
-          // `resume` does not replay the history, and the adapter's own settings apply again: the mode is re-locked below.
-          this.absorb(await this.signedIn(adapter, () => adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) })));
-        } else if (adapter.caps.loadSession) {
-          this.replaying = true;
-          try { this.absorb(await this.signedIn(adapter, () => adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }))); } finally { this.replaying = false; }
-        } else {
-          throw new SessionRefusal("adapter_cannot_resume", "the adapter can neither resume nor load a session");
+        try {
+          if (caps?.resume) {
+            // `resume` does not replay the history, and the adapter's own settings apply again: the mode is re-locked below.
+            this.absorb(await this.signedIn(adapter, () => adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) })));
+          } else if (adapter.caps.loadSession) {
+            this.replaying = true;
+            try { this.absorb(await this.signedIn(adapter, () => adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }))); } finally { this.replaying = false; }
+          } else {
+            throw new SessionRefusal("adapter_cannot_resume", "the adapter can neither resume nor load a session");
+          }
+        } catch (e) {
+          if (!this.neverPrompted(e)) throw e;
+          // Opened and never sent a message: the agent wrote nothing yet (Claude keeps a conversation only from its first
+          // message), so there is nothing to resume and nothing to lose. A fresh one takes its place, in the same folder.
+          const res = await this.signedIn(adapter, () => adapter.request("session/new", { cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }));
+          if (typeof res.sessionId !== "string") throw new SessionRefusal("adapter_protocol", "session/new returned no session id");
+          this.audit("session_recreated", { was: this.acpId, now: res.sessionId, why: errMessage(e).slice(0, 200) });
+          this.acpId = res.sessionId;
+          this.absorb(res);
+          this.env.store.patch(this.id, { acp_session_id: this.acpId });
         }
       }
       await this.enforceMode(this.targetMode);
@@ -469,6 +482,19 @@ export class Session {
   private async refuseSignedOut(adapter: AdapterProcess): Promise<void> {
     const st = await adapter.waitAuthStatus(this.env.timing.authWaitMs);
     if (st?.kind === "none") throw new SessionRefusal("agent_auth_required", `the agent reports that it is not signed in${st.label ? ` (${st.label})` : ""}`);
+  }
+
+  /**
+   * The adapter cannot find the conversation to resume, and this session's record says it was started new by this
+   * connector and never had a message (`unused`). Any other failure, a used or taken-over session, or a record that does
+   * not say (written by an older version), keeps its error.
+   */
+  private neverPrompted(e: unknown): boolean {
+    if (this.agent.attach || e instanceof SessionRefusal) return false;
+    // Only a record that says so: one written before this was kept, or a takeover, may well have had messages.
+    const rec = this.env.store.get(this.id);
+    if (rec?.unused !== true || rec.used_at) return false;
+    return /not found|no (?:such )?(?:session|conversation)/i.test(errMessage(e));
   }
 
   /** Take the modes and the mode config option out of a `session/new|resume|load` answer. */
@@ -821,7 +847,7 @@ export class Session {
       const now = new Date().toISOString();
       // Recorded before the prompt counts as handled: from here a restart finds this turn instead of losing it.
       this.env.store.beginTurn({ session_id: this.id, cmd_id: cmdId, cmd_seq: cmdSeq, started_at: now });
-      this.env.store.patch(this.id, { used_at: now });
+      this.env.store.patch(this.id, { used_at: now, unused: false });
       started();
       const res = await reply;
       const usage = isObject(res.usage) ? res.usage : undefined;

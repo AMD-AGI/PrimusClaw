@@ -168,7 +168,9 @@ directory (`adapters/<package>@<version>`), by `init`, by `service install` and 
 then started from there with the connector's own Node.js: a session does not wait for npx to look the package up in a
 registry (about 70 seconds when the registry cannot be reached) or download it (Claude's adapter takes about 350 MB on
 disk with its dependencies), and a repository's own `.npmrc` cannot pick the registry. The install uses `npm install` with your npm
-settings (`~/.npmrc`, `npm_config_*`, an `npm_config_registry` in the agent's `env`). A session that opens while its
+settings (`~/.npmrc`, `npm_config_*`, `NPM_TOKEN`, an `npm_config_registry` in the agent's `env`), and never with the agents'
+sign-in variables: anything named like a credential that is not npm's own (`ANTHROPIC_API_KEY`, a gateway token...) is left
+out of npm's environment, so no install script of the adapter or its dependencies sees it. A session that opens while its
 adapter is still being installed waits for it; if the install failed, the agent's npx command runs as before, in the
 connector's state directory, and the install is tried again in the background ten minutes later. An agent with its own
 `command` or `args` is started exactly as written.
@@ -253,6 +255,10 @@ All of these run on your machine and fail closed.
   limit, so a root on a stalled network mount refuses its own sessions (`root_unavailable`), never those under a healthy
   root, and never freezes the connector or its heartbeat. A restored session whose root does not answer is kept: its
   commands are rejected `root_unavailable` until it does, and `close` still closes it.
+- **Opened, never used, then a restart.** Claude keeps a conversation only from its first message, so a session opened
+  from the phone and restarted before anyone wrote in it has nothing to resume ("Resource not found"). Such a session (never
+  prompted, not a takeover) gets a fresh conversation in the same folder (audited `session_recreated`) instead of being
+  closed; a session that was used keeps the error.
 - **Signed in before ready.** A new session of an agent that reports its sign-in (Claude Code does) and reports none is
   refused at once with `agent_auth_required`, instead of opening and failing at its first message; a session that
   already exists is kept and its prompts say why. A prompt refused for the same reason later
