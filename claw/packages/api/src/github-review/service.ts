@@ -1154,6 +1154,7 @@ export class GithubReview {
         riskReasons: acc.riskReasons, confirmationId: acc.confirmationId, dryRun: acc.dryRun, write: acc.write,
         result: outcome.isError ? "refused" : "ok", detail: String(outcome.body.reason ?? outcome.body.status ?? ""),
         reviewPath: acc.reviewPath, reviewPathReason: acc.reviewPathReason, reviewMode: acc.reviewMode, posted: acc.posted ?? null,
+        mergeState: outcome.isError && typeof outcome.body.merge_state === "string" ? outcome.body.merge_state : null,
       });
     } catch {
       // The row was written before the work; a failure to finish it leaves it 'started', which counts against limits and reads as unfinished.

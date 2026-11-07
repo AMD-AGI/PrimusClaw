@@ -20,6 +20,7 @@ import { announceItemDeliveries } from "./deliveries.js";
 import { queueServerMessage, drainSessionIfIdle } from "./messages.js";
 import { recordNeedsYouFallback, storeAnswerWhole, type SayDeps } from "./outbound.js";
 import { formatWorkEvent, SAY_BRIEF_CHARS } from "./prompts.js";
+import { tellRequesterOfConflict } from "./review-conflict.js";
 import {
   applyWorkerReport, type BoardState, type ReportKind, type ReportSource, type WorkReport,
 } from "./work-items.js";
@@ -203,6 +204,8 @@ export async function ingestReport(
   if (written.answer) await written.answer.announce();
   // The router cannot be woken to say it: the system says it now, after the answer said whole (which this then finds stored).
   if (written.wake?.status === "refused") await tellUnwoken(run.itemId);
+  // A review someone else asked for, stopped by a conflict in the author's branch: the one who asked is told too, not only the reviewer.
+  if (applied && written.outcome.status === "applied" && written.outcome.boardState === "needs_you") await tellRequesterOfConflict(run.itemId);
   if (applied && recorded.kind !== "progress") await announceDeliveries(run.itemId, written.eventId);
   else if (source === "turn_end") await announceDeliveries(run.itemId);
   if (written.wake?.status === "queued") await drainSessionIfIdle(written.wake.sessionId, written.wake.userId);

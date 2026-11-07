@@ -92,6 +92,8 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
     )`,
   // The acting user's review mode the call ran under (`high_risk_confirm` or `fully_auto`, their own setting in claw_github_review_settings).
   `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS review_mode TEXT`,
+  // GitHub's merge state a merge was refused on (`merge_state_not_clean`: DIRTY is a conflict only the author can resolve), else null.
+  `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS merge_state TEXT`,
   `CREATE INDEX IF NOT EXISTS idx_github_audit_actor ON claw_github_audit(actor_user_id, at DESC)`,
   // One approval or merge decision at a time per acting user and pull request, across replicas (see acquireWriteLock).
   `CREATE TABLE IF NOT EXISTS claw_github_write_locks (
@@ -213,6 +215,8 @@ export interface AuditFinish {
   reviewMode?: string;
   /** A posted review's record (`PostedReview`), for a review item's session only. */
   posted?: PostedReview | null;
+  /** GitHub's merge state a merge was refused on (`merge_state_not_clean`), else unset. */
+  mergeState?: string | null;
 }
 
 /** One inline finding of a posted review: where it is, the thread GitHub opened for it (null when that could not be read) and its first words. */
@@ -236,13 +240,13 @@ export async function auditFinish(db: Queryable, id: number, f: AuditFinish): Pr
             github_requests = $5, github_request_ids = $6::jsonb, github_status = $7,
             risk_reasons = $8::jsonb, confirmation_id = $9, dry_run = $10, write = $11,
             result = $12, detail = $13, review_path = $14, review_path_reason = $15, review_mode = COALESCE($16, review_mode),
-            posted = COALESCE($17::jsonb, posted)
+            posted = COALESCE($17::jsonb, posted), merge_state = COALESCE($18, merge_state)
       WHERE id = $1`,
     [
       id, f.repo ?? null, f.pr ?? null, f.headSha ?? null, f.githubRequests, JSON.stringify(f.githubRequestIds.slice(-20)),
       f.githubStatus ?? null, JSON.stringify(f.riskReasons ?? []), f.confirmationId ?? null, f.dryRun, f.write,
       f.result, (f.detail ?? "").slice(0, 500), f.reviewPath ?? null, f.reviewPathReason ?? null, f.reviewMode ?? null,
-      f.posted ? JSON.stringify(f.posted) : null,
+      f.posted ? JSON.stringify(f.posted) : null, f.mergeState ? String(f.mergeState).slice(0, 40) : null,
     ],
   );
 }
