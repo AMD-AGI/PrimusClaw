@@ -905,6 +905,15 @@ export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWE
 // `on` gives the router the review and settings tools (review_start, review_restart, confirmation_answer,
 // review_mode_set, channel_action); anything else leaves it the five tools of a conversation.
 export const CLAW_ASSISTANT_TOOLS = env("CLAW_ASSISTANT_TOOLS", "off").trim().toLowerCase() === "on";
+// `on` turns on the routing and result discipline (`assistant/discipline.ts`, router-discipline-v1 and worker-v7) for every user: a
+// reply to a result already given is acknowledged and acts on nothing, a request to read ~/.ssh, keys or credentials is declined in
+// chat and work_create refuses it, and a worker whose task changed nothing outside reports what it delivered as an answer, with no
+// Accept. Off (the default), only the users named in CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS (Claw user ids, comma-separated) get it: the
+// canary, opened for the evaluation identities first.
+export const CLAW_ASSISTANT_ROUTE_DISCIPLINE = env("CLAW_ASSISTANT_ROUTE_DISCIPLINE", "off").trim().toLowerCase() === "on";
+export const CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
 // The marketplace plugin whose MCP servers the assistant reads from and its workers run with, when the message names
 // none (a chat client that talks to the assistant sends no plugin). Blank or 0: none, and a router turn has no read tools.
 // A router turn is offered only the read tools `assistant/read-tools.ts` lists of it; a worker gets the whole plugin.
