@@ -129,6 +129,9 @@ record it.
 - A tool call whose tool answered an error (a call the platform refused, such as `review_start` answering `already_merged`, a refused
   read, a tool that threw) is recorded with `status: "error"` (and `is_error: true`) in the session's events and stream, no longer as
   `"success"`; the turn rebuilt for the next message still carries what that call answered.
+- An item started after the server's "on it" line is told in that line's message: the start notice takes its place (`replaces`), and
+  what the router adds after it goes to the same message, so the channel shows one message rather than the line and the notice
+  (2026-11-07 run on sa-eval-bot-8: 3 of 34 timed lines stayed beside a start notice).
 - A user whose several machines are all offline is told in Chinese to run the restart command on each of them (每台机器), not on
   "that machine". A pairing claimed but not registered yet holds its name: two machines of one hostname claimed one after the
   other, before either registered, no longer both get the same alternate name.

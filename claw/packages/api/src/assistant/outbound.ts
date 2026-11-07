@@ -665,6 +665,25 @@ export async function turnFirstSay(q: Querier, userId: string, since: Date | str
   return row?.say_id ?? null;
 }
 
+/**
+ * The server's "on it" for the turn answering `messageId` (`lookup-ack.ts`, its id derived from the message), as `replaces`, while its
+ * message still shows that line: it was said and nothing of this user was stored after it. Once anything was (the router's say, which
+ * took the line's place; an earlier start notice of the turn, a second item), the notice is a message of its own, as without the line,
+ * so nothing the person was shown is overwritten. Read without the turn: a say of another session in between only keeps the notice its
+ * own message.
+ */
+async function turnAckReplaced(q: Querier, userId: string, messageId: string): Promise<{ replaces?: string }> {
+  if (!CLAW_NOTIFICATIONS_ENABLED) return {};
+  const ack = deterministicEventId("assistant.notice", userId, `lookup_ack:${messageId}`);
+  const showing = await q(
+    `SELECT 1 FROM claw_assistant_says a
+      WHERE a.say_id = $1::uuid AND a.user_id = $2
+        AND NOT EXISTS (SELECT 1 FROM claw_assistant_says l WHERE l.user_id = $2 AND l.say_id <> a.say_id AND l.created_at >= a.created_at)`,
+    [ack, userId],
+  );
+  return showing.rowCount ? { replaces: ack } : {};
+}
+
 const NEEDS_YOU_TEXT: Record<string, (item: ItemRow) => string> = {
   ready: (i) => `is ready for your review (v${i.result_version}).`,
   waiting: (i) => `needs your answer: ${i.pending_question ?? ""}`,
@@ -970,16 +989,31 @@ export async function recordSystemNotice(
     files?: AssistantFile[];
     /** A development environment session's own message: which session, and which kind (`remote-items.ts`). */
     remote?: AssistantRemoteNotice;
+    /**
+     * Takes the place of the server's "on it" for `turnMessageId` (`lookup-ack.ts`), when one was said: an item's start notice is the
+     * turn's message, and without this the person would read the line and the notice as two messages.
+     */
+    replacesTurnAck?: boolean;
   }, deps: SayDeps = {},
 ): Promise<SayOutcome | null> {
-  const stored = await storeSettled(async (q, storeOne) => storeOne({
-    type: "assistant.say", fallback: true, item: input.itemId ? await loadItem(q, input.itemId, input.userId) : null,
-    sayId: deterministicEventId("assistant.notice", input.userId, input.key),
-    userId: input.userId, sessionId: input.sessionId, text: input.text,
-    ...(input.files?.length ? { files: input.files } : {}),
-    ...(input.turnMessageId ? { noticeOfTurn: input.turnMessageId } : {}),
-    ...(input.remote ? { remote: input.remote } : {}),
-  }), (late) => announce(late, deps, input.turnMessageId));
+  const stored = await storeSettled(async (q, storeOne) => {
+    let replaced: { replaces?: string } = {};
+    if (input.replacesTurnAck && input.turnMessageId) {
+      // Under the user's say lock, as a say is stored: two notices of one turn (two items started at once), or a notice and the
+      // router's say, never both find the line still showing and both take its place.
+      await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
+      replaced = await turnAckReplaced(q, input.userId, input.turnMessageId);
+    }
+    return storeOne({
+      type: "assistant.say", fallback: true, item: input.itemId ? await loadItem(q, input.itemId, input.userId) : null,
+      sayId: deterministicEventId("assistant.notice", input.userId, input.key),
+      userId: input.userId, sessionId: input.sessionId, text: input.text,
+      ...(input.files?.length ? { files: input.files } : {}),
+      ...(input.turnMessageId ? { noticeOfTurn: input.turnMessageId } : {}),
+      ...(input.remote ? { remote: input.remote } : {}),
+      ...replaced,
+    });
+  }, (late) => announce(late, deps, input.turnMessageId));
   if (!stored) return null;
   await announce(stored, deps, input.turnMessageId);
   return { say_id: stored.sayId, subscribers: stored.subscribers };

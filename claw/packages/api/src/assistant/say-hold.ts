@@ -103,8 +103,12 @@ export async function turnAnnouncedStart(q: Querier, userId: string, since: Date
   // is, and turns of one user can overlap (an ended gate lets an older run speak), so it is never matched by time: a say after it is
   // then a message of its own, which loses nothing (and there is no channel that would join the two). Read from the user's recent
   // messages first (their index), then their deliveries.
+  // A notice that took the place of the server's "on it" (`replaces`) is shown in that line's message: an addition names that one.
   const row = (await q(
-    `SELECT s.say_id::text AS say_id FROM claw_assistant_says s
+    `SELECT COALESCE(
+              (SELECT o.payload->>'replaces' FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text AND o.payload->>'replaces' IS NOT NULL LIMIT 1),
+              s.say_id::text) AS say_id
+       FROM claw_assistant_says s
       WHERE s.user_id = $1 AND s.fallback AND s.item_id IS NOT NULL AND s.created_at >= $2
         AND (s.text LIKE '已开始：#%' OR s.text LIKE 'Started #%')
         AND EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text AND o.payload->>'turn_message_id' = $3)

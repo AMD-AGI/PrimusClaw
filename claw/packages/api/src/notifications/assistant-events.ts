@@ -136,8 +136,9 @@ export interface AssistantSayPayload extends AssistantEventBase {
   remote?: AssistantRemoteNotice;
   /**
    * The `event_id` of an earlier message of this turn that this one adds to: the system's start notice of an item, after which the
-   * router's words belong in that same message. A channel that still has that message shows it with these words added (its text, a
-   * blank line, this text); one that does not shows this as a message of its own.
+   * router's words belong in that same message. A channel that still has that message shows it with these words added (its current
+   * text, a blank line, this text); one that does not shows this as a message of its own. When the start notice took the place of the
+   * server's "on it" line (`replaces`), this names that line's id: the message the channel shows, whose current text is the notice.
    */
   amends?: string;
   /**
