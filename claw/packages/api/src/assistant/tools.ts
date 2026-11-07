@@ -31,7 +31,7 @@ import { suggestedReplies } from "./suggested.js";
 import { metrics } from "../infra/metrics.js";
 import { bareItemNumbers, internalTextIn, userWordsOf } from "./internal-text.js";
 import { parseItemRef } from "./item-ref.js";
-import { detectLanguage, languageToAnswerIn, replyLanguageLine, replyLanguageMismatch } from "./language.js";
+import { detectLanguage, languageToAnswerIn, replyLanguageLine, replyLanguageMismatch, requestedTextLanguage } from "./language.js";
 import { earlierConversationItemOf, WORK_EVENT_PREFIX } from "./prompts.js";
 import { redactCommandSecrets } from "../notifications/approval-target.js";
 import { assistantPluginId } from "./read-tools.js";
@@ -197,7 +197,9 @@ async function assertSayReadable(
     );
   }
   const expected = await turnReplyLanguage(claims.sid, prompt);
-  const found = expected ? replyLanguageMismatch(text, expected, items.map((i) => i.title)) : null;
+  // A text the user asked for in a named language (a translation) is said in that language, and not refused for it.
+  const asked = prompt.startsWith(WORK_EVENT_PREFIX) ? null : requestedTextLanguage(prompt);
+  const found = expected ? replyLanguageMismatch(text, expected, items.map((i) => i.title), asked) : null;
   if (expected && found) {
     throw new ToolRefused(
       "reply_language",

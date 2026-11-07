@@ -13,6 +13,8 @@
  *   Q6 each router turn that answers the user logs how soon it was first heard, last heard, and whether it started an item
  *   Q7 the router's prompt says each of the rules of router-v10 and router-read-v7
  *   Q8 what the router can do is told from the tool catalog: each write of its servers, done by an item that asks first, never "read-only"
+ *   Q9 a text the user asked for in a language they named (a translation) is said in it at once, not refused and rewritten with a label
+ *      before it (2026-11-06 parity run, S2); any other message in that language to a Chinese user still is
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -80,6 +82,21 @@ describe("router quality, through the tools", { skip }, () => {
     const turn = await turnFor(`[work_event] #${item.seq} (item_id: ${item.itemId}) answer: the build failed on a flaky test`);
     await assert.rejects(w.mod.tools.say(turn as never, { text: "The build failed on a flaky test." }, w.sayDeps), /reply_language|answered in Chinese/);
     assert.equal((await w.mod.tools.say(turn as never, { text: "构建挂在一个不稳定的测试上。" }, w.sayDeps)).ok, true);
+  });
+
+  test("Q9 say lets through the translation the user asked for, in the language they named, and only that", async () => {
+    const S2 = "把这句翻成英文，只给译文：今天下午三点前把评审意见回完，来不及的话先说一声。";
+    const translation = "Please finish replying to the review comments before 3 PM today, and let me know in advance if you can't make it.";
+    const turn = await turnFor(S2);
+    const ok = await w.mod.tools.say(turn as never, { text: translation }, w.sayDeps);
+    assert.equal(ok.ok, true, "the English translation is said as it is, in the first step");
+    assert.deepEqual((await says()).map((r: { text: string }) => r.text), [translation]);
+    // The same English, to a Chinese message that asked for no other language, is refused as before.
+    const other = await turnFor("帮我看看今天下午三点前要回完的评审意见。");
+    await assert.rejects(w.mod.tools.say(other as never, { text: translation }, w.sayDeps), (err: any) => err.code === "reply_language");
+    // Asked in other words (翻译成), the same.
+    const ja = await turnFor("把这句翻译成英文：明天开会");
+    assert.equal((await w.mod.tools.say(ja as never, { text: "The meeting is tomorrow." }, w.sayDeps)).ok, true);
   });
 
   test("Q4 work_create tells the user at once that it started, once, in their language, only when answering them", async () => {
@@ -244,6 +261,22 @@ describe("router quality, pure", () => {
     assert.deepEqual(bare("Taken on as #6, and #8 is next.", 6), [8]);
   });
 
+  test("Q2b the language a message asks a text in is read from the user's own words, and only that one is let through", async () => {
+    const { replyLanguageMismatch, requestedTextLanguage } = await import("../src/assistant/language.js");
+    for (const [message, asked] of [
+      ["把这句翻成英文，只给译文：今天下午三点前把评审意见回完，来不及的话先说一声。", "English"],
+      ["翻译成英语：明天开会", "English"], ["帮我译为日文", "Japanese"], ["用英文写一段介绍", "English"], ["给我一个英文版", "English"],
+      ["写成韩文", "Korean"], ["Translate this paragraph into Chinese please", "Chinese"], ["Summarize the thread in English", "English"],
+      ["帮我看看评审意见", null], ["这个 PR 合了吗", null], ["Please fix the build", null],
+      // What the message quotes is not what it asks: "翻成英文" inside quotes is a phrase it asks about.
+      ["“翻成英文”这几个字是什么意思？", null],
+    ] as const) assert.equal(requestedTextLanguage(message), asked, message);
+    const english = "Please finish replying to the review comments before 3 PM today.";
+    assert.equal(replyLanguageMismatch(english, "Chinese"), "English");
+    assert.equal(replyLanguageMismatch(english, "Chinese", [], "English"), null, "the translation asked for");
+    assert.equal(replyLanguageMismatch(english, "Chinese", [], "Japanese"), "English", "another language than the one asked for");
+  });
+
   test("Q2 another language is found only when the message is plainly in it", async () => {
     const { replyLanguageMismatch } = await import("../src/assistant/language.js");
     assert.equal(replyLanguageMismatch("All three are done; nothing waits for you.", "Chinese"), "English");
@@ -267,10 +300,11 @@ describe("router quality, the prompt", () => {
     const p = await import("../src/assistant/prompts.js");
     // router-v16 (this rule set, a long answer said whole, a say after the start notice added to it, one message a turn, progress read
     // live, a follow-up with the earlier files, progress from what the job wrote now with its age, a derived number from the unrounded
-    // values); its review prompt is router-v20.
-    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v16");
-    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v8");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v20");
+    // values; router-v17: a translation said alone, in the language asked for); its review prompt is router-v21; router-read-v9 adds
+    // "how many" answered with the list, and a pull request that does not exist said so.
+    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v17");
+    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v9");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v21");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): a say after it in the turn is added to that same message, so never repeat the start/],
@@ -297,6 +331,9 @@ describe("router quality, the prompt", () => {
       ["memory and channel tools", /the memory tools of the Memory section[\s\S]*channel_action, whether the user typed its command or said it in words/],
       ["a declined request in a line", /A request you will not carry out[^\n]*say so in one short line/],
       ["every say in the reply language", /write every say in it, the last one too \(say refuses a reply to a Chinese message that has no Chinese in it\)/],
+      ["a translation said alone, in its language", /a text the user asked for in a language they named \(把这句翻成英文, translate it into English\): say that text alone, in that language, with nothing before or after it \(no 译文：, no quotes, no note\)/],
+      ["how many is answered with the list", /"How many pull requests \(issues\) do I have open" is answered with the total \(total_count\) and then the list itself, never the number alone[^\n]*refs_by_repo/],
+      ["a pull request that does not exist is said so", /When a GitHub read answers no_such_pull_request, the pull request does not exist[^\n]*Never say it might be private or a permission problem/],
       ["no number without its title", /never by its number alone: say refuses "#6、#8" without the titles/],
     ];
     for (const [what, re] of rules) assert.match(system, re, what);

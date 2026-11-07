@@ -645,6 +645,67 @@ describe("B what a failed read says", () => {
     const r = await call(await connect(token()), "issue_comment", { repo: "o/r", number: 1, body: "hi" });
     assert.deepEqual([r.isError, r.text], [true, `GitHub answered 422: ${SAID}`]);
   });
+
+  test("B14 pr_get says when a merged pull request merged, by whom and its merge commit; an open one has none of these", async () => {
+    const base = { number: 306, title: "t", user: { login: "alice" }, head: { sha: "abc", ref: "feat" }, base: { ref: "main" }, body: "b" };
+    respond = (url) => url.pathname === "/repos/AMD-AGI/PrimusClaw/pulls/306"
+      ? json({ ...base, state: "closed", merged: true, merged_at: "2026-11-05T09:12:44Z", closed_at: "2026-11-05T09:12:44Z", merged_by: { login: "zoroyihan7" }, merge_commit_sha: "a1b2c3d" })
+      : url.pathname === "/repos/AMD-AGI/PrimusClaw/pulls/307" ? json({ ...base, number: 307, state: "closed", merged: false, merged_at: null, closed_at: "2026-11-04T01:00:00Z", merge_commit_sha: "f00" })
+        : url.pathname === "/repos/AMD-AGI/PrimusClaw/pulls/308" ? json({ ...base, number: 308, state: "open", merged: false, merged_at: null, closed_at: null, merge_commit_sha: "f00" })
+          : json({}, 404);
+    const c = await connect(token());
+    const merged = JSON.parse((await call(c, "pr_get", { repo: "AMD-AGI/PrimusClaw", number: 306 })).text);
+    assert.deepEqual([merged.merged, merged.merged_at, merged.merged_by, merged.merge_commit, merged.closed_at], [true, "2026-11-05T09:12:44Z", "zoroyihan7", "a1b2c3d", undefined]);
+    const closed = JSON.parse((await call(c, "pr_get", { repo: "AMD-AGI/PrimusClaw", number: 307 })).text);
+    assert.deepEqual([closed.merged_at, closed.merge_commit, closed.closed_at], [undefined, undefined, "2026-11-04T01:00:00Z"]);
+    const open = JSON.parse((await call(c, "pr_get", { repo: "AMD-AGI/PrimusClaw", number: 308 })).text);
+    assert.deepEqual([open.state, open.merged_at, open.merge_commit, open.closed_at], ["open", undefined, undefined, undefined]);
+  });
+
+  test("B15 issue_search lists every match as #number under its repository, in by_repo's order: \"how many\" is answered with the list", async () => {
+    const at = (n: number, repo: string) => ({
+      number: n, title: `pr ${n}`, state: "open", user: { login: "alice" }, html_url: `https://github.com/${repo}/pull/${n}`,
+      repository_url: `${API}/repos/${repo}`, pull_request: {}, draft: false, comments: 0, labels: [],
+    });
+    const items = [at(2494, "AMD-AGI/Hyperloom"), at(7179, "ROCm/aiter"), at(2492, "AMD-AGI/Hyperloom"), at(41, "ROCm/spur"), at(2490, "AMD-AGI/Hyperloom"), at(40, "ROCm/spur")];
+    respond = (url) => url.pathname === "/search/issues" ? json({ total_count: items.length, incomplete_results: false, items }) : json({}, 404);
+    const found = JSON.parse((await call(await connect(token()), "issue_search", { query: "is:pr is:open author:@me" })).text);
+    assert.equal(found.total_count, 6);
+    assert.deepEqual(found.by_repo, { "AMD-AGI/Hyperloom": 3, "ROCm/spur": 2, "ROCm/aiter": 1 });
+    assert.deepEqual(found.refs_by_repo, { "AMD-AGI/Hyperloom": ["#2494", "#2492", "#2490"], "ROCm/spur": ["#41", "#40"], "ROCm/aiter": ["#7179"] });
+    assert.deepEqual(Object.keys(found.refs_by_repo), Object.keys(found.by_repo), "grouped as counted");
+    for (const [repo, n] of Object.entries(found.by_repo as Record<string, number>)) assert.equal(found.refs_by_repo[repo].length, n, repo);
+  });
+
+  test("B16 a pull request number GitHub has none of is said not to exist, with the repository's newest numbers; a hidden repository keeps the plain 404", async () => {
+    const R = "/repos/AMD-AGI/PrimusClaw";
+    const newest = [372, 371, 370, 369, 368].map((n) => ({ number: n }));
+    let repoVisible = true;
+    respond = (url) => {
+      if (url.pathname === R) return repoVisible ? json({ full_name: "AMD-AGI/PrimusClaw" }) : json({ message: "Not Found" }, 404);
+      if (url.pathname === `${R}/pulls` && url.searchParams.get("state") === "all") return json(newest);
+      if (url.pathname === `${R}/issues/42`) return json({ number: 42, title: "an issue" });
+      if (url.pathname === "/graphql") return json({ data: { repository: { pullRequest: null } } });
+      return json({ message: "Not Found" }, 404);
+    };
+    const c = await connect(token());
+    const PAST = "no_such_pull_request: AMD-AGI/PrimusClaw has no pull request #99999 (the repository is readable, and GitHub answered 404 for that number); "
+      + "its newest pull request is #372, so #99999 is past the last number used (newest: #372, #371, #370, #369, #368)";
+    // Every read of the pull request H2 asked for answers the same, and none of them reads as "may be private".
+    for (const tool of ["pr_get", "pr_reviews", "pr_files", "review_threads_list"]) {
+      const r = await call(c, tool, { repo: "AMD-AGI/PrimusClaw", number: 99999 });
+      assert.deepEqual([r.isError, r.text], [true, PAST], tool);
+    }
+    const issue = await call(c, "pr_get", { repo: "AMD-AGI/PrimusClaw", number: 42 });
+    assert.deepEqual([issue.isError, issue.text], [true,
+      "no_such_pull_request: AMD-AGI/PrimusClaw#42 is an issue, not a pull request (the repository is readable, and GitHub answered 404 for pull request #42)"]);
+    const gap = await call(c, "pr_get", { repo: "AMD-AGI/PrimusClaw", number: 100 });
+    assert.match(gap.text, /^no_such_pull_request: AMD-AGI\/PrimusClaw has no pull request #100 \(the repository is readable[^)]*\); its newest pull requests are #372, #371, #370, #369, #368$/);
+    // A repository the token cannot see: nothing is claimed about the number.
+    repoVisible = false;
+    const hidden = await call(c, "pr_get", { repo: "AMD-AGI/PrimusClaw", number: 99999 });
+    assert.deepEqual([hidden.isError, hidden.text], [true, "GitHub answered 404: not found, or the user's GitHub token cannot see it"]);
+  });
 });
 
 describe("C the entry a turn is given", () => {

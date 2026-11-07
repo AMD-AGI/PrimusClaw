@@ -190,7 +190,11 @@ function prSummary(p: Record<string, any>) {
     url: p.html_url, base: p.base?.ref, head: p.head?.ref, head_sha: p.head?.sha, head_repo: p.head?.repo?.full_name,
     mergeable_state: p.mergeable_state, additions: p.additions, deletions: p.deletions, changed_files: p.changed_files,
     labels: Array.isArray(p.labels) ? p.labels.map((l: { name?: string }) => l.name) : undefined,
-    created_at: p.created_at, updated_at: p.updated_at, body: p.body ?? "",
+    created_at: p.created_at, updated_at: p.updated_at,
+    // When and how it ended: "已经合入了吗" is answered with the time and the commit, not with merged: true alone.
+    ...(p.merged_at ? { merged_at: p.merged_at, merged_by: login(p.merged_by), merge_commit: p.merge_commit_sha } : {}),
+    ...(p.closed_at && !p.merged_at ? { closed_at: p.closed_at } : {}),
+    body: p.body ?? "",
   };
 }
 
@@ -227,10 +231,14 @@ function issueLine(i: Record<string, any>) {
  */
 export function listAnswer(
   items: readonly unknown[],
-  meta: { total_count?: number | null; complete: boolean; next_page?: number | null; note?: string; by_repo?: Record<string, number> },
+  meta: {
+    total_count?: number | null; complete: boolean; next_page?: number | null; note?: string; by_repo?: Record<string, number>;
+    refs_by_repo?: Record<string, string[]>;
+  },
 ): Record<string, unknown> {
   const head = {
     total_count: meta.total_count ?? null, shown: 0, complete: false, ...(meta.by_repo ? { by_repo: meta.by_repo } : {}),
+    ...(meta.refs_by_repo ? { refs_by_repo: meta.refs_by_repo } : {}),
     ...(meta.note ? { note: meta.note } : {}),
   };
   const kept: unknown[] = [];
@@ -373,6 +381,81 @@ export function byRepoNote(why: ByRepoUnavailable): string {
     + "the matches shown and total_count are as read; ask again for the count";
 }
 
+/**
+ * A search page's matches as the user names them, `#number` grouped by repository: the repositories in the order of `byRepo` when
+ * there is one (most matches first), else by how many of the page each has; within one, in the page's order. What a turn lists when
+ * it is asked "how many pull requests do I have open": the count alone was the answer once, without the pull requests it counted
+ * (2026-11-06 parity run, G1).
+ */
+export function refsByRepo(items: ReadonlyArray<{ repo?: string; number?: unknown }>, byRepo: Record<string, number> | null): Record<string, string[]> {
+  const groups = new Map<string, string[]>();
+  for (const i of items) {
+    if (!Number.isSafeInteger(i.number)) continue;
+    const repo = i.repo ?? "unknown";
+    const list = groups.get(repo) ?? [];
+    list.push(`#${i.number as number}`);
+    groups.set(repo, list);
+  }
+  const order = byRepo ? Object.keys(byRepo) : [];
+  const rank = (r: string): number => { const k = order.indexOf(r); return k < 0 ? order.length : k; };
+  return Object.fromEntries([...groups.entries()].sort((x, y) => rank(x[0]) - rank(y[0]) || y[1].length - x[1].length));
+}
+
+/** What starts the failure a read answers for a pull request that does not exist (`missingPullRequest`): the prompt names it. */
+export const NO_SUCH_PULL_REQUEST = "no_such_pull_request";
+
+/** How many of a repository's newest pull request numbers a read for one that does not exist lists. */
+const NEWEST_LISTED = 5;
+
+/**
+ * Why a read of pull request `number` of `r` failed, when the reason is that it does not exist: the repository itself is read first,
+ * so a 404 there (no such repository, or a token that cannot see it) keeps GitHub's plain answer; then the number as a pull request
+ * and as an issue, and the repository's newest pull requests. Null when it cannot be told (the repository cannot be read, the number
+ * is a pull request after all, or a read failed): the caller then answers as it would have. Claw's own words and GitHub's numbers
+ * only, so it is a clean failure (`assistant/read-tools.ts`). "may be private" was the answer to #99999 of a repository the user
+ * reads every day, with no number to go on (2026-11-06 parity run, H2).
+ */
+export async function missingPullRequest(gh: GithubClient, r: { owner: string; repo: string }, number: number): Promise<string | null> {
+  const name = `${r.owner}/${r.repo}`;
+  try {
+    if ((await gh.get(repoPath(r), undefined, [404])).status !== 200) return null;
+    if ((await gh.get(repoPath(r, `/pulls/${number}`), undefined, [404])).status !== 404) return null;
+    const issue = await gh.get<any>(repoPath(r, `/issues/${number}`), undefined, [404, 410]);
+    if (issue.status === 200 && issue.json && issue.json.pull_request === undefined) {
+      return `${NO_SUCH_PULL_REQUEST}: ${name}#${number} is an issue, not a pull request (the repository is readable, and GitHub answered 404 for pull request #${number})`;
+    }
+    const newest = ((await gh.get<any[]>(repoPath(r, "/pulls"), { state: "all", sort: "created", direction: "desc", per_page: NEWEST_LISTED })).json ?? [])
+      .map((p) => p?.number).filter((n): n is number => Number.isSafeInteger(n));
+    const head = `${NO_SUCH_PULL_REQUEST}: ${name} has no pull request #${number} (the repository is readable, and GitHub answered 404 for that number`
+      + `${issue.status === 410 ? "; an issue of that number was deleted" : ""})`;
+    if (!newest.length) return `${head}; the repository has no pull requests`;
+    const listed = newest.map((n) => `#${n}`).join(", ");
+    return number > newest[0]
+      ? `${head}; its newest pull request is #${newest[0]}, so #${number} is past the last number used (newest: ${listed})`
+      : `${head}; its newest pull requests are ${listed}`;
+  } catch (err) {
+    logger.warn({ status: (err as GithubError)?.status, errorClass: (err as Error)?.constructor?.name }, "github_mcp.missing_pull_check_failed");
+    return null;
+  }
+}
+
+/** A read of one pull request whose failure says plainly that it does not exist, when that is why (`missingPullRequest`). */
+async function onePull<T>(gh: GithubClient, r: { owner: string; repo: string }, number: number, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    // GraphQL answers a number that is no pull request with an error (or with none), REST with 404.
+    const notFound = err instanceof GithubGraphqlError || (err instanceof GithubError && err.status === 404)
+      || (err instanceof BadInput && err.message === NO_PULL_IN_ANSWER);
+    const missing = notFound ? await missingPullRequest(gh, r, number) : null;
+    if (missing) throw new BadInput(missing);
+    throw err;
+  }
+}
+
+/** What review_threads_list said of a pull request GitHub's GraphQL answered with none. */
+const NO_PULL_IN_ANSWER = "no such pull request";
+
 /** A search's qualifiers that name where to search: GitHub refuses some tokens a search that carries one. */
 const SCOPED_SEARCH_RE = /(^|\s)-?(repo|org|user):/i;
 
@@ -510,9 +593,12 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     return pageAnswer(items, perPage, page);
   }, (v) => on(each(v?.items).map((r) => (typeof r.url === "string" ? { url: r.url, title: str(r.repo), kind: "github_repo" as const } : null)))));
 
-  mcp.tool("pr_get", "A pull request: title, state, author, branches, head sha, mergeability, size and description.", {
+  mcp.tool("pr_get", "A pull request: title, state, author, branches, head sha, mergeability, size, description, and once it is merged when (merged_at), by whom and its merge commit.", {
     repo: REPO, number: NUMBER,
-  }, (a) => answer("pr_get", async () => prSummary((await gh.get<any>(repoPath(repoOf(a.repo), `/pulls/${a.number}`))).json),
+  }, (a) => answer("pr_get", async () => {
+    const r = repoOf(a.repo);
+    return prSummary((await onePull(gh, r, a.number, () => gh.get<any>(repoPath(r, `/pulls/${a.number}`)))).json);
+  },
     (v) => on([itemSource(repoName(a.repo), v, true)])));
 
   mcp.tool("pr_list", "List pull requests of a repository. state open (the default) or all: newest first; closed: most recently closed first; merged: only the merged ones, most recently merged first (use it for \"what merged last\"). author keeps one person's. Says how many there are (total_count) and whether every one is shown (complete).", {
@@ -538,7 +624,8 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
   mcp.tool("pr_files", "The files a pull request changes, with each file's patch (long patches are cut).", {
     repo: REPO, number: NUMBER, page: PAGE,
   }, (a) => answer("pr_files", async () => {
-    const files = (await gh.get<any[]>(repoPath(repoOf(a.repo), `/pulls/${a.number}/files`), { per_page: 100, page: a.page ?? 1 })).json ?? [];
+    const r = repoOf(a.repo);
+    const files = (await onePull(gh, r, a.number, () => gh.get<any[]>(repoPath(r, `/pulls/${a.number}/files`), { per_page: 100, page: a.page ?? 1 }))).json ?? [];
     return files.map((f) => ({
       filename: f.filename, status: f.status, additions: f.additions, deletions: f.deletions,
       ...(f.previous_filename ? { previous_filename: f.previous_filename } : {}),
@@ -552,7 +639,8 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
   mcp.tool("pr_reviews", "The reviews of a pull request: who reviewed, their verdict (APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED), when, on which commit, and what they wrote.", {
     repo: REPO, number: NUMBER,
   }, (a) => answer("pr_reviews", async () => {
-    const reviews = (await gh.get<any[]>(repoPath(repoOf(a.repo), `/pulls/${a.number}/reviews`), { per_page: 100 })).json ?? [];
+    const r = repoOf(a.repo);
+    const reviews = (await onePull(gh, r, a.number, () => gh.get<any[]>(repoPath(r, `/pulls/${a.number}/reviews`), { per_page: 100 }))).json ?? [];
     return reviews.map((r) => ({ id: r.id, author: login(r.user), state: r.state, submitted_at: r.submitted_at, commit: r.commit_id, body: r.body ?? "" }));
   }));
 
@@ -650,6 +738,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
       complete: page === 1 && total !== null && items.length >= total && !incomplete,
       next_page: total !== null && seen < total && items.length === perPage ? page + 1 : null,
       ...(byRepo ? { by_repo: byRepo } : {}),
+      refs_by_repo: refsByRepo(items, byRepo),
       ...(notes.length ? { note: notes.join("; ") } : {}),
     });
   }, (v) => on(each(v?.items).map((i) => itemSource(typeof i.repo === "string" ? i.repo : undefined, i)))));
@@ -658,9 +747,11 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     repo: REPO, number: NUMBER,
   }, (a) => answer("review_threads_list", async () => {
     const r = repoOf(a.repo);
-    const data = await gh.graphql<any>(THREADS_QUERY, { owner: r.owner, repo: r.repo, number: a.number });
-    const pr = data?.repository?.pullRequest;
-    if (!pr) throw new BadInput("no such pull request");
+    const pr = await onePull(gh, r, a.number, async () => {
+      const found = (await gh.graphql<any>(THREADS_QUERY, { owner: r.owner, repo: r.repo, number: a.number }))?.repository?.pullRequest;
+      if (!found) throw new BadInput(NO_PULL_IN_ANSWER);
+      return found;
+    });
     return (pr.reviewThreads?.nodes ?? []).map((t: any) => ({
       id: t.id, resolved: t.isResolved, outdated: t.isOutdated, path: t.path, line: t.line,
       comments: (t.comments?.nodes ?? []).map((c: any) => ({ author: login(c.author), created_at: c.createdAt, url: c.url, body: c.body })),
