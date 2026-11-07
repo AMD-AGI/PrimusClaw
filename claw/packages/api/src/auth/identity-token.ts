@@ -36,7 +36,7 @@
  *     service client for the exchange, and SaFE to accept that actor (see docs/identity-client.md). The
  *     answer must name the token's own `sub`, or its keys are somebody else's and are not used, and it is
  *     kept per person for at most the life the delegated token has left. A token that is itself delegated
- *     (RFC 8693 `act`) is not exchanged again. A SaFE or a provider that cannot be reached is a 503; a SaFE
+ *     (RFC 8693 `act`) is not exchanged again, unless a service the operator named issued it (two items down). A SaFE or a provider that cannot be reached is a 503; a SaFE
  *     that does not accept the delegated token, or a provider that refuses the exchange, leaves the caller
  *     without keys and says so in the log. The token's roles are still not copied, and neither are SaFE's.
  *   - A delegated token has no keys of its own, and one exception: a service the operator named in
@@ -48,6 +48,11 @@
  *     that SaFE does not accept, is a 401 `invalid_api_key`, a key that is somebody else's is a 401
  *     `key_subject_mismatch`, SaFE not answering is a 503. A request from any other service, or with no
  *     `x-api-key`, is as it always was, and so is a token that is not delegated: the header is not read for it.
+ *   - A delegated token of a service the operator named in `CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS` (default: none, compared
+ *     exactly as the provider signed its `client_id`) that brings no key of the person's own has the keys SaFE holds for its subject,
+ *     got as for a token that is not delegated: the API exchanges the service's token once more at the provider (which keeps the service
+ *     in the new token's `act` chain) and shows SaFE the result. This is how a chat service that holds no key of the person (a Teams
+ *     user who never linked one) has the person's turns run on the person's own virtual key. A key the service does bring is the one used.
  *   - The one way a token's role becomes the caller's role is an operator naming it in
  *     `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` (default: none; only `system-admin` and
  *     `system-admin-readonly` can be named). Even then a role is adopted only when all
@@ -110,6 +115,8 @@ export interface IdentityTokenSettings {
   delegationScope: string;
   /** The services (client ids, compared as signed) whose delegated token may bring its subject's own key in `x-api-key`. */
   ownKeyClientIds: string[];
+  /** The services (client ids, compared as signed) whose delegated token is exchanged once more for its subject's SaFE keys. */
+  delegatedKeyClientIds: string[];
 }
 
 function setting(key: string, fallback: string): string {
@@ -130,6 +137,8 @@ function setting(key: string, fallback: string): string {
  *   CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE     its scope, default safe.api
  *   CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS   comma- or space-separated client ids of the services whose delegated token may bring
  *                                            the person's own `ak-` key in `x-api-key`; default none
+ *   CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS  comma- or space-separated client ids of the services whose delegated token is
+ *                                            exchanged once more for the keys SaFE holds for its subject; default none
  */
 export function identityTokenSettings(): IdentityTokenSettings {
   return {
@@ -141,6 +150,7 @@ export function identityTokenSettings(): IdentityTokenSettings {
     delegationAudience: setting("CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE", "primus-safe"),
     delegationScope: setting("CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE", "safe.api"),
     ownKeyClientIds: parseClientIds(process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS),
+    delegatedKeyClientIds: parseClientIds(process.env.CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS),
   };
 }
 
@@ -242,7 +252,9 @@ async function ownKeysOf(verifier: TokenKeyVerifier, key: string, sub: string): 
  * answer when that is asked for). It is not shown to SaFE: it is the proof the provider needs to
  * issue this API a token for SaFE's audience that acts for the person, and that token is what SaFE is
  * shown (`delegated-keys.ts`). A token that is itself delegated is not exchanged again: the question
- * has no useful answer for a party that was not sent the person's own token.
+ * has no useful answer for a party that was not sent the person's own token, unless the operator named the service it was issued to in
+ * `CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS`: that token is exchanged as the person's own would be, and the provider keeps the
+ * service in the chain of actors of the token SaFE is shown.
  *
  * `unavailable` is SaFE or the provider not being able to answer (unreachable, 5xx) and `misconfigured` is this
  * API not being able to ask (no `AUTH_INTERNAL_TOKEN`), as for a cookie or a key: neither is "no
@@ -254,12 +266,14 @@ async function ownKeysOf(verifier: TokenKeyVerifier, key: string, sub: string): 
  */
 async function safeKeysOf(
   verifier: TokenKeyVerifier, identity: NonNullable<ReturnType<typeof identityClient>>, token: string, sub: string,
-  claims: Record<string, unknown>, ownKey: string | undefined, settings: IdentityTokenSettings,
+  claims: Record<string, unknown>, clientId: string, ownKey: string | undefined, settings: IdentityTokenSettings,
 ): Promise<SaFeKeys> {
   if (ownKey !== undefined) return ownKeysOf(verifier, ownKey, sub);
   const verifyAccessToken = verifier?.verifyAccessToken?.bind(verifier);
   if (!verifier || !verifyAccessToken) return { status: "none", reason: "no_safe" };
-  if (claims.act !== undefined) return { status: "none", reason: "delegated_token" };
+  if (claims.act !== undefined && !(clientId && settings.delegatedKeyClientIds.includes(clientId))) {
+    return { status: "none", reason: "delegated_token" };
+  }
   let cache = keyCaches.get(verifier);
   if (!cache) keyCaches.set(verifier, (cache = new DelegatedKeys()));
   return cache.keysOf(sub, token, { audience: settings.delegationAudience, scope: settings.delegationScope }, {
@@ -332,7 +346,7 @@ export async function verifyIdentityAccessToken(
     // `worker ` are two clients (only a blank id is no id).
     const clientId = typeof claims.client_id === "string" && claims.client_id.trim() !== "" ? claims.client_id : "";
     const ownKey = ownKeyPresented(req, claims, clientId, settings);
-    const keys = await safeKeysOf(verifier, identity, token, sub, claims, ownKey, settings);
+    const keys = await safeKeysOf(verifier, identity, token, sub, claims, clientId, ownKey, settings);
     if (keys.status === "unavailable") {
       logger.warn({ path: pathname, source: keys.source }, "auth.identity_token.keys_unavailable");
       return {

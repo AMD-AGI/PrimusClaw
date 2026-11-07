@@ -26,6 +26,7 @@
  *   K5  the answer is kept per person for at most the delegated token's life, and a failure to answer is not
  *   K6  `callerAuthOf` presents the platform key for such a caller (`GET /v1/me` with it is me-route-identity-token.test.ts)
  *   K7  a delegated token has no keys, except an allow-listed service's, which may bring the person's own key: which refusals, and what is never read
+ *   K9  a delegated token of a service named in CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS is exchanged once more, and has its subject's keys
  */
 import test, { after, before, beforeEach, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -106,7 +107,7 @@ const ENV_KEYS = [
   "IDENTITY_EXCHANGE_REFRESH_SKEW_SECONDS",
   "CLAW_IDENTITY_TOKEN_AUTH_ENABLED", "CLAW_IDENTITY_TOKEN_AUDIENCE", "CLAW_IDENTITY_TOKEN_SCOPE", "CLAW_IDENTITY_TOKEN_INTROSPECT",
   "CLAW_IDENTITY_TOKEN_TRUSTED_ROLES", "CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE", "CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE",
-  "CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS",
+  "CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS", "CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS",
 ];
 
 function identity(): void {
@@ -673,6 +674,81 @@ describe("K7 a delegated token has no keys, except an allow-listed service's, wh
     process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = ` first ,${SERVICE}\n  third,${SERVICE}`;
     assert.equal(user(await run(asService(), client, { "x-api-key": "ak-alice-platform" })).platformKey, "ak-alice-platform");
     assert.equal(user(await run(delegatedBy("fir"), client, { "x-api-key": "ak-alice-platform" })).platformKey, "");
+  });
+});
+
+describe("K9 a named chat service's delegated token has the keys SaFE holds for its subject (CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS)", () => {
+  const CHAT = "svc-teams";
+  /** As the provider issues it to a chat service for a person it has a binding of: `sub` the person, `act` and `client_id` the service. */
+  const byChat = (over: Record<string, unknown> = {}) => mint({ act: { sub: CHAT }, client_id: CHAT, ...over });
+  const asked = () => verifyCalls().map((c) => JSON.parse(c.body) as { apiKey?: string; authorization?: string });
+  beforeEach(() => { process.env.CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS = CHAT; });
+
+  test("the service's token is exchanged once more, SaFE is shown the result (this API acting, the service kept in the chain), and the keys are the subject's", async () => {
+    const token = byChat();
+    const u = user(await run(token));
+    assert.deepEqual([u.userId, u.platformKey, u.virtualKey], ["u-alice", "ak-alice-platform", "sk-alice-virtual"]);
+    assert.deepEqual(u.roles, ["default"], "SaFE's roles are still nobody's but the operator's");
+    assert.deepEqual(u.delegation, { actorSub: CHAT, clientId: CHAT }, "still a service acting for the person");
+    assert.deepEqual(delegations.map((d) => [d.subjectToken, d.audience, d.scope]), [[token, "primus-safe", "safe.api"]]);
+    const [shown] = asked();
+    assert.equal(asked().length, 1);
+    assert.equal(shown!.apiKey, undefined);
+    const delegated = payloadOf(shown!.authorization!.replace("Bearer ", ""));
+    assert.deepEqual([delegated.sub, delegated.aud, delegated.act], ["u-alice", "primus-safe", { sub: CLAW, act: { sub: CHAT } }]);
+    assert.notEqual(shown!.authorization, `Bearer ${token}`, "SaFE never sees the service's token itself");
+  });
+
+  test("two people through the same service never share keys", async () => {
+    const a = user(await run(byChat()));
+    const b = user(await run(byChat({ sub: "u-bob", name: "Bob" })));
+    assert.deepEqual([a.virtualKey, b.virtualKey], ["sk-alice-virtual", "sk-bob-virtual"]);
+  });
+
+  test("an answer for another subject than the token's is not taken", async () => {
+    verifyAnswer = (req, res) => sendJson(res, 200, { code: 0, data: { id: "u-bob", name: "Bob", platformKey: "ak-bob-platform", virtualKey: "sk-bob-virtual" } });
+    const u = user(await run(byChat()));
+    assert.deepEqual([u.userId, u.platformKey, u.virtualKey], ["u-alice", "", ""]);
+  });
+
+  test("a key the service brings for the person is still the one used, and nothing is exchanged", async () => {
+    process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = CHAT;
+    const u = user(await run(byChat(), client, { "x-api-key": "ak-alice-platform" }));
+    assert.deepEqual([u.platformKey, u.virtualKey], ["ak-alice-platform", "sk-alice-virtual"]);
+    assert.equal(exchangeCalls().length, 0);
+    assert.deepEqual(asked().map((q) => q.apiKey), ["ak-alice-platform"]);
+  });
+
+  test("the provider or SaFE not answering is a 503, as for a token that is not delegated, never a keyless caller", async () => {
+    verifyAnswer = (_r, res) => sendJson(res, 503, { code: 503, message: "down" });
+    const e = refused(await run(byChat()));
+    assert.deepEqual([e.status, e.legacyError], [503, "authentication_service_unavailable"]);
+  });
+
+  // [name, the environment's list (null: unset; undefined: this suite's), the token]: keyless, nothing exchanged, SaFE not asked, as before.
+  const keyless: Array<[string, string | null | undefined, () => string]> = [
+    ["no service is named (the default)", null, () => byChat()],
+    ["an empty list", "", () => byChat()],
+    ["another service is named", "svc-other", () => byChat()],
+    ["a client id that differs by case", undefined, () => mint({ act: { sub: CHAT }, client_id: "SVC-TEAMS" })],
+    ["a client id that merely begins with the named one", undefined, () => mint({ act: { sub: CHAT }, client_id: `${CHAT}-2` })],
+    ["a client id that differs by a trailing space", undefined, () => mint({ act: { sub: CHAT }, client_id: `${CHAT} ` })],
+    ["a delegated token that names no client (its act names the service)", undefined, () => byChat({ client_id: undefined })],
+  ];
+  for (const [name, list, token] of keyless) {
+    test(`not exchanged, no keys (as before): ${name}`, async () => {
+      if (list === null) delete process.env.CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS;
+      else if (list !== undefined) process.env.CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS = list;
+      const u = user(await run(token()));
+      assert.deepEqual([u.userId, u.platformKey, u.virtualKey], ["u-alice", "", ""]);
+      assert.equal(exchangeCalls().length, 0);
+      assert.equal(verifyCalls().length, 0);
+    });
+  }
+
+  test("the setting is a list of client ids as signed, separated by commas or white space", async () => {
+    process.env.CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS = ` first ,${CHAT}\n third`;
+    assert.equal(user(await run(byChat())).virtualKey, "sk-alice-virtual");
   });
 });
 
