@@ -59,6 +59,72 @@ export const REMOTE_AGENT_TIMING = {
   watchdogMs: 75_000,
 } as const;
 
+/** The npm package the connector is published as; its command is `claw-connector`. */
+export const CONNECTOR_PACKAGE = "@primusclaw/connector";
+
+/**
+ * Which connector versions a server takes. Below `minimum` a connector still registers and is listed (so its owner
+ * sees why), but no new session is started on it (`409 connector_outdated`); below `recommended` it works and its
+ * owner is told to upgrade. A server may move both with `CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION` and
+ * `CLAW_REMOTE_AGENTS_RECOMMENDED_CONNECTOR_VERSION`. 0.1.3 is the first release with `service install`; 0.1.4 names
+ * the prompt every `turn_end` ends, without which an assistant item stays in progress after its last instruction.
+ */
+export const CONNECTOR_VERSIONS = { minimum: "0.1.3", recommended: "0.1.4" } as const;
+
+/** `current`: at least the recommended version; `outdated`: works, upgrade; `unsupported`: below the minimum; `unknown`: no readable version. */
+export type ConnectorVersionStatus = "current" | "outdated" | "unsupported" | "unknown";
+
+const SEMVER_RE = /^v?(\d{1,9})\.(\d{1,9})\.(\d{1,9})(?:-([0-9A-Za-z.-]{1,64}))?(?:\+[0-9A-Za-z.-]{1,64})?$/;
+
+/** A version's `[major, minor, patch, prerelease]`, or null when it is no `x.y.z`. */
+function semver(v: string): [number, number, number, string | null] | null {
+  const m = SEMVER_RE.exec(v.trim());
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3]), m[4] ?? null] : null;
+}
+
+/** Two prerelease tags in semver's order: identifier by identifier, numbers numerically and below words, a shorter prefix first. */
+function comparePrerelease(a: string, b: string): number {
+  const x = a.split(".");
+  const y = b.split(".");
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    if (x[i] === undefined) return -1;
+    if (y[i] === undefined) return 1;
+    const nx = /^\d+$/.test(x[i]);
+    const ny = /^\d+$/.test(y[i]);
+    if (nx && ny) { const d = Number(x[i]) - Number(y[i]); if (d) return d < 0 ? -1 : 1; continue; }
+    if (nx !== ny) return nx ? -1 : 1;
+    if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Compares two `x.y.z` versions as semver orders them (a prerelease sorts before its release; build metadata is ignored). Null when
+ * either is not a version.
+ */
+export function compareConnectorVersions(a: string, b: string): number | null {
+  const x = semver(a);
+  const y = semver(b);
+  if (!x || !y) return null;
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return (x[i] as number) < (y[i] as number) ? -1 : 1;
+  if (x[3] === y[3]) return 0;
+  if (x[3] === null) return 1;
+  if (y[3] === null) return -1;
+  return comparePrerelease(x[3], y[3]);
+}
+
+/** Where `version` stands against `policy`. A connector that reports no version, or one that is no `x.y.z`, is `unknown`: it is not refused. */
+export function connectorVersionStatus(
+  version: string | null | undefined, policy: { minimum: string; recommended: string } = CONNECTOR_VERSIONS,
+): ConnectorVersionStatus {
+  if (!version) return "unknown";
+  const toMin = compareConnectorVersions(version, policy.minimum);
+  if (toMin === null) return "unknown";
+  if (toMin < 0) return "unsupported";
+  const toRec = compareConnectorVersions(version, policy.recommended);
+  return toRec !== null && toRec < 0 ? "outdated" : "current";
+}
+
 /** Event types the server itself acts on; every other type is stored and relayed as is. */
 export const REMOTE_EVENT_PERMISSION_REQUEST = "permissionRequest";
 export const REMOTE_EVENT_PERMISSION_RESOLVED = "permission_resolved";

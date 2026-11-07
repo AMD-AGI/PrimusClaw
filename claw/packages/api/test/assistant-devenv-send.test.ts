@@ -462,6 +462,33 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations"))[0].n, 3);
   });
 
+  test("F4b no machine gives the exact commands that connect one; a connector below the minimum starts no session", async () => {
+    const alice = await w.user("alice");
+    const none = await tools.devenvSend(await userTurn(alice, "让开发机上的 claude 跑 make"), { text: "make" }).catch((e) => e);
+    assert.equal((none as Recorded).code, "no_machine");
+    const setup = (none as Recorded).data.connect_a_machine;
+    assert.equal(setup.commands[0], "npm install -g @primusclaw/connector");
+    assert.match(setup.commands[2], /^claw-connector login --server /);
+    assert.match(setup.text_zh, /claw-connector init/);
+    assert.match(setup.text_en, /claw-connector service install/);
+
+    const laptop = await machine("alice", "laptop");
+    const open = await chatSession("alice", laptop);   // (opened while its connector was still new enough)
+    await w.q("UPDATE claw_remote_connectors SET version = '0.1.2' WHERE connector_id = $1", [laptop]);
+    // A session already open on it continues: only a new one is refused.
+    const cont = await tools.planSend("alice", { text: "make", target: open });
+    assert.equal(cont.ok, true, JSON.stringify(cont));
+    await w.q("UPDATE claw_remote_sessions SET status = 'closed' WHERE session_id = $1", [open]);
+    const old = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make"), { text: "make", target: "laptop" }).catch((e) => e);
+    assert.equal((old as Recorded).code, "connector_outdated");
+    assert.match((old as Recorded).message, /0\.1\.2, older than 0\.1\.3.*npm install -g @primusclaw\/connector@latest && claw-connector stop && claw-connector service install$/);
+    // A card pressed after the connector went out of date sends nothing either.
+    const plan = { connector_id: laptop, machine: "laptop", agent_id: "claude", agent_name: null, session_id: null, resume_ref: null, cwd: "/home/u/repo", label: "laptop/claude/new" };
+    const sent = await tools.executeSend("alice", plan, "make", "k-outdated", "en");
+    assert.deepEqual([sent.ok, (sent as Recorded).error], [false, "connector_outdated"]);
+    assert.deepEqual(await queued(laptop), []);
+  });
+
   test("F4 only the user's own machines; two that fit is a question; an offline one says so", async () => {
     const alice = await w.user("alice");
     await w.user("bob");
@@ -1064,7 +1091,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v4");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v5");
     // What operators and release notes say Claw may run on a user's machine is what the code does: a card, never from the turn.
     const { readFileSync } = await import("node:fs");
     const doc = readFileSync(new URL("../../../docs/remote-agents.md", import.meta.url), "utf8");

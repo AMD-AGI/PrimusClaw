@@ -36,6 +36,7 @@ import { db } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
+import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
 import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
@@ -269,7 +270,16 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   app.get("/v1/remote-agents/connectors", async (req, reply) => {
     const owner = requireOwner(req, reply);
     if (!owner) return;
-    return reply.send({ ok: true, data: await store.listConnectors(owner, onlineWindowMs) });
+    const policy = connectorVersionPolicy();
+    const rows = await store.listConnectors(owner, onlineWindowMs);
+    return reply.send({ ok: true, data: rows.map((r) => ({ ...r, ...versionVerdict(r.version as string | null, policy) })) });
+  });
+
+  /** How to connect a machine to this server: the package, the exact commands and this deployment's addresses (`remote-agents/setup.ts`). */
+  app.get("/v1/remote-agents/setup", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    return reply.send({ ok: true, data: connectorSetup() });
   });
 
   /** Revoke one of the caller's connectors: the row stays revoked for good, its queued commands go and its sessions close. */
@@ -307,7 +317,12 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const hb = parseHeartbeat(req.body);
     if (!hb.ok) return fail(reply, 400, hb.error);
     await store.recordHeartbeat(connector.connector_id, owner, hb.value);
-    return reply.send({ ok: true, data: { server_time: new Date().toISOString(), online_window_ms: onlineWindowMs } });
+    // Below the recommended version the answer says so, with the command that upgrades it; a connector may print it.
+    const verdict = versionVerdict(hb.value.version ?? (connector.version as string | null));
+    return reply.send({ ok: true, data: {
+      server_time: new Date().toISOString(), online_window_ms: onlineWindowMs,
+      ...(verdict.upgrade_command ? { connector_version: verdict } : {}),
+    } });
   });
 
   app.post(CONNECTOR_SIDE_ROUTES.events.url, async (req, reply) => {
@@ -401,6 +416,11 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     )).rows;
     if (!agents.length) return fail(reply, 404, "agent_not_found");
     if (!connector.online) return fail(reply, 409, "connector_offline");
+    // Too old to be given a session: the owner is told which version and how to upgrade, instead of a session that fails on it.
+    const verdict = versionVerdict(connector.version as string | null);
+    if (verdict.version_status === "unsupported") {
+      return reply.status(409).send({ ok: false, error: "connector_outdated", data: { version: connector.version, ...verdict } });
+    }
     const out = await store.createSession({
       owner, client: clientLabel(req), connectorId: connector.connector_id, agentId: body.value.agent_id,
       cwd: body.value.cwd, mode: body.value.mode, resumeRef: body.value.resume_ref, maxActive: maxActiveSessions, commandsPerMinute,
