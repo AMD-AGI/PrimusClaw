@@ -251,7 +251,8 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     t.tmux("send-keys", "-t", "%0", "-l", "the person types");
     await until("their text", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "typed");
     const three = h.prompt(sid, "third");
-    const queued = await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued")[0]);
+    // (its own notice: an earlier message may have had one of its own while the screen was being redrawn, terminal_state_unknown)
+    const queued = await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === three));
     assert.deepEqual([queued.data.reason, queued.data.cmd_seq], ["terminal_typing", three]);
     assert.ok(!typed(t.transcript).includes("third"), "not typed over their text");
     t.tmux("send-keys", "-t", "%0", "C-u");
