@@ -135,6 +135,27 @@ describe("a command held in the socket while the connector was stopped", { timeo
     assert.deepEqual(audit(m).filter((r) => r.kind === "turn_started"), []);
   });
 
+  test("a prompt read before the stall and queued behind a running turn is confirmed when it reaches the agent, and dropped once its session closed", async () => {
+    const m = await machine();
+    const sid = await openSession(m);
+    const gate = path.join(m.work, "the-turn-may-end");
+    m.claw.issue("prompt", sid, { text: `wait ${gate}` });
+    await m.claw.until("the long turn running", () => received(m).includes(`wait ${gate}`), 15_000);
+    const seq = m.claw.issue("prompt", sid, { text: "ls" });
+    const cmd = String(m.claw.commands.find((c) => c.seq === seq)!.payload.cmd_id);
+    await sleep(500); // read, and queued on the machine behind the running turn, before the lid closes
+    assert.deepEqual(m.claw.confirmations, []);
+    await lidClosed(m, () => {
+      m.claw.closedSessions.add(sid); // the person closed the session while the lid was closed
+      fs.writeFileSync(gate, ""); // and the running turn ends meanwhile (its adapter was not stopped)
+    });
+    const rejected = await m.claw.until("the queued prompt refused", () => m.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_id === cmd), 15_000);
+    assert.equal(rejected.data.status, "session_closed");
+    assert.deepEqual(m.claw.confirmations, [{ cmd_id: cmd, status: "session_closed" }]);
+    await sleep(500);
+    assert.equal(received(m).includes("ls"), false, "the queued prompt never reached the agent");
+  });
+
   test("a prompt still live after the stall is confirmed and runs; one that arrives without a stall runs without asking", async () => {
     const m = await machine();
     const sid = await openSession(m);

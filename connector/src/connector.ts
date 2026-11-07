@@ -270,6 +270,8 @@ export class Connector {
   private tickWall = Date.now();
   /** Until this monotonic time every command (but a cancel or close) is confirmed with Claw first: a stall just ended. */
   private confirmUntil = -Infinity;
+  /** How many stalls this run has seen: a command read before one and still waiting to act is confirmed when it acts. */
+  private stallEpoch = 0;
   /** Claw's clock minus this machine's, from the command stream's `ready` frame, to judge a command's `issued_at`. */
   private clockOffsetMs = 0;
   /** connector.json, written off the event loop: a heartbeat never waits for the disk (see statefile.ts). */
@@ -737,14 +739,36 @@ export class Connector {
     this.ledger.begin(seq, cmd.cmd_id);
     // Judged now, as the frame is read, not once it reaches the front of its session's queue: a frame read just after a stall
     // was in the socket's buffer through it.
-    const late = ENDING_COMMANDS.has(cmd.type) ? null : this.lateness(cmd);
+    const gate = ENDING_COMMANDS.has(cmd.type) ? undefined : this.gateFor(cmd, this.lateness(cmd));
     // Not awaited: the stream must keep being read while a slow command (starting an adapter) runs.
     // The command counts as handled when the manager says so (a prompt: when it reaches the adapter), and
     // only then can the cursor sent to the server pass it. A late one runs only if Claw says it is still live.
     void this.manager.handle(cmd, () => {
       this.ledger.end(seq, cmd.cmd_id);
       this.writeIdentity();
-    }, late ? () => this.confirmLive(cmd, late) : undefined);
+    }, gate);
+  }
+
+  /**
+   * What is asked each time `cmd` is about to act: when it reaches the front of its session's commands, and again when a prompt
+   * queued behind a running turn (or waiting for a terminal) reaches the agent. True at once, with no request, unless it was read
+   * late (`late`) or a stall has happened since it was read or last confirmed: then Claw is asked (`confirmLive`). Once refused,
+   * always refused.
+   */
+  private gateFor(cmd: Command, late: "stall" | "old" | null): () => boolean | Promise<boolean> {
+    let seen = this.stallEpoch;
+    let why: "stall" | "old" | null = late;
+    let refused = false;
+    return () => {
+      if (refused) return false;
+      this.tick();
+      if (this.stallEpoch !== seen) why ??= "stall";
+      if (!why) return true;
+      const asking = why;
+      why = null;
+      seen = this.stallEpoch;
+      return this.confirmLive(cmd, asking).then((ok) => { if (!ok) refused = true; return ok; });
+    };
   }
 
   /** One tick of the stall clock; a gap since the last one longer than `stallMs` is a stall that just ended. */
@@ -758,6 +782,7 @@ export class Connector {
     this.tickWall = wall;
     if (gap > this.timing.stallMs) {
       this.confirmUntil = mono + this.timing.stallMs;
+      this.stallEpoch++;
       this.d.log.warn("this process could not run for a while (stopped, or the machine slept): commands received now are confirmed with Claw before they run", { gap_ms: Math.round(gap) });
       this.d.audit.record("stall_detected", { gap_ms: Math.round(gap) });
     }

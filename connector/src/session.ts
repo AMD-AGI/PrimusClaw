@@ -33,7 +33,7 @@ import {
 } from "./permissions.js";
 import { redactDeep } from "./redact.js";
 import type { SessionStore } from "./session-store.js";
-import { errMessage, isObject, sleep, truncateBytes, type Logger } from "./util.js";
+import { allowed, errMessage, isObject, sleep, truncateBytes, type Logger, type MayRun } from "./util.js";
 
 /** `after`: the event is written (and posted) only once that has settled, e.g. the record it depends on is on disk. */
 export type Emit = (sessionId: string, type: string, data: Record<string, unknown>, after?: Promise<unknown>) => void;
@@ -150,7 +150,7 @@ export class Session {
    * again). See {@link SessionManager.recover}.
    */
   private stopping = false;
-  private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void }> = [];
+  private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun }> = [];
   private launching: Promise<void> | null = null;
   private idle: NodeJS.Timeout | undefined;
   /**
@@ -164,7 +164,7 @@ export class Session {
    * still {@link readOnly} here (no agent is started, nothing else writes), but not to Claw: it takes prompts.
    */
   private terminal: TerminalInput | null = null;
-  private terminalQueue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void }> = [];
+  private terminalQueue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun }> = [];
   private terminalTurn: {
     cmdId: string | null; cmdSeq: number | null; text: string; sentAt: number; seen: boolean; idleSince: number | null; done: () => void;
   } | null = null;
@@ -398,9 +398,9 @@ export class Session {
    * A message for a conversation open in a tmux pane: queued, then typed into the terminal once it is free (Claude Code says it
    * is idle, and its input box is empty), one at a time. While it waits the phone is told once why (`terminal_input_queued`).
    */
-  private enqueueTerminal(text: string, cmdId: string | null, cmdSeq: number | null, started: () => void): void {
+  private enqueueTerminal(text: string, cmdId: string | null, cmdSeq: number | null, started: () => void, mayRun?: MayRun): void {
     if (this.terminalQueue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts", cmdSeq); return started(); }
-    this.terminalQueue.push({ text, cmdId, cmdSeq, started });
+    this.terminalQueue.push({ text, cmdId, cmdSeq, started, mayRun });
     void this.pumpTerminal();
   }
 
@@ -465,6 +465,14 @@ export class Session {
         if (this.closed || this.terminalQueue[0] !== next) continue;   // closed, or dropped by a cancel
         if (modeRefused) { refused(modeRefused, "", { terminal_mode: mode }); continue; }
         if (!ready) { refused(told === WAIT_WHY.gone ? "terminal_gone" : told === WAIT_WHY.other ? "terminal_switched" : "terminal_busy", told); continue; }
+        // Still live (connector.ts `gateFor`: Claw is asked if the connector stalled since the message came): if not, it was
+        // reported as refused already and is only dropped here.
+        if (next.mayRun && !(await allowed(next.mayRun))) {
+          if (this.terminalQueue[0] === next) this.terminalQueue.shift();
+          next.started();
+          continue;
+        }
+        if (this.closed || this.terminalQueue[0] !== next) continue;
         // Asked again just before the keys go: the same process, still on this conversation, still idle.
         if (this.holderStatus(term) !== "idle") { refused("terminal_switched", "the terminal changed just before typing"); continue; }
         this.terminalQueue.shift();
@@ -1011,9 +1019,9 @@ export class Session {
    * the session closed): only then does the connector count the command as handled, so a restart before that
    * delivers it again instead of losing it.
    */
-  enqueuePrompt(text: string, cmdId: string | null, started: () => void = () => {}, cmdSeq: number | null = null): void {
+  enqueuePrompt(text: string, cmdId: string | null, started: () => void = () => {}, cmdSeq: number | null = null, mayRun?: MayRun): void {
     if (this.closed) { this.rejectCommand("prompt", cmdId, "session_closed", cmdSeq); return started(); }
-    if (this.readOnly && (this.terminal || this.terminalRestoring)) return this.enqueueTerminal(text, cmdId, cmdSeq, started);
+    if (this.readOnly && (this.terminal || this.terminalRestoring)) return this.enqueueTerminal(text, cmdId, cmdSeq, started, mayRun);
     if (this.readOnly) {
       // Never queued, never sent: what the person typed does not reach the conversation the terminal is writing.
       this.audit("prompt_refused", { reason: READ_ONLY_REASON });
@@ -1022,7 +1030,7 @@ export class Session {
       return started();
     }
     if (this.queue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts", cmdSeq); return started(); }
-    this.queue.push({ text, cmdId, cmdSeq, started });
+    this.queue.push({ text, cmdId, cmdSeq, started, mayRun });
     if (!this.turnRunning) void this.pump();
   }
 
@@ -1047,6 +1055,10 @@ export class Session {
     try {
       while (this.queue.length && !this.closed) {
         const next = this.queue.shift()!;
+        // Still live as it reaches the agent (connector.ts `gateFor`): asked of Claw only if the connector stalled since the
+        // prompt came. Refused, it was reported already and is only counted as handled here.
+        if (next.mayRun && !(await allowed(next.mayRun))) { next.started(); continue; }
+        if (this.closed) { this.rejectCommand("prompt", next.cmdId, "session_closed", next.cmdSeq); next.started(); break; }
         await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq);
       }
     } finally {
