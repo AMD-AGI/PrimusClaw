@@ -954,7 +954,10 @@ describe("crash safety", () => {
     await h.claw.until("the record without the turn", () => {
       const turns = path.join(h.dirs.state, "sessions.json.turns");
       // (The stuck write renames the FIFO into place before the next write replaces it: never read a FIFO here.)
-      try { return fs.lstatSync(turns).isFile() && !(sid in JSON.parse(fs.readFileSync(turns, "utf8"))); } catch { return false; }
+      // One open, then a check and a read of that same file: O_NONBLOCK keeps the open of a FIFO from waiting for a writer.
+      let fd: number;
+      try { fd = fs.openSync(turns, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK); } catch { return false; }
+      try { return fs.fstatSync(fd).isFile() && !(sid in JSON.parse(fs.readFileSync(fd, "utf8"))); } catch { return false; } finally { fs.closeSync(fd); }
     }, 3_000);
     h.connect();
     h.start();
