@@ -1416,6 +1416,7 @@ describe("a session opened and never used, across a restart", () => {
     await h.stop();
     // What a connector from before this change left behind: no `unused` marker.
     h.connector.store.patch(sid, { unused: undefined });
+    assert.equal(await h.connector.store.flushed(), true, "on disk before the restart (the store writes off the event loop)");
     h.connect();
     h.start();
     h.prompt(sid, "say hello");
