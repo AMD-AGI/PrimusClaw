@@ -1326,9 +1326,11 @@ export async function parkForIdleReclaim(sessionId: string): Promise<void> {
       // further than parking would have got.
       return;
     case "superseded":
-      // Every replica runs this teardown, so all of them park and only one can
-      // win the conditional write. Losing is the expected outcome and the goal is
-      // still met, so this is not a failure. Reporting it as one would mean five
+      // One replica runs a session's teardown now (a queue group), but two can
+      // still park at once -- during a rollout, when a replica of a version that
+      // ran it everywhere is still up -- and only one can win the conditional
+      // write. Losing is the expected outcome and the goal is still met, so this
+      // is not a failure. Reporting it as one would mean five
       // misleading warnings per incomplete teardown, burying a real KV outage
       // among them.
       logger.info({ sessionId }, "hands.park_for_idle_reclaim_superseded");

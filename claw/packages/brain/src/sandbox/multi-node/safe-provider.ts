@@ -158,24 +158,57 @@ export function sessionWorkspaces(workspaces: readonly (string | null | undefine
 }
 
 /**
- * Every workload a session owns: the unscoped list when the key may read it, else one walk per recorded
- * workspace. A walk that fails fails the whole lookup: a teardown that read one workspace and not the other
- * must not call the session clean.
+ * The workspaces SaFE says the key's user belongs to (`GET /api/v1/users/self`, `workspaces[].id`).
+ *
+ * Throws when SaFE will not say: an unknown membership is not an empty one, and a teardown that read it as
+ * empty would call a session clean without having looked anywhere.
+ */
+async function keyWorkspaces(apiKey: string): Promise<string[]> {
+  const resp = await safeFetch("/api/v1/users/self", { apiKey });
+  if (resp.status !== 200) {
+    throw new WorkloadListRefused(resp.status, `users/self failed: HTTP ${resp.status} ${JSON.stringify(resp.body).slice(0, 300)}`);
+  }
+  const list = resp.body && typeof resp.body === "object" ? (resp.body as { workspaces?: unknown }).workspaces : undefined;
+  if (!Array.isArray(list)) {
+    throw new WorkloadListRefused(resp.status, `users/self named no workspace list: ${JSON.stringify(resp.body).slice(0, 300)}`);
+  }
+  return sessionWorkspaces(list.map((w) => {
+    const id = w && typeof w === "object" ? (w as { id?: unknown }).id : undefined;
+    return typeof id === "string" ? id : undefined;
+  }));
+}
+
+/**
+ * Every workload a session owns: the unscoped list when the key may read it, else one walk per workspace
+ * the session recorded -- or, when it recorded none, per workspace the key's user belongs to. A walk that
+ * fails fails the whole lookup: a teardown that read one workspace and not the other must not call the
+ * session clean.
+ *
+ * The key's own workspaces are asked for because a session does not always record one. Its `hands.<sid>`
+ * binding names the sandbox's workspace, but a session that never started a sandbox (a connector session, a
+ * session deleted the moment it was created) or whose binding was already removed has none -- and a
+ * non-admin key's unscoped list is always 403, so every such delete by an ordinary user or a service
+ * identity used to end `lookup_failed` and log `session.cleanup_incomplete_parked`, with nothing to park.
+ * A key can only have created workloads in a workspace its user may use, so those workspaces are the whole
+ * of where this session's workloads can be; a user who belongs to none owns none, which is a finished
+ * teardown with nothing found rather than a failed one.
  */
 async function findSessionWorkloads(
   sessionId: string,
   apiKey: string,
   workspaces?: readonly (string | null | undefined)[],
 ): Promise<SessionWorkloadPage> {
-  const scopes = sessionWorkspaces(workspaces);
   // The unscoped list first: a key that may read it (an admin's) sees every workspace, including one the
   // binding does not name, exactly as before. Only its 403 -- the answer every other key gets -- moves the
-  // lookup to the recorded workspaces.
+  // lookup to the named workspaces.
   try {
     return await findSessionWorkloadsIn(sessionId, apiKey, undefined);
   } catch (err) {
-    if (!(err instanceof WorkloadListRefused) || err.status !== 403 || scopes.length === 0) throw err;
+    if (!(err instanceof WorkloadListRefused) || err.status !== 403) throw err;
   }
+  // The recorded workspaces when there are any, as before; the key's own only when the session recorded none.
+  const recorded = sessionWorkspaces(workspaces);
+  const scopes = recorded.length ? recorded : await keyWorkspaces(apiKey);
   const items: WorkloadRef[] = [];
   let incomplete = false;
   let reason: SessionWorkloadPage["reason"];
