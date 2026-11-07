@@ -7,7 +7,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, describe } from "node:test";
@@ -70,6 +70,35 @@ describe("a running worker's files, read now", () => {
       assert.ok(out.files[0].tail.endsWith("real last line"));
       assert.ok(Math.abs(Date.parse(out.read_at) - Date.now()) < 5000, "the file's text is not the script's clock");
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("a listed file swapped for a link since is not read: not outside the workspace, not a hidden file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "claw-live-files-swap-"));
+    const outside = mkdtempSync(join(tmpdir(), "claw-live-files-outside-"));
+    const shim = mkdtempSync(join(tmpdir(), "claw-live-files-shim-"));
+    try {
+      mkdirSync(join(dir, "job"));
+      writeFileSync(join(outside, "secret.txt"), "OUTSIDE THE WORKSPACE\n");
+      writeFileSync(join(dir, ".env"), "HIDDEN=1\n");
+      writeFileSync(join(dir, "job/progress.log"), "step 5/16\n");
+      symlinkSync(join(outside, "secret.txt"), join(dir, "job/out.log"));
+      symlinkSync(join(dir, ".env"), join(dir, "job/env.log"));
+      // What \`find\` listed while these were still regular files: the swap happened after it.
+      const now = Math.floor(Date.now() / 1000);
+      const listed = ["job/out.log", "job/env.log", "job/progress.log"].map((p) => `'${now} 10 ${p}'`).join(" ");
+      writeFileSync(join(shim, "find"), `#!/bin/sh\nprintf '%s\\0' ${listed}\n`);
+      chmodSync(join(shim, "find"), 0o755);
+      const out = parseLiveFiles(execFileSync("bash", ["-c", liveFilesScript(dir)], {
+        encoding: "utf8", env: { ...process.env, PATH: `${shim}:${process.env.PATH}` },
+      }));
+      assert.equal(out.status, "read");
+      if (out.status !== "read") return;
+      assert.deepEqual(out.files.map((f) => f.path), ["job/progress.log"], "only the file that is what it was listed as");
+      assert.ok(!JSON.stringify(out).includes("OUTSIDE"));
+      assert.ok(!JSON.stringify(out).includes("HIDDEN"));
+    } finally {
+      for (const d of [dir, outside, shim]) rmSync(d, { recursive: true, force: true });
+    }
   });
 
   test("an empty or missing workspace reads as no files", () => {

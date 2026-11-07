@@ -32,19 +32,32 @@ export const LIVE_FILE_TAIL_CHARS = 1200;
 /** The router is waiting: well inside Hands' own limit. */
 const LIVE_FILES_TIMEOUT_SEC = 8;
 
-/** The script: no input but the root, a constant here. Paths and contents go out as base64, so nothing in them can break the framing. */
+/**
+ * The script: no input but the root, a constant here. Paths and contents go out as base64, so nothing in them can break the framing.
+ *
+ * A file is opened once (fd 3) and read only through that descriptor, after checking what was opened: a regular file whose real path
+ * is under the root and in no hidden or dependency directory. A path `find` listed and something in the sandbox swapped for a link
+ * since (to a file outside the workspace, or to `.env`) is therefore not read.
+ */
 export function liveFilesScript(root: string = WORKSPACE_ROOT): string {
   const q = `'${root.replace(/'/g, `'\\''`)}'`;
   return [
-    `cd ${q} 2>/dev/null || exit 0;`,
+    `cd ${q} 2>/dev/null || exit 0; R=$(pwd -P);`,
     `find . -xdev \\( -path '*/.*' -o -name node_modules \\) -prune -o -type f -mmin -${LIVE_FILES_MINUTES} -printf '%T@ %s %P\\0' 2>/dev/null`,
     `| sort -z -rn | head -z -n 20 | { n=0; while IFS= read -r -d '' r; do`,
-    `t=\${r%% *}; rest=\${r#* }; s=\${rest%% *}; p=\${rest#* };`,
+    `t=\${r%% *}; rest=\${r#* }; p=\${rest#* };`,
+    `exec 3<"$p" 2>/dev/null || continue;`,
+    `f=$(readlink /proc/self/fd/3 2>/dev/null); rel=\${f#"$R"/};`,
+    `case "$f" in "$R"/*) ;; *) exec 3<&-; continue ;; esac;`,
+    `case "/$rel" in */.*|*/node_modules/*) exec 3<&-; continue ;; esac;`,
+    `if [ ! -f /proc/self/fd/3 ]; then exec 3<&-; continue; fi;`,
+    `s=$(stat -L -c %s /proc/self/fd/3 2>/dev/null || echo 0);`,
     // Text only: a binary file's tail says nothing to a person.
-    `if [ "$s" = 0 ] || head -c 8192 -- "$p" 2>/dev/null | LC_ALL=C grep -Iq . ; then`,
-    `printf '@@FILE %s %s %s\\n' "\${t%.*}" "$s" "$(printf %s "$p" | base64 -w0)";`,
-    `printf '@@TAIL %s\\n' "$(tail -c ${LIVE_FILE_READ_BYTES} -- "$p" 2>/dev/null | base64 -w0)";`,
-    `n=$((n+1)); [ "$n" -ge ${LIVE_FILES_MAX} ] && break; fi; done; };`,
+    // Each read opens /proc/self/fd/3, the file fd 3 holds (not its path again), from its start.
+    `if [ "$s" = 0 ] || head -c 8192 /proc/self/fd/3 2>/dev/null | LC_ALL=C grep -Iq . ; then`,
+    `printf '@@FILE %s %s %s\\n' "\${t%.*}" "$s" "$(printf %s "$rel" | base64 -w0)";`,
+    `printf '@@TAIL %s\\n' "$(tail -c ${LIVE_FILE_READ_BYTES} /proc/self/fd/3 2>/dev/null | base64 -w0)";`,
+    `n=$((n+1)); fi; exec 3<&-; [ "$n" -ge ${LIVE_FILES_MAX} ] && break; done; };`,
     `printf '@@NOW %s\\n' "$(date +%s)"`,
   ].join(" ");
 }
