@@ -273,9 +273,11 @@ describe("devenv_list", { skip }, () => {
     assert.equal(b.machines[0].sessions.find((x: Recorded) => x.cwd === "/w/d").last_activity, null, "a time no date can hold is no time");
 
     // A session that only watches a terminal's conversation is listed, read-only, and is never what "connect me" means.
-    const watching = await session("alice", box, "claude", "/w/b", [["session_started", { attached: true, read_only: true }]]);
+    // The terminal is writing: what it writes is the terminal's turn, never one of Claw's, so the watch is not shown as working.
+    const watching = await session("alice", box, "claude", "/w/b", [["session_started", { attached: true, read_only: true }], chunk("from the terminal", { read_only: true })]);
     b = (await call(await w.routerTurn(alice))).body;
-    assert.equal(b.machines[0].sessions.find((x: Recorded) => x.ref === watching).read_only, true);
+    const watchRow = b.machines[0].sessions.find((x: Recorded) => x.ref === watching);
+    assert.deepEqual([watchRow.read_only, watchRow.state], [true, "in_terminal"]);
     assert.equal(b.attach_default.ref, "eva10000-0000-4000-8000-000000000001", "the watched session is not the default");
     await w.q("UPDATE claw_remote_sessions SET status = 'closed' WHERE session_id = $1", [watching]);
 

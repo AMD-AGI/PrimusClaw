@@ -725,7 +725,8 @@ export class TranscriptTail {
       const n = buf.length ? fs.readSync(fd, buf, 0, buf.length, start) : 0;
       this.offset = start + n;
       this.decoder = new StringDecoder("utf8");
-      let text = buf.subarray(0, n).toString("utf8");
+      // Through the decoder: a read that ends inside a character keeps its first bytes for the next poll.
+      let text = this.decoder.write(buf.subarray(0, n));
       // The first line is cut in the middle unless the read began at the start.
       if (start > 0) text = text.slice(text.indexOf("\n") + 1);
       const end = text.lastIndexOf("\n");

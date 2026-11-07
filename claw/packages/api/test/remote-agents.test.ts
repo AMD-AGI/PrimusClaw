@@ -1094,6 +1094,35 @@ describe("remote agents", { skip }, () => {
       assert.equal(audit.detail.for_session, madeId);
     });
 
+    test("at the limit a read-only session is closed to make room first, even while its terminal is writing", async () => {
+      const small = await serve({ maxActiveSessionsPerUser: 2 });
+      const cid = (await as("u1").post("/v1/remote-agents/connectors", { name: "m" }, undefined, small)).body.data.connector_id;
+      const s = await SseClient.open(`${small}/v1/remote-agents/connectors/${cid}/commands`, { "x-test-user": "u1" });
+      streams.push(s);
+      await as("u1").post(`/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [AGENT] }, undefined, small);
+      const make = () => as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/w" }, undefined, small);
+      const idle = (await make()).body.data.session_id as string;
+      const watch = (await make()).body.data.session_id as string;
+      await q("DELETE FROM claw_remote_commands WHERE session_id = ANY($1::uuid[])", [[idle, watch]]);
+      const chunk = { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "from the terminal" } }, read_only: true };
+      // The watch: its terminal wrote just now, after the last turn_end it ever had (none), so by its events a turn is under way.
+      const posted = await as("u1").post(`/v1/remote-agents/connectors/${cid}/events`, { batch_id: "w1", events: [
+        { session_id: watch, seq: 1, type: "session_started", ts: Date.now(), data: { attached: true, read_only: true, modes: [], currentMode: null } },
+        { session_id: watch, seq: 2, type: "agent_message_chunk", ts: Date.now(), data: chunk },
+        { session_id: watch, seq: 3, type: "tool_call", ts: Date.now(), data: { update: { sessionUpdate: "tool_call", title: "Bash" }, read_only: true } },
+      ] }, undefined, small);
+      assert.deepEqual(posted.body.data.rejected, []);
+      // The other one is idle and unused for longer: by age alone it would be the one.
+      await q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '2 hours' WHERE session_id = $1", [idle]);
+      const made = await make();
+      assert.equal(made.status, 201, JSON.stringify(made.body));
+      assert.deepEqual(made.body.reclaimed, [watch], "the watch makes room: closing it ends only the watch");
+      const status = async (sid: string) => (await q("SELECT status FROM claw_remote_sessions WHERE session_id = $1", [sid])).rows[0].status;
+      assert.deepEqual([await status(watch), await status(idle)], ["closed", "active"]);
+      const frame = await s.next((f) => f.event === "command" && JSON.parse(f.data).type === "close");
+      assert.equal(JSON.parse(frame.data).session_id, watch, "its connector is told to close it");
+    });
+
     test("one user may hold only so many event streams open, and closing one frees its place", async () => {
       const small = await serve({ maxStreamsPerUser: 2 });
       const cid = (await as("u1").post("/v1/remote-agents/connectors", { name: "m" }, undefined, small)).body.data.connector_id;

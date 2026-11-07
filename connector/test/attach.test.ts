@@ -421,6 +421,15 @@ describe("reading a transcript another process writes", () => {
     fs.writeFileSync(file, Array.from({ length: 30 }, (_, i) => say(`old ${i}`)).join(""));
     const texts = (us: ReturnType<TranscriptTail["poll"]>) => us.map((u) => (u.update.content as { text: string }).text);
     assert.deepEqual(texts(new TranscriptTail(() => file).backlog()).length, 20, "the backlog is the last twenty");
+    // A backlog read that ends inside a character keeps its first bytes: the line completes on the next poll, whole.
+    const cutFile = path.join(path.dirname(file), "cut.jsonl");
+    const whole = Buffer.from(say("下一步"));
+    const mid = whole.indexOf(Buffer.from("下")) + 2;
+    fs.writeFileSync(cutFile, Buffer.concat([Buffer.from(say("before")), whole.subarray(0, mid)]));
+    const cutTail = new TranscriptTail(() => cutFile);
+    assert.deepEqual(texts(cutTail.backlog()), ["before"]);
+    fs.appendFileSync(cutFile, whole.subarray(mid));
+    assert.deepEqual(texts(cutTail.poll()), ["下一步"]);
     tail.fromEnd();
     assert.deepEqual(tail.poll(), []);
     const line = Buffer.from(say("完成了"));
@@ -610,6 +619,22 @@ describe("attach end to end", () => {
     const rejected = await h.claw.until("the prompt to be refused", () => h.claw.eventsOf(sid, "command_rejected")[0]);
     assert.equal(rejected.data.reason, "read_only_live_session");
     assert.ok(!adapterMethods(h).includes("session/resume"));
+  });
+
+  test("a read-only session stays read-only after a restart even when its agent can no longer attach", async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    const sid = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.read_only, true);
+    await h.stop();
+    // The machine's config dropped the agent's attach support before the restart.
+    (h.config.agents.find((a) => a.id === "fake") as { attach: unknown }).attach = null;
+    h.connect({ timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    h.start();
+    await h.online();
+    h.prompt(sid, "say hi");
+    const rejected = await h.claw.until("the prompt to be refused", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.equal(rejected.data.reason, "read_only_live_session");
+    assert.ok(!adapterMethods(h).includes("session/resume"), "no adapter was launched on the terminal's conversation");
   });
 
   test("after a restart a watch goes on by itself, a replayed request to open it stays read-only, and it ends with the terminal", async () => {

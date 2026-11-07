@@ -369,7 +369,8 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
       const ref = String(s.session_id);
       const row: DevenvSession = {
         label: label(String(s.agent_id)), agent: String(s.agent_id), agent_name: shown(agent?.name, NAME_MAX), cwd: shown(s.cwd, CWD_MAX),
-        opened_in: "chat", state: reading.state, last_activity: iso(s.updated_at),
+        // A watch is never at work for Claw: what it shows is the terminal's turn, so it reads as that terminal's (as `planSend` does).
+        opened_in: "chat", state: s.read_only === true ? "in_terminal" : reading.state, last_activity: iso(s.updated_at),
         ref: online ? ref : null, attach_command: online ? attachCommand(ref) : null,
         ...(online ? {} : { why_not: "the machine is offline" }),
         ...(s.read_only === true ? { read_only: true, note: READ_ONLY_NOTE } : {}),

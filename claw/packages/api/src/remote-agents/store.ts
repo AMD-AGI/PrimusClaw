@@ -642,7 +642,9 @@ interface Reclaimable { session_id: string; connector_id: string; agent_id: stri
  * the longest unused; [] when fewer than `need` may. Sessions are never closed on their own: only here, when the person opens one
  * more than they may have open, so a session left behind (a phone that never closed it, a chat that moved on) does not keep them
  * out for good. One at work, waiting for their approval, or with a command its connector has not collected is never closed, unless
- * nothing has come from it for a day.
+ * nothing has come from it for a day. A read-only session (one that watches a conversation a terminal has open, {@link READ_ONLY_SQL})
+ * is never at work for Claw, whatever the terminal writes: it may be closed whenever no command waits for it, before any session that
+ * is not read-only (closing it ends only the watch; the conversation goes on in the terminal and can be watched again).
  */
 async function reclaimable(q: Querier, owner: string, need: number, onlineWindowMs: number): Promise<Reclaimable[]> {
   // Locked as read (FOR UPDATE), which waits for a batch of its events being stored now: storing an event takes a key-share lock
@@ -651,11 +653,14 @@ async function reclaimable(q: Querier, owner: string, need: number, onlineWindow
   const rows = (await q(
     `SELECT s.session_id::text AS session_id, s.connector_id::text AS connector_id, s.agent_id, s.updated_at,
             COALESCE(c.revoked_at IS NULL AND c.heartbeat_at > NOW() - make_interval(secs => $2::float8)
-              AND c.stream_seen_at > NOW() - make_interval(secs => $2::float8), FALSE) AS online
+              AND c.stream_seen_at > NOW() - make_interval(secs => $2::float8), FALSE) AS online,
+            ${READ_ONLY_SQL} AS read_only
        FROM claw_remote_sessions s JOIN claw_remote_connectors c ON c.connector_id = s.connector_id
       WHERE s.owner_user_id = $1 AND s.status = 'active'
         AND NOT EXISTS (SELECT 1 FROM claw_remote_commands m WHERE m.connector_id = s.connector_id AND m.session_id = s.session_id)
         AND (s.updated_at < NOW() - make_interval(secs => $4::float8)
+          -- A watch: what its terminal writes is the terminal's turn, never one of Claw's, so it never keeps the session open.
+          OR ${READ_ONLY_SQL}
           OR (s.updated_at < NOW() - make_interval(secs => $3::float8)
             AND COALESCE((SELECT MAX(e.id) FROM claw_remote_events e
                            WHERE e.session_id = s.session_id AND e.type = ANY($5::text[]) AND COALESCE(e.data->>'replay', '') <> 'true'), 0)
@@ -665,7 +670,7 @@ async function reclaimable(q: Querier, owner: string, need: number, onlineWindow
                WHERE r.session_id = s.session_id AND r.type = $6 AND COALESCE(r.data->>'replay', '') <> 'true'
                  AND NOT EXISTS (SELECT 1 FROM claw_remote_events d
                                   WHERE d.session_id = s.session_id AND d.type = $7 AND d.data->>'actionId' = r.data->>'actionId'))))
-      ORDER BY online, s.updated_at
+      ORDER BY online, read_only DESC, s.updated_at
       LIMIT $8
         FOR UPDATE OF s`,
     [owner, secs(onlineWindowMs), secs(SESSION_RECLAIM_IDLE_MS), secs(SESSION_RECLAIM_STALE_MS), TURN_EVENT_TYPES,
