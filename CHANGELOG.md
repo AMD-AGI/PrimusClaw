@@ -192,6 +192,14 @@ record it.
   or `close` never waits behind a confirmation Claw does not answer: it ends those in its session (dropped and said as
   `cancelled` / `session_closed`), is carried out straight away, and what came before it there is dropped the same way when its
   turn comes. A session its machine reports closed drops its queued acting commands, under the connector row's lock.
+- A prompt that reached a connector on time and queued behind a running turn no longer runs after the person closed its session
+  while the network held the stream back for less than a heartbeat (no stall, no late frame, no reconnect: nothing the connector
+  watched). A command stream that gives no frame, not even a ping, for longer than its ping interval plus 3 s now counts as network
+  trouble (audited `network_trouble`, `reason: "stream_quiet"`), so a `prompt`, `set_mode`, `resume` or `decision` waiting to act
+  then is confirmed with Claw when it is about to (`why: "network"`); the stream's `ready` now says that interval (`ping_ms`).
+  The confirmation names the command's session (`session_id`), and Claw answers `session_closed`, not `gone`, for a command it
+  deleted when that session closed, so the person sees why it did not run. A command that came on time while pings kept coming
+  still runs without a question.
 - "连接我的开发环境" with no machine connected answers the one-line pairing command, every time. devenv_list with no machine, in a
   router turn answering a message the user sent signed in, recently, makes the pairing itself and gives it in `connect_a_machine`
   (`commands` the one line, `text` in the user's language with it in a code block, `pairing` its minutes). Any other turn (a report,

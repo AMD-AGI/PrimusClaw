@@ -105,7 +105,8 @@ describe("remote agents", { skip }, () => {
     const cid = await connector(user);
     const stream = await openCommands(user, cid);
     assert.equal(stream.status, 200);
-    await stream.nextEvent("ready");
+    // It says how often it pings (150 ms here): a connector takes a stream that missed pings for longer as held in the network.
+    assert.equal((await stream.nextEvent("ready")).json().ping_ms, 150);
     assert.equal((await heartbeat(user, cid)).status, 200);
     return { cid, stream };
   }
@@ -1634,9 +1635,25 @@ describe("remote agents", { skip }, () => {
       const closed = await sent({ type: "close" });
       assert.deepEqual((await q("SELECT type FROM claw_remote_commands WHERE connector_id = $1 AND session_id = $2 ORDER BY cmd_seq", [cid, sid])).rows.map((r) => r.type),
         ["cancel", "close"]);
+      // Deleted, it is answered by the session the connector names (a prompt queued behind a turn, asked about when the turn ends,
+      // must be refused as `session_closed`, which the person reads as such); a connector that names none (one from before) is
+      // told `gone`, and drops it all the same.
+      assert.equal((await confirm(p2.cmd_id, "u1", { received_late: false, why: "network", session_id: sid })).body.data.status, "session_closed");
+      assert.equal((await confirm(p2.cmd_id, "u1", { session_id: sid.toUpperCase() })).body.data.status, "session_closed");
       assert.equal((await confirm(p2.cmd_id)).body.data.status, "gone");
+      assert.equal((await confirm(opened.cmd_id, "u1", { session_id: sid })).body.data.status, "session_closed");
       assert.equal((await confirm(opened.cmd_id)).body.data.status, "gone");
+      assert.equal((await confirm(p2.cmd_id, "u1", { session_id: "not-a-uuid" })).body.data.status, "gone");
       assert.equal((await confirm(closed.cmd_id)).body.data.status, "live");
+      // Only a closed session of this connector's says so: another connector's closed session, or an open one of its own, does not.
+      const other = await online("u2");
+      const otherSid = await session("u2", other.cid);
+      assert.equal((await other.stream.nextEvent("command")).json().session_id, otherSid);
+      assert.equal((await as("u2").post(`/v1/remote-agents/sessions/${otherSid}/commands`, { type: "close" })).status, 202);
+      assert.equal((await confirm(p2.cmd_id, "u1", { session_id: otherSid })).body.data.status, "gone");
+      const openSid = await session("u1", cid);
+      assert.equal((await stream.nextEvent("command")).json().session_id, openSid);
+      assert.equal((await confirm(p2.cmd_id, "u1", { session_id: openSid })).body.data.status, "gone");
       const refused = (await q("SELECT detail FROM claw_remote_audit WHERE action = 'command.refused_late' ORDER BY id")).rows.map((r) => [r.detail.cmd_id, r.detail.status]);
       // Only commands Claw holds are audited: an id it never issued (or no longer holds) writes nothing, so the route cannot fill the trail.
       assert.deepEqual(refused, [[p1.cmd_id, "cancelled"], [pw.cmd_id, "cancelled"], [p1.cmd_id, "expired"], [p1.cmd_id, "expired"]]);
@@ -1647,8 +1664,9 @@ describe("remote agents", { skip }, () => {
       const p4 = (await stream.nextEvent("command")).json();
       assert.equal((await post("u1", cid, [ev(sid3, "session_closed", { reason: "adapter_exited" })])).status, 200);
       // Its machine closed it: the prompt queued before is deleted with the session's other acting commands, so it is never sent
-      // again and, asked about, it is `gone` (the connector drops it and says so either way).
+      // again and, asked about naming its session, it is `session_closed` (without, `gone`: dropped and said so either way).
       assert.deepEqual((await q("SELECT type FROM claw_remote_commands WHERE session_id = $1", [sid3])).rows, []);
+      assert.equal((await confirm(p4.cmd_id, "u1", { session_id: sid3 })).body.data.status, "session_closed");
       assert.equal((await confirm(p4.cmd_id)).body.data.status, "gone");
       assert.ok((await q("SELECT detail FROM claw_remote_audit WHERE action = 'command.confirmed'")).rows.some((r) => r.detail.cmd_id === p1.cmd_id), "a live answer is recorded");
       // The machine is removed: whatever it still holds in a buffer is answered 401 revoked, which stops it.

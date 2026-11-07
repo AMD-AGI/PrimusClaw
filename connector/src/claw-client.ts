@@ -109,7 +109,7 @@ export class ClawClient {
    * the live TTL when it came (only then may Claw call it `expired`). Throws {@link RevokedError} when this connector was revoked,
    * and {@link HttpError} 404 with a code other than `not_found` from a Claw that has no such route.
    */
-  async confirmCommand(cid: string, cmdId: string, q: { why: string; received_late: boolean }, signal?: AbortSignal): Promise<string> {
+  async confirmCommand(cid: string, cmdId: string, q: { why: string; received_late: boolean; session_id?: string }, signal?: AbortSignal): Promise<string> {
     const timeout = AbortSignal.timeout(this.o.requestTimeoutMs ?? 20_000);
     const d = await this.json("POST", `/v1/remote-agents/connectors/${encodeURIComponent(cid)}/commands/${encodeURIComponent(cmdId)}/confirm`, q,
       signal ? AbortSignal.any([signal, timeout]) : timeout);

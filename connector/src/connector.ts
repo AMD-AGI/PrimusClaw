@@ -155,9 +155,9 @@ export const DEFAULT_TIMING: ConnectorTiming = {
 const ENDING_COMMANDS = new Set(["cancel", "close", "withdraw"]);
 /**
  * Why a command is confirmed with Claw before it acts: read just after a stall (`stall`); read while the network was holding frames
- * back, or just after (`network`: a heartbeat answered late or not at all, a command stream that reconnected); a frame that took
- * longer than `transitMs` to arrive (`delayed`); older than the live TTL (`old`); or asked about by an earlier run that stopped
- * before the answer (`deferred`: `IdentityState.confirm_first`).
+ * back, or just after (`network`: a heartbeat answered late or not at all, a command stream that reconnected or went quiet for longer
+ * than a ping takes); a frame that took longer than `transitMs` to arrive (`delayed`); older than the live TTL (`old`); or asked
+ * about by an earlier run that stopped before the answer (`deferred`: `IdentityState.confirm_first`).
  */
 type Lateness = "stall" | "network" | "delayed" | "old" | "deferred";
 
@@ -178,6 +178,16 @@ const isRouteMissing = (e: unknown): boolean => e instanceof HttpError && (
   (e.status === 404 && e.code !== "not_found")
   // A Claw from before the route, asked with a paired connector's grant: it refuses a path it does not know as a connector route.
   || (e.status === 403 && e.code === "connector_grant_not_accepted"));
+
+/**
+ * How often Claw pings on the stream a `ready` frame opens (its `ping_ms`): never taken as longer than the protocol's (a longer one
+ * would only let a held stream go unseen for longer), and the protocol's when the frame does not say (a Claw from before it).
+ */
+function readyPingMs(f: SseFrame): number {
+  let v: unknown;
+  try { v = (JSON.parse(f.data ?? "null") as Record<string, unknown> | null)?.ping_ms; } catch { v = undefined; }
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.min(v, REMOTE_AGENT_TIMING.pingMs) : REMOTE_AGENT_TIMING.pingMs;
+}
 
 /** What to do about 409 `connector_limit_reached`, for the log, `status` and the run's own output. */
 export const CONNECTOR_LIMIT_HINT = "Claw already holds the most connectors one person may have, so it will not register this machine: "
@@ -349,6 +359,15 @@ export class Connector {
   private streamAskedAt = 0;
   /** Per session, the latest `cancel` or `close` that ran ahead of commands still waiting in its chain (`endAsking`). */
   private readonly overtaken = new Map<string, { type: string; seq: number }>();
+  /**
+   * When the command stream last gave this process any frame (monotonic; `ready`, `ping`, a command), or null before the first.
+   * Claw pings every {@link pingMs}: a stream quiet for longer than that plus `transitMs` is being held in the network (`tick`).
+   */
+  private lastFrameAt: number | null = null;
+  /** The quiet stream was already counted as network trouble (`tick`); cleared by the next frame. */
+  private quietSeen = false;
+  /** How often Claw pings on the command stream: its `ready` says (`ping_ms`, at most the protocol's); a Claw from before, the protocol's. */
+  private pingMs: number = REMOTE_AGENT_TIMING.pingMs;
   /** When the heartbeat in flight was sent (monotonic), or null. */
   private hbSince: number | null = null;
   /** The heartbeat in flight was seen late (`tick`). */
@@ -810,9 +829,14 @@ export class Connector {
 
   private onFrame(f: SseFrame, reconnect: boolean): void {
     if (f.event) this.lastFrame = f.event;
+    // Any frame says the stream is moving (`tick`); one that comes after a quiet spell was held behind it, and is judged by
+    // `lateness` (the window `netTrouble` opened, or its `sent_at`).
+    this.lastFrameAt = performance.now();
+    this.quietSeen = false;
     switch (f.event) {
       case "ready":
         this.resetClock(); // a new stream: its replica's clock, measured afresh
+        this.pingMs = readyPingMs(f);
         // Taken as an upper bound: the frame was sent no earlier than the stream was asked for, so adding the time since then
         // can only make a frame behind it look older (asked about), never younger, however long this `ready` was held.
         this.observeClock(f, "server_time", performance.now() - this.streamAskedAt);
@@ -938,6 +962,8 @@ export class Connector {
       this.clockOffsetMs = this.readyBound;
       this.d.log.warn("this process could not run for a while (stopped, or the machine slept): commands received now are confirmed with Claw before they run", { gap_ms: Math.round(gap) });
       this.d.audit.record("stall_detected", { gap_ms: Math.round(gap) });
+      // The stream's quiet through the stall is the stall's (said as such); from now on, missed pings count again.
+      if (this.lastFrameAt !== null) this.lastFrameAt = mono;
     }
     // A heartbeat that has had no answer for longer than a frame may take: the network is holding things back, frames on the
     // command stream too.
@@ -945,10 +971,18 @@ export class Connector {
       this.hbLate = true;
       this.netTrouble("heartbeat_late");
     }
+    // A command stream that has given nothing for longer than a ping takes to come (Claw pings every `pingMs`): the network is
+    // holding its frames back, a `close` of a session among them perhaps. A command waiting to act (queued behind a turn) is
+    // confirmed when it acts, as after a heartbeat answered late. A hold too short to miss a ping is not seen; one that is, is.
+    if (this.lastFrameAt !== null && !this.quietSeen && mono - this.lastFrameAt > this.pingMs + this.timing.transitMs) {
+      this.quietSeen = true;
+      this.netTrouble("stream_quiet");
+    }
   }
 
   /**
-   * The network held frames back, or may have: a heartbeat answered late or not at all, or a command stream opened again. As after
+   * The network held frames back, or may have: a heartbeat answered late or not at all, a command stream opened again, or one that
+   * missed a ping (`stream_quiet`). As after
    * a stall, commands read now and for `stallMs` after, and every one waiting to act, are confirmed with Claw first.
    */
   private netTrouble(reason: string): void {
@@ -1074,7 +1108,8 @@ export class Connector {
       if (this.ctl.signal.aborted || ended.aborted) break;
       const sig = AbortSignal.any([this.ctl.signal, ended]);
       try {
-        status = await this.d.client.confirmCommand(this.cid, cmd.cmd_id, { why, received_late: receivedOld }, sig);
+        // Its session goes with it: once that is closed Claw holds the command no more, and says `session_closed` only if told whose it was.
+        status = await this.d.client.confirmCommand(this.cid, cmd.cmd_id, { why, received_late: receivedOld, session_id: cmd.session_id }, sig);
       } catch (e) {
         if (this.isRevocation(e)) { status = "connector_revoked"; void this.onRevoked(e); break; }
         error = errMessage(e);

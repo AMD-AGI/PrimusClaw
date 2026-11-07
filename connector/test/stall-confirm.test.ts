@@ -373,6 +373,8 @@ describe("a command whose frame was held in the network", () => {
     const h = await Harness.create({ timing });
     await h.stop();
     h.claw.streamLagMs = 2_000; // after the ready, every frame (pings, commands) arrives 2 s late
+    // (Its ping cadence unsaid, so the 2 s gap right after the `ready` is not taken as a quiet stream: the clock alone is tested.)
+    h.claw.readyPingMs = false;
     h.connect({ timing });
     h.start();
     await sleep(3_500); // more than 8 lagged pings (one every 100 ms) have been read

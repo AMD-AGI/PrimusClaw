@@ -40,7 +40,7 @@ session), or an access token from the identity provider (see
 | `POST .../connectors/:cid/heartbeat` | Every 30 s: `{version?, agents:[{agent_id, kind, name, capabilities?}], cmd_cursor?}`. Replaces the advertised agent list; `cmd_cursor` lets the server forget commands up to it. |
 | `GET .../connectors/:cid/commands` | The command stream; each `id:` is the connector's `cmd_seq`. On every connect the server sends every command it still holds, in order. It holds a command until a heartbeat's `cmd_cursor` covers it, so a `Last-Event-ID` (or `?after=`) is validated but never skips one: the id of the last frame a client received does not prove it acted on it. A connector skips what it already did, by `cmd_seq` or `cmd_id`. |
 | `POST .../connectors/:cid/events` | `{batch_id, events:[{session_id, seq, type, ts, data}]}`. Answers `{acked:{session_id: highest stored seq}, rejected:[{index, session_id, seq, reason}]}`. |
-| `POST .../connectors/:cid/commands/:cmd_id/confirm` | Before a connector carries out a command it received late, it asks whether it may. Body (optional): `{received_late?, why?}`; `received_late` (default `true`) says the command was already past the live TTL when it reached the connector. Answers `{cmd_id, status}`, where `status` is `live` (run it), `session_closed`, `cancelled` (a prompt, and a `cancel` or `close` of its session was queued after it), `expired` (it reached the connector past the live TTL: never one received in time that then waited on the machine) or `gone` (Claw no longer holds it). Only `live` may run. A revoked connector gets `401 revoked`, as on every connector-side route. An answer about a command Claw holds is audited (`command.confirmed`, `command.refused_late`); one about an id it does not hold is not. See "A command received late" below. |
+| `POST .../connectors/:cid/commands/:cmd_id/confirm` | Before a connector carries out a command it received late, it asks whether it may. Body (optional): `{received_late?, why?, session_id?}`; `received_late` (default `true`) says the command was already past the live TTL when it reached the connector; `session_id` is the command's session. Answers `{cmd_id, status}`, where `status` is `live` (run it), `session_closed`, `cancelled` (a prompt, and a `cancel` or `close` of its session was queued after it), `expired` (it reached the connector past the live TTL: never one received in time that then waited on the machine) or `gone` (Claw no longer holds it). Closing a session deletes its acting commands, so for one of those the answer is `session_closed` when `session_id` names a closed session of this connector's, and `gone` otherwise. Only `live` may run. A revoked connector gets `401 revoked`, as on every connector-side route. An answer about a command Claw holds is audited (`command.confirmed`, `command.refused_late`); one about an id it does not hold is not. See "A command received late" below. |
 | `POST .../connectors/:cid/revoke` | Revoke one of the caller's connectors, as the user-side `DELETE /v1/remote-agents/connectors/:cid` does (the row stays revoked, its commands go, its sessions close): what `claw-connector logout` calls with a device sign-in, whose access token the user-side route refuses. The token names a user, not a connector, so it may revoke any of that user's connectors. `404 not_found` for a row that is not the caller's or is already revoked. |
 
 Command frames are `event: command` with `data: {v, cmd_id, type, session_id, issued_at, sent_at, ...}`; `issued_at` is when Claw
@@ -273,7 +273,8 @@ where the turn may not pair, the setup commands), and the router gives it as it 
 ## Keepalive and presence
 
 The server sends `event: ping` every 25 s on the command stream (it carries no `id`,
-so it is never a resume position) and a `: keepalive` comment on a reading stream.
+so it is never a resume position; the stream's `ready` says the interval as `ping_ms`)
+and a `: keepalive` comment on a reading stream.
 A gateway that closes a connection after 180 s of silence therefore never sees one.
 A connector that receives no byte for 75 s should drop the stream and reconnect
 with backoff.
@@ -403,8 +404,11 @@ the person may have closed the session or removed the machine, and been told tha
   confirmed (`why: "delayed"`); the `ready` reading adds the time since the stream was asked for and is kept for the life of the
   stream (pings, which a lagging link delays as much as commands, can only raise the offset), so Claw's clock is never taken as
   earlier than it is. So is every command read while a heartbeat has had no answer for more than 3 s, and within 5 s after a
-  heartbeat answered late or failed, a `ready` that took more than 3 s, or the command stream reconnecting (`why: "network"`),
-  and every command still waiting to act then. After a stall the pings are measured afresh and the `ready` bound is moved on by
+  heartbeat answered late or failed, a `ready` that took more than 3 s, the command stream reconnecting, or the command stream
+  giving no frame at all (not even a ping) for longer than its ping interval (`ready`'s `ping_ms`, at most 25 s; 25 s from a
+  Claw that does not say) plus 3 s (`why: "network"`), and every command still waiting to act then. So a prompt that came on
+  time and queued behind a running turn is confirmed when the turn ends if the stream was held meanwhile long enough to miss a
+  ping; a hold too short to miss one is not seen. After a stall the pings are measured afresh and the `ready` bound is moved on by
   the time the monotonic clock missed (a sleep). On the usual path (no stall, no network trouble, a frame that came at once) nothing is asked.
 - Claw calls a command `expired` only when it reached the connector past the live TTL (`received_late`). A prompt received in
   time and queued on the machine behind a turn longer than the TTL is confirmed after a stall like any other, and runs if its
