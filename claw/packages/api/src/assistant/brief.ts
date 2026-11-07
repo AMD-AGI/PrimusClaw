@@ -94,27 +94,65 @@ export interface Brief {
 
 export interface WorkloadSeen { id: string; name: string; phase: string; createdAt: string | null; kind: string | null; userId: string | null }
 
+/** At most this many of the user's workspaces are listed one by one (`briefPorts.listWorkloads`). */
+const SAFE_WORKSPACES_MAX = 20;
+const SAFE_WORKLOADS_MAX = 100;
+
+/** One page of SaFE's workload list, as the brief reads it. */
+function workloadsOf(body: unknown): WorkloadSeen[] {
+  const items = (body && typeof body === "object" ? (body as { items?: unknown }).items : undefined);
+  return (Array.isArray(items) ? items : []).flatMap((raw): WorkloadSeen[] => {
+    const w = (raw && typeof raw === "object" ? raw : {}) as Record<string, any>;
+    if (typeof w.workloadId !== "string" || !w.workloadId) return [];
+    const kind = typeof w.kind === "string" ? w.kind : typeof w.groupVersionKind?.kind === "string" ? w.groupVersionKind.kind : null;
+    return [{
+      id: w.workloadId, name: typeof w.displayName === "string" && w.displayName ? w.displayName : w.workloadId,
+      phase: typeof w.phase === "string" ? w.phase : "", createdAt: typeof w.creationTime === "string" ? w.creationTime : null,
+      kind, userId: typeof w.userId === "string" ? w.userId : null,
+    }];
+  });
+}
+
+/** GET a SaFE path with the user's key: the parsed body, or the status it was refused with. */
+async function safeGet(path: string, apiKey: string): Promise<{ ok: true; body: unknown } | { ok: false; status: number }> {
+  const resp = await fetch(`${SAFE_API_URL}${path}`, {
+    headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(SAFE_TIMEOUT_MS),
+  });
+  if (!resp.ok) return { ok: false, status: resp.status };
+  return { ok: true, body: await resp.json() };
+}
+
 /** What leaves the process: SaFE, read with the user's own key. */
 export const briefPorts: {
   listWorkloads: (userId: string, apiKey: string) => Promise<WorkloadSeen[]>;
 } = {
+  /**
+   * The user's workloads, newest first. SaFE lists workloads across workspaces only for an administrator: anyone else is answered
+   * 403 ("not allowed to list workload, workspace: []") unless the query names one workspace (measured 2026-11-07 for two
+   * global-cpu members: 403 without workspaceId, 200 with it, and 403 again for two workspaces at once). So a 403 is followed by the
+   * user's own workspaces (`GET /api/v1/workspaces`, which lists what the key may see), one query each; a workspace that refuses
+   * as well is left out, and only when every one refuses (or the list itself is refused) is SaFE said to be unreadable.
+   */
   listWorkloads: async (userId, apiKey) => {
-    const query = new URLSearchParams({ userId, sortBy: "creation_time", order: "desc", limit: "100" });
-    const resp = await fetch(`${SAFE_API_URL}/api/v1/workloads?${query}`, {
-      headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(SAFE_TIMEOUT_MS),
-    });
-    if (!resp.ok) throw new Error(`safe_http_${resp.status}`);
-    const body = await resp.json() as { items?: unknown };
-    return (Array.isArray(body?.items) ? body.items : []).flatMap((raw): WorkloadSeen[] => {
-      const w = (raw && typeof raw === "object" ? raw : {}) as Record<string, any>;
-      if (typeof w.workloadId !== "string" || !w.workloadId) return [];
-      const kind = typeof w.kind === "string" ? w.kind : typeof w.groupVersionKind?.kind === "string" ? w.groupVersionKind.kind : null;
-      return [{
-        id: w.workloadId, name: typeof w.displayName === "string" && w.displayName ? w.displayName : w.workloadId,
-        phase: typeof w.phase === "string" ? w.phase : "", createdAt: typeof w.creationTime === "string" ? w.creationTime : null,
-        kind, userId: typeof w.userId === "string" ? w.userId : null,
-      }];
-    });
+    const query = (extra: Record<string, string> = {}) =>
+      new URLSearchParams({ userId, sortBy: "creation_time", order: "desc", limit: String(SAFE_WORKLOADS_MAX), ...extra });
+    const all = await safeGet(`/api/v1/workloads?${query()}`, apiKey);
+    if (all.ok) return workloadsOf(all.body);
+    if (all.status !== 403) throw new Error(`safe_http_${all.status}`);
+    const spaces = await safeGet("/api/v1/workspaces", apiKey);
+    if (!spaces.ok) throw new Error(`safe_http_${spaces.status}`);
+    const items = (spaces.body && typeof spaces.body === "object" ? (spaces.body as { items?: unknown }).items : undefined);
+    const ids = [...new Set((Array.isArray(items) ? items : [])
+      .map((x) => (x && typeof x === "object" ? (x as Record<string, unknown>).workspaceId : undefined))
+      .filter((id): id is string => typeof id === "string" && id.length > 0))].slice(0, SAFE_WORKSPACES_MAX);
+    if (!ids.length) return [];
+    const pages = await Promise.all(ids.map((id) => safeGet(`/api/v1/workloads?${query({ workspaceId: id })}`, apiKey)));
+    const read = pages.filter((p): p is { ok: true; body: unknown } => p.ok);
+    if (!read.length) throw new Error(`safe_http_${(pages[0] as { status: number }).status}`);
+    const seen = new Map<string, WorkloadSeen>();
+    for (const w of read.flatMap((p) => workloadsOf(p.body))) seen.set(w.id, w);
+    const at = (w: WorkloadSeen) => (w.createdAt ? Date.parse(w.createdAt) || 0 : 0);
+    return [...seen.values()].sort((a, b) => at(b) - at(a)).slice(0, SAFE_WORKLOADS_MAX);
   },
 };
 

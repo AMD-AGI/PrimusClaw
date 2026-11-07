@@ -108,7 +108,20 @@ export interface SessionComputeTeardownDeps {
   multiNodeAvailable: () => boolean;
   /** The provider's session-scoped destroy. */
   destroyForSession: (sessionId: string, opts: { platformKey: string; workspaces: string[] }) => Promise<SessionDestroyResult>;
+  /** Waits between lookup retries; injected by tests. */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/**
+ * The waits before each repeat of a teardown whose lookup failed.
+ *
+ * A lookup that fails has enumerated nothing, so nothing was deleted and repeating it is safe. It is
+ * repeated here because nothing else may: a session with no `hands.<sid>` binding has nothing to park,
+ * so the idle sweeps that finish a parked teardown never see it, and the one notification is the only
+ * chance its workloads get. Short, because a SaFE blip clears in seconds and this holds the one replica
+ * the teardown was delivered to.
+ */
+export const LOOKUP_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000];
 
 /**
  * Remove everything on the platform that a deleted session owns.
@@ -123,8 +136,18 @@ export async function destroySessionCompute(
   if (!deps.multiNodeAvailable()) return { complete: true, found: 0, deleted: 0 };
   const credential = await resolveCleanupCredential(sessionId, offeredKey);
   switch (credential.kind) {
-    case "key":
-      return deps.destroyForSession(sessionId, { platformKey: credential.platformKey, workspaces: credential.workspaces });
+    case "key": {
+      const opts = { platformKey: credential.platformKey, workspaces: credential.workspaces };
+      const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+      let result = await deps.destroyForSession(sessionId, opts);
+      for (const delay of LOOKUP_RETRY_DELAYS_MS) {
+        if (result.complete || result.reason !== "lookup_failed") break;
+        logger.warn({ sessionId, retryInMs: delay }, "session.cleanup_lookup_retry");
+        await sleep(delay);
+        result = await deps.destroyForSession(sessionId, opts);
+      }
+      return result;
+    }
     case "no_handle":
       logger.info({ sessionId }, "session.cleanup_nothing_addressable");
       return { complete: true, found: 0, deleted: 0 };

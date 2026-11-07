@@ -19,7 +19,10 @@ export class HttpError extends Error {
   }
 }
 /** The network failed or the stream went silent. */
-export class TransportError extends Error {}
+export class TransportError extends Error {
+  /** `true`: Claw had answered (a command stream that broke or went silent after it opened), so Claw was up. */
+  constructor(message: string, readonly afterAnswer = false) { super(message); }
+}
 
 export interface ClawClientOptions {
   /** Base URL up to and including any gateway prefix, without a trailing slash. */
@@ -149,9 +152,9 @@ export class ClawClient {
       try {
         for await (const frame of readSse(res.body, arm)) yield frame;
       } catch (e) {
-        throw new TransportError(timedOut ? `no byte for ${opts.watchdogMs} ms` : `command stream: ${errMessage(e)}`);
+        throw new TransportError(timedOut ? `no byte for ${opts.watchdogMs} ms` : `command stream: ${errMessage(e)}`, true);
       }
-      if (timedOut) throw new TransportError(`no byte for ${opts.watchdogMs} ms`);
+      if (timedOut) throw new TransportError(`no byte for ${opts.watchdogMs} ms`, true);
     } finally {
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onAbort);

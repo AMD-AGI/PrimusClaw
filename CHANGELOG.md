@@ -112,6 +112,14 @@ record it.
   the database pool under it): the completion was stamped processed regardless, so its redelivery acked and the notification was
   never recorded. What it still owes is now stored with the processed stamp, and the event is redelivered until the notification
   is recorded -- once, by its run-derived key -- without running the rest of the completion again.
+- A connector no longer stops for good (exit 78, `needs-login.json`, offline until someone runs `login`) because Claw's sign-in
+  service was down. On 2026-11-07 09:50-10:15Z, while SaFE was failing, Claw answered a mix of no answer, 503
+  `authentication_service_unavailable` and 401 `invalid_api_key` for a key that was fine, and the connector took four 401s as a
+  deleted key. A 401 or 403 that comes while Claw is failing (no answer, 5xx, 429), or within ten minutes of it, or that is not
+  Claw's own answer (no JSON error: a gateway's page), is no longer counted and the connector keeps retrying; the same rule now
+  applies at start, so a supervisor restart into an outage is not ended by its first 401. A revocation still stops it at once.
+- The API answers 503 `authentication_service_unavailable`, not 401 `invalid_api_key` (or `invalid_cookie`), when SaFE answers
+  a key or cookie check with a 5xx or with a 2xx that is not an answer, and no longer remembers the latter as a refusal for 30 s.
 - A fresh connector install trusts the CAs the machine trusts: a Claw behind a company CA no longer fails `doctor`, `login`, `pair`
   and `run` until `NODE_USE_SYSTEM_CA=1` is set. On Node.js 22.19+ / 24.5+ the connector adds the system store to Node's own list
   (and `NODE_EXTRA_CA_CERTS`) before its first connection and passes `NODE_USE_SYSTEM_CA=1` to the programs it starts;
@@ -125,6 +133,9 @@ record it.
   by side, so a lookup followed by an answer read as an answer written beside (before) the lookup. History now replays each call, then
   its result, then the turn's text, in the order they ran. The router's answer about what it can do no longer labels any part of
   itself read-only (只读) (`router-read-v11`).
+- The brief's SaFE section works for members who are not administrators. SaFE refuses them a workload list across workspaces
+  (403), so every such brief said "SaFE 没有回答：safe_http_403". After a 403 the brief now lists the user's own workspaces and reads
+  each one (at most 20); a workspace that refuses is left out, and SaFE is unreadable only when every one refuses.
 - A machine paired from the chat (`claw-connector pair`) and then disconnected is told, wherever the connector says what to do next
   (the revocation itself, `run` started again by the service or by hand, the supervisor's log line, `status`, `service status`,
   `doctor`'s fix, a sign-in refused at start), to ask the
