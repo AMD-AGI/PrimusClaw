@@ -331,5 +331,37 @@ describe("a command whose frame was held in the network", () => {
       assert.equal(h.adapterLog().some((l) => l.prompt === "late one"), false);
     });
   }
+
+  test("a cancel that runs ahead of a session.new still being confirmed still cancels the prompt sent before it", async () => {
+    const h = await Harness.create();
+    h.claw.holdConfirms = true; // Claw answers about the session.new only later
+    const sid = h.claw.newSession("fake", h.work, undefined, { issued_at: Date.now() - REMOTE_AGENT_TIMING.liveCommandTtlMs - 60_000 });
+    const newId = String(h.claw.commands.find((c) => c.payload.session_id === sid)!.payload.cmd_id);
+    await h.claw.until("the session.new being confirmed", () => h.claw.confirmAsked.includes(newId));
+    const seq = h.prompt(sid, "sent before the cancel", { cmd_id: "c-before-cancel" });
+    h.claw.issue("cancel", sid); // runs at once (it must not wait behind the confirmation), ahead of the prompt in the chain
+    await h.claw.until("the cancel handled", () => h.audit().some((a) => a.kind === "command" && a.type === "cancel"));
+    h.claw.holdConfirms = false;
+    h.claw.releaseConfirms(); // live: the session starts after all
+    await h.claw.until("the session started", () => h.claw.eventsOf(sid, "session_started")[0]);
+    const rejected = await h.claw.until("the prompt refused", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_id === "c-before-cancel"));
+    assert.deepEqual([rejected.data.status, rejected.data.cmd_seq], ["cancelled", seq]);
+    await sleep(300);
+    assert.equal(h.adapterLog().some((l) => l.prompt === "sent before the cancel"), false, "the cancel came after it: it never runs");
+  });
+
+  test("a `ready` held for less than transitMs still bounds Claw's clock from above: a frame held longer behind it is confirmed (`delayed`)", async () => {
+    // (Round 8: the ready's own delay made Claw's clock look that much earlier, so a frame held 1.3 s + 0.4 s looked 0.4 s old.)
+    const timing = { transitMs: 1_500, watchdogMs: 10_000 };
+    const h = await Harness.create({ timing });
+    await h.stop();
+    h.claw.streamDelayMs = 1_300; // below transitMs: not `ready_late`
+    const sid = h.claw.newSession("fake", h.work, undefined, { sent_at: Date.now() - 400 });
+    h.connect({ timing });
+    h.start();
+    await h.claw.until("session_started", () => h.claw.eventsOf(sid, "session_started")[0]);
+    assert.equal(h.claw.confirmBodies.length, 1, "the session.new held 1.7 s was asked about");
+    assert.ok(["delayed", "network"].includes(h.claw.confirmBodies[0]!.body.why), h.claw.confirmBodies[0]!.body.why);
+  });
 });
 

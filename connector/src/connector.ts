@@ -161,6 +161,9 @@ const ENDING_COMMANDS = new Set(["cancel", "close"]);
  */
 type Lateness = "stall" | "network" | "delayed" | "old" | "deferred";
 
+/** At most this many sessions are remembered in `overtaken`; the oldest go first. */
+const MAX_OVERTAKEN = 1_000;
+
 /** How many of the stream's latest clock readings (`ready`, then a `ping` every 25 s) Claw's clock is taken from: a few minutes. */
 const CLOCK_SAMPLES = 8;
 
@@ -338,6 +341,8 @@ export class Connector {
   private readonly asking = new Map<string, Map<string, { type: string; ctl: AbortController }>>();
   /** When the command stream was last asked for (monotonic): a `ready` that takes long to come was held in the network. */
   private streamAskedAt = 0;
+  /** Per session, the latest `cancel` or `close` that ran ahead of commands still waiting in its chain (`endAsking`). */
+  private readonly overtaken = new Map<string, { type: string; seq: number }>();
   /** When the heartbeat in flight was sent (monotonic), or null. */
   private hbSince: number | null = null;
   /** The heartbeat in flight was seen late (`tick`). */
@@ -800,7 +805,9 @@ export class Connector {
     switch (f.event) {
       case "ready":
         this.resetClock(); // a new stream: its replica's clock, measured afresh
-        this.observeClock(f, "server_time");
+        // Taken as an upper bound: the frame was sent no earlier than the stream was asked for, so adding the time since then
+        // can only make a frame behind it look older (asked about), never younger, however long this `ready` was held.
+        this.observeClock(f, "server_time", performance.now() - this.streamAskedAt);
         // A `ready` that came late was held back, and so were the frames right behind it, which its clock would make look prompt.
         if (!reconnect && performance.now() - this.streamAskedAt > this.timing.transitMs) this.netTrouble("ready_late");
         // A stream opened again after one was lost (or ended): frames may have been held in the network meanwhile, and the
@@ -844,7 +851,7 @@ export class Connector {
     // only then can the cursor sent to the server pass it. A late one runs only if Claw says it is still live.
     // A cancel or close is never held up by a confirmation still being asked in its session: that ends (a close: every one; a
     // cancel: those of prompts, as a cancel drops queued prompts), and the cancel or close runs at once.
-    const now = ENDING_COMMANDS.has(cmd.type) && this.endAsking(cmd.session_id, cmd.type);
+    const now = ENDING_COMMANDS.has(cmd.type) && this.endAsking(cmd.session_id, cmd.type, seq);
     void this.manager.handle(cmd, () => {
       this.ledger.end(seq, cmd.cmd_id);
       this.writeIdentity();
@@ -852,13 +859,18 @@ export class Connector {
   }
 
   /** Ends the confirmations being asked in session `sid` that a `close` or `cancel` makes moot; whether any was being asked. */
-  private endAsking(sid: string, type: string): boolean {
+  private endAsking(sid: string, type: string, seq: number): boolean {
     const asking = this.asking.get(sid);
     if (!asking?.size) return false;
     for (const a of asking.values()) {
       if (type === "close") a.ctl.abort("session_closed");
       else if (a.type === "prompt") a.ctl.abort("cancelled");
     }
+    // Run ahead of the session's chain, it must still end what came before it there: a prompt (for a cancel) or anything (for a
+    // close) read before it and not yet acting is dropped when it reaches the front (`gateFor`), as it would have been in order.
+    const prev = this.overtaken.get(sid);
+    if (!prev || seq > prev.seq || type === "close") this.overtaken.set(sid, { type: prev?.type === "close" ? "close" : type, seq: Math.max(seq, prev?.seq ?? 0) });
+    if (this.overtaken.size > MAX_OVERTAKEN) this.overtaken.delete(this.overtaken.keys().next().value!);
     return true;
   }
 
@@ -874,6 +886,13 @@ export class Connector {
     let refused = false;
     return () => {
       if (refused) return "drop";
+      // A cancel or close that came after it ran ahead of it (`endAsking`): it ends this command as it would have in order.
+      const over = this.overtaken.get(cmd.session_id);
+      if (over && (cmd.cmd_seq ?? Infinity) < over.seq && (over.type === "close" || cmd.type === "prompt")) {
+        refused = true;
+        this.reportDropped(cmd, over.type === "close" ? "session_closed" : "cancelled", "overtaken");
+        return "drop";
+      }
       this.tick();
       if (this.stallEpoch !== seen) why ??= this.epochWhy;
       if (!why) return "run";
@@ -929,13 +948,16 @@ export class Connector {
   /** This machine's monotonic clock as ms since the epoch: a wall clock set by hand does not move it. */
   private localNow(): number { return performance.timeOrigin + performance.now(); }
 
-  /** Claw's clock from a `ready` (`server_time`, ISO) or `ping` (`t`, ms) frame: the offset is the largest seen on this stream. */
-  private observeClock(f: SseFrame, field: "server_time" | "t"): void {
+  /**
+   * Claw's clock from a `ready` (`server_time`, ISO) or `ping` (`t`, ms) frame: the offset is the largest seen on this stream. `bound`:
+   * the most time the frame can have taken (a `ready`: since the stream was asked for), added so that the reading is an upper bound.
+   */
+  private observeClock(f: SseFrame, field: "server_time" | "t", bound = 0): void {
     try {
       const raw = (JSON.parse(f.data ?? "null") as Record<string, unknown> | null)?.[field];
       const t = typeof raw === "number" ? raw : Date.parse(String(raw ?? ""));
       if (!Number.isFinite(t)) return;
-      this.clockSamples.push(t - this.localNow());
+      this.clockSamples.push(t - this.localNow() + Math.max(0, bound));
       if (this.clockSamples.length > CLOCK_SAMPLES) this.clockSamples.shift();
       this.clockOffsetMs = Math.max(...this.clockSamples);
     } catch { /* no clock in it */ }
@@ -1057,12 +1079,17 @@ export class Connector {
       this.d.audit.record("command_unconfirmable", { type: cmd.type, cmd_id: cmd.cmd_id, cmd_seq: seq, why, error: error.slice(0, 300) });
       return "run";
     }
-    const said = status ?? "unconfirmed";
-    this.d.log.warn("a command received late was dropped: Claw did not confirm it is still live", { type: cmd.type, cmd_seq: seq, status: said, why, ...(error ? { error } : {}) });
-    this.d.audit.record("command_dropped", { reason: "not_live", status: said, why, type: cmd.type, cmd_id: cmd.cmd_id, cmd_seq: seq, ...(error ? { error: error.slice(0, 300) } : {}) });
-    if (cmd.type === "session.new") this.emit(cmd.session_id, "session_closed", { reason: "command_not_live", status: said });
-    else this.emit(cmd.session_id, "command_rejected", { type: cmd.type, cmd_id: cmd.cmd_id, reason: "command_not_live", status: said, ...(seq !== undefined ? { cmd_seq: seq } : {}) });
+    this.reportDropped(cmd, status ?? "unconfirmed", why, error);
     return "drop";
+  }
+
+  /** A command that will not run: audited, and said in its session (a `session.new`: `session_closed`), so whoever waits is told. */
+  private reportDropped(cmd: Command, status: string, why: string, error = ""): void {
+    const seq = Number.isSafeInteger(cmd.cmd_seq) ? cmd.cmd_seq : undefined;
+    this.d.log.warn("a command received late was dropped: Claw did not confirm it is still live", { type: cmd.type, cmd_seq: seq, status, why, ...(error ? { error } : {}) });
+    this.d.audit.record("command_dropped", { reason: "not_live", status, why, type: cmd.type, cmd_id: cmd.cmd_id, cmd_seq: seq, ...(error ? { error: error.slice(0, 300) } : {}) });
+    if (cmd.type === "session.new") this.emit(cmd.session_id, "session_closed", { reason: "command_not_live", status });
+    else this.emit(cmd.session_id, "command_rejected", { type: cmd.type, cmd_id: cmd.cmd_id, reason: "command_not_live", status, ...(seq !== undefined ? { cmd_seq: seq } : {}) });
   }
 
   private async streamLoop(): Promise<void> {
