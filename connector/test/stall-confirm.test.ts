@@ -26,20 +26,20 @@ const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src",
 const STOPPED_MS = 6_500;
 
 interface Machine { claw: FakeClaw; child: ChildProcess; home: string; work: string; log: string; exited: Promise<number | null> }
-/** The connector process ended (continued first if it is still stopped), and its stand-in Claw closed, before its home goes. */
-async function shutDown(m: Machine): Promise<void> {
+/** The connector process ended (continued first if it is still stopped), before its home goes. */
+async function stopConnector(m: Machine): Promise<void> {
   if (processStart(m.child.pid!) !== null) {
     try { process.kill(m.child.pid!, "SIGCONT"); } catch { /* gone */ }
     m.child.kill("SIGTERM");
     if (await Promise.race([m.exited.then(() => true), sleep(10_000).then(() => false)]) === false) m.child.kill("SIGKILL");
   }
   await Promise.race([m.exited, sleep(5_000)]);
-  await m.claw.close();
 }
 
 /** The real `claw-connector run` in its own process, signed in with a key, its agent the stand-in adapter that logs each prompt. */
 async function machine(): Promise<Machine> {
   const claw = await FakeClaw.start({ pingMs: 200 });
+  onCleanup(() => claw.close()); // (after the connector: cleanups run newest first)
   const home = tmpdir("cc-stall-");
   const work = tmpdir("cc-stall-work-");
   const log = path.join(home, "agent-received.jsonl");
@@ -64,7 +64,7 @@ FAKE_LOG = ${JSON.stringify(log)}
   const child = spawn(process.execPath, ["--import", "tsx", cli, "run"], { env, stdio: "ignore" });
   const exited = new Promise<number | null>((resolve) => child.once("exit", (code) => resolve(code)));
   const m = { claw, child, home, work, log, exited };
-  onCleanup(() => shutDown(m));
+  onCleanup(() => stopConnector(m));
   await claw.until("the connector online", () => claw.online && claw.heartbeats.length > 0, 30_000);
   return m;
 }
