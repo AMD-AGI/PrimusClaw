@@ -576,10 +576,13 @@ describe("claw-connector commands", () => {
     const tsx = path.join(here, "..", "node_modules", ".bin", "tsx");
     const child = spawn(tsx, [path.join(here, "support", "run-fast.ts")], { env: withThreadPool({ ...process.env, CLAW_CONNECTOR_HOME: home }), stdio: "ignore", detached: true });
     const readers: Array<ReturnType<typeof spawn>> = [];
+    // Made beside the file and renamed over it: the running connector may write the file again between a remove and
+    // a mkfifo (the outbox log, while the session starts), which made mkfifo fail with EEXIST.
     const fifo = (file: string) => {
-      fs.rmSync(file, { force: true });
-      const r = spawnSync("mkfifo", ["-m", "600", file]);
-      assert.equal(r.status, 0, `mkfifo ${file}`);
+      const tmp = `${file}.fifo`;
+      const r = spawnSync("mkfifo", ["-m", "600", tmp]);
+      assert.equal(r.status, 0, `mkfifo ${tmp}: ${r.stderr}`);
+      fs.renameSync(tmp, file);
     };
     try {
       await claw.until("online", () => claw.online && claw.heartbeats.length > 0, 20_000);
