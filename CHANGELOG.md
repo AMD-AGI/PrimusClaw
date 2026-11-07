@@ -108,6 +108,10 @@ record it.
   its `run.completed` was measured from the claim that resumed it, which clears and restamps `started_at`, so a 70-second run
   resumed three seconds before its end ran "three seconds" and no notification was recorded (release claw-rel-1917, 2026-11-07).
   A run is now measured across every claim from its run-time anchor, less the time it spent queued.
+- A run's `run.completed` / `run.failed` is no longer lost when the outbox write fails at the run's end (an API drain closing
+  the database pool under it): the completion was stamped processed regardless, so its redelivery acked and the notification was
+  never recorded. What it still owes is now stored with the processed stamp, and the event is redelivered until the notification
+  is recorded -- once, by its run-derived key -- without running the rest of the completion again.
 - A fresh connector install trusts the CAs the machine trusts: a Claw behind a company CA no longer fails `doctor`, `login`, `pair`
   and `run` until `NODE_USE_SYSTEM_CA=1` is set. On Node.js 22.19+ / 24.5+ the connector adds the system store to Node's own list
   (and `NODE_EXTRA_CA_CERTS`) before its first connection and passes `NODE_USE_SYSTEM_CA=1` to the programs it starts;

@@ -108,6 +108,8 @@ CREATE TABLE claw_session_events (
   -- exercises nothing at all. (No backticks here: this whole schema is a
   -- template literal.)
   processed_at TIMESTAMPTZ,
+  -- Read beside processed_at by the same statement.
+  run_notification_owed JSONB,
   deleted_at   TIMESTAMPTZ,
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
