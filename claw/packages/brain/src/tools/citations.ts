@@ -22,7 +22,7 @@
  */
 import pino from "pino";
 import {
-  CITE_DROPPED_META, CITE_MAX_PER_CALL, CITE_SOURCES_META, CITE_TITLE_MAX, citeableUrl, isCiteSourceKind, isPlatformMcpServer,
+  CITE_DROPPED_META, CITE_MAX_PER_CALL, CITE_SOURCES_META, CITE_TITLE_MAX, citeSourcesAsked, citeableUrl, isCiteSourceKind, isPlatformMcpServer,
   type CiteDropped, type CiteSource, type CitedSource,
 } from "@claw/protocol";
 
@@ -170,7 +170,7 @@ export class RunCitations {
    */
   metaFor(name: string, input: Record<string, unknown>): Record<string, unknown> | undefined {
     if (!this.cites(name) || input.sources === undefined) return undefined;
-    const asked = Array.isArray(input.sources) ? input.sources : [input.sources];
+    const asked = citeSourcesAsked(input.sources);
     const cited: CitedSource[] = [];
     const dropped: CiteDropped = { not_in_turn: 0, invalid: 0, over_cap: 0 };
     const missedHosts: string[] = [];
