@@ -1274,6 +1274,12 @@ describe("a first session that would fail at its first message", () => {
     const end = await h.turnEnd(sid);
     assert.equal(end.data.error, "agent_auth_required", JSON.stringify(end.data));
     assert.match(end.data.hint, /not signed in/);
+    // A "resume" from the phone is refused the same way, with the fix, and the session stays.
+    h.claw.issue("resume", sid, {});
+    const rej = await h.claw.until("resume refused", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.type === "resume") ?? h.claw.eventsOf(sid, "session_closed")[0]);
+    assert.equal(rej.type, "command_rejected", JSON.stringify(rej.data));
+    assert.equal(rej.data.reason, "agent_auth_required");
+    assert.match(rej.data.hint, /not signed in/);
     assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0);
   });
 

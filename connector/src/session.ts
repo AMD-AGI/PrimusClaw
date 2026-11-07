@@ -920,6 +920,8 @@ export class Session {
       if (this.adapter && !this.adapter.exited) await this.enforceMode(this.targetMode);
       else await this.launch("resume");
     } catch (e) {
+      // Not signed in (yet): the resume is refused with the fix and the session stays, as for a prompt.
+      if (e instanceof SessionRefusal && e.reason === "agent_auth_required") return this.rejectCommand("resume", cmdId, e.reason);
       return this.refuse(e);
     }
     this.audit("session_resumed", { mode: this.currentMode, unattended: this.unattended });
