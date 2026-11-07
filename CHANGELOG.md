@@ -101,6 +101,9 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A user whose several machines are all offline is told in Chinese to run the restart command on each of them (每台机器), not on
+  "that machine". A pairing claimed but not registered yet holds its name: two machines of one hostname claimed one after the
+  other, before either registered, no longer both get the same alternate name.
 - "连接我的开发环境" from someone whose machines are all offline answers, in one reply, how to bring the offline machine back
   (`claw-connector service install` on it) and the one-line pairing command for a new machine. devenv_list with every machine
   offline now carries `connect_a_machine` with `all_offline: true`: its `text` is the restart line, then the pairing command (or,

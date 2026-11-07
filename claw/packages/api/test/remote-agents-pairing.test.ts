@@ -135,11 +135,25 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     // A connector that sent no alternate (its name was chosen) keeps it; another owner's "box" takes nothing from alice's.
     assert.equal((await withAlt((await newCode("alice")).code, "box")).body.data.name, "box");
     assert.equal((await withAlt((await newCode("bob")).code, "box", "box-api")).body.data.name, "box");
-    // A revoked machine's name is free again.
+    // A claim not registered yet holds its name too (P1c); once it runs out (pruneUnboundGrants), and once a machine is revoked,
+    // the name is free again.
+    assert.equal((await withAlt((await newCode("alice")).code, "box-api-2", "box-api-2-x")).body.data.name, "box-api-2-x");
+    await q("DELETE FROM claw_remote_grants WHERE owner_user_id = 'alice' AND connector_id IS NULL");
     await q("UPDATE claw_remote_connectors SET revoked_at = NOW() WHERE owner_user_id = 'alice'");
     assert.equal((await withAlt((await newCode("alice")).code, "box", "box-api")).body.data.name, "box");
     const names = (await q("SELECT device_name FROM claw_remote_grants WHERE owner_user_id = 'alice' ORDER BY created_at")).rows.map((r) => r.device_name);
-    assert.deepEqual(names, ["box", "box-api", "box-api-2", "box", "box"]);
+    assert.deepEqual(names, ["box", "box-api", "box"]);
+  });
+
+  test("P1c two machines of one hostname claimed before either registered: the second still gets the alternate", async () => {
+    const withAlt = (code: string, name: string, alternate_name: string) =>
+      call("POST", "/v1/remote-agents/pairings/claim", { body: { code, name, alternate_name } });
+    const a = await withAlt((await newCode("alice")).code, "box", "box-api");
+    const b = await withAlt((await newCode("alice")).code, "box", "box-web");
+    assert.deepEqual([a.body.data.name, b.body.data.name], ["box", "box-web"], "the first claim, not registered yet, holds the name");
+    // Both register under the names they were given.
+    assert.equal((await register(a.body.data.token as string, "box")).status, 201);
+    assert.equal((await register(b.body.data.token as string, "box-web")).status, 201);
   });
 
   test("P2 a wrong, expired or retired code gets one answer, and nothing is created", async () => {
