@@ -485,10 +485,12 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
           const frames = rows.map((r) => {
             cursor = Number(r.cmd_seq);
             // The fixed fields go last so a payload can never overwrite them.
-            // `issued_at` (Claw's clock, ms): a connector that gets a command later than the live TTL asks before it runs it.
+            // `issued_at` (when it was queued, ms): a connector that gets a command later than the live TTL asks before it runs it.
+            // `sent_at` (this replica's clock, the one `ready` and `ping` carry, ms): a frame the network held back for more than a
+            // few seconds is asked about too, before it runs.
             return sseFrame("command", {
               ...r.payload, v: REMOTE_AGENT_PROTOCOL_VERSION, cmd_id: r.cmd_id, type: r.type, session_id: r.session_id,
-              issued_at: new Date(r.created_at as string | Date).getTime(),
+              issued_at: new Date(r.created_at as string | Date).getTime(), sent_at: Date.now(),
             }, cursor);
           });
           return { frames, more: rows.length === 100 };
@@ -501,9 +503,11 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
 
   /**
    * A connector asks whether a command it received may still be carried out, before it does: after its machine slept or its
-   * process was stopped (a closed laptop), or for a command older than the live TTL. A frame can sit in the socket's buffer through
-   * that, and the person may meanwhile have closed the session or removed the machine and been told so. Answered with the command's
-   * status (`store.commandLiveness`); only `live` may run. A revoked connector gets 401 `revoked`, as on every connector-side route.
+   * process was stopped (a closed laptop), for a frame the network held back, or for a command older than the live TTL. A frame
+   * can sit in a buffer through that, and the person may meanwhile have closed the session or removed the machine and been told
+   * so. Answered with the command's status (`store.commandLiveness`); only `live` may run. A revoked connector gets 401 `revoked`,
+   * as on every connector-side route. The body (optional): `received_late` (boolean; the command was past the live TTL when it
+   * came, the only case it can be `expired`; taken as true when absent) and `why` (the connector's reason, for the audit trail).
    */
   app.post<{ Params: { cid: string; cmd_id: string } }>(CONNECTOR_SIDE_ROUTES.confirm.url, async (req, reply) => {
     const owner = requireOwner(req, reply, "connector");
@@ -514,7 +518,11 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (typeof cmdId !== "string" || cmdId.length < 1 || cmdId.length > 128 || /[\u0000-\u001f\u007f]/u.test(cmdId)) {
       return fail(reply, 400, "invalid_cmd_id");
     }
-    const r = await store.commandLiveness(owner, connector.connector_id as string, cmdId, clientLabel(req));
+    const body = (req.body ?? {}) as { received_late?: unknown; why?: unknown };
+    if (typeof body !== "object" || Array.isArray(body)) return fail(reply, 400, "invalid_body");
+    const receivedLate = body.received_late !== false;
+    const why = typeof body.why === "string" && /^[a-z_]{1,32}$/u.test(body.why) ? body.why : null;
+    const r = await store.commandLiveness(owner, connector.connector_id as string, cmdId, clientLabel(req), { receivedLate, why });
     // Revoked between the check above and the lock the answer is given under.
     if (r.status === "connector_revoked") return fail(reply, 401, "revoked");
     if (r.status !== "live") logger.info({ owner, connectorId: connector.connector_id, cmdSeq: r.cmd_seq, status: r.status }, "remote_agents.command_refused_late");

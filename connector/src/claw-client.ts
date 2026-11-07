@@ -104,11 +104,13 @@ export class ClawClient {
   }
 
   /**
-   * Whether command `cmdId`, received late (after a stall, or past the live TTL), may still be carried out: Claw's answer, `live`
-   * or why not (`session_closed`, `cancelled`, `expired`, `gone`). Throws {@link RevokedError} when this connector was revoked.
+   * Whether command `cmdId`, received late (after a stall, held in the network, or past the live TTL), may still be carried out:
+   * Claw's answer, `live` or why not (`session_closed`, `cancelled`, `expired`, `gone`). `received_late`: it was already older than
+   * the live TTL when it came (only then may Claw call it `expired`). Throws {@link RevokedError} when this connector was revoked,
+   * and {@link HttpError} 404 with a code other than `not_found` from a Claw that has no such route.
    */
-  async confirmCommand(cid: string, cmdId: string): Promise<string> {
-    const d = await this.json("POST", `/v1/remote-agents/connectors/${encodeURIComponent(cid)}/commands/${encodeURIComponent(cmdId)}/confirm`, {});
+  async confirmCommand(cid: string, cmdId: string, q: { why: string; received_late: boolean }): Promise<string> {
+    const d = await this.json("POST", `/v1/remote-agents/connectors/${encodeURIComponent(cid)}/commands/${encodeURIComponent(cmdId)}/confirm`, q);
     return typeof d.status === "string" ? d.status : "unknown";
   }
 

@@ -118,7 +118,15 @@ record it.
   `reason: "command_not_live"`. A command read before a stall that is still waiting to act (behind a running turn, or for a
   terminal) is confirmed when it reaches the agent. Claw deletes the queued commands that would make an agent act when it closes their session
   (`close`, a reclaim, a revocation) and refuses a late confirmation for them (audited `command.refused_late`). `cancel` and `close`
-  are never held up.
+  are never held up. The same holds when the process keeps running but the network holds the frames back (Wi-Fi drops, roaming,
+  a VPN reconnecting): every command frame carries `sent_at`, and one that took more than 3 s to arrive is confirmed, as is every
+  command read while a heartbeat is overdue and within 5 s after a late or failed heartbeat or a stream reconnect. `expired` now
+  means only "reached the connector past the live TTL" (the connector says `received_late`): a prompt received in time and queued
+  behind a turn longer than 5 minutes runs after a stall instead of being dropped. With no answer the connector asks again for up
+  to 10 minutes, the command waiting in its session, before it reports it `unconfirmed`; a Claw without the confirm route (404
+  from its router) leaves the command to run as before, so the API and the connector ship in either order. A `set_mode`,
+  `resume` or `decision` queued before a `cancel` is no longer refused as `cancelled`, and a confirmation for an id Claw does not
+  hold writes no audit row.
 - "连接我的开发环境" with no machine connected answers the one-line pairing command, every time. devenv_list with no machine, in a
   router turn answering a message the user sent signed in, recently, makes the pairing itself and gives it in `connect_a_machine`
   (`commands` the one line, `text` in the user's language with it in a code block, `pairing` its minutes). Any other turn (a report,

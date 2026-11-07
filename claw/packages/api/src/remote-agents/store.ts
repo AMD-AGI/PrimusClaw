@@ -555,8 +555,11 @@ export async function commandsAfter(connectorId: string, cursor: number, limit: 
  * run; a connector drops anything else and says so in the session.
  *  - `live`: still queued, its session open, not expired, nothing after it cancels it.
  *  - `session_closed`: its session was closed (by the person, by a reclaim, by its machine, or because the connector was revoked).
- *  - `cancelled`: a `cancel` or `close` of its session was queued after it.
- *  - `expired`: older than a command of its kind may be carried out ({@link expiredSql}).
+ *  - `cancelled`: a prompt, and a `cancel` or `close` of its session was queued after it. (A `set_mode`, `resume` or `decision`
+ *    queued before a cancel is still live: the connector's cancel drops only queued prompts.)
+ *  - `expired`: it reached the connector already older than a command of its kind may be carried out ({@link expiredSql}). One the
+ *    connector received in time (`receivedLate` false) and that then waited on the machine, queued behind a long turn or for a
+ *    terminal, is never expired: the TTL is for commands that were never collected, not for ones collected in time.
  *  - `gone`: Claw holds no such command for this connector any more (ended by Claw, or never this connector's).
  * `connector_revoked`: the connector was revoked (the route answers it 401 `revoked`, as every connector-side route does).
  *
@@ -570,11 +573,14 @@ export type CommandLiveness = "live" | "session_closed" | "cancelled" | "expired
 const ENDING_COMMAND_TYPES = ["cancel", "close"];
 
 /**
- * Whether command `cmdId`, which connector `connectorId` received and has not carried out, may still be carried out. A refusal is
- * audited (`command.refused_late`), with what was refused and why, never the text of a prompt.
+ * Whether command `cmdId`, which connector `connectorId` received and has not carried out, may still be carried out. `receivedLate`:
+ * the connector says the command was already past the live TTL when it came (only then can it be `expired`); `why` is the
+ * connector's reason for asking, for the audit trail. An answer about a command Claw holds is audited (`command.confirmed`, or
+ * `command.refused_late` with what was refused and why, never the text of a prompt); one about an id it does not hold is not, so
+ * the route cannot be used to fill the audit trail.
  */
 export async function commandLiveness(
-  owner: string, connectorId: string, cmdId: string, client: string | null,
+  owner: string, connectorId: string, cmdId: string, client: string | null, ask: { receivedLate: boolean; why: string | null } = { receivedLate: true, why: null },
 ): Promise<{ status: CommandLiveness; cmd_seq: number | null; session_id: string | null }> {
   return inTransaction(async (q) => {
     const conn = (await q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1 FOR UPDATE", [connectorId])).rows[0];
@@ -593,15 +599,17 @@ export async function commandLiveness(
     if (!row) status = "gone";
     else if (ENDING_COMMAND_TYPES.includes(String(row.type))) status = "live";
     else if (row.session_id && row.session_status !== "active") status = "session_closed";
-    else if (row.expired) status = "expired";
-    else if (row.cancelled_after && row.type !== "session.new") status = "cancelled";
+    else if (row.expired && ask.receivedLate) status = "expired";
+    else if (row.cancelled_after && row.type === "prompt") status = "cancelled";
     else status = "live";
     const sessionId = row?.session_id ? String(row.session_id) : null;
-    await writeAudit(q, {
-      owner, actor: connectorId, client, connectorId, agentId: row?.agent_id ?? null, sessionId,
-      action: status === "live" ? "command.confirmed" : "command.refused_late",
-      detail: { cmd_id: cmdId, ...(row ? { type: row.type, cmd_seq: Number(row.cmd_seq) } : {}), status },
-    });
+    if (row) {
+      await writeAudit(q, {
+        owner, actor: connectorId, client, connectorId, agentId: row.agent_id ?? null, sessionId,
+        action: status === "live" ? "command.confirmed" : "command.refused_late",
+        detail: { cmd_id: cmdId, type: row.type, cmd_seq: Number(row.cmd_seq), status, received_late: ask.receivedLate, ...(ask.why ? { why: ask.why } : {}) },
+      });
+    }
     return { status, cmd_seq: row ? Number(row.cmd_seq) : null, session_id: sessionId };
   });
 }

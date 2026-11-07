@@ -152,6 +152,8 @@ describe("a command held in the socket while the connector was stopped", { timeo
     const rejected = await m.claw.until("the queued prompt refused", () => m.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_id === cmd), 15_000);
     assert.equal(rejected.data.status, "session_closed");
     assert.deepEqual(m.claw.confirmations, [{ cmd_id: cmd, status: "session_closed" }]);
+    // Read in time, so Claw is told it did not come late: however long it then waited behind the turn, it is never `expired`.
+    assert.deepEqual(m.claw.confirmBodies.map((c) => [c.cmd_id, c.body.why, c.body.received_late]), [[cmd, "stall", false]]);
     await sleep(500);
     assert.equal(received(m).includes("ls"), false, "the queued prompt never reached the agent");
   });
@@ -186,6 +188,7 @@ describe("a command older than the live TTL", () => {
     await h.turnEnd(sid, 1);
     assert.deepEqual(h.adapterLog().filter((r) => r.prompt).map((r) => r.prompt), ["old but live"]);
     assert.deepEqual(h.claw.confirmations.map((c) => [c.cmd_id, c.status]), [["c-stale", "expired"], ["c-live", "live"]]);
+    assert.deepEqual(h.claw.confirmBodies.map((c) => [c.cmd_id, c.body.why, c.body.received_late]), [["c-stale", "old", true], ["c-live", "old", true]]);
     // A fresh one is not asked about.
     h.prompt(sid, "fresh");
     await h.turnEnd(sid, 2);
@@ -232,5 +235,65 @@ describe("a command older than the live TTL", () => {
     h.claw.issue("close", sid, { issued_at: 1 });
     await h.claw.until("closed", () => h.claw.eventsOf(sid, "session_closed")[0]);
     assert.equal(h.claw.confirmations.length, 0);
+  });
+});
+
+describe("a command whose frame was held in the network", () => {
+  test("one that took longer than transitMs to come is confirmed first (`delayed`); one that came at once is not", async () => {
+    const h = await Harness.create();
+    const sid = await h.newSession();
+    h.prompt(sid, "came late", { sent_at: Date.now() - 10_000, cmd_id: "c-delayed" });
+    await h.turnEnd(sid, 1);
+    assert.deepEqual(h.claw.confirmBodies.map((c) => [c.cmd_id, c.body.why, c.body.received_late]), [["c-delayed", "delayed", false]]);
+    h.prompt(sid, "came at once");
+    await h.turnEnd(sid, 2);
+    assert.equal(h.claw.confirmAsked.length, 1, "a frame that came at once is not asked about");
+    assert.deepEqual(h.adapterLog().filter((r) => r.prompt).map((r) => r.prompt), ["came late", "came at once"]);
+  });
+
+  test("with no answer yet (no network after a wake), it waits in its session and is asked again until Claw answers; it is not dropped", async () => {
+    const h = await Harness.create();
+    const sid = await h.newSession();
+    h.claw.failConfirms = 8; // more than the four tries the connector used to give up after
+    h.prompt(sid, "asked until answered", { sent_at: Date.now() - 10_000, cmd_id: "c-wait" });
+    await h.turnEnd(sid, 1);
+    assert.equal(h.claw.confirmAsked.filter((c) => c === "c-wait").length, 9);
+    assert.deepEqual(h.claw.confirmations, [{ cmd_id: "c-wait", status: "live" }]);
+    assert.equal(h.claw.eventsOf(sid, "command_rejected").length, 0);
+  });
+
+  test("past the retry budget with no answer it is dropped, and the session is told why (command_rejected unconfirmed)", async () => {
+    const h = await Harness.create({ timing: { confirmRetryMs: 400 } });
+    const sid = await h.newSession();
+    h.claw.failConfirms = 1_000;
+    const seq = h.prompt(sid, "never answered", { sent_at: Date.now() - 10_000, cmd_id: "c-never" });
+    const rejected = await h.claw.until("the prompt refused", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_id === "c-never"));
+    assert.equal(rejected.data.reason, "command_not_live");
+    assert.equal(rejected.data.status, "unconfirmed");
+    assert.equal(rejected.data.cmd_seq, seq);
+    await sleep(200);
+    assert.deepEqual(h.adapterLog().filter((r) => r.prompt), [], "never reached the agent");
+  });
+
+  test("a Claw with no confirm route (404 from its router): the command runs as before, so the API and the connector ship in either order", async () => {
+    const h = await Harness.create();
+    const sid = await h.newSession();
+    h.claw.confirmRoute = false;
+    h.prompt(sid, "say old-claw", { sent_at: Date.now() - 10_000, cmd_id: "c-old-claw" });
+    await h.turnEnd(sid, 1);
+    assert.ok(h.messages(sid).includes("old-claw"));
+    assert.ok(h.audit().some((a) => a.kind === "command_unconfirmable" && a.cmd_id === "c-old-claw"));
+    assert.equal(h.claw.eventsOf(sid, "command_rejected").length, 0);
+  });
+
+  test("after the command stream reconnects, a command read in the window is confirmed first (`network`)", async () => {
+    const h = await Harness.create({ timing: { stallMs: 2_000 } });
+    const sid = await h.newSession();
+    h.claw.dropStreams();
+    await h.claw.until("the stream back", () => h.claw.online && h.claw.streamHeaders.length >= 2);
+    h.prompt(sid, "right after", { cmd_id: "c-after-reconnect" });
+    await h.turnEnd(sid, 1);
+    assert.deepEqual(h.claw.confirmBodies.map((c) => [c.cmd_id, c.body.why]), [["c-after-reconnect", "network"]]);
+    assert.ok(h.audit().some((a) => a.kind === "network_trouble" && a.reason === "reconnect"));
   });
 });
