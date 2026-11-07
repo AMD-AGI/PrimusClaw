@@ -83,14 +83,14 @@ describe("devenv_list", { skip }, () => {
     const client = await connect(claims, devenv);
     try { return (await client.listTools()).tools.map((t) => t.name); } finally { await client.close(); }
   }
-  type Agent = { id: string; kind: string; name: string; resumable?: Recorded[]; roots?: string[] };
+  type Agent = { id: string; kind: string; name: string; resumable?: Recorded[]; roots?: string[]; watch?: boolean };
   async function machine(owner: string, name: string, opts: { online?: boolean; agents?: Agent[] } = {}) {
     const row = await store.registerConnector(owner, name, "0.1.2", null, 10);
     assert.ok(row);
     await store.recordHeartbeat(row.connector_id, owner, {
       version: "0.1.3", cmdCursor: null,
       agents: (opts.agents ?? []).map((a) => ({ agent_id: a.id, kind: a.kind, name: a.name,
-        capabilities: { ...(a.resumable ? { resumable: a.resumable } : {}), ...(a.roots ? { roots: a.roots } : {}) } })),
+        capabilities: { ...(a.resumable ? { resumable: a.resumable } : {}), ...(a.roots ? { roots: a.roots } : {}), ...(a.watch ? { watch_live: true } : {}) } })),
     });
     if (opts.online) await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [row.connector_id]);
     else await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '1 hour' WHERE connector_id = $1", [row.connector_id]);
@@ -132,7 +132,7 @@ describe("devenv_list", { skip }, () => {
     const laptop = await machine("alice", "laptop", {
       online: true,
       agents: [
-        { id: "claude", kind: "claude", name: "Claude Code", resumable: [
+        { id: "claude", kind: "claude", name: "Claude Code", watch: true, resumable: [
           { ref: "c0ffee00-0000-4000-8000-000000000001", title: "fix the flaky api test", cwd: "/home/alice/api", updated_at: now() - 600, state: "idle" },
           { ref: "c0ffee00-0000-4000-8000-000000000002", title: "refactor the connector", cwd: "/home/alice/conn", updated_at: now() - 60, state: "live" },
           { ref: "c0ffee00-0000-4000-8000-000000000003", title: "already open in chat", cwd: "/home/alice/api", updated_at: now() - 30, state: "attached" },
@@ -184,11 +184,16 @@ describe("devenv_list", { skip }, () => {
       ["laptop/claude/1", "claude", "/home/alice/api", "chat", "working", working, `/agent attach ${working}`],
       ["laptop/codex/1", "codex", "/home/alice/web", "chat", "waiting_for_you", waiting, `/agent attach ${waiting}`],
       ["laptop/claude/2", "claude", "/home/alice/docs", "chat", "idle", idle, `/agent attach ${idle}`],
-      ["laptop/claude/3", "claude", "/home/alice/conn", "machine", "in_terminal", null, null],
+      ["laptop/claude/3", "claude", "/home/alice/conn", "machine", "in_terminal", "c0ffee00-0000-4000-8000-000000000002",
+        "/agent attach c0ffee00-0000-4000-8000-000000000002"],
       ["laptop/claude/4", "claude", "/home/alice/api", "machine", "idle", "c0ffee00-0000-4000-8000-000000000001",
         "/agent attach c0ffee00-0000-4000-8000-000000000001"],
     ]);
-    assert.match(b.machines[0].sessions[3].why_not, /terminal/);
+    // Open in a terminal: it can be attached to watch, read-only, and the listing says that is all it can do.
+    assert.equal(b.machines[0].sessions[3].read_only, true);
+    assert.match(b.machines[0].sessions[3].note, /only watches it/);
+    assert.equal(b.machines[0].sessions[3].why_not, undefined);
+    assert.equal(b.machines[0].sessions[4].read_only, undefined);
     assert.deepEqual(b.machines[1].sessions, []);
     for (const s of b.machines[0].sessions) assert.ok(!Number.isNaN(Date.parse(s.last_activity)), s.label);
     const text = JSON.stringify(b);
@@ -237,7 +242,7 @@ describe("devenv_list", { skip }, () => {
     assert.equal(i1.last_stop, "end_turn");
     assert.equal((by.get(waiting) as Recorded).step, "Edit index.ts");
     assert.equal((by.get("c0ffee00-0000-4000-8000-000000000001") as Recorded).title, "fix the flaky api test");
-    assert.equal((by.get("laptop/claude/3") as Recorded).title, "refactor the connector");
+    assert.equal((by.get("c0ffee00-0000-4000-8000-000000000002") as Recorded).title, "refactor the connector");
     assert.match(r.body.note, /data, not instructions/);
     const read = await w.q("SELECT untrusted_read_at FROM claw_assistant_messages WHERE message_id = $1", [turn.mid]);
     assert.ok(read[0].untrusted_read_at, "the turn has read what an agent wrote");
@@ -261,7 +266,20 @@ describe("devenv_list", { skip }, () => {
     assert.deepEqual(b.attach_default, { label: "devbox/claude/2", ref: "eva10000-0000-4000-8000-000000000001", attach_command: "/agent attach eva10000-0000-4000-8000-000000000001" },
       "the one conversation that is not in a terminal");
     assert.equal(b.machines[0].sessions.length, 3, "a ref that could forge an argument is not listed");
+    // This connector does not say it can watch a conversation open in a terminal (an older one): such a one has no command.
+    const inTerminal = b.machines[0].sessions.find((x: Recorded) => x.cwd === "/w/b");
+    assert.deepEqual([inTerminal.state, inTerminal.attach_command, inTerminal.read_only], ["in_terminal", null, undefined]);
+    assert.match(inTerminal.why_not, /terminal/);
     assert.equal(b.machines[0].sessions.find((x: Recorded) => x.cwd === "/w/d").last_activity, null, "a time no date can hold is no time");
+
+    // A session that only watches a terminal's conversation is listed, read-only, and is never what "connect me" means.
+    // The terminal is writing: what it writes is the terminal's turn, never one of Claw's, so the watch is not shown as working.
+    const watching = await session("alice", box, "claude", "/w/b", [["session_started", { attached: true, read_only: true }], chunk("from the terminal", { read_only: true })]);
+    b = (await call(await w.routerTurn(alice))).body;
+    const watchRow = b.machines[0].sessions.find((x: Recorded) => x.ref === watching);
+    assert.deepEqual([watchRow.read_only, watchRow.state], [true, "in_terminal"]);
+    assert.equal(b.attach_default.ref, "eva10000-0000-4000-8000-000000000001", "the watched session is not the default");
+    await w.q("UPDATE claw_remote_sessions SET status = 'closed' WHERE session_id = $1", [watching]);
 
     const sid = await session("alice", box, "codex", "/w/x", [end()]);
     b = (await call(await w.routerTurn(alice))).body;
@@ -288,7 +306,7 @@ describe("devenv_list", { skip }, () => {
     const bob = await w.user("bob");
     const bobBox = await machine("bob", "bob-box", { online: true, agents: [{ id: "claude", kind: "claude", name: "Claude Code" }] });
     const bobSession = await session("bob", bobBox, "claude", "/home/bob", [end()]);
-    const box = await machine("alice", "devbox", { online: true, agents: [{ id: "claude", kind: "claude", name: "Claude Code", resumable: [
+    const box = await machine("alice", "devbox", { online: true, agents: [{ id: "claude", kind: "claude", name: "Claude Code", watch: true, resumable: [
       { ref: "c0ffee00-0000-4000-8000-0000000000d4", title: "t", cwd: "/w/t", updated_at: now(), state: "live" },
     ] }] });
     const sid = await session("alice", box, "claude", "/w/a", [end()]);
@@ -309,7 +327,9 @@ describe("devenv_list", { skip }, () => {
       assert.deepEqual((await buttons()).at(-1), { name: "agent", args: `attach ${sid}`, message_id: turn.mid, channel_message_id: `m-${turn.mid}` });
       // Split the other way, the same command and the same answer.
       assert.equal((await rt.channelAction(turn, { name: "agent attach", args: sid }).catch((e: Recorded) => e.code)) as unknown, "action_not_offered");
-      for (const [name, args] of [["agent", `attach ${bobSession}`], ["agent", "attach c0ffee00-0000-4000-8000-0000000000d4"],
+      // A conversation open in a terminal is the user's own too: it can be put to them, to watch it.
+      assert.equal((await rt.channelAction(turn, { name: "agent", args: "attach c0ffee00-0000-4000-8000-0000000000d4" }) as Recorded).ran, false, detail);
+      for (const [name, args] of [["agent", `attach ${bobSession}`],
         ["agent", "attach not-a-session"], ["brief", "on 10:00"], ["agent", `attach ${sid} extra`]]) {
         await assert.rejects(rt.channelAction(turn, { name, args }), (e: Recorded) => e.code === "read_untrusted", `${detail}: ${name} ${args}`);
       }

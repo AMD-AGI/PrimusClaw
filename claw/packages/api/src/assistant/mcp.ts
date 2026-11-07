@@ -30,7 +30,7 @@ import { PASS_REASONS, SAY_MAX_CHARS } from "./prompts.js";
 import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
 import { SAY_SUGGESTED_PARAM, suggestedRepliesOn } from "./suggested.js";
 import { REPORT_KINDS } from "./work-items.js";
-import { githubEventsEnabled, prReply, REPLY_BODY_MAX, watchNamedPullRequests, workSubscribe } from "./github-events.js";
+import { githubEventsEnabled, prReply, REPLY_BODY_MAX, watchNamedPullRequests, workSubscribe, workUnsubscribe } from "./github-events.js";
 import { jobHttpSources, jobSources, jobUnwatch, jobWatch, jobWatchesEnabled, jobWatchList } from "./job-watch.js";
 import { briefTool } from "./brief.js";
 import {
@@ -421,9 +421,25 @@ export function createAssistantMcpServer(
       mcp.tool(
         "work_subscribe",
         "Have an item watch a GitHub pull request: new comments, reviews and failed CI on it go straight to the item's worker. "
-        + "Use it when the user wants an item to follow up on a pull request. It never lets the worker answer on GitHub without the user's approval.",
+        + "Use it when the user wants an item to follow up on a pull request. It never turns on automatic replies itself: only the user's "
+        + "own button does. Where they are on (the result says reply_allowed true, the item list says auto-reply on), the worker answers "
+        + "as the user right away with no approval card; otherwise each answer on GitHub waits for the user's approval.",
         { item_id: z.string().describe(ITEM_ID_PARAM), pr: z.string().describe("The pull request: owner/repo#123 or its https://github.com URL.") },
         (args) => answer(claims, "work_subscribe", () => workSubscribe(claims, { item_id: args.item_id, pr: args.pr })),
+      );
+      mcp.tool(
+        "work_unsubscribe",
+        "Stop an item watching a GitHub pull request, and with it any automatic replies, when the user asks (别再自动回复 #381 了, "
+        + "不用再盯这个 PR 了, stop answering comments on it). Name the item, the pull request, or both: with the pull request alone, "
+        + "every item of the user's that watches it stops. It only takes away; it never starts anything. auto_reply_only true keeps "
+        + "the item watching and only turns automatic replies off (answers then wait for approval): use it only when the user asks "
+        + "for exactly that (继续盯，但回复前先问我); a plain stop (别再自动回复了, 取消订阅) stops the watch.",
+        {
+          item_id: z.string().optional().describe(`${ITEM_ID_PARAM} Leave out to stop every item of the user's that watches the pull request.`),
+          pr: z.string().optional().describe("The pull request: owner/repo#123, its https://github.com URL, or #123 for the user's watched pull request of that number. Leave out to stop all the item watches."),
+          auto_reply_only: z.boolean().optional().describe("true: keep watching, only turn automatic replies off."),
+        },
+        (args) => answer(claims, "work_unsubscribe", () => workUnsubscribe(claims, { item_id: args.item_id, pr: args.pr, auto_reply_only: args.auto_reply_only })),
       );
     }
     if (devenv) {

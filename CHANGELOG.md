@@ -28,6 +28,9 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A conversation open in a terminal on your machine that has waited a minute for you (Claude Code's own "waiting": a permission or a
+  question) is pushed once through your assistant: the machine, the agent, what it waits for and the conversation's title. Answered at
+  the terminal within the minute, it is never pushed; a terminal working or finishing is never pushed. A later wait is told again once.
 - Pairing a machine from the chat with a one-time code (remote agents). `POST /v1/remote-agents/pairings` gives the signed-in person a
   12-character code (10 minutes, one use, at most 3 live) inside one command line,
   `npm install -g @primusclaw/connector@latest && claw-connector pair <code> --server <CLAW_PUBLIC_URL>`; running it on the machine is the

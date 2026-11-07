@@ -362,6 +362,18 @@ A transcript written within the last 10 seconds is refused too (a terminal that 
 `session_live`, `recently_written` and `twin_check_failed`; the agent that this connector itself started for the conversation
 is not mistaken for a twin.
 
+A conversation that a terminal has open when the phone asks for it is not refused but watched, read-only. Nothing is
+started: the connector reads the transcript the terminal writes, from its end (opened read-only; nothing is ever written to it),
+and sends each new line as the update an adapter would have sent (the user's words, the agent's words, the steps it starts
+and how they end; thinking and sub-agents are left out), scrubbed for credentials like every event and marked `read_only`.
+The last twenty updates already there are sent first, marked `replay`. `session_started` says `read_only: true` and
+`read_only_reason: "session_live"`. A prompt, a mode change or a decision sent to it is refused with
+`read_only_live_session` and reaches nothing that could write to the transcript; the server refuses them too
+(`session_read_only`). The heartbeat still reports the conversation as `live`, and an attach agent's capabilities say `watch_live: true`, so a
+client offers the watch only where the connector can do it. When the terminal no longer has it open the
+watch ends (`session_closed`, reason `terminal_closed`), and taking it over is then a new session, through every check
+above. A watched session stays read-only across a restart of the connector.
+
 The ask mode still applies: a conversation keeps the mode it was left in, often one that never asks (`bypassPermissions`),
 and the adapter says so while it sets the session up. That warning describes the mode that is about to be replaced, so it is
 set aside until the ask mode (`default`) is locked and read back from the adapter; a warning that comes after that, or a mode

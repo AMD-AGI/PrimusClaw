@@ -41,6 +41,7 @@ import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
 import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
+import { startTerminalWaitSweep, TERMINAL_WAIT_NOTICE_MS } from "../remote-agents/terminal-waits.js";
 import { closeCardsOfConnector } from "../assistant/devenv-tools.js";
 import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
@@ -67,6 +68,8 @@ export interface RemoteAgentOptions {
   presenceSweepMs?: number;
   /** How long a connector stays offline before its owner is told. */
   offlineNoticeMs?: number;
+  /** How long a conversation open in a terminal waits for its person before they are told. */
+  terminalWaitNoticeMs?: number;
   /** Pairing a machine with a one-time code (`remote-agents/pairing-routes.ts`). */
   pairing?: PairingRouteOptions;
   /**
@@ -88,6 +91,24 @@ const IDLE_POLL_MS = 5_000;
 
 /** How often each replica deletes sessions that are past the retention. */
 const RETENTION_SWEEP_MS = 60 * 60 * 1000;
+
+/** The commands a read-only session refuses: everything that would make its agent act. `cancel`, `resume` and `close` are harmless. */
+const READ_ONLY_REFUSED = new Set<string>(["prompt", "set_mode", "decision"]);
+
+/**
+ * Whether a session is read-only, followed frame by frame: it starts as the session is now, and each `session_started` or
+ * `session_resumed` says it again (`read_only`, set by the connector). Every frame of a read-only session carries the mark on
+ * top, its `turn_end` and `session_closed` included.
+ */
+function readOnlyTracker(initial: boolean): (r: store.Row) => { read_only?: true } {
+  let ro = initial;
+  return (r) => {
+    if (r.type === "session_started" || r.type === "session_resumed") {
+      ro = typeof r.data === "object" && r.data !== null && (r.data as Record<string, unknown>).read_only === true;
+    }
+    return ro ? { read_only: true } : {};
+  };
+}
 
 const notFound = (reply: FastifyReply) => reply.status(404).send({ ok: false, error: "not_found" });
 const fail = (reply: FastifyReply, status: number, error: string) => reply.status(status).send({ ok: false, error });
@@ -234,6 +255,12 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   const presenceSweepMs = opts.presenceSweepMs ?? PRESENCE_SWEEP_MS;
   if (presenceSweepMs > 0) {
     const stop = startPresenceSweep({ onlineWindowMs, noticeAfterMs: opts.offlineNoticeMs ?? OFFLINE_NOTICE_MS, sweepMs: presenceSweepMs });
+    app.addHook("onClose", async () => stop());
+  }
+  // A conversation open in a terminal that has waited a minute for its person: told once (`remote-agents/terminal-waits.ts`). On the
+  // presence sweep's schedule; a lock makes each sweep one replica's.
+  if (presenceSweepMs > 0) {
+    const stop = startTerminalWaitSweep({ onlineWindowMs, noticeAfterMs: opts.terminalWaitNoticeMs ?? TERMINAL_WAIT_NOTICE_MS, sweepMs: presenceSweepMs });
     app.addHook("onClose", async () => stop());
   }
   await registerPairingRoutes(app, opts.pairing);
@@ -483,6 +510,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!sessionId || !session) return notFound(reply);
     if (!isRemoteCommandType(type)) return fail(reply, 400, "unknown_command_type");
     if (session.status !== "active") return fail(reply, 409, "session_closed");
+    // A conversation open in a terminal, watched: nothing typed here may reach it (a second writer forks its transcript).
+    // Refused before it is queued; the connector refuses it too.
+    if (session.read_only === true && READ_ONLY_REFUSED.has(type)) return fail(reply, 409, "session_read_only");
     const connector = await store.findConnector(owner, session.connector_id, onlineWindowMs);
     if (!connector || connector.revoked_at) return notFound(reply);
     const spec = REMOTE_COMMANDS[type as RemoteCommandType];
@@ -568,15 +598,17 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       if (!resume.ok) return fail(reply, 400, resume.error);
       let cursor = resume.value;
 
+      // History is read from its start or from a cursor: what the session is now is the best guess until a lifecycle event says.
+      const mark = readOnlyTracker(cursor === 0 ? false : session.read_only === true);
       const frameOf = (r: store.Row) =>
-        sseFrame(r.type, { type: r.type, session_id: sessionId, seq: Number(r.seq), ts: r.ts, data: r.data }, String(r.id));
+        sseFrame(r.type, { type: r.type, session_id: sessionId, seq: Number(r.seq), ts: r.ts, ...mark(r), data: r.data }, String(r.id));
 
       if (req.query.mode === "replay") {
         const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 500));
         const rows = await store.eventsAfter(sessionId, cursor, limit);
         return reply.send({
           ok: true,
-          data: rows.map((r) => ({ id: String(r.id), seq: Number(r.seq), type: r.type, ts: r.ts, data: r.data })),
+          data: rows.map((r) => ({ id: String(r.id), seq: Number(r.seq), type: r.type, ts: r.ts, ...mark(r), data: r.data })),
         });
       }
 
