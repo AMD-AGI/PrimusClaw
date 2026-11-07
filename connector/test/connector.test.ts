@@ -932,6 +932,36 @@ describe("crash safety", () => {
       assert.equal(JSON.parse(fs.readFileSync(path.join(h.dirs.state, "sessions.json.turns"), "utf8"))[sid].cmd_seq, seq);
     } finally { fs.rmSync(tmpFile, { recursive: true, force: true }); }
   });
+  test("stopped before its turn record landed, a prompt is sent again after the restart and its dropped record is not also recovered", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const fifo = path.join(h.dirs.state, "sessions.json.turns.tmp");
+    fs.rmSync(fifo, { force: true });
+    assert.equal(spawnSync("mkfifo", ["-m", "600", fifo]).status, 0);
+    const flag = path.join(h.work, "never5");
+    let read: Promise<unknown> | null = null;
+    let seq = 0;
+    try {
+      seq = h.prompt(sid, `wait ${flag}`);
+      await h.claw.until("the prompt to reach the agent", () => h.adapterLog().some((l) => l.prompt === `wait ${flag}`));
+      const stopped = h.stop();
+      await sleep(2_500); // the session sees it is stopping while the record's write is still stuck
+      read = fs.promises.readFile(fifo); // the disk answers: the stuck write lands, then the one without the turn
+      await stopped;
+      await read;
+    } finally { await (read ?? fs.promises.readFile(fifo)); }
+    assert.ok(h.claw.cursor < seq, `the server still holds the prompt (cursor ${h.claw.cursor}, prompt ${seq})`);
+    await h.claw.until("the record without the turn", () => {
+      const turns = path.join(h.dirs.state, "sessions.json.turns");
+      // (The stuck write renames the FIFO into place before the next write replaces it: never read a FIFO here.)
+      try { return fs.lstatSync(turns).isFile() && !(sid in JSON.parse(fs.readFileSync(turns, "utf8"))); } catch { return false; }
+    }, 3_000);
+    h.connect();
+    h.start();
+    await h.claw.until("the prompt sent again", () => h.adapterLog().filter((l) => l.prompt === `wait ${flag}`).length === 2);
+    await sleep(300);
+    assert.equal(h.claw.eventsOf(sid, "turn_end").filter((e) => e.data.error === "connector_restarted").length, 0, "the dropped record is not recovered too");
+  });
   test("a prompt queued behind the running turn when the connector restarts is delivered again, not lost", async () => {
     const h = await make();
     const sid = await h.newSession();

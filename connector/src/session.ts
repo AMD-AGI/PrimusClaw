@@ -878,17 +878,21 @@ export class Session {
 
   /**
    * The turn record is written off the event loop, so the prompt counts as handled (and the heartbeat's cursor passes
-   * it) only once the record has landed: until then a restart is sent the prompt again instead of finding neither the
-   * command nor the turn. A write that failed is tried again every second. Once the turn has ended (its record is gone
-   * or replaced) or the session closed, the record no longer matters; a connector that stops leaves the prompt unhandled.
+   * it) only once the record has landed. Either the next run finds the turn (and ends or carries it on), or it is sent
+   * the prompt again; never neither, and never both:
+   * - the record landed: handled;
+   * - the turn ended (its record gone or replaced) or the session closed: handled, the record no longer matters;
+   * - the connector stops before the record landed: the record is dropped and the prompt left unhandled, so the next
+   *   run is sent it again instead of also finding this turn;
+   * - otherwise (a stalled disk, a failed write) it asks again every second; a failed write is tried again each time.
    */
   private async handledOnceRecorded(started: () => void, startedAt: string): Promise<void> {
-    while (!(await this.env.store.written())) {
-      if (this.stopping) return;
-      if (this.closed || this.env.store.turn(this.id)?.started_at !== startedAt) break;
+    for (;;) {
+      if (await this.env.store.flushed(1_000)) return started();
+      if (this.closed || this.env.store.turn(this.id)?.started_at !== startedAt) return started();
+      if (this.stopping) { this.env.store.endTurn(this.id); return; }
       await sleep(1_000);
     }
-    if (!this.stopping) started();
   }
 
   /**
