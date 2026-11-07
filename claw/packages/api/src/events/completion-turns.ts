@@ -26,8 +26,9 @@ async function readTurnTools(sessionId: string, messageId: string | null) {
   }
   const events = rows.map((row) => row.data);
   const toolCalls = events.filter((event) => event.type === "toolUsed" && event.status === "start");
+  // A call that failed or was refused ("error") answered the model too: its text is the tool_result the turn is rebuilt with.
   const toolResults = events
-    .filter((event) => event.type === "toolUsed" && event.status === "success")
+    .filter((event) => event.type === "toolUsed" && (event.status === "success" || event.status === "error"))
     .map(({ full_output: _fullOutput, ...event }) => event);
   return { toolCalls, toolResults };
 }

@@ -113,6 +113,14 @@ record it.
 ### Fixed
 - A development environment turn cut off because its connector restarted mid-turn is told on the assistant's item as an
   interruption with what to do (send the instruction again, or say "continue"), not as the bare code `connector_restarted`.
+- A request to review or merge pull requests that are already merged, or closed, is answered from a read: the assistant first calls
+  `pr_state`, which only reads where each pull request stands (open; merged with when and its merge commit; closed with when),
+  and answers a merged or closed one itself without calling `review_start` at all; only the open ones are started. A person with no
+  GitHub here is read for as anyone is, so a public pull request's state is still found. `review_start` still refuses a merged one
+  (`already_merged`) and now a closed one too (`already_closed`).
+- A tool call whose tool answered an error (a call the platform refused, such as `review_start` answering `already_merged`, a refused
+  read, a tool that threw) is recorded with `status: "error"` (and `is_error: true`) in the session's events and stream, no longer as
+  `"success"`; the turn rebuilt for the next message still carries what that call answered.
 - A user whose several machines are all offline is told in Chinese to run the restart command on each of them (每台机器), not on
   "that machine". A pairing claimed but not registered yet holds its name: two machines of one hostname claimed one after the
   other, before either registered, no longer both get the same alternate name.

@@ -2116,8 +2116,9 @@ async function getSessionToolEvents(sessionId: string): Promise<any[]> {
 
 function formatToolSequence(events: any[]): string {
   return events
-    .filter((e: any) => e.status === "start" || e.status === "success")
-    .map((e: any) => `${e.status === "start" ? "→" : "✓"} ${e.tool}`)
+    // A call whose tool answered an error ends with "error" (Brain's agent loop): it is part of the sequence, marked failed.
+    .filter((e: any) => e.status === "start" || e.status === "success" || e.status === "error")
+    .map((e: any) => `${e.status === "start" ? "→" : e.status === "error" ? "✗" : "✓"} ${e.tool}`)
     .join("\n")
     .slice(0, 3000);
 }

@@ -291,7 +291,7 @@ test("the list reads of the API's github server are kept whole up to their own b
   for (const [tool, text, whole] of cases) assert.equal(truncateToolResult(text, tool) === text, whole, `${tool} ${text.length}`);
 });
 
-test("a call whose tool answered its own error is recorded with is_error on its result event; one that worked is not", async () => {
+test("a call whose tool answered its own error is recorded as failed (status error, is_error) on its result event; one that worked is not", async () => {
   const session = scriptedSession([
     { content: [toolUse("t1", "mcp__github__issue_search", { query: "repo:o/r is:pr" }), toolUse("t2", "mcp__github__pr_list", { repo: "o/r" })], stopReason: "tool_use" },
     { content: [text("done")], stopReason: "end_turn" },
@@ -308,5 +308,32 @@ test("a call whose tool answered its own error is recorded with is_error on its 
   const tools = ["mcp__github__issue_search", "mcp__github__pr_list"].map((name) => ({ name, description: name, input_schema: { type: "object", properties: {} } })) as unknown as ToolSchema[];
   await agentLoop([{ role: "user", content: "how many" }], tools, opts(router, session, { onEvent: async (e) => { events.push(e as Record<string, unknown>); } }));
   const ended = events.filter((e) => e.type === "toolUsed" && e.status !== "start").map((e) => [e.tool, e.status, e.is_error]);
-  assert.deepEqual(ended, [["mcp__github__issue_search", "success", true], ["mcp__github__pr_list", "success", undefined]]);
+  assert.deepEqual(ended, [["mcp__github__issue_search", "error", true], ["mcp__github__pr_list", "success", undefined]]);
+});
+
+test("a call the platform refused (review_start answering already_merged) is never recorded as a success", async () => {
+  // Parity G3 (2026-11-07): the assistant's review_start refused a merged pull request with isError, and the session recorded the
+  // call as "success", which read as a review started.
+  const refusal = JSON.stringify({ ok: false, error: "already_merged", message: "AMD-AGI/PrimusClaw#306 is already merged on GitHub, so nothing was started or handed over." });
+  const session = scriptedSession([
+    { content: [toolUse("t1", "mcp__assistant__review_start", { prs: ["AMD-AGI/PrimusClaw#306"], merge: true })], stopReason: "tool_use" },
+    { content: [text("merged already")], stopReason: "end_turn" },
+  ]);
+  const router = {
+    route: async (_name: string, _input: unknown, _signal: unknown, outcome?: { isError: boolean }) => {
+      if (outcome) outcome.isError = true;
+      return refusal;
+    },
+    spillToolResult: async () => null,
+    setHands: () => {},
+  } as unknown as ToolRouter;
+  const events: Array<Record<string, unknown>> = [];
+  const tools = [{ name: "mcp__assistant__review_start", description: "review_start", input_schema: { type: "object", properties: {} } }] as unknown as ToolSchema[];
+  await agentLoop([{ role: "user", content: "review and merge #306" }], tools, opts(router, session, { onEvent: async (e) => { events.push(e as Record<string, unknown>); } }));
+  const ended = events.filter((e) => e.type === "toolUsed" && e.tool === "mcp__assistant__review_start" && e.status !== "start");
+  assert.equal(ended.length, 1);
+  assert.equal(ended[0].status, "error", "a refused call is recorded as failed");
+  assert.equal(ended[0].is_error, true);
+  assert.equal(ended[0].description, refusal, "with the refusal the model read");
+  assert.ok(!events.some((e) => e.type === "toolUsed" && e.tool === "mcp__assistant__review_start" && e.status === "success"));
 });

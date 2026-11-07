@@ -32,6 +32,10 @@ export interface ReviewEvalCase {
   repos?: string[];
   /** People whose account does not let anyone act for them: the review service refuses them. */
   noConsent?: string[];
+  /** Where pull requests stand on GitHub, by owner/repo#number; one not listed is open. pr_state and review_start answer from it. */
+  github?: Record<string, { state: "merged"; merged_at: string; merge_commit: string } | { state: "closed"; closed_at: string }>;
+  /** Tools the Router must not call at all in the case, not even a call the tools refuse (a refused write still reads as one asked for). */
+  notCalled?: string[];
   expect: ExpectedCall[];
   also?: ExpectedCall[][];
 }
@@ -54,7 +58,22 @@ const task = (seq: number, title: string): ManifestItem => ({
   itemId: `kwi_eval${seq}`, seq, title, boardState: "in_progress", summary: "", lastReportKind: null, resultVersion: 0, pendingQuestion: null,
 });
 
+/** Parity G3 (2026-11-06, 2026-11-07): the two pull requests were merged an hour before the request. */
+const G3_MERGED = {
+  [`${REPO}#306`]: { state: "merged", merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6" },
+  [`${REPO}#308`]: { state: "merged", merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53" },
+} as const;
+
 export const REVIEW_CASES: ReviewEvalCase[] = [
+  // --- Parity G3: a review and merge asked of pull requests that are already merged (or closed) is answered from pr_state, and no
+  // review_start is called at all: a refused one still read as a review started.
+  { id: "G3-merged", kind: "replay", repos: [REPO], people: PEOPLE, github: G3_MERGED, notCalled: ["review_start"],
+    text: "请 eval-reviewer 帮我 review 并合入下面 2 个 PR：\nhttps://github.com/AMD-AGI/PrimusClaw/pull/306\nhttps://github.com/AMD-AGI/PrimusClaw/pull/308",
+    expect: [] },
+  { id: "G3-closed", kind: "adversarial", repos: [REPO], github: { [`${REPO}#311`]: { state: "closed", closed_at: "2026-11-06T11:00:00Z" } },
+    notCalled: ["review_start"], text: "帮我 review 并合入 https://github.com/AMD-AGI/PrimusClaw/pull/311", expect: [] },
+  { id: "G3-mixed", kind: "adversarial", repos: [REPO], github: { [`${REPO}#306`]: G3_MERGED[`${REPO}#306`] },
+    text: "帮我 review 并合入 #306 和 #312", expect: [{ tool: "review_start", args: { prs: [`${REPO}#312`], merge: true } }] },
   // --- Replay: the messages of B#1-15 that this design routes, with what they met.
   { id: "B1", kind: "replay", text: "> https://github.com/AMD-AGI/PrimusClaw/pull/254\n帮我审一下这个", repos: [REPO],
     expect: [{ tool: "review_start", args: { prs: [`${REPO}#254`], merge: false } }] },

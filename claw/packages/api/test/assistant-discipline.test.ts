@@ -7,7 +7,7 @@
  *   D1  it is on for everyone with the switch, for the named users without it, and for nobody by default
  *   D2  a task that names ~/.ssh, a private key or a credential file is caught however it is put; a task about SSH in general is not
  *   D3  a ready report with no refs is caught; one with refs, and an answer, are not; an answer about delivered files parses
- *   P1  router-discipline-v1 rides on the router prompt only when on: an acknowledgement acts on nothing, a secret read is declined in
+ *   P1  router-discipline-v2 rides on the router prompt only when on: an acknowledgement acts on nothing, a secret read is declined in
  *       chat, any other write is an item
  *   P2  worker-v7 only when on: a task that changed nothing outside (files delivered) is an answer with nothing to accept, and ready
  *       needs refs; off, the worker prompt is worker-v6 as it was
@@ -79,7 +79,7 @@ test("D3 a ready report with no refs is caught; an answer about delivered files 
   assert.equal(readyWithoutRefs(answer.report), null);
 });
 
-test("P1 router-discipline-v1 rides on the router prompt only when on", () => {
+test("P1 router-discipline-v2 rides on the router prompt only when on", () => {
   assert.ok(!renderRouterPrompt().includes(ROUTER_DISCIPLINE_PROMPT));
   assert.equal(renderRouterPrompt(), ROUTER_PROMPT);
   const on = renderRouterPrompt(undefined, { discipline: true });
@@ -96,6 +96,8 @@ test("P1 router-discipline-v1 rides on the router prompt only when on", () => {
   assert.match(ROUTER_DISCIPLINE_PROMPT, /Never start a work item for it/);
   // Every other write is an item whose worker holds it.
   assert.match(ROUTER_DISCIPLINE_PROMPT, /is a work item: work_create it, and its worker holds the write/);
+  // A review or merge of pull requests stays with the review tools, not a work item (router-discipline-v2).
+  assert.match(ROUTER_DISCIPLINE_PROMPT, /a review or merge of pull requests when you have review_start \(that goes as your review instructions say: pr_state first, then review_start for the open ones\)/);
 });
 
 test("P2 worker-v7 only when on: delivered files are an answer, ready needs refs; off, worker-v6 as it was", () => {
