@@ -13,6 +13,8 @@
  *   T4  a new wait after the first ended is a new episode, told again once; still waiting is never told twice
  *   T5  a notice that could not be stored is tried again by the next sweep, and said once
  *   T6  only one replica sweeps at a time
+ *   T7  told only on a report made after the minute that still says it waits: one answered just before the minute, whose last report
+ *       predates the answer, is not told on that report
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -66,7 +68,7 @@ describe("conversations open in a terminal that wait for their person", { skip }
   async function terminal(cid: string, owner: string, entries: Array<Record<string, unknown>>): Promise<void> {
     await w.q(
       `INSERT INTO claw_remote_agents (connector_id, agent_id, owner_user_id, kind, name, capabilities) VALUES ($1, 'claude-sessions', $2, 'claude', 'Claude Code', $3::jsonb)
-       ON CONFLICT (connector_id, agent_id) DO UPDATE SET capabilities = excluded.capabilities`,
+       ON CONFLICT (connector_id, agent_id) DO UPDATE SET capabilities = excluded.capabilities, updated_at = NOW()`,
       [cid, owner, JSON.stringify({ resumable: entries })],
     );
   }
@@ -78,6 +80,10 @@ describe("conversations open in a terminal that wait for their person", { skip }
   const waitedFor = (cid: string, ref: string, ms: number) => w.q(
     "UPDATE claw_remote_terminal_waits SET since = NOW() - make_interval(secs => $3::float8) WHERE connector_id = $1 AND ref = $2", [cid, ref, ms / 1000],
   );
+  /** As if the connector's last report of its terminals was made `ms` ago. */
+  const reportedAgo = (cid: string, ms: number) => w.q(
+    "UPDATE claw_remote_agents SET updated_at = NOW() - make_interval(secs => $2::float8) WHERE connector_id = $1", [cid, ms / 1000],
+  );
   const sweep = () => waits.runTerminalWaitSweep(WINDOW_MS, MINUTE);
   const says = async (userId: string) => (await w.q("SELECT text FROM claw_assistant_says WHERE user_id = $1 ORDER BY created_at", [userId])).map((r) => String(r.text));
 
@@ -87,7 +93,7 @@ describe("conversations open in a terminal that wait for their person", { skip }
     let out = await sweep();
     assert.deepEqual([out.swept, out.waiting, out.notices.length], [true, 1, 0], "seen waiting: not yet a minute");
     assert.deepEqual(await says("alice"), []);
-    await waitedFor(cid, "s-1", MINUTE + 1000);
+    await waitedFor(cid, "s-1", 2 * MINUTE);
     out = await sweep();
     assert.equal(out.notices.length, 1);
     assert.deepEqual(await says("alice"), ["dev-pod 上终端里的 Claude Code 在等你（input needed）：fix the flaky test。已经等了一分多钟，回到那个终端处理。"]);
@@ -193,5 +199,32 @@ describe("conversations open in a terminal that wait for their person", { skip }
     } finally {
       await holder.end();
     }
+  });
+
+  test("T7 told only on a report made after the minute that still says it waits", async () => {
+    const cid = await machine("alice", "dev-pod");
+    await terminal(cid, "alice", [conv("s-1", "waiting")]);
+    await sweep();
+    // A minute and a bit since the sweep first saw it wait, but the last report was made before the minute was up: the person may
+    // have answered since, and the connector has not said so yet.
+    await waitedFor(cid, "s-1", MINUTE + 5_000);
+    await reportedAgo(cid, 10_000);
+    let out = await sweep();
+    assert.deepEqual([out.waiting, out.notices.length], [1, 0]);
+    assert.deepEqual(await says("alice"), []);
+    // It answered: the next report says so, and nothing is ever said.
+    await terminal(cid, "alice", [conv("s-1", "working")]);
+    await sweep();
+    assert.deepEqual(await says("alice"), []);
+    // Another wait; this time a report well after the minute still says it waits: told once.
+    await terminal(cid, "alice", [conv("s-1", "waiting")]);
+    await sweep();
+    await waitedFor(cid, "s-1", MINUTE + 5_000);
+    out = await sweep();
+    assert.equal(out.notices.length, 0, "the report is only 5 s past the minute, inside the connector's lag");
+    await waitedFor(cid, "s-1", MINUTE + waits.TERMINAL_REPORT_LAG_MS + 1_000);
+    out = await sweep();
+    assert.equal(out.notices.length, 1);
+    assert.equal((await says("alice")).length, 1);
   });
 });

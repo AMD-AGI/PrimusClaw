@@ -15,7 +15,8 @@
  *
  * A sweep, every few seconds on whichever replica takes the lock, keeps one row per waiting conversation
  * (`claw_remote_terminal_waits`: since when the sweep first saw it wait, and whether it was told), so the minute is counted from the
- * sweep's own sight, never from a time a connector wrote.
+ * sweep's own sight, never from a time a connector wrote; and it is told only on a report made after the minute (and the connector's
+ * own lag, `TERMINAL_REPORT_LAG_MS`) that still says it waits.
  */
 import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
@@ -27,6 +28,13 @@ const logger = pino({ name: "remote-agents-terminal-waits" });
 export const TERMINAL_WAIT_NOTICE_MS = 60 * 1000;
 /** How often a replica tries to sweep. One sweep at a time across replicas (an advisory lock). */
 export const TERMINAL_WAIT_SWEEP_MS = 15 * 1000;
+
+/**
+ * How stale a connector's report of a terminal may be: it looks at its terminals every 10 s and says what changed with its next
+ * heartbeat. A wait is told only once a report made this long after the minute was up still says it waits, so someone who answered
+ * just before the minute is never told on an older report.
+ */
+export const TERMINAL_REPORT_LAG_MS = 15 * 1000;
 
 /** Same namespace as the presence sweep's lock, a scope of its own. */
 const LOCK_NS = 7_001;
@@ -89,7 +97,7 @@ export async function sweepTerminalWaits(onlineWindowMs: number, noticeAfterMs: 
     const now = (await q(
       `SELECT c.connector_id::text AS connector_id, c.owner_user_id, c.name AS machine, a.agent_id, a.name AS agent,
               r.value->>'ref' AS ref, COALESCE(r.value->>'title', '') AS title, COALESCE(r.value->>'cwd', '') AS cwd,
-              COALESCE(r.value->>'waiting_for', '') AS waiting_for
+              COALESCE(r.value->>'waiting_for', '') AS waiting_for, a.updated_at AS reported_at
          FROM claw_remote_connectors c
          JOIN claw_remote_agents a ON a.connector_id = c.connector_id
          CROSS JOIN LATERAL jsonb_array_elements(
@@ -101,6 +109,8 @@ export async function sweepTerminalWaits(onlineWindowMs: number, noticeAfterMs: 
           AND jsonb_typeof(r.value->'ref') = 'string' AND r.value->>'ref' ~ $2`,
       [onlineWindowMs / 1000, REF_RE],
     )).rows as Array<Record<string, string>>;
+    const keyOf = (c: string, a: string, r: string) => `${c}\u0000${a}\u0000${r}`;
+    const byKey = new Map(now.map((r) => [keyOf(r.connector_id, r.agent_id, r.ref), r]));
     const keys = { c: now.map((r) => r.connector_id), a: now.map((r) => r.agent_id), r: now.map((r) => r.ref) };
     // The episodes that are over: no longer waiting, or their machine is not online now.
     await q(
@@ -115,15 +125,27 @@ export async function sweepTerminalWaits(onlineWindowMs: number, noticeAfterMs: 
        ON CONFLICT (connector_id, agent_id, ref) DO NOTHING`,
       [keys.c, keys.a, keys.r, now.map((r) => r.owner_user_id)],
     );
-    const due = (await q(
-      `UPDATE claw_remote_terminal_waits SET told_at = NOW()
-        WHERE told_at IS NULL AND since <= NOW() - make_interval(secs => $1::float8)
-        RETURNING connector_id::text AS connector_id, agent_id, ref, since`,
+    // Waited the minute, and the report that says so was made after it (and the connector's lag): someone who answered in time is not
+    // told on a report that predates their answer.
+    const candidates = (await q(
+      `SELECT connector_id::text AS connector_id, agent_id, ref, since FROM claw_remote_terminal_waits
+        WHERE told_at IS NULL AND since <= NOW() - make_interval(secs => $1::float8)`,
       [noticeAfterMs / 1000],
     )).rows as Array<{ connector_id: string; agent_id: string; ref: string; since: Date }>;
+    const confirmed = candidates.filter((d) => {
+      const r = byKey.get(keyOf(d.connector_id, d.agent_id, d.ref));
+      return !!r && new Date(r.reported_at).getTime() >= new Date(d.since).getTime() + noticeAfterMs + TERMINAL_REPORT_LAG_MS;
+    });
+    const due = confirmed.length ? (await q(
+      `UPDATE claw_remote_terminal_waits w SET told_at = NOW()
+         FROM unnest($1::uuid[], $2::text[], $3::text[]) k(c, a, r)
+        WHERE w.connector_id = k.c AND w.agent_id = k.a AND w.ref = k.r AND w.told_at IS NULL
+        RETURNING w.connector_id::text AS connector_id, w.agent_id, w.ref, w.since`,
+      [confirmed.map((d) => d.connector_id), confirmed.map((d) => d.agent_id), confirmed.map((d) => d.ref)],
+    )).rows as Array<{ connector_id: string; agent_id: string; ref: string; since: Date }> : [];
     const notices: TerminalWaitNotice[] = [];
     for (const d of due) {
-      const r = now.find((x) => x.connector_id === d.connector_id && x.agent_id === d.agent_id && x.ref === d.ref);
+      const r = byKey.get(keyOf(d.connector_id, d.agent_id, d.ref));
       if (!r) continue;
       notices.push({
         owner: r.owner_user_id, connectorId: r.connector_id, agentId: r.agent_id, ref: r.ref, machine: r.machine, agent: r.agent,
