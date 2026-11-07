@@ -81,9 +81,11 @@ export class SessionManager {
       this.env.audit.record("command_failed", { type: cmd.type, session_id: sid, cmd_id: cmd.cmd_id, error: errMessage(e).slice(0, 300) });
       once();
     });
+    // Run ahead, but what the session receives after it still waits for it (and for what was already in the chain).
+    const tail = now ? Promise.all([this.chains.get(sid), next]).then(() => undefined) : next;
+    this.chains.set(sid, tail);
+    void tail.finally(() => { if (this.chains.get(sid) === tail) this.chains.delete(sid); });
     if (now) return next;
-    this.chains.set(sid, next);
-    void next.finally(() => { if (this.chains.get(sid) === next) this.chains.delete(sid); });
     return next;
   }
 

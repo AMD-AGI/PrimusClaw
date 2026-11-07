@@ -401,7 +401,9 @@ the person may have closed the session or removed the machine, and been told tha
   a `cancel` those of prompts; each is dropped and said as below, `status` `session_closed` or `cancelled`), is carried out straight away, and
   what came before it in the session that has not acted yet is dropped the same way when its turn comes. A
   Claw with no confirm route (a 404 from its router, not its own `not_found`) cannot say, and the command runs as it did before
-  the route existed (audited `command_unconfirmable`), so the API and the connector can ship in either order.
+  the route existed (audited `command_unconfirmable`); a Claw whose command frames carry no `sent_at` predates the route too, and
+  is not asked at all (a device sign-in's access token would only be refused on a route it does not know). So the API and the
+  connector can ship in either order.
 - Anything but `live` is dropped: audited on the machine (`command_dropped`, `reason: "not_live"`), and said in the session, as
   `command_rejected {type, cmd_id, cmd_seq, reason: "command_not_live", status}` (a `session.new`: `session_closed` with that
   reason). No answer within the retry budget counts as `unconfirmed`, and is dropped and said the same way. `401 revoked` stops

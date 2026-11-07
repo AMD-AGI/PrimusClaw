@@ -76,6 +76,8 @@ export class FakeClaw {
    * long: they are made (and stamped) at once, and written this much later.
    */
   streamDelayMs = 0;
+  /** Whether command frames carry `sent_at`; false is a Claw from before it (and before the confirm route). */
+  sentAt = true;
   /** Every frame after the `ready` of the next command stream reaches the connector this much later (a buffering link). */
   streamLagMs = 0;
   /** Answer the next N confirmations with 503 (Claw, or the network to it, not there yet). */
@@ -296,7 +298,7 @@ export class FakeClaw {
         res.on("close", () => { this.streams.delete(res); this.wake(); });
         let sent = 0;
         // `sent_at` stamped as the frame is written, as the real server does: how long the frame then takes is the connector's to see.
-        const frame = (c: { seq: number; payload: Record<string, unknown> }) => `id: ${c.seq}\nevent: command\ndata: ${JSON.stringify({ sent_at: Date.now(), ...c.payload })}\n\n`;
+        const frame = (c: { seq: number; payload: Record<string, unknown> }) => `id: ${c.seq}\nevent: command\ndata: ${JSON.stringify(this.sentAt ? { sent_at: Date.now(), ...c.payload } : c.payload)}\n\n`;
         const pump = () => {
           if (res.destroyed || res.writableEnded) return;
           for (const c of this.commands) {

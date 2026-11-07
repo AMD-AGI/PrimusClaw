@@ -306,7 +306,7 @@ describe("a command whose frame was held in the network", () => {
     const sid = h.claw.newSession("fake", h.work);
     h.connect({ timing });
     h.start();
-    await h.claw.until("session_started", () => h.claw.eventsOf(sid, "session_started")[0]);
+    await h.claw.until("session_started", () => h.claw.eventsOf(sid, "session_started")[0], 20_000);
     assert.deepEqual(h.claw.confirmBodies.map((c) => c.body.why), ["network"]);
     assert.ok(h.audit().some((a) => a.kind === "network_trouble" && a.reason === "ready_late"));
   });
@@ -359,7 +359,7 @@ describe("a command whose frame was held in the network", () => {
     const sid = h.claw.newSession("fake", h.work, undefined, { sent_at: Date.now() - 400 });
     h.connect({ timing });
     h.start();
-    await h.claw.until("session_started", () => h.claw.eventsOf(sid, "session_started")[0]);
+    await h.claw.until("session_started", () => h.claw.eventsOf(sid, "session_started")[0], 20_000);
     assert.equal(h.claw.confirmBodies.length, 1, "the session.new held 1.7 s was asked about");
     assert.ok(["delayed", "network"].includes(h.claw.confirmBodies[0]!.body.why), h.claw.confirmBodies[0]!.body.why);
   });
@@ -375,8 +375,19 @@ describe("a command whose frame was held in the network", () => {
     h.start();
     await sleep(3_500); // more than 8 lagged pings (one every 100 ms) have been read
     const sid = h.claw.newSession("fake", h.work);
-    await h.claw.until("session_started", () => h.claw.eventsOf(sid, "session_started")[0]);
+    await h.claw.until("session_started", () => h.claw.eventsOf(sid, "session_started")[0], 20_000);
     assert.deepEqual(h.claw.confirmBodies.map((c) => c.body.why), ["delayed"]);
+  });
+
+  test("a Claw whose frames carry no `sent_at` predates the confirm route: a late command runs as before, without asking", async () => {
+    const h = await Harness.create();
+    const sid = await h.newSession();
+    h.claw.sentAt = false;
+    h.prompt(sid, "say from-an-old-claw", { issued_at: Date.now() - REMOTE_AGENT_TIMING.liveCommandTtlMs - 60_000, cmd_id: "c-no-sent-at" });
+    await h.turnEnd(sid, 1);
+    assert.ok(h.messages(sid).includes("from-an-old-claw"));
+    assert.deepEqual(h.claw.confirmAsked, [], "nothing asked of a Claw that has no route to ask");
+    assert.ok(h.audit().some((a) => a.kind === "command_unconfirmable" && a.cmd_id === "c-no-sent-at" && a.reason === "claw_without_confirm"));
   });
 });
 

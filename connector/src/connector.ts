@@ -1026,6 +1026,13 @@ export class Connector {
    * With no answer because this run is stopping (not revoked), `keep`: not run and not handled, so the next run gets it again.
    */
   private async confirmLive(cmd: Command, why: Lateness, receivedOld: boolean): Promise<Verdict> {
+    // A frame with no `sent_at` comes from a Claw from before the confirm route (both came in one change): nothing there can be
+    // asked, and asking would only be refused (a device sign-in's access token is not accepted on a route it does not know), so the
+    // command runs as it did before the route existed. The API and the connector can then ship in either order.
+    if (typeof cmd.sent_at !== "number") {
+      this.d.audit.record("command_unconfirmable", { type: cmd.type, cmd_id: cmd.cmd_id, cmd_seq: Number.isSafeInteger(cmd.cmd_seq) ? cmd.cmd_seq : undefined, why, reason: "claw_without_confirm" });
+      return "run";
+    }
     // Written down before asking, and waited for (a bounded time): a run that stops before the answer leaves the next one a note
     // to ask again when Claw delivers the command to it, instead of taking it as fresh.
     if (!this.confirmFirst.has(cmd.cmd_id)) {

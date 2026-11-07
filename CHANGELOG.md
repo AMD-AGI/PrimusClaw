@@ -124,7 +124,8 @@ record it.
   means only "reached the connector past the live TTL" (the connector says `received_late`): a prompt received in time and queued
   behind a turn longer than 5 minutes runs after a stall instead of being dropped. With no answer the connector asks again for up
   to 10 minutes, the command waiting in its session, before it reports it `unconfirmed`; a Claw without the confirm route (404
-  from its router) leaves the command to run as before, so the API and the connector ship in either order. A `set_mode`,
+  from its router, or command frames without `sent_at`, in which case nothing is asked) leaves the command to run as before, so
+  the API and the connector ship in either order. A `set_mode`,
   `resume` or `decision` queued before a `cancel` is no longer refused as `cancelled`, and a confirmation for an id Claw does not
   hold writes no audit row. A `ready` that took more than 3 s also opens that window, and its clock reading is kept as an upper bound
   for the life of the stream, so neither a held `ready` nor a link that keeps lagging makes a held frame look prompt. A `cancel`
