@@ -1318,6 +1318,14 @@ export const CALLBACK_MAX_DELAY_MS = envInt("CALLBACK_MAX_DELAY_MS", 30000);
 // Periodically `exec` a no-op inside each active Hands sandbox to refresh
 // lastActivity so SaFE doesn't GC the pod mid-LLM-call. Set <=0 to disable.
 export const SANDBOX_KEEPALIVE_INTERVAL_SEC = envInt("SANDBOX_KEEPALIVE_INTERVAL_SEC", 60);
+// How long a new sandbox waits for the fleet count to become readable again
+// before admission refuses it. A sweep that could not read the fleet whole
+// marks the roster stale until the next one reads it clean, which is at most
+// one keepalive interval away; refusing at once turned that interval into a
+// failed task. Default: one interval plus 15s. 0 refuses at once.
+export const SANDBOX_ADMISSION_STALE_WAIT_MS = envInt(
+  "SANDBOX_ADMISSION_STALE_WAIT_MS", (Math.max(0, SANDBOX_KEEPALIVE_INTERVAL_SEC) + 15) * 1000, { min: 0 },
+);
 // Consecutive ping failures after which a sandbox is auto-evicted (destroy the
 // sandbox; the in-flight task is NOT aborted -- that would cancel DAG siblings
 // sharing the session, so a task parked in an MCP call to this sandbox unblocks

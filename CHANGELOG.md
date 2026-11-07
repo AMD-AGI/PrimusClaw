@@ -72,6 +72,13 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A sandbox torn down by one brain replica while another was walking the handle records no longer stops every replica
+  from starting sandboxes. The walk read the deleted record's DEL marker as an unreadable record, marked the fleet count
+  incomplete, and admission refused new sandboxes ("the fleet count it would be checked against is incomplete") until a later
+  sweep read clean, failing the user's task; replicas that start together sweep in phase, so after a rollout this happened
+  often. A deleted record is now an absent one. And a fleet count that is briefly unreadable is waited out
+  (`SANDBOX_ADMISSION_STALE_WAIT_MS`, default one keepalive interval plus 15s) before a new sandbox is refused; a refusal after
+  the wait, and a fleet genuinely at its ceiling, say in plain words what happened and that a retry later will work.
 - A user with no development environment session can connect from the assistant: `devenv_list` gives each agent on an online machine
   its own `attach_command` (`/agent attach MACHINE/AGENT`, which attaches its open session or starts one in its first folder), the
   attach button accepts it, and with no session anywhere and one such agent `attach_default` is that agent (`new_session: true`).
