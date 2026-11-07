@@ -474,13 +474,16 @@ describe("devenv_list", { skip }, () => {
     process.env.IDENTITY_ISSUER_URL = "https://id.example.com";
     try {
       const alice = await w.user("alice");
-      const unpaired = (body: Recorded, why: string) => {
+      // No pairing here, and devenv_pair is refused the same way: the note never sends the model to it (codex r3 on #457).
+      const unpaired = (body: Recorded, why: string, code: RegExp) => {
         assert.equal(body.connect_a_machine.pairing, undefined, why);
         assert.equal(body.connect_a_machine.commands.length, 4, why);
-        assert.match(body.note, /call devenv_pair and give them its one command/, why);
+        assert.match(body.note, /no pairing command can be made for them in this turn \(([a-z_]+)\)[^]*connect_a_machine\.text as it is[^]*Do not call devenv_pair: it is refused here too/, why);
+        assert.match(body.note, code, why);
+        assert.doesNotMatch(body.note, /to connect one, call devenv_pair/, why);
       };
       // A report answers no message of the user's.
-      unpaired((await call(await w.routerTurn(alice))).body, "report");
+      unpaired((await call(await w.routerTurn(alice))).body, "report", /\(not_from_user\)/);
       // A message that came with a key, one too old to act on: nobody is attending, and devenv_pair refuses there too.
       const pairTool = async (claims: Claims) => {
         const client = await connect(claims);
@@ -491,17 +494,17 @@ describe("devenv_list", { skip }, () => {
       };
       const key = await userTurn(alice, "连接我的开发环境");
       await w.q("UPDATE claw_assistant_messages SET attended_via = NULL WHERE message_id = $1", [key.mid]);
-      unpaired((await call(key)).body, "key");
+      unpaired((await call(key)).body, "key", /\(not_attended\)/);
       const keyPair = await pairTool(key);
       assert.ok(keyPair.isError && /not_attended/.test(keyPair.text), keyPair.text);
       const stale = await userTurn(alice, "连接我的开发环境");
       await w.q("UPDATE claw_assistant_messages SET received_at = NOW() - interval '2 hours' WHERE message_id = $1", [stale.mid]);
-      unpaired((await call(stale)).body, "stale");
+      unpaired((await call(stale)).body, "stale", /\(attendance_expired\)/);
       const stalePair = await pairTool(stale);
       assert.ok(stalePair.isError && /attendance_expired/.test(stalePair.text), stalePair.text);
       assert.equal(Number((await w.q("SELECT COUNT(*) AS n FROM claw_remote_pairings WHERE owner_user_id = 'alice'"))[0].n), 0);
       delete process.env.CLAW_PUBLIC_URL;
-      unpaired((await call(await userTurn(alice, "连到我的开发机"))).body, "no public address");
+      unpaired((await call(await userTurn(alice, "连到我的开发机"))).body, "no public address", /\(pairing_unavailable\)/);
       process.env.CLAW_PUBLIC_URL = "https://claw.example.com/claw-api";
       assert.equal(Number((await w.q("SELECT COUNT(*) AS n FROM claw_remote_pairings WHERE owner_user_id = 'alice'"))[0].n), 0);
       // Too many codes this minute: the setup commands, not a failed list.
@@ -518,8 +521,7 @@ describe("devenv_list", { skip }, () => {
       ]);
       assert.match(zh.connect_a_machine.text, /^在要使用的机器上/);
       for (const c of zh.connect_a_machine.commands) assert.ok(zh.connect_a_machine.text.includes(c), c);
-      assert.match(zh.note, /connect_a_machine\.text as it is/);
-      assert.match(zh.note, /call devenv_pair/);
+      unpaired(zh, "the limit", /\(rate_limited\)[^]*ask again in a minute for a one-line pairing command/);
       const en = (await call(await userTurn(alice, "connect me to my dev box"))).body;
       assert.match(en.connect_a_machine.text, /^On the machine you want to use/);
 
@@ -538,6 +540,32 @@ describe("devenv_list", { skip }, () => {
       assert.match(section, /connector_outdated/);
       assert.doesNotMatch(section, /running claw-connector on a machine connects it/, "no hint the model has to turn into commands itself");
     } finally {
+      for (const [k, v] of [["CLAW_PUBLIC_URL", keep.pub], ["IDENTITY_ISSUER_URL", keep.iss]] as const) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+  });
+
+  test("D8d no machine and the pairing check itself fails: the list is still answered, with the setup commands", async () => {
+    const keep = { pub: process.env.CLAW_PUBLIC_URL, iss: process.env.IDENTITY_ISSUER_URL };
+    process.env.CLAW_PUBLIC_URL = "https://claw.example.com/claw-api";
+    process.env.IDENTITY_ISSUER_URL = "https://id.example.com";
+    const tools = await import("../src/assistant/devenv-tools.js");
+    const real = tools.devenvToolPorts.pairingTurn;
+    tools.devenvToolPorts.pairingTurn = async () => { throw new Error("connection terminated unexpectedly"); };
+    try {
+      const alice = await w.user("alice");
+      const r = await call(await userTurn(alice, "连接我的开发环境"));
+      assert.equal(r.isError, false, JSON.stringify(r.body));
+      assert.equal(r.body.ok, true);
+      assert.equal(r.body.total, 0);
+      assert.equal(r.body.connect_a_machine.pairing, undefined);
+      assert.equal(r.body.connect_a_machine.commands.length, 4);
+      // Not known to be refused: devenv_pair may still answer, so the note may name it.
+      assert.match(r.body.note, /call devenv_pair and give them its one command/);
+      assert.equal(Number((await w.q("SELECT COUNT(*) AS n FROM claw_remote_pairings WHERE owner_user_id = 'alice'"))[0].n), 0);
+    } finally {
+      tools.devenvToolPorts.pairingTurn = real;
       for (const [k, v] of [["CLAW_PUBLIC_URL", keep.pub], ["IDENTITY_ISSUER_URL", keep.iss]] as const) {
         if (v === undefined) delete process.env[k]; else process.env[k] = v;
       }

@@ -59,6 +59,11 @@ export const DEVENV_LIST = {
     + "attach_command.",
 };
 
+/** The one-line pairing command the tools make for a user with no machine (`devenv-tools.ts`, `pairing.ts`). */
+export const PAIR_COMMAND = "npm install -g @primusclaw/connector@latest && claw-connector pair K7QM-4XRT-9WCD --server https://claw.example.com/claw-api";
+/** What the old answer for a user with no machine was: the setup steps, with a login. None of it may reach the user now. */
+export const SETUP_STEP = /claw-connector (init|login)|service install|--identity-url/;
+
 /** The work item list: one development environment item in progress (what codex on the dev pod is working on), one ordinary item. */
 export const ITEM_DEVENV = "kwi_01K9X4Q7M2W8N5R3T6V1000011";
 export const ITEM_OTHER = "kwi_01K9X4Q7M2W8N5R3T6V1000004";
@@ -101,6 +106,12 @@ export interface DevenvCase {
   also?: Want[][];
   /** None of these may be accepted. */
   forbid: string[];
+  /** "none": the user has no machine connected (devenv_list lists none; devenv_send is refused no_machine with a pairing). */
+  world?: "none";
+  /** What the user must be told, each found in what was said. */
+  says?: RegExp[];
+  /** What the user must never be told. */
+  never?: RegExp[];
   why?: string;
 }
 
@@ -153,4 +164,19 @@ export const CASES: readonly DevenvCase[] = [
   // 6. What is there (a read, nothing else).
   { id: "list-zh", lang: "zh", text: "我开发机上现在有哪些会话", want: [{ tool: "devenv_list" }], forbid: except() },
   { id: "list-en", lang: "en", text: "what sessions do I have on my dev box?", want: [{ tool: "devenv_list" }], forbid: except() },
+  // 7. No machine at all: an instruction for one, or connecting one, is answered with the one-line pairing command the tool made,
+  //    as it is, and never the old setup steps (init, login, service install); no second code is asked for.
+  ...(["zh", "en"] as const).flatMap((lang): DevenvCase[] => {
+    const zh = lang === "zh";
+    const pairing = { world: "none" as const, says: [new RegExp(PAIR_COMMAND.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))], never: [SETUP_STEP] };
+    return [
+      { id: `none-send-${lang}`, lang, text: zh ? "让开发机上的 claude 跑一下 ls" : "Have the claude on my dev box run ls", ...pairing,
+        want: [{ tool: "devenv_send", okRefusals: ["no_machine"] }], also: [[{ tool: "devenv_list" }]],
+        forbid: [...except(), "devenv_pair"], why: "no_machine carries the pairing command: nothing else is called" },
+      { id: `none-send-make-${lang}`, lang, text: zh ? "让开发机上的 claude 跑 make test" : "ask claude on my machine to run make test", ...pairing,
+        want: [{ tool: "devenv_send", okRefusals: ["no_machine"] }], also: [[{ tool: "devenv_list" }]], forbid: [...except(), "devenv_pair"] },
+      { id: `none-connect-${lang}`, lang, text: zh ? "连接我的开发环境" : "connect me to my dev environment", ...pairing,
+        want: [{ tool: "devenv_list" }], forbid: [...except(), "devenv_pair"], why: "devenv_list makes the pairing itself (#457)" },
+    ];
+  }),
 ];
