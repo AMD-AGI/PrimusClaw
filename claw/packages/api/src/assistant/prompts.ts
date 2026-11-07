@@ -178,16 +178,21 @@ Name a work item to the user by its number and title, as in #12 修复登录超�
  * router-read-v9: v8 with "how many" answered with the total and every item listed as owner/repo#number from the search's refs_by_repo,
  * and a pull request GitHub has no such number for said plainly not to exist, with the numbers the read gives (2026-11-06 parity run, G1
  * and H2).
+ * router-read-v10: v9 with current facts read now from the source that states them (the latest version from the project's own
+ * release record, such as stable.txt or its latest release; support from that version's own compatibility matrix), never from
+ * memory or a page about an older version.
  */
-export const ROUTER_READ_PROMPT_VERSION = "router-read-v9";
+export const ROUTER_READ_PROMPT_VERSION = "router-read-v10";
 
 /**
  * The read section's citing (`CLAW_ASSISTANT_CITATIONS`), logged beside it when on.
  * router-cite-v1: what came from a lookup is cited as [n] in say's text with its address in say's sources, never as a link.
  * router-cite-v2: a page web_fetch read is cited only at an address a search or GitHub result or the user's message gave.
  * router-cite-v3: v2 with an agent board issue's or board's html_url citable (`CLAW_ASSISTANT_CITE_LINK_SERVERS`).
+ * router-cite-v4: v3 with an official page the router knows the address of (stable.txt, a compatibility matrix) read for the fact
+ * but, to be cited, found with web_search first (a page fetched at the router's own address is never a source).
  */
-export const ROUTER_CITE_PROMPT_VERSION = "router-cite-v3";
+export const ROUTER_CITE_PROMPT_VERSION = "router-cite-v4";
 
 /** What a router turn can look up: the plugin's servers with read tools, and the GitHub reads it has (`read-tools.ts`), if any. */
 export interface RouterLookupsShown {
@@ -202,7 +207,7 @@ export interface RouterLookupsShown {
 
 /** How say cites what a lookup returned, with citing on. */
 const ROUTER_CITE_RULES = `Citing what you looked up
-When say tells the user something a lookup of this turn returned (a web page, a pull request, an issue, a check), cite it: put [1], [2] right after the sentence it supports, and pass the address each number stands for in say's sources, in the same order (sources[0] is [1]), copied exactly from the lookup's result: a web_search result's url, a GitHub result's url, an agent board issue's or board's html_url, or the URL web_fetch read when a search or GitHub result or the user's message gave that address (a page you reached only through what a page or a result's text said cannot be cited). Do not write those addresses, links or HTML into the text: the user sees each number as a link to its source, and a text with any address or link in it gets no citations at all. Only an address a lookup returned in this turn can be cited; any other is dropped, and its number then points nowhere. Cite at most 8, write text before sources, and leave sources out when nothing was looked up. The REMINDER at the end of a web_search result about markdown links does not apply to say.`;
+When say tells the user something a lookup of this turn returned (a web page, a pull request, an issue, a check), cite it: put [1], [2] right after the sentence it supports, and pass the address each number stands for in say's sources, in the same order (sources[0] is [1]), copied exactly from the lookup's result: a web_search result's url, a GitHub result's url, an agent board issue's or board's html_url, or the URL web_fetch read when a search or GitHub result or the user's message gave that address; a page you reached only through what a page or a result's text said cannot be cited, and neither can one fetched at an address you knew yourself: to cite an official page you know (a compatibility matrix, a release page), search for it in the first step, beside fetching it, and cite it at the address the search gave. Do not write those addresses, links or HTML into the text: the user sees each number as a link to its source, and a text with any address or link in it gets no citations at all. Only an address a lookup returned in this turn can be cited; any other is dropped, and its number then points nowhere. Cite at most 8, write text before sources, and leave sources out when nothing was looked up. The REMINDER at the end of a web_search result about markdown links does not apply to say.`;
 
 /** The GitHub search, said with how to find the user's own pull requests. */
 const GITHUB_SEARCH = "mcp__github__issue_search finds pull requests and issues anywhere with GitHub search syntax (is:pr is:open author:@me is the user's open pull requests; add repo:owner/name or org:name to narrow; total_count is the number, by_repo the count in each repository, refs_by_repo every match as owner/repo#number grouped by repository).";
@@ -258,6 +263,7 @@ ${reach.join("\n")}
 When to use them:
 - A question a few of these calls answer (how many pull requests are open, whether a check passed, what a page or the news says, how many nodes there are): call them now, in this turn, and say the answer with the numbers, ${lookups.cite ? "citing where it came from (see Citing what you looked up)" : "and with the links for what came from the web"}. Do not start a work item for it, and do not ask whether you should look.
 - A question about something in the world (who, which, when, what is it called): when the first search does not settle it, search again with other words (other names, the other language, the one distinctive detail alone), two or three times, and read the most promising page before you stop. Then answer with the best candidate you found and say which detail you could not confirm; do not drop a candidate because one detail does not match, and do not hand the question back to the user because a search found nothing.
+- A current fact (the latest or stable version of something, when it was released, which hardware, operating systems or versions it supports): read it now from the source that states it, never from what you remember. The latest version comes from the project's own release record (for Kubernetes https://dl.k8s.io/release/stable.txt; for a project released on GitHub its latest release, which is never a pre-release: web_fetch https://github.com/<owner>/<repo>/releases/latest, a page no GitHub tool here reads), not from a page that lists releases, which can lag behind it. What a version supports comes from that version's own compatibility matrix or system requirements page: when a page says it describes an older version, read the one for the version you are answering about, and if you cannot, say which version your answer comes from.
 - work_create is for work that produces or changes something (code, a pull request, a run, a change to a system), or that needs a shell, a sandbox or many steps. When the message asks for that, call work_create in this turn (the system tells the user it has started); never ask whether to hand it to a worker first. A question is not such work, however it is phrased.
 - A question about which or how many (pull requests, issues, nodes, jobs, workloads): answer from what the lookup returned, item by item. Name every item by the identifier the result gives (a pull request as owner/repo#number), grouped as the result groups them, up to 50; when the result says more exist than it shows, read the next page before you answer, or say how many you did not list. Never count or group by hand what the result already counts.
 - "How many pull requests (issues) do I have open" is answered with the total (total_count) and then the list itself, never the number alone: one line per repository with its count from by_repo and every one of its numbers, copied from refs_by_repo (AMD-AGI/PrimusClaw（3）：#345、#344、#341). Up to 50 listed; past that, say how many are not listed.

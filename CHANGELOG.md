@@ -68,6 +68,16 @@ record it.
   `review_threads_list`) gets 404 while the repository itself is readable, it answers `no_such_pull_request` with the repository's newest
   pull request numbers, or that the number is an issue (H2: "可能不存在，也可能没有权限", with a number made up). A repository the token
   cannot see keeps GitHub's plain 404.
+- An assistant router turn that looks something up answers through `say` again, with its sources. Beside `web_search` and
+  `web_fetch`, which have plain names, the model now and then called `say` by its short name instead of `mcp__assistant__say`; the
+  call was outside the run's tool allowlist and refused, so the answer went out as the turn's plain text, without sources, saying its
+  message tool was not available (2026-11-07 parity runs R1/R2, 3 of 3 lookup turns). Brain's agent loop now reads a call by an
+  offered MCP tool's short name as that tool (`tools/offered-name.ts`: only when exactly one offered `mcp__<server>__<name>` matches
+  and the name itself is not offered), renamed before the allowlist, hooks, approval, the router and the replayed history see it.
+- Router prompts `router-cite-v4` (a page fetched at an address the router knew is never a source, so an official page it wants
+  to cite is found with `web_search` in the first step, beside the fetch) and `router-read-v10`: a current fact (the latest version, what a version supports) is
+  read now from the source that states it, the latest version from the project's release record (stable.txt, the GitHub latest
+  release) rather than a releases page that lags it, and support from that version's own compatibility matrix.
 - How far an item got is answered from what its job wrote at the question, not from the worker's last look at it: a worker checks a
   long job only every minute or two, so its last tool output was up to two steps behind the log (2026-11-06 parity run, L1: "step 3/16"
   while the log said step 5). While the item's run is going, `work_recall(item, "live")` also returns `files_now`: the tails of the
