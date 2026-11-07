@@ -21,6 +21,9 @@ import path from "node:path";
 export const STATE_WRITE_WAIT_MS = 10_000;
 /** A write that took longer than this is reported when it finishes. */
 export const SLOW_WRITE_MS = 5_000;
+/** A failed snapshot write is tried again after this, doubling up to {@link RETRY_MAX_MS}, until it lands. */
+export const RETRY_MIN_MS = 1_000;
+export const RETRY_MAX_MS = 30_000;
 
 /** Told of a write that failed, or finished slowly (`ms` past {@link SLOW_WRITE_MS}). */
 export type WriteReport = (what: string, info: { ms: number; error?: string }) => void;
@@ -86,6 +89,10 @@ export async function writeWhole(file: string, data: string, mode = 0o600, durab
 /**
  * A small file that is rewritten whole (connector.json): `save` returns at once, the newest content is written in the
  * background, one write at a time. Content saved while a write is under way replaces whatever else was waiting.
+ *
+ * A write that fails (a quota used up, a disk full or gone) is tried again on its own, after {@link RETRY_MIN_MS} and then
+ * up to every {@link RETRY_MAX_MS}, until it lands or newer content replaces it: children.json, which `stop` reads to find
+ * the agents to end, must not stay stale until something else happens to change (2026-11-07, EDQUOT on an NFS share).
  */
 export class SnapshotFile {
   private latest = "";
@@ -94,6 +101,8 @@ export class SnapshotFile {
   private written = 0;
   private failed = 0;
   private running: Promise<void> | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retries = 0;
   private readonly waiters: Array<{ upTo: number; resolve: (ok: boolean) => void }> = [];
 
   /** `durable`: each write is flushed to the disk before it replaces the file ({@link writeWhole}). */
@@ -136,6 +145,26 @@ export class SnapshotFile {
     this.running = null;
     // Saved again while the last write was failing: try once more for the newer content.
     if (this.written < this.saved && this.failed < this.saved) this.running = this.drain();
+    else if (this.written < this.saved) this.retryLater();
+    else this.retries = 0;
+  }
+
+  /** After a failed write with nothing newer to write: the same content again, later. */
+  private retryLater(): void {
+    if (this.retryTimer !== null) return;
+    const ms = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** Math.min(this.retries, 10));
+    this.retries += 1;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (this.running !== null || this.written >= this.saved) return;
+      // A directory that is gone (removed on purpose: a reinstall, a test's cleanup) is not made again by a retry; the
+      // next save writes it as before.
+      this.running = fsp.access(path.dirname(this.file)).then(() => {
+        this.failed = this.written;
+        return this.drain();
+      }, () => { this.running = null; });
+    }, ms);
+    this.retryTimer.unref?.();
   }
 }
 

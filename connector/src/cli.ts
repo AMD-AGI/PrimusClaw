@@ -8,10 +8,18 @@ import { resolveDirs } from "./paths.js";
 import type { Connector } from "./connector.js";
 import { probeAgents } from "./probe.js";
 import { inheritSystemCa, trustSystemCAs } from "./system-ca.js";
+import { lineSink } from "./logsink.js";
+import { setLogLine } from "./util.js";
 
 // Before any connection: trust the CAs this machine trusts as well as Node's own list (system-ca.ts), and hand the same
 // trust to the processes the connector starts.
 inheritSystemCa(process.env, trustSystemCAs(process.env));
+
+// Every line the connector prints goes through these: a log file that cannot be written (a quota used up, a full disk)
+// sends its lines elsewhere instead of ending the process (logsink.ts).
+const out = lineSink({ fd: 1, stream: process.stdout });
+const err = lineSink({ fd: 2, stream: process.stderr });
+setLogLine(err);
 
 let connector: Connector | null = null;
 
@@ -43,8 +51,8 @@ main(process.argv.slice(2), {
   dirs: resolveDirs(),
   cli: fileURLToPath(import.meta.url),
   env: process.env,
-  out: (l) => process.stdout.write(l + "\n"),
-  err: (l) => process.stderr.write(l + "\n"),
+  out,
+  err,
   ask,
   probe: probeAgents,
   installAdapters: true,
@@ -55,4 +63,4 @@ main(process.argv.slice(2), {
     // so the same ask sent to an older connector that does not listen is harmless.
     process.on("SIGWINCH", () => c.recheckHealth());
   },
-}).then((code) => process.exit(code), (e) => { process.stderr.write(`fatal: ${e instanceof Error ? e.stack : String(e)}\n`); process.exit(1); });
+}).then((code) => process.exit(code), (e) => { err(`fatal: ${e instanceof Error ? e.stack : String(e)}`); process.exit(1); });

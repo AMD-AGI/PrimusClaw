@@ -174,6 +174,20 @@ describe("state files written off the event loop", () => {
     assert.equal(await within(f.settled(Infinity), 2_000, null), true, "the disk answers again: the newest content is written");
     assert.equal(fs.readFileSync(file, "utf8"), "one");
   });
+  test("a failed write is tried again on its own, with nothing saved since and nobody asking (children.json at a quota)", async () => {
+    const dir = tmpdir();
+    const file = path.join(dir, "children.json");
+    fs.mkdirSync(`${file}.tmp`); // the temporary file cannot be written: the write fails, as with EDQUOT
+    const reports: string[] = [];
+    const f = new SnapshotFile(file, (what, info) => { if (info.error) reports.push(what); });
+    f.save("[1]");
+    assert.equal(await within(f.settled(500), 1_500, null), false, "the write failed");
+    fs.rmdirSync(`${file}.tmp`); // room again
+    const deadline = Date.now() + 5_000;
+    while (!fs.existsSync(file) && Date.now() < deadline) await sleep(50);
+    assert.equal(fs.existsSync(file) && fs.readFileSync(file, "utf8"), "[1]", "written by the retry, without another save or settled()");
+    assert.ok(reports.length >= 1);
+  });
   test("one failed write of sessions.json.pending does not hold back every later event (written() settles)", async () => {
     const dir = tmp();
     const file = path.join(dir, "sessions.json");
