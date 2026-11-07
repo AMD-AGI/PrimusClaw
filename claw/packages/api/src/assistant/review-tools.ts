@@ -61,16 +61,16 @@ export { confirmationRef };
 const logger = pino({ name: "assistant-review-tools" });
 
 /**
- * The user's own reviews of every one of `prs` created since the message was received, or null when any is missing: what an earlier
- * call answering the same message started (one transaction starts all of a call's reviews, so it is all or none).
+ * The user's own reviews of every one of `prs` that a turn answering message `messageId` started (`request_message`), or null when any
+ * is missing. One transaction starts all of a call's reviews, so it is all or none.
  */
-export async function startedSince(userId: string, since: Date, prs: readonly PrRef[]): Promise<Array<{ item_id: string; seq: number; pr: string }> | null> {
+export async function startedFor(userId: string, messageId: string, prs: readonly PrRef[]): Promise<Array<{ item_id: string; seq: number; pr: string }> | null> {
   const rows = (await db.query(
     `SELECT item_id, seq, params->'pr'->>'owner' AS owner, params->'pr'->>'repo' AS repo, params->'pr'->>'number' AS number
        FROM claw_work_items
-      WHERE user_id = $1 AND kind = 'review' AND NOT (params ? 'requested_by') AND created_at >= $2
+      WHERE user_id = $1 AND kind = 'review' AND params->>'request_message' = $2
       ORDER BY created_at`,
-    [userId, since],
+    [userId, messageId],
   )).rows as Array<{ item_id: string; seq: number; owner: string; repo: string; number: string }>;
   const out: Array<{ item_id: string; seq: number; pr: string }> = [];
   for (const pr of prs) {
@@ -84,7 +84,7 @@ export async function startedSince(userId: string, since: Date, prs: readonly Pr
 
 /** The ways out of this module, so a test can stand in for what lies beyond the HTTP boundary of each. */
 export const reviewToolPorts = {
-  startedSince,
+  startedFor,
   startReviews,
   restartReview,
   /** The decision route's own function (`decideConfirmation`), with the process's review service, not a copy of it. */
@@ -606,14 +606,13 @@ export async function reviewStart(
     }
     const signedIn = await requesterSignedIn(q, claims.sid, userId, message, via);
     const note = asked;
-    const receivedAt = message.receivedAt;
-    if (!args.reviewer || args.reviewer === userId) return { userId, signedIn, note, receivedAt, actingAs: userId, actingAsName: undefined };
+    if (!args.reviewer || args.reviewer === userId) return { userId, signedIn, note, actingAs: userId, actingAsName: undefined };
     const reviewer = lower(args.reviewer);
     const people = message.context.people;
     const person = people.find((p): p is ChannelPerson & { user_id: string } => p.user_id === args.reviewer);
     if (person && reviewerNamed(message.content, person, people)) {
       // A review as someone else runs on their account: the person's message must name them, not only the channel list them.
-      return { userId, signedIn, note, receivedAt, actingAs: args.reviewer, actingAsName: person.name };
+      return { userId, signedIn, note, actingAs: args.reviewer, actingAsName: person.name };
     }
     const named = !person && people.some((p) => !p.user_id && (lower(p.name) === reviewer || (p.email !== undefined && lower(p.email) === reviewer)));
     if (named) refuseUngrounded("reviewer_not_linked", "that person has not linked their account, so nobody can review as them: tell the user");
@@ -625,7 +624,7 @@ export async function reviewStart(
   // Sent again (Brain resends a call whose answer was lost, `idempotentHint`): what the first call started is the answer, even when it
   // has already finished or merged, which the one-open-review-per-pull-request rule alone would not catch.
   if (ready.actingAs === ready.userId) {
-    const started = await reviewToolPorts.startedSince(ready.userId, ready.receivedAt, prs);
+    const started = await reviewToolPorts.startedFor(ready.userId, claims.mid, prs);
     if (started) {
       logger.info({ items: started.map((i) => i.item_id) }, "assistant.review_start_repeated");
       return { ok: true, items: started, repeated: "these reviews were already started for this message (by an earlier call whose answer was lost): nothing new was started" };
@@ -651,6 +650,7 @@ export async function reviewStart(
       review_only: !args.merge,
     }),
     mergeNeedsConfirmation: true,
+    requestMessageId: claims.mid,
   }, stillActing(claims, ready.userId))));
   return { ok: true, items };
 }

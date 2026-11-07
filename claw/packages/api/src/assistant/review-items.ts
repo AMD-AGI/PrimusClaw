@@ -97,6 +97,11 @@ export interface ReviewParams {
    * once, and one waiting starts only while fewer do (`startQueuedOf`).
    */
   request_batch?: string;
+  /**
+   * The assistant message whose turn started it (`review_start`): a call sent again for that message answers this review instead of
+   * starting another (`startedFor`). Absent for a review started any other way.
+   */
+  request_message?: string;
   /** The last review of the same pull request this one continues (a restart, or a new request after a closed item), as the facts recorded it. */
   continues?: ReviewContinues | null;
   /** What this review has posted so far, from the same facts (`reviewRecord`); written when the item's state is brought up to date. */
@@ -218,6 +223,8 @@ export interface ReviewRequest {
    * the router's tool, never parsed from a body.
    */
   mergeNeedsConfirmation?: boolean;
+  /** The assistant message whose turn asked (`review_start`), kept on each review as `request_message`. Set by the router's tool, never parsed from a body. */
+  requestMessageId?: string;
   /**
    * The handoff the assistant queued for this request (`review_for_other`, `claw_assistant_review_handoffs`), echoed by the channel that
    * starts it. Only names a record the server wrote: whether the review may merge at all is read from that record, never from this request.
@@ -681,6 +688,7 @@ export async function startReviews(
       review_only: request.reviewOnly, brief: message ?? defaultBrief(pr, request.reviewOnly),
       ...(request.mergeNeedsConfirmation === true ? { merge_needs_confirmation: true as const } : {}),
       ...(batch ? { request_batch: batch } : {}),
+      ...(request.requestMessageId ? { request_message: request.requestMessageId } : {}),
     };
     return {
       pr, sessionId: randomUUID(), attended: checked.attended, ...(batch && index >= REVIEWS_STARTED_AT_ONCE ? { hold: true } : {}),
