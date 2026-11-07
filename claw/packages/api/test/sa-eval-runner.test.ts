@@ -51,6 +51,7 @@
  *      the key's identity refuses the run before anything is sent
  *   R18 a person who writes to the run's assistant session while the run is on: the item their turn started is not the run's and
  *      is neither closed nor stripped of its worker's session (it is said as left alone), while the run's own item is closed
+ *   R20 "items named by title" knows the board's highest item number: a "#n" above it is not one of the person's items
  *   R19 a multi-turn case: each item in the results says whether the graded last turn started it (`last`), so an item an earlier
  *      turn started is not counted as the last turn's
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
@@ -737,6 +738,22 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
       const items = report.results[0].attempts[0].items as Array<{ seq: number; last?: boolean }>;
       assert.deepEqual(items.map((i) => [i.seq, i.last]).sort(), [[1, false], [2, true]], run.out);
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it("R20 items named by title: a number above the board's highest item number is not one of the person's", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    let n = 0;
+    claw.router = (_content, id) => { n++; claw.turn(id, { item: item(n), say: n === 1 ? "Started. The upstream one is #4321." : `Started #${n}.` }); };
+    const r = runner(base, [itemCase({ id: "t-seq-001", style: { no_ids: true } }), itemCase({ id: "t-seq-002", style: { no_ids: true } })]);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+      const titled = (id: string) => (report.results as any[]).find((x) => x.id === id).attempts[0].checks.find((c: any) => c.name === "items named by title")?.pass;
+      assert.equal(titled("t-seq-001"), true, run.out);
+      assert.equal(titled("t-seq-002"), false, "#2 is on the board: a bare item number");
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 

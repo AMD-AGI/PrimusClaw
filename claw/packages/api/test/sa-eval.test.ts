@@ -804,6 +804,20 @@ test("S25b a list under a heading that names pull requests", () => {
   }
 });
 
+test("S25c a number above the person's highest item number is no item of theirs", () => {
+  const pulse = "共有 47 个上游 PR：\n**sglang**\n- #48434、#48406、#48043。\n另一个相近的是 #48043。";
+  assert.equal(bareItemNumber(pulse, 312), null, "upstream PR numbers, the board's highest item is #312");
+  assert.equal(bareItemNumber(pulse), "#48434", "without the board's numbers it is unchanged");
+  assert.equal(bareItemNumber("还剩 #12。", 312), "#12", "a number the board can hold is still bare");
+  assert.equal(bareItemNumber("还剩 #12。", 0), "#12", "an empty board read bounds nothing");
+  const c = caseOf({ style: { no_ids: true } });
+  const named = (shown: string, itemSeqMax?: number) => failed(c, observed({ shown: [shown], final: shown, ...(itemSeqMax ? { itemSeqMax } : {}) }))
+    .filter((n) => n.startsWith("items"));
+  assert.deepEqual(named("另一个相近的是 #48043。", 312), []);
+  assert.deepEqual(named("另一个相近的是 #48043。"), ["items named by title"]);
+  assert.deepEqual(named("已完成的是 #7。", 312), ["items named by title"]);
+});
+
 test("S27 internal text: a sandbox workload's name and a system prompt as a subject are not leaks", () => {
   const leaks = (text: string) => failed(caseOf(), observed({ shown: [text], final: text })).filter((n) => n.startsWith("no internal text"));
   assert.deepEqual(leaks("你的 workload：claw-1762480000000-sandbox Running，claw-1762480000123-sandbox Failed。"), []);
