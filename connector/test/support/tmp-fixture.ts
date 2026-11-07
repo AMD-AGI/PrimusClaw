@@ -7,12 +7,14 @@
  *   pass   the test passes and the file's hooks run
  *   fail   the test fails and the file's hooks run
  *   exit   the process exits in the middle of the test, so no hook runs
- * Before it ends it writes the directories it made, and the adapter its session started, to TMP_FIXTURE_REPORT
- * (outside that TMPDIR).
+ * Before it ends it writes the directories it made, and the adapters it started (one by a session, one below a wrapper
+ * that has exited), to TMP_FIXTURE_REPORT (outside that TMPDIR).
  */
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import test from "node:test";
 import path from "node:path";
+import { ChildRegistry } from "../../src/children.js";
 import { Harness, tmpdir } from "./harness.js";
 import { liveTmpdirs } from "./tmp.js";
 
@@ -30,6 +32,15 @@ test("the suite's setup", async () => {
     try { return (JSON.parse(fs.readFileSync(path.join(h.dirs.state, "children.json"), "utf8")) as Array<{ pid: number }>).map((r) => r.pid); } catch { return []; }
   };
   const adapters = await h.claw.until("children.json to name the adapter", () => (recorded().length > 0 ? recorded() : undefined));
+  // A wrapper (`npx` and the like) that started the agent and left: the recorded leader is gone, its group lives on.
+  const reg = new ChildRegistry(path.join(tmpdir("cc-wrap-"), "state", "children.json"));
+  const wrapper = spawn("sh", ["-c", "sleep 300 & echo $!; read _"], { detached: true, stdio: ["pipe", "pipe", "ignore"] });
+  reg.add({ pid: wrapper.pid!, pgid: wrapper.pid!, agent_id: "wrapped", session_id: "s" });
+  const agent = Number(await new Promise<string>((r) => wrapper.stdout!.once("data", (d) => r(String(d).trim()))));
+  wrapper.stdin!.end();
+  await new Promise((r) => wrapper.once("exit", r));
+  wrapper.stdout!.destroy();
+  adapters.push(agent);
   fs.writeFileSync(`${h.work}/file`, "x");
   tmpdir("cc-claudecfg-");
   tmpdir("cc-fakecli-");

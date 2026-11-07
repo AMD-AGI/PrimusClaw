@@ -41,10 +41,10 @@ describe("temporary directories", { skip: process.platform !== "linux" && "reads
       const r = run(end);
       assert.equal(r.status, status, r.out);
       const prefixes = new Set(r.made.map((d) => path.basename(d).slice(0, -6)));
-      for (const p of ["cc-", "cc-work-", "cc-claude-", "cc-claudecfg-", "cc-fakecli-", "w-"]) {
+      for (const p of ["cc-", "cc-work-", "cc-claude-", "cc-claudecfg-", "cc-fakecli-", "cc-nest-", "cc-wrap-", "w-"]) {
         assert.ok(prefixes.has(p), `the fixture made a ${p}* directory (it made ${[...prefixes].join(", ")})`);
       }
-      assert.equal(r.adapters.length, 1, `the fixture's session started an adapter\n${r.out}`);
+      assert.equal(r.adapters.length, 2, `the fixture started its two adapters\n${r.out}`);
       for (const pid of r.adapters) assert.equal(alive(pid), false, `adapter ${pid} outlived the file`);
       assert.deepEqual(r.left, [], `left in TMPDIR: ${r.left.join(", ")}\n${r.out}`);
       for (const d of r.made) assert.equal(fs.existsSync(d), false, d);

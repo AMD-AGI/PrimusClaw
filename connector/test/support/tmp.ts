@@ -4,9 +4,9 @@
 /**
  * Temporary directories for the tests, removed when the test file ends. Every directory `tmpdir` makes is
  * recorded; the file's `after` hook first runs what `onCleanup` registered (a connector to stop, a stand-in Claw to
- * close), newest first, so nothing is still writing, and then removes the directories. A file that dies before its
- * hooks run (an uncaught error, `process.exit`) still removes them on the process's `exit`, after killing the adapters
- * a connector with its home in one of them recorded in children.json: they run detached and would outlive the file.
+ * close), newest first, then kills the adapters still recorded in a children.json under them (they run detached and
+ * would outlive the file), so nothing is still writing, and then removes the directories. A file that dies before its
+ * hooks run (an uncaught error, `process.exit`) does the same, synchronously, on the process's `exit`.
  *
  * Only the test files' own processes import this: it registers a hook with node:test, which a helper process a
  * test spawns must not do (support/run-fast.ts imports support/timing.ts, not the harness, for that reason).
@@ -15,7 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after } from "node:test";
-import { processStart, type ChildRecord } from "../../src/children.js";
+import { ChildRegistry } from "../../src/children.js";
 
 const made = new Set<string>();
 const closers: Array<() => unknown> = [];
@@ -64,17 +64,18 @@ function childrenFiles(dir: string, depth: number): string[] {
 }
 
 /**
- * SIGKILL the process groups the connectors recorded in children.json under the directories made, those whose
- * start time still matches (the connector's own rule: a recycled pid is never hit). Synchronous, for `exit`.
+ * SIGKILL the process groups the connectors recorded in children.json under the directories made, by the connector's
+ * own rule (ChildRegistry.isOurs: the leader is still the process started, or it is gone and its group lives on; a
+ * recycled pid is never hit), and never this file's process or its runner. Synchronous, for `exit`.
  */
 function killRecordedAdapters(): void {
   for (const dir of made) {
     for (const file of childrenFiles(dir, 3)) {
-      let recs: unknown;
-      try { recs = JSON.parse(fs.readFileSync(file, "utf8")); } catch { continue; }
-      for (const r of Array.isArray(recs) ? (recs as ChildRecord[]) : []) {
-        if (!r || !Number.isInteger(r.pgid) || r.pgid <= 1 || processStart(r.pid) !== r.start) continue;
-        if ([process.pid, process.ppid].includes(r.pgid) || r.pid === process.pid) continue; // never this file or its runner
+      let reg: ChildRegistry;
+      try { reg = new ChildRegistry(file); } catch { continue; }
+      for (const r of reg.list()) {
+        if (!Number.isInteger(r.pgid) || r.pgid <= 1 || [process.pid, process.ppid].includes(r.pgid) || r.pid === process.pid) continue;
+        if (!reg.isOurs(r)) continue;
         try { process.kill(-r.pgid, "SIGKILL"); } catch { /* gone */ }
       }
     }
@@ -88,11 +89,16 @@ function removeAll(): void {
   }
 }
 
-/** Close what was registered (newest first), then remove every directory made. Safe to call more than once. */
+/**
+ * Close what was registered (newest first), kill the adapters still recorded under the directories made, then remove
+ * them. Safe to call more than once.
+ */
 export async function cleanupTmp(): Promise<void> {
   for (const close of closers.splice(0).reverse()) {
     try { await close(); } catch { /* the directories go regardless */ }
   }
+  // What a stopped connector still lists is what it could not stop, or what a test recorded and left.
+  try { killRecordedAdapters(); } catch { /* the directories go regardless */ }
   removeAll();
 }
 
