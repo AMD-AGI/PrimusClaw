@@ -42,3 +42,7 @@ export const supervisorPidFile = (d: Dirs) => path.join(d.state, "supervisor.pid
 export const runLogFile = (d: Dirs) => path.join(d.state, "run.log");
 export const keepaliveFile = (d: Dirs) => path.join(d.state, "keepalive.sh");
 export const serviceFile = (d: Dirs) => path.join(d.state, "service.json");
+/** The last `claw-connector doctor` report. */
+export const doctorFile = (d: Dirs) => path.join(d.state, "doctor.json");
+/** Touched by every `service ensure` (what keepalive.sh runs), so `doctor` can tell whether anything calls it. */
+export const keepaliveStampFile = (d: Dirs) => path.join(d.state, "keepalive-last");

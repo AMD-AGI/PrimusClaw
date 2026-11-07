@@ -41,10 +41,10 @@ If npm answers `EACCES`, point its global prefix at a directory you own (`npm co
 ```sh
 claw-connector init      # writes agents.toml and prints where: ~/.config/claw-connector/agents.toml unless XDG_CONFIG_HOME or CLAW_CONNECTOR_HOME is set
 claw-connector status    # after you edit it: prints a "problem:" line if the file is wrong
-claw-connector doctor    # starts each agent's adapter, opens a session (no prompt) and checks the modes it offers
+claw-connector doctor    # checks the machine (step 5), then starts each agent's adapter, opens a session (no prompt) and checks the modes it offers
 ```
 
-`init` runs the same check as `doctor` at the end. `doctor` says `ok` for an agent whose phone sessions will open, and otherwise a
+`init` runs the adapter check of `doctor` at the end. `doctor` says `ok` for an agent whose phone sessions will open, and otherwise a
 `problem:` line with the fix, for example an agent whose sessions would be refused with `mode_unavailable`.
 
 By default every agent asks before it writes a file or runs a command, and your phone answers each question. To let phone sessions run
@@ -94,7 +94,24 @@ when the supervisor is up) so a restarted container comes back by itself. See [K
 To try it in the foreground instead, `claw-connector run` prints `connecting claude to https://claw.example.com/claw-api as
 "<machine name>"` and stays up until Ctrl-C, which stops it and every agent it started.
 
-**5. See it in Clawy**
+**5. Check the machine**
+
+```sh
+claw-connector doctor
+```
+
+`doctor` checks what makes a first phone session fail far from the machine that caused it, and prints one fix per problem:
+Node.js 22 or newer; each agent's program on `PATH` (and on the `PATH` the installed service starts it with, which is not your
+shell's); whether Claude Code and Codex are signed in (`claude auth status`, `codex login status`, or the model provider's key
+variable in `~/.codex/config.toml`); the `roots` writable; `HTTPS_PROXY` and `https_proxy` not set to different values; a service
+installed (and, for `keepalive.sh`, something calling it); and Claw answering, including whether Node.js trusts its certificate
+(Node does not read the system's CA store by default: behind a company CA set `NODE_USE_SYSTEM_CA=1` or `NODE_EXTRA_CA_CERTS`). Then it
+runs the adapter check of step 2. It exits 1 when something will stop sessions (`--json`: `ok` is the adapters' verdict,
+`machine_ok` and `environment` the machine's). The
+running connector repeats the machine checks with its own environment (in a child process, so a stalled disk cannot stall
+it) every 15 minutes, and at once when `doctor` runs (it signals the connector), and Clawy's `/agents` card shows what it found under the machine ("Codex is not signed in: run `codex login` on that machine").
+
+**6. See it in Clawy**
 
 In Clawy (or any chat client built on Claw), send `/agents`. The agents of this machine are listed, online while `run` is up.
 A session started there runs on this machine, inside one of your `roots`, and each permission request comes back as a card in the chat.
@@ -371,6 +388,7 @@ session stops the agent process; it never deletes the conversation.
 | `run [--supervised]` | Connect and serve. Exit code 78 means starting it again will not help: the connector was revoked, Claw or the identity service refused the sign-in (at start, or for two minutes in a row while running), or there is no usable `agents.toml` or sign-in; the reason is kept in `needs-login.json`, and until `login` removes it `run` exits 78 at once without contacting Claw. `--supervised` marks a run the service started. Any other non-zero exit is worth a restart. A unit written by hand for 0.1.2 and older (`RestartPreventExitStatus=3`): replace it with `claw-connector service install`, which writes the same file. |
 | `service install\|uninstall\|status [--supervisor systemd\|launchd\|script] [--env NAME ...]` | Keep `run` up (see [Keeping it running](#keeping-it-running)). `install` stops a `run` started by hand so the service takes over; `status` also lists the last five disconnects and why. |
 | `status [--json]` | Running or not, paused, signed in, agents, adapter processes, the last disconnect and its reason (`last down:`), a `problem:` line when a new sign-in is needed, and a `warning:` line for each agent whose sessions will be refused because Claude's own settings default to `bypassPermissions` (see [Running without per-step approval](#running-without-per-step-approval)). |
+| `doctor [--agent ID] [--json]` | Check this machine and print one fix per problem (see step 5 of the quick start), then each agent's adapter (step 2); exit 1 when something stops sessions. The report is kept in `doctor.json`; a running connector is signalled to check again and sends what it finds to Claw (each agent's `capabilities.health`). |
 | `pause` / `resume` | Stop every agent within a second and stay offline, or undo that. |
 | `stop` | Stop the running connector and every agent it started. |
 | `logout` | Stop, revoke this machine's connector at Claw (with a key, `DELETE /v1/remote-agents/connectors/:cid`; with a device sign-in, the connector-side `POST .../connectors/:cid/revoke`), ask the identity service to revoke the sign-in, and delete it from this machine. The next sign-in registers a new connector. When Claw cannot be reached or refuses (a Claw from before the connector-side route refuses a device sign-in), the sign-in is still deleted, but `logout` says the connector was not revoked, prints the `curl` that revokes it with a Claw API key of yours, keeps its id (so a later sign-in reuses it), and exits 1. |
@@ -387,8 +405,8 @@ the connector sees it within a heartbeat, stops every agent and exits without re
 refused). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME/claw-connector/`): `connector.json` (the connector's identity and the
 commands handled), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
 decisions, every command received, every permission request and answer, every automatic approval, mode changes),
-`logs/`, `children.json`, `connector.pid`, `disconnects.jsonl`, `needs-login.json` (only after a run that needs a new sign-in), and with
-the script supervisor `supervisor.pid`, `keepalive.sh` and `run.log`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
+`logs/`, `children.json`, `connector.pid`, `disconnects.jsonl`, `needs-login.json` (only after a run that needs a new sign-in), `doctor.json`
+(the last `doctor` report), and with the script supervisor `supervisor.pid`, `keepalive.sh`, `keepalive-last` (when it last ran) and `run.log`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
 
 ## Keeping it running
 
@@ -410,7 +428,7 @@ A successful `login` starts an installed service again, so after a revocation or
 installed for a state directory is recorded in its `service.json`.
 
 The unit carries `PATH` (so the agents are found), `CLAW_CONNECTOR_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `CLAUDE_CONFIG_DIR`,
-`CODEX_HOME`, the CA and proxy variables and `LANG` from the shell that ran `install` (a proxy URL with a password in it only when named with `--env`, e.g. `--env HTTPS_PROXY`); `--env NAME` adds another, except a name that looks
+`CODEX_HOME`, the CA and proxy variables (with `NODE_USE_SYSTEM_CA` and `NODE_USE_ENV_PROXY`) and `LANG` from the shell that ran `install` (a proxy URL with a password in it only when named with `--env`, e.g. `--env HTTPS_PROXY`); `--env NAME` adds another, except a name that looks
 like a credential (`KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`), which is never written into a unit. Run `install` again after
 changing any of them, or after moving Node. With a service installed, `claw-connector stop` stops the connector until the next login,
 boot or keep-alive check; to stay offline use `pause`, or `service uninstall`.
