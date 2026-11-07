@@ -8,7 +8,7 @@
  */
 import { main } from "../../src/commands.js";
 import { resolveDirs } from "../../src/paths.js";
-import { FAST } from "./harness.js";
+import { FAST } from "./timing.js";
 
 const code = await main(["run"], {
   dirs: resolveDirs(process.env), env: process.env, timing: { ...FAST, heartbeatMs: 100 },

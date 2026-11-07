@@ -3,7 +3,6 @@
 
 /** A connector wired to a FakeClaw and a fake ACP adapter, on a temporary home. */
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ClawClient } from "../../src/claw-client.js";
@@ -16,16 +15,14 @@ import { redactDeep } from "../../src/redact.js";
 import { auditFile, resolveDirs, type Dirs } from "../../src/paths.js";
 import { silentLogger } from "../../src/util.js";
 import { FakeClaw } from "./fake-claw.js";
+import { onCleanup, tmpdir } from "./tmp.js";
+import { FAST } from "./timing.js";
 
 export const ADAPTER = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-adapter.mjs");
 export const FAKE_CLAUDE = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-claude.mjs");
 
-export const tmpdir = (p = "cc-"): string => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), p)));
-
-export const FAST: Partial<ConnectorTiming> = {
-  heartbeatMs: 150, watchdogMs: 700, batchMs: 15, backoffMinMs: 20, backoffMaxMs: 150, pausePollMs: 40,
-  idleMs: 60_000, permissionTtlMs: 60_000, modeConfirmMs: 250,
-};
+export { tmpdir, onCleanup } from "./tmp.js";
+export { FAST } from "./timing.js";
 
 /** An agent made from the claude-attach preset, with a stand-in `claude` command and a Claude config directory of its own. */
 export interface AttachOptions {
@@ -80,6 +77,8 @@ export class Harness {
   static async create(o: HarnessOptions = {}): Promise<Harness> {
     const h = new Harness();
     h.claw = o.claw ?? (await FakeClaw.start());
+    // Stopped before the file's temporary directories (its home among them) are removed.
+    onCleanup(() => h.close());
     h.dirs = resolveDirs({ CLAW_CONNECTOR_HOME: o.home ?? tmpdir() } as NodeJS.ProcessEnv);
     h.work = o.work ?? tmpdir("cc-work-");
     h.fakeLog = path.join(h.dirs.state, "fake-adapter.log");
@@ -154,10 +153,15 @@ ${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, {
     return (await this.running) ?? "stopped";
   }
 
-  async close(): Promise<void> {
-    await this.stop().catch(() => undefined);
-    await this.claw.close();
+  /** Stop the connector and the stand-in Claw; a second call waits for the first. */
+  close(): Promise<void> {
+    this.closing ??= (async () => {
+      await this.stop().catch(() => undefined);
+      await this.claw.close();
+    })();
+    return this.closing;
   }
+  private closing: Promise<void> | null = null;
 
   /** A session created and started, resolved when `session_started` or `session_closed` arrives. */
   async newSession(cwd: string = this.work, mode?: string, agent = "fake"): Promise<string> {

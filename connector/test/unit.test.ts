@@ -3,7 +3,6 @@
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import test, { describe } from "node:test";
 import { ConfigError, PRESETS, parseConfig } from "../src/config.js";
@@ -13,9 +12,10 @@ import { globMatches } from "../src/glob.js";
 import { redactDeep, redactText } from "../src/redact.js";
 import { SseParser } from "../src/sse.js";
 import { backoffMs, secureUrl, truncateBytes, UrlError } from "../src/util.js";
+import { tmpdir } from "./support/tmp.js";
 
 const PEM = (what: string) => "-----" + what + " PRIVATE" + " KEY-----";
-const tmp = (prefix = "cc-") => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+const tmp = tmpdir;
 
 describe("agents.toml", () => {
   const root = tmp();

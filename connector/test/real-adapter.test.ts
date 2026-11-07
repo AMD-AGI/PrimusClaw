@@ -15,8 +15,8 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import test, { after, describe } from "node:test";
-import { tmpdir } from "./support/harness.js";
+import test, { describe } from "node:test";
+import { onCleanup, tmpdir } from "./support/tmp.js";
 import { ClawClient } from "../src/claw-client.js";
 import { parseConfig } from "../src/config.js";
 import { Connector } from "../src/connector.js";
@@ -29,9 +29,6 @@ import { FakeClaw } from "./support/fake-claw.js";
 const ADAPTER = process.env.CLAW_REAL_CLAUDE_ACP;
 const SETTINGS = process.env.CLAW_REAL_CLAUDE_SETTINGS;
 const skip = ADAPTER && SETTINGS ? false : "set CLAW_REAL_CLAUDE_ACP and CLAW_REAL_CLAUDE_SETTINGS to run against the real adapter";
-
-const cleanups: Array<() => Promise<void>> = [];
-after(async () => { for (const f of cleanups) await f(); });
 
 async function realConnector(agentToml: string) {
   const user = JSON.parse(fs.readFileSync(SETTINGS!, "utf8")) as { env?: unknown; model?: unknown };
@@ -58,7 +55,7 @@ CLAUDE_CONFIG_DIR = ${JSON.stringify(claudeHome)}
     timing: { heartbeatMs: 500, watchdogMs: 5000, batchMs: 15, modeConfirmMs: 3000, permissionTtlMs: 30_000 },
   });
   const running = connector.run();
-  cleanups.push(async () => { connector.stop(); await running.catch(() => undefined); await claw.close(); });
+  onCleanup(async () => { connector.stop(); await running.catch(() => undefined); await claw.close(); });
   await claw.until("the connector online", () => claw.online && claw.heartbeats.length > 0, 30_000);
   const sid = claw.newSession("claude", work);
   await claw.until("started or closed", () => claw.eventsOf(sid).some((e) => e.type === "session_started" || e.type === "session_closed"), 90_000);

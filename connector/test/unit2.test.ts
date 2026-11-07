@@ -4,7 +4,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import test, { describe } from "node:test";
 import { ChildRegistry, processStart } from "../src/children.js";
@@ -20,8 +19,9 @@ import { SessionStore } from "../src/session-store.js";
 import { SnapshotFile, within } from "../src/statefile.js";
 import { UrlError, sleep } from "../src/util.js";
 import { FakeIdentity } from "./support/fake-identity.js";
+import { tmpdir } from "./support/tmp.js";
 
-const tmp = (p = "cc-") => fs.mkdtempSync(path.join(os.tmpdir(), p));
+const tmp = tmpdir;
 const SID = "11111111-1111-4111-8111-111111111111";
 const SID2 = "22222222-2222-4222-8222-222222222222";
 
