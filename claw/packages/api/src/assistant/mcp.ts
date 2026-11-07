@@ -256,6 +256,10 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims, choic
       model: z.string().optional().describe(choice ? MODEL_PARAM_CHOICE : "Only when the user named a model."),
       effort: z.enum(["low", "medium", "high"]).optional().describe("Only when the user asked for one."),
     },
+    // Safe to send again with the same arguments, and Brain does when an answer is lost (`retryIdempotentMcp`): within one turn a
+    // repeat hands over nothing more (the handoff's id is the message's, `handOffReview`) and starts nothing more (one open review per
+    // pull request, `refuseIfReviewed`), and answers what the first call did.
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     (args) => answer(claims, "review_start", () => reviewStart(claims, args)),
   );
   mcp.tool(

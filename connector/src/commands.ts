@@ -30,6 +30,7 @@ import { UrlError, errMessage, isObject, secureUrl, sleep, stderrLogger } from "
 import { VERSION } from "./version.js";
 import { redactDeep } from "./redact.js";
 import { probeAgents, probeLines, type ProbeFn } from "./probe.js";
+import { rootProblems } from "./roots.js";
 
 export interface Ctx {
   dirs: Dirs;
@@ -412,6 +413,9 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   ctx.out(`connecting ${cfg.agents.map((a) => (a.unattended ? `${a.id} (no per-step approval)` : a.id)).join(", ")} to ${server} as "${cfg.name}"`);
   for (const n of notes) ctx.out(`note: ${n}`);
   for (const w of noAsk(ctx, cfg)) ctx.out(`warning: ${w}`);
+  for (const a of cfg.agents) if (a.readOnlyModes.includes(a.askMode)) ctx.out(`note: ${a.id}: its sessions start read-only (${a.askMode} mode changes no file); to let phone sessions write code, set approval = "never" on it in agents.toml`);
+  // A root that is missing or stalled is reported, not fatal: a network mount may come back, and its sessions with it.
+  void rootProblems(cfg.agents).then((ps) => { for (const p of ps) ctx.out(`warning: ${p}`); }, () => undefined);
   try {
     const result = await connector.run();
     // A machine paired from the chat has no login to run again: a new pairing code is what connects it.

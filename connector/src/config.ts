@@ -11,7 +11,6 @@ import os from "node:os";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { isObject } from "./util.js";
-import { realRoot } from "./roots.js";
 
 export interface AutoAllowRule {
   kind: string;
@@ -46,6 +45,8 @@ export interface AgentConfig {
   allowUnsafeModes: boolean;
   /** Sessions start in a mode outside `askingModes`: no per-step approval. Never true without `allowUnsafeModes`. */
   unattended: boolean;
+  /** Modes in which this agent cannot change a file at all (measured for the preset): a session in one only answers. */
+  readOnlyModes: string[];
   autoAllow: AutoAllowRule[];
   /**
    * Set for an agent that takes over sessions that already exist on this machine instead of starting new ones.
@@ -80,6 +81,8 @@ interface Preset {
   /** What `approval = "never"` turns the preset into: the adapter's mode that never asks, and the flags that go with it. */
   unattended: { askMode: string; args?: string[] };
   attach?: boolean;
+  /** Modes in which the agent cannot change a file (it asks nothing because it may do nothing). */
+  readOnly?: string[];
 }
 
 /**
@@ -103,14 +106,14 @@ export const PRESETS: Record<string, Preset> = {
   claude: {
     kind: "claude", name: "Claude Code", command: "npx",
     args: ["-y", "@agentclientprotocol/claude-agent-acp@0.99.0"], askMode: "default", safeModes: ["default", "plan"],
-    unattended: { askMode: "bypassPermissions" },
+    unattended: { askMode: "bypassPermissions" }, readOnly: ["plan"],
   },
   // Existing Claude Code sessions, taken over from the phone. The kind is the opaque label a chat client picks an icon
   // from; it says what the entry is for, not which product serves it. Same adapter and same ask mode as `claude`.
   "claude-attach": {
     kind: "attach", name: "Claude Code (existing sessions)", command: "npx",
     args: ["-y", "@agentclientprotocol/claude-agent-acp@0.99.0"], askMode: "default", safeModes: ["default", "plan"], attach: true,
-    unattended: { askMode: "bypassPermissions" },
+    unattended: { askMode: "bypassPermissions" }, readOnly: ["plan"],
   },
   codex: {
     kind: "codex", name: "Codex", command: "npx",
@@ -119,7 +122,7 @@ export const PRESETS: Record<string, Preset> = {
   },
   cursor: {
     kind: "cursor", name: "Cursor", command: "agent", args: ["acp"], askMode: "ask", safeModes: ["ask", "plan"],
-    unattended: { askMode: "agent", args: ["--force", "acp"] },
+    unattended: { askMode: "agent", args: ["--force", "acp"] }, readOnly: ["ask", "plan"],
   },
 };
 
@@ -208,9 +211,11 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
     if (asking.has(askMode) && !safeModes.includes(askMode)) safeModes.push(askMode);
     const roots = strList(raw.roots, `${label}.roots`, problems).map((r) => path.resolve(expandHome(r)));
     if (roots.length === 0) problems.push(`${label}: roots is required (an agent with no allowed directory is never offered)`);
+    // Whether a root exists is not checked here: reading agents.toml must never touch a network mount (a stalled one
+    // would freeze the start), and a root that is missing now may be mounted later. `run` reports such roots
+    // (rootProblems), and their sessions are refused with a reason until they are back.
     for (const r of roots) {
       if (r === path.parse(r).root) problems.push(`${label}: a root may not be the filesystem root`);
-      else if (!realRoot(r)) problems.push(`${label}: root ${r} does not exist`);
     }
     const env: Record<string, string> = {};
     if (raw.env !== undefined) {
@@ -236,6 +241,8 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
     agents.push({
       id, kind, name: typeof raw.name === "string" && raw.name.trim() ? raw.name.trim().slice(0, 128) : (preset?.name ?? id),
       command, args, env, roots, askMode, safeModes, askingModes: [...asking], allowUnsafeModes: allowUnsafe, unattended: !asking.has(askMode),
+      // What the preset measured; a custom agent declares nothing here.
+      readOnlyModes: [...(preset?.readOnly ?? [])],
       autoAllow: [...globalAllow, ...own], attach,
     });
   });
@@ -331,6 +338,8 @@ export function sampleApprovals(approval: Partial<Record<string, Approval>>): { 
 /** A line of explanation written above a sample block, for a preset whose purpose is not its name. */
 const SAMPLE_NOTES: Record<string, string> = {
   "claude-attach": "# Take over a Claude Code conversation that already exists on this machine (exit it in the terminal first).",
+  cursor: `# Cursor asks before it runs a command but cannot ask before it edits a file, so with approval "ask" its sessions are
+# read-only (ask and plan modes): they answer questions and change nothing. To let it write code, set approval = "never".`,
 };
 
 const NEVER_NOTE = `# No per-step approval: this agent runs like it does in your terminal. A phone session writes files and runs

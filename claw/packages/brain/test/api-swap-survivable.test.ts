@@ -15,6 +15,11 @@
 //   H4 MCP: the retry policy is bounded and only for transient failures
 //   H5 MCP over a real server: connect and a read-only tool ride out a reset;
 //      a tool that may write is not sent twice
+//   H6 MCP: a tool Claw's assistant API declares idempotent whose answer is lost
+//      is sent again and answers; one that is not is sent once; two lost answers
+//      are told to the model as "not known yet", not "Request timed out"
+//      (2026-11-07 07:14Z: review_start's answer was cut off by a closing pod);
+//      another server's idempotentHint changes nothing
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -23,7 +28,7 @@ import type { ExecuteRequest } from "@claw/protocol";
 
 import { isTransientFetchError, sendWithTransientRetry } from "../src/infra/transient-http.js";
 import { askRunLease, postAgentDone } from "../src/tasks/callback.js";
-import { __mcpRetryForTest, connectPlatformMcp, isTransientMcpError, MCP_TRANSIENT_DELAYS_MS } from "../src/clients/mcp.js";
+import { __mcpRetryForTest, connectPlatformMcp, idempotentCallPolicy, isTransientMcpError, MCP_TRANSIENT_DELAYS_MS, trustsIdempotentHint } from "../src/clients/mcp.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
@@ -192,6 +197,78 @@ test("H5 MCP over a real server: connect and a read-only tool ride out a reset, 
     await assert.rejects(caller.callTool("post_comment", {}), "the failure reaches the model, which can look before acting");
     assert.equal(executed.post_comment, 1, "and the write was not sent a second time");
   } finally {
+    await mcp.closeAll();
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test("H6 MCP: an idempotent tool whose answer is lost is sent again; a write that is not, once", async () => {
+  const saved = { ...idempotentCallPolicy };
+  idempotentCallPolicy.timeoutMs = 300;
+  const executed: Record<string, number> = { review_start: 0, post_comment: 0, never: 0 };
+  // Which calls never get an answer, as when a closing pod ends the stream it was to come on.
+  const unanswered: Record<string, number> = { review_start: 1, post_comment: 1, never: 99 };
+  const held: ServerResponse[] = [];
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
+    const tool = body?.method === "tools/call" ? String(body.params?.name) : "";
+    if (tool && unanswered[tool]! > 0) {
+      unanswered[tool]!--;
+      executed[tool]!++;
+      held.push(res);
+      return;
+    }
+    const mcp = new McpServer({ name: "assistant", version: "1.0.0" });
+    mcp.registerTool("review_start", { description: "hands over", annotations: { idempotentHint: true } }, async () => {
+      executed.review_start!++;
+      return { content: [{ type: "text", text: "handed_off" }] };
+    });
+    mcp.registerTool("never", { description: "hands over", annotations: { idempotentHint: true } }, async () => {
+      return { content: [{ type: "text", text: "unreachable" }] };
+    });
+    mcp.registerTool("post_comment", { description: "writes" }, async () => {
+      executed.post_comment!++;
+      return { content: [{ type: "text", text: "posted" }] };
+    });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as never });
+    res.on("close", () => { void transport.close(); void mcp.close(); });
+    await mcp.connect(transport);
+    await transport.handleRequest(req, res, body);
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address() as AddressInfo;
+  const mcp = await connectPlatformMcp({
+    assistant: { type: "http", url: `http://127.0.0.1:${port}/v1/internal/assistant-mcp`, token: "t" },
+    // The same tools on any other server: a request's or a plugin's.
+    thirdparty: { type: "http", url: `http://127.0.0.1:${port}/mcp`, token: "t" },
+  });
+  try {
+    const caller = mcp.clients.get("assistant")!;
+    assert.equal(await caller.callTool("review_start", {}), "handed_off", "the repeat answers what happened");
+    assert.equal(executed.review_start, 2);
+
+    await assert.rejects(caller.callTool("never", {}), /not known yet[\s\S]*still being confirmed/, "the model is told what it may do");
+    assert.equal(executed.never, 2, "bounded: one resend");
+
+    // Another server's hint: sent once, on the SDK's own wait (cut short here by the caller's signal).
+    unanswered.review_start = 1;
+    const before = executed.review_start!;
+    await assert.rejects(mcp.clients.get("thirdparty")!.callTool("review_start", {}, undefined, undefined, AbortSignal.timeout(800)));
+    assert.equal(executed.review_start! - before, 1, "a hint from a server Claw does not run is not acted on");
+    assert.equal(trustsIdempotentHint("assistant", "http://api/v1/internal/assistant-mcp"), true);
+    assert.equal(trustsIdempotentHint("assistant", "http://elsewhere/mcp"), false, "the name alone is not enough");
+    assert.equal(trustsIdempotentHint("github", "http://api/v1/internal/assistant-mcp"), false);
+
+    idempotentCallPolicy.timeoutMs = saved.timeoutMs;
+    const write = caller.callTool("post_comment", {}, undefined, undefined, AbortSignal.timeout(400));
+    await assert.rejects(write);
+    assert.equal(executed.post_comment, 1, "a write the server does not call idempotent is not sent again");
+  } finally {
+    Object.assign(idempotentCallPolicy, saved);
+    for (const res of held) res.destroy();
     await mcp.closeAll();
     server.closeAllConnections();
     await new Promise<void>((r) => server.close(() => r()));

@@ -60,8 +60,39 @@ export { confirmationRef };
 
 const logger = pino({ name: "assistant-review-tools" });
 
+/**
+ * Which message a review_start answers, as the messages table keys it (`claw_assistant_messages`, primary key session and message id):
+ * a message id alone (`claw-<ms>`) is unique only within its session.
+ */
+export function requestKey(claims: Pick<AssistantTokenClaims, "sid" | "mid">): string {
+  return `${claims.sid}/${claims.mid}`;
+}
+
+/**
+ * The user's own reviews of every one of `prs` that a turn answering message `messageKey` (`requestKey`) started (`request_message`), or null when any
+ * is missing. One transaction starts all of a call's reviews, so it is all or none.
+ */
+export async function startedFor(userId: string, messageKey: string, prs: readonly PrRef[]): Promise<Array<{ item_id: string; seq: number; pr: string }> | null> {
+  const rows = (await db.query(
+    `SELECT item_id, seq, params->'pr'->>'owner' AS owner, params->'pr'->>'repo' AS repo, params->'pr'->>'number' AS number
+       FROM claw_work_items
+      WHERE user_id = $1 AND kind = 'review' AND params->>'request_message' = $2
+      ORDER BY created_at DESC`,
+    [userId, messageKey],
+  )).rows as Array<{ item_id: string; seq: number; owner: string; repo: string; number: string }>;
+  const out: Array<{ item_id: string; seq: number; pr: string }> = [];
+  for (const pr of prs) {
+    const hit = rows.find((r) => r.owner.toLowerCase() === pr.owner.toLowerCase() && r.repo.toLowerCase() === pr.repo.toLowerCase()
+      && r.number === String(pr.number));
+    if (!hit) return null;
+    out.push({ item_id: hit.item_id, seq: Number(hit.seq), pr: `${pr.owner}/${pr.repo}#${pr.number}` });
+  }
+  return out;
+}
+
 /** The ways out of this module, so a test can stand in for what lies beyond the HTTP boundary of each. */
 export const reviewToolPorts = {
+  startedFor,
   startReviews,
   restartReview,
   /** The decision route's own function (`decideConfirmation`), with the process's review service, not a copy of it. */
@@ -598,6 +629,15 @@ export async function reviewStart(
     if (grounded && err instanceof ToolRefused && ASKS_WHICH_REVIEWER.has(err.code)) await refuseMerged(grounded, claims.sid, prs);
     throw err;
   });
+  // Sent again (Brain resends a call whose answer was lost, `idempotentHint`): what the first call started is the answer, even when it
+  // has already finished or merged, which the one-open-review-per-pull-request rule alone would not catch.
+  if (ready.actingAs === ready.userId) {
+    const started = await reviewToolPorts.startedFor(ready.userId, requestKey(claims), prs);
+    if (started) {
+      logger.info({ items: started.map((i) => i.item_id) }, "assistant.review_start_repeated");
+      return { ok: true, items: started, repeated: "these reviews were already started for this message (by an earlier call whose answer was lost): nothing new was started" };
+    }
+  }
   await refuseMerged(ready.userId, claims.sid, prs);
   // A review asked of someone else runs on their own credentials, which only the channel that carried the message can bring. When it
   // said it can be handed one, it is: the channel starts it as the reviewer and tells the person how it went. Otherwise it is refused
@@ -618,6 +658,7 @@ export async function reviewStart(
       review_only: !args.merge,
     }),
     mergeNeedsConfirmation: true,
+    requestMessageId: requestKey(claims),
   }, stillActing(claims, ready.userId))));
   return { ok: true, items };
 }

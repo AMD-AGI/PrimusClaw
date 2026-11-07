@@ -100,6 +100,13 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A sandbox torn down by one brain replica while another was walking the handle records no longer stops every replica
+  from starting sandboxes. The walk read the deleted record's DEL marker as an unreadable record, marked the fleet count
+  incomplete, and admission refused new sandboxes ("the fleet count it would be checked against is incomplete") until a later
+  sweep read clean, failing the user's task; replicas that start together sweep in phase, so after a rollout this happened
+  often. A deleted record is now an absent one. And a fleet count that is briefly unreadable is waited out
+  (`SANDBOX_ADMISSION_STALE_WAIT_MS`, default one keepalive interval plus 15s) before a new sandbox is refused; a refusal after
+  the wait, and a fleet genuinely at its ceiling, say in plain words what happened and that a retry later will work.
 - A user with no development environment session can connect from the assistant: `devenv_list` gives each agent on an online machine
   its own `attach_command` (`/agent attach MACHINE/AGENT`, which attaches its open session or starts one in its first folder), the
   attach button accepts it, and with no session anywhere and one such agent `attach_default` is that agent (`new_session: true`).
@@ -809,6 +816,14 @@ record it.
   stream again at once, without the reconnect backoff and without waiting for the end of the response a gateway may hold (up to the
   75 s watchdog before); `disconnects.jsonl` records it as `server_closed` / `restart`. A second such frame within 5 s takes the
   usual backoff, so a release never becomes a burst of reconnects.
+- `@primusclaw/connector` 0.1.6: `claw-connector doctor` checks the machine first (Node version, the agents' programs on the PATH the
+  service sees, whether Claude and Codex are signed in, writable roots, proxy variables, a Claw certificate Node does not trust, the
+  keep-alive) with one fix per problem, then opens a session on each agent's adapter; a running connector re-checks every 15 minutes
+  and reports the result with each agent's health, which the chat shows; `service install` also carries `NODE_USE_SYSTEM_CA` and
+  `NODE_USE_ENV_PROXY` (#416). After a restart (a crash, a kill, a pod or supervisor restart, an upgrade) a connector carries on
+  a turn that was waiting for a tool approval and shows its card again (an agent that always asks, not paused, offline for less than
+  the card's lifetime), ends any other running turn with `connector_restarted`, keeps the prompts that were queued, and says
+  `session_recovered` for a session used in the last 4 h (#419).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
