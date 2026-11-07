@@ -46,7 +46,17 @@ export interface Resumable {
   /** Last activity, seconds since the epoch. */
   updated_at: number;
   state: ResumableState;
+  /**
+   * For a conversation a terminal holds open (`live`), what it is doing there, as Claude Code itself says it
+   * (`claude agents --json` / its session registry): `working` on a turn, `waiting` for the person at that terminal, or
+   * `idle`. Absent when it does not say.
+   */
+  activity?: LiveActivity;
+  /** With `waiting`: what it waits for, in Claude Code's words ("input needed"), short and scrubbed. */
+  waiting_for?: string;
 }
+
+export type LiveActivity = "working" | "waiting" | "idle";
 
 interface Listed {
   ref: string;
@@ -61,6 +71,10 @@ export interface LiveEntry {
   pid: number;
   sessionId: string;
   status: string | null;
+  /** What a `waiting` session waits for, as Claude Code says it. */
+  waitingFor?: string | null;
+  /** The directory the process registered (the registry only). */
+  cwd?: string | null;
   /** Registered by a process this machine cannot see (another host or container sharing the directory): not provably gone. */
   foreign: boolean;
   /** Read from the rows the terminal hooks keep, not from Claude Code's own registry. */
@@ -84,6 +98,9 @@ export { localPidDomain };
 export const MAX_REPORTED = 12;
 const MAX_LIST_PAGES = 8;
 const MAX_TITLE = 80;
+const MAX_WAITING_FOR = 60;
+/** A conversation the list does not know yet is listed again at most this often (it starts an adapter). */
+const UNKNOWN_RELIST_MS = 20_000;
 const MAX_SCANNED_PROJECT_DIRS = 2000;
 /** A registry file that does not parse is ignored once it is this old; a younger one may be mid-write. */
 const UNREADABLE_GRACE_MS = 60_000;
@@ -232,10 +249,72 @@ export class AttachSupport {
     } else if (this.now() - this.listedAt > this.d.catalogMs) void this.refreshCatalog();
     const live = await within(this.liveEntries().catch(() => null), capMs, null);
     const attached = this.d.attachedRefs();
-    return this.listed.slice(0, MAX_REPORTED).map((l) => ({
-      ref: l.ref, title: l.title, cwd: l.cwd, updated_at: Math.floor(l.updatedAt / 1000),
-      state: attached.has(l.ref) ? "attached" : live === null ? "unknown" : live.some((e) => e.sessionId.toLowerCase() === l.ref) ? "live" : "idle",
-    }));
+    return this.listed.slice(0, MAX_REPORTED).map((l) => {
+      const holders = live?.filter((e) => e.sessionId.toLowerCase() === l.ref) ?? [];
+      const state: ResumableState = attached.has(l.ref) ? "attached" : live === null ? "unknown" : holders.length ? "live" : "idle";
+      const out: Resumable = { ref: l.ref, title: l.title, cwd: l.cwd, updated_at: Math.floor(l.updatedAt / 1000), state };
+      if (state === "live") Object.assign(out, liveActivity(holders));
+      return out;
+    });
+  }
+
+  // --- noticing a change without starting anything ----------------------------------------
+
+  private lastPrint: string | null = null;
+  private lastUnknownList = 0;
+
+  /**
+   * A cheap look, with no process started: the names and modification times of Claude Code's session registry files (one
+   * is written when a terminal opens a conversation, rewritten when it starts or finishes a turn or starts waiting, and
+   * removed when it exits) and of its projects directory (a new working directory). True when something changed since
+   * the previous look, so that the caller reports at once rather than at the next heartbeat. A live conversation inside
+   * the roots whose transcript exists but which the list does not have yet (a terminal just opened it) is listed again
+   * first, at most every {@link UNKNOWN_RELIST_MS}. The first look only learns what is there.
+   */
+  async poll(): Promise<boolean> {
+    const print = this.fingerprint();
+    if (print === this.lastPrint) return false;
+    const first = this.lastPrint === null;
+    this.lastPrint = print;
+    let rows: LiveEntry[] | null;
+    try { rows = readRegistry(this.configDir, this.localDomain, this.now()); } catch { rows = null; }
+    if (!first && rows && this.now() - this.lastUnknownList >= UNKNOWN_RELIST_MS && this.unlistedLive(rows)) {
+      this.lastUnknownList = this.now();
+      await within(this.refreshCatalog().then(() => true), 60_000, false);
+    }
+    // Only a change in what the phone is shown is worth a report: a file rewritten with the same status is not.
+    const summary = rows === null ? "unreadable" : this.listed.slice(0, MAX_REPORTED).map((l) => {
+      const holders = rows!.filter((e) => e.sessionId.toLowerCase() === l.ref);
+      return `${l.ref}:${holders.length ? (liveActivity(holders).activity ?? "live") : "-"}:${liveActivity(holders).waiting_for ?? ""}`;
+    }).join(",");
+    const changed = summary !== this.lastSummary;
+    this.lastSummary = summary;
+    return !first && changed;
+  }
+
+  private lastSummary = "";
+
+  private fingerprint(): string {
+    const parts: string[] = [];
+    const dir = path.join(this.configDir, "sessions");
+    try {
+      for (const name of fs.readdirSync(dir).sort()) {
+        if (!name.endsWith(".json")) continue;
+        try { parts.push(`${name}:${fs.statSync(path.join(dir, name)).mtimeMs}`); } catch { /* removed meanwhile */ }
+      }
+    } catch { parts.push("no-sessions"); }
+    try { parts.push(`projects:${fs.statSync(path.join(this.configDir, "projects")).mtimeMs}`); } catch { parts.push("no-projects"); }
+    return parts.join("|");
+  }
+
+  /** Whether a process holds open a conversation in the roots, with a transcript on disk, that the last list did not have. */
+  private unlistedLive(rows: LiveEntry[]): boolean {
+    return rows.some((e) => {
+      const ref = e.sessionId.toLowerCase();
+      if (e.foreign || !SESSION_REF_RE.test(ref) || !e.cwd || this.listed.some((l) => l.ref === ref)) return false;
+      if (!checkCwd(e.cwd, this.agent.roots).ok) return false;
+      return fs.existsSync(path.join(this.configDir, "projects", e.cwd.replace(/[^A-Za-z0-9]/g, "-"), `${ref}.jsonl`));
+    });
   }
 
   // --- the twin check ----------------------------------------------------------------
@@ -393,7 +472,8 @@ export function parseAgentsJson(text: string): LiveEntry[] {
   const out: LiveEntry[] = [];
   for (const x of raw) {
     if (isObject(x) && typeof x.pid === "number" && Number.isInteger(x.pid) && typeof x.sessionId === "string") {
-      out.push({ pid: x.pid, sessionId: x.sessionId, status: typeof x.status === "string" ? x.status : null, foreign: false });
+      out.push({ pid: x.pid, sessionId: x.sessionId, status: typeof x.status === "string" ? x.status : null, foreign: false,
+        waitingFor: typeof x.waitingFor === "string" ? x.waitingFor : null, cwd: typeof x.cwd === "string" ? x.cwd : null });
     }
   }
   return out;
@@ -433,7 +513,8 @@ export function readRegistry(configDir: string, localDomain: string | null, now 
       if (!isAlive(doc.pid)) continue;
       if (process.platform === "linux" && typeof doc.procStart === "string" && processStart(doc.pid) !== doc.procStart) continue;
     }
-    out.push({ pid: doc.pid, sessionId: doc.sessionId, status: typeof doc.status === "string" ? doc.status : null, foreign });
+    out.push({ pid: doc.pid, sessionId: doc.sessionId, status: typeof doc.status === "string" ? doc.status : null, foreign,
+      waitingFor: typeof doc.waitingFor === "string" ? doc.waitingFor : null, cwd: typeof doc.cwd === "string" ? doc.cwd : null });
   }
   return out;
 }
@@ -449,6 +530,21 @@ export function processGroup(pid: number): number | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * What the processes holding a conversation open say it is doing: waiting for the person wins over working, which wins
+ * over idle (two holders: the one that needs someone is the one to show). Nothing when none of them says.
+ */
+export function liveActivity(holders: LiveEntry[]): { activity?: LiveActivity; waiting_for?: string } {
+  const waiting = holders.find((e) => e.status === "waiting");
+  if (waiting) {
+    const why = waiting.waitingFor ? cleanTitle(waiting.waitingFor).slice(0, MAX_WAITING_FOR) : "";
+    return why ? { activity: "waiting", waiting_for: why } : { activity: "waiting" };
+  }
+  if (holders.some((e) => e.status === "busy")) return { activity: "working" };
+  if (holders.some((e) => e.status === "idle")) return { activity: "idle" };
+  return {};
 }
 
 /** A title that is safe to send: no credential shapes, no control characters, one line, short. */

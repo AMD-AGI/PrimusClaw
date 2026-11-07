@@ -131,7 +131,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       return reply(id, { protocolVersion: 1, agentInfo: { name: "fake" }, authMethods: [], agentCapabilities: { loadSession: true, sessionCapabilities: env.FAKE_NO_RESUME === "1" ? { close: {} } : { resume: {}, close: {}, list: {} } } });
     case "session/list": {
       // The shape of a real adapter's answer: {sessionId, cwd, title, updatedAt}, newest first, paged by an opaque cursor.
-      const all = JSON.parse(env.FAKE_SESSIONS || "[]");
+      // FAKE_SESSIONS_FILE: the list as it is on disk now (a test adds a conversation between two lists).
+      const all = JSON.parse(env.FAKE_SESSIONS_FILE ? fs.readFileSync(env.FAKE_SESSIONS_FILE, "utf8") : env.FAKE_SESSIONS || "[]");
       const size = Number(env.FAKE_PAGE_SIZE || 100);
       const from = params?.cursor ? Number(String(params.cursor).replace("offset:", "")) : 0;
       return reply(id, { sessions: all.slice(from, from + size), ...(from + size < all.length ? { nextCursor: `offset:${from + size}` } : {}) });

@@ -240,8 +240,43 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
     });
   });
 
+  if (Array.isArray(rawAgents)) agents.push(...existingSessionAgents(rawAgents, agents, problems));
+
   if (problems.length) throw new ConfigError(problems);
   return { server, identityUrl, name, allowUnsafeModes, dropMessagePatterns, agents };
+}
+
+/** What a derived agent's id ends in: `<id of the claude agent>-sessions`. */
+export const EXISTING_SESSIONS_SUFFIX = "-sessions";
+
+/**
+ * The conversations already on this machine show up on the phone without anyone configuring it: every agent made from the
+ * `claude` preset brings an agent that lists the Claude Code conversations in its roots and takes over the ones nothing
+ * holds open, exactly as a `claude-attach` agent with the same roots, adapter, approval and environment would. Not when the
+ * file already has a `claude-attach` agent reading the same Claude config directory (it already does this), and not with
+ * `existing_sessions = false` on the claude agent.
+ */
+function existingSessionAgents(rawAgents: unknown[], agents: AgentConfig[], problems: string[]): AgentConfig[] {
+  const out: AgentConfig[] = [];
+  const configDir = (a: AgentConfig) => a.env.CLAUDE_CONFIG_DIR ?? "";
+  const ids = new Set(agents.map((a) => a.id));
+  for (const raw of rawAgents) {
+    if (!isObject(raw) || typeof raw.id !== "string") continue;
+    const flag = raw.existing_sessions;
+    if (flag !== undefined && typeof flag !== "boolean") { problems.push(`agent ${raw.id}: existing_sessions must be true or false`); continue; }
+    if (flag !== undefined && raw.preset !== "claude") { problems.push(`agent ${raw.id}: existing_sessions only applies to an agent made from the claude preset`); continue; }
+    if (raw.preset !== "claude" || flag === false) continue;
+    const src = agents.find((a) => a.id === raw.id);
+    if (!src) continue;
+    if ([...agents, ...out].some((a) => a.attach && configDir(a) === configDir(src))) continue;
+    const id = `${src.id.slice(0, 64 - EXISTING_SESSIONS_SUFFIX.length)}${EXISTING_SESSIONS_SUFFIX}`;
+    if (ids.has(id)) continue;   // (an agent of the owner's has that id: theirs wins, and nothing is derived)
+    ids.add(id);
+    const name = src.name === PRESETS.claude!.name ? PRESETS["claude-attach"]!.name : `${src.name} (existing sessions)`.slice(0, 128);
+    out.push({ ...src, id, kind: PRESETS["claude-attach"]!.kind, name, args: [...src.args], roots: [...src.roots], env: { ...src.env },
+      safeModes: [...src.safeModes], askingModes: [...src.askingModes], autoAllow: [...src.autoAllow], attach: { cli: "claude" } });
+  }
+  return out;
 }
 
 function parseAutoAllow(raw: unknown, at: string, problems: string[]): AutoAllowRule[] {

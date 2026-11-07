@@ -317,7 +317,7 @@ describe("no per-step approval, by the owner's opt-in", () => {
 
   test("a mode the owner listed as selectable but the preset does not know to ask still says unattended", async () => {
     // Listing a mode lets a phone select it (here the file allows unsafe modes, so a preset's list may be extended); it does not make it asking.
-    const h = await make({ preset: "claude", topToml: "allow_unsafe_modes = true\n", safeModes: ["default", "plan", "acceptEdits"] });
+    const h = await make({ preset: "claude", topToml: "allow_unsafe_modes = true\n", safeModes: ["default", "plan", "acceptEdits"], agentToml: "existing_sessions = false\n" });
     const sid = await h.newSession();
     const started = h.claw.eventsOf(sid, "session_started")[0]!;
     assert.deepEqual(started.data.modes.map((m: any) => [m.id, m.unattended]), [["default", false], ["plan", false], ["acceptEdits", true], ["bypassPermissions", true]]);

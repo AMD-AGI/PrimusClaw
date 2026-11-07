@@ -165,7 +165,7 @@ describe("status and run say it", () => {
   const setup = (approval = "") => {
     const l = layout();
     const home = path.join(l.base, "cc-home");
-    write(path.join(home, "config", "agents.toml"), `[[agents]]\nid = "claude"\npreset = "claude"\nroots = [${JSON.stringify(l.work)}]\n${approval}`);
+    write(path.join(home, "config", "agents.toml"), `[[agents]]\nid = "claude"\npreset = "claude"\nexisting_sessions = false\nroots = [${JSON.stringify(l.work)}]\n${approval}`);
     write(l.user, BYPASS);
     const out: string[] = [];
     const err: string[] = [];

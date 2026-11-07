@@ -258,6 +258,17 @@ reference, title, directory, last activity, and whether anything holds it open),
 chat client can offer a choice; `session.new` then names the chosen one (`resume_ref`). Claw and the chat client know no
 product: the agent's `kind` is the label `attach`.
 
+**You do not have to add this agent.** Every agent made from the `claude` preset brings one with the same roots, adapter,
+approval and environment, named `<id>-sessions`, so the conversations already on the machine show up on the phone by
+themselves. `existing_sessions = false` on the `claude` agent turns that off; an explicit `claude-attach` agent reading the same
+Claude config directory replaces it.
+
+Each entry also says, for a conversation a terminal holds open, what Claude Code says that terminal is doing (`activity`:
+`working`, `waiting` for the person at it, or `idle`; with `waiting`, `waiting_for` in its words, such as "input needed"). The
+connector looks at Claude Code's session registry and projects directory every 10 seconds (file names and times only; nothing
+is started) and reports a change at once instead of at the next heartbeat, so a conversation a terminal has just opened, or one
+that starts waiting, reaches the phone within seconds.
+
 ```toml
 [[agents]]
 id = "claude-attach"
