@@ -1267,6 +1267,9 @@ describe("Cursor extension requests are never left unanswered", () => {
     const sid = await h.newSession();
     h.prompt(sid, "todos");
     await h.turnEnd(sid);
+    // The adapter's notification and its answer to the prompt are dispatched separately: the event may reach Claw just after
+    // the turn's end (CI run 42366684698 saw it absent at the turn's end).
+    await h.claw.until("the todo event", () => h.claw.eventsOf(sid, "cursor.update_todos").length > 0);
     assert.equal(h.claw.eventsOf(sid, "cursor.update_todos").length, 1);
   });
 });
