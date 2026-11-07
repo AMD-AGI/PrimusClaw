@@ -163,7 +163,7 @@ describe("claw-connector commands", () => {
       const all = loadWritten(home);
       // Claude brings the agent that lists the conversations already on the machine, with Claude's own approval setting.
       assert.deepEqual(all.map((x) => x.id), ["claude", "claude-sessions"], "only Claude is on in the sample (and its existing conversations)");
-      assert.deepEqual([all[1]!.kind, all[1]!.unattended, all[1]!.attach], ["attach", all[0]!.unattended, { cli: "claude" }]);
+      assert.deepEqual([all[1]!.kind, all[1]!.unattended, all[1]!.attach], ["attach", all[0]!.unattended, { cli: "claude", tmux: "tmux" }]);
       const written = all.filter((x) => x.id !== "claude-sessions");
       assert.deepEqual(written.filter((x) => x.unattended).map((x) => x.id), unattended);
       assert.deepEqual(/no per-step approval for: ([a-z, ]+)\./.exec(a.text())?.[1]?.split(", ") ?? [], unattended);

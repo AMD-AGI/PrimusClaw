@@ -35,6 +35,7 @@ import { REMOTE_AGENT_LIMITS } from "./protocol.js";
 import { redactText } from "./redact.js";
 import { checkCwd, resolveCwd } from "./roots.js";
 import { within } from "./statefile.js";
+import { findPane, type PaneLookup } from "./terminal-input.js";
 import { SESSION_ID_RE, localPidDomain, readTerminals, readTerminalsAsync, terminalsDir } from "./terminals.js";
 import { errMessage, isObject, type Logger } from "./util.js";
 
@@ -57,6 +58,11 @@ export interface Resumable {
   activity?: LiveActivity;
   /** With `waiting`: what it waits for, in Claude Code's words ("input needed"), short and scrubbed. */
   waiting_for?: string;
+  /**
+   * For a `live` one: `terminal` when the terminal that has it open is a tmux pane of this user's, so a message sent to it is
+   * typed there (terminal-input.ts) instead of being refused. Absent: it can only be watched (or taken over).
+   */
+  input?: "terminal";
 }
 
 export type LiveActivity = "working" | "waiting" | "idle";
@@ -293,7 +299,10 @@ export class AttachSupport {
       const holders = live?.filter((e) => e.sessionId.toLowerCase() === l.ref) ?? [];
       const state: ResumableState = attached.has(l.ref) ? "attached" : live === null ? "unknown" : holders.length ? "live" : "idle";
       const out: Resumable = { ref: l.ref, title: l.title, cwd: l.cwd, updated_at: Math.floor(l.updatedAt / 1000), state };
-      if (state === "live") Object.assign(out, liveActivity(holders));
+      if (state === "live") {
+        Object.assign(out, liveActivity(holders));
+        if (this.typesIntoTerminals() && holders.length > 0 && holders.every((e) => !e.foreign) && holders.some((e) => paneHint(e.pid))) out.input = "terminal";
+      }
       return out;
     });
   }
@@ -589,6 +598,50 @@ export class AttachSupport {
     }
   }
 
+  /** Whether this agent types a message into a conversation open in a tmux pane (`terminal_input`, on by default). */
+  typesIntoTerminals(): boolean {
+    return this.agent.attach !== null && this.agent.attach.tmux !== null;
+  }
+
+  /**
+   * The tmux pane of the one local process of this user's, working inside the roots, that holds `ref` open: the terminal a
+   * message to it is typed into. Not when more than one process holds it (which one would get it?), when one of them is on
+   * another machine, or when it is not a tmux pane that this user's tmux server proves runs it (terminal-input.ts `findPane`).
+   */
+  async terminalPane(ref: string): Promise<PaneLookup> {
+    if (!this.typesIntoTerminals()) return { ok: false, why: "typing into a terminal is turned off for this agent (terminal_input = false)" };
+    if (!SESSION_REF_RE.test(ref)) return { ok: false, why: "not a session id" };
+    const want = ref.toLowerCase();
+    let live: LiveEntry[];
+    try { live = await this.liveEntries(); } catch (e) { return { ok: false, why: errMessage(e) }; }
+    const holders = live.filter((e) => e.sessionId.toLowerCase() === want);
+    if (holders.some((e) => e.foreign)) return { ok: false, why: "it is open on another machine that shares this Claude directory" };
+    const pids = [...new Set(holders.map((e) => e.pid))];
+    if (pids.length !== 1) return { ok: false, why: pids.length ? `${pids.length} processes have it open` : "no process has it open" };
+    const pid = pids[0]!;
+    if (!(await this.provenLocalHolders(want)).has(pid)) return { ok: false, why: `cannot tell that process ${pid} on this machine is the one holding it` };
+    const owner = processUid(pid);
+    if (owner === null || (typeof process.getuid === "function" && owner !== process.getuid())) return { ok: false, why: `process ${pid} belongs to another user` };
+    return findPane(pid, this.agent.attach?.tmux ?? "tmux");
+  }
+
+  /**
+   * What Claude Code's own registry says process `pid` is doing with `ref` (`idle`, `busy`, `waiting`); `other` when its row now
+   * names another conversation (`/resume`, `/clear` in that terminal) or the pid is another process than the one proven
+   * (`procStart`); null when the row cannot be read or does not say.
+   */
+  holderStatus(pid: number, ref: string, procStart: string | null): string | null {
+    if (procStart !== null && processStart(pid) !== procStart) return "other";
+    try {
+      const doc: unknown = JSON.parse(fs.readFileSync(path.join(this.configDir, "sessions", `${pid}.json`), "utf8"));
+      if (!isObject(doc) || doc.pid !== pid) return null;
+      if (typeof doc.sessionId !== "string" || doc.sessionId.toLowerCase() !== ref.toLowerCase()) return "other";
+      return typeof doc.status === "string" ? doc.status : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** The size of the conversation's transcript now, or null when there is none to look at. */
   transcriptSize(ref: string): number | null {
     const file = SESSION_REF_RE.test(ref) ? this.transcriptFile(ref.toLowerCase()) : null;
@@ -654,6 +707,17 @@ function isZombie(pid: number): boolean {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
     return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a process was started inside tmux (its environment names a server and a pane); a hint for the list, proven only when used. */
+function paneHint(pid: number): boolean {
+  if (process.platform !== "linux") return false;
+  try {
+    const env = fs.readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
+    return env.some((kv) => kv.startsWith("TMUX=/")) && env.some((kv) => /^TMUX_PANE=%\d+$/.test(kv));
   } catch {
     return false;
   }
@@ -818,7 +882,7 @@ export function fitResumable(base: Record<string, unknown>, items: Resumable[], 
     if (n === 0) {
       // Not even an empty list fits. `watch_live` goes too when the rest fits without it: it only matters with a list, and
       // the heartbeat must stay as valid as it was before the flag existed.
-      const { watch_live: _watch, ...rest } = base;
+      const { watch_live: _watch, terminal_input: _typed, ...rest } = base;
       return size(base) > limit && size(rest) < size(base) ? rest : base;
     }
     n--;
@@ -829,7 +893,8 @@ export function fitResumable(base: Record<string, unknown>, items: Resumable[], 
 
 /** One thing the transcript says happened, shaped as the ACP `session/update` an adapter would have sent for it. */
 export interface TranscriptUpdate {
-  type: "user_message_chunk" | "agent_message_chunk" | "tool_call" | "tool_call_update";
+  /** `turn_done`: the terminal finished a turn (Claude Code's `turn_duration` line); never sent on, it ends a typed prompt's turn. */
+  type: "user_message_chunk" | "agent_message_chunk" | "tool_call" | "tool_call_update" | "turn_done";
   update: Record<string, unknown>;
 }
 
@@ -844,6 +909,7 @@ export function transcriptUpdates(line: string): TranscriptUpdate[] {
   let doc: unknown;
   try { doc = JSON.parse(line); } catch { return []; }
   if (!isObject(doc) || doc.isSidechain === true || doc.isMeta === true) return [];
+  if (doc.type === "system" && doc.subtype === "turn_duration") return [{ type: "turn_done", update: {} }];
   if (doc.type !== "user" && doc.type !== "assistant") return [];
   const msg = isObject(doc.message) ? doc.message : null;
   if (!msg) return [];

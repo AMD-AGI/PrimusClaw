@@ -14,6 +14,8 @@ export interface SessionRecord {
   mode: string | null;
   /** A conversation open in a terminal, watched without taking it over (session.ts `spectate`). */
   read_only?: boolean;
+  /** ... whose terminal is a tmux pane: what is sent to it is typed there (session.ts `enqueueTerminal`). */
+  terminal_input?: boolean;
   created_at: string;
   /** When a prompt last reached the session's agent (absent on records written before this was kept). */
   used_at?: string;

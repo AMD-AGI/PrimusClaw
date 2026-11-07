@@ -321,6 +321,11 @@ jobs:
       - run: npm run typecheck
         working-directory: connector
 
+      # test/terminal-input.test.ts types into a real tmux pane (a server of
+      # its own, on its own socket); in CI a missing tmux fails it, not skips it.
+      - name: tmux for the terminal-input tests
+        run: command -v tmux >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q tmux; }
+
       # Real child processes and sockets: a stand-in Claw and a stand-in ACP
       # adapter, no database and no network beyond the loopback. TMPDIR is a
       # directory of this step's own, so the check after the run sees only what

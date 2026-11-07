@@ -73,6 +73,9 @@ const HINTS: Record<string, string> = {
   too_many_queued_prompts: "five messages are already waiting for this session: wait for the agent to finish one",
   text_required: "the message was empty",
   session_closed: "the session has already ended: start a new one",
+  terminal_mode_not_allowed: `the conversation's terminal is in a permission mode this agent's approval setting does not allow from the phone (terminal_mode names it): switch the terminal to a mode that asks (shift+tab in Claude Code, for example manual or plan mode), or set approval = "never" for this agent in agents.toml on that machine, then send again`,
+  terminal_mode_unknown: "the connector could not read which permission mode the conversation's terminal is in, so nothing was typed: make sure Claude Code there is up to date and shows its mode below the input box, then send again",
+  terminal_command_refused: "a message that starts with ! or / would run a shell command or a slash command in that terminal, so it is not typed from the phone: rephrase it, or run the command at the terminal",
 };
 
 /** What to do about `reason`, for the agent it is about (a sign-in hint names that agent's own command); null when there is nothing to do. */

@@ -50,9 +50,11 @@ export interface AgentConfig {
   autoAllow: AutoAllowRule[];
   /**
    * Set for an agent that takes over sessions that already exist on this machine instead of starting new ones.
-   * `cli` is the command that lists the processes holding a session open (see attach.ts).
+   * `cli` is the command that lists the processes holding a session open (see attach.ts). `tmux` is the tmux command a
+   * message to a conversation open in a tmux pane is typed with (terminal-input.ts); null when the owner turned that off
+   * (`terminal_input = false`), and then such a conversation can only be watched. Absent means `tmux`.
    */
-  attach: { cli: string } | null;
+  attach: { cli: string; tmux?: string | null } | null;
 }
 
 export interface ConnectorConfig {
@@ -161,6 +163,8 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
   }
 
   const globalAllow = parseAutoAllow(doc.auto_allow, "auto_allow", problems);
+  // A plain claude agent's own `terminal_input` / `tmux_cli`, for the agent derived from it (existingSessionAgents).
+  const derivedTyping = new Map<string, string | null>();
   const agents: AgentConfig[] = [];
   const seen = new Set<string>();
   const rawAgents = doc.agents === undefined ? [] : doc.agents;
@@ -231,12 +235,27 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
     }
     const own = parseAutoAllow(raw.auto_allow, `${label}.auto_allow`, problems);
     let attach: AgentConfig["attach"] = null;
+    // Typing into a conversation open in a tmux pane: on unless `terminal_input = false`; the tmux command, or null when off.
+    const typingTmux = (): string | null => {
+      const typing = raw.terminal_input === undefined ? true : raw.terminal_input;
+      const tmux = raw.tmux_cli === undefined ? "tmux" : raw.tmux_cli;
+      if (typeof typing !== "boolean") problems.push(`${label}.terminal_input must be true or false`);
+      if (typeof tmux !== "string" || !tmux.trim()) problems.push(`${label}.tmux_cli must be a command name or path`);
+      return typing === false || typeof tmux !== "string" ? null : tmux.trim();
+    };
     if (preset?.attach) {
       const cli = raw.attach_cli === undefined ? "claude" : raw.attach_cli;
+      const tmux = typingTmux();
       if (typeof cli !== "string" || !cli.trim()) problems.push(`${label}.attach_cli must be a command name or path`);
-      else attach = { cli: cli.trim() };
-    } else if (raw.attach_cli !== undefined) {
-      problems.push(`${label}: attach_cli only applies to an agent made from the claude-attach preset`);
+      else attach = { cli: cli.trim(), tmux };
+    } else {
+      if (raw.attach_cli !== undefined) problems.push(`${label}: attach_cli only applies to an agent made from the claude-attach preset`);
+      // A claude agent's existing sessions are a claude-attach agent of its own (existingSessionAgents): these are that agent's.
+      if (presetName === "claude") derivedTyping.set(id, typingTmux());
+      else {
+        if (raw.terminal_input !== undefined) problems.push(`${label}: terminal_input only applies to an agent made from the claude or claude-attach preset`);
+        if (raw.tmux_cli !== undefined) problems.push(`${label}: tmux_cli only applies to an agent made from the claude or claude-attach preset`);
+      }
     }
     agents.push({
       id, kind, name: typeof raw.name === "string" && raw.name.trim() ? raw.name.trim().slice(0, 128) : (preset?.name ?? id),
@@ -247,7 +266,7 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
     });
   });
 
-  if (Array.isArray(rawAgents)) agents.push(...existingSessionAgents(rawAgents, agents, problems));
+  if (Array.isArray(rawAgents)) agents.push(...existingSessionAgents(rawAgents, agents, problems, derivedTyping));
 
   if (problems.length) throw new ConfigError(problems);
   return { server, identityUrl, name, allowUnsafeModes, dropMessagePatterns, agents };
@@ -261,9 +280,10 @@ export const EXISTING_SESSIONS_SUFFIX = "-sessions";
  * `claude` preset brings an agent that lists the Claude Code conversations in its roots and takes over the ones nothing
  * holds open, exactly as a `claude-attach` agent with the same roots, adapter, approval and environment would. Not when the
  * file already has a `claude-attach` agent reading the same Claude config directory (it already does this), and not with
- * `existing_sessions = false` on the claude agent.
+ * `existing_sessions = false` on the claude agent. Its `terminal_input` and `tmux_cli` are the claude agent's own: with
+ * `terminal_input = false` there a conversation open in a terminal is only watched.
  */
-function existingSessionAgents(rawAgents: unknown[], agents: AgentConfig[], problems: string[]): AgentConfig[] {
+function existingSessionAgents(rawAgents: unknown[], agents: AgentConfig[], problems: string[], typing: Map<string, string | null>): AgentConfig[] {
   const out: AgentConfig[] = [];
   // The directory each agent will actually read, as AttachSupport resolves it: its own setting, else the connector's, else ~/.claude.
   const configDir = (a: AgentConfig) => path.resolve(expandHome(a.env.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude")));
@@ -282,7 +302,7 @@ function existingSessionAgents(rawAgents: unknown[], agents: AgentConfig[], prob
     ids.add(id);
     const name = src.name === PRESETS.claude!.name ? PRESETS["claude-attach"]!.name : `${src.name} (existing sessions)`.slice(0, 128);
     out.push({ ...src, id, kind: PRESETS["claude-attach"]!.kind, name, args: [...src.args], roots: [...src.roots], env: { ...src.env },
-      safeModes: [...src.safeModes], askingModes: [...src.askingModes], autoAllow: [...src.autoAllow], attach: { cli: "claude" } });
+      safeModes: [...src.safeModes], askingModes: [...src.askingModes], autoAllow: [...src.autoAllow], attach: { cli: "claude", tmux: typing.has(src.id) ? typing.get(src.id)! : "tmux" } });
   }
   return out;
 }

@@ -309,6 +309,15 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal(got[2].remote.kind, "error");
     assert.match(got[2].text, /^laptop 上的 claude 出错了，#\d+ 没有做完：再跑一次\n（出错：adapter_unavailable）/);
 
+    // One the connector would not type into a terminal in an unsafe mode: said in words, with the terminal's mode.
+    await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
+    await sendByCard(await userTurn(alice, "从手机输入"), { text: "从手机输入" });
+    await events("alice", cid, sid, [["turn_end", { stopReason: "error", error: "terminal_mode_not_allowed", terminal_mode: "bypassPermissions" }]]);
+    got = await pushed(itemId);
+    assert.equal(got.length, 4, JSON.stringify(got.map((g) => g.text)));
+    assert.equal(got[3].remote.kind, "error");
+    assert.match(got[3].text, /从手机输入\n（没有输入：终端会话处于 bypassPermissions，按你的审批设置不能从手机直接输入；在终端切到安全模式/);
+
     // One the machine refuses, and a session that closes before it finished: errors, each once.
     await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
     await sendByCard(await userTurn(alice, "第三次"), { text: "第三次" });
@@ -317,9 +326,9 @@ describe("development environment items and devenv_send", { skip }, () => {
     await sendByCard(await userTurn(alice, "第四次"), { text: "第四次" });
     await events("alice", cid, sid, [["session_closed", { reason: "agent_exited" }]]);
     got = await pushed(itemId);
-    assert.deepEqual(got.map((g) => g.remote?.kind), ["needs_you", "done", "error", "error", "error"], JSON.stringify(got.map((g) => g.text)));
-    assert.match(got[3].text, /没有接下/);
-    assert.match(got[4].text, /会话已关闭/);
+    assert.deepEqual(got.map((g) => g.remote?.kind), ["needs_you", "done", "error", "error", "error", "error"], JSON.stringify(got.map((g) => g.text)));
+    assert.match(got[4].text, /没有接下/);
+    assert.match(got[5].text, /会话已关闭/);
     assert.ok(got.every((g) => g.remote.session_id === sid));
   });
 
@@ -412,6 +421,31 @@ describe("development environment items and devenv_send", { skip }, () => {
     const busy = await tools.devenvSend(await userTurn(alice, "让它也跑 lint"), { text: "跑 lint", target: sid }).catch((e) => e);
     assert.equal((busy as Recorded).code, "busy");
     assert.equal((await queued(cid)).filter((c: Recorded) => c.type === "prompt").length, 2);
+  });
+
+  test("F3b a conversation open in a terminal its connector types into takes the instruction: the card says it is typed there", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const ref = "c0ffee00-0000-4000-8000-0000000000b3";
+    const live = (input: Recorded) => [{ ...CLAUDE, capabilities: { ...CLAUDE.capabilities, watch_live: true, ...input,
+      resumable: [{ ref, title: "in the terminal", cwd: "/home/u/repo/api", updated_at: Math.floor(Date.now() / 1000), state: "live", activity: "idle", input: "terminal" }] } }];
+    // A connector that does not say it types into terminals: the conversation is the terminal's only, whatever the entry says.
+    const cid = await machine("alice", "laptop", { agents: live({}) });
+    await assert.rejects(tools.devenvSend(await userTurn(alice, "接着在终端那个会话里跑"), { text: "跑 lint", target: ref }),
+      (e: Recorded) => e.code === "busy" && /open in a terminal/.test(String(e.message)));
+    assert.deepEqual(await queued(cid), []);
+    // One that does: a card that says the instruction is typed into that terminal; pressed, the conversation is attached and sent to.
+    await store.recordHeartbeat(cid, "alice", { version: "0.1.3", cmdCursor: null, agents: live({ terminal_input: true }) as never });
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [cid]);
+    const shown = await tools.devenvSend(await userTurn(alice, "接着在终端那个会话里跑"), { text: "跑 lint", target: ref });
+    assert.equal(shown.why_card, "confirm_first", JSON.stringify(shown));
+    const card = (await w.q("SELECT payload FROM claw_notification_outbox WHERE payload ? 'confirm_write' ORDER BY id DESC LIMIT 1"))[0].payload;
+    assert.match(card.text, /会话：输入到它在那台机器终端里正开着的对话 laptop\/claude\/\d+（像在终端里打字一样，终端里也看得到）；目录：\/home\/u\/repo\/api\n/);
+    const decided = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(shown.confirmation_id), decision: "allow", via: "button" });
+    assert.equal(decided.status, "done", JSON.stringify(decided));
+    const cmds = await queued(cid);
+    assert.deepEqual(cmds.map((c: Recorded) => c.type), ["session.new", "prompt"]);
+    assert.deepEqual([cmds[0].payload.resume_ref, cmds[0].payload.takeover, cmds[1].payload.text], [ref, undefined, "跑 lint"], "attached, never taken over");
   });
 
   test("F3 after reading a machine's report, or from a key, only a card: sent when the person lets it through", async () => {
