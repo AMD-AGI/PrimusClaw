@@ -339,6 +339,7 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
     "assistant/tools.ts": "work_create makes sessions without acting_as; work_send into a review item's session is refused by queueServerMessage, which it gives no proof",
     "assistant/reports.ts": "wakes the user's router session, which never carries acting_as",
     "assistant/github-events.ts": "hands GitHub events to a task item's worker through queueServerMessage, which it gives no proof, so an acting session is refused; a review item cannot subscribe and its stored events are dropped before that",
+    "assistant/retry.ts": "queues the retry on a task item's worker session through queueServerMessage, which it gives no proof, so an acting session is refused; a review item is never retried",
     "assistant/observe.ts": "queues a place's message on the caller's own watcher session, made without acting_as; queueServerMessage, given no proof, refuses one that carries it",
     "assistant/review-items.ts": "queues a review session's first message with the proof that routes/assistant.ts's request passed checkSessionCreate (below)",
     "assistant/model-fallback.ts": "runs a refused turn again: a worker's or the router's through queueServerMessage, which refuses an acting session without the proof, and a review's first message through review-items.ts with proofForFirstMessageAgain (below)",
