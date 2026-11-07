@@ -161,3 +161,20 @@ test("a session event's data is carried whole, so a flag a connector adds to it 
   assert.deepEqual(parsed.value.events[0]!.data, data);
   assert.deepEqual(parsed.value.rejected, []);
 });
+
+test("connector versions order as semver, and a connector's status follows the minimum and the recommended version", async () => {
+  const { CONNECTOR_PACKAGE, CONNECTOR_VERSIONS, compareConnectorVersions, connectorVersionStatus } = await import("../src/remote-agents.js");
+  assert.equal(CONNECTOR_PACKAGE, "@primusclaw/connector");
+  const pairs: Array<[string, string, number | null]> = [
+    ["0.1.3", "0.1.4", -1], ["0.1.10", "0.1.9", 1], ["1.0.0", "0.99.99", 1], ["0.1.4", "v0.1.4", 0],
+    ["0.1.5-rc.1", "0.1.5", -1], ["0.1.5", "0.1.5-rc.1", 1], ["0.1.5-rc.1", "0.1.5-rc.2", -1], ["0.1.5-rc.2", "0.1.5-rc.10", -1], ["0.1.5-rc", "0.1.5-rc.1", -1],
+    ["0.1.5-1", "0.1.5-alpha", -1], ["0.1.5-beta", "0.1.5-alpha", 1], ["0.1.4+build", "0.1.4", 0],
+    ["0.1", "0.1.0", null], ["latest", "0.1.0", null], ["", "0.1.0", null],
+  ];
+  for (const [a, b, want] of pairs) assert.equal(compareConnectorVersions(a, b), want, `${a} vs ${b}`);
+  assert.ok(compareConnectorVersions(CONNECTOR_VERSIONS.minimum, CONNECTOR_VERSIONS.recommended)! <= 0, "the minimum is not above the recommended");
+  const policy = { minimum: "0.1.3", recommended: "0.1.4" };
+  const status = (v: string | null) => connectorVersionStatus(v, policy);
+  assert.deepEqual(["0.0.0-stage", "0.1.2", "0.1.3", "0.1.4-rc.1", "0.1.4", "0.2.0", null, "dev"].map(status),
+    ["unsupported", "unsupported", "outdated", "outdated", "current", "current", "unknown", "unknown"]);
+});

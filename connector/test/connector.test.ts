@@ -624,6 +624,31 @@ describe("transport: reconnect, duplicates, loss", () => {
     assert.equal(h.claw.eventsOf(sid, "turn_end").length, 0);
     assert.ok(h.audit().some((a) => a.kind === "event_rejected" && a.type === "turn_end"));
   });
+  test("a Claw release's `event: reconnect` opens the stream again at once, without a backoff or the end of the response", async () => {
+    // A backoff and a watchdog far longer than the wait below: only the frame can explain a reconnect inside it.
+    const h = await make({ timing: { backoffMinMs: 4_000, backoffMaxMs: 4_000, watchdogMs: 20_000 } });
+    await h.online();
+    const connects = h.claw.streamHeaders.length;
+    const t0 = Date.now();
+    h.claw.restart({ hold: true });
+    await h.claw.until("a new command stream", () => h.claw.streamHeaders.length > connects, 1_500);
+    assert.ok(Date.now() - t0 < 1_000, `reconnected in ${Date.now() - t0} ms`);
+    const down = fs.readFileSync(path.join(h.dirs.state, "disconnects.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(down.at(-1).reason, "server_closed");
+    assert.equal(down.at(-1).detail, "restart");
+  });
+  test("after a release's reconnect, a second `event: reconnect` within seconds waits the usual backoff", async () => {
+    const h = await make({ timing: { backoffMinMs: 2_000, backoffMaxMs: 2_000, watchdogMs: 20_000 } });
+    await h.online();
+    const first = h.claw.streamHeaders.length;
+    h.claw.restart();
+    await h.claw.until("the first reconnect", () => h.claw.streamHeaders.length > first && h.claw.online, 1_500);
+    const second = h.claw.streamHeaders.length;
+    const t0 = Date.now();
+    h.claw.restart();
+    await h.claw.until("the second reconnect", () => h.claw.streamHeaders.length > second, 5_000);
+    assert.ok(Date.now() - t0 >= 900, `a second restart in a row is not a burst: ${Date.now() - t0} ms`);
+  });
   test("a healthy stream is never dropped by the watchdog, however long it lives", async () => {
     const h = await make();
     await h.online();

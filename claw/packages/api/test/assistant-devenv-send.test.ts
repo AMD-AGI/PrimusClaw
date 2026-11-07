@@ -46,6 +46,9 @@
  *   F21 at the limit of open sessions a new one closes the longest unused idle session of the user's (never one working, waiting for
  *       an approval, or with a command not yet collected, unless silent for a day), tells its connector, and audits it; the route
  *       says which it closed; with none that may be closed, session_limit_reached says what to do
+ *   F22 an item closed by its stop button keeps nothing open once the stopped turn's end comes: no prompt listed, no turn counted,
+ *       whether the connector names the prompt or not, and whether the turn was cancelled or finished on its own; the next
+ *       instruction opens it afresh and its own end closes it
  *   N1  only three things are ever pushed of an instruction the assistant sent, each once, each saying which session and which kind:
  *       it needs the user (the permission request whole: its options and when it runs out, so a channel puts it to them as buttons;
  *       the same request sent again after a reconnect is not pushed again), it finished, it failed (a turn that ended in an error, an
@@ -457,6 +460,33 @@ describe("development environment items and devenv_send", { skip }, () => {
     const report = await w.routerTurn(alice);
     await assert.rejects(tools.devenvSend(report, { text: "rm -rf build" }), (e: Recorded) => e.code === "not_from_user");
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations"))[0].n, 3);
+  });
+
+  test("F4b no machine gives the exact commands that connect one; a connector below the minimum starts no session", async () => {
+    const alice = await w.user("alice");
+    const none = await tools.devenvSend(await userTurn(alice, "让开发机上的 claude 跑 make"), { text: "make" }).catch((e) => e);
+    assert.equal((none as Recorded).code, "no_machine");
+    const setup = (none as Recorded).data.connect_a_machine;
+    assert.equal(setup.commands[0], "npm install -g @primusclaw/connector");
+    assert.match(setup.commands[2], /^claw-connector login --server /);
+    assert.match(setup.text_zh, /claw-connector init/);
+    assert.match(setup.text_en, /claw-connector service install/);
+
+    const laptop = await machine("alice", "laptop");
+    const open = await chatSession("alice", laptop);   // (opened while its connector was still new enough)
+    await w.q("UPDATE claw_remote_connectors SET version = '0.1.2' WHERE connector_id = $1", [laptop]);
+    // A session already open on it continues: only a new one is refused.
+    const cont = await tools.planSend("alice", { text: "make", target: open });
+    assert.equal(cont.ok, true, JSON.stringify(cont));
+    await w.q("UPDATE claw_remote_sessions SET status = 'closed' WHERE session_id = $1", [open]);
+    const old = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make"), { text: "make", target: "laptop" }).catch((e) => e);
+    assert.equal((old as Recorded).code, "connector_outdated");
+    assert.match((old as Recorded).message, /0\.1\.2, older than 0\.1\.3.*npm install -g @primusclaw\/connector@latest && claw-connector stop && claw-connector service install$/);
+    // A card pressed after the connector went out of date sends nothing either.
+    const plan = { connector_id: laptop, machine: "laptop", agent_id: "claude", agent_name: null, session_id: null, resume_ref: null, cwd: "/home/u/repo", label: "laptop/claude/new" };
+    const sent = await tools.executeSend("alice", plan, "make", "k-outdated", "en");
+    assert.deepEqual([sent.ok, (sent as Recorded).error], [false, "connector_outdated"]);
+    assert.deepEqual(await queued(laptop), []);
   });
 
   test("F4 only the user's own machines; two that fit is a question; an offline one says so", async () => {
@@ -1027,6 +1057,33 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.deepEqual([again.status, again.body.error], [409, "session_limit_reached"]);
   });
 
+  test("F22 a stopped item clears what it still had open when the stopped turn's end comes, named or counted", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop");
+    const promptSeqs = async (sid: string): Promise<number[]> =>
+      (await w.q("SELECT cmd_seq FROM claw_remote_commands WHERE session_id = $1 AND type = 'prompt' ORDER BY cmd_seq", [sid])).map((r: Recorded) => Number(r.cmd_seq));
+    const endOf = (seq: number | null, stopReason = "end_turn"): [string, Recorded] => ["turn_end", { stopReason, cmd_id: seq === null ? null : `id-${seq}`, cmd_seq: seq }];
+    const open = async (sid: string) => { const it = await remoteItem(sid); return [it.board_state, it.outcome, it.params.open_turns, it.params.open_cmd_seqs]; };
+
+    for (const [named, stopReason] of [[true, "cancelled"], [true, "end_turn"], [false, "cancelled"]] as const) {
+      const out = await sendByCard(await userTurn(alice, `跑 make test ${stopReason}`), { text: `跑 make test ${stopReason}` });
+      const sid = String(out.session_id);
+      const [p1] = await promptSeqs(sid);
+      assert.equal((await post("alice", `/v1/work-items/${String(out.item_id)}/stop`, {})).status, 200);
+      // Closed by the button, before the machine has said anything: the running prompt is still on the books.
+      assert.deepEqual(await open(sid), ["done", "stopped", 1, [p1]]);
+      await events("alice", cid, sid, [chunk("half"), named ? endOf(p1, stopReason) : end(stopReason)]);
+      assert.deepEqual(await open(sid), ["done", "stopped", 0, named ? [] : null], `named=${named} ${stopReason}: nothing left open`);
+      // The next instruction opens it afresh, and its own end closes it.
+      assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "pwd" })).status, 202);
+      const p2 = (await promptSeqs(sid)).at(-1)!;
+      assert.deepEqual(await open(sid), ["in_progress", null, 1, [p2]]);
+      await events("alice", cid, sid, [chunk("/home/u/repo"), named ? endOf(p2) : end()]);
+      assert.deepEqual(await open(sid), ["done", "answered", 0, named ? [] : null]);
+    }
+  });
+
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {
     const section = prompts.renderRouterDevenvSection({ actions: true, send: true });
     assert.match(section, /devenv_send, called directly and first, never after devenv_list/);
@@ -1034,7 +1091,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v5");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v6");
     // What operators and release notes say Claw may run on a user's machine is what the code does: a card, never from the turn.
     const { readFileSync } = await import("node:fs");
     const doc = readFileSync(new URL("../../../docs/remote-agents.md", import.meta.url), "utf8");

@@ -88,6 +88,17 @@ export class FakeClaw {
     this.streams.clear();
   }
 
+  /**
+   * What a Claw replica does when it shuts down for a release: `event: reconnect` on every command stream, then the
+   * end of the response. `hold` keeps the response open after the frame, as a gateway that does not pass the end on.
+   */
+  restart(opts: { hold?: boolean } = {}): void {
+    for (const r of this.streams) {
+      try { r.write(`event: reconnect\ndata: ${JSON.stringify({ connector_id: this.connectorId })}\n\n`); if (!opts.hold) r.end(); } catch { /* gone */ }
+    }
+    if (!opts.hold) this.streams.clear();
+  }
+
   get online(): boolean { return this.streams.size > 0; }
 
   /** Whether the connector row a client registered last is revoked. */

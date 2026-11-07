@@ -75,6 +75,16 @@ export class GracefulShutdown {
   private state: "serving" | "draining" | "closing_streams" = "serving";
   private readonly streams = new Set<ServerResponse>();
   private started = false;
+  private readonly closingCtl = new AbortController();
+
+  /**
+   * Aborted just before the open event streams are ended. A route whose clients understand a frame of their own
+   * (the remote-agents command stream's `event: reconnect`) writes it from a listener: the listeners run before the
+   * `retry:` frame and the end, so that frame is the last thing such a client reads before the stream ends.
+   */
+  get closing(): AbortSignal {
+    return this.closingCtl.signal;
+  }
 
   constructor(private readonly opts: GracefulShutdownOptions) {}
 
@@ -166,6 +176,9 @@ export class GracefulShutdown {
     if (delayMs > 0) await sleep(delayMs);
 
     this.state = "closing_streams";
+    try { this.closingCtl.abort(); } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, "api.shutdown.closing_listener_failed");
+    }
     const streams = [...this.streams];
     for (const res of streams) this.endStream(res);
     logger.info({ signal, streams: streams.length }, "api.shutdown.streams_closed");

@@ -39,6 +39,7 @@ import { db } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
+import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
 import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
@@ -67,6 +68,12 @@ export interface RemoteAgentOptions {
   offlineNoticeMs?: number;
   /** Pairing a machine with a one-time code (`remote-agents/pairing-routes.ts`). */
   pairing?: PairingRouteOptions;
+  /**
+   * Aborted when this process starts to shut down (`GracefulShutdown.closing`). Every command stream then sends
+   * `event: reconnect` and ends, and its connector is kept online (`markStreamClosed`'s `restart`) while it opens a
+   * stream on another replica, so a Claw release is neither an offline transition nor a notice.
+   */
+  closing?: AbortSignal;
 }
 
 /**
@@ -118,6 +125,8 @@ interface SseStream {
   key: string;
   first?: string[];
   pingFrame: () => string;
+  /** The last frame a stream sends when the process shuts down (`RemoteAgentOptions.closing`); without it the stream just ends. */
+  closingFrame?: () => string;
   /** Frames to send now, and whether more are already waiting; `stop` is a last frame that ends the stream. */
   poll: () => Promise<{ frames: string[]; more?: boolean; stop?: string }>;
   onPing?: () => Promise<void>;
@@ -128,7 +137,7 @@ interface SseStream {
 const MAX_WRITE_BACKLOG = 4 * 1024 * 1024;
 
 async function serveSse(
-  req: FastifyRequest, reply: FastifyReply, waker: Waker, t: { pingMs: number; pollMs: number }, s: SseStream,
+  req: FastifyRequest, reply: FastifyReply, waker: Waker, t: { pingMs: number; pollMs: number; closing?: AbortSignal }, s: SseStream,
 ): Promise<FastifyReply> {
   reply.hijack();
   const res = reply.raw;
@@ -146,8 +155,15 @@ async function serveSse(
     if (res.writableEnded || res.destroyed) return;
     try { res.write(frame); } catch { gone.abort(); }
   };
+  // The process is shutting down: say so (synchronously, before `GracefulShutdown` ends the response) and stop.
+  const onClosing = () => {
+    if (s.closingFrame) write(s.closingFrame());
+    gone.abort();
+  };
   try {
     for (const f of s.first ?? []) write(f);
+    if (t.closing?.aborted) onClosing();
+    else t.closing?.addEventListener("abort", onClosing, { once: true });
     let nextPing = Date.now() + t.pingMs;
     while (!gone.signal.aborted) {
       const out = await s.poll();
@@ -166,6 +182,7 @@ async function serveSse(
     // The client reconnects and resumes from its cursor; nothing here is lost.
     logger.warn({ err: (err as Error)?.message }, "remote_agents.stream_failed");
   } finally {
+    t.closing?.removeEventListener("abort", onClosing);
     await s.onClose?.().catch((err) => logger.warn({ err: (err as Error)?.message }, "remote_agents.stream_close_failed"));
     if (!res.writableEnded) res.end();
   }
@@ -184,7 +201,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   const maxConnectors = opts.maxConnectorsPerUser ?? REMOTE_AGENT_LIMITS.maxConnectorsPerUser;
   const maxActiveSessions = opts.maxActiveSessionsPerUser ?? REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser;
   const maxStreams = opts.maxStreamsPerUser ?? 20;
-  const timing = { pingMs, pollMs };
+  const timing = { pingMs, pollMs, closing: opts.closing };
 
   // Closed sessions and their events would otherwise be kept for ever. Every replica sweeps; the
   // delete is idempotent, so two sweeping at once only share the work. The timer neither keeps
@@ -243,12 +260,15 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const body = parseConnectorRegistration(req.body ?? {});
     if (!body.ok) return fail(reply, 400, body.error);
     const row = await store.registerConnector(
-      owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req),
+      owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req), onlineWindowMs,
     );
     if (!row) return fail(reply, 409, "connector_limit_reached");
     // A paired machine's grant follows the row it registered: only that row's routes, and over when that row is revoked.
     const grant = grantOf(req);
     if (grant) await bindGrant(grant, row.connector_id, row.name);
+    // Offline rows under the same name (a connector that lost its state and registered again) were revoked in its place.
+    if (row.replaced.length) logger.info({ owner, connectorId: row.connector_id, replaced: row.replaced }, "remote_agents.connector_replaced");
+    for (const id of row.replaced) waker.wake(`c:${id}`);
     // The id every row of this connector is filed under. A connector whose token `sub` is not the id the
     // user's own clients resolve to is registered and online yet invisible to them, with no error; this
     // line is where an operator reads which id it was filed under (docs/remote-agents.md, "Connector access tokens").
@@ -259,7 +279,16 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   app.get("/v1/remote-agents/connectors", async (req, reply) => {
     const owner = requireOwner(req, reply);
     if (!owner) return;
-    return reply.send({ ok: true, data: await store.listConnectors(owner, onlineWindowMs) });
+    const policy = connectorVersionPolicy();
+    const rows = await store.listConnectors(owner, onlineWindowMs);
+    return reply.send({ ok: true, data: rows.map((r) => ({ ...r, ...versionVerdict(r.version as string | null, policy) })) });
+  });
+
+  /** How to connect a machine to this server: the package, the exact commands and this deployment's addresses (`remote-agents/setup.ts`). */
+  app.get("/v1/remote-agents/setup", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    return reply.send({ ok: true, data: connectorSetup() });
   });
 
   /** Revoke one of the caller's connectors: the row stays revoked for good, its queued commands go and its sessions close. */
@@ -297,7 +326,12 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const hb = parseHeartbeat(req.body);
     if (!hb.ok) return fail(reply, 400, hb.error);
     await store.recordHeartbeat(connector.connector_id, owner, hb.value);
-    return reply.send({ ok: true, data: { server_time: new Date().toISOString(), online_window_ms: onlineWindowMs } });
+    // Below the recommended version the answer says so, with the command that upgrades it; a connector may print it.
+    const verdict = versionVerdict(hb.value.version ?? (connector.version as string | null));
+    return reply.send({ ok: true, data: {
+      server_time: new Date().toISOString(), online_window_ms: onlineWindowMs,
+      ...(verdict.upgrade_command ? { connector_version: verdict } : {}),
+    } });
   });
 
   app.post(CONNECTOR_SIDE_ROUTES.events.url, async (req, reply) => {
@@ -348,6 +382,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
         key: `c:${cid}`,
         first: [sseFrame("ready", { v: REMOTE_AGENT_PROTOCOL_VERSION, connector_id: cid, server_time: new Date().toISOString() })],
         pingFrame: () => sseFrame("ping", { t: Date.now() }),
+        // A Claw release: reconnect now (to another replica), not after a backoff. Its connector stays online meanwhile.
+        closingFrame: () => { endReason = "restart"; return sseFrame("reconnect", { connector_id: cid }); },
         async poll() {
           // A stream opened with an access token ends when the token does (the
           // connector reconnects with a fresh one), and when the provider says
@@ -389,6 +425,11 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     )).rows;
     if (!agents.length) return fail(reply, 404, "agent_not_found");
     if (!connector.online) return fail(reply, 409, "connector_offline");
+    // Too old to be given a session: the owner is told which version and how to upgrade, instead of a session that fails on it.
+    const verdict = versionVerdict(connector.version as string | null);
+    if (verdict.version_status === "unsupported") {
+      return reply.status(409).send({ ok: false, error: "connector_outdated", data: { version: connector.version, ...verdict } });
+    }
     const out = await store.createSession({
       owner, client: clientLabel(req), connectorId: connector.connector_id, agentId: body.value.agent_id,
       cwd: body.value.cwd, mode: body.value.mode, resumeRef: body.value.resume_ref, maxActive: maxActiveSessions, commandsPerMinute,
