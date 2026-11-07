@@ -45,7 +45,8 @@
  *       pending cards no longer name it, a press afterwards sends nothing; another machine's card, and another user's revoke, are untouched;
  *       a card proposed while the machine is being revoked is refused (no_machine), never left waiting; a revoke never waits for a card
  *       that is being pressed (the press holds the card while its send waits for the machine: a cycle Postgres cannot see); a machine
- *       whose offline row is replaced by registering again under its name closes its cards the same way
+ *       whose offline row is replaced by registering again under its name closes only the cards that continue one of its sessions
+ *       (`machine_reconnected`); a card for a new session waits and, pressed, follows the new registration
  *   F20 an agent that only takes over existing conversations (kind attach) is never chosen for a new session, which its connector would
  *       refuse: with another agent there, that one; alone, a question listing its conversations, else no_agent saying why
  *   F21 at the limit of open sessions a new one closes the longest unused idle session of the user's (never one working, waiting for
@@ -106,7 +107,7 @@ describe("development environment items and devenv_send", { skip }, () => {
       (req as any).user = { userId: id, userName: id, platformKey: "", virtualKey: "", roles: ["default"] };
       (req as any).authMethod = "identity_token";
     });
-    await registerRemoteAgentRoutes(app, { pingMs: 150, pollMs: 40, retentionDays: 0 });
+    await registerRemoteAgentRoutes(app, { pingMs: 150, pollMs: 40, retentionDays: 0, undeliveredSweepMs: 0 });
     const { registerAssistantRoutes } = await import("../src/routes/assistant.js");
     await registerAssistantRoutes(app);
     await app.listen({ port: 0, host: "127.0.0.1" });
@@ -114,7 +115,7 @@ describe("development environment items and devenv_send", { skip }, () => {
   });
   after(async () => { await app?.close(); await w?.stop(); });
   beforeEach(async () => {
-    await w.q(`TRUNCATE claw_remote_events, claw_remote_commands, claw_remote_sessions, claw_remote_agents, claw_remote_connectors,
+    await w.q(`TRUNCATE claw_remote_events, claw_remote_commands, claw_remote_sessions, claw_remote_agents, claw_remote_connector_transitions, claw_remote_connectors,
       claw_remote_audit, claw_work_items, claw_work_item_events, claw_tasks, claw_assistants, claw_sessions, claw_assistant_messages,
       claw_assistant_says, claw_assistant_confirmations, claw_notification_outbox, claw_notification_subscriptions CASCADE`);
   });
@@ -531,25 +532,35 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal((await w.q("SELECT status FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toDesktop.confirmation_id]))[0].status, "pending");
   });
 
-  test("F17e a machine replaced by registering again under its name: its waiting card closes as on a revoke", async () => {
+  test("F17e a machine replaced by registering again under its name: a card for a new session waits and follows it; one continuing an old session closes", async () => {
     const alice = await w.user("alice");
     await w.subscribe(alice.userId);
     const laptop = await machine("alice", "laptop");
     await machine("alice", "desktop");
+    // A card for a new session (no session open yet), then one that continues a session opened since.
     const toLaptop = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
+    const sid = await chatSession("alice", laptop);
+    const toSession = await tools.devenvSend(await userTurn(alice, "让它跑 lint"), { text: "跑 lint", target: sid });
     const toDesktop = await tools.devenvSend(await userTurn(alice, "让 desktop 上的 claude 跑 lint"), { text: "跑 lint", target: "desktop" });
-    assert.equal(toLaptop.done, false, JSON.stringify(toLaptop));
-    assert.equal(toDesktop.done, false, JSON.stringify(toDesktop));
+    for (const c of [toLaptop, toSession, toDesktop]) assert.equal(c.done, false, JSON.stringify(c));
     // laptop lost its local state: its row is an hour old and offline, and it registers afresh under the same name.
     await w.q("UPDATE claw_remote_connectors SET created_at = NOW() - interval '1 hour', heartbeat_at = NOW() - interval '1 hour', stream_seen_at = NULL WHERE connector_id = $1", [laptop]);
     const again = await post("alice", "/v1/remote-agents/connectors", { name: "laptop" });
     assert.equal(again.status, 201, JSON.stringify(again.body));
     assert.ok((await w.q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [laptop]))[0].revoked_at, "the old row was replaced");
-    const card = (await w.q("SELECT * FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toLaptop.confirmation_id]))[0];
-    assert.deepEqual([card.status, card.decided_via, card.result?.error], ["expired", "connector_revoked", "no_machine"]);
-    assert.deepEqual((await schedules.pendingConfirmations("alice")).map((c) => c.confirmation_id), [toDesktop.confirmation_id],
-      "the other machine's card still waits");
-    assert.doesNotMatch(await schedules.renderScheduleState("alice"), /on the machine "laptop"/);
+    const card = async (id: unknown) => (await w.q("SELECT * FROM claw_assistant_confirmations WHERE confirmation_id = $1", [id]))[0];
+    // The session it continued went with the old registration: that card closes, and says why.
+    const gone = await card(toSession.confirmation_id);
+    assert.deepEqual([gone.status, gone.decided_via, gone.result?.error], ["expired", "connector_revoked", "machine_reconnected"]);
+    // A new session on that machine is still what the user asked for: that card waits, and, pressed once the machine is back, goes to it.
+    assert.deepEqual((await schedules.pendingConfirmations("alice")).map((c) => c.confirmation_id).sort(),
+      [toLaptop.confirmation_id, toDesktop.confirmation_id].sort());
+    const fresh = String(again.body.data.connector_id);
+    await store.recordHeartbeat(fresh, "alice", { version: "0.1.5", cmdCursor: null, agents: [CLAUDE] as never });
+    await w.q("UPDATE claw_remote_connectors SET stream_seen_at = NOW() WHERE connector_id = $1", [fresh]);
+    const pressed = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(toLaptop.confirmation_id), decision: "allow", via: "button" });
+    assert.equal(pressed.status, "done", JSON.stringify(pressed));
+    assert.deepEqual([(await queued(laptop)).length, (await queued(fresh)).map((c: Recorded) => c.type)], [0, ["session.new", "prompt"]]);
   });
 
   test("F17b a card drawn while its machine is being revoked: the turn is refused, no card is left waiting", async () => {
@@ -1325,6 +1336,205 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal(tools.folderOf("~/x", ["D:/Users/bob/w"]), "D:/Users/bob/x");
     assert.equal(tools.folderOf("~/x", ["C:\\Users\\alice\\a", "c:/users/ALICE/b"]), "C:\\Users\\alice\\x", "one home, two spellings");
     assert.equal(tools.folderOf("~/x", ["C:\\work"]), null, "a drive root shows no home");
+  });
+
+  test("F30 an instruction its machine never acknowledged (a laptop closed as it was sent) ends its item as unconfirmed, told once", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop");
+    const beat = () => post("alice", `/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [CLAUDE] });
+    // A new session and its first instruction: the machine looked online, and neither was ever collected.
+    const first = await sendByCard(await userTurn(alice, "让 claude 跑 make test"), { text: "跑 make test", agent: "claude" });
+    assert.equal(first.status, "done");
+    const fresh = String(first.session_id);
+    // An instruction to a session that had started.
+    const sid = await chatSession("alice", cid);
+    const second = await sendByCard(await userTurn(alice, "让它跑 lint"), { text: "跑 lint", target: sid });
+    assert.deepEqual([second.status, second.session_id], ["done", sid]);
+    assert.deepEqual((await queued(cid)).map((c: Recorded) => c.type), ["session.new", "prompt", "prompt"]);
+    await w.q("UPDATE claw_remote_commands SET created_at = NOW() - interval '10 minutes' WHERE connector_id = $1", [cid]);
+    // The laptop was closed after they were sent (the presence sweep recorded it), and wakes: its first heartbeat finds them too
+    // old to deliver, and says so in each session.
+    await w.q(
+      `INSERT INTO claw_remote_connector_transitions (connector_id, owner_user_id, from_state, to_state, reason, at)
+       VALUES ($1, 'alice', 'online', 'offline', 'no_heartbeat', NOW() - interval '9 minutes')`, [cid],
+    );
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '11 minutes' WHERE connector_id = $1", [cid]);
+    assert.equal((await beat()).status, 200);
+    assert.deepEqual(await queued(cid), []);
+    for (const [s, asked] of [[fresh, "跑 make test"], [sid, "跑 lint"]]) {
+      const item = await remoteItem(s);
+      assert.deepEqual([item.board_state, item.outcome, item.summary], ["done", "dropped", "机器在确认收到前断开了，这条指令可能没有执行"], asked);
+    }
+    const told = (await says("alice")).filter((x: Recorded) => x.item_id).map((x: Recorded) => x.text);
+    assert.equal(told.length, 2, JSON.stringify(told));
+    assert.match(told[0], /^laptop 上的 claude 没有确认收到 #\d+（跑 make test）：那台机器在这条指令发出前后断开了（比如笔记本合盖了），可能没有执行/);
+    assert.match(told[1], /^laptop 上的 claude 没有确认收到 #\d+（跑 lint）/);
+    assert.equal((await beat()).status, 200);
+    assert.equal((await says("alice")).filter((x: Recorded) => x.item_id).length, 2, "said once");
+    // The session that started goes on: the next instruction is sent to it as before.
+    assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "again" })).status, 202);
+  });
+
+  test("F32 an instruction Claw cannot confirm its machine got is said as that, and the machine's own end still closes it", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop");
+    const sid = await chatSession("alice", cid);
+    const sent = await sendByCard(await userTurn(alice, "让它跑 lint"), { text: "跑 lint", target: sid });
+    assert.equal(sent.status, "done");
+    const seq = Number((await w.q("SELECT cmd_seq FROM claw_remote_commands WHERE connector_id = $1 AND type = 'prompt'", [cid]))[0].cmd_seq);
+    // Alive 10 s before it was queued, gone since: the laptop closed just as it was sent.
+    await w.q("UPDATE claw_remote_commands SET created_at = NOW() - interval '10 minutes' WHERE connector_id = $1", [cid]);
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '610 seconds', stream_seen_at = NULL WHERE connector_id = $1", [cid]);
+    assert.equal((await post("alice", `/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [CLAUDE] })).status, 200);
+    let item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome, item.summary], ["done", "dropped", "机器在确认收到前断开了，这条指令可能没有执行"]);
+    let told = (await says("alice")).filter((x: Recorded) => x.item_id).map((x: Recorded) => x.text);
+    assert.equal(told.length, 1);
+    assert.match(told[0], /^laptop 上的 claude 没有确认收到 #\d+（跑 lint）：那台机器在这条指令发出前后断开了（比如笔记本合盖了），可能没有执行/);
+    // It had: the machine's own end for that prompt comes when it is back, and closes the item with its answer, told once.
+    await events("alice", cid, sid, [chunk("lint clean"), ["turn_end", { stopReason: "end_turn", cmd_seq: seq }]]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome], ["done", "answered"]);
+    told = (await says("alice")).filter((x: Recorded) => x.item_id).map((x: Recorded) => x.text);
+    assert.equal(told.length, 2);
+    assert.match(told[1], /^laptop 上的 claude 做完了 #\d+：跑 lint\nlint clean$/);
+    await events("alice", cid, sid, [["turn_end", { stopReason: "end_turn", cmd_seq: seq }]]);
+    assert.equal((await says("alice")).filter((x: Recorded) => x.item_id).length, 2, "said once");
+
+    // Again, but the user sends the next instruction before the late answer comes: that one stays open, the late answer is told
+    // with its own instruction, once.
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [cid]);
+    await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
+    const third = await sendByCard(await userTurn(alice, "让它跑 build"), { text: "跑 build", target: sid });
+    assert.equal(third.status, "done");
+    const s3 = Number((await w.q("SELECT cmd_seq FROM claw_remote_commands WHERE connector_id = $1 AND type = 'prompt'", [cid]))[0].cmd_seq);
+    await w.q("UPDATE claw_remote_events SET created_at = NOW() - interval '15 minutes' WHERE session_id = $1", [sid]);   // (all before it)
+    await w.q("UPDATE claw_remote_commands SET created_at = NOW() - interval '10 minutes' WHERE connector_id = $1", [cid]);
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '610 seconds', stream_seen_at = NULL WHERE connector_id = $1", [cid]);
+    assert.equal((await post("alice", `/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [CLAUDE] })).status, 200);
+    assert.equal((await remoteItem(sid)).board_state, "done");
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [cid]);
+    const fourth = await sendByCard(await userTurn(alice, "让它跑 deploy"), { text: "跑 deploy", target: sid });
+    assert.equal(fourth.status, "done");
+    const s4 = Number((await w.q("SELECT cmd_seq FROM claw_remote_commands WHERE connector_id = $1 AND type = 'prompt' ORDER BY cmd_seq DESC LIMIT 1", [cid]))[0].cmd_seq);
+    await events("alice", cid, sid, [chunk("build ok"), ["turn_end", { stopReason: "end_turn", cmd_seq: s3 }]]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.params.open_cmd_seqs, item.params.unconfirmed], ["in_progress", [s4], []], "the newer one stays open");
+    told = (await says("alice")).filter((x: Recorded) => x.item_id).map((x: Recorded) => x.text);
+    assert.match(told[told.length - 1], /^laptop 上的 claude 做完了 #\d+：跑 build\nbuild ok$/);
+    const n = told.length;
+    await events("alice", cid, sid, [chunk("deployed"), ["turn_end", { stopReason: "end_turn", cmd_seq: s4 }]]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome], ["done", "answered"]);
+    told = (await says("alice")).filter((x: Recorded) => x.item_id).map((x: Recorded) => x.text);
+    assert.equal(told.length, n + 1);
+    assert.match(told[n], /^laptop 上的 claude 做完了 #\d+：跑 deploy\ndeployed$/);
+  });
+
+  test("F33 two instructions Claw could not confirm, ended together: each one's own late end still counts, the earlier one kept apart", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop");
+    const sid = await chatSession("alice", cid);
+    // Two typed into the attached chat one after the other (the second waits behind the first on the machine, as far as Claw knows).
+    for (const text of ["跑 lint", "跑 test"]) assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text })).status, 202);
+    const seqs = (await w.q("SELECT cmd_seq FROM claw_remote_commands WHERE connector_id = $1 AND type = 'prompt' ORDER BY cmd_seq", [cid])).map((r: Recorded) => Number(r.cmd_seq));
+    await w.q("UPDATE claw_remote_commands SET created_at = NOW() - interval '10 minutes' WHERE connector_id = $1", [cid]);
+    await w.q("UPDATE claw_remote_audit SET ts = NOW() - interval '10 minutes' WHERE session_id = $1", [sid]);
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '610 seconds', stream_seen_at = NULL WHERE connector_id = $1", [cid]);
+    assert.equal((await post("alice", `/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [CLAUDE] })).status, 200);
+    let item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.params.unconfirmed, item.params.unconfirmed_asked], ["done", seqs, { [seqs[0]]: "", [seqs[1]]: "跑 test" }],
+      "both remembered, the earlier one without words (the item keeps only the newest instruction's)");
+    // The machine had both: the earlier one's end comes first and is kept as an answer without moving the item; the later one closes it.
+    const answers = async () => (await w.q("SELECT summary FROM claw_work_item_events WHERE item_id = $1 AND kind = 'answer' ORDER BY id", [item.item_id])).map((r: Recorded) => r.summary);
+    await events("alice", cid, sid, [chunk("lint clean"), ["turn_end", { stopReason: "end_turn", cmd_seq: seqs[0] }]]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome, item.params.unconfirmed, await answers()], ["done", "dropped", [seqs[1]], ["lint clean"]]);
+    await events("alice", cid, sid, [chunk("tests pass"), ["turn_end", { stopReason: "end_turn", cmd_seq: seqs[1] }]]);
+    item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome, item.params.unconfirmed], ["done", "answered", []]);
+    assert.equal((await answers()).length, 2);
+  });
+
+  test("F34 many instructions Claw could not confirm, ended in one sweep: the oldest one's late end still counts", async () => {
+    await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const sid = await chatSession("alice", cid);
+    for (let i = 0; i < 25; i++) assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: `p${i}` })).status, 202);
+    const seqs = (await w.q("SELECT cmd_seq FROM claw_remote_commands WHERE connector_id = $1 AND type = 'prompt' ORDER BY cmd_seq", [cid])).map((r: Recorded) => Number(r.cmd_seq));
+    await w.q("UPDATE claw_remote_commands SET created_at = NOW() - interval '10 minutes' WHERE connector_id = $1", [cid]);
+    await w.q("UPDATE claw_remote_audit SET ts = NOW() - interval '10 minutes' WHERE session_id = $1", [sid]);
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '610 seconds', stream_seen_at = NULL WHERE connector_id = $1", [cid]);
+    assert.equal((await post("alice", `/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [CLAUDE] })).status, 200);
+    let item = await remoteItem(sid);
+    assert.equal(item.params.unconfirmed.length, 25);
+    await events("alice", cid, sid, [chunk("p0 done"), ["turn_end", { stopReason: "end_turn", cmd_seq: seqs[0] }]]);
+    item = await remoteItem(sid);
+    assert.equal(item.params.unconfirmed.includes(seqs[0]), false);
+    const answers = (await w.q("SELECT summary FROM claw_work_item_events WHERE item_id = $1 AND kind = 'answer'", [item.item_id])).map((r: Recorded) => r.summary);
+    assert.deepEqual(answers, ["p0 done"]);
+  });
+
+  test("F31 a card made before its machine registered again follows the machine for a new session, and asks again for an old one", async () => {
+    const alice = await w.user("alice");
+    const old = await machine("alice", "laptop");
+    // Shown, not pressed. Then the connector is set up again (a reinstall, a rebuilt pod): a new row under the same name.
+    const card = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make"), { text: "跑 make", target: "laptop" });
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '1 hour', stream_seen_at = NULL WHERE connector_id = $1", [old]);
+    const now = await machine("alice", "laptop");
+    const pressed = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(card.confirmation_id), decision: "allow", via: "button" });
+    assert.equal(pressed.status, "done", JSON.stringify(pressed));
+    assert.deepEqual(await queued(old), [], "nothing for the old registration");
+    assert.deepEqual((await queued(now)).map((c: Recorded) => c.type), ["session.new", "prompt"]);
+    assert.equal(((await w.q("SELECT connector_id::text AS c FROM claw_remote_sessions WHERE session_id = $1", [(pressed.result as Recorded).session_id]))[0]).c, now);
+
+    // The old stream ended seconds ago (still online by the reconnect grace) and the machine is already back under a new row: the
+    // card follows the new one, not the row in its grace.
+    const lap = await machine("alice", "lap2");
+    const graceCard = await tools.devenvSend(await userTurn(alice, "让 lap2 上的 claude 跑 make"), { text: "跑 make", target: "lap2" });
+    await w.q("UPDATE claw_remote_connectors SET stream_seen_at = NULL, stream_closed_at = NOW() - interval '10 seconds' WHERE connector_id = $1", [lap]);
+    const lapNew = await machine("alice", "lap2");
+    const viaGrace = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(graceCard.confirmation_id), decision: "allow", via: "button" });
+    assert.equal(viaGrace.status, "done", JSON.stringify(viaGrace));
+    assert.deepEqual([(await queued(lap)).length, (await queued(lapNew)).map((c: Recorded) => c.type)], [0, ["session.new", "prompt"]]);
+    // A card continuing a session of a row in its grace, the machine already back under a new row: that session went with the old
+    // one, so nothing is sent.
+    const lapSid = await chatSession("alice", lapNew);
+    const sessCard = await tools.devenvSend(await userTurn(alice, "让它继续"), { text: "继续", target: lapSid });
+    await w.q("UPDATE claw_remote_connectors SET stream_seen_at = NULL, stream_closed_at = NOW() - interval '10 seconds' WHERE connector_id = $1", [lapNew]);
+    const lapNewer = await machine("alice", "lap2");
+    const viaSess = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(sessCard.confirmation_id), decision: "allow", via: "button" });
+    assert.deepEqual([viaSess.status, (viaSess.result as Recorded).error], ["failed", "machine_reconnected"]);
+    assert.deepEqual([(await queued(lapNew)).filter((c: Recorded) => c.type === "prompt" && c.session_id === lapSid).length, (await queued(lapNewer)).length], [0, 0]);
+    // In its grace with no new row, the old one is used: it is the one reconnecting.
+    const solo = await machine("alice", "solo");
+    const soloCard = await tools.devenvSend(await userTurn(alice, "让 solo 上的 claude 跑 make"), { text: "跑 make", target: "solo" });
+    await w.q("UPDATE claw_remote_connectors SET stream_seen_at = NULL, stream_closed_at = NOW() - interval '10 seconds' WHERE connector_id = $1", [solo]);
+    const viaSolo = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(soloCard.confirmation_id), decision: "allow", via: "button" });
+    assert.deepEqual([viaSolo.status, (await queued(solo)).map((c: Recorded) => c.type)], ["done", ["session.new", "prompt"]]);
+
+    // A card that continues a session of the registration that went: that session is gone with it, so nothing is sent.
+    const sid = await chatSession("alice", now);
+    const onSession = await tools.devenvSend(await userTurn(alice, "让它继续"), { text: "继续", target: sid });
+    await w.q("UPDATE claw_remote_connectors SET revoked_at = NOW(), stream_seen_at = NULL WHERE connector_id = $1", [now]);
+    const third = await machine("alice", "laptop");
+    const refused = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(onSession.confirmation_id), decision: "allow", via: "button" });
+    assert.deepEqual([refused.status, (refused.result as Recorded).error], ["failed", "machine_reconnected"]);
+    assert.deepEqual((await queued(third)).filter((c: Recorded) => c.type === "prompt"), []);
+
+    // A machine that merely went offline, never registered again by its owner: offline, as before. Another user's machine of the
+    // same name, registered since, is never followed.
+    const desk = await machine("alice", "desk");
+    const offCard = await tools.devenvSend(await userTurn(alice, "让 desk 上的 claude 跑 make"), { text: "跑 make", target: "desk" });
+    await w.q("UPDATE claw_remote_connectors SET stream_seen_at = NULL WHERE connector_id = $1", [desk]);
+    await w.user("bob");
+    const bobs = await machine("bob", "desk");
+    const off = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(offCard.confirmation_id), decision: "allow", via: "button" });
+    assert.deepEqual([off.status, (off.result as Recorded).error], ["failed", "connector_offline"]);
+    assert.deepEqual(await queued(bobs), []);
   });
 
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {

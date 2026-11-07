@@ -21,6 +21,7 @@
 import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
+import { onlineSql } from "./store.js";
 
 const logger = pino({ name: "remote-agents-terminal-waits" });
 
@@ -102,9 +103,7 @@ export async function sweepTerminalWaits(onlineWindowMs: number, noticeAfterMs: 
          JOIN claw_remote_agents a ON a.connector_id = c.connector_id
          CROSS JOIN LATERAL jsonb_array_elements(
            CASE WHEN jsonb_typeof(a.capabilities->'resumable') = 'array' THEN a.capabilities->'resumable' ELSE '[]'::jsonb END) r(value)
-        WHERE c.revoked_at IS NULL
-          AND c.heartbeat_at > NOW() - make_interval(secs => $1::float8)
-          AND c.stream_seen_at > NOW() - make_interval(secs => $1::float8)
+        WHERE ${onlineSql(1)}
           AND jsonb_typeof(r.value) = 'object' AND r.value->>'state' = 'live' AND r.value->>'activity' = 'waiting'
           AND jsonb_typeof(r.value->'ref') = 'string' AND r.value->>'ref' ~ $2`,
       [onlineWindowMs / 1000, REF_RE],
@@ -118,9 +117,7 @@ export async function sweepTerminalWaits(onlineWindowMs: number, noticeAfterMs: 
     // or every entry is unknown) ends nothing: a wait told once is never told again just because one heartbeat could not see it.
     const open = (await q(
       `SELECT w.connector_id::text AS connector_id, w.agent_id, w.ref,
-              COALESCE(c.revoked_at IS NULL
-                AND c.heartbeat_at > NOW() - make_interval(secs => $1::float8)
-                AND c.stream_seen_at > NOW() - make_interval(secs => $1::float8), FALSE) AS online,
+              ${onlineSql(1)} AS online,
               a.capabilities->'resumable' AS resumable, a.agent_id IS NOT NULL AS has_agent
          FROM claw_remote_terminal_waits w
          LEFT JOIN claw_remote_connectors c ON c.connector_id = w.connector_id

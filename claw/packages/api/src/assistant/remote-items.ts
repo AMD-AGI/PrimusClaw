@@ -39,7 +39,7 @@ import {
 } from "@claw/protocol";
 import { CLAW_ASSISTANT_ENABLED, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
-import { findSession, issueCommand, wakeConnector } from "../remote-agents/store.js";
+import { DELIVERY_UNCONFIRMED, findSession, issueCommand, onlineSql, wakeConnector } from "../remote-agents/store.js";
 import { newWorkItemId } from "../tasks/ids.js";
 import type { AssistantRemoteAsk, AssistantRemoteNotice } from "../notifications/assistant-events.js";
 import { recordSystemNotice } from "./outbound.js";
@@ -68,6 +68,11 @@ const ASKED_MAX = 120;
 const SUMMARY_MAX = 80;
 const ANSWER_EVENT_MAX = 600;
 const NOTICE_ANSWER_MAX = 400;
+/**
+ * How many prompts ended as `delivery_unconfirmed` an item remembers (their late ends still count). More than one sweep can end at
+ * once: a user issues at most `commandsPerMinute` (60) commands a minute, over the 6 minutes a command waits before it is ended.
+ */
+const UNCONFIRMED_KEPT = 400;
 /** At most this many of a session's moving events are applied in one pass; the next post applies the rest. */
 const EVENTS_PER_PASS = 100;
 /** The newest message chunks of a turn its answer is read from. */
@@ -109,6 +114,12 @@ export interface RemoteParams {
   closed_event_id?: number;
   /** Cancels sent whose turn_end has not come yet, oldest first (`PendingCancel`). */
   cancels?: PendingCancel[];
+  /** Prompts (`cmd_seq`) Claw ended as `delivery_unconfirmed`: an end of the machine's own for one of them still ends the item. */
+  unconfirmed?: number[];
+  /** What each of those asked (`asked` when it was ended), by `cmd_seq`: said with its answer should that come once the item moved on. */
+  unconfirmed_asked?: Record<string, string>;
+  /** The prompt whose `delivery_unconfirmed` end closed the item, while nothing later has: its own end closes the item instead. */
+  closed_by_unconfirmed?: number | null;
 }
 
 /** A cancel sent to the session whose end (one turn_end, `stopReason: "cancelled"`) has not come yet. */
@@ -310,7 +321,7 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
       : Array.isArray(open.params?.open_cmd_seqs) ? [...open.params.open_cmd_seqs, p.cmdSeq] : null;
     const patch = {
       asked, origin: p.origin, lang, open_turns: turns, cancels, open_cmd_seqs: openSeqs,
-      ...(open.board_state === "done" ? { waiting: [], closed_event_id: 0, last_event_id: from } : {}),
+      ...(open.board_state === "done" ? { waiting: [], closed_event_id: 0, last_event_id: from, closed_by_unconfirmed: null } : {}),
     };
     await q(
       `UPDATE claw_work_items
@@ -351,7 +362,7 @@ async function answerOf(q: Querier, sessionId: string, endId: number): Promise<s
   return rows.reverse().map((r) => r.text).join("");
 }
 
-export type RemoteNoticeKind = "done" | "waiting" | "closed" | "refused" | "failed";
+export type RemoteNoticeKind = "done" | "waiting" | "closed" | "refused" | "failed" | "undelivered";
 
 /** Which of the three kinds of news a session's message is (`AssistantRemoteNotice.kind`). */
 export const remoteNoticeKind = (kind: RemoteNoticeKind): AssistantRemoteNotice["kind"] =>
@@ -378,11 +389,19 @@ export function remoteNotice(
   if (kind === "refused") {
     return zh ? `${who} 没有接下 #${seq}（${p.asked}）：${detail}` : `${who} refused #${seq} (${p.asked}): ${detail}`;
   }
+  if (kind === "undelivered") {
+    return zh
+      ? `${who} 没有确认收到 #${seq}（${p.asked}）：那台机器在这条指令发出前后断开了（比如笔记本合盖了），可能没有执行。它重新连上后如果做完了，我会再告诉你。`
+      : `${who} did not confirm it got #${seq} (${p.asked}): the machine went just as it was sent (a laptop closed, for one), so it may not have run. If it finishes once the machine is back, I will tell you.`;
+  }
   if (kind === "closed") {
     return zh ? `${who} 的会话已关闭，#${seq}（${p.asked}）没有做完。` : `The session of ${who} closed before #${seq} (${p.asked}) finished.`;
   }
   return zh ? `${who} 做完了 #${seq}：${p.asked}\n${detail}` : `${who} finished #${seq}: ${p.asked}\n${detail}`;
 }
+
+/** An end Claw wrote for a prompt its machine never acknowledged (`store.expireUndelivered`), not one the machine sent. */
+const undelivered = (e: MovingEvent): boolean => e.data.by === "claw" && e.data.error === DELIVERY_UNCONFIRMED;
 
 /** How a turn ended, said beside its answer when it did not simply end. */
 function stopWords(stop: string, error: string, lang: RemoteLang): string {
@@ -485,6 +504,10 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
     };
     // The item ends with this turn's end: answered, with the end of the agent's answer.
     const closeAnswered = async (e: MovingEvent) => {
+      if (undelivered(e)) {
+        await closeUndelivered(e);
+        return;
+      }
       const stop = flat(e.data.stopReason, 40);
       const said = stopWords(stop, flat(e.data.error, 200), p.lang);
       const whole = await answerOf(q, sessionId, e.id);
@@ -511,12 +534,63 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       );
       tell(`refused:${e.id}`, "refused", remoteNotice("refused", p, item.seq, reason));
     };
+    // The machine never got the instruction (`store.expireUndelivered`: its prompt or its session's start was too old to deliver):
+    // nothing ran, and that is said as such, never as an answer or an error of the agent's.
+    const closeUndelivered = async (e: MovingEvent) => {
+      // Claw could not tell whether the machine took it just before it went: said so, and its own end, if it comes, still counts.
+      const seq = Number.isSafeInteger(e.data.cmd_seq) ? Number(e.data.cmd_seq) : null;
+      p.closed_by_unconfirmed = seq;
+      const summary = p.lang === "zh" ? "机器在确认收到前断开了，这条指令可能没有执行" : "the machine went before confirming it had the instruction; it may not have run";
+      await write(
+        `board_state = 'done', outcome = 'dropped', last_report_kind = 'dropped', summary = $2, pending_question = NULL,
+         closed_at = NOW(), attention_seq = attention_seq + $3::int`,
+        [summary, p.origin === "assistant" ? 1 : 0], { kind: "dropped", summary },
+      );
+      tell(`undelivered:${e.id}`, "undelivered", remoteNotice("undelivered", p, item.seq, ""));
+    };
     for (const e of events) {
       p.last_event_id = e.id;
       // A connector that names the prompt a turn's end ends (`cmd_seq`, null for a cancel that found nothing running) is followed by
       // name, while the item knows every prompt open by its number. A turn's end, or a refusal of a prompt that never runs, that names
       // none (an older connector) makes the item count them instead, as it did before names were kept.
       const seq = Number.isSafeInteger(e.data.cmd_seq) ? Number(e.data.cmd_seq) : null;
+      // Every instruction Claw ends as unconfirmed is remembered, whether or not it closes the item (others may still be open), with what
+      // it asked when that is known (the newest one open is `asked`; an earlier one is said as "an earlier instruction").
+      if (e.type === REMOTE_EVENT_TURN_END && undelivered(e) && seq !== null) {
+        const opened = Array.isArray(p.open_cmd_seqs) ? p.open_cmd_seqs : [];
+        const newest = !opened.length || opened[opened.length - 1] === seq;
+        p.unconfirmed = [...(Array.isArray(p.unconfirmed) ? p.unconfirmed : []).filter((c) => c !== seq), seq].slice(-UNCONFIRMED_KEPT);
+        const asked = { ...(p.unconfirmed_asked ?? {}), [String(seq)]: newest ? p.asked : "" };
+        p.unconfirmed_asked = Object.fromEntries(Object.entries(asked).filter(([k]) => p.unconfirmed!.includes(Number(k))));
+      }
+      // The machine's own end of an instruction Claw could not confirm it had (`delivery_unconfirmed`): it had, and this is its end.
+      if (e.type === REMOTE_EVENT_TURN_END && !undelivered(e) && seq !== null && Array.isArray(p.unconfirmed) && p.unconfirmed.includes(seq)) {
+        const asked = p.unconfirmed_asked?.[String(seq)] || (p.lang === "zh" ? "之前的一条指令" : "an earlier instruction");
+        p.unconfirmed = p.unconfirmed.filter((c) => c !== seq);
+        if (p.unconfirmed_asked) delete p.unconfirmed_asked[String(seq)];
+        if (board === "done" && p.closed_by_unconfirmed === seq) {
+          p.closed_by_unconfirmed = null;
+          p.closed_event_id = e.id;
+          await closeAnswered(e);
+        } else {
+          // The item has moved on to a later instruction (open, or ended since): that one is left as it is, and this end is told with
+          // its own instruction and answer.
+          const stop = flat(e.data.stopReason, 40);
+          const said = stopWords(stop, flat(e.data.error, 200), p.lang);
+          const whole = await answerOf(q, sessionId, e.id);
+          await q(
+            `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary, result)
+             SELECT item_id, 'answer', 'remote', generation, $2, $3::jsonb FROM claw_work_items WHERE item_id = $1`,
+            [item.item_id, [said, tailOf(whole, ANSWER_EVENT_MAX)].filter(Boolean).join(" ") || null, JSON.stringify({ stop_reason: stop || null, remote_event_id: e.id, cmd_seq: seq })],
+          );
+          // (one notice per time the item needs the user: this is another)
+          if (p.origin === "assistant") await q("UPDATE claw_work_items SET attention_seq = attention_seq + 1, updated_at = NOW() WHERE item_id = $1", [item.item_id]);
+          const kind: RemoteNoticeKind = FAILED_STOPS.has(stop) ? "failed" : "done";
+          tell(`late:${e.id}`, kind, remoteNotice(kind, { ...p, asked }, item.seq, [said, tailLines(whole, NOTICE_ANSWER_MAX)].filter(Boolean).join(" ")
+            || (p.lang === "zh" ? "已结束，没有回答文字" : "ended with no answer text")));
+        }
+        continue;
+      }
       const reason = e.type === REMOTE_EVENT_COMMAND_REJECTED && e.data.type === "prompt" ? flat(e.data.reason, 80) : "";
       // A refusal ends its prompt only when the prompt never runs; one refused as its turn starts ends with that turn's end.
       const refusedUnrun = PROMPT_REFUSED_UNQUEUED.has(reason) || reason === PROMPT_DROPPED_BY_CANCEL;
@@ -665,8 +739,7 @@ export async function remoteManifest(
   if (!remote.length || !CLAW_REMOTE_AGENTS_ENABLED) return out;
   const online = new Set(((await db.query(
     `SELECT connector_id::text AS connector_id FROM claw_remote_connectors c
-      WHERE c.owner_user_id = $1 AND c.revoked_at IS NULL
-        AND c.heartbeat_at > NOW() - make_interval(secs => $2::float8) AND c.stream_seen_at > NOW() - make_interval(secs => $2::float8)`,
+      WHERE c.owner_user_id = $1 AND ${onlineSql(2)}`,
     [userId, onlineWindowMs / 1000],
   )).rows as Array<{ connector_id: string }>).map((r) => r.connector_id));
   for (const i of remote) {

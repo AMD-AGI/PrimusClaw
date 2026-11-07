@@ -303,16 +303,31 @@ told again once (`claw_remote_terminal_waits`).
 | `GET .../sessions/:id/events` | History, a `historyComplete` marker, then live events, in the frame format of `/v1/chat/sessions/:id/messages`; resume with `Last-Event-ID` or `?after=`; when both are sent `Last-Event-ID` wins, because a browser reconnecting to the same URL changes only that header. `?mode=replay` returns JSON pages. |
 | `GET /v1/remote-agents/audit` | The caller's audit trail, filterable by `session_id` and `connector_id`. |
 
-`prompt`, `set_mode` and `resume` are refused with `409 connector_offline` while the
-connector is offline, so a prompt nobody could see being waited on cannot run later.
-`cancel`, `close` and `decision` are queued, since they are safe to deliver late.
+A new session, `prompt`, `set_mode` and `resume` are refused with `409 connector_offline` while
+the connector is offline, so a prompt nobody could see being waited on cannot run later.
+`cancel`, `close` and `decision` are queued, since they are safe to deliver late. A connector
+whose command stream has just ended still counts as online for 45 s (`STREAM_GRACE_SECS`)
+while its heartbeat is fresh: a Claw release, an ingress restart or a token refresh ends every
+stream and the connector opens the next within seconds, so what is asked in that gap is queued
+and delivered on the new stream, not refused.
 
 The same rule holds after a command is accepted. A connector counts as online for up to
-90 s after its connection has died unnoticed (a closed laptop), so a `prompt`, `set_mode` or
-`resume` accepted then goes into a dead socket. Such a command is delivered for 5 minutes
-(`REMOTE_AGENT_TIMING.liveCommandTtlMs`) and then dropped: a connector that comes back
-later is not sent it, and the queue row is deleted. A client that gets no events for a prompt
-sends it again. `cancel`, `close` and `decision` stay deliverable for a day.
+90 s after its connection has died unnoticed (a closed laptop), so a `session.new`, `prompt`,
+`set_mode` or `resume` accepted then goes into a dead socket. Such a command is delivered for
+5 minutes (`REMOTE_AGENT_TIMING.liveCommandTtlMs`) and then dropped: a connector that comes
+back later is not sent it. One minute later (the slack for an acknowledgement on its way), when
+its machine went away after it was queued (offline now, or recorded offline since), its session has
+heard nothing from the machine since, and no turn was running when it was queued, Claw deletes the
+queue row, on the connector's next heartbeat (judged before that beat is recorded) or on a sweep
+every 15 s whether or not the machine comes back. A prompt's turn is then ended with an event of
+Claw's own (`data.by = "claw"`, a negative `seq`): `turn_end {stopReason: "error", error:
+"delivery_unconfirmed", cmd_seq}`. Claw cannot tell whether the machine took the prompt just before
+it went (a connector acknowledges a prompt only when it reaches the agent, and says so on its next
+heartbeat), so it never says the prompt did not run: a chat attached to the session and the
+assistant's item end on it with "may not have run" instead of waiting hours for a turn's end, and
+an end of the machine's own for that prompt, if it comes once the machine is back, still closes the
+item with its answer. A `session.new` gets no event and its session is left open (the machine may be
+starting it); a `set_mode` or `resume` is dropped. `cancel`, `close` and `decision` stay deliverable for a day.
 
 `Idempotency-Key` holds for as long as the audit trail does, not only while the command is
 queued: a retry made after the connector has acknowledged the command is answered
@@ -456,5 +471,5 @@ transitions older than the same number of days go in the same sweep.
 label): connector registered and revoked, session created, every command issued, every
 permission requested and resolved. A prompt is recorded as its SHA-256 and length,
 never its text. A queued command is deleted once a heartbeat acknowledges it, or after a day
-unacknowledged (5 minutes for `prompt`, `set_mode` and `resume`): an instruction nobody has
-collected for that long should not run.
+unacknowledged (6 minutes for `session.new`, `prompt`, `set_mode` and `resume`, each recorded as
+`command.expired`): an instruction nobody has collected for that long should not run.

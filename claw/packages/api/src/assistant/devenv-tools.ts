@@ -29,7 +29,7 @@ import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS } from "@claw
 import { CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
-  createSession, findConnector, findSession, issueCommand, listConnectors, sessionActivity, wakeConnector, type Row,
+  createSession, findConnector, findSession, issueCommand, listConnectors, onlineSql, sessionActivity, wakeConnector, type Row,
 } from "../remote-agents/store.js";
 import { connectorSetup, outdatedMessage, versionVerdict, type ConnectorVersionVerdict } from "../remote-agents/setup.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
@@ -767,6 +767,24 @@ async function priorSend(userId: string, plan: SendPlan, cmdId: string): Promise
   };
 }
 
+/**
+ * The owner's connectors registered under the plan's machine name after the one the plan names, not revoked: whether each is
+ * online now, has its command stream open, and reports the plan's agent. Empty when the machine never registered again (or the plan's row is not theirs).
+ */
+async function registeredAgain(
+  userId: string, plan: SendPlan, onlineWindowMs: number,
+): Promise<Array<{ connector_id: string; online: boolean; has_agent: boolean; stream_open: boolean }>> {
+  return (await db.query(
+    `SELECT c.connector_id::text AS connector_id, ${onlineSql(1)} AS online, c.stream_seen_at IS NOT NULL AS stream_open,
+            EXISTS (SELECT 1 FROM claw_remote_agents a WHERE a.connector_id = c.connector_id AND a.agent_id = $4) AS has_agent
+       FROM claw_remote_connectors c JOIN claw_remote_connectors old ON old.connector_id = $3::uuid AND old.owner_user_id = $2
+      WHERE c.owner_user_id = $2 AND c.name = old.name AND c.connector_id <> old.connector_id AND c.revoked_at IS NULL
+        AND c.created_at > old.created_at
+      ORDER BY c.created_at`,
+    [onlineWindowMs / 1000, userId, plan.connector_id, plan.agent_id],
+  )).rows;
+}
+
 export type SendOutcome =
   | { ok: true; item_id: string; seq: number; title: string; session_id: string; machine: string; agent: string; new_session: boolean; duplicate?: boolean }
   | { ok: false; error: string; message: string };
@@ -777,12 +795,33 @@ export type SendOutcome =
  * machine is theirs and online, the session limit, the command rate, and a session working on something is not sent another.
  */
 export async function executeSend(
-  userId: string, plan: SendPlan, text: string, cmdId: string, lang: RemoteLang,
+  userId: string, asked: SendPlan, text: string, cmdId: string, lang: RemoteLang,
   onlineWindowMs: number = REMOTE_AGENT_TIMING.onlineWindowMs,
 ): Promise<SendOutcome> {
+  let plan = asked;
   const prior = await priorSend(userId, plan, cmdId);
   if (prior) return prior;
-  const connector = await findConnector(userId, plan.connector_id, onlineWindowMs);
+  let connector = await findConnector(userId, plan.connector_id, onlineWindowMs);
+  const live = !!connector && !connector.revoked_at && !!connector.online;
+  // Online by the reconnect grace only (`STREAM_GRACE_SECS`: its stream has just ended), or not at all: the machine may have registered
+  // again since the plan (or the card) was made (a reinstall, a lost state directory, a rebuilt pod, a logout and login), its connector
+  // a new row under the same name.
+  if (!live || connector!.stream_seen_at == null) {
+    const since = await registeredAgain(userId, plan, onlineWindowMs);
+    if (since.length) {
+      const online = since.filter((r) => r.online && r.has_agent && r.stream_open);
+      // A new session on that machine is what the card showed, wherever its connector row now is: it follows it. A session (or a
+      // conversation to take over) of the old registration is gone with it, also when that row is still in its grace but the machine
+      // is already back under a new one: nothing is sent, and the user is asked again. An old row still in its grace with no new one
+      // online is used as it is: it may be the one coming back.
+      if (online.length === 1 && !plan.session_id && !plan.resume_ref) {
+        plan = { ...plan, connector_id: String(online[0].connector_id) };
+        connector = await findConnector(userId, plan.connector_id, onlineWindowMs);
+      } else if (!live || online.length) {
+        return { ok: false, error: "machine_reconnected", message: `${plan.machine} connected again since this was planned: nothing was sent; ask the user to say it once more` };
+      }
+    }
+  }
   if (!connector || connector.revoked_at) return { ok: false, error: "no_machine", message: "that machine is no longer connected" };
   if (!connector.online) return { ok: false, error: "connector_offline", message: `the machine ${plan.machine} is offline: nothing was sent` };
   if (!plan.session_id && versionVerdict(connector.version).version_status === "unsupported") {
@@ -944,8 +983,14 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
  * their development environments), so pressing one could only fail, and the router must not keep putting it to them. Closed as
  * `expired`, never answered (`decided_via` says why; `result.error` is the word a press now gets, `no_machine`), in the caller's
  * transaction (`revokeConnector`). Returns the ids closed.
+ *
+ * `replaced`: the row was revoked because the same machine registered again (`registerConnector`), not removed. A card for a new
+ * session on that machine stays: pressed, it follows the machine's new registration (`executeSend`). Only a card that continues a
+ * session (or takes over a conversation) of the old registration closes, as `machine_reconnected`.
  */
-export async function closeCardsOfConnector(q: Querier, owner: string, connectorId: string): Promise<string[]> {
+export async function closeCardsOfConnector(
+  q: Querier, owner: string, connectorId: string, opts: { replaced?: boolean } = {},
+): Promise<string[]> {
   // A card being pressed right now is skipped, never waited for: the press holds the card's lock while its send waits for the
   // machine's, which this revoke holds, and the press waits on that send outside the database, so Postgres could not see the
   // cycle and both would hang. That press finishes on its own after this revoke commits: its send reads the machine again under
@@ -955,13 +1000,16 @@ export async function closeCardsOfConnector(q: Querier, owner: string, connector
   const closed = await q(
     `UPDATE claw_assistant_confirmations
         SET status = 'expired', decided_via = 'connector_revoked', decided_at = NOW(),
-            result = jsonb_build_object('error', 'no_machine', 'message', 'that machine was removed before the card was answered: nothing was sent')
+            result = CASE WHEN $3 THEN jsonb_build_object('error', 'machine_reconnected', 'message',
+                                 'that machine was set up again and the session this card continued went with its old registration: nothing was sent')
+                          ELSE jsonb_build_object('error', 'no_machine', 'message', 'that machine was removed before the card was answered: nothing was sent') END
       WHERE confirmation_id IN (
               SELECT confirmation_id FROM claw_assistant_confirmations
                WHERE user_id = $1 AND kind = 'devenv_send' AND status = 'pending' AND params->>'connector_id' = $2
+                 AND (NOT $3 OR COALESCE(params->>'session_id', '') <> '' OR COALESCE(params->>'resume_ref', '') <> '')
                  FOR UPDATE SKIP LOCKED)
       RETURNING confirmation_id`,
-    [owner, connectorId],
+    [owner, connectorId, opts.replaced === true],
   );
   return (closed.rows as Array<{ confirmation_id: string }>).map((r) => r.confirmation_id);
 }

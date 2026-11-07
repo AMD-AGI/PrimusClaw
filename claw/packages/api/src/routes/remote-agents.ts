@@ -35,7 +35,7 @@ import { CONNECTOR_GRANT_METHOD, grantOf } from "../auth/connector-grant.js";
 import { notifyPaired } from "../remote-agents/pairing.js";
 import { registerPairingRoutes, type PairingRouteOptions } from "../remote-agents/pairing-routes.js";
 import { CONNECTOR_SIDE_ROUTES } from "../remote-agents/connector-routes.js";
-import { db } from "../infra/db.js";
+import { db, inTransaction } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
@@ -78,6 +78,23 @@ export interface RemoteAgentOptions {
    * stream on another replica, so a Claw release is neither an offline transition nor a notice.
    */
   closing?: AbortSignal;
+  /** How often this replica ends commands that were never delivered (`store.expireUndelivered`); zero or less runs no sweep. */
+  undeliveredSweepMs?: number;
+}
+
+/**
+ * Sessions that gained Claw's own event for a command that was never delivered (`store.expireUndelivered`): their readers on this
+ * replica are woken (others poll), and their items move, so the user is told now instead of waiting hours for an answer.
+ */
+async function sayUndelivered(list: store.Undelivered[], wake: (sessionId: string) => void): Promise<void> {
+  if (!list.length) return;
+  for (const u of list) wake(u.session_id);
+  const byOwner = new Map<string, string[]>();
+  for (const u of list) byOwner.set(u.owner, [...(byOwner.get(u.owner) ?? []), u.session_id]);
+  for (const [owner, sessionIds] of byOwner) {
+    await noteRemoteEvents(owner, sessionIds).catch((err) => logger.warn({ err: (err as Error)?.message }, "remote_agents.undelivered_note_failed"));
+  }
+  logger.info({ sessions: list.length }, "remote_agents.undelivered_ended");
 }
 
 /**
@@ -263,6 +280,26 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const stop = startTerminalWaitSweep({ onlineWindowMs, noticeAfterMs: opts.terminalWaitNoticeMs ?? TERMINAL_WAIT_NOTICE_MS, sweepMs: presenceSweepMs });
     app.addHook("onClose", async () => stop());
   }
+  // A command accepted while its machine still looked online (a laptop closed within the online window) and never collected:
+  // every replica looks as often as presence is swept, whether or not the machine ever comes back; a delete hands each to one.
+  const undeliveredSweepMs = opts.undeliveredSweepMs ?? PRESENCE_SWEEP_MS;
+  if (undeliveredSweepMs > 0) {
+    let timer: NodeJS.Timeout | undefined;
+    let stopped = false;
+    const tick = async () => {
+      try {
+        await sayUndelivered(await inTransaction((q) => store.expireUndelivered(q)), (sid) => waker.wake(`s:${sid}`));
+      } catch (err) {
+        logger.warn({ err: (err as Error)?.message }, "remote_agents.undelivered_sweep_failed");
+      }
+      if (stopped) return;
+      timer = setTimeout(tick, undeliveredSweepMs);
+      timer.unref();
+    };
+    timer = setTimeout(tick, undeliveredSweepMs);
+    timer.unref();
+    app.addHook("onClose", async () => { stopped = true; clearTimeout(timer); });
+  }
   await registerPairingRoutes(app, opts.pairing);
   // A reader's stream polls the database, so one user cannot hold an unbounded number open.
   const openReaders = new Map<string, number>();
@@ -291,8 +328,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     try {
       row = await store.registerConnector(
         owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req), onlineWindowMs,
-        // A replaced row is revoked: the cards that would send to it close with it, as on the revoke route.
-        (q, id) => closeCardsOfConnector(q, owner, id).then(() => undefined),
+        // A replaced row is revoked: the cards that would continue one of its sessions close with it; one for a new session on that
+        // machine stays, and follows the new registration when pressed (`executeSend`).
+        (q, id) => closeCardsOfConnector(q, owner, id, { replaced: true }).then(() => undefined),
         grantOf(req),
       );
     } catch (err) {
@@ -365,7 +403,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!connector) return;
     const hb = parseHeartbeat(req.body);
     if (!hb.ok) return fail(reply, 400, hb.error);
-    await store.recordHeartbeat(connector.connector_id, owner, hb.value);
+    const undelivered = await store.recordHeartbeat(connector.connector_id, owner, hb.value);
+    await sayUndelivered(undelivered, (sid) => waker.wake(`s:${sid}`));
     // Below the recommended version the answer says so, with the command that upgrades it; a connector may print it.
     const verdict = versionVerdict(hb.value.version ?? (connector.version as string | null));
     return reply.send({ ok: true, data: {

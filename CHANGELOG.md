@@ -150,6 +150,20 @@ record it.
   lets a call already in flight finish, for up to `SIGTERM_TOOL_GRACE_MS` (default the foreground ceiling plus 20 s, at most 180 s,
   inside the chart's 300 s grace), and the resumed run continues from its recorded result. A call still running then is cut as
   before, and the model is told not to mention the restart.
+- Development environments: an instruction accepted while a closed laptop still looked online no longer leaves its chat and its
+  assistant item waiting for hours. Five minutes on it is not delivered any more, as before (a new session too, which until now was
+  still started up to a day later), and once its machine has gone away since it was queued with nothing heard from it in that
+  session and no turn running before it, Claw ends the prompt's turn with `turn_end {error: "delivery_unconfirmed"}`: the item closes
+  as dropped and the user is told once that it may not have run. The machine's own end of it, if it comes later, still closes the
+  item with its answer. A prompt waiting behind a running turn is never ended this way.
+- A `devenv_send` card pressed after its machine registered again (a reinstall, a lost state directory, a rebuilt pod) sends the new
+  session to the machine's new registration, when exactly one of that name is online with that agent, instead of failing with
+  `no_machine`. A card that continues a session of the old registration fails with `machine_reconnected` and sends nothing; when
+  the old row is replaced on registering again, such a card is closed at once as `machine_reconnected`, while a card for a new session
+  keeps waiting (it was closed with the row before). An old row still in its reconnect grace is passed over for a newer one online.
+- A connector whose command stream has just ended without a graceful hand-over (a replica that crashed, an ingress or gateway
+  restart, a token refresh) is online for 45 s more while its heartbeat is fresh: a session asked for in that gap is queued and
+  delivered on the next stream, not refused with `connector_offline`, and the break is not recorded as an offline transition.
 - Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
   忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
   not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with
