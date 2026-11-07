@@ -89,7 +89,7 @@ describe("pairing a machine with a one-time code", { skip }, () => {
   test("P1 the person's code is in one command line; it works once, and the grant registers a connector that is theirs", async () => {
     const d = await newCode("alice");
     assert.match(d.code, /^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/);
-    assert.equal(d.command, `npm install -g @primusclaw/connector@latest && claw-connector pair ${d.code} --server ${SERVER}`);
+    assert.equal(d.command, `npm install -g --no-update-notifier @primusclaw/connector@latest && claw-connector pair ${d.code} --server ${SERVER}`);
     assert.equal(d.expires_in, 600);
     assert.equal(d.server, SERVER);
     // Only a hash of the code is kept.
@@ -116,6 +116,30 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     assert.equal(audit[2].detail.credential, "connector_grant");
     assert.ok(!JSON.stringify(audit).includes(token), "the grant is not in the audit trail");
     assert.deepEqual(told, [{ owner: "alice", name: "laptop" }], "the owner is told once that a machine was paired");
+  });
+
+  test("P1b a hostname another live machine of theirs has: the claim names the alternate (numbered when that is taken too); asked for no alternate, the name stays", async () => {
+    const withAlt = (code: string, name: string, alternate_name?: string) =>
+      call("POST", "/v1/remote-agents/pairings/claim", { body: { code, name, ...(alternate_name ? { alternate_name } : {}) } });
+    // The first machine called "box": nothing is taken, it keeps the hostname.
+    const first = await withAlt((await newCode("alice")).code, "box", "box-api");
+    assert.equal(first.body.data.name, "box");
+    const t1 = first.body.data.token as string;
+    assert.equal((await register(t1, "box")).status, 201);
+    // A second folder on that machine: the alternate. A third folder of the same name: numbered.
+    const second = await withAlt((await newCode("alice")).code, "box", "box-api");
+    assert.equal(second.body.data.name, "box-api");
+    assert.equal((await register(second.body.data.token as string, "box-api")).status, 201);
+    const third = await withAlt((await newCode("alice")).code, "BOX", "box-api");
+    assert.equal(third.body.data.name, "box-api-2", "names compare without case, as the chat finds a machine");
+    // A connector that sent no alternate (its name was chosen) keeps it; another owner's "box" takes nothing from alice's.
+    assert.equal((await withAlt((await newCode("alice")).code, "box")).body.data.name, "box");
+    assert.equal((await withAlt((await newCode("bob")).code, "box", "box-api")).body.data.name, "box");
+    // A revoked machine's name is free again.
+    await q("UPDATE claw_remote_connectors SET revoked_at = NOW() WHERE owner_user_id = 'alice'");
+    assert.equal((await withAlt((await newCode("alice")).code, "box", "box-api")).body.data.name, "box");
+    const names = (await q("SELECT device_name FROM claw_remote_grants WHERE owner_user_id = 'alice' ORDER BY created_at")).rows.map((r) => r.device_name);
+    assert.deepEqual(names, ["box", "box-api", "box-api-2", "box", "box"]);
   });
 
   test("P2 a wrong, expired or retired code gets one answer, and nothing is created", async () => {

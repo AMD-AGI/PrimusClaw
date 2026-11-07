@@ -133,16 +133,17 @@ export async function registerPairingRoutes(app: FastifyInstance, opts: PairingR
   app.post("/v1/remote-agents/pairings/claim", async (req, reply) => {
     const caller = callerKey(req);
     if (perCaller.full(caller)) return fail(reply, 429, "rate_limited");
-    const body = (req.body ?? {}) as { code?: unknown; name?: unknown };
+    const body = (req.body ?? {}) as { code?: unknown; name?: unknown; alternate_name?: unknown };
     if (!(await gate.enter())) return fail(reply, 503, "busy");
     let out: Awaited<ReturnType<typeof claimPairing>>;
-    try { out = await claimPairing(body.code, body.name); } finally { gate.leave(); }
+    try { out = await claimPairing(body.code, body.name, new Date(), body.alternate_name); } finally { gate.leave(); }
     if (!out.ok) {
       perCaller.count(caller);
       return fail(reply, 400, out.error);
     }
     logger.info({ owner: out.owner, grantId: out.grantId }, "remote_agents.pairing_claimed");
-    return reply.status(201).send({ ok: true, data: { token: out.token, server } });
+    // name: what the machine is called (a connector that sent an alternate name pairs under the one given here).
+    return reply.status(201).send({ ok: true, data: { token: out.token, server, ...(out.name ? { name: out.name } : {}) } });
   });
 
   // Claimed codes that never registered, and old codes. Hourly on every replica; idempotent.

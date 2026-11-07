@@ -317,7 +317,11 @@ export interface DevenvList {
    * message, a one-line pairing command made for them now (`pairing`, as devenv_pair gives it); else, or where pairing is refused,
    * the setup commands with this deployment's addresses (`remote-agents/setup.ts`).
    */
-  connect_a_machine?: { commands: string[]; text: string; pairing?: { expires_in_minutes: number; single_use: true } };
+  connect_a_machine?: {
+    commands: string[]; text: string; pairing?: { expires_in_minutes: number; single_use: true };
+    /** Every machine of the user's is offline: `text` first says how to bring them back, then how to connect a new one. */
+    all_offline?: true;
+  };
   note: string;
 }
 
@@ -414,6 +418,30 @@ export function sendConnectMessage(c: ConnectNew): string {
     + (c.refused === "rate_limited" ? "; they can ask again in a minute for a one-line pairing command" : "") + ".";
 }
 
+/** The one command that starts an offline machine's connector again (as a service, or the keep-alive supervisor). */
+export const RESTART_COMMAND = "claw-connector service install";
+
+/**
+ * What a user whose machines are all offline is told, in one reply: one line for the offline machine(s), how to bring them back,
+ * and one for a new machine (`connect`, the pairing command or the setup commands). "连接我的开发环境" from such a user was read as
+ * "connect that offline machine" and answered only "it is still offline" (DM2, 2026-11-07): it left out the new machine they meant.
+ */
+export function allOfflineText(names: string[], connect: string, zh: boolean): string {
+  // Named by the connector: one line each, no backticks (they would end the code span), at most a few.
+  const all = names.map((n) => flat(n.replace(/`/g, "'"), NAME_MAX) ?? "?");
+  const shown = all.length > 5 ? [...all.slice(0, 5), zh ? `等 ${all.length} 台` : `and ${all.length - 5} more`] : all;
+  const list = shown.join(zh ? "、" : ", ");
+  return zh
+    ? `你的开发机 ${list} ${shown.length > 1 ? "都" : ""}离线：在那台机器上运行 \`${RESTART_COMMAND}\` 就能让它重新上线。\n要连接一台新机器：${connect}`
+    : `Your machine${shown.length > 1 ? "s" : ""} ${list} ${shown.length > 1 ? "are" : "is"} offline: run \`${RESTART_COMMAND}\` on ${shown.length > 1 ? "each" : "it"} to bring ${shown.length > 1 ? "them" : "it"} back.\n`
+      + `To connect a new machine instead: ${connect}`;
+}
+
+export const ALL_OFFLINE_NOTE = " Every machine of the user's is offline, so nothing can be attached or sent now. Whatever they asked about "
+  + "connecting (连接我的开发环境, connect me, attach), answer in one reply with connect_a_machine.text as it is: it says how to bring "
+  + "the offline machine back AND how to connect a new one; its commands exact, each in a code block or inline as written, and nothing "
+  + "added. Do not call devenv_pair for another. Never say it is \"still\" offline or \"the same as last time\" (还是, 上次): say only what this list shows.";
+
 const OUTDATED_NOTE = " A machine whose version_status is outdated or unsupported needs its connector upgraded (unsupported: no new session "
   + "starts on it): give the user its upgrade_command as it is.";
 
@@ -438,9 +466,12 @@ export async function devenvList(
   // Before any of it is passed on: from here on this turn has read what a connector and its agents reported.
   await markUntrustedRead((text, params) => db.query(text, params), claims.sid, claims.mid);
   const { machines, attachable } = await collect(userId, detail === "activity", onlineWindowMs);
-  const message = machines.length ? null : await turnMessage((text, params) => db.query(text, params), claims.sid, claims.mid);
+  // No machine, or none online: what connects one (and, when all are offline, what brings them back) is part of the answer.
+  const allOffline = machines.length > 0 && machines.every((m) => !m.online);
+  const connecting = machines.length === 0 || allOffline;
+  const message = connecting ? await turnMessage((text, params) => db.query(text, params), claims.sid, claims.mid) : null;
   const old = machines.some((m) => m.version_status === "outdated" || m.version_status === "unsupported");
-  const made = machines.length ? null : await connectNew(claims, gate);
+  const made = connecting ? await connectNew(claims, gate) : null;
   const zh = langOf(message?.content ?? "") === "zh";
   // "Connect me" without naming one: the one session open through Claw, else the one conversation that can be taken over, else
   // (no session at all) the one agent that can start one. One open in a terminal is never the default: it can only be watched,
@@ -458,9 +489,17 @@ export async function devenvList(
       ? { label: pick.label, ref: pick.ref, attach_command: attachCommand(pick.ref), ...(pick.opened_in === "agent" ? { new_session: true } : {}) }
       : null,
     ...(made
-      ? { connect_a_machine: { commands: made.commands, text: zh ? made.text.zh : made.text.en, ...(made.pairing ? { pairing: made.pairing } : {}) } }
+      ? {
+        connect_a_machine: {
+          commands: allOffline ? [RESTART_COMMAND, ...made.commands] : made.commands,
+          text: allOffline ? allOfflineText(machines.map((m) => m.machine ?? "?"), zh ? made.text.zh : made.text.en, zh) : zh ? made.text.zh : made.text.en,
+          ...(made.pairing ? { pairing: made.pairing } : {}),
+          ...(allOffline ? { all_offline: true as const } : {}),
+        },
+      }
       : {}),
-    note: (detail === "activity" ? ACTIVITY_NOTE : STATUS_NOTE) + (made ? noteFor(made) : "") + (old ? OUTDATED_NOTE : ""),
+    note: (detail === "activity" ? ACTIVITY_NOTE : STATUS_NOTE) + (made ? (allOffline ? ALL_OFFLINE_NOTE : noteFor(made)) : "")
+      + (old ? OUTDATED_NOTE : ""),
   };
 }
 

@@ -220,7 +220,7 @@ router's `devenv_pair` tool, or `devenv_list` itself when the person has no mach
 pairing command; both only in a turn answering a message they sent signed in, recently); the client calls `POST /v1/remote-agents/pairings` as that person and shows the answer's `command`:
 
 ```
-npm install -g @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
+npm install -g --no-update-notifier @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
 ```
 
 Running it on the machine is the approval. `claw-connector pair` posts `{code, name}` to `POST /v1/remote-agents/pairings/claim`,

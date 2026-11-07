@@ -38,6 +38,11 @@ export interface PairDeps {
 
 const USAGE = "usage: claw-connector pair <code> --server <Claw API URL> [--name <machine name>] [--no-start]";
 
+/** The account the command runs as, for {@link alternateName}. */
+function userName(env: NodeJS.ProcessEnv): string | null {
+  try { return env.USER ?? env.LOGNAME ?? os.userInfo().username; } catch { return null; }
+}
+
 /** Which of `DETECTED_AGENTS` have their program on `PATH`. */
 export function detectAgents(env: NodeJS.ProcessEnv): string[] {
   const dirs = (env.PATH ?? "").split(path.delimiter).filter(Boolean);
@@ -62,6 +67,18 @@ name = ${q(o.name)}
 
 ${blocks.join("\n\n")}
 `;
+}
+
+/**
+ * The name to pair under when the hostname is already another of the person's machines (Claw decides; `alternate_name`): the
+ * hostname and the folder the agents work in, or the user when that folder is the home directory. Two folders on one machine,
+ * or two containers with one hostname, would otherwise be two machines of one name.
+ */
+export function alternateName(host: string, root: string, user: string | null): string {
+  const clean = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[-.]+|[-.]+$/g, "").slice(0, 24);
+  const atHome = path.resolve(root) === path.resolve(os.homedir());
+  const tail = clean(atHome ? (user ?? "") : path.basename(root)) || clean(user ?? "");
+  return tail ? `${host.slice(0, 63 - tail.length)}-${tail}` : host;
 }
 
 /** The folder agents get: where the command was run, unless that is the root of the filesystem. */
@@ -100,7 +117,11 @@ export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise
       return 2;
     }
   }
-  const name = (values.name ?? cfg?.name ?? ctx.hostname ?? os.hostname()).trim().slice(0, 64);
+  let name = (values.name ?? cfg?.name ?? ctx.hostname ?? os.hostname()).trim().slice(0, 64);
+  // A name nobody chose (the hostname) may be taken by another of their machines: Claw then pairs it under the alternate.
+  const root = defaultRoot(ctx.cwd ?? process.cwd());
+  const chosen = values.name !== undefined || cfg !== null;
+  const alternate = chosen ? null : alternateName(name, root, userName(ctx.env));
 
   // 1. The code, traded for a grant. Nothing is written before Claw has said yes.
   const f = ctx.fetch ?? fetch;
@@ -108,7 +129,7 @@ export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise
   try {
     res = await f(`${server}/v1/remote-agents/pairings/claim`, {
       method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({ code, name }), signal: AbortSignal.timeout(20_000),
+      body: JSON.stringify({ code, name, ...(alternate && alternate !== name ? { alternate_name: alternate } : {}) }), signal: AbortSignal.timeout(20_000),
     });
   } catch (e) {
     ctx.err(`could not reach Claw at ${server} (${errMessage(e)}); check the address and the network, then run the same command again`);
@@ -127,13 +148,18 @@ export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise
     ctx.err(`Claw did not accept the pairing (${err || `HTTP ${res.status}`}); is ${server} the Claw API address the chat gave?`);
     return 1;
   }
+  // The name Claw paired it under: the hostname, or the alternate when the hostname is another machine of theirs.
+  const given = data && typeof data.name === "string" ? data.name.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 64) : "";
+  if (!chosen && given && given !== name) {
+    ctx.out(`another of your machines is already called "${name}": this one is "${given}" (choose another with --name)`);
+    name = given;
+  }
 
   // 2. What may run here: an agents.toml of its own when there is none.
   if (!cfg) {
     let agents = detectAgents(ctx.env);
     const none = agents.length === 0;
     if (none) agents = ["claude"];
-    const root = defaultRoot(ctx.cwd ?? process.cwd());
     fs.mkdirSync(path.dirname(cfgFile), { recursive: true, mode: 0o700 });
     try {
       // "wx": created only if it is still not there, in one step.

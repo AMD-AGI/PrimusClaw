@@ -9,7 +9,7 @@ import path from "node:path";
 import test, { describe } from "node:test";
 import { main, EXIT, type Ctx } from "../src/commands.js";
 import { parseConfig } from "../src/config.js";
-import { defaultRoot, detectAgents, pairedConfig } from "../src/pair.js";
+import { alternateName, defaultRoot, detectAgents, pairedConfig } from "../src/pair.js";
 import { credentialsFile, identityFile, identityKeepFile, resolveDirs } from "../src/paths.js";
 import { saveCredentials } from "../src/credentials.js";
 import { FakeClaw } from "./support/fake-claw.js";
@@ -63,7 +63,8 @@ describe("claw-connector pair", () => {
       fs.writeFileSync(identityKeepFile(resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv)), JSON.stringify({ server: claw.url, connector_id: "old" }));
       const a = ctx(home, { fetch: f, cwd: work, env: { PATH: fakePath("claude", "codex"), CLAUDE_CONFIG_DIR: path.join(home, "cc") } });
       assert.equal(await main(["pair", "abcd-efgh-jkmn", "--server", claw.url, "--no-start"], a.c), EXIT.ok, a.errText());
-      assert.deepEqual(seen.map((s) => s.body), [{ code: "abcd-efgh-jkmn", name: "box" }]);
+      // The hostname, and the name to use instead should it be another machine of theirs: it and the folder.
+      assert.deepEqual(seen.map((s) => s.body), [{ code: "abcd-efgh-jkmn", name: "box", alternate_name: `box-${path.basename(work)}` }]);
       const toml = fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8");
       const cfg = parseConfig(toml, { hostname: "box" });
       // (A claude agent also brings the machine's own Claude conversations, `claude-sessions`, by itself.)
@@ -118,6 +119,38 @@ describe("claw-connector pair", () => {
       await running;
       await claw.close();
     }
+  });
+
+  test("a hostname another of their machines has: paired under the name Claw gives back (hostname and folder), said once", async () => {
+    const home = tmpdir();
+    const work = path.join(tmpdir("w-"), "proj");
+    fs.mkdirSync(work);
+    const seen: any[] = [];
+    const a = ctx(home, {
+      fetch: claimFetch((b) => ({ status: 201, body: { ok: true, data: { token: GRANT, name: b.alternate_name } } }), seen),
+      cwd: work, env: { PATH: fakePath("claude"), USER: "alice", CLAUDE_CONFIG_DIR: path.join(home, "cc") },
+    });
+    assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start"], a.c), EXIT.ok, a.errText());
+    assert.deepEqual(seen[0].body, { code: "ABCD-EFGH-JKMN", name: "box", alternate_name: "box-proj" });
+    assert.equal(parseConfig(fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8"), { hostname: "box" }).name, "box-proj");
+    assert.equal(JSON.parse(fs.readFileSync(credentialsFile(a.c.dirs), "utf8")).device_name, "box-proj");
+    assert.match(a.text(), /another of your machines is already called "box": this one is "box-proj" \(choose another with --name\)/);
+    assert.match(a.text(), /paired "box-proj" with/);
+
+    // A name the person chose (--name) is never swapped: no alternate is sent, and an answer naming another is not taken.
+    const home2 = tmpdir();
+    const seen2: any[] = [];
+    const b = ctx(home2, { fetch: claimFetch(() => ({ status: 201, body: { ok: true, data: { token: GRANT, name: "other" } } }), seen2), cwd: work });
+    assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--name", "mine", "--no-start"], b.c), EXIT.ok, b.errText());
+    assert.deepEqual(seen2[0].body, { code: "ABCD-EFGH-JKMN", name: "mine" });
+    assert.equal(parseConfig(fs.readFileSync(path.join(home2, "config", "agents.toml"), "utf8"), { hostname: "box" }).name, "mine");
+  });
+
+  test("the alternate name: hostname and folder, or the user in the home directory, in safe characters", () => {
+    assert.equal(alternateName("box", "/work/my repo!", "alice"), "box-my-repo");
+    assert.equal(alternateName("box", os.homedir(), "alice"), "box-alice");
+    assert.equal(alternateName("box", "/", null), "box");
+    assert.equal(alternateName("h".repeat(64), "/w/proj", null).length <= 64, true);
   });
 
   test("a wrong, expired or used code writes nothing and exits 78 with what to do", async () => {

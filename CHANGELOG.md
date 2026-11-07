@@ -101,6 +101,20 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- "连接我的开发环境" from someone whose machines are all offline answers, in one reply, how to bring the offline machine back
+  (`claw-connector service install` on it) and the one-line pairing command for a new machine. devenv_list with every machine
+  offline now carries `connect_a_machine` with `all_offline: true`: its `text` is the restart line, then the pairing command (or,
+  where the turn may not pair, the setup commands), and its note says to give it as it is. Before, the request was read as
+  "connect that old machine" and answered only that it was still offline. The router also no longer says a machine is "still"
+  offline or "the same as last time" (上次) from a check it cannot see in this conversation. Router prompt router-devenv-v11.
+- The pairing command installs with `npm install -g --no-update-notifier`, so npm's "New major version of npm available" notice no
+  longer appears in its output, where it looked like an error.
+- A machine paired without a name of its own (the hostname) that another live machine of the person's already has is paired under
+  the hostname and its folder (or the user, in the home directory): `claw-connector pair` sends that as `alternate_name`, the claim
+  answers the name it paired under in `data.name` (numbered when that is taken too), and the connector writes it into agents.toml
+  and says so. Two folders on one machine were two machines of one name. A name chosen with `--name` or an agents.toml is kept.
+- A paired machine whose configuration is on the container's own file system is told to keep it elsewhere and then ask the chat for a
+  new pairing command, not to "run init and login again", which it never did.
 - "让开发机上的 claude 跑 make test" with no machine connected answers the same one-line pairing command, not the four setup steps.
   devenv_send refused `no_machine` because the user has no machine at all now carries in `data.connect_a_machine` the pairing made
   for them (`commands` the one line, `text_zh` and `text_en` with it in a code block, `pairing` its minutes), under the same gate

@@ -27,7 +27,7 @@ import { parseArgs } from "node:util";
 import { parse as parseToml } from "smol-toml";
 import type { Ctx, ServiceHelpers } from "./commands.js";
 import { isAlive, processStart } from "./children.js";
-import { reconnectFix, reconnectStep } from "./credentials.js";
+import { loadCredentials, reconnectFix, reconnectStep } from "./credentials.js";
 import { needsLogin, recordDisconnect, recentDisconnects } from "./health.js";
 import { credentialsFile, keepaliveFile, keepaliveStampFile, runLogFile, serviceEnvFile, serviceFile, supervisorPidFile } from "./paths.js";
 import { errMessage, isObject, sleep } from "./util.js";
@@ -675,7 +675,7 @@ function scheduleKeepalive(ctx: Ctx, d: ServiceDeps, script: string): void {
     ctx.out("comes back when you next open a shell):");
     ctx.out(`  sh ${sh(script)} >/dev/null 2>&1`);
   }
-  const where = ephemeralWhere(ctx.dirs.config);
+  const where = ephemeralWhere(ctx.dirs.config, readMounts(), signedInByPairing(ctx));
   if (where) ctx.out(`Note: ${where}`);
 }
 
@@ -731,7 +731,7 @@ function mountOf(p: string, mounts: Mount[]): Mount | null {
  * (overlay, tmpfs), the sentence that says so and where to keep it instead; null when it is not (or cannot be told).
  * A dev pod's home directory is often such a place: everything in it is gone when the pod is recreated.
  */
-export function ephemeralWhere(configDir: string, mounts: Mount[] = readMounts()): string | null {
+export function ephemeralWhere(configDir: string, mounts: Mount[] = readMounts(), paired = false): string | null {
   // Only /proc/self/mountinfo is read: a look at a network mount (a stalled one) could hang init or install. The path
   // is taken as written; a configuration reached through a link onto another disk is rare and only misses this note.
   const m = mountOf(path.resolve(configDir), mounts);
@@ -739,7 +739,16 @@ export function ephemeralWhere(configDir: string, mounts: Mount[] = readMounts()
   const persistent = [...new Set(mounts.filter((x) => PERSISTENT_FS.test(x.fstype) && !x.point.startsWith("/proc") && !x.point.startsWith("/sys")).map((x) => x.point))].slice(0, 3);
   return `agents.toml and the sign-in are in ${configDir}, on the container's own file system (${m.fstype}), which is lost when the container is recreated. `
     + `Keep them on storage that outlives it: export CLAW_CONNECTOR_CONFIG_DIR=<a directory of yours on ${persistent.length ? persistent.join(" or ") : "a persistent volume"}>/claw-connector `
-    + `in your shell profile and the container's startup command, then run init and login again (the state directory, with its pid and lock files, stays where it is).`;
+    + `in your shell profile and the container's startup command, then `
+    + (paired
+      // A paired machine never ran init or login: what connects it again is a new pairing command from the chat.
+      ? `ask Clawy for a new pairing command ("连接我的开发环境") and run it in that shell (the state directory, with its pid and lock files, stays where it is).`
+      : `run init and login again (the state directory, with its pid and lock files, stays where it is).`);
+}
+
+/** Whether this machine's sign-in came from `pair` (a connector grant): it never ran init or login. */
+function signedInByPairing(ctx: Ctx): boolean {
+  try { return loadCredentials(credentialsFile(ctx.dirs))?.kind === "grant"; } catch { return false; }
 }
 
 // --- service-env.json ---------------------------------------------------------------------

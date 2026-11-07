@@ -826,6 +826,11 @@ describe("a container whose home does not outlive it", () => {
     assert.match(said ?? "", /CLAW_CONNECTOR_CONFIG_DIR=/);
     assert.equal(ephemeralWhere("/root/persist/claw", mounts), null);
     assert.equal(ephemeralWhere("/mnt/ceph/me/claw", mounts), null);
+    assert.match(said ?? "", /then run init and login again/, "a machine that signed in with login is told to do so again");
+    // A paired machine never ran init or login: it is sent back to the chat for a new pairing command.
+    const paired = ephemeralWhere("/root/.config/claw-connector", mounts, true) ?? "";
+    assert.match(paired, /then ask Clawy for a new pairing command \("连接我的开发环境"\) and run it in that shell/);
+    assert.doesNotMatch(paired, /init|login/);
   });
 
   test("CLAW_CONNECTOR_CONFIG_DIR moves only the configuration and sign-in; the state stays", () => {

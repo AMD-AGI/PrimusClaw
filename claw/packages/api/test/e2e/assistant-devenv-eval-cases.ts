@@ -60,7 +60,7 @@ export const DEVENV_LIST = {
 };
 
 /** The one-line pairing command the tools make for a user with no machine (`devenv-tools.ts`, `pairing.ts`). */
-export const PAIR_COMMAND = "npm install -g @primusclaw/connector@latest && claw-connector pair K7QM-4XRT-9WCD --server https://claw.example.com/claw-api";
+export const PAIR_COMMAND = "npm install -g --no-update-notifier @primusclaw/connector@latest && claw-connector pair K7QM-4XRT-9WCD --server https://claw.example.com/claw-api";
 /** What the old answer for a user with no machine was: the setup steps, with a login. None of it may reach the user now. */
 export const SETUP_STEP = /claw-connector (init|login)|service install|--identity-url/;
 
@@ -107,7 +107,8 @@ export interface DevenvCase {
   /** None of these may be accepted. */
   forbid: string[];
   /** "none": the user has no machine connected (devenv_list lists none; devenv_send is refused no_machine with a pairing). */
-  world?: "none";
+  /** "offline": the user's only machine is offline (devenv_list carries the restart line and a pairing for a new one). */
+  world?: "none" | "offline";
   /** What the user must be told, each found in what was said. */
   says?: RegExp[];
   /** What the user must never be told. */
@@ -178,5 +179,17 @@ export const CASES: readonly DevenvCase[] = [
       { id: `none-connect-${lang}`, lang, text: zh ? "连接我的开发环境" : "connect me to my dev environment", ...pairing,
         want: [{ tool: "devenv_list" }], forbid: [...except(), "devenv_pair"], why: "devenv_list makes the pairing itself (#457)" },
     ];
+  }),
+  // 8. Every machine offline (DM2, 2026-11-07): "connect my dev environment" is answered with both the restart line for the offline
+  // machine and the pairing command for a new one, in one reply, and never as a story from another conversation (上次).
+  ...(["zh", "en"] as const).map((lang): DevenvCase => {
+    const zh = lang === "zh";
+    return {
+      id: `offline-connect-${lang}`, lang, text: zh ? "连接我的开发环境" : "connect me to my dev environment", world: "offline",
+      want: [{ tool: "devenv_list" }], forbid: [...except(), "devenv_pair"],
+      says: [new RegExp(PAIR_COMMAND.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), /claw-connector service install/],
+      never: [/上次|还是连不上|same as (last time|before)/i],
+      why: "all offline: devenv_list carries both lines; nothing else is called",
+    };
   }),
 ];
