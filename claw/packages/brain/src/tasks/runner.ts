@@ -55,7 +55,7 @@ import {
 } from "../config.js";
 import { ensureHands } from "../sandbox/ensure-hands.js";
 import { parseToolAllowlist } from "../tools/allowlist.js";
-import { allowsSandboxUse } from "../tools/hands.js";
+import { allowsSandboxUse, isSandboxTool } from "../tools/hands.js";
 import { isMultiNodeRequest } from "../sandbox/multi-node/prompt-flags.js";
 import { applyReviewProfileBackstop, reviewTurnBudgetRefusal } from "../agent/review-profile.js";
 import { gpuWorkspaceFor } from "../sandbox/workspace-select.js";
@@ -1139,6 +1139,27 @@ export function wantsSandboxPrestart(
   return !allowlist || allowsSandboxUse((name) => allowlist.allows(name));
 }
 
+/**
+ * Whether the attempts a checkpoint records had a sandbox to lose: a workspace
+ * sync was taken, or a tool that only runs in a sandbox -- a sandbox tool, a
+ * sub-agent (`task`, which runs on its parent's sandbox) or `deliver_file` --
+ * succeeded. Exported for its test.
+ *
+ * Successes, not attempts, when the checkpoint says which: a call whose sandbox
+ * could not be opened is still counted as an attempt, and an account the platform
+ * refuses a sandbox records one for every such call -- which is exactly the run
+ * that must not be made to open one before it can continue. A checkpoint written
+ * before successes were recorded has only the attempts, and is read by them.
+ */
+export function checkpointUsedSandbox(
+  ckpt: Pick<CheckpointState, "tool_calls_by_name" | "tool_ok_by_name"> & { has_workspace_sync?: boolean },
+): boolean {
+  if (ckpt.has_workspace_sync) return true;
+  const counts = ckpt.tool_ok_by_name ?? ckpt.tool_calls_by_name ?? {};
+  return Object.entries(counts).some(([name, n]) =>
+    (n ?? 0) > 0 && (isSandboxTool(name) || name === "task" || name === "deliver_file"));
+}
+
 /** Why a prestarted open was given up: the run ended without anything asking for its sandbox. */
 const PRESTART_UNUSED_REASON = new Error("sandbox_prestart_unused");
 
@@ -1368,6 +1389,13 @@ class TaskRunner {
   // Read from KV before any provisioning and consumed by the sandbox attach,
   // which may happen much later than the read on a deferred run.
   private pendingResumeCkpt: TaskCheckpoint | null = null;
+  /**
+   * The checkpointed conversation went to the engine before any sandbox was
+   * opened (`resumeWithoutSandbox`). A sandbox opened later in the run restores
+   * /workspace as any resume does, but the conversation is the engine's by then,
+   * so `resolveResumeState` neither replaces it nor adds to it.
+   */
+  private resumeHandedOver = false;
   private handsAttach: Promise<HandsClient> | null = null;
   /**
    * Whether anything in this run has asked for its sandbox: the up-front open, or
@@ -2618,18 +2646,58 @@ class TaskRunner {
   /**
    * A sandbox is provisioned before the first turn only when the run is about
    * the sandbox: script mode drives a fixed tool sequence with no model in
-   * between, a multi-node run exists to get its cluster, and a resumed run
-   * needs its /workspace rehydrated before the model sees a single message.
-   * Every other run — the ordinary chat turn — gets one the first time a tool
-   * actually asks, which for a question answered from the conversation alone
-   * never happens. That is the difference between a 20-second pod start on
-   * every "what did we decide yesterday?" and none at all.
+   * between, a multi-node run exists to get its cluster, and a resumed run whose
+   * earlier attempts used a sandbox needs its /workspace back before the model
+   * reads its own history. Every other run — the ordinary chat turn, and a
+   * resumed run that never used one — gets one the first time a tool actually
+   * asks, which for a question answered from the conversation alone never
+   * happens. That is the difference between a 20-second pod start on every
+   * "what did we decide yesterday?" and none at all.
+   *
+   * A resumed run that never used a sandbox used to open one here anyway, and an
+   * account the platform refuses a sandbox then lost a run that had never needed
+   * one: a 30-turn research task, taken over after a rollout, failed on its first
+   * step with "You do not have a CPU sandbox workspace yet".
    */
   private needsSandboxUpFront(ckpt: TaskCheckpoint | null): boolean {
     if (!BRAIN_LAZY_SANDBOX) return true;
     if (this.request.mode === "script") return true;
     if (isMultiNodeRequest(this.request)) return true;
-    return ckpt !== null;
+    return ckpt !== null && checkpointUsedSandbox(ckpt);
+  }
+
+  /**
+   * Whether a resumed run whose up-front open failed with `err` can carry on
+   * without a sandbox instead of failing: only when the open was up front for
+   * the resume alone (not a script or a cluster, which are nothing without it),
+   * and only when the platform has said it has no sandbox for this run
+   * (SANDBOX_UNAVAILABLE_REASONS). The tools that need one are then told why,
+   * as on any lazy run, and the model carries on with the rest.
+   */
+  private mayResumeWithoutSandbox(err: unknown): boolean {
+    return BRAIN_LAZY_SANDBOX
+      && this.pendingResumeCkpt !== null
+      && this.request.mode !== "script"
+      && !isMultiNodeRequest(this.request)
+      && sandboxUnavailableOf(err) !== null;
+  }
+
+  /**
+   * Hand a resumed run's checkpointed conversation to the engine without
+   * opening a sandbox. The attach would have done this in `resolveResumeState`;
+   * on a run that opens none it has to happen here, or the run starts over from
+   * the user's message and its earlier turns are lost.
+   */
+  private resumeWithoutSandbox(): void {
+    const ckpt = this.pendingResumeCkpt;
+    if (!ckpt || this.resumeCheckpoint) return;
+    this.resumeCheckpoint = ckpt;
+    this.resumeHandedOver = true;
+    logger.info(
+      { sessionId: this.sessionId, messageId: this.messageId, turns: ckpt.turns_completed,
+        has_workspace_sync: ckpt.has_workspace_sync },
+      "task.resume.without_sandbox",
+    );
   }
 
   /**
@@ -3058,7 +3126,7 @@ class TaskRunner {
       // is already in place from the live sandbox itself. Most common
       // resume path under normal SIGTERM redelivery (≤ 10 min ack_wait,
       // sandbox idle GC at ~15 min).
-      this.resumeCheckpoint = ckpt;
+      if (!this.resumeHandedOver) this.resumeCheckpoint = ckpt;
       this.resumeMode = "sandbox_reuse";
       logger.info(
         { sessionId: this.sessionId, turns: ckpt.turns_completed,
@@ -3070,7 +3138,7 @@ class TaskRunner {
       // safe when we have a hex user id AND the prior brain marked
       // has_workspace_sync). Fall through to S3 baseline restore on any
       // failure so the user still gets the best workspace we have.
-      this.resumeCheckpoint = ckpt;
+      if (!this.resumeHandedOver) this.resumeCheckpoint = ckpt;
       let restored = false;
       if (WORKSPACE_PERSIST_BASE && this.userIdHex && ckpt.has_workspace_sync) {
         const restoreCtl = new AbortController();
@@ -3142,7 +3210,8 @@ class TaskRunner {
     const resumeOutcome = classifyResumeOutcome(
       this.resumeMode, ckpt, isPartialAssistantTail, this.msg.info.deliveryCount,
     );
-    if (resumeOutcome.hint && this.resumeCheckpoint) {
+    // Not on a conversation already handed to the engine: it is the loop's now.
+    if (resumeOutcome.hint && this.resumeCheckpoint && !this.resumeHandedOver) {
       // By content, not by the prefix: other notices share it -- an unfinished
       // background start says so through the same channel -- and matching the
       // prefix would let one of those suppress this one on the next resume.
@@ -4767,11 +4836,22 @@ class TaskRunner {
       await this.executeAppRun();
       return;
     }
-    const upFront = this.needsSandboxUpFront(this.pendingResumeCkpt);
+    let upFront = this.needsSandboxUpFront(this.pendingResumeCkpt);
     const prestart = !upFront && wantsSandboxPrestart(this.request);
     if (upFront) {
-      await this.attachHands();
-    } else {
+      try {
+        await this.attachHands();
+      } catch (err) {
+        if (!this.mayResumeWithoutSandbox(err)) throw err;
+        logger.warn(
+          { sessionId: this.sessionId, messageId: this.messageId, reason: sandboxUnavailableOf(err)?.reason },
+          "task.resume.sandbox_unavailable_continuing",
+        );
+        upFront = false;
+      }
+    }
+    if (!upFront) {
+      this.resumeWithoutSandbox();
       await this.startWithoutSandbox(prestart);
     }
     await this.reconcileBackgroundStarts();

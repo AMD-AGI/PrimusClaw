@@ -18,9 +18,11 @@ import type { JsMsg, KV } from "nats";
 import type { ExecuteRequest, ExecuteResult } from "@claw/protocol";
 import {
   bindTaskRunnerDeps,
+  checkpointUsedSandbox,
   runHandleTask,
   type TaskRunnerSideEffects,
 } from "../src/tasks/runner.js";
+import { SandboxProvisionTerminalError, SANDBOX_WORKSPACE_FORBIDDEN } from "../src/sandbox/errors.js";
 import type { Engine, ExecuteExtras } from "../src/agent/index.js";
 import type { NatsEmitter } from "../src/events/emitter.js";
 import { activeAbort } from "../src/tasks/abort-registry.js";
@@ -72,7 +74,7 @@ function result(over: Partial<ExecuteResult> = {}): ExecuteResult {
 }
 
 /** A v3 checkpoint as it would sit in KV for a redelivered run. */
-function seededCheckpoint(): string {
+function seededCheckpoint(over: Record<string, unknown> = {}): string {
   return JSON.stringify({
     version: 3,
     session_id: SESSION,
@@ -93,18 +95,41 @@ function seededCheckpoint(): string {
     plan_mode: false,
     todo_state: [],
     rebuilds_used: 0,
+    ...over,
   });
 }
 
+/** What an attempt that used its sandbox leaves in the checkpoint. */
+const USED_SANDBOX = { tool_calls_by_name: { bash: 3 }, tool_ok_by_name: { bash: 3 }, total_tool_calls: 3 };
+
+/**
+ * What a 30-turn research run of an account the platform refuses a sandbox leaves:
+ * web tools that worked, and the one `bash` it tried, which never got a sandbox.
+ */
+const NEVER_USED_SANDBOX = {
+  turns_completed: 30,
+  tool_calls_by_name: { web_search: 12, web_fetch: 9, bash: 1 },
+  tool_ok_by_name: { web_search: 12, web_fetch: 9 },
+  total_tool_calls: 22,
+  error_count: 1,
+};
+
+const forbidden = () => new SandboxProvisionTerminalError(
+  SANDBOX_WORKSPACE_FORBIDDEN,
+  "You do not have a CPU sandbox workspace yet: your account may not start sandboxes in the global-cpu workspace.",
+);
+
 function stubSideEffects(opts: {
   failFirstEnsure?: boolean;
+  /** Every ensure fails with this, as for an account the platform refuses. */
+  ensureError?: () => Error;
   /**
    * Called while /workspace is being restored, and handed the call log so a test
    * can mark its own events in the same order as the run's.
    */
   duringRestore?: (calls: string[]) => void;
 }) {
-  const { failFirstEnsure, duringRestore } = opts;
+  const { failFirstEnsure, duringRestore, ensureError } = opts;
   const calls: string[] = [];
   const agentDone: Array<Record<string, unknown>> = [];
   let ensureCount = 0;
@@ -117,6 +142,7 @@ function stubSideEffects(opts: {
     ensureHands: ((..._a: unknown[]) => {
       ensureCount++;
       calls.push("ensureHands");
+      if (ensureError) return Promise.reject(ensureError());
       if (failFirstEnsure && ensureCount === 1) {
         return Promise.reject(new Error("no capacity right now"));
       }
@@ -179,16 +205,19 @@ function stubSideEffects(opts: {
 async function runScenario(opts: {
   engineBehavior: (extras: ExecuteExtras | undefined) => Promise<ExecuteResult>;
   request?: Partial<ExecuteRequest>;
-  seedCheckpoint?: boolean;
+  seedCheckpoint?: boolean | Record<string, unknown>;
   failFirstEnsure?: boolean;
+  ensureError?: () => Error;
+  deliveryCount?: number;
   duringRestore?: (calls: string[]) => void;
 }) {
   const { msg, verdicts } = fakeMsg();
+  if (opts.deliveryCount) (msg.info as { deliveryCount: number }).deliveryCount = opts.deliveryCount;
   const { kv } = fakeKv();
   const { kv: kvCkpt, store: ckptStore } = fakeKv();
   if (opts.seedCheckpoint) {
     ckptStore.set(`task-ckpt.${SESSION}.${MESSAGE}`,
-      new TextEncoder().encode(seededCheckpoint()));
+      new TextEncoder().encode(seededCheckpoint(opts.seedCheckpoint === true ? {} : opts.seedCheckpoint)));
   }
   const events: Array<Record<string, unknown>> = [];
   const emitter = {
@@ -197,6 +226,7 @@ async function runScenario(opts: {
   const { sideEffects, calls, agentDone, ensureCount } = stubSideEffects({
     failFirstEnsure: opts.failFirstEnsure,
     duringRestore: opts.duringRestore,
+    ensureError: opts.ensureError,
   });
 
   let handsAtEngineStart: unknown;
@@ -313,9 +343,9 @@ test("a failed attach can be retried by a later tool call", async () => {
   assert.equal(r.ensureCount, 2, "the second call has to be a real attempt, not a cached one");
 });
 
-test("a resumed run provisions before the model sees its own history", async () => {
+test("a resumed run that used its sandbox provisions before the model sees its own history", async () => {
   const r = await runScenario({
-    seedCheckpoint: true,
+    seedCheckpoint: USED_SANDBOX,
     engineBehavior: async () => result(),
   });
 
@@ -489,4 +519,117 @@ test("a requested review with no positive turn budget is refused before a sandbo
   // An ordinary run with max_turns 0 is its owner's choice of no limit, as before.
   const own = await runScenario({ request: { message_id: MESSAGE, max_turns: 0 } as Partial<ExecuteRequest>, engineBehavior: async () => result() });
   assert.ok(own.calls.includes("engine.execute"));
+});
+
+// A run taken over after a restart used to open a sandbox before its first turn
+// whatever it had done before. An account the platform refuses a sandbox then
+// lost a run that had never needed one: a 30-turn research task, resumed after a
+// rollout, failed on its first step with "You do not have a CPU sandbox workspace
+// yet" and the user never got the report.
+
+test("a resumed run that never used a sandbox continues its conversation without opening one", async () => {
+  let handed: ExecuteExtras["resumeCheckpoint"];
+  const r = await runScenario({
+    seedCheckpoint: NEVER_USED_SANDBOX,
+    deliveryCount: 2,
+    // Refused, as the account in the incident was: a run that asks fails here.
+    ensureError: forbidden,
+    async engineBehavior(extras) {
+      handed = extras?.resumeCheckpoint;
+      return result();
+    },
+  });
+
+  assert.equal(r.ensureCount, 0, "nothing asked for a sandbox, so none was opened");
+  assert.ok(r.calls.includes("engine.execute"), "the turn ran");
+  assert.equal(handed?.turns_completed, 30, "and it ran from the checkpoint, not from the user's message");
+  assert.deepEqual(handed?.messages, [{ role: "user", content: "hi" }]);
+  assert.deepEqual(r.verdicts, ["ack"]);
+  assert.equal(r.agentDone.length, 1);
+  assert.equal(r.agentDone[0]!.failureReason, undefined, "the run finished, it did not fail");
+  const statuses = r.events.filter((e) => e.type === "sandboxStatus").map((e) => e.status);
+  assert.ok(statuses.includes("deferred") && !statuses.includes("failed"), statuses.join(","));
+});
+
+test("a deferred resume that opens its sandbox later keeps the conversation the engine already has", async () => {
+  let handed: ExecuteExtras["resumeCheckpoint"];
+  let messagesAtStart = -1;
+  const r = await runScenario({
+    seedCheckpoint: NEVER_USED_SANDBOX,
+    deliveryCount: 2,
+    async engineBehavior(extras) {
+      handed = extras?.resumeCheckpoint;
+      messagesAtStart = handed?.messages.length ?? -1;
+      await extras!.attachHands!();
+      return result();
+    },
+  });
+
+  assert.equal(r.ensureCount, 1, "the tool that asked got its sandbox");
+  assert.ok(r.calls.includes("syncWorkspaceFromS3"), "and /workspace was restored into it as on any resume");
+  assert.equal(handed?.turns_completed, 30);
+  assert.equal(handed?.messages.length, messagesAtStart, "the late open added nothing to a conversation already running");
+  assert.deepEqual(r.verdicts, ["ack"]);
+});
+
+test("a resumed run whose account is refused a sandbox carries on without one rather than failing", async () => {
+  // The up-front open is for the resume alone, so the refusal is what any lazy
+  // run would get: each tool that needs a sandbox is told why, the rest work.
+  let handed: ExecuteExtras["resumeCheckpoint"];
+  let toolSaw: unknown;
+  const r = await runScenario({
+    seedCheckpoint: USED_SANDBOX,
+    deliveryCount: 2,
+    ensureError: forbidden,
+    async engineBehavior(extras) {
+      handed = extras?.resumeCheckpoint;
+      toolSaw = await extras!.attachHands!().then(() => null, (e: unknown) => e);
+      return result();
+    },
+  });
+
+  assert.equal(r.ensureCount, 1, "one refusal, latched: the tool's ask is not a second provision");
+  assert.ok(r.calls.includes("engine.execute"), "the turn ran");
+  assert.equal(handed?.turns_completed, 2, "from the checkpoint");
+  assert.ok(toolSaw instanceof SandboxProvisionTerminalError, "the tool that asked was told the refusal");
+  assert.deepEqual(r.verdicts, ["ack"]);
+  assert.equal(r.agentDone[0]!.failureReason, undefined, "not failed");
+});
+
+test("a script resumed into a refused sandbox still fails: it is nothing without one", async () => {
+  const r = await runScenario({
+    request: { mode: "script" } as Partial<ExecuteRequest>,
+    seedCheckpoint: USED_SANDBOX,
+    deliveryCount: 2,
+    ensureError: forbidden,
+    engineBehavior: async () => result(),
+  });
+  assert.ok(!r.calls.includes("runScript"), "no step ran without the sandbox");
+  assert.equal(r.agentDone[0]!.failureReason, SANDBOX_WORKSPACE_FORBIDDEN);
+});
+
+test("a first delivery of an account refused a sandbox finishes a turn that needs none, prestart or not", async () => {
+  for (const prestart of [false, true]) {
+    const r = await runScenario({
+      request: { sandbox_prestart: prestart } as Partial<ExecuteRequest>,
+      ensureError: forbidden,
+      engineBehavior: async () => result(),
+    });
+    assert.ok(r.calls.includes("engine.execute"), `prestart=${prestart}: the turn ran`);
+    assert.equal(r.ensureCount, prestart ? 1 : 0, `prestart=${prestart}: only the prestart asked`);
+    assert.deepEqual(r.verdicts, ["ack"]);
+    assert.equal(r.agentDone[0]!.failureReason, undefined, `prestart=${prestart}: not failed`);
+  }
+});
+
+test("checkpointUsedSandbox reads successes, and attempts only on a checkpoint that has no successes", () => {
+  assert.equal(checkpointUsedSandbox({ tool_calls_by_name: {} }), false);
+  assert.equal(checkpointUsedSandbox(NEVER_USED_SANDBOX), false, "a bash that never got a sandbox is not a use");
+  assert.equal(checkpointUsedSandbox(USED_SANDBOX), true);
+  assert.equal(checkpointUsedSandbox({ tool_calls_by_name: {}, has_workspace_sync: true }), true, "a synced workspace is one");
+  for (const name of ["task", "deliver_file", "read", "write"]) {
+    assert.equal(checkpointUsedSandbox({ tool_calls_by_name: { [name]: 1 }, tool_ok_by_name: { [name]: 1 } }), true, name);
+  }
+  assert.equal(checkpointUsedSandbox({ tool_calls_by_name: { bash: 1 } }), true, "an older checkpoint is read by its attempts");
+  assert.equal(checkpointUsedSandbox({ tool_calls_by_name: { web_search: 4, load_skill: 1 } }), false);
 });

@@ -331,10 +331,12 @@ function fakeMsg(deliveryCount: number) {
  * Present because `needsSandboxUpFront` is what decides whether this turn calls
  * `ensureHands` at all: with BRAIN_LAZY_SANDBOX defaulting true, an ordinary
  * chat turn gets its sandbox only when a tool asks for one, and a run with
- * nothing to restore never provisions. A resumed run does, before the model
- * sees a message, because its /workspace has to be rehydrated first -- and a
- * resumed run is exactly the shape of a session whose sandbox died under it,
- * which is the situation this whole branch is about.
+ * nothing to restore never provisions. A resumed run whose earlier attempt
+ * used its sandbox does, before the model sees a message, because its
+ * /workspace has to be rehydrated first -- and a resumed run is exactly the
+ * shape of a session whose sandbox died under it, which is the situation this
+ * whole branch is about. Hence the bash call below: a checkpoint with no
+ * sandbox use resumes without one (`checkpointUsedSandbox`).
  */
 function fakeCheckpointKv(): KV {
   const store = new Map<string, Uint8Array>();
@@ -352,8 +354,9 @@ function fakeCheckpointKv(): KV {
     usage: { input_tokens: 10, output_tokens: 20, cache_read: 0, cache_create: 0 },
     text_parts: [],
     error_count: 0,
-    tool_calls_by_name: {},
-    total_tool_calls: 0,
+    tool_calls_by_name: { bash: 1 },
+    tool_ok_by_name: { bash: 1 },
+    total_tool_calls: 1,
     elapsed_ms_before: 1000,
     setup_commands: [],
   })));
