@@ -90,46 +90,143 @@ export interface Ctx {
  */
 export const EXIT = { ok: 0, failure: 1, usage: 2, terminated: 75, needsPerson: 78, revoked: 78 } as const;
 
+/**
+ * One subcommand: how it is called (`usage`, after "claw-connector"), what it does (`about`, wrapped at the width the
+ * overall help prints it), and what runs it. Every entry answers `-h`/`--help` with its own help, before `run` sees
+ * anything (main); `noArgs` commands take nothing after their name, so a stray option is a usage error rather than
+ * ignored. `hidden` ones are started by the connector itself, not by people, and stay out of the overall help.
+ */
+interface Command {
+  usage: string;
+  about: string;
+  hidden?: boolean;
+  noArgs?: boolean;
+  run: (rest: string[], ctx: Ctx) => Promise<number> | number;
+}
+
+/** Every subcommand, in the order the overall help lists them. The single source for dispatch and for help. */
+export const COMMANDS: Readonly<Record<string, Command>> = {
+  init: {
+    usage: "init [--approval ask|never | --approval AGENT=ask|never ...] [--hooks | --no-hooks] [--no-probe]",
+    about: `write a sample agents.toml. In a terminal it then asks whether to add the Claude Code session
+hooks to Claude's settings.json (see "hooks"); --hooks adds them without asking, --no-hooks
+does not, and when nobody can answer they are not added. Agents ask before every write and command by default;
+"--approval never" (or "--approval claude=never") lets phone sessions run like your
+terminal, with no per-step approval. Agents are: ${SAMPLE_AGENTS.join(", ")}.`,
+    run: (rest, ctx) => cmdInit(rest, ctx),
+  },
+  hooks: {
+    usage: "hooks install|uninstall|status [--config-dir DIR]",
+    about: `the SessionStart/SessionEnd hooks that tell this connector which Claude Code sessions are open
+in a terminal; merged into DIR/settings.json (default: the claude-attach agents' config
+directories, else $CLAUDE_CONFIG_DIR or ~/.claude); only its own entries are ever changed`,
+    run: (rest, ctx) => cmdHooks(rest, ctx),
+  },
+  pair: {
+    usage: "pair CODE --server URL",
+    about: `connect this machine with the one-time code your chat gave you ("连接我的开发环境"): writes
+agents.toml if there is none (the agents found here, working in this folder), saves the
+sign-in and starts the service. [--name HOST] [--no-start]`,
+    run: (rest, ctx) => cmdPair(rest, ctx, {
+      runningPid, stop: (c) => cmdStop(c, true), start: (c) => cmdService(["install"], c, serviceHelpers),
+    }),
+  },
+  login: {
+    usage: "login",
+    about: `sign in (device flow); --server URL --identity-url URL [--name HOST]
+development only: --key <api key>  (or CLAW_CONNECTOR_KEY)`,
+    run: (rest, ctx) => cmdLogin(rest, ctx),
+  },
+  run: {
+    usage: "run",
+    about: `connect and serve (Ctrl-C or SIGTERM stops it and every agent it started). Exit code 78:
+revoked, sign-in refused, or no usable config; starting it again will not help`,
+    run: async (rest, ctx) => {
+      const code = await cmdRun(rest, ctx);
+      // launchd cannot be told "never restart on 78"; it does not restart a clean exit. The reason was printed.
+      return code === EXIT.needsPerson && ctx.env.CLAW_CONNECTOR_SUPERVISOR === "launchd" ? EXIT.ok : code;
+    },
+  },
+  service: {
+    usage: "service install|uninstall|status [--supervisor systemd|launchd|script] [--env NAME ...]",
+    about: `keep "run" up: started at login/boot, restarted 5 s after it dies, never restarted
+after exit 78. systemd --user on Linux, launchd on macOS; "script" (containers without
+systemd) writes a keep-alive script and adds it to crontab, or says what must call it.
+The agents' settings in this shell (PATH, proxies, ANTHROPIC_BASE_URL...) go into the
+service; their sign-in variables (ANTHROPIC_API_KEY, OPENAI_API_KEY...) and any --env
+named like a credential go into service-env.json (0600), never into the unit`,
+    run: async (rest, ctx) => {
+      if (rest[0] === "install") await installAdapters(ctx, false);
+      return await cmdService(rest, ctx, serviceHelpers);
+    },
+  },
+  status: {
+    usage: "status [--json]",
+    about: "what is running, signed in, paused, the last disconnect and why",
+    run: (rest, ctx) => cmdStatus(rest, ctx),
+  },
+  doctor: {
+    usage: "doctor [--agent ID] [--json]",
+    about: `check this machine before a phone session fails on it, one fix per problem: Node, each
+agent's program on PATH (and on the installed service's PATH), Claude Code / Codex signed
+in, the roots writable, the proxy variables, Claw's certificate, the service and Claw
+itself; then start each agent's adapter, open a session (no prompt) and check that it
+offers the modes agents.toml needs. Exit 1 when something stops sessions. A running
+connector repeats the machine checks and shows them in the chat; init runs the adapter check`,
+    run: (rest, ctx) => cmdDoctor(rest, ctx),
+  },
+  pause: { usage: "pause", about: `stop every agent now and stay offline until "resume"`, noArgs: true, run: (_, ctx) => cmdPause(ctx) },
+  resume: { usage: "resume", about: `undo "pause"`, noArgs: true, run: (_, ctx) => cmdResume(ctx) },
+  stop: { usage: "stop", about: "stop the running connector and every agent it started", noArgs: true, run: (_, ctx) => cmdStop(ctx) },
+  logout: {
+    usage: "logout",
+    about: "stop, revoke this connector at Claw and the sign-in, and delete the sign-in",
+    noArgs: true,
+    run: (_, ctx) => cmdLogout(ctx),
+  },
+  supervise: {
+    usage: "supervise",
+    about: `(started by "service install --supervisor script", not by people) keep "run" up in the
+background where there is no systemd or launchd`,
+    hidden: true,
+    noArgs: true,
+    run: (rest, ctx) => cmdSupervise(rest, ctx),
+  },
+  "health-check": {
+    usage: "health-check",
+    about: `(started by a running connector, not by people) check the agents given as JSON on stdin and
+print the result as JSON`,
+    hidden: true,
+    noArgs: true,
+    run: (_, ctx) => cmdHealthCheck(ctx, ctx.stdin ?? readStdin),
+  },
+};
+
+const DESC_COL = 27;
+/** One command as the overall help lists it: usage, then its description from column 27 (on the next line when the usage is too long). */
+function helpEntry(c: Command): string {
+  const [first, ...more] = c.about.split("\n");
+  const head = c.usage.length <= DESC_COL - 4 ? `  ${c.usage.padEnd(DESC_COL - 2)}${first}` : `  ${c.usage}\n${" ".repeat(DESC_COL)}${first}`;
+  return [head, ...more.map((l) => " ".repeat(DESC_COL) + l)].join("\n");
+}
+
+/** What `claw-connector CMD --help` prints. */
+export function commandHelp(name: string): string {
+  const c = COMMANDS[name];
+  return `Usage: claw-connector ${c.usage}\n\n${c.about.split("\n").map((l) => "  " + l).join("\n")}\n\nclaw-connector --help lists every command, and where the connector keeps its files.`;
+}
+
+/** `-h` or `--help` among a command's arguments, before a `--` that ends the options. */
+const asksForHelp = (rest: string[]): boolean => {
+  const end = rest.indexOf("--");
+  return (end < 0 ? rest : rest.slice(0, end)).some((a) => a === "-h" || a === "--help");
+};
+
 const HELP = `claw-connector ${VERSION}: connect the coding agents on this machine to Claw (outbound HTTPS only).
 
 Usage: claw-connector <command> [options]
 
-  init [--approval ask|never | --approval AGENT=ask|never ...] [--hooks | --no-hooks] [--no-probe]
-                           write a sample agents.toml. In a terminal it then asks whether to add the Claude Code session
-                           hooks to Claude's settings.json (see "hooks"); --hooks adds them without asking, --no-hooks
-                           does not, and when nobody can answer they are not added. Agents ask before every write and command by default;
-                           "--approval never" (or "--approval claude=never") lets phone sessions run like your
-                           terminal, with no per-step approval. Agents are: ${SAMPLE_AGENTS.join(", ")}.
-  hooks install|uninstall|status [--config-dir DIR]
-                           the SessionStart/SessionEnd hooks that tell this connector which Claude Code sessions are open
-                           in a terminal; merged into DIR/settings.json (default: the claude-attach agents' config
-                           directories, else $CLAUDE_CONFIG_DIR or ~/.claude); only its own entries are ever changed
-  pair CODE --server URL   connect this machine with the one-time code your chat gave you ("连接我的开发环境"): writes
-                           agents.toml if there is none (the agents found here, working in this folder), saves the
-                           sign-in and starts the service. [--name HOST] [--no-start]
-  login                    sign in (device flow); --server URL --identity-url URL [--name HOST]
-                           development only: --key <api key>  (or CLAW_CONNECTOR_KEY)
-  run                      connect and serve (Ctrl-C or SIGTERM stops it and every agent it started). Exit code 78:
-                           revoked, sign-in refused, or no usable config; starting it again will not help
-  service install|uninstall|status [--supervisor systemd|launchd|script] [--env NAME ...]
-                           keep "run" up: started at login/boot, restarted 5 s after it dies, never restarted
-                           after exit 78. systemd --user on Linux, launchd on macOS; "script" (containers without
-                           systemd) writes a keep-alive script and adds it to crontab, or says what must call it.
-                           The agents' settings in this shell (PATH, proxies, ANTHROPIC_BASE_URL...) go into the
-                           service; their sign-in variables (ANTHROPIC_API_KEY, OPENAI_API_KEY...) and any --env
-                           named like a credential go into service-env.json (0600), never into the unit
-  status [--json]          what is running, signed in, paused, the last disconnect and why
-  doctor [--agent ID] [--json]
-                           check this machine before a phone session fails on it, one fix per problem: Node, each
-                           agent's program on PATH (and on the installed service's PATH), Claude Code / Codex signed
-                           in, the roots writable, the proxy variables, Claw's certificate, the service and Claw
-                           itself; then start each agent's adapter, open a session (no prompt) and check that it
-                           offers the modes agents.toml needs. Exit 1 when something stops sessions. A running
-                           connector repeats the machine checks and shows them in the chat; init runs the adapter check
-  pause                    stop every agent now and stay offline until "resume"
-  resume                   undo "pause"
-  stop                     stop the running connector and every agent it started
-  logout                   stop, revoke this connector at Claw and the sign-in, and delete the sign-in
+${Object.values(COMMANDS).filter((c) => !c.hidden).map(helpEntry).join("\n")}
   --version, --help
 
 Files: ${"$"}XDG_CONFIG_HOME/claw-connector (agents.toml, credentials.json) and ${"$"}XDG_STATE_HOME/claw-connector
@@ -162,31 +259,23 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
   useAdapterStore(new AdapterStore(adaptersDir(ctx.dirs.state), { autoInstall: ctx.installAdapters === true }));
   try {
     switch (cmd) {
-      case undefined: case "help": case "--help": case "-h": ctx.out(HELP); return cmd ? EXIT.ok : EXIT.usage;
+      case undefined: ctx.out(HELP); return EXIT.usage;
+      case "--help": case "-h": ctx.out(HELP); return EXIT.ok;
+      case "help": ctx.out(rest[0] !== undefined && Object.hasOwn(COMMANDS, rest[0]) ? commandHelp(rest[0]) : HELP); return EXIT.ok;
       case "--version": case "-v": case "version": ctx.out(VERSION); return EXIT.ok;
-      case "init": return await cmdInit(rest, ctx);
-      case "hooks": return cmdHooks(rest, ctx);
-      case "login": return await cmdLogin(rest, ctx);
-      case "pair": return await cmdPair(rest, ctx, {
-        runningPid, stop: (c) => cmdStop(c, true), start: (c) => cmdService(["install"], c, serviceHelpers),
-      });
-      case "run": {
-        const code = await cmdRun(rest, ctx);
-        // launchd cannot be told "never restart on 78"; it does not restart a clean exit. The reason was printed.
-        return code === EXIT.needsPerson && ctx.env.CLAW_CONNECTOR_SUPERVISOR === "launchd" ? EXIT.ok : code;
-      }
-      case "service": if (rest[0] === "install") await installAdapters(ctx, false); return await cmdService(rest, ctx, serviceHelpers);
-      case "supervise": return await cmdSupervise(rest, ctx);
-      case "status": return cmdStatus(rest, ctx);
-      case "doctor": return await cmdDoctor(rest, ctx);
-      case "health-check": return await cmdHealthCheck(ctx, ctx.stdin ?? readStdin);
-      case "pause": return await cmdPause(ctx);
-      case "resume": return cmdResume(ctx);
-      case "stop": return await cmdStop(ctx);
-      case "logout": return await cmdLogout(ctx);
-      default: ctx.err(`unknown command ${JSON.stringify(cmd)}\n\n${HELP}`); return EXIT.usage;
     }
+    if (!Object.hasOwn(COMMANDS, cmd)) { ctx.err(`unknown command ${JSON.stringify(cmd)}\n\n${HELP}`); return EXIT.usage; }
+    const command = COMMANDS[cmd];
+    if (asksForHelp(rest)) { ctx.out(commandHelp(cmd)); return EXIT.ok; }
+    if (command.noArgs && rest.length > 0) { ctx.err(`${cmd} takes no arguments, not ${JSON.stringify(rest[0])}\n\n${commandHelp(cmd)}`); return EXIT.usage; }
+    return await command.run(rest, ctx);
   } catch (e) {
+    // A command's own option parser (node:util parseArgs, strict) refused the arguments: a usage error, with that command's help.
+    const code = (e as { code?: unknown } | null)?.code;
+    if (typeof code === "string" && code.startsWith("ERR_PARSE_ARGS_") && cmd !== undefined && Object.hasOwn(COMMANDS, cmd)) {
+      ctx.err(`${cmd}: ${errMessage(e)}\n\n${commandHelp(cmd)}`);
+      return EXIT.usage;
+    }
     if (e instanceof ConfigError || e instanceof CredentialsError || e instanceof DeviceFlowError || e instanceof UrlError) { ctx.err(e.message); return EXIT.failure; }
     ctx.err(`error: ${errMessage(e)}`);
     return EXIT.failure;

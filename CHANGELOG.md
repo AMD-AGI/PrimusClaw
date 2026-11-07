@@ -101,6 +101,9 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- `claw-connector <command> --help` (or `-h`) prints that command's help and exits 0, for every command; before, `pair --help` and
+  `login --help` failed with "unknown option". An unknown option is a usage error (exit 2) for every command, including `login`
+  (it exited 1) and commands that take no arguments (`stop`, `pause`, `resume`, `logout`, which ignored them).
 - A machine paired from the chat (`claw-connector pair`) and then disconnected is told, wherever the connector says what to do next
   (the revocation itself, `run` started again by the service or by hand, the supervisor's log line, `status`, `service status`,
   `doctor`'s fix, a sign-in refused at start), to ask the
