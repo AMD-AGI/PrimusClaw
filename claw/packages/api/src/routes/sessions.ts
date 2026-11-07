@@ -8,8 +8,9 @@ import { singleflightCreate, type FlightResult } from "../shared/singleflight.js
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { submitSessionMessage } from "../sessions/submit-message.js";
-import { CLAW_ASSISTANT_ENABLED, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_FIRST_ACK_USERS, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
 import { attendedViaOfRequest, parseChannelContext, preemptReportTurn, recordAssistantMessage } from "../assistant/inbound.js";
+import { armFirstAck } from "../assistant/lookup-ack.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { checkSessionCreate } from "../github-review/acting-session.js";
 import { REQUESTED_REVIEW_CONFIG_KEYS } from "../github-review/requested-by.js";
@@ -1908,6 +1909,13 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         }),
       } : {}),
     });
+    // A message to the person's assistant that has had no word CLAW_ASSISTANT_FIRST_ACK_MS from now is told "on it" by the server
+    // (`assistant/lookup-ack.ts`), counted from now: a message queued behind a worker's report waits from here, not from its run.
+    if (CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_FIRST_ACK_USERS) {
+      const firstAckId = submitted.kind === "dispatched" ? submitted.messageId
+        : submitted.kind === "queued" && submitted.pendingId !== null ? queuedMessageId(submitted.pendingId) : null;
+      if (firstAckId) armFirstAck(sessionId, firstAckId, undefined, {}, userId);
+    }
     if (CLAW_ASSISTANT_ENABLED && submitted.kind === "queued" && submitted.drain === "awaiting_turn") {
       // What the user says next goes before a worker's report the assistant is still reading.
       await preemptReportTurn(sessionId).catch((err) => logger.warn({ err, sessionId }, "assistant.report_turn_preempt_failed"));

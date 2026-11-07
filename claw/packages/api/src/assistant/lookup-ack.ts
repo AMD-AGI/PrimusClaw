@@ -87,26 +87,38 @@ export function resetLookupAckCacheForTest(): void { routerUserOf.clear(); }
  * Why the turn answering `messageId` is not to be told "on it" now, or null when it is: read fresh each time, so the check after the
  * grace sees a line the router wrote meanwhile.
  */
-async function reasonToStaySilent(q: Querier, sessionId: string, userId: string, messageId: string): Promise<string | null> {
-  const run = (await q(
+async function reasonToStaySilent(
+  q: Querier, sessionId: string, userId: string, messageId: string, pendingSince?: Date,
+): Promise<string | null> {
+  let run = (await q(
     `SELECT COALESCE(started_at, created_at) AS began, status, COALESCE(prompt, input->>'prompt', '') AS prompt
        FROM claw_tasks WHERE session_id = $1 AND origin = 'chat' AND metadata->>'message_id' = $2
       ORDER BY created_at DESC LIMIT 1`,
     [sessionId, messageId],
   )).rows[0] as { began: Date; status: string; prompt: string } | undefined;
+  // A message still queued behind another turn (a worker's report being read): no run yet, and the person has waited since it came in.
+  if (!run && pendingSince) {
+    const pending = /^claw-pending-(\d+)$/.exec(messageId);
+    const queued = pending && (await q("SELECT 1 FROM claw_pending_messages WHERE id = $1 AND session_id = $2", [pending[1], sessionId])).rowCount;
+    if (queued) run = { began: pendingSince, status: "queued", prompt: "" };
+  }
   if (!run) return "no_run";
   if (run.prompt.startsWith(WORK_EVENT_PREFIX)) return "report_turn";
   if (run.status === "completed" || run.status === "failed" || run.status === "cancelled") return "turn_ended";
   // Anything said to the person since the turn began: the router's line, an item's start notice, this line itself.
   const said = await q("SELECT 1 FROM claw_assistant_says WHERE user_id = $1 AND created_at >= $2 LIMIT 1", [userId, run.began]);
   if (said.rowCount) return "spoke";
-  // A say the router has started (written beside the lookup, still being stored).
-  const saying = await q(
-    `SELECT 1 FROM claw_session_events
-      WHERE session_id = $1 AND event = 'toolUsed' AND deleted_at IS NULL AND data->>'message_id' = $2 AND data->>'tool' = $3 LIMIT 1`,
+  // A say the router has started and that has not ended (written beside the lookup, still being stored). One that ended stored a row
+  // (`spoke`) or was refused: a refused say holds nothing back, the router writes it again a few seconds later (2026-11-07 run:
+  // cat-memory-ro-001 and cat-items-ro-001, a say refused at 3.2 s and said again at 5.3 s and 5.9 s).
+  const saying = (await q(
+    `SELECT count(*) FILTER (WHERE data->>'status' = 'start')::int AS started,
+            count(*) FILTER (WHERE data->>'status' IS DISTINCT FROM 'start')::int AS ended
+       FROM claw_session_events
+      WHERE session_id = $1 AND event = 'toolUsed' AND deleted_at IS NULL AND data->>'message_id' = $2 AND data->>'tool' = $3`,
     [sessionId, messageId, SAY_TOOL],
-  );
-  if (saying.rowCount) return "saying";
+  )).rows[0] as { started: number; ended: number } | undefined;
+  if (saying && saying.started > saying.ended) return "saying";
   return null;
 }
 
@@ -184,7 +196,7 @@ export async function ackFirstReply(sessionId: string, messageId: string, deps: 
   const message = await turnMessage(q, sessionId, messageId);
   if (!message) return "no_message";
   if (mayHandOff(message)) return "may_hand_off";
-  const why = await reasonToStaySilent(q, sessionId, userId, messageId);
+  const why = await reasonToStaySilent(q, sessionId, userId, messageId, new Date(message.receivedAt));
   if (why) return why;
   const stored = await recordSystemNotice({
     userId, sessionId, text: firstAckText(message.content), key: lookupAckKey(messageId), turnMessageId: messageId,
@@ -195,11 +207,17 @@ export async function ackFirstReply(sessionId: string, messageId: string, deps: 
 }
 
 /**
- * Called when a chat run is opened (`openChatRun`): after `delayMs` the turn is told on it if it has said nothing by then. A timer of
- * this process, never awaited and never throwing: a restart in between loses one line, which the turn's own answer still follows.
+ * Called when the person's message is accepted (`routes/sessions.ts`, whether it starts a turn or waits behind one) and when a chat run
+ * is opened (`openChatRun`): after `delayMs` the turn is told on it if it has said nothing by then. A message queued behind a worker's
+ * report waits from when it came in, not from when its run opens (2026-11-07 run: cat-items-wr-006 queued 5.5 s, first reply 7.8 s).
+ * Whichever timer fires first says it; the other finds it said. A timer of this process, never awaited and never throwing: a restart
+ * in between loses one line, which the turn's own answer still follows. Only for the people the setting names (`userId`, when known).
  */
-export function armFirstAck(sessionId: string, messageId: string, delayMs: number = CLAW_ASSISTANT_FIRST_ACK_MS, deps: FirstAckDeps = {}): void {
+export function armFirstAck(
+  sessionId: string, messageId: string, delayMs: number = CLAW_ASSISTANT_FIRST_ACK_MS, deps: FirstAckDeps = {}, userId?: string,
+): void {
   if (!(deps.enabled ?? firstAckOn()) || !messageId) return;
+  if (userId !== undefined && !firstAckFor(userId, deps.users)) return;
   const timer = setTimeout(() => {
     void ackFirstReply(sessionId, messageId, deps)
       .then((out) => { if (out !== "said") logger.debug({ sessionId, messageId, out }, "assistant.first_ack_skipped"); })

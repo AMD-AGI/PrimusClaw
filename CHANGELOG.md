@@ -111,6 +111,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- The server's "on it" line for a silent router turn (`CLAW_ASSISTANT_FIRST_ACK_USERS`) counts from when the person's message came in,
+  not from when its run opened, so a message queued behind a worker's report hears it at 3.5 s too (2026-11-07 run: cat-items-wr-006
+  queued 5.5 s, first reply 7.8 s); and a say the router started and that was refused no longer holds the line back (cat-memory-ro-001,
+  cat-items-ro-001: refused at 3.2 s, said again at 5.3 s and 5.9 s).
 - A grant's GPU hours are charged only while a sandbox runs: from the moment it first reaches running (new grant status field
   `sandboxes[].runningAt`) to its end. A sandbox that waited in a queue, sat scheduling-gated or pulled its image and was then deleted
   charges nothing; before, two measurement sandboxes held pending for 28 minutes spent 3354 GPU seconds of a 6-GPU-hour grant. Apply
