@@ -233,16 +233,16 @@ describe("devenv_list", { skip }, () => {
     const { truncateToolResult } = await import("../../brain/src/agent/agent-loop.js");
     const alice = await w.user("alice");
     const many = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => ({
-      ref: `${prefix}-0000-4000-8000-${String(i).padStart(12, "0")}`, title: `t${i}`, cwd: `/shared_nfs/yihan/local/wt/claw-line-${i}`, updated_at: now() - 60 * (i + 1),
+      ref: `${prefix}-0000-4000-8000-${String(i).padStart(12, "0")}`, title: `t${i}`, cwd: `/home/alice/work/checkouts/claw-line-${i}`, updated_at: now() - 60 * (i + 1),
       state: i % 3 === 1 ? "live" : "idle",
     }));
     const attachAgent = (prefix: string, n: number) => ({ id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)", watch: true, resumable: many(prefix, n) });
-    await machine("alice", "autopilot-devpod", { online: true, agents: [attachAgent("d0d0d0d0", 14)] });
-    await machine("alice", "yihan-dev-pod", { online: true, agents: [attachAgent("e1e1e1e1", 12)] });
+    await machine("alice", "build-box", { online: true, agents: [attachAgent("d0d0d0d0", 14)] });
+    await machine("alice", "dev-box", { online: true, agents: [attachAgent("e1e1e1e1", 12)] });
 
     const b = (await call(await userTurn(alice, "我的开发环境有哪些"))).body;
     assert.deepEqual(b.machines.map((m: Recorded) => [m.machine, m.session_count, m.sessions_not_shown, (m.sessions as unknown[]).length]), [
-      ["autopilot-devpod", 14, 8, 6], ["yihan-dev-pod", 12, 6, 6],
+      ["build-box", 14, 8, 6], ["dev-box", 12, 6, 6],
     ]);
     assert.deepEqual(b.machines[0].sessions_by_state, { idle: 9, in_terminal: 5 }, "counted over all of them");
     assert.equal(b.machines[0].sessions[0].ref, "d0d0d0d0-0000-4000-8000-000000000000", "the latest first");
@@ -251,15 +251,15 @@ describe("devenv_list", { skip }, () => {
     const read = truncateToolResult(JSON.stringify(b), "mcp__assistant__devenv_list");
     const seen = JSON.parse(read);
     assert.equal(seen.complete, undefined, "not cut by Brain");
-    assert.deepEqual(seen.machines.map((m: Recorded) => m.machine), ["autopilot-devpod", "yihan-dev-pod"]);
+    assert.deepEqual(seen.machines.map((m: Recorded) => m.machine), ["build-box", "dev-box"]);
 
     // One machine by name: every session of it, and only it; a name that is none of theirs is refused with the names they have.
-    const one = (await call(await userTurn(alice, "第二台有哪些会话"), { machine: "Yihan-Dev-Pod" })).body;
+    const one = (await call(await userTurn(alice, "第二台有哪些会话"), { machine: "Dev-Box" })).body;
     assert.deepEqual([one.total, one.machines.length, one.machines[0].machine, one.machines[0].sessions.length, one.machines[0].session_count],
-      [2, 1, "yihan-dev-pod", 12, undefined]);
+      [2, 1, "dev-box", 12, undefined]);
     const none = await call(await userTurn(alice, "第三台"), { machine: "nope" });
     assert.equal(none.isError, true);
-    assert.match(JSON.stringify(none.body), /autopilot-devpod, yihan-dev-pod/);
+    assert.match(JSON.stringify(none.body), /build-box, dev-box/);
   });
 
   test("D2 detail activity says what each session is doing in the agent's words, and the turn has read untrusted text", async () => {
