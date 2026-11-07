@@ -142,6 +142,16 @@ Presets and the adapter versions they pin (override `command` and `args` to move
 | `codex` | `npx @agentclientprotocol/codex-acp@2.3.0` | `read-only` | `read-only` | `agent-full-access` |
 | `cursor` | `agent acp` (the Cursor CLI) | `ask` | `ask`, `plan` | `agent`, started as `agent --force acp` |
 
+The pinned adapters (the `npx -y <package>@<version>` presets above) are installed once into the connector's state
+directory (`adapters/<package>@<version>`), by `init`, by `service install` and in the background when `run` starts, and are
+then started from there with the connector's own Node.js: a session does not wait for npx to look the package up in a
+registry (about 70 seconds when the registry cannot be reached) or download it (Claude's adapter takes about 350 MB on
+disk with its dependencies), and a repository's own `.npmrc` cannot pick the registry. The install uses `npm install` with your npm
+settings (`~/.npmrc`, `npm_config_*`, an `npm_config_registry` in the agent's `env`). A session that opens while its
+adapter is still being installed waits for it; if the install failed, the agent's npx command runs as before, in the
+connector's state directory, and the install is tried again in the background ten minutes later. An agent with its own
+`command` or `args` is started exactly as written.
+
 `claude-attach` does not start new conversations: it takes over Claude Code conversations that already exist on this
 machine (see [Taking over an existing conversation](#taking-over-an-existing-conversation)).
 

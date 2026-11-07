@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
+import { adapterStore } from "./adapter-install.js";
 import type { AgentConfig } from "./config.js";
 import type { ChildRegistry } from "./children.js";
 import { redactText } from "./redact.js";
@@ -45,17 +46,21 @@ export class AdapterProcess {
 
   static async start(o: AdapterStart): Promise<AdapterProcess> {
     fs.mkdirSync(path.dirname(o.logFile), { recursive: true, mode: 0o700 });
+    const env = { ...process.env, ...o.cfg.env };
+    // A pinned preset runs from the copy installed in the connector's directory, never through npx in the session's
+    // folder (adapter-install.ts). The session's folder reaches the adapter in session/new either way.
+    const run = (await adapterStore()?.launch(o.cfg, o.cwd, env)) ?? { command: o.cfg.command, args: o.cfg.args, cwd: o.cwd };
     const log = fs.openSync(o.logFile, "a", 0o600);
-    const child = spawn(o.cfg.command, o.cfg.args, {
-      cwd: o.cwd,
-      env: { ...process.env, ...o.cfg.env },
+    const child = spawn(run.command, run.args, {
+      cwd: run.cwd,
+      env,
       stdio: ["pipe", "pipe", "pipe"],
       // Its own process group, so the whole tree (an npx wrapper and the agent below it) can be stopped as one.
       detached: true,
     });
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", () => resolve());
-      child.once("error", (e) => reject(new Error(`could not start ${o.cfg.command}: ${errMessage(e)}`)));
+      child.once("error", (e) => reject(new Error(`could not start ${run.command}: ${errMessage(e)}`)));
     }).catch((e) => { fs.closeSync(log); throw e; });
     const pid = child.pid!;
     o.registry.add({ pid, pgid: pid, agent_id: o.cfg.id, session_id: o.sessionId });

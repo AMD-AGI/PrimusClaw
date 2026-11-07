@@ -26,6 +26,7 @@ main(process.argv.slice(2), {
   out: (l) => process.stdout.write(l + "\n"),
   err: (l) => process.stderr.write(l + "\n"),
   probe: probeAgents,
+  installAdapters: true,
   onConnector: (c) => {
     connector = c;
     for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(sig, onSignal);
