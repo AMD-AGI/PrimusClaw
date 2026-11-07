@@ -77,7 +77,7 @@ export async function startedFor(userId: string, messageKey: string, prs: readon
     `SELECT item_id, seq, params->'pr'->>'owner' AS owner, params->'pr'->>'repo' AS repo, params->'pr'->>'number' AS number
        FROM claw_work_items
       WHERE user_id = $1 AND kind = 'review' AND params->>'request_message' = $2
-      ORDER BY created_at`,
+      ORDER BY created_at DESC`,
     [userId, messageKey],
   )).rows as Array<{ item_id: string; seq: number; owner: string; repo: string; number: string }>;
   const out: Array<{ item_id: string; seq: number; pr: string }> = [];

@@ -232,6 +232,23 @@ export function isMcpTimeout(err: unknown): boolean {
 export const IDEMPOTENT_CALL_TIMEOUT_MS = 30_000;
 /** Sends after the first, of a repeatable tool whose answer did not come in time: one, so two waits are the most a turn spends. */
 export const IDEMPOTENT_TIMEOUT_RESENDS = 1;
+/**
+ * The one server whose `idempotentHint` Brain acts on: Claw's own assistant API, which the API itself writes into every assistant turn
+ * under this name and path, replacing any server of that name a request carried (`role-profile.ts`). Another server's hint changes
+ * nothing: its tools keep the SDK's wait and are sent once, since a tool of someone else's that takes 30-60 s by design would otherwise
+ * time out and run twice.
+ */
+export const IDEMPOTENT_TRUSTED_SERVER = { name: "assistant", path: "/v1/internal/assistant-mcp" } as const;
+
+export function trustsIdempotentHint(name: string, url: string): boolean {
+  if (name !== IDEMPOTENT_TRUSTED_SERVER.name) return false;
+  try {
+    return new URL(url).pathname === IDEMPOTENT_TRUSTED_SERVER.path;
+  } catch {
+    return false;
+  }
+}
+
 /** Read per call, so a test can shorten the wait. */
 export const idempotentCallPolicy = { timeoutMs: IDEMPOTENT_CALL_TIMEOUT_MS, resends: IDEMPOTENT_TIMEOUT_RESENDS };
 
@@ -383,7 +400,7 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
       idempotentTools.clear();
       for (const t of result.tools) {
         if (t.annotations?.readOnlyHint === true) readOnlyTools.add(t.name);
-        else if (t.annotations?.idempotentHint === true) idempotentTools.add(t.name);
+        else if (t.annotations?.idempotentHint === true && trustsIdempotentHint(name, url)) idempotentTools.add(t.name);
       }
       const tools = result.tools.map((t) => ({
         name: t.name,
