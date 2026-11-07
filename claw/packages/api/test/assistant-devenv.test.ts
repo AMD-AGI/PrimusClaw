@@ -85,14 +85,14 @@ describe("devenv_list", { skip }, () => {
     const client = await connect(claims, devenv);
     try { return (await client.listTools()).tools.map((t) => t.name); } finally { await client.close(); }
   }
-  type Agent = { id: string; kind: string; name: string; resumable?: Recorded[]; roots?: string[]; watch?: boolean; health?: Recorded };
+  type Agent = { id: string; kind: string; name: string; resumable?: Recorded[]; roots?: string[]; watch?: boolean; typed?: boolean; health?: Recorded };
   async function machine(owner: string, name: string, opts: { online?: boolean; agents?: Agent[] } = {}) {
     const row = await store.registerConnector(owner, name, "0.1.2", null, 10);
     assert.ok(row);
     await store.recordHeartbeat(row.connector_id, owner, {
       version: "0.1.3", cmdCursor: null,
       agents: (opts.agents ?? []).map((a) => ({ agent_id: a.id, kind: a.kind, name: a.name,
-        capabilities: { ...(a.resumable ? { resumable: a.resumable } : {}), ...(a.roots ? { roots: a.roots } : {}), ...(a.watch ? { watch_live: true } : {}), ...(a.health ? { health: a.health } : {}) } })),
+        capabilities: { ...(a.resumable ? { resumable: a.resumable } : {}), ...(a.roots ? { roots: a.roots } : {}), ...(a.watch ? { watch_live: true } : {}), ...(a.typed ? { terminal_input: true } : {}), ...(a.health ? { health: a.health } : {}) } })),
     });
     if (opts.online) await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [row.connector_id]);
     else await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '1 hour' WHERE connector_id = $1", [row.connector_id]);
@@ -300,6 +300,23 @@ describe("devenv_list", { skip }, () => {
       assert.equal(s.attach_command, null, s.label);
       assert.ok(s.why_not, s.label);
     }
+  });
+
+  test("D1t a conversation open in a terminal its connector types into is usable, not only watchable; one it cannot type into stays watch-only", async () => {
+    const alice = await w.user("alice");
+    const typedRef = "c0ffee00-0000-4000-8000-0000000000e1";
+    const watchRef = "c0ffee00-0000-4000-8000-0000000000e2";
+    await machine("alice", "devbox", { online: true, agents: [{ id: "claude", kind: "claude", name: "Claude Code", watch: true, typed: true, resumable: [
+      { ref: typedRef, title: "in tmux", cwd: "/w/a", updated_at: now(), state: "live", activity: "idle", input: "terminal" },
+      { ref: watchRef, title: "plain tty", cwd: "/w/b", updated_at: now() - 10, state: "live", activity: "working" },
+    ] }] });
+    const b = (await call(await userTurn(alice, "连接到我的开发环境"))).body;
+    const [typed, watched] = b.machines[0].sessions;
+    assert.deepEqual([typed.ref, typed.state, typed.read_only, typed.typed_into_terminal], [typedRef, "in_terminal", undefined, true]);
+    assert.match(typed.note, /typed into that terminal/);
+    assert.deepEqual([watched.ref, watched.read_only, watched.typed_into_terminal], [watchRef, true, undefined]);
+    // "Connect me": the one it can type into is the obvious one; the watch-only one never is.
+    assert.equal(b.attach_default.ref, typedRef);
   });
 
   test("D4 after a read, only the attach command of the user's own session is put to them, as a button", async () => {

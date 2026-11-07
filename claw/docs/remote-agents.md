@@ -98,6 +98,14 @@ mark from the session's newest `session_started`/`session_resumed`: `GET .../ses
 `prompt`, `set_mode` and `decision` are refused with 409 `session_read_only` before anything is queued (`cancel`, `resume`
 and `close` are not). The connector refuses them as well (`read_only_live_session`).
 
+A connector may also type what is sent into the terminal that has such a conversation open (the connector in this repository
+does when that terminal is a tmux pane of its user's: `connector/README.md`). It then says `terminal_input: true` in the agent's
+capabilities and `input: "terminal"` on the `live` entry, and the session it opens for it is not read-only: its `session_started`
+carries `live_terminal: true` and `input: "terminal"` instead of `read_only`, so Claw relays `prompt` (and `cancel`) as for any
+session. While the terminal is busy the connector may send `terminal_input_queued` (`data.reason`, `data.cmd_seq`); Claw stores and
+relays it like any other event. `devenv_list` shows such a conversation with `typed_into_terminal: true` instead of `read_only`, and
+`devenv_send` may send to it.
+
 `POST /v1/remote-agents/sessions` also takes `takeover: true` next to a `resume_ref` (400 `takeover_needs_resume_ref` without
 one, 400 `invalid_takeover` when it is not a boolean): the person confirmed that whatever holds that conversation open on the
 machine is to be ended so that this session continues it. Claw forwards it in `session.new` and records it in the

@@ -37,6 +37,11 @@ export interface AttachOptions {
   cliMode?: string;
   /** Use this command instead of the stand-in. */
   cli?: string;
+  /**
+   * The tmux command a message to a conversation open in a tmux pane is typed with. By default one that does not exist: a
+   * test run from inside a person's tmux must never reach their panes (its processes inherit that tmux's variables).
+   */
+  tmux?: string;
 }
 
 export interface HarnessOptions {
@@ -93,7 +98,7 @@ export class Harness {
       fs.writeFileSync(h.liveFile, JSON.stringify(o.attach.live ?? []));
       const wrapper = path.join(h.attachDir, "claude");
       fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_CLAUDE)} "$@"\n`, { mode: 0o755 });
-      attachToml = `preset = "claude-attach"\nattach_cli = ${JSON.stringify(o.attach.cli ?? wrapper)}`;
+      attachToml = `preset = "claude-attach"\nattach_cli = ${JSON.stringify(o.attach.cli ?? wrapper)}\ntmux_cli = ${JSON.stringify(o.attach.tmux ?? "/nonexistent/tmux-for-tests")}`;
       Object.assign(attachEnv, {
         CLAUDE_CONFIG_DIR: h.attachDir, FAKE_CLAUDE_LIVE: h.liveFile, FAKE_CLAUDE_LOG: h.cliLog, FAKE_CLAUDE_MODE: o.attach.cliMode ?? "ok",
         FAKE_SESSIONS: JSON.stringify(o.attach.sessions),

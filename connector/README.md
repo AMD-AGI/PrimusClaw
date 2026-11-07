@@ -358,6 +358,8 @@ id = "claude-attach"
 preset = "claude-attach"
 roots = ["~/work"]
 # attach_cli = "claude"        # the command asked which sessions are open (default: claude, from PATH)
+# terminal_input = true         # a message to a conversation open in a tmux pane is typed into that terminal (default: true)
+# tmux_cli = "tmux"             # the tmux command used for that (default: tmux, from PATH)
 # [agents.env]
 # CLAUDE_CONFIG_DIR = "/home/me/.claude"   # where the conversations live, if not the default
 ```
@@ -424,6 +426,32 @@ The last twenty updates already there are sent first, marked `replay`. `session_
 client offers the watch only where the connector can do it. When the terminal no longer has it open the
 watch ends (`session_closed`, reason `terminal_closed`), and taking it over is then a new session, through every check
 above. A watched session stays read-only across a restart of the connector.
+
+When the terminal that has the conversation open is a **tmux pane**, the phone can talk to it without taking it over: what
+is sent is typed into that terminal, as the person at it would type it, and the replies are read from the transcript as for a
+watch. Nothing else writes to the conversation, so its history never forks, and the terminal and the phone show the same
+conversation. `session_started` then says `live_terminal: true` and `input: "terminal"` instead of `read_only`, and a prompt is
+accepted: it waits (one notice, `terminal_input_queued`, with `reason` `terminal_working`, `terminal_waiting`, `terminal_typing`,
+`terminal_screen` or `terminal_scrolled`) until Claude Code says it is idle **and** its input box is empty on the screen, so that
+half-typed text at the terminal is never sent along and a question or a menu on the screen is never answered by an Enter; after
+10 minutes it is refused (`terminal_busy`). It is then typed with `tmux send-keys -l` (literal: nothing in it is read as a key
+name), or, with several lines, pasted as one bracketed paste (`load-buffer` and `paste-buffer -p -d`), and submitted with Enter
+once the box shows it. Before that every control character is removed from it (C0, DEL, C1, the Unicode line separators; tabs
+become spaces), so nothing in a message can act as a key or end the paste. Its turn ends (`turn_end`, naming the prompt) when the
+transcript records the end of the terminal's turn, when the turn is stopped there (`cancelled`), or once Claude Code has said it is
+idle for 5 seconds; a message that does not appear in the transcript within 20 seconds ends as `terminal_input_unconfirmed`. A
+`cancel` presses Esc in the terminal, which stops the turn there. A mode change is refused (`terminal_session`): the terminal keeps
+its own mode. The audit log records each message typed (`terminal_input`: the pid, the pane, its length, line count and a digest,
+never its words). The heartbeat marks such a conversation `input: "terminal"` and the agent's capabilities say `terminal_input: true`.
+
+Only the terminal of this connector's own user is typed into, and only one that is proven: exactly one local process holds the
+conversation open, Claude Code's own `claude agents --json` (or its registry row with the same process start) names it, its working
+directory is inside the agent's roots, it runs as this user, the `TMUX` socket it was started with is a socket owned by this user,
+and that tmux server reports a pane whose process is that process or one of its parents. Anything less (a plain terminal, `screen`,
+another user's tmux, two terminals on one conversation, a holder on another machine, not Linux) is watched read-only as above, and
+`session_started` says why (`read_only_why`). The owner turns it off with `terminal_input = false` on the agent. Claude Code's
+own messaging between sessions was not used for this: a message sent that way arrives as a message from another session, not as
+the person's own input. A second `claude --resume` process was not either: two writers fork the conversation.
 
 Taking it over while the terminal still has it is the person's choice, made on the phone after being told what it does:
 `session.new` with `takeover: true` (Claw passes it on only with a `resume_ref`). The connector then asks every process on

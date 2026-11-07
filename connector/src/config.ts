@@ -50,9 +50,11 @@ export interface AgentConfig {
   autoAllow: AutoAllowRule[];
   /**
    * Set for an agent that takes over sessions that already exist on this machine instead of starting new ones.
-   * `cli` is the command that lists the processes holding a session open (see attach.ts).
+   * `cli` is the command that lists the processes holding a session open (see attach.ts). `tmux` is the tmux command a
+   * message to a conversation open in a tmux pane is typed with (terminal-input.ts); null when the owner turned that off
+   * (`terminal_input = false`), and then such a conversation can only be watched. Absent means `tmux`.
    */
-  attach: { cli: string } | null;
+  attach: { cli: string; tmux?: string | null } | null;
 }
 
 export interface ConnectorConfig {
@@ -233,10 +235,16 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
     let attach: AgentConfig["attach"] = null;
     if (preset?.attach) {
       const cli = raw.attach_cli === undefined ? "claude" : raw.attach_cli;
+      const typing = raw.terminal_input === undefined ? true : raw.terminal_input;
+      const tmux = raw.tmux_cli === undefined ? "tmux" : raw.tmux_cli;
+      if (typeof typing !== "boolean") problems.push(`${label}.terminal_input must be true or false`);
+      if (typeof tmux !== "string" || !tmux.trim()) problems.push(`${label}.tmux_cli must be a command name or path`);
       if (typeof cli !== "string" || !cli.trim()) problems.push(`${label}.attach_cli must be a command name or path`);
-      else attach = { cli: cli.trim() };
-    } else if (raw.attach_cli !== undefined) {
-      problems.push(`${label}: attach_cli only applies to an agent made from the claude-attach preset`);
+      else attach = { cli: cli.trim(), tmux: typing === false || typeof tmux !== "string" ? null : tmux.trim() };
+    } else {
+      if (raw.attach_cli !== undefined) problems.push(`${label}: attach_cli only applies to an agent made from the claude-attach preset`);
+      if (raw.terminal_input !== undefined) problems.push(`${label}: terminal_input only applies to an agent made from the claude-attach preset`);
+      if (raw.tmux_cli !== undefined) problems.push(`${label}: tmux_cli only applies to an agent made from the claude-attach preset`);
     }
     agents.push({
       id, kind, name: typeof raw.name === "string" && raw.name.trim() ? raw.name.trim().slice(0, 128) : (preset?.name ?? id),
@@ -282,7 +290,7 @@ function existingSessionAgents(rawAgents: unknown[], agents: AgentConfig[], prob
     ids.add(id);
     const name = src.name === PRESETS.claude!.name ? PRESETS["claude-attach"]!.name : `${src.name} (existing sessions)`.slice(0, 128);
     out.push({ ...src, id, kind: PRESETS["claude-attach"]!.kind, name, args: [...src.args], roots: [...src.roots], env: { ...src.env },
-      safeModes: [...src.safeModes], askingModes: [...src.askingModes], autoAllow: [...src.autoAllow], attach: { cli: "claude" } });
+      safeModes: [...src.safeModes], askingModes: [...src.askingModes], autoAllow: [...src.autoAllow], attach: { cli: "claude", tmux: "tmux" } });
   }
   return out;
 }

@@ -142,6 +142,8 @@ export interface DevenvSession {
   why_not?: string;
   /** Open in a terminal on the machine: attaching shows it read-only (its output, live) and nothing typed reaches it. */
   read_only?: true;
+  /** Open in a terminal on the machine that its connector can type into: what is sent goes into that terminal as the user's own input. */
+  typed_into_terminal?: true;
   note?: string;
   /**
    * `in_terminal` only: what the terminal on the machine says it is doing, as the connector reports it: `working` on a turn,
@@ -232,6 +234,8 @@ export interface DevenvAgent {
 const attachCommand = (ref: string): string => `/agent attach ${ref}`;
 
 const READ_ONLY_NOTE = "open in a terminal on that machine: attaching only watches it (its output, live); what the user types is not sent to it";
+const TYPED_NOTE = "open in a terminal on that machine: what is sent is typed into that terminal as the user's own input (it waits while the "
+  + "terminal is busy or someone is typing there), and the replies come back here; the terminal keeps its own mode";
 
 /** The connector's version against this server's (`remote-agents/setup.ts`), as `devenv_list` shows it. */
 const versionOf = (c: Row): Pick<DevenvMachine, "version_status" | "upgrade_command"> => {
@@ -267,6 +271,8 @@ function agentRef(c: Row, agent: Row, online: Row[]): { ref: string } | { why_no
 type Resumable = {
   ref: string; title: string | null; cwd: string | null; updated_at: string | null; state: string;
   terminal_state: DevenvSession["terminal_state"] | null; waiting_for: string | null;
+  /** `live`, and its connector types what is sent into that terminal (`input: "terminal"` with `capabilities.terminal_input`). */
+  typed: boolean;
 };
 
 /** The connector's word for what a terminal is doing (`activity`), in the states this tool uses; anything else is nothing. */
@@ -275,6 +281,7 @@ const TERMINAL_STATES: Record<string, NonNullable<DevenvSession["terminal_state"
 function resumableOf(agent: Row): Resumable[] {
   const caps = isObject(agent.capabilities) ? agent.capabilities : {};
   const raw = Array.isArray(caps.resumable) ? caps.resumable : [];
+  const typing = caps.terminal_input === true && caps.watch_live === true;
   const out: Resumable[] = [];
   for (const r of raw) {
     if (!isObject(r) || typeof r.ref !== "string") continue;
@@ -288,6 +295,7 @@ function resumableOf(agent: Row): Resumable[] {
     out.push({
       ref, title: flat(r.title, TITLE_MAX), cwd: typeof r.cwd === "string" ? r.cwd : null, updated_at: at, state: typeof r.state === "string" ? r.state : "unknown",
       terminal_state: terminal, waiting_for: terminal === "waiting_for_you" ? flat(r.waiting_for, WAITING_FOR_MAX) : null,
+      typed: live && typing && r.input === "terminal",
     });
   }
   return out;
@@ -435,7 +443,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
           opened_in: "machine", state: inTerminal ? "in_terminal" : r.state === "idle" ? "idle" : "unknown", last_activity: r.updated_at,
           ref: can ? r.ref : null, attach_command: can ? attachCommand(r.ref) : null,
           ...(can ? {} : { why_not: !online ? "the machine is offline" : "it is open in a terminal on that machine; only the terminal can use it now" }),
-          ...(can && inTerminal ? { read_only: true, note: READ_ONLY_NOTE } : {}),
+          ...(can && inTerminal ? (r.typed ? { typed_into_terminal: true as const, note: TYPED_NOTE } : { read_only: true as const, note: READ_ONLY_NOTE }) : {}),
         };
         if (inTerminal && r.terminal_state) row.terminal_state = r.terminal_state;
         if (activity) {
@@ -443,7 +451,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
           if (r.terminal_state === "waiting_for_you") row.waiting_for = r.waiting_for;
         }
         sessions.push(row);
-        if (can) attachable.push({ label: row.label, ref: r.ref, opened_in: "machine", ...(inTerminal ? { read_only: true as const } : {}) });
+        if (can) attachable.push({ label: row.label, ref: r.ref, opened_in: "machine", ...(inTerminal && !r.typed ? { read_only: true as const } : {}) });
       }
     }
     // Each agent itself, which is how a user with no session yet gets one: the channel attaches its open session, else starts one.
@@ -483,6 +491,8 @@ export interface SendPlan {
   resume_ref: string | null;
   cwd: string;
   label: string;
+  /** `resume_ref` is open in a terminal there, and what is sent is typed into that terminal (the connector's `input: "terminal"`). */
+  terminal?: true;
 }
 
 const lowerFlat = (v: unknown): string => (flat(v, 200) ?? "").toLowerCase();
@@ -602,7 +612,7 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
   };
   // Every session a target may name: those open through Claw (by id or label), and the agents' own conversations (by ref or label),
   // labelled as devenv_list labels them.
-  type Named = { c: Row; agent: Row | undefined; label: string; session_id: string | null; resume_ref: string | null; cwd: string | null; busy: string | null };
+  type Named = { c: Row; agent: Row | undefined; label: string; session_id: string | null; resume_ref: string | null; cwd: string | null; busy: string | null; terminal?: true };
   const named: Named[] = [];
   for (const c of connectors) {
     const counter = new Map<string, number>();
@@ -620,7 +630,8 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
     for (const a of agents) {
       for (const r of resumableOf(a).filter((x) => x.state !== "attached").sort((x, y) => (y.updated_at ?? "").localeCompare(x.updated_at ?? ""))) {
         named.push({ c, agent: a, label: label(String(a.agent_id)), session_id: null, resume_ref: r.ref, cwd: r.cwd,
-          busy: r.state === "live" ? "in_terminal" : null });
+          // One its connector types into takes the instruction as the terminal's next input (it waits there while the terminal works).
+          busy: r.state === "live" && !r.typed ? "in_terminal" : null, ...(r.state === "live" && r.typed ? { terminal: true as const } : {}) });
       }
     }
   }
@@ -647,7 +658,7 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
     if (!cwd) return { ok: false, code: "no_folder", read: true, choices: [n.label], message: "that session names no folder" };
     return { ok: true, plan: {
       connector_id: String(n.c.connector_id), machine: nameOf(n.c), agent_id: String(n.agent.agent_id), agent_name: flat(n.agent.name, NAME_MAX),
-      session_id: n.session_id, resume_ref: n.resume_ref, cwd, label: n.label,
+      session_id: n.session_id, resume_ref: n.resume_ref, cwd, label: n.label, ...(n.terminal ? { terminal: true as const } : {}),
     } };
   };
 
@@ -898,10 +909,13 @@ const cmdKey = (...parts: string[]): string => createHash("sha256").update(parts
  * it is what pressing the card does (`sendConfirmed` sends the plan the card was made from), so nothing about it is a surprise.
  */
 export function sendCardText(
-  plan: Pick<SendPlan, "machine" | "agent_id" | "label" | "session_id" | "resume_ref" | "cwd">, text: string, ref: string, zh: boolean,
+  plan: Pick<SendPlan, "machine" | "agent_id" | "label" | "session_id" | "resume_ref" | "cwd" | "terminal">, text: string, ref: string, zh: boolean,
 ): string {
   const where = plan.session_id
     ? (zh ? `继续会话 ${plan.label}` : `continuing the session ${plan.label}`)
+    : plan.resume_ref && plan.terminal
+      ? (zh ? `输入到它在那台机器终端里正开着的对话 ${plan.label}（像在终端里打字一样，终端里也看得到）`
+        : `typing it into its conversation ${plan.label} that is open in a terminal on that machine (as if typed there; the terminal shows it too)`)
     : plan.resume_ref
       ? (zh ? `接管它在那台机器上已有的对话 ${plan.label}（带着那段对话的上下文）` : `taking over its own conversation ${plan.label} on that machine (with that conversation's history)`)
       : (zh ? "新会话" : "a new session");

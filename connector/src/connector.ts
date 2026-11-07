@@ -287,9 +287,10 @@ export class Connector {
       const readOnly = a.readOnlyModes.includes(a.askMode);
       const support = this.attach.get(a.id);
       // `watch_live`: a conversation open in a terminal can be opened read-only (session.ts `spectate`); a client offers that only then.
+      // `terminal_input`: and one open in a tmux pane takes messages, typed into that terminal (`resumable[].input: "terminal"`).
       const base = withHealth({
         ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes,
-        ...(support ? { watch_live: true } : {}),
+        ...(support ? { watch_live: true, ...(support.typesIntoTerminals() ? { terminal_input: true } : {}) } : {}),
         ...(a.readOnlyModes.length ? { read_only_modes: a.readOnlyModes } : {}),
         ...(readOnly ? { edits: false, edits_hint: READ_ONLY_HINT } : {}),
       }, this.healthReport ? agentHealth(this.healthReport, a.id) : null);

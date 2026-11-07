@@ -21,6 +21,8 @@
 import path from "node:path";
 import { TranscriptTail, type AttachSupport, type TranscriptUpdate } from "./attach.js";
 import type { Audit } from "./audit.js";
+import { TerminalInput, cleanInput, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
+import { createHash } from "node:crypto";
 import { AdapterProcess, type AcpParams, type AdapterHooks } from "./adapter.js";
 import type { ChildRegistry } from "./children.js";
 import type { AgentConfig, ConnectorConfig } from "./config.js";
@@ -55,11 +57,17 @@ export interface SessionTiming {
   authWaitMs: number;
   /** How long a takeover waits for the terminal it ended to exit (the transcript's quiet, `recentWriteMs`, is waited on top). */
   takeoverWaitMs: number;
+  /** A message for a terminal that is busy (or being typed in) waits this long for it to be free, then is refused (`terminal_busy`). */
+  terminalWaitMs: number;
+  /** A message typed into a terminal must show up in its transcript within this long, or its turn ends `terminal_input_unconfirmed`. */
+  terminalEchoMs: number;
+  /** A typed message's turn also ends once the terminal has said it is idle for this long (a turn stopped with Esc writes no end). */
+  terminalIdleMs: number;
 }
 
 export const DEFAULT_SESSION_TIMING: SessionTiming = {
   idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000, spectateMs: 1_000, spectateCheckMs: 5_000,
-  rootCheckMs: 10_000, authWaitMs: 3_000, takeoverWaitMs: 15_000,
+  rootCheckMs: 10_000, authWaitMs: 3_000, takeoverWaitMs: 15_000, terminalWaitMs: 10 * 60_000, terminalEchoMs: 20_000, terminalIdleMs: 5_000,
 };
 
 /**
@@ -67,6 +75,12 @@ export const DEFAULT_SESSION_TIMING: SessionTiming = {
  * its transcript. The session shows what the terminal does and takes no input.
  */
 export const READ_ONLY_REASON = "read_only_live_session";
+/** Why a mode change or a decision for a conversation that is typed into in its terminal is refused: the terminal owns those. */
+export const TERMINAL_OWNS_REASON = "terminal_session";
+/** What a terminal that typed messages wait for is doing, as the queue notice says it. */
+const WAIT_WHY: Record<Exclude<Readiness, { ready: true }>["why"] | "busy" | "waiting", string> = {
+  typing: "terminal_typing", screen: "terminal_screen", copy_mode: "terminal_scrolled", gone: "terminal_gone", busy: "terminal_working", waiting: "terminal_waiting",
+};
 
 export interface SessionEnv {
   config: ConnectorConfig;
@@ -142,6 +156,18 @@ export class Session {
    * No adapter is ever started for it, and every command that would write is refused.
    */
   readOnly = false;
+  /**
+   * Set when the terminal that has the conversation open is a tmux pane of this user's: then a message sent to the session is
+   * typed into that terminal (terminal-input.ts) and the reply is read from the transcript as for a watch. The session is
+   * still {@link readOnly} here (no agent is started, nothing else writes), but not to Claw: it takes prompts.
+   */
+  private terminal: TerminalInput | null = null;
+  private terminalQueue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void }> = [];
+  private terminalTurn: {
+    cmdId: string | null; cmdSeq: number | null; text: string; sentAt: number; seen: boolean; idleSince: number | null; done: () => void;
+  } | null = null;
+  private terminalPumping = false;
+  private terminalRestoring: Promise<void> | null = null;
   private tail: TranscriptTail | null = null;
   private tailTimer: NodeJS.Timeout | undefined;
   private lastTerminalCheck = 0;
@@ -182,7 +208,10 @@ export class Session {
   }
 
   get pendingCount(): number { return this.book.size; }
-  get busy(): boolean { return this.turnRunning || this.queue.length > 0 || this.book.size > 0; }
+  get busy(): boolean { return this.turnRunning || this.queue.length > 0 || this.book.size > 0 || this.terminalTurn !== null || this.terminalQueue.length > 0; }
+
+  /** Whether what is sent to this session is typed into the terminal that has it open. */
+  get typesIntoTerminal(): boolean { return this.terminal !== null; }
 
   /** Whether `mode` may be selected from a phone. */
   modeAllowed(mode: string): boolean {
@@ -235,7 +264,7 @@ export class Session {
     if (support && this.acpId) {
       const verdict = await support.check(this.acpId, { transcript: false });
       if (!verdict.ok && verdict.reason === "session_live") {
-        if (!takeover) return this.spectate(support, title, verdict.detail);
+        if (!takeover) return this.spectate(support, title, verdict.detail, await support.terminalPane(this.acpId));
         const ended = await support.endHolders(this.acpId, { waitMs: this.env.timing.takeoverWaitMs });
         if (!ended.ok) {
           this.audit("takeover_refused", { reason: ended.reason, detail: ended.detail.slice(0, 300) });
@@ -268,26 +297,46 @@ export class Session {
    * could write to the transcript. When the terminal no longer has the conversation open the session ends
    * (`terminal_closed`): taking it over then is a new session, through the full check.
    */
-  private spectate(support: AttachSupport, title: string, detail: string): void {
+  private spectate(support: AttachSupport, title: string, detail: string, pane: { ok: true; pane: PaneRef } | { ok: false; why: string }): void {
     this.readOnly = true;
+    if (pane.ok) this.terminal = new TerminalInput(pane.pane, tmuxRunner(this.agent.attach?.tmux ?? "tmux", pane.pane.socket));
     this.tail = new TranscriptTail(() => (this.acpId ? support.transcriptPath(this.acpId) : null));
     const backlog = this.tail.backlog();
-    this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: null, read_only: true, created_at: new Date().toISOString() });
-    this.audit("session_spectating", { cwd: this.cwd, acp_session_id: this.acpId, detail: detail.slice(0, 300) });
-    this.emit("session_started", {
-      acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true,
-      read_only: true, read_only_reason: "session_live", modes: [], currentMode: null, unattended: false,
+    this.env.store.put(this.id, {
+      agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: null, read_only: true,
+      ...(pane.ok ? { terminal_input: true } : {}), created_at: new Date().toISOString(),
     });
+    if (pane.ok) {
+      this.audit("session_terminal_input", { cwd: this.cwd, acp_session_id: this.acpId, pid: pane.pane.pid, pane: pane.pane.pane, detail: detail.slice(0, 300) });
+      // Not read-only: what is sent is typed into the terminal. The terminal keeps its own mode; it is not the phone's to set.
+      this.emit("session_started", {
+        acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true,
+        live_terminal: true, input: "terminal", modes: [], currentMode: null,
+      });
+    } else {
+      this.audit("session_spectating", { cwd: this.cwd, acp_session_id: this.acpId, detail: detail.slice(0, 300), why_not_typed: pane.why.slice(0, 300) });
+      this.emit("session_started", {
+        acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true,
+        read_only: true, read_only_reason: "session_live", read_only_why: pane.why.slice(0, 200), modes: [], currentMode: null, unattended: false,
+      });
+    }
     this.announced = true;
     for (const u of backlog) this.emitTranscript(u, true);
     this.followTail(support);
   }
 
   /** After a restart: a session that was read-only is again, from the transcript's end (what was sent before is not sent twice). */
-  restoreSpectate(): void {
+  restoreSpectate(typed = false): void {
     this.readOnly = true;
     const support = this.env.attach.get(this.agent.id);
     if (!support) return;
+    // One that typed into its terminal does again, once the pane is proven again; until then (or if it cannot be) a message is refused.
+    if (typed && this.acpId) {
+      this.terminalRestoring = support.terminalPane(this.acpId).then((pane) => {
+        if (pane.ok && !this.closed) this.terminal = new TerminalInput(pane.pane, tmuxRunner(this.agent.attach?.tmux ?? "tmux", pane.pane.socket));
+        else if (!pane.ok) this.audit("terminal_input_lost", { why: pane.why.slice(0, 300) });
+      }).finally(() => { this.terminalRestoring = null; });
+    }
     this.tail = new TranscriptTail(() => (this.acpId ? support.transcriptPath(this.acpId) : null));
     this.tail.fromEnd();
     this.followTail(support);
@@ -298,6 +347,7 @@ export class Session {
     const tick = () => {
       if (this.closed || !this.tail) return;
       for (const u of this.tail.poll()) this.emitTranscript(u, false);
+      this.watchTerminalTurn(support);
       if (!this.checkingTerminal && Date.now() - this.lastTerminalCheck >= this.env.timing.spectateCheckMs) void this.checkTerminal(support);
     };
     this.tailTimer = setInterval(tick, this.env.timing.spectateMs);
@@ -323,10 +373,136 @@ export class Session {
   }
 
   private emitTranscript(u: TranscriptUpdate, replay: boolean): void {
+    const turn = replay ? null : this.terminalTurn;
+    if (u.type === "turn_done") {
+      if (turn?.seen) this.endTerminalTurn("end_turn");
+      return;
+    }
+    if (u.type === "user_message_chunk" && turn) {
+      const said = String((u.update.content as { text?: unknown } | undefined)?.text ?? "");
+      // The message typed for the phone comes back as the terminal's own prompt: it is that turn's start, not news.
+      if (!turn.seen && sameText(said, turn.text)) { turn.seen = true; return; }
+      if (turn.seen && /^\[Request interrupted by user/.test(said.trim())) { this.endTerminalTurn("cancelled"); }
+    }
     const text = u.type === "agent_message_chunk" ? String((u.update.content as { text?: unknown } | undefined)?.text ?? "") : "";
     if (text && this.env.config.dropMessagePatterns.some((re) => re.test(text))) return;
     const data = limitStrings(redactDeep({ sessionId: this.acpId, update: u.update }) as Record<string, unknown>, MAX_TOOL_OUTPUT_BYTES);
-    this.emit(u.type, { ...data, read_only: true, ...(replay ? { replay: true } : {}) });
+    this.emit(u.type, { ...data, ...(this.terminal ? {} : { read_only: true }), ...(replay ? { replay: true } : {}) });
+  }
+
+  // --- typing into the terminal ------------------------------------------------------------
+
+  /**
+   * A message for a conversation open in a tmux pane: queued, then typed into the terminal once it is free (Claude Code says it
+   * is idle, and its input box is empty), one at a time. While it waits the phone is told once why (`terminal_input_queued`).
+   */
+  private enqueueTerminal(text: string, cmdId: string | null, cmdSeq: number | null, started: () => void): void {
+    if (this.terminalQueue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts", cmdSeq); return started(); }
+    this.terminalQueue.push({ text, cmdId, cmdSeq, started });
+    void this.pumpTerminal();
+  }
+
+  private async pumpTerminal(): Promise<void> {
+    if (this.terminalPumping) return;
+    this.terminalPumping = true;
+    try {
+      while (this.terminalQueue.length && !this.closed) {
+        const next = this.terminalQueue[0]!;
+        const refused = (reason: string, detail = "") => {
+          this.terminalQueue.shift();
+          next.started();
+          this.audit("terminal_input_refused", { reason, detail: detail.slice(0, 300), cmd_id: next.cmdId });
+          this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq);
+          this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq });
+        };
+        const text = cleanInput(next.text);
+        if (!text.trim()) { refused("empty_prompt"); continue; }
+        if (this.terminalRestoring) await this.terminalRestoring;
+        const term = this.terminal;
+        if (!term) { refused("terminal_input_unavailable"); continue; }
+        const waitBy = Date.now() + this.env.timing.terminalWaitMs;
+        let told = "";
+        let ready = false;
+        while (!this.closed && this.terminalQueue[0] === next) {
+          // Claude Code's own word first (a turn running, a question on its screen), then the screen itself: both must say free.
+          const status = this.env.attach.get(this.agent.id)?.holderStatus(term.ref.pid) ?? null;
+          let why: string;
+          if (status !== "idle") {
+            why = status === "busy" || status === "waiting" ? WAIT_WHY[status] : "terminal_state_unknown";
+          } else {
+            const r = await term.readiness();
+            if (r.ready) { ready = true; break; }
+            why = WAIT_WHY[r.why];
+            if (r.why === "gone") { told = why; break; }
+          }
+          if (why !== told) {
+            told = why;
+            this.emit("terminal_input_queued", { reason: why, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length });
+          }
+          if (Date.now() >= waitBy) break;
+          await sleep(Math.max(200, Math.min(1_000, this.env.timing.spectateMs * 5)));
+        }
+        if (this.closed || this.terminalQueue[0] !== next) continue;   // closed, or dropped by a cancel
+        if (!ready) { refused(told === WAIT_WHY.gone ? "terminal_gone" : "terminal_busy", told); continue; }
+        this.terminalQueue.shift();
+        const finished = new Promise<void>((resolve) => {
+          this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve };
+        });
+        try {
+          await term.type(text);
+        } catch (e) {
+          this.terminalTurn = null;
+          next.started();
+          this.audit("terminal_input_refused", { reason: "terminal_input_failed", detail: errMessage(e).slice(0, 300), cmd_id: next.cmdId });
+          this.rejectCommand("prompt", next.cmdId, "terminal_input_failed", next.cmdSeq);
+          this.emit("turn_end", { stopReason: "error", error: "terminal_input_failed", cmd_id: next.cmdId, cmd_seq: next.cmdSeq });
+          continue;
+        }
+        next.started();
+        // What was typed is the person's own message; the trail keeps its size and a digest, not the words.
+        this.audit("terminal_input", {
+          acp_session_id: this.acpId, pid: term.ref.pid, pane: term.ref.pane, cmd_id: next.cmdId, length: text.length,
+          lines: text.split("\n").length, sha256: createHash("sha256").update(text).digest("hex").slice(0, 16),
+        });
+        this.env.store.patch(this.id, { used_at: new Date().toISOString() });
+        await finished;
+      }
+    } finally {
+      this.terminalPumping = false;
+    }
+  }
+
+  /** The typed message's turn, from the tick: it must show up in the transcript, and it ends when the terminal says it is idle again. */
+  private watchTerminalTurn(support: AttachSupport): void {
+    const turn = this.terminalTurn;
+    if (!turn || !this.terminal) return;
+    const now = Date.now();
+    if (!turn.seen) {
+      if (now - turn.sentAt >= this.env.timing.terminalEchoMs) this.endTerminalTurn("error", "terminal_input_unconfirmed");
+      return;
+    }
+    if (support.holderStatus(this.terminal.ref.pid) === "idle") {
+      turn.idleSince ??= now;
+      if (now - turn.idleSince >= this.env.timing.terminalIdleMs) this.endTerminalTurn("end_turn");
+    } else {
+      turn.idleSince = null;
+    }
+  }
+
+  private endTerminalTurn(stopReason: string, error?: string): void {
+    const turn = this.terminalTurn;
+    if (!turn) return;
+    this.terminalTurn = null;
+    this.audit("terminal_turn_end", { stop_reason: stopReason, ...(error ? { error } : {}), cmd_id: turn.cmdId });
+    this.emit("turn_end", { stopReason, ...(error ? { error } : {}), cmd_id: turn.cmdId, cmd_seq: turn.cmdSeq });
+    turn.done();
+  }
+
+  /** The queued typed messages are dropped: each is refused by name (`cancelled`, or the reason given). */
+  private dropTerminalQueue(reason: string): void {
+    const q = this.terminalQueue;
+    this.terminalQueue = [];
+    for (const item of q) { item.started(); this.rejectCommand("prompt", item.cmdId, reason, item.cmdSeq); }
   }
 
   /** The process is stopping: the transcript is no longer followed (the session itself stays recorded, read-only). */
@@ -598,7 +774,7 @@ export class Session {
 
   /** `set_mode`: a user-chosen mode, only from the allowed list, always read back. */
   async setMode(modeId: string, cmdId: string | null): Promise<void> {
-    if (this.readOnly) return this.rejectCommand("set_mode", cmdId, READ_ONLY_REASON);
+    if (this.readOnly) return this.rejectCommand("set_mode", cmdId, this.terminal ? TERMINAL_OWNS_REASON : READ_ONLY_REASON);
     if (!this.adapter) await this.ensureAdapter();
     if (!this.modeAllowed(modeId)) return this.rejectCommand("set_mode", cmdId, "mode_not_allowed");
     if (this.modes.length && !this.modes.some((m) => m.id === modeId)) return this.rejectCommand("set_mode", cmdId, "mode_unavailable");
@@ -789,6 +965,7 @@ export class Session {
    */
   enqueuePrompt(text: string, cmdId: string | null, started: () => void = () => {}, cmdSeq: number | null = null): void {
     if (this.closed) { this.rejectCommand("prompt", cmdId, "session_closed", cmdSeq); return started(); }
+    if (this.readOnly && (this.terminal || this.terminalRestoring)) return this.enqueueTerminal(text, cmdId, cmdSeq, started);
     if (this.readOnly) {
       // Never queued, never sent: what the person typed does not reach the conversation the terminal is writing.
       this.audit("prompt_refused", { reason: READ_ONLY_REASON });
@@ -812,6 +989,8 @@ export class Session {
   shutdown(): void {
     this.stopping = true;
     this.dropQueued(true);
+    // Not counted as handled: Claw delivers the messages that were waiting for the terminal again after the restart.
+    this.terminalQueue = [];
   }
 
   private async pump(): Promise<void> {
@@ -973,7 +1152,9 @@ export class Session {
     if (this.closed) return this.rejectCommand("resume", cmdId, "session_closed");
     if (this.readOnly) {
       // Nothing to bring back: a read-only session runs no agent. Say that it is still there, and still read-only.
-      this.emit("session_resumed", { acp_session_id: this.acpId, read_only: true, modes: [], currentMode: null, unattended: false });
+      this.emit("session_resumed", this.terminal
+        ? { acp_session_id: this.acpId, live_terminal: true, input: "terminal", modes: [], currentMode: null }
+        : { acp_session_id: this.acpId, read_only: true, modes: [], currentMode: null, unattended: false });
       return;
     }
     try {
@@ -994,6 +1175,17 @@ export class Session {
    * unrun is refused by name (`command_rejected`, reason `cancelled`, with its `cmd_id` and `cmd_seq`): it never gets a `turn_end`.
    */
   async cancel(): Promise<void> {
+    if (this.readOnly && (this.terminal || this.terminalQueue.length)) {
+      const queued = this.terminalQueue.length;
+      this.dropTerminalQueue("cancelled");
+      const running = this.terminalTurn;
+      // The typed message's turn is the terminal's own now: Esc stops it there, as the person at the terminal would.
+      if (running && this.terminal) await this.terminal.interrupt().catch(() => undefined);
+      this.audit("cancelled", { turn_running: running !== null, queued_dropped: queued, terminal: true });
+      if (running) this.endTerminalTurn("cancelled");
+      else this.emit("turn_end", { stopReason: "cancelled", cmd_id: null, cmd_seq: null });
+      return;
+    }
     const dropped = this.queue.map((q) => [q.cmdId, q.cmdSeq] as const);
     const queued = dropped.length;
     this.dropQueued();
@@ -1027,6 +1219,8 @@ export class Session {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.idle);
+    this.dropTerminalQueue("session_closed");
+    if (this.terminalTurn) this.endTerminalTurn("error", reason === "terminal_closed" ? "terminal_closed" : "session_closed");
     this.stopTail();
     this.dropQueued();
     for (const actionId of this.book.cancelAll()) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: reason });
@@ -1075,4 +1269,10 @@ export function limitStrings<T>(value: T, max: number): T {
     return out as T;
   }
   return value;
+}
+
+/** The same message, as Claude Code records what was typed: whitespace at the ends and inside runs does not count. */
+function sameText(a: string, b: string): boolean {
+  const norm = (t: string) => t.replace(/\s+/g, " ").trim();
+  return norm(a) === norm(b);
 }

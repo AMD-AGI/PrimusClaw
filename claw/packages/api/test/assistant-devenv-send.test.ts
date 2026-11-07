@@ -414,6 +414,31 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal((await queued(cid)).filter((c: Recorded) => c.type === "prompt").length, 2);
   });
 
+  test("F3b a conversation open in a terminal its connector types into takes the instruction: the card says it is typed there", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const ref = "c0ffee00-0000-4000-8000-0000000000b3";
+    const live = (input: Recorded) => [{ ...CLAUDE, capabilities: { ...CLAUDE.capabilities, watch_live: true, ...input,
+      resumable: [{ ref, title: "in the terminal", cwd: "/home/u/repo/api", updated_at: Math.floor(Date.now() / 1000), state: "live", activity: "idle", input: "terminal" }] } }];
+    // A connector that does not say it types into terminals: the conversation is the terminal's only, whatever the entry says.
+    const cid = await machine("alice", "laptop", { agents: live({}) });
+    await assert.rejects(tools.devenvSend(await userTurn(alice, "接着在终端那个会话里跑"), { text: "跑 lint", target: ref }),
+      (e: Recorded) => e.code === "busy" && /open in a terminal/.test(String(e.message)));
+    assert.deepEqual(await queued(cid), []);
+    // One that does: a card that says the instruction is typed into that terminal; pressed, the conversation is attached and sent to.
+    await store.recordHeartbeat(cid, "alice", { version: "0.1.3", cmdCursor: null, agents: live({ terminal_input: true }) as never });
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [cid]);
+    const shown = await tools.devenvSend(await userTurn(alice, "接着在终端那个会话里跑"), { text: "跑 lint", target: ref });
+    assert.equal(shown.why_card, "confirm_first", JSON.stringify(shown));
+    const card = (await w.q("SELECT payload FROM claw_notification_outbox WHERE payload ? 'confirm_write' ORDER BY id DESC LIMIT 1"))[0].payload;
+    assert.match(card.text, /会话：输入到它在那台机器终端里正开着的对话 laptop\/claude\/\d+（像在终端里打字一样，终端里也看得到）；目录：\/home\/u\/repo\/api\n/);
+    const decided = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(shown.confirmation_id), decision: "allow", via: "button" });
+    assert.equal(decided.status, "done", JSON.stringify(decided));
+    const cmds = await queued(cid);
+    assert.deepEqual(cmds.map((c: Recorded) => c.type), ["session.new", "prompt"]);
+    assert.deepEqual([cmds[0].payload.resume_ref, cmds[0].payload.takeover, cmds[1].payload.text], [ref, undefined, "跑 lint"], "attached, never taken over");
+  });
+
   test("F3 after reading a machine's report, or from a key, only a card: sent when the person lets it through", async () => {
     const alice = await w.user("alice");
     await w.subscribe(alice.userId);

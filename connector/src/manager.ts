@@ -240,7 +240,7 @@ export class SessionManager {
     const s = new Session(sid, agent, verdict.real, this.env, rec.acp_session_id, rec.mode);
     this.sessions.set(sid, s);
     // It stays read-only: a prompt to it after a restart is refused as before, never a takeover by surprise.
-    if (rec.read_only) s.restoreSpectate();
+    if (rec.read_only) s.restoreSpectate(rec.terminal_input === true);
     return s;
   }
 
