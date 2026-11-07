@@ -78,6 +78,14 @@ record it.
   to cite is found with `web_search` in the first step, beside the fetch) and `router-read-v10`: a current fact (the latest version, what a version supports) is
   read now from the source that states it, the latest version from the project's release record (stable.txt, the GitHub latest
   release) rather than a releases page that lags it, and support from that version's own compatibility matrix.
+- A person who asks something the router answers from a lookup hears from it at once: when the turn's first web search or MCP read starts
+  and nothing has been said, the system says one short line in their language ("收到，我查一下。"), and the answer takes that line's place
+  (`CLAW_ASSISTANT_LOOKUP_ACK`, default on; 2026-11-06 nightly: first reply p90 8.4 s against a 5 s target). A router turn that spends every
+  step on lookups now answers in text at its cap (Brain `report_at_turn_cap`), and one that still ends with no word is told so once (peer
+  run bczh-202: eleven web lookups, no reply). The message saying an item waits for a write its worker holds carries the write as a card
+  (`held_write`) for a reader of the session. The router is told outright that what a worker reported is `work_recall`, that "记住…" is a
+  memory entry and never a setting, and that a daily brief or a pause is a channel action, never a scheduled task (`router-v18`,
+  `router-memory-v2`).
 - How far an item got is answered from what its job wrote at the question, not from the worker's last look at it: a worker checks a
   long job only every minute or two, so its last tool output was up to two steps behind the log (2026-11-06 parity run, L1: "step 3/16"
   while the log said step 5). While the item's run is going, `work_recall(item, "live")` also returns `files_now`: the tails of the
