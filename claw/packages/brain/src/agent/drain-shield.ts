@@ -34,6 +34,10 @@ export function shieldFromDrain(run: AbortSignal | undefined, graceMs: number): 
   }
   const own = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const cutNow = (reason: unknown): void => { if (!own.signal.aborted) own.abort(reason); };
+  let cuts = shielded.get(run);
+  if (!cuts) shielded.set(run, cuts = new Set());
+  cuts.add(cutNow);
   const follow = (): void => {
     if (run.reason !== SIGTERM_ABORT_REASON) {
       own.abort(run.reason);
@@ -51,6 +55,22 @@ export function shieldFromDrain(run: AbortSignal | undefined, graceMs: number): 
     dispose: () => {
       run.removeEventListener("abort", follow);
       if (timer !== undefined) clearTimeout(timer);
+      cuts.delete(cutNow);
     },
   };
+}
+
+/** The calls a drain is letting finish, by the run signal they follow. */
+const shielded = new WeakMap<AbortSignal, Set<(reason: unknown) => void>>();
+
+/**
+ * Cut, now, every call of this run that a drain is letting finish.
+ *
+ * The run's signal aborts once: after a drain has aborted it, news that
+ * another replica took the run over (a lost lock or lease, the self-fence)
+ * cannot reach the call through it. The runner says so here instead, so a call
+ * never goes on writing to a workspace someone else now drives.
+ */
+export function cutDrainedCalls(run: AbortSignal, reason: unknown): void {
+  for (const cut of [...(shielded.get(run) ?? [])]) cut(reason);
 }

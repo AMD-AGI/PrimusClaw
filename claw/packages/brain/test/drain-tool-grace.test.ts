@@ -20,7 +20,7 @@ import type { LlmSession, LlmTurnResult, LlmContentBlock } from "../src/llm/prov
 import type { ToolRouter } from "../src/tools/router.js";
 import type { CheckpointState } from "../src/agent/index.js";
 import { agentLoop, INTERRUPTED_TOOL_RESULT, type LoopOptions } from "../src/agent/agent-loop.js";
-import { shieldFromDrain } from "../src/agent/drain-shield.js";
+import { cutDrainedCalls, shieldFromDrain } from "../src/agent/drain-shield.js";
 import { SIGTERM_ABORT_REASON, LEASE_LOST_ABORT_REASON } from "../src/tasks/abort-registry.js";
 
 function session(turns: Array<Partial<LlmTurnResult>>): { session: LlmSession; prompts: Message[][] } {
@@ -94,10 +94,16 @@ function sandbox(ms: number, onStart: () => void) {
 
 const SLEEP = { command: "sleep 90 && echo slept" };
 
-async function drainedThenResumed(graceMs: number, commandMs: number, reason: unknown = SIGTERM_ABORT_REASON) {
+async function drainedThenResumed(graceMs: number, commandMs: number, reason: unknown = SIGTERM_ABORT_REASON,
+  takenOverAfterMs?: number) {
   const kv = store();
   const ac = new AbortController();
-  const box = sandbox(commandMs, () => { if (!ac.signal.aborted) ac.abort(reason); });
+  const box = sandbox(commandMs, () => {
+    if (ac.signal.aborted) return;
+    ac.abort(reason);
+    // (another replica takes the run over while the drain waits: what the runner says on a lost lock, `noteLeaseLost`)
+    if (takenOverAfterMs !== undefined) setTimeout(() => cutDrainedCalls(ac.signal, LEASE_LOST_ABORT_REASON), takenOverAfterMs);
+  });
   const first = session([{ content: [text("我先执行命令。"), toolUse("b1", "bash", SLEEP)], stopReason: "tool_use" }]);
   await agentLoop([{ role: "user", content: "run it" }], TOOLS, opts({
     signal: ac.signal, drainToolGraceMs: graceMs, llmSession: first.session, router: box.router,
@@ -137,6 +143,15 @@ test("D3: a stop that is not a drain cuts the call at once, whatever the grace",
   const r = await drainedThenResumed(5_000, 2_000, LEASE_LOST_ABORT_REASON);
   assert.ok(Date.now() - started < 1_500, "the call was not waited for");
   assert.match(JSON.stringify(r.shown[0].content), new RegExp(INTERRUPTED_TOOL_RESULT.slice(0, 30)));
+});
+
+test("D5: a run taken over by another replica while the drain waits has its call cut at once", async () => {
+  const started = Date.now();
+  const r = await drainedThenResumed(5_000, 2_000, SIGTERM_ABORT_REASON, 20);
+  assert.ok(Date.now() - started < 1_500, "the call did not go on writing after the takeover");
+  assert.deepEqual(r.runs, [SLEEP.command]);
+  assert.match(JSON.stringify(r.shown[0].content), new RegExp(INTERRUPTED_TOOL_RESULT.slice(0, 30)),
+    "a call cut by the takeover is told as interrupted, never as a result");
 });
 
 test("D4: the shield follows the run's signal: other reasons at once, a drain after the grace, nothing once disposed", async () => {

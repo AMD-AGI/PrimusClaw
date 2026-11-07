@@ -1875,7 +1875,8 @@ export const BASH_FOREGROUND_MAX_SEC = envInt(
 export const SIGTERM_TOOL_GRACE_MS = envInt(
   "SIGTERM_TOOL_GRACE_MS",
   Math.min((BASH_FOREGROUND_MAX_SEC + 20) * 1000, 180_000),
-  { min: 0, max: 280_000 },
+  // (180 s at most: with the SIGTERM path's own ~93 s and the preStop, more would outlast the 300 s grace)
+  { min: 0, max: 180_000 },
 );
 
 /**
