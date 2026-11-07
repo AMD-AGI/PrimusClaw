@@ -984,6 +984,10 @@ record it.
   prompt as `recently_written` (#472); `pair` on a hostname that is already another of the person's machines pairs under the
   hostname and the agents' folder, and a paired machine's service hint asks the chat for a new pairing command (#477, connector
   part).
+- `@primusclaw/connector` 0.1.11: a log or state file that cannot be written (a full quota, `EDQUOT`) no longer stops the
+  connector (#496); `withdraw` takes back a message from the chat that has not started and never touches what runs (#494); a
+  closed session stops reading its mode back at once, and `run` waits up to 10 s for commands it has accepted before it exits
+  (#497).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
