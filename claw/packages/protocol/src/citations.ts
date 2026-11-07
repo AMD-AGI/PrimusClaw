@@ -68,6 +68,12 @@ export function citeSourcesAsked(raw: unknown): unknown[] {
   return [raw];
 }
 
+/**
+ * Release records the router's own rules name as where a current version is read (the router prompt's read rules): a page read
+ * at one of these addresses is a source, as one the user wrote is. They come from the platform, never from the model or a page.
+ */
+export const CITE_KNOWN_RECORDS: readonly string[] = ["https://dl.k8s.io/release/stable.txt"];
+
 export function isCiteSourceKind(v: unknown): v is CiteSourceKind {
   return typeof v === "string" && (CITE_SOURCE_KINDS as readonly string[]).includes(v);
 }
