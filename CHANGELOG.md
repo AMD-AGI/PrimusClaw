@@ -106,6 +106,9 @@ record it.
   (and `NODE_EXTRA_CA_CERTS`) before its first connection and passes `NODE_USE_SYSTEM_CA=1` to the programs it starts;
   `NODE_USE_SYSTEM_CA=0` turns it off. When the certificate is still not trusted, `doctor` says what the connector already did and
   names the next step (add the CA to the machine's store; on an older Node.js, upgrade or `NODE_OPTIONS=--use-system-ca`).
+- `claw-connector <command> --help` (or `-h`) prints that command's help and exits 0, for every command; before, `pair --help` and
+  `login --help` failed with "unknown option". An unknown option is a usage error (exit 2) for every command, including `login`
+  (it exited 1) and commands that take no arguments (`stop`, `pause`, `resume`, `logout`, which ignored them).
 - A machine paired from the chat (`claw-connector pair`) and then disconnected is told, wherever the connector says what to do next
   (the revocation itself, `run` started again by the service or by hand, the supervisor's log line, `status`, `service status`,
   `doctor`'s fix, a sign-in refused at start), to ask the
