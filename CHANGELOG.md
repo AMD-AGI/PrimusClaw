@@ -101,6 +101,11 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A fresh connector install trusts the CAs the machine trusts: a Claw behind a company CA no longer fails `doctor`, `login`, `pair`
+  and `run` until `NODE_USE_SYSTEM_CA=1` is set. On Node.js 22.19+ / 24.5+ the connector adds the system store to Node's own list
+  (and `NODE_EXTRA_CA_CERTS`) before its first connection and passes `NODE_USE_SYSTEM_CA=1` to the programs it starts;
+  `NODE_USE_SYSTEM_CA=0` turns it off. When the certificate is still not trusted, `doctor` says what the connector already did and
+  names the next step (add the CA to the machine's store; on an older Node.js, upgrade or `NODE_OPTIONS=--use-system-ca`).
 - A machine paired from the chat (`claw-connector pair`) and then disconnected is told, wherever the connector says what to do next
   (the revocation itself, `run` started again by the service or by hand, the supervisor's log line, `status`, `service status`,
   `doctor`'s fix, a sign-in refused at start), to ask the

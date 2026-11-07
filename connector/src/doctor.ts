@@ -27,6 +27,7 @@ import path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import type { AgentConfig } from "./config.js";
 import { doctorFile, keepaliveFile, keepaliveStampFile, serviceFile, type Dirs } from "./paths.js";
+import { systemCaOutcome, type SystemCaOutcome } from "./system-ca.js";
 import { errMessage, isObject } from "./util.js";
 
 /**
@@ -115,6 +116,8 @@ export interface DoctorDeps {
   fsTimeoutMs?: number;
   /** GET a URL with a timeout: the HTTP status, or the error. */
   get: (url: string) => Promise<{ status: number } | { error: string }>;
+  /** Whether this process added the machine's CA store to the CAs it trusts (system-ca.ts); null: it was not asked to. */
+  systemCa?: SystemCaOutcome | null;
 }
 
 /**
@@ -178,6 +181,7 @@ export function defaultDeps(env: NodeJS.ProcessEnv, over: Partial<DoctorDeps> & 
     home: os.homedir(),
     user: env.USER || (() => { try { return os.userInfo().username; } catch { return ""; } })(),
     nodeVersion: process.versions.node,
+    systemCa: systemCaOutcome(),
     uid: process.getuid?.() ?? null,
     now: () => Date.now(),
     probe: run,
@@ -328,6 +332,7 @@ export async function checkAll(input: CheckInput, d: DoctorDeps): Promise<Report
   if (!Number.isFinite(major) || major < NODE_MIN_MAJOR) {
     add({ code: "node_too_old", severity: "fail", detail: `Node.js ${d.nodeVersion} is older than ${NODE_MIN_MAJOR}`, fix: `install Node.js ${NODE_MIN_MAJOR} or newer (https://nodejs.org), then: npm install -g @primusclaw/connector` });
   } else ok.push(`Node.js ${d.nodeVersion}`);
+  if (d.systemCa?.kind === "applied") ok.push(`Node.js trusts this machine's CA store (${d.systemCa.count} certificate${d.systemCa.count === 1 ? "" : "s"}) as well as its own list`);
 
   // Each agent: its program, its sign-in, its folders. In parallel: each sign-in check may start a program.
   const servicePath = input.by === "doctor" ? await installedServicePath(input.dirs) : null;
@@ -396,13 +401,12 @@ export async function checkAll(input: CheckInput, d: DoctorDeps): Promise<Report
     else {
       const why = "status" in r ? `HTTP ${r.status}` : r.error;
       const proxied = ["HTTPS_PROXY", "https_proxy"].some((k) => set(d.env, k));
-      // Node does not read the system's certificate store by default: a Claw behind a company CA fails here while curl works.
+      // A Claw behind a company CA: the connector trusts this machine's CA store as well as Node's own list (system-ca.ts),
+      // so what is left to say depends on whether it could.
       const untrusted = /certificate|self[- ]signed|UNABLE_TO_GET_ISSUER|CERT_/i.test(why);
       if (untrusted) {
-        add({
-          code: "claw_tls_untrusted", severity: "fail", detail: `Node.js does not trust the certificate of ${shown} (${why.split(input.server).join(shown)})`,
-          fix: "export NODE_USE_SYSTEM_CA=1  (Node.js then trusts the CAs this machine trusts; or NODE_EXTRA_CA_CERTS=/path/to/ca.pem), then run the connector again; an installed service: claw-connector service install again so it carries it",
-        });
+        const { detail, fix } = untrustedAdvice(d.systemCa ?? null, d.nodeVersion);
+        add({ code: "claw_tls_untrusted", severity: "fail", detail: `Node.js does not trust the certificate of ${shown} (${why.split(input.server).join(shown)})${detail}`, fix });
       } else add({
         code: "claw_unreachable", severity: "fail", detail: `${shown} does not answer (${why.split(input.server).join(shown)})`,
         fix: proxied && !set(d.env, "NODE_USE_ENV_PROXY")
@@ -412,6 +416,35 @@ export async function checkAll(input: CheckInput, d: DoctorDeps): Promise<Report
     }
   }
   return { checked_at: new Date(d.now()).toISOString(), by: input.by, ok, problems: dedupe(problems) };
+}
+
+const AGAIN = "then run the connector again; an installed service: claw-connector service install again so it carries it";
+
+/** What to say about a certificate Node.js does not trust, given what the connector did about the machine's CA store. */
+function untrustedAdvice(ca: SystemCaOutcome | null, nodeVersion: string): { detail: string; fix: string } {
+  switch (ca?.kind) {
+    case "applied":
+      return {
+        detail: `, although the connector trusts this machine's CA store (${ca.count} certificate${ca.count === 1 ? "" : "s"}) as well as Node.js's own list`,
+        fix: "add the CA that signed Claw's certificate to this machine's trusted CAs (Debian/Ubuntu: copy it to /usr/local/share/ca-certificates/ and run update-ca-certificates), or export NODE_EXTRA_CA_CERTS=/path/to/ca.pem; " + AGAIN,
+      };
+    case "disabled":
+      return { detail: "; NODE_USE_SYSTEM_CA=0 keeps the connector from trusting this machine's CA store", fix: `unset NODE_USE_SYSTEM_CA  (the connector then trusts the CAs this machine trusts; or NODE_EXTRA_CA_CERTS=/path/to/ca.pem), ${AGAIN}` };
+    case "unsupported":
+      return {
+        detail: `; Node.js ${nodeVersion} cannot add this machine's CA store from inside the connector (22.19+ and 24.5+ can)`,
+        fix: ca.flag
+          ? `install Node.js 22.19+ or 24.5+ (the connector then trusts the CAs this machine trusts by itself), or export NODE_OPTIONS=--use-system-ca, or NODE_EXTRA_CA_CERTS=/path/to/ca.pem; ${AGAIN}`
+          : `install Node.js 22.19+ or 24.5+ (the connector then trusts the CAs this machine trusts by itself), or export NODE_EXTRA_CA_CERTS=/path/to/ca.pem; ${AGAIN}`,
+      };
+    case "empty":
+      return {
+        detail: `; this machine's CA store ${ca.error ? `could not be read (${ca.error})` : "is empty"}`,
+        fix: `install the CA certificates (Debian/Ubuntu: apt-get install ca-certificates) and add the CA that signed Claw's certificate, or export NODE_EXTRA_CA_CERTS=/path/to/ca.pem; ${AGAIN}`,
+      };
+    default:
+      return { detail: "", fix: `export NODE_USE_SYSTEM_CA=1  (Node.js then trusts the CAs this machine trusts; or NODE_EXTRA_CA_CERTS=/path/to/ca.pem), ${AGAIN}` };
+  }
 }
 
 /** A URL as it may be shown: its scheme, host and path only (a user name, password, query or fragment may hold a credential). */

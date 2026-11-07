@@ -126,7 +126,8 @@ Node.js 22 or newer; each agent's program on `PATH` (and on the `PATH` the insta
 shell's); whether Claude Code and Codex are signed in (`claude auth status`, `codex login status`, or the model provider's key
 variable in `~/.codex/config.toml`); the `roots` writable; `HTTPS_PROXY` and `https_proxy` not set to different values; a service
 installed (and, for `keepalive.sh`, something calling it); and Claw answering, including whether Node.js trusts its certificate
-(Node does not read the system's CA store by default: behind a company CA set `NODE_USE_SYSTEM_CA=1` or `NODE_EXTRA_CA_CERTS`). Then it
+(the connector trusts this machine's CA store as well as Node's own list and `NODE_EXTRA_CA_CERTS`, on Node.js 22.19+ / 24.5+, and passes
+`NODE_USE_SYSTEM_CA=1` to the programs it starts; `NODE_USE_SYSTEM_CA=0` turns that off; on an older Node.js doctor names the fix). Then it
 runs the adapter check of step 2. It exits 1 when something will stop sessions (`--json`: `ok` is the adapters' verdict,
 `machine_ok` and `environment` the machine's). The
 running connector repeats the machine checks with its own environment (in a child process, so a stalled disk cannot stall
