@@ -33,7 +33,7 @@ import { insertSessionRow } from "../routes/sessions.js";
 import { queuedMessageId, SWEEPABLE_RUN_STATUSES, stopSessionRuns } from "../tasks/chat-run.js";
 import { getOrCreateAssistant } from "./assistant.js";
 import { drainSessionIfIdle, queueServerMessage, type QueuedServerMessage } from "./messages.js";
-import { queueRouterWake } from "./reports.js";
+import { queueRouterWake, tellUnwoken } from "./reports.js";
 import { freezeRequesterView } from "./requester-view.js";
 import { clipOneLine, getWorkItem, insertWorkItem, itemView, MAX_QUEUED_ITEMS, RUNNING, WAITING, type Outcome, type WorkItemView } from "./work-items.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
@@ -1272,7 +1272,8 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
       itemId, userId: row.user_id as string, eventId: Number(event.id), kind: state.reportKind, version: 0, summary: state.summary, question,
     });
   });
-  if (woke) await drainSessionIfIdle(woke.sessionId, woke.userId);
+  if (woke?.status === "queued") await drainSessionIfIdle(woke.sessionId, woke.userId);
+  else if (woke?.status === "refused") await tellUnwoken(itemId);
   const after = (await db.query("SELECT * FROM claw_work_items WHERE item_id = $1", [itemId])).rows[0] as Record<string, unknown> | undefined;
   return after ? itemView(after) : null;
 }

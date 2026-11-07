@@ -93,6 +93,12 @@ export interface SayInput {
   amendNotice?: boolean;
   /** The replies it suggests, already checked (`suggested.ts`): carried by its event as `suggested_replies`. */
   suggested?: string[];
+  /**
+   * The item the report that woke this turn is about, when that report said the item came from a session the user deleted
+   * (`earlierConversationItemOf`): a message about that item starts with where it came from (`MOVED_PREFIX_ZH`/`_EN`), as the system's
+   * own message about it does, added here when the router left it out.
+   */
+  fromEarlierConversationItem?: string;
 }
 
 export interface SayDeps {
@@ -590,8 +596,9 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
       )).rows[0].n);
       if (recent >= limit) throw new SayCapped(limit);
       const replaces = input.turnMessageId && input.turnBegan ? await turnFirstSay(q, input.userId, input.turnBegan, input.turnMessageId) : null;
+      const said = item && item.item_id === input.fromEarlierConversationItem ? withMovedPrefix(text) : text;
       return storeOne({
-        type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text, item, sources: input.sources, suggested: input.suggested,
+        type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text: said, item, sources: input.sources, suggested: input.suggested,
         ...(input.turnMessageId ? { turnMessageId: input.turnMessageId } : {}),
         // After the turn's start notice a say adds to that notice (`amends`); otherwise a later say takes the place of the turn's first one.
         ...(notice ? { amends: notice } : replaces ? { replaces } : {}),
@@ -776,6 +783,12 @@ export async function turnHandedOffReview(q: Querier, userId: string, messageId:
 /** What a message about an item from a session the user deleted starts with: it is said in the session they have now, once. */
 export const MOVED_PREFIX_ZH = "（之前的对话里开始的事项）";
 export const MOVED_PREFIX_EN = "(From an earlier conversation) ";
+
+/** A message about an item from a deleted session, starting with where it came from: unchanged when it already says so anywhere. */
+export function withMovedPrefix(text: string): string {
+  if (text.includes(MOVED_PREFIX_ZH) || text.toLowerCase().includes(MOVED_PREFIX_EN.trim().toLowerCase())) return text;
+  return `${detectLanguage(text) === "Chinese" ? MOVED_PREFIX_ZH : MOVED_PREFIX_EN}${text}`;
+}
 
 /**
  * Where the system says something about an item on its own: the assistant session the item was started from. When the user deleted

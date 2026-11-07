@@ -14,7 +14,11 @@
  *   W2  the state change, its event and the wake are one transaction: a commit that fails leaves none of them
  *   W3  the wake is one queued message per report, carries the owner's credentials, and is drained after the commit;
       a router in the middle of a turn is left to drain its own queue
- *   W4  a router that cannot be woken does not lose the report
+ *   W4  a router that cannot be woken does not lose the report: the system says it at once, once, not the sweep minutes later
+ *   W5  after the user deleted the item's session, a result reaches the session made again before their first message there at once,
+ *       once, saying where the item came from (2026-11-07 parity run, v369 B-short: 5 minutes late)
+ *   W6  after the user deleted the item's session and spoke in the new one, the router is told where the item came from and its say
+ *       about the item starts with it; an item of the current session is said as before (v369 B-talk: no marker)
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -248,12 +252,110 @@ describe("assistant worker reports", { skip }, () => {
     assert.equal(w.drains.filter((d) => d.sessionId === alice.routerSid).length, 0);
   });
 
-  test("W4 a router that cannot be woken does not lose the report", async () => {
-    await w.q("UPDATE claw_sessions SET config = '{}'::jsonb WHERE session_id = $1", [alice.routerSid]);
-    const turn = await w.workerTurn(item.itemId);
-    assert.equal((await report(turn, { kind: "ready", summary: "done" })).status, "recorded");
-    assert.equal((await w.item(item.itemId)).board_state, "needs_you");
-    assert.equal((await w.pending(alice.routerSid)).length, 0);
-    assert.equal(w.drains.length, 0);
+  /** The system's messages and the router's, as the web client was sent them. */
+  const shown = () => w.events.filter((e) => e.type === "AssistantSay").map((e) => ({ session: e.session_id, text: String(e.text), fallback: e.fallback }));
+  /** The reports' announcements go to this world's session stream, for the test's length. */
+  const withSayDeps = async (fn: () => Promise<void>) => {
+    const real = w.mod.reports.reportPorts.sayDeps;
+    w.mod.reports.reportPorts.sayDeps = w.sayDeps;
+    w.events.length = 0;
+    try { await fn(); } finally { w.mod.reports.reportPorts.sayDeps = real; }
+  };
+  const deleteSession = (sessionId: string) => w.q("UPDATE claw_sessions SET deleted_at = NOW() WHERE session_id = $1", [sessionId]);
+  /** The silent sweep, as if every item had been quiet past its threshold. */
+  const sweep = () => w.mod.silent.tellSilentItems(0);
+
+  test("W4 a router that cannot be woken does not lose the report: the system says it at once, once", async () => {
+    await withSayDeps(async () => {
+      await w.q("UPDATE claw_sessions SET config = '{}'::jsonb WHERE session_id = $1", [alice.routerSid]);
+      const turn = await w.workerTurn(item.itemId);
+      assert.equal((await report(turn, { kind: "ready", summary: "done" })).status, "recorded");
+      assert.equal((await w.item(item.itemId)).board_state, "needs_you");
+      assert.equal((await w.pending(alice.routerSid)).length, 0);
+      assert.equal(w.drains.length, 0);
+      assert.deepEqual(shown(), [{ session: alice.routerSid, text: `#${item.seq} "Fix the build" is ready for your review (v1).`, fallback: true }],
+        "said by the system with the report, not left to the sweep");
+      assert.equal(await sweep(), 0, "and not again by the sweep");
+      assert.equal(shown().length, 1);
+    });
+  });
+
+  test("W5 a result after a delete, before the user's first message in the new session, is said there at once, once, from where", async () => {
+    await withSayDeps(async () => {
+      const job = await w.createItem(alice, "计算 3 的 40 次方模 1000003");
+      const turn = await w.workerTurn(job.itemId);
+      await deleteSession(alice.routerSid);
+      // What the user's next visit does; they have not written in it yet, so it holds no credentials of theirs.
+      const again = await w.mod.assistant.getOrCreateAssistant("alice");
+      assert.notEqual(again.sessionId, alice.routerSid);
+      assert.equal((await report(turn, { kind: "answer", summary: "3^40 mod 1000003 = 970294" })).status, "recorded");
+      assert.equal((await w.pending(again.sessionId)).length, 0, "the wake was refused: no credentials");
+      const told = shown();
+      assert.equal(told.length, 1, JSON.stringify(told));
+      assert.equal(told[0].session, again.sessionId, "the session the user has now");
+      assert.equal(told[0].fallback, true);
+      assert.ok(told[0].text.startsWith(w.mod.outbound.MOVED_PREFIX_ZH), told[0].text);
+      assert.match(told[0].text, /970294/);
+      assert.equal(await sweep(), 0, "said once: the sweep finds it told");
+      assert.equal(shown().length, 1);
+    });
+  });
+
+  test("W6 a result after a delete, once the user spoke in the new session, is said by the router with where the item came from", async () => {
+    const prompts = await import("../src/assistant/prompts.js");
+    await withSayDeps(async () => {
+      const job = await w.createItem(alice, "计算 3 的 40 次方模 1000003");
+      const turn = await w.workerTurn(job.itemId);
+      await deleteSession(alice.routerSid);
+      // The user's first message in the session made again stamps their credentials there (as `w.user` does).
+      const now = await w.user("alice");
+      assert.notEqual(now.routerSid, alice.routerSid);
+      assert.equal((await report(turn, { kind: "answer", summary: "3^40 mod 1000003 = 970294" })).status, "recorded");
+      const [wake] = await w.pending(now.routerSid);
+      assert.ok(wake, "the router of the session the user has now is woken");
+      assert.ok(String(wake.content).split("\n").includes(prompts.EARLIER_CONVERSATION_LINE), String(wake.content));
+      assert.equal(shown().length, 0, "nothing said by the system: the router says it");
+
+      const routerTurn = await w.routerTurn(now);
+      await w.q("UPDATE claw_tasks SET prompt = $2 WHERE task_id = $1", [routerTurn.task_id, wake.content]);
+      await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [now.routerSid]);
+      await w.mod.tools.say(routerTurn as never, { text: `✅ #${job.seq} 计算 3 的 40 次方模 1000003 已完成：结果 970294`, item_id: job.itemId }, w.sayDeps);
+      const said = shown();
+      assert.equal(said.length, 1);
+      assert.equal(said[0].session, now.routerSid);
+      assert.equal(said[0].text, `${w.mod.outbound.MOVED_PREFIX_ZH}✅ #${job.seq} 计算 3 的 40 次方模 1000003 已完成：结果 970294`);
+      assert.equal(await sweep(), 0, "said once");
+    });
+  });
+
+  test("W6b the router's own words about where the item came from are kept; an item of the current session has no marker", async () => {
+    const prompts = await import("../src/assistant/prompts.js");
+    await withSayDeps(async () => {
+      const job = await w.createItem(alice, "计算 3 的 40 次方模 1000003");
+      const turn = await w.workerTurn(job.itemId);
+      await deleteSession(alice.routerSid);
+      const now = await w.user("alice");
+      await report(turn, { kind: "answer", summary: "970294" });
+      const [wake] = await w.pending(now.routerSid);
+      const routerTurn = await w.routerTurn(now);
+      await w.q("UPDATE claw_tasks SET prompt = $2 WHERE task_id = $1", [routerTurn.task_id, wake.content]);
+      await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [now.routerSid]);
+      const own = `之前的对话里开始的 #${job.seq} 计算 3 的 40 次方模 1000003 完成了：970294（之前的对话里开始的事项）`;
+      await w.mod.tools.say(routerTurn as never, { text: own, item_id: job.itemId }, w.sayDeps);
+      assert.equal(shown()[0].text, own, "not marked twice");
+
+      // An item started in the session the user has now: as before.
+      w.events.length = 0;
+      const here = await w.createItem(now, "计算 2 的 10 次方");
+      const hereTurn = await w.workerTurn(here.itemId);
+      await report(hereTurn, { kind: "answer", summary: "1024" });
+      const [hereWake] = await w.pending(now.routerSid);
+      assert.ok(!String(hereWake.content).includes(prompts.EARLIER_CONVERSATION_LINE), String(hereWake.content));
+      const next = await w.routerTurn(now);
+      await w.q("UPDATE claw_tasks SET prompt = $2 WHERE task_id = $1", [next.task_id, hereWake.content]);
+      const plain = `✅ #${here.seq} 计算 2 的 10 次方：1024`;
+      await w.mod.tools.say(next as never, { text: plain, item_id: here.itemId }, w.sayDeps);
+      assert.equal(shown()[0].text, plain);
+    });
   });
 });
