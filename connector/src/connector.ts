@@ -16,11 +16,11 @@ import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-clie
 import type { ConnectorConfig } from "./config.js";
 import { GrantRevokedError, TransientAuthError } from "./credentials.js";
 import { recordDisconnect } from "./health.js";
-import { SnapshotFile, STATE_WRITE_WAIT_MS, within, type WriteReport } from "./statefile.js";
+import { SnapshotFile, STATE_WRITE_WAIT_MS, within, writeWhole, type WriteReport } from "./statefile.js";
 import { SessionManager, type Command } from "./manager.js";
 import { Outbox } from "./outbox.js";
 import {
-  childrenFile, identityFile, logDir, outboxDir, pauseFile, pidFile, sessionsFile, type Dirs,
+  childrenFile, identityFile, identityKeepFile, logDir, outboxDir, pauseFile, pidFile, sessionsFile, type Dirs,
 } from "./paths.js";
 import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, type RemoteAgentDescriptor } from "./protocol.js";
 import { redactDeep } from "./redact.js";
@@ -243,7 +243,7 @@ export class Connector {
       said.set(what, now);
       d.log.warn(error ? "a state write failed" : "a state write was slow (is the state directory on a network disk that stalled?)", { what, ms, ...(error ? { error } : {}) });
     };
-    this.identityOut = new SnapshotFile(identityFile(d.dirs), report);
+    this.identityOut = new SnapshotFile(identityFile(d.dirs), report, true);
     this.outbox = new Outbox({ dir: outboxDir(d.dirs), report });
     this.registry = new ChildRegistry(childrenFile(d.dirs), { background: true, report });
     this.store = new SessionStore(sessionsFile(d.dirs), report);
@@ -303,14 +303,51 @@ export class Connector {
 
   // --- identity -------------------------------------------------------------------
 
-  private readIdentity(): IdentityState | null {
+  /**
+   * The connector id stored here: connector.json, or, when that file is there but cannot be read (a crash during its
+   * write, a damaged disk), connector-id.json, which holds the id alone. Registering again in that case would give the
+   * machine a second connector at Claw (the first revoked as a stale twin, its sessions closed with it). A missing
+   * connector.json is a machine never registered here, or one `pair`/`logout` made forget its id: it registers.
+   */
+  private readIdentity(): (IdentityState & { fromKeep?: true }) | null {
+    let text: string;
+    try { text = fs.readFileSync(identityFile(this.d.dirs), "utf8"); } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+      return this.keptIdentity(errMessage(e));
+    }
+    let raw: unknown;
+    try { raw = JSON.parse(text); } catch (e) { return this.keptIdentity(`not JSON (${errMessage(e)})`); }
+    if (!isObject(raw) || typeof raw.connector_id !== "string" || typeof raw.server !== "string") return this.keptIdentity("no connector id in it");
+    // Stored for another Claw: not this server's row, and the fallback is not either.
+    if (raw.server !== this.d.server) return null;
+    return { server: raw.server, connector_id: raw.connector_id, cursor: typeof raw.cursor === "number" ? raw.cursor : 0, handled: Array.isArray(raw.handled) ? raw.handled.filter((x): x is string => typeof x === "string") : [] };
+  }
+
+  /** connector-id.json, for a connector.json that cannot be read; null when it has no id for this server either. */
+  private keptIdentity(why: string): (IdentityState & { fromKeep: true }) | null {
     try {
-      const raw: unknown = JSON.parse(fs.readFileSync(identityFile(this.d.dirs), "utf8"));
+      const raw: unknown = JSON.parse(fs.readFileSync(identityKeepFile(this.d.dirs), "utf8"));
       if (isObject(raw) && raw.server === this.d.server && typeof raw.connector_id === "string") {
-        return { server: raw.server, connector_id: raw.connector_id, cursor: typeof raw.cursor === "number" ? raw.cursor : 0, handled: Array.isArray(raw.handled) ? raw.handled.filter((x): x is string => typeof x === "string") : [] };
+        this.d.log.warn("connector.json cannot be read; keeping the connector id from connector-id.json", { why, connector_id: raw.connector_id });
+        return { server: raw.server, connector_id: raw.connector_id, cursor: 0, handled: [], fromKeep: true };
       }
-    } catch { /* first run */ }
+    } catch { /* none (written by a version before it existed), or unreadable too */ }
+    this.d.log.warn("connector.json cannot be read and no connector id is kept beside it; registering this machine again", { why });
     return null;
+  }
+
+  /**
+   * Keep the id in connector-id.json too, flushed to the disk, when it is not there yet: on registration, and on the
+   * first start of a version that keeps it (an id registered before). Waited for a bounded time, like connector.json.
+   */
+  private async keepIdentity(): Promise<void> {
+    const file = identityKeepFile(this.d.dirs);
+    try {
+      const raw: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (isObject(raw) && raw.server === this.d.server && raw.connector_id === this.cid) return;
+    } catch { /* not kept yet */ }
+    const ok = await within(writeWhole(file, JSON.stringify({ server: this.d.server, connector_id: this.cid }), 0o600, true).then(() => true), STATE_WRITE_WAIT_MS, false);
+    if (!ok) this.d.log.warn("connector-id.json is not written yet; going on");
   }
 
   /** Saves connector.json in the background; `identityOut.settled()` says whether it landed. */
@@ -325,11 +362,15 @@ export class Connector {
     if (have) {
       this.cid = have.connector_id;
       this.ledger = new CommandLedger(have.cursor, have.handled);
+      // connector.json written whole again, from the kept id.
+      if (have.fromKeep) { this.writeIdentity(); await this.identityOut.settled(); }
+      await this.keepIdentity();
       return;
     }
     this.cid = await this.d.client.register(this.d.config.name, this.d.version);
     this.ledger = new CommandLedger();
     this.writeIdentity();
+    await this.keepIdentity();
     // Waited for (a bounded time): an id that never reached the disk is registered again by the next start.
     if (!(await this.identityOut.settled())) this.d.log.warn("connector.json is not written yet; going on (a restart before it is would register this machine again)");
     this.d.audit.record("connector_registered", { connector_id: this.cid, name: this.d.config.name });
@@ -347,6 +388,7 @@ export class Connector {
       await this.heartbeat();
     } catch (e) {
       if (e instanceof HttpError && e.status === 404) {
+        this.d.log.warn("Claw does not know the stored connector id (another account's, or removed); registering this machine again", { connector_id: this.cid });
         await this.identify(true);
         await this.heartbeat();
         return;

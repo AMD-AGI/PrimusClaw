@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /** Where the connector keeps its files. */
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -32,6 +33,17 @@ export const credentialsFile = (d: Dirs) => path.join(d.config, "credentials.jso
 /** The agents' own sign-in variables (ANTHROPIC_API_KEY...) that `service install` kept for the service; 0600. */
 export const serviceEnvFile = (d: Dirs) => path.join(d.config, "service-env.json");
 export const identityFile = (d: Dirs) => path.join(d.state, "connector.json");
+/**
+ * The connector id alone ({server, connector_id}), written when the id is first stored and not rewritten by every
+ * heartbeat as connector.json is: what `run` falls back to when connector.json is there but cannot be read, so a damaged
+ * file does not register the machine again as another connector.
+ */
+export const identityKeepFile = (d: Dirs) => path.join(d.state, "connector-id.json");
+/** Forget this machine's connector id (both files): the next `run` registers it anew. */
+export function forgetIdentity(d: Dirs): void {
+  fs.rmSync(identityFile(d), { force: true });
+  fs.rmSync(identityKeepFile(d), { force: true });
+}
 export const sessionsFile = (d: Dirs) => path.join(d.state, "sessions.json");
 export const childrenFile = (d: Dirs) => path.join(d.state, "children.json");
 export const pidFile = (d: Dirs) => path.join(d.state, "connector.pid");

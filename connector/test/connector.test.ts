@@ -15,6 +15,7 @@ import { getEventListeners } from "node:events";
 import { processStart } from "../src/children.js";
 import { sleep } from "../src/util.js";
 import { FakeClaw } from "./support/fake-claw.js";
+import { identityFile, identityKeepFile } from "../src/paths.js";
 import { Harness, tmpdir } from "./support/harness.js";
 
 const hs: Harness[] = [];
@@ -41,6 +42,51 @@ describe("identity, heartbeat and presence", () => {
     h.start();
     await h.online();
     assert.equal(h.claw.registered, 1);
+  });
+  test("a restart after an upgrade from a version that kept no connector-id.json keeps the id, and keeps it there from then on", async () => {
+    const h = await make();
+    await h.online();
+    const id = h.claw.connectorId;
+    await h.stop();
+    // As 0.1.7 and before left the state directory: connector.json only.
+    fs.rmSync(identityKeepFile(h.dirs), { force: true });
+    h.connect();
+    h.start();
+    await h.online();
+    assert.equal(h.claw.registered, 1, "not registered again");
+    assert.equal(JSON.parse(fs.readFileSync(identityFile(h.dirs), "utf8")).connector_id, id);
+    assert.deepEqual(JSON.parse(fs.readFileSync(identityKeepFile(h.dirs), "utf8")), { server: h.claw.url, connector_id: id });
+  });
+  for (const [what, damage] of [
+    ["empty (its data never reached the disk before the machine went down)", ""],
+    ["zero bytes where the data was", "\0".repeat(134)],
+    ["cut off", '{"server":"https://cl'],
+    ["valid JSON without an id", "{}"],
+  ] as const) {
+    test(`connector.json ${what}: the restart keeps the connector id instead of registering this machine again`, async () => {
+      const h = await make();
+      await h.online();
+      const id = h.claw.connectorId;
+      await h.stop();
+      fs.writeFileSync(identityFile(h.dirs), damage);
+      h.connect();
+      h.start();
+      await h.online();
+      assert.equal(h.claw.registered, 1, "not registered again");
+      assert.equal(JSON.parse(fs.readFileSync(identityFile(h.dirs), "utf8")).connector_id, id, "connector.json is whole again");
+    });
+  }
+  test("connector.json damaged and no connector-id.json beside it: the machine registers again (nothing to keep)", async () => {
+    const h = await make();
+    await h.online();
+    await h.stop();
+    fs.writeFileSync(identityFile(h.dirs), "");
+    fs.rmSync(identityKeepFile(h.dirs), { force: true });
+    h.connect();
+    h.start();
+    await h.online();
+    assert.equal(h.claw.registered, 2);
+    assert.equal(JSON.parse(fs.readFileSync(identityKeepFile(h.dirs), "utf8")).connector_id, h.claw.connectorId);
   });
   test("keeps heartbeating and reports the command cursor once commands are handled; the server then forgets them", async () => {
     const h = await make();

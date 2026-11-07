@@ -12,7 +12,7 @@ import { main, COMMANDS, EXIT, type Ctx } from "../src/commands.js";
 import { withThreadPool } from "../src/service.js";
 import { PRESETS, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
-import { credentialsFile, identityFile, pauseFile, resolveDirs, type Dirs } from "../src/paths.js";
+import { credentialsFile, identityFile, identityKeepFile, pauseFile, resolveDirs, type Dirs } from "../src/paths.js";
 import { sleep } from "../src/util.js";
 import { FakeClaw } from "./support/fake-claw.js";
 import { FakeIdentity } from "./support/fake-identity.js";
@@ -43,6 +43,7 @@ ${agentEnv ? `[agents.env]\n${agentEnv}\n` : ""}`);
 const seedIdentity = (dirs: Dirs, server: string, id = "stored-connector", revoked = false) => {
   fs.mkdirSync(dirs.state, { recursive: true });
   fs.writeFileSync(identityFile(dirs), JSON.stringify({ server, connector_id: id, cursor: 0, handled: [], ...(revoked ? { revoked: true } : {}) }), { mode: 0o600 });
+  fs.writeFileSync(identityKeepFile(dirs), JSON.stringify({ server, connector_id: id }), { mode: 0o600 });
 };
 const storedId = (dirs: Dirs): any => JSON.parse(fs.readFileSync(identityFile(dirs), "utf8"));
 /** Drains the FIFO named by its argument for as long as it lives: every writer that opens it gets its write through. */
@@ -500,17 +501,20 @@ describe("claw-connector commands", () => {
         seedIdentity(a.c.dirs, "https://x.example", "stored-connector", revoked);
         assert.equal(await main(["login", "--server", "https://x.example", "--key", "k"], ctx(home).c), EXIT.ok);
         assert.equal(fs.existsSync(identityFile(a.c.dirs)), !revoked, `login --key, revoked=${revoked}`);
+        assert.equal(fs.existsSync(identityKeepFile(a.c.dirs)), !revoked, `login --key keeps or forgets connector-id.json with it, revoked=${revoked}`);
         // device path
         id.interval = 0.01;
         id.pollScript = ["ok"];
         seedIdentity(a.c.dirs, "https://x.example", "stored-connector", revoked);
         assert.equal(await main(["login", "--server", "https://x.example", "--identity-url", id.url], ctx(home).c), EXIT.ok);
         assert.equal(fs.existsSync(identityFile(a.c.dirs)), !revoked, `login device, revoked=${revoked}`);
+        assert.equal(fs.existsSync(identityKeepFile(a.c.dirs)), !revoked, `login device keeps or forgets connector-id.json with it, revoked=${revoked}`);
         // logout, with Claw out of reach: a revoked row needs nothing of it; a live one cannot be revoked, so its id stays
         seedIdentity(a.c.dirs, "https://x.example", "stored-connector", revoked);
         const offline = (async () => { throw new Error("offline"); }) as typeof fetch;
         assert.equal(await main(["logout"], ctx(home, { fetch: offline }).c), revoked ? EXIT.ok : EXIT.failure);
         assert.equal(fs.existsSync(identityFile(a.c.dirs)), !revoked, `logout, revoked=${revoked}`);
+        assert.equal(fs.existsSync(identityKeepFile(a.c.dirs)), !revoked, `logout keeps or forgets connector-id.json with it, revoked=${revoked}`);
         if (!revoked) assert.equal(storedId(a.c.dirs).connector_id, "stored-connector");
       }
     } finally { await id.close(); }

@@ -17,7 +17,7 @@ import { parseArgs } from "node:util";
 import { parseConfig, type ConnectorConfig } from "./config.js";
 import { saveCredentials } from "./credentials.js";
 import { clearNeedsLogin } from "./health.js";
-import { configFile, credentialsFile, identityFile } from "./paths.js";
+import { configFile, credentialsFile, forgetIdentity } from "./paths.js";
 import { errMessage, isObject, secureUrl } from "./util.js";
 import type { Ctx } from "./commands.js";
 
@@ -165,7 +165,7 @@ export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise
   }
   saveCredentials(credentialsFile(ctx.dirs), { v: 1, server, kind: "grant", token, device_name: name, saved_at: new Date().toISOString() });
   // A connector id from an earlier sign-in is not this grant's: the next run registers this machine anew.
-  fs.rmSync(identityFile(ctx.dirs), { force: true });
+  forgetIdentity(ctx.dirs);
   clearNeedsLogin(ctx.dirs);
   ctx.out(`paired "${name}" with ${server}`);
 

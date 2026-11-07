@@ -10,7 +10,7 @@ import test, { describe } from "node:test";
 import { main, EXIT, type Ctx } from "../src/commands.js";
 import { parseConfig } from "../src/config.js";
 import { defaultRoot, detectAgents, pairedConfig } from "../src/pair.js";
-import { credentialsFile, identityFile, resolveDirs } from "../src/paths.js";
+import { credentialsFile, identityFile, identityKeepFile, resolveDirs } from "../src/paths.js";
 import { saveCredentials } from "../src/credentials.js";
 import { FakeClaw } from "./support/fake-claw.js";
 import { tmpdir } from "./support/harness.js";
@@ -60,6 +60,7 @@ describe("claw-connector pair", () => {
       // A connector id of an earlier sign-in, which is not this grant's.
       fs.mkdirSync(resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv).state, { recursive: true });
       fs.writeFileSync(identityFile(resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv)), JSON.stringify({ server: claw.url, connector_id: "old", cursor: 0, handled: [] }));
+      fs.writeFileSync(identityKeepFile(resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv)), JSON.stringify({ server: claw.url, connector_id: "old" }));
       const a = ctx(home, { fetch: f, cwd: work, env: { PATH: fakePath("claude", "codex"), CLAUDE_CONFIG_DIR: path.join(home, "cc") } });
       assert.equal(await main(["pair", "abcd-efgh-jkmn", "--server", claw.url, "--no-start"], a.c), EXIT.ok, a.errText());
       assert.deepEqual(seen.map((s) => s.body), [{ code: "abcd-efgh-jkmn", name: "box" }]);
@@ -72,6 +73,7 @@ describe("claw-connector pair", () => {
       assert.deepEqual([saved.kind, saved.token, saved.server, saved.device_name], ["grant", GRANT, claw.url, "box"]);
       assert.equal(fs.statSync(credentialsFile(a.c.dirs)).mode & 0o777, 0o600);
       assert.equal(fs.existsSync(identityFile(a.c.dirs)), false, "the earlier connector id is forgotten: this grant registers anew");
+      assert.equal(fs.existsSync(identityKeepFile(a.c.dirs)), false, "connector-id.json too, or a damaged connector.json would bring the earlier id back");
       assert.doesNotMatch(a.text() + a.errText(), new RegExp(GRANT), "the grant is never printed");
 
       // The grant is the bearer `run` presents, and it registers a connector.
