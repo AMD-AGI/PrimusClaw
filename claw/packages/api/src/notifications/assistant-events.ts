@@ -93,6 +93,31 @@ export interface AssistantFile {
   data_base64?: string;
 }
 
+/**
+ * What a development environment session's own message is about (`assistant/remote-items.ts`): one of the three things a session is
+ * ever said for, so a channel can draw it and tell it apart. `done`: the instruction finished; `needs_you`: the agent waits on the person
+ * (`ask`: the permission request, for a channel to put to them with its options as buttons, answered as an attached chat's card is, a
+ * decision on the session); `error`: the instruction failed, was refused, or its session ended before it finished. `machine` and
+ * `agent` are what the connector reported, and `ask`'s words what the agent wrote: untrusted text, shown as text only.
+ */
+export interface AssistantRemoteNotice {
+  kind: "done" | "needs_you" | "error";
+  session_id: string;
+  machine: string;
+  agent: string;
+  ask?: AssistantRemoteAsk;
+}
+
+/** A permission request a development environment's agent waits on (`permissionRequest`), as its connector posted it. */
+export interface AssistantRemoteAsk {
+  action_id: string;
+  tool: string;
+  /** The options the agent offered, ids as the agent gave them: the only answers a decision may carry. */
+  options: Array<{ optionId: string; name: string; kind: string }>;
+  /** When the connector stops waiting for an answer (it refuses the request then); absent when it did not say. */
+  expires_at?: string;
+}
+
 /** Something the assistant chose to say to the user. */
 export interface AssistantSayPayload extends AssistantEventBase {
   type: "assistant.say";
@@ -107,6 +132,8 @@ export interface AssistantSayPayload extends AssistantEventBase {
   confirm_write?: AssistantConfirmWrite;
   /** Files the user gets with the message (a worker's deliveries, `deliveries.ts`): one download each. */
   files?: AssistantFile[];
+  /** Present on a development environment session's own message: which session, and which of its three kinds of news. */
+  remote?: AssistantRemoteNotice;
   /**
    * The `event_id` of an earlier message of this turn that this one adds to: the system's start notice of an item, after which the
    * router's words belong in that same message. A channel that still has that message shows it with these words added (its text, a

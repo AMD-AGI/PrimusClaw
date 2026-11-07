@@ -28,6 +28,12 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A development environment session is pushed only when it needs you, finishes or fails, each once: an instruction the assistant sent
+  to an agent on your machine says nothing while it works, one message when the agent waits on a permission request (`assistant.say`
+  `remote.ask`: the request with its options and when it runs out, for a channel to put to you as buttons), one when it finished, and
+  one when it failed (an error or a refusal, the machine refusing the instruction, or the session closing first, now said as an error
+  rather than as a finish). Each message carries `remote: {kind, session_id, machine, agent}` so a channel that already shows the
+  session can tell. `GET /v1/remote-agents/sessions` lists, per active session, the requests it waits on its user for (`waiting`).
 - Brain's `SKILL_HINTS_IN_SYSTEM_USERS` (default none): comma-separated user ids whose turns put the skill and MCP server hints in
   the system message, as `SKILL_HINTS_IN_SYSTEM` does for everyone, so the change can be measured on one identity on a live
   deployment before it is switched on for all. `engine.tools_resolved` logs `hintsInSystem` for each turn.
