@@ -24,6 +24,7 @@ import type { Audit } from "./audit.js";
 import { AdapterProcess, type AcpParams, type AdapterHooks } from "./adapter.js";
 import type { ChildRegistry } from "./children.js";
 import type { AgentConfig, ConnectorConfig } from "./config.js";
+import { claudeSessionMeta } from "./claude-mode.js";
 import {
   PermissionBook, boundedInput, matchAutoAllow, normalizeOptions, type OfferedOption,
 } from "./permissions.js";
@@ -66,6 +67,9 @@ export interface ModeInfo { id: string; name?: string; description?: string }
 export class SessionRefusal extends Error {
   constructor(readonly reason: string, message?: string) { super(message ?? reason); }
 }
+
+/** Why Claude Code leaves `bypassPermissions` out of its modes, for the log line of a refused session (claude-mode.ts). */
+const BYPASS_HINT = ` (Claude Code offers it to root only with IS_SANDBOX set, and never when permissions.disableBypassPermissionsMode is "disable"; "claw-connector doctor" names the fix)`;
 
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024;
 const MAX_QUEUED_PROMPTS = 5;
@@ -285,7 +289,7 @@ export class Session {
     this.modeSeen = [];
     try {
       if (how === "new") {
-        const res = await adapter.request("session/new", { cwd: this.cwd, mcpServers: [] });
+        const res = await adapter.request("session/new", { cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) });
         if (typeof res.sessionId !== "string") throw new SessionRefusal("adapter_protocol", "session/new returned no session id");
         this.acpId = res.sessionId;
         this.absorb(res);
@@ -294,10 +298,10 @@ export class Session {
         const caps = adapter.caps.sessionCapabilities as AcpParams | undefined;
         if (caps?.resume) {
           // `resume` does not replay the history, and the adapter's own settings apply again: the mode is re-locked below.
-          this.absorb(await adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [] }));
+          this.absorb(await adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }));
         } else if (adapter.caps.loadSession) {
           this.replaying = true;
-          try { this.absorb(await adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [] })); } finally { this.replaying = false; }
+          try { this.absorb(await adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) })); } finally { this.replaying = false; }
         } else {
           throw new SessionRefusal("adapter_cannot_resume", "the adapter can neither resume nor load a session");
         }
@@ -338,7 +342,7 @@ export class Session {
   private async enforceMode(mode: string): Promise<void> {
     const a = this.adapter;
     if (!a || !this.acpId) throw new SessionRefusal("adapter_gone");
-    if (this.modes.length && !this.modes.some((m) => m.id === mode)) throw new SessionRefusal("mode_unavailable", `the adapter offers no mode ${mode}`);
+    if (this.modes.length && !this.modes.some((m) => m.id === mode)) throw new SessionRefusal("mode_unavailable", `the adapter offers no mode ${mode}${mode === "bypassPermissions" ? BYPASS_HINT : ""}`);
     this.enforcing = true;
     this.modeSeen = [];
     try {

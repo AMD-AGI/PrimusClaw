@@ -136,12 +136,14 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=${sdQuote(d.node)} ${sdQuote(d.cli)} run --supervised
+ExecStop=${sdQuote(d.node)} ${sdQuote(d.cli)} stop
 ${vars.map(([k, v]) => `Environment=${sdEnv(`${k}=${v}`)}`).join("\n")}
 Restart=on-failure
 RestartSec=${RESTART_SEC}
 # 78: revoked, sign-in refused, or no usable config. Restarting cannot help; "claw-connector login" can.
 RestartPreventExitStatus=${NEEDS_PERSON}
-# "claw-connector stop" and "systemctl --user stop" both end it cleanly (exit 0), which is not restarted.
+# "claw-connector stop" and "systemctl --user stop" (through ExecStop) both end it cleanly (exit 0), which is not
+# restarted. Any other SIGTERM ends a supervised run with exit 75, which is.
 KillMode=mixed
 TimeoutStopSec=20
 
@@ -211,7 +213,8 @@ export interface SuperviseOptions {
 
 /**
  * Run `run --supervised` in the foreground, again 5 s after it ends with anything but 0 (stopped on purpose) or 78
- * (needs a person). A signal to the supervisor is passed to the run and ends the loop.
+ * (needs a person). A supervised run exits 0 only for `claw-connector stop`; a signal from anywhere else ends it with
+ * 75, which is restarted. A signal to the supervisor is passed to the run and ends the loop.
  */
 export async function supervise(ctx: Ctx, o: SuperviseOptions = {}): Promise<number> {
   const d = deps(ctx);

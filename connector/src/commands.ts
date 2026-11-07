@@ -15,16 +15,17 @@ import {
   CredentialsError, DEFAULT_CLIENT_ID, GrantRevokedError, loadCredentials, providerFor, saveCredentials, type Credentials,
 } from "./credentials.js";
 import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
-import { noAskWarnings } from "./claude-mode.js";
+import { applyRootSandbox, bypassUnavailableWarnings } from "./claude-mode.js";
 import { HooksError, hooksStatus, installHooks, settingsFile, uninstallHooks } from "./hooks.js";
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
 import { cmdService, cmdSupervise, startAfterLogin, type ServiceDeps } from "./service.js";
 import {
-  auditFile, childrenFile, configFile, credentialsFile, identityFile, pauseFile, pidFile, type Dirs,
+  auditFile, childrenFile, configFile, credentialsFile, identityFile, logDir, pauseFile, pidFile, stopRequestFile, type Dirs,
 } from "./paths.js";
 import { UrlError, errMessage, isObject, secureUrl, sleep, stderrLogger } from "./util.js";
 import { VERSION } from "./version.js";
+import { probeAgents, probeLines, type ProbeFn } from "./probe.js";
 
 export interface Ctx {
   dirs: Dirs;
@@ -42,6 +43,11 @@ export interface Ctx {
   /** Claude Code's managed settings file and the effective uid, as the Claude adapter sees them (tests set them). */
   claudeManagedSettings?: string;
   euid?: number | null;
+  /**
+   * How `doctor` starts each agent's adapter and asks it for a session (default: the real adapters). `init` probes only
+   * when this is set, which the command line does, so a test of `init` does not start the sample agents' adapters.
+   */
+  probe?: ProbeFn;
   /** How `service` runs systemctl/launchctl, which program a unit starts, and where the units go (tests set them). */
   service?: Partial<ServiceDeps>;
 }
@@ -51,13 +57,17 @@ export interface Ctx {
  * service refused the sign-in, or there is no usable config or sign-in. A supervisor (the units `service install`
  * writes) restarts on any other failure and never on this one. `revoked` is the same code, kept as its own name.
  */
-export const EXIT = { ok: 0, failure: 1, usage: 2, needsPerson: 78, revoked: 78 } as const;
+/**
+ * `terminated`: a supervised run ended by a signal that did not come from `stop` (a bare `kill`, the OOM killer's
+ * SIGTERM, a container runtime). It is not a stop on purpose, so every supervisor restarts it.
+ */
+export const EXIT = { ok: 0, failure: 1, usage: 2, terminated: 75, needsPerson: 78, revoked: 78 } as const;
 
 const HELP = `claw-connector ${VERSION}: connect the coding agents on this machine to Claw (outbound HTTPS only).
 
 Usage: claw-connector <command> [options]
 
-  init [--approval ask|never | --approval AGENT=ask|never ...] [--no-hooks]
+  init [--approval ask|never | --approval AGENT=ask|never ...] [--no-hooks] [--no-probe]
                            write a sample agents.toml, and install the Claude Code session hooks (see "hooks"; --no-hooks
                            skips that). Agents ask before every write and command by default;
                            "--approval never" (or "--approval claude=never") lets phone sessions run like your
@@ -75,6 +85,9 @@ Usage: claw-connector <command> [options]
                            after exit 78. systemd --user on Linux, launchd on macOS; "script" (containers without
                            systemd) writes a keep-alive script for a startup hook and a 5-minute cron line
   status [--json]          what is running, signed in, paused, the last disconnect and why
+  doctor [--agent ID] [--json]
+                           start each agent's adapter, open a session (no prompt) and check that it offers the
+                           modes agents.toml needs, so a phone session is not refused; init runs it too
   pause                    stop every agent now and stay offline until "resume"
   resume                   undo "pause"
   stop                     stop the running connector and every agent it started
@@ -85,13 +98,16 @@ Files: ${"$"}XDG_CONFIG_HOME/claw-connector (agents.toml, credentials.json) and 
 (audit.jsonl, logs, outbox); set CLAW_CONNECTOR_HOME to keep everything under one directory.
 `;
 
-function loadCfg(ctx: Ctx): ConnectorConfig {
-  return loadConfig(configFile(ctx.dirs), { hostname: ctx.hostname ?? os.hostname() });
+/** The configuration as the agents will run it: with IS_SANDBOX set for unattended Claude agents under root (claude-mode.ts). */
+function loadCfg(ctx: Ctx, notes: string[] = []): ConnectorConfig {
+  const cfg = loadConfig(configFile(ctx.dirs), { hostname: ctx.hostname ?? os.hostname() });
+  notes.push(...applyRootSandbox(cfg.agents, ctx.env, { euid: ctx.euid }));
+  return cfg;
 }
 
-/** Agents whose sessions the connector will close because Claude's own settings start them in a mode that never asks. */
+/** Agents whose sessions the connector will close: Claude will not offer the mode an unattended agent runs in. */
 const noAsk = (ctx: Ctx, cfg: ConnectorConfig): string[] =>
-  noAskWarnings(cfg.agents, ctx.env, { managedFile: ctx.claudeManagedSettings, euid: ctx.euid });
+  bypassUnavailableWarnings(cfg.agents, ctx.env, { managedFile: ctx.claudeManagedSettings, euid: ctx.euid });
 
 function serverUrl(ctx: Ctx, flag: string | undefined, cfg: ConnectorConfig | null, creds: Credentials | null): string | null {
   const v = flag ?? ctx.env.CLAW_URL ?? cfg?.server ?? creds?.server ?? null;
@@ -115,6 +131,7 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
       case "service": return await cmdService(rest, ctx, serviceHelpers);
       case "supervise": return await cmdSupervise(rest, ctx);
       case "status": return cmdStatus(rest, ctx);
+      case "doctor": return await cmdDoctor(rest, ctx);
       case "pause": return await cmdPause(ctx);
       case "resume": return cmdResume(ctx);
       case "stop": return await cmdStop(ctx);
@@ -148,7 +165,7 @@ function parseApproval(values: string[]): Partial<Record<string, Approval>> | st
 }
 
 async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
-  const { values } = parseArgs({ args, strict: true, options: { approval: { type: "string", multiple: true }, "no-hooks": { type: "boolean" } } });
+  const { values } = parseArgs({ args, strict: true, options: { approval: { type: "string", multiple: true }, "no-hooks": { type: "boolean" }, "no-probe": { type: "boolean" } } });
   const approval = parseApproval(values.approval ?? []);
   if (typeof approval === "string") { ctx.err(approval); return EXIT.usage; }
   const file = configFile(ctx.dirs);
@@ -173,7 +190,35 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
     if (!fs.existsSync(dir)) ctx.out(`no Claude Code directory at ${dir}; once you use Claude Code, run: claw-connector hooks install`);
     else installForInit(ctx, dir);
   }
+  if (ctx.probe && !values["no-probe"]) {
+    try {
+      const cfg = loadCfg(ctx);
+      ctx.out("checking each agent's adapter (claw-connector doctor; skip with --no-probe):");
+      for (const l of probeLines(await ctx.probe(cfg.agents, { logDir: logDir(ctx.dirs), version: VERSION }))) ctx.out(l);
+    } catch (e) { ctx.out(`could not check the agents yet: ${errMessage(e)}; after editing agents.toml run: claw-connector doctor`); }
+  }
   return EXIT.ok;
+}
+
+// --- doctor ----------------------------------------------------------------------------
+
+async function cmdDoctor(args: string[], ctx: Ctx): Promise<number> {
+  const { values } = parseArgs({ args, strict: true, options: { agent: { type: "string" }, json: { type: "boolean" } } });
+  const notes: string[] = [];
+  const cfg = loadCfg(ctx, notes);
+  const agents = values.agent ? cfg.agents.filter((a) => a.id === values.agent) : cfg.agents;
+  if (agents.length === 0) { ctx.err(values.agent ? `no agent ${JSON.stringify(values.agent)} in agents.toml` : "agents.toml defines no agents; add an [[agents]] table"); return EXIT.failure; }
+  const warnings = noAsk(ctx, { ...cfg, agents });
+  const results = await (ctx.probe ?? probeAgents)(agents, { logDir: logDir(ctx.dirs), version: VERSION });
+  const ok = results.every((r) => r.ok);
+  if (values.json) {
+    ctx.out(JSON.stringify({ version: VERSION, ok, notes, warnings, agents: results }, null, 2));
+  } else {
+    for (const n of notes) ctx.out(`note: ${n}`);
+    for (const w of warnings) ctx.out(`warning: ${w}`);
+    for (const l of probeLines(results)) ctx.out(l);
+  }
+  return ok ? EXIT.ok : EXIT.failure;
 }
 
 function installForInit(ctx: Ctx, dir: string): void {
@@ -304,7 +349,7 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   // needs-login.json, which only `login` clears: a revoked or refused connector is not started again and again, by
   // these units or by a unit written by hand earlier for the old revoked code 3 (it now restarts on 78, and each
   // restart ends here without contacting Claw).
-  parseArgs({ args, strict: true, options: { supervised: { type: "boolean" } } });
+  const { values: runFlags } = parseArgs({ args, strict: true, options: { supervised: { type: "boolean" } } });
   {
     const nl = needsLogin(ctx.dirs);
     if (nl) {
@@ -314,8 +359,9 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   }
   let cfg: ConnectorConfig;
   let creds: Credentials | null;
+  const notes: string[] = [];
   try {
-    cfg = loadCfg(ctx);
+    cfg = loadCfg(ctx, notes);
     creds = loadCredentials(credentialsFile(ctx.dirs));
   } catch (e) {
     if (e instanceof ConfigError || e instanceof CredentialsError) { ctx.err(e.message); return EXIT.needsPerson; }
@@ -333,6 +379,7 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   const connector = new Connector({ config: cfg, dirs: ctx.dirs, client, server, audit, log, version: VERSION, timing: ctx.timing });
   ctx.onConnector?.(connector);
   ctx.out(`connecting ${cfg.agents.map((a) => (a.unattended ? `${a.id} (no per-step approval)` : a.id)).join(", ")} to ${server} as "${cfg.name}"`);
+  for (const n of notes) ctx.out(`note: ${n}`);
   for (const w of noAsk(ctx, cfg)) ctx.out(`warning: ${w}`);
   try {
     const result = await connector.run();
@@ -345,6 +392,10 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
       markNeedsLogin(ctx.dirs, `Claw refused the sign-in (${connector.authFailure})`);
       ctx.err(`Claw keeps refusing this sign-in (${connector.authFailure}): every agent was stopped. Run login again.`);
       return EXIT.needsPerson;
+    }
+    if (runFlags.supervised && !takeStopRequest(ctx)) {
+      ctx.err(`${new Date().toISOString()} stopped by a signal that did not come from "claw-connector stop"; exit ${EXIT.terminated}, so the supervisor starts it again`);
+      return EXIT.terminated;
     }
     return EXIT.ok;
   } catch (e) {
@@ -431,6 +482,9 @@ function cmdResume(ctx: Ctx): number {
 async function cmdStop(ctx: Ctx, quiet = false): Promise<number> {
   const pid = runningPid(ctx);
   if (pid !== null) {
+    // Said before the signal: the run reads it as it ends, and a supervised run that finds it exits 0 (not restarted).
+    fs.mkdirSync(ctx.dirs.state, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(stopRequestFile(ctx.dirs), JSON.stringify({ pid, start: processStart(pid) ?? "", at: new Date().toISOString() }), { mode: 0o600 });
     process.kill(pid, "SIGTERM");
     const deadline = Date.now() + 15_000;
     while (Date.now() < deadline && isAlive(pid) && processStart(pid) !== null) await sleep(100);
@@ -438,10 +492,25 @@ async function cmdStop(ctx: Ctx, quiet = false): Promise<number> {
       process.kill(pid, "SIGKILL");
       if (!quiet) ctx.out(`the connector (pid ${pid}) did not stop in 15 s and was killed`);
     }
+    // A run that ended reads it as it ends; one that never did (killed, or gone before the signal) leaves nothing behind.
+    fs.rmSync(stopRequestFile(ctx.dirs), { force: true });
   }
   const left = await new ChildRegistry(childrenFile(ctx.dirs)).killAll();
   if (!quiet) ctx.out(pid === null ? `no connector running${left.killed.length ? `; stopped ${left.killed.length} leftover agent process group(s)` : ""}` : `stopped the connector${left.killed.length ? ` and ${left.killed.length} leftover agent process group(s)` : ""}`);
   return EXIT.ok;
+}
+
+/** Whether `stop` asked this process to end; the request is used up either way. */
+function takeStopRequest(ctx: Ctx): boolean {
+  const file = stopRequestFile(ctx.dirs);
+  let mine = false;
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+    // The start time too: a request left behind for a process that is gone must not match a later one with its pid.
+    mine = isObject(raw) && raw.pid === process.pid && raw.start === (processStart(process.pid) ?? "");
+  } catch { return false; }
+  if (mine) fs.rmSync(file, { force: true });
+  return mine;
 }
 
 /** The connector row `run` stored, as it stored it: which server, which id, and whether Claw revoked it. */

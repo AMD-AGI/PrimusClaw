@@ -41,7 +41,11 @@ If npm answers `EACCES`, point its global prefix at a directory you own (`npm co
 ```sh
 claw-connector init      # writes agents.toml and prints where: ~/.config/claw-connector/agents.toml unless XDG_CONFIG_HOME or CLAW_CONNECTOR_HOME is set
 claw-connector status    # after you edit it: prints a "problem:" line if the file is wrong
+claw-connector doctor    # starts each agent's adapter, opens a session (no prompt) and checks the modes it offers
 ```
+
+`init` runs the same check as `doctor` at the end. `doctor` says `ok` for an agent whose phone sessions will open, and otherwise a
+`problem:` line with the fix, for example an agent whose sessions would be refused with `mode_unavailable`.
 
 By default every agent asks before it writes a file or runs a command, and your phone answers each question. To let phone sessions run
 like your terminal instead, run `claw-connector init --approval never` (or set `approval = "never"` on an agent later); see
@@ -80,6 +84,8 @@ claw-connector service status
 
 This starts the connector now and keeps it up: at login and after a reboot, and again 5 seconds after it dies for any reason, except
 one that only you can fix (the connector was revoked, or Claw refused the sign-in), which leaves it stopped until you run `login` again.
+Only `claw-connector stop` (or stopping the service) stops it for good: a `kill` of the connector's process from anywhere else ends it
+with exit 75, and it is started again.
 It uses `systemd --user` on Linux and launchd on macOS. On Linux, run `loginctl enable-linger $USER` once (`service install` says so
 when it is needed) so it also runs while you are logged out. In a container without systemd, `service install` starts a small
 supervisor and writes `keepalive.sh`; have the container's startup command and a 5-minute cron job run that script (it does nothing
@@ -165,22 +171,19 @@ unattended while Cursor keeps asking. For that agent the connector then:
   `mode_update` carry `unattended`, so a client can always show whether a session asks. `status` and the line `run` prints
   at start-up name the agents without per-step approval.
 
-**Before the first phone session, check which way your Claude settings go.** When `permissions.defaultMode` is
-`bypassPermissions` in your user `settings.json` (`$CLAUDE_CONFIG_DIR`, else `~/.claude`) or in Claude's managed settings,
-every session of a `claude` agent without `approval = "never"` is closed with `mode_not_enforced` (a `claude-attach`
-agent accepts the warning while it takes a conversation over, so it is not affected).
-`claw-connector status` and the start-up line of `run` say so for each such agent:
-
-```
-warning:    claude: sessions will be refused (mode_not_enforced): Claude defaults to bypassPermissions here (permissions.defaultMode in /home/me/.claude/settings.json); set approval = "never" on this agent or change defaultMode
-```
-
-Choose one: `approval = "never"` on that agent (knowing the risk below), or another `defaultMode` in that file. The check
-reads the two files from which the Claude adapter takes `bypassPermissions` (it ignores that value in a repository's
-`.claude/settings.json` and `.claude/settings.local.json`), and only the exact spelling counts, as for the adapter; root
-without `IS_SANDBOX` cannot use bypass, and `permissions.disableBypassPermissionsMode = "disable"` turns it off. It applies
-to every agent that runs `claude-agent-acp` except `claude-attach`. Codex and Cursor have no equivalent: their own
+**Your own Claude settings may default to `bypassPermissions`** (`permissions.defaultMode` in your user `settings.json`,
+`$CLAUDE_CONFIG_DIR` or `~/.claude`, or in Claude's managed settings). For a `claude` agent that asks (no
+`approval = "never"`), the connector tells the adapter to leave that mode out (`allowDangerouslySkipPermissions: false`),
+so its sessions start in `default` and ask; before 0.1.5 each of them was closed with `mode_not_enforced`. An agent with
+`approval = "never"` runs in `bypassPermissions` either way. A `claude-attach` agent takes over a conversation in the mode
+its terminal chose and accepts the adapter's warning while it starts. Codex and Cursor have no equivalent: their own
 settings are replaced by the mode the connector sets and reads back.
+
+**Root.** Claude Code offers `bypassPermissions` to root only when `IS_SANDBOX` is set. For an agent that runs
+`claude-agent-acp` with `approval = "never"` (or `allow_unsafe_modes = true`), the connector sets `IS_SANDBOX=1` in that
+agent's adapter environment when it runs as root, and `run` prints a `note:` line saying so; nothing else gets it. Without
+that, every phone session of such an agent was refused with `mode_unavailable`. To keep it off, set `IS_SANDBOX` yourself
+in the agent's `[agents.env]` (an empty value is kept as it is; `status` then warns that sessions will be refused).
 
 **The risk, in one sentence:** an agent without per-step approval acts on whatever it is told, including text it read in
 a file or a web page, with everything your account can do inside its roots (and `--force` or full access reach outside the
