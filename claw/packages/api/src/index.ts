@@ -359,7 +359,7 @@ async function main() {
   await registerUserEnvVarRoutes(app);
   await registerNotificationSubscriptionRoutes(app);
   // Off unless CLAW_REMOTE_AGENTS_ENABLED: the module registers nothing otherwise.
-  await registerRemoteAgentRoutes(app);
+  await registerRemoteAgentRoutes(app, { closing: shutdown.closing });
   // Off unless CLAW_ASSISTANT_ENABLED: the module registers nothing otherwise.
   await registerAssistantRoutes(app);
   // The pull requests a work item watches; nothing unless CLAW_ASSISTANT_ENABLED and CLAW_ASSISTANT_GITHUB_EVENTS.
