@@ -669,8 +669,16 @@ const namesOther = (clause: string): boolean => {
 };
 
 /**
+ * Whether the text names `#n` elsewhere as something else's number: `owner/repo#n`, or right after a pull request or issue
+ * ("PR #291", "pull request #291", "议题 #3"). "Review AMD-AGI/PrimusClaw#291 … review-only of #291" speaks of one pull request.
+ */
+const namedAsOtherElsewhere = (text: string, n: string): boolean =>
+  new RegExp(`(?:[\\w.-]+\\/[\\w.-]+|\\b(?:PRs?|pull requests?|pulls?|issues?)\\s*|(?:拉取请求|合并请求|议题)\\s*)#${n}(?!\\d)`, "i").test(text);
+
+/**
  * The first item named only by its number (`BARE_NUMBER`) that is not something else's number (`NOT_AN_ITEM` earlier in its
- * clause, or in the heading of the list it is an entry of); null when none is.
+ * clause, or in the heading of the list it is an entry of, or the same number named elsewhere in the text as a pull request's
+ * or an issue's); null when none is.
  */
 export function bareItemNumber(text: string): string | null {
   const re = new RegExp(BARE_NUMBER.source, "gm");
@@ -680,6 +688,7 @@ export function bareItemNumber(text: string): string | null {
     if (namesOther(clause)) continue;
     const heading = listHeading(text, m.index);
     if (heading !== null && namesOther(heading)) continue;
+    if (namedAsOtherElsewhere(text, m[0].slice(1).match(/\d+/)![0])) continue;
     return m[0];
   }
   return null;

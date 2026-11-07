@@ -794,6 +794,14 @@ test("S25b a list under a heading that names pull requests", () => {
     ["PR #294 合入了。\n- #7", "#7"], ["开着的 PR：\n- #294\n已完成\n- #7", "#7"], ["PR 合入后的事项：\n- #8", "#8"]] as const) {
     assert.equal(bareItemNumber(text), bare, text);
   }
+  // The same number named elsewhere in the reply as a pull request's or an issue's.
+  for (const text of ["I couldn't start the review of AMD-AGI/PrimusClaw#291.\n- What I would do: review-only (no merge) of #291.",
+    "PR #12 已合入。接下来看 #12。", "议题 #3 还开着，#3。"]) {
+    assert.equal(bareItemNumber(text), null, text);
+  }
+  for (const [text, bare] of [["AMD-AGI/PrimusClaw#2910 合入了。还剩 #291。", "#291"], ["PR #12 合入了；the only open item is #1?", "#1"]] as const) {
+    assert.equal(bareItemNumber(text), bare, text);
+  }
 });
 
 test("S27 internal text: a sandbox workload's name and a system prompt as a subject are not leaks", () => {
