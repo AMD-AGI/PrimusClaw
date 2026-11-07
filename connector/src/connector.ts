@@ -83,6 +83,8 @@ export interface ConnectorTiming extends SessionTiming {
 
 /** The least time between two reconnects made at once on a server's `event: reconnect` (`streamLoop`). */
 const RESTART_RECONNECT_GAP_MS = 5_000;
+/** What a phone shows for an agent whose sessions start read-only. */
+export const READ_ONLY_HINT = `sessions of this agent start read-only: it answers and plans but changes no file. To let phone sessions write code, set approval = "never" for this agent in agents.toml on that machine and restart the connector`;
 
 export const DEFAULT_TIMING: ConnectorTiming = {
   ...DEFAULT_SESSION_TIMING,
@@ -255,11 +257,15 @@ export class Connector {
     return Promise.all(this.d.config.agents.map(async (a) => {
       // `unattended`: sessions start in a mode that does not ask before a write or a command. `unattended_allowed`:
       // a phone may switch this agent to such a mode. A client shows the first so nobody is surprised by it.
+      // `edits: false`: sessions start in a mode that cannot change files (Cursor asking), with the one-line fix for a phone to show.
+      const readOnly = a.readOnlyModes.includes(a.askMode);
       const support = this.attach.get(a.id);
       // `watch_live`: a conversation open in a terminal can be opened read-only (session.ts `spectate`); a client offers that only then.
       const base = withHealth({
         ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes,
         ...(support ? { watch_live: true } : {}),
+        ...(a.readOnlyModes.length ? { read_only_modes: a.readOnlyModes } : {}),
+        ...(readOnly ? { edits: false, edits_hint: READ_ONLY_HINT } : {}),
       }, this.healthReport ? agentHealth(this.healthReport, a.id) : null);
       // An attach agent also says which existing sessions it could take over, and whether anything holds them open now.
       const capabilities = support ? fitResumable(base, await support.resumable()) : base;

@@ -32,7 +32,7 @@ import type { AgentConfig } from "./config.js";
 import { hooksStatus } from "./hooks.js";
 import { REMOTE_AGENT_LIMITS } from "./protocol.js";
 import { redactText } from "./redact.js";
-import { checkCwd } from "./roots.js";
+import { checkCwd, resolveCwd } from "./roots.js";
 import { SESSION_ID_RE, localPidDomain, readTerminals } from "./terminals.js";
 import { errMessage, isObject, type Logger } from "./util.js";
 
@@ -204,7 +204,9 @@ export class AttachSupport {
         const res = await adapter.request("session/list", cursor ? { cursor } : {}, 30_000);
         for (const s of Array.isArray(res.sessions) ? res.sessions : []) {
           if (!isObject(s) || typeof s.sessionId !== "string" || !SESSION_REF_RE.test(s.sessionId) || typeof s.cwd !== "string") continue;
-          const where = checkCwd(s.cwd, this.agent.roots);
+          // Absolute paths only (a listed session's own directory), looked at without blocking: a stalled mount skips it.
+          if (!path.isAbsolute(s.cwd)) continue;
+          const where = await resolveCwd(s.cwd, this.agent.roots, { home: os.homedir(), timeoutMs: 5_000 });
           if (!where.ok) continue;
           const at = typeof s.updatedAt === "string" ? Date.parse(s.updatedAt) : NaN;
           found.set(s.sessionId.toLowerCase(), {
