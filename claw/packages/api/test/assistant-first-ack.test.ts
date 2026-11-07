@@ -15,7 +15,7 @@
  *   F5  a say the router started and that was refused does not hold the line back; one still being written does
  *   F6  a message the route queues behind a running turn hears the line 3.5 s after it came in, before its run opens, and the
  *       answer of the run that later carries it takes the line's place
- *   F5  a turn that starts an item after the line: the start notice takes the line's place, and the router's words after it are added
+ *   F7  a turn that starts an item after the line: the start notice takes the line's place, and the router's words after it are added
  *       to that same message (one message in the channel, as without the line); but never once the line's message shows something
  *       else: after the router's say took its place, or for a second item's notice, the notice is its own message, as without the line;
  *       two notices stored at once included
@@ -238,7 +238,7 @@ describe("assistant first ack by the clock", { skip }, () => {
     const answer = (await w.q("SELECT payload FROM claw_notification_outbox WHERE payload->>'text' = '已发到你的 Teams。'"))[0];
     assert.equal(answer.payload.replaces, ack.lookupAckSayId("alice", t.mid), "one message: the answer edits the line");
   });
-  test("F5 an item started after the line: the start notice takes its place, and what the router adds goes to that message", async () => {
+  test("F7 an item started after the line: the start notice takes its place, and what the router adds goes to that message", async () => {
     await w.subscribe("alice");
     const turn = await w.routerTurn(alice);
     const content = "帮我新建一个任务：写一份 ROCm 7.2 升级说明";
@@ -269,7 +269,7 @@ describe("assistant first ack by the clock", { skip }, () => {
     const a2 = await w.mod.tools.say(plain as never, { text: "顺便：按版本分组。" }, w.sayDeps);
     assert.equal(w.events.find((e) => e.type === "AssistantSay" && e.say_id === a2.say_id)?.amends, n2.event_id);
   });
-  test("F5b the notice never overwrites what took the line's place: a router say before it, or the first item's notice", async () => {
+  test("F7b the notice never overwrites what took the line's place: a router say before it, or the first item's notice", async () => {
     await w.subscribe("alice");
     const notices = async () => w.q("SELECT event_id, payload FROM claw_notification_outbox WHERE payload->>'text' LIKE '已开始：#%' ORDER BY created_at, event_id");
     // The line, the router's say (in the line's place), then the item: the notice is its own message, the say stays.
@@ -294,7 +294,7 @@ describe("assistant first ack by the clock", { skip }, () => {
     assert.equal(two[0].payload.replaces, ack.lookupAckSayId("alice", b.mid));
     assert.equal(two[1].payload.replaces, undefined, "the second item's notice does not overwrite the first's");
   });
-  test("F5c two start notices of one turn stored at once: only one takes the line's place", async () => {
+  test("F7c two start notices of one turn stored at once: only one takes the line's place", async () => {
     await w.subscribe("alice");
     for (let round = 0; round < 8; round += 1) {
       await w.q("TRUNCATE claw_notification_outbox, claw_assistant_says");
