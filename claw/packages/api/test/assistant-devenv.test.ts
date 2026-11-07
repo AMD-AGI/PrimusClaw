@@ -160,7 +160,7 @@ describe("devenv_list", { skip }, () => {
     const alice = await w.user("alice");
     const { working, waiting, idle } = await aliceWorld();
     const gone = await machine("alice", "old box", { online: true });
-    assert.equal(await store.revokeConnector("alice", gone, null), true);
+    assert.ok(await store.revokeConnector("alice", gone, null));
     const bobBox = await machine("bob", "bob-box", { online: true, agents: [{ id: "claude", kind: "claude", name: "Claude Code",
       resumable: [{ ref: "b0b00000-0000-4000-8000-000000000001", title: "bob's secret work", cwd: "/home/bob", updated_at: now(), state: "idle" }] }] });
     const bobSession = await session("bob", bobBox, "claude", "/home/bob/x", [chunk("bob's answer"), end()]);

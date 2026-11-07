@@ -1376,6 +1376,48 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "again" })).status, 202);
   });
 
+  test("F35 an instruction still queued when its machine is replaced (registered again) or revoked ends its item, told once", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const sid = await chatSession("alice", laptop);
+    const sent = await sendByCard(await userTurn(alice, "让它跑 lint"), { text: "跑 lint", target: sid });
+    assert.deepEqual([sent.status, sent.session_id], ["done", sid]);
+    assert.equal((await remoteItem(sid)).board_state, "in_progress");
+    // The laptop closed with the prompt never collected, and came back with its local state lost: it registers afresh under its name.
+    await w.q("UPDATE claw_remote_connectors SET created_at = NOW() - interval '1 hour', heartbeat_at = NOW() - interval '1 hour', stream_seen_at = NULL WHERE connector_id = $1", [laptop]);
+    const again = await post("alice", "/v1/remote-agents/connectors", { name: "laptop" });
+    assert.equal(again.status, 201, JSON.stringify(again.body));
+    // The old row's queued prompt went with it, so nothing the machine sends can end that turn: Claw closes the session in its stead.
+    assert.deepEqual(await queued(laptop), []);
+    const closedBy = async (s: string) => (await w.q("SELECT seq, data FROM claw_remote_events WHERE session_id = $1 AND type = 'session_closed'", [s]))
+      .map((e: Recorded) => [Number(e.seq) < 0, e.data.reason, e.data.by]);
+    assert.deepEqual(await closedBy(sid), [[true, "machine_reconnected", "claw"]]);
+    let item = await remoteItem(sid);
+    assert.deepEqual([item.board_state, item.outcome, item.summary], ["done", "dropped", "会话已关闭"]);
+    let told = (await says("alice")).filter((x: Recorded) => x.item_id).map((x: Recorded) => x.text);
+    assert.equal(told.length, 1, JSON.stringify(told));
+    assert.match(told[0], /会话已关闭，#\d+（跑 lint）没有做完/);
+    // The same when the user removes the machine (logout, /agent off): its sessions' items end now, not never.
+    const fresh = String(again.body.data.connector_id);
+    await store.recordHeartbeat(fresh, "alice", { version: "0.1.6", cmdCursor: null, agents: [CLAUDE] as never });
+    await w.q("UPDATE claw_remote_connectors SET stream_seen_at = NOW() WHERE connector_id = $1", [fresh]);
+    const sid2 = await chatSession("alice", fresh);
+    assert.equal((await sendByCard(await userTurn(alice, "让它跑 build"), { text: "跑 build", target: sid2 })).status, "done");
+    const r = await fetch(`${base}/v1/remote-agents/connectors/${fresh}`, { method: "DELETE", headers: { "x-test-user": "alice" } });
+    assert.equal(r.status, 200);
+    assert.deepEqual(await closedBy(sid2), [[true, "connector_revoked", "claw"]]);
+    item = await remoteItem(sid2);
+    assert.deepEqual([item.board_state, item.outcome], ["done", "dropped"]);
+    told = (await says("alice")).filter((x: Recorded) => x.item_id).map((x: Recorded) => x.text);
+    assert.equal(told.length, 2, JSON.stringify(told));
+    assert.match(told[1], /会话已关闭，#\d+（跑 build）没有做完/);
+    // A revoke of a row already revoked closes nothing twice.
+    const r2 = await fetch(`${base}/v1/remote-agents/connectors/${fresh}`, { method: "DELETE", headers: { "x-test-user": "alice" } });
+    assert.equal(r2.status, 404);
+    assert.equal((await says("alice")).filter((x: Recorded) => x.item_id).length, 2, "said once");
+  });
+
   test("F32 an instruction Claw cannot confirm its machine got is said as that, and the machine's own end still closes it", async () => {
     const alice = await w.user("alice");
     await w.subscribe(alice.userId);

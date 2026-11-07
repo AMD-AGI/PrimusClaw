@@ -282,7 +282,7 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     const token = (await claim((await newCode("alice")).code)).body.data.token as string;
     const cid = (await register(token)).body.data.connector_id as string;
     const grantId = (await q("SELECT grant_id::text AS id FROM claw_remote_grants")).rows[0].id as string;
-    assert.equal(await store.revokeConnector("alice", cid, null), true);
+    assert.ok(await store.revokeConnector("alice", cid, null));
     await assert.rejects(store.registerConnector("alice", "laptop", "0.1.6", null, 10, "connector_grant", 90_000, undefined, grantId),
       (e: unknown) => e instanceof store.GrantRegistrationRefused && e.reason === "revoked");
     // A bound row that is gone altogether counts as revoked too.
