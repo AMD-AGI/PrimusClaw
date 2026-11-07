@@ -617,7 +617,10 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
   // someone else put on the board meanwhile (a review asked of this identity) is neither graded nor closed here.
   const started = turnCalls(stream.events, messageIds);
   const mine = (all: ItemSeen[]): ItemSeen[] => itemsStartedBy(started, all.filter((i) => i.seq > floor), RUN_ITEMS);
-  let items = mine(await board());
+  // The highest item number on the board: a "#n" above it in a reply is no item of the person's (items-named-by-title).
+  let seqMax = 0;
+  const onBoard = (all: ItemSeen[]): ItemSeen[] => { for (const i of all) seqMax = Math.max(seqMax, i.seq); return all; };
+  let items = mine(onBoard(await board()));
   for (const i of items) RUN_ITEMS.add(i.item_id);
   // A request the case's item holds for its person: answered the way that person's channel answers it.
   const hold = c.hold && items.length ? await answerHold(c.hold, items, start + (c.item_wait_s ?? ITEM_WAIT_SEC) * 1000) : undefined;
@@ -629,7 +632,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
     const settled = (is: ItemSeen[]): boolean => is.every((i) => (c.items_closed ? i.board_state === "done" : i.board_state !== "in_progress"));
     let boardError: string | null = null;
     await waitFor(async () => {
-      try { items = mine(await board()); boardError = null; } catch (err) { boardError = err instanceof Error ? err.message : String(err); }
+      try { items = mine(onBoard(await board())); boardError = null; } catch (err) { boardError = err instanceof Error ? err.message : String(err); }
       return !boardError && settled(items) ? true : undefined;
     }, start + (c.item_wait_s ?? ITEM_WAIT_SEC) * 1000, 5_000);
     if (boardError) unread.push(`the board (${boardError})`);
@@ -660,7 +663,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
     mode: MODE, route: routeOf(lastItems, lastRouter, lastSays), cards: cardsOf(lastSays), calls: lastCalls, shown: shown.map((s) => s.text),
     final: final?.text ?? "", firstReplyMs: firstOwn === null ? null : firstOwn - lastSent, finalMs: final ? final.at - lastSent : null,
     replyMs: messageIds.map((id, k) => { const s = says.find((x) => x.turn === id); return s ? s.at - sentAt[k]! : null; }),
-    items, factValues: values, delivered: filesFrom(says, lastIds), ...(hold ? { hold } : {}),
+    items, factValues: values, delivered: filesFrom(says, lastIds), ...(hold ? { hold } : {}), ...(seqMax ? { itemSeqMax: seqMax } : {}),
   };
   const allCalls = [...turnCalls(stream.events, messageIds)];
   for (const i of items) if (!lastIds.includes(i.item_id)) allCalls.push(...(await read(`item ${i.seq}'s worker calls`, workerCalls(i.item_id), [])));

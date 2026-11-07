@@ -678,12 +678,14 @@ const namedAsOtherElsewhere = (text: string, n: string): boolean =>
 /**
  * The first item named only by its number (`BARE_NUMBER`) that is not something else's number (`NOT_AN_ITEM` earlier in its
  * clause, or in the heading of the list it is an entry of, or the same number named elsewhere in the text as a pull request's
- * or an issue's); null when none is.
+ * or an issue's, or, given `seqMax` (the highest item number on the person's board), a number above it); null when none is.
  */
-export function bareItemNumber(text: string): string | null {
+export function bareItemNumber(text: string, seqMax?: number): string | null {
   const re = new RegExp(BARE_NUMBER.source, "gm");
   for (let m = re.exec(text); m; m = re.exec(text)) {
     if (m[0].startsWith("编号")) return m[0];
+    // Item numbers count up per person: one above the highest on their board is no item of theirs (an upstream PR, #48043).
+    if (seqMax && Number(m[0].match(/\d+/)![0]) > seqMax) continue;
     const clause = text.slice(Math.max(0, m.index - 120), m.index).split(/[。!！?？\n;；]|\.\s/).at(-1) ?? "";
     if (namesOther(clause)) continue;
     const heading = listHeading(text, m.index);
@@ -1025,6 +1027,8 @@ export interface Observed {
   hold?: HoldSeen;
   /** The files the last turn's items handed the user (assistant mode; absent in baseline). */
   delivered?: SaidFile[];
+  /** The highest item number on the person's board when the case was graded (assistant mode; absent when none was read). */
+  itemSeqMax?: number;
 }
 
 /** The longest an item may take to hold its request for the person, from Brain asking: what a person waits for the card. */
@@ -1087,7 +1091,7 @@ export function grade(c: EvalCase, o: Observed): Check[] {
       : { name: "no false denial", pass: true });
   }
   if (c.style?.no_ids) {
-    const m = bareItemNumber(shownText);
+    const m = bareItemNumber(shownText, o.itemSeqMax);
     out.push({ name: "items named by title", pass: m === null, detail: m ?? undefined });
   }
   if (c.style?.reply_lang === "follow_user" && c.lang !== "mixed") {
