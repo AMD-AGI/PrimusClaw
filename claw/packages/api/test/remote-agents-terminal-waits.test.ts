@@ -15,6 +15,8 @@
  *   T6  only one replica sweeps at a time
  *   T7  told only on a report made after the minute that still says it waits: one answered just before the minute, whose last report
  *       predates the answer, is not told on that report
+ *   T8  a told wait is never told again while it still waits, even when a heartbeat in between could not see it (every entry
+ *       `unknown`, or this one); a list that knows its conversations and lacks it, or an agent gone from the report, ends it
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -226,5 +228,47 @@ describe("conversations open in a terminal that wait for their person", { skip }
     out = await sweep();
     assert.equal(out.notices.length, 1);
     assert.equal((await says("alice")).length, 1);
+  });
+
+  test("T8 a told wait is not told again after a heartbeat that could not see it", async () => {
+    const cid = await machine("alice", "dev-pod");
+    await terminal(cid, "alice", [conv("s-1", "waiting"), conv("s-2", "idle")]);
+    await sweep();
+    await waitedFor(cid, "s-1", 2 * MINUTE);
+    await sweep();
+    assert.equal((await says("alice")).length, 1);
+    // One slow heartbeat: the connector could not list its terminals, so every entry is unknown; then it waits as before.
+    await terminal(cid, "alice", [{ ...conv("s-1", null), state: "unknown" }, { ...conv("s-2", null), state: "unknown" }]);
+    await sweep();
+    await terminal(cid, "alice", [conv("s-1", "waiting"), conv("s-2", "idle")]);
+    for (let i = 0; i < 2; i++) await sweep();
+    await waitedFor(cid, "s-1", 3 * MINUTE);
+    await reportedAgo(cid, 0);
+    await sweep();
+    // This entry alone unknown, and a report with no list at all: the same.
+    await terminal(cid, "alice", [{ ...conv("s-1", null), state: "unknown" }, conv("s-2", "idle")]);
+    await sweep();
+    await terminal(cid, "alice", []);
+    await w.q("UPDATE claw_remote_agents SET capabilities = '{}'::jsonb WHERE connector_id = $1", [cid]);
+    await sweep();
+    await terminal(cid, "alice", [conv("s-1", "waiting"), conv("s-2", "idle")]);
+    await sweep();
+    await waitedFor(cid, "s-1", 3 * MINUTE);
+    await sweep();
+    assert.equal((await says("alice")).length, 1, "still the same wait: told once");
+    // A list that knows its conversations and no longer has it: that wait is over, and a new one is told again.
+    await terminal(cid, "alice", [conv("s-2", "idle")]);
+    await sweep();
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_remote_terminal_waits"))[0].n, 0);
+    await terminal(cid, "alice", [conv("s-1", "waiting")]);
+    await sweep();
+    await waitedFor(cid, "s-1", 2 * MINUTE);
+    await sweep();
+    assert.equal((await says("alice")).length, 2);
+    // The agent gone from the report ends it too.
+    await terminal(cid, "alice", [conv("s-1", "waiting")]);
+    await w.q("DELETE FROM claw_remote_agents WHERE connector_id = $1", [cid]);
+    await sweep();
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_remote_terminal_waits"))[0].n, 0);
   });
 });

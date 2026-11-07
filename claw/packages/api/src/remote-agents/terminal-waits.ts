@@ -11,7 +11,7 @@
  * online is said to its owner once (`recordSystemNotice`, keyed by the episode); one answered at the terminal before then is never
  * said, and neither is anything else a terminal does (working, finishing): the person at the terminal sees that, and only the need of
  * one who is not there is worth a push. The episode ends when the conversation stops waiting (answered, ended, or its machine went
- * offline), and a later wait is a new one.
+ * offline, on a report that says so: one heartbeat that could not see its terminals ends nothing), and a later wait is a new one.
  *
  * A sweep, every few seconds on whichever replica takes the lock, keeps one row per waiting conversation
  * (`claw_remote_terminal_waits`: since when the sweep first saw it wait, and whether it was told), so the minute is counted from the
@@ -112,13 +112,36 @@ export async function sweepTerminalWaits(onlineWindowMs: number, noticeAfterMs: 
     const keyOf = (c: string, a: string, r: string) => `${c}\u0000${a}\u0000${r}`;
     const byKey = new Map(now.map((r) => [keyOf(r.connector_id, r.agent_id, r.ref), r]));
     const keys = { c: now.map((r) => r.connector_id), a: now.map((r) => r.agent_id), r: now.map((r) => r.ref) };
-    // The episodes that are over: no longer waiting, or their machine is not online now.
-    await q(
-      `DELETE FROM claw_remote_terminal_waits w
-        WHERE NOT EXISTS (SELECT 1 FROM unnest($1::uuid[], $2::text[], $3::text[]) k(c, a, r)
-                           WHERE k.c = w.connector_id AND k.a = w.agent_id AND k.r = w.ref)`,
-      [keys.c, keys.a, keys.r],
-    );
+    // The episodes that are over, on a report that says so: the machine went offline (or was revoked), the agent is gone from its
+    // report, or the agent's report says the conversation no longer waits (another activity, idle, attached, or absent from a list
+    // that knows its conversations). A report that does not know (`state: "unknown"`: the connector's look at its terminals timed out,
+    // or every entry is unknown) ends nothing: a wait told once is never told again just because one heartbeat could not see it.
+    const open = (await q(
+      `SELECT w.connector_id::text AS connector_id, w.agent_id, w.ref,
+              COALESCE(c.revoked_at IS NULL
+                AND c.heartbeat_at > NOW() - make_interval(secs => $1::float8)
+                AND c.stream_seen_at > NOW() - make_interval(secs => $1::float8), FALSE) AS online,
+              a.capabilities->'resumable' AS resumable, a.agent_id IS NOT NULL AS has_agent
+         FROM claw_remote_terminal_waits w
+         LEFT JOIN claw_remote_connectors c ON c.connector_id = w.connector_id
+         LEFT JOIN claw_remote_agents a ON a.connector_id = w.connector_id AND a.agent_id = w.agent_id`,
+      [onlineWindowMs / 1000],
+    )).rows as Array<{ connector_id: string; agent_id: string; ref: string; online: boolean; resumable: unknown; has_agent: boolean }>;
+    const over = open.filter((w) => {
+      if (byKey.has(keyOf(w.connector_id, w.agent_id, w.ref))) return false;
+      if (!w.online || !w.has_agent) return true;
+      const list = (Array.isArray(w.resumable) ? w.resumable : []).filter((e): e is Record<string, unknown> => !!e && typeof e === "object");
+      const entry = list.find((e) => e.ref === w.ref);
+      if (entry) return entry.state !== "unknown";
+      return list.some((e) => e.state !== "unknown");
+    });
+    if (over.length) {
+      await q(
+        `DELETE FROM claw_remote_terminal_waits w USING unnest($1::uuid[], $2::text[], $3::text[]) k(c, a, r)
+          WHERE w.connector_id = k.c AND w.agent_id = k.a AND w.ref = k.r`,
+        [over.map((w) => w.connector_id), over.map((w) => w.agent_id), over.map((w) => w.ref)],
+      );
+    }
     await q(
       `INSERT INTO claw_remote_terminal_waits (connector_id, agent_id, ref, owner_user_id, since)
        SELECT k.c, k.a, k.r, k.o, NOW() FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[]) k(c, a, r, o)
