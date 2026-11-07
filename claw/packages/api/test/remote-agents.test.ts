@@ -1626,6 +1626,7 @@ describe("remote agents", { skip }, () => {
       const p4 = (await stream.nextEvent("command")).json();
       assert.equal((await post("u1", cid, [ev(sid3, "session_closed", { reason: "adapter_exited" })])).status, 200);
       assert.equal((await confirm(p4.cmd_id)).body.data.status, "session_closed");
+      assert.ok((await q("SELECT detail FROM claw_remote_audit WHERE action = 'command.confirmed'")).rows.some((r) => r.detail.cmd_id === p1.cmd_id), "a live answer is recorded");
       // The machine is removed: whatever it still holds in a buffer is answered 401 revoked, which stops it.
       const sid2 = await session("u1", cid);
       const p3 = await (async () => {
@@ -1633,7 +1634,22 @@ describe("remote agents", { skip }, () => {
         assert.equal((await as("u1").post(`/v1/remote-agents/sessions/${sid2}/commands`, { type: "prompt", text: "ls" })).status, 202);
         return (await stream.nextEvent("command")).json();
       })();
-      assert.equal((await as("u1").del(`/v1/remote-agents/connectors/${cid}`)).status, 200);
+      // Answered under the connector row's lock, the one a revocation takes: one in progress is waited for, and once it has
+      // committed the answer is 401 `revoked`, never `live`.
+      const revoking = await h.connect();
+      try {
+        await revoking.query("BEGIN");
+        await revoking.query("UPDATE claw_remote_connectors SET revoked_at = NOW() WHERE connector_id = $1", [cid]);
+        let settled = false;
+        const asked = confirm(p3.cmd_id).finally(() => { settled = true; });
+        await new Promise((r) => setTimeout(r, 400));
+        assert.equal(settled, false, "the answer waits for the revocation in progress");
+        await revoking.query("COMMIT");
+        const r = await asked;
+        assert.deepEqual([r.status, r.body], [401, { ok: false, error: "revoked" }], "never live once the revocation committed");
+      } finally {
+        await revoking.query("ROLLBACK").catch(() => undefined); // (a failed assertion leaves no lock behind; the cluster closes it)
+      }
       assert.deepEqual([(await confirm(p3.cmd_id)).status, (await confirm(p3.cmd_id)).body], [401, { ok: false, error: "revoked" }]);
     });
 

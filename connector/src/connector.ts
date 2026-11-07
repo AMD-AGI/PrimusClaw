@@ -800,6 +800,9 @@ export class Connector {
       }
     }
     const seq = Number.isSafeInteger(cmd.cmd_seq) ? cmd.cmd_seq : undefined;
+    // Revoked or stopping while the answer was on its way: not run, whatever Claw said before that.
+    if (this.revoked) status = "connector_revoked";
+    else if (status === "live" && this.ctl.signal.aborted) status = null;
     if (status === "live") {
       this.d.audit.record("command_confirmed", { type: cmd.type, cmd_id: cmd.cmd_id, cmd_seq: seq, why });
       return true;

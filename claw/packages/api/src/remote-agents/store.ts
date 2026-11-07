@@ -558,9 +558,13 @@ export async function commandsAfter(connectorId: string, cursor: number, limit: 
  *  - `cancelled`: a `cancel` or `close` of its session was queued after it.
  *  - `expired`: older than a command of its kind may be carried out ({@link expiredSql}).
  *  - `gone`: Claw holds no such command for this connector any more (ended by Claw, or never this connector's).
- * A revoked connector is not answered with a status: like every connector-side route it gets 401 `revoked`, and stops.
+ * `connector_revoked`: the connector was revoked (the route answers it 401 `revoked`, as every connector-side route does).
+ *
+ * Answered under the connector row's lock, the one a revocation (`revokeIn`) and every queued command (`enqueueCommand`: a `close`,
+ * a reclaim) take first: a `live` answer is never given once a close or a revocation has committed, and one that has committed
+ * before them is recorded (`command.confirmed`), so the command counts as started before the close, as one delivered in time does.
  */
-export type CommandLiveness = "live" | "session_closed" | "cancelled" | "expired" | "gone";
+export type CommandLiveness = "live" | "session_closed" | "cancelled" | "expired" | "gone" | "connector_revoked";
 
 /** The commands {@link commandLiveness} never calls dead for being cancelled: they are the cancel and the close themselves. */
 const ENDING_COMMAND_TYPES = ["cancel", "close"];
@@ -573,6 +577,8 @@ export async function commandLiveness(
   owner: string, connectorId: string, cmdId: string, client: string | null,
 ): Promise<{ status: CommandLiveness; cmd_seq: number | null; session_id: string | null }> {
   return inTransaction(async (q) => {
+    const conn = (await q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1 FOR UPDATE", [connectorId])).rows[0];
+    if (!conn || conn.revoked_at) return { status: "connector_revoked" as const, cmd_seq: null, session_id: null };
     const row = (await q(
       `SELECT m.cmd_seq, m.type, m.session_id::text AS session_id, s.status AS session_status, s.agent_id,
               ${expiredSql(3, 4, "m.")} AS expired,
@@ -591,12 +597,11 @@ export async function commandLiveness(
     else if (row.cancelled_after && row.type !== "session.new") status = "cancelled";
     else status = "live";
     const sessionId = row?.session_id ? String(row.session_id) : null;
-    if (status !== "live") {
-      await writeAudit(q, {
-        owner, actor: connectorId, client, connectorId, agentId: row?.agent_id ?? null, sessionId, action: "command.refused_late",
-        detail: { cmd_id: cmdId, ...(row ? { type: row.type, cmd_seq: Number(row.cmd_seq) } : {}), status },
-      });
-    }
+    await writeAudit(q, {
+      owner, actor: connectorId, client, connectorId, agentId: row?.agent_id ?? null, sessionId,
+      action: status === "live" ? "command.confirmed" : "command.refused_late",
+      detail: { cmd_id: cmdId, ...(row ? { type: row.type, cmd_seq: Number(row.cmd_seq) } : {}), status },
+    });
     return { status, cmd_seq: row ? Number(row.cmd_seq) : null, session_id: sessionId };
   });
 }

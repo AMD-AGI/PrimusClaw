@@ -515,6 +515,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       return fail(reply, 400, "invalid_cmd_id");
     }
     const r = await store.commandLiveness(owner, connector.connector_id as string, cmdId, clientLabel(req));
+    // Revoked between the check above and the lock the answer is given under.
+    if (r.status === "connector_revoked") return fail(reply, 401, "revoked");
     if (r.status !== "live") logger.info({ owner, connectorId: connector.connector_id, cmdSeq: r.cmd_seq, status: r.status }, "remote_agents.command_refused_late");
     return reply.send({ ok: true, data: { cmd_id: cmdId, status: r.status } });
   });
