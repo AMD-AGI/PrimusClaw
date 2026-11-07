@@ -43,6 +43,7 @@ import {
 } from "./model-choice.js";
 import { ingestReport } from "./reports.js";
 import { remoteAnswerTail } from "./remote-items.js";
+import { readLiveFiles } from "./live-files.js";
 import type { AssistantTokenClaims } from "./token.js";
 import {
   clipOneLine, getWorkItem, insertWorkItem, recentEvents, reopenWorkItem, resolveWorkItem, resolveWorkItemNow, stopWorkItem,
@@ -785,7 +786,10 @@ export async function workRecall(
   if (args.detail === "summary") return { ok: true, item: summary, note: UNTRUSTED_NOTE };
   await recordRecall(claims.sid, claims.mid, named.item_id);
   if (args.detail === "live") {
-    return { ok: true, item: summary, note: UNTRUSTED_NOTE, ...await workerLive((t, p) => db.query(t, p), String(item.worker_session_id)) };
+    const live = await workerLive((t, p) => db.query(t, p), String(item.worker_session_id));
+    // A worker looks at a long job only now and then: while its run is going, what the job wrote is read from its workspace now.
+    const files = live.run?.status === "running" && item.kind === "task" ? await readLiveFiles(String(item.worker_session_id)) : null;
+    return { ok: true, item: summary, note: UNTRUSTED_NOTE, ...live, ...(files ? { files_now: files } : {}) };
   }
   if (args.detail === "reports") {
     return { ok: true, item: summary, note: UNTRUSTED_NOTE, reports: await recentEvents(named.item_id, RECALL_EVENTS) };

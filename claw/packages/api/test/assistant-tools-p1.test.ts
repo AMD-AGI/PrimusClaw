@@ -437,6 +437,61 @@ describe("assistant tools", { skip }, () => {
     assert.equal((await t().say(await asked(), { text: "#1 后台运行 slow_job.sh 并取结果 失败了。", item_id: item.itemId }, w.sayDeps)).ok, true);
   });
 
+  test("N3c work_recall live reads what a running job wrote now, from the worker's own sandbox, not the worker's last look at it", async () => {
+    const lf = await import("../src/assistant/live-files.js");
+    const { execFileSync } = await import("node:child_process");
+    const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const workspace = mkdtempSync(join(tmpdir(), "claw-n3c-"));
+    const ports = { ...lf.liveFilesPorts };
+    const asked: Array<{ sessionId: string; command?: string }> = [];
+    try {
+      const item = await w.createItem(alice, "后台运行 slow_job.sh 并取结果");
+      const run = await w.workerTurn(item.itemId);
+      // The worker's last look at the job, a minute and a half ago: step 3.
+      await w.q(
+        `INSERT INTO claw_session_events (event_id, session_id, event, data, created_at) VALUES ('n3c-1', $1, 'toolUsed', $2::jsonb, NOW() - interval '90 seconds')`,
+        [item.workerSid, JSON.stringify({ tool: "bash", status: "success", description: "elapsed=97s; last: 2026-11-06T23:01:27Z step 3/16 acc=9557" })],
+      );
+      // What the job has written since: step 5.
+      mkdirSync(join(workspace, "job"));
+      writeFileSync(join(workspace, "job/progress.log"), "2026-11-06T23:01:27Z step 3/16 acc=9557\n2026-11-06T23:01:57Z step 4/16 acc=96265\n2026-11-06T23:02:27Z step 5/16 acc=84133\n");
+      lf.liveFilesPorts.readTarget = async (sessionId) => { asked.push({ sessionId }); return { url: "http://hands.invalid/mcp", token: "t" }; };
+      lf.liveFilesPorts.exec = async (_target, command) => {
+        asked.push({ sessionId: "exec", command });
+        assert.equal(command, lf.liveFilesScript(), "the fixed script, over the workspace");
+        return { text: execFileSync("bash", ["-c", lf.liveFilesScript(workspace)], { encoding: "utf8" }), isError: false };
+      };
+
+      const live = await t().workRecall(await w.routerTurn(alice), { item_id: item.itemId, detail: "live" }) as any;
+      assert.equal(live.run.status, "running");
+      assert.match(live.latest.at(-1).output, /step 3\/16/, "the worker's own last look");
+      assert.equal(asked[0].sessionId, item.workerSid, "the item's own worker sandbox");
+      assert.equal(live.files_now.status, "read");
+      assert.equal(live.files_now.files[0].path, "job/progress.log");
+      assert.ok(live.files_now.files[0].tail.endsWith("2026-11-06T23:02:27Z step 5/16 acc=84133"), "the job's latest line, read now");
+      assert.ok(Date.parse(live.files_now.files[0].modified_at) <= Date.parse(live.files_now.read_at));
+
+      // No sandbox that is ready: said so, the steps are still there.
+      lf.liveFilesPorts.readTarget = async () => null;
+      const gone = await t().workRecall(await w.routerTurn(alice), { item_id: item.itemId, detail: "live" }) as any;
+      assert.deepEqual(gone.files_now, { status: "not_running" });
+      assert.equal(gone.latest.length, 1);
+
+      // A run that ended reads nothing from a sandbox.
+      asked.length = 0;
+      await t().report(run, { kind: "failed", summary: "the job died" });
+      await w.q("UPDATE claw_tasks SET status = 'completed', completed_at = NOW() WHERE session_id = $1", [item.workerSid]);
+      const ended = await t().workRecall(await w.routerTurn(alice), { item_id: item.itemId, detail: "live" }) as any;
+      assert.equal(ended.files_now, undefined);
+      assert.equal(asked.length, 0, "the registry is not even read");
+    } finally {
+      Object.assign(lf.liveFilesPorts, ports);
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
   test("X1 another user's item is unreachable from every tool, and is not changed", async () => {
     const item = await w.createItem(alice, "Alice's work");
     const before = JSON.stringify(await w.item(item.itemId));
