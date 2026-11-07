@@ -305,7 +305,7 @@ describe("router quality, the prompt", () => {
     // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
     // now from the source that states them.
     assert.equal(p.ROUTER_PROMPT_VERSION, "router-v18");
-    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v13");
+    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v14");
     assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v22");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
@@ -325,6 +325,8 @@ describe("router quality, the prompt", () => {
       ["health is read from the health fields", /Why something is unhealthy, failing or marked bad \(nodes on a page or dashboard\): read the health itself, for each one, not only a phase or state \(Ready is not healthy\)/],
       ["Autopilot node health is node_status", /For Autopilot nodes that is get_metrics with chart node_status \(each node's bad reasons and the age of its last health reading, vk_not_ready\), get_metrics with chart node_health and a range for when it changed, and get_events of each node/],
       ["a premise that does not hold is said first", /When they show nothing unhealthy now, say in the first line that the premise does not hold now, with what you read/],
+      // Parity R2 (2026-11-07 on v13): Rocky Linux 9 and Oracle Linux 8 listed for MI355X from an Instinct-wide list.
+      ["support for one named product from its matrix", /When the question names one product \(a GPU model such as MI355X\), read that version's compatibility matrix itself, not only its release notes, and give only what it states for that product/],
       ["progress is read live", /When the user asks how far an item got, what it is doing now, or when it will finish, look now: call work_recall\(item, "live"\)/],
       ["progress is never estimated", /Never work out how far it got or when it ends from when it started or how long it was expected to take/],
       ["progress from what the job wrote now", /files_now, when it is there, is newer than the worker's steps[^\n]*answer from its latest line/],
