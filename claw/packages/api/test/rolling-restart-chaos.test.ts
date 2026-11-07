@@ -25,6 +25,9 @@
  *   C6 Brain roll, then API roll, in the middle of a long run of a session that
  *      asked to hear when its runs end: its `run.completed` reaches the webhook
  *      exactly once (release claw-rel-1917 lost it, 2026-11-07)
+ *   C7 Session delete with three brains: every brain forgets the session, and
+ *      one of them tears it down (each used to do the whole teardown, so
+ *      production logged every incomplete teardown three times)
  *
  * Every scenario asserts the turn completed, exactly once (one `exec_complete`
  * event, one row), and within 60 seconds of the disruption (C5: 120 seconds).
@@ -317,5 +320,55 @@ test("C6 a long run's run.completed survives a Brain roll and an API roll mid-ru
   } finally {
     await c.close();
     await new Promise<void>((r) => receiver.close(() => r()));
+  }
+});
+
+/**
+ * C7: one session delete, three brains. The API publishes one `cleanup.<sid>`; Brain's entry point subscribes it twice --
+ * a plain subscription, so every replica forgets the session (marks it deleted, aborts its runs, drops its own hold on
+ * the sandbox), and a queue-group subscription, so one replica tears down what the session owns on the platform. With
+ * the queue group dropped from that wiring, every brain runs the whole teardown (three SaFE listings and three
+ * `session.cleanup_incomplete_parked` per delete in production, 2026-11-07); with the plain subscription dropped, two
+ * brains keep running a deleted session's turns. Both are counted from the brains' own logs, which is the entry point's
+ * wiring and not a unit's.
+ */
+test("C7 a session delete is forgotten by every brain and torn down by one", { skip, timeout: 5 * 60_000 }, async () => {
+  const BRAINS = ["brain-a", "brain-b", "brain-c"];
+  const c = await startCluster({ natsServer: NATS_SERVER, adminDbUrl: ADMIN_DB });
+  try {
+    await c.startApi("api-1");
+    await Promise.all(BRAINS.map((name) => c.startBrain(name)));
+    const sessionIds: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const s = await api<{ data: { session_id: string } }>(c, "POST", "/v1/sessions", {});
+      sessionIds.push(s.data.session_id);
+    }
+    for (const sessionId of sessionIds) {
+      const r = await fetch(`${c.front.url}/v1/sessions/${sessionId}`, { method: "DELETE" });
+      assert.equal(r.status, 200, `DELETE ${sessionId}: ${await r.text()}`);
+    }
+
+    const count = (brain: string, msg: string, sessionId: string) =>
+      c.brains.get(brain)!.grep(new RegExp(`"msg":"${msg.replace(/\./g, "\\.")}"`)).filter((l) => l.includes(sessionId)).length;
+    const teardowns = (sessionId: string) => BRAINS.map((b) =>
+      count(b, "session.cleanup_done", sessionId) + count(b, "session.cleanup_failed", sessionId)
+      + count(b, "session.cleanup_incomplete_parked", sessionId));
+    const forgets = (sessionId: string) => BRAINS.map((b) => count(b, "session.deleted_forgotten_locally", sessionId));
+    const sum = (xs: number[]) => xs.reduce((a, x) => a + x, 0);
+
+    await until("C7 every brain forgot every deleted session and each was torn down", async () =>
+      sessionIds.every((sid) => forgets(sid).every((n) => n >= 1) && sum(teardowns(sid)) >= 1), 30_000).catch((e) => {
+      throw new Error(`${(e as Error).message}\n${c.logs()}`);
+    });
+    // Long enough for a second replica's teardown, had the message reached one, to have logged too.
+    await sleep(3_000);
+    for (const sessionId of sessionIds) {
+      assert.deepEqual(forgets(sessionId), [1, 1, 1], `${sessionId}: every brain forgets it, once\n${c.logs()}`);
+      assert.equal(sum(teardowns(sessionId)), 1,
+        `${sessionId}: torn down by one brain, not one per brain: ${JSON.stringify(teardowns(sessionId))}\n${c.logs()}`);
+      assert.equal(sum(BRAINS.map((b) => count(b, "session.cleanup_done", sessionId))), 1, `${sessionId}: the teardown completed`);
+    }
+  } finally {
+    await c.close();
   }
 });

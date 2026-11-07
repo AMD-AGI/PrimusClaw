@@ -712,6 +712,7 @@ async function forgetDeletedSession(sid: string): Promise<void> {
     await abortRunsOfDeletedSession(sid);
   } finally {
     releaseLocalHandsState(sid);
+    logger.info({ sessionId: sid }, "session.deleted_forgotten_locally");
   }
 }
 

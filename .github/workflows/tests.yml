@@ -298,7 +298,7 @@ jobs:
           test -x "$CLAW_CHAOS_NATS_SERVER"
           npx --no-install tsx --test --test-reporter=spec test/rolling-restart-chaos.test.ts | tee "$RUNNER_TEMP/chaos.log"
           # A skipped suite passes too; this job exists to run it.
-          grep -q "^ℹ pass 7$" "$RUNNER_TEMP/chaos.log"
+          grep -q "^ℹ pass 8$" "$RUNNER_TEMP/chaos.log"
 
   connector:
     name: Connector (TypeScript)
