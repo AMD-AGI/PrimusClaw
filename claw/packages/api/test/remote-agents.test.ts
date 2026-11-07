@@ -142,6 +142,36 @@ describe("remote agents", { skip }, () => {
       await connector("u1", "again");
     });
 
+    test("registering again under a name whose old row is offline revokes that row; an online, a just-made, another name's or another user's is left alone", async () => {
+      const old = async (cid: string) => q("UPDATE claw_remote_connectors SET created_at = NOW() - interval '1 hour' WHERE connector_id = $1", [cid]);
+      // All made first (none old yet, so none replaces another), then all but `fresh` made an hour ago.
+      const stale = await connector("u1", "laptop");
+      await heartbeat("u1", stale);
+      const sid = await q("INSERT INTO claw_remote_sessions (session_id, owner_user_id, connector_id, agent_id, cwd, mode) VALUES (gen_random_uuid(), 'u1', $1, 'a1', '/w', 'default') RETURNING session_id::text AS session_id", [stale]);
+      const { cid: live } = await online("u1");
+      const fresh = await connector("u1", "laptop");
+      const desk = await connector("u1", "desk");
+      const theirs = await connector("u2", "laptop");
+      for (const cid of [stale, live, desk, theirs]) await old(cid);
+      await q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '1 hour' WHERE connector_id = $1", [stale]);
+
+      const again = await as("u1").post("/v1/remote-agents/connectors", { name: "laptop" });
+      assert.equal(again.status, 201, JSON.stringify(again.body));
+      const revoked = (await q("SELECT connector_id FROM claw_remote_connectors WHERE revoked_at IS NOT NULL")).rows.map((r: any) => r.connector_id);
+      assert.deepEqual(revoked, [stale], "only the offline twin");
+      const listed = (await as("u1").get("/v1/remote-agents/connectors")).body.data.map((c: any) => c.connector_id).sort();
+      assert.deepEqual(listed, [live, fresh, desk, again.body.data.connector_id].sort());
+      assert.equal((await q("SELECT status FROM claw_remote_sessions WHERE session_id = $1", [sid.rows[0].session_id])).rows[0].status, "closed");
+      const audit = async (cid: string, action: string) =>
+        (await q("SELECT detail FROM claw_remote_audit WHERE connector_id = $1 AND action = $2", [cid, action])).rows.map((r: any) => r.detail);
+      assert.deepEqual((await audit(again.body.data.connector_id, "connector.registered")).map((d: any) => d.replaced), [[stale]]);
+      assert.deepEqual((await audit(stale, "connector.revoked")).map((d: any) => [d.reason, d.sessions_closed]), [["replaced_by_same_name", 1]]);
+      // The old one, should it come back, is told it was revoked.
+      assert.deepEqual([(await heartbeat("u1", stale)).status, (await heartbeat("u1", stale)).body.error], [401, "revoked"]);
+      // The twin no longer takes a place: live, fresh, desk and the new one.
+      assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_connectors WHERE owner_user_id = 'u1' AND revoked_at IS NULL")).rows[0].n, 4);
+    });
+
     test("anonymous and 'default' callers are refused", async () => {
       assert.equal((await call(null, "GET", "/v1/remote-agents/connectors")).status, 403);
       assert.equal((await as("default").get("/v1/remote-agents/connectors")).status, 403);
