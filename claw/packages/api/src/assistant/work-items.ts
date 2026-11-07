@@ -175,7 +175,7 @@ export async function applyWorkerReport(q: StatementRunner, input: ApplyReport):
 
 // --- What the user sees ---------------------------------------------------------------
 
-const ITEM_COLUMNS = `item_id, seq, title, summary, board_state, last_report_kind, pending_question,
+export const ITEM_COLUMNS = `item_id, seq, title, summary, board_state, last_report_kind, pending_question,
   outcome, result_version, accepted_version, worker_session_id, created_at, updated_at, closed_at, kind, params`;
 
 export interface WorkItemView {

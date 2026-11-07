@@ -10,6 +10,7 @@
  *   GET  /v1/work-items/:id               one item with its latest events
  *   POST /v1/work-items/:id/accept        {version}: the result the user saw, and only that one
  *   POST /v1/work-items/:id/stop
+ *   POST /v1/work-items/:id/retry         a task that failed or was stopped runs again (`retry.ts`)
  *   POST /v1/assistant/reviews            reviews on someone's behalf, as items (`review-items.ts`)
  *   POST /v1/assistant/reviews/:id/restart the same pull request again, with what the body changes
  *   GET  /v1/assistant/scopes             the group chats and repositories the caller's assistant watches
@@ -37,6 +38,7 @@ import pino from "pino";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { getOrCreateAssistant } from "../assistant/assistant.js";
+import { retryWorkItem } from "../assistant/retry.js";
 import {
   acceptWorkItem, BOARD_STATES, getWorkItem, itemView, listWorkItems, recentEvents, stopWorkItem,
   type BoardState, type DecisionResult,
@@ -199,6 +201,16 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
       logger.error({ err, itemId }, "assistant.stop_interrupt_failed");
       return reply.status(503).send({ ok: false, error: "interrupt_not_recorded" });
     }
+  });
+
+  // Retry is the owner's alone: a review asked of someone else answers its requester 404 here, as accept does.
+  app.post("/v1/work-items/:id/retry", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    const result = await retryWorkItem(userId, (req.params as { id: string }).id);
+    if (result.status === "not_found") return reply.status(404).send({ ok: false, error: "not_found" });
+    if (result.status === "conflict") return reply.status(409).send({ ok: false, error: result.error, data: result.item });
+    return reply.send({ ok: true, data: result.item });
   });
 
   if (CLAW_ASSISTANT_OBSERVE) registerObserveRoutes(app);
