@@ -454,10 +454,14 @@ wait
     fs.writeFileSync(cli, "process.exit(0)\n");
     const env = { PATH: "/p/one:/p/two" };
     const t = ctx(h, env, deps(env));
-    t.c.service = { platform: "linux", uid: 1000, user: "me", node: process.execPath, cli, systemdBooted: () => false };
+    // No real crontab is ever read or written by a test.
+    t.c.service = { platform: "linux", uid: 1000, user: "me", node: process.execPath, cli, systemdBooted: () => false, readCrontab: () => null, writeCrontab: () => false };
     assert.equal(await main(["service", "install", "--supervisor", "script"], t.c), 0, t.errText());
     assert.equal(JSON.parse(fs.readFileSync(serviceFile(t.c.dirs), "utf8")).path, "/p/one:/p/two");
-    assert.ok(fs.existsSync(keepaliveStampFile(t.c.dirs)), "install ran ensure, which left its time");
+    // Install starting the supervisor once is not "something calls keepalive.sh": no stamp, so doctor still warns.
+    assert.equal(fs.existsSync(keepaliveStampFile(t.c.dirs)), false, "install's own start is not a schedule");
+    await main(["service", "ensure"], t.c);
+    assert.ok(fs.existsSync(keepaliveStampFile(t.c.dirs)), "an ensure (what keepalive.sh runs) leaves its time");
     await main(["service", "uninstall"], t.c);
   });
 });

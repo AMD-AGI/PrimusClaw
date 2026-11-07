@@ -8,8 +8,8 @@ import path from "node:path";
 import test, { describe } from "node:test";
 import { main, EXIT, type Ctx } from "../src/commands.js";
 import { needsLogin, recentDisconnects } from "../src/health.js";
-import { keepaliveFile, needsLoginFile, pidFile, resolveDirs, supervisorPidFile } from "../src/paths.js";
-import { carriedEnv, supervise, systemdUnit, type ExecResult, type ServiceDeps } from "../src/service.js";
+import { keepaliveFile, needsLoginFile, pidFile, resolveDirs, serviceEnvFile, supervisorPidFile } from "../src/paths.js";
+import { accountName, carriedEnv, codexEnvKeys, cronLines, ephemeralWhere, readMounts, supervise, systemdUnit, type ExecResult, type ServiceDeps } from "../src/service.js";
 import { FakeClaw } from "./support/fake-claw.js";
 import { ADAPTER, tmpdir } from "./support/harness.js";
 
@@ -21,7 +21,7 @@ function ctx(home: string, extra: Partial<Ctx> = {}, env: NodeJS.ProcessEnv = {}
 }
 
 const writeConfig = (home: string, work: string) => {
-  fs.mkdirSync(path.join(home, "config"), { recursive: true });
+  fs.mkdirSync(path.join(home, "config"), { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(home, "config", "agents.toml"), `
 [[agents]]
 id = "fake"
@@ -47,7 +47,7 @@ function fakeExec(answers: Record<string, ExecResult> = {}) {
 const D = (over: Partial<ServiceDeps> = {}): Partial<ServiceDeps> => {
   const cli = path.join(tmpdir("cli-"), "cli.js");
   fs.writeFileSync(cli, "");
-  return { platform: "linux", uid: 1000, user: "me", node: "/usr/bin/node", cli, systemdBooted: () => true, ...over };
+  return { platform: "linux", uid: 1000, user: "me", node: "/usr/bin/node", cli, systemdBooted: () => true, readCrontab: () => null, writeCrontab: () => false, ...over };
 };
 
 describe("the units", () => {
@@ -73,10 +73,146 @@ describe("the units", () => {
     assert.deepEqual(asked.withheld, ["https_proxy"]);
   });
 
-  test("only the listed variables are carried, and never one named like a credential, even when asked for", () => {
-    const { vars, refused } = carriedEnv({ PATH: "/bin", CLAW_CONNECTOR_KEY: "ak-secret", ANTHROPIC_API_KEY: "sk", FOO: "1", GH_TOKEN: "t" }, ["FOO", "GH_TOKEN", "ANTHROPIC_API_KEY"]);
-    assert.deepEqual(vars, [["PATH", "/bin"], ["FOO", "1"]]);
-    assert.deepEqual(refused, ["GH_TOKEN", "ANTHROPIC_API_KEY"]);
+  test("a unit gets the listed variables and the agents' plain settings; never a credential, which goes to service-env.json; never the connector's key", () => {
+    const env = {
+      PATH: "/bin", CLAW_CONNECTOR_KEY: "ak-secret", ANTHROPIC_API_KEY: "sk", FOO: "1", GH_TOKEN: "t", BAR: "2",
+      ANTHROPIC_BASE_URL: "https://gw.example", ANTHROPIC_MODEL: "m", IS_SANDBOX: "1", OPENAI_API_KEY: "ok", MY_GW_KEY: "g",
+      npm_config_registry: "https://npm.example", CLAUDE_CODE_USE_BEDROCK: "1", ANTHROPIC_CUSTOM_HEADERS: "x-api-key: h",
+    };
+    const c = carriedEnv(env, ["FOO", "GH_TOKEN", "CLAW_CONNECTOR_KEY"], ["ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS", "OPENAI_API_KEY", "MY_GW_KEY"]);
+    assert.deepEqual(new Map(c.vars), new Map([["PATH", "/bin"], ["IS_SANDBOX", "1"], ["npm_config_registry", "https://npm.example"], ["ANTHROPIC_BASE_URL", "https://gw.example"], ["ANTHROPIC_MODEL", "m"], ["CLAUDE_CODE_USE_BEDROCK", "1"], ["FOO", "1"]]));
+    assert.deepEqual(new Map(c.secrets), new Map([["ANTHROPIC_API_KEY", "sk"], ["ANTHROPIC_CUSTOM_HEADERS", "x-api-key: h"], ["OPENAI_API_KEY", "ok"], ["MY_GW_KEY", "g"], ["GH_TOKEN", "t"]]));
+    assert.deepEqual(c.refused, ["CLAW_CONNECTOR_KEY"]);
+    assert.ok(!c.vars.some(([k]) => k === "BAR"), "an unrelated variable is not carried unless asked for");
+    const u = carriedEnv({ ANTHROPIC_BASE_URL: "https://user:pw@gw.example", npm_config_registry: "https://tok@npm.example/" });
+    assert.deepEqual(u.vars, [], "a URL with a user name or password in it never goes into a unit");
+    assert.deepEqual(new Map(u.secrets), new Map([["ANTHROPIC_BASE_URL", "https://user:pw@gw.example"], ["npm_config_registry", "https://tok@npm.example/"]]));
+  });
+
+  test("a config directory of this account's that others may write (umask 0002) is closed to them before the sign-in goes in", async () => {
+    for (const mode of [0o775, 0o777]) {
+      const home = tmpdir();
+      writeConfig(home, tmpdir("w-"));
+      await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
+      fs.chmodSync(path.join(home, "config"), mode);
+      const a = ctx(home, { service: { ...D(), exec: fakeExec({ "systemctl --user is-active": { code: 0, out: "active" } }).exec } }, { XDG_CONFIG_HOME: tmpdir("xdg-"), ANTHROPIC_API_KEY: "sk-x" });
+      assert.equal(await main(["service", "install", "--supervisor", "systemd"], a.c), EXIT.ok, a.errText());
+      assert.equal(fs.statSync(path.join(home, "config")).mode & 0o777, 0o700, mode.toString(8));
+      const fd = fs.openSync(serviceEnvFile(a.c.dirs), "r");
+      try { assert.equal(fs.fstatSync(fd).mode & 0o777, 0o600); } finally { fs.closeSync(fd); }
+    }
+  });
+
+  test("a config directory that is a link is not written through", async () => {
+    const home = tmpdir();
+    writeConfig(home, tmpdir("w-"));
+    await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
+    const elsewhere = tmpdir("elsewhere-");
+    const linked = path.join(tmpdir("cfg-"), "claw-connector");
+    fs.symlinkSync(elsewhere, linked);
+    const { writeSecretFile } = await import("../src/service.js");
+    assert.throws(() => writeSecretFile(path.join(linked, "service-env.json"), "{}"), /a link is not followed/);
+    assert.deepEqual(fs.readdirSync(elsewhere), []);
+  });
+
+  test("a config directory swapped for a link after the check does not redirect the chmod or the write (Linux)", { skip: !fs.existsSync("/proc/self/fd") }, async () => {
+    const { writeSecretFile } = await import("../src/service.js");
+    const parent = tmpdir("swap-");
+    const dir = path.join(parent, "claw-connector");
+    const victim = tmpdir("victim-");
+    fs.mkdirSync(dir, { mode: 0o775 });
+    fs.chmodSync(dir, 0o775);
+    fs.chmodSync(victim, 0o755);
+    // Someone who may rename entries in the parent swaps the directory for a link between the check and the write.
+    const real = fs.fchmodSync;
+    let swapped = false;
+    (fs as { fchmodSync: typeof fs.fchmodSync }).fchmodSync = (fd, mode) => {
+      if (!swapped) { swapped = true; fs.renameSync(dir, path.join(parent, "moved")); fs.symlinkSync(victim, dir); }
+      return real(fd, mode);
+    };
+    try { writeSecretFile(path.join(dir, "service-env.json"), "{\"K\":\"v\"}\n"); } finally { (fs as { fchmodSync: typeof fs.fchmodSync }).fchmodSync = real; }
+    assert.ok(swapped);
+    assert.deepEqual(fs.readdirSync(victim), [], "nothing written through the link");
+    assert.equal(fs.statSync(victim).mode & 0o777, 0o755, "the link's target was not chmod-ed");
+    assert.deepEqual(fs.readdirSync(path.join(parent, "moved")), ["service-env.json"], "written into the directory that was checked");
+    assert.equal(fs.statSync(path.join(parent, "moved")).mode & 0o777, 0o700);
+  });
+
+  test("where a directory cannot be written through its descriptor (macOS), a path others could change on the way is refused", async () => {
+    const { renamableAncestor } = await import("../src/service.js");
+    const top = tmpdir("anc-");
+    const open = path.join(top, "open");
+    fs.mkdirSync(path.join(open, "cfg"), { recursive: true });
+    fs.chmodSync(open, 0o777);
+    assert.equal(renamableAncestor(path.join(open, "cfg")), open, "a world-writable parent without the sticky bit");
+    fs.chmodSync(open, 0o1777);
+    assert.equal(renamableAncestor(path.join(open, "cfg")), null, "sticky, like /tmp: others cannot rename our entries");
+    fs.chmodSync(open, 0o755);
+    assert.equal(renamableAncestor(path.join(open, "cfg")), null);
+    // A link on the way is refused even when everything it points through is safe.
+    const via = path.join(top, "via");
+    fs.symlinkSync(open, via);
+    assert.equal(renamableAncestor(path.join(via, "cfg")), via);
+    let chowned = false;
+    try { fs.chownSync(open, 4242, 4242); chowned = true; } catch { /* not root, or a user namespace that cannot map 4242 */ }
+    if (chowned) assert.equal(renamableAncestor(path.join(open, "cfg"), process.getuid?.() === 0 ? 0 : 4243), open, "a parent owned by another account (not root)");
+  });
+
+  test("without /proc/self/fd (macOS), a config path that leads through a link into a directory others may write is refused", async () => {
+    const { writeSecretFile } = await import("../src/service.js");
+    const top = tmpdir("mac-");
+    const open = path.join(top, "open");
+    fs.mkdirSync(path.join(open, "cfg"), { recursive: true });
+    fs.chmodSync(open, 0o777);
+    fs.mkdirSync(path.join(top, "safe"), { mode: 0o755 });
+    fs.symlinkSync(open, path.join(top, "safe", "link"));
+    const real = fs.existsSync;
+    (fs as { existsSync: typeof fs.existsSync }).existsSync = (p) => (String(p).startsWith("/proc/self/fd/") ? false : real(p));
+    try {
+      assert.throws(() => writeSecretFile(path.join(top, "safe", "link", "cfg", "service-env.json"), "{}"), /can be changed by other accounts/);
+      fs.chmodSync(open, 0o755);
+      writeSecretFile(path.join(top, "safe", "link", "cfg", "service-env.json"), "{}");
+      assert.deepEqual(fs.readdirSync(path.join(open, "cfg")), ["service-env.json"]);
+    } finally { (fs as { existsSync: typeof fs.existsSync }).existsSync = real; }
+  });
+
+  test("a cron daemon counts only in this container's own mount namespace (hostPID shows the host's)", async () => {
+    const { cronDaemonRunning } = await import("../src/service.js");
+    const proc = tmpdir("proc-");
+    const mk = (pid: string, comm: string, ns: string) => {
+      fs.mkdirSync(path.join(proc, pid, "ns"), { recursive: true });
+      fs.writeFileSync(path.join(proc, pid, "comm"), comm + "\n");
+      fs.writeFileSync(path.join(proc, pid, "cmdline"), `/usr/sbin/${comm}\0-f`);
+      fs.symlinkSync(ns, path.join(proc, pid, "ns", "mnt"));
+    };
+    mk("self", "node", "mnt:[100]");
+    mk("2000", "cron", "mnt:[1]");
+    assert.equal(cronDaemonRunning(proc), false, "the host's cron, seen through hostPID");
+    mk("42", "crond", "mnt:[100]");
+    assert.equal(cronDaemonRunning(proc), true);
+  });
+
+  test("a terminal's own session variables, and a value that spans lines, are not carried", () => {
+    const c = carriedEnv({ PATH: "/bin", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SSE_PORT: "1", CLAUDE_CODE_SESSION_ID: "s", CODEX_SANDBOX: "seatbelt", CODEX_THREAD_ID: "t",
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000", ANTHROPIC_MODEL: "a\nb" });
+    assert.deepEqual(c.vars, [["PATH", "/bin"], ["CLAUDE_CODE_MAX_OUTPUT_TOKENS", "8000"]], "a count of tokens is a setting, not a secret");
+    assert.deepEqual(c.secrets, []);
+    assert.deepEqual(c.withheld, ["ANTHROPIC_MODEL"]);
+  });
+
+  test("Codex's env_key names count as the agents' sign-in variables", () => {
+    const home = tmpdir("ch-");
+    fs.mkdirSync(path.join(home, ".codex"));
+    fs.writeFileSync(path.join(home, ".codex", "config.toml"), `model_provider = "gw"\n[model_providers.gw]\nbase_url = "https://gw"\nenv_key = "GW_TOKEN_X"\n`);
+    assert.deepEqual(codexEnvKeys({}, home), ["GW_TOKEN_X"]);
+    assert.deepEqual(codexEnvKeys({ CODEX_HOME: path.join(home, "nope") }, home), []);
+  });
+
+  test("a uid with no passwd entry still gets a name (os.userInfo throws ENOENT there)", () => {
+    const throws = () => { throw Object.assign(new Error("ENOENT: no such file or directory, uv_os_get_passwd"), { code: "ENOENT" }); };
+    assert.equal(accountName({}, 4242, throws), "4242");
+    assert.equal(accountName({ LOGNAME: "me" }, 4242, throws), "me");
+    assert.equal(accountName({ USER: "u" }, 4242, throws), "u");
   });
 });
 
@@ -226,9 +362,38 @@ describe("service install / uninstall / status", () => {
     assert.match(body, /service ensure\n$/);
     assert.match(a.text(), /supervisor running \(pid \d+\)/);
     assert.deepEqual(chroot.calls, [], "systemctl was not even asked");
-    assert.match(a.text(), /@reboot sh .*keepalive\.sh/);
-    assert.match(a.text(), /\*\/5 \* \* \* \* sh .*keepalive\.sh/);
+    // Installing is not "something calls keepalive.sh": doctor must not take the install's own start for a schedule.
+    const { keepaliveStampFile } = await import("../src/paths.js");
+    assert.equal(fs.existsSync(keepaliveStampFile(a.c.dirs)), false);
+    // No cron daemon (the fake's default, and the usual container): said plainly, with the line a startup hook needs.
+    assert.match(a.text(), /No cron daemon runs here: after a reboot or a container restart NOTHING starts the connector again/);
+    assert.match(a.text(), /^  sh '.*keepalive\.sh' >\/dev\/null 2>&1$/m);
     fs.rmSync(supervisorPidFile(a.c.dirs));
+  });
+
+  test("script: where a cron daemon runs, the two lines go into the crontab once, beside the user's own, and uninstall takes them out", async () => {
+    const home = tmpdir();
+    writeConfig(home, tmpdir("w-"));
+    await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
+    fs.mkdirSync(ctx(home).c.dirs.state, { recursive: true });
+    const { processStart } = await import("../src/children.js");
+    const alive = () => fs.writeFileSync(supervisorPidFile(ctx(home).c.dirs), JSON.stringify({ pid: process.ppid, start: processStart(process.ppid) }));
+    alive();
+    const script = keepaliveFile(ctx(home).c.dirs);
+    let tab = `MAILTO=me\n\n0 3 * * * backup.sh\n# my note about ${script}\n\n`;
+    const svc = { ...D({ systemdBooted: () => false }), readCrontab: () => tab, writeCrontab: (t: string) => { tab = t; return true; } };
+    for (let i = 0; i < 2; i++) {
+      const a = ctx(home, { service: svc }, { PATH: "/bin" });
+      assert.equal(await main(["service", "install"], a.c), EXIT.ok, a.errText());
+      assert.match(a.text(), /added to your crontab/);
+    }
+    assert.equal(tab, `MAILTO=me\n\n0 3 * * * backup.sh\n# my note about ${script}\n\n${cronLines(script).join("\n")}\n`, "installed twice, listed once; the user's lines kept, blank ones too");
+    // uninstall would stop the recorded supervisor: point the record at nothing alive.
+    fs.rmSync(supervisorPidFile(ctx(home).c.dirs));
+    const u = ctx(home, { service: svc });
+    assert.equal(await main(["service", "uninstall"], u.c), EXIT.ok);
+    assert.equal(tab, `MAILTO=me\n\n0 3 * * * backup.sh\n# my note about ${script}\n\n`, "only the lines install wrote are removed");
+    assert.match(u.text(), /and its crontab lines/);
   });
 });
 
@@ -416,5 +581,137 @@ describe("the disconnect record", () => {
     const after = recentDisconnects(fresh, 10_000);
     assert.ok(after.length >= trimmedAt / 2 - 1, `kept ${after.length} of ${trimmedAt + 1}`);
     assert.match(after.at(-1)?.detail ?? "", new RegExp(`^${trimmedAt} `), "the record that caused the trim is kept");
+  });
+});
+
+describe("the agents' sign-in under a service", () => {
+  test("install keeps ANTHROPIC_API_KEY out of the unit, in service-env.json (0600); a run then gives it to the agent, whose session opens", async () => {
+    const claw = await FakeClaw.start();
+    let running: Promise<number> | null = null;
+    const held: { c: import("../src/connector.js").Connector | null } = { c: null };
+    // The adapter inherits this test process's environment: whatever key the machine running the tests has must not
+    // stand in for the one the service is meant to supply.
+    const own = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      const home = tmpdir();
+      const work = tmpdir("w-");
+      writeConfig(home, work);
+      // The agent signs in with ANTHROPIC_API_KEY, as Claude Code does for a key or gateway user.
+      fs.appendFileSync(path.join(home, "config", "agents.toml"), `[agents.env]\nFAKE_NEEDS_ENV = "ANTHROPIC_API_KEY"\n`);
+      await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c);
+      const xdg = tmpdir("xdg-");
+      const f = fakeExec({ "systemctl --user is-system-running": { code: 0, out: "running" }, "systemctl --user is-active": { code: 0, out: "active" } });
+      const shell = { XDG_CONFIG_HOME: xdg, PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-ant-must-not-be-in-the-unit", ANTHROPIC_BASE_URL: "https://gw.example" };
+      const i = ctx(home, { service: { ...D(), exec: f.exec } }, shell);
+      assert.equal(await main(["service", "install"], i.c), EXIT.ok, i.errText());
+      const unit = fs.readFileSync(path.join(xdg, "systemd", "user", "claw-connector.service"), "utf8");
+      assert.doesNotMatch(unit, /sk-ant-must-not-be|ANTHROPIC_API_KEY/);
+      assert.match(unit, /Environment="ANTHROPIC_BASE_URL=https:\/\/gw\.example"/);
+      const fd = fs.openSync(serviceEnvFile(i.c.dirs), "r");
+      try {
+        assert.equal(fs.fstatSync(fd).mode & 0o777, 0o600);
+        assert.deepEqual(JSON.parse(fs.readFileSync(fd, "utf8")), { ANTHROPIC_API_KEY: "sk-ant-must-not-be-in-the-unit" });
+      } finally { fs.closeSync(fd); }
+      assert.match(i.text(), /sign-in for the service .*: ANTHROPIC_API_KEY/);
+      assert.doesNotMatch(i.text() + i.errText(), /sk-ant-must-not-be/, "names only, never the value");
+      // The service's run: the unit's environment, without the key.
+      const r = ctx(home, { timing: { heartbeatMs: 150, pausePollMs: 40, batchMs: 15, backoffMinMs: 20, backoffMaxMs: 100 }, onConnector: (cn) => { held.c = cn; } }, { PATH: "/usr/bin" });
+      running = main(["run", "--supervised"], r.c);
+      await claw.until("online", () => claw.online && claw.heartbeats.length > 0);
+      const sid = claw.newSession("fake", work);
+      const got = await claw.until("an answer", () => claw.eventsOf(sid, "session_started")[0] ?? claw.eventsOf(sid, "session_closed")[0]);
+      assert.equal(got.type, "session_started", JSON.stringify(got.data));
+      const st = ctx(home, { service: { ...D(), exec: f.exec } });
+      await main(["service", "status"], st.c);
+      assert.match(st.text(), /agent env: +ANTHROPIC_API_KEY/);
+    } finally {
+      held.c?.stop();
+      if (running) await running;
+      await claw.close();
+      if (own !== undefined) process.env.ANTHROPIC_API_KEY = own;
+    }
+  });
+
+  test("install again from a shell without the key keeps it; uninstall removes the file", async () => {
+    const home = tmpdir();
+    writeConfig(home, tmpdir("w-"));
+    await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
+    const f = fakeExec({ "systemctl --user is-active": { code: 0, out: "active" } });
+    const svc = { ...D(), exec: f.exec };
+    const xdg = tmpdir("xdg-");
+    assert.equal(await main(["service", "install", "--supervisor", "systemd"], ctx(home, { service: svc }, { XDG_CONFIG_HOME: xdg, OPENAI_API_KEY: "o1" }).c), EXIT.ok);
+    const again = ctx(home, { service: svc }, { XDG_CONFIG_HOME: xdg, ANTHROPIC_API_KEY: "a1" });
+    assert.equal(await main(["service", "install", "--supervisor", "systemd"], again.c), EXIT.ok);
+    assert.deepEqual(JSON.parse(fs.readFileSync(serviceEnvFile(again.c.dirs), "utf8")), { OPENAI_API_KEY: "o1", ANTHROPIC_API_KEY: "a1" });
+    assert.match(again.text(), /OPENAI_API_KEY \(kept from before\)/);
+    assert.equal(await main(["service", "uninstall", "--supervisor", "systemd"], ctx(home, { service: svc }, { XDG_CONFIG_HOME: xdg }).c), EXIT.ok);
+    assert.equal(fs.existsSync(serviceEnvFile(again.c.dirs)), false);
+  });
+
+  test("an agent's own [agents.env] and the connector's environment win over what the service kept", async () => {
+    const { applyServiceEnv } = await import("../src/service.js");
+    const agents = [{ env: { ANTHROPIC_API_KEY: "own" } as Record<string, string> }, { env: {} as Record<string, string> }];
+    assert.deepEqual(applyServiceEnv(agents, { ANTHROPIC_API_KEY: "kept", OPENAI_API_KEY: "kept-o" }, { OPENAI_API_KEY: "shell" }), ["ANTHROPIC_API_KEY"]);
+    assert.deepEqual(agents.map((a) => a.env), [{ ANTHROPIC_API_KEY: "own" }, { ANTHROPIC_API_KEY: "kept" }]);
+  });
+});
+
+describe("a container whose home does not outlive it", () => {
+  const MOUNTINFO = [
+    "100 1 0:50 / / rw,relatime - overlay overlay rw,lowerdir=/x",
+    "101 100 0:60 / /mnt/ceph rw,relatime - ceph 10.0.0.1:/ rw",
+    "102 100 0:61 / /proc rw - proc proc rw",
+    "103 100 0:62 / /root/persist rw - ext4 /dev/sdb rw",
+  ].join("\n");
+
+  test("a configuration on overlay is said to be lost with the container, naming the persistent mounts; on a real disk nothing is said", () => {
+    const mounts = readMounts(MOUNTINFO);
+    assert.deepEqual(mounts.map((m) => `${m.point}:${m.fstype}`), ["/:overlay", "/mnt/ceph:ceph", "/proc:proc", "/root/persist:ext4"]);
+    const said = ephemeralWhere("/root/.config/claw-connector", mounts);
+    assert.match(said ?? "", /on the container's own file system \(overlay\), which is lost when the container is recreated/);
+    assert.match(said ?? "", /CLAW_CONNECTOR_CONFIG_DIR=/);
+    assert.equal(ephemeralWhere("/root/persist/claw", mounts), null);
+    assert.equal(ephemeralWhere("/mnt/ceph/me/claw", mounts), null);
+  });
+
+  test("CLAW_CONNECTOR_CONFIG_DIR moves only the configuration and sign-in; the state stays", () => {
+    const d = resolveDirs({ CLAW_CONNECTOR_CONFIG_DIR: "/persist/cc" } as NodeJS.ProcessEnv, "/home/me");
+    assert.deepEqual(d, { config: "/persist/cc", state: "/home/me/.local/state/claw-connector" });
+    const h = resolveDirs({ CLAW_CONNECTOR_HOME: "/h", CLAW_CONNECTOR_CONFIG_DIR: "/persist/cc" } as NodeJS.ProcessEnv);
+    assert.deepEqual(h, { config: "/persist/cc", state: "/h/state" });
+  });
+});
+
+describe("Claw's connector limit", () => {
+  test("409 connector_limit_reached: the run stays up, says what to do once, retries slowly and comes online when a slot frees", async () => {
+    const claw = await FakeClaw.start();
+    let running: Promise<number> | null = null;
+    const held: { c: import("../src/connector.js").Connector | null } = { c: null };
+    try {
+      const home = tmpdir();
+      writeConfig(home, tmpdir("w-"));
+      await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c);
+      claw.atConnectorLimit = true;
+      const r = ctx(home, { timing: { heartbeatMs: 150, pausePollMs: 40, backoffMinMs: 20, backoffMaxMs: 100, limitRetryMs: 200 }, onConnector: (cn) => { held.c = cn; } });
+      let ended = false;
+      running = main(["run"], r.c).finally(() => { ended = true; });
+      await claw.until("two refusals", () => claw.limitRefusals >= 2);
+      assert.equal(ended, false, "the run did not end: a supervisor would restart it every 5 s for good");
+      const last = recentDisconnects(r.c.dirs, 5);
+      assert.equal(last.filter((x) => x.reason === "connector_limit_reached").length, 1, "said once, not on every try");
+      assert.match(last.at(-1)?.detail ?? "", /remove machines you no longer use/);
+      // Paused while waiting: a slot that frees up meanwhile is not taken until "resume".
+      await main(["pause"], ctx(home).c);
+      claw.atConnectorLimit = false;
+      await new Promise((r) => setTimeout(r, 600));
+      assert.equal(claw.registered, 0, "not registered while paused");
+      await main(["resume"], ctx(home).c);
+      await claw.until("online", () => claw.online && claw.heartbeats.length > 0, 5_000);
+    } finally {
+      held.c?.stop();
+      if (running) await running;
+      await claw.close();
+    }
   });
 });

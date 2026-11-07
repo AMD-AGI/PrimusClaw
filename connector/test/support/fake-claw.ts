@@ -40,6 +40,9 @@ export class FakeClaw {
   readonly requests: Array<{ method: string; path: string; auth: string | undefined; client: string | undefined }> = [];
   readonly streamHeaders: Array<Record<string, string | string[] | undefined>> = [];
   duplicatesSeen = 0;
+  /** Refuse every registration with 409 `connector_limit_reached`, as Claw does once a person has the most connectors allowed. */
+  atConnectorLimit = false;
+  limitRefusals = 0;
   /** Whether the connector-side `POST .../connectors/:cid/revoke` exists; false is a Claw from before it. */
   revokeRoute = true;
   /** Every revocation asked of this Claw, by either route, and what was asked with. */
@@ -166,6 +169,7 @@ export class FakeClaw {
     if (!m) return this.json(res, 404, { ok: false, error: "not_found" });
     if (!m[1]) {
       if (req.method === "GET") return this.json(res, 200, { ok: true, data: [] });
+      if (this.atConnectorLimit) { this.limitRefusals++; return this.json(res, 409, { ok: false, error: "connector_limit_reached" }); }
       this.registered++;
       if (this.revoked) this.connectorId = randomUUID(); // a revoked row is never reused
       return this.json(res, 201, { ok: true, data: { connector_id: this.connectorId } });

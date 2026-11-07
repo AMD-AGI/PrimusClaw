@@ -21,10 +21,10 @@ import { HooksError, hooksStatus, installHooks, settingsFile, uninstallHooks } f
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
 import { checkAll, defaultDeps, formatReport, runProbe, shq, writeReport, type DoctorDeps, type Problem, type Report } from "./doctor.js";
-import { cmdService, cmdSupervise, startAfterLogin, type ServiceDeps } from "./service.js";
+import { applyServiceEnv, cmdService, cmdSupervise, ephemeralWhere, loadServiceEnv, startAfterLogin, type ServiceDeps } from "./service.js";
 import { cmdPair } from "./pair.js";
 import {
-  auditFile, childrenFile, configFile, credentialsFile, doctorFile, identityFile, logDir, pauseFile, pidFile, stopRequestFile, type Dirs,
+  auditFile, childrenFile, configFile, credentialsFile, doctorFile, identityFile, logDir, pauseFile, pidFile, serviceEnvFile, stopRequestFile, type Dirs,
 } from "./paths.js";
 import { UrlError, errMessage, isObject, secureUrl, sleep, stderrLogger } from "./util.js";
 import { VERSION } from "./version.js";
@@ -107,7 +107,10 @@ Usage: claw-connector <command> [options]
   service install|uninstall|status [--supervisor systemd|launchd|script] [--env NAME ...]
                            keep "run" up: started at login/boot, restarted 5 s after it dies, never restarted
                            after exit 78. systemd --user on Linux, launchd on macOS; "script" (containers without
-                           systemd) writes a keep-alive script for a startup hook and a 5-minute cron line
+                           systemd) writes a keep-alive script and adds it to crontab, or says what must call it.
+                           The agents' settings in this shell (PATH, proxies, ANTHROPIC_BASE_URL...) go into the
+                           service; their sign-in variables (ANTHROPIC_API_KEY, OPENAI_API_KEY...) and any --env
+                           named like a credential go into service-env.json (0600), never into the unit
   status [--json]          what is running, signed in, paused, the last disconnect and why
   doctor [--agent ID] [--json]
                            check this machine before a phone session fails on it, one fix per problem: Node, each
@@ -123,12 +126,17 @@ Usage: claw-connector <command> [options]
   --version, --help
 
 Files: ${"$"}XDG_CONFIG_HOME/claw-connector (agents.toml, credentials.json) and ${"$"}XDG_STATE_HOME/claw-connector
-(audit.jsonl, logs, outbox); set CLAW_CONNECTOR_HOME to keep everything under one directory.
+(audit.jsonl, logs, outbox); set CLAW_CONNECTOR_HOME to keep everything under one directory, and
+CLAW_CONNECTOR_CONFIG_DIR to keep only the configuration and sign-in elsewhere (storage that outlives a container).
 `;
 
-/** The configuration as the agents will run it: with IS_SANDBOX set for unattended Claude agents under root (claude-mode.ts). */
+/**
+ * The configuration as the agents will run it: with the sign-in variables `service install` kept (service.ts), and
+ * IS_SANDBOX set for unattended Claude agents under root (claude-mode.ts).
+ */
 function loadCfg(ctx: Ctx, notes: string[] = []): ConnectorConfig {
   const cfg = loadConfig(configFile(ctx.dirs), { hostname: ctx.hostname ?? os.hostname() });
+  applyServiceEnv(cfg.agents, loadServiceEnv(serviceEnvFile(ctx.dirs)), ctx.env);
   notes.push(...applyRootSandbox(cfg.agents, ctx.env, { euid: ctx.euid }));
   return cfg;
 }
@@ -217,6 +225,9 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
     if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
     ctx.out(`${file} already exists; left alone${values.approval?.length ? ` (to change an agent's approval, set approval = "ask" or "never" in its [[agents]] table)` : ""}`);
   }
+  // A dev pod's home directory is often thrown away with the pod: say so now, not after the first restart.
+  const where = ephemeralWhere(ctx.dirs.config);
+  if (where) ctx.out(`note: ${where}`);
   // The hooks are a convenience: a Claude Code settings file that cannot be merged into is reported, and init still succeeded.
   if (!values["no-hooks"]) {
     const dir = defaultClaudeDir(ctx);
