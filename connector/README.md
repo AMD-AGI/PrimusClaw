@@ -392,7 +392,13 @@ before it starts the agent again after a pause and before every prompt. A prompt
 (the session stays, and the prompt can be sent again once the terminal is closed), and the connector's agent for the
 conversation is discarded: what the terminal wrote is not in its memory, so the next prompt starts a fresh one that reads
 the transcript. The same happens when the transcript is no longer the size the connector left it, which is how a terminal
-that came and went between two prompts is noticed.
+that came and went between two prompts is noticed. What the agent itself writes between two prompts does not count: a
+background task it started finishes and Claude Code answers it with a turn of its own. Those entries name the same program
+(`entrypoint`) as the agent's own turns, and their only prompt is the one Claude Code writes for itself
+(`origin.kind: "task-notification"`) about a task whose id the agent's own turn recorded, so the agent is kept and the
+prompt goes through. An entry from any other program
+(a terminal's say `cli`), any other prompt (one a person typed, or a `claude -p`), or anything that cannot be read still
+discards the agent, and the prompt is refused `recently_written` while that write is fresh.
 
 While the connector's own agent is working on the conversation (starting, or running a turn) the size cannot say whether
 someone else wrote, because the agent's own writes grow it too. So during that time the registry is read every second and

@@ -37,9 +37,40 @@ if (env.FAKE_STDERR_SPLIT === "1") { process.stderr.write("auth: Bearer abcdefgh
 // Some real adapters do not leave when their stdin closes; this one can be told not to either.
 if (env.FAKE_SURVIVE_EOF === "1") setInterval(() => {}, 1000);
 
+/**
+ * FAKE_TRANSCRIPT=1: each turn is appended to the conversation's transcript in `$CLAUDE_CONFIG_DIR/projects/<cwd>/<id>.jsonl`,
+ * in the shapes claude-agent-acp 0.99.0 has Claude Code write (measured): its entries say `entrypoint: "sdk-cli"`, and the
+ * prompt `origin: {kind: "human"}, promptSource: "sdk"`.
+ */
+function transcriptOf(sessionId, s) {
+  return path.join(env.CLAUDE_CONFIG_DIR, "projects", s.cwd.replace(/[^A-Za-z0-9]/g, "-"), `${sessionId}.jsonl`);
+}
+function writeTurn(sessionId, s, promptEntry, answer, extra = []) {
+  if (env.FAKE_TRANSCRIPT !== "1") return;
+  const file = transcriptOf(sessionId, s);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const base = { sessionId, cwd: s.cwd, entrypoint: "sdk-cli", userType: "external", isSidechain: false, version: "2.1.312" };
+  const lines = [
+    { type: "queue-operation", operation: "enqueue", sessionId },
+    { type: "queue-operation", operation: "dequeue", sessionId },
+    { ...base, type: "user", ...promptEntry },
+    { type: "api-request", sessionId },
+    ...extra.map((e) => ({ ...base, ...e })),
+    { ...base, type: "assistant", message: { role: "assistant", content: [{ type: "text", text: answer }] } },
+  ];
+  fs.appendFileSync(file, lines.map((l) => JSON.stringify(l) + "\n").join(""));
+}
+
 async function prompt(id, params) {
   const s = sessions.get(params.sessionId);
   const said = (params.prompt || []).map((p) => p.text || "").join(" ");
+  // A `background` turn records the task it started as a real run_in_background call does (`toolUseResult.backgroundTaskId`).
+  const task = /^background \d+$/.test(said) ? `b${nextOut++}` : null;
+  const ran = task ? [
+    { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: `toolu_${task}`, name: "Bash", input: { run_in_background: true } }] } },
+    { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: `toolu_${task}`, content: `Command running in background with ID: ${task}` }] }, toolUseResult: { stdout: "", backgroundTaskId: task } },
+  ] : [];
+  if (said) writeTurn(params.sessionId, s, { message: { role: "user", content: said }, promptSource: "sdk", origin: { kind: "human" } }, said.startsWith("say ") ? said.slice(4) : "ok", ran);
   // The connector's own "go on" after a restart (manager.ts CONTINUE_PROMPT): like a real agent, it asks again.
   const text = said.startsWith("[claw-connector]") ? "write continued.txt" : said;
   s.cancelled = false;
@@ -80,6 +111,14 @@ async function prompt(id, params) {
   }
   if (text === "bigoutput") {
     update(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "big", status: "completed", content: [{ type: "content", content: { type: "text", text: "x".repeat(30000) } }] });
+    return done("end_turn");
+  }
+  // `background <ms>`: like a Bash call with run_in_background, the turn ends at once; when the task finishes, Claude Code
+  // writes the notification as a prompt of its own and answers it, in this same process, with no one asking.
+  if ((n = /^background (\d+)$/.exec(text))) {
+    update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "started" } });
+    const note = `<task-notification>\n<task-id>${task}</task-id>\n<status>completed</status>\n</task-notification>`;
+    setTimeout(() => writeTurn(params.sessionId, s, { message: { role: "user", content: note }, promptSource: "system", origin: { kind: "task-notification", producer: "session-task" } }, "finished"), Number(n[1]));
     return done("end_turn");
   }
   if (text.startsWith("say ")) {

@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import test, { after, describe } from "node:test";
 import {
-  AttachSupport, MAX_REPORTED, SESSION_REF_RE, cleanTitle, fitResumable, liveActivity, localPidDomain, parseAgentsJson, processGroup, readRegistry,
+  AttachSupport, MAX_REPORTED, SESSION_REF_RE, classifyAppended, cleanTitle, ownTurnOf, fitResumable, liveActivity, localPidDomain, parseAgentsJson, processGroup, readRegistry,
   TranscriptTail, TwinCheckError, transcriptUpdates, type Resumable,
 } from "../src/attach.js";
 import { ChildRegistry, processStart } from "../src/children.js";
@@ -472,6 +472,99 @@ const fresh = () => ({ takeover: true, takeover_until: Date.now() + 5 * 60_000 }
 const closedReason = (h: Harness, sid: string) => h.claw.eventsOf(sid, "session_closed")[0]?.data.reason;
 const adapterMethods = (h: Harness) => h.adapterLog().map((l) => l.method).filter(Boolean);
 
+// The shapes Claude Code writes, as measured on 2.1.312 (claude-agent-acp 0.99.0) and 2.1.319 (a terminal), contents cut.
+const jl = (...entries: Array<Record<string, unknown>>) => entries.map((e) => JSON.stringify(e) + "\n").join("");
+const SDK = { entrypoint: "sdk-cli", userType: "external", isSidechain: false, sessionId: REF };
+const CLI = { ...SDK, entrypoint: "cli" };
+const agentTurn = (text: string) => [
+  { type: "queue-operation", operation: "enqueue", sessionId: REF },
+  { type: "queue-operation", operation: "dequeue", sessionId: REF },
+  { ...SDK, type: "user", message: { role: "user", content: text }, promptSource: "sdk", origin: { kind: "human" } },
+  { type: "api-request", sessionId: REF },
+  { ...SDK, type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } },
+];
+/** The agent's own turn that started a background task (`run_in_background`), which records the task's id. */
+const startedTask = (id: string) => [
+  ...agentTurn("run the tests in the background"),
+  { ...SDK, type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: `toolu_${id}`, name: "Bash", input: {} }] } },
+  { ...SDK, type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: `toolu_${id}`, content: "running" }] }, toolUseResult: { stdout: "", backgroundTaskId: id } },
+];
+/** A background task has finished: Claude Code writes the notification as its own prompt and answers it. */
+const notified = (id: string) => ({ ...SDK, type: "user", message: { role: "user", content: `<task-notification>\n<task-id>${id}</task-id>\n<tool-use-id>toolu_${id}</tool-use-id>\n<status>completed</status>\n</task-notification>` }, promptSource: "system", origin: { kind: "task-notification", producer: "session-task", runId: "r1" } });
+const selfTurn = [
+  { type: "queue-operation", operation: "enqueue", sessionId: REF },
+  { type: "queue-operation", operation: "dequeue", sessionId: REF },
+  notified("bktod8m08"),
+  { type: "api-request-blob", message: { role: "user", content: [{ type: "text", text: "…" }] } },
+  { type: "api-request", sessionId: REF },
+  { ...SDK, type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } },
+  { ...SDK, type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] }, toolUseResult: {} },
+  { ...SDK, type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "finished" }] } },
+  { ...SDK, type: "system", subtype: "turn_duration", isMeta: false },
+  { type: "last-prompt", sessionId: REF }, { type: "ai-title", sessionId: REF }, { type: "mode", sessionId: REF },
+];
+/** A person typed a prompt in a terminal: the same session, another program. */
+const typedTurn = [
+  { type: "file-history-snapshot", sessionId: REF },
+  { ...CLI, type: "user", message: { role: "user", content: "fix it" }, promptSource: "typed", origin: { kind: "human" } },
+  { ...CLI, type: "attachment" },
+  { ...CLI, type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "fixed" }] } },
+  { ...CLI, type: "system", subtype: "turn_duration", isMeta: false },
+];
+
+describe("who wrote what a transcript gained between two prompts", () => {
+  const OWN = { entrypoint: "sdk-cli", tasks: new Set(["bktod8m08"]) };
+  const classify = (text: string, own: { entrypoint: string | null; tasks: ReadonlySet<string> } = OWN) => classifyAppended(text, own, Buffer.byteLength(text));
+
+  test("the agent's own turn on a finished background task, and its own interruption note, are its own", () => {
+    assert.deepEqual(classify(jl(...selfTurn)), { by: "self", size: Buffer.byteLength(jl(...selfTurn)), tasks: [] });
+    const interrupted = jl({ ...SDK, type: "user", message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user for tool use]" }] } });
+    assert.equal(classify(interrupted).by, "self");
+    assert.equal(classify("").by, "self", "nothing written");
+  });
+
+  test("a person's prompt typed in a terminal is not, nor anything another program wrote", () => {
+    assert.equal(classify(jl(...typedTurn)).by, "other");
+    // Even one entry of a terminal among the agent's own.
+    assert.equal(classify(jl(...selfTurn, { ...CLI, type: "attachment" })).by, "other");
+    // A terminal's entries with no prompt in them (opened, a slash command, closed) are still a terminal's.
+    assert.equal(classify(jl({ ...CLI, type: "system", subtype: "local_command" })).by, "other");
+  });
+
+  test("a notification of a task this agent did not start is another process's turn, though it is the same program", () => {
+    // Another SDK process (a second adapter, a `claude -p`) that resumed the conversation, started a task and left.
+    assert.deepEqual(classify(jl(notified("bzzzzzzzz"))), { by: "other", why: "a notification of a task this agent did not start" });
+    assert.equal(classify(jl({ ...notified("bktod8m08"), message: { role: "user", content: "<task-notification>no id</task-notification>" } })).by, "other");
+    // A task the agent's own turn on a notification started is its own too, and so is that task's notification later.
+    const chained = jl(...selfTurn.slice(0, 6), { ...SDK, type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "" }] }, toolUseResult: { backgroundTaskId: "b2" } });
+    assert.deepEqual(classify(chained), { by: "self", size: Buffer.byteLength(chained), tasks: ["b2"] });
+    assert.equal(classify(jl(notified("b2"))).by, "other", "not before it is known");
+    assert.equal(classify(jl(notified("b2")), { entrypoint: "sdk-cli", tasks: new Set(["b2"]) }).by, "self");
+  });
+
+  test("a prompt the connector did not send is someone else's turn, even from the same kind of program (`claude -p`)", () => {
+    assert.equal(classify(jl(...agentTurn("hello"))).by, "other");
+    assert.equal(classify(jl({ ...SDK, type: "user", message: { role: "user", content: [{ type: "image" }] } })).by, "other", "an image is a prompt too");
+    assert.equal(classify(jl({ ...SDK, type: "user" })).by, "other", "a user entry that says nothing about what it is: not the agent's for certain");
+    assert.equal(classify(jl({ ...SDK, type: "user", message: { role: "user", content: "x" }, origin: { kind: "something-new" } })).by, "other", "an origin not known to be the agent's own");
+  });
+
+  test("while the agent's own program is not known, any entry that names one is not its own; what cannot be read is not either", () => {
+    assert.equal(classify(jl(...selfTurn), { entrypoint: null, tasks: OWN.tasks }).by, "other");
+    assert.equal(classify(jl({ type: "last-prompt" }), { entrypoint: null, tasks: new Set() }).by, "self", "an entry that names no program and is no prompt");
+    assert.equal(classify("{not json}\n").by, "other");
+    assert.equal(classify("[1]\n").by, "other");
+    assert.deepEqual(classify(jl(...selfTurn).slice(0, -5)), { by: "partial" }, "an entry still being written");
+  });
+
+  test("the program that wrote a turn, and the tasks it started, are read from the turn: one program, or none when two did", () => {
+    assert.deepEqual(ownTurnOf(jl(...agentTurn("hi"))), { entrypoint: "sdk-cli", tasks: [] });
+    assert.deepEqual(ownTurnOf(jl(...startedTask("bktod8m08"))), { entrypoint: "sdk-cli", tasks: ["bktod8m08"] });
+    assert.equal(ownTurnOf(jl(...agentTurn("hi"), ...typedTurn)).entrypoint, null);
+    assert.equal(ownTurnOf(jl({ type: "mode" })).entrypoint, null);
+  });
+});
+
 describe("attach end to end", () => {
   test("the heartbeat lists what can be taken over, newest first, inside the roots, with its state; the kind is opaque", async () => {
     const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF2, status: "idle" }] });
@@ -926,6 +1019,64 @@ describe("attach end to end", () => {
     assert.equal(resumes(), 2);
     assert.deepEqual(h.adapterLog().filter((l) => l.prompt).map((l) => l.prompt), ["say one", "say two", "say four"]);
     assert.equal(h.connector.registry.list().length, 1);
+  });
+
+  test("what the agent writes on its own between turns (a background task it started finishing) neither refuses the next prompt nor discards the agent", async () => {
+    // A window far longer than the test: a check of the transcript's age would refuse every prompt below.
+    const h = await attachHarness({ env: { FAKE_TRANSCRIPT: "1" }, timing: { recentWriteMs: 600_000 } });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, jl(...typedTurn));
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    const sid = await h.attach(REF);
+    const resumes = () => adapterMethods(h).filter((m) => m === "session/resume").length;
+    h.prompt(sid, "background 100");
+    assert.equal((await h.turnEnd(sid, 1)).data.stopReason, "end_turn");
+    await h.claw.until("the agent to answer the finished task by itself", () => fs.readFileSync(file, "utf8").includes("task-notification"));
+    assert.ok(Date.now() - fs.statSync(file).mtimeMs < 600_000, "the transcript was written a moment ago");
+    h.prompt(sid, "say two");
+    assert.equal((await h.turnEnd(sid, 2)).data.stopReason, "end_turn");
+    assert.equal(h.claw.eventsOf(sid, "command_rejected").length, 0, "not refused as recently_written");
+    assert.deepEqual(h.messages(sid), ["started", "two"]);
+    assert.equal(resumes(), 1, "the same agent goes on: it wrote what was added, so it is in its memory");
+    assert.ok(h.audit().some((a) => a.kind === "transcript_grew_by_agent"));
+    assert.ok(!h.audit().some((a) => a.kind === "transcript_changed"));
+    // And again, once more on its own: the agent's program is known from each of its turns.
+    h.prompt(sid, "background 50");
+    assert.equal((await h.turnEnd(sid, 3)).data.stopReason, "end_turn");
+    await h.claw.until("the second notification", () => fs.readFileSync(file, "utf8").split('"kind":"task-notification"').length === 3);
+    h.prompt(sid, "say four");
+    assert.equal((await h.turnEnd(sid, 4)).data.stopReason, "end_turn");
+    assert.equal(h.claw.eventsOf(sid, "command_rejected").length, 0);
+    assert.equal(resumes(), 1);
+  });
+
+  test("a person who typed in a terminal between two prompts still holds the next one back, though the agent wrote on its own too", async () => {
+    const h = await attachHarness({ env: { FAKE_TRANSCRIPT: "1" }, timing: { recentWriteMs: 5_000 } });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, jl(...typedTurn));
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    const sid = await h.attach(REF);
+    h.prompt(sid, "background 50");
+    assert.equal((await h.turnEnd(sid, 1)).data.stopReason, "end_turn");
+    await h.claw.until("the agent's own turn", () => fs.readFileSync(file, "utf8").includes("task-notification"));
+    // A terminal opened the conversation, the person typed a prompt, it was answered, and the terminal closed.
+    fs.appendFileSync(file, jl(...typedTurn));
+    h.prompt(sid, "say two");
+    const rejected = await h.claw.until("the prompt to be held back", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.equal(rejected.data.reason, "recently_written");
+    const changed = h.audit().find((a) => a.kind === "transcript_changed");
+    assert.equal(changed?.why, "entries written by another program");
+    assert.ok(!h.audit().some((a) => a.kind === "transcript_grew_by_agent"));
+    assert.deepEqual(h.adapterLog().filter((l) => l.prompt).map((l) => l.prompt), ["background 50"], "not sent to the agent that has not read the terminal's turn");
+    // Once it has settled, a fresh agent that reads the transcript takes it.
+    fs.utimesSync(file, old, old);
+    h.prompt(sid, "say three");
+    await h.turnEnd(sid, 3);
+    assert.equal(adapterMethods(h).filter((m) => m === "session/resume").length, 2);
   });
 
   test("a terminal that opens the conversation during a turn, takes a turn of its own and exits is noticed: the next prompt does not go to the agent that was running", async () => {
