@@ -110,6 +110,9 @@ const BYPASS_HINT = ` (Claude Code offers it to root only with IS_SANDBOX set, a
 
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024;
 const MAX_QUEUED_PROMPTS = 5;
+/** How long a prompt waits for an entry the agent is still writing to the transcript to be complete: 8 × 250 ms. */
+const PARTIAL_ENTRY_TRIES = 8;
+const PARTIAL_ENTRY_WAIT_MS = 250;
 const PERMISSION_WARNING_RE = /canUseTool will not be invoked/i;
 
 export class Session {
@@ -136,6 +139,14 @@ export class Session {
   private inheritedWarningOk = false;
   /** The transcript's size when this connector last left it (see {@link preflight}). */
   private transcriptMark: number | null = null;
+  /**
+   * The program (`entrypoint`) the transcript names for what this connector's own agent wrote in its last turn, so that
+   * what the same agent writes on its own between turns is told from a terminal's (see {@link preflight}). Null until
+   * the agent has taken a turn, and again when it is discarded.
+   */
+  private ownWriter: string | null = null;
+  /** The background tasks the agent started (their ids), so that only their notifications count as its own. */
+  private ownTasks = new Set<string>();
   /**
    * Another process was seen holding the conversation open while this connector's own agent was running a turn on
    * it. That agent's memory then lacks whatever the process wrote, and the transcript's size cannot say so (see
@@ -1083,6 +1094,7 @@ export class Session {
     const a = this.adapter!;
     this.audit("turn_started", { length: text.length });
     const support = this.agent.attach && this.acpId ? this.env.attach.get(this.agent.id) : undefined;
+    const turnFrom = support ? support.transcriptSize(this.acpId!) : null;
     const watch = support ? this.watchTwins(support, this.acpId!) : null;
     try {
       const reply = a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });
@@ -1108,7 +1120,7 @@ export class Session {
     } finally {
       // At once, before the look at who holds the conversation open: the test below it for a terminal that writes
       // next is the size, and it must start from the turn's end, not from a moment later.
-      this.markTranscript();
+      this.markTranscript(turnFrom);
       if (watch) {
         if (this.closed) watch.stop();
         else if (await watch.finish()) this.twinSeen = true;
@@ -1167,12 +1179,36 @@ export class Session {
     if (live && this.transcriptMark !== null) {
       const now = support.transcriptSize(ref);
       if (now !== null && now !== this.transcriptMark) {
-        this.audit("transcript_changed", { was: this.transcriptMark, now });
+        // The agent itself writes between turns too: a background task it started finishes, and it takes a turn of its own
+        // to answer it. That is in its memory, and nobody else holds the conversation open (the check above): it is kept.
+        const grown = await this.ownGrowth(support, ref, this.transcriptMark);
+        if (grown.by === "self") {
+          this.audit("transcript_grew_by_agent", { was: this.transcriptMark, now: grown.size });
+          this.transcriptMark = grown.size;
+          for (const id of grown.tasks) this.ownTasks.add(id);
+          return null;
+        }
+        this.audit("transcript_changed", { was: this.transcriptMark, now, why: grown.why });
         await this.dropAdapter();
         return this.preflight();
       }
     }
     return null;
+  }
+
+  /**
+   * Who wrote what the transcript gained since `mark`, while this connector's own agent was idle (see
+   * {@link classifyAppended}). An entry still being written is waited for, briefly; one that is not done by then is not the
+   * agent's for certain.
+   */
+  private async ownGrowth(support: AttachSupport, ref: string, mark: number): Promise<{ by: "self"; size: number; tasks: string[] } | { by: "other"; why: string }> {
+    for (let i = 0; ; i++) {
+      const r = support.appendedSince(ref, mark, { entrypoint: this.ownWriter, tasks: this.ownTasks });
+      if (r === null) return { by: "other", why: "the transcript shrank, or grew by more than is read" };
+      if (r.by !== "partial") return r;
+      if (i >= PARTIAL_ENTRY_TRIES) return { by: "other", why: "an entry that is still being written" };
+      await sleep(PARTIAL_ENTRY_WAIT_MS);
+    }
   }
 
   /** The turn is over: say so and forget it. Not while the connector is going away: the next run ends or continues it. */
@@ -1182,9 +1218,19 @@ export class Session {
     this.env.store.endTurn(this.id);
   }
 
-  /** What size the transcript is as this connector leaves it: after it starts the session and after every turn. */
-  private markTranscript(): void {
-    if (this.agent.attach && this.acpId) this.transcriptMark = this.env.attach.get(this.agent.id)?.transcriptSize(this.acpId) ?? null;
+  /**
+   * What size the transcript is as this connector leaves it: after it starts the session and after every turn. After a
+   * turn (`turnFrom`: the size it started at), also which program the transcript names for what the agent wrote in it.
+   */
+  private markTranscript(turnFrom: number | null = null): void {
+    if (!this.agent.attach || !this.acpId) return;
+    const support = this.env.attach.get(this.agent.id);
+    this.transcriptMark = support?.transcriptSize(this.acpId) ?? null;
+    if (turnFrom !== null && support && this.transcriptMark !== null) {
+      const turn = support.ownTurn(this.acpId, turnFrom, this.transcriptMark);
+      this.ownWriter = turn?.entrypoint ?? null;
+      for (const id of turn?.tasks ?? []) this.ownTasks.add(id);
+    }
   }
 
   /** A recycled (or crashed) adapter comes back on demand. */
@@ -1259,6 +1305,8 @@ export class Session {
   private async dropAdapter(): Promise<void> {
     const a = this.adapter;
     this.adapter = null;
+    this.ownWriter = null;
+    this.ownTasks.clear();
     if (a) await a.kill();
   }
 
