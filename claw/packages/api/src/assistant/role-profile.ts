@@ -132,6 +132,9 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
   )).rows as Array<Record<string, unknown>>;
   // Development environment items: where each runs, and whether that machine is online now (`remote-items.ts`).
   const remote = await remoteManifest(userId, rows as Array<{ item_id: string; kind: string; params: unknown }>, REMOTE_AGENT_TIMING.onlineWindowMs);
+  // The pull requests each item watches, and whether the user turned on automatic replies there: the router must not promise an
+  // approval card for an answer that goes out without one.
+  const watches = githubEventsEnabled() ? await itemWatches(userId, rows.map((r) => String(r.item_id))) : new Map<string, NonNullable<ManifestItem["watches"]>>();
   return rows.map((r) => ({
     itemId: String(r.item_id),
     seq: Number(r.seq),
@@ -146,7 +149,25 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
     closedAt: (r.closed_at as Date | null) ?? null,
     ...(r.kind === "review" ? { review: reviewOf(r.params) } : {}),
     ...(remote.has(String(r.item_id)) ? { remote: remote.get(String(r.item_id)) } : {}),
+    ...(watches.has(String(r.item_id)) ? { watches: watches.get(String(r.item_id)) } : {}),
   }));
+}
+
+/** The active pull request watches of these items of the user's, by item. */
+async function itemWatches(userId: string, itemIds: string[]): Promise<Map<string, NonNullable<ManifestItem["watches"]>>> {
+  const out = new Map<string, NonNullable<ManifestItem["watches"]>>();
+  if (!itemIds.length) return out;
+  const rows = (await db.query(
+    `SELECT item_id, owner, repo, number, reply_allowed FROM claw_work_item_subscriptions
+      WHERE user_id = $1 AND state = 'active' AND item_id = ANY($2::text[]) ORDER BY id`,
+    [userId, itemIds],
+  )).rows as Array<{ item_id: string; owner: string; repo: string; number: number; reply_allowed: boolean }>;
+  for (const r of rows) {
+    const list = out.get(r.item_id) ?? [];
+    list.push({ pr: `${r.owner}/${r.repo}#${r.number}`, autoReply: r.reply_allowed === true });
+    out.set(r.item_id, list);
+  }
+  return out;
 }
 
 /** The reviews the user asked of others, in the same window as their own items: the four facts each, read-only. */

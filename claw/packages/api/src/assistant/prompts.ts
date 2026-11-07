@@ -376,6 +376,11 @@ export interface ManifestItem {
    * remote session it is, and whether that machine is online now.
    */
   remote?: { machine: string; agent: string; session: string; online: boolean };
+  /**
+   * The pull requests the item watches now (`github-events.ts`), as Claw recorded them: with `autoReply` the user turned on automatic
+   * replies themselves, and its worker answers new comments there as them with no approval card.
+   */
+  watches?: Array<{ pr: string; autoReply: boolean }>;
 }
 
 /**
@@ -453,6 +458,9 @@ export function formatManifestLine(item: ManifestItem): string {
   if (item.review) {
     const r = item.review;
     tail.push(`review of ${oneLine(r.pr)}, ${r.reviewOnly ? "review only" : "merge"}${r.model ? `, model ${oneLine(r.model)}` : ""}`);
+  }
+  for (const w of item.watches ?? []) {
+    tail.push(`watches ${oneLine(w.pr)}, ${w.autoReply ? "auto-reply on: answers new comments as the user, no approval card" : "auto-reply off: answers on GitHub wait for the user's approval"}`);
   }
   if (item.remote) tail.push(`development environment item: agent ${quoted(item.remote.agent)}, session ${oneLine(item.remote.session)}, machine ${item.remote.online ? "online" : "offline"}`);
   const data = [`title: ${quoted(item.title)}`];

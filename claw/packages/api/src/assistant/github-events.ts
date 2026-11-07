@@ -51,6 +51,10 @@ import { canAccept, reopenWorkItem, resolveWorkItem, type WorkReport } from "./w
 const logger = pino({ name: "assistant-github-events" });
 
 export const GITHUB_EVENT_PREFIX = "[github_event]";
+/** What `pr_reply` tells the worker with a posted answer: how its report names it. */
+export const POSTED_NOTE = "Posted as the user under the automatic replies they turned on for this pull request. In your report say so "
+  + "with the link (in Chinese: 已按你开启的自动回复以你的身份回复了 <link>); it did not wait for approval, and never say it did or will.";
+
 /** What every answer `pr_reply` posts ends with: how a retry finds an answer that landed (with the author it was posted as). */
 export const REPLY_MARKER_PREFIX = "<!-- claw-reply:";
 export const replyMarker = (eventId: string): string => `${REPLY_MARKER_PREFIX}${eventId} -->`;
@@ -284,24 +288,86 @@ export async function listSubscriptions(userId: string, itemId: string): Promise
  * when the subscription is not the caller's (or not there).
  */
 export async function endSubscription(userId: string, itemId: string, subId: number): Promise<SubscriptionView | null> {
+  return inTransaction((query) => endSubscriptionIn(query, userId, itemId, subId));
+}
+
+/** `endSubscription` inside the caller's transaction. */
+async function endSubscriptionIn(query: Querier, userId: string, itemId: string, subId: number): Promise<SubscriptionView | null> {
+  const row = (await query(
+    `UPDATE claw_work_item_subscriptions
+        SET state = 'ended', end_reason = COALESCE(end_reason, 'user'), ended_at = COALESCE(ended_at, NOW()), reply_allowed = FALSE
+      WHERE id = $1 AND item_id = $2 AND user_id = $3
+      RETURNING *`,
+    [subId, itemId, userId],
+  )).rows[0] as Record<string, any> | undefined;
+  if (!row) return null;
+  // What was read and not yet delivered (held by the wake limit, say) is not delivered after the user stopped watching.
+  await query(
+    `UPDATE claw_work_item_github_events SET dropped_at = NOW(), drop_reason = 'subscription_ended'
+      WHERE sub_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
+    [subId],
+  );
+  return subscriptionView(row);
+}
+
+/** What the router is told after a stop from the chat; the words to tell the user are its own, in their language. */
+const UNSUBSCRIBED_NOTE = "Stopped: new comments, reviews and failed CI on it no longer reach the item, and nothing more is answered on GitHub "
+  + "as the user. Tell the user in one line that you stopped watching it (and automatic replies, where they were on).";
+
+/**
+ * `work_unsubscribe`: the user, in the chat, stops an item watching a pull request (别再自动回复 #381 了, stop watching that PR). It
+ * ends the watch the way the route's DELETE does, so automatic replies end with it. Only taking away, so the router may do it on the
+ * user's word; it never starts anything. With `pr` alone, every active watch of that pull request by any of the user's items;
+ * with `item_id` alone, every watch of that item; with both, that one.
+ */
+export async function workUnsubscribe(
+  claims: AssistantTokenClaims, args: { item_id?: string; pr?: string },
+): Promise<{ ok: true; ended: Array<{ sub_id: number; item_id: string; pr: string; auto_reply_was_on: boolean }>; note: string }> {
+  if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
+  const itemArg = typeof args.item_id === "string" && args.item_id.trim() ? args.item_id.trim() : null;
+  const prArg = typeof args.pr === "string" && args.pr.trim() ? args.pr.trim() : null;
+  if (!itemArg && !prArg) throw new ToolRefused("invalid_arguments", "name the item (item_id), the pull request (pr), or both");
+  const ref = prArg ? parsePrRef(prArg) : null;
+  if (prArg && !ref) throw new ToolRefused("invalid_pr", "name the pull request as owner/repo#123 or by its https://github.com URL");
+  const owner = (await db.query("SELECT user_id FROM claw_assistants WHERE session_id = $1", [claims.sid])).rows[0] as
+    { user_id: string } | undefined;
+  if (!owner) throw new ToolRefused("turn_not_live", "this session is not an assistant");
   return inTransaction(async (query) => {
-    const row = (await query(
-      `UPDATE claw_work_item_subscriptions
-          SET state = 'ended', end_reason = COALESCE(end_reason, 'user'), ended_at = COALESCE(ended_at, NOW()), reply_allowed = FALSE
-        WHERE id = $1 AND item_id = $2 AND user_id = $3
-        RETURNING *`,
-      [subId, itemId, userId],
-    )).rows[0] as Record<string, any> | undefined;
-    if (!row) return null;
-    // What was read and not yet delivered (held by the wake limit, say) is not delivered after the user stopped watching.
-    await query(
-      `UPDATE claw_work_item_github_events SET dropped_at = NOW(), drop_reason = 'subscription_ended'
-        WHERE sub_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
-      [subId],
-    );
-    return subscriptionView(row);
+    if ((await assertLiveRun(query, claims)).userId !== owner.user_id) throw new ToolRefused("turn_not_live", "the session changed hands");
+    let itemId: string | null = null;
+    if (itemArg) {
+      const found = await resolveWorkItem(query, owner.user_id, itemArg, { forUpdate: true });
+      if (!found.ok) throw new ToolRefused(found.error, found.message);
+      itemId = found.item.item_id;
+    }
+    const rows = (await query(
+      `SELECT id, item_id, reply_allowed FROM claw_work_item_subscriptions
+        WHERE user_id = $1 AND state = 'active' AND ($2::text IS NULL OR item_id = $2)
+          AND ($3::text IS NULL OR (lower(owner) = lower($3) AND lower(repo) = lower($4) AND number = $5))
+        ORDER BY id FOR UPDATE`,
+      [owner.user_id, itemId, ref?.owner ?? null, ref?.repo ?? null, ref?.number ?? null],
+    )).rows as Array<{ id: number | string; item_id: string; reply_allowed: boolean }>;
+    if (!rows.length) {
+      throw new ToolRefused("not_watching", itemId
+        ? `that item watches no${ref ? " such" : ""} pull request now: nothing to stop`
+        : "none of the user's items watches that pull request now: nothing to stop");
+    }
+    const ended: Array<{ sub_id: number; item_id: string; pr: string; auto_reply_was_on: boolean }> = [];
+    for (const r of rows) {
+      const view = await endSubscriptionIn(query, owner.user_id, r.item_id, Number(r.id));
+      if (view) ended.push({ sub_id: view.sub_id, item_id: view.item_id, pr: view.pr, auto_reply_was_on: r.reply_allowed === true });
+    }
+    return { ok: true as const, ended, note: UNSUBSCRIBED_NOTE };
   });
 }
+
+/**
+ * What the router is told of a watch whose automatic replies the user turned on themselves (the button on the item's card): the
+ * worker answers as them, at once, with no card. Said so the router never promises an approval that will not come.
+ */
+export const AUTO_REPLY_ON = "The user turned on automatic replies for it themselves: the worker answers new comments on the pull "
+  + "request as the user right away, with no approval card. Never say an answer waits for their approval; they can turn it off "
+  + "at any time (work_unsubscribe, or the button on the item's card).";
 
 /**
  * `work_subscribe`: the router has an item watch a pull request. Read-only: it never allows answers without asking, whatever the call
@@ -324,7 +390,7 @@ export async function workSubscribe(
     return {
       ok: true, sub_id: sub.sub_id, item_id: sub.item_id, pr: sub.pr, reply_allowed: sub.reply_allowed, created: sub.created,
       note: sub.reply_allowed
-        ? "New comments, reviews and failed CI on it now go to the item's worker, which may answer on the pull request."
+        ? `New comments, reviews and failed CI on it now go to the item's worker. ${AUTO_REPLY_ON}`
         : "New comments, reviews and failed CI on it now go to the item's worker. Its answers on GitHub wait for the user's approval unless the user allows automatic answers themselves.",
     };
   } catch (err) {
@@ -832,7 +898,7 @@ export function formatGithubEvents(events: readonly PendingEvent[]): string {
   lines.push(
     "Decide for each event whether it needs anything within this item's task, and do it."
     + (replyable
-      ? ` To answer on the pull request, call ${TOOL_NAME_PREFIX}pr_reply(event_id, body): it posts as the user, at most once per event, and only where the user allowed it.`
+      ? ` To answer on the pull request, call ${TOOL_NAME_PREFIX}pr_reply(event_id, body): it posts as the user, at most once per event, and only where the user allowed it. The user turned on automatic replies on this pull request themselves, so an answer goes out at once with no approval card; when you report, say plainly that you answered as the user under the automatic replies they turned on and give the answer's link (in Chinese: 已按你开启的自动回复以你的身份回复了 <link>), and never say an answer waits for or needed approval.`
       : " Answering on the pull request needs the user's approval for each comment (the github tools ask for it); do not try another way.")
     + ` When you are done and nothing needs the user, finish with ${TOOL_NAME_PREFIX}report(kind="waiting", summary) so the item keeps watching; report ready only for a new result the user should check.`,
   );
@@ -1105,7 +1171,7 @@ const definitelyNotWritten = (err: unknown): boolean =>
 export async function prReply(
   claims: AssistantTokenClaims,
   args: { event_id: string; body: string },
-): Promise<{ ok: true; status: "posted" | "already_posted"; url: string | null }> {
+): Promise<{ ok: true; status: "posted" | "already_posted"; url: string | null; note: string }> {
   if (claims.role !== "worker") throw new ToolRefused("not_allowed", `this tool is for the worker, not the ${claims.role}`);
   const body = String(args.body ?? "").trim();
   if (!body) throw new ToolRefused("invalid_arguments", "pr_reply needs a body");
@@ -1151,7 +1217,7 @@ export async function prReply(
     )).rows[0] as { attempt: number; created_at: Date };
     return { target: { ...t, sub_id: Number(t.sub_id), number: Number(t.number) } as ReplyTarget, attempt: Number(claimed.attempt), createdAt: claimed.created_at, retry: prior !== undefined };
   });
-  if ("done" in step) return { ok: true, status: "already_posted", url: step.done ?? null };
+  if ("done" in step) return { ok: true, status: "already_posted", url: step.done ?? null, note: POSTED_NOTE };
 
   const { target, attempt, createdAt, retry } = step;
   const release = () => db.query(
@@ -1202,13 +1268,13 @@ export async function prReply(
       const found = await findPosted(gh, token, target, createdAt);
       if (found !== null) {
         await posted(found.url, found.id);
-        return { ok: true, status: "already_posted", url: found.url };
+        return { ok: true, status: "already_posted", url: found.url, note: POSTED_NOTE };
       }
     }
     const answer = await gh.request<any>("POST", replyPath(target).post, { body: { body: `${withoutMarkers(body)}\n\n${replyMarker(eventId)}` } });
     const url = typeof answer.json?.html_url === "string" ? answer.json.html_url : null;
     await posted(url, answer.json?.id == null ? null : String(answer.json.id));
-    return { ok: true, status: "posted", url };
+    return { ok: true, status: "posted", url, note: POSTED_NOTE };
   } catch (err) {
     if (definitelyNotWritten(err)) {
       await release();

@@ -8,10 +8,11 @@
  */
 
 /**
- * router-proactive-v2: schedules with a confirmation card, job watches, pull requests watched by their items; v2: the week's brief
- * (a weekly report now, and a scheduled one), and job kinds the deployment adds.
+ * router-proactive-v3: schedules with a confirmation card, job watches, pull requests watched by their items; v2: the week's brief
+ * (a weekly report now, and a scheduled one), and job kinds the deployment adds; v3: automatic replies on a watched pull request are
+ * said as they are (no approval card), and work_unsubscribe stops a watch from the chat.
  */
-export const ROUTER_PROACTIVE_PROMPT_VERSION = "router-proactive-v2";
+export const ROUTER_PROACTIVE_PROMPT_VERSION = "router-proactive-v3";
 
 /** A kind of job the deployment adds (`CLAW_ASSISTANT_JOB_HTTP_SOURCES`), as the router is told of it. */
 export interface ProactiveJobKind { kind: string; description: string }
@@ -39,6 +40,8 @@ export function renderRouterProactiveSection(on: ProactiveParts): string {
   if (on.pullRequests) {
     lines.push(
       "- An item whose title or brief names a pull request in full (its link, or owner/repo#123) watches it from the start: comments, reviews and failed CI reach its worker, and work_create's result says watching. For an existing item, work_subscribe(item_id, pr) does the same. When the user hands you a pull request to look after (盯一下, keep an eye on, 有人评论就处理), say that its item watches it; when they only ask about one, you may offer to watch it in one short line.",
+      "- Automatic replies on a watched pull request: an item line that says auto-reply on means the user turned them on themselves (the button on the item's card); you cannot turn them on. Its worker then answers new comments on that pull request as the user right away, with no approval card: never say an answer will wait for their approval or a card, for that item. When its worker reports it answered, tell the user it was sent under the automatic replies they turned on, as the user, with the link to the answer (in Chinese: 已按你开启的自动回复以你的身份回复了 <link>); it is not a mistake and needs no apology. With auto-reply off, answers on GitHub wait for the user's approval as usual.",
+      "- work_unsubscribe(item_id?, pr?): the user wants an item to stop watching a pull request or to stop answering on it (别再自动回复 #381 了, 不用再盯这个 PR 了, stop replying to comments there). Call it at once with the item, the pull request (a bare #381 is the pull request of that number an item line shows as watched), or both; it ends the watch and the automatic replies with it. Then say in one line that it stopped. Never say this cannot be done, and never stop the item itself for it.",
     );
   }
   lines.push("A refusal from any of these is the answer: tell the user what it says; never say something was set up that was refused.");
