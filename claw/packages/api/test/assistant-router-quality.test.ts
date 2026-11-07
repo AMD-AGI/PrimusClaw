@@ -265,11 +265,12 @@ describe("router quality, pure", () => {
 describe("router quality, the prompt", () => {
   test("Q7 router-v10 and router-read-v7 say each rule", async () => {
     const p = await import("../src/assistant/prompts.js");
-    // router-v15 (this rule set, a long answer said whole, a say after the start notice added to it, one message a turn, progress read
-    // live, a follow-up with the earlier files); its review prompt is router-v19.
-    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v15");
+    // router-v16 (this rule set, a long answer said whole, a say after the start notice added to it, one message a turn, progress read
+    // live, a follow-up with the earlier files, progress from what the job wrote now with its age, a derived number from the unrounded
+    // values); its review prompt is router-v20.
+    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v16");
     assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v8");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v19");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v20");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): a say after it in the turn is added to that same message, so never repeat the start/],
@@ -280,6 +281,9 @@ describe("router quality, the prompt", () => {
       ["answer with the best candidate", /answer with the best candidate you found and say which detail you could not confirm/],
       ["progress is read live", /When the user asks how far an item got, what it is doing now, or when it will finish, look now: call work_recall\(item, "live"\)/],
       ["progress is never estimated", /Never work out how far it got or when it ends from when it started or how long it was expected to take/],
+      ["progress from what the job wrote now", /files_now, when it is there, is newer than the worker's steps[^\n]*answer from its latest line/],
+      ["the age of what progress is read from", /with that line's time and how long before now \(as_of\) it was/],
+      ["a derived number from the unrounded values", /A difference, ratio or percentage between results \(少了多少、百分之几、how much more\) is computed from the unrounded values, never from the rounded figures a report shows[^\n]*never subtract the rounded figures yourself/],
       ["a follow-up goes to the item that did it", /A follow-up on earlier work \(再算一次, 去掉某一类再算, 换个口径, do it for main too\) is for the item that did it: work_send it there while that item is open/],
       ["a new item for a follow-up has the earlier files", /the files the user sent earlier go with it \(Files the user sent earlier\), so never ask for them again/],
       ["start what a worker can find out", /So start the item, and do not ask the user for what the work can find out \(which repository, which file, which test\)/],

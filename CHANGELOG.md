@@ -39,6 +39,15 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- How far an item got is answered from what its job wrote at the question, not from the worker's last look at it: a worker checks a
+  long job only every minute or two, so its last tool output was up to two steps behind the log (2026-11-06 parity run, L1: "step 3/16"
+  while the log said step 5). While the item's run is going, `work_recall(item, "live")` also returns `files_now`: the tails of the
+  newest files of the worker's workspace, read from its running sandbox (never one started for it; hidden files and dependency trees
+  skipped; masked and cut), each with the time it was written, and the router answers from them with the line's time and how long ago
+  it was (`router-v16`).
+- A difference or percentage between two results is computed from the unrounded values: the router no longer subtracts the rounded
+  figures of two reports itself (2026-11-06 parity run, M2: 678.7 where the data gives 678.6) but asks the item that has the data, and
+  a worker rounds only the figure it reports (`worker-v6`).
 - A follow-up that starts a new item ("去掉 cancelled 再算一次") no longer leaves its worker without the file the user sent earlier: a new item
   gets a copy of the files the user sent in the last 24 hours of the conversation (`files_from_earlier_messages`), the router is told
   they will go with it, and it forwards a follow-up to the item that did the work while that item is open (`router-v15`).
