@@ -694,6 +694,7 @@ export async function executeSend(
       };
     }
     if (made.status === "rate_limited") return { ok: false, error: "rate_limited", message: "too many instructions in the last minute: try again in a minute" };
+    if (made.status === "gone") return { ok: false, error: "no_machine", message: "that machine is no longer connected" };
     for (const c of new Set(made.reclaimed.map((r) => r.connector_id))) wakeConnector(c);
     sessionId = String(made.session.session_id);
     fresh = true;
@@ -717,6 +718,7 @@ export async function executeSend(
     return out;
   });
   if (issued.status === "rate_limited") return { ok: false, error: "rate_limited", message: "too many instructions in the last minute: try again in a minute" };
+  if (issued.status === "gone") return { ok: false, error: "no_machine", message: "that machine is no longer connected" };
   wakeConnector(plan.connector_id);
   const row = (await db.query(
     "SELECT item_id, seq, title FROM claw_work_items WHERE worker_session_id = $1 AND user_id = $2", [remoteWorkerSessionId(sessionId), userId],
@@ -796,6 +798,14 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
   const out = await inTransaction(async (tx) => {
     await assertLiveRun(tx, claims);
     await tx("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [userId]);
+    // Read again under the machine's row lock: `planSend` read it before, and a revoke that committed since has already closed
+    // the cards it found (`closeCardsOfConnector`), so a card drawn now would wait for a machine that is gone. A revoke still
+    // running waits for this one instead, and closes the card it draws.
+    const live = (await tx(
+      "SELECT 1 FROM claw_remote_connectors WHERE connector_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL FOR SHARE",
+      [plan.connector_id, userId],
+    )).rows[0];
+    if (!live) throw new ToolRefused("no_machine", `the machine ${plan.machine} was removed from the user's development environments: nothing was sent`);
     return proposeConfirmation(tx, claims, userId, "devenv_send", params, {
       text: (ref) => sendCardText(plan, text, ref, zh), allowLabel: zh ? "发送" : "Send",
     });
@@ -805,6 +815,33 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
     ...proposed(out.row, out.subscribers, "sent"), machine: plan.machine, agent: plan.agent_id,
     why_card: refusal?.code ?? "confirm_first",
   };
+}
+
+/**
+ * The `devenv_send` cards of `owner` still waiting that would send to `connectorId`, closed: the machine was revoked (removed from
+ * their development environments), so pressing one could only fail, and the router must not keep putting it to them. Closed as
+ * `expired`, never answered (`decided_via` says why; `result.error` is the word a press now gets, `no_machine`), in the caller's
+ * transaction (`revokeConnector`). Returns the ids closed.
+ */
+export async function closeCardsOfConnector(q: Querier, owner: string, connectorId: string): Promise<string[]> {
+  // A card being pressed right now is skipped, never waited for: the press holds the card's lock while its send waits for the
+  // machine's, which this revoke holds, and the press waits on that send outside the database, so Postgres could not see the
+  // cycle and both would hang. That press finishes on its own after this revoke commits: its send reads the machine again under
+  // that lock (`enqueueCommand`), finds it revoked, queues nothing and fails the card.
+  // A Claw whose assistant never ran has no cards table, and its revoke must still work (a failed statement would abort the revoke).
+  if (!(await q("SELECT to_regclass('claw_assistant_confirmations') IS NOT NULL AS present")).rows[0]?.present) return [];
+  const closed = await q(
+    `UPDATE claw_assistant_confirmations
+        SET status = 'expired', decided_via = 'connector_revoked', decided_at = NOW(),
+            result = jsonb_build_object('error', 'no_machine', 'message', 'that machine was removed before the card was answered: nothing was sent')
+      WHERE confirmation_id IN (
+              SELECT confirmation_id FROM claw_assistant_confirmations
+               WHERE user_id = $1 AND kind = 'devenv_send' AND status = 'pending' AND params->>'connector_id' = $2
+                 FOR UPDATE SKIP LOCKED)
+      RETURNING confirmation_id`,
+    [owner, connectorId],
+  );
+  return (closed.rows as Array<{ confirmation_id: string }>).map((r) => r.confirmation_id);
 }
 
 /** A `devenv_send` card the person let through (`decideConfirmation`): sent now, as it showed it. */
