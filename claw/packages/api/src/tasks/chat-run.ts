@@ -669,7 +669,7 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
     // first needed: the assistant's modules import this one.
     if (CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_FIRST_ACK_USERS && (input.origin ?? "chat") === "chat") {
       void import("../assistant/lookup-ack.js")
-        .then((ack) => ack.armFirstAck(input.sessionId, input.messageId))
+        .then((ack) => ack.armFirstAck(input.sessionId, input.messageId, undefined, {}, input.userId))
         .catch((err) => logger.warn({ err, sessionId: input.sessionId }, "chat_run.first_ack_arm_failed"));
     }
     // On the insert's own transaction when there is one: a reference committed

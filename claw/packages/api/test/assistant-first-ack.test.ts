@@ -12,6 +12,9 @@
  *   F3  not for a person the setting does not name, a turn a report started, one that may hand a review off, one that ended, a worker's
  *       session, or with the setting off; the lookup line and this one are one line per turn, whichever comes first
  *   F4  a turn whose run waited in the queue: the line said while it waited is still the one its answer replaces
+ *   F5  a say the router started and that was refused does not hold the line back; one still being written does
+ *   F6  a message the route queues behind a running turn hears the line 3.5 s after it came in, before its run opens, and the
+ *       answer of the run that later carries it takes the line's place
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -42,6 +45,13 @@ describe("assistant first ack by the clock", { skip }, () => {
   });
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  /** The says once there is one, waiting up to `ms`: a loaded runner fires the timer late, never early. */
+  const saysWithin = async (ms: number) => {
+    const until = Date.now() + ms;
+    let rows = await says();
+    while (!rows.length && Date.now() < until) { await sleep(100); rows = await says(); }
+    return rows;
+  };
   const says = async () => w.q("SELECT text, fallback, say_id::text AS say_id, created_at FROM claw_assistant_says ORDER BY created_at");
   const message = (sessionId: string, mid: string, content: string, userId = "alice", context: Record<string, unknown> = {}) => w.q(
     "INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context) VALUES ($1, $2, $3, $4, $5::jsonb)",
@@ -75,14 +85,13 @@ describe("assistant first ack by the clock", { skip }, () => {
     const t = await opened("帮我把上周的进展整理成三句话");
     await sleep(3_000);
     assert.equal((await says()).length, 0, "nothing before the deadline");
-    await sleep(1_000);
-    const rows = await says();
+    const rows = await saysWithin(2_500);
     assert.equal(rows.length, 1, "one line at the deadline");
     assert.equal(rows[0].text, "收到，我看一下。");
     assert.equal(rows[0].fallback, true, "the system's words: not taken for the turn having answered");
     assert.equal(rows[0].say_id, ack.lookupAckSayId("alice", t.mid));
     const at = new Date(rows[0].created_at).getTime() - t.created.getTime();
-    assert.ok(at >= 3_500 && at < 4_000, `said at ${at} ms after the turn began`);
+    assert.ok(at >= 3_500 && at < 5_000, `said at ${at} ms after the turn began: from the deadline, within the 5 s target`);
     // The answer, at 4 s: it takes the line's place in the channel.
     await w.mod.outbound.recordAssistantSay({
       userId: "alice", sessionId: alice.routerSid, text: "上周：合入 3 个 PR，发布 v0.9，修了登录超时。", turnMessageId: t.mid, turnBegan: t.began,
@@ -147,6 +156,68 @@ describe("assistant first ack by the clock", { skip }, () => {
     assert.equal(ack.firstAckFor("bob", "alice,carol"), false);
     assert.equal(ack.firstAckFor("bob", ""), false);
     assert.equal(ack.firstAckText("帮我看看"), "收到，我看一下。");
+  });
+
+  test("F5 a refused say does not hold the line back; a say still being written does", async () => {
+    const say = (mid: string, status: string) => w.q(
+      "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, 'toolUsed', $3)",
+      [`claw-f5-${++seq}`, alice.routerSid, JSON.stringify({ type: "toolUsed", message_id: mid, tool: "mcp__assistant__say", status })],
+    );
+    const refused = await turn("我记住了哪些事");
+    await say(refused.mid, "start");
+    assert.equal(await first(alice.routerSid, refused.mid), "saying", "a say on its way");
+    await say(refused.mid, "error");
+    assert.equal(await first(alice.routerSid, refused.mid), "said", "the say was refused: nothing reached the person");
+    await w.q("TRUNCATE claw_assistant_says");
+    const again = await turn("我有哪些事项");
+    await say(again.mid, "start");
+    await say(again.mid, "error");
+    await say(again.mid, "start");
+    assert.equal(await first(alice.routerSid, again.mid), "saying", "written again and still on its way");
+  });
+
+  test("F6 a message queued behind a running turn hears the line 3.5 s after it came in, and its answer replaces it", async () => {
+    await w.subscribe("alice");
+    const Fastify = (await import("fastify")).default;
+    const { registerSessionRoutes } = await import("../src/routes/sessions.js");
+    // A turn is running (a worker's report being read): the person's message queues behind it.
+    await w.openRun(alice.routerSid, { messageId: "claw-report-turn" });
+    const app = Fastify();
+    app.addHook("preHandler", async (req) => {
+      (req as unknown as { user: unknown }).user = { userId: "alice", userName: "Alice", roles: ["default"], platformKey: "pk", virtualKey: "vk" };
+    });
+    await registerSessionRoutes(app);
+    await app.ready();
+    let mid: string;
+    const sent = Date.now();
+    try {
+      const res = await app.inject({ method: "POST", url: `/v1/sessions/${alice.routerSid}/messages`, payload: { content: "我的事项都怎么样了" } });
+      const body = res.json() as { queued?: boolean; message_id?: string };
+      assert.equal(body.queued, true, "queued behind the running turn");
+      mid = body.message_id!;
+    } finally { await app.close(); }
+    assert.match(mid, /^claw-pending-\d+$/);
+    await sleep(3_000);
+    assert.equal((await says()).length, 0, "nothing before the deadline");
+    const rows = await saysWithin(2_500);
+    assert.deepEqual(rows.map((r) => [r.text, r.fallback]), [["收到，我看一下。", true]], "the line, with no run open yet");
+    assert.equal(rows[0].say_id, ack.lookupAckSayId("alice", mid));
+    const at = new Date(rows[0].created_at).getTime() - sent;
+    assert.ok(at >= 3_400 && at < 5_000, `said ${at} ms after the message was sent: from its arrival, within the 5 s target`);
+    // The report turn ends; the drain opens the message's run under its id, and the answer replaces the line.
+    await w.q("UPDATE claw_tasks SET status = 'completed', completed_at = NOW() WHERE metadata->>'message_id' = 'claw-report-turn'");
+    await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [alice.routerSid]);
+    const run = await chatRun.openChatRun({
+      dispatch: "fat", sessionId: alice.routerSid, userId: "alice", messageId: mid, prompt: "我的事项都怎么样了", recordWorkspaceUse: false,
+    });
+    const began = (await w.q("SELECT started_at FROM claw_tasks WHERE task_id = $1", [run!.taskId]))[0].started_at;
+    await w.mod.outbound.recordAssistantSay({
+      userId: "alice", sessionId: alice.routerSid, text: "你有 2 个事项在进行。", turnMessageId: mid, turnBegan: began,
+    }, w.sayDeps);
+    const answer = (await w.q("SELECT payload FROM claw_notification_outbox WHERE payload->>'text' = '你有 2 个事项在进行。'"))[0];
+    assert.equal(answer.payload.replaces, ack.lookupAckSayId("alice", mid), "one message: the answer edits the line");
+    // The run's own timer, armed when it opened, finds the line said.
+    assert.equal(await first(alice.routerSid, mid), "spoke");
   });
 
   test("F4 a turn whose run waited in the queue: the answer still replaces the line said while it waited", async () => {
