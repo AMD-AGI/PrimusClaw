@@ -55,6 +55,9 @@
  *       instruction the machine refused, a session that closed before it finished); nothing else (an approval answered is not news)
  *   N2  the sessions list says what each active session waits on its user for now: a request asked and not yet answered, once even
  *       when sent again; not one answered, nor one from a turn that has ended; nothing of anyone else's
+ *   NL1 a new session asked for (new_session) is never one already open, beside the session named when one is; a folder written with ~
+ *       is read in the home folder the agent's roots are in, and must still be under a root
+ *   NL2 ~ is read in the one home folder the roots show, never guessed
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -1084,6 +1087,67 @@ describe("development environment items and devenv_send", { skip }, () => {
     }
   });
 
+  test("NL1 a new session asked for is never one already open, and a folder written with ~ is read in the machine's home", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop", {
+      agents: [{ ...CLAUDE, capabilities: { roots: ["/home/u/repo", "/home/u/work"] } }],
+    });
+    const idle = await chatSession("alice", cid);
+    // Without new_session an idle session of that agent continues; with it, a new one is opened beside it.
+    const plain = await tools.planSend("alice", { text: "看看", agent: "claude" });
+    assert.ok(plain.ok && plain.plan.session_id === idle, JSON.stringify(plain));
+    const fresh = await sendByCard(await userTurn(alice, "新开一个会话看看"), { text: "看看", agent: "claude", new_session: true });
+    assert.equal(fresh.status, "done", JSON.stringify(fresh));
+    assert.notEqual(fresh.session_id, idle, "a new session, not the idle one");
+    const cmds = await queued(cid);
+    assert.deepEqual(cmds.map((c: Recorded) => c.type), ["session.new", "prompt"]);
+    assert.equal(cmds[0].payload.cwd, "/home/u/repo");
+    // Naming the open session with new_session: a new one beside it, on its machine and with its agent.
+    const beside = await tools.planSend("alice", { text: "看看", target: idle, new_session: true });
+    assert.ok(beside.ok && beside.plan.session_id === null && beside.plan.agent_id === "claude", JSON.stringify(beside));
+
+    // ~/work is /home/u/work there (the roots show the home folder); the card shows the folder as the machine names it.
+    const tilde = await tools.planSend("alice", { text: "看看", agent: "claude", cwd: "~/work", new_session: true });
+    assert.ok(tilde.ok, JSON.stringify(tilde));
+    assert.deepEqual([tilde.plan.cwd, tilde.plan.session_id], ["/home/u/work", null]);
+    const shown = await tools.devenvSend(await userTurn(alice, "新开一个会话在 ~/work 里看看"), { text: "看看", agent: "claude", cwd: "~/work", new_session: true });
+    const card = (await w.q("SELECT params FROM claw_assistant_confirmations WHERE confirmation_id = $1", [shown.confirmation_id]))[0];
+    assert.equal(card.params.cwd, "/home/u/work");
+    // ~ alone is the home folder, which is outside the roots: no agent may work there, and nothing is planned.
+    const home = await tools.planSend("alice", { text: "看看", agent: "claude", cwd: "~" });
+    assert.ok(!home.ok && /may work in ~/.test(home.message), JSON.stringify(home));
+    // ~/elsewhere is outside the roots too.
+    const outside = await tools.planSend("alice", { text: "看看", agent: "claude", cwd: "~/elsewhere" });
+    assert.ok(!outside.ok && /may work in ~\/elsewhere/.test(outside.message));
+    // An idle session in ~/repo continues when no new one was asked for: ~/repo and its /home/u/repo are the same folder.
+    const same = await tools.planSend("alice", { text: "看看", agent: "claude", cwd: "~/repo" });
+    assert.ok(same.ok && same.plan.session_id === idle, JSON.stringify(same));
+    // A Windows machine: ~/repo under C:\Users\a is placed under its root and sent as the root spells it.
+    await machine("alice", "winbox", { agents: [{ ...CLAUDE, agent_id: "claude", capabilities: { roots: ["C:\\Users\\a\\repo"] } }] });
+    const win = await tools.planSend("alice", { text: "看看", target: "winbox", cwd: "~/repo/api", new_session: true });
+    assert.ok(win.ok && win.plan.cwd === "C:\\Users\\a\\repo\\api", JSON.stringify(win));
+    // "laptop/claude": the agent named by the label's second part.
+    const byLabel = await tools.planSend("alice", { text: "看看", target: "laptop/claude", new_session: true });
+    assert.ok(byLabel.ok && byLabel.plan.agent_id === "claude" && byLabel.plan.session_id === null);
+  });
+
+  test("NL2 ~ is read in the one home folder the agent's roots show, never guessed", () => {
+    assert.equal(tools.folderOf("~/repo", ["/home/yihan/repo"]), "/home/yihan/repo");
+    assert.equal(tools.folderOf("~/repo/", ["/home/yihan/work", "/home/yihan"]), "/home/yihan/repo");
+    assert.equal(tools.folderOf("~", ["/root/work"]), "/root");
+    assert.equal(tools.folderOf("~/x", ["/Users/me/code"]), "/Users/me/x");
+    assert.equal(tools.folderOf("/srv/a", ["/home/yihan"]), "/srv/a", "an absolute folder is as it was asked");
+    assert.equal(tools.folderOf("~/repo", ["/srv/work"]), null, "no root shows a home folder");
+    assert.equal(tools.folderOf("~/repo", ["/home/a/x", "/home/b/y"]), null, "two homes: not guessed");
+    // Windows: the home a root sits in, with the root's separator (codex round 3).
+    assert.equal(tools.folderOf("~/repo", ["C:\\Users\\alice\\repo"]), "C:\\Users\\alice\\repo");
+    assert.equal(tools.folderOf("~/repo/web", ["C:\\Users\\alice\\code"]), "C:\\Users\\alice\\repo\\web");
+    assert.equal(tools.folderOf("~/x", ["D:/Users/bob/w"]), "D:/Users/bob/x");
+    assert.equal(tools.folderOf("~/x", ["C:\\Users\\alice\\a", "c:/users/ALICE/b"]), "C:\\Users\\alice\\x", "one home, two spellings");
+    assert.equal(tools.folderOf("~/x", ["C:\\work"]), null, "a drive root shows no home");
+  });
+
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {
     const section = prompts.renderRouterDevenvSection({ actions: true, send: true });
     assert.match(section, /devenv_send, called directly and first, never after devenv_list/);
@@ -1091,7 +1155,12 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v5");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v6");
+    // The plain-words control: a new session, a session named by when it was used, back to the assistant with nothing to run.
+    assert.match(section, /new_session: true when they ask for a new session/);
+    assert.match(section, /昨天那个会话/);
+    assert.match(section, /回到助理[^\n]*Call nothing/);
+    assert.match(section, /switching only moves the chat/);
     // What operators and release notes say Claw may run on a user's machine is what the code does: a card, never from the turn.
     const { readFileSync } = await import("node:fs");
     const doc = readFileSync(new URL("../../../docs/remote-agents.md", import.meta.url), "utf8");

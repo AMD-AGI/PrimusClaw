@@ -409,7 +409,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
 /** The longest instruction the router may send in one call: the card that may show it is read on a phone. */
 export const SEND_TEXT_MAX = 2000;
 
-export interface DevenvSendArgs { text?: unknown; agent?: unknown; target?: unknown; cwd?: unknown }
+export interface DevenvSendArgs { text?: unknown; agent?: unknown; target?: unknown; cwd?: unknown; new_session?: unknown }
 
 /** Where an instruction goes: one machine of the user's, one agent on it, and the session (an open one, or a new one in `cwd`). */
 export interface SendPlan {
@@ -476,6 +476,39 @@ function placeIn(cwd: string, root: string): string | null {
 const samePlace = (a: string | null, placed: string): boolean =>
   a !== null && (a === placed || (isWindowsPath(placed) && isWindowsFolder(a) && windowsForm(a).toLowerCase() === windowsForm(placed).toLowerCase()));
 
+/**
+ * The home folder a root sits in (`/home/yihan/work` -> `/home/yihan`, `/root` -> `/root`, `C:\Users\a\repo` -> `C:\Users\a`), else
+ * null. A Windows home is compared as Windows compares (any case, either separator) and kept as the root spells it.
+ */
+const HOME_RE = /^(\/root|\/home\/[^/]+|\/Users\/[^/]+)(?:\/|$)/;
+const WINDOWS_HOME_RE = /^([A-Za-z]:[\\/]Users[\\/][^\\/]+)(?:[\\/]|$)/i;
+const homeOf = (root: string): string | null => HOME_RE.exec(root)?.[1] ?? WINDOWS_HOME_RE.exec(root)?.[1] ?? null;
+
+/**
+ * The folder `asked` means on a machine whose agent may work in `roots`: as it was asked, unless it is `~` or `~/x`, which is read in
+ * the home folder the roots are in (the connector expands `~` in its roots to the home folder of the account it runs as, which Claw is
+ * not told: the roots show it). Null when `~` was asked and no root shows a home folder, or the roots show more than one.
+ */
+export function folderOf(asked: string, roots: readonly string[]): string | null {
+  const flatAsked = asked.trim();
+  if (flatAsked !== "~" && !flatAsked.startsWith("~/")) return flatAsked;
+  const found = roots.map(homeOf).filter((h): h is string => h !== null);
+  // One home, however its roots spell it (C:\Users\a and c:/users/a are one folder on Windows).
+  const byKey = new Map<string, string>();
+  for (const h of found) {
+    const k = isWindowsPath(h) ? windowsForm(h).toLowerCase() : h;
+    if (!byKey.has(k)) byKey.set(k, h);   // (spelled as the first root that shows it)
+  }
+  const homes = [...byKey.values()];
+  if (homes.length !== 1) return null;
+  const home = homes[0];
+  const rest = flatAsked.slice(1).replace(/^[\\/]+/, "").replace(/[\\/]+$/, "");
+  if (!rest) return home;
+  // On Windows the folder is written with the home's own separator, as placeIn spells a folder under a root.
+  const sep = isWindowsPath(home) && home.includes("\\") && !home.includes("/") ? "\\" : "/";
+  return `${home}${sep}${rest.split(/[\\/]+/).join(sep)}`;
+}
+
 type PlanOutcome =
   | { ok: true; plan: SendPlan }
   | { ok: false; code: string; message: string; choices?: string[]; read: boolean; data?: Record<string, unknown> };
@@ -492,6 +525,10 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
   // A trailing slash dropped (not a Windows drive's own: `C:/` is a root, `C:` is not a path); placeIn compares Windows paths whole.
   const cwdTyped = typeof args.cwd === "string" ? args.cwd.trim() : "";
   const cwdAsked = !cwdTyped ? null : isWindowsPath(cwdTyped) ? cwdTyped : cwdTyped.replace(/\/+$/, "") || "/";
+  // "A new session": never one already open, and never the agent's own conversation on the machine, whatever else fits.
+  const fresh = args.new_session === true;
+  /** The folder the user asked for, as `agent`'s machine names it (`~` in its home folder), else null. */
+  const cwdFor = (agent: Row): string | null => (cwdAsked === null ? null : folderOf(cwdAsked, rootsOf(agent)));
   const [connectors, open] = await Promise.all([
     listConnectors(userId, onlineWindowMs),
     sessionActivity(userId, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser),
@@ -552,13 +589,19 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
   // A session named exactly: by its id or ref, or by its label.
   if (target) {
     const bySession = named.find((n) => n.session_id?.toLowerCase() === targetLower || n.resume_ref?.toLowerCase() === targetLower || n.label.toLowerCase() === targetLower);
-    if (bySession) return fromSession(bySession);
+    if (bySession && !fresh) return fromSession(bySession);
   }
   // Else machines: the one named, else all of them; and on them the agents named, else all.
   let machines = connectors;
+  // A new session beside one the user named: on that session's machine, with its agent unless they named another.
+  let agentWanted = agentAsked;
   if (target) {
     const machineOf = targetLower.split("/")[0];
-    machines = connectors.filter((c) => nameOf(c).toLowerCase() === machineOf);
+    const sessionMachine = named.find((n) => n.session_id?.toLowerCase() === targetLower || n.resume_ref?.toLowerCase() === targetLower);
+    machines = sessionMachine ? [sessionMachine.c] : connectors.filter((c) => nameOf(c).toLowerCase() === machineOf);
+    if (sessionMachine && !agentWanted) agentWanted = lowerFlat(sessionMachine.agent?.agent_id);
+    // "yihan-dev-pod/codex": the agent is the second part, as devenv_list labels a session.
+    if (!agentWanted && targetLower.includes("/")) agentWanted = targetLower.split("/")[1] ?? "";
     if (!machines.length) machines = connectors.filter((c) => nameOf(c).toLowerCase().includes(machineOf));
     if (!machines.length) {
       return { ok: false, code: "no_machine", read: true, choices: connectors.map(nameOf), message: `no machine of the user is named ${flat(target, 80)}` };
@@ -572,9 +615,11 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
       data: { connect_a_machine: { commands: setup.steps.map((s) => s.command), text_en: setup.text.en, text_zh: setup.text.zh } },
     };
   }
-  // Each agent with the folder it would work in: the one asked for, placed under the first of its roots that holds it; else its first root.
-  const pairs = machines.flatMap((c) => agentsNamed(c, agentAsked).map((a) => {
-    const placed = cwdAsked ? rootsOf(a).map((r) => placeIn(cwdAsked, r)).find((x) => x !== null) ?? null : null;
+  // Each agent with the folder it would work in: the one asked for (`~` read in the agent's home folder), placed under the first of
+  // its roots that holds it; else its first root.
+  const pairs = machines.flatMap((c) => agentsNamed(c, agentWanted).map((a) => {
+    const asked = cwdFor(a);
+    const placed = asked ? rootsOf(a).map((r) => placeIn(asked, r)).find((x) => x !== null) ?? null : null;
     return { c, a, placed };
   })).filter((p) => !cwdAsked || p.placed !== null);
   if (!pairs.length) {
@@ -589,7 +634,7 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
   // An agent that only takes over the agent's own conversations on that machine (`kind: attach`) cannot start a session: its
   // connector refuses one without a conversation to take over. It is chosen only to continue its idle session open through Claw;
   // its conversations are taken over by naming one (target).
-  const continues = (p: (typeof reachable)[number]) => named.some((n) => n.c === p.c && n.session_id && n.agent?.agent_id === p.a.agent_id
+  const continues = (p: (typeof reachable)[number]) => !fresh && named.some((n) => n.c === p.c && n.session_id && n.agent?.agent_id === p.a.agent_id
     && !n.busy && (!cwdAsked || (p.placed !== null && samePlace(n.cwd, p.placed))));
   const online = reachable.filter((p) => String(p.a.kind) !== "attach" || continues(p));
   if (!online.length) {
@@ -618,8 +663,8 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
   const { c, a, placed } = online[0];
   const cwd = placed ?? rootsOf(a)[0] ?? null;
   if (!cwd) return { ok: false, code: "no_folder", read: true, choices: [`${nameOf(c)}/${String(a.agent_id)}`], message: "that agent names no folder it may work in" };
-  // An idle session of that agent open through Claw, in that folder, continues; else a new one.
-  const idle = named.find((n) => n.c === c && n.session_id && n.agent?.agent_id === a.agent_id && !n.busy && (!cwdAsked || samePlace(n.cwd, cwd)));
+  // An idle session of that agent open through Claw, in that folder, continues (unless a new one was asked for); else a new one.
+  const idle = fresh ? undefined : named.find((n) => n.c === c && n.session_id && n.agent?.agent_id === a.agent_id && !n.busy && (!cwdAsked || samePlace(n.cwd, cwd)));
   if (idle) return fromSession(idle);
   // A new session: not on a connector below the minimum version (an open one it already has continues).
   if (versionVerdict(c.version).version_status === "unsupported") return outdated(c);
