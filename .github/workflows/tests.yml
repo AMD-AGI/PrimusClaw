@@ -371,7 +371,7 @@ jobs:
           else
             env -u IS_SANDBOX "CLAW_REAL_CLAUDE_ACP=$adapter" "$node" --import tsx --test test/real-modes.test.ts | tee "$RUNNER_TEMP/real.log"
           fi
-          grep -q "^ℹ pass 4$" "$RUNNER_TEMP/real.log"
+          grep -q "^ℹ pass 5$" "$RUNNER_TEMP/real.log"
 
   sandbox:
     name: Sandbox (Go)
