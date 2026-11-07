@@ -903,6 +903,32 @@ describe("assistant outbound", { skip }, () => {
       assert.equal(shown().length, 1, "published once");
     });
 
+    test("the system's own message is published once when a sweep elsewhere tries to show it while it is being published", async () => {
+      const own = await assistantOf();
+      const itemId = await answeredItem("后台运行 slow_job.sh", "RESULT=86972");
+      let other: Promise<boolean> | null = null;
+      const racing = deps({
+        publishSessionEvent: async (sessionId, event) => {
+          // Another replica's sweep, between this publish's claim and its event.
+          other = outbound.reshowFallback({ itemId }, deps());
+          await other;
+          events.push({ sessionId, event });
+        },
+      });
+      assert.ok(await outbound.recordNeedsYouFallback({ itemId }, racing));
+      assert.equal(await other, false, "the other sweep found it claimed");
+      assert.deepEqual(shown().map((e) => e.session), [own.sessionId], "one event");
+      assert.equal(await sweep(), 0);
+
+      // The other order: a sweep elsewhere shows an answer said whole after it was stored, before its own announcement runs.
+      const whole = await answeredItem("jobs.csv 汇总", "39,144.2");
+      const stored = await outbound.storeAnswerWhole((t: string, p?: unknown[]) => q(t, p ?? []) as never, whole, deps());
+      assert.ok(stored);
+      assert.equal(await outbound.reshowFallback({ itemId: whole }, deps()), true);
+      await stored!.announce();
+      assert.equal(shown().filter((e) => e.text.includes("39,144.2")).length, 1, "the announcement finds it shown and publishes nothing");
+    });
+
     test("one said in a session deleted before its event was published told nobody", async () => {
       const own = await assistantOf();
       const itemId = await answeredItem("后台运行 slow_job.sh", "RESULT=86972");

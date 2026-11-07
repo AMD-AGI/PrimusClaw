@@ -230,21 +230,37 @@ async function announce(stored: Stored, deps: SayDeps, turnMessageId?: string, h
 export async function publishSayEvent(
   sessionId: string, sayId: string, payload: AssistantSayPayload | WorkItemNeedsYouPayload, deps: SayDeps, turnMessageId?: string,
 ): Promise<void> {
+  // Shown in a session that is still there is what tells a user with no channel (the silent sweep's `told`): the message is claimed
+  // for the session first, so it is published there at most once whoever else tries (`reshowFallback`, another replica), and the claim
+  // is let go when the publish fails. A message another publish claimed is not published again. A session deleted meanwhile is read
+  // by nobody: published unrecorded, as is everything when the claim cannot be made at all.
+  let claimed = false;
+  try {
+    claimed = ((await db.query(
+      `UPDATE claw_assistant_says SET session_id = $2
+        WHERE say_id = $1 AND session_id IS NULL
+          AND EXISTS (SELECT 1 FROM claw_sessions WHERE session_id = $2 AND deleted_at IS NULL)`,
+      [sayId, sessionId],
+    )).rowCount ?? 0) > 0;
+    if (!claimed && (await db.query(
+      "SELECT 1 FROM claw_assistant_says WHERE say_id = $1 AND session_id IS NOT NULL", [sayId],
+    )).rowCount) return;
+  } catch (err) {
+    logger.warn({ err, sayId }, "assistant.say_shown_record_failed");
+  }
   try {
     await sendSayEvent(sessionId, sayId, payload, deps, turnMessageId);
   } catch (err) {
     // The message is stored and queued; a web client that missed the live event reads it later.
     logger.error({ err, sayId }, "assistant.say_event_publish_failed");
-    return;
+    if (claimed) await releaseShown(sayId, sessionId);
   }
-  // Shown: in a session that is still there, which is what tells a user with no channel (the silent sweep's `told`). A session
-  // deleted meanwhile is read by nobody, and a failed publish showed nothing; neither is recorded.
-  await db.query(
-    `UPDATE claw_assistant_says SET session_id = $2
-      WHERE say_id = $1 AND session_id IS NULL
-        AND EXISTS (SELECT 1 FROM claw_sessions WHERE session_id = $2 AND deleted_at IS NULL)`,
-    [sayId, sessionId],
-  ).catch((err) => logger.warn({ err, sayId }, "assistant.say_shown_record_failed"));
+}
+
+/** A claim to have shown the message in the session, let go: nothing was shown. */
+async function releaseShown(sayId: string, sessionId: string): Promise<void> {
+  await db.query("UPDATE claw_assistant_says SET session_id = NULL WHERE say_id = $1 AND session_id = $2", [sayId, sessionId])
+    .catch((err) => logger.error({ err, sayId }, "assistant.say_shown_release_failed"));
 }
 
 /** The event itself; throws when it was not published. */
@@ -723,14 +739,13 @@ export async function reshowFallback(input: { itemId: string }, deps: SayDeps = 
     [sayId, where.sessionId],
   )).rows[0] as { text: string; created_at: Date } | undefined;
   if (!claimed) return false;
-  if (await eventInSession(where.sessionId, sayId)) return true;
   const m: ToStore = { type: "work_item.needs_you", sayId, userId: item.user_id, sessionId: where.sessionId, text: claimed.text, item };
   try {
-    await sendSayEvent(where.sessionId, sayId, payloadOf(m, claimed.created_at), deps);
+    if (!(await eventInSession(where.sessionId, sayId))) await sendSayEvent(where.sessionId, sayId, payloadOf(m, claimed.created_at), deps);
     return true;
   } catch (err) {
     logger.error({ err, sayId }, "assistant.say_event_publish_failed");
-    await db.query("UPDATE claw_assistant_says SET session_id = NULL WHERE say_id = $1 AND session_id = $2", [sayId, where.sessionId]);
+    await releaseShown(sayId, where.sessionId);
     return false;
   }
 }
