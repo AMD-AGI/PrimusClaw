@@ -262,7 +262,9 @@ export function answerDelegation(
     const token = signJwt({
       key,
       claims: {
-        iss: fake.issuer, aud: audience, sub: subject.sub, client_id: clientId, act: { sub: clientId },
+        // As primus-identity does: a subject token that was itself delegated keeps its actor under this one (RFC 8693 4.1).
+        iss: fake.issuer, aud: audience, sub: subject.sub, client_id: clientId,
+        act: { sub: clientId, ...(subject.act !== undefined ? { act: subject.act } : {}) },
         ...(subject.gid !== undefined ? { gid: subject.gid } : {}),
         scope, jti: `delegated-${++counter}`, iat, nbf: iat - 1, exp: iat + lifetime,
       },

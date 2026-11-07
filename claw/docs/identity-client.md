@@ -128,13 +128,14 @@ accepts. The code is `packages/api/src/auth/identity-token.ts`; it verifies with
 | `CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE` | `safe.api` | The scope of that token |
 | `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` | none | The platform roles a token the provider confirms may confer: `system-admin` and/or `system-admin-readonly`, separated by commas or spaces. Any other name is ignored. See "Administrators" below |
 | `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` | none | SaFE deployment mode: the client ids of the services whose delegated token (RFC 8693 `act`) may bring the person's own `ak-` key in `x-api-key`, separated by commas or spaces and compared exactly as the provider signed the token's `client_id`. Empty: no service may, and a delegated token has no keys, as before. See "A service that brings the person's own key" below |
+| `CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS` | none | SaFE deployment mode: the client ids of the services whose delegated token is exchanged once more for the keys SaFE holds for its subject, separated by commas or spaces and compared exactly as signed. Empty: a delegated token is not exchanged, as before. See "A service that holds no key of the person" below |
 
 These are read on each request. In the chart they are `identity.tokenAuth.enabled`,
 `.audience`, `.scope`, `.introspect`, `.delegationAudience`, `.delegationScope` and `.trustedRoles` (a list), rendered into the
 API Deployment only; `identity.tokenAuth.enabled` without `identity.enabled` is
 refused at render time, and so is a `trustedRoles` entry that is not one of the two
-adoptable roles. `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` is not in the chart: set it as an environment
-variable of the API, as `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` is.
+adoptable roles. `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` and `CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS` are not in the chart: set them as environment
+variables of the API, as `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` is.
 
 **What a token must be.** Typed `at+jwt` in its JOSE header, signed RS256 or ES256
 by a key in the issuer's key set, issued by the configured issuer, naming
@@ -225,6 +226,17 @@ the table above. A Bearer value shaped like a JWT is still final (see "How it co
 never judged as a credential of its own: a key alone, in either header, is still only what it was (a key caller:
 `method` is `api_key` or `x_api_key`, never `identity_token`).
 
+**A service that holds no key of the person (SaFE deployment mode).** A chat service that speaks for a person
+through a binding the person confirmed at the provider (a chat user who never linked a key) has nothing to bring.
+For a service the operator named in `CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS`, a delegated token without
+`x-api-key` is treated as a token that is not delegated is: the API exchanges it once more at the provider for SaFE's
+audience and shows SaFE the result, so the caller has the keys SaFE holds for the token's `sub` (their own virtual key,
+billed to them) with every answer and every refusal of "Keys for a token's user". The provider keeps the service in
+the new token's actor chain (`act: {sub: <this API>, act: {sub: <the service>}}`), so SaFE still sees this API as the
+actor it was told to accept. A key the service does bring is the one used, as above; and the caller is still a
+service acting for the person (`delegation` is recorded). Not named (the default), or a client id that only looks like
+a named one: no exchange and no keys, as before.
+
 The service must also be in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` when GitHub review is on: a process whose
 `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` names a client that list does not refuses to start (see
 [github-review.md](github-review.md)). The other way round is allowed: a service that only answers held merges needs
@@ -246,7 +258,9 @@ What has to be set up, and what is not done:
   SaFE needs no name of this API beyond that client id.
 - A token that is itself delegated (RFC 8693, with an `act` claim: a service acting for the person) is
   not exchanged again. Such a caller has no keys, unless the service is one the operator named in
-  `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` and brings the person's own key (above).
+  `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` and brings the person's own key, or one named in
+  `CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS` (above). For the latter the provider must also let this API's
+  client exchange tokens issued for its audience by that service (`subjectAudiences` `claw-api` covers it).
 - The person's token is not forwarded to SaFE by any route. The MCP tool that lists models, which sends the
   caller's own `Authorization` header to SaFE, sends such a caller's platform key instead (nothing if they have none).
 - The roles in SaFE's answer are ignored, as the token's are: only
