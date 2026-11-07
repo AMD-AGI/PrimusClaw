@@ -922,6 +922,10 @@ record it.
   once the person confirms (#423, connector part); a fresh install trusts the machine's CA store without `NODE_USE_SYSTEM_CA` (#443);
   every command answers `-h`/`--help` and an unknown option exits 2 (#440); a crash that damages `connector.json` no longer
   registers the machine as a new connector (#446).
+- `@primusclaw/connector` 0.1.9: a message from the chat can be typed into a conversation open in a tmux terminal instead of
+  only watching it (#451, connector part), and a tmux client that exits before reading that input fails the run instead of
+  crashing the connector on EPIPE (#473); a 401 during Claw's auth outage no longer stops the connector for good (#453); `doctor`
+  checks that an API-key Codex agent is signed in, as its sessions open (#462).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
