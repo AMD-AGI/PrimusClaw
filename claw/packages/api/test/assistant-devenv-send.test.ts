@@ -1289,6 +1289,16 @@ describe("development environment items and devenv_send", { skip }, () => {
     await machine("alice", "winbox", { agents: [{ ...CLAUDE, agent_id: "claude", capabilities: { roots: ["C:\\Users\\a\\repo"] } }] });
     const win = await tools.planSend("alice", { text: "看看", target: "winbox", cwd: "~/repo/api", new_session: true });
     assert.ok(win.ok && win.plan.cwd === "C:\\Users\\a\\repo\\api", JSON.stringify(win));
+    // A new session beside a session whose agent its machine no longer offers: refused, never another agent of that machine (codex
+    // round 5 of #417). Named with the agent, it is that agent's.
+    const two = await machine("alice", "twobox", { agents: [CLAUDE, { agent_id: "codex", kind: "codex", name: "Codex", capabilities: { roots: ["/home/u/repo"] } }] });
+    const codexSid = (await post("alice", "/v1/remote-agents/sessions", { connector_id: two, agent_id: "codex", cwd: "/home/u/repo" })).body.data.session_id;
+    await store.recordHeartbeat(two, "alice", { version: "0.1.3", cmdCursor: null, agents: [CLAUDE] as never });
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [two]);
+    const gone = await tools.planSend("alice", { text: "看看", target: codexSid, new_session: true });
+    assert.ok(!gone.ok && gone.code === "no_agent", JSON.stringify(gone));
+    const named = await tools.planSend("alice", { text: "看看", target: codexSid, agent: "claude", new_session: true });
+    assert.ok(named.ok && named.plan.agent_id === "claude" && named.plan.session_id === null, JSON.stringify(named));
     // "laptop/claude": the agent named by the label's second part.
     const byLabel = await tools.planSend("alice", { text: "看看", target: "laptop/claude", new_session: true });
     assert.ok(byLabel.ok && byLabel.plan.agent_id === "claude" && byLabel.plan.session_id === null);

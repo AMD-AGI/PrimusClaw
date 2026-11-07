@@ -614,7 +614,13 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
     const machineOf = targetLower.split("/")[0];
     const sessionMachine = named.find((n) => n.session_id?.toLowerCase() === targetLower || n.resume_ref?.toLowerCase() === targetLower);
     machines = sessionMachine ? [sessionMachine.c] : connectors.filter((c) => nameOf(c).toLowerCase() === machineOf);
-    if (sessionMachine && !agentWanted) agentWanted = lowerFlat(sessionMachine.agent?.agent_id);
+    if (sessionMachine && !agentWanted) {
+      // A new session beside it runs its agent: one its machine no longer offers is refused, never swapped for another agent there.
+      if (!sessionMachine.agent) {
+        return { ok: false, code: "no_agent", read: true, choices: [sessionMachine.label], message: `the agent of ${sessionMachine.label} is no longer offered by its machine: name the agent for a new session` };
+      }
+      agentWanted = lowerFlat(sessionMachine.agent.agent_id);
+    }
     // "yihan-dev-pod/codex": the agent is the second part, as devenv_list labels a session.
     if (!agentWanted && targetLower.includes("/")) agentWanted = targetLower.split("/")[1] ?? "";
     if (!machines.length) machines = connectors.filter((c) => nameOf(c).toLowerCase().includes(machineOf));
