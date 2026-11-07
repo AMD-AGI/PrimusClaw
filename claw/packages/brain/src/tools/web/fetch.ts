@@ -260,15 +260,62 @@ function isSameHost(a: URL, b: URL): boolean {
 
 // ── HTML → Markdown conversion ──
 
-type TurndownLike = new (opts: Record<string, string>) => { turndown: (html: string) => string };
+interface TurndownNode { nodeName: string; getAttribute?: (name: string) => string | null }
+type TurndownLike = new (opts: Record<string, string>) => {
+  turndown: (html: string) => string;
+  addRule: (key: string, rule: { filter: (node: TurndownNode) => boolean; replacement: (content: string, node: TurndownNode) => string }) => void;
+};
 let TurndownCtor: TurndownLike | null = null;
 
-async function htmlToMarkdown(html: string): Promise<string> {
+/** The most values of one condition key `showCondition` names before it says how many more there are. */
+const SHOW_COND_VALUES_MAX = 12;
+/** The longest `data-show-cond` read; a longer one adds nothing. */
+const SHOW_COND_MAX_CHARS = 4096;
+/**
+ * The elements a condition is written for: those Turndown has no rule of its own for, so writing the note loses nothing of the
+ * element's own Markdown (a list item's bullet, a heading's #, a link's address, a code fence would be lost otherwise).
+ */
+const SHOW_COND_NODES = new Set(["TD", "TH", "TR", "TABLE", "TBODY", "THEAD", "DIV", "SPAN", "SECTION"]);
+const BLOCK_NODES = new Set(["DIV", "TABLE", "TBODY", "THEAD", "TR", "SECTION"]);
+/** A key or value as plain words: whitespace collapsed, anything but letters, digits and . _ - + : / dropped. */
+const plainWord = (v: string, max: number): string => v.replace(/\s+/g, " ").replace(/[^\p{L}\p{N}._\-+:/ ]/gu, "").trim().slice(0, max);
+
+/**
+ * What a page's `data-show-cond` (rocm-docs selectors: a cell or block shown only for some GPUs, OS families or versions) says, as
+ * text, or null. A page that picks what to show by script is flattened to every variant at once; without this, a reader cannot tell
+ * which row belongs to which choice (parity R2: Rocky Linux 9 read as an MI355X distribution when the page shows it for MI300X only).
+ */
+export function showCondition(raw: string | null | undefined): string | null {
+  if (!raw || raw.length > SHOW_COND_MAX_CHARS) return null;
+  let cond: unknown;
+  try { cond = JSON.parse(raw); } catch { return null; }
+  if (!cond || typeof cond !== "object" || Array.isArray(cond)) return null;
+  const parts: string[] = [];
+  for (const [key, values] of Object.entries(cond as Record<string, unknown>).slice(0, 4)) {
+    if (!Array.isArray(values)) continue;
+    const vs = values.slice(0, SHOW_COND_VALUES_MAX * 4).filter((v): v is string | number => typeof v === "string" || typeof v === "number")
+      .map((v) => plainWord(String(v), 60)).filter((v) => v !== "");
+    if (!vs.length) continue;
+    const more = vs.length > SHOW_COND_VALUES_MAX ? `, +${vs.length - SHOW_COND_VALUES_MAX} more` : "";
+    const k = plainWord(key, 30);
+    if (k) parts.push(`${k}: ${vs.slice(0, SHOW_COND_VALUES_MAX).join(", ")}${more}`);
+  }
+  return parts.length ? `(shown only for ${parts.join("; ")})` : null;
+}
+
+export async function htmlToMarkdown(html: string): Promise<string> {
   if (!TurndownCtor) {
     const mod = await import("turndown");
     TurndownCtor = (mod.default ?? mod) as TurndownLike;
   }
   const td = new TurndownCtor({ headingStyle: "atx", codeBlockStyle: "fenced" });
+  td.addRule("showCondition", {
+    filter: (node) => SHOW_COND_NODES.has(node.nodeName) && !!showCondition(node.getAttribute?.("data-show-cond")),
+    replacement: (content, node) => {
+      const note = showCondition(node.getAttribute?.("data-show-cond"))!;
+      return BLOCK_NODES.has(node.nodeName) ? `\n\n${note}\n${content}\n\n` : ` ${note} ${content} `;
+    },
+  });
   return td.turndown(html);
 }
 
