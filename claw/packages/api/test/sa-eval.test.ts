@@ -245,6 +245,30 @@ test("S9 the seed set", () => {
   for (const c of cases) assert.equal(passed(grade(c, empty)), false, c.id);
 });
 
+test("S9b the review-as-X set, the multi-turn scripts and the recent-issue cases", () => {
+  const { cases } = loadCases(SEED_DIR);
+  const of = (dir: string) => cases.filter((c) => c.dir === dir);
+  const review = of("review-a8");
+  assert.ok(review.length >= 20, `${review.length} review-a8 cases`);
+  // Review as another person, a merge confirmation and stopping a review are each covered.
+  assert.ok(review.some((c) => c.turns.some((t) => t.user.includes("{EVAL_OTHER_PERSON}")) && c.route === "review"));
+  assert.ok(review.some((c) => c.tools_must?.some((p) => toolPattern(p).test("mcp__assistant__confirmation_answer"))));
+  assert.ok(review.some((c) => c.tools_must?.some((p) => toolPattern(p).test("mcp__assistant__work_stop"))));
+  // A merged pull request is answered with when it merged, read from GitHub, and starts no review.
+  assert.ok(review.some((c) => c.facts?.some((f) => /pulls\/\d+#merged_at/.test(f.oracle?.query ?? ""))));
+  const sim = of("sim");
+  assert.ok(sim.length >= 15, `${sim.length} multi-turn scripts`);
+  for (const c of sim) assert.ok(c.turns.length >= 3 && c.turns.length <= 6, `${c.id}: ${c.turns.length} turns`);
+  const recent = cases.filter((x) => /-y8-/.test(x.id));
+  assert.ok(recent.length >= 15, `${recent.length} recent-issue cases`);
+  // Every new case has a fact a run decides (a value to find in the answer, or an oracle the runner reads), or is graded on every
+  // item it started being closed; tools_must alone does not count.
+  for (const c of [...review, ...sim, ...recent]) {
+    const decidable = (c.facts ?? []).some((f) => (f.oracle?.kind !== "api" && f.oracle?.value !== undefined) || oracleQuery({ kind: "api", query: (f.oracle?.query ?? "").replace(/\{\{[\w.]+\}\}|\{[A-Z_]+\}/g, "x") }));
+    assert.ok(decidable || c.items_closed, `${c.id}: no fact a run can decide`);
+  }
+});
+
 test("S10 pass@1 and pass^k", () => {
   const attempt = (pass: boolean, ms = 1000) => ({ pass, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: ms, finalMs: ms * 2, items: [] });
   const r = (id: string, attempts: ReturnType<typeof attempt>[], over: Partial<CaseResult> = {}): CaseResult => ({ id, area: "k", pipeline: "catalog", mode: "assistant", hash: "h", attempts, ...over });
