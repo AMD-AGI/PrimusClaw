@@ -79,10 +79,18 @@ than start a new conversation.
 
 The convention the connector in this repository uses for `resumable`, newest first and at most twelve entries:
 `[{ref, title, cwd, updated_at, state}]` with `ref` the value to send back as `resume_ref`, `updated_at` in seconds since the
-epoch, and `state` one of `idle`, `live` (something else has it open: not offered for takeover), `attached` (this
-connector already holds it) or `unknown`; a `live` entry may add `activity` (`working`, `waiting` for the person at that
-terminal, or `idle`) and, with `waiting`, `waiting_for` (a short phrase in the agent's words). `devenv_list` shows `activity` as
-`terminal_state` and `waiting_for` only with `detail: "activity"`.
+epoch, and `state` one of `idle`, `live` (something else has it open: not offered for takeover; a session for it is opened
+read-only, see below), `attached` (this connector already holds it) or `unknown`; a `live` entry may add `activity`
+(`working`, `waiting` for the person at that terminal, or `idle`) and, with `waiting`, `waiting_for` (a short phrase in the
+agent's words). `devenv_list` shows `activity` as `terminal_state` and `waiting_for` only with `detail: "activity"`.
+
+An agent whose connector can do that says `watch_live: true` in its capabilities. A session the connector opens to
+watch a conversation that a terminal on that machine has open is read-only: its
+`session_started` (and `session_resumed`) carries `read_only: true`, and so does every event it sends. The API reads that
+mark from the session's newest `session_started`/`session_resumed`: `GET .../sessions` and `GET .../sessions/:id` answer
+`read_only`, every frame of its event stream (and of `?mode=replay`) carries `read_only: true` next to `data`, and
+`prompt`, `set_mode` and `decision` are refused with 409 `session_read_only` before anything is queued (`cancel`, `resume`
+and `close` are not). The connector refuses them as well (`read_only_live_session`).
 
 ## Whether a session asks before it acts
 
@@ -272,8 +280,9 @@ machine) and in a `devenv_send` refused `no_machine`. Its `login` line names thi
 (`CLAW_CONNECTOR_IDENTITY_URL`, else `IDENTITY_ISSUER_URL`). Sessions are not closed on their own: a new one at the
 session limit closes the user's sessions nobody is using to make room (no event for half an
 hour, no command waiting for its connector, no turn under way and no approval waiting; or no
-event for a day), a machine that is offline first, each with a `close` to its connector and a
-`session.reclaimed` audit, and `201` names them in `reclaimed`. Only when none may be closed is
+event for a day; or a read-only session, which only watches a terminal's conversation, whatever
+that terminal writes), a machine that is offline first, then read-only sessions, each with a
+`close` to its connector and a `session.reclaimed` audit, and `201` names them in `reclaimed`. Only when none may be closed is
 the answer `409 session_limit_reached`.
 
 A write made through the same API replica reaches an open stream at once. A write
@@ -291,8 +300,11 @@ conversations a connector offers to take over (`capabilities.resumable`), each w
 state (`working`, `waiting_for_you`, `idle`, `in_terminal`), last activity, a label
 (`machine/agent/n`) and the command that attaches the user's chat to it
 (`/agent attach <session id or conversation ref>`). The router passes that command to the
-channel with `channel_action`; a conversation open in a terminal on the machine, or a machine
-that is offline, has none. `detail: "activity"` adds each session's current step and the end of
+channel with `channel_action`; a machine that is offline has none. A conversation open in a
+terminal on the machine has one too when its agent reports `watch_live`, marked `read_only` with a
+`note`: attaching to it only watches it, and it is never the `attach_default` (from an older
+connector it has none). A session open through Claw that watches one is `read_only` too, with
+state `in_terminal`: it is never at work for Claw, whatever the terminal does. `detail: "activity"` adds each session's current step and the end of
 its last answer. Names, folders and what agents wrote can be named by anyone, so a turn that has
 read the list no longer acts for the user, with one exception: it may still put
 `/agent attach <ref>` for one of the user's own attachable sessions to them, as a button they

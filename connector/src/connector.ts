@@ -221,8 +221,12 @@ export class Connector {
     return Promise.all(this.d.config.agents.map(async (a) => {
       // `unattended`: sessions start in a mode that does not ask before a write or a command. `unattended_allowed`:
       // a phone may switch this agent to such a mode. A client shows the first so nobody is surprised by it.
-      const base = { ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes };
       const support = this.attach.get(a.id);
+      // `watch_live`: a conversation open in a terminal can be opened read-only (session.ts `spectate`); a client offers that only then.
+      const base = {
+        ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes,
+        ...(support ? { watch_live: true } : {}),
+      };
       // An attach agent also says which existing sessions it could take over, and whether anything holds them open now.
       const capabilities = support ? fitResumable(base, await support.resumable()) : base;
       return { agent_id: a.id, kind: a.kind, name: a.name, capabilities };
@@ -558,6 +562,7 @@ export class Connector {
     try {
       const up = await this.startup();
       if (up !== "ok") return (result = up);
+      await this.manager.restoreReadOnly();
       this.d.audit.record("connector_online", {
         connector_id: this.cid, agents: this.d.config.agents.map((a) => a.id), paused: this.paused,
         unattended_agents: this.d.config.agents.filter((a) => a.unattended).map((a) => a.id),

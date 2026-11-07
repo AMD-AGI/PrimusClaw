@@ -13,7 +13,7 @@ import path from "node:path";
 import test, { after, describe } from "node:test";
 import {
   AttachSupport, MAX_REPORTED, SESSION_REF_RE, cleanTitle, fitResumable, liveActivity, localPidDomain, parseAgentsJson, processGroup, readRegistry,
-  TwinCheckError, type Resumable,
+  TranscriptTail, TwinCheckError, transcriptUpdates, type Resumable,
 } from "../src/attach.js";
 import { ChildRegistry, processStart } from "../src/children.js";
 import { memoryAudit } from "../src/audit.js";
@@ -359,6 +359,13 @@ describe("what is reported to Claw", () => {
     assert.ok(new TextEncoder().encode(JSON.stringify(edge)).length <= 4096 && new TextEncoder().encode(JSON.stringify({ ...edge, resumable: [] })).length > 4096, "the case is the one that matters");
     assert.deepEqual(fitResumable(edge, items), edge);
     assert.deepEqual(fitResumable(base, []), { ...base, resumable: [] }, "nothing to offer, room to say so");
+    // The flag that says a conversation in a terminal can be watched never makes a valid heartbeat invalid.
+    const bare = new TextEncoder().encode(JSON.stringify({ ...base, roots: ["/"] })).length;
+    const near = { ...base, roots: ["/".concat("x".repeat(4090 - bare))] };
+    const flagged = { ...near, watch_live: true };
+    assert.ok(new TextEncoder().encode(JSON.stringify(near)).length <= 4096 && new TextEncoder().encode(JSON.stringify(flagged)).length > 4096, "the case is the one that matters");
+    assert.deepEqual(fitResumable(flagged, items), near);
+    assert.deepEqual(fitResumable({ ...base, watch_live: true }, []), { ...base, watch_live: true, resumable: [] }, "with room, it is said");
   });
 
   test("the preset: an opaque kind, the ask mode, a default command to list with, and nothing that applies to other agents", () => {
@@ -380,6 +387,61 @@ roots = ["${os.tmpdir()}"]
     assert.deepEqual(cfg.agents.map((a) => [a.kind, a.askMode, a.attach?.cli ?? null]), [["attach", "default", "claude"], ["attach", "default", "/opt/claude/bin/claude"], ["claude", "default", null]]);
     assert.throws(() => parseConfig(`[[agents]]\nid = "c"\npreset = "claude"\nattach_cli = "claude"\nroots = ["${os.tmpdir()}"]`), ConfigError);
     assert.throws(() => parseConfig(`[[agents]]\nid = "c"\npreset = "claude-attach"\nattach_cli = ""\nroots = ["${os.tmpdir()}"]`), ConfigError);
+  });
+});
+
+describe("reading a transcript another process writes", () => {
+  test("each line becomes what an adapter would have sent; what a phone has no use for is nothing", () => {
+    const j = (d: unknown) => JSON.stringify(d);
+    const rows: Array<[string, string, Array<[string, unknown]>]> = [
+      ["the user's words", j({ type: "user", message: { role: "user", content: "hi" } }), [["user_message_chunk", "hi"]]],
+      ["the agent's words", j({ type: "assistant", message: { content: [{ type: "text", text: "ok" }] } }), [["agent_message_chunk", "ok"]]],
+      ["a step it starts", j({ type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "/a/b.ts" } }] } }), [["tool_call", "Read: /a/b.ts"]]],
+      ["how a step ended", j({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: [{ type: "text", text: "boom" }] }] } }), [["tool_call_update", "failed"]]],
+      ["thinking", j({ type: "assistant", message: { content: [{ type: "thinking", thinking: "x" }] } }), []],
+      ["a sub-agent", j({ type: "assistant", isSidechain: true, message: { content: [{ type: "text", text: "x" }] } }), []],
+      ["Claude Code's own lines", j({ type: "user", isMeta: true, message: { content: "x" } }), []],
+      ["a summary", j({ type: "summary", summary: "x" }), []],
+      ["not JSON", "{ half", []],
+      ["empty text", j({ type: "assistant", message: { content: [{ type: "text", text: "  " }] } }), []],
+    ];
+    for (const [what, line, want] of rows) {
+      const got = transcriptUpdates(line).map((u) => [u.type, u.type === "tool_call" ? u.update.title : u.type === "tool_call_update" ? u.update.status : (u.update.content as { text: string }).text]);
+      assert.deepEqual(got, want, what);
+    }
+  });
+
+  test("the tail reads only what is new, waits for a line to be whole, survives a character split across reads and a rewrite", () => {
+    const file = path.join(tmpdir("cc-tail-"), "t.jsonl");
+    let where: string | null = null;
+    const tail = new TranscriptTail(() => where);
+    assert.deepEqual(tail.backlog(), [], "no file yet");
+    where = file;
+    const say = (t: string) => `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: t } ] } })}\n`;
+    fs.writeFileSync(file, Array.from({ length: 30 }, (_, i) => say(`old ${i}`)).join(""));
+    const texts = (us: ReturnType<TranscriptTail["poll"]>) => us.map((u) => (u.update.content as { text: string }).text);
+    assert.deepEqual(texts(new TranscriptTail(() => file).backlog()).length, 20, "the backlog is the last twenty");
+    // A backlog read that ends inside a character keeps its first bytes: the line completes on the next poll, whole.
+    const cutFile = path.join(path.dirname(file), "cut.jsonl");
+    const whole = Buffer.from(say("下一步"));
+    const mid = whole.indexOf(Buffer.from("下")) + 2;
+    fs.writeFileSync(cutFile, Buffer.concat([Buffer.from(say("before")), whole.subarray(0, mid)]));
+    const cutTail = new TranscriptTail(() => cutFile);
+    assert.deepEqual(texts(cutTail.backlog()), ["before"]);
+    fs.appendFileSync(cutFile, whole.subarray(mid));
+    assert.deepEqual(texts(cutTail.poll()), ["下一步"]);
+    tail.fromEnd();
+    assert.deepEqual(tail.poll(), []);
+    const line = Buffer.from(say("完成了"));
+    const cut = line.indexOf(Buffer.from("完")) + 1;   // inside the character
+    fs.appendFileSync(file, line.subarray(0, cut));
+    assert.deepEqual(tail.poll(), [], "half a line is held");
+    fs.appendFileSync(file, line.subarray(cut));
+    assert.deepEqual(texts(tail.poll()), ["完成了"]);
+    fs.writeFileSync(file, say("rewritten"));
+    assert.deepEqual(tail.poll(), [], "a rewritten file is followed from its new end");
+    fs.appendFileSync(file, say("after"));
+    assert.deepEqual(texts(tail.poll()), ["after"]);
   });
 });
 
@@ -415,6 +477,7 @@ describe("attach end to end", () => {
     const hb = await h.claw.until("a heartbeat with the list", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
     const a = hb.agents[0];
     assert.equal(a.kind, "attach");
+    assert.equal(a.capabilities.watch_live, true, "it says a conversation open in a terminal can be watched");
     assert.deepEqual(a.capabilities.resumable.map((r: any) => [r.ref, r.title, r.state]), [[REF, "Fix the flaky test", "idle"], [REF2, "Second", "live"]], "REF3 is outside the roots and is not offered");
     assert.equal(a.capabilities.resumable[0].updated_at, Date.parse("2026-10-29T10:00:00.000Z") / 1000);
     assert.equal(a.capabilities.resumable[0].cwd, fs.realpathSync(h.work));
@@ -479,16 +542,137 @@ describe("attach end to end", () => {
     assert.equal(h.claw.eventsOf(sid, "session_started").length, 0);
   });
 
-  test("a live twin refuses the takeover before an adapter is started", async () => {
-    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }] });
+  test("a conversation open in a terminal is watched read-only: its output arrives, nothing typed reaches it, and the watch ends with the terminal", async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing: { spectateMs: 20, spectateCheckMs: 100 } });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const line = (doc: Record<string, unknown>) => fs.appendFileSync(file, `${JSON.stringify({ sessionId: REF, isSidechain: false, ...doc })}\n`);
+    line({ type: "user", message: { role: "user", content: "run the tests" } });
+    line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Running them now." }] } });
     const sid = await h.attach(REF);
-    assert.equal(closedReason(h, sid), "session_live");
-    assert.deepEqual(adapterMethods(h).filter((m) => m !== "initialize" && m !== "session/list"), [], "nothing was resumed");
-    assert.ok(h.audit().some((a) => a.kind === "attach_refused" && a.reason === "session_live"));
-    // The terminal is closed: the same request now goes through.
+    const started = h.claw.eventsOf(sid, "session_started")[0]!.data;
+    assert.deepEqual([started.read_only, started.read_only_reason, started.attached, started.acp_session_id], [true, "session_live", true, REF]);
+    assert.equal(closedReason(h, sid), undefined, "not refused: watched");
+    assert.deepEqual(adapterMethods(h).filter((m) => m !== "initialize" && m !== "session/list"), [], "nothing was resumed or started");
+    assert.ok(h.audit().some((a) => a.kind === "session_spectating"));
+    // What was there before: sent once, marked as history.
+    const before = h.claw.eventsOf(sid, "agent_message_chunk");
+    assert.deepEqual(before.map((e) => [e.data.update.content.text, e.data.replay, e.data.read_only]), [["Running them now.", true, true]]);
+    assert.equal(h.claw.eventsOf(sid, "user_message_chunk")[0]?.data.update.content.text, "run the tests");
+    // The terminal goes on: each new line arrives, scrubbed, as the update an adapter would have sent.
+    line({ type: "assistant", message: { role: "assistant", content: [{ type: "thinking", thinking: "a private musing" }, { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "npm test" } }] } });
+    line({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "12 passed, token ghp_abcdefghijklmnopqrstuvwxyz0123 seen" }] } });
+    line({ type: "assistant", isSidechain: true, message: { role: "assistant", content: [{ type: "text", text: "a sub-agent's aside" }] } });
+    fs.appendFileSync(file, JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "全部通过。" }] } }).slice(0, 40));
+    const call = await h.claw.until("the tool call", () => h.claw.eventsOf(sid, "tool_call")[0]);
+    assert.deepEqual([call.data.update.toolCallId, call.data.update.title, call.data.read_only, call.data.replay], ["toolu_1", "Bash: npm test", true, undefined]);
+    const result = await h.claw.until("its result", () => h.claw.eventsOf(sid, "tool_call_update")[0]);
+    assert.equal(result.data.update.status, "completed");
+    assert.ok(!JSON.stringify(result.data).includes("ghp_abcdef"), "a credential in the output is masked before it leaves");
+    assert.match(JSON.stringify(result.data), /12 passed/);
+    // A line written in two pieces is read once it is whole.
+    fs.appendFileSync(file, `${JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "全部通过。" }] } }).slice(40)}\n`);
+    await h.claw.until("the last line", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "全部通过。"));
+    assert.ok(!h.claw.eventsOf(sid).some((e) => JSON.stringify(e.data).includes("private musing") || JSON.stringify(e.data).includes("sub-agent")), "thinking and sub-agents are not shown");
+
+    // Typing into it is refused, by name, and not one byte reaches the transcript.
+    const bytes = fs.readFileSync(file);
+    const seq = h.prompt(sid, "say do something else");
+    const rejected = await h.claw.until("the prompt to be refused", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.deepEqual([rejected.data.type, rejected.data.reason, rejected.data.cmd_seq], ["prompt", "read_only_live_session", seq]);
+    const end = await h.turnEnd(sid);
+    assert.deepEqual([end.data.stopReason, end.data.error, end.data.cmd_seq], ["error", "read_only_live_session", seq]);
+    h.claw.issue("set_mode", sid, { mode_id: "plan" });
+    await h.claw.until("the mode change to be refused", () => h.claw.eventsOf(sid, "command_rejected")[1]);
+    assert.equal(h.claw.eventsOf(sid, "command_rejected")[1]!.data.reason, "read_only_live_session");
+    h.claw.issue("resume", sid, {});
+    const resumed = await h.claw.until("the resume to answer", () => h.claw.eventsOf(sid, "session_resumed")[0]);
+    assert.equal(resumed.data.read_only, true);
+    assert.deepEqual(h.adapterLog().filter((l) => l.prompt), [], "no prompt reached any agent");
+    assert.ok(!adapterMethods(h).some((m) => m === "session/resume" || m === "session/prompt" || m === "session/set_mode"), "no agent was started");
+    assert.ok(fs.readFileSync(file).equals(bytes), "the transcript is exactly as the terminal left it");
+    // The list still says the terminal has it: watching is not holding.
+    await h.claw.until("a heartbeat that says live", () => [...h.claw.heartbeats].reverse().find((b) => b.agents[0].capabilities.resumable?.find((r: any) => r.ref === REF)?.state === "live"));
+
+    // The terminal is closed: the watch ends, and the conversation can now be taken over through the full check.
     h.setLive([]);
+    await h.claw.until("the watch to end", () => closedReason(h, sid) !== undefined);
+    assert.equal(closedReason(h, sid), "terminal_closed");
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
     const again = await h.attach(REF);
-    assert.equal(h.claw.eventsOf(again, "session_started").length, 1);
+    const taken = h.claw.eventsOf(again, "session_started")[0]!.data;
+    assert.equal(taken.read_only, undefined);
+    assert.equal(adapterMethods(h).filter((m) => m === "session/resume").length, 1);
+  });
+
+  test("a read-only session stays read-only after the connector restarts", async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    const sid = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.read_only, true);
+    await h.stop();
+    h.connect({ timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    h.start();
+    await h.online();
+    h.setLive([]);   // even with the terminal gone, a prompt after the restart is not a takeover by surprise
+    h.prompt(sid, "say hi");
+    const rejected = await h.claw.until("the prompt to be refused", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.equal(rejected.data.reason, "read_only_live_session");
+    assert.ok(!adapterMethods(h).includes("session/resume"));
+  });
+
+  test("a read-only session stays read-only after a restart even when its agent can no longer attach", async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    const sid = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.read_only, true);
+    await h.stop();
+    // The machine's config dropped the agent's attach support before the restart.
+    (h.config.agents.find((a) => a.id === "fake") as { attach: unknown }).attach = null;
+    h.connect({ timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    h.start();
+    await h.online();
+    h.prompt(sid, "say hi");
+    const rejected = await h.claw.until("the prompt to be refused", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.equal(rejected.data.reason, "read_only_live_session");
+    assert.ok(!adapterMethods(h).includes("session/resume"), "no adapter was launched on the terminal's conversation");
+  });
+
+  test("after a restart a watch goes on by itself, a replayed request to open it stays read-only, and it ends with the terminal", async () => {
+    const timing = { spectateMs: 20, spectateCheckMs: 100 };
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "");
+    const sid = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.read_only, true);
+    await h.stop();
+    h.connect({ timing });
+    h.start();
+    await h.claw.until("the restarted connector to be up", () => h.audit().filter((a) => a.kind === "connector_online").length === 2);
+    // Followed again without any command: what the terminal writes now arrives.
+    fs.appendFileSync(file, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "after the restart" }] } })}\n`);
+    await h.claw.until("output after the restart", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "after the restart"));
+    // The terminal closes and the transcript is old: a replay of the very request that opened the watch is still not a takeover.
+    h.setLive([]);
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    h.claw.issue("session.new", sid, { agent_id: "fake", cwd: h.work, mode: null, resume_ref: REF });
+    await h.claw.until("the watch to end", () => closedReason(h, sid) !== undefined);
+    assert.equal(closedReason(h, sid), "terminal_closed");
+    assert.ok(h.claw.eventsOf(sid, "session_started").every((e) => e.data.read_only === true), "never opened as a takeover");
+    assert.ok(!adapterMethods(h).includes("session/resume"));
+  });
+
+  test("a transcript reached through a link that leaves the config directory is not read", () => {
+    const dir = configDir();
+    const outside = path.join(tmpdir("cc-outside-"), "secret.jsonl");
+    fs.writeFileSync(outside, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "not yours" }] } })}\n`);
+    fs.mkdirSync(path.join(dir, "projects", "-x"), { recursive: true });
+    fs.symlinkSync(outside, path.join(dir, "projects", "-x", `${REF}.jsonl`));
+    const s = support(dir);
+    assert.equal(s.transcriptPath(REF), null);
+    fs.writeFileSync(path.join(dir, "projects", "-x", `${REF2}.jsonl`), "");
+    assert.equal(s.transcriptPath(REF2), fs.realpathSync(path.join(dir, "projects", "-x", `${REF2}.jsonl`)));
   });
 
   test("the requests that must be refused, each with its own reason and none starting a resume", async () => {
