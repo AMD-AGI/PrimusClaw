@@ -7,7 +7,7 @@
  * tmux the tests may be run from), with a stand-in for Claude Code's interface in the pane.
  */
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test, { after, describe } from "node:test";
@@ -115,8 +115,17 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.ok(found.ok, JSON.stringify(found));
     assert.equal(found.pane.socket, t.socket);
     assert.equal(found.pane.pane, "%0");
-    // Not the process of another pane, nor one outside tmux.
-    assert.deepEqual(await findPane(process.pid, "tmux").then((r) => r.ok && r.pane.socket === t.socket), false);
+    // Not a process outside tmux, nor one that only claims this pane in its environment (it does not run in it).
+    const outside = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", env: { PATH: process.env.PATH ?? "" } });
+    const forged = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", env: { PATH: process.env.PATH ?? "", TMUX: `${t.socket},1,0`, TMUX_PANE: "%0" } });
+    try {
+      await until("both to start", () => fs.existsSync(`/proc/${outside.pid}/environ`) && fs.existsSync(`/proc/${forged.pid}/environ`));
+      assert.deepEqual(await findPane(outside.pid!, "tmux"), { ok: false, why: "the terminal is not a tmux pane" });
+      assert.deepEqual(await findPane(forged.pid!, "tmux"), { ok: false, why: "the tmux pane it names does not run that process" });
+    } finally {
+      outside.kill("SIGKILL");
+      forged.kill("SIGKILL");
+    }
     const input = new TerminalInput(found.pane, tmuxRunner("tmux", t.socket));
     await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
     assert.deepEqual(await input.readiness(), { ready: true });
