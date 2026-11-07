@@ -8,8 +8,9 @@
  */
 import pino from "pino";
 import {
-  activeAbort, gracefulStopRemainingMs, resolveAbortTargets, resolveSessionEndTargets,
+  activeAbort, gracefulStopRemainingMs, resolveAbortTargets, resolveSessionEndTargets, SIGTERM_ABORT_REASON,
 } from "./abort-registry.js";
+import { cutDrainedCalls } from "../agent/drain-shield.js";
 import { releaseTaskLock } from "./lock.js";
 
 const logger = pino({ name: "brain" });
@@ -21,6 +22,8 @@ export function interruptRunsAt(address: string, forceReleaseAfterMs = 30_000): 
     const ctrl = activeAbort.get(lockKey);
     if (!ctrl) continue;
     ctrl.abort();
+    // A drain aborted it first, so that abort cannot reach a call the drain is letting finish: the Stop cuts it here.
+    if (ctrl.signal.reason === SIGTERM_ABORT_REASON) cutDrainedCalls(ctrl.signal, "interrupted");
     aborted.push(lockKey);
     logger.info({ address, lockKey }, "task.interrupted");
     // The SDK may not propagate abort through an in-flight tool RPC.

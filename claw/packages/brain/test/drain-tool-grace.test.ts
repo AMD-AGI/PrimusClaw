@@ -154,6 +154,31 @@ test("D5: a run taken over by another replica while the drain waits has its call
     "a call cut by the takeover is told as interrupted, never as a result");
 });
 
+test("D6: a drain that begins before the call leaves does not start it; the resumed run makes it once, as usual", async () => {
+  const kv = store();
+  const ac = new AbortController();
+  const box = sandbox(20, () => {});
+  const first = session([{ content: [text("我先执行命令。"), toolUse("b1", "bash", SLEEP)], stopReason: "tool_use" }]);
+  await agentLoop([{ role: "user", content: "run it" }], TOOLS, opts({
+    signal: ac.signal, drainToolGraceMs: 5_000, llmSession: first.session, router: box.router,
+    onCheckpoint: kv.onCheckpoint,
+    // (the drain lands while the call's start is being journalled: after it was announced, before it was sent)
+    onTurnJournal: async (st: CheckpointState) => {
+      await kv.onTurnJournal(st);
+      if (st.pending_turn?.started?.includes("b1") && !ac.signal.aborted) ac.abort(SIGTERM_ABORT_REASON);
+    },
+  }));
+  assert.deepEqual(box.runs, [], "nothing was started once the drain had begun");
+  const second = session([{ content: [text("命令已完成。")], stopReason: "end_turn" }]);
+  await agentLoop([{ role: "user", content: "run it" }], TOOLS, opts({
+    resumeFrom: kv.latest, llmSession: second.session, router: box.router,
+    onCheckpoint: kv.onCheckpoint, onTurnJournal: kv.onTurnJournal,
+  }));
+  assert.deepEqual(box.runs, [SLEEP.command], "the resumed run made it, once");
+  const shown = second.prompts[0].at(-1)!.content as Array<{ tool_use_id: string; content: unknown }>;
+  assert.match(JSON.stringify(shown[0].content), /slept/);
+});
+
 test("D4: the shield follows the run's signal: other reasons at once, a drain after the grace, nothing once disposed", async () => {
   const user = new AbortController();
   const a = shieldFromDrain(user.signal, 10_000);
@@ -183,4 +208,13 @@ test("D4: the shield follows the run's signal: other reasons at once, a drain af
   const d = shieldFromDrain(off.signal, 0);
   assert.equal(d.signal, off.signal, "grace 0 is the run's own signal");
   assert.equal(shieldFromDrain(undefined, 1_000).signal, undefined);
+
+  // A takeover the runner learned of before this call was shielded still cuts it, as it is made.
+  const early = new AbortController();
+  early.abort(SIGTERM_ABORT_REASON);
+  cutDrainedCalls(early.signal, LEASE_LOST_ABORT_REASON);
+  const e = shieldFromDrain(early.signal, 10_000);
+  assert.equal(e.signal?.aborted, true);
+  assert.equal(e.signal?.reason, LEASE_LOST_ABORT_REASON);
+  e.dispose();
 });

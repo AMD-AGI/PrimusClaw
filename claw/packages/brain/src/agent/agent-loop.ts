@@ -2653,6 +2653,14 @@ class AgentLoopRunner {
       // execution slot away for nothing; the read is separate from the poll so
       // it moves no output offset.
       const parks = WAITING_TOOLS.has(toolName) && await this.waitCanBlock(finalInput);
+      // The run stopped (a drain included) before this call left: it never ran. It is answered as the calls after it are,
+      // and left out of the journal, so a resumed run makes it as usual. A drain lets only a call already in flight finish.
+      if (this.signal?.aborted) {
+        callSignal.dispose();
+        if (journalled) await this.journalForget(toolId);
+        resultByToolId.set(toolId, CANCELLED_TOOL_RESULT);
+        return;
+      }
       resultText = parks
         ? await whileWaiting(this.runIdentityKeyFor("background_command"), "background_command", this.waitMode, () =>
             this.router.route(toolName, finalInput, callSignal.signal, outcome, stepCtx))

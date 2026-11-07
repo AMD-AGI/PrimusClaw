@@ -35,6 +35,7 @@ export function shieldFromDrain(run: AbortSignal | undefined, graceMs: number): 
   const own = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const cutNow = (reason: unknown): void => { if (!own.signal.aborted) own.abort(reason); };
+  if (cutReasons.has(run)) cutNow(cutReasons.get(run));   // (cut before this call was even made: it gets no grace)
   let cuts = shielded.get(run);
   if (!cuts) shielded.set(run, cuts = new Set());
   cuts.add(cutNow);
@@ -62,6 +63,8 @@ export function shieldFromDrain(run: AbortSignal | undefined, graceMs: number): 
 
 /** The calls a drain is letting finish, by the run signal they follow. */
 const shielded = new WeakMap<AbortSignal, Set<(reason: unknown) => void>>();
+/** Runs whose drain has been cut short, and why: a call shielded afterwards is cut as it is made. */
+const cutReasons = new WeakMap<AbortSignal, unknown>();
 
 /**
  * Cut, now, every call of this run that a drain is letting finish.
@@ -72,5 +75,6 @@ const shielded = new WeakMap<AbortSignal, Set<(reason: unknown) => void>>();
  * never goes on writing to a workspace someone else now drives.
  */
 export function cutDrainedCalls(run: AbortSignal, reason: unknown): void {
+  if (!cutReasons.has(run)) cutReasons.set(run, reason);
   for (const cut of [...(shielded.get(run) ?? [])]) cut(reason);
 }
