@@ -284,6 +284,31 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.equal(rejected.data.reason, "terminal_session");
   });
 
+  test("a row another pid domain left in the shared Claude directory does not stop typing into the local terminal", async () => {
+    // (a dev container on a shared disk restarts; the rows of the processes killed with its earlier boot stay, in a domain
+    // that is not this one, and nothing can tell them from a process on another machine)
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir);
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    fs.writeFileSync(path.join(h.attachDir, "sessions", "424242.json"), JSON.stringify({
+      pid: 424242, sessionId: REF, status: "busy", kind: "interactive", cwd: work, procStart: "1", pidDomain: "linux:an-earlier-boot:pid:[4026531836]" }));
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    await h.online();
+    await h.claw.until("a heartbeat that offers typing", () => [...h.claw.heartbeats].reverse().find((b) =>
+      b.agents[0].capabilities.resumable?.find((r: any) => r.ref === REF)?.input === "terminal"));
+    const sid = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.input, "terminal");
+    const one = h.prompt(sid, "despite the old row");
+    const end = await h.turnEnd(sid, 1);
+    assert.deepEqual([end.data.stopReason, end.data.cmd_seq, end.data.error], ["end_turn", one, undefined]);
+    assert.deepEqual(typed(t.transcript), ["despite the old row"]);
+  });
+
   test("a restart during a typed message's turn ends that turn by name and never types the message again", async () => {
     const work = tmpdir("cc-work-");
     const h = await Harness.create({
