@@ -37,6 +37,9 @@
  *       access) is held back and the owner is told, once
  *   W4  bots: only those the operator lists reach the worker
  *   W5  a review comment's file name is quoted with the text, never in our own line
+ *   B1  an owner with no GH_TOKEN who bound GitHub with /github bind: the loop reads, and pr_reply posts, with the binding's token
+ *       (asked of the identity provider for themselves, naming the use); with neither, nothing is read or posted; an identity
+ *       provider that cannot be asked is not "no token"
  *   G1  the guards: an ended router turn subscribes nothing; a watch ended during a read stores nothing; a message that cannot be queued
  *       leaves its events undelivered and the item as it was; events still waiting when the user stops watching are dropped
  */
@@ -185,12 +188,14 @@ describe("assistant GitHub events", { skip }, () => {
   let alice: { userId: string; routerSid: string };
   let bob: { userId: string; routerSid: string };
   let app: FastifyInstance;
+  let realLoadToken: (userId: string, purpose: string) => Promise<string | null>;
 
   before(async () => {
     w = await startWorld({
       CLAW_ASSISTANT_GITHUB_EVENTS: "true", CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS: "3", CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS: "Review-App[bot]",
     });
     ev = await import("../src/assistant/github-events.js");
+    realLoadToken = ev.githubEventPorts.loadToken;
     mcp = await import("../src/assistant/mcp.js");
     const { registerAssistantGithubEventRoutes } = await import("../src/routes/assistant-github-events.js");
     app = Fastify();
@@ -735,9 +740,9 @@ describe("assistant GitHub events", { skip }, () => {
     const [e] = await events(it.itemId);
     const turn = await w.workerTurn(it.itemId);
     const load = ev.githubEventPorts.loadToken;
-    ev.githubEventPorts.loadToken = async (userId) => {
+    ev.githubEventPorts.loadToken = async (userId, purpose) => {
       await ev.subscribeItem({ userId: "alice", item: it.itemId, pr: prRef, reply: false });
-      return load(userId);
+      return load(userId, purpose);
     };
     try {
       assert.equal(await code(ev.prReply(turn, { event_id: e.event_id, body: "late" })), "reply_not_allowed");
@@ -746,6 +751,63 @@ describe("assistant GitHub events", { skip }, () => {
     }
     assert.equal(gh.s.posts.length, 0);
     assert.equal(await count("claw_work_item_pr_replies"), 0, "the event is free again");
+  });
+
+  test("B1 an owner who bound GitHub with /github bind and keeps no GH_TOKEN: read and answered with the binding's token", async () => {
+    const asked: Array<{ userId: string; requesterUserId: string; purpose: string }> = [];
+    let binding: "bound" | "not_bound" | "down" = "bound";
+    const auth: string[] = [];
+    const fetchImpl = gh.fetchImpl;
+    const ports = { ...ev.githubEventPorts };
+    ev.githubEventPorts.loadToken = realLoadToken;   // (the real one: GH_TOKEN from the env vault, else the binding)
+    ev.githubEventPorts.binding = () => true;
+    ev.githubEventPorts.resolveBinding = async (req) => {
+      asked.push({ userId: req.userId, requesterUserId: req.requesterUserId, purpose: req.purpose });
+      if (binding === "down") throw new Error("identity provider unreachable");
+      if (binding === "not_bound") {
+        const { IdentityCredentialRefusedError } = await import("@claw/utils");
+        throw new IdentityCredentialRefusedError("not_bound", 400);
+      }
+      return { token: "gho_bound_alice", providerLogin: "alice", kind: "oauth", scopes: ["repo"], delegation: false, expiresAt: null } as never;
+    };
+    ev.githubEventPorts.fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      auth.push(String(new Headers(init?.headers).get("authorization") ?? ""));
+      return fetchImpl(input, init);
+    }) as typeof fetch;
+    try {
+      assert.equal(await count("claw_user_env_vars", "user_id = $1", [alice.userId]), 0, "alice keeps no GH_TOKEN");
+      const it = await watched();
+      gh.comment("Please rename foo to bar.");
+      const first = await poll();
+      assert.deepEqual({ stored: first.stored, delivered: first.delivered }, { stored: 1, delivered: 1 }, "read with the binding");
+      assert.ok(auth.length > 0 && auth.every((h) => h.endsWith("gho_bound_alice")), "every read carries the binding's token");
+      assert.ok(asked.some((a) => a.purpose === "github_events:poll"));
+      assert.ok(asked.every((a) => a.userId === alice.userId && a.requesterUserId === alice.userId), "asked for herself, by herself");
+
+      await handedToRun(it.workerSid);
+      const [e] = await events(it.itemId);
+      const turn = await w.workerTurn(it.itemId);
+      auth.length = 0;
+      assert.equal((await ev.prReply(turn, { event_id: e.event_id, body: "Renamed." })).status, "posted");
+      assert.equal(gh.s.posts.length, 1);
+      assert.ok(auth.at(-1)?.endsWith("gho_bound_alice"), "posted with the binding's token");
+      assert.ok(asked.some((a) => a.purpose === "github_events:pr_reply"));
+
+      // The identity provider cannot be asked: not "no token", and nothing is read or posted.
+      binding = "down";
+      gh.comment("And on delete?", { ageSec: 1 });
+      const reads = gh.s.reads;
+      await poll();
+      assert.equal(gh.s.reads, reads, "nothing read");
+      assert.equal((await w.q("SELECT last_error FROM claw_work_item_subscriptions WHERE id = $1", [it.subId]))[0].last_error, "github_unavailable");
+      // Neither a GH_TOKEN nor a binding: no token, as before.
+      binding = "not_bound";
+      await poll();
+      assert.equal(gh.s.reads, reads, "nothing read");
+      assert.equal((await w.q("SELECT last_error FROM claw_work_item_subscriptions WHERE id = $1", [it.subId]))[0].last_error, "no_github_token");
+    } finally {
+      Object.assign(ev.githubEventPorts, ports);
+    }
   });
 
   test("S1 an answer carries its own event's marker and no other", async () => {
