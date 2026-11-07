@@ -795,6 +795,43 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(await actionsRun(), 1);
   });
 
+  test("S9b a turn that cannot act still says a merged pull request its message names: a key's message, a stale one", async () => {
+    // The parity case G3 as the eval runner sends it: the message came with a key, so the turn cannot act for the person.
+    mergedOnGithub = {
+      "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", merged_by: "zoroyihan7" },
+      "AMD-AGI/PrimusClaw#308": { merged_at: "2026-11-06T09:50:33Z", merge_commit: "a13084055d8c4a58d972f832a2eb301d0542ca53", merged_by: "zoroyihan7" },
+    };
+    const prs = ["https://github.com/AMD-AGI/PrimusClaw/pull/306", "https://github.com/AMD-AGI/PrimusClaw/pull/308"];
+    const text = `请 eval-reviewer 帮我 review 并合入下面 2 个 PR：\n${prs.join("\n")}`;
+    const viaKey = await userTurn(alice, text, { via: null, context: { channel: "api" } });
+    let refusal: any;
+    await assert.rejects(rt.reviewStart(viaKey, { prs, merge: true, reviewer: "eval-reviewer" }), (err: any) => { refusal = err; return true; });
+    assert.equal(refusal.code, "already_merged", "the merge is said, not that the turn cannot act");
+    assert.deepEqual(refusal.data.merged.map((m: Recorded) => [m.pr, m.merged_at]), [
+      ["AMD-AGI/PrimusClaw#306", "2026-11-06T09:50:16Z"], ["AMD-AGI/PrimusClaw#308", "2026-11-06T09:50:33Z"],
+    ]);
+    assert.equal(await code(rt.reviewStart(viaKey, { prs, merge: false })), "already_merged");
+    // Nothing merged: the turn still cannot act, as before.
+    mergedOnGithub = {};
+    assert.equal(await code(rt.reviewStart(viaKey, { prs, merge: true })), "not_attended");
+    await w.closeRun(viaKey.task_id);
+    mergedOnGithub = { "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", merged_by: "zoroyihan7" } };
+    // A signed-in message too old to act on: the same.
+    const old = await userTurn(alice, `审一下并合入 ${prs[0]}`, { agoSec: 601 });
+    assert.equal(await code(rt.reviewStart(old, { prs: [prs[0]], merge: true })), "already_merged");
+    await w.closeRun(old.task_id);
+    // A pull request the key's message does not name is never looked up, and a worker's report answers no message: both cannot act.
+    stateReads.length = 0;
+    const other = await userTurn(alice, "审一下并合入 AMD-AGI/PrimusClaw#999", { via: null });
+    assert.equal(await code(rt.reviewStart(other, { prs: [prs[0]], merge: true })), "not_attended");
+    await w.closeRun(other.task_id);
+    const report = await w.routerTurn(alice);
+    assert.equal(await code(rt.reviewStart(report, { prs: [prs[0]], merge: true })), "not_attended");
+    assert.deepEqual(stateReads, [], "GitHub is asked only about pull requests a message names");
+    assert.equal(calls.start.length, 0, "no review started");
+    assert.equal(await actionsRun(), 0, "nothing handed to the channel");
+  });
+
   test("S10 review_start sent again for the same message (Brain resends a lost answer) starts nothing more, even once the first review is done", async () => {
     const pr = { owner: "AMD-AGI", repo: "PrimusClaw", number: 261 };
     const turn = await userTurn(alice, "审 261");
