@@ -610,8 +610,10 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       }
       return queued;
     };
-    // A prompt and a stop are queued and noted one at a time per session, so the item counts them in the order the connector runs them.
-    const out = type === "prompt" || type === "cancel" ? await inRemoteSessionOrder(sessionId, send) : await send();
+    // A prompt, a stop and a withdraw are queued one at a time per session, so the connector gets them in the order they were asked
+    // (a withdraw sent right after a prompt takes that prompt back) and the item counts them in that order.
+    const ordered = type === "prompt" || type === "cancel" || type === "withdraw";
+    const out = ordered ? await inRemoteSessionOrder(sessionId, send) : await send();
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");
     if (out.status === "gone") return notFound(reply);
     if (out.status === "duplicate") {
