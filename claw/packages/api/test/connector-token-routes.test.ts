@@ -185,6 +185,7 @@ describe("a connector access token over the whole router", { skip }, () => {
       [`POST ${connectorSide.events.url}`]: 404,
       [`GET ${connectorSide.commands.url}`]: 404,
       [`POST ${connectorSide.revoke.url}`]: 404, // not this user's connector
+      [`POST ${connectorSide.confirm.url}`]: 404, // not this user's connector
     };
     for (const r of Object.values(connectorSide)) {
       const res = await app.inject({

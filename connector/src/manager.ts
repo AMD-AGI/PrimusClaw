@@ -62,12 +62,17 @@ export class SessionManager {
    * `handled` is called exactly once, when the command counts as carried out: for most that is when the
    * handler returns; for a prompt it is when the prompt reaches the adapter (see Session.enqueuePrompt).
    */
-  handle(cmd: Command, handled: () => void = () => {}): Promise<void> {
+  handle(cmd: Command, handled: () => void = () => {}, mayRun?: () => Promise<boolean>): Promise<void> {
     const sid = cmd.session_id;
     let done = false;
     const once = () => { if (!done) { done = true; handled(); } };
     const prev = this.chains.get(sid) ?? Promise.resolve();
-    const next = prev.then(() => this.dispatch(cmd, once)).catch((e) => {
+    // `mayRun` (a command received late: connector.ts `confirmLive`) is asked in the session's turn, so what comes after it
+    // waits for the answer; refused, the command is handled without running.
+    const next = prev.then(async () => {
+      if (mayRun && !(await mayRun())) return once();
+      return this.dispatch(cmd, once);
+    }).catch((e) => {
       this.env.log.error("command failed", { type: cmd.type, session: sid, error: errMessage(e) });
       this.env.audit.record("command_failed", { type: cmd.type, session_id: sid, cmd_id: cmd.cmd_id, error: errMessage(e).slice(0, 300) });
       once();

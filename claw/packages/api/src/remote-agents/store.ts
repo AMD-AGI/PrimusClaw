@@ -371,9 +371,9 @@ export const DELIVERY_UNCONFIRMED = "delivery_unconfirmed";
  * would end a terminal the person may be using by then. `cancel`, `close` and `decision` are safe to
  * deliver late and keep only the day.
  */
-const expiredSql = (typesParam: number, secsParam: number): string =>
-  `(created_at < NOW() - interval '1 day'
-    OR (type = ANY($${typesParam}::text[]) AND created_at < NOW() - make_interval(secs => $${secsParam}::float8)))`;
+const expiredSql = (typesParam: number, secsParam: number, alias = ""): string =>
+  `(${alias}created_at < NOW() - interval '1 day'
+    OR (${alias}type = ANY($${typesParam}::text[]) AND ${alias}created_at < NOW() - make_interval(secs => $${secsParam}::float8)))`;
 
 /**
  * Forget commands the connector has handled, plus any a day old. A live command too old to deliver ({@link expiredSql}) is not
@@ -543,11 +543,76 @@ export async function markStreamClosed(connectorId: string, streamConn: string, 
 
 export async function commandsAfter(connectorId: string, cursor: number, limit: number): Promise<Row[]> {
   return (await direct(
-    `SELECT cmd_seq, cmd_id, session_id::text AS session_id, type, payload
+    `SELECT cmd_seq, cmd_id, session_id::text AS session_id, type, payload, created_at
        FROM claw_remote_commands WHERE connector_id = $1 AND cmd_seq > $2 AND NOT ${expiredSql(4, 5)}
       ORDER BY cmd_seq LIMIT $3`,
     [connectorId, cursor, limit, LIVE_COMMAND_TYPES, LIVE_COMMAND_TTL_SECS],
   )).rows;
+}
+
+/**
+ * What a connector is told when it asks, before carrying out a command it received late ({@link commandLiveness}). Only `live` may
+ * run; a connector drops anything else and says so in the session.
+ *  - `live`: still queued, its session open, not expired, nothing after it cancels it.
+ *  - `session_closed`: its session was closed (by the person, by a reclaim, by its machine, or because the connector was revoked).
+ *  - `cancelled`: a `cancel` or `close` of its session was queued after it.
+ *  - `expired`: older than a command of its kind may be carried out ({@link expiredSql}).
+ *  - `gone`: Claw holds no such command for this connector any more (ended by Claw, or never this connector's).
+ * A revoked connector is not answered with a status: like every connector-side route it gets 401 `revoked`, and stops.
+ */
+export type CommandLiveness = "live" | "session_closed" | "cancelled" | "expired" | "gone";
+
+/** The commands {@link commandLiveness} never calls dead for being cancelled: they are the cancel and the close themselves. */
+const ENDING_COMMAND_TYPES = ["cancel", "close"];
+
+/**
+ * Whether command `cmdId`, which connector `connectorId` received and has not carried out, may still be carried out. A refusal is
+ * audited (`command.refused_late`), with what was refused and why, never the text of a prompt.
+ */
+export async function commandLiveness(
+  owner: string, connectorId: string, cmdId: string, client: string | null,
+): Promise<{ status: CommandLiveness; cmd_seq: number | null; session_id: string | null }> {
+  return inTransaction(async (q) => {
+    const row = (await q(
+      `SELECT m.cmd_seq, m.type, m.session_id::text AS session_id, s.status AS session_status, s.agent_id,
+              ${expiredSql(3, 4, "m.")} AS expired,
+              EXISTS (SELECT 1 FROM claw_remote_commands o
+                       WHERE o.connector_id = m.connector_id AND o.session_id = m.session_id AND o.cmd_seq > m.cmd_seq
+                         AND o.type = ANY($5::text[])) AS cancelled_after
+         FROM claw_remote_commands m LEFT JOIN claw_remote_sessions s ON s.session_id = m.session_id
+        WHERE m.connector_id = $1 AND m.cmd_id = $2`,
+      [connectorId, cmdId, LIVE_COMMAND_TYPES, LIVE_COMMAND_TTL_SECS, ENDING_COMMAND_TYPES],
+    )).rows[0];
+    let status: CommandLiveness;
+    if (!row) status = "gone";
+    else if (ENDING_COMMAND_TYPES.includes(String(row.type))) status = "live";
+    else if (row.session_id && row.session_status !== "active") status = "session_closed";
+    else if (row.expired) status = "expired";
+    else if (row.cancelled_after && row.type !== "session.new") status = "cancelled";
+    else status = "live";
+    const sessionId = row?.session_id ? String(row.session_id) : null;
+    if (status !== "live") {
+      await writeAudit(q, {
+        owner, actor: connectorId, client, connectorId, agentId: row?.agent_id ?? null, sessionId, action: "command.refused_late",
+        detail: { cmd_id: cmdId, ...(row ? { type: row.type, cmd_seq: Number(row.cmd_seq) } : {}), status },
+      });
+    }
+    return { status, cmd_seq: row ? Number(row.cmd_seq) : null, session_id: sessionId };
+  });
+}
+
+/**
+ * The commands of a session that would make its agent act ({@link LIVE_COMMAND_TYPES} and `decision`), deleted when the session
+ * closes on Claw's side: the person was told it ended, so nothing they sent it before may run after. Its `close` and any `cancel`
+ * stay, to be delivered. A connector that already received one (a frame held in a socket while its machine was asleep) asks before
+ * it carries it out ({@link commandLiveness}) and is told `session_closed`.
+ */
+async function dropActingCommandsOf(q: Querier, sessionIds: string[]): Promise<void> {
+  if (!sessionIds.length) return;
+  await q(
+    "DELETE FROM claw_remote_commands WHERE session_id = ANY($1::uuid[]) AND type = ANY($2::text[])",
+    [sessionIds, [...LIVE_COMMAND_TYPES, "decision"]],
+  );
 }
 
 export interface NewCommand {
@@ -837,6 +902,7 @@ export async function issueCommand(r: IssueRequest): Promise<IssueOutcome> {
     });
     if (r.closesSession) {
       await q("UPDATE claw_remote_sessions SET status = 'closed', updated_at = NOW() WHERE session_id = $1", [r.sessionId]);
+      await dropActingCommandsOf(q, [r.sessionId]);
     }
     if (r.type === "prompt") await notePrompt(q, r, Number(queued.row.cmd_seq));
     return { status: "queued", row: queued.row } as IssueOutcome;
@@ -983,6 +1049,7 @@ export async function createSession(p: {
       const closeId = randomUUID();
       await enqueueCommand(q, { connectorId: v.connector_id, cmdId: closeId, sessionId: v.session_id, type: "close", payload: {} });
       await q("UPDATE claw_remote_sessions SET status = 'closed', updated_at = NOW() WHERE session_id = $1", [v.session_id]);
+      await dropActingCommandsOf(q, [v.session_id]);
       await writeAudit(q, {
         owner: p.owner, actor: p.owner, client: p.client, connectorId: v.connector_id, agentId: v.agent_id, sessionId: v.session_id,
         action: "session.reclaimed",

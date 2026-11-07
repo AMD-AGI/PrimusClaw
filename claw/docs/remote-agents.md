@@ -40,9 +40,11 @@ session), or an access token from the identity provider (see
 | `POST .../connectors/:cid/heartbeat` | Every 30 s: `{version?, agents:[{agent_id, kind, name, capabilities?}], cmd_cursor?}`. Replaces the advertised agent list; `cmd_cursor` lets the server forget commands up to it. |
 | `GET .../connectors/:cid/commands` | The command stream; each `id:` is the connector's `cmd_seq`. On every connect the server sends every command it still holds, in order. It holds a command until a heartbeat's `cmd_cursor` covers it, so a `Last-Event-ID` (or `?after=`) is validated but never skips one: the id of the last frame a client received does not prove it acted on it. A connector skips what it already did, by `cmd_seq` or `cmd_id`. |
 | `POST .../connectors/:cid/events` | `{batch_id, events:[{session_id, seq, type, ts, data}]}`. Answers `{acked:{session_id: highest stored seq}, rejected:[{index, session_id, seq, reason}]}`. |
+| `POST .../connectors/:cid/commands/:cmd_id/confirm` | Before a connector carries out a command it received late, it asks whether it may: `{cmd_id, status}`, where `status` is `live` (run it), `session_closed`, `cancelled` (a `cancel` or `close` of its session was queued after it), `expired` (past the live TTL) or `gone` (Claw no longer holds it). Only `live` may run. A revoked connector gets `401 revoked`, as on every connector-side route. A refusal is audited (`command.refused_late`). See "A command received late" below. |
 | `POST .../connectors/:cid/revoke` | Revoke one of the caller's connectors, as the user-side `DELETE /v1/remote-agents/connectors/:cid` does (the row stays revoked, its commands go, its sessions close): what `claw-connector logout` calls with a device sign-in, whose access token the user-side route refuses. The token names a user, not a connector, so it may revoke any of that user's connectors. `404 not_found` for a row that is not the caller's or is already revoked. |
 
-Command frames are `event: command` with `data: {v, cmd_id, type, session_id, ...}`.
+Command frames are `event: command` with `data: {v, cmd_id, type, session_id, issued_at, ...}`; `issued_at` is when Claw queued
+the command, in milliseconds on Claw's clock.
 Delivery is at least once: a connector deduplicates on `cmd_id` (or skips `cmd_seq` values it has handled). Types: `session.new`
 (`agent_id`, `cwd`, `mode`, and `resume_ref` when the user chose an existing session), `prompt` (`text`), `cancel`, `set_mode` (`mode_id`),
 `resume`, `close`, `decision` (`action_id`, `option_id`, `by`). Nothing else is ever sent.
@@ -363,6 +365,25 @@ assistant's items, reclaiming idle sessions, an attached chat) reads it.
 
 Limits per user: 5 connectors, 10 active sessions, 60 commands a minute, 20 open
 event streams per API replica.
+
+### A command received late
+
+A frame can sit in the connector's socket while its process cannot run: a closed laptop stops it (or the machine sleeps), and
+whatever Claw wrote into the stream meanwhile is read the moment it runs again. By then the person may have closed the session
+or removed the machine, and been told that what they sent will not run. So:
+
+- When Claw closes a session (the person's `close`, a reclaim at the session limit, or the connector's revocation), it deletes
+  that session's queued commands that would make its agent act (`session.new`, `prompt`, `set_mode`, `resume`, `decision`); its
+  `close` and any `cancel` stay to be delivered.
+- The connector keeps a stall clock: it ticks every second, and a gap of more than 5 s between two ticks, on the monotonic clock
+  or the wall clock, means the process could not run (SIGSTOP; the monotonic clock goes on while a process is stopped) or the
+  machine slept (the wall clock jumps over it). Every command but a `cancel` or `close` read within 5 s after such a gap, and
+  every one whose `issued_at` is older than the live TTL (`REMOTE_AGENT_TIMING.liveCommandTtlMs`, the same 5 minutes after which
+  Claw stops delivering it), is confirmed with `POST .../commands/:cmd_id/confirm` before it runs, in its session's order.
+- Anything but `live` is dropped: audited on the machine (`command_dropped`, `reason: "not_live"`), and said in the session, as
+  `command_rejected {type, cmd_id, cmd_seq, reason: "command_not_live", status}` (a `session.new`: `session_closed` with that
+  reason). No answer after a few tries counts as `unconfirmed`, and is dropped too. `401 revoked` stops the connector, as
+  everywhere.
 
 ### Connector versions and setup
 

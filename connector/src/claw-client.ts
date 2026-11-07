@@ -104,6 +104,15 @@ export class ClawClient {
   }
 
   /**
+   * Whether command `cmdId`, received late (after a stall, or past the live TTL), may still be carried out: Claw's answer, `live`
+   * or why not (`session_closed`, `cancelled`, `expired`, `gone`). Throws {@link RevokedError} when this connector was revoked.
+   */
+  async confirmCommand(cid: string, cmdId: string): Promise<string> {
+    const d = await this.json("POST", `/v1/remote-agents/connectors/${encodeURIComponent(cid)}/commands/${encodeURIComponent(cmdId)}/confirm`, {});
+    return typeof d.status === "string" ? d.status : "unknown";
+  }
+
+  /**
    * Revoke connector `cid` at Claw, for `logout`: Claw sends it nothing more and closes its sessions. A key is a user's
    * credential and uses the user-side DELETE; a device sign-in's access token is refused there, and uses the
    * connector-side route made for this. Throws {@link HttpError} 404 `not_found` when Claw has no live row by that id

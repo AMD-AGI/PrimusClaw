@@ -485,8 +485,10 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
           const frames = rows.map((r) => {
             cursor = Number(r.cmd_seq);
             // The fixed fields go last so a payload can never overwrite them.
+            // `issued_at` (Claw's clock, ms): a connector that gets a command later than the live TTL asks before it runs it.
             return sseFrame("command", {
               ...r.payload, v: REMOTE_AGENT_PROTOCOL_VERSION, cmd_id: r.cmd_id, type: r.type, session_id: r.session_id,
+              issued_at: new Date(r.created_at as string | Date).getTime(),
             }, cursor);
           });
           return { frames, more: rows.length === 100 };
@@ -496,6 +498,26 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       });
     },
   );
+
+  /**
+   * A connector asks whether a command it received may still be carried out, before it does: after its machine slept or its
+   * process was stopped (a closed laptop), or for a command older than the live TTL. A frame can sit in the socket's buffer through
+   * that, and the person may meanwhile have closed the session or removed the machine and been told so. Answered with the command's
+   * status (`store.commandLiveness`); only `live` may run. A revoked connector gets 401 `revoked`, as on every connector-side route.
+   */
+  app.post<{ Params: { cid: string; cmd_id: string } }>(CONNECTOR_SIDE_ROUTES.confirm.url, async (req, reply) => {
+    const owner = requireOwner(req, reply, "connector");
+    if (!owner) return;
+    const connector = await ownConnector(req, reply, owner);
+    if (!connector) return;
+    const cmdId = req.params.cmd_id;
+    if (typeof cmdId !== "string" || cmdId.length < 1 || cmdId.length > 128 || /[\u0000-\u001f\u007f]/u.test(cmdId)) {
+      return fail(reply, 400, "invalid_cmd_id");
+    }
+    const r = await store.commandLiveness(owner, connector.connector_id as string, cmdId, clientLabel(req));
+    if (r.status !== "live") logger.info({ owner, connectorId: connector.connector_id, cmdSeq: r.cmd_seq, status: r.status }, "remote_agents.command_refused_late");
+    return reply.send({ ok: true, data: { cmd_id: cmdId, status: r.status } });
+  });
 
   // --- sessions (user side) --------------------------------------------------
 

@@ -108,6 +108,16 @@ record it.
   be made for the turn (`not_from_user`, `not_attended`, `attendance_expired`, `pairing_unavailable`, `rate_limited`), neither
   devenv_list's note nor devenv_send's message sends the model to devenv_pair any more, and a pairing check that itself fails
   (the database) leaves devenv_list answered with the setup commands instead of failing it. Router prompt router-devenv-v10.
+- A command that reached a connector while its process was stopped (a closed laptop: SIGSTOP) or its machine slept no longer runs
+  after the person closed the session or removed the machine. The frame waited in the socket's buffer and was read first when the
+  process ran again, so the agent ran a message the person had been told would not run. The connector now keeps a stall clock (a
+  gap of more than 5 s between one-second ticks, on the monotonic or the wall clock) and confirms every command read within 5 s
+  after a stall, and every command older than the live TTL (`issued_at`, now in every command frame), with the new connector-side
+  `POST /v1/remote-agents/connectors/:cid/commands/:cmd_id/confirm` before it runs; anything but `live` (`session_closed`,
+  `cancelled`, `expired`, `gone`, 401 `revoked`, or no answer) is dropped and reported in the session as `command_rejected` with
+  `reason: "command_not_live"`. Claw deletes the queued commands that would make an agent act when it closes their session
+  (`close`, a reclaim, a revocation) and refuses a late confirmation for them (audited `command.refused_late`). `cancel` and `close`
+  are never held up.
 - "连接我的开发环境" with no machine connected answers the one-line pairing command, every time. devenv_list with no machine, in a
   router turn answering a message the user sent signed in, recently, makes the pairing itself and gives it in `connect_a_machine`
   (`commands` the one line, `text` in the user's language with it in a code block, `pairing` its minutes). Any other turn (a report,

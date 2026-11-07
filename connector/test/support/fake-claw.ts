@@ -59,6 +59,12 @@ export class FakeClaw {
   readonly revocations: Array<{ method: string; id: string; auth: string | undefined }> = [];
   cursor = 0;
   nextSeq = 1;
+  /** Sessions closed on Claw's side (the person closed one, or removed the machine): their commands are no longer live. */
+  readonly closedSessions = new Set<string>();
+  /** What `POST .../commands/:cmd_id/confirm` answers for a command, instead of judging it. */
+  readonly commandStatus = new Map<string, string>();
+  /** Every confirmation asked, in order, and what was answered. */
+  readonly confirmations: Array<{ cmd_id: string; status: string }> = [];
   private readonly streams = new Set<http.ServerResponse>();
   private readonly sockets = new Set<import("node:net").Socket>();
   private server!: http.Server;
@@ -84,7 +90,7 @@ export class FakeClaw {
 
   issue(type: string, sessionId: string, payload: Record<string, unknown> = {}): number {
     const seq = this.nextSeq++;
-    this.commands.push({ seq, payload: { ...payload, cmd_id: payload.cmd_id ?? randomUUID(), type, session_id: sessionId, v: 1 } });
+    this.commands.push({ seq, payload: { issued_at: Date.now(), ...payload, cmd_id: payload.cmd_id ?? randomUUID(), type, session_id: sessionId, v: 1 } });
     this.wake();
     return seq;
   }
@@ -118,8 +124,20 @@ export class FakeClaw {
   get revoked(): boolean { return this.revokedIds.has(this.connectorId); }
   set revoked(v: boolean) { if (v) this.revokedIds.add(this.connectorId); else this.revokedIds.delete(this.connectorId); }
 
+  /** As Claw judges a command a connector asks about: live while held and its session open (`store.commandLiveness`). */
+  liveness(cmdId: string): string {
+    const set = this.commandStatus.get(cmdId);
+    if (set) return set;
+    const c = this.commands.find((x) => x.payload.cmd_id === cmdId);
+    if (!c || c.seq <= this.cursor) return "gone";
+    if (this.closedSessions.has(String(c.payload.session_id)) && c.payload.type !== "close" && c.payload.type !== "cancel") return "session_closed";
+    return "live";
+  }
+
   revoke(): void {
     this.revoked = true;
+    // As on the real server: a revoked connector's sessions close with it.
+    for (const c of this.commands) this.closedSessions.add(String(c.payload.session_id));
     for (const r of this.streams) { try { r.write(`event: revoked\ndata: {}\n\n`); r.end(); } catch { /* gone */ } }
     this.streams.clear();
   }
@@ -179,6 +197,16 @@ export class FakeClaw {
       if (rv[1] !== this.connectorId || this.revoked) return this.json(res, 404, { ok: false, error: "not_found" });
       this.revoke();
       return this.json(res, 200, { ok: true });
+    }
+    const cf = /^\/v1\/remote-agents\/connectors\/([^/]+)\/commands\/([^/]+)\/confirm$/.exec(path);
+    if (cf && req.method === "POST") {
+      if (this.revokedIds.has(cf[1]!)) return this.json(res, 401, { ok: false, error: "revoked" });
+      if (cf[1] !== this.connectorId) return this.json(res, 404, { ok: false, error: "not_found" });
+      const cmdId = decodeURIComponent(cf[2]!);
+      const status = this.liveness(cmdId);
+      this.confirmations.push({ cmd_id: cmdId, status });
+      this.wake();
+      return this.json(res, 200, { ok: true, data: { cmd_id: cmdId, status } });
     }
     const m = /^\/v1\/remote-agents\/connectors(?:\/([^/]+)\/(heartbeat|events|commands))?$/.exec(path);
     if (!m) return this.json(res, 404, { ok: false, error: "not_found" });

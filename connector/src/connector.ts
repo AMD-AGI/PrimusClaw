@@ -8,6 +8,7 @@
  */
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import { performance } from "node:perf_hooks";
 import { randomUUID } from "node:crypto";
 import type { Audit } from "./audit.js";
 import { AttachSupport, fitResumable } from "./attach.js";
@@ -92,6 +93,15 @@ export interface ConnectorTiming extends SessionTiming {
    * often, not every few seconds by a supervisor, until a machine they no longer use is removed.
    */
   limitRetryMs: number;
+  /** How often the stall clock ticks (`stallWatch`): the time between two ticks is how long this process could not run. */
+  stallTickMs: number;
+  /**
+   * A gap this long between two ticks, on the monotonic clock or the wall clock, is a stall: the process was stopped (SIGSTOP, a
+   * closed laptop) or the machine slept. A command frame may have sat in the socket's buffer meanwhile, while the person closed
+   * its session or removed this machine and was told it would not run; so every command received within this long after a stall
+   * is confirmed with Claw before it runs (`confirmLive`).
+   */
+  stallMs: number;
 }
 
 /** The least time between two reconnects made at once on a server's `event: reconnect` (`streamLoop`). */
@@ -118,7 +128,18 @@ export const DEFAULT_TIMING: ConnectorTiming = {
   healthMs: RECHECK_MS,
   healthMinGapMs: 5_000,
   limitRetryMs: 10 * 60_000,
+  stallTickMs: 1_000,
+  stallMs: 5_000,
 };
+
+/**
+ * The commands carried out late without asking: they only end things (a turn, a session), so running one that Claw no longer holds
+ * cannot do anything the person was told would not happen. Everything else (`session.new`, `prompt`, `set_mode`, `resume`,
+ * `decision`) makes an agent act, and is confirmed after a stall or past the live TTL.
+ */
+const ENDING_COMMANDS = new Set(["cancel", "close"]);
+/** Tries at asking Claw whether a late command is still live, before it is dropped as unconfirmed. */
+const CONFIRM_ATTEMPTS = 4;
 
 /** What to do about 409 `connector_limit_reached`, for the log, `status` and the run's own output. */
 export const CONNECTOR_LIMIT_HINT = "Claw already holds the most connectors one person may have, so it will not register this machine: "
@@ -244,6 +265,13 @@ export class Connector {
   private lastHealthAsk = 0;
   private streamCtl: AbortController | null = null;
   private readonly ctl = new AbortController();
+  /** The last tick of the stall clock, monotonic and wall (`stallWatch`). */
+  private tickMono = performance.now();
+  private tickWall = Date.now();
+  /** Until this monotonic time every command (but a cancel or close) is confirmed with Claw first: a stall just ended. */
+  private confirmUntil = -Infinity;
+  /** Claw's clock minus this machine's, from the command stream's `ready` frame, to judge a command's `issued_at`. */
+  private clockOffsetMs = 0;
   /** connector.json, written off the event loop: a heartbeat never waits for the disk (see statefile.ts). */
   private readonly identityOut: SnapshotFile;
 
@@ -678,6 +706,10 @@ export class Connector {
     if (f.event) this.lastFrame = f.event;
     switch (f.event) {
       case "ready":
+        try {
+          const t = Date.parse(String((JSON.parse(f.data ?? "null") as { server_time?: unknown } | null)?.server_time ?? ""));
+          if (Number.isFinite(t)) this.clockOffsetMs = t - Date.now();
+        } catch { /* no clock: commands are judged on this machine's */ }
         // A card that was waiting when the connection dropped is shown again.
         if (reconnect) this.manager.resendPending();
         this.wakeHeartbeat?.();
@@ -703,13 +735,81 @@ export class Connector {
     const cmd = { ...data, cmd_seq: seq } as Command;
     if (this.ledger.seen(seq, cmd.cmd_id)) return; // delivered again after a reconnect; already done
     this.ledger.begin(seq, cmd.cmd_id);
+    // Judged now, as the frame is read, not once it reaches the front of its session's queue: a frame read just after a stall
+    // was in the socket's buffer through it.
+    const late = ENDING_COMMANDS.has(cmd.type) ? null : this.lateness(cmd);
     // Not awaited: the stream must keep being read while a slow command (starting an adapter) runs.
     // The command counts as handled when the manager says so (a prompt: when it reaches the adapter), and
-    // only then can the cursor sent to the server pass it.
+    // only then can the cursor sent to the server pass it. A late one runs only if Claw says it is still live.
     void this.manager.handle(cmd, () => {
       this.ledger.end(seq, cmd.cmd_id);
       this.writeIdentity();
-    });
+    }, late ? () => this.confirmLive(cmd, late) : undefined);
+  }
+
+  /** One tick of the stall clock; a gap since the last one longer than `stallMs` is a stall that just ended. */
+  private tick(): void {
+    const mono = performance.now();
+    const wall = Date.now();
+    // Both clocks: the monotonic one goes on while the process is stopped (SIGSTOP), but on some systems not while the machine is
+    // asleep; the wall clock jumps over a sleep. A wall clock set forward by hand only makes a command be confirmed, never run.
+    const gap = Math.max(mono - this.tickMono, wall - this.tickWall);
+    this.tickMono = mono;
+    this.tickWall = wall;
+    if (gap > this.timing.stallMs) {
+      this.confirmUntil = mono + this.timing.stallMs;
+      this.d.log.warn("this process could not run for a while (stopped, or the machine slept): commands received now are confirmed with Claw before they run", { gap_ms: Math.round(gap) });
+      this.d.audit.record("stall_detected", { gap_ms: Math.round(gap) });
+    }
+  }
+
+  /** Why `cmd` must be confirmed before it runs: a stall just ended (`stall`), or it is older than the live TTL (`old`); or null. */
+  private lateness(cmd: Command): "stall" | "old" | null {
+    this.tick();
+    if (performance.now() <= this.confirmUntil) return "stall";
+    const issued = cmd.issued_at;
+    if (typeof issued === "number" && Number.isFinite(issued) && Date.now() + this.clockOffsetMs - issued > REMOTE_AGENT_TIMING.liveCommandTtlMs) return "old";
+    return null;
+  }
+
+  private async stallWatch(): Promise<void> {
+    while (!this.ctl.signal.aborted) {
+      this.tick();
+      await sleep(this.timing.stallTickMs, this.ctl.signal);
+    }
+  }
+
+  /**
+   * Ask Claw whether `cmd`, received late, may still run; true only for `live`. Anything else (its session closed, cancelled,
+   * expired, gone, this connector revoked, or no answer) drops it: audited, and said in its session, so whoever waits on it is told.
+   */
+  private async confirmLive(cmd: Command, why: "stall" | "old"): Promise<boolean> {
+    let status: string | null = null;
+    let error = "";
+    for (let attempt = 0; attempt < CONFIRM_ATTEMPTS && status === null; attempt++) {
+      if (this.revoked) { status = "connector_revoked"; break; }
+      if (this.ctl.signal.aborted) break;
+      try {
+        status = await this.d.client.confirmCommand(this.cid, cmd.cmd_id);
+      } catch (e) {
+        if (this.isRevocation(e)) { status = "connector_revoked"; void this.onRevoked(e); break; }
+        error = errMessage(e);
+        // A refusal that is an answer (not a failure that passes by itself) is not asked again.
+        if (e instanceof HttpError && e.status < 500 && e.status !== 429) break;
+        if (attempt + 1 < CONFIRM_ATTEMPTS) await sleep(backoffMs(attempt, this.timing.backoffMinMs, this.timing.backoffMaxMs), this.ctl.signal).catch(() => undefined);
+      }
+    }
+    const seq = Number.isSafeInteger(cmd.cmd_seq) ? cmd.cmd_seq : undefined;
+    if (status === "live") {
+      this.d.audit.record("command_confirmed", { type: cmd.type, cmd_id: cmd.cmd_id, cmd_seq: seq, why });
+      return true;
+    }
+    const said = status ?? "unconfirmed";
+    this.d.log.warn("a command received late was dropped: Claw did not confirm it is still live", { type: cmd.type, cmd_seq: seq, status: said, why, ...(error ? { error } : {}) });
+    this.d.audit.record("command_dropped", { reason: "not_live", status: said, why, type: cmd.type, cmd_id: cmd.cmd_id, cmd_seq: seq, ...(error ? { error: error.slice(0, 300) } : {}) });
+    if (cmd.type === "session.new") this.emit(cmd.session_id, "session_closed", { reason: "command_not_live", status: said });
+    else this.emit(cmd.session_id, "command_rejected", { type: cmd.type, cmd_id: cmd.cmd_id, reason: "command_not_live", status: said, ...(seq !== undefined ? { cmd_seq: seq } : {}) });
+    return false;
   }
 
   private async streamLoop(): Promise<void> {
@@ -807,7 +907,13 @@ export class Connector {
         connector_id: this.cid, agents: this.d.config.agents.map((a) => a.id), paused: this.paused,
         unattended_agents: this.d.config.agents.filter((a) => a.unattended).map((a) => a.id),
       });
-      await Promise.all([this.sender(), this.heartbeater(), this.streamLoop(), this.pauseWatcher(), this.sessionsWatcher(), this.healthWatcher()]);
+      // The stall clock starts now: the time start-up took (waiting for Claw, a sign-in) is not a stall.
+      this.tickMono = performance.now();
+      this.tickWall = Date.now();
+      await Promise.all([
+        this.sender(), this.heartbeater(), this.streamLoop(), this.pauseWatcher(), this.sessionsWatcher(), this.healthWatcher(),
+        this.stallWatch().catch(() => undefined),
+      ]);
       result = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : "stopped";
     } catch (e) {
       failure = errMessage(e);
