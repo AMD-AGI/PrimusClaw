@@ -100,13 +100,35 @@ export async function registerConnector(
   /** A connector grant (`pairing.ts`) the caller registers with: bound to the new row in this same transaction. */
   grantId: string | null = null,
 ): Promise<(Row & { replaced: string[]; closedSessions: string[] }) | null> {
+  try {
+    return await registerIn(owner, name, version, client, maxPerUser, credential, onlineWindowMs, alsoOnReplace, grantId);
+  } catch (err) {
+    if (err instanceof ConnectorLimitReached) return null;
+    throw err;
+  }
+}
+
+/**
+ * Thrown inside `registerIn`'s transaction when the owner has no place left even after the rows it replaced: the transaction rolls
+ * back, so a refused registration replaces nothing. Committed, those rows would be revoked and their sessions closed with nobody
+ * told (the caller says the closes only of a registration that succeeded), and a paired machine's grant would point at its revoked
+ * row and be refused for good.
+ */
+class ConnectorLimitReached extends Error {}
+
+async function registerIn(
+  owner: string, name: string, version: string | null, client: string | null, maxPerUser: number,
+  credential: string | null, onlineWindowMs: number | null,
+  alsoOnReplace: ((q: Querier, connectorId: string) => Promise<void>) | undefined, grantId: string | null,
+): Promise<Row & { replaced: string[]; closedSessions: string[] }> {
   return inTransaction(async (q) => {
     await lock(q, `connectors:${owner}`);
     // A connector that lost its local state registers afresh under the same name, and the row it had stays behind offline for
     // good: a stale twin the owner cannot tell from the real one. Rows of this owner with this name that are offline (as
     // `ONLINE_SQL`, with `onlineWindowMs` as its window) are revoked here, as `revokeConnector` does, before the count. One online
     // is another process holding that name and is left alone, and so is one made within the window (registered, not yet
-    // connected). Should a machine whose row was revoked this way come back after all, it is told `revoked` and stops.
+    // connected). Should a machine whose row was revoked this way come back after all, it is told `revoked` and stops. A registration
+    // the limit refuses rolls all of it back (`ConnectorLimitReached`): nothing is replaced unless the new row is made.
     const replaced: string[] = [];
     // The sessions the replaced rows had, closed with them (`revokeIn`): the caller tells their readers and items.
     const closedSessions: string[] = [];
@@ -148,7 +170,7 @@ export async function registerConnector(
     const n = Number((await q(
       "SELECT COUNT(*) AS n FROM claw_remote_connectors WHERE owner_user_id = $1 AND revoked_at IS NULL", [owner],
     )).rows[0].n);
-    if (n >= maxPerUser) return null;
+    if (n >= maxPerUser) throw new ConnectorLimitReached();
     const row = (await q(
       `INSERT INTO claw_remote_connectors (connector_id, owner_user_id, name, version) VALUES ($1, $2, $3, $4)
        RETURNING connector_id, name, created_at`,

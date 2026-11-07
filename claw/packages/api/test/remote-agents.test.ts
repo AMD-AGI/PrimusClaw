@@ -191,6 +191,27 @@ describe("remote agents", { skip }, () => {
       assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_connectors WHERE owner_user_id = 'u1' AND revoked_at IS NULL")).rows[0].n, 4);
     });
 
+    test("a registration refused at the limit leaves the offline twin it would have replaced as it was: not revoked, its sessions open", async () => {
+      // Already past the limit (it was lowered, say): five machines plus one more. `laptop` is an offline twin, an hour old.
+      const twin = await connector("u1", "laptop");
+      for (let i = 1; i < 5; i++) await connector("u1", `m${i}`);
+      await q("INSERT INTO claw_remote_connectors (connector_id, owner_user_id, name) VALUES (gen_random_uuid(), 'u1', 'over')");
+      await q("UPDATE claw_remote_connectors SET created_at = NOW() - interval '1 hour' WHERE connector_id = $1", [twin]);
+      const sid = (await q(
+        "INSERT INTO claw_remote_sessions (session_id, owner_user_id, connector_id, agent_id, cwd, mode) VALUES (gen_random_uuid(), 'u1', $1, 'a1', '/w', 'default') RETURNING session_id::text AS session_id",
+        [twin],
+      )).rows[0].session_id;
+      const again = await as("u1").post("/v1/remote-agents/connectors", { name: "laptop" });
+      assert.deepEqual([again.status, again.body.error], [409, "connector_limit_reached"]);
+      // Nothing was registered, so nothing was replaced: had the twin been revoked here, its session would have closed with nobody
+      // told (the refusal returns before the closes are said), and a paired machine's grant would point at a revoked row for good.
+      assert.equal((await q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [twin])).rows[0].revoked_at, null);
+      assert.equal((await q("SELECT status FROM claw_remote_sessions WHERE session_id = $1", [sid])).rows[0].status, "active");
+      assert.deepEqual((await q("SELECT type FROM claw_remote_events WHERE session_id = $1", [sid])).rows, []);
+      assert.deepEqual((await q("SELECT action FROM claw_remote_audit WHERE owner_user_id = 'u1' AND action <> 'connector.registered'")).rows, []);
+      assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_connectors WHERE owner_user_id = 'u1' AND revoked_at IS NULL")).rows[0].n, 6);
+    });
+
     test("anonymous and 'default' callers are refused", async () => {
       assert.equal((await call(null, "GET", "/v1/remote-agents/connectors")).status, 403);
       assert.equal((await as("default").get("/v1/remote-agents/connectors")).status, 403);

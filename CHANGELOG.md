@@ -197,6 +197,9 @@ record it.
   name now ends its open sessions with a `session_closed {reason: "connector_revoked" | "machine_reconnected", by: "claw"}` of Claw's
   own. Their queued commands were dropped with the row and their sessions closed with no event, so an assistant item whose prompt
   was still queued stayed in progress for good and an attached chat waited for an end that could not come.
+- A connector registration refused with `connector_limit_reached` no longer replaces anything. An owner already past the limit who
+  registered again under a name whose old row was offline had that row revoked and its sessions closed, with no `session_closed`
+  said to their items or chats, and a paired machine's grant left pointing at the revoked row; the refusal now rolls all of it back.
 - Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
   忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
   not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with
