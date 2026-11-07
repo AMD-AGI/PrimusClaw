@@ -156,3 +156,48 @@ test("a non-admin session's teardown completes through the real provider", async
 
   assert.deepEqual(result, { complete: true, found: 1, deleted: 1 });
 });
+
+test("a failed lookup is asked again before the teardown is called incomplete", async () => {
+  // A session with no binding has nothing to park, so no sweep ever comes back for it: the one notification
+  // is the only chance its workloads get, and one SaFE blip used to spend it.
+  bindStore({});
+  const answers: SessionDestroyResult[] = [
+    { complete: false, reason: "lookup_failed", found: 0, deleted: 0 },
+    { complete: true, found: 1, deleted: 1 },
+  ];
+  const waits: number[] = [];
+  let calls = 0;
+
+  const result = await destroySessionCompute(SID, "caller-key", {
+    multiNodeAvailable: () => true,
+    destroyForSession: async () => answers[calls++],
+    sleep: async (ms) => { waits.push(ms); },
+  });
+
+  assert.deepEqual(result, { complete: true, found: 1, deleted: 1 });
+  assert.equal(calls, 2);
+  assert.deepEqual(waits, [1_000]);
+});
+
+test("a lookup that keeps failing is retried a bounded number of times, and a refused delete is not retried", async () => {
+  bindStore({});
+  let lookups = 0;
+  const waits: number[] = [];
+  const failed = await destroySessionCompute(SID, "caller-key", {
+    multiNodeAvailable: () => true,
+    destroyForSession: async () => { lookups += 1; return { complete: false, reason: "lookup_failed", found: 0, deleted: 0 }; },
+    sleep: async (ms) => { waits.push(ms); },
+  });
+  assert.equal(failed.reason, "lookup_failed");
+  assert.equal(lookups, 3);
+  assert.deepEqual(waits, [1_000, 4_000]);
+
+  let deletes = 0;
+  const refused = await destroySessionCompute(SID, "caller-key", {
+    multiNodeAvailable: () => true,
+    destroyForSession: async () => { deletes += 1; return { complete: false, reason: "delete_failed", found: 1, deleted: 0 }; },
+    sleep: async () => { throw new Error("must not wait"); },
+  });
+  assert.equal(refused.reason, "delete_failed");
+  assert.equal(deletes, 1);
+});
