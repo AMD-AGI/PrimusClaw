@@ -12,6 +12,8 @@ export interface SessionRecord {
   status: "active" | "closed";
   /** The mode the session was last verified in. */
   mode: string | null;
+  /** A conversation open in a terminal, watched without taking it over (session.ts `spectate`). */
+  read_only?: boolean;
   created_at: string;
 }
 

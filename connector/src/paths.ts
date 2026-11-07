@@ -31,6 +31,8 @@ export const sessionsFile = (d: Dirs) => path.join(d.state, "sessions.json");
 export const childrenFile = (d: Dirs) => path.join(d.state, "children.json");
 export const pidFile = (d: Dirs) => path.join(d.state, "connector.pid");
 export const pauseFile = (d: Dirs) => path.join(d.state, "paused");
+/** Written by `stop` for the run it is about to end: only that run ends with exit 0, which a supervisor does not restart. */
+export const stopRequestFile = (d: Dirs) => path.join(d.state, "stop-requested.json");
 export const auditFile = (d: Dirs) => path.join(d.state, "audit.jsonl");
 export const outboxDir = (d: Dirs) => path.join(d.state, "outbox");
 export const logDir = (d: Dirs) => path.join(d.state, "logs");

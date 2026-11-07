@@ -24,6 +24,7 @@ import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { AdapterProcess, type AdapterHooks } from "./adapter.js";
 import type { Audit } from "./audit.js";
 import { isAlive, processStart, type ChildRegistry } from "./children.js";
@@ -445,6 +446,20 @@ export class AttachSupport {
     try { return file ? fs.statSync(file).size : null; } catch { return null; }
   }
 
+  /** Where the conversation's transcript is, or null when it cannot be found (yet). */
+  transcriptPath(ref: string): string | null {
+    const file = SESSION_REF_RE.test(ref) ? this.transcriptFile(ref.toLowerCase()) : null;
+    if (!file) return null;
+    // Read only what really is in this config directory's projects: a link that leads anywhere else is not followed.
+    try {
+      const root = fs.realpathSync(path.join(this.configDir, "projects"));
+      const real = fs.realpathSync(file);
+      return real.startsWith(root + path.sep) && real.endsWith(`${ref.toLowerCase()}.jsonl`) ? real : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** `<config dir>/projects/<working directory with every non-alphanumeric turned into "-">/<id>.jsonl`, found by name when that guess misses. */
   private transcriptFile(ref: string): string | null {
     const cached = this.transcripts.get(ref);
@@ -601,7 +616,172 @@ export function fitResumable(base: Record<string, unknown>, items: Resumable[], 
   for (;;) {
     const caps = { ...base, resumable: items.slice(0, n) };
     if (size(caps) <= limit) return caps;
-    if (n === 0) return base;
+    if (n === 0) {
+      // Not even an empty list fits. `watch_live` goes too when the rest fits without it: it only matters with a list, and
+      // the heartbeat must stay as valid as it was before the flag existed.
+      const { watch_live: _watch, ...rest } = base;
+      return size(base) > limit && size(rest) < size(base) ? rest : base;
+    }
     n--;
+  }
+}
+
+// --- watching a conversation another process holds open --------------------------------------
+
+/** One thing the transcript says happened, shaped as the ACP `session/update` an adapter would have sent for it. */
+export interface TranscriptUpdate {
+  type: "user_message_chunk" | "agent_message_chunk" | "tool_call" | "tool_call_update";
+  update: Record<string, unknown>;
+}
+
+const MAX_TOOL_TITLE = 200;
+
+/**
+ * What one line of a Claude Code transcript shows a phone: the user's words, the agent's words, the steps it starts and how
+ * they end. Thinking, sub-agent lines (`isSidechain`), lines Claude Code adds for itself (`isMeta`, summaries, snapshots) and
+ * anything that does not parse are nothing. Read-only: the line is never written back, and nothing here runs.
+ */
+export function transcriptUpdates(line: string): TranscriptUpdate[] {
+  let doc: unknown;
+  try { doc = JSON.parse(line); } catch { return []; }
+  if (!isObject(doc) || doc.isSidechain === true || doc.isMeta === true) return [];
+  if (doc.type !== "user" && doc.type !== "assistant") return [];
+  const msg = isObject(doc.message) ? doc.message : null;
+  if (!msg) return [];
+  const text = (type: "user_message_chunk" | "agent_message_chunk", t: string): TranscriptUpdate[] =>
+    t.trim() ? [{ type, update: { sessionUpdate: type, content: { type: "text", text: t } } }] : [];
+  if (typeof msg.content === "string") return text(doc.type === "user" ? "user_message_chunk" : "agent_message_chunk", msg.content);
+  if (!Array.isArray(msg.content)) return [];
+  const out: TranscriptUpdate[] = [];
+  for (const block of msg.content) {
+    if (!isObject(block)) continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      out.push(...text(doc.type === "user" ? "user_message_chunk" : "agent_message_chunk", block.text));
+    } else if (doc.type === "assistant" && block.type === "tool_use" && typeof block.id === "string") {
+      out.push({ type: "tool_call", update: { sessionUpdate: "tool_call", toolCallId: block.id, title: toolTitle(block.name, block.input), kind: "other", status: "in_progress", rawInput: isObject(block.input) ? block.input : {} } });
+    } else if (doc.type === "user" && block.type === "tool_result" && typeof block.tool_use_id === "string") {
+      const result = resultText(block.content);
+      out.push({ type: "tool_call_update", update: {
+        sessionUpdate: "tool_call_update", toolCallId: block.tool_use_id, status: block.is_error === true ? "failed" : "completed",
+        ...(result ? { content: [{ type: "content", content: { type: "text", text: result } }] } : {}),
+      } });
+    }
+  }
+  return out;
+}
+
+function toolTitle(name: unknown, input: unknown): string {
+  const tool = typeof name === "string" && name ? name : "Tool";
+  const i = isObject(input) ? input : {};
+  const what = [i.description, i.command, i.file_path, i.path, i.pattern, i.url].find((v): v is string => typeof v === "string" && v.trim() !== "");
+  return cleanTitleTo(what ? `${tool}: ${what}` : tool, MAX_TOOL_TITLE);
+}
+
+function resultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((c) => isObject(c) && c.type === "text" && typeof c.text === "string").map((c) => (c as { text: string }).text).join("\n");
+}
+
+function cleanTitleTo(raw: string, max: number): string {
+  const one = raw.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  return one.length > max ? `${one.slice(0, max - 1)}…` : one;
+}
+
+/** How much of the end of a transcript is read for what came just before a watcher arrived. */
+const TAIL_BACKLOG_BYTES = 64 * 1024;
+/** What one look reads at most; a burst larger than this is read over the next looks. */
+const TAIL_READ_BYTES = 256 * 1024;
+/** A line longer than this (one huge tool result) is skipped rather than held. */
+const TAIL_MAX_LINE = 1024 * 1024;
+/** How many of the backlog's updates are passed on. */
+export const TAIL_BACKLOG_UPDATES = 20;
+
+/**
+ * Follows a transcript another process is writing, from its end, by reading it: the file is opened read-only and nothing
+ * is ever written to it or to anything next to it. `poll()` returns what was appended since the last look; `backlog()`
+ * what was at the end of it before the first look. A file that is not there yet is looked for again; one that shrinks
+ * (rewritten) is followed from its new end.
+ */
+export class TranscriptTail {
+  private offset: number | null = null;
+  private partial = "";
+  private skipping = false;
+  /** A read can end inside a character; the decoder keeps its first bytes for the next one. */
+  private decoder = new StringDecoder("utf8");
+
+  constructor(private readonly locate: () => string | null) {}
+
+  /** The last updates already in the transcript (at most {@link TAIL_BACKLOG_UPDATES}); from here on `poll()` reads what is new. */
+  backlog(): TranscriptUpdate[] {
+    const file = this.locate();
+    if (!file) return [];
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(file, "r");
+      const size = fs.fstatSync(fd).size;
+      const start = Math.max(0, size - TAIL_BACKLOG_BYTES);
+      const buf = Buffer.alloc(size - start);
+      const n = buf.length ? fs.readSync(fd, buf, 0, buf.length, start) : 0;
+      this.offset = start + n;
+      this.decoder = new StringDecoder("utf8");
+      // Through the decoder: a read that ends inside a character keeps its first bytes for the next poll.
+      let text = this.decoder.write(buf.subarray(0, n));
+      // The first line is cut in the middle unless the read began at the start.
+      if (start > 0) text = text.slice(text.indexOf("\n") + 1);
+      const end = text.lastIndexOf("\n");
+      this.partial = end === text.length - 1 ? "" : text.slice(end + 1);
+      const updates = text.slice(0, end + 1).split("\n").flatMap((l) => (l ? transcriptUpdates(l) : []));
+      return updates.slice(-TAIL_BACKLOG_UPDATES);
+    } catch {
+      return [];
+    } finally {
+      if (fd !== null) fs.closeSync(fd);
+    }
+  }
+
+  /** Start from the end without reading what is there (a watcher that was already following, after a restart). */
+  fromEnd(): void {
+    const file = this.locate();
+    try { this.offset = file ? fs.statSync(file).size : null; } catch { this.offset = null; }
+    this.partial = "";
+    this.decoder = new StringDecoder("utf8");
+  }
+
+  /** What was appended since the last look. */
+  poll(): TranscriptUpdate[] {
+    const file = this.locate();
+    if (!file) return [];
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(file, "r");
+      const size = fs.fstatSync(fd).size;
+      if (this.offset === null) this.offset = 0;   // it did not exist when the watch began: all of it is new
+      if (size < this.offset) { this.offset = size; this.partial = ""; this.decoder = new StringDecoder("utf8"); return []; }
+      if (size === this.offset) return [];
+      const buf = Buffer.alloc(Math.min(TAIL_READ_BYTES, size - this.offset));
+      const n = fs.readSync(fd, buf, 0, buf.length, this.offset);
+      this.offset += n;
+      return this.take(this.decoder.write(buf.subarray(0, n)));
+    } catch {
+      return [];
+    } finally {
+      if (fd !== null) fs.closeSync(fd);
+    }
+  }
+
+  private take(chunk: string): TranscriptUpdate[] {
+    const text = this.partial + chunk;
+    const end = text.lastIndexOf("\n");
+    if (end < 0) {
+      this.partial = text;
+      if (this.partial.length > TAIL_MAX_LINE) { this.partial = ""; this.skipping = true; }
+      return [];
+    }
+    this.partial = text.slice(end + 1);
+    const lines = text.slice(0, end).split("\n");
+    if (this.skipping) { lines.shift(); this.skipping = false; }   // the rest of a line too long to hold
+    if (this.partial.length > TAIL_MAX_LINE) { this.partial = ""; this.skipping = true; }
+    return lines.flatMap((l) => (l ? transcriptUpdates(l) : []));
   }
 }

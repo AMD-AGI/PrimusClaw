@@ -59,6 +59,9 @@ export interface ConnectorTiming extends SessionTiming {
   authFailWindowMs: number;
 }
 
+/** The least time between two reconnects made at once on a server's `event: reconnect` (`streamLoop`). */
+const RESTART_RECONNECT_GAP_MS = 5_000;
+
 export const DEFAULT_TIMING: ConnectorTiming = {
   ...DEFAULT_SESSION_TIMING,
   heartbeatMs: REMOTE_AGENT_TIMING.heartbeatMs,
@@ -218,8 +221,12 @@ export class Connector {
     return Promise.all(this.d.config.agents.map(async (a) => {
       // `unattended`: sessions start in a mode that does not ask before a write or a command. `unattended_allowed`:
       // a phone may switch this agent to such a mode. A client shows the first so nobody is surprised by it.
-      const base = { ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes };
       const support = this.attach.get(a.id);
+      // `watch_live`: a conversation open in a terminal can be opened read-only (session.ts `spectate`); a client offers that only then.
+      const base = {
+        ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes,
+        ...(support ? { watch_live: true } : {}),
+      };
       // An attach agent also says which existing sessions it could take over, and whether anything holds them open now.
       const capabilities = support ? fitResumable(base, await support.resumable()) : base;
       return { agent_id: a.id, kind: a.kind, name: a.name, capabilities };
@@ -453,7 +460,7 @@ export class Connector {
       case "command":
         return this.onCommand(f);
       default:
-        return; // ping, superseded: a superseded stream simply ends and the loop reconnects
+        return; // ping, superseded, reconnect: the stream ends and the loop reconnects (`reconnect`: at once, `streamLoop`)
     }
   }
 
@@ -481,6 +488,7 @@ export class Connector {
   private async streamLoop(): Promise<void> {
     let attempt = 0;
     let reconnect = false;
+    let lastRestartAt = -Infinity;
     while (!this.ctl.signal.aborted) {
       if (this.paused) { await sleep(this.timing.pausePollMs, this.ctl.signal); continue; }
       this.streamCtl = new AbortController();
@@ -488,17 +496,24 @@ export class Connector {
         const sig = AbortSignal.any([this.ctl.signal, this.streamCtl.signal]);
         let got = false;
         this.lastFrame = "";
+        let restart = false;
         for await (const f of this.d.client.commands(this.cid, { lastEventId: this.ledger.highestSeen || undefined, signal: sig, watchdogMs: this.timing.watchdogMs })) {
           if (!got) { got = true; attempt = 0; this.authFailures = 0; }
           this.onFrame(f, reconnect);
           if (f.event === "ready") reconnect = true;
+          // The Claw replica serving this stream is shutting down (a release): leave it now, without waiting for the
+          // end of the response (which a gateway may hold) or a backoff, and open the stream on another replica.
+          if (f.event === "reconnect") { restart = true; break; }
         }
         // The server ended the stream on purpose: a Claw release or restart, another run of this connector
         // (`superseded`), or an access token that ran out (`token_expired`). Said once, so a log shows why.
         if (!this.ctl.signal.aborted && !this.paused) {
-          const why = this.lastFrame === "superseded" || this.lastFrame === "token_expired" ? this.lastFrame : "the server closed the stream (a Claw release or restart)";
+          const why = restart ? "restart" : this.lastFrame === "superseded" || this.lastFrame === "token_expired" ? this.lastFrame : "the server closed the stream (a Claw release or restart)";
           this.d.log.info("command stream ended by the server; reconnecting", { why });
           recordDisconnect(this.d.dirs, { reason: "server_closed", detail: why });
+          // At once, but only once in a while: a stream that lands on another replica that is also leaving gets the
+          // usual backoff, so a release never turns into a burst of reconnects.
+          if (restart && Date.now() - lastRestartAt >= RESTART_RECONNECT_GAP_MS) { lastRestartAt = Date.now(); attempt = 0; continue; }
         }
       } catch (e) {
         if (this.isRevocation(e)) return void (await this.onRevoked(e));
@@ -547,6 +562,7 @@ export class Connector {
     try {
       const up = await this.startup();
       if (up !== "ok") return (result = up);
+      await this.manager.restoreReadOnly();
       this.d.audit.record("connector_online", {
         connector_id: this.cid, agents: this.d.config.agents.map((a) => a.id), paused: this.paused,
         unattended_agents: this.d.config.agents.filter((a) => a.unattended).map((a) => a.id),

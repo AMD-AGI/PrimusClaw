@@ -41,12 +41,28 @@
  *       masked as a credential on the way (a credential-shaped Idempotency-Key) still ends by its number; an end naming no prompt (an
  *       older connector) makes the item count again, as before; a stop whose cancel finds nothing running (the connector restarted
  *       mid-turn, and that turn's end never comes) ends every instruction sent before it
+ *   F17 a machine revoked while a card that would send to it waits: the card closes (expired, `connector_revoked`), the router's
+ *       pending cards no longer name it, a press afterwards sends nothing; another machine's card, and another user's revoke, are untouched;
+ *       a card proposed while the machine is being revoked is refused (no_machine), never left waiting; a revoke never waits for a card
+ *       that is being pressed (the press holds the card while its send waits for the machine: a cycle Postgres cannot see); a machine
+ *       whose offline row is replaced by registering again under its name closes its cards the same way
+ *   F20 an agent that only takes over existing conversations (kind attach) is never chosen for a new session, which its connector would
+ *       refuse: with another agent there, that one; alone, a question listing its conversations, else no_agent saying why
+ *   F21 at the limit of open sessions a new one closes the longest unused idle session of the user's (never one working, waiting for
+ *       an approval, or with a command not yet collected, unless silent for a day), tells its connector, and audits it; the route
+ *       says which it closed; with none that may be closed, session_limit_reached says what to do
+ *   F22 an item closed by its stop button keeps nothing open once the stopped turn's end comes: no prompt listed, no turn counted,
+ *       whether the connector names the prompt or not, and whether the turn was cancelled or finished on its own; the next
+ *       instruction opens it afresh and its own end closes it
  *   N1  only three things are ever pushed of an instruction the assistant sent, each once, each saying which session and which kind:
  *       it needs the user (the permission request whole: its options and when it runs out, so a channel puts it to them as buttons;
  *       the same request sent again after a reconnect is not pushed again), it finished, it failed (a turn that ended in an error, an
  *       instruction the machine refused, a session that closed before it finished); nothing else (an approval answered is not news)
  *   N2  the sessions list says what each active session waits on its user for now: a request asked and not yet answered, once even
  *       when sent again; not one answered, nor one from a turn that has ended; nothing of anyone else's
+ *   NL1 a new session asked for (new_session) is never one already open, beside the session named when one is; a folder written with ~
+ *       is read in the home folder the agent's roots are in, and must still be under a root
+ *   NL2 ~ is read in the one home folder the roots show, never guessed
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -452,6 +468,190 @@ describe("development environment items and devenv_send", { skip }, () => {
     const report = await w.routerTurn(alice);
     await assert.rejects(tools.devenvSend(report, { text: "rm -rf build" }), (e: Recorded) => e.code === "not_from_user");
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations"))[0].n, 3);
+  });
+
+  test("F4b no machine gives the exact commands that connect one; a connector below the minimum starts no session", async () => {
+    const alice = await w.user("alice");
+    const none = await tools.devenvSend(await userTurn(alice, "让开发机上的 claude 跑 make"), { text: "make" }).catch((e) => e);
+    assert.equal((none as Recorded).code, "no_machine");
+    const setup = (none as Recorded).data.connect_a_machine;
+    assert.equal(setup.commands[0], "npm install -g @primusclaw/connector");
+    assert.match(setup.commands[2], /^claw-connector login --server /);
+    assert.match(setup.text_zh, /claw-connector init/);
+    assert.match(setup.text_en, /claw-connector service install/);
+
+    const laptop = await machine("alice", "laptop");
+    const open = await chatSession("alice", laptop);   // (opened while its connector was still new enough)
+    await w.q("UPDATE claw_remote_connectors SET version = '0.1.2' WHERE connector_id = $1", [laptop]);
+    // A session already open on it continues: only a new one is refused.
+    const cont = await tools.planSend("alice", { text: "make", target: open });
+    assert.equal(cont.ok, true, JSON.stringify(cont));
+    await w.q("UPDATE claw_remote_sessions SET status = 'closed' WHERE session_id = $1", [open]);
+    const old = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make"), { text: "make", target: "laptop" }).catch((e) => e);
+    assert.equal((old as Recorded).code, "connector_outdated");
+    assert.match((old as Recorded).message, /0\.1\.2, older than 0\.1\.3.*npm install -g @primusclaw\/connector@latest && claw-connector stop && claw-connector service install$/);
+    // A card pressed after the connector went out of date sends nothing either.
+    const plan = { connector_id: laptop, machine: "laptop", agent_id: "claude", agent_name: null, session_id: null, resume_ref: null, cwd: "/home/u/repo", label: "laptop/claude/new" };
+    const sent = await tools.executeSend("alice", plan, "make", "k-outdated", "en");
+    assert.deepEqual([sent.ok, (sent as Recorded).error], [false, "connector_outdated"]);
+    assert.deepEqual(await queued(laptop), []);
+  });
+
+  test("F17 a machine revoked with its card waiting: the card closes, the router no longer puts it to them, a press sends nothing", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const desktop = await machine("alice", "desktop");
+    const toLaptop = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
+    const toDesktop = await tools.devenvSend(await userTurn(alice, "让 desktop 上的 claude 跑 lint"), { text: "跑 lint", target: "desktop" });
+    assert.equal(toLaptop.done, false, JSON.stringify(toLaptop));
+    assert.equal(toDesktop.done, false, JSON.stringify(toDesktop));
+    assert.match(await schedules.renderScheduleState("alice"), /on the machine "laptop"/);
+
+    // Revoked through the user's route (the same one claw-connector logout's revoke reaches): laptop's card closes with it.
+    const r = await fetch(`${base}/v1/remote-agents/connectors/${laptop}`, { method: "DELETE", headers: { "x-test-user": "alice" } });
+    assert.equal(r.status, 200, await r.text());
+    const card = (await w.q("SELECT * FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toLaptop.confirmation_id]))[0];
+    assert.deepEqual([card.status, card.decided_via, card.result?.error], ["expired", "connector_revoked", "no_machine"]);
+    assert.deepEqual((await schedules.pendingConfirmations("alice")).map((c) => c.confirmation_id), [toDesktop.confirmation_id],
+      "the other machine's card still waits");
+    const state = await schedules.renderScheduleState("alice");
+    assert.doesNotMatch(state, /on the machine "laptop"/, "the router is not told of the revoked machine's card");
+    assert.match(state, /on the machine "desktop"/);
+
+    // Pressed afterwards: answered before (closed), nothing sent; the card stays as it was closed.
+    const pressed = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(toLaptop.confirmation_id), decision: "allow", via: "button" });
+    assert.deepEqual([pressed.status, pressed.answered_now], ["expired", false]);
+    assert.deepEqual(await queued(laptop), []);
+    // Another user's revoke never touches alice's cards, and revoking again is a 404 that closes nothing.
+    await w.user("bob");
+    await machine("bob", "bob-box");
+    const again = await fetch(`${base}/v1/remote-agents/connectors/${desktop}`, { method: "DELETE", headers: { "x-test-user": "bob" } });
+    assert.equal(again.status, 404);
+    assert.equal((await w.q("SELECT status FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toDesktop.confirmation_id]))[0].status, "pending");
+  });
+
+  test("F17e a machine replaced by registering again under its name: its waiting card closes as on a revoke", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    await machine("alice", "desktop");
+    const toLaptop = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
+    const toDesktop = await tools.devenvSend(await userTurn(alice, "让 desktop 上的 claude 跑 lint"), { text: "跑 lint", target: "desktop" });
+    assert.equal(toLaptop.done, false, JSON.stringify(toLaptop));
+    assert.equal(toDesktop.done, false, JSON.stringify(toDesktop));
+    // laptop lost its local state: its row is an hour old and offline, and it registers afresh under the same name.
+    await w.q("UPDATE claw_remote_connectors SET created_at = NOW() - interval '1 hour', heartbeat_at = NOW() - interval '1 hour', stream_seen_at = NULL WHERE connector_id = $1", [laptop]);
+    const again = await post("alice", "/v1/remote-agents/connectors", { name: "laptop" });
+    assert.equal(again.status, 201, JSON.stringify(again.body));
+    assert.ok((await w.q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [laptop]))[0].revoked_at, "the old row was replaced");
+    const card = (await w.q("SELECT * FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toLaptop.confirmation_id]))[0];
+    assert.deepEqual([card.status, card.decided_via, card.result?.error], ["expired", "connector_revoked", "no_machine"]);
+    assert.deepEqual((await schedules.pendingConfirmations("alice")).map((c) => c.confirmation_id), [toDesktop.confirmation_id],
+      "the other machine's card still waits");
+    assert.doesNotMatch(await schedules.renderScheduleState("alice"), /on the machine "laptop"/);
+  });
+
+  test("F17b a card drawn while its machine is being revoked: the turn is refused, no card is left waiting", async () => {
+    const { inTransaction } = await import("../src/infra/db.js");
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    // A revoke holds the machine's row (as `revokeConnector` does) while the turn plans against it.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let held!: () => void;
+    const isHeld = new Promise<void>((r) => { held = r; });
+    const revoke = inTransaction(async (q) => {
+      await q("UPDATE claw_remote_connectors SET revoked_at = NOW(), stream_seen_at = NULL WHERE connector_id = $1", [laptop]);
+      held();
+      await gate;
+      await tools.closeCardsOfConnector(q, "alice", laptop);
+    });
+    await isHeld;
+    const sent = tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" })
+      .then((v) => v, (e) => e);
+    // The turn is seen waiting on the machine's row; a turn that never takes it would draw its card meanwhile.
+    for (let i = 0; i < 100; i++) {
+      const waiting = await w.q("SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%claw_remote_connectors%FOR SHARE%'");
+      if (waiting.length) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    release();
+    await revoke;
+    const out = await sent;
+    assert.equal((out as Recorded).code, "no_machine", JSON.stringify(out));
+    assert.deepEqual(await schedules.pendingConfirmations("alice"), [], "no card waits for the revoked machine");
+    assert.deepEqual(await queued(laptop), []);
+  });
+
+  test("F17c a revoke while a card of that machine is being pressed: the revoke finishes, it does not wait for the press", async () => {
+    const { inTransaction } = await import("../src/infra/db.js");
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const card = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
+    assert.equal(card.done, false, JSON.stringify(card));
+    // The press holds the card's row (as `decideConfirmation` does) while its send waits for the machine's.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let held!: () => void;
+    const isHeld = new Promise<void>((r) => { held = r; });
+    const press = inTransaction(async (q) => {
+      await q("SELECT 1 FROM claw_assistant_confirmations WHERE confirmation_id = $1 FOR UPDATE", [card.confirmation_id]);
+      held();
+      await gate;
+    });
+    await isHeld;
+    try {
+      const r = await Promise.race([
+        fetch(`${base}/v1/remote-agents/connectors/${laptop}`, { method: "DELETE", headers: { "x-test-user": "alice" } }),
+        new Promise<null>((r) => setTimeout(() => r(null), 5000)),
+      ]);
+      assert.ok(r, "the revoke waited for the card being pressed");
+      assert.equal(r.status, 200, await r.text());
+      assert.ok((await w.q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [laptop]))[0].revoked_at);
+    } finally {
+      release();
+      await press;
+    }
+  });
+
+  test("F17d a card pressed while its machine is being revoked: the press queues nothing and fails, the revoke does not wait", async () => {
+    const { inTransaction } = await import("../src/infra/db.js");
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const card = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
+    assert.equal(card.done, false, JSON.stringify(card));
+    // A revoke that has marked the machine and holds its row, not yet committed: the press reads the machine as still there.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let held!: () => void;
+    const isHeld = new Promise<void>((r) => { held = r; });
+    let closed: string[] = [];
+    const revoke = inTransaction(async (q) => {
+      await q("UPDATE claw_remote_connectors SET revoked_at = NOW(), stream_seen_at = NULL WHERE connector_id = $1", [laptop]);
+      held();
+      await gate;
+      closed = await tools.closeCardsOfConnector(q, "alice", laptop);
+    });
+    await isHeld;
+    const press = schedules.decideConfirmation({ userId: "alice", confirmationId: String(card.confirmation_id), decision: "allow", via: "button" });
+    // The press is seen waiting on the machine's row, holding its card.
+    let seen = false;
+    for (let i = 0; i < 100 && !seen; i++) {
+      seen = (await w.q("SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%claw_remote_connectors%FOR UPDATE%'")).length > 0;
+      if (!seen) await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(seen, "the press reached the machine's row");
+    release();
+    await revoke;
+    assert.deepEqual(closed, [], "the card being pressed is left to its press");
+    const out = await press;
+    assert.deepEqual([out.status, out.answered_now, (out.result as Recorded)?.error], ["failed", true, "no_machine"], JSON.stringify(out));
+    assert.deepEqual(await queued(laptop), [], "nothing queued for the revoked machine");
+    assert.deepEqual(await w.q("SELECT 1 FROM claw_remote_sessions WHERE connector_id = $1 AND status = 'active'", [laptop]), []);
   });
 
   test("F4 only the user's own machines; two that fit is a question; an offline one says so", async () => {
@@ -943,6 +1143,173 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_cmd_seqs], ["done", []]);
   });
 
+  test("F20 an agent that only takes over existing conversations is never chosen for a new session; the refusal says why", async () => {
+    const alice = await w.user("alice");
+    const ATTACH = { agent_id: "claude-attach", kind: "attach", name: "Claude Code (existing sessions)", capabilities: { roots: ["/home/u/repo"] } };
+    // Both offered, none named: the one that can start a session, not a question and never the takeover-only one.
+    const cid = await machine("alice", "laptop", { agents: [ATTACH, CLAUDE] });
+    const both = await sendByCard(await userTurn(alice, "让开发机跑 make test"), { text: "make test" });
+    assert.equal(both.status, "done", JSON.stringify(both));
+    const made = (await queued(cid)).filter((c: Recorded) => c.type === "session.new");
+    assert.deepEqual(made.map((c: Recorded) => c.payload.agent_id), ["claude"]);
+
+    // Only the takeover-only agent, with nothing to take over: no card, a refusal that says why, nothing queued.
+    const only = await machine("alice", "desktop", { agents: [ATTACH] });
+    const none = await tools.devenvSend(await userTurn(alice, "让 desktop 跑 make"), { text: "make", target: "desktop" }).catch((e) => e);
+    assert.equal((none as Recorded).code, "no_agent", JSON.stringify(none));
+    assert.match((none as Recorded).message, /only takes over a conversation already on that machine[\s\S]*cannot start a new session/);
+    assert.deepEqual(await queued(only), []);
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations WHERE status = 'pending'"))[0].n, 0);
+
+    // With a conversation to take over: a question listing it; named, it is taken over (resume_ref), never a session without one.
+    await store.recordHeartbeat(only, "alice", { version: "0.1.3", cmdCursor: null, agents: [{ ...ATTACH, capabilities: { ...ATTACH.capabilities,
+      resumable: [{ ref: "c0ffee00-0000-4000-8000-0000000000f2", title: "t", cwd: "/home/u/repo", updated_at: Math.floor(Date.now() / 1000), state: "idle" }] } }] as never });
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [only]);
+    const which = await tools.devenvSend(await userTurn(alice, "让 desktop 跑 make"), { text: "make", target: "desktop" }).catch((e) => e);
+    assert.equal((which as Recorded).code, "which_agent", JSON.stringify(which));
+    assert.deepEqual((which as Recorded).data.choices, ["desktop/claude-attach/1"]);
+    const taken = await sendByCard(await userTurn(alice, "让 desktop/claude-attach/1 跑 make"), { text: "make", target: "desktop/claude-attach/1" });
+    assert.equal(taken.status, "done", JSON.stringify(taken));
+    const newOnDesktop = (await queued(only)).filter((c: Recorded) => c.type === "session.new");
+    assert.deepEqual(newOnDesktop.map((c: Recorded) => [c.payload.agent_id, c.payload.resume_ref]), [["claude-attach", "c0ffee00-0000-4000-8000-0000000000f2"]]);
+  });
+
+  test("F21 at the limit of open sessions, a new one closes the longest unused idle one instead of being refused", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const sids: string[] = [];
+    for (let i = 0; i < 10; i++) sids.push(await chatSession("alice", cid));
+    // All ten were used within the half hour: none may be closed, and the refusal says what to do. (A folder none of them is in, so
+    // the instruction needs a new session rather than continuing an idle one.)
+    const full = await sendByCard(await userTurn(alice, "让 claude 跑 make"), { text: "make", target: "laptop", cwd: "/home/u/repo/web" });
+    assert.deepEqual([full.status, full.error], ["failed", "session_limit_reached"], JSON.stringify(full));
+    assert.match(String(full.message), /all 10 sessions[\s\S]*\/agent close/);
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_remote_sessions WHERE status = 'active'"))[0].n, 10);
+
+    // An hour unused: one working (its turn under way), one waiting for approval, one with a prompt not yet collected, and two idle.
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '1 hour'");
+    await events("alice", cid, sids[0], [chunk("still going")]);
+    await events("alice", cid, sids[1], [ask("act-9", "Run rm")]);
+    await events("alice", cid, sids[3], [end()]);
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '1 hour'");
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '2 hours' WHERE session_id = ANY($1::uuid[])", [[sids[0], sids[1], sids[2]]]);
+    assert.equal((await post("alice", `/v1/remote-agents/sessions/${sids[2]}/commands`, { type: "prompt", text: "x" })).status, 202);
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '2 hours' WHERE session_id = $1", [sids[2]]);
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '90 minutes' WHERE session_id = $1", [sids[3]]);
+    // Others' sessions are not hers to close.
+    await w.user("bob");
+    const bobBox = await machine("bob", "bob-box");
+    const bobSid = await chatSession("bob", bobBox);
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '3 hours' WHERE session_id = $1", [bobSid]);
+
+    const sent = await sendByCard(await userTurn(alice, "让 claude 跑 make"), { text: "make", target: "laptop", cwd: "/home/u/repo/web" });
+    assert.equal(sent.status, "done", JSON.stringify(sent));
+    const closed = (await w.q("SELECT session_id::text AS s FROM claw_remote_sessions WHERE status = 'closed'")).map((r: Recorded) => r.s);
+    assert.deepEqual(closed, [sids[3]], "the longest unused that is idle: not the working, the waiting or the queued one, and not bob's");
+    const close = (await queued(cid)).filter((c: Recorded) => c.type === "close");
+    assert.deepEqual(close.map((c: Recorded) => c.session_id), [sids[3]], "its connector is told to close it");
+    const audit = (await w.q("SELECT detail FROM claw_remote_audit WHERE action = 'session.reclaimed'"))[0].detail;
+    assert.equal(audit.for_session, sent.session_id);
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_remote_sessions WHERE status = 'active' AND owner_user_id = 'alice'"))[0].n, 10);
+
+    // A day without a word: even one mid-turn may be closed (its machine went away).
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() WHERE owner_user_id = 'alice' AND status = 'active'");
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '25 hours' WHERE session_id = $1", [sids[0]]);
+    const route = await post("alice", "/v1/remote-agents/sessions", { connector_id: cid, agent_id: "claude", cwd: "/home/u/repo" });
+    assert.equal(route.status, 201, JSON.stringify(route.body));
+    assert.deepEqual(route.body.reclaimed, [sids[0]], "the route says which one it closed");
+    const again = await post("alice", "/v1/remote-agents/sessions", { connector_id: cid, agent_id: "claude", cwd: "/home/u/repo" });
+    assert.deepEqual([again.status, again.body.error], [409, "session_limit_reached"]);
+  });
+
+  test("F22 a stopped item clears what it still had open when the stopped turn's end comes, named or counted", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop");
+    const promptSeqs = async (sid: string): Promise<number[]> =>
+      (await w.q("SELECT cmd_seq FROM claw_remote_commands WHERE session_id = $1 AND type = 'prompt' ORDER BY cmd_seq", [sid])).map((r: Recorded) => Number(r.cmd_seq));
+    const endOf = (seq: number | null, stopReason = "end_turn"): [string, Recorded] => ["turn_end", { stopReason, cmd_id: seq === null ? null : `id-${seq}`, cmd_seq: seq }];
+    const open = async (sid: string) => { const it = await remoteItem(sid); return [it.board_state, it.outcome, it.params.open_turns, it.params.open_cmd_seqs]; };
+
+    for (const [named, stopReason] of [[true, "cancelled"], [true, "end_turn"], [false, "cancelled"]] as const) {
+      const out = await sendByCard(await userTurn(alice, `跑 make test ${stopReason}`), { text: `跑 make test ${stopReason}` });
+      const sid = String(out.session_id);
+      const [p1] = await promptSeqs(sid);
+      assert.equal((await post("alice", `/v1/work-items/${String(out.item_id)}/stop`, {})).status, 200);
+      // Closed by the button, before the machine has said anything: the running prompt is still on the books.
+      assert.deepEqual(await open(sid), ["done", "stopped", 1, [p1]]);
+      await events("alice", cid, sid, [chunk("half"), named ? endOf(p1, stopReason) : end(stopReason)]);
+      assert.deepEqual(await open(sid), ["done", "stopped", 0, named ? [] : null], `named=${named} ${stopReason}: nothing left open`);
+      // The next instruction opens it afresh, and its own end closes it.
+      assert.equal((await post("alice", `/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "pwd" })).status, 202);
+      const p2 = (await promptSeqs(sid)).at(-1)!;
+      assert.deepEqual(await open(sid), ["in_progress", null, 1, [p2]]);
+      await events("alice", cid, sid, [chunk("/home/u/repo"), named ? endOf(p2) : end()]);
+      assert.deepEqual(await open(sid), ["done", "answered", 0, named ? [] : null]);
+    }
+  });
+
+  test("NL1 a new session asked for is never one already open, and a folder written with ~ is read in the machine's home", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop", {
+      agents: [{ ...CLAUDE, capabilities: { roots: ["/home/u/repo", "/home/u/work"] } }],
+    });
+    const idle = await chatSession("alice", cid);
+    // Without new_session an idle session of that agent continues; with it, a new one is opened beside it.
+    const plain = await tools.planSend("alice", { text: "看看", agent: "claude" });
+    assert.ok(plain.ok && plain.plan.session_id === idle, JSON.stringify(plain));
+    const fresh = await sendByCard(await userTurn(alice, "新开一个会话看看"), { text: "看看", agent: "claude", new_session: true });
+    assert.equal(fresh.status, "done", JSON.stringify(fresh));
+    assert.notEqual(fresh.session_id, idle, "a new session, not the idle one");
+    const cmds = await queued(cid);
+    assert.deepEqual(cmds.map((c: Recorded) => c.type), ["session.new", "prompt"]);
+    assert.equal(cmds[0].payload.cwd, "/home/u/repo");
+    // Naming the open session with new_session: a new one beside it, on its machine and with its agent.
+    const beside = await tools.planSend("alice", { text: "看看", target: idle, new_session: true });
+    assert.ok(beside.ok && beside.plan.session_id === null && beside.plan.agent_id === "claude", JSON.stringify(beside));
+
+    // ~/work is /home/u/work there (the roots show the home folder); the card shows the folder as the machine names it.
+    const tilde = await tools.planSend("alice", { text: "看看", agent: "claude", cwd: "~/work", new_session: true });
+    assert.ok(tilde.ok, JSON.stringify(tilde));
+    assert.deepEqual([tilde.plan.cwd, tilde.plan.session_id], ["/home/u/work", null]);
+    const shown = await tools.devenvSend(await userTurn(alice, "新开一个会话在 ~/work 里看看"), { text: "看看", agent: "claude", cwd: "~/work", new_session: true });
+    const card = (await w.q("SELECT params FROM claw_assistant_confirmations WHERE confirmation_id = $1", [shown.confirmation_id]))[0];
+    assert.equal(card.params.cwd, "/home/u/work");
+    // ~ alone is the home folder, which is outside the roots: no agent may work there, and nothing is planned.
+    const home = await tools.planSend("alice", { text: "看看", agent: "claude", cwd: "~" });
+    assert.ok(!home.ok && /may work in ~/.test(home.message), JSON.stringify(home));
+    // ~/elsewhere is outside the roots too.
+    const outside = await tools.planSend("alice", { text: "看看", agent: "claude", cwd: "~/elsewhere" });
+    assert.ok(!outside.ok && /may work in ~\/elsewhere/.test(outside.message));
+    // An idle session in ~/repo continues when no new one was asked for: ~/repo and its /home/u/repo are the same folder.
+    const same = await tools.planSend("alice", { text: "看看", agent: "claude", cwd: "~/repo" });
+    assert.ok(same.ok && same.plan.session_id === idle, JSON.stringify(same));
+    // A Windows machine: ~/repo under C:\Users\a is placed under its root and sent as the root spells it.
+    await machine("alice", "winbox", { agents: [{ ...CLAUDE, agent_id: "claude", capabilities: { roots: ["C:\\Users\\a\\repo"] } }] });
+    const win = await tools.planSend("alice", { text: "看看", target: "winbox", cwd: "~/repo/api", new_session: true });
+    assert.ok(win.ok && win.plan.cwd === "C:\\Users\\a\\repo\\api", JSON.stringify(win));
+    // "laptop/claude": the agent named by the label's second part.
+    const byLabel = await tools.planSend("alice", { text: "看看", target: "laptop/claude", new_session: true });
+    assert.ok(byLabel.ok && byLabel.plan.agent_id === "claude" && byLabel.plan.session_id === null);
+  });
+
+  test("NL2 ~ is read in the one home folder the agent's roots show, never guessed", () => {
+    assert.equal(tools.folderOf("~/repo", ["/home/yihan/repo"]), "/home/yihan/repo");
+    assert.equal(tools.folderOf("~/repo/", ["/home/yihan/work", "/home/yihan"]), "/home/yihan/repo");
+    assert.equal(tools.folderOf("~", ["/root/work"]), "/root");
+    assert.equal(tools.folderOf("~/x", ["/Users/me/code"]), "/Users/me/x");
+    assert.equal(tools.folderOf("/srv/a", ["/home/yihan"]), "/srv/a", "an absolute folder is as it was asked");
+    assert.equal(tools.folderOf("~/repo", ["/srv/work"]), null, "no root shows a home folder");
+    assert.equal(tools.folderOf("~/repo", ["/home/a/x", "/home/b/y"]), null, "two homes: not guessed");
+    // Windows: the home a root sits in, with the root's separator (codex round 3).
+    assert.equal(tools.folderOf("~/repo", ["C:\\Users\\alice\\repo"]), "C:\\Users\\alice\\repo");
+    assert.equal(tools.folderOf("~/repo/web", ["C:\\Users\\alice\\code"]), "C:\\Users\\alice\\repo\\web");
+    assert.equal(tools.folderOf("~/x", ["D:/Users/bob/w"]), "D:/Users/bob/x");
+    assert.equal(tools.folderOf("~/x", ["C:\\Users\\alice\\a", "c:/users/ALICE/b"]), "C:\\Users\\alice\\x", "one home, two spellings");
+    assert.equal(tools.folderOf("~/x", ["C:\\work"]), null, "a drive root shows no home");
+  });
+
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {
     const section = prompts.renderRouterDevenvSection({ actions: true, send: true });
     assert.match(section, /devenv_send, called directly and first, never after devenv_list/);
@@ -950,7 +1317,12 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v3");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v6");
+    // The plain-words control: a new session, a session named by when it was used, back to the assistant with nothing to run.
+    assert.match(section, /new_session: true when they ask for a new session/);
+    assert.match(section, /昨天那个会话/);
+    assert.match(section, /回到助理[^\n]*Call nothing/);
+    assert.match(section, /switching only moves the chat/);
     // What operators and release notes say Claw may run on a user's machine is what the code does: a card, never from the turn.
     const { readFileSync } = await import("node:fs");
     const doc = readFileSync(new URL("../../../docs/remote-agents.md", import.meta.url), "utf8");

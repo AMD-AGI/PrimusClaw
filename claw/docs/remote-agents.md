@@ -79,10 +79,18 @@ than start a new conversation.
 
 The convention the connector in this repository uses for `resumable`, newest first and at most twelve entries:
 `[{ref, title, cwd, updated_at, state}]` with `ref` the value to send back as `resume_ref`, `updated_at` in seconds since the
-epoch, and `state` one of `idle`, `live` (something else has it open: not offered for takeover), `attached` (this
-connector already holds it) or `unknown`; a `live` entry may add `activity` (`working`, `waiting` for the person at that
-terminal, or `idle`) and, with `waiting`, `waiting_for` (a short phrase in the agent's words). `devenv_list` shows `activity` as
-`terminal_state` and `waiting_for` only with `detail: "activity"`.
+epoch, and `state` one of `idle`, `live` (something else has it open: not offered for takeover; a session for it is opened
+read-only, see below), `attached` (this connector already holds it) or `unknown`; a `live` entry may add `activity`
+(`working`, `waiting` for the person at that terminal, or `idle`) and, with `waiting`, `waiting_for` (a short phrase in the
+agent's words). `devenv_list` shows `activity` as `terminal_state` and `waiting_for` only with `detail: "activity"`.
+
+An agent whose connector can do that says `watch_live: true` in its capabilities. A session the connector opens to
+watch a conversation that a terminal on that machine has open is read-only: its
+`session_started` (and `session_resumed`) carries `read_only: true`, and so does every event it sends. The API reads that
+mark from the session's newest `session_started`/`session_resumed`: `GET .../sessions` and `GET .../sessions/:id` answer
+`read_only`, every frame of its event stream (and of `?mode=replay`) carries `read_only: true` next to `data`, and
+`prompt`, `set_mode` and `decision` are refused with 409 `session_read_only` before anything is queued (`cancel`, `resume`
+and `close` are not). The connector refuses them as well (`read_only_live_session`).
 
 ## Whether a session asks before it acts
 
@@ -184,8 +192,17 @@ A gateway that closes a connection after 180 s of silence therefore never sees o
 A connector that receives no byte for 75 s should drop the stream and reconnect
 with backoff.
 
+**A Claw release.** An API replica that receives SIGTERM sends `event: reconnect`
+(`data: {"connector_id": ...}`, no `id`) on every command stream it holds, then ends
+them. A connector reconnects at once on that frame, without its backoff and without
+waiting for the response to end. The server keeps such a connector online while it
+does (the stream ended with `stream_end_reason` `restart` still counts as seen), so a
+rolling update records no offline transition; one that does not reconnect is offline
+once the online window below has passed.
+
 A connector is **online** while its command stream is open and its last heartbeat is
-at most 90 s old; a closed stream is offline at once. A newer stream for the same
+at most 90 s old; a closed stream is offline at once (except after `event: reconnect`,
+above). A newer stream for the same
 connector replaces the older, which receives `event: superseded` and ends. When a
 connector is revoked its stream receives `event: revoked` and ends, and every
 connector-side route answers `401 revoked`.
@@ -212,9 +229,10 @@ first recorded for it. Transitions are kept as long as closed sessions are (Rete
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/remote-agents/connectors` | The caller's connectors, with `online`, `last_seen_at`, `offline_since`, `offline_reason` and their agents. |
+| `GET /v1/remote-agents/setup` | How to connect a machine to this server: the npm package, the exact commands with this deployment's addresses, the minimum and recommended connector versions, and the same as a short text in English and Chinese (`remote-agents/setup.ts`). |
+| `GET /v1/remote-agents/connectors` | The caller's connectors, with `online`, `last_seen_at`, `offline_since`, `offline_reason`, `version_status` (and `upgrade_command` below the recommended version) and their agents. |
 | `DELETE .../connectors/:cid` | Revoke: closes its sessions, drops its queued commands. |
-| `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?, resume_ref?}`. `409 connector_offline` unless online. |
+| `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?, resume_ref?}`. `409 connector_offline` unless online; `409 connector_outdated` (with `data.version`, `data.upgrade_command`) when its connector is below the minimum version. |
 | `GET .../sessions`, `GET .../sessions/:id` | List (each active session with `waiting`: the permission requests it waits on its user for now, asked since its last turn ended and not answered, so a client lists those first), and read one with `connector_online`. |
 | `POST .../sessions/:id/commands` | `{type: prompt\|cancel\|set_mode\|resume\|close, ...}`. `Idempotency-Key` makes a retry queue one command. |
 | `POST .../sessions/:id/decisions` | `{action_id, option_id}`, an option the agent offered. Answered twice, counted once: a different second choice is `409 already_decided`, even after the connector has acknowledged the first, because the audit trail remembers it. |
@@ -240,6 +258,33 @@ another session is `409 idempotency_key_reused`.
 Limits per user: 5 connectors, 10 active sessions, 60 commands a minute, 20 open
 event streams per API replica.
 
+### Connector versions and setup
+
+The connector reports its version when it registers and in every heartbeat. A server takes
+connectors from a minimum version and recommends one (`CONNECTOR_VERSIONS` in the protocol,
+0.1.3 and 0.1.4; `CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION` and
+`CLAW_REMOTE_AGENTS_RECOMMENDED_CONNECTOR_VERSION` move them, a value that is no `x.y.z` is
+ignored). Each connector is `current`, `outdated` (below the recommended version: it works),
+`unsupported` (below the minimum: it registers and is listed, so its owner sees why, but no
+new session starts on it) or `unknown` (it reports no version: not refused). Below the
+recommended version the connector list, `devenv_list` and the heartbeat's answer
+(`connector_version`) carry the command that upgrades it and restarts it on the new version:
+`npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install`
+(`stop` exits 0 when nothing runs, so a failed install stops the chain). Sessions already open
+are not touched.
+
+What a person runs to connect a machine is given by the server, never written by a client
+or a model: `GET /v1/remote-agents/setup`, and `connect_a_machine` in `devenv_list` (no
+machine) and in a `devenv_send` refused `no_machine`. Its `login` line names this server's
+`CLAW_PUBLIC_URL` and the identity service the connector signs in with
+(`CLAW_CONNECTOR_IDENTITY_URL`, else `IDENTITY_ISSUER_URL`). Sessions are not closed on their own: a new one at the
+session limit closes the user's sessions nobody is using to make room (no event for half an
+hour, no command waiting for its connector, no turn under way and no approval waiting; or no
+event for a day; or a read-only session, which only watches a terminal's conversation, whatever
+that terminal writes), a machine that is offline first, then read-only sessions, each with a
+`close` to its connector and a `session.reclaimed` audit, and `201` names them in `reclaimed`. Only when none may be closed is
+the answer `409 session_limit_reached`.
+
 A write made through the same API replica reaches an open stream at once. A write
 made through another replica is found by the stream's own read of the database,
 which an idle stream does every 5 s, so it can arrive up to that much later.
@@ -255,12 +300,21 @@ conversations a connector offers to take over (`capabilities.resumable`), each w
 state (`working`, `waiting_for_you`, `idle`, `in_terminal`), last activity, a label
 (`machine/agent/n`) and the command that attaches the user's chat to it
 (`/agent attach <session id or conversation ref>`). The router passes that command to the
-channel with `channel_action`; a conversation open in a terminal on the machine, or a machine
-that is offline, has none. `detail: "activity"` adds each session's current step and the end of
+channel with `channel_action`; a machine that is offline has none. A conversation open in a
+terminal on the machine has one too when its agent reports `watch_live`, marked `read_only` with a
+`note`: attaching to it only watches it, and it is never the `attach_default` (from an older
+connector it has none). A session open through Claw that watches one is `read_only` too, with
+state `in_terminal`: it is never at work for Claw, whatever the terminal does. `detail: "activity"` adds each session's current step and the end of
 its last answer. Names, folders and what agents wrote can be named by anyone, so a turn that has
 read the list no longer acts for the user, with one exception: it may still put
 `/agent attach <ref>` for one of the user's own attachable sessions to them, as a button they
-press (never run at once); any other ref or action is refused.
+press (never run at once); any other ref or action is refused. Each agent on an online machine
+carries such a command too, `/agent attach <machine>/<agent>`, which the channel takes as "that
+agent's newest open session, else a new one in its first folder": how a user with no session
+gets one. An agent that only takes over existing conversations (`kind: attach`), one that
+reports no folder, or one on a machine whose name another online machine of the user's shares
+has none. With no session anywhere and one such agent, it is `attach_default`
+(`new_session: true`).
 
 ### Development environment items
 
@@ -300,12 +354,17 @@ untrusted text. `work_send` refuses these items; `work_stop` and the item's stop
 
 ### Sending an instruction (`devenv_send`)
 
-`devenv_send{text, agent?, target?, cwd?}` sends an instruction to an agent on one of the user's own
+`devenv_send{text, agent?, target?, cwd?, new_session?}` sends an instruction to an agent on one of the user's own
 machines. It chooses the machine and agent itself, among the caller's connectors only: the one the user
 named (by machine name, session label or session id), else the only online machine offering that agent;
 more than one is `which_machine`, an offline one is `connector_offline`. It continues an idle session of
 that agent open through Claw, else opens a new one in the agent's first root (or the folder named, which
-must be under a root); a session working on something is never sent another (`busy`). The prompt goes
+must be under a root); a session working on something is never sent another (`busy`). `new_session: true`
+(the user asked for a new session) never continues one: a new session is opened, beside the session named
+when one was, on its machine and with its agent. A folder written `~` or `~/x` is read in the home folder the
+agent's roots are in (the connector expands `~` in its roots to its account's home, which it does not report):
+`/home/u/repo` as a root makes `~/x` mean `/home/u/x`; roots that show no home folder, or more than one, read
+no `~` folder at all, and the folder must still be under a root. The card shows the folder as the machine names it. The prompt goes
 through the same checks as the user's own route (session limit, command rate, audit with the prompt's hash
 only), under a command id derived from the card (`cmdKey("card", confirmationId)`), so pressing it twice
 sends nothing twice.

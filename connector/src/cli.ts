@@ -4,6 +4,7 @@
 import { main } from "./commands.js";
 import { resolveDirs } from "./paths.js";
 import type { Connector } from "./connector.js";
+import { probeAgents } from "./probe.js";
 
 let connector: Connector | null = null;
 let stopping = false;
@@ -24,6 +25,8 @@ main(process.argv.slice(2), {
   env: process.env,
   out: (l) => process.stdout.write(l + "\n"),
   err: (l) => process.stderr.write(l + "\n"),
+  probe: probeAgents,
+  installAdapters: true,
   onConnector: (c) => {
     connector = c;
     for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(sig, onSignal);

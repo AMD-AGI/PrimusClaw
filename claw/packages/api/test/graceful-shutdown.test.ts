@@ -14,7 +14,8 @@
  *   G3 while draining, /ready is 503, /health stays 200, and responses ask for a new connection
  *   G4 nothing that never finishes holds the exit past the deadline
  *   G5 the session event stream resumes from Last-Event-ID
- *   G6 an MCP call in flight when the drain starts gets its answer, though streamable HTTP sends it as an event stream, and the
+ *   G6 a route's own last frame (the command stream's `event: reconnect`), written on `closing`, comes before the end
+ *   G7 an MCP call in flight when the drain starts gets its answer, though streamable HTTP sends it as an event stream, and the
  *      pools close only after it (2026-11-07 07:14Z: the drain ended that stream first, the review it started was handed over,
  *      and the router waited 60 s for an answer that never came)
  */
@@ -79,6 +80,13 @@ async function rig(opts: { deadlineMs?: number; delayMs?: number } = {}): Promis
     reply.hijack();
     reply.raw.writeHead(200, { "Content-Type": "text/event-stream", Connection: "keep-alive" });
     reply.raw.write("id: claw-1\nevent: x\ndata: {}\n\n");
+  });
+  // The shape routes/remote-agents.ts's command stream uses: its own frame when the process starts closing.
+  app.get("/commands", async (_req, reply) => {
+    reply.hijack();
+    reply.raw.writeHead(200, { "Content-Type": "text/event-stream", Connection: "keep-alive" });
+    reply.raw.write("event: ready\ndata: {}\n\n");
+    shutdown.closing.addEventListener("abort", () => { reply.raw.write("event: reconnect\ndata: {}\n\n"); }, { once: true });
   });
   // The shape of the assistant's MCP route (`assistant/mcp.ts`): stateless, one server and transport per request, a tool that
   // waits on the gate as review_start waits on GitHub and the database.
@@ -192,7 +200,26 @@ test("G5 the session event stream resumes from Last-Event-ID", () => {
   assert.equal(lastEventIdOf("x'; DROP TABLE"), null, "only ids this stream hands out");
 });
 
-test("G6 an MCP call in flight when the drain starts gets its answer, and the pools close after it", { timeout: 30_000 }, async () => {
+test("G6 a route's own last frame, written when the shutdown signals `closing`, reaches the client before the end", { timeout: 30_000 }, async () => {
+  const r = await rig();
+  let received = "";
+  let ended = false;
+  await new Promise<void>((resolve, reject) => {
+    http.get(`${r.base}/commands`, { agent: false }, (res) => {
+      res.setEncoding("utf8");
+      res.on("data", (c) => { received += c; if (received.includes("ready")) resolve(); });
+      res.on("end", () => { ended = true; });
+    }).on("error", reject);
+  });
+  assert.equal(r.shutdown.closing.aborted, false);
+  await r.shutdown.begin("SIGTERM");
+  await until(() => ended);
+  assert.equal(r.shutdown.closing.aborted, true);
+  assert.ok(received.endsWith(`event: reconnect\ndata: {}\n\n${SSE_RECONNECT_FRAME}`), JSON.stringify(received));
+  assert.deepEqual(r.exits, [0]);
+});
+
+test("G7 an MCP call in flight when the drain starts gets its answer, and the pools close after it", { timeout: 30_000 }, async () => {
   const r = await rig();
   const client = new Client({ name: "brain", version: "1.0.0" });
   await client.connect(new StreamableHTTPClientTransport(new URL(`${r.base}/mcp`)));
@@ -211,7 +238,7 @@ test("G6 an MCP call in flight when the drain starts gets its answer, and the po
   await client.close().catch(() => undefined);
 });
 
-test("G7 what counts as one call's answer: a POST that accepts JSON and an event stream, as the MCP specification has it", () => {
+test("G8 what counts as one call's answer: a POST that accepts JSON and an event stream, as the MCP specification has it", () => {
   const res = (method: string, accept?: string) => ({ req: { method, headers: accept === undefined ? {} : { accept } } }) as never;
   assert.equal(answersOneCall(res("POST", "application/json, text/event-stream")), true, "MCP streamable HTTP");
   assert.equal(answersOneCall(res("GET", "application/json, text/event-stream")), false, "a GET stream is a subscription");

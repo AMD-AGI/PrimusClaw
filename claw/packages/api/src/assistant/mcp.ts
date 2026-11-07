@@ -455,7 +455,8 @@ export function createAssistantMcpServer(
           text: z.string().describe("The instruction, as the user said it."),
           agent: z.string().optional().describe("The agent they named: claude, codex, cursor."),
           target: z.string().optional().describe("The machine, session label or session id they named; left out when they named none."),
-          cwd: z.string().optional().describe("Only a folder they named."),
+          cwd: z.string().optional().describe("Only a folder they named, as they wrote it (~/repo is fine: it is read on that machine)."),
+          new_session: z.boolean().optional().describe("true only when they asked for a new session (新开一个会话, a fresh session): never continue one."),
         },
         (args) => answer(claims, "devenv_send", () => devenvSend(claims, args)),
       );

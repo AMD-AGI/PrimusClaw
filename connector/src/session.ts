@@ -19,11 +19,12 @@
  * event that names its mode also says whether it is `unattended`, so a phone always shows it.
  */
 import path from "node:path";
-import type { AttachSupport } from "./attach.js";
+import { TranscriptTail, type AttachSupport, type TranscriptUpdate } from "./attach.js";
 import type { Audit } from "./audit.js";
 import { AdapterProcess, type AcpParams, type AdapterHooks } from "./adapter.js";
 import type { ChildRegistry } from "./children.js";
 import type { AgentConfig, ConnectorConfig } from "./config.js";
+import { claudeSessionMeta } from "./claude-mode.js";
 import {
   PermissionBook, boundedInput, matchAutoAllow, normalizeOptions, type OfferedOption,
 } from "./permissions.js";
@@ -42,9 +43,21 @@ export interface SessionTiming {
   modeConfirmMs: number;
   /** An attach session reads the registry this often while its own agent is starting or running a turn, to see a terminal that opens the conversation meanwhile. */
   twinWatchMs: number;
+  /** A read-only session (a conversation open in a terminal) reads its transcript for new lines this often. */
+  spectateMs: number;
+  /** ... and looks this often whether the terminal still has it open; once it has not, the read-only session ends. */
+  spectateCheckMs: number;
 }
 
-export const DEFAULT_SESSION_TIMING: SessionTiming = { idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000 };
+export const DEFAULT_SESSION_TIMING: SessionTiming = {
+  idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000, spectateMs: 1_000, spectateCheckMs: 5_000,
+};
+
+/**
+ * Why a command to a read-only session is refused: the conversation is open in a terminal, and a second writer would fork
+ * its transcript. The session shows what the terminal does and takes no input.
+ */
+export const READ_ONLY_REASON = "read_only_live_session";
 
 export interface SessionEnv {
   config: ConnectorConfig;
@@ -66,6 +79,9 @@ export interface ModeInfo { id: string; name?: string; description?: string }
 export class SessionRefusal extends Error {
   constructor(readonly reason: string, message?: string) { super(message ?? reason); }
 }
+
+/** Why Claude Code leaves `bypassPermissions` out of its modes, for the log line of a refused session (claude-mode.ts). */
+const BYPASS_HINT = ` (Claude Code offers it to root only with IS_SANDBOX set, and never when permissions.disableBypassPermissionsMode is "disable"; "claw-connector doctor" names the fix)`;
 
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024;
 const MAX_QUEUED_PROMPTS = 5;
@@ -105,6 +121,15 @@ export class Session {
   private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void }> = [];
   private launching: Promise<void> | null = null;
   private idle: NodeJS.Timeout | undefined;
+  /**
+   * The conversation is open in a terminal: this session only reads its transcript and shows it (see {@link spectate}).
+   * No adapter is ever started for it, and every command that would write is refused.
+   */
+  readOnly = false;
+  private tail: TranscriptTail | null = null;
+  private tailTimer: NodeJS.Timeout | undefined;
+  private lastTerminalCheck = 0;
+  private checkingTerminal = false;
   private readonly book: PermissionBook;
 
   constructor(readonly id: string, readonly agent: AgentConfig, cwd: string, private readonly env: SessionEnv, acpId: string | null = null, mode: string | null = null) {
@@ -186,6 +211,12 @@ export class Session {
     if (requestedMode && !this.agent.safeModes.includes(requestedMode) && !this.agent.allowUnsafeModes) {
       return this.refuse(new SessionRefusal("mode_not_allowed", `mode ${requestedMode} needs approval = "never" for this agent (or allow_unsafe_modes) on this machine`));
     }
+    // A conversation a terminal has open now is not taken over: it is watched, read-only, for as long as the terminal has it.
+    const support = this.env.attach.get(this.agent.id);
+    if (support && this.acpId) {
+      const verdict = await support.check(this.acpId, { transcript: false });
+      if (!verdict.ok && verdict.reason === "session_live") return this.spectate(support, title, verdict.detail);
+    }
     if (requestedMode) this.targetMode = requestedMode;
     try {
       await this.launch("resume");
@@ -197,6 +228,84 @@ export class Session {
     this.audit("session_attached", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
     this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
     this.touch();
+  }
+
+  // --- read-only: a conversation open in a terminal ------------------------------------
+
+  /**
+   * Show a conversation that a terminal has open without taking it over. Nothing is started: the transcript the terminal
+   * writes is read from its end (`TranscriptTail`, read-only) and each new line goes out as the update an adapter would
+   * have sent, scrubbed like every other event, marked `read_only`. What was there just before is sent first, marked
+   * `replay`. Prompts, mode changes and decisions are refused (`read_only_live_session`) and never reach anything that
+   * could write to the transcript. When the terminal no longer has the conversation open the session ends
+   * (`terminal_closed`): taking it over then is a new session, through the full check.
+   */
+  private spectate(support: AttachSupport, title: string, detail: string): void {
+    this.readOnly = true;
+    this.tail = new TranscriptTail(() => (this.acpId ? support.transcriptPath(this.acpId) : null));
+    const backlog = this.tail.backlog();
+    this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: null, read_only: true, created_at: new Date().toISOString() });
+    this.audit("session_spectating", { cwd: this.cwd, acp_session_id: this.acpId, detail: detail.slice(0, 300) });
+    this.emit("session_started", {
+      acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true,
+      read_only: true, read_only_reason: "session_live", modes: [], currentMode: null, unattended: false,
+    });
+    this.announced = true;
+    for (const u of backlog) this.emitTranscript(u, true);
+    this.followTail(support);
+  }
+
+  /** After a restart: a session that was read-only is again, from the transcript's end (what was sent before is not sent twice). */
+  restoreSpectate(): void {
+    this.readOnly = true;
+    const support = this.env.attach.get(this.agent.id);
+    if (!support) return;
+    this.tail = new TranscriptTail(() => (this.acpId ? support.transcriptPath(this.acpId) : null));
+    this.tail.fromEnd();
+    this.followTail(support);
+  }
+
+  private followTail(support: AttachSupport): void {
+    this.lastTerminalCheck = Date.now();
+    const tick = () => {
+      if (this.closed || !this.tail) return;
+      for (const u of this.tail.poll()) this.emitTranscript(u, false);
+      if (!this.checkingTerminal && Date.now() - this.lastTerminalCheck >= this.env.timing.spectateCheckMs) void this.checkTerminal(support);
+    };
+    this.tailTimer = setInterval(tick, this.env.timing.spectateMs);
+    this.tailTimer.unref?.();
+  }
+
+  /** Is the conversation still open somewhere else? The cheap look first; only a look that finds nothing asks every source. */
+  private async checkTerminal(support: AttachSupport): Promise<void> {
+    if (!this.acpId) return;
+    this.checkingTerminal = true;
+    try {
+      this.lastTerminalCheck = Date.now();
+      if (support.peek(this.acpId, null)?.twin) return;
+      const verdict = await support.check(this.acpId, { transcript: false });
+      // Only a clear "nobody has it" ends the watch: a check that could not be made is not one.
+      if (verdict.ok && !this.closed) {
+        for (const u of this.tail?.poll() ?? []) this.emitTranscript(u, false);
+        await this.close("terminal_closed");
+      }
+    } finally {
+      this.checkingTerminal = false;
+    }
+  }
+
+  private emitTranscript(u: TranscriptUpdate, replay: boolean): void {
+    const text = u.type === "agent_message_chunk" ? String((u.update.content as { text?: unknown } | undefined)?.text ?? "") : "";
+    if (text && this.env.config.dropMessagePatterns.some((re) => re.test(text))) return;
+    const data = limitStrings(redactDeep({ sessionId: this.acpId, update: u.update }) as Record<string, unknown>, MAX_TOOL_OUTPUT_BYTES);
+    this.emit(u.type, { ...data, read_only: true, ...(replay ? { replay: true } : {}) });
+  }
+
+  /** The process is stopping: the transcript is no longer followed (the session itself stays recorded, read-only). */
+  stopTail(): void {
+    clearInterval(this.tailTimer);
+    this.tailTimer = undefined;
+    this.tail = null;
   }
 
   /** Start (or restart) the adapter and bring the ACP session up in a verified mode. One at a time. */
@@ -285,7 +394,7 @@ export class Session {
     this.modeSeen = [];
     try {
       if (how === "new") {
-        const res = await adapter.request("session/new", { cwd: this.cwd, mcpServers: [] });
+        const res = await adapter.request("session/new", { cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) });
         if (typeof res.sessionId !== "string") throw new SessionRefusal("adapter_protocol", "session/new returned no session id");
         this.acpId = res.sessionId;
         this.absorb(res);
@@ -294,10 +403,10 @@ export class Session {
         const caps = adapter.caps.sessionCapabilities as AcpParams | undefined;
         if (caps?.resume) {
           // `resume` does not replay the history, and the adapter's own settings apply again: the mode is re-locked below.
-          this.absorb(await adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [] }));
+          this.absorb(await adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }));
         } else if (adapter.caps.loadSession) {
           this.replaying = true;
-          try { this.absorb(await adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [] })); } finally { this.replaying = false; }
+          try { this.absorb(await adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) })); } finally { this.replaying = false; }
         } else {
           throw new SessionRefusal("adapter_cannot_resume", "the adapter can neither resume nor load a session");
         }
@@ -338,7 +447,7 @@ export class Session {
   private async enforceMode(mode: string): Promise<void> {
     const a = this.adapter;
     if (!a || !this.acpId) throw new SessionRefusal("adapter_gone");
-    if (this.modes.length && !this.modes.some((m) => m.id === mode)) throw new SessionRefusal("mode_unavailable", `the adapter offers no mode ${mode}`);
+    if (this.modes.length && !this.modes.some((m) => m.id === mode)) throw new SessionRefusal("mode_unavailable", `the adapter offers no mode ${mode}${mode === "bypassPermissions" ? BYPASS_HINT : ""}`);
     this.enforcing = true;
     this.modeSeen = [];
     try {
@@ -397,6 +506,7 @@ export class Session {
 
   /** `set_mode`: a user-chosen mode, only from the allowed list, always read back. */
   async setMode(modeId: string, cmdId: string | null): Promise<void> {
+    if (this.readOnly) return this.rejectCommand("set_mode", cmdId, READ_ONLY_REASON);
     if (!this.adapter) await this.ensureAdapter();
     if (!this.modeAllowed(modeId)) return this.rejectCommand("set_mode", cmdId, "mode_not_allowed");
     if (this.modes.length && !this.modes.some((m) => m.id === modeId)) return this.rejectCommand("set_mode", cmdId, "mode_unavailable");
@@ -581,6 +691,13 @@ export class Session {
    */
   enqueuePrompt(text: string, cmdId: string | null, started: () => void = () => {}, cmdSeq: number | null = null): void {
     if (this.closed) { this.rejectCommand("prompt", cmdId, "session_closed", cmdSeq); return started(); }
+    if (this.readOnly) {
+      // Never queued, never sent: what the person typed does not reach the conversation the terminal is writing.
+      this.audit("prompt_refused", { reason: READ_ONLY_REASON });
+      this.rejectCommand("prompt", cmdId, READ_ONLY_REASON, cmdSeq);
+      this.emit("turn_end", { stopReason: "error", error: READ_ONLY_REASON, read_only: true, cmd_id: cmdId, cmd_seq: cmdSeq });
+      return started();
+    }
     if (this.queue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts", cmdSeq); return started(); }
     this.queue.push({ text, cmdId, cmdSeq, started });
     if (!this.turnRunning) void this.pump();
@@ -706,6 +823,11 @@ export class Session {
   /** `resume`: bring the session back. A live adapter is NOT asked to resume (that would reset its mode); the mode is re-asserted instead. */
   async resume(cmdId: string | null): Promise<void> {
     if (this.closed) return this.rejectCommand("resume", cmdId, "session_closed");
+    if (this.readOnly) {
+      // Nothing to bring back: a read-only session runs no agent. Say that it is still there, and still read-only.
+      this.emit("session_resumed", { acp_session_id: this.acpId, read_only: true, modes: [], currentMode: null, unattended: false });
+      return;
+    }
     try {
       if (this.adapter && !this.adapter.exited) await this.enforceMode(this.targetMode);
       else await this.launch("resume");
@@ -755,6 +877,7 @@ export class Session {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.idle);
+    this.stopTail();
     this.dropQueued();
     for (const actionId of this.book.cancelAll()) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: reason });
     const a = this.adapter;

@@ -142,6 +142,36 @@ describe("remote agents", { skip }, () => {
       await connector("u1", "again");
     });
 
+    test("registering again under a name whose old row is offline revokes that row; an online, a just-made, another name's or another user's is left alone", async () => {
+      const old = async (cid: string) => q("UPDATE claw_remote_connectors SET created_at = NOW() - interval '1 hour' WHERE connector_id = $1", [cid]);
+      // All made first (none old yet, so none replaces another), then all but `fresh` made an hour ago.
+      const stale = await connector("u1", "laptop");
+      await heartbeat("u1", stale);
+      const sid = await q("INSERT INTO claw_remote_sessions (session_id, owner_user_id, connector_id, agent_id, cwd, mode) VALUES (gen_random_uuid(), 'u1', $1, 'a1', '/w', 'default') RETURNING session_id::text AS session_id", [stale]);
+      const { cid: live } = await online("u1");
+      const fresh = await connector("u1", "laptop");
+      const desk = await connector("u1", "desk");
+      const theirs = await connector("u2", "laptop");
+      for (const cid of [stale, live, desk, theirs]) await old(cid);
+      await q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '1 hour' WHERE connector_id = $1", [stale]);
+
+      const again = await as("u1").post("/v1/remote-agents/connectors", { name: "laptop" });
+      assert.equal(again.status, 201, JSON.stringify(again.body));
+      const revoked = (await q("SELECT connector_id FROM claw_remote_connectors WHERE revoked_at IS NOT NULL")).rows.map((r: any) => r.connector_id);
+      assert.deepEqual(revoked, [stale], "only the offline twin");
+      const listed = (await as("u1").get("/v1/remote-agents/connectors")).body.data.map((c: any) => c.connector_id).sort();
+      assert.deepEqual(listed, [live, fresh, desk, again.body.data.connector_id].sort());
+      assert.equal((await q("SELECT status FROM claw_remote_sessions WHERE session_id = $1", [sid.rows[0].session_id])).rows[0].status, "closed");
+      const audit = async (cid: string, action: string) =>
+        (await q("SELECT detail FROM claw_remote_audit WHERE connector_id = $1 AND action = $2", [cid, action])).rows.map((r: any) => r.detail);
+      assert.deepEqual((await audit(again.body.data.connector_id, "connector.registered")).map((d: any) => d.replaced), [[stale]]);
+      assert.deepEqual((await audit(stale, "connector.revoked")).map((d: any) => [d.reason, d.sessions_closed]), [["replaced_by_same_name", 1]]);
+      // The old one, should it come back, is told it was revoked.
+      assert.deepEqual([(await heartbeat("u1", stale)).status, (await heartbeat("u1", stale)).body.error], [401, "revoked"]);
+      // The twin no longer takes a place: live, fresh, desk and the new one.
+      assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_connectors WHERE owner_user_id = 'u1' AND revoked_at IS NULL")).rows[0].n, 4);
+    });
+
     test("anonymous and 'default' callers are refused", async () => {
       assert.equal((await call(null, "GET", "/v1/remote-agents/connectors")).status, 403);
       assert.equal((await as("default").get("/v1/remote-agents/connectors")).status, 403);
@@ -229,6 +259,89 @@ describe("remote agents", { skip }, () => {
         assert.equal((await as("u1").post("/v1/remote-agents/sessions", bad)).status, 400, JSON.stringify(bad));
       }
       assert.equal((await as("u1").post("/v1/remote-agents/sessions", { ...body, mode: "ask" })).status, 201);
+    });
+  });
+
+  describe("connector versions and setup", () => {
+    test("a connector below the minimum is listed with the command that upgrades it, and starts no session", async () => {
+      const body = (cid: string) => ({ connector_id: cid, agent_id: "a1", cwd: "/work" });
+      const at = async (version: string | null) => {
+        const cid = await connector("u1", `m-${version ?? "none"}`);
+        const stream = await openCommands("u1", cid);
+        await stream.nextEvent("ready");
+        assert.equal((await heartbeat("u1", cid, version ? { version } : {})).status, 200);
+        return cid;
+      };
+      const old = await at("0.1.2");
+      const outdated = await at("0.1.3");
+      const current = await at("0.1.4");
+      const unknown = await at(null);
+      const list = (await as("u1").get("/v1/remote-agents/connectors")).body.data as Array<Record<string, any>>;
+      const by = (cid: string) => list.find((c) => c.connector_id === cid)!;
+      assert.deepEqual([by(old).version_status, by(outdated).version_status, by(current).version_status, by(unknown).version_status],
+        ["unsupported", "outdated", "current", "unknown"]);
+      const upgrade = "npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install";
+      assert.equal(by(old).upgrade_command, upgrade);
+      assert.equal(by(outdated).upgrade_command, upgrade);
+      assert.equal(by(current).upgrade_command, undefined);
+      // Below the minimum: refused by name, with what to run; nothing is queued for it.
+      const refused = await as("u1").post("/v1/remote-agents/sessions", body(old));
+      assert.deepEqual([refused.status, refused.body.error, refused.body.data.version, refused.body.data.upgrade_command],
+        [409, "connector_outdated", "0.1.2", upgrade]);
+      assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_sessions WHERE connector_id = $1", [old])).rows[0].n, 0);
+      // An outdated one, a current one and one that reports no version all still work.
+      for (const cid of [outdated, current, unknown]) assert.equal((await as("u1").post("/v1/remote-agents/sessions", body(cid))).status, 201);
+      // The heartbeat answer tells an old connector to upgrade, and a current one nothing.
+      const hbOld = await heartbeat("u1", outdated, { version: "0.1.3" });
+      assert.deepEqual([hbOld.body.data.connector_version.version_status, hbOld.body.data.connector_version.upgrade_command], ["outdated", upgrade]);
+      assert.equal((await heartbeat("u1", current, { version: "0.1.4" })).body.data.connector_version, undefined);
+    });
+
+    test("the minimum and recommended versions follow the server's settings", async () => {
+      const { cid } = await online();
+      await heartbeat("u1", cid, { version: "0.1.4" });
+      process.env.CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION = "0.2.0";
+      try {
+        const r = await as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/work" });
+        assert.deepEqual([r.status, r.body.error, r.body.data.minimum_version, r.body.data.recommended_version], [409, "connector_outdated", "0.2.0", "0.2.0"]);
+        process.env.CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION = "not a version";
+        assert.equal((await as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/work" })).status, 201);
+      } finally {
+        delete process.env.CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION;
+      }
+    });
+
+    test("setup gives the exact commands, with this server's addresses", async () => {
+      const keep = { pub: process.env.CLAW_PUBLIC_URL, iss: process.env.IDENTITY_ISSUER_URL };
+      process.env.CLAW_PUBLIC_URL = "https://claw.example.com/claw-api/";
+      process.env.IDENTITY_ISSUER_URL = "https://id.example.com";
+      try {
+        const r = await as("u1").get("/v1/remote-agents/setup");
+        assert.equal(r.status, 200);
+        const d = r.body.data;
+        assert.deepEqual(d.steps.map((s: Record<string, string>) => s.command), [
+          "npm install -g @primusclaw/connector",
+          "claw-connector init",
+          "claw-connector login --server https://claw.example.com/claw-api --identity-url https://id.example.com",
+          "claw-connector service install",
+        ]);
+        assert.deepEqual([d.package, d.server, d.identity_url, d.minimum_version, d.recommended_version], [
+          "@primusclaw/connector", "https://claw.example.com/claw-api", "https://id.example.com", "0.1.3", "0.1.4"]);
+        for (const text of [d.text.en, d.text.zh]) {
+          for (const s of d.steps) assert.ok(text.includes(s.command), s.command);
+          assert.doesNotMatch(text, /(^|\n)connector (login|run)/, "the command is claw-connector, never a bare connector");
+        }
+        // An identity service named for the connector wins over the issuer.
+        process.env.CLAW_CONNECTOR_IDENTITY_URL = "https://device.example.com/";
+        assert.match((await as("u1").get("/v1/remote-agents/setup")).body.data.steps[2].command, /--identity-url https:\/\/device\.example\.com$/);
+        // Only for a signed-in user, like every user-side route.
+        assert.equal((await call(null, "GET", "/v1/remote-agents/setup")).status, 403);
+      } finally {
+        delete process.env.CLAW_CONNECTOR_IDENTITY_URL;
+        for (const [k, v] of [["CLAW_PUBLIC_URL", keep.pub], ["IDENTITY_ISSUER_URL", keep.iss]] as const) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
     });
   });
 
@@ -653,6 +766,41 @@ describe("remote agents", { skip }, () => {
       assert.deepEqual([(await s.next()).json().data, (await s.next()).json().data, (await s.next()).json().data], [started, changed, started]);
     });
 
+    test("a session that watches a terminal's conversation is read-only: said on the session and on every frame, and nothing typed is queued", async () => {
+      const { cid } = await online1();
+      const sid = await session("u1", cid);
+      const types = async () => (await q("SELECT type FROM claw_remote_commands WHERE session_id = $1 ORDER BY cmd_seq", [sid])).rows.map((r: any) => r.type);
+      // Before the connector says so, the session takes prompts as any other.
+      assert.equal((await as("u1").get(`/v1/remote-agents/sessions/${sid}`)).body.data.read_only, false);
+      await post("u1", cid, [
+        ev(sid, "session_started", { attached: true, read_only: true, read_only_reason: "session_live", modes: [], currentMode: null }),
+        ev(sid, "agent_message_chunk", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "from the terminal" } }, read_only: true }),
+      ]);
+      assert.equal((await as("u1").get(`/v1/remote-agents/sessions/${sid}`)).body.data.read_only, true);
+      assert.equal((await as("u1").get("/v1/remote-agents/sessions")).body.data.find((x: any) => x.session_id === sid).read_only, true);
+      const before = await types();
+      for (const body of [{ type: "prompt", text: "do something else" }, { type: "set_mode", mode_id: "plan" }]) {
+        const r = await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, body);
+        assert.deepEqual([r.status, r.body.error], [409, "session_read_only"], body.type);
+      }
+      assert.deepEqual(await types(), before, "nothing was queued for the connector");
+      assert.equal((await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, { type: "cancel" })).status, 202, "a stop is harmless and goes through");
+      // What the connector answers it with does not repeat the mark: the frame carries it all the same.
+      await post("u1", cid, [ev(sid, "turn_end", { stopReason: "cancelled", cmd_id: null })], "b8");
+      const s = await SseClient.open(`${base}/v1/remote-agents/sessions/${sid}/events`, { "x-test-user": "u1" });
+      streams.push(s);
+      const [f1, f2, f3] = [(await s.next()).json(), (await s.next()).json(), (await s.next()).json()];
+      assert.deepEqual([f1.type, f1.read_only, f2.type, f2.read_only, f2.data.update.content.text], ["session_started", true, "agent_message_chunk", true, "from the terminal"]);
+      assert.deepEqual([f3.type, f3.read_only, f3.data.read_only], ["turn_end", true, undefined]);
+      const replay = (await as("u1").get(`/v1/remote-agents/sessions/${sid}/events?mode=replay`)).body.data;
+      assert.deepEqual(replay.map((r: any) => r.read_only), [true, true, true]);
+      // The terminal closed and the conversation was taken over in a new session: that one is not read-only.
+      const other = await session("u1", cid, "/work/other");
+      await post("u1", cid, [ev(other, "session_started", { attached: true, modes: [], currentMode: "default" })], "b9");
+      assert.equal((await as("u1").get(`/v1/remote-agents/sessions/${other}`)).body.data.read_only, false);
+      assert.equal((await as("u1").post(`/v1/remote-agents/sessions/${other}/commands`, { type: "prompt", text: "go" })).status, 202);
+    });
+
     test("a session with no events still gets its marker", async () => {
       const { cid } = await online1();
       const sid = await session("u1", cid);
@@ -894,6 +1042,87 @@ describe("remote agents", { skip }, () => {
       assert.equal((await make()).status, 201);
     });
 
+    test("at the limit an idle session is closed to make room, but never one whose events are being stored as it is chosen", async () => {
+      const small = await serve({ maxActiveSessionsPerUser: 2 });
+      const cid = (await as("u1").post("/v1/remote-agents/connectors", { name: "m" }, undefined, small)).body.data.connector_id;
+      const s = await SseClient.open(`${small}/v1/remote-agents/connectors/${cid}/commands`, { "x-test-user": "u1" });
+      streams.push(s);
+      await as("u1").post(`/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [AGENT] }, undefined, small);
+      const make = () => as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/w" }, undefined, small);
+      const a = (await make()).body.data.session_id as string;
+      const b = (await make()).body.data.session_id as string;
+      let madeId = "";
+      // Both collected by the connector, and unused for an hour; b the longer, so b is the one chosen.
+      await q("DELETE FROM claw_remote_commands WHERE session_id = ANY($1::uuid[])", [[a, b]]);
+      await q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '1 hour' WHERE session_id = $1", [a]);
+      await q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '2 hours' WHERE session_id = $1", [b]);
+      // b's connector is storing a batch right now: the real ingest (POST .../events) is held just after it has written the event
+      // (a test-only trigger waits on a lock this test holds), not yet committed, when the new session is asked for.
+      const gate = await h.connect();
+      await gate.query("SELECT pg_advisory_lock(424242)");
+      await q(`CREATE OR REPLACE FUNCTION test_hold_ingest() RETURNS trigger LANGUAGE plpgsql AS
+        $f$ BEGIN PERFORM pg_advisory_xact_lock_shared(424242); RETURN NULL; END $f$`);
+      await q("CREATE TRIGGER test_hold_ingest AFTER INSERT ON claw_remote_events FOR EACH STATEMENT EXECUTE FUNCTION test_hold_ingest()");
+      try {
+        const posted = as("u1").post(`/v1/remote-agents/connectors/${cid}/events`,
+          { batch_id: "held", events: [{ session_id: b, seq: 1, type: "agent_message_chunk", ts: Date.now(), data: {} }] }, undefined, small);
+        const waiting = async () => Number((await q(
+          "SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND objid = 424242 AND NOT granted")).rows[0].n);
+        for (let i = 0; i < 100 && await waiting() === 0; i++) await new Promise((r) => setTimeout(r, 20));
+        assert.equal(await waiting(), 1, "the batch is held after writing its event");
+        let settled = false;
+        const third = make().then((r) => { settled = true; return r; });
+        await new Promise((r) => setTimeout(r, 400));
+        assert.equal(settled, false, "choosing b waits for the batch being stored");
+        await gate.query("SELECT pg_advisory_unlock(424242)");
+        assert.equal((await posted).status, 200);
+        const made = await third;
+        assert.equal(made.status, 201, JSON.stringify(made.body));
+        assert.deepEqual(made.body.reclaimed, [a], "b is at work now: the other idle one makes room");
+        madeId = made.body.data.session_id;
+      } finally {
+        await q("DROP TRIGGER IF EXISTS test_hold_ingest ON claw_remote_events");
+        await gate.query("SELECT pg_advisory_unlock_all()");
+      }
+      const status = async (sid: string) => (await q("SELECT status FROM claw_remote_sessions WHERE session_id = $1", [sid])).rows[0].status;
+      assert.deepEqual([await status(a), await status(b)], ["closed", "active"]);
+      const close = (await q("SELECT type, session_id::text AS session_id FROM claw_remote_commands WHERE connector_id = $1 AND type = 'close'", [cid])).rows;
+      assert.deepEqual(close, [{ type: "close", session_id: a }], "its connector is told to close it");
+      const frame = await s.next((f) => f.event === "command" && JSON.parse(f.data).type === "close");
+      assert.equal(JSON.parse(frame.data).session_id, a, "and the close reaches the connector's stream");
+      const audit = (await q("SELECT detail FROM claw_remote_audit WHERE action = 'session.reclaimed' AND session_id = $1", [a])).rows[0];
+      assert.equal(audit.detail.for_session, madeId);
+    });
+
+    test("at the limit a read-only session is closed to make room first, even while its terminal is writing", async () => {
+      const small = await serve({ maxActiveSessionsPerUser: 2 });
+      const cid = (await as("u1").post("/v1/remote-agents/connectors", { name: "m" }, undefined, small)).body.data.connector_id;
+      const s = await SseClient.open(`${small}/v1/remote-agents/connectors/${cid}/commands`, { "x-test-user": "u1" });
+      streams.push(s);
+      await as("u1").post(`/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [AGENT] }, undefined, small);
+      const make = () => as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/w" }, undefined, small);
+      const idle = (await make()).body.data.session_id as string;
+      const watch = (await make()).body.data.session_id as string;
+      await q("DELETE FROM claw_remote_commands WHERE session_id = ANY($1::uuid[])", [[idle, watch]]);
+      const chunk = { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "from the terminal" } }, read_only: true };
+      // The watch: its terminal wrote just now, after the last turn_end it ever had (none), so by its events a turn is under way.
+      const posted = await as("u1").post(`/v1/remote-agents/connectors/${cid}/events`, { batch_id: "w1", events: [
+        { session_id: watch, seq: 1, type: "session_started", ts: Date.now(), data: { attached: true, read_only: true, modes: [], currentMode: null } },
+        { session_id: watch, seq: 2, type: "agent_message_chunk", ts: Date.now(), data: chunk },
+        { session_id: watch, seq: 3, type: "tool_call", ts: Date.now(), data: { update: { sessionUpdate: "tool_call", title: "Bash" }, read_only: true } },
+      ] }, undefined, small);
+      assert.deepEqual(posted.body.data.rejected, []);
+      // The other one is idle and unused for longer: by age alone it would be the one.
+      await q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '2 hours' WHERE session_id = $1", [idle]);
+      const made = await make();
+      assert.equal(made.status, 201, JSON.stringify(made.body));
+      assert.deepEqual(made.body.reclaimed, [watch], "the watch makes room: closing it ends only the watch");
+      const status = async (sid: string) => (await q("SELECT status FROM claw_remote_sessions WHERE session_id = $1", [sid])).rows[0].status;
+      assert.deepEqual([await status(watch), await status(idle)], ["closed", "active"]);
+      const frame = await s.next((f) => f.event === "command" && JSON.parse(f.data).type === "close");
+      assert.equal(JSON.parse(frame.data).session_id, watch, "its connector is told to close it");
+    });
+
     test("one user may hold only so many event streams open, and closing one frees its place", async () => {
       const small = await serve({ maxStreamsPerUser: 2 });
       const cid = (await as("u1").post("/v1/remote-agents/connectors", { name: "m" }, undefined, small)).body.data.connector_id;
@@ -965,6 +1194,36 @@ describe("remote agents", { skip }, () => {
       assert.deepEqual(bye.json(), { connector_id: cid });
       await first.waitEnded();
       assert.equal((await as("u1").get("/v1/remote-agents/connectors")).body.data[0].online, true);
+    });
+
+    test("a replica shutting down (a Claw release) tells its command streams to reconnect, and their connectors stay online", async () => {
+      const closing = new AbortController();
+      const root = await serve({ closing: closing.signal });
+      const cid = await connector();
+      await heartbeat("u1", cid);
+      const open = async () => {
+        const s = await SseClient.open(`${root}/v1/remote-agents/connectors/${cid}/commands`, { "x-test-user": "u1" });
+        streams.push(s);
+        return s;
+      };
+      const stream = await open();
+      await stream.nextEvent("ready");
+      closing.abort();
+      assert.deepEqual((await stream.nextEvent("reconnect")).json(), { connector_id: cid });
+      await stream.waitEnded();
+      const row = (await q("SELECT stream_seen_at, stream_closed_at, stream_end_reason FROM claw_remote_connectors WHERE connector_id = $1", [cid])).rows[0];
+      assert.equal(row.stream_end_reason, "restart");
+      assert.ok(row.stream_seen_at, "still seen: the connector is on its way to another replica");
+      assert.ok(row.stream_closed_at);
+      assert.equal((await as("u1").get("/v1/remote-agents/connectors")).body.data[0].online, true, "online through the handover");
+      // A stream that reaches this replica after it started closing is sent on at once.
+      const late = await open();
+      await late.nextEvent("ready");
+      await late.nextEvent("reconnect");
+      await late.waitEnded();
+      // A connector that does not come back is offline once the online window has passed, as with any stream.
+      await q("UPDATE claw_remote_connectors SET stream_seen_at = NOW() - interval '91 seconds' WHERE connector_id = $1", [cid]);
+      assert.equal((await as("u1").get("/v1/remote-agents/connectors")).body.data[0].online, false);
     });
 
     test("revoking a connector ends its stream with a revoked frame, refuses it afterwards, and closes its sessions", async () => {

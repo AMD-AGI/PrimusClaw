@@ -28,6 +28,26 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Connecting a machine is said with the exact commands, for every client. `GET /v1/remote-agents/setup` gives the connector's npm
+  package (`@primusclaw/connector`), the four commands (`npm install -g`, `claw-connector init`, `claw-connector login --server <this
+  API's CLAW_PUBLIC_URL> --identity-url <CLAW_CONNECTOR_IDENTITY_URL, else IDENTITY_ISSUER_URL>`, `claw-connector service install`) and
+  the same as a short text in English and Chinese. `devenv_list` with no machine connected, and a `devenv_send` refused `no_machine`,
+  carry it (`connect_a_machine`), and the router is told to give it as it is: before, it was told only that "running claw-connector
+  connects it" and composed the commands itself. Router prompt router-devenv-v5.
+- A minimum and a recommended connector version (`CONNECTOR_VERSIONS` in the protocol, 0.1.3 and 0.1.4; a server moves them with
+  `CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION` and `CLAW_REMOTE_AGENTS_RECOMMENDED_CONNECTOR_VERSION`). `GET /v1/remote-agents/connectors`
+  and `devenv_list` give each machine's `version_status` (`current`, `outdated`, `unsupported`, `unknown`) and, below the recommended
+  version, the `upgrade_command` (`npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service
+  install`); a heartbeat's answer carries the same (`connector_version`). Below the minimum no new session starts on it:
+  `POST /v1/remote-agents/sessions`, `devenv_send` and a pressed `devenv_send` card answer `409 connector_outdated` with the version
+  and the command, instead of a session that fails on the old connector. A connector that reports no version is not refused, and a
+  session already open on an old connector continues.
+- The assistant drives development environments from plain words end to end: `devenv_send` takes
+  `new_session` (新开一个会话在 ~/repo 里看看 opens a new session, never an idle one) and reads a folder
+  written with `~` in the home folder the agent's roots are in; the router names a session by when it was
+  last used (切到昨天那个会话), and answers 回到助理 in a chat that is already with it without running anything.
+  `test/e2e/assistant-devenv-eval.ts` measures these sentences, in Chinese and English, against the router's
+  real prompt and tools. Router prompt router-devenv-v6.
 - A development environment session is pushed only when it needs you, finishes or fails, each once: an instruction the assistant sent
   to an agent on your machine says nothing while it works, one message when the agent waits on a permission request (`assistant.say`
   `remote.ask`: the request with its options and when it runs out, for a channel to put to you as buttons), one when it finished, and
@@ -52,11 +72,48 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A user with no development environment session can connect from the assistant: `devenv_list` gives each agent on an online machine
+  its own `attach_command` (`/agent attach MACHINE/AGENT`, which attaches its open session or starts one in its first folder), the
+  attach button accepts it, and with no session anywhere and one such agent `attach_default` is that agent (`new_session: true`).
+  Before, "connect me to my dev box" with no session open had nothing to attach and nothing it could press.
+- `devenv_send` no longer chooses an agent that only takes over existing conversations (`kind: attach`) for a new session, which its
+  connector refused (`resume_ref_required`) with nothing said to the user: it is chosen only to continue its own idle session, and
+  when it is all that fits, the refusal says so (`which_agent` listing its conversations, else `no_agent`).
+  Router prompt router-devenv-v4.
+- Opening a remote session at the limit of open sessions (10) closes the user's sessions nobody is using to make room (none for half
+  an hour, no command waiting, no turn under way, no approval waiting; or nothing for a day), an offline machine's first, each with a
+  `close` to its connector and a `session.reclaimed` audit; `session_limit_reached` now means every open session is in use. Before,
+  sessions were never closed unless the user closed them, so ordinary use hit the limit in about a week. `POST
+  /v1/remote-agents/sessions` returns the closed ones as `reclaimed`.
 - A machine whose connector runs on Windows can be sent instructions from the assistant: its roots (`C:\Users\a\repo`, a share
   `\\server\share\proj`) were dropped as not absolute, so `devenv_send` answered `no_folder` for every one of them. They are folders
   now, and a folder asked for under one compares as Windows does (either separator, any case, a trailing separator or not) and is sent
   as the root spells it with the root's separator; an idle session open there continues however the folder is typed. POSIX roots compare
   exactly, as before.
+- Connector: an agent with `approval = "never"` on a machine where the connector runs as root opens its phone sessions again. Claude
+  Code offers `bypassPermissions` to root only with `IS_SANDBOX` set, so every such session was refused with `mode_unavailable`; the
+  connector now sets `IS_SANDBOX=1` for that agent's Claude adapter only, and says so when it starts. An agent whose own `env` sets
+  `IS_SANDBOX` is left as written, and `status` warns when the mode will still be missing.
+- Connector: a Claude agent that asks before every step opens its phone sessions in `default` on a machine whose own Claude
+  settings default to `bypassPermissions`; the connector tells the adapter to leave that mode out
+  (`allowDangerouslySkipPermissions: false`) instead of closing each session with `mode_not_enforced`. The start-up warning
+  about it is gone with the refusal.
+- Connector: `claw-connector doctor` (also run at the end of `init`) starts each agent's adapter, opens a session without a prompt
+  and compares the modes the adapter offers with what `agents.toml` needs, naming the fix instead of leaving it to a refused phone
+  session.
+- Connector: a supervised connector stopped by a signal that did not come from `claw-connector stop` (a bare `kill`) exits 75 and is
+  started again; before, it exited 0, which the supervisor took for a stop on purpose, and the machine stayed offline.
+- A Claw release no longer takes development environments offline. An API replica that is shutting down sends every connector
+  command stream it holds `event: reconnect` before it ends them, and keeps those connectors online (`stream_end_reason` `restart`)
+  while they open the stream on another replica, so a rolling update is neither an offline transition in
+  `claw_remote_connector_transitions` nor a reason to tell anyone; a connector that does not come back is offline once the 90 s
+  online window has passed, as before. Live releases had shown each connector offline for 2-7 s.
+- A Brain rollout no longer cuts a tool call in flight. A drain used to abort every run at once: Hands killed the foreground command
+  with its request, the run resumed on another replica told the call was interrupted, and the model said so in the chat and ran the
+  command again (one chat turn, cut twice by one rollout, ran its `sleep 90` three times and showed both explanations). A drain now
+  lets a call already in flight finish, for up to `SIGTERM_TOOL_GRACE_MS` (default the foreground ceiling plus 20 s, at most 180 s,
+  inside the chart's 300 s grace), and the resumed run continues from its recorded result. A call still running then is cut as
+  before, and the model is told not to mention the restart.
 - Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
   忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
   not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with
@@ -720,6 +777,10 @@ record it.
   development environment item no longer stays `in_progress` after its last instruction when stops and turn ends cross (#365);
   `claw-connector logout` revokes the connector at the Claw it registered with before it deletes the sign-in, and exits 1 with
   the remedy when it cannot (#367).
+- `@primusclaw/connector` 0.1.5: on `event: reconnect` (a Claw replica shutting down for a release) the connector opens its command
+  stream again at once, without the reconnect backoff and without waiting for the end of the response a gateway may hold (up to the
+  75 s watchdog before); `disconnects.jsonl` records it as `server_closed` / `restart`. A second such frame within 5 s takes the
+  usual backoff, so a release never becomes a burst of reconnects.
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
