@@ -27,8 +27,9 @@ import { parseArgs } from "node:util";
 import { parse as parseToml } from "smol-toml";
 import type { Ctx, ServiceHelpers } from "./commands.js";
 import { isAlive, processStart } from "./children.js";
+import { reconnectStep } from "./credentials.js";
 import { needsLogin, recordDisconnect, recentDisconnects } from "./health.js";
-import { keepaliveFile, keepaliveStampFile, runLogFile, serviceEnvFile, serviceFile, supervisorPidFile } from "./paths.js";
+import { credentialsFile, keepaliveFile, keepaliveStampFile, runLogFile, serviceEnvFile, serviceFile, supervisorPidFile } from "./paths.js";
 import { errMessage, isObject, sleep } from "./util.js";
 
 export type Supervisor = "systemd" | "launchd" | "script";
@@ -803,7 +804,7 @@ function status(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, json: boolean): num
   ctx.out(`service:    ${sup ? `${sup} (${active})` : "not installed; run: claw-connector service install"}`);
   ctx.out(`connector:  ${st.running !== null ? `running (pid ${st.running})` : "not running"}`);
   if (st.agent_env.length) ctx.out(`agent env:  ${st.agent_env.join(", ")} (from ${serviceEnvFile(ctx.dirs)})`);
-  if (st.needs_login) ctx.out(`problem:    needs a new sign-in: ${st.needs_login.reason}; run: claw-connector login`);
+  if (st.needs_login) ctx.out(`problem:    needs a new sign-in: ${st.needs_login.reason}; ${reconnectStep(credentialsFile(ctx.dirs))}`);
   for (const x of st.recent_disconnects) ctx.out(`down:       ${x.at} ${x.reason}${x.detail ? ` (${x.detail})` : ""}`);
   return 0;
 }

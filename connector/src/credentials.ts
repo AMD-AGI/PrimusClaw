@@ -36,6 +36,32 @@ export interface Credentials {
 }
 
 export class CredentialsError extends Error {}
+
+/** What a machine paired from the chat (`claw-connector pair`) runs to come back: it never had a login to run again. */
+export const PAIR_AGAIN = 'ask the chat for a new pairing command ("连接我的开发环境") and run it here';
+export const LOGIN_AGAIN = "claw-connector login";
+
+/**
+ * The fix for a connector that only a person can bring back (revoked, its sign-in refused): a new pairing command for a
+ * machine whose sign-in came from one, `claw-connector login` for any other (or an unreadable sign-in file).
+ */
+export function reconnectFix(file: string): string {
+  let kind: Credentials["kind"] | undefined;
+  try { kind = loadCredentials(file)?.kind; } catch { /* unreadable: login writes a new one */ }
+  return kind === "grant" ? PAIR_AGAIN : LOGIN_AGAIN;
+}
+
+/** {@link reconnectFix} as the end of a status line: "run: claw-connector login", or the pairing step. */
+export function reconnectStep(file: string): string {
+  const fix = reconnectFix(file);
+  return fix === LOGIN_AGAIN ? `run: ${fix}` : fix;
+}
+
+/** {@link reconnectFix} as a sentence. */
+export function reconnectAdvice(file: string): string {
+  const fix = reconnectFix(file);
+  return fix === PAIR_AGAIN ? `Pair it again: ${fix}.` : `Sign in again (${fix}).`;
+}
 /** The identity service says the grant is gone: stop, do not retry. */
 export class GrantRevokedError extends Error {
   constructor(message = "the sign-in was revoked") { super(message); }

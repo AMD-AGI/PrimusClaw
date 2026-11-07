@@ -101,6 +101,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A machine paired from the chat (`claw-connector pair`) and then disconnected is told, wherever the connector says what to do next
+  (`run` started again by the service or by hand, `status`, `service status`, `doctor`'s fix, a sign-in refused at start), to ask the
+  chat for a new pairing command and run it, instead of `claw-connector login`, which it never ran. A machine signed in with `login`
+  is still told to log in.
 - A sandbox torn down by one brain replica while another was walking the handle records no longer stops every replica
   from starting sandboxes. The walk read the deleted record's DEL marker as an unreadable record, marked the fleet count
   incomplete, and admission refused new sandboxes ("the fleet count it would be checked against is incomplete") until a later
