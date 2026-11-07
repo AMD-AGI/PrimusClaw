@@ -111,6 +111,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A grant's GPU hours are charged only while a sandbox runs: from the moment it first reaches running (new grant status field
+  `sandboxes[].runningAt`) to its end. A sandbox that waited in a queue, sat scheduling-gated or pulled its image and was then deleted
+  charges nothing; before, two measurement sandboxes held pending for 28 minutes spent 3354 GPU seconds of a 6-GPU-hour grant. Apply
+  the updated `sandboxgrant` CRD with the release, or the field is pruned and a running sandbox is charged from its start as before.
 - A development environment turn cut off because its connector restarted mid-turn is told on the assistant's item as an
   interruption with what to do (send the instruction again, or say "continue"), not as the bare code `connector_restarted`.
 - A request to review or merge pull requests that are already merged, or closed, is answered from a read: the assistant first calls
