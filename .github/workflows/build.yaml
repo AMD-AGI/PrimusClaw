@@ -191,9 +191,28 @@ jobs:
           buildah bud \
             --layers \
             --build-context agent-sandbox=sandbox \
+            --build-arg CLAW_BUILD=${DATE_TIME} \
             -t ${{ matrix.name }}:${IMAGE_VERSION} \
             -t ${{ matrix.name }}:${DATE_TIME} \
             -f ${{ matrix.dockerfile_path }} ${{ matrix.context_path }}
+
+      # The claw image reports its own build to the assistant through CLAW_BUILD
+      # (claw/Dockerfile). Assert the image just built carries exactly the tag it
+      # is about to be pushed under, so a dropped build-arg fails here rather
+      # than as "build unknown" on a live deployment.
+      - name: Assert the image knows its tag
+        if: matrix.name == 'claw'
+        env:
+          DATE_TIME: ${{ needs.detect-changes.outputs.date_time }}
+        run: |
+          set -e
+          ENVS=$(buildah inspect --type image --format '{{range .OCIv1.Config.Env}}{{println .}}{{end}}' ${{ matrix.name }}:${DATE_TIME})
+          GOT=$(printf '%s\n' "$ENVS" | sed -n 's/^CLAW_BUILD=//p')
+          echo "CLAW_BUILD in image: '${GOT}', tag: '${DATE_TIME}'"
+          if [[ -z "$DATE_TIME" || "$GOT" != "$DATE_TIME" ]]; then
+            echo "::error::claw image CLAW_BUILD='${GOT}' does not equal its tag '${DATE_TIME}'"
+            exit 1
+          fi
 
       - name: Push with Buildah
         if: github.event_name != 'pull_request'
