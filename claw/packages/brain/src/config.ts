@@ -1970,6 +1970,16 @@ export const PROGRESSIVE_SKILLS_ENABLED = envBool("PROGRESSIVE_SKILLS_ENABLED", 
 // placeholders, as always. On: in the system message, so the user's message is the last thing the model reads and the
 // hints are part of the cached prefix. Affects every session; switch it on only after an evaluation shows no regression.
 export const SKILL_HINTS_IN_SYSTEM = envBool("SKILL_HINTS_IN_SYSTEM", false);
+// A canary for SKILL_HINTS_IN_SYSTEM: comma-separated user ids whose turns put the hints in the system message while the
+// flag is off for everyone else, so the change can be measured on one identity on a live deployment before it is switched
+// on for all. Empty (default): nobody. With SKILL_HINTS_IN_SYSTEM on it changes nothing.
+export const SKILL_HINTS_IN_SYSTEM_USERS: ReadonlySet<string> = new Set(
+  env("SKILL_HINTS_IN_SYSTEM_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
+/** Whether this user's turn puts the skill and MCP hints in the system message: the flag, or the user is in the canary list. */
+export function skillHintsInSystemFor(userId: string | undefined): boolean {
+  return SKILL_HINTS_IN_SYSTEM || (!!userId && SKILL_HINTS_IN_SYSTEM_USERS.has(userId));
+}
 // Budget for the downloaded skill files (plugin skills and marketplace tool_ids
 // skills) Brain keeps in memory between turns, so a skill version is fetched once
 // per process instead of once per turn (see tools/skill-cache.ts). Counted as

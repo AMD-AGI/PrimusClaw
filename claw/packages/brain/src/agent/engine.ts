@@ -44,7 +44,7 @@ import {
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
   BASH_APPROVAL_RULES, BASH_APPROVAL_DEFAULTS_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  MCP_PLATFORM_KEY_ALLOWED_HOSTS, MCP_CONNECT_BUDGET_MS, MCP_POOL_ENABLED, MCP_POOL_IDLE_MS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, SKILL_HINTS_IN_SYSTEM, BG_SHELL_ENABLED,
+  MCP_PLATFORM_KEY_ALLOWED_HOSTS, MCP_CONNECT_BUDGET_MS, MCP_POOL_ENABLED, MCP_POOL_IDLE_MS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, skillHintsInSystemFor, BG_SHELL_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
@@ -355,6 +355,7 @@ export class AgentEngine {
     const repoBlock = binding ? renderRepoBlock(binding, repoProgressive.length) : "";
 
     const rules = loadRules();
+    const hintsInSystem = skillHintsInSystemFor(request.user_id);
     const fullPrompt = buildPrompt(
       request.prompt ?? "",
       inlineSkills,
@@ -371,10 +372,11 @@ export class AgentEngine {
       progressiveSkills,
       repoBlock,
       loadSkillAllowed,
-      SKILL_HINTS_IN_SYSTEM,
+      hintsInSystem,
     );
-    // With SKILL_HINTS_IN_SYSTEM the same hints go to the system message instead, built from the same inputs.
-    const systemHints = SKILL_HINTS_IN_SYSTEM
+    // With SKILL_HINTS_IN_SYSTEM (or this user in SKILL_HINTS_IN_SYSTEM_USERS) the same hints go to the system message
+    // instead, built from the same inputs.
+    const systemHints = hintsInSystem
       ? renderSystemHints(buildSkillAndMcpHints(inlineSkills, Object.keys(mergedMcp), sessionDir, progressiveSkills, loadSkillAllowed))
       : "";
 
@@ -385,6 +387,7 @@ export class AgentEngine {
       progressiveSkillCount: progressiveSkills.length,
       mcpServerCount: Object.keys(mergedMcp).length,
       promptLen: fullPrompt.length,
+      hintsInSystem,
     }, "engine.tools_resolved");
 
     // The user's connections from earlier turns are reused (`mcp-pool.ts`), the servers are connected side by side, and the run
