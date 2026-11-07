@@ -98,7 +98,7 @@ export interface ReviewParams {
    */
   request_batch?: string;
   /**
-   * The assistant message whose turn started it (`review_start`): a call sent again for that message answers this review instead of
+   * The assistant message whose turn started it (`review_start`), as `<session>/<message>` (`requestKey`): a call sent again for that message answers this review instead of
    * starting another (`startedFor`). Absent for a review started any other way.
    */
   request_message?: string;
@@ -223,7 +223,7 @@ export interface ReviewRequest {
    * the router's tool, never parsed from a body.
    */
   mergeNeedsConfirmation?: boolean;
-  /** The assistant message whose turn asked (`review_start`), kept on each review as `request_message`. Set by the router's tool, never parsed from a body. */
+  /** The assistant message whose turn asked (`review_start`, `requestKey`), kept on each review as `request_message`. Set by the router's tool, never parsed from a body. */
   requestMessageId?: string;
   /**
    * The handoff the assistant queued for this request (`review_for_other`, `claw_assistant_review_handoffs`), echoed by the channel that

@@ -351,7 +351,7 @@ describe("assistant review tools", { skip }, () => {
       request: {
         prs: [{ pr: { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 }, message: null }, { pr: { owner: "AMD-AGI", repo: "PrimusClaw", number: 257 }, message: null }],
         requesterNote: null, actingAs: "u-weilei", actingAsName: "Wei Lei", handoffId: null, model: "claude-opus-4-8", effort: undefined,
-        reviewOnly: false, mergeNeedsConfirmation: true, requestMessageId: turn.mid,
+        reviewOnly: false, mergeNeedsConfirmation: true, requestMessageId: `${turn.sid}/${turn.mid}`,
       },
     });
     assert.equal((out as Recorded).items.length, 2);
@@ -807,7 +807,7 @@ describe("assistant review tools", { skip }, () => {
     };
     await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#261"], merge: false });
     assert.equal(calls.start.length, 1);
-    assert.equal(calls.start[0].request.requestMessageId, turn.mid, "the review is told which message asked");
+    assert.equal(calls.start[0].request.requestMessageId, `${turn.sid}/${turn.mid}`, "the review is told which message asked, in which session");
 
     const again = await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#261"], merge: false }) as Recorded;
     assert.equal(calls.start.length, 1, "the resend starts no second review");
