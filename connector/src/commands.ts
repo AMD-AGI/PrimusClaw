@@ -15,7 +15,7 @@ import {
   CredentialsError, DEFAULT_CLIENT_ID, GrantRevokedError, loadCredentials, providerFor, saveCredentials, type Credentials,
 } from "./credentials.js";
 import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
-import { applyRootSandbox, bypassUnavailableWarnings, noAskWarnings } from "./claude-mode.js";
+import { applyRootSandbox, bypassUnavailableWarnings } from "./claude-mode.js";
 import { HooksError, hooksStatus, installHooks, settingsFile, uninstallHooks } from "./hooks.js";
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
@@ -105,14 +105,9 @@ function loadCfg(ctx: Ctx, notes: string[] = []): ConnectorConfig {
   return cfg;
 }
 
-/**
- * Agents whose sessions the connector will close: Claude's own settings start them in a mode that never asks, or
- * Claude will not offer the mode an unattended agent runs in.
- */
-const noAsk = (ctx: Ctx, cfg: ConnectorConfig): string[] => [
-  ...noAskWarnings(cfg.agents, ctx.env, { managedFile: ctx.claudeManagedSettings, euid: ctx.euid }),
-  ...bypassUnavailableWarnings(cfg.agents, ctx.env, { managedFile: ctx.claudeManagedSettings, euid: ctx.euid }),
-];
+/** Agents whose sessions the connector will close: Claude will not offer the mode an unattended agent runs in. */
+const noAsk = (ctx: Ctx, cfg: ConnectorConfig): string[] =>
+  bypassUnavailableWarnings(cfg.agents, ctx.env, { managedFile: ctx.claudeManagedSettings, euid: ctx.euid });
 
 function serverUrl(ctx: Ctx, flag: string | undefined, cfg: ConnectorConfig | null, creds: Credentials | null): string | null {
   const v = flag ?? ctx.env.CLAW_URL ?? cfg?.server ?? creds?.server ?? null;
@@ -497,6 +492,8 @@ async function cmdStop(ctx: Ctx, quiet = false): Promise<number> {
       process.kill(pid, "SIGKILL");
       if (!quiet) ctx.out(`the connector (pid ${pid}) did not stop in 15 s and was killed`);
     }
+    // A run that ended reads it as it ends; one that never did (killed, or gone before the signal) leaves nothing behind.
+    fs.rmSync(stopRequestFile(ctx.dirs), { force: true });
   }
   const left = await new ChildRegistry(childrenFile(ctx.dirs)).killAll();
   if (!quiet) ctx.out(pid === null ? `no connector running${left.killed.length ? `; stopped ${left.killed.length} leftover agent process group(s)` : ""}` : `stopped the connector${left.killed.length ? ` and ${left.killed.length} leftover agent process group(s)` : ""}`);
@@ -509,7 +506,8 @@ function takeStopRequest(ctx: Ctx): boolean {
   let mine = false;
   try {
     const raw: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
-    mine = isObject(raw) && raw.pid === process.pid;
+    // The start time too: a request left behind for a process that is gone must not match a later one with its pid.
+    mine = isObject(raw) && raw.pid === process.pid && raw.start === (processStart(process.pid) ?? "");
   } catch { return false; }
   if (mine) fs.rmSync(file, { force: true });
   return mine;

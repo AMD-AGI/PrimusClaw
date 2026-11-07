@@ -2,209 +2,98 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * `status` and `run` say, before any phone session, that Claude's own settings start a session in bypassPermissions
- * and that the connector will therefore close it (mode_not_enforced). The cases are the ones measured against the real
- * claude-agent-acp 0.99.0: which file, which spelling, root, and the opt-outs.
+ * A Claude agent that asks before every step, on a machine whose own Claude settings default to bypassPermissions:
+ * the connector used to see the adapter start the session in bypassPermissions, warn that it would not ask, and close
+ * it (mode_not_enforced). It now tells the adapter to leave bypass out (`allowDangerouslySkipPermissions: false`), and
+ * the session opens in `default`. The stand-in adapter does what claude-agent-acp 0.99.0 does with that option
+ * (fake-adapter.mjs); test/real-modes.test.ts runs the real one.
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test, { describe } from "node:test";
-import { claudeStartMode, noAskWarnings } from "../src/claude-mode.js";
+import { claudeSessionMeta } from "../src/claude-mode.js";
 import { main, type Ctx } from "../src/commands.js";
 import { parseConfig } from "../src/config.js";
 import { resolveDirs } from "../src/paths.js";
 import { FakeClaw } from "./support/fake-claw.js";
-import { tmpdir } from "./support/harness.js";
+import { ADAPTER, tmpdir } from "./support/harness.js";
 
-const BYPASS = { permissions: { defaultMode: "bypassPermissions" } };
-const write = (file: string, v: unknown) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, typeof v === "string" ? v : JSON.stringify(v)); };
+const agent = (work: string, extra: string, args = `[${JSON.stringify(ADAPTER)}, "claude-agent-acp"]`) => `
+[[agents]]
+id = "cc"
+preset = "claude"
+command = ${JSON.stringify(process.execPath)}
+args = ${args}
+roots = [${JSON.stringify(work)}]
+${extra}
+[agents.env]
+FAKE_START_MODE = "bypassPermissions"
+FAKE_NEW_WARN = "1"
+`;
 
-/** A Claude config directory, a work directory (the root) and a managed settings path that does not exist yet. */
-function layout() {
-  const base = tmpdir("cm-");
-  const claude = path.join(base, "claude");
-  const work = path.join(base, "work");
-  fs.mkdirSync(claude, { recursive: true });
-  fs.mkdirSync(work, { recursive: true });
-  return {
-    base, claude, work, managed: path.join(base, "managed-settings.json"),
-    user: path.join(claude, "settings.json"),
-    project: path.join(work, ".claude", "settings.json"),
-    local: path.join(work, ".claude", "settings.local.json"),
-  };
-}
+describe("claudeSessionMeta", () => {
+  const work = tmpdir("cm-work-");
+  const meta = { _meta: { claudeCode: { options: { allowDangerouslySkipPermissions: false } } } };
 
-const mode = (l: ReturnType<typeof layout>, env: NodeJS.ProcessEnv = {}, euid: number | null = 1000) =>
-  claudeStartMode({ env: { CLAUDE_CONFIG_DIR: l.claude, ...env }, cwd: l.work, managedFile: l.managed, euid });
-
-describe("Claude's own start mode, read like the Claude adapter reads it", () => {
-  test("bypassPermissions in the user settings.json starts sessions in it, and names that file", () => {
-    const l = layout();
-    assert.deepEqual(mode(l), { bypass: false, file: null, unreadable: [] });
-    write(l.user, BYPASS);
-    assert.deepEqual(mode(l), { bypass: true, file: l.user, unreadable: [] });
-  });
-
-  test("the config directory is $CLAUDE_CONFIG_DIR, else ~/.claude of HOME", () => {
-    const l = layout();
-    write(path.join(l.base, ".claude", "settings.json"), BYPASS);
-    assert.equal(claudeStartMode({ env: { HOME: l.base }, cwd: l.work, managedFile: l.managed, euid: 1000 }).bypass, true);
-    assert.equal(claudeStartMode({ env: { HOME: l.base, CLAUDE_CONFIG_DIR: l.claude }, cwd: l.work, managedFile: l.managed, euid: 1000 }).bypass, false);
-  });
-
-  test("only the exact spelling counts", () => {
-    const l = layout();
-    for (const v of ["Bypass", "bypass", "BypassPermissions", "dontAsk", "acceptEdits", "auto", "default", 3]) {
-      write(l.user, { permissions: { defaultMode: v } });
-      assert.equal(mode(l).bypass, false, String(v));
-    }
-  });
-
-  test("bypassPermissions from the repository's .claude files is ignored, and the user's file is not used instead", () => {
-    const l = layout();
-    write(l.project, BYPASS);
-    assert.equal(mode(l).bypass, false);
-    fs.rmSync(l.project);
-    write(l.local, BYPASS);
-    assert.equal(mode(l).bypass, false);
-    write(l.user, BYPASS);
-    assert.equal(mode(l).bypass, false, "a project/local bypass overrides the user's and is then dropped");
-    fs.rmSync(l.local);
-    write(l.project, { permissions: { defaultMode: "default" } });
-    assert.equal(mode(l).bypass, false, "a project default overrides the user's bypass");
-    write(l.project, { permissions: { allow: ["Read"] } });
-    assert.equal(mode(l).bypass, true, "a project file without defaultMode leaves the user's");
-  });
-
-  test("the managed settings file wins over the others", () => {
-    const l = layout();
-    write(l.managed, BYPASS);
-    assert.deepEqual(mode(l), { bypass: true, file: l.managed, unreadable: [] });
-    write(l.user, BYPASS);
-    write(l.managed, { permissions: { defaultMode: "default" } });
-    assert.equal(mode(l).bypass, false);
-  });
-
-  test("root without IS_SANDBOX, and disableBypassPermissionsMode, keep the session out of bypass", () => {
-    const l = layout();
-    write(l.user, BYPASS);
-    assert.equal(mode(l, {}, 0).bypass, false);
-    assert.equal(mode(l, { IS_SANDBOX: "1" }, 0).bypass, true);
-    write(l.project, { permissions: { disableBypassPermissionsMode: "disable" } });
-    assert.equal(mode(l).bypass, false);
-  });
-
-  test("a settings file that is not JSON is reported, not taken as saying nothing", () => {
-    const l = layout();
-    write(l.user, "{ not json");
-    assert.deepEqual(mode(l), { bypass: false, file: null, unreadable: [l.user] });
+  test("a Claude agent that asks gets it; one without approval, claude-attach, and other adapters do not", () => {
+    assert.deepEqual(claudeSessionMeta(parseConfig(agent(work, "")).agents[0]!), meta);
+    assert.deepEqual(claudeSessionMeta(parseConfig(agent(work, `approval = "ask"`)).agents[0]!), meta);
+    assert.deepEqual(claudeSessionMeta(parseConfig(agent(work, `approval = "never"`)).agents[0]!), {});
+    assert.deepEqual(claudeSessionMeta(parseConfig(`allow_unsafe_modes = true\n${agent(work, "")}`).agents[0]!), {});
+    assert.deepEqual(claudeSessionMeta(parseConfig(agent(work, "", `[${JSON.stringify(ADAPTER)}]`)).agents[0]!), {});
+    assert.deepEqual(claudeSessionMeta(parseConfig(`[[agents]]\nid = "att"\npreset = "claude-attach"\nroots = [${JSON.stringify(work)}]\n`).agents[0]!), {});
+    assert.deepEqual(claudeSessionMeta(parseConfig(`[[agents]]\nid = "cx"\npreset = "codex"\nroots = [${JSON.stringify(work)}]\n`).agents[0]!), {});
   });
 });
 
-describe("which agents are warned about", () => {
-  const cfg = (l: ReturnType<typeof layout>, blocks: string, top = "") => parseConfig(`${top}\n${blocks.replaceAll("ROOT", JSON.stringify(l.work))}`);
-  const warn = (l: ReturnType<typeof layout>, c: ReturnType<typeof parseConfig>, env: NodeJS.ProcessEnv = { CLAUDE_CONFIG_DIR: l.claude }) =>
-    noAskWarnings(c.agents, env, { managedFile: l.managed, euid: 1000 });
-
-  test("a Claude agent without approval = never is warned about; with it, or with allow_unsafe_modes, it is not", () => {
-    const l = layout();
-    write(l.user, BYPASS);
-    const one = warn(l, cfg(l, `[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\n`));
-    assert.equal(one.length, 1);
-    assert.match(one[0]!, /^cc: sessions will be refused \(mode_not_enforced\): Claude defaults to bypassPermissions here \(permissions\.defaultMode in .*settings\.json\); set approval = "never" on this agent or change defaultMode$/);
-    assert.ok(one[0]!.includes(l.user));
-    assert.deepEqual(warn(l, cfg(l, `[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\napproval = "never"\n`)), []);
-    assert.deepEqual(warn(l, cfg(l, `[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\n`, "allow_unsafe_modes = true")), []);
-    assert.equal(warn(l, cfg(l, `[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\napproval = "ask"\n`, "allow_unsafe_modes = true")).length, 1);
-  });
-
-  test("only agents that run the Claude adapter are checked: not claude-attach (it accepts the warning while it takes over), Codex, or a custom agent labelled claude", () => {
-    const l = layout();
-    write(l.user, BYPASS);
-    const w = warn(l, cfg(l, `[[agents]]\nid = "att"\npreset = "claude-attach"\nroots = [ROOT]\n[[agents]]\nid = "cx"\npreset = "codex"\nroots = [ROOT]\n[[agents]]\nid = "mine"\nkind = "claude"\ncommand = "x"\nask_mode = "a"\nroots = [ROOT]\n`));
-    assert.deepEqual(w, []);
-    const both = warn(l, cfg(l, `[[agents]]\nid = "att"\npreset = "claude-attach"\nroots = [ROOT]\n[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\n`));
-    assert.deepEqual(both.map((s) => s.split(":")[0]), ["cc"]);
-  });
-
-  test("a custom agent that runs claude-agent-acp is checked, whatever its kind", () => {
-    const l = layout();
-    write(l.user, BYPASS);
-    const w = warn(l, cfg(l, `[[agents]]\nid = "own"\ncommand = "node"\nargs = ["/opt/claude-agent-acp/dist/index.js"]\nask_mode = "default"\nroots = [ROOT]\n`));
-    assert.deepEqual(w.map((s) => s.split(":")[0]), ["own"]);
-  });
-
-  test("a root's own .claude file that sets another defaultMode does not hide the warning: a session may start below it", () => {
-    const l = layout();
-    write(l.user, BYPASS);
-    write(l.project, { permissions: { defaultMode: "default" } });
-    assert.equal(warn(l, cfg(l, `[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\n`)).length, 1);
-  });
-
-  test("the agent's own [agents.env] CLAUDE_CONFIG_DIR is the one read", () => {
-    const l = layout();
-    const other = path.join(l.base, "other");
-    write(path.join(other, "settings.json"), BYPASS);
-    const c = cfg(l, `[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\n[agents.env]\nCLAUDE_CONFIG_DIR = ${JSON.stringify(other)}\n`);
-    assert.equal(warn(l, c).length, 1);
-    write(l.user, BYPASS);
-    const d = cfg(l, `[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\n[agents.env]\nCLAUDE_CONFIG_DIR = ${JSON.stringify(path.join(l.base, "empty"))}\n`);
-    assert.deepEqual(warn(l, d), []);
-  });
-
-  test("an unreadable settings file is said, per agent", () => {
-    const l = layout();
-    write(l.user, "nope");
-    const w = warn(l, cfg(l, `[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\n`));
-    assert.deepEqual(w, [`cc: cannot tell whether Claude defaults to bypassPermissions: ${l.user} is not readable JSON`]);
-  });
-});
-
-describe("status and run say it", () => {
-  const setup = (approval = "") => {
-    const l = layout();
-    const home = path.join(l.base, "cc-home");
-    write(path.join(home, "config", "agents.toml"), `[[agents]]\nid = "claude"\npreset = "claude"\nexisting_sessions = false\nroots = [${JSON.stringify(l.work)}]\n${approval}`);
-    write(l.user, BYPASS);
+describe("through run: Claude's own settings default to bypassPermissions", () => {
+  async function openSession(extra: string, args?: string) {
+    const base = tmpdir("cm-");
+    const home = path.join(base, "home");
+    const work = path.join(base, "work");
+    fs.mkdirSync(path.join(home, "config"), { recursive: true });
+    fs.mkdirSync(work, { recursive: true });
+    fs.writeFileSync(path.join(home, "config", "agents.toml"), agent(work, extra, args));
     const out: string[] = [];
-    const err: string[] = [];
     const c: Ctx = {
-      dirs: resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv), env: { CLAUDE_CONFIG_DIR: l.claude },
-      out: (s) => out.push(s), err: (s) => err.push(s), hostname: "box", claudeManagedSettings: l.managed, euid: 1000,
+      dirs: resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv), env: { CLAUDE_CONFIG_DIR: path.join(base, "claude") },
+      out: (s) => out.push(s), err: (s) => out.push(s), hostname: "box", claudeManagedSettings: path.join(base, "managed.json"), euid: 1000,
     };
-    return { l, home, c, out, err };
-  };
-
-  test("status prints a warning line and lists it in --json", async () => {
-    const t = setup();
-    await main(["status"], t.c);
-    assert.match(t.out.join("\n"), /\nwarning:    claude: sessions will be refused \(mode_not_enforced\)/);
-    const j = setup();
-    await main(["status", "--json"], j.c);
-    assert.equal(JSON.parse(j.out.join("\n")).warnings.length, 1);
-    const n = setup(`approval = "never"\n`);
-    await main(["status", "--json"], n.c);
-    assert.deepEqual(JSON.parse(n.out.join("\n")).warnings, []);
-  });
-
-  test("run prints it right after the line that names the agents", async () => {
     const claw = await FakeClaw.start();
     let connector: any;
     let running: Promise<number> | undefined;
     try {
-      const t = setup();
       claw.tokens.add("good-token");
-      await main(["login", "--server", claw.url, "--key", "good-token"], { ...t.c, out: () => {}, err: () => {} });
-      running = main(["run"], { ...t.c, onConnector: (cn) => { connector = cn; }, timing: { heartbeatMs: 150, batchMs: 15, backoffMinMs: 20, backoffMaxMs: 100 } });
+      await main(["login", "--server", claw.url, "--key", "good-token"], { ...c, out: () => {}, err: () => {} });
+      running = main(["run"], { ...c, onConnector: (cn) => { connector = cn; }, timing: { heartbeatMs: 150, batchMs: 15, backoffMinMs: 20, backoffMaxMs: 100, modeConfirmMs: 250 } });
       await claw.until("online", () => claw.online);
-      const i = t.out.findIndex((s) => s.startsWith("connecting claude to "));
-      assert.ok(i >= 0, t.out.join("\n"));
-      assert.match(t.out[i + 1] ?? "", /^warning: claude: sessions will be refused \(mode_not_enforced\)/);
+      const sid = claw.newSession("cc", work);
+      return await claw.until("session_started or session_closed", () => claw.eventsOf(sid).find((e) => e.type === "session_started" || e.type === "session_closed"), 15_000);
     } finally {
       connector?.stop();
       await running;
       await claw.close();
     }
+  }
+
+  test("an agent that asks opens in default and asks", async () => {
+    const ev = await openSession(`approval = "ask"`);
+    assert.equal(ev.type, "session_started", JSON.stringify(ev.data));
+    assert.equal(ev.data.currentMode, "default");
+    assert.equal(ev.data.unattended, false);
+  });
+
+  test("without the option (an adapter the connector does not recognise as Claude's) it is still closed, not opened unattended", async () => {
+    const ev = await openSession(`approval = "ask"`, `[${JSON.stringify(ADAPTER)}]`);
+    assert.equal(ev.type, "session_closed");
+    assert.equal(ev.data.reason, "mode_not_enforced");
+  });
+
+  test("an agent with approval = never still opens in bypassPermissions", async () => {
+    const ev = await openSession(`approval = "never"`);
+    assert.equal(ev.type, "session_started", JSON.stringify(ev.data));
+    assert.equal(ev.data.currentMode, "bypassPermissions");
+    assert.equal(ev.data.unattended, true);
   });
 });

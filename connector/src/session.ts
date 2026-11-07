@@ -24,6 +24,7 @@ import type { Audit } from "./audit.js";
 import { AdapterProcess, type AcpParams, type AdapterHooks } from "./adapter.js";
 import type { ChildRegistry } from "./children.js";
 import type { AgentConfig, ConnectorConfig } from "./config.js";
+import { claudeSessionMeta } from "./claude-mode.js";
 import {
   PermissionBook, boundedInput, matchAutoAllow, normalizeOptions, type OfferedOption,
 } from "./permissions.js";
@@ -288,7 +289,7 @@ export class Session {
     this.modeSeen = [];
     try {
       if (how === "new") {
-        const res = await adapter.request("session/new", { cwd: this.cwd, mcpServers: [] });
+        const res = await adapter.request("session/new", { cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) });
         if (typeof res.sessionId !== "string") throw new SessionRefusal("adapter_protocol", "session/new returned no session id");
         this.acpId = res.sessionId;
         this.absorb(res);
@@ -297,10 +298,10 @@ export class Session {
         const caps = adapter.caps.sessionCapabilities as AcpParams | undefined;
         if (caps?.resume) {
           // `resume` does not replay the history, and the adapter's own settings apply again: the mode is re-locked below.
-          this.absorb(await adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [] }));
+          this.absorb(await adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }));
         } else if (adapter.caps.loadSession) {
           this.replaying = true;
-          try { this.absorb(await adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [] })); } finally { this.replaying = false; }
+          try { this.absorb(await adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) })); } finally { this.replaying = false; }
         } else {
           throw new SessionRefusal("adapter_cannot_resume", "the adapter can neither resume nor load a session");
         }

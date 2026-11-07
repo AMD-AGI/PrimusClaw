@@ -42,11 +42,11 @@ describe("applyRootSandbox and bypassUnavailableWarnings", () => {
   const work = tmpdir("rs-work-");
   const parse = (approval: string, extraEnv = "", top = "") => parseConfig(`${top}\n${claudeAgent(work, approval, extraEnv)}`);
 
-  test("root, approval = never: IS_SANDBOX=1 is set for that agent's adapter, and said", () => {
+  test("root, approval = never: IS_SANDBOX=1 is set for that agent's adapter (and the existing-sessions agent it brings), and said", () => {
     const c = parse("never");
     const notes = applyRootSandbox(c.agents, {}, { euid: 0 });
-    assert.equal(c.agents[0]!.env.IS_SANDBOX, "1");
-    assert.deepEqual(notes.map((n) => n.split(":")[0]), ["cc"]);
+    assert.deepEqual(c.agents.map((a) => [a.id, a.env.IS_SANDBOX]), [["cc", "1"], ["cc-sessions", "1"]]);
+    assert.deepEqual(notes.map((n) => n.split(":")[0]), ["cc", "cc-sessions"]);
     assert.deepEqual(bypassUnavailableWarnings(c.agents, {}, { euid: 0, managedFile: path.join(work, "none.json") }), []);
   });
 
@@ -69,7 +69,7 @@ describe("applyRootSandbox and bypassUnavailableWarnings", () => {
     assert.deepEqual(applyRootSandbox(c.agents, {}, { euid: 0 }), []);
     assert.equal(c.agents[0]!.env.IS_SANDBOX, "");
     const w = bypassUnavailableWarnings(c.agents, {}, { euid: 0, managedFile: path.join(work, "none.json") });
-    assert.equal(w.length, 1);
+    assert.deepEqual(w.map((x) => x.split(":")[0]), ["cc", "cc-sessions"]);
     assert.match(w[0]!, /^cc: sessions will be refused \(mode_unavailable\): .*remove IS_SANDBOX from its env, or set approval = "ask"$/);
   });
 
@@ -80,7 +80,7 @@ describe("applyRootSandbox and bypassUnavailableWarnings", () => {
       const c = parse("never", `CLAUDE_CONFIG_DIR = ${JSON.stringify(claude)}`);
       applyRootSandbox(c.agents, {}, { euid });
       const w = bypassUnavailableWarnings(c.agents, {}, { euid, managedFile: path.join(work, "none.json") });
-      assert.equal(w.length, 1, String(euid));
+      assert.deepEqual(w.map((x) => x.split(":")[0]), ["cc", "cc-sessions"], String(euid));
       assert.match(w[0]!, /disableBypassPermissionsMode is "disable" in .*settings\.json/);
     }
   });

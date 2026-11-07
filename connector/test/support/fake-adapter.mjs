@@ -142,7 +142,13 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
     case "session/new": {
       if (env.FAKE_AUTH_REQUIRED) return fail(id, -32000, "Authentication required");
       const sessionId = "acp-" + nextId++;
-      const s = { cwd: params.cwd, mode: START_MODE, cancelled: false };
+      // Like claude-agent-acp 0.99.0: a client that sets allowDangerouslySkipPermissions to false gets no bypass at all,
+      // and a session the user's settings start in bypassPermissions starts in default instead.
+      const noBypass = params?._meta?.claudeCode?.options?.allowDangerouslySkipPermissions === false;
+      const start = noBypass && START_MODE === "bypassPermissions" ? "default" : START_MODE;
+      // ... and, starting in a mode that never asks, it says so while it sets the session up.
+      if (env.FAKE_NEW_WARN === "1" && start === "bypassPermissions") process.stderr.write("Warning: canUseTool will not be invoked: permissionMode 'bypassPermissions' auto-approves every tool call\n");
+      const s = { cwd: params.cwd, mode: start, cancelled: false };
       sessions.set(sessionId, s);
       return reply(id, { sessionId, modes: modesOf(s), configOptions: configOptions(s) });
     }

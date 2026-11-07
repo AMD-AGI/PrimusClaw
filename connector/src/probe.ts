@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { AdapterProcess, type AcpParams } from "./adapter.js";
 import { ChildRegistry } from "./children.js";
+import { claudeSessionMeta } from "./claude-mode.js";
 import type { AgentConfig } from "./config.js";
 import { errMessage, isObject } from "./util.js";
 
@@ -61,7 +62,7 @@ export async function probeAgent(a: AgentConfig, o: { logDir: string; version: s
         onExtension: async () => ({}),
       },
     });
-    const res = await adapter.request("session/new", { cwd, mcpServers: [] }, timeoutMs);
+    const res = await adapter.request("session/new", { cwd, mcpServers: [], ...claudeSessionMeta(a) }, timeoutMs);
     out.modes = modesOf(res);
     if (out.modes === null || out.modes.length === 0) {
       out.notes.push("the adapter lists no modes; the connector sets the ask mode and reads it back when a session opens");

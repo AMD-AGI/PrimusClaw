@@ -5,7 +5,7 @@
  * A phone session against the REAL claude-agent-acp adapter, through `run`, as whoever runs the test: CI runs this
  * file once as the runner's own user and once as root (tests.yml, "Connector real adapter"), so it covers
  * {root, non-root} x {approval = "never", approval = "ask"}. Opening a session needs no model and no credentials
- * (no prompt is sent). Skipped unless CLAW_REAL_CLAUDE_ACP names the adapter's dist/index.js
+ * (no prompt is sent), and also with the user's own Claude settings defaulting to bypassPermissions. Skipped unless CLAW_REAL_CLAUDE_ACP names the adapter's dist/index.js
  * (npm i @agentclientprotocol/claude-agent-acp@0.99.0).
  */
 import assert from "node:assert/strict";
@@ -27,13 +27,19 @@ const saved = process.env.IS_SANDBOX;
 before(() => { delete process.env.IS_SANDBOX; });
 after(() => { if (saved !== undefined) process.env.IS_SANDBOX = saved; });
 
-async function openSession(approval: "never" | "ask") {
+/**
+ * `userBypass`: the user's own Claude settings default to bypassPermissions; `sandbox`: the connector itself runs with
+ * IS_SANDBOX=1 (a container that sets it for everything), so root may use bypass too.
+ */
+async function openSession(approval: "never" | "ask", o: { userBypass?: boolean; sandbox?: boolean } = {}) {
   const base = tmpdir("rm-");
   const home = path.join(base, "home");
   const work = path.join(base, "work");
   const claude = path.join(base, "claude");
   for (const d of [path.join(home, "config"), work, claude]) fs.mkdirSync(d, { recursive: true });
   fs.writeFileSync(path.join(claude, ".claude.json"), JSON.stringify({ hasCompletedOnboarding: true }));
+  if (o.userBypass) fs.writeFileSync(path.join(claude, "settings.json"), JSON.stringify({ permissions: { defaultMode: "bypassPermissions" } }));
+  if (o.sandbox) process.env.IS_SANDBOX = "1";
   fs.writeFileSync(path.join(home, "config", "agents.toml"), `
 [[agents]]
 id = "cc"
@@ -68,6 +74,7 @@ HOME = ${JSON.stringify(base)}
     connector?.stop();
     await running;
     await claw.close();
+    delete process.env.IS_SANDBOX;
   }
 }
 
@@ -85,5 +92,20 @@ describe(`the real Claude adapter as ${who}`, { skip }, () => {
     assert.equal(r.ev.type, "session_started", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
     assert.equal(r.ev.data.currentMode, "default");
     assert.equal(r.doctor.code, EXIT.ok, JSON.stringify(r.doctor.doc));
+  });
+
+  test(`approval = "ask" while the user's own settings default to bypassPermissions (and IS_SANDBOX is set): opens in default`, { timeout: 300_000 }, async () => {
+    const r = await openSession("ask", { userBypass: true, sandbox: true });
+    assert.equal(r.ev.type, "session_started", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
+    assert.equal(r.ev.data.currentMode, "default");
+    assert.equal(r.ev.data.unattended, false);
+    assert.equal(r.doctor.code, EXIT.ok, JSON.stringify(r.doctor.doc));
+    assert.ok(!r.doctor.doc.agents[0].modes.includes("bypassPermissions"), "the adapter leaves bypass out for an agent that asks");
+  });
+
+  test(`approval = "never" while the user's own settings default to bypassPermissions: opens in bypassPermissions`, { timeout: 300_000 }, async () => {
+    const r = await openSession("never", { userBypass: true });
+    assert.equal(r.ev.type, "session_started", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
+    assert.equal(r.ev.data.currentMode, "bypassPermissions");
   });
 });

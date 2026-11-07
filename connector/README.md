@@ -171,21 +171,12 @@ unattended while Cursor keeps asking. For that agent the connector then:
   `mode_update` carry `unattended`, so a client can always show whether a session asks. `status` and the line `run` prints
   at start-up name the agents without per-step approval.
 
-**Before the first phone session, check which way your Claude settings go.** When `permissions.defaultMode` is
-`bypassPermissions` in your user `settings.json` (`$CLAUDE_CONFIG_DIR`, else `~/.claude`) or in Claude's managed settings,
-every session of a `claude` agent without `approval = "never"` is closed with `mode_not_enforced` (a `claude-attach`
-agent accepts the warning while it takes a conversation over, so it is not affected).
-`claw-connector status` and the start-up line of `run` say so for each such agent:
-
-```
-warning:    claude: sessions will be refused (mode_not_enforced): Claude defaults to bypassPermissions here (permissions.defaultMode in /home/me/.claude/settings.json); set approval = "never" on this agent or change defaultMode
-```
-
-Choose one: `approval = "never"` on that agent (knowing the risk below), or another `defaultMode` in that file. The check
-reads the two files from which the Claude adapter takes `bypassPermissions` (it ignores that value in a repository's
-`.claude/settings.json` and `.claude/settings.local.json`), and only the exact spelling counts, as for the adapter; root
-without `IS_SANDBOX` cannot use bypass, and `permissions.disableBypassPermissionsMode = "disable"` turns it off. It applies
-to every agent that runs `claude-agent-acp` except `claude-attach`. Codex and Cursor have no equivalent: their own
+**Your own Claude settings may default to `bypassPermissions`** (`permissions.defaultMode` in your user `settings.json`,
+`$CLAUDE_CONFIG_DIR` or `~/.claude`, or in Claude's managed settings). For a `claude` agent that asks (no
+`approval = "never"`), the connector tells the adapter to leave that mode out (`allowDangerouslySkipPermissions: false`),
+so its sessions start in `default` and ask; before 0.1.5 each of them was closed with `mode_not_enforced`. An agent with
+`approval = "never"` runs in `bypassPermissions` either way. A `claude-attach` agent takes over a conversation in the mode
+its terminal chose and accepts the adapter's warning while it starts. Codex and Cursor have no equivalent: their own
 settings are replaced by the mode the connector sets and reads back.
 
 **Root.** Claude Code offers `bypassPermissions` to root only when `IS_SANDBOX` is set. For an agent that runs

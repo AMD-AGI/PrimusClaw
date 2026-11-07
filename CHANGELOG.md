@@ -61,6 +61,10 @@ record it.
   Code offers `bypassPermissions` to root only with `IS_SANDBOX` set, so every such session was refused with `mode_unavailable`; the
   connector now sets `IS_SANDBOX=1` for that agent's Claude adapter only, and says so when it starts. An agent whose own `env` sets
   `IS_SANDBOX` is left as written, and `status` warns when the mode will still be missing.
+- Connector: a Claude agent that asks before every step opens its phone sessions in `default` on a machine whose own Claude
+  settings default to `bypassPermissions`; the connector tells the adapter to leave that mode out
+  (`allowDangerouslySkipPermissions: false`) instead of closing each session with `mode_not_enforced`. The start-up warning
+  about it is gone with the refusal.
 - Connector: `claw-connector doctor` (also run at the end of `init`) starts each agent's adapter, opens a session without a prompt
   and compares the modes the adapter offers with what `agents.toml` needs, naming the fix instead of leaving it to a refused phone
   session.
