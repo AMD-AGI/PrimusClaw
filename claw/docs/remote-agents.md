@@ -184,8 +184,17 @@ A gateway that closes a connection after 180 s of silence therefore never sees o
 A connector that receives no byte for 75 s should drop the stream and reconnect
 with backoff.
 
+**A Claw release.** An API replica that receives SIGTERM sends `event: reconnect`
+(`data: {"connector_id": ...}`, no `id`) on every command stream it holds, then ends
+them. A connector reconnects at once on that frame, without its backoff and without
+waiting for the response to end. The server keeps such a connector online while it
+does (the stream ended with `stream_end_reason` `restart` still counts as seen), so a
+rolling update records no offline transition; one that does not reconnect is offline
+once the online window below has passed.
+
 A connector is **online** while its command stream is open and its last heartbeat is
-at most 90 s old; a closed stream is offline at once. A newer stream for the same
+at most 90 s old; a closed stream is offline at once (except after `event: reconnect`,
+above). A newer stream for the same
 connector replaces the older, which receives `event: superseded` and ends. When a
 connector is revoked its stream receives `event: revoked` and ends, and every
 connector-side route answers `401 revoked`.

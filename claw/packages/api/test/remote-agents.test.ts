@@ -1049,6 +1049,36 @@ describe("remote agents", { skip }, () => {
       assert.equal((await as("u1").get("/v1/remote-agents/connectors")).body.data[0].online, true);
     });
 
+    test("a replica shutting down (a Claw release) tells its command streams to reconnect, and their connectors stay online", async () => {
+      const closing = new AbortController();
+      const root = await serve({ closing: closing.signal });
+      const cid = await connector();
+      await heartbeat("u1", cid);
+      const open = async () => {
+        const s = await SseClient.open(`${root}/v1/remote-agents/connectors/${cid}/commands`, { "x-test-user": "u1" });
+        streams.push(s);
+        return s;
+      };
+      const stream = await open();
+      await stream.nextEvent("ready");
+      closing.abort();
+      assert.deepEqual((await stream.nextEvent("reconnect")).json(), { connector_id: cid });
+      await stream.waitEnded();
+      const row = (await q("SELECT stream_seen_at, stream_closed_at, stream_end_reason FROM claw_remote_connectors WHERE connector_id = $1", [cid])).rows[0];
+      assert.equal(row.stream_end_reason, "restart");
+      assert.ok(row.stream_seen_at, "still seen: the connector is on its way to another replica");
+      assert.ok(row.stream_closed_at);
+      assert.equal((await as("u1").get("/v1/remote-agents/connectors")).body.data[0].online, true, "online through the handover");
+      // A stream that reaches this replica after it started closing is sent on at once.
+      const late = await open();
+      await late.nextEvent("ready");
+      await late.nextEvent("reconnect");
+      await late.waitEnded();
+      // A connector that does not come back is offline once the online window has passed, as with any stream.
+      await q("UPDATE claw_remote_connectors SET stream_seen_at = NOW() - interval '91 seconds' WHERE connector_id = $1", [cid]);
+      assert.equal((await as("u1").get("/v1/remote-agents/connectors")).body.data[0].online, false);
+    });
+
     test("revoking a connector ends its stream with a revoked frame, refuses it afterwards, and closes its sessions", async () => {
       const { cid, stream } = await online1();
       const sid = await session("u1", cid);

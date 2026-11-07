@@ -282,10 +282,14 @@ export async function touchStream(connectorId: string, streamConn: string): Prom
 /**
  * The current stream has ended. `reason` is the last frame the server sent it (`token_expired`, `revoked`), or
  * `closed` when the connection simply went; kept with the time, so presence can say when it was last seen and why.
+ * `restart` is the server's own shutdown (a Claw release), which told the connector to reconnect at once: the stream
+ * keeps counting as seen, so the connector stays online through the handover and only goes offline if it does not
+ * come back within the online window.
  */
 export async function markStreamClosed(connectorId: string, streamConn: string, reason = "closed"): Promise<void> {
   await direct(
-    `UPDATE claw_remote_connectors SET stream_seen_at = NULL, stream_closed_at = NOW(), stream_end_reason = $3
+    `UPDATE claw_remote_connectors SET stream_seen_at = CASE WHEN $3 = 'restart' THEN stream_seen_at ELSE NULL END,
+            stream_closed_at = NOW(), stream_end_reason = $3
       WHERE connector_id = $1 AND stream_conn = $2`,
     [connectorId, streamConn, reason],
   );
