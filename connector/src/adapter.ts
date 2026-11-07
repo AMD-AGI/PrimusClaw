@@ -12,7 +12,7 @@ import { adapterStore } from "./adapter-install.js";
 import type { AgentConfig } from "./config.js";
 import type { ChildRegistry } from "./children.js";
 import { redactText } from "./redact.js";
-import { errMessage } from "./util.js";
+import { errMessage, isObject } from "./util.js";
 
 export type AcpParams = Record<string, any>;
 
@@ -170,6 +170,27 @@ export class AdapterProcess {
     return this.authStatus;
   }
 
+  /**
+   * `open` (a `session/new`, `session/resume` or `session/load`), signing the adapter in first when it needs that and can
+   * do it by itself: an adapter that answers "Authentication required" and offers an `api-key` method, while `env` (the
+   * connector's environment with the agent's `[agents.env]` over it) holds a key it reads (codex-acp: OPENAI_API_KEY or
+   * CODEX_API_KEY), is told to `authenticate` with it and asked once more. The key itself is never sent: the adapter
+   * reads its own environment. `onAuthenticate` runs before the `authenticate` request; a failed `authenticate` throws
+   * {@link AuthenticateFailed}. Sessions and `doctor`'s adapter check both open this way, so `doctor` passes an agent
+   * whose sessions open.
+   */
+  async openSignedIn<T>(env: Record<string, string | undefined>, open: () => Promise<T>, onAuthenticate?: (method: string) => void): Promise<T> {
+    try {
+      return await open();
+    } catch (e) {
+      const method = this.apiKeyMethod();
+      if (!isAuthRequiredError(e) || !method || !hasApiKeyEnv(env)) throw e;
+      onAuthenticate?.(method);
+      try { await this.request("authenticate", { methodId: method }); } catch (ae) { throw new AuthenticateFailed(method, ae); }
+      return await open();
+    }
+  }
+
   /** The id of an `authenticate` method that signs in with an API key the adapter reads from its own environment. */
   apiKeyMethod(): string | null {
     for (const m of this.authMethods) {
@@ -205,4 +226,19 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: NodeJS.Timeout;
   const t = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms); timer.unref?.(); });
   return Promise.race([p, t]).finally(() => clearTimeout(timer));
+}
+
+/** An adapter error that says the agent is not signed in. */
+export function isAuthRequiredError(e: unknown): boolean {
+  return /authentication required|auth_required|not logged in|login required/i.test(errMessage(e)) || (isObject(e) && (e as { code?: unknown }).code === -32000);
+}
+
+/** Whether an adapter's environment holds an OpenAI/Codex key its `api-key` sign-in reads. */
+export function hasApiKeyEnv(env: Record<string, string | undefined>): boolean {
+  return ["CODEX_API_KEY", "OPENAI_API_KEY"].some((k) => typeof env[k] === "string" && env[k]!.trim() !== "");
+}
+
+/** `authenticate` itself failed: the agent stays signed out. */
+export class AuthenticateFailed extends Error {
+  constructor(readonly method: string, cause: unknown) { super(`authenticate ${method} failed: ${errMessage(cause)}`); }
 }

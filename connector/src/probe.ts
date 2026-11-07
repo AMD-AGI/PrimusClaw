@@ -62,7 +62,9 @@ export async function probeAgent(a: AgentConfig, o: { logDir: string; version: s
         onExtension: async () => ({}),
       },
     });
-    const res = await adapter.request("session/new", { cwd, mcpServers: [], ...claudeSessionMeta(a) }, timeoutMs);
+    // Opened the way a session opens it, so an agent that signs in with an API key (Codex) is checked signed in.
+    const started = adapter;
+    const res = await started.openSignedIn({ ...process.env, ...a.env }, () => started.request("session/new", { cwd, mcpServers: [], ...claudeSessionMeta(a) }, timeoutMs));
     out.modes = modesOf(res);
     if (out.modes === null || out.modes.length === 0) {
       out.notes.push("the adapter lists no modes; the connector sets the ask mode and reads it back when a session opens");

@@ -182,6 +182,17 @@ describe("doctor: the adapter's modes against agents.toml, before any phone sess
     assert.deepEqual(doc.agents[0].modes, ["default", "plan", "acceptEdits"]);
   });
 
+  test("an agent that signs in with an API key (Codex) is checked signed in, as its sessions open; without a key it is a problem", async () => {
+    const work = tmpdir("rd-w-");
+    const agent = (env: string) => parseConfig(`[[agents]]\nid = "codex-key"\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(ADAPTER)}]\nask_mode = "default"\nroots = [${JSON.stringify(work)}]\n[agents.env]\nFAKE_API_KEY_AUTH = "1"\nCODEX_API_KEY = ""\n${env}`).agents;
+    const [r] = await probeAgents(agent(`OPENAI_API_KEY = "sk-probe-test"\n`), { logDir: tmpdir("rd-log-"), version: "test", timeoutMs: 5000 });
+    assert.equal(r!.ok, true, JSON.stringify(r));
+    assert.deepEqual(r!.problems, []);
+    const [none] = await probeAgents(agent(`OPENAI_API_KEY = ""\n`), { logDir: tmpdir("rd-log-"), version: "test", timeoutMs: 5000 });
+    assert.equal(none!.ok, false);
+    assert.match(none!.problems[0]!, /did not open a session: Authentication required/);
+  });
+
   test("an adapter that cannot start is a problem, not a pass", async () => {
     const work = tmpdir("rd-w-");
     const c = parseConfig(`[[agents]]\nid = "gone"\ncommand = "/nonexistent/adapter"\nask_mode = "default"\nroots = [${JSON.stringify(work)}]\n`);
