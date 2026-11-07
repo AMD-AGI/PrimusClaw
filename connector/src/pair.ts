@@ -142,6 +142,16 @@ export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise
       if (none) ctx.out("no claude, codex or cursor-agent on PATH: claude is offered; install Claude Code, or edit the file for another agent");
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      // Written by something else since it was read: kept, but held to the same rule as one that was there before.
+      let appeared: ConnectorConfig;
+      try { appeared = parseConfig(fs.readFileSync(cfgFile, "utf8"), { hostname: ctx.hostname ?? os.hostname() }); } catch (err) {
+        ctx.err(`${cfgFile} appeared while pairing and cannot be used (${errMessage(err)}); nothing was saved. Fix it, ask for a new code and run the new command.`);
+        return 78;
+      }
+      if (appeared.server && secureUrl(appeared.server.trim(), "the Claw server URL") !== server) {
+        ctx.err(`${cfgFile} appeared while pairing and names another Claw (${appeared.server.trim()}); nothing was saved. Change or remove it, ask for a new code and run the new command.`);
+        return 78;
+      }
       ctx.out(`${cfgFile} appeared meanwhile; left as it is`);
     }
   } else {

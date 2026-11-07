@@ -137,6 +137,21 @@ describe("claw-connector pair", () => {
     assert.equal(await main(["pair", "--server", "https://claw.example/api"], ctx(tmpdir()).c), EXIT.usage);
   });
 
+  test("an agents.toml that appears while the code is being claimed is held to the same server rule", async () => {
+    for (const [server, expected] of [["https://elsewhere.example/api", EXIT.needsPerson], ["https://claw.example/api", EXIT.ok]] as const) {
+      const home = tmpdir();
+      const file = path.join(home, "config", "agents.toml");
+      const appear = () => {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, `server = ${JSON.stringify(server)}\n[[agents]]\nid = "claude"\npreset = "claude"\nroots = [${JSON.stringify(tmpdir("w-"))}]\n`);
+        return { status: 201, body: { ok: true, data: { token: GRANT } } };
+      };
+      const a = ctx(home, { fetch: claimFetch(appear, []), cwd: tmpdir("w-") });
+      assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start"], a.c), expected, a.errText());
+      assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), expected === EXIT.ok, server);
+    }
+  });
+
   test("what pair writes and where agents may work", () => {
     assert.deepEqual(detectAgents({ PATH: fakePath("claude", "cursor-agent") }), ["claude", "cursor"]);
     assert.deepEqual(detectAgents({ PATH: "" }), []);
