@@ -111,6 +111,8 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const work = tmpdir("cc-work-");
     const claudeDir = tmpdir("cc-claude-");
     const t = terminal(work, claudeDir);
+    // (Once the stand-in draws its box: until the pane's process has started, it still has the tmux server's environment.)
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
     const found = await findPane(t.pid, "tmux");
     assert.ok(found.ok, JSON.stringify(found));
     assert.equal(found.pane.socket, t.socket);
@@ -196,6 +198,14 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.deepEqual(trail.map((a) => a.length), [13, 23, 5]);
     assert.ok(trail.every((a) => a.pid === t.pid && a.pane === "%0" && typeof a.sha256 === "string"));
     assert.ok(!JSON.stringify(h.audit()).includes("first message"), "the words are not in the trail");
+    // The terminal switches to another conversation (`/resume` there): a message for this one is not typed into it.
+    const row = JSON.parse(fs.readFileSync(t.row, "utf8"));
+    fs.writeFileSync(t.row, JSON.stringify({ ...row, sessionId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", status: "idle" }));
+    const four = h.prompt(sid, "fourth");
+    const refused = await h.claw.until("the refusal", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_seq === four));
+    assert.equal(refused.data.reason, "terminal_switched");
+    assert.ok(!typed(t.transcript).includes("fourth"), "not typed into the other conversation");
+    fs.writeFileSync(t.row, JSON.stringify(row));
     // A mode change is the terminal's.
     h.claw.issue("set_mode", sid, { mode_id: "plan" });
     const rejected = await h.claw.until("the mode change refused", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.type === "set_mode"));

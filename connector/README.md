@@ -447,7 +447,9 @@ never its words). The heartbeat marks such a conversation `input: "terminal"` an
 Only the terminal of this connector's own user is typed into, and only one that is proven: exactly one local process holds the
 conversation open, Claude Code's own `claude agents --json` (or its registry row with the same process start) names it, its working
 directory is inside the agent's roots, it runs as this user, the `TMUX` socket it was started with is a socket owned by this user,
-and that tmux server reports a pane whose process is that process or one of its parents. Anything less (a plain terminal, `screen`,
+and that tmux server reports a pane whose process is that process or one of its parents. Before every message this is asked
+again: the same process (same start time) still runs in that pane, and Claude Code's registry row for it still names this
+conversation (a `/resume` or `/clear` in that terminal moves it to another one: the message is refused, `terminal_switched`). Anything less (a plain terminal, `screen`,
 another user's tmux, two terminals on one conversation, a holder on another machine, not Linux) is watched read-only as above, and
 `session_started` says why (`read_only_why`). The owner turns it off with `terminal_input = false` on the agent. Claude Code's
 own messaging between sessions was not used for this: a message sent that way arrives as a message from another session, not as

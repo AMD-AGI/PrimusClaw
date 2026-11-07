@@ -625,11 +625,18 @@ export class AttachSupport {
     return findPane(pid, this.agent.attach?.tmux ?? "tmux");
   }
 
-  /** What Claude Code's own registry says process `pid` is doing (`idle`, `busy`, `waiting`), or null when it does not say. */
-  holderStatus(pid: number): string | null {
+  /**
+   * What Claude Code's own registry says process `pid` is doing with `ref` (`idle`, `busy`, `waiting`); `other` when its row now
+   * names another conversation (`/resume`, `/clear` in that terminal) or the pid is another process than the one proven
+   * (`procStart`); null when the row cannot be read or does not say.
+   */
+  holderStatus(pid: number, ref: string, procStart: string | null): string | null {
+    if (procStart !== null && processStart(pid) !== procStart) return "other";
     try {
       const doc: unknown = JSON.parse(fs.readFileSync(path.join(this.configDir, "sessions", `${pid}.json`), "utf8"));
-      return isObject(doc) && doc.pid === pid && typeof doc.status === "string" ? doc.status : null;
+      if (!isObject(doc) || doc.pid !== pid) return null;
+      if (typeof doc.sessionId !== "string" || doc.sessionId.toLowerCase() !== ref.toLowerCase()) return "other";
+      return typeof doc.status === "string" ? doc.status : null;
     } catch {
       return null;
     }

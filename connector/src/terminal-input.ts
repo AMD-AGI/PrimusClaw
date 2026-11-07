@@ -21,6 +21,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { processStart } from "./children.js";
 import { errMessage } from "./util.js";
 
 /** Runs the tmux client against one server socket. The seam the tests replace. */
@@ -46,6 +47,8 @@ export interface PaneRef {
   pane: string;
   /** The process that holds the conversation open, inside that pane. */
   pid: number;
+  /** Its start time when it was proven (Linux): a pid that names another process later is not this one. */
+  procStart: string | null;
 }
 
 export type PaneLookup = { ok: true; pane: PaneRef } | { ok: false; why: string };
@@ -120,7 +123,7 @@ export async function findPane(pid: number, cli: string, runner: (socket: string
   if (dead === "1") return { ok: false, why: "the terminal's pane has exited" };
   const n = Number(panePid);
   if (!Number.isInteger(n) || n <= 1 || !descendsFrom(pid, n)) return { ok: false, why: "the tmux pane it names does not run that process" };
-  return { ok: true, pane: { socket, pane, pid } };
+  return { ok: true, pane: { socket, pane, pid, procStart: processStart(pid) } };
 }
 
 // --- the screen ---------------------------------------------------------------------------
@@ -198,16 +201,22 @@ export type Readiness = { ready: true } | { ready: false; why: "typing" | "scree
 export class TerminalInput {
   constructor(readonly ref: PaneRef, private readonly tmux: TmuxRunner, private readonly echoWaitMs = 3_000) {}
 
-  /** Whether the pane can be typed into now: alive, not scrolled back (copy mode), and its input box empty. */
+  /** Whether the process proven at the start is still the one there, and still runs in this pane. */
+  private stillThere(panePid: number): boolean {
+    if (this.ref.procStart !== null && processStart(this.ref.pid) !== this.ref.procStart) return false;
+    return Number.isInteger(panePid) && panePid > 1 && descendsFrom(this.ref.pid, panePid);
+  }
+
+  /** Whether the pane can be typed into now: the same process in it, alive, not scrolled back (copy mode), and its input box empty. */
   async readiness(): Promise<Readiness> {
     let info: string;
     try {
-      info = await this.tmux.run(["display-message", "-p", "-t", this.ref.pane, "#{pane_in_mode} #{pane_dead}"]);
+      info = await this.tmux.run(["display-message", "-p", "-t", this.ref.pane, "#{pane_in_mode} #{pane_dead} #{pane_pid}"]);
     } catch {
       return { ready: false, why: "gone" };
     }
-    const [mode, dead] = info.trim().split(" ");
-    if (dead === "1") return { ready: false, why: "gone" };
+    const [mode, dead, panePid] = info.trim().split(" ");
+    if (dead === "1" || !this.stillThere(Number(panePid))) return { ready: false, why: "gone" };
     if (mode !== "0") return { ready: false, why: "copy_mode" };
     const box = inputBox(await this.screen());
     return box === "empty" ? { ready: true } : { ready: false, why: box === "typed" ? "typing" : "screen" };

@@ -78,8 +78,8 @@ export const READ_ONLY_REASON = "read_only_live_session";
 /** Why a mode change or a decision for a conversation that is typed into in its terminal is refused: the terminal owns those. */
 export const TERMINAL_OWNS_REASON = "terminal_session";
 /** What a terminal that typed messages wait for is doing, as the queue notice says it. */
-const WAIT_WHY: Record<Exclude<Readiness, { ready: true }>["why"] | "busy" | "waiting", string> = {
-  typing: "terminal_typing", screen: "terminal_screen", copy_mode: "terminal_scrolled", gone: "terminal_gone", busy: "terminal_working", waiting: "terminal_waiting",
+const WAIT_WHY: Record<Exclude<Readiness, { ready: true }>["why"] | "busy" | "waiting" | "other", string> = {
+  typing: "terminal_typing", screen: "terminal_screen", copy_mode: "terminal_scrolled", gone: "terminal_gone", busy: "terminal_working", waiting: "terminal_waiting", other: "terminal_switched",
 };
 
 export interface SessionEnv {
@@ -425,8 +425,9 @@ export class Session {
         let ready = false;
         while (!this.closed && this.terminalQueue[0] === next) {
           // Claude Code's own word first (a turn running, a question on its screen), then the screen itself: both must say free.
-          const status = this.env.attach.get(this.agent.id)?.holderStatus(term.ref.pid) ?? null;
+          const status = this.holderStatus(term);
           let why: string;
+          if (status === "other") { told = WAIT_WHY.other; break; }   // (the terminal is on another conversation now, or gone)
           if (status !== "idle") {
             why = status === "busy" || status === "waiting" ? WAIT_WHY[status] : "terminal_state_unknown";
           } else {
@@ -443,7 +444,9 @@ export class Session {
           await sleep(Math.max(200, Math.min(1_000, this.env.timing.spectateMs * 5)));
         }
         if (this.closed || this.terminalQueue[0] !== next) continue;   // closed, or dropped by a cancel
-        if (!ready) { refused(told === WAIT_WHY.gone ? "terminal_gone" : "terminal_busy", told); continue; }
+        if (!ready) { refused(told === WAIT_WHY.gone ? "terminal_gone" : told === WAIT_WHY.other ? "terminal_switched" : "terminal_busy", told); continue; }
+        // Asked again just before the keys go: the same process, still on this conversation, still idle.
+        if (this.holderStatus(term) !== "idle") { refused("terminal_switched", "the terminal changed just before typing"); continue; }
         this.terminalQueue.shift();
         const finished = new Promise<void>((resolve) => {
           this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve };
@@ -472,6 +475,11 @@ export class Session {
     }
   }
 
+  /** What Claude Code says the terminal's process is doing with this conversation (see `AttachSupport.holderStatus`). */
+  private holderStatus(term: TerminalInput): string | null {
+    return this.env.attach.get(this.agent.id)?.holderStatus(term.ref.pid, this.acpId ?? "", term.ref.procStart) ?? null;
+  }
+
   /** The typed message's turn, from the tick: it must show up in the transcript, and it ends when the terminal says it is idle again. */
   private watchTerminalTurn(support: AttachSupport): void {
     const turn = this.terminalTurn;
@@ -481,7 +489,9 @@ export class Session {
       if (now - turn.sentAt >= this.env.timing.terminalEchoMs) this.endTerminalTurn("error", "terminal_input_unconfirmed");
       return;
     }
-    if (support.holderStatus(this.terminal.ref.pid) === "idle") {
+    const status = support.holderStatus(this.terminal.ref.pid, this.acpId ?? "", this.terminal.ref.procStart);
+    if (status === "other") { this.endTerminalTurn("end_turn"); return; }
+    if (status === "idle") {
       turn.idleSince ??= now;
       if (now - turn.idleSince >= this.env.timing.terminalIdleMs) this.endTerminalTurn("end_turn");
     } else {
