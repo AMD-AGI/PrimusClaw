@@ -28,6 +28,11 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A router turn that has said nothing 3.5 s after it began is told "收到，我看一下。" ("On it: looking into it now.") by the server, whatever it
+  is doing (thinking, the assistant's own tools, a slow start), not only when a lookup starts; the answer takes that line's place, so a
+  channel that edits a message shows one. Off unless `CLAW_ASSISTANT_FIRST_ACK_USERS` names the user (`*` for everyone);
+  `CLAW_ASSISTANT_FIRST_ACK_MS` sets the wait (2026-11-06 baseline: first reply p90 7.28 s, 21 turns heard only at their end). The router
+  says its quick line before `deliver_text`, `trigger_create`, `review_mode_set` and the `devenv_` tools too (`router-v19`).
 - The connector picks up after a restart (a crash, a kill, a pod restart, `stop`, an upgrade): the turn an agent was running is kept
   on disk, and the next run either carries it on (the agent was waiting for a person's permission for a tool call, always asks, and
   the connector is not paused: it asks again and a new card comes, under the same prompt) or ends it with `turn_end` `error: "connector_restarted"`, so a phone stops waiting; prompts queued
