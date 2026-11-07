@@ -171,9 +171,11 @@ async function keyWorkspaces(apiKey: string, fetchImpl: typeof globalThis.fetch)
  * knows none, to every workspace the key's user belongs to (`users/self`), one
  * list per workspace. A key can only have created the run's sandbox in a
  * workspace it may use, so those are the whole of where it can be. A workspace
- * that answers 403 is one the key cannot have created it in, and is skipped: it
- * does not hide what the others hold. Every other failure in any workspace, or a
- * 403 in all of them, fails the lookup.
+ * that answers 403 does not hide what the others hold: a sandbox found elsewhere
+ * is returned (adopting or stopping it is right whatever the refused workspace
+ * holds). But when nothing is found, a 403 anywhere fails the lookup, as does
+ * every other failure in any workspace: the refused workspace may hold the
+ * run's sandbox, and "could not look" must not become a second create.
  */
 export async function findLiveAppSandboxes(
   runId: string,
@@ -201,9 +203,11 @@ export async function findLiveAppSandboxes(
     }
   }
   if (refused.length > 0) {
-    logger.warn({ runId, refused, read: scopes.length - refused.length }, "app_sandbox.lookup_workspace_refused");
-    if (refused.length === scopes.length) {
-      throw new AppSandboxLookupRefused(403, `app sandbox lookup failed: HTTP 403 in every workspace (${refused.join(", ")})`);
+    logger.warn({ runId, refused, read: scopes.length - refused.length, found: found.length }, "app_sandbox.lookup_workspace_refused");
+    // Nothing found while a workspace could not be read is "could not look", not "none": the sandbox may
+    // be in that workspace (created before the key lost it), and a create here would be its second.
+    if (found.length === 0) {
+      throw new AppSandboxLookupRefused(403, `app sandbox lookup failed: HTTP 403 in workspace ${refused.join(", ")}`);
     }
   }
   return found;

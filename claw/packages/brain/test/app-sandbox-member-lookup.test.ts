@@ -126,11 +126,19 @@ test("a 403 in the run's own workspace does not hide the sandbox in the other on
   assert.deepEqual(found.map((w) => w.id), ["wl-ns"]);
 });
 
-test("could not look is never none: a 403 in every workspace, or any other failure in one, fails the lookup", async () => {
+test("could not look is never none: a 403 with nothing found elsewhere, or any other failure in one workspace, fails the lookup", async () => {
   await assert.rejects(
     findLiveAppSandboxes("run-1", "pk-member", memberSafe({ refuse: ["ws-app"] }).fetch, ["ws-app"]),
-    /HTTP 403 in every workspace \(ws-app\)/,
+    /HTTP 403 in workspace ws-app/,
   );
+  // The run names a workspace the key has since lost, and the one it would create in now is empty: the
+  // sandbox may be in the lost one, so the lookup fails rather than reading "none" and creating a second.
+  const moved = memberSafe({ refuse: ["ws-old"] });
+  moved.workloads.push({ id: "wl-old", workspace: "ws-old", runId: "run-1", phase: "Running" });
+  const r = run({ sandboxSpec: { ...run().sandboxSpec, namespace: "ws-old" } as AppSandboxRun["sandboxSpec"] });
+  const md = deps(moved);
+  await assert.rejects(ensureAppSandbox(r, md.deps), /HTTP 403 in workspace ws-old/);
+  assert.deepEqual(md.created, [], "no second sandbox");
   const down = memberSafe({ self: ["ws-a", "ws-b"], fail: ["ws-b"] });
   down.workloads.push({ id: "wl-a", workspace: "ws-a", runId: "run-1", phase: "Running" });
   await assert.rejects(findLiveAppSandboxes("run-1", "pk-member", down.fetch, []), /HTTP 503/);
