@@ -147,6 +147,19 @@ function parseReport(lines: string[]): { sources: Map<number, ListedSource>; cla
   return { sources, claims };
 }
 
+/** Whether `text` is a report the check reads: it cites a number and lists a source. Nothing is fetched. */
+export function isCitedReport(text: string): boolean {
+  const { sources, claims } = parseReport(text.split("\n"));
+  return sources.size > 0 && claims.length > 0;
+}
+
+/** The files `deliver_file` hands over whose text may be a cited report: those go through a checked `deliver_text` instead. */
+export const CHECKED_FILE_EXTENSIONS = /\.(md|markdown|txt)$/i;
+
+/** What a `deliver_file` of a cited report is refused with. */
+export const CITED_FILE_REFUSAL = "Error: this file is a report with numbered citations, so it is delivered with deliver_text (its name and its "
+  + "whole text), which checks its sources before the user gets it. Nothing was delivered: call deliver_text with the report instead.";
+
 /** Run `work` over `items`, at most `limit` at a time. */
 async function eachLimited<T>(items: T[], limit: number, work: (item: T) => Promise<void>): Promise<void> {
   let next = 0;

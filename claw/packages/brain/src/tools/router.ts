@@ -11,7 +11,7 @@ import type { McpToolCaller } from "../clients/mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
 import type { RunCitations } from "./citations.js";
-import { checkNote, checkReport, type CiteCheck } from "./cite-check.js";
+import { CHECKED_FILE_EXTENSIONS, CITED_FILE_REFUSAL, checkNote, checkReport, isCitedReport, type CiteCheck } from "./cite-check.js";
 import type { LogReads } from "./log-reads.js";
 import { callWithWorkspaceFanout, fansOut } from "./workspace-fanout.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
@@ -484,6 +484,12 @@ export class ToolRouter {
     // A research report is checked against its own sources before it is delivered, and only the checked text goes on
     // (`cite-check.ts`); the model is told what the check found before what the tool answered.
     const check = this.citeCheck;
+    // The same report copied out of the sandbox would reach the user unchecked: a text file that is one is refused, and the model
+    // is told to deliver it as text.
+    if (check && name === DELIVER_FILE_TOOL && typeof input.path === "string" && CHECKED_FILE_EXTENSIONS.test(input.path)
+      && await this.sandboxFileIsCitedReport(input.path, signal)) {
+      return refuse(outcome, CITED_FILE_REFUSAL);
+    }
     if (check?.checks(name) && typeof input.text === "string" && input.text.trim()) {
       const result = await checkReport(input.text, check.ports, signal);
       if (result.checked) {
@@ -493,6 +499,22 @@ export class ToolRouter {
       }
     }
     return this.routeListed(name, input, signal, outcome, ctx);
+  }
+
+  /**
+   * Whether the sandbox file at `path` is a cited report (`isCitedReport`), read with the sandbox's own `read` (its first 2000 lines,
+   * numbered). A file that cannot be read is not one: `deliver_file` then answers for it as it would.
+   */
+  private async sandboxFileIsCitedReport(path: string, signal?: AbortSignal): Promise<boolean> {
+    const read: RouteOutcome = { isError: false };
+    let text: string;
+    try {
+      text = await this.routeAllowed("read", { path, limit: 2000 }, signal, read);
+    } catch {
+      return false;
+    }
+    if (read.isError) return false;
+    return isCitedReport(text.split("\n").map((l) => l.replace(/^\s*\d+\|/, "")).join("\n"));
   }
 
   /** `route()` for a call the allow-list let through: the read taint and the citations, then the tool. */
