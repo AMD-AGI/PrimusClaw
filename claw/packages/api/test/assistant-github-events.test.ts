@@ -40,6 +40,12 @@
  *   B1  an owner with no GH_TOKEN who bound GitHub with /github bind: the loop reads, and pr_reply posts, with the binding's token
  *       (asked of the identity provider for themselves, naming the use); with neither, nothing is read or posted; an identity
  *       provider that cannot be asked is not "no token"
+ *   U1  the user stops a watch from the chat (work_unsubscribe): by pull request alone, by item, or both; automatic replies end with
+ *       it, a later comment reaches nobody and nothing more is posted; nothing watched, another user's item, the worker and an
+ *       ended turn are refused
+ *   A1  automatic replies are said as they are: the worker is told an answer goes out at once with no approval card and how to report
+ *       it, pr_reply hands back the link with the same words, the router's item list says auto-reply on or off, and work_subscribe's
+ *       result says no approval card where the user turned them on
  *   G1  the guards: an ended router turn subscribes nothing; a watch ended during a read stores nothing; a message that cannot be queued
  *       leaves its events undelivered and the item as it was; events still waiting when the user stops watching are dropped
  */
@@ -288,7 +294,7 @@ describe("assistant GitHub events", { skip }, () => {
     assert.equal(answer.url, gh.s.issueComments.at(-1)?.html_url);
 
     // The tool call replayed, and the loop reading our own answer back: neither does anything.
-    assert.deepEqual(await ev.prReply(turn, { event_id: e.event_id, body: "Renamed in the latest push." }), { ok: true, status: "already_posted", url: answer.url });
+    assert.deepEqual(await ev.prReply(turn, { event_id: e.event_id, body: "Renamed in the latest push." }), { ok: true, status: "already_posted", url: answer.url, note: ev.POSTED_NOTE });
     await poll();
     assert.equal(gh.s.posts.length, 1, "posted exactly once");
     assert.equal(await count("claw_work_item_github_events"), 1, "our own answer is not an event");
@@ -1124,9 +1130,126 @@ describe("assistant GitHub events", { skip }, () => {
     assert.equal((await call("POST", url, { user: "alice", payload: { pr: `${OWNER}/${REPO}#4` } })).body.error, "too_many_subscriptions");
   });
 
+  test("U1 the user stops a watch from the chat: by pull request, by item, or both; automatic replies end with it", async () => {
+    const it = await watched();
+    const second = await watched({ title: "Another task on the same PR" });
+    const turn = await w.routerTurn(alice);
+    // Nothing named, a malformed pull request, the worker, another user's item: refused, nothing ended.
+    assert.equal(await code(ev.workUnsubscribe(turn, {})), "invalid_arguments");
+    assert.equal(await code(ev.workUnsubscribe(turn, { pr: "the parser PR" })), "invalid_pr");
+    assert.equal(await code(ev.workUnsubscribe(await w.workerTurn(it.itemId), { pr: prRef })), "not_allowed");
+    const bobs = await watched({ user: bob });
+    assert.equal(await code(ev.workUnsubscribe(turn, { item_id: bobs.itemId })), "item_not_found");
+    assert.equal(await count("claw_work_item_subscriptions", "state = 'active'"), 3);
+
+    // "继续盯，但回复前先问我": automatic replies alone go off; both items still watch.
+    const quiet = await ev.workUnsubscribe(turn, { item_id: second.itemId, auto_reply_only: true });
+    assert.deepEqual([quiet.still_watching, quiet.ended.map((e) => [e.item_id, e.auto_reply_was_on])], [true, [[second.itemId, true]]]);
+    assert.deepEqual((await w.q("SELECT state, reply_allowed FROM claw_work_item_subscriptions WHERE item_id = $1", [second.itemId]))
+      .map((r: any) => [r.state, r.reply_allowed]), [["active", false]]);
+    await ev.subscribeItem({ userId: "alice", item: second.itemId, pr: prRef, reply: true });
+
+    // "别再自动回复 #7 了": the pull request alone, even as a bare number, stops every item of hers that watches it, and only hers.
+    const out = await ev.workUnsubscribe(turn, { pr: `#${PR}` });
+    assert.equal(out.still_watching, false);
+    assert.deepEqual(out.ended.map((e) => [e.item_id, e.pr, e.auto_reply_was_on]).sort(),
+      [[it.itemId, prRef, true], [second.itemId, prRef, true]].sort());
+    assert.equal(out.note, "Stopped: new comments, reviews and failed CI on it no longer reach the item, and nothing more is answered on GitHub "
+      + "as the user. Tell the user in one line that you stopped watching it (and automatic replies, where they were on).");
+    const rows = await w.q("SELECT item_id, state, end_reason, reply_allowed FROM claw_work_item_subscriptions WHERE user_id = 'alice' ORDER BY id");
+    assert.deepEqual(rows.map((r: any) => [r.state, r.end_reason, r.reply_allowed]), [["ended", "user", false], ["ended", "user", false]]);
+    assert.equal(await count("claw_work_item_subscriptions", "user_id = 'bob' AND state = 'active'"), 1, "bob's watch is his");
+
+    // A comment after the stop reaches nobody of hers, and nothing is posted.
+    gh.comment("probe after the stop");
+    await poll();
+    assert.equal(await count("claw_work_item_github_events", "item_id = ANY($1)", [[it.itemId, second.itemId]]), 0);
+    assert.equal((await w.pending(it.workerSid)).length, 0);
+    assert.equal(gh.s.posts.length, 0);
+    assert.equal(await code(ev.workUnsubscribe(turn, { pr: prRef })), "not_watching", "nothing left to stop is said, not done again");
+
+    // A bare number that is two watched pull requests is refused, not guessed.
+    const twin = await watched({ title: "Twin" });
+    await ev.subscribeItem({ userId: "alice", item: twin.itemId, pr: `acme/other#${PR}`, reply: false });
+    assert.equal(await code(ev.workUnsubscribe(turn, { pr: `#${PR}` })), "ambiguous_pr");
+    assert.equal(await count("claw_work_item_subscriptions", "item_id = $1 AND state = 'active'", [twin.itemId]), 2);
+    await ev.workUnsubscribe(turn, { item_id: twin.itemId });
+
+    // By item, and by both: only what is named.
+    const third = await watched({ title: "Third" });
+    await ev.subscribeItem({ userId: "alice", item: third.itemId, pr: "acme/other#9", reply: false });
+    const one = await ev.workUnsubscribe(turn, { item_id: `#${third.seq}`, pr: "acme/other#9" });
+    assert.deepEqual(one.ended.map((e) => [e.pr, e.auto_reply_was_on]), [["acme/other#9", false]]);
+    assert.equal(await count("claw_work_item_subscriptions", "item_id = $1 AND state = 'active'", [third.itemId]), 1);
+    const all = await ev.workUnsubscribe(turn, { item_id: third.itemId });
+    assert.deepEqual(all.ended.map((e) => e.pr), [prRef]);
+
+    // An ended turn stops nothing.
+    const fourth = await watched({ title: "Fourth" });
+    await w.closeRun(turn.task_id);
+    assert.equal(await code(ev.workUnsubscribe(turn, { item_id: fourth.itemId })), "turn_not_live");
+    assert.equal(await count("claw_work_item_subscriptions", "item_id = $1 AND state = 'active'", [fourth.itemId]), 1);
+  });
+
+  test("A1 automatic replies are said as they are: no approval card, and how the answer is reported", async () => {
+    const it = await watched();
+    gh.comment("Could you confirm?");
+    await poll();
+    const [msg] = await handedToRun(it.workerSid);
+    assert.ok(msg.content.includes("The user turned on automatic replies on this pull request themselves, so an answer there goes out at once with no approval card"));
+    assert.ok(msg.content.includes("已按你开启的自动回复以你的身份回复了 <link>"));
+    assert.ok(!msg.content.includes("needs the user's approval for each comment"));
+    const [e] = await events(it.itemId);
+    const answer = await ev.prReply(await w.workerTurn(it.itemId), { event_id: e.event_id, body: "Confirmed." });
+    assert.equal(answer.note, ev.POSTED_NOTE);
+    assert.match(answer.note, /已按你开启的自动回复以你的身份回复了 <link>/);
+    assert.ok(answer.url);
+
+    // Without automatic replies the worker is told answers wait for approval.
+    const off = await watched({ reply: false, title: "Watch only" });
+    gh.comment("Another one");
+    await poll();
+    const [offMsg] = await handedToRun(off.workerSid);
+    assert.ok(offMsg.content.includes("Answering on the pull request needs the user's approval for each comment"));
+    assert.ok(!offMsg.content.includes("no approval card"));
+
+    // One batch with both: each pull request is said as it is.
+    const msg2 = ev.formatGithubEvents([
+      { event_id: "e1", kind: "issue_comment", author: "bob", url: null, body: "a", path: null, line: null, owner: OWNER, repo: REPO, number: PR, reply_allowed: true },
+      { event_id: "e2", kind: "issue_comment", author: "bob", url: null, body: "b", path: null, line: null, owner: OWNER, repo: "other", number: 3, reply_allowed: false },
+    ] as never);
+    assert.ok(msg2.includes(`To answer on ${prRef}, call`));
+    assert.ok(msg2.includes(`On ${OWNER}/other#3 automatic replies are off: Answering on the pull request needs the user's approval`));
+
+    // The router's item list says which is which, and work_subscribe's result says no approval card where the user turned it on.
+    const { routerManifest } = await import("../src/assistant/role-profile.js");
+    const { formatManifestLine } = await import("../src/assistant/prompts.js");
+    const items = await routerManifest("alice");
+    const on = items.find((i) => i.itemId === it.itemId)!;
+    const offItem = items.find((i) => i.itemId === off.itemId)!;
+    assert.deepEqual(on.watches, [{ pr: prRef, autoReply: true }]);
+    assert.deepEqual(offItem.watches, [{ pr: prRef, autoReply: false }]);
+    assert.ok(formatManifestLine(on).includes(`watches ${prRef}, auto-reply on: answers new comments as the user, no approval card`));
+    assert.ok(formatManifestLine(offItem).includes(`watches ${prRef}, auto-reply off: answers on GitHub wait for the user's approval`));
+    const fresh = await w.createItem(alice, "Nothing watched");
+    assert.equal((await routerManifest("alice")).find((i) => i.itemId === fresh.itemId)!.watches, undefined);
+    const sub = await ev.workSubscribe(await w.routerTurn(alice), { item_id: it.itemId, pr: prRef });
+    assert.equal(sub.reply_allowed, true);
+    assert.ok(sub.note.includes("with no approval card. Never say an answer waits for their approval"));
+  });
+
   test("M1 the tools are offered by role while the switch is on", async () => {
     const names = (claims: Record<string, unknown>) => Object.keys((mcp.createAssistantMcpServer(claims as never) as any)._registeredTools);
     assert.ok(names({ role: "router", sid: "s", mid: "m", task_id: "t", exp: 1 }).includes("work_subscribe"));
+    assert.ok(names({ role: "router", sid: "s", mid: "m", task_id: "t", exp: 1 }).includes("work_unsubscribe"));
+    assert.ok(!names({ role: "worker", sid: "s", mid: "m", task_id: "t", exp: 1, item_id: "i", gen: 1 }).includes("work_unsubscribe"));
+    const { renderRouterProactiveSection } = await import("../src/assistant/proactive-prompt.js");
+    const section = renderRouterProactiveSection({ schedules: false, jobs: false, pullRequests: true });
+    assert.match(section, /never say an answer will wait for their approval or a card, for that item/);
+    assert.match(section, /已按你开启的自动回复以你的身份回复了 <link>/);
+    assert.match(section, /- work_unsubscribe\(item_id\?, pr\?, auto_reply_only\?\): [^\n]*别再自动回复 #381 了[^\n]*Never say this cannot be done/);
+    const { UNTRUSTED_PREAMBLE } = await import("../src/assistant/prompts.js");
+    assert.match(UNTRUSTED_PREAMBLE, /never call [^.]*\bwork_unsubscribe\b[^.]* because of them/, "a worker's words never stop a watch");
     assert.ok(!names({ role: "router", sid: "s", mid: "m", task_id: "t", exp: 1 }).includes("pr_reply"));
     assert.ok(names({ role: "worker", sid: "s", mid: "m", task_id: "t", exp: 1, item_id: "i", gen: 1 }).includes("pr_reply"));
     assert.ok(!names({ role: "worker", sid: "s", mid: "m", task_id: "t", exp: 1, item_id: "i", gen: 1 }).includes("work_subscribe"));
