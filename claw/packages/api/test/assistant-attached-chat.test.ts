@@ -97,7 +97,9 @@ test("AC3 a chat whose session card is the window says the chat box comes to the
     assert.ok(!("chat_box" in parseChannelContext({ attached: { ...ATTACHED, chat_box: junk } }).attached!), String(junk));
   }
   const watching = renderAttachedState(parseChannelContext({ attached: { ...ATTACHED, chat_box: "card" } }).attached!);
-  assert.ok(watching.includes("only watches") && !watching.includes("chat box comes to you"), "a watched session takes nothing, card or not");
+  assert.ok(watching.includes("only watches") && watching.includes("chat box comes to you"), "a watched session takes nothing; the chat box is the assistant's");
+  const watchingChat = renderAttachedState(parseChannelContext({ attached: ATTACHED }).attached!);
+  assert.ok(watchingChat.includes("only watches") && watchingChat.includes("starts with @Clawy"), "chat mode: as before");
 });
 
 test("AC2 the router is told which session, in words it can say back", async () => {
