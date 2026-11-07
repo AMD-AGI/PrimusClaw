@@ -118,6 +118,20 @@ describe("a running worker's files, read now", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  test("a file that grew between its size and its read is cut by what was read, not by the size", () => {
+    // Listed at 100 bytes; by the read it had grown, and the read did not start at its start.
+    const read = Buffer.from(`ORD={"value":"${"x".repeat(17_000)}S3cr3tToken0123456789"}\nstep 6/16\n`);
+    const out = parseLiveFiles(`@@FILE ${Math.floor(Date.now() / 1000)} 100 ${Buffer.from("job/grow.log").toString("base64")}\n@@TAIL ${read.toString("base64")}\n`);
+    assert.equal(out.status, "read");
+    if (out.status !== "read") return;
+    assert.equal(out.files[0].tail, "step 6/16", "the partial first line is dropped");
+    // A read that starts right after a line's end keeps its first line.
+    const aligned = Buffer.concat([Buffer.from("\n"), Buffer.from(`${"a".repeat(16_374)}\nstep 7/16`)]);
+    assert.equal(aligned.length, 16_385);
+    const kept = parseLiveFiles(`@@FILE 1 100 ${Buffer.from("x.log").toString("base64")}\n@@TAIL ${aligned.toString("base64")}\n`);
+    assert.ok(kept.status === "read" && kept.files[0].tail.endsWith("aaaa\nstep 7/16"), "its first line is whole");
+  });
+
   test("an empty or missing workspace reads as no files", () => {
     const out = parseLiveFiles(run(join(root, "does-not-exist")));
     assert.deepEqual(out.status === "read" ? out.files : null, []);

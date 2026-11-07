@@ -60,7 +60,8 @@ export function liveFilesScript(root: string = WORKSPACE_ROOT): string {
     // Each read opens /proc/self/fd/3, the file fd 3 holds (not its path again), from its start.
     `if [ "$s" = 0 ] || head -c 8192 /proc/self/fd/3 2>/dev/null | LC_ALL=C grep -Iq . ; then`,
     `printf '@@FILE %s %s %s\\n' "\${t%.*}" "$s" "$(printf %s "$rel" | base64 -w0)";`,
-    `printf '@@TAIL %s\\n' "$(tail -c ${LIVE_FILE_READ_BYTES} /proc/self/fd/3 2>/dev/null | base64 -w0)";`,
+    // One byte more than is kept: whether the read started at the file's start is told by what was read, not by a size taken before.
+    `printf '@@TAIL %s\\n' "$(tail -c ${LIVE_FILE_READ_BYTES + 1} /proc/self/fd/3 2>/dev/null | base64 -w0)";`,
     `n=$((n+1)); fi; exec 3<&-; [ "$n" -ge ${LIVE_FILES_MAX} ] && break; done; };`,
     `printf '@@NOW %s\\n' "$(date +%s)"`,
   ].join(" ");
@@ -96,8 +97,10 @@ export function parseLiveFiles(output: string): LiveFiles {
     if (tail && pending) {
       // Only whole lines are kept: when the file is longer than what was read, the first, partial line is dropped, and a last line
       // longer than all of it is not shown at all (its start, which may name a secret, was not read).
-      let text = b64(tail[1]).replace(/\r/g, "");
-      if (pending.size > LIVE_FILE_READ_BYTES) text = text.includes("\n") ? text.slice(text.indexOf("\n") + 1) : "";
+      const bytes = Buffer.from(tail[1], "base64");
+      let text = bytes.subarray(Math.max(0, bytes.length - LIVE_FILE_READ_BYTES)).toString("utf8").replace(/\r/g, "");
+      // The byte before what is kept ends a line: what is kept starts with a whole one.
+      if (bytes.length > LIVE_FILE_READ_BYTES && bytes[0] !== 0x0a) text = text.includes("\n") ? text.slice(text.indexOf("\n") + 1) : "";
       text = redactCommandSecrets(text).replace(/\s+$/, "");
       files.push({ ...pending, tail: text.length > LIVE_FILE_TAIL_CHARS ? `…${text.slice(-LIVE_FILE_TAIL_CHARS)}` : text });
       pending = null;
