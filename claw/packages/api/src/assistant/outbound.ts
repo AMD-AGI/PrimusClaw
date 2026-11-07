@@ -626,11 +626,15 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
  */
 export async function turnFirstSay(q: Querier, userId: string, since: Date | string, messageId: string): Promise<string | null> {
   if (!CLAW_NOTIFICATIONS_ENABLED) return null;
-  // The server's "on it" for the turn (`lookup-ack.ts`) is the turn's first message as well: the answer takes its place.
+  // The server's "on it" for the turn (`lookup-ack.ts`) is the turn's first message as well: the answer takes its place. Its id is
+  // derived from this turn's message, so it is matched by id alone: a person with no channel subscribed has no delivery to match it by,
+  // and still reads one message in the session.
   const row = (await q(
     `SELECT s.say_id::text AS say_id FROM claw_assistant_says s
-      WHERE s.user_id = $1 AND (NOT s.fallback OR s.say_id = $4::uuid) AND s.created_at >= $2
-        AND EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text AND o.payload->>'turn_message_id' = $3)
+      WHERE s.user_id = $1 AND s.created_at >= $2
+        AND (s.say_id = $4::uuid
+          OR (NOT s.fallback
+            AND EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text AND o.payload->>'turn_message_id' = $3)))
       ORDER BY s.created_at, s.say_id LIMIT 1`,
     [userId, since, messageId, deterministicEventId("assistant.notice", userId, `lookup_ack:${messageId}`)],
   )).rows[0] as { say_id: string } | undefined;

@@ -11,7 +11,8 @@
  *   A2  not when the router said or started a say, an item's start notice was said, the turn may hand a review off, a report started the
  *       turn, the turn ended, the session is a worker's, or the tool is the assistant's own read or a say
  *   A3  the line the router writes during the grace wins: the server says nothing
- *   A4  the turn's answer takes the line's place (`replaces`), as it takes the router's own first line's
+ *   A4  the turn's answer takes the line's place (`replaces`), as it takes the router's own first line's, in a channel and in the
+ *       session of a person with no channel subscribed
  *   A5  a turn answering the person that looked things up and ended with no word and no text is told so once, in its language; not one
  *       that said something, started an item, made no lookup, or that a report started
  *   A6  the router's turn asks Brain for a text reply at its turn cap (`report_at_turn_cap`)
@@ -140,6 +141,18 @@ describe("assistant lookup ack and silent turns", { skip }, () => {
     }, w.sayDeps);
     const answer = (await w.q("SELECT payload FROM claw_notification_outbox WHERE payload->>'text' = '有 3 台空闲节点。'"))[0];
     assert.equal(answer.payload.replaces, ack.lookupAckSayId("alice", t.mid), "the answer replaces the server's line");
+    // A person with no channel subscribed reads the session: the answer there takes the line's place all the same.
+    await w.q("DELETE FROM claw_notification_subscriptions");
+    w.events.length = 0;
+    const web = await turn("SaFE 上有几个 workspace");
+    assert.equal(await run(alice.routerSid, start(web.mid, "mcp__safe__workspace_list")), "said");
+    const webBegan = (await w.q("SELECT started_at FROM claw_tasks WHERE task_id = $1", [web.task_id]))[0].started_at;
+    await w.mod.outbound.recordAssistantSay({
+      userId: "alice", sessionId: alice.routerSid, text: "有 2 个 workspace。", turnMessageId: web.mid, turnBegan: webBegan,
+    }, w.sayDeps);
+    const shown = w.events.filter((e) => e.type === "AssistantSay");
+    assert.deepEqual(shown.map((e) => e.text), ["收到，我查一下。", "有 2 个 workspace。"]);
+    assert.equal(shown[1].replaces, ack.lookupAckSayId("alice", web.mid), "the session's copy replaces the line");
   });
 
   test("A5 a turn that looked things up and ended with no word and no text is told so, once", async () => {
