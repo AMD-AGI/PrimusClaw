@@ -146,8 +146,16 @@ export function offlineReason(streamEndReason: unknown): "auth_expired" | "no_he
 }
 
 /** Revoke one connector and close its sessions. False when it is not the caller's, or already revoked. */
-export async function revokeConnector(owner: string, connectorId: string, client: string | null): Promise<boolean> {
-  return inTransaction((q) => revokeIn(q, owner, connectorId, client));
+export async function revokeConnector(
+  owner: string, connectorId: string, client: string | null, alsoInTransaction?: (q: Querier) => Promise<void>,
+): Promise<boolean> {
+  return inTransaction(async (q) => {
+    if (!(await revokeIn(q, owner, connectorId, client))) return false;
+    // What else ends with the machine (the cards that would send to it: `closeCardsOfConnector`), in the same transaction, so a
+    // revoked machine never leaves a card that still waits for the person.
+    await alsoInTransaction?.(q);
+    return true;
+  });
 }
 
 /** `revokeConnector` inside a transaction the caller holds; `detail` is added to its audit row. */

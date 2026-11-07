@@ -41,6 +41,8 @@
  *       masked as a credential on the way (a credential-shaped Idempotency-Key) still ends by its number; an end naming no prompt (an
  *       older connector) makes the item count again, as before; a stop whose cancel finds nothing running (the connector restarted
  *       mid-turn, and that turn's end never comes) ends every instruction sent before it
+ *   F17 a machine revoked while a card that would send to it waits: the card closes (expired, `connector_revoked`), the router's
+ *       pending cards no longer name it, a press afterwards sends nothing; another machine's card, and another user's revoke, are untouched
  *   F20 an agent that only takes over existing conversations (kind attach) is never chosen for a new session, which its connector would
  *       refuse: with another agent there, that one; alone, a question listing its conversations, else no_agent saying why
  *   F21 at the limit of open sessions a new one closes the longest unused idle session of the user's (never one working, waiting for
@@ -487,6 +489,40 @@ describe("development environment items and devenv_send", { skip }, () => {
     const sent = await tools.executeSend("alice", plan, "make", "k-outdated", "en");
     assert.deepEqual([sent.ok, (sent as Recorded).error], [false, "connector_outdated"]);
     assert.deepEqual(await queued(laptop), []);
+  });
+
+  test("F17 a machine revoked with its card waiting: the card closes, the router no longer puts it to them, a press sends nothing", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const desktop = await machine("alice", "desktop");
+    const toLaptop = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
+    const toDesktop = await tools.devenvSend(await userTurn(alice, "让 desktop 上的 claude 跑 lint"), { text: "跑 lint", target: "desktop" });
+    assert.equal(toLaptop.done, false, JSON.stringify(toLaptop));
+    assert.equal(toDesktop.done, false, JSON.stringify(toDesktop));
+    assert.match(await schedules.renderScheduleState("alice"), /on the machine "laptop"/);
+
+    // Revoked through the user's route (the same one claw-connector logout's revoke reaches): laptop's card closes with it.
+    const r = await fetch(`${base}/v1/remote-agents/connectors/${laptop}`, { method: "DELETE", headers: { "x-test-user": "alice" } });
+    assert.equal(r.status, 200, await r.text());
+    const card = (await w.q("SELECT * FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toLaptop.confirmation_id]))[0];
+    assert.deepEqual([card.status, card.decided_via, card.result?.error], ["expired", "connector_revoked", "no_machine"]);
+    assert.deepEqual((await schedules.pendingConfirmations("alice")).map((c) => c.confirmation_id), [toDesktop.confirmation_id],
+      "the other machine's card still waits");
+    const state = await schedules.renderScheduleState("alice");
+    assert.doesNotMatch(state, /on the machine "laptop"/, "the router is not told of the revoked machine's card");
+    assert.match(state, /on the machine "desktop"/);
+
+    // Pressed afterwards: answered before (closed), nothing sent; the card stays as it was closed.
+    const pressed = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(toLaptop.confirmation_id), decision: "allow", via: "button" });
+    assert.deepEqual([pressed.status, pressed.answered_now], ["expired", false]);
+    assert.deepEqual(await queued(laptop), []);
+    // Another user's revoke never touches alice's cards, and revoking again is a 404 that closes nothing.
+    await w.user("bob");
+    await machine("bob", "bob-box");
+    const again = await fetch(`${base}/v1/remote-agents/connectors/${desktop}`, { method: "DELETE", headers: { "x-test-user": "bob" } });
+    assert.equal(again.status, 404);
+    assert.equal((await w.q("SELECT status FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toDesktop.confirmation_id]))[0].status, "pending");
   });
 
   test("F4 only the user's own machines; two that fit is a question; an offline one says so", async () => {

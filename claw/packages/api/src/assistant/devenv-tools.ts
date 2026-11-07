@@ -807,6 +807,26 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
   };
 }
 
+/**
+ * The `devenv_send` cards of `owner` still waiting that would send to `connectorId`, closed: the machine was revoked (removed from
+ * their development environments), so pressing one could only fail, and the router must not keep putting it to them. Closed as
+ * `expired`, never answered (`decided_via` says why; `result.error` is the word a press now gets, `no_machine`), in the caller's
+ * transaction (`revokeConnector`). Returns the ids closed.
+ */
+export async function closeCardsOfConnector(q: Querier, owner: string, connectorId: string): Promise<string[]> {
+  // A Claw whose assistant never ran has no cards table, and its revoke must still work (a failed statement would abort the revoke).
+  if (!(await q("SELECT to_regclass('claw_assistant_confirmations') IS NOT NULL AS present")).rows[0]?.present) return [];
+  const closed = await q(
+    `UPDATE claw_assistant_confirmations
+        SET status = 'expired', decided_via = 'connector_revoked', decided_at = NOW(),
+            result = jsonb_build_object('error', 'no_machine', 'message', 'that machine was removed before the card was answered: nothing was sent')
+      WHERE user_id = $1 AND kind = 'devenv_send' AND status = 'pending' AND params->>'connector_id' = $2
+      RETURNING confirmation_id`,
+    [owner, connectorId],
+  );
+  return (closed.rows as Array<{ confirmation_id: string }>).map((r) => r.confirmation_id);
+}
+
 /** A `devenv_send` card the person let through (`decideConfirmation`): sent now, as it showed it. */
 export async function sendConfirmed(userId: string, confirmationId: string, params: Record<string, unknown>): Promise<Record<string, unknown> & { ok: boolean }> {
   const plan: SendPlan = {

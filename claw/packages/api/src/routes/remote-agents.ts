@@ -38,6 +38,7 @@ import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
 import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
+import { closeCardsOfConnector } from "../assistant/devenv-tools.js";
 import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
 const logger = pino({ name: "remote-agents" });
@@ -285,7 +286,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   /** Revoke one of the caller's connectors: the row stays revoked for good, its queued commands go and its sessions close. */
   async function revoke(req: FastifyRequest, reply: FastifyReply, owner: string) {
     const id = parseRemoteId((req.params as { cid?: string }).cid);
-    if (!id || !(await store.revokeConnector(owner, id, clientLabel(req)))) return notFound(reply);
+    if (!id || !(await store.revokeConnector(owner, id, clientLabel(req), (q) => closeCardsOfConnector(q, owner, id).then(() => undefined)))) {
+      return notFound(reply);
+    }
     waker.wake(`c:${id}`);
     return reply.send({ ok: true });
   }
