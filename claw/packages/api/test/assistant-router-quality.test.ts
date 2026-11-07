@@ -305,7 +305,7 @@ describe("router quality, the prompt", () => {
     // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
     // now from the source that states them.
     assert.equal(p.ROUTER_PROMPT_VERSION, "router-v18");
-    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v10");
+    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v11");
     assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v22");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
@@ -375,6 +375,7 @@ describe("router quality, the prompt", () => {
     const changes = abilities.split("\n").find((l) => l.startsWith("- Change things")) ?? "";
     for (const read of toolsOfClass("agent-board", "read")) assert.ok(!new RegExp(`\\b${read}\\b`).test(changes), `the read ${read} is not a change`);
     assert.match(abilities, /Never call yourself read-only, and never say you cannot write, change or send something listed here/);
+    assert.match(abilities, /Never label any part of the answer read-only either \(no 只读 or read-only as a heading/);
     assert.match(abilities, /Its worker asks the user on a card before each write runs, so say yes: you can, and it will ask them to approve the change first/);
     assert.match(abilities, /GitHub \(comment, review/);
     assert.match(abilities, /not a sandbox that would not start, a permission error, a status code \(such as 403\)/);
