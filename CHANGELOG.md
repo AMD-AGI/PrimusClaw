@@ -1019,6 +1019,9 @@ record it.
   connector (#496); `withdraw` takes back a message from the chat that has not started and never touches what runs (#494); a
   closed session stops reading its mode back at once, and `run` waits up to 10 s for commands it has accepted before it exits
   (#497).
+- `@primusclaw/connector` 0.1.12: a command held in the socket through a stall (a laptop lid closed, a network gap) is confirmed
+  with Claw before it runs, so a prompt the chat has since withdrawn or let go is not run late (#469, connector part; needs Claw
+  with #469, live since :202611080318).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
