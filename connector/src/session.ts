@@ -178,6 +178,8 @@ export class Session {
   private terminalQueue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void }> = [];
   private terminalTurn: {
     cmdId: string | null; cmdSeq: number | null; text: string; sentAt: number; seen: boolean; idleSince: number | null; done: () => void;
+    /** The keys are going (or went) to the terminal: from here on it is the terminal's turn, which a withdraw leaves alone. */
+    keys?: boolean;
   } | null = null;
   private terminalPumping = false;
   private terminalRestoring: Promise<void> | null = null;
@@ -495,10 +497,12 @@ export class Session {
         // reach the disk (a restart could not end this turn), and the terminal itself (someone may have started typing, a menu may
         // be open now). Each ends the turn by name and types nothing.
         const giveUp = (reason: string | null, extra: Record<string, unknown> = {}) => {
-          if (this.terminalTurn === turn) this.terminalTurn = null;
+          const mine = this.terminalTurn === turn;
+          if (mine) this.terminalTurn = null;
           // (Going away: the record stays, and the next run ends this turn by name.)
           if (!this.stopping) this.env.store.endTurn(this.id);
-          if (reason === null) return;
+          // (A turn taken from here meanwhile, by a withdraw or a cancel, was already answered for by name: not a second time.)
+          if (reason === null || !mine) return;
           this.audit("terminal_input_refused", { reason, cmd_id: next.cmdId, ...extra });
           this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq, extra);
           this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, ...extra });
@@ -510,7 +514,8 @@ export class Session {
         // The mode asked again on this screen too: a switch since (shift+tab) is not typed into.
         const verdictNow = modeVerdict(this.agent, again.mode);
         if (!verdictNow.ok) { giveUp(verdictNow.reason, { terminal_mode: again.mode }); continue; }
-        if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }
+        if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
+        turn.keys = true;
         try {
           await term.type(text);
         } catch (e) {
@@ -1271,8 +1276,18 @@ export class Session {
    * A chat that lets the session go while its message still waits sends this, so the person's terminal is never interrupted.
    */
   withdraw(): void {
-    const terminal = this.terminalQueue.length;
+    let terminal = this.terminalQueue.length;
     if (terminal) this.dropTerminalQueue("withdrawn");
+    // A message taken off the queue whose keys have not gone yet (its turn is recorded first, then the terminal is read once more):
+    // still the phone's, so it is taken back too. The pump sees its turn is gone right before typing and types nothing.
+    const pending = this.terminalTurn;
+    if (pending && !pending.keys) {
+      this.terminalTurn = null;
+      if (!this.stopping) this.env.store.endTurn(this.id);
+      this.rejectCommand("prompt", pending.cmdId, "withdrawn", pending.cmdSeq);
+      pending.done();
+      terminal += 1;
+    }
     const dropped = this.queue.map((q) => [q.cmdId, q.cmdSeq] as const);
     this.dropQueued();
     for (const [cmdId, cmdSeq] of dropped) this.rejectCommand("prompt", cmdId, "withdrawn", cmdSeq);
