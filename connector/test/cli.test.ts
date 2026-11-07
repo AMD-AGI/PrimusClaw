@@ -92,7 +92,8 @@ describe("claw-connector commands", () => {
     const all = ctx(tmpdir());
     assert.equal(await main(["--help"], all.c), EXIT.ok);
     for (const [name, c] of Object.entries(COMMANDS)) {
-      assert.equal(new RegExp(`^  ${name.replace(/-/g, "\\-")}(\\s|$)`, "m").test(all.text()), !c.hidden, `overall help and ${name}`);
+      const listed = all.text().split("\n").some((l) => l === `  ${name}` || l.startsWith(`  ${name} `));
+      assert.equal(listed, !c.hidden, `overall help and ${name}`);
     }
     // After `--` a "--help" is an argument, not a request for help: `stop -- --help` is a usage error.
     assert.equal(await main(["stop", "--", "--help"], ctx(tmpdir()).c), EXIT.usage);
