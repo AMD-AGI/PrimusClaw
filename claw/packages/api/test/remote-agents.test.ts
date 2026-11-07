@@ -894,6 +894,58 @@ describe("remote agents", { skip }, () => {
       assert.equal((await make()).status, 201);
     });
 
+    test("at the limit an idle session is closed to make room, but never one whose events are being stored as it is chosen", async () => {
+      const small = await serve({ maxActiveSessionsPerUser: 2 });
+      const cid = (await as("u1").post("/v1/remote-agents/connectors", { name: "m" }, undefined, small)).body.data.connector_id;
+      const s = await SseClient.open(`${small}/v1/remote-agents/connectors/${cid}/commands`, { "x-test-user": "u1" });
+      streams.push(s);
+      await as("u1").post(`/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [AGENT] }, undefined, small);
+      const make = () => as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/w" }, undefined, small);
+      const a = (await make()).body.data.session_id as string;
+      const b = (await make()).body.data.session_id as string;
+      let madeId = "";
+      // Both collected by the connector, and unused for an hour; b the longer, so b is the one chosen.
+      await q("DELETE FROM claw_remote_commands WHERE session_id = ANY($1::uuid[])", [[a, b]]);
+      await q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '1 hour' WHERE session_id = $1", [a]);
+      await q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '2 hours' WHERE session_id = $1", [b]);
+      // b's connector is storing a batch right now: the real ingest (POST .../events) is held just after it has written the event
+      // (a test-only trigger waits on a lock this test holds), not yet committed, when the new session is asked for.
+      const gate = await h.connect();
+      await gate.query("SELECT pg_advisory_lock(424242)");
+      await q(`CREATE OR REPLACE FUNCTION test_hold_ingest() RETURNS trigger LANGUAGE plpgsql AS
+        $f$ BEGIN PERFORM pg_advisory_xact_lock_shared(424242); RETURN NULL; END $f$`);
+      await q("CREATE TRIGGER test_hold_ingest AFTER INSERT ON claw_remote_events FOR EACH STATEMENT EXECUTE FUNCTION test_hold_ingest()");
+      try {
+        const posted = as("u1").post(`/v1/remote-agents/connectors/${cid}/events`,
+          { batch_id: "held", events: [{ session_id: b, seq: 1, type: "agent_message_chunk", ts: Date.now(), data: {} }] }, undefined, small);
+        const waiting = async () => Number((await q(
+          "SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND objid = 424242 AND NOT granted")).rows[0].n);
+        for (let i = 0; i < 100 && await waiting() === 0; i++) await new Promise((r) => setTimeout(r, 20));
+        assert.equal(await waiting(), 1, "the batch is held after writing its event");
+        let settled = false;
+        const third = make().then((r) => { settled = true; return r; });
+        await new Promise((r) => setTimeout(r, 400));
+        assert.equal(settled, false, "choosing b waits for the batch being stored");
+        await gate.query("SELECT pg_advisory_unlock(424242)");
+        assert.equal((await posted).status, 200);
+        const made = await third;
+        assert.equal(made.status, 201, JSON.stringify(made.body));
+        assert.deepEqual(made.body.reclaimed, [a], "b is at work now: the other idle one makes room");
+        madeId = made.body.data.session_id;
+      } finally {
+        await q("DROP TRIGGER IF EXISTS test_hold_ingest ON claw_remote_events");
+        await gate.query("SELECT pg_advisory_unlock_all()");
+      }
+      const status = async (sid: string) => (await q("SELECT status FROM claw_remote_sessions WHERE session_id = $1", [sid])).rows[0].status;
+      assert.deepEqual([await status(a), await status(b)], ["closed", "active"]);
+      const close = (await q("SELECT type, session_id::text AS session_id FROM claw_remote_commands WHERE connector_id = $1 AND type = 'close'", [cid])).rows;
+      assert.deepEqual(close, [{ type: "close", session_id: a }], "its connector is told to close it");
+      const frame = await s.next((f) => f.event === "command" && JSON.parse(f.data).type === "close");
+      assert.equal(JSON.parse(frame.data).session_id, a, "and the close reaches the connector's stream");
+      const audit = (await q("SELECT detail FROM claw_remote_audit WHERE action = 'session.reclaimed' AND session_id = $1", [a])).rows[0];
+      assert.equal(audit.detail.for_session, madeId);
+    });
+
     test("one user may hold only so many event streams open, and closing one frees its place", async () => {
       const small = await serve({ maxStreamsPerUser: 2 });
       const cid = (await as("u1").post("/v1/remote-agents/connectors", { name: "m" }, undefined, small)).body.data.connector_id;

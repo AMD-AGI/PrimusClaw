@@ -575,7 +575,9 @@ interface Reclaimable { session_id: string; connector_id: string; agent_id: stri
  * nothing has come from it for a day.
  */
 async function reclaimable(q: Querier, owner: string, need: number, onlineWindowMs: number): Promise<Reclaimable[]> {
-  // Locked as read: an event a connector is storing now commits first, and a session it moved is then read again (and kept).
+  // Locked as read (FOR UPDATE), which waits for a batch of its events being stored now: storing an event takes a key-share lock
+  // on its session row (the events' foreign key) before the batch moves the row's updated_at, so the batch commits first and the
+  // row is then read again as it is (Postgres re-checks a row that changed while it waited), and a session it moved is kept.
   const rows = (await q(
     `SELECT s.session_id::text AS session_id, s.connector_id::text AS connector_id, s.agent_id, s.updated_at,
             COALESCE(c.revoked_at IS NULL AND c.heartbeat_at > NOW() - make_interval(secs => $2::float8)
