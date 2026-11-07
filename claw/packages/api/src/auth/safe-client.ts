@@ -266,10 +266,10 @@ export class SafeClient {
           err,
         );
       }
-      // A SaFE that answers 5xx has not judged the credential, any more than one that does not
-      // answer: remembering it as a failed verification would turn one error response into half
+      // A SaFE that answers 5xx, or 2xx with something that is not an answer, has not judged the credential,
+      // any more than one that does not answer: remembering it as a failed verification would turn one error response into half
       // a minute of "invalid" for a credential that is fine.
-      if (cacheable && !(err instanceof SafeUpstreamHttpError && err.status >= 500)) {
+      if (cacheable && !(err instanceof SafeUpstreamHttpError && err.status >= 500) && !(err instanceof SafeUpstreamProtocolError)) {
         this.setCache(cacheKey, null, err.message, NEGATIVE_TTL);
       }
       throw err;

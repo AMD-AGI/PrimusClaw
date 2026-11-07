@@ -108,6 +108,14 @@ record it.
   its `run.completed` was measured from the claim that resumed it, which clears and restamps `started_at`, so a 70-second run
   resumed three seconds before its end ran "three seconds" and no notification was recorded (release claw-rel-1917, 2026-11-07).
   A run is now measured across every claim from its run-time anchor, less the time it spent queued.
+- A connector no longer stops for good (exit 78, `needs-login.json`, offline until someone runs `login`) because Claw's sign-in
+  service was down. On 2026-11-07 09:50-10:15Z, while SaFE was failing, Claw answered a mix of no answer, 503
+  `authentication_service_unavailable` and 401 `invalid_api_key` for a key that was fine, and the connector took four 401s as a
+  deleted key. A 401 or 403 that comes while Claw is failing (no answer, 5xx, 429), or within ten minutes of it, or that is not
+  Claw's own answer (no JSON error: a gateway's page), is no longer counted and the connector keeps retrying; the same rule now
+  applies at start, so a supervisor restart into an outage is not ended by its first 401. A revocation still stops it at once.
+- The API answers 503 `authentication_service_unavailable`, not 401 `invalid_api_key` (or `invalid_cookie`), when SaFE answers
+  a key or cookie check with a 5xx or with a 2xx that is not an answer, and no longer remembers the latter as a refusal for 30 s.
 - A fresh connector install trusts the CAs the machine trusts: a Claw behind a company CA no longer fails `doctor`, `login`, `pair`
   and `run` until `NODE_USE_SYSTEM_CA=1` is set. On Node.js 22.19+ / 24.5+ the connector adds the system store to Node's own list
   (and `NODE_EXTRA_CA_CERTS`) before its first connection and passes `NODE_USE_SYSTEM_CA=1` to the programs it starts;
