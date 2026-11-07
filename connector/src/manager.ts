@@ -5,6 +5,7 @@
 import type { AgentConfig } from "./config.js";
 import { SESSION_REF_RE } from "./attach.js";
 import { Session, type SessionEnv } from "./session.js";
+import type { TurnRecord } from "./session-store.js";
 import { checkCwd } from "./roots.js";
 import { REMOTE_COMMAND_TYPES, isRemoteCommandType } from "./protocol.js";
 import { sha256, errMessage } from "./util.js";
@@ -19,6 +20,16 @@ export interface Command {
 }
 
 const MAX_ACTIVE_SESSIONS = 10;
+
+/** A session used this recently is told, after a restart, that it is back (Claude Code keeps a conversation resumable for hours). */
+export const RECOVER_NOTICE_MS = 4 * 3600_000;
+
+/**
+ * What the agent is told when its turn was cut off by a restart while it waited for a person's permission. The request
+ * died with the adapter; going on from the transcript makes the agent ask again, so the card comes back by itself.
+ */
+export const CONTINUE_PROMPT = "[claw-connector] The connector on this machine restarted while you were waiting for my permission, so that "
+  + "request was cancelled. Continue the task from where you left off, and ask again for anything that still needs my permission.";
 
 const cmdSeqOf = (cmd: Command): number | null => (Number.isSafeInteger(cmd.cmd_seq) ? cmd.cmd_seq! : null);
 
@@ -232,11 +243,57 @@ export class SessionManager {
     return [...this.sessions.values()].reduce((n, s) => n + s.pendingCount, 0);
   }
 
-  /** The kill switch: every adapter process, now. Sessions stay recorded and can be resumed. */
-  async killAll(reason: string): Promise<void> {
+  /**
+   * After a restart (a crash, a kill, a supervisor's restart, an upgrade): every turn the previous run left running is
+   * ended or carried on, and every session used lately is told it is back (`session_recovered`), once.
+   *
+   * A turn whose agent was waiting for a person's permission, cut off no longer ago than a card lives, goes on with
+   * {@link CONTINUE_PROMPT} under the same prompt (`cmd_id`, `cmd_seq`): the agent asks again, so the card comes back,
+   * and the prompt's own `turn_end` still ends it. It only asks, so nothing runs that a person has not approved. Any
+   * other turn ends with `turn_end` `error: "connector_restarted"`, naming its prompt, so the phone stops waiting for it;
+   * whether the agent finished what it was doing is in the conversation, which the next message resumes.
+   */
+  recover(o: { turns: TurnRecord[]; waiting: ReadonlySet<string>; downForMs: number | null; now?: number }): void {
+    const now = o.now ?? Date.now();
+    const told = new Set<string>();
+    for (const t of o.turns) {
+      const sid = t.session_id;
+      const rec = this.env.store.get(sid);
+      const active = rec?.status === "active";
+      const waiting = Boolean(t.waiting) || o.waiting.has(sid);
+      const recent = o.downForMs !== null && o.downForMs <= this.env.timing.permissionTtlMs;
+      if (active && waiting && recent) {
+        this.env.audit.record("turn_continued", { session_id: sid, cmd_id: t.cmd_id, cmd_seq: t.cmd_seq, down_ms: o.downForMs });
+        this.env.emit(sid, "session_recovered", { reason: "connector_restart", interrupted: true, continuing: true, cmd_id: t.cmd_id, cmd_seq: t.cmd_seq });
+        void this.handle({ cmd_id: t.cmd_id ?? `continue-${t.cmd_seq ?? sid}`, type: "prompt", session_id: sid, text: CONTINUE_PROMPT, ...(t.cmd_seq !== null ? { cmd_seq: t.cmd_seq } : {}) });
+      } else {
+        this.env.audit.record("turn_interrupted", { session_id: sid, cmd_id: t.cmd_id, cmd_seq: t.cmd_seq, waiting, down_ms: o.downForMs });
+        // Before the turn_end: a phone reading the turn hears why it ended in the same place it hears that it ended.
+        if (active) this.env.emit(sid, "session_recovered", { reason: "connector_restart", interrupted: true, continuing: false, cmd_id: t.cmd_id, cmd_seq: t.cmd_seq });
+        this.env.emit(sid, "turn_end", { stopReason: "error", error: "connector_restarted", cmd_id: t.cmd_id, cmd_seq: t.cmd_seq });
+      }
+      told.add(sid);
+    }
+    for (const sid of this.env.store.ids()) {
+      const rec = this.env.store.get(sid);
+      if (told.has(sid) || rec?.status !== "active" || !rec.used_at) continue;
+      const used = Date.parse(rec.used_at);
+      if (!Number.isFinite(used) || now - used > RECOVER_NOTICE_MS) continue;
+      this.env.emit(sid, "session_recovered", { reason: "connector_restart", interrupted: false, continuing: false });
+    }
+  }
+
+  /**
+   * Every adapter process, now. Sessions stay recorded and can be resumed. `restarting`: the connector is only going away
+   * for a while (stopped, or restarted by its supervisor); what is in flight is left for the next run ({@link recover})
+   * instead of being ended, and queued prompts are delivered again. Otherwise (the kill switch: revoked, paused) every
+   * turn ends here and queued prompts count as handled.
+   */
+  async killAll(reason: string, restarting = false): Promise<void> {
     for (const s of this.sessions.values()) {
       this.env.audit.record("session_killed", { session_id: s.id, reason });
-      s.dropQueued();
+      if (restarting) s.shutdown();
+      else s.dropQueued();
       s.stopTail();
     }
     await this.env.registry.killAll();

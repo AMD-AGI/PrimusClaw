@@ -422,11 +422,25 @@ dated by its last heartbeat). `status` shows the latest, `service status` the la
 
 ## Restarts and crashes
 
-A prompt counts as handled only when it reaches the agent (or is dropped by a cancel, a close or a stop), so a connector that
-dies with a prompt still queued is sent that prompt again by Claw instead of losing it. A permission request waiting
-for an answer lives in the adapter, which dies with the connector: the next run closes such a card (`cancelled`, by
-`connector_restart`), so a phone is not left with a button that does nothing. Session state, unacknowledged events and
-their sequence numbers are on disk; a session resumes in a fresh adapter on its next prompt.
+A prompt counts as handled only when it reaches the agent (or is dropped by a cancel or a close), so a connector that
+dies, or is stopped or restarted by its supervisor, with a prompt still queued is sent that prompt again by Claw instead of
+losing it. A permission request waiting for an answer lives in the adapter, which dies with the connector: the next run
+closes such a card (`cancelled`, by `connector_restart`), so a phone is not left with a button that does nothing. Session
+state, unacknowledged events and their sequence numbers are on disk; a session resumes in a fresh adapter on its next prompt
+(Claude Code's `session/resume`, the conversation intact).
+
+The turn an agent is running is on disk too, from the moment its prompt reaches the agent until its `turn_end`. The next run
+(after a crash, a kill, a pod restart, `stop`, or an upgrade) finds it and:
+
+- carries it on when the agent was waiting for a person's permission and the connector was away no longer than a card lives
+  (10 minutes): the agent is told the connector restarted and to go on, so it asks again and a new card comes; the prompt's own
+  `turn_end` still ends it. It only asks, so nothing runs that nobody approved;
+- otherwise ends it with `turn_end` `{"stopReason": "error", "error": "connector_restarted"}`, naming its prompt (`cmd_id`,
+  `cmd_seq`), so a phone stops waiting for it. The agent is not re-run by itself; the next message resumes the conversation.
+
+Every session used in the last 4 hours, and every one with a turn found this way, then gets one `session_recovered` event
+(`interrupted`: a turn was cut off; `continuing`: it is being carried on; `cmd_id` and `cmd_seq` of that turn), which a chat
+shows as "recovered". A stop by the kill switch (`pause`, a revocation) still ends every turn and drops the queue.
 
 Known limit: the working-directory check resolves the path and starts the adapter in the resolved path, but another process of
 the same user that can rewrite a directory in that path could swap a symlink between the check and the start. The

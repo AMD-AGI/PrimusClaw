@@ -15,15 +15,36 @@ export interface SessionRecord {
   /** A conversation open in a terminal, watched without taking it over (session.ts `spectate`). */
   read_only?: boolean;
   created_at: string;
+  /** When a prompt last reached the session's agent (absent on records written before this was kept). */
+  used_at?: string;
+}
+
+/** A turn the agent was running, kept from the moment its prompt reaches the agent until its `turn_end` is emitted. */
+export interface TurnRecord {
+  session_id: string;
+  cmd_id: string | null;
+  cmd_seq: number | null;
+  started_at: string;
+  /** The agent was waiting for a person's answer to a permission request. */
+  waiting?: boolean;
 }
 
 export class SessionStore {
   private recs: Record<string, SessionRecord> = {};
   private pending: Array<{ session_id: string; action_id: string }> = [];
   private readonly pendingFile: string;
+  private turns: Record<string, TurnRecord> = {};
+  private readonly turnsFile: string;
 
   constructor(private readonly file: string) {
     this.pendingFile = `${file}.pending`;
+    this.turnsFile = `${file}.turns`;
+    try {
+      const raw: unknown = JSON.parse(fs.readFileSync(this.turnsFile, "utf8"));
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        for (const [k, t] of Object.entries(raw as Record<string, TurnRecord>)) if (t && typeof t.session_id === "string") this.turns[k] = t;
+      }
+    } catch { /* none */ }
     try {
       const raw: unknown = JSON.parse(fs.readFileSync(this.pendingFile, "utf8"));
       if (Array.isArray(raw)) this.pending = raw.filter((p) => p && typeof p.session_id === "string" && typeof p.action_id === "string");
@@ -78,6 +99,44 @@ export class SessionStore {
     const tmp = `${this.pendingFile}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(this.pending), { mode: 0o600 });
     fs.renameSync(tmp, this.pendingFile);
+  }
+
+  /**
+   * The turn a session's agent is running. It lives in the adapter's memory, so a connector that dies (or is stopped)
+   * mid-turn would leave the prompt open for ever: the next run reads these and ends or continues each one.
+   */
+  beginTurn(t: TurnRecord): void {
+    this.turns[t.session_id] = t;
+    this.saveTurns();
+  }
+
+  /** The turn's agent is waiting for a person (`true`), or no longer (`false`). */
+  markWaiting(sessionId: string, waiting: boolean): void {
+    const t = this.turns[sessionId];
+    if (!t || Boolean(t.waiting) === waiting) return;
+    this.turns[sessionId] = { ...t, waiting };
+    this.saveTurns();
+  }
+
+  endTurn(sessionId: string): void {
+    if (!(sessionId in this.turns)) return;
+    delete this.turns[sessionId];
+    this.saveTurns();
+  }
+
+  /** Return the turns that were running and forget them. */
+  takeTurns(): TurnRecord[] {
+    const out = Object.values(this.turns);
+    this.turns = {};
+    if (out.length) this.saveTurns();
+    return out;
+  }
+
+  private saveTurns(): void {
+    fs.mkdirSync(path.dirname(this.turnsFile), { recursive: true, mode: 0o700 });
+    const tmp = `${this.turnsFile}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(this.turns), { mode: 0o600 });
+    fs.renameSync(tmp, this.turnsFile);
   }
 
   ids(): string[] {

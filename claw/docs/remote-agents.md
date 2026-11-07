@@ -67,6 +67,12 @@ Claw matches on `cmd_seq`: a `cmd_id` may be a client's `Idempotency-Key`, which
 events can change, and a number it never does. A connector from before this change sends neither in `turn_end`,
 and its dropped prompts are not refused.
 
+After a restart the connector ends a turn its previous run left running with `turn_end`
+`{"stopReason": "error", "error": "connector_restarted"}` (naming its prompt), or carries it on under the same prompt
+when the agent was waiting for a permission (it asks again; that prompt's own `turn_end` ends it). Each session used
+lately then gets one `session_recovered` (`data.interrupted`, `data.continuing`, and `data.cmd_id`/`data.cmd_seq` of the
+turn when there was one). Claw stores and relays it like any other event.
+
 ### Continuing a session that already exists
 
 A connector may offer sessions that already exist on its machine instead of (or beside) starting new ones. Claw does not

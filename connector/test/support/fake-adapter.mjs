@@ -38,9 +38,11 @@ if (env.FAKE_SURVIVE_EOF === "1") setInterval(() => {}, 1000);
 
 async function prompt(id, params) {
   const s = sessions.get(params.sessionId);
-  const text = (params.prompt || []).map((p) => p.text || "").join(" ");
+  const said = (params.prompt || []).map((p) => p.text || "").join(" ");
+  // The connector's own "go on" after a restart (manager.ts CONTINUE_PROMPT): like a real agent, it asks again.
+  const text = said.startsWith("[claw-connector]") ? "write continued.txt" : said;
   s.cancelled = false;
-  log({ prompt: text, mode: s.mode });
+  log({ prompt: said, mode: s.mode });
   const done = (stopReason) => reply(id, { stopReason, usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } });
   const m = /^write (\S+)(?: (.*))?$/.exec(text);
   if (m) {

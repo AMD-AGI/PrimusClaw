@@ -118,6 +118,13 @@ export class Session {
    */
   private twinSeen = false;
   private turnRunning = false;
+  /**
+   * The connector is going away (stopped, or restarted by its supervisor) and will come back. What this process cannot
+   * finish is left recorded for the next run instead of being ended here: the running turn (no `turn_end`), its waiting
+   * permission requests (still pending), and the prompts queued behind it (not counted as handled, so Claw delivers them
+   * again). See {@link SessionManager.recover}.
+   */
+  private stopping = false;
   private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void }> = [];
   private launching: Promise<void> | null = null;
   private idle: NodeJS.Timeout | undefined;
@@ -558,7 +565,8 @@ export class Session {
     this.adapter = null;
     const hadTurn = this.turnRunning;
     const cancelled = this.book.cancelAll();
-    for (const actionId of cancelled) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "adapter_exit" });
+    // Going away: the next run closes these cards (by connector_restart) and knows the turn was waiting on them.
+    if (!this.stopping) for (const actionId of cancelled) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "adapter_exit" });
     if (!this.closed) this.audit("adapter_exited", { code: info.code, signal: info.signal, during_turn: hadTurn });
   }
 
@@ -620,10 +628,14 @@ export class Session {
   private askPerson(options: OfferedOption[], info: Record<string, unknown>, shape: (optionId: string | null) => AcpParams): Promise<AcpParams> {
     return new Promise<AcpParams>((resolve) => {
       const p = this.book.open(options, (actionId) => redactDeep({ actionId, ...info, options, timeout_ms: this.book.ttl }) as Record<string, unknown>, (optionId) => {
-        this.env.store.removePending(this.id, p.actionId);
+        if (!this.stopping) {
+          this.env.store.removePending(this.id, p.actionId);
+          if (this.book.size === 0) this.env.store.markWaiting(this.id, false);
+        }
         resolve(shape(optionId));
       });
       this.env.store.addPending(this.id, p.actionId);
+      this.env.store.markWaiting(this.id, true);
       this.audit("permission_requested", { action_id: p.actionId, tool: info.tool, tool_kind: info.kind, options: options.map((o) => o.optionId) });
       this.emit("permissionRequest", p.payload);
     });
@@ -703,11 +715,17 @@ export class Session {
     if (!this.turnRunning) void this.pump();
   }
 
-  /** Prompts that will now never run (the process is being stopped): they count as handled. */
-  dropQueued(): void {
+  /** Prompts that will now never run here: they count as handled, unless (`keep`) the connector is only restarting and the next run should get them again. */
+  dropQueued(keep = false): void {
     const q = this.queue;
     this.queue = [];
-    for (const item of q) item.started();
+    if (!keep) for (const item of q) item.started();
+  }
+
+  /** The connector is about to stop its adapters and will come back: see {@link stopping}. */
+  shutdown(): void {
+    this.stopping = true;
+    this.dropQueued(true);
   }
 
   private async pump(): Promise<void> {
@@ -749,13 +767,17 @@ export class Session {
     const watch = support ? this.watchTwins(support, this.acpId!) : null;
     try {
       const reply = a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });
+      const now = new Date().toISOString();
+      // Recorded before the prompt counts as handled: from here a restart finds this turn instead of losing it.
+      this.env.store.beginTurn({ session_id: this.id, cmd_id: cmdId, cmd_seq: cmdSeq, started_at: now });
+      this.env.store.patch(this.id, { used_at: now });
       started();
       const res = await reply;
       const usage = isObject(res.usage) ? res.usage : undefined;
-      this.emit("turn_end", { stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });
+      this.endTurn({ stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });
     } catch (e) {
-      this.audit("turn_failed", { error: errMessage(e) });
-      this.emit("turn_end", { stopReason: "error", error: errMessage(e).slice(0, 300), cmd_id: cmdId, cmd_seq: cmdSeq });
+      if (!this.stopping) this.audit("turn_failed", { error: errMessage(e) });
+      this.endTurn({ stopReason: "error", error: errMessage(e).slice(0, 300), cmd_id: cmdId, cmd_seq: cmdSeq });
     } finally {
       // At once, before the look at who holds the conversation open: the test below it for a terminal that writes
       // next is the size, and it must start from the turn's end, not from a moment later.
@@ -805,6 +827,13 @@ export class Session {
       }
     }
     return null;
+  }
+
+  /** The turn is over: say so and forget it. Not while the connector is going away: the next run ends or continues it. */
+  private endTurn(data: Record<string, unknown>): void {
+    if (this.stopping) return;
+    this.emit("turn_end", data);
+    this.env.store.endTurn(this.id);
   }
 
   /** What size the transcript is as this connector leaves it: after it starts the session and after every turn. */

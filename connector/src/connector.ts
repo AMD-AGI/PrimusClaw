@@ -541,10 +541,17 @@ export class Connector {
     // Adapters a crashed earlier run left recorded are stopped first (only if they are still the processes we started).
     await this.registry.killAll();
     // A card whose adapter died with the previous run can never be answered: close it, so a phone does not keep a dead button.
+    const waiting = new Set<string>();
     for (const p of this.store.takePending()) {
+      waiting.add(p.session_id);
       this.d.audit.record("permission_orphaned", { session_id: p.session_id, action_id: p.action_id });
       this.emit(p.session_id, "permission_resolved", { actionId: p.action_id, optionId: null, outcome: "cancelled", by: "connector_restart" });
     }
+    // The turns the previous run left running end, or (one that was waiting for a person) go on and ask again; the sessions
+    // used lately are told they are back. How long the machine was away is from its last heartbeat (connector.json).
+    let downForMs: number | null = null;
+    try { downForMs = Math.max(0, Date.now() - fs.statSync(identityFile(this.d.dirs)).mtimeMs); } catch { /* never registered */ }
+    this.manager.recover({ turns: this.store.takeTurns(), waiting, downForMs });
     const pidf = pidFile(this.d.dirs);
     // A pid file left behind means the previous run never reached its own clean-up: it was killed (SIGKILL, OOM),
     // crashed, or the machine went down under it. Its last heartbeat is when connector.json was last written.
@@ -573,7 +580,8 @@ export class Connector {
       failure = errMessage(e);
       throw e;
     } finally {
-      await this.manager.killAll(this.revoked ? "revoked" : "stopped").catch(() => undefined);
+      // Stopped or restarted (not revoked, not refused): what is in flight is the next run's to end or carry on.
+      await this.manager.killAll(this.revoked ? "revoked" : "stopped", !this.revoked && !this.authFailed).catch(() => undefined);
       const reason = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : failure ? "failed" : this.paused ? "stopped_while_paused" : result;
       recordDisconnect(this.d.dirs, { reason, detail: this.authWhy || failure || undefined });
       fs.rmSync(pidf, { force: true });
