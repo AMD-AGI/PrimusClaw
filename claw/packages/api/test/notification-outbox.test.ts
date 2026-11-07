@@ -493,6 +493,24 @@ describe("notification outbox", { skip }, () => {
       );
     });
 
+    test("a row deleted under a send in flight is carried over, but not sent again before that send's lease ends", async () => {
+      const first = (await post()).json().data;
+      // A replica claimed the row for a retry and is sending it (its lease, 120 s) when the subscription is deleted.
+      await q(
+        `INSERT INTO claw_notification_outbox (event_id, subscription_id, payload, attempts, last_status, next_attempt_at)
+         VALUES ('ev-flying', $1, '{"type":"run.completed","user_id":"u1","trigger_id":"trg"}'::jsonb, 3, 'http_503', NOW() + interval '120 seconds')`,
+        [first.subscription_id],
+      );
+      assert.equal((await del(first.subscription_id)).statusCode, 200);
+      const second = (await post()).json().data;
+      const [row] = await rows();
+      assert.equal(row.subscription_id, second.subscription_id, "carried over");
+      assert.deepEqual(await deliver(), { delivered: 0, failed: 0 }, "not due while the first send may still be on the wire");
+      assert.equal(sent.length, 0);
+      await makeDue();
+      assert.deepEqual(await deliver(), { delivered: 1, failed: 0 }, "sent once the lease is over");
+    });
+
     test("is carried over only to a subscription whose sources take it, as it would have been queued", async () => {
       const first = (await post({ url: "https://93.184.216.34/claw", sources: ["trigger"] })).json().data;
       await seedRun({ sid: "s1", tid: "t1", trigger: "trg" });

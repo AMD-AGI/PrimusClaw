@@ -593,7 +593,8 @@ const PAYLOAD_SOURCE_SQL = `CASE WHEN o.payload->>'source' = 'assistant_item' TH
  * usual reason for a delete is a receiver that makes its subscription again: a chat bot that lost the secret of its old one, or a
  * person who unlinked and linked again. Before, the delete took the rows with it, and every notice queued for that person -- most
  * of them during the receiver's own restart -- was gone for good. Here each such row from the last `GIVE_UP_AFTER_HOURS` whose type
- * (and, for a work item's approval, source) the subscription takes is moved to it and made due, one row per event, so a receiver
+ * (and, for a work item's approval, source) the subscription takes is moved to it and made due (a row that may be in flight keeps
+ * its lease), one row per event, so a receiver
  * that dedups by event id sees it once. Concurrent calls cannot both take a row: the update re-reads `subscription_id` under its row
  * lock. Returns how many rows were carried over.
  */
@@ -614,13 +615,16 @@ export async function adoptOrphanedRows(subscriptionId: string, q: Querier = dir
         ORDER BY o.event_id, o.id
      )
      UPDATE claw_notification_outbox o
-        -- A row that failed before is due now, its failure forgotten; one never tried keeps its time and status (a held say).
+        -- A row that failed before is due now, its failure forgotten, unless it is due within the claim lease anyway: that may be a
+        -- row a replica claimed and is sending right now (deleted under it), which must not be sent a second time. One never tried
+        -- keeps its time and status (a held say).
         SET subscription_id = $1,
-            next_attempt_at = CASE WHEN o.attempts > 0 THEN NOW() ELSE o.next_attempt_at END,
+            next_attempt_at = CASE WHEN o.attempts > 0 AND o.next_attempt_at > NOW() + make_interval(secs => $3) THEN NOW()
+                                   ELSE o.next_attempt_at END,
             last_status = CASE WHEN o.attempts > 0 THEN NULL ELSE o.last_status END
        FROM picked
       WHERE o.id = picked.id AND o.subscription_id IS NULL`,
-    [subscriptionId, GIVE_UP_AFTER_HOURS],
+    [subscriptionId, GIVE_UP_AFTER_HOURS, CLAIM_LEASE_SECONDS],
   );
   const n = r.rowCount ?? 0;
   if (n > 0) logger.info({ subscriptionId, rows: n }, "notification.orphans_adopted");
