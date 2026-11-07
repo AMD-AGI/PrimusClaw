@@ -231,25 +231,7 @@ export async function publishSayEvent(
   sessionId: string, sayId: string, payload: AssistantSayPayload | WorkItemNeedsYouPayload, deps: SayDeps, turnMessageId?: string,
 ): Promise<void> {
   try {
-    await (deps.publishSessionEvent ?? publishEvent)(sessionId, {
-      type: "AssistantSay",
-      session_id: sessionId,
-      say_id: sayId,
-      ...(turnMessageId ? { turn_message_id: turnMessageId } : {}),
-      text: payload.text,
-      ...(payload.item ? { item: payload.item } : {}),
-      ...(payload.type === "assistant.say" && payload.sources ? { sources: payload.sources } : {}),
-      ...(payload.type === "assistant.say" && payload.suggested_replies ? { suggested_replies: payload.suggested_replies } : {}),
-      // What the message puts to the person to press, as a channel gets it: a web client, and an evaluation reading the session,
-      // must see the card the channel draws, not only its words.
-      ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
-      ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
-      ...(payload.type === "assistant.say" && payload.files ? { files: payload.files } : {}),
-      ...(payload.type === "assistant.say" && payload.amends ? { amends: payload.amends } : {}),
-      ...(payload.type === "assistant.say" && payload.replaces ? { replaces: payload.replaces } : {}),
-      fallback: payload.type === "work_item.needs_you",
-      ts: Date.parse(payload.occurred_at),
-    });
+    await sendSayEvent(sessionId, sayId, payload, deps, turnMessageId);
   } catch (err) {
     // The message is stored and queued; a web client that missed the live event reads it later.
     logger.error({ err, sayId }, "assistant.say_event_publish_failed");
@@ -263,6 +245,31 @@ export async function publishSayEvent(
         AND EXISTS (SELECT 1 FROM claw_sessions WHERE session_id = $2 AND deleted_at IS NULL)`,
     [sayId, sessionId],
   ).catch((err) => logger.warn({ err, sayId }, "assistant.say_shown_record_failed"));
+}
+
+/** The event itself; throws when it was not published. */
+async function sendSayEvent(
+  sessionId: string, sayId: string, payload: AssistantSayPayload | WorkItemNeedsYouPayload, deps: SayDeps, turnMessageId?: string,
+): Promise<void> {
+  await (deps.publishSessionEvent ?? publishEvent)(sessionId, {
+    type: "AssistantSay",
+    session_id: sessionId,
+    say_id: sayId,
+    ...(turnMessageId ? { turn_message_id: turnMessageId } : {}),
+    text: payload.text,
+    ...(payload.item ? { item: payload.item } : {}),
+    ...(payload.type === "assistant.say" && payload.sources ? { sources: payload.sources } : {}),
+    ...(payload.type === "assistant.say" && payload.suggested_replies ? { suggested_replies: payload.suggested_replies } : {}),
+    // What the message puts to the person to press, as a channel gets it: a web client, and an evaluation reading the session,
+    // must see the card the channel draws, not only its words.
+    ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
+    ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
+    ...(payload.type === "assistant.say" && payload.files ? { files: payload.files } : {}),
+    ...(payload.type === "assistant.say" && payload.amends ? { amends: payload.amends } : {}),
+    ...(payload.type === "assistant.say" && payload.replaces ? { replaces: payload.replaces } : {}),
+    fallback: payload.type === "work_item.needs_you",
+    ts: Date.parse(payload.occurred_at),
+  });
 }
 
 /** Where the unreachable-message warning goes: a seam, so a test can see which messages were warned about. */
@@ -697,22 +704,35 @@ export async function recordNeedsYouFallback(input: { itemId: string }, deps: Sa
 /**
  * Show again, in the item's session, the system's message about its current need that was stored but shown in no session (its
  * publish failed, or the user had no session then): the silent sweep's, for a user no channel tells (`silent-sweep.ts`). The same
- * message, under the same id, so a client shows it once. True when it is shown now.
+ * message, under the same id. At most once: the message is claimed for the session first (`session_id`, set only while unset), so of
+ * two sweeps only one publishes, and the claim is let go when the publish fails, for a later sweep to try again; an event the session's
+ * stream already holds (a publish whose claim was lost) is not published again. True when it is shown now.
  */
 export async function reshowFallback(input: { itemId: string }, deps: SayDeps = {}): Promise<boolean> {
   await ensureLiveAssistant(input.itemId);
   const item = await loadItem((t, p) => db.query(t, p), input.itemId);
   if (!item) return false;
   const sayId = deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq));
-  const said = (await db.query(
-    "SELECT text, created_at FROM claw_assistant_says WHERE say_id = $1 AND fallback AND session_id IS NULL", [sayId],
-  )).rows[0] as { text: string; created_at: Date } | undefined;
-  if (!said) return false;
   const where = await itemSession((t, p) => db.query(t, p), item.item_id);
   if (!where?.sessionId) return false;
-  const m: ToStore = { type: "work_item.needs_you", sayId, userId: item.user_id, sessionId: where.sessionId, text: said.text, item };
-  await publishSayEvent(where.sessionId, sayId, payloadOf(m, said.created_at), deps);
-  return ((await db.query("SELECT session_id FROM claw_assistant_says WHERE say_id = $1", [sayId])).rows[0]?.session_id ?? null) !== null;
+  const claimed = (await db.query(
+    `UPDATE claw_assistant_says SET session_id = $2
+      WHERE say_id = $1 AND fallback AND session_id IS NULL
+        AND EXISTS (SELECT 1 FROM claw_sessions WHERE session_id = $2 AND deleted_at IS NULL)
+      RETURNING text, created_at`,
+    [sayId, where.sessionId],
+  )).rows[0] as { text: string; created_at: Date } | undefined;
+  if (!claimed) return false;
+  if (await eventInSession(where.sessionId, sayId)) return true;
+  const m: ToStore = { type: "work_item.needs_you", sayId, userId: item.user_id, sessionId: where.sessionId, text: claimed.text, item };
+  try {
+    await sendSayEvent(where.sessionId, sayId, payloadOf(m, claimed.created_at), deps);
+    return true;
+  } catch (err) {
+    logger.error({ err, sayId }, "assistant.say_event_publish_failed");
+    await db.query("UPDATE claw_assistant_says SET session_id = NULL WHERE say_id = $1 AND session_id = $2", [sayId, where.sessionId]);
+    return false;
+  }
 }
 
 /** What the router is told when the system already told the user, in this turn, that the item they asked for started. */

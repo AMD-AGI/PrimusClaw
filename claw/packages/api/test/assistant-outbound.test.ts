@@ -875,13 +875,32 @@ describe("assistant outbound", { skip }, () => {
       assert.equal(await sweep(down), 1, "stored");
       assert.equal(shown().length, 0);
       assert.equal(await sweep(down), 0, "still down: not shown, not counted");
-      assert.equal(await sweep(), 1, "shown now");
+      // Two sweeps at once (two replicas): one publishes.
+      const itemId = (await saysRows()).find((x) => x.fallback).item_id;
+      const both = await Promise.all([outbound.reshowFallback({ itemId }, deps()), outbound.reshowFallback({ itemId }, deps())]);
+      assert.deepEqual(both.sort(), [false, true], "one claimed it");
       assert.equal(await sweep(), 0, "once");
       const told = shown();
       assert.equal(told.length, 1);
       assert.equal(told[0].session, own.sessionId);
       assert.match(told[0].text, /RESULT=86972/);
       assert.equal((await saysRows()).filter((x) => x.fallback).length, 1, "one message, shown under its one id");
+    });
+
+    test("the system's own message the session's stream already holds is not published again, though its record was lost", async () => {
+      const own = await assistantOf();
+      await answeredItem("后台运行 slow_job.sh", "RESULT=86972");
+      assert.equal(await sweep(), 1);
+      const [stored] = (await saysRows()).filter((x) => x.fallback);
+      // The event reached the stream (the event consumer persisted it), and then the record that it was shown was lost.
+      await q(
+        `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, 'AssistantSay', $3::jsonb)`,
+        [`ev-${stored.say_id}`, own.sessionId, JSON.stringify({ say_id: stored.say_id })],
+      );
+      await q("UPDATE claw_assistant_says SET session_id = NULL WHERE say_id = $1", [stored.say_id]);
+      assert.equal(await sweep(), 1, "recorded as shown");
+      assert.equal(await sweep(), 0);
+      assert.equal(shown().length, 1, "published once");
     });
 
     test("one said in a session deleted before its event was published told nobody", async () => {
