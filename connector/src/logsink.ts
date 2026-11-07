@@ -52,7 +52,7 @@ const codeOf = (e: unknown): string => {
  * device) is written synchronously, as Node writes it, so a failure is known at once; a pipe or a terminal goes through
  * its stream, and once that stream has failed (its reader gone) the lines after it are dropped and counted.
  */
-export function lineSink(o: LineSinkOptions): (line: string) => void {
+export function lineSink(o: LineSinkOptions): (line: string, force?: boolean) => void {
   const now = o.now ?? Date.now;
   const writeFd = o.writeFd ?? writeAll;
   let direct = o.stream === undefined;
@@ -77,14 +77,15 @@ export function lineSink(o: LineSinkOptions): (line: string) => void {
     if (held.length > HELD_LINES) { held.shift(); dropped += 1; }
   };
 
-  return (line: string): void => {
+  // `force`: try the descriptor now even within the pause (a last line before the process exits).
+  return (line: string, force = false): void => {
     const data = line + "\n";
     if (!direct) {
       if (streamBroken) { dropped += 1; return; }
       try { o.stream!.write(data); } catch { streamBroken = true; dropped += 1; }
       return;
     }
-    if (failedAt !== null && now() - failedAt < RETRY_PRIMARY_MS) { hold(data); return; }
+    if (failedAt !== null && !force && now() - failedAt < RETRY_PRIMARY_MS) { hold(data); return; }
     try {
       if (failedAt !== null) {
         writeFd(o.fd, `${new Date(now()).toISOString()} claw-connector: this log could not be written from ${since} (${failure}); the last ${held.length} line(s) follow, ${dropped} older one(s) dropped\n`);

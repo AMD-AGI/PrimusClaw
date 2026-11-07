@@ -63,4 +63,4 @@ main(process.argv.slice(2), {
     // so the same ask sent to an older connector that does not listen is harmless.
     process.on("SIGWINCH", () => c.recheckHealth());
   },
-}).then((code) => process.exit(code), (e) => { err(`fatal: ${e instanceof Error ? e.stack : String(e)}`); process.exit(1); });
+}).then((code) => process.exit(code), (e) => { err(`fatal: ${e instanceof Error ? e.stack : String(e)}`, true); process.exit(1); });

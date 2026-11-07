@@ -188,6 +188,29 @@ describe("state files written off the event loop", () => {
     assert.equal(fs.existsSync(file) && fs.readFileSync(file, "utf8"), "[1]", "written by the retry, without another save or settled()");
     assert.ok(reports.length >= 1);
   });
+  test("a save and a settled() made while a retry checks the directory are written and answered at once, even when the directory is gone", async () => {
+    const dir = tmpdir();
+    const state = path.join(dir, "state");
+    fs.mkdirSync(state);
+    const file = path.join(state, "sessions.json");
+    fs.mkdirSync(`${file}.tmp`); // the first write fails
+    let checks = 0;
+    let answer: ((e?: NodeJS.ErrnoException) => void) | null = null;
+    // The retry's directory check stays pending until the test answers it.
+    const f = new SnapshotFile(file, undefined, false, () => { checks += 1; return new Promise<void>((resolve, reject) => { answer = (e) => (e ? reject(e) : resolve()); }); });
+    f.save("[1]");
+    assert.equal(await within(f.settled(500), 1_500, null), false, "the write failed");
+    const deadline = Date.now() + 5_000;
+    while (checks === 0 && Date.now() < deadline) await sleep(20);
+    assert.equal(checks, 1, "the retry is checking the directory");
+    fs.rmSync(state, { recursive: true, force: true }); // and the directory is gone
+    f.save("[2]");
+    assert.equal(await within(f.settled(Infinity), 2_000, null), true, "answered while the check is still pending");
+    assert.equal(fs.readFileSync(file, "utf8"), "[2]", "the newer content is written (its directory made again)");
+    answer!(Object.assign(new Error("gone"), { code: "ENOENT" }));
+    await sleep(50);
+    assert.equal(fs.readFileSync(file, "utf8"), "[2]");
+  });
   test("one failed write of sessions.json.pending does not hold back every later event (written() settles)", async () => {
     const dir = tmp();
     const file = path.join(dir, "sessions.json");

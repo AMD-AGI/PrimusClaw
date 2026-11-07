@@ -106,8 +106,14 @@ export class SnapshotFile {
   private closed = false;
   private readonly waiters: Array<{ upTo: number; resolve: (ok: boolean) => void }> = [];
 
-  /** `durable`: each write is flushed to the disk before it replaces the file ({@link writeWhole}). */
-  constructor(readonly file: string, private readonly report?: WriteReport, private readonly durable = false) {}
+  /**
+   * `durable`: each write is flushed to the disk before it replaces the file ({@link writeWhole}). `access`: how a retry
+   * checks that the directory is still there (the tests hold it pending).
+   */
+  constructor(
+    readonly file: string, private readonly report?: WriteReport, private readonly durable = false,
+    private readonly access: (dir: string) => Promise<unknown> = (dir) => fsp.access(dir),
+  ) {}
 
   save(data: string): void {
     this.latest = data;
@@ -157,6 +163,13 @@ export class SnapshotFile {
     this.retryTimer = null;
   }
 
+  /** The retry itself, unless closed meanwhile, or a drain already runs, or nothing is left to write. */
+  private retryNow(): void {
+    if (this.closed || this.running !== null || this.written >= this.saved) return;
+    this.failed = this.written;
+    this.running = this.drain();
+  }
+
   /** After a failed write with nothing newer to write: the same content again, later. */
   private retryLater(): void {
     if (this.retryTimer !== null || this.closed) return;
@@ -164,17 +177,13 @@ export class SnapshotFile {
     this.retries += 1;
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
-      if (this.running !== null || this.written >= this.saved) return;
-      // A directory that is gone (removed on purpose: a reinstall, a test's cleanup) is not made again by a retry; the
-      // next save writes it as before.
-      this.running = fsp.access(path.dirname(this.file)).then(() => {
-        if (this.closed) { this.running = null; return; }
-        this.failed = this.written;
-        return this.drain();
-      }, (e: NodeJS.ErrnoException) => {
-        this.running = null;
-        // Gone (ENOENT): left alone. Anything else (the disk not answering): tried again later.
-        if (e.code !== "ENOENT") this.retryLater();
+      if (this.closed || this.running !== null || this.written >= this.saved) return;
+      // A directory that is gone (removed on purpose: a reinstall, a test's cleanup) is not made again by a retry of its
+      // own; a save or a settled() writes it as before. The check holds nothing: a save or a settled() that arrives
+      // while it is under way starts its drain at once, exactly as with no retry pending.
+      this.access(path.dirname(this.file)).then(() => this.retryNow(), (e: NodeJS.ErrnoException) => {
+        // Anything but ENOENT (the disk not answering): tried again later.
+        if (e?.code !== "ENOENT") this.retryLater();
       });
     }, ms);
     this.retryTimer.unref?.();

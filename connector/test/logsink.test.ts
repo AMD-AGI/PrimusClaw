@@ -78,6 +78,21 @@ describe("lineSink", () => {
   });
 });
 
+describe("lineSink, a last line", () => {
+  test("a forced line tries the descriptor at once, within the pause", () => {
+    let t = 0;
+    let failing = true;
+    const written: string[] = [];
+    const write = lineSink({ fd: 2, now: () => t, writeFd: (_fd, d) => { if (failing) throw edquot(); written.push(d); } });
+    write("held");
+    failing = false;
+    t += 1_000; // well within RETRY_PRIMARY_MS
+    write("fatal: boom", true);
+    assert.match(written[0]!, /the last 1 line\(s\) follow/);
+    assert.deepEqual(written.slice(1), ["held\n", "fatal: boom\n"]);
+  });
+});
+
 describe("a connector whose stdout and stderr cannot be written", () => {
   test("stays up and online", { skip: !fs.existsSync("/dev/full") && "no /dev/full" }, async () => {
     // /dev/full fails every write with ENOSPC, as a file at its quota fails with EDQUOT; Node writes to both the same
