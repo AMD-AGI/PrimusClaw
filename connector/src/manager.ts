@@ -61,12 +61,14 @@ export class SessionManager {
    * Commands of one session run one after another; sessions run side by side.
    * `handled` is called exactly once, when the command counts as carried out: for most that is when the
    * handler returns; for a prompt it is when the prompt reaches the adapter (see Session.enqueuePrompt).
+   * `now`: run at once, not after the session's earlier commands (a `cancel` or `close` that must not wait behind a command whose
+   * confirmation with Claw is still being asked, connector.ts `confirmLive`); the session's later commands still follow its chain.
    */
-  handle(cmd: Command, handled: () => void = () => {}, mayRun?: MayRun): Promise<void> {
+  handle(cmd: Command, handled: () => void = () => {}, mayRun?: MayRun, now = false): Promise<void> {
     const sid = cmd.session_id;
     let done = false;
     const once = () => { if (!done) { done = true; handled(); } };
-    const prev = this.chains.get(sid) ?? Promise.resolve();
+    const prev = now ? Promise.resolve() : this.chains.get(sid) ?? Promise.resolve();
     // `mayRun` (connector.ts `gateFor`) is asked in the session's turn, so what comes after it waits for the answer; refused, the
     // command is handled without running. A prompt carries it on and asks again when it reaches the agent (Session.enqueuePrompt).
     const next = prev.then(async () => {
@@ -79,6 +81,7 @@ export class SessionManager {
       this.env.audit.record("command_failed", { type: cmd.type, session_id: sid, cmd_id: cmd.cmd_id, error: errMessage(e).slice(0, 300) });
       once();
     });
+    if (now) return next;
     this.chains.set(sid, next);
     void next.finally(() => { if (this.chains.get(sid) === next) this.chains.delete(sid); });
     return next;

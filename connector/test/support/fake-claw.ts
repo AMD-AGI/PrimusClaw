@@ -71,6 +71,11 @@ export class FakeClaw {
   readonly confirmBodies: Array<{ cmd_id: string; body: any }> = [];
   /** Whether `POST .../commands/:cmd_id/confirm` exists; false is a Claw from before it (404 from the router, not `not_found`). */
   confirmRoute = true;
+  /**
+   * The network holds what the next command stream's first frames (its `ready` and the commands sent on connect) carry for this
+   * long: they are made (and stamped) at once, and written this much later.
+   */
+  streamDelayMs = 0;
   /** Answer the next N confirmations with 503 (Claw, or the network to it, not there yet). */
   failConfirms = 0;
   /** Hold every confirmation's answer until `releaseConfirms` (a slow Claw). */
@@ -271,7 +276,13 @@ export class FakeClaw {
       case "commands": {
         this.streamHeaders.push(req.headers);
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-        res.write(`event: ready\ndata: ${JSON.stringify({ v: 1, connector_id: this.connectorId, server_time: new Date().toISOString() })}\n\n`);
+        const delay = this.streamDelayMs;
+        this.streamDelayMs = 0;
+        const held: string[] = [];
+        let released = delay <= 0;
+        const write = (chunk: string) => { if (!released) held.push(chunk); else res.write(chunk); };
+        if (!released) setTimeout(() => { released = true; if (!res.destroyed) for (const c of held) res.write(c); }, delay);
+        write(`event: ready\ndata: ${JSON.stringify({ v: 1, connector_id: this.connectorId, server_time: new Date().toISOString() })}\n\n`);
         this.streams.add(res);
         res.on("close", () => { this.streams.delete(res); this.wake(); });
         let sent = 0;
@@ -282,12 +293,12 @@ export class FakeClaw {
           for (const c of this.commands) {
             if (c.seq <= this.cursor || c.seq <= sent) continue;
             sent = c.seq;
-            res.write(frame(c));
+            write(frame(c));
           }
         };
         // Everything still held is sent on every connect, in order; a cursor in the heartbeat is what forgets one.
-        for (const c of this.commands) if (c.seq > this.cursor) { sent = c.seq; res.write(frame(c)); }
-        const pinger = setInterval(() => { if (!this.muted) res.write(`event: ping\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`); }, this.pingMs);
+        for (const c of this.commands) if (c.seq > this.cursor) { sent = c.seq; write(frame(c)); }
+        const pinger = setInterval(() => { if (!this.muted) write(`event: ping\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`); }, this.pingMs);
         const poller = setInterval(pump, 10);
         res.on("close", () => { clearInterval(pinger); clearInterval(poller); });
         return;

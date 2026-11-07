@@ -1633,13 +1633,16 @@ describe("remote agents", { skip }, () => {
       const refused = (await q("SELECT detail FROM claw_remote_audit WHERE action = 'command.refused_late' ORDER BY id")).rows.map((r) => [r.detail.cmd_id, r.detail.status]);
       // Only commands Claw holds are audited: an id it never issued (or no longer holds) writes nothing, so the route cannot fill the trail.
       assert.deepEqual(refused, [[p1.cmd_id, "cancelled"], [p1.cmd_id, "expired"], [p1.cmd_id, "expired"]]);
-      // A session its machine reported closed: a prompt queued before that is refused as such.
+      // A session its machine reported closed.
       const sid3 = await session("u1", cid);
       assert.equal((await stream.nextEvent("command")).json().session_id, sid3);
       assert.equal((await as("u1").post(`/v1/remote-agents/sessions/${sid3}/commands`, { type: "prompt", text: "ls" })).status, 202);
       const p4 = (await stream.nextEvent("command")).json();
       assert.equal((await post("u1", cid, [ev(sid3, "session_closed", { reason: "adapter_exited" })])).status, 200);
-      assert.equal((await confirm(p4.cmd_id)).body.data.status, "session_closed");
+      // Its machine closed it: the prompt queued before is deleted with the session's other acting commands, so it is never sent
+      // again and, asked about, it is `gone` (the connector drops it and says so either way).
+      assert.deepEqual((await q("SELECT type FROM claw_remote_commands WHERE session_id = $1", [sid3])).rows, []);
+      assert.equal((await confirm(p4.cmd_id)).body.data.status, "gone");
       assert.ok((await q("SELECT detail FROM claw_remote_audit WHERE action = 'command.confirmed'")).rows.some((r) => r.detail.cmd_id === p1.cmd_id), "a live answer is recorded");
       // The machine is removed: whatever it still holds in a buffer is answered 401 revoked, which stops it.
       const sid2 = await session("u1", cid);

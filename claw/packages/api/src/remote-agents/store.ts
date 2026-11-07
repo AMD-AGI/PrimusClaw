@@ -822,6 +822,8 @@ export async function ingestEvents(
     }
     if (closed.size) {
       await q("UPDATE claw_remote_sessions SET status = 'closed' WHERE session_id = ANY($1::uuid[])", [[...closed]]);
+      // Its machine closed it: what is still queued that would make its agent act is never sent (it would only be refused there).
+      await dropActingCommandsOf(q, [...closed]);
     }
     const acked: Record<string, number> = {};
     const answered = [...new Set(accepted.map((e) => e.session_id))];

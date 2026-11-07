@@ -171,7 +171,10 @@ const OLD_CONFIRM_ATTEMPTS = 4;
  * Claw answered 404 with something other than its own `not_found` (which says this connector is not the caller's): the confirm
  * route does not exist there, a Claw from before it. The connector then does as it did before that route: it runs the command.
  */
-const isRouteMissing = (e: unknown): boolean => e instanceof HttpError && e.status === 404 && e.code !== "not_found";
+const isRouteMissing = (e: unknown): boolean => e instanceof HttpError && (
+  (e.status === 404 && e.code !== "not_found")
+  // A Claw from before the route, asked with a paired connector's grant: it refuses a path it does not know as a connector route.
+  || (e.status === 403 && e.code === "connector_grant_not_accepted"));
 
 /** What to do about 409 `connector_limit_reached`, for the log, `status` and the run's own output. */
 export const CONNECTOR_LIMIT_HINT = "Claw already holds the most connectors one person may have, so it will not register this machine: "
@@ -328,6 +331,13 @@ export class Connector {
    */
   private clockOffsetMs: number | null = null;
   private clockSamples: number[] = [];
+  /**
+   * The confirmations being asked, by session and command (`confirmLive`): a `close` of the session ends every one of them, and
+   * a `cancel` those of its prompts, at once (they are dropped and said so), instead of waiting behind them.
+   */
+  private readonly asking = new Map<string, Map<string, { type: string; ctl: AbortController }>>();
+  /** When the command stream was last asked for (monotonic): a `ready` that takes long to come was held in the network. */
+  private streamAskedAt = 0;
   /** When the heartbeat in flight was sent (monotonic), or null. */
   private hbSince: number | null = null;
   /** The heartbeat in flight was seen late (`tick`). */
@@ -791,6 +801,8 @@ export class Connector {
       case "ready":
         this.resetClock(); // a new stream: its replica's clock, measured afresh
         this.observeClock(f, "server_time");
+        // A `ready` that came late was held back, and so were the frames right behind it, which its clock would make look prompt.
+        if (!reconnect && performance.now() - this.streamAskedAt > this.timing.transitMs) this.netTrouble("ready_late");
         // A stream opened again after one was lost (or ended): frames may have been held in the network meanwhile, and the
         // `close` of a session may be among those sent again. Commands read now, and those waiting to act, are confirmed.
         if (reconnect) this.netTrouble("reconnect");
@@ -830,10 +842,24 @@ export class Connector {
     // Not awaited: the stream must keep being read while a slow command (starting an adapter) runs.
     // The command counts as handled when the manager says so (a prompt: when it reaches the adapter), and
     // only then can the cursor sent to the server pass it. A late one runs only if Claw says it is still live.
+    // A cancel or close is never held up by a confirmation still being asked in its session: that ends (a close: every one; a
+    // cancel: those of prompts, as a cancel drops queued prompts), and the cancel or close runs at once.
+    const now = ENDING_COMMANDS.has(cmd.type) && this.endAsking(cmd.session_id, cmd.type);
     void this.manager.handle(cmd, () => {
       this.ledger.end(seq, cmd.cmd_id);
       this.writeIdentity();
-    }, gate);
+    }, gate, now);
+  }
+
+  /** Ends the confirmations being asked in session `sid` that a `close` or `cancel` makes moot; whether any was being asked. */
+  private endAsking(sid: string, type: string): boolean {
+    const asking = this.asking.get(sid);
+    if (!asking?.size) return false;
+    for (const a of asking.values()) {
+      if (type === "close") a.ctl.abort("session_closed");
+      else if (a.type === "prompt") a.ctl.abort("cancelled");
+    }
+    return true;
   }
 
   /**
@@ -968,7 +994,17 @@ export class Connector {
       this.writeIdentity();
       await this.identityOut.settled(STATE_WRITE_WAIT_MS);
     }
-    const verdict = await this.askLive(cmd, why, receivedOld);
+    const ended = new AbortController();
+    const inSession = this.asking.get(cmd.session_id) ?? new Map<string, { type: string; ctl: AbortController }>();
+    this.asking.set(cmd.session_id, inSession);
+    inSession.set(cmd.cmd_id, { type: cmd.type, ctl: ended });
+    let verdict: Verdict;
+    try {
+      verdict = await this.askLive(cmd, why, receivedOld, ended.signal);
+    } finally {
+      inSession.delete(cmd.cmd_id);
+      if (!inSession.size && this.asking.get(cmd.session_id) === inSession) this.asking.delete(cmd.session_id);
+    }
     if (verdict !== "keep") { this.confirmFirst.delete(cmd.cmd_id); this.writeIdentity(); }
     return verdict;
   }
@@ -979,16 +1015,17 @@ export class Connector {
    * expired anyway): the command waits in its session meanwhile. `receivedOld` goes with the question: Claw calls a command
    * `expired` only when it came late, never one delivered in time that waited on this machine (queued behind a long turn).
    */
-  private async askLive(cmd: Command, why: Lateness, receivedOld: boolean): Promise<Verdict> {
+  private async askLive(cmd: Command, why: Lateness, receivedOld: boolean, ended: AbortSignal): Promise<Verdict> {
     let status: string | null = null;
     let error = "";
     let unsupported = false;
     const began = performance.now();
     for (let attempt = 0; status === null; attempt++) {
       if (this.revoked) { status = "connector_revoked"; break; }
-      if (this.ctl.signal.aborted) break;
+      if (this.ctl.signal.aborted || ended.aborted) break;
+      const sig = AbortSignal.any([this.ctl.signal, ended]);
       try {
-        status = await this.d.client.confirmCommand(this.cid, cmd.cmd_id, { why, received_late: receivedOld });
+        status = await this.d.client.confirmCommand(this.cid, cmd.cmd_id, { why, received_late: receivedOld }, sig);
       } catch (e) {
         if (this.isRevocation(e)) { status = "connector_revoked"; void this.onRevoked(e); break; }
         error = errMessage(e);
@@ -998,12 +1035,14 @@ export class Connector {
         const left = receivedOld ? (attempt + 1 < OLD_CONFIRM_ATTEMPTS ? Infinity : 0) : this.timing.confirmRetryMs - (performance.now() - began);
         if (left <= 0) break;
         if (attempt === 0) this.d.log.warn("Claw cannot be asked yet whether a command received late may run; it waits and is asked again", { type: cmd.type, why, error });
-        await sleep(Math.min(left, backoffMs(attempt, this.timing.backoffMinMs, this.timing.backoffMaxMs)), this.ctl.signal).catch(() => undefined);
+        await sleep(Math.min(left, backoffMs(attempt, this.timing.backoffMinMs, this.timing.backoffMaxMs)), sig).catch(() => undefined);
       }
     }
     const seq = Number.isSafeInteger(cmd.cmd_seq) ? cmd.cmd_seq : undefined;
-    // Revoked or stopping while the answer was on its way: not run, whatever Claw said before that.
+    // Revoked or stopping while the answer was on its way: not run, whatever Claw said before that. A close (or, for a prompt, a
+    // cancel) of its session that came meanwhile ends it too, as Claw would have answered.
     if (this.revoked) status = "connector_revoked";
+    else if (ended.aborted) { status = String(ended.reason); unsupported = false; error = ""; }
     else if (this.ctl.signal.aborted && (status === null || status === "live")) {
       this.d.audit.record("command_deferred", { type: cmd.type, cmd_id: cmd.cmd_id, cmd_seq: seq, why, reason: "stopping" });
       return "keep";
@@ -1033,6 +1072,7 @@ export class Connector {
     while (!this.ctl.signal.aborted) {
       if (this.paused) { await sleep(this.timing.pausePollMs, this.ctl.signal); continue; }
       this.streamCtl = new AbortController();
+      this.streamAskedAt = performance.now();
       try {
         const sig = AbortSignal.any([this.ctl.signal, this.streamCtl.signal]);
         let got = false;

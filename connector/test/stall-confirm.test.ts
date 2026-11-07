@@ -296,4 +296,40 @@ describe("a command whose frame was held in the network", () => {
     assert.deepEqual(h.claw.confirmBodies.map((c) => [c.cmd_id, c.body.why]), [["c-after-reconnect", "network"]]);
     assert.ok(h.audit().some((a) => a.kind === "network_trouble" && a.reason === "reconnect"));
   });
+
+  test("a first command stream whose `ready` the network held: what came behind it is confirmed (`network`, ready_late)", async () => {
+    // (A watchdog longer than the hold: the stream is not dropped and opened afresh, which would make its frames fresh.)
+    const timing = { transitMs: 1_000, watchdogMs: 10_000 };
+    const h = await Harness.create({ timing });
+    await h.stop();
+    h.claw.streamDelayMs = 1_800; // the ready and the session.new behind it are stamped now and arrive 1.8 s later
+    const sid = h.claw.newSession("fake", h.work);
+    h.connect({ timing });
+    h.start();
+    await h.claw.until("session_started", () => h.claw.eventsOf(sid, "session_started")[0]);
+    assert.deepEqual(h.claw.confirmBodies.map((c) => c.body.why), ["network"]);
+    assert.ok(h.audit().some((a) => a.kind === "network_trouble" && a.reason === "ready_late"));
+  });
+
+  for (const ending of ["close", "cancel"] as const) {
+    test(`a ${ending} of the session is not held up by a confirmation Claw does not answer: it runs at once, and the prompt is dropped and said so`, async () => {
+      const h = await Harness.create();
+      const sid = await h.newSession();
+      const flag = path.join(h.work, `never-${ending}`);
+      h.prompt(sid, `wait ${flag}`); // a running turn the cancel must interrupt
+      await h.claw.until("the turn running", () => h.adapterLog().some((l) => l.prompt === `wait ${flag}`));
+      h.claw.failConfirms = 1_000; // no answer, for the 10 minutes the connector would keep asking
+      h.prompt(sid, "late one", { sent_at: Date.now() - 10_000, cmd_id: `c-${ending}` });
+      await h.claw.until("the confirmation being asked", () => h.claw.confirmAsked.includes(`c-${ending}`));
+      const t0 = Date.now();
+      h.claw.issue(ending, sid);
+      const rejected = await h.claw.until("the prompt refused", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_id === `c-${ending}`));
+      assert.equal(rejected.data.status, ending === "close" ? "session_closed" : "cancelled");
+      if (ending === "close") await h.claw.until("the session closed", () => h.claw.eventsOf(sid, "session_closed")[0]);
+      else await h.claw.until("the running turn cancelled", () => h.turnEnds(sid).find((e) => e.data.stopReason === "cancelled"));
+      assert.ok(Date.now() - t0 < 5_000, `at once, not after the retries: ${Date.now() - t0} ms`);
+      assert.equal(h.adapterLog().some((l) => l.prompt === "late one"), false);
+    });
+  }
 });
+
