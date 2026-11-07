@@ -230,30 +230,62 @@ async function announce(stored: Stored, deps: SayDeps, turnMessageId?: string, h
 export async function publishSayEvent(
   sessionId: string, sayId: string, payload: AssistantSayPayload | WorkItemNeedsYouPayload, deps: SayDeps, turnMessageId?: string,
 ): Promise<void> {
+  // Shown in a session that is still there is what tells a user with no channel (the silent sweep's `told`): the message is claimed
+  // for the session first, so it is published there at most once whoever else tries (`reshowFallback`, another replica), and the claim
+  // is let go when the publish fails. A message another publish claimed is not published again. A session deleted meanwhile is read
+  // by nobody: published unrecorded, as is everything when the claim cannot be made at all.
+  let claimed = false;
   try {
-    await (deps.publishSessionEvent ?? publishEvent)(sessionId, {
-      type: "AssistantSay",
-      session_id: sessionId,
-      say_id: sayId,
-      ...(turnMessageId ? { turn_message_id: turnMessageId } : {}),
-      text: payload.text,
-      ...(payload.item ? { item: payload.item } : {}),
-      ...(payload.type === "assistant.say" && payload.sources ? { sources: payload.sources } : {}),
-      ...(payload.type === "assistant.say" && payload.suggested_replies ? { suggested_replies: payload.suggested_replies } : {}),
-      // What the message puts to the person to press, as a channel gets it: a web client, and an evaluation reading the session,
-      // must see the card the channel draws, not only its words.
-      ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
-      ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
-      ...(payload.type === "assistant.say" && payload.files ? { files: payload.files } : {}),
-      ...(payload.type === "assistant.say" && payload.amends ? { amends: payload.amends } : {}),
-      ...(payload.type === "assistant.say" && payload.replaces ? { replaces: payload.replaces } : {}),
-      fallback: payload.type === "work_item.needs_you",
-      ts: Date.parse(payload.occurred_at),
-    });
+    claimed = ((await db.query(
+      `UPDATE claw_assistant_says SET session_id = $2
+        WHERE say_id = $1 AND session_id IS NULL
+          AND EXISTS (SELECT 1 FROM claw_sessions WHERE session_id = $2 AND deleted_at IS NULL)`,
+      [sayId, sessionId],
+    )).rowCount ?? 0) > 0;
+    if (!claimed && (await db.query(
+      "SELECT 1 FROM claw_assistant_says WHERE say_id = $1 AND session_id IS NOT NULL", [sayId],
+    )).rowCount) return;
+  } catch (err) {
+    logger.warn({ err, sayId }, "assistant.say_shown_record_failed");
+  }
+  try {
+    await sendSayEvent(sessionId, sayId, payload, deps, turnMessageId);
   } catch (err) {
     // The message is stored and queued; a web client that missed the live event reads it later.
     logger.error({ err, sayId }, "assistant.say_event_publish_failed");
+    if (claimed) await releaseShown(sayId, sessionId);
   }
+}
+
+/** A claim to have shown the message in the session, let go: nothing was shown. */
+async function releaseShown(sayId: string, sessionId: string): Promise<void> {
+  await db.query("UPDATE claw_assistant_says SET session_id = NULL WHERE say_id = $1 AND session_id = $2", [sayId, sessionId])
+    .catch((err) => logger.error({ err, sayId }, "assistant.say_shown_release_failed"));
+}
+
+/** The event itself; throws when it was not published. */
+async function sendSayEvent(
+  sessionId: string, sayId: string, payload: AssistantSayPayload | WorkItemNeedsYouPayload, deps: SayDeps, turnMessageId?: string,
+): Promise<void> {
+  await (deps.publishSessionEvent ?? publishEvent)(sessionId, {
+    type: "AssistantSay",
+    session_id: sessionId,
+    say_id: sayId,
+    ...(turnMessageId ? { turn_message_id: turnMessageId } : {}),
+    text: payload.text,
+    ...(payload.item ? { item: payload.item } : {}),
+    ...(payload.type === "assistant.say" && payload.sources ? { sources: payload.sources } : {}),
+    ...(payload.type === "assistant.say" && payload.suggested_replies ? { suggested_replies: payload.suggested_replies } : {}),
+    // What the message puts to the person to press, as a channel gets it: a web client, and an evaluation reading the session,
+    // must see the card the channel draws, not only its words.
+    ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
+    ...(payload.type === "assistant.say" && payload.confirm_write ? { confirm_write: payload.confirm_write } : {}),
+    ...(payload.type === "assistant.say" && payload.files ? { files: payload.files } : {}),
+    ...(payload.type === "assistant.say" && payload.amends ? { amends: payload.amends } : {}),
+    ...(payload.type === "assistant.say" && payload.replaces ? { replaces: payload.replaces } : {}),
+    fallback: payload.type === "work_item.needs_you",
+    ts: Date.parse(payload.occurred_at),
+  });
 }
 
 /** Where the unreachable-message warning goes: a seam, so a test can see which messages were warned about. */
@@ -675,6 +707,7 @@ function heldWriteText(item: ItemRow, params: Record<string, unknown> | null): s
  * user before the call got here. Not counted against the say limit.
  */
 export async function recordNeedsYouFallback(input: { itemId: string }, deps: SayDeps = {}): Promise<SayOutcome | null> {
+  await ensureLiveAssistant(input.itemId);
   const stored = await storeSettled(async (q, storeOne) => {
     const m = await needsYouMessage(q, input.itemId);
     return m ? storeOne(m) : null;
@@ -682,6 +715,39 @@ export async function recordNeedsYouFallback(input: { itemId: string }, deps: Sa
   if (!stored) return null;
   await announce(stored, deps);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
+}
+
+/**
+ * Show again, in the item's session, the system's message about its current need that was stored but shown in no session (its
+ * publish failed, or the user had no session then): the silent sweep's, for a user no channel tells (`silent-sweep.ts`). The same
+ * message, under the same id. At most once: the message is claimed for the session first (`session_id`, set only while unset), so of
+ * two sweeps only one publishes, and the claim is let go when the publish fails, for a later sweep to try again; an event the session's
+ * stream already holds (a publish whose claim was lost) is not published again. True when it is shown now.
+ */
+export async function reshowFallback(input: { itemId: string }, deps: SayDeps = {}): Promise<boolean> {
+  await ensureLiveAssistant(input.itemId);
+  const item = await loadItem((t, p) => db.query(t, p), input.itemId);
+  if (!item) return false;
+  const sayId = deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq));
+  const where = await itemSession((t, p) => db.query(t, p), item.item_id);
+  if (!where?.sessionId) return false;
+  const claimed = (await db.query(
+    `UPDATE claw_assistant_says SET session_id = $2
+      WHERE say_id = $1 AND fallback AND session_id IS NULL
+        AND EXISTS (SELECT 1 FROM claw_sessions WHERE session_id = $2 AND deleted_at IS NULL)
+      RETURNING text, created_at`,
+    [sayId, where.sessionId],
+  )).rows[0] as { text: string; created_at: Date } | undefined;
+  if (!claimed) return false;
+  const m: ToStore = { type: "work_item.needs_you", sayId, userId: item.user_id, sessionId: where.sessionId, text: claimed.text, item };
+  try {
+    if (!(await eventInSession(where.sessionId, sayId))) await sendSayEvent(where.sessionId, sayId, payloadOf(m, claimed.created_at), deps);
+    return true;
+  } catch (err) {
+    logger.error({ err, sayId }, "assistant.say_event_publish_failed");
+    await releaseShown(sayId, where.sessionId);
+    return false;
+  }
 }
 
 /** What the router is told when the system already told the user, in this turn, that the item they asked for started. */
@@ -707,6 +773,49 @@ export async function turnHandedOffReview(q: Querier, userId: string, messageId:
   )).rows.length > 0;
 }
 
+/** What a message about an item from a session the user deleted starts with: it is said in the session they have now, once. */
+export const MOVED_PREFIX_ZH = "（之前的对话里开始的事项）";
+export const MOVED_PREFIX_EN = "(From an earlier conversation) ";
+
+/**
+ * Where the system says something about an item on its own: the assistant session the item was started from. When the user deleted
+ * that session, the one that replaced it, and `moved`: the message says where the item came from. It is still said once (its id is
+ * the item's and the need's), and only when nothing told the user before (the silent sweep's `told`). An item made before its session
+ * was recorded goes to the current session, as before. A user with no assistant at all has only their channels (no session). Null when
+ * the user's assistant has no session that is still there: nobody would read it.
+ */
+async function itemSession(q: Querier, itemId: string): Promise<{ sessionId: string | null; moved: boolean } | null> {
+  const row = (await q(
+    `SELECT w.router_session_id AS own, a.session_id AS current,
+            EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = w.router_session_id AND s.deleted_at IS NULL) AS own_live,
+            EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = a.session_id AND s.deleted_at IS NULL) AS current_live
+       FROM claw_work_items w LEFT JOIN claw_assistants a ON a.user_id = w.user_id
+      WHERE w.item_id = $1`,
+    [itemId],
+  )).rows[0] as { own: string | null; current: string | null; own_live: boolean; current_live: boolean } | undefined;
+  if (!row) return null;
+  if (row.current === null) return { sessionId: null, moved: false };
+  if (row.own && row.own_live) return { sessionId: row.own, moved: false };
+  if (row.current && row.current_live) return { sessionId: row.current, moved: row.own !== null && row.own !== row.current };
+  return null;
+}
+
+/**
+ * Before the system says something about an item on its own: a user whose assistant session was deleted and not yet made again gets
+ * it made now, as their next visit would (`getOrCreateAssistant`), so the message has a session that is read. Otherwise it would be
+ * shown nowhere and, for a user with no channel, never be said.
+ */
+async function ensureLiveAssistant(itemId: string): Promise<void> {
+  const row = (await db.query(
+    `SELECT w.user_id, EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = a.session_id AND s.deleted_at IS NULL) AS live
+       FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id WHERE w.item_id = $1`,
+    [itemId],
+  )).rows[0] as { user_id: string; live: boolean } | undefined;
+  if (!row || row.live) return;
+  const { getOrCreateAssistant } = await import("./assistant.js");
+  await getOrCreateAssistant(row.user_id);
+}
+
 /** The system's message for an item that needs the user or was answered (`recordNeedsYouFallback`), or null when it is neither. */
 async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToStore, { type: "work_item.needs_you" }> | null> {
   const item = await loadItem(q, itemId);
@@ -718,18 +827,21 @@ async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToSt
         "SELECT summary FROM claw_work_item_events WHERE item_id = $1 AND kind = 'answer' ORDER BY id DESC LIMIT 1", [item.item_id],
       )).rows[0]?.summary as string | undefined) ?? ""
     : "";
-  const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id ?? null;
+  const where = await itemSession(q, item.item_id);
+  // No session is read: nothing is stored, so a later call (the sweep's, once a session exists) says it.
+  if (!where) return null;
   const params = answered ? null
     : ((await q("SELECT params FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0]?.params as Record<string, unknown> | null) ?? null;
   const zh = await personWritesChinese(q, item.user_id, item.title);
-  const text = answered
+  const said = answered
     ? (zh ? `#${item.seq} ${item.title}：${answer}` : `#${item.seq} "${item.title}": ${answer}`)
     : heldWriteText(item, params) ?? needsYouText(item, zh);
+  const text = where.moved ? `${zh ? MOVED_PREFIX_ZH : MOVED_PREFIX_EN}${said}` : said;
   return {
     type: "work_item.needs_you",
     sayId: deterministicEventId("work_item.needs_you", item.item_id, String(item.attention_seq)),
     userId: item.user_id,
-    sessionId,
+    sessionId: where.sessionId,
     text,
     item,
   };
@@ -856,7 +968,7 @@ export const ANSWERED_UNSAID_SQL = "w.board_state = 'done' AND w.outcome = 'answ
  * by its id -- `deterministicEventId("work_item.needs_you", item_id, attention_seq)`, computed here the same way -- and
  * `assistant.say` for every other say, a system notice about an item included.
  */
-const SAY_EVENT_TYPE_SQL = `CASE WHEN s.fallback AND s.item_id IS NOT NULL AND s.item_attention_seq IS NOT NULL
+export const SAY_EVENT_TYPE_SQL = `CASE WHEN s.fallback AND s.item_id IS NOT NULL AND s.item_attention_seq IS NOT NULL
              AND s.say_id = substr(encode(sha256(
                    convert_to('work_item.needs_you', 'UTF8') || '\\x00'::bytea || convert_to(s.item_id, 'UTF8')
                    || '\\x00'::bytea || convert_to(s.item_attention_seq::text, 'UTF8')), 'hex'), 1, 32)::uuid
