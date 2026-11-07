@@ -50,6 +50,14 @@ const MAX_SOCKETS = 256;
  * for a store several times slower than measured. The cost is more requests for
  * a large prefix, each of them small; the time to walk the whole prefix is the
  * same, because it is set by the keys and not by the pages.
+ *
+ * That holds for every page but the first of a recursive listing. MinIO serves
+ * a listing from a metadata cache filled by walking the drives, and the first
+ * page waits for the cache's first block of thousands of entries -- for a prefix
+ * smaller than that, the whole subtree -- however few keys it asked for: 161 s
+ * for a hundred keys of a 4,470-object workspace. A walk that has to finish on
+ * a deep prefix therefore lists a directory at a time, as the session delete
+ * does (deletePrefix in sessions/teardown.ts).
  */
 export const S3_LIST_PAGE_KEYS = 100;
 

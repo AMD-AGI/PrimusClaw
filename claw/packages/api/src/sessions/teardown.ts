@@ -223,27 +223,41 @@ function pastDeadline(deadline?: number): boolean {
 }
 
 /**
- * Delete everything under one prefix, a page at a time.
+ * Delete everything under one prefix, a directory at a time.
  *
- * Each page is deleted before the next is listed, rather than collecting every
- * key first. A workspace archive is written per turn, so a long session reaches
- * six figures of objects, and holding all of them costs memory in a request
- * handler for no benefit -- they are deleted one page later anyway. Safe to
- * interleave: a continuation token resumes after the last key returned, so
- * removing keys already listed does not disturb the walk.
+ * Walked with a delimiter, depth first, rather than as one flat listing. The
+ * reason is the store's and not the API's: MinIO answers a listing out of a
+ * metadata cache it fills by walking the drives, and the first page of a
+ * recursive listing waits for that cache's first block -- thousands of entries,
+ * so for any workspace smaller than that the whole subtree is read before a
+ * single key comes back, whatever `MaxKeys` asked for. Measured on production
+ * for a deleted session that never finished deleting: 4,470 objects in 978
+ * directories, a first hundred-key page of 161 s against a thirty-second
+ * request timeout, so every attempt failed on its first listing having deleted
+ * nothing, and failed the same way on every retry. A listing with a delimiter
+ * reads one directory; the same prefix walked that way took 979 listings, the
+ * slowest 7.5 s. What bounds a request is then the widest directory and not the
+ * whole workspace, which is a bound a session can only exceed by putting
+ * thousands of files side by side.
  *
- * The page boundary is where a deadline is honoured between listings. Inside a
- * page the delete batches honour it too: finishing a full page after the clock
- * has stopped is how an inline delete spends minutes in a request handler, and
- * how it overlaps a sweeper pass that thought it had the rest. Stopping
- * mid-page is still resumable -- the next attempt lists from the start and the
- * keys already gone are simply not returned.
+ * Each page's keys are deleted, and the subdirectories that page named are
+ * walked, before the next page of the same directory is asked for. Holding a
+ * directory's subdirectories until all of its pages were listed would let a
+ * pass spend its whole budget listing a level that holds only directories and
+ * stop having deleted nothing -- which the cleanup records as no progress and
+ * backs off, the stuck row again by another route. Walked this way, a pass
+ * reaches a file after one listing per level, and one cut short by the
+ * deadline has removed whole subtrees, so the next pass -- which lists from the
+ * top again -- finds less than this one did. MinIO drops a directory once its
+ * last object goes, so emptied subtrees are not even listed again. Safe to
+ * interleave for the same reason a flat walk was: a continuation token resumes
+ * after the last entry returned, so deleting entries already listed does not
+ * disturb it.
  *
- * The page is {@link S3_LIST_PAGE_KEYS} and not the API's thousand, because the
- * listing is the one request here whose duration grows with its answer: on a
- * store that lists slowly, a thousand-key page outlasts the client's request
- * timeout, the walk fails before its first delete, and a session with more
- * files than one such page can ever hold is never cleaned up at all.
+ * Every directory followed is a common prefix the store returned for a listing
+ * under `prefix`, so it extends `prefix`; one that does not, or that does not
+ * grow, is refused rather than followed. The prefix is the whole safety argument
+ * for this delete, and it is checked here rather than trusted.
  */
 async function deletePrefix(
   s3: S3Client,
@@ -253,23 +267,44 @@ async function deletePrefix(
 ): Promise<{ deleted: number; failed: number; complete: boolean }> {
   let deleted = 0;
   let failed = 0;
-  let token: string | undefined;
-  do {
+  /** A directory being walked: where its listing is, and the subdirectories its last page named. */
+  interface Frame { dir: string; token?: string; listed: boolean; below: string[] }
+  const stack: Frame[] = [{ dir: prefix, listed: false, below: [] }];
+  while (stack.length) {
+    const frame = stack[stack.length - 1];
+    const next = frame.below.shift();
+    if (next !== undefined) {
+      stack.push({ dir: next, listed: false, below: [] });
+      continue;
+    }
+    if (frame.listed && frame.token === undefined) {
+      stack.pop();
+      continue;
+    }
     if (pastDeadline(deadline)) return { deleted, failed, complete: false };
     const page = await s3.send(
       new ListObjectsV2Command({
-        Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: token, MaxKeys: S3_LIST_PAGE_KEYS,
+        Bucket: S3_BUCKET,
+        Prefix: frame.dir,
+        Delimiter: "/",
+        ContinuationToken: frame.token,
+        MaxKeys: S3_LIST_PAGE_KEYS,
       }),
     );
+    frame.listed = true;
+    frame.token = page.IsTruncated ? page.NextContinuationToken : undefined;
+    for (const common of page.CommonPrefixes ?? []) {
+      const sub = common.Prefix;
+      if (sub && sub.startsWith(frame.dir) && sub.length > frame.dir.length) frame.below.push(sub);
+    }
     const keys = (page.Contents ?? [])
       .map((obj) => obj.Key)
-      .filter((key): key is string => Boolean(key));
+      .filter((key): key is string => typeof key === "string" && key.startsWith(prefix));
     const outcome = await deleteObjects(s3, keys, sessionId, deadline);
     deleted += outcome.deleted;
     failed += outcome.failed;
     if (!outcome.complete) return { deleted, failed, complete: false };
-    token = page.IsTruncated ? page.NextContinuationToken : undefined;
-  } while (token);
+  }
   return { deleted, failed, complete: true };
 }
 
