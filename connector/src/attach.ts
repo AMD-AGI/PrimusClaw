@@ -418,7 +418,8 @@ export class AttachSupport {
       const out: Resumable = { ref: l.ref, title: l.title, cwd: l.cwd, updated_at: Math.floor(l.updatedAt / 1000), state };
       if (state === "live") {
         Object.assign(out, liveActivity(holders));
-        if (this.typesIntoTerminals() && holders.length > 0 && holders.every((e) => !e.foreign) && holders.some((e) => paneHint(e.pid))) out.input = "terminal";
+        // (a row of another pid domain does not stop typing: see `terminalPane`)
+        if (this.typesIntoTerminals() && holders.some((e) => !e.foreign && paneHint(e.pid))) out.input = "terminal";
       }
       return out;
     });
@@ -722,8 +723,14 @@ export class AttachSupport {
 
   /**
    * The tmux pane of the one local process of this user's, working inside the roots, that holds `ref` open: the terminal a
-   * message to it is typed into. Not when more than one process holds it (which one would get it?), when one of them is on
-   * another machine, or when it is not a tmux pane that this user's tmux server proves runs it (terminal-input.ts `findPane`).
+   * message to it is typed into. Not when more than one local process holds it (which one would get it?), or when it is not a
+   * tmux pane that this user's tmux server proves runs it (terminal-input.ts `findPane`).
+   *
+   * A registry row of another pid domain does not stop it. Such a row is a process on another machine sharing this Claude
+   * directory, or the leftover of a process that died with an earlier boot of this one (a dev container on a shared disk
+   * restarts, and Claude Code never removes the rows of processes killed with it), and nothing here can tell which. For
+   * typing it makes no difference: the message is typed into the local terminal, as the person at it would type it, so it adds
+   * no writer to the conversation. (Ending holders for a takeover still refuses such a row: `endHolders`.)
    */
   async terminalPane(ref: string): Promise<PaneLookup> {
     if (!this.typesIntoTerminals()) return { ok: false, why: "typing into a terminal is turned off for this agent (terminal_input = false)" };
@@ -731,8 +738,7 @@ export class AttachSupport {
     const want = ref.toLowerCase();
     let live: LiveEntry[];
     try { live = await this.liveEntries(); } catch (e) { return { ok: false, why: errMessage(e) }; }
-    const holders = live.filter((e) => e.sessionId.toLowerCase() === want);
-    if (holders.some((e) => e.foreign)) return { ok: false, why: "it is open on another machine that shares this Claude directory" };
+    const holders = live.filter((e) => e.sessionId.toLowerCase() === want && !e.foreign);
     const pids = [...new Set(holders.map((e) => e.pid))];
     if (pids.length !== 1) return { ok: false, why: pids.length ? `${pids.length} processes have it open` : "no process has it open" };
     const pid = pids[0]!;
