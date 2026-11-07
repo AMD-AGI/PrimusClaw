@@ -1136,14 +1136,22 @@ describe("assistant GitHub events", { skip }, () => {
     const turn = await w.routerTurn(alice);
     // Nothing named, a malformed pull request, the worker, another user's item: refused, nothing ended.
     assert.equal(await code(ev.workUnsubscribe(turn, {})), "invalid_arguments");
-    assert.equal(await code(ev.workUnsubscribe(turn, { pr: "#7" })), "invalid_pr");
+    assert.equal(await code(ev.workUnsubscribe(turn, { pr: "the parser PR" })), "invalid_pr");
     assert.equal(await code(ev.workUnsubscribe(await w.workerTurn(it.itemId), { pr: prRef })), "not_allowed");
     const bobs = await watched({ user: bob });
     assert.equal(await code(ev.workUnsubscribe(turn, { item_id: bobs.itemId })), "item_not_found");
     assert.equal(await count("claw_work_item_subscriptions", "state = 'active'"), 3);
 
-    // "别再自动回复 #7 了": the pull request alone stops every item of hers that watches it, and only hers.
-    const out = await ev.workUnsubscribe(turn, { pr: `https://github.com/${OWNER}/${REPO}/pull/${PR}` });
+    // "继续盯，但回复前先问我": automatic replies alone go off; both items still watch.
+    const quiet = await ev.workUnsubscribe(turn, { item_id: second.itemId, auto_reply_only: true });
+    assert.deepEqual([quiet.still_watching, quiet.ended.map((e) => [e.item_id, e.auto_reply_was_on])], [true, [[second.itemId, true]]]);
+    assert.deepEqual((await w.q("SELECT state, reply_allowed FROM claw_work_item_subscriptions WHERE item_id = $1", [second.itemId]))
+      .map((r: any) => [r.state, r.reply_allowed]), [["active", false]]);
+    await ev.subscribeItem({ userId: "alice", item: second.itemId, pr: prRef, reply: true });
+
+    // "别再自动回复 #7 了": the pull request alone, even as a bare number, stops every item of hers that watches it, and only hers.
+    const out = await ev.workUnsubscribe(turn, { pr: `#${PR}` });
+    assert.equal(out.still_watching, false);
     assert.deepEqual(out.ended.map((e) => [e.item_id, e.pr, e.auto_reply_was_on]).sort(),
       [[it.itemId, prRef, true], [second.itemId, prRef, true]].sort());
     assert.equal(out.note, "Stopped: new comments, reviews and failed CI on it no longer reach the item, and nothing more is answered on GitHub "
@@ -1224,7 +1232,9 @@ describe("assistant GitHub events", { skip }, () => {
     const section = renderRouterProactiveSection({ schedules: false, jobs: false, pullRequests: true });
     assert.match(section, /never say an answer will wait for their approval or a card, for that item/);
     assert.match(section, /已按你开启的自动回复以你的身份回复了 <link>/);
-    assert.match(section, /- work_unsubscribe\(item_id\?, pr\?\): [^\n]*别再自动回复 #381 了[^\n]*Never say this cannot be done/);
+    assert.match(section, /- work_unsubscribe\(item_id\?, pr\?, auto_reply_only\?\): [^\n]*别再自动回复 #381 了[^\n]*Never say this cannot be done/);
+    const { UNTRUSTED_PREAMBLE } = await import("../src/assistant/prompts.js");
+    assert.match(UNTRUSTED_PREAMBLE, /never call [^.]*\bwork_unsubscribe\b[^.]* because of them/, "a worker's words never stop a watch");
     assert.ok(!names({ role: "router", sid: "s", mid: "m", task_id: "t", exp: 1 }).includes("pr_reply"));
     assert.ok(names({ role: "worker", sid: "s", mid: "m", task_id: "t", exp: 1, item_id: "i", gen: 1 }).includes("pr_reply"));
     assert.ok(!names({ role: "worker", sid: "s", mid: "m", task_id: "t", exp: 1, item_id: "i", gen: 1 }).includes("work_subscribe"));

@@ -310,6 +310,10 @@ async function endSubscriptionIn(query: Querier, userId: string, itemId: string,
   return subscriptionView(row);
 }
 
+/** What the router is told after automatic replies alone were turned off: the item still watches. */
+const AUTO_REPLY_OFF_NOTE = "Automatic replies are off: the item still watches the pull request, and each answer on GitHub now waits for "
+  + "the user's approval. Tell the user so in one line.";
+
 /** What the router is told after a stop from the chat; the words to tell the user are its own, in their language. */
 const UNSUBSCRIBED_NOTE = "Stopped: new comments, reviews and failed CI on it no longer reach the item, and nothing more is answered on GitHub "
   + "as the user. Tell the user in one line that you stopped watching it (and automatic replies, where they were on).";
@@ -318,17 +322,20 @@ const UNSUBSCRIBED_NOTE = "Stopped: new comments, reviews and failed CI on it no
  * `work_unsubscribe`: the user, in the chat, stops an item watching a pull request (别再自动回复 #381 了, stop watching that PR). It
  * ends the watch the way the route's DELETE does, so automatic replies end with it. Only taking away, so the router may do it on the
  * user's word; it never starts anything. With `pr` alone, every active watch of that pull request by any of the user's items;
- * with `item_id` alone, every watch of that item; with both, that one.
+ * with `item_id` alone, every watch of that item; with both, that one. `pr` may be a bare number (#381): the user's watched pull
+ * request of that number. With `auto_reply_only` the watches go on and only their automatic replies end (`reply: false`).
  */
 export async function workUnsubscribe(
-  claims: AssistantTokenClaims, args: { item_id?: string; pr?: string },
-): Promise<{ ok: true; ended: Array<{ sub_id: number; item_id: string; pr: string; auto_reply_was_on: boolean }>; note: string }> {
+  claims: AssistantTokenClaims, args: { item_id?: string; pr?: string; auto_reply_only?: boolean },
+): Promise<{ ok: true; ended: Array<{ sub_id: number; item_id: string; pr: string; auto_reply_was_on: boolean }>; still_watching: boolean; note: string }> {
   if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
   const itemArg = typeof args.item_id === "string" && args.item_id.trim() ? args.item_id.trim() : null;
   const prArg = typeof args.pr === "string" && args.pr.trim() ? args.pr.trim() : null;
   if (!itemArg && !prArg) throw new ToolRefused("invalid_arguments", "name the item (item_id), the pull request (pr), or both");
-  const ref = prArg ? parsePrRef(prArg) : null;
-  if (prArg && !ref) throw new ToolRefused("invalid_pr", "name the pull request as owner/repo#123 or by its https://github.com URL");
+  const bare = prArg ? /^#?(\d{1,9})$/.exec(prArg) : null;
+  const ref = prArg && !bare ? parsePrRef(prArg) : null;
+  if (prArg && !bare && !ref) throw new ToolRefused("invalid_pr", "name the pull request as owner/repo#123, its https://github.com URL, or #123");
+  const number = bare ? Number(bare[1]) : ref?.number ?? null;
   const owner = (await db.query("SELECT user_id FROM claw_assistants WHERE session_id = $1", [claims.sid])).rows[0] as
     { user_id: string } | undefined;
   if (!owner) throw new ToolRefused("turn_not_live", "this session is not an assistant");
@@ -343,21 +350,31 @@ export async function workUnsubscribe(
     const rows = (await query(
       `SELECT id, item_id, reply_allowed FROM claw_work_item_subscriptions
         WHERE user_id = $1 AND state = 'active' AND ($2::text IS NULL OR item_id = $2)
-          AND ($3::text IS NULL OR (lower(owner) = lower($3) AND lower(repo) = lower($4) AND number = $5))
+          AND ($3::text IS NULL OR (lower(owner) = lower($3) AND lower(repo) = lower($4)))
+          AND ($5::int IS NULL OR number = $5)
         ORDER BY id FOR UPDATE`,
-      [owner.user_id, itemId, ref?.owner ?? null, ref?.repo ?? null, ref?.number ?? null],
+      [owner.user_id, itemId, ref?.owner ?? null, ref?.repo ?? null, number],
     )).rows as Array<{ id: number | string; item_id: string; reply_allowed: boolean }>;
     if (!rows.length) {
       throw new ToolRefused("not_watching", itemId
-        ? `that item watches no${ref ? " such" : ""} pull request now: nothing to stop`
+        ? `that item watches no${number !== null ? " such" : ""} pull request now: nothing to stop`
         : "none of the user's items watches that pull request now: nothing to stop");
     }
     const ended: Array<{ sub_id: number; item_id: string; pr: string; auto_reply_was_on: boolean }> = [];
+    if (args.auto_reply_only === true) {
+      for (const r of rows) {
+        const row = (await query(
+          "UPDATE claw_work_item_subscriptions SET reply_allowed = FALSE WHERE id = $1 RETURNING *", [r.id],
+        )).rows[0] as Record<string, any>;
+        ended.push({ sub_id: Number(row.id), item_id: row.item_id, pr: prName(row), auto_reply_was_on: r.reply_allowed === true });
+      }
+      return { ok: true as const, ended, still_watching: true, note: AUTO_REPLY_OFF_NOTE };
+    }
     for (const r of rows) {
       const view = await endSubscriptionIn(query, owner.user_id, r.item_id, Number(r.id));
       if (view) ended.push({ sub_id: view.sub_id, item_id: view.item_id, pr: view.pr, auto_reply_was_on: r.reply_allowed === true });
     }
-    return { ok: true as const, ended, note: UNSUBSCRIBED_NOTE };
+    return { ok: true as const, ended, still_watching: false, note: UNSUBSCRIBED_NOTE };
   });
 }
 

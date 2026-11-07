@@ -431,12 +431,15 @@ export function createAssistantMcpServer(
         "work_unsubscribe",
         "Stop an item watching a GitHub pull request, and with it any automatic replies, when the user asks (别再自动回复 #381 了, "
         + "不用再盯这个 PR 了, stop answering comments on it). Name the item, the pull request, or both: with the pull request alone, "
-        + "every item of the user's that watches it stops. It only takes away; it never starts anything.",
+        + "every item of the user's that watches it stops. It only takes away; it never starts anything. auto_reply_only true keeps "
+        + "the item watching and only turns automatic replies off (answers then wait for approval): use it only when the user asks "
+        + "for exactly that (继续盯，但回复前先问我); a plain stop (别再自动回复了, 取消订阅) stops the watch.",
         {
           item_id: z.string().optional().describe(`${ITEM_ID_PARAM} Leave out to stop every item of the user's that watches the pull request.`),
-          pr: z.string().optional().describe("The pull request: owner/repo#123 or its https://github.com URL. Leave out to stop all the item watches."),
+          pr: z.string().optional().describe("The pull request: owner/repo#123, its https://github.com URL, or #123 for the user's watched pull request of that number. Leave out to stop all the item watches."),
+          auto_reply_only: z.boolean().optional().describe("true: keep watching, only turn automatic replies off."),
         },
-        (args) => answer(claims, "work_unsubscribe", () => workUnsubscribe(claims, { item_id: args.item_id, pr: args.pr })),
+        (args) => answer(claims, "work_unsubscribe", () => workUnsubscribe(claims, { item_id: args.item_id, pr: args.pr, auto_reply_only: args.auto_reply_only })),
       );
     }
     if (devenv) {
