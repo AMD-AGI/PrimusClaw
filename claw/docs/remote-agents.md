@@ -45,7 +45,10 @@ session), or an access token from the identity provider (see
 Command frames are `event: command` with `data: {v, cmd_id, type, session_id, ...}`.
 Delivery is at least once: a connector deduplicates on `cmd_id` (or skips `cmd_seq` values it has handled). Types: `session.new`
 (`agent_id`, `cwd`, `mode`, and `resume_ref` when the user chose an existing session), `prompt` (`text`), `cancel`, `set_mode` (`mode_id`),
-`resume`, `close`, `decision` (`action_id`, `option_id`, `by`). Nothing else is ever sent.
+`resume`, `close`, `decision` (`action_id`, `option_id`, `by`), `withdraw`. Nothing else is ever sent. `withdraw` takes back the prompts
+that have not started (waiting for a terminal, or queued behind a running turn) and touches nothing that runs: no Escape, no cancel,
+no permission answered. A connector that understands it says `withdraw: true` in the agent's capabilities; a client sends it only
+then (an older connector drops it unread), for example when a chat lets a session go while its message still waits.
 
 Events are stored once per `(session_id, seq)`; a repeat is ignored and a gap is
 allowed. A malformed event is refused alone and named in `rejected`, so one bad
@@ -62,7 +65,8 @@ The connector in this repository names the prompt a turn ends: `turn_end` carrie
 `data.cmd_id`, the `cmd_seq` (the frame's `id:`) and `cmd_id` of the `prompt` command that started the turn, both
 `null` for the end a `cancel` posts when no turn was running. A prompt that never runs gets no `turn_end`; it is
 refused by name instead, as `command_rejected` (`data.type: "prompt"`, `data.cmd_id`, `data.cmd_seq`,
-`data.reason`), and the prompts a `cancel` drops from the queue are refused this way with `reason: "cancelled"`.
+`data.reason`), and the prompts a `cancel` drops from the queue are refused this way with `reason: "cancelled"` (those a `withdraw`
+takes back with `reason: "withdrawn"`).
 Claw matches on `cmd_seq`: a `cmd_id` may be a client's `Idempotency-Key`, which the credential masking of
 events can change, and a number it never does. A connector from before this change sends neither in `turn_end`,
 and its dropped prompts are not refused.
@@ -330,7 +334,7 @@ told again once (`claw_remote_terminal_waits`).
 
 A new session, `prompt`, `set_mode` and `resume` are refused with `409 connector_offline` while
 the connector is offline, so a prompt nobody could see being waited on cannot run later.
-`cancel`, `close` and `decision` are queued, since they are safe to deliver late. A connector
+`cancel`, `close`, `decision` and `withdraw` are queued, since they are safe to deliver late. A connector
 whose command stream has just ended still counts as online for 45 s (`STREAM_GRACE_SECS`)
 while its heartbeat is fresh: a Claw release, an ingress restart or a token refresh ends every
 stream and the connector opens the next within seconds, so what is asked in that gap is queued

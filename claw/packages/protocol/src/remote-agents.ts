@@ -335,7 +335,7 @@ export function parseSessionNew(body: unknown): Parsed<RemoteSessionNew> {
  * remote shell, so a type that is not listed is refused at the server and
  * dropped (and audited) at the connector.
  */
-export const REMOTE_COMMAND_TYPES = ["prompt", "cancel", "set_mode", "resume", "close", "decision"] as const;
+export const REMOTE_COMMAND_TYPES = ["prompt", "cancel", "set_mode", "resume", "close", "decision", "withdraw"] as const;
 export type RemoteCommandType = (typeof REMOTE_COMMAND_TYPES)[number];
 
 export interface RemoteCommandSpec {
@@ -384,6 +384,18 @@ export const REMOTE_COMMANDS: Record<RemoteCommandType, RemoteCommandSpec> = {
   },
   resume: {
     needsOnline: true,
+    closesSession: false,
+    parse: () => ({ ok: true, value: {} }),
+    audit: () => ({}),
+  },
+  /**
+   * Take back the prompts that have not started (waiting for a terminal to be free, or queued behind a running turn): each is refused
+   * by name (`withdrawn`). Nothing that runs is touched: no Escape into a terminal, no cancel of the turn, no permission answered. A
+   * chat that lets a session go while its message still waits sends it (a connector says it can with the agent capability
+   * `withdraw`); safe to deliver late, like a cancel.
+   */
+  withdraw: {
+    needsOnline: false,
     closesSession: false,
     parse: () => ({ ok: true, value: {} }),
     audit: () => ({}),

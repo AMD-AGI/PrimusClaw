@@ -1265,6 +1265,21 @@ export class Session {
   }
 
   /**
+   * `withdraw`: take back the prompts that have not started, and nothing else. The ones waiting for the terminal to be free (never
+   * typed) and the ones queued behind a running turn are each refused by name (`withdrawn`, with its `cmd_id` and `cmd_seq`); a turn
+   * that runs (typed into the terminal, or in the adapter) goes on untouched: no Escape, no session/cancel, no permission answered.
+   * A chat that lets the session go while its message still waits sends this, so the person's terminal is never interrupted.
+   */
+  withdraw(): void {
+    const terminal = this.terminalQueue.length;
+    if (terminal) this.dropTerminalQueue("withdrawn");
+    const dropped = this.queue.map((q) => [q.cmdId, q.cmdSeq] as const);
+    this.dropQueued();
+    for (const [cmdId, cmdSeq] of dropped) this.rejectCommand("prompt", cmdId, "withdrawn", cmdSeq);
+    this.audit("withdrawn", { queued_dropped: terminal + dropped.length, terminal: terminal > 0 });
+  }
+
+  /**
    * `cancel`: stop the turn, drop what was queued, answer every waiting permission request `cancelled`. Each prompt dropped
    * unrun is refused by name (`command_rejected`, reason `cancelled`, with its `cmd_id` and `cmd_seq`): it never gets a `turn_end`.
    */
