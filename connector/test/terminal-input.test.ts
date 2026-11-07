@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { localPidDomain } from "../src/attach.js";
 import { ConfigError, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
-import { cleanInput, inputBox, findPane, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
+import { CLAUDE_MODE_INDICATORS, actsAsCommand, cleanInput, inputBox, findPane, modeVerdict, terminalMode, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
 import { Harness, tmpdir } from "./support/harness.js";
 
 const REF = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -44,6 +44,59 @@ describe("reading Claude Code's input box", () => {
   });
 });
 
+/** Every permission mode Claude Code has (its own table), and the footer it draws for each. */
+const MODES = Object.values(CLAUDE_MODE_INDICATORS);
+const INDICATOR_OF = Object.fromEntries(Object.entries(CLAUDE_MODE_INDICATORS).map(([label, id]) => [id, label]));
+const screenIn = (footer: string, box = "\x1b[39m❯ \x1b[2mTry \"fix lint errors\"\x1b[0m") => `  ready\n${RULE}\n${box}\n${RULE}\n${footer}`;
+
+describe("the terminal's permission mode, and whether the agent's policy lets the phone type in it", () => {
+  test("Claude Code's six modes are the ones it names (2.1.285 to 2.1.319)", () => {
+    assert.deepEqual([...MODES].sort(), ["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"]);
+  });
+
+  test("read from the footer below the box, as Claude Code draws it for each mode; anything else is unknown", () => {
+    // As 2.1.319 drew them in a real tmux pane.
+    assert.equal(terminalMode(screenIn("\x1b[39m  \x1b[38;5;246m⏸ manual mode on · ? for shortcuts\x1b[39m")), "default");
+    assert.equal(terminalMode(screenIn("\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle) · ← for agents          ◐ medium · /effort")), "auto");
+    for (const mode of MODES) {
+      const sym = mode === "default" || mode === "plan" ? "⏸" : "⏵⏵";
+      assert.equal(terminalMode(screenIn(`  \x1b[38;5;147m${sym} ${INDICATOR_OF[mode]} on\x1b[38;5;246m (shift+tab to cycle)\x1b[39m`)), mode, mode);
+    }
+    // No mode named (an older Claude Code, a notice in its place), two named, or no box at all: unknown.
+    assert.equal(terminalMode(screenIn("  ? for shortcuts")), null);
+    assert.equal(terminalMode(screenIn("  Press Ctrl-C again to exit")), null);
+    assert.equal(terminalMode(screenIn("  ⏵⏵ accept edits on · ⏸ plan mode on")), null);
+    assert.equal(terminalMode(" Do you want to proceed?\n ❯ 1. Yes\n   2. No\n  ⏸ manual mode on"), null);
+    // Words in the box are not the footer.
+    assert.equal(terminalMode(screenIn("  ? for shortcuts", "❯ please turn bypass permissions on")), null);
+  });
+
+  const agentOf = (extra: string) => parseConfig(`[[agents]]\nid = "a"\npreset = "claude-attach"\nroots = ["/tmp"]\n${extra}\n`).agents[0]!;
+  test("approval \"ask\": only a mode in safeModes; every other mode Claude Code has is refused", () => {
+    const a = agentOf("");
+    const allowed = MODES.filter((m) => modeVerdict(a, m).ok);
+    assert.deepEqual(allowed.sort(), ["default", "plan"]);
+    for (const m of MODES.filter((x) => !allowed.includes(x))) assert.deepEqual(modeVerdict(a, m), { ok: false, reason: "terminal_mode_not_allowed" }, m);
+    assert.deepEqual(modeVerdict(agentOf('approval = "ask"'), "bypassPermissions"), { ok: false, reason: "terminal_mode_not_allowed" });
+  });
+  test("approval \"never\" (or allow_unsafe_modes): every mode, the unsafe ones too", () => {
+    for (const m of MODES) assert.deepEqual(modeVerdict(agentOf('approval = "never"'), m), { ok: true }, m);
+    const file = parseConfig(`allow_unsafe_modes = true\n[[agents]]\nid = "a"\npreset = "claude-attach"\nroots = ["/tmp"]\n`).agents[0]!;
+    for (const m of MODES) assert.deepEqual(modeVerdict(file, m), { ok: true }, m);
+  });
+  test("a read-only agent (its ask mode cannot write): only a read-only mode", () => {
+    const a = agentOf('ask_mode = "plan"');
+    assert.deepEqual(MODES.filter((m) => modeVerdict(a, m).ok), ["plan"]);
+  });
+  test("a mode that cannot be read is refused, whatever the approval", () => {
+    for (const extra of ["", 'approval = "never"']) assert.deepEqual(modeVerdict(agentOf(extra), null), { ok: false, reason: "terminal_mode_unknown" });
+  });
+  test("a message that would run a shell command (!) or a slash command (/) there is not a prompt", () => {
+    for (const t of ["!rm -rf ~", "  !ls", "/permissions", " /add-dir /", "/clear\nmore"]) assert.equal(actsAsCommand(t), true, t);
+    for (const t of ["hello", "what does ! do", "a/b", "# heading"]) assert.equal(actsAsCommand(t), false, t);
+  });
+});
+
 describe("the owner's switch", () => {
   const agent = (extra: string, preset = "claude-attach") => `[[agents]]\nid = "a"\npreset = "${preset}"\nroots = ["/tmp"]\n${extra}\n`;
   test("on by default with tmux from PATH; off with terminal_input = false; only for an attach agent, only a boolean", () => {
@@ -51,7 +104,18 @@ describe("the owner's switch", () => {
     assert.deepEqual(parseConfig(agent('tmux_cli = "/opt/bin/tmux"')).agents[0]!.attach, { cli: "claude", tmux: "/opt/bin/tmux" });
     assert.deepEqual(parseConfig(agent("terminal_input = false")).agents[0]!.attach, { cli: "claude", tmux: null });
     assert.throws(() => parseConfig(agent('terminal_input = "yes"')), (e: unknown) => e instanceof ConfigError && /terminal_input must be true or false/.test(e.message));
-    assert.throws(() => parseConfig(agent("terminal_input = true", "claude")), (e: unknown) => e instanceof ConfigError && /only applies to an agent made from the claude-attach preset/.test(e.message));
+    assert.throws(() => parseConfig(agent("terminal_input = true", "codex")), (e: unknown) => e instanceof ConfigError && /terminal_input only applies to an agent made from the claude or claude-attach preset/.test(e.message));
+    assert.throws(() => parseConfig(agent('tmux_cli = "tmux"', "codex")), (e: unknown) => e instanceof ConfigError && /tmux_cli only applies/.test(e.message));
+  });
+
+  test("on a plain claude agent it is the setting of the agent derived from it for the conversations already there", () => {
+    const derived = (extra: string) => parseConfig(agent(extra, "claude")).agents.find((a) => a.id === "a-sessions")!;
+    assert.deepEqual(derived("").attach, { cli: "claude", tmux: "tmux" });
+    // Honoured, not a config problem: the derived agent only watches a conversation open in a terminal.
+    assert.deepEqual(derived("terminal_input = false").attach, { cli: "claude", tmux: null });
+    assert.deepEqual(derived('tmux_cli = "/opt/bin/tmux"').attach, { cli: "claude", tmux: "/opt/bin/tmux" });
+    assert.equal(parseConfig(agent("terminal_input = false", "claude")).agents.find((a) => a.id === "a")!.attach, null, "the claude agent itself attaches nothing");
+    assert.throws(() => parseConfig(agent('terminal_input = "no"', "claude")), (e: unknown) => e instanceof ConfigError && /terminal_input must be true or false/.test(e.message));
   });
 });
 
@@ -71,9 +135,13 @@ after(async () => {
 });
 
 /** A tmux server on a socket of its own, with the stand-in interface in its one pane, working in `work`. */
-function terminal(work: string, claudeDir: string, workMs = 300): { socket: string; pid: number; row: string; transcript: string; tmux: (...a: string[]) => string } {
+function terminal(work: string, claudeDir: string, workMs = 300): {
+  socket: string; pid: number; row: string; transcript: string; tmux: (...a: string[]) => string; setMode: (m: string) => void;
+} {
   const dir = tmpdir("cc-tmux-");
   const socket = path.join(dir, "sock");
+  const modeFile = path.join(dir, "mode");
+  fs.writeFileSync(modeFile, "default");
   servers.push(socket);
   const transcript = path.join(claudeDir, "projects", work.replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
   fs.mkdirSync(path.dirname(transcript), { recursive: true });
@@ -82,7 +150,7 @@ function terminal(work: string, claudeDir: string, workMs = 300): { socket: stri
   fs.mkdirSync(path.dirname(row), { recursive: true });
   const tmux = (...a: string[]) => execFileSync("tmux", ["-S", socket, ...a], { encoding: "utf8" });
   // The pane's own environment is what the connector reads: the test's own TMUX (if any) is not passed on.
-  const env = { ...process.env, FAKE_TRANSCRIPT: transcript, FAKE_ROW: row, FAKE_SESSION: REF, FAKE_WORK_MS: String(workMs) } as Record<string, string>;
+  const env = { ...process.env, FAKE_TRANSCRIPT: transcript, FAKE_ROW: row, FAKE_SESSION: REF, FAKE_WORK_MS: String(workMs), FAKE_MODE_FILE: modeFile } as Record<string, string>;
   delete env.TMUX; delete env.TMUX_PANE;
   execFileSync("tmux", ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-x", "120", "-y", "30", "-c", work,
     `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_TERMINAL)}`], { env });
@@ -91,7 +159,7 @@ function terminal(work: string, claudeDir: string, workMs = 300): { socket: stri
   const named = path.join(claudeDir, "sessions", `${pid}.json`);
   fs.writeFileSync(named, JSON.stringify({ pid, sessionId: REF, status: "idle", kind: "interactive", cwd: work, procStart: processStart(pid), pidDomain: localPidDomain() }));
   fs.symlinkSync(named, row);
-  return { socket, pid, row: named, transcript, tmux };
+  return { socket, pid, row: named, transcript, tmux, setMode: (m) => fs.writeFileSync(modeFile, m) };
 }
 
 const until = async <T>(what: string, f: () => T | undefined | false, ms = 15_000): Promise<T> => {
@@ -130,7 +198,11 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     }
     const input = new TerminalInput(found.pane, tmuxRunner("tmux", t.socket));
     await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
-    assert.deepEqual(await input.readiness(), { ready: true });
+    assert.deepEqual(await input.readiness(), { ready: true, mode: "default" });
+    t.setMode("bypassPermissions");
+    await until("the footer names the new mode", () => terminalMode(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "bypassPermissions");
+    assert.deepEqual(await input.readiness(), { ready: true, mode: "bypassPermissions" });
+    t.setMode("default");
     t.tmux("send-keys", "-t", "%0", "-l", "half-typed");
     await until("the half-typed text", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "typed");
     assert.deepEqual(await input.readiness(), { ready: false, why: "typing" });
@@ -232,6 +304,57 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.equal(end.data.error, "connector_restarted");
     await new Promise((r) => setTimeout(r, 1_500));
     assert.deepEqual(typed(t.transcript).filter((x) => x === "a long one").length, 1, "typed once, not again after the restart");
+  });
+
+  /** A typed session on an agent with `approval`, and one prompt per mode Claude Code has: typed, or refused by name. */
+  const throughModes = async (approval: "ask" | "never") => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000, terminalModeWaitMs: 300 } as never,
+      ...(approval === "never" ? { approval, askMode: "bypassPermissions" } : { approval }),
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir);
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const out: Record<string, { typed: boolean; error?: string; reason?: string; mode?: unknown }> = {};
+    for (const mode of [...MODES, "none"]) {
+      t.setMode(mode);
+      await until(`the footer for ${mode}`, () => terminalMode(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === (mode === "none" ? null : mode)
+        && inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+      const words = `in ${mode}`;
+      const seq = h.prompt(sid, words);
+      const end = await h.claw.until(`the end of the prompt in ${mode}`, () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
+      const rejected = h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_seq === seq);
+      out[mode] = { typed: typed(t.transcript).includes(words), ...(end.data.error ? { error: end.data.error, reason: rejected?.data.reason, mode: rejected?.data.terminal_mode } : {}) };
+    }
+    t.setMode("default");
+    // A shell command or a slash command is never typed, in any mode.
+    const bang = h.prompt(sid, "!touch pwned");
+    const r = await h.claw.until("the refusal", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_seq === bang));
+    assert.equal(r.data.reason, "terminal_command_refused");
+    assert.match(String(r.data.hint), /starts with ! or \//);
+    assert.ok(!typed(t.transcript).includes("!touch pwned"));
+    return out;
+  };
+
+  test("approval \"ask\": typed only in a mode in safeModes; an unsafe mode is refused with the mode named; an unread mode is refused", async () => {
+    const out = await throughModes("ask");
+    const want: typeof out = {};
+    for (const m of MODES) {
+      want[m] = ["default", "plan"].includes(m) ? { typed: true } : { typed: false, error: "terminal_mode_not_allowed", reason: "terminal_mode_not_allowed", mode: m };
+    }
+    want.none = { typed: false, error: "terminal_mode_unknown", reason: "terminal_mode_unknown", mode: null };
+    assert.deepEqual(out, want);
+  });
+
+  test("approval \"never\": typed in every mode, the unsafe ones too; an unread mode is still refused", async () => {
+    const out = await throughModes("never");
+    const want: typeof out = Object.fromEntries(MODES.map((m) => [m, { typed: true }]));
+    want.none = { typed: false, error: "terminal_mode_unknown", reason: "terminal_mode_unknown", mode: null };
+    assert.deepEqual(out, want);
   });
 
   test("the owner can turn it off: then the same conversation is only watched", async () => {

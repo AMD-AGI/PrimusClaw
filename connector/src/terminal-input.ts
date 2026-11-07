@@ -22,6 +22,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { processStart } from "./children.js";
+import type { AgentConfig } from "./config.js";
 import { errMessage } from "./util.js";
 
 /** Runs the tmux client against one server socket. The seam the tests replace. */
@@ -141,21 +142,76 @@ const RULE_RE = /^─{8,}$/;
  * line; `unknown` when there is no such box (a menu, a permission question, a dialog, another program).
  */
 export function inputBox(screen: string): BoxState {
+  const { raw, plain, at, end } = boxOf(screen);
+  if (at < 0 || end < 0) return "unknown";
+  if (end !== at + 1) return "typed";
+  const text = plain[at]!.trimStart().replace(PROMPT_RE, "").trim();
+  if (!text) return "empty";
+  // The suggestion Claude Code shows in an empty box is the only thing on the line, dimmed (SGR 2) throughout.
+  return onlyDim(raw[at]!.replace(/^(?:\s|\x1b\[[0-9;:]*m)*(?:❯|>)/, "")) ? "empty" : "typed";
+}
+
+/** Where Claude Code's input box is on a screen: its prompt line (`at`) and the rule below it (`end`); -1 when there is none. */
+function boxOf(screen: string): { raw: string[]; plain: string[]; at: number; end: number } {
   const raw = screen.split("\n").map((l) => l.replace(/\s+$/, ""));
   const plain = raw.map((l) => l.replace(SGR_RE, "").replace(/\s+$/, ""));
   let at = -1;
   for (let i = plain.length - 1; i >= 0; i--) {
     if (PROMPT_RE.test(plain[i]!.trimStart()) && i > 0 && RULE_RE.test(plain[i - 1]!.trim())) { at = i; break; }
   }
-  if (at < 0) return "unknown";
   let end = -1;
-  for (let j = at + 1; j < plain.length; j++) if (RULE_RE.test(plain[j]!.trim())) { end = j; break; }
-  if (end < 0) return "unknown";
-  if (end !== at + 1) return "typed";
-  const text = plain[at]!.trimStart().replace(PROMPT_RE, "").trim();
-  if (!text) return "empty";
-  // The suggestion Claude Code shows in an empty box is the only thing on the line, dimmed (SGR 2) throughout.
-  return onlyDim(raw[at]!.replace(/^(?:\s|\x1b\[[0-9;:]*m)*(?:❯|>)/, "")) ? "empty" : "typed";
+  if (at >= 0) for (let j = at + 1; j < plain.length; j++) if (RULE_RE.test(plain[j]!.trim())) { end = j; break; }
+  return { raw, plain, at, end };
+}
+
+/**
+ * Claude Code's permission modes, as its footer names each one (`<indicator> on`, below the input box) and the id the agent and
+ * its transcript use for it: Claude Code's own table (`indicator` and `external`), the same in 2.1.285 and 2.1.319. Every mode is
+ * named there, the default one too ("manual mode on").
+ */
+export const CLAUDE_MODE_INDICATORS: Readonly<Record<string, string>> = {
+  "manual mode": "default", "plan mode": "plan", "accept edits": "acceptEdits", "bypass permissions": "bypassPermissions", "don't ask": "dontAsk", "auto mode": "auto",
+};
+const MODE_RE = new RegExp(`(?:^|[\\s·⏵⏸▶])(${Object.keys(CLAUDE_MODE_INDICATORS).join("|")}) on\\b`, "g");
+const FOOTER_LINES = 3;
+
+/**
+ * The permission mode the terminal's Claude Code is in now, read from the footer below its input box. The screen is the one place
+ * that says it as it is: the transcript records the mode only with the next prompt, so a switch (shift+tab) at an idle terminal is
+ * not in it. null when the footer does not name exactly one mode (no box, another program, a notice in its place, an older Claude
+ * Code that does not name the default mode): then nothing is typed.
+ */
+export function terminalMode(screen: string): string | null {
+  const { plain, at, end } = boxOf(screen);
+  if (at < 0 || end < 0) return null;
+  const found = new Set<string>();
+  for (const line of plain.slice(end + 1, end + 1 + FOOTER_LINES)) {
+    for (const m of line.matchAll(MODE_RE)) found.add(CLAUDE_MODE_INDICATORS[m[1]!]!);
+  }
+  return found.size === 1 ? [...found][0]! : null;
+}
+
+export type ModeVerdict = { ok: true } | { ok: false; reason: "terminal_mode_unknown" | "terminal_mode_not_allowed" };
+
+/**
+ * Whether a message from the phone may be typed into a terminal in `mode`, by the rule a phone session of this agent runs under
+ * (session.ts `modeAllowed`, `noteMode`): a mode in the agent's `safeModes`, or any mode once the owner opted out of per-step
+ * approval (`approval = "never"`, `allowUnsafeModes`). A read-only agent (its ask mode is one that cannot write) only into a
+ * terminal in one of those read-only modes. A mode that cannot be read is refused.
+ */
+export function modeVerdict(agent: Pick<AgentConfig, "safeModes" | "allowUnsafeModes" | "askMode" | "readOnlyModes">, mode: string | null): ModeVerdict {
+  if (mode === null) return { ok: false, reason: "terminal_mode_unknown" };
+  if (agent.readOnlyModes.includes(agent.askMode)) return agent.readOnlyModes.includes(mode) ? { ok: true } : { ok: false, reason: "terminal_mode_not_allowed" };
+  return agent.safeModes.includes(mode) || agent.allowUnsafeModes ? { ok: true } : { ok: false, reason: "terminal_mode_not_allowed" };
+}
+
+/**
+ * Whether a message would act as a command in Claude Code's input box instead of being a prompt: `!` runs the rest as a shell
+ * command with no permission question, and `/` runs a slash command (`/permissions`, `/add-dir` change what the session may do).
+ * Such a message is never typed.
+ */
+export function actsAsCommand(text: string): boolean {
+  return /^[!/]/.test(text.trimStart());
 }
 
 /**
@@ -195,7 +251,7 @@ function onlyDim(line: string): boolean {
   return true;
 }
 
-export type Readiness = { ready: true } | { ready: false; why: "typing" | "screen" | "copy_mode" | "gone" };
+export type Readiness = { ready: true; mode: string | null } | { ready: false; why: "typing" | "screen" | "copy_mode" | "gone" };
 
 /** One tmux pane that holds a conversation open, and the typing into it. */
 export class TerminalInput {
@@ -207,7 +263,10 @@ export class TerminalInput {
     return Number.isInteger(panePid) && panePid > 1 && descendsFrom(this.ref.pid, panePid);
   }
 
-  /** Whether the pane can be typed into now: the same process in it, alive, not scrolled back (copy mode), and its input box empty. */
+  /**
+   * Whether the pane can be typed into now: the same process in it, alive, not scrolled back (copy mode), and its input box empty;
+   * when it can, with the permission mode its footer shows on that same screen (null when it does not show one).
+   */
   async readiness(): Promise<Readiness> {
     let info: string;
     try {
@@ -218,8 +277,9 @@ export class TerminalInput {
     const [mode, dead, panePid] = info.trim().split(" ");
     if (dead === "1" || !this.stillThere(Number(panePid))) return { ready: false, why: "gone" };
     if (mode !== "0") return { ready: false, why: "copy_mode" };
-    const box = inputBox(await this.screen());
-    return box === "empty" ? { ready: true } : { ready: false, why: box === "typed" ? "typing" : "screen" };
+    const screen = await this.screen();
+    const box = inputBox(screen);
+    return box === "empty" ? { ready: true, mode: terminalMode(screen) } : { ready: false, why: box === "typed" ? "typing" : "screen" };
   }
 
   private async screen(): Promise<string> {

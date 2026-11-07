@@ -8,7 +8,9 @@
  * "works", then an answer and the end of the turn are written and the row says `idle` again.
  *
  * FAKE_TRANSCRIPT: the transcript file. FAKE_ROW: the registry row (written by the test; only its status is changed here).
- * FAKE_SESSION: the session id. FAKE_WORK_MS: how long a turn takes.
+ * FAKE_SESSION: the session id. FAKE_WORK_MS: how long a turn takes. FAKE_MODE_FILE: a file holding the permission mode the footer
+ * below the box names, as Claude Code names it (`manual mode on` for `default`, `accept edits on`...); `none` draws a footer that
+ * names no mode. Read again every 50 ms, so the test can switch it as shift+tab would.
  */
 import fs from "node:fs";
 
@@ -20,6 +22,14 @@ let buffer = "";
 let pasting = false;
 let working = false;
 let pending = "";
+const modeFile = process.env.FAKE_MODE_FILE;
+// Claude Code's own table (indicator per mode id), as the connector reads it back.
+const INDICATOR = { default: "manual mode", plan: "plan mode", acceptEdits: "accept edits", bypassPermissions: "bypass permissions", dontAsk: "don't ask", auto: "auto mode" };
+const readMode = () => { try { return fs.readFileSync(modeFile, "utf8").trim(); } catch { return "default"; } };
+let mode = readMode();
+const footer = () => (mode === "none" ? "  ? for shortcuts" : mode === "default"
+  ? "  \x1b[38;5;246m⏸ manual mode on · ? for shortcuts\x1b[39m"
+  : `  \x1b[38;5;147m⏵⏵ ${INDICATOR[mode] ?? mode} on\x1b[38;5;246m (shift+tab to cycle)\x1b[39m          ◐ medium · /effort`);
 
 const status = (s) => {
   try {
@@ -34,7 +44,7 @@ function draw() {
   const rule = "─".repeat(60);
   const lines = buffer ? buffer.split("\n") : [];
   const box = lines.length ? [`\x1b[39m❯ ${lines[0]}`, ...lines.slice(1).map((l) => `  ${l}`)] : ["\x1b[39m❯ \x1b[2mTry \"fix lint errors\"\x1b[0m"];
-  process.stdout.write(`\x1b[2J\x1b[H${working ? "✻ Working…" : "  ready"}\r\n${rule}\r\n${box.join("\r\n")}\r\n${rule}\r\n  ⏵⏵ fake mode\r\n`);
+  process.stdout.write(`\x1b[2J\x1b[H${working ? "✻ Working…" : "  ready"}\r\n${rule}\r\n${box.join("\r\n")}\r\n${rule}\r\n${footer()}\r\n`);
 }
 
 function submit() {
@@ -74,4 +84,4 @@ process.stdin.on("data", (chunk) => {
   draw();
 });
 draw();
-setInterval(() => {}, 60_000);
+setInterval(() => { const m = readMode(); if (m !== mode) { mode = m; draw(); } }, 50);

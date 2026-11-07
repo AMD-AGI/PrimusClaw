@@ -404,8 +404,34 @@ export function remoteNotice(
 const undelivered = (e: MovingEvent): boolean => e.data.by === "claw" && e.data.error === DELIVERY_UNCONFIRMED;
 
 /** How a turn ended, said beside its answer when it did not simply end. */
-function stopWords(stop: string, error: string, lang: RemoteLang): string {
+/**
+ * A message the connector would not type into a terminal (connector session.ts `pumpTerminal`): what to do about it, with the
+ * terminal's permission mode when the connector named it (`terminal_mode`). Anything else is said by its code, as before.
+ */
+function terminalRefusal(error: string, mode: string, lang: RemoteLang): string | null {
+  const m = mode || (lang === "zh" ? "未知模式" : "an unknown mode");
+  if (error === "terminal_mode_not_allowed") {
+    return lang === "zh"
+      ? `终端会话处于 ${m}，按你的审批设置不能从手机直接输入；在终端切到安全模式（Claude Code 里按 shift+tab，如 manual 或 plan），或把这个 agent 的审批设置改为 approval = "never" 后再试`
+      : `the terminal's conversation is in ${m}, which your approval setting does not allow from the phone; switch the terminal to a safe mode (shift+tab in Claude Code, e.g. manual or plan), or set approval = "never" for this agent, then try again`;
+  }
+  if (error === "terminal_mode_unknown") {
+    return lang === "zh"
+      ? "看不出终端会话现在处于哪种权限模式，没有输入；确认那台机器上的 Claude Code 在输入框下方显示模式后再试"
+      : "could not tell which permission mode the terminal's conversation is in, so nothing was typed; make sure Claude Code there shows its mode below the input box, then try again";
+  }
+  if (error === "terminal_command_refused") {
+    return lang === "zh"
+      ? "以 ! 或 / 开头的消息会在终端里直接执行命令，不从手机输入；换个说法，或在终端里执行"
+      : "a message starting with ! or / would run a command in the terminal, so it is not typed from the phone; rephrase it, or run it at the terminal";
+  }
+  return null;
+}
+
+function stopWords(stop: string, error: string, lang: RemoteLang, mode = ""): string {
   if (stop === "end_turn" || !stop) return "";
+  const terminal = stop === "error" ? terminalRefusal(error, mode, lang) : null;
+  if (terminal) return lang === "zh" ? `（没有输入：${terminal}）` : `(not typed: ${terminal})`;
   if (lang === "zh") return stop === "cancelled" ? "（已取消）" : stop === "error" ? `（出错：${error || "未知"}）` : `（结束原因：${stop}）`;
   return stop === "cancelled" ? "(cancelled)" : stop === "error" ? `(failed: ${error || "unknown"})` : `(ended: ${stop})`;
 }
@@ -509,7 +535,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         return;
       }
       const stop = flat(e.data.stopReason, 40);
-      const said = stopWords(stop, flat(e.data.error, 200), p.lang);
+      const said = stopWords(stop, flat(e.data.error, 200), p.lang, flat(e.data.terminal_mode, 40));
       const whole = await answerOf(q, sessionId, e.id);
       const answer = tailOf(whole, ANSWER_EVENT_MAX);
       const summary = [said, tailOf(answer, SUMMARY_MAX)].filter(Boolean).join(" ") || (p.lang === "zh" ? "已结束，没有回答文字" : "ended with no answer text");
@@ -576,7 +602,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
           // The item has moved on to a later instruction (open, or ended since): that one is left as it is, and this end is told with
           // its own instruction and answer.
           const stop = flat(e.data.stopReason, 40);
-          const said = stopWords(stop, flat(e.data.error, 200), p.lang);
+          const said = stopWords(stop, flat(e.data.error, 200), p.lang, flat(e.data.terminal_mode, 40));
           const whole = await answerOf(q, sessionId, e.id);
           await q(
             `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary, result)

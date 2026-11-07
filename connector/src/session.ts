@@ -21,7 +21,7 @@
 import path from "node:path";
 import { TranscriptTail, type AttachSupport, type TranscriptUpdate } from "./attach.js";
 import type { Audit } from "./audit.js";
-import { TerminalInput, cleanInput, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
+import { TerminalInput, actsAsCommand, cleanInput, modeVerdict, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
 import { createHash } from "node:crypto";
 import { AdapterProcess, type AcpParams, type AdapterHooks } from "./adapter.js";
 import type { ChildRegistry } from "./children.js";
@@ -63,11 +63,13 @@ export interface SessionTiming {
   terminalEchoMs: number;
   /** A typed message's turn also ends once the terminal has said it is idle for this long (a turn stopped with Esc writes no end). */
   terminalIdleMs: number;
+  /** A terminal whose footer names no permission mode is read again for this long, then the message is refused (`terminal_mode_unknown`). */
+  terminalModeWaitMs: number;
 }
 
 export const DEFAULT_SESSION_TIMING: SessionTiming = {
   idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000, spectateMs: 1_000, spectateCheckMs: 5_000,
-  rootCheckMs: 10_000, authWaitMs: 3_000, takeoverWaitMs: 15_000, terminalWaitMs: 10 * 60_000, terminalEchoMs: 20_000, terminalIdleMs: 5_000,
+  rootCheckMs: 10_000, authWaitMs: 3_000, takeoverWaitMs: 15_000, terminalWaitMs: 10 * 60_000, terminalEchoMs: 20_000, terminalIdleMs: 5_000, terminalModeWaitMs: 3_000,
 };
 
 /**
@@ -408,21 +410,28 @@ export class Session {
     try {
       while (this.terminalQueue.length && !this.closed) {
         const next = this.terminalQueue[0]!;
-        const refused = (reason: string, detail = "") => {
+        const refused = (reason: string, detail = "", extra: Record<string, unknown> = {}) => {
           this.terminalQueue.shift();
           next.started();
-          this.audit("terminal_input_refused", { reason, detail: detail.slice(0, 300), cmd_id: next.cmdId });
-          this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq);
-          this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq });
+          this.audit("terminal_input_refused", { reason, detail: detail.slice(0, 300), cmd_id: next.cmdId, ...extra });
+          this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq, extra);
+          this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, ...extra });
         };
         const text = cleanInput(next.text);
         if (!text.trim()) { refused("empty_prompt"); continue; }
+        // `!` or `/` first would run a shell command or a slash command there, not ask the agent: never typed.
+        if (actsAsCommand(text)) { refused("terminal_command_refused"); continue; }
         if (this.terminalRestoring) await this.terminalRestoring;
         const term = this.terminal;
         if (!term) { refused("terminal_input_unavailable"); continue; }
         const waitBy = Date.now() + this.env.timing.terminalWaitMs;
         let told = "";
         let ready = false;
+        // The terminal's permission mode, read with the empty box: a message is typed only in a mode this agent's policy allows
+        // (the rule a phone session of it runs under), never in whatever mode the terminal happens to be in.
+        let mode: string | null = null;
+        let modeRefused: string | null = null;
+        let unknownSince: number | null = null;
         while (!this.closed && this.terminalQueue[0] === next) {
           // Claude Code's own word first (a turn running, a question on its screen), then the screen itself: both must say free.
           const status = this.holderStatus(term);
@@ -432,7 +441,17 @@ export class Session {
             why = status === "busy" || status === "waiting" ? WAIT_WHY[status] : "terminal_state_unknown";
           } else {
             const r = await term.readiness();
-            if (r.ready) { ready = true; break; }
+            if (r.ready) {
+              const verdict = modeVerdict(this.agent, r.mode);
+              if (verdict.ok) { ready = true; mode = r.mode; break; }
+              if (verdict.reason === "terminal_mode_not_allowed") { mode = r.mode; modeRefused = verdict.reason; break; }
+              // Not named on the screen (a notice in the footer's place for a moment): read again briefly, then refused.
+              unknownSince ??= Date.now();
+              if (Date.now() - unknownSince >= this.env.timing.terminalModeWaitMs) { modeRefused = verdict.reason; break; }
+              await sleep(Math.max(100, Math.min(500, this.env.timing.spectateMs * 5)));
+              continue;
+            }
+            unknownSince = null;
             why = WAIT_WHY[r.why];
             if (r.why === "gone") { told = why; break; }
           }
@@ -444,6 +463,7 @@ export class Session {
           await sleep(Math.max(200, Math.min(1_000, this.env.timing.spectateMs * 5)));
         }
         if (this.closed || this.terminalQueue[0] !== next) continue;   // closed, or dropped by a cancel
+        if (modeRefused) { refused(modeRefused, "", { terminal_mode: mode }); continue; }
         if (!ready) { refused(told === WAIT_WHY.gone ? "terminal_gone" : told === WAIT_WHY.other ? "terminal_switched" : "terminal_busy", told); continue; }
         // Asked again just before the keys go: the same process, still on this conversation, still idle.
         if (this.holderStatus(term) !== "idle") { refused("terminal_switched", "the terminal changed just before typing"); continue; }
@@ -463,19 +483,22 @@ export class Session {
         // Everything asked again after that wait, right before the keys go: a cancel or a close meanwhile, a record that did not
         // reach the disk (a restart could not end this turn), and the terminal itself (someone may have started typing, a menu may
         // be open now). Each ends the turn by name and types nothing.
-        const giveUp = (reason: string | null) => {
+        const giveUp = (reason: string | null, extra: Record<string, unknown> = {}) => {
           if (this.terminalTurn === turn) this.terminalTurn = null;
           // (Going away: the record stays, and the next run ends this turn by name.)
           if (!this.stopping) this.env.store.endTurn(this.id);
           if (reason === null) return;
-          this.audit("terminal_input_refused", { reason, cmd_id: next.cmdId });
-          this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq);
-          this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq });
+          this.audit("terminal_input_refused", { reason, cmd_id: next.cmdId, ...extra });
+          this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq, extra);
+          this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, ...extra });
         };
         if (this.closed || this.stopping || !turn || this.terminalTurn !== turn) { giveUp(null); continue; }
         if (!recorded) { giveUp("terminal_input_failed"); continue; }
         const again = await term.readiness();
         if (!again.ready || this.holderStatus(term) !== "idle") { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
+        // The mode asked again on this screen too: a switch since (shift+tab) is not typed into.
+        const verdictNow = modeVerdict(this.agent, again.mode);
+        if (!verdictNow.ok) { giveUp(verdictNow.reason, { terminal_mode: again.mode }); continue; }
         if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }
         try {
           await term.type(text);
@@ -489,7 +512,7 @@ export class Session {
         }
         // What was typed is the person's own message; the trail keeps its size and a digest, not the words.
         this.audit("terminal_input", {
-          acp_session_id: this.acpId, pid: term.ref.pid, pane: term.ref.pane, cmd_id: next.cmdId, length: text.length,
+          acp_session_id: this.acpId, pid: term.ref.pid, pane: term.ref.pane, cmd_id: next.cmdId, terminal_mode: again.mode, length: text.length,
           lines: text.split("\n").length, sha256: createHash("sha256").update(text).digest("hex").slice(0, 16),
         });
         await finished;
@@ -1277,9 +1300,9 @@ export class Session {
   }
 
   /** A command refused; a prompt's refusal names it by `cmd_seq` too, as its turn_end would. */
-  rejectCommand(type: string, cmdId: string | null, reason: string, cmdSeq: number | null = null): void {
+  rejectCommand(type: string, cmdId: string | null, reason: string, cmdSeq: number | null = null, extra: Record<string, unknown> = {}): void {
     this.audit("command_rejected", { type, cmd_id: cmdId, reason });
-    this.emit("command_rejected", withHint({ type, cmd_id: cmdId, reason, ...(cmdSeq !== null ? { cmd_seq: cmdSeq } : {}) }, this.agent));
+    this.emit("command_rejected", withHint({ type, cmd_id: cmdId, reason, ...(cmdSeq !== null ? { cmd_seq: cmdSeq } : {}), ...extra }, this.agent));
   }
 }
 
