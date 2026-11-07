@@ -52,6 +52,22 @@ record it.
   `claw_assistant_router_unsaid_total{outcome}` (`delivered`, `replaced_early_line`, `lost_notice`, `withheld`, `refused`,
   `after_say`). `replaced_early_line` is the parity run's K2 (only "查一下 Autopilot 的状态。" reached the user), which was fixed but
   not counted, so a return of it could only be found by reading transcripts.
+- A translation the user asks for is said at once, alone: `say` no longer refuses the English text a Chinese message asked for
+  (把这句翻成英文，只给译文), which cost a rewrite of about 1.4 s and put a Chinese label before it (2026-11-06 parity run, S2). A message in
+  the language the user named (翻成/译成/写成/用 X 写/X 版, translate … into X, in X) is let through; any other message in another language
+  still is refused (`router-v17`).
+- A request to review and merge pull requests that are already merged is answered with when each merged and its merge commit, and starts
+  nothing: `review_start` reads each named pull request on GitHub first, as the person (their `GH_TOKEN`, else their binding, audited
+  as a GitHub read), and refuses `already_merged` before it asks who the reviewer is or hands anything to the channel (G3: the router
+  asked who eval-reviewer was). The router calls it before asking anything (`router-v21`). `pr_get` also returns `merged_at`,
+  `merged_by`, `merge_commit` and `closed_at`.
+- "How many pull requests do I have open" is answered with the total and the pull requests themselves: `issue_search` returns
+  `refs_by_repo` (every match as `#number`, grouped by repository in `by_repo`'s order), and the router lists them from it (G1: 18 and the
+  per-repository counts, no numbers; `router-read-v9`).
+- A pull request number that does not exist is said not to exist: when a read of one (`pr_get`, `pr_reviews`, `pr_files`,
+  `review_threads_list`) gets 404 while the repository itself is readable, it answers `no_such_pull_request` with the repository's newest
+  pull request numbers, or that the number is an issue (H2: "可能不存在，也可能没有权限", with a number made up). A repository the token
+  cannot see keeps GitHub's plain 404.
 - How far an item got is answered from what its job wrote at the question, not from the worker's last look at it: a worker checks a
   long job only every minute or two, so its last tool output was up to two steps behind the log (2026-11-06 parity run, L1: "step 3/16"
   while the log said step 5). While the item's run is going, `work_recall(item, "live")` also returns `files_now`: the tails of the

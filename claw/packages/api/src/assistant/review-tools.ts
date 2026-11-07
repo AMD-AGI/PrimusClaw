@@ -54,6 +54,7 @@ import { resolveWorkItemNow } from "./work-items.js";
 import { modelChoiceOn } from "./model-choice.js";
 import { voidStreamedSay } from "./router-speed.js";
 import { dropHeldSays } from "./say-hold.js";
+import { mergedPulls, type MergedPull } from "./pr-state.js";
 
 export { confirmationRef };
 
@@ -67,6 +68,8 @@ export const reviewToolPorts = {
   decide: (userId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null, guard?: (q: Querier) => Promise<void>) =>
     decideConfirmation(githubReviewService(), db, userId, id, decision, via, guard),
   kick: (): Promise<void> => kickDelivery(),
+  /** Which of the pull requests a review request names GitHub says are merged, read as the person (`pr-state.ts`). */
+  mergedPulls: (userId: string, sessionId: string, prs: readonly PrRef[]): Promise<MergedPull[]> => mergedPulls(userId, sessionId, prs),
   /** Takes back what the turn streamed of a say (`router-speed.ts`). */
   voidStreamedSay: (sessionId: string, messageId: string | undefined, reason: string): Promise<void> =>
     voidStreamedSay(sessionId, messageId, reason),
@@ -521,6 +524,26 @@ function refuseWhichReviewer(code: string, text: string, people: readonly Channe
   { candidates });
 }
 
+/** The refusals that ask the person which reviewer they meant: a merged pull request is said before any of them. */
+const ASKS_WHICH_REVIEWER: ReadonlySet<string> = new Set(["reviewer_not_named", "reviewer_not_in_message", "reviewer_not_linked"]);
+
+/**
+ * Nothing is started, handed over or asked about for a pull request that is already merged: the person is told when it merged and its
+ * merge commit instead (`pr-state.ts`). Only pull requests the message grounded reach here.
+ */
+async function refuseMerged(userId: string, sessionId: string, prs: readonly PrRef[]): Promise<void> {
+  const merged = await reviewToolPorts.mergedPulls(userId, sessionId, prs);
+  if (!merged.length) return;
+  const open = prs.length - merged.length;
+  throw new ToolRefused(
+    "already_merged",
+    `${merged.map((m) => m.pr).join(", ")} ${merged.length === 1 ? "is" : "are"} already merged on GitHub (data.merged: when, by whom, the merge commit), so nothing was started or handed over. `
+      + "Tell the user each one is already merged, with merged_at and the short merge commit, and that no review was asked for; ask nothing about the reviewer. "
+      + (open ? `The other ${open} ${open === 1 ? "is" : "are"} not merged: say that only those would be reviewed, and call review_start with only them if the user's message still asks for it.` : "Offer the next step: nothing more is needed, or a review after the merge if they want one."),
+    { merged },
+  );
+}
+
 // --- Tools ------------------------------------------------------------------------------------------------------
 
 export async function reviewStart(
@@ -532,6 +555,7 @@ export async function reviewStart(
   const prs = parsePrs(args.prs);
   if (typeof args.merge !== "boolean") throw new ToolRefused("invalid_arguments", "merge must be true or false: true only when the user clearly asked to merge");
   // Asked here, so a refusal costs the review service nothing.
+  let grounded: string | null = null;
   const ready = await inTransaction(async (q) => {
     const { userId, message, via } = await attendedTurn(q, claims);
     // `确认 <name>` answers the question which reviewer the person meant, for a review by someone else: the pull requests (and the model)
@@ -550,6 +574,8 @@ export async function reviewStart(
         refuseUngrounded("repo_not_grounded", `the user did not name ${pr.owner}/${pr.repo}: ask them which repository`);
       }
     }
+    // Every pull request is one the person named: from here on, one already merged is said before anything is asked or started.
+    grounded = userId;
     // With model choice on, the model is checked against the allow-list and the payer's key instead (`model-choice.ts`): "use the fast
     // one" names a model without its name, and the quota spent is the user's own.
     if (args.model && !modelChoiceOn() && !modelGrounded(answered ? `${asked}\n${message.content}` : asked, args.model)) {
@@ -568,7 +594,11 @@ export async function reviewStart(
     const named = !person && people.some((p) => !p.user_id && (lower(p.name) === reviewer || (p.email !== undefined && lower(p.email) === reviewer)));
     if (named) refuseUngrounded("reviewer_not_linked", "that person has not linked their account, so nobody can review as them: tell the user");
     return refuseWhichReviewer(person ? "reviewer_not_named" : "reviewer_not_in_message", message.content, people, userId);
+  }).catch(async (err: unknown) => {
+    if (grounded && err instanceof ToolRefused && ASKS_WHICH_REVIEWER.has(err.code)) await refuseMerged(grounded, claims.sid, prs);
+    throw err;
   });
+  await refuseMerged(ready.userId, claims.sid, prs);
   // A review asked of someone else runs on their own credentials, which only the channel that carried the message can bring. When it
   // said it can be handed one, it is: the channel starts it as the reviewer and tells the person how it went. Otherwise it is refused
   // below, as before (`asRequesterOfOther`).

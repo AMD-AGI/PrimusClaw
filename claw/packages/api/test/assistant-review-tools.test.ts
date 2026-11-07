@@ -47,6 +47,8 @@
  *       (`claw_assistant_review_handoffs`), which the payload carries for the channel to echo
  *   S7c a turn that handed a review over says nothing more: its say is refused, and neither its plain text nor a failure notice is
  *       delivered; a say before the handoff, the next message's turn and another person's turn speak as always
+ *   S9  a pull request GitHub says is already merged is said so before anything else: nothing starts or is handed over, the reviewer is
+ *       not asked about, and the refusal carries when it merged and its merge commit (2026-11-06 parity run, G3)
  *   R1  review_restart takes a review the user pointed at, and only a review
  *   R1b an item number is read whole: #11 does not point at #1, nor repo#1 at item #1
  *   C1  confirmation_answer allows only when the message is the exact approval command (批准 #<ref> / approve #<ref>) naming a
@@ -86,6 +88,9 @@ describe("assistant review tools", { skip }, () => {
   let saved: Record<string, unknown>;
   const calls: { start: Recorded[]; restart: Recorded[]; decide: Recorded[] } = { start: [], restart: [], decide: [] };
   let startAnswer: (request: Recorded) => Promise<unknown>;
+  /** What GitHub says is merged, by `owner/repo#number`, and the pull requests each check was asked about. */
+  let mergedOnGithub: Record<string, { merged_at: string; merge_commit: string; merged_by: string }> = {};
+  const stateReads: string[][] = [];
 
   before(async () => {
     w = await startWorld({
@@ -107,6 +112,11 @@ describe("assistant review tools", { skip }, () => {
       return { http: 200, body: { ok: true, status: decision === "allow" ? "merged" : "denied" } };
     }) as never;
     rt.reviewToolPorts.kick = async () => undefined;
+    rt.reviewToolPorts.mergedPulls = (async (_userId: string, _sid: string, prs: Array<{ owner: string; repo: string; number: number }>) => {
+      const names = prs.map((p) => `${p.owner}/${p.repo}#${p.number}`);
+      stateReads.push(names);
+      return names.filter((n) => mergedOnGithub[n]).map((n) => ({ pr: n, ...mergedOnGithub[n] }));
+    }) as never;
   });
   after(async () => { Object.assign(rt.reviewToolPorts, saved); await w?.stop(); });
   beforeEach(async () => {
@@ -115,6 +125,7 @@ describe("assistant review tools", { skip }, () => {
       claw_github_review_settings, claw_assistant_review_handoffs CASCADE`);
     w.drains.length = 0;
     calls.start.length = 0; calls.restart.length = 0; calls.decide.length = 0;
+    mergedOnGithub = {}; stateReads.length = 0;
     startAnswer = async (request) => request.prs.map((p: Recorded, i: number) => ({ item_id: `kwi_s${i}`, seq: i + 1, pr: p.pr }));
     alice = await w.user("alice");
     bob = await w.user("bob");
@@ -726,6 +737,62 @@ describe("assistant review tools", { skip }, () => {
       assert.equal((err as { code: string }).code, "review_in_progress");
       assert.deepEqual((err as { data: unknown }).data, { pr: 254, item_id: "item_x", seq: 3 });
     }
+  });
+
+  test("S9 a pull request already merged is said so first: nothing starts, nothing is handed over, nobody is asked about", async () => {
+    mergedOnGithub = {
+      "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-05T09:12:44Z", merge_commit: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", merged_by: "zoroyihan7" },
+      "AMD-AGI/PrimusClaw#308": { merged_at: "2026-11-05T10:01:02Z", merge_commit: "0f9e8d7c6b5a40f9e8d7c6b5a40f9e8d7c6b5a40", merged_by: "zoroyihan7" },
+    };
+    const prs = ["https://github.com/AMD-AGI/PrimusClaw/pull/306", "https://github.com/AMD-AGI/PrimusClaw/pull/308"];
+    const text = `请 eval-reviewer 帮我 review 并合入下面 2 个 PR：\n${prs.join("\n")}`;
+    // The parity prompt, as the channel sends it: the reviewer it names is nobody the channel listed.
+    const ctx = { ...DEFAULT_CTX, people: [{ name: "Wei Lei", user_id: "u-weilei" }], handoffs: ["review_for_other"] };
+    const turn = await userTurn(alice, text, { context: ctx });
+    let refusal: any;
+    await assert.rejects(rt.reviewStart(turn, { prs, merge: true, reviewer: "eval-reviewer" }), (err: any) => { refusal = err; return true; });
+    assert.equal(refusal.code, "already_merged", "the merge is said before any question about who reviews");
+    assert.deepEqual(refusal.data.merged.map((m: Recorded) => [m.pr, m.merged_at, m.merge_commit]), [
+      ["AMD-AGI/PrimusClaw#306", "2026-11-05T09:12:44Z", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"],
+      ["AMD-AGI/PrimusClaw#308", "2026-11-05T10:01:02Z", "0f9e8d7c6b5a40f9e8d7c6b5a40f9e8d7c6b5a40"],
+    ]);
+    assert.match(refusal.message, /nothing was started or handed over[\s\S]*ask nothing about the reviewer/);
+    // As the user themself, and as a listed person the message names: the same.
+    assert.equal(await code(rt.reviewStart(turn, { prs, merge: true })), "already_merged");
+    assert.equal(calls.start.length, 0, "no review started");
+    assert.equal(await actionsRun(), 0, "nothing handed to the channel");
+    assert.equal(await count("claw_assistant_review_handoffs"), 0);
+
+    // One merged and one open: the open one is not started by this call either, and the refusal says which is which.
+    delete mergedOnGithub["AMD-AGI/PrimusClaw#308"];
+    const mixed = await code(rt.reviewStart(turn, { prs, merge: true }));
+    assert.equal(mixed, "already_merged");
+    assert.equal(calls.start.length, 0);
+    // Called again with only the open one, it starts.
+    await rt.reviewStart(turn, { prs: [prs[1]], merge: true });
+    assert.equal(calls.start.length, 1);
+
+    // A pull request the message does not name is refused before GitHub is asked about it.
+    stateReads.length = 0;
+    assert.equal(await code(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#999"], merge: true })), "pr_not_in_message");
+    assert.deepEqual(stateReads, []);
+    // Nothing merged: the reviewer question stands as before.
+    mergedOnGithub = {};
+    assert.equal(await code(rt.reviewStart(turn, { prs, merge: true, reviewer: "eval-reviewer" })), "reviewer_not_in_message");
+
+    // A listed person the message names, from a channel that takes handoffs: nothing is handed over for a merged pull request.
+    mergedOnGithub = { "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-05T09:12:44Z", merge_commit: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", merged_by: "zoroyihan7" } };
+    await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
+    const named = await userTurn(alice, `请 Wei Lei 帮我 review 并合入：\n${prs[0]}`, { context: ctx });
+    assert.equal(await code(rt.reviewStart(named, { prs: [prs[0]], merge: true, reviewer: "u-weilei" })), "already_merged");
+    assert.equal(await actionsRun(), 0, "nothing handed to the channel");
+    assert.equal(await count("claw_assistant_review_handoffs"), 0);
+    assert.equal(calls.start.length, 1, "nothing more started");
+    // The same request for a pull request that is not merged is handed over: the check is what held it back.
+    mergedOnGithub = {};
+    const open = await userTurn(alice, `请 Wei Lei 帮我 review 并合入：\n${prs[0]}`, { context: ctx });
+    assert.equal(((await rt.reviewStart(open, { prs: [prs[0]], merge: true, reviewer: "u-weilei" })) as Recorded).handed_off, true);
+    assert.equal(await actionsRun(), 1);
   });
 
   test("R1 review_restart takes a review the user pointed at, and only a review", async () => {
