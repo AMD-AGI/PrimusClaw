@@ -31,6 +31,14 @@ const logger = pino({ name: "notification-outbox" });
 
 /** Seconds to wait after the Nth failed attempt; the last step repeats. */
 export const RETRY_BACKOFF_SECONDS = [1, 5, 30, 300];
+/**
+ * The longest wait of a subscription's probe: its oldest row that has failed, after a failure that says the receiver is down
+ * rather than refusing (a connection error, a timeout, a 5xx, 408, 429). The other rows keep the backoff above, and go out the
+ * moment the probe gets a 2xx (`releaseWaiting`). Without it a receiver that was down for more than about 40 s -- a pod rolled
+ * with the Recreate strategy -- heard nothing until the 300 s step ran out: every notice of the outage came five minutes late.
+ * One row per failing subscription, so a receiver down for a day is asked once every `PROBE_SECONDS`, not once per row.
+ */
+export const PROBE_SECONDS = 15;
 /** A row that has not been delivered this long after it was created is dropped. */
 export const GIVE_UP_AFTER_HOURS = 24;
 /**
@@ -386,13 +394,37 @@ async function claimDue(): Promise<Claimed[]> {
       WHERE id IN (
         SELECT id FROM claw_notification_outbox
          WHERE delivered_at IS NULL AND dropped_at IS NULL AND next_attempt_at <= NOW()
-         ORDER BY next_attempt_at ASC
+           -- A row whose subscription was deleted waits for its owner's next subscription (adoptOrphanedRows).
+           AND subscription_id IS NOT NULL
+         ORDER BY next_attempt_at ASC, id ASC
          LIMIT $1
          FOR UPDATE SKIP LOCKED)
       RETURNING id, event_id, subscription_id, payload, attempts,
                 created_at < NOW() - make_interval(hours => $3) AS expired`,
     [CLAIM_BATCH, CLAIM_LEASE_SECONDS, GIVE_UP_AFTER_HOURS],
   )).rows;
+}
+
+/** A failure that says the receiver is not there (yet) rather than that it refuses: what the probe retries soon. */
+export function receiverDown(status: string): boolean {
+  if (status.startsWith("error:")) return true;
+  const code = /^http_(\d{3})$/.exec(status)?.[1];
+  return code !== undefined && (code.startsWith("5") || code === "408" || code === "429");
+}
+
+/**
+ * A subscription whose receiver just answered 2xx after failing: every row of it that waits out a backoff from an earlier failure is
+ * due now, so what queued during an outage goes out with the probe's success instead of when each row's own wait runs out. Rows
+ * never tried (a held say, `say-hold.ts`) and a first send another replica holds are not touched. Returns how many were released.
+ */
+async function releaseWaiting(subscriptionId: string): Promise<number> {
+  const r = await db.query(
+    `UPDATE claw_notification_outbox SET next_attempt_at = NOW()
+      WHERE subscription_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL
+        AND attempts > 0 AND last_status IS NOT NULL AND next_attempt_at > NOW()`,
+    [subscriptionId],
+  );
+  return r.rowCount ?? 0;
 }
 
 async function recordFailure(row: Claimed, status: string): Promise<void> {
@@ -403,12 +435,19 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
     );
     logger.warn({ eventId: row.event_id, subscriptionId: row.subscription_id, status }, "notification.dropped_after_retries");
   } else {
-    const wait = RETRY_BACKOFF_SECONDS[Math.min(row.attempts - 1, RETRY_BACKOFF_SECONDS.length - 1)];
+    const backoff = RETRY_BACKOFF_SECONDS[Math.min(row.attempts - 1, RETRY_BACKOFF_SECONDS.length - 1)];
+    // The subscription's probe (`PROBE_SECONDS`): its oldest row that has been tried and is still pending, when the receiver is down.
     await db.query(
-      `UPDATE claw_notification_outbox
-          SET next_attempt_at = NOW() + make_interval(secs => $2), last_status = $3
-        WHERE id = $1`,
-      [row.id, wait, status],
+      `UPDATE claw_notification_outbox o
+          SET next_attempt_at = NOW() + make_interval(secs => CASE
+                WHEN $4::boolean AND NOT EXISTS (
+                  SELECT 1 FROM claw_notification_outbox p
+                   WHERE p.subscription_id = o.subscription_id AND p.id < o.id
+                     AND p.delivered_at IS NULL AND p.dropped_at IS NULL AND p.attempts > 0)
+                THEN LEAST($2::int, $5::int) ELSE $2::int END),
+              last_status = $3
+        WHERE o.id = $1`,
+      [row.id, backoff, status, receiverDown(status), PROBE_SECONDS],
     );
   }
   const sub = (await db.query(
@@ -442,7 +481,11 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
       `SELECT url, secret_enc, enabled FROM claw_notification_subscriptions WHERE subscription_id = $1`,
       [row.subscription_id],
     )).rows[0];
-    if (!sub || !sub.enabled) {
+    if (!sub) {
+      // Deleted after the claim: the row is now its owner's to carry over (`adoptOrphanedRows`), not a send that failed.
+      return;
+    }
+    if (!sub.enabled) {
       await db.query(
         `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'subscription_gone' WHERE id = $1`,
         [row.id],
@@ -474,7 +517,7 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
             `UPDATE claw_notification_outbox SET delivered_at = NOW(), last_status = $2 WHERE id = $1`,
             [row.id, String(code)],
           );
-          await db.query(
+          const recovered = await db.query(
             `UPDATE claw_notification_subscriptions
                 SET consecutive_failures = 0, failing_since = NULL,
                     -- A 2xx proves the receiver works. If another replica's failure
@@ -485,6 +528,8 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
                 AND (consecutive_failures <> 0 OR failing_since IS NOT NULL OR auto_disabled)`,
             [row.subscription_id],
           );
+          // The receiver is back: what waits behind the probe goes now, in this process's next round.
+          if ((recovered.rowCount ?? 0) > 0 && await releaseWaiting(row.subscription_id) > 0) rerun = true;
           delivered += 1;
           return;
         }
@@ -511,6 +556,7 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
   };
   // One receiver's slowness must not hold up the others: each subscription's rows
   // are sent in order, and the subscriptions run side by side.
+  await sweepOrphans();
   const bySub = new Map<string, Claimed[]>();
   for (const row of await claimDue()) {
     const list = bySub.get(row.subscription_id) ?? [];
@@ -525,6 +571,70 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
 
 export function newSubscriptionId(): string {
   return randomUUID();
+}
+
+/**
+ * Hand a new (or re-enabled) subscription what its owner's deleted subscriptions had not delivered yet.
+ *
+ * Deleting a subscription leaves its pending rows in place, with no subscription (`ON DELETE SET NULL`, schema.ts), because the
+ * usual reason for a delete is a receiver that makes its subscription again: a chat bot that lost the secret of its old one, or a
+ * person who unlinked and linked again. Before, the delete took the rows with it, and every notice queued for that person -- most
+ * of them during the receiver's own restart -- was gone for good. Here each such row from the last `GIVE_UP_AFTER_HOURS` whose type
+ * (and, for a work item's approval, source) the subscription takes is moved to it and made due, one row per event, so a receiver
+ * that dedups by event id sees it once. Concurrent calls cannot both take a row: the update re-reads `subscription_id` under its row
+ * lock. Returns how many rows were carried over.
+ */
+export async function adoptOrphanedRows(subscriptionId: string, q: Querier = direct): Promise<number> {
+  const r = await q(
+    `WITH sub AS (
+       SELECT subscription_id, owner_user_id, event_types, sources FROM claw_notification_subscriptions
+        WHERE subscription_id = $1 AND enabled
+     ), picked AS (
+       SELECT DISTINCT ON (o.event_id) o.id
+         FROM claw_notification_outbox o, sub
+        WHERE o.subscription_id IS NULL AND o.delivered_at IS NULL AND o.dropped_at IS NULL
+          AND o.created_at > NOW() - make_interval(hours => $2)
+          AND o.payload->>'user_id' = sub.owner_user_id
+          AND o.payload->>'type' = ANY(sub.event_types)
+          AND (o.payload->>'source' IS DISTINCT FROM 'assistant_item' OR 'assistant_item' = ANY(sub.sources))
+          AND NOT EXISTS (SELECT 1 FROM claw_notification_outbox d WHERE d.event_id = o.event_id AND d.subscription_id = sub.subscription_id)
+        ORDER BY o.event_id, o.id
+     )
+     UPDATE claw_notification_outbox o
+        -- A row that failed before is due now, its failure forgotten; one never tried keeps its time and status (a held say).
+        SET subscription_id = $1,
+            next_attempt_at = CASE WHEN o.attempts > 0 THEN NOW() ELSE o.next_attempt_at END,
+            last_status = CASE WHEN o.attempts > 0 THEN NULL ELSE o.last_status END
+       FROM picked
+      WHERE o.id = picked.id AND o.subscription_id IS NULL`,
+    [subscriptionId, GIVE_UP_AFTER_HOURS],
+  );
+  const n = r.rowCount ?? 0;
+  if (n > 0) logger.info({ subscriptionId, rows: n }, "notification.orphans_adopted");
+  return n;
+}
+
+const ORPHAN_SWEEP_MS = 10 * 60_000;
+let lastOrphanSweep = 0;
+
+/**
+ * Rows of a deleted subscription that no new one took within `GIVE_UP_AFTER_HOURS` are dropped, as a row that could not be delivered
+ * in that time is. At most every `ORPHAN_SWEEP_MS` per process. Never throws.
+ */
+async function sweepOrphans(): Promise<void> {
+  if (Date.now() - lastOrphanSweep < ORPHAN_SWEEP_MS) return;
+  lastOrphanSweep = Date.now();
+  await db.query(
+    `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'subscription_gone'
+      WHERE subscription_id IS NULL AND delivered_at IS NULL AND dropped_at IS NULL
+        AND created_at < NOW() - make_interval(hours => $1)`,
+    [GIVE_UP_AFTER_HOURS],
+  ).catch((err) => logger.error({ err }, "notification.orphan_sweep_failed"));
+}
+
+/** Test seam: the next `deliverDue` sweeps orphans whenever the last sweep was. */
+export function __sweepOrphansNextForTest(): void {
+  lastOrphanSweep = 0;
 }
 
 const POLL_MS = 5000;

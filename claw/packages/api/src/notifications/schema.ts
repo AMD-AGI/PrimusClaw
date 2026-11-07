@@ -49,4 +49,27 @@ export async function ensureNotificationSchema(client: pg.PoolClient): Promise<v
        ON claw_notification_outbox(next_attempt_at)
        WHERE delivered_at IS NULL AND dropped_at IS NULL`,
   );
+  // Deleting a subscription keeps its rows, with no subscription, for its owner's next one (`adoptOrphanedRows`, outbox.ts): the
+  // cascade a table made before this deleted every notice queued for a receiver that made its subscription again. Changed once,
+  // when the key still cascades; NOT VALID, as every row there already references a subscription.
+  await client.query(`
+    DO $$
+    DECLARE c RECORD;
+    BEGIN
+      FOR c IN SELECT conname FROM pg_constraint
+                WHERE conrelid = 'claw_notification_outbox'::regclass AND contype = 'f' AND confdeltype <> 'n' LOOP
+        EXECUTE format('ALTER TABLE claw_notification_outbox DROP CONSTRAINT %I', c.conname);
+      END LOOP;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'claw_notification_outbox'::regclass AND contype = 'f') THEN
+        ALTER TABLE claw_notification_outbox ALTER COLUMN subscription_id DROP NOT NULL;
+        ALTER TABLE claw_notification_outbox ADD CONSTRAINT claw_notification_outbox_subscription_id_fkey
+          FOREIGN KEY (subscription_id) REFERENCES claw_notification_subscriptions(subscription_id) ON DELETE SET NULL NOT VALID;
+      END IF;
+    END $$
+  `);
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_notification_outbox_orphans
+       ON claw_notification_outbox(created_at)
+       WHERE subscription_id IS NULL AND delivered_at IS NULL AND dropped_at IS NULL`,
+  );
 }

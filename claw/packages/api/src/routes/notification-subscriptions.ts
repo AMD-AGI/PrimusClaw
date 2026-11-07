@@ -26,7 +26,7 @@ import { getUser } from "../auth/middleware.js";
 import { encryptUserEnvValue } from "../crypto/user-env.js";
 import { db } from "../infra/db.js";
 import { ASSISTANT_EVENT_TYPES } from "../notifications/assistant-events.js";
-import { newSubscriptionId } from "../notifications/outbox.js";
+import { adoptOrphanedRows, newSubscriptionId } from "../notifications/outbox.js";
 import { guardWebhookUrl, parseAllowedHosts } from "../notifications/url-guard.js";
 
 const MAX_SUBSCRIPTIONS_PER_USER = 5;
@@ -43,13 +43,22 @@ const logger = pino({ name: "notification-subscriptions" });
 const SAY_TYPES = ["assistant.say", "work_item.needs_you"];
 
 /**
- * A subscription that now takes the assistant's messages: what was said to its owner while nothing could carry it, about
- * an item that still needs them, is sent to it once (`resendUnreachedSays`). Never fails the request: the subscription is
- * saved, and the silent sweep sends the same messages on its next pass.
+ * A subscription made, or changed while enabled: what its owner's deleted subscriptions had not delivered is carried over to it
+ * (`adoptOrphanedRows`), and, when it takes the assistant's messages, what was said to its owner while nothing could carry it is sent
+ * to it once (`resendUnreachedSays`): a say about an item that still needs them, and any other say of the last day. Never fails the
+ * request: the subscription is saved, and the silent sweep sends the item's messages on its next pass.
  */
 async function resendAfterSubscribing(userId: string, row: Record<string, unknown>): Promise<void> {
+  if (row.enabled !== true) return;
+  // First what a deleted subscription of the owner's had queued and not delivered: a receiver that made its subscription again
+  // (a restart that lost it, an unlink and link) gets it on this one. Before the resend, which then finds those says on their way.
+  try {
+    await adoptOrphanedRows(String(row.subscription_id));
+  } catch (err) {
+    logger.warn({ err, userId }, "notification.adopt_orphans_failed");
+  }
   const types = (row.event_types as string[] | null) ?? [];
-  if (row.enabled !== true || !types.some((t) => SAY_TYPES.includes(t))) return;
+  if (!types.some((t) => SAY_TYPES.includes(t))) return;
   try {
     await resendUnreachedSays({ userId });
   } catch (err) {

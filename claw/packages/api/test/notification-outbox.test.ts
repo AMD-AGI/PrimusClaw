@@ -224,11 +224,12 @@ describe("notification outbox", { skip }, () => {
       assert.deepEqual(await deliver(), { delivered: 0, failed: 0 });
     });
 
-    test("a failing receiver is retried on the backoff schedule with the same event id, then succeeds once", async () => {
+    test("a refusing receiver is retried on the backoff schedule with the same event id, then succeeds once", async () => {
       await subscribe();
       await seedRun({ sid: "s1", tid: "t1", trigger: "trg" });
       await outbox.recordRunFinished({ sessionId: "s1", taskIds: ["t1"], outcome: "completed" });
-      status = 503;
+      // A refusal, not a receiver that is down: no probe (the next test), the whole schedule.
+      status = 401;
       const wait = async () => Number(((await q(
         "SELECT EXTRACT(EPOCH FROM (next_attempt_at - NOW())) AS s FROM claw_notification_outbox",
       )).rows[0] as any).s);
@@ -245,6 +246,47 @@ describe("notification outbox", { skip }, () => {
       assert.equal(new Set(sent.map((s) => s.headers[EVENT_ID_HEADER])).size, 1, "every attempt carries the same event id");
       assert.equal(sent.length, outbox.RETRY_BACKOFF_SECONDS.length + 1);
       assert.equal((await rows())[0].attempts, outbox.RETRY_BACKOFF_SECONDS.length + 1);
+    });
+
+    test("a receiver that is down is probed every PROBE_SECONDS by its oldest row, and its first 2xx sends the rest at once", async () => {
+      // A receiver rolled with the Recreate strategy is down for about a minute, which took every row past the 30 s step to 300 s, so
+      // the notices of a rollout reached people five minutes after the pod was Ready.
+      const sub = await subscribe();
+      for (let i = 0; i < 3; i++) {
+        await q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload) VALUES ($1, $2, '{}'::jsonb)", [`ev-${i}`, sub.id]);
+      }
+      const waits = async () => (await q(
+        "SELECT event_id, EXTRACT(EPOCH FROM (next_attempt_at - NOW()))::float AS s FROM claw_notification_outbox ORDER BY id",
+      )).rows.map((r: any) => [r.event_id, Number(r.s)] as [string, number]);
+      for (const down of [503, "ECONNREFUSED", 502, "deadline", 504]) {
+        status = typeof down === "number" ? down : 0;
+        const realTransport = transport;
+        const t: Transport = typeof down === "number" ? realTransport : async (req) => { sent.push(req); throw new Error(down); };
+        await outbox.deliverDue({ transport: t, resolve: pub, allowedHosts: new Set() });
+        await makeDue();
+      }
+      await outbox.deliverDue({ transport, resolve: pub, allowedHosts: new Set() });   // a sixth failure, past the 300 s step
+      const [probe, ...rest] = await waits();
+      assert.equal(probe[0], "ev-0");
+      assert.ok(probe[1] > outbox.PROBE_SECONDS - 2 && probe[1] <= outbox.PROBE_SECONDS, `the oldest row is the probe: waits ${probe[1]}s`);
+      for (const [id, w] of rest) assert.ok(w > 298 && w <= 300, `${id} keeps the backoff: waits ${w}s`);
+
+      status = 200;
+      sent.length = 0;
+      await q("UPDATE claw_notification_outbox SET next_attempt_at = NOW() - interval '1 second' WHERE event_id = 'ev-0'");
+      await outbox.kickDelivery({ transport, resolve: pub, allowedHosts: new Set() });
+      assert.deepEqual(sent.map((r) => r.headers[EVENT_ID_HEADER]), ["ev-0", "ev-1", "ev-2"],
+        "the probe's 2xx releases the rest, sent in the same kick and in order, not 300 s later");
+      assert.equal(((await q("SELECT COUNT(*)::int AS n FROM claw_notification_outbox WHERE delivered_at IS NOT NULL")).rows[0] as any).n, 3);
+    });
+
+    test("only a failure that says the receiver is down makes a probe: a refusal keeps the backoff", async () => {
+      assert.deepEqual(
+        ["error:connect ECONNREFUSED", "error:deadline", "http_500", "http_503", "http_408", "http_429", "http_400", "http_401", "http_404", "refused:private_address"]
+          .map((st) => [st, outbox.receiverDown(st)]),
+        [["error:connect ECONNREFUSED", true], ["error:deadline", true], ["http_500", true], ["http_503", true], ["http_408", true],
+          ["http_429", true], ["http_400", false], ["http_401", false], ["http_404", false], ["refused:private_address", false]],
+      );
     });
 
     test("a row older than the give-up age is dropped, not retried for ever", async () => {
@@ -389,6 +431,82 @@ describe("notification outbox", { skip }, () => {
       assert.deepEqual(r, { delivered: 0, failed: 1 });
       assert.equal(sent.length, 0);
       assert.match((await rows())[0].last_status, /private_address/);
+    });
+  });
+
+  describe("a subscription deleted and made again", () => {
+    const post = (payload: unknown = { url: "https://93.184.216.34/claw" }) =>
+      app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: payload as object });
+    const del = (id: string) => app.inject({ method: "DELETE", url: `/v1/notification-subscriptions/${id}` });
+
+    test("keeps what was queued for it, and its owner's next subscription is sent it, once", async () => {
+      // A receiver that makes its subscription again (the Teams bot deletes its old one before it creates one): the delete took every notice
+      // queued for that person with it.
+      const first = (await post()).json().data;
+      await seedRun({ sid: "s1", tid: "t1", trigger: "trg" });
+      await outbox.recordRunFinished({ sessionId: "s1", taskIds: ["t1"], outcome: "completed" });
+      status = 503;
+      assert.deepEqual(await deliver(), { delivered: 0, failed: 1 }, "the receiver is down");
+      assert.equal((await del(first.subscription_id)).statusCode, 200);
+      const [kept] = await rows();
+      assert.ok(kept, "the row outlives its subscription");
+      assert.deepEqual([kept.subscription_id, kept.delivered_at, kept.dropped_at], [null, null, null]);
+      await makeDue();
+      sent.length = 0;
+      assert.deepEqual(await deliver(), { delivered: 0, failed: 0 }, "a row with no subscription is not sent, nor dropped");
+      assert.equal(sent.length, 0);
+
+      status = 200;
+      const second = (await post()).json().data;
+      const [moved] = await rows();
+      assert.equal(moved.subscription_id, second.subscription_id);
+      assert.deepEqual(await deliver(), { delivered: 1, failed: 0 }, "due at once, not after the old row's backoff");
+      assert.equal(verifySignature({
+        secret: second.secret, timestamp: sent[0].headers[TIMESTAMP_HEADER], signature: sent[0].headers[SIGNATURE_HEADER], body: sent[0].body,
+      }), "ok", "signed with the new subscription's secret");
+      assert.equal(sent[0].headers[EVENT_ID_HEADER], kept.event_id);
+
+      // Once: a third subscription of the same owner is not sent it again.
+      await post({ url: "https://93.184.216.34/other" });
+      assert.equal((await rows()).length, 1);
+      await makeDue();
+      assert.deepEqual(await deliver(), { delivered: 0, failed: 0 });
+    });
+
+    test("the delete no longer cascades, and building the schema again changes nothing", async () => {
+      const fk = async () => (await q(
+        `SELECT conname, confdeltype FROM pg_constraint WHERE conrelid = 'claw_notification_outbox'::regclass AND contype = 'f'`,
+      )).rows.map((r: any) => [r.conname, r.confdeltype]);
+      assert.deepEqual(await fk(), [["claw_notification_outbox_subscription_id_fkey", "n"]], "ON DELETE SET NULL");
+      const { ensureNotificationSchema } = await import("../src/notifications/schema.js");
+      await ensureNotificationSchema({ query: q } as never);
+      assert.deepEqual(await fk(), [["claw_notification_outbox_subscription_id_fkey", "n"]]);
+      await assert.rejects(
+        q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload) VALUES ('ev-x', $1, '{}'::jsonb)", [outbox.newSubscriptionId()]),
+        /foreign key/, "a row still has to name a subscription that exists",
+      );
+    });
+
+    test("is not sent to another user's subscription, nor to one that does not take its type; and is dropped after the give-up age", async () => {
+      const first = (await post()).json().data;
+      await seedRun({ sid: "s1", tid: "t1", trigger: "trg" });
+      await outbox.recordRunFinished({ sessionId: "s1", taskIds: ["t1"], outcome: "completed" });
+      assert.equal((await del(first.subscription_id)).statusCode, 200);
+
+      caller = user("u2");
+      await post();
+      caller = user("u1");
+      await post({ url: "https://93.184.216.34/approvals", event_types: ["approval.requested"] });
+      assert.equal((await rows())[0].subscription_id, null, "neither took it");
+
+      await q("UPDATE claw_notification_outbox SET created_at = NOW() - interval '25 hours'");
+      await post({ url: "https://93.184.216.34/late" });
+      assert.equal((await rows())[0].subscription_id, null, "too old to be carried over");
+      outbox.__sweepOrphansNextForTest();
+      await deliver();
+      const [gone] = await rows();
+      assert.ok(gone.dropped_at, "dropped, as an undeliverable row of that age is");
+      assert.equal(gone.last_status, "subscription_gone");
     });
   });
 

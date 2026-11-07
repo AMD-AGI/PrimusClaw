@@ -117,6 +117,14 @@ record it.
   new pairing command, not to "run init and login again", which it never did.
 - `GET /v1/remote-agents/connectors` says of each machine whether it was connected with a pairing code (`paired`), so a client can
   tell how to connect it again: a new pairing command, not `claw-connector login`.
+- Notifications are no longer lost when a receiver makes its subscription again or restarts. Deleting a subscription used to
+  delete every row still queued for it (`ON DELETE CASCADE`), so a receiver that deletes its old subscription and makes a new one
+  lost what was queued meanwhile; those rows are now kept and carried over, once per event, to the owner's next subscription that
+  takes their type (within the 24-hour give-up window). An assistant message about no work item, said while the user had no
+  subscription for it, is sent to the user's next subscription, once (the last 24 hours), as only a message about an item that
+  still needs the user was before. And a receiver that was down for more than about 40 seconds (a Recreate rollout) no longer hears
+  nothing for five minutes: its oldest failed row is retried every 15 seconds while the failures say it is down (connection error,
+  timeout, 5xx, 408, 429), and its first 2xx sends everything that waited behind it at once.
 - "让开发机上的 claude 跑 make test" with no machine connected answers the same one-line pairing command, not the four setup steps.
   devenv_send refused `no_machine` because the user has no machine at all now carries in `data.connect_a_machine` the pairing made
   for them (`commands` the one line, `text_zh` and `text_en` with it in a code block, `pairing` its minutes), under the same gate

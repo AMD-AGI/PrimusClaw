@@ -51,7 +51,7 @@ export const silentSweepPorts = { recordNeedsYouFallback, resendUnreachedSays, r
 const told = (notifications: boolean): string => notifications
   ? `s.delivered_at IS NOT NULL OR EXISTS (
        SELECT 1 FROM claw_notification_outbox o
-        WHERE o.event_id = s.say_id::text AND o.dropped_at IS NULL AND o.last_status IS NULL)
+        WHERE o.event_id = s.say_id::text AND o.dropped_at IS NULL AND o.last_status IS NULL AND o.subscription_id IS NOT NULL)
      OR (s.session_id IS NOT NULL AND NOT EXISTS (
        SELECT 1 FROM claw_notification_subscriptions n
         WHERE n.owner_user_id = s.user_id AND n.enabled AND (${SAY_EVENT_TYPE_SQL}) = ANY(n.event_types)))`
