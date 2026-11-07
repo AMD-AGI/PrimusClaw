@@ -227,6 +227,10 @@ async function store(q: Querier, m: ToStore): Promise<Stored | null> {
     )).rows
     : [];
   const subscribers = await enqueue(m.sayId, subs, payload, q, m.hold);
+  // Nothing carries it now: kept as it would have been sent, for the user's next subscription (`resendUnreachedSays`).
+  if (subscribers === 0 && CLAW_NOTIFICATIONS_ENABLED && !m.item) {
+    await q("UPDATE claw_assistant_says SET unsent_payload = $2::jsonb WHERE say_id = $1", [m.sayId, JSON.stringify(payload)]);
+  }
   return { sayId: m.sayId, sessionId: m.sessionId, payload, subscribers };
 }
 
@@ -1046,13 +1050,14 @@ export const SAY_EVENT_TYPE_SQL = `CASE WHEN s.fallback AND s.item_id IS NOT NUL
 
 /**
  * A say, `s`, that has not reached its user and is not on its way: not delivered, and no outbox row for it delivered or
- * still queued without a failure. One whose sends all failed or were dropped (a 410, a day of retries) is unreached too.
+ * still queued without a failure. One whose sends all failed or were dropped (a 410, a day of retries) is unreached too, and so is
+ * one whose only row lost its subscription (deleted, waiting for the owner's next one: `adoptOrphanedRows`).
  */
 const SAY_UNREACHED_SQL = `s.delivered_at IS NULL
              AND NOT EXISTS (
                SELECT 1 FROM claw_notification_outbox o
                 WHERE o.event_id = s.say_id::text
-                  AND (o.delivered_at IS NOT NULL OR (o.dropped_at IS NULL AND o.last_status IS NULL)))`;
+                  AND (o.delivered_at IS NOT NULL OR (o.dropped_at IS NULL AND o.last_status IS NULL AND o.subscription_id IS NOT NULL)))`;
 
 /**
  * A subscription, `n`, of the say's owner that can carry the say `s` and was never handed it: enabled, taking its
@@ -1086,6 +1091,59 @@ export const UNREACHED_SAY_SQL = `
  */
 export async function resendUnreachedSays(input: { userId: string; itemId?: string }): Promise<number> {
   if (!CLAW_NOTIFICATIONS_ENABLED || !CLAW_ASSISTANT_ENABLED) return 0;
+  const unattached = input.itemId === undefined ? await resendUnsentSays(input.userId) : 0;
+  return unattached + await resendItemSays(input);
+}
+
+/** How far back a say stored while nothing could carry it is still sent to the user's next subscription: as long as a send is retried. */
+export const UNSENT_SAY_HOURS = 24;
+
+/**
+ * The says about no item that were stored while no subscription of the user took their type (`unsent_payload`), from the last
+ * `UNSENT_SAY_HOURS`, oldest first, queued for every enabled subscription of the user's that takes the type and was never handed the
+ * say: a user whose channel's subscription was missing for a moment (a receiver making it again) is told what was said meanwhile,
+ * once, by the say's id. One delivered anywhere is not sent again. Before, only a say about an item that still needs the user was
+ * (`resendItemSays`), and every other one was lost for good.
+ */
+async function resendUnsentSays(userId: string): Promise<number> {
+  let written = 0;
+  // A page at a time, after the last one read (its time as text: a Date would drop the microseconds), so each is looked at once.
+  let after: { at: string; say_id: string } | null = null;
+  for (;;) {
+    const page = (await db.query(
+      `SELECT s.say_id::text AS say_id, s.unsent_payload AS payload, s.created_at::text AS at
+         FROM claw_assistant_says s
+        WHERE s.user_id = $1 AND s.item_id IS NULL AND s.unsent_payload IS NOT NULL AND s.delivered_at IS NULL
+          AND s.created_at > NOW() - make_interval(hours => $2)
+          AND ($3::timestamptz IS NULL OR (s.created_at, s.say_id) > ($3::timestamptz, $4::uuid))
+        ORDER BY s.created_at, s.say_id
+        LIMIT 100`,
+      [userId, UNSENT_SAY_HOURS, after?.at ?? null, after?.say_id ?? null],
+    )).rows as Array<{ say_id: string; payload: AssistantSayPayload; at: string }>;
+    written += await resendUnsentPage(userId, page);
+    if (page.length < 100) return written;
+    after = page[page.length - 1];
+  }
+}
+
+async function resendUnsentPage(userId: string, says: Array<{ say_id: string; payload: AssistantSayPayload }>): Promise<number> {
+  let written = 0;
+  for (const say of says) {
+    const subs = (await db.query(
+      `SELECT n.subscription_id FROM claw_notification_subscriptions n
+        WHERE n.owner_user_id = $1 AND n.enabled AND $2 = ANY(n.event_types)
+          AND NOT EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = $3 AND o.subscription_id = n.subscription_id)`,
+      [userId, say.payload.type, say.say_id],
+    )).rows;
+    const rows = await enqueue(say.say_id, subs, say.payload);
+    if (rows > 0) logger.info({ userId, sayId: say.say_id, rows }, "assistant.unsent_say_resent");
+    written += rows;
+  }
+  return written;
+}
+
+/** `resendUnreachedSays` for the says about an item that still needs the user. */
+async function resendItemSays(input: { userId: string; itemId?: string }): Promise<number> {
   const says = (await db.query(
     `SELECT DISTINCT ON (s.item_id) s.say_id::text AS say_id, s.text, (${SAY_EVENT_TYPE_SQL}) AS type, s.created_at, s.item_id
        FROM claw_work_items w

@@ -133,6 +133,9 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   // The assistant session the say was shown in, recorded once its event was published there while the session was still there (null:
   // none). A say shown there told a user who has no channel that carries it, and the silent sweep does not say it again (`silent-sweep.ts`).
   await client.query("ALTER TABLE claw_assistant_says ADD COLUMN IF NOT EXISTS session_id TEXT");
+  // A say stored while no subscription of its user took its type: what a receiver would have been sent, kept so that the user's next
+  // subscription is sent it as it was (`resendUnreachedSays`). Null for every say an outbox row carried.
+  await client.query("ALTER TABLE claw_assistant_says ADD COLUMN IF NOT EXISTS unsent_payload JSONB");
   // At most one system fallback per time an item needed the user. Ordinary says
   // are not limited: the assistant may speak about one item more than once.
   await client.query(
