@@ -332,6 +332,12 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
 
 interface MovingEvent { id: number; type: string; occurred_at: string; data: Record<string, unknown> }
 
+/** Nothing open on a closed item: no turn counted, and, while prompts are followed by name, none listed. */
+function clearOpen(p: RemoteParams): void {
+  p.open_turns = 0;
+  if (Array.isArray(p.open_cmd_seqs)) p.open_cmd_seqs = [];
+}
+
 /** What the agent answered in the turn that ended with event `endId`: its message chunks since the turn before it ended. */
 async function answerOf(q: Querier, sessionId: string, endId: number): Promise<string> {
   const rows = (await q(
@@ -517,7 +523,13 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       const named = (e.type === REMOTE_EVENT_TURN_END && Object.hasOwn(e.data, "cmd_seq")) || (refusedUnrun && seq !== null);
       if ((e.type === REMOTE_EVENT_TURN_END || refusedUnrun) && !named) p.open_cmd_seqs = null;
       if (Array.isArray(p.open_cmd_seqs) && named) {
-        if (board === "done") continue;
+        if (board === "done") {
+          // A closed item has nothing open. One closed from outside its events (the stop button, work_stop) still lists the prompt
+          // that was running; the end that turn brings (cancelled, or finished on its own as the stop was on its way) clears it. The
+          // cancels pending are left as they are: the next prompt passes over those whose ends have come (`notePrompt`).
+          if (e.type === REMOTE_EVENT_TURN_END) clearOpen(p);
+          continue;
+        }
         const ended = new Set<number>(seq !== null ? [seq] : []);
         // The end a cancel brings (`cancelled`, after the oldest cancel pending was sent): nothing sent before that cancel is left to
         // run, so every prompt open when it was sent ends with it, whether it names the turn it cancelled or none (it found nothing
@@ -571,7 +583,11 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         p.cancels = cancels;
       }
       const sentAfter = cancels.reduce((sum, c) => sum + c.n, 0);
-      if (board === "done" && e.type !== REMOTE_EVENT_SESSION_CLOSED) continue;
+      if (board === "done" && e.type !== REMOTE_EVENT_SESSION_CLOSED) {
+        // Counted, the same: a turn's end that reaches a closed item leaves no turn open on it (the cancels were taken above).
+        if (e.type === REMOTE_EVENT_TURN_END) clearOpen(p);
+        continue;
+      }
       if (e.type === REMOTE_EVENT_PERMISSION_REQUEST) {
         const actionId = flat(e.data.actionId, 128);
         if (!actionId || p.waiting.includes(actionId)) continue;
