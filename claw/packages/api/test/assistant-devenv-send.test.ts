@@ -592,6 +592,43 @@ describe("development environment items and devenv_send", { skip }, () => {
     }
   });
 
+  test("F17d a card pressed while its machine is being revoked: the press queues nothing and fails, the revoke does not wait", async () => {
+    const { inTransaction } = await import("../src/infra/db.js");
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const card = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
+    assert.equal(card.done, false, JSON.stringify(card));
+    // A revoke that has marked the machine and holds its row, not yet committed: the press reads the machine as still there.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let held!: () => void;
+    const isHeld = new Promise<void>((r) => { held = r; });
+    let closed: string[] = [];
+    const revoke = inTransaction(async (q) => {
+      await q("UPDATE claw_remote_connectors SET revoked_at = NOW(), stream_seen_at = NULL WHERE connector_id = $1", [laptop]);
+      held();
+      await gate;
+      closed = await tools.closeCardsOfConnector(q, "alice", laptop);
+    });
+    await isHeld;
+    const press = schedules.decideConfirmation({ userId: "alice", confirmationId: String(card.confirmation_id), decision: "allow", via: "button" });
+    // The press is seen waiting on the machine's row, holding its card.
+    let seen = false;
+    for (let i = 0; i < 100 && !seen; i++) {
+      seen = (await w.q("SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%claw_remote_connectors%FOR UPDATE%'")).length > 0;
+      if (!seen) await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(seen, "the press reached the machine's row");
+    release();
+    await revoke;
+    assert.deepEqual(closed, [], "the card being pressed is left to its press");
+    const out = await press;
+    assert.deepEqual([out.status, out.answered_now, (out.result as Recorded)?.error], ["failed", true, "no_machine"], JSON.stringify(out));
+    assert.deepEqual(await queued(laptop), [], "nothing queued for the revoked machine");
+    assert.deepEqual(await w.q("SELECT 1 FROM claw_remote_sessions WHERE connector_id = $1 AND status = 'active'", [laptop]), []);
+  });
+
   test("F4 only the user's own machines; two that fit is a question; an offline one says so", async () => {
     const alice = await w.user("alice");
     await w.user("bob");

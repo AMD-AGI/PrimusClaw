@@ -431,6 +431,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     });
     if (out.status === "limit") return fail(reply, 409, "session_limit_reached");
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");
+    if (out.status === "gone") return notFound(reply);
     waker.wake(`c:${connector.connector_id}`);
     // At the limit, sessions nobody was using were closed to make room: their connectors are told now, and the caller can say so.
     for (const c of new Set(out.reclaimed.map((r) => r.connector_id))) waker.wake(`c:${c}`);
@@ -517,6 +518,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     // A prompt and a stop are queued and noted one at a time per session, so the item counts them in the order the connector runs them.
     const out = type === "prompt" || type === "cancel" ? await inRemoteSessionOrder(sessionId, send) : await send();
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");
+    if (out.status === "gone") return notFound(reply);
     if (out.status === "duplicate") {
       const same = out.row.type === type && out.row.session_id === sessionId
         && (type !== "decision" || out.row.payload?.option_id === (parsed.value as { option_id: string }).option_id);

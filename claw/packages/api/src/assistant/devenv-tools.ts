@@ -694,6 +694,7 @@ export async function executeSend(
       };
     }
     if (made.status === "rate_limited") return { ok: false, error: "rate_limited", message: "too many instructions in the last minute: try again in a minute" };
+    if (made.status === "gone") return { ok: false, error: "no_machine", message: "that machine is no longer connected" };
     for (const c of new Set(made.reclaimed.map((r) => r.connector_id))) wakeConnector(c);
     sessionId = String(made.session.session_id);
     fresh = true;
@@ -717,6 +718,7 @@ export async function executeSend(
     return out;
   });
   if (issued.status === "rate_limited") return { ok: false, error: "rate_limited", message: "too many instructions in the last minute: try again in a minute" };
+  if (issued.status === "gone") return { ok: false, error: "no_machine", message: "that machine is no longer connected" };
   wakeConnector(plan.connector_id);
   const row = (await db.query(
     "SELECT item_id, seq, title FROM claw_work_items WHERE worker_session_id = $1 AND user_id = $2", [remoteWorkerSessionId(sessionId), userId],
@@ -824,9 +826,8 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
 export async function closeCardsOfConnector(q: Querier, owner: string, connectorId: string): Promise<string[]> {
   // A card being pressed right now is skipped, never waited for: the press holds the card's lock while its send waits for the
   // machine's, which this revoke holds, and the press waits on that send outside the database, so Postgres could not see the
-  // cycle and both would hang. That press finishes on its own after this revoke commits, with whatever its send decided: a send
-  // that had not yet read the machine finds it revoked and fails the card; one that had read it queues a command no revoked
-  // connector can fetch.
+  // cycle and both would hang. That press finishes on its own after this revoke commits: its send reads the machine again under
+  // that lock (`enqueueCommand`), finds it revoked, queues nothing and fails the card.
   // A Claw whose assistant never ran has no cards table, and its revoke must still work (a failed statement would abort the revoke).
   if (!(await q("SELECT to_regclass('claw_assistant_confirmations') IS NOT NULL AS present")).rows[0]?.present) return [];
   const closed = await q(
