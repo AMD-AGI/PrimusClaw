@@ -17,7 +17,7 @@ import { filterToRegExp } from "./nats-kv-stub.js";
 import fs from "node:fs";
 import { secretValuesOf } from "../src/apps/app-env.js";
 import { applyPlatformKeyEnv } from "../src/sandbox/params.js";
-import { appModelKeyEnv, appStartEnv, ensureAppSandbox, readSandboxNodeName, type AppSandboxRun } from "../src/apps/app-sandbox.js";
+import { appModelKeyEnv, appSandboxNamespace, appStartEnv, ensureAppSandbox, readSandboxNodeName, type AppSandboxRun } from "../src/apps/app-sandbox.js";
 import { SANDBOX_DEFAULT_TIMEOUT_SECONDS } from "../src/config.js";
 import { workloadTimeoutSeconds } from "../src/sandbox/safe-workload-provider.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
@@ -41,6 +41,7 @@ function fakeSafe() {
   let listStatus = 200;
   let extraItems: Array<Record<string, unknown>> = [];
   let listCalls = 0;
+  const listedWorkspaces: string[] = [];
   let createFailsAfterProvisioned: Error | null = null;
   const provider = {
     kind: "safe-workload",
@@ -60,6 +61,11 @@ function fakeSafe() {
   const fetch = (async (input: unknown) => {
     const url = new URL(String(input), "http://safe.test");
     if (listStatus !== 200) return new Response("nope", { status: listStatus });
+    // Like SaFE for a user who is not a system-admin: a list that names no
+    // workspace is refused (hosting, 2026-11-07: sa-eval-bot's run looped on 403).
+    const workspaceId = url.searchParams.get("workspaceId");
+    listedWorkspaces.push(workspaceId ?? "");
+    if (!workspaceId) return new Response(JSON.stringify({ errorMessage: "forbidden" }), { status: 403 });
     const envValue = url.searchParams.get("envValue");
     listCalls++;
     // Newest first, like the real list. The phase filter is deliberately NOT
@@ -72,7 +78,7 @@ function fakeSafe() {
     return new Response(JSON.stringify({ totalCount: all.length, items: all.slice(offset, offset + limit) }), { status: 200 });
   }) as typeof globalThis.fetch;
   return {
-    workloads, created, stopped, fetch,
+    workloads, created, stopped, fetch, listedWorkspaces,
     get listCalls() { return listCalls; },
     failList() { listStatus = 503; },
     withExtraItems(x: Array<Record<string, unknown>>) { extraItems = x; },
@@ -124,6 +130,25 @@ test("an app sandbox carries the session, component and run labels, via the shar
   // Session teardown deletes what it finds by this env: an app sandbox must not carry it.
   assert.equal(p.env.CLAW_SESSION_ID, undefined);
   assert.deepEqual(recorded, [["run-1", "wl-1"]], "the id is recorded");
+});
+
+test("the app runs in the run's workspace and is looked up there, whatever its resources", async () => {
+  // hosting, 2026-11-07: resources.workspace=crusoe-spur-vk with sandbox_workspace=top-models.
+  const safe = fakeSafe();
+  const hosted = run({
+    workspaceId: "crusoe-spur-vk",
+    sandboxSpec: { ...run().sandboxSpec, namespace: "crusoe-spur-vk", sandbox_workspace: "top-models", resources: { cpu: "32", memory: "256Gi" } } as AppSandboxRun["sandboxSpec"],
+  });
+  const out = await ensureAppSandbox(hosted, { fetch: safe.fetch, recordWorkloadId: async () => undefined });
+  assert.equal(out.created, true);
+  assert.equal(safe.created[0]!.namespace, "crusoe-spur-vk");
+  assert.equal(out.instance.namespace, "crusoe-spur-vk");
+  assert.deepEqual(safe.listedWorkspaces, ["crusoe-spur-vk"], "the lookup names the workspace, or SaFE refuses a non-admin");
+  // A GPU app keeps its named workspace too.
+  const gpu = fakeSafe();
+  const gpuRun = run({ workspaceId: "crusoe-spur-vk", sandboxSpec: { ...hosted.sandboxSpec, resources: { cpu: "32", gpu: "8" } } });
+  assert.equal((await ensureAppSandbox(gpuRun, { fetch: gpu.fetch, recordWorkloadId: async () => undefined })).instance.namespace, "crusoe-spur-vk");
+  assert.equal(appSandboxNamespace(gpuRun), "crusoe-spur-vk");
 });
 
 test("a second call for the same run returns the same sandbox and creates nothing", async () => {

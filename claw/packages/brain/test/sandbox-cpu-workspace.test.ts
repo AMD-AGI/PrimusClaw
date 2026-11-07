@@ -8,7 +8,8 @@
  * The rule is pinned three ways, because it is applied in three places that have to
  * agree: the pure function, the namespace a request's spec fingerprint folds in (the
  * same function picks the namespace the workload is created in), and the instance an
- * app sandbox is addressed by. The one Router serves both workspaces.
+ * app sandbox is addressed by when its run names no workspace (a run that names one
+ * runs there). The one Router serves both workspaces.
  */
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -117,7 +118,7 @@ test("the spec fingerprint folds in the namespace the rule picks (the workload i
   assert.notEqual(fingerprintOf({ ...gpu, workspace_id: "ws-x" }), fingerprintOf({ ...cpu, workspace_id: "ws-x" }));
 });
 
-test("an app sandbox is addressed in the workspace the rule picks", () => {
+test("an app sandbox is addressed in its named workspace, else the workspace the rule picks", () => {
   const run = (workspaceId: string | undefined, gpu: string) => ({
     workspaceId,
     platformKey: "pk",
@@ -125,7 +126,9 @@ test("an app sandbox is addressed in the workspace the rule picks", () => {
   }) as never;
   assert.equal(appSandboxInstance(run(undefined, "0"), "wl-1").namespace, "cpu-ws");
   assert.equal(appSandboxInstance(run(undefined, "8"), "wl-1").namespace, "gpu-ws");
-  assert.equal(appSandboxInstance(run("cpu-ws", "8"), "wl-1").namespace, "gpu-ws");
+  // The app runs in resources.workspace, which admission checked: the rule does not move it.
+  assert.equal(appSandboxInstance(run("cpu-ws", "8"), "wl-1").namespace, "cpu-ws");
+  assert.equal(appSandboxInstance(run("gpu-ws", "0"), "wl-1").namespace, "gpu-ws");
   assert.equal(appSandboxInstance(run("ws-x", "8"), "wl-1").namespace, "ws-x");
   assert.equal(sandboxNamespaceForResources(undefined, { gpu: "0" }), "cpu-ws");
 });

@@ -172,8 +172,17 @@ type ListResponse struct {
 	NextToken string            `json:"nextToken,omitempty"`
 }
 
-// firstWorkspace is the workspace the child workload runs in.
-func firstWorkspace(names []string) (string, error) {
+// grantWorkspace is the workspace a grant-key sandbox runs in: the one its
+// template names, else the grant's first. A template workspace the grant does
+// not list is refused: the attestation and the membership check covered only
+// the listed ones.
+func grantWorkspace(names []string, templateWorkspace string) (string, error) {
+	if templateWorkspace != "" {
+		if !contains(names, templateWorkspace) {
+			return "", grant.Op(http.StatusForbidden, "workspace_not_allowed", "template workspace "+templateWorkspace+" is not listed on the grant")
+		}
+		return templateWorkspace, nil
+	}
 	if len(names) == 0 || names[0] == "" {
 		return "", grant.Op(http.StatusBadRequest, "invalid_grant", "workspace is required")
 	}
@@ -209,7 +218,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	if who.owner {
 		workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, body.Metadata[workspaceMetadata], who.admin, who.user)
 	} else {
-		workspace, err = firstWorkspace(snap.Workspaces)
+		workspace, err = grantWorkspace(snap.Workspaces, tpl.Workspace)
 	}
 	if err != nil {
 		s.grants.AuditDenied(ctx, grantID, "", err)
