@@ -115,7 +115,8 @@ record it.
   after a stall, and every command older than the live TTL (`issued_at`, now in every command frame), with the new connector-side
   `POST /v1/remote-agents/connectors/:cid/commands/:cmd_id/confirm` before it runs; anything but `live` (`session_closed`,
   `cancelled`, `expired`, `gone`, 401 `revoked`, or no answer) is dropped and reported in the session as `command_rejected` with
-  `reason: "command_not_live"`. Claw deletes the queued commands that would make an agent act when it closes their session
+  `reason: "command_not_live"`. A command read before a stall that is still waiting to act (behind a running turn, or for a
+  terminal) is confirmed when it reaches the agent. Claw deletes the queued commands that would make an agent act when it closes their session
   (`close`, a reclaim, a revocation) and refuses a late confirmation for them (audited `command.refused_late`). `cancel` and `close`
   are never held up.
 - "连接我的开发环境" with no machine connected answers the one-line pairing command, every time. devenv_list with no machine, in a

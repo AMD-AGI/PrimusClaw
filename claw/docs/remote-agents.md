@@ -379,7 +379,9 @@ or removed the machine, and been told that what they sent will not run. So:
   or the wall clock, means the process could not run (SIGSTOP; the monotonic clock goes on while a process is stopped) or the
   machine slept (the wall clock jumps over it). Every command but a `cancel` or `close` read within 5 s after such a gap, and
   every one whose `issued_at` is older than the live TTL (`REMOTE_AGENT_TIMING.liveCommandTtlMs`, the same 5 minutes after which
-  Claw stops delivering it), is confirmed with `POST .../commands/:cmd_id/confirm` before it runs, in its session's order.
+  Claw stops delivering it), is confirmed with `POST .../commands/:cmd_id/confirm` before it runs, in its session's order. A
+  command read before a stall and still waiting to act when it ends (a prompt queued behind a running turn, or waiting for a
+  terminal) is confirmed when it reaches the agent. On the usual path (no stall, a fresh command) nothing is asked.
 - Anything but `live` is dropped: audited on the machine (`command_dropped`, `reason: "not_live"`), and said in the session, as
   `command_rejected {type, cmd_id, cmd_seq, reason: "command_not_live", status}` (a `session.new`: `session_closed` with that
   reason). No answer after a few tries counts as `unconfirmed`, and is dropped too. `401 revoked` stops the connector, as
