@@ -60,8 +60,31 @@ export { confirmationRef };
 
 const logger = pino({ name: "assistant-review-tools" });
 
+/**
+ * The user's own reviews of every one of `prs` created since the message was received, or null when any is missing: what an earlier
+ * call answering the same message started (one transaction starts all of a call's reviews, so it is all or none).
+ */
+export async function startedSince(userId: string, since: Date, prs: readonly PrRef[]): Promise<Array<{ item_id: string; seq: number; pr: string }> | null> {
+  const rows = (await db.query(
+    `SELECT item_id, seq, params->'pr'->>'owner' AS owner, params->'pr'->>'repo' AS repo, params->'pr'->>'number' AS number
+       FROM claw_work_items
+      WHERE user_id = $1 AND kind = 'review' AND NOT (params ? 'requested_by') AND created_at >= $2
+      ORDER BY created_at`,
+    [userId, since],
+  )).rows as Array<{ item_id: string; seq: number; owner: string; repo: string; number: string }>;
+  const out: Array<{ item_id: string; seq: number; pr: string }> = [];
+  for (const pr of prs) {
+    const hit = rows.find((r) => r.owner.toLowerCase() === pr.owner.toLowerCase() && r.repo.toLowerCase() === pr.repo.toLowerCase()
+      && r.number === String(pr.number));
+    if (!hit) return null;
+    out.push({ item_id: hit.item_id, seq: Number(hit.seq), pr: `${pr.owner}/${pr.repo}#${pr.number}` });
+  }
+  return out;
+}
+
 /** The ways out of this module, so a test can stand in for what lies beyond the HTTP boundary of each. */
 export const reviewToolPorts = {
+  startedSince,
   startReviews,
   restartReview,
   /** The decision route's own function (`decideConfirmation`), with the process's review service, not a copy of it. */
@@ -583,13 +606,14 @@ export async function reviewStart(
     }
     const signedIn = await requesterSignedIn(q, claims.sid, userId, message, via);
     const note = asked;
-    if (!args.reviewer || args.reviewer === userId) return { userId, signedIn, note, actingAs: userId, actingAsName: undefined };
+    const receivedAt = message.receivedAt;
+    if (!args.reviewer || args.reviewer === userId) return { userId, signedIn, note, receivedAt, actingAs: userId, actingAsName: undefined };
     const reviewer = lower(args.reviewer);
     const people = message.context.people;
     const person = people.find((p): p is ChannelPerson & { user_id: string } => p.user_id === args.reviewer);
     if (person && reviewerNamed(message.content, person, people)) {
       // A review as someone else runs on their account: the person's message must name them, not only the channel list them.
-      return { userId, signedIn, note, actingAs: args.reviewer, actingAsName: person.name };
+      return { userId, signedIn, note, receivedAt, actingAs: args.reviewer, actingAsName: person.name };
     }
     const named = !person && people.some((p) => !p.user_id && (lower(p.name) === reviewer || (p.email !== undefined && lower(p.email) === reviewer)));
     if (named) refuseUngrounded("reviewer_not_linked", "that person has not linked their account, so nobody can review as them: tell the user");
@@ -598,6 +622,15 @@ export async function reviewStart(
     if (grounded && err instanceof ToolRefused && ASKS_WHICH_REVIEWER.has(err.code)) await refuseMerged(grounded, claims.sid, prs);
     throw err;
   });
+  // Sent again (Brain resends a call whose answer was lost, `idempotentHint`): what the first call started is the answer, even when it
+  // has already finished or merged, which the one-open-review-per-pull-request rule alone would not catch.
+  if (ready.actingAs === ready.userId) {
+    const started = await reviewToolPorts.startedSince(ready.userId, ready.receivedAt, prs);
+    if (started) {
+      logger.info({ items: started.map((i) => i.item_id) }, "assistant.review_start_repeated");
+      return { ok: true, items: started, repeated: "these reviews were already started for this message (by an earlier call whose answer was lost): nothing new was started" };
+    }
+  }
   await refuseMerged(ready.userId, claims.sid, prs);
   // A review asked of someone else runs on their own credentials, which only the channel that carried the message can bring. When it
   // said it can be handed one, it is: the channel starts it as the reviewer and tells the person how it went. Otherwise it is refused

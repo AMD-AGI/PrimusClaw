@@ -795,6 +795,30 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(await actionsRun(), 1);
   });
 
+  test("S10 review_start sent again for the same message (Brain resends a lost answer) starts nothing more, even once the first review is done", async () => {
+    const pr = { owner: "AMD-AGI", repo: "PrimusClaw", number: 261 };
+    const turn = await userTurn(alice, "审 261");
+    startAnswer = async () => {
+      // What the first call did: one review, which has already finished by the time its lost answer is asked for again.
+      const itemId = await reviewItem(alice, 7, pr);
+      await w.q("UPDATE claw_work_items SET board_state = 'done' WHERE item_id = $1", [itemId]);
+      return [{ item_id: itemId, seq: 7, pr }];
+    };
+    await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#261"], merge: false });
+    assert.equal(calls.start.length, 1);
+
+    const again = await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#261"], merge: false }) as Recorded;
+    assert.equal(calls.start.length, 1, "the resend starts no second review");
+    assert.deepEqual(again.items, [{ item_id: `kwi_rev${alice.userId}7`, seq: 7, pr: "AMD-AGI/PrimusClaw#261" }], "it answers what the first call started");
+    assert.match(String(again.repeated), /already started for this message/);
+
+    // A new message asking again is a new request, and is started.
+    startAnswer = async () => [{ item_id: "kwi_next", seq: 8, pr }];
+    const later = await userTurn(alice, "再审一次 261");
+    await rt.reviewStart(later, { prs: ["AMD-AGI/PrimusClaw#261"], merge: false });
+    assert.equal(calls.start.length, 2, "a later message starts its own review");
+  });
+
   test("R1 review_restart takes a review the user pointed at, and only a review", async () => {
     const first = await reviewItem(alice, 1, { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 });
     const task = await w.createItem(alice, "Fix the build");
