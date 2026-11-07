@@ -878,6 +878,11 @@ record it.
 - `@primusclaw/connector` 0.1.7: `claw-connector pair <code> --server <url>` signs a machine in with a one-time code from the chat
   (#421); setup no longer touches a network mount that may hang, the npm install of the adapters runs without the agents' keys,
   and a session that never received a message survives a connector restart (#435). (0.1.6, as published, also carried #430 and #425.)
+- `@primusclaw/connector` 0.1.8: `init` asks before writing Claude hooks and a stalled state directory no longer stops the heartbeat
+  (#401); a paired machine that was disconnected is told to pair again (#437); a conversation open in a terminal can be taken over
+  once the person confirms (#423, connector part); a fresh install trusts the machine's CA store without `NODE_USE_SYSTEM_CA` (#443);
+  every command answers `-h`/`--help` and an unknown option exits 2 (#440); a crash that damages `connector.json` no longer
+  registers the machine as a new connector (#446).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
