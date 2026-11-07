@@ -124,6 +124,31 @@ describe("a session's delete ends its app runs' grants and leaves the outcome re
     assert.deepEqual(revoked, ["gr-live"]);
   });
 
+  test("the run as a Brain reads it says the user cancelled it, through a finish-only reopen and a patch", async () => {
+    const state = await import("../src/tasks/app-run-state.js");
+    await seed("app-1", "s1", null);
+    await seed("app-4", "s2", null);
+    let run = (await state.readAppRun("app-1"))!;
+    assert.deepEqual({ status: run.task_status, deleted: run.session_deleted }, { status: "running", deleted: false });
+
+    await teardown.commitSessionDeletion("s1");
+    run = (await state.readAppRun("app-1"))!;
+    assert.deepEqual({ status: run.task_status, deleted: run.session_deleted }, { status: "cancelled", deleted: true });
+    const other = (await state.readAppRun("app-4"))!;
+    assert.deepEqual({ status: other.task_status, deleted: other.session_deleted }, { status: "running", deleted: false });
+
+    // A finish-only dispatch reopens the task to `preparing`; the user's cancel is what the Brain must see.
+    await sql(`UPDATE claw_tasks SET status = 'preparing', lease_owner = 'brain-B', lease_expires_at = NOW() + INTERVAL '30 seconds',
+                      metadata = jsonb_build_object('app_finish_prior', jsonb_build_object('status', 'cancelled'))
+                WHERE task_id = 'app-1'`);
+    await sql("UPDATE claw_sessions SET deleted_at = NULL WHERE session_id = 's1'");
+    run = (await state.readAppRun("app-1"))!;
+    assert.deepEqual({ status: run.task_status, deleted: run.session_deleted }, { status: "cancelled", deleted: false });
+    const patched = await state.patchAppRun("app-1", { brainId: "brain-B", claimCount: 1 }, { state: "finishing" });
+    assert.equal(patched.ok, true);
+    assert.equal(patched.ok && patched.run.task_status, "cancelled", "a patch answers with the same view");
+  });
+
   async function tasksAs(caller: UserInfo): Promise<FastifyInstance> {
     const { registerTaskRoutes } = await import("../src/routes/tasks.js");
     const app = Fastify();

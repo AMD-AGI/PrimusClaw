@@ -705,17 +705,26 @@ function deletedSessionRun(deleted: boolean) {
     extend: noopAppGrant.extend,
   };
   const asked: string[] = [];
+  // The session is deleted when the run is cancelled, not before: it ran until then.
+  const at = { deleted: false };
   const runner = new AppRunner(RUN_ID, PLATFORM_KEY, {
     store: world.store, sandbox: world.sandbox, grant, now: world.now, sleep: world.sleep, tickMs: 5000,
-    sessionDeleted: async (sid) => { asked.push(sid); return deleted; },
+    sessionDeleted: async (sid) => { asked.push(sid); return at.deleted; },
   });
-  return { world, runner, order, asked };
+  /** Bring the run to `running`, then delete the session (or not) as the cancel lands. */
+  const runThenCancel = async () => {
+    for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
+    assert.equal(world.rec.state, "running");
+    at.deleted = deleted;
+  };
+  return { world, runner, order, asked, runThenCancel };
 }
 
 test("R5b a deleted session's run: the grant is revoked before the SIGTERM, and the application gets the short grace", async () => {
   const { SESSION_DELETED_STOP_GRACE_SEC } = await import("../src/apps/app-runner.js");
-  const { world, runner, order, asked } = deletedSessionRun(true);
-  for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
+  const { world, runner, order, asked, runThenCancel } = deletedSessionRun(true);
+  await runThenCancel();
+  asked.length = 0;
   const wl = world.rec.sandbox_workload_id!;
   const cancelledAt = world.now();
   const outcome = await runner.finishNow("cancelled");
@@ -735,8 +744,8 @@ test("R5b a deleted session's run: the grant is revoked before the SIGTERM, and 
 });
 
 test("R5c an ordinary cancel keeps the application's own grace and revokes after it", async () => {
-  const { world, runner, order } = deletedSessionRun(false);
-  for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
+  const { world, runner, order, runThenCancel } = deletedSessionRun(false);
+  await runThenCancel();
   const cancelledAt = world.now();
   await runner.finishNow("cancelled");
   assert.equal(order.length, 1);
@@ -746,8 +755,8 @@ test("R5c an ordinary cancel keeps the application's own grace and revokes after
 });
 
 test("R5d a deleted session's run whose sandbox is gone makes no sandbox to read a result nobody can see", async () => {
-  const { world, runner } = deletedSessionRun(true);
-  for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
+  const { world, runner, runThenCancel } = deletedSessionRun(true);
+  await runThenCancel();
   const wl = world.rec.sandbox_workload_id!;
   world.killWorkload(wl, "absent");
   const created = [...world.created];
@@ -765,6 +774,52 @@ test("R5e a session check that cannot answer is an ordinary cancel, not a failed
   for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
   await runner.finishNow("cancelled");
   assert.equal(world.rec.state, "ended");
+});
+
+test("R5f a run its user cancelled gets no sandbox, read from the row just before the create", async () => {
+  const world = new World(MANIFEST);
+  let loads = 0;
+  const load = world.store.load;
+  // The tick starts with the run open; the cancel lands before the create.
+  world.store.load = async (id) => (++loads === 1 ? load(id) : { ...(await load(id)), task_status: "cancelled" });
+  const runner = new AppRunner(RUN_ID, PLATFORM_KEY, {
+    store: world.store, sandbox: world.sandbox, now: world.now, sleep: world.sleep, tickMs: 5000,
+  });
+  assert.deepEqual(await runner.reconcile(), { done: false });
+  assert.deepEqual(world.created, [], "nothing created for a cancelled run");
+  assert.equal(world.rec.state, "provisioning");
+});
+
+test("R5g a takeover finishing a cancelled run whose sandbox is gone makes no sandbox to read its result", async () => {
+  for (const closed of [{ task_status: "cancelled" }, { task_status: "cancelling" }, { session_deleted: true }]) {
+    const world = new World(MANIFEST, {
+      state: "finishing", sandbox_workload_id: "wl-9", state_dir: STATE_DIR,
+      last_exit: { at: new Date(T0).toISOString(), cause: "row_terminal", final: false, stop_at: new Date(T0).toISOString() },
+      ...closed,
+    });
+    world.workloads.set("wl-9", "absent");
+    const runner = new AppRunner(RUN_ID, PLATFORM_KEY, {
+      store: world.store, sandbox: world.sandbox, now: world.now, sleep: world.sleep, tickMs: 5000,
+    });
+    await runner.finishNow("row_terminal");
+    assert.deepEqual(world.created, [], `no reader sandbox for ${JSON.stringify(closed)}`);
+    assert.equal(world.rec.state, "ended");
+  }
+});
+
+test("R5h a run whose task failed (not cancelled) still reads the result it may have left", async () => {
+  const world = new World(MANIFEST, {
+    state: "finishing", sandbox_workload_id: "wl-9", state_dir: STATE_DIR, task_status: "failed",
+    last_exit: { at: new Date(T0).toISOString(), cause: "row_terminal", final: false, stop_at: new Date(T0).toISOString() },
+  });
+  world.workloads.set("wl-9", "absent");
+  world.files.set(`${STATE_DIR}/exit.json`, JSON.stringify(finalExit(0)));
+  const runner = new AppRunner(RUN_ID, PLATFORM_KEY, {
+    store: world.store, sandbox: world.sandbox, now: world.now, sleep: world.sleep, tickMs: 5000,
+  });
+  const outcome = await runner.finishNow("row_terminal");
+  assert.equal(world.created.length, 1, "the reader is made, as before");
+  assert.equal(outcome.success, true);
 });
 
 test("R6 the running seams are called while the app is alive, and a failing seam does not break the machine", async () => {

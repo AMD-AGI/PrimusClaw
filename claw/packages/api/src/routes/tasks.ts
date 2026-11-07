@@ -155,12 +155,17 @@ async function requireSessionAccess(
   readDeletedSec = 0,
 ): Promise<boolean | "deleted"> {
   const within = write || startsWork ? 0 : readDeletedSec;
-  const session = (await db.query(
-    `SELECT user_id, deleted_at IS NOT NULL AS deleted FROM claw_sessions
-      WHERE session_id = $1
-        AND (deleted_at IS NULL OR ($2::int > 0 AND deleted_at > NOW() - ($2::int * INTERVAL '1 second')))`,
-    [sessionId, within],
-  )).rows[0] as { user_id?: string | null; deleted?: boolean } | undefined;
+  const session = (within > 0
+    ? await db.query(
+      `SELECT user_id, deleted_at IS NOT NULL AS deleted FROM claw_sessions
+        WHERE session_id = $1
+          AND (deleted_at IS NULL OR deleted_at > NOW() - ($2::int * INTERVAL '1 second'))`,
+      [sessionId, within],
+    )
+    : await db.query(
+      "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+      [sessionId],
+    )).rows[0] as { user_id?: string | null; deleted?: boolean } | undefined;
   if (!session) {
     reply.status(404).send({ ok: false, error: "session_not_found" });
     return false;

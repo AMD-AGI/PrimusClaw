@@ -50,7 +50,7 @@ import { provisionTerminalOf } from "../sandbox/errors.js";
 import type { AppSandbox, AppSandboxEnsureOptions, AppSandboxRun } from "./app-sandbox.js";
 import { appStartEnv } from "./app-sandbox.js";
 import {
-  AppRunWriteRefused,
+  AppRunWriteRefused, runClosedForUser,
   type AppLastExit, type AppRunPatch, type AppRunRecord, type AppRunState, type AppRunStore,
 } from "./app-run-store.js";
 import {
@@ -666,6 +666,11 @@ export class AppRunner {
   }
 
   private async inProvisioning(): Promise<TickResult> {
+    // A run its user has cancelled, or whose session is gone, gets no sandbox:
+    // whatever stopped it is about to finish it, and a sandbox made now would be
+    // one more thing to stop -- or, on a Brain that took the run over, the only
+    // thing left running.
+    if (await this.closedBeforeCreate()) return { done: false };
     let sandbox: AppSandbox;
     try {
       sandbox = await this.deps.sandbox.ensure(this.sandboxRun(), this.ensureStop);
@@ -1100,6 +1105,24 @@ export class AppRunner {
     return this.adoptFinalExit(inst, stateDir, sandboxGone);
   }
 
+  /**
+   * Whether the run is closed for its user, read again from the database (through
+   * the API) right before a sandbox could be created rather than taken from the
+   * start of the tick; the Brain's own tombstone is asked as well. A read that
+   * fails throws, so the tick ends and nothing is created on a guess.
+   */
+  private async closedBeforeCreate(): Promise<boolean> {
+    const fresh = await this.deps.store.load(this.runId);
+    const closed = runClosedForUser(fresh) || await this.sessionDeleted(fresh.session_id);
+    if (closed) {
+      logger.info(
+        { runId: this.runId, state: fresh.state, taskStatus: fresh.task_status, sessionDeleted: fresh.session_deleted === true },
+        "app_run.sandbox_not_created_run_closed",
+      );
+    }
+    return closed;
+  }
+
   /** Whether the run's session was deleted; latched, and false when it cannot be told. */
   private async sessionDeleted(sessionId: string): Promise<boolean> {
     if (this.sessionGone) return true;
@@ -1123,6 +1146,11 @@ export class AppRunner {
    */
   private async readFinalFromSharedStorage(stateDir: string): Promise<Extract<ExitRead, { kind: "exit" }> | null> {
     if (this.rec.last_exit?.recovery === true) return null;
+    // A cancel keeps the cancel whatever the application wrote, and a deleted
+    // session has nobody to read for: neither is worth a sandbox the size of the
+    // application's. Measured on 2026-11-07, a finish-only takeover of a deleted
+    // session's run made one, as the run's last act.
+    if (await this.closedBeforeCreate()) return null;
     const reader = await this.deps.sandbox.ensure(this.sandboxRun(), this.ensureStop);
     const exit = await this.readExit(reader.instance, stateDir);
     // A read that failed (the sandbox could not be made, the file could not be
