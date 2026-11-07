@@ -64,6 +64,39 @@ export interface ChannelFile { path: string; name: string; media_type?: string; 
 export const CONTEXT_FILES_MAX = 10;
 const FILE_PATH_MAX = 300;
 
+/**
+ * The agent session on one of the person's machines that the chat this message came from is attached to (`channel_context.attached`,
+ * as a chat channel sends it): what the person types in that chat goes to that session, and only a message addressed to the
+ * assistant (or one sent on their behalf) comes here. `phase`: `watching` when the session only watches a conversation open in a
+ * terminal (read-only), else `attached`. The words are the channel's (its connector's and agent's names): grounding, never instructions.
+ */
+export interface ChannelAttached {
+  session_id: string;
+  connector?: string;
+  agent?: string;
+  agent_id?: string;
+  cwd?: string;
+  phase: "watching" | "attached";
+  busy: boolean;
+  conversation?: string;
+}
+
+function parseAttached(raw: unknown): ChannelAttached | null | undefined {
+  if (raw === null) return null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const a = raw as Record<string, unknown>;
+  const sessionId = str(a.session_id);
+  if (!sessionId) return undefined;
+  const opt = (k: string, v: string | undefined) => (v ? { [k]: v } : {});
+  return {
+    session_id: sessionId,
+    ...opt("connector", str(a.connector)), ...opt("agent", str(a.agent)), ...opt("agent_id", str(a.agent_id)), ...opt("cwd", str(a.cwd)),
+    phase: a.phase === "watching" ? "watching" : "attached",
+    busy: a.busy === true,
+    ...opt("conversation", str(a.conversation)),
+  };
+}
+
 export interface ChannelContext {
   channel?: string;
   channel_message_id?: string;
@@ -73,6 +106,8 @@ export interface ChannelContext {
   handoffs: ChannelHandoff[];
   /** The files sent with the message (`ChannelFile`); empty when none were. */
   files: ChannelFile[];
+  /** The session the chat is attached to (`ChannelAttached`); null: the channel says it is attached to none; absent: not said. */
+  attached?: ChannelAttached | null;
 }
 
 /**
@@ -142,9 +177,11 @@ export function parseChannelContext(raw: unknown): ChannelContext {
   const handoffs = CHANNEL_HANDOFFS.filter((h) => Array.isArray(c.handoffs) && c.handoffs.includes(h));
   const channel = str(c.channel);
   const channelMessageId = str(c.channel_message_id);
+  const attached = parseAttached(c.attached);
   return {
     ...(channel ? { channel } : {}), ...(channelMessageId ? { channel_message_id: channelMessageId } : {}),
     people, actions, repos, handoffs, files: parseFiles(c.files),
+    ...(attached !== undefined ? { attached } : {}),
   };
 }
 
