@@ -386,8 +386,13 @@ function codePoint(n: number): string {
 
 /** `s` with its tags taken out and the entities an HTML results page writes in titles and snippets read. */
 function htmlText(s: string): string {
-  return s
-    .replace(/<[^>]*>/g, "")
+  // Tags out until none is left: one pass over "<scr<b>ipt>" would leave a tag behind.
+  let text = s;
+  for (let prev = ""; prev !== text;) {
+    prev = text;
+    text = text.replace(/<[^>]*>/g, "");
+  }
+  return text
     .replace(/&#x([0-9a-f]{1,6});/gi, (_, h: string) => codePoint(parseInt(h, 16)))
     .replace(/&#(\d{1,7});/g, (_, d: string) => codePoint(Number(d)))
     .replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")

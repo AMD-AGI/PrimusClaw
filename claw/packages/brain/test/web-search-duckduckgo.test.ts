@@ -78,6 +78,8 @@ test("DG1 the native search fails: DuckDuckGo's links are the hits and the sourc
   assert.doesNotMatch(text, /Buy GPUs|duckduckgo\.com/);
   assert.deepEqual(parseDuckDuckGoHtml(`<a class="result__a" href="https://x.example/">a &lt;script&gt;b</a>`).map((h) => h.title), ["a scriptb"],
     "no tag is formed again from what an entity spelled out");
+  assert.deepEqual(parseDuckDuckGoHtml(`<a class="result__a" href="https://x.example/">a <scr<b>ipt>b</a>`).map((h) => h.title), ["a iptb"],
+    "nor from a tag split by another");
   assert.equal(asked.length, 1);
   assert.equal(asked[0].params.q, "vllm rocm");
 });
