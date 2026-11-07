@@ -611,6 +611,29 @@ test("a walk stopped by its deadline has deleted what it reached, so the next on
   assert.ok(passes.length > 1, "the deadline did cut the walk short");
 });
 
+test("a level holding only directories, pages of them, does not use up a pass before a delete", async (t) => {
+  // Listing every page of such a level before descending spends the pass on
+  // listings and stops with nothing deleted -- recorded as no progress, so
+  // the cleanup backs off and every later pass does the same. The walk has to
+  // reach a file after one listing per level.
+  let now = 1_700_000_000_000;
+  t.mock.method(Date, "now", () => now);
+  const keys: string[] = [];
+  for (let a = 0; a < 500; a++) keys.push(`users/u-1/sessions/sess-abc/d${String(a).padStart(3, "0")}/f`);
+  const s3 = stubWalkingListingS3(keys, 0, 30_000);
+  const realSend = S3Client.prototype.send;
+  S3Client.prototype.send = (async function (this: S3Client, command: unknown) {
+    if (command instanceof ListObjectsV2Command) now += 100;
+    return realSend.call(this, command as never);
+  }) as typeof S3Client.prototype.send;
+
+  const outcome = await deleteSessionWorkspaceObjects("u-1", "sess-abc", now + 450);
+
+  assert.equal(outcome.complete, false);
+  assert.ok(outcome.deleted > 0, "a pass that stopped on the clock had deleted something");
+  assert.equal(s3.deleted.length, outcome.deleted);
+});
+
 test("every listing in this package asks for a bounded page", async () => {
   // The closed set, rather than the callers someone remembered: the file list,
   // the archive download, the upload sweep and the plugin walk page through

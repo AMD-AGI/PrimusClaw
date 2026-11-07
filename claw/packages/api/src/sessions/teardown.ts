@@ -240,13 +240,19 @@ function pastDeadline(deadline?: number): boolean {
  * whole workspace, which is a bound a session can only exceed by putting
  * thousands of files side by side.
  *
- * Each level's keys are deleted before the walk goes below it, and a directory
- * is finished before its siblings, so a walk cut short by the deadline has
- * removed whole subtrees and the next pass -- which lists from the top again --
- * finds less than this one did. MinIO drops a directory once its last object
- * goes, so emptied subtrees are not even listed again. Safe to interleave for
- * the same reason a flat walk was: a continuation token resumes after the last
- * entry returned, so deleting entries already listed does not disturb it.
+ * Each page's keys are deleted, and the subdirectories that page named are
+ * walked, before the next page of the same directory is asked for. Holding a
+ * directory's subdirectories until all of its pages were listed would let a
+ * pass spend its whole budget listing a level that holds only directories and
+ * stop having deleted nothing -- which the cleanup records as no progress and
+ * backs off, the stuck row again by another route. Walked this way, a pass
+ * reaches a file after one listing per level, and one cut short by the
+ * deadline has removed whole subtrees, so the next pass -- which lists from the
+ * top again -- finds less than this one did. MinIO drops a directory once its
+ * last object goes, so emptied subtrees are not even listed again. Safe to
+ * interleave for the same reason a flat walk was: a continuation token resumes
+ * after the last entry returned, so deleting entries already listed does not
+ * disturb it.
  *
  * Every directory followed is a common prefix the store returned for a listing
  * under `prefix`, so it extends `prefix`; one that does not, or that does not
@@ -261,37 +267,43 @@ async function deletePrefix(
 ): Promise<{ deleted: number; failed: number; complete: boolean }> {
   let deleted = 0;
   let failed = 0;
-  const pending: string[] = [prefix];
-  while (pending.length) {
-    const dir = pending.pop()!;
-    const below: string[] = [];
-    let token: string | undefined;
-    do {
-      if (pastDeadline(deadline)) return { deleted, failed, complete: false };
-      const page = await s3.send(
-        new ListObjectsV2Command({
-          Bucket: S3_BUCKET,
-          Prefix: dir,
-          Delimiter: "/",
-          ContinuationToken: token,
-          MaxKeys: S3_LIST_PAGE_KEYS,
-        }),
-      );
-      const keys = (page.Contents ?? [])
-        .map((obj) => obj.Key)
-        .filter((key): key is string => typeof key === "string" && key.startsWith(prefix));
-      for (const common of page.CommonPrefixes ?? []) {
-        const sub = common.Prefix;
-        if (sub && sub.startsWith(dir) && sub.length > dir.length) below.push(sub);
-      }
-      const outcome = await deleteObjects(s3, keys, sessionId, deadline);
-      deleted += outcome.deleted;
-      failed += outcome.failed;
-      if (!outcome.complete) return { deleted, failed, complete: false };
-      token = page.IsTruncated ? page.NextContinuationToken : undefined;
-    } while (token);
-    // Reversed so the first subdirectory listed is the next one walked.
-    for (let i = below.length - 1; i >= 0; i--) pending.push(below[i]);
+  /** A directory being walked: where its listing is, and the subdirectories its last page named. */
+  interface Frame { dir: string; token?: string; listed: boolean; below: string[] }
+  const stack: Frame[] = [{ dir: prefix, listed: false, below: [] }];
+  while (stack.length) {
+    const frame = stack[stack.length - 1];
+    const next = frame.below.shift();
+    if (next !== undefined) {
+      stack.push({ dir: next, listed: false, below: [] });
+      continue;
+    }
+    if (frame.listed && frame.token === undefined) {
+      stack.pop();
+      continue;
+    }
+    if (pastDeadline(deadline)) return { deleted, failed, complete: false };
+    const page = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: S3_BUCKET,
+        Prefix: frame.dir,
+        Delimiter: "/",
+        ContinuationToken: frame.token,
+        MaxKeys: S3_LIST_PAGE_KEYS,
+      }),
+    );
+    frame.listed = true;
+    frame.token = page.IsTruncated ? page.NextContinuationToken : undefined;
+    for (const common of page.CommonPrefixes ?? []) {
+      const sub = common.Prefix;
+      if (sub && sub.startsWith(frame.dir) && sub.length > frame.dir.length) frame.below.push(sub);
+    }
+    const keys = (page.Contents ?? [])
+      .map((obj) => obj.Key)
+      .filter((key): key is string => typeof key === "string" && key.startsWith(prefix));
+    const outcome = await deleteObjects(s3, keys, sessionId, deadline);
+    deleted += outcome.deleted;
+    failed += outcome.failed;
+    if (!outcome.complete) return { deleted, failed, complete: false };
   }
   return { deleted, failed, complete: true };
 }
