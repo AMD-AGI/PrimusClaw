@@ -19,6 +19,13 @@
  *      the response, which every EventSource-style client answers by opening
  *      the stream again, resuming from its last event id. Streams never end on
  *      their own, so without this the drain below would wait for the deadline.
+ *      Not an MCP call's answer, which streamable HTTP also sends as an event
+ *      stream (`answersOneCall`): it ends by itself once the tool has answered,
+ *      and ending it first throws that answer away. The tool has done its work
+ *      by then; the caller hears nothing and waits out its own timeout
+ *      (2026-11-07 07:14Z: a review handed over in 0.4 s, and the router waited
+ *      60 s for an answer that this step had cut off). It is waited for in 3,
+ *      like any request in flight.
  *   3. The server stops accepting and waits for the requests it has to finish.
  *   4. Background consumers and pools are closed: a NATS drain hands the
  *      unacknowledged messages back for another replica instead of leaving them
@@ -71,9 +78,24 @@ function headerValue(headers: unknown, name: string): string | undefined {
   return undefined;
 }
 
+/**
+ * An event stream that is the answer to one MCP call, not a subscription: streamable HTTP answers a POST of JSON-RPC with an event
+ * stream that the server ends once every request in it is answered, and the MCP specification has every such POST accept both
+ * `application/json` and `text/event-stream`. A subscription is a GET (`routes/events.ts`, an MCP server's own GET stream), or a POST
+ * that accepts only the event stream (A2A's `message/stream`), and has no end of its own.
+ */
+export function answersOneCall(res: ServerResponse): boolean {
+  const req = (res as ServerResponse & { req?: { method?: string; headers?: Record<string, unknown> } }).req;
+  if (req?.method !== "POST") return false;
+  const accept = String(req.headers?.accept ?? "").toLowerCase();
+  return accept.includes("application/json") && accept.includes("text/event-stream");
+}
+
 export class GracefulShutdown {
   private state: "serving" | "draining" | "closing_streams" = "serving";
   private readonly streams = new Set<ServerResponse>();
+  /** MCP calls answered as event streams (`answersOneCall`): waited for, never ended early. */
+  private readonly calls = new Set<ServerResponse>();
   private started = false;
 
   constructor(private readonly opts: GracefulShutdownOptions) {}
@@ -116,6 +138,12 @@ export class GracefulShutdown {
   }
 
   private trackStream(res: ServerResponse): void {
+    if (answersOneCall(res)) {
+      this.calls.add(res);
+      res.once("close", () => this.calls.delete(res));
+      if (this.draining) this.closeAfterAnswer(res);
+      return;
+    }
     if (this.state === "closing_streams") {
       // Opened after the streams were told to go: tell this one too.
       setImmediate(() => this.endStream(res));
@@ -123,6 +151,18 @@ export class GracefulShutdown {
     }
     this.streams.add(res);
     res.once("close", () => this.streams.delete(res));
+  }
+
+  /**
+   * Its connection is let go once the answer is out: its head was written while serving, so it promised keep-alive, and the server's
+   * close would wait out the idle timeout for it.
+   */
+  private closeAfterAnswer(res: ServerResponse): void {
+    // Read now: a finished response lets go of its socket.
+    const socket = res.socket;
+    const release = () => { try { socket?.end(); } catch { /* already gone */ } };
+    if (res.writableFinished) release();
+    else res.once("finish", release);
   }
 
   private endStream(res: ServerResponse): void {
@@ -168,7 +208,8 @@ export class GracefulShutdown {
     this.state = "closing_streams";
     const streams = [...this.streams];
     for (const res of streams) this.endStream(res);
-    logger.info({ signal, streams: streams.length }, "api.shutdown.streams_closed");
+    for (const res of this.calls) this.closeAfterAnswer(res);
+    logger.info({ signal, streams: streams.length, calls: this.calls.size }, "api.shutdown.streams_closed");
 
     // Clean means every request the server had was answered. A server that
     // had to be abandoned at the deadline cut some off, and says so in its exit

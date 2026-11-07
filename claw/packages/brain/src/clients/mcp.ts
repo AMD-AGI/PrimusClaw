@@ -5,6 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { ToolSchema } from "@claw/protocol";
 import { isIP } from "node:net";
 import { CITE_SOURCES_META } from "@claw/protocol";
@@ -218,6 +219,56 @@ async function retryTransientMcp<T>(
 /** Test seam: the retry policy over a stand-in call, with the sleeps it would take. */
 export const __mcpRetryForTest = retryTransientMcp;
 
+/** The SDK's answer to a request that got none within its timeout (`McpError`, code -32001). */
+export function isMcpTimeout(err: unknown): boolean {
+  return (err as { code?: unknown } | null)?.code === ErrorCode.RequestTimeout;
+}
+
+/**
+ * How long one call of a tool that may be repeated (`annotations.idempotentHint`) is waited for before it is sent again. Above every
+ * `review_start` the live router made in three days (2026-11-05..07: p50 1.8 s, p99 10.5 s, slowest 19.6 s), below the SDK's 60 s,
+ * which is what a lost answer used to cost: the router waited the whole minute and then knew nothing (2026-11-07 07:14Z).
+ */
+export const IDEMPOTENT_CALL_TIMEOUT_MS = 30_000;
+/** Sends after the first, of a repeatable tool whose answer did not come in time: one, so two waits are the most a turn spends. */
+export const IDEMPOTENT_TIMEOUT_RESENDS = 1;
+/** Read per call, so a test can shorten the wait. */
+export const idempotentCallPolicy = { timeoutMs: IDEMPOTENT_CALL_TIMEOUT_MS, resends: IDEMPOTENT_TIMEOUT_RESENDS };
+
+/**
+ * A call the server says it may be sent again (`idempotentHint`: a repeat with the same arguments does nothing the first did not),
+ * re-sent when its answer was lost as well as when the server was briefly gone: the repeat's answer is the first call's outcome
+ * (`review_start`: the same handoff, or the review it already started). When no answer comes at all, the model is told in words
+ * that the outcome is unknown and what it may do, not "Request timed out", which it read as "maybe nothing happened".
+ */
+async function retryIdempotentMcp<T>(
+  what: string,
+  name: string,
+  call: () => Promise<T>,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<T> {
+  let resends = 0;
+  for (;;) {
+    try {
+      return await retryTransientMcp(what, name, call, sleep);
+    } catch (err) {
+      if (!isMcpTimeout(err)) throw err;
+      if (resends >= idempotentCallPolicy.resends) {
+        throw new Error(
+          `${what} gave no answer in ${Math.round((resends + 1) * idempotentCallPolicy.timeoutMs / 1000)}s (asked ${resends + 1} times): `
+          + "whether it took effect is not known yet. Calling it again with the same arguments is safe (it never does twice what it did once) "
+          + "and answers what happened; if you do not, tell the user in one sentence that their request is still being confirmed, not that it failed.",
+        );
+      }
+      resends += 1;
+      logger.warn({ name, what, resends }, "mcp_client.idempotent_resend_after_timeout");
+    }
+  }
+}
+
+/** Test seam: the repeatable tool's policy over a stand-in call. */
+export const __mcpIdempotentRetryForTest = retryIdempotentMcp;
+
 async function connectMcpServer(name: string, spec: Record<string, unknown>): Promise<McpClientWrapper> {
   const url = spec.url as string;
   const type = (spec.type as string) || "http";
@@ -287,6 +338,9 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
   // before the connection dropped, and sending it again could do it twice; it
   // fails to the model as before, which can see what happened and decide.
   const readOnlyTools = new Set<string>();
+  // Filled by listTools: the writes the server declares safe to repeat (`annotations.idempotentHint`), re-sent also when their
+  // answer did not come in time (`retryIdempotentMcp`).
+  const idempotentTools = new Set<string>();
 
   return {
     persistent,
@@ -308,12 +362,14 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
         const read = await retryTransientMcp(toolName, name, () => client.readResource({ uri }));
         return read.contents.map((c) => renderResourceContents(c as McpContentBlock)).join("\n");
       }
+      const repeatable = !readOnlyTools.has(toolName) && idempotentTools.has(toolName);
       const send = () => client.callTool(
         { name: toolName, arguments: args, ...(meta ? { _meta: meta } : {}) },
         undefined,
-        signal ? { signal } : undefined,
+        signal || repeatable ? { ...(signal ? { signal } : {}), ...(repeatable ? { timeout: idempotentCallPolicy.timeoutMs } : {}) } : undefined,
       );
-      const result = readOnlyTools.has(toolName) ? await retryTransientMcp(toolName, name, send) : await send();
+      const result = readOnlyTools.has(toolName) ? await retryTransientMcp(toolName, name, send)
+        : repeatable ? await retryIdempotentMcp(toolName, name, send) : await send();
       // The tool's own error bit (`isError`), which its text alone cannot carry: what it answered is a failure, not data it read.
       if (outcome && result.isError === true) outcome.isError = true;
       const sources = (result._meta as Record<string, unknown> | undefined)?.[CITE_SOURCES_META];
@@ -324,7 +380,11 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
       const result = await retryTransientMcp("tools/list", name, () => client.listTools());
       const own = new Set(result.tools.map((t) => t.name));
       readOnlyTools.clear();
-      for (const t of result.tools) if (t.annotations?.readOnlyHint === true) readOnlyTools.add(t.name);
+      idempotentTools.clear();
+      for (const t of result.tools) {
+        if (t.annotations?.readOnlyHint === true) readOnlyTools.add(t.name);
+        else if (t.annotations?.idempotentHint === true) idempotentTools.add(t.name);
+      }
       const tools = result.tools.map((t) => ({
         name: t.name,
         description: t.description || `[${name}] ${t.name}`,
