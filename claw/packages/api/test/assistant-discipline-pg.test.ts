@@ -10,7 +10,7 @@
  *       is unchanged; a task about SSH in general is made for alice
  *   W2  (Postgres) alice's worker's ready report with no refs is refused and changes nothing; its answer about the file it delivered
  *       closes the item with nothing to accept, and the file reaches the user with it; a ready with refs still waits for Accept; bob's ready with no refs is recorded as before
- *   W3  (Postgres) the turn's own system prompt: alice's worker and router turns carry worker-v7 and router-discipline-v2, bob's do not
+ *   W3  (Postgres) the turn's own system prompt: alice's worker and router turns carry worker-v9 and router-discipline-v2, bob's do not
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";

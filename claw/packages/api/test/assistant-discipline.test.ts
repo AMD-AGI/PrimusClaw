@@ -9,8 +9,8 @@
  *   D3  a ready report with no refs is caught; one with refs, and an answer, are not; an answer about delivered files parses
  *   P1  router-discipline-v2 rides on the router prompt only when on: an acknowledgement acts on nothing, a secret read is declined in
  *       chat, any other write is an item
- *   P2  worker-v7 only when on: a task that changed nothing outside (files delivered) is an answer with nothing to accept, and ready
- *       needs refs; off, the worker prompt is worker-v6 as it was
+ *   P2  worker-v9 only when on: a task that changed nothing outside (files delivered) is an answer with nothing to accept, and ready
+ *       needs refs; off, the worker prompt is worker-v8 as it was
  *
  * On Postgres, with the canary on for one user: assistant-discipline-pg.test.ts.
  */
@@ -100,15 +100,15 @@ test("P1 router-discipline-v2 rides on the router prompt only when on", () => {
   assert.match(ROUTER_DISCIPLINE_PROMPT, /a review or merge of pull requests when you have review_start \(that goes as your review instructions say: pr_state first, then review_start for the open ones\)/);
 });
 
-test("P2 worker-v7 only when on: delivered files are an answer, ready needs refs; off, worker-v6 as it was", () => {
+test("P2 worker-v9 only when on: delivered files are an answer, ready needs refs; off, worker-v8 as it was", () => {
   const item = { seq: 3, title: "Chart" };
   assert.ok(renderWorkerSystem(item).startsWith(WORKER_PROMPT));
   assert.ok(renderWorkerSystem(item, { discipline: true }).startsWith(WORKER_DISCIPLINE_PROMPT));
   assert.notEqual(WORKER_PROMPT, WORKER_DISCIPLINE_PROMPT);
-  // worker-v6, unchanged
+  // worker-v8, unchanged
   assert.match(WORKER_PROMPT, /report\(kind="answer", summary\) when the task was only to find something out/);
   assert.match(WORKER_PROMPT, /report\(kind="ready", summary, result\?\) when the work is done and can be checked/);
-  // worker-v7
+  // worker-v9
   assert.match(WORKER_DISCIPLINE_PROMPT, /report\(kind="answer", summary\) when the task changed nothing outside your workspace/);
   assert.match(WORKER_DISCIPLINE_PROMPT, /handed over with deliver_file or deliver_text/);
   assert.match(WORKER_DISCIPLINE_PROMPT, /nothing for the user to accept/);

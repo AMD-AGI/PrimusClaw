@@ -9,6 +9,7 @@
  *   P1  the router prompt names exactly the router's tools, and no tool that accepts a result
  *   P2  the router is told plain output reaches nobody, and the limit it is told is the limit the server enforces
  *   P3  the worker is told to report, to finish with a report, and to check before repeating an effect
+ *   P3b the worker makes a write the task asks for and lets its hold ask the user; it never asks first in a report (both prompts)
  *   P4  the work event that wakes the router begins with the marker the prompt names, and says what the router needs
  *   P5  the item list the router sees is one line per item and says "none" when there are none
  *   P6  what workers and models wrote reaches the router only as quoted data inside the untrusted block, under its preamble
@@ -20,7 +21,7 @@ import test from "node:test";
 
 import { parseReport, REPORT_QUESTION_MAX, REPORT_SUMMARY_MAX } from "../src/assistant/report.js";
 import {
-  ROUTER_PROMPT, SAY_MAX_CHARS, UNTRUSTED_CLOSE, UNTRUSTED_OPEN, UNTRUSTED_PREAMBLE, WORKER_PROMPT, WORK_EVENT_PREFIX,
+  ROUTER_PROMPT, SAY_MAX_CHARS, UNTRUSTED_CLOSE, UNTRUSTED_OPEN, UNTRUSTED_PREAMBLE, WORKER_DISCIPLINE_PROMPT, WORKER_PROMPT, WORK_EVENT_PREFIX,
   formatManifestLine, formatWorkEvent, itemStatus, manifestTime, renderRouterSystem, renderWorkerSystem,
 } from "../src/assistant/prompts.js";
 
@@ -89,6 +90,18 @@ test("P3 the worker is told how to report, to end with a report, and to check be
   assert.match(WORKER_PROMPT, /Check before you repeat/);
   assert.match(WORKER_PROMPT, /do not open a second pull request/);
   assert.match(renderWorkerSystem({ seq: 7, title: "Fix CI" }), /item #7: Fix CI$/);
+});
+
+// G0 2026-11-07 (nightly sa-eval-bot-2, cat-items-wr-001): asked to "add a script and open a PR", the worker reported waiting with
+// "Confirm I should push ... and open the PR?" instead of pushing, so no card came and the user was asked again in words.
+test("P3b the worker makes the write the task asks for and lets the hold ask; it never asks first in a report", () => {
+  for (const prompt of [WORKER_PROMPT, WORKER_DISCIPLINE_PROMPT]) {
+    assert.match(prompt, /A write the task asks for \(pushing your branch, opening a pull request, a comment, a merge, another write to another system\) is made when you reach it, without asking first/);
+    assert.match(prompt, /held and put to them on a card, and runs only when they approve it there/);
+    assert.match(prompt, /Never report\(kind="waiting"\) or report\(kind="blocked"\) with a question that only asks whether to make it/);
+    assert.match(prompt, /Ask only what the task leaves open/);
+    assert.match(prompt, /When you cannot make it \(no GitHub login, no write access\), report\(kind="blocked"\) with what is missing, such as connecting GitHub with \/github bind/);
+  }
 });
 
 test("P4 the work event begins with the marker the prompt names", () => {

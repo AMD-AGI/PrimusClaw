@@ -111,6 +111,11 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A worker asked to make a write (push a branch and open a pull request, post a comment) makes it when it gets there and lets the hold
+  put it to the user on a card, instead of first reporting a question that only asks whether to make it ("Confirm I should push and
+  open the PR?"), which asked a user who had already asked for it again in words, and once more on the card after their yes (G0
+  2026-11-07 nightly, cat-items-wr-001). When it cannot make the write (no GitHub login, no write access) it reports blocked with what
+  is missing. Logged as worker-v8, and worker-v9 with `CLAW_ASSISTANT_ROUTE_DISCIPLINE`.
 - The server's "on it" line for a silent router turn (`CLAW_ASSISTANT_FIRST_ACK_USERS`) counts from when the person's message came in,
   not from when its run opened, so a message queued behind a worker's report hears it at 3.5 s too (2026-11-07 run: cat-items-wr-006
   queued 5.5 s, first reply 7.8 s); and a say the router started and that was refused no longer holds the line back (cat-memory-ro-001,
