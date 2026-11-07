@@ -17,9 +17,13 @@
  * channel answers the message itself, in one message: `say-hold.ts`), nor once anything was said in the turn or the router started its
  * own say. A short wait (`CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS`) lets a line the router writes beside the lookup, in the same step, arrive
  * first. Best effort: a failure here is logged and never touches the event it was triggered by.
+ *
+ * Only with notifications on (`CLAW_NOTIFICATIONS_ENABLED`): the answer takes the line's place by its delivery (`turnFirstSay` matches a
+ * message to its turn through the outbox), and without them the line would stay beside the answer as a second message. A deployment
+ * without channels shows the router's `say` while it is written (`stream_tool_text`) instead.
  */
 import pino from "pino";
-import { CLAW_ASSISTANT_LOOKUP_ACK, CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS } from "../config.js";
+import { CLAW_ASSISTANT_LOOKUP_ACK, CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { db, type Querier } from "../infra/db.js";
 import { deterministicEventId } from "../notifications/outbox.js";
 import { turnMessage } from "./inbound.js";
@@ -97,6 +101,9 @@ async function reasonToStaySilent(q: Querier, sessionId: string, userId: string,
   return null;
 }
 
+/** Whether the line is said at all: the flag, and a channel's delivery for the answer to take its place in. */
+export const lookupAckOn = (): boolean => CLAW_ASSISTANT_LOOKUP_ACK && CLAW_NOTIFICATIONS_ENABLED;
+
 export interface LookupAckDeps extends SayDeps {
   graceMs?: number;
   enabled?: boolean;
@@ -108,7 +115,7 @@ export interface LookupAckDeps extends SayDeps {
  * said nothing. Returns what it did, for the tests and the log: `said`, or why not.
  */
 export async function ackBeforeLookup(sessionId: string, event: Record<string, unknown>, deps: LookupAckDeps = {}): Promise<string> {
-  if (!(deps.enabled ?? CLAW_ASSISTANT_LOOKUP_ACK)) return "off";
+  if (!(deps.enabled ?? lookupAckOn())) return "off";
   if (event.type !== "toolUsed" || event.status !== "start") return "not_a_start";
   const tool = typeof event.tool === "string" ? event.tool : "";
   const messageId = typeof event.message_id === "string" ? event.message_id : "";
@@ -137,6 +144,6 @@ export async function ackBeforeLookup(sessionId: string, event: Record<string, u
 
 /** The event consumer's call: never awaited by it and never throwing into it. */
 export function ackBeforeLookupInBackground(sessionId: string, event: Record<string, unknown>): void {
-  if (!CLAW_ASSISTANT_LOOKUP_ACK || event.type !== "toolUsed" || event.status !== "start") return;
+  if (!lookupAckOn() || event.type !== "toolUsed" || event.status !== "start") return;
   void ackBeforeLookup(sessionId, event).catch((err) => logger.warn({ err, sessionId }, "assistant.lookup_ack_failed"));
 }
