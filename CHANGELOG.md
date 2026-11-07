@@ -164,6 +164,10 @@ record it.
 - A connector whose command stream has just ended without a graceful hand-over (a replica that crashed, an ingress or gateway
   restart, a token refresh) is online for 45 s more while its heartbeat is fresh: a session asked for in that gap is queued and
   delivered on the next stream, not refused with `connector_offline`, and the break is not recorded as an offline transition.
+- A connector revoked (`claw-connector logout`, `/agent off`, `DELETE .../connectors/:cid`) or replaced by registering again under its
+  name now ends its open sessions with a `session_closed {reason: "connector_revoked" | "machine_reconnected", by: "claw"}` of Claw's
+  own. Their queued commands were dropped with the row and their sessions closed with no event, so an assistant item whose prompt
+  was still queued stayed in progress for good and an attached chat waited for an end that could not come.
 - Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
   忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
   not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with

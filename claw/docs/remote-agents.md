@@ -295,7 +295,7 @@ told again once (`claw_remote_terminal_waits`).
 |---|---|
 | `GET /v1/remote-agents/setup` | How to connect a machine to this server: the npm package, the exact commands with this deployment's addresses, the minimum and recommended connector versions, and the same as a short text in English and Chinese (`remote-agents/setup.ts`). |
 | `GET /v1/remote-agents/connectors` | The caller's connectors, with `online`, `last_seen_at`, `offline_since`, `offline_reason`, `version_status` (and `upgrade_command` below the recommended version) and their agents. |
-| `DELETE .../connectors/:cid` | Revoke: closes its sessions, drops its queued commands. |
+| `DELETE .../connectors/:cid` | Revoke: drops its queued commands and closes its sessions, each with a `session_closed {reason: "connector_revoked", by: "claw"}` of Claw's own (`"machine_reconnected"` when a row is replaced by registering again under its name), so whatever waited on them ends. |
 | `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?, resume_ref?}`. `409 connector_offline` unless online; `409 connector_outdated` (with `data.version`, `data.upgrade_command`) when its connector is below the minimum version. |
 | `GET .../sessions`, `GET .../sessions/:id` | List (each active session with `waiting`: the permission requests it waits on its user for now, asked since its last turn ended and not answered, so a client lists those first), and read one with `connector_online`. |
 | `POST .../sessions/:id/commands` | `{type: prompt\|cancel\|set_mode\|resume\|close, ...}`. `Idempotency-Key` makes a retry queue one command. |

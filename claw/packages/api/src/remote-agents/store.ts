@@ -99,7 +99,7 @@ export async function registerConnector(
   alsoOnReplace?: (q: Querier, connectorId: string) => Promise<void>,
   /** A connector grant (`pairing.ts`) the caller registers with: bound to the new row in this same transaction. */
   grantId: string | null = null,
-): Promise<(Row & { replaced: string[] }) | null> {
+): Promise<(Row & { replaced: string[]; closedSessions: string[] }) | null> {
   return inTransaction(async (q) => {
     await lock(q, `connectors:${owner}`);
     // A connector that lost its local state registers afresh under the same name, and the row it had stays behind offline for
@@ -108,6 +108,8 @@ export async function registerConnector(
     // is another process holding that name and is left alone, and so is one made within the window (registered, not yet
     // connected). Should a machine whose row was revoked this way come back after all, it is told `revoked` and stops.
     const replaced: string[] = [];
+    // The sessions the replaced rows had, closed with them (`revokeIn`): the caller tells their readers and items.
+    const closedSessions: string[] = [];
     if (grantId) {
       // A paired machine's grant (`pairing.ts`) replaces no row but its own: never another machine of the owner's, whatever name it
       // gives. Bound already, it registers again only under its own row's name, and that row is the one replaced; a grant whose row
@@ -120,7 +122,9 @@ export async function registerConnector(
           [g.connector_id, owner])).rows[0] as { name: string; revoked_at: Date | null } | undefined;
         if (!own || own.revoked_at) throw new GrantRegistrationRefused("revoked");
         if (own.name !== name) throw new GrantRegistrationRefused("name_mismatch");
-        if (await revokeIn(q, owner, g.connector_id, client, { reason: "replaced_by_same_name" })) {
+        const closed = await revokeIn(q, owner, g.connector_id, client, { reason: "replaced_by_same_name" });
+        if (closed) {
+          closedSessions.push(...closed);
           await alsoOnReplace?.(q, g.connector_id);
           replaced.push(g.connector_id);
         }
@@ -134,7 +138,9 @@ export async function registerConnector(
         [secs(onlineWindowMs), owner, name],
       )).rows.map((r) => String(r.connector_id));
       for (const id of stale) {
-        if (!(await revokeIn(q, owner, id, client, { reason: "replaced_by_same_name" }))) continue;
+        const closed = await revokeIn(q, owner, id, client, { reason: "replaced_by_same_name" });
+        if (!closed) continue;
+        closedSessions.push(...closed);
         await alsoOnReplace?.(q, id);
         replaced.push(id);
       }
@@ -157,7 +163,7 @@ export async function registerConnector(
       owner, actor: owner, client, connectorId: row.connector_id, action: "connector.registered",
       detail: withCredential(replaced.length ? { name, replaced } : { name }, credential),
     });
-    return { ...row, replaced };
+    return { ...row, replaced, closedSessions };
   });
 }
 
@@ -197,37 +203,68 @@ export function offlineReason(streamEndReason: unknown): "auth_expired" | "no_he
   return streamEndReason === "token_expired" || streamEndReason === "revoked" ? "auth_expired" : "no_heartbeat";
 }
 
-/** Revoke one connector and close its sessions. False when it is not the caller's, or already revoked. */
+/**
+ * Revoke one connector and close its sessions. Null when it is not the caller's, or already revoked; else the sessions it closed,
+ * each of which gained Claw's own `session_closed` (`revokeIn`), for the caller to tell their readers and items.
+ */
 export async function revokeConnector(
   owner: string, connectorId: string, client: string | null, alsoInTransaction?: (q: Querier) => Promise<void>,
-): Promise<boolean> {
+): Promise<string[] | null> {
   return inTransaction(async (q) => {
-    if (!(await revokeIn(q, owner, connectorId, client))) return false;
+    const closed = await revokeIn(q, owner, connectorId, client);
+    if (!closed) return null;
     // What else ends with the machine (the cards that would send to it: `closeCardsOfConnector`), in the same transaction, so a
     // revoked machine never leaves a card that still waits for the person.
     await alsoInTransaction?.(q);
-    return true;
+    return closed;
   });
 }
 
-/** `revokeConnector` inside a transaction the caller holds; `detail` is added to its audit row. */
-async function revokeIn(q: Querier, owner: string, connectorId: string, client: string | null, detail: Record<string, unknown> = {}): Promise<boolean> {
+/**
+ * The `seq` of the `session_closed` Claw writes in a session it closed because its connector was revoked (`revokeIn`): negative,
+ * so it never meets a connector's own numbering, below every `-cmd_seq` of `expireUndelivered`, and one per session (a session
+ * closes once).
+ */
+export const REVOKED_CLOSE_SEQ = -Number.MAX_SAFE_INTEGER;
+
+/** Why Claw closed a session whose connector was revoked: `replaced` when the same machine registered again in its place. */
+export const SESSION_CLOSED_CONNECTOR_REVOKED = "connector_revoked";
+export const SESSION_CLOSED_MACHINE_REPLACED = "machine_reconnected";
+
+/**
+ * `revokeConnector` inside a transaction the caller holds; `detail` is added to its audit row. Null when nothing was revoked, else
+ * the sessions closed. Its queued commands go, so nothing the machine never collected can end a turn later: each closed session
+ * gains a `session_closed` of Claw's own, which ends whatever waits on it (an item's open prompt, a chat attached to it) as the
+ * machine's own close would; without it they waited for an end that cannot come.
+ */
+async function revokeIn(
+  q: Querier, owner: string, connectorId: string, client: string | null, detail: Record<string, unknown> = {},
+): Promise<string[] | null> {
   const r = await q(
     `UPDATE claw_remote_connectors SET revoked_at = NOW(), stream_seen_at = NULL
       WHERE connector_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL RETURNING connector_id`,
     [connectorId, owner],
   );
-  if (!r.rowCount) return false;
+  if (!r.rowCount) return null;
   await q("DELETE FROM claw_remote_commands WHERE connector_id = $1", [connectorId]);
-  const closed = await q(
+  const closed = (await q(
     "UPDATE claw_remote_sessions SET status = 'closed', updated_at = NOW() WHERE connector_id = $1 AND status = 'active' RETURNING session_id",
     [connectorId],
-  );
+  )).rows.map((x) => String(x.session_id));
+  const reason = detail.reason === "replaced_by_same_name" ? SESSION_CLOSED_MACHINE_REPLACED : SESSION_CLOSED_CONNECTOR_REVOKED;
+  if (closed.length) {
+    await q(
+      `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
+       SELECT sid, $2, $3, NOW(), $4::jsonb FROM unnest($1::uuid[]) AS sid
+       ON CONFLICT (session_id, seq) DO NOTHING`,
+      [closed, REVOKED_CLOSE_SEQ, REMOTE_EVENT_SESSION_CLOSED, JSON.stringify({ reason, by: "claw" })],
+    );
+  }
   await writeAudit(q, {
     owner, actor: owner, client, connectorId, action: "connector.revoked",
-    detail: { ...detail, sessions_closed: closed.rowCount ?? 0 },
+    detail: { ...detail, sessions_closed: closed.length },
   });
-  return true;
+  return closed;
 }
 
 /**

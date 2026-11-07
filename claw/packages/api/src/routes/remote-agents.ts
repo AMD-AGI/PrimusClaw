@@ -83,18 +83,21 @@ export interface RemoteAgentOptions {
 }
 
 /**
- * Sessions that gained Claw's own event for a command that was never delivered (`store.expireUndelivered`): their readers on this
- * replica are woken (others poll), and their items move, so the user is told now instead of waiting hours for an answer.
+ * Sessions that gained Claw's own event: a command that was never delivered (`store.expireUndelivered`), or a close because their
+ * connector was revoked (`store.revokeConnector`, a row replaced in `store.registerConnector`). Their readers on this replica are
+ * woken (others poll), and their items move, so the user is told now instead of waiting hours for an answer.
  */
-async function sayUndelivered(list: store.Undelivered[], wake: (sessionId: string) => void): Promise<void> {
+async function sayUndelivered(
+  list: store.Undelivered[], wake: (sessionId: string) => void, what: "undelivered" | "revoked" = "undelivered",
+): Promise<void> {
   if (!list.length) return;
   for (const u of list) wake(u.session_id);
   const byOwner = new Map<string, string[]>();
   for (const u of list) byOwner.set(u.owner, [...(byOwner.get(u.owner) ?? []), u.session_id]);
   for (const [owner, sessionIds] of byOwner) {
-    await noteRemoteEvents(owner, sessionIds).catch((err) => logger.warn({ err: (err as Error)?.message }, "remote_agents.undelivered_note_failed"));
+    await noteRemoteEvents(owner, sessionIds).catch((err) => logger.warn({ err: (err as Error)?.message, what }, "remote_agents.claw_end_note_failed"));
   }
-  logger.info({ sessions: list.length }, "remote_agents.undelivered_ended");
+  logger.info({ sessions: list.length }, `remote_agents.${what}_ended`);
 }
 
 /**
@@ -345,6 +348,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     // Offline rows under the same name (a connector that lost its state and registered again) were revoked in its place.
     if (row.replaced.length) logger.info({ owner, connectorId: row.connector_id, replaced: row.replaced }, "remote_agents.connector_replaced");
     for (const id of row.replaced) waker.wake(`c:${id}`);
+    // The replaced rows' sessions closed with them (`session_closed` of Claw's own): their readers and items are told now.
+    await sayUndelivered(row.closedSessions.map((sessionId) => ({ owner, session_id: sessionId })), (sid) => waker.wake(`s:${sid}`), "revoked");
     // The id every row of this connector is filed under. A connector whose token `sub` is not the id the
     // user's own clients resolve to is registered and online yet invisible to them, with no error; this
     // line is where an operator reads which id it was filed under (docs/remote-agents.md, "Connector access tokens").
@@ -370,10 +375,11 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   /** Revoke one of the caller's connectors: the row stays revoked for good, its queued commands go and its sessions close. */
   async function revoke(req: FastifyRequest, reply: FastifyReply, owner: string) {
     const id = parseRemoteId((req.params as { cid?: string }).cid);
-    if (!id || !(await store.revokeConnector(owner, id, clientLabel(req), (q) => closeCardsOfConnector(q, owner, id).then(() => undefined)))) {
-      return notFound(reply);
-    }
+    const closed = id ? await store.revokeConnector(owner, id, clientLabel(req), (q) => closeCardsOfConnector(q, owner, id).then(() => undefined)) : null;
+    if (!id || !closed) return notFound(reply);
     waker.wake(`c:${id}`);
+    // Its sessions closed with it, each with a `session_closed` of Claw's own: their readers and items are told now.
+    await sayUndelivered(closed.map((sessionId) => ({ owner, session_id: sessionId })), (sid) => waker.wake(`s:${sid}`), "revoked");
     return reply.send({ ok: true });
   }
 
