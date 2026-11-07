@@ -11,6 +11,7 @@ import { main, EXIT, type Ctx } from "../src/commands.js";
 import { parseConfig } from "../src/config.js";
 import { defaultRoot, detectAgents, pairedConfig } from "../src/pair.js";
 import { credentialsFile, identityFile, resolveDirs } from "../src/paths.js";
+import { saveCredentials } from "../src/credentials.js";
 import { FakeClaw } from "./support/fake-claw.js";
 import { tmpdir } from "./support/harness.js";
 
@@ -88,6 +89,14 @@ describe("claw-connector pair", () => {
       assert.equal(await main(["logout"], ctx(home).c), EXIT.ok);
       assert.deepEqual(claw.revocations.map((x) => [x.method, x.auth]), [["POST", `Bearer ${GRANT}`]]);
       assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
+      // Revoked at Claw while running: a paired machine is told to pair again, not to log in.
+      saveCredentials(credentialsFile(a.c.dirs), { v: 1, server: claw.url, kind: "grant", token: GRANT, saved_at: "" });
+      const rv = ctx(home, { timing: { heartbeatMs: 150, pausePollMs: 40, batchMs: 15, backoffMinMs: 20, backoffMaxMs: 100 } });
+      const again = main(["run"], rv.c);
+      await claw.until("registered again", () => claw.online);
+      claw.revoke();
+      assert.equal(await again, EXIT.revoked);
+      assert.match(rv.errText(), /Pair it again/);
     } finally {
       connector?.stop();
       await running;

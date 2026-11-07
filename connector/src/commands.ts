@@ -414,14 +414,16 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   for (const w of noAsk(ctx, cfg)) ctx.out(`warning: ${w}`);
   try {
     const result = await connector.run();
+    // A machine paired from the chat has no login to run again: a new pairing code is what connects it.
+    const again = creds.kind === "grant" ? "Pair it again: ask the chat for a new command (\"连接我的开发环境\") and run it here." : "Run login again to connect it anew.";
     if (result === "revoked") {
       markNeedsLogin(ctx.dirs, "this connector was revoked");
-      ctx.err("this connector was revoked: every agent was stopped. Run login again to connect it anew.");
+      ctx.err(`this connector was revoked: every agent was stopped. ${again}`);
       return EXIT.revoked;
     }
     if (result === "auth_failed") {
       markNeedsLogin(ctx.dirs, `Claw refused the sign-in (${connector.authFailure})`);
-      ctx.err(`Claw keeps refusing this sign-in (${connector.authFailure}): every agent was stopped. Run login again.`);
+      ctx.err(`Claw keeps refusing this sign-in (${connector.authFailure}): every agent was stopped. ${again}`);
       return EXIT.needsPerson;
     }
     if (runFlags.supervised && !takeStopRequest(ctx)) {

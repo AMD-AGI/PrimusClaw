@@ -996,8 +996,15 @@ export async function devenvPair(claims: AssistantTokenClaims): Promise<Record<s
   }
   const server = (process.env.CLAW_PUBLIC_URL ?? "").trim().replace(/\/+$/, "");
   if (!server) throw new ToolRefused("pairing_unavailable", "pairing is not set up here (no public Claw address): tell the user to run claw-connector login on the machine");
-  const { createPairing, pairCommand, PAIRING_TTL_MS } = await import("../remote-agents/pairing.js");
-  const { code, expires_at } = await createPairing(userId, "assistant");
+  const { createPairing, pairCommand, PAIRING_TTL_MS, PairingRateLimited } = await import("../remote-agents/pairing.js");
+  let got: { code: string; expires_at: string };
+  try {
+    got = await createPairing(userId, "assistant");
+  } catch (err) {
+    if (err instanceof PairingRateLimited) throw new ToolRefused("rate_limited", "too many pairing codes in the last minute: ask the user to wait a minute and ask again");
+    throw err;
+  }
+  const { code, expires_at } = got;
   return {
     command: pairCommand(server, code),
     expires_at,

@@ -211,29 +211,36 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     }
   });
 
-  test("P6 a grant that never registered runs out after a day", async () => {
+  test("P6 a grant that never registered runs out after an hour", async () => {
     const token = (await claim((await newCode("alice")).code)).body.data.token as string;
-    await q("UPDATE claw_remote_grants SET created_at = NOW() - interval '25 hours'");
+    await q("UPDATE claw_remote_grants SET created_at = NOW() - interval '61 minutes'");
     const r = await register(token);
     assert.deepEqual([r.status, r.body.error], [401, "invalid_token"]);
     assert.equal(await pairing.pruneUnboundGrants(), 1);
   });
 
-  test("P7 codes are only for a signed-in person, and claims are throttled per address", async () => {
+  test("P7 codes are only for a signed-in person, at most a few a minute; wrong claims are throttled per client address", async () => {
     const anon = await call("POST", "/v1/remote-agents/pairings", { body: {} });
     assert.equal(anon.status, 401);
     const limited = Fastify();
-    limited.addHook("preHandler", async (req) => { (req as any).user = { userId: "alice", userName: "alice", platformKey: "", virtualKey: "", roles: ["default"] }; });
+    limited.addHook("preHandler", async (req) => { (req as any).user = { userId: "carol", userName: "carol", platformKey: "", virtualKey: "", roles: ["default"] }; });
     const { registerPairingRoutes } = await import("../src/remote-agents/pairing-routes.js");
-    await registerPairingRoutes(limited, { publicUrl: SERVER, claimsPerMinute: 2, codesPerMinute: 1 });
-    const inject = (url: string, payload: unknown) => limited.inject({ method: "POST", url, payload: payload as object });
+    await registerPairingRoutes(limited, { publicUrl: SERVER, claimsPerMinute: 2, codesPerMinute: 2 });
+    const inject = (url: string, payload: unknown, from = "203.0.113.7") =>
+      limited.inject({ method: "POST", url, payload: payload as object, headers: { "x-forwarded-for": `${from}, 10.0.0.1` } });
+    const good = (await inject("/v1/remote-agents/pairings", {})).json().data.code as string;
+    assert.equal((await inject("/v1/remote-agents/pairings", {})).statusCode, 201);
+    assert.equal((await inject("/v1/remote-agents/pairings", {})).statusCode, 429, "a third code in a minute");
+    // The limit is the person's, whichever route asks (the assistant's devenv_pair calls the same function).
+    await assert.rejects(pairing.createPairing("carol", null, new Date(), 2), pairing.PairingRateLimited);
+    // Someone posting wrong codes from one address is held back there...
     assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" })).statusCode, 400);
     assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" })).statusCode, 400);
     assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: "x" })).statusCode, 429);
-    assert.equal((await inject("/v1/remote-agents/pairings", {})).statusCode, 201);
-    assert.equal((await inject("/v1/remote-agents/pairings", {})).statusCode, 429);
+    // ...and nobody else is: behind the ingress every request has the same socket address, and the forwarded one tells them apart.
+    assert.equal((await inject("/v1/remote-agents/pairings/claim", { code: good }, "198.51.100.9")).statusCode, 201);
     const noServer = Fastify();
-    noServer.addHook("preHandler", async (req) => { (req as any).user = { userId: "alice", userName: "alice", platformKey: "", virtualKey: "", roles: ["default"] }; });
+    noServer.addHook("preHandler", async (req) => { (req as any).user = { userId: "dave", userName: "dave", platformKey: "", virtualKey: "", roles: ["default"] }; });
     const saved = process.env.CLAW_PUBLIC_URL;
     delete process.env.CLAW_PUBLIC_URL;
     try {
@@ -245,6 +252,43 @@ describe("pairing a machine with a one-time code", { skip }, () => {
       await limited.close();
       await noServer.close();
     }
+  });
+
+  test("P9 a grant revokes no other machine of the owner's: not by registering under its name, not by renaming itself", async () => {
+    // The owner's own machine, signed in otherwise, offline for a long time under the name "workstation".
+    const ws = await call("POST", "/v1/remote-agents/connectors", { user: "alice", body: { name: "workstation", version: "0.1.6" } });
+    const wsId = ws.body.data.connector_id as string;
+    await q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '1 hour', stream_seen_at = NULL, created_at = NOW() - interval '1 hour' WHERE connector_id = $1", [wsId]);
+    const token = (await claim((await newCode("alice")).code)).body.data.token as string;
+    const mine = await register(token, "workstation");
+    assert.equal(mine.status, 201);
+    assert.deepEqual(mine.body.data.replaced ?? [], []);
+    assert.equal((await q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [wsId])).rows[0].revoked_at, null,
+      "the owner's own workstation is not revoked by a grant taking its name");
+    // Bound now: another name is refused, and the grant stays on its row...
+    const renamed = await register(token, "x");
+    assert.deepEqual([renamed.status, renamed.body.error], [403, "connector_grant_name_mismatch"]);
+    const cid = mine.body.data.connector_id as string;
+    assert.equal((await heartbeat(token, cid)).status, 200);
+    // ...so /agent off on the name the owner was told ends it, registering again included.
+    assert.equal((await call("DELETE", `/v1/remote-agents/connectors/${cid}`, { user: "alice" })).status, 200);
+    for (const r of [await register(token, "workstation"), await register(token, "x")]) assert.deepEqual([r.status, r.body.error], [401, "revoked"]);
+  });
+
+  test("P10 a revocation that lands between the auth check and the registration is honoured in the registration's transaction", async () => {
+    const store = await import("../src/remote-agents/store.js");
+    const token = (await claim((await newCode("alice")).code)).body.data.token as string;
+    const cid = (await register(token)).body.data.connector_id as string;
+    const grantId = (await q("SELECT grant_id::text AS id FROM claw_remote_grants")).rows[0].id as string;
+    assert.equal(await store.revokeConnector("alice", cid, null), true);
+    await assert.rejects(store.registerConnector("alice", "laptop", "0.1.6", null, 10, "connector_grant", 90_000, undefined, grantId),
+      (e: unknown) => e instanceof store.GrantRegistrationRefused && e.reason === "revoked");
+    // A bound row that is gone altogether counts as revoked too.
+    const t2 = (await claim((await newCode("alice")).code)).body.data.token as string;
+    const c2 = (await register(t2, "box")).body.data.connector_id as string;
+    await q("DELETE FROM claw_remote_connectors WHERE connector_id = $1", [c2]);
+    const r = await register(t2, "box");
+    assert.deepEqual([r.status, r.body.error], [401, "revoked"]);
   });
 
   test("P8 codes are read as typed: case, dashes and the letters base32 reads as digits", () => {

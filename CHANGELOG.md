@@ -42,7 +42,9 @@ record it.
   approval. The connector trades the code at the anonymous `POST /v1/remote-agents/pairings/claim` for a connector grant (`cpg_...`,
   only its SHA-256 stored) that authenticates on the connector-side routes only, reaches only the connector it registered, and ends when
   that connector is revoked (`/agent off`, logout, `DELETE .../connectors/:cid`): it then answers 401 `revoked`. The owner is told once,
-  through their assistant, which machine was paired and how to disconnect it. New tables `claw_remote_pairings`, `claw_remote_grants`
+  through their assistant, which machine was paired and how to disconnect it. A grant replaces no row but its own (never another
+  machine of the owner's with the same name) and re-registers only under its own row's name; wrong claims are throttled per client
+  address (first `X-Forwarded-For` entry), failures only; at most 6 codes a minute per person by any route. New tables `claw_remote_pairings`, `claw_remote_grants`
   (created with the remote-agents schema). The router's `devenv_pair` tool answers "连接我的开发环境" with no machine yet, "add a machine",
   "pair my laptop" with that command line, said as given; it is never sent by devenv_send or by a report. Router prompt router-devenv-v8.
 - Connecting a machine is said with the exact commands, for every client. `GET /v1/remote-agents/setup` gives the connector's npm

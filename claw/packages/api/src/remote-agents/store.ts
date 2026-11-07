@@ -68,6 +68,11 @@ export async function findConnector(owner: string, connectorId: string, onlineWi
 const withCredential = (detail: Record<string, unknown>, credential: string | null): Record<string, unknown> =>
   credential ? { ...detail, credential } : detail;
 
+/** A connector grant may not register this way (`registerConnector` with a grant id): its row was revoked, or another name. */
+export class GrantRegistrationRefused extends Error {
+  constructor(readonly reason: "revoked" | "name_mismatch") { super(`connector grant registration refused: ${reason}`); }
+}
+
 export async function registerConnector(
   owner: string, name: string, version: string | null, client: string | null, maxPerUser: number,
   credential: string | null = null, onlineWindowMs: number | null = null,
@@ -84,7 +89,24 @@ export async function registerConnector(
     // is another process holding that name and is left alone, and so is one made within the window (registered, not yet
     // connected). Should a machine whose row was revoked this way come back after all, it is told `revoked` and stops.
     const replaced: string[] = [];
-    if (onlineWindowMs !== null) {
+    if (grantId) {
+      // A paired machine's grant (`pairing.ts`) replaces no row but its own: never another machine of the owner's, whatever name it
+      // gives. Bound already, it registers again only under its own row's name, and that row is the one replaced; a grant whose row
+      // was revoked (`/agent off`) is over, here too, in this transaction.
+      const g = (await q("SELECT connector_id::text AS connector_id, revoked_at FROM claw_remote_grants WHERE grant_id = $1 FOR UPDATE",
+        [grantId])).rows[0] as { connector_id: string | null; revoked_at: Date | null } | undefined;
+      if (!g || g.revoked_at) throw new GrantRegistrationRefused("revoked");
+      if (g.connector_id) {
+        const own = (await q("SELECT name, revoked_at FROM claw_remote_connectors WHERE connector_id = $1 AND owner_user_id = $2 FOR UPDATE",
+          [g.connector_id, owner])).rows[0] as { name: string; revoked_at: Date | null } | undefined;
+        if (!own || own.revoked_at) throw new GrantRegistrationRefused("revoked");
+        if (own.name !== name) throw new GrantRegistrationRefused("name_mismatch");
+        if (await revokeIn(q, owner, g.connector_id, client, { reason: "replaced_by_same_name" })) {
+          await alsoOnReplace?.(q, g.connector_id);
+          replaced.push(g.connector_id);
+        }
+      }
+    } else if (onlineWindowMs !== null) {
       const stale = (await q(
         `SELECT c.connector_id FROM claw_remote_connectors c
           WHERE c.owner_user_id = $2 AND c.name = $3 AND c.revoked_at IS NULL

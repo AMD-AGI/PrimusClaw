@@ -287,12 +287,19 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!owner) return;
     const body = parseConnectorRegistration(req.body ?? {});
     if (!body.ok) return fail(reply, 400, body.error);
-    const row = await store.registerConnector(
-      owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req), onlineWindowMs,
-      // A replaced row is revoked: the cards that would send to it close with it, as on the revoke route.
-      (q, id) => closeCardsOfConnector(q, owner, id).then(() => undefined),
-      grantOf(req),
-    );
+    let row: Awaited<ReturnType<typeof store.registerConnector>>;
+    try {
+      row = await store.registerConnector(
+        owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req), onlineWindowMs,
+        // A replaced row is revoked: the cards that would send to it close with it, as on the revoke route.
+        (q, id) => closeCardsOfConnector(q, owner, id).then(() => undefined),
+        grantOf(req),
+      );
+    } catch (err) {
+      if (!(err instanceof store.GrantRegistrationRefused)) throw err;
+      // As the auth hook answers: a revoked row's grant is over (401 revoked, the connector stops); another name is not this grant's.
+      return err.reason === "revoked" ? fail(reply, 401, "revoked") : fail(reply, 403, "connector_grant_name_mismatch");
+    }
     if (!row) return fail(reply, 409, "connector_limit_reached");
     // A paired machine's grant now follows this row (bound above, in its transaction): only its routes, over once it is revoked.
     const grant = grantOf(req);

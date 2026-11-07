@@ -15,7 +15,7 @@
  *     (`auth/connector-grant.ts`), and is bound to the connector row it registers. It does not expire: revoking that row
  *     (`/agent off` in the chat, `DELETE /v1/remote-agents/connectors/:cid`, `claw-connector logout`) ends it, and a grant
  *     whose row is revoked answers 401 `revoked`, which stops the connector for good.
- *   - A grant claimed and never used to register is dropped after {@link UNBOUND_GRANT_TTL_MS}.
+ *   - A grant claimed and never used to register is refused an hour after its claim (`pair` registers within seconds) and dropped.
  *
  * The first registration under a grant tells the owner through their assistant, once, which machine was paired and how to
  * disconnect it: the code was shown in a chat, and a person who did not run it should hear about it.
@@ -30,7 +30,7 @@ const logger = pino({ name: "remote-agents-pairing" });
 
 export const PAIRING_TTL_MS = 10 * 60 * 1000;
 export const MAX_LIVE_CODES = 3;
-export const UNBOUND_GRANT_TTL_MS = 24 * 60 * 60 * 1000;
+export const UNBOUND_GRANT_TTL_MS = 60 * 60 * 1000;
 /** What every connector grant starts with, so a request that carries one is recognised before any other credential path. */
 export const GRANT_PREFIX = "cpg_";
 /** The npm package the pairing command installs. */
@@ -100,11 +100,24 @@ export async function ensurePairingSchema(q: Querier): Promise<void> {
 }
 
 /** A new code for `owner`, and when it runs out. Retires the owner's oldest live codes beyond {@link MAX_LIVE_CODES}. */
-export async function createPairing(owner: string, client: string | null, now: Date = new Date()): Promise<{ code: string; expires_at: string }> {
+/** Codes one person may be given per minute, by any route (the HTTP route and the assistant's `devenv_pair` alike). */
+export const CODES_PER_MINUTE = 6;
+
+export class PairingRateLimited extends Error {
+  constructor() { super("too many pairing codes asked for in the last minute"); }
+}
+
+export async function createPairing(owner: string, client: string | null, now: Date = new Date(), perMinute: number = CODES_PER_MINUTE): Promise<{ code: string; expires_at: string }> {
   const code = newCode();
   const expires = new Date(now.getTime() + PAIRING_TTL_MS);
   await inTransaction(async (q) => {
     await q("SELECT pg_advisory_xact_lock(7001, hashtext($1))", [`pairings:${owner}`]);
+    // Counted from the audit trail, which outlives the codes (spent and expired ones are deleted below).
+    const recent = Number((await q(
+      `SELECT COUNT(*) AS n FROM claw_remote_audit WHERE owner_user_id = $1 AND action = 'pairing.created'
+         AND ts > $2::timestamptz - INTERVAL '1 minute'`, [owner, now],
+    )).rows[0].n);
+    if (recent >= perMinute) throw new PairingRateLimited();
     // Spent and expired codes say nothing any more; the live ones beyond the newest few are retired.
     await q("DELETE FROM claw_remote_pairings WHERE owner_user_id = $1 AND (claimed_at IS NOT NULL OR expires_at <= $2)", [owner, now]);
     await q(
@@ -166,7 +179,8 @@ export interface GrantRow {
 export async function findGrant(token: string, q: Querier = (t, p) => db.query(t, p)): Promise<GrantRow | null> {
   const row = (await q(
     `SELECT g.grant_id::text AS grant_id, g.owner_user_id, g.connector_id::text AS connector_id, g.created_at, g.revoked_at,
-            COALESCE(c.revoked_at IS NOT NULL, FALSE) AS connector_revoked
+            -- Fails closed: a bound row that is gone counts as revoked.
+            (g.connector_id IS NOT NULL AND (c.connector_id IS NULL OR c.revoked_at IS NOT NULL)) AS connector_revoked
        FROM claw_remote_grants g LEFT JOIN claw_remote_connectors c ON c.connector_id = g.connector_id
       WHERE g.token_hash = $1`,
     [hashGrant(token)],
