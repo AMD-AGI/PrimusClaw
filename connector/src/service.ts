@@ -11,6 +11,12 @@
  *  - script: for containers without systemd. `supervise` (this file) is a small foreground loop doing what the
  *    systemd unit does, and `keepalive.sh` starts it detached unless it is already alive; a startup hook and a
  *    5-minute cron line call that script, so a killed supervisor or a restarted container is back within minutes.
+ *    `install` adds the two cron lines itself when a cron daemon runs, and says plainly when none does.
+ *
+ * The environment: a service starts with almost nothing, so `install` carries over what the agents read from the shell
+ * that ran it. Plain settings (PATH, proxies, model gateways) go into the unit; the agents' own sign-in variables
+ * (ANTHROPIC_API_KEY, OPENAI_API_KEY...) go into `service-env.json` next to the sign-in (0600, never into a unit), which
+ * every `run` reads. Without that, a connector that worked in the foreground loses its agents' sign-in as a service.
  */
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -18,10 +24,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { parse as parseToml } from "smol-toml";
 import type { Ctx, ServiceHelpers } from "./commands.js";
 import { isAlive, processStart } from "./children.js";
 import { needsLogin, recordDisconnect, recentDisconnects } from "./health.js";
-import { keepaliveFile, keepaliveStampFile, runLogFile, serviceFile, supervisorPidFile } from "./paths.js";
+import { keepaliveFile, keepaliveStampFile, runLogFile, serviceEnvFile, serviceFile, supervisorPidFile } from "./paths.js";
 import { errMessage, isObject, sleep } from "./util.js";
 
 export type Supervisor = "systemd" | "launchd" | "script";
@@ -33,14 +40,35 @@ export const NEEDS_PERSON = 78;
 
 /**
  * Variables a unit carries over from the shell that ran `service install`. A service starts with an almost empty
- * environment, and the agents it spawns need PATH (to find claude, codex, npx) and the same config directories the
- * terminal uses. Nothing else is copied: no credential variable (CLAW_CONNECTOR_KEY, API keys) ever lands in a unit.
+ * environment, and the agents it spawns need PATH (to find claude, codex, npx), the same config directories the
+ * terminal uses, and the settings that point them at a model: a gateway URL, a cloud provider, the npm registry.
+ * No credential variable (CLAW_CONNECTOR_KEY, API keys) ever lands in a unit; the agents' own go to service-env.json.
  */
 export const CARRIED_ENV = [
-  "PATH", "CLAW_CONNECTOR_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+  "PATH", "CLAW_CONNECTOR_HOME", "CLAW_CONNECTOR_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
   "NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA", "NODE_USE_ENV_PROXY", "SSL_CERT_FILE", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "LANG",
+  "IS_SANDBOX", "npm_config_registry", "NPM_CONFIG_REGISTRY", "npm_config_proxy", "npm_config_https_proxy",
+  "AWS_REGION", "AWS_PROFILE", "CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS",
 ] as const;
-const SECRET_NAME = /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i;
+/** Every non-secret setting of the agents themselves (ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, CLAUDE_CODE_USE_BEDROCK, OPENAI_BASE_URL...). */
+const AGENT_SETTING = /^(?:ANTHROPIC|CLAUDE_CODE|OPENAI|CODEX|CURSOR)_/;
+/**
+ * What a Claude Code or Codex terminal sets for its own session (install may run inside one): never carried, or every
+ * agent of the service would believe it runs inside that session (terminals.ts reads CLAUDE_CODE_ENTRYPOINT).
+ */
+const TERMINAL_SESSION = /^(?:CLAUDE_CODE_(?:ENTRYPOINT|SSE_PORT|SESSION|CHILD_SESSION|MESSAGING|EXECPATH|IDE|GIT_BASH)|CODEX_(?:SANDBOX|THREAD|SESSION|MANAGED|INTERNAL|CI))/;
+/** Named like a credential. `_TOKENS` (CLAUDE_CODE_MAX_OUTPUT_TOKENS) is a count, not a token. */
+const SECRET_NAME = /KEY|TOKEN(?!S)|SECRET|PASSWORD|CREDENTIAL/i;
+/**
+ * The agents' own sign-in variables. When set in the shell that runs `install`, they are kept in service-env.json
+ * (0600, beside credentials.json) for the service, never in a unit. ANTHROPIC_CUSTOM_HEADERS usually carries one.
+ */
+export const AGENT_SECRETS = [
+  "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
+  "OPENAI_API_KEY", "CODEX_API_KEY", "CURSOR_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+] as const;
+/** The connector's own credential: it lives in credentials.json and is never copied anywhere. */
+const NEVER_CARRIED = new Set(["CLAW_CONNECTOR_KEY"]);
 
 export interface ExecResult { code: number | null; out: string }
 
@@ -56,15 +84,70 @@ export interface ServiceDeps {
   cli: string;
   /** Whether systemd is this machine's init (sd_booted: /run/systemd/system exists). */
   systemdBooted: () => boolean;
+  /** The user's crontab: null when there is no usable cron (no `crontab` program, or no cron daemon running). */
+  readCrontab: () => string | null;
+  writeCrontab: (text: string) => boolean;
+}
+
+/**
+ * The account's name for loginctl, never a crash: a uid with no /etc/passwd entry (a container started with an
+ * arbitrary runAsUser) makes os.userInfo() throw ENOENT, and only the systemd branch needs a name at all.
+ */
+export function accountName(env: NodeJS.ProcessEnv, uid: number, userInfo: () => { username: string } = os.userInfo): string {
+  if (env.USER) return env.USER;
+  if (env.LOGNAME) return env.LOGNAME;
+  try { return userInfo().username; } catch { return String(uid); }
+}
+
+/**
+ * Whether a cron daemon that reads this container's crontab is running: a container often has the `crontab` program and
+ * no daemon to read it, and one that shares the host's process list (hostPID) sees the host's cron, which reads the
+ * host's crontab, not this one. So a cron process counts only in this process's own mount namespace.
+ */
+export function cronDaemonRunning(proc = "/proc"): boolean {
+  let self: string;
+  let pids: string[];
+  try {
+    self = fs.readlinkSync(`${proc}/self/ns/mnt`);
+    pids = fs.readdirSync(proc).filter((n) => /^\d+$/.test(n));
+  } catch { return false; }
+  for (const pid of pids) {
+    try {
+      if (!/^(?:cron|crond|busybox)$/.test(fs.readFileSync(`${proc}/${pid}/comm`, "utf8").trim())) continue;
+      if (!/cron/.test(fs.readFileSync(`${proc}/${pid}/cmdline`, "utf8"))) continue;
+      if (fs.readlinkSync(`${proc}/${pid}/ns/mnt`) === self) return true;
+    } catch { /* gone, or not ours to read */ }
+  }
+  return false;
+}
+
+function systemCrontab(): Pick<ServiceDeps, "readCrontab" | "writeCrontab"> {
+  return {
+    readCrontab: () => {
+      if (!cronDaemonRunning()) return null;
+      const r = spawnSync("crontab", ["-l"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] });
+      if (r.error) return null;
+      // "no crontab for me" (exit 1) is an empty crontab, not a missing cron.
+      return r.status === 0 ? r.stdout : /no crontab/i.test(r.stderr ?? "") ? "" : null;
+    },
+    writeCrontab: (text) => {
+      const r = spawnSync("crontab", ["-"], { input: text, encoding: "utf8", timeout: 10_000, stdio: ["pipe", "pipe", "pipe"] });
+      return !r.error && r.status === 0;
+    },
+  };
 }
 
 function deps(ctx: Ctx): ServiceDeps {
   const d = ctx.service ?? {};
+  const uid = d.uid ?? (process.getuid?.() ?? 0);
+  const cron = d.readCrontab && d.writeCrontab ? null : systemCrontab();
   return {
     platform: d.platform ?? process.platform,
     home: d.home ?? os.homedir(),
-    uid: d.uid ?? (process.getuid?.() ?? 0),
-    user: d.user ?? (ctx.env.USER || os.userInfo().username),
+    uid,
+    user: d.user ?? accountName(ctx.env, uid),
+    readCrontab: d.readCrontab ?? cron!.readCrontab,
+    writeCrontab: d.writeCrontab ?? cron!.writeCrontab,
     exec: d.exec ?? ((cmd, args) => {
       const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 30_000, stdio: ["ignore", "pipe", "pipe"] });
       return { code: r.error ? null : r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
@@ -93,26 +176,88 @@ export function detectSupervisor(d: ServiceDeps): Supervisor {
 
 /** A proxy URL with a user name or password in it (`http://user:pass@host`). */
 export const hasUserinfo = (v: string): boolean => {
-  try { const u = new URL(v); return u.username !== "" || u.password !== ""; } catch { return /\/\/[^/]*@/.test(v); }
+  try { const u = new URL(v); if (u.username !== "" || u.password !== "") return true; } catch { /* not one URL */ }
+  return /\/\/[^/\s]*@/.test(v);
 };
 
 /**
- * The variables a unit sets: the carried ones that are set here, plus any `--env NAME`, never one that looks like a
- * secret. A proxy URL that carries a password is left out (`withheld`) unless named with `--env`: the unit file is
- * 0600, but a password is not written into it without being asked.
+ * The names of the variables Codex's own config.toml reads a key from (`env_key` of a `model_providers` entry), which
+ * a Codex agent needs as much as OPENAI_API_KEY. Unreadable or absent: none.
  */
-export function carriedEnv(env: NodeJS.ProcessEnv, extra: string[] = []): { vars: Array<[string, string]>; refused: string[]; withheld: string[] } {
+export function codexEnvKeys(env: NodeJS.ProcessEnv, home: string): string[] {
+  const dir = env.CODEX_HOME?.trim() || path.join(home, ".codex");
+  try {
+    const doc = parseToml(fs.readFileSync(path.join(dir, "config.toml"), "utf8")) as Record<string, unknown>;
+    const providers = isObject(doc.model_providers) ? doc.model_providers : {};
+    return Object.values(providers).flatMap((p) => (isObject(p) && typeof p.env_key === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(p.env_key) ? [p.env_key] : []));
+  } catch { return []; }
+}
+
+export interface Carried {
+  /** Written into the unit (or keepalive.sh, or the LaunchAgent). */
+  vars: Array<[string, string]>;
+  /** The agents' sign-in variables: written into service-env.json (0600), never into a unit. */
+  secrets: Array<[string, string]>;
+  /** Asked for with --env and never carried (the connector's own key). */
+  refused: string[];
+  /** A proxy URL with a password in it, left out unless asked for with --env. */
+  withheld: string[];
+}
+
+/**
+ * What the service gets from this shell: the carried variables and the agents' plain settings that are set here, for
+ * the unit; the agents' sign-in variables (AGENT_SECRETS, Codex's `env_key` names, anything named like a credential
+ * that `--env` asks for), for service-env.json. A proxy URL that carries a password is left out (`withheld`) unless
+ * named with `--env`: the unit file is 0600, but a password is not written into it without being asked.
+ */
+export function carriedEnv(env: NodeJS.ProcessEnv, extra: string[] = [], secretNames: readonly string[] = AGENT_SECRETS): Carried {
   const vars: Array<[string, string]> = [];
+  const secrets: Array<[string, string]> = [];
   const refused: string[] = [];
   const withheld: string[] = [];
-  for (const name of new Set([...CARRIED_ENV, ...extra])) {
-    if (!(CARRIED_ENV as readonly string[]).includes(name) && SECRET_NAME.test(name)) { refused.push(name); continue; }
+  const settings = Object.keys(env).filter((k) => AGENT_SETTING.test(k) && !TERMINAL_SESSION.test(k)).sort();
+  for (const name of new Set([...CARRIED_ENV, ...settings, ...secretNames, ...extra])) {
+    if (NEVER_CARRIED.has(name)) { if (extra.includes(name)) refused.push(name); continue; }
     const v = env[name];
     if (v === undefined || v === "") continue;
-    if (/proxy$/i.test(name) && hasUserinfo(v) && !extra.includes(name)) { withheld.push(name); continue; }
+    const proxy = /proxy$/i.test(name);
+    // A URL with a user name or password in it (`https://user:pass@gateway`) is a credential whatever the name says.
+    const secret = (!(CARRIED_ENV as readonly string[]).includes(name) && (SECRET_NAME.test(name) || secretNames.includes(name))) || (!proxy && hasUserinfo(v));
+    if (secret) { secrets.push([name, v]); continue; }
+    // A proxy is read by the connector itself, not only by the agents, so it stays in the unit: with a password only
+    // when asked for by name (`--env HTTPS_PROXY`), into a unit file that is 0600 (unchanged from before).
+    if (proxy && hasUserinfo(v) && !extra.includes(name)) { withheld.push(name); continue; }
+    // One line per variable in a unit or a script: a value with a line break in it cannot be written there safely.
+    if (/[\r\n]/.test(v)) { withheld.push(name); continue; }
     vars.push([name, v]);
   }
-  return { vars, refused, withheld };
+  return { vars, secrets, refused, withheld };
+}
+
+/**
+ * Give each agent the sign-in variables `service install` kept, where neither the connector's own environment nor the
+ * agent's `[agents.env]` sets them: a service starts without the shell's ANTHROPIC_API_KEY, and an agent that signs in
+ * with it would otherwise start, say it is ready, and fail at the first message. Returns the names it filled in.
+ */
+export function applyServiceEnv(agents: Array<{ env: Record<string, string> }>, kept: Record<string, string>, env: NodeJS.ProcessEnv): string[] {
+  const used = new Set<string>();
+  for (const a of agents) {
+    for (const [k, v] of Object.entries(kept)) {
+      if (env[k] !== undefined || Object.hasOwn(a.env, k)) continue;
+      a.env = { ...a.env, [k]: v };
+      used.add(k);
+    }
+  }
+  return [...used].sort();
+}
+
+/** The agents' sign-in variables the service keeps (service-env.json), by name. Unreadable or absent: none. */
+export function loadServiceEnv(file: string): Record<string, string> {
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!isObject(raw)) return {};
+    return Object.fromEntries(Object.entries(raw).filter((e): e is [string, string] => typeof e[1] === "string" && !NEVER_CARRIED.has(e[0])));
+  } catch { return {}; }
 }
 
 /**
@@ -265,8 +410,9 @@ export async function cmdSupervise(_args: string[], ctx: Ctx): Promise<number> {
 }
 
 /** `service ensure` (what keepalive.sh runs): start the supervisor, detached, unless it lives or a sign-in is needed. */
-async function ensure(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers): Promise<number> {
-  stampKeepalive(ctx);
+async function ensure(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, o: { byInstall?: boolean } = {}): Promise<number> {
+  // The stamp says that something (cron, a startup hook) calls keepalive.sh; `install` starting it once is not that.
+  if (!o.byInstall) stampKeepalive(ctx);
   const sup = supervisorPid(ctx);
   if (sup !== null) { ctx.out(`supervisor running (pid ${sup})`); return 0; }
   // Not started while only a person can help (no config, no sign-in, revoked): it would exit 78 every time.
@@ -347,6 +493,69 @@ export function startAfterLogin(ctx: Ctx, h: ServiceHelpers): void {
   ctx.out(r.code === 0 ? `started the ${sup} service again` : `could not start the ${sup} service (${r.out || `exit ${r.code}`}); run: claw-connector service install`);
 }
 
+export class UnsafeDirError extends Error {}
+
+/**
+ * Write a file that holds secrets: only into a directory this account owns, closed to its group and others first (made
+ * under umask 0002 it is 0775), through a new temporary file created exclusively. On Linux every step after the check
+ * goes through the directory as it was opened (`/proc/self/fd/N/...`, the opened inode), so a directory renamed or
+ * swapped for a link in the meantime cannot redirect the chmod or the write.
+ */
+export function writeSecretFile(file: string, body: string): void {
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  let dfd: number;
+  try {
+    dfd = fs.openSync(dir, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+  } catch (e) {
+    throw new UnsafeDirError(`${dir} cannot be opened as a directory of its own (${(e as NodeJS.ErrnoException).code ?? errMessage(e)}; a link is not followed): the agents' sign-in variables are not written there (set CLAW_CONNECTOR_CONFIG_DIR to a directory of your own)`);
+  }
+  try {
+    const st = fs.fstatSync(dfd);
+    const uid = process.getuid?.();
+    if (!st.isDirectory() || (uid !== undefined && st.uid !== uid)) {
+      throw new UnsafeDirError(`${dir} is ${!st.isDirectory() ? "not a directory" : "owned by another account"}: the agents' sign-in variables are not written there (set CLAW_CONNECTOR_CONFIG_DIR to a directory of your own)`);
+    }
+    // It is about to hold secrets, and only this account uses it.
+    if ((st.mode & 0o077) !== 0) fs.fchmodSync(dfd, 0o700);
+    let anchored: string;
+    if (fs.existsSync(`/proc/self/fd/${dfd}`)) anchored = `/proc/self/fd/${dfd}`;
+    else {
+      // No descriptor-relative path here (macOS): a path is used again, so it must be one nobody else can change. Its
+      // canonical form (no links left in it) must name the very directory that was checked, and every directory on
+      // the way to it must be this account's or root's and closed to others (or sticky). Otherwise nothing is written.
+      const real = fs.realpathSync(dir);
+      const rs = fs.statSync(real);
+      if (rs.dev !== st.dev || rs.ino !== st.ino) throw new UnsafeDirError(`${dir} changed while it was being checked; the agents' sign-in variables are not written there`);
+      const weak = renamableAncestor(real);
+      if (weak) throw new UnsafeDirError(`${weak} can be changed by other accounts, so ${dir} could be swapped while the agents' sign-in variables are written; they are not written there (set CLAW_CONNECTOR_CONFIG_DIR to a directory of your own)`);
+      anchored = real;
+    }
+    const tmp = path.join(anchored, `${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
+    const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    try { fs.writeSync(fd, body); fs.fchmodSync(fd, 0o600); } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, path.join(anchored, path.basename(file)));
+  } finally { fs.closeSync(dfd); }
+}
+
+/**
+ * The first directory on the way to `dir` (its parent and up, `dir` being a canonical path) in which another account
+ * could rename or replace an entry: a link, one that is not this account's or root's, or one its group or others may
+ * write without the sticky bit. Null when there is none.
+ */
+export function renamableAncestor(dir: string, uid: number | undefined = process.getuid?.()): string | null {
+  for (let p = path.dirname(path.resolve(dir)); ; p = path.dirname(p)) {
+    let st: fs.Stats;
+    // lstat: a link on the way is itself something that could point elsewhere; only plain directories pass.
+    try { st = fs.lstatSync(p); } catch { return p; }
+    if (!st.isDirectory()) return p;
+    const owner = st.uid === 0 || uid === undefined || st.uid === uid;
+    const sticky = (st.mode & 0o1000) !== 0;
+    if (!owner || ((st.mode & 0o022) !== 0 && !sticky)) return p;
+    if (p === path.dirname(p)) return null;
+  }
+}
+
 function writeFile600(file: string, body: string, mode = 0o600): void {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
@@ -358,9 +567,18 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
   const problem = h.preflight(ctx);
   if (problem) { ctx.err(`cannot install the service yet: ${problem}`); return NEEDS_PERSON; }
   if (!fs.existsSync(d.cli)) { ctx.err(`${d.cli} does not exist (a source checkout needs "npm run build" first)`); return 1; }
-  const { vars, refused, withheld } = carriedEnv(ctx.env, extra);
-  for (const r of refused) ctx.err(`--env ${r}: not carried into the service (it looks like a credential)`);
-  for (const w of withheld) ctx.err(`${w}: not carried into the service because it holds a password; if the connector needs it, install again with --env ${w} (it is then written into the 0600 unit file)`);
+  const { vars, secrets, refused, withheld } = carriedEnv(ctx.env, extra, [...AGENT_SECRETS, ...codexEnvKeys(ctx.env, d.home)]);
+  for (const r of refused) ctx.err(`--env ${r}: not carried into the service (it is the connector's own key, kept in credentials.json)`);
+  for (const w of withheld) {
+    ctx.err(/[\r\n]/.test(ctx.env[w] ?? "")
+      ? `${w}: not carried into the service because its value spans several lines`
+      : `${w}: not carried into the service because it holds a password; if the connector needs it, install again with --env ${w} (it is then written into the 0600 unit file)`);
+  }
+  try { saveServiceEnv(ctx, secrets); } catch (e) {
+    if (!(e instanceof UnsafeDirError)) throw e;
+    ctx.err(`cannot install the service: ${e.message}`);
+    return 1;
+  }
   // The service must be the one run: one started by hand would make every start of the service fail "already running".
   const manual = h.runningPid(ctx);
   if (manual !== null && supervisorPid(ctx) === null) {
@@ -397,14 +615,128 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
     const script = keepaliveFile(ctx.dirs);
     writeFile600(script, keepaliveScript(d, vars), 0o700);
     recordInstalled(ctx, "script", vars);
-    const code = await ensure(ctx, d, h);
+    const code = await ensure(ctx, d, h, { byInstall: true });
     if (code !== 0) return code;
-    ctx.out(`wrote ${script}. This machine has no systemd: the supervisor restarts the connector 5 s after it dies, but`);
-    ctx.out("nothing starts the supervisor after a reboot or a container restart. Add both of these (crontab -e, or your container's startup hook):");
-    ctx.out(`  @reboot sh ${script}`);
-    ctx.out(`  */5 * * * * sh ${script}`);
+    ctx.out(`wrote ${script}. This machine has no systemd: the supervisor restarts the connector 5 s after it dies.`);
+    scheduleKeepalive(ctx, d, script);
   }
   return 0;
+}
+
+/** The two crontab lines that call keepalive.sh: at boot, and every 5 minutes (it does nothing while the supervisor lives). */
+export const cronLines = (script: string): string[] => [`@reboot sh ${sh(script)} >/dev/null 2>&1`, `*/5 * * * * sh ${sh(script)} >/dev/null 2>&1`];
+
+/**
+ * Something must call keepalive.sh after a reboot or a container restart. Where a cron daemon runs, the two lines are
+ * added to the user's crontab (once; `uninstall` takes them out). Where none runs, which is the usual container, that
+ * is said plainly, with the one line a startup hook (or ~/.bashrc) needs: otherwise the connector is silently offline
+ * after the next restart.
+ */
+function scheduleKeepalive(ctx: Ctx, d: ServiceDeps, script: string): void {
+  const tab = d.readCrontab();
+  const want = cronLines(script);
+  if (tab !== null) {
+    // The user's lines as they were (blank ones too), without ours; ours go at the end.
+    const lines = tab.split("\n");
+    if (lines[lines.length - 1] === "") lines.pop();
+    const kept = lines.filter((l) => !want.includes(l.trim()));
+    if (d.writeCrontab([...kept, ...want].join("\n") + "\n")) {
+      ctx.out(`added to your crontab, so it comes back after a reboot and within 5 minutes of the supervisor dying:`);
+      for (const l of want) ctx.out(`  ${l}`);
+      return;
+    }
+    ctx.err("could not write your crontab (crontab -); add the lines below by hand");
+  }
+  ctx.out("No cron daemon runs here: after a reboot or a container restart NOTHING starts the connector again.");
+  ctx.out("Run this from the container's startup command (it does nothing while the connector is up; ~/.bashrc works too, then it");
+  ctx.out("comes back when you next open a shell):");
+  ctx.out(`  sh ${sh(script)} >/dev/null 2>&1`);
+  const where = ephemeralWhere(ctx.dirs.config);
+  if (where) ctx.out(`Note: ${where}`);
+}
+
+/** Lines of the user's crontab without the ones that call this keep-alive script; null when there is no cron. */
+function withoutOurCron(d: ServiceDeps, script: string): { tab: string; removed: number } | null {
+  const tab = d.readCrontab();
+  if (tab === null) return null;
+  // Only the exact lines `install` wrote: a line of the user's own that mentions the script is theirs.
+  const ours = cronLines(script);
+  const lines = tab.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  const kept = lines.filter((l) => !ours.includes(l.trim()));
+  return { tab: kept.length ? kept.join("\n") + "\n" : "", removed: lines.length - kept.length };
+}
+
+// --- where the configuration lives ------------------------------------------------------
+
+/** File systems a container throws away with itself. */
+const EPHEMERAL_FS = new Set(["overlay", "overlayfs", "aufs", "tmpfs"]);
+/** Network file systems a pod usually mounts from storage that outlives it. */
+const PERSISTENT_FS = /^(?:ceph|nfs|nfs4|lustre|wekafs|gpfs|beegfs|cifs|smb3|fuse\.(?:ceph|juicefs|s3fs|gcsfuse|sshfs|rclone))$/;
+
+interface Mount { point: string; fstype: string }
+
+export function readMounts(text?: string): Mount[] {
+  let raw = text;
+  if (raw === undefined) { try { raw = fs.readFileSync("/proc/self/mountinfo", "utf8"); } catch { return []; } }
+  const out: Mount[] = [];
+  for (const line of raw.split("\n")) {
+    // "36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw": the mount point is field 5, the type follows " - ".
+    const dash = line.indexOf(" - ");
+    if (dash < 0) continue;
+    const fields = line.slice(0, dash).split(" ");
+    const point = fields[4]?.replace(/\\([0-7]{3})/g, (_m, o: string) => String.fromCharCode(parseInt(o, 8)));
+    const fstype = line.slice(dash + 3).split(" ")[0];
+    if (point && fstype) out.push({ point, fstype });
+  }
+  return out;
+}
+
+/** The mount a path lives on: the longest mount point that is a prefix of it. */
+function mountOf(p: string, mounts: Mount[]): Mount | null {
+  let best: Mount | null = null;
+  for (const m of mounts) {
+    const inside = p === m.point || p.startsWith(m.point.endsWith("/") ? m.point : `${m.point}/`);
+    if (inside && (!best || m.point.length >= best.point.length)) best = m;
+  }
+  return best;
+}
+
+/**
+ * When the connector's configuration (agents.toml and the sign-in) is on a file system the container throws away
+ * (overlay, tmpfs), the sentence that says so and where to keep it instead; null when it is not (or cannot be told).
+ * A dev pod's home directory is often such a place: everything in it is gone when the pod is recreated.
+ */
+export function ephemeralWhere(configDir: string, mounts: Mount[] = readMounts()): string | null {
+  let real = configDir;
+  for (let p = configDir; ; p = path.dirname(p)) {
+    try { real = path.join(fs.realpathSync(p), path.relative(p, configDir)); break; } catch { if (p === path.dirname(p)) break; }
+  }
+  const m = mountOf(real, mounts);
+  if (!m || !EPHEMERAL_FS.has(m.fstype)) return null;
+  const persistent = [...new Set(mounts.filter((x) => PERSISTENT_FS.test(x.fstype) && !x.point.startsWith("/proc") && !x.point.startsWith("/sys")).map((x) => x.point))]
+    .filter((pt) => { try { fs.accessSync(pt, fs.constants.W_OK); return true; } catch { return false; } }).slice(0, 3);
+  return `agents.toml and the sign-in are in ${configDir}, on the container's own file system (${m.fstype}), which is lost when the container is recreated. `
+    + `Keep them on storage that outlives it: export CLAW_CONNECTOR_CONFIG_DIR=<a directory of yours on ${persistent.length ? persistent.join(" or ") : "a persistent volume"}>/claw-connector `
+    + `in your shell profile and the container's startup command, then run init and login again (the state directory, with its pid and lock files, stays where it is).`;
+}
+
+// --- service-env.json ---------------------------------------------------------------------
+
+/**
+ * The agents' sign-in variables the service needs, kept in service-env.json (0600) beside credentials.json. Merged
+ * with what an earlier install kept: installing again from a shell without the variable does not take it away.
+ */
+function saveServiceEnv(ctx: Ctx, secrets: Array<[string, string]>): void {
+  const file = serviceEnvFile(ctx.dirs);
+  const before = loadServiceEnv(file);
+  const merged = { ...before, ...Object.fromEntries(secrets) };
+  const names = Object.keys(merged).sort();
+  if (names.length === 0) return;
+  writeSecretFile(file, JSON.stringify(merged, null, 2) + "\n");
+  const fresh = secrets.map(([k]) => k);
+  const kept = names.filter((n) => !fresh.includes(n));
+  ctx.out(`the agents' sign-in for the service (in ${file}, mode 0600, never in a unit): ${[...fresh, ...kept.map((k) => `${k} (kept from before)`)].join(", ")}`);
 }
 
 /** `path`: the PATH the service starts the connector with (absent: none carried), which `doctor` checks the agents against. */
@@ -438,7 +770,13 @@ async function uninstall(ctx: Ctx, d: ServiceDeps, sup: Supervisor): Promise<num
     const script = keepaliveFile(ctx.dirs);
     const had = fs.existsSync(script);
     fs.rmSync(script, { force: true });
-    ctx.out(`${pid !== null ? `stopped the supervisor (pid ${pid}) and the connector; ` : ""}${had ? `removed ${script}` : "no keep-alive script"}. Remove the @reboot and */5 lines that call it.`);
+    const cron = withoutOurCron(d, script);
+    const cronGone = cron !== null && cron.removed > 0 && d.writeCrontab(cron.tab);
+    ctx.out(`${pid !== null ? `stopped the supervisor (pid ${pid}) and the connector; ` : ""}${had ? `removed ${script}` : "no keep-alive script"}${cronGone ? " and its crontab lines" : ". Remove any startup-hook or cron line that calls it."}`);
+  }
+  if (fs.existsSync(serviceEnvFile(ctx.dirs))) {
+    fs.rmSync(serviceEnvFile(ctx.dirs), { force: true });
+    ctx.out(`removed ${serviceEnvFile(ctx.dirs)} (the agents' sign-in variables kept for the service)`);
   }
   return 0;
 }
@@ -452,6 +790,8 @@ function status(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, json: boolean): num
   const st = {
     installed: sup,
     active,
+    /** The names (never the values) of the agents' sign-in variables the service keeps. */
+    agent_env: Object.keys(loadServiceEnv(serviceEnvFile(ctx.dirs))).sort(),
     running: h.runningPid(ctx),
     needs_login: needsLogin(ctx.dirs),
     recent_disconnects: recentDisconnects(ctx.dirs, 5),
@@ -459,6 +799,7 @@ function status(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, json: boolean): num
   if (json) { ctx.out(JSON.stringify(st, null, 2)); return 0; }
   ctx.out(`service:    ${sup ? `${sup} (${active})` : "not installed; run: claw-connector service install"}`);
   ctx.out(`connector:  ${st.running !== null ? `running (pid ${st.running})` : "not running"}`);
+  if (st.agent_env.length) ctx.out(`agent env:  ${st.agent_env.join(", ")} (from ${serviceEnvFile(ctx.dirs)})`);
   if (st.needs_login) ctx.out(`problem:    needs a new sign-in: ${st.needs_login.reason}; run: claw-connector login`);
   for (const x of st.recent_disconnects) ctx.out(`down:       ${x.at} ${x.reason}${x.detail ? ` (${x.detail})` : ""}`);
   return 0;

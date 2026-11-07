@@ -88,8 +88,10 @@ Only `claw-connector stop` (or stopping the service) stops it for good: a `kill`
 with exit 75, and it is started again.
 It uses `systemd --user` on Linux and launchd on macOS. On Linux, run `loginctl enable-linger $USER` once (`service install` says so
 when it is needed) so it also runs while you are logged out. In a container without systemd, `service install` starts a small
-supervisor and writes `keepalive.sh`; have the container's startup command and a 5-minute cron job run that script (it does nothing
-when the supervisor is up) so a restarted container comes back by itself. See [Keeping it running](#keeping-it-running).
+supervisor, writes `keepalive.sh` and adds it to your crontab when a cron daemon runs; when none does it says so, and the container's
+startup command must run that script (it does nothing when the supervisor is up) for a restarted container to come back. Keys the
+agents read from your shell (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`...) are kept for the service in a 0600 file, never in the unit.
+See [Keeping it running](#keeping-it-running).
 
 To try it in the foreground instead, `claw-connector run` prints `connecting claude to https://claw.example.com/claw-api as
 "<machine name>"` and stays up until Ctrl-C, which stops it and every agent it started.
@@ -426,8 +428,8 @@ the connector sees it within a heartbeat, stops every agent and exits without re
 
 ## Files
 
-`~/.config/claw-connector/` (or `$XDG_CONFIG_HOME/claw-connector/`): `agents.toml`, `credentials.json` (0600; a file other users can read is
-refused). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME/claw-connector/`): `connector.json` (the connector's identity and the
+`~/.config/claw-connector/` (or `$XDG_CONFIG_HOME/claw-connector/`, or `$CLAW_CONNECTOR_CONFIG_DIR`): `agents.toml`, `credentials.json`
+(0600; a file other users can read is refused), and `service-env.json` (0600, the agents' sign-in variables `service install` kept). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME/claw-connector/`): `connector.json` (the connector's identity and the
 commands handled), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
 decisions, every command received, every permission request and answer, every automatic approval, mode changes),
 `logs/`, `children.json`, `connector.pid`, `disconnects.jsonl`, `needs-login.json` (only after a run that needs a new sign-in), `doctor.json`
@@ -444,24 +446,44 @@ decisions, every command received, every permission request and answer, every au
   Log: `run.log` in the state directory.
 - **script** (a container without systemd; an `systemctl` that answers "Running in chroot" counts as none): `claw-connector supervise`
   runs in the background and restarts the connector 5 seconds after it dies; `keepalive.sh` in the state directory starts that
-  supervisor unless it is alive (recorded pid and start time) or a sign-in is needed. Nothing restarts the supervisor after the container
-  restarts, so call `keepalive.sh` from the container's startup command and from a 5-minute cron job. Log: `run.log`.
+  supervisor unless it is alive (recorded pid and start time) or a sign-in is needed. Where a cron daemon runs, `install` adds an
+  `@reboot` and a 5-minute line that call `keepalive.sh` to your crontab (once; `uninstall` removes them). Where none runs (most
+  containers), `install` says so: nothing brings the connector back after a restart until the container's startup command (or
+  `~/.bashrc`) runs `sh keepalive.sh`. Log: `run.log`.
+
+**A container whose home directory does not outlive it** (a dev pod): when `agents.toml` and the sign-in sit on the container's own
+file system (overlay, tmpfs), `init` and `service install` say so. Keep them on storage that survives the container with
+`CLAW_CONNECTOR_CONFIG_DIR=/mnt/<your persistent volume>/claw-connector` (only the configuration and sign-in move; pid files, the outbox
+and logs stay on the local disk), set in your shell profile and in the container's startup command, which then runs
+`claw-connector service ensure` (after installing the package again, if it lived on the container's file system too).
 
 A successful `login` starts an installed service again, so after a revocation or a refused key signing in is the whole fix.
 `keepalive.sh` and the script supervisor start nothing while only a person can help (no `agents.toml`, not signed in,
 `needs-login.json`); under launchd every exit 78 is turned into a clean exit, which launchd does not restart. The service
 installed for a state directory is recorded in its `service.json`.
 
-The unit carries `PATH` (so the agents are found), `CLAW_CONNECTOR_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `CLAUDE_CONFIG_DIR`,
-`CODEX_HOME`, the CA and proxy variables (with `NODE_USE_SYSTEM_CA` and `NODE_USE_ENV_PROXY`) and `LANG` from the shell that ran `install` (a proxy URL with a password in it only when named with `--env`, e.g. `--env HTTPS_PROXY`); `--env NAME` adds another, except a name that looks
-like a credential (`KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`), which is never written into a unit. Run `install` again after
-changing any of them, or after moving Node. With a service installed, `claw-connector stop` stops the connector until the next login,
+The unit carries `PATH` (so the agents are found), `CLAW_CONNECTOR_HOME`, `CLAW_CONNECTOR_CONFIG_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, the CA and proxy variables (with `NODE_USE_SYSTEM_CA` and `NODE_USE_ENV_PROXY`), `LANG`, `IS_SANDBOX`, the npm registry and proxy settings, and every
+plain setting of the agents (`ANTHROPIC_*`, `CLAUDE_CODE_*`, `OPENAI_*`, `CODEX_*`, `CURSOR_*` that is not named like a credential:
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `CLAUDE_CODE_USE_BEDROCK`...) from the shell that ran `install` (a proxy URL with a password in
+it only when named with `--env`, e.g. `--env HTTPS_PROXY`); `--env NAME` adds another.
+
+The agents' own sign-in variables are never written into a unit. When the shell that runs `install` has `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CURSOR_API_KEY`, the
+AWS keys, a variable Codex's `config.toml` names as a provider's `env_key`, or an `--env` name that looks like a credential (`KEY`,
+`TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`), they are kept in `service-env.json` beside `credentials.json` (mode 0600) and every `run`
+gives them to the agents that do not set them in `[agents.env]` (a configuration directory its group or others may write is first made 0700; one owned by another account is refused). `install` prints their names, never their values; `service status`
+lists them; `uninstall` deletes the file. Without this a connector that works in a terminal loses its agents' sign-in as a service,
+and each session fails at its first message. `CLAW_CONNECTOR_KEY` is never copied. Run `install` again after changing any of them, or
+after moving Node. With a service installed, `claw-connector stop` stops the connector until the next login,
 boot or keep-alive check; to stay offline use `pause`, or `service uninstall`.
 
 **Why it went down.** Every disconnect is appended to `disconnects.jsonl` in the state directory: `server_closed` (a Claw release or
 restart, `superseded` by another run, `token_expired`; reconnected at once), `stream_lost` (the network, with the error), `stopped`,
-`revoked`, `auth_failed`, `failed`, and `process_died` (the previous run never shut down: killed, crashed or the machine restarted;
-dated by its last heartbeat). `status` shows the latest, `service status` the last five.
+`revoked`, `auth_failed`, `failed`, `process_died` (the previous run never shut down: killed, crashed or the machine restarted;
+dated by its last heartbeat), and `connector_limit_reached` (Claw already holds the most connectors one person may have: remove a
+machine you no longer use, in the chat with `/agents` or with `claw-connector logout` on it; the run stays up and tries again every 10
+minutes instead of being restarted every 5 seconds). `status` shows the latest, `service status` the last five.
 
 ## Restarts and crashes
 

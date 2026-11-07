@@ -14,18 +14,23 @@ export interface Dirs {
 
 /**
  * `CLAW_CONNECTOR_HOME` puts everything under one directory (tests, containers);
- * otherwise the XDG locations, with their usual defaults.
+ * otherwise the XDG locations, with their usual defaults. `CLAW_CONNECTOR_CONFIG_DIR` moves only the configuration
+ * (agents.toml, the sign-in) somewhere else: onto storage that outlives a container, while the state (pid files, the
+ * outbox, logs) stays on the local disk.
  */
 export function resolveDirs(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): Dirs {
   const one = env.CLAW_CONNECTOR_HOME?.trim();
-  if (one) return { config: path.join(one, "config"), state: path.join(one, "state") };
+  const own = env.CLAW_CONNECTOR_CONFIG_DIR?.trim();
+  if (one) return { config: own ? path.resolve(own) : path.join(one, "config"), state: path.join(one, "state") };
   const cfg = env.XDG_CONFIG_HOME?.trim() || path.join(home, ".config");
   const st = env.XDG_STATE_HOME?.trim() || path.join(home, ".local", "state");
-  return { config: path.join(cfg, "claw-connector"), state: path.join(st, "claw-connector") };
+  return { config: own ? path.resolve(own) : path.join(cfg, "claw-connector"), state: path.join(st, "claw-connector") };
 }
 
 export const configFile = (d: Dirs) => path.join(d.config, "agents.toml");
 export const credentialsFile = (d: Dirs) => path.join(d.config, "credentials.json");
+/** The agents' own sign-in variables (ANTHROPIC_API_KEY...) that `service install` kept for the service; 0600. */
+export const serviceEnvFile = (d: Dirs) => path.join(d.config, "service-env.json");
 export const identityFile = (d: Dirs) => path.join(d.state, "connector.json");
 export const sessionsFile = (d: Dirs) => path.join(d.state, "sessions.json");
 export const childrenFile = (d: Dirs) => path.join(d.state, "children.json");
