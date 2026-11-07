@@ -17,6 +17,8 @@ export interface SessionRecord {
   created_at: string;
   /** When a prompt last reached the session's agent (absent on records written before this was kept). */
   used_at?: string;
+  /** Started new by this connector and no prompt has reached it yet; absent when unknown (older records, takeovers). */
+  unused?: boolean;
 }
 
 /** A turn the agent was running, kept from the moment its prompt reaches the agent until its `turn_end` is emitted. */

@@ -209,7 +209,8 @@ export class Session {
       return this.refuse(e);
     }
     if (this.closed) return;
-    this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString() });
+    // `unused`: a new conversation of this connector's own making that no message has reached yet (see neverPrompted).
+    this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString(), unused: true });
     this.audit("session_started", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
     this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
     this.announced = true;
@@ -484,12 +485,15 @@ export class Session {
   }
 
   /**
-   * The adapter cannot find the conversation to resume, and this session never had a message: its own (non-takeover)
-   * agent never wrote one. Any other failure, or a session that was used, keeps its error.
+   * The adapter cannot find the conversation to resume, and this session's record says it was started new by this
+   * connector and never had a message (`unused`). Any other failure, a used or taken-over session, or a record that does
+   * not say (written by an older version), keeps its error.
    */
   private neverPrompted(e: unknown): boolean {
     if (this.agent.attach || e instanceof SessionRefusal) return false;
-    if (this.env.store.get(this.id)?.used_at) return false;
+    // Only a record that says so: one written before this was kept, or a takeover, may well have had messages.
+    const rec = this.env.store.get(this.id);
+    if (rec?.unused !== true || rec.used_at) return false;
     return /not found|no (?:such )?(?:session|conversation)/i.test(errMessage(e));
   }
 
@@ -843,7 +847,7 @@ export class Session {
       const now = new Date().toISOString();
       // Recorded before the prompt counts as handled: from here a restart finds this turn instead of losing it.
       this.env.store.beginTurn({ session_id: this.id, cmd_id: cmdId, cmd_seq: cmdSeq, started_at: now });
-      this.env.store.patch(this.id, { used_at: now });
+      this.env.store.patch(this.id, { used_at: now, unused: false });
       started();
       const res = await reply;
       const usage = isObject(res.usage) ? res.usage : undefined;

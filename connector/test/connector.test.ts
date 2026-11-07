@@ -1324,6 +1324,20 @@ describe("a session opened and never used, across a restart", () => {
     assert.match(fs.readFileSync(auditFile(h.dirs), "utf8"), /"session_recreated"/);
   });
 
+  test("a record that does not say it was unused (an older version wrote it) is never replaced", async () => {
+    const h = await make({ env: { FAKE_RESUME_NOT_FOUND: "1" } });
+    const sid = await h.newSession();
+    await h.stop();
+    // What a connector from before this change left behind: no `unused` marker.
+    h.connector.store.patch(sid, { unused: undefined });
+    h.connect();
+    h.start();
+    h.prompt(sid, "say hello");
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.stopReason, "error");
+    assert.ok(!h.messages(sid).includes("hello"));
+  });
+
   test("a session that was used keeps the old answer: a conversation the agent cannot find is an error, not silently replaced", async () => {
     const h = await make({ env: { FAKE_RESUME_NOT_FOUND: "1" } });
     const sid = await h.newSession();
