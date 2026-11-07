@@ -41,6 +41,17 @@
  *       masked as a credential on the way (a credential-shaped Idempotency-Key) still ends by its number; an end naming no prompt (an
  *       older connector) makes the item count again, as before; a stop whose cancel finds nothing running (the connector restarted
  *       mid-turn, and that turn's end never comes) ends every instruction sent before it
+ *   F20 an agent that only takes over existing conversations (kind attach) is never chosen for a new session, which its connector would
+ *       refuse: with another agent there, that one; alone, a question listing its conversations, else no_agent saying why
+ *   F21 at the limit of open sessions a new one closes the longest unused idle session of the user's (never one working, waiting for
+ *       an approval, or with a command not yet collected, unless silent for a day), tells its connector, and audits it; the route
+ *       says which it closed; with none that may be closed, session_limit_reached says what to do
+ *   N1  only three things are ever pushed of an instruction the assistant sent, each once, each saying which session and which kind:
+ *       it needs the user (the permission request whole: its options and when it runs out, so a channel puts it to them as buttons;
+ *       the same request sent again after a reconnect is not pushed again), it finished, it failed (a turn that ended in an error, an
+ *       instruction the machine refused, a session that closed before it finished); nothing else (an approval answered is not news)
+ *   N2  the sessions list says what each active session waits on its user for now: a request asked and not yet answered, once even
+ *       when sent again; not one answered, nor one from a turn that has ended; nothing of anyone else's
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -227,6 +238,108 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal((await remoteItem(sid)).title, "laptop claude: run make test");
   });
 
+  /** What was pushed of `itemId` (each say queued for the user's subscription), oldest first. */
+  const pushed = async (itemId: string) => (await w.q(
+    `SELECT o.payload FROM claw_notification_outbox o JOIN claw_assistant_says s ON s.say_id::text = o.event_id
+      WHERE s.item_id = $1 ORDER BY o.id`, [itemId],
+  )).map((r: Recorded) => r.payload as Recorded);
+
+  test("N1 an instruction the assistant sent is pushed only when it needs the user, finishes, or fails, each once", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop");
+    const out = await sendByCard(await userTurn(alice, "让开发机上的 claude 跑 make test"), { text: "跑 make test", agent: "claude" });
+    assert.equal(out.status, "done", JSON.stringify(out));
+    const sid = String(out.session_id);
+    const itemId = String(out.item_id);
+    const options = [
+      { optionId: "allow", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" },
+      { name: "no id" }, "junk",
+    ];
+    // Work going on is not news: nothing is pushed while the agent works.
+    await events("alice", cid, sid, [chunk("running…"), ["tool_call", { update: { sessionUpdate: "tool_call", title: "make test" } }]]);
+    assert.deepEqual(await pushed(itemId), []);
+
+    // It needs the user: one push, the request whole; the same request sent again after a reconnect is not pushed again.
+    await events("alice", cid, sid, [["permissionRequest", { actionId: "act-1", tool: "Run make test", kind: "execute", options, timeout_ms: 600_000 }]]);
+    await events("alice", cid, sid, [["permissionRequest", { actionId: "act-1", tool: "Run make test", kind: "execute", options, timeout_ms: 600_000, resent: true }]]);
+    let got = await pushed(itemId);
+    assert.equal(got.length, 1, JSON.stringify(got));
+    assert.equal(got[0].type, "assistant.say");
+    assert.match(got[0].text, /^laptop 上的 claude 在等你批准：Run make test/);
+    const remote = got[0].remote;
+    assert.deepEqual([remote.kind, remote.session_id, remote.machine, remote.agent], ["needs_you", sid, "laptop", "claude"]);
+    assert.deepEqual([remote.ask.action_id, remote.ask.tool], ["act-1", "Run make test"]);
+    assert.deepEqual(remote.ask.options, [
+      { optionId: "allow", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" },
+    ], "only the options that can be answered");
+    const left = Date.parse(remote.ask.expires_at) - Date.now();
+    assert.ok(left > 590_000 && left <= 600_000, `runs out when the connector stops waiting (${left} ms)`);
+    assert.equal((await remoteItem(sid)).board_state, "needs_you");
+
+    // Answered: the agent goes on, and that is not news either; then it finishes: one push, kind done.
+    await events("alice", cid, sid, [["permission_resolved", { actionId: "act-1", optionId: "allow" }], chunk("312 passed")]);
+    assert.equal((await pushed(itemId)).length, 1);
+    await events("alice", cid, sid, [end()]);
+    await events("alice", cid, sid, [end()]);
+    got = await pushed(itemId);
+    assert.equal(got.length, 2, JSON.stringify(got));
+    assert.deepEqual([got[1].remote.kind, got[1].remote.session_id, got[1].remote.ask], ["done", sid, undefined]);
+    assert.match(got[1].text, /^laptop 上的 claude 做完了 #\d+：跑 make test\nrunning…312 passed$/);
+
+    // The next instruction fails on the machine: one push, kind error, said as an error.
+    await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
+    const next = await sendByCard(await userTurn(alice, "再跑一次"), { text: "再跑一次" });
+    assert.deepEqual([next.status, next.session_id], ["done", sid]);
+    await events("alice", cid, sid, [["turn_end", { stopReason: "error", error: "adapter_unavailable" }]]);
+    got = await pushed(itemId);
+    assert.equal(got.length, 3, JSON.stringify(got));
+    assert.equal(got[2].remote.kind, "error");
+    assert.match(got[2].text, /^laptop 上的 claude 出错了，#\d+ 没有做完：再跑一次\n（出错：adapter_unavailable）/);
+
+    // One the machine refuses, and a session that closes before it finished: errors, each once.
+    await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
+    await sendByCard(await userTurn(alice, "第三次"), { text: "第三次" });
+    await events("alice", cid, sid, [["command_rejected", { type: "prompt", reason: "too_many_queued_prompts" }]]);
+    await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
+    await sendByCard(await userTurn(alice, "第四次"), { text: "第四次" });
+    await events("alice", cid, sid, [["session_closed", { reason: "agent_exited" }]]);
+    got = await pushed(itemId);
+    assert.deepEqual(got.map((g) => g.remote?.kind), ["needs_you", "done", "error", "error", "error"], JSON.stringify(got.map((g) => g.text)));
+    assert.match(got[3].text, /没有接下/);
+    assert.match(got[4].text, /会话已关闭/);
+    assert.ok(got.every((g) => g.remote.session_id === sid));
+  });
+
+  test("N2 the sessions list says what each active session waits on its user for now", async () => {
+    await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const a = await chatSession("alice", cid);
+    const b = await chatSession("alice", cid, "/home/u/repo/b");
+    const list = async (user = "alice") => {
+      const r = await fetch(`${base}/v1/remote-agents/sessions`, { headers: { "x-test-user": user } });
+      assert.equal(r.status, 200);
+      return new Map(((await r.json()) as Recorded).data.map((s: Recorded) => [s.session_id, s.waiting]));
+    };
+    assert.deepEqual([(await list()).get(a), (await list()).get(b)], [[], []]);
+    // a asks; the same request is sent again after a reconnect; b answers its own.
+    await events("alice", cid, a, [ask("act-a", "Run make test")]);
+    await events("alice", cid, a, [["permissionRequest", { actionId: "act-a", tool: "Run make test", options: [{ optionId: "allow" }], resent: true }]]);
+    await events("alice", cid, b, [ask("act-b", "Edit main.go"), ["permission_resolved", { actionId: "act-b", optionId: "allow" }]]);
+    let now = await list();
+    assert.deepEqual((now.get(a) as Recorded[]).map((x) => [x.action_id, x.tool]), [["act-a", "Run make test"]]);
+    assert.ok(Date.parse((now.get(a) as Recorded[])[0].asked_at) > 0);
+    assert.deepEqual(now.get(b), []);
+    // Replayed history is not a request; an ask its turn ended without answering is moot.
+    await events("alice", cid, b, [["permissionRequest", { actionId: "old", tool: "x", options: [{ optionId: "allow" }], replay: true }]]);
+    await events("alice", cid, a, [end()]);
+    now = await list();
+    assert.deepEqual([now.get(a), now.get(b)], [[], []]);
+    // Bob sees none of it.
+    await w.user("bob");
+    assert.equal((await list("bob")).size, 0);
+  });
+
   test("F2 devenv_send in the user's own signed-in turn is a card; pressed, it sends, files the item, and tells them its end once", async () => {
     const alice = await w.user("alice");
     await w.subscribe(alice.userId);
@@ -375,6 +488,51 @@ describe("development environment items and devenv_send", { skip }, () => {
     const off = await tools.devenvSend(await userTurn(alice, "让 desktop 上的 claude 跑 make"), { text: "make", target: "desktop" }).catch((e) => e);
     assert.equal((off as Recorded).code, "connector_offline");
     assert.match((off as Recorded).message, /offline/);
+  });
+
+  test("F17 a Windows machine's roots are folders: drive and share roots, either separator, any case, its own spelling sent", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const roots = ["C:\\Users\\alice\\repo", "\\\\fileserver\\share\\proj"];
+    const cid = await machine("alice", "winbox", { agents: [{ ...CLAUDE, capabilities: { roots } }] });
+    const plan = async (cwd?: string) => {
+      const out = await tools.planSend("alice", { text: "dir", agent: "claude", ...(cwd === undefined ? {} : { cwd }) });
+      return out.ok ? out.plan.cwd : `${out.code}: ${out.message}`;
+    };
+    // Nothing named: the agent's first root, which was refused as no folder at all before.
+    assert.equal(await plan(), "C:\\Users\\alice\\repo");
+    // A folder inside a root, however it is typed: sent as the root spells it, with the root's separator.
+    assert.equal(await plan("C:\\Users\\alice\\repo\\api"), "C:\\Users\\alice\\repo\\api");
+    assert.equal(await plan("c:/users/alice/repo/api/"), "C:\\Users\\alice\\repo\\api");
+    assert.equal(await plan("C:\\Users\\alice\\repo\\"), "C:\\Users\\alice\\repo");
+    assert.equal(await plan("\\\\FileServer\\Share\\proj\\web"), "\\\\fileserver\\share\\proj\\web");
+    assert.equal(await plan("//FileServer/Share/proj/web"), "\\\\fileserver\\share\\proj\\web");
+    // Outside every root, a sibling sharing a prefix, another drive, a POSIX path: no agent may work there.
+    for (const outside of ["C:\\Users\\alice\\repo2", "D:\\Users\\alice\\repo", "C:\\Users", "/home/u/repo", "Users\\alice\\repo"]) {
+      assert.match(await plan(outside), /^which_agent: no agent there may work in/, outside);
+    }
+
+    // The product path: pressed, the card opens the session in that folder on the machine.
+    const sent = await sendByCard(await userTurn(alice, "在 winbox 的 repo/api 里 dir"), { text: "dir", agent: "claude", cwd: "c:/users/alice/repo/api" });
+    assert.equal(sent.status, "done", JSON.stringify(sent));
+    const cmds = await queued(cid);
+    assert.deepEqual(cmds.map((c: Recorded) => [c.type, c.payload.cwd ?? null]), [["session.new", "C:\\Users\\alice\\repo\\api"], ["prompt", null]]);
+
+    // An idle session already open in that folder continues, whichever way the folder is typed.
+    const open = await chatSession("alice", cid, "C:\\Users\\alice\\repo\\web");
+    const again = await tools.planSend("alice", { text: "dir", agent: "claude", cwd: "c:/Users/Alice/repo/web" });
+    assert.ok(again.ok, JSON.stringify(again));
+    assert.equal(again.plan.session_id, open);
+
+    // A POSIX root that starts with two slashes is POSIX: its folders compare exactly, case and all.
+    const posix = await machine("alice", "nfsbox", { agents: [{ ...CLAUDE, capabilities: { roots: ["//srv/share/proj"] } }] });
+    const lower = await chatSession("alice", posix, "//srv/share/proj/web");
+    const exact = await tools.planSend("alice", { text: "ls", target: "nfsbox", agent: "claude", cwd: "//srv/share/proj/web" });
+    assert.ok(exact.ok, JSON.stringify(exact));
+    assert.equal(exact.plan.session_id, lower);
+    const other = await tools.planSend("alice", { text: "ls", target: "nfsbox", agent: "claude", cwd: "//srv/share/proj/Web" });
+    assert.ok(other.ok, JSON.stringify(other));
+    assert.deepEqual([other.plan.session_id, other.plan.cwd], [null, "//srv/share/proj/Web"]);
   });
 
   test("F5 work_send refuses a development environment item; work_stop closes it and cancels its turn; worker_tail is the answer", async () => {
@@ -790,6 +948,85 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).params.open_cmd_seqs], ["done", []]);
   });
 
+  test("F20 an agent that only takes over existing conversations is never chosen for a new session; the refusal says why", async () => {
+    const alice = await w.user("alice");
+    const ATTACH = { agent_id: "claude-attach", kind: "attach", name: "Claude Code (existing sessions)", capabilities: { roots: ["/home/u/repo"] } };
+    // Both offered, none named: the one that can start a session, not a question and never the takeover-only one.
+    const cid = await machine("alice", "laptop", { agents: [ATTACH, CLAUDE] });
+    const both = await sendByCard(await userTurn(alice, "让开发机跑 make test"), { text: "make test" });
+    assert.equal(both.status, "done", JSON.stringify(both));
+    const made = (await queued(cid)).filter((c: Recorded) => c.type === "session.new");
+    assert.deepEqual(made.map((c: Recorded) => c.payload.agent_id), ["claude"]);
+
+    // Only the takeover-only agent, with nothing to take over: no card, a refusal that says why, nothing queued.
+    const only = await machine("alice", "desktop", { agents: [ATTACH] });
+    const none = await tools.devenvSend(await userTurn(alice, "让 desktop 跑 make"), { text: "make", target: "desktop" }).catch((e) => e);
+    assert.equal((none as Recorded).code, "no_agent", JSON.stringify(none));
+    assert.match((none as Recorded).message, /only takes over a conversation already on that machine[\s\S]*cannot start a new session/);
+    assert.deepEqual(await queued(only), []);
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations WHERE status = 'pending'"))[0].n, 0);
+
+    // With a conversation to take over: a question listing it; named, it is taken over (resume_ref), never a session without one.
+    await store.recordHeartbeat(only, "alice", { version: "0.1.3", cmdCursor: null, agents: [{ ...ATTACH, capabilities: { ...ATTACH.capabilities,
+      resumable: [{ ref: "c0ffee00-0000-4000-8000-0000000000f2", title: "t", cwd: "/home/u/repo", updated_at: Math.floor(Date.now() / 1000), state: "idle" }] } }] as never });
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [only]);
+    const which = await tools.devenvSend(await userTurn(alice, "让 desktop 跑 make"), { text: "make", target: "desktop" }).catch((e) => e);
+    assert.equal((which as Recorded).code, "which_agent", JSON.stringify(which));
+    assert.deepEqual((which as Recorded).data.choices, ["desktop/claude-attach/1"]);
+    const taken = await sendByCard(await userTurn(alice, "让 desktop/claude-attach/1 跑 make"), { text: "make", target: "desktop/claude-attach/1" });
+    assert.equal(taken.status, "done", JSON.stringify(taken));
+    const newOnDesktop = (await queued(only)).filter((c: Recorded) => c.type === "session.new");
+    assert.deepEqual(newOnDesktop.map((c: Recorded) => [c.payload.agent_id, c.payload.resume_ref]), [["claude-attach", "c0ffee00-0000-4000-8000-0000000000f2"]]);
+  });
+
+  test("F21 at the limit of open sessions, a new one closes the longest unused idle one instead of being refused", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "laptop");
+    const sids: string[] = [];
+    for (let i = 0; i < 10; i++) sids.push(await chatSession("alice", cid));
+    // All ten were used within the half hour: none may be closed, and the refusal says what to do. (A folder none of them is in, so
+    // the instruction needs a new session rather than continuing an idle one.)
+    const full = await sendByCard(await userTurn(alice, "让 claude 跑 make"), { text: "make", target: "laptop", cwd: "/home/u/repo/web" });
+    assert.deepEqual([full.status, full.error], ["failed", "session_limit_reached"], JSON.stringify(full));
+    assert.match(String(full.message), /all 10 sessions[\s\S]*\/agent close/);
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_remote_sessions WHERE status = 'active'"))[0].n, 10);
+
+    // An hour unused: one working (its turn under way), one waiting for approval, one with a prompt not yet collected, and two idle.
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '1 hour'");
+    await events("alice", cid, sids[0], [chunk("still going")]);
+    await events("alice", cid, sids[1], [ask("act-9", "Run rm")]);
+    await events("alice", cid, sids[3], [end()]);
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '1 hour'");
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '2 hours' WHERE session_id = ANY($1::uuid[])", [[sids[0], sids[1], sids[2]]]);
+    assert.equal((await post("alice", `/v1/remote-agents/sessions/${sids[2]}/commands`, { type: "prompt", text: "x" })).status, 202);
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '2 hours' WHERE session_id = $1", [sids[2]]);
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '90 minutes' WHERE session_id = $1", [sids[3]]);
+    // Others' sessions are not hers to close.
+    await w.user("bob");
+    const bobBox = await machine("bob", "bob-box");
+    const bobSid = await chatSession("bob", bobBox);
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '3 hours' WHERE session_id = $1", [bobSid]);
+
+    const sent = await sendByCard(await userTurn(alice, "让 claude 跑 make"), { text: "make", target: "laptop", cwd: "/home/u/repo/web" });
+    assert.equal(sent.status, "done", JSON.stringify(sent));
+    const closed = (await w.q("SELECT session_id::text AS s FROM claw_remote_sessions WHERE status = 'closed'")).map((r: Recorded) => r.s);
+    assert.deepEqual(closed, [sids[3]], "the longest unused that is idle: not the working, the waiting or the queued one, and not bob's");
+    const close = (await queued(cid)).filter((c: Recorded) => c.type === "close");
+    assert.deepEqual(close.map((c: Recorded) => c.session_id), [sids[3]], "its connector is told to close it");
+    const audit = (await w.q("SELECT detail FROM claw_remote_audit WHERE action = 'session.reclaimed'"))[0].detail;
+    assert.equal(audit.for_session, sent.session_id);
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_remote_sessions WHERE status = 'active' AND owner_user_id = 'alice'"))[0].n, 10);
+
+    // A day without a word: even one mid-turn may be closed (its machine went away).
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() WHERE owner_user_id = 'alice' AND status = 'active'");
+    await w.q("UPDATE claw_remote_sessions SET updated_at = NOW() - interval '25 hours' WHERE session_id = $1", [sids[0]]);
+    const route = await post("alice", "/v1/remote-agents/sessions", { connector_id: cid, agent_id: "claude", cwd: "/home/u/repo" });
+    assert.equal(route.status, 201, JSON.stringify(route.body));
+    assert.deepEqual(route.body.reclaimed, [sids[0]], "the route says which one it closed");
+    const again = await post("alice", "/v1/remote-agents/sessions", { connector_id: cid, agent_id: "claude", cwd: "/home/u/repo" });
+    assert.deepEqual([again.status, again.body.error], [409, "session_limit_reached"]);
+  });
+
   test("F6 the router sends instructions with devenv_send and follows development environment items", async () => {
     const section = prompts.renderRouterDevenvSection({ actions: true, send: true });
     assert.match(section, /devenv_send, called directly and first, never after devenv_list/);
@@ -797,7 +1034,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v4");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v5");
     // What operators and release notes say Claw may run on a user's machine is what the code does: a card, never from the turn.
     const { readFileSync } = await import("node:fs");
     const doc = readFileSync(new URL("../../../docs/remote-agents.md", import.meta.url), "utf8");

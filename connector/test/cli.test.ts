@@ -107,8 +107,11 @@ describe("claw-connector commands", () => {
       else assert.doesNotMatch(a.text(), /not enabled/);
       // The file as written, not as the owner might edit it: the agents the command says run without asking are exactly the ones
       // that are on and unattended in it (the message once listed agents the file leaves commented out).
-      const written = loadWritten(home);
-      assert.deepEqual(written.map((x) => x.id), ["claude"], "only Claude is on in the sample");
+      const all = loadWritten(home);
+      // Claude brings the agent that lists the conversations already on the machine, with Claude's own approval setting.
+      assert.deepEqual(all.map((x) => x.id), ["claude", "claude-sessions"], "only Claude is on in the sample (and its existing conversations)");
+      assert.deepEqual([all[1]!.kind, all[1]!.unattended, all[1]!.attach], ["attach", all[0]!.unattended, { cli: "claude" }]);
+      const written = all.filter((x) => x.id !== "claude-sessions");
       assert.deepEqual(written.filter((x) => x.unattended).map((x) => x.id), unattended);
       assert.deepEqual(/no per-step approval for: ([a-z, ]+)\./.exec(a.text())?.[1]?.split(", ") ?? [], unattended);
     });

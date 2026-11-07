@@ -39,6 +39,12 @@ export interface ConnectorTiming extends SessionTiming {
   pausePollMs: number;
   /** An attach agent's list of existing sessions is reused this long. */
   catalogMs: number;
+  /**
+   * How often the conversations on this machine are looked at, cheaply (file names and times; nothing is started), for a
+   * change the phone should see now: a terminal that opened one, started waiting for its person, or finished. A change is
+   * reported at once instead of at the next heartbeat.
+   */
+  sessionsWatchMs: number;
   /** How long the command that lists the open sessions may take before the check is refused as unanswerable. */
   attachCliMs: number;
   /** A session whose transcript was written this recently is still in someone's hands. */
@@ -63,6 +69,7 @@ export const DEFAULT_TIMING: ConnectorTiming = {
   backoffMaxMs: 60_000,
   pausePollMs: 1_000,
   catalogMs: 120_000,
+  sessionsWatchMs: 10_000,
   attachCliMs: 8_000,
   recentWriteMs: 10_000,
   authFailLimit: 4,
@@ -397,6 +404,20 @@ export class Connector {
     }
   }
 
+  /** Report a change in the conversations on this machine (see {@link ConnectorTiming.sessionsWatchMs}) without waiting for the heartbeat. */
+  private async sessionsWatcher(): Promise<void> {
+    if (this.attach.size === 0) return;
+    // The first look is taken at once, so that what changes between the list made at start and the next look is seen.
+    while (!this.ctl.signal.aborted) {
+      let changed = false;
+      for (const support of this.attach.values()) {
+        try { if (await support.poll()) changed = true; } catch (e) { this.d.log.warn("looking for changed sessions failed", { agent: support.agent.id, error: errMessage(e) }); }
+      }
+      if (changed && !this.paused) this.wakeHeartbeat?.();
+      await sleep(this.timing.sessionsWatchMs, this.ctl.signal);
+    }
+  }
+
   private async heartbeater(): Promise<void> {
     while (!this.ctl.signal.aborted) {
       await new Promise<void>((resolve) => {
@@ -530,7 +551,7 @@ export class Connector {
         connector_id: this.cid, agents: this.d.config.agents.map((a) => a.id), paused: this.paused,
         unattended_agents: this.d.config.agents.filter((a) => a.unattended).map((a) => a.id),
       });
-      await Promise.all([this.sender(), this.heartbeater(), this.streamLoop(), this.pauseWatcher()]);
+      await Promise.all([this.sender(), this.heartbeater(), this.streamLoop(), this.pauseWatcher(), this.sessionsWatcher()]);
       result = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : "stopped";
     } catch (e) {
       failure = errMessage(e);

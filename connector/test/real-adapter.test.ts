@@ -44,6 +44,7 @@ async function realConnector(agentToml: string) {
   const config = parseConfig(`[[agents]]
 id = "claude"
 preset = "claude"
+existing_sessions = false
 command = ${JSON.stringify(process.execPath)}
 args = [${JSON.stringify(ADAPTER)}]
 roots = [${JSON.stringify(work)}]

@@ -20,6 +20,9 @@
  *   D6  the router's prompt has the development environment section exactly where remote agents are on
  *   D7  an instruction in a name a connector reported reaches the router only in a turn that can no longer act on it, except to
  *       put the attach command of the user's own session; attachRefOf reads the command however it is split
+ *   D8  a user with no session connects through an agent: each agent on an online machine (not one that only takes over existing
+ *       conversations, one that reports a folder, on a machine the channel can find by name) carries `/agent attach MACHINE/AGENT`,
+ *       put to them as a button after the read; with no session anywhere and one such agent it is attach_default (new_session)
  *   R1  readSession: the state, step, answer and question of a session from its events (pure)
  */
 import assert from "node:assert/strict";
@@ -80,13 +83,14 @@ describe("devenv_list", { skip }, () => {
     const client = await connect(claims, devenv);
     try { return (await client.listTools()).tools.map((t) => t.name); } finally { await client.close(); }
   }
-  type Agent = { id: string; kind: string; name: string; resumable?: Recorded[] };
+  type Agent = { id: string; kind: string; name: string; resumable?: Recorded[]; roots?: string[] };
   async function machine(owner: string, name: string, opts: { online?: boolean; agents?: Agent[] } = {}) {
     const row = await store.registerConnector(owner, name, "0.1.2", null, 10);
     assert.ok(row);
     await store.recordHeartbeat(row.connector_id, owner, {
       version: "0.1.3", cmdCursor: null,
-      agents: (opts.agents ?? []).map((a) => ({ agent_id: a.id, kind: a.kind, name: a.name, capabilities: a.resumable ? { resumable: a.resumable } : {} })),
+      agents: (opts.agents ?? []).map((a) => ({ agent_id: a.id, kind: a.kind, name: a.name,
+        capabilities: { ...(a.resumable ? { resumable: a.resumable } : {}), ...(a.roots ? { roots: a.roots } : {}) } })),
     });
     if (opts.online) await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [row.connector_id]);
     else await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '1 hour' WHERE connector_id = $1", [row.connector_id]);
@@ -170,7 +174,9 @@ describe("devenv_list", { skip }, () => {
     assert.equal(b.total, 2);
     assert.equal(b.online, 1);
     assert.deepEqual(b.machines.map((m: Recorded) => [m.machine, m.online, m.version]), [["laptop", true, "0.1.3"], ["desktop", false, "0.1.3"]]);
-    assert.deepEqual(b.machines[0].agents, [{ agent: "claude", kind: "claude", name: "Claude Code" }, { agent: "codex", kind: "codex", name: "Codex" }]);
+    assert.deepEqual(b.machines[0].agents.map((a: Recorded) => [a.agent, a.kind, a.name, a.attach_command]),
+      [["claude", "claude", "Claude Code", null], ["codex", "codex", "Codex", null]], "agents that report no folder cannot start a session");
+    assert.match(b.machines[0].agents[0].why_not, /no folder/);
     assert.ok(!Number.isNaN(Date.parse(b.machines[1].last_seen)), "when the offline one was last seen");
 
     const rows = b.machines[0].sessions.map((s: Recorded) => [s.label, s.agent, s.cwd, s.opened_in, s.state, s.ref, s.attach_command]);
@@ -193,6 +199,25 @@ describe("devenv_list", { skip }, () => {
       assert.ok(!text.includes(words), `"${words}" is the agent's, and only "activity" carries it`);
     }
     assert.match(b.note, /not SaFE\s+workspaces/);
+  });
+
+  test("D1b a conversation open in a terminal says what that terminal is doing; what it waits for is the agent's words, activity only", async () => {
+    const alice = await w.user("alice");
+    await machine("alice", "laptop", { online: true, agents: [{ id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)", resumable: [
+      { ref: "c0ffee00-0000-4000-8000-00000000000a", title: "needs me", cwd: "/w/a", updated_at: now() - 5, state: "live", activity: "waiting", waiting_for: "input needed" },
+      { ref: "c0ffee00-0000-4000-8000-00000000000b", title: "busy", cwd: "/w/b", updated_at: now() - 10, state: "live", activity: "working" },
+      { ref: "c0ffee00-0000-4000-8000-00000000000c", title: "odd", cwd: "/w/c", updated_at: now() - 20, state: "live", activity: "constructor" },
+      { ref: "c0ffee00-0000-4000-8000-00000000000d", title: "closed", cwd: "/w/d", updated_at: now() - 30, state: "idle", activity: "waiting", waiting_for: "x" },
+    ] }] });
+    const status = (await call(await userTurn(alice, "我的开发环境上有哪些会话"))).body;
+    assert.deepEqual(status.machines[0].sessions.map((s: Recorded) => [s.cwd, s.state, s.terminal_state ?? null, s.waiting_for ?? null]), [
+      ["/w/a", "in_terminal", "waiting_for_you", null],
+      ["/w/b", "in_terminal", "working", null],
+      ["/w/c", "in_terminal", null, null],
+      ["/w/d", "idle", null, null],
+    ], "the state is the connector's word mapped to ours, or nothing; what it waits for is not in a status read");
+    const act = (await call(await userTurn(alice, "哪个会话在等我"), { detail: "activity" })).body;
+    assert.deepEqual(act.machines[0].sessions.map((s: Recorded) => s.waiting_for ?? null), ["input needed", null, null, null]);
   });
 
   test("D2 detail activity says what each session is doing in the agent's words, and the turn has read untrusted text", async () => {
@@ -302,6 +327,59 @@ describe("devenv_list", { skip }, () => {
     const mine = JSON.stringify((await call(await w.routerTurn(alice))).body);
     assert.ok(!mine.includes(bobSession) && !mine.includes("bob-box"));
     assert.ok(JSON.stringify((await call(await w.routerTurn(bob))).body).includes(bobSession));
+  });
+
+  test("D8 a user with no session connects through an agent: its attach command starts one, and it is the default when it is the one", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
+    const actions = [{ name: "agent", usage: "/agent attach <ref>", summary: "连到开发环境里的一个会话" }];
+    const box = await machine("alice", "devbox", { online: true, agents: [
+      { id: "claude", kind: "claude", name: "Claude Code", roots: ["/home/alice"] },
+      { id: "claude-attach", kind: "attach", name: "Claude Code (existing sessions)", roots: ["/home/alice"] },
+    ] });
+    await machine("alice", "desktop", { agents: [{ id: "codex", kind: "codex", name: "Codex", roots: ["/home/alice"] }] });
+    await w.user("bob");
+    await machine("bob", "bob-box", { online: true, agents: [{ id: "claude", kind: "claude", name: "Claude Code", roots: ["/home/bob"] }] });
+
+    const turn = await userTurn(alice, "连接到我的开发机", actions);
+    const b = (await call(turn)).body;
+    assert.deepEqual(b.machines.map((m: Recorded) => m.sessions.length), [0, 0], "no session anywhere");
+    assert.deepEqual(b.machines[0].agents.map((a: Recorded) => [a.agent, a.ref, a.attach_command]), [
+      ["claude", "devbox/claude", "/agent attach devbox/claude"],
+      ["claude-attach", null, null],
+    ]);
+    assert.match(b.machines[0].agents[1].why_not, /only takes over/, "the takeover-only agent cannot start a session");
+    assert.deepEqual([b.machines[1].agents[0].attach_command, b.machines[1].agents[0].why_not], [null, "the machine is offline"]);
+    assert.deepEqual(b.attach_default, { label: "devbox/claude", ref: "devbox/claude", attach_command: "/agent attach devbox/claude", new_session: true });
+    assert.match(b.note, /how a user with no session starts one/);
+
+    // Put to them as a button, after the read; another user's agent, an offline machine's or the takeover-only one is refused.
+    const out = await rt.channelAction(turn, { name: "agent", args: "attach devbox/claude" }) as Recorded;
+    assert.equal(out.ran, false, "a button, never run at once");
+    assert.equal(out.command, "/agent attach devbox/claude");
+    for (const ref of ["bob-box/claude", "desktop/codex", "devbox/claude-attach", "devbox/codex"]) {
+      await assert.rejects(rt.channelAction(turn, { name: "agent", args: `attach ${ref}` }), (e: Recorded) => e.code === "read_untrusted", ref);
+    }
+
+    // Two agents that can start one: ask which (no default), both listed.
+    await store.recordHeartbeat(box, "alice", { version: "0.1.3", cmdCursor: null, agents: [
+      { agent_id: "claude", kind: "claude", name: "Claude Code", capabilities: { roots: ["/home/alice"] } },
+      { agent_id: "codex", kind: "codex", name: "Codex", capabilities: { roots: ["/home/alice"] } },
+    ] });
+    let again = (await call(await w.routerTurn(alice))).body;
+    assert.equal(again.attach_default, null);
+    assert.deepEqual(again.machines[0].agents.map((a: Recorded) => a.ref), ["devbox/claude", "devbox/codex"]);
+    // A session open: it is the default, as before; the agents keep their commands.
+    const sid = await session("alice", box, "codex", "/home/alice/x", [end()]);
+    again = (await call(await w.routerTurn(alice))).body;
+    assert.equal(again.attach_default.ref, sid);
+    assert.equal(again.attach_default.new_session, undefined);
+    // Two online machines by one name: the channel finds a machine by name, so neither carries a command.
+    await machine("alice", "DevBox", { online: true, agents: [{ id: "claude", kind: "claude", name: "Claude Code", roots: ["/x"] }] });
+    again = (await call(await w.routerTurn(alice))).body;
+    for (const m of again.machines.filter((x: Recorded) => x.online)) {
+      for (const a of m.agents) assert.match(String(a.why_not), /more than one online machine/, `${m.machine}/${a.agent}`);
+    }
   });
 
   test("D5 only a router is offered it, only where remote agents are on, and an ended turn is refused", async () => {

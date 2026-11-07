@@ -392,11 +392,14 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const out = await store.createSession({
       owner, client: clientLabel(req), connectorId: connector.connector_id, agentId: body.value.agent_id,
       cwd: body.value.cwd, mode: body.value.mode, resumeRef: body.value.resume_ref, maxActive: maxActiveSessions, commandsPerMinute,
+      onlineWindowMs,
     });
     if (out.status === "limit") return fail(reply, 409, "session_limit_reached");
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");
     waker.wake(`c:${connector.connector_id}`);
-    return reply.status(201).send({ ok: true, data: out.session });
+    // At the limit, sessions nobody was using were closed to make room: their connectors are told now, and the caller can say so.
+    for (const c of new Set(out.reclaimed.map((r) => r.connector_id))) waker.wake(`c:${c}`);
+    return reply.status(201).send({ ok: true, data: out.session, ...(out.reclaimed.length ? { reclaimed: out.reclaimed.map((r) => r.session_id) } : {}) });
   });
 
   app.get<{ Querystring: { connector_id?: string } }>("/v1/remote-agents/sessions", async (req, reply) => {
@@ -407,7 +410,10 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       connectorId = parseRemoteId(req.query.connector_id);
       if (!connectorId) return fail(reply, 400, "invalid_connector_id");
     }
-    return reply.send({ ok: true, data: await store.listSessions(owner, connectorId, 100) });
+    const sessions = await store.listSessions(owner, connectorId, 100);
+    // What each active session waits on its user for (a permission request not yet answered): a client lists those first.
+    const waiting = await store.sessionsWaiting(owner, sessions.filter((s) => s.status === "active").map((s) => String(s.session_id)));
+    return reply.send({ ok: true, data: sessions.map((s) => ({ ...s, waiting: waiting.get(String(s.session_id)) ?? [] })) });
   });
 
   app.get("/v1/remote-agents/sessions/:id", async (req, reply) => {

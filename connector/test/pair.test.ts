@@ -64,7 +64,8 @@ describe("claw-connector pair", () => {
       assert.deepEqual(seen.map((s) => s.body), [{ code: "abcd-efgh-jkmn", name: "box" }]);
       const toml = fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8");
       const cfg = parseConfig(toml, { hostname: "box" });
-      assert.deepEqual(cfg.agents.map((x) => [x.id, x.roots, x.unattended]), [["claude", [work], false], ["codex", [work], false]]);
+      // (A claude agent also brings the machine's own Claude conversations, `claude-sessions`, by itself.)
+      assert.deepEqual(cfg.agents.filter((x) => x.id !== "claude-sessions").map((x) => [x.id, x.roots, x.unattended]), [["claude", [work], false], ["codex", [work], false]]);
       assert.equal(cfg.server, claw.url);
       const saved = JSON.parse(fs.readFileSync(credentialsFile(a.c.dirs), "utf8"));
       assert.deepEqual([saved.kind, saved.token, saved.server, saved.device_name], ["grant", GRANT, claw.url, "box"]);
@@ -161,6 +162,6 @@ describe("claw-connector pair", () => {
     const text = pairedConfig({ server: "https://c.example/api", name: "dev \"pod\"", agents: ["claude", "cursor"], root: work });
     const cfg = parseConfig(text, { hostname: "h" });
     assert.equal(cfg.name, "dev \"pod\"");
-    assert.deepEqual(cfg.agents.map((a) => [a.id, a.roots]), [["claude", [work]], ["cursor", [work]]]);
+    assert.deepEqual(cfg.agents.filter((a) => a.id !== "claude-sessions").map((a) => [a.id, a.roots]), [["claude", [work]], ["cursor", [work]]]);
   });
 });
