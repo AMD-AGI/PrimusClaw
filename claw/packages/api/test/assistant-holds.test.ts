@@ -270,6 +270,38 @@ describe("assistant holds", { skip }, () => {
     assert.equal(says.length, 1);
     assert.equal(says[0].item_attention_seq, 1);
     assert.equal(await w.mod.silent.tellSilentItems(1), 0, "and once: the sweep has nothing left to say");
+    // The card for the held write rides on the message: the call to decide, the worker's session to send it to, in plain words.
+    const card = rows[0].payload.held_write;
+    assert.deepEqual(
+      { item_id: card?.item_id, session_id: card?.session_id, tool_use_id: card?.tool_use_id },
+      { item_id: item.itemId, session_id: item.workerSid, tool_use_id: "tu-1" },
+    );
+    assert.match(String(card.action), /^Run mcp__safe__workload_stop workload_id=sa-eval-fixture-sleep token=<redacted>$/);
+    assert.ok(!JSON.stringify(card).includes("ghp_"), "the credential is masked on the card too");
+  });
+
+  test("HD5c with no channel at all, the message in the item's session carries the card a reader of the session draws", async () => {
+    // The router session's copy of the message, as a web client and the evaluation read it (`AssistantSay`), caught where it is published.
+    const real = holds.holdPorts.recordNeedsYouFallback;
+    holds.holdPorts.recordNeedsYouFallback = (input) => w.mod.outbound.recordNeedsYouFallback(input, w.sayDeps);
+    w.events.length = 0;
+    try {
+      const item = await workingItem();
+      await deliver(item.workerSid, held());
+      const shown = w.events.filter((e) => e.type === "AssistantSay" && e.item?.item_id === item.itemId);
+      assert.equal(shown.length, 1, JSON.stringify(w.events));
+      assert.equal(shown[0].held_write?.tool_use_id, "tu-1");
+      assert.equal(shown[0].held_write?.session_id, item.workerSid);
+      assert.equal(shown[0].fallback, true);
+      // A question waits for an answer, not a decision: no card.
+      const other = await workingItem("Pick a cluster");
+      await deliver(other.workerSid, asked());
+      const q = w.events.filter((e) => e.type === "AssistantSay" && e.item?.item_id === other.itemId);
+      assert.equal(q.length, 1);
+      assert.equal(q[0].held_write, undefined, "a question carries no write card");
+    } finally {
+      holds.holdPorts.recordNeedsYouFallback = real;
+    }
   });
 
   test("HD6 a request a channel took is the item's needs-you message: the sweep does not say it again", async () => {

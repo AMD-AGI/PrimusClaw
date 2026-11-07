@@ -28,6 +28,7 @@ import {
   type AssistantItemSnapshot,
   type AssistantConfirmAction,
   type AssistantConfirmWrite,
+  type AssistantHeldWrite,
   type AssistantSayPayload,
   type AssistantSaySource,
   type WorkItemNeedsYouPayload,
@@ -168,13 +169,13 @@ type ToStore =
     /** A router say's turn, kept on its payload the same way, so a later say of that turn finds it (`turnFirstSay`). */
     turnMessageId?: string;
   })
-  | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow });
+  | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow; heldWrite?: AssistantHeldWrite });
 
 /** What a stored message is, to a receiver and to the web client. */
 function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | WorkItemNeedsYouPayload {
   const base = { event_id: m.sayId, occurred_at: new Date(createdAt).toISOString(), user_id: m.userId, text: redact(m.text) };
   return m.type === "work_item.needs_you"
-    ? { ...base, type: m.type, fallback: true, item: snapshot(m.item) }
+    ? { ...base, type: m.type, fallback: true, item: snapshot(m.item), ...(m.heldWrite ? { held_write: m.heldWrite } : {}) }
     : {
       ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}),
       ...(m.sources?.length ? { sources: m.sources } : {}),
@@ -289,6 +290,8 @@ async function sendSayEvent(
     ...(payload.type === "assistant.say" && payload.files ? { files: payload.files } : {}),
     ...(payload.type === "assistant.say" && payload.amends ? { amends: payload.amends } : {}),
     ...(payload.type === "assistant.say" && payload.replaces ? { replaces: payload.replaces } : {}),
+    // A write the item's worker holds for the person: the card a channel draws from its `approval.requested`, for a reader of the session.
+    ...(payload.type === "work_item.needs_you" && payload.held_write ? { held_write: payload.held_write } : {}),
     fallback: payload.type === "work_item.needs_you",
     ts: Date.parse(payload.occurred_at),
   });
@@ -623,12 +626,13 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
  */
 export async function turnFirstSay(q: Querier, userId: string, since: Date | string, messageId: string): Promise<string | null> {
   if (!CLAW_NOTIFICATIONS_ENABLED) return null;
+  // The server's "on it" for the turn (`lookup-ack.ts`) is the turn's first message as well: the answer takes its place.
   const row = (await q(
     `SELECT s.say_id::text AS say_id FROM claw_assistant_says s
-      WHERE s.user_id = $1 AND NOT s.fallback AND s.created_at >= $2
+      WHERE s.user_id = $1 AND (NOT s.fallback OR s.say_id = $4::uuid) AND s.created_at >= $2
         AND EXISTS (SELECT 1 FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text AND o.payload->>'turn_message_id' = $3)
       ORDER BY s.created_at, s.say_id LIMIT 1`,
-    [userId, since, messageId],
+    [userId, since, messageId, deterministicEventId("assistant.notice", userId, `lookup_ack:${messageId}`)],
   )).rows[0] as { say_id: string } | undefined;
   return row?.say_id ?? null;
 }
@@ -674,7 +678,7 @@ export async function personWritesChinese(q: Querier, userId: string, fallback =
 }
 
 /** A write a worker holds for the person, as `holds.ts` records it: what it would do in their words, and the text it would write. */
-interface HeldWrite { kind?: string; attention_seq?: number; action?: string; detail?: string; zh?: boolean; expires_at?: string }
+interface HeldWrite { kind?: string; attention_seq?: number; action?: string; detail?: string; zh?: boolean; expires_at?: string; tool_use_id?: string }
 
 /**
  * The message for an item whose worker holds a write for the person, in the language the hold was recorded in: what it would do, in
@@ -682,11 +686,29 @@ interface HeldWrite { kind?: string; attention_seq?: number; action?: string; de
  * "needs your answer: Approve or deny: mcp__github__issue_comment …" was all a Chinese user saw). Null when the item holds no such write
  * now, or the hold predates these words.
  */
-function heldWriteText(item: ItemRow, params: Record<string, unknown> | null): string | null {
+/** The write the item's worker holds for the person now, as `holds.ts` recorded it, or null. */
+function currentHeldWrite(item: ItemRow, params: Record<string, unknown> | null): HeldWrite | null {
   if (item.board_state !== "needs_you") return null;
   const holds = (Array.isArray(params?.holds) ? params!.holds : []) as HeldWrite[];
   const current = holds.filter((h) => h && h.kind === "approval" && Number(h.attention_seq) === Number(item.attention_seq) && h.action);
-  const h = current.at(-1);
+  return current.at(-1) ?? null;
+}
+
+/**
+ * The card for the write the item's worker holds now (`AssistantHeldWrite`), for the message that says so; null when it holds none, or
+ * the hold does not say which call it is.
+ */
+function heldWriteCard(item: ItemRow, params: Record<string, unknown> | null, workerSessionId: string | null): AssistantHeldWrite | null {
+  const h = currentHeldWrite(item, params);
+  if (!h || !workerSessionId || typeof h.tool_use_id !== "string" || !h.tool_use_id) return null;
+  return {
+    item_id: item.item_id, session_id: workerSessionId, tool_use_id: h.tool_use_id, action: redact(String(h.action)),
+    ...(h.expires_at ? { expires_at: String(h.expires_at) } : {}),
+  };
+}
+
+function heldWriteText(item: ItemRow, params: Record<string, unknown> | null): string | null {
+  const h = currentHeldWrite(item, params);
   if (!h) return null;
   const until = h.expires_at ? new Date(h.expires_at) : null;
   const time = until && !Number.isNaN(until.getTime()) ? `${until.toISOString().slice(11, 16)} UTC` : "";
@@ -746,7 +768,12 @@ export async function reshowFallback(input: { itemId: string }, deps: SayDeps = 
     [sayId, where.sessionId],
   )).rows[0] as { text: string; created_at: Date } | undefined;
   if (!claimed) return false;
-  const m: ToStore = { type: "work_item.needs_you", sayId, userId: item.user_id, sessionId: where.sessionId, text: claimed.text, item };
+  const held = (await db.query("SELECT params, worker_session_id FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0] as
+    { params: Record<string, unknown> | null; worker_session_id: string | null } | undefined;
+  const heldWrite = heldWriteCard(item, held?.params ?? null, held?.worker_session_id ?? null);
+  const m: ToStore = {
+    type: "work_item.needs_you", sayId, userId: item.user_id, sessionId: where.sessionId, text: claimed.text, item, ...(heldWrite ? { heldWrite } : {}),
+  };
   try {
     if (!(await eventInSession(where.sessionId, sayId))) await sendSayEvent(where.sessionId, sayId, payloadOf(m, claimed.created_at), deps);
     return true;
@@ -843,8 +870,11 @@ async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToSt
   const where = await itemSession(q, item.item_id);
   // No session is read: nothing is stored, so a later call (the sweep's, once a session exists) says it.
   if (!where) return null;
-  const params = answered ? null
-    : ((await q("SELECT params FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0]?.params as Record<string, unknown> | null) ?? null;
+  const held = answered ? null
+    : (await q("SELECT params, worker_session_id FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0] as
+      { params: Record<string, unknown> | null; worker_session_id: string | null } | undefined;
+  const params = held?.params ?? null;
+  const heldWrite = answered ? null : heldWriteCard(item, params, held?.worker_session_id ?? null);
   const zh = await personWritesChinese(q, item.user_id, item.title);
   const said = answered
     ? (zh ? `#${item.seq} ${item.title}：${answer}` : `#${item.seq} "${item.title}": ${answer}`)
@@ -857,6 +887,7 @@ async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToSt
     sessionId: where.sessionId,
     text,
     item,
+    ...(heldWrite ? { heldWrite } : {}),
   };
 }
 

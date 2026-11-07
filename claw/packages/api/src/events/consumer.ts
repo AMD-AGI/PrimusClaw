@@ -31,6 +31,7 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTIO
 import { skipsSkillSelection } from "../assistant/role-profile.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
+import { ackBeforeLookupInBackground } from "../assistant/lookup-ack.js";
 import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
 import { rerunOnFallback } from "../assistant/model-fallback.js";
 import { a2aPushEnabled } from "../routes/a2a-flags.js";
@@ -509,6 +510,10 @@ export async function consumeEventDelivery(msg: {
           logger.error({ err, sessionId }, "notification.approval_record_failed");
         }
       }
+    } else if (CLAW_ASSISTANT_ENABLED && event.type === "toolUsed" && event.status === "start" && event.tool !== QUESTION_TOOL) {
+      // A router turn starting a slow lookup with nothing said yet: the person is told it is on it (`assistant/lookup-ack.ts`).
+      // In the background: the lookup's own events are never held up by it.
+      ackBeforeLookupInBackground(sessionId, event);
     } else if (CLAW_ASSISTANT_ENABLED && (event.type === "decisionResult" || (event.type === "toolUsed" && event.tool === QUESTION_TOOL))) {
       // The wait is over (a decision, an answer, or Brain gave up): an item held for it goes back to in progress.
       if ((await eventNotificationPorts.releaseOrRetry(sessionId, event, msg)) === "retry") return;

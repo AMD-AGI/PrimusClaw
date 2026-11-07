@@ -110,6 +110,11 @@ test("S2 final answer, what was shown, cards", () => {
   assert.deepEqual(mine.map((s) => s.at), [1, 3, 4]);
   assert.equal(cardsOf(mine), "accept");
   assert.equal(cardsOf(caseSays(says, ["m1"], [])), "none");
+  // A write the item's worker holds for the person is put to them as a card on the message saying the item needs them.
+  const held = saysOf([say(5, "pending-3", "#1 needs your approval to: post a comment", {
+    item: { item_id: "i1", board_state: "needs_you" }, held_write: { item_id: "i1", session_id: "w1", tool_use_id: "toolu_1", action: "post a comment" },
+  })]);
+  assert.equal(cardsOf(caseSays(held, ["m1"], ["i1"])), "confirm");
   const calls = turnCalls([
     { at: 1, eventId: "a", data: { type: "toolUsed", tool: "mcp__autopilot__get_status", status: "start", actionId: "t1", message_id: "m1" } },
     { at: 2, eventId: "b", data: { type: "toolUsed", tool: "mcp__autopilot__get_status", status: "success", actionId: "t1", message_id: "m1" } },

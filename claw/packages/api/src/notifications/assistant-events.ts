@@ -128,6 +128,24 @@ export interface WorkItemNeedsYouPayload extends AssistantEventBase {
   type: "work_item.needs_you";
   fallback: true;
   item: AssistantItemSnapshot;
+  /** Present when what the item waits for is a write its worker holds for the person (`AssistantHeldWrite`). */
+  held_write?: AssistantHeldWrite;
+}
+
+/**
+ * A write an item's worker holds for the person (`assistant/holds.ts`), on the message that says so: what a card needs to put it to them
+ * beside the text. The person answers it as any held call is answered: a `decision` (`allow` or `deny`, with `tool_use_id`) on the
+ * worker's session, `POST /v1/sessions/{session_id}/messages`; the channel that got the item's `approval.requested` draws the same card
+ * from that. Every field is what Claw recorded of the hold, never a model's words; `action` is in the person's language.
+ */
+export interface AssistantHeldWrite {
+  item_id: string;
+  /** The worker's session, where the decision is sent. */
+  session_id: string;
+  tool_use_id: string;
+  /** What it would do, in plain words (`approvalAction`). */
+  action: string;
+  expires_at?: string;
 }
 
 /**

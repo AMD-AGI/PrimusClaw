@@ -213,6 +213,57 @@ export async function saidOnlyBeforeLookups(sessionId: string, messageIds: Reado
   return lastSay >= 0 && lastLookup > lastSay;
 }
 
+/**
+ * What the person is told when the turn answering them looked things up and then ended with no word and no text (the 2026-11-06 peer
+ * run, bczh-202: eleven web lookups and no reply at all). In the language of what they wrote; the system's words, so they claim nothing
+ * the turn found. Null for a turn a report started. Pure, for the tests.
+ */
+export function silentTurnNotice(prompts: readonly string[]): string | null {
+  const own = prompts.filter((p) => !p.startsWith(WORK_EVENT_PREFIX));
+  if (!own.length) return null;
+  return detectLanguage(own.join("\n")) === "Chinese"
+    ? "我查了一些资料，但这次没能整理出答复。请再问我一次，或者把问题说得具体一点。"
+    : "I looked into it but could not put an answer together this time. Please ask me again, or narrow the question down.";
+}
+
+/** Whether the turn answering `messageIds` made a lookup (any of `isLookup`), read from the session's stored events. */
+export async function turnMadeLookup(sessionId: string, messageIds: ReadonlySet<string>): Promise<boolean> {
+  if (!messageIds.size) return false;
+  const rows = (await db.query(
+    `SELECT DISTINCT data->>'tool' AS tool FROM claw_session_events
+      WHERE session_id = $1 AND event = 'toolUsed' AND deleted_at IS NULL AND data->>'message_id' = ANY($2::text[])`,
+    [sessionId, [...messageIds]],
+  )).rows as Array<{ tool: string | null }>;
+  return rows.some((r) => !!r.tool && isLookup(r.tool));
+}
+
+/**
+ * A turn that answers the person, looked something up, and ended with neither a say of its own nor any text: it is told so, once, in
+ * the system's words (`silentTurnNotice`). Not when the turn started an item (its start notice is the reply) or handed a review over.
+ */
+async function sayLookedButSilent(
+  end: RouterTurnEnd, userId: string, runs: ReadonlyArray<{ began: Date; message_id: string | null }>, prompts: readonly string[], deps: SayDeps,
+): Promise<"said" | "skipped"> {
+  const text = silentTurnNotice(prompts);
+  if (!text) return "skipped";
+  const answered = new Set([end.messageId, ...runs.map((r) => r.message_id)].filter((m): m is string => !!m));
+  const began = new Date(Math.min(...runs.map((r) => new Date(r.began).getTime())));
+  const spoke = await db.query("SELECT 1 FROM claw_assistant_says WHERE user_id = $1 AND NOT fallback AND created_at >= $2 LIMIT 1", [userId, began]);
+  if (spoke.rowCount) return "skipped";
+  const started = await db.query("SELECT 1 FROM claw_work_items WHERE user_id = $1 AND created_at >= $2 LIMIT 1", [userId, began]);
+  if (started.rowCount) return "skipped";
+  for (const messageId of answered) {
+    if (await turnHandedOffReview((t, p) => db.query(t, p), userId, messageId)) return "skipped";
+  }
+  if (!(await turnMadeLookup(end.sessionId, answered))) return "skipped";
+  const stored = await recordSystemNotice({
+    userId, sessionId: end.sessionId, text, key: `turn_silent:${[...end.runIds].sort().join(",")}`,
+    ...(end.messageId ? { turnMessageId: end.messageId } : {}),
+  }, deps);
+  if (stored) logger.warn({ sessionId: end.sessionId, runIds: end.runIds }, "assistant.silent_turn_notice_delivered");
+  return stored ? "said" : "skipped";
+}
+
 async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" | "skipped"> {
   const lost = end.failed || end.interrupted || end.fromSweeper;
   const router = (await db.query("SELECT user_id FROM claw_assistants WHERE session_id = $1", [end.sessionId])).rows[0] as
@@ -240,7 +291,7 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
   const prompts = runs.map((r) => r.prompt);
   const why = lostWhy(end);
   let text = lost ? turnLostNotice(prompts, why) : answerToDeliver(end.finalText, prompts);
-  if (!text) return "skipped";
+  if (!text) return lost ? "skipped" : await sayLookedButSilent(end, router.user_id, runs, prompts, deps);
   // The message the turn answered, as the completion names it, or as its runs were started for it (a sweeper's completion may not say).
   const answered = new Set([end.messageId, ...runs.map((r) => r.message_id)].filter((m): m is string => !!m));
   for (const messageId of answered) {

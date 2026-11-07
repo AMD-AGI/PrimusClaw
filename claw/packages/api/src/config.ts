@@ -937,3 +937,10 @@ export const ASSISTANT_DEPLOYMENT_MODEL = env("DEFAULT_MODEL");
 // The address Brain reaches this API at; the assistant MCP service is served under it.
 export const INTERNAL_BACKEND_URL =
   process.env.INTERNAL_BACKEND_URL || `http://127.0.0.1:${process.env.API_PORT || "8200"}`;
+// `true` (the default) has the server tell the person "on it" when a router turn answering them starts its first lookup (a web search,
+// an MCP read) without having said anything yet (`assistant/lookup-ack.ts`): the lookup can take seconds, and the first reply is what the
+// person waits on. The answer the turn says later takes that line's place in a channel that can edit it. Off: only the router's own words.
+export const CLAW_ASSISTANT_LOOKUP_ACK = envBool("CLAW_ASSISTANT_LOOKUP_ACK", true);
+// How long after a router turn's first lookup starts the server waits for the router's own line before it says its own (milliseconds):
+// a model that writes its line beside the lookup, in the same step, is not answered twice.
+export const CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS = envInt("CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS", 600, { min: 0 });
