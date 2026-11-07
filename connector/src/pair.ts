@@ -89,6 +89,14 @@ export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise
   const rawServer = values.server ?? ctx.env.CLAW_URL ?? cfg?.server ?? null;
   if (!rawServer) { ctx.err(`pair needs --server <Claw API URL>\n${USAGE}`); return 2; }
   const server = secureUrl(rawServer.trim(), "the Claw server URL");
+  // `run` takes CLAW_URL, then agents.toml, before the sign-in's own server: one that names another Claw would send this
+  // grant there. Refused before the code is spent.
+  for (const [where, other] of [["CLAW_URL", ctx.env.CLAW_URL], [cfgFile, cfg?.server]] as const) {
+    if (other && secureUrl(other.trim(), "the Claw server URL") !== server) {
+      ctx.err(`${where} names another Claw (${other.trim()}) than ${server}; the connector would use that one. Change or remove it, then run the same command again.`);
+      return 2;
+    }
+  }
   const name = (values.name ?? cfg?.name ?? ctx.hostname ?? os.hostname()).trim().slice(0, 64);
 
   // 1. The code, traded for a grant. Nothing is written before Claw has said yes.

@@ -133,6 +133,14 @@ describe("pairing a machine with a one-time code", { skip }, () => {
 
   test("P3 the grant reaches its own connector's routes and nothing else", async () => {
     const token = (await claim((await newCode("alice")).code)).body.data.token as string;
+    // Before it registers, it reaches none of the person's existing connectors (their command streams included).
+    const existing = await call("POST", "/v1/remote-agents/connectors", { user: "alice", body: { name: "existing", version: "0.1.6" } });
+    const eid = existing.body.data.connector_id as string;
+    for (const [method, path] of [["POST", `/v1/remote-agents/connectors/${eid}/heartbeat`], ["GET", `/v1/remote-agents/connectors/${eid}/commands`],
+      ["POST", `/v1/remote-agents/connectors/${eid}/events`], ["POST", `/v1/remote-agents/connectors/${eid}/revoke`]] as const) {
+      const r = await call(method, path, { bearer: token, ...(method === "POST" ? { body: {} } : {}) });
+      assert.deepEqual([r.status, r.body.error], [403, "connector_grant_mismatch"], `unbound ${method} ${path}`);
+    }
     const cid = (await register(token)).body.data.connector_id as string;
     // Another connector of the same person, registered otherwise.
     const other = await call("POST", "/v1/remote-agents/connectors", { user: "alice", body: { name: "desktop", version: "0.1.6" } });
@@ -164,6 +172,23 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     assert.equal((await heartbeat(token, second)).status, 200);
     assert.equal((await heartbeat(token, first)).body.error, "connector_grant_mismatch");
     assert.equal(told.length, 1);
+  });
+
+  test("P5b a notice that could not be said is said at the next registration, once", async () => {
+    const saved = pairing.pairingPorts.tell;
+    let fail = true;
+    pairing.pairingPorts.tell = async (n) => { if (fail) throw new Error("assistant down"); told.push({ owner: n.owner, name: n.name }); return true; };
+    try {
+      const token = (await claim((await newCode("alice")).code)).body.data.token as string;
+      assert.equal((await register(token)).status, 201);
+      assert.deepEqual(told, []);
+      fail = false;
+      assert.equal((await register(token)).status, 201);
+      assert.equal((await register(token)).status, 201);
+      assert.deepEqual(told, [{ owner: "alice", name: "laptop" }]);
+    } finally {
+      pairing.pairingPorts.tell = saved;
+    }
   });
 
   test("P6 a grant that never registered runs out after a day", async () => {

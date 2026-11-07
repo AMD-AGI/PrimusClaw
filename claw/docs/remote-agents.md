@@ -197,7 +197,8 @@ the folder the command was run in), saves the answer's grant (mode 0600) and sta
   person, with the `default` role, on the connector-side routes and nowhere else (anything else: `403 connector_grant_not_accepted`).
   Its registration binds it to that connector: from then on another connector id is `403 connector_grant_mismatch`, and once that
   connector is revoked (`/agent off`, `claw-connector logout`, `DELETE /v1/remote-agents/connectors/:cid`) every request is
-  `401 revoked`, which stops the connector for good. Registering again (lost local state) rebinds it to the new row. A grant
+  `401 revoked`, which stops the connector for good. Before it has registered, it reaches no existing connector (only
+  registration). Registering again (lost local state) rebinds it to the new row. A grant
   that never registered is refused a day after its claim and then deleted.
 - **Telling the owner**: the first registration under a grant tells the owner once, through their assistant, that the machine is
   paired and how to disconnect it if they did not run the command themselves.

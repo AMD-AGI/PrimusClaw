@@ -117,6 +117,15 @@ describe("claw-connector pair", () => {
     assert.equal(fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8"), mine);
     assert.match(ok.text(), /kept/);
 
+    // An agents.toml or CLAW_URL naming another Claw: refused before the code is spent.
+    const spent: any[] = [];
+    const other = ctx(home, { fetch: claimFetch(() => ({ status: 201, body: { ok: true, data: { token: GRANT } } }), spent) });
+    assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://other.example/api", "--no-start"], other.c), EXIT.usage);
+    assert.match(other.errText(), /names another Claw/);
+    const env = ctx(tmpdir(), { fetch: claimFetch(() => ({ status: 201, body: { ok: true, data: { token: GRANT } } }), spent), env: { CLAW_URL: "https://env.example/api" } });
+    assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start"], env.c), EXIT.usage);
+    assert.deepEqual(spent, [], "no code was spent");
+
     const offline = (async () => { throw new Error("ECONNREFUSED"); }) as typeof fetch;
     const b = ctx(tmpdir(), { fetch: offline });
     assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api"], b.c), EXIT.failure);

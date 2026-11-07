@@ -9,7 +9,8 @@
  *
  *   - It authenticates on the connector-side routes (`CONNECTOR_SIDE_ROUTES`) and is refused (403) on every other route.
  *   - The caller is the person the code was issued to, with the `default` role only.
- *   - Once the grant has registered a connector, it reaches that connector's routes only; another connector id is refused.
+ *   - It reaches the routes of the one connector it registered, and before that only registration: any other connector id,
+ *     the person's own included, is refused.
  *     When that row is revoked the grant answers 401 `revoked`, which tells the connector to stop and not come back.
  *   - A grant that never registered is good for a day after its claim.
  *
@@ -63,8 +64,10 @@ export async function verifyConnectorGrant(req: FastifyRequest, pathname: string
   if (!g.connector_id && now - new Date(g.created_at).getTime() > UNBOUND_GRANT_TTL_MS) {
     return reject("unbound_expired", refuse(401, "invalid_token", "the connector grant was never used and has expired; pair the machine again"));
   }
+  // Until it has registered a connector, a grant names none: it may register one, and reach no existing connector of the
+  // person's (that would hand whoever claimed a code the command stream of a machine that is already theirs).
   const cid = CID_IN_PATH.exec(pathname)?.[1];
-  if (cid && g.connector_id && cid.toLowerCase() !== g.connector_id.toLowerCase()) {
+  if (cid && (!g.connector_id || cid.toLowerCase() !== g.connector_id.toLowerCase())) {
     return reject("other_connector", refuse(403, "connector_grant_mismatch", "this connector grant belongs to another connector"));
   }
   grants.set(req, g.grant_id);

@@ -181,22 +181,21 @@ export async function findGrant(token: string, q: Querier = (t, p) => db.query(t
 }
 
 /**
- * Bind `grantId` to the connector row it just registered. The first time, the owner is told which machine was paired (after
- * the caller's work commits; a failure to tell is logged, never the registration's failure).
+ * Bind `grantId` to the connector row it just registered. Until the owner has been told which machine was paired, they are
+ * told (a failure to tell is logged, never the registration's failure, and tried again at the next registration).
  */
 export async function bindGrant(grantId: string, connectorId: string, name: string): Promise<void> {
-  const first = await inTransaction(async (q) => {
-    const g = (await q(
-      "SELECT owner_user_id, notified_at FROM claw_remote_grants WHERE grant_id = $1 AND revoked_at IS NULL FOR UPDATE", [grantId],
-    )).rows[0] as { owner_user_id: string; notified_at: Date | null } | undefined;
-    if (!g) return null;
-    await q("UPDATE claw_remote_grants SET connector_id = $2, notified_at = COALESCE(notified_at, NOW()) WHERE grant_id = $1", [grantId, connectorId]);
-    return g.notified_at ? null : g.owner_user_id;
-  });
-  if (!first) return;
+  const g = (await db.query(
+    `UPDATE claw_remote_grants SET connector_id = $2 WHERE grant_id = $1 AND revoked_at IS NULL
+      RETURNING owner_user_id, notified_at`,
+    [grantId, connectorId],
+  )).rows[0] as { owner_user_id: string; notified_at: Date | null } | undefined;
+  if (!g || g.notified_at) return;
+  // Marked told only once it was said; the notice's key makes a second attempt (a later registration) say nothing twice.
   try {
-    const told = await pairingPorts.tell({ owner: first, grantId, connectorId, name });
-    logger.info({ owner: first, connectorId, told }, "remote_agents.paired_notice");
+    const told = await pairingPorts.tell({ owner: g.owner_user_id, grantId, connectorId, name });
+    if (told) await db.query("UPDATE claw_remote_grants SET notified_at = NOW() WHERE grant_id = $1", [grantId]);
+    logger.info({ owner: g.owner_user_id, connectorId, told }, "remote_agents.paired_notice");
   } catch (err) {
     logger.warn({ err: (err as Error)?.message, connectorId }, "remote_agents.paired_notice_failed");
   }
