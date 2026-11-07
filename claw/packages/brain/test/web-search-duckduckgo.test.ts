@@ -28,7 +28,8 @@ const result = (target: string, title: string, snippet: string): string => `
     <a class="result__url" href="//duckduckgo.com/l/?uddg=${encodeURIComponent(target)}&amp;rut=abc">${target}</a>
     <a class="result__snippet" href="//duckduckgo.com/l/?uddg=${encodeURIComponent(target)}&amp;rut=abc">${snippet}</a>
   </div>`;
-const AD = `<div class="result results_links result--ad"><a rel="nofollow" class="result__a" href="https://duckduckgo.com/y.js?ad_domain=ads.example&amp;u3=x">Buy GPUs</a></div>`;
+const AD = `<div class="result results_links result--ad"><a rel="nofollow" class="result__a" href="https://duckduckgo.com/y.js?ad_domain=ads.example&amp;u3=x">Buy GPUs</a></div>`
+  + `<div class="result results_links result--ad"><a rel="nofollow" class="result__a" href="https://duckduckgo.com./y.js?ad_domain=ads.example">Buy GPUs</a></div>`;
 const PAGE = `<html><body><div id="links" class="results">${AD}${result("https://rocm.docs.amd.com/vllm.html", "vLLM inference on <b>ROCm</b> &amp; MI300X", "Run <b>vLLM</b> on AMD &#8212; docs")}${result("https://docs.vllm.ai/en/latest/", "vLLM", "Install")}${result("https://rocm.docs.amd.com/vllm.html", "dup", "dup")}</div></body></html>`;
 
 let ddg: (config: InternalAxiosRequestConfig) => Promise<unknown>;

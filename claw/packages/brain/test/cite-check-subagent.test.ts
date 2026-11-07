@@ -121,6 +121,13 @@ test("CS2 deliver_file of a cited report is refused; other files are not refused
   noted.router.citeCheck = check;
   assert.equal(await noted.router.route("deliver_file", { path: "/workspace/[note] 1 file.md" }, undefined, { isError: false }), CITED_FILE_REFUSAL);
 
+  // A citation at the start of its line is still one; a report too large to search is taken to be one.
+  for (const [file, path] of [[`[1] vLLM supports MI300X.\n\n[1]: vLLM on ROCm — ${A}`, "/workspace/r.md"], ["BIG", "/workspace/huge.md"]] as const) {
+    const r = routerOver(file);
+    r.router.citeCheck = check;
+    assert.equal(await r.router.route("deliver_file", { path }, undefined, { isError: false }), CITED_FILE_REFUSAL, path);
+  }
+
   // Past any read limit, and under another extension: still the same report.
   const long = routerOver(["vLLM supports MI300X [1].", ...Array.from({ length: 5000 }, (_, i) => `filler ${i}`), `[1]: vLLM on ROCm — ${A}`].join("\n"));
   long.router.citeCheck = check;

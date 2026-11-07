@@ -11,7 +11,7 @@ import type { McpToolCaller } from "../clients/mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
 import type { RunCitations } from "./citations.js";
-import { CITED_FILE_PATTERNS, CITED_FILE_REFUSAL, checkNote, checkReport, type CiteCheck } from "./cite-check.js";
+import { CITED_FILE_PATTERNS, CITED_FILE_REFUSAL, REPORT_FILE_EXTENSIONS, checkNote, checkReport, type CiteCheck } from "./cite-check.js";
 import type { LogReads } from "./log-reads.js";
 import { callWithWorkspaceFanout, fansOut } from "./workspace-fanout.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
@@ -517,7 +517,9 @@ export class ToolRouter {
       // A match is the file's count line, `<path>:<n>` with n > 0, whatever the path's name; no note (a file too large to search, a
       // scan cut short) ends that way. A refusal that did is read as a match: the file then goes through deliver_text, never unchecked.
       const matched = text.split("\n").some((l) => Number(l.trim().match(/.:(\d+)$/)?.[1] ?? 0) > 0);
-      if (found.isError || !matched) return false;
+      // A report too large to search is not taken to be anything else (a log or a table that size is delivered as before).
+      const unsearched = !matched && REPORT_FILE_EXTENSIONS.test(path) && /\bnot searched\b/.test(text);
+      if (found.isError || (!matched && !unsearched)) return false;
     }
     return true;
   }

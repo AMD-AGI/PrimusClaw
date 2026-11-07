@@ -149,13 +149,16 @@ function parseReport(lines: string[]): { sources: Map<number, ListedSource>; cla
 
 /**
  * A file in the sandbox that is a cited report, as two searches of the whole file (JavaScript regular expressions, one line each):
- * a line of a list of sources, and a line where a citation number follows other text. Both must match. Looser than the check's own
- * parsing (a code block is not skipped), so a report cannot pass as a file the check would not read.
+ * a line of a list of sources, and a line with a citation number that is not a source line's own. Both must match. Looser than the
+ * check's own parsing (a code block is not skipped), so a report in its usual shape cannot pass as a file the check would not read.
  */
 export const CITED_FILE_PATTERNS = [
   String.raw`^\s{0,3}(?:[-*+]\s+)?\[\d{1,3}\][:.]?\s+.*https?://`,
-  String.raw`\S.*\[\d{1,3}(?:\s*[,，、]\s*\d{1,3})*\](?!\()`,
+  String.raw`\[\d{1,3}(?:\s*[,，、]\s*\d{1,3})*\](?!\(|[:.]?\s+.*https?://)`,
 ];
+
+/** A report's own file types: one too large for the sandbox's search is taken to be a cited report, and refused as one. */
+export const REPORT_FILE_EXTENSIONS = /\.(md|markdown|html?)$/i;
 
 /** What a `deliver_file` of a cited report is refused with. */
 export const CITED_FILE_REFUSAL = "Error: this file is a report with numbered citations, so it is delivered with deliver_text (its name and its "

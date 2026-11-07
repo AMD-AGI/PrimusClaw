@@ -414,7 +414,7 @@ export function parseDuckDuckGoHtml(html: string): SearchHit[] {
     } catch {
       continue;
     }
-    const host = target.hostname.toLowerCase();
+    const host = target.hostname.toLowerCase().replace(/\.+$/, "");
     if ((target.protocol !== "https:" && target.protocol !== "http:") || host === "duckduckgo.com" || host.endsWith(".duckduckgo.com")) continue;
     const snippet = part.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/)?.[1];
     if (hits.some((h) => h.url === target.toString())) continue;
