@@ -67,6 +67,7 @@ import {
 import { getMultiNodeProvider, multiNodeAvailable } from "./sandbox/multi-node/factory.js";
 import type { SessionDestroyResult } from "./sandbox/multi-node/types.js";
 import { destroySessionCompute } from "./sandbox/session-compute-teardown.js";
+import { installSessionCleanupSubscribers } from "./sandbox/session-cleanup-subscriber.js";
 import {
   destroyHands, parkForIdleReclaim, releaseLocalHandsState,
   startMultiNodeSweeper, startSandboxSweeper,
@@ -704,10 +705,19 @@ function installInterruptSubscriber(): void {
   })();
 }
 
-async function cleanupSession(sid: string, payload: Uint8Array): Promise<void> {
+/** Every replica: the session is gone, so stop its runs here and let go of this process's hold on its sandbox. */
+async function forgetDeletedSession(sid: string): Promise<void> {
   markSessionDeleted(sid);
-  await abortRunsOfDeletedSession(sid);
+  try {
+    await abortRunsOfDeletedSession(sid);
+  } finally {
+    releaseLocalHandsState(sid);
+    logger.info({ sessionId: sid }, "session.deleted_forgotten_locally");
+  }
+}
 
+/** One replica (the queue group's pick): remove what the session owns on the platform. */
+async function teardownDeletedSession(sid: string, payload: Uint8Array): Promise<void> {
   const offeredKey = decodeCleanupPayload(payload.length ? sc.decode(payload) : "").platformKey ?? "";
   let complete = false;
   let failureReason: SessionCleanupIncompleteReason | undefined;
@@ -728,7 +738,6 @@ async function cleanupSession(sid: string, payload: Uint8Array): Promise<void> {
     failureReason = "threw";
     logger.error({ err, sessionId: sid }, "session.cleanup_failed");
   } finally {
-    releaseLocalHandsState(sid);
     if (!complete) {
       await parkForIdleReclaim(sid);
       metrics.onSessionCleanupIncomplete(failureReason ?? "unknown");
@@ -741,14 +750,12 @@ async function cleanupSession(sid: string, payload: Uint8Array): Promise<void> {
 }
 
 function installCleanupSubscriber(): void {
-  const clnSub = nc.subscribe("cleanup.*");
-  (async () => {
-    for await (const msg of clnSub) {
-      const parts = msg.subject.split(".");
-      const sid = parts[parts.length - 1];
-      await cleanupSession(sid, msg.data);
-    }
-  })();
+  installSessionCleanupSubscribers({
+    subscribe: (subject, opts) => nc.subscribe(subject, opts),
+    forget: forgetDeletedSession,
+    teardown: teardownDeletedSession,
+    onError: (err, sessionId, half) => logger.error({ err, sessionId, half }, "session.cleanup_handler_failed"),
+  });
 }
 
 /**

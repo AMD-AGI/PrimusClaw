@@ -36,7 +36,7 @@ import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
 import { rerunOnFallback } from "../assistant/model-fallback.js";
 import { a2aPushEnabled } from "../routes/a2a-flags.js";
 import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
-import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
+import { recordApprovalRequested, recordRunFinished, type RunFinished } from "../notifications/outbox.js";
 import { holdForPerson, QUESTION_TOOL, releaseHold, releaseRunHolds } from "../assistant/holds.js";
 import {
   markChatRunRunning, closeChatRun, gateNamesEndedTurnSql, gateOwnershipEnforced, queuedMessageId,
@@ -52,6 +52,7 @@ import { metrics } from "../infra/metrics.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
+import type { LeaderLease } from "../infra/leader-lock.js";
 import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
 
 /** Brain's event for a streaming tool call's text so far (`ExecuteRequest.stream_tool_text`); never stored. */
@@ -211,21 +212,98 @@ function listenForCleanupNotices(): void {
   });
 }
 
+/**
+ * What a completion delivery left to do. `done`: nothing, ack. `busy`: another
+ * delivery holds the session's completion lock, ask again shortly. `owed`: the
+ * completion is processed but its run notification could not be recorded, and
+ * the event is redelivered until it is.
+ */
+type CompletionOutcome = "done" | "busy" | "owed";
+
+/**
+ * The run notification a processed completion still owes, as the stamp stored
+ * it, or null. A value that is not one is logged and dropped rather than
+ * redelivered for ever: nothing a retry does can make it readable.
+ */
+function owedRunNotice(raw: unknown, rowId: number): RunFinished | null {
+  if (raw === null || raw === undefined) return null;
+  const v = raw as Partial<RunFinished>;
+  if (typeof v === "object" && typeof v.sessionId === "string" && Array.isArray(v.taskIds)
+    && v.taskIds.every((t) => typeof t === "string") && (v.outcome === "completed" || v.outcome === "failed")) {
+    return {
+      sessionId: v.sessionId,
+      taskIds: v.taskIds,
+      outcome: v.outcome,
+      ...(typeof v.failureReason === "string" ? { failureReason: v.failureReason } : {}),
+    };
+  }
+  logger.error({ rowId }, "notification.owed_unreadable");
+  return null;
+}
+
+/**
+ * A processed completion whose run notification was not recorded (see the stamp in `processCompletionEvent`): record
+ * that and nothing else. Everything else the completion did is done and is not done again; the notification's own key
+ * (the run, not the delivery) is what makes recording it a second time, after a clear that did not land, write nothing.
+ * Called with the completion lock held.
+ */
+async function recordOwedRunNotice(
+  sessionId: string,
+  rowId: number,
+  raw: unknown,
+  lease: Pick<LeaderLease, "lost">,
+): Promise<CompletionOutcome> {
+  const owed = CLAW_NOTIFICATIONS_ENABLED ? owedRunNotice(raw, rowId) : null;
+  if (!owed) return "done";
+  try {
+    await completionPorts.recordRunFinished(owed);
+  } catch (err) {
+    logger.error({ err, sessionId, rowId }, "notification.record_failed");
+    return "owed";
+  }
+  if (lease.lost()) return "done";
+  await db.query("UPDATE claw_session_events SET run_notification_owed = NULL WHERE id = $1", [rowId]);
+  logger.info({ sessionId, rowId, taskIds: owed.taskIds }, "notification.owed_recorded");
+  return "done";
+}
+
+/**
+ * The redelivery of a completion whose session was deleted after it was processed: the run it announces did end, and
+ * a notification it still owes is recorded before the delivery is dropped (the run's end, not the session's content).
+ * A completion that was never processed, or owes nothing, is dropped as before.
+ */
+async function recordOwedRunNoticeOfDeletedSession(sessionId: string, eventId: string): Promise<CompletionOutcome> {
+  const stored = (await db.query(
+    `SELECT id, run_notification_owed FROM claw_session_events
+      WHERE event_id = $1 AND session_id = $2 AND processed_at IS NOT NULL AND run_notification_owed IS NOT NULL`,
+    [eventId, sessionId],
+  )).rows[0] as { id: number } | undefined;
+  if (!stored) return "done";
+  const outcome = await withCompletionLock(sessionId, async (lease): Promise<CompletionOutcome> => {
+    const current = (await db.query(
+      "SELECT run_notification_owed FROM claw_session_events WHERE id = $1",
+      [stored.id],
+    )).rows[0] as { run_notification_owed?: unknown } | undefined;
+    return recordOwedRunNotice(sessionId, stored.id, current?.run_notification_owed, lease);
+  });
+  return outcome.ran ? outcome.result : "busy";
+}
+
 async function processCompletionEvent(
   sessionId: string,
   event: Record<string, unknown>,
   rowId: number,
-): Promise<boolean> {
+): Promise<CompletionOutcome> {
   const messageId = typeof event.message_id === "string" && event.message_id
     ? event.message_id : null;
-  const outcome = await withCompletionLock(sessionId, async (lease) => {
+  const outcome = await withCompletionLock(sessionId, async (lease): Promise<CompletionOutcome> => {
     // Another delivery may have finished while this one was acquiring the lock.
     const current = (await db.query(
-      "SELECT processed_at FROM claw_session_events WHERE id = $1 AND session_id = $2",
+      "SELECT processed_at, run_notification_owed FROM claw_session_events WHERE id = $1 AND session_id = $2",
       [rowId, sessionId],
     )).rows[0];
     if (!current || !("processed_at" in current)) throw new Error("completion event row is missing");
-    if (current.processed_at !== null) return;
+    if (current.processed_at !== null) return recordOwedRunNotice(sessionId, rowId, current.run_notification_owed, lease);
 
     // A sweeper completion describes a row it already terminalized; its task id
     // is context for the turn, not a worker-generation fence.
@@ -245,7 +323,8 @@ async function processCompletionEvent(
     // `processed_at` NULL, which is the column's existing contract for a body
     // that did not finish: the nak retry re-runs it under whoever holds the
     // lock then.
-    if (lease.lost()) return;
+    if (lease.lost()) return "done";
+    let owed: RunFinished | undefined;
     if (alreadyProcessed) {
       if (messageId && event.completion_source !== "sweeper") {
         await recordCompletionTurns(sessionId, event, messageId, () => !lease.lost());
@@ -254,7 +333,7 @@ async function processCompletionEvent(
     } else if (namesChatRow && messageAlreadyProcessed) {
       const verdict = await completionAdmissibility(provenance, runClaimOf(event));
       if (verdict === "active") {
-        await handleComplete(sessionId, event, rowId, provenance, () => !lease.lost());
+        owed = await handleComplete(sessionId, event, rowId, provenance, () => !lease.lost());
       } else {
         if (verdict === "settled" && messageId && event.completion_source !== "sweeper") {
           await recordCompletionTurns(sessionId, event, messageId, () => !lease.lost());
@@ -265,7 +344,7 @@ async function processCompletionEvent(
         );
       }
     } else {
-      await handleComplete(sessionId, event, rowId, provenance, () => !lease.lost());
+      owed = await handleComplete(sessionId, event, rowId, provenance, () => !lease.lost());
     }
     // The durable done-marker, and the one statement in this body that a hold
     // which has already lost its lock must not write.
@@ -319,10 +398,20 @@ async function processCompletionEvent(
     // stamp fail rather than succeed -- which needs `LeaderLease` to expose its
     // client (infra/leader-lock.ts), and would put a completion's write on the
     // lock pool the bulkhead in db.ts keeps it off.
-    if (lease.lost()) return;
-    await db.query("UPDATE claw_session_events SET processed_at = NOW() WHERE id = $1", [rowId]);
+    //
+    // A run notification `handleComplete` could not record is written in the same statement, so the marker that says the
+    // completion is done and the record of what it still owes cannot be separated: stamped alone, a failed outbox write
+    // was gone for good -- the redelivery read the marker and acked -- and the run's `run.completed` was never sent.
+    // Left unstamped instead, the redelivery would run the whole completion again (skill feedback, the evolution job,
+    // the fallback rerun) to retry one write.
+    if (lease.lost()) return "done";
+    await db.query(
+      "UPDATE claw_session_events SET processed_at = NOW(), run_notification_owed = $2::jsonb WHERE id = $1",
+      [rowId, owed ? JSON.stringify(owed) : null],
+    );
+    return owed ? "owed" : "done";
   });
-  return outcome.ran;
+  return outcome.ran ? outcome.result : "busy";
 }
 
 /**
@@ -376,6 +465,21 @@ export async function consumeEventDelivery(msg: {
       return;
     }
     if (deleted) {
+      if (event.type === "exec_complete" && CLAW_NOTIFICATIONS_ENABLED) {
+        let outcome: CompletionOutcome;
+        try {
+          outcome = await recordOwedRunNoticeOfDeletedSession(
+            sessionId, makeEventId((msg as any).seq ?? (msg as any).info?.streamSequence),
+          );
+        } catch (err) {
+          logger.error({ err, sessionId }, "notification.owed_record_failed");
+          outcome = "owed";
+        }
+        if (outcome !== "done") {
+          msg.nak(outcome === "busy" ? 1_000 : 10_000);
+          return;
+        }
+      }
       logger.info({ sessionId, type: event.type }, "event-consumer.dropped_deleted_session");
       msg.ack();
       return;
@@ -453,8 +557,15 @@ export async function consumeEventDelivery(msg: {
     if (event.type === "exec_complete") {
       try {
         if (rowId === null) throw new Error("completion event has no durable row");
-        if (!await processCompletionEvent(sessionId, event, rowId)) {
+        const outcome = await processCompletionEvent(sessionId, event, rowId);
+        if (outcome === "busy") {
           msg.nak(1_000);
+          return;
+        }
+        if (outcome === "owed") {
+          // Processed, with its run notification still to record: redelivered until it is (see the stamp in
+          // `processCompletionEvent`). The wait is the one a failed completion gets.
+          msg.nak(10_000);
           return;
         }
       } catch (e) {
@@ -879,7 +990,7 @@ async function handleComplete(
   // steps above it each take a round trip, and the lock this body depends on
   // is held on another connection that can be released during any of them.
   stillHeld?: () => boolean,
-): Promise<void> {
+): Promise<RunFinished | undefined> {
   const { failed, user_id, interrupted, failure_reason } = event as any;
   const userId: string = user_id || "default";
   // Null rather than "" when absent: the unique index over the turns is partial
@@ -1214,18 +1325,24 @@ async function handleComplete(
   }
 
   // 8. Notify subscribers that a run ended. Opt-in (flag and a subscription),
-  //    best-effort, and idempotent: the outbox row key is derived from the run,
-  //    so a redelivered completion records nothing new.
+  //    and idempotent: the outbox row key is derived from the run, so a
+  //    redelivered completion records nothing new. Not best-effort: a write that
+  //    fails here does not fail the rest of the completion, but it is returned,
+  //    stored with the completion's done-marker, and retried on redelivery until
+  //    it is recorded (`processCompletionEvent`). Nothing else would ever send it.
+  let owedNotice: RunFinished | undefined;
   if (CLAW_NOTIFICATIONS_ENABLED && !interrupted && endedRunIds.length) {
+    const notice: RunFinished = {
+      sessionId,
+      taskIds: endedRunIds,
+      outcome: failed ? "failed" : "completed",
+      ...(failed ? { failureReason: String(failure_reason ?? "agent_error") } : {}),
+    };
     try {
-      await completionPorts.recordRunFinished({
-        sessionId,
-        taskIds: endedRunIds,
-        outcome: failed ? "failed" : "completed",
-        failureReason: failed ? String(failure_reason ?? "agent_error") : undefined,
-      });
+      await completionPorts.recordRunFinished(notice);
     } catch (err) {
       logger.error({ err, sessionId }, "notification.record_failed");
+      owedNotice = notice;
     }
   }
 
@@ -1307,6 +1424,7 @@ async function handleComplete(
   }
 
   logger.info({ sessionId, failed, userId }, "exec_complete.handled");
+  return owedNotice;
 }
 
 /** How often a router turn's unsaid answer is tried when delivering it faults, and the first pause between tries. */

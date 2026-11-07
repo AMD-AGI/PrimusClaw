@@ -216,7 +216,8 @@ for the connector-side actions it keeps (`connector.registered`,
 ## Pairing a machine with a one-time code
 
 The first connection of a machine needs no sign-in on it. The person asks their own client (Clawy: "连接我的开发环境", or the
-router's `devenv_pair` tool); the client calls `POST /v1/remote-agents/pairings` as that person and shows the answer's `command`:
+router's `devenv_pair` tool, or `devenv_list` itself when the person has no machine yet: its `connect_a_machine` is then this
+pairing command; both only in a turn answering a message they sent signed in, recently); the client calls `POST /v1/remote-agents/pairings` as that person and shows the answer's `command`:
 
 ```
 npm install -g @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
@@ -348,6 +349,18 @@ queued: a retry made after the connector has acknowledged the command is answere
 `200 {duplicate: true}` and queues nothing, and the same key with another command type or
 another session is `409 idempotency_key_reused`.
 
+What the person sent is part of the session's events. An agent reports only its own side, so a
+window opened on the session somewhere else (the web page beside a Teams chat, another device) would
+show answers to questions it cannot see. When a `prompt` is queued, from any client or from the
+assistant (`devenv_send`), Claw writes in the same transaction an event of its own, `user_prompt
+{text, cmd_id, cmd_seq, client, by: "claw"}` with a negative `seq` (`-(2^52 + cmd_seq)`, apart from
+the `-cmd_seq` of an undelivered prompt's `turn_end`), and wakes the session's readers. A retry
+with the same `Idempotency-Key` writes nothing. The text is masked as the connector's events are at
+ingest (`redactPublicJson`) and kept with the session's other events, under the same retention; the
+audit trail still keeps only its hash. A connector may not post this type (`reserved_type`), so a
+`user_prompt` frame is always Claw's account of what was sent. Nothing that follows a turn (the
+assistant's items, reclaiming idle sessions, an attached chat) reads it.
+
 Limits per user: 5 connectors, 10 active sessions, 60 commands a minute, 20 open
 event streams per API replica.
 
@@ -368,7 +381,7 @@ are not touched.
 
 What a person runs to connect a machine is given by the server, never written by a client
 or a model: `GET /v1/remote-agents/setup`, and `connect_a_machine` in `devenv_list` (no
-machine) and in a `devenv_send` refused `no_machine`. Its `login` line names this server's
+machine, where no pairing can be made for the turn) and in a `devenv_send` refused `no_machine`. Its `login` line names this server's
 `CLAW_PUBLIC_URL` and the identity service the connector signs in with
 (`CLAW_CONNECTOR_IDENTITY_URL`, else `IDENTITY_ISSUER_URL`). Sessions are not closed on their own: a new one at the
 session limit closes the user's sessions nobody is using to make room (no event for half an
@@ -484,6 +497,6 @@ transitions older than the same number of days go in the same sweep.
 `claw_remote_audit` records who did what through which client (`X-Claw-Client`, a short
 label): connector registered and revoked, session created, every command issued, every
 permission requested and resolved. A prompt is recorded as its SHA-256 and length,
-never its text. A queued command is deleted once a heartbeat acknowledges it, or after a day
+never its text (the text is in the session's `user_prompt` event, which goes with the session). A queued command is deleted once a heartbeat acknowledges it, or after a day
 unacknowledged (6 minutes for `session.new`, `prompt`, `set_mode` and `resume`, each recorded as
 `command.expired`): an instruction nobody has collected for that long should not run.

@@ -240,8 +240,9 @@ jobs:
   # suite starts the real API and Brain entry points against a real Postgres
   # and a real JetStream server, then rolls the API, rolls a Brain, kills a
   # Brain, stalls JetStream, and loses a Brain with its node (killed and never
-  # restarted under its name), each in the middle of a turn
-  # (claw/packages/api/test/rolling-restart-chaos.test.ts). The package shards
+  # restarted under its name), each in the middle of a turn, and checks that a
+  # long run's run.completed reaches its webhook exactly once through a Brain
+  # roll and an API roll (claw/packages/api/test/rolling-restart-chaos.test.ts). The package shards
   # above skip it: they have no nats-server.
   claw-rolling-restart:
     name: Claw rolling restart (chaos)
@@ -297,7 +298,7 @@ jobs:
           test -x "$CLAW_CHAOS_NATS_SERVER"
           npx --no-install tsx --test --test-reporter=spec test/rolling-restart-chaos.test.ts | tee "$RUNNER_TEMP/chaos.log"
           # A skipped suite passes too; this job exists to run it.
-          grep -q "^ℹ pass 6$" "$RUNNER_TEMP/chaos.log"
+          grep -q "^ℹ pass 8$" "$RUNNER_TEMP/chaos.log"
 
   connector:
     name: Connector (TypeScript)

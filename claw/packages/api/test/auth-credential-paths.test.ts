@@ -27,6 +27,8 @@ import {
 import {
   AuthServiceMisconfiguredError,
   AuthUpstreamUnreachableError,
+  SafeUpstreamHttpError,
+  SafeUpstreamProtocolError,
 } from "../src/auth/safe-client.js";
 import type { UserInfo } from "../src/auth/models.js";
 
@@ -222,6 +224,36 @@ test("bearer: an unreachable SaFE is a 503", async () => {
     API_PATH,
   );
   assert.deepEqual(rejection(outcome), { status: 503, legacyError: "authentication_service_unavailable" });
+});
+
+// 2026-11-07 09:50-10:15Z: SaFE answered 5xx while it restarted, the API turned that into 401 invalid_api_key,
+// and a connector holding a good key took four of those as "the key is gone" and stopped until a person signed in again.
+test("api key (bearer, x-api-key) and cookie: SaFE answering 5xx, or 2xx with no answer, is a 503, never a 401", async () => {
+  const failures: Error[] = [
+    new SafeUpstreamHttpError({ status: 502, bodySnippet: "<html>bad gateway</html>" }),
+    new SafeUpstreamHttpError({ status: 503, bodySnippet: "" }),
+    new SafeUpstreamHttpError({ status: 500, bodySnippet: "db down" }),
+    new SafeUpstreamProtocolError("SaFE answered 200 with a body that is not JSON"),
+  ];
+  for (const err of failures) {
+    const bearer = await verifyBearerApiKey(request({ headers: { authorization: `Bearer ${KEY}` } }), stub(err), API_PATH);
+    assert.deepEqual(rejection(bearer), { status: 503, legacyError: "authentication_service_unavailable" }, `bearer: ${err.message}`);
+    const xkey = await verifyXApiKeyHeader(request({ headers: { "x-api-key": KEY } }), stub(err), API_PATH);
+    assert.deepEqual(rejection(xkey), { status: 503, legacyError: "authentication_service_unavailable" }, `x-api-key: ${err.message}`);
+    const cookie = await verifySessionCookie(request({ cookies: { Token: "tok" } }), stub(err), API_PATH);
+    assert.deepEqual(rejection(cookie), { status: 503, legacyError: "authentication_service_unavailable" }, `cookie: ${err.message}`);
+    // SaFE's own text is not handed to the caller.
+    assert.ok(bearer.status === "rejected" && !bearer.error.message.includes("db down") && !bearer.error.message.includes("<html>"));
+  }
+});
+
+test("api key: SaFE refusing with a 4xx is still the key's fault, a 401", async () => {
+  const outcome = await verifyBearerApiKey(
+    request({ headers: { authorization: `Bearer ${KEY}` } }),
+    stub(new SafeUpstreamHttpError({ status: 403, bodySnippet: "forbidden" })),
+    API_PATH,
+  );
+  assert.deepEqual(rejection(outcome), { status: 401, legacyError: "invalid_api_key" });
 });
 
 test("x-api-key: authenticates an ak- key", async () => {

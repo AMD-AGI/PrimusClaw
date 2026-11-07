@@ -112,6 +112,34 @@ describe("notification outbox", { skip }, () => {
       assert.equal(delivered?.message_id, "claw-1793790955023", "the receiver is sent the id, not only the outbox row");
     });
 
+    test("a long run taken over near its end is still a long run; a short run that queued long is not", async () => {
+      // What a brain roll leaves on the row (2026-11-07 11:21Z): the draining brain hands the run back, which clears
+      // `started_at`, and the claim that resumes it stamps a new one seconds before the end. The run's anchor and its
+      // banked queue time are what the run-time ledger keeps across every claim.
+      await subscribe();
+      const seed = async (sid: string, tid: string, epochAgo: number, startedAgo: number, queuedMs: number, claims: number) => {
+        await q(
+          "INSERT INTO claw_sessions (session_id, name, user_id, mode, config) VALUES ($1, 'show-here', 'u1', 'claw', '{\"notify_on_finish\": true}'::jsonb)",
+          [sid],
+        );
+        await q(
+          `INSERT INTO claw_tasks (task_id, session_id, name, status, origin, claim_count, run_time_epoch_at, queued_ms_accrued,
+                                   created_at, started_at, completed_at, metadata)
+           VALUES ($1, $2, 'run', 'completed', 'chat', $6, NOW() - make_interval(secs => $3), $5,
+                   NOW() - make_interval(secs => $3), NOW() - make_interval(secs => $4), NOW(), '{}'::jsonb)`,
+          [tid, sid, epochAgo, startedAgo, queuedMs, claims],
+        );
+      };
+      // The incident's row: 82.8 s from the anchor, 1.2 s of it queued (the takeover's requeue), 3 s since the second claim.
+      await seed("s-taken", "t-taken", 82.8, 3, 1_208, 2);
+      // A turn that waited 117 s behind another and then ran for 3 s: as short as it was before this change.
+      await seed("s-queued", "t-queued", 120, 3, 117_000, 1);
+      for (const [sid, tid] of [["s-taken", "t-taken"], ["s-queued", "t-queued"]]) {
+        await outbox.recordRunFinished({ sessionId: sid, taskIds: [tid], outcome: "completed" });
+      }
+      assert.deepEqual((await rows()).map((r) => r.payload.task_id), ["t-taken"]);
+    });
+
     test("long_run requires the session's notify_on_finish opt-in", async () => {
       const cases: Array<{ name: string; seconds: number; notify?: unknown; trigger?: string; announced: boolean }> = [
         { name: "long run, no flag", seconds: 120, announced: false },

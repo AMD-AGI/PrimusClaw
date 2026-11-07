@@ -32,7 +32,7 @@ import {
   ASSISTANT_MCP_SERVER, confirmationRef, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
   ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderModelChoice,
   renderObserverSystem, renderReviewState, renderRouterItems, renderRouterPrompt, renderWorkerSystem, withTurnState,
-  ROUTER_DEVENV_PROMPT_VERSION, renderRouterDevenvSection,
+  ROUTER_DEVENV_PROMPT_VERSION, renderAttachedState, renderRouterDevenvSection,
   type AskedOfOtherLine, type ManifestItem,
 } from "./prompts.js";
 import { allowedModels, modelChoiceOn, platformModel, readModelPrefs } from "./model-choice.js";
@@ -316,6 +316,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // And what they sent earlier in the conversation, which a new item gets too (`earlierFilesOf`): a follow-up is about those.
     const earlier = message ? await earlierFilesOf((t, p) => db.query(t, p), sessionId, messageId, files) : [];
     if (files.length || earlier.length) state.push(renderFilesState(files, earlier));
+    // Which session the chat the message came from is attached to, when the channel said (`channel_context.attached`).
+    if (message?.context.attached !== undefined) state.push(renderAttachedState(message.context.attached));
     if (files.length) {
       const images = promptImagesOf(files);
       if (images.length) task.prompt_images = images;

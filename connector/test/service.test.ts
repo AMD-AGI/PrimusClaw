@@ -12,6 +12,8 @@ import { needsLogin, recentDisconnects } from "../src/health.js";
 import { keepaliveFile, needsLoginFile, pidFile, resolveDirs, serviceEnvFile, supervisorPidFile } from "../src/paths.js";
 import { accountName, carriedEnv, codexEnvKeys, cronLines, ephemeralWhere, launchdPlist, readMounts, supervise, systemdUnit, withThreadPool, type ExecResult, type ServiceDeps } from "../src/service.js";
 import { FakeClaw } from "./support/fake-claw.js";
+import { isDefinitiveRefusal } from "../src/connector.js";
+import { HttpError } from "../src/claw-client.js";
 import { ADAPTER, tmpdir } from "./support/harness.js";
 
 function ctx(home: string, extra: Partial<Ctx> = {}, env: NodeJS.ProcessEnv = {}) {
@@ -539,13 +541,14 @@ describe("exit 78 and the disconnect record", () => {
       const home = tmpdir();
       writeConfig(home, tmpdir("w-"));
       await main(["login", "--server", claw.url, "--key", "deleted-key"], ctx(home).c);
-      const r = ctx(home);
+      // Judged as later in the run: authFailLimit refusals from a Claw that answers, lasting authFailWindowMs.
+      const r = ctx(home, { timing: { backoffMinMs: 10, backoffMaxMs: 20, authFailLimit: 3, authFailWindowMs: 50 } });
       assert.equal(await main(["run"], r.c), EXIT.needsPerson);
       assert.match(needsLogin(r.c.dirs)?.reason ?? "", /refused the sign-in/);
       const s = ctx(home);
       await main(["status"], s.c);
       assert.match(s.text(), /needs a new sign-in/);
-      assert.match(s.text(), /last down: .* failed/);
+      assert.match(s.text(), /last down: .* auth_failed/);
     } finally { await claw.close(); }
   });
 
@@ -603,6 +606,85 @@ describe("exit 78 and the disconnect record", () => {
       connector.stop();
       assert.equal(await running, EXIT.ok);
     } finally { connector?.stop(); await running; await claw.close(); }
+  });
+
+  test("an identity-service outage (503, 401, 503, 401 ...) far longer than authFailWindowMs does not end the run, which comes back by itself", async () => {
+    const claw = await FakeClaw.start();
+    let connector: any;
+    let running: Promise<number> | undefined;
+    try {
+      const home = tmpdir();
+      writeConfig(home, tmpdir("w-"));
+      await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c);
+      const r = ctx(home, { timing: { heartbeatMs: 30, pausePollMs: 40, backoffMinMs: 5, backoffMaxMs: 20, authFailLimit: 2, authFailWindowMs: 40 }, onConnector: (cn) => { connector = cn; } });
+      running = main(["run"], r.c);
+      await claw.until("online", () => claw.online && claw.heartbeats.length > 0);
+      claw.outage = true;
+      claw.dropStreams();
+      // Many times authFailLimit refusals, over many times authFailWindowMs: before this fix the 4th ended the run (exit 78).
+      await claw.until("refusals", () => claw.outageRefusals >= 12, 10_000);
+      await new Promise((res) => setTimeout(res, 200));
+      assert.equal(needsLogin(r.c.dirs), null, "no needs-login.json while Claw is failing");
+      claw.outage = false;
+      const before = claw.heartbeats.length;
+      await claw.until("back", () => claw.online && claw.heartbeats.length > before, 10_000);
+      connector.stop();
+      assert.equal(await running, EXIT.ok);
+    } finally { connector?.stop(); await running; await claw.close(); }
+  });
+
+  test("a supervisor restart straight into the outage: the first answer a 401 still does not end the run", async () => {
+    const claw = await FakeClaw.start();
+    let connector: any;
+    let running: Promise<number> | undefined;
+    try {
+      const home = tmpdir();
+      writeConfig(home, tmpdir("w-"));
+      await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c);
+      claw.outage = true;
+      // Two refusals first: the client asks again once on a 401 (an access token may just have expired), so the start
+      // itself sees the refusal, not the 503 after it.
+      claw.outagePattern = [401, 401, 503];
+      const r = ctx(home, { timing: { heartbeatMs: 30, pausePollMs: 40, backoffMinMs: 5, backoffMaxMs: 20, authFailLimit: 2, authFailWindowMs: 40 }, onConnector: (cn) => { connector = cn; } });
+      running = main(["run", "--supervised"], r.c);
+      await claw.until("refusals", () => claw.outageRefusals >= 8, 10_000);
+      await new Promise((res) => setTimeout(res, 200));
+      assert.equal(needsLogin(r.c.dirs), null);
+      claw.outage = false;
+      await claw.until("online", () => claw.online && claw.heartbeats.length > 0, 10_000);
+      connector.stop();
+    } finally { connector?.stop(); await running; await claw.close(); }
+  });
+
+  test("a revocation right after an outage still ends the run at once with 78", async () => {
+    const claw = await FakeClaw.start();
+    try {
+      const home = tmpdir();
+      writeConfig(home, tmpdir("w-"));
+      await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c);
+      // Default authOutageQuietMs (10 min) and authFailWindowMs (2 min): only the revocation can end this run in time.
+      const r = ctx(home, { timing: { heartbeatMs: 30, pausePollMs: 40, backoffMinMs: 5, backoffMaxMs: 20 } });
+      const running = main(["run"], r.c);
+      await claw.until("online", () => claw.online && claw.heartbeats.length > 0);
+      claw.outage = true;
+      claw.dropStreams();
+      await claw.until("refusals", () => claw.outageRefusals >= 4, 10_000);
+      claw.outage = false;
+      const t0 = Date.now();
+      claw.revoked = true;
+      claw.dropStreams();
+      assert.equal(await running, EXIT.revoked);
+      assert.ok(Date.now() - t0 < 5_000, `exit 78 came ${Date.now() - t0} ms after the revocation`);
+      assert.match(needsLogin(r.c.dirs)?.reason ?? "", /revoked/);
+    } finally { await claw.close(); }
+  });
+
+  test("a 401 or 403 that is not Claw's word (no JSON error: a gateway, a proxy's page) is never counted", () => {
+    assert.equal(isDefinitiveRefusal(new HttpError(401, "invalid_api_key", "/x")), true);
+    assert.equal(isDefinitiveRefusal(new HttpError(403, "insufficient_scope", "/x")), true);
+    assert.equal(isDefinitiveRefusal(new HttpError(401, "http_401", "/x")), false);
+    assert.equal(isDefinitiveRefusal(new HttpError(403, "http_403", "/x")), false);
+    assert.equal(isDefinitiveRefusal(new HttpError(503, "authentication_service_unavailable", "/x")), false);
   });
 
   test("a run that was killed is recorded by the next one as process_died, with its last heartbeat", async () => {

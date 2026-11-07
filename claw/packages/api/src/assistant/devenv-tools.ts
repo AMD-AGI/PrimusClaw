@@ -25,6 +25,7 @@
  * they press it.
  */
 import { createHash } from "node:crypto";
+import pino from "pino";
 import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -36,6 +37,8 @@ import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { inRemoteSessionOrder, langOf, noteRemotePrompt, remoteEventMark, remoteWorkerSessionId, type RemoteLang } from "./remote-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
+
+const logger = pino({ name: "assistant-devenv" });
 
 /** Whether the router is offered `devenv_list`. */
 export const devenvToolsOn = (): boolean => CLAW_REMOTE_AGENTS_ENABLED;
@@ -309,8 +312,12 @@ export interface DevenvList {
   machines: DevenvMachine[];
   /** The session "connect me" means when there is exactly one obvious one, else null (ask which). */
   attach_default: { label: string; ref: string; attach_command: string; new_session?: true } | null;
-  /** With no machine connected: the exact commands that connect one, with this deployment's addresses (`remote-agents/setup.ts`). */
-  connect_a_machine?: { commands: string[]; text: string };
+  /**
+   * With no machine connected, what connects one, said in `text` with its exact command(s): in a turn answering the user's own
+   * message, a one-line pairing command made for them now (`pairing`, as devenv_pair gives it); else, or where pairing is refused,
+   * the setup commands with this deployment's addresses (`remote-agents/setup.ts`).
+   */
+  connect_a_machine?: { commands: string[]; text: string; pairing?: { expires_in_minutes: number; single_use: true } };
   note: string;
 }
 
@@ -320,8 +327,54 @@ export function connectAMachine(zh: boolean): { commands: string[]; text: string
   return { commands: setup.steps.map((s) => s.command), text: zh ? setup.text.zh : setup.text.en };
 }
 
+/**
+ * The one-line pairing command, said in the user's language, for a user with no machine. A user who asked to connect their dev
+ * environment and has none gets it from devenv_list itself: a model that has to call devenv_pair after the list too often answered
+ * with the setup commands the list used to carry instead (S1, 5 of 7 fresh sessions).
+ */
+export function pairingText(command: string, minutes: number, zh: boolean): string {
+  return zh
+    ? `在要连接的机器上打开终端，进入允许 agent 工作的目录，运行下面这一行（${minutes} 分钟内有效，只能用一次）。它会安装连接器、完成配对并在后台运行，`
+      + `不需要登录或打开浏览器；连上后这里会告诉你。\n\`\`\`\n${command}\n\`\`\``
+    : `On the machine you want to connect, open a terminal in the folder the agents may work in and run this one line (it works once, `
+      + `within ${minutes} minutes). It installs the connector, pairs the machine and keeps it running; no login or browser is needed. `
+      + `You will be told here when it is connected.\n\`\`\`\n${command}\n\`\`\``;
+}
+
+/**
+ * Whether this list may make the user a pairing itself: when devenv_pair may ({@link pairingTurn}). Every other turn gets the setup
+ * commands, and devenv_pair refuses there too.
+ */
+async function mayPairHere(claims: AssistantTokenClaims): Promise<boolean> {
+  if (claims.role !== "router") return false;
+  try {
+    await pairingTurn((text, params) => db.query(text, params), claims);
+    return true;
+  } catch (err) {
+    if (err instanceof ToolRefused) return false;
+    throw err;
+  }
+}
+
+/** What connects a machine for a user with none: a pairing made now when this turn may make one, else the setup commands. */
+async function connectNew(claims: AssistantTokenClaims, zh: boolean, mayPair: boolean): Promise<NonNullable<DevenvList["connect_a_machine"]>> {
+  if (!mayPair) return connectAMachine(zh);
+  try {
+    const p = await devenvPair(claims) as { command: string; expires_in_minutes: number };
+    return { commands: [p.command], text: pairingText(p.command, p.expires_in_minutes, zh), pairing: { expires_in_minutes: p.expires_in_minutes, single_use: true } };
+  } catch (err) {
+    // No public address here, too many codes this minute, or the pairing could not be written: the setup commands, and the list
+    // is still answered.
+    if (!(err instanceof ToolRefused)) logger.warn({ err, sid: claims.sid }, "assistant.devenv_list_pairing_failed");
+    return connectAMachine(zh);
+  }
+}
+
 const SETUP_NOTE = " The user has no machine connected: to connect one, call devenv_pair and give them its one command as it is; only "
   + "if devenv_pair is refused, give them connect_a_machine.text as it is (the commands are exact; do not change or shorten them).";
+const PAIRED_NOTE = " The user has no machine connected: connect_a_machine is a one-time pairing command made for them now. Give them "
+  + "connect_a_machine.text as it is, its command in a code block (exact: never change, shorten or add to it, never give other "
+  + "connector commands), and do not call devenv_pair for another.";
 const OUTDATED_NOTE = " A machine whose version_status is outdated or unsupported needs its connector upgraded (unsupported: no new session "
   + "starts on it): give the user its upgrade_command as it is.";
 
@@ -342,11 +395,13 @@ export async function devenvList(
   const detail = args.detail === undefined || args.detail === "" ? "status" : args.detail;
   if (detail !== "status" && detail !== "activity") throw new ToolRefused("invalid_arguments", "detail is status or activity");
   const { userId } = await inTransaction((q) => assertLiveRun(q, claims));
+  const mayPair = await mayPairHere(claims);
   // Before any of it is passed on: from here on this turn has read what a connector and its agents reported.
   await markUntrustedRead((text, params) => db.query(text, params), claims.sid, claims.mid);
   const { machines, attachable } = await collect(userId, detail === "activity", onlineWindowMs);
   const message = machines.length ? null : await turnMessage((text, params) => db.query(text, params), claims.sid, claims.mid);
   const old = machines.some((m) => m.version_status === "outdated" || m.version_status === "unsupported");
+  const connect = machines.length ? null : await connectNew(claims, langOf(message?.content ?? "") === "zh", mayPair);
   // "Connect me" without naming one: the one session open through Claw, else the one conversation that can be taken over, else
   // (no session at all) the one agent that can start one. One open in a terminal is never the default: it can only be watched,
   // and "connect me" means to work with it.
@@ -362,8 +417,9 @@ export async function devenvList(
     attach_default: pick
       ? { label: pick.label, ref: pick.ref, attach_command: attachCommand(pick.ref), ...(pick.opened_in === "agent" ? { new_session: true } : {}) }
       : null,
-    ...(machines.length ? {} : { connect_a_machine: connectAMachine(langOf(message?.content ?? "") === "zh") }),
-    note: (detail === "activity" ? ACTIVITY_NOTE : STATUS_NOTE) + (machines.length ? "" : SETUP_NOTE) + (old ? OUTDATED_NOTE : ""),
+    ...(connect ? { connect_a_machine: connect } : {}),
+    note: (detail === "activity" ? ACTIVITY_NOTE : STATUS_NOTE) + (connect ? (connect.pairing ? PAIRED_NOTE : SETUP_NOTE) : "")
+      + (old ? OUTDATED_NOTE : ""),
   };
 }
 
@@ -1044,6 +1100,20 @@ export async function sendConfirmed(userId: string, confirmationId: string, para
 }
 
 /**
+ * A turn that may be given a pairing code: one answering a message the user sent signed in, recently (`attendedTurn`). It may have
+ * read untrusted text (devenv_list itself marks the turn before it pairs): after a read the turn can only speak to the user
+ * (`AFTER_READ_TOOLS`), so the code reaches no one else, and it connects nothing until the user runs it on a machine of theirs.
+ */
+async function pairingTurn(q: Querier, claims: AssistantTokenClaims): Promise<{ userId: string }> {
+  const { userId } = await assertLiveRun(q, claims);
+  if (!(await turnMessage(q, claims.sid, claims.mid))) {
+    throw new ToolRefused("not_from_user", "only the user's own message can ask for a pairing code: a report cannot");
+  }
+  await attendedTurn(q, claims, { readUntrustedOk: true });
+  return { userId };
+}
+
+/**
  * `devenv_pair`: a one-time code for connecting a new machine, inside the one command line that uses it
  * (`remote-agents/pairing.ts`). Only in a turn that answers the user's own message: a report or an event never mints one.
  * The code is shown to the user alone, in their own chat, and connects nothing until they run the line on a machine, so it
@@ -1052,10 +1122,7 @@ export async function sendConfirmed(userId: string, confirmationId: string, para
 export async function devenvPair(claims: AssistantTokenClaims): Promise<Record<string, unknown>> {
   if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
   const q: Querier = (t, p) => db.query(t, p);
-  const { userId } = await assertLiveRun(q, claims);
-  if (!(await turnMessage(q, claims.sid, claims.mid))) {
-    throw new ToolRefused("not_from_user", "only the user's own message can ask for a pairing code: a report cannot");
-  }
+  const { userId } = await pairingTurn(q, claims);
   const server = (process.env.CLAW_PUBLIC_URL ?? "").trim().replace(/\/+$/, "");
   if (!server) throw new ToolRefused("pairing_unavailable", "pairing is not set up here (no public Claw address): tell the user to run claw-connector login on the machine");
   const { createPairing, pairCommand, PAIRING_TTL_MS, PairingRateLimited } = await import("../remote-agents/pairing.js");

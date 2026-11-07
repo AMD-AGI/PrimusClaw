@@ -29,6 +29,16 @@ export class FakeClaw {
   failPosts = 0;
   /** Answer the next N requests, whatever they are, with 503. */
   unavailable = 0;
+  /**
+   * Claw's identity service is down: every request is answered, in turn, 503 `authentication_service_unavailable` and
+   * 401 `invalid_api_key` (an API that could not ask SaFE about a key that is fine), as on 2026-11-07 09:50-10:15Z.
+   */
+  outage = false;
+  /** The answers an outage cycles through. */
+  outagePattern: Array<401 | 503> = [503, 401];
+  private outageN = 0;
+  /** Requests answered 401 during an outage. */
+  outageRefusals = 0;
   /** Refuse (name in `rejected`, as the real server does) every event of this type. */
   rejectType: string | null = null;
   /** Store the next N event posts but close the socket before answering (a lost acknowledgement). */
@@ -151,6 +161,11 @@ export class FakeClaw {
     const path = url.pathname.replace(/^\/claw-api/, "");
     this.requests.push({ method: req.method ?? "", path, auth: req.headers.authorization, client: req.headers["x-claw-client"] as string | undefined });
     if (this.unavailable > 0) { this.unavailable--; return this.json(res, 503, { ok: false, error: "unavailable" }); }
+    if (this.outage) {
+      if (this.outagePattern[this.outageN++ % this.outagePattern.length] === 503) return this.json(res, 503, { ok: false, error: "authentication_service_unavailable" });
+      this.outageRefusals++;
+      return this.json(res, 401, { ok: false, error: "invalid_api_key" });
+    }
     const token = (req.headers.authorization ?? "").replace(/^Bearer /, "");
     if (!this.tokens.has(token)) return this.json(res, 401, { ok: false, error: "unauthorized" });
     const rv = /^\/v1\/remote-agents\/connectors\/([^/]+)(\/revoke)?$/.exec(path);

@@ -140,7 +140,9 @@ test("SC4 a router turn cites with say, from the API's GitHub server when it has
   // router-cite-v4: a page fetched at an address the router knew is never a source (Brain keeps a fetch only at an address a lookup
   // or the user gave), so an official page it wants to cite is found with web_search beside the fetch.
   assert.match(on, /neither can one fetched at an address you knew yourself: to cite an official page you know \(a compatibility matrix, a release page\), search for it in the first step, beside fetching it, and cite it at the address the search gave/);
-  assert.equal(ROUTER_CITE_PROMPT_VERSION, "router-cite-v4");
+  // router-cite-v5 (parity R1): the release records the read rules name are citable where they were read, and Brain keeps them.
+  assert.match(on, /The one exception is https:\/\/dl\.k8s\.io\/release\/stable\.txt: read there, it is cited at that address/);
+  assert.equal(ROUTER_CITE_PROMPT_VERSION, "router-cite-v5");
   assert.doesNotMatch(on, /with the links for what came from the web/);
   assert.match(off, /with the links for what came from the web/);
   assert.doesNotMatch(off, /Citing what you looked up|sources\[0\]/);

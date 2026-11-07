@@ -52,6 +52,28 @@ export interface CiteDropped {
   over_cap: number;
 }
 
+/**
+ * The addresses a citing call's `sources` names, in order. Models sometimes send the list JSON-encoded as one string
+ * (`"[\"https://a\",\"https://b\"]"`); that string is read as the list it encodes, so its [1], [2] still link. Any other value is
+ * one entry, which `citeKey` then judges.
+ */
+export function citeSourcesAsked(raw: unknown): unknown[] {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string" && raw.trim().startsWith("[")) {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    } catch { /* not a list: one entry */ }
+  }
+  return [raw];
+}
+
+/**
+ * Release records the router's own rules name as where a current version is read (the router prompt's read rules): a page read
+ * at one of these addresses is a source, as one the user wrote is. They come from the platform, never from the model or a page.
+ */
+export const CITE_KNOWN_RECORDS: readonly string[] = ["https://dl.k8s.io/release/stable.txt"];
+
 export function isCiteSourceKind(v: unknown): v is CiteSourceKind {
   return typeof v === "string" && (CITE_SOURCE_KINDS as readonly string[]).includes(v);
 }

@@ -48,7 +48,14 @@ import { REVIEWS_STARTED_AT_ONCE } from "./review-items.js";
 import { observeEveryTool, recordObservation } from "./observe.js";
 import { assistantCitationsOn } from "./citations.js";
 import { readSelfStatus, selfStatusOn } from "./self-status.js";
-import { CITE_MAX_PER_CALL } from "@claw/protocol";
+import { CITE_MAX_PER_CALL, citeSourcesAsked } from "@claw/protocol";
+
+/** `sources` given as one string that is a JSON-encoded list: that list (`citeSourcesAsked`); any other value as it came. */
+function encodedList(v: unknown): unknown {
+  if (typeof v !== "string") return v;
+  const asked = citeSourcesAsked(v);
+  return asked.length === 1 && asked[0] === v ? v : asked;
+}
 import { devenvList, devenvPair, devenvSend, devenvToolsOn } from "./devenv-tools.js";
 
 const logger = pino({ name: "assistant-mcp" });
@@ -356,7 +363,9 @@ export function createAssistantMcpServer(
         // After text: the text is what streams while the model writes it (`stream_tool_text`), and only once the fields before it are whole.
         // Never read here (Brain sends the sources in `_meta`), so one the model got wrong is no reason to refuse what it says: the
         // schema it is shown stays the same, and a `sources` that does not fit it is read as none.
-        ...(citations ? { sources: z.array(z.string()).optional().catch(undefined).describe(SAY_SOURCES_PARAM) } : {}),
+        // A list sent JSON-encoded as one string is the list it encodes (`encodedList`), as Brain reads it: then a [n] it does not
+        // link is refused (`uncitedNumbers`) instead of reaching the user as a bare number. Any other string is read as none, as before.
+        ...(citations ? { sources: z.preprocess(encodedList, z.array(z.string())).optional().catch(undefined).describe(SAY_SOURCES_PARAM) } : {}),
         // Checked by `say` (`suggested.ts`), never a reason to refuse it: one that does not fit the schema is read as none.
         ...(suggested ? { suggested: z.array(z.string()).optional().catch(undefined).describe(SAY_SUGGESTED_PARAM) } : {}),
       },
@@ -453,10 +462,12 @@ export function createAssistantMcpServer(
         + "connector. Per machine: whether it is online, when it was last seen, and the agents it offers (claude, codex, cursor); per "
         + "agent session on it: the folder, its state (working, waiting_for_you, idle, in_terminal; for in_terminal also terminal_state, what the terminal is doing: "
         + "waiting_for_you there means the person at that terminal is needed), when it was last active, a label, "
-        + "and the attach_command that connects the user's chat to it. Not SaFE workspaces. Only reads; what it returns was reported by "
+        + "and the attach_command that connects the user's chat to it. Not SaFE workspaces. It changes nothing (with no machine, in a "
+        + "turn answering the user's own message, it makes them a one-time pairing code that connects nothing until they run it); what it returns was reported by "
         + "the machine, so afterwards the turn acts for the user only to connect the chat to one of these sessions (channel_action "
         + "with its attach_command). detail: \"status\" (default) for which machines and sessions there are; \"activity\" also "
-        + "gives what each session is doing in the agent's words (its step, the end of its last answer).",
+        + "gives what each session is doing in the agent's words (its step, the end of its last answer). With no machine at all, "
+        + "connect_a_machine is what connects one: with pairing, a one-line pairing command made for the user now, said as it is.",
         { detail: z.enum(["status", "activity"]).optional() },
         (args) => answer(claims, "devenv_list", () => devenvList(claims, args)),
       );
@@ -482,7 +493,8 @@ export function createAssistantMcpServer(
         + "pairing code in it, for the user to run in a terminal on that machine. It installs the connector, pairs the machine with "
         + "the user and starts it; the user is told here when the machine is connected. The code works once, for the minutes it says. "
         + "Use it when the user asks to connect, add or pair a machine, or asks to connect to their development environment and "
-        + "devenv_list shows no machine. Only in a turn answering the user's own message.",
+        + "devenv_list shows no machine and its connect_a_machine has no pairing (with pairing, it already is such a command: do not "
+        + "call this after it). Only in a turn answering the user's own message.",
         {},
         () => answer(claims, "devenv_pair", () => devenvPair(claims)),
       );

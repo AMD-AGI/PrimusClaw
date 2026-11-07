@@ -23,7 +23,7 @@ import { TranscriptTail, type AttachSupport, type TranscriptUpdate } from "./att
 import type { Audit } from "./audit.js";
 import { TerminalInput, actsAsCommand, cleanInput, modeVerdict, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
 import { createHash } from "node:crypto";
-import { AdapterProcess, type AcpParams, type AdapterHooks } from "./adapter.js";
+import { AdapterProcess, AuthenticateFailed, isAuthRequiredError, type AcpParams, type AdapterHooks } from "./adapter.js";
 import type { ChildRegistry } from "./children.js";
 import type { AgentConfig, ConnectorConfig } from "./config.js";
 import { claudeSessionMeta } from "./claude-mode.js";
@@ -704,22 +704,11 @@ export class Session {
    */
   private async signedIn(adapter: AdapterProcess, open: () => Promise<AcpParams>): Promise<AcpParams> {
     try {
-      return await open();
+      return await adapter.openSignedIn({ ...process.env, ...this.agent.env }, open, (method) => this.audit("agent_authenticate", { method }));
     } catch (e) {
-      const method = adapter.apiKeyMethod();
-      if (mapAdapterError(e).reason !== "agent_auth_required" || !method || !this.hasApiKey()) throw e;
-      this.audit("agent_authenticate", { method });
-      try { await adapter.request("authenticate", { methodId: method }); } catch (ae) {
-        throw new SessionRefusal("agent_auth_required", `authenticate ${method} failed: ${errMessage(ae)}`);
-      }
-      return await open();
+      if (e instanceof AuthenticateFailed) throw new SessionRefusal("agent_auth_required", e.message);
+      throw e;
     }
-  }
-
-  /** Whether the adapter's environment (the connector's, with the agent's `[agents.env]` over it) holds an OpenAI/Codex key. */
-  private hasApiKey(): boolean {
-    const env = { ...process.env, ...this.agent.env };
-    return ["CODEX_API_KEY", "OPENAI_API_KEY"].some((k) => typeof env[k] === "string" && env[k]!.trim() !== "");
   }
 
   /**
@@ -1308,10 +1297,7 @@ export class Session {
 
 function mapAdapterError(e: unknown): SessionRefusal {
   const message = errMessage(e);
-  if (/authentication required|auth_required|not logged in|login required/i.test(message) || (isObject(e) && (e as { code?: unknown }).code === -32000)) {
-    return new SessionRefusal("agent_auth_required", message);
-  }
-  return new SessionRefusal("adapter_error", message);
+  return new SessionRefusal(isAuthRequiredError(e) ? "agent_auth_required" : "adapter_error", message);
 }
 
 function str(v: unknown, max: number): string {

@@ -103,6 +103,9 @@ claw-connector service status
 
 This starts the connector now and keeps it up: at login and after a reboot, and again 5 seconds after it dies for any reason, except
 one that only you can fix (the connector was revoked, or Claw refused the sign-in), which leaves it stopped until you run `login` again.
+A revocation stops it at once. A refused sign-in stops it only after Claw has refused it four times in a row over two minutes
+while answering everything else: a 401 that comes while Claw or its sign-in service is failing (no answer, 5xx), or within ten
+minutes of such a failure, is not counted, and the connector keeps retrying until the outage ends.
 Only `claw-connector stop` (or stopping the service) stops it for good: a `kill` of the connector's process from anywhere else ends it
 with exit 75, and it is started again.
 It uses `systemd --user` on Linux and launchd on macOS. On Linux, run `loginctl enable-linger $USER` once (`service install` says so

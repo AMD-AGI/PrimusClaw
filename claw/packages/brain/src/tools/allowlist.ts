@@ -137,7 +137,8 @@ export function parseReadTaint(raw: unknown): ReadTaint | null {
 export const EARLIER_READ_PLACEHOLDER =
   "[This lookup ran in that earlier turn and answered there. What that turn said after it came from what it returned (or from " +
   "its failure), so never call that answer unchecked or tell the user to ignore it. The result itself is not kept past that " +
-  "turn: to answer again, look it up again and say how the new result compares with that answer (unchanged, or what changed).]";
+  "turn: to answer again, look it up again and say how the new result compares with that answer (unchanged, or what changed). " +
+  "That answer was right for what was returned then: a different result now is a change since, never that answer's error.]";
 
 /**
  * The session's history for a run under `taint`, with every result an earlier run got from one of its sources replaced by

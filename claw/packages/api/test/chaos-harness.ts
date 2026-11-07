@@ -112,8 +112,8 @@ export class Front {
 }
 
 /**
- * An OpenAI-compatible chat endpoint that streams its answer over `holdMs`, so a
- * run is mid-turn for that long. Counts calls, so a test can tell a turn that
+ * An OpenAI-compatible chat endpoint that streams its answer over `holdMs` (as it
+ * was when the call began), so a run is mid-turn for that long. Counts calls, so a test can tell a turn that
  * was resumed (two calls) from one that was never interrupted (one).
  */
 export class FakeModel {
@@ -138,13 +138,16 @@ export class FakeModel {
         return;
       }
       const n = ++this.calls;
+      // Read once per call: a test that shortens the next call (the one a resumed turn makes) must not hurry the call
+      // in flight to its end before the disruption it is about to cause.
+      const holdMs = this.holdMs;
       res.writeHead(200, { "content-type": "text/event-stream" });
       const chunk = (o: unknown) => res.write(`data: ${JSON.stringify(o)}\n\n`);
       const base = { id: `c${n}`, object: "chat.completion.chunk", model: j.model };
       chunk({ ...base, choices: [{ index: 0, delta: { role: "assistant", content: "" } }] });
       const steps = 10;
       for (let i = 0; i < steps; i++) {
-        await sleep(this.holdMs / steps);
+        await sleep(holdMs / steps);
         if (res.destroyed) return;
         chunk({ ...base, choices: [{ index: 0, delta: { content: `part${i} ` } }] });
       }
@@ -181,7 +184,7 @@ export interface Cluster {
   logs(): string;
 }
 
-export async function startCluster(opts: { natsServer: string; adminDbUrl: string }): Promise<Cluster> {
+export async function startCluster(opts: { natsServer: string; adminDbUrl: string; env?: NodeJS.ProcessEnv }): Promise<Cluster> {
   const dir = mkdtempSync(join(tmpdir(), "claw-chaos-"));
   const dbName = `claw_chaos_${randomBytes(4).toString("hex")}`;
   const admin = new pg.Client({ connectionString: opts.adminDbUrl });
@@ -226,6 +229,7 @@ export async function startCluster(opts: { natsServer: string; adminDbUrl: strin
     DOTENV_CONFIG_PATH: join(dir, "no-such.env"),
     // A deployment without the chart's preStop: the test plays that part.
     SHUTDOWN_DELAY_MS: "0",
+    ...opts.env,
   };
 
   const apis = new Map<string, { proc: Proc; port: number }>();

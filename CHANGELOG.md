@@ -101,6 +101,31 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- "连接我的开发环境" with no machine connected answers the one-line pairing command, every time. devenv_list with no machine, in a
+  router turn answering a message the user sent signed in, recently, makes the pairing itself and gives it in `connect_a_machine`
+  (`commands` the one line, `text` in the user's language with it in a code block, `pairing` its minutes). Any other turn (a report,
+  a message with a key, an old one), and where pairing is refused (no `CLAW_PUBLIC_URL`, too many codes), gets the four setup
+  commands; `devenv_pair` now refuses the same turns (`not_attended`, `attendance_expired`). Before, the list always carried the four
+  setup commands and the router copied them in 5 of 7 fresh sessions instead of calling devenv_pair. Router prompt router-devenv-v9.
+- An assistant whose new lookup differs from its earlier answer says what changed since, not that the earlier answer was its mistake
+  (`router-read-v12`, and the placeholder that stands for an earlier turn's result): a pull request merged between two asks was
+  told as "上次我多算了 1 个，抱歉".
+- A long run taken over by another brain near its end (a Brain rolling update in the middle of it) is announced as a long run again:
+  its `run.completed` was measured from the claim that resumed it, which clears and restamps `started_at`, so a 70-second run
+  resumed three seconds before its end ran "three seconds" and no notification was recorded (release claw-rel-1917, 2026-11-07).
+  A run is now measured across every claim from its run-time anchor, less the time it spent queued.
+- A run's `run.completed` / `run.failed` is no longer lost when the outbox write fails at the run's end (an API drain closing
+  the database pool under it): the completion was stamped processed regardless, so its redelivery acked and the notification was
+  never recorded. What it still owes is now stored with the processed stamp, and the event is redelivered until the notification
+  is recorded -- once, by its run-derived key -- without running the rest of the completion again.
+- A connector no longer stops for good (exit 78, `needs-login.json`, offline until someone runs `login`) because Claw's sign-in
+  service was down. On 2026-11-07 09:50-10:15Z, while SaFE was failing, Claw answered a mix of no answer, 503
+  `authentication_service_unavailable` and 401 `invalid_api_key` for a key that was fine, and the connector took four 401s as a
+  deleted key. A 401 or 403 that comes while Claw is failing (no answer, 5xx, 429), or within ten minutes of it, or that is not
+  Claw's own answer (no JSON error: a gateway's page), is no longer counted and the connector keeps retrying; the same rule now
+  applies at start, so a supervisor restart into an outage is not ended by its first 401. A revocation still stops it at once.
+- The API answers 503 `authentication_service_unavailable`, not 401 `invalid_api_key` (or `invalid_cookie`), when SaFE answers
+  a key or cookie check with a 5xx or with a 2xx that is not an answer, and no longer remembers the latter as a refusal for 30 s.
 - A fresh connector install trusts the CAs the machine trusts: a Claw behind a company CA no longer fails `doctor`, `login`, `pair`
   and `run` until `NODE_USE_SYSTEM_CA=1` is set. On Node.js 22.19+ / 24.5+ the connector adds the system store to Node's own list
   (and `NODE_EXTRA_CA_CERTS`) before its first connection and passes `NODE_USE_SYSTEM_CA=1` to the programs it starts;
@@ -114,6 +139,13 @@ record it.
   by side, so a lookup followed by an answer read as an answer written beside (before) the lookup. History now replays each call, then
   its result, then the turn's text, in the order they ran. The router's answer about what it can do no longer labels any part of
   itself read-only (只读) (`router-read-v11`).
+- Asking the assistant how many nodes SaFE has no longer answers 0 for members who are not administrators. SaFE answers their
+  `node_list` without a workspace with an empty list (200, `totalCount: 0`) rather than a 403, so the answer read "no nodes" while
+  the workspaces they use have several. Brain now reads such an empty answer again per workspace of `user_self`, as it already does
+  for the 403 of `workload_list`, and says which workspaces the count covers; `limit: -1` still returns every node.
+- The brief's SaFE section works for members who are not administrators. SaFE refuses them a workload list across workspaces
+  (403), so every such brief said "SaFE 没有回答：safe_http_403". After a 403 the brief now lists the user's own workspaces and reads
+  each one (at most 20); a workspace that refuses is left out, and SaFE is unreadable only when every one refuses.
 - A machine paired from the chat (`claw-connector pair`) and then disconnected is told, wherever the connector says what to do next
   (the revocation itself, `run` started again by the service or by hand, the supervisor's log line, `status`, `service status`,
   `doctor`'s fix, a sign-in refused at start), to ask the
@@ -878,6 +910,11 @@ record it.
 - `@primusclaw/connector` 0.1.7: `claw-connector pair <code> --server <url>` signs a machine in with a one-time code from the chat
   (#421); setup no longer touches a network mount that may hang, the npm install of the adapters runs without the agents' keys,
   and a session that never received a message survives a connector restart (#435). (0.1.6, as published, also carried #430 and #425.)
+- `@primusclaw/connector` 0.1.8: `init` asks before writing Claude hooks and a stalled state directory no longer stops the heartbeat
+  (#401); a paired machine that was disconnected is told to pair again (#437); a conversation open in a terminal can be taken over
+  once the person confirms (#423, connector part); a fresh install trusts the machine's CA store without `NODE_USE_SYSTEM_CA` (#443);
+  every command answers `-h`/`--help` and an unknown option exits 2 (#440); a crash that damages `connector.json` no longer
+  registers the machine as a new connector (#446).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,

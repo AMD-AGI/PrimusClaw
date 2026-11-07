@@ -82,6 +82,12 @@ export interface ConnectorTiming extends SessionTiming {
   /** ...and only once the refusals have gone on this long, so a burst (a gateway or identity-service hiccup) never ends a run. */
   authFailWindowMs: number;
   /**
+   * A refusal that comes within this long of Claw failing in a way that passes by itself (no answer, 5xx, 429) is not
+   * counted toward `authFailLimit`: while Claw or the identity service behind it is down, a 401 says nothing about the
+   * credential (an API that could not ask SaFE has answered 401 for a key that was fine). The run keeps retrying instead.
+   */
+  authOutageQuietMs: number;
+  /**
    * Claw refused to register one more connector for this person (409 `connector_limit_reached`): tried again this
    * often, not every few seconds by a supervisor, until a machine they no longer use is removed.
    */
@@ -108,6 +114,7 @@ export const DEFAULT_TIMING: ConnectorTiming = {
   recentWriteMs: 10_000,
   authFailLimit: 4,
   authFailWindowMs: 120_000,
+  authOutageQuietMs: 10 * 60_000,
   healthMs: RECHECK_MS,
   healthMinGapMs: 5_000,
   limitRetryMs: 10 * 60_000,
@@ -195,6 +202,12 @@ export type RunResult = "stopped" | "revoked" | "auth_failed";
 /** Claw answered, and refused the credential itself (not a revocation of the row, which is {@link RevokedError}). */
 export const isAuthRefusal = (e: unknown): boolean => e instanceof HttpError && (e.status === 401 || e.status === 403);
 
+/**
+ * A refusal Claw itself said in so many words: its JSON body names an error. A 401 or 403 with no such body came from
+ * something in front of Claw (a gateway, a proxy's page) and says nothing about the credential.
+ */
+export const isDefinitiveRefusal = (e: unknown): boolean => isAuthRefusal(e) && !/^http_\d+$/.test((e as HttpError).code);
+
 /** Failures that pass by themselves: no connection, a provider that is down or busy. */
 export function isTransient(e: unknown): boolean {
   return e instanceof TransientAuthError || e instanceof TransportError || (e instanceof HttpError && (e.status >= 500 || e.status === 429));
@@ -218,6 +231,8 @@ export class Connector {
   private authFailures = 0;
   private authFirstAt = 0;
   private authWhy = "";
+  /** When Claw last failed in a way that passes (see {@link ConnectorTiming.authOutageQuietMs}); 0: not in this run. */
+  private outageAt = 0;
   /** The last event on the command stream, to tell why the server ended it (`superseded`, `token_expired`, a release). */
   private lastFrame = "";
   private wakeSender: (() => void) | null = null;
@@ -401,10 +416,11 @@ export class Connector {
   /**
    * Identify to Claw and send the first heartbeat, trying again (with the usual backoff) while the failure is
    * the kind that passes: no network yet (a laptop that woke before Wi-Fi), the identity service or Claw
-   * answering 5xx or 429. Anything else (a refused credential, a missing scope) is a problem a retry will not
-   * fix and ends the run with its message.
+   * answering 5xx or 429. A refused credential (401 that is not `revoked`, 403) is judged as it is later in the run
+   * ({@link Connector.authRefused}): it ends the run as `auth_failed` only after a run of refusals from a Claw that is
+   * otherwise answering. Anything else is a problem a retry will not fix and ends the run with its message.
    */
-  private async startup(): Promise<"ok" | "stopped" | "revoked"> {
+  private async startup(): Promise<"ok" | "stopped" | "revoked" | "auth_failed"> {
     let atLimit = false;
     for (let attempt = 0; !this.ctl.signal.aborted; attempt++) {
       try {
@@ -427,8 +443,15 @@ export class Connector {
           while (!this.ctl.signal.aborted && fs.existsSync(pauseFile(this.d.dirs))) await sleep(this.timing.pausePollMs, this.ctl.signal);
           continue;
         }
-        if (!isTransient(e)) throw e;
-        this.d.log.warn("cannot reach Claw yet; will retry", { error: errMessage(e), attempt });
+        // A refused credential at start is judged as it is later: by a run of refusals from a Claw that answers, not by
+        // one 401 from a Claw whose identity service is down (a supervisor restarts the run straight into an outage).
+        if (isAuthRefusal(e)) {
+          if (await this.authRefused(e)) return "auth_failed";
+        } else if (!isTransient(e)) throw e;
+        else {
+          this.noteOutage(e);
+          this.d.log.warn("cannot reach Claw yet; will retry", { error: errMessage(e), attempt });
+        }
         await sleep(backoffMs(attempt, this.timing.backoffMinMs, this.timing.backoffMaxMs), this.ctl.signal);
       }
     }
@@ -460,10 +483,29 @@ export class Connector {
     await this.manager.killAll("revoked");
   }
 
-  /** One more refusal of the credential; the run ends once `authFailLimit` come in a row. Returns whether it ended. */
+  /**
+   * Claw, or the identity service behind it, failed in a way that passes by itself (no answer, 5xx, 429): a refusal
+   * soon after it is not held against the credential. A command stream that broke after Claw had answered is not that.
+   */
+  private noteOutage(e: unknown): void {
+    if (isTransient(e) && !(e instanceof TransportError && e.afterAnswer)) this.outageAt = Date.now();
+  }
+
+  /**
+   * One more refusal of the credential; the run ends once `authFailLimit` come in a row. Returns whether it ended.
+   * A refusal that is not Claw's own word, or that comes while Claw or its identity service is failing (an outage seen
+   * within `authOutageQuietMs`), is not counted, and starts the count again: only a run of refusals from a Claw that is
+   * otherwise answering means the credential is gone.
+   */
   private async authRefused(e: unknown): Promise<boolean> {
-    if (this.authFailures++ === 0) this.authFirstAt = Date.now();
     if (this.authFailed) return true;
+    const outage = this.outageAt > 0 && Date.now() - this.outageAt < this.timing.authOutageQuietMs;
+    if (outage || !isDefinitiveRefusal(e)) {
+      this.authFailures = 0;
+      this.d.log.warn(outage ? "Claw refused the sign-in while it was failing; not counted, will retry" : "a refusal that did not come from Claw; not counted, will retry", { error: errMessage(e) });
+      return false;
+    }
+    if (this.authFailures++ === 0) this.authFirstAt = Date.now();
     if (this.authFailures < this.timing.authFailLimit || Date.now() - this.authFirstAt < this.timing.authFailWindowMs) return false;
     this.authFailed = true;
     this.authWhy = errMessage(e);
@@ -587,6 +629,7 @@ export class Connector {
         failures = 0;
       } catch (e) {
         if (this.isRevocation(e)) return void (await this.onRevoked(e));
+        this.noteOutage(e);
         failures++;
         this.d.log.warn("posting events failed; will retry", { error: errMessage(e), pending: this.outbox.size });
         await sleep(backoffMs(failures - 1, this.timing.backoffMinMs, this.timing.backoffMaxMs), this.ctl.signal);
@@ -624,6 +667,7 @@ export class Connector {
         this.writeIdentity();
       } catch (e) {
         if (this.isRevocation(e)) return void (await this.onRevoked(e));
+        this.noteOutage(e);
         if (isAuthRefusal(e) && await this.authRefused(e)) return;
         this.d.log.warn("heartbeat failed", { error: errMessage(e) });
       }
@@ -701,6 +745,7 @@ export class Connector {
       } catch (e) {
         if (this.isRevocation(e)) return void (await this.onRevoked(e));
         if (this.ctl.signal.aborted) break;
+        this.noteOutage(e);
         if (isAuthRefusal(e) && await this.authRefused(e)) return;
         void recordDisconnect(this.d.dirs, { reason: "stream_lost", detail: errMessage(e) });
         if (e instanceof HttpError && e.status === 404) {

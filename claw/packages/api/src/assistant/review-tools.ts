@@ -48,7 +48,7 @@ import {
   reviewItemsEnabled, REVIEWS_STARTED_AT_ONCE, startReviews,
 } from "./review-items.js";
 import type { AssistantTokenClaims } from "./token.js";
-import { attendedTurn, ToolRefused } from "./tools.js";
+import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
 import { attachRefOf, ownAttachRef } from "./devenv-tools.js";
 import { resolveWorkItemNow } from "./work-items.js";
 import { modelChoiceOn } from "./model-choice.js";
@@ -555,6 +555,26 @@ function refuseWhichReviewer(code: string, text: string, people: readonly Channe
   { candidates });
 }
 
+/**
+ * The refusals for a turn that cannot act for the person (their message came with a key, or is too old): a merged pull request the
+ * message names is said before them too, since saying it acts for nobody.
+ */
+const CANNOT_ACT: ReadonlySet<string> = new Set(["not_attended", "attendance_expired"]);
+
+/**
+ * Who asked, when this turn answers a message of theirs that names every one of `prs` (number and repository), else null: a worker's
+ * report answers no message, and a pull request the message does not name is never looked up.
+ */
+async function askerNaming(claims: AssistantTokenClaims, prs: readonly PrRef[]): Promise<string | null> {
+  return inTransaction(async (q) => {
+    const { userId } = await assertLiveRun(q, claims);
+    const message = await turnMessage(q, claims.sid, claims.mid);
+    if (!message) return null;
+    const recent = await recentReviewRepos(q, userId);
+    return prs.every((pr) => prGrounded(message.content, pr) && repoGrounded(message.content, pr, message.context.repos, recent)) ? userId : null;
+  });
+}
+
 /** The refusals that ask the person which reviewer they meant: a merged pull request is said before any of them. */
 const ASKS_WHICH_REVIEWER: ReadonlySet<string> = new Set(["reviewer_not_named", "reviewer_not_in_message", "reviewer_not_linked"]);
 
@@ -627,6 +647,10 @@ export async function reviewStart(
     return refuseWhichReviewer(person ? "reviewer_not_named" : "reviewer_not_in_message", message.content, people, userId);
   }).catch(async (err: unknown) => {
     if (grounded && err instanceof ToolRefused && ASKS_WHICH_REVIEWER.has(err.code)) await refuseMerged(grounded, claims.sid, prs);
+    if (err instanceof ToolRefused && CANNOT_ACT.has(err.code)) {
+      const asker = await askerNaming(claims, prs).catch(() => null);
+      if (asker) await refuseMerged(asker, claims.sid, prs);
+    }
     throw err;
   });
   // Sent again (Brain resends a call whose answer was lost, `idempotentHint`): what the first call started is the answer, even when it
