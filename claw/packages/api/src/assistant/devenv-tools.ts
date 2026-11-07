@@ -1139,7 +1139,8 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
  * The `devenv_send` cards of `owner` still waiting that would send to `connectorId`, closed: the machine was revoked (removed from
  * their development environments), so pressing one could only fail, and the router must not keep putting it to them. Closed as
  * `expired`, never answered (`decided_via` says why; `result.error` is the word a press now gets, `no_machine`), in the caller's
- * transaction (`revokeConnector`). Returns the ids closed.
+ * transaction (`revokeConnector`). `result.voided_reason` and `result.machine` say why and which machine, so the router can tell the
+ * person what became of the card (`renderScheduleState`) instead of guessing whether it was pressed. Returns the ids closed.
  *
  * `replaced`: the row was revoked because the same machine registered again (`registerConnector`), not removed. A card for a new
  * session on that machine stays: pressed, it follows the machine's new registration (`executeSend`). Only a card that continues a
@@ -1157,9 +1158,11 @@ export async function closeCardsOfConnector(
   const closed = await q(
     `UPDATE claw_assistant_confirmations
         SET status = 'expired', decided_via = 'connector_revoked', decided_at = NOW(),
-            result = CASE WHEN $3 THEN jsonb_build_object('error', 'machine_reconnected', 'message',
+            result = CASE WHEN $3 THEN jsonb_build_object('error', 'machine_reconnected', 'voided_reason', 'machine_reconnected',
+                                 'machine', params->>'machine', 'message',
                                  'that machine was set up again and the session this card continued went with its old registration: nothing was sent')
-                          ELSE jsonb_build_object('error', 'no_machine', 'message', 'that machine was removed before the card was answered: nothing was sent') END
+                          ELSE jsonb_build_object('error', 'no_machine', 'voided_reason', 'connector_revoked', 'machine', params->>'machine',
+                                 'message', 'that machine was removed before the card was answered: nothing was sent') END
       WHERE confirmation_id IN (
               SELECT confirmation_id FROM claw_assistant_confirmations
                WHERE user_id = $1 AND kind = 'devenv_send' AND status = 'pending' AND params->>'connector_id' = $2

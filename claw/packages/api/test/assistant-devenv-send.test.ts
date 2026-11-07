@@ -46,7 +46,9 @@
  *       a card proposed while the machine is being revoked is refused (no_machine), never left waiting; a revoke never waits for a card
  *       that is being pressed (the press holds the card while its send waits for the machine: a cycle Postgres cannot see); a machine
  *       whose offline row is replaced by registering again under its name closes only the cards that continue one of its sessions
- *       (`machine_reconnected`); a card for a new session waits and, pressed, follows the new registration
+ *       (`machine_reconnected`); a card for a new session waits and, pressed, follows the new registration; a closed card records
+ *       why (`voided_reason`) and which machine, and the router is shown it as void for a day (leave it out of what waits; asked,
+ *       one line: the machine went, nothing was sent), never as waiting and never left to guess whether it was pressed
  *   F20 an agent that only takes over existing conversations (kind attach) is never chosen for a new session, which its connector would
  *       refuse: with another agent there, that one; alone, a question listing its conversations, else no_agent saying why
  *   F21 at the limit of open sessions a new one closes the longest unused idle session of the user's (never one working, waiting for
@@ -625,11 +627,29 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal(r.status, 200, await r.text());
     const card = (await w.q("SELECT * FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toLaptop.confirmation_id]))[0];
     assert.deepEqual([card.status, card.decided_via, card.result?.error], ["expired", "connector_revoked", "no_machine"]);
+    // The closing record says why and which machine, so the router can say what became of the card.
+    assert.deepEqual([card.result?.voided_reason, card.result?.machine], ["connector_revoked", "laptop"]);
     assert.deepEqual((await schedules.pendingConfirmations("alice")).map((c) => c.confirmation_id), [toDesktop.confirmation_id],
       "the other machine's card still waits");
     const state = await schedules.renderScheduleState("alice");
-    assert.doesNotMatch(state, /on the machine "laptop"/, "the router is not told of the revoked machine's card");
-    assert.match(state, /on the machine "desktop"/);
+    const [waitingPart, voidedPart = ""] = state.split("Instruction cards no longer waiting");
+    assert.doesNotMatch(waitingPart, /on the machine "laptop"/, "the router is not told the revoked machine's card waits");
+    assert.match(waitingPart, /on the machine "desktop"/);
+    // It is told the card is void, and why: never left to guess whether it was pressed (S4 retest, 2026-11-07).
+    const laptopRef = prompts.confirmationRef(String(toLaptop.confirmation_id));
+    const voidedLine = voidedPart.split("\n").find((l) => l.startsWith(`- ref #${laptopRef} `));
+    assert.ok(voidedLine, voidedPart);
+    assert.match(voidedLine, /on the machine "laptop": "跑 make test"/);
+    assert.match(voidedLine, /voided_reason: connector_revoked \(the machine "laptop" was revoked/);
+    assert.match(voidedLine, /never pressed: nothing was sent/);
+    assert.match(voidedPart, /asked what waits for them, leave these out\. Do not bring one up on your own\./);
+    assert.match(voidedPart, /never say you cannot tell whether it was pressed or lapsed/);
+    assert.doesNotMatch(voidedPart, new RegExp(`批准 #${laptopRef}`), "a void card is never put to them to approve");
+    assert.equal((await schedules.renderScheduleState("bob")), "", "another user is shown nothing of alice's void card");
+    // A day on, it is no longer shown at all.
+    await w.q("UPDATE claw_assistant_confirmations SET decided_at = NOW() - INTERVAL '25 hours' WHERE confirmation_id = $1", [toLaptop.confirmation_id]);
+    assert.doesNotMatch(await schedules.renderScheduleState("alice"), /Instruction cards no longer waiting/);
+    await w.q("UPDATE claw_assistant_confirmations SET decided_at = NOW() WHERE confirmation_id = $1", [toLaptop.confirmation_id]);
 
     // Pressed afterwards: answered before (closed), nothing sent; the card stays as it was closed.
     const pressed = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(toLaptop.confirmation_id), decision: "allow", via: "button" });
@@ -663,6 +683,9 @@ describe("development environment items and devenv_send", { skip }, () => {
     // The session it continued went with the old registration: that card closes, and says why.
     const gone = await card(toSession.confirmation_id);
     assert.deepEqual([gone.status, gone.decided_via, gone.result?.error], ["expired", "connector_revoked", "machine_reconnected"]);
+    assert.deepEqual([gone.result?.voided_reason, gone.result?.machine], ["machine_reconnected", "laptop"]);
+    assert.match(await schedules.renderScheduleState("alice"),
+      new RegExp(`- ref #${prompts.confirmationRef(String(toSession.confirmation_id))} .*voided_reason: machine_reconnected \\(the machine "laptop" was set up again`));
     // A new session on that machine is still what the user asked for: that card waits, and, pressed once the machine is back, goes to it.
     assert.deepEqual((await schedules.pendingConfirmations("alice")).map((c) => c.confirmation_id).sort(),
       [toLaptop.confirmation_id, toDesktop.confirmation_id].sort());
