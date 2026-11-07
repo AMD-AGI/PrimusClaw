@@ -435,7 +435,7 @@ directory: `session_live_elsewhere`), belongs to another user (`takeover_not_per
 process that holds it, inside this agent's roots (`takeover_failed`: Claude Code's own `claude agents --json` lists it, or
 its registry row names this machine and the same process start time, and its working directory is inside the roots), or
 is still there after 15 seconds (`terminal_did_not_exit`; it is never killed harder). Without `takeover` the conversation is only watched, as above.
-An attach agent reports `takeover: true` in its capabilities so that a client knows it can offer this. Afterwards the
+A takeover is acted on only while the confirmation is fresh: Claw sends `takeover_until` (the live-command TTL, 5 minutes, from when it was confirmed) and drops an uncollected one after that; one that reaches the connector later, or names no deadline, is refused (`takeover_expired`) and ends nothing. An attach agent reports `takeover: true` in its capabilities so that a client knows it can offer this. Afterwards the
 terminal continues the same conversation with `claude --resume <id>` once the phone session is closed.
 
 The ask mode still applies: a conversation keeps the mode it was left in, often one that never asks (`bypassPermissions`),

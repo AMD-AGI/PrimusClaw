@@ -471,7 +471,10 @@ export class AttachSupport {
         return { ok: false, reason: code === "EPERM" ? "takeover_not_permitted" : "takeover_failed", detail: `process ${pid}: ${errMessage(e)}` };
       }
     }
-    const deadline = this.now() + o.waitMs;
+    // `waitMs` is for the processes to exit; the quiet the transcript then needs (`recentWriteMs`) is waited on top of it, so a
+    // terminal that is slow to exit is not refused as `recently_written` once it has.
+    const exitBy = this.now() + o.waitMs;
+    let quietBy: number | null = null;
     // Gone, and the transcript quiet: the terminal may write its last lines on the way out.
     for (;;) {
       const left = pids.filter((pid) => isAlive(pid) && !isZombie(pid));
@@ -479,10 +482,12 @@ export class AttachSupport {
       let age = Infinity;
       try { if (file) age = this.now() - fs.statSync(file).mtimeMs; } catch { /* no transcript to look at */ }
       if (!left.length && age >= this.d.recentWriteMs) break;
-      if (this.now() >= deadline) {
-        return left.length
-          ? { ok: false, reason: "terminal_did_not_exit", detail: `process ${left.join(", ")} did not exit within ${Math.round(o.waitMs / 1000)} s` }
-          : { ok: false, reason: "recently_written", detail: "its transcript is still being written" };
+      if (left.length && this.now() >= exitBy) {
+        return { ok: false, reason: "terminal_did_not_exit", detail: `process ${left.join(", ")} did not exit within ${Math.round(o.waitMs / 1000)} s` };
+      }
+      if (!left.length) {
+        quietBy ??= this.now() + this.d.recentWriteMs + 2_000;
+        if (this.now() >= quietBy) return { ok: false, reason: "recently_written", detail: "its transcript is still being written" };
       }
       await pause(250);
     }

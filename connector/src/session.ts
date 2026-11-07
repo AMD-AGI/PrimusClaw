@@ -53,7 +53,7 @@ export interface SessionTiming {
   rootCheckMs: number;
   /** How long a new session waits for an adapter that reports its sign-in to say which one it is. */
   authWaitMs: number;
-  /** How long a takeover waits for the terminal it ended to exit and for the transcript to go quiet. */
+  /** How long a takeover waits for the terminal it ended to exit (the transcript's quiet, `recentWriteMs`, is waited on top). */
   takeoverWaitMs: number;
 }
 

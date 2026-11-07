@@ -67,6 +67,7 @@ const HINTS: Record<string, string> = {
   terminal_did_not_exit: "the terminal that has that conversation open did not exit when asked: exit it there (/exit), then take it over again",
   session_live_elsewhere: "that conversation is open on another machine or container sharing this Claude config directory: exit it there, then try again",
   takeover_not_permitted: "the terminal that has that conversation open belongs to another user: exit it there, then try again",
+  takeover_expired: "the confirmation to take that conversation over reached the machine too late: open it again and confirm again",
   takeover_failed: "the connector could not end the terminal that has that conversation open: exit it there (/exit), then try again",
   twin_check_failed: "the connector could not check whether a terminal holds that conversation open: try again in a moment",
   too_many_queued_prompts: "five messages are already waiting for this session: wait for the agent to finish one",

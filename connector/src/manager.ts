@@ -194,11 +194,15 @@ export class SessionManager {
       const asked = await this.where(cmd.cwd, agent);
       if (!asked.ok) return refuse(asked.reason, { cwd: String(cmd.cwd).slice(0, 300) });
       if (asked.real !== found.item.cwd) return refuse("cwd_mismatch", { cwd: String(cmd.cwd).slice(0, 300) });
+      // A takeover is acted on only while the person's confirmation is fresh (Claw sets `takeover_until` to the live-command
+      // TTL); a late one, or one without a deadline, would end a terminal the person may be using by now.
+      const takeover = cmd.takeover === true;
+      if (takeover && !(typeof cmd.takeover_until === "number" && Date.now() <= cmd.takeover_until)) return refuse("takeover_expired");
       // Registered before anything is awaited, so from here the session itself is the claim.
       const s = new Session(sid, agent, found.item.cwd, this.env, found.item.ref);
       this.sessions.set(sid, s);
       this.attaching.delete(claim);
-      await s.attach(typeof cmd.mode === "string" ? cmd.mode : null, found.item.title, cmd.takeover === true);
+      await s.attach(typeof cmd.mode === "string" ? cmd.mode : null, found.item.title, takeover);
     } finally {
       this.attaching.delete(claim);
     }

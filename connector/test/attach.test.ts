@@ -467,6 +467,8 @@ async function attachHarness(o: { live?: Array<Record<string, unknown>>; cliMode
   return h;
 }
 
+/** What Claw sends with a takeover the person has just confirmed: the flag and until when the confirmation holds. */
+const fresh = () => ({ takeover: true, takeover_until: Date.now() + 5 * 60_000 });
 const closedReason = (h: Harness, sid: string) => h.claw.eventsOf(sid, "session_closed")[0]?.data.reason;
 const adapterMethods = (h: Harness) => h.adapterLog().map((l) => l.method).filter(Boolean);
 
@@ -627,7 +629,7 @@ describe("attach end to end", () => {
     await h.claw.until("the watch to close", () => closedReason(h, watched) !== undefined);
 
     const exited = new Promise<number | null>((r) => term.once("exit", (code) => r(code)));
-    const sid = await h.attach(REF, h.work, { takeover: true });
+    const sid = await h.attach(REF, h.work, fresh());
     assert.equal(closedReason(h, sid), undefined, `taken over, not refused (${closedReason(h, sid)})`);
     const started = h.claw.eventsOf(sid, "session_started")[0]!.data;
     assert.deepEqual([started.read_only, started.took_over, started.acp_session_id], [undefined, true, REF]);
@@ -644,10 +646,26 @@ describe("attach end to end", () => {
   test("a holder proven by its registry row (this machine's pid domain, the same process start) is ended too, without the command's word", async () => {
     const h = await attachHarness({ live: [], cliMode: "fail", timing: { recentWriteMs: 100, takeoverWaitMs: 5_000, spectateMs: 20, spectateCheckMs: 60_000 } });
     const term = openTerminal(h.attachDir, REF, h.work);
-    const sid = await h.attach(REF, h.work, { takeover: true });
+    const sid = await h.attach(REF, h.work, fresh());
     assert.equal(closedReason(h, sid), undefined, `taken over (${closedReason(h, sid)})`);
     assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.took_over, true);
     assert.ok(!(await import("../src/children.js")).isAlive(term.pid), "the terminal's process was ended");
+  });
+
+  test("a takeover that reaches the machine after its confirmation lapsed, or names no deadline, ends nothing and resumes nothing", async () => {
+    for (const [label, extra] of [["late", { takeover: true, takeover_until: Date.now() - 1 }], ["no deadline", { takeover: true }]] as const) {
+      const h = await attachHarness({ timing: { recentWriteMs: 100, takeoverWaitMs: 2_000 } });
+      const term = sleeper({ cwd: h.work });
+      await new Promise((r) => setTimeout(r, 200));
+      h.setLive([{ pid: term.pid, sessionId: REF, status: "busy" }]);
+      const sid = await h.attach(REF, h.work, extra);
+      await h.claw.until("refused", () => closedReason(h, sid) !== undefined);
+      assert.equal(closedReason(h, sid), "takeover_expired", label);
+      await new Promise((r) => setTimeout(r, 200));
+      assert.deepEqual([term.exitCode, term.signalCode], [null, null], `${label}: the terminal is untouched`);
+      assert.ok(!adapterMethods(h).includes("session/resume"), label);
+      assert.equal(h.claw.eventsOf(sid, "session_started").length, 0, `${label}: not even watched`);
+    }
   });
 
   test("a takeover is refused, and nothing is resumed, when the terminal cannot be ended", async () => {
@@ -655,7 +673,7 @@ describe("attach end to end", () => {
     const far = await attachHarness({ live: [], timing: { recentWriteMs: 100, takeoverWaitMs: 2_000 } });
     fs.mkdirSync(path.join(far.attachDir, "sessions"), { recursive: true });
     fs.writeFileSync(path.join(far.attachDir, "sessions", "424242.json"), JSON.stringify({ pid: 424242, sessionId: REF, status: "busy", kind: "interactive", pidDomain: "another-host:0" }));
-    const sid1 = await far.attach(REF, far.work, { takeover: true });
+    const sid1 = await far.attach(REF, far.work, fresh());
     await far.claw.until("refused", () => closedReason(far, sid1) !== undefined);
     assert.equal(closedReason(far, sid1), "session_live_elsewhere");
     assert.ok(!adapterMethods(far).includes("session/resume"));
@@ -665,7 +683,7 @@ describe("attach end to end", () => {
     const bystander = sleeper();
     fs.mkdirSync(path.join(unproven.attachDir, "sessions"), { recursive: true });
     fs.writeFileSync(path.join(unproven.attachDir, "sessions", `${bystander.pid}.json`), JSON.stringify({ pid: bystander.pid, sessionId: REF, status: "busy", kind: "interactive" }));
-    const sid0 = await unproven.attach(REF, unproven.work, { takeover: true });
+    const sid0 = await unproven.attach(REF, unproven.work, fresh());
     await unproven.claw.until("refused", () => closedReason(unproven, sid0) !== undefined);
     assert.equal(closedReason(unproven, sid0), "takeover_failed");
     await new Promise((r) => setTimeout(r, 300));
@@ -676,7 +694,7 @@ describe("attach end to end", () => {
     // A proven holder whose working directory is outside the agent's roots is not this agent's to end.
     const outside = await attachHarness({ live: [], cliMode: "fail", timing: { recentWriteMs: 100, takeoverWaitMs: 2_000 } });
     const far2 = openTerminal(outside.attachDir, REF, os.tmpdir());
-    const sid3 = await outside.attach(REF, outside.work, { takeover: true });
+    const sid3 = await outside.attach(REF, outside.work, fresh());
     await outside.claw.until("refused", () => closedReason(outside, sid3) !== undefined);
     assert.equal(closedReason(outside, sid3), "takeover_failed");
     assert.ok((await import("../src/children.js")).isAlive(far2.pid), "a process outside the roots is never signalled");
@@ -688,7 +706,7 @@ describe("attach end to end", () => {
     children.push(term);
     await new Promise((r) => setTimeout(r, 300));
     stubborn.setLive([{ pid: term.pid, sessionId: REF, status: "busy" }]);
-    const sid2 = await stubborn.attach(REF, stubborn.work, { takeover: true });
+    const sid2 = await stubborn.attach(REF, stubborn.work, fresh());
     await stubborn.claw.until("refused", () => closedReason(stubborn, sid2) !== undefined);
     assert.equal(closedReason(stubborn, sid2), "terminal_did_not_exit");
     assert.equal(term.exitCode, null, "still running: only asked, never killed");
