@@ -130,6 +130,9 @@ export class SessionManager {
       case "cancel":
         await s.cancel();
         return false;
+      case "withdraw":
+        s.withdraw();
+        return false;
       case "set_mode":
         if (typeof cmd.mode_id !== "string") s.rejectCommand("set_mode", cmdId, "mode_id_required");
         else await s.setMode(cmd.mode_id, cmdId);

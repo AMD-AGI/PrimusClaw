@@ -572,6 +572,35 @@ describe("permissions", () => {
     assert.ok(refused[0]!.seq < end.seq);
     assert.equal(h.turnEnds(sid).length, 1);
   });
+  test("withdraw takes back the prompts queued behind a running turn, refusing each by name, and leaves the turn running", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    h.prompt(sid, "hang", { cmd_id: "p-hang" });
+    const later = h.prompt(sid, "say later", { cmd_id: "p-later" });
+    await h.claw.until("the turn to be running", () => h.adapterLog().some((l) => l.prompt === "hang"));
+    h.claw.issue("withdraw", sid, { cmd_id: "w-1" });
+    await h.claw.until("the queued prompt to be refused", () => h.claw.eventsOf(sid, "command_rejected").length > 0);
+    const refused = h.claw.eventsOf(sid, "command_rejected");
+    assert.deepEqual(refused.map((e) => [e.data.type, e.data.cmd_id, e.data.cmd_seq, e.data.reason]), [["prompt", "p-later", later, "withdrawn"]]);
+    await sleep(150);
+    assert.ok(!h.adapterLog().some((l) => l.method === "session/cancel"), "nothing that runs is stopped");
+    assert.equal(h.turnEnds(sid).length, 0, "the running turn goes on");
+    assert.ok(!h.adapterLog().some((l) => l.prompt === "say later"));
+  });
+  test("withdraw with nothing waiting does nothing at all: no turn end, no refusal", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    h.claw.issue("withdraw", sid, { cmd_id: "w-idle" });
+    await sleep(200);
+    assert.equal(h.turnEnds(sid).length, 0);
+    assert.deepEqual(h.claw.eventsOf(sid, "command_rejected"), []);
+  });
+  test("an agent says it can take a waiting prompt back (withdraw)", async () => {
+    const h = await make();
+    await h.claw.until("a heartbeat", () => h.claw.heartbeats.length > 0);
+    const agents = h.claw.heartbeats.at(-1)!.agents as Array<{ capabilities: Record<string, unknown> }>;
+    assert.ok(agents.length > 0 && agents.every((a) => a.capabilities.withdraw === true));
+  });
   test("a cancel with nothing running still answers once, naming no prompt", async () => {
     const h = await make();
     const sid = await h.newSession();

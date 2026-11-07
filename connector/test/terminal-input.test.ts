@@ -251,7 +251,8 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     t.tmux("send-keys", "-t", "%0", "-l", "the person types");
     await until("their text", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "typed");
     const three = h.prompt(sid, "third");
-    const queued = await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued")[0]);
+    // (its own notice: an earlier message may have had one of its own while the screen was being redrawn, terminal_state_unknown)
+    const queued = await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === three));
     assert.deepEqual([queued.data.reason, queued.data.cmd_seq], ["terminal_typing", three]);
     assert.ok(!typed(t.transcript).includes("third"), "not typed over their text");
     t.tmux("send-keys", "-t", "%0", "C-u");
@@ -282,6 +283,38 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     h.claw.issue("set_mode", sid, { mode_id: "plan" });
     const rejected = await h.claw.until("the mode change refused", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.type === "set_mode"));
     assert.equal(rejected.data.reason, "terminal_session");
+  });
+
+  test("withdraw takes back a message waiting for the terminal and leaves the terminal alone: no Escape, nothing typed", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir);
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    await h.online();
+    await h.claw.until("a heartbeat that offers typing and taking back", () => [...h.claw.heartbeats].reverse().find((b) =>
+      b.agents[0].capabilities.withdraw === true && b.agents[0].capabilities.resumable?.find((r: any) => r.ref === REF)?.input === "terminal"));
+    const sid = await h.attach(REF);
+    // Someone is typing at the terminal: the phone's message waits for it.
+    t.tmux("send-keys", "-t", "%0", "-l", "the person types");
+    await until("their text", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "typed");
+    const one = h.prompt(sid, "from the phone");
+    await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued")[0]);
+    h.claw.issue("withdraw", sid, { cmd_id: "w-term" });
+    const refused = await h.claw.until("the message taken back", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_seq === one));
+    assert.equal(refused.data.reason, "withdrawn");
+    // Their text is still in the box (no Escape, no clearing), and once they send it the phone's message is never typed.
+    assert.equal(inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")), "typed");
+    t.tmux("send-keys", "-t", "%0", "Enter");
+    await h.claw.until("the terminal's prompt", () => h.claw.eventsOf(sid, "user_message_chunk").find((e) => e.data.update.content.text === "the person types"));
+    await new Promise((r) => setTimeout(r, 1_000));
+    assert.ok(!typed(t.transcript).includes("from the phone"), "the message taken back is not typed");
+    assert.equal(h.audit().filter((a) => a.kind === "terminal_input").length, 0);
+    assert.equal(h.turnEnds(sid).length, 0, "nothing of the phone's ran, so nothing of it ended");
   });
 
   test("a row another pid domain left in the shared Claude directory does not stop typing into the local terminal", async () => {

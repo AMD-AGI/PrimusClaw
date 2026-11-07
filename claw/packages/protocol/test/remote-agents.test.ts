@@ -23,7 +23,7 @@ test("the timings keep a stream alive through the gateway's 180 s idle cut and s
 });
 
 test("the command set is closed, and only commands that can wait may be queued offline", () => {
-  assert.deepEqual([...REMOTE_COMMAND_TYPES], ["prompt", "cancel", "set_mode", "resume", "close", "decision"]);
+  assert.deepEqual([...REMOTE_COMMAND_TYPES], ["prompt", "cancel", "set_mode", "resume", "close", "decision", "withdraw"]);
   const needsOnline = REMOTE_COMMAND_TYPES.filter((t) => REMOTE_COMMANDS[t].needsOnline);
   assert.deepEqual(needsOnline, ["prompt", "set_mode", "resume"]);
   assert.deepEqual(REMOTE_COMMAND_TYPES.filter((t) => REMOTE_COMMANDS[t].closesSession), ["close"]);
