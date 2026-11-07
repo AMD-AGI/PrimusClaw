@@ -22,8 +22,9 @@ test("the suite's setup", async () => {
   const attach = await Harness.create({ attach: { sessions: [] } });
   await attach.online();
   // A session starts an adapter: a detached process writing into the home, which must not outlive the file. Some real
-  // adapters do not leave when their stdin closes; this one is told not to either.
-  const h = await Harness.create({ env: { FAKE_SURVIVE_EOF: "1" } });
+  // adapters do not leave when their stdin closes; this one is told not to either. The home is a folder inside a
+  // temporary directory, not one itself, as in the tests that start a connector without the harness.
+  const h = await Harness.create({ home: path.join(tmpdir("cc-nest-"), "home"), env: { FAKE_SURVIVE_EOF: "1" } });
   await h.newSession();
   const recorded = (): number[] => {
     try { return (JSON.parse(fs.readFileSync(path.join(h.dirs.state, "children.json"), "utf8")) as Array<{ pid: number }>).map((r) => r.pid); } catch { return []; }

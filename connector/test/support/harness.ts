@@ -12,11 +12,10 @@ import { KeyTokenProvider, type TokenProvider } from "../../src/credentials.js";
 import type { Report } from "../../src/doctor.js";
 import { fileAudit, type Audit } from "../../src/audit.js";
 import { redactDeep } from "../../src/redact.js";
-import { auditFile, childrenFile, resolveDirs, type Dirs } from "../../src/paths.js";
-import { processStart, type ChildRecord } from "../../src/children.js";
+import { auditFile, resolveDirs, type Dirs } from "../../src/paths.js";
 import { silentLogger } from "../../src/util.js";
 import { FakeClaw } from "./fake-claw.js";
-import { onCleanup, onExitSync, tmpdir } from "./tmp.js";
+import { onCleanup, tmpdir } from "./tmp.js";
 import { FAST } from "./timing.js";
 
 export const ADAPTER = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-adapter.mjs");
@@ -78,10 +77,8 @@ export class Harness {
   static async create(o: HarnessOptions = {}): Promise<Harness> {
     const h = new Harness();
     h.claw = o.claw ?? (await FakeClaw.start());
-    // Stopped before the file's temporary directories (its home among them) are removed; and if the file dies first,
-    // the adapters its connector started (detached, so they would outlive it) are killed before the directories go.
+    // Stopped before the file's temporary directories (its home among them) are removed.
     onCleanup(() => h.close());
-    onExitSync(() => h.killAdapters());
     h.dirs = resolveDirs({ CLAW_CONNECTOR_HOME: o.home ?? tmpdir() } as NodeJS.ProcessEnv);
     h.work = o.work ?? tmpdir("cc-work-");
     h.fakeLog = path.join(h.dirs.state, "fake-adapter.log");
@@ -154,16 +151,6 @@ ${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, {
   async stop(): Promise<RunResult> {
     this.connector.stop();
     return (await this.running) ?? "stopped";
-  }
-
-  /** SIGKILL the adapter process groups the connector recorded in children.json (those still the same process). */
-  killAdapters(): void {
-    let recs: ChildRecord[] = [];
-    try { recs = JSON.parse(fs.readFileSync(childrenFile(this.dirs), "utf8")) as ChildRecord[]; } catch { return; }
-    for (const r of Array.isArray(recs) ? recs : []) {
-      if (!r || typeof r.pgid !== "number" || r.pgid <= 1 || processStart(r.pid) !== r.start) continue;
-      try { process.kill(-r.pgid, "SIGKILL"); } catch { /* gone */ }
-    }
   }
 
   /** Stop the connector and the stand-in Claw; a second call waits for the first. */
