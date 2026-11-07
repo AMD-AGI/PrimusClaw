@@ -104,6 +104,10 @@ record it.
 - An assistant whose new lookup differs from its earlier answer says what changed since, not that the earlier answer was its mistake
   (`router-read-v12`, and the placeholder that stands for an earlier turn's result): a pull request merged between two asks was
   told as "上次我多算了 1 个，抱歉".
+- A long run taken over by another brain near its end (a Brain rolling update in the middle of it) is announced as a long run again:
+  its `run.completed` was measured from the claim that resumed it, which clears and restamps `started_at`, so a 70-second run
+  resumed three seconds before its end ran "three seconds" and no notification was recorded (release claw-rel-1917, 2026-11-07).
+  A run is now measured across every claim from its run-time anchor, less the time it spent queued.
 - A fresh connector install trusts the CAs the machine trusts: a Claw behind a company CA no longer fails `doctor`, `login`, `pair`
   and `run` until `NODE_USE_SYSTEM_CA=1` is set. On Node.js 22.19+ / 24.5+ the connector adds the system store to Node's own list
   (and `NODE_EXTRA_CA_CERTS`) before its first connection and passes `NODE_USE_SYSTEM_CA=1` to the programs it starts;
