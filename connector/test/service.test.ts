@@ -362,6 +362,9 @@ describe("service install / uninstall / status", () => {
     assert.match(body, /service ensure\n$/);
     assert.match(a.text(), /supervisor running \(pid \d+\)/);
     assert.deepEqual(chroot.calls, [], "systemctl was not even asked");
+    // Installing is not "something calls keepalive.sh": doctor must not take the install's own start for a schedule.
+    const { keepaliveStampFile } = await import("../src/paths.js");
+    assert.equal(fs.existsSync(keepaliveStampFile(a.c.dirs)), false);
     // No cron daemon (the fake's default, and the usual container): said plainly, with the line a startup hook needs.
     assert.match(a.text(), /No cron daemon runs here: after a reboot or a container restart NOTHING starts the connector again/);
     assert.match(a.text(), /^  sh '.*keepalive\.sh' >\/dev\/null 2>&1$/m);

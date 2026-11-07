@@ -410,8 +410,9 @@ export async function cmdSupervise(_args: string[], ctx: Ctx): Promise<number> {
 }
 
 /** `service ensure` (what keepalive.sh runs): start the supervisor, detached, unless it lives or a sign-in is needed. */
-async function ensure(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers): Promise<number> {
-  stampKeepalive(ctx);
+async function ensure(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, o: { byInstall?: boolean } = {}): Promise<number> {
+  // The stamp says that something (cron, a startup hook) calls keepalive.sh; `install` starting it once is not that.
+  if (!o.byInstall) stampKeepalive(ctx);
   const sup = supervisorPid(ctx);
   if (sup !== null) { ctx.out(`supervisor running (pid ${sup})`); return 0; }
   // Not started while only a person can help (no config, no sign-in, revoked): it would exit 78 every time.
@@ -517,7 +518,7 @@ export function writeSecretFile(file: string, body: string): void {
     }
     // It is about to hold secrets, and only this account uses it.
     if ((st.mode & 0o077) !== 0) fs.fchmodSync(dfd, 0o700);
-    let anchored = dir;
+    let anchored: string;
     if (fs.existsSync(`/proc/self/fd/${dfd}`)) anchored = `/proc/self/fd/${dfd}`;
     else {
       // No descriptor-relative path here (macOS): a path is used again, so it must be one nobody else can change. Its
@@ -614,7 +615,7 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
     const script = keepaliveFile(ctx.dirs);
     writeFile600(script, keepaliveScript(d, vars), 0o700);
     recordInstalled(ctx, "script", vars);
-    const code = await ensure(ctx, d, h);
+    const code = await ensure(ctx, d, h, { byInstall: true });
     if (code !== 0) return code;
     ctx.out(`wrote ${script}. This machine has no systemd: the supervisor restarts the connector 5 s after it dies.`);
     scheduleKeepalive(ctx, d, script);
