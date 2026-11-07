@@ -147,18 +147,32 @@ function parseReport(lines: string[]): { sources: Map<number, ListedSource>; cla
   return { sources, claims };
 }
 
-/** Whether `text` is a report the check reads: it cites a number and lists a source. Nothing is fetched. */
-export function isCitedReport(text: string): boolean {
-  const { sources, claims } = parseReport(text.split("\n"));
-  return sources.size > 0 && claims.length > 0;
-}
-
-/** The files `deliver_file` hands over whose text may be a cited report: those go through a checked `deliver_text` instead. */
-export const CHECKED_FILE_EXTENSIONS = /\.(md|markdown|txt)$/i;
+/**
+ * A file in the sandbox that is a cited report, as two searches of the whole file (JavaScript regular expressions, one line each):
+ * a line of a list of sources, and a line where a citation number follows other text. Both must match. Looser than the check's own
+ * parsing (a code block is not skipped), so a report cannot pass as a file the check would not read.
+ */
+export const CITED_FILE_PATTERNS = [
+  String.raw`^\s{0,3}(?:[-*+]\s+)?\[\d{1,3}\][:.]?\s+.*https?://`,
+  String.raw`\S.*\[\d{1,3}(?:\s*[,，、]\s*\d{1,3})*\](?!\()`,
+];
 
 /** What a `deliver_file` of a cited report is refused with. */
 export const CITED_FILE_REFUSAL = "Error: this file is a report with numbered citations, so it is delivered with deliver_text (its name and its "
   + "whole text), which checks its sources before the user gets it. Nothing was delivered: call deliver_text with the report instead.";
+
+/** `work`'s result, or a rejection as soon as `signal` aborts, whichever comes first. */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error("cite check budget spent"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new Error("cite check budget spent"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (v) => { signal.removeEventListener("abort", onAbort); resolve(v); },
+      (e) => { signal.removeEventListener("abort", onAbort); reject(e); },
+    );
+  });
+}
 
 /** Run `work` over `items`, at most `limit` at a time. */
 async function eachLimited<T>(items: T[], limit: number, work: (item: T) => Promise<void>): Promise<void> {
@@ -206,7 +220,8 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
       if (budget.signal.aborted || now() > deadline) { unreadable.add(n); return; }
       let page: CheckedPage;
       try {
-        page = await ports.fetchPage(source.url, budget.signal);
+        // The budget ends the wait even when the fetch itself would go on: a page still loading then counts as unreadable.
+        page = await untilAborted(ports.fetchPage(source.url, budget.signal), budget.signal);
       } catch (err) {
         logger.info({ host: hostOf(source.url), err: err instanceof Error ? err.message : String(err) }, "cite_check.fetch_threw");
         page = { ok: false };
@@ -218,7 +233,7 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
         const batch = mine.slice(k, k + CITE_CHECK_CLAIMS_PER_CALL);
         let verdicts: boolean[] | null;
         try {
-          verdicts = await ports.judge({ url: source.url, page: page.text, claims: batch.map(({ c }) => c.text) }, budget.signal);
+          verdicts = await untilAborted(ports.judge({ url: source.url, page: page.text, claims: batch.map(({ c }) => c.text) }, budget.signal), budget.signal);
         } catch (err) {
           logger.info({ host: hostOf(source.url), err: err instanceof Error ? err.message : String(err) }, "cite_check.judge_threw");
           verdicts = null;

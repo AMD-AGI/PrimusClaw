@@ -33,7 +33,8 @@ record it.
   cites a numbered source. Before the file is stored, Brain opens every cited source with the run's own `web_fetch` and asks a small
   model whether the page supports each finding that cites it (`ExecuteRequest.cite_check`): a finding no opened source supports is
   marked unverified (未证实), a source that does not open is marked in the list, and the file ends with the counts. A sub-agent's
-  delivery is checked the same way, and `deliver_file` of a cited report is refused in favour of a checked `deliver_text`.
+  delivery is checked the same way, and `deliver_file` of a sandbox file that is a cited report is refused in favour of a checked
+  `deliver_text`.
 - `duckduckgo`, a web search backend that needs no key: named in `WEB_SEARCH_FALLBACK` behind `anthropic`, it answers only while the
   native search fails (a gateway that refuses its forced tool choice), so nothing changes once the gateway accepts it.
 - A router turn that has said nothing 3.5 s after it began is told "收到，我看一下。" ("On it: looking into it now.") by the server, whatever it

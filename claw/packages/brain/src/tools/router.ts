@@ -11,7 +11,7 @@ import type { McpToolCaller } from "../clients/mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
 import type { RunCitations } from "./citations.js";
-import { CHECKED_FILE_EXTENSIONS, CITED_FILE_REFUSAL, checkNote, checkReport, isCitedReport, type CiteCheck } from "./cite-check.js";
+import { CITED_FILE_PATTERNS, CITED_FILE_REFUSAL, checkNote, checkReport, type CiteCheck } from "./cite-check.js";
 import type { LogReads } from "./log-reads.js";
 import { callWithWorkspaceFanout, fansOut } from "./workspace-fanout.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
@@ -486,8 +486,7 @@ export class ToolRouter {
     const check = this.citeCheck;
     // The same report copied out of the sandbox would reach the user unchecked: a text file that is one is refused, and the model
     // is told to deliver it as text.
-    if (check && name === DELIVER_FILE_TOOL && typeof input.path === "string" && CHECKED_FILE_EXTENSIONS.test(input.path)
-      && await this.sandboxFileIsCitedReport(input.path, signal)) {
+    if (check && name === DELIVER_FILE_TOOL && typeof input.path === "string" && await this.sandboxFileIsCitedReport(input.path, signal)) {
       return refuse(outcome, CITED_FILE_REFUSAL);
     }
     if (check?.checks(name) && typeof input.text === "string" && input.text.trim()) {
@@ -502,19 +501,25 @@ export class ToolRouter {
   }
 
   /**
-   * Whether the sandbox file at `path` is a cited report (`isCitedReport`), read with the sandbox's own `read` (its first 2000 lines,
-   * numbered). A file that cannot be read is not one: `deliver_file` then answers for it as it would.
+   * Whether the sandbox file at `path` is a cited report: the sandbox's own `grep` (which reads the whole file) finds both a line of a
+   * list of sources and a line that cites a number (`CITED_FILE_PATTERNS`). A file the search cannot read is not one: `deliver_file`
+   * then answers for it as it would.
    */
   private async sandboxFileIsCitedReport(path: string, signal?: AbortSignal): Promise<boolean> {
-    const read: RouteOutcome = { isError: false };
-    let text: string;
-    try {
-      text = await this.routeAllowed("read", { path, limit: 2000 }, signal, read);
-    } catch {
-      return false;
+    for (const pattern of CITED_FILE_PATTERNS) {
+      const found: RouteOutcome = { isError: false };
+      let text: string;
+      try {
+        text = await this.routeAllowed("grep", { pattern, path, output_mode: "files_with_matches", case_sensitive: true }, signal, found);
+      } catch {
+        return false;
+      }
+      // A match is the file's path on a line of its own; a note (a file too large to search, a scan cut short) or a refusal is not.
+      const matched = text.split("\n").map((l) => l.trim()).some((l) =>
+        l !== "" && l !== "(no matches)" && !l.startsWith("[") && !l.includes("[scan aborted") && !/^(Error|Invalid|Pattern)\b/.test(l));
+      if (found.isError || !matched) return false;
     }
-    if (read.isError) return false;
-    return isCitedReport(text.split("\n").map((l) => l.replace(/^\s*\d+\|/, "")).join("\n"));
+    return true;
   }
 
   /** `route()` for a call the allow-list let through: the read taint and the citations, then the tool. */
