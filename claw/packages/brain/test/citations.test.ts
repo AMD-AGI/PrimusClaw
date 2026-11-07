@@ -92,6 +92,15 @@ test("C2 sources are kept only from a producer the run believes: Brain's web too
   assert.equal(confirmed.size, 1, "a page read at an address the user wrote is kept");
 });
 
+test("C2b a release record the router's rules name is kept where it was read, as an address the user wrote is (parity R1)", () => {
+  const cite = parseCite({ tools: [SAY] }, {})!;
+  cite.keep("web_fetch", [webSource("https://dl.k8s.io/release/stable.txt", "stable.txt")]);
+  cite.keep("web_fetch", [webSource("https://dl.k8s.io/release/latest.txt", "latest.txt")]);
+  assert.equal(cite.size, 1, "only the named record, not its neighbours");
+  const meta = cite.metaFor(SAY, { text: "v1.37.2 [1]", sources: ["https://dl.k8s.io/release/stable.txt"] })!;
+  assert.deepEqual(meta[CITE_SOURCES_META], [{ n: 1, url: "https://dl.k8s.io/release/stable.txt", title: "stable.txt", kind: "web" }]);
+});
+
 test("C3 a citing call gets the kept entry for each address it names, numbered by its place; the rest is dropped", () => {
   const cite = new RunCitations(new Set([SAY]), new Set(["github"]));
   cite.keep("mcp__github__pr_get", [{ url: PR, title: "AMD-AGI/PrimusClaw#309 perf", kind: "github_pr" }]);

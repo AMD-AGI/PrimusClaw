@@ -22,7 +22,7 @@
  */
 import pino from "pino";
 import {
-  CITE_DROPPED_META, CITE_MAX_PER_CALL, CITE_SOURCES_META, CITE_TITLE_MAX, citeSourcesAsked, citeableUrl, isCiteSourceKind, isPlatformMcpServer,
+  CITE_DROPPED_META, CITE_KNOWN_RECORDS, CITE_MAX_PER_CALL, CITE_SOURCES_META, CITE_TITLE_MAX, citeSourcesAsked, citeableUrl, isCiteSourceKind, isPlatformMcpServer,
   type CiteDropped, type CiteSource, type CitedSource,
 } from "@claw/protocol";
 
@@ -208,7 +208,8 @@ export function parseCite(raw: unknown, servers: Record<string, unknown>): RunCi
     if (!ok) logger.warn({ server: name }, "cite.source_server_not_trusted");
     return ok;
   });
-  const userKeys = names(r.user_urls).slice(0, USER_URLS_MAX).map(citeKey).filter((k): k is string => k !== null);
+  // The release records the router is told to read (`CITE_KNOWN_RECORDS`) confirm a fetch as an address the user wrote does.
+  const userKeys = [...names(r.user_urls).slice(0, USER_URLS_MAX), ...CITE_KNOWN_RECORDS].map(citeKey).filter((k): k is string => k !== null);
   return new RunCitations(new Set(tools), new Set(trusted), new Set(userKeys), parseLinkServers(r.link_servers));
 }
 
