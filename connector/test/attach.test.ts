@@ -557,10 +557,15 @@ describe("attach end to end", () => {
     assert.equal(closedReason(h, sid), undefined, "not refused: watched");
     assert.deepEqual(adapterMethods(h).filter((m) => m !== "initialize" && m !== "session/list"), [], "nothing was resumed or started");
     assert.ok(h.audit().some((a) => a.kind === "session_spectating"));
-    // What was there before: sent once, marked as history.
-    const before = h.claw.eventsOf(sid, "agent_message_chunk");
-    assert.deepEqual(before.map((e) => [e.data.update.content.text, e.data.replay, e.data.read_only]), [["Running them now.", true, true]]);
-    assert.equal(h.claw.eventsOf(sid, "user_message_chunk")[0]?.data.update.content.text, "run the tests");
+    // What was there before: sent once, marked as history, right after session_started. The connector posts events in
+    // batches as their lines reach its outbox on disk, so session_started can be posted (and `attach` return) one batch
+    // ahead of the history: it is waited for, not assumed to have come in the same request.
+    const history = () => h.claw.eventsOf(sid).filter((e) => e.data.replay === true)
+      .map((e) => [e.type, e.data.update.content.text, e.data.read_only]);
+    const shown: unknown[][] = [["user_message_chunk", "run the tests", true], ["agent_message_chunk", "Running them now.", true]];
+    await h.claw.until("the history", () => history().length >= shown.length);
+    assert.deepEqual(history(), shown);
+    assert.deepEqual(h.claw.eventsOf(sid).slice(0, 3).map((e) => e.type), ["session_started", "user_message_chunk", "agent_message_chunk"], "the history follows session_started, before anything new");
     // The terminal goes on: each new line arrives, scrubbed, as the update an adapter would have sent.
     line({ type: "assistant", message: { role: "assistant", content: [{ type: "thinking", thinking: "a private musing" }, { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "npm test" } }] } });
     line({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "12 passed, token ghp_abcdefghijklmnopqrstuvwxyz0123 seen" }] } });
@@ -576,6 +581,7 @@ describe("attach end to end", () => {
     fs.appendFileSync(file, `${JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "全部通过。" }] } }).slice(40)}\n`);
     await h.claw.until("the last line", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "全部通过。"));
     assert.ok(!h.claw.eventsOf(sid).some((e) => JSON.stringify(e.data).includes("private musing") || JSON.stringify(e.data).includes("sub-agent")), "thinking and sub-agents are not shown");
+    assert.deepEqual(history(), shown, "the history was sent once, and nothing new is marked as history");
 
     // Typing into it is refused, by name, and not one byte reaches the transcript.
     const bytes = fs.readFileSync(file);
