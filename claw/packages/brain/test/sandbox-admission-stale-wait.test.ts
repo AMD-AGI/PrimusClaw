@@ -151,3 +151,30 @@ test("a fleet genuinely at its ceiling is refused at once, saying the slots are 
   });
   assert.ok(Date.now() - started < WAIT_MS / 2, "capacity is a verdict, not a reading to wait out");
 });
+
+test("a run cancelled while it waits stops waiting at once and claims nothing", async () => {
+  // The prestart a run never used is aborted and then awaited: an admission
+  // that kept waiting held the run's ending for the rest of the wait, and one
+  // that claimed after the roster cleared started a sandbox nobody needed.
+  store.edit(markStale);
+  const abort = new AbortController();
+  const reason = new Error("prestart unused");
+  setTimeout(() => abort.abort(reason), 100);
+  setTimeout(() => store.edit(clearStale), 150);
+  const started = Date.now();
+
+  await assert.rejects(() => admitSandbox("sess-cancelled", abort.signal), (err: Error) => {
+    assert.equal(err, reason, "the abort's own reason, not a capacity refusal");
+    return true;
+  });
+  assert.ok(Date.now() - started < WAIT_MS / 2, "ended by the abort, not by the wait running out");
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(store.roster().entries.length, 0, "and no slot was claimed after it");
+});
+
+test("an already-aborted run claims nothing even when the count is readable", async () => {
+  const abort = new AbortController();
+  abort.abort(new Error("cancelled"));
+  await assert.rejects(() => admitSandbox("sess-cancelled", abort.signal), /cancelled/);
+  assert.equal(store.roster().entries.length, 0);
+});

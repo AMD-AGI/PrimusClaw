@@ -2769,7 +2769,7 @@ async function provisionHands(
     }
     return await ensureHandsAgentSandbox(
       sessionId, request, action, workloadImage, env, handsToken, mcpPort, onEvent,
-      options.attemptId ?? null, requestedSpec,
+      options.attemptId ?? null, requestedSpec, options.signal,
     );
   }
 
@@ -2805,7 +2805,7 @@ async function provisionHands(
   // Before the provider is called at all: a ceiling checked once the sandbox
   // exists is not a ceiling, because two provisions racing the last slot both
   // start and both are then live work nothing may evict.
-  const hold = await admitSandbox(sessionId);
+  const hold = await admitSandbox(sessionId, options.signal);
   const onProvisioned = makeOnProvisioned({
     sessionId, namespace: nsForSandbox, apiKey, handsToken, sandboxImage, kv, hold,
     // Same field the READY payload below carries, and for the same reason, but
@@ -3646,6 +3646,8 @@ async function ensureHandsAgentSandbox(
    * kubernetes path to miss and rebuild.
    */
   requestedSpec: string,
+  /** The run's signal: it ends an admission wait the run no longer needs. */
+  signal?: AbortSignal,
 ): Promise<EnsureHandsResult> {
   const kv = getHandsKv();
   const provider = getAgentSandboxProvider();
@@ -3668,7 +3670,7 @@ async function ensureHandsAgentSandbox(
   await onEvent({ type: "sandboxStatus", event: "phase", phase: "Creating", status: "creating", log: "" });
   // Claimed before the provider is called, so two provisions racing the last
   // slot cannot both start; bound below at the first moment an identity exists.
-  const hold = await admitSandbox(sessionId);
+  const hold = await admitSandbox(sessionId, signal);
   let inst;
   try {
     inst = await provider.create({

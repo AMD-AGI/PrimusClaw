@@ -226,11 +226,15 @@ type ClaimOutcome = ClaimResult;
  * after the wait is the same compare-and-set an immediate one would have been.
  */
 async function claimOnceCounted(
-  sessionId: string, store: RosterStore, config: RosterConfig,
+  sessionId: string, store: RosterStore, config: RosterConfig, signal?: AbortSignal,
 ): Promise<ClaimOutcome> {
   const deadline = Date.now() + staleWait.ms;
   let waiting = false;
   for (;;) {
+    // Checked before every claim, not only between waits: a run that was
+    // cancelled while it waited must not come back holding a slot -- and then
+    // a sandbox -- it no longer needs.
+    throwIfAborted(signal);
     let outcome: ClaimOutcome;
     if (localStaleLatch) {
       outcome = {
@@ -253,8 +257,27 @@ async function claimOnceCounted(
         "admission.stale_waiting",
       );
     }
-    await new Promise((r) => setTimeout(r, Math.min(staleWait.pollMs, remaining)));
+    await pause(Math.min(staleWait.pollMs, remaining), signal);
   }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : new Error("sandbox admission aborted");
+  }
+}
+
+/** A wait an abort ends at once, so a cancelled run is not held for the rest of it. */
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 /**
@@ -262,14 +285,18 @@ async function claimOnceCounted(
  *
  * Returns a hold the caller binds and releases. Throws
  * {@link SandboxCapacityRefused} where the fleet is at its ceiling; nothing is
- * provisioned in that case.
+ * provisioned in that case. A fleet count that is briefly unreadable is waited
+ * out first; `signal` ends that wait, and an aborted signal throws its reason
+ * with nothing claimed.
  */
-export async function admitSandbox(sessionId: string): Promise<AdmissionHold> {
+export async function admitSandbox(
+  sessionId: string, signal?: AbortSignal,
+): Promise<AdmissionHold> {
   if (!roster) return NO_HOLD;
   const { store, config } = roster;
 
   assertFleetCensused(sessionId);
-  const claim = await claimOnceCounted(sessionId, store, config);
+  const claim = await claimOnceCounted(sessionId, store, config, signal);
   if (!claim.ok && claim.reason === "stale") {
     logger.warn(
       { sessionId, reason: claim.staleReason, waitedMs: staleWait.ms },
