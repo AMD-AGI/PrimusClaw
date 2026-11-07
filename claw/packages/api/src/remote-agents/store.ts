@@ -370,10 +370,19 @@ export async function recentCommandCount(q: Querier, owner: string): Promise<num
   )).rows[0].n);
 }
 
+/**
+ * Whether session `s` is read-only: its connector opened it to watch a conversation that a terminal on that machine has open
+ * (`read_only` on the session's newest `session_started` or `session_resumed`, connector/src/session.ts `spectate`). Such a
+ * session shows what the terminal does and takes no prompt; the routes refuse one before it is queued.
+ */
+const READ_ONLY_SQL = `COALESCE((SELECT e.data->>'read_only' = 'true' FROM claw_remote_events e
+   WHERE e.session_id = s.session_id AND e.type IN ('session_started', 'session_resumed') ORDER BY e.id DESC LIMIT 1), false)`;
+
 export async function findSession(owner: string, sessionId: string, q: Querier = direct): Promise<Row | null> {
   const r = await q(
-    `SELECT session_id::text AS session_id, connector_id::text AS connector_id, agent_id, cwd, mode, status, created_at, updated_at
-       FROM claw_remote_sessions WHERE owner_user_id = $1 AND session_id = $2`,
+    `SELECT session_id::text AS session_id, connector_id::text AS connector_id, agent_id, cwd, mode, status, created_at, updated_at,
+            ${READ_ONLY_SQL} AS read_only
+       FROM claw_remote_sessions s WHERE owner_user_id = $1 AND session_id = $2`,
     [owner, sessionId],
   );
   return r.rows[0] ?? null;
@@ -381,8 +390,9 @@ export async function findSession(owner: string, sessionId: string, q: Querier =
 
 export async function listSessions(owner: string, connectorId: string | null, limit: number): Promise<Row[]> {
   return (await direct(
-    `SELECT session_id::text AS session_id, connector_id::text AS connector_id, agent_id, cwd, mode, status, created_at, updated_at
-       FROM claw_remote_sessions
+    `SELECT session_id::text AS session_id, connector_id::text AS connector_id, agent_id, cwd, mode, status, created_at, updated_at,
+            ${READ_ONLY_SQL} AS read_only
+       FROM claw_remote_sessions s
       WHERE owner_user_id = $1 AND ($2::uuid IS NULL OR connector_id = $2::uuid)
       ORDER BY created_at DESC LIMIT $3`,
     [owner, connectorId, limit],
@@ -402,7 +412,7 @@ const ACTIVITY_TEXT = 400;
 export async function sessionActivity(owner: string, limit: number, events = ACTIVITY_EVENTS): Promise<Row[]> {
   return (await direct(
     `SELECT s.session_id::text AS session_id, s.connector_id::text AS connector_id, s.agent_id, s.cwd, s.mode,
-            s.created_at, s.updated_at,
+            s.created_at, s.updated_at, ${READ_ONLY_SQL} AS read_only,
             (SELECT COUNT(*)::int FROM claw_remote_commands m
               WHERE m.connector_id = s.connector_id AND m.session_id = s.session_id AND m.type = 'prompt') AS queued,
             COALESCE((

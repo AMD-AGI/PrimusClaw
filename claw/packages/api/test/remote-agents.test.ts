@@ -766,6 +766,41 @@ describe("remote agents", { skip }, () => {
       assert.deepEqual([(await s.next()).json().data, (await s.next()).json().data, (await s.next()).json().data], [started, changed, started]);
     });
 
+    test("a session that watches a terminal's conversation is read-only: said on the session and on every frame, and nothing typed is queued", async () => {
+      const { cid } = await online1();
+      const sid = await session("u1", cid);
+      const types = async () => (await q("SELECT type FROM claw_remote_commands WHERE session_id = $1 ORDER BY cmd_seq", [sid])).rows.map((r: any) => r.type);
+      // Before the connector says so, the session takes prompts as any other.
+      assert.equal((await as("u1").get(`/v1/remote-agents/sessions/${sid}`)).body.data.read_only, false);
+      await post("u1", cid, [
+        ev(sid, "session_started", { attached: true, read_only: true, read_only_reason: "session_live", modes: [], currentMode: null }),
+        ev(sid, "agent_message_chunk", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "from the terminal" } }, read_only: true }),
+      ]);
+      assert.equal((await as("u1").get(`/v1/remote-agents/sessions/${sid}`)).body.data.read_only, true);
+      assert.equal((await as("u1").get("/v1/remote-agents/sessions")).body.data.find((x: any) => x.session_id === sid).read_only, true);
+      const before = await types();
+      for (const body of [{ type: "prompt", text: "do something else" }, { type: "set_mode", mode_id: "plan" }]) {
+        const r = await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, body);
+        assert.deepEqual([r.status, r.body.error], [409, "session_read_only"], body.type);
+      }
+      assert.deepEqual(await types(), before, "nothing was queued for the connector");
+      assert.equal((await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, { type: "cancel" })).status, 202, "a stop is harmless and goes through");
+      // What the connector answers it with does not repeat the mark: the frame carries it all the same.
+      await post("u1", cid, [ev(sid, "turn_end", { stopReason: "cancelled", cmd_id: null })], "b8");
+      const s = await SseClient.open(`${base}/v1/remote-agents/sessions/${sid}/events`, { "x-test-user": "u1" });
+      streams.push(s);
+      const [f1, f2, f3] = [(await s.next()).json(), (await s.next()).json(), (await s.next()).json()];
+      assert.deepEqual([f1.type, f1.read_only, f2.type, f2.read_only, f2.data.update.content.text], ["session_started", true, "agent_message_chunk", true, "from the terminal"]);
+      assert.deepEqual([f3.type, f3.read_only, f3.data.read_only], ["turn_end", true, undefined]);
+      const replay = (await as("u1").get(`/v1/remote-agents/sessions/${sid}/events?mode=replay`)).body.data;
+      assert.deepEqual(replay.map((r: any) => r.read_only), [true, true, true]);
+      // The terminal closed and the conversation was taken over in a new session: that one is not read-only.
+      const other = await session("u1", cid, "/work/other");
+      await post("u1", cid, [ev(other, "session_started", { attached: true, modes: [], currentMode: "default" })], "b9");
+      assert.equal((await as("u1").get(`/v1/remote-agents/sessions/${other}`)).body.data.read_only, false);
+      assert.equal((await as("u1").post(`/v1/remote-agents/sessions/${other}/commands`, { type: "prompt", text: "go" })).status, 202);
+    });
+
     test("a session with no events still gets its marker", async () => {
       const { cid } = await online1();
       const sid = await session("u1", cid);

@@ -140,6 +140,9 @@ export interface DevenvSession {
   ref: string | null;
   attach_command: string | null;
   why_not?: string;
+  /** Open in a terminal on the machine: attaching shows it read-only (its output, live) and nothing typed reaches it. */
+  read_only?: true;
+  note?: string;
   /**
    * `in_terminal` only: what the terminal on the machine says it is doing, as the connector reports it: `working` on a turn,
    * `waiting_for_you` (the person at that terminal is needed: a question or an approval there), or `idle`.
@@ -184,6 +187,8 @@ export interface DevenvAgent {
 }
 
 const attachCommand = (ref: string): string => `/agent attach ${ref}`;
+
+const READ_ONLY_NOTE = "open in a terminal on that machine: attaching only watches it (its output, live); what the user types is not sent to it";
 
 /** The connector's version against this server's (`remote-agents/setup.ts`), as `devenv_list` shows it. */
 const versionOf = (c: Row): Pick<DevenvMachine, "version_status" | "upgrade_command"> => {
@@ -292,10 +297,12 @@ export async function devenvList(
   const message = machines.length ? null : await turnMessage((text, params) => db.query(text, params), claims.sid, claims.mid);
   const old = machines.some((m) => m.version_status === "outdated" || m.version_status === "unsupported");
   // "Connect me" without naming one: the one session open through Claw, else the one conversation that can be taken over, else
-  // (no session at all) the one agent that can start one.
-  const chat = attachable.filter((a) => a.opened_in === "chat");
-  const sessions = attachable.filter((a) => a.opened_in !== "agent");
-  const agents = attachable.filter((a) => a.opened_in === "agent");
+  // (no session at all) the one agent that can start one. One open in a terminal is never the default: it can only be watched,
+  // and "connect me" means to work with it.
+  const usable = attachable.filter((a) => !a.read_only);
+  const chat = usable.filter((a) => a.opened_in === "chat");
+  const sessions = usable.filter((a) => a.opened_in !== "agent");
+  const agents = usable.filter((a) => a.opened_in === "agent");
   const pick = chat.length === 1 ? chat[0]
     : chat.length === 0 && sessions.length === 1 ? sessions[0]
       : sessions.length === 0 && agents.length === 1 ? agents[0] : null;
@@ -328,7 +335,7 @@ export function attachRefOf(name: string, args: string): string | null {
   return m ? m[1] : null;
 }
 
-type Attachable = { label: string; ref: string; opened_in: "chat" | "machine" | "agent" };
+type Attachable = { label: string; ref: string; opened_in: "chat" | "machine" | "agent"; read_only?: true };
 
 async function collect(userId: string, activity: boolean, onlineWindowMs: number): Promise<{
   machines: DevenvMachine[]; attachable: Attachable[];
@@ -365,21 +372,26 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
         opened_in: "chat", state: reading.state, last_activity: iso(s.updated_at),
         ref: online ? ref : null, attach_command: online ? attachCommand(ref) : null,
         ...(online ? {} : { why_not: "the machine is offline" }),
+        ...(s.read_only === true ? { read_only: true, note: READ_ONLY_NOTE } : {}),
       };
       if (activity) Object.assign(row, { step: reading.step, last_answer: reading.answer, asked: reading.asked, last_stop: reading.last_stop, queued_prompts: Number(s.queued) || 0 });
       sessions.push(row);
-      if (online) attachable.push({ label: row.label, ref, opened_in: "chat" });
+      if (online) attachable.push({ label: row.label, ref, opened_in: "chat", ...(s.read_only === true ? { read_only: true as const } : {}) });
     }
     // The agents' own conversations on this machine that are not already open through Claw ("attached" ones are).
     for (const a of agents) {
       for (const r of resumableOf(a).filter((x) => x.state !== "attached").sort((x, y) => (y.updated_at ?? "").localeCompare(x.updated_at ?? ""))) {
         const inTerminal = r.state === "live";
-        const can = online && !inTerminal;
+        // One open in a terminal can be attached too, to watch it, when its connector says it can (`watch_live`): it shows it
+        // read-only and refuses what is typed. An older connector would refuse it: it stays for the terminal only.
+        const watchable = isObject(a.capabilities) && a.capabilities.watch_live === true;
+        const can = online && (!inTerminal || watchable);
         const row: DevenvSession = {
           label: label(String(a.agent_id)), agent: String(a.agent_id), agent_name: shown(a.name, NAME_MAX), cwd: shown(r.cwd, CWD_MAX),
           opened_in: "machine", state: inTerminal ? "in_terminal" : r.state === "idle" ? "idle" : "unknown", last_activity: r.updated_at,
           ref: can ? r.ref : null, attach_command: can ? attachCommand(r.ref) : null,
-          ...(can ? {} : { why_not: inTerminal ? "it is open in a terminal on that machine; only the terminal can use it now" : "the machine is offline" }),
+          ...(can ? {} : { why_not: !online ? "the machine is offline" : "it is open in a terminal on that machine; only the terminal can use it now" }),
+          ...(can && inTerminal ? { read_only: true, note: READ_ONLY_NOTE } : {}),
         };
         if (inTerminal && r.terminal_state) row.terminal_state = r.terminal_state;
         if (activity) {
@@ -387,7 +399,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
           if (r.terminal_state === "waiting_for_you") row.waiting_for = r.waiting_for;
         }
         sessions.push(row);
-        if (can) attachable.push({ label: row.label, ref: r.ref, opened_in: "machine" });
+        if (can) attachable.push({ label: row.label, ref: r.ref, opened_in: "machine", ...(inTerminal ? { read_only: true as const } : {}) });
       }
     }
     // Each agent itself, which is how a user with no session yet gets one: the channel attaches its open session, else starts one.
@@ -512,7 +524,9 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
       const reading = readSession(Array.isArray(s.events) ? s.events as ActivityEvent[] : [], Number(s.queued) || 0);
       named.push({
         c, agent: agents.find((a) => a.agent_id === s.agent_id), label: label(String(s.agent_id)), session_id: String(s.session_id),
-        resume_ref: null, cwd: typeof s.cwd === "string" ? s.cwd : null, busy: reading.state === "idle" ? null : reading.state,
+        resume_ref: null, cwd: typeof s.cwd === "string" ? s.cwd : null,
+        // A session that only watches a terminal's conversation takes no instruction, as the conversation itself does not.
+        busy: s.read_only === true ? "in_terminal" : reading.state === "idle" ? null : reading.state,
       });
     }
     for (const a of agents) {
@@ -674,6 +688,7 @@ export async function executeSend(
   if (sessionId) {
     const s = await findSession(userId, sessionId);
     if (!s || s.status !== "active" || s.connector_id !== plan.connector_id) return { ok: false, error: "session_closed", message: "that session has closed since" };
+    if (s.read_only === true) return { ok: false, error: "session_read_only", message: "that session is open in a terminal on the machine and can only be watched: nothing was sent" };
     // Read again now: a session that started working since the plan (or the card) is not sent another instruction.
     const [now] = (await sessionActivity(userId, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser)).filter((r) => r.session_id === sessionId);
     if (now && readSession(Array.isArray(now.events) ? now.events as ActivityEvent[] : [], Number(now.queued) || 0).state !== "idle") {

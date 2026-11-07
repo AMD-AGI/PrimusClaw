@@ -109,6 +109,9 @@ export class SessionManager {
   private async sessionNew(cmd: Command): Promise<void> {
     const sid = cmd.session_id;
     if (this.sessions.has(sid)) return; // a repeat of a command already carried out
+    // A repeat that comes after a restart (the cursor was not yet saved) finds the session recorded. A read-only one is
+    // brought back read-only: it must not become a takeover because the terminal has closed in the meantime.
+    if (this.env.store.get(sid)?.read_only) { await this.lookup(sid); return; }
     const agent = this.agent(cmd.agent_id);
     if (!agent) {
       this.env.audit.record("session_refused", { session_id: sid, reason: "unknown_agent", agent_id: String(cmd.agent_id).slice(0, 64) });
@@ -162,7 +165,8 @@ export class SessionManager {
     // synchronous step: two requests for the same conversation must not both get past it while one is still being
     // looked up, or two adapters would be writing to one transcript.
     const claim = `${agent.id}:${want}`;
-    if (this.attaching.has(claim) || [...this.sessions.values()].some((s) => !s.closed && s.agent.id === agent.id && s.acpId?.toLowerCase() === want)) return refuse("already_attached");
+    // A read-only session only reads the transcript, so it is no second writer: it does not hold the conversation.
+    if (this.attaching.has(claim) || [...this.sessions.values()].some((s) => !s.closed && !s.readOnly && s.agent.id === agent.id && s.acpId?.toLowerCase() === want)) return refuse("already_attached");
     if ([...this.sessions.values()].filter((s) => !s.closed).length + this.attaching.size >= MAX_ACTIVE_SESSIONS) return refuse("too_many_sessions");
     this.attaching.add(claim);
     try {
@@ -184,7 +188,8 @@ export class SessionManager {
   /** The ids of the existing sessions this connector holds open, by agent. */
   attachedRefs(agentId: string): Set<string> {
     const out = new Set<string>();
-    for (const s of this.sessions.values()) if (!s.closed && s.agent.id === agentId && s.acpId) out.add(s.acpId.toLowerCase());
+    // (A read-only one is not: the conversation is the terminal's, and the list says so.)
+    for (const s of this.sessions.values()) if (!s.closed && !s.readOnly && s.agent.id === agentId && s.acpId) out.add(s.acpId.toLowerCase());
     return out;
   }
 
@@ -205,7 +210,17 @@ export class SessionManager {
     }
     const s = new Session(sid, agent, verdict.real, this.env, rec.acp_session_id, rec.mode);
     this.sessions.set(sid, s);
+    // It stays read-only: a prompt to it after a restart is refused as before, never a takeover by surprise.
+    if (rec.read_only && agent.attach) s.restoreSpectate();
     return s;
+  }
+
+  /** At start: every session that was watching a terminal's conversation goes on watching it (and notices when it ends). */
+  async restoreReadOnly(): Promise<void> {
+    for (const sid of this.env.store.ids()) {
+      const rec = this.env.store.get(sid);
+      if (rec?.read_only && rec.status === "active" && !this.sessions.has(sid)) await this.lookup(sid);
+    }
   }
 
   /** After the command stream reconnects: cards still waiting are shown again. */
@@ -222,6 +237,7 @@ export class SessionManager {
     for (const s of this.sessions.values()) {
       this.env.audit.record("session_killed", { session_id: s.id, reason });
       s.dropQueued();
+      s.stopTail();
     }
     await this.env.registry.killAll();
     this.sessions.clear();
