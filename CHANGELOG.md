@@ -28,6 +28,9 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A conversation open in a terminal on your machine that has waited a minute for you (Claude Code's own "waiting": a permission or a
+  question) is pushed once through your assistant: the machine, the agent, what it waits for and the conversation's title. Answered at
+  the terminal within the minute, it is never pushed; a terminal working or finishing is never pushed. A later wait is told again once.
 - Connecting a machine is said with the exact commands, for every client. `GET /v1/remote-agents/setup` gives the connector's npm
   package (`@primusclaw/connector`), the four commands (`npm install -g`, `claw-connector init`, `claw-connector login --server <this
   API's CLAW_PUBLIC_URL> --identity-url <CLAW_CONNECTOR_IDENTITY_URL, else IDENTITY_ISSUER_URL>`, `claw-connector service install`) and

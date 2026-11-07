@@ -38,6 +38,7 @@ import { Waker } from "../remote-agents/waker.js";
 import * as store from "../remote-agents/store.js";
 import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
+import { startTerminalWaitSweep, TERMINAL_WAIT_NOTICE_MS } from "../remote-agents/terminal-waits.js";
 import { closeCardsOfConnector } from "../assistant/devenv-tools.js";
 import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
@@ -64,6 +65,8 @@ export interface RemoteAgentOptions {
   presenceSweepMs?: number;
   /** How long a connector stays offline before its owner is told. */
   offlineNoticeMs?: number;
+  /** How long a conversation open in a terminal waits for its person before they are told. */
+  terminalWaitNoticeMs?: number;
   /**
    * Aborted when this process starts to shut down (`GracefulShutdown.closing`). Every command stream then sends
    * `event: reconnect` and ends, and its connector is kept online (`markStreamClosed`'s `restart`) while it opens a
@@ -247,6 +250,12 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   const presenceSweepMs = opts.presenceSweepMs ?? PRESENCE_SWEEP_MS;
   if (presenceSweepMs > 0) {
     const stop = startPresenceSweep({ onlineWindowMs, noticeAfterMs: opts.offlineNoticeMs ?? OFFLINE_NOTICE_MS, sweepMs: presenceSweepMs });
+    app.addHook("onClose", async () => stop());
+  }
+  // A conversation open in a terminal that has waited a minute for its person: told once (`remote-agents/terminal-waits.ts`). On the
+  // presence sweep's schedule; a lock makes each sweep one replica's.
+  if (presenceSweepMs > 0) {
+    const stop = startTerminalWaitSweep({ onlineWindowMs, noticeAfterMs: opts.terminalWaitNoticeMs ?? TERMINAL_WAIT_NOTICE_MS, sweepMs: presenceSweepMs });
     app.addHook("onClose", async () => stop());
   }
   // A reader's stream polls the database, so one user cannot hold an unbounded number open.

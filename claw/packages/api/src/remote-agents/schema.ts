@@ -154,4 +154,17 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_remote_audit_cmd ON claw_remote_audit((detail->>'cmd_id')) WHERE action = 'command.issued'",
   );
+  // A conversation open in a terminal that waits for its person, one row per waiting episode (`terminal-waits.ts`): since when the
+  // sweep saw it wait, and when its owner was told. Gone when it stops waiting.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_remote_terminal_waits (
+      connector_id  UUID NOT NULL REFERENCES claw_remote_connectors(connector_id) ON DELETE CASCADE,
+      agent_id      TEXT NOT NULL,
+      ref           TEXT NOT NULL,
+      owner_user_id TEXT NOT NULL,
+      since         TIMESTAMPTZ NOT NULL,
+      told_at       TIMESTAMPTZ,
+      PRIMARY KEY (connector_id, agent_id, ref)
+    )
+  `);
 }
