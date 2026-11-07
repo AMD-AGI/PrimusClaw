@@ -146,8 +146,12 @@ const cleanName = (v: unknown): string => (typeof v === "string" ? v.replace(/[\
  */
 async function pairedName(q: Querier, owner: string, name: string, alternate: string): Promise<string> {
   if (!name || !alternate || alternate.toLowerCase() === name.toLowerCase()) return name;
+  // Live machines, and pairings claimed but not registered yet (a grant whose machine is still starting): two codes claimed one
+  // after the other, before either machine registered, would otherwise both get the same alternate.
   const taken = new Set(((await q(
-    "SELECT lower(name) AS n FROM claw_remote_connectors WHERE owner_user_id = $1 AND revoked_at IS NULL", [owner],
+    `SELECT lower(name) AS n FROM claw_remote_connectors WHERE owner_user_id = $1 AND revoked_at IS NULL
+     UNION SELECT lower(device_name) FROM claw_remote_grants
+      WHERE owner_user_id = $1 AND connector_id IS NULL AND revoked_at IS NULL AND device_name IS NOT NULL`, [owner],
   )).rows as Array<{ n: string }>).map((r) => r.n));
   if (!taken.has(name.toLowerCase())) return name;
   for (let i = 1; i < 100; i++) {

@@ -432,7 +432,9 @@ export function allOfflineText(names: string[], connect: string, zh: boolean): s
   const shown = all.length > 5 ? [...all.slice(0, 5), zh ? `等 ${all.length} 台` : `and ${all.length - 5} more`] : all;
   const list = shown.join(zh ? "、" : ", ");
   return zh
-    ? `你的开发机 ${list} ${shown.length > 1 ? "都" : ""}离线：在那台机器上运行 \`${RESTART_COMMAND}\` 就能让它重新上线。\n要连接一台新机器：${connect}`
+    ? (shown.length > 1
+      ? `你的开发机 ${list} 都离线：在每台机器上运行 \`${RESTART_COMMAND}\` 就能让它们重新上线。\n要连接一台新机器：${connect}`
+      : `你的开发机 ${list} 离线：在那台机器上运行 \`${RESTART_COMMAND}\` 就能让它重新上线。\n要连接一台新机器：${connect}`)
     : `Your machine${shown.length > 1 ? "s" : ""} ${list} ${shown.length > 1 ? "are" : "is"} offline: run \`${RESTART_COMMAND}\` on ${shown.length > 1 ? "each" : "it"} to bring ${shown.length > 1 ? "them" : "it"} back.\n`
       + `To connect a new machine instead: ${connect}`;
 }

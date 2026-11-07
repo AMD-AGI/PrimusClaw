@@ -512,6 +512,8 @@ describe("devenv_list", { skip }, () => {
       await machine("alice", "desk", { agents: [] });
       const en = (await call(await userTurn(alice, "connect my dev environment"))).body;
       assert.match(en.connect_a_machine.text, /^Your machines routeguard-eval, desk are offline: run `claw-connector service install` on each to bring them back\.\nTo connect a new machine instead: On the machine you want to connect/);
+      const zh2 = (await call(await userTurn(alice, "连接我的开发环境"))).body;
+      assert.equal(zh2.connect_a_machine.text.split("\n")[0], "你的开发机 routeguard-eval、desk 都离线：在每台机器上运行 `claw-connector service install` 就能让它们重新上线。");
       // One online machine: nothing to pair, the list as before.
       const bob = await w.user("bob");
       await machine("bob", "laptop", { online: true, agents: [{ id: "claude", kind: "claude", name: "Claude Code" }] });
