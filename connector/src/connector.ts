@@ -20,12 +20,30 @@ import { Outbox } from "./outbox.js";
 import {
   childrenFile, identityFile, logDir, outboxDir, pauseFile, pidFile, sessionsFile, type Dirs,
 } from "./paths.js";
-import { REMOTE_AGENT_TIMING, type RemoteAgentDescriptor } from "./protocol.js";
+import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, type RemoteAgentDescriptor } from "./protocol.js";
 import { redactDeep } from "./redact.js";
 import { DEFAULT_SESSION_TIMING, type SessionEnv, type SessionTiming } from "./session.js";
 import { SessionStore } from "./session-store.js";
 import type { SseFrame } from "./sse.js";
 import { backoffMs, errMessage, isObject, sleep, type Logger } from "./util.js";
+import { agentHealth, RECHECK_MS, type AgentHealth, type Report } from "./doctor.js";
+
+/**
+ * `base` with `health` in it, dropping its last problems until the whole stays well inside the capabilities cap (the
+ * rest of the cap is for the sessions an attach agent offers, which `fitResumable` fits after this).
+ */
+export function withHealth(base: Record<string, unknown>, health: AgentHealth | null, limit = REMOTE_AGENT_LIMITS.maxCapabilitiesBytes / 2): Record<string, unknown> {
+  if (!health) return base;
+  const size = (c: Record<string, unknown>) => new TextEncoder().encode(JSON.stringify(c)).length;
+  const problems = [...health.problems];
+  for (;;) {
+    const caps = { ...base, health: { ...health, problems } };
+    if (size(caps) <= limit) return caps;
+    // Not even an empty report fits beside what the agent already says (a long list of roots): no health, as before it.
+    if (problems.length === 0) return base;
+    problems.pop();
+  }
+}
 
 export interface ConnectorTiming extends SessionTiming {
   heartbeatMs: number;
@@ -37,6 +55,10 @@ export interface ConnectorTiming extends SessionTiming {
   backoffMinMs: number;
   backoffMaxMs: number;
   pausePollMs: number;
+  /** The health checks run again this often. */
+  healthMs: number;
+  /** `recheckHealth` checks again at most this often. */
+  healthMinGapMs: number;
   /** An attach agent's list of existing sessions is reused this long. */
   catalogMs: number;
   /**
@@ -77,6 +99,8 @@ export const DEFAULT_TIMING: ConnectorTiming = {
   recentWriteMs: 10_000,
   authFailLimit: 4,
   authFailWindowMs: 120_000,
+  healthMs: RECHECK_MS,
+  healthMinGapMs: 5_000,
 };
 
 interface IdentityState {
@@ -143,6 +167,11 @@ export interface ConnectorDeps {
   log: Logger;
   version: string;
   timing?: Partial<ConnectorTiming>;
+  /**
+   * The machine's health checks (doctor.ts), run at start, every `healthMs`, and after `claw-connector doctor` wrote a
+   * report. Each agent's descriptor carries the result as `capabilities.health`. Absent: no health is reported.
+   */
+  health?: (signal: AbortSignal) => Promise<Report>;
 }
 
 export type RunResult = "stopped" | "revoked" | "auth_failed";
@@ -177,6 +206,11 @@ export class Connector {
   private lastFrame = "";
   private wakeSender: (() => void) | null = null;
   private wakeHeartbeat: (() => void) | null = null;
+  /** The last health report (null until the first check finishes, or when none is configured). */
+  private healthReport: Report | null = null;
+  private wakeHealth: (() => void) | null = null;
+  private healthAsked = false;
+  private lastHealthAsk = 0;
   private streamCtl: AbortController | null = null;
   private readonly ctl = new AbortController();
 
@@ -223,10 +257,10 @@ export class Connector {
       // a phone may switch this agent to such a mode. A client shows the first so nobody is surprised by it.
       const support = this.attach.get(a.id);
       // `watch_live`: a conversation open in a terminal can be opened read-only (session.ts `spectate`); a client offers that only then.
-      const base = {
+      const base = withHealth({
         ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes,
         ...(support ? { watch_live: true } : {}),
-      };
+      }, this.healthReport ? agentHealth(this.healthReport, a.id) : null);
       // An attach agent also says which existing sessions it could take over, and whether anything holds them open now.
       const capabilities = support ? fitResumable(base, await support.resumable()) : base;
       return { agent_id: a.id, kind: a.kind, name: a.name, capabilities };
@@ -370,6 +404,53 @@ export class Connector {
       }
       await sleep(this.timing.pausePollMs, this.ctl.signal);
     }
+  }
+
+  /**
+   * Check the machine at start, every `healthMs`, and when asked (`recheckHealth`: `claw-connector doctor` signals a running
+   * connector after it ran). A changed result is sent with an early heartbeat. A check that throws keeps the last report, and
+   * a stop never waits for one: it must never take the connection down. Nothing here touches the file system itself (the
+   * checks run in a child process: see commands.ts `runHealth`), so a stalled disk cannot reach this process.
+   */
+  private async healthWatcher(): Promise<void> {
+    const check = this.d.health;
+    if (!check) return;
+    while (!this.ctl.signal.aborted) {
+      this.healthAsked = false;
+      try {
+        const before = this.healthReport ? JSON.stringify(this.healthReport.problems) : null;
+        let onAbort = () => {};
+        const stopped = new Promise<null>((resolve) => {
+          onAbort = () => resolve(null);
+          if (this.ctl.signal.aborted) resolve(null);
+          else this.ctl.signal.addEventListener("abort", onAbort, { once: true });
+        });
+        let report: Report | null;
+        try { report = await Promise.race([check(this.ctl.signal), stopped]); } finally { this.ctl.signal.removeEventListener("abort", onAbort); }
+        if (report === null) break;
+        this.healthReport = report;
+        if (JSON.stringify(this.healthReport.problems) !== before) {
+          this.d.log.info("health", { problems: this.healthReport.problems.map((p) => `${p.agent ?? "machine"}:${p.code}`) });
+          this.wakeHeartbeat?.();
+        }
+      } catch (e) { this.d.log.warn("health check failed", { error: errMessage(e) }); }
+      if (this.healthAsked) continue;   // (asked again while that check ran)
+      await new Promise<void>((resolve) => {
+        const done = () => { clearTimeout(t); this.wakeHealth = null; this.ctl.signal.removeEventListener("abort", done); resolve(); };
+        const t = setTimeout(done, this.timing.healthMs);
+        this.wakeHealth = done;
+        this.ctl.signal.addEventListener("abort", done, { once: true });
+      });
+    }
+  }
+
+  /** Check the machine again now (a `doctor` run asks; at most once per `healthMinGapMs`, so a burst of asks is one check). */
+  recheckHealth(): void {
+    const now = Date.now();
+    if (now - this.lastHealthAsk < this.timing.healthMinGapMs) return;
+    this.lastHealthAsk = now;
+    this.healthAsked = true;
+    this.wakeHealth?.();
   }
 
   // --- the loops -----------------------------------------------------------------------
@@ -545,6 +626,9 @@ export class Connector {
       this.d.audit.record("permission_orphaned", { session_id: p.session_id, action_id: p.action_id });
       this.emit(p.session_id, "permission_resolved", { actionId: p.action_id, optionId: null, outcome: "cancelled", by: "connector_restart" });
     }
+    // How long the machine was away, from its last heartbeat (connector.json), read before this run writes it.
+    let downForMs: number | null = null;
+    try { downForMs = Math.max(0, Date.now() - fs.statSync(identityFile(this.d.dirs)).mtimeMs); } catch { /* never registered */ }
     const pidf = pidFile(this.d.dirs);
     // A pid file left behind means the previous run never reached its own clean-up: it was killed (SIGKILL, OOM),
     // crashed, or the machine went down under it. Its last heartbeat is when connector.json was last written.
@@ -563,17 +647,21 @@ export class Connector {
       const up = await this.startup();
       if (up !== "ok") return (result = up);
       await this.manager.restoreReadOnly();
+      // Signed in and not revoked: the turns the previous run left running end, or (one that was waiting for a person's
+      // approval) go on and ask again, never while paused; the sessions used lately are told they are back.
+      this.manager.recover({ downForMs, mayContinue: !this.paused && !fs.existsSync(pauseFile(this.d.dirs)) });
       this.d.audit.record("connector_online", {
         connector_id: this.cid, agents: this.d.config.agents.map((a) => a.id), paused: this.paused,
         unattended_agents: this.d.config.agents.filter((a) => a.unattended).map((a) => a.id),
       });
-      await Promise.all([this.sender(), this.heartbeater(), this.streamLoop(), this.pauseWatcher(), this.sessionsWatcher()]);
+      await Promise.all([this.sender(), this.heartbeater(), this.streamLoop(), this.pauseWatcher(), this.sessionsWatcher(), this.healthWatcher()]);
       result = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : "stopped";
     } catch (e) {
       failure = errMessage(e);
       throw e;
     } finally {
-      await this.manager.killAll(this.revoked ? "revoked" : "stopped").catch(() => undefined);
+      // Stopped or restarted (not revoked, not refused): what is in flight is the next run's to end or carry on.
+      await this.manager.killAll(this.revoked ? "revoked" : "stopped", !this.revoked && !this.authFailed).catch(() => undefined);
       const reason = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : failure ? "failed" : this.paused ? "stopped_while_paused" : result;
       recordDisconnect(this.d.dirs, { reason, detail: this.authWhy || failure || undefined });
       fs.rmSync(pidf, { force: true });

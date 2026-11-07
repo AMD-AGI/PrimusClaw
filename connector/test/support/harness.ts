@@ -10,6 +10,7 @@ import { ClawClient } from "../../src/claw-client.js";
 import { parseConfig, type ConnectorConfig } from "../../src/config.js";
 import { Connector, type ConnectorTiming, type RunResult } from "../../src/connector.js";
 import { KeyTokenProvider, type TokenProvider } from "../../src/credentials.js";
+import type { Report } from "../../src/doctor.js";
 import { fileAudit } from "../../src/audit.js";
 import { auditFile, resolveDirs, type Dirs } from "../../src/paths.js";
 import { silentLogger } from "../../src/util.js";
@@ -58,6 +59,8 @@ export interface HarnessOptions {
   token?: string;
   tokens?: TokenProvider;
   start?: boolean;
+  /** The connector's health checks (doctor.ts); absent: none. */
+  health?: () => Promise<Report>;
 }
 
 export class Harness {
@@ -125,7 +128,7 @@ ${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, {
     const client = new ClawClient({ server: this.claw.url, tokens: o.tokens ?? new KeyTokenProvider(o.token ?? "good-token"), requestTimeoutMs: 3000 });
     this.connector = new Connector({
       config: this.config, dirs: this.dirs, client, server: this.claw.url, audit: fileAudit(auditFile(this.dirs)), log: silentLogger,
-      version: "test", timing: { ...FAST, ...(o.timing ?? {}) },
+      version: "test", timing: { ...FAST, ...(o.timing ?? {}) }, health: o.health,
     });
   }
 

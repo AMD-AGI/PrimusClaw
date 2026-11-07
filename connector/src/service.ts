@@ -21,7 +21,7 @@ import { parseArgs } from "node:util";
 import type { Ctx, ServiceHelpers } from "./commands.js";
 import { isAlive, processStart } from "./children.js";
 import { needsLogin, recordDisconnect, recentDisconnects } from "./health.js";
-import { keepaliveFile, runLogFile, serviceFile, supervisorPidFile } from "./paths.js";
+import { keepaliveFile, keepaliveStampFile, runLogFile, serviceFile, supervisorPidFile } from "./paths.js";
 import { errMessage, isObject, sleep } from "./util.js";
 
 export type Supervisor = "systemd" | "launchd" | "script";
@@ -38,7 +38,7 @@ export const NEEDS_PERSON = 78;
  */
 export const CARRIED_ENV = [
   "PATH", "CLAW_CONNECTOR_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
-  "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "LANG",
+  "NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA", "NODE_USE_ENV_PROXY", "SSL_CERT_FILE", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "LANG",
 ] as const;
 const SECRET_NAME = /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i;
 
@@ -266,6 +266,7 @@ export async function cmdSupervise(_args: string[], ctx: Ctx): Promise<number> {
 
 /** `service ensure` (what keepalive.sh runs): start the supervisor, detached, unless it lives or a sign-in is needed. */
 async function ensure(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers): Promise<number> {
+  stampKeepalive(ctx);
   const sup = supervisorPid(ctx);
   if (sup !== null) { ctx.out(`supervisor running (pid ${sup})`); return 0; }
   // Not started while only a person can help (no config, no sign-in, revoked): it would exit 78 every time.
@@ -286,6 +287,14 @@ async function ensure(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers): Promise<numb
     ctx.out(`started the supervisor (pid ${p.pid}); log: ${runLogFile(ctx.dirs)}`);
   } finally { fs.closeSync(log); }
   return 0;
+}
+
+/** Each `ensure` leaves its time, so `doctor` can tell that something (cron, a startup hook, a CronJob) calls keepalive.sh. */
+function stampKeepalive(ctx: Ctx): void {
+  try {
+    fs.mkdirSync(ctx.dirs.state, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(keepaliveStampFile(ctx.dirs), new Date().toISOString() + "\n", { mode: 0o600 });
+  } catch { /* best effort: only doctor reads it */ }
 }
 
 // --- install / uninstall / status ----------------------------------------------------
@@ -363,7 +372,7 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
     const unit = systemdUnitPath(ctx, d);
     writeFile600(unit, systemdUnit(d, vars));
     // Recorded before the first start, which may already end in 78: `login` must still find the unit to restart.
-    recordInstalled(ctx, "systemd");
+    recordInstalled(ctx, "systemd", vars);
     if (!d.systemdBooted()) { ctx.err("systemd is not this machine's init (no /run/systemd/system): use --supervisor script"); return 1; }
     for (const a of [["--user", "daemon-reload"], ["--user", "enable", UNIT], ["--user", "restart", UNIT]]) {
       const r = d.exec("systemctl", a);
@@ -379,7 +388,7 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
     const plist = launchdPlistPath(d);
     // 0600: the proxy URLs it carries may hold a password. launchd reads a LaunchAgent as its owner.
     writeFile600(plist, launchdPlist(d, vars, runLogFile(ctx.dirs)));
-    recordInstalled(ctx, "launchd");
+    recordInstalled(ctx, "launchd", vars);
     d.exec("launchctl", ["bootout", `gui/${d.uid}/${LABEL}`]);
     const r = d.exec("launchctl", ["bootstrap", `gui/${d.uid}`, plist]);
     if (r.code !== 0) { ctx.err(`launchctl bootstrap failed: ${r.out || `exit ${r.code}`}`); return 1; }
@@ -387,7 +396,7 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
   } else {
     const script = keepaliveFile(ctx.dirs);
     writeFile600(script, keepaliveScript(d, vars), 0o700);
-    recordInstalled(ctx, "script");
+    recordInstalled(ctx, "script", vars);
     const code = await ensure(ctx, d, h);
     if (code !== 0) return code;
     ctx.out(`wrote ${script}. This machine has no systemd: the supervisor restarts the connector 5 s after it dies, but`);
@@ -398,8 +407,10 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
   return 0;
 }
 
-function recordInstalled(ctx: Ctx, sup: Supervisor): void {
-  writeFile600(serviceFile(ctx.dirs), JSON.stringify({ supervisor: sup, installed_at: new Date().toISOString() }));
+/** `path`: the PATH the service starts the connector with (absent: none carried), which `doctor` checks the agents against. */
+function recordInstalled(ctx: Ctx, sup: Supervisor, vars: Array<[string, string]>): void {
+  const p = vars.find(([k]) => k === "PATH")?.[1];
+  writeFile600(serviceFile(ctx.dirs), JSON.stringify({ supervisor: sup, installed_at: new Date().toISOString(), ...(p !== undefined ? { path: p } : {}) }));
 }
 
 async function uninstall(ctx: Ctx, d: ServiceDeps, sup: Supervisor): Promise<number> {

@@ -28,6 +28,11 @@ record it.
 ## [Unreleased]
 
 ### Added
+- The connector picks up after a restart (a crash, a kill, a pod restart, `stop`, an upgrade): the turn an agent was running is kept
+  on disk, and the next run either carries it on (the agent was waiting for a person's permission for a tool call, always asks, and
+  the connector is not paused: it asks again and a new card comes, under the same prompt) or ends it with `turn_end` `error: "connector_restarted"`, so a phone stops waiting; prompts queued
+  behind it are delivered again after a supervisor's restart instead of being dropped; and each session used in the last 4 hours
+  gets one `session_recovered` event, which a chat shows as "recovered".
 - A conversation open in a terminal on your machine that has waited a minute for you (Claude Code's own "waiting": a permission or a
   question) is pushed once through your assistant: the machine, the agent, what it waits for and the conversation's title. Answered at
   the terminal within the minute, it is never pushed; a terminal working or finishing is never pushed. A later wait is told again once.
@@ -39,7 +44,7 @@ record it.
   that connector is revoked (`/agent off`, logout, `DELETE .../connectors/:cid`): it then answers 401 `revoked`. The owner is told once,
   through their assistant, which machine was paired and how to disconnect it. New tables `claw_remote_pairings`, `claw_remote_grants`
   (created with the remote-agents schema). The router's `devenv_pair` tool answers "连接我的开发环境" with no machine yet, "add a machine",
-  "pair my laptop" with that command line, said as given; it is never sent by devenv_send or by a report. Router prompt router-devenv-v7.
+  "pair my laptop" with that command line, said as given; it is never sent by devenv_send or by a report. Router prompt router-devenv-v8.
 - Connecting a machine is said with the exact commands, for every client. `GET /v1/remote-agents/setup` gives the connector's npm
   package (`@primusclaw/connector`), the four commands (`npm install -g`, `claw-connector init`, `claw-connector login --server <this
   API's CLAW_PUBLIC_URL> --identity-url <CLAW_CONNECTOR_IDENTITY_URL, else IDENTITY_ISSUER_URL>`, `claw-connector service install`) and
@@ -66,6 +71,15 @@ record it.
   one when it failed (an error or a refusal, the machine refusing the instruction, or the session closing first, now said as an error
   rather than as a finish). Each message carries `remote: {kind, session_id, machine, agent}` so a channel that already shows the
   session can tell. `GET /v1/remote-agents/sessions` lists, per active session, the requests it waits on its user for (`waiting`).
+- `claw-connector doctor` checks the machine first, before its adapter check: Node.js 22+, each agent's program on PATH and on the
+  installed service's PATH, Claude Code and Codex signed in, the roots writable, the proxy variables, Claw answering and whether
+  Node trusts its certificate (`NODE_USE_SYSTEM_CA=1`, which the service now carries with `NODE_USE_ENV_PROXY`), a service and
+  something calling `keepalive.sh`; one fix per problem, exit 1 when something stops sessions (`--json`: `machine_ok`,
+  `environment`). A running connector repeats the machine checks with its own environment, in a child process (a stalled disk
+  cannot stall the connection), every 15 minutes and at once when `doctor` signals it, and reports them in each agent's
+  `capabilities.health` (docs/remote-agents.md, "Health"). The assistant's `devenv_list` passes them on as each machine's
+  `problems`, so "is my dev box OK?" and a devenv_send that cannot work are answered with the fix.
+  Router prompt router-devenv-v7.
 - Brain's `SKILL_HINTS_IN_SYSTEM_USERS` (default none): comma-separated user ids whose turns put the skill and MCP server hints in
   the system message, as `SKILL_HINTS_IN_SYSTEM` does for everyone, so the change can be measured on one identity on a live
   deployment before it is switched on for all. `engine.tools_resolved` logs `hintsInSystem` for each turn.

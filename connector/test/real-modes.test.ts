@@ -83,7 +83,7 @@ describe(`the real Claude adapter as ${who}`, { skip }, () => {
     const r = await openSession("never");
     assert.equal(r.ev.type, "session_started", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
     assert.equal(r.ev.data.currentMode, "bypassPermissions");
-    assert.equal(r.doctor.code, EXIT.ok, JSON.stringify(r.doctor.doc));
+    assert.equal(r.doctor.doc.ok, true, JSON.stringify(r.doctor.doc));   // (the adapter's verdict: the machine checks may fail here, e.g. Claude is not signed in on CI)
     assert.ok(r.doctor.doc.agents[0].modes.includes("bypassPermissions"));
   });
 
@@ -91,7 +91,7 @@ describe(`the real Claude adapter as ${who}`, { skip }, () => {
     const r = await openSession("ask");
     assert.equal(r.ev.type, "session_started", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
     assert.equal(r.ev.data.currentMode, "default");
-    assert.equal(r.doctor.code, EXIT.ok, JSON.stringify(r.doctor.doc));
+    assert.equal(r.doctor.doc.ok, true, JSON.stringify(r.doctor.doc));   // (the adapter's verdict: the machine checks may fail here, e.g. Claude is not signed in on CI)
   });
 
   test(`approval = "ask" while the user's own settings default to bypassPermissions (and IS_SANDBOX is set): opens in default`, { timeout: 300_000 }, async () => {
@@ -99,7 +99,7 @@ describe(`the real Claude adapter as ${who}`, { skip }, () => {
     assert.equal(r.ev.type, "session_started", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
     assert.equal(r.ev.data.currentMode, "default");
     assert.equal(r.ev.data.unattended, false);
-    assert.equal(r.doctor.code, EXIT.ok, JSON.stringify(r.doctor.doc));
+    assert.equal(r.doctor.doc.ok, true, JSON.stringify(r.doctor.doc));   // (the adapter's verdict: the machine checks may fail here, e.g. Claude is not signed in on CI)
     assert.ok(!r.doctor.doc.agents[0].modes.includes("bypassPermissions"), "the adapter leaves bypass out for an agent that asks");
   });
 
