@@ -1299,6 +1299,13 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.ok(!gone.ok && gone.code === "no_agent", JSON.stringify(gone));
     const named = await tools.planSend("alice", { text: "看看", target: codexSid, agent: "claude", new_session: true });
     assert.ok(named.ok && named.plan.agent_id === "claude" && named.plan.session_id === null, JSON.stringify(named));
+    // A session id or conversation ref that names nothing of hers now is never read as a machine's name (codex round 1 of #431).
+    const uuidBox = "0badc0de-0000-4000-8000-000000000001";
+    await machine("alice", uuidBox);
+    for (const fresh of [true, false]) {
+      const stale = await tools.planSend("alice", { text: "看看", target: uuidBox, new_session: fresh });
+      assert.ok(!stale.ok && stale.code === "no_machine", JSON.stringify(stale));
+    }
     // "laptop/claude": the agent named by the label's second part.
     const byLabel = await tools.planSend("alice", { text: "看看", target: "laptop/claude", new_session: true });
     assert.ok(byLabel.ok && byLabel.plan.agent_id === "claude" && byLabel.plan.session_id === null);

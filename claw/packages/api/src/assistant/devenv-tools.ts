@@ -489,6 +489,9 @@ function placeIn(cwd: string, root: string): string | null {
 const samePlace = (a: string | null, placed: string): boolean =>
   a !== null && (a === placed || (isWindowsPath(placed) && isWindowsFolder(a) && windowsForm(a).toLowerCase() === windowsForm(placed).toLowerCase()));
 
+/** What a session id, or the ref of an agent's own conversation, looks like (a UUID): never a machine's name. */
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * The home folder a root sits in (`/home/yihan/work` -> `/home/yihan`, `/root` -> `/root`, `C:\Users\a\repo` -> `C:\Users\a`), else
  * null. A Windows home is compared as Windows compares (any case, either separator) and kept as the root spells it.
@@ -613,6 +616,11 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
   if (target) {
     const machineOf = targetLower.split("/")[0];
     const sessionMachine = named.find((n) => n.session_id?.toLowerCase() === targetLower || n.resume_ref?.toLowerCase() === targetLower);
+    // A session id (or a conversation's ref) that names none of theirs now (closed, or its agent gone with its conversations) is not
+    // read as a machine's name: nothing is chosen in its place.
+    if (!sessionMachine && SESSION_ID_RE.test(target)) {
+      return { ok: false, code: "no_machine", read: false, message: `no open session or conversation of the user is ${flat(target, 80)} now: name the machine and agent instead` };
+    }
     machines = sessionMachine ? [sessionMachine.c] : connectors.filter((c) => nameOf(c).toLowerCase() === machineOf);
     if (sessionMachine && !agentWanted) {
       // A new session beside it runs its agent: one its machine no longer offers is refused, never swapped for another agent there.
