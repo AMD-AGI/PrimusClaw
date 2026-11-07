@@ -1168,6 +1168,13 @@ describe("assistant GitHub events", { skip }, () => {
     assert.equal(gh.s.posts.length, 0);
     assert.equal(await code(ev.workUnsubscribe(turn, { pr: prRef })), "not_watching", "nothing left to stop is said, not done again");
 
+    // A bare number that is two watched pull requests is refused, not guessed.
+    const twin = await watched({ title: "Twin" });
+    await ev.subscribeItem({ userId: "alice", item: twin.itemId, pr: `acme/other#${PR}`, reply: false });
+    assert.equal(await code(ev.workUnsubscribe(turn, { pr: `#${PR}` })), "ambiguous_pr");
+    assert.equal(await count("claw_work_item_subscriptions", "item_id = $1 AND state = 'active'", [twin.itemId]), 2);
+    await ev.workUnsubscribe(turn, { item_id: twin.itemId });
+
     // By item, and by both: only what is named.
     const third = await watched({ title: "Third" });
     await ev.subscribeItem({ userId: "alice", item: third.itemId, pr: "acme/other#9", reply: false });
@@ -1189,7 +1196,7 @@ describe("assistant GitHub events", { skip }, () => {
     gh.comment("Could you confirm?");
     await poll();
     const [msg] = await handedToRun(it.workerSid);
-    assert.ok(msg.content.includes("The user turned on automatic replies on this pull request themselves, so an answer goes out at once with no approval card"));
+    assert.ok(msg.content.includes("The user turned on automatic replies on this pull request themselves, so an answer there goes out at once with no approval card"));
     assert.ok(msg.content.includes("已按你开启的自动回复以你的身份回复了 <link>"));
     assert.ok(!msg.content.includes("needs the user's approval for each comment"));
     const [e] = await events(it.itemId);
@@ -1205,6 +1212,14 @@ describe("assistant GitHub events", { skip }, () => {
     const [offMsg] = await handedToRun(off.workerSid);
     assert.ok(offMsg.content.includes("Answering on the pull request needs the user's approval for each comment"));
     assert.ok(!offMsg.content.includes("no approval card"));
+
+    // One batch with both: each pull request is said as it is.
+    const msg2 = ev.formatGithubEvents([
+      { event_id: "e1", kind: "issue_comment", author: "bob", url: null, body: "a", path: null, line: null, owner: OWNER, repo: REPO, number: PR, reply_allowed: true },
+      { event_id: "e2", kind: "issue_comment", author: "bob", url: null, body: "b", path: null, line: null, owner: OWNER, repo: "other", number: 3, reply_allowed: false },
+    ] as never);
+    assert.ok(msg2.includes(`To answer on ${prRef}, call`));
+    assert.ok(msg2.includes(`On ${OWNER}/other#3 automatic replies are off: Answering on the pull request needs the user's approval`));
 
     // The router's item list says which is which, and work_subscribe's result says no approval card where the user turned it on.
     const { routerManifest } = await import("../src/assistant/role-profile.js");

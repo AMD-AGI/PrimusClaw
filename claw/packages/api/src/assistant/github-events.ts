@@ -348,13 +348,17 @@ export async function workUnsubscribe(
       itemId = found.item.item_id;
     }
     const rows = (await query(
-      `SELECT id, item_id, reply_allowed FROM claw_work_item_subscriptions
+      `SELECT id, item_id, reply_allowed, owner, repo, number FROM claw_work_item_subscriptions
         WHERE user_id = $1 AND state = 'active' AND ($2::text IS NULL OR item_id = $2)
           AND ($3::text IS NULL OR (lower(owner) = lower($3) AND lower(repo) = lower($4)))
           AND ($5::int IS NULL OR number = $5)
         ORDER BY id FOR UPDATE`,
       [owner.user_id, itemId, ref?.owner ?? null, ref?.repo ?? null, number],
-    )).rows as Array<{ id: number | string; item_id: string; reply_allowed: boolean }>;
+    )).rows as Array<{ id: number | string; item_id: string; reply_allowed: boolean; owner: string; repo: string; number: number }>;
+    const named = [...new Set(rows.map((r) => prName(r).toLowerCase()))];
+    if (bare && named.length > 1) {
+      throw new ToolRefused("ambiguous_pr", `#${bare[1]} is more than one watched pull request (${named.join(", ")}): name it as owner/repo#${bare[1]}`);
+    }
     if (!rows.length) {
       throw new ToolRefused("not_watching", itemId
         ? `that item watches no${number !== null ? " such" : ""} pull request now: nothing to stop`
@@ -911,12 +915,15 @@ export function formatGithubEvents(events: readonly PendingEvent[]): string {
     for (const l of `${where}${e.body ?? ""}`.split(/\r\n|\r|\n/)) lines.push(`   > ${l}`);
   });
   lines.push("");
-  const replyable = events.some((e) => e.reply_allowed);
+  const auto = [...new Set(events.filter((e) => e.reply_allowed).map((e) => prName(e)))];
+  const asking = [...new Set(events.filter((e) => !e.reply_allowed).map((e) => prName(e)))];
+  const askFirst = " Answering on the pull request needs the user's approval for each comment (the github tools ask for it); do not try another way.";
   lines.push(
     "Decide for each event whether it needs anything within this item's task, and do it."
-    + (replyable
-      ? ` To answer on the pull request, call ${TOOL_NAME_PREFIX}pr_reply(event_id, body): it posts as the user, at most once per event, and only where the user allowed it. The user turned on automatic replies on this pull request themselves, so an answer goes out at once with no approval card; when you report, say plainly that you answered as the user under the automatic replies they turned on and give the answer's link (in Chinese: 已按你开启的自动回复以你的身份回复了 <link>), and never say an answer waits for or needed approval.`
-      : " Answering on the pull request needs the user's approval for each comment (the github tools ask for it); do not try another way.")
+    + (auto.length
+      ? ` To answer on ${auto.join(", ")}, call ${TOOL_NAME_PREFIX}pr_reply(event_id, body): it posts as the user, at most once per event, and only where the user allowed it. The user turned on automatic replies on ${auto.length > 1 ? "these pull requests" : "this pull request"} themselves, so an answer there goes out at once with no approval card; when you report, say plainly that you answered as the user under the automatic replies they turned on and give the answer's link (in Chinese: 已按你开启的自动回复以你的身份回复了 <link>), and never say such an answer waits for or needed approval.`
+        + (asking.length ? ` On ${asking.join(", ")} automatic replies are off:${askFirst}` : "")
+      : askFirst)
     + ` When you are done and nothing needs the user, finish with ${TOOL_NAME_PREFIX}report(kind="waiting", summary) so the item keeps watching; report ready only for a new result the user should check.`,
   );
   return lines.join("\n");
