@@ -11,7 +11,9 @@ import readline from "node:readline";
 
 const env = process.env;
 const START_MODE = env.FAKE_START_MODE || "default";
-const MODES = ["default", "plan", "acceptEdits", "bypassPermissions"].map((id) => ({ id, name: id === "default" && env.FAKE_MODE_NAME ? env.FAKE_MODE_NAME : id }));
+// FAKE_ROOT=1 stands in for running as root: like claude-agent-acp 0.99.0, bypassPermissions is offered only with IS_SANDBOX set.
+const BYPASS_OFFERED = env.FAKE_ROOT !== "1" || !!env.IS_SANDBOX;
+const MODES = ["default", "plan", "acceptEdits", ...(BYPASS_OFFERED ? ["bypassPermissions"] : [])].map((id) => ({ id, name: id === "default" && env.FAKE_MODE_NAME ? env.FAKE_MODE_NAME : id }));
 const OPTION_IDS = (env.FAKE_OPTIONS || "allow-once,allow-with-updates,reject").split(",");
 const OPTION_KINDS = ["allow_once", "allow_always", "reject_once"];
 const log = env.FAKE_LOG ? (o) => fs.appendFileSync(env.FAKE_LOG, JSON.stringify(o) + "\n") : () => {};

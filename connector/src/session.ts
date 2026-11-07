@@ -67,6 +67,9 @@ export class SessionRefusal extends Error {
   constructor(readonly reason: string, message?: string) { super(message ?? reason); }
 }
 
+/** Why Claude Code leaves `bypassPermissions` out of its modes, for the log line of a refused session (claude-mode.ts). */
+const BYPASS_HINT = ` (Claude Code offers it to root only with IS_SANDBOX set, and never when permissions.disableBypassPermissionsMode is "disable"; "claw-connector doctor" names the fix)`;
+
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024;
 const MAX_QUEUED_PROMPTS = 5;
 const PERMISSION_WARNING_RE = /canUseTool will not be invoked/i;
@@ -338,7 +341,7 @@ export class Session {
   private async enforceMode(mode: string): Promise<void> {
     const a = this.adapter;
     if (!a || !this.acpId) throw new SessionRefusal("adapter_gone");
-    if (this.modes.length && !this.modes.some((m) => m.id === mode)) throw new SessionRefusal("mode_unavailable", `the adapter offers no mode ${mode}`);
+    if (this.modes.length && !this.modes.some((m) => m.id === mode)) throw new SessionRefusal("mode_unavailable", `the adapter offers no mode ${mode}${mode === "bypassPermissions" ? BYPASS_HINT : ""}`);
     this.enforcing = true;
     this.modeSeen = [];
     try {

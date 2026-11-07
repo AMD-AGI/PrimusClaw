@@ -331,6 +331,48 @@ jobs:
           npm run build
           node dist/cli.js --version
 
+  # The connector against the REAL Claude adapter, as the runner's own user and as root: Claude Code offers
+  # bypassPermissions to root only with IS_SANDBOX set, and an agent with approval = "never" was refused with
+  # mode_unavailable on every root machine until the connector set it. Opening a session sends no prompt, so no
+  # model and no credentials are needed. The file skips without the adapter, so the pass count is checked.
+  connector-real-adapter:
+    name: Connector real adapter (${{ matrix.user }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        user: [runner, root]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: connector/package-lock.json
+
+      - run: npm ci
+        working-directory: connector
+
+      - name: Install the adapter the claude preset runs
+        run: npm i --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/acp" @agentclientprotocol/claude-agent-acp@0.99.0
+
+      - name: Open sessions with approval never and ask
+        working-directory: connector
+        shell: bash
+        env:
+          AS_USER: ${{ matrix.user }}
+        run: |
+          adapter="$RUNNER_TEMP/acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"
+          node="$(command -v node)"
+          if [ "$AS_USER" = root ]; then
+            sudo env "PATH=$PATH" "CLAW_REAL_CLAUDE_ACP=$adapter" "$node" --import tsx --test test/real-modes.test.ts | tee "$RUNNER_TEMP/real.log"
+          else
+            env -u IS_SANDBOX "CLAW_REAL_CLAUDE_ACP=$adapter" "$node" --import tsx --test test/real-modes.test.ts | tee "$RUNNER_TEMP/real.log"
+          fi
+          grep -q "^ℹ pass 2$" "$RUNNER_TEMP/real.log"
+
   sandbox:
     name: Sandbox (Go)
     runs-on: ubuntu-latest

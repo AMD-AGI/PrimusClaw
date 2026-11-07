@@ -57,6 +57,15 @@ record it.
   now, and a folder asked for under one compares as Windows does (either separator, any case, a trailing separator or not) and is sent
   as the root spells it with the root's separator; an idle session open there continues however the folder is typed. POSIX roots compare
   exactly, as before.
+- Connector: an agent with `approval = "never"` on a machine where the connector runs as root opens its phone sessions again. Claude
+  Code offers `bypassPermissions` to root only with `IS_SANDBOX` set, so every such session was refused with `mode_unavailable`; the
+  connector now sets `IS_SANDBOX=1` for that agent's Claude adapter only, and says so when it starts. An agent whose own `env` sets
+  `IS_SANDBOX` is left as written, and `status` warns when the mode will still be missing.
+- Connector: `claw-connector doctor` (also run at the end of `init`) starts each agent's adapter, opens a session without a prompt
+  and compares the modes the adapter offers with what `agents.toml` needs, naming the fix instead of leaving it to a refused phone
+  session.
+- Connector: a supervised connector stopped by a signal that did not come from `claw-connector stop` (a bare `kill`) exits 75 and is
+  started again; before, it exited 0, which the supervisor took for a stop on purpose, and the machine stayed offline.
 - Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
   忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
   not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with
