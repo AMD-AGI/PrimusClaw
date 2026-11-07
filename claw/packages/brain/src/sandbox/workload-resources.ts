@@ -8,6 +8,9 @@
  */
 const GPU_RESOURCE_KEY = "amd.com/gpu";
 
+/** SaFE's `resources[].ephemeralStorageLimit`: an ephemeral-storage limit above the request. */
+const EPHEMERAL_STORAGE_LIMIT_KEY = "ephemeralStorageLimit";
+
 /** One element of POST /api/v1/workloads `resources` (SaFE shape). */
 export type WorkloadResourceEntry = Record<string, string | number>;
 
@@ -33,11 +36,18 @@ export function normalizeWorkloadResourcesEntry(d: unknown): WorkloadResourceEnt
   } else if ("ephemeralStorage" in obj) {
     out.ephemeralStorage = String(obj.ephemeralStorage);
   }
+  // SaFE's ephemeral-storage limit, when it is to be larger than the request
+  // above: the pod is scheduled on `ephemeralStorage` and may grow to this.
+  // Only meaningful next to a request, so it is not a quota key on its own.
+  if (EPHEMERAL_STORAGE_LIMIT_KEY in obj && out.ephemeralStorage !== undefined) {
+    out[EPHEMERAL_STORAGE_LIMIT_KEY] = String(obj[EPHEMERAL_STORAGE_LIMIT_KEY]);
+  }
   out.replica = 1;
   for (const [key, val] of Object.entries(obj)) {
     const sk = String(key);
     if (
-      ["replica", "cpu", "memory", "gpu", "ephemeralStorage", "ephemeral-storage"].includes(sk)
+      ["replica", "cpu", "memory", "gpu", "ephemeralStorage", "ephemeral-storage",
+        EPHEMERAL_STORAGE_LIMIT_KEY].includes(sk)
     ) {
       continue;
     }
