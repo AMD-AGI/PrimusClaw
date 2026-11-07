@@ -113,6 +113,21 @@ export function clipSummary(text: string): string {
   return redacted.length > SUMMARY_MAX ? `${redacted.slice(0, SUMMARY_MAX - 1)}…` : redacted;
 }
 
+/**
+ * How long a run ran, in seconds, across every claim of it.
+ *
+ * Not `completed_at - started_at`: a run a draining brain hands back (`releaseClaim`) or a reaper requeues has its
+ * `started_at` cleared, and the claim that resumes it stamps a new one. Measured from there, a 70-second run taken over
+ * three seconds before its end ran three seconds, and was not announced as a long run at all (2026-11-07 11:21Z, release
+ * claw-rel-1917: the run's `run.completed` was never recorded, so the chat that started it never heard it end). The row's
+ * run-time anchor (`run_time_epoch_at`, stamped once) and the queue time banked across every requeue
+ * (`queued_ms_accrued`) give the run's whole life minus its time in the queue, which is what `started_at` measured
+ * for a run claimed once. A row from before the anchor existed keeps the old measure.
+ */
+const RUN_SECONDS_SQL = `CASE WHEN t.run_time_epoch_at IS NOT NULL
+              THEN EXTRACT(EPOCH FROM (COALESCE(t.completed_at, NOW()) - t.run_time_epoch_at)) - t.queued_ms_accrued / 1000.0
+              ELSE EXTRACT(EPOCH FROM (COALESCE(t.completed_at, NOW()) - COALESCE(t.started_at, t.created_at))) END`;
+
 export interface RunFinished {
   sessionId: string;
   taskIds: string[];
@@ -138,7 +153,7 @@ export async function recordRunFinished(input: RunFinished): Promise<number> {
     `SELECT t.task_id, t.metadata->>'message_id' AS message_id, s.user_id, s.name, s.config->>'trigger_id' AS trigger_id,
             (s.config->'notify_on_finish' = 'true'::jsonb) AS notify_on_finish,
             COALESCE(t.completed_at, NOW()) AS finished_at,
-            EXTRACT(EPOCH FROM (COALESCE(t.completed_at, NOW()) - COALESCE(t.started_at, t.created_at))) AS seconds
+            ${RUN_SECONDS_SQL} AS seconds
        FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id
       WHERE t.session_id = $1 AND t.task_id = ANY($2)`,
     [input.sessionId, input.taskIds],
