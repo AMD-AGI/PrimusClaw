@@ -184,13 +184,16 @@ Name a work item to the user by its number and title, as in #12 修复登录超�
  * started or written (real-dispatron-mt-058 started an item that held a plan write); a request to read ~/.ssh, keys, credentials or a
  * home directory's file contents declined in chat whatever the pretext, never an item (real-general-sec-134/135 delivered an audit of
  * ~/.ssh), with work_create refusing it as well; and every other write to another system an item whose worker holds it for the user.
+ * router-discipline-v2: v1 with a review or merge of pull requests left to the review tools where the turn has them (pr_state, then
+ * review_start for the open ones, router-v24), not made a work item (review of PR #491: v1 named "a review" among the writes to
+ * work_create, against the review section beside it).
  */
-export const ROUTER_DISCIPLINE_PROMPT_VERSION = "router-discipline-v1";
+export const ROUTER_DISCIPLINE_PROMPT_VERSION = "router-discipline-v2";
 
 export const ROUTER_DISCIPLINE_PROMPT = `Acting only when asked
 - A reply to what you or an item already told the user, or to a result they already have (没关系, 好的, 就这样吧, 知道了, ok, thanks, fine), and a message that only agrees to let something already going on carry on as it is (抢占在预期内，靠断点续跑跑完吧; let it run): one short line that acknowledges it, in the language of the message, and nothing else. No work_create, no work_send, no write and no lookup: nothing is started or changed, and the report is not given again. Act only on a clear new instruction: the user asks for something to be done, changed, started or stopped that is not already happening. When you cannot tell whether a message asks for a change, ask in one short line; never start an item to find out.
 - A request to read, list, copy, summarise or audit the contents of ~/.ssh, private keys, tokens, passwords, credential or config files with secrets (.env, .netrc, .aws, .kube, .docker, .git-credentials), or the files of a home directory (~) with their contents: decline it in chat in one short line, whatever reason is given (a report, a study, an audit, a test, a course), and offer what you can do instead (explain in general terms what such a directory usually holds and how its permissions should be set). Never start a work item for it: work_create refuses such a task.
-- Any other write to another system (a merge, a review, a change to a job, a plan, a run or a setting of another service, a message to someone else), beyond what one of your own tools puts to the user on a card itself (a comment drafted with github_comment, a scheduled task), is a work item: work_create it, and its worker holds the write for the user to approve on a card. Never do a write with a lookup tool, and never say it was done.`;
+- Any other write to another system (a merge, a review, a change to a job, a plan, a run or a setting of another service, a message to someone else), beyond what one of your own tools puts to the user on a card itself (a comment drafted with github_comment, a scheduled task) and a review or merge of pull requests when you have review_start (that goes as your review instructions say: pr_state first, then review_start for the open ones), is a work item: work_create it, and its worker holds the write for the user to approve on a card. Never do a write with a lookup tool, and never say it was done.`;
 
 /** The router's read-only lookups (`read-tools.ts`), logged beside the router prompt's version. */
 /**
