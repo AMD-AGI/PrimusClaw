@@ -191,27 +191,41 @@ describe("a command older than the live TTL", () => {
     await h.turnEnd(sid, 2);
     assert.equal(h.claw.confirmations.length, 2);
   });
-  test("a restart while Claw is being asked keeps the command for the next run: neither run nor counted as handled", async () => {
-    const h = await Harness.create();
-    const sid = await h.newSession();
-    h.claw.holdConfirms = true;
-    const old = Date.now() - REMOTE_AGENT_TIMING.liveCommandTtlMs - 60_000;
-    const seq = h.prompt(sid, "say asked-across-a-restart", { issued_at: old, cmd_id: "c-restart" });
-    await h.claw.until("the confirmation asked", () => h.claw.confirmAsked.includes("c-restart"));
-    await h.stop();
-    h.claw.releaseConfirms(); // the answer (live) comes after that run stopped
-    await sleep(300);
-    assert.equal(h.messages(sid).includes("asked-across-a-restart"), false, "not run by the run that stopped");
-    assert.ok(h.claw.cursor < seq, "not acknowledged: Claw still holds it");
-    assert.ok(h.audit().some((a) => a.kind === "command_deferred" && a.cmd_id === "c-restart"));
-    assert.equal(h.claw.eventsOf(sid, "command_rejected").length, 0, "nor reported refused");
-    h.claw.holdConfirms = false;
-    h.connect();
-    h.start();
-    await h.claw.until("the prompt run by the next run", () => h.messages(sid).includes("asked-across-a-restart"));
-    const ends = await h.claw.until("its turn_end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq));
-    assert.equal(ends.data.stopReason, "end_turn");
-  });
+  for (const later of ["live", "cancelled"] as const) {
+    test(`a restart while Claw is being asked keeps the command for the next run, which asks again: ${later === "live" ? "still live, it runs there" : "cancelled meanwhile, it never runs"}`, async () => {
+      const h = await Harness.create();
+      const sid = await h.newSession();
+      h.claw.holdConfirms = true;
+      const old = Date.now() - REMOTE_AGENT_TIMING.liveCommandTtlMs - 60_000;
+      const seq = h.prompt(sid, "say asked-across-a-restart", { issued_at: old, cmd_id: "c-restart" });
+      await h.claw.until("the confirmation asked", () => h.claw.confirmAsked.includes("c-restart"));
+      await h.stop();
+      h.claw.releaseConfirms(); // the answer (live) comes after that run stopped
+      await sleep(300);
+      assert.equal(h.messages(sid).includes("asked-across-a-restart"), false, "not run by the run that stopped");
+      assert.ok(h.claw.cursor < seq, "not acknowledged: Claw still holds it");
+      assert.ok(h.audit().some((a) => a.kind === "command_deferred" && a.cmd_id === "c-restart"));
+      assert.equal(h.claw.eventsOf(sid, "command_rejected").length, 0, "nor reported refused");
+      // Delivered again as a young command (no stall in the next run, inside the TTL): the note left by the run that stopped is
+      // what makes the next one ask.
+      h.claw.commands.find((c) => c.seq === seq)!.payload.issued_at = Date.now();
+      h.claw.holdConfirms = false;
+      if (later === "cancelled") h.claw.commandStatus.set("c-restart", "cancelled");
+      h.connect();
+      h.start();
+      if (later === "live") {
+        await h.claw.until("the prompt run by the next run", () => h.messages(sid).includes("asked-across-a-restart"));
+        const ends = await h.claw.until("its turn_end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq));
+        assert.equal(ends.data.stopReason, "end_turn");
+      } else {
+        const rejected = await h.claw.until("refused by the next run", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_id === "c-restart"));
+        assert.equal(rejected.data.status, "cancelled");
+        await sleep(300);
+        assert.equal(h.messages(sid).includes("asked-across-a-restart"), false, "never run");
+      }
+      assert.deepEqual(h.claw.confirmAsked.filter((c) => c === "c-restart").length, 2, "asked again by the next run");
+    });
+  }
   test("a close or a cancel is never held up by a question", async () => {
     const h = await Harness.create();
     const sid = await h.newSession();

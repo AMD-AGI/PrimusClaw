@@ -138,6 +138,12 @@ export const DEFAULT_TIMING: ConnectorTiming = {
  * `decision`) makes an agent act, and is confirmed after a stall or past the live TTL.
  */
 const ENDING_COMMANDS = new Set(["cancel", "close"]);
+/**
+ * Why a command is confirmed with Claw before it acts: read just after a stall (`stall`), older than the live TTL (`old`), or
+ * asked about by an earlier run that stopped before the answer (`deferred`: `IdentityState.confirm_first`).
+ */
+type Lateness = "stall" | "old" | "deferred";
+
 /** Tries at asking Claw whether a late command is still live, before it is dropped as unconfirmed. */
 const CONFIRM_ATTEMPTS = 4;
 
@@ -155,7 +161,15 @@ interface IdentityState {
   handled: string[];
   /** Claw said this row was revoked (401 `revoked`). It stays revoked for good, so the next sign-in registers a new one. */
   revoked?: boolean;
+  /**
+   * Commands Claw was being asked about (`confirmLive`) and had not answered for when this was written: one delivered again to a
+   * later run is asked about there too, whatever that run's stall clock says (the stall it was late for is not that run's).
+   */
+  confirm_first?: string[];
 }
+
+/** At most this many ids are kept in `confirm_first`; the oldest go first. */
+const MAX_CONFIRM_FIRST = 200;
 
 /**
  * Which commands have been handled. A command is "handled" once it has been
@@ -272,6 +286,8 @@ export class Connector {
   private confirmUntil = -Infinity;
   /** How many stalls this run has seen: a command read before one and still waiting to act is confirmed when it acts. */
   private stallEpoch = 0;
+  /** `IdentityState.confirm_first`: asked about and not yet answered, here or by an earlier run. */
+  private confirmFirst = new Set<string>();
   /** Claw's clock minus this machine's, from the command stream's `ready` frame, to judge a command's `issued_at`. */
   private clockOffsetMs = 0;
   /** connector.json, written off the event loop: a heartbeat never waits for the disk (see statefile.ts). */
@@ -366,7 +382,11 @@ export class Connector {
     if (!isObject(raw) || typeof raw.connector_id !== "string" || typeof raw.server !== "string") return this.keptIdentity("no connector id in it");
     // Stored for another Claw: not this server's row, and the fallback is not either.
     if (raw.server !== this.d.server) return null;
-    return { server: raw.server, connector_id: raw.connector_id, cursor: typeof raw.cursor === "number" ? raw.cursor : 0, handled: Array.isArray(raw.handled) ? raw.handled.filter((x): x is string => typeof x === "string") : [] };
+    return {
+      server: raw.server, connector_id: raw.connector_id, cursor: typeof raw.cursor === "number" ? raw.cursor : 0,
+      handled: Array.isArray(raw.handled) ? raw.handled.filter((x): x is string => typeof x === "string") : [],
+      confirm_first: Array.isArray(raw.confirm_first) ? raw.confirm_first.filter((x): x is string => typeof x === "string").slice(-MAX_CONFIRM_FIRST) : [],
+    };
   }
 
   /** connector-id.json, for a connector.json that cannot be read; null when it has no id for this server either. */
@@ -398,7 +418,10 @@ export class Connector {
 
   /** Saves connector.json in the background; `identityOut.settled()` says whether it landed. */
   private writeIdentity(): void {
-    const st: IdentityState = { server: this.d.server, connector_id: this.cid, cursor: this.ledger.cursor, handled: this.ledger.recentIds, ...(this.rowRevoked ? { revoked: true } : {}) };
+    const st: IdentityState = {
+      server: this.d.server, connector_id: this.cid, cursor: this.ledger.cursor, handled: this.ledger.recentIds, ...(this.rowRevoked ? { revoked: true } : {}),
+      ...(this.confirmFirst.size ? { confirm_first: [...this.confirmFirst] } : {}),
+    };
     this.identityOut.save(JSON.stringify(st));
   }
 
@@ -408,6 +431,7 @@ export class Connector {
     if (have) {
       this.cid = have.connector_id;
       this.ledger = new CommandLedger(have.cursor, have.handled);
+      this.confirmFirst = new Set(have.confirm_first ?? []);
       // connector.json written whole again, from the kept id.
       if (have.fromKeep) { this.writeIdentity(); await this.identityOut.settled(); }
       await this.keepIdentity();
@@ -739,7 +763,8 @@ export class Connector {
     this.ledger.begin(seq, cmd.cmd_id);
     // Judged now, as the frame is read, not once it reaches the front of its session's queue: a frame read just after a stall
     // was in the socket's buffer through it.
-    const gate = ENDING_COMMANDS.has(cmd.type) ? undefined : this.gateFor(cmd, this.lateness(cmd));
+    const gate = ENDING_COMMANDS.has(cmd.type) ? undefined
+      : this.gateFor(cmd, this.lateness(cmd) ?? (this.confirmFirst.has(cmd.cmd_id) ? "deferred" : null));
     // Not awaited: the stream must keep being read while a slow command (starting an adapter) runs.
     // The command counts as handled when the manager says so (a prompt: when it reaches the adapter), and
     // only then can the cursor sent to the server pass it. A late one runs only if Claw says it is still live.
@@ -755,9 +780,9 @@ export class Connector {
    * late (`late`) or a stall has happened since it was read or last confirmed: then Claw is asked (`confirmLive`). Once refused,
    * always refused.
    */
-  private gateFor(cmd: Command, late: "stall" | "old" | null): MayRun {
+  private gateFor(cmd: Command, late: Lateness | null): MayRun {
     let seen = this.stallEpoch;
-    let why: "stall" | "old" | null = late;
+    let why: Lateness | null = late;
     let refused = false;
     return () => {
       if (refused) return "drop";
@@ -793,7 +818,7 @@ export class Connector {
   }
 
   /** Why `cmd` must be confirmed before it runs: a stall just ended (`stall`), or it is older than the live TTL (`old`); or null. */
-  private lateness(cmd: Command): "stall" | "old" | null {
+  private lateness(cmd: Command): Lateness | null {
     this.tick();
     if (performance.now() <= this.confirmUntil) return "stall";
     const issued = cmd.issued_at;
@@ -813,7 +838,21 @@ export class Connector {
    * expired, gone, this connector revoked, or no answer) drops it: audited, and said in its session, so whoever waits on it is told.
    * With no answer because this run is stopping (not revoked), `keep`: not run and not handled, so the next run gets it again.
    */
-  private async confirmLive(cmd: Command, why: "stall" | "old"): Promise<Verdict> {
+  private async confirmLive(cmd: Command, why: Lateness): Promise<Verdict> {
+    // Written down before asking, and waited for (a bounded time): a run that stops before the answer leaves the next one a note
+    // to ask again when Claw delivers the command to it, instead of taking it as fresh.
+    if (!this.confirmFirst.has(cmd.cmd_id)) {
+      this.confirmFirst.add(cmd.cmd_id);
+      for (const id of [...this.confirmFirst].slice(0, Math.max(0, this.confirmFirst.size - MAX_CONFIRM_FIRST))) this.confirmFirst.delete(id);
+      this.writeIdentity();
+      await this.identityOut.settled(STATE_WRITE_WAIT_MS);
+    }
+    const verdict = await this.askLive(cmd, why);
+    if (verdict !== "keep") { this.confirmFirst.delete(cmd.cmd_id); this.writeIdentity(); }
+    return verdict;
+  }
+
+  private async askLive(cmd: Command, why: Lateness): Promise<Verdict> {
     let status: string | null = null;
     let error = "";
     for (let attempt = 0; attempt < CONFIRM_ATTEMPTS && status === null; attempt++) {
