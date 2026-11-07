@@ -79,6 +79,11 @@ export interface ConnectorTiming extends SessionTiming {
   authFailLimit: number;
   /** ...and only once the refusals have gone on this long, so a burst (a gateway or identity-service hiccup) never ends a run. */
   authFailWindowMs: number;
+  /**
+   * Claw refused to register one more connector for this person (409 `connector_limit_reached`): tried again this
+   * often, not every few seconds by a supervisor, until a machine they no longer use is removed.
+   */
+  limitRetryMs: number;
 }
 
 /** The least time between two reconnects made at once on a server's `event: reconnect` (`streamLoop`). */
@@ -103,7 +108,14 @@ export const DEFAULT_TIMING: ConnectorTiming = {
   authFailWindowMs: 120_000,
   healthMs: RECHECK_MS,
   healthMinGapMs: 5_000,
+  limitRetryMs: 10 * 60_000,
 };
+
+/** What to do about 409 `connector_limit_reached`, for the log, `status` and the run's own output. */
+export const CONNECTOR_LIMIT_HINT = "Claw already holds the most connectors one person may have, so it will not register this machine: "
+  + "remove machines you no longer use (in the chat: /agents, or claw-connector logout on that machine). This connector tries again every 10 minutes by itself.";
+
+export const isConnectorLimit = (e: unknown): boolean => e instanceof HttpError && e.status === 409 && e.code === "connector_limit_reached";
 
 interface IdentityState {
   server: string;
@@ -334,6 +346,7 @@ export class Connector {
    * fix and ends the run with its message.
    */
   private async startup(): Promise<"ok" | "stopped" | "revoked"> {
+    let atLimit = false;
     for (let attempt = 0; !this.ctl.signal.aborted; attempt++) {
       try {
         await this.identify();
@@ -341,6 +354,20 @@ export class Connector {
         return "ok";
       } catch (e) {
         if (this.isRevocation(e)) { await this.onRevoked(e); return "revoked"; }
+        if (isConnectorLimit(e)) {
+          // Not a failure a restart fixes, and not one to end on either: a supervisor would start it again every 5 s
+          // for good. It waits here, slowly, and comes up by itself once a slot is free.
+          if (!atLimit) {
+            atLimit = true;
+            this.d.log.error(CONNECTOR_LIMIT_HINT, { error: errMessage(e) });
+            this.d.audit.record("connector_limit_reached", {});
+            recordDisconnect(this.d.dirs, { reason: "connector_limit_reached", detail: CONNECTOR_LIMIT_HINT });
+          }
+          await sleep(this.timing.limitRetryMs, this.ctl.signal);
+          // Paused meanwhile ("claw-connector pause"): not registered until it is resumed.
+          while (!this.ctl.signal.aborted && fs.existsSync(pauseFile(this.d.dirs))) await sleep(this.timing.pausePollMs, this.ctl.signal);
+          continue;
+        }
         if (!isTransient(e)) throw e;
         this.d.log.warn("cannot reach Claw yet; will retry", { error: errMessage(e), attempt });
         await sleep(backoffMs(attempt, this.timing.backoffMinMs, this.timing.backoffMaxMs), this.ctl.signal);

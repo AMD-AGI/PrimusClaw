@@ -156,6 +156,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
     case "session/new": {
       if (env.FAKE_AUTH_REQUIRED) return fail(id, -32000, "Authentication required");
       if (env.FAKE_API_KEY_AUTH === "1" && !signedIn) return fail(id, -32000, "Authentication required");
+      // An agent that signs in with a variable (ANTHROPIC_API_KEY): without it, refused as the real adapters refuse.
+      if (env.FAKE_NEEDS_ENV && !env[env.FAKE_NEEDS_ENV]) return fail(id, -32000, "Authentication required");
       const sessionId = "acp-" + nextId++;
       // Like claude-agent-acp 0.99.0: a client that sets allowDangerouslySkipPermissions to false gets no bypass at all,
       // and a session the user's settings start in bypassPermissions starts in default instead.
