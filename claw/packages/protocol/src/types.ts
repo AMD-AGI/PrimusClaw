@@ -433,6 +433,13 @@ export interface ExecuteRequest {
    */
   cite?: { tools: string[]; source_servers?: string[]; user_urls?: string[]; link_servers?: Record<string, string> };
   /**
+   * The tools whose `text` is a report checked against its own sources before the call goes on (a worker's `deliver_text`, by exact
+   * name): every source its numbered citations name is opened with the run's `web_fetch`, a statement no opened source supports is
+   * marked unverified, and only the checked text is delivered (Brain, `tools/cite-check.ts`). A text with no numbered citations
+   * and list of sources is passed on unchanged.
+   */
+  cite_check?: { tools: string[] };
+  /**
    * The lookups of this run whose results are log text, by exact tool name (`mcp__<server>__<tool>`), each with the argument
    * that says how many lines or entries it returns (`tail_lines`, `limit`; empty for a read that counts nothing but may carry log
    * text, such as a container's termination message). For such a call Brain lowers that argument to `lines` (and sets it when

@@ -1729,7 +1729,7 @@ export const FETCH_BODY_IDLE_TIMEOUT_MS = envInt("FETCH_BODY_IDLE_TIMEOUT_MS", 6
 export const FETCH_TOTAL_TIMEOUT_MS = envInt("FETCH_TOTAL_TIMEOUT_MS", 600_000);
 
 // --- Web Search ---
-export type WebSearchProviderType = "anthropic" | "tavily" | "brave" | "serper" | "disabled";
+export type WebSearchProviderType = "anthropic" | "tavily" | "brave" | "serper" | "duckduckgo" | "disabled";
 export const WEB_SEARCH_PROVIDER = env("WEB_SEARCH_PROVIDER", "disabled") as WebSearchProviderType;
 export const WEB_SEARCH_FALLBACK = env("WEB_SEARCH_FALLBACK", "");
 export const WEB_SEARCH_MAX_USES = envInt("WEB_SEARCH_MAX_USES", 8);

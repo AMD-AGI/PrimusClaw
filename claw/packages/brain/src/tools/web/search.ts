@@ -3,7 +3,7 @@
 
 /**
  * WebSearchService — unified web search dispatching to Anthropic native,
- * Tavily, Brave, or Serper backends.
+ * Tavily, Brave, Serper, or the keyless DuckDuckGo HTML backend.
  *
  * The Anthropic native path wraps the server-side search tool in a short
  * auxiliary Messages call, so `web_search` stays an ordinary client-side tool
@@ -372,6 +372,108 @@ class SerperProvider implements WebSearchProvider {
   }
 }
 
+// ── Keyless provider: DuckDuckGo HTML ──
+
+/** The page DuckDuckGo serves to clients without JavaScript: results as plain links, no key needed. */
+export const DUCKDUCKGO_HTML_URL = "https://html.duckduckgo.com/html/";
+/** The most of a results page parsed: the page is about 35 KB. */
+const DUCKDUCKGO_MAX_BYTES = 1024 * 1024;
+
+/** The character `n` names, or nothing when it names none. */
+function codePoint(n: number): string {
+  return Number.isInteger(n) && n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : "";
+}
+
+/** `s` with its tags taken out and the entities an HTML results page writes in titles and snippets read. */
+function htmlText(s: string): string {
+  return s
+    .replace(/<[^>]*>/g, "")
+    .replace(/&#x([0-9a-f]{1,6});/gi, (_, h: string) => codePoint(parseInt(h, 16)))
+    .replace(/&#(\d{1,7});/g, (_, d: string) => codePoint(Number(d)))
+    .replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * The hits of a DuckDuckGo HTML results page, in order: each `result__a` link's target (the `uddg` parameter of its redirect link,
+ * or the link itself), its title and the snippet that follows it. Ads are left out: their link stays on duckduckgo.com (`y.js`).
+ */
+export function parseDuckDuckGoHtml(html: string): SearchHit[] {
+  const hits: SearchHit[] = [];
+  const parts = html.split(/<a\b(?=[^>]*\bclass="result__a")/);
+  for (const part of parts.slice(1)) {
+    const href = part.match(/\bhref="([^"]*)"/)?.[1];
+    const title = part.match(/^[^>]*>([\s\S]*?)<\/a>/)?.[1];
+    if (!href || title === undefined) continue;
+    let target: URL;
+    try {
+      const link = new URL(href.replace(/&amp;/g, "&"), "https://duckduckgo.com/");
+      const uddg = link.searchParams.get("uddg");
+      target = new URL(uddg ?? link.toString());
+    } catch {
+      continue;
+    }
+    const host = target.hostname.toLowerCase();
+    if ((target.protocol !== "https:" && target.protocol !== "http:") || host === "duckduckgo.com" || host.endsWith(".duckduckgo.com")) continue;
+    const snippet = part.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/)?.[1];
+    if (hits.some((h) => h.url === target.toString())) continue;
+    hits.push({ title: htmlText(title), url: target.toString(), ...(snippet ? { snippet: htmlText(snippet) } : {}) });
+  }
+  return hits;
+}
+
+/**
+ * DuckDuckGo's HTML results page: a search with no key, for a deployment whose native search cannot run (a gateway that refuses
+ * the search tool) and that has no third-party key. Named in `WEB_SEARCH_FALLBACK` it answers only when the provider before it
+ * failed, so the native search takes over again by itself once it works.
+ */
+class DuckDuckGoProvider implements WebSearchProvider {
+  readonly name = "duckduckgo";
+  async search(query: string, opts: {
+    maxResults?: number;
+    allowedDomains?: string[];
+    blockedDomains?: string[];
+    freshness?: string;
+  }): Promise<SearchHit[]> {
+    const { default: axios } = await import("axios");
+    let q = query;
+    if (opts.allowedDomains?.length) {
+      q += " " + opts.allowedDomains.map((d) => `site:${d}`).join(" OR ");
+    }
+    const freshnessMap: Record<string, string> = { day: "d", week: "w", month: "m", year: "y" };
+    const params: Record<string, string> = {
+      q,
+      ...(opts.freshness && freshnessMap[opts.freshness] ? { df: freshnessMap[opts.freshness] } : {}),
+    };
+    const resp = await axios.get(DUCKDUCKGO_HTML_URL, {
+      params,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      responseType: "text",
+      maxContentLength: DUCKDUCKGO_MAX_BYTES,
+      timeout: 15_000,
+    });
+    // A page with no results that is not a results page at all (DuckDuckGo's check for automated traffic answers 202) is a failure
+    // of this backend, so the next one is tried, not "nothing found".
+    const body = typeof resp.data === "string" ? resp.data : "";
+    let results = parseDuckDuckGoHtml(body);
+    if (!results.length && (resp.status !== 200 || !/\bresults\b/.test(body))) {
+      throw new BackendFailure(`no results page (HTTP ${resp.status})`);
+    }
+    if (opts.blockedDomains?.length) {
+      results = results.filter((h) => {
+        try {
+          return !domainMatchesAny(new URL(h.url).hostname, opts.blockedDomains!);
+        } catch { return false; }
+      });
+    }
+    return results.slice(0, opts.maxResults ?? 8);
+  }
+}
+
 // ── Format third-party results to same output string ──
 
 function formatThirdPartyResults(query: string, hits: SearchHit[]): string {
@@ -420,6 +522,7 @@ export class WebSearchService {
         case "tavily":  this.providers.push(new TavilyProvider()); break;
         case "brave":   this.providers.push(new BraveProvider()); break;
         case "serper":  this.providers.push(new SerperProvider()); break;
+        case "duckduckgo": this.providers.push(new DuckDuckGoProvider()); break;
       }
     }
   }

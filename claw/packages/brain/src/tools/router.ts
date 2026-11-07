@@ -11,6 +11,7 @@ import type { McpToolCaller } from "../clients/mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
 import type { RunCitations } from "./citations.js";
+import { checkNote, checkReport, type CiteCheck } from "./cite-check.js";
 import type { LogReads } from "./log-reads.js";
 import { callWithWorkspaceFanout, fansOut } from "./workspace-fanout.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
@@ -276,6 +277,8 @@ export class ToolRouter {
   readTaint: ReadTaint | null = null;
   /** The run's `cite` (`citations.ts`): set by the engine on the top-level router, null when the request has none. */
   citations: RunCitations | null = null;
+  /** The run's `cite_check` (`cite-check.ts`): set by the engine on the top-level router, null when the request has none. */
+  citeCheck: CiteCheck | null = null;
   /** The run's `log_reads` (`log-reads.ts`): set by the engine, null when the request has none. */
   logReads: LogReads | null = null;
 
@@ -478,6 +481,28 @@ export class ToolRouter {
     if (this.toolAllowlist && !this.toolAllowlist.allows(name)) {
       return refuse(outcome, toolNotAllowedMessage(name));
     }
+    // A research report is checked against its own sources before it is delivered, and only the checked text goes on
+    // (`cite-check.ts`); the model is told what the check found before what the tool answered.
+    const check = this.citeCheck;
+    if (check?.checks(name) && typeof input.text === "string" && input.text.trim()) {
+      const result = await checkReport(input.text, check.ports, signal);
+      if (result.checked) {
+        const answered: RouteOutcome = outcome ?? { isError: false };
+        const text = await this.routeListed(name, { ...input, text: result.text }, signal, answered, ctx);
+        return answered.isError ? text : `${checkNote(result)}\n\n${text}`;
+      }
+    }
+    return this.routeListed(name, input, signal, outcome, ctx);
+  }
+
+  /** `route()` for a call the allow-list let through: the read taint and the citations, then the tool. */
+  private async routeListed(
+    name: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+    outcome?: RouteOutcome,
+    ctx?: { stepIdentity?: string },
+  ): Promise<string> {
     const taint = this.readTaint;
     const cite = this.citations;
     if (!taint && !cite) return this.routeAllowed(name, input, signal, outcome, ctx);

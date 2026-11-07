@@ -28,6 +28,13 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Research reports with checked citations (`CLAW_ASSISTANT_RESEARCH`, off by default): the assistant hands "research X / a comparison
+  report on X and Y" to a background work item; the worker searches, reads the pages and delivers a Markdown report whose every finding
+  cites a numbered source. Before the file is stored, Brain opens every cited source with the run's own `web_fetch` and asks a small
+  model whether the page supports each finding that cites it (`ExecuteRequest.cite_check`): a finding no opened source supports is
+  marked unverified (未证实), a source that does not open is marked in the list, and the file ends with the counts.
+- `duckduckgo`, a web search backend that needs no key: named in `WEB_SEARCH_FALLBACK` behind `anthropic`, it answers only while the
+  native search fails (a gateway that refuses its forced tool choice), so nothing changes once the gateway accepts it.
 - A router turn that has said nothing 3.5 s after it began is told "收到，我看一下。" ("On it: looking into it now.") by the server, whatever it
   is doing (thinking, the assistant's own tools, a slow start), not only when a lookup starts; the answer takes that line's place, so a
   channel that edits a message shows one. Off unless `CLAW_ASSISTANT_FIRST_ACK_USERS` names the user (`*` for everyone);
