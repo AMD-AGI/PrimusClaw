@@ -47,14 +47,14 @@ function clip(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
-function salientInput(input: unknown): string {
+function salientInput(input: unknown, maxFields = MAX_FIELDS): string {
   if (!input || typeof input !== "object" || Array.isArray(input)) return "";
   // Keys that look like credentials are masked by value, and kept, so the reader
   // sees that one was passed.
   const safe = redactPublicJson(input) as Record<string, unknown>;
   const parts: string[] = [];
   for (const [key, value] of Object.entries(safe)) {
-    if (parts.length >= MAX_FIELDS) break;
+    if (parts.length >= maxFields) break;
     if (value === null || value === undefined || value === "") continue;
     const text = typeof value === "object" ? JSON.stringify(value) : String(value);
     parts.push(`${key}=${clip(oneLine(text), VALUE_MAX)}`);
@@ -113,7 +113,8 @@ export function approvalAction(tool: unknown, input: unknown, zh: boolean): { ac
       if (!covered.has(key) && value !== null && value !== undefined && value !== "") rest[key] = value;
     }
     // Masked as the target is: a value can carry a command line's credential shapes (`GH_TOKEN=…`), which only the target's masking knows.
-    const more = redactCommandSecrets(salientInput(rest));
+    // Every one of them, not the target's first six: what is approved is what is shown.
+    const more = redactCommandSecrets(salientInput(rest, Infinity));
     const action = zh ? known.zh : known.en;
     if (!more) return { action, detail: body };
     if (mcp?.[1] === "github") return { action: zh ? `${action}（另设 ${more}）` : `${action} (also setting ${more})`, detail: body };

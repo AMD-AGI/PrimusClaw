@@ -341,6 +341,12 @@ test("the writes of Dispatron, Agent Board and Autopilot have their own words, a
   assert.match(zh("mcp__dispatron__post_runs_task_id_cancel", { task_id: "t-1", force: true, api_token: GH }), /^在 Dispatron 上取消运行 t-1，参数：force=true api_token=/);
   assert.ok(!zh("mcp__dispatron__post_runs_task_id_cancel", { task_id: "t-1", note: `GH_TOKEN=${GH}` }).includes(GH));
   assert.equal(zh("mcp__dispatron__post_problems_problem_id_diagnosis_mark", { problem_id: 4, verdict: "maybe" }), "在 Dispatron 上提交「problems problem id diagnosis mark」，参数：problem_id=4 verdict=maybe");
+  // Every field the words do not say is shown, however many: none is dropped after the target's first six.
+  const repo = { name: "r", organization: "boards", auto_init: true, default_branch: "main", description: "d", gitignores: "Go", issue_labels: "Default", license: "MIT", private: true, readme: "Default", template: true, trust_model: "committer" };
+  const created = zh("mcp__agent-board__create_repo", repo);
+  for (const key of Object.keys(repo).filter((k) => k !== "name" && k !== "organization")) assert.match(created, new RegExp(`\\b${key}=`), `${key}: ${created}`);
+  const many = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`f${i}`, i]));
+  assert.match(en("mcp__github__issue_comment", { repo: "o/r", number: 1, ...many }), /f11=11\)$/, "a GitHub write too");
   // The preconditions of an unknown tool are not known to be preconditions: they are shown.
   assert.match(zh("mcp__x__set_y", { expected_updated_at: "t" }), /参数：expected_updated_at=t$/);
 });
