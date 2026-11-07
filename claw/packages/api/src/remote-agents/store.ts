@@ -548,14 +548,75 @@ export async function issueCommand(r: IssueRequest): Promise<IssueOutcome> {
   });
 }
 
-export type CreateSessionOutcome = { status: "limit" } | { status: "rate_limited" } | { status: "created"; session: Row };
+export type CreateSessionOutcome =
+  | { status: "limit" } | { status: "rate_limited" }
+  | { status: "created"; session: Row; reclaimed: Array<{ session_id: string; connector_id: string }> };
 
-/** Create a session and queue the command that makes the connector start it, or refuse at the limits. */
+/**
+ * When a session nobody is using may be closed to make room for a new one (`createSession` at the limit): no event for this long,
+ * no command waiting for its connector, no turn under way and no approval waiting for the user.
+ */
+export const SESSION_RECLAIM_IDLE_MS = 30 * 60_000;
+/** A session with no event for this long may be closed to make room whatever its last events say (a turn whose machine went away). */
+export const SESSION_RECLAIM_STALE_MS = 24 * 60 * 60_000;
+/** The events that mean a turn is under way when they come after the last `turn_end` (as `readSession` in `devenv-tools.ts` reads them). */
+const TURN_EVENT_TYPES = [
+  "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan", "user_message_chunk",
+  REMOTE_EVENT_PERMISSION_REQUEST, "permission_auto_allowed",
+];
+
+interface Reclaimable { session_id: string; connector_id: string; agent_id: string; updated_at: unknown }
+
+/**
+ * The owner's open sessions that may be closed to make room for `need` new ones, the ones on a machine that is offline first, then
+ * the longest unused; [] when fewer than `need` may. Sessions are never closed on their own: only here, when the person opens one
+ * more than they may have open, so a session left behind (a phone that never closed it, a chat that moved on) does not keep them
+ * out for good. One at work, waiting for their approval, or with a command its connector has not collected is never closed, unless
+ * nothing has come from it for a day.
+ */
+async function reclaimable(q: Querier, owner: string, need: number, onlineWindowMs: number): Promise<Reclaimable[]> {
+  // Locked as read (FOR UPDATE), which waits for a batch of its events being stored now: storing an event takes a key-share lock
+  // on its session row (the events' foreign key) before the batch moves the row's updated_at, so the batch commits first and the
+  // row is then read again as it is (Postgres re-checks a row that changed while it waited), and a session it moved is kept.
+  const rows = (await q(
+    `SELECT s.session_id::text AS session_id, s.connector_id::text AS connector_id, s.agent_id, s.updated_at,
+            COALESCE(c.revoked_at IS NULL AND c.heartbeat_at > NOW() - make_interval(secs => $2::float8)
+              AND c.stream_seen_at > NOW() - make_interval(secs => $2::float8), FALSE) AS online
+       FROM claw_remote_sessions s JOIN claw_remote_connectors c ON c.connector_id = s.connector_id
+      WHERE s.owner_user_id = $1 AND s.status = 'active'
+        AND NOT EXISTS (SELECT 1 FROM claw_remote_commands m WHERE m.connector_id = s.connector_id AND m.session_id = s.session_id)
+        AND (s.updated_at < NOW() - make_interval(secs => $4::float8)
+          OR (s.updated_at < NOW() - make_interval(secs => $3::float8)
+            AND COALESCE((SELECT MAX(e.id) FROM claw_remote_events e
+                           WHERE e.session_id = s.session_id AND e.type = ANY($5::text[]) AND COALESCE(e.data->>'replay', '') <> 'true'), 0)
+              <= COALESCE((SELECT MAX(e.id) FROM claw_remote_events e WHERE e.session_id = s.session_id AND e.type = 'turn_end'), 0)
+            AND NOT EXISTS (
+              SELECT 1 FROM claw_remote_events r
+               WHERE r.session_id = s.session_id AND r.type = $6 AND COALESCE(r.data->>'replay', '') <> 'true'
+                 AND NOT EXISTS (SELECT 1 FROM claw_remote_events d
+                                  WHERE d.session_id = s.session_id AND d.type = $7 AND d.data->>'actionId' = r.data->>'actionId'))))
+      ORDER BY online, s.updated_at
+      LIMIT $8
+        FOR UPDATE OF s`,
+    [owner, secs(onlineWindowMs), secs(SESSION_RECLAIM_IDLE_MS), secs(SESSION_RECLAIM_STALE_MS), TURN_EVENT_TYPES,
+      REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, need],
+  )).rows as Reclaimable[];
+  return rows.length >= need ? rows : [];
+}
+
+/**
+ * Create a session and queue the command that makes the connector start it, or refuse at the limits. At the limit of open sessions,
+ * the ones nobody is using are closed to make room ({@link reclaimable}): each gets a `close` for its connector (the caller wakes
+ * those, `reclaimed`) and a `session.reclaimed` audit naming the session it made room for. Only when no session may be closed is
+ * the answer `limit`.
+ */
 export async function createSession(p: {
   owner: string; client: string | null; connectorId: string; agentId: string; cwd: string; mode: string | null;
   /** Forwarded to the connector as given; never stored on the row (the connector keeps what it needs). */
   resumeRef?: string | null;
   maxActive: number; commandsPerMinute: number;
+  /** The connector presence window, which orders the sessions closed to make room (an offline machine's first). */
+  onlineWindowMs?: number;
 }): Promise<CreateSessionOutcome> {
   return inTransaction(async (q) => {
     await lock(q, `sessions:${p.owner}`);
@@ -563,7 +624,10 @@ export async function createSession(p: {
     const n = Number((await q(
       "SELECT COUNT(*) AS n FROM claw_remote_sessions WHERE owner_user_id = $1 AND status = 'active'", [p.owner],
     )).rows[0].n);
-    if (n >= p.maxActive) return { status: "limit" } as CreateSessionOutcome;
+    const victims = n >= p.maxActive
+      ? await reclaimable(q, p.owner, n - p.maxActive + 1, p.onlineWindowMs ?? REMOTE_AGENT_TIMING.onlineWindowMs)
+      : [];
+    if (n >= p.maxActive && !victims.length) return { status: "limit" } as CreateSessionOutcome;
     if (await recentCommandCount(q, p.owner) >= p.commandsPerMinute) return { status: "rate_limited" } as CreateSessionOutcome;
     const sessionId = randomUUID();
     const session = (await q(
@@ -580,7 +644,20 @@ export async function createSession(p: {
     const base = { owner: p.owner, actor: p.owner, client: p.client, connectorId: p.connectorId, agentId: p.agentId, sessionId };
     await writeAudit(q, { ...base, action: "session.created", detail: { cwd: p.cwd, mode: p.mode, ...(p.resumeRef ? { resume_ref: p.resumeRef } : {}) } });
     await writeAudit(q, { ...base, action: "command.issued", detail: { type: "session.new", cmd_id: cmdId } });
-    return { status: "created", session } as CreateSessionOutcome;
+    for (const v of victims) {
+      // Closed as `/agent close` closes it: its connector is told (a close is delivered late too), and the row is closed now.
+      const closeId = randomUUID();
+      await enqueueCommand(q, { connectorId: v.connector_id, cmdId: closeId, sessionId: v.session_id, type: "close", payload: {} });
+      await q("UPDATE claw_remote_sessions SET status = 'closed', updated_at = NOW() WHERE session_id = $1", [v.session_id]);
+      await writeAudit(q, {
+        owner: p.owner, actor: p.owner, client: p.client, connectorId: v.connector_id, agentId: v.agent_id, sessionId: v.session_id,
+        action: "session.reclaimed",
+        detail: { cmd_id: closeId, for_session: sessionId, idle_since: v.updated_at instanceof Date ? v.updated_at.toISOString() : String(v.updated_at) },
+      });
+    }
+    return {
+      status: "created", session, reclaimed: victims.map((v) => ({ session_id: v.session_id, connector_id: v.connector_id })),
+    } as CreateSessionOutcome;
   });
 }
 

@@ -238,7 +238,12 @@ queued: a retry made after the connector has acknowledged the command is answere
 another session is `409 idempotency_key_reused`.
 
 Limits per user: 5 connectors, 10 active sessions, 60 commands a minute, 20 open
-event streams per API replica.
+event streams per API replica. Sessions are not closed on their own: a new one at the
+session limit closes the user's sessions nobody is using to make room (no event for half an
+hour, no command waiting for its connector, no turn under way and no approval waiting; or no
+event for a day), a machine that is offline first, each with a `close` to its connector and a
+`session.reclaimed` audit, and `201` names them in `reclaimed`. Only when none may be closed is
+the answer `409 session_limit_reached`.
 
 A write made through the same API replica reaches an open stream at once. A write
 made through another replica is found by the stream's own read of the database,
@@ -260,7 +265,13 @@ that is offline, has none. `detail: "activity"` adds each session's current step
 its last answer. Names, folders and what agents wrote can be named by anyone, so a turn that has
 read the list no longer acts for the user, with one exception: it may still put
 `/agent attach <ref>` for one of the user's own attachable sessions to them, as a button they
-press (never run at once); any other ref or action is refused.
+press (never run at once); any other ref or action is refused. Each agent on an online machine
+carries such a command too, `/agent attach <machine>/<agent>`, which the channel takes as "that
+agent's newest open session, else a new one in its first folder": how a user with no session
+gets one. An agent that only takes over existing conversations (`kind: attach`), one that
+reports no folder, or one on a machine whose name another online machine of the user's shares
+has none. With no session anywhere and one such agent, it is `attach_default`
+(`new_session: true`).
 
 ### Development environment items
 
