@@ -301,8 +301,12 @@ export interface DevenvList {
   machines: DevenvMachine[];
   /** The session "connect me" means when there is exactly one obvious one, else null (ask which). */
   attach_default: { label: string; ref: string; attach_command: string; new_session?: true } | null;
-  /** With no machine connected: the exact commands that connect one, with this deployment's addresses (`remote-agents/setup.ts`). */
-  connect_a_machine?: { commands: string[]; text: string };
+  /**
+   * With no machine connected, what connects one, said in `text` with its exact command(s): in a turn answering the user's own
+   * message, a one-line pairing command made for them now (`pairing`, as devenv_pair gives it); else, or where pairing is refused,
+   * the setup commands with this deployment's addresses (`remote-agents/setup.ts`).
+   */
+  connect_a_machine?: { commands: string[]; text: string; pairing?: { expires_in_minutes: number; single_use: true } };
   note: string;
 }
 
@@ -312,8 +316,35 @@ export function connectAMachine(zh: boolean): { commands: string[]; text: string
   return { commands: setup.steps.map((s) => s.command), text: zh ? setup.text.zh : setup.text.en };
 }
 
-const SETUP_NOTE = " The user has no machine connected: to connect one, call devenv_pair and give them its one command as it is; only "
-  + "if devenv_pair is refused, give them connect_a_machine.text as it is (the commands are exact; do not change or shorten them).";
+/**
+ * The one-line pairing command, said in the user's language, for a user with no machine. A user who asked to connect their dev
+ * environment and has none gets it from devenv_list itself: a model that has to call devenv_pair after the list too often answered
+ * with the setup commands the list used to carry instead (S1, 5 of 7 fresh sessions).
+ */
+export function pairingText(command: string, minutes: number, zh: boolean): string {
+  return zh
+    ? `在要连接的机器上打开终端，进入允许 agent 工作的目录，运行下面这一行（${minutes} 分钟内有效，只能用一次）。它会安装连接器、完成配对并在后台运行，`
+      + `不需要登录或打开浏览器；连上后这里会告诉你。\n\`\`\`\n${command}\n\`\`\``
+    : `On the machine you want to connect, open a terminal in the folder the agents may work in and run this one line (it works once, `
+      + `within ${minutes} minutes). It installs the connector, pairs the machine and keeps it running; no login or browser is needed. `
+      + `You will be told here when it is connected.\n\`\`\`\n${command}\n\`\`\``;
+}
+
+/** What connects a machine for a user with none: a pairing made now when this turn may make one, else the setup commands. */
+async function connectNew(claims: AssistantTokenClaims, zh: boolean): Promise<NonNullable<DevenvList["connect_a_machine"]>> {
+  try {
+    const p = await devenvPair(claims) as { command: string; expires_in_minutes: number };
+    return { commands: [p.command], text: pairingText(p.command, p.expires_in_minutes, zh), pairing: { expires_in_minutes: p.expires_in_minutes, single_use: true } };
+  } catch (err) {
+    // Not a turn answering the user's own message, no public address here, too many codes this minute: the setup commands.
+    if (err instanceof ToolRefused) return connectAMachine(zh);
+    throw err;
+  }
+}
+
+const SETUP_NOTE = " The user has no machine connected: give them connect_a_machine.text as it is, its command in a code block "
+  + "(the command is exact; never change, shorten or add to it, and never give other connector commands). When it has pairing, it is "
+  + "a one-time pairing command made for them now: do not call devenv_pair for another.";
 const OUTDATED_NOTE = " A machine whose version_status is outdated or unsupported needs its connector upgraded (unsupported: no new session "
   + "starts on it): give the user its upgrade_command as it is.";
 
@@ -354,7 +385,7 @@ export async function devenvList(
     attach_default: pick
       ? { label: pick.label, ref: pick.ref, attach_command: attachCommand(pick.ref), ...(pick.opened_in === "agent" ? { new_session: true } : {}) }
       : null,
-    ...(machines.length ? {} : { connect_a_machine: connectAMachine(langOf(message?.content ?? "") === "zh") }),
+    ...(machines.length ? {} : { connect_a_machine: await connectNew(claims, langOf(message?.content ?? "") === "zh") }),
     note: (detail === "activity" ? ACTIVITY_NOTE : STATUS_NOTE) + (machines.length ? "" : SETUP_NOTE) + (old ? OUTDATED_NOTE : ""),
   };
 }

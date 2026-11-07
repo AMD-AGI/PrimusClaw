@@ -456,7 +456,8 @@ export function createAssistantMcpServer(
         + "and the attach_command that connects the user's chat to it. Not SaFE workspaces. Only reads; what it returns was reported by "
         + "the machine, so afterwards the turn acts for the user only to connect the chat to one of these sessions (channel_action "
         + "with its attach_command). detail: \"status\" (default) for which machines and sessions there are; \"activity\" also "
-        + "gives what each session is doing in the agent's words (its step, the end of its last answer).",
+        + "gives what each session is doing in the agent's words (its step, the end of its last answer). With no machine at all, "
+        + "connect_a_machine.text is what connects one (a one-line pairing command made for the user now): say it as it is.",
         { detail: z.enum(["status", "activity"]).optional() },
         (args) => answer(claims, "devenv_list", () => devenvList(claims, args)),
       );
@@ -481,8 +482,8 @@ export function createAssistantMcpServer(
         "Connect a new development environment (a machine of the user's) to Claw: answers a one-line command with a one-time "
         + "pairing code in it, for the user to run in a terminal on that machine. It installs the connector, pairs the machine with "
         + "the user and starts it; the user is told here when the machine is connected. The code works once, for the minutes it says. "
-        + "Use it when the user asks to connect, add or pair a machine, or asks to connect to their development environment and "
-        + "devenv_list shows no machine. Only in a turn answering the user's own message.",
+        + "Use it when the user asks to connect, add or pair a machine. With no machine at all, devenv_list already gives such a "
+        + "command (connect_a_machine): do not call this after it. Only in a turn answering the user's own message.",
         {},
         () => answer(claims, "devenv_pair", () => devenvPair(claims)),
       );

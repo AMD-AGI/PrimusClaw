@@ -208,7 +208,8 @@ for the connector-side actions it keeps (`connector.registered`,
 ## Pairing a machine with a one-time code
 
 The first connection of a machine needs no sign-in on it. The person asks their own client (Clawy: "连接我的开发环境", or the
-router's `devenv_pair` tool); the client calls `POST /v1/remote-agents/pairings` as that person and shows the answer's `command`:
+router's `devenv_pair` tool, or `devenv_list` itself when the person has no machine yet: its `connect_a_machine` is then this
+pairing command, made in a turn answering their own message); the client calls `POST /v1/remote-agents/pairings` as that person and shows the answer's `command`:
 
 ```
 npm install -g @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
@@ -360,7 +361,7 @@ are not touched.
 
 What a person runs to connect a machine is given by the server, never written by a client
 or a model: `GET /v1/remote-agents/setup`, and `connect_a_machine` in `devenv_list` (no
-machine) and in a `devenv_send` refused `no_machine`. Its `login` line names this server's
+machine, where no pairing can be made for the turn) and in a `devenv_send` refused `no_machine`. Its `login` line names this server's
 `CLAW_PUBLIC_URL` and the identity service the connector signs in with
 (`CLAW_CONNECTOR_IDENTITY_URL`, else `IDENTITY_ISSUER_URL`). Sessions are not closed on their own: a new one at the
 session limit closes the user's sessions nobody is using to make room (no event for half an

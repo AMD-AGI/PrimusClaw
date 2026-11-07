@@ -95,10 +95,10 @@ describe("devenv_pair", { skip }, () => {
     const prompts = await import("../src/assistant/prompts.js");
     const reads = await import("../src/assistant/read-tools.js");
     const section = prompts.renderRouterDevenvSection({ actions: true, send: true });
-    assert.match(section, /No machine: say none is connected, then devenv_pair/);
+    assert.match(section, /No machine: say none is connected, then give connect_a_machine\.text exactly as it is/);
     assert.match(section, /exactly as it answered/);
-    assert.match(section, /连接我的开发环境 when there is none/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v8");
+    assert.match(section, /连接我的开发环境 when there is none is devenv_list, whose connect_a_machine already carries the pairing command/);
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v9");
     assert.ok((reads.AFTER_READ_TOOLS as readonly string[]).includes("devenv_pair"), "after devenv_list finds no machine, it may still pair");
   });
 });
