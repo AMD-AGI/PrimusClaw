@@ -46,6 +46,8 @@ const LIVE_FILES_TIMEOUT_SEC = 8;
 export function liveFilesScript(root: string = WORKSPACE_ROOT): string {
   const q = `'${root.replace(/'/g, `'\\''`)}'`;
   return [
+    // The tools it needs (GNU find, head, base64): a sandbox without them says so, rather than reading as one with no files.
+    `{ find . -maxdepth 0 -printf '' && printf 'a\\0' | head -z -n 1 && base64 -w0 </dev/null; } >/dev/null 2>&1 || { printf '@@UNSUPPORTED\\n'; exit 0; };`,
     `cd ${q} 2>/dev/null || exit 0; R=$(pwd -P);`,
     `find . -xdev \\( -path '*/.*' -o -name node_modules \\) -prune -o -type f -mmin -${LIVE_FILES_MINUTES} -printf '%T@ %s %P\\0' 2>/dev/null`,
     `| sort -z -rn | head -z -n 20 | { n=0; while IFS= read -r -d '' r; do`,
@@ -84,6 +86,7 @@ const b64 = (s: string): string => Buffer.from(s, "base64").toString("utf8");
 
 /** The script's output, as the router is given it. */
 export function parseLiveFiles(output: string): LiveFiles {
+  if (/^@@UNSUPPORTED$/m.test(output)) return { status: "unavailable" };
   const files: LiveFile[] = [];
   let now: number | null = null;
   let pending: { path: string; modified_at: string; size: number } | null = null;

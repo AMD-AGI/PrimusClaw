@@ -132,6 +132,19 @@ describe("a running worker's files, read now", () => {
     assert.ok(kept.status === "read" && kept.files[0].tail.endsWith("aaaa\nstep 7/16"), "its first line is whole");
   });
 
+  test("a sandbox without the GNU tools the read needs says it could not read, not that there are no files", () => {
+    const shim = mkdtempSync(join(tmpdir(), "claw-live-files-nognu-"));
+    try {
+      writeFileSync(join(shim, "find"), "#!/bin/sh\necho 'find: unknown predicate -printf' >&2\nexit 1\n");
+      chmodSync(join(shim, "find"), 0o755);
+      put("job/progress.log", "step 1/16\n", 1);
+      const out = parseLiveFiles(execFileSync("bash", ["-c", liveFilesScript(root)], {
+        encoding: "utf8", env: { ...process.env, PATH: `${shim}:${process.env.PATH}` },
+      }));
+      assert.deepEqual(out, { status: "unavailable" });
+    } finally { rmSync(shim, { recursive: true, force: true }); }
+  });
+
   test("an empty or missing workspace reads as no files", () => {
     const out = parseLiveFiles(run(join(root, "does-not-exist")));
     assert.deepEqual(out.status === "read" ? out.files : null, []);
