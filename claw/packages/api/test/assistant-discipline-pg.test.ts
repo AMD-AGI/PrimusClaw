@@ -8,8 +8,8 @@
  *
  *   W1  (Postgres) with the canary on for alice: work_create refuses her task to read ~/.ssh and makes nothing; bob, not in the canary,
  *       is unchanged; a task about SSH in general is made for alice
- *   W2  (Postgres) alice's worker's ready report with no refs is refused and changes nothing; its answer about the delivered files closes
- *       the item with nothing to accept; a ready with refs still waits for Accept; bob's ready with no refs is recorded as before
+ *   W2  (Postgres) alice's worker's ready report with no refs is refused and changes nothing; its answer about the file it delivered
+ *       closes the item with nothing to accept, and the file reaches the user with it; a ready with refs still waits for Accept; bob's ready with no refs is recorded as before
  *   W3  (Postgres) the turn's own system prompt: alice's worker and router turns carry worker-v7 and router-discipline-v1, bob's do not
  */
 import assert from "node:assert/strict";
@@ -23,7 +23,20 @@ describe("the discipline on Postgres, with the canary on for alice", { skip: pos
   let alice: { userId: string; routerSid: string };
   let bob: { userId: string; routerSid: string };
 
-  before(async () => { w = await startWorld({ CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS: "alice" }); });
+  let td: typeof import("../src/assistant/text-delivery.js");
+  let stored: Map<string, { body: Buffer; contentType: string; at: Date }>;
+
+  before(async () => {
+    w = await startWorld({ CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS: "alice" });
+    // The object store, behind its ports: what a worker delivers, and what the announcement lists and reads.
+    td = await import("../src/assistant/text-delivery.js");
+    const deliveries = await import("../src/assistant/deliveries.js");
+    td.textDeliveryPorts.put = async (key, body, contentType) => { stored.set(key, { body, contentType, at: new Date() }); };
+    td.textDeliveryPorts.sayDeps = w.sayDeps;
+    deliveries.deliveryPorts.list = async (prefix) =>
+      [...stored].filter(([k]) => k.startsWith(prefix)).map(([key, o]) => ({ key, size: o.body.length, at: o.at }));
+    deliveries.deliveryPorts.read = async (key) => stored.get(key)?.body ?? Buffer.alloc(0);
+  });
   after(async () => { await w?.stop(); });
   beforeEach(async () => {
     await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_sessions, claw_notification_outbox, claw_session_events, claw_assistant_messages CASCADE");
@@ -31,6 +44,7 @@ describe("the discipline on Postgres, with the canary on for alice", { skip: pos
     w.events.length = 0;
     alice = await w.user("alice");
     bob = await w.user("bob");
+    stored = new Map();
   });
 
   const t = () => w.mod.tools;
@@ -58,9 +72,11 @@ describe("the discipline on Postgres, with the canary on for alice", { skip: pos
   });
 
   test("W2 alice's ready with no refs is refused; her answer closes the item with nothing to accept; bob's is recorded", async () => {
-    const chart = await w.createItem(alice, "CPU 与 GPU 对比图");
+    await w.subscribe(alice.userId);
+    const chart = await w.createItem(alice, "CPU 与 GPU 对比数据");
     const worker = await w.workerTurn(chart.itemId);
-    assert.equal(await code(t().report(worker, { kind: "ready", summary: "画好了 chart.png，已交付" })), "invalid_report");
+    await td.deliverText(worker as never, { name: "cpu-gpu.csv", text: "device,score\nCPU,1\nGPU,12\n" });
+    assert.equal(await code(t().report(worker, { kind: "ready", summary: "写好了 cpu-gpu.csv，已交付" })), "invalid_report");
     let row = await w.item(chart.itemId);
     assert.equal(row.board_state, "in_progress", "the refused report changed nothing");
     assert.equal(row.last_report_kind, null);
@@ -69,6 +85,9 @@ describe("the discipline on Postgres, with the canary on for alice", { skip: pos
     row = await w.item(chart.itemId);
     assert.equal(row.board_state, "done");
     assert.equal(row.outcome, "answered", "closed by the answer: nothing waits for Accept");
+    // The file it delivered reaches the user with the answer, as it did with a ready report.
+    const told = (await w.q("SELECT text FROM claw_assistant_says")).filter((r) => r.text.includes(`#${chart.seq}`) && r.text.includes("cpu-gpu.csv"));
+    assert.equal(told.length, 1, "the delivered file is announced with the answer");
 
     const pr = await w.createItem(alice, "Line count script");
     const prWorker = await w.workerTurn(pr.itemId);

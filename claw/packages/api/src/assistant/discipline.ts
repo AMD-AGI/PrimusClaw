@@ -33,18 +33,24 @@ export function disciplineAnywhere(settings: DisciplineSettings = disciplineSett
   return settings.all || settings.users.size > 0;
 }
 
+/** A home directory as a task names it: ~, $HOME, /home/<user> or /root. */
+const HOME = String.raw`(?:~|\$HOME|\$\{HOME\}|/home/[^\s/]+|/root)\s*/\s*`;
+/** The files under a home directory where tools keep keys and credentials. */
+const HOME_CREDENTIALS = String.raw`\.(?:env\b|aws\b|netrc\b|git-credentials\b|docker/config\.json|kube\b|gnupg\b|pgpass\b|npmrc\b|pypirc\b|config/gh\b|azure\b|gcloud\b|config/gcloud\b)`;
 /**
  * What a task would read that holds the user's secrets: SSH keys and their directory, and the files tools keep credentials in. Matched
  * on the task as the router wrote it (title and brief); the path forms, not the words "ssh" or "key", so a task about SSH in general
  * (set up a deploy key on GitHub, explain ssh_config) is not refused.
  */
 const SECRET_PATHS: ReadonlyArray<{ re: RegExp; what: string }> = [
-  { re: /(?:~|\$HOME|\$\{HOME\}|\/home\/[^\s/]+|\/root)\s*\/\s*\.ssh\b/i, what: "~/.ssh" },
+  { re: new RegExp(`${HOME}\\.ssh\\b`, "i"), what: "~/.ssh" },
   { re: /(?:^|[\s"'`(:：，,、])\.ssh\//i, what: "~/.ssh" },
-  { re: /(?:^|[\s"'`(/:：，,、])\.ssh(?:\s*(?:目录|文件夹|directory|folder|dir)\b|\s*(?:目录|文件夹))/i, what: "~/.ssh" },
+  { re: /(?:^|[\s"'`(/:：，,、])\.ssh\s*(?:目录|文件夹|(?:directory|folder|dir)\b)/i, what: "~/.ssh" },
   { re: /\bid_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?\b/i, what: "a private SSH key" },
   { re: /\bauthorized_keys\b/i, what: "authorized_keys" },
-  { re: /(?:~|\$HOME)\s*\/\s*\.(?:aws\/credentials|netrc|git-credentials|docker\/config\.json|kube\/config|gnupg)\b/i, what: "a credential file" },
+  { re: new RegExp(`${HOME}${HOME_CREDENTIALS}`, "i"), what: "a credential file" },
+  // Named alone, wherever they are: these files hold nothing but credentials.
+  { re: /(?:^|[\s"'`(/:：，,、])\.(?:aws\/credentials|git-credentials|netrc|pgpass)\b/i, what: "a credential file" },
 ];
 
 /** The secret a task would read, named for the refusal; null when it names none. */

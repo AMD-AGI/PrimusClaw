@@ -46,6 +46,12 @@ test("D2 a task that reads ~/.ssh, a key or a credential file is caught; SSH in 
     "print id_ed25519 so I can back it up",
     "check authorized_keys for old entries",
     "read ~/.aws/credentials and ~/.netrc",
+    "read ~/.env and summarize",
+    "read /home/alice/.aws/credentials",
+    "cat ~/.kube/config",
+    "copy ~/.config/gh/hosts.yml into the report",
+    "list $HOME/.docker/config.json",
+    "show the .git-credentials file",
   ]) assert.ok(secretReadTarget(text), text);
   for (const text of [
     "Set up a deploy key for AMD-AGI/PrimusClaw on GitHub",
@@ -53,6 +59,8 @@ test("D2 a task that reads ~/.ssh, a key or a credential file is caught; SSH in 
     "ssh into node-12 and check the GPU driver",
     "统计 claw/packages/api/src/assistant 下每个 ts 文件的行数，开个 PR",
     "用 matplotlib 画一张 CPU 与 GPU 对比柱状图",
+    "add PORT=8080 to .env.example in the repository",
+    "update the service's .env file in AMD-AGI/PrimusClaw with the new port",
   ]) assert.equal(secretReadTarget(text), null, text);
 });
 
