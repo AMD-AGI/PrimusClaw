@@ -29,8 +29,8 @@ const REF3 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 // Every process a test starts is recorded here and stopped by pid (never by pattern).
 const children: ChildProcess[] = [];
 after(() => { for (const c of children) { try { if (c.pid && c.exitCode === null) process.kill(c.pid, "SIGKILL"); } catch { /* gone */ } } });
-const sleeper = (opts: { detached?: boolean } = {}): ChildProcess => {
-  const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: opts.detached ?? false });
+const sleeper = (opts: { detached?: boolean; cwd?: string } = {}): ChildProcess => {
+  const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: opts.detached ?? false, cwd: opts.cwd });
   children.push(c);
   return c;
 };
@@ -64,8 +64,8 @@ ${Object.entries(o.cliEnv ?? {}).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).
 }
 
 /** A terminal that has the conversation open: a real process and the registry row Claude Code writes for it. `leave()` is `/exit`. */
-function openTerminal(dir: string, ref = REF): { pid: number; leave(): Promise<void> } {
-  const proc = sleeper();
+function openTerminal(dir: string, ref = REF, cwd?: string): { pid: number; leave(): Promise<void> } {
+  const proc = sleeper({ cwd });
   fs.mkdirSync(path.join(dir, "sessions"), { recursive: true });
   const row = path.join(dir, "sessions", `${proc.pid}.json`);
   fs.writeFileSync(row, JSON.stringify({ pid: proc.pid, sessionId: ref, status: "busy", kind: "interactive", procStart: processStart(proc.pid!), pidDomain: localPidDomain() }));
@@ -615,7 +615,7 @@ describe("attach end to end", () => {
     const liveFile = (h as unknown as { liveFile: string }).liveFile;
     // (the paths reach it through its environment, never through the code it runs)
     const script = 'process.on("SIGTERM", () => { const fs = require("fs"); fs.appendFileSync(process.env.T_FILE, JSON.stringify({ type: "system", subtype: "end" }) + "\\n"); fs.writeFileSync(process.env.T_LIVE, "[]"); process.exit(0); }); setInterval(() => {}, 1000);';
-    const term = spawn(process.execPath, ["-e", script], { stdio: "ignore", env: { ...process.env, T_FILE: file, T_LIVE: liveFile } });
+    const term = spawn(process.execPath, ["-e", script], { stdio: "ignore", cwd: h.work, env: { ...process.env, T_FILE: file, T_LIVE: liveFile } });
     children.push(term);
     await new Promise((r) => setTimeout(r, 300));   // (its handler is in place)
     h.setLive([{ pid: term.pid, sessionId: REF, status: "busy" }]);
@@ -643,7 +643,7 @@ describe("attach end to end", () => {
 
   test("a holder proven by its registry row (this machine's pid domain, the same process start) is ended too, without the command's word", async () => {
     const h = await attachHarness({ live: [], cliMode: "fail", timing: { recentWriteMs: 100, takeoverWaitMs: 5_000, spectateMs: 20, spectateCheckMs: 60_000 } });
-    const term = openTerminal(h.attachDir);
+    const term = openTerminal(h.attachDir, REF, h.work);
     const sid = await h.attach(REF, h.work, { takeover: true });
     assert.equal(closedReason(h, sid), undefined, `taken over (${closedReason(h, sid)})`);
     assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.took_over, true);
@@ -673,9 +673,18 @@ describe("attach end to end", () => {
     assert.equal(bystander.signalCode, null);
     assert.ok(!adapterMethods(unproven).includes("session/resume"));
 
+    // A proven holder whose working directory is outside the agent's roots is not this agent's to end.
+    const outside = await attachHarness({ live: [], cliMode: "fail", timing: { recentWriteMs: 100, takeoverWaitMs: 2_000 } });
+    const far2 = openTerminal(outside.attachDir, REF, os.tmpdir());
+    const sid3 = await outside.attach(REF, outside.work, { takeover: true });
+    await outside.claw.until("refused", () => closedReason(outside, sid3) !== undefined);
+    assert.equal(closedReason(outside, sid3), "takeover_failed");
+    assert.ok((await import("../src/children.js")).isAlive(far2.pid), "a process outside the roots is never signalled");
+    assert.ok(!adapterMethods(outside).includes("session/resume"));
+
     // A terminal that does not exit when asked: refused once the wait is over; it is not killed harder.
     const stubborn = await attachHarness({ timing: { recentWriteMs: 100, takeoverWaitMs: 1_000 } });
-    const term = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], { stdio: "ignore" });
+    const term = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], { stdio: "ignore", cwd: stubborn.work });
     children.push(term);
     await new Promise((r) => setTimeout(r, 300));
     stubborn.setLive([{ pid: term.pid, sessionId: REF, status: "busy" }]);

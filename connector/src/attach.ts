@@ -495,11 +495,24 @@ export class AttachSupport {
    * domain and the start time of the process that has that pid now. A row without either proof is not enough to signal a pid.
    */
   private async provenLocalHolders(want: string): Promise<Set<number>> {
-    const out = new Set<number>();
+    const proven = await this.provenHolderPids(want);
+    // ... and only one that works inside this agent's roots: a takeover never reaches a process outside what it may touch.
+    return new Set([...proven.keys()].filter((pid) => {
+      let cwd = proven.get(pid) ?? null;
+      if (process.platform === "linux") {
+        try { cwd = fs.realpathSync(`/proc/${pid}/cwd`); } catch { cwd = null; }
+      }
+      return cwd !== null && checkCwd(cwd, this.agent.roots).ok;
+    }));
+  }
+
+  /** The proven holders of `want` (see {@link provenLocalHolders}), each with the directory its row reports (null: none). */
+  private async provenHolderPids(want: string): Promise<Map<number, string | null>> {
+    const out = new Map<number, string | null>();
     const env = { ...this.d.env, ...this.agent.env, CLAUDE_CONFIG_DIR: this.configDir };
     try {
       for (const e of parseAgentsJson(await run(this.agent.attach?.cli ?? "claude", ["agents", "--json"], env, this.d.cliTimeoutMs))) {
-        if (e.sessionId.toLowerCase() === want) out.add(e.pid);
+        if (e.sessionId.toLowerCase() === want) out.set(e.pid, typeof e.cwd === "string" ? e.cwd : null);
       }
     } catch { /* the rows below may still prove it */ }
     if (this.localDomain === null) return out;
@@ -512,7 +525,9 @@ export class AttachSupport {
         try { doc = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")); } catch { continue; }
         if (!isObject(doc) || typeof doc.pid !== "number" || !Number.isInteger(doc.pid) || typeof doc.sessionId !== "string") continue;
         if (doc.sessionId.toLowerCase() !== want || doc.pidDomain !== this.localDomain) continue;
-        if (typeof doc.procStart === "string" && doc.procStart && processStart(doc.pid) === doc.procStart) out.add(doc.pid);
+        if (typeof doc.procStart === "string" && doc.procStart && processStart(doc.pid) === doc.procStart) {
+          out.set(doc.pid, typeof doc.cwd === "string" ? doc.cwd : out.get(doc.pid) ?? null);
+        }
       }
     }
     return out;

@@ -431,8 +431,10 @@ registry row and exits, about a second, measured on 2.1.319; a turn running in t
 and the transcript has been quiet for 10 seconds, and resumes the conversation through every check above;
 `session_started` then says `took_over: true` and the audit log records `terminal_ended` with the pids. It fails closed,
 and resumes nothing, when the holder is a process this machine cannot see (another host or container sharing the config
-directory: `session_live_elsewhere`), belongs to another user (`takeover_not_permitted`), or is still there after 15
-seconds (`terminal_did_not_exit`; it is never killed harder). Without `takeover` the conversation is only watched, as above.
+directory: `session_live_elsewhere`), belongs to another user (`takeover_not_permitted`), cannot be proven to be the local
+process that holds it, inside this agent's roots (`takeover_failed`: Claude Code's own `claude agents --json` lists it, or
+its registry row names this machine and the same process start time, and its working directory is inside the roots), or
+is still there after 15 seconds (`terminal_did_not_exit`; it is never killed harder). Without `takeover` the conversation is only watched, as above.
 An attach agent reports `takeover: true` in its capabilities so that a client knows it can offer this. Afterwards the
 terminal continues the same conversation with `claude --resume <id>` once the phone session is closed.
 
