@@ -126,6 +126,9 @@ func (s *Service) MarkRunning(ctx context.Context, grantID, sandboxID string, up
 			return opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 		}
 		ref.State = runtimev1alpha1.SandboxRunning
+		if ref.RunningAt.IsZero() {
+			ref.RunningAt = metav1.NewTime(s.now())
+		}
 		if up.SandboxName != "" {
 			ref.SandboxName = up.SandboxName
 		}
@@ -531,13 +534,7 @@ func endOne(g *runtimev1alpha1.SandboxGrant, sandboxID, reason string, now time.
 	if ref.State == runtimev1alpha1.SandboxEnded {
 		return nil
 	}
-	seconds := int64(0)
-	if !ref.StartedAt.IsZero() {
-		d := now.Sub(ref.StartedAt.Time)
-		if d > 0 && ref.GPUs > 0 {
-			seconds = int64(d.Seconds()) * int64(ref.GPUs)
-		}
-	}
+	seconds := chargedGPUSeconds(ref, now)
 	ref.State = runtimev1alpha1.SandboxEnded
 	ref.EndReason = capReason(reason)
 	ref.EndedAt = metav1.NewTime(now)
@@ -566,6 +563,31 @@ func endOne(g *runtimev1alpha1.SandboxGrant, sandboxID, reason string, now time.
 		g.Status.GPUSeconds += seconds
 	}
 	return nil
+}
+
+// chargedGPUSeconds is the GPU time a sandbox ending at now spends from the grant budget.
+// Only running time counts: a sandbox that never left pending (queued, scheduling-gated,
+// pulling its image) charges nothing. A running ref without runningAt predates the field
+// and is charged from startedAt, as it was when it began.
+func chargedGPUSeconds(ref runtimev1alpha1.GrantSandboxRef, now time.Time) int64 {
+	if ref.GPUs <= 0 {
+		return 0
+	}
+	from := ref.RunningAt
+	if from.IsZero() {
+		if ref.State != runtimev1alpha1.SandboxRunning {
+			return 0
+		}
+		from = ref.StartedAt
+	}
+	if from.IsZero() {
+		return 0
+	}
+	d := now.Sub(from.Time)
+	if d <= 0 {
+		return 0
+	}
+	return int64(d.Seconds()) * int64(ref.GPUs)
 }
 
 const maxEndedSandboxRefs = 1000
