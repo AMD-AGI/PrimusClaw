@@ -606,6 +606,64 @@ describe("attach end to end", () => {
     assert.equal(adapterMethods(h).filter((m) => m === "session/resume").length, 1);
   });
 
+  test("a takeover the person confirmed ends the terminal that has the conversation open, then resumes it; without it, the same request is only watched", async () => {
+    const h = await attachHarness({ timing: { spectateMs: 20, spectateCheckMs: 60_000, recentWriteMs: 300, takeoverWaitMs: 8_000 } });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({ type: "user", sessionId: REF, message: { role: "user", content: "hello" } })}\n`);
+    // The terminal: a real process that, like Claude Code on SIGTERM, writes the end of its transcript, drops its row and exits.
+    const liveFile = (h as unknown as { liveFile: string }).liveFile;
+    const script = `process.on("SIGTERM", () => { require("fs").appendFileSync(${JSON.stringify(file)}, '{"type":"system","subtype":"end"}\\n'); require("fs").writeFileSync(${JSON.stringify(liveFile)}, "[]"); process.exit(0); }); setInterval(() => {}, 1000);`;
+    const term = spawn(process.execPath, ["-e", script], { stdio: "ignore" });
+    children.push(term);
+    await new Promise((r) => setTimeout(r, 300));   // (its handler is in place)
+    h.setLive([{ pid: term.pid, sessionId: REF, status: "busy" }]);
+
+    const watched = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(watched, "session_started")[0]!.data.read_only, true, "no takeover asked for: watched");
+    assert.equal(term.exitCode, null, "the terminal is untouched by a request that did not ask to take it over");
+    h.claw.issue("close", watched, {});
+    await h.claw.until("the watch to close", () => closedReason(h, watched) !== undefined);
+
+    const exited = new Promise<number | null>((r) => term.once("exit", (code) => r(code)));
+    const sid = await h.attach(REF, h.work, { takeover: true });
+    assert.equal(closedReason(h, sid), undefined, `taken over, not refused (${closedReason(h, sid)})`);
+    const started = h.claw.eventsOf(sid, "session_started")[0]!.data;
+    assert.deepEqual([started.read_only, started.took_over, started.acp_session_id], [undefined, true, REF]);
+    assert.equal(await Promise.race([exited, new Promise((r) => setTimeout(() => r("still running"), 5_000))]), 0, "the terminal was asked to end and ended by itself");
+    assert.equal(adapterMethods(h).filter((m) => m === "session/resume").length, 1, "resumed once, after the terminal was gone");
+    assert.match(fs.readFileSync(file, "utf8"), /"subtype":"end"/, "what the terminal wrote on its way out is kept");
+    const ended = h.audit().find((a) => a.kind === "terminal_ended");
+    assert.deepEqual(ended?.pids, [term.pid]);
+    await h.online();
+    const hb = await h.claw.until("a heartbeat", () => h.claw.heartbeats.at(-1));
+    assert.equal(hb.agents[0].capabilities.takeover, true, "the phone is told a takeover can be asked for");
+  });
+
+  test("a takeover is refused, and nothing is resumed, when the terminal cannot be ended", async () => {
+    // Another host shares the config directory: its process cannot be ended from here.
+    const far = await attachHarness({ live: [], timing: { recentWriteMs: 100, takeoverWaitMs: 2_000 } });
+    fs.mkdirSync(path.join(far.attachDir, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(far.attachDir, "sessions", "424242.json"), JSON.stringify({ pid: 424242, sessionId: REF, status: "busy", kind: "interactive", pidDomain: "another-host:0" }));
+    const sid1 = await far.attach(REF, far.work, { takeover: true });
+    await far.claw.until("refused", () => closedReason(far, sid1) !== undefined);
+    assert.equal(closedReason(far, sid1), "session_live_elsewhere");
+    assert.ok(!adapterMethods(far).includes("session/resume"));
+
+    // A terminal that does not exit when asked: refused once the wait is over; it is not killed harder.
+    const stubborn = await attachHarness({ timing: { recentWriteMs: 100, takeoverWaitMs: 1_000 } });
+    const term = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], { stdio: "ignore" });
+    children.push(term);
+    await new Promise((r) => setTimeout(r, 300));
+    stubborn.setLive([{ pid: term.pid, sessionId: REF, status: "busy" }]);
+    const sid2 = await stubborn.attach(REF, stubborn.work, { takeover: true });
+    await stubborn.claw.until("refused", () => closedReason(stubborn, sid2) !== undefined);
+    assert.equal(closedReason(stubborn, sid2), "terminal_did_not_exit");
+    assert.equal(term.exitCode, null, "still running: only asked, never killed");
+    assert.ok(!adapterMethods(stubborn).includes("session/resume"));
+    assert.ok(stubborn.audit().some((a) => a.kind === "takeover_refused" && a.reason === "terminal_did_not_exit"));
+  });
+
   test("a read-only session stays read-only after the connector restarts", async () => {
     const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
     const sid = await h.attach(REF);

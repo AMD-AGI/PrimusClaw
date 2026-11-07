@@ -500,7 +500,7 @@ describe("remote agents", { skip }, () => {
       assert.deepEqual(cmd, {
         agent_id: "a1", cwd: "/work/repo", mode: null, resume_ref: ref,
         v: 1, cmd_id: cmd.cmd_id, type: "session.new", session_id: made.body.data.session_id,
-      });
+      });   // (no takeover unless asked for: the connector then only watches a conversation a terminal has open)
       assert.equal("resume_ref" in made.body.data, false, "the row does not keep it: the connector does");
       const audited = (await as("u1").get(`/v1/remote-agents/audit?session_id=${made.body.data.session_id}`)).body.data;
       assert.ok(audited.some((r: any) => r.action === "session.created" && r.detail.resume_ref === ref));
@@ -509,6 +509,15 @@ describe("remote agents", { skip }, () => {
         assert.equal(r.status, 400, JSON.stringify(bad));
         assert.equal(r.body.error, "invalid_resume_ref");
       }
+      // A takeover the person confirmed is passed on with it; one without a reference is refused before anything is queued.
+      const taken = await as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/work/repo", resume_ref: ref, takeover: true });
+      assert.equal(taken.status, 201, JSON.stringify(taken.body));
+      const tcmd = (await stream.nextEvent("command")).json();
+      assert.deepEqual([tcmd.type, tcmd.resume_ref, tcmd.takeover], ["session.new", ref, true]);
+      const tAudit = (await as("u1").get(`/v1/remote-agents/audit?session_id=${taken.body.data.session_id}`)).body.data;
+      assert.ok(tAudit.some((r: any) => r.action === "session.created" && r.detail.takeover === true), "who asked to end a terminal is on the record");
+      const noRef = await as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/work/repo", takeover: true });
+      assert.deepEqual([noRef.status, noRef.body.error], [400, "takeover_needs_resume_ref"]);
       // Without one, the command is what it always was.
       const plain = await session("u1", cid);
       assert.equal("resume_ref" in (await stream.nextEvent("command")).json(), false, plain);

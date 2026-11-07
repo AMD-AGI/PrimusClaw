@@ -511,7 +511,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     }
     const out = await store.createSession({
       owner, client: clientLabel(req), connectorId: connector.connector_id, agentId: body.value.agent_id,
-      cwd: body.value.cwd, mode: body.value.mode, resumeRef: body.value.resume_ref, maxActive: maxActiveSessions, commandsPerMinute,
+      cwd: body.value.cwd, mode: body.value.mode, resumeRef: body.value.resume_ref, takeover: body.value.takeover, maxActive: maxActiveSessions, commandsPerMinute,
       onlineWindowMs,
     });
     if (out.status === "limit") return fail(reply, 409, "session_limit_reached");

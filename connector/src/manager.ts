@@ -198,7 +198,7 @@ export class SessionManager {
       const s = new Session(sid, agent, found.item.cwd, this.env, found.item.ref);
       this.sessions.set(sid, s);
       this.attaching.delete(claim);
-      await s.attach(typeof cmd.mode === "string" ? cmd.mode : null, found.item.title);
+      await s.attach(typeof cmd.mode === "string" ? cmd.mode : null, found.item.title, cmd.takeover === true);
     } finally {
       this.attaching.delete(claim);
     }

@@ -424,6 +424,18 @@ client offers the watch only where the connector can do it. When the terminal no
 watch ends (`session_closed`, reason `terminal_closed`), and taking it over is then a new session, through every check
 above. A watched session stays read-only across a restart of the connector.
 
+Taking it over while the terminal still has it is the person's choice, made on the phone after being told what it does:
+`session.new` with `takeover: true` (Claw passes it on only with a `resume_ref`). The connector then asks every process on
+this machine that holds the conversation open to end (`SIGTERM`: Claude Code writes the end of its transcript, removes its
+registry row and exits, about a second, measured on 2.1.319; a turn running in that terminal stops), waits until none is left
+and the transcript has been quiet for 10 seconds, and resumes the conversation through every check above;
+`session_started` then says `took_over: true` and the audit log records `terminal_ended` with the pids. It fails closed,
+and resumes nothing, when the holder is a process this machine cannot see (another host or container sharing the config
+directory: `session_live_elsewhere`), belongs to another user (`takeover_not_permitted`), or is still there after 15
+seconds (`terminal_did_not_exit`; it is never killed harder). Without `takeover` the conversation is only watched, as above.
+An attach agent reports `takeover: true` in its capabilities so that a client knows it can offer this. Afterwards the
+terminal continues the same conversation with `claude --resume <id>` once the phone session is closed.
+
 The ask mode still applies: a conversation keeps the mode it was left in, often one that never asks (`bypassPermissions`),
 and the adapter says so while it sets the session up. That warning describes the mode that is about to be replaced, so it is
 set aside until the ask mode (`default`) is locked and read back from the adapter; a warning that comes after that, or a mode

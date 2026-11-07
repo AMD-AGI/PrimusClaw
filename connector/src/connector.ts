@@ -294,7 +294,9 @@ export class Connector {
         ...(readOnly ? { edits: false, edits_hint: READ_ONLY_HINT } : {}),
       }, this.healthReport ? agentHealth(this.healthReport, a.id) : null);
       // An attach agent also says which existing sessions it could take over, and whether anything holds them open now.
-      const capabilities = support ? fitResumable(base, await support.resumable()) : base;
+      // `takeover`: a conversation a terminal has open can be taken over when the person confirms it (`session.new` with
+      // `takeover`), which ends the terminal's process; without it, such a conversation is only watched.
+      const capabilities = support ? fitResumable({ ...base, takeover: true }, await support.resumable()) : base;
       return { agent_id: a.id, kind: a.kind, name: a.name, capabilities };
     }));
   }

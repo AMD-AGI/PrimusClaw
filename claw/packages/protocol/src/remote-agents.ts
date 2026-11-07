@@ -286,6 +286,11 @@ export interface RemoteSessionNew {
    * only one that knows what it means.
    */
   resume_ref: string | null;
+  /**
+   * With `resume_ref`: the person confirmed that whatever holds that session open on the machine (a terminal) is to be
+   * ended so that this session can continue it. Without it a session held open elsewhere is only watched, read-only.
+   */
+  takeover: boolean;
 }
 
 export function parseSessionNew(body: unknown): Parsed<RemoteSessionNew> {
@@ -308,7 +313,10 @@ export function parseSessionNew(body: unknown): Parsed<RemoteSessionNew> {
     if (typeof body.resume_ref !== "string" || !OPAQUE_ID_RE.test(body.resume_ref)) return fail("invalid_resume_ref");
     resumeRef = body.resume_ref;
   }
-  return { ok: true, value: { connector_id: connectorId, agent_id: body.agent_id, cwd: body.cwd, mode, resume_ref: resumeRef } };
+  if (body.takeover !== undefined && body.takeover !== null && typeof body.takeover !== "boolean") return fail("invalid_takeover");
+  const takeover = body.takeover === true;
+  if (takeover && !resumeRef) return fail("takeover_needs_resume_ref");
+  return { ok: true, value: { connector_id: connectorId, agent_id: body.agent_id, cwd: body.cwd, mode, resume_ref: resumeRef, takeover } };
 }
 
 /**

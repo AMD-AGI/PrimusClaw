@@ -88,6 +88,10 @@ export type Verdict =
   | { ok: true }
   | { ok: false; reason: "session_live" | "recently_written" | "twin_check_failed"; detail: string };
 
+export type EndVerdict =
+  | { ok: true; ended: number[] }
+  | { ok: false; reason: "session_live_elsewhere" | "takeover_not_permitted" | "takeover_failed" | "terminal_did_not_exit" | "recently_written" | "twin_check_failed"; detail: string };
+
 export type Resolved = { ok: true; item: Listed } | { ok: false; reason: "unknown_session" | "catalog_unavailable" };
 
 /** The check could not be answered. Attaching is refused: not being able to read it is not "nothing is open". */
@@ -425,6 +429,59 @@ export class AttachSupport {
     return { ok: true };
   }
 
+  /**
+   * Taking over a conversation a terminal has open, after the person confirmed it on the phone: every local process that
+   * holds `ref` open is asked to end (SIGTERM; Claude Code writes the end of its transcript, drops its registry row and
+   * exits, measured on 2.1.319 in about a second), and this waits until none is left and the transcript has been quiet
+   * for `recentWriteMs`, so that the resume that follows goes through the full check like any other. It fails closed: a
+   * holder this machine cannot see (another host or container sharing the directory) cannot be ended, a process of
+   * another user is not touched, and one that is still there after `waitMs` is a refusal, never a second writer.
+   */
+  async endHolders(ref: string, o: { ownPgid?: number | null; waitMs: number; sleep?: (ms: number) => Promise<void> }): Promise<EndVerdict> {
+    if (!SESSION_REF_RE.test(ref)) return { ok: false, reason: "twin_check_failed", detail: "not a session id" };
+    const want = ref.toLowerCase();
+    const pause = o.sleep ?? ((ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); t.unref?.(); }));
+    let live: LiveEntry[];
+    try {
+      live = await this.liveEntries();
+    } catch (e) {
+      return { ok: false, reason: "twin_check_failed", detail: errMessage(e) };
+    }
+    const holders = live.filter((e) => isTwin(e, want, o.ownPgid));
+    const foreign = holders.find((e) => e.foreign);
+    if (foreign) return { ok: false, reason: "session_live_elsewhere", detail: describeTwin(foreign) };
+    const pids = [...new Set(holders.map((e) => e.pid))].filter((pid) => pid > 1 && pid !== process.pid);
+    for (const pid of pids) {
+      const owner = processUid(pid);
+      if (owner !== null && typeof process.getuid === "function" && owner !== process.getuid()) {
+        return { ok: false, reason: "takeover_not_permitted", detail: `process ${pid} belongs to another user` };
+      }
+    }
+    for (const pid of pids) {
+      try { process.kill(pid, "SIGTERM"); } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === "ESRCH") continue;
+        return { ok: false, reason: code === "EPERM" ? "takeover_not_permitted" : "takeover_failed", detail: `process ${pid}: ${errMessage(e)}` };
+      }
+    }
+    const deadline = this.now() + o.waitMs;
+    // Gone, and the transcript quiet: the terminal may write its last lines on the way out.
+    for (;;) {
+      const left = pids.filter((pid) => isAlive(pid) && !isZombie(pid));
+      const file = this.transcriptFile(want);
+      let age = Infinity;
+      try { if (file) age = this.now() - fs.statSync(file).mtimeMs; } catch { /* no transcript to look at */ }
+      if (!left.length && age >= this.d.recentWriteMs) break;
+      if (this.now() >= deadline) {
+        return left.length
+          ? { ok: false, reason: "terminal_did_not_exit", detail: `process ${left.join(", ")} did not exit within ${Math.round(o.waitMs / 1000)} s` }
+          : { ok: false, reason: "recently_written", detail: "its transcript is still being written" };
+      }
+      await pause(250);
+    }
+    return { ok: true, ended: pids };
+  }
+
   /** Every live process that holds a session open. Throws {@link TwinCheckError} when neither source can be read. */
   async liveEntries(): Promise<LiveEntry[]> {
     const env = { ...this.d.env, ...this.agent.env, CLAUDE_CONFIG_DIR: this.configDir };
@@ -533,6 +590,28 @@ function describeTwin(e: LiveEntry): string {
 function isTwin(e: LiveEntry, want: string, ownPgid: number | null | undefined): boolean {
   if (e.sessionId.toLowerCase() !== want) return false;
   return e.foreign || !(ownPgid != null && processGroup(e.pid) === ownPgid);
+}
+
+/** An exited process its parent has not reaped yet (Linux): it holds nothing open any more. */
+function isZombie(pid: number): boolean {
+  if (process.platform !== "linux") return false;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+  } catch {
+    return false;
+  }
+}
+
+/** The real user id of a process (Linux), or null where that cannot be read. */
+function processUid(pid: number): number | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const m = /^Uid:\s+(\d+)/m.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"));
+    return m ? Number(m[1]) : null;
+  } catch {
+    return null;
+  }
 }
 
 // --- sources ---------------------------------------------------------------------------

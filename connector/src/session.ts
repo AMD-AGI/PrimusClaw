@@ -53,11 +53,13 @@ export interface SessionTiming {
   rootCheckMs: number;
   /** How long a new session waits for an adapter that reports its sign-in to say which one it is. */
   authWaitMs: number;
+  /** How long a takeover waits for the terminal it ended to exit and for the transcript to go quiet. */
+  takeoverWaitMs: number;
 }
 
 export const DEFAULT_SESSION_TIMING: SessionTiming = {
   idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000, spectateMs: 1_000, spectateCheckMs: 5_000,
-  rootCheckMs: 10_000, authWaitMs: 3_000,
+  rootCheckMs: 10_000, authWaitMs: 3_000, takeoverWaitMs: 15_000,
 };
 
 /**
@@ -222,15 +224,26 @@ export class Session {
    * `session.new` that names a session which already exists: resume it in the ask mode. The twin check runs inside
    * the launch (so it also runs again whenever a recycled adapter comes back), and a refusal closes the session.
    */
-  async attach(requestedMode: string | null, title: string): Promise<void> {
+  async attach(requestedMode: string | null, title: string, takeover = false): Promise<void> {
     if (requestedMode && !this.agent.safeModes.includes(requestedMode) && !this.agent.allowUnsafeModes) {
       return this.refuse(new SessionRefusal("mode_not_allowed", `mode ${requestedMode} needs approval = "never" for this agent (or allow_unsafe_modes) on this machine`));
     }
-    // A conversation a terminal has open now is not taken over: it is watched, read-only, for as long as the terminal has it.
+    // A conversation a terminal has open now is not taken over: it is watched, read-only, for as long as the terminal has
+    // it. Unless the person confirmed a takeover: then the terminal's process is ended first (`AttachSupport.endHolders`).
     const support = this.env.attach.get(this.agent.id);
+    let tookOver = false;
     if (support && this.acpId) {
       const verdict = await support.check(this.acpId, { transcript: false });
-      if (!verdict.ok && verdict.reason === "session_live") return this.spectate(support, title, verdict.detail);
+      if (!verdict.ok && verdict.reason === "session_live") {
+        if (!takeover) return this.spectate(support, title, verdict.detail);
+        const ended = await support.endHolders(this.acpId, { waitMs: this.env.timing.takeoverWaitMs });
+        if (!ended.ok) {
+          this.audit("takeover_refused", { reason: ended.reason, detail: ended.detail.slice(0, 300) });
+          return this.refuse(new SessionRefusal(ended.reason, ended.detail));
+        }
+        this.audit("terminal_ended", { acp_session_id: this.acpId, pids: ended.ended, detail: verdict.detail.slice(0, 300) });
+        tookOver = true;
+      }
     }
     if (requestedMode) this.targetMode = requestedMode;
     try {
@@ -241,7 +254,7 @@ export class Session {
     if (this.closed) return;
     this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString() });
     this.audit("session_attached", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
-    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended }, this.env.store.written());
+    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, ...(tookOver ? { took_over: true } : {}), modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended }, this.env.store.written());
     this.touch();
   }
 
