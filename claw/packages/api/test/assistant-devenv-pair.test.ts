@@ -81,6 +81,12 @@ describe("devenv_pair", { skip }, () => {
     const r1 = await call(report);
     assert.ok(r1.offered && r1.isError);
     assert.match(JSON.stringify(r1), /not_from_user/);
+    // A message that came with a key, not signed in: nobody is attending.
+    const key = await userTurn(alice, "pair my laptop");
+    await w.q("UPDATE claw_assistant_messages SET attended_via = NULL WHERE message_id = $1", [key.mid]);
+    const rk = await call(key);
+    assert.ok(rk.offered && rk.isError);
+    assert.match(JSON.stringify(rk), /not_attended/);
     const ended = await userTurn(alice, "pair my laptop");
     await w.closeRun(ended.task_id);
     const r2 = await call(ended);
@@ -95,10 +101,10 @@ describe("devenv_pair", { skip }, () => {
     const prompts = await import("../src/assistant/prompts.js");
     const reads = await import("../src/assistant/read-tools.js");
     const section = prompts.renderRouterDevenvSection({ actions: true, send: true });
-    assert.match(section, /No machine: say none is connected, then devenv_pair/);
+    assert.match(section, /No machine: say none is connected\. When connect_a_machine has pairing[^\n]*do not call devenv_pair after it\. Without pairing: devenv_pair/);
     assert.match(section, /exactly as it answered/);
-    assert.match(section, /连接我的开发环境 when there is none/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v8");
+    assert.match(section, /连接我的开发环境 when there is none is devenv_list, whose connect_a_machine then carries the pairing command/);
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v9");
     assert.ok((reads.AFTER_READ_TOOLS as readonly string[]).includes("devenv_pair"), "after devenv_list finds no machine, it may still pair");
   });
 });
