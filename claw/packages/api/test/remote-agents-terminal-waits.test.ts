@@ -16,7 +16,7 @@
  *   T7  told only on a report made after the minute that still says it waits: one answered just before the minute, whose last report
  *       predates the answer, is not told on that report
  *   T8  a told wait is never told again while it still waits, even when a heartbeat in between could not see it (every entry
- *       `unknown`, or this one); a list that knows its conversations and lacks it, or an agent gone from the report, ends it
+ *       `unknown`, or this one); a list that knows its conversations and lacks it, or an agent gone from the report, ends it *   T9  an owner with no assistant yet is told once they have one, if it still waits
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -270,5 +270,21 @@ describe("conversations open in a terminal that wait for their person", { skip }
     await w.q("DELETE FROM claw_remote_agents WHERE connector_id = $1", [cid]);
     await sweep();
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_remote_terminal_waits"))[0].n, 0);
+  });
+
+  test("T9 an owner with no assistant yet is told once they have one", async () => {
+    const cid = await machine("carol", "carol-box");
+    await terminal(cid, "carol", [conv("c-1", "waiting")]);
+    await sweep();
+    await waitedFor(cid, "c-1", 2 * MINUTE);
+    const out = await sweep();
+    assert.equal(out.notices.length, 1, "due");
+    assert.deepEqual(await says("carol"), [], "nobody to say it through");
+    assert.equal((await w.q("SELECT told_at FROM claw_remote_terminal_waits WHERE connector_id = $1", [cid]))[0].told_at, null, "not told");
+    const carol = await w.user("carol");
+    await said(carol, "我的开发环境有哪些");
+    await sweep();
+    await sweep();
+    assert.equal((await says("carol")).length, 1);
   });
 });

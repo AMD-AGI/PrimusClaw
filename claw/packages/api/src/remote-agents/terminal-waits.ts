@@ -197,22 +197,25 @@ export const terminalWaitPorts: {
 };
 
 /**
- * One sweep and its notices. A notice that fails to be stored is put back (not told) for the next sweep, as long as that conversation
- * still waits; its key (the episode's) makes a second attempt say nothing twice.
+ * One sweep and its notices. A notice that fails to be stored, or that had nobody to say it through (the owner has no assistant
+ * yet: it is made on their first message), is put back (not told) for the next sweep, as long as that conversation still waits; its key
+ * (the episode's) makes a second attempt say nothing twice.
  */
 export async function runTerminalWaitSweep(onlineWindowMs: number, noticeAfterMs: number = TERMINAL_WAIT_NOTICE_MS): Promise<TerminalWaitSweep> {
   const out = await sweepTerminalWaits(onlineWindowMs, noticeAfterMs);
+  // (the row, if it is still there, is this episode or a newer one not yet told: either way it is not told)
+  const putBack = (n: TerminalWaitNotice) => db.query(
+    "UPDATE claw_remote_terminal_waits SET told_at = NULL WHERE connector_id = $1 AND agent_id = $2 AND ref = $3",
+    [n.connectorId, n.agentId, n.ref],
+  ).catch((e) => logger.warn({ err: (e as Error)?.message, connectorId: n.connectorId }, "remote_agents.terminal_wait_requeue_failed"));
   for (const n of out.notices) {
     try {
       const told = await terminalWaitPorts.tell(n);
       logger.info({ owner: n.owner, connectorId: n.connectorId, agentId: n.agentId, told }, "remote_agents.terminal_wait_notice");
+      if (!told) await putBack(n);
     } catch (err) {
       logger.warn({ err: (err as Error)?.message, connectorId: n.connectorId }, "remote_agents.terminal_wait_notice_failed");
-      // (the row, if it is still there, is this episode or a newer one not yet told: either way it is not told)
-      await db.query(
-        "UPDATE claw_remote_terminal_waits SET told_at = NULL WHERE connector_id = $1 AND agent_id = $2 AND ref = $3",
-        [n.connectorId, n.agentId, n.ref],
-      ).catch((e) => logger.warn({ err: (e as Error)?.message, connectorId: n.connectorId }, "remote_agents.terminal_wait_requeue_failed"));
+      await putBack(n);
     }
   }
   return out;
