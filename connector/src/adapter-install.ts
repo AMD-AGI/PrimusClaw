@@ -210,13 +210,16 @@ export class AdapterStore {
     const pkg = pinnedPackage(cfg);
     if (!pkg) return { command: cfg.command, args: cfg.args, cwd, installed: false };
     let bin = this.installed(pkg);
-    if (!bin && this.o.autoInstall) {
+    if (!bin) {
       const failed = this.failedAt.get(pkg.spec);
-      // A first install (or one already running) is worth waiting for; a retry after a failure runs in the background.
-      if (this.installing(pkg) || failed === undefined) bin = await raceTimeout(this.install(pkg, env), this.o.waitMs ?? INSTALL_WAIT_MS);
-      else if (this.now() - failed >= RETRY_AFTER_MS) void this.install(pkg, env);
-    } else if (!bin && this.installing(pkg)) {
-      bin = await raceTimeout(this.pending.get(pkg.spec)!, this.o.waitMs ?? INSTALL_WAIT_MS);
+      if (failed === undefined) {
+        // A first install (started here, or already running at init or run's start) is worth waiting for.
+        const job = this.o.autoInstall ? this.install(pkg, env) : this.pending.get(pkg.spec);
+        if (job) bin = await raceTimeout(job, this.o.waitMs ?? INSTALL_WAIT_MS);
+      } else if (this.o.autoInstall && !this.installing(pkg) && this.now() - failed >= RETRY_AFTER_MS) {
+        // After a failure the install is tried again in the background, and no session waits for that retry.
+        void this.install(pkg, env);
+      }
     }
     if (bin) return runByNode(bin) ? { command: process.execPath, args: [bin, ...pkg.rest], cwd, installed: true } : { command: bin, args: pkg.rest, cwd, installed: true };
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });

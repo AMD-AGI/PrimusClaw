@@ -141,6 +141,30 @@ describe("pinned adapters", () => {
     assert.equal(fs.readFileSync(f.log, "utf8").trim().split("\n").length, 2, "retried in the background later");
   });
 
+  test("after a failed install, a session that opens while the background retry runs does not wait for it", async () => {
+    const f = fixture();
+    const state = tmpdir("ai-state-");
+    const work = tmpdir("ai-work-");
+    const a = agent(work, envFor(f, { FAKE_NPM_FAIL: "1" }));
+    let now = 1_000_000;
+    const store = new AdapterStore(adaptersDir(state), { autoInstall: true, now: () => now });
+    assert.equal((await store.launch(a, work, { ...process.env, ...a.env })).installed, false);
+    // The retry would now succeed, but slowly (the registry came back, the download takes a while).
+    const slow = { ...process.env, ...envFor(f, { FAKE_NPM_SLEEP: "3" }) };
+    now += 11 * 60_000;
+    const t0 = Date.now();
+    const second = await store.launch(a, work, slow);
+    assert.ok(store.installing(pinnedPackage(a)!), "the retry started");
+    const third = await store.launch(a, work, slow);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 1_000, `sessions waited ${ms} ms for the background retry`);
+    assert.deepEqual([second.installed, third.installed, third.cwd], [false, false, adaptersDir(state)]);
+    // Once the retry is done, the next session uses the installed copy.
+    const bin = await store.install(pinnedPackage(a)!, slow);
+    assert.ok(bin);
+    assert.equal((await store.launch(a, work, slow)).installed, true);
+  });
+
   test("without auto-install (a test, or nothing installed yet) the configured command runs, never in the session folder", async () => {
     const state = tmpdir("ai-state-");
     const work = tmpdir("ai-work-");
