@@ -162,9 +162,14 @@ describe("assistant lookup ack and silent turns", { skip }, () => {
     const t = await turn("帮我查一下最近关于 MI355X 的新闻");
     for (let i = 0; i < 3; i += 1) await stored(alice.routerSid, t.mid, "web_search", "success");
     await w.closeRun(t.task_id, "completed", undefined, 0);
+    const family = w.h.app.metrics.registry.getSingleMetric("claw_assistant_router_unsaid_total");
+    const silentCount = async () => ((await family!.get()).values.find((v) => v.labels.outcome === "silent_notice")?.value ?? 0);
+    const before = await silentCount();
     assert.equal(await end(t), "said");
     assert.deepEqual((await says()).map((s) => [s.text, s.fallback]), [["我查了一些资料，但这次没能整理出答复。请再问我一次，或者把问题说得具体一点。", true]]);
+    assert.equal(await silentCount(), before + 1, "counted (claw_assistant_router_unsaid_total{outcome=silent_notice})");
     assert.equal(await end(t), "skipped", "a redelivered completion stores nothing new");
+    assert.equal(await silentCount(), before + 1, "and counted once");
     assert.equal((await says()).length, 1);
     // After the server's own "on it", still told: that line answered nothing.
     await w.q("TRUNCATE claw_assistant_says");

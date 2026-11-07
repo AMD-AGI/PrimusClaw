@@ -260,7 +260,10 @@ async function sayLookedButSilent(
     userId, sessionId: end.sessionId, text, key: `turn_silent:${[...end.runIds].sort().join(",")}`,
     ...(end.messageId ? { turnMessageId: end.messageId } : {}),
   }, deps);
-  if (stored) logger.warn({ sessionId: end.sessionId, runIds: end.runIds }, "assistant.silent_turn_notice_delivered");
+  if (stored) {
+    logger.warn({ sessionId: end.sessionId, runIds: end.runIds }, "assistant.silent_turn_notice_delivered");
+    metrics.onAssistantRouterUnsaid("silent_notice");
+  }
   return stored ? "said" : "skipped";
 }
 
