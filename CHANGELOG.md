@@ -28,6 +28,20 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Connecting a machine is said with the exact commands, for every client. `GET /v1/remote-agents/setup` gives the connector's npm
+  package (`@primusclaw/connector`), the four commands (`npm install -g`, `claw-connector init`, `claw-connector login --server <this
+  API's CLAW_PUBLIC_URL> --identity-url <CLAW_CONNECTOR_IDENTITY_URL, else IDENTITY_ISSUER_URL>`, `claw-connector service install`) and
+  the same as a short text in English and Chinese. `devenv_list` with no machine connected, and a `devenv_send` refused `no_machine`,
+  carry it (`connect_a_machine`), and the router is told to give it as it is: before, it was told only that "running claw-connector
+  connects it" and composed the commands itself. Router prompt router-devenv-v5.
+- A minimum and a recommended connector version (`CONNECTOR_VERSIONS` in the protocol, 0.1.3 and 0.1.4; a server moves them with
+  `CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION` and `CLAW_REMOTE_AGENTS_RECOMMENDED_CONNECTOR_VERSION`). `GET /v1/remote-agents/connectors`
+  and `devenv_list` give each machine's `version_status` (`current`, `outdated`, `unsupported`, `unknown`) and, below the recommended
+  version, the `upgrade_command` (`npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service
+  install`); a heartbeat's answer carries the same (`connector_version`). Below the minimum no new session starts on it:
+  `POST /v1/remote-agents/sessions`, `devenv_send` and a pressed `devenv_send` card answer `409 connector_outdated` with the version
+  and the command, instead of a session that fails on the old connector. A connector that reports no version is not refused, and a
+  session already open on an old connector continues.
 - A development environment session is pushed only when it needs you, finishes or fails, each once: an instruction the assistant sent
   to an agent on your machine says nothing while it works, one message when the agent waits on a permission request (`assistant.say`
   `remote.ask`: the request with its options and when it runs out, for a channel to put to you as buttons), one when it finished, and

@@ -232,6 +232,89 @@ describe("remote agents", { skip }, () => {
     });
   });
 
+  describe("connector versions and setup", () => {
+    test("a connector below the minimum is listed with the command that upgrades it, and starts no session", async () => {
+      const body = (cid: string) => ({ connector_id: cid, agent_id: "a1", cwd: "/work" });
+      const at = async (version: string | null) => {
+        const cid = await connector("u1", `m-${version ?? "none"}`);
+        const stream = await openCommands("u1", cid);
+        await stream.nextEvent("ready");
+        assert.equal((await heartbeat("u1", cid, version ? { version } : {})).status, 200);
+        return cid;
+      };
+      const old = await at("0.1.2");
+      const outdated = await at("0.1.3");
+      const current = await at("0.1.4");
+      const unknown = await at(null);
+      const list = (await as("u1").get("/v1/remote-agents/connectors")).body.data as Array<Record<string, any>>;
+      const by = (cid: string) => list.find((c) => c.connector_id === cid)!;
+      assert.deepEqual([by(old).version_status, by(outdated).version_status, by(current).version_status, by(unknown).version_status],
+        ["unsupported", "outdated", "current", "unknown"]);
+      const upgrade = "npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install";
+      assert.equal(by(old).upgrade_command, upgrade);
+      assert.equal(by(outdated).upgrade_command, upgrade);
+      assert.equal(by(current).upgrade_command, undefined);
+      // Below the minimum: refused by name, with what to run; nothing is queued for it.
+      const refused = await as("u1").post("/v1/remote-agents/sessions", body(old));
+      assert.deepEqual([refused.status, refused.body.error, refused.body.data.version, refused.body.data.upgrade_command],
+        [409, "connector_outdated", "0.1.2", upgrade]);
+      assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_remote_sessions WHERE connector_id = $1", [old])).rows[0].n, 0);
+      // An outdated one, a current one and one that reports no version all still work.
+      for (const cid of [outdated, current, unknown]) assert.equal((await as("u1").post("/v1/remote-agents/sessions", body(cid))).status, 201);
+      // The heartbeat answer tells an old connector to upgrade, and a current one nothing.
+      const hbOld = await heartbeat("u1", outdated, { version: "0.1.3" });
+      assert.deepEqual([hbOld.body.data.connector_version.version_status, hbOld.body.data.connector_version.upgrade_command], ["outdated", upgrade]);
+      assert.equal((await heartbeat("u1", current, { version: "0.1.4" })).body.data.connector_version, undefined);
+    });
+
+    test("the minimum and recommended versions follow the server's settings", async () => {
+      const { cid } = await online();
+      await heartbeat("u1", cid, { version: "0.1.4" });
+      process.env.CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION = "0.2.0";
+      try {
+        const r = await as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/work" });
+        assert.deepEqual([r.status, r.body.error, r.body.data.minimum_version, r.body.data.recommended_version], [409, "connector_outdated", "0.2.0", "0.2.0"]);
+        process.env.CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION = "not a version";
+        assert.equal((await as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/work" })).status, 201);
+      } finally {
+        delete process.env.CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION;
+      }
+    });
+
+    test("setup gives the exact commands, with this server's addresses", async () => {
+      const keep = { pub: process.env.CLAW_PUBLIC_URL, iss: process.env.IDENTITY_ISSUER_URL };
+      process.env.CLAW_PUBLIC_URL = "https://claw.example.com/claw-api/";
+      process.env.IDENTITY_ISSUER_URL = "https://id.example.com";
+      try {
+        const r = await as("u1").get("/v1/remote-agents/setup");
+        assert.equal(r.status, 200);
+        const d = r.body.data;
+        assert.deepEqual(d.steps.map((s: Record<string, string>) => s.command), [
+          "npm install -g @primusclaw/connector",
+          "claw-connector init",
+          "claw-connector login --server https://claw.example.com/claw-api --identity-url https://id.example.com",
+          "claw-connector service install",
+        ]);
+        assert.deepEqual([d.package, d.server, d.identity_url, d.minimum_version, d.recommended_version], [
+          "@primusclaw/connector", "https://claw.example.com/claw-api", "https://id.example.com", "0.1.3", "0.1.4"]);
+        for (const text of [d.text.en, d.text.zh]) {
+          for (const s of d.steps) assert.ok(text.includes(s.command), s.command);
+          assert.doesNotMatch(text, /(^|\n)connector (login|run)/, "the command is claw-connector, never a bare connector");
+        }
+        // An identity service named for the connector wins over the issuer.
+        process.env.CLAW_CONNECTOR_IDENTITY_URL = "https://device.example.com/";
+        assert.match((await as("u1").get("/v1/remote-agents/setup")).body.data.steps[2].command, /--identity-url https:\/\/device\.example\.com$/);
+        // Only for a signed-in user, like every user-side route.
+        assert.equal((await call(null, "GET", "/v1/remote-agents/setup")).status, 403);
+      } finally {
+        delete process.env.CLAW_CONNECTOR_IDENTITY_URL;
+        for (const [k, v] of [["CLAW_PUBLIC_URL", keep.pub], ["IDENTITY_ISSUER_URL", keep.iss]] as const) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
+  });
+
   // ------------------------------------------------------------- isolation
 
   describe("owner isolation", () => {

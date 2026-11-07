@@ -410,6 +410,46 @@ describe("devenv_list", { skip }, () => {
     assert.doesNotMatch(prompts.renderRouterDevenvSection({ actions: false }), /channel_action/);
   });
 
+  test("D8 no machine: the exact commands that connect one, in the user's language; an old connector says how to upgrade", async () => {
+    const keep = { pub: process.env.CLAW_PUBLIC_URL, iss: process.env.IDENTITY_ISSUER_URL };
+    process.env.CLAW_PUBLIC_URL = "https://claw.example.com/claw-api";
+    process.env.IDENTITY_ISSUER_URL = "https://id.example.com";
+    try {
+      const alice = await w.user("alice");
+      const zh = (await call(await userTurn(alice, "连到我的开发机"))).body;
+      assert.equal(zh.total, 0);
+      assert.deepEqual(zh.connect_a_machine.commands, [
+        "npm install -g @primusclaw/connector",
+        "claw-connector init",
+        "claw-connector login --server https://claw.example.com/claw-api --identity-url https://id.example.com",
+        "claw-connector service install",
+      ]);
+      assert.match(zh.connect_a_machine.text, /^在要使用的机器上/);
+      for (const c of zh.connect_a_machine.commands) assert.ok(zh.connect_a_machine.text.includes(c), c);
+      assert.match(zh.note, /connect_a_machine\.text as it is/);
+      const en = (await call(await userTurn(alice, "connect me to my dev box"))).body;
+      assert.match(en.connect_a_machine.text, /^On the machine you want to use/);
+
+      // With a machine there is nothing to connect; a connector below the recommended version is told how to upgrade.
+      await machine("alice", "laptop", { online: true });
+      await w.q("UPDATE claw_remote_connectors SET version = '0.1.2' WHERE owner_user_id = 'alice'");
+      const listed = (await call(await userTurn(alice, "我的开发环境有哪些"))).body;
+      assert.equal(listed.connect_a_machine, undefined);
+      assert.deepEqual([listed.machines[0].version_status, listed.machines[0].upgrade_command],
+        ["unsupported", "npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install"]);
+      assert.match(listed.note, /upgrade_command as it is/);
+      const prompts = await import("../src/assistant/prompts.js");
+      const section = prompts.renderRouterDevenvSection({ actions: true, send: true });
+      assert.match(section, /connect_a_machine\.text exactly as it is/);
+      assert.match(section, /connector_outdated/);
+      assert.doesNotMatch(section, /running claw-connector on a machine connects it/, "no hint the model has to turn into commands itself");
+    } finally {
+      for (const [k, v] of [["CLAW_PUBLIC_URL", keep.pub], ["IDENTITY_ISSUER_URL", keep.iss]] as const) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+  });
+
   test("D7 a name a connector reported reaches only a turn that can no longer act on it, except to attach", async () => {
     const tools = await import("../src/assistant/devenv-tools.js");
     const alice = await w.user("alice");
