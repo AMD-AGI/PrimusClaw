@@ -102,7 +102,8 @@ record it.
 
 ### Fixed
 - A machine paired from the chat (`claw-connector pair`) and then disconnected is told, wherever the connector says what to do next
-  (`run` started again by the service or by hand, `status`, `service status`, `doctor`'s fix, a sign-in refused at start), to ask the
+  (the revocation itself, `run` started again by the service or by hand, the supervisor's log line, `status`, `service status`,
+  `doctor`'s fix, a sign-in refused at start), to ask the
   chat for a new pairing command and run it, instead of `claw-connector login`, which it never ran. A machine signed in with `login`
   is still told to log in.
 - A sandbox torn down by one brain replica while another was walking the handle records no longer stops every replica

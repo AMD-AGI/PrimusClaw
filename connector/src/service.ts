@@ -27,7 +27,7 @@ import { parseArgs } from "node:util";
 import { parse as parseToml } from "smol-toml";
 import type { Ctx, ServiceHelpers } from "./commands.js";
 import { isAlive, processStart } from "./children.js";
-import { reconnectStep } from "./credentials.js";
+import { reconnectFix, reconnectStep } from "./credentials.js";
 import { needsLogin, recordDisconnect, recentDisconnects } from "./health.js";
 import { credentialsFile, keepaliveFile, keepaliveStampFile, runLogFile, serviceEnvFile, serviceFile, supervisorPidFile } from "./paths.js";
 import { errMessage, isObject, sleep } from "./util.js";
@@ -395,7 +395,7 @@ export async function supervise(ctx: Ctx, o: SuperviseOptions = {}): Promise<num
       const at = new Date().toISOString();
       if (stopping) return 0;
       if (code === 0) { ctx.err(`${at} supervisor: the connector stopped on purpose (exit 0); not restarting`); return 0; }
-      if (code === NEEDS_PERSON) { ctx.err(`${at} supervisor: the connector needs a new sign-in (exit 78); not restarting until: claw-connector login`); return NEEDS_PERSON; }
+      if (code === NEEDS_PERSON) { ctx.err(`${at} supervisor: the connector needs a new sign-in (exit 78); not restarting until: ${reconnectFix(credentialsFile(ctx.dirs))}`); return NEEDS_PERSON; }
       const how = signal ? `killed by ${signal}` : `exit ${code}`;
       // A run killed outright never wrote why; say it here, so status shows it.
       if (signal) recordDisconnect(ctx.dirs, { reason: "process_died", detail: `the connector was ${how}; restarted by the supervisor` });

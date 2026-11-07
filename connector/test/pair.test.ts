@@ -96,7 +96,7 @@ describe("claw-connector pair", () => {
       await claw.until("registered again", () => claw.online);
       claw.revoke();
       assert.equal(await again, EXIT.revoked);
-      assert.match(rv.errText(), /Pair it again/);
+      assert.match(rv.errText(), /this connector was revoked: every agent was stopped. Pair it again: ask the chat for a new pairing command/);
       // Started again afterwards (by the service, or by hand), and asked for its status: still told to pair, never to log in,
       // which a paired machine never did. A machine signed in with login is still told to log in.
       const rerun = ctx(home);

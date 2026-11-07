@@ -431,7 +431,7 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   try {
     const result = await connector.run();
     // A machine paired from the chat has no login to run again: a new pairing code is what connects it.
-    const again = creds.kind === "grant" ? "Pair it again: ask the chat for a new command (\"连接我的开发环境\") and run it here." : "Run login again to connect it anew.";
+    const again = reconnectAdvice(credentialsFile(ctx.dirs));
     if (result === "revoked") {
       markNeedsLogin(ctx.dirs, "this connector was revoked");
       ctx.err(`this connector was revoked: every agent was stopped. ${again}`);
