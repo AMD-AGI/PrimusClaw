@@ -805,6 +805,14 @@ record it.
   stream again at once, without the reconnect backoff and without waiting for the end of the response a gateway may hold (up to the
   75 s watchdog before); `disconnects.jsonl` records it as `server_closed` / `restart`. A second such frame within 5 s takes the
   usual backoff, so a release never becomes a burst of reconnects.
+- `@primusclaw/connector` 0.1.6: `claw-connector doctor` checks the machine first (Node version, the agents' programs on the PATH the
+  service sees, whether Claude and Codex are signed in, writable roots, proxy variables, a Claw certificate Node does not trust, the
+  keep-alive) with one fix per problem, then opens a session on each agent's adapter; a running connector re-checks every 15 minutes
+  and reports the result with each agent's health, which the chat shows; `service install` also carries `NODE_USE_SYSTEM_CA` and
+  `NODE_USE_ENV_PROXY` (#416). After a restart (a crash, a kill, a pod or supervisor restart, an upgrade) a connector carries on
+  a turn that was waiting for a tool approval and shows its card again (an agent that always asks, not paused, offline for less than
+  the card's lifetime), ends any other running turn with `connector_restarted`, keeps the prompts that were queued, and says
+  `session_recovered` for a session used in the last 4 h (#419).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
