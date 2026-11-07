@@ -4,6 +4,7 @@
 /** One agent adapter process and the ACP connection to it (newline-delimited JSON-RPC over its stdio). */
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
@@ -55,12 +56,15 @@ export class AdapterProcess {
   private constructor(readonly child: ChildProcess, readonly pid: number, private readonly registry: ChildRegistry) {}
 
   static async start(o: AdapterStart): Promise<AdapterProcess> {
-    fs.mkdirSync(path.dirname(o.logFile), { recursive: true, mode: 0o700 });
+    // The log is written as a stream (off the event loop): it sits in the state directory, which may be a network disk
+    // that stalls, and an adapter's stderr must not freeze the connector. Past 1 MiB waiting for the disk, lines are dropped.
+    await fsp.mkdir(path.dirname(o.logFile), { recursive: true, mode: 0o700 });
     const env = { ...process.env, ...o.cfg.env };
     // A pinned preset runs from the copy installed in the connector's directory, never through npx in the session's
     // folder (adapter-install.ts). The session's folder reaches the adapter in session/new either way.
     const run = (await adapterStore()?.launch(o.cfg, o.cwd, env)) ?? { command: o.cfg.command, args: o.cfg.args, cwd: o.cwd };
-    const log = fs.openSync(o.logFile, "a", 0o600);
+    const log = fs.createWriteStream(o.logFile, { flags: "a", mode: 0o600 });
+    log.on("error", () => { /* the log is best effort */ });
     const child = spawn(run.command, run.args, {
       cwd: run.cwd,
       env,
@@ -71,7 +75,7 @@ export class AdapterProcess {
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", () => resolve());
       child.once("error", (e) => reject(new Error(`could not start ${run.command}: ${errMessage(e)}`)));
-    }).catch((e) => { fs.closeSync(log); throw e; });
+    }).catch((e) => { log.end(); throw e; });
     const pid = child.pid!;
     o.registry.add({ pid, pgid: pid, agent_id: o.cfg.id, session_id: o.sessionId });
     const a = new AdapterProcess(child, pid, o.registry);
@@ -80,7 +84,7 @@ export class AdapterProcess {
     let tail = "";
     const flushLine = (line: string) => {
       const text = redactText(line).text;
-      try { fs.writeSync(log, text + "\n"); } catch { /* the log is best effort */ }
+      if (log.writableLength < 1024 * 1024) log.write(text + "\n");
       try { o.hooks.onStderr(text); } catch { /* a hook must not break the stream */ }
     };
     child.stderr!.on("data", (d: Buffer) => {
@@ -92,7 +96,7 @@ export class AdapterProcess {
       }
       if (tail.length > 64 * 1024) { flushLine(tail); tail = ""; }
     });
-    child.stderr!.once("close", () => { if (tail) { flushLine(tail); tail = ""; } try { fs.closeSync(log); } catch { /* already closed */ } });
+    child.stderr!.once("close", () => { if (tail) { flushLine(tail); tail = ""; } log.end(); });
     child.stdin!.on("error", () => { /* the adapter went away; the exit handler reports it */ });
     child.once("exit", (code, signal) => {
       a.exited = true;
@@ -128,6 +132,10 @@ export class AdapterProcess {
       a.caps = ((init as AcpParams).agentCapabilities ?? {}) as AcpParams;
       const methods = (init as AcpParams).authMethods;
       a.authMethods = Array.isArray(methods) ? methods.filter((m: unknown) => typeof m === "object" && m !== null) : [];
+      // Its pid must be on record before it is used: after a crash the next run stops what children.json names, and an
+      // adapter it does not name would be left running. A state directory that does not take the record (in a bounded
+      // time) fails the start.
+      if (!(await o.registry.flushed())) throw new Error("could not record the adapter's process: the state directory did not answer");
     } catch (e) {
       await a.kill();
       throw e;

@@ -11,7 +11,8 @@ import { parseConfig, type ConnectorConfig } from "../../src/config.js";
 import { Connector, type ConnectorTiming, type RunResult } from "../../src/connector.js";
 import { KeyTokenProvider, type TokenProvider } from "../../src/credentials.js";
 import type { Report } from "../../src/doctor.js";
-import { fileAudit } from "../../src/audit.js";
+import { fileAudit, type Audit } from "../../src/audit.js";
+import { redactDeep } from "../../src/redact.js";
 import { auditFile, resolveDirs, type Dirs } from "../../src/paths.js";
 import { silentLogger } from "../../src/util.js";
 import { FakeClaw } from "./fake-claw.js";
@@ -126,8 +127,15 @@ ${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, {
   /** (Re)build the connector object on the same home, as after a restart. */
   connect(o: HarnessOptions = {}): void {
     const client = new ClawClient({ server: this.claw.url, tokens: o.tokens ?? new KeyTokenProvider(o.token ?? "good-token"), requestTimeoutMs: 3000 });
+    // The trail is written to its file as in production (off the event loop, so a moment later); `audit()` reads the
+    // same records, as they were made, at once.
+    const file = fileAudit(auditFile(this.dirs));
+    const audit: Audit = {
+      record: (kind, detail = {}) => { file.record(kind, detail); this.auditRecords.push({ ...redactDeep(detail), kind }); },
+      flush: () => file.flush?.() ?? Promise.resolve(),
+    };
     this.connector = new Connector({
-      config: this.config, dirs: this.dirs, client, server: this.claw.url, audit: fileAudit(auditFile(this.dirs)), log: silentLogger,
+      config: this.config, dirs: this.dirs, client, server: this.claw.url, audit, log: silentLogger,
       version: "test", timing: { ...FAST, ...(o.timing ?? {}) }, health: o.health,
     });
   }
@@ -191,9 +199,11 @@ ${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, {
     try { return fs.readFileSync(this.fakeLog, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
   }
 
+  /** Every audit record this harness's connectors made, across restarts, oldest first. */
   audit(): any[] {
-    try { return fs.readFileSync(auditFile(this.dirs), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
+    return [...this.auditRecords];
   }
+  private readonly auditRecords: any[] = [];
 
   messages(sid: string): string[] {
     return this.claw.eventsOf(sid, "agent_message_chunk").map((e) => e.data.update.content.text);

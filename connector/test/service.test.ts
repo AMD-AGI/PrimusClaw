@@ -3,13 +3,14 @@
 
 /** `service`, `supervise`, exit 78 and the disconnect record: what keeps a connector up, and what keeps it down. */
 import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test, { describe } from "node:test";
 import { main, EXIT, type Ctx } from "../src/commands.js";
 import { needsLogin, recentDisconnects } from "../src/health.js";
 import { keepaliveFile, needsLoginFile, pidFile, resolveDirs, serviceEnvFile, supervisorPidFile } from "../src/paths.js";
-import { accountName, carriedEnv, codexEnvKeys, cronLines, ephemeralWhere, readMounts, supervise, systemdUnit, type ExecResult, type ServiceDeps } from "../src/service.js";
+import { accountName, carriedEnv, codexEnvKeys, cronLines, ephemeralWhere, launchdPlist, readMounts, supervise, systemdUnit, withThreadPool, type ExecResult, type ServiceDeps } from "../src/service.js";
 import { FakeClaw } from "./support/fake-claw.js";
 import { ADAPTER, tmpdir } from "./support/harness.js";
 
@@ -49,6 +50,50 @@ const D = (over: Partial<ServiceDeps> = {}): Partial<ServiceDeps> => {
   fs.writeFileSync(cli, "");
   return { platform: "linux", uid: 1000, user: "me", node: "/usr/bin/node", cli, systemdBooted: () => true, readCrontab: () => null, writeCrontab: () => false, ...over };
 };
+
+describe("a run the service starts has a thread pool a stalled disk cannot fill", () => {
+  // The pool size must be in the environment before node starts: the ES module loader starts the pool (four threads)
+  // before any line of the program runs, so setting it from inside the program does nothing.
+  const probe = path.join(path.dirname(new URL(import.meta.url).pathname), "support", "pool-probe.mjs");
+  const lookupMs = async (env: NodeJS.ProcessEnv): Promise<string> => {
+    const dir = tmpdir("fifo-");
+    const fifos = Array.from({ length: 6 }, (_, i) => path.join(dir, `f${i}`));
+    for (const f of fifos) assert.equal(spawnSync("mkfifo", ["-m", "600", f]).status, 0, `mkfifo ${f}`);
+    const p = spawn(process.execPath, [probe, ...fifos], { env, stdio: ["ignore", "pipe", "ignore"] });
+    try {
+      let out = "";
+      p.stdout.on("data", (b: Buffer) => { out += b.toString(); });
+      for (let i = 0; i < 100 && !out.includes("\n"); i++) await new Promise((r) => setTimeout(r, 50));
+      return out.trim();
+    } finally { p.kill("SIGKILL"); }
+  };
+  const bare = (): NodeJS.ProcessEnv => { const e = { ...process.env }; delete e.UV_THREADPOOL_SIZE; return e; };
+
+  test("with the environment a run is started with, a DNS lookup still gets a thread while six file calls are stuck", async () => {
+    const ms = await lookupMs(withThreadPool(bare()));
+    assert.match(ms, /^\d+$/, `the lookup answered (got ${JSON.stringify(ms)})`);
+    assert.ok(Number(ms) < 1_000, `in ${ms} ms`);
+  });
+  test("control: with node's default pool the same lookup is stuck (the probe measures what it claims)", async () => {
+    assert.equal(await lookupMs(bare()), "stuck");
+  });
+  test("the systemd unit, the launchd plist and the supervisor's run all start node with it; a value the user set is kept", async () => {
+    const d = { node: "/usr/bin/node", cli: "/x/cli.js" } as ServiceDeps;
+    assert.match(systemdUnit(d, [["PATH", "/bin"]]), /^Environment="UV_THREADPOOL_SIZE=16"$/m);
+    assert.match(launchdPlist(d, [["PATH", "/bin"]], "/l"), /<key>UV_THREADPOOL_SIZE<\/key><string>16<\/string>/);
+    const own = systemdUnit(d, [["UV_THREADPOOL_SIZE", "64"]]);
+    assert.match(own, /^Environment="UV_THREADPOOL_SIZE=64"$/m);
+    assert.doesNotMatch(own, /UV_THREADPOOL_SIZE=16/);
+    const seen = path.join(tmpdir("pool-"), "seen");
+    const record = (env: NodeJS.ProcessEnv) => supervise(ctx(tmpdir(), {}, env).c, {
+      command: [process.execPath, ["-e", "require('fs').writeFileSync(process.argv[1], process.env.UV_THREADPOOL_SIZE ?? 'unset')", seen]], restartMs: 20,
+    });
+    assert.equal(await record({}), 0);
+    assert.equal(fs.readFileSync(seen, "utf8"), "16");
+    assert.equal(await record({ UV_THREADPOOL_SIZE: "8" }), 0);
+    assert.equal(fs.readFileSync(seen, "utf8"), "8");
+  });
+});
 
 describe("the units", () => {
   test("the systemd unit restarts 5 s after any failure but never after 78, starts run --supervised, and keeps $ and % literal", () => {
@@ -588,7 +633,7 @@ describe("the disconnect record", () => {
   test("is trimmed to its newer half past 128 KiB, newest last", async () => {
     const { recordDisconnect } = await import("../src/health.js");
     const dirs = ctx(tmpdir()).c.dirs;
-    for (let i = 0; i < 700; i++) recordDisconnect(dirs, { reason: "stream_lost", detail: `${i} ${"x".repeat(200)}` });
+    for (let i = 0; i < 700; i++) await recordDisconnect(dirs, { reason: "stream_lost", detail: `${i} ${"x".repeat(200)}` });
     const size = Buffer.byteLength(fs.readFileSync(path.join(dirs.state, "disconnects.jsonl"), "utf8"));
     assert.ok(size <= 128 * 1024, `size ${size}`);
     assert.match(recentDisconnects(dirs, 1)[0]?.detail ?? "", /^699 /);
@@ -600,7 +645,7 @@ describe("the disconnect record", () => {
     let trimmedAt = -1;
     const fresh = ctx(tmpdir()).c.dirs;
     for (let i = 0; i < 700 && trimmedAt < 0; i++) {
-      recordDisconnect(fresh, { reason: "stream_lost", detail: `${i} ${"x".repeat(200)}` });
+      await recordDisconnect(fresh, { reason: "stream_lost", detail: `${i} ${"x".repeat(200)}` });
       if (recentDisconnects(fresh, 10_000).length < i + 1) trimmedAt = i;
     }
     assert.ok(trimmedAt > 0, "a trim happened");

@@ -33,7 +33,8 @@ import { redactDeep } from "./redact.js";
 import type { SessionStore } from "./session-store.js";
 import { errMessage, isObject, sleep, truncateBytes, type Logger } from "./util.js";
 
-export type Emit = (sessionId: string, type: string, data: Record<string, unknown>) => void;
+/** `after`: the event is written (and posted) only once that has settled, e.g. the record it depends on is on disk. */
+export type Emit = (sessionId: string, type: string, data: Record<string, unknown>, after?: Promise<unknown>) => void;
 
 export interface SessionTiming {
   /** A session with no activity for this long loses its adapter process (the session itself stays and resumes on demand). */
@@ -163,8 +164,8 @@ export class Session {
 
   // --- helpers -----------------------------------------------------------------
 
-  private emit(type: string, data: Record<string, unknown>): void {
-    this.env.emit(this.id, type, data);
+  private emit(type: string, data: Record<string, unknown>, after?: Promise<unknown>): void {
+    this.env.emit(this.id, type, data, after);
   }
 
   private audit(kind: string, detail: Record<string, unknown> = {}): void {
@@ -212,7 +213,7 @@ export class Session {
     // `unused`: a new conversation of this connector's own making that no message has reached yet (see neverPrompted).
     this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString(), unused: true });
     this.audit("session_started", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
-    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
+    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended }, this.env.store.written());
     this.announced = true;
     this.touch();
   }
@@ -240,7 +241,7 @@ export class Session {
     if (this.closed) return;
     this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString() });
     this.audit("session_attached", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
-    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
+    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended }, this.env.store.written());
     this.touch();
   }
 
@@ -708,7 +709,8 @@ export class Session {
       this.env.store.addPending(this.id, p.actionId);
       this.env.store.markWaiting(this.id, true, permission);
       this.audit("permission_requested", { action_id: p.actionId, tool: info.tool, tool_kind: info.kind, options: options.map((o) => o.optionId) });
-      this.emit("permissionRequest", p.payload);
+      // Shown once the card is on record: a crash after that closes it on the next run (`takePending`).
+      this.emit("permissionRequest", p.payload, this.env.store.written());
     });
   }
 
@@ -848,7 +850,7 @@ export class Session {
       // Recorded before the prompt counts as handled: from here a restart finds this turn instead of losing it.
       this.env.store.beginTurn({ session_id: this.id, cmd_id: cmdId, cmd_seq: cmdSeq, started_at: now });
       this.env.store.patch(this.id, { used_at: now, unused: false });
-      started();
+      void this.handledOnceRecorded(started, now);
       const res = await reply;
       const usage = isObject(res.usage) ? res.usage : undefined;
       this.endTurn({ stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });
@@ -871,6 +873,25 @@ export class Session {
         if (this.closed) watch.stop();
         else if (await watch.finish()) this.twinSeen = true;
       }
+    }
+  }
+
+  /**
+   * The turn record is written off the event loop, so the prompt counts as handled (and the heartbeat's cursor passes
+   * it) only once the record has landed. Either the next run finds the turn (and ends or carries it on), or it is sent
+   * the prompt again; never neither, and never both:
+   * - the record landed: handled;
+   * - the turn ended (its record gone or replaced) or the session closed: handled, the record no longer matters;
+   * - the connector stops before the record landed: the record is dropped and the prompt left unhandled, so the next
+   *   run is sent it again instead of also finding this turn;
+   * - otherwise (a stalled disk, a failed write) it asks again every second; a failed write is tried again each time.
+   */
+  private async handledOnceRecorded(started: () => void, startedAt: string): Promise<void> {
+    for (;;) {
+      if (await this.env.store.flushed(1_000)) return started();
+      if (this.closed || this.env.store.turn(this.id)?.started_at !== startedAt) return started();
+      if (this.stopping) { this.env.store.endTurn(this.id); return; }
+      await sleep(1_000);
     }
   }
 

@@ -67,6 +67,12 @@ export interface Ctx {
   /** How `service` runs systemctl/launchctl, which program a unit starts, and where the units go (tests set them). */
   service?: Partial<ServiceDeps>;
   /**
+   * Asks the person at the terminal a yes/no question; absent when nobody can answer (stdin or stdout is not a
+   * terminal: a script, a pipe, CI). `init` asks before it changes Claude Code's own settings, and without this it
+   * changes nothing there and prints the command that would.
+   */
+  ask?: (question: string) => Promise<boolean>;
+  /**
    * Install the pinned adapters into the state directory (adapter-install.ts): at init, service install, the start of
    * run, and when a session needs one. The command line sets it; a test leaves it off, so nothing is downloaded.
    */
@@ -88,9 +94,10 @@ const HELP = `claw-connector ${VERSION}: connect the coding agents on this machi
 
 Usage: claw-connector <command> [options]
 
-  init [--approval ask|never | --approval AGENT=ask|never ...] [--no-hooks] [--no-probe]
-                           write a sample agents.toml, and install the Claude Code session hooks (see "hooks"; --no-hooks
-                           skips that). Agents ask before every write and command by default;
+  init [--approval ask|never | --approval AGENT=ask|never ...] [--hooks | --no-hooks] [--no-probe]
+                           write a sample agents.toml. In a terminal it then asks whether to add the Claude Code session
+                           hooks to Claude's settings.json (see "hooks"); --hooks adds them without asking, --no-hooks
+                           does not, and when nobody can answer they are not added. Agents ask before every write and command by default;
                            "--approval never" (or "--approval claude=never") lets phone sessions run like your
                            terminal, with no per-step approval. Agents are: ${SAMPLE_AGENTS.join(", ")}.
   hooks install|uninstall|status [--config-dir DIR]
@@ -206,7 +213,8 @@ function parseApproval(values: string[]): Partial<Record<string, Approval>> | st
 }
 
 async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
-  const { values } = parseArgs({ args, strict: true, options: { approval: { type: "string", multiple: true }, "no-hooks": { type: "boolean" }, "no-probe": { type: "boolean" } } });
+  const { values } = parseArgs({ args, strict: true, options: { approval: { type: "string", multiple: true }, hooks: { type: "boolean" }, "no-hooks": { type: "boolean" }, "no-probe": { type: "boolean" } } });
+  if (values.hooks && values["no-hooks"]) { ctx.err("init: --hooks and --no-hooks contradict each other; pass one"); return EXIT.usage; }
   const approval = parseApproval(values.approval ?? []);
   if (typeof approval === "string") { ctx.err(approval); return EXIT.usage; }
   const file = configFile(ctx.dirs);
@@ -228,12 +236,7 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
   // A dev pod's home directory is often thrown away with the pod: say so now, not after the first restart.
   const where = ephemeralWhere(ctx.dirs.config);
   if (where) ctx.out(`note: ${where}`);
-  // The hooks are a convenience: a Claude Code settings file that cannot be merged into is reported, and init still succeeded.
-  if (!values["no-hooks"]) {
-    const dir = defaultClaudeDir(ctx);
-    if (!fs.existsSync(dir)) ctx.out(`no Claude Code directory at ${dir}; once you use Claude Code, run: claw-connector hooks install`);
-    else installForInit(ctx, dir);
-  }
+  await initHooks(ctx, { hooks: !!values.hooks, noHooks: !!values["no-hooks"] });
   // Installed first, so the probe below (and the first phone session) starts the adapter without a download.
   await installAdapters(ctx, true);
   if (ctx.probe && !values["no-probe"]) {
@@ -244,6 +247,31 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
     } catch (e) { ctx.out(`could not check the agents yet: ${errMessage(e)}; after editing agents.toml run: claw-connector doctor`); }
   }
   return EXIT.ok;
+}
+
+/**
+ * The hooks are a convenience, and they live in Claude Code's own settings file, which is the user's, not ours: they are
+ * added only when asked for (--hooks) or agreed to at the terminal. A file that cannot be merged into is reported, and
+ * init still succeeds.
+ */
+async function initHooks(ctx: Ctx, o: { hooks: boolean; noHooks: boolean }): Promise<void> {
+  if (o.noHooks) return;
+  const dir = defaultClaudeDir(ctx);
+  if (!fs.existsSync(dir)) { ctx.out(`no Claude Code directory at ${dir}; once you use Claude Code, run: claw-connector hooks install`); return; }
+  // Hooks of ours already there were agreed to before: they are brought up to date (a moved program) without asking again.
+  if (!o.hooks && !hooksPresent(dir)) {
+    const yes = ctx.ask ? await ctx.ask(`Add two hooks (SessionStart, SessionEnd) to ${settingsFile(dir)}, so Claw can tell which Claude Code sessions are open in a terminal? [y/N] `) : false;
+    if (!yes) {
+      ctx.out(`left ${settingsFile(dir)} alone${ctx.ask ? "" : " (no terminal to ask in)"}. Without the session hooks, a Claude Code session open in a terminal is found by listing processes only; to add them: claw-connector hooks install`);
+      return;
+    }
+  }
+  installForInit(ctx, dir);
+}
+
+/** Whether any hook of ours is in this directory's settings already; a settings file that cannot be read counts as no. */
+function hooksPresent(dir: string): boolean {
+  try { return hooksStatus(dir).events.length > 0; } catch { return false; }
 }
 
 /**

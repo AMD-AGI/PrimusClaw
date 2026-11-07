@@ -7,6 +7,7 @@
  * speaking real newline-delimited JSON-RPC over stdio.
  */
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test, { after, describe } from "node:test";
@@ -564,8 +565,9 @@ describe("what leaves the machine", () => {
   test("adapter stderr is masked before it is written, even when a credential arrives split across two writes", async () => {
     const h = await make({ env: { FAKE_STDERR_SPLIT: "1" } });
     const sid = await h.newSession();
-    await sleep(300);
-    const log = fs.readFileSync(path.join(h.dirs.state, "logs", "adapter-fake.log"), "utf8");
+    // The log is a write stream (off the event loop): read once the second half has landed.
+    const file = path.join(h.dirs.state, "logs", "adapter-fake.log");
+    const log = await h.claw.until("the masked line in the log", () => { try { const t = fs.readFileSync(file, "utf8"); return /done/.test(t) && t; } catch { return false; } });
     assert.match(log, /\[hidden\]/);
     assert.doesNotMatch(log, /abcdefghijklmnopqrstuvwxyz0123/);
     assert.equal(h.claw.eventsOf(sid, "session_started").length, 1);
@@ -646,7 +648,14 @@ describe("transport: reconnect, duplicates, loss", () => {
     h.claw.restart({ hold: true });
     await h.claw.until("a new command stream", () => h.claw.streamHeaders.length > connects, 1_500);
     assert.ok(Date.now() - t0 < 1_000, `reconnected in ${Date.now() - t0} ms`);
-    const down = fs.readFileSync(path.join(h.dirs.state, "disconnects.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    // The disconnect record is appended off the event loop: read it once the line has landed.
+    const file = path.join(h.dirs.state, "disconnects.jsonl");
+    const down: any[] = await h.claw.until("the disconnect on record", () => {
+      try {
+        const rows = fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+        return rows.at(-1)?.reason === "server_closed" && rows;
+      } catch { return false; }
+    });
     assert.equal(down.at(-1).reason, "server_closed");
     assert.equal(down.at(-1).detail, "restart");
   });
@@ -738,6 +747,7 @@ describe("crash safety", () => {
     const sid = "33333333-3333-4333-8333-333333333333";
     h.claw.issue("session.new", sid, { agent_id: "fake", cwd: h.work, mode: null }); // so the server knows the session
     h.connector.store.addPending(sid, "orphan-action");
+    assert.equal(await h.connector.store.flushed(), true, "on disk before the crash");
     h.connect();
     h.start();
     const ev = await h.claw.until("the orphaned card to be closed", () => h.claw.eventsOf(sid, "permission_resolved").find((e) => e.data.actionId === "orphan-action"));
@@ -799,6 +809,7 @@ describe("crash safety", () => {
     const sid = "44444444-4444-4444-8444-444444444444";
     h.connector.store.put(sid, { agent_id: "fake", acp_session_id: "acp-x", cwd: h.work, status: "active", mode: "default", created_at: new Date().toISOString() });
     h.connector.store.beginTurn({ session_id: sid, cmd_id: "c-1", cmd_seq: 7, started_at: new Date().toISOString(), waiting: true, waiting_permission: true });
+    assert.equal(await h.connector.store.flushed(), true, "on disk, as a crash would leave them (the store writes off the event loop)");
     fs.writeFileSync(path.join(h.dirs.state, "connector.json"), "{}");
     const old = new Date(Date.now() - 60_000);
     fs.utimesSync(path.join(h.dirs.state, "connector.json"), old, old);
@@ -810,9 +821,10 @@ describe("crash safety", () => {
     assert.deepEqual(h.adapterLog(), [], "nothing was started");
   });
   /** A session of the fake agent recorded by an earlier run, with a turn that was waiting for a tool call's permission a moment ago. */
-  const crashedWhileAsking = (h: Harness, sid: string, cwd = h.work, mode = "default") => {
+  const crashedWhileAsking = async (h: Harness, sid: string, cwd = h.work, mode = "default") => {
     h.connector.store.put(sid, { agent_id: "fake", acp_session_id: "acp-x", cwd, status: "active", mode, created_at: new Date().toISOString() });
     h.connector.store.beginTurn({ session_id: sid, cmd_id: "c-9", cmd_seq: 9, started_at: new Date().toISOString(), waiting: true, waiting_permission: true });
+    assert.equal(await h.connector.store.flushed(), true, "on disk, as a crash would leave them (the store writes off the event loop)");
     // Its last heartbeat a moment ago (connector.json's mtime), so only the rule under test keeps the turn from going on.
     // (Opened once, created when missing and kept when there: one file handle, no check-then-write.)
     const fd = fs.openSync(path.join(h.dirs.state, "connector.json"), fs.constants.O_RDWR | fs.constants.O_CREAT, 0o600);
@@ -837,7 +849,7 @@ describe("crash safety", () => {
   test("an agent that may run without asking (approval = never) is never carried on after a restart", async () => {
     const h = await make({ start: false, approval: "never", askMode: "bypassPermissions" });
     const sid = "66666666-6666-4666-8666-666666666666";
-    crashedWhileAsking(h, sid, h.work, "default");
+    await crashedWhileAsking(h, sid, h.work, "default");
     h.connect();
     h.start();
     const end = await h.turnEnd(sid);
@@ -847,7 +859,7 @@ describe("crash safety", () => {
   test("with the kill switch on at start (paused), a turn that was waiting is ended, nothing is started", async () => {
     const h = await make({ start: false });
     const sid = "77777777-7777-4777-8777-777777777777";
-    crashedWhileAsking(h, sid);
+    await crashedWhileAsking(h, sid);
     fs.writeFileSync(path.join(h.dirs.state, "paused"), "x");
     h.connect();
     h.start();
@@ -861,7 +873,7 @@ describe("crash safety", () => {
     await h.online();
     await h.stop();
     const sid = "88888888-8888-4888-8888-888888888888";
-    crashedWhileAsking(h, sid);
+    await crashedWhileAsking(h, sid);
     h.claw.revoked = true; // the row this connector registered
     h.connect();
     assert.equal(await h.start(), "revoked");
@@ -871,12 +883,87 @@ describe("crash safety", () => {
   test("a carried-on turn that cannot start again (its folder left the roots) is ended by the refusal and forgotten", async () => {
     const h = await make({ start: false });
     const sid = "99999999-9999-4999-8999-999999999999";
-    crashedWhileAsking(h, sid, tmpdir("cc-gone-"));
+    await crashedWhileAsking(h, sid, tmpdir("cc-gone-"));
     h.connect();
     h.start();
     await h.claw.until("the session refused", () => h.claw.eventsOf(sid, "session_closed")[0]);
     await h.claw.until("the record forgotten", () => h.connector.store.listTurns().length === 0);
     assert.deepEqual(h.adapterLog(), []);
+  });
+  test("a prompt counts as handled only once its turn is on disk: while that write is stuck, the heartbeat's cursor stays below it", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    // A FIFO nobody reads stands in for a disk that stopped answering, for the turn record's write only.
+    const fifo = path.join(h.dirs.state, "sessions.json.turns.tmp");
+    fs.rmSync(fifo, { force: true });
+    assert.equal(spawnSync("mkfifo", ["-m", "600", fifo]).status, 0);
+    let read: Promise<unknown> | null = null;
+    try {
+      const flag = path.join(h.work, "never3");
+      const seq = h.prompt(sid, `wait ${flag}`);
+      await h.claw.until("the prompt to reach the agent", () => h.adapterLog().some((l) => l.prompt === `wait ${flag}`));
+      const n = h.claw.heartbeats.length;
+      await h.claw.until("three more heartbeats", () => h.claw.heartbeats.length >= n + 3);
+      assert.ok(h.claw.cursor < seq, `the server still holds the command (cursor ${h.claw.cursor}, prompt ${seq}): a restart now would send it again`);
+      // The disk answers: the record lands, and only then is the command forgotten.
+      read = fs.promises.readFile(fifo);
+      await h.claw.until("the cursor to pass the prompt", () => h.claw.cursor >= seq);
+      assert.equal(h.connector.store.turn(sid)?.cmd_seq, seq);
+    } finally {
+      // Never leave the write stuck: a libuv thread blocked on the FIFO would keep the test process from exiting.
+      await (read ?? fs.promises.readFile(fifo));
+    }
+  });
+  test("a turn record whose write fails keeps its prompt unhandled, and is written again until it lands", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const tmpFile = path.join(h.dirs.state, "sessions.json.turns.tmp");
+    fs.mkdirSync(tmpFile); // the temporary file cannot be written: every write of the record fails at once
+    try {
+      const flag = path.join(h.work, "never4");
+      const seq = h.prompt(sid, `wait ${flag}`);
+      await h.claw.until("the prompt to reach the agent", () => h.adapterLog().some((l) => l.prompt === `wait ${flag}`));
+      const n = h.claw.heartbeats.length;
+      await h.claw.until("three more heartbeats", () => h.claw.heartbeats.length >= n + 3);
+      await sleep(1_200); // past one retry, which fails too
+      assert.ok(h.claw.cursor < seq, `the server still holds the command (cursor ${h.claw.cursor}, prompt ${seq})`);
+      fs.rmdirSync(tmpFile);
+      await h.claw.until("the cursor to pass the prompt once the record is written", () => h.claw.cursor >= seq, 5_000);
+      assert.equal(JSON.parse(fs.readFileSync(path.join(h.dirs.state, "sessions.json.turns"), "utf8"))[sid].cmd_seq, seq);
+    } finally { fs.rmSync(tmpFile, { recursive: true, force: true }); }
+  });
+  test("stopped before its turn record landed, a prompt is sent again after the restart and its dropped record is not also recovered", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const fifo = path.join(h.dirs.state, "sessions.json.turns.tmp");
+    fs.rmSync(fifo, { force: true });
+    assert.equal(spawnSync("mkfifo", ["-m", "600", fifo]).status, 0);
+    const flag = path.join(h.work, "never5");
+    let read: Promise<unknown> | null = null;
+    let seq = 0;
+    try {
+      seq = h.prompt(sid, `wait ${flag}`);
+      await h.claw.until("the prompt to reach the agent", () => h.adapterLog().some((l) => l.prompt === `wait ${flag}`));
+      const stopped = h.stop();
+      await sleep(2_500); // the session sees it is stopping while the record's write is still stuck
+      read = fs.promises.readFile(fifo); // the disk answers: the stuck write lands, then the one without the turn
+      await stopped;
+      await read;
+    } finally { await (read ?? fs.promises.readFile(fifo)); }
+    assert.ok(h.claw.cursor < seq, `the server still holds the prompt (cursor ${h.claw.cursor}, prompt ${seq})`);
+    await h.claw.until("the record without the turn", () => {
+      const turns = path.join(h.dirs.state, "sessions.json.turns");
+      // (The stuck write renames the FIFO into place before the next write replaces it: never read a FIFO here.)
+      // One open, then a check and a read of that same file: O_NONBLOCK keeps the open of a FIFO from waiting for a writer.
+      let fd: number;
+      try { fd = fs.openSync(turns, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK); } catch { return false; }
+      try { return fs.fstatSync(fd).isFile() && !(sid in JSON.parse(fs.readFileSync(fd, "utf8"))); } catch { return false; } finally { fs.closeSync(fd); }
+    }, 3_000);
+    h.connect();
+    h.start();
+    await h.claw.until("the prompt sent again", () => h.adapterLog().filter((l) => l.prompt === `wait ${flag}`).length === 2);
+    await sleep(300);
+    assert.equal(h.claw.eventsOf(sid, "turn_end").filter((e) => e.data.error === "connector_restarted").length, 0, "the dropped record is not recovered too");
   });
   test("a prompt queued behind the running turn when the connector restarts is delivered again, not lost", async () => {
     const h = await make();
@@ -1027,6 +1114,7 @@ describe("kill switch", () => {
     const { spawn } = await import("node:child_process");
     const orphan = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" });
     h.connector.registry.add({ pid: orphan.pid!, pgid: orphan.pid!, agent_id: "fake", session_id: "old" });
+    assert.equal(await h.connector.registry.flushed(), true, "on disk before the crash");
     h.connect();
     h.start();
     await h.online();
@@ -1036,7 +1124,7 @@ describe("kill switch", () => {
 
 describe("sessions over time", () => {
   test("an idle session loses its process and comes back on the next prompt, locked into the ask mode again even though the adapter resets it", async () => {
-    const h = await make({ env: { FAKE_RESUME_RESETS: "bypassPermissions" }, timing: { idleMs: 250 } });
+    const h = await make({ env: { FAKE_RESUME_RESETS: "bypassPermissions" }, timing: { idleMs: 800 } });
     const sid = await h.newSession();
     const pid = h.connector.registry.list()[0]!.pid;
     await h.claw.until("recycled", () => !alive(pid));
@@ -1079,7 +1167,7 @@ describe("sessions over time", () => {
     assert.ok(h.adapterLog().some((l) => l.method === "session/resume"));
   });
   test("an adapter that cannot resume falls back to load, and the replayed history is marked as a replay", async () => {
-    const h = await make({ env: { FAKE_NO_RESUME: "1" }, timing: { idleMs: 200 } });
+    const h = await make({ env: { FAKE_NO_RESUME: "1" }, timing: { idleMs: 800 } });
     const sid = await h.newSession();
     const pid = h.connector.registry.list()[0]!.pid;
     await h.claw.until("recycled", () => !alive(pid));
@@ -1116,6 +1204,7 @@ describe("close", () => {
     h.claw.issue("close", sid);
     await h.claw.until("closed", () => h.claw.eventsOf(sid, "session_closed")[0]);
     await h.claw.until("process gone", () => !alive(pid));
+    assert.equal(await h.connector.store.flushed(), true);
     assert.equal(JSON.parse(fs.readFileSync(path.join(h.dirs.state, "sessions.json"), "utf8"))[sid].status, "closed");
     assert.ok(h.adapterLog().some((l) => l.method === "session/close"));
   });
@@ -1330,6 +1419,7 @@ describe("a session opened and never used, across a restart", () => {
     await h.stop();
     // What a connector from before this change left behind: no `unused` marker.
     h.connector.store.patch(sid, { unused: undefined });
+    assert.equal(await h.connector.store.flushed(), true, "on disk before the restart (the store writes off the event loop)");
     h.connect();
     h.start();
     h.prompt(sid, "say hello");
