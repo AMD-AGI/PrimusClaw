@@ -31,6 +31,9 @@ import { CLAW_REMOTE_AGENTS_ENABLED, CLAW_REMOTE_AGENTS_RETENTION_DAYS } from ".
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { CONNECTOR_TOKEN_METHOD, tokenExpired, tokenRevoked } from "../auth/connector-token.js";
+import { CONNECTOR_GRANT_METHOD, grantOf } from "../auth/connector-grant.js";
+import { notifyPaired } from "../remote-agents/pairing.js";
+import { registerPairingRoutes, type PairingRouteOptions } from "../remote-agents/pairing-routes.js";
 import { CONNECTOR_SIDE_ROUTES } from "../remote-agents/connector-routes.js";
 import { db } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
@@ -67,6 +70,8 @@ export interface RemoteAgentOptions {
   offlineNoticeMs?: number;
   /** How long a conversation open in a terminal waits for its person before they are told. */
   terminalWaitNoticeMs?: number;
+  /** Pairing a machine with a one-time code (`remote-agents/pairing-routes.ts`). */
+  pairing?: PairingRouteOptions;
   /**
    * Aborted when this process starts to shut down (`GracefulShutdown.closing`). Every command stream then sends
    * `event: reconnect` and ends, and its connector is kept online (`markStreamClosed`'s `restart`) while it opens a
@@ -123,7 +128,7 @@ function requireOwner(req: FastifyRequest, reply: FastifyReply, side: "user" | "
     fail(reply, 403, "remote_agents_require_authenticated_user");
     return null;
   }
-  if (side === "user" && getAuthMethod(req) === CONNECTOR_TOKEN_METHOD) {
+  if (side === "user" && (getAuthMethod(req) === CONNECTOR_TOKEN_METHOD || getAuthMethod(req) === CONNECTOR_GRANT_METHOD)) {
     fail(reply, 403, "connector_token_not_accepted");
     return null;
   }
@@ -258,6 +263,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const stop = startTerminalWaitSweep({ onlineWindowMs, noticeAfterMs: opts.terminalWaitNoticeMs ?? TERMINAL_WAIT_NOTICE_MS, sweepMs: presenceSweepMs });
     app.addHook("onClose", async () => stop());
   }
+  await registerPairingRoutes(app, opts.pairing);
   // A reader's stream polls the database, so one user cannot hold an unbounded number open.
   const openReaders = new Map<string, number>();
 
@@ -281,12 +287,23 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!owner) return;
     const body = parseConnectorRegistration(req.body ?? {});
     if (!body.ok) return fail(reply, 400, body.error);
-    const row = await store.registerConnector(
-      owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req), onlineWindowMs,
-      // A replaced row is revoked: the cards that would send to it close with it, as on the revoke route.
-      (q, id) => closeCardsOfConnector(q, owner, id).then(() => undefined),
-    );
+    let row: Awaited<ReturnType<typeof store.registerConnector>>;
+    try {
+      row = await store.registerConnector(
+        owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req), onlineWindowMs,
+        // A replaced row is revoked: the cards that would send to it close with it, as on the revoke route.
+        (q, id) => closeCardsOfConnector(q, owner, id).then(() => undefined),
+        grantOf(req),
+      );
+    } catch (err) {
+      if (!(err instanceof store.GrantRegistrationRefused)) throw err;
+      // As the auth hook answers: a revoked row's grant is over (401 revoked, the connector stops); another name is not this grant's.
+      return err.reason === "revoked" ? fail(reply, 401, "revoked") : fail(reply, 403, "connector_grant_name_mismatch");
+    }
     if (!row) return fail(reply, 409, "connector_limit_reached");
+    // A paired machine's grant now follows this row (bound above, in its transaction): only its routes, over once it is revoked.
+    const grant = grantOf(req);
+    if (grant) await notifyPaired(grant, row.connector_id, row.name);
     // Offline rows under the same name (a connector that lost its state and registered again) were revoked in its place.
     if (row.replaced.length) logger.info({ owner, connectorId: row.connector_id, replaced: row.replaced }, "remote_agents.connector_replaced");
     for (const id of row.replaced) waker.wake(`c:${id}`);

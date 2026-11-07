@@ -22,6 +22,7 @@ import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
 import { checkAll, defaultDeps, formatReport, runProbe, shq, writeReport, type DoctorDeps, type Problem, type Report } from "./doctor.js";
 import { applyServiceEnv, cmdService, cmdSupervise, ephemeralWhere, loadServiceEnv, startAfterLogin, type ServiceDeps } from "./service.js";
+import { cmdPair } from "./pair.js";
 import {
   auditFile, childrenFile, configFile, credentialsFile, doctorFile, identityFile, logDir, pauseFile, pidFile, serviceEnvFile, stopRequestFile, type Dirs,
 } from "./paths.js";
@@ -48,6 +49,8 @@ export interface Ctx {
   stdin?: () => Promise<string>;
   /** How `doctor` asks a running connector (its pid) to check again (default: SIGWINCH). */
   askRecheck?: (pid: number) => void;
+  /** The working directory `pair` gives agents when it writes agents.toml (default: the process's). */
+  cwd?: string;
   /** Called with the connector once it exists, so a signal handler can stop it. */
   onConnector?: (c: Connector) => void;
   /** The file the terminal hooks run (default: `terminal-hook.js` next to this program) and the node that runs it. */
@@ -94,6 +97,9 @@ Usage: claw-connector <command> [options]
                            the SessionStart/SessionEnd hooks that tell this connector which Claude Code sessions are open
                            in a terminal; merged into DIR/settings.json (default: the claude-attach agents' config
                            directories, else $CLAUDE_CONFIG_DIR or ~/.claude); only its own entries are ever changed
+  pair CODE --server URL   connect this machine with the one-time code your chat gave you ("连接我的开发环境"): writes
+                           agents.toml if there is none (the agents found here, working in this folder), saves the
+                           sign-in and starts the service. [--name HOST] [--no-start]
   login                    sign in (device flow); --server URL --identity-url URL [--name HOST]
                            development only: --key <api key>  (or CLAW_CONNECTOR_KEY)
   run                      connect and serve (Ctrl-C or SIGTERM stops it and every agent it started). Exit code 78:
@@ -154,6 +160,9 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
       case "init": return await cmdInit(rest, ctx);
       case "hooks": return cmdHooks(rest, ctx);
       case "login": return await cmdLogin(rest, ctx);
+      case "pair": return await cmdPair(rest, ctx, {
+        runningPid, stop: (c) => cmdStop(c, true), start: (c) => cmdService(["install"], c, serviceHelpers),
+      });
       case "run": {
         const code = await cmdRun(rest, ctx);
         // launchd cannot be told "never restart on 78"; it does not restart a clean exit. The reason was printed.
@@ -421,14 +430,16 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   void rootProblems(cfg.agents).then((ps) => { for (const p of ps) ctx.out(`warning: ${p}`); }, () => undefined);
   try {
     const result = await connector.run();
+    // A machine paired from the chat has no login to run again: a new pairing code is what connects it.
+    const again = creds.kind === "grant" ? "Pair it again: ask the chat for a new command (\"连接我的开发环境\") and run it here." : "Run login again to connect it anew.";
     if (result === "revoked") {
       markNeedsLogin(ctx.dirs, "this connector was revoked");
-      ctx.err("this connector was revoked: every agent was stopped. Run login again to connect it anew.");
+      ctx.err(`this connector was revoked: every agent was stopped. ${again}`);
       return EXIT.revoked;
     }
     if (result === "auth_failed") {
       markNeedsLogin(ctx.dirs, `Claw refused the sign-in (${connector.authFailure})`);
-      ctx.err(`Claw keeps refusing this sign-in (${connector.authFailure}): every agent was stopped. Run login again.`);
+      ctx.err(`Claw keeps refusing this sign-in (${connector.authFailure}): every agent was stopped. ${again}`);
       return EXIT.needsPerson;
     }
     if (runFlags.supervised && !takeStopRequest(ctx)) {

@@ -49,7 +49,7 @@ import { observeEveryTool, recordObservation } from "./observe.js";
 import { assistantCitationsOn } from "./citations.js";
 import { readSelfStatus, selfStatusOn } from "./self-status.js";
 import { CITE_MAX_PER_CALL } from "@claw/protocol";
-import { devenvList, devenvSend, devenvToolsOn } from "./devenv-tools.js";
+import { devenvList, devenvPair, devenvSend, devenvToolsOn } from "./devenv-tools.js";
 
 const logger = pino({ name: "assistant-mcp" });
 
@@ -475,6 +475,16 @@ export function createAssistantMcpServer(
           new_session: z.boolean().optional().describe("true only when they asked for a new session (新开一个会话, a fresh session): never continue one."),
         },
         (args) => answer(claims, "devenv_send", () => devenvSend(claims, args)),
+      );
+      mcp.tool(
+        "devenv_pair",
+        "Connect a new development environment (a machine of the user's) to Claw: answers a one-line command with a one-time "
+        + "pairing code in it, for the user to run in a terminal on that machine. It installs the connector, pairs the machine with "
+        + "the user and starts it; the user is told here when the machine is connected. The code works once, for the minutes it says. "
+        + "Use it when the user asks to connect, add or pair a machine, or asks to connect to their development environment and "
+        + "devenv_list shows no machine. Only in a turn answering the user's own message.",
+        {},
+        () => answer(claims, "devenv_pair", () => devenvPair(claims)),
       );
     }
     if (reviewTools) registerReviewTools(mcp, claims, modelChoice);

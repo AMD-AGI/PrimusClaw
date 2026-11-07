@@ -312,8 +312,8 @@ export function connectAMachine(zh: boolean): { commands: string[]; text: string
   return { commands: setup.steps.map((s) => s.command), text: zh ? setup.text.zh : setup.text.en };
 }
 
-const SETUP_NOTE = " The user has no machine connected: to connect one, give them connect_a_machine.text as it is (the commands are exact; "
-  + "do not change or shorten them).";
+const SETUP_NOTE = " The user has no machine connected: to connect one, call devenv_pair and give them its one command as it is; only "
+  + "if devenv_pair is refused, give them connect_a_machine.text as it is (the commands are exact; do not change or shorten them).";
 const OUTDATED_NOTE = " A machine whose version_status is outdated or unsupported needs its connector upgraded (unsupported: no new session "
   + "starts on it): give the user its upgrade_command as it is.";
 
@@ -979,4 +979,36 @@ export async function sendConfirmed(userId: string, confirmationId: string, para
   const sent = await executeSend(userId, plan, String(params.text ?? ""), cmdKey("card", confirmationId), lang);
   if (!sent.ok) return { ok: false, error: sent.error, message: sent.message };
   return { ok: true, item_id: sent.item_id, seq: sent.seq, session_id: sent.session_id, machine: sent.machine, agent: sent.agent };
+}
+
+/**
+ * `devenv_pair`: a one-time code for connecting a new machine, inside the one command line that uses it
+ * (`remote-agents/pairing.ts`). Only in a turn that answers the user's own message: a report or an event never mints one.
+ * The code is shown to the user alone, in their own chat, and connects nothing until they run the line on a machine, so it
+ * may follow a read (`AFTER_READ_TOOLS`).
+ */
+export async function devenvPair(claims: AssistantTokenClaims): Promise<Record<string, unknown>> {
+  if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
+  const q: Querier = (t, p) => db.query(t, p);
+  const { userId } = await assertLiveRun(q, claims);
+  if (!(await turnMessage(q, claims.sid, claims.mid))) {
+    throw new ToolRefused("not_from_user", "only the user's own message can ask for a pairing code: a report cannot");
+  }
+  const server = (process.env.CLAW_PUBLIC_URL ?? "").trim().replace(/\/+$/, "");
+  if (!server) throw new ToolRefused("pairing_unavailable", "pairing is not set up here (no public Claw address): tell the user to run claw-connector login on the machine");
+  const { createPairing, pairCommand, PAIRING_TTL_MS, PairingRateLimited } = await import("../remote-agents/pairing.js");
+  let got: { code: string; expires_at: string };
+  try {
+    got = await createPairing(userId, "assistant");
+  } catch (err) {
+    if (err instanceof PairingRateLimited) throw new ToolRefused("rate_limited", "too many pairing codes in the last minute: ask the user to wait a minute and ask again");
+    throw err;
+  }
+  const { code, expires_at } = got;
+  return {
+    command: pairCommand(server, code),
+    expires_at,
+    expires_in_minutes: Math.round(PAIRING_TTL_MS / 60_000),
+    single_use: true,
+  };
 }

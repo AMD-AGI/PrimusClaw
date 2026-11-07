@@ -106,7 +106,7 @@ export class ClawClient {
    * connector-side route made for this. Throws {@link HttpError} 404 `not_found` when Claw has no live row by that id
    * for this sign-in (already revoked, or another account's).
    */
-  async revoke(cid: string, kind: "key" | "device"): Promise<void> {
+  async revoke(cid: string, kind: "key" | "device" | "grant"): Promise<void> {
     const id = encodeURIComponent(cid);
     if (kind === "key") await this.json("DELETE", `/v1/remote-agents/connectors/${id}`);
     else await this.json("POST", `/v1/remote-agents/connectors/${id}/revoke`);

@@ -199,6 +199,45 @@ for the connector-side actions it keeps (`connector.registered`,
 `permission.requested`, `permission.resolved`): `connector_token`, `api_key`,
 `cookie` or `x_api_key`.
 
+## Pairing a machine with a one-time code
+
+The first connection of a machine needs no sign-in on it. The person asks their own client (Clawy: "连接我的开发环境", or the
+router's `devenv_pair` tool); the client calls `POST /v1/remote-agents/pairings` as that person and shows the answer's `command`:
+
+```
+npm install -g @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
+```
+
+Running it on the machine is the approval. `claw-connector pair` posts `{code, name}` to `POST /v1/remote-agents/pairings/claim`,
+which is anonymous (the code is the credential), writes `agents.toml` if there is none (the agents found on the machine, working in
+the folder the command was run in), saves the answer's grant (mode 0600) and starts the connector as a service.
+
+- **Code**: 12 characters of Crockford base32 (60 bits), shown as `XXXX-XXXX-XXXX`; case, dashes and O/I/L-for-0/1 do not matter.
+  Good for 10 minutes and one claim; a person has at most 3 live, and a new one retires the oldest. Only its SHA-256 is stored
+  (`claw_remote_pairings`). A wrong, expired, retired and used code all get the same `400 invalid_code`. At most 6 codes a minute
+  per person, by any route (the HTTP route and the assistant's `devenv_pair`; counted from the audit trail). Wrong claims are
+  throttled per caller: the whole `X-Forwarded-For` chain as received together with the socket address (behind the ingress the
+  socket address alone is the ingress's, shared by everyone, and the first entry alone is the caller's say; the chain ends with the
+  address the proxy saw). 10 a minute, only failures count, so nobody's wrong codes lock out a right one. What
+  a flood of made-up keys can spend is bounded apart from the keys: at most 10,000 callers are remembered (oldest first out), and at
+  most 4 claims reach the database at once with 64 waiting; beyond that `503 busy`, which passes with the flood. Without `CLAW_PUBLIC_URL` there is no command to give: `503 pairing_unavailable`.
+- **Grant**: `cpg_` and 43 base64url characters, stored as its SHA-256 (`claw_remote_grants`). The global auth hook judges a
+  `Bearer cpg_...` before every other credential path, so it never reaches SaFE or the identity provider. It authenticates as the
+  person, with the `default` role, on the connector-side routes and nowhere else (anything else: `403 connector_grant_not_accepted`).
+  Before it has registered, it reaches no existing connector (only registration). Its registration binds it to that connector, in
+  the registration's own transaction: from then on another connector id is `403 connector_grant_mismatch`, and once that connector
+  is revoked (`/agent off`, `claw-connector logout`, `DELETE /v1/remote-agents/connectors/:cid`), or its row is gone, every request
+  is `401 revoked`, which stops the connector for good.
+- **What a grant's registration replaces**: only its own row. Unlike a key or a device sign-in, a grant never revokes another row
+  of the owner's that has the same name (#395's replacement of a stale same-name row does not apply to it). Bound already, it may
+  register again (lost local state) only under its own row's name, and that row is replaced; another name is
+  `403 connector_grant_name_mismatch`, so the name the owner was told to `/agent off` is always the grant's. A grant that never
+  registered is refused an hour after its claim and then deleted.
+- **Telling the owner**: the first registration under a grant tells the owner once, through their assistant, that the machine is
+  paired and how to disconnect it if they did not run the command themselves.
+- **Audit**: `pairing.created`, `pairing.claimed` (with the grant id and the name the machine gave), and the registration's
+  `connector.registered` with `credential: connector_grant`.
+
 ## Keepalive and presence
 
 The server sends `event: ping` every 25 s on the command stream (it carries no `id`,

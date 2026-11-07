@@ -19,6 +19,25 @@ phone / chat client --> Claw (remote agents) <-- connector on your machine --> a
 Claw's side is documented in [claw/docs/remote-agents.md](https://github.com/AMD-AGI/PrimusClaw/blob/main/claw/docs/remote-agents.md); the wire
 contract is `claw/packages/protocol/src/remote-agents.ts`, compiled into this package.
 
+## Fastest: pair from the chat (one command)
+
+In Clawy (or another chat client built on Claw), say **连接我的开发环境** ("connect my dev environment"). It answers one line
+with a one-time code in it, for example:
+
+```sh
+npm install -g @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
+```
+
+Run it in a terminal on the machine, in the folder the agents may work in. That is the whole setup: it installs the connector,
+pairs this machine with you (running the command is the approval; the code works once, for 10 minutes), writes `agents.toml`
+for the agents it finds (`claude`, `codex`, `cursor-agent` on your `PATH`), each asking before it writes a file or runs a
+command and working in that folder, and starts the connector as a service (see [Keep it running](#quick-start-about-5-minutes)).
+The chat tells you when the machine is connected. To disconnect it, `/agent off <machine>` in the chat or `claw-connector logout`
+here; either ends this machine's sign-in for good. An `agents.toml` that is already there is kept as it is.
+
+The pairing is a connector grant: it reaches the connector routes of Claw for this one machine and nothing else, and it ends
+when the machine is disconnected. Pair again (a new code) to connect it again.
+
 ## Quick start (about 5 minutes)
 
 You need Node.js 22 or newer, a coding agent that already works on this machine (Claude Code, Codex or the Cursor CLI), and the

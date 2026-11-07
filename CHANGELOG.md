@@ -36,6 +36,18 @@ record it.
 - A conversation open in a terminal on your machine that has waited a minute for you (Claude Code's own "waiting": a permission or a
   question) is pushed once through your assistant: the machine, the agent, what it waits for and the conversation's title. Answered at
   the terminal within the minute, it is never pushed; a terminal working or finishing is never pushed. A later wait is told again once.
+- Pairing a machine from the chat with a one-time code (remote agents). `POST /v1/remote-agents/pairings` gives the signed-in person a
+  12-character code (10 minutes, one use, at most 3 live) inside one command line,
+  `npm install -g @primusclaw/connector@latest && claw-connector pair <code> --server <CLAW_PUBLIC_URL>`; running it on the machine is the
+  approval. The connector trades the code at the anonymous `POST /v1/remote-agents/pairings/claim` for a connector grant (`cpg_...`,
+  only its SHA-256 stored) that authenticates on the connector-side routes only, reaches only the connector it registered, and ends when
+  that connector is revoked (`/agent off`, logout, `DELETE .../connectors/:cid`): it then answers 401 `revoked`. The owner is told once,
+  through their assistant, which machine was paired and how to disconnect it. A grant replaces no row but its own (never another
+  machine of the owner's with the same name) and re-registers only under its own row's name; wrong claims are throttled per caller
+  (the forwarded chain with the socket address), failures only, with a bounded caller table and at
+  most 4 claims at the database at once (64 waiting, else 503 busy); at most 6 codes a minute per person by any route. New tables `claw_remote_pairings`, `claw_remote_grants`
+  (created with the remote-agents schema). The router's `devenv_pair` tool answers "连接我的开发环境" with no machine yet, "add a machine",
+  "pair my laptop" with that command line, said as given; it is never sent by devenv_send or by a report. Router prompt router-devenv-v8.
 - Connecting a machine is said with the exact commands, for every client. `GET /v1/remote-agents/setup` gives the connector's npm
   package (`@primusclaw/connector`), the four commands (`npm install -g`, `claw-connector init`, `claw-connector login --server <this
   API's CLAW_PUBLIC_URL> --identity-url <CLAW_CONNECTOR_IDENTITY_URL, else IDENTITY_ISSUER_URL>`, `claw-connector service install`) and
