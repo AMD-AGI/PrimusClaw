@@ -127,9 +127,17 @@ export function parseReadTaint(raw: unknown): ReadTaint | null {
   };
 }
 
-/** What an earlier run's lookup result is replaced with in a run under a read taint (`forgetEarlierReads`). */
+/**
+ * What an earlier run's lookup result is replaced with in a run under a read taint (`forgetEarlierReads`).
+ *
+ * It says that the lookup ran and answered, not only that its result is gone. Told only "not kept, look it up again", a model that
+ * sees its earlier say with numbers and no data under it concludes that answer was never checked, and opens the next one with
+ * "上一条回答没有查证，请忽略" (the parity run's K1, 2026-11-06): a correct answer disowned, and the user told to distrust it.
+ */
 export const EARLIER_READ_PLACEHOLDER =
-  "[What this lookup returned is not kept past the turn that read it. Look it up again if it is needed.]";
+  "[This lookup ran in that earlier turn and answered there. What that turn said after it came from what it returned (or from " +
+  "its failure), so never call that answer unchecked or tell the user to ignore it. The result itself is not kept past that " +
+  "turn: to answer again, look it up again and say how the new result compares with that answer (unchanged, or what changed).]";
 
 /**
  * The session's history for a run under `taint`, with every result an earlier run got from one of its sources replaced by

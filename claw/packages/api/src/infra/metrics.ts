@@ -142,6 +142,19 @@ const assistantSayUnreachableTotal = new Counter({
   registers: [registry],
 });
 
+// A router turn that answered the user and ended without its answer said (`assistant/router-turn-end.ts`), by what became of it: its
+// plain text said for it (`delivered`, a turn that said nothing; `replaced_early_line`, a turn whose only say came before its last
+// lookup, "查一下 Autopilot 的状态。"), the system's notice instead (`lost_notice` for a failed or stopped turn, `withheld` for text with
+// internal words in it), refused by the say cap (`refused`), or left unsaid after a say that answered (`after_say`). The parity run's
+// K2 (2026-11-06) was a turn of the second kind that nobody counted: the user got only the early line.
+export type RouterUnsaidOutcome = "delivered" | "replaced_early_line" | "lost_notice" | "withheld" | "refused" | "after_say";
+const assistantRouterUnsaidTotal = new Counter({
+  name: "claw_assistant_router_unsaid_total",
+  help: "Router turns answering the user that ended without their answer said, by what the turn end did about it.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
 // `error` keeps a throw out of loadUsage or queueLength in the denominator;
 // without it a partial outage makes every rollout ratio read healthier.
 const admissionDecisionTotal = new Counter({
@@ -405,5 +418,8 @@ export const metrics = {
   },
   onAssistantSayUnreachable(type: string): void {
     assistantSayUnreachableTotal.inc({ type });
+  },
+  onAssistantRouterUnsaid(outcome: RouterUnsaidOutcome): void {
+    assistantRouterUnsaidTotal.inc({ outcome });
   },
 };
