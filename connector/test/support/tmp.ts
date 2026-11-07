@@ -5,7 +5,8 @@
  * Temporary directories for the tests, removed when the test file ends. Every directory `tmpdir` makes is
  * recorded; the file's `after` hook first runs what `onCleanup` registered (a connector to stop, a stand-in Claw to
  * close), newest first, so nothing is still writing, and then removes the directories. A file that dies before its
- * hooks run (an uncaught error, `process.exit`) still removes them on the process's `exit`.
+ * hooks run (an uncaught error, `process.exit`) still removes them on the process's `exit`, after what `onExitSync`
+ * registered (killing the adapters a connector started, which run detached and would outlive it).
  *
  * Only the test files' own processes import this: it registers a hook with node:test, which a helper process a
  * test spawns must not do (support/run-fast.ts imports support/timing.ts, not the harness, for that reason).
@@ -17,6 +18,7 @@ import { after } from "node:test";
 
 const made = new Set<string>();
 const closers: Array<() => unknown> = [];
+const exitHooks: Array<() => void> = [];
 
 /** A new directory under os.tmpdir() (TMPDIR), its real path, removed when the test file ends. */
 export const tmpdir = (prefix = "cc-"): string => {
@@ -27,6 +29,9 @@ export const tmpdir = (prefix = "cc-"): string => {
 
 /** Run `close` when the test file ends, before its temporary directories are removed. */
 export const onCleanup = (close: () => unknown): void => { closers.push(close); };
+
+/** Run `fn` (synchronously: nothing can be awaited at exit) on the process's `exit`, before the directories go. */
+export const onExitSync = (fn: () => void): void => { exitHooks.push(fn); };
 
 /** The directories made and not yet removed. */
 export const liveTmpdirs = (): string[] => [...made].filter((d) => fs.existsSync(d));
@@ -67,4 +72,9 @@ export async function cleanupTmp(): Promise<void> {
 
 after(cleanupTmp);
 // A crash, or a process.exit before the hooks ran; also catches a directory a late writer recreated after `after`.
-process.on("exit", removeAll);
+process.on("exit", () => {
+  for (const fn of exitHooks.splice(0).reverse()) {
+    try { fn(); } catch { /* the directories go regardless */ }
+  }
+  removeAll();
+});
