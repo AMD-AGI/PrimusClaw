@@ -26,6 +26,7 @@ import {
 import { invalidateSyncManifest } from "../workspace/sync-delta.js";
 import { syncWorkspace, restoreWorkspace } from "../workspace/sync.js";
 import { SIGTERM_PROBE_TIMEOUT_SEC, gitReportKey, type GitReport } from "../workspace/git-dirs.js";
+import { cutDrainedCalls } from "../agent/drain-shield.js";
 import {
   workspaceSyncSemaphore,
   workspaceSigtermSyncSemaphore,
@@ -4697,6 +4698,8 @@ class TaskRunner {
         // branch -- the one that files the ending as a user interrupt -- is
         // the true account of what happened.
         if (status === "cancelling") {
+          // (a Stop during a drain cuts the call the drain was letting finish: the person asked for it to stop)
+          this.cutDrainedCalls("cancelled");
           if (this.abortCtrl.signal.aborted) return;
           logger.info(
             { sessionId: this.sessionId, messageId: this.messageId,
@@ -4713,7 +4716,8 @@ class TaskRunner {
         // the other road left this one swallowed by any earlier abort. `gone`
         // is not: the row went terminal and nobody took over, so this worker is
         // still the one holding the sandbox.
-        if (status === "superseded") this.leaseLost = true;
+        if (status === "superseded") this.noteLeaseLost();
+        if (status === "gone") this.cutDrainedCalls(RUN_ROW_TERMINAL_ABORT_REASON);
         if (!refused || this.abortCtrl.signal.aborted) return;
         logger.error(
           { sessionId: this.sessionId, messageId: this.messageId,
@@ -4755,6 +4759,22 @@ class TaskRunner {
     return timer;
   }
 
+  /**
+   * Another replica holds this run now. Recorded whatever else happened, and a
+   * call a drain is letting finish (`agent/drain-shield.ts`) is cut at once:
+   * the drain's abort came first, so the run's signal cannot carry this news.
+   * The same holds for a Stop and a terminal row (`cutDrainedCalls`).
+   */
+  private noteLeaseLost(): void {
+    this.leaseLost = true;
+    this.cutDrainedCalls(LEASE_LOST_ABORT_REASON);
+  }
+
+  /** Cut, at once, a call a drain is letting finish: the run has to stop touching the sandbox now, for `reason`. */
+  private cutDrainedCalls(reason: unknown): void {
+    if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) cutDrainedCalls(this.abortCtrl.signal, reason);
+  }
+
   private startDeliveryHeartbeat(): void {
     // keepAlive must be much shorter than the consumer's ack_wait to avoid
     // redelivery while a task is still making progress. That is
@@ -4768,7 +4788,7 @@ class TaskRunner {
         // news entirely, because the only trace of a lost lease was the abort
         // REASON and that slot was taken. Teardown then read the successor's
         // entry, asked whether it still held the lock, and was told yes.
-        if (yielding) this.leaseLost = true;
+        if (yielding) this.noteLeaseLost();
         if (!yielding || this.abortCtrl.signal.aborted) return;
         logger.error(
           { sessionId: this.sessionId, messageId: this.messageId, lockKey: this.lockKey, renewal },
@@ -4794,7 +4814,7 @@ class TaskRunner {
     // counted from when the last successful renewal was sent.
     this.selfFence = setInterval(() => {
       if (!fx().lockPastSelfFence(this.lockKey)) return;
-      this.leaseLost = true;
+      this.noteLeaseLost();
       if (this.abortCtrl.signal.aborted) return;
       logger.error(
         { sessionId: this.sessionId, messageId: this.messageId, lockKey: this.lockKey },

@@ -39,6 +39,7 @@ import * as store from "../remote-agents/store.js";
 import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
 import { startTerminalWaitSweep, TERMINAL_WAIT_NOTICE_MS } from "../remote-agents/terminal-waits.js";
+import { closeCardsOfConnector } from "../assistant/devenv-tools.js";
 import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
 const logger = pino({ name: "remote-agents" });
@@ -264,6 +265,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!body.ok) return fail(reply, 400, body.error);
     const row = await store.registerConnector(
       owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req), onlineWindowMs,
+      // A replaced row is revoked: the cards that would send to it close with it, as on the revoke route.
+      (q, id) => closeCardsOfConnector(q, owner, id).then(() => undefined),
     );
     if (!row) return fail(reply, 409, "connector_limit_reached");
     // Offline rows under the same name (a connector that lost its state and registered again) were revoked in its place.
@@ -294,7 +297,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   /** Revoke one of the caller's connectors: the row stays revoked for good, its queued commands go and its sessions close. */
   async function revoke(req: FastifyRequest, reply: FastifyReply, owner: string) {
     const id = parseRemoteId((req.params as { cid?: string }).cid);
-    if (!id || !(await store.revokeConnector(owner, id, clientLabel(req)))) return notFound(reply);
+    if (!id || !(await store.revokeConnector(owner, id, clientLabel(req), (q) => closeCardsOfConnector(q, owner, id).then(() => undefined)))) {
+      return notFound(reply);
+    }
     waker.wake(`c:${id}`);
     return reply.send({ ok: true });
   }
@@ -437,6 +442,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     });
     if (out.status === "limit") return fail(reply, 409, "session_limit_reached");
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");
+    if (out.status === "gone") return notFound(reply);
     waker.wake(`c:${connector.connector_id}`);
     // At the limit, sessions nobody was using were closed to make room: their connectors are told now, and the caller can say so.
     for (const c of new Set(out.reclaimed.map((r) => r.connector_id))) waker.wake(`c:${c}`);
@@ -523,6 +529,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     // A prompt and a stop are queued and noted one at a time per session, so the item counts them in the order the connector runs them.
     const out = type === "prompt" || type === "cancel" ? await inRemoteSessionOrder(sessionId, send) : await send();
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");
+    if (out.status === "gone") return notFound(reply);
     if (out.status === "duplicate") {
       const same = out.row.type === type && out.row.session_id === sessionId
         && (type !== "decision" || out.row.payload?.option_id === (parsed.value as { option_id: string }).option_id);

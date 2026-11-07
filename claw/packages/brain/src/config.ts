@@ -1855,6 +1855,31 @@ export const BASH_FOREGROUND_MAX_SEC = envInt(
 );
 
 /**
+ * How long a drain (SIGTERM) lets a tool call that is already in flight finish
+ * before it is cut, in milliseconds.
+ *
+ * The handover argument above ("every foreground command the previous owner
+ * started has ended") was only true by killing the command: the drain aborted
+ * every run at once, Hands killed the command with its request, and the run
+ * resumed on another replica told the call was interrupted. The model then said
+ * so in the chat and ran the command again -- on 2026-11-07 one legacy chat turn
+ * was cut twice by one brain rollout and ran its command three times. Letting
+ * the call finish puts its real result in the turn journal, and the resumed run
+ * answers it from there, so the model never learns of the restart.
+ *
+ * The foreground ceiling plus 20 s of transport slack, held at 180 s: with the
+ * SIGTERM path's own budget (about 93 s, SIGTERM_PENDING_SYNC_WAIT_MS) it fits
+ * inside the chart's 300 s terminationGracePeriodSeconds. A call that is still
+ * running then is cut as before. Zero restores the old behaviour.
+ */
+export const SIGTERM_TOOL_GRACE_MS = envInt(
+  "SIGTERM_TOOL_GRACE_MS",
+  Math.min((BASH_FOREGROUND_MAX_SEC + 20) * 1000, 180_000),
+  // (180 s at most: with the SIGTERM path's own ~93 s and the preStop, more would outlast the 300 s grace)
+  { min: 0, max: 180_000 },
+);
+
+/**
  * The default the model is told about, mirroring Hands' BASH_DEFAULT_TIMEOUT_SEC.
  *
  * Separate from the ceiling because the two only coincide at 100s: once the

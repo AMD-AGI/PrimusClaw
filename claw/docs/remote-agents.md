@@ -352,12 +352,17 @@ untrusted text. `work_send` refuses these items; `work_stop` and the item's stop
 
 ### Sending an instruction (`devenv_send`)
 
-`devenv_send{text, agent?, target?, cwd?}` sends an instruction to an agent on one of the user's own
+`devenv_send{text, agent?, target?, cwd?, new_session?}` sends an instruction to an agent on one of the user's own
 machines. It chooses the machine and agent itself, among the caller's connectors only: the one the user
 named (by machine name, session label or session id), else the only online machine offering that agent;
 more than one is `which_machine`, an offline one is `connector_offline`. It continues an idle session of
 that agent open through Claw, else opens a new one in the agent's first root (or the folder named, which
-must be under a root); a session working on something is never sent another (`busy`). The prompt goes
+must be under a root); a session working on something is never sent another (`busy`). `new_session: true`
+(the user asked for a new session) never continues one: a new session is opened, beside the session named
+when one was, on its machine and with its agent. A folder written `~` or `~/x` is read in the home folder the
+agent's roots are in (the connector expands `~` in its roots to its account's home, which it does not report):
+`/home/u/repo` as a root makes `~/x` mean `/home/u/x`; roots that show no home folder, or more than one, read
+no `~` folder at all, and the folder must still be under a root. The card shows the folder as the machine names it. The prompt goes
 through the same checks as the user's own route (session limit, command rate, audit with the prompt's hash
 only), under a command id derived from the card (`cmdKey("card", confirmationId)`), so pressing it twice
 sends nothing twice.

@@ -71,6 +71,8 @@ const withCredential = (detail: Record<string, unknown>, credential: string | nu
 export async function registerConnector(
   owner: string, name: string, version: string | null, client: string | null, maxPerUser: number,
   credential: string | null = null, onlineWindowMs: number | null = null,
+  /** What else ends with a row replaced here, in this transaction (as `revokeConnector`'s `alsoInTransaction`). */
+  alsoOnReplace?: (q: Querier, connectorId: string) => Promise<void>,
 ): Promise<(Row & { replaced: string[] }) | null> {
   return inTransaction(async (q) => {
     await lock(q, `connectors:${owner}`);
@@ -89,7 +91,9 @@ export async function registerConnector(
         [secs(onlineWindowMs), owner, name],
       )).rows.map((r) => String(r.connector_id));
       for (const id of stale) {
-        if (await revokeIn(q, owner, id, client, { reason: "replaced_by_same_name" })) replaced.push(id);
+        if (!(await revokeIn(q, owner, id, client, { reason: "replaced_by_same_name" }))) continue;
+        await alsoOnReplace?.(q, id);
+        replaced.push(id);
       }
     }
     const n = Number((await q(
@@ -146,8 +150,16 @@ export function offlineReason(streamEndReason: unknown): "auth_expired" | "no_he
 }
 
 /** Revoke one connector and close its sessions. False when it is not the caller's, or already revoked. */
-export async function revokeConnector(owner: string, connectorId: string, client: string | null): Promise<boolean> {
-  return inTransaction((q) => revokeIn(q, owner, connectorId, client));
+export async function revokeConnector(
+  owner: string, connectorId: string, client: string | null, alsoInTransaction?: (q: Querier) => Promise<void>,
+): Promise<boolean> {
+  return inTransaction(async (q) => {
+    if (!(await revokeIn(q, owner, connectorId, client))) return false;
+    // What else ends with the machine (the cards that would send to it: `closeCardsOfConnector`), in the same transaction, so a
+    // revoked machine never leaves a card that still waits for the person.
+    await alsoInTransaction?.(q);
+    return true;
+  });
 }
 
 /** `revokeConnector` inside a transaction the caller holds; `detail` is added to its audit row. */
@@ -312,6 +324,11 @@ export interface NewCommand {
   payload: Record<string, unknown>;
 }
 
+/** Thrown by `enqueueCommand` when the connector is revoked (or gone); `issueCommand` and `createSession` answer it as `gone`. */
+export class ConnectorGone extends Error {
+  constructor() { super("connector revoked"); this.name = "ConnectorGone"; }
+}
+
 /**
  * Append a command to a connector's queue. Must run inside a transaction.
  *
@@ -321,7 +338,10 @@ export interface NewCommand {
  * again; the original row comes back with `inserted: false`.
  */
 export async function enqueueCommand(q: Querier, c: NewCommand): Promise<{ inserted: boolean; row: Row }> {
-  await q("SELECT 1 FROM claw_remote_connectors WHERE connector_id = $1 FOR UPDATE", [c.connectorId]);
+  // Read under the lock a revoke takes: a caller that found the connector active before a revoke that has committed since queues
+  // nothing for it (a command stream already open could still fetch it). The caller's transaction rolls back (`ConnectorGone`).
+  const live = (await q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1 FOR UPDATE", [c.connectorId])).rows[0];
+  if (!live || live.revoked_at) throw new ConnectorGone();
   // A connector that never acknowledges must not keep a user's prompts for ever: whoever is
   // still issuing commands to it clears out what is a day old.
   await pruneCommands(q, c.connectorId, 0);
@@ -525,6 +545,7 @@ async function commandIssued(q: Querier, owner: string, connectorId: string, cmd
 
 export type IssueOutcome =
   | { status: "rate_limited" }
+  | { status: "gone" }
   | { status: "queued" | "duplicate"; row: Row };
 
 export interface IssueRequest {
@@ -549,7 +570,7 @@ export interface IssueRequest {
  * cannot both take it.
  */
 export async function issueCommand(r: IssueRequest): Promise<IssueOutcome> {
-  return inTransaction(async (q) => {
+  return goneAsStatus(() => inTransaction(async (q): Promise<IssueOutcome> => {
     await lock(q, `commands:${r.owner}`);
     // A repeat of a command already queued is answered with the original and
     // does not count against the limit, so a client may retry freely.
@@ -574,11 +595,21 @@ export async function issueCommand(r: IssueRequest): Promise<IssueOutcome> {
       await q("UPDATE claw_remote_sessions SET status = 'closed', updated_at = NOW() WHERE session_id = $1", [r.sessionId]);
     }
     return { status: "queued", row: queued.row } as IssueOutcome;
-  });
+  }));
+}
+
+/** `run`, with a `ConnectorGone` it threw (its transaction rolled back) answered as `{ status: "gone" }`. */
+async function goneAsStatus<T>(run: () => Promise<T>): Promise<T | { status: "gone" }> {
+  try {
+    return await run();
+  } catch (err) {
+    if (err instanceof ConnectorGone) return { status: "gone" };
+    throw err;
+  }
 }
 
 export type CreateSessionOutcome =
-  | { status: "limit" } | { status: "rate_limited" }
+  | { status: "limit" } | { status: "rate_limited" } | { status: "gone" }
   | { status: "created"; session: Row; reclaimed: Array<{ session_id: string; connector_id: string }> };
 
 /**
@@ -647,7 +678,7 @@ export async function createSession(p: {
   /** The connector presence window, which orders the sessions closed to make room (an offline machine's first). */
   onlineWindowMs?: number;
 }): Promise<CreateSessionOutcome> {
-  return inTransaction(async (q) => {
+  return goneAsStatus(() => inTransaction(async (q): Promise<CreateSessionOutcome> => {
     await lock(q, `sessions:${p.owner}`);
     await lock(q, `commands:${p.owner}`);
     const n = Number((await q(
@@ -687,7 +718,7 @@ export async function createSession(p: {
     return {
       status: "created", session, reclaimed: victims.map((v) => ({ session_id: v.session_id, connector_id: v.connector_id })),
     } as CreateSessionOutcome;
-  });
+  }));
 }
 
 /**
