@@ -532,7 +532,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     const alice = await w.user("alice");
     await w.subscribe(alice.userId);
     const laptop = await machine("alice", "laptop");
-    const desktop = await machine("alice", "desktop");
+    await machine("alice", "desktop");
     const toLaptop = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
     const toDesktop = await tools.devenvSend(await userTurn(alice, "让 desktop 上的 claude 跑 lint"), { text: "跑 lint", target: "desktop" });
     assert.equal(toLaptop.done, false, JSON.stringify(toLaptop));
