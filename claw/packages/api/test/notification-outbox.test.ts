@@ -493,6 +493,17 @@ describe("notification outbox", { skip }, () => {
       );
     });
 
+    test("is carried over only to a subscription whose sources take it, as it would have been queued", async () => {
+      const first = (await post({ url: "https://93.184.216.34/claw", sources: ["trigger"] })).json().data;
+      await seedRun({ sid: "s1", tid: "t1", trigger: "trg" });
+      await outbox.recordRunFinished({ sessionId: "s1", taskIds: ["t1"], outcome: "completed" });
+      assert.equal((await del(first.subscription_id)).statusCode, 200);
+      await post({ url: "https://93.184.216.34/long", sources: ["long_run"] });
+      assert.equal((await rows())[0].subscription_id, null, "a trigger's run is not a long_run subscription's");
+      const trig = (await post({ url: "https://93.184.216.34/trig", sources: ["trigger"] })).json().data;
+      assert.equal((await rows())[0].subscription_id, trig.subscription_id);
+    });
+
     test("is not sent to another user's subscription, nor to one that does not take its type; and is dropped after the give-up age", async () => {
       const first = (await post()).json().data;
       await seedRun({ sid: "s1", tid: "t1", trigger: "trg" });

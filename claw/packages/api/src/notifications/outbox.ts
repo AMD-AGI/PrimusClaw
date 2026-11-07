@@ -576,6 +576,17 @@ export function newSubscriptionId(): string {
 }
 
 /**
+ * Which of a subscription's `sources` an outbox row `o` was queued under, read from its payload: an item's approval
+ * (`assistant_item`), a run or approval of a session a trigger started (`trigger`), any other run or approval (`long_run`: the only
+ * other way one is queued), and none for the assistant's events, which every subscription that takes their type gets. A run both
+ * started by a trigger and long reads as `trigger`: a subscription carried over only by `long_run` misses it rather than gets one
+ * it did not ask for.
+ */
+const PAYLOAD_SOURCE_SQL = `CASE WHEN o.payload->>'source' = 'assistant_item' THEN 'assistant_item'
+            WHEN o.payload->>'type' NOT IN ('run.completed', 'run.failed', 'approval.requested') THEN NULL
+            WHEN o.payload->>'trigger_id' IS NOT NULL THEN 'trigger' ELSE 'long_run' END`;
+
+/**
  * Hand a new (or re-enabled) subscription what its owner's deleted subscriptions had not delivered yet.
  *
  * Deleting a subscription leaves its pending rows in place, with no subscription (`ON DELETE SET NULL`, schema.ts), because the
@@ -598,7 +609,7 @@ export async function adoptOrphanedRows(subscriptionId: string, q: Querier = dir
           AND o.created_at > NOW() - make_interval(hours => $2)
           AND o.payload->>'user_id' = sub.owner_user_id
           AND o.payload->>'type' = ANY(sub.event_types)
-          AND (o.payload->>'source' IS DISTINCT FROM 'assistant_item' OR 'assistant_item' = ANY(sub.sources))
+          AND ((${PAYLOAD_SOURCE_SQL}) IS NULL OR (${PAYLOAD_SOURCE_SQL}) = ANY(sub.sources))
           AND NOT EXISTS (SELECT 1 FROM claw_notification_outbox d WHERE d.event_id = o.event_id AND d.subscription_id = sub.subscription_id)
         ORDER BY o.event_id, o.id
      )

@@ -813,6 +813,24 @@ describe("assistant outbound", { skip }, () => {
       } finally { restore(); }
     });
 
+    test("about no item, every one of the last day is sent, however many there are", async () => {
+      const n = 230;
+      for (let i = 0; i < n; i++) {
+        const id = outbox.deterministicEventId("test.unsent", "u1", String(i));
+        await q(
+          `INSERT INTO claw_assistant_says (say_id, user_id, text, created_at, unsent_payload)
+           VALUES ($1, 'u1', $2, NOW() - make_interval(secs => $3), $4::jsonb)`,
+          [id, `say ${i}`, n - i, JSON.stringify({ type: "assistant.say", event_id: id, occurred_at: new Date().toISOString(), user_id: "u1", text: `say ${i}` })],
+        );
+      }
+      const created = await app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: { url: "https://93.184.216.34/a", event_types: ["assistant.say"] } });
+      assert.equal(created.statusCode, 201, created.body);
+      const queued = await outboxRows();
+      assert.equal(queued.length, n, "not only the first page");
+      assert.equal(new Set(queued.map((r) => r.event_id)).size, n, "each once");
+      assert.deepEqual(queued.slice(0, 3).map((r) => r.payload.text), ["say 0", "say 1", "say 2"], "oldest first");
+    });
+
     test("a receiver that makes its subscription again is sent, once each, what was queued for the old one and what was said meanwhile", async () => {
       // The restart-like case: the receiver is down, deletes its subscription and makes a new one, as the Teams bot does when it has lost the old one's secret.
       const post = (payload: unknown) => app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: payload as object });

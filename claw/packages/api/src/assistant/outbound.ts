@@ -1106,15 +1106,27 @@ export const UNSENT_SAY_HOURS = 24;
  * (`resendItemSays`), and every other one was lost for good.
  */
 async function resendUnsentSays(userId: string): Promise<number> {
-  const says = (await db.query(
-    `SELECT s.say_id::text AS say_id, s.unsent_payload AS payload
-       FROM claw_assistant_says s
-      WHERE s.user_id = $1 AND s.item_id IS NULL AND s.unsent_payload IS NOT NULL AND s.delivered_at IS NULL
-        AND s.created_at > NOW() - make_interval(hours => $2)
-      ORDER BY s.created_at, s.say_id
-      LIMIT 100`,
-    [userId, UNSENT_SAY_HOURS],
-  )).rows as Array<{ say_id: string; payload: AssistantSayPayload }>;
+  let written = 0;
+  // A page at a time, after the last one read (its time as text: a Date would drop the microseconds), so each is looked at once.
+  let after: { at: string; say_id: string } | null = null;
+  for (;;) {
+    const page = (await db.query(
+      `SELECT s.say_id::text AS say_id, s.unsent_payload AS payload, s.created_at::text AS at
+         FROM claw_assistant_says s
+        WHERE s.user_id = $1 AND s.item_id IS NULL AND s.unsent_payload IS NOT NULL AND s.delivered_at IS NULL
+          AND s.created_at > NOW() - make_interval(hours => $2)
+          AND ($3::timestamptz IS NULL OR (s.created_at, s.say_id) > ($3::timestamptz, $4::uuid))
+        ORDER BY s.created_at, s.say_id
+        LIMIT 100`,
+      [userId, UNSENT_SAY_HOURS, after?.at ?? null, after?.say_id ?? null],
+    )).rows as Array<{ say_id: string; payload: AssistantSayPayload; at: string }>;
+    written += await resendUnsentPage(userId, page);
+    if (page.length < 100) return written;
+    after = page[page.length - 1];
+  }
+}
+
+async function resendUnsentPage(userId: string, says: Array<{ say_id: string; payload: AssistantSayPayload }>): Promise<number> {
   let written = 0;
   for (const say of says) {
     const subs = (await db.query(
