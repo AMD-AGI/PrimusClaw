@@ -11,6 +11,7 @@
  * describes.
  */
 import type pg from "pg";
+import { ensurePairingSchema } from "./pairing.js";
 
 export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<void> {
   await client.query(`
@@ -154,4 +155,6 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_remote_audit_cmd ON claw_remote_audit((detail->>'cmd_id')) WHERE action = 'command.issued'",
   );
+  // Pairing a machine with a one-time code, and the grants the codes were traded for (`pairing.ts`).
+  await ensurePairingSchema((text, params) => client.query(text, params));
 }

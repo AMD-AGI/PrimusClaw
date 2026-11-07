@@ -658,7 +658,9 @@ describe("connector access tokens", { skip }, () => {
       try {
         assert.ok(routes.length >= 12, `only ${routes.length} routes`);
         // The router also serves HEAD for a GET route, through the same handler.
-        const userSide = routes.filter((r) => !Object.values(connectorSide).some(
+        // The pairing claim is anonymous (the one-time code is its credential) and reads no caller at all.
+        const { isAnonymousPath } = await import("../src/auth/middleware.js");
+        const userSide = routes.filter((r) => !isAnonymousPath(r.url) && !Object.values(connectorSide).some(
           (c) => c.url === r.url && (c.method === r.method || (c.method === "GET" && r.method === "HEAD"))));
         assert.ok(userSide.length >= 9, `only ${userSide.length} user-side routes`);
         for (const { method, url } of userSide) {

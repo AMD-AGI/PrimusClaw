@@ -20,6 +20,7 @@ import { HooksError, hooksStatus, installHooks, settingsFile, uninstallHooks } f
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
 import { cmdService, cmdSupervise, startAfterLogin, type ServiceDeps } from "./service.js";
+import { cmdPair } from "./pair.js";
 import {
   auditFile, childrenFile, configFile, credentialsFile, identityFile, pauseFile, pidFile, type Dirs,
 } from "./paths.js";
@@ -34,6 +35,8 @@ export interface Ctx {
   fetch?: typeof fetch;
   hostname?: string;
   timing?: Partial<ConnectorTiming>;
+  /** The working directory `pair` gives agents when it writes agents.toml (default: the process's). */
+  cwd?: string;
   /** Called with the connector once it exists, so a signal handler can stop it. */
   onConnector?: (c: Connector) => void;
   /** The file the terminal hooks run (default: `terminal-hook.js` next to this program) and the node that runs it. */
@@ -66,6 +69,9 @@ Usage: claw-connector <command> [options]
                            the SessionStart/SessionEnd hooks that tell this connector which Claude Code sessions are open
                            in a terminal; merged into DIR/settings.json (default: the claude-attach agents' config
                            directories, else $CLAUDE_CONFIG_DIR or ~/.claude); only its own entries are ever changed
+  pair CODE --server URL   connect this machine with the one-time code your chat gave you ("连接我的开发环境"): writes
+                           agents.toml if there is none (the agents found here, working in this folder), saves the
+                           sign-in and starts the service. [--name HOST] [--no-start]
   login                    sign in (device flow); --server URL --identity-url URL [--name HOST]
                            development only: --key <api key>  (or CLAW_CONNECTOR_KEY)
   run                      connect and serve (Ctrl-C or SIGTERM stops it and every agent it started). Exit code 78:
@@ -107,6 +113,9 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
       case "init": return await cmdInit(rest, ctx);
       case "hooks": return cmdHooks(rest, ctx);
       case "login": return await cmdLogin(rest, ctx);
+      case "pair": return await cmdPair(rest, ctx, {
+        runningPid, stop: (c) => cmdStop(c, true), start: (c) => cmdService(["install"], c, serviceHelpers),
+      });
       case "run": {
         const code = await cmdRun(rest, ctx);
         // launchd cannot be told "never restart on 78"; it does not restart a clean exit. The reason was printed.

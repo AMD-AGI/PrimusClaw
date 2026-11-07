@@ -628,3 +628,28 @@ export async function sendConfirmed(userId: string, confirmationId: string, para
   if (!sent.ok) return { ok: false, error: sent.error, message: sent.message };
   return { ok: true, item_id: sent.item_id, seq: sent.seq, session_id: sent.session_id, machine: sent.machine, agent: sent.agent };
 }
+
+/**
+ * `devenv_pair`: a one-time code for connecting a new machine, inside the one command line that uses it
+ * (`remote-agents/pairing.ts`). Only in a turn that answers the user's own message: a report or an event never mints one.
+ * The code is shown to the user alone, in their own chat, and connects nothing until they run the line on a machine, so it
+ * may follow a read (`AFTER_READ_TOOLS`).
+ */
+export async function devenvPair(claims: AssistantTokenClaims): Promise<Record<string, unknown>> {
+  if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
+  const q: Querier = (t, p) => db.query(t, p);
+  const { userId } = await assertLiveRun(q, claims);
+  if (!(await turnMessage(q, claims.sid, claims.mid))) {
+    throw new ToolRefused("not_from_user", "only the user's own message can ask for a pairing code: a report cannot");
+  }
+  const server = (process.env.CLAW_PUBLIC_URL ?? "").trim().replace(/\/+$/, "");
+  if (!server) throw new ToolRefused("pairing_unavailable", "pairing is not set up here (no public Claw address): tell the user to run claw-connector login on the machine");
+  const { createPairing, pairCommand, PAIRING_TTL_MS } = await import("../remote-agents/pairing.js");
+  const { code, expires_at } = await createPairing(userId, "assistant");
+  return {
+    command: pairCommand(server, code),
+    expires_at,
+    expires_in_minutes: Math.round(PAIRING_TTL_MS / 60_000),
+    single_use: true,
+  };
+}

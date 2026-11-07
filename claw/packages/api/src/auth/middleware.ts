@@ -16,6 +16,7 @@ import { resolveUserLlmKey, usePlatformKeyForLlm } from "../llm/key-source.js";
 import { ByokInvalidKeyError, ByokRateLimitError, ByokUpstreamUnavailableError, verifyByokKey } from "./byok.js";
 import { constantTimeEquals } from "@claw/utils";
 import { verifyConnectorToken } from "./connector-token.js";
+import { verifyConnectorGrant } from "./connector-grant.js";
 import { verifyIdentityAccessToken } from "./identity-token.js";
 import { recordRequestCredential } from "./request-credential.js";
 import { platformAccessRefusal } from "./platform-access.js";
@@ -95,6 +96,9 @@ const ANONYMOUS_PATHS = new Set([
   "/a2a/.well-known/agent-card.json",
   "/a2a/.well-known/agent.json",
   "/a2a/health",
+  // Pairing a machine: the one-time code in the body is the credential (remote-agents/pairing.ts). The route exists only
+  // while remote agents are on.
+  "/v1/remote-agents/pairings/claim",
 ]);
 
 /**
@@ -530,6 +534,21 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
     authorizationScheme: authHeaderRaw.split(" ")[0] || null,
     devAuthBypass: devAuthBypassEnabled(),
   }, "auth.incoming");
+
+  // A connector grant (`cpg_`, auth/connector-grant.ts): what a machine paired
+  // with a one-time code holds. Judged before anything else, so it is never sent
+  // on to SaFE or the identity provider; it abstains for every other credential.
+  const connectorGrant = await verifyConnectorGrant(req, pathname);
+  if (connectorGrant.status === "verified") {
+    const refused = refuseWithoutPlatformAccess(connectorGrant.user, connectorGrant.method);
+    if (refused) return refused as any;
+    grantVerifiedUser(req, connectorGrant.user, connectorGrant.method);
+    return;
+  }
+  if (connectorGrant.status === "rejected") {
+    const { status, legacyError, anthropicType, message } = connectorGrant.error;
+    return sendAuthError(req, reply, status, legacyError, anthropicType, message) as any;
+  }
 
   // A connector's access token, on the connector-side routes of remote agents
   // only (auth/connector-token.ts). First, so that a request which carries one

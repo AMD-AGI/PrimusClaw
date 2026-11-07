@@ -797,7 +797,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v3");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v4");
     // What operators and release notes say Claw may run on a user's machine is what the code does: a card, never from the turn.
     const { readFileSync } = await import("node:fs");
     const doc = readFileSync(new URL("../../../docs/remote-agents.md", import.meta.url), "utf8");

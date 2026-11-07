@@ -168,7 +168,7 @@ describe("a connector access token over the whole router", { skip }, () => {
     assert.deepEqual(failures, []);
     assert.ok(checked >= 100, `only ${checked} routes were checked`);
     // The anonymous ones judge no credential at all, so a token cannot add to them; they are the known, tested set.
-    assert.ok(skipped.every((s) => /\/health|\/metrics|\.well-known|\/v1\/internal\//.test(s)), skipped.join(", "));
+    assert.ok(skipped.every((s) => /\/health|\/metrics|\.well-known|\/v1\/internal\/|^POST \/v1\/remote-agents\/pairings\/claim$/.test(s)), skipped.join(", "));
   });
 
   test("the same request without a token gets the same refusal, so the token was judged and not ignored by luck", async () => {

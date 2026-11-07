@@ -31,6 +31,9 @@ import { CLAW_REMOTE_AGENTS_ENABLED, CLAW_REMOTE_AGENTS_RETENTION_DAYS } from ".
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { CONNECTOR_TOKEN_METHOD, tokenExpired, tokenRevoked } from "../auth/connector-token.js";
+import { CONNECTOR_GRANT_METHOD, grantOf } from "../auth/connector-grant.js";
+import { bindGrant } from "../remote-agents/pairing.js";
+import { registerPairingRoutes, type PairingRouteOptions } from "../remote-agents/pairing-routes.js";
 import { CONNECTOR_SIDE_ROUTES } from "../remote-agents/connector-routes.js";
 import { db } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
@@ -62,6 +65,8 @@ export interface RemoteAgentOptions {
   presenceSweepMs?: number;
   /** How long a connector stays offline before its owner is told. */
   offlineNoticeMs?: number;
+  /** Pairing a machine with a one-time code (`remote-agents/pairing-routes.ts`). */
+  pairing?: PairingRouteOptions;
 }
 
 /**
@@ -94,7 +99,7 @@ function requireOwner(req: FastifyRequest, reply: FastifyReply, side: "user" | "
     fail(reply, 403, "remote_agents_require_authenticated_user");
     return null;
   }
-  if (side === "user" && getAuthMethod(req) === CONNECTOR_TOKEN_METHOD) {
+  if (side === "user" && (getAuthMethod(req) === CONNECTOR_TOKEN_METHOD || getAuthMethod(req) === CONNECTOR_GRANT_METHOD)) {
     fail(reply, 403, "connector_token_not_accepted");
     return null;
   }
@@ -213,6 +218,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const stop = startPresenceSweep({ onlineWindowMs, noticeAfterMs: opts.offlineNoticeMs ?? OFFLINE_NOTICE_MS, sweepMs: presenceSweepMs });
     app.addHook("onClose", async () => stop());
   }
+  await registerPairingRoutes(app, opts.pairing);
   // A reader's stream polls the database, so one user cannot hold an unbounded number open.
   const openReaders = new Map<string, number>();
 
@@ -240,6 +246,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req),
     );
     if (!row) return fail(reply, 409, "connector_limit_reached");
+    // A paired machine's grant follows the row it registered: only that row's routes, and over when that row is revoked.
+    const grant = grantOf(req);
+    if (grant) await bindGrant(grant, row.connector_id, row.name);
     // The id every row of this connector is filed under. A connector whose token `sub` is not the id the
     // user's own clients resolve to is registered and online yet invisible to them, with no error; this
     // line is where an operator reads which id it was filed under (docs/remote-agents.md, "Connector access tokens").
