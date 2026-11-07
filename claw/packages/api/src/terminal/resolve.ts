@@ -13,24 +13,42 @@
  *
  * Every SaFE call is made with the caller's own SaFE key, so what the caller may
  * see is what SaFE says they may see, and nothing is read with a shared identity.
+ *
+ * SaFE lists workloads across workspaces only for an operator; for anyone else
+ * an unscoped list is a 403. So when it refuses, the list is asked again inside
+ * the workspaces the caller belongs to (and the one the binding names), which is
+ * what an ordinary user's sandbox is found by once its binding is gone.
  */
 import type { ShellTarget } from "./tickets.js";
 
 const CALL_TIMEOUT_MS = 10_000;
 const MAX_DETAIL_CHARS = 300;
 const ENDED_PHASES = new Set(["Stopped", "Failed", "Succeeded"]);
+/** At most this many of the caller's workspaces are searched for the session's sandbox. */
+const MAX_SCOPED_LISTS = 8;
 
 /** The environment key that ties a SaFE workload to the session it serves. */
 export const SESSION_ENV_KEY = "CLAW_SESSION_ID";
 
 export type TerminalResolution =
   | { state: "ready"; target: ShellTarget }
-  | { state: "none" | "starting" | "ended"; message: string };
+  | {
+    state: "none" | "starting" | "ended";
+    message: string;
+    /**
+     * `cause: "sandbox_gone"`: the sandbox the session was bound to no longer exists (it
+     * was reclaimed or deleted) and no other one is running for it. The state is
+     * `ended`, so a client that knows only the states offers to start a new one.
+     */
+    cause?: "sandbox_gone";
+  };
 
 /** The sandbox binding Brain recorded for the session, as far as this module reads it. */
 export interface SandboxBinding {
   provider: "safe-workload" | "agent-sandbox";
   workloadId: string;
+  /** The SaFE workspace the bound workload was made in, when the binding says. */
+  workspaceId?: string;
 }
 
 /**
@@ -40,7 +58,12 @@ export interface SandboxBinding {
  * `refused` is one that answered no (the key, or the permission, is the problem).
  */
 export class TerminalUpstreamError extends Error {
-  constructor(public readonly kind: "unreachable" | "refused", public readonly reason: string) {
+  constructor(
+    public readonly kind: "unreachable" | "refused",
+    public readonly reason: string,
+    /** SaFE's HTTP status, for a refusal. */
+    public readonly status?: number,
+  ) {
     super(reason);
     this.name = "TerminalUpstreamError";
   }
@@ -92,7 +115,7 @@ async function safeJson(
     throw new TerminalUpstreamError("unreachable", "cannot reach SaFE to look up the session's sandbox");
   }
   if (resp.status === 401 || resp.status === 403) {
-    throw new TerminalUpstreamError("refused", `SaFE refused the caller's credentials (HTTP ${resp.status})`);
+    throw new TerminalUpstreamError("refused", `SaFE refused the caller's credentials (HTTP ${resp.status})`, resp.status);
   }
   if (resp.status === 404) return { status: 404, body: null };
   if (!resp.ok) {
@@ -140,6 +163,16 @@ export function pickSessionSandbox(workloads: WorkloadSummary[]): WorkloadSummar
   return newest(workloads.filter((w) => w.phase === "Running")) || newest(workloads);
 }
 
+/** The bound sandbox is gone and nothing else runs for the session: a new one can be started. */
+export function describeGone(): TerminalResolution {
+  return {
+    state: "ended",
+    cause: "sandbox_gone",
+    message:
+      "The sandbox of this session is gone: it was released or deleted. Start a new one, or one starts the next time the agent runs a command.",
+  };
+}
+
 export function describeUnavailable(workload: WorkloadSummary | undefined): TerminalResolution {
   if (!workload) {
     return {
@@ -162,11 +195,52 @@ export function describeUnavailable(workload: WorkloadSummary | undefined): Term
   };
 }
 
-async function findByEnvironment(input: ResolveInput, fetchImpl: FetchLike): Promise<WorkloadSummary | undefined> {
-  const qs = new URLSearchParams({ envKey: SESSION_ENV_KEY, envValue: input.sessionId, limit: "20" });
-  const { body } = await safeJson(input, `/api/v1/workloads?${qs.toString()}`, fetchImpl);
+function listedItems(body: unknown): unknown[] {
   const items = body && typeof body === "object" ? (body as { items?: unknown }).items : undefined;
-  const found = (Array.isArray(items) ? items : [])
+  return Array.isArray(items) ? items : [];
+}
+
+/** The workspaces SaFE says the caller belongs to; none when it will not say. */
+async function callerWorkspaces(input: ResolveInput, fetchImpl: FetchLike): Promise<string[]> {
+  const { body } = await safeJson(input, "/api/v1/users/self", fetchImpl);
+  const list = body && typeof body === "object" ? (body as { workspaces?: unknown }).workspaces : undefined;
+  return (Array.isArray(list) ? list : []).flatMap((w): string[] => {
+    const id = w && typeof w === "object" ? (w as { id?: unknown }).id : undefined;
+    return typeof id === "string" && id ? [id] : [];
+  });
+}
+
+async function findByEnvironment(input: ResolveInput, fetchImpl: FetchLike): Promise<WorkloadSummary | undefined> {
+  const query = (workspaceId?: string) => {
+    const qs = new URLSearchParams({ envKey: SESSION_ENV_KEY, envValue: input.sessionId, limit: "20" });
+    if (workspaceId) qs.set("workspaceId", workspaceId);
+    return `/api/v1/workloads?${qs.toString()}`;
+  };
+  let items: unknown[];
+  try {
+    items = listedItems((await safeJson(input, query(), fetchImpl)).body);
+  } catch (err) {
+    // An unscoped list is an operator's question; for anyone else SaFE answers
+    // 403 and the list is asked again in each workspace the caller may list in.
+    if (!(err instanceof TerminalUpstreamError) || err.status !== 403) throw err;
+    const scopes = [...new Set([input.binding?.workspaceId ?? "", ...await callerWorkspaces(input, fetchImpl)])]
+      .filter(Boolean)
+      .slice(0, MAX_SCOPED_LISTS);
+    items = [];
+    let answered = false;
+    for (const ws of scopes) {
+      try {
+        items.push(...listedItems((await safeJson(input, query(ws), fetchImpl)).body));
+        answered = true;
+      } catch (inner) {
+        // A workspace the caller is not allowed to list in is not where their sandbox is.
+        if (!(inner instanceof TerminalUpstreamError) || inner.status !== 403) throw inner;
+      }
+    }
+    // Refused everywhere: what the sandbox is cannot be said.
+    if (!answered) throw err;
+  }
+  const found = items
     .map(asWorkload)
     .filter((w): w is WorkloadSummary => w !== null)
     // Whatever SaFE lists for the caller, only the caller's own workload is
@@ -189,13 +263,18 @@ export async function resolveTerminal(input: ResolveInput): Promise<TerminalReso
   }
 
   let workload: WorkloadSummary | undefined;
+  let boundGone = false;
   if (input.binding) {
-    const { body } = await safeJson(input, `/api/v1/workloads/${enc(input.binding.workloadId)}`, fetchImpl);
+    const { status, body } = await safeJson(input, `/api/v1/workloads/${enc(input.binding.workloadId)}`, fetchImpl);
     // A binding whose workload SaFE no longer knows is stale, not an answer.
     workload = asWorkload(body) ?? undefined;
+    boundGone = status === 404;
   }
   if (!workload) {
     const listed = await findByEnvironment(input, fetchImpl);
+    // The sandbox on record is gone and no other one is listed for the session:
+    // it was reclaimed, and a new one is what the caller can ask for.
+    if (!listed && boundGone) return describeGone();
     if (!listed || listed.phase !== "Running") return describeUnavailable(listed);
     const { body } = await safeJson(input, `/api/v1/workloads/${enc(listed.workloadId)}`, fetchImpl);
     workload = asWorkload(body) ?? listed;
