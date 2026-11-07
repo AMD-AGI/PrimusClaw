@@ -1166,6 +1166,9 @@ export async function closeCardsOfConnector(
       WHERE confirmation_id IN (
               SELECT confirmation_id FROM claw_assistant_confirmations
                WHERE user_id = $1 AND kind = 'devenv_send' AND status = 'pending' AND params->>'connector_id' = $2
+                 -- A card that already lapsed was not voided by this: it stays as it lapsed (\`pendingConfirmations\` no longer lists it),
+                 -- never stamped \`connector_revoked\`, so the router is not told the machine took a card the person let run out.
+                 AND expires_at > NOW()
                  AND (NOT $3 OR COALESCE(params->>'session_id', '') <> '' OR COALESCE(params->>'resume_ref', '') <> '')
                  FOR UPDATE SKIP LOCKED)
       RETURNING confirmation_id`,

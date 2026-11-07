@@ -564,7 +564,7 @@ export async function voidedDevenvCards(userId: string): Promise<Array<Record<st
   return ((await db.query(
     `SELECT confirmation_id, params, result, decided_at FROM claw_assistant_confirmations
       WHERE user_id = $1 AND kind = 'devenv_send' AND status = 'expired' AND decided_via = 'connector_revoked'
-        AND decided_at > NOW() - INTERVAL '1 day'
+        AND decided_at > NOW() - INTERVAL '1 day' AND expires_at > decided_at
       ORDER BY decided_at DESC LIMIT 10`,
     [userId],
   )).rows as Array<Record<string, any>>).map((r) => ({ ...r, ref: confirmationRef(String(r.confirmation_id)) }));

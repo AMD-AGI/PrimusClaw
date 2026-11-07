@@ -48,7 +48,8 @@
  *       whose offline row is replaced by registering again under its name closes only the cards that continue one of its sessions
  *       (`machine_reconnected`); a card for a new session waits and, pressed, follows the new registration; a closed card records
  *       why (`voided_reason`) and which machine, and the router is shown it as void for a day (leave it out of what waits; asked,
- *       one line: the machine went, nothing was sent), never as waiting and never left to guess whether it was pressed
+ *       one line: the machine went, nothing was sent), never as waiting and never left to guess whether it was pressed; a card
+ *       that had already lapsed is not voided by a later revoke and never reported as taken by it
  *   F20 an agent that only takes over existing conversations (kind attach) is never chosen for a new session, which its connector would
  *       refuse: with another agent there, that one; alone, a question listing its conversations, else no_agent saying why
  *   F21 at the limit of open sessions a new one closes the longest unused idle session of the user's (never one working, waiting for
@@ -661,6 +662,29 @@ describe("development environment items and devenv_send", { skip }, () => {
     const again = await fetch(`${base}/v1/remote-agents/connectors/${desktop}`, { method: "DELETE", headers: { "x-test-user": "bob" } });
     assert.equal(again.status, 404);
     assert.equal((await w.q("SELECT status FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toDesktop.confirmation_id]))[0].status, "pending");
+  });
+
+  test("F17f a card that lapsed before its machine was revoked is not voided by the revoke, and the router is never told the machine took it", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const lapsed = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
+    const live = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 lint"), { text: "跑 lint", target: "laptop" });
+    for (const c of [lapsed, live]) assert.equal(c.done, false, JSON.stringify(c));
+    // Shown and ignored: its day ran out before the machine went (nothing moves a lapsed card out of pending until it is pressed).
+    await w.q("UPDATE claw_assistant_confirmations SET created_at = NOW() - INTERVAL '3 days', expires_at = NOW() - INTERVAL '2 days' WHERE confirmation_id = $1",
+      [lapsed.confirmation_id]);
+    const r = await fetch(`${base}/v1/remote-agents/connectors/${laptop}`, { method: "DELETE", headers: { "x-test-user": "alice" } });
+    assert.equal(r.status, 200, await r.text());
+    const row = async (id: unknown) => (await w.q("SELECT status, decided_via, result FROM claw_assistant_confirmations WHERE confirmation_id = $1", [id]))[0];
+    assert.deepEqual(await row(lapsed.confirmation_id), { status: "pending", decided_via: null, result: null }, "the lapsed card stays as it lapsed");
+    assert.deepEqual([(await row(live.confirmation_id)).decided_via, (await row(live.confirmation_id)).result?.voided_reason], ["connector_revoked", "connector_revoked"]);
+    const state = await schedules.renderScheduleState("alice");
+    assert.match(state, new RegExp(`- ref #${prompts.confirmationRef(String(live.confirmation_id))} .*voided_reason: connector_revoked`));
+    assert.doesNotMatch(state, new RegExp(`#${prompts.confirmationRef(String(lapsed.confirmation_id))}`), "a lapsed card is never reported as voided by the revoke");
+    // Even a row stamped so by an older Claw (before this check) is not listed: it had lapsed before it was closed.
+    await w.q("UPDATE claw_assistant_confirmations SET status = 'expired', decided_via = 'connector_revoked', decided_at = NOW() WHERE confirmation_id = $1", [lapsed.confirmation_id]);
+    assert.doesNotMatch(await schedules.renderScheduleState("alice"), new RegExp(`#${prompts.confirmationRef(String(lapsed.confirmation_id))}`));
   });
 
   test("F17e a machine replaced by registering again under its name: a card for a new session waits and follows it; one continuing an old session closes", async () => {
