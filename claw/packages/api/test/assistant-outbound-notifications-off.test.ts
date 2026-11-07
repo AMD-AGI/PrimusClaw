@@ -68,8 +68,9 @@ describe("assistant outbound without notifications", { skip }, () => {
     );
     await q("INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary) VALUES ('kwi_offanswered', 'answer', 'worker', 1, 'RESULT=86972')");
     const events: unknown[] = [];
+    const { sessionId } = await (await import("../src/assistant/assistant.js")).getOrCreateAssistant("u-off");
     await outbound.recordAssistantSay(
-      { userId: "u-off", sessionId: "assistant-u-off", text: "✅ RESULT=86972", itemId: "kwi_offanswered" },
+      { userId: "u-off", sessionId, text: "✅ RESULT=86972", itemId: "kwi_offanswered" },
       { publishSessionEvent: async (_s, e) => { events.push(e); }, kick: async () => {} },
     );
     const silent = await import("../src/assistant/silent-sweep.js");

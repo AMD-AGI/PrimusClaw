@@ -130,8 +130,8 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_assistant_says_user ON claw_assistant_says(user_id, created_at DESC)",
   );
-  // The assistant session the say was published to, for the web client (null: none). A say shown there told a user who has no channel
-  // that carries it, and the silent sweep does not say it again (`silent-sweep.ts`).
+  // The assistant session the say was shown in, recorded once its event was published there while the session was still there (null:
+  // none). A say shown there told a user who has no channel that carries it, and the silent sweep does not say it again (`silent-sweep.ts`).
   await client.query("ALTER TABLE claw_assistant_says ADD COLUMN IF NOT EXISTS session_id TEXT");
   // At most one system fallback per time an item needed the user. Ordinary says
   // are not limited: the assistant may speak about one item more than once.

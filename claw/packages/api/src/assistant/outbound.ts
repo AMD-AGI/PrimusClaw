@@ -184,11 +184,11 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
 /** Store the message and queue it for every subscription that asked for its type. `null`: it was stored before. */
 async function store(q: Querier, m: ToStore): Promise<Stored | null> {
   const inserted = (await q(
-    `INSERT INTO claw_assistant_says (say_id, user_id, item_id, item_attention_seq, text, fallback, session_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `INSERT INTO claw_assistant_says (say_id, user_id, item_id, item_attention_seq, text, fallback)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (say_id) DO NOTHING
      RETURNING created_at`,
-    [m.sayId, m.userId, m.item?.item_id ?? null, m.item?.attention_seq ?? null, m.text, m.type === "work_item.needs_you" || m.fallback === true, m.sessionId],
+    [m.sayId, m.userId, m.item?.item_id ?? null, m.item?.attention_seq ?? null, m.text, m.type === "work_item.needs_you" || m.fallback === true],
   )).rows[0];
   if (!inserted) return null;
   const payload = payloadOf(m, inserted.created_at);
@@ -253,7 +253,16 @@ export async function publishSayEvent(
   } catch (err) {
     // The message is stored and queued; a web client that missed the live event reads it later.
     logger.error({ err, sayId }, "assistant.say_event_publish_failed");
+    return;
   }
+  // Shown: in a session that is still there, which is what tells a user with no channel (the silent sweep's `told`). A session
+  // deleted meanwhile is read by nobody, and a failed publish showed nothing; neither is recorded.
+  await db.query(
+    `UPDATE claw_assistant_says SET session_id = $2
+      WHERE say_id = $1 AND session_id IS NULL
+        AND EXISTS (SELECT 1 FROM claw_sessions WHERE session_id = $2 AND deleted_at IS NULL)`,
+    [sayId, sessionId],
+  ).catch((err) => logger.warn({ err, sayId }, "assistant.say_shown_record_failed"));
 }
 
 /** Where the unreachable-message warning goes: a seam, so a test can see which messages were warned about. */
@@ -675,6 +684,7 @@ function heldWriteText(item: ItemRow, params: Record<string, unknown> | null): s
  * user before the call got here. Not counted against the say limit.
  */
 export async function recordNeedsYouFallback(input: { itemId: string }, deps: SayDeps = {}): Promise<SayOutcome | null> {
+  await ensureLiveAssistant(input.itemId);
   const stored = await storeSettled(async (q, storeOne) => {
     const m = await needsYouMessage(q, input.itemId);
     return m ? storeOne(m) : null;
@@ -713,21 +723,41 @@ export const MOVED_PREFIX_EN = "(From an earlier conversation) ";
 
 /**
  * Where the system says something about an item on its own: the assistant session the item was started from. When the user deleted
- * that session (a new one took its place), the session they have now, and `moved`: the message says where the item came from. It is
- * still said once (its id is the item's and the need's), and only when nothing told the user before (the silent sweep's `told`). An
- * item made before its session was recorded goes to the current session, as before.
+ * that session, the one that replaced it, and `moved`: the message says where the item came from. It is still said once (its id is
+ * the item's and the need's), and only when nothing told the user before (the silent sweep's `told`). An item made before its session
+ * was recorded goes to the current session, as before. A user with no assistant at all has only their channels (no session). Null when
+ * the user's assistant has no session that is still there: nobody would read it.
  */
-async function itemSession(q: Querier, itemId: string): Promise<{ sessionId: string | null; moved: boolean }> {
+async function itemSession(q: Querier, itemId: string): Promise<{ sessionId: string | null; moved: boolean } | null> {
   const row = (await q(
     `SELECT w.router_session_id AS own, a.session_id AS current,
-            EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = w.router_session_id AND s.deleted_at IS NULL) AS own_live
+            EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = w.router_session_id AND s.deleted_at IS NULL) AS own_live,
+            EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = a.session_id AND s.deleted_at IS NULL) AS current_live
        FROM claw_work_items w LEFT JOIN claw_assistants a ON a.user_id = w.user_id
       WHERE w.item_id = $1`,
     [itemId],
-  )).rows[0] as { own: string | null; current: string | null; own_live: boolean } | undefined;
-  if (!row) return { sessionId: null, moved: false };
-  if (!row.own || row.own_live || row.own === row.current) return { sessionId: row.own && row.own_live ? row.own : row.current, moved: false };
-  return { sessionId: row.current, moved: row.current !== null };
+  )).rows[0] as { own: string | null; current: string | null; own_live: boolean; current_live: boolean } | undefined;
+  if (!row) return null;
+  if (row.current === null) return { sessionId: null, moved: false };
+  if (row.own && row.own_live) return { sessionId: row.own, moved: false };
+  if (row.current && row.current_live) return { sessionId: row.current, moved: row.own !== null && row.own !== row.current };
+  return null;
+}
+
+/**
+ * Before the system says something about an item on its own: a user whose assistant session was deleted and not yet made again gets
+ * it made now, as their next visit would (`getOrCreateAssistant`), so the message has a session that is read. Otherwise it would be
+ * shown nowhere and, for a user with no channel, never be said.
+ */
+async function ensureLiveAssistant(itemId: string): Promise<void> {
+  const row = (await db.query(
+    `SELECT w.user_id, EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = a.session_id AND s.deleted_at IS NULL) AS live
+       FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id WHERE w.item_id = $1`,
+    [itemId],
+  )).rows[0] as { user_id: string; live: boolean } | undefined;
+  if (!row || row.live) return;
+  const { getOrCreateAssistant } = await import("./assistant.js");
+  await getOrCreateAssistant(row.user_id);
 }
 
 /** The system's message for an item that needs the user or was answered (`recordNeedsYouFallback`), or null when it is neither. */
@@ -742,6 +772,8 @@ async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToSt
       )).rows[0]?.summary as string | undefined) ?? ""
     : "";
   const where = await itemSession(q, item.item_id);
+  // No session is read: nothing is stored, so a later call (the sweep's, once a session exists) says it.
+  if (!where) return null;
   const params = answered ? null
     : ((await q("SELECT params FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0]?.params as Record<string, unknown> | null) ?? null;
   const zh = await personWritesChinese(q, item.user_id, item.title);

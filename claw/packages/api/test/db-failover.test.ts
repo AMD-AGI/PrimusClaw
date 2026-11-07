@@ -469,7 +469,7 @@ describe("database failover", { skip }, () => {
     await new Promise((r) => setTimeout(r, 5 * 300 + 500));
     assert.equal(w.events.length, 0);
     await w.q(
-      `INSERT INTO claw_assistant_says (say_id, user_id, item_id, item_attention_seq, text, fallback, session_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      `INSERT INTO claw_assistant_says (say_id, user_id, item_id, item_attention_seq, text, fallback) VALUES ($1, $2, $3, $4, $5, $6)`,
       row,
     );
     const deadline = Date.now() + 8_000;

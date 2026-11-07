@@ -592,13 +592,13 @@ describe("assistant outbound", { skip }, () => {
     });
 
     test("is shown to a web client in the user's assistant session when there is one", async () => {
-      await q("INSERT INTO claw_assistants (user_id, session_id) VALUES ('u1', 'assistant-u1')");
+      const { sessionId } = await (await import("../src/assistant/assistant.js")).getOrCreateAssistant("u1");
       const itemId = await seedItem();
       const out = await outbound.recordNeedsYouFallback({ itemId }, deps());
       assert.equal(events.length, 1);
       assert.deepEqual(
         [events[0].sessionId, events[0].event.type, events[0].event.say_id, events[0].event.fallback, events[0].event.item.can_accept],
-        ["assistant-u1", "AssistantSay", out!.say_id, true, true],
+        [sessionId, "AssistantSay", out!.say_id, true, true],
       );
 
       events = [];
@@ -711,9 +711,8 @@ describe("assistant outbound", { skip }, () => {
         const itemId = await seedItem();
         const said = await say("#1 is ready for your review.", { itemId });
         await q("UPDATE claw_work_items SET updated_at = NOW() - interval '1 hour'");
-        assert.equal(await silent.tellSilentItems(300), 0, "shown in the session, the one place a user with no channel reads: told");
+        assert.equal(await silent.tellSilentItems(300), 1, "the fallback is stored, newer than the say");
         const sub = await subscribe("u1", ["assistant.say"]);
-        assert.equal(await silent.tellSilentItems(300), 1, "a channel takes it now and never got it: the fallback is stored, newer than the say");
         assert.equal(await silent.tellSilentItems(300), 1);
         assert.deepEqual((await outboxRows()).map((r) => [r.event_id, r.subscription_id, r.payload.type]),
           [[said.say_id, sub, "assistant.say"]], "the say the subscription takes, not the newer fallback it does not");
@@ -848,6 +847,8 @@ describe("assistant outbound", { skip }, () => {
 
       assert.equal(await sweep(), 0, "said in the session, which is where a user with no channel reads it: nothing is said again");
       await deleteSession(first.sessionId);
+      assert.equal(await sweep(), 0, "deleted and not yet made again: still told");
+      assert.equal((await q("SELECT session_id FROM claw_assistants WHERE user_id = 'u1'")).rows[0].session_id, first.sessionId, "and no session is made for it");
       const second = await assistantOf();
       assert.equal(second.created, true);
       assert.notEqual(second.sessionId, first.sessionId);
@@ -856,12 +857,50 @@ describe("assistant outbound", { skip }, () => {
       assert.deepEqual((await saysRows()).filter((x) => x.fallback), [], "no system message was stored");
     });
 
+    test("one whose session event failed to publish told nobody: the sweep says it, once", async () => {
+      const own = await assistantOf();
+      const itemId = await answeredItem("后台运行 slow_job.sh", "RESULT=86972");
+      await say("✅ RESULT=86972", { itemId, sessionId: own.sessionId }, deps({ publishSessionEvent: async () => { throw new Error("nats is down"); } }));
+      assert.equal(shown().length, 0);
+      assert.equal(await sweep(), 1);
+      assert.equal(await sweep(), 0, "once");
+      assert.deepEqual(shown().map((e) => e.session), [own.sessionId]);
+    });
+
+    test("one said in a session deleted before its event was published told nobody", async () => {
+      const own = await assistantOf();
+      const itemId = await answeredItem("后台运行 slow_job.sh", "RESULT=86972");
+      await deleteSession(own.sessionId);
+      await say("✅ RESULT=86972", { itemId, sessionId: own.sessionId });
+      assert.equal((await saysRows())[0].session_id, null, "not recorded as shown");
+      assert.equal(await sweep(), 1, "said again, in a session that is read");
+      const next = (await q("SELECT session_id FROM claw_assistants WHERE user_id = 'u1'")).rows[0].session_id;
+      assert.notEqual(next, own.sessionId);
+      assert.equal(shown().at(-1)?.session, next);
+    });
+
     test("one nobody said goes to the item's own session, once", async () => {
       const own = await assistantOf();
       const itemId = await answeredItem("jobs.csv 去掉 cancelled 后汇总", "36,661.0 GPU 小时");
       assert.equal(await sweep(), 1);
       assert.equal(await sweep(), 0, "once");
       assert.deepEqual(shown(), [{ session: own.sessionId, text: "#" + (await q("SELECT seq FROM claw_work_items WHERE item_id = $1", [itemId])).rows[0].seq + " jobs.csv 去掉 cancelled 后汇总：36,661.0 GPU 小时" }]);
+    });
+
+    test("one nobody said, whose session was deleted and not yet made again, goes to the session made for it, once", async () => {
+      const first = await assistantOf();
+      await answeredItem("jobs.csv 去掉 cancelled 后汇总", "36,661.0 GPU 小时");
+      await deleteSession(first.sessionId);
+      assert.equal(await sweep(), 1);
+      assert.equal(await sweep(), 0, "once");
+      const made = (await q("SELECT session_id FROM claw_assistants WHERE user_id = 'u1'")).rows[0].session_id;
+      assert.notEqual(made, first.sessionId, "made as the user's next visit would");
+      const told = shown();
+      assert.equal(told.length, 1);
+      assert.equal(told[0].session, made, "never the deleted session");
+      assert.ok(told[0].text.startsWith(outbound.MOVED_PREFIX_ZH), told[0].text);
+      const again = await assistantOf();
+      assert.deepEqual([again.sessionId, again.created], [made, false], "the user's next visit finds that session");
     });
 
     test("one nobody said, whose session the user deleted, goes to the session they have now, once, saying where it came from", async () => {
