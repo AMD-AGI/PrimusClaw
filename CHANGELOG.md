@@ -39,6 +39,15 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
+  忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
+  not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with
+  numbers and no data under it, the model took that answer for unchecked. The placeholder now says the lookup ran and answered in its
+  turn, that the answer said after it came from it and is never to be called unchecked, and that a new answer is compared with it.
+- A router turn that answered the user and ended without its answer said is counted, by what its end did about it:
+  `claw_assistant_router_unsaid_total{outcome}` (`delivered`, `replaced_early_line`, `lost_notice`, `withheld`, `refused`,
+  `after_say`). `replaced_early_line` is the parity run's K2 (only "查一下 Autopilot 的状态。" reached the user), which was fixed but
+  not counted, so a return of it could only be found by reading transcripts.
 - How far an item got is answered from what its job wrote at the question, not from the worker's last look at it: a worker checks a
   long job only every minute or two, so its last tool output was up to two steps behind the log (2026-11-06 parity run, L1: "step 3/16"
   while the log said step 5). While the item's run is going, `work_recall(item, "live")` also returns `files_now`: the tails of the

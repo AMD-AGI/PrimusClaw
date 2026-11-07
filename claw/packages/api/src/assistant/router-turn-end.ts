@@ -30,6 +30,7 @@ import { TOOL_NAME_PREFIX, WORK_EVENT_PREFIX } from "./prompts.js";
 import { ROUTER_ASSISTANT_READS, ROUTER_SPEAK_TOOL } from "./read-tools.js";
 import { releaseHeldSays } from "./say-hold.js";
 import { kickDelivery } from "../notifications/outbox.js";
+import { metrics } from "../infra/metrics.js";
 
 const logger = pino({ name: "assistant-router-turn-end" });
 
@@ -266,10 +267,14 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
   // before its last lookup answered: then the person holds a line that the turn was on it ("查一下 Autopilot 的状态。") and the answer
   // is this text, which they would never get (the parity run's K2, 2026-11-06). Said now, it takes that line's place (`replaces`).
   if (spoke.rowCount && !(!lost && !leaked && await saidOnlyBeforeLookups(end.sessionId, answered))) {
-    if (!lost && !leaked) logger.info({ sessionId: end.sessionId, runIds: end.runIds, chars: text.length }, "assistant.unsaid_text_after_say");
+    if (!lost && !leaked) {
+      logger.info({ sessionId: end.sessionId, runIds: end.runIds, chars: text.length }, "assistant.unsaid_text_after_say");
+      metrics.onAssistantRouterUnsaid("after_say");
+    }
     return "skipped";
   }
-  if (spoke.rowCount) {
+  const earlyLine = (spoke.rowCount ?? 0) > 0;
+  if (earlyLine) {
     // Once: a redelivered completion finds the answer it stored (it is a say, so the turn's events do not change).
     const stored = await db.query(
       "SELECT 1 FROM claw_assistant_says WHERE user_id = $1 AND NOT fallback AND created_at >= $2 AND text = $3 LIMIT 1",
@@ -283,7 +288,10 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
     const stored = await recordSystemNotice({
       userId: router.user_id, sessionId: end.sessionId, text, key: `turn_lost:${[...end.runIds].sort().join(",")}`,
     }, deps);
-    if (stored) logger.warn({ sessionId: end.sessionId, runIds: end.runIds, why: lost ? why : "leaked" }, "assistant.turn_lost_notice_delivered");
+    if (stored) {
+      logger.warn({ sessionId: end.sessionId, runIds: end.runIds, why: lost ? why : "leaked" }, "assistant.turn_lost_notice_delivered");
+      metrics.onAssistantRouterUnsaid(lost ? "lost_notice" : "withheld");
+    }
     return stored ? "said" : "skipped";
   }
   try {
@@ -293,10 +301,12 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
     // when it first refused them (`recordAssistantSay`); only a fault is worth a retry, and it is thrown for the caller's.
     if (err instanceof SayRefused) {
       logger.warn({ sessionId: end.sessionId, code: err.code }, "assistant.unsaid_answer_refused");
+      metrics.onAssistantRouterUnsaid("refused");
       return "skipped";
     }
     throw err;
   }
   logger.warn({ sessionId: end.sessionId, runIds: end.runIds }, "assistant.unsaid_answer_delivered");
+  metrics.onAssistantRouterUnsaid(earlyLine ? "replaced_early_line" : "delivered");
   return "said";
 }
