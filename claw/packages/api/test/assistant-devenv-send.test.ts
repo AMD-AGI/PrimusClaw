@@ -393,6 +393,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal(await plan("c:/users/alice/repo/api/"), "C:\\Users\\alice\\repo\\api");
     assert.equal(await plan("C:\\Users\\alice\\repo\\"), "C:\\Users\\alice\\repo");
     assert.equal(await plan("\\\\FileServer\\Share\\proj\\web"), "\\\\fileserver\\share\\proj\\web");
+    assert.equal(await plan("//FileServer/Share/proj/web"), "\\\\fileserver\\share\\proj\\web");
     // Outside every root, a sibling sharing a prefix, another drive, a POSIX path: no agent may work there.
     for (const outside of ["C:\\Users\\alice\\repo2", "D:\\Users\\alice\\repo", "C:\\Users", "/home/u/repo", "Users\\alice\\repo"]) {
       assert.match(await plan(outside), /^which_agent: no agent there may work in/, outside);

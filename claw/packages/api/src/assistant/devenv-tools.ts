@@ -332,6 +332,8 @@ function agentsNamed(c: Row, asked: string): Row[] {
 /** A Windows path: a drive (`C:\` or `C:/`) or a share (`\\server\share`), as a connector on Windows reports its roots. */
 const WINDOWS_ABSOLUTE = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/;
 const isWindowsPath = (p: string): boolean => WINDOWS_ABSOLUTE.test(p);
+/** A folder typed for a Windows root: a Windows path, or a share written with forward slashes (`//server/share/proj`). */
+const isWindowsFolder = (p: string): boolean => isWindowsPath(p) || /^\/\/[^\\/]+[\\/][^\\/]+/.test(p);
 /** `p` with its separators made one backslash each and none at the end: how two Windows paths are compared (case aside). */
 const windowsForm = (p: string): string => p.replace(/[\\/]+/g, "\\").replace(/\\+$/, "");
 
@@ -352,7 +354,7 @@ function placeIn(cwd: string, root: string): string | null {
     const posix = root.endsWith("/") ? root : `${root}/`;
     return cwd === root || cwd.startsWith(posix) ? cwd : null;
   }
-  if (!isWindowsPath(cwd)) return null;
+  if (!isWindowsFolder(cwd)) return null;
   const r = windowsForm(root);
   const c = windowsForm(cwd);
   if (c.toLowerCase() === r.toLowerCase()) return root;
@@ -363,7 +365,7 @@ function placeIn(cwd: string, root: string): string | null {
 
 /** Whether two folders a session or a request names are the same one (Windows paths compare as Windows does). */
 const samePlace = (a: string | null, b: string): boolean =>
-  a !== null && (a === b || (isWindowsPath(a) && isWindowsPath(b) && windowsForm(a).toLowerCase() === windowsForm(b).toLowerCase()));
+  a !== null && (a === b || (isWindowsFolder(a) && isWindowsFolder(b) && windowsForm(a).toLowerCase() === windowsForm(b).toLowerCase()));
 
 type PlanOutcome =
   | { ok: true; plan: SendPlan }
