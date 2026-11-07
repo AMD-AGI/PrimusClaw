@@ -299,8 +299,8 @@ test("a held write of any non-GitHub server is said in words, never by its mcp__
       const params = { holds: [{ kind: "approval", attention_seq: 2, action, zh, expires_at: "2026-11-07T18:00:00Z", tool_use_id: "tu-1" }] };
       const text = heldWriteText({ seq: 3, title: "t", board_state: "needs_you", attention_seq: 2 }, params);
       assert.ok(text && !/\bmcp__/.test(text), `${label}: ${text}`);
-      // The pending question a channel or the console shows, as `holds.ts` writes it, says the same words.
-      assert.doesNotMatch(pendingText("approval", approvalTarget(tool, input), true, approvalAction(tool, input, true).action), /\bmcp__/, label);
+      // The pending question a channel or the console shows, as `holds.ts` writes it, says the same words, in either language.
+      assert.doesNotMatch(pendingText("approval", approvalTarget(tool, input), zh, action), /\bmcp__/, `${label} ${zh ? "zh" : "en"} pending`);
     }
   }
 });

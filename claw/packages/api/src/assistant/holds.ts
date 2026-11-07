@@ -186,7 +186,7 @@ export function heldQuestions(raw: unknown): HeldQuestion[] {
  */
 export function pendingText(kind: HoldKind, target: string, zh = false, action?: string): string {
   if (zh) return clip(kind === "question" ? `需要你回答：${target}` : `需要你批准：${action || target}`, PENDING_MAX);
-  return clip(kind === "question" ? `Question for you: ${target}` : `Approve or deny: ${target}`, PENDING_MAX);
+  return clip(kind === "question" ? `Question for you: ${target}` : `Approve or deny: ${action || target}`, PENDING_MAX);
 }
 
 /** A worker's report, at most this long, said to the person before the write it holds for them (`holdForPerson`). */
