@@ -1037,6 +1037,10 @@ describe("the conversations already on the machine show up by themselves", () =>
     fs.writeFileSync(path.join(project, `${REF}.jsonl`), "{}\n");
     h.start();
     await h.claw.until("the first heartbeat", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
+    // The command stream's `ready` frame wakes one more heartbeat; on a slow runner the stream opens after any fixed wait, so
+    // the count is taken once that heartbeat is in (CI 2026-11-07: counted 2 where 1 was taken as the baseline).
+    await h.online();
+    await h.claw.until("the heartbeat the stream's ready frame wakes", () => h.claw.heartbeats.length >= 2);
     await new Promise((r) => setTimeout(r, 400));
     const before = h.claw.heartbeats.length;
     // Appending to a transcript is no new conversation and lists nothing again.
