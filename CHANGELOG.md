@@ -28,6 +28,9 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Brain's `SKILL_HINTS_IN_SYSTEM_USERS` (default none): comma-separated user ids whose turns put the skill and MCP server hints in
+  the system message, as `SKILL_HINTS_IN_SYSTEM` does for everyone, so the change can be measured on one identity on a live
+  deployment before it is switched on for all. `engine.tools_resolved` logs `hintsInSystem` for each turn.
 - `CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS` (default none): a delegated identity token of a named service that brings no key of
   the person's own is exchanged once more at the identity provider, and the caller has the keys SaFE holds for the token's subject. A
   chat service that holds no key of the person (a chat user who never linked one) then has the person's turns run on their own virtual
