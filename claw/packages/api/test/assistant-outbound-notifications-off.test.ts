@@ -111,6 +111,12 @@ describe("assistant outbound without notifications", { skip }, () => {
     assert.match(shown[0].e.text, /39,144\.2/);
   });
 
+  test("the server's \"on it\" before a lookup is not said: there is no delivery for the answer to take its place in (lookup-ack.ts)", async () => {
+    const ack = await import("../src/assistant/lookup-ack.js");
+    assert.equal(ack.lookupAckOn(), false);
+    assert.equal(await ack.ackBeforeLookup("assistant-u1", { type: "toolUsed", status: "start", tool: "web_search", message_id: "m1" }), "off");
+  });
+
   test("the delivery hook is registered only behind both the notifications and the assistant flag", () => {
     const index = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
     assert.match(index, /if \(CLAW_NOTIFICATIONS_ENABLED && CLAW_ASSISTANT_ENABLED\) registerAssistantDeliveryHook\(\)/);

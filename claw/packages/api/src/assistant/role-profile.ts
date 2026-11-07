@@ -252,6 +252,9 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     const read = lookups.plugin;
     task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN, ...lookups.allowlist];
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
+    // A turn that used every step on lookups still answers: Brain asks the model once more, for text only, and that text is delivered
+    // as the turn's answer (`router-turn-end.ts`). Without it the person heard nothing (2026-11-06, bczh-202: 11 web lookups, no reply).
+    task.report_at_turn_cap = true;
     // Only the assistant's own server, the plugin's read servers, the user's GitHub and the turn's own scheduled tasks: any other is
     // a connection made and a tool never offered. The GitHub entry is built here from the session, as `githubMcpServers` builds a
     // worker's; the `schedules` one is kept only when this API minted its bearer for this turn (`ownTriggerServer`).

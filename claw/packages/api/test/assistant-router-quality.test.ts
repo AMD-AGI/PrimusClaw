@@ -300,12 +300,13 @@ describe("router quality, the prompt", () => {
     const p = await import("../src/assistant/prompts.js");
     // router-v16 (this rule set, a long answer said whole, a say after the start notice added to it, one message a turn, progress read
     // live, a follow-up with the earlier files, progress from what the job wrote now with its age, a derived number from the unrounded
-    // values; router-v17: a translation said alone, in the language asked for); its review prompt is router-v21; router-read-v9 adds
+    // values; router-v17: a translation said alone, in the language asked for; router-v18: the tool for a worker's report, a request to
+    // remember and a channel setting named outright); its review prompt is router-v22; router-read-v9 adds
     // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
     // now from the source that states them.
-    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v17");
+    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v18");
     assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v10");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v21");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v22");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): a say after it in the turn is added to that same message, so never repeat the start/],
@@ -341,6 +342,10 @@ describe("router quality, the prompt", () => {
       ["how many is answered with the list", /"How many pull requests \(issues\) do I have open" is answered with the total \(total_count\) and then the list itself, never the number alone[^\n]*refs_by_repo/],
       ["a pull request that does not exist is said so", /When a GitHub read answers no_such_pull_request, the pull request does not exist[^\n]*Never say it might be private or a permission problem/],
       ["no number without its title", /never by its number alone: say refuses "#6、#8" without the titles/],
+      // router-v18 (2026-11-06 nightly: cat-items-ro-003 answered from the list, cat-settings-wr-002 made a scheduled task).
+      ["a worker's report is read with work_recall", /What a worker reported, found or answered on an item[^\n]*work_recall\(item, "reports"\) for that item[^\n]*never from its line in the list alone/],
+      ["memory is never a setting tool", /the memory tools of the Memory section[^\n]*never a setting tool in their place/],
+      ["a brief or a pause is never a scheduled task", /A daily brief or a pause of notifications is never a scheduled task \(trigger_create\) and never a work item/],
     ];
     for (const [what, re] of rules) assert.match(system, re, what);
     // Nothing in the read section tells the router to announce a start the system has already announced.
@@ -348,6 +353,14 @@ describe("router quality, the prompt", () => {
     assert.ok(!/call work_create in the same turn with the question/.test(system), "a failed lookup no longer starts an item");
     // The system prompt carries nothing that changes per turn, so it stays a prompt-cache prefix.
     assert.equal(p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search"] }), p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search"] }));
+  });
+
+  test("Q7m router-memory-v2: a request to remember is saved even when a setting fits, and a correction or undo is done with its tool", async () => {
+    const p = await import("../src/assistant/prompts.js");
+    assert.equal(p.ROUTER_MEMORY_PROMPT_VERSION, "router-memory-v2");
+    // 2026-11-06 nightly: cat-memory-wr-001 and wr-003 called model_default_set for 记住：我审 PR 默认用 opus; wr-005 only said the undo.
+    assert.match(p.ROUTER_MEMORY_PROMPT, /记住 \/ remember \/ 以后都… is memory_save, even when a setting also fits it \(记住：我审 PR 默认用 opus is an entry, not model_default_set or review_mode_set\)/);
+    assert.match(p.ROUTER_MEMORY_PROMPT, /A correction right after a save \(不对，改成 sonnet\) is memory_update of the entry just saved, and 撤销刚才那条 is memory_undo of it: call the tool, never only say it\./);
   });
 
   test("Q8 what the router can do comes from the tool catalog, and no system failure is a limit", async () => {

@@ -495,6 +495,13 @@ export interface ExecuteRequest {
    */
   stream_tool_text?: string[];
   /**
+   * True: when the top-level loop uses its last allowed turn without ending (`max_turns`), the model is asked once more for a reply in
+   * text only, with what it found so far, as a sub-agent always is at its cap. An assistant router's turn, whose plain text reaches the
+   * person (the API delivers it as the turn's answer) where a run that ran out of turns would otherwise leave them with nothing.
+   * Absent: the top-level loop ends at its cap as it always did.
+   */
+  report_at_turn_cap?: boolean;
+  /**
    * "5m": the rolling prompt-cache markers of this run's turns (sub-agents included) are written for five minutes, the anchor keeps
    * Brain's `LLM_CACHE_TTL`. For a run nobody waits on between turns; absent, every marker is written at `LLM_CACHE_TTL`. The API sets it
    * for a session that reviews a pull request on someone's behalf.

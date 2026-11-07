@@ -417,6 +417,11 @@ export interface LoopOptions {
    */
   streamToolText?: readonly string[];
   /**
+   * `ExecuteRequest.report_at_turn_cap`: the top-level loop, too, asks its model for a text-only reply when it used its last turn without
+   * ending (`reportAtTurnCap`), as a sub-agent's always does. Sub-agents are unaffected (they always do).
+   */
+  reportAtTurnCap?: boolean;
+  /**
    * Tools besides the sandbox reads (PARALLEL_READ_TOOLS) whose consecutive calls in one step run side by side: the read-only lookups
    * a request names (`read_taint.sources`, `readTaintSources`), each a separate request to its own server. Top-level loop only.
    */
@@ -1254,7 +1259,8 @@ class AgentLoopRunner {
       if (ended) break;
     }
     // The reply at the cap is a model turn as well: under a pool, only when one is left.
-    if (!ended && this.depth > 0 && !this.signal?.aborted && (!this.opts.turnPool || takePooledTurn(this.opts.turnPool))) await this.reportAtTurnCap(turn);
+    if (!ended && (this.depth > 0 || this.opts.reportAtTurnCap === true) && !this.signal?.aborted
+      && (!this.opts.turnPool || takePooledTurn(this.opts.turnPool))) await this.reportAtTurnCap(turn);
 
     logger.info({
       sessionId: this.sessionId,
@@ -1280,7 +1286,10 @@ class AgentLoopRunner {
     };
   }
 
-  /** A sub-agent's one text-only reply after its last allowed turn ended without an answer (see TURN_CAP_NOTICE). */
+  /**
+   * A sub-agent's one text-only reply after its last allowed turn ended without an answer (see TURN_CAP_NOTICE); a top-level loop's too,
+   * when its run asked for it (`LoopOptions.reportAtTurnCap`).
+   */
   private async reportAtTurnCap(turn: number): Promise<void> {
     this.workingMessages.push({ role: "user", content: TURN_CAP_NOTICE });
     const { content, usage } = await this.streamTurnWithRetry(turn, Date.now());
