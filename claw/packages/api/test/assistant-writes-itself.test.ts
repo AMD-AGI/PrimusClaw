@@ -13,7 +13,7 @@
  *      the user; short last words, or a report that already held them, make no file; a second completion writes the same file
  *   W4 github_comment posts nothing by itself: the card shows the exact comment; the press posts that comment as the user once; a
  *      deny posts nothing; a GitHub refusal is the card's failure; a key in the draft is masked on the card and in what is posted
- *      alike; a report's turn cannot propose one
+ *      alike; a report's turn cannot propose one; the card's session event names the turn that proposed it
  *   W5 the router is offered deliver_text always and github_comment with the confirmation cards; both may follow a lookup; a worker
  *      gets deliver_text and not github_comment
  *   W6 a say whose [n] lost its source (an address no lookup returned) is refused, so no bare number reaches the user; one whose
@@ -201,6 +201,11 @@ describe("the router writes itself, and a worker's words reach the user", { skip
     const [row] = await w.q("SELECT payload FROM claw_notification_outbox");
     assert.equal(row.payload.confirm_write?.kind, "github_comment");
     assert.equal(row.payload.confirm_write?.allow_label, "发表");
+    // The card's session event names the turn that proposed it, so whoever follows the session reads it as that message's answer; the
+    // delivery a later say is matched against (`turnFirstSay`) stays as it was.
+    const shownCard = w.events.find((e) => e.confirm_write?.kind === "github_comment");
+    assert.equal(shownCard?.turn_message_id, turn.mid, "the card's event names its turn");
+    assert.equal(row.payload.turn_message_id, undefined, "the card's delivery is unchanged");
 
     const first = await sch.decideConfirmation({ userId: alice.userId, confirmationId: c.confirmation_id, decision: "allow", via: "button" });
     assert.equal(first.status, "done");

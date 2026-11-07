@@ -33,6 +33,11 @@ record it.
   channel that edits a message shows one. Off unless `CLAW_ASSISTANT_FIRST_ACK_USERS` names the user (`*` for everyone);
   `CLAW_ASSISTANT_FIRST_ACK_MS` sets the wait (2026-11-06 baseline: first reply p90 7.28 s, 21 turns heard only at their end). The router
   says its quick line before `deliver_text`, `trigger_create`, `review_mode_set` and the `devenv_` tools too (`router-v19`).
+- `CLAW_ASSISTANT_ROUTE_DISCIPLINE` (`on`, default off) and `CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS` (Claw user ids, the canary): the
+  assistant answers a reply to a result it already gave (没关系, 就这样吧) with one line and starts nothing; declines in chat a request to
+  read ~/.ssh, keys or credentials whatever the reason given, and `work_create` refuses such a task; and a work item whose task changed
+  nothing outside (it delivered a file or a report) closes with its answer instead of waiting for Accept: a worker's `ready` report must
+  name what it changed (`result.refs`). Logged as router-discipline-v1 and worker-v7.
 - The connector picks up after a restart (a crash, a kill, a pod restart, `stop`, an upgrade): the turn an agent was running is kept
   on disk, and the next run either carries it on (the agent was waiting for a person's permission for a tool call, always asks, and
   the connector is not paused: it asks again and a new card comes, under the same prompt) or ends it with `turn_end` `error: "connector_restarted"`, so a phone stops waiting; prompts queued
@@ -109,6 +114,8 @@ record it.
 - A user whose several machines are all offline is told in Chinese to run the restart command on each of them (每台机器), not on
   "that machine". A pairing claimed but not registered yet holds its name: two machines of one hostname claimed one after the
   other, before either registered, no longer both get the same alternate name.
+- A card the assistant puts to the user itself (a comment drafted with `github_comment`, a scheduled task) is published to the session
+  with the turn that proposed it, so a client following the session shows it as the answer to that message.
 - "连接我的开发环境" from someone whose machines are all offline answers, in one reply, how to bring the offline machine back
   (`claw-connector service install` on it) and the one-line pairing command for a new machine. devenv_list with every machine
   offline now carries `connect_a_machine` with `all_offline: true`: its `text` is the restart line, then the pairing command (or,

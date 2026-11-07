@@ -217,7 +217,7 @@ export async function proposeConfirmation(
   if (!row) return { row: (await q(SAME_CARD_SQL, [dedupeKey])).rows[0] as Record<string, any>, announce: null, subscribers: 0 };
   const ref = confirmationRef(id);
   const card = await recordWriteConfirm(q, {
-    userId, sessionId: claims.sid, text: render.text(ref),
+    userId, sessionId: claims.sid, text: render.text(ref), turnMessageId: claims.mid,
     confirm: {
       confirmation_id: id, ref, kind, allow_label: render.allowLabel, expires_at: new Date(row.expires_at).toISOString(),
     },

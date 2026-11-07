@@ -30,7 +30,7 @@ import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import { reviewMemoryBlock, routerMemoryParts, workerMemoryBlock } from "./memory-tools.js";
 import {
   ASSISTANT_MCP_SERVER, confirmationRef, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
-  ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderModelChoice,
+  ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, ROUTER_DISCIPLINE_PROMPT_VERSION, WORKER_DISCIPLINE_PROMPT_VERSION, renderModelChoice,
   renderObserverSystem, renderReviewState, renderRouterItems, renderRouterPrompt, renderWorkerSystem, withTurnState,
   ROUTER_DEVENV_PROMPT_VERSION, renderAttachedState, renderRouterDevenvSection,
   type AskedOfOtherLine, type ManifestItem,
@@ -55,6 +55,7 @@ import { remoteManifest } from "./remote-items.js";
 import { renderRouterSelfSection, ROUTER_SELF_PROMPT_VERSION, selfStatusOn } from "./self-status.js";
 import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
+import { disciplineOn } from "./discipline.js";
 import { applyRouterTurnSpeed } from "./router-speed.js";
 import { routerCite } from "./citations.js";
 
@@ -302,7 +303,11 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // The system prompt is the same on every turn, so it and the history after it come from the prompt cache. What changes
     // from turn to turn (the item list, what waits for the user, what the channel sent) goes with the message instead.
     const github = lookups.githubTools.length > 0;
-    withSystemAppend(task, renderRouterPrompt({ servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null, githubBinding: readGithubMcpSettings().binding }));
+    // The routing discipline (`discipline.ts`): per user while it is a canary, so the prompt stays the same from turn to turn for each.
+    const discipline = disciplineOn(role.userId);
+    withSystemAppend(task, renderRouterPrompt(
+      { servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null, githubBinding: readGithubMcpSettings().binding }, { discipline },
+    ));
     // What it writes itself (a document, a draft, a translation), and how a file or a comment of its reaches the user (`writing-prompt.ts`).
     withSystemAppend(task, renderRouterWritingSection({ comment: assistantSchedulesOn() }));
     const state = [renderRouterItems(await routerManifest(role.userId), await askedOfOthersManifest(role.userId))];
@@ -375,6 +380,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       ...(devenv ? { devenv: ROUTER_DEVENV_PROMPT_VERSION } : {}),
       read: ROUTER_READ_PROMPT_VERSION, write: ROUTER_WRITING_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),
       ...(cite ? { cite: ROUTER_CITE_PROMPT_VERSION } : {}), self: ROUTER_SELF_PROMPT_VERSION, selfStatus: self,
+      ...(discipline ? { discipline: ROUTER_DISCIPLINE_PROMPT_VERSION } : {}),
     }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);
@@ -383,14 +389,15 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // With model choice on, the worker's session holds the model chosen for its item (`model-choice.ts`), and the deployment's worker
     // model only fills in for a session that names none. Off, it is every worker turn's model, as it always was.
     if (CLAW_ASSISTANT_WORKER_MODEL && !(modelChoiceOn() && stringField(task, "model"))) task.model = CLAW_ASSISTANT_WORKER_MODEL;
-    withSystemAppend(task, renderWorkerSystem({ seq: started.seq, title: started.title }));
+    const discipline = disciplineOn(role.userId);
+    withSystemAppend(task, renderWorkerSystem({ seq: started.seq, title: started.title }, { discipline }));
     // A worker does its item's work in the sandbox, so Brain opens it beside the turn's first model call rather than after it.
     task.sandbox_prestart = true;
     // A write it holds, or a question it asks, waits for a person who is told on their channel and may be away: not Brain's minutes.
     if (CLAW_ASSISTANT_DECISION_WAIT_SEC > 0) task.decision_wait_ms = CLAW_ASSISTANT_DECISION_WAIT_SEC * 1000;
     const memory = await workerMemoryBlock(role.userId, started.itemId, sessionId);
     if (memory) withSystemAppend(task, memory);
-    logger.info({ sessionId, taskId, itemId: started.itemId, generation: started.generation, prompt: WORKER_PROMPT_VERSION }, "assistant.worker_turn");
+    logger.info({ sessionId, taskId, itemId: started.itemId, generation: started.generation, prompt: discipline ? WORKER_DISCIPLINE_PROMPT_VERSION : WORKER_PROMPT_VERSION }, "assistant.worker_turn");
   }
 
   // Replaces a server of the same name that the request carried: the user's own session config must not

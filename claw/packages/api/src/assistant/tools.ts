@@ -37,6 +37,7 @@ import { redactCommandSecrets } from "../notifications/approval-target.js";
 import { assistantPluginId } from "./read-tools.js";
 import { requestedItemOf, requesterViewOf, routerView, type RequesterView } from "./requester-view.js";
 import { parseReport } from "./report.js";
+import { disciplineAnywhere, disciplineOn, readyWithoutRefs, secretReadRefusal, secretReadTarget } from "./discipline.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import {
   assertAllowedModel, isAllowedModel, modelAnswer, modelChoiceOn, ModelChoiceRefused, modelParams, resolveItemModel, writeModelPrefs, type ResolvedModel,
@@ -425,6 +426,11 @@ export async function workCreate(
   const created = await inTransaction(async (query) => {
     const q = { query };
     const { userId } = await assertLiveRun(query, claims);
+    // A task that would read the user's keys or credentials is never an item, whatever it is said to be for (`discipline.ts`).
+    if (disciplineOn(userId)) {
+      const secret = secretReadTarget(`${title}\n${brief}`);
+      if (secret) throw new ToolRefused("refused_secret_read", secretReadRefusal(secret));
+    }
     // The lock `insertWorkItem` takes, taken first: two calls for one title meet here, and the second sees the first's item.
     await query("SELECT 1 FROM claw_assistants WHERE session_id = $1 FOR UPDATE", [claims.sid]);
     const same = (await query(
@@ -816,12 +822,23 @@ export async function workRecall(
 
 // --- Worker ---------------------------------------------------------------------------
 
+/** The user whose item a worker reports on. */
+async function itemOwner(itemId: string): Promise<string | null> {
+  const row = (await db.query("SELECT user_id FROM claw_work_items WHERE item_id = $1", [itemId])).rows[0] as { user_id: string } | undefined;
+  return row?.user_id ?? null;
+}
+
 export async function report(
   claims: AssistantTokenClaims, args: unknown,
 ): Promise<{ ok: true; status: string; item_state: string }> {
   requireRole(claims, "worker");
   const parsed = parseReport(args);
   if (!parsed.ok) throw new ToolRefused("invalid_report", parsed.error);
+  // Only a change outside waits for the user's Accept: a ready report that names none is refused, so the worker answers instead.
+  const noRefs = readyWithoutRefs(parsed.report);
+  if (noRefs && disciplineAnywhere() && disciplineOn(await itemOwner(claims.item_id as string))) {
+    throw new ToolRefused("invalid_report", noRefs);
+  }
   const outcome = await ingestReport({
     itemId: claims.item_id as string, workerSessionId: claims.sid,
     generation: claims.gen as number, runId: claims.task_id,

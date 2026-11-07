@@ -1025,7 +1025,7 @@ export async function recordActionConfirm(
  * confirmation: `null` when it was stored before. `announce` after the commit.
  */
 export async function recordWriteConfirm(
-  q: Querier, input: { userId: string; sessionId: string; text: string; confirm: AssistantConfirmWrite }, deps: SayDeps = {},
+  q: Querier, input: { userId: string; sessionId: string; text: string; confirm: AssistantConfirmWrite; turnMessageId?: string }, deps: SayDeps = {},
 ): Promise<{ sayId: string; subscribers: number; announce: () => Promise<void> } | null> {
   const stored = await store(q, {
     type: "assistant.say", fallback: true, item: null, confirmWrite: input.confirm,
@@ -1033,7 +1033,11 @@ export async function recordWriteConfirm(
     userId: input.userId, sessionId: input.sessionId, text: input.text,
   });
   if (!stored) return null;
-  return { sayId: stored.sayId, subscribers: stored.subscribers, announce: () => announce(stored, deps) };
+  // The card's session event names the turn that proposed it, as that turn's says do: whoever follows the session (the web client, an
+  // evaluation) sees the card as the answer to that message (G0 2026-11-07, cat-github-wr-001: a github_comment card was stored and
+  // shown, and read as no card because its event named no turn). Only the event: the delivery's payload, which `turnFirstSay` matches
+  // a later say against, is unchanged.
+  return { sayId: stored.sayId, subscribers: stored.subscribers, announce: () => announce(stored, deps, input.turnMessageId) };
 }
 
 /** An item closed by its answer, recently enough that saying it still helps (over `claw_work_items w`). */
