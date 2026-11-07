@@ -457,9 +457,26 @@ export class Session {
         const startedAt = new Date().toISOString();
         this.env.store.beginTurn({ session_id: this.id, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, started_at: startedAt });
         this.env.store.patch(this.id, { used_at: startedAt });
-        await this.env.store.flushed(2_000);
+        const recorded = await this.env.store.flushed(2_000);
         next.started();
-        if (this.closed || this.stopping) { this.terminalTurn = null; this.env.store.endTurn(this.id); continue; }
+        const turn = this.terminalTurn;
+        // Everything asked again after that wait, right before the keys go: a cancel or a close meanwhile, a record that did not
+        // reach the disk (a restart could not end this turn), and the terminal itself (someone may have started typing, a menu may
+        // be open now). Each ends the turn by name and types nothing.
+        const giveUp = (reason: string | null) => {
+          if (this.terminalTurn === turn) this.terminalTurn = null;
+          // (Going away: the record stays, and the next run ends this turn by name.)
+          if (!this.stopping) this.env.store.endTurn(this.id);
+          if (reason === null) return;
+          this.audit("terminal_input_refused", { reason, cmd_id: next.cmdId });
+          this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq);
+          this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq });
+        };
+        if (this.closed || this.stopping || !turn || this.terminalTurn !== turn) { giveUp(null); continue; }
+        if (!recorded) { giveUp("terminal_input_failed"); continue; }
+        const again = await term.readiness();
+        if (!again.ready || this.holderStatus(term) !== "idle") { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
+        if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }
         try {
           await term.type(text);
         } catch (e) {
