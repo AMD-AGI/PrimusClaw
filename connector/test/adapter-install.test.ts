@@ -215,3 +215,15 @@ describe("pinned adapters", () => {
     assert.ok(fs.existsSync(path.join(adaptersDir(dirs.state), "@claw-test+fake-acp@1.0.0")));
   });
 });
+
+describe("what npm is given", () => {
+  test("never the agents' sign-in variables, only npm's own settings and token", async () => {
+    const { npmEnv } = await import("../src/adapter-install.js");
+    const env = npmEnv({
+      PATH: "/bin", HOME: "/h", HTTPS_PROXY: "http://p:3128", npm_config_registry: "https://r", NPM_TOKEN: "npm-t", NODE_AUTH_TOKEN: "n-t",
+      ANTHROPIC_API_KEY: "sk-a", OPENAI_API_KEY: "sk-o", ANTHROPIC_AUTH_TOKEN: "t", ANTHROPIC_CUSTOM_HEADERS: "x-api-key: h", GW_TOKEN_X: "g",
+      AWS_SECRET_ACCESS_KEY: "s", CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000", ANTHROPIC_BASE_URL: "https://gw",
+    });
+    assert.deepEqual(Object.keys(env).sort(), ["ANTHROPIC_BASE_URL", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "HOME", "HTTPS_PROXY", "NODE_AUTH_TOKEN", "NPM_TOKEN", "PATH", "npm_config_registry"]);
+  });
+});

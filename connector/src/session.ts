@@ -415,14 +415,26 @@ export class Session {
       } else {
         if (!this.acpId) throw new SessionRefusal("adapter_cannot_resume", "no adapter session to resume");
         const caps = adapter.caps.sessionCapabilities as AcpParams | undefined;
-        if (caps?.resume) {
-          // `resume` does not replay the history, and the adapter's own settings apply again: the mode is re-locked below.
-          this.absorb(await this.signedIn(adapter, () => adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) })));
-        } else if (adapter.caps.loadSession) {
-          this.replaying = true;
-          try { this.absorb(await this.signedIn(adapter, () => adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }))); } finally { this.replaying = false; }
-        } else {
-          throw new SessionRefusal("adapter_cannot_resume", "the adapter can neither resume nor load a session");
+        try {
+          if (caps?.resume) {
+            // `resume` does not replay the history, and the adapter's own settings apply again: the mode is re-locked below.
+            this.absorb(await this.signedIn(adapter, () => adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) })));
+          } else if (adapter.caps.loadSession) {
+            this.replaying = true;
+            try { this.absorb(await this.signedIn(adapter, () => adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }))); } finally { this.replaying = false; }
+          } else {
+            throw new SessionRefusal("adapter_cannot_resume", "the adapter can neither resume nor load a session");
+          }
+        } catch (e) {
+          if (!this.neverPrompted(e)) throw e;
+          // Opened and never sent a message: the agent wrote nothing yet (Claude keeps a conversation only from its first
+          // message), so there is nothing to resume and nothing to lose. A fresh one takes its place, in the same folder.
+          const res = await this.signedIn(adapter, () => adapter.request("session/new", { cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }));
+          if (typeof res.sessionId !== "string") throw new SessionRefusal("adapter_protocol", "session/new returned no session id");
+          this.audit("session_recreated", { was: this.acpId, now: res.sessionId, why: errMessage(e).slice(0, 200) });
+          this.acpId = res.sessionId;
+          this.absorb(res);
+          this.env.store.patch(this.id, { acp_session_id: this.acpId });
         }
       }
       await this.enforceMode(this.targetMode);
@@ -469,6 +481,16 @@ export class Session {
   private async refuseSignedOut(adapter: AdapterProcess): Promise<void> {
     const st = await adapter.waitAuthStatus(this.env.timing.authWaitMs);
     if (st?.kind === "none") throw new SessionRefusal("agent_auth_required", `the agent reports that it is not signed in${st.label ? ` (${st.label})` : ""}`);
+  }
+
+  /**
+   * The adapter cannot find the conversation to resume, and this session never had a message: its own (non-takeover)
+   * agent never wrote one. Any other failure, or a session that was used, keeps its error.
+   */
+  private neverPrompted(e: unknown): boolean {
+    if (this.agent.attach || e instanceof SessionRefusal) return false;
+    if (this.env.store.get(this.id)?.used_at) return false;
+    return /not found|no (?:such )?(?:session|conversation)/i.test(errMessage(e));
   }
 
   /** Take the modes and the mode config option out of a `session/new|resume|load` answer. */

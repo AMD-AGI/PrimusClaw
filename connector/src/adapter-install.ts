@@ -63,9 +63,24 @@ function isExecutable(f: string): boolean {
   try { fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile(); } catch { return false; }
 }
 
-export const npmInstaller: Installer = ({ dir, spec, env, timeoutMs }) => new Promise((resolve, reject) => {
+/** Named like a credential (a count of tokens is not one). */
+const SECRET_NAME = /KEY|TOKEN(?!S)|SECRET|PASSWORD|CREDENTIAL|AUTH|COOKIE|HEADERS/i;
+/** What npm itself may need to reach a private registry: its own settings and the token an ~/.npmrc names. */
+const NPM_OWN = /^(?:npm_config_|NPM_CONFIG_|NPM_TOKEN$|NODE_AUTH_TOKEN$)/;
+
+/**
+ * The environment npm runs in: the adapter's, without the agents' sign-in variables (ANTHROPIC_API_KEY, OPENAI_API_KEY,
+ * a gateway token, anything named like a credential that is not npm's own). An install runs the lifecycle scripts of
+ * the adapter and every dependency; none of them needs a model key, so none of them is given one.
+ */
+export function npmEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([k]) => NPM_OWN.test(k) || !SECRET_NAME.test(k) || k === "SSH_AUTH_SOCK"));
+}
+
+export const npmInstaller: Installer = ({ dir, spec, env: adapterEnv, timeoutMs }) => new Promise((resolve, reject) => {
   const args = ["install", "--prefix", dir, "--no-save", "--no-package-lock", "--no-audit", "--no-fund", "--omit=dev", "--loglevel=error", spec];
   let out = "";
+  const env = npmEnv(adapterEnv);
   // cwd is the empty install directory: no project .npmrc applies; the user's own ~/.npmrc and npm_config_* do.
   const p = spawn(npmCommand(env), args, { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32", timeout: timeoutMs, killSignal: "SIGKILL" });
   const keep = (d: Buffer) => { out = (out + d.toString("utf8")).slice(-2000); };

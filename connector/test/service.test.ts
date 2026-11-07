@@ -192,6 +192,32 @@ describe("the units", () => {
     assert.equal(cronDaemonRunning(proc), true);
   });
 
+  test("a crontab that cannot be written is said as such, with the lines, not as a machine without cron", async () => {
+    const home = tmpdir();
+    writeConfig(home, tmpdir("w-"));
+    await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
+    fs.mkdirSync(ctx(home).c.dirs.state, { recursive: true });
+    const { processStart } = await import("../src/children.js");
+    fs.writeFileSync(supervisorPidFile(ctx(home).c.dirs), JSON.stringify({ pid: process.ppid, start: processStart(process.ppid) }));
+    const a = ctx(home, { service: { ...D({ systemdBooted: () => false }), readCrontab: () => "", writeCrontab: () => false } }, { PATH: "/bin" });
+    assert.equal(await main(["service", "install"], a.c), EXIT.ok, a.errText());
+    assert.match(a.errText(), /could not write your crontab/);
+    assert.match(a.errText(), /\*\/5 \* \* \* \* sh .*keepalive\.sh/);
+    assert.doesNotMatch(a.text(), /No cron daemon runs here/);
+    fs.rmSync(supervisorPidFile(a.c.dirs));
+  });
+
+  test("the container-home note reads only the mount table, never a mount itself", () => {
+    const mounts = readMounts("100 1 0:50 / / rw - overlay overlay rw\n101 100 0:60 / /mnt/never-answers rw - nfs4 host:/x rw\n");
+    const realAccess = fs.accessSync;
+    const realReal = fs.realpathSync;
+    (fs as { accessSync: unknown }).accessSync = () => { throw new Error("a stalled mount was touched"); };
+    (fs as { realpathSync: unknown }).realpathSync = () => { throw new Error("a stalled mount was touched"); };
+    try {
+      assert.match(ephemeralWhere("/root/.config/claw-connector", mounts) ?? "", /\/mnt\/never-answers/);
+    } finally { (fs as { accessSync: unknown }).accessSync = realAccess; (fs as { realpathSync: unknown }).realpathSync = realReal; }
+  });
+
   test("a terminal's own session variables, and a value that spans lines, are not carried", () => {
     const c = carriedEnv({ PATH: "/bin", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SSE_PORT: "1", CLAUDE_CODE_SESSION_ID: "s", CODEX_SANDBOX: "seatbelt", CODEX_THREAD_ID: "t",
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000", ANTHROPIC_MODEL: "a\nb" });
@@ -200,12 +226,12 @@ describe("the units", () => {
     assert.deepEqual(c.withheld, ["ANTHROPIC_MODEL"]);
   });
 
-  test("Codex's env_key names count as the agents' sign-in variables", () => {
+  test("Codex's env_key names count as the agents' sign-in variables", async () => {
     const home = tmpdir("ch-");
     fs.mkdirSync(path.join(home, ".codex"));
     fs.writeFileSync(path.join(home, ".codex", "config.toml"), `model_provider = "gw"\n[model_providers.gw]\nbase_url = "https://gw"\nenv_key = "GW_TOKEN_X"\n`);
-    assert.deepEqual(codexEnvKeys({}, home), ["GW_TOKEN_X"]);
-    assert.deepEqual(codexEnvKeys({ CODEX_HOME: path.join(home, "nope") }, home), []);
+    assert.deepEqual(await codexEnvKeys({}, home), ["GW_TOKEN_X"]);
+    assert.deepEqual(await codexEnvKeys({ CODEX_HOME: path.join(home, "nope") }, home), []);
   });
 
   test("a uid with no passwd entry still gets a name (os.userInfo throws ENOENT there)", () => {

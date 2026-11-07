@@ -172,6 +172,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
     case "session/resume": case "session/load": {
       // A sign-in that lapsed before an existing session comes back (Codex's resume needs one).
       if (env.FAKE_RESUME_AUTH === "1") return fail(id, -32000, "Authentication required");
+      // What claude-agent-acp answers for a session that never had a message: it kept nothing to resume.
+      if (env.FAKE_RESUME_NOT_FOUND === "1" && !sessions.has(params.sessionId)) return fail(id, -32002, "Resource not found");
       const s = sessions.get(params.sessionId) ?? { cwd: params.cwd, mode: START_MODE, cancelled: false };
       sessions.set(params.sessionId, s);
       // The trap measured on a real adapter: resuming puts the user's own configured mode back.

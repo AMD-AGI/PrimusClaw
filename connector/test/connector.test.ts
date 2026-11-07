@@ -1303,3 +1303,38 @@ describe("read-only agents", () => {
     assert.deepEqual(caps.read_only_modes, ["ask", "plan"]);
   });
 });
+
+describe("a session opened and never used, across a restart", () => {
+  test("its conversation cannot be found (nothing was written): a fresh one takes its place in the same folder, and the message runs", async () => {
+    const h = await make({ env: { FAKE_RESUME_NOT_FOUND: "1" } });
+    const sid = await h.newSession();
+    const before = h.claw.eventsOf(sid, "session_started")[0]!.data.acp_session_id;
+    await h.stop();
+    h.connect();
+    h.start();
+    h.prompt(sid, "say hello");
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.stopReason, "end_turn", JSON.stringify(end.data));
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0);
+    assert.ok(h.messages(sid).includes("hello"));
+    const methods = h.adapterLog().map((l) => l.method).filter(Boolean);
+    assert.ok(methods.lastIndexOf("session/new") > methods.indexOf("session/resume"), "a new session after the resume that found nothing");
+    void before;
+    const { auditFile } = await import("../src/paths.js");
+    assert.match(fs.readFileSync(auditFile(h.dirs), "utf8"), /"session_recreated"/);
+  });
+
+  test("a session that was used keeps the old answer: a conversation the agent cannot find is an error, not silently replaced", async () => {
+    const h = await make({ env: { FAKE_RESUME_NOT_FOUND: "1" } });
+    const sid = await h.newSession();
+    h.prompt(sid, "say first");
+    await h.turnEnd(sid);
+    await h.stop();
+    h.connect();
+    h.start();
+    h.prompt(sid, "say again");
+    const end = await h.turnEnd(sid, 2);
+    assert.equal(end.data.stopReason, "error");
+    assert.ok(!h.adapterLog().slice(-5).some((l) => l.method === "session/new"));
+  });
+});

@@ -246,7 +246,8 @@ async function installAdapters(ctx: Ctx, initFallback: boolean): Promise<void> {
   const store = adapterStore();
   if (!store || !ctx.installAdapters) return;
   let agents: Array<{ command: string; args: string[]; env: Record<string, string> }>;
-  try { agents = loadCfg(ctx).agents; } catch {
+  // The configuration as written, without the sign-in variables the service keeps: npm is never given those.
+  try { agents = loadConfig(configFile(ctx.dirs), { hostname: ctx.hostname ?? os.hostname() }).agents; } catch {
     if (!initFallback) return;
     agents = SAMPLE_ACTIVE.map((id) => ({ command: PRESETS[id]!.command, args: PRESETS[id]!.args, env: {} }));
   }
