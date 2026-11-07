@@ -111,8 +111,11 @@ function pageOf(text: string): Page | null {
   } catch {
     return null;
   }
-  if (!v || typeof v !== "object" || !Array.isArray((v as { items?: unknown }).items)) return null;
-  const items = (v as { items: unknown[] }).items.filter((i): i is Record<string, unknown> => !!i && typeof i === "object");
+  if (!v || typeof v !== "object") return null;
+  // SaFE writes an empty page as `{"items": null, "totalCount": 0}`: a workspace with nothing that matches, not a failure.
+  const raw = (v as { items?: unknown }).items;
+  if (!Array.isArray(raw) && !(raw === null && (v as { totalCount?: unknown }).totalCount === 0)) return null;
+  const items = (raw ?? []).filter((i): i is Record<string, unknown> => !!i && typeof i === "object");
   const tc = (v as { totalCount?: unknown }).totalCount;
   return { items, totalCount: typeof tc === "number" && Number.isSafeInteger(tc) && tc >= 0 ? tc : items.length };
 }

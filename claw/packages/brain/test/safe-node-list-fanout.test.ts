@@ -6,7 +6,8 @@
  * nodes (measured 2026-11-07 for a default-role member of crusoe-spur-vk and global-cpu: `{"items": null, "totalCount": 0}`, while
  * `workspace_id: global-cpu` answers 6), so the person was told SaFE has no nodes (E229).
  *
- *   NL1 a member's unscoped node list is read per workspace of user_self, filters kept; `limit: -1` (every node) is not cut
+ *   NL1 a member's unscoped node list is read per workspace of user_self, filters kept; `limit: -1` (every node) is not cut; a
+ *       workspace's empty page (`items: null`) is a count of 0, not a failed workspace
  *   NL2 an admin's non-empty unscoped list, and any call that names a workspace, is one call answered as the server answered it
  *   NL3 an empty answer with an unreadable user_self keeps the empty answer, not an error, and says it does not mean "no nodes"
  *   NL4 an empty workload list (200) is not read again: only the node list treats an empty answer as unscoped
@@ -71,6 +72,16 @@ test("NL1 a member's unscoped node list is read per workspace; limit -1 returns 
   const r = JSON.parse(await callWithWorkspaceFanout(ready.client, NAME, "node_list", { phase: "SSHFailed", limit: 1 }));
   assert.equal(r.totalCount, 1, "a filter is kept per workspace");
   assert.deepEqual(r.items.map((n: { nodeId: string }) => n.nodeId), ["autopilot-g2"]);
+  assert.equal(r.complete, true, "a workspace with no matching node (SaFE's items: null) is read, not failed");
+  assert.equal(r.workspaces_failed, undefined);
+
+  // Nothing matches anywhere: an answer of 0 across every workspace, not an error.
+  const o3 = { isError: false };
+  const none = JSON.parse(await callWithWorkspaceFanout(fakeSafe({ self: ["crusoe-spur-vk", "global-cpu"], ws: WS }).client, NAME, "node_list", { phase: "Managing" }, o3));
+  assert.equal(o3.isError, false);
+  assert.equal(none.totalCount, 0);
+  assert.equal(none.complete, true);
+  assert.equal(none.workspaces.length, 2);
 
   // More nodes than SaFE's default page: -1 still means every one, not the first 100.
   const big = fakeSafe({ self: ["a", "b"], ws: { a: Array.from({ length: 90 }, (_, i) => node(`a${i}`)), b: Array.from({ length: 40 }, (_, i) => node(`b${i}`)) } });
