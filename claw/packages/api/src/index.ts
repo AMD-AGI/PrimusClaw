@@ -45,7 +45,7 @@ import { registerTriggerMcpRoutes } from "./triggers/mcp.js";
 import { assertTriggerToolsConfig } from "./triggers/token.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
 import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
-import { startNotificationWorker } from "./notifications/outbox.js";
+import { startNotificationWorker, stopNotificationDelivery } from "./notifications/outbox.js";
 import { registerAssistantDeliveryHook } from "./assistant/outbound.js";
 import { registerHoldDeliveryHook } from "./assistant/holds.js";
 import { a2aPushEnabled } from "./routes/a2a-flags.js";
@@ -306,6 +306,8 @@ async function main() {
     delayMs: SHUTDOWN_DELAY_MS,
     closeServer: () => app.close(),
     steps: [
+      // Before the pools end: what this process claimed to deliver is sent or handed back, and it claims nothing more.
+      { name: "notifications", run: () => stopNotificationDelivery() },
       { name: "nats", run: async () => { await natsConnection?.drain(); } },
       { name: "db", run: () => Promise.all([db.pool.end(), db.lockPool.end()]) },
     ],
