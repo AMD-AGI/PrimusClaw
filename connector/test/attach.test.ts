@@ -771,6 +771,15 @@ describe("the conversations already on the machine show up by themselves", () =>
     assert.deepEqual(ids(`[[agents]]\nid = "x"\npreset = "codex"\nroots = ["${root}"]\n`), [["x", "codex", null]], "only Claude");
     assert.throws(() => parseConfig(`[[agents]]\nid = "x"\npreset = "codex"\nexisting_sessions = true\nroots = ["${root}"]\n`), /existing_sessions only applies/);
     assert.throws(() => parseConfig(claude(`existing_sessions = "no"\n`)), /existing_sessions must be true or false/);
+    const same = path.join(os.homedir(), ".claude-same-test");
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = same;
+    try {
+      assert.deepEqual(ids(`${claude()}\n[[agents]]\nid = "mine"\npreset = "claude-attach"\nroots = ["${root}"]\n[agents.env]\nCLAUDE_CONFIG_DIR = "${same}/"\n`).map((r) => r[0]),
+        ["cc", "mine"], "the same directory spelled differently (the connector's default here, written out there) is the same directory");
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev;
+    }
     assert.ok(parseConfig(claude("", "a".repeat(64))).agents[1]!.id.length <= 64);
   });
 
@@ -827,5 +836,33 @@ describe("the conversations already on the machine show up by themselves", () =>
     const row = hb.agents[0].capabilities.resumable.find((r: any) => r.ref === REF2);
     assert.deepEqual([row.title, row.state, row.activity, row.waiting_for], ["Just opened", "live", "waiting", "input needed"]);
     await stop(term);
+  });
+
+  test("so is one a terminal ran and already ended (claude -p): a new transcript in a project folder inside the roots", async () => {
+    const work = tmpdir("cc-work-");
+    const real = fs.realpathSync(work);
+    const listFile = path.join(tmpdir("cc-list-"), "sessions.json");
+    const old = { sessionId: REF, cwd: work, title: "Old one", updatedAt: "2026-10-29T10:00:00.000Z" };
+    fs.writeFileSync(listFile, JSON.stringify([old]));
+    const h = await Harness.create({
+      work, env: { FAKE_SESSIONS_FILE: listFile }, attach: { sessions: [] }, timing: { heartbeatMs: 60_000, sessionsWatchMs: 100, catalogMs: 600_000 }, start: false,
+    });
+    hs.push(h);
+    const project = path.join(h.attachDir, "projects", real.replace(/[^A-Za-z0-9]/g, "-"));
+    fs.mkdirSync(project, { recursive: true });
+    fs.writeFileSync(path.join(project, `${REF}.jsonl`), "{}\n");
+    h.start();
+    await h.claw.until("the first heartbeat", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
+    await new Promise((r) => setTimeout(r, 400));
+    const before = h.claw.heartbeats.length;
+    // Appending to a transcript is no new conversation and lists nothing again.
+    fs.appendFileSync(path.join(project, `${REF}.jsonl`), "{}\n");
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(h.claw.heartbeats.length, before, "nothing changed that the phone is shown");
+    fs.writeFileSync(listFile, JSON.stringify([{ sessionId: REF2, cwd: work, title: "Ran and ended", updatedAt: "2026-10-29T11:00:00.000Z" }, old]));
+    fs.writeFileSync(path.join(project, `${REF2}.jsonl`), "{}\n");
+    const hb = await h.claw.until("a heartbeat with the ended conversation", () => h.claw.heartbeats.slice(before)
+      .find((b) => b.agents[0].capabilities.resumable?.some((r: any) => r.ref === REF2)), 5_000);
+    assert.deepEqual(hb.agents[0].capabilities.resumable.map((r: any) => [r.title, r.state]), [["Ran and ended", "idle"], ["Old one", "idle"]]);
   });
 });

@@ -101,6 +101,8 @@ const MAX_TITLE = 80;
 const MAX_WAITING_FOR = 60;
 /** A conversation the list does not know yet is listed again at most this often (it starts an adapter). */
 const UNKNOWN_RELIST_MS = 20_000;
+/** Project folders looked at by {@link AttachSupport.poll}. */
+const MAX_WATCHED_PROJECT_DIRS = 200;
 const MAX_SCANNED_PROJECT_DIRS = 2000;
 /** A registry file that does not parse is ignored once it is this old; a younger one may be mid-write. */
 const UNREADABLE_GRACE_MS = 60_000;
@@ -268,31 +270,67 @@ export class AttachSupport {
    * is written when a terminal opens a conversation, rewritten when it starts or finishes a turn or starts waiting, and
    * removed when it exits) and of its projects directory (a new working directory). True when something changed since
    * the previous look, so that the caller reports at once rather than at the next heartbeat. A live conversation inside
-   * the roots whose transcript exists but which the list does not have yet (a terminal just opened it) is listed again
-   * first, at most every {@link UNKNOWN_RELIST_MS}. The first look only learns what is there.
+   * the roots whose transcript exists but which the list does not have yet (a terminal just opened it), or a new transcript
+   * in a project folder inside the roots (one a terminal ran and already ended), is listed again first, at most every
+   * {@link UNKNOWN_RELIST_MS} (a change inside that time is listed when it is up). The first look only learns what is there.
    */
   async poll(): Promise<boolean> {
     const print = this.fingerprint();
-    if (print === this.lastPrint) return false;
+    const projects = this.projectsPrint();
+    if (print === this.lastPrint && projects === this.lastProjects && !this.relistDue) return false;
     const first = this.lastPrint === null;
+    const looked = print !== this.lastPrint || projects !== this.lastProjects;
+    // A new transcript in a project folder inside the roots: a conversation was started there (one a terminal ran and
+    // already ended, `claude -p`, is in no registry). Appending to a transcript does not change its folder.
+    const newTranscript = !first && projects !== this.lastProjects;
     this.lastPrint = print;
+    this.lastProjects = projects;
     let rows: LiveEntry[] | null;
     try { rows = readRegistry(this.configDir, this.localDomain, this.now()); } catch { rows = null; }
-    if (!first && rows && this.now() - this.lastUnknownList >= UNKNOWN_RELIST_MS && this.unlistedLive(rows)) {
+    // Once per change: a list that still lacks the conversation afterwards is not asked again until something changes. The
+    // first look asks too, for a terminal opened between the list made at start and this look.
+    if (looked && (newTranscript || (rows !== null && this.unlistedLive(rows)))) this.relistDue = true;
+    let relisted = false;
+    if (this.relistDue && this.now() - this.lastUnknownList >= UNKNOWN_RELIST_MS) {
+      this.relistDue = false;
       this.lastUnknownList = this.now();
-      await within(this.refreshCatalog().then(() => true), 60_000, false);
+      relisted = await within(this.refreshCatalog().then(() => true), 60_000, false);
     }
     // Only a change in what the phone is shown is worth a report: a file rewritten with the same status is not.
-    const summary = rows === null ? "unreadable" : this.listed.slice(0, MAX_REPORTED).map((l) => {
-      const holders = rows!.filter((e) => e.sessionId.toLowerCase() === l.ref);
+    // (A registry that cannot be read, or is not there yet, still lets a new conversation in the list count as a change.)
+    const summary = (rows === null ? "unreadable;" : "") + this.listed.slice(0, MAX_REPORTED).map((l) => {
+      const holders = (rows ?? []).filter((e) => e.sessionId.toLowerCase() === l.ref);
       return `${l.ref}:${holders.length ? (liveActivity(holders).activity ?? "live") : "-"}:${liveActivity(holders).waiting_for ?? ""}`;
     }).join(",");
     const changed = summary !== this.lastSummary;
     this.lastSummary = summary;
-    return !first && changed;
+    return changed && (!first || relisted);
   }
 
   private lastSummary = "";
+  private lastProjects: string | null = null;
+  /** A change asked for a new list that the rate limit has held back; the next look makes it. */
+  private relistDue = false;
+
+  /**
+   * The project folders inside the roots (Claude Code names one after the working directory, every non-alphanumeric
+   * turned into "-") with their modification times: one changes when a conversation is started in it. At most
+   * {@link MAX_WATCHED_PROJECT_DIRS} of them, so a huge config directory is not walked every few seconds.
+   */
+  private projectsPrint(): string {
+    const projects = path.join(this.configDir, "projects");
+    const prefixes = this.agent.roots.map((r) => r.replace(/[^A-Za-z0-9]/g, "-"));
+    const parts: string[] = [];
+    try {
+      parts.push(`projects:${fs.statSync(projects).mtimeMs}`);
+      for (const name of fs.readdirSync(projects).sort()) {
+        if (!prefixes.some((p) => name.startsWith(p))) continue;
+        if (parts.length > MAX_WATCHED_PROJECT_DIRS) break;
+        try { parts.push(`${name}:${fs.statSync(path.join(projects, name)).mtimeMs}`); } catch { /* removed meanwhile */ }
+      }
+    } catch { parts.push("no-projects"); }
+    return parts.join("|");
+  }
 
   private fingerprint(): string {
     const parts: string[] = [];
@@ -303,7 +341,6 @@ export class AttachSupport {
         try { parts.push(`${name}:${fs.statSync(path.join(dir, name)).mtimeMs}`); } catch { /* removed meanwhile */ }
       }
     } catch { parts.push("no-sessions"); }
-    try { parts.push(`projects:${fs.statSync(path.join(this.configDir, "projects")).mtimeMs}`); } catch { parts.push("no-projects"); }
     return parts.join("|");
   }
 

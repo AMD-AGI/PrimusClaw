@@ -258,7 +258,8 @@ export const EXISTING_SESSIONS_SUFFIX = "-sessions";
  */
 function existingSessionAgents(rawAgents: unknown[], agents: AgentConfig[], problems: string[]): AgentConfig[] {
   const out: AgentConfig[] = [];
-  const configDir = (a: AgentConfig) => a.env.CLAUDE_CONFIG_DIR ?? "";
+  // The directory each agent will actually read, as AttachSupport resolves it: its own setting, else the connector's, else ~/.claude.
+  const configDir = (a: AgentConfig) => path.resolve(expandHome(a.env.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude")));
   const ids = new Set(agents.map((a) => a.id));
   for (const raw of rawAgents) {
     if (!isObject(raw) || typeof raw.id !== "string") continue;

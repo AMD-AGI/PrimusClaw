@@ -407,14 +407,14 @@ export class Connector {
   /** Report a change in the conversations on this machine (see {@link ConnectorTiming.sessionsWatchMs}) without waiting for the heartbeat. */
   private async sessionsWatcher(): Promise<void> {
     if (this.attach.size === 0) return;
+    // The first look is taken at once, so that what changes between the list made at start and the next look is seen.
     while (!this.ctl.signal.aborted) {
-      try { await sleep(this.timing.sessionsWatchMs, this.ctl.signal); } catch { break; }
-      if (this.ctl.signal.aborted) break;
       let changed = false;
       for (const support of this.attach.values()) {
         try { if (await support.poll()) changed = true; } catch (e) { this.d.log.warn("looking for changed sessions failed", { agent: support.agent.id, error: errMessage(e) }); }
       }
       if (changed && !this.paused) this.wakeHeartbeat?.();
+      await sleep(this.timing.sessionsWatchMs, this.ctl.signal);
     }
   }
 
