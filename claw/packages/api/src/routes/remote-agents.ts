@@ -237,9 +237,12 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const body = parseConnectorRegistration(req.body ?? {});
     if (!body.ok) return fail(reply, 400, body.error);
     const row = await store.registerConnector(
-      owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req),
+      owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req), onlineWindowMs,
     );
     if (!row) return fail(reply, 409, "connector_limit_reached");
+    // Offline rows under the same name (a connector that lost its state and registered again) were revoked in its place.
+    if (row.replaced.length) logger.info({ owner, connectorId: row.connector_id, replaced: row.replaced }, "remote_agents.connector_replaced");
+    for (const id of row.replaced) waker.wake(`c:${id}`);
     // The id every row of this connector is filed under. A connector whose token `sub` is not the id the
     // user's own clients resolve to is registered and online yet invisible to them, with no error; this
     // line is where an operator reads which id it was filed under (docs/remote-agents.md, "Connector access tokens").

@@ -50,9 +50,10 @@ export function writeAudit(q: Querier, e: AuditEntry): Promise<unknown> {
 }
 
 /** `online` as a column of `claw_remote_connectors c`; `$1` is the window in seconds. */
-const ONLINE_SQL = `COALESCE(c.revoked_at IS NULL
+const ONLINE_COND = `COALESCE(c.revoked_at IS NULL
   AND c.heartbeat_at > NOW() - make_interval(secs => $1::float8)
-  AND c.stream_seen_at > NOW() - make_interval(secs => $1::float8), FALSE) AS online`;
+  AND c.stream_seen_at > NOW() - make_interval(secs => $1::float8), FALSE)`;
+const ONLINE_SQL = `${ONLINE_COND} AS online`;
 
 /** A connector row (revoked or not) that belongs to `owner`, with its presence. */
 export async function findConnector(owner: string, connectorId: string, onlineWindowMs: number, q: Querier = direct): Promise<Row | null> {
@@ -69,10 +70,28 @@ const withCredential = (detail: Record<string, unknown>, credential: string | nu
 
 export async function registerConnector(
   owner: string, name: string, version: string | null, client: string | null, maxPerUser: number,
-  credential: string | null = null,
-): Promise<Row | null> {
+  credential: string | null = null, onlineWindowMs: number | null = null,
+): Promise<(Row & { replaced: string[] }) | null> {
   return inTransaction(async (q) => {
     await lock(q, `connectors:${owner}`);
+    // A connector that lost its local state registers afresh under the same name, and the row it had stays behind offline for
+    // good: a stale twin the owner cannot tell from the real one. Rows of this owner with this name that are offline (as
+    // `ONLINE_SQL`, with `onlineWindowMs` as its window) are revoked here, as `revokeConnector` does, before the count. One online
+    // is another process holding that name and is left alone, and so is one made within the window (registered, not yet
+    // connected). Should a machine whose row was revoked this way come back after all, it is told `revoked` and stops.
+    const replaced: string[] = [];
+    if (onlineWindowMs !== null) {
+      const stale = (await q(
+        `SELECT c.connector_id FROM claw_remote_connectors c
+          WHERE c.owner_user_id = $2 AND c.name = $3 AND c.revoked_at IS NULL
+            AND c.created_at < NOW() - make_interval(secs => $1::float8) AND NOT ${ONLINE_COND}
+          ORDER BY c.created_at FOR UPDATE`,
+        [secs(onlineWindowMs), owner, name],
+      )).rows.map((r) => String(r.connector_id));
+      for (const id of stale) {
+        if (await revokeIn(q, owner, id, client, { reason: "replaced_by_same_name" })) replaced.push(id);
+      }
+    }
     const n = Number((await q(
       "SELECT COUNT(*) AS n FROM claw_remote_connectors WHERE owner_user_id = $1 AND revoked_at IS NULL", [owner],
     )).rows[0].n);
@@ -82,8 +101,11 @@ export async function registerConnector(
        RETURNING connector_id, name, created_at`,
       [randomUUID(), owner, name, version],
     )).rows[0];
-    await writeAudit(q, { owner, actor: owner, client, connectorId: row.connector_id, action: "connector.registered", detail: withCredential({ name }, credential) });
-    return row;
+    await writeAudit(q, {
+      owner, actor: owner, client, connectorId: row.connector_id, action: "connector.registered",
+      detail: withCredential(replaced.length ? { name, replaced } : { name }, credential),
+    });
+    return { ...row, replaced };
   });
 }
 
@@ -125,24 +147,27 @@ export function offlineReason(streamEndReason: unknown): "auth_expired" | "no_he
 
 /** Revoke one connector and close its sessions. False when it is not the caller's, or already revoked. */
 export async function revokeConnector(owner: string, connectorId: string, client: string | null): Promise<boolean> {
-  return inTransaction(async (q) => {
-    const r = await q(
-      `UPDATE claw_remote_connectors SET revoked_at = NOW(), stream_seen_at = NULL
-        WHERE connector_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL RETURNING connector_id`,
-      [connectorId, owner],
-    );
-    if (!r.rowCount) return false;
-    await q("DELETE FROM claw_remote_commands WHERE connector_id = $1", [connectorId]);
-    const closed = await q(
-      "UPDATE claw_remote_sessions SET status = 'closed', updated_at = NOW() WHERE connector_id = $1 AND status = 'active' RETURNING session_id",
-      [connectorId],
-    );
-    await writeAudit(q, {
-      owner, actor: owner, client, connectorId, action: "connector.revoked",
-      detail: { sessions_closed: closed.rowCount ?? 0 },
-    });
-    return true;
+  return inTransaction((q) => revokeIn(q, owner, connectorId, client));
+}
+
+/** `revokeConnector` inside a transaction the caller holds; `detail` is added to its audit row. */
+async function revokeIn(q: Querier, owner: string, connectorId: string, client: string | null, detail: Record<string, unknown> = {}): Promise<boolean> {
+  const r = await q(
+    `UPDATE claw_remote_connectors SET revoked_at = NOW(), stream_seen_at = NULL
+      WHERE connector_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL RETURNING connector_id`,
+    [connectorId, owner],
+  );
+  if (!r.rowCount) return false;
+  await q("DELETE FROM claw_remote_commands WHERE connector_id = $1", [connectorId]);
+  const closed = await q(
+    "UPDATE claw_remote_sessions SET status = 'closed', updated_at = NOW() WHERE connector_id = $1 AND status = 'active' RETURNING session_id",
+    [connectorId],
+  );
+  await writeAudit(q, {
+    owner, actor: owner, client, connectorId, action: "connector.revoked",
+    detail: { ...detail, sessions_closed: closed.rowCount ?? 0 },
   });
+  return true;
 }
 
 /** Record a heartbeat: refresh presence, replace the advertised agents, forget acknowledged commands. */
