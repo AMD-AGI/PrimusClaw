@@ -4,7 +4,7 @@
 /**
  * The routing and result discipline (`CLAW_ASSISTANT_ROUTE_DISCIPLINE`): what the router starts, and what waits for the user's Accept.
  *
- * Its words are in the prompts (router-discipline-v2, worker-v7, `prompts.ts`); what a prompt states is also enforced here, so a model
+ * Its words are in the prompts (router-discipline-v2, worker-v9, `prompts.ts`); what a prompt states is also enforced here, so a model
  * that does not follow it is refused, not believed:
  *
  *  - `secretReadTarget`: work_create refuses a task that would read ~/.ssh, a private key or a credential file. However the request is

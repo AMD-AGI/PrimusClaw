@@ -314,7 +314,7 @@ describe("the router writes itself, and a worker's words reach the user", { skip
     assert.match(read, /Never tell the user an earlier answer was not checked/);
     assert.match(read, /say it as a change \(上次查是 17 个，其间 #447 合入了，现在是 16 个\), never as your earlier mistake/);
     assert.match(prompts.WORKER_PROMPT, /deliver_text/);
-    assert.equal(prompts.WORKER_PROMPT_VERSION, "worker-v6");
+    assert.equal(prompts.WORKER_PROMPT_VERSION, "worker-v8");
     // M2 (2026-11-06): 678.7 from the rounded figures where the unrounded ones give 678.6.
     assert.match(prompts.WORKER_PROMPT, /compute a difference, ratio or percentage from the unrounded values, and round only the figure you report[^\n]*never from figures you already rounded/);
     assert.match(prompts.WORKER_PROMPT, /Before a write the user approves \(a comment, a review, a merge, a push, an issue, a message to someone\), when the task also asked you to find things out[^\n]*first report\(kind="progress", summary\) with everything you found that answers what was asked, with the numbers, then make the write/);

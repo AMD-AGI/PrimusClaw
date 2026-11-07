@@ -86,16 +86,20 @@ export const TOOL_NAME_PREFIX = `mcp__${ASSISTANT_MCP_SERVER}__`;
  * words written after the report, which nobody reads.
  * worker-v5: v4 with what was found reported before a write the user approves: the user is told it first, then asked (G2).
  * worker-v6: v5 with a difference, ratio or percentage computed from the unrounded values and rounded once, at the end (M2).
+ * worker-v8: v6 with a write the task asks for made when the worker reaches it, never first asked about in a report: the hold puts it
+ * to the user on a card (G0 2026-11-07, nightly sa-eval-bot-2 cat-items-wr-001: the worker asked "Confirm I should push ... and open
+ * the PR?" as a waiting question, so a user who had asked for the PR was asked again in words, and once more on the card after yes).
  */
-export const WORKER_PROMPT_VERSION = "worker-v6";
+export const WORKER_PROMPT_VERSION = "worker-v8";
 /**
  * worker-v7 (`CLAW_ASSISTANT_ROUTE_DISCIPLINE`, `discipline.ts`): v6 with a task that changed nothing outside the workspace (it found
  * something out, or it only made files or a written result it delivered) reported as an answer, which closes the item with nothing to
  * accept, and ready kept for a change outside that the user checks (a pull request, a commit, a run, another write), named in
  * result.refs. Only an external change waits for Accept; an informational result completes by itself (super-agent polish plan Q2, decided
  * 2026-11-05; G0 2026-11-07: real-items-it-104 and real-general-it-114/119 showed Accept for a file the worker had delivered).
+ * worker-v9: v7 with the write the task asks for made, not asked about first (as worker-v8).
  */
-export const WORKER_DISCIPLINE_PROMPT_VERSION = "worker-v7";
+export const WORKER_DISCIPLINE_PROMPT_VERSION = "worker-v9";
 
 /**
  * The longest `say` text (the API's `SAY_TEXT_MAX`): a channel shows a long one as up to three messages, whole. The norm is
@@ -392,6 +396,7 @@ Report as you go, and keep reports few:
 ${WORKER_RESULT_KINDS}
 - report(kind="failed", summary) when the work cannot be done; say why.
 - Before a write the user approves (a comment, a review, a merge, a push, an issue, a message to someone), when the task also asked you to find things out (what a pull request changes, how many files, its CI, its open threads): first report(kind="progress", summary) with everything you found that answers what was asked, with the numbers, then make the write. The user is told that report first, then asked to approve the write, so they decide knowing what you found.
+- A write the task asks for (pushing your branch, opening a pull request, a comment, a merge, another write to another system) is made when you reach it, without asking first: each one that needs the user's approval is held and put to them on a card, and runs only when they approve it there. Never report(kind="waiting") or report(kind="blocked") with a question that only asks whether to make it (Confirm I should push and open the PR?): the user already asked for it, and would be asked twice. Ask only what the task leaves open (which repository, which branch, which of two plans). When you cannot make it (no GitHub login, no write access), report(kind="blocked") with what is missing, such as connecting GitHub with /github bind.
 - report(kind="dropped", summary) when the work turns out not to be needed.
 summary is at most ${REPORT_SUMMARY_MAX} characters, except an answer's: an answer is given whole, up to ${REPORT_ANSWER_MAX} characters, never cut short. An answer longer than that goes into a file you deliver (below), with the gist in the summary. A report that is refused tells you why: fix it and report again.
 
