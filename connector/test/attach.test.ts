@@ -613,8 +613,9 @@ describe("attach end to end", () => {
     fs.writeFileSync(file, `${JSON.stringify({ type: "user", sessionId: REF, message: { role: "user", content: "hello" } })}\n`);
     // The terminal: a real process that, like Claude Code on SIGTERM, writes the end of its transcript, drops its row and exits.
     const liveFile = (h as unknown as { liveFile: string }).liveFile;
-    const script = `process.on("SIGTERM", () => { require("fs").appendFileSync(${JSON.stringify(file)}, '{"type":"system","subtype":"end"}\\n'); require("fs").writeFileSync(${JSON.stringify(liveFile)}, "[]"); process.exit(0); }); setInterval(() => {}, 1000);`;
-    const term = spawn(process.execPath, ["-e", script], { stdio: "ignore" });
+    // (the paths reach it through its environment, never through the code it runs)
+    const script = 'process.on("SIGTERM", () => { const fs = require("fs"); fs.appendFileSync(process.env.T_FILE, JSON.stringify({ type: "system", subtype: "end" }) + "\\n"); fs.writeFileSync(process.env.T_LIVE, "[]"); process.exit(0); }); setInterval(() => {}, 1000);';
+    const term = spawn(process.execPath, ["-e", script], { stdio: "ignore", env: { ...process.env, T_FILE: file, T_LIVE: liveFile } });
     children.push(term);
     await new Promise((r) => setTimeout(r, 300));   // (its handler is in place)
     h.setLive([{ pid: term.pid, sessionId: REF, status: "busy" }]);
