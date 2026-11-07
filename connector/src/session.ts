@@ -847,10 +847,12 @@ export class Session {
     try {
       const reply = a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });
       const now = new Date().toISOString();
-      // Recorded before the prompt counts as handled: from here a restart finds this turn instead of losing it.
+      // Recorded before the prompt counts as handled: from here a restart finds this turn instead of losing it. The
+      // record is written off the event loop, so the command counts as handled (and the heartbeat's cursor passes it)
+      // only once the record has landed; until then a restart is sent the command again.
       this.env.store.beginTurn({ session_id: this.id, cmd_id: cmdId, cmd_seq: cmdSeq, started_at: now });
       this.env.store.patch(this.id, { used_at: now, unused: false });
-      started();
+      void this.env.store.written().then(started, started);
       const res = await reply;
       const usage = isObject(res.usage) ? res.usage : undefined;
       this.endTurn({ stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });

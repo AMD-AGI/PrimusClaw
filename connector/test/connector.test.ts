@@ -7,6 +7,7 @@
  * speaking real newline-delimited JSON-RPC over stdio.
  */
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test, { after, describe } from "node:test";
@@ -888,6 +889,30 @@ describe("crash safety", () => {
     await h.claw.until("the session refused", () => h.claw.eventsOf(sid, "session_closed")[0]);
     await h.claw.until("the record forgotten", () => h.connector.store.listTurns().length === 0);
     assert.deepEqual(h.adapterLog(), []);
+  });
+  test("a prompt counts as handled only once its turn is on disk: while that write is stuck, the heartbeat's cursor stays below it", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    // A FIFO nobody reads stands in for a disk that stopped answering, for the turn record's write only.
+    const fifo = path.join(h.dirs.state, "sessions.json.turns.tmp");
+    fs.rmSync(fifo, { force: true });
+    assert.equal(spawnSync("mkfifo", ["-m", "600", fifo]).status, 0);
+    let read: Promise<unknown> | null = null;
+    try {
+      const flag = path.join(h.work, "never3");
+      const seq = h.prompt(sid, `wait ${flag}`);
+      await h.claw.until("the prompt to reach the agent", () => h.adapterLog().some((l) => l.prompt === `wait ${flag}`));
+      const n = h.claw.heartbeats.length;
+      await h.claw.until("three more heartbeats", () => h.claw.heartbeats.length >= n + 3);
+      assert.ok(h.claw.cursor < seq, `the server still holds the command (cursor ${h.claw.cursor}, prompt ${seq}): a restart now would send it again`);
+      // The disk answers: the record lands, and only then is the command forgotten.
+      read = fs.promises.readFile(fifo);
+      await h.claw.until("the cursor to pass the prompt", () => h.claw.cursor >= seq);
+      assert.equal(h.connector.store.turn(sid)?.cmd_seq, seq);
+    } finally {
+      // Never leave the write stuck: a libuv thread blocked on the FIFO would keep the test process from exiting.
+      await (read ?? fs.promises.readFile(fifo));
+    }
   });
   test("a prompt queued behind the running turn when the connector restarts is delivered again, not lost", async () => {
     const h = await make();
