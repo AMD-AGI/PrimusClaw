@@ -180,6 +180,8 @@ export class Session {
     cmdId: string | null; cmdSeq: number | null; text: string; sentAt: number; seen: boolean; idleSince: number | null; done: () => void;
     /** The keys are going (or went) to the terminal: from here on it is the terminal's turn, which a withdraw leaves alone. */
     keys?: boolean;
+    /** Counts its prompt as handled (idempotent): a withdraw that takes the turn back before its keys go calls it itself. */
+    started?: () => void;
   } | null = null;
   private terminalPumping = false;
   private terminalRestoring: Promise<void> | null = null;
@@ -482,7 +484,7 @@ export class Session {
         if (this.holderStatus(term) !== "idle") { refused("terminal_switched", "the terminal changed just before typing"); continue; }
         this.terminalQueue.shift();
         const finished = new Promise<void>((resolve) => {
-          this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve };
+          this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve, started: next.started };
         });
         // At most once: the turn is recorded and the prompt counted as handled BEFORE the keys go, so a restart in between
         // ends this turn (`connector_restarted`, SessionManager.recover) instead of Claw delivering it again and the terminal
@@ -1285,6 +1287,9 @@ export class Session {
       this.terminalTurn = null;
       if (!this.stopping) this.env.store.endTurn(this.id);
       this.rejectCommand("prompt", pending.cmdId, "withdrawn", pending.cmdSeq);
+      // Counted as handled now, before the withdraw itself is: after a restart Claw must not deliver it again with the withdraw
+      // already behind the cursor (the pump would type it). `started` is the manager's once-only `handled`.
+      pending.started?.();
       pending.done();
       terminal += 1;
     }
