@@ -101,6 +101,8 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A development environment turn cut off because its connector restarted mid-turn is told on the assistant's item as an
+  interruption with what to do (send the instruction again, or say "continue"), not as the bare code `connector_restarted`.
 - A user whose several machines are all offline is told in Chinese to run the restart command on each of them (每台机器), not on
   "that machine". A pairing claimed but not registered yet holds its name: two machines of one hostname claimed one after the
   other, before either registered, no longer both get the same alternate name.

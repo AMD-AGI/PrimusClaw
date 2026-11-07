@@ -428,10 +428,23 @@ function terminalRefusal(error: string, mode: string, lang: RemoteLang): string 
   return null;
 }
 
+/**
+ * A turn the connector ended because it restarted mid-turn (connector manager.ts `recover`): the session is back, so the person is told
+ * what happened and how to carry on rather than the code. Anything else is said by its code, as before.
+ */
+function interruption(error: string, lang: RemoteLang): string | null {
+  if (error !== "connector_restarted") return null;
+  return lang === "zh"
+    ? "（被打断：那台机器上的连接器重启了，这一轮没有做完；会话已经重新接上，再发一次这条指令，或发“继续”让它接着做）"
+    : "(interrupted: the connector on that machine restarted, so this turn did not finish; the session is back, so send the instruction again, or say \"continue\", to carry on)";
+}
+
 function stopWords(stop: string, error: string, lang: RemoteLang, mode = ""): string {
   if (stop === "end_turn" || !stop) return "";
   const terminal = stop === "error" ? terminalRefusal(error, mode, lang) : null;
   if (terminal) return lang === "zh" ? `（没有输入：${terminal}）` : `(not typed: ${terminal})`;
+  const cut = stop === "error" ? interruption(error, lang) : null;
+  if (cut) return cut;
   if (lang === "zh") return stop === "cancelled" ? "（已取消）" : stop === "error" ? `（出错：${error || "未知"}）` : `（结束原因：${stop}）`;
   return stop === "cancelled" ? "(cancelled)" : stop === "error" ? `(failed: ${error || "unknown"})` : `(ended: ${stop})`;
 }
