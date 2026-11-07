@@ -227,7 +227,7 @@ never judged as a credential of its own: a key alone, in either header, is still
 `method` is `api_key` or `x_api_key`, never `identity_token`).
 
 **A service that holds no key of the person (SaFE deployment mode).** A chat service that speaks for a person
-through a binding the person confirmed at the provider (a Teams user who never linked a key) has nothing to bring.
+through a binding the person confirmed at the provider (a chat user who never linked a key) has nothing to bring.
 For a service the operator named in `CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS`, a delegated token without
 `x-api-key` is treated as a token that is not delegated is: the API exchanges it once more at the provider for SaFE's
 audience and shows SaFE the result, so the caller has the keys SaFE holds for the token's `sub` (their own virtual key,

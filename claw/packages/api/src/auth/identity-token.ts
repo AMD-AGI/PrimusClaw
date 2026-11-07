@@ -51,7 +51,7 @@
  *   - A delegated token of a service the operator named in `CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS` (default: none, compared
  *     exactly as the provider signed its `client_id`) that brings no key of the person's own has the keys SaFE holds for its subject,
  *     got as for a token that is not delegated: the API exchanges the service's token once more at the provider (which keeps the service
- *     in the new token's `act` chain) and shows SaFE the result. This is how a chat service that holds no key of the person (a Teams
+ *     in the new token's `act` chain) and shows SaFE the result. This is how a chat service that holds no key of the person (a chat
  *     user who never linked one) has the person's turns run on the person's own virtual key. A key the service does bring is the one used.
  *   - The one way a token's role becomes the caller's role is an operator naming it in
  *     `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` (default: none; only `system-admin` and

@@ -30,7 +30,7 @@ record it.
 ### Added
 - `CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS` (default none): a delegated identity token of a named service that brings no key of
   the person's own is exchanged once more at the identity provider, and the caller has the keys SaFE holds for the token's subject. A
-  chat service that holds no key of the person (a Teams user who never linked one) then has the person's turns run on their own virtual
+  chat service that holds no key of the person (a chat user who never linked one) then has the person's turns run on their own virtual
   key instead of none.
 - The assistant writes text itself and hands it over with no sandbox: `deliver_text(name, text, caption?)` (router and worker) stores a
   text file (markdown, plain text, CSV, JSON, YAML, code; at most 256 KB, redacted as a message is) as a delivery of the calling

@@ -678,7 +678,7 @@ describe("K7 a delegated token has no keys, except an allow-listed service's, wh
 });
 
 describe("K9 a named chat service's delegated token has the keys SaFE holds for its subject (CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS)", () => {
-  const CHAT = "svc-teams";
+  const CHAT = "svc-chatbot";
   /** As the provider issues it to a chat service for a person it has a binding of: `sub` the person, `act` and `client_id` the service. */
   const byChat = (over: Record<string, unknown> = {}) => mint({ act: { sub: CHAT }, client_id: CHAT, ...over });
   const asked = () => verifyCalls().map((c) => JSON.parse(c.body) as { apiKey?: string; authorization?: string });
@@ -730,7 +730,7 @@ describe("K9 a named chat service's delegated token has the keys SaFE holds for 
     ["no service is named (the default)", null, () => byChat()],
     ["an empty list", "", () => byChat()],
     ["another service is named", "svc-other", () => byChat()],
-    ["a client id that differs by case", undefined, () => mint({ act: { sub: CHAT }, client_id: "SVC-TEAMS" })],
+    ["a client id that differs by case", undefined, () => mint({ act: { sub: CHAT }, client_id: "SVC-CHATBOT" })],
     ["a client id that merely begins with the named one", undefined, () => mint({ act: { sub: CHAT }, client_id: `${CHAT}-2` })],
     ["a client id that differs by a trailing space", undefined, () => mint({ act: { sub: CHAT }, client_id: `${CHAT} ` })],
     ["a delegated token that names no client (its act names the service)", undefined, () => byChat({ client_id: undefined })],
