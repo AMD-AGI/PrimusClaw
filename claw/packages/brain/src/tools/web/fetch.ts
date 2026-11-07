@@ -260,15 +260,51 @@ function isSameHost(a: URL, b: URL): boolean {
 
 // ── HTML → Markdown conversion ──
 
-type TurndownLike = new (opts: Record<string, string>) => { turndown: (html: string) => string };
+interface TurndownNode { nodeName: string; getAttribute?: (name: string) => string | null }
+type TurndownLike = new (opts: Record<string, string>) => {
+  turndown: (html: string) => string;
+  addRule: (key: string, rule: { filter: (node: TurndownNode) => boolean; replacement: (content: string, node: TurndownNode) => string }) => void;
+};
 let TurndownCtor: TurndownLike | null = null;
 
-async function htmlToMarkdown(html: string): Promise<string> {
+/** The most values of one condition key `showCondition` names before it says how many more there are. */
+const SHOW_COND_VALUES_MAX = 12;
+const BLOCK_NODES = new Set(["DIV", "TABLE", "TBODY", "THEAD", "TR", "SECTION", "UL", "OL", "P"]);
+
+/**
+ * What a page's `data-show-cond` (rocm-docs selectors: a cell or block shown only for some GPUs, OS families or versions) says, as
+ * text, or null. A page that picks what to show by script is flattened to every variant at once; without this, a reader cannot tell
+ * which row belongs to which choice (parity R2: Rocky Linux 9 read as an MI355X distribution when the page shows it for MI300X only).
+ */
+export function showCondition(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let cond: unknown;
+  try { cond = JSON.parse(raw); } catch { return null; }
+  if (!cond || typeof cond !== "object" || Array.isArray(cond)) return null;
+  const parts: string[] = [];
+  for (const [key, values] of Object.entries(cond as Record<string, unknown>).slice(0, 4)) {
+    if (!Array.isArray(values)) continue;
+    const vs = values.filter((v): v is string | number => typeof v === "string" || typeof v === "number").map((v) => String(v).slice(0, 60));
+    if (!vs.length) continue;
+    const more = vs.length > SHOW_COND_VALUES_MAX ? `, +${vs.length - SHOW_COND_VALUES_MAX} more` : "";
+    parts.push(`${key.slice(0, 30)}: ${vs.slice(0, SHOW_COND_VALUES_MAX).join(", ")}${more}`);
+  }
+  return parts.length ? `(shown only for ${parts.join("; ")})` : null;
+}
+
+export async function htmlToMarkdown(html: string): Promise<string> {
   if (!TurndownCtor) {
     const mod = await import("turndown");
     TurndownCtor = (mod.default ?? mod) as TurndownLike;
   }
   const td = new TurndownCtor({ headingStyle: "atx", codeBlockStyle: "fenced" });
+  td.addRule("showCondition", {
+    filter: (node) => !!showCondition(node.getAttribute?.("data-show-cond")),
+    replacement: (content, node) => {
+      const note = showCondition(node.getAttribute?.("data-show-cond"))!;
+      return BLOCK_NODES.has(node.nodeName) ? `\n\n${note}\n${content}\n\n` : ` ${note} ${content} `;
+    },
+  });
   return td.turndown(html);
 }
 
