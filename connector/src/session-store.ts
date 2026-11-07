@@ -46,6 +46,9 @@ export class SessionStore {
   private readonly pendingOut: SnapshotFile;
   private readonly turnsOut: SnapshotFile;
 
+  /** Stops retrying failed writes on their own (the connector has stopped). */
+  close(): void { for (const f of [this.recsOut, this.pendingOut, this.turnsOut]) f.close(); }
+
   constructor(file: string, report?: WriteReport) {
     this.pendingFile = `${file}.pending`;
     this.turnsFile = `${file}.turns`;

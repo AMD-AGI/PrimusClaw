@@ -28,6 +28,7 @@ import {
   NotConfiguredError,
   NotFoundError,
   PluginDuplicateError,
+  PluginNameTakenError,
   ToolDuplicateError,
   ToolVersionDuplicateError,
   UpsertConflictError,
@@ -611,7 +612,7 @@ async function upsertPluginOnce(
   }
   const source = latestRowByVersion(rows);
   if (!sameActorOwner(actingUserId, source.owner_user_id) && !isAdmin) {
-    throw new UpsertPermissionError();
+    throw new PluginNameTakenError(name);
   }
   if (rowsMatchVersion(rows, ver)) {
     const match = rowMatchingVersion(rows, ver);

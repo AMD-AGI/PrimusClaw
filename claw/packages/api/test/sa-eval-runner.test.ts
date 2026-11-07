@@ -26,8 +26,9 @@
  *   R7 a stream that missed a stored event of the case (a leak in a say it never delivered): an error, not a grade; an item whose
  *      work_create answer the stream missed is still closed with its worker's session; an assistant session still running
  *      before a case: nothing is sent, an error
- *   R9 a judge that gives no verdict (an error status, no PASS or FAIL twice) makes the attempt an error of the run, not a FAIL; its
- *      FAIL fails, its PASS passes. R3e a stop while the stream holds its history back ends the wait at once
+ *   R9 a judge that gives no verdict (an error status, a busy or failing gateway twice, no PASS or FAIL twice) makes the attempt an
+ *      error of the run, not a FAIL; a verdict-less answer is asked again saying what was missing; a verdict on the last line of a
+ *      judge that reasons first counts; its FAIL fails, its PASS passes. R3e a stop while the stream holds its history back ends the wait at once
  *   R10 an oracle that could not be read makes the attempt the run's error before anything is sent; one that answers is graded
  *   R11 a read the grade needs that failed (a worker's events, the board through the item wait) makes the attempt the run's
  *      error, its item still closed; in the final cleanup, a board that answers again after a while is read again and the
@@ -50,6 +51,9 @@
  *      the key's identity refuses the run before anything is sent
  *   R18 a person who writes to the run's assistant session while the run is on: the item their turn started is not the run's and
  *      is neither closed nor stripped of its worker's session (it is said as left alone), while the run's own item is closed
+ *   R20 "items named by title" knows the board's highest item number: a "#n" above it is not one of the person's items
+ *   R19 a multi-turn case: each item in the results says whether the graded last turn started it (`last`), so an item an earlier
+ *      turn started is not counted as the last turn's
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -63,6 +67,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { JUDGE_RETRY_NOTE } from "./e2e/sa-eval-lib.js";
 
 const API_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNNER = join(API_DIR, "test", "e2e", "sa-eval.ts");
@@ -81,6 +86,8 @@ class FakeClaw {
   readonly sessions = new Map<string, { status: string; stale: number; createdAt?: number }>();
   /** The judge's answers, in order (an HTTP status, or the text of a 200). */
   judgeAnswers: Array<number | string> = [];
+  /** What the judge was asked, in order. */
+  judgePrompts: string[] = [];
   /** How long a stream holds back the end of its history. */
   historyDelayMs = 0;
   readonly items: Item[] = [];
@@ -154,6 +161,7 @@ class FakeClaw {
       return send(200, { userId: email === EMAIL ? "u-eval" : `u-${email}`, name: "sa-eval-bot", email });
     }
     if (method === "POST" && path === "/judge/v1/messages") {
+      this.judgePrompts.push(String((JSON.parse(body || "{}") as any)?.messages?.[0]?.content ?? ""));
       const a = this.judgeAnswers.shift() ?? "PASS: ok";
       return typeof a === "number" ? send(a, { error: "down" }) : send(200, { content: [{ type: "text", text: a }] });
     }
@@ -689,13 +697,16 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
   it("R9 a judge that gives no verdict is the run's error, not the assistant's FAIL", { timeout: 120_000 }, async () => {
     const claw = new FakeClaw();
     const base = await claw.start();
-    // An answer without a verdict is asked once more: t-j-002 gets none twice, t-j-005 gets one on the second ask.
-    claw.judgeAnswers = [503, "Hmm, hard to say.", "Still unsure.", "FAIL: wrong count", "PASS: names the count", "Let me think.", "**PASS**: on a second ask"];
+    // An answer without a verdict, and a busy or failing gateway, are asked once more: t-j-001 gets 503 twice, t-j-002 no verdict
+    // twice, t-j-005 a verdict on the second ask, t-j-006 one after a 503; t-j-007's judge reasons first and ends on its verdict;
+    // t-j-008's 400 is not asked again.
+    claw.judgeAnswers = [503, 503, "Hmm, hard to say.", "Still unsure.", "FAIL: wrong count", "PASS: names the count", "Let me think.", "**PASS**: on a second ask",
+      502, "PASS: after a 502", "The reply gives the count the user asked for.\n\nPASS: names the count", 400];
     claw.router = (_content, id) => claw.turn(id, { say: "There are 3 nodes." });
     const answer = (id: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: id }] });
     const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
     writeFileSync(join(dir, "judge-key"), "judge-key-not-a-secret\n");
-    const r = runner(base, ["t-j-001", "t-j-002", "t-j-003", "t-j-004", "t-j-005"].map(answer),
+    const r = runner(base, ["t-j-001", "t-j-002", "t-j-003", "t-j-004", "t-j-005", "t-j-006", "t-j-007", "t-j-008"].map(answer),
       { EVAL_JUDGE_URL: `${base}/judge`, EVAL_JUDGE_MODEL: "m", EVAL_JUDGE_KEY_FILE: join(dir, "judge-key") }, dir);
     const run = await r.done;
     await claw.stop();
@@ -705,8 +716,45 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.match(run.out, /FAIL t-j-003#1/);
       assert.match(run.out, /pass t-j-004#1/);
       assert.match(run.out, /pass t-j-005#1/);
+      assert.match(run.out, /pass t-j-006#1/);
+      assert.match(run.out, /pass t-j-007#1/);
+      assert.match(run.out, /ERROR t-j-008#1 .*infra: judge answered 400/);
       assert.equal(claw.judgeAnswers.length, 0, "every answer was asked for");
+      assert.equal(claw.judgePrompts.filter((x) => x.endsWith(JUDGE_RETRY_NOTE)).length, 2, "a verdict-less answer's second ask says what was missing");
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("R19 the items of a multi-turn case: which the graded last turn started", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    let n = 0;
+    // The first turn starts item 1, the second (the graded one) item 2.
+    claw.router = (_content, id) => { n++; claw.turn(id, { item: item(n), say: `Started ${n}.` }); };
+    const r = runner(base, [itemCase({ id: "t-last-001", turns: [{ user: "start a task" }, { user: "and another", after_ms: 1_000 }] })]);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.match(run.out, /t-last-001#1/, run.out);
+      const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+      const items = report.results[0].attempts[0].items as Array<{ seq: number; last?: boolean }>;
+      assert.deepEqual(items.map((i) => [i.seq, i.last]).sort(), [[1, false], [2, true]], run.out);
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it("R20 items named by title: a number above the board's highest item number is not one of the person's", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    let n = 0;
+    claw.router = (_content, id) => { n++; claw.turn(id, { item: item(n), say: n === 1 ? "Started. The upstream one is #4321." : `Started #${n}.` }); };
+    const r = runner(base, [itemCase({ id: "t-seq-001", style: { no_ids: true } }), itemCase({ id: "t-seq-002", style: { no_ids: true } })]);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+      const titled = (id: string) => (report.results as any[]).find((x) => x.id === id).attempts[0].checks.find((c: any) => c.name === "items named by title")?.pass;
+      assert.equal(titled("t-seq-001"), true, run.out);
+      assert.equal(titled("t-seq-002"), false, "#2 is on the board: a bare item number");
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 
   it("R3e a stop while the stream holds its history back", { timeout: 120_000 }, async () => {

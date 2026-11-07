@@ -229,9 +229,11 @@ describe("a command older than the live TTL", () => {
       assert.deepEqual(h.claw.confirmAsked.filter((c) => c === "c-restart").length, 2, "asked again by the next run");
     });
   }
-  test("a close or a cancel is never held up by a question", async () => {
+  test("a close, a cancel or a withdraw is never held up by a question", async () => {
     const h = await Harness.create();
     const sid = await h.newSession();
+    h.claw.issue("withdraw", sid, { issued_at: 1, sent_at: Date.now() - 60_000 });
+    await h.claw.until("the withdraw carried out", () => h.audit().some((a) => a.kind === "command" && a.type === "withdraw"));
     h.claw.issue("close", sid, { issued_at: 1 });
     await h.claw.until("closed", () => h.claw.eventsOf(sid, "session_closed")[0]);
     assert.equal(h.claw.confirmations.length, 0);
@@ -390,4 +392,3 @@ describe("a command whose frame was held in the network", () => {
     assert.ok(h.audit().some((a) => a.kind === "command_unconfirmable" && a.cmd_id === "c-no-sent-at" && a.reason === "claw_without_confirm"));
   });
 });
-

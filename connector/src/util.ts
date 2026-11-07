@@ -41,11 +41,17 @@ export interface Logger {
   error(msg: string, extra?: Record<string, unknown>): void;
 }
 
+let writeLogLine: (line: string) => void = (l) => { process.stderr.write(l + "\n"); };
+/** Where {@link logLine} writes: the command line sets a writer that survives a log file it cannot write (logsink.ts). */
+export function setLogLine(w: (line: string) => void): void { writeLogLine = w; }
+/** One line of the connector's own log (stderr). */
+export const logLine = (line: string): void => writeLogLine(line);
+
 /** One line per record on stderr; the connector's own log, never an adapter's. */
 export const stderrLogger = (quiet = false): Logger => {
   const w = (level: string) => (msg: string, extra?: Record<string, unknown>) => {
     if (quiet && level === "info") return;
-    process.stderr.write(`${new Date().toISOString()} ${level} ${msg}${extra ? " " + JSON.stringify(extra) : ""}\n`);
+    logLine(`${new Date().toISOString()} ${level} ${msg}${extra ? " " + JSON.stringify(extra) : ""}`);
   };
   return { info: w("info"), warn: w("warn"), error: w("error") };
 };

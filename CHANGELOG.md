@@ -28,6 +28,16 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A router turn that has said nothing 3.5 s after it began is told "收到，我看一下。" ("On it: looking into it now.") by the server, whatever it
+  is doing (thinking, the assistant's own tools, a slow start), not only when a lookup starts; the answer takes that line's place, so a
+  channel that edits a message shows one. Off unless `CLAW_ASSISTANT_FIRST_ACK_USERS` names the user (`*` for everyone);
+  `CLAW_ASSISTANT_FIRST_ACK_MS` sets the wait (2026-11-06 baseline: first reply p90 7.28 s, 21 turns heard only at their end). The router
+  says its quick line before `deliver_text`, `trigger_create`, `review_mode_set` and the `devenv_` tools too (`router-v19`).
+- `CLAW_ASSISTANT_ROUTE_DISCIPLINE` (`on`, default off) and `CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS` (Claw user ids, the canary): the
+  assistant answers a reply to a result it already gave (没关系, 就这样吧) with one line and starts nothing; declines in chat a request to
+  read ~/.ssh, keys or credentials whatever the reason given, and `work_create` refuses such a task; and a work item whose task changed
+  nothing outside (it delivered a file or a report) closes with its answer instead of waiting for Accept: a worker's `ready` report must
+  name what it changed (`result.refs`). Logged as router-discipline-v1 and worker-v7.
 - The connector picks up after a restart (a crash, a kill, a pod restart, `stop`, an upgrade): the turn an agent was running is kept
   on disk, and the next run either carries it on (the agent was waiting for a person's permission for a tool call, always asks, and
   the connector is not paused: it asks again and a new card comes, under the same prompt) or ends it with `turn_end` `error: "connector_restarted"`, so a phone stops waiting; prompts queued
@@ -101,6 +111,49 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A grant's GPU hours are charged only while a sandbox runs: from the moment it first reaches running (new grant status field
+  `sandboxes[].runningAt`) to its end. A sandbox that waited in a queue, sat scheduling-gated or pulled its image and was then deleted
+  charges nothing; before, two measurement sandboxes held pending for 28 minutes spent 3354 GPU seconds of a 6-GPU-hour grant. Apply
+  the updated `sandboxgrant` CRD with the release, or the field is pruned and a running sandbox is charged from its start as before.
+- A development environment turn cut off because its connector restarted mid-turn is told on the assistant's item as an
+  interruption with what to do (send the instruction again, or say "continue"), not as the bare code `connector_restarted`.
+- A request to review or merge pull requests that are already merged, or closed, is answered from a read: the assistant first calls
+  `pr_state`, which only reads where each pull request stands (open; merged with when and its merge commit; closed with when),
+  and answers a merged or closed one itself without calling `review_start` at all; only the open ones are started. A person with no
+  GitHub here is read for as anyone is, so a public pull request's state is still found. `review_start` still refuses a merged one
+  (`already_merged`) and now a closed one too (`already_closed`).
+- A tool call whose tool answered an error (a call the platform refused, such as `review_start` answering `already_merged`, a refused
+  read, a tool that threw) is recorded with `status: "error"` (and `is_error: true`) in the session's events and stream, no longer as
+  `"success"`; the turn rebuilt for the next message still carries what that call answered.
+- A user whose several machines are all offline is told in Chinese to run the restart command on each of them (每台机器), not on
+  "that machine". A pairing claimed but not registered yet holds its name: two machines of one hostname claimed one after the
+  other, before either registered, no longer both get the same alternate name.
+- A card the assistant puts to the user itself (a comment drafted with `github_comment`, a scheduled task) is published to the session
+  with the turn that proposed it, so a client following the session shows it as the answer to that message.
+- "连接我的开发环境" from someone whose machines are all offline answers, in one reply, how to bring the offline machine back
+  (`claw-connector service install` on it) and the one-line pairing command for a new machine. devenv_list with every machine
+  offline now carries `connect_a_machine` with `all_offline: true`: its `text` is the restart line, then the pairing command (or,
+  where the turn may not pair, the setup commands), and its note says to give it as it is. Before, the request was read as
+  "connect that old machine" and answered only that it was still offline. The router also no longer says a machine is "still"
+  offline or "the same as last time" (上次) from a check it cannot see in this conversation. Router prompt router-devenv-v11.
+- The pairing command installs with `npm install -g --no-update-notifier`, so npm's "New major version of npm available" notice no
+  longer appears in its output, where it looked like an error.
+- A machine paired without a name of its own (the hostname) that another live machine of the person's already has is paired under
+  the hostname and its folder (or the user, in the home directory): `claw-connector pair` sends that as `alternate_name`, the claim
+  answers the name it paired under in `data.name` (numbered when that is taken too), and the connector writes it into agents.toml
+  and says so. Two folders on one machine were two machines of one name. A name chosen with `--name` or an agents.toml is kept.
+- A paired machine whose configuration is on the container's own file system is told to keep it elsewhere and then ask the chat for a
+  new pairing command, not to "run init and login again", which it never did.
+- `GET /v1/remote-agents/connectors` says of each machine whether it was connected with a pairing code (`paired`), so a client can
+  tell how to connect it again: a new pairing command, not `claw-connector login`.
+- Notifications are no longer lost when a receiver makes its subscription again or restarts. Deleting a subscription used to
+  delete every row still queued for it (`ON DELETE CASCADE`), so a receiver that deletes its old subscription and makes a new one
+  lost what was queued meanwhile; those rows are now kept and carried over, once per event, to the owner's next subscription that
+  takes their type (within the 24-hour give-up window). An assistant message about no work item, said while the user had no
+  subscription for it, is sent to the user's next subscription, once (the last 24 hours), as only a message about an item that
+  still needs the user was before. And a receiver that was down for more than about 40 seconds (a Recreate rollout) no longer hears
+  nothing for five minutes: its oldest failed row is retried every 15 seconds while the failures say it is down (connection error,
+  timeout, 5xx, 408, 429), and its first 2xx sends everything that waited behind it at once.
 - "让开发机上的 claude 跑 make test" with no machine connected answers the same one-line pairing command, not the four setup steps.
   devenv_send refused `no_machine` because the user has no machine at all now carries in `data.connect_a_machine` the pairing made
   for them (`commands` the one line, `text_zh` and `text_en` with it in a code block, `pairing` its minutes), under the same gate
@@ -117,8 +170,8 @@ record it.
   `cancelled`, `expired`, `gone`, 401 `revoked`, or no answer) is dropped and reported in the session as `command_rejected` with
   `reason: "command_not_live"`. A command read before a stall that is still waiting to act (behind a running turn, or for a
   terminal) is confirmed when it reaches the agent. Claw deletes the queued commands that would make an agent act when it closes their session
-  (`close`, a reclaim, a revocation) and refuses a late confirmation for them (audited `command.refused_late`). `cancel` and `close`
-  are never held up. The same holds when the process keeps running but the network holds the frames back (Wi-Fi drops, roaming,
+  (`close`, a reclaim, a revocation) and refuses a late confirmation for them (audited `command.refused_late`). `cancel`, `withdraw`
+  and `close` are never held up. The same holds when the process keeps running but the network holds the frames back (Wi-Fi drops, roaming,
   a VPN reconnecting): every command frame carries `sent_at`, and one that took more than 3 s to arrive is confirmed, as is every
   command read while a heartbeat is overdue and within 5 s after a late or failed heartbeat or a stream reconnect. `expired` now
   means only "reached the connector past the live TTL" (the connector says `received_late`): a prompt received in time and queued
@@ -946,6 +999,15 @@ record it.
   once the person confirms (#423, connector part); a fresh install trusts the machine's CA store without `NODE_USE_SYSTEM_CA` (#443);
   every command answers `-h`/`--help` and an unknown option exits 2 (#440); a crash that damages `connector.json` no longer
   registers the machine as a new connector (#446).
+- `@primusclaw/connector` 0.1.9: a message from the chat can be typed into a conversation open in a tmux terminal instead of
+  only watching it (#451, connector part), and a tmux client that exits before reading that input fails the run instead of
+  crashing the connector on EPIPE (#473); a 401 during Claw's auth outage no longer stops the connector for good (#453); `doctor`
+  checks that an API-key Codex agent is signed in, as its sessions open (#462).
+- `@primusclaw/connector` 0.1.10: a prompt from the chat can be typed into a local tmux terminal even when the shared Claude
+  directory keeps session rows of another pid domain (#487); the agent's own writes between turns no longer refuse the next
+  prompt as `recently_written` (#472); `pair` on a hostname that is already another of the person's machines pairs under the
+  hostname and the agents' folder, and a paired machine's service hint asks the chat for a new pairing command (#477, connector
+  part).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,

@@ -122,7 +122,7 @@ import {
   mergeSays, parseSayLog, endedTurns, storedTurnEnds, streamMissed, filledCase, filesFrom, finalSay, grade, forRecording, identityRefusal, itemsStartedBy,
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   sayWaitMs, saysOf, staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
-  holdAnswers, toolPattern, judgeVerdict, oracleValues, withToolFailures, flatVars, storedTurnCalls,
+  holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
   type SayMark, type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
@@ -498,23 +498,32 @@ async function judge(c: EvalCase, turns: Turn[], final: string, calls: readonly 
   if (!url || !model || !keyFile) return null;
   const key = readFileSync(keyFile, "utf8").trim();
   const prompt = judgePrompt(c, turns, final, calls);
-  // An answer without a verdict is asked once more: the gateway's model sometimes spends its turn on a thinking block.
+  // An answer without a verdict, a gateway that is busy or down (429, 5xx) and a request that failed are asked once more: the
+  // gateway's model sometimes spends its turn on a thinking block, or reasons first and gives no verdict line. The second ask of a
+  // verdict-less answer says what was missing. Only then is it the run's error.
   let why = "judge gave no PASS or FAIL";
+  let noVerdict = false;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
+      const content = noVerdict ? prompt + JUDGE_RETRY_NOTE : prompt;
       const res = await fetch(`${url.replace(/\/+$/, "")}/v1/messages`, {
         method: "POST", signal: AbortSignal.timeout(60_000),
         headers: { "content-type": "application/json", "x-api-key": key, authorization: `Bearer ${key}`, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model, max_tokens: JUDGE_MAX_TOKENS, messages: [{ role: "user", content: prompt }] }),
+        body: JSON.stringify({ model, max_tokens: JUDGE_MAX_TOKENS, messages: [{ role: "user", content }] }),
       });
-      if (!res.ok) return { pass: false, why: `judge answered ${res.status}`, failed: true };
+      if (!res.ok) {
+        why = `judge answered ${res.status}`;
+        if (res.status === 429 || res.status >= 500) continue;
+        return { pass: false, why, failed: true };
+      }
       const body = (await res.json()) as any;
       const text = (Array.isArray(body?.content) ? body.content : []).filter((b: any) => b?.type === "text").map((b: any) => String(b.text ?? "")).join("\n");
       const word = judgeVerdict(text);
       if (word) return { pass: word === "PASS", why: scrubWith(text.trim().slice(0, 300), [KEY, key]) };
       why = `judge gave no PASS or FAIL (stop_reason ${String(body?.stop_reason ?? "?")}, ${text.length} chars of text)`;
+      noVerdict = true;
     } catch (err) {
-      return { pass: false, why: `judge failed: ${err instanceof Error ? err.message : String(err)}`, failed: true };
+      why = `judge failed: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
   return { pass: false, why, failed: true };
@@ -608,7 +617,10 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
   // someone else put on the board meanwhile (a review asked of this identity) is neither graded nor closed here.
   const started = turnCalls(stream.events, messageIds);
   const mine = (all: ItemSeen[]): ItemSeen[] => itemsStartedBy(started, all.filter((i) => i.seq > floor), RUN_ITEMS);
-  let items = mine(await board());
+  // The highest item number on the board: a "#n" above it in a reply is no item of the person's (items-named-by-title).
+  let seqMax = 0;
+  const onBoard = (all: ItemSeen[]): ItemSeen[] => { for (const i of all) seqMax = Math.max(seqMax, i.seq); return all; };
+  let items = mine(onBoard(await board()));
   for (const i of items) RUN_ITEMS.add(i.item_id);
   // A request the case's item holds for its person: answered the way that person's channel answers it.
   const hold = c.hold && items.length ? await answerHold(c.hold, items, start + (c.item_wait_s ?? ITEM_WAIT_SEC) * 1000) : undefined;
@@ -620,7 +632,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
     const settled = (is: ItemSeen[]): boolean => is.every((i) => (c.items_closed ? i.board_state === "done" : i.board_state !== "in_progress"));
     let boardError: string | null = null;
     await waitFor(async () => {
-      try { items = mine(await board()); boardError = null; } catch (err) { boardError = err instanceof Error ? err.message : String(err); }
+      try { items = mine(onBoard(await board())); boardError = null; } catch (err) { boardError = err instanceof Error ? err.message : String(err); }
       return !boardError && settled(items) ? true : undefined;
     }, start + (c.item_wait_s ?? ITEM_WAIT_SEC) * 1000, 5_000);
     if (boardError) unread.push(`the board (${boardError})`);
@@ -651,7 +663,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
     mode: MODE, route: routeOf(lastItems, lastRouter, lastSays), cards: cardsOf(lastSays), calls: lastCalls, shown: shown.map((s) => s.text),
     final: final?.text ?? "", firstReplyMs: firstOwn === null ? null : firstOwn - lastSent, finalMs: final ? final.at - lastSent : null,
     replyMs: messageIds.map((id, k) => { const s = says.find((x) => x.turn === id); return s ? s.at - sentAt[k]! : null; }),
-    items, factValues: values, delivered: filesFrom(says, lastIds), ...(hold ? { hold } : {}),
+    items, factValues: values, delivered: filesFrom(says, lastIds), ...(hold ? { hold } : {}), ...(seqMax ? { itemSeqMax: seqMax } : {}),
   };
   const allCalls = [...turnCalls(stream.events, messageIds)];
   for (const i of items) if (!lastIds.includes(i.item_id)) allCalls.push(...(await read(`item ${i.seq}'s worker calls`, workerCalls(i.item_id), [])));
@@ -661,7 +673,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
   for (const i of mine(await board().catch(() => items))) {
     RUN_ITEMS.add(i.item_id);
     const seen = items.find((x) => x.item_id === i.item_id) ?? i;
-    cleaned.push({ seq: i.seq, kind: i.kind, board_state: seen.board_state, cleanup: await closeItem(i) });
+    cleaned.push({ seq: i.seq, kind: i.kind, board_state: seen.board_state, cleanup: await closeItem(i), last: lastIds.includes(i.item_id) });
   }
   if (gaps.length) throw new Error(`the stream missed ${gaps.length} stored event(s) of the case (${gaps.slice(0, 3).join(",")}): not graded`);
   if (unread.length) throw new Error(`infra: could not read ${unread.join("; ")}: not graded`);

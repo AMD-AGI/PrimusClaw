@@ -104,7 +104,7 @@ async function deferForLockContention(
  * during a rolling upgrade. Either one present is an answer, and finding neither
  * is only ever read as "not deleted", which is what it meant before as well.
  */
-async function sessionWasDeleted(sessionId: string): Promise<boolean> {
+export async function sessionWasDeleted(sessionId: string): Promise<boolean> {
   const buckets = [_kvTombstones, _kv].filter((b): b is KV => b !== null);
   for (const bucket of buckets) {
     try {

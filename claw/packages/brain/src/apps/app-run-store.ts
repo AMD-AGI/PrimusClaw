@@ -87,6 +87,22 @@ export interface AppRunRecord {
   workspace_id: string | null;
   /** The user the grant is signed for. */
   user_id?: string | null;
+  /**
+   * The task's status as the user last saw it (the prior one, for a finish-only
+   * dispatch). Absent from an API older than the field.
+   */
+  task_status?: string;
+  /** The run's session was deleted. Absent from an API older than the field. */
+  session_deleted?: boolean;
+}
+
+/**
+ * Whether the run is over for its user: the task cancelled (or being cancelled),
+ * or the session deleted. Such a run is only ever finished, and nothing is
+ * created for it -- no sandbox to run in, none to read a result from.
+ */
+export function runClosedForUser(rec: Pick<AppRunRecord, "task_status" | "session_deleted">): boolean {
+  return rec.session_deleted === true || rec.task_status === "cancelled" || rec.task_status === "cancelling";
 }
 
 export interface AppRunSecrets {

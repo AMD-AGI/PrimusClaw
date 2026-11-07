@@ -50,7 +50,7 @@ import { provisionTerminalOf } from "../sandbox/errors.js";
 import type { AppSandbox, AppSandboxEnsureOptions, AppSandboxRun } from "./app-sandbox.js";
 import { appStartEnv } from "./app-sandbox.js";
 import {
-  AppRunWriteRefused,
+  AppRunWriteRefused, runClosedForUser,
   type AppLastExit, type AppRunPatch, type AppRunRecord, type AppRunState, type AppRunStore,
 } from "./app-run-store.js";
 import {
@@ -83,6 +83,19 @@ const TEXT_MAX = 300;
  * count of its own.
  */
 export const MAX_STOP_GRACE_SEC = 3600;
+/**
+ * The SIGTERM grace of a run whose session was deleted, whatever the manifest asks for.
+ *
+ * The grace is there so an application can write its own `final` result, and a
+ * deleted session has nobody left to read one: its task is closed and hidden the
+ * moment the delete commits. What the full grace (900 s by default) bought instead
+ * was fifteen minutes of a live grant and its GPU sandboxes after the delete,
+ * measured on 2026-11-07. Short enough that the holder finishes inside the lease it
+ * still has -- the API renews no lease on a task the delete has closed, and the
+ * last renewal can be one heartbeat old -- so the finish does not wait for the
+ * sweeper to hand it to another Brain.
+ */
+export const SESSION_DELETED_STOP_GRACE_SEC = 15;
 
 // ---------------------------------------------------------------------------
 // Ports
@@ -202,6 +215,12 @@ export interface AppRunnerDeps {
   statusTimeoutMs?: number;
   /** Epoch quoted to the API when it signs an extend or a reissue. */
   claimCount?: number;
+  /**
+   * Whether the run's session was deleted. Read only while finishing a run that
+   * was ended from outside; a check that cannot answer says false, which is the
+   * ordinary cancel. Absent means never deleted.
+   */
+  sessionDeleted?: (sessionId: string) => Promise<boolean>;
 }
 
 export interface AppRunOutcome {
@@ -313,6 +332,8 @@ export class AppRunner {
   private readonly claimCount: number;
   /** Fake-clock time before which a grant that was already seen is not looked up again. */
   private grantInspectAfter = 0;
+  /** Latched once the session is seen deleted: a deletion is never undone. */
+  private sessionGone = false;
 
   constructor(
     private readonly runId: string,
@@ -645,6 +666,11 @@ export class AppRunner {
   }
 
   private async inProvisioning(): Promise<TickResult> {
+    // A run its user has cancelled, or whose session is gone, gets no sandbox:
+    // whatever stopped it is about to finish it, and a sandbox made now would be
+    // one more thing to stop -- or, on a Brain that took the run over, the only
+    // thing left running.
+    if (await this.closedBeforeCreate()) return { done: false };
     let sandbox: AppSandbox;
     try {
       sandbox = await this.deps.sandbox.ensure(this.sandboxRun(), this.ensureStop);
@@ -1001,8 +1027,20 @@ export class AppRunner {
     const run: AppGrantRun = this.grantRun(rec);
     const cause = rec.last_exit?.cause ?? "exit";
     const cancelled = cause === "cancelled" || cause === "deadline" || cause === "row_terminal";
+    const sessionGone = cancelled && await this.sessionDeleted(rec);
+    const revokeGrant = async (): Promise<void> => {
+      await this.grant.revoke(run);
+      // Recorded on the row as well, so extendGrant refuses it from here on (and
+      // from any Brain that takes the run over). Only for a run that had a grant.
+      if (rec.grant_id && !this.rec.grant_revoked_at) await this.move({ grant_revoked: true });
+    };
 
-    if (cancelled && !(await this.step("stop_application", () => this.stopApplication(inst)))) return { done: false };
+    // A deleted session ends its run as a cancel with nobody waiting for the result:
+    // the grant goes first, which takes the sandboxes made under it with it, and the
+    // application gets the short grace rather than its own. A step already done is
+    // not repeated, so the order can differ from a takeover's without running twice.
+    if (sessionGone) await this.step("revoke_grant", revokeGrant);
+    if (cancelled && !(await this.step("stop_application", () => this.stopApplication(inst, sessionGone)))) return { done: false };
     await this.step("drain_events", async () => {
       if (!this.seams.drainEvents) return;
       // A sandbox that is gone cannot be read: say what was left, do not spend the step's attempts on it.
@@ -1012,12 +1050,7 @@ export class AppRunner {
       }
       await this.seams.drainEvents(ctx);
     });
-    await this.step("revoke_grant", async () => {
-      await this.grant.revoke(run);
-      // Recorded on the row as well, so extendGrant refuses it from here on (and
-      // from any Brain that takes the run over). Only for a run that had a grant.
-      if (rec.grant_id && !this.rec.grant_revoked_at) await this.move({ grant_revoked: true });
-    });
+    await this.step("revoke_grant", revokeGrant);
     await this.step("unregister_mcp", () => this.seams.unregisterMcp?.(ctx));
     await this.step("stop_sandbox", () => this.stopSandboxes(inst));
 
@@ -1033,12 +1066,13 @@ export class AppRunner {
    * a tick open. After the grace, or once the process is gone, the run goes on
    * and step 5 stops the sandbox. Returns {@link STEP_PENDING} while waiting.
    */
-  private async stopApplication(inst: SandboxInstance | null): Promise<typeof STEP_PENDING | undefined> {
+  private async stopApplication(inst: SandboxInstance | null, sessionGone = false): Promise<typeof STEP_PENDING | undefined> {
     const stateDir = this.rec.state_dir;
     // Never got as far as a sandbox and a state directory: nothing to signal.
     if (!inst || !stateDir) return undefined;
     const graceMs = Math.min(
       this.rec.manifest.stop_grace_sec ?? APP_MANIFEST_DEFAULTS.stop_grace_sec, MAX_STOP_GRACE_SEC,
+      sessionGone ? SESSION_DELETED_STOP_GRACE_SEC : MAX_STOP_GRACE_SEC,
     ) * 1000;
     const sentAt = Date.parse(this.rec.last_exit?.stop_at ?? "");
     const signalled = Number.isFinite(sentAt);
@@ -1063,9 +1097,46 @@ export class AppRunner {
         return STEP_PENDING;
       }
     }
+    // A deleted session has nobody to read a result for, so a sandbox that is gone
+    // is not brought back to read one from shared storage.
+    if (sandboxGone && sessionGone) return undefined;
     // The process exited, never ran, or the grace is over: an application that
     // wrote `final` keeps its own return code and stop reason.
     return this.adoptFinalExit(inst, stateDir, sandboxGone);
+  }
+
+  /**
+   * Whether the run is closed for its user, read again from the database (through
+   * the API) right before a sandbox could be created rather than taken from the
+   * start of the tick; the Brain's own tombstone is asked as well. A read that
+   * fails throws, so the tick ends and nothing is created on a guess.
+   */
+  private async closedBeforeCreate(): Promise<boolean> {
+    const fresh = await this.deps.store.load(this.runId);
+    const closed = runClosedForUser(fresh) || await this.sessionDeleted(fresh);
+    if (closed) {
+      logger.info(
+        { runId: this.runId, state: fresh.state, taskStatus: fresh.task_status, sessionDeleted: fresh.session_deleted === true },
+        "app_run.sandbox_not_created_run_closed",
+      );
+    }
+    return closed;
+  }
+
+  /**
+   * Whether the run's session was deleted: the row says so (the database), or the
+   * Brain's tombstone does. Latched; false only when neither can tell.
+   */
+  private async sessionDeleted(rec: Pick<AppRunRecord, "session_id" | "session_deleted">): Promise<boolean> {
+    if (this.sessionGone) return true;
+    if (rec.session_deleted === true) return (this.sessionGone = true);
+    if (!this.deps.sessionDeleted || !rec.session_id) return false;
+    try {
+      this.sessionGone = await this.deps.sessionDeleted(rec.session_id);
+    } catch (err) {
+      logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.session_deleted_check_failed");
+    }
+    return this.sessionGone;
   }
 
   /**
@@ -1079,6 +1150,11 @@ export class AppRunner {
    */
   private async readFinalFromSharedStorage(stateDir: string): Promise<Extract<ExitRead, { kind: "exit" }> | null> {
     if (this.rec.last_exit?.recovery === true) return null;
+    // A cancel keeps the cancel whatever the application wrote, and a deleted
+    // session has nobody to read for: neither is worth a sandbox the size of the
+    // application's. Measured on 2026-11-07, a finish-only takeover of a deleted
+    // session's run made one, as the run's last act.
+    if (await this.closedBeforeCreate()) return null;
     const reader = await this.deps.sandbox.ensure(this.sandboxRun(), this.ensureStop);
     const exit = await this.readExit(reader.instance, stateDir);
     // A read that failed (the sandbox could not be made, the file could not be

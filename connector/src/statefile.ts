@@ -21,6 +21,9 @@ import path from "node:path";
 export const STATE_WRITE_WAIT_MS = 10_000;
 /** A write that took longer than this is reported when it finishes. */
 export const SLOW_WRITE_MS = 5_000;
+/** A failed snapshot write is tried again after this, doubling up to {@link RETRY_MAX_MS}, until it lands. */
+export const RETRY_MIN_MS = 1_000;
+export const RETRY_MAX_MS = 30_000;
 
 /** Told of a write that failed, or finished slowly (`ms` past {@link SLOW_WRITE_MS}). */
 export type WriteReport = (what: string, info: { ms: number; error?: string }) => void;
@@ -86,6 +89,10 @@ export async function writeWhole(file: string, data: string, mode = 0o600, durab
 /**
  * A small file that is rewritten whole (connector.json): `save` returns at once, the newest content is written in the
  * background, one write at a time. Content saved while a write is under way replaces whatever else was waiting.
+ *
+ * A write that fails (a quota used up, a disk full or gone) is tried again on its own, after {@link RETRY_MIN_MS} and then
+ * up to every {@link RETRY_MAX_MS}, until it lands or newer content replaces it: children.json, which `stop` reads to find
+ * the agents to end, must not stay stale until something else happens to change (2026-11-07, EDQUOT on an NFS share).
  */
 export class SnapshotFile {
   private latest = "";
@@ -94,10 +101,19 @@ export class SnapshotFile {
   private written = 0;
   private failed = 0;
   private running: Promise<void> | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retries = 0;
+  private closed = false;
   private readonly waiters: Array<{ upTo: number; resolve: (ok: boolean) => void }> = [];
 
-  /** `durable`: each write is flushed to the disk before it replaces the file ({@link writeWhole}). */
-  constructor(readonly file: string, private readonly report?: WriteReport, private readonly durable = false) {}
+  /**
+   * `durable`: each write is flushed to the disk before it replaces the file ({@link writeWhole}). `access`: how a retry
+   * checks that the directory is still there (the tests hold it pending).
+   */
+  constructor(
+    readonly file: string, private readonly report?: WriteReport, private readonly durable = false,
+    private readonly access: (dir: string) => Promise<unknown> = (dir) => fsp.access(dir),
+  ) {}
 
   save(data: string): void {
     this.latest = data;
@@ -136,6 +152,41 @@ export class SnapshotFile {
     this.running = null;
     // Saved again while the last write was failing: try once more for the newer content.
     if (this.written < this.saved && this.failed < this.saved) this.running = this.drain();
+    else if (this.written < this.saved) this.retryLater();
+    else this.retries = 0;
+  }
+
+  /** No more retries on its own (the connector that owns the file has stopped); `save` and `settled` still write. */
+  close(): void {
+    this.closed = true;
+    if (this.retryTimer !== null) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
+
+  /** The retry itself, unless closed meanwhile, or a drain already runs, or nothing is left to write. */
+  private retryNow(): void {
+    if (this.closed || this.running !== null || this.written >= this.saved) return;
+    this.failed = this.written;
+    this.running = this.drain();
+  }
+
+  /** After a failed write with nothing newer to write: the same content again, later. */
+  private retryLater(): void {
+    if (this.retryTimer !== null || this.closed) return;
+    const ms = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** Math.min(this.retries, 10));
+    this.retries += 1;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (this.closed || this.running !== null || this.written >= this.saved) return;
+      // A directory that is gone (removed on purpose: a reinstall, a test's cleanup) is not made again by a retry of its
+      // own; a save or a settled() writes it as before. The check holds nothing: a save or a settled() that arrives
+      // while it is under way starts its drain at once, exactly as with no retry pending.
+      this.access(path.dirname(this.file)).then(() => this.retryNow(), (e: NodeJS.ErrnoException) => {
+        // Anything but ENOENT (the disk not answering): tried again later.
+        if (e?.code !== "ENOENT") this.retryLater();
+      });
+    }, ms);
+    this.retryTimer.unref?.();
   }
 }
 

@@ -779,6 +779,83 @@ describe("assistant outbound", { skip }, () => {
       }
     });
 
+    test("about no item, is sent to the user's next subscription, once, as it was said; one older than a day is not", async () => {
+      // Before, only a say about an item that still needs the user was sent again: a user whose channel's subscription was
+      // missing for a moment lost every other say of that moment for good.
+      const post = (payload: unknown) => app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: payload as object });
+      try {
+        const old = await say("from yesterday");
+        await q("UPDATE claw_assistant_says SET created_at = NOW() - interval '25 hours' WHERE say_id = $1", [old.say_id]);
+        const first = await say("Done: the report is in your files.", { turnMessageId: "m-1" });
+        const second = await say("And the build is green.");
+        assert.deepEqual([first.subscribers, second.subscribers], [0, 0], "nothing could carry them");
+
+        const created = await post({ url: "https://93.184.216.34/a", event_types: ["assistant.say"] });
+        assert.equal(created.statusCode, 201, created.body);
+        const id = created.json().data.subscription_id;
+        const queued = await outboxRows();
+        assert.deepEqual(queued.map((r) => [r.event_id, r.subscription_id, r.payload.text]),
+          [[first.say_id, id, "Done: the report is in your files."], [second.say_id, id, "And the build is green."]],
+          "both, oldest first; not the one from yesterday");
+        assert.equal(queued[0].payload.turn_message_id, "m-1", "the payload it would have had, not one rebuilt from its text");
+        await deliver();
+        assert.deepEqual(sent.map((r) => r.headers[EVENT_ID_HEADER]), [first.say_id, second.say_id]);
+        assert.ok((await saysRows()).filter((x) => x.say_id !== old.say_id).every((x) => x.delivered_at), "marked delivered");
+
+        // Once: neither the same subscription changed nor another one made later is sent them again.
+        const patch = await app.inject({ method: "PATCH", url: `/v1/notification-subscriptions/${id}`, payload: { event_types: ["assistant.say", "run.completed"] } });
+        assert.equal(patch.statusCode, 200);
+        await post({ url: "https://93.184.216.34/b", event_types: ["assistant.say"] });
+        assert.equal((await outboxRows()).length, 2);
+        // A say a subscription carried is not kept for a later one.
+        assert.equal((await say("carried")).subscribers, 2);
+        assert.equal((await saysRows()).find((x) => x.text === "carried").unsent_payload, null);
+      } finally { restore(); }
+    });
+
+    test("about no item, every one of the last day is sent, however many there are", async () => {
+      const n = 230;
+      for (let i = 0; i < n; i++) {
+        const id = outbox.deterministicEventId("test.unsent", "u1", String(i));
+        await q(
+          `INSERT INTO claw_assistant_says (say_id, user_id, text, created_at, unsent_payload)
+           VALUES ($1, 'u1', $2, NOW() - make_interval(secs => $3), $4::jsonb)`,
+          [id, `say ${i}`, n - i, JSON.stringify({ type: "assistant.say", event_id: id, occurred_at: new Date().toISOString(), user_id: "u1", text: `say ${i}` })],
+        );
+      }
+      const created = await app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: { url: "https://93.184.216.34/a", event_types: ["assistant.say"] } });
+      assert.equal(created.statusCode, 201, created.body);
+      const queued = await outboxRows();
+      assert.equal(queued.length, n, "not only the first page");
+      assert.equal(new Set(queued.map((r) => r.event_id)).size, n, "each once");
+      assert.deepEqual(queued.slice(0, 3).map((r) => r.payload.text), ["say 0", "say 1", "say 2"], "oldest first");
+    });
+
+    test("a receiver that makes its subscription again is sent, once each, what was queued for the old one and what was said meanwhile", async () => {
+      // The restart-like case: the receiver is down, deletes its subscription and makes a new one, as the Teams bot does when it has lost the old one's secret.
+      const post = (payload: unknown) => app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: payload as object });
+      try {
+        const a = (await post({ url: "https://93.184.216.34/a", event_types: ["assistant.say"] })).json().data;
+        const before = await say("said while it was down");
+        status = 503;
+        await settle();
+        assert.equal((await outboxRows())[0].last_status, "http_503");
+        assert.equal((await app.inject({ method: "DELETE", url: `/v1/notification-subscriptions/${a.subscription_id}` })).statusCode, 200);
+        const between = await say("said while it had no subscription");
+        assert.equal(between.subscribers, 0);
+
+        status = 200;
+        sent.length = 0;
+        const b = (await post({ url: "https://93.184.216.34/b", event_types: ["assistant.say"] })).json().data;
+        assert.deepEqual((await outboxRows()).map((r) => [r.event_id, r.subscription_id]),
+          [[before.say_id, b.subscription_id], [between.say_id, b.subscription_id]], "one row each, both on the new subscription");
+        await deliver();
+        await makeDue();
+        await deliver();
+        assert.deepEqual(sent.map((r) => r.headers[EVENT_ID_HEADER]).sort(), [before.say_id, between.say_id].sort(), "each exactly once");
+      } finally { restore(); }
+    });
+
     test("is sent to a subscription when it starts taking the assistant's events, once, for items that still need the user", async () => {
       const post = (payload: unknown) => app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: payload as object });
       try {

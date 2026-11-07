@@ -919,6 +919,9 @@ func TestReclaimCountsLiveGPUSecondsOnce(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := svc.MarkRunning(context.Background(), req.GrantID, "sbx-1", RunningUpdate{}); err != nil {
+		t.Fatal(err)
+	}
 	clock = now.Add(10 * time.Second)
 	if err := svc.EndSandbox(context.Background(), req.GrantID, "sbx-1", "killed"); err != nil {
 		t.Fatal(err)
@@ -927,6 +930,9 @@ func TestReclaimCountsLiveGPUSecondsOnce(t *testing.T) {
 		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-2",
 		TemplateID: "ar-01ja-runner-g1", GPUs: 4, TimeoutSec: 60,
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.MarkRunning(context.Background(), req.GrantID, "sbx-2", RunningUpdate{}); err != nil {
 		t.Fatal(err)
 	}
 	clock = now.Add(15 * time.Second)
@@ -943,6 +949,100 @@ func TestReclaimCountsLiveGPUSecondsOnce(t *testing.T) {
 	}
 	if len(reclaimer.ids) != 1 || reclaimer.ids[0] != "sbx-2" {
 		t.Fatalf("reclaimed=%v", reclaimer.ids)
+	}
+}
+
+// gpuSecondsGrant issues a grant with a GPU-hour budget and a clock the test moves.
+func gpuSecondsGrant(t *testing.T) (*Service, IssueRequest, *time.Time) {
+	t.Helper()
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, _ := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	req := sampleRequest(now.Add(2 * time.Hour))
+	req.GPUHoursBudget = 6
+	req.Roles["measurement"] = RoleRequest{Templates: []string{"runner"}, MaxSandboxes: 2, MaxGPUs: 8}
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"sbx-1", "sbx-2"} {
+		if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+			GrantID: req.GrantID, Role: "measurement", SandboxID: id,
+			TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 3600,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return svc, req, &clock
+}
+
+func grantGPUSeconds(t *testing.T, svc *Service, grantID string) int64 {
+	t.Helper()
+	view, err := svc.Get(context.Background(), grantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return view.GPUSeconds
+}
+
+// Two sandboxes held SchedulingGated for 1677 s and then deleted must not
+// spend the grant's GPU hours (hosting smoke #4 charged 3354 s).
+func TestPendingSandboxEndedChargesNoGPUSeconds(t *testing.T) {
+	svc, req, clock := gpuSecondsGrant(t)
+	*clock = clock.Add(1677 * time.Second)
+	if err := svc.EndSandbox(context.Background(), req.GrantID, "sbx-1", "killed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.FailSandbox(context.Background(), req.GrantID, "sbx-2", "pending_timeout"); err != nil {
+		t.Fatal(err)
+	}
+	if got := grantGPUSeconds(t, svc, req.GrantID); got != 0 {
+		t.Fatalf("gpuSeconds=%d after two never-running sandboxes ended, want 0", got)
+	}
+}
+
+// A sandbox pending for 100 s and then running for 30 s on 1 GPU charges 30 s.
+// Marking it running again does not move the start of the charge.
+func TestGPUSecondsChargeOnlyRunningTime(t *testing.T) {
+	svc, req, clock := gpuSecondsGrant(t)
+	start := *clock
+	*clock = start.Add(100 * time.Second)
+	if err := svc.MarkRunning(context.Background(), req.GrantID, "sbx-1", RunningUpdate{}); err != nil {
+		t.Fatal(err)
+	}
+	*clock = start.Add(120 * time.Second)
+	if err := svc.MarkRunning(context.Background(), req.GrantID, "sbx-1", RunningUpdate{NodeName: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+	*clock = start.Add(130 * time.Second)
+	if err := svc.EndSandbox(context.Background(), req.GrantID, "sbx-1", "killed"); err != nil {
+		t.Fatal(err)
+	}
+	if got := grantGPUSeconds(t, svc, req.GrantID); got != 30 {
+		t.Fatalf("gpuSeconds=%d, want 30 (running 100s..130s on 1 GPU)", got)
+	}
+	// The pending sibling reclaimed at revoke adds nothing.
+	*clock = start.Add(200 * time.Second)
+	if _, err := svc.Revoke(context.Background(), req.GrantID); err != nil {
+		t.Fatal(err)
+	}
+	if got := grantGPUSeconds(t, svc, req.GrantID); got != 30 {
+		t.Fatalf("gpuSeconds=%d after revoke, want 30", got)
+	}
+}
+
+// A running ref written before runningAt existed is still charged from startedAt.
+func TestChargedGPUSecondsLegacyRunningRef(t *testing.T) {
+	start := time.Now().UTC().Truncate(time.Second)
+	end := start.Add(50 * time.Second)
+	legacy := runtimev1alpha1.GrantSandboxRef{GPUs: 2, State: runtimev1alpha1.SandboxRunning, StartedAt: metav1.NewTime(start)}
+	if got := chargedGPUSeconds(legacy, end); got != 100 {
+		t.Fatalf("legacy running=%d, want 100", got)
+	}
+	pending := runtimev1alpha1.GrantSandboxRef{GPUs: 2, State: runtimev1alpha1.SandboxPending, StartedAt: metav1.NewTime(start)}
+	if got := chargedGPUSeconds(pending, end); got != 0 {
+		t.Fatalf("pending=%d, want 0", got)
 	}
 }
 

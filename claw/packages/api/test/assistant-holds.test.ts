@@ -125,7 +125,8 @@ describe("assistant holds", { skip }, () => {
     assert.equal(row.board_state, "needs_you");
     assert.equal(row.last_report_kind, "waiting");
     assert.equal(row.attention_seq, 1);
-    assert.match(row.pending_question, /^Approve or deny: mcp__safe__workload_stop .*workload_id=sa-eval-fixture-sleep/);
+    assert.match(row.pending_question, /^Approve or deny: Stop the workload sa-eval-fixture-sleep on SaFE, with token=/);
+    assert.doesNotMatch(row.pending_question, /\bmcp__/, "an English writer reads what it does too, not the tool's name");
     assert.equal(row.pending_question.includes("ghp_abcdefghijklmnop"), false, "a credential in the call is masked");
     assert.equal(row.params.holds.length, 1);
     assert.equal(row.params.holds[0].tool_use_id, "tu-1");
@@ -265,7 +266,7 @@ describe("assistant holds", { skip }, () => {
     assert.equal(rows.length, 1);
     assert.equal(rows[0].payload.type, "work_item.needs_you");
     // What it would do, with its inputs masked, and where to answer it: not the board's one line.
-    assert.match(rows[0].payload.text, /^#1 "Stop the sleeper" needs your approval to: Run mcp__safe__workload_stop workload_id=sa-eval-fixture-sleep token=<redacted>\.\nApprove or deny it on its card in your chat, or in this task in the console, before \d\d:\d\d UTC; after that it is refused\.$/);
+    assert.match(rows[0].payload.text, /^#1 "Stop the sleeper" needs your approval to: Stop the workload sa-eval-fixture-sleep on SaFE, with token=<redacted>\.\nApprove or deny it on its card in your chat, or in this task in the console, before \d\d:\d\d UTC; after that it is refused\.$/);
     const says = await w.q("SELECT * FROM claw_assistant_says");
     assert.equal(says.length, 1);
     assert.equal(says[0].item_attention_seq, 1);
@@ -276,7 +277,8 @@ describe("assistant holds", { skip }, () => {
       { item_id: card?.item_id, session_id: card?.session_id, tool_use_id: card?.tool_use_id },
       { item_id: item.itemId, session_id: item.workerSid, tool_use_id: "tu-1" },
     );
-    assert.match(String(card.action), /^Run mcp__safe__workload_stop workload_id=sa-eval-fixture-sleep token=<redacted>$/);
+    assert.match(String(card.action), /^Stop the workload sa-eval-fixture-sleep on SaFE, with token=<redacted>$/);
+    assert.doesNotMatch(String(card.action), /\bmcp__/, "the card says what it does, not the tool's name");
     assert.ok(!JSON.stringify(card).includes("ghp_"), "the credential is masked on the card too");
   });
 
@@ -412,7 +414,7 @@ describe("assistant holds", { skip }, () => {
     await deliver(item.workerSid, decided("tu-2", "deny"));
     row = await w.item(item.itemId);
     assert.equal(row.board_state, "needs_you");
-    assert.match(row.pending_question, /^Approve or deny: mcp__safe__workload_stop/);
+    assert.match(row.pending_question, /^Approve or deny: Stop the workload sa-eval-fixture-sleep on SaFE/);
     assert.deepEqual(ids(row.params.holds), ["tu-1"]);
     assert.equal(row.attention_seq, 2, "the same need, one request fewer");
     assert.equal((await w.itemEvents(item.itemId)).at(-1)!.summary, "denied");
@@ -633,7 +635,7 @@ describe("assistant holds", { skip }, () => {
     await deliver(item.workerSid, commentHeld(turn));
     const rows = await outbox();
     assert.deepEqual(rows.map((r) => r.payload.type), ["work_item.needs_you"], "no report, nothing said before the request");
-    assert.match((await w.item(item.itemId)).pending_question, /^Approve or deny: mcp__github__issue_comment /);
+    assert.equal((await w.item(item.itemId)).pending_question, "Approve or deny: Post a comment on AMD-AGI/PrimusClaw#322 as your GitHub account");
     const text = rows[0].payload.text as string;
     assert.ok(text.startsWith(`#${item.seq} "Comment on PR 322" needs your approval to: Post a comment on AMD-AGI/PrimusClaw#322 as your GitHub account.`), text);
     assert.ok(text.includes(COMMENT.body));

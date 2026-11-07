@@ -98,6 +98,123 @@ export type EndVerdict =
   | { ok: true; ended: number[] }
   | { ok: false; reason: "session_live_elsewhere" | "takeover_not_permitted" | "takeover_failed" | "terminal_did_not_exit" | "recently_written" | "twin_check_failed"; detail: string };
 
+/**
+ * What a transcript gained since a mark, as {@link classifyAppended} reads it: `self`, only what Claude Code itself writes
+ * between two prompts (`size` is where it ends; `tasks`, the background tasks started in it); `other`, something a person
+ * or another program did; `partial`, the last entry is not complete yet.
+ */
+export type Appended = { by: "self"; size: number; tasks: string[] } | { by: "other"; why: string } | { by: "partial" };
+
+/**
+ * What the connector's own agent is known to have written: the program its turns name (`entrypoint`, `sdk-cli` for
+ * claude-agent-acp 0.99.0; null until it has taken a turn) and the ids of the background tasks it started.
+ */
+export interface OwnWrites {
+  entrypoint: string | null;
+  tasks: ReadonlySet<string>;
+}
+
+/** How much of a transcript's growth between two prompts is read to tell who wrote it; more than this is not the agent's own. */
+export const MAX_APPENDED_READ = 4 * 1024 * 1024;
+
+/**
+ * The prompt Claude Code writes for itself (measured on 2.1.312/2.1.319): a background task it started has finished
+ * (`origin.kind: "task-notification"`, `promptSource: "system"`, the content naming `<task-id>`) and it takes a turn on its
+ * own to answer it. A person's prompt says `human`, typed in a terminal (`promptSource: "typed"`) as well as sent through
+ * the SDK (`"sdk"`).
+ */
+const TASK_NOTIFICATION = "task-notification";
+const TASK_ID_RE = /<task-id>([^<\s]{1,200})<\/task-id>/g;
+const INTERRUPTED = "[Request interrupted by user";
+
+/**
+ * Whether what was appended to a transcript between two prompts (`text`, starting at an entry boundary) can only be the
+ * connector's own agent at work, with no person and no other program involved. It is `self` only when every entry
+ * - names no program (`entrypoint`) other than the one the agent's own turns were written by (a terminal's say `cli`),
+ *   and none at all may name one while that is not known;
+ * - and is no prompt, unless it is Claude Code's notification that a background task finished which this agent started
+ *   (its `<task-id>` was in the agent's own writes: another process of the same program cannot pass one of its own tasks
+ *   off as the agent's), or Claude Code's own `[Request interrupted by user]` note. Any other prompt is someone else's turn.
+ * Anything it cannot read is `other`. `end` is the byte offset `text` ends at.
+ */
+export function classifyAppended(text: string, own: OwnWrites, end: number): Appended {
+  if (text.length && !text.endsWith("\n")) return { by: "partial" };
+  const tasks = new Set(own.tasks);
+  const started: string[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let o: unknown;
+    try { o = JSON.parse(line); } catch { return { by: "other", why: "an entry that does not parse" }; }
+    if (!isObject(o)) return { by: "other", why: "an entry that is not an object" };
+    if (typeof o.entrypoint === "string" && (own.entrypoint === null || o.entrypoint !== own.entrypoint)) {
+      return { by: "other", why: own.entrypoint === null ? "entries of a program, and which one is the agent's is not known yet" : "entries written by another program" };
+    }
+    if (o.type !== "user") continue;
+    if (isPrompt(o)) {
+      const kind = isObject(o.origin) && typeof o.origin.kind === "string" ? o.origin.kind : null;
+      if (kind === TASK_NOTIFICATION) {
+        const ids = notifiedTasks(o);
+        if (!ids.length || !ids.every((id) => tasks.has(id))) return { by: "other", why: "a notification of a task this agent did not start" };
+        continue;
+      }
+      if (kind === null && isInterruptedNote(o)) continue;
+      return { by: "other", why: "a prompt this connector did not send" };
+    }
+    // The agent's own turn on a notification may start another background task: its notification is the agent's too.
+    const id = backgroundTaskId(o);
+    if (id !== null) { tasks.add(id); started.push(id); }
+  }
+  return { by: "self", size: end, tasks: started };
+}
+
+/**
+ * What the complete entries of `text`, one turn of the agent's own, say about its writes: the one `entrypoint` they name
+ * (null when none or more than one does) and the background tasks started in it.
+ */
+export function ownTurnOf(text: string): { entrypoint: string | null; tasks: string[] } {
+  const seen = new Set<string>();
+  const tasks: string[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let o: unknown;
+    try { o = JSON.parse(line); } catch { continue; /* a line cut by the range: it says nothing */ }
+    if (!isObject(o)) continue;
+    if (typeof o.entrypoint === "string") seen.add(o.entrypoint);
+    const id = backgroundTaskId(o);
+    if (id !== null) tasks.push(id);
+  }
+  return { entrypoint: seen.size === 1 ? [...seen][0]! : null, tasks };
+}
+
+/** A `user` entry that carries something to answer: text or an image, not only the results of the agent's own tool calls. */
+function isPrompt(o: Record<string, unknown>): boolean {
+  const content = isObject(o.message) ? o.message.content : undefined;
+  // A string, or anything not known to be only tool results (no content at all included), counts as a prompt.
+  if (!Array.isArray(content)) return true;
+  return content.some((b) => !isObject(b) || b.type !== "tool_result");
+}
+
+function isInterruptedNote(o: Record<string, unknown>): boolean {
+  const content = isObject(o.message) ? o.message.content : undefined;
+  if (typeof content === "string") return content.startsWith(INTERRUPTED);
+  return Array.isArray(content) && content.length > 0
+    && content.every((b) => isObject(b) && b.type === "text" && typeof b.text === "string" && b.text.startsWith(INTERRUPTED));
+}
+
+/** The `<task-id>`s a task notification names. */
+function notifiedTasks(o: Record<string, unknown>): string[] {
+  const content = isObject(o.message) ? o.message.content : undefined;
+  const texts = typeof content === "string" ? [content]
+    : Array.isArray(content) ? content.flatMap((b) => (isObject(b) && typeof b.text === "string" ? [b.text] : [])) : [];
+  return texts.flatMap((t) => [...t.matchAll(TASK_ID_RE)].map((m) => m[1]!));
+}
+
+/** The background task a tool call started, as the result of a `run_in_background` call records it (`toolUseResult.backgroundTaskId`). */
+function backgroundTaskId(o: Record<string, unknown>): string | null {
+  const r = o.toolUseResult;
+  return isObject(r) && typeof r.backgroundTaskId === "string" && r.backgroundTaskId ? r.backgroundTaskId : null;
+}
+
 export type Resolved = { ok: true; item: Listed } | { ok: false; reason: "unknown_session" | "catalog_unavailable" };
 
 /** The check could not be answered. Attaching is refused: not being able to read it is not "nothing is open". */
@@ -301,7 +418,8 @@ export class AttachSupport {
       const out: Resumable = { ref: l.ref, title: l.title, cwd: l.cwd, updated_at: Math.floor(l.updatedAt / 1000), state };
       if (state === "live") {
         Object.assign(out, liveActivity(holders));
-        if (this.typesIntoTerminals() && holders.length > 0 && holders.every((e) => !e.foreign) && holders.some((e) => paneHint(e.pid))) out.input = "terminal";
+        // (a row of another pid domain does not stop typing: see `terminalPane`)
+        if (this.typesIntoTerminals() && holders.some((e) => !e.foreign && paneHint(e.pid))) out.input = "terminal";
       }
       return out;
     });
@@ -605,8 +723,14 @@ export class AttachSupport {
 
   /**
    * The tmux pane of the one local process of this user's, working inside the roots, that holds `ref` open: the terminal a
-   * message to it is typed into. Not when more than one process holds it (which one would get it?), when one of them is on
-   * another machine, or when it is not a tmux pane that this user's tmux server proves runs it (terminal-input.ts `findPane`).
+   * message to it is typed into. Not when more than one local process holds it (which one would get it?), or when it is not a
+   * tmux pane that this user's tmux server proves runs it (terminal-input.ts `findPane`).
+   *
+   * A registry row of another pid domain does not stop it. Such a row is a process on another machine sharing this Claude
+   * directory, or the leftover of a process that died with an earlier boot of this one (a dev container on a shared disk
+   * restarts, and Claude Code never removes the rows of processes killed with it), and nothing here can tell which. For
+   * typing it makes no difference: the message is typed into the local terminal, as the person at it would type it, so it adds
+   * no writer to the conversation. (Ending holders for a takeover still refuses such a row: `endHolders`.)
    */
   async terminalPane(ref: string): Promise<PaneLookup> {
     if (!this.typesIntoTerminals()) return { ok: false, why: "typing into a terminal is turned off for this agent (terminal_input = false)" };
@@ -614,8 +738,7 @@ export class AttachSupport {
     const want = ref.toLowerCase();
     let live: LiveEntry[];
     try { live = await this.liveEntries(); } catch (e) { return { ok: false, why: errMessage(e) }; }
-    const holders = live.filter((e) => e.sessionId.toLowerCase() === want);
-    if (holders.some((e) => e.foreign)) return { ok: false, why: "it is open on another machine that shares this Claude directory" };
+    const holders = live.filter((e) => e.sessionId.toLowerCase() === want && !e.foreign);
     const pids = [...new Set(holders.map((e) => e.pid))];
     if (pids.length !== 1) return { ok: false, why: pids.length ? `${pids.length} processes have it open` : "no process has it open" };
     const pid = pids[0]!;
@@ -646,6 +769,51 @@ export class AttachSupport {
   transcriptSize(ref: string): number | null {
     const file = SESSION_REF_RE.test(ref) ? this.transcriptFile(ref.toLowerCase()) : null;
     try { return file ? fs.statSync(file).size : null; } catch { return null; }
+  }
+
+  /**
+   * Who wrote what the transcript gained after byte `from` (see {@link classifyAppended}). `partial`: its last entry is still
+   * being written. Null when there is no transcript, it shrank, or it grew by more than can be read here.
+   */
+  appendedSince(ref: string, from: number, own: OwnWrites): Appended | null {
+    const file = SESSION_REF_RE.test(ref) ? this.transcriptFile(ref.toLowerCase()) : null;
+    if (!file) return null;
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(file, "r");
+      const size = fs.fstatSync(fd).size;
+      if (size < from || size - from > MAX_APPENDED_READ) return null;
+      const buf = Buffer.alloc(size - from);
+      let got = 0;
+      while (got < buf.length) {
+        const n = fs.readSync(fd, buf, got, buf.length - got, from + got);
+        if (n === 0) break;
+        got += n;
+      }
+      return classifyAppended(buf.subarray(0, got).toString("utf8"), own, from + got);
+    } catch {
+      return null;
+    } finally {
+      if (fd !== null) try { fs.closeSync(fd); } catch { /* already gone */ }
+    }
+  }
+
+  /** What bytes [`from`, `to`) of the transcript, one turn of the agent's own, say about its writes ({@link ownTurnOf}); null when unreadable. */
+  ownTurn(ref: string, from: number, to: number): { entrypoint: string | null; tasks: string[] } | null {
+    const file = SESSION_REF_RE.test(ref) ? this.transcriptFile(ref.toLowerCase()) : null;
+    if (!file || to <= from || to - from > MAX_APPENDED_READ) return null;
+    try {
+      const fd = fs.openSync(file, "r");
+      try {
+        const buf = Buffer.alloc(to - from);
+        const n = fs.readSync(fd, buf, 0, buf.length, from);
+        return ownTurnOf(buf.subarray(0, n).toString("utf8"));
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return null;
+    }
   }
 
   /** Where the conversation's transcript is, or null when it cannot be found (yet). */

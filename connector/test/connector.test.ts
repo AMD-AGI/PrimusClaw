@@ -224,6 +224,44 @@ describe("the forced ask mode, read back", () => {
       await h.claw.until("adapter process stopped", () => h.connector.registry.list().length === 0);
     });
   }
+  test("a session refused while its mode is being read back is refused once, and its command ends then, not when the read-back would give up", async () => {
+    // CI 2026-11-07: the read-back went on after the refusal, past the end of the run that took the command; it then refused
+    // the session a second time and, the command done, rewrote connector.json into a state directory removed meanwhile.
+    const h = await make({ env: { FAKE_NO_CONFIG_OPTION: "1", FAKE_WARN_AFTER_LOCK: "1" }, timing: { modeConfirmMs: 60_000 } });
+    const sid = await h.newSession();
+    assert.equal(h.claw.eventsOf(sid, "session_closed")[0]!.data.reason, "mode_not_enforced");
+    const seq = h.claw.commands.find((c) => c.payload.session_id === sid)!.seq;
+    await h.claw.until("a heartbeat that counts the command carried out", () => h.claw.heartbeats.some((b) => (b.cmd_cursor ?? 0) >= seq));
+    assert.deepEqual(h.audit().filter((a) => a.kind === "session_refused").map((a) => a.reason), ["mode_not_enforced"]);
+  });
+  test("a run stopped while a session is opening ends with that command, so nothing the command writes comes after the run", async () => {
+    const h = await make({ env: { FAKE_NO_CONFIG_OPTION: "1" }, timing: { modeConfirmMs: 60_000 } });
+    await h.online();
+    h.claw.newSession("fake", h.work);
+    await h.claw.until("the mode being read back", () => h.adapterLog().some((l) => l.method === "session/set_config_option"));
+    const t0 = Date.now();
+    await h.stop();
+    assert.ok(Date.now() - t0 < 5_000, `the read-back ends with its adapter (stopping took ${Date.now() - t0} ms)`);
+    assert.ok(h.audit().some((a) => a.kind === "session_refused"), "the opening had ended when the run returned");
+  });
+  test("a run waits for a command it took to be carried out before it returns", async () => {
+    const h = await make();
+    await h.online();
+    // A command that takes its time whatever the adapter does (a folder on a slow disk being looked at, say).
+    const m = h.connector.manager as any;
+    const run = m.run.bind(m);
+    let ended = false;
+    m.run = async (cmd: any, handled: () => void) => {
+      if (cmd.type !== "session.new") return run(cmd, handled);
+      await sleep(400);
+      ended = true;
+      return false;
+    };
+    h.claw.newSession("fake", h.work);
+    await h.claw.until("the command taken", () => h.connector["ledger"].highestSeen > 0);
+    await h.stop();
+    assert.ok(ended, "the command had ended when the run returned");
+  });
   test("the read-back can come from a mode notification when the adapter has no mode option", async () => {
     const h = await make({ env: { FAKE_NO_CONFIG_OPTION: "1", FAKE_NOTIFY_MODE: "1" } });
     const sid = await h.newSession();
@@ -533,6 +571,35 @@ describe("permissions", () => {
     assert.deepEqual(refused.map((e) => [e.data.type, e.data.cmd_id, e.data.cmd_seq, e.data.reason]), [["prompt", "p-never", never, "cancelled"]]);
     assert.ok(refused[0]!.seq < end.seq);
     assert.equal(h.turnEnds(sid).length, 1);
+  });
+  test("withdraw takes back the prompts queued behind a running turn, refusing each by name, and leaves the turn running", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    h.prompt(sid, "hang", { cmd_id: "p-hang" });
+    const later = h.prompt(sid, "say later", { cmd_id: "p-later" });
+    await h.claw.until("the turn to be running", () => h.adapterLog().some((l) => l.prompt === "hang"));
+    h.claw.issue("withdraw", sid, { cmd_id: "w-1" });
+    await h.claw.until("the queued prompt to be refused", () => h.claw.eventsOf(sid, "command_rejected").length > 0);
+    const refused = h.claw.eventsOf(sid, "command_rejected");
+    assert.deepEqual(refused.map((e) => [e.data.type, e.data.cmd_id, e.data.cmd_seq, e.data.reason]), [["prompt", "p-later", later, "withdrawn"]]);
+    await sleep(150);
+    assert.ok(!h.adapterLog().some((l) => l.method === "session/cancel"), "nothing that runs is stopped");
+    assert.equal(h.turnEnds(sid).length, 0, "the running turn goes on");
+    assert.ok(!h.adapterLog().some((l) => l.prompt === "say later"));
+  });
+  test("withdraw with nothing waiting does nothing at all: no turn end, no refusal", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    h.claw.issue("withdraw", sid, { cmd_id: "w-idle" });
+    await sleep(200);
+    assert.equal(h.turnEnds(sid).length, 0);
+    assert.deepEqual(h.claw.eventsOf(sid, "command_rejected"), []);
+  });
+  test("an agent says it can take a waiting prompt back (withdraw)", async () => {
+    const h = await make();
+    await h.claw.until("a heartbeat", () => h.claw.heartbeats.length > 0);
+    const agents = h.claw.heartbeats.at(-1)!.agents as Array<{ capabilities: Record<string, unknown> }>;
+    assert.ok(agents.length > 0 && agents.every((a) => a.capabilities.withdraw === true));
   });
   test("a cancel with nothing running still answers once, naming no prompt", async () => {
     const h = await make();

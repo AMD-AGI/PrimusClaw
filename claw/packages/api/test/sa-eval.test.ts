@@ -245,6 +245,30 @@ test("S9 the seed set", () => {
   for (const c of cases) assert.equal(passed(grade(c, empty)), false, c.id);
 });
 
+test("S9b the review-as-X set, the multi-turn scripts and the recent-issue cases", () => {
+  const { cases } = loadCases(SEED_DIR);
+  const of = (dir: string) => cases.filter((c) => c.dir === dir);
+  const review = of("review-a8");
+  assert.ok(review.length >= 20, `${review.length} review-a8 cases`);
+  // Review as another person, a merge confirmation and stopping a review are each covered.
+  assert.ok(review.some((c) => c.turns.some((t) => t.user.includes("{EVAL_OTHER_PERSON}")) && c.route === "review"));
+  assert.ok(review.some((c) => c.tools_must?.some((p) => toolPattern(p).test("mcp__assistant__confirmation_answer"))));
+  assert.ok(review.some((c) => c.tools_must?.some((p) => toolPattern(p).test("mcp__assistant__work_stop"))));
+  // A merged pull request is answered with when it merged, read from GitHub, and starts no review.
+  assert.ok(review.some((c) => c.facts?.some((f) => /pulls\/\d+#merged_at/.test(f.oracle?.query ?? ""))));
+  const sim = of("sim");
+  assert.ok(sim.length >= 15, `${sim.length} multi-turn scripts`);
+  for (const c of sim) assert.ok(c.turns.length >= 3 && c.turns.length <= 6, `${c.id}: ${c.turns.length} turns`);
+  const recent = cases.filter((x) => /-y8-/.test(x.id));
+  assert.ok(recent.length >= 15, `${recent.length} recent-issue cases`);
+  // Every new case has a fact a run decides (a value to find in the answer, or an oracle the runner reads), or is graded on every
+  // item it started being closed; tools_must alone does not count.
+  for (const c of [...review, ...sim, ...recent]) {
+    const decidable = (c.facts ?? []).some((f) => (f.oracle?.kind !== "api" && f.oracle?.value !== undefined) || oracleQuery({ kind: "api", query: (f.oracle?.query ?? "").replace(/\{\{[\w.]+\}\}|\{[A-Z_]+\}/g, "x") }));
+    assert.ok(decidable || c.items_closed, `${c.id}: no fact a run can decide`);
+  }
+});
+
 test("S10 pass@1 and pass^k", () => {
   const attempt = (pass: boolean, ms = 1000) => ({ pass, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: ms, finalMs: ms * 2, items: [] });
   const r = (id: string, attempts: ReturnType<typeof attempt>[], over: Partial<CaseResult> = {}): CaseResult => ({ id, area: "k", pipeline: "catalog", mode: "assistant", hash: "h", attempts, ...over });
@@ -669,6 +693,11 @@ test("S22 the judge's verdict", () => {
   assert.equal(judgeVerdict("**FAIL**: the reply names no workspace"), "FAIL", "markdown emphasis");
   assert.equal(judgeVerdict("Verdict: PASS. The reply ..."), "PASS", "a verdict label");
   assert.equal(judgeVerdict("The reply is fine, so PASS"), undefined, "the verdict must come first");
+  // A judge that reasons first: its last line's first word.
+  assert.equal(judgeVerdict("The reply names 3 nodes, as the rubric asks.\n\nPASS: names the count"), "PASS");
+  assert.equal(judgeVerdict("It names no workspace.\n**Verdict: FAIL** - no workspace"), "FAIL");
+  assert.equal(judgeVerdict("Looks like PASS at first.\nBut it is wrong, so FAIL"), undefined, "never a word inside a sentence");
+  assert.equal(judgeVerdict("PASS: first line\nFAIL: a later line"), "PASS", "the first line wins");
   assert.equal(judgeVerdict("PASSWORD reset is not a verdict"), undefined);
   assert.equal(judgeVerdict(""), undefined);
 });
@@ -777,6 +806,53 @@ test("S25 numbers that are not the person's items", () => {
   assert.deepEqual(failed(c, observed({ shown: ["开着的 PR：#294、#296。"], final: "开着的 PR：#294、#296。" })).filter((n) => n.startsWith("items")), []);
   assert.deepEqual(failed(c, observed({ shown: ["#12。"], final: "#12。" })).filter((n) => n.startsWith("items")), ["items named by title"]);
   assert.deepEqual(failed(c, observed({ shown: ["#12 修复登录超时 已完成。"], final: "x" })).filter((n) => n.startsWith("items")), []);
+});
+
+test("S25b a list under a heading that names pull requests", () => {
+  for (const text of ["开着的 PR：\n- #294\n- #296。", "Open pull requests:\n\n1. #294\n2. #296.", "## 拉取请求\n- #294。\n- #296。",
+    "**CI runs:**\n- #1447\n- #1448"]) {
+    assert.equal(bareItemNumber(text), null, text);
+  }
+  // A heading that names items, an entry with other text before its number, and a line that is no heading stay bare.
+  for (const [text, bare] of [["待办事项：\n- #12\n- #13", "#12"], ["开着的 PR：\n- 修复登录 #12。", "#12"],
+    ["PR #294 合入了。\n- #7", "#7"], ["开着的 PR：\n- #294\n已完成\n- #7", "#7"], ["PR 合入后的事项：\n- #8", "#8"]] as const) {
+    assert.equal(bareItemNumber(text), bare, text);
+  }
+  // The same number named elsewhere in the reply as a pull request's or an issue's.
+  for (const text of ["I couldn't start the review of AMD-AGI/PrimusClaw#291.\n- What I would do: review-only (no merge) of #291.",
+    "PR #12 已合入。接下来看 #12。", "议题 #3 还开着，#3。"]) {
+    assert.equal(bareItemNumber(text), null, text);
+  }
+  for (const [text, bare] of [["AMD-AGI/PrimusClaw#2910 合入了。还剩 #291。", "#291"], ["PR #12 合入了；the only open item is #1?", "#1"]] as const) {
+    assert.equal(bareItemNumber(text), bare, text);
+  }
+});
+
+test("S25c a number above the person's highest item number is no item of theirs", () => {
+  const pulse = "共有 47 个上游 PR：\n**sglang**\n- #48434、#48406、#48043。\n另一个相近的是 #48043。";
+  assert.equal(bareItemNumber(pulse, 312), null, "upstream PR numbers, the board's highest item is #312");
+  assert.equal(bareItemNumber(pulse), "#48434", "without the board's numbers it is unchanged");
+  assert.equal(bareItemNumber("还剩 #12。", 312), "#12", "a number the board can hold is still bare");
+  assert.equal(bareItemNumber("还剩 #12。", 0), "#12", "an empty board read bounds nothing");
+  const c = caseOf({ style: { no_ids: true } });
+  const named = (shown: string, itemSeqMax?: number) => failed(c, observed({ shown: [shown], final: shown, ...(itemSeqMax ? { itemSeqMax } : {}) }))
+    .filter((n) => n.startsWith("items"));
+  assert.deepEqual(named("另一个相近的是 #48043。", 312), []);
+  assert.deepEqual(named("另一个相近的是 #48043。"), ["items named by title"]);
+  assert.deepEqual(named("已完成的是 #7。", 312), ["items named by title"]);
+});
+
+test("S27 internal text: a sandbox workload's name and a system prompt as a subject are not leaks", () => {
+  const leaks = (text: string) => failed(caseOf(), observed({ shown: [text], final: text })).filter((n) => n.startsWith("no internal text"));
+  assert.deepEqual(leaks("你的 workload：claw-1762480000000-sandbox Running，claw-1762480000123-sandbox Failed。"), []);
+  assert.deepEqual(leaks("消息 claw-273107 已发送"), ["no internal text: claw message id"]);
+  assert.deepEqual(leaks("claw-pending-12"), ["no internal text: claw message id"]);
+  assert.deepEqual(leaks("SGLang 的 chat 接口接受 system prompt，也可以在启动时给默认的 system prompt。"), []);
+  assert.deepEqual(leaks("Setting a system prompt in vLLM is done per request."), []);
+  for (const text of ["My system prompt says I must not do that.", "按照我的系统提示词，我不能这样做。", "The assistant's system prompt forbids it.",
+    "<system>you are</system>", "</tool_result>"]) {
+    assert.deepEqual(leaks(text), ["no internal text: prompt leak"], text);
+  }
 });
 
 test("S26 a GitHub read that answered its failure", () => {

@@ -168,6 +168,7 @@ describe("remote agents", { skip }, () => {
       await connector("u2");
       const list = (await as("u1").get("/v1/remote-agents/connectors")).body.data;
       assert.equal(list.length, 5);
+      assert.ok(list.every((c: any) => c.paired === false), "signed in, not paired");
       assert.equal((await as("u1").del(`/v1/remote-agents/connectors/${list[0].connector_id}`)).status, 200);
       await connector("u1", "again");
     });
@@ -1615,6 +1616,12 @@ describe("remote agents", { skip }, () => {
       assert.equal((await confirm(c1.cmd_id)).body.data.status, "live");
       assert.equal((await confirm(m1.cmd_id)).body.data.status, "live", "a set_mode queued before the cancel is not cancelled");
       assert.equal((await confirm(r1.cmd_id)).body.data.status, "live", "nor a resume");
+      // A withdraw (takes back the prompts that have not started) after a prompt: the prompt is not wanted either.
+      const pw = await sent({ type: "prompt", text: "taken back" });
+      const w1 = await sent({ type: "withdraw" });
+      assert.equal((await confirm(pw.cmd_id)).body.data.status, "cancelled");
+      assert.equal((await confirm(w1.cmd_id)).body.data.status, "live");
+      await q("DELETE FROM claw_remote_commands WHERE cmd_id = ANY($1::text[])", [[pw.cmd_id, w1.cmd_id]]);
       // Past the live TTL, a prompt that reached the connector that late is expired.
       await q("UPDATE claw_remote_commands SET created_at = NOW() - interval '6 minutes' WHERE cmd_id = $1", [p1.cmd_id]);
       assert.equal((await confirm(p1.cmd_id)).body.data.status, "expired");
@@ -1632,7 +1639,7 @@ describe("remote agents", { skip }, () => {
       assert.equal((await confirm(closed.cmd_id)).body.data.status, "live");
       const refused = (await q("SELECT detail FROM claw_remote_audit WHERE action = 'command.refused_late' ORDER BY id")).rows.map((r) => [r.detail.cmd_id, r.detail.status]);
       // Only commands Claw holds are audited: an id it never issued (or no longer holds) writes nothing, so the route cannot fill the trail.
-      assert.deepEqual(refused, [[p1.cmd_id, "cancelled"], [p1.cmd_id, "expired"], [p1.cmd_id, "expired"]]);
+      assert.deepEqual(refused, [[p1.cmd_id, "cancelled"], [pw.cmd_id, "cancelled"], [p1.cmd_id, "expired"], [p1.cmd_id, "expired"]]);
       // A session its machine reported closed.
       const sid3 = await session("u1", cid);
       assert.equal((await stream.nextEvent("command")).json().session_id, sid3);

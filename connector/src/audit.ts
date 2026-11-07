@@ -7,6 +7,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { redactDeep } from "./redact.js";
 import { DiskQueue, type WriteReport } from "./statefile.js";
+import { logLine } from "./util.js";
 
 export interface Audit {
   record(kind: string, detail?: Record<string, unknown>): void;
@@ -31,7 +32,7 @@ export function fileAudit(file: string, now: () => number = Date.now, report?: W
       await fsp.appendFile(file, line + "\n", { mode: 0o600 });
     } catch {
       // An audit that cannot be written must not take the session down, but it must not be silent either.
-      process.stderr.write(`audit write failed: ${kind}\n`);
+      logLine(`audit write failed: ${kind}`);
     }
   });
   return {

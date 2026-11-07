@@ -134,3 +134,25 @@ test("V5 no machine at all: the pairing line is said as the tools give it, never
   assert.equal((await run("none-connect-en", [["devenv_list", {}], said(listed.connect_a_machine.text.replace(/^[^\n]*/, "On the machine you want to connect, run this one line:"))])).pass, true);
   assert.equal((await run("none-connect-en", [["devenv_list", {}], said("No machine is connected yet.")])).pass, false, "the line was not given");
 });
+
+test("V6 every machine offline: one reply with the restart line and the new machine's pairing command, never another conversation's story", async () => {
+  for (const lang of ["zh", "en"]) assert.equal(byId(`offline-connect-${lang}`).world, "offline");
+  assert.equal(byId("offline-connect-zh").text, "连接我的开发环境");
+  const listed = new DevenvStub({ offline: true, zh: true }).call("devenv_list", {}).result as {
+    total: number; online: number; connect_a_machine: { text: string; commands: string[]; all_offline: boolean }; note: string;
+  };
+  assert.deepEqual([listed.total, listed.online, listed.connect_a_machine.all_offline], [1, 0, true]);
+  assert.deepEqual(listed.connect_a_machine.commands, ["claw-connector service install", PAIR_COMMAND]);
+  assert.match(listed.note, /Every machine of the user's is offline/);
+  const tools = await routerTools();
+  const run = async (id: string, calls: Array<[string, Record<string, unknown>]>) =>
+    scoreDevenv(byId(id), await runDevenvCase(byId(id), { llm: scripted(calls), tools }));
+  const said = (text: string): [string, Record<string, unknown>] => ["say", { text }];
+  assert.equal((await run("offline-connect-zh", [["devenv_list", {}], said(listed.connect_a_machine.text)])).pass, true);
+  // What the assistant said on 2026-11-07: only the old machine, and as a story from another conversation.
+  const old = await run("offline-connect-zh", [["devenv_list", {}], said("❌ 还是连不上：你唯一的开发机 routeguard-eval 仍然离线……和上次一样没有变化。")]);
+  assert.equal(old.pass, false);
+  assert.ok(old.why.some((w) => w.startsWith("did not say")) && old.why.some((w) => w.startsWith("said ")), old.why.join("; "));
+  const second = await run("offline-connect-zh", [["devenv_list", {}], ["devenv_pair", {}], said(listed.connect_a_machine.text)]);
+  assert.equal(second.pass, false, "a second code");
+});

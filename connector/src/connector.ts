@@ -148,11 +148,11 @@ export const DEFAULT_TIMING: ConnectorTiming = {
 };
 
 /**
- * The commands carried out late without asking: they only end things (a turn, a session), so running one that Claw no longer holds
- * cannot do anything the person was told would not happen. Everything else (`session.new`, `prompt`, `set_mode`, `resume`,
- * `decision`) makes an agent act, and is confirmed after a stall or past the live TTL.
+ * The commands carried out late without asking: they only end or take back things (a turn, queued prompts, a session), so running
+ * one that Claw no longer holds cannot do anything the person was told would not happen. Everything else (`session.new`, `prompt`,
+ * `set_mode`, `resume`, `decision`) makes an agent act, and is confirmed after a stall or past the live TTL.
  */
-const ENDING_COMMANDS = new Set(["cancel", "close"]);
+const ENDING_COMMANDS = new Set(["cancel", "close", "withdraw"]);
 /**
  * Why a command is confirmed with Claw before it acts: read just after a stall (`stall`); read while the network was holding frames
  * back, or just after (`network`: a heartbeat answered late or not at all, a command stream that reconnected); a frame that took
@@ -414,6 +414,8 @@ export class Connector {
       // `terminal_input`: and one open in a tmux pane takes messages, typed into that terminal (`resumable[].input: "terminal"`).
       const base = withHealth({
         ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes,
+        // `withdraw`: a prompt that has not started can be taken back without stopping anything (Session.withdraw)
+        withdraw: true,
         ...(support ? { watch_live: true, ...(support.typesIntoTerminals() ? { terminal_input: true } : {}) } : {}),
         ...(a.readOnlyModes.length ? { read_only_modes: a.readOnlyModes } : {}),
         ...(readOnly ? { edits: false, edits_hint: READ_ONLY_HINT } : {}),
@@ -870,7 +872,7 @@ export class Connector {
     if (!asking?.size) return false;
     for (const a of asking.values()) {
       if (type === "close") a.ctl.abort("session_closed");
-      else if (a.type === "prompt") a.ctl.abort("cancelled");
+      else if (a.type === "prompt") a.ctl.abort(type === "withdraw" ? "withdrawn" : "cancelled");
     }
     // Run ahead of the session's chain, it must still end what came before it there: a prompt (for a cancel) or anything (for a
     // close) read before it and not yet acting is dropped when it reaches the front (`gateFor`), as it would have been in order.
@@ -896,7 +898,7 @@ export class Connector {
       const over = this.overtaken.get(cmd.session_id);
       if (over && (cmd.cmd_seq ?? Infinity) < over.seq && (over.type === "close" || cmd.type === "prompt")) {
         refused = true;
-        this.reportDropped(cmd, over.type === "close" ? "session_closed" : "cancelled", "overtaken");
+        this.reportDropped(cmd, over.type === "close" ? "session_closed" : over.type === "withdraw" ? "withdrawn" : "cancelled", "overtaken");
         return "drop";
       }
       this.tick();
@@ -1227,6 +1229,10 @@ export class Connector {
     } finally {
       // Stopped or restarted (not revoked, not refused): what is in flight is the next run's to end or carry on.
       await this.manager.killAll(this.revoked ? "revoked" : "stopped", !this.revoked && !this.authFailed).catch(() => undefined);
+      // A command still being carried out (a session that was opening) ends now that its adapter is gone. It is waited for,
+      // so that what it writes as it ends (the session's last events, connector.json) lands before the flush below and
+      // never after this run has returned (CI 2026-11-07: a refused session's command rewrote a state directory removed after the run).
+      await within(this.manager.idle(), STATE_WRITE_WAIT_MS, undefined);
       const reason = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : failure ? "failed" : this.paused ? "stopped_while_paused" : result;
       const disconnected = recordDisconnect(this.d.dirs, { reason, detail: this.authWhy || failure || undefined });
       // What is still being written gets a bounded time to land; a disk that does not answer does not keep the process.
@@ -1234,6 +1240,8 @@ export class Connector {
         this.identityOut.settled(STATE_WRITE_WAIT_MS), this.store.flushed(), this.registry.flushed(), this.outbox.flush(), this.d.audit.flush?.(), disconnected,
       ]).then(([id, st, reg]) => id && st && reg), STATE_WRITE_WAIT_MS, false);
       if (!landed) this.d.log.warn("the state directory did not take the last writes in time (connector.json may be behind)");
+      // A write still failing is not retried after this run: the next run (in this process or another) owns the files.
+      this.identityOut.close(); this.store.close(); this.registry.close();
       fs.rmSync(pidf, { force: true });
     }
     return result;

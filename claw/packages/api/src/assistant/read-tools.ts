@@ -85,9 +85,10 @@ export function readToolPatterns(server: string): string[] {
  * `deliver_text` speaks as `say` does, with a file only the user gets (`text-delivery.ts`). `github_comment` writes nothing: it shows
  * the user the exact comment on a card, and only their press posts it (`schedules.ts`); a draft is written from what was read, so it
  * must come after the reads. `devenv_pair` shows the user, in their own chat, a one-time code that connects nothing until they run
- * it on a machine of theirs ("connect my dev environment" finds none with devenv_list, then pairs).
+ * it on a machine of theirs ("connect my dev environment" finds none with devenv_list, then pairs). `pr_state` only reads where a
+ * pull request stands (`review-tools.ts`).
  */
-export const AFTER_READ_TOOLS = ["say", "work_recall", "memory_recall", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list"] as const;
+export const AFTER_READ_TOOLS = ["say", "work_recall", "memory_recall", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state"] as const;
 
 /** The tool a router turn speaks with (`router-turn-end.ts`, `saidOnlyBeforeLookups`). */
 export const ROUTER_SPEAK_TOOL = "say";
@@ -97,7 +98,7 @@ export const ROUTER_SPEAK_TOOL = "say";
  * not derived from AFTER_READ_TOOLS, which also holds what speaks or drafts after a read (`deliver_text`, `github_comment`).
  */
 export const ROUTER_ASSISTANT_READS: readonly string[] = [
-  "work_recall", "memory_recall", "devenv_list", "claw_self_status", "brief", "trigger_list", "job_watch_list",
+  "work_recall", "memory_recall", "devenv_list", "claw_self_status", "brief", "trigger_list", "job_watch_list", "pr_state",
 ];
 
 /**

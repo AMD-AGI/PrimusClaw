@@ -482,6 +482,11 @@ export const SESSION_AUTO_ARCHIVE_DAYS = envInt("SESSION_AUTO_ARCHIVE_DAYS", 7, 
 // prefixes are removed by the cleanup sweeper). 0 disables it. See
 // sessions/retention.ts for which archived sessions are never taken.
 export const SESSION_RETENTION_DAYS = envInt("SESSION_RETENTION_DAYS", 0, { min: 0 });
+// For this many seconds after a session is deleted, GET /v1/tasks/:id still
+// answers for its tasks with how they ended (status, failure reason, times) and
+// nothing they carried -- so a caller that deleted a session with a run in it can
+// see the run's final state. 0 answers 404 at once, as before.
+export const DELETED_SESSION_TASK_READ_SEC = envInt("DELETED_SESSION_TASK_READ_SEC", 86_400, { min: 0 });
 // The soft-deleted conversation rows of a session deleted more than this many
 // days ago (turns, events, summaries) are removed for good. 0 disables it.
 export const SESSION_PURGE_DAYS = envInt("SESSION_PURGE_DAYS", 0, { min: 0 });
@@ -900,6 +905,15 @@ export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWE
 // `on` gives the router the review and settings tools (review_start, review_restart, confirmation_answer,
 // review_mode_set, channel_action); anything else leaves it the five tools of a conversation.
 export const CLAW_ASSISTANT_TOOLS = env("CLAW_ASSISTANT_TOOLS", "off").trim().toLowerCase() === "on";
+// `on` turns on the routing and result discipline (`assistant/discipline.ts`, router-discipline-v2 and worker-v7) for every user: a
+// reply to a result already given is acknowledged and acts on nothing, a request to read ~/.ssh, keys or credentials is declined in
+// chat and work_create refuses it, and a worker whose task changed nothing outside reports what it delivered as an answer, with no
+// Accept. Off (the default), only the users named in CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS (Claw user ids, comma-separated) get it: the
+// canary, opened for the evaluation identities first.
+export const CLAW_ASSISTANT_ROUTE_DISCIPLINE = env("CLAW_ASSISTANT_ROUTE_DISCIPLINE", "off").trim().toLowerCase() === "on";
+export const CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
 // The marketplace plugin whose MCP servers the assistant reads from and its workers run with, when the message names
 // none (a chat client that talks to the assistant sends no plugin). Blank or 0: none, and a router turn has no read tools.
 // A router turn is offered only the read tools `assistant/read-tools.ts` lists of it; a worker gets the whole plugin.
@@ -944,3 +958,10 @@ export const CLAW_ASSISTANT_LOOKUP_ACK = envBool("CLAW_ASSISTANT_LOOKUP_ACK", tr
 // How long after a router turn's first lookup starts the server waits for the router's own line before it says its own (milliseconds):
 // a model that writes its line beside the lookup, in the same step, is not answered twice.
 export const CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS = envInt("CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS", 600, { min: 0 });
+// Whom the server tells "on it" when a router turn answering them has said nothing CLAW_ASSISTANT_FIRST_ACK_MS after it began, whatever the
+// turn is doing (thinking, the assistant's own tools, a slow start), as the lookup line above is said for a lookup
+// (`assistant/lookup-ack.ts`): `*` for everyone, or a comma-separated list of user ids; blank, the default, for no one. Measured on the
+// evaluation identities first (2026-11-06 baseline: first reply p90 7.28 s, 21 turns that only answered at their end).
+export const CLAW_ASSISTANT_FIRST_ACK_USERS = env("CLAW_ASSISTANT_FIRST_ACK_USERS");
+// How long after a router turn began (its run row) the server waits for the router's first word before it says its own (milliseconds).
+export const CLAW_ASSISTANT_FIRST_ACK_MS = envInt("CLAW_ASSISTANT_FIRST_ACK_MS", 3500, { min: 0 });

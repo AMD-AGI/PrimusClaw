@@ -301,17 +301,19 @@ describe("router quality, the prompt", () => {
     // router-v16 (this rule set, a long answer said whole, a say after the start notice added to it, one message a turn, progress read
     // live, a follow-up with the earlier files, progress from what the job wrote now with its age, a derived number from the unrounded
     // values; router-v17: a translation said alone, in the language asked for; router-v18: the tool for a worker's report, a request to
-    // remember and a channel setting named outright); its review prompt is router-v22; router-read-v9 adds
+    // remember and a channel setting named outright; router-v19: the quick line before deliver_text, trigger_create, review_mode_set and
+    // devenv_); its review prompt is router-v24; router-read-v9 adds
     // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
     // now from the source that states them.
-    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v18");
+    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v19");
     assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v14");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v22");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v24");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): a say after it in the turn is added to that same message, so never repeat the start/],
       ["a quick first line", /put one short line that you are on it \(查一下 \/ Checking now\) in the first step, as a say beside the lookups/],
       ["lookups of a step at once", /Make every lookup a step needs in that one step, side by side/],
+      ["the quick line before the slow assistant tools", /Before deliver_text, trigger_create, review_mode_set or a devenv_ tool, say that line first, in the same step/],
       ["GitHub only by its tools", /read with these mcp__github__ tools only: never with web_fetch of api\.github\.com or a github\.com page they read, and never with another server's tools \(the agent board is not GitHub\)/],
       ["research again in other words", /search again with other words \(other names, the other language, the one distinctive detail alone\), two or three times/],
       ["answer with the best candidate", /answer with the best candidate you found and say which detail you could not confirm/],

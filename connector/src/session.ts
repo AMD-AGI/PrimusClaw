@@ -110,6 +110,9 @@ const BYPASS_HINT = ` (Claude Code offers it to root only with IS_SANDBOX set, a
 
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024;
 const MAX_QUEUED_PROMPTS = 5;
+/** How long a prompt waits for an entry the agent is still writing to the transcript to be complete: 8 × 250 ms. */
+const PARTIAL_ENTRY_TRIES = 8;
+const PARTIAL_ENTRY_WAIT_MS = 250;
 const PERMISSION_WARNING_RE = /canUseTool will not be invoked/i;
 
 export class Session {
@@ -136,6 +139,14 @@ export class Session {
   private inheritedWarningOk = false;
   /** The transcript's size when this connector last left it (see {@link preflight}). */
   private transcriptMark: number | null = null;
+  /**
+   * The program (`entrypoint`) the transcript names for what this connector's own agent wrote in its last turn, so that
+   * what the same agent writes on its own between turns is told from a terminal's (see {@link preflight}). Null until
+   * the agent has taken a turn, and again when it is discarded.
+   */
+  private ownWriter: string | null = null;
+  /** The background tasks the agent started (their ids), so that only their notifications count as its own. */
+  private ownTasks = new Set<string>();
   /**
    * Another process was seen holding the conversation open while this connector's own agent was running a turn on
    * it. That agent's memory then lacks whatever the process wrote, and the transcript's size cannot say so (see
@@ -167,6 +178,10 @@ export class Session {
   private terminalQueue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun }> = [];
   private terminalTurn: {
     cmdId: string | null; cmdSeq: number | null; text: string; sentAt: number; seen: boolean; idleSince: number | null; done: () => void;
+    /** The keys are going (or went) to the terminal: from here on it is the terminal's turn, which a withdraw leaves alone. */
+    keys?: boolean;
+    /** Counts its prompt as handled (idempotent): a withdraw that takes the turn back before its keys go calls it itself. */
+    started?: () => void;
   } | null = null;
   private terminalPumping = false;
   private terminalRestoring: Promise<void> | null = null;
@@ -480,7 +495,7 @@ export class Session {
         if (this.holderStatus(term) !== "idle") { refused("terminal_switched", "the terminal changed just before typing"); continue; }
         this.terminalQueue.shift();
         const finished = new Promise<void>((resolve) => {
-          this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve };
+          this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve, started: next.started };
         });
         // At most once: the turn is recorded and the prompt counted as handled BEFORE the keys go, so a restart in between
         // ends this turn (`connector_restarted`, SessionManager.recover) instead of Claw delivering it again and the terminal
@@ -495,10 +510,12 @@ export class Session {
         // reach the disk (a restart could not end this turn), and the terminal itself (someone may have started typing, a menu may
         // be open now). Each ends the turn by name and types nothing.
         const giveUp = (reason: string | null, extra: Record<string, unknown> = {}) => {
-          if (this.terminalTurn === turn) this.terminalTurn = null;
+          const mine = this.terminalTurn === turn;
+          if (mine) this.terminalTurn = null;
           // (Going away: the record stays, and the next run ends this turn by name.)
           if (!this.stopping) this.env.store.endTurn(this.id);
-          if (reason === null) return;
+          // (A turn taken from here meanwhile, by a withdraw or a cancel, was already answered for by name: not a second time.)
+          if (reason === null || !mine) return;
           this.audit("terminal_input_refused", { reason, cmd_id: next.cmdId, ...extra });
           this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq, extra);
           this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, ...extra });
@@ -510,7 +527,8 @@ export class Session {
         // The mode asked again on this screen too: a switch since (shift+tab) is not typed into.
         const verdictNow = modeVerdict(this.agent, again.mode);
         if (!verdictNow.ok) { giveUp(verdictNow.reason, { terminal_mode: again.mode }); continue; }
-        if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }
+        if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
+        turn.keys = true;
         try {
           await term.type(text);
         } catch (e) {
@@ -804,7 +822,9 @@ export class Session {
       } catch { /* fall through to notifications */ }
     }
     const deadline = Date.now() + this.env.timing.modeConfirmMs;
-    while (Date.now() < deadline) {
+    // Not past the end of the session or of its adapter (refused meanwhile, or killed by a stop): nothing can confirm a
+    // mode then, and a look that went on would end the opening, and the command, long after the run that took it.
+    while (Date.now() < deadline && !this.closed && this.adapter === a) {
       const last = this.modeSeen[this.modeSeen.length - 1];
       if (last !== undefined) return last;
       await sleep(25);
@@ -1101,6 +1121,7 @@ export class Session {
     const a = this.adapter!;
     this.audit("turn_started", { length: text.length });
     const support = this.agent.attach && this.acpId ? this.env.attach.get(this.agent.id) : undefined;
+    const turnFrom = support ? support.transcriptSize(this.acpId!) : null;
     const watch = support ? this.watchTwins(support, this.acpId!) : null;
     try {
       const reply = a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });
@@ -1126,7 +1147,7 @@ export class Session {
     } finally {
       // At once, before the look at who holds the conversation open: the test below it for a terminal that writes
       // next is the size, and it must start from the turn's end, not from a moment later.
-      this.markTranscript();
+      this.markTranscript(turnFrom);
       if (watch) {
         if (this.closed) watch.stop();
         else if (await watch.finish()) this.twinSeen = true;
@@ -1185,12 +1206,36 @@ export class Session {
     if (live && this.transcriptMark !== null) {
       const now = support.transcriptSize(ref);
       if (now !== null && now !== this.transcriptMark) {
-        this.audit("transcript_changed", { was: this.transcriptMark, now });
+        // The agent itself writes between turns too: a background task it started finishes, and it takes a turn of its own
+        // to answer it. That is in its memory, and nobody else holds the conversation open (the check above): it is kept.
+        const grown = await this.ownGrowth(support, ref, this.transcriptMark);
+        if (grown.by === "self") {
+          this.audit("transcript_grew_by_agent", { was: this.transcriptMark, now: grown.size });
+          this.transcriptMark = grown.size;
+          for (const id of grown.tasks) this.ownTasks.add(id);
+          return null;
+        }
+        this.audit("transcript_changed", { was: this.transcriptMark, now, why: grown.why });
         await this.dropAdapter();
         return this.preflight();
       }
     }
     return null;
+  }
+
+  /**
+   * Who wrote what the transcript gained since `mark`, while this connector's own agent was idle (see
+   * {@link classifyAppended}). An entry still being written is waited for, briefly; one that is not done by then is not the
+   * agent's for certain.
+   */
+  private async ownGrowth(support: AttachSupport, ref: string, mark: number): Promise<{ by: "self"; size: number; tasks: string[] } | { by: "other"; why: string }> {
+    for (let i = 0; ; i++) {
+      const r = support.appendedSince(ref, mark, { entrypoint: this.ownWriter, tasks: this.ownTasks });
+      if (r === null) return { by: "other", why: "the transcript shrank, or grew by more than is read" };
+      if (r.by !== "partial") return r;
+      if (i >= PARTIAL_ENTRY_TRIES) return { by: "other", why: "an entry that is still being written" };
+      await sleep(PARTIAL_ENTRY_WAIT_MS);
+    }
   }
 
   /** The turn is over: say so and forget it. Not while the connector is going away: the next run ends or continues it. */
@@ -1200,9 +1245,19 @@ export class Session {
     this.env.store.endTurn(this.id);
   }
 
-  /** What size the transcript is as this connector leaves it: after it starts the session and after every turn. */
-  private markTranscript(): void {
-    if (this.agent.attach && this.acpId) this.transcriptMark = this.env.attach.get(this.agent.id)?.transcriptSize(this.acpId) ?? null;
+  /**
+   * What size the transcript is as this connector leaves it: after it starts the session and after every turn. After a
+   * turn (`turnFrom`: the size it started at), also which program the transcript names for what the agent wrote in it.
+   */
+  private markTranscript(turnFrom: number | null = null): void {
+    if (!this.agent.attach || !this.acpId) return;
+    const support = this.env.attach.get(this.agent.id);
+    this.transcriptMark = support?.transcriptSize(this.acpId) ?? null;
+    if (turnFrom !== null && support && this.transcriptMark !== null) {
+      const turn = support.ownTurn(this.acpId, turnFrom, this.transcriptMark);
+      this.ownWriter = turn?.entrypoint ?? null;
+      for (const id of turn?.tasks ?? []) this.ownTasks.add(id);
+    }
   }
 
   /** A recycled (or crashed) adapter comes back on demand. */
@@ -1234,6 +1289,34 @@ export class Session {
     this.audit("session_resumed", { mode: this.currentMode, unattended: this.unattended });
     this.emit("session_resumed", { acp_session_id: this.acpId, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
     this.touch();
+  }
+
+  /**
+   * `withdraw`: take back the prompts that have not started, and nothing else. The ones waiting for the terminal to be free (never
+   * typed) and the ones queued behind a running turn are each refused by name (`withdrawn`, with its `cmd_id` and `cmd_seq`); a turn
+   * that runs (typed into the terminal, or in the adapter) goes on untouched: no Escape, no session/cancel, no permission answered.
+   * A chat that lets the session go while its message still waits sends this, so the person's terminal is never interrupted.
+   */
+  withdraw(): void {
+    let terminal = this.terminalQueue.length;
+    if (terminal) this.dropTerminalQueue("withdrawn");
+    // A message taken off the queue whose keys have not gone yet (its turn is recorded first, then the terminal is read once more):
+    // still the phone's, so it is taken back too. The pump sees its turn is gone right before typing and types nothing.
+    const pending = this.terminalTurn;
+    if (pending && !pending.keys) {
+      this.terminalTurn = null;
+      if (!this.stopping) this.env.store.endTurn(this.id);
+      this.rejectCommand("prompt", pending.cmdId, "withdrawn", pending.cmdSeq);
+      // Counted as handled now, before the withdraw itself is: after a restart Claw must not deliver it again with the withdraw
+      // already behind the cursor (the pump would type it). `started` is the manager's once-only `handled`.
+      pending.started?.();
+      pending.done();
+      terminal += 1;
+    }
+    const dropped = this.queue.map((q) => [q.cmdId, q.cmdSeq] as const);
+    this.dropQueued();
+    for (const [cmdId, cmdSeq] of dropped) this.rejectCommand("prompt", cmdId, "withdrawn", cmdSeq);
+    this.audit("withdrawn", { queued_dropped: terminal + dropped.length, terminal: terminal > 0 });
   }
 
   /**
@@ -1277,6 +1360,8 @@ export class Session {
   private async dropAdapter(): Promise<void> {
     const a = this.adapter;
     this.adapter = null;
+    this.ownWriter = null;
+    this.ownTasks.clear();
     if (a) await a.kill();
   }
 
@@ -1300,6 +1385,8 @@ export class Session {
 
   /** A session that cannot be opened (or kept safe) is closed with the reason, never left half-open. */
   private async refuse(e: unknown): Promise<void> {
+    // Already closed (refused while it was opening): the opening's own failure that follows is not a second refusal.
+    if (this.closed) return;
     const r = e instanceof SessionRefusal ? e : mapAdapterError(e);
     this.env.log.warn("session refused", { session: this.id, reason: r.reason, message: r.message });
     this.audit("session_refused", { reason: r.reason, message: r.message.slice(0, 300) });

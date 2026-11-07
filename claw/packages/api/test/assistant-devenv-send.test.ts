@@ -46,7 +46,10 @@
  *       a card proposed while the machine is being revoked is refused (no_machine), never left waiting; a revoke never waits for a card
  *       that is being pressed (the press holds the card while its send waits for the machine: a cycle Postgres cannot see); a machine
  *       whose offline row is replaced by registering again under its name closes only the cards that continue one of its sessions
- *       (`machine_reconnected`); a card for a new session waits and, pressed, follows the new registration
+ *       (`machine_reconnected`); a card for a new session waits and, pressed, follows the new registration; a closed card records
+ *       why (`voided_reason`) and which machine, and the router is shown it as void for a day (leave it out of what waits; asked,
+ *       one line: the machine went, nothing was sent), never as waiting and never left to guess whether it was pressed; a card
+ *       that had already lapsed is not voided by a later revoke and never reported as taken by it
  *   F20 an agent that only takes over existing conversations (kind attach) is never chosen for a new session, which its connector would
  *       refuse: with another agent there, that one; alone, a question listing its conversations, else no_agent saying why
  *   F21 at the limit of open sessions a new one closes the longest unused idle session of the user's (never one working, waiting for
@@ -318,6 +321,17 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal(got[3].remote.kind, "error");
     assert.match(got[3].text, /从手机输入\n（没有输入：终端会话处于 bypassPermissions，按你的审批设置不能从手机直接输入；在终端切到安全模式/);
 
+    // One the connector cut off by restarting mid-turn: said as an interruption with what to do, not as the code.
+    await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
+    await sendByCard(await userTurn(alice, "接着写"), { text: "接着写" });
+    await events("alice", cid, sid, [["turn_end", { stopReason: "error", error: "connector_restarted" }]]);
+    got = await pushed(itemId);
+    assert.equal(got.length, 5, JSON.stringify(got.map((g) => g.text)));
+    assert.equal(got[4].remote.kind, "error");
+    assert.match(got[4].text, /接着写\n（被打断：那台机器上的连接器重启了，这一轮没有做完；再发一次这条指令，或发“继续”让它接着做）/);
+    assert.doesNotMatch(got[4].text, /重新接上/);
+    assert.doesNotMatch(got[4].text, /connector_restarted/);
+
     // One the machine refuses, and a session that closes before it finished: errors, each once.
     await store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000);
     await sendByCard(await userTurn(alice, "第三次"), { text: "第三次" });
@@ -326,9 +340,9 @@ describe("development environment items and devenv_send", { skip }, () => {
     await sendByCard(await userTurn(alice, "第四次"), { text: "第四次" });
     await events("alice", cid, sid, [["session_closed", { reason: "agent_exited" }]]);
     got = await pushed(itemId);
-    assert.deepEqual(got.map((g) => g.remote?.kind), ["needs_you", "done", "error", "error", "error", "error"], JSON.stringify(got.map((g) => g.text)));
-    assert.match(got[4].text, /没有接下/);
-    assert.match(got[5].text, /会话已关闭/);
+    assert.deepEqual(got.map((g) => g.remote?.kind), ["needs_you", "done", "error", "error", "error", "error", "error"], JSON.stringify(got.map((g) => g.text)));
+    assert.match(got[5].text, /没有接下/);
+    assert.match(got[6].text, /会话已关闭/);
     assert.ok(got.every((g) => g.remote.session_id === sid));
   });
 
@@ -551,7 +565,7 @@ describe("development environment items and devenv_send", { skip }, () => {
         assert.equal(e.code, "no_machine", e.message);
         return { message: String(e.message), connect: e.data.connect_a_machine as Recorded };
       };
-      const line = /^npm install -g @primusclaw\/connector@latest && claw-connector pair ([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}) --server https:\/\/claw\.example\.com\/claw-api$/;
+      const line = /^npm install -g --no-update-notifier @primusclaw\/connector@latest && claw-connector pair ([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}) --server https:\/\/claw\.example\.com\/claw-api$/;
       const steps = /claw-connector (init|login)|service install/;
 
       const zh = await refused(await userTurn(alice, "让开发机上的 claude 跑一下 make test"), "跑一下 make test");
@@ -625,11 +639,29 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal(r.status, 200, await r.text());
     const card = (await w.q("SELECT * FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toLaptop.confirmation_id]))[0];
     assert.deepEqual([card.status, card.decided_via, card.result?.error], ["expired", "connector_revoked", "no_machine"]);
+    // The closing record says why and which machine, so the router can say what became of the card.
+    assert.deepEqual([card.result?.voided_reason, card.result?.machine], ["connector_revoked", "laptop"]);
     assert.deepEqual((await schedules.pendingConfirmations("alice")).map((c) => c.confirmation_id), [toDesktop.confirmation_id],
       "the other machine's card still waits");
     const state = await schedules.renderScheduleState("alice");
-    assert.doesNotMatch(state, /on the machine "laptop"/, "the router is not told of the revoked machine's card");
-    assert.match(state, /on the machine "desktop"/);
+    const [waitingPart, voidedPart = ""] = state.split("Instruction cards no longer waiting");
+    assert.doesNotMatch(waitingPart, /on the machine "laptop"/, "the router is not told the revoked machine's card waits");
+    assert.match(waitingPart, /on the machine "desktop"/);
+    // It is told the card is void, and why: never left to guess whether it was pressed (S4 retest, 2026-11-07).
+    const laptopRef = prompts.confirmationRef(String(toLaptop.confirmation_id));
+    const voidedLine = voidedPart.split("\n").find((l) => l.startsWith(`- ref #${laptopRef} `));
+    assert.ok(voidedLine, voidedPart);
+    assert.match(voidedLine, /on the machine "laptop": "跑 make test"/);
+    assert.match(voidedLine, /voided_reason: connector_revoked \(the machine "laptop" was revoked/);
+    assert.match(voidedLine, /never pressed: nothing was sent/);
+    assert.match(voidedPart, /asked what waits for them, leave these out\. Do not bring one up on your own\./);
+    assert.match(voidedPart, /never say you cannot tell whether it was pressed or lapsed/);
+    assert.doesNotMatch(voidedPart, new RegExp(`批准 #${laptopRef}`), "a void card is never put to them to approve");
+    assert.equal((await schedules.renderScheduleState("bob")), "", "another user is shown nothing of alice's void card");
+    // A day on, it is no longer shown at all.
+    await w.q("UPDATE claw_assistant_confirmations SET decided_at = NOW() - INTERVAL '25 hours' WHERE confirmation_id = $1", [toLaptop.confirmation_id]);
+    assert.doesNotMatch(await schedules.renderScheduleState("alice"), /Instruction cards no longer waiting/);
+    await w.q("UPDATE claw_assistant_confirmations SET decided_at = NOW() WHERE confirmation_id = $1", [toLaptop.confirmation_id]);
 
     // Pressed afterwards: answered before (closed), nothing sent; the card stays as it was closed.
     const pressed = await schedules.decideConfirmation({ userId: "alice", confirmationId: String(toLaptop.confirmation_id), decision: "allow", via: "button" });
@@ -641,6 +673,29 @@ describe("development environment items and devenv_send", { skip }, () => {
     const again = await fetch(`${base}/v1/remote-agents/connectors/${desktop}`, { method: "DELETE", headers: { "x-test-user": "bob" } });
     assert.equal(again.status, 404);
     assert.equal((await w.q("SELECT status FROM claw_assistant_confirmations WHERE confirmation_id = $1", [toDesktop.confirmation_id]))[0].status, "pending");
+  });
+
+  test("F17f a card that lapsed before its machine was revoked is not voided by the revoke, and the router is never told the machine took it", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const lapsed = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 make test"), { text: "跑 make test", target: "laptop" });
+    const live = await tools.devenvSend(await userTurn(alice, "让 laptop 上的 claude 跑 lint"), { text: "跑 lint", target: "laptop" });
+    for (const c of [lapsed, live]) assert.equal(c.done, false, JSON.stringify(c));
+    // Shown and ignored: its day ran out before the machine went (nothing moves a lapsed card out of pending until it is pressed).
+    await w.q("UPDATE claw_assistant_confirmations SET created_at = NOW() - INTERVAL '3 days', expires_at = NOW() - INTERVAL '2 days' WHERE confirmation_id = $1",
+      [lapsed.confirmation_id]);
+    const r = await fetch(`${base}/v1/remote-agents/connectors/${laptop}`, { method: "DELETE", headers: { "x-test-user": "alice" } });
+    assert.equal(r.status, 200, await r.text());
+    const row = async (id: unknown) => (await w.q("SELECT status, decided_via, result FROM claw_assistant_confirmations WHERE confirmation_id = $1", [id]))[0];
+    assert.deepEqual(await row(lapsed.confirmation_id), { status: "pending", decided_via: null, result: null }, "the lapsed card stays as it lapsed");
+    assert.deepEqual([(await row(live.confirmation_id)).decided_via, (await row(live.confirmation_id)).result?.voided_reason], ["connector_revoked", "connector_revoked"]);
+    const state = await schedules.renderScheduleState("alice");
+    assert.match(state, new RegExp(`- ref #${prompts.confirmationRef(String(live.confirmation_id))} .*voided_reason: connector_revoked`));
+    assert.doesNotMatch(state, new RegExp(`#${prompts.confirmationRef(String(lapsed.confirmation_id))}`), "a lapsed card is never reported as voided by the revoke");
+    // Even a row stamped so by an older Claw (before this check) is not listed: it had lapsed before it was closed.
+    await w.q("UPDATE claw_assistant_confirmations SET status = 'expired', decided_via = 'connector_revoked', decided_at = NOW() WHERE confirmation_id = $1", [lapsed.confirmation_id]);
+    assert.doesNotMatch(await schedules.renderScheduleState("alice"), new RegExp(`#${prompts.confirmationRef(String(lapsed.confirmation_id))}`));
   });
 
   test("F17e a machine replaced by registering again under its name: a card for a new session waits and follows it; one continuing an old session closes", async () => {
@@ -663,6 +718,9 @@ describe("development environment items and devenv_send", { skip }, () => {
     // The session it continued went with the old registration: that card closes, and says why.
     const gone = await card(toSession.confirmation_id);
     assert.deepEqual([gone.status, gone.decided_via, gone.result?.error], ["expired", "connector_revoked", "machine_reconnected"]);
+    assert.deepEqual([gone.result?.voided_reason, gone.result?.machine], ["machine_reconnected", "laptop"]);
+    assert.match(await schedules.renderScheduleState("alice"),
+      new RegExp(`- ref #${prompts.confirmationRef(String(toSession.confirmation_id))} .*voided_reason: machine_reconnected \\(the machine "laptop" was set up again`));
     // A new session on that machine is still what the user asked for: that card waits, and, pressed once the machine is back, goes to it.
     assert.deepEqual((await schedules.pendingConfirmations("alice")).map((c) => c.confirmation_id).sort(),
       [toLaptop.confirmation_id, toDesktop.confirmation_id].sort());
@@ -1697,7 +1755,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v10");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v11");
     // The plain-words control: a new session, a session named by when it was used, back to the assistant with nothing to run.
     assert.match(section, /new_session: true when they ask for a new session/);
     assert.match(section, /昨天那个会话/);

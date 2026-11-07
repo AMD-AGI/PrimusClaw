@@ -64,7 +64,7 @@ describe("devenv_pair", { skip }, () => {
     const r = await call(await userTurn(alice, "连接我的开发环境"));
     assert.ok(r.offered && !r.isError, JSON.stringify(r));
     const b = (r as { body: Record<string, any> }).body;
-    const m = /^npm install -g @primusclaw\/connector@latest && claw-connector pair ([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}) --server (\S+)$/.exec(b.command);
+    const m = /^npm install -g --no-update-notifier @primusclaw\/connector@latest && claw-connector pair ([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}) --server (\S+)$/.exec(b.command);
     assert.ok(m, b.command);
     assert.equal(m![2], SERVER);
     assert.equal(b.expires_in_minutes, 10);
@@ -104,7 +104,7 @@ describe("devenv_pair", { skip }, () => {
     assert.match(section, /No machine: say none is connected\. When connect_a_machine has pairing[^\n]*do not call devenv_pair after it\. Without pairing: devenv_pair/);
     assert.match(section, /exactly as it answered/);
     assert.match(section, /连接我的开发环境 when there is none is devenv_list, whose connect_a_machine then carries the pairing command/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v10");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v11");
     assert.ok((reads.AFTER_READ_TOOLS as readonly string[]).includes("devenv_pair"), "after devenv_list finds no machine, it may still pair");
   });
 });

@@ -85,8 +85,12 @@ export class SessionManager {
     const tail = now ? Promise.all([this.chains.get(sid), next]).then(() => undefined) : next;
     this.chains.set(sid, tail);
     void tail.finally(() => { if (this.chains.get(sid) === tail) this.chains.delete(sid); });
-    if (now) return next;
     return next;
+  }
+
+  /** Resolves once every command taken so far has been carried out (a stopping run waits for them). */
+  idle(): Promise<void> {
+    return Promise.all([...this.chains.values()]).then(() => undefined);
   }
 
   private async dispatch(cmd: Command, handled: () => void, mayRun?: MayRun): Promise<void> {
@@ -136,6 +140,9 @@ export class SessionManager {
         return true;
       case "cancel":
         await s.cancel();
+        return false;
+      case "withdraw":
+        s.withdraw();
         return false;
       case "set_mode":
         if (typeof cmd.mode_id !== "string") s.rejectCommand("set_mode", cmdId, "mode_id_required");

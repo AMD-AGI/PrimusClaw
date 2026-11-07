@@ -153,6 +153,7 @@ func (in *SandboxGrantStatus) DeepCopy() *SandboxGrantStatus {
 func (in *GrantSandboxRef) DeepCopyInto(out *GrantSandboxRef) {
 	*out = *in
 	in.StartedAt.DeepCopyInto(&out.StartedAt)
+	in.RunningAt.DeepCopyInto(&out.RunningAt)
 	in.EndedAt.DeepCopyInto(&out.EndedAt)
 	if in.AccessTokenHashes != nil {
 		out.AccessTokenHashes = append([]string(nil), in.AccessTokenHashes...)

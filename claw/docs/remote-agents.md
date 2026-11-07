@@ -48,7 +48,10 @@ queued the command, and `sent_at` when the serving replica wrote the frame, on t
 (`t`) frames carry, both in milliseconds.
 Delivery is at least once: a connector deduplicates on `cmd_id` (or skips `cmd_seq` values it has handled). Types: `session.new`
 (`agent_id`, `cwd`, `mode`, and `resume_ref` when the user chose an existing session), `prompt` (`text`), `cancel`, `set_mode` (`mode_id`),
-`resume`, `close`, `decision` (`action_id`, `option_id`, `by`). Nothing else is ever sent.
+`resume`, `close`, `decision` (`action_id`, `option_id`, `by`), `withdraw`. Nothing else is ever sent. `withdraw` takes back the prompts
+that have not started (waiting for a terminal, or queued behind a running turn) and touches nothing that runs: no Escape, no cancel,
+no permission answered. A connector that understands it says `withdraw: true` in the agent's capabilities; a client sends it only
+then (an older connector drops it unread), for example when a chat lets a session go while its message still waits.
 
 Events are stored once per `(session_id, seq)`; a repeat is ignored and a gap is
 allowed. A malformed event is refused alone and named in `rejected`, so one bad
@@ -65,7 +68,8 @@ The connector in this repository names the prompt a turn ends: `turn_end` carrie
 `data.cmd_id`, the `cmd_seq` (the frame's `id:`) and `cmd_id` of the `prompt` command that started the turn, both
 `null` for the end a `cancel` posts when no turn was running. A prompt that never runs gets no `turn_end`; it is
 refused by name instead, as `command_rejected` (`data.type: "prompt"`, `data.cmd_id`, `data.cmd_seq`,
-`data.reason`), and the prompts a `cancel` drops from the queue are refused this way with `reason: "cancelled"`.
+`data.reason`), and the prompts a `cancel` drops from the queue are refused this way with `reason: "cancelled"` (those a `withdraw`
+takes back with `reason: "withdrawn"`).
 Claw matches on `cmd_seq`: a `cmd_id` may be a client's `Idempotency-Key`, which the credential masking of
 events can change, and a number it never does. A connector from before this change sends neither in `turn_end`,
 and its dropped prompts are not refused.
@@ -223,12 +227,22 @@ router's `devenv_pair` tool, or `devenv_list` itself when the person has no mach
 pairing command; both only in a turn answering a message they sent signed in, recently); the client calls `POST /v1/remote-agents/pairings` as that person and shows the answer's `command`:
 
 ```
-npm install -g @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
+npm install -g --no-update-notifier @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
 ```
 
 Running it on the machine is the approval. `claw-connector pair` posts `{code, name}` to `POST /v1/remote-agents/pairings/claim`,
 which is anonymous (the code is the credential), writes `agents.toml` if there is none (the agents found on the machine, working in
 the folder the command was run in), saves the answer's grant (mode 0600) and starts the connector as a service.
+
+A machine whose name nobody chose (no `--name`, no `agents.toml`: the hostname) also sends `alternate_name`, the hostname and the
+folder (or the user, in the home directory). When another live machine of the person's already has the hostname (case aside), the
+claim pairs it under the alternate, numbered (`-2`, ...) if that is taken too, and answers the name in `data.name`; the connector
+writes that name into `agents.toml`. `GET /v1/remote-agents/connectors` says of each machine whether it was paired (`paired`):
+connecting it again is a new pairing command, not `claw-connector login`.
+
+When every machine of the person's is offline, `devenv_list` carries `connect_a_machine` with `all_offline: true`: its `text` is
+one line that brings the offline machine back (`claw-connector service install` on it), then the pairing command for a new one (or,
+where the turn may not pair, the setup commands), and the router gives it as it is, in one reply.
 
 - **Code**: 12 characters of Crockford base32 (60 bits), shown as `XXXX-XXXX-XXXX`; case, dashes and O/I/L-for-0/1 do not matter.
   Good for 10 minutes and one claim; a person has at most 3 live, and a new one retires the oldest. Only its SHA-256 is stored
@@ -323,7 +337,7 @@ told again once (`claw_remote_terminal_waits`).
 
 A new session, `prompt`, `set_mode` and `resume` are refused with `409 connector_offline` while
 the connector is offline, so a prompt nobody could see being waited on cannot run later.
-`cancel`, `close` and `decision` are queued, since they are safe to deliver late. A connector
+`cancel`, `close`, `decision` and `withdraw` are queued, since they are safe to deliver late. A connector
 whose command stream has just ended still counts as online for 45 s (`STREAM_GRACE_SECS`)
 while its heartbeat is fresh: a Claw release, an ingress restart or a token refresh ends every
 stream and the connector opens the next within seconds, so what is asked in that gap is queued
@@ -379,7 +393,7 @@ the person may have closed the session or removed the machine, and been told tha
   `close` and any `cancel` stay to be delivered.
 - The connector keeps a stall clock: it ticks every second, and a gap of more than 5 s between two ticks, on the monotonic clock
   or the wall clock, means the process could not run (SIGSTOP; the monotonic clock goes on while a process is stopped) or the
-  machine slept (the wall clock jumps over it). Every command but a `cancel` or `close` read within 5 s after such a gap, and
+  machine slept (the wall clock jumps over it). Every command but a `cancel`, `withdraw` or `close` read within 5 s after such a gap, and
   every one whose `issued_at` is older than the live TTL (`REMOTE_AGENT_TIMING.liveCommandTtlMs`, the same 5 minutes after which
   Claw stops delivering it), is confirmed with `POST .../commands/:cmd_id/confirm` before it runs, in its session's order. A
   command read before a stall and still waiting to act when it ends (a prompt queued behind a running turn, or waiting for a
@@ -397,8 +411,9 @@ the person may have closed the session or removed the machine, and been told tha
   session is still open.
 - With no answer (no network yet after a wake, Claw down) the connector asks again with its usual backoff for up to 10 minutes,
   and the command waits in its session meanwhile; one that was already past the live TTL when it came gets only a few tries. A
-  `cancel` or `close` of that session never waits behind it: it ends the confirmations being asked there (a `close` all of them,
-  a `cancel` those of prompts; each is dropped and said as below, `status` `session_closed` or `cancelled`), is carried out straight away, and
+  `cancel`, `withdraw` or `close` of that session never waits behind it: it ends the confirmations being asked there (a `close`
+  all of them, a `cancel` or `withdraw` those of prompts; each is dropped and said as below, `status` `session_closed`,
+  `cancelled` or `withdrawn`), is carried out straight away, and
   what came before it in the session that has not acted yet is dropped the same way when its turn comes. A
   Claw with no confirm route (a 404 from its router, not its own `not_found`) cannot say, and the command runs as it did before
   the route existed (audited `command_unconfirmable`); a Claw whose command frames carry no `sent_at` predates the route too, and

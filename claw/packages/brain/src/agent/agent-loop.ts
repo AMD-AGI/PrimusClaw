@@ -2772,11 +2772,13 @@ class AgentLoopRunner {
       callSignal.dispose();
       if (journalled) await this.journalDone(toolId, resultText, toolOutcome.isError && callSignal.cut());
     await this.onEvent({
-        type: "toolUsed", tool: toolName, actionId: toolId, status: "success",
+        // The tool's own error bit, which the counts above read: its answer was a failure (a call the platform refused, a refused
+        // read, a tool that threw), not data, and the call is recorded as one that failed. A refused review_start (already_merged)
+        // was recorded as "success" and read as a review started (parity G3, 2026-11-07). Its text is still the tool_result a later
+        // turn is rebuilt with (`completion-turns.ts` keeps an "error" result as it keeps a "success" one); is_error says the same
+        // for readers of the earlier shape.
+        type: "toolUsed", tool: toolName, actionId: toolId, status: toolOutcome.isError ? "error" : "success",
         description: resultText.slice(0, 2000),
-        // The tool's own error bit, which the counts above read: its answer was a failure (a refused read, a tool that threw),
-        // not data. `status` stays "success" (the call returned, and its text is the tool_result a later turn is rebuilt with);
-        // without this a failed read was recorded in the session as one that read something.
         ...(toolOutcome.isError ? { is_error: true } : {}),
         // The file a client offers for download (tools/deliver-file.ts).
         ...(toolOutcome.delivery ? { delivery: toolOutcome.delivery } : {}),
