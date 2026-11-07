@@ -174,6 +174,26 @@ describe("pairing a machine with a one-time code", { skip }, () => {
     assert.equal(told.length, 1);
   });
 
+  test("P5c a paired machine that lost its state registers again under its name: its stale row is replaced and the grant follows", async () => {
+    const token = (await claim((await newCode("alice")).code)).body.data.token as string;
+    const first = (await register(token)).body.data.connector_id as string;
+    // Long offline, as a machine whose local state was wiped (the row is past the online window and was made before it).
+    await q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '1 hour', stream_seen_at = NULL, created_at = NOW() - interval '1 hour' WHERE connector_id = $1", [first]);
+    const again = await register(token);
+    assert.equal(again.status, 201, JSON.stringify(again.body));
+    const second = again.body.data.connector_id as string;
+    assert.ok((await q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [first])).rows[0].revoked_at, "the stale row was replaced");
+    assert.equal((await heartbeat(token, second)).status, 200, "the grant works on the new row");
+    assert.equal((await heartbeat(token, first)).body.error, "connector_grant_mismatch", "and no longer names the old one");
+    assert.equal((await register(token)).status, 201, "registering again still works");
+    // The binding is part of the registration's own transaction: what it commits already names the new row.
+    const store = await import("../src/remote-agents/store.js");
+    const grantId = (await q("SELECT grant_id::text AS id FROM claw_remote_grants")).rows[0].id as string;
+    const row = await store.registerConnector("alice", "laptop", "0.1.6", null, 10, "connector_grant", 90_000, grantId);
+    assert.ok(row);
+    assert.equal((await q("SELECT connector_id::text AS c FROM claw_remote_grants WHERE grant_id = $1", [grantId])).rows[0].c, row!.connector_id);
+  });
+
   test("P5b a notice that could not be said is said at the next registration, once", async () => {
     const saved = pairing.pairingPorts.tell;
     let fail = true;

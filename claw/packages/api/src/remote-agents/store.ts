@@ -71,6 +71,8 @@ const withCredential = (detail: Record<string, unknown>, credential: string | nu
 export async function registerConnector(
   owner: string, name: string, version: string | null, client: string | null, maxPerUser: number,
   credential: string | null = null, onlineWindowMs: number | null = null,
+  /** A connector grant (`pairing.ts`) the caller registers with: bound to the new row in this same transaction. */
+  grantId: string | null = null,
 ): Promise<(Row & { replaced: string[] }) | null> {
   return inTransaction(async (q) => {
     await lock(q, `connectors:${owner}`);
@@ -101,6 +103,11 @@ export async function registerConnector(
        RETURNING connector_id, name, created_at`,
       [randomUUID(), owner, name, version],
     )).rows[0];
+    // In the transaction that may have revoked the grant's previous row (same name, above): never a moment, nor a failure in
+    // between, in which the grant points at a revoked row and is refused for good.
+    if (grantId) {
+      await q("UPDATE claw_remote_grants SET connector_id = $2 WHERE grant_id = $1 AND revoked_at IS NULL", [grantId, row.connector_id]);
+    }
     await writeAudit(q, {
       owner, actor: owner, client, connectorId: row.connector_id, action: "connector.registered",
       detail: withCredential(replaced.length ? { name, replaced } : { name }, credential),

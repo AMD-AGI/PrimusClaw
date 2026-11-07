@@ -181,17 +181,15 @@ export async function findGrant(token: string, q: Querier = (t, p) => db.query(t
 }
 
 /**
- * Bind `grantId` to the connector row it just registered. Until the owner has been told which machine was paired, they are
- * told (a failure to tell is logged, never the registration's failure, and tried again at the next registration).
+ * After a grant registered a connector (bound to it in `registerConnector`'s transaction): until the owner has been told which
+ * machine was paired, they are told. A failure to tell is logged, never the registration's failure, and tried again at the
+ * next registration; the notice's key says it once.
  */
-export async function bindGrant(grantId: string, connectorId: string, name: string): Promise<void> {
+export async function notifyPaired(grantId: string, connectorId: string, name: string): Promise<void> {
   const g = (await db.query(
-    `UPDATE claw_remote_grants SET connector_id = $2 WHERE grant_id = $1 AND revoked_at IS NULL
-      RETURNING owner_user_id, notified_at`,
-    [grantId, connectorId],
+    "SELECT owner_user_id, notified_at FROM claw_remote_grants WHERE grant_id = $1 AND revoked_at IS NULL", [grantId],
   )).rows[0] as { owner_user_id: string; notified_at: Date | null } | undefined;
   if (!g || g.notified_at) return;
-  // Marked told only once it was said; the notice's key makes a second attempt (a later registration) say nothing twice.
   try {
     const told = await pairingPorts.tell({ owner: g.owner_user_id, grantId, connectorId, name });
     if (told) await db.query("UPDATE claw_remote_grants SET notified_at = NOW() WHERE grant_id = $1", [grantId]);

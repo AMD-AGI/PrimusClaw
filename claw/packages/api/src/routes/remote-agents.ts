@@ -32,7 +32,7 @@ import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { CONNECTOR_TOKEN_METHOD, tokenExpired, tokenRevoked } from "../auth/connector-token.js";
 import { CONNECTOR_GRANT_METHOD, grantOf } from "../auth/connector-grant.js";
-import { bindGrant } from "../remote-agents/pairing.js";
+import { notifyPaired } from "../remote-agents/pairing.js";
 import { registerPairingRoutes, type PairingRouteOptions } from "../remote-agents/pairing-routes.js";
 import { CONNECTOR_SIDE_ROUTES } from "../remote-agents/connector-routes.js";
 import { db } from "../infra/db.js";
@@ -260,12 +260,12 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const body = parseConnectorRegistration(req.body ?? {});
     if (!body.ok) return fail(reply, 400, body.error);
     const row = await store.registerConnector(
-      owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req), onlineWindowMs,
+      owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req), onlineWindowMs, grantOf(req),
     );
     if (!row) return fail(reply, 409, "connector_limit_reached");
-    // A paired machine's grant follows the row it registered: only that row's routes, and over when that row is revoked.
+    // A paired machine's grant now follows this row (bound above, in its transaction): only its routes, over once it is revoked.
     const grant = grantOf(req);
-    if (grant) await bindGrant(grant, row.connector_id, row.name);
+    if (grant) await notifyPaired(grant, row.connector_id, row.name);
     // Offline rows under the same name (a connector that lost its state and registered again) were revoked in its place.
     if (row.replaced.length) logger.info({ owner, connectorId: row.connector_id, replaced: row.replaced }, "remote_agents.connector_replaced");
     for (const id of row.replaced) waker.wake(`c:${id}`);
