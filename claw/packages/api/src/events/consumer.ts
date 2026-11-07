@@ -52,6 +52,7 @@ import { metrics } from "../infra/metrics.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
+import type { LeaderLease } from "../infra/leader-lock.js";
 import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
 
 /** Brain's event for a streaming tool call's text so far (`ExecuteRequest.stream_tool_text`); never stored. */
@@ -240,6 +241,54 @@ function owedRunNotice(raw: unknown, rowId: number): RunFinished | null {
   return null;
 }
 
+/**
+ * A processed completion whose run notification was not recorded (see the stamp in `processCompletionEvent`): record
+ * that and nothing else. Everything else the completion did is done and is not done again; the notification's own key
+ * (the run, not the delivery) is what makes recording it a second time, after a clear that did not land, write nothing.
+ * Called with the completion lock held.
+ */
+async function recordOwedRunNotice(
+  sessionId: string,
+  rowId: number,
+  raw: unknown,
+  lease: Pick<LeaderLease, "lost">,
+): Promise<CompletionOutcome> {
+  const owed = CLAW_NOTIFICATIONS_ENABLED ? owedRunNotice(raw, rowId) : null;
+  if (!owed) return "done";
+  try {
+    await completionPorts.recordRunFinished(owed);
+  } catch (err) {
+    logger.error({ err, sessionId, rowId }, "notification.record_failed");
+    return "owed";
+  }
+  if (lease.lost()) return "done";
+  await db.query("UPDATE claw_session_events SET run_notification_owed = NULL WHERE id = $1", [rowId]);
+  logger.info({ sessionId, rowId, taskIds: owed.taskIds }, "notification.owed_recorded");
+  return "done";
+}
+
+/**
+ * The redelivery of a completion whose session was deleted after it was processed: the run it announces did end, and
+ * a notification it still owes is recorded before the delivery is dropped (the run's end, not the session's content).
+ * A completion that was never processed, or owes nothing, is dropped as before.
+ */
+async function recordOwedRunNoticeOfDeletedSession(sessionId: string, eventId: string): Promise<CompletionOutcome> {
+  const stored = (await db.query(
+    `SELECT id, run_notification_owed FROM claw_session_events
+      WHERE event_id = $1 AND session_id = $2 AND processed_at IS NOT NULL AND run_notification_owed IS NOT NULL`,
+    [eventId, sessionId],
+  )).rows[0] as { id: number } | undefined;
+  if (!stored) return "done";
+  const outcome = await withCompletionLock(sessionId, async (lease): Promise<CompletionOutcome> => {
+    const current = (await db.query(
+      "SELECT run_notification_owed FROM claw_session_events WHERE id = $1",
+      [stored.id],
+    )).rows[0] as { run_notification_owed?: unknown } | undefined;
+    return recordOwedRunNotice(sessionId, stored.id, current?.run_notification_owed, lease);
+  });
+  return outcome.ran ? outcome.result : "busy";
+}
+
 async function processCompletionEvent(
   sessionId: string,
   event: Record<string, unknown>,
@@ -254,23 +303,7 @@ async function processCompletionEvent(
       [rowId, sessionId],
     )).rows[0];
     if (!current || !("processed_at" in current)) throw new Error("completion event row is missing");
-    if (current.processed_at !== null) {
-      // Processed, but the run notification it owes was not recorded (see the stamp below): record that and nothing
-      // else. Everything else the completion did is done and is not done again; the notification's own key (the run,
-      // not the delivery) is what makes recording it a second time, after a clear that did not land, write nothing.
-      const owed = CLAW_NOTIFICATIONS_ENABLED ? owedRunNotice(current.run_notification_owed, rowId) : null;
-      if (!owed) return "done";
-      try {
-        await completionPorts.recordRunFinished(owed);
-      } catch (err) {
-        logger.error({ err, sessionId, rowId }, "notification.record_failed");
-        return "owed";
-      }
-      if (lease.lost()) return "done";
-      await db.query("UPDATE claw_session_events SET run_notification_owed = NULL WHERE id = $1", [rowId]);
-      logger.info({ sessionId, rowId, taskIds: owed.taskIds }, "notification.owed_recorded");
-      return "done";
-    }
+    if (current.processed_at !== null) return recordOwedRunNotice(sessionId, rowId, current.run_notification_owed, lease);
 
     // A sweeper completion describes a row it already terminalized; its task id
     // is context for the turn, not a worker-generation fence.
@@ -432,6 +465,21 @@ export async function consumeEventDelivery(msg: {
       return;
     }
     if (deleted) {
+      if (event.type === "exec_complete" && CLAW_NOTIFICATIONS_ENABLED) {
+        let outcome: CompletionOutcome;
+        try {
+          outcome = await recordOwedRunNoticeOfDeletedSession(
+            sessionId, makeEventId((msg as any).seq ?? (msg as any).info?.streamSequence),
+          );
+        } catch (err) {
+          logger.error({ err, sessionId }, "notification.owed_record_failed");
+          outcome = "owed";
+        }
+        if (outcome !== "done") {
+          msg.nak(outcome === "busy" ? 1_000 : 10_000);
+          return;
+        }
+      }
       logger.info({ sessionId, type: event.type }, "event-consumer.dropped_deleted_session");
       msg.ack();
       return;

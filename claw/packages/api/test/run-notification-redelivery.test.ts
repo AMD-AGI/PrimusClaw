@@ -161,6 +161,33 @@ describe("run notification after a failed outbox write", { skip }, () => {
     assert.deepEqual(rows, { n: 1, delivered: 1 });
   });
 
+  test("a session deleted before the redelivery still has its run's end recorded, once", async () => {
+    failFirst = 1;
+    assert.equal(await deliverEvent(7, completion()), "nak");
+    assert.equal(summaries, 1);
+    // Deleted between the failed write and the redelivery: the delivery is dropped, but not before what it owes.
+    await q("UPDATE claw_sessions SET deleted_at = NOW() WHERE session_id = $1", [SESSION]);
+    let tombstoneReads = 0;
+    consumer.tombstoneReader.has = async () => { tombstoneReads++; return true; };
+    // The live answer the first delivery cached would otherwise be read instead of the tombstone.
+    (await import("../src/sessions/deleted-cache.js")).resetDeletedSessionCache();
+    try {
+      assert.equal(await deliverEvent(7, completion()), "ack");
+      assert.equal(await deliverEvent(7, completion()), "ack");
+      // A completion that was never processed is still dropped unread.
+      assert.equal(await deliverEvent(9, completion()), "ack");
+    } finally {
+      consumer.tombstoneReader.has = async () => false;
+    }
+    assert.ok(tombstoneReads > 0, "the deliveries took the deleted-session path");
+    assert.equal(writes, 2);
+    assert.equal(summaries, 1);
+    const ev = (await q("SELECT run_notification_owed FROM claw_session_events WHERE event = 'exec_complete'")).rows;
+    assert.deepEqual(ev.map((r) => r.run_notification_owed), [null], "one stored completion, owing nothing");
+    await deliver();
+    assert.equal(runCompleted().length, 1);
+  });
+
   test("CONTROL: a write that does not fail is recorded on the first delivery, which is acked", async () => {
     assert.deepEqual(await deliverUntilAcked(7, completion()), ["ack"]);
     await deliver();
