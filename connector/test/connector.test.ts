@@ -801,9 +801,12 @@ describe("crash safety", () => {
     h.connector.store.put(sid, { agent_id: "fake", acp_session_id: "acp-x", cwd, status: "active", mode, created_at: new Date().toISOString() });
     h.connector.store.beginTurn({ session_id: sid, cmd_id: "c-9", cmd_seq: 9, started_at: new Date().toISOString(), waiting: true, waiting_permission: true });
     // Its last heartbeat a moment ago (connector.json's mtime), so only the rule under test keeps the turn from going on.
-    const id = path.join(h.dirs.state, "connector.json");
-    if (!fs.existsSync(id)) fs.writeFileSync(id, "{}");
-    else fs.utimesSync(id, new Date(), new Date());
+    // (Opened once, created when missing and kept when there: one file handle, no check-then-write.)
+    const fd = fs.openSync(path.join(h.dirs.state, "connector.json"), fs.constants.O_RDWR | fs.constants.O_CREAT, 0o600);
+    try {
+      if (fs.fstatSync(fd).size === 0) fs.writeSync(fd, "{}");
+      fs.futimesSync(fd, new Date(), new Date());
+    } finally { fs.closeSync(fd); }
   };
   test("a turn waiting on a plan card (not a tool call's permission) is ended at a restart, not carried on", async () => {
     const h = await make();
