@@ -266,7 +266,8 @@ forward), which is what a long-lived session's reader should ask for. The stream
 read a page at a time and, when the client does not say where it resumes (`?after=` or
 `Last-Event-ID`), is the session's last `SSE_HISTORY_TAIL` events (2000 by default; the
 `historyComplete` marker's `has_more` says older ones exist; `?history=all` sends all of them).
-`after` is placed by row, so `claw-10` follows `claw-9`. The subscription is established
+`after=claw-<seq>` is followed by every stream event of a higher sequence (whatever order the
+replicas stored them in) and by the other rows stored after it, so `claw-10` follows `claw-9`. The subscription is established
 *before* the history query runs, which closes the window in which an event published
 between the two would be lost.
 

@@ -145,8 +145,9 @@ record it.
   connection. Without `?after=` or `Last-Event-ID` it replays the session's last `SSE_HISTORY_TAIL` events (default 2000), and
   the `historyComplete` marker carries `has_more: true` when older ones were left out; `?history=all` replays all of them, and
   `?mode=replay` pages through them as JSON. The history is read and written 500 rows at a time, waiting for a slow client.
-  `after` (and `Last-Event-ID`) is placed by row instead of comparing ids as text, so a reconnect after `claw-9` gets `claw-10`;
-  a `claw-<seq>` the table does not hold yet resumes after the last stored event at or before it. The Anthropic-compatible
+  `after` (and `Last-Event-ID`) no longer compares ids as text, so a reconnect after `claw-9` gets `claw-10`: a `claw-<seq>`
+  cursor is followed by every stream event of a higher sequence wherever its row is (replicas can store `claw-11` before
+  `claw-10`), and by the other rows stored after it; a `claw-<seq>` the table does not hold yet is placed the same way. The Anthropic-compatible
   `/anthropic/v1/sessions/:id/events/stream` replays the last `SSE_HISTORY_TAIL` events too (the paged list route has all of
   them), and an A2A task's `artifacts` carry its latest 100 turn results.
 - `GET /v1/chat/sessions/:id/messages?mode=replay` reads a window of the history instead of all of it when asked: `tail=N` is

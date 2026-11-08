@@ -232,3 +232,30 @@ test("events the stream never sends do not take places in the tail", async () =>
   assert.deepEqual(s.ns, range(1, SSE_HISTORY_TAIL));
   assert.equal(s.marker?.has_more, false);
 });
+
+/** One event `id` stored now (rows are stored in the order these are called). */
+async function store1(id: string, n: number): Promise<void> {
+  await h.sql(
+    `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, 'toolUsed', jsonb_build_object('type', 'toolUsed', 'n', $3::int))`,
+    [id, SID, n],
+  );
+}
+
+test("a stream event stored before a lower one still follows it: after is placed by sequence, not by row", async () => {
+  // Several API replicas pull from one consumer: claw-11 can be stored before claw-10.
+  await seed(9);
+  await store1("user-a", 100);    // a row of the turn itself (no stream id), stored before the cursor
+  await store1("claw-11", 11);
+  await store1("claw-10", 10);
+  await store1("user-b", 101);    // stored after the cursor
+  await store1("claw-12", 12);
+  assert.deepEqual((await stream("", { "last-event-id": "claw-10" })).ids, ["claw-11", "user-b", "claw-12"]);
+  assert.deepEqual((await stream("?after=claw-11")).ids, ["user-b", "claw-12"]);
+});
+
+test("a stream id not stored yet is placed by sequence too", async () => {
+  await seed(9);
+  await store1("claw-12", 12);
+  await store1("claw-11", 11);    // claw-10 reached the client live; its row is not written yet
+  assert.deepEqual((await stream("?after=claw-10")).ids, ["claw-12", "claw-11"]);
+});

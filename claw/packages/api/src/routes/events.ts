@@ -125,8 +125,8 @@ export function historySegment(
 /**
  * The marker that ends the history segment. `count`: the events it sent. `has_more`: the history was cut to the session's
  * last events (a stream that does not say where it resumes gets the last `SSE_HISTORY_TAIL`) and older ones were not
- * sent; `?history=all` asks for all of them, and `?mode=replay&after=` / `&tail=` reads them as JSON. Always present, so
- * a client can tell this server from one that predates it (whose `after` compared ids as text).
+ * sent; `?history=all` asks for all of them, and `?mode=replay&after=` / `&tail=` reads them as JSON. Always present on
+ * this stream, so a client can tell this server from one that predates it (whose `after` compared ids as text).
  */
 export function historyCompleteFrame(count: number, hasMore: boolean): string {
   return `event: ${HISTORY_COMPLETE_EVENT}\n`
@@ -241,6 +241,8 @@ export const HISTORY_PAGE_ROWS = 500;
  */
 export interface HistoryStart {
   afterId: number;
+  /** Only rows after this cursor (`?after=` / Last-Event-ID); null: no cursor. */
+  after: AfterCursor | null;
   upTo: number;
   hasMore: boolean;
 }
@@ -256,27 +258,49 @@ function shownSql(opts: ForwardOpts, params: unknown[]): string {
   return filter ? `${named} AND ${filter}` : named;
 }
 
+/** A stream event id's sequence (`claw-<seq>`) in SQL; NULL for any other id. Cast only where it matches. */
+const STREAM_SEQ_SQL = "(CASE WHEN event_id ~ '^claw-[0-9]{1,15}$' THEN substr(event_id, 6)::bigint END)";
+
 /**
- * The row an `after` cursor stands for: its place in the table (`id`), so what follows it is read by row order and
- * `claw-10` follows `claw-9` (comparing the ids as text put `claw-10` first, and a reconnect after `claw-9` lost it).
- * A stream id the table does not hold yet (`claw-<seq>`: the live event reached the client before its row was written)
- * stands after the last stored stream event at or before that sequence. Null: not an event this session can place.
+ * What follows an `after` cursor. A stream id (`claw-<seq>`) is followed by every stream event of a higher sequence,
+ * wherever its row is: several API replicas pull from one consumer, so `claw-101` can be stored before `claw-100`, and
+ * reading by row from `claw-100` would leave it out. An id that is no stream id (the turn's own rows) is followed by
+ * what was stored after its row, as are such rows after a stream cursor. Comparing ids as text put `claw-10` before
+ * `claw-9`. `seq` null: no stream cursor.
  */
-async function cursorRowId(sessionId: string, after: string): Promise<number | null> {
+export interface AfterCursor {
+  seq: number | null;
+  row: number;
+}
+
+/**
+ * The cursor `after` stands for in this session. A stream id the table does not hold yet (the live event reached the
+ * client before its row was written) still has its sequence; its row is the last stored stream event at or before it.
+ * Null: not an event this session can place.
+ */
+async function afterCursor(sessionId: string, after: string): Promise<AfterCursor | null> {
+  const m = /^claw-([0-9]{1,15})$/.exec(after);
+  const seq = m ? Number(m[1]) : null;
   const exact = (await db.query(
     "SELECT id FROM claw_session_events WHERE session_id = $1 AND event_id = $2",
     [sessionId, after],
   )).rows[0] as { id: number | string } | undefined;
-  if (exact) return Number(exact.id);
-  const seq = /^claw-([0-9]{1,15})$/.exec(after);
-  if (!seq) return null;
+  if (exact) return { seq, row: Number(exact.id) };
+  if (seq === null) return null;
   const before = (await db.query(
-    `SELECT COALESCE(MAX(id), 0) AS id FROM claw_session_events
-      WHERE session_id = $1
-        AND (CASE WHEN event_id ~ '^claw-[0-9]{1,15}$' THEN substr(event_id, 6)::bigint END) <= $2::bigint`,
-    [sessionId, seq[1]],
+    `SELECT COALESCE(MAX(id), 0) AS id FROM claw_session_events WHERE session_id = $1 AND ${STREAM_SEQ_SQL} <= $2::bigint`,
+    [sessionId, seq],
   )).rows[0] as { id: number | string } | undefined;
-  return Number(before?.id ?? 0);
+  return { seq, row: Number(before?.id ?? 0) };
+}
+
+/** The rows after `cursor` (see AfterCursor) as a SQL predicate, its parameters appended to `params`. */
+function afterSql(cursor: AfterCursor, params: unknown[]): string {
+  params.push(cursor.row);
+  const row = `id > $${params.length}`;
+  if (cursor.seq === null) return row;
+  params.push(cursor.seq);
+  return `(${STREAM_SEQ_SQL} > $${params.length}::bigint OR (${STREAM_SEQ_SQL} IS NULL AND ${row}))`;
 }
 
 /** The newest row of the session (0: none). */
@@ -298,10 +322,19 @@ export async function historyStart(
 ): Promise<HistoryStart> {
   const upTo = await newestRowId(sessionId);
   if (after) {
-    const afterId = await cursorRowId(sessionId, after);
-    if (afterId !== null) return { afterId, upTo, hasMore: false };
+    const cursor = await afterCursor(sessionId, after);
+    if (cursor !== null) {
+      // Pages are read by row from the first row after the cursor (a stream event of a higher sequence can sit before it).
+      const params: unknown[] = [sessionId];
+      const first = (await db.query(
+        `SELECT MIN(id) AS id FROM claw_session_events WHERE session_id = $1 AND ${afterSql(cursor, params)}`,
+        params,
+      )).rows[0] as { id: number | string | null } | undefined;
+      const afterId = first?.id == null ? cursor.row : Number(first.id) - 1;
+      return { afterId, after: cursor, upTo, hasMore: false };
+    }
   }
-  if (all) return { afterId: 0, upTo, hasMore: false };
+  if (all) return { afterId: 0, after: null, upTo, hasMore: false };
   const params: unknown[] = [sessionId, upTo];
   const where = ["session_id = $1", "deleted_at IS NULL", "id <= $2", shownSql(opts, params)];
   params.push(tail);
@@ -309,15 +342,19 @@ export async function historyStart(
     `SELECT id FROM claw_session_events WHERE ${where.join(" AND ")} ORDER BY id DESC OFFSET $${params.length} LIMIT 1`,
     params,
   )).rows[0] as { id: number | string } | undefined;
-  return edge ? { afterId: Number(edge.id), upTo, hasMore: true } : { afterId: 0, upTo, hasMore: false };
+  return edge ? { afterId: Number(edge.id), after: null, upTo, hasMore: true } : { afterId: 0, after: null, upTo, hasMore: false };
 }
 
-/** The next page of history after row `afterId` and up to row `upTo`, oldest first, at most HISTORY_PAGE_ROWS rows. */
+/**
+ * The next page of history after row `afterId` and up to row `upTo`, oldest first, at most HISTORY_PAGE_ROWS rows; with
+ * `after`, only rows after that cursor.
+ */
 export async function historyPage(
-  sessionId: string, afterId: number, upTo: number, opts: ForwardOpts,
+  sessionId: string, afterId: number, upTo: number, opts: ForwardOpts, after: AfterCursor | null = null,
 ): Promise<Array<{ id: number | string; event_id: unknown; data: unknown }>> {
   const params: unknown[] = [sessionId, afterId, upTo];
   const where = ["session_id = $1", "deleted_at IS NULL", "id > $2", "id <= $3", shownSql(opts, params)];
+  if (after) where.push(afterSql(after, params));
   params.push(HISTORY_PAGE_ROWS);
   return (await db.query(
     `SELECT id, event_id, event, data FROM claw_session_events WHERE ${where.join(" AND ")} ORDER BY id LIMIT $${params.length}`,
@@ -520,7 +557,7 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
           upTo = newest;
         }
         for (;;) {
-          const rows = await historyPage(sessionId, cursor, upTo, fwdOpts);
+          const rows = await historyPage(sessionId, cursor, upTo, fwdOpts, start.after);
           const page = historyFrames(rows, fwdOpts, seenAppEvents);
           for (const eid of page.seenIds) seenIds.add(eid);
           for (const frame of page.frames) sseWrite(frame);
