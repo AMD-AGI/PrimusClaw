@@ -12,7 +12,8 @@
  * which is what these tests assert: the exact arguments the tool hands across.
  *
  *   I1  a message to the user's own assistant is written down with the turn's id, how it was authenticated and its bounded context
- *   I2  the message route takes who stands behind a message from how it was authenticated, never from the body
+ *   I2  the message route takes who stands behind a message from how it was authenticated, never from the body; the channel's `via`
+ *       (a message posted for the person, `on_behalf`) is stored with it, and nothing outside that closed set
  *   A1  a turn that answers no signed-in message cannot act: a report's turn, a key's message, an injected report
  *   A2  the person's say goes stale after CLAW_ASSISTANT_ATTENDED_TTL_SEC
  *   A3  a turn that read what a worker wrote (work_recall) no longer acts for the person
@@ -259,13 +260,16 @@ describe("assistant review tools", { skip }, () => {
     await w.openRun(alice.routerSid, { messageId: "claw-user-turn" });
     await w.q(`INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content) VALUES ($1, 'claw-user-turn', $2, 'earlier')`,
       [alice.routerSid, alice.userId]);
-    const viaToken = await post("identity_token", undefined, { content: "审 254", channel_context: { channel_message_id: "t-1", people: [{ name: "Wei", user_id: "u-w" }] } });
+    const viaToken = await post("identity_token", undefined, { content: "审 254", channel_context: { channel_message_id: "t-1", via: "on_behalf", people: [{ name: "Wei", user_id: "u-w" }] } });
     const viaKey = await post("api_key", undefined, { content: "审 254", attended: true, attended_via: { kind: "person" } });
-    const viaCookie = await post("cookie", undefined, { content: "审 254" });
+    const viaCookie = await post("cookie", undefined, { content: "审 254", channel_context: { via: "admin" } });
     const rows = await w.q("SELECT message_id, attended_via, channel_context FROM claw_assistant_messages WHERE session_id = $1 AND message_id <> 'claw-user-turn' ORDER BY received_at, message_id", [alice.routerSid]);
     const byId = new Map(rows.map((r) => [r.message_id, r]));
     assert.deepEqual(byId.get(viaToken.message_id)?.attended_via, PERSON);
     assert.deepEqual(byId.get(viaToken.message_id)?.channel_context.people, [{ name: "Wei", user_id: "u-w" }]);
+    // How the message reached the chat is stored with it, for what counts the person's own messages apart (Clawy's failure mining).
+    assert.equal(byId.get(viaToken.message_id)?.channel_context.via, "on_behalf");
+    assert.ok(!("via" in byId.get(viaCookie.message_id)!.channel_context), "a value outside the closed set is not stored");
     assert.equal(byId.get(viaKey.message_id)?.attended_via, null, "what the body says about attendance is not read");
     assert.equal(byId.get(viaCookie.message_id)?.attended_via, null);
     assert.equal(rows.length, 3);
