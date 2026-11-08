@@ -287,9 +287,10 @@ async function pullRequestSection(q: Querier, userId: string, w: Words, needs: s
     // A week's report names its source: the pull request's own page.
     return r === "week" ? `${w.prLine(pr, parts)} ${prUrl(pr)}` : w.prLine(pr, parts);
   });
-  if (asked.total) lines.unshift(w.asked(asked.total, asked.merged, asked.changes_requested, w.period[r]));
+  // The reviews' line comes first and takes no pull request's place under the section's cap.
+  const askedLine = asked.total ? [w.asked(asked.total, asked.merged, asked.changes_requested, w.period[r])] : [];
   return {
-    key: "pull_requests", title: w.pull_requests, checked: true, lines: lines.slice(0, SECTION_LINES_MAX[r]),
+    key: "pull_requests", title: w.pull_requests, checked: true, lines: [...askedLine, ...lines.slice(0, SECTION_LINES_MAX[r])],
     summary: w.prSummary(watched, events.reduce((n, e) => n + Number(e.n), 0), w.period[r]),
   };
 }

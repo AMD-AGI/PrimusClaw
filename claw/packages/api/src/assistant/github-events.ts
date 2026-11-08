@@ -874,8 +874,10 @@ export async function pollSubscription(sub: Subscription): Promise<{ stored: num
     const seen = rate();
     if (seen && seen.remaining < seen.limit * RATE_FLOOR_SHARE) await deferUser(sub.user_id, seen.resetAt);
   }
+  // Best effort: the branches only tell the brief what to leave out, and a failure to keep them never holds back the events read.
   if (read.refs && (read.refs.head !== null || read.refs.base !== null)) {
-    await db.query("UPDATE claw_work_item_subscriptions SET head_ref = $2, base_ref = $3 WHERE id = $1", [sub.id, read.refs.head, read.refs.base]);
+    await db.query("UPDATE claw_work_item_subscriptions SET head_ref = $2, base_ref = $3 WHERE id = $1", [sub.id, read.refs.head, read.refs.base])
+      .catch((err) => logger.warn({ subId: sub.id, err: (err as Error)?.message }, "github_events.refs_not_kept"));
   }
   return storeEvents(sub, read);
 }

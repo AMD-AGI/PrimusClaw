@@ -305,6 +305,20 @@ describe("assistant GitHub events", { skip }, () => {
     assert.ok(Date.now() - t0 < 120_000);
   });
 
+  test("P1b a poll whose branch write fails still stores and delivers what it read", async () => {
+    const it = await watched();
+    gh.comment("Please look at the parser again.");
+    // The branches cannot be kept (their column is gone): the comment is stored and delivered all the same.
+    await w.q("ALTER TABLE claw_work_item_subscriptions DROP COLUMN head_ref");
+    try {
+      const first = await poll();
+      assert.deepEqual({ stored: first.stored, delivered: first.delivered }, { stored: 1, delivered: 1 });
+      assert.equal((await events(it.itemId)).length, 1);
+    } finally {
+      await w.q("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS head_ref TEXT");
+    }
+  });
+
   test("P2 an answer GitHub wrote but whose reply was lost is found on the pull request, not posted again", async () => {
     const it = await watched();
     gh.comment("Is the cache invalidated on rename?");

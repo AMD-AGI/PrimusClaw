@@ -429,6 +429,18 @@ describe("assistant brief", { skip }, () => {
     assert.ok(!week.text.includes("#381"), week.text);
     assert.equal(s.pull_requests.summary, "1 watched, 3 new events in the last week", "the fixture is neither watched nor its comments counted");
     assert.equal(s.pull_requests.lines[0], "reviews asked of others in the last week: 4, 2 merged, 1 with changes requested");
+    assert.equal(s.pull_requests.lines[1], "AMD-AGI/PrimusClaw#291: 2 comments, CI failed https://github.com/AMD-AGI/PrimusClaw/pull/291");
+    // Ten more pull requests with news: the section's cap (ten for a week) holds ten of them, and the reviews' line takes none's place.
+    for (let n = 1; n <= 10; n++) {
+      const [sub] = await w.q(
+        `INSERT INTO claw_work_item_subscriptions (item_id, user_id, owner, repo, number, since, cursor_at, head_ref, base_ref)
+         VALUES ('kwi_3', 'alice', 'o', 'r', $1, NOW(), NOW(), 'feat', 'main') RETURNING id`, [500 + n],
+      );
+      await w.q(`INSERT INTO claw_work_item_github_events (event_id, sub_id, item_id, kind, github_id) VALUES ($1, $2, 'kwi_3', 'issue_comment', $1)`, [`gh:more:${n}`, sub.id]);
+    }
+    const full = Object.fromEntries((await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "en", timezone: "UTC", now, range: "week" })).sections.map((x) => [x.key, x]));
+    assert.equal(full.pull_requests.lines.length, 11, "the reviews' line and ten pull requests");
+    assert.match(full.pull_requests.lines[0], /^reviews asked of others in the last week/);
     const day = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "en", timezone: "UTC", now });
     assert.equal(Object.fromEntries(day.sections.map((x) => [x.key, x])).pull_requests.lines[0], "reviews asked of others in the last day: 2, 1 merged, 0 with changes requested");
     const zh = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "zh", timezone: "UTC", now, range: "week" });
