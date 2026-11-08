@@ -45,7 +45,19 @@ const CONTEXT_MAX_CHARS = 1200;
  * The most of a page one judgement reads, in characters: about 4k tokens. The page's paragraphs that share the most rare words with
  * the statements are taken, each statement's best first (`pageExcerpt`). A whole page was about 33k tokens a judgement (2026-11-08).
  */
-export const CITE_CHECK_EXCERPT_CHARS = 12_000;
+export const CITE_CHECK_EXCERPT_CHARS = 7_000;
+/**
+ * The second look at a statement the first judged not supported (`checkReport`): those statements alone, a page within this many
+ * characters given whole, a longer one cut to this budget for them alone, so each has more of the page than in the first look.
+ */
+export const CITE_CHECK_SECOND_EXCERPT_CHARS = 10_000;
+/** The most statements one second look reads. */
+export const CITE_CHECK_SECOND_CLAIMS_PER_CALL = 15;
+/**
+ * A statement whose line holds fewer letters than this (a table row of numbers: "当前开放 PR 881 280") says too little to be checked
+ * on its own: when no source is found to support it, it is marked as such and counted apart, not as unverified.
+ */
+export const CITE_CHECK_THIN_LETTERS = 8;
 /** What stands between two parts of an excerpt. */
 const EXCERPT_JOIN = "\n\n…\n\n";
 /** The longest paragraph an excerpt takes whole; a longer one is cut into pieces of this size. */
@@ -104,6 +116,13 @@ export interface CiteCheckResult {
   unchecked: number;
   /** Judge calls that gave no answer, after their retry: a batch of statements each. */
   judgeFailures: number;
+  /**
+   * Statements that say too little to be checked (`isThin`) and no source was found to support: marked so (`（信息过少，未能核对）`),
+   * counted apart from unverified and not checked.
+   */
+  thin: number;
+  /** Statements the first look judged not supported and the second look (`CITE_CHECK_SECOND_EXCERPT_CHARS`) found supported. */
+  secondLook: number;
 }
 
 const SOURCE_LINE = /^\s{0,3}(?:[-*+]\s+)?\[(\d{1,3})\][:.]?\s+(.*)$/;
@@ -224,6 +243,11 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+/** Whether a statement's line says too little to be checked on its own: fewer than `CITE_CHECK_THIN_LETTERS` letters. */
+export function isThin(line: string): boolean {
+  return (line.match(/\p{L}/gu)?.length ?? 0) < CITE_CHECK_THIN_LETTERS;
+}
+
 /** Run `work` over `items`, at most `limit` at a time. */
 async function eachLimited<T>(items: T[], limit: number, work: (item: T) => Promise<void>): Promise<void> {
   let next = 0;
@@ -238,7 +262,9 @@ async function eachLimited<T>(items: T[], limit: number, work: (item: T) => Prom
 
 /** `text` as it is, marked as not a report: the numbers are all zero. */
 function unchanged(text: string): CiteCheckResult {
-  return { text, checked: false, claims: 0, supported: 0, unverified: 0, sources: 0, unreadable: 0, unchecked: 0, judgeFailures: 0 };
+  return {
+    text, checked: false, claims: 0, supported: 0, unverified: 0, sources: 0, unreadable: 0, unchecked: 0, judgeFailures: 0, thin: 0, secondLook: 0,
+  };
 }
 
 /**
@@ -262,7 +288,12 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
   const supportedBy: Set<number>[] = claims.map(() => new Set<number>());
   // For each statement, the numbers whose judge gave no answer: nothing was decided about the statement and those pages.
   const unjudged: Set<number>[] = claims.map(() => new Set<number>());
+  // For each statement, the numbers whose judge said no in the first look: those get a second look (below).
+  const judgedNo: Set<number>[] = claims.map(() => new Set<number>());
+  // The pages read, for the second look.
+  const pages = new Map<number, string>();
   let judgeFailures = 0;
+  let secondLook = 0;
   const checkedClaims = claims.slice(0, CITE_CHECK_MAX_CLAIMS);
   const allCited = [...new Set(claims.flatMap((c) => c.numbers))].filter((n) => sources.has(n));
   const cited = [...new Set(checkedClaims.flatMap((c) => c.numbers))].filter((n) => sources.has(n)).slice(0, CITE_CHECK_MAX_SOURCES);
@@ -274,6 +305,39 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
   };
   claims.forEach((c, i) => { if (i >= CITE_CHECK_MAX_CLAIMS) c.numbers.filter((n) => sources.has(n)).forEach((n) => unjudged[i].add(n)); });
   for (const n of allCited) if (!cited.includes(n)) notReached(n);
+
+  /**
+   * One judgement of `batch` against `page` (an excerpt, or the whole page): the verdicts, or null when the judge gave no answer
+   * twice. A judge that gave no answer (an empty reply, one cut short, one that is not a boolean per statement) is asked once more;
+   * a second miss is counted where it can be seen (`cite_check.judge_no_answer`, the metric).
+   */
+  const judgeBatch = async (url: string, page: string, batch: Claim[]): Promise<boolean[] | null> => {
+    const ask = async (): Promise<boolean[] | null> => {
+      try {
+        const v = await untilAborted(
+          ports.judge({ url, page, claims: batch.map((c) => c.text), contexts: batch.map((c) => c.context) }, budget.signal), budget.signal,
+        );
+        return v && v.length === batch.length ? v : null;
+      } catch (err) {
+        logger.info({ host: hostOf(url), err: err instanceof Error ? err.message : String(err) }, "cite_check.judge_threw");
+        return null;
+      }
+    };
+    let verdicts = await ask();
+    if (verdicts) {
+      metrics.onCiteCheckJudge("answered");
+      return verdicts;
+    }
+    logger.warn({ host: hostOf(url), statements: batch.length }, "cite_check.judge_no_answer_retrying");
+    verdicts = await ask();
+    if (verdicts) {
+      metrics.onCiteCheckJudge("answered_on_retry");
+      return verdicts;
+    }
+    metrics.onCiteCheckJudge("no_answer");
+    logger.warn({ host: hostOf(url), statements: batch.length }, "cite_check.judge_no_answer");
+    return null;
+  };
 
   try {
     await eachLimited(cited, CITE_CHECK_CONCURRENCY, async (n) => {
@@ -290,6 +354,7 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
         page = { ok: false };
       }
       if (!page.ok || !page.text.trim()) { unreadable.add(n); return; }
+      pages.set(n, page.text);
       const mine = checkedClaims.map((c, i) => ({ c, i })).filter(({ c }) => c.numbers.includes(n));
       for (let k = 0; k < mine.length; k += CITE_CHECK_CLAIMS_PER_CALL) {
         if (budget.signal.aborted || now() > deadline) {
@@ -297,35 +362,43 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
           return;
         }
         const batch = mine.slice(k, k + CITE_CHECK_CLAIMS_PER_CALL);
-        const ask = async (): Promise<boolean[] | null> => {
-          try {
-            const claimTexts = batch.map(({ c }) => c.text);
-            const contexts = batch.map(({ c }) => c.context);
-            const excerpt = pageExcerpt(page.text, batch.map(({ c }) => `${c.text} ${c.context}`));
-            const v = await untilAborted(ports.judge({ url: source.url, page: excerpt, claims: claimTexts, contexts }, budget.signal), budget.signal);
-            return v && v.length === batch.length ? v : null;
-          } catch (err) {
-            logger.info({ host: hostOf(source.url), err: err instanceof Error ? err.message : String(err) }, "cite_check.judge_threw");
-            return null;
-          }
-        };
-        // A judge that gave no answer (an empty reply, one cut short, one that is not a boolean per statement) is asked once more;
-        // a second miss leaves the batch not checked, and is counted where it can be seen (`cite_check.judge_no_answer`, the metric).
-        let verdicts = await ask();
-        if (verdicts) metrics.onCiteCheckJudge("answered");
-        else {
-          logger.warn({ host: hostOf(source.url), statements: batch.length }, "cite_check.judge_no_answer_retrying");
-          verdicts = await ask();
-          if (verdicts) metrics.onCiteCheckJudge("answered_on_retry");
-          else {
-            metrics.onCiteCheckJudge("no_answer");
-            judgeFailures += 1;
-            logger.warn({ host: hostOf(source.url), statements: batch.length }, "cite_check.judge_no_answer");
-            batch.forEach(({ i }) => unjudged[i].add(n));
-            continue;
-          }
+        const excerpt = pageExcerpt(page.text, batch.map(({ c }) => `${c.text} ${c.context}`));
+        const verdicts = await judgeBatch(source.url, excerpt, batch.map(({ c }) => c));
+        if (!verdicts) {
+          judgeFailures += 1;
+          batch.forEach(({ i }) => unjudged[i].add(n));
+          continue;
         }
-        batch.forEach(({ i }, j) => { if (verdicts![j] === true) supportedBy[i].add(n); });
+        batch.forEach(({ i }, j) => { if (verdicts[j] === true) supportedBy[i].add(n); else judgedNo[i].add(n); });
+      }
+    });
+
+    // The second look: a statement no source was found to support, whose judge said no (not one that failed to answer), is judged
+    // again on that source with its own excerpt of the page, more of it per statement (the whole page when it is short enough), with
+    // the other statements of that source the first look rejected. Supported now, it is supported. Time left permitting.
+    const again = new Map<number, number[]>();
+    checkedClaims.forEach((_, i) => {
+      if (supportedBy[i].size) return;
+      for (const n of judgedNo[i]) again.set(n, [...(again.get(n) ?? []), i]);
+    });
+    await eachLimited([...again.keys()], CITE_CHECK_CONCURRENCY, async (n) => {
+      const source = sources.get(n)!;
+      const page = pages.get(n)!;
+      const all = again.get(n)!;
+      for (let k = 0; k < all.length; k += CITE_CHECK_SECOND_CLAIMS_PER_CALL) {
+        if (budget.signal.aborted || now() > deadline) return;
+        const batch = all.slice(k, k + CITE_CHECK_SECOND_CLAIMS_PER_CALL);
+        const text = page.length <= CITE_CHECK_SECOND_EXCERPT_CHARS
+          ? page
+          : pageExcerpt(page, batch.map((i) => `${claims[i].text} ${claims[i].context}`), CITE_CHECK_SECOND_EXCERPT_CHARS);
+        const verdicts = await judgeBatch(source.url, text, batch.map((i) => claims[i]));
+        // No answer the second time: the first look's no stands.
+        if (!verdicts) continue;
+        batch.forEach((i, j) => {
+          if (verdicts[j] !== true) return;
+          if (!supportedBy[i].size) secondLook += 1;
+          supportedBy[i].add(n);
+        });
       }
     });
   } finally {
@@ -336,21 +409,25 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
   const zh = isChinese(text);
   const mark = zh ? "（未证实）" : " (unverified)";
   const notChecked = zh ? "（未核对）" : " (not checked)";
+  const thinMark = zh ? "（信息过少，未能核对）" : " (too little to check)";
   // Each line's statements, rewritten from the last to the first so the earlier offsets hold.
   const byLine = new Map<number, number[]>();
   claims.forEach((c, i) => byLine.set(c.line, [...(byLine.get(c.line) ?? []), i]));
   let supported = 0;
   let unchecked = 0;
+  let thin = 0;
   for (const [ln, idx] of byLine) {
     let line = lines[ln];
     for (const i of [...idx].reverse()) {
       const c = claims[i];
       const keep = c.numbers.filter((n) => supportedBy[i].has(n));
       const open = !keep.length && unjudged[i].size > 0;
+      const tooThin = !keep.length && !open && isThin(c.context);
       if (keep.length) supported += 1;
       else if (open) unchecked += 1;
+      else if (tooThin) thin += 1;
       const trailing = line.slice(c.start, c.end).match(/\s*$/)?.[0] ?? "";
-      const group = keep.length ? keep.map((n) => `[${n}]`).join("") : open ? notChecked : mark;
+      const group = keep.length ? keep.map((n) => `[${n}]`).join("") : open ? notChecked : tooThin ? thinMark : mark;
       // The mark follows the statement's last word; kept numbers stay where they were.
       const head = keep.length ? line.slice(0, c.start) : line.slice(0, c.start).replace(/\s+$/, "");
       line = `${head}${group}${trailing}${line.slice(c.end)}`;
@@ -361,15 +438,16 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
     const s = sources.get(n)!;
     lines[s.line] = `${lines[s.line].replace(/\s+$/, "")}${zh ? "（未能打开或读取，未作为依据）" : " (could not be opened or read; not used as evidence)"}`;
   }
-  const unverified = claims.length - supported - unchecked;
+  const unverified = claims.length - supported - unchecked - thin;
   const summary = zh
-    ? `引用核对（交付前由系统逐条打开来源核对）：${claims.length} 条带引用的结论中 ${supported} 条有来源支持，${unverified} 条标为“未证实”${unchecked ? `，${unchecked} 条因核对未能完成标为“未核对”` : ""}；被引用的 ${allCited.length} 个来源中 ${unreadable.size} 个未能打开或读取。`
-    : `Citation check (each source opened and checked by the system before delivery): ${supported} of ${claims.length} cited statements are supported by their sources, ${unverified} are marked unverified${unchecked ? `, ${unchecked} are marked not checked (the check could not be completed for them)` : ""}; ${unreadable.size} of the ${allCited.length} cited sources could not be opened or read.`;
+    ? `引用核对（交付前由系统逐条打开来源核对）：${claims.length} 条带引用的结论中 ${supported} 条有来源支持，${unverified} 条标为“未证实”${unchecked ? `，${unchecked} 条因核对未能完成标为“未核对”` : ""}${thin ? `，${thin} 条信息过少（如只有数字的表格行）未能核对` : ""}；被引用的 ${allCited.length} 个来源中 ${unreadable.size} 个未能打开或读取。`
+    : `Citation check (each source opened and checked by the system before delivery): ${supported} of ${claims.length} cited statements are supported by their sources, ${unverified} are marked unverified${unchecked ? `, ${unchecked} are marked not checked (the check could not be completed for them)` : ""}${thin ? `, ${thin} say too little to be checked (a table row of numbers, say)` : ""}; ${unreadable.size} of the ${allCited.length} cited sources could not be opened or read.`;
   const out = `${lines.join("\n").replace(/\s+$/, "")}\n\n---\n\n${summary}\n`;
-  metrics.onCiteCheckStatements(supported, unverified, unchecked);
-  logger.info({ claims: claims.length, supported, unverified, unchecked, judgeFailures, sources: allCited.length, checkedSources: cited.length, unreadable: unreadable.size, ms: now() - (deadline - CITE_CHECK_BUDGET_MS) }, "cite_check.done");
+  metrics.onCiteCheckStatements(supported, unverified, unchecked, thin);
+  logger.info({ claims: claims.length, supported, unverified, unchecked, thin, secondLook, judgeFailures, sources: allCited.length, checkedSources: cited.length, unreadable: unreadable.size, ms: now() - (deadline - CITE_CHECK_BUDGET_MS) }, "cite_check.done");
   return {
     text: out, checked: true, claims: claims.length, supported, unverified, sources: allCited.length, unreadable: unreadable.size, unchecked, judgeFailures,
+    thin, secondLook,
   };
 }
 
@@ -381,7 +459,8 @@ function hostOf(url: string): string {
 /** What the model is told about the check, before what the checking tool answered. */
 export function checkNote(r: CiteCheckResult): string {
   return `Citation check before delivery: ${r.supported} of ${r.claims} cited statements are supported by their sources; `
-    + `${r.unverified} were marked unverified in the delivered file${r.unchecked ? `, ${r.unchecked} were marked not checked (the check could not judge them)` : ""} `
+    + `${r.unverified} were marked unverified in the delivered file${r.unchecked ? `, ${r.unchecked} were marked not checked (the check could not judge them)` : ""}`
+    + `${r.thin ? `, ${r.thin} were marked as saying too little to be checked` : ""} `
     + `and ${r.unreadable} of ${r.sources} cited sources could not be opened or read. `
     + "The file delivered is the checked text. Give these numbers in your report; do not present an unverified statement as a finding.";
 }
