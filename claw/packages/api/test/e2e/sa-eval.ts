@@ -70,10 +70,15 @@
  *   EVAL_TURN_WAIT_S  how long a turn may take to end (default 180 for a router turn, 600 for a plain session's), counted from
  *                     its own message: a turn whose exec_complete is not stored by then makes the attempt an error, not a grade;
  *                     so does an assistant session still running that long before a case. An attempt is graded on what the
- *                     stream showed only when it showed every stored event of the case (15 s grace); otherwise it is an error
+ *                     stream showed only when it showed every stored event of the case that is graded (a gap opens the stream
+ *                     again at once, then 15 s grace; every reopening is logged and kept in the attempt's `reopened`); otherwise it
+ *                     is an error
  *   EVAL_SAY_GRACE_S  how long, after a turn ended, its first say is waited for (default 5): a router that says nothing gets the
  *                     server's own reply a moment after its turn ends, and that reply is what the person is shown
  *   EVAL_GAP_S        seconds between the end of one case and the start of the next (default 0)
+ *   EVAL_INFRA_RETRY  1 (default): an attempt that ended in an error of the run (not a grade: a missed stream, a read or a judge
+ *                     that failed, a turn that did not end) is run again once, and the second try is the one reported (`retried`
+ *                     names the first one's error); 0 runs each attempt once
  *   EVAL_FRESH_SESSION_EVERY
  *                     assistant mode: a new assistant session every that many cases (1: each case its own; default 0: one for
  *                     the run), so no case is read in the context of earlier ones. The session before is let finish, its items
@@ -232,6 +237,7 @@ function sendToken(): string {
   return token;
 }
 const GAP_MS = int("EVAL_GAP_S", 0, 0, 3_600) * 1000;
+const INFRA_RETRY = int("EVAL_INFRA_RETRY", 1, 0, 1) === 1;
 const SAY_GRACE_MS = int("EVAL_SAY_GRACE_S", 5, 0, 120) * 1000;
 
 /**
@@ -304,11 +310,15 @@ async function deleteOwn(sessionId: string): Promise<boolean> {
 
 // --- The live stream of a session ---------------------------------------------------------------------------------
 
+/** Every time a stream of the run was opened again, and why (it dropped, or the run reopened it to fill a gap). */
+const REOPENED: Array<{ at: number; why: "dropped" | "forced" }> = [];
+
 /**
  * Every event of a session that arrives on its stream, with the time it arrived here. With `skipHistory` what the
  * session held before the stream opened is left out (the assistant's earlier conversation). The stream is reopened
- * when it drops; an event stored while it was down arrives with the new stream's history and is taken with the time it
- * was seen, so a gap only makes a latency look longer, never shorter.
+ * when it drops, and when the run finds a stored event it did not deliver (`reopen`: a stream can stall without
+ * dropping); an event stored while it was down arrives with the new stream's history and is taken with the time it
+ * was seen, so a gap only makes a latency look longer, never shorter. Each reopening is logged and kept in REOPENED.
  */
 class LiveStream {
   readonly events: LiveEvent[] = [];
@@ -316,6 +326,9 @@ class LiveStream {
   private closed = false;
   private abort = new AbortController();
   private first = true;
+  private forced = false;
+  /** Called when the next stream's history has been read (`reopen`). */
+  private readonly onHistory: Array<() => void> = [];
 
   constructor(private readonly sessionId: string, private readonly skipHistory: boolean) {}
 
@@ -324,8 +337,14 @@ class LiveStream {
     const historyDone = new Promise<void>((r) => { ready = r; });
     void (async () => {
       while (!this.closed) {
-        try { await this.read(ready); } catch { /* dropped: reopened below */ }
-        if (!this.closed) await sleep(2_000);
+        this.forced = false;
+        try { await this.read(ready); } catch { /* dropped, or reopened on purpose: reopened below */ }
+        if (this.closed) break;
+        const why = this.forced ? "forced" : "dropped";
+        if (this.forced) this.forced = false; else await sleep(2_000);
+        if (this.closed) break;
+        REOPENED.push({ at: Date.now(), why });
+        log(`the stream of ${this.sessionId} is opened again (${why === "forced" ? "a stored event was not delivered" : "it dropped"})`);
       }
     })();
     // A stop ends the wait as well: the cleanup's own wait follows.
@@ -346,7 +365,7 @@ class LiveStream {
       const { frames, rest } = sseFrames(buffer);
       buffer = rest;
       for (const f of frames) {
-        if (f.event === "historyComplete") { live = true; ready(); continue; }
+        if (f.event === "historyComplete") { live = true; ready(); for (const done of this.onHistory.splice(0)) done(); continue; }
         let data: Record<string, any>;
         try { data = JSON.parse(f.data); } catch { continue; }
         const id = f.id || `${data.type}:${data.say_id ?? data.actionId ?? ""}:${data.status ?? ""}:${data.message_id ?? ""}`;
@@ -359,7 +378,20 @@ class LiveStream {
     }
   }
 
-  close(): void { this.closed = true; this.abort.abort(); }
+  /**
+   * Open the stream again now, and wait (up to `ms`) until the new stream's history is read: what was stored and not delivered
+   * comes with it. False when that history did not come in time.
+   */
+  async reopen(ms = 30_000): Promise<boolean> {
+    if (this.closed) return false;
+    let timer: NodeJS.Timeout | undefined;
+    const read = new Promise<boolean>((r) => { this.onHistory.push(() => r(true)); timer = setTimeout(() => r(false), ms); });
+    this.forced = true;
+    this.abort.abort();
+    try { return await read; } finally { clearTimeout(timer); }
+  }
+
+  close(): void { this.closed = true; this.abort.abort(); for (const done of this.onHistory.splice(0)) done(); }
 }
 
 // --- Reads --------------------------------------------------------------------------------------------------------
@@ -640,10 +672,14 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
       || saysOf(stream.events).some((s) => s.itemId === i.item_id && s.itemState !== "in_progress")) ? true : undefined), Date.now() + 30_000, 1_000);
   }
   // What is graded is what the stream showed, so only when it showed every stored event of the case's turns and of what was
-  // said about its items (a stream stalled without dropping would hide a leak, a card or a work_create); it gets 15 s to catch up.
+  // said about its items (a stream stalled without dropping would hide a leak, a card or a work_create). A gap opens the stream
+  // again at once (its history brings what was stored), and then it gets 15 s to catch up.
   const missed = async (): Promise<string[]> => streamMissed(await replay(sessionId).catch(() => null), stream.events, messageIds, items.map((i) => i.item_id));
   let gaps = await missed();
-  if (gaps.length) await waitFor(async () => ((gaps = await missed()).length ? undefined : true), Date.now() + 15_000, 3_000);
+  if (gaps.length) {
+    await stream.reopen();
+    await waitFor(async () => ((gaps = await missed()).length ? undefined : true), Date.now() + 15_000, 3_000);
+  }
   // What is graded is the last turn (earlier turns are its context and may start items of their own): its Router turn's
   // calls, the items that turn started and their workers' calls, what was said in it and about those items. Leaks are
   // looked for in everything the case showed; latencies run from the last turn's sending.
@@ -865,6 +901,7 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
     const sentIds = mids.filter((m): m is string => !!m);
     let gaps = streamMissed(rows, stream.events, sentIds);
     if (gaps.length) {
+      await stream.reopen();
       await waitFor(async () => {
         rows = await replay(sessionId).catch(() => rows);
         return (gaps = streamMissed(rows, stream.events, sentIds)).length ? undefined : true;
@@ -1170,21 +1207,37 @@ async function main(): Promise<void> {
         if (MODE === "assistant") {
           try { await paceSays(session!.stream, priorSays); } catch (err) { if (err instanceof Interrupted) break cases; throw err; }
         }
-        let a: Attempt;
-        const caseStart = Date.now();
-        const earlier = new Set(RUN_MESSAGES);   // an earlier attempt's refusal that arrives late is not this one's
-        try {
-          a = MODE === "assistant" ? await runAssistant(filled, turns, session!) : await runBaseline(filled, turns);
-        } catch (err) {
-          a = { pass: false, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: null, finalMs: null, items: [], error: scrub(err instanceof Error ? err.message : String(err)) };
+        const once = async (): Promise<Attempt> => {
+          let a: Attempt;
+          const caseStart = Date.now();
+          const earlier = new Set(RUN_MESSAGES);   // an earlier attempt's refusal that arrives late is not this one's
+          try {
+            a = MODE === "assistant" ? await runAssistant(filled, turns, session!) : await runBaseline(filled, turns);
+          } catch (err) {
+            a = { pass: false, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: null, finalMs: null, items: [], error: scrub(err instanceof Error ? err.message : String(err)) };
+          }
+          // A say the server refused for its hourly cap is the run's failure, not the assistant's.
+          const refused = MODE === "assistant" && !a.error ? capRefusedSays(session!.stream.events, caseStart, earlier) : 0;
+          if (refused) a = { ...a, pass: false, error: `infra: ${refused} say(s) refused by the hourly cap (say_rate_limited)` };
+          if (MODE === "assistant") writeSayLog(sayLog, mergeSays([priorSays, countedSays(session!.stream.events)], Date.now()));
+          const reopened = REOPENED.filter((x) => x.at >= caseStart).map((x) => `${new Date(x.at).toISOString()} ${x.why}`);
+          return reopened.length ? { ...a, reopened } : a;
+        };
+        let a = await once();
+        // An attempt that ended in an error of the run (a missed stream, a read or a judge that failed, a turn that did not end) is
+        // run again once: what is reported is the second try, with the first one's error. A stop is not run again.
+        if (a.error && INFRA_RETRY && !stopSignal) {
+          log(`ERROR ${c.id}#${k + 1} ${a.error}: running it again once`);
+          if (MODE === "assistant") {
+            try { await paceSays(session!.stream, priorSays); } catch (err) { if (err instanceof Interrupted) { r.attempts.push(a); break cases; } throw err; }
+          }
+          const first = a;
+          a = { ...(await once()), retried: first.error };
+          if (first.reopened) a.reopened = [...first.reopened, ...(a.reopened ?? [])];
         }
-        // A say the server refused for its hourly cap is the run's failure, not the assistant's.
-        const refused = MODE === "assistant" && !a.error ? capRefusedSays(session!.stream.events, caseStart, earlier) : 0;
-        if (refused) a = { ...a, pass: false, error: `infra: ${refused} say(s) refused by the hourly cap (say_rate_limited)` };
-        if (MODE === "assistant") writeSayLog(sayLog, mergeSays([priorSays, countedSays(session!.stream.events)], Date.now()));
         r.attempts.push(a);
         const failed = a.checks.filter((x) => !x.pass).map((x) => x.name);
-        log(`${a.error ? "ERROR" : a.pass ? "pass" : "FAIL"} ${c.id}#${k + 1} route=${a.route ?? "-"} cards=${a.cards ?? "-"} first=${a.firstReplyMs}ms final=${a.finalMs}ms ${a.error ?? failed.join("; ")}`);
+        log(`${a.error ? "ERROR" : a.pass ? "pass" : "FAIL"} ${c.id}#${k + 1} route=${a.route ?? "-"} cards=${a.cards ?? "-"} first=${a.firstReplyMs}ms final=${a.finalMs}ms ${a.error ?? failed.join("; ")}${a.retried ? " (second try)" : ""}`);
         lastCaseEnd = Date.now();
         if (stopSignal) break cases;
       }

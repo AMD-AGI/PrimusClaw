@@ -815,11 +815,22 @@ export function judgeVerdict(text: string): "PASS" | "FAIL" | undefined {
 export const JUDGE_RETRY_NOTE = "\n\nYour last answer had no verdict. Answer with exactly one line that starts with PASS or FAIL.";
 
 /**
+ * Stored events nothing graded reads: a session's progress (`statusUpdate`, but one that says the turn failed ends it), its
+ * sandbox's (`sandboxStatus`), and Brain's own loading of a plugin's servers, rules and hooks (`toolUsed` load_*, a result with
+ * no call). A stream that missed one of them showed everything a case is graded on.
+ */
+export function ungraded(d: Record<string, any>, type: unknown): boolean {
+  if (type === "sandboxStatus") return true;
+  if (type === "statusUpdate") return d.agentStatus !== "failed";
+  return type === "toolUsed" && /^load_(?:mcp|rule|hooks)$/.test(String(d.tool ?? ""));
+}
+
+/**
  * The stored events (`?mode=replay`, with their `event_id`, which is the stream's frame id) of the given turns, and of what was
  * said about the given items, that the stream did not deliver: none when it showed everything a case is graded on. A turn's
  * exec_complete and the user's own message are left out: the live part of a stream never carries either (Claw stores a
  * UserMessage and publishes it on core-NATS `sse.events.<session>`, while the stream follows JetStream `events.<session>`; only a
- * stream's history segment replays it), and the runner wrote the message itself.
+ * stream's history segment replays it), and the runner wrote the message itself. So is what nothing graded reads (`ungraded`).
  * Events that could not be read are a gap too.
  */
 export function streamMissed(rows: ReadonlyArray<EventRow & { event_id?: unknown }> | null, events: readonly LiveEvent[],
@@ -831,7 +842,7 @@ export function streamMissed(rows: ReadonlyArray<EventRow & { event_id?: unknown
   return rows.filter((r) => {
     const d = r.data ?? {};
     const type = d.type ?? r.event_type;
-    if (type === "exec_complete" || type === "UserMessage") return false;
+    if (type === "exec_complete" || type === "UserMessage" || ungraded(d, type)) return false;
     const ours = turns.has(String(d.message_id ?? "")) || turns.has(String(d.turn_message_id ?? "")) || (d.item?.item_id !== undefined && items.has(String(d.item.item_id)));
     return ours && !seen.has(String(r.event_id ?? ""));
   }).map((r) => String(r.event_id ?? "?"));
@@ -1189,6 +1200,10 @@ export interface Attempt {
   /** Not fully graded, so not a pass: content only a judge can grade and no judge graded it, or an oracle not read (offline). */
   unjudged?: true;
   error?: string;
+  /** When a stream of the attempt was opened again (ISO time and why: it dropped, or a stored event was not delivered). */
+  reopened?: string[];
+  /** The error of a first try that the run ran again (once): this attempt is the second try. */
+  retried?: string;
 }
 
 /** The case has content only a judge can grade: a rubric, or a fact whose value is neither written nor read by an oracle. */

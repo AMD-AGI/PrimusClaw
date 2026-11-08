@@ -719,6 +719,18 @@ test("S21 what the stream missed", () => {
   assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2"), ["m1"], ["i1"]), ["claw-3"], "a say about the case's item");
   assert.deepEqual(streamMissed(rows, seen("claw-1", "claw-2"), ["m1"]), [], "an item the case did not start is not looked at");
   assert.deepEqual(streamMissed(null, [], ["m1"]), ["(the stored events could not be read)"]);
+  // What nothing graded reads is no gap (E249: 8 events at a turn's start, its progress, sandbox and plugin loading); a status that
+  // says the turn failed ends it, and is one.
+  const progress = [
+    row("claw-8", { type: "statusUpdate", message_id: "m1", agentStatus: "running" }),
+    row("claw-9", { type: "sandboxStatus", message_id: "m1", status: "ready" }),
+    row("claw-10", { type: "toolUsed", message_id: "m1", tool: "load_mcp", status: "success", brief: "Loaded plugin MCP (safe)" }),
+    row("claw-11", { type: "toolUsed", message_id: "m1", tool: "load_rule", status: "success" }),
+    row("claw-12", { type: "toolUsed", message_id: "m1", tool: "load_hooks", status: "success" }),
+    row("claw-13", { type: "statusUpdate", message_id: "m1", agentStatus: "failed" }),
+    row("claw-14", { type: "toolUsed", message_id: "m1", tool: "mcp__assistant__load_notes", status: "success" }),
+  ];
+  assert.deepEqual(streamMissed([...rows, ...progress], seen("claw-1", "claw-2", "claw-3"), ["m1"], ["i1"]), ["claw-13", "claw-14"]);
 });
 
 test("S23 files in, files and long answers out", () => {
