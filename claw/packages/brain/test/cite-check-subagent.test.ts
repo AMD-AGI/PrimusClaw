@@ -93,7 +93,7 @@ test("CS1 a sub-agent's delivery is checked with the forwarded check, and only w
  * answers with the path and the count of matching lines; its `read` with line_numbers false answers the file's raw text. The run's
  * assistant server records what deliver_text was sent. `unreadable`: the read fails.
  */
-function routerOver(file: string | null, opts: { unreadable?: boolean } = {}) {
+function routerOver(file: string | null, opts: { unreadable?: boolean; size?: number } = {}) {
   const searches: Array<Record<string, unknown>> = [];
   const reads: Array<Record<string, unknown>> = [];
   const delivered: Array<Record<string, unknown>> = [];
@@ -104,7 +104,7 @@ function routerOver(file: string | null, opts: { unreadable?: boolean } = {}) {
       if (name !== "bash" || !command.startsWith("stat ")) throw new Error(`unexpected ${name}`);
       const p = /^stat -L -c '[^']*' -- '((?:[^']|'\\'')*)' 2>&1 && /.exec(command)![1].replace(/'\\''/g, "'");
       if (file === null) return `stat: cannot statx '${p}': No such file or directory\n\nExit code: 1`;
-      const size = file === "BIG" ? 9 * 1024 * 1024 : file.startsWith("GREPFAIL") ? 400 * 1024 : Buffer.byteLength(file, "utf8");
+      const size = opts.size ?? (file === "BIG" ? 9 * 1024 * 1024 : file.startsWith("GREPFAIL") ? 400 * 1024 : Buffer.byteLength(file, "utf8"));
       return `__claw_deliver_stat__regular file|${size}\n__claw_deliver_real__${Buffer.from(`/workspace\0${p}\0`, "utf8").toString("base64")}\n`;
     },
     callToolFull: async (name: string, input: Record<string, unknown>) => {
@@ -230,7 +230,18 @@ test("CS4 a cited report too large, unreadable, or with no checked deliver_text 
   const other = routerOver(REPORT);
   other.router.citeCheck = parseCiteCheck({ tools: ["mcp__assistant__other"] }, ports);
   assert.deepEqual(await deliverFile(other, "/workspace/report.md"), { text: CITED_FILE_REFUSAL, isError: true });
-  assert.deepEqual([other.reads.length, other.delivered.length], [0, 0]);
+  assert.equal(other.delivered.length, 0);
+  const plain = routerOver("Plain notes, no citations.");
+  plain.router.citeCheck = parseCiteCheck({ tools: ["mcp__assistant__other"] }, ports);
+  assert.notEqual((await deliverFile(plain, "/workspace/notes.md")).text, CITED_FILE_REFUSAL, "a file that is not a report is never refused for it");
+
+  // A small file whose text reads longer than its bytes (a binary read as UTF-8) is not a report: copied, never refused as too large.
+  const binary = routerOver("\uFFFD".repeat(100 * 1024), { size: 100 * 1024 });
+  binary.router.citeCheck = check();
+  const b = await deliverFile(binary, "/workspace/blob.dat");
+  assert.notEqual(b.text, CITED_FILE_TOO_LARGE);
+  assert.equal(binary.delivered.length, 0);
+  assert.equal(binary.reads.length, 1, "it was read, being small");
 });
 
 test("CS5 only the file deliver_file would copy is read, and only a report the check reads goes through deliver_text", async () => {

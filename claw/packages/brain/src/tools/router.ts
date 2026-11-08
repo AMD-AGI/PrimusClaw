@@ -551,8 +551,6 @@ export class ToolRouter {
     ctx?: { stepIdentity?: string },
   ): Promise<string | null> {
     const path = file.real;
-    const tool = check.deliverTool();
-    if (!tool) return refuse(outcome, CITED_FILE_REFUSAL);
     const read: RouteOutcome = { isError: false };
     let text: string;
     try {
@@ -561,10 +559,12 @@ export class ToolRouter {
       return refuse(outcome, CITED_FILE_UNREADABLE);
     }
     if (read.isError || /^Error\b/.test(text)) return refuse(outcome, CITED_FILE_UNREADABLE);
-    if (Buffer.byteLength(text, "utf8") > CITED_FILE_MAX_BYTES) return refuse(outcome, CITED_FILE_TOO_LARGE);
-    // What the search took for a report the check may not (its citations only inside code blocks): not a report, so deliver_file
-    // copies it as any other file, as deliver_text would have passed it on unchanged.
+    // Not a report the check reads (a binary file, notes, citations only inside code blocks): deliver_file copies it as any other
+    // file, as deliver_text would have passed its text on unchanged. Asked first: the text read may be longer than the file's bytes.
     if (!isCitedReport(text)) return null;
+    if (Buffer.byteLength(text, "utf8") > CITED_FILE_MAX_BYTES) return refuse(outcome, CITED_FILE_TOO_LARGE);
+    const tool = check.deliverTool();
+    if (!tool) return refuse(outcome, CITED_FILE_REFUSAL);
     const base = file.file.split("/").filter(Boolean).pop() ?? "report.md";
     const fileName = /\.(md|markdown|txt)$/i.test(base) ? base : `${base.replace(/\.[^.]*$/, "")}.md`;
     const args: Record<string, unknown> = { name: fileName, text };
