@@ -422,7 +422,8 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
       const c = claims[i];
       const keep = c.numbers.filter((n) => supportedBy[i].has(n));
       const open = !keep.length && unjudged[i].size > 0;
-      const tooThin = !keep.length && !open && isThin(c.context);
+      // Only a statement a judge answered no for: one never judged (a number with no source, a page that did not open) stays unverified.
+      const tooThin = !keep.length && !open && judgedNo[i].size > 0 && isThin(c.context);
       if (keep.length) supported += 1;
       else if (open) unchecked += 1;
       else if (tooThin) thin += 1;

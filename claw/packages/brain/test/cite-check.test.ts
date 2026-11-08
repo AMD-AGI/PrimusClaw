@@ -27,8 +27,9 @@
  *   CC16 a statement the first look rejects is looked at again with more of the page (the whole page when short enough), alone
  *        with the others rejected on that source; supported then, it is supported; a statement no judge answered for, or one
  *        already supported, gets no second look; a second look with no answer leaves the first look's no
- *   CC17 a statement whose line says too little (a table row of numbers) and is not supported is marked so and counted apart,
- *        not as unverified; one that is supported stays supported
+ *   CC17 a statement whose line says too little (a table row of numbers) that a judge said no to is marked so and counted apart,
+ *        not as unverified; one that is supported stays supported; one no judge looked at (a number with no source, a page that did
+ *        not open) stays unverified
  *   CC13 up to 80 sources are checked; a source past that cap, a statement past the statements cap and a batch the budget ran out
  *        before are not checked (未核对), never unverified
  */
@@ -465,4 +466,17 @@ test("CC17 a statement that says too little is marked so and counted apart when 
   assert.match(r.text, /\| 合并 PR \| 2166 \[1\] \|/, "a thin statement that is supported stays supported");
   assert.match(r.text, /vLLM 已正式支持 MI300X 并提供镜像（未证实）。/);
   assert.match(r.text.trimEnd().split("\n").at(-1)!, /1 条信息过少（如只有数字的表格行）未能核对/);
+
+  // A short line no judge answered for (a number with no source, a page that did not open) stays unverified, never thin.
+  const unjudged = [
+    "# 对比报告：两个推理框架在 MI300X 上的支持情况与性能差异的总结说明",
+    "| GPU | 881 [9] |",
+    "| GPU | 280 [2] |",
+    "",
+    `[2]: 打不开的页面 — ${C}`,
+  ].join("\n");
+  const u = await checkReport(unjudged, { fetchPage: async () => ({ ok: false }), judge: async ({ claims }) => claims.map(() => false) });
+  assert.deepEqual([u.thin, u.unverified, u.unreadable], [0, 2, 1]);
+  assert.match(u.text, /\| GPU \| 881（未证实） \|/);
+  assert.match(u.text, /\| GPU \| 280（未证实） \|/);
 });

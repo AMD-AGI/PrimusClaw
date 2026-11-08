@@ -144,7 +144,8 @@ record it.
 - A research report's citation check looks again at what it rejects: a statement no source was found to support, whose judge
   said no, is judged once more on that source with its own excerpt (up to 10,000 characters, the whole page when short enough);
   supported then, it is supported. A statement whose line has fewer than 8 letters (a table row of numbers) that nothing
-  supports is marked "too little to check" (信息过少，未能核对) and counted apart from unverified. The first look reads at most
+  a judge said no to is marked "too little to check" (信息过少，未能核对) and counted apart from unverified; one no judge
+  looked at (a number with no source, a page that did not open) stays unverified. The first look reads at most
   7,000 characters of a page. On a live 143-statement report: judge cost $0.87 by the gateway's billing, against $0.80 before.
 - A research report's citation check judges each statement with the whole line it is written in (a statement cut at a
   mid-sentence citation was judged as a fragment), and reads only the parts of a long page that bear on the statements: the
