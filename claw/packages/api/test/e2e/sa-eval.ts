@@ -80,7 +80,8 @@
  *                     again at once, then 15 s grace; every reopening is logged and kept in the attempt's `reopened`); otherwise it
  *                     is an error
  *   EVAL_SAY_GRACE_S  how long, after a turn ended, its first say is waited for (default 5): a router that says nothing gets the
- *                     server's own reply a moment after its turn ends, and that reply is what the person is shown
+ *                     server's own reply a moment after its turn ends, and that reply is what the person is shown. The server's
+ *                     "on it" line said while the turn worked is not that reply: the wait goes on until another say of the turn
  *   EVAL_GAP_S        seconds between the end of one case and the start of the next (default 0)
  *   EVAL_INFRA_RETRY  1 (default): an attempt that ended in an error of the run (not a grade: a missed stream, a read or a judge
  *                     that failed, a turn that did not end) is run again once, and the second try is the one reported (`retried`
@@ -135,7 +136,7 @@ import {
   BUILTIN_TOOLS, assistantInUse, capRefusedSays, caseHash, caseSays, cardsOf, cleanupOf, countedSays, countedSaysOf, deleteSessionConfirmed,
   mergeSays, parseSayLog, endedTurns, storedTurnEnds, streamMissed, filledCase, filesFrom, finalSay, grade, forRecording, identityRefusal, itemsStartedBy,
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
-  sayWaitMs, saysOf, staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
+  sayWaitMs, saysOf, staticFindings, turnsAnswered, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
   type SayMark, type Arms, type Attempt, type Check, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
@@ -264,6 +265,7 @@ const FRESH_EVERY = int("EVAL_FRESH_SESSION_EVERY", 0, 0, 100_000);
 const SEND_TOKEN_CMD = process.env.EVAL_SEND_TOKEN_CMD;
 const sendTokens: string[] = [];   // every token EVAL_SEND_TOKEN_CMD gave: scrubbed like the key
 let sendTokenCached: { token: string; until: number } | null = null;
+let ME_USER_ID: string | null = null;   // the identity's user id (`/v1/me`): how the server's "on it" line of a turn is known by its id
 
 /**
  * A signed-in access token of the key's identity for the messages the run sends (EVAL_SEND_TOKEN_CMD prints it): a message sent with
@@ -731,8 +733,9 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
   if (late.length) throw new Error(`no end of the turn of ${late.join(",")} within ${turnWaitMs(true) / 1000} s of its message: not graded`);
   // A turn whose router said nothing gets the server's own reply (a fallback say) a moment after its end: each turn's first say is
   // waited for a little (EVAL_SAY_GRACE_S), so that reply is graded and timed rather than taken for no answer.
+  // The server's "on it" line said while the turn worked is not that reply: the answer said after the turn's end takes its place.
   if (SAY_GRACE_MS) {
-    await waitFor(() => (messageIds.every((id) => saysOf(stream.events).some((x) => x.turn === id)) ? true : undefined), Date.now() + SAY_GRACE_MS, 200);
+    await waitFor(() => (turnsAnswered(saysOf(stream.events), messageIds, ME_USER_ID) ? true : undefined), Date.now() + SAY_GRACE_MS, 200);
   }
   // The case's items are only those its own turns started (read from their work_create / review_start answers): an item
   // someone else put on the board meanwhile (a review asked of this identity) is neither graded nor closed here.
@@ -1248,6 +1251,7 @@ async function main(): Promise<void> {
   // Before anything is said to anybody's assistant: whose key this is, and whether a channel would carry the run to a person.
   const me = await api("GET", "/v1/me");
   if (me.status !== 200) { console.error(`GET /v1/me answered ${me.status}`); process.exit(2); }
+  ME_USER_ID = typeof me.json?.userId === "string" && me.json.userId ? me.json.userId : null;
   const subs = await api("GET", "/v1/notification-subscriptions");
   if (subs.status !== 200 || !Array.isArray(subs.json?.data)) { console.error(`GET /v1/notification-subscriptions answered ${subs.status}: refusing to run blind`); process.exit(2); }
   const refusal = identityRefusal(me.json ?? {}, subs.json.data, process.env);

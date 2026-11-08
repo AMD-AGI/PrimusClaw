@@ -49,6 +49,8 @@
  *   S27 run variables from a JSON object: nested objects as `a.b`, null as no value
  *   S28 a label for the kind of answer, or settings written as code, is a description, not a value; a number, a name, a path or a time is a value
  *   S29 the stored calls of the run's own turns (the messages it knows by id): a person's turn in the same session is not one
+ *   S30 a turn's reply is not its "on it" line: the wait after a turn's end goes on until another say of the turn, which the server
+ *       says for a router that ended in plain text; the line is known by the id the server gives it
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -59,12 +61,13 @@ import { fileURLToPath } from "node:url";
 
 import type { ToolCall } from "./e2e/agent-eval-lib.js";
 import * as readTools from "../src/assistant/read-tools.js";
+import { lookupAckSayId } from "../src/assistant/lookup-ack.js";
 import {
   BUILTIN_TOOLS, CAPABILITY_DENIAL, SELF_INABILITY, fill, oracleMcpTarget, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
   type Arms,
   apiQuery, caseSays, cardsOf, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
-  assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded,
+  assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
   bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
 } from "./e2e/sa-eval-lib.js";
 
@@ -955,4 +958,28 @@ test("S29 the stored calls of the run's own turns: a person's turn in the same s
   const items = (ids: string[]) => storedTurnCalls(rows, ids).filter((c) => c.ok).flatMap((c) => [...c.result.matchAll(/"item_id":"([^"]+)"/g)].map((m) => m[1])).sort();
   assert.deepEqual(items(["m1", "m2"]), ["i1", "i2"], "the person's turn (p1) started i3, which is not the run's");
   assert.deepEqual(items([]), [], "no message known: nothing is the run's");
+});
+
+test("S30 a turn's reply is not its \"on it\" line", () => {
+  const user = "0bf9d8bb82066c5002cc1db44557334b";
+  const m = "claw-1794117436554";
+  // The id the server gives the line (`lookupAckSayId`), not one copied from it.
+  assert.equal(turnAckSayId(user, m), lookupAckSayId(user, m));
+  assert.notEqual(turnAckSayId(user, m), turnAckSayId(user, "claw-1"));
+  const ack = say(3507, m, "收到，我看一下。", { say_id: lookupAckSayId(user, m) });
+  const answer = say(4226, m, "Kestrel 下个月的冻结期从 12 月 4 日（周五）开始。", { replaces: lookupAckSayId(user, m) });
+  // E242 cat-memory-chain-013: the line alone is not the turn answered, so the wait goes on; with the answer it is.
+  assert.equal(turnsAnswered(saysOf([ack]), [m], user), false);
+  assert.equal(turnsAnswered(saysOf([ack, answer]), [m], user), true);
+  assert.equal(finalSay(saysOf([ack, answer]), [m], [])?.text, "Kestrel 下个月的冻结期从 12 月 4 日（周五）开始。");
+  // The router's own say answers the turn, with or without the line before it; a say of another turn does not.
+  assert.equal(turnsAnswered(saysOf([say(1800, m, "我的回答")]), [m], user), true);
+  assert.equal(turnsAnswered(saysOf([say(1800, "claw-other", "别的")]), [m], user), false);
+  // Every turn of the case: one answered and one with only its line is not done.
+  const m2 = "claw-1794117446524";
+  assert.equal(turnsAnswered(saysOf([answer, say(3000, m2, "收到，我看一下。", { say_id: lookupAckSayId(user, m2) })]), [m, m2], user), false);
+  // Another person's line is no line of this one's: it counts as a say, as every say did before.
+  assert.equal(turnsAnswered(saysOf([say(3000, m, "收到，我看一下。", { say_id: lookupAckSayId("someone-else", m) })]), [m], user), true);
+  // Without the person's id every say of the turn counts.
+  assert.equal(turnsAnswered(saysOf([ack]), [m], null), true);
 });

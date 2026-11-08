@@ -1009,6 +1009,29 @@ export function finalSay(says: readonly Say[], messageIds: readonly string[], it
   return says.filter((s) => turns.has(s.turn)).at(-1) ?? null;
 }
 
+/**
+ * The id of the server's "on it" line for the turn answering `messageId` (`lookupAckSayId` in `src/assistant/lookup-ack.ts`): a say in
+ * the system's words, said while the turn is still working, that the turn's answer takes the place of (`replaces`). The live stream
+ * marks it no differently from an answer, so it is known by its id.
+ */
+export function turnAckSayId(userId: string, messageId: string): string {
+  const h = createHash("sha256").update(`assistant.notice\u0000${userId}\u0000lookup_ack:${messageId}`).digest("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
+
+/**
+ * Whether every one of these turns has had its answer shown: a say of the turn other than its "on it" line. A router turn that ended in
+ * plain text has its words said by the server a moment after its end, often after that line (E242 memory-chain run 2026-11-08,
+ * cat-memory-chain-013: the line at 3.5 s, the answer at 4.2 s, and the grade read "收到，我看一下。" as the whole reply). Without the
+ * person's id every say counts, as before.
+ */
+export function turnsAnswered(says: readonly Say[], messageIds: readonly string[], userId: string | null): boolean {
+  return messageIds.every((id) => {
+    const ack = userId ? turnAckSayId(userId, id) : null;
+    return says.some((s) => s.turn === id && s.sayId !== ack);
+  });
+}
+
 /** Everything said to the user in the case: its own turns' says and every say about its items. */
 export function caseSays(says: readonly Say[], messageIds: readonly string[], itemIds: readonly string[]): Say[] {
   const turns = new Set(messageIds);

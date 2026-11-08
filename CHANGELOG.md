@@ -127,6 +127,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- The super-agent evaluation no longer grades a router turn by its server "on it" line (收到，我看一下。). A turn that ended in plain
+  text has its words said by the server just after its end, after that line; the wait after a turn's end took the line for the reply
+  and graded before the answer arrived (E242 memory-chain run, cat-memory-chain-013: line at 3.5 s, answer at 4.2 s). The wait now
+  goes on until a say of the turn other than its line, which is known by the id the server gives it.
 - A research report's citation check reaches up to 80 sources (was 40), and what it never decided is marked not checked (未核对),
   not unverified: a source or a statement past the caps, a page or a batch the time budget ran out before. A 63-source report had
   36 statements marked unverified only because their sources were past the old cap. `CITE_CHECK_MODEL` chooses the judge's model
