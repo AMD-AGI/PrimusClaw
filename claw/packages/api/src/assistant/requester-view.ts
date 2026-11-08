@@ -13,7 +13,9 @@
  * posted, which anyone who can read the pull request reads there too. Every answer R gets about the item is this and only this
  * (`GET /v1/work-items/:id`, the stop and its 409, `GET /v1/work-items/asked-of-others`), never the item's summary, its pending question,
  * its params or the session's id. When the item closes, the view is written into `params.requester_view` and stays as it was: what X does
- * in the session afterwards (a second look, another verdict) is X's and does not reach R.
+ * in the session afterwards (a second look, another verdict) is X's and does not reach R. One more fact reaches R on its own, as a notice
+ * (`review-conflict.ts`): that the review stopped because GitHub will not merge the pull request R named while its branch conflicts with
+ * the base, which GitHub shows on the pull request as it does the review's findings.
  */
 import { redactPublicJson } from "../events/redaction.js";
 import type { StatementRunner } from "../infra/db.js";

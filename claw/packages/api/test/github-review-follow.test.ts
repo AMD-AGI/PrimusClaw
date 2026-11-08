@@ -12,6 +12,7 @@
  *   F3  no merge when alice did not write the pull request, or may not push
  *   F4  no merge while CI is not green, a thread is open, or the merge state is not CLEAN; nothing is written and it is tried again later
  *   F5  bob deciding his held merge right now, or holding the lock on his writes to it, goes first
+ *   F5b GitHub's 405 "Base branch was modified" on the merge is retried twice, 1 s and 2 s apart, then reported as not_mergeable
  *   F6  merged or closed on GitHub: said so, with whichever account reads it, and everything still held for bob's answer is closed
  *   F7  a review that may not merge by the requester (a review only, or bob's own) only reads, with bob's account
  *   F8  alice has no GitHub account bound: the pull request is read with bob's account, nothing is merged
@@ -169,6 +170,27 @@ describe("F the requester's merge after the reviewer's approval", () => {
     e.gh.mergeStatus = 405;
     o = await follow();
     assert.equal(o.body.reason, "not_mergeable", o.text);
+    assert.equal((await statusOf(held)).status, "pending");
+  });
+
+  test("F5b GitHub's 405 \"Base branch was modified\" on alice's merge is retried after 1 s and 2 s; merged on a retry, bob's held merge closes as merged; refused a third time, it is not_mergeable and the held merge waits for bob again", async () => {
+    const moved = { status: 405, message: "Base branch was modified. Review and try the merge again." };
+    await approvedByBob();
+    let held = await heldForBob();
+    e.gh.mergeAnswers = [moved, { status: 200, message: "" }];
+    let o = await follow();
+    assert.equal(o.body.status, "merged", o.text);
+    assert.equal(puts().length, 2);
+    assert.deepEqual(e.sleeps, [1000]);
+    assert.equal((await statusOf(held)).status, "merged");
+    e.gh.calls.length = 0;
+    e.sleeps.length = 0;
+    held = await heldForBob();
+    e.gh.mergeAnswers = [moved, moved, moved, { status: 200, message: "" }];
+    o = await follow();
+    assert.equal(o.body.reason, "not_mergeable", o.text);
+    assert.equal(puts().length, 3);
+    assert.deepEqual(e.sleeps, [1000, 2000]);
     assert.equal((await statusOf(held)).status, "pending");
   });
 

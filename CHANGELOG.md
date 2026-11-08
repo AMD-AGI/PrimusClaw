@@ -119,6 +119,18 @@ record it.
   out of their items and counts unless `include_fixtures`. The reviews asked of others are counted in all before the latest 20 are
   listed. `devenv_list` lists every machine with its latest 6 sessions and the counts of all of them, and `machine` lists one machine's
   every session.
+- A router turn that has read text Claw did not write is refused other writes with a message that no longer names `work_recall`
+  whatever it read, and, where development environments are on, says what it may still do: put the attach command of the user's own
+  session, or of an agent on their own online machine (its newest open session, or a new one when it has none), as a button, and
+  `devenv_send` as a card (`new_session: true` for a new session even when one is open).
+  After a `devenv_list`, the old wording sent the router looking for a read it never made, and it told the user it could not open a
+  session on their own machine (2026-11-07 daily gaps, N9).
+- A review asked of someone through another person's assistant is told to the reviewer in the language of the one who asked when the
+  reviewer has never written to their own assistant, instead of in the language of the item's English title ("Review+merge …"): on
+  2026-11-07 a reviewer asked in Chinese got 23 "is blocked and needs your answer" notices in English (daily gaps, N5). When such a review
+  stops because GitHub refused the merge on a conflict (merge state DIRTY), the one who asked is told too, through their own assistant and
+  in their language, that the author has to resolve the conflict; at least 17 of those 23 notices were this, and only the reviewer heard of
+  them. Once per item and head commit. The GitHub review audit row records the merge state a merge was refused on (`merge_state`).
 - A worker asked to make a write (push a branch and open a pull request, post a comment) makes it when it gets there and lets the hold
   put it to the user on a card, instead of first reporting a question that only asks whether to make it ("Confirm I should push and
   open the PR?"), which asked a user who had already asked for it again in words, and once more on the card after their yes (G0
