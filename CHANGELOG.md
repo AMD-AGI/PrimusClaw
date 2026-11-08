@@ -127,6 +127,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A research report written to a file is delivered checked: `deliver_file` of a sandbox file that is a cited report reads it whole
+  and delivers it through the run's checked `deliver_text` (a `.md` name kept, another given `.md`), instead of refusing it; one
+  larger than a text delivery (256 KB) is refused. The worker is told to write a report too long for one call to a file
+  (research-v2): written whole into one `deliver_text` call past the model's output budget, it arrived empty and the item failed.
 - The super-agent evaluation no longer grades a router turn by its server "on it" line (收到，我看一下。). A turn that ended in plain
   text has its words said by the server just after its end, after that line; the wait after a turn's end took the line for the reply
   and graded before the answer arrived (E242 memory-chain run, cat-memory-chain-013: line at 3.5 s, answer at 4.2 s). The wait now

@@ -11,7 +11,10 @@ import type { McpToolCaller } from "../clients/mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
 import type { RunCitations } from "./citations.js";
-import { CITED_FILE_PATTERNS, CITED_FILE_REFUSAL, REPORT_FILE_EXTENSIONS, checkNote, checkReport, type CiteCheck } from "./cite-check.js";
+import {
+  CITED_FILE_MAX_BYTES, isCitedReport, CITED_FILE_PATTERNS, CITED_FILE_REFUSAL, CITED_FILE_TOO_LARGE, CITED_FILE_UNREADABLE, REPORT_FILE_EXTENSIONS, checkNote,
+  checkReport, type CiteCheck,
+} from "./cite-check.js";
 import type { LogReads } from "./log-reads.js";
 import { callWithWorkspaceFanout, fansOut } from "./workspace-fanout.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
@@ -24,7 +27,7 @@ import {
   DELIVER_FILE_ENABLED, DELIVER_FILE_MAX_BYTES,
 } from "../config.js";
 import type { Delivery } from "@claw/protocol";
-import { DELIVER_FILE_TOOL, deliverFile, deliverFileSchema } from "./deliver-file.js";
+import { DELIVER_FILE_TOOL, deliverFile, deliverFileSchema, workspaceFile } from "./deliver-file.js";
 import type { WebSearchService } from "./web/search.js";
 import type { WebFetchService } from "./web/fetch.js";
 import { LOAD_SKILL_TOOL, type SkillStore } from "../agent/skill-store.js";
@@ -484,10 +487,23 @@ export class ToolRouter {
     // A research report is checked against its own sources before it is delivered, and only the checked text goes on
     // (`cite-check.ts`); the model is told what the check found before what the tool answered.
     const check = this.citeCheck;
-    // The same report copied out of the sandbox would reach the user unchecked: a text file that is one is refused, and the model
-    // is told to deliver it as text.
-    if (check && name === DELIVER_FILE_TOOL && typeof input.path === "string" && await this.sandboxFileIsCitedReport(input.path, signal)) {
-      return refuse(outcome, CITED_FILE_REFUSAL);
+    // The same report copied out of the sandbox would reach the user unchecked: a file that is one is read and delivered as checked
+    // text instead (a report too long for one deliver_text call is written to a file, so this is how it is delivered).
+    // The file is the one deliver_file would copy (`workspaceFile`: under /workspace, links followed); one it would refuse is left
+    // to refuse.
+    if (check && name === DELIVER_FILE_TOOL && typeof input.path === "string") {
+      const found = await workspaceFile(await this.requireHands(), input.path, signal);
+      if (found.ok) {
+        // A file one text delivery can hold is read, and the check's own parsing decides whether it is a cited report. A larger one
+        // cannot be delivered checked: one that may be a report (the search finds a source line and a citation in it, whatever its
+        // type, or cannot search a text file) is refused; any other is copied as before.
+        if (found.size <= CITED_FILE_MAX_BYTES) {
+          const delivered = await this.deliverCitedFile(check, found, input, signal, outcome, ctx);
+          if (delivered !== null) return delivered;
+        } else if (await this.largeFileMayCite(found.real, REPORT_FILE_EXTENSIONS.test(found.real), signal)) {
+          return refuse(outcome, CITED_FILE_TOO_LARGE);
+        }
+      }
     }
     if (check?.checks(name) && typeof input.text === "string" && input.text.trim()) {
       const result = await checkReport(input.text, check.ports, signal);
@@ -501,27 +517,64 @@ export class ToolRouter {
   }
 
   /**
-   * Whether the sandbox file at `path` is a cited report: the sandbox's own `grep` (which reads the whole file) counts both a line of
-   * a list of sources and a line that cites a number (`CITED_FILE_PATTERNS`). A file the search cannot read is not one: `deliver_file`
-   * then answers for it as it would.
+   * Whether a file too large to be delivered checked may be a cited report, whatever its type: the sandbox's own `grep` (which reads
+   * the whole file) counts both a line of a list of sources and a line with a citation number (`CITED_FILE_PATTERNS`). Two clean
+   * answers, one of them without a match, rule it out. A search that failed, was cut short or could not search the file (over its
+   * 8 MB) rules it out only for a file that is not a text file (`textType` false).
    */
-  private async sandboxFileIsCitedReport(path: string, signal?: AbortSignal): Promise<boolean> {
+  private async largeFileMayCite(path: string, textType: boolean, signal?: AbortSignal): Promise<boolean> {
     for (const pattern of CITED_FILE_PATTERNS) {
       const found: RouteOutcome = { isError: false };
       let text: string;
       try {
         text = await this.routeAllowed("grep", { pattern, path, output_mode: "count", case_sensitive: true }, signal, found);
       } catch {
-        return false;
+        return textType;
       }
-      // A match is the file's count line, `<path>:<n>` with n > 0, whatever the path's name; no note (a file too large to search, a
-      // scan cut short) ends that way. A refusal that did is read as a match: the file then goes through deliver_text, never unchecked.
-      const matched = text.split("\n").some((l) => Number(l.trim().match(/.:(\d+)$/)?.[1] ?? 0) > 0);
-      // A report too large to search is not taken to be anything else (a log or a table that size is delivered as before).
-      const unsearched = !matched && REPORT_FILE_EXTENSIONS.test(path) && /\bnot searched\b/.test(text);
-      if (found.isError || (!matched && !unsearched)) return false;
+      // A search that did not answer, or did not read the whole file, rules nothing out for a text file; a file of another type
+      // (a large archive, a dataset) is not taken for a report on that alone.
+      if (found.isError || /^(Error|Invalid|Pattern)\b/.test(text.trim()) || /\bnot searched\b|\[scan aborted|\[grep aborted/.test(text)) return textType;
+      // A match is the file's count line, `<path>:<n>` with n > 0, whatever the path's name; no note ends that way.
+      if (!text.split("\n").some((l) => Number(l.trim().match(/.:(\d+)$/)?.[1] ?? 0) > 0)) return false;
     }
     return true;
+  }
+
+  /**
+   * Deliver the sandbox file `file` (resolved as deliver_file resolves it), a cited report, as `deliver_text` would deliver its text:
+   * read whole with the sandbox's own `read` at its resolved path, then handed to the run's checked `deliver_text` (`route`), so it is
+   * checked against its sources before it is stored. Its name is the file's, with `.md` added when it is not a text file's; the
+   * caption is the call's. Refused, with nothing delivered, when the file cannot be read, is larger than one text delivery, or the run
+   * has no checked `deliver_text`. Null when the text read is not a report the check reads: deliver_file then copies it as it is.
+   */
+  private async deliverCitedFile(
+    check: CiteCheck, file: { file: string; real: string }, input: Record<string, unknown>, signal?: AbortSignal, outcome?: RouteOutcome,
+    ctx?: { stepIdentity?: string },
+  ): Promise<string | null> {
+    const path = file.real;
+    const read: RouteOutcome = { isError: false };
+    let text: string;
+    // A text file that cannot be read back may be a report: refused. Any other (an image Hands cannot decode) is copied as before.
+    const unreadable = (): string | null => (REPORT_FILE_EXTENSIONS.test(path) ? refuse(outcome, CITED_FILE_UNREADABLE) : null);
+    try {
+      text = await this.routeAllowed("read", { path, line_numbers: false }, signal, read);
+    } catch {
+      return unreadable();
+    }
+    if (read.isError || /^Error\b/.test(text)) return unreadable();
+    // Not a report the check reads (a binary file, notes, citations only inside code blocks): deliver_file copies it as any other
+    // file, as deliver_text would have passed its text on unchanged. Asked first: the text read may be longer than the file's bytes.
+    if (!isCitedReport(text)) return null;
+    if (Buffer.byteLength(text, "utf8") > CITED_FILE_MAX_BYTES) return refuse(outcome, CITED_FILE_TOO_LARGE);
+    const tool = check.deliverTool();
+    if (!tool) return refuse(outcome, CITED_FILE_REFUSAL);
+    const base = file.file.split("/").filter(Boolean).pop() ?? "report.md";
+    const fileName = /\.(md|markdown|txt)$/i.test(base) ? base : `${base.replace(/\.[^.]*$/, "")}.md`;
+    const args: Record<string, unknown> = { name: fileName, text };
+    if (typeof input.caption === "string" && input.caption.trim()) args.caption = input.caption;
+    const answered: RouteOutcome = outcome ?? { isError: false };
+    const answer = await this.route(tool, args, signal, answered, ctx);
+    return answered.isError ? answer : `This file is a report with numbered citations: it was delivered as text (${fileName}), checked against its sources.\n\n${answer}`;
   }
 
   /** `route()` for a call the allow-list let through: the read taint and the citations, then the tool. */

@@ -5,17 +5,25 @@
  * A run's citation check (`ExecuteRequest.cite_check`, `tools/cite-check.ts`) has no way around it.
  *
  *   CS1 a sub-agent's deliver_text of a cited report is checked as its parent's would be; without the forwarded check it is not
- *   CS2 deliver_file of a cited report in the sandbox is refused, and the model told to deliver it with deliver_text, whatever its
- *       extension and however long (the whole file is searched); a file with only one of the two, a file that cannot be read, and
- *       any file in a run without the check are not refused for it
+ *   CS2 deliver_file of a cited report in the sandbox, whatever its extension and its citation shape (the check's own parsing
+ *       decides), is read whole and delivered through the run's checked deliver_text, so the text stored is the checked one; a file
+ *       that is not one, one that does not exist, and any file in a run without the check are left to deliver_file
+ *   CS4 a file too large to be delivered checked that may be a cited report (the search finds both patterns, whatever its type;
+ *       or a text file the search cannot finish on) is refused, nothing delivered, as is a cited report that cannot be read back or
+ *       has no checked deliver_text to go through; a large file without citations, or a non-text one the search cannot finish on,
+ *       is left to deliver_file
+ *   CS5 the file is the one deliver_file would copy: a path outside /workspace is never searched or read; a file whose citations
+ *       are all inside code blocks is not a report the check reads, and deliver_file copies it as any other
  *   CS3 the check's budget ends a wait for a page that never answers: the check returns, and the statement is not checked
  */
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import type { Message, ToolSchema } from "@claw/protocol";
 
+// deliver_file on, as a deployment that offers it has it: ordinary files are copied by it.
+process.env.DELIVER_FILE_ENABLED = "true";
 const { runSubagent } = await import("../src/agent/sub-agent.js");
-const { parseCiteCheck, CITED_FILE_REFUSAL } = await import("../src/tools/cite-check.js");
+const { parseCiteCheck, CITED_FILE_REFUSAL, CITED_FILE_TOO_LARGE, CITED_FILE_UNREADABLE } = await import("../src/tools/cite-check.js");
 const { ToolRouter } = await import("../src/tools/router.js");
 const { AnthropicProvider } = await import("../src/llm/anthropic-provider.js");
 const { OpenAiProvider } = await import("../src/llm/openai-provider.js");
@@ -84,55 +92,104 @@ test("CS1 a sub-agent's delivery is checked with the forwarded check, and only w
 });
 
 /**
- * A router over a sandbox whose one file is `file` (or none, when null): its `grep` searches the file line by line, as Hands' does,
- * and lists the path when a line matches.
+ * A router over a sandbox whose one file is `file` (or none, when null): its `grep` searches the file line by line, as Hands' does, and
+ * answers with the path and the count of matching lines; its `read` with line_numbers false answers the file's raw text. The run's
+ * assistant server records what deliver_text was sent. `unreadable`: the read fails.
  */
-function routerOver(file: string | null) {
+function routerOver(file: string | null, opts: { unreadable?: boolean; size?: number } = {}) {
   const searches: Array<Record<string, unknown>> = [];
+  const reads: Array<Record<string, unknown>> = [];
+  const delivered: Array<Record<string, unknown>> = [];
+  const copied: string[] = [];
   const hands = {
+    // deliver_file's own probe (`workspaceFile`): the file's type and size, and where it resolves, under /workspace.
+    callTool: async (name: string, input: Record<string, unknown>) => {
+      const command = String(input.command ?? "");
+      if (name === "upload_to_s3") {
+        const local = (input.files as Array<{ local_path: string }>)[0].local_path;
+        copied.push(local);
+        return JSON.stringify({ ok: [local], failed: [], total: 1 });
+      }
+      if (name === "bash" && command.includes("base64 -w0 --")) return "__claw_deliver_data__\n";
+      if (name !== "bash" || !command.startsWith("stat ")) throw new Error(`unexpected ${name}`);
+      const p = /^stat -L -c '[^']*' -- '((?:[^']|'\\'')*)' 2>&1 && /.exec(command)![1].replace(/'\\''/g, "'");
+      if (file === null) return `stat: cannot statx '${p}': No such file or directory\n\nExit code: 1`;
+      const size = opts.size ?? (file === "BIG" ? 9 * 1024 * 1024 : file.startsWith("GREPFAIL") ? 400 * 1024 : Buffer.byteLength(file, "utf8"));
+      return `__claw_deliver_stat__regular file|${size}\n__claw_deliver_real__${Buffer.from(`/workspace\0${p}\0`, "utf8").toString("base64")}\n`;
+    },
     callToolFull: async (name: string, input: Record<string, unknown>) => {
+      if (name === "read") {
+        reads.push(input);
+        if (opts.unreadable || file === null) return { text: `Error reading ${String(input.path)}: ENOENT`, isError: true };
+        return { text: input.line_numbers === false ? file : "1|numbered", isError: false };
+      }
       if (name !== "grep") throw new Error(`unexpected ${name}`);
       searches.push(input);
       if (file === null) return { text: `Error: ENOENT: no such file or directory, stat '${String(input.path)}'`, isError: false };
       if (file === "BIG") return { text: "[note] 1 file(s) over 8 MB not searched.", isError: false };
+      if (file.startsWith("GREPFAIL")) {
+        return file === "GREPFAIL-error" ? { text: "Error: grep failed", isError: true } : { text: "x.md: [scan aborted at 2000ms]", isError: false };
+      }
       const re = new RegExp(String(input.pattern), input.case_sensitive ? "" : "i");
       const n = file.split("\n").filter((l) => re.test(l)).length;
       // As Hands answers a count: the path relative to the workspace, a colon and the number of matching lines.
       return { text: n ? `${String(input.path).replace(/^\/workspace\//, "")}:${n}` : "(no matches)", isError: false };
     },
   } as unknown as HandsClient;
-  return { router: new ToolRouter(hands), searches };
+  const assistant = {
+    callTool: async (tool: string, input: Record<string, unknown>) => {
+      if (tool !== "deliver_text") throw new Error(`unexpected ${tool}`);
+      delivered.push(input);
+      return "{\"ok\":true}";
+    },
+  };
+  const router = new ToolRouter(hands, new Map([["assistant", assistant as never]]));
+  // deliver_file's own copy needs a session to copy into.
+  router.a2aContext = { userId: "u", sessionId: "s" };
+  return { router, searches, reads, delivered, copied };
 }
 
-test("CS2 deliver_file of a cited report is refused; other files are not refused for it", async () => {
-  const check = parseCiteCheck({ tools: ["mcp__assistant__deliver_text"] }, ports);
-  const report = routerOver(REPORT);
-  report.router.citeCheck = check;
+const check = () => parseCiteCheck({ tools: ["mcp__assistant__deliver_text"] }, ports);
+const deliverFile = async (r: ReturnType<typeof routerOver>, path: string, extra: Record<string, unknown> = {}) => {
   const outcome = { isError: false };
-  assert.equal(await report.router.route("deliver_file", { path: "/workspace/report.md" }, undefined, outcome), CITED_FILE_REFUSAL);
-  assert.equal(outcome.isError, true);
-  assert.equal(report.searches.length, 2, "the whole file is searched for a list of sources and for a citation");
+  const text = await r.router.route("deliver_file", { path, ...extra }, undefined, outcome).catch((e: Error) => `threw: ${e.message}`);
+  return { text, isError: outcome.isError };
+};
 
-  // A name that looks like a note is still the file's.
-  const bracket = routerOver(REPORT);
-  bracket.router.citeCheck = check;
-  assert.equal(await bracket.router.route("deliver_file", { path: "/workspace/[1].md" }, undefined, { isError: false }), CITED_FILE_REFUSAL);
-  const noted = routerOver(REPORT);
-  noted.router.citeCheck = check;
-  assert.equal(await noted.router.route("deliver_file", { path: "/workspace/[note] 1 file.md" }, undefined, { isError: false }), CITED_FILE_REFUSAL);
+test("CS2 deliver_file of a cited report is delivered as checked text; other files are left to deliver_file", async () => {
+  const report = routerOver(REPORT);
+  report.router.citeCheck = check();
+  const out = await deliverFile(report, "/workspace/report.md", { caption: "the comparison" });
+  assert.equal(out.isError, false);
+  assert.equal(report.searches.length, 0, "a file one text delivery can hold is read, not searched");
+  assert.deepEqual(report.reads, [{ path: "/workspace/report.md", line_numbers: false }], "read whole, raw");
+  assert.equal(report.delivered.length, 1);
+  assert.equal(report.delivered[0].name, "report.md");
+  assert.equal(report.delivered[0].caption, "the comparison");
+  assert.notEqual(report.delivered[0].text, REPORT, "the file's own text never reaches the API");
+  assert.match(String(report.delivered[0].text), /vLLM is the fastest engine \(unverified\)\./);
+  assert.match(String(report.delivered[0].text), /^Citation check /m);
+  assert.match(out.text, /^This file is a report with numbered citations: it was delivered as text \(report\.md\), checked against its sources\./);
+  assert.match(out.text, /Citation check before delivery: 1 of 2 cited statements are supported/);
 
-  // A citation at the start of its line is still one; a report too large to search is taken to be one.
-  for (const [file, path] of [[`[1] vLLM supports MI300X.\n\n[1]: vLLM on ROCm — ${A}`, "/workspace/r.md"], ["BIG", "/workspace/huge.md"]] as const) {
+  // A name that looks like a note, a citation at the start of its line, a report past any read limit under another extension, a
+  // citation followed by an address in the text.
+  for (const [file, path, name] of [
+    [`Finding [1]: https://example.com/x supports the claim.\n\n[1]: Example — ${A}`, "/workspace/inline.txt", "inline.txt"],
+    [REPORT, "/workspace/[1].md", "[1].md"],
+    [REPORT, "/workspace/[note] 1 file.md", "[note] 1 file.md"],
+    [`[1] vLLM supports MI300X.\n\n[1]: vLLM on ROCm — ${A}`, "/workspace/r.md", "r.md"],
+    [["vLLM supports MI300X [1].", ...Array.from({ length: 5000 }, (_, i) => `filler ${i}`), `[1]: vLLM on ROCm — ${A}`].join("\n"), "/workspace/report.html", "report.md"],
+  ] as const) {
     const r = routerOver(file);
-    r.router.citeCheck = check;
-    assert.equal(await r.router.route("deliver_file", { path }, undefined, { isError: false }), CITED_FILE_REFUSAL, path);
+    r.router.citeCheck = check();
+    const o = await deliverFile(r, path);
+    assert.equal(o.isError, false, path);
+    assert.deepEqual(r.delivered.map((d) => d.name), [name], path);
+    assert.match(String(r.delivered[0].text), /^Citation check /m, path);
   }
 
-  // Past any read limit, and under another extension: still the same report.
-  const long = routerOver(["vLLM supports MI300X [1].", ...Array.from({ length: 5000 }, (_, i) => `filler ${i}`), `[1]: vLLM on ROCm — ${A}`].join("\n"));
-  long.router.citeCheck = check;
-  assert.equal(await long.router.route("deliver_file", { path: "/workspace/report.html" }, undefined, { isError: false }), CITED_FILE_REFUSAL);
-
+  // Not a cited report: deliver_file answers for it as before, nothing goes through deliver_text.
   for (const [file, path] of [
     ["Plain notes.\nNo citations.", "/workspace/notes.md"],
     [`Links only.\n[1]: a page — ${A}`, "/workspace/links.md"],
@@ -141,14 +198,103 @@ test("CS2 deliver_file of a cited report is refused; other files are not refused
     ["BIG", "/workspace/data.csv"],
   ] as const) {
     const r = routerOver(file);
-    r.router.citeCheck = check;
-    const text = await r.router.route("deliver_file", { path }, undefined, { isError: false }).catch((e: Error) => e.message);
-    assert.notEqual(text, CITED_FILE_REFUSAL, path);
+    r.router.citeCheck = check();
+    const o = await deliverFile(r, path);
+    assert.equal(r.delivered.length, 0, path);
+    assert.doesNotMatch(o.text, /numbered citations/, path);
+    if (file !== null) {
+      assert.deepEqual(r.copied, [path], `${path}: copied by deliver_file as before`);
+      assert.equal(o.isError, false, path);
+    }
   }
   const unchecked = routerOver(REPORT);
-  const text = await unchecked.router.route("deliver_file", { path: "/workspace/report.md" }, undefined, { isError: false }).catch((e: Error) => e.message);
-  assert.notEqual(text, CITED_FILE_REFUSAL);
-  assert.equal(unchecked.searches.length, 0, "without the check the file is not searched");
+  await deliverFile(unchecked, "/workspace/report.md");
+  assert.deepEqual([unchecked.searches.length, unchecked.delivered.length], [0, 0], "without the check the file is neither searched nor read");
+});
+
+test("CS4 a cited report too large, unreadable, or with no checked deliver_text is refused, nothing delivered", async () => {
+  for (const path of ["/workspace/huge.md", "/workspace/huge.txt"]) {
+    const huge = routerOver("BIG");
+    huge.router.citeCheck = check();
+    assert.deepEqual(await deliverFile(huge, path), { text: CITED_FILE_TOO_LARGE, isError: true }, path);
+    assert.equal(huge.reads.length, 0, "a file too large to search is not read");
+  }
+  // A large text file the search could not finish on is not ruled out.
+  for (const file of ["GREPFAIL-error", "GREPFAIL-aborted"]) {
+    const r = routerOver(file);
+    r.router.citeCheck = check();
+    assert.deepEqual(await deliverFile(r, "/workspace/big.md"), { text: CITED_FILE_TOO_LARGE, isError: true }, file);
+  }
+  // A large cited report is refused whatever its type: the search runs on every large file.
+  for (const path of ["/workspace/report.rst", "/workspace/report.json", "/workspace/REPORT", "/workspace/data.bin"]) {
+    const r = routerOver(`${"x".repeat(300 * 1024)} [1].\n\n[1]: vLLM on ROCm — ${A}`);
+    r.router.citeCheck = check();
+    assert.deepEqual(await deliverFile(r, path), { text: CITED_FILE_TOO_LARGE, isError: true }, path);
+    assert.equal(r.searches.length, 2, `${path}: searched`);
+    assert.deepEqual([r.reads.length, r.delivered.length, r.copied.length], [0, 0, 0], path);
+  }
+  // A large file without citations, of any type, and a large non-text file the search could not finish on: copied as before.
+  for (const [file, path] of [
+    [`${"x".repeat(300 * 1024)}\nno citations`, "/workspace/log.txt"],
+    [`${"x".repeat(300 * 1024)}\nno citations`, "/workspace/data.bin"],
+    ["GREPFAIL-aborted", "/workspace/archive.tar"],
+    ["BIG", "/workspace/model.bin"],
+  ] as const) {
+    const r = routerOver(file);
+    r.router.citeCheck = check();
+    const o = await deliverFile(r, path);
+    assert.notEqual(o.text, CITED_FILE_TOO_LARGE, path);
+    assert.deepEqual([r.reads.length, r.delivered.length, r.copied], [0, 0, [path]], path);
+  }
+
+  const big = routerOver(`${"x".repeat(300 * 1024)} [1].\n\n[1]: vLLM on ROCm — ${A}`);
+  big.router.citeCheck = check();
+  assert.deepEqual(await deliverFile(big, "/workspace/big.md"), { text: CITED_FILE_TOO_LARGE, isError: true });
+  assert.deepEqual([big.reads.length, big.delivered.length], [0, 0], "its size is known before it is read: it is not read");
+
+  const gone = routerOver(REPORT, { unreadable: true });
+  gone.router.citeCheck = check();
+  assert.deepEqual(await deliverFile(gone, "/workspace/report.md"), { text: CITED_FILE_UNREADABLE, isError: true });
+  assert.equal(gone.delivered.length, 0);
+  // A file of another type that cannot be read as text (a damaged image) is copied as before, never refused for it.
+  const image = routerOver(REPORT, { unreadable: true });
+  image.router.citeCheck = check();
+  const im = await deliverFile(image, "/workspace/chart.png");
+  assert.notEqual(im.text, CITED_FILE_UNREADABLE);
+  assert.equal(image.delivered.length, 0);
+  assert.deepEqual([image.copied, im.isError], [["/workspace/chart.png"], false], "the image is copied as before");
+
+  const other = routerOver(REPORT);
+  other.router.citeCheck = parseCiteCheck({ tools: ["mcp__assistant__other"] }, ports);
+  assert.deepEqual(await deliverFile(other, "/workspace/report.md"), { text: CITED_FILE_REFUSAL, isError: true });
+  assert.equal(other.delivered.length, 0);
+  const plain = routerOver("Plain notes, no citations.");
+  plain.router.citeCheck = parseCiteCheck({ tools: ["mcp__assistant__other"] }, ports);
+  assert.notEqual((await deliverFile(plain, "/workspace/notes.md")).text, CITED_FILE_REFUSAL, "a file that is not a report is never refused for it");
+
+  // A small file whose text reads longer than its bytes (a binary read as UTF-8) is not a report: copied, never refused as too large.
+  const binary = routerOver("\uFFFD".repeat(100 * 1024), { size: 100 * 1024 });
+  binary.router.citeCheck = check();
+  const b = await deliverFile(binary, "/workspace/blob.dat");
+  assert.notEqual(b.text, CITED_FILE_TOO_LARGE);
+  assert.equal(binary.delivered.length, 0);
+  assert.equal(binary.reads.length, 1, "it was read, being small");
+});
+
+test("CS5 only the file deliver_file would copy is read, and only a report the check reads goes through deliver_text", async () => {
+  const outside = routerOver(REPORT);
+  outside.router.citeCheck = check();
+  await deliverFile(outside, "/etc/report.md");
+  assert.deepEqual([outside.searches.length, outside.reads.length, outside.delivered.length], [0, 0, 0]);
+  await deliverFile(outside, "/workspace/../etc/report.md");
+  assert.deepEqual([outside.searches.length, outside.reads.length, outside.delivered.length], [0, 0, 0]);
+
+  const fenced = routerOver(["```", "vLLM supports MI300X [1].", `[1]: vLLM on ROCm — ${A}`, "```"].join("\n"));
+  fenced.router.citeCheck = check();
+  const o = await deliverFile(fenced, "/workspace/snippet.md");
+  assert.equal(fenced.reads.length, 1, "it is read");
+  assert.equal(fenced.delivered.length, 0, "the check does not take it for a report: it is not delivered through deliver_text");
+  assert.doesNotMatch(o.text, /numbered citations/);
 });
 
 test("CS3 a page that never answers does not hold the check past its budget", { timeout: 10_000 }, async (t) => {
