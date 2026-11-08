@@ -13,8 +13,9 @@
  * shows on it to anyone who can read it, read through the reviewer's session as the view's `findings` and `merged` are; nothing of the
  * session itself (no summary, question or session id).
  *
- * Off the report's path: `ingestReport` starts it after its commit and does not wait for it (`checkConflictLater`), so a slow read or
- * notice never delays a report.
+ * Started where a review item comes to need its owner: `syncReviewItem` (`review-items.ts`), which writes a review's "blocked" from the
+ * facts of its session (a review session sends no worker report), and `ingestReport` for an item that does report. Both start it after
+ * their commit and do not wait for it (`checkConflictLater`), so a slow read or notice never delays either.
  */
 import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
@@ -55,37 +56,54 @@ export async function conflictChecksSettled(): Promise<void> {
  * was refused on a conflict, tell the one who asked. True when told now. Never throws: the report stands whatever this does.
  */
 export async function tellRequesterOfConflict(itemId: string): Promise<boolean> {
-  if (!CLAW_ASSISTANT_ENABLED || !CLAW_GITHUB_REVIEW_ENABLED) return false;
+  // Every way this ends without telling says why (`assistant.review_conflict_skipped`, with the reason), so a conflict nobody was told of
+  // is never silent in the logs (2026-11-08, N5: neither "told" nor "not told" was ever logged for four of them).
+  const skipped = (reason: string, extra: Record<string, unknown> = {}): false => {
+    logger.info({ itemId, reason, ...extra }, "assistant.review_conflict_skipped");
+    return false;
+  };
+  if (!CLAW_ASSISTANT_ENABLED || !CLAW_GITHUB_REVIEW_ENABLED) return skipped("disabled");
   try {
     const q: Querier = (t, p) => db.query(t, p);
     // Only a review someone else asked to be merged: a review only never merges, and the owner's own review has no one else to tell.
     const item = (await q(
-      `SELECT item_id, user_id, params, worker_session_id FROM claw_work_items
-        WHERE item_id = $1 AND kind = 'review' AND board_state = 'needs_you' AND params ? 'requested_by'
-          AND COALESCE(params->>'review_only', 'false') <> 'true'`,
+      `SELECT item_id, user_id, params, worker_session_id, kind, board_state FROM claw_work_items WHERE item_id = $1`,
       [itemId],
-    )).rows[0] as { item_id: string; user_id: string; params: Record<string, unknown> | null; worker_session_id: string | null } | undefined;
-    if (!item?.worker_session_id) return false;
+    )).rows[0] as {
+      item_id: string; user_id: string; params: Record<string, unknown> | null; worker_session_id: string | null;
+      kind: string; board_state: string;
+    } | undefined;
+    if (!item) return skipped("no_item");
+    if (item.kind !== "review") return skipped("not_a_review");
+    if (item.board_state !== "needs_you") return skipped("not_needs_you", { boardState: item.board_state });
+    if (String(item.params?.review_only ?? "false") === "true") return skipped("review_only");
     const requester = requestedByOfItem(item.params);
-    if (!requester || requester === item.user_id) return false;
+    if (!requester) return skipped("no_requested_by");
+    if (requester === item.user_id) return skipped("requested_by_is_owner");
+    if (!item.worker_session_id) return skipped("no_worker_session");
     // The session's latest merge, whatever came of it: a conflict that a later merge got past (or failed on for another reason) is not told.
     const merge = (await q(
       `SELECT repo, pr, head_sha, result, detail, merge_state FROM claw_github_audit
         WHERE session_id = $1 AND tool = 'gh_pr_merge' AND result <> 'started' ORDER BY id DESC LIMIT 1`,
       [item.worker_session_id],
     )).rows[0] as { repo: string; pr: number | null; head_sha: string; result: string; detail: string; merge_state: string | null } | undefined;
-    if (!merge || merge.result !== "refused" || merge.detail !== "merge_state_not_clean" || merge.merge_state !== "DIRTY") return false;
-    if (!merge.repo || !merge.pr) return false;
+    if (!merge) return skipped("no_merge");
+    if (merge.result !== "refused" || merge.detail !== "merge_state_not_clean") {
+      return skipped("merge_not_refused_on_state", { result: merge.result, detail: merge.detail });
+    }
+    if (merge.merge_state !== "DIRTY") return skipped("merge_state_not_dirty", { mergeState: merge.merge_state ?? null });
+    if (!merge.repo || !merge.pr) return skipped("merge_without_pr");
     const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [requester])).rows[0]?.session_id as string | undefined;
-    if (!sessionId) return false;
+    if (!sessionId) return skipped("requester_has_no_assistant", { requester });
     const pr = `${merge.repo}#${merge.pr}`;
     const zh = await personWritesChinese(q, requester);
     const told = await reviewConflictPorts.recordSystemNotice({
       userId: requester, sessionId, text: conflictText(pr, `https://github.com/${merge.repo}/pull/${merge.pr}`, zh),
       key: `review_conflict:${item.item_id}:${merge.head_sha || "-"}`,
     });
-    if (told) logger.info({ itemId, requester, pr }, "assistant.review_conflict_told");
-    return told !== null;
+    if (told === null) return skipped("already_told", { requester, pr, head: merge.head_sha || "-" });
+    logger.info({ itemId, requester, pr }, "assistant.review_conflict_told");
+    return true;
   } catch (err) {
     logger.warn({ err, itemId }, "assistant.review_conflict_not_told");
     return false;
