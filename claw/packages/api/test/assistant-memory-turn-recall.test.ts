@@ -10,6 +10,8 @@
  *   K2  off (a user not on the list, or the list emptied): the turn is the same text as without the feature, the system prompt too
  *   K3  only the user's own active entries, and none where the index is not shown (memory off, a session marked `memory: "off"`)
  *   K4  a recall is not counted as a read
+ *   K5  a store above the entry limit (lowered since) is read only to the limit, pinned then newest first
+ *   K6  an entry's body is shown whole, up to what a write may store
  *   R*  the ranking itself (`rankByMessage`), pure
  */
 import assert from "node:assert/strict";
@@ -30,7 +32,7 @@ describe("router turn recall", { skip }, () => {
 
   before(async () => {
     w = await startWorld({
-      CLAW_MEMORY_ENABLED: "true", CLAW_ASSISTANT_MEMORY_TOOLS: "on", CLAW_MEMORY_CATALOGUE_MAX_LINES: "4",
+      CLAW_MEMORY_ENABLED: "true", CLAW_ASSISTANT_MEMORY_TOOLS: "on", CLAW_MEMORY_CATALOGUE_MAX_LINES: "4", CLAW_MEMORY_MAX_ENTRIES: "12",
       CLAW_MEMORY_TURN_RECALL_USERS: "alice",
     });
     mt = await import("../src/assistant/memory-tools.js");
@@ -39,7 +41,7 @@ describe("router turn recall", { skip }, () => {
   });
   after(async () => { await w?.stop(); });
   beforeEach(async () => {
-    await w.q("TRUNCATE claw_work_item_subscriptions, claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistant_messages, claw_assistants, claw_sessions, claw_notification_outbox, claw_memory_entries, claw_memory_events, claw_user_memory_prefs, claw_assistant_scopes CASCADE");
+    await w.q("TRUNCATE claw_work_item_subscriptions, claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistant_messages, claw_assistants, claw_sessions, claw_notification_outbox, claw_memory_links, claw_memory_entries, claw_memory_events, claw_user_memory_prefs, claw_assistant_scopes CASCADE");
     mt.turnRecallSettings.all = false;
     mt.turnRecallSettings.users = new Set(["alice"]);
     alice = await w.user("alice");
@@ -140,6 +142,29 @@ describe("router turn recall", { skip }, () => {
     const before = await read();
     assert.ok(String((await turnFor(alice, "Kestrel 一般在哪天发布？")).task.prompt).includes(`#${release} `));
     assert.deepEqual(await read(), before);
+  });
+
+  test("K5 a store above the entry limit is read only to the limit, newest first", async () => {
+    const old = await stored("alice", "project", "Kestrel 发布窗口", "Kestrel 只在每月第二个周四发布。");
+    for (let i = 0; i < 12; i += 1) {
+      await w.q(
+        `INSERT INTO claw_memory_entries (user_id, category, content, mtype, title, status) VALUES ('alice', 'user', $1, 'user', $1, 'active')`,
+        [`偏好第 ${i} 条：回答用短句 ${i}`],
+      );
+    }
+    const prompt = String((await turnFor(alice, "Kestrel 一般在哪天发布？")).task.prompt);
+    assert.ok(!prompt.includes(`#${old} Kestrel 发布窗口:`), prompt);
+    // A pinned entry is read first, however old.
+    await w.q("UPDATE claw_memory_entries SET pinned = TRUE WHERE id = $1", [old]);
+    assert.ok(String((await turnFor(alice, "Kestrel 一般在哪天发布？")).task.prompt).includes(`#${old} Kestrel 发布窗口:`));
+  });
+
+  test("K6 an entry's body is shown whole, up to what a write may store", async () => {
+    const body = `Kestrel 发布规则：${"每月第二个周四发布冻结期从前一周周五开始".repeat(23)}到此为止`;
+    assert.ok([...body].length > 400 && [...body].length <= 500, String([...body].length));
+    const id = await stored("alice", "project", "Kestrel 发布规则", body);
+    const prompt = String((await turnFor(alice, "Kestrel 一般在哪天发布？")).task.prompt);
+    assert.ok(prompt.includes(`#${id} Kestrel 发布规则: ${body}`), prompt);
   });
 });
 

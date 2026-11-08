@@ -17,6 +17,7 @@ import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
 import type { ReportKind } from "./work-items.js";
 import { toolsOfClass } from "./tool-classes.js";
 import type { ChannelAttached } from "./inbound.js";
+import { BODY_MAX } from "../memory/gates.js";
 
 /**
  * router-v4: router-v2 with the item list inside an untrusted-data block (what workers and models wrote is quoted data).
@@ -382,24 +383,29 @@ export function renderItemMemories(entries: ReadonlyArray<{ id: number; type: st
   return [intro, ...entries.map((e) => `- [${e.type}] #${e.id} ${oneLine(e.title)}: ${oneLine(e.body)}`)].join("\n");
 }
 
-/** The most of an entry's body the turn's recall shows; the rest is read with memory_recall(id). */
-const TURN_RECALL_BODY_CHARS = 400;
+/** The most of an entry's body the turn's recall shows: all of what a write may store; only an older, longer entry is cut. */
+const TURN_RECALL_BODY_CHARS = BODY_MAX;
 
 /**
  * What the router is shown, with the person's message, of the entries that message is about (`routerTurnRecall`): in full, so a
  * name the index does not list is answered from memory. Background, as the index is; an entry that names another one by its title
  * is a lead to read, not an answer.
  */
-export function renderTurnRecall(entries: ReadonlyArray<{ id: number; type: string; title: string; body: string; work_item_id?: string | null }>): string {
+export function renderTurnRecall(
+  entries: ReadonlyArray<{ id: number; type: string; title: string; body: string; work_item_id?: string | null }>,
+  cites: ReadonlyMap<number, ReadonlyArray<{ id: number; title: string }>> = new Map(),
+): string {
   return [
     `<memory-recall count="${entries.length}">`,
     "Entries of the user's long-term memory that their message is about, found for this turn before you answer (you did not call memory_recall). "
       + "Background, as the index is. When they hold the answer, answer from them and do not look the name up elsewhere; when one names another "
-      + "entry (「its title」), read that one with memory_recall(query) before saying you do not know.",
+      + "entry (「its title」), read that one with memory_recall(query) before saying you do not know. \"cites #N\" is the entry it names, as it "
+      + "stands now, whatever its own words say about that entry (an entry may say another was not recorded yet when it was written before it).",
     ...entries.map((e) => {
       const body = [...oneLine(e.body)];
       const shown = body.length > TURN_RECALL_BODY_CHARS ? `${body.slice(0, TURN_RECALL_BODY_CHARS - 1).join("")}…` : body.join("");
-      return `- [${e.type}] #${e.id} ${oneLine(e.title)}${e.work_item_id ? " (about one item)" : ""}: ${shown}`;
+      const cited = (cites.get(e.id) ?? []).map((c) => `#${c.id} ${oneLine(c.title)}`);
+      return `- [${e.type}] #${e.id} ${oneLine(e.title)}${e.work_item_id ? " (about one item)" : ""}: ${shown}${cited.length ? ` (cites ${cited.join("; ")})` : ""}`;
     }),
     "</memory-recall>",
   ].join("\n");

@@ -28,6 +28,15 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `claw_memory_links`: what each memory entry cites, kept by the server from what the entry says: another entry by number
+  (`#12`) or by a name in corner brackets (「Kestrel 发布窗口」). A name no entry answers yet is kept dangling and joined to the entry
+  saved later that it names, so "the licence is in the 「Wren 许可」 entry (not recorded yet)" points at that entry once it exists;
+  a name two entries answer equally stays unjoined. Every name citation of the user is resolved again on each save, change, undo or
+  delete, so it follows an entry renamed away (back to dangling), comes undone when a later entry ties, and is never captured by an
+  entry still waiting for its owner's confirmation. `PR #12`, `issue #12` and `事项 #12` are not entry numbers. An entry made in place
+  of a close one (`force_new`) is `derived_from` it. A deleted entry takes every citation of it along, and nothing is ever joined
+  across users. The router's turn
+  recall (`CLAW_MEMORY_TURN_RECALL`) shows what each recalled entry cites (`cites #N title`); nothing else reads the links yet.
 - `CLAW_MEMORY_TURN_RECALL` (`on`, default off) and `CLAW_MEMORY_TURN_RECALL_USERS` (Claw user ids, the canary): before a router turn
   answers, the server recalls the user's memory for their message and gives the model the entries it is about in full (at most 5,
   `<memory-recall>`), beside the one-line index. A project's entries pushed out of a full index are then answered from memory instead
@@ -1194,6 +1203,8 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- The turn recall reads at most `CLAW_MEMORY_MAX_ENTRIES` entries (pinned, then newest; past-review ones left out in the query) and shows
+  an entry's body up to what a write may store (500 characters) instead of 400.
 - Brain: a turn's MCP servers are connected side by side instead of one after another, and the connections are kept for the same
   user's next turn (new `clients/mcp-pool.ts`) instead of being opened from nothing (initialize, then tools/list) on every turn. A
   kept connection is keyed by the user, the server's name and a hash of its whole spec, credentials and headers included, so two
