@@ -22,7 +22,9 @@
  *       put the attach command of the user's own session; attachRefOf reads the command however it is split
  *   D8  a user with no session connects through an agent: each agent on an online machine (not one that only takes over existing
  *       conversations, one that reports a folder, on a machine the channel can find by name) carries `/agent attach MACHINE/AGENT`,
- *       put to them as a button after the read; with no session anywhere and one such agent it is attach_default (new_session)
+ *       put to them as a button after the read, also while another agent's session is open; with no session anywhere and one such
+ *       agent it is attach_default (new_session); the read_untrusted refusal names no read the turn did not make (not work_recall
+ *       after devenv_list) and says what is still put to the user: their own attach commands as a button, devenv_send as a card
  *   D9  what each machine's connector health checks found (`capabilities.health`) reaches the router as the machine's problems:
  *       failures first, a machine-wide one once, each with its fix; a connector that reports no health has no problems field
  *   R1  readSession: the state, step, answer and question of a session from its events (pure)
@@ -399,6 +401,15 @@ describe("devenv_list", { skip }, () => {
     for (const ref of ["bob-box/claude", "desktop/codex", "devbox/claude-attach", "devbox/codex"]) {
       await assert.rejects(rt.channelAction(turn, { name: "agent", args: `attach ${ref}` }), (e: Recorded) => e.code === "read_untrusted", ref);
     }
+    // The refusal names no read the turn did not make (it read a development environment list, not work_recall), and says what is
+    // still open to it: the attach command of the user's own session or agent, as a button, so "connect me" is not answered "I cannot".
+    await assert.rejects(rt.channelAction(turn, { name: "agent", args: "attach bob-box/claude" }), (e: Recorded) => {
+      assert.doesNotMatch(String(e.message), /work_recall/);
+      assert.match(String(e.message), /development environment list/);
+      assert.match(String(e.message), /attach_command the list gave, of the user's own session or of an agent on their own online machine \(that agent's newest open session there, or a new one when it has none\)/);
+      assert.match(String(e.message), /devenv_send, which only shows a card \(new_session: true starts a new session even when one is open\)/);
+      return true;
+    });
 
     // Two agents that can start one: ask which (no default), both listed.
     await store.recordHeartbeat(box, "alice", { version: "0.1.3", cmdCursor: null, agents: [
@@ -413,6 +424,14 @@ describe("devenv_list", { skip }, () => {
     again = (await call(await w.routerTurn(alice))).body;
     assert.equal(again.attach_default.ref, sid);
     assert.equal(again.attach_default.new_session, undefined);
+    // With a codex session open, a claude session (none open: the agent's command starts one) is still put to them after the read, as a button.
+    const fresh = await userTurn(alice, "在 devbox 上开一个 claude 会话", actions);
+    const listed = (await call(fresh)).body;
+    assert.deepEqual(listed.machines[0].sessions.map((x: Recorded) => x.agent), ["codex"], "no claude session is open");
+    assert.ok(listed.machines[0].agents.some((a: Recorded) => a.attach_command === "/agent attach devbox/claude"));
+    const button = await rt.channelAction(fresh, { name: "agent", args: "attach devbox/claude" }) as Recorded;
+    assert.equal(button.ran, false, "a button, never run at once");
+    assert.equal(button.command, "/agent attach devbox/claude");
     // Two online machines by one name: the channel finds a machine by name, so neither carries a command.
     await machine("alice", "DevBox", { online: true, agents: [{ id: "claude", kind: "claude", name: "Claude Code", roots: ["/x"] }] });
     again = (await call(await w.routerTurn(alice))).body;
