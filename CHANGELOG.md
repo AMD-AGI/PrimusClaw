@@ -120,6 +120,12 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- The brief leaves release-gate fixture pull requests out of its pull request section, told by their branches as `pr_list` tells them
+  (a weekly report said "#381: 2 comments" for the fixture on 2026-11-08); a watched pull request's head and base branches are kept
+  with its watch (`claw_work_item_subscriptions.head_ref`, `base_ref`, added at api start). The brief's pull request section also
+  counts the reviews the user asked of others over its own range (a weekly brief, the week). The router's state says its totals of
+  those reviews are of the last 24 hours, and that a week's count is the weekly brief's: "23 reviews, 22 merged" from the last 24 hours
+  was said under "this week".
 - The assistant no longer answers a partial read as if it were all of it (N8, 2026-11-07: "17 merged, only 3 open" from 20 of the merged
   pull requests with a release-gate fixture among the open ones; "19 of the 20 merged" when 82 reviews had been handed over; the second
   dev machine said to be unreachable when the list showed one of two). GitHub list answers that are not complete say so in `partial`, and

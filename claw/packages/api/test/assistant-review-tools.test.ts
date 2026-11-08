@@ -1678,9 +1678,11 @@ describe("assistant review tools", { skip }, () => {
     const listed = await rp.askedOfOthersManifest(alice.userId);
     assert.equal(listed.length, 20, "the list stays the latest 20");
     const items = prompts.renderRouterItems([], listed, new Date(), totals);
-    assert.ok(items.includes(`${prompts.ASKED_OF_OTHERS_HEADER}\nIn all: 25 in all, open ones and ones closed in the last day: 3 open, 22 closed, of the closed 18 merged and 4 with changes requested. Only the 20 most recently updated are listed below.`), items);
+    assert.ok(items.includes(`${prompts.ASKED_OF_OTHERS_HEADER}\nIn all: 25 in all in the last 24 hours (open ones, and ones closed in the last 24 hours; not this week's): 3 open, 22 closed, of the closed 18 merged and 4 with changes requested. Only the 20 most recently updated are listed below.`), items);
+    // The window goes with the numbers, never under a week's heading; a week's count is brief's (2026-11-08, "这周研发进度").
+    assert.match(items, /Any of these numbers is said with its window, in the user's language \(过去 24 小时 \/ in the last 24 hours\), never under a week's heading; for this week's count, call brief with range week/);
     assert.match(items, /never from counting the lines below, and a list of them says it is the latest 20 of 25\./);
-    assert.match(prompts.formatAskedOfOthersTotals(3, { total: 3, open: 1, closed: 2, merged: 2, changes_requested: 0 }), /Every one of them is listed below\.$/);
+    assert.match(prompts.formatAskedOfOthersTotals(3, { total: 3, open: 1, closed: 2, merged: 2, changes_requested: 0 }), /Every one of them is listed below\. Any of these numbers is said with its window/);
   });
 
   test("T1 the tools exist only with CLAW_ASSISTANT_TOOLS on", async () => {

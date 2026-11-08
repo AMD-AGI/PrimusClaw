@@ -68,7 +68,7 @@ interface Posted { method: string; path: string; body: string }
 /** A pull request on a GitHub that lives in this process. */
 function fakeGithub() {
   const s = {
-    pr: { state: "open", merged: false, head: { sha: HEAD }, html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR}`, closed_at: null as string | null, merged_by: null as unknown },
+    pr: { state: "open", merged: false, head: { sha: HEAD, ref: "feat/parser" }, base: { ref: "main" }, html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR}`, closed_at: null as string | null, merged_by: null as unknown },
     issueComments: [] as Array<Record<string, any>>,
     reviewComments: [] as Array<Record<string, any>>,
     reviews: [] as Array<Record<string, any>>,
@@ -265,6 +265,8 @@ describe("assistant GitHub events", { skip }, () => {
     assert.equal(e.event_id, `gh:${it.subId}:issue_comment:${c.id}`);
     assert.equal(e.author, "bob");
     assert.ok(e.delivered_at, "delivered in the same poll that stored it");
+    // The pull request's branches are kept with the watch: the brief tells a release-gate fixture by them.
+    assert.deepEqual((await w.q("SELECT head_ref, base_ref FROM claw_work_item_subscriptions WHERE id = $1", [it.subId]))[0], { head_ref: "feat/parser", base_ref: "main" });
 
     // Redelivery: the same comment read again, by a later poll and by two polls at once.
     await poll();
@@ -301,6 +303,20 @@ describe("assistant GitHub events", { skip }, () => {
     assert.equal((await w.pending(it.workerSid)).length, 0, "and wakes nobody");
     // The bound: the comment was stored at the first poll after it appeared, so the wait is at most one interval of the loop.
     assert.ok(Date.now() - t0 < 120_000);
+  });
+
+  test("P1b a poll whose branch write fails still stores and delivers what it read", async () => {
+    const it = await watched();
+    gh.comment("Please look at the parser again.");
+    // The branches cannot be kept (their column is gone): the comment is stored and delivered all the same.
+    await w.q("ALTER TABLE claw_work_item_subscriptions DROP COLUMN head_ref");
+    try {
+      const first = await poll();
+      assert.deepEqual({ stored: first.stored, delivered: first.delivered }, { stored: 1, delivered: 1 });
+      assert.equal((await events(it.itemId)).length, 1);
+    } finally {
+      await w.q("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS head_ref TEXT");
+    }
   });
 
   test("P2 an answer GitHub wrote but whose reply was lost is found on the pull request, not posted again", async () => {
