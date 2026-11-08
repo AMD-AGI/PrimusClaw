@@ -4,7 +4,7 @@
 /**
  * The assistant and its board of work items.
  *
- *   POST /v1/assistant                    the caller's assistant session, made on first use
+ *   POST /v1/assistant                    the caller's assistant session, made on first use, and their hourly say cap
  *   GET  /v1/work-items?state=            the board: in_progress | needs_you | done
  *   GET  /v1/work-items/asked-of-others   the reviews the caller asked of others: open, or closed in the last ASKED_CLOSED_WINDOW
  *   GET  /v1/work-items/:id               one item with its latest events
@@ -38,6 +38,7 @@ import pino from "pino";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { getOrCreateAssistant } from "../assistant/assistant.js";
+import { sayMaxPerHour } from "../assistant/outbound.js";
 import { retryWorkItem } from "../assistant/retry.js";
 import {
   acceptWorkItem, BOARD_STATES, getWorkItem, itemView, listWorkItems, recentEvents, stopWorkItem,
@@ -112,7 +113,8 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
     const userId = requireRealUser(req, reply);
     if (!userId) return;
     const { sessionId, created } = await getOrCreateAssistant(userId);
-    return reply.send({ ok: true, data: { session_id: sessionId, created } });
+    // The caller's own hourly say cap: an evaluation run paces itself under it (`sa-eval.ts`, EVAL_SAY_PER_HOUR).
+    return reply.send({ ok: true, data: { session_id: sessionId, created, say_max_per_hour: sayMaxPerHour(userId) } });
   });
 
   app.get("/v1/work-items", async (req, reply) => {

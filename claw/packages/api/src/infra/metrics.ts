@@ -111,7 +111,7 @@ const workItemStaleRejectedTotal = new Counter({
   registers: [registry],
 });
 
-// A message the assistant was not let say because its user had CLAW_ASSISTANT_SAY_MAX_PER_HOUR of them in the last
+// A message the assistant was not let say because its user had their cap (`sayMaxPerHour`) of them in the last
 // hour, by what the user was told: the notice that replies are paused (`sent`, the first refusal of a stretch at the
 // cap), nothing more because they had it already (`already_sent`), or nothing because storing it failed (`failed`).
 const assistantSayRateLimitedTotal = new Counter({

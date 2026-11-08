@@ -283,6 +283,20 @@ describe("assistant outbound", { skip }, () => {
   describe("the limit on how much an assistant says", () => {
     test("is 120 an hour unless configured", () => {
       assert.equal(config.CLAW_ASSISTANT_SAY_MAX_PER_HOUR, 120);
+      assert.equal(config.CLAW_ASSISTANT_SAY_EVAL_USERS.size, 0, "no evaluation identity unless named");
+      assert.equal(outbound.sayMaxPerHour("u1"), 120);
+    });
+
+    test("is the evaluation cap for a named evaluation identity only", async () => {
+      const evalUsers = new Set(["bot"]);
+      assert.equal(outbound.sayMaxPerHour("bot", evalUsers, 600, 120), 600);
+      assert.equal(outbound.sayMaxPerHour("u1", evalUsers, 600, 120), 120, "a person keeps the people's cap");
+      assert.equal(outbound.sayMaxPerHour("Bot", evalUsers, 600, 120), 120, "an id matches exactly");
+      // The cap that applies is the one the say is refused at: the evaluation identity's own, not a looser one.
+      const evalCap = deps({ maxPerHour: outbound.sayMaxPerHour("u1", new Set(["u1"]), 2, 120) });
+      await say("one", {}, evalCap);
+      await say("two", {}, evalCap);
+      await assert.rejects(say("three", {}, evalCap), (e: any) => e.code === "say_rate_limited" && /had 2 messages/.test(e.message));
     });
 
     test("stops a user at the limit, for that user only, and counts only the last hour", async () => {

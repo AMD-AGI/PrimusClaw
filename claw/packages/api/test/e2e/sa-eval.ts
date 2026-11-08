@@ -68,8 +68,11 @@
  *                     the assistant mode's pace (default 100 and 10): before each attempt it waits until the identity's says of
  *                     the last hour (those stored in its assistant session before the run, and the run's own; the system's
  *                     fallbacks are not counted, as the server does not count them) plus the reserve are within the first.
- *                     Keep it below the deployment's CLAW_ASSISTANT_SAY_MAX_PER_HOUR (120): a say the server refuses for its
+ *                     Keep it below the identity's cap on the server (CLAW_ASSISTANT_SAY_MAX_PER_HOUR, 120, or for an identity in
+ *                     CLAW_ASSISTANT_SAY_EVAL_USERS CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR): a say the server refuses for its
  *                     cap makes the attempt an error of the run (`infra: ... say_rate_limited`), not a failure of the assistant.
+ *                     A server that says the cap (POST /v1/assistant `say_max_per_hour`) lowers the pace to 20 under it
+ *                     (`pacedPerHour`), so a pace raised for an evaluation identity's own cap is safe where it does not have it.
  *                     0 turns the pace off. The says of an assistant session a run deleted cannot be read back and still
  *                     count: each run keeps the hour's says it saw in EVAL_SAY_LOG (default: a file per identity under
  *                     ~/.cache/sa-eval) for the next run on the same host
@@ -133,7 +136,7 @@ import { traceOf, type EventRow, type ToolCall } from "./agent-eval-lib.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
-  BUILTIN_TOOLS, assistantInUse, capRefusedSays, caseHash, caseSays, cardsOf, cleanupOf, countedSays, countedSaysOf, deleteSessionConfirmed,
+  BUILTIN_TOOLS, assistantInUse, capRefusedSays, pacedPerHour, caseHash, caseSays, cardsOf, cleanupOf, countedSays, countedSaysOf, deleteSessionConfirmed,
   mergeSays, parseSayLog, endedTurns, storedTurnEnds, streamMissed, filledCase, filesFrom, finalSay, grade, forRecording, identityRefusal, itemsStartedBy,
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   ownSays, sayWaitMs, saysOf, staticFindings, turnsAnswered, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
@@ -209,6 +212,8 @@ const RECORD_DIR = process.env.EVAL_RECORD_DIR;
 const SAY_PER_HOUR = int("EVAL_SAY_PER_HOUR", 100, 0, 100_000);
 const SAY_RESERVE = int("EVAL_SAY_RESERVE", 10, 0, 1_000);
 if (SAY_PER_HOUR && SAY_RESERVE >= SAY_PER_HOUR) { console.error("EVAL_SAY_RESERVE must be below EVAL_SAY_PER_HOUR"); process.exit(2); }
+/** The pace kept: SAY_PER_HOUR, lowered under the cap the server answers POST /v1/assistant with (`pacedPerHour`). */
+let sayPerHour = SAY_PER_HOUR;
 const QUIET_MS = int("EVAL_QUIET_S", 300, 0, 86_400) * 1000;
 const TURN_WAIT_S = process.env.EVAL_TURN_WAIT_S ? int("EVAL_TURN_WAIT_S", 180, 1, 3600) : null;
 /** How long a turn may take to end: EVAL_TURN_WAIT_S, else 180 s for a router turn and 600 s for a plain session's. */
@@ -1044,9 +1049,9 @@ async function runBaseline(c: EvalCase, turns: Turn[]): Promise<Attempt> {
  */
 async function paceSays(stream: LiveStream, prior: readonly SayMark[]): Promise<void> {
   for (let said = false; ;) {
-    const wait = sayWaitMs(mergeSays([prior, countedSays(stream.events)], Date.now()).map((m) => m.at), Date.now(), SAY_PER_HOUR, SAY_RESERVE);
+    const wait = sayWaitMs(mergeSays([prior, countedSays(stream.events)], Date.now()).map((m) => m.at), Date.now(), sayPerHour, SAY_RESERVE);
     if (!wait) return;
-    if (!said) { log(`say cap: waiting ${Math.ceil(wait / 1000)}s for room (EVAL_SAY_PER_HOUR=${SAY_PER_HOUR}, EVAL_SAY_RESERVE=${SAY_RESERVE})`); said = true; }
+    if (!said) { log(`say cap: waiting ${Math.ceil(wait / 1000)}s for room (pace ${sayPerHour} an hour: EVAL_SAY_PER_HOUR=${SAY_PER_HOUR}, EVAL_SAY_RESERVE=${SAY_RESERVE})`); said = true; }
     await pause(Math.min(wait, 60_000));
   }
 }
@@ -1119,6 +1124,11 @@ async function openAssistant(first: boolean): Promise<AssistantSession> {
   const id = a.json?.data?.session_id;
   if (a.status !== 200 || typeof id !== "string" || !id) throw new Error(`POST /v1/assistant answered ${a.status}`);
   const created = a.json?.data?.created === true;
+  const paced = pacedPerHour(SAY_PER_HOUR, a.json?.data?.say_max_per_hour, SAY_RESERVE);
+  if (paced !== sayPerHour) {
+    log(`say pace: ${paced} an hour (EVAL_SAY_PER_HOUR=${SAY_PER_HOUR}; the server's cap for this identity: ${a.json?.data?.say_max_per_hour ?? "not said"})`);
+    sayPerHour = paced;
+  }
   if (created) OWN_SESSIONS.add(id);
   else if (!first) throw new Error(`POST /v1/assistant gave session ${id}, which the run did not make, after the run deleted its own`);
   else {
