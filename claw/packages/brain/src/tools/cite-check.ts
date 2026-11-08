@@ -27,15 +27,15 @@ import { metrics } from "../infra/metrics.js";
 
 const logger = pino({ name: "cite-check" });
 
-/** The most sources one report has checked; a statement citing only sources past it is unverified. */
+/** The most sources one report has checked; a statement citing only sources past it is not checked. */
 export const CITE_CHECK_MAX_SOURCES = 80;
-/** The most statements one report has checked; the rest are unverified. */
+/** The most statements one report has checked; the rest are not checked. */
 export const CITE_CHECK_MAX_CLAIMS = 200;
 /** The most statements one judge call reads. */
 export const CITE_CHECK_CLAIMS_PER_CALL = 25;
 /** How many sources are checked at once. */
 export const CITE_CHECK_CONCURRENCY = 4;
-/** The time the whole check may take; what is not checked by then is unverified. */
+/** The time the whole check may take; what is not checked by then is marked not checked. */
 export const CITE_CHECK_BUDGET_MS = 240_000;
 /** The longest statement given to the judge. */
 const CLAIM_MAX_CHARS = 600;
@@ -176,20 +176,38 @@ function parseReport(lines: string[]): { sources: Map<number, ListedSource>; cla
   return { sources, claims };
 }
 
+/** Whether `text` is a report the check reads (it cites a number outside code blocks and lists a source); nothing is fetched. */
+export function isCitedReport(text: string): boolean {
+  const { sources, claims } = parseReport(text.split("\n"));
+  return sources.size > 0 && claims.length > 0;
+}
+
 /**
- * A file in the sandbox that is a cited report, as two searches of the whole file (JavaScript regular expressions, one line each):
- * a line of a list of sources, and a line with a citation number that is not a source line's own. Both must match. Looser than the
- * check's own parsing (a code block is not skipped), so a report in its usual shape cannot pass as a file the check would not read.
+ * A text file too large to be delivered checked that may be a cited report, as two searches of the whole file (JavaScript regular
+ * expressions, one line each): a line of a list of sources, and any citation number. Both must match. Looser than the check's own
+ * parsing (a code block is not skipped, a source line's own number counts), so no report the check reads passes as another file. A
+ * file small enough to be delivered checked is read instead, and the check's own parsing decides (`isCitedReport`).
  */
 export const CITED_FILE_PATTERNS = [
   String.raw`^\s{0,3}(?:[-*+]\s+)?\[\d{1,3}\][:.]?\s+.*https?://`,
-  String.raw`\[\d{1,3}(?:\s*[,，、]\s*\d{1,3})*\](?!\(|[:.]?\s+.*https?://)`,
+  String.raw`\[\d{1,3}(?:\s*[,，、]\s*\d{1,3})*\](?!\()`,
 ];
 
-/** A report's own file types: one too large for the sandbox's search is taken to be a cited report, and refused as one. */
-export const REPORT_FILE_EXTENSIONS = /\.(md|markdown|html?)$/i;
+/** The text files a report may be written as: one too large to be delivered checked that may be a cited report is refused. */
+export const REPORT_FILE_EXTENSIONS = /\.(md|markdown|txt|html?)$/i;
 
-/** What a `deliver_file` of a cited report is refused with. */
+/** The largest cited report delivered from a file: what one text delivery takes (the API's `TEXT_DELIVERY_MAX_BYTES`). */
+export const CITED_FILE_MAX_BYTES = 256 * 1024;
+
+/** What a `deliver_file` of a cited report too large to be checked is refused with. */
+export const CITED_FILE_TOO_LARGE = "Error: this file is a report with numbered citations, and it is too large to be checked and delivered "
+  + `(at most ${CITED_FILE_MAX_BYTES / 1024} KB). Nothing was delivered: shorten it, or split it into several reports, and deliver them.`;
+
+/** What a `deliver_file` of a cited report that could not be read back is refused with. */
+export const CITED_FILE_UNREADABLE = "Error: this file is a report with numbered citations, and it could not be read to be checked. Nothing "
+  + "was delivered: deliver it again.";
+
+/** What a `deliver_file` of a cited report is refused with when the run has no checked deliver_text. */
 export const CITED_FILE_REFUSAL = "Error: this file is a report with numbered citations, so it is delivered with deliver_text (its name and its "
   + "whole text), which checks its sources before the user gets it. Nothing was delivered: call deliver_text with the report instead.";
 
@@ -263,7 +281,7 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
       if (budget.signal.aborted || now() > deadline) { notReached(n); return; }
       let page: CheckedPage;
       try {
-        // The budget ends the wait even when the fetch itself would go on: a page still loading then counts as unreadable.
+        // The budget ends the wait even when the fetch itself would go on: a page still loading then leaves its statements not checked.
         page = await untilAborted(ports.fetchPage(source.url, budget.signal), budget.signal);
       } catch (err) {
         logger.info({ host: hostOf(source.url), err: err instanceof Error ? err.message : String(err) }, "cite_check.fetch_threw");
@@ -375,6 +393,11 @@ export class CiteCheck {
   /** Whether a call of `name` has its `text` checked. */
   checks(name: string): boolean {
     return this.tools.has(name);
+  }
+
+  /** The checked tool a cited report in a file is delivered through: the run's checked `deliver_text`, when it has one. */
+  deliverTool(): string | undefined {
+    return [...this.tools].find((t) => t.endsWith("__deliver_text"));
   }
 }
 
