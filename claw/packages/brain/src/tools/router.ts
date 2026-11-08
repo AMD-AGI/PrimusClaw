@@ -16,6 +16,7 @@ import {
   checkReport, type CiteCheck,
 } from "./cite-check.js";
 import type { LogReads } from "./log-reads.js";
+import { citeReviseFor } from "./cite-revise.js";
 import { callWithWorkspaceFanout, fansOut } from "./workspace-fanout.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import { MEMORY_TOOLS, MEMORY_TOOL_SCHEMAS, callMemoryTool } from "./memory-tools.js";
@@ -508,6 +509,12 @@ export class ToolRouter {
     if (check?.checks(name) && typeof input.text === "string" && input.text.trim()) {
       const result = await checkReport(input.text, check.ports, signal);
       if (result.checked) {
+        // Too much of it unverified: back to its writer before anything is delivered, a bounded number of times (`cite-revise.ts`).
+        const revise = citeReviseFor(check)?.review(result);
+        if (revise) {
+          logger.info({ tool: name, claims: result.claims, unverified: result.unverified }, "cite_check.revise");
+          return refuse(outcome, revise);
+        }
         const answered: RouteOutcome = outcome ?? { isError: false };
         const text = await this.routeListed(name, { ...input, text: result.text }, signal, answered, ctx);
         return answered.isError ? text : `${checkNote(result)}\n\n${text}`;

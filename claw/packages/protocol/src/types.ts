@@ -437,8 +437,12 @@ export interface ExecuteRequest {
    * name): every source its numbered citations name is opened with the run's `web_fetch`, a statement no opened source supports is
    * marked unverified, and only the checked text is delivered (Brain, `tools/cite-check.ts`). A text with no numbered citations
    * and list of sources is passed on unchanged.
+   *
+   * `revise`: when more than `unverified_ratio` of the report's cited statements are unverified, the call is refused with the
+   * statements marked, nothing delivered, so the writer corrects them and delivers again; at most `rounds` times a run (Brain caps
+   * it at 2), after which the delivery is made whatever the check finds (`tools/cite-revise.ts`). Absent: delivered at once.
    */
-  cite_check?: { tools: string[] };
+  cite_check?: { tools: string[]; revise?: { rounds: number; unverified_ratio: number } };
   /**
    * The lookups of this run whose results are log text, by exact tool name (`mcp__<server>__<tool>`), each with the argument
    * that says how many lines or entries it returns (`tail_lines`, `limit`; empty for a read that counts nothing but may carry log
