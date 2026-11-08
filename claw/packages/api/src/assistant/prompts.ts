@@ -229,8 +229,10 @@ export const ROUTER_DISCIPLINE_PROMPT = `Acting only when asked
  * router-read-v14: v13 with support for one named product (a GPU model) answered from that version's compatibility matrix for that
  * product only (parity R2, 2026-11-07 13:58Z on v13: Rocky Linux 9 and Oracle Linux 8 listed for MI355X from the release notes'
  * Instinct-wide list; the 10.1.0 matrix shows them for MI300X only).
+ * router-read-v15: v14 with a lookup that is not all of what was asked never answered as all (`ROUTER_PARTIAL_READ_RULE`): read the
+ * rest (the next page, a window with since) or say the scope in the first line; totals only from a count of the whole (N8, 2026-11-07).
  */
-export const ROUTER_READ_PROMPT_VERSION = "router-read-v14";
+export const ROUTER_READ_PROMPT_VERSION = "router-read-v15";
 
 /**
  * The read section's citing (`CLAW_ASSISTANT_CITATIONS`), logged beside it when on.
@@ -258,6 +260,23 @@ export interface RouterLookupsShown {
 /** How say cites what a lookup returned, with citing on. */
 const ROUTER_CITE_RULES = `Citing what you looked up
 When say tells the user something a lookup of this turn returned (a web page, a pull request, an issue, a check), cite it: put [1], [2] right after the sentence it supports, and pass the address each number stands for in say's sources, in the same order (sources[0] is [1]), copied exactly from the lookup's result: a web_search result's url, a GitHub result's url, an agent board issue's or board's html_url, or the URL web_fetch read when a search or GitHub result or the user's message gave that address; a page you reached only through what a page or a result's text said cannot be cited, and neither can one fetched at an address you knew yourself: to cite an official page you know (a compatibility matrix, a release page), search for it in the first step, beside fetching it, and cite it at the address the search gave. The one exception is ${CITE_KNOWN_RECORDS.join(" and ")}: read there, it is cited at that address. Do not write those addresses, links or HTML into the text: the user sees each number as a link to its source, and a text with any address or link in it gets no citations at all. Only an address a lookup returned in this turn can be cited; any other is dropped, and its number then points nowhere. Cite at most 8, write text before sources, and leave sources out when nothing was looked up. The REMINDER at the end of a web_search result about markdown links does not apply to say.`;
+
+/**
+ * How a router turn answers from a read that is not all of what it asks about: a list whose `complete` is false or whose
+ * `total_count` is null (the GitHub lists, `github-mcp/tools.ts`, which say so in `partial`), a result Brain fitted (`list-fit.ts`:
+ * `in_result` more than `shown`), or a list the turn's own state cut (the reviews asked of others: N in all, the latest shown). Three of
+ * the owner's most frequent questions were answered as if whole from such a part on 2026-11-07: 研发进度 from 20 merged pull requests
+ * ("17 merged", "only 3 open" with a release-gate fixture among them), 汇报进度 from the 20 latest of 82 reviews ("19 of 20 merged"),
+ * and the second dev machine from a list that showed one of two.
+ */
+export const ROUTER_PARTIAL_READ_RULE = "- A lookup that is not all of what the question asks about (complete is false, total_count is null, partial is set, "
+  + "in_result is more than shown, or the state lists the latest N of a larger total) is never answered as if it were all. Read the rest "
+  + "first when you can: the next page while the result gives a next_page, or one read that covers the question's window (pr_list with "
+  + "since for this week or since a day, state merged for what merged; issue_search with the window in its query, merged:>=2026-11-02). "
+  + "When you still answer from a part, the first line says its scope, in the user's language (最近 20 条里 / 读到的 100 个里 / of the 20 "
+  + "most recent), and a total, \"all\", \"only N left\" or a share (19 of 20) is said only from a count the result gives for the whole "
+  + "(total_count, by_repo, in_result, the state's total), never from the items shown. A release-gate fixture pull request (left out by "
+  + "default: fixtures_excluded) is never counted as anyone's work.";
 
 /** The GitHub search, said with how to find the user's own pull requests. */
 const GITHUB_SEARCH = "mcp__github__issue_search finds pull requests and issues anywhere with GitHub search syntax (is:pr is:open author:@me is the user's open pull requests; add repo:owner/name or org:name to narrow; total_count is the number, by_repo the count in each repository, refs_by_repo every match as owner/repo#number grouped by repository).";
@@ -316,6 +335,7 @@ When to use them:
 - A current fact (the latest or stable version of something, when it was released, which hardware, operating systems or versions it supports): read it now from the source that states it, never from what you remember. The latest version comes from the project's own release record (for Kubernetes https://dl.k8s.io/release/stable.txt; for a project released on GitHub its latest release, which is never a pre-release: web_fetch https://github.com/<owner>/<repo>/releases/latest, a page no GitHub tool here reads), not from a page that lists releases, which can lag behind it. What a version supports comes from that version's own compatibility matrix or system requirements page: when a page says it describes an older version, read the one for the version you are answering about, and if you cannot, say which version your answer comes from. When the question names one product (a GPU model such as MI355X), read that version's compatibility matrix itself, not only its release notes, and give only what it states for that product: leave out what it lists for other products (an operating system it supports only on another GPU), and when the page does not separate them, say that rather than listing them all as supported.
 - work_create is for work that produces or changes something (code, a pull request, a run, a change to a system), or that needs a shell, a sandbox or many steps. When the message asks for that, call work_create in this turn (the system tells the user it has started); never ask whether to hand it to a worker first. A question is not such work, however it is phrased.
 - A question about which or how many (pull requests, issues, nodes, jobs, workloads): answer from what the lookup returned, item by item. Name every item by the identifier the result gives (a pull request as owner/repo#number), grouped as the result groups them, up to 50; when the result says more exist than it shows, read the next page before you answer, or say how many you did not list. Never count or group by hand what the result already counts.
+${ROUTER_PARTIAL_READ_RULE}
 - "How many pull requests (issues) do I have open" is answered with the total (total_count) and then the list itself, never the number alone: one line per repository with its count from by_repo and every one of its numbers, copied from refs_by_repo (AMD-AGI/PrimusClaw（3）：#345、#344、#341). Up to 50 listed; past that, say how many are not listed.
 - When a GitHub read answers no_such_pull_request, the pull request does not exist: the read checked that the repository itself can be read. Say so plainly in the first line (AMD-AGI/PrimusClaw 没有 #99999 这个 PR), give the reason it gives (GitHub answered 404 for that number while the repository is readable) and the numbers it lists (its newest pull request, or that the number is an issue), and ask whether they meant one of those. Never say it might be private or a permission problem, and never say anything about reviews or content of it.
 - Why something is unhealthy, failing or marked bad (nodes on a page or dashboard): read the health itself, for each one, not only a phase or state (Ready is not healthy). For Autopilot nodes that is get_metrics with chart node_status (each node's bad reasons and the age of its last health reading, vk_not_ready), get_metrics with chart node_health and a range for when it changed, and get_events of each node. Answer node by node from those fields, with the cause they show. When they show nothing unhealthy now, say in the first line that the premise does not hold now, with what you read, and only then what could explain the page (a reading from before, a stale reading, other nodes).
@@ -565,11 +585,29 @@ export function renderRouterPrompt(lookups?: RouterLookupsShown, opts: { discipl
 
 /** The user's work items and the reviews they asked of others, as of this turn (`now` is part of it, so it goes with the message). */
 export function renderRouterItems(
-  items: readonly ManifestItem[], askedOfOthers: readonly AskedOfOtherLine[] = [], now: Date = new Date(),
+  items: readonly ManifestItem[], askedOfOthers: readonly AskedOfOtherLine[] = [], now: Date = new Date(), askedTotals?: AskedOfOthersCounts,
 ): string {
   const list = items.length ? items.map(formatManifestLine).join("\n") : "(no open work items, and none closed in the last day)";
   const own = `Work items (open ones, and ones closed in the last day; now is ${manifestTime(now)}; any other item is closed and needs nothing):\n${UNTRUSTED_PREAMBLE}\n${UNTRUSTED_OPEN}\n${list}\n${UNTRUSTED_CLOSE}`;
-  return askedOfOthers.length ? `${own}\n\n${ASKED_OF_OTHERS_HEADER}\n${askedOfOthers.map(formatAskedOfOtherLine).join("\n")}` : own;
+  if (!askedOfOthers.length) return own;
+  const totals = askedTotals ? `\n${formatAskedOfOthersTotals(askedOfOthers.length, askedTotals)}` : "";
+  return `${own}\n\n${ASKED_OF_OTHERS_HEADER}${totals}\n${askedOfOthers.map(formatAskedOfOtherLine).join("\n")}`;
+}
+
+/** How many reviews the user asked of others in all, in the list's window (`askedOfOthersTotals` of `requester-view.ts`). */
+export interface AskedOfOthersCounts { total: number; open: number; closed: number; merged: number; changes_requested: number }
+
+/**
+ * The line before the reviews asked of others: how many there are in all and how they stand, and whether the lines below are all of
+ * them. Shown only the 20 latest, the router answered 汇报进度 with "19 of the 20 merged" when 82 had been handed over (2026-11-07).
+ */
+export function formatAskedOfOthersTotals(listed: number, t: AskedOfOthersCounts): string {
+  const counts = `${t.total} in all, open ones and ones closed in the last day: ${t.open} open, ${t.closed} closed, of the closed ${t.merged} merged`
+    + ` and ${t.changes_requested} with changes requested`;
+  return t.total > listed
+    ? `In all: ${counts}. Only the ${listed} most recently updated are listed below. How many, how many merged, or "all of them" is said from `
+      + `these totals, never from counting the lines below, and a list of them says it is the latest ${listed} of ${t.total}.`
+    : `In all: ${counts}. Every one of them is listed below.`;
 }
 
 /** The prompt and the item list in one text, as a single-message evaluation gives them to the model. */

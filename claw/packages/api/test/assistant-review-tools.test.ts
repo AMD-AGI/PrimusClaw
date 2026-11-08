@@ -1653,6 +1653,36 @@ describe("assistant review tools", { skip }, () => {
     assert.deepEqual((await w.mod.tools.workRecall(turn, { item_id: item, detail: "summary" }) as Recorded).requester_view, frozen);
   });
 
+  test("W6b the reviews asked of others are counted in all before the latest are listed: \"汇报进度\" counts from the totals", async () => {
+    // As on 2026-11-07 14:34: the router was shown the 20 latest and said "19 of the 20 merged" when 82 had been handed over.
+    const rp = await import("../src/assistant/role-profile.js");
+    const prompts = await import("../src/assistant/prompts.js");
+    const frozen = (merged: boolean, verdict: string) => ({ status: "done", pr_url: null, verdict, merged, waiting_for: null, findings: null, note: null });
+    for (let n = 1; n <= 25; n++) {
+      const item = await reviewItem(bob, n, { owner: "AMD-AGI", repo: "PrimusClaw", number: 600 + n }, { requested_by: alice.userId, requester_label: "Alice A" });
+      if (n <= 22) {
+        const view = n <= 18 ? frozen(true, "approve") : frozen(false, "request_changes");
+        await w.q(
+          "UPDATE claw_work_items SET board_state = 'done', outcome = 'accepted', closed_at = NOW(), params = params || jsonb_build_object('requester_view', $2::jsonb) WHERE item_id = $1",
+          [item, JSON.stringify(view)],
+        );
+      }
+    }
+    // One closed two days ago is out of the window, as it is out of the list.
+    const old = await reviewItem(bob, 26, { owner: "AMD-AGI", repo: "PrimusClaw", number: 700 }, { requested_by: alice.userId, requester_label: "Alice A" });
+    await w.q("UPDATE claw_work_items SET board_state = 'done', closed_at = NOW() - interval '2 days', params = params || jsonb_build_object('requester_view', $2::jsonb) WHERE item_id = $1",
+      [old, JSON.stringify(frozen(true, "approve"))]);
+    const totals = await rp.askedOfOthersTotalsManifest(alice.userId);
+    assert.deepEqual(totals, { total: 25, open: 3, closed: 22, merged: 18, changes_requested: 4 });
+    assert.deepEqual(await rp.askedOfOthersTotalsManifest(bob.userId), { total: 0, open: 0, closed: 0, merged: 0, changes_requested: 0 });
+    const listed = await rp.askedOfOthersManifest(alice.userId);
+    assert.equal(listed.length, 20, "the list stays the latest 20");
+    const items = prompts.renderRouterItems([], listed, new Date(), totals);
+    assert.ok(items.includes(`${prompts.ASKED_OF_OTHERS_HEADER}\nIn all: 25 in all, open ones and ones closed in the last day: 3 open, 22 closed, of the closed 18 merged and 4 with changes requested. Only the 20 most recently updated are listed below.`), items);
+    assert.match(items, /never from counting the lines below, and a list of them says it is the latest 20 of 25\./);
+    assert.match(prompts.formatAskedOfOthersTotals(3, { total: 3, open: 1, closed: 2, merged: 2, changes_requested: 0 }), /Every one of them is listed below\.$/);
+  });
+
   test("T1 the tools exist only with CLAW_ASSISTANT_TOOLS on", async () => {
     const { createAssistantMcpServer } = await import("../src/assistant/mcp.js");
     const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");

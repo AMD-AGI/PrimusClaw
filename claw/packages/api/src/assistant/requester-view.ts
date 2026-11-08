@@ -169,6 +169,38 @@ export async function requestedItemOf(q: StatementRunner, userId: string, itemId
  */
 export interface AskedOfOther { item_id: string; reviewer: string | null; view: RequesterView }
 
+/** How many reviews this user asked of others are open, or closed within the window, in all: what a list cut at its latest can count from. */
+export interface AskedOfOthersTotals {
+  total: number;
+  open: number;
+  /** Closed within the window. */
+  closed: number;
+  /** Of the closed ones, those whose frozen view says merged; and those whose verdict was request_changes. */
+  merged: number;
+  changes_requested: number;
+}
+
+/**
+ * The counts of `askedOfOthers` over the same rows, without its limit: the router was shown the 20 latest and said "19 of the 20
+ * merged" when 82 had been handed over that day (2026-11-07 14:34). An open review's view is not frozen yet, so of the open ones only
+ * the number is counted.
+ */
+export async function askedOfOthersTotals(q: StatementRunner, userId: string, closedWindow: string): Promise<AskedOfOthersTotals> {
+  const row = (await q.query(
+    `SELECT count(*)::int AS total,
+            count(*) FILTER (WHERE board_state <> 'done')::int AS open,
+            count(*) FILTER (WHERE board_state = 'done')::int AS closed,
+            count(*) FILTER (WHERE board_state = 'done' AND params->'requester_view'->>'merged' = 'true')::int AS merged,
+            count(*) FILTER (WHERE board_state = 'done' AND params->'requester_view'->>'verdict' = 'request_changes')::int AS changes_requested
+       FROM claw_work_items
+      WHERE kind = 'review' AND params ? 'requested_by' AND params->>'requested_by' = $1 AND user_id <> $1
+        AND (board_state <> 'done' OR closed_at > NOW() - $2::interval)`,
+    [userId, closedWindow],
+  )).rows[0] as Record<string, unknown> | undefined;
+  const n = (v: unknown): number => Number(v) || 0;
+  return { total: n(row?.total), open: n(row?.open), closed: n(row?.closed), merged: n(row?.merged), changes_requested: n(row?.changes_requested) };
+}
+
 /**
  * The reviews this user asked of others that are open, or closed within `closedWindow`, newest first, at most `limit`. A closed one is
  * its frozen `params.requester_view`; an open one has none yet and is the four facts as they are now. Nothing else of the item (its

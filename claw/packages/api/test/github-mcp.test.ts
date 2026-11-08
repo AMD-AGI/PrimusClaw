@@ -258,7 +258,7 @@ describe("B the reads a question needs", () => {
     assert.equal(seen.length, 1);
     const url = new URL(seen[0].url);
     assert.deepEqual([url.origin + url.pathname, seen[0].authorization], [`${API}/search/issues`, `Bearer ${GH_TOKEN}`]);
-    assert.deepEqual(Object.fromEntries(url.searchParams), { q: "is:pr is:open author:@me", sort: "updated", order: "desc", per_page: "50", page: "1" });
+    assert.deepEqual(Object.fromEntries(url.searchParams), { q: "is:pr is:open author:@me -base:release-gate-fixture/base", sort: "updated", order: "desc", per_page: "50", page: "1" });
     const found = JSON.parse(r.text);
     assert.deepEqual([found.total_count, found.shown, found.complete], [3, 3, true]);
     assert.deepEqual(found.items.map((i: any) => [i.repo, i.number, i.is_pull_request, i.draft]), [
@@ -497,9 +497,222 @@ describe("B lists a turn sees whole", () => {
     const c = await connect(token());
     const prs = JSON.parse((await call(c, "pr_list", { repo: "o/r" })).text);
     assert.deepEqual([prs.total_count, prs.complete, prs.items.length], [7, true, 7]);
-    assert.deepEqual(Object.fromEntries(new URL(seen[0].url).searchParams), { state: "open", sort: "created", direction: "desc", per_page: "50", page: "1" });
+    // Read 100 at a time, so that what is filtered out (a release-gate fixture) is counted out of the whole list, not out of a page.
+    assert.deepEqual(Object.fromEntries(new URL(seen[0].url).searchParams), { state: "open", sort: "created", direction: "desc", per_page: "100", page: "1" });
     const issues = JSON.parse((await call(c, "issue_list", { repo: "o/r", per_page: 10 })).text);
     assert.deepEqual([issues.total_count, issues.complete, issues.next_page, issues.items.length], [null, false, 2, 10]);
+  });
+
+  test("B23 pr_list leaves the release-gate fixtures out of the list and its count, and lists them when asked", async () => {
+    // As on 2026-11-07 06:09: #381 "release-gate fixture, do not merge" was counted as one of "3 still open", and fixtures that
+    // merged into the fixture branch as merged work. A person's own "[do not merge]" pull request stays.
+    const open = [
+      pr(381, { title: "release-gate fixture, do not merge", head: { ref: "release-gate-fixture/head" }, base: { ref: "release-gate-fixture/base" } }),
+      pr(380, { title: "[do not merge] try the new router", head: { ref: "wip/router" } }),
+      pr(294, { title: "Default the chart model" }),
+    ];
+    const merged = [
+      pr(413, { title: "handoff e2e fixture 23, do not merge into main", state: "closed", head: { ref: "handoff-e2e-fixture/23" }, base: { ref: "release-gate-fixture/base" }, merged_at: "2026-11-07T06:52:39Z", updated_at: "2026-11-07T06:52:40Z" }),
+      pr(378, { state: "closed", merged_at: "2026-11-07T05:55:10Z", updated_at: "2026-11-07T05:55:12Z" }),
+      pr(377, { title: "a fixture renamed by hand, do not merge", state: "closed", head: { ref: "x/y" }, merged_at: "2026-11-07T05:50:00Z", updated_at: "2026-11-07T05:50:00Z" }),
+    ];
+    respond = (url) => (url.pathname === "/repos/o/r/pulls" ? json(url.searchParams.get("state") === "open" ? open : merged) : json({}, 404));
+    const c = await connect(token());
+    const found = JSON.parse((await call(c, "pr_list", { repo: "o/r" })).text);
+    assert.deepEqual(found.items.map((p: any) => p.number), [380, 294]);
+    assert.deepEqual([found.total_count, found.complete, found.fixtures_excluded], [2, true, 1]);
+    assert.match(found.note, /1 release-gate fixture .*include_fixtures: true lists them/);
+    const all = JSON.parse((await call(c, "pr_list", { repo: "o/r", include_fixtures: true })).text);
+    assert.deepEqual([all.items.map((p: any) => p.number), all.total_count, all.fixtures_excluded], [[381, 380, 294], 3, undefined]);
+    const done = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged" })).text);
+    assert.deepEqual([done.items.map((p: any) => p.number), done.total_count, done.fixtures_excluded], [[378], 1, 2]);
+  });
+
+  test("B24 issue_search leaves the fixtures out in the search itself, so total_count and by_repo count without them", async () => {
+    respond = (url) => (url.pathname === "/search/issues" ? json({ total_count: 1, incomplete_results: false, items: [hit(12)] }) : json({}, 404));
+    const c = await connect(token());
+    const found = JSON.parse((await call(c, "issue_search", { query: "is:pr is:open author:@me" })).text);
+    assert.equal(new URL(seen[0].url).searchParams.get("q"), "is:pr is:open author:@me -base:release-gate-fixture/base");
+    assert.match(String(found.fixtures_excluded), /left out of the search and its counts/);
+    for (const [args, q] of [
+      [{ query: "is:pr is:open author:@me", include_fixtures: true }, "is:pr is:open author:@me"],
+      [{ query: "is:pr base:release-gate-fixture/base" }, "is:pr base:release-gate-fixture/base"],
+      [{ query: "is:pr fixture in:title" }, "is:pr fixture in:title"],
+    ] as const) {
+      seen = [];
+      const r = JSON.parse((await call(c, "issue_search", args)).text);
+      assert.equal(new URL(seen[0].url).searchParams.get("q"), q, JSON.stringify(args));
+      assert.equal(r.fixtures_excluded, undefined);
+    }
+  });
+
+  test("B25 pr_list since reads the whole window and counts it: \"what merged this week\" is a total, not the latest page", async () => {
+    // 250 merged in the week, one a minute back from Saturday noon, then older ones: GitHub pages them 100 at a time.
+    const week = Date.UTC(2026, 10, 2);
+    const at = (i: number) => new Date(Date.UTC(2026, 10, 7, 12) - i * 40 * 60_000).toISOString();
+    const page = (n: number) => Array.from({ length: 100 }, (_, i) => {
+      const t = at(n * 100 + i);
+      return pr(10_000 - (n * 100 + i), { state: "closed", merged_at: t, closed_at: t, updated_at: t });
+    });
+    respond = (url) => (url.pathname === "/repos/o/r/pulls" ? json(page(Number(url.searchParams.get("page")) - 1)) : json({}, 404));
+    const inWeek = Array.from({ length: 500 }, (_, i) => at(i)).filter((t) => Date.parse(t) >= week).length;
+    const found = JSON.parse((await call(await connect(token()), "pr_list", { repo: "o/r", state: "merged", since: "2026-11-02", per_page: 20 })).text);
+    assert.equal(found.total_count, inWeek, "every one merged since Monday, counted");
+    assert.equal(found.since, "2026-11-02T00:00:00.000Z");
+    assert.deepEqual([found.shown, found.complete, found.next_page], [20, false, 2]);
+    assert.ok(found.items.every((p: any) => Date.parse(p.merged_at) >= week));
+    assert.equal(seen.length, Math.ceil((inWeek + 1) / 100), "read until the window is passed, and no further");
+    for (const since of ["last week", "2026-02-30", "2026-13-01", "2026-11-02T24:00:00Z"]) {
+      const bad = await call(await connect(token()), "pr_list", { repo: "o/r", state: "merged", since });
+      assert.equal(bad.isError, true, since);
+      assert.match(bad.text, /since must be an ISO date/, since);
+    }
+    const local = JSON.parse((await call(await connect(token()), "pr_list", { repo: "o/r", state: "merged", since: "2026-11-02T08:00" })).text);
+    assert.equal(local.since, "2026-11-02T08:00:00.000Z", "a time without a zone is UTC");
+  });
+
+  test("B26 a list that is not all of its matches says so in the answer, with what to do before a count", async () => {
+    const { partialLine } = await import("../src/github-mcp/tools.js");
+    respond = (url) => (url.pathname === "/repos/o/r/pulls"
+      ? json(Array.from({ length: 100 }, (_, i) => {
+          const t = new Date(Date.UTC(2026, 10, 7, 6) - i * 60_000).toISOString();
+          return pr(400 - i, { state: "closed", merged_at: t, closed_at: t, updated_at: t });
+        }))
+      : json({}, 404));
+    const part = JSON.parse((await call(await connect(token()), "pr_list", { repo: "o/r", state: "merged", per_page: 20 })).text);
+    assert.deepEqual([part.complete, part.total_count, part.shown], [false, null, 20]);
+    assert.equal(part.partial, partialLine(20, null, { page: 1, more: true }));
+    assert.match(part.partial, /items holds the 20 most recent \(最近 20 条里\), not all the matches, and how many there are in all is not known\. Before you give a count.*read next_page while there is one.*covers only these/);
+    // Page 2 is said as page 2, never as "the most recent"; a page of a list whose count is known says to give that count.
+    assert.match(partialLine(50, 120, { page: 2, more: true }), /^items holds page 2, 50 of them \(第 2 页\), not all the matches\. total_count 120 counts all of them: give that as the total, never a count of items; to list the others, read next_page while there is one\.$/);
+    // A search that timed out: its count may be low, and is never said to be the total.
+    assert.match(partialLine(50, 900, { exact: false }), /total_count 900 may be low\. Before you give a count/);
+    respond = (url) => (url.pathname === "/search/issues"
+      ? json({ total_count: 900, incomplete_results: true, items: Array.from({ length: 50 }, (_, i) => hit(i + 1)) })
+      : json({}, 404));
+    const timedOut = JSON.parse((await call(await connect(token()), "issue_search", { query: "is:pr is:open" })).text);
+    assert.match(timedOut.partial, /total_count 900 may be low/, "a search that timed out never has its count given as the total");
+    respond = (url) => (url.pathname === "/repos/o/r/pulls" ? json([pr(1), pr(2)]) : json({}, 404));
+    const whole = JSON.parse((await call(await connect(token()), "pr_list", { repo: "o/r" })).text);
+    assert.deepEqual([whole.complete, whole.partial], [true, undefined]);
+  });
+
+  test("B27 pr_list pages past what it scans with the same filter: no pull request listed twice or skipped, and no page named that would come back empty", async () => {
+    // 700 open ones, newest first, two of them fixtures: one in the first 500 the scan reads, one past them.
+    const fixture = { title: "release-gate fixture, do not merge", head: { ref: "release-gate-fixture/head" } };
+    const all = Array.from({ length: 700 }, (_, i) => pr(1000 - i, i === 20 || i === 520 ? fixture : {}));
+    respond = (url) => {
+      if (url.pathname !== "/repos/o/r/pulls") return json({}, 404);
+      const per = Number(url.searchParams.get("per_page"));
+      const n = Number(url.searchParams.get("page"));
+      return json(url.searchParams.get("state") === "open" ? all.slice((n - 1) * per, n * per) : []);
+    };
+    const c = await connect(token());
+    const listed: number[] = [];
+    let page: number | null = 1;
+    let last: any = null;
+    while (page !== null) {
+      last = JSON.parse((await call(c, "pr_list", { repo: "o/r", per_page: 50, page })).text);
+      listed.push(...last.items.map((p: any) => p.number));
+      page = last.next_page ?? null;
+    }
+    const want = all.map((p) => p.number).filter((n) => n !== 980 && n !== 480);
+    assert.deepEqual(listed, want, "every one once, in order, the fixtures left out");
+    assert.equal(last.total_count, 698, "read to the end: counted");
+    const p11 = JSON.parse((await call(c, "pr_list", { repo: "o/r", per_page: 50, page: 11 })).text);
+    assert.deepEqual([p11.items[0].number, p11.items.length, p11.next_page], [499, 50, 12]);
+    assert.match(p11.partial, /^items holds page 11, 50 of them/);
+    const p15 = JSON.parse((await call(c, "pr_list", { repo: "o/r", per_page: 50, page: 15 })).text);
+    assert.deepEqual([p15.items.length, p15.next_page ?? null], [0, null]);
+    // A page that holds exactly the last of a filtered list names no page after it: 50 merged, then only closed ones.
+    respond = (url) => (url.pathname === "/repos/o/r/pulls"
+      ? json(Number(url.searchParams.get("page")) === 1 ? Array.from({ length: 100 }, (_, i) => {
+          const at = new Date(Date.UTC(2026, 10, 7) - i * 60_000).toISOString();
+          return pr(3000 - i, { state: "closed", merged_at: i < 50 ? at : null, closed_at: at, updated_at: at });
+        }) : [])
+      : json({}, 404));
+    const exact = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", per_page: 50 })).text);
+    assert.deepEqual([exact.items.length, exact.next_page ?? null], [50, null]);
+    // A merged list past its scan names no page after it, and says to narrow instead.
+    const t = (i: number) => new Date(Date.UTC(2026, 10, 7) - i * 60_000).toISOString();
+    respond = (url) => (url.pathname === "/repos/o/r/pulls"
+      ? json(Array.from({ length: 100 }, (_, i) => { const k = (Number(url.searchParams.get("page")) - 1) * 100 + i; return pr(5000 - k, { state: "closed", merged_at: "2026-01-01T00:00:00Z", closed_at: t(k), updated_at: t(k) }); }))
+      : json({}, 404));
+    seen = [];
+    const m11 = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", per_page: 50, page: 11 })).text);
+    assert.deepEqual([m11.items.length, m11.next_page], [50, 12], "read on past the scan to the page asked for");
+    assert.equal(seen.length, 20, "every one merged long before it was last updated: never settled, read to the deep limit");
+    const deep = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", per_page: 50, page: 50 })).text);
+    assert.deepEqual([deep.items.length, deep.next_page ?? null, deep.total_count], [0, null, null]);
+    assert.match(deep.note, /pr_list reads no further: for older ones search with issue_search \(is:pr repo:o\/r is:merged\), or narrow with since/);
+    const narrowed = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", base: "main", per_page: 50, page: 50 })).text);
+    assert.match(narrowed.note, /issue_search \(is:pr repo:o\/r is:merged base:main\), or narrow with since/, "the search carries the list's own filters");
+    const windowed = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", since: "2020-01-01", per_page: 50, page: 50 })).text);
+    assert.match(windowed.note, /issue_search \(is:pr repo:o\/r is:merged merged:>=2020-01-01T00:00:00Z\)$/);
+    const withFixtures = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", include_fixtures: true, per_page: 50, page: 50 })).text);
+    assert.match(withFixtures.note, /issue_search \(is:pr repo:o\/r is:merged, include_fixtures: true\)/);
+    // A fork's branch (alice:feature) has no search of its own: the search names a branch in every fork, so none is offered.
+    const forked = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", head: "alice:feature", per_page: 50, page: 50 })).text);
+    assert.match(forked.note, /pr_list reads no further: narrow with since/);
+    assert.ok(!/issue_search/.test(forked.note), forked.note);
+    // One person's, sparse: three of 700, two of them past the first 500.
+    const sparse = Array.from({ length: 700 }, (_, i) => pr(1000 - i, { user: { login: [10, 600, 650].includes(i) ? "bob" : "alice" } }));
+    respond = (url) => {
+      if (url.pathname !== "/repos/o/r/pulls") return json({}, 404);
+      const n = Number(url.searchParams.get("page"));
+      return json(sparse.slice((n - 1) * 100, n * 100));
+    };
+    const b1 = JSON.parse((await call(c, "pr_list", { repo: "o/r", author: "bob", per_page: 2 })).text);
+    assert.deepEqual([b1.items.map((p: any) => p.number), b1.next_page, b1.total_count], [[990, 400], 2, null]);
+    const b2 = JSON.parse((await call(c, "pr_list", { repo: "o/r", author: "bob", per_page: 2, page: 2 })).text);
+    assert.deepEqual([b2.items.map((p: any) => p.number), b2.next_page ?? null, b2.total_count], [[350], null, 3]);
+  });
+
+  test("B28 a list answer stays under its cap with the partial line, whatever its envelope holds; a merged list reads on until its page is settled", async () => {
+    const { listAnswer, partialLine, PARTIAL_ROOM } = await import("../src/github-mcp/tools.js");
+    const { GITHUB_LIST_MAX_CHARS } = await import("@claw/protocol");
+    for (const [shown, total, at] of [[100, 123456789, { page: 100, more: true }], [100, null, { page: 100, more: true }], [100, 123456789, { page: 100, more: true, exact: false }]] as const) {
+      const line = partialLine(shown, total, at);
+      assert.ok(JSON.stringify(line).length + 12 <= PARTIAL_ROOM, `${line.length}`);
+    }
+    // 240 repositories, as a search across an organisation can give: every number of them leaves no room for the rest.
+    const repos = Array.from({ length: 240 }, (_, i) => `some-organisation/repository-${i}`);
+    const byRepo = Object.fromEntries(repos.map((r) => [r, 1]));
+    const refs = Object.fromEntries(repos.map((r, i) => [r, [`#${1000 + i}`, `#${2000 + i}`]]));
+    const items = Array.from({ length: 50 }, (_, i) => ({ repo: repos[i], number: i, title: `pull request ${i}`, url: `https://github.com/${repos[i]}/pull/${i}` }));
+    const out = listAnswer(items, { total_count: 4000, complete: false, next_page: 2, by_repo: byRepo, refs_by_repo: refs, page: 1, note: "n".repeat(300) });
+    assert.ok(JSON.stringify(out).length <= GITHUB_LIST_MAX_CHARS, `${JSON.stringify(out).length}`);
+    assert.equal(out.refs_by_repo, undefined);
+    assert.match(String(out.refs_by_repo_cut), /by_repo counts them/);
+    assert.ok(typeof out.partial === "string");
+    // 300 repositories with long names: by_repo itself leaves no room, and keeps the ones with the most matches.
+    const long = Array.from({ length: 300 }, (_, i) => `an-organisation-with-a-rather-long-name/a-repository-with-a-long-name-too-${i}`);
+    const many = listAnswer(items, { total_count: 9000, complete: false, by_repo: Object.fromEntries(long.map((r, i) => [r, 300 - i])), refs_by_repo: {}, page: 1 });
+    assert.ok(JSON.stringify(many).length <= GITHUB_LIST_MAX_CHARS, `${JSON.stringify(many).length}`);
+    const kept = Object.keys(many.by_repo as object);
+    assert.ok(kept.length > 0 && kept.length < 300 && kept[0] === long[0], `${kept.length}`);
+    const left = long.slice(kept.length).reduce((n, _r, i) => n + (300 - kept.length - i), 0);
+    assert.equal(many.by_repo_cut, `${300 - kept.length} more repositories (${left} matches) are not listed in by_repo: name one with repo: to count it`);
+    const small = listAnswer(items.slice(0, 2), { total_count: 2, complete: true, by_repo: { a: 2 }, refs_by_repo: { a: ["#1", "#2"] } });
+    assert.deepEqual(small.refs_by_repo, { a: ["#1", "#2"] }, "kept where it fits");
+
+    // Merged ones read in update order: one updated late on page 7 merged before most of what pages 1-6 hold, and one on page 8
+    // merged after the page's last; the page is settled only once nothing unread can come before it.
+    const t = (min: number) => new Date(Date.UTC(2026, 10, 7, 12) - min * 60_000).toISOString();
+    respond = (url) => {
+      if (url.pathname !== "/repos/o/r/pulls") return json({}, 404);
+      const n = Number(url.searchParams.get("page"));
+      if (n > 8) return json([]);
+      return json(Array.from({ length: 100 }, (_, i) => {
+        const k = (n - 1) * 100 + i;
+        // Updated in order k; merged long before, except one on page 8 that merged just now (updated as the oldest of its page).
+        return pr(10_000 - k, { state: "closed", updated_at: t(k), closed_at: t(k), merged_at: k === 750 ? t(0) : t(5000 + k) });
+      }));
+    };
+    seen = [];
+    const top = JSON.parse((await call(await connect(token()), "pr_list", { repo: "o/r", state: "merged", per_page: 3 })).text);
+    assert.equal(top.items[0].number, 10_000 - 750, "the one that merged last, from page 8");
+    assert.ok(seen.length > 5, `${seen.length} pages read`);
   });
 
   test("B22 the list reads still name each item they answer as a source, now from the answer's items", async () => {

@@ -306,7 +306,7 @@ describe("router quality, the prompt", () => {
     // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
     // now from the source that states them.
     assert.equal(p.ROUTER_PROMPT_VERSION, "router-v19");
-    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v14");
+    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v15");
     assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v24");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
@@ -329,6 +329,13 @@ describe("router quality, the prompt", () => {
       ["a premise that does not hold is said first", /When they show nothing unhealthy now, say in the first line that the premise does not hold now, with what you read/],
       // Parity R2 (2026-11-07 on v13): Rocky Linux 9 and Oracle Linux 8 listed for MI355X from an Instinct-wide list.
       ["support for one named product from its matrix", /When the question names one product \(a GPU model such as MI355X\), read that version's compatibility matrix itself, not only its release notes, and give only what it states for that product/],
+      // N8 (2026-11-07): 研发进度 answered "17 merged, only 3 open" from 20 of the merged pull requests (complete: false) with a
+      // release-gate fixture among the open ones.
+      ["a part is never answered as all", /A lookup that is not all of what the question asks about \(complete is false, total_count is null, partial is set, in_result is more than shown, or the state lists the latest N of a larger total\) is never answered as if it were all/],
+      ["read the rest or a window first", /the next page while the result gives a next_page, or one read that covers the question's window \(pr_list with since/],
+      ["the scope in the first line", /When you still answer from a part, the first line says its scope, in the user's language \(最近 20 条里/],
+      ["totals only from a whole count", /a total, "all", "only N left" or a share \(19 of 20\) is said only from a count the result gives for the whole/],
+      ["a fixture is nobody's work", /A release-gate fixture pull request \(left out by default: fixtures_excluded\) is never counted as anyone's work/],
       ["progress is read live", /When the user asks how far an item got, what it is doing now, or when it will finish, look now: call work_recall\(item, "live"\)/],
       ["progress is never estimated", /Never work out how far it got or when it ends from when it started or how long it was expected to take/],
       ["progress from what the job wrote now", /files_now, when it is there, is newer than the worker's steps[^\n]*answer from its latest line/],

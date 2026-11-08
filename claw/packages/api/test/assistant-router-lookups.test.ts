@@ -176,7 +176,8 @@ describe("assistant router lookups", { skip }, () => {
         assert.equal(found.total_count, 2);
         assert.deepEqual(found.items.map((i: any) => `${i.repo}#${i.number}`), ["AMD-AGI/PrimusClaw#300", "o/r#12"]);
         assert.equal(seen.length, 1);
-        assert.deepEqual([new URL(seen[0].url).searchParams.get("q"), seen[0].authorization], ["is:pr is:open author:@me", `Bearer ${GH_TOKEN}`]);
+        assert.deepEqual([new URL(seen[0].url).searchParams.get("q"), seen[0].authorization], ["is:pr is:open author:@me -base:release-gate-fixture/base", `Bearer ${GH_TOKEN}`],
+          "the user's own search, with the release-gate fixtures left out");
       } finally {
         await client.close();
       }
