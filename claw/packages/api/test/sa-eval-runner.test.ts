@@ -23,9 +23,13 @@
  *      message fails the case; a sub-agent's message is not the first reply; the final answer's time is when it was shown, not
  *      the turn's end), and the session is deleted and seen gone; R5b with two turns, what is graded of the last turn is its
  *      own (another turn's message delivered again is not its answer)
- *   R7 a stream that missed a stored event of the case (a leak in a say it never delivered): an error, not a grade; an item whose
- *      work_create answer the stream missed is still closed with its worker's session; an assistant session still running
- *      before a case: nothing is sent, an error
+ *   R7 a stream that missed a stored event of the case (a leak in a say it never delivered, not even in a new stream's history,
+ *      though the gap opened the stream again): an error, not a grade; an item whose work_create answer the stream missed is
+ *      still closed with its worker's session; R7b an assistant session still running before a case: nothing is sent, an error;
+ *      R7c a gap that a new stream's history fills is graded (the stream is opened again at once, and the attempt says when);
+ *      a turn's progress, sandbox and plugin-loading events are no gap; R7d an attempt that ended in an error of the run is run
+ *      again once (EVAL_INFRA_RETRY), and the second try is reported with the first one's error; R7e a first try recorded before
+ *      its error (a judge that failed) leaves no recording: EVAL_OFFLINE grades the one attempt the live report has
  *   R9 a judge that gives no verdict (an error status, a busy or failing gateway twice, no PASS or FAIL twice) makes the attempt an
  *      error of the run, not a FAIL; a verdict-less answer is asked again saying what was missing; a verdict on the last line of a
  *      judge that reasons first counts; its FAIL fails, its PASS passes. R3e a stop while the stream holds its history back ends the wait at once
@@ -123,8 +127,12 @@ class FakeClaw {
   private readonly sessionGets = new Map<string, number>();
   /** Called when the run asks for its assistant session: what the run reads right after is set up relative to that moment. */
   onAssistant: () => void = () => {};
-  /** Stored events the stream does not deliver (a stream stalled without dropping). */
+  /** Stored events the stream does not deliver (a stream stalled without dropping): a new stream's history still has them. */
   hidden: (data: Record<string, unknown>) => boolean = () => false;
+  /** Stored events no stream ever delivers, not even in a new stream's history. */
+  withheld: (data: Record<string, unknown>) => boolean = () => false;
+  /** How many times a session's stream was opened. */
+  readonly streamsOpened = new Map<string, number>();
   private readonly streams = new Map<string, Set<ServerResponse>>();
   private server!: Server;
   private n = 0;
@@ -149,7 +157,7 @@ class FakeClaw {
     this.rows.set(sessionId, [...(this.rows.get(sessionId) ?? []), row]);
     if (row.event_type === "exec_complete") this.settledAt.set(String(data.message_id), Date.now());
     // The API keeps exec_complete from a stream (`routes/events.ts`).
-    if (row.event_type === "exec_complete" || this.hidden(data)) return;
+    if (row.event_type === "exec_complete" || this.hidden(data) || this.withheld(data)) return;
     for (const s of this.streams.get(sessionId) ?? []) s.write(frame(row));
   }
 
@@ -262,7 +270,8 @@ class FakeClaw {
         return this.failReplay.has(sessionId) ? send(500, { ok: false }) : send(200, { ok: true, data: this.rows.get(sessionId) ?? [] });
       }
       res.writeHead(200, { "content-type": "text/event-stream" });
-      for (const row of this.rows.get(sessionId) ?? []) if (row.event_type !== "exec_complete") res.write(frame(row));
+      this.streamsOpened.set(sessionId, (this.streamsOpened.get(sessionId) ?? 0) + 1);
+      for (const row of this.rows.get(sessionId) ?? []) if (row.event_type !== "exec_complete" && !this.withheld(row.data)) res.write(frame(row));
       if (this.historyDelayMs) await new Promise((r) => setTimeout(r, this.historyDelayMs));
       res.write("event: historyComplete\ndata: {}\n\n");
       const open = this.streams.get(sessionId) ?? new Set<ServerResponse>();
@@ -324,7 +333,8 @@ function runner(claw: string, cases: object[], env: Record<string, string> = {},
     env: {
       PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? dir,
       EVAL_CLAW: claw, EVAL_KEY_FILE: join(dir, "key"), EVAL_IDENTITY_ACK: `test:${EMAIL}`, EVAL_CASES_DIR: join(dir, "cases"), EVAL_K: "1",
-      EVAL_OUT: join(dir, "out"), EVAL_SAY_LOG: join(dir, "says.jsonl"), ...env,
+      // One try per attempt unless a test asks for the retry (R7d): the other tests are each about one try's error.
+      EVAL_OUT: join(dir, "out"), EVAL_SAY_LOG: join(dir, "says.jsonl"), EVAL_INFRA_RETRY: "0", ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -648,8 +658,8 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
   it("R7 what the stream missed is not graded; the run's items are still closed", { timeout: 120_000 }, async () => {
     const claw = new FakeClaw();
     const base = await claw.start();
-    // The stream misses the work_create answer and a say with a tool name in it; both are stored.
-    claw.hidden = (d) => (d.type === "toolUsed" && d.tool === "mcp__assistant__work_create" && d.status === "success") || (d.type === "AssistantSay" && String(d.text).includes("mcp__"));
+    // The stream misses the work_create answer and a say with a tool name in it, even in a new stream's history; both are stored.
+    claw.withheld = (d) => (d.type === "toolUsed" && d.tool === "mcp__assistant__work_create" && d.status === "success") || (d.type === "AssistantSay" && String(d.text).includes("mcp__"));
     claw.router = (content, id) => {
       claw.turn(id, { item: item(1, { board_state: "in_progress", can_accept: false }), say: "On it." });
       claw.emit({ type: "AssistantSay", say_id: `leak-${id}`, turn_message_id: id, text: "I called mcp__safe__node_list." });
@@ -659,10 +669,99 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
     await claw.stop();
     try {
       assert.match(run.out, /ERROR t-items-001#1 .*the stream missed 2 stored event\(s\) of the case/, run.out);
+      // The gap opened the stream again first (its history did not have them either), and the attempt says when.
+      assert.match(run.out, /the stream of asst-1 is opened again \(a stored event was not delivered\)/);
+      assert.equal(claw.streamsOpened.get("asst-1"), 2);
+      const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+      assert.match(report.results[0].attempts[0].reopened?.[0] ?? "", /^\d{4}-\d\d-\d\dT\S+Z forced$/);
       assert.deepEqual(claw.calls.filter((c) => c.includes("/stop") || c.includes("/accept")), ["POST /v1/work-items/item-1/stop"], "tied by its stored work_create answer and closed");
       assert.ok(claw.calls.includes("DELETE /v1/sessions/worker-1") && !claw.sessions.has("worker-1"));
       assert.doesNotMatch(run.out, /not tied to the run's calls/);
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it("R7c a gap the stream's history fills is graded; what nothing graded reads is no gap", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    // The live stream stalls on the work_create answer and on a say with a tool name in it; a new stream's history has both.
+    claw.hidden = (d) => (d.type === "toolUsed" && d.tool === "mcp__assistant__work_create" && d.status === "success") || (d.type === "AssistantSay" && String(d.text).includes("mcp__"));
+    // A turn's progress, its sandbox and Brain's plugin loading never reach any stream (E249: 8 such events at a turn's start).
+    claw.withheld = (d) => d.type === "statusUpdate" || d.type === "sandboxStatus" || (d.type === "toolUsed" && String(d.tool).startsWith("load_"));
+    claw.router = (content, id) => {
+      claw.emit({ type: "statusUpdate", message_id: id, agentStatus: "running" });
+      claw.emit({ type: "sandboxStatus", message_id: id, status: "ready" });
+      claw.emit({ type: "toolUsed", message_id: id, tool: "load_mcp", status: "success", actionId: `plugin_mcp_${id}`, brief: "Loaded plugin MCP (safe)" });
+      claw.turn(id, { item: item(1, { board_state: "in_progress", can_accept: false }), say: "On it." });
+      claw.emit({ type: "AssistantSay", say_id: `leak-${id}`, turn_message_id: id, text: "I called mcp__safe__node_list." });
+    };
+    const r = runner(base, [itemCase({ item_wait_s: 1 })]);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      // Graded on what the reopened stream brought: the leak it would have missed fails the case; nothing is an error.
+      assert.match(run.out, /FAIL t-items-001#1 .*no internal text/, run.out);
+      assert.doesNotMatch(run.out, /ERROR|stream missed/);
+      assert.match(run.out, /the stream of asst-1 is opened again \(a stored event was not delivered\)/);
+      assert.equal(claw.streamsOpened.get("asst-1"), 2, "opened once more, for the gap");
+      const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+      assert.equal(report.results[0].attempts[0].reopened?.length, 1);
+      assert.deepEqual(claw.calls.filter((c) => c.includes("/stop") || c.includes("/accept")), ["POST /v1/work-items/item-1/stop"]);
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it("R7d an attempt that ended in an error of the run is run again once", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    // The first try's say is stored but never delivered, not even by a new stream; the second try's is.
+    claw.withheld = (d) => d.type === "AssistantSay" && d.turn_message_id === "msg-1";
+    claw.router = (_content, id) => claw.turn(id, { say: "There are 3." });
+    const answer = { id: "t-a-001", pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: "how many?" }],
+      facts: [{ claim: "the count", oracle: { kind: "static", value: "3" } }] };
+    const r = runner(base, [answer], { EVAL_INFRA_RETRY: "1" });
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      assert.match(run.out, /ERROR t-a-001#1 the stream missed 1 stored event\(s\) of the case .*: running it again once/);
+      assert.match(run.out, /pass t-a-001#1 .*\(second try\)/);
+      assert.deepEqual(claw.sent.map((x) => x.content), ["how many?", "how many?"]);
+      const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+      const attempts = report.results[0].attempts;
+      assert.equal(attempts.length, 1, "the second try is the attempt");
+      assert.equal(attempts[0].pass, true);
+      assert.equal(attempts[0].error, undefined);
+      assert.match(attempts[0].retried, /the stream missed 1 stored event/);
+      assert.match(attempts[0].reopened?.[0] ?? "", / forced$/, "the first try's reopening is kept");
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it("R7e a retried attempt is recorded once: the first try's recording is dropped", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    // The first try is recorded, then its judge fails twice (busy gateway): an error of the run, after the recording. The second try
+    // is judged.
+    claw.judgeAnswers = [503, 503, "PASS: states the count"];
+    claw.router = (_content, id) => claw.turn(id, { say: "There are 3." });
+    const answer = { id: "t-a-002", pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: "how many?" }],
+      facts: [{ claim: "the count", oracle: { kind: "static", value: "3" } }] };
+    const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    writeFileSync(join(dir, "judge-key"), "judge-key-not-a-secret\n");
+    const r = runner(base, [answer], { EVAL_INFRA_RETRY: "1", EVAL_JUDGE_URL: `${base}/judge`, EVAL_JUDGE_MODEL: "m", EVAL_JUDGE_KEY_FILE: join(dir, "judge-key"),
+      EVAL_KEEP_TEXT: "1", EVAL_RECORD_DIR: join(dir, "records") }, dir);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      assert.match(run.out, /ERROR t-a-002#1 infra: judge answered 503: running it again once/);
+      assert.match(run.out, /pass t-a-002#1 .*\(second try\)/);
+      const recs = readFileSync(join(dir, "records", "assistant-recordings.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      assert.deepEqual(recs.map((x) => `${x.case_id}#${x.attempt}`), ["t-a-002#1"], "one recording for one attempt");
+      // Graded again offline, the case has the one attempt the live report has.
+      const off = runner(base, [answer], { EVAL_OFFLINE: join(dir, "records", "assistant-recordings.jsonl"), EVAL_OUT: join(dir, "offline") }, dir);
+      const offRun = await off.done;
+      const offline = JSON.parse(readFileSync(join(dir, "offline", "assistant.json"), "utf8"));
+      assert.equal(offline.results.find((x: any) => x.id === "t-a-002").attempts.length, 1, offRun.out);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it("R7b an assistant session still running before a case: nothing is sent", { timeout: 120_000 }, async () => {
