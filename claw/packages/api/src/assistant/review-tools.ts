@@ -587,19 +587,21 @@ async function refuseMerged(userId: string, sessionId: string, prs: readonly PrR
   const states = await reviewToolPorts.pullStates(userId, sessionId, prs);
   const merged = states.filter((s): s is Extract<PullState, { state: "merged" }> => s.state === "merged").map(({ state: _s, ...m }) => m);
   const closed = states.filter((s): s is Extract<PullState, { state: "closed" }> => s.state === "closed").map(({ state: _s, ...c }) => c);
-  if (!merged.length && !closed.length) return;
-  const open = prs.length - merged.length - closed.length;
+  const missing = states.filter((s) => s.state === "not_found").map((s) => s.pr);
+  if (!merged.length && !closed.length && !missing.length) return;
+  const open = prs.length - merged.length - closed.length - missing.length;
   const are = (n: number) => (n === 1 ? "is" : "are");
   const said = [
     ...(merged.length ? [`${merged.map((m) => m.pr).join(", ")} ${are(merged.length)} already merged on GitHub (data.merged: when, the merge commit)`] : []),
     ...(closed.length ? [`${closed.map((c) => c.pr).join(", ")} ${are(closed.length)} closed on GitHub without a merge (data.closed: when)`] : []),
+    ...(missing.length ? [`${missing.join(", ")} ${missing.length === 1 ? "does" : "do"} not exist on GitHub (data.not_found: its repository has no pull request of that number)`] : []),
   ];
   throw new ToolRefused(
-    merged.length ? "already_merged" : "already_closed",
+    merged.length ? "already_merged" : closed.length ? "already_closed" : "not_found",
     `${said.join("; ")}, so nothing was started or handed over. `
-      + "Tell the user each one is already merged, with merged_at and the short merge commit, or closed, with when, and that no review was asked for; ask nothing about the reviewer. "
-      + (open ? `The other ${open} ${are(open)} neither merged nor closed: say that only those would be reviewed, and call review_start with only them if the user's message still asks for it.` : "Offer the next step: nothing more is needed, or a review after the merge if they want one."),
-    { ...(merged.length ? { merged } : {}), ...(closed.length ? { closed } : {}) },
+      + "Tell the user each one is already merged, with merged_at and the short merge commit, closed, with when, or does not exist, with its number, and that no review was asked for; ask nothing about the reviewer. "
+      + (open ? `The other ${open} ${are(open)} open: say that only those would be reviewed, and call review_start with only them if the user's message still asks for it.` : "Offer the next step: nothing more is needed, or a review after the merge if they want one."),
+    { ...(merged.length ? { merged } : {}), ...(closed.length ? { closed } : {}), ...(missing.length ? { not_found: missing } : {}) },
   );
 }
 
@@ -615,11 +617,12 @@ export async function prState(claims: AssistantTokenClaims, args: { prs: unknown
   const userId = await inTransaction(async (q) => (await assertLiveRun(q, claims)).userId);
   const states = await reviewToolPorts.pullStates(userId, claims.sid, prs);
   const unread = states.filter((s) => s.state === "unknown").length;
-  return {
-    ok: true,
-    prs: states,
-    ...(unread ? { note: `${unread} could not be read on GitHub (state unknown): for those, call review_start as before, which reads them again.` } : {}),
-  };
+  const missing = states.filter((s) => s.state === "not_found").length;
+  const notes = [
+    ...(missing ? [`${missing} ${missing === 1 ? "does" : "do"} not exist (state not_found: GitHub read the repository and it has no pull request of that number): tell the user so, with the number they wrote, and start nothing for ${missing === 1 ? "it" : "them"}.`] : []),
+    ...(unread ? [`${unread} could not be read on GitHub (state unknown): for those, call review_start as before, which reads them again.`] : []),
+  ];
+  return { ok: true, prs: states, ...(notes.length ? { note: notes.join(" ") } : {}) };
 }
 
 // --- Tools ------------------------------------------------------------------------------------------------------

@@ -50,6 +50,7 @@
  *   S9  a pull request GitHub says is already merged is said so before anything else: nothing starts or is handed over, the reviewer is
  *       not asked about, and the refusal carries when it merged and its merge commit (2026-11-06 parity run, G3)
  *   S9c one GitHub says is closed without a merge is refused the same way (already_closed), with when it was closed
+ *   S9d one whose repository has no pull request of that number is refused as not_found, and pr_state says it does not exist
  *   S11 pr_state only reads: it answers where each pull request stands (merged with when and its merge commit, closed, open), starts,
  *       hands over and writes nothing, works in a turn that cannot act, and is the router's alone (2026-11-07 parity run, G3)
  *   R1  review_restart takes a review the user pointed at, and only a review
@@ -94,6 +95,7 @@ describe("assistant review tools", { skip }, () => {
   /** What GitHub says is merged, and closed without a merge, by `owner/repo#number`, and the pull requests each check was asked about. */
   let mergedOnGithub: Record<string, { merged_at: string; merge_commit: string }> = {};
   let closedOnGithub: Record<string, { closed_at: string }> = {};
+  let missingOnGithub = new Set<string>();
   const stateReads: string[][] = [];
 
   before(async () => {
@@ -120,7 +122,8 @@ describe("assistant review tools", { skip }, () => {
       const names = prs.map((p) => `${p.owner}/${p.repo}#${p.number}`);
       stateReads.push(names);
       return names.map((n) => (mergedOnGithub[n] ? { pr: n, state: "merged", ...mergedOnGithub[n] }
-        : closedOnGithub[n] ? { pr: n, state: "closed", ...closedOnGithub[n] } : { pr: n, state: "open", draft: false }));
+        : closedOnGithub[n] ? { pr: n, state: "closed", ...closedOnGithub[n] }
+        : missingOnGithub.has(n) ? { pr: n, state: "not_found" } : { pr: n, state: "open", draft: false }));
     }) as never;
   });
   after(async () => { Object.assign(rt.reviewToolPorts, saved); await w?.stop(); });
@@ -130,7 +133,7 @@ describe("assistant review tools", { skip }, () => {
       claw_github_review_settings, claw_assistant_review_handoffs CASCADE`);
     w.drains.length = 0;
     calls.start.length = 0; calls.restart.length = 0; calls.decide.length = 0;
-    mergedOnGithub = {}; closedOnGithub = {}; stateReads.length = 0;
+    mergedOnGithub = {}; closedOnGithub = {}; missingOnGithub = new Set(); stateReads.length = 0;
     startAnswer = async (request) => request.prs.map((p: Recorded, i: number) => ({ item_id: `kwi_s${i}`, seq: i + 1, pr: p.pr }));
     alice = await w.user("alice");
     bob = await w.user("bob");
@@ -816,6 +819,30 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(refusal.code, "already_merged");
     assert.deepEqual(Object.keys(refusal.data).sort(), ["closed", "merged"]);
     assert.equal(calls.start.length, 0);
+  });
+
+  test("S9d a pull request number its repository does not have is refused as not_found; pr_state says it does not exist", async () => {
+    missingOnGithub = new Set(["AMD-AGI/PrimusClaw#99999"]);
+    const turn = await userTurn(alice, "帮我 review AMD-AGI/PrimusClaw#99999");
+    let refusal: any;
+    await assert.rejects(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#99999"], merge: false }), (err: any) => { refusal = err; return true; });
+    assert.equal(refusal.code, "not_found");
+    assert.deepEqual(refusal.data, { not_found: ["AMD-AGI/PrimusClaw#99999"] });
+    assert.match(refusal.message, /does not exist on GitHub[\s\S]*nothing was started or handed over/);
+    assert.equal(calls.start.length, 0, "no review started");
+    // With a merged one beside it: already_merged, carrying both, and the open one is left to be asked for again.
+    mergedOnGithub = { "AMD-AGI/PrimusClaw#306": { merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6" } };
+    const mixed = await userTurn(alice, "帮我 review AMD-AGI/PrimusClaw#306、AMD-AGI/PrimusClaw#99999 和 AMD-AGI/PrimusClaw#312");
+    await assert.rejects(rt.reviewStart(mixed, { prs: ["AMD-AGI/PrimusClaw#306", "AMD-AGI/PrimusClaw#99999", "AMD-AGI/PrimusClaw#312"], merge: false }),
+      (err: any) => { refusal = err; return true; });
+    assert.equal(refusal.code, "already_merged");
+    assert.deepEqual(Object.keys(refusal.data).sort(), ["merged", "not_found"]);
+    assert.match(refusal.message, /The other 1 is open/);
+    assert.equal(calls.start.length, 0);
+    const answer = await rt.prState(mixed, { prs: ["AMD-AGI/PrimusClaw#99999", "AMD-AGI/PrimusClaw#312"] }) as Recorded;
+    assert.deepEqual(answer.prs, [{ pr: "AMD-AGI/PrimusClaw#99999", state: "not_found" }, { pr: "AMD-AGI/PrimusClaw#312", state: "open", draft: false }]);
+    assert.match(String(answer.note), /1 does not exist \(state not_found/);
+    assert.doesNotMatch(String(answer.note), /could not be read/);
   });
 
   test("S11 pr_state only reads where each pull request stands: nothing starts, is handed over or written", async () => {
