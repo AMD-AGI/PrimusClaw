@@ -585,6 +585,21 @@ test("CC19 a run's second check judges only what is new or changed", async () =>
   const r = await checkReport(nulReport("good [1] part\u0000tail"), nul.ports, undefined, nul.verdicts);
   assert.equal(r.supported, 1);
 
+  // The same line twice in one check, one found supported and one not: the key is kept as supported, never as rejected.
+  const twice = parseCiteCheck({ tools: ["t"] }, { fetchPage: async () => ({ ok: true, text: "x" }), judge: async () => null })!;
+  let look = 0;
+  const firstPorts: CiteCheckPorts = {
+    fetchPage: async () => ({ ok: true, text: "x" }),
+    judge: async ({ claims }) => { look++; return look === 1 ? claims.map((_, k) => k === 0) : claims.map(() => false); },
+  };
+  const dup = `- Statement on alpha [1].\n- Statement on alpha [1].\n\n[1]: A — ${A}`;
+  const d1 = await checkReport(dup, firstPorts, undefined, twice.verdicts);
+  assert.deepEqual([d1.supported, d1.unverified], [1, 1]);
+  assert.deepEqual([...twice.verdicts.values()], [true], "the shared key is kept as supported");
+  let judgedAgain = 0;
+  const d2 = await checkReport(dup, { fetchPage: async () => ({ ok: true, text: "x" }), judge: async ({ claims }) => { judgedAgain++; return claims.map(() => true); } }, undefined, twice.verdicts);
+  assert.deepEqual([d2.supported, d2.unverified, judgedAgain], [2, 0, 0]);
+
   // A statement that cited two sources and now cites one is judged again: the judge decides a different question.
   const parts = parseCiteCheck({ tools: ["t"] }, {
     fetchPage: async () => ({ ok: true, text: "x" }),

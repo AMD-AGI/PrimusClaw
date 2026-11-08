@@ -492,13 +492,18 @@ export async function checkReport(
   }
   // What this check settled, for the run's next check (a report sent back and delivered again): a page that supports a statement,
   // and a statement both looks said no to. A first look's no alone is not kept: the next check gives it its second look.
+  // Two pairs of one check can share a key (the same line twice, one statement citing two list entries with one address) and get
+  // different verdicts: a key any of them found supported is kept as supported, never overwritten by another's no.
+  const found = new Map<string, boolean>();
   checkedClaims.forEach((c, i) => {
     for (const n of c.numbers) {
       if (!sources.has(n)) continue;
-      if (supportedBy[i].has(n)) verdicts.set(key(n, i), true);
-      else if (secondNo.has(key(n, i))) verdicts.set(key(n, i), false);
+      const k = key(n, i);
+      if (supportedBy[i].has(n)) found.set(k, true);
+      else if (secondNo.has(k) && !found.has(k)) found.set(k, false);
     }
   });
+  for (const [k, v] of found) verdicts.set(k, v);
 
   const zh = isChinese(text);
   const mark = zh ? "（未证实）" : " (unverified)";
