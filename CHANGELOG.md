@@ -28,6 +28,11 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `CLAW_MEMORY_TURN_RECALL` (`on`, default off) and `CLAW_MEMORY_TURN_RECALL_USERS` (Claw user ids, the canary): before a router turn
+  answers, the server recalls the user's memory for their message and gives the model the entries it is about in full (at most 5,
+  `<memory-recall>`), beside the one-line index. A project's entries pushed out of a full index are then answered from memory instead
+  of being looked up on the web (E242 baseline, 15 memory-chain probes: the 6 wrong answers were turns that never called memory_recall).
+  Only the user's own active entries, only where the index is shown; not counted as reads; off leaves every turn as it was.
 - `CLAW_ASSISTANT_RESEARCH_USERS`: research reports for the named users only (Claw user ids, comma-separated; `*` is everyone)
   while `CLAW_ASSISTANT_RESEARCH` is off, so the evaluation identities get them first.
 - Research reports with checked citations (`CLAW_ASSISTANT_RESEARCH`, off by default): the assistant hands "research X / a comparison

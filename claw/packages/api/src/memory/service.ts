@@ -26,7 +26,7 @@ import { sessionWithholdsMemory } from "../github-review/session-tools.js";
 import { estimateTokens } from "../shared/tokens.js";
 import {
   BODY_MAX, NOTE_MAX, SIMILARITY_THRESHOLD, TITLE_MAX, isMemoryType, legacyType, memoryCommand, normalizeText,
-  quoteIsFrom, quoteSupports, scanInjection, scanSecrets, similarity, type MemoryType,
+  quoteIsFrom, quoteSupports, rankByMessage, scanInjection, scanSecrets, similarity, type MemoryType,
 } from "./gates.js";
 
 const logger = pino({ name: "memory-service" });
@@ -548,6 +548,26 @@ export async function recallMemory(
   const ids = rows.map((r) => r.id);
   if (ids.length) await db.query("UPDATE claw_memory_entries SET access_count = access_count + 1, last_accessed = NOW() WHERE user_id = $1 AND id = ANY($2::int[])", [userId, ids]);
   return rows;
+}
+
+/** At most this many entries are recalled for one message (`memoriesForMessage`). */
+export const MESSAGE_RECALL_LIMIT = 5;
+/** The share of a message's known wording an entry must hold to be recalled for it (`rankByMessage`). */
+export const MESSAGE_RECALL_MIN_SCORE = 0.25;
+
+/**
+ * The user's entries a message is about, best first (`rankByMessage`): what the catalogue would list, active and not past
+ * review, of this user only, over every binding (the router's index lists them all). Not counted as a use: nobody asked for
+ * them, and `access_count` stays the count of reads a model chose to make. One read of at most CLAW_MEMORY_MAX_ENTRIES rows,
+ * scored in memory.
+ */
+export async function memoriesForMessage(userId: string, message: string): Promise<MemoryRow[]> {
+  if (!message.trim()) return [];
+  const rows = (await db.query(
+    `SELECT ${ROW_COLUMNS} FROM claw_memory_entries WHERE user_id = $1 AND ${USER_ROWS} AND status = 'active' ORDER BY id DESC`, [userId],
+  )).rows.map(toRow).filter((r) => !r.due_for_review);
+  return rankByMessage(message, rows, (r) => `${r.title}\n${r.body}`, { limit: MESSAGE_RECALL_LIMIT, minScore: MESSAGE_RECALL_MIN_SCORE })
+    .map((x) => x.item);
 }
 
 // ===== The catalogue =====

@@ -27,7 +27,7 @@ import { readGithubMcpSettings } from "../github-mcp/settings.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
-import { reviewMemoryBlock, routerMemoryParts, workerMemoryBlock } from "./memory-tools.js";
+import { memoryTurnRecallOn, reviewMemoryBlock, routerMemoryParts, routerTurnRecall, workerMemoryBlock } from "./memory-tools.js";
 import {
   ASSISTANT_MCP_SERVER, confirmationRef, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
   ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, ROUTER_DISCIPLINE_PROMPT_VERSION, WORKER_DISCIPLINE_PROMPT_VERSION, renderModelChoice,
@@ -355,6 +355,11 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       withSystemAppend(task, memory.prompt);
       if (memory.entries) state.push(memory.entries);
     }
+    // The entries the person's message is about, in full, beside the index (`CLAW_MEMORY_TURN_RECALL`): only where the index is shown.
+    const recall = memory?.entries && message?.content && memoryTurnRecallOn(role.userId)
+      ? await routerTurnRecall(role.userId, sessionId, message.content)
+      : null;
+    if (recall) state.push(recall.text);
     const devenv = devenvToolsOn();
     if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS, send: true }));
     // Who it is (Clawy, with claw_self_status) and how to count what a lookup returned: the same on every turn, so it stays cached.
@@ -387,7 +392,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     task.prompt = withTurnState(stringField(task, "prompt"), state);
     logger.info({
       sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION, base: ROUTER_PROMPT_VERSION,
-      ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
+      ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(recall ? { turnRecall: recall.ids } : {}),
+      ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
       ...(proactiveSection ? { proactive: ROUTER_PROACTIVE_PROMPT_VERSION } : {}),
       ...(devenv ? { devenv: ROUTER_DEVENV_PROMPT_VERSION } : {}),
       read: ROUTER_READ_PROMPT_VERSION, write: ROUTER_WRITING_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),

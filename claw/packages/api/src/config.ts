@@ -575,6 +575,15 @@ export const CLAW_ASSISTANT_REVIEW_ITEMS = envBool("CLAW_ASSISTANT_REVIEW_ITEMS"
 // read-only index, a review item's session the entries bound to its item. Needs CLAW_ASSISTANT_ENABLED and
 // CLAW_MEMORY_ENABLED as well; anything else leaves every assistant turn exactly as without memory.
 export const CLAW_ASSISTANT_MEMORY_TOOLS = env("CLAW_ASSISTANT_MEMORY_TOOLS", "off").trim().toLowerCase() === "on";
+// `on` recalls the user's memory for every router turn before the model answers (`assistant/memory-tools.ts`, `routerTurnRecall`):
+// the entries the person's message is about, in full, go with the message, so a name the index does not list (a project's entries
+// pushed out of a full index) is answered from memory instead of looked up on the web. Off (the default), only the users named in
+// CLAW_MEMORY_TURN_RECALL_USERS (Claw user ids, comma-separated) get it: the canary, opened for the evaluation identities first.
+// Needs the assistant's memory (CLAW_ASSISTANT_MEMORY_TOOLS) and the user's own opt-in, as every read of their memory does.
+export const CLAW_MEMORY_TURN_RECALL = env("CLAW_MEMORY_TURN_RECALL", "off").trim().toLowerCase() === "on";
+export const CLAW_MEMORY_TURN_RECALL_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_MEMORY_TURN_RECALL_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
 // GitHub events for work items: an item watches a pull request, and new comments, reviews and failed CI
 // reach its worker without anybody mentioning it (`assistant/github-events.ts`). Needs CLAW_ASSISTANT_ENABLED
 // as well; off, there are no subscription routes, no tools for them and nothing polls.
