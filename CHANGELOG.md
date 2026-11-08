@@ -28,6 +28,8 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `CLAW_ASSISTANT_RESEARCH_USERS`: research reports for the named users only (Claw user ids, comma-separated; `*` is everyone)
+  while `CLAW_ASSISTANT_RESEARCH` is off, so the evaluation identities get them first.
 - Research reports with checked citations (`CLAW_ASSISTANT_RESEARCH`, off by default): the assistant hands "research X / a comparison
   report on X and Y" to a background work item; the worker searches, reads the pages and delivers a Markdown report whose every finding
   cites a numbered source. Before the file is stored, Brain opens every cited source with the run's own `web_fetch` and asks a small

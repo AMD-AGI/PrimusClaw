@@ -319,7 +319,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // What it writes itself (a document, a draft, a translation), and how a file or a comment of its reaches the user (`writing-prompt.ts`).
     withSystemAppend(task, renderRouterWritingSection({ comment: assistantSchedulesOn() }));
     // A research report is a work item, never text the router writes from what it knows: after the writing section, which it narrows.
-    const research = assistantResearchOn();
+    const research = assistantResearchOn(role.userId);
     if (research) withSystemAppend(task, ROUTER_RESEARCH_PROMPT);
     const asked = await askedOfOthersManifest(role.userId);
     const state = [renderRouterItems(await routerManifest(role.userId), asked, new Date(), asked.length ? await askedOfOthersTotalsManifest(role.userId) : undefined)];
@@ -411,7 +411,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     const memory = await workerMemoryBlock(role.userId, started.itemId, sessionId);
     if (memory) withSystemAppend(task, memory);
     // A research report: its method, and its deliver_text checked against its citations by Brain before the file is stored.
-    const research = applyWorkerResearch(task, (text) => withSystemAppend(task, text));
+    const research = applyWorkerResearch(task, (text) => withSystemAppend(task, text), assistantResearchOn(role.userId));
     logger.info({
       sessionId, taskId, itemId: started.itemId, generation: started.generation,
       prompt: discipline ? WORKER_DISCIPLINE_PROMPT_VERSION : WORKER_PROMPT_VERSION,
