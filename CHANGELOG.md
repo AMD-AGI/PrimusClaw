@@ -122,6 +122,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A research report's citation check no longer marks whole batches unverified when its judge answers nothing: the judge has a
+  4096-token output budget (at 1024 claude-haiku-5.5 spent it thinking and replied empty), a batch with no answer is asked once more,
+  and one still unanswered is marked not checked (未核对), counted apart, logged (`cite_check.judge_no_answer`) and counted in
+  `claw_cite_check_judge_total{outcome}`; every checked statement is counted in `claw_cite_check_statements_total{verdict}`.
 - `pr_state` says a pull request number its repository does not have is `not_found` (GitHub answered 404 for the pull request and
   read the repository), not `unknown`/`read_failed`; a 404 from a repository the person cannot read stays `unknown`. `review_start`
   refuses such a number as `not_found`, and the router says it does not exist. Before, "请 X 帮我审 #483 和 #99999" was answered

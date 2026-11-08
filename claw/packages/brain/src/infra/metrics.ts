@@ -63,6 +63,18 @@ const skillStageTotal = new Counter({
   labelNames: ["source", "outcome"] as const,
   registers: [registry],
 });
+const citeCheckJudgeTotal = new Counter({
+  name: "claw_cite_check_judge_total",
+  help: "Judge calls of a research report's citation check, by outcome: answered, answered on its one retry, or no answer after it (the batch's statements are then not checked).",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+const citeCheckStatementsTotal = new Counter({
+  name: "claw_cite_check_statements_total",
+  help: "Cited statements of the research reports checked before delivery, by verdict: supported, unverified, or not checked.",
+  labelNames: ["verdict"] as const,
+  registers: [registry],
+});
 const platformDefaultChatsTotal = new Counter({
   name: "claw_platform_default_chats_total",
   help: "Chats that were offered at least one platform-default skill.",
@@ -791,6 +803,16 @@ export const metrics = {
   /** One platform-default item resolved, skipped or failed. */
   onPlatformDefault(kind: "skill" | "mcp" | "config", outcome: "ok" | "failed" | "skipped", reason: string): void {
     platformDefaultTotal.inc({ kind, outcome, reason });
+  },
+  /** One judge call of a citation check (`tools/cite-check.ts`): answered, answered on its retry, or no answer after it. */
+  onCiteCheckJudge(outcome: "answered" | "answered_on_retry" | "no_answer"): void {
+    citeCheckJudgeTotal.inc({ outcome });
+  },
+  /** The verdicts of one checked report's statements. */
+  onCiteCheckStatements(supported: number, unverified: number, unchecked: number): void {
+    if (supported) citeCheckStatementsTotal.inc({ verdict: "supported" }, supported);
+    if (unverified) citeCheckStatementsTotal.inc({ verdict: "unverified" }, unverified);
+    if (unchecked) citeCheckStatementsTotal.inc({ verdict: "not_checked" }, unchecked);
   },
   /** One skill staged for a turn: `outcome` says whether its files were downloaded. */
   onSkillStage(source: "plugin" | "tool", outcome: "hit" | "joined" | "downloaded"): void {

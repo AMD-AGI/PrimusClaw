@@ -11,6 +11,13 @@ import { judgePrompt, parseVerdicts, type CheckedPage, type CiteCheckPorts } fro
 import type { WebFetchService } from "./fetch.js";
 import type { WebToolContext, WebToolOutcome } from "./types.js";
 
+/**
+ * The judge's output budget. A gateway model that thinks first spends it before it answers: at 1024, claude-haiku-5.5 returned an
+ * empty reply cut at max_tokens for batches of 14 and 15 statements (2026-11-08, 6 of 6 tries), and every statement of those batches
+ * went out unverified; at 4096 it answered 6 of 6.
+ */
+export const CITE_CHECK_JUDGE_MAX_TOKENS = 4096;
+
 /** The most parts of one page read (each `WEB_FETCH_MAX_OUTPUT_CHARS`): a long page's support may be past its first part. */
 export const CITE_CHECK_PAGE_PARTS = 3;
 
@@ -60,7 +67,7 @@ export function webCiteCheckPorts(fetch: WebFetchService | undefined, ctx: WebTo
     judge: async ({ url, page, claims }, signal) => {
       const { system, user } = judgePrompt(url, page, claims);
       const resp = await ctx.anthropic.messages.create(
-        { model: WEB_FETCH_SUMMARIZE_MODEL, max_tokens: 1024, system, messages: [{ role: "user", content: user }] },
+        { model: WEB_FETCH_SUMMARIZE_MODEL, max_tokens: CITE_CHECK_JUDGE_MAX_TOKENS, system, messages: [{ role: "user", content: user }] },
         { signal },
       );
       const usage = resp.usage as unknown as Record<string, number>;
