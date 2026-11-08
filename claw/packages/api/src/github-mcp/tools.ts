@@ -238,16 +238,21 @@ export function listAnswer(
     page?: number; count_exact?: boolean;
   },
 ): Record<string, unknown> {
-  const head = {
+  const headOf = (refs: boolean) => ({
     total_count: meta.total_count ?? null, shown: 0, complete: false, ...(meta.by_repo ? { by_repo: meta.by_repo } : {}),
-    ...(meta.refs_by_repo ? { refs_by_repo: meta.refs_by_repo } : {}),
+    ...(meta.refs_by_repo && refs ? { refs_by_repo: meta.refs_by_repo } : {}),
+    ...(meta.refs_by_repo && !refs ? { refs_by_repo_cut: "too many repositories for every number to fit: by_repo counts them; list one repository's with its repo: qualifier" } : {}),
     ...(meta.since ? { since: meta.since } : {}),
     ...(meta.fixtures_excluded !== undefined && meta.fixtures_excluded !== 0 ? { fixtures_excluded: meta.fixtures_excluded } : {}),
     ...(meta.note ? { note: meta.note } : {}),
-  };
+  });
+  // The envelope's own size, with room for the fields filled in below (the partial line among them). An envelope that leaves no room
+  // for them drops its numbers per repository first (by_repo still counts them): an answer over the cap is cut in two by Brain, and
+  // is no longer JSON at all.
+  let head = headOf(true);
+  if (JSON.stringify(head).length + ENVELOPE_ROOM + PARTIAL_ROOM > GITHUB_LIST_MAX_CHARS) head = headOf(false);
   const kept: unknown[] = [];
-  // The envelope's own size, with room for the fields filled in below (the partial line among them).
-  let size = JSON.stringify(head).length + 160 + PARTIAL_ROOM;
+  let size = JSON.stringify(head).length + ENVELOPE_ROOM + PARTIAL_ROOM;
   for (const item of items) {
     const n = JSON.stringify(item).length + 1;
     if (size + n > GITHUB_LIST_MAX_CHARS) break;
@@ -286,8 +291,9 @@ export function partialLine(shown: number, total: number | null, at: { page?: nu
     + "count, a total or \"all\"/\"only N\", read next_page while there is one (or narrow: since, state, author, a repository); if "
     + `you answer from these alone, say in the answer that it covers only these: ${these}.`;
 }
-/** Room the envelope keeps for `partialLine`. */
-const PARTIAL_ROOM = 460;
+/** Room the envelope keeps for `partialLine`, and for its other fields filled in after the items are chosen. */
+export const PARTIAL_ROOM = 460;
+const ENVELOPE_ROOM = 160;
 
 /**
  * One page of a list GitHub pages itself (`per_page`, `page`): a page shorter than asked is the list's end, which gives the
@@ -337,8 +343,10 @@ async function scanPulls(
   // the same filter throughout, so that the items before it are counted the same way (a fixture left out of an earlier page moves
   // every later one); and one more than the page needs, to know whether another follows. A list in creation order with no author
   // filter is read as far as GitHub pages; a filtered or reordered one at most MAX_DEEP_PAGES, past which the note names the search.
+  // One ordered by when it closed or merged reads on until the page is settled: it is read in update order, so a later page can still
+  // hold one that closed or merged after some already read.
   const limit = !ordered && author === null ? MAX_LIST_PAGES : MAX_DEEP_PAGES;
-  for (let n = 1; n <= limit && !ended && !settled && !windowRead && (n <= MAX_SCAN_PAGES || since !== null || kept.length <= want); n++) {
+  for (let n = 1; n <= limit && !ended && !settled && !windowRead && (n <= MAX_SCAN_PAGES || since !== null || ordered || kept.length <= want); n++) {
     const q = { ...filter, state: state === "merged" ? "closed" : state, sort: ordered ? "updated" : "created", direction: "desc", per_page: 100, page: n };
     const list = (await gh.get<any[]>(repoPath(r, "/pulls"), q)).json ?? [];
     read += list.length;
@@ -375,13 +383,23 @@ async function scanPulls(
         `read the ${read} most recently ${ordered ? "updated" : "created"} ${what}pull requests, not all of them: how many there are in all is not known`
           + (ordered && !settled ? `, and older ones may have ${state === "merged" ? "merged" : "closed"} later than some shown` : "")
           + (all.length <= want
-            ? `; pr_list reads no further: for older ones search with issue_search (is:pr repo:${r.owner}/${r.repo}${state === "all" ? "" : ` is:${state}`}`
-              + `${author !== null ? ` author:${author}` : ""}), or narrow with since`
+            ? `; pr_list reads no further: for older ones search with issue_search (${searchOfList(r, state, author, filter, opts.sinceText ?? null)})`
+              + (since === null ? ", or narrow with since" : "")
             : ""),
       ]),
       ...(fixtures ? [`${fixtures} release-gate fixture pull request(s) of those read are left out (test fixtures, never the project's work); include_fixtures: true lists them`] : []),
     ].join("; ") || undefined,
   });
+}
+
+/** The issue_search query that reads the same pull requests as a pr_list call: its state, author, branches and window. */
+function searchOfList(r: { owner: string; repo: string }, state: PullState, author: string | null, filter: Record<string, string>, since: string | null): string {
+  const when = state === "merged" ? "merged" : state === "closed" ? "closed" : "created";
+  const head = filter.head ? filter.head.slice(filter.head.indexOf(":") + 1) : null;
+  return [
+    `is:pr repo:${r.owner}/${r.repo}`, ...(state === "all" ? [] : [`is:${state}`]), ...(author !== null ? [`author:${author}`] : []),
+    ...(filter.base ? [`base:${filter.base}`] : []), ...(head ? [`head:${head}`] : []), ...(since ? [`${when}:>=${since.slice(0, 19)}Z`] : []),
+  ].join(" ");
 }
 
 /** `since` as a time, or a refusal: a date the model wrote is checked, never guessed at. */

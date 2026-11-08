@@ -641,10 +641,12 @@ describe("B lists a turn sees whole", () => {
     seen = [];
     const m11 = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", per_page: 50, page: 11 })).text);
     assert.deepEqual([m11.items.length, m11.next_page], [50, 12], "read on past the scan to the page asked for");
-    assert.equal(seen.length, 6);
+    assert.equal(seen.length, 20, "every one merged long before it was last updated: never settled, read to the deep limit");
     const deep = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", per_page: 50, page: 50 })).text);
     assert.deepEqual([deep.items.length, deep.next_page ?? null, deep.total_count], [0, null, null]);
     assert.match(deep.note, /pr_list reads no further: for older ones search with issue_search \(is:pr repo:o\/r is:merged\), or narrow with since/);
+    const narrowed = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", base: "main", head: "o:feat", per_page: 50, page: 50 })).text);
+    assert.match(narrowed.note, /issue_search \(is:pr repo:o\/r is:merged base:main head:feat\)/, "the search carries the list's own filters");
     // One person's, sparse: three of 700, two of them past the first 500.
     const sparse = Array.from({ length: 700 }, (_, i) => pr(1000 - i, { user: { login: [10, 600, 650].includes(i) ? "bob" : "alice" } }));
     respond = (url) => {
@@ -656,6 +658,45 @@ describe("B lists a turn sees whole", () => {
     assert.deepEqual([b1.items.map((p: any) => p.number), b1.next_page, b1.total_count], [[990, 400], 2, null]);
     const b2 = JSON.parse((await call(c, "pr_list", { repo: "o/r", author: "bob", per_page: 2, page: 2 })).text);
     assert.deepEqual([b2.items.map((p: any) => p.number), b2.next_page ?? null, b2.total_count], [[350], null, 3]);
+  });
+
+  test("B28 a list answer stays under its cap with the partial line, whatever its envelope holds; a merged list reads on until its page is settled", async () => {
+    const { listAnswer, partialLine, PARTIAL_ROOM } = await import("../src/github-mcp/tools.js");
+    const { GITHUB_LIST_MAX_CHARS } = await import("@claw/protocol");
+    for (const [shown, total, at] of [[100, 123456789, { page: 100, more: true }], [100, null, { page: 100, more: true }], [100, 123456789, { page: 100, more: true, exact: false }]] as const) {
+      const line = partialLine(shown, total, at);
+      assert.ok(JSON.stringify(line).length + 12 <= PARTIAL_ROOM, `${line.length}`);
+    }
+    // 240 repositories, as a search across an organisation can give: every number of them leaves no room for the rest.
+    const repos = Array.from({ length: 240 }, (_, i) => `some-organisation/repository-${i}`);
+    const byRepo = Object.fromEntries(repos.map((r) => [r, 1]));
+    const refs = Object.fromEntries(repos.map((r, i) => [r, [`#${1000 + i}`, `#${2000 + i}`]]));
+    const items = Array.from({ length: 50 }, (_, i) => ({ repo: repos[i], number: i, title: `pull request ${i}`, url: `https://github.com/${repos[i]}/pull/${i}` }));
+    const out = listAnswer(items, { total_count: 4000, complete: false, next_page: 2, by_repo: byRepo, refs_by_repo: refs, page: 1, note: "n".repeat(300) });
+    assert.ok(JSON.stringify(out).length <= GITHUB_LIST_MAX_CHARS, `${JSON.stringify(out).length}`);
+    assert.equal(out.refs_by_repo, undefined);
+    assert.match(String(out.refs_by_repo_cut), /by_repo counts them/);
+    assert.ok(typeof out.partial === "string");
+    const small = listAnswer(items.slice(0, 2), { total_count: 2, complete: true, by_repo: { a: 2 }, refs_by_repo: { a: ["#1", "#2"] } });
+    assert.deepEqual(small.refs_by_repo, { a: ["#1", "#2"] }, "kept where it fits");
+
+    // Merged ones read in update order: one updated late on page 7 merged before most of what pages 1-6 hold, and one on page 8
+    // merged after the page's last; the page is settled only once nothing unread can come before it.
+    const t = (min: number) => new Date(Date.UTC(2026, 10, 7, 12) - min * 60_000).toISOString();
+    respond = (url) => {
+      if (url.pathname !== "/repos/o/r/pulls") return json({}, 404);
+      const n = Number(url.searchParams.get("page"));
+      if (n > 8) return json([]);
+      return json(Array.from({ length: 100 }, (_, i) => {
+        const k = (n - 1) * 100 + i;
+        // Updated in order k; merged long before, except one on page 8 that merged just now (updated as the oldest of its page).
+        return pr(10_000 - k, { state: "closed", updated_at: t(k), closed_at: t(k), merged_at: k === 750 ? t(0) : t(5000 + k) });
+      }));
+    };
+    seen = [];
+    const top = JSON.parse((await call(await connect(token()), "pr_list", { repo: "o/r", state: "merged", per_page: 3 })).text);
+    assert.equal(top.items[0].number, 10_000 - 750, "the one that merged last, from page 8");
+    assert.ok(seen.length > 5, `${seen.length} pages read`);
   });
 
   test("B22 the list reads still name each item they answer as a source, now from the answer's items", async () => {
