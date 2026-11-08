@@ -141,6 +141,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A research report's citation check reads a table row cell by cell: each cited cell is a statement of its own, read with
+  its row label and column header and judged only against the sources it cites, never with the other cells of the row. A
+  statement citing several sources is supported when any of them supports it, and the judge is told the page need support
+  only its own part.
 - A research report's citation check looks again at what it rejects: a statement no source was found to support, whose judge
   said no, is judged once more on that source with its own excerpt (up to 10,000 characters, the whole page when short enough);
   supported then, it is supported. A statement whose line has fewer than 8 letters (a table row of numbers) that no source
