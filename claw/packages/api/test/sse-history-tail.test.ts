@@ -207,10 +207,10 @@ test("the next page waits while the client has not taken the last one, and stops
   assert.equal(await drained(Object.assign(fake(), { destroyed: true }), false), false, "a closed response is not written to");
 });
 
-test("events stored while the history is sent do not extend it: they are the live part", async () => {
+test("the history is read to the newest row when it starts, once more for what came meanwhile, and no further", async () => {
   await seed(HISTORY_PAGE_ROWS + 100);
   let next = HISTORY_PAGE_ROWS + 100;
-  let writes = 5;   // a page more after each page read, five times (an unbounded history would send them all)
+  let writes = 5;   // a writer adds a page after each page is read, five times (an unbounded history would send them all)
   afterPage = async () => {
     if (writes-- <= 0) return;
     const from = next + 1;
@@ -218,8 +218,11 @@ test("events stored while the history is sent do not extend it: they are the liv
     await seed(next, 0, from);
   };
   const s = await stream("?history=all");
-  assert.deepEqual(s.ns, range(1, HISTORY_PAGE_ROWS + 100));
-  assert.equal(s.marker?.count, HISTORY_PAGE_ROWS + 100);
+  // 600 when it started, and the 1000 stored while those two pages were sent; what came while those were sent is live.
+  const sent = HISTORY_PAGE_ROWS + 100 + 2 * HISTORY_PAGE_ROWS;
+  assert.deepEqual(s.ns, range(1, sent));
+  assert.equal(s.marker?.count, sent);
+  assert.equal(next, HISTORY_PAGE_ROWS + 100 + 5 * HISTORY_PAGE_ROWS, "the writer went on past what was sent");
 });
 
 test("events the stream never sends do not take places in the tail", async () => {

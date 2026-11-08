@@ -236,9 +236,8 @@ function forwardFilterSql(opts: ForwardOpts, params: unknown[]): string | null {
 export const HISTORY_PAGE_ROWS = 500;
 
 /**
- * Where an SSE history starts: after the row `afterId` (0: from the first), and whether older events were left out. It
- * ends at row `upTo`, the newest row when it was asked: what is stored later reaches the client live, so a session
- * written to faster than its history is sent still gets to its live events.
+ * Where an SSE history starts: after the row `afterId` (0: from the first), and whether older events were left out.
+ * `upTo`: the newest row when it was asked, where the first reading of the history ends (see the route).
  */
 export interface HistoryStart {
   afterId: number;
@@ -280,6 +279,15 @@ async function cursorRowId(sessionId: string, after: string): Promise<number | n
   return Number(before?.id ?? 0);
 }
 
+/** The newest row of the session (0: none). */
+async function newestRowId(sessionId: string): Promise<number> {
+  const newest = (await db.query(
+    "SELECT COALESCE(MAX(id), 0) AS id FROM claw_session_events WHERE session_id = $1",
+    [sessionId],
+  )).rows[0] as { id: number | string } | undefined;
+  return Number(newest?.id ?? 0);
+}
+
 /**
  * Where an SSE connection's history starts. After `after` when it names a place in this session; otherwise the
  * whole history when `all`, else the last `tail` events the caller is shown (the sub-agent filter applies), with
@@ -288,11 +296,7 @@ async function cursorRowId(sessionId: string, after: string): Promise<number | n
 export async function historyStart(
   sessionId: string, after: string | null, all: boolean, tail: number, opts: ForwardOpts,
 ): Promise<HistoryStart> {
-  const newest = (await db.query(
-    "SELECT COALESCE(MAX(id), 0) AS id FROM claw_session_events WHERE session_id = $1",
-    [sessionId],
-  )).rows[0] as { id: number | string } | undefined;
-  const upTo = Number(newest?.id ?? 0);
+  const upTo = await newestRowId(sessionId);
   if (after) {
     const afterId = await cursorRowId(sessionId, after);
     if (afterId !== null) return { afterId, upTo, hasMore: false };
@@ -496,23 +500,36 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       // has no `?after=`. Without it the reconnect replays the history again.
       // Without either, only the last SSE_HISTORY_TAIL events are sent (the marker says `has_more`), unless the client
       // asks for `?history=all`: a long session's whole history was read into this process on every connection.
-      // The live consumer is made before the newest row is read (`start.upTo`), so what is stored after that row
-      // arrives live; made lazily after the history, as it was, what was stored while the history was being sent would
-      // be in neither. (An event published just before the consumer began and stored just after the read still is.)
+      // The history is read up to the newest row when it starts (`start.upTo`), then once more up to the newest row
+      // when that is sent (what was stored meanwhile), and no further: a session written to faster than its history is
+      // sent still reaches its live events. The live consumer is made first, so an event stored after the second read
+      // was published after the consumer began and arrives live; one published before it began is stored, in practice
+      // within milliseconds, before the second read. (The consumer used to be made after the history, and an event
+      // published between the read and the consumer was in neither.) What comes both ways is sent once (seenIds).
       await subscription.ready();
       const afterEventId = req.query.after || lastEventIdOf(req.headers["last-event-id"]) || null;
       const start = await historyStart(sessionId, afterEventId, req.query.history === "all", SSE_HISTORY_TAIL, fwdOpts);
       let cursor = start.afterId;
+      let upTo = start.upTo;
       let sent = 0;
-      for (;;) {
-        const rows = await historyPage(sessionId, cursor, start.upTo, fwdOpts);
-        const page = historyFrames(rows, fwdOpts, seenAppEvents);
-        for (const eid of page.seenIds) seenIds.add(eid);
-        for (const frame of page.frames) sseWrite(frame);
-        sent += page.frames.length;
-        if (rows.length < HISTORY_PAGE_ROWS) break;
-        cursor = Number(rows[rows.length - 1].id);
-        if (!(await drained(res, backlog))) break;
+      let open = true;
+      for (let pass = 0; pass < 2 && open; pass++) {
+        if (pass === 1) {
+          const newest = await newestRowId(sessionId);
+          if (newest <= upTo) break;
+          upTo = newest;
+        }
+        for (;;) {
+          const rows = await historyPage(sessionId, cursor, upTo, fwdOpts);
+          const page = historyFrames(rows, fwdOpts, seenAppEvents);
+          for (const eid of page.seenIds) seenIds.add(eid);
+          for (const frame of page.frames) sseWrite(frame);
+          sent += page.frames.length;
+          if (!(await drained(res, backlog))) { open = false; break; }
+          if (rows.length < HISTORY_PAGE_ROWS) break;
+          cursor = Number(rows[rows.length - 1].id);
+        }
+        cursor = upTo;
       }
       sseWrite(historyCompleteFrame(sent, start.hasMore));
 
