@@ -32,7 +32,7 @@ import { metrics } from "../infra/metrics.js";
 import { bareItemNumbers, internalTextIn, userWordsOf } from "./internal-text.js";
 import { parseItemRef } from "./item-ref.js";
 import { detectLanguage, languageToAnswerIn, replyLanguageLine, replyLanguageMismatch, requestedTextLanguage } from "./language.js";
-import { earlierConversationItemOf, WORK_EVENT_PREFIX } from "./prompts.js";
+import { answerEventItemOf, earlierConversationItemOf, WORK_EVENT_PREFIX } from "./prompts.js";
 import { redactCommandSecrets } from "../notifications/approval-target.js";
 import { assistantPluginId } from "./read-tools.js";
 import { requestedItemOf, requesterViewOf, routerView, type RequesterView } from "./requester-view.js";
@@ -164,12 +164,6 @@ async function assistantUser(sessionId: string): Promise<string> {
 
 export { internalTextIn } from "./internal-text.js";
 
-/** The item whose answer woke this router turn (`formatWorkEvent` with kind `answer`) in its prompt, or undefined. */
-function answerItemOf(prompt: string | null | undefined): string | undefined {
-  return prompt?.match(ANSWER_EVENT_RE)?.[1];
-}
-const ANSWER_EVENT_RE = new RegExp(`^${WORK_EVENT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} #\\d+ \\(item_id: (kwi_[0-9A-Za-z]+)\\) answer:`);
-
 /** How many of the user's items, newest first, a say is checked against for numbers said without their titles. */
 const SAY_ITEMS_CHECKED = 500;
 /** How many of the user's earlier messages say which language they write in, when the one a turn answers does not (as `role-profile.ts`). */
@@ -260,7 +254,7 @@ async function sayOnce(
   }
   // A say in the turn an answer woke that names no item is about that item: recorded so, it is the say the silent sweep looks
   // for, and the answer is not announced a second time.
-  const itemId = args.item_id?.trim() ? args.item_id : answerItemOf(run?.prompt);
+  const itemId = args.item_id?.trim() ? args.item_id : answerEventItemOf(run?.prompt);
   if (typeof args.text === "string") await assertSayReadable(claims, userId, run?.prompt ?? "", args.text, itemId);
   if (typeof args.item_id === "string" && args.item_id.trim()) await assertStatusChecked(claims, userId, run?.began, args.item_id.trim());
   // A turn that may still hand a review to the person's channel: what it says goes out when it ends, or never if it hands one over.

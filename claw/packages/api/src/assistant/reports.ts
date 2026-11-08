@@ -16,7 +16,7 @@ import { isDeepStrictEqual } from "node:util";
 import pino from "pino";
 import { inTransaction, isFailoverError, neverCommitted, type Querier, type StatementRunner } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
-import { announceItemDeliveries } from "./deliveries.js";
+import { announceItemDeliveries, hasUnannouncedDeliveries } from "./deliveries.js";
 import { queueServerMessage, drainSessionIfIdle } from "./messages.js";
 import { recordNeedsYouFallback, storeAnswerWhole, type SayDeps } from "./outbound.js";
 import { formatWorkEvent, SAY_BRIEF_CHARS } from "./prompts.js";
@@ -69,10 +69,28 @@ async function repeatsLastReport(query: Querier, run: ReportRun, report: WorkRep
 /**
  * An answer longer than a usual message is said to the user whole by the system (`storeAnswerWhole`, in the report's own
  * transaction), formatted as the worker wrote it, instead of being retyped by the router into one; the router is told it was
- * sent. A short one is the router's to say.
+ * sent. So is one that comes with files the worker delivered (`withFiles`): the files are shown the moment the report lands
+ * (`announceDeliveries`), and what the user asked about them ("then tell me what its first line says") goes with them, not after
+ * a second turn of the router that may be slow, or stopped by the user's next message (release gate run 1108021655-0c1088: the
+ * chat showed "delivered result.md (28 B)" and no answer). Any other short one is the router's to say.
  */
-export function answerSentWhole(kind: ReportKind, summary: string): boolean {
-  return kind === "answer" && summary.length > SAY_BRIEF_CHARS;
+export function answerSentWhole(kind: ReportKind, summary: string, withFiles = false): boolean {
+  return kind === "answer" && (withFiles || summary.length > SAY_BRIEF_CHARS);
+}
+
+/**
+ * Whether an answer comes with files the user has not been told of yet (`hasUnannouncedDeliveries`), read before the report's
+ * transaction, as the store is not to be waited on with the item locked. False for any other report, and when it cannot be read:
+ * the answer is then the router's to say, as it was.
+ */
+async function answerWithFiles(itemId: string, report: WorkReport): Promise<boolean> {
+  if (report.kind !== "answer" || answerSentWhole(report.kind, report.summary)) return false;
+  try {
+    return await reportPorts.hasUnannouncedDeliveries(itemId);
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.name, itemId }, "assistant.answer_files_not_read");
+    return false;
+  }
 }
 
 /**
@@ -82,7 +100,8 @@ export function answerSentWhole(kind: ReportKind, summary: string): boolean {
 export const reportPorts: {
   sayDeps: SayDeps;
   tellUnwoken: (input: { itemId: string }, deps: SayDeps) => Promise<unknown>;
-} = { sayDeps: {}, tellUnwoken: recordNeedsYouFallback };
+  hasUnannouncedDeliveries: (itemId: string) => Promise<boolean>;
+} = { sayDeps: {}, tellUnwoken: recordNeedsYouFallback, hasUnannouncedDeliveries };
 
 /**
  * What waking the item's owner's assistant came to (`queueRouterWake`): queued in the router's session; refused, as a session that
@@ -161,6 +180,7 @@ export async function ingestReport(
   let written: Written;
   // The answer this report stored for sending, for the case the COMMIT's own answer is lost (see the catch).
   let answerStored: { settle: () => void } | null = null;
+  const withFiles = await answerWithFiles(run.itemId, recorded);
   try {
     written = await inTransaction(async (query): Promise<Written> => {
       answerStored = null;
@@ -174,7 +194,7 @@ export async function ingestReport(
       if (!applied.applied) return { outcome: { status: "stale" }, wake: null };
       // Stored for sending with the report itself, so the router below is told "sent in full" only of an answer that will be:
       // a failure to store it fails the report, which the worker sends again, rather than leaving an answer nobody says.
-      const answer = answerSentWhole(recorded.kind, recorded.summary)
+      const answer = answerSentWhole(recorded.kind, recorded.summary, withFiles)
         ? await storeAnswerWhole(query, run.itemId, reportPorts.sayDeps)
         : null;
       answerStored = answer;

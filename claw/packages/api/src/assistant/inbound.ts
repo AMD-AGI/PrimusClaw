@@ -282,9 +282,10 @@ export async function markUntrustedRead(q: Querier, sessionId: string, messageId
 
 /**
  * A user's message takes priority over a worker's report: stop the router turn that is reading a report so the
- * message queued behind it runs now. The report is not lost: it is on the item, which the next turn's list shows, and
- * an item that needs the user and was not announced is the silent sweep's. A turn that answers the user is never
- * stopped for another of their messages.
+ * message queued behind it runs now. The report is not lost: it is on the item, which the next turn's list shows; an
+ * answer the stopped turn did not say is said by the system when the turn ends (`tellUnsaidAnswers`), and an item that
+ * needs the user and was not announced is the silent sweep's. A turn that answers the user is never stopped for another
+ * of their messages.
  */
 export async function preemptReportTurn(sessionId: string): Promise<boolean> {
   const turn = (await db.query(
