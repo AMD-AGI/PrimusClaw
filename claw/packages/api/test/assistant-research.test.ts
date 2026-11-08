@@ -43,6 +43,7 @@ test("RS3 the worker is told the form the check reads and what the check does", 
   assert.match(WORKER_RESEARCH_PROMPT, /marked unverified \(未证实\)/);
   assert.match(WORKER_RESEARCH_PROMPT, /deliver_text/);
   assert.match(WORKER_RESEARCH_PROMPT, /report\(kind="answer"\)/);
+  assert.match(WORKER_RESEARCH_PROMPT, /too long to write in one call .* written to a file in the workspace instead and delivered with deliver_file; it is checked the same way/);
 });
 
 test("RS4 the router hands research to a work item", () => {

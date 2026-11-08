@@ -5,9 +5,11 @@
  * A run's citation check (`ExecuteRequest.cite_check`, `tools/cite-check.ts`) has no way around it.
  *
  *   CS1 a sub-agent's deliver_text of a cited report is checked as its parent's would be; without the forwarded check it is not
- *   CS2 deliver_file of a cited report in the sandbox is refused, and the model told to deliver it with deliver_text, whatever its
- *       extension and however long (the whole file is searched); a file with only one of the two, a file that cannot be read, and
- *       any file in a run without the check are not refused for it
+ *   CS2 deliver_file of a cited report in the sandbox, whatever its extension and however long (the whole file is searched), is
+ *       read whole and delivered through the run's checked deliver_text, so the text stored is the checked one; a file with only one
+ *       of the two, a file that cannot be searched, and any file in a run without the check are left to deliver_file
+ *   CS4 a cited report that is too large, cannot be read back, or has no checked deliver_text to go through is refused, nothing
+ *       delivered
  *   CS3 the check's budget ends a wait for a page that never answers: the check returns, and the statement is not checked
  */
 import test, { after, before } from "node:test";
@@ -15,7 +17,7 @@ import assert from "node:assert/strict";
 import type { Message, ToolSchema } from "@claw/protocol";
 
 const { runSubagent } = await import("../src/agent/sub-agent.js");
-const { parseCiteCheck, CITED_FILE_REFUSAL } = await import("../src/tools/cite-check.js");
+const { parseCiteCheck, CITED_FILE_REFUSAL, CITED_FILE_TOO_LARGE, CITED_FILE_UNREADABLE } = await import("../src/tools/cite-check.js");
 const { ToolRouter } = await import("../src/tools/router.js");
 const { AnthropicProvider } = await import("../src/llm/anthropic-provider.js");
 const { OpenAiProvider } = await import("../src/llm/openai-provider.js");
@@ -84,13 +86,21 @@ test("CS1 a sub-agent's delivery is checked with the forwarded check, and only w
 });
 
 /**
- * A router over a sandbox whose one file is `file` (or none, when null): its `grep` searches the file line by line, as Hands' does,
- * and lists the path when a line matches.
+ * A router over a sandbox whose one file is `file` (or none, when null): its `grep` searches the file line by line, as Hands' does, and
+ * answers with the path and the count of matching lines; its `read` with line_numbers false answers the file's raw text. The run's
+ * assistant server records what deliver_text was sent. `unreadable`: the read fails.
  */
-function routerOver(file: string | null) {
+function routerOver(file: string | null, opts: { unreadable?: boolean } = {}) {
   const searches: Array<Record<string, unknown>> = [];
+  const reads: Array<Record<string, unknown>> = [];
+  const delivered: Array<Record<string, unknown>> = [];
   const hands = {
     callToolFull: async (name: string, input: Record<string, unknown>) => {
+      if (name === "read") {
+        reads.push(input);
+        if (opts.unreadable || file === null) return { text: `Error reading ${String(input.path)}: ENOENT`, isError: true };
+        return { text: input.line_numbers === false ? file : "1|numbered", isError: false };
+      }
       if (name !== "grep") throw new Error(`unexpected ${name}`);
       searches.push(input);
       if (file === null) return { text: `Error: ENOENT: no such file or directory, stat '${String(input.path)}'`, isError: false };
@@ -101,38 +111,55 @@ function routerOver(file: string | null) {
       return { text: n ? `${String(input.path).replace(/^\/workspace\//, "")}:${n}` : "(no matches)", isError: false };
     },
   } as unknown as HandsClient;
-  return { router: new ToolRouter(hands), searches };
+  const assistant = {
+    callTool: async (tool: string, input: Record<string, unknown>) => {
+      if (tool !== "deliver_text") throw new Error(`unexpected ${tool}`);
+      delivered.push(input);
+      return "{\"ok\":true}";
+    },
+  };
+  return { router: new ToolRouter(hands, new Map([["assistant", assistant as never]])), searches, reads, delivered };
 }
 
-test("CS2 deliver_file of a cited report is refused; other files are not refused for it", async () => {
-  const check = parseCiteCheck({ tools: ["mcp__assistant__deliver_text"] }, ports);
-  const report = routerOver(REPORT);
-  report.router.citeCheck = check;
+const check = () => parseCiteCheck({ tools: ["mcp__assistant__deliver_text"] }, ports);
+const deliverFile = async (r: ReturnType<typeof routerOver>, path: string, extra: Record<string, unknown> = {}) => {
   const outcome = { isError: false };
-  assert.equal(await report.router.route("deliver_file", { path: "/workspace/report.md" }, undefined, outcome), CITED_FILE_REFUSAL);
-  assert.equal(outcome.isError, true);
+  const text = await r.router.route("deliver_file", { path, ...extra }, undefined, outcome).catch((e: Error) => `threw: ${e.message}`);
+  return { text, isError: outcome.isError };
+};
+
+test("CS2 deliver_file of a cited report is delivered as checked text; other files are left to deliver_file", async () => {
+  const report = routerOver(REPORT);
+  report.router.citeCheck = check();
+  const out = await deliverFile(report, "/workspace/report.md", { caption: "the comparison" });
+  assert.equal(out.isError, false);
   assert.equal(report.searches.length, 2, "the whole file is searched for a list of sources and for a citation");
+  assert.deepEqual(report.reads, [{ path: "/workspace/report.md", line_numbers: false }], "read whole, raw");
+  assert.equal(report.delivered.length, 1);
+  assert.equal(report.delivered[0].name, "report.md");
+  assert.equal(report.delivered[0].caption, "the comparison");
+  assert.notEqual(report.delivered[0].text, REPORT, "the file's own text never reaches the API");
+  assert.match(String(report.delivered[0].text), /vLLM is the fastest engine \(unverified\)\./);
+  assert.match(String(report.delivered[0].text), /^Citation check /m);
+  assert.match(out.text, /^This file is a report with numbered citations: it was delivered as text \(report\.md\), checked against its sources\./);
+  assert.match(out.text, /Citation check before delivery: 1 of 2 cited statements are supported/);
 
-  // A name that looks like a note is still the file's.
-  const bracket = routerOver(REPORT);
-  bracket.router.citeCheck = check;
-  assert.equal(await bracket.router.route("deliver_file", { path: "/workspace/[1].md" }, undefined, { isError: false }), CITED_FILE_REFUSAL);
-  const noted = routerOver(REPORT);
-  noted.router.citeCheck = check;
-  assert.equal(await noted.router.route("deliver_file", { path: "/workspace/[note] 1 file.md" }, undefined, { isError: false }), CITED_FILE_REFUSAL);
-
-  // A citation at the start of its line is still one; a report too large to search is taken to be one.
-  for (const [file, path] of [[`[1] vLLM supports MI300X.\n\n[1]: vLLM on ROCm — ${A}`, "/workspace/r.md"], ["BIG", "/workspace/huge.md"]] as const) {
+  // A name that looks like a note, a citation at the start of its line, a report past any read limit under another extension.
+  for (const [file, path, name] of [
+    [REPORT, "/workspace/[1].md", "[1].md"],
+    [REPORT, "/workspace/[note] 1 file.md", "[note] 1 file.md"],
+    [`[1] vLLM supports MI300X.\n\n[1]: vLLM on ROCm — ${A}`, "/workspace/r.md", "r.md"],
+    [["vLLM supports MI300X [1].", ...Array.from({ length: 5000 }, (_, i) => `filler ${i}`), `[1]: vLLM on ROCm — ${A}`].join("\n"), "/workspace/report.html", "report.md"],
+  ] as const) {
     const r = routerOver(file);
-    r.router.citeCheck = check;
-    assert.equal(await r.router.route("deliver_file", { path }, undefined, { isError: false }), CITED_FILE_REFUSAL, path);
+    r.router.citeCheck = check();
+    const o = await deliverFile(r, path);
+    assert.equal(o.isError, false, path);
+    assert.deepEqual(r.delivered.map((d) => d.name), [name], path);
+    assert.match(String(r.delivered[0].text), /^Citation check /m, path);
   }
 
-  // Past any read limit, and under another extension: still the same report.
-  const long = routerOver(["vLLM supports MI300X [1].", ...Array.from({ length: 5000 }, (_, i) => `filler ${i}`), `[1]: vLLM on ROCm — ${A}`].join("\n"));
-  long.router.citeCheck = check;
-  assert.equal(await long.router.route("deliver_file", { path: "/workspace/report.html" }, undefined, { isError: false }), CITED_FILE_REFUSAL);
-
+  // Not a cited report, or not searchable: deliver_file answers for it as before, nothing goes through deliver_text.
   for (const [file, path] of [
     ["Plain notes.\nNo citations.", "/workspace/notes.md"],
     [`Links only.\n[1]: a page — ${A}`, "/workspace/links.md"],
@@ -141,14 +168,36 @@ test("CS2 deliver_file of a cited report is refused; other files are not refused
     ["BIG", "/workspace/data.csv"],
   ] as const) {
     const r = routerOver(file);
-    r.router.citeCheck = check;
-    const text = await r.router.route("deliver_file", { path }, undefined, { isError: false }).catch((e: Error) => e.message);
-    assert.notEqual(text, CITED_FILE_REFUSAL, path);
+    r.router.citeCheck = check();
+    const o = await deliverFile(r, path);
+    assert.deepEqual([r.delivered.length, r.reads.length], [0, 0], path);
+    assert.doesNotMatch(o.text, /numbered citations/, path);
   }
   const unchecked = routerOver(REPORT);
-  const text = await unchecked.router.route("deliver_file", { path: "/workspace/report.md" }, undefined, { isError: false }).catch((e: Error) => e.message);
-  assert.notEqual(text, CITED_FILE_REFUSAL);
-  assert.equal(unchecked.searches.length, 0, "without the check the file is not searched");
+  await deliverFile(unchecked, "/workspace/report.md");
+  assert.deepEqual([unchecked.searches.length, unchecked.delivered.length], [0, 0], "without the check the file is neither searched nor read");
+});
+
+test("CS4 a cited report too large, unreadable, or with no checked deliver_text is refused, nothing delivered", async () => {
+  const huge = routerOver("BIG");
+  huge.router.citeCheck = check();
+  assert.deepEqual(await deliverFile(huge, "/workspace/huge.md"), { text: CITED_FILE_TOO_LARGE, isError: true });
+  assert.equal(huge.reads.length, 0, "a file too large to search is not read");
+
+  const big = routerOver(`${"x".repeat(300 * 1024)} [1].\n\n[1]: vLLM on ROCm — ${A}`);
+  big.router.citeCheck = check();
+  assert.deepEqual(await deliverFile(big, "/workspace/big.md"), { text: CITED_FILE_TOO_LARGE, isError: true });
+  assert.equal(big.delivered.length, 0);
+
+  const gone = routerOver(REPORT, { unreadable: true });
+  gone.router.citeCheck = check();
+  assert.deepEqual(await deliverFile(gone, "/workspace/report.md"), { text: CITED_FILE_UNREADABLE, isError: true });
+  assert.equal(gone.delivered.length, 0);
+
+  const other = routerOver(REPORT);
+  other.router.citeCheck = parseCiteCheck({ tools: ["mcp__assistant__other"] }, ports);
+  assert.deepEqual(await deliverFile(other, "/workspace/report.md"), { text: CITED_FILE_REFUSAL, isError: true });
+  assert.deepEqual([other.reads.length, other.delivered.length], [0, 0]);
 });
 
 test("CS3 a page that never answers does not hold the check past its budget", { timeout: 10_000 }, async (t) => {
