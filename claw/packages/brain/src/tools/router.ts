@@ -507,7 +507,7 @@ export class ToolRouter {
       }
     }
     if (check?.checks(name) && typeof input.text === "string" && input.text.trim()) {
-      const result = await checkReport(input.text, check.ports, signal);
+      const result = await checkReport(input.text, check.ports, signal, check.verdicts);
       if (result.checked) {
         // Too much of it unverified: back to its writer before anything is delivered, a bounded number of times (`cite-revise.ts`).
         const revise = citeReviseFor(check)?.review(result);

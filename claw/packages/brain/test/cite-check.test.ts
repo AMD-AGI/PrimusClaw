@@ -33,6 +33,9 @@
  *   CC18 a table row's cells are separate statements: each read within its own cell, with the row label and the column header,
  *        and judged only against the sources it cites, never with the other cells; a statement citing several sources is
  *        supported when any of them supports it, and the judge is told it need support only its own part
+ *   CC19 a run's second check (a report sent back and delivered again) judges only what is new or changed: a statement already
+ *        supported, or rejected by both looks, on the same page with the same text and line is taken as it was, and a page whose
+ *        statements are all settled is not read again; a first look's no alone is not kept; a new run starts with nothing
  *   CC13 up to 80 sources are checked; a source past that cap, a statement past the statements cap and a batch the budget ran out
  *        before are not checked (未核对), never unverified
  */
@@ -519,4 +522,143 @@ test("CC18 a table row's cells are judged one by one, each against its own sourc
   const { user, system } = judgePrompt(A, "p", onA.claims, onA.contexts, onA.sourceCounts);
   assert.match(user, /2\. 合计 — vLLM: 共 1161 个\n   \(cites 2 sources; this page need support only its own part\)/);
   assert.match(system, /may take each of its facts from a different one/);
+});
+
+test("CC19 a run's second check judges only what is new or changed", async () => {
+  const pageA = "alpha beta gamma";
+  const pageB = "delta epsilon";
+  const fetched: string[] = [];
+  const judged: string[] = [];
+  const ports: CiteCheckPorts = {
+    fetchPage: async (u) => { fetched.push(u); return { ok: true, text: u === A ? pageA : pageB }; },
+    judge: async ({ page, claims }) => { judged.push(...claims); return claims.map((c) => page.includes(c.match(/\{(\w+)\}/)?.[1] ?? "\u0000")); },
+  };
+  const first = [
+    "- Statement on alpha {alpha} [1].", "- Statement on zeta {zeta} [1].", "- Statement on delta {delta} [2].", "",
+    `[1]: A — ${A}`, `[2]: B — ${B}`,
+  ].join("\n");
+  const check = parseCiteCheck({ tools: ["mcp__assistant__deliver_text"] }, ports)!;
+  const r1 = await checkReport(first, check.ports, undefined, check.verdicts);
+  assert.deepEqual([r1.supported, r1.unverified], [2, 1]);
+  assert.deepEqual(judged.filter((c) => c.includes("zeta")).length, 2, "zeta: a first look and a second look");
+  assert.equal(check.verdicts.size, 3, "alpha and delta supported, zeta rejected by both looks");
+
+  // The writer changes nothing on page B, rewrites one statement on page A and adds one.
+  const second = [
+    "- Statement on alpha {alpha} [1].", "- Statement on gamma {gamma} [1].", "- Statement on delta {delta} [2].", "- Statement on beta {beta} [1].", "",
+    `[1]: A — ${A}`, `[2]: B — ${B}`,
+  ].join("\n");
+  fetched.length = 0;
+  judged.length = 0;
+  const r2 = await checkReport(second, check.ports, undefined, check.verdicts);
+  assert.deepEqual(judged.sort(), ["Statement on beta {beta}", "Statement on gamma {gamma}"], "only the changed and the new");
+  assert.deepEqual(fetched, [A], "page B's statements are all settled: it is not read again");
+  assert.deepEqual([r2.supported, r2.unverified], [4, 0]);
+
+  // A statement rejected by both looks stays rejected without a judge; a first look's no alone is not kept.
+  judged.length = 0;
+  const third = await checkReport(first, check.ports, undefined, check.verdicts);
+  assert.deepEqual(judged, [], "everything in the first report is settled now");
+  assert.match(third.text, /Statement on zeta \{zeta\} \(unverified\)\./);
+  const firstOnly = parseCiteCheck({ tools: ["t"] }, {
+    fetchPage: async () => ({ ok: true, text: "x" }),
+    judge: async ({ claims }) => claims.map(() => false),
+  })!;
+  let calls = 0;
+  const once = { ...firstOnly.ports, judge: async (i: { claims: string[] }) => { calls++; return calls >= 2 ? null : i.claims.map(() => false); } };
+  await checkReport("- Statement on omega {omega} [1].\n\n[1]: A — " + A, once, undefined, firstOnly.verdicts);
+  assert.equal(firstOnly.verdicts.size, 0, "no second look answered: the first look's no is not kept");
+
+  // The same statement in another context, or in a new run, is judged again.
+  judged.length = 0;
+  await checkReport("- Statement on alpha {alpha} [1]. Then a sentence that changes what it is about.\n\n[1]: A — " + A, check.ports, undefined, check.verdicts);
+  assert.deepEqual(judged, ["Statement on alpha {alpha}"], "the same statement in another line: judged again");
+  // No characters in a statement can make two different statements share a key.
+  const { verdictKey } = await import("../src/tools/cite-check.js");
+  assert.notEqual(verdictKey(A, "a\u0000b", "c"), verdictKey(A, "a", "b\u0000c"));
+  const nul = parseCiteCheck({ tools: ["t"] }, {
+    fetchPage: async () => ({ ok: true, text: "x" }),
+    judge: async ({ claims }) => claims.map((c) => c.startsWith("good")),
+  })!;
+  const nulReport = (line: string) => `${line}\n\n[1]: A — ${A}`;
+  await checkReport(nulReport("good\u0000part [1] tail"), nul.ports, undefined, nul.verdicts);
+  const r = await checkReport(nulReport("good [1] part\u0000tail"), nul.ports, undefined, nul.verdicts);
+  assert.equal(r.supported, 1);
+
+  // The same line twice in one check, one found supported and one not: the key is kept as supported, never as rejected.
+  const twice = parseCiteCheck({ tools: ["t"] }, { fetchPage: async () => ({ ok: true, text: "x" }), judge: async () => null })!;
+  let look = 0;
+  const firstPorts: CiteCheckPorts = {
+    fetchPage: async () => ({ ok: true, text: "x" }),
+    judge: async ({ claims }) => { look++; return look === 1 ? claims.map((_, k) => k === 0) : claims.map(() => false); },
+  };
+  const dup = `- Statement on alpha [1].\n- Statement on alpha [1].\n\n[1]: A — ${A}`;
+  const d1 = await checkReport(dup, firstPorts, undefined, twice.verdicts);
+  assert.deepEqual([d1.supported, d1.unverified], [1, 1]);
+  assert.deepEqual([...twice.verdicts.values()], [true], "the shared key is kept as supported");
+  let judgedAgain = 0;
+  const d2 = await checkReport(dup, { fetchPage: async () => ({ ok: true, text: "x" }), judge: async ({ claims }) => { judgedAgain++; return claims.map(() => true); } }, undefined, twice.verdicts);
+  assert.deepEqual([d2.supported, d2.unverified, judgedAgain], [2, 0, 0]);
+
+  // One statement citing two list entries with one address: supported on one, rejected by both looks on the other; kept as supported.
+  const sameUrl = parseCiteCheck({ tools: ["t"] }, { fetchPage: async () => ({ ok: true, text: "x" }), judge: async () => null })!;
+  let calls2 = 0;
+  const s1 = await checkReport(`- A statement on two entries [1][2].\n\n[1]: A — ${A}\n[2]: A again — ${A}`, {
+    fetchPage: async () => ({ ok: true, text: "x" }),
+    judge: async ({ claims }) => { calls2++; return claims.map(() => calls2 === 1); },
+  }, undefined, sameUrl.verdicts);
+  assert.equal(s1.supported, 1);
+  assert.deepEqual([...sameUrl.verdicts.values()], [true]);
+  let judgedSame = 0;
+  const s2 = await checkReport(`- A statement on two entries [1][2].\n\n[1]: A — ${A}\n[2]: A again — ${A}`, {
+    fetchPage: async () => ({ ok: true, text: "x" }),
+    judge: async ({ claims }) => { judgedSame++; return claims.map(() => false); },
+  }, undefined, sameUrl.verdicts);
+  assert.deepEqual([s2.supported, judgedSame], [1, 0], "settled as supported: not judged again, still supported");
+
+  // Two checks of one run at once (a sub-agent's delivery beside its parent's): the one that finds the key rejected and writes
+  // last does not undo the other's support.
+  const both = parseCiteCheck({ tools: ["t"] }, { fetchPage: async () => ({ ok: true, text: "x" }), judge: async () => null })!;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const single = `- Statement on alpha [1].\n\n[1]: A — ${A}`;
+  const slowNo = checkReport(single, {
+    fetchPage: async () => { await gate; return { ok: true, text: "x" }; },
+    judge: async ({ claims }) => claims.map(() => false),
+  }, undefined, both.verdicts);
+  await checkReport(single, { fetchPage: async () => ({ ok: true, text: "x" }), judge: async ({ claims }) => claims.map(() => true) }, undefined, both.verdicts);
+  release();
+  await slowNo;
+  assert.deepEqual([...both.verdicts.values()], [true], "a supported key is never set back to rejected");
+
+  // A statement that cited two sources and now cites one is judged again: the judge decides a different question.
+  const parts = parseCiteCheck({ tools: ["t"] }, {
+    fetchPage: async () => ({ ok: true, text: "x" }),
+    judge: async ({ claims, sourceCounts }) => claims.map((_, k) => (sourceCounts?.[k] ?? 1) > 1),
+  })!;
+  const two = await checkReport(`- A statement with two sources [1][2].\n\n[1]: A — ${A}\n[2]: B — ${B}`, parts.ports, undefined, parts.verdicts);
+  assert.equal(two.supported, 1);
+  const one = await checkReport(`- A statement with two sources [1].\n\n[1]: A — ${A}\n[2]: B — ${B}`, parts.ports, undefined, parts.verdicts);
+  assert.equal(one.supported, 0, "the verdict given for its part of two is not taken for the whole");
+  judged.length = 0;
+  const other = parseCiteCheck({ tools: ["mcp__assistant__deliver_text"] }, ports)!;
+  assert.equal(other.verdicts.size, 0, "a new run starts with nothing");
+  await checkReport(first, other.ports, undefined, other.verdicts);
+  assert.ok(judged.length >= 3);
+});
+
+test("CC20 the router's checked deliveries of one run share its verdicts", async () => {
+  const judged: string[] = [];
+  const ports: CiteCheckPorts = {
+    fetchPage: async () => ({ ok: true, text: "alpha" }),
+    judge: async ({ claims }) => { judged.push(...claims); return claims.map((c) => c.includes("alpha")); },
+  };
+  const sent: unknown[] = [];
+  const router = new ToolRouter(null, new Map([["assistant", { callTool: async (_t: string, input: Record<string, unknown>) => { sent.push(input); return "{\"ok\":true}"; } } as never]]));
+  router.citeCheck = parseCiteCheck({ tools: ["mcp__assistant__deliver_text"] }, ports);
+  const report = ["- Statement on alpha {alpha} [1].", "", `[1]: A — ${A}`].join("\n");
+  await router.route("mcp__assistant__deliver_text", { name: "r.md", text: report });
+  await router.route("mcp__assistant__deliver_text", { name: "r.md", text: report });
+  assert.equal(judged.length, 1, "the second delivery of the same report judges nothing");
+  assert.equal(sent.length, 2);
 });
