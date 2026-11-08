@@ -122,6 +122,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- `pr_state` says a pull request number its repository does not have is `not_found` (GitHub answered 404 for the pull request and
+  read the repository), not `unknown`/`read_failed`; a 404 from a repository the person cannot read stays `unknown`. `review_start`
+  refuses such a number as `not_found`, and the router says it does not exist. Before, "请 X 帮我审 #483 和 #99999" was answered
+  "#99999: GitHub could not be read". Router review prompt router-v25.
 - The brief also leaves out a release-gate fixture whose watch ended before polls kept a pull request's branches (2026-11-08 retest:
   "#381: 2 comments" still listed): each ended watch whose news is from the last 7 days has its branches read once with its owner's
   token, beside the poll pass and never holding it back (`claw_work_item_subscriptions.refs_read_at`, added at api start), claimed across replicas and

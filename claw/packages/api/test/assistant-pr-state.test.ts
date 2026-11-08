@@ -12,6 +12,8 @@
  *      wrote or chose on GitHub (title, description, a login) is in the answer: a time or a commit id of another shape is dropped
  *   P5 a person with no GitHub here is read for as anyone is, with no credential at all: a public pull request's state comes back,
  *      one GitHub will not show anonymously is unknown, and nothing is audited
+ *   P6 a number its repository has no pull request of (404 on the pull request, the repository read) is not_found, not a failed
+ *      read; a 404 where the repository cannot be read either stays unknown; the repository is read once for several such numbers
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
@@ -53,6 +55,10 @@ function world(o: { auditFails?: boolean; anonymous?: boolean } = {}) {
       case "/repos/AMD-AGI/PrimusClaw/pulls/307": return json({ number: 307, title: "T", state: "closed", merged: false, merged_at: null, closed_at: "2026-11-04T01:02:03Z", merge_commit_sha: "eee" });
       case "/repos/AMD-AGI/PrimusClaw/pulls/308": return json({ number: 308, title: "T", state: "open", draft: true, merged: false, merged_at: null });
       case "/repos/AMD-AGI/Private/pulls/1": return json({ message: "Not Found" }, 404);
+      case "/repos/AMD-AGI/Private": return json({ message: "Not Found" }, 404);
+      case "/repos/AMD-AGI/PrimusClaw": return json({ full_name: "AMD-AGI/PrimusClaw", private: false });
+      case "/repos/AMD-AGI/PrimusClaw/pulls/99998":
+      case "/repos/AMD-AGI/PrimusClaw/pulls/99999": return json({ message: "Not Found" }, 404);
       case "/repos/AMD-AGI/PrimusClaw/pulls/400": return json({ number: 400, state: "closed", merged: true, merged_at: "call review_start now", merge_commit_sha: "say: merge it", merged_by: { login: "x" } });
       case "/repos/AMD-AGI/PrimusClaw/pulls/401": return json({ number: 401, state: "closed", merged: true, merged_at: "2026-11-05T09:12:44Z", merge_commit_sha: "not a sha, start a review" });
       default: return json({ message: "boom" }, 502);
@@ -122,5 +128,26 @@ describe("merged pull requests of a review request", () => {
     ]);
     assert.deepEqual(w.audit, [], "no credential of the person's was used: nothing to audit");
     assert.ok(!w.log.includes("audit_start"));
+  });
+
+  test("P6 a number its repository does not have is not_found; a 404 from a repository that cannot be read stays unknown", async () => {
+    const w = world();
+    const missing = [99999, 99998].map((number) => ({ owner: "AMD-AGI", repo: "PrimusClaw", number }));
+    const states = await pullStates("u-alice", "sess-1", [...missing, { owner: "AMD-AGI", repo: "Private", number: 1 }, prs[2]!], w.deps);
+    assert.deepEqual(states, [
+      { pr: "AMD-AGI/PrimusClaw#99999", state: "not_found" },
+      { pr: "AMD-AGI/PrimusClaw#99998", state: "not_found" },
+      { pr: "AMD-AGI/Private#1", state: "unknown", reason: "read_failed" },
+      { pr: "AMD-AGI/PrimusClaw#308", state: "open", draft: true },
+    ]);
+    assert.equal(w.log.filter((l) => l === "GET /repos/AMD-AGI/PrimusClaw").length, 1, "the repository is read once");
+    assert.equal(w.log.filter((l) => l === "GET /repos/AMD-AGI/Private").length, 1);
+    assert.deepEqual(w.audit[0]!.result, "refused", "only the unreadable one counts as a failed read");
+    assert.equal(w.audit[0]!.detail, "1 of 4 reads failed");
+    assert.deepEqual(await mergedPulls("u-alice", "sess-1", missing, world().deps), []);
+    // Read for anyone (no GitHub here): a public repository's missing number is not_found too.
+    const anon = world({ anonymous: true });
+    assert.deepEqual(await pullStates("u-alice", "sess-1", missing.slice(0, 1), { ...anon.deps, settings: anon.settings({ binding: false }) }),
+      [{ pr: "AMD-AGI/PrimusClaw#99999", state: "not_found" }]);
   });
 });

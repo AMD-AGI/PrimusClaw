@@ -48,14 +48,15 @@ export interface ClosedPull {
 
 /**
  * Where a pull request stands on GitHub, as `pr_state` answers the router: `open`, `merged` (with when and its merge commit),
- * `closed` (closed without a merge, with when) or `unknown` (it could not be read: no GitHub, a failed read, no such pull request).
- * Only these fields, each checked for its shape (a time, a commit id): nothing anyone wrote or chose on GitHub (a title, a
+ * `closed` (closed without a merge, with when), `not_found` (GitHub read the repository and has no pull request of that number) or
+ * `unknown` (it could not be read: no GitHub, a failed read, or a repository that cannot be read either). Only these fields, each checked for its shape (a time, a commit id): nothing anyone wrote or chose on GitHub (a title, a
  * description, a login), so reading it is not reading untrusted text, and a turn that read it may still act for the person.
  */
 export type PullState =
   | { pr: string; state: "open"; draft: boolean }
   | ({ state: "merged" } & MergedPull)
   | ({ state: "closed" } & ClosedPull)
+  | { pr: string; state: "not_found" }
   | { pr: string; state: "unknown"; reason: "no_github" | "read_failed" };
 
 export interface PrStateDeps {
@@ -135,13 +136,28 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
   }
   const states: PullState[] = [];
   let failed = 0;
+  // GitHub answers 404 both for a number the repository has no pull request of and for a repository the reader cannot see: the
+  // repository is read once (per repository) to tell them apart, so only a number missing from a repository that was read is
+  // `not_found` (2026-11-08 E249: "#99999" was said to be "could not be read" rather than "does not exist").
+  const repoSeen = new Map<string, Promise<boolean>>();
+  const repoReadable = (p: PrRef): Promise<boolean> => {
+    const key = `${p.owner}/${p.repo}`.toLowerCase();
+    let seen = repoSeen.get(key);
+    if (!seen) {
+      seen = read(repoPath(p)).then((r) => Boolean(r && typeof r === "object"), () => false);
+      repoSeen.set(key, seen);
+    }
+    return seen;
+  };
   for (let i = 0; i < prs.length; i += READ_PARALLEL) {
     states.push(...await Promise.all(prs.slice(i, i + READ_PARALLEL).map(async (p): Promise<PullState> => {
       try {
         return stateOf(p, await read(repoPath(p, `/pulls/${p.number}`)));
       } catch (err) {
+        const status = (err as { status?: number })?.status;
+        if (status === 404 && await repoReadable(p)) return { pr: nameOf(p), state: "not_found" };
         failed++;
-        logger.warn({ sessionId, pr: nameOf(p), status: (err as { status?: number })?.status }, "assistant.pr_state_read_failed");
+        logger.warn({ sessionId, pr: nameOf(p), status }, "assistant.pr_state_read_failed");
         return { pr: nameOf(p), state: "unknown", reason: "read_failed" };
       }
     })));
