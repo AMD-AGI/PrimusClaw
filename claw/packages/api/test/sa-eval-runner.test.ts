@@ -43,7 +43,8 @@
  *   R13 a turn whose router said nothing: the server's own reply, a moment after the turn's end, is waited for (EVAL_SAY_GRACE_S),
  *      graded and timed; without the wait the case had no answer
  *   R14 EVAL_FRESH_SESSION_EVERY: each case in a new assistant session, the one before closed and deleted (seen gone) first; an
- *      identity that already has an assistant session refuses the run (the run deletes only its own)
+ *      assistant session the identity already has is deleted (seen gone) before anything is sent, its says still counted for the
+ *      pace, and the first case starts in a new one; one in use refuses the run, nothing deleted
  *   R15 EVAL_VARS_CMD is run before each case, so a value read right before it fills its text; one that fails is the run's error for
  *      that case, and nothing of it is sent
  *   R16 EVAL_GAP_S: the next case waits that long after the last one ended
@@ -998,20 +999,44 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.deepEqual(JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8")).cleanup_failed, []);
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
 
-    // An identity that already has an assistant session (not the run's): refused, nothing sent, nothing deleted.
+    // An identity that already has an assistant session, idle (E249: 58 cases in one conversation, a case answered from another's):
+    // it is deleted and seen gone before anything is sent, and the first case starts in a new one. Its say of the hour still counts.
     const other = new FakeClaw();
     const base2 = await other.start();
     other.created = false;
+    other.freshAssistant = true;
     other.sessions.set(other.assistant, { status: "idle", stale: 0 });
+    other.emit({ type: "AssistantSay", say_id: "say-before-the-run", text: "an earlier answer" }, Date.now() - 1_800_000);
+    other.router = (_content, id, sid) => other.turn(id, { say: `answered in ${sid}` });
     const r2 = runner(base2, [answerCase("t-fresh-003")], { EVAL_FRESH_SESSION_EVERY: "1" });
     const run2 = await r2.done;
     await other.stop();
     try {
-      assert.equal(run2.code, 2, run2.out);
-      assert.match(run2.out, /EVAL_FRESH_SESSION_EVERY needs an identity without an assistant session/);
-      assert.equal(other.sent.length, 0);
-      assert.deepEqual(other.calls.filter((c) => c.startsWith("DELETE")), []);
+      assert.equal(run2.code, 0, run2.out);
+      assert.match(run2.out, /deleted the identity's assistant session asst-1 before the run/);
+      const del = other.calls.indexOf("DELETE /v1/sessions/asst-1");
+      const got = other.calls.indexOf("GET /v1/sessions/asst-1", del);
+      assert.ok(del > 0 && got > del, "deleted, then seen gone");
+      assert.deepEqual(other.calls.filter((c) => /^POST \/v1\/sessions\/[^/]+\/messages$/.test(c)), ["POST /v1/sessions/asst-2/messages"]);
+      assert.ok(got < other.calls.indexOf("POST /v1/sessions/asst-2/messages"), "before anything is sent");
+      assert.ok(!other.sessions.has("asst-1") && !other.sessions.has("asst-2"));
+      assert.ok(readFileSync(join(r2.dir, "says.jsonl"), "utf8").includes("say-before-the-run"), "its say still counts for the pace");
     } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+
+    // One in use is not deleted: refused, nothing sent, nothing deleted.
+    const busy = new FakeClaw();
+    const base3 = await busy.start();
+    busy.created = false;
+    busy.sessions.set(busy.assistant, { status: "running", stale: 0 });
+    const r3 = runner(base3, [answerCase("t-fresh-004")], { EVAL_FRESH_SESSION_EVERY: "1" });
+    const run3 = await r3.done;
+    await busy.stop();
+    try {
+      assert.equal(run3.code, 2, run3.out);
+      assert.match(run3.out, /refusing to run: .*running/);
+      assert.equal(busy.sent.length, 0);
+      assert.deepEqual(busy.calls.filter((c) => c.startsWith("DELETE")), []);
+    } finally { rmSync(r3.dir, { recursive: true, force: true }); }
   });
 
   it("R15 run variables read again before each case", { timeout: 120_000 }, async () => {

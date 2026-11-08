@@ -77,8 +77,9 @@
  *   EVAL_FRESH_SESSION_EVERY
  *                     assistant mode: a new assistant session every that many cases (1: each case its own; default 0: one for
  *                     the run), so no case is read in the context of earlier ones. The session before is let finish, its items
- *                     closed, and it is deleted and seen gone first. Only a session the run made is ever deleted, so this needs an
- *                     identity without an assistant session at the start
+ *                     closed, and it is deleted and seen gone first. An assistant session the identity already has when the run
+ *                     starts is deleted (and seen gone) before anything is sent, so the first case starts in a new one too; one
+ *                     in use (see EVAL_QUIET_S) refuses the run instead, and its says of the last hour still count for the pace
  *   EVAL_SEND_TOKEN_CMD
  *                     assistant mode: a command (as EVAL_VARS_CMD: no shell) that prints a signed-in access token of the key's own identity (an identity
  *                     provider's, for the Claw API): the run's messages are sent with it, as a person's channel sends them, so a
@@ -97,8 +98,8 @@
  * runs the cases one at a time, waits for the assistant to be idle before each, and cleans up what it started: every
  * work item its own turns' work_create / review_start answers name is accepted (a result that waits, at the version
  * shown) or stopped, then its worker's session is deleted, and an assistant session it created is deleted. It deletes
- * only sessions it made or that its own items name, never by identity, and a session counts as deleted only when a GET
- * after the DELETE answers 404. No other item is touched; a new open item it cannot tie to its calls is reported. Exit 0
+ * only sessions it made or that its own items name, never by identity (but for the identity's own assistant session with
+ * EVAL_FRESH_SESSION_EVERY, before the run), and a session counts as deleted only when a GET after the DELETE answers 404. No other item is touched; a new open item it cannot tie to its calls is reported. Exit 0
  * when every attempt ran to a verdict and the cleanup is complete; the score is a measurement, not a gate.
  *
  * SIGINT or SIGTERM stops a live run between two steps: nothing more is sent (an approval decision included), the turns
@@ -961,10 +962,14 @@ interface AssistantSession {
   unknownSends: number;
 }
 
+/** The counted says of an assistant session the run deleted before it began (EVAL_FRESH_SESSION_EVERY): they still count for the pace. */
+const DELETED_SAYS: SayMark[] = [];
+
 /**
  * The identity's assistant session (`POST /v1/assistant`), its stream open. One the run did not make is used only when nobody else is
- * using it, and never with EVAL_FRESH_SESSION_EVERY (the run deletes the sessions it changes from, and only its own). After the first,
- * the run has just deleted its previous one, so the server must make a new one.
+ * using it; with EVAL_FRESH_SESSION_EVERY it is instead deleted, and seen gone, and a new one is asked for (the run deletes the
+ * sessions it changes from, so each must be its own). After the first, the run has just deleted its previous one, so the server
+ * must make a new one.
  */
 async function openAssistant(first: boolean): Promise<AssistantSession> {
   const a = await api("POST", "/v1/assistant", {});
@@ -973,10 +978,7 @@ async function openAssistant(first: boolean): Promise<AssistantSession> {
   const created = a.json?.data?.created === true;
   if (created) OWN_SESSIONS.add(id);
   else if (!first) throw new Error(`POST /v1/assistant gave session ${id}, which the run did not make, after the run deleted its own`);
-  else if (FRESH_EVERY) {
-    console.error("refusing to run: EVAL_FRESH_SESSION_EVERY needs an identity without an assistant session (the run deletes only its own); one exists");
-    process.exit(2);
-  } else {
+  else {
     // Nobody else may be using it: another run's messages and items would be taken for this one's, and either run's
     // cleanup would close what the other is still grading. Each parallel run needs an identity of its own.
     const s = await api("GET", `/v1/sessions/${id}`);
@@ -986,6 +988,17 @@ async function openAssistant(first: boolean): Promise<AssistantSession> {
     const lastAt = rows.reduce<number | null>((m, x) => { const t = Date.parse(x.created_at); return Number.isFinite(t) && (m === null || t > m) ? t : m; }, null);
     const busy = assistantInUse(s.json?.data ?? null, lastAt, Date.now(), QUIET_MS);
     if (busy) { console.error(`refusing to run: ${busy}; another run or a person is using this identity`); process.exit(2); }
+    if (FRESH_EVERY) {
+      // Nobody is using it (above), and the identity is a test one (`identityRefusal`): the first case gets a new conversation as
+      // well, not this one's. Its says of the last hour still count against the cap.
+      DELETED_SAYS.push(...countedSaysOf(rows));
+      if (!(await deleteSessionConfirmed(api, id, Date.now() + 60_000, 5_000))) {
+        console.error(`refusing to run: EVAL_FRESH_SESSION_EVERY could not delete the identity's assistant session ${id} (a GET after the DELETE did not answer 404)`);
+        process.exit(2);
+      }
+      log(`deleted the identity's assistant session ${id} before the run (EVAL_FRESH_SESSION_EVERY): each case starts in a new one`);
+      return openAssistant(false);
+    }
   }
   const stream = new LiveStream(id, true);
   await stream.open();
@@ -1127,7 +1140,7 @@ async function main(): Promise<void> {
     if (MODE === "assistant") {
       live();
       session = await openAssistant(true);
-      priorSays = mergeSays([readSayLog(sayLog), countedSaysOf(session.before)], Date.now());
+      priorSays = mergeSays([readSayLog(sayLog), countedSaysOf(session.before), DELETED_SAYS], Date.now());
     }
     let lastCaseEnd = 0;   // when the last case that sent anything ended: the next waits EVAL_GAP_S from it
     cases: for (const c of cases) {
