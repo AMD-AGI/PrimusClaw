@@ -78,7 +78,9 @@
  *   EVAL_GAP_S        seconds between the end of one case and the start of the next (default 0)
  *   EVAL_INFRA_RETRY  1 (default): an attempt that ended in an error of the run (not a grade: a missed stream, a read or a judge
  *                     that failed, a turn that did not end) is run again once, and the second try is the one reported (`retried`
- *                     names the first one's error); 0 runs each attempt once
+ *                     names the first one's error; a recording of the first try is dropped); 0 runs each attempt once. In the
+ *                     assistant mode the second try runs in the same session as the first, as further attempts of a case do
+ *                     (EVAL_FRESH_SESSION_EVERY counts cases, not tries)
  *   EVAL_FRESH_SESSION_EVERY
  *                     assistant mode: a new assistant session every that many cases (1: each case its own; default 0: one for
  *                     the run), so no case is read in the context of earlier ones. The session before is let finish, its items
@@ -385,10 +387,17 @@ class LiveStream {
   async reopen(ms = 30_000): Promise<boolean> {
     if (this.closed) return false;
     let timer: NodeJS.Timeout | undefined;
-    const read = new Promise<boolean>((r) => { this.onHistory.push(() => r(true)); timer = setTimeout(() => r(false), ms); });
+    let wake: (() => void) | undefined;
+    // A stop ends the wait as well, as in `open`: the cleanup's own wait follows.
+    const read = new Promise<boolean>((r) => {
+      this.onHistory.push(() => r(true));
+      timer = setTimeout(() => r(false), ms);
+      wake = () => r(false);
+      if (stopSignal) r(false); else wakers.add(wake);
+    });
     this.forced = true;
     this.abort.abort();
-    try { return await read; } finally { clearTimeout(timer); }
+    try { return await read; } finally { clearTimeout(timer); if (wake) wakers.delete(wake); }
   }
 
   close(): void { this.closed = true; this.abort.abort(); for (const done of this.onHistory.splice(0)) done(); }
@@ -1223,6 +1232,7 @@ async function main(): Promise<void> {
           const reopened = REOPENED.filter((x) => x.at >= caseStart).map((x) => `${new Date(x.at).toISOString()} ${x.why}`);
           return reopened.length ? { ...a, reopened } : a;
         };
+        const recorded = recordings.length;
         let a = await once();
         // An attempt that ended in an error of the run (a missed stream, a read or a judge that failed, a turn that did not end) is
         // run again once: what is reported is the second try, with the first one's error. A stop is not run again.
@@ -1232,6 +1242,9 @@ async function main(): Promise<void> {
             try { await paceSays(session!.stream, priorSays); } catch (err) { if (err instanceof Interrupted) { r.attempts.push(a); break cases; } throw err; }
           }
           const first = a;
+          // The first try is thrown away: a recording it left (its error came from the judge or the say cap, after it was
+          // recorded) goes too, so EVAL_OFFLINE grades the same K attempts as the live report.
+          recordings.length = recorded;
           a = { ...(await once()), retried: first.error };
           if (first.reopened) a.reopened = [...first.reopened, ...(a.reopened ?? [])];
         }

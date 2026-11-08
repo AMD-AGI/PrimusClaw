@@ -28,7 +28,8 @@
  *      still closed with its worker's session; R7b an assistant session still running before a case: nothing is sent, an error;
  *      R7c a gap that a new stream's history fills is graded (the stream is opened again at once, and the attempt says when);
  *      a turn's progress, sandbox and plugin-loading events are no gap; R7d an attempt that ended in an error of the run is run
- *      again once (EVAL_INFRA_RETRY), and the second try is reported with the first one's error
+ *      again once (EVAL_INFRA_RETRY), and the second try is reported with the first one's error; R7e a first try recorded before
+ *      its error (a judge that failed) leaves no recording: EVAL_OFFLINE grades the one attempt the live report has
  *   R9 a judge that gives no verdict (an error status, a busy or failing gateway twice, no PASS or FAIL twice) makes the attempt an
  *      error of the run, not a FAIL; a verdict-less answer is asked again saying what was missing; a verdict on the last line of a
  *      judge that reasons first counts; its FAIL fails, its PASS passes. R3e a stop while the stream holds its history back ends the wait at once
@@ -722,6 +723,35 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.match(attempts[0].retried, /the stream missed 1 stored event/);
       assert.match(attempts[0].reopened?.[0] ?? "", / forced$/, "the first try's reopening is kept");
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it("R7e a retried attempt is recorded once: the first try's recording is dropped", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    // The first try is recorded, then its judge fails twice (busy gateway): an error of the run, after the recording. The second try
+    // is judged.
+    claw.judgeAnswers = [503, 503, "PASS: states the count"];
+    claw.router = (_content, id) => claw.turn(id, { say: "There are 3." });
+    const answer = { id: "t-a-002", pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: "how many?" }],
+      facts: [{ claim: "the count", oracle: { kind: "static", value: "3" } }] };
+    const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    writeFileSync(join(dir, "judge-key"), "judge-key-not-a-secret\n");
+    const r = runner(base, [answer], { EVAL_INFRA_RETRY: "1", EVAL_JUDGE_URL: `${base}/judge`, EVAL_JUDGE_MODEL: "m", EVAL_JUDGE_KEY_FILE: join(dir, "judge-key"),
+      EVAL_KEEP_TEXT: "1", EVAL_RECORD_DIR: join(dir, "records") }, dir);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      assert.match(run.out, /ERROR t-a-002#1 infra: judge answered 503: running it again once/);
+      assert.match(run.out, /pass t-a-002#1 .*\(second try\)/);
+      const recs = readFileSync(join(dir, "records", "assistant-recordings.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      assert.deepEqual(recs.map((x) => `${x.case_id}#${x.attempt}`), ["t-a-002#1"], "one recording for one attempt");
+      // Graded again offline, the case has the one attempt the live report has.
+      const off = runner(base, [answer], { EVAL_OFFLINE: join(dir, "records", "assistant-recordings.jsonl"), EVAL_OUT: join(dir, "offline") }, dir);
+      const offRun = await off.done;
+      const offline = JSON.parse(readFileSync(join(dir, "offline", "assistant.json"), "utf8"));
+      assert.equal(offline.results.find((x: any) => x.id === "t-a-002").attempts.length, 1, offRun.out);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it("R7b an assistant session still running before a case: nothing is sent", { timeout: 120_000 }, async () => {
