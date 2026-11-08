@@ -28,7 +28,7 @@ import {
   BODY_MAX, NOTE_MAX, SIMILARITY_THRESHOLD, TITLE_MAX, isMemoryType, legacyType, memoryCommand, normalizeText,
   quoteIsFrom, quoteSupports, rankByMessage, scanInjection, scanSecrets, similarity, type MemoryType,
 } from "./gates.js";
-import { citedBy, LINKS_PER_ENTRY_MAX, linkDerived, relinkEntry, resolveNames, unlinkErased } from "./links.js";
+import { citedBy, linkDerived, relinkEntry, resolveNames, unlinkErased } from "./links.js";
 
 const logger = pino({ name: "memory-service" });
 
@@ -631,34 +631,42 @@ export interface LinkedMemory { row: MemoryRow; hop: number; via: string }
  * The entries the user's links reach from `seeds`, breadth first, at most LINK_RECALL_DEPTH hops and `max` entries, in both
  * directions (what a seed cites or is derived from, and what cites it or is derived from it). Every hop is read from this user's
  * rows only: a link is this user's, and the entry it reaches must be this user's, active and not past review; a hop never passes
- * through one that is not. Not counted as reads, as the seeds are not. At most CLAW_MEMORY_MAX_ENTRIES x LINKS_PER_ENTRY_MAX links
- * are read, and one read of the entries per hop.
+ * through one that is not. Not counted as reads, as the seeds are not. Per hop, one read of the links of the entries it starts
+ * from (all of them) and one read of the entries it reaches.
  */
 export async function expandAlongLinks(userId: string, seeds: readonly MemoryRow[], max: number): Promise<LinkedMemory[]> {
   if (!seeds.length || max <= 0) return [];
-  const links = (await db.query(
-    `SELECT from_id, rel, to_id FROM claw_memory_links WHERE user_id = $1 AND to_kind = 'memory' LIMIT $2`,
-    [userId, CLAW_MEMORY_MAX_ENTRIES * LINKS_PER_ENTRY_MAX],
-  )).rows as Array<{ from_id: number; rel: string; to_id: string }>;
-  const next = new Map<number, Array<{ to: number; via: (from: number) => string }>>();
-  const add = (a: number, b: number, via: (from: number) => string): void => {
-    const list = next.get(a) ?? [];
-    list.push({ to: b, via });
-    next.set(a, list);
+  // The links of the entries a hop starts from, read per hop and only theirs: no limit can drop one of them. An entry has at most
+  // LINKS_PER_ENTRY_MAX + 1 links of its own and the user at most CLAW_MEMORY_MAX_ENTRIES entries, so a read is bounded by those.
+  const linksOf = async (ids: readonly number[]): Promise<Map<number, Array<{ to: number; via: (from: number) => string }>>> => {
+    const rows = (await db.query(
+      `SELECT from_id, rel, to_id FROM claw_memory_links
+        WHERE user_id = $1 AND to_kind = 'memory' AND (from_id = ANY($2::int[]) OR to_id = ANY($3::text[]))
+        ORDER BY from_id, to_id`,
+      [userId, ids, ids.map(String)],
+    )).rows as Array<{ from_id: number; rel: string; to_id: string }>;
+    const next = new Map<number, Array<{ to: number; via: (from: number) => string }>>();
+    const add = (a: number, b: number, via: (from: number) => string): void => {
+      const list = next.get(a) ?? [];
+      list.push({ to: b, via });
+      next.set(a, list);
+    };
+    for (const l of rows) {
+      const from = Number(l.from_id);
+      const to = Number(l.to_id);
+      if (!Number.isSafeInteger(to) || from === to) continue;
+      const verb = l.rel === "derived_from" ? "is derived from" : "cites";
+      add(from, to, (x) => `#${x} ${verb} it`);
+      add(to, from, (x) => `it ${verb} #${x}`);
+    }
+    return next;
   };
-  for (const l of links) {
-    const from = Number(l.from_id);
-    const to = Number(l.to_id);
-    if (!Number.isSafeInteger(to) || from === to) continue;
-    const verb = l.rel === "derived_from" ? "is derived from" : "cites";
-    add(from, to, (x) => `#${x} ${verb} it`);
-    add(to, from, (x) => `it ${verb} #${x}`);
-  }
   const seen = new Set(seeds.map((r) => r.id));
   const out: LinkedMemory[] = [];
   let frontier = seeds.map((r) => r.id);
   for (let hop = 1; hop <= LINK_RECALL_DEPTH && frontier.length && out.length < max; hop += 1) {
     const reached: Array<{ id: number; via: string }> = [];
+    const next = await linksOf(frontier);
     for (const f of frontier) {
       for (const e of next.get(f) ?? []) {
         if (seen.has(e.to) || reached.some((r) => r.id === e.to)) continue;

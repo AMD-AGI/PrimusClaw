@@ -19,6 +19,7 @@
  *   X1  the turn recall follows links from what the message matched, two hops at most, saying how each entry was reached
  *   X2  ... in both directions: what cites a matched entry, and what it cites
  *   X3  ... never to another user's entry, nor through one waiting for confirmation or past review
+ *   X5  ... whatever else the user's links hold: a hop reads every link of the entries it starts from
  *   X4  ... and shows at most TURN_RECALL_MAX_ENTRIES entries and TURN_RECALL_MAX_CHARS body characters in all
  *   L12 an update waits for the user's write lock before it locks a row: a forget-all holding the lock deletes the row, and neither
  *       deadlocks
@@ -257,6 +258,19 @@ describe("memory citations", { skip }, () => {
     assert.ok(lineOf(block, a), block);
     for (const id of [theirs, pending, behind, due]) assert.equal(lineOf(block, id), "", `#${id} shown: ${block}`);
     assert.ok(!block.includes("门禁") && !block.includes("4321"), block);
+  });
+
+  test("X5 a hop reads every link of the entries it starts from, however many other links there are", async () => {
+    // 1200 links of another entry, more than any fixed cap over all of the user's links would read, sorting before the chain's.
+    const other = await save("alice", "杂项", "很多引用。");
+    await w.q(
+      `INSERT INTO claw_memory_links (user_id, from_id, rel, name, to_kind, to_id, created_by)
+       SELECT 'alice', $1, 'cites', '', 'memory', '00' || g, 'system' FROM generate_series(1, 1200) g`,
+      [other],
+    );
+    const { a, b } = await chain();
+    const block = await recallFor("Kestrel 用的数据集叫什么？");
+    assert.ok(lineOf(block, b).endsWith(`(found because #${a} cites it)`), block);
   });
 
   test("X4 at most TURN_RECALL_MAX_ENTRIES entries and TURN_RECALL_MAX_CHARS body characters in all", async () => {
