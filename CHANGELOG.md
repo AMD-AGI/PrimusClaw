@@ -127,6 +127,11 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A research report's citation check judges each statement with the whole line it is written in (a statement cut at a
+  mid-sentence citation was judged as a fragment), and reads only the parts of a long page that bear on the statements: the
+  paragraphs sharing the most rare words with them, each statement's best first, at most about 4k tokens a judgement (a whole
+  page was about 33k). On a 137-statement report this took the judge's input from 1.54M to 0.29M tokens. The judge's verdicts
+  are the last array of booleans in its answer, so one that reasons first is still read.
 - The super-agent evaluation no longer grades a router turn by its server "on it" line (收到，我看一下。). A turn that ended in plain
   text has its words said by the server just after its end, after that line; the wait after a turn's end took the line for the reply
   and graded before the answer arrived (E242 memory-chain run, cat-memory-chain-013: line at 3.5 s, answer at 4.2 s). The wait now

@@ -21,13 +21,16 @@
  *        answered again, its statements are marked not checked (未核对), counted apart, and counted in the metric
  *   CC12 the judge is asked with an output budget a thinking model can answer in, and an empty reply is no answer; on the page
  *        summarizer's model while CITE_CHECK_MODEL is blank
+ *   CC14 a long page is cut to the parts that bear on the statements: each statement's best paragraph, within the excerpt budget,
+ *        in page order; a short page is given whole
+ *   CC15 the judge gets each statement with its whole line, and the excerpt, not the whole page
  *   CC13 up to 80 sources are checked; a source past that cap, a statement past the statements cap and a batch the budget ran out
  *        before are not checked (未核对), never unverified
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  checkReport, judgePrompt, parseCiteCheck, parseVerdicts, type CheckedPage, type CiteCheckPorts,
+  CITE_CHECK_EXCERPT_CHARS, checkReport, judgePrompt, pageExcerpt, parseCiteCheck, parseVerdicts, type CheckedPage, type CiteCheckPorts,
 } from "../src/tools/cite-check.js";
 import { readCitedPage } from "../src/tools/web/cite-check-ports.js";
 import { ToolRouter } from "../src/tools/router.js";
@@ -231,6 +234,7 @@ test("CC10 the judge is asked with the page as data and answered with booleans o
   assert.equal(parseVerdicts("[true]", 2), null);
   assert.equal(parseVerdicts("[\"yes\", true]", 2), null);
   assert.equal(parseVerdicts("no array", 1), null);
+  assert.deepEqual(parseVerdicts("Statement [1] is in the page, [2] is not: [true, false]", 2), [true, false], "the last boolean array, after reasoning");
 });
 
 test("CC11 a judge with no answer is asked once more; still none: not checked, counted apart and in the metric", async () => {
@@ -279,7 +283,8 @@ test("CC12 the judge has an output budget a thinking model can answer in, and an
   const signal = new AbortController().signal;
   assert.equal(await ports.judge({ url: A, page: "p", claims: ["x", "y"] }, signal), null, "an empty reply cut at max_tokens is no answer");
   reply = { content: [{ type: "thinking", thinking: "..." }, { type: "text", text: "[true, false]" }], stop_reason: "end_turn" };
-  assert.deepEqual(await ports.judge({ url: A, page: "p", claims: ["x", "y"] }, signal), [true, false]);
+  assert.deepEqual(await ports.judge({ url: A, page: "p", claims: ["x", "y"], contexts: ["x and its line", "y"] }, signal), [true, false]);
+  assert.match(JSON.stringify(asked.at(-1)), /its line: x and its line/, "the judge's prompt carries the statement's line");
   assert.equal(CITE_CHECK_JUDGE_MAX_TOKENS, 4096);
   assert.deepEqual(asked.map((a) => a.max_tokens), [4096, 4096]);
   const { WEB_FETCH_SUMMARIZE_MODEL } = await import("../src/config.js");
@@ -320,4 +325,46 @@ test("CC13 what the caps or the budget leave out is not checked, never unverifie
     judge: async ({ claims }) => { clock += CITE_CHECK_BUDGET_MS + 1; return claims.map(() => true); },
   });
   assert.deepEqual([late.supported, late.unverified, late.unchecked], [CITE_CHECK_CLAIMS_PER_CALL, 0, 4]);
+});
+
+test("CC14 a long page is cut to the parts that bear on the statements", () => {
+  const filler = (i: number) => `Unrelated paragraph ${i} about cooking pasta, gardening and weather in the mountains, nothing else here at all.`;
+  const paras = Array.from({ length: 600 }, (_, i) => filler(i));
+  paras.splice(10, 0, "The MI300X (gfx942) is supported from ROCm 6.3 onward by vLLM.");
+  paras.splice(550, 0, "SGLang ships images tagged v0.5.23-rocm10-mi35x for the MI355X.");
+  const page = paras.join("\n\n");
+  assert.ok(page.length > 4 * CITE_CHECK_EXCERPT_CHARS);
+  const ex = pageExcerpt(page, ["vLLM supports the MI300X gfx942 from ROCm 6.3", "SGLang has a v0.5.23-rocm10-mi35x image"]);
+  assert.ok(ex.length <= CITE_CHECK_EXCERPT_CHARS, `${ex.length}`);
+  assert.match(ex, /MI300X \(gfx942\) is supported from ROCm 6\.3/, "the first statement's paragraph, near the top");
+  assert.match(ex, /v0\.5\.23-rocm10-mi35x/, "the second statement's paragraph, near the end");
+  assert.ok(ex.indexOf("gfx942") < ex.indexOf("rocm10-mi35x"), "in page order");
+  assert.equal(pageExcerpt("a short page", ["anything"]), "a short page", "a page within the budget is given whole");
+  // A number with thousands separators, an identifier with underscores, a dashed tag: each found by its parts.
+  const counts = [...Array.from({ length: 500 }, (_, i) => filler(i)), "Merged pull requests: 2,166", "", "ROCM_AITER_FA is the default backend", "", "image lmsysorg/sglang:v0.5.23-rocm10-mi35x"].join("\n\n");
+  const ex2 = pageExcerpt(counts, ["近 30 天合入 PR 2166", "ROCM AITER FA 是默认后端", "镜像标签含 rocm10"]);
+  assert.match(ex2, /2,166/);
+  assert.match(ex2, /ROCM_AITER_FA/);
+  assert.match(ex2, /v0\.5\.23-rocm10-mi35x/);
+  // Chinese statements match Chinese paragraphs.
+  const zh = [...Array.from({ length: 400 }, (_, i) => filler(i)), "官方文档说明 MI350 需要 ROCm 7.0 或更高版本。"].join("\n\n");
+  assert.match(pageExcerpt(zh, ["MI350 需要 ROCm 7.0 或更高"]), /MI350 需要 ROCm 7\.0/);
+});
+
+test("CC15 the judge gets each statement with its whole line, and an excerpt of a long page", async () => {
+  const long = [...Array.from({ length: 800 }, (_, i) => `Filler ${i} on unrelated matters of no interest whatsoever to anyone.`), "vLLM supports mi300x since v0.6."].join("\n\n");
+  const seen: Array<{ page: string; claims: string[]; contexts?: string[] }> = [];
+  const text = ["- 1. vLLM supports mi300x [1] and more since v0.6.", "", `[1]: vLLM — ${A}`].join("\n");
+  const r = await checkReport(text, {
+    fetchPage: async () => ({ ok: true, text: long }),
+    judge: async (input) => { seen.push(input); return input.claims.map(() => true); },
+  });
+  assert.equal(r.supported, 1);
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0].page.length <= CITE_CHECK_EXCERPT_CHARS && seen[0].page.length < long.length / 4, "not the whole page");
+  assert.match(seen[0].page, /vLLM supports mi300x since v0\.6\./);
+  assert.deepEqual(seen[0].claims, ["1. vLLM supports mi300x"]);
+  assert.deepEqual(seen[0].contexts, ["1. vLLM supports mi300x and more since v0.6."], "the statement's whole line, citations out");
+  const { user } = judgePrompt(A, "p", seen[0].claims, seen[0].contexts);
+  assert.match(user, /1\. 1\. vLLM supports mi300x\n   \(its line: 1\. vLLM supports mi300x and more since v0\.6\.\)/);
 });
