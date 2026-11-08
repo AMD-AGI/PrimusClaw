@@ -354,3 +354,22 @@ test("text shown by a model call that failed and is tried again is taken back; t
     ["toolTextDelta", "text-2-0", "下个月冻结期从 12 月 4 日开始。"],
   ]);
 });
+
+test("every text a model call showed is taken back when a tool call follows, two blocks split by thinking included", async () => {
+  const { session: s } = session([
+    {
+      content: [{ type: "text", text: "先看一下" }, { type: "thinking", thinking: "" } as unknown as LlmContentBlock, { type: "text", text: "再查节点" },
+        use("toolu_m", "mcp__safe__node_list")],
+      during: async (o) => {
+        o!.text!.onText({ index: 0, text: "先看一下" });
+        o!.text!.onText({ index: 2, text: "再查节点" });
+        o!.text!.onToolCall();
+      },
+    },
+    { content: [{ type: "text", text: "done" }] },
+  ]);
+  const { opts: o, events } = opts({ llmSession: s, streamToolText: [SAY], streamTextAs: SAY });
+  await agentLoop([{ role: "user", content: "nodes?" }], TOOLS, o);
+  assert.deepEqual(events.filter((e) => e.type === "toolTextVoid").map((e) => e.actionId).sort(), ["text-1-0", "text-1-2"]);
+});
+

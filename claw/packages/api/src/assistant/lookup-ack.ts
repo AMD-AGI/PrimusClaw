@@ -83,34 +83,49 @@ async function routerUser(q: Querier, sessionId: string): Promise<string | null>
 /** For the tests: forget which sessions were routers, and which turns' text was noted. */
 export function resetLookupAckCacheForTest(): void { routerUserOf.clear(); textPreviewNoted.clear(); }
 
-/** The turns whose shown text this process has noted, by message id, and how: a delta every few hundred ms writes the run once. */
+/** The previews this process has noted, by turn and preview id, and how: a delta every few hundred ms writes the run once. */
 const textPreviewNoted = new Map<string, boolean>();
 
 /**
  * Note on the run answering `messageId` that its own text is being shown as its say's (`stream_text_as`: a `toolTextDelta` with
- * `source: "text"`), or that it was taken back (`toolTextVoid`, same source): the turn has started to answer, so the "on it" line is not
- * said over it (`reasonToStaySilent`), and its end takes back what was shown if it does not say it (`router-turn-end.ts`). The deltas
- * are never stored, and the events of one turn reach every API process, so it is kept on the run. Taken back wins: a delta handled late
- * by another process never marks the run again. False when it could not be written: the caller has the event delivered again.
+ * `source: "text"`), or that a shown text was taken back (`toolTextVoid`, same source), by the preview's id (`actionId`): the turn has
+ * started to answer, so the "on it" line is not said over it (`reasonToStaySilent`), and its end takes back what was shown if it does
+ * not say it (`router-turn-end.ts`). The deltas are never stored, and the events of one turn reach every API process, so it is kept on
+ * the run: `text_preview` is the id of the text on screen (or false), `text_voided` the ids taken back. A take-back wins over its own
+ * preview only: a late delta of a text taken back never marks the run again, while the next text the turn shows (a retried model call
+ * writes it under a new id) does. A take-back of an earlier text leaves a later one marked. False when it could not be written: the
+ * caller has the event delivered again.
  */
-export async function noteTextPreview(sessionId: string, messageId: string, showing: boolean, q: Querier = (t, p) => db.query(t, p)): Promise<boolean> {
-  if (!sessionId || !messageId || textPreviewNoted.get(messageId) === showing) return true;
+export async function noteTextPreview(
+  sessionId: string, messageId: string, previewId: string, showing: boolean, q: Querier = (t, p) => db.query(t, p),
+): Promise<boolean> {
+  const key = `${messageId}\u0000${previewId}`;
+  if (!sessionId || !messageId || !previewId || textPreviewNoted.get(key) === showing) return true;
   if (textPreviewNoted.size >= ROUTER_CACHE_MAX) textPreviewNoted.clear();
-  textPreviewNoted.set(messageId, showing);
+  textPreviewNoted.set(key, showing);
   try {
     await q(
-      `UPDATE claw_tasks SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{text_preview}', to_jsonb($3::boolean), true)
-        WHERE session_id = $1 AND origin = 'chat' AND metadata->>'message_id' = $2
-          AND ($3::boolean = false OR NOT (COALESCE(metadata, '{}'::jsonb) ? 'text_preview'))`,
-      [sessionId, messageId, showing],
+      showing
+        ? `UPDATE claw_tasks SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{text_preview}', to_jsonb($3::text), true)
+            WHERE session_id = $1 AND origin = 'chat' AND metadata->>'message_id' = $2
+              AND NOT (COALESCE(metadata->'text_voided', '[]'::jsonb) ? $3)`
+        : `UPDATE claw_tasks SET metadata = jsonb_set(
+                 jsonb_set(COALESCE(metadata, '{}'::jsonb), '{text_voided}', COALESCE(metadata->'text_voided', '[]'::jsonb) || to_jsonb($3::text), true),
+                 '{text_preview}', CASE WHEN metadata->>'text_preview' = $3 OR NOT (COALESCE(metadata, '{}'::jsonb) ? 'text_preview')
+                                        THEN 'false'::jsonb ELSE metadata->'text_preview' END, true)
+            WHERE session_id = $1 AND origin = 'chat' AND metadata->>'message_id' = $2`,
+      [sessionId, messageId, previewId],
     );
     return true;
   } catch (err) {
-    textPreviewNoted.delete(messageId);
+    textPreviewNoted.delete(key);
     logger.warn({ err: (err as Error)?.message, sessionId, messageId }, "assistant.text_preview_note_failed");
     return false;
   }
 }
+
+/** Whether a run's `text_preview` (as `metadata->>'text_preview'`) says a text of its own is on screen: a preview id, not false. */
+export const textShown = (preview: string | null | undefined): boolean => !!preview && preview !== "false";
 
 /**
  * Why the turn answering `messageId` is not to be told "on it" now, or null when it is: read fresh each time, so the check after the
@@ -144,7 +159,7 @@ async function reasonToStaySilent(
     : await q("SELECT 1 FROM claw_assistant_says WHERE user_id = $1 AND created_at >= $2 LIMIT 1", [userId, run.began]);
   if (said.rowCount) return "spoke";
   // Its own text is on the person's screen as it is written (`noteTextPreview`): the turn has started to answer, as with a say.
-  if (run.text_preview === "true") return "writing";
+  if (textShown(run.text_preview)) return "writing";
   // A say the router has started and that has not ended (written beside the lookup, still being stored). One that ended stored a row
   // (`spoke`) or was refused: a refused say holds nothing back, the router writes it again a few seconds later (2026-11-07 run:
   // cat-memory-ro-001 and cat-items-ro-001, a say refused at 3.2 s and said again at 5.3 s and 5.9 s).

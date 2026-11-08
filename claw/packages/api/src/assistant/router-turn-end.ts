@@ -37,6 +37,7 @@ import { answerEventItemOf, TOOL_NAME_PREFIX, WORK_EVENT_PREFIX } from "./prompt
 import { ROUTER_ASSISTANT_READS, ROUTER_SPEAK_TOOL } from "./read-tools.js";
 import { releaseHeldSays } from "./say-hold.js";
 import { voidStreamedSay } from "./router-speed.js";
+import { textShown } from "./lookup-ack.js";
 import { kickDelivery } from "../notifications/outbox.js";
 import { metrics } from "../infra/metrics.js";
 
@@ -323,7 +324,7 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
   // The turn's own text was shown as it was written (`stream_text_as`, `noteTextPreview`) and is still on screen. Unless it is said now
   // as the answer, it is taken back (`voidStreamedSay`), so a channel does not keep words that never come as a message: a turn that
   // failed, handed a review over, wrote internal text, or met the say limit.
-  const shown = runs.some((r) => r.text_preview === "true");
+  const shown = runs.some((r) => textShown(r.text_preview));
   const takeBack = async (reason: string): Promise<void> => {
     if (shown) await voidStreamedSay(end.sessionId, end.messageId ?? runs.find((r) => r.message_id)?.message_id ?? undefined, reason, deps.publishSessionEvent);
   };
@@ -345,7 +346,11 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
   const why = lostWhy(end);
   let text = lost ? turnLostNotice(prompts, why) : answerToDeliver(end.finalText, prompts);
   if (lost) await takeBack(why === "declined" ? "declined" : "turn_lost");
-  if (!text) return lost ? "skipped" : await sayLookedButSilent(end, router.user_id, runs, prompts, deps);
+  if (!text) {
+    if (lost) return "skipped";
+    await takeBack("no_text");
+    return sayLookedButSilent(end, router.user_id, runs, prompts, deps);
+  }
   // The message the turn answered, as the completion names it, or as its runs were started for it (a sweeper's completion may not say).
   const answered = new Set([end.messageId, ...runs.map((r) => r.message_id)].filter((m): m is string => !!m));
   for (const messageId of answered) {
@@ -377,6 +382,7 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
     if (!lost && !leaked) {
       logger.info({ sessionId: end.sessionId, runIds: end.runIds, chars: text.length }, "assistant.unsaid_text_after_say");
       metrics.onAssistantRouterUnsaid("after_say");
+      await takeBack("after_say");
     }
     return "skipped";
   }

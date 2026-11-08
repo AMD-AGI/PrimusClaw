@@ -448,8 +448,8 @@ export async function consumeEventDelivery(msg: {
     if (event.type === TOOL_TEXT_DELTA_EVENT || event.type === TOOL_TEXT_VOID_EVENT) {
       // A router turn's own text shown as its say's (`stream_text_as`), or taken back: noted on its run (`noteTextPreview`), which its
       // end reads to take back what it does not say. A note that could not be written is asked for again, not dropped.
-      if (event.source === "text" && typeof event.message_id === "string"
-        && !(await noteTextPreview(sessionId, event.message_id, event.type === TOOL_TEXT_DELTA_EVENT))) {
+      if (event.source === "text" && typeof event.message_id === "string" && typeof event.actionId === "string"
+        && !(await noteTextPreview(sessionId, event.message_id, event.actionId, event.type === TOOL_TEXT_DELTA_EVENT))) {
         msg.nak(TOMBSTONE_UNKNOWN_NAK_MS);
         return;
       }

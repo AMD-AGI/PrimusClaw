@@ -994,8 +994,8 @@ class AgentLoopRunner {
   private readonly depth: number;
   /** `streamTextAs`: the run's own text may still be shown (no call of that tool yet, and none taken back). */
   private textPreviewOpen = true;
-  /** The id of the run's own text shown last (`streamTextAs`), or null: what a void takes back. */
-  private textPreviewShown: string | null = null;
+  /** The ids of the run's own text on screen (`streamTextAs`): what a void takes back, every block of the model call that wrote them. */
+  private readonly textPreviewShown = new Set<string>();
   /** Model calls that could show the run's own text, for unique ids across retries and turns. */
   private textPreviewAttempts = 0;
   /** A sub-agent runs inside the slot its parent holds, so its waits must not
@@ -2351,7 +2351,7 @@ class AgentLoopRunner {
           if (!this.textPreviewOpen) return;
           const id = `text-${attempt}-${index}`;
           texts.add(id);
-          this.textPreviewShown = id;
+          this.textPreviewShown.add(id);
           throttle.preview(id, textAs, text);
         },
         onToolCall: () => this.voidTextPreview(throttle),
@@ -2370,17 +2370,20 @@ class AgentLoopRunner {
   }
 
   /**
-   * Take back the run's own text shown last (`toolTextVoid` under its id), if any: true when there was one. `reason` is why: a tool call
-   * followed it (`tool_call`), or the model call that wrote it failed and is tried again (`retry`).
+   * Take back every text of the run's own on screen (`toolTextVoid` under each id; a model call can write two text blocks, split by its
+   * thinking), if any: true when there was one. `reason` is why: a tool call followed it (`tool_call`), or the model call that wrote it
+   * failed and is tried again (`retry`). A delta of it already on its way may land after the void: a reader drops a preview's deltas
+   * after its void (`StreamVoided` in the API's `routes/events.ts`), and a channel that took text back shows no more of it.
    */
   private retractTextPreview(throttle: ToolTextThrottle, reason: "tool_call" | "retry"): boolean {
-    const id = this.textPreviewShown;
     const tool = this.opts.streamTextAs;
-    if (!id || !tool) return false;
-    this.textPreviewShown = null;
-    throttle.drop(id);
-    Promise.resolve(this.onEvent({ type: "toolTextVoid", tool, actionId: id, reason, source: "text" })).catch((err: unknown) =>
-      logger.warn({ err: (err as Error)?.message, sessionId: this.sessionId, tool }, "agent-loop.text_void_failed"));
+    if (!this.textPreviewShown.size || !tool) return false;
+    for (const id of this.textPreviewShown) {
+      throttle.drop(id);
+      Promise.resolve(this.onEvent({ type: "toolTextVoid", tool, actionId: id, reason, source: "text" })).catch((err: unknown) =>
+        logger.warn({ err: (err as Error)?.message, sessionId: this.sessionId, tool }, "agent-loop.text_void_failed"));
+    }
+    this.textPreviewShown.clear();
     return true;
   }
 

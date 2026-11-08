@@ -276,10 +276,42 @@ describe("assistant lookup ack and silent turns", { skip }, () => {
     // A note that could not be written says so (the consumer has the event delivered again), and is written on the next try.
     const third = await turn("再问一个");
     const broken = async () => { throw new Error("db down"); };
-    assert.equal(await ack.noteTextPreview(alice.routerSid, third.mid, true, broken as never), false);
-    assert.equal(await ack.noteTextPreview(alice.routerSid, third.mid, true), true);
+    assert.equal(await ack.noteTextPreview(alice.routerSid, third.mid, "text-1-0", true, broken as never), false);
+    assert.equal(await ack.noteTextPreview(alice.routerSid, third.mid, "text-1-0", true), true);
     const noted = await w.q("SELECT metadata->>'text_preview' AS v FROM claw_tasks WHERE task_id = $1", [third.task_id]);
-    assert.equal(noted[0].v, "true");
+    assert.equal(noted[0].v, "text-1-0");
+  });
+
+  test("A10 a model call that failed takes its text back and the retry shows its own: the turn is writing again (review of #539)", async (t0) => {
+    const t = await turn("下个月 Kestrel 的冻结期从哪天开始？");
+    const realTombstone = { ...w.mod.consumer.tombstoneReader };
+    Object.assign(w.mod.consumer.tombstoneReader, { has: async () => false });
+    t0.after(() => { Object.assign(w.mod.consumer.tombstoneReader, realTombstone); });
+    const deliver = async (event: Record<string, unknown>) => {
+      await w.mod.consumer.consumeEventDelivery({
+        subject: `events.${alice.routerSid}`, data: new TextEncoder().encode(JSON.stringify({ ...event, message_id: t.mid, ts: Date.now() })),
+        seq: 9_700 + ++seq, ack: () => {}, nak: () => { assert.fail("nak"); },
+      } as never);
+    };
+    const delta = (actionId: string, text: string) => ({ type: "toolTextDelta", tool: "mcp__assistant__say", actionId, text, source: "text" });
+    const voidOf = (actionId: string) => ({ type: "toolTextVoid", tool: "mcp__assistant__say", actionId, reason: "retry", source: "text" });
+    const preview = async () => (await w.q("SELECT metadata->>'text_preview' AS v FROM claw_tasks WHERE task_id = $1", [t.task_id]))[0].v;
+    await deliver(delta("text-1-0", "下个月冻"));
+    await deliver(voidOf("text-1-0"));
+    assert.equal(await preview(), "false");
+    await deliver(delta("text-2-0", "下个月冻结期从 12 月 4 日开始。"));
+    assert.equal(await preview(), "text-2-0", "the retry's text is on screen");
+    assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "writing", "no line over it");
+    // Late events of the text taken back change nothing: a delta of it marks nothing, its void again leaves the retry's text marked.
+    ack.resetLookupAckCacheForTest();
+    await deliver(delta("text-1-0", "下个月冻结"));
+    await deliver(voidOf("text-1-0"));
+    assert.equal(await preview(), "text-2-0");
+    assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "writing");
+    // Its own take-back clears it.
+    await deliver({ ...voidOf("text-2-0"), reason: "tool_call" });
+    assert.equal(await preview(), "false");
+    assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "said");
   });
 
   test("A9 a router turn has its own text streamed only for the people who have it, and only when it answers them", async (t0) => {
