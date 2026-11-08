@@ -584,6 +584,16 @@ test("CC19 a run's second check judges only what is new or changed", async () =>
   await checkReport(nulReport("good\u0000part [1] tail"), nul.ports, undefined, nul.verdicts);
   const r = await checkReport(nulReport("good [1] part\u0000tail"), nul.ports, undefined, nul.verdicts);
   assert.equal(r.supported, 1);
+
+  // A statement that cited two sources and now cites one is judged again: the judge decides a different question.
+  const parts = parseCiteCheck({ tools: ["t"] }, {
+    fetchPage: async () => ({ ok: true, text: "x" }),
+    judge: async ({ claims, sourceCounts }) => claims.map((_, k) => (sourceCounts?.[k] ?? 1) > 1),
+  })!;
+  const two = await checkReport(`- A statement with two sources [1][2].\n\n[1]: A — ${A}\n[2]: B — ${B}`, parts.ports, undefined, parts.verdicts);
+  assert.equal(two.supported, 1);
+  const one = await checkReport(`- A statement with two sources [1].\n\n[1]: A — ${A}\n[2]: B — ${B}`, parts.ports, undefined, parts.verdicts);
+  assert.equal(one.supported, 0, "the verdict given for its part of two is not taken for the whole");
   judged.length = 0;
   const other = parseCiteCheck({ tools: ["mcp__assistant__deliver_text"] }, ports)!;
   assert.equal(other.verdicts.size, 0, "a new run starts with nothing");

@@ -150,7 +150,7 @@ record it.
   (28.6 MB), and each whole read of it cost its reader about 200 MB, which ended a 512 MiB pod.
 - A research report sent back to its writer and delivered again is judged only for what changed: the citation check keeps,
   for its run only, the verdicts it settled (a page supports a statement, or both looks said no), keyed by source address,
-  statement text and context, and takes them as they were in the run's next check; a page whose statements are all settled is
+  statement text, context and how many sources it cites, and takes them as they were in the run's next check; a page whose statements are all settled is
   not read again. On a live report the second check had cost as much as the first ($0.76 against $0.82).
 - A research report's citation check reads a table row cell by cell: each cited cell is a statement of its own, read with
   its row label and column header and judged only against the sources it cites, never with the other cells of the row. A

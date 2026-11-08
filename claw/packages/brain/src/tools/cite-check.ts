@@ -300,11 +300,11 @@ export function tableHeader(lines: string[], i: number): string[] | null {
 export type VerdictCache = Map<string, boolean>;
 
 /**
- * The key of a verdict: the source's address, the statement's text and its context, as the judge was given them, encoded as a JSON
- * array so that no text, whatever characters it holds, can make two different triples one key.
+ * The key of a verdict: the source's address, the statement's text, its context and how many listed sources it cites, as the judge
+ * was given them, encoded as a JSON array so that no text, whatever characters it holds, can make two different inputs one key.
  */
-export function verdictKey(url: string, text: string, context: string): string {
-  return JSON.stringify([url, text, context]);
+export function verdictKey(url: string, text: string, context: string, sourceCount = 1): string {
+  return JSON.stringify([url, text, context, sourceCount]);
 }
 
 /** Run `work` over `items`, at most `limit` at a time. */
@@ -356,7 +356,9 @@ export async function checkReport(
   let judgeFailures = 0;
   let secondLook = 0;
   // Verdicts this run already settled for a statement on a source (`VerdictCache`): applied as they are, not judged again.
-  const key = (n: number, i: number): string => verdictKey(sources.get(n)!.url, claims[i].text, claims[i].context);
+  // The number of listed sources a statement cites is part of what the judge decides (one of several need support only its part).
+  const key = (n: number, i: number): string =>
+    verdictKey(sources.get(n)!.url, claims[i].text, claims[i].context, claims[i].numbers.filter((m) => sources.has(m)).length);
   const settled = new Set<string>();
   // The (source, statement) pairs the second look said no to: settled, kept for the run's next check.
   const secondNo = new Set<string>();
