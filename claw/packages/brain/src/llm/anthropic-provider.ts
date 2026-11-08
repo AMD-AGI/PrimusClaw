@@ -83,6 +83,32 @@ function toolTextSoFar(
   }
 }
 
+/**
+ * The stream's events, with an event that is not JSON reported as a cut stream.
+ *
+ * The SDK parses each SSE event with `JSON.parse` and lets a SyntaxError out.
+ * The gateway produces such an event when its own upstream connection closes
+ * mid-event: LiteLLM's pass-through forwards bytes as they arrive and then
+ * writes its error frame (`data: {"error": {"message": "Connection closed. ..."}}`)
+ * straight after the partial line, so the SDK reads
+ * `{"type":"content_block_delta","index"data: {"error": ...` as one event.
+ * That is the same failure as a stream that ends without a stop_reason, and is
+ * retried the same way; left as a bare SyntaxError it failed the whole run.
+ * Only errors from the stream itself pass through here: one thrown by the loop
+ * body that consumes these events never reaches this generator.
+ */
+export async function* streamEvents<T>(stream: AsyncIterable<T>): AsyncGenerator<T> {
+  try {
+    for await (const evt of stream) yield evt;
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    const cut: any = new Error(`stream truncated: an event was not valid JSON (${err.message})`);
+    cut.code = "STREAM_TRUNCATED";
+    cut.cause = err;
+    throw cut;
+  }
+}
+
 async function streamingTurn(
   client: Anthropic,
   model: string,
@@ -243,7 +269,7 @@ async function streamingTurn(
   let bodyModel: string | undefined;
 
   try {
-    for await (const evt of stream as AsyncIterable<RawMessageStreamEvent>) {
+    for await (const evt of streamEvents(stream as AsyncIterable<RawMessageStreamEvent>)) {
       armIdleTimer();
       if (signal?.aborted) break;
 
