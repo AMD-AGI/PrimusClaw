@@ -600,6 +600,37 @@ test("CC19 a run's second check judges only what is new or changed", async () =>
   const d2 = await checkReport(dup, { fetchPage: async () => ({ ok: true, text: "x" }), judge: async ({ claims }) => { judgedAgain++; return claims.map(() => true); } }, undefined, twice.verdicts);
   assert.deepEqual([d2.supported, d2.unverified, judgedAgain], [2, 0, 0]);
 
+  // One statement citing two list entries with one address: supported on one, rejected by both looks on the other; kept as supported.
+  const sameUrl = parseCiteCheck({ tools: ["t"] }, { fetchPage: async () => ({ ok: true, text: "x" }), judge: async () => null })!;
+  let calls2 = 0;
+  const s1 = await checkReport(`- A statement on two entries [1][2].\n\n[1]: A — ${A}\n[2]: A again — ${A}`, {
+    fetchPage: async () => ({ ok: true, text: "x" }),
+    judge: async ({ claims }) => { calls2++; return claims.map(() => calls2 === 1); },
+  }, undefined, sameUrl.verdicts);
+  assert.equal(s1.supported, 1);
+  assert.deepEqual([...sameUrl.verdicts.values()], [true]);
+  let judgedSame = 0;
+  const s2 = await checkReport(`- A statement on two entries [1][2].\n\n[1]: A — ${A}\n[2]: A again — ${A}`, {
+    fetchPage: async () => ({ ok: true, text: "x" }),
+    judge: async ({ claims }) => { judgedSame++; return claims.map(() => false); },
+  }, undefined, sameUrl.verdicts);
+  assert.deepEqual([s2.supported, judgedSame], [1, 0], "settled as supported: not judged again, still supported");
+
+  // Two checks of one run at once (a sub-agent's delivery beside its parent's): the one that finds the key rejected and writes
+  // last does not undo the other's support.
+  const both = parseCiteCheck({ tools: ["t"] }, { fetchPage: async () => ({ ok: true, text: "x" }), judge: async () => null })!;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const single = `- Statement on alpha [1].\n\n[1]: A — ${A}`;
+  const slowNo = checkReport(single, {
+    fetchPage: async () => { await gate; return { ok: true, text: "x" }; },
+    judge: async ({ claims }) => claims.map(() => false),
+  }, undefined, both.verdicts);
+  await checkReport(single, { fetchPage: async () => ({ ok: true, text: "x" }), judge: async ({ claims }) => claims.map(() => true) }, undefined, both.verdicts);
+  release();
+  await slowNo;
+  assert.deepEqual([...both.verdicts.values()], [true], "a supported key is never set back to rejected");
+
   // A statement that cited two sources and now cites one is judged again: the judge decides a different question.
   const parts = parseCiteCheck({ tools: ["t"] }, {
     fetchPage: async () => ({ ok: true, text: "x" }),

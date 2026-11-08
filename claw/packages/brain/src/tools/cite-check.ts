@@ -503,7 +503,9 @@ export async function checkReport(
       else if (secondNo.has(k) && !found.has(k)) found.set(k, false);
     }
   });
-  for (const [k, v] of found) verdicts.set(k, v);
+  // Nor by another check of the run that read the cache before this one wrote to it (a sub-agent's delivery running beside it): a
+  // supported key is never set back to rejected.
+  for (const [k, v] of found) if (v || verdicts.get(k) !== true) verdicts.set(k, v);
 
   const zh = isChinese(text);
   const mark = zh ? "（未证实）" : " (unverified)";
