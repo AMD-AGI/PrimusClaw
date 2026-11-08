@@ -292,7 +292,7 @@ test("CC13 what the caps or the budget leave out is not checked, never unverifie
   assert.equal(CITE_CHECK_MAX_SOURCES, 80);
   const url = (n: number) => `https://docs.example.org/page-${n}`;
   const yes: CiteCheckPorts["judge"] = async ({ claims }) => claims.map(() => true);
-  const open: CiteCheckPorts["fetchPage"] = async () => ({ ok: true, text: "page" });
+  const open: CiteCheckPorts["fetchPage"] = async (_url, _signal) => ({ ok: true, text: "page" });
 
   // 85 sources, one statement each: the first 80 are checked, the last 5 are not.
   const many = [
