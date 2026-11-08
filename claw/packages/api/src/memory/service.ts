@@ -51,12 +51,21 @@ export const memoryPorts = {
 };
 
 /**
- * Keep the entries' citations (`links.ts`) inside the transaction that changed them, under the user's write lock (the one
- * `writeMemory` takes, so two writes never resolve the same name at once) and a savepoint: a citation that cannot be kept is lost
- * and logged, and the write it follows stands.
+ * One writer of a user's memory at a time: taken first in every transaction that writes an entry, before any of its rows is
+ * locked, so that two writes (an update and a forget-all) never hold one each of the lock and a row the other waits for.
+ * Reentrant within the transaction.
+ */
+async function lockUser(q: Querier, userId: string): Promise<void> {
+  await q("SELECT pg_advisory_xact_lock(hashtext('claw_memory:' || $1))", [userId]);
+}
+
+/**
+ * Keep the entries' citations (`links.ts`) inside the transaction that changed them, under the user's write lock (`lockUser`, which
+ * the caller has taken already, so two writes never resolve the same name at once) and a savepoint: a citation that cannot be kept
+ * is lost and logged, and the write it follows stands.
  */
 async function maintainLinks(q: Querier, userId: string, what: string, work: () => Promise<void>): Promise<void> {
-  await q("SELECT pg_advisory_xact_lock(hashtext('claw_memory:' || $1))", [userId]);
+  await lockUser(q, userId);
   await q("SAVEPOINT memory_links");
   try {
     await work();
@@ -368,7 +377,7 @@ export async function writeMemory(userId: string, draft: MemoryDraft, actor: Mem
 
   const result = await inTransaction(async (q) => {
     // One writer per user at a time, so the count and the duplicate check hold for the insert that follows.
-    await q("SELECT pg_advisory_xact_lock(hashtext('claw_memory:' || $1))", [userId]);
+    await lockUser(q, userId);
     await opts.guard?.(q);
     const live = (await q(
       `SELECT id, category, content, mtype, title, evidence_quote, work_item_id FROM claw_memory_entries WHERE user_id = $1 AND ${LIVE_ROWS}`,
@@ -444,6 +453,7 @@ export async function updateMemory(
   const days = reviewDays(type, draft.expires_in_days);
   const quote = actor.kind === "model" ? actor.quote : null;
   const done = await inTransaction(async (q) => {
+    await lockUser(q, userId);
     await opts.guard?.(q);
     // The model's edit holds only while the entry is still active (a REST edit may have made it pending since).
     const updated = await q(
@@ -501,6 +511,7 @@ export async function forgetMemory(
   userId: string, id: number, actorKind: "model" | "api", guard?: (q: Querier) => Promise<void>,
 ): Promise<boolean> {
   return inTransaction(async (q) => {
+    await lockUser(q, userId);
     await guard?.(q);
     const found = (await q(
       `SELECT id FROM claw_memory_entries WHERE user_id = $1 AND id = $2 AND kind IS NULL AND deleted_at IS NULL${modelSees(actorKind)} FOR UPDATE`,
@@ -519,6 +530,7 @@ export async function undoMemory(
   userId: string, id: number, actorKind: "model" | "api", guard?: (q: Querier) => Promise<void>,
 ): Promise<"restored" | "deleted" | "not_found"> {
   return inTransaction(async (q) => {
+    await lockUser(q, userId);
     await guard?.(q);
     const row = (await q(
       `SELECT prev_title, prev_body FROM claw_memory_entries WHERE user_id = $1 AND id = $2 AND kind IS NULL AND deleted_at IS NULL${modelSees(actorKind)} FOR UPDATE`,
@@ -547,6 +559,7 @@ export async function undoMemory(
 /** Delete every entry of the user, the legacy profile with them. The count is what was deleted. */
 export async function forgetAllMemories(userId: string): Promise<number> {
   return inTransaction(async (q) => {
+    await lockUser(q, userId);
     const ids = (await q("SELECT id FROM claw_memory_entries WHERE user_id = $1 AND kind IS NULL", [userId])).rows.map((r) => Number(r.id));
     await eraseEntries(q, userId, ids, "api", "delete");
     return ids.length;

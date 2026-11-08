@@ -16,6 +16,8 @@
  *   L9  a cited entry renamed away takes the citation with it: the name is dangling again, and the recall shows no citation
  *   L10 a later entry that ties with the cited one leaves the name unjoined
  *   L11 an entry waiting for its owner's confirmation does not capture a name; confirmed, it is joined
+ *   L12 an update waits for the user's write lock before it locks a row: a forget-all holding the lock deletes the row, and neither
+ *       deadlocks
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -166,6 +168,26 @@ describe("memory citations", { skip }, () => {
     const ok = await svc.updateMemory("alice", r.id, {}, { kind: "api", attended: true });
     assert.ok(ok.ok && ok.status === "active", JSON.stringify(ok));
     assert.deepEqual(await links(), [`${dataset} cites memory:${r.id}`]);
+  });
+
+  test("L12 an update waits for the user's lock before locking a row: no deadlock with a forget-all holding it", async () => {
+    const id = await save("alice", "Kestrel 发布窗口", "Kestrel 只在每月第二个周四发布。");
+    const pool = w.h.app.db.db.pool as unknown as { connect(): Promise<{ query(t: string, p?: unknown[]): Promise<unknown>; release(): void }> };
+    const other = await pool.connect();
+    try {
+      // What a forget-all does: the user's lock first, then the delete of their rows.
+      await other.query("BEGIN");
+      await other.query("SELECT pg_advisory_xact_lock(hashtext('claw_memory:' || $1))", ["alice"]);
+      const update = svc.updateMemory("alice", id, { body: "Kestrel 改到每月第三个周四发布。" }, { kind: "api", attended: true });
+      await new Promise((r) => setTimeout(r, 300));
+      await other.query("DELETE FROM claw_memory_entries WHERE user_id = 'alice' AND id = $1", [id]);
+      await other.query("COMMIT");
+      const r = await update;
+      assert.ok(!r.ok && r.error === "not_found", JSON.stringify(r));
+    } finally {
+      await other.query("ROLLBACK").catch(() => undefined);
+      other.release();
+    }
   });
 });
 
