@@ -176,3 +176,75 @@ export function legacyType(category: string): MemoryType {
 export function isMemoryType(v: unknown): v is MemoryType {
   return typeof v === "string" && (MEMORY_TYPES as readonly string[]).includes(v);
 }
+
+// ===== Recall by a message =====
+
+/**
+ * The terms a text is matched on: each run of letters and digits as one word (`kestrel`, `wren`, `v3`), and each run of
+ * other characters (Chinese, Japanese, ...) as its character bigrams, a single character alone. Normalised as
+ * `normalizeText` does (NFKC, lower case), but split at whitespace and punctuation instead of joined across them, so
+ * that two English words do not make a bigram that neither holds.
+ */
+export function recallTerms(text: string): Set<string> {
+  const out = new Set<string>();
+  const s = (text || "").normalize("NFKC").toLowerCase();
+  for (const run of s.match(/[\p{L}\p{N}]+/gu) ?? []) {
+    for (const part of run.match(/[a-z0-9]+|[^a-z0-9]+/g) ?? []) {
+      if (/^[a-z0-9]/.test(part)) { out.add(part); continue; }
+      const chars = [...part];
+      if (chars.length === 1) out.add(chars[0]);
+      for (let i = 0; i + 1 < chars.length; i++) out.add(chars[i] + chars[i + 1]);
+    }
+  }
+  return out;
+}
+
+/** A word counts as the bigrams it spells (`kestrel` as six), so a name weighs what it would in the bigram measure. */
+function termLength(term: string): number {
+  return /^[a-z0-9]/.test(term) ? Math.max(1, term.length - 1) : 1;
+}
+
+export interface MessageRecallOptions {
+  /** At most this many, best first. */
+  limit: number;
+  /** The share of the message's known wording an entry must hold, 0..1 (`rankByMessage`). */
+  minScore: number;
+}
+
+/**
+ * The texts a message is about, best first. A text's score is the share of the message's wording it holds, each term
+ * weighted by how few of the texts share it (inverse document frequency over `texts`, so a word every entry has counts
+ * for little) and a word by its length (`termLength`), out of all the message's terms that any text holds: words no
+ * entry has (greetings, 一般, 哪天) neither help nor dilute. A text must also hold at least one term that few of the
+ * texts hold (a quarter of them, or two), so a message that shares only the commonest wording (用户, 时候) with many
+ * entries recalls nothing. Pure, and over the given texts only.
+ */
+export function rankByMessage<T>(
+  message: string, texts: readonly T[], textOf: (t: T) => string, opts: MessageRecallOptions,
+): Array<{ item: T; score: number }> {
+  const query = recallTerms(message);
+  if (!query.size || !texts.length) return [];
+  const docs = texts.map((t) => recallTerms(textOf(t)));
+  const n = docs.length;
+  const df = new Map<string, number>();
+  for (const g of query) {
+    let c = 0;
+    for (const d of docs) if (d.has(g)) c += 1;
+    if (c) df.set(g, c);
+  }
+  let known = 0;
+  const idf = new Map<string, number>();
+  for (const [g, c] of df) { const w = Math.log(1 + n / c) * termLength(g); idf.set(g, w); known += w; }
+  if (known <= 0) return [];
+  // A telling term: one at most a quarter of the texts hold, or two of a handful, where a quarter is less than one.
+  const rare = Math.max(2, Math.ceil(n / 4));
+  const out: Array<{ item: T; score: number; at: number }> = [];
+  docs.forEach((d, at) => {
+    let held = 0;
+    let distinctive = false;
+    for (const [g, w] of idf) if (d.has(g)) { held += w; if ((df.get(g) ?? 0) <= rare) distinctive = true; }
+    const score = held / known;
+    if (distinctive && score >= opts.minScore) out.push({ item: texts[at], score, at });
+  });
+  return out.sort((a, b) => b.score - a.score || a.at - b.at).slice(0, opts.limit).map(({ item, score }) => ({ item, score }));
+}

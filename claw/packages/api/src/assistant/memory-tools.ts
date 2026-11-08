@@ -23,14 +23,14 @@
  * to run, so a worker that was ever shown more than its item's entries (`memoryReached`) never answers unasked (`prReply`).
  */
 import pino from "pino";
-import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_MEMORY_TOOLS } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_MEMORY_TOOLS, CLAW_MEMORY_TURN_RECALL, CLAW_MEMORY_TURN_RECALL_USERS } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
-  buildMemoryCatalogue, forgetMemory, getMemoryPreference, listMemories, memoriesOfItem, memoryAvailable, memoryPorts, recallMemory, undoMemory,
+  buildMemoryCatalogue, forgetMemory, getMemoryPreference, listMemories, memoriesForMessage, memoriesOfItem, memoryAvailable, memoryPorts, recallMemory, undoMemory,
   updateMemory, writeMemory, type MemoryActor, type MemoryRow, type WriteResult,
 } from "../memory/service.js";
 import {
-  ITEM_MEMORY_INTRO, ROUTER_MEMORY_OFF, ROUTER_MEMORY_PREAMBLE, ROUTER_MEMORY_PROMPT, WORKER_MEMORY_PREAMBLE, renderItemMemories,
+  ITEM_MEMORY_INTRO, ROUTER_MEMORY_OFF, ROUTER_MEMORY_PREAMBLE, ROUTER_MEMORY_PROMPT, WORKER_MEMORY_PREAMBLE, renderItemMemories, renderTurnRecall,
 } from "./prompts.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
@@ -324,6 +324,30 @@ export async function routerMemoryParts(userId: string, sessionId: string): Prom
     if (!(await getMemoryPreference(userId))) return { prompt: ROUTER_MEMORY_OFF, entries: "" };
     const catalogue = await buildMemoryCatalogue(userId, { preamble: ROUTER_MEMORY_PREAMBLE, boundItems: await boundItemLabels(userId) });
     return { prompt: ROUTER_MEMORY_PROMPT, entries: catalogue?.text ?? "## Long-term Memory\n(no entries yet)" };
+  });
+}
+
+export interface TurnRecallSettings { all: boolean; users: ReadonlySet<string> }
+
+/** Who has the turn's recall (`CLAW_MEMORY_TURN_RECALL`, `CLAW_MEMORY_TURN_RECALL_USERS`). */
+export const turnRecallSettings: TurnRecallSettings = { all: CLAW_MEMORY_TURN_RECALL, users: CLAW_MEMORY_TURN_RECALL_USERS };
+
+/** Whether this user's router turns recall their memory for the message before the model answers. */
+export function memoryTurnRecallOn(userId: string | null | undefined, settings: TurnRecallSettings = turnRecallSettings): boolean {
+  return settings.all || (!!userId && settings.users.has(userId));
+}
+
+/**
+ * The router turn's recall: the user's entries the message is about, in full (`memoriesForMessage`, `renderTurnRecall`), or
+ * null. Asked only where the turn is shown the user's index (`routerMemoryParts` gave entries), so it reaches no further than the
+ * index and memory_recall already do: this user's own entries, in a session their memory serves, with their memory on. A failed
+ * read costs the turn its recall, never the turn (`orNothing`).
+ */
+export async function routerTurnRecall(userId: string, sessionId: string, message: string): Promise<{ text: string; ids: number[] } | null> {
+  if (!message.trim()) return null;
+  return orNothing("turn_recall", sessionId, async () => {
+    const rows = await memoriesForMessage(userId, message);
+    return rows.length ? { text: renderTurnRecall(rows), ids: rows.map((r) => r.id) } : null;
   });
 }
 
