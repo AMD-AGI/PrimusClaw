@@ -115,7 +115,14 @@ export class SnapshotFile {
     private readonly access: (dir: string) => Promise<unknown> = (dir) => fsp.access(dir),
   ) {}
 
+  /**
+   * Content equal to the newest already saved is not written again while that one is on disk or a write under way will put it
+   * there: connector.json is saved after every heartbeat, and rewriting (and, durable, flushing) an unchanged file each time kept
+   * the libuv thread pool busy, so every other file operation of the process (an adapter's start, the session records an event
+   * waits for) queued behind those flushes. After a failed write the same content is written again, as before.
+   */
   save(data: string): void {
+    if (this.saved > 0 && data === this.latest && this.failed < this.saved && (this.written >= this.saved || this.running !== null)) return;
     this.latest = data;
     this.saved += 1;
     this.running ??= this.drain();

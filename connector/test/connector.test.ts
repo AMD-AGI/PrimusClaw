@@ -26,6 +26,19 @@ const alive = (pid: number) => processStart(pid) !== null;
 const fileExists = (p: string) => fs.existsSync(p);
 
 describe("identity, heartbeat and presence", () => {
+  test("an idle connector's heartbeats do not rewrite connector.json, so they keep no file operation of the process waiting", async () => {
+    const h = await make();
+    await h.online();
+    const file = identityFile(h.dirs);
+    await h.claw.until("connector.json to be written", () => fs.existsSync(file));
+    // A link keeps the inode written: a rewrite (a new file renamed over this one) would give the name another inode.
+    const seen = `${file}.seen`;
+    fs.linkSync(file, seen);
+    const beats = h.claw.heartbeats.length;
+    await h.claw.until("five more heartbeats", () => h.claw.heartbeats.length >= beats + 5);
+    assert.equal(fs.statSync(file).ino, fs.statSync(seen).ino, "connector.json was written again with nothing changed");
+    fs.unlinkSync(seen);
+  });
   test("registers, sends the agents and a heartbeat that parses with the server's own parser, with the credential and a client label", async () => {
     const h = await make();
     await h.online();

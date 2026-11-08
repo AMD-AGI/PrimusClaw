@@ -211,6 +211,30 @@ describe("state files written off the event loop", () => {
     await sleep(50);
     assert.equal(fs.readFileSync(file, "utf8"), "[2]");
   });
+  test("content equal to what is on disk is not written again; newer content is, and so is the content of a write that failed", async () => {
+    const file = path.join(tmpdir(), "connector.json");
+    const f = new SnapshotFile(file, undefined, true);
+    f.save("a");
+    f.save("a"); // while the first write is under way
+    assert.equal(await f.settled(), true);
+    // A link keeps the inode written: a rewrite (a new file renamed over this one) would give the name another inode.
+    const seen = `${file}.seen`;
+    fs.linkSync(file, seen);
+    for (let i = 0; i < 5; i++) f.save("a");
+    assert.equal(await f.settled(), true);
+    assert.equal(fs.statSync(file).ino, fs.statSync(seen).ino, "the same content is not written again");
+    f.save("b");
+    assert.equal(await f.settled(), true);
+    assert.equal(fs.readFileSync(file, "utf8"), "b");
+    fs.mkdirSync(`${file}.tmp`); // the next write fails
+    f.save("c");
+    assert.equal(await f.settled(500), false);
+    fs.rmdirSync(`${file}.tmp`);
+    f.save("c");
+    assert.equal(await f.settled(), true, "a failed write's content is written by the next save of it");
+    assert.equal(fs.readFileSync(file, "utf8"), "c");
+    f.close();
+  });
   test("one failed write of sessions.json.pending does not hold back every later event (written() settles)", async () => {
     const dir = tmp();
     const file = path.join(dir, "sessions.json");
