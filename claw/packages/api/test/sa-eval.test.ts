@@ -460,6 +460,23 @@ test("S15 runnable oracles, and what the judge is shown", () => {
   assert.match(withCalls, /Tools it has for this request: mcp__github__issue_search\n/);
   assert.match(withCalls, /Tool calls it made in this turn: mcp__github__issue_search \(failed\), web_search \(ok\)\n/);
   assert.doesNotMatch(withCalls, /secret-ish/, "no tool output");
+  // The values the run read are given as the truth, newer than the judge may know (E249: "ROCm 10.x does not exist"), with what the
+  // fact check means: every value of a fact is required, and a value's `a||b` alternatives are each enough (`names`). A fact with no
+  // value is left out, and without values there is no such line.
+  const rocm = caseOf({ facts: [{ claim: "the latest ROCm release", oracle: { kind: "api", query: "gh:/repos/ROCm/TheRock/releases/latest#tag_name" } },
+    { claim: "where it was read", oracle: { kind: "api", query: "a description" } }, { claim: "nothing read", oracle: { kind: "api", query: "gh:/x#y" } },
+    { claim: "whether anything was found", oracle: { kind: "api", query: "gh:/y#z|map:0=没有||没搜到||none" } },
+    { claim: "the open pull requests", oracle: { kind: "api", query: "gh:/p#n" } }] });
+  const truth = judgePrompt(rocm, [{ user: "ROCm 最新版本？" }], "10.1.0", [],
+    [["10.1.0"], null, [], ["没有||没搜到||none"], ["#12", "#15", ...Array.from({ length: 12 }, (_, k) => `#${100 + k}`)]]);
+  assert.match(truth, /source of truth[^\n]*newer than anything you know[^\n]*"all of"[^\n]*every one[^\n]*"one of"[^\n]*any one/);
+  assert.match(truth, /\n- the latest ROCm release: "10\.1\.0"\n/);
+  assert.match(truth, /\n- whether anything was found: one of "没有", "没搜到", "none"\n/, "alternatives, never the raw a||b string");
+  assert.doesNotMatch(truth, /\|\|/);
+  assert.match(truth, /\n- the open pull requests: all of: \("#12"\) and \("#15"\) and [^\n]*\("#107"\)\n/, "every value required, the first 10 as the check");
+  assert.doesNotMatch(truth, /#108/);
+  assert.doesNotMatch(truth, /- where it was read:|- nothing read:/);
+  assert.doesNotMatch(judgePrompt(rocm, [{ user: "q" }], "a"), /source of truth/);
   assert.equal(needsJudge(caseOf({ facts: [{ claim: "n", oracle: { kind: "api", query: "gh:/x#y" } }] })), false, "a runnable oracle needs no judge");
   // Offline, a GitHub or MCP oracle was not read either: unverified, never a pass.
   const gh = caseOf({ facts: [{ claim: "n", oracle: { kind: "api", query: "gh:/x#y" } }] });

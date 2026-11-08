@@ -60,13 +60,17 @@
  *   R20 "items named by title" knows the board's highest item number: a "#n" above it is not one of the person's items
  *   R19 a multi-turn case: each item in the results says whether the graded last turn started it (`last`), so an item an earlier
  *      turn started is not counted as the last turn's
+ *   R21 the judge: its FAIL on a case every deterministic check passed is asked again (a third time on a split) and the majority
+ *      decides, a case a check failed is judged once; it is told the values the run read as the truth; its reasons are kept without
+ *      EVAL_KEEP_TEXT; EVAL_RECORD_DIR (no EVAL_KEEP_TEXT needed) is made 0700 and its file 0600 with the whole answers and every
+ *      judge answer, and a directory open to others, or under one others may change, refuses the run before anything is sent
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
  */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fstatSync, mkdtempSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -809,7 +813,8 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
     // An answer without a verdict, and a busy or failing gateway, are asked once more: t-j-001 gets 503 twice, t-j-002 no verdict
     // twice, t-j-005 a verdict on the second ask, t-j-006 one after a 503; t-j-007's judge reasons first and ends on its verdict;
     // t-j-008's 400 is not asked again.
-    claw.judgeAnswers = [503, 503, "Hmm, hard to say.", "Still unsure.", "FAIL: wrong count", "PASS: names the count", "Let me think.", "**PASS**: on a second ask",
+    // t-j-003's FAIL (every deterministic check passed) is asked again, and the second FAIL decides.
+    claw.judgeAnswers = [503, 503, "Hmm, hard to say.", "Still unsure.", "FAIL: wrong count", "FAIL: still the wrong count", "PASS: names the count", "Let me think.", "**PASS**: on a second ask",
       502, "PASS: after a 502", "The reply gives the count the user asked for.\n\nPASS: names the count", 400];
     claw.router = (_content, id) => claw.turn(id, { say: "There are 3 nodes." });
     const answer = (id: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: id }] });
@@ -831,6 +836,79 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.equal(claw.judgeAnswers.length, 0, "every answer was asked for");
       assert.equal(claw.judgePrompts.filter((x) => x.endsWith(JUDGE_RETRY_NOTE)).length, 2, "a verdict-less answer's second ask says what was missing");
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("R21 the judge: a lone FAIL is asked again and the majority decides; its reasons are kept; the recording is private", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    // t-m-001: FAIL, then PASS, PASS (E249: a judge that held a newer version than it knew to be made up); t-m-002: FAIL twice;
+    // t-m-003: a deterministic check fails, so its judge's FAIL is not asked again.
+    claw.judgeAnswers = ["FAIL: ROCm 10.1.0 does not exist", "PASS: states 10.1.0", "PASS: the version read for the run",
+      "FAIL: no source named", "FAIL: still no source", "FAIL: the count is wrong"];
+    claw.router = (content, id) => claw.turn(id, { say: content === "t-m-003" ? "There are 4." : "The latest ROCm is 10.1.0." });
+    const version = (id: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: id }],
+      facts: [{ claim: "the latest ROCm release", oracle: { kind: "static", value: id === "t-m-003" ? "3" : "10.1.0" } }] });
+    const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    writeFileSync(join(dir, "judge-key"), "judge-key-not-a-secret\n");
+    const records = join(dir, "private", "records");
+    const r = runner(base, ["t-m-001", "t-m-002", "t-m-003"].map(version),
+      { EVAL_JUDGE_URL: `${base}/judge`, EVAL_JUDGE_MODEL: "m", EVAL_JUDGE_KEY_FILE: join(dir, "judge-key"), EVAL_RECORD_DIR: records }, dir);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.match(run.out, /pass t-m-001#1/, run.out);
+      assert.match(run.out, /FAIL t-m-002#1/);
+      assert.match(run.out, /FAIL t-m-003#1/);
+      const asked = (id: string) => claw.judgePrompts.filter((x) => x.includes(`User said:\n${id}\n`));
+      assert.deepEqual(["t-m-001", "t-m-002", "t-m-003"].map((id) => asked(id).length), [3, 2, 1]);
+      // The judge is told the value the run has, as the truth.
+      assert.match(asked("t-m-001")[0]!, /source of truth[\s\S]*- the latest ROCm release: "10\.1\.0"/);
+      const report = JSON.parse(readFileSync(join(dir, "out", "assistant.json"), "utf8"));
+      const judged = (id: string) => report.results.find((x: any) => x.id === id).attempts[0];
+      // The reasons are kept without EVAL_KEEP_TEXT (the answer is not).
+      assert.equal(judged("t-m-001").final, null);
+      assert.deepEqual(judged("t-m-001").judge, { pass: true, why: "PASS: states 10.1.0", votes: [
+        { pass: false, why: "FAIL: ROCm 10.1.0 does not exist" }, { pass: true, why: "PASS: states 10.1.0" }, { pass: true, why: "PASS: the version read for the run" }] });
+      assert.equal(judged("t-m-002").judge.why, "FAIL: no source named");
+      assert.equal(judged("t-m-002").judge.votes.length, 2);
+      assert.deepEqual(judged("t-m-003").judge, { pass: false, why: "FAIL: the count is wrong" });
+      // The recording, in a directory made private, keeps the whole answers and every judge answer.
+      assert.equal(statSync(records).mode & 0o777, 0o700);
+      // One open file: its mode and its text are of the same file.
+      const fd = openSync(join(records, "assistant-recordings.jsonl"), "r");
+      let text: string;
+      try {
+        assert.equal(fstatSync(fd).mode & 0o777, 0o600);
+        text = readFileSync(fd, "utf8");
+      } finally { closeSync(fd); }
+      const recs = text.trim().split("\n").map((l) => JSON.parse(l));
+      const rec = recs.find((x) => x.case_id === "t-m-001");
+      assert.equal(rec.observed.final, "The latest ROCm is 10.1.0.");
+      assert.deepEqual(rec.judge, { pass: true, answers: ["FAIL: ROCm 10.1.0 does not exist", "PASS: states 10.1.0", "PASS: the version read for the run"] });
+      assert.doesNotMatch(text, /test-key-not-a-secret|judge-key-not-a-secret/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+
+    // A recording directory others can read: refused before anything is sent.
+    const open = new FakeClaw();
+    const base2 = await open.start();
+    const dir2 = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    mkdirSync(join(dir2, "shared"), { mode: 0o755 });
+    chmodSync(join(dir2, "shared"), 0o755);
+    // A private directory under one others may write (not sticky): it could be moved away and replaced before the write.
+    mkdirSync(join(dir2, "anyones"), { mode: 0o777 });
+    chmodSync(join(dir2, "anyones"), 0o777);
+    const r2 = runner(base2, [version("t-m-004")], { EVAL_RECORD_DIR: join(dir2, "shared") }, dir2);
+    const run2 = await r2.done;
+    const r3 = runner(base2, [version("t-m-005")], { EVAL_RECORD_DIR: join(dir2, "anyones", "mine") }, dir2);
+    const run3 = await r3.done;
+    await open.stop();
+    try {
+      assert.equal(run2.code, 2, run2.out);
+      assert.match(run2.out, /refusing to run: EVAL_RECORD_DIR is open to group or others \(mode 755/);
+      assert.equal(run3.code, 2, run3.out);
+      assert.match(run3.out, /refusing to run: EVAL_RECORD_DIR lies under \S+anyones, which someone else could change \(owner \d+, mode 777\)/);
+      assert.equal(open.sent.length, 0);
+    } finally { rmSync(dir2, { recursive: true, force: true }); }
   });
 
   it("R19 the items of a multi-turn case: which the graded last turn started", { timeout: 120_000 }, async () => {
