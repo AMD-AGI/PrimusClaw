@@ -104,7 +104,22 @@ describe("devenv_pair", { skip }, () => {
     assert.match(section, /No machine: say none is connected\. When connect_a_machine has pairing[^\n]*do not call devenv_pair after it\. Without pairing: devenv_pair/);
     assert.match(section, /exactly as it answered/);
     assert.match(section, /连接我的开发环境 when there is none is devenv_list, whose connect_a_machine then carries the pairing command/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v11");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v12");
     assert.ok((reads.AFTER_READ_TOOLS as readonly string[]).includes("devenv_pair"), "after devenv_list finds no machine, it may still pair");
+  });
+
+  test("DP4 the router's prompt reads machines in the turn, and says a terminal session as it is (E249, 2026-11-08)", async () => {
+    const prompts = await import("../src/assistant/prompts.js");
+    for (const section of [prompts.renderRouterDevenvSection({ actions: true, send: true }), prompts.renderRouterDevenvSection({ actions: false })]) {
+      // "让 autopilot pod 的 connector 也重连一下" was answered "0 machines" with no read in the turn.
+      assert.match(section, /any question about their machines or the sessions on them[^\n]*calls devenv_list in this turn before you answer, even when an earlier turn of this conversation read it/);
+      assert.match(section, /one that is not listed is not connected to them/);
+      assert.match(section, /You cannot restart or reconnect a connector from here: never say it was done/);
+      assert.match(section, /`claw-connector service install`/, "the restart command is written as code, not as the end of the template");
+      // "只能看不能发，这正常吗" was answered "watching is normal"; the shared-session ask "the product cannot do that".
+      assert.match(section, /One marked typed_into_terminal can be joined from the chat without taking it over: what they send is typed into that terminal/);
+      assert.match(section, /One marked read_only can only be watched[^\n]*not running inside tmux, or its connector is too old/);
+      assert.match(section, /never call it a missing feature or offer to file a request for it/);
+    }
   });
 });

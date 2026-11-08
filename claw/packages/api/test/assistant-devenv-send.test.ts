@@ -1755,7 +1755,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v11");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v12");
     // The plain-words control: a new session, a session named by when it was used, back to the assistant with nothing to run.
     assert.match(section, /new_session: true when they ask for a new session/);
     assert.match(section, /昨天那个会话/);
