@@ -26,7 +26,7 @@ import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_MEMORY_TOOLS, CLAW_MEMORY_TURN_RECALL, CLAW_MEMORY_TURN_RECALL_USERS } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
-  buildMemoryCatalogue, forgetMemory, getMemoryPreference, listMemories, memoriesForMessage, memoriesOfItem, memoryAvailable, memoryPorts, recallMemory, undoMemory,
+  buildMemoryCatalogue, citationsOf, forgetMemory, getMemoryPreference, listMemories, memoriesForMessage, memoriesOfItem, memoryAvailable, memoryPorts, recallMemory, undoMemory,
   updateMemory, writeMemory, type MemoryActor, type MemoryRow, type WriteResult,
 } from "../memory/service.js";
 import {
@@ -347,7 +347,9 @@ export async function routerTurnRecall(userId: string, sessionId: string, messag
   if (!message.trim()) return null;
   return orNothing("turn_recall", sessionId, async () => {
     const rows = await memoriesForMessage(userId, message);
-    return rows.length ? { text: renderTurnRecall(rows), ids: rows.map((r) => r.id) } : null;
+    if (!rows.length) return null;
+    const ids = rows.map((r) => r.id);
+    return { text: renderTurnRecall(rows, await citationsOf(userId, ids)), ids };
   });
 }
 

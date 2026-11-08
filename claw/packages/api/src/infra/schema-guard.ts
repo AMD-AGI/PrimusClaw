@@ -223,6 +223,11 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["id", "user_id", "entry_id", "op", "actor", "session_id", "reason", "title", "evidence_quote", "created_at"],
   },
   {
+    table: "claw_memory_links",
+    // An entry's citations (memory/links.ts), kept with every memory write and read by the router's turn recall.
+    columns: ["user_id", "from_id", "rel", "to_kind", "to_id", "created_by", "created_at"],
+  },
+  {
     table: "claw_assistants",
     // `POST /v1/assistant` and every work-item write start from this row.
     onlyWhenAssistant: true,

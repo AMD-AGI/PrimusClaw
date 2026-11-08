@@ -28,6 +28,7 @@ import {
   BODY_MAX, NOTE_MAX, SIMILARITY_THRESHOLD, TITLE_MAX, isMemoryType, legacyType, memoryCommand, normalizeText,
   quoteIsFrom, quoteSupports, rankByMessage, scanInjection, scanSecrets, similarity, type MemoryType,
 } from "./gates.js";
+import { citedBy, joinDangling, linkDerived, relinkEntry, unlinkErased } from "./links.js";
 
 const logger = pino({ name: "memory-service" });
 
@@ -48,6 +49,21 @@ const LIVE_ROWS = `${USER_ROWS} AND status IN ('active', 'pending')`;
 export const memoryPorts = {
   publishSessionEvent: (sessionId: string, event: Record<string, unknown>) => publishEvent(sessionId, event),
 };
+
+/**
+ * Keep the entries' citations (`links.ts`) inside the transaction that changed them, under a savepoint: a citation that cannot be
+ * kept (an entry it names deleted at the same moment) is lost and logged, and the write it follows stands.
+ */
+async function maintainLinks(q: Querier, userId: string, what: string, work: () => Promise<void>): Promise<void> {
+  await q("SAVEPOINT memory_links");
+  try {
+    await work();
+    await q("RELEASE SAVEPOINT memory_links");
+  } catch (err) {
+    await q("ROLLBACK TO SAVEPOINT memory_links");
+    logger.error({ err, userId, what }, "memory.links_failed");
+  }
+}
 
 // ===== Per-user opt-in =====
 
@@ -391,6 +407,11 @@ export async function writeMemory(userId: string, draft: MemoryDraft, actor: Mem
     )).rows[0];
     const id = Number(row.id);
     await recordEvent(q, { userId, entryId: id, op: "add", actor: actor.kind, sessionId: actor.kind === "model" ? actor.sessionId : null, title, quote });
+    await maintainLinks(q, userId, "add", async () => {
+      await relinkEntry(q, userId, id);
+      await joinDangling(q, userId, id);
+      if (closest) await linkDerived(q, userId, id, Number(closest.row.id), actor.kind);
+    });
     return { ok: true as const, id, op: "add" as const, status, title, live: live.length + 1 };
   });
   if (!result.ok) await recordRefusal(userId, actor, result.error, result.similar?.id ?? null);
@@ -437,6 +458,10 @@ export async function updateMemory(
     );
     if (!updated.rowCount) return false;
     await recordEvent(q, { userId, entryId: id, op: "update", actor: actor.kind, sessionId: actor.kind === "model" ? actor.sessionId : null, title, quote });
+    await maintainLinks(q, userId, "update", async () => {
+      await relinkEntry(q, userId, id);
+      await joinDangling(q, userId, id);
+    });
     return true;
   });
   if (!done) return refuse("not_found", `no memory #${id}`);
@@ -450,7 +475,11 @@ export async function updateMemory(
  */
 async function eraseEntries(q: Querier, userId: string, ids: number[], actor: string, op: string): Promise<void> {
   if (!ids.length) return;
+  // What cited them is joined to nothing again: their names go back to dangling, their numbers go (`unlinkErased`).
+  let citing: number[] = [];
+  await maintainLinks(q, userId, "erase", async () => { citing = await unlinkErased(q, userId, ids); });
   await q("DELETE FROM claw_memory_entries WHERE user_id = $1 AND id = ANY($2::int[])", [userId, ids]);
+  if (citing.length) await maintainLinks(q, userId, "erase_relink", async () => { for (const f of citing) await relinkEntry(q, userId, f); });
   await q("UPDATE claw_memory_events SET title = NULL, evidence_quote = NULL WHERE user_id = $1 AND entry_id = ANY($2::int[])", [userId, ids]);
   await q(
     `UPDATE claw_session_events SET data = data - 'title'
@@ -506,6 +535,10 @@ export async function undoMemory(
     );
     await q("UPDATE claw_memory_events SET title = NULL, evidence_quote = NULL WHERE user_id = $1 AND entry_id = $2 AND op = 'update'", [userId, id]);
     await recordEvent(q, { userId, entryId: id, op: "undo", actor: actorKind });
+    await maintainLinks(q, userId, "undo", async () => {
+      await relinkEntry(q, userId, id);
+      await joinDangling(q, userId, id);
+    });
     return "restored";
   });
 }
@@ -563,11 +596,20 @@ export const MESSAGE_RECALL_MIN_SCORE = 0.25;
  */
 export async function memoriesForMessage(userId: string, message: string): Promise<MemoryRow[]> {
   if (!message.trim()) return [];
+  // Past review in the query, and the newest CLAW_MEMORY_MAX_ENTRIES only: a store left above a cap lowered since is not read whole.
   const rows = (await db.query(
-    `SELECT ${ROW_COLUMNS} FROM claw_memory_entries WHERE user_id = $1 AND ${USER_ROWS} AND status = 'active' ORDER BY id DESC`, [userId],
-  )).rows.map(toRow).filter((r) => !r.due_for_review);
+    `SELECT ${ROW_COLUMNS} FROM claw_memory_entries
+      WHERE user_id = $1 AND ${USER_ROWS} AND status = 'active' AND (expires_at IS NULL OR expires_at > NOW())
+      ORDER BY id DESC LIMIT $2`,
+    [userId, CLAW_MEMORY_MAX_ENTRIES],
+  )).rows.map(toRow);
   return rankByMessage(message, rows, (r) => `${r.title}\n${r.body}`, { limit: MESSAGE_RECALL_LIMIT, minScore: MESSAGE_RECALL_MIN_SCORE })
     .map((x) => x.item);
+}
+
+/** The active entries each of `ids` cites (`claw_memory_links`), of this user only. */
+export async function citationsOf(userId: string, ids: readonly number[]): Promise<Map<number, Array<{ id: number; title: string }>>> {
+  return citedBy((text, params) => db.query(text, params), userId, ids);
 }
 
 // ===== The catalogue =====
