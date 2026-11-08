@@ -8,9 +8,10 @@
  *   CS2 deliver_file of a cited report in the sandbox, whatever its extension and its citation shape (the check's own parsing
  *       decides), is read whole and delivered through the run's checked deliver_text, so the text stored is the checked one; a file
  *       that is not one, one that does not exist, and any file in a run without the check are left to deliver_file
- *   CS4 a text file too large to be delivered checked that may be a cited report (or cannot be searched) is refused, nothing
- *       delivered, as is a cited report that cannot be read back or has no checked deliver_text to go through; a large file of
- *       another type, or one with no citations, is left to deliver_file
+ *   CS4 a file too large to be delivered checked that may be a cited report (the search finds both patterns, whatever its type;
+ *       or a text file the search cannot finish on) is refused, nothing delivered, as is a cited report that cannot be read back or
+ *       has no checked deliver_text to go through; a large file without citations, or a non-text one the search cannot finish on,
+ *       is left to deliver_file
  *   CS5 the file is the one deliver_file would copy: a path outside /workspace is never searched or read; a file whose citations
  *       are all inside code blocks is not a report the check reads, and deliver_file copies it as any other
  *   CS3 the check's budget ends a wait for a page that never answers: the check returns, and the statement is not checked
@@ -224,13 +225,26 @@ test("CS4 a cited report too large, unreadable, or with no checked deliver_text 
     r.router.citeCheck = check();
     assert.deepEqual(await deliverFile(r, "/workspace/big.md"), { text: CITED_FILE_TOO_LARGE, isError: true }, file);
   }
-  // Large, but not a text file, or a text file without citations: copied as before.
-  for (const [file, path] of [[`${"x".repeat(300 * 1024)} [1].\n\n[1]: vLLM on ROCm — ${A}`, "/workspace/data.bin"], [`${"x".repeat(300 * 1024)}\nno citations`, "/workspace/log.txt"]] as const) {
+  // A large cited report is refused whatever its type: the search runs on every large file.
+  for (const path of ["/workspace/report.rst", "/workspace/report.json", "/workspace/REPORT", "/workspace/data.bin"]) {
+    const r = routerOver(`${"x".repeat(300 * 1024)} [1].\n\n[1]: vLLM on ROCm — ${A}`);
+    r.router.citeCheck = check();
+    assert.deepEqual(await deliverFile(r, path), { text: CITED_FILE_TOO_LARGE, isError: true }, path);
+    assert.equal(r.searches.length, 2, `${path}: searched`);
+    assert.deepEqual([r.reads.length, r.delivered.length, r.copied.length], [0, 0, 0], path);
+  }
+  // A large file without citations, of any type, and a large non-text file the search could not finish on: copied as before.
+  for (const [file, path] of [
+    [`${"x".repeat(300 * 1024)}\nno citations`, "/workspace/log.txt"],
+    [`${"x".repeat(300 * 1024)}\nno citations`, "/workspace/data.bin"],
+    ["GREPFAIL-aborted", "/workspace/archive.tar"],
+    ["BIG", "/workspace/model.bin"],
+  ] as const) {
     const r = routerOver(file);
     r.router.citeCheck = check();
     const o = await deliverFile(r, path);
     assert.notEqual(o.text, CITED_FILE_TOO_LARGE, path);
-    assert.deepEqual([r.reads.length, r.delivered.length], [0, 0], path);
+    assert.deepEqual([r.reads.length, r.delivered.length, r.copied], [0, 0, [path]], path);
   }
 
   const big = routerOver(`${"x".repeat(300 * 1024)} [1].\n\n[1]: vLLM on ROCm — ${A}`);
