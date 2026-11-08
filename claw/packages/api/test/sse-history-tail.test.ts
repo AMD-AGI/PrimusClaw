@@ -187,8 +187,8 @@ test("an A2A task's artifacts are its latest results, oldest first", async () =>
   assert.deepEqual(rowsRead, [100]);
 });
 
-test("the next page waits while the client has not taken the last one, and stops when it has gone", async () => {
-  const fake = () => Object.assign(new EventEmitter(), { destroyed: false, writableEnded: false }) as unknown as ServerResponse;
+test("the next page waits while the client has not taken the last one, and stops when it has gone", { timeout: 10_000 }, async () => {
+  const fake = () => Object.assign(new EventEmitter(), { destroyed: false, writableEnded: false, writableNeedDrain: true }) as unknown as ServerResponse;
   assert.equal(await drained(fake(), false), true, "nothing buffered: go on at once");
 
   const slow = fake();
@@ -205,6 +205,9 @@ test("the next page waits while the client has not taken the last one, and stops
   gone.emit("close");
   assert.equal(await waiting, false);
   assert.equal(await drained(Object.assign(fake(), { destroyed: true }), false), false, "a closed response is not written to");
+  // The write was held back, but the buffer has been flushed since (its `drain` already went): go on, do not wait for
+  // another that never comes.
+  assert.equal(await drained(Object.assign(fake(), { writableNeedDrain: false }), true), true, "a flushed buffer: go on at once");
 });
 
 test("the history is read to the newest row when it starts, once more for what came meanwhile, and no further", async () => {
