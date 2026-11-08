@@ -1754,6 +1754,9 @@ export const WEB_FETCH_DOMAIN_DENYLIST = env("WEB_FETCH_DOMAIN_DENYLIST", "");
 export const WEB_FETCH_TIMEOUT_MS = envInt("WEB_FETCH_TIMEOUT_MS", 60_000);
 export const WEB_FETCH_SUMMARIZE = envBool("WEB_FETCH_SUMMARIZE", true);
 export const WEB_FETCH_SUMMARIZE_MODEL = env("WEB_FETCH_SUMMARIZE_MODEL", "claude-3-5-haiku-latest");
+// The model that judges a research report's citations before it is delivered (`tools/cite-check.ts`). Blank (the default): the one
+// that summarizes fetched pages, WEB_FETCH_SUMMARIZE_MODEL. A judge that is too strict marks supported findings unverified.
+export const CITE_CHECK_MODEL = env("CITE_CHECK_MODEL", "");
 export const WEB_FETCH_CACHE_TTL_MS = envInt("WEB_FETCH_CACHE_TTL_MS", 15 * 60 * 1000);
 export const WEB_FETCH_CACHE_MAX_BYTES = envInt("WEB_FETCH_CACHE_MAX_BYTES", 50 * 1024 * 1024);
 

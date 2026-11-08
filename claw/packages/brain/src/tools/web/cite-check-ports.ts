@@ -6,7 +6,8 @@
  * check opens nothing that tool would not (its address guards, its denylist, its cache), and the judge asked on the model that
  * summarizes fetched pages.
  */
-import { WEB_FETCH_SUMMARIZE_MODEL } from "../../config.js";
+import pino from "pino";
+import { CITE_CHECK_MODEL, WEB_FETCH_SUMMARIZE_MODEL } from "../../config.js";
 import { judgePrompt, parseVerdicts, type CheckedPage, type CiteCheckPorts } from "../cite-check.js";
 import type { WebFetchService } from "./fetch.js";
 import type { WebToolContext, WebToolOutcome } from "./types.js";
@@ -59,6 +60,13 @@ export async function readCitedPage(fetch: WebFetchService, url: string): Promis
   return text.trim() ? { ok: true, text } : { ok: false };
 }
 
+const logger = pino({ name: "cite-check" });
+
+/** The judge's model: CITE_CHECK_MODEL, or the page summarizer's when it is blank. */
+export function citeCheckModel(): string {
+  return CITE_CHECK_MODEL.trim() || WEB_FETCH_SUMMARIZE_MODEL;
+}
+
 /** The check's ports for a run with web fetch on: null when it has none (`parseCiteCheck` then fails every page). */
 export function webCiteCheckPorts(fetch: WebFetchService | undefined, ctx: WebToolContext | undefined): CiteCheckPorts | null {
   if (!fetch || !ctx) return null;
@@ -66,8 +74,10 @@ export function webCiteCheckPorts(fetch: WebFetchService | undefined, ctx: WebTo
     fetchPage: (url) => readCitedPage(fetch, url),
     judge: async ({ url, page, claims }, signal) => {
       const { system, user } = judgePrompt(url, page, claims);
+      const model = citeCheckModel();
+      const t0 = Date.now();
       const resp = await ctx.anthropic.messages.create(
-        { model: WEB_FETCH_SUMMARIZE_MODEL, max_tokens: CITE_CHECK_JUDGE_MAX_TOKENS, system, messages: [{ role: "user", content: user }] },
+        { model, max_tokens: CITE_CHECK_JUDGE_MAX_TOKENS, system, messages: [{ role: "user", content: user }] },
         { signal },
       );
       const usage = resp.usage as unknown as Record<string, number>;
@@ -78,7 +88,13 @@ export function webCiteCheckPorts(fetch: WebFetchService | undefined, ctx: WebTo
         cache_create: usage.cache_creation_input_tokens ?? 0,
       });
       const text = resp.content.filter((b) => b.type === "text").map((b) => (b as { text: string }).text).join("\n");
-      return parseVerdicts(text, claims.length);
+      const verdicts = parseVerdicts(text, claims.length);
+      // What one judgement costs and takes, for the judge's model to be chosen on: tokens and time, never the page or the statements.
+      logger.info({
+        model, ms: Date.now() - t0, statements: claims.length, input_tokens: usage.input_tokens ?? 0, output_tokens: usage.output_tokens ?? 0,
+        answered: verdicts !== null,
+      }, "cite_check.judge_call");
+      return verdicts;
     },
   };
 }

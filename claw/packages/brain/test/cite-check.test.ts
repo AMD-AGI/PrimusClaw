@@ -19,7 +19,10 @@
  *   CC10 the judge's answer is read as booleans only
  *   CC11 a judge that gives no answer (an empty reply cut at max_tokens) is asked once more: answered then, its verdicts hold; not
  *        answered again, its statements are marked not checked (未核对), counted apart, and counted in the metric
- *   CC12 the judge is asked with an output budget a thinking model can answer in, and an empty reply is no answer
+ *   CC12 the judge is asked with an output budget a thinking model can answer in, and an empty reply is no answer; on the page
+ *        summarizer's model while CITE_CHECK_MODEL is blank
+ *   CC13 up to 80 sources are checked; a source past that cap, a statement past the statements cap and a batch the budget ran out
+ *        before are not checked (未核对), never unverified
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -279,4 +282,42 @@ test("CC12 the judge has an output budget a thinking model can answer in, and an
   assert.deepEqual(await ports.judge({ url: A, page: "p", claims: ["x", "y"] }, signal), [true, false]);
   assert.equal(CITE_CHECK_JUDGE_MAX_TOKENS, 4096);
   assert.deepEqual(asked.map((a) => a.max_tokens), [4096, 4096]);
+  const { WEB_FETCH_SUMMARIZE_MODEL } = await import("../src/config.js");
+  assert.deepEqual(asked.map((a) => (a as unknown as { model: string }).model), [WEB_FETCH_SUMMARIZE_MODEL, WEB_FETCH_SUMMARIZE_MODEL],
+    "CITE_CHECK_MODEL blank: the summarizer's model");
+});
+
+test("CC13 what the caps or the budget leave out is not checked, never unverified", async () => {
+  const { CITE_CHECK_MAX_SOURCES, CITE_CHECK_MAX_CLAIMS, CITE_CHECK_CLAIMS_PER_CALL, CITE_CHECK_BUDGET_MS } = await import("../src/tools/cite-check.js");
+  assert.equal(CITE_CHECK_MAX_SOURCES, 80);
+  const url = (n: number) => `https://docs.example.org/page-${n}`;
+  const yes: CiteCheckPorts["judge"] = async ({ claims }) => claims.map(() => true);
+  const open: CiteCheckPorts["fetchPage"] = async (_url, _signal) => ({ ok: true, text: "page" });
+
+  // 85 sources, one statement each: the first 80 are checked, the last 5 are not.
+  const many = [
+    ...Array.from({ length: 85 }, (_, i) => `- Finding number ${i + 1} about the engines [${i + 1}].`), "",
+    ...Array.from({ length: 85 }, (_, i) => `[${i + 1}]: Page ${i + 1} — ${url(i + 1)}`),
+  ].join("\n");
+  const fetched: string[] = [];
+  const capped = await checkReport(many, { fetchPage: async (u, sig) => { fetched.push(u); return open(u, sig); }, judge: yes });
+  assert.equal(fetched.length, 80);
+  assert.deepEqual([capped.supported, capped.unverified, capped.unchecked], [80, 0, 5]);
+  assert.match(capped.text, /Finding number 81 about the engines \(not checked\)\./);
+  assert.match(capped.text, /Finding number 80 about the engines \[80\]\./);
+
+  // Statements past the statements cap are never judged.
+  const long = [...Array.from({ length: CITE_CHECK_MAX_CLAIMS + 3 }, (_, i) => `- Statement ${i + 1} says something [1].`), "", `[1]: Page — ${url(1)}`].join("\n");
+  const over = await checkReport(long, { fetchPage: open, judge: yes });
+  assert.deepEqual([over.supported, over.unverified, over.unchecked], [CITE_CHECK_MAX_CLAIMS, 0, 3]);
+
+  // The budget runs out after the first batch of one source: the rest of its statements are not checked.
+  let clock = 0;
+  const n = CITE_CHECK_CLAIMS_PER_CALL + 4;
+  const batches = [...Array.from({ length: n }, (_, i) => `- Item ${i + 1} holds [1].`), "", `[1]: Page — ${url(1)}`].join("\n");
+  const late = await checkReport(batches, {
+    now: () => clock, fetchPage: open,
+    judge: async ({ claims }) => { clock += CITE_CHECK_BUDGET_MS + 1; return claims.map(() => true); },
+  });
+  assert.deepEqual([late.supported, late.unverified, late.unchecked], [CITE_CHECK_CLAIMS_PER_CALL, 0, 4]);
 });
