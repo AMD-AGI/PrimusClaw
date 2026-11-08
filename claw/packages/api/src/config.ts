@@ -897,6 +897,11 @@ export const CLAW_ASSISTANT_CITE_LINK_SERVERS = env("CLAW_ASSISTANT_CITE_LINK_SE
 // delivers a Markdown report with numbered citations through deliver_text, and Brain opens every cited source and marks each
 // statement no source supports as unverified before the file is stored (`ExecuteRequest.cite_check`). Off (the default): neither.
 export const CLAW_ASSISTANT_RESEARCH = envBool("CLAW_ASSISTANT_RESEARCH", false);
+// With CLAW_ASSISTANT_RESEARCH off, the users who get research reports all the same (Claw user ids, comma-separated): the canary,
+// opened for the evaluation identities first. `*` among them is everyone, as the switch itself is.
+export const CLAW_ASSISTANT_RESEARCH_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_ASSISTANT_RESEARCH_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
 // `true` (the default) gives the router's `say` an optional `suggested`: up to three short replies the user is likely to send next,
 // carried by `assistant.say` as `suggested_replies` for a channel to show as buttons that send them (`assistant/suggested.ts`).
 export const CLAW_ASSISTANT_SUGGESTED_REPLIES = envBool("CLAW_ASSISTANT_SUGGESTED_REPLIES", true);

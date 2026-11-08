@@ -10,12 +10,13 @@
  *       findings are marked before the file is stored
  *   RS4 the router is told a research report is a work item, never text it writes from what it knows
  *   RS5 the switch is off by default
+ *   RS6 per user: off unless the switch is on, the user is named, or the names hold `*`; never without the assistant
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  applyWorkerResearch, assistantResearchOn, RESEARCH_CHECKED_TOOL, ROUTER_RESEARCH_PROMPT, WORKER_RESEARCH_PROMPT,
+  applyWorkerResearch, assistantResearchOn, researchSettings, RESEARCH_CHECKED_TOOL, ROUTER_RESEARCH_PROMPT, WORKER_RESEARCH_PROMPT,
 } from "../src/assistant/research.js";
 
 test("RS1 on: the worker's deliver_text is checked and the method is in its system text", () => {
@@ -52,5 +53,20 @@ test("RS4 the router hands research to a work item", () => {
 
 test("RS5 off unless switched on", () => {
   assert.equal(process.env.CLAW_ASSISTANT_RESEARCH, undefined);
-  assert.equal(assistantResearchOn(), false);
+  assert.equal(process.env.CLAW_ASSISTANT_RESEARCH_USERS, undefined);
+  assert.deepEqual([researchSettings.all, researchSettings.users.size], [false, 0]);
+  assert.equal(assistantResearchOn("u-1"), false);
+});
+
+test("RS6 per user: the named users, everyone with * or the switch, nobody without the assistant", () => {
+  const users = (...u: string[]) => new Set(u);
+  const on = (userId: string | null, s: { enabled?: boolean; all?: boolean; users?: Set<string> }) =>
+    assistantResearchOn(userId, { enabled: s.enabled ?? true, all: s.all ?? false, users: s.users ?? users() });
+  assert.equal(on("bot-6", { users: users("bot-6") }), true);
+  assert.equal(on("alice", { users: users("bot-6") }), false, "a user not named");
+  assert.equal(on(null, { users: users("bot-6") }), false, "no user");
+  assert.equal(on("", { users: users("") }), false);
+  assert.equal(on("alice", { users: users("bot-6", "*") }), true, "* is everyone");
+  assert.equal(on("alice", { all: true }), true, "the switch is everyone");
+  assert.equal(on("bot-6", { enabled: false, all: true, users: users("bot-6", "*") }), false, "never without the assistant");
 });

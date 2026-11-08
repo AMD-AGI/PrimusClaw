@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Deep research (`CLAW_ASSISTANT_RESEARCH`): a report on a topic, with a citation for every finding, made in the background.
+ * Deep research (`CLAW_ASSISTANT_RESEARCH`, or per user `CLAW_ASSISTANT_RESEARCH_USERS`): a report on a topic, with a citation for every finding, made in the background.
  *
  *  - The router hands "research X", "a comparison report on X and Y" to a work item, never writes it from what the model knows
  *    (`ROUTER_RESEARCH_PROMPT`, after the router's writing section, which would otherwise have it write the text itself).
@@ -18,14 +18,22 @@
  *
  * research-v1: the router's hand-off and the worker's method, with deliver_text checked.
  */
-import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_RESEARCH } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_RESEARCH, CLAW_ASSISTANT_RESEARCH_USERS } from "../config.js";
 import { TOOL_NAME_PREFIX } from "./prompts.js";
 
 export const RESEARCH_PROMPT_VERSION = "research-v1";
 
-/** Whether research reports are on. */
-export function assistantResearchOn(): boolean {
-  return CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_RESEARCH;
+export interface ResearchSettings { enabled: boolean; all: boolean; users: ReadonlySet<string> }
+
+/** The deployment's: the assistant, the switch for everyone, and the users it is opened for before that (`*` is everyone). */
+export const researchSettings: ResearchSettings = {
+  enabled: CLAW_ASSISTANT_ENABLED, all: CLAW_ASSISTANT_RESEARCH, users: CLAW_ASSISTANT_RESEARCH_USERS,
+};
+
+/** Whether research reports are on for this user's router and worker turns. */
+export function assistantResearchOn(userId: string | null | undefined, settings: ResearchSettings = researchSettings): boolean {
+  if (!settings.enabled) return false;
+  return settings.all || settings.users.has("*") || (!!userId && settings.users.has(userId));
 }
 
 /** The tool whose text Brain checks against its citations: the worker's `deliver_text`. */
@@ -44,7 +52,7 @@ When the item asks for research or a report with sources, this is how it is done
 6. Then report(kind="answer"): the conclusions in a few lines, the counts the check gave (how many findings are supported, how many unverified), and that the report is attached. Never present an unverified finding as established.`;
 
 /** A worker turn's research part: its method in the system text, and its `deliver_text` checked. Nothing when research is off. */
-export function applyWorkerResearch(task: Record<string, unknown>, append: (text: string) => void, on: boolean = assistantResearchOn()): boolean {
+export function applyWorkerResearch(task: Record<string, unknown>, append: (text: string) => void, on: boolean): boolean {
   if (!on) {
     delete task.cite_check;
     return false;
