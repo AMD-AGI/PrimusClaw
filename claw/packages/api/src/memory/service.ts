@@ -621,6 +621,76 @@ export async function memoriesForMessage(userId: string, message: string): Promi
     .map((x) => x.item);
 }
 
+/** How far the turn recall follows the entries' links from what the message matched (E242: at most two hops). */
+export const LINK_RECALL_DEPTH = 2;
+
+/** An entry reached along a link, and the link it was reached by: `#410 cites it`, `it cites #415`. */
+export interface LinkedMemory { row: MemoryRow; hop: number; via: string }
+
+/**
+ * The entries the user's links reach from `seeds`, breadth first, at most LINK_RECALL_DEPTH hops and `max` entries, in both
+ * directions (what a seed cites or is derived from, and what cites it or is derived from it). Every hop is read from this user's
+ * rows only: a link is this user's, and the entry it reaches must be this user's, active and not past review; a hop never passes
+ * through one that is not. Not counted as reads, as the seeds are not. Per hop, one read of the links of the entries it starts
+ * from (all of them) and one read of the entries it reaches.
+ */
+export async function expandAlongLinks(userId: string, seeds: readonly MemoryRow[], max: number): Promise<LinkedMemory[]> {
+  if (!seeds.length || max <= 0) return [];
+  // The links of the entries a hop starts from, read per hop and only theirs: no limit can drop one of them. An entry has at most
+  // LINKS_PER_ENTRY_MAX + 1 links of its own and the user at most CLAW_MEMORY_MAX_ENTRIES entries, so a read is bounded by those.
+  const linksOf = async (ids: readonly number[]): Promise<Map<number, Array<{ to: number; via: (from: number) => string }>>> => {
+    const rows = (await db.query(
+      `SELECT from_id, rel, to_id FROM claw_memory_links
+        WHERE user_id = $1 AND to_kind = 'memory' AND (from_id = ANY($2::int[]) OR to_id = ANY($3::text[]))
+        ORDER BY from_id, to_id`,
+      [userId, ids, ids.map(String)],
+    )).rows as Array<{ from_id: number; rel: string; to_id: string }>;
+    const next = new Map<number, Array<{ to: number; via: (from: number) => string }>>();
+    const add = (a: number, b: number, via: (from: number) => string): void => {
+      const list = next.get(a) ?? [];
+      list.push({ to: b, via });
+      next.set(a, list);
+    };
+    for (const l of rows) {
+      const from = Number(l.from_id);
+      const to = Number(l.to_id);
+      if (!Number.isSafeInteger(to) || from === to) continue;
+      const verb = l.rel === "derived_from" ? "is derived from" : "cites";
+      add(from, to, (x) => `#${x} ${verb} it`);
+      add(to, from, (x) => `it ${verb} #${x}`);
+    }
+    return next;
+  };
+  const seen = new Set(seeds.map((r) => r.id));
+  const out: LinkedMemory[] = [];
+  let frontier = seeds.map((r) => r.id);
+  for (let hop = 1; hop <= LINK_RECALL_DEPTH && frontier.length && out.length < max; hop += 1) {
+    const reached: Array<{ id: number; via: string }> = [];
+    const next = await linksOf(frontier);
+    for (const f of frontier) {
+      for (const e of next.get(f) ?? []) {
+        if (seen.has(e.to) || reached.some((r) => r.id === e.to)) continue;
+        reached.push({ id: e.to, via: e.via(f) });
+      }
+    }
+    if (!reached.length) break;
+    const rows = new Map((await db.query(
+      `SELECT ${ROW_COLUMNS} FROM claw_memory_entries
+        WHERE user_id = $1 AND id = ANY($2::int[]) AND ${USER_ROWS} AND status = 'active' AND (expires_at IS NULL OR expires_at > NOW())`,
+      [userId, reached.map((r) => r.id)],
+    )).rows.map(toRow).map((r) => [r.id, r] as const));
+    frontier = [];
+    for (const r of reached) {
+      const row = rows.get(r.id);
+      if (!row || out.length >= max) continue;
+      seen.add(r.id);
+      out.push({ row, hop, via: r.via });
+      frontier.push(r.id);
+    }
+  }
+  return out;
+}
+
 /** The active entries each of `ids` cites (`claw_memory_links`), of this user only. */
 export async function citationsOf(userId: string, ids: readonly number[]): Promise<Map<number, Array<{ id: number; title: string }>>> {
   return citedBy((text, params) => db.query(text, params), userId, ids);

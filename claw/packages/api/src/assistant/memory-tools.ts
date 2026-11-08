@@ -26,11 +26,11 @@ import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_MEMORY_TOOLS, CLAW_MEMORY_TURN_RECALL, CLAW_MEMORY_TURN_RECALL_USERS } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
-  buildMemoryCatalogue, citationsOf, forgetMemory, getMemoryPreference, listMemories, memoriesForMessage, memoriesOfItem, memoryAvailable, memoryPorts, recallMemory, undoMemory,
+  buildMemoryCatalogue, citationsOf, expandAlongLinks, forgetMemory, getMemoryPreference, listMemories, memoriesForMessage, memoriesOfItem, memoryAvailable, memoryPorts, recallMemory, undoMemory,
   updateMemory, writeMemory, type MemoryActor, type MemoryRow, type WriteResult,
 } from "../memory/service.js";
 import {
-  ITEM_MEMORY_INTRO, ROUTER_MEMORY_OFF, ROUTER_MEMORY_PREAMBLE, ROUTER_MEMORY_PROMPT, WORKER_MEMORY_PREAMBLE, renderItemMemories, renderTurnRecall,
+  ITEM_MEMORY_INTRO, ROUTER_MEMORY_OFF, ROUTER_MEMORY_PREAMBLE, ROUTER_MEMORY_PROMPT, WORKER_MEMORY_PREAMBLE, renderItemMemories, renderTurnRecall, fitTurnRecall, TURN_RECALL_MAX_ENTRIES,
 } from "./prompts.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
@@ -348,8 +348,11 @@ export async function routerTurnRecall(userId: string, sessionId: string, messag
   return orNothing("turn_recall", sessionId, async () => {
     const rows = await memoriesForMessage(userId, message);
     if (!rows.length) return null;
-    const ids = rows.map((r) => r.id);
-    return { text: renderTurnRecall(rows, await citationsOf(userId, ids)), ids };
+    // What the matched entries' links reach, two hops at most (E242): a chain's second entry seldom shares the message's words.
+    const linked = await expandAlongLinks(userId, rows, TURN_RECALL_MAX_ENTRIES - rows.length);
+    const entries = fitTurnRecall([...rows, ...linked.map((l) => ({ ...l.row, via: l.via }))]);
+    const ids = entries.map((e) => e.id);
+    return { text: renderTurnRecall(entries, await citationsOf(userId, ids)), ids };
   });
 }
 

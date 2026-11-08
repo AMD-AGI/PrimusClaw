@@ -28,6 +28,11 @@ record it.
 ## [Unreleased]
 
 ### Added
+- The router's turn recall (`CLAW_MEMORY_TURN_RECALL`, no new switch) follows `claw_memory_links` from the entries the message
+  matched, two hops at most and both ways (what a matched entry cites, and what cites it), and says how each entry it adds was
+  reached (`found because #410 cites it`), so a chain's second and third entries reach the model though they share no word with the
+  question. One turn shows at most 8 entries and 2400 body characters in all; every hop reads only the user's own active entries
+  that are not past review.
 - `claw_memory_links`: what each memory entry cites, kept by the server from what the entry says: another entry by number
   (`#12`) or by a name in corner brackets (「Kestrel 发布窗口」). A name no entry answers yet is kept dangling and joined to the entry
   saved later that it names, so "the licence is in the 「Wren 许可」 entry (not recorded yet)" points at that entry once it exists;
