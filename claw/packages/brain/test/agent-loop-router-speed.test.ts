@@ -372,4 +372,3 @@ test("every text a model call showed is taken back when a tool call follows, two
   await agentLoop([{ role: "user", content: "nodes?" }], TOOLS, o);
   assert.deepEqual(events.filter((e) => e.type === "toolTextVoid").map((e) => e.actionId).sort(), ["text-1-0", "text-1-2"]);
 });
-

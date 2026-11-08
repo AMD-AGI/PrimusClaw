@@ -37,7 +37,7 @@ import { answerEventItemOf, TOOL_NAME_PREFIX, WORK_EVENT_PREFIX } from "./prompt
 import { ROUTER_ASSISTANT_READS, ROUTER_SPEAK_TOOL } from "./read-tools.js";
 import { releaseHeldSays } from "./say-hold.js";
 import { voidStreamedSay } from "./router-speed.js";
-import { textShown } from "./lookup-ack.js";
+import { TEXT_SHOWN_SQL } from "./lookup-ack.js";
 import { kickDelivery } from "../notifications/outbox.js";
 import { metrics } from "../infra/metrics.js";
 
@@ -317,14 +317,14 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
   if (!router) return "skipped";
   const runs = (await db.query(
     `SELECT COALESCE(started_at, created_at) AS began, COALESCE(prompt, input->>'prompt', '') AS prompt, metadata->>'message_id' AS message_id,
-            metadata->>'text_preview' AS text_preview
+            ${TEXT_SHOWN_SQL} AS text_shown
        FROM claw_tasks WHERE session_id = $1 AND task_id = ANY($2::text[]) AND origin = 'chat'`,
     [end.sessionId, end.runIds],
-  )).rows as Array<{ began: Date; prompt: string; message_id: string | null; text_preview?: string | null }>;
+  )).rows as Array<{ began: Date; prompt: string; message_id: string | null; text_shown?: boolean }>;
   // The turn's own text was shown as it was written (`stream_text_as`, `noteTextPreview`) and is still on screen. Unless it is said now
   // as the answer, it is taken back (`voidStreamedSay`), so a channel does not keep words that never come as a message: a turn that
   // failed, handed a review over, wrote internal text, or met the say limit.
-  const shown = runs.some((r) => textShown(r.text_preview));
+  const shown = runs.some((r) => r.text_shown === true);
   const takeBack = async (reason: string): Promise<void> => {
     if (shown) await voidStreamedSay(end.sessionId, end.messageId ?? runs.find((r) => r.message_id)?.message_id ?? undefined, reason, deps.publishSessionEvent);
   };

@@ -265,7 +265,7 @@ describe("assistant lookup ack and silent turns", { skip }, () => {
       data: new TextEncoder().encode(JSON.stringify({ type: "toolTextDelta", tool: "mcp__assistant__say", actionId: "toolu_1", text: "还", message_id: other.mid })),
       ack: () => {}, nak: () => {},
     } as never);
-    const marked = await w.q("SELECT metadata ? 'text_preview' AS marked FROM claw_tasks WHERE task_id = $1", [other.task_id]);
+    const marked = await w.q("SELECT metadata ? 'text_shown' AS marked FROM claw_tasks WHERE task_id = $1", [other.task_id]);
     assert.equal(marked[0].marked, false);
     // Taken back (a tool call followed it): the turn has said nothing after all, and a late delta does not mark it again.
     await deliver({ type: "toolTextVoid", tool: "mcp__assistant__say", actionId: "text-1-0", reason: "tool_call", source: "text" });
@@ -278,8 +278,8 @@ describe("assistant lookup ack and silent turns", { skip }, () => {
     const broken = async () => { throw new Error("db down"); };
     assert.equal(await ack.noteTextPreview(alice.routerSid, third.mid, "text-1-0", true, broken as never), false);
     assert.equal(await ack.noteTextPreview(alice.routerSid, third.mid, "text-1-0", true), true);
-    const noted = await w.q("SELECT metadata->>'text_preview' AS v FROM claw_tasks WHERE task_id = $1", [third.task_id]);
-    assert.equal(noted[0].v, "text-1-0");
+    const noted = await w.q("SELECT metadata->'text_shown' AS v FROM claw_tasks WHERE task_id = $1", [third.task_id]);
+    assert.deepEqual(noted[0].v, ["text-1-0"]);
   });
 
   test("A10 a model call that failed takes its text back and the retry shows its own: the turn is writing again (review of #539)", async (t0) => {
@@ -295,23 +295,46 @@ describe("assistant lookup ack and silent turns", { skip }, () => {
     };
     const delta = (actionId: string, text: string) => ({ type: "toolTextDelta", tool: "mcp__assistant__say", actionId, text, source: "text" });
     const voidOf = (actionId: string) => ({ type: "toolTextVoid", tool: "mcp__assistant__say", actionId, reason: "retry", source: "text" });
-    const preview = async () => (await w.q("SELECT metadata->>'text_preview' AS v FROM claw_tasks WHERE task_id = $1", [t.task_id]))[0].v;
+    const { TEXT_SHOWN_SQL } = await import("../src/assistant/lookup-ack.js");
+    const shown = async (taskId = t.task_id) => (await w.q(`SELECT ${TEXT_SHOWN_SQL} AS v FROM claw_tasks WHERE task_id = $1`, [taskId]))[0].v;
     await deliver(delta("text-1-0", "下个月冻"));
     await deliver(voidOf("text-1-0"));
-    assert.equal(await preview(), "false");
+    assert.equal(await shown(), false);
     await deliver(delta("text-2-0", "下个月冻结期从 12 月 4 日开始。"));
-    assert.equal(await preview(), "text-2-0", "the retry's text is on screen");
+    assert.equal(await shown(), true, "the retry's text is on screen");
     assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "writing", "no line over it");
     // Late events of the text taken back change nothing: a delta of it marks nothing, its void again leaves the retry's text marked.
     ack.resetLookupAckCacheForTest();
     await deliver(delta("text-1-0", "下个月冻结"));
     await deliver(voidOf("text-1-0"));
-    assert.equal(await preview(), "text-2-0");
+    assert.equal(await shown(), true);
     assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "writing");
     // Its own take-back clears it.
     await deliver({ ...voidOf("text-2-0"), reason: "tool_call" });
-    assert.equal(await preview(), "false");
+    assert.equal(await shown(), false);
     assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "said");
+
+    // Processes write in any order (codex round 4 of #539): the retry's delta first, then the failed call's delta, then its void. The
+    // retry's text is still the one on screen.
+    const u = await turn("再问一次冻结期");
+    const at = async (event: Record<string, unknown>) => {
+      await w.mod.consumer.consumeEventDelivery({
+        subject: `events.${alice.routerSid}`, data: new TextEncoder().encode(JSON.stringify({ ...event, message_id: u.mid, ts: Date.now() })),
+        seq: 9_800 + ++seq, ack: () => {}, nak: () => { assert.fail("nak"); },
+      } as never);
+    };
+    await at(delta("text-2-0", "下个月冻结期从 12 月 4 日开始。"));
+    await at(delta("text-1-0", "下个月冻"));
+    await at(voidOf("text-1-0"));
+    assert.equal(await shown(u.task_id), true);
+    // And a void that comes before its own delta still wins over it.
+    await at(voidOf("text-3-0"));
+    await at(delta("text-3-0", "x"));
+    await at({ ...voidOf("text-2-0"), reason: "tool_call" });
+    assert.equal(await shown(u.task_id), false);
+    // Nothing else of the run's metadata is touched.
+    const meta = (await w.q("SELECT metadata FROM claw_tasks WHERE task_id = $1", [u.task_id]))[0].metadata;
+    assert.equal(meta.message_id, u.mid);
   });
 
   test("A9 a router turn has its own text streamed only for the people who have it, and only when it answers them", async (t0) => {
