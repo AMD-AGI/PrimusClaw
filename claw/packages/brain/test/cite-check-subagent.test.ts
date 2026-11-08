@@ -104,7 +104,7 @@ function routerOver(file: string | null, opts: { unreadable?: boolean } = {}) {
       if (name !== "bash" || !command.startsWith("stat ")) throw new Error(`unexpected ${name}`);
       const p = /^stat -L -c '[^']*' -- '((?:[^']|'\\'')*)' 2>&1 && /.exec(command)![1].replace(/'\\''/g, "'");
       if (file === null) return `stat: cannot statx '${p}': No such file or directory\n\nExit code: 1`;
-      const size = file === "BIG" ? 9 * 1024 * 1024 : Buffer.byteLength(file, "utf8");
+      const size = file === "BIG" ? 9 * 1024 * 1024 : file.startsWith("GREPFAIL") ? 400 * 1024 : Buffer.byteLength(file, "utf8");
       return `__claw_deliver_stat__regular file|${size}\n__claw_deliver_real__${Buffer.from(`/workspace\0${p}\0`, "utf8").toString("base64")}\n`;
     },
     callToolFull: async (name: string, input: Record<string, unknown>) => {
@@ -117,6 +117,9 @@ function routerOver(file: string | null, opts: { unreadable?: boolean } = {}) {
       searches.push(input);
       if (file === null) return { text: `Error: ENOENT: no such file or directory, stat '${String(input.path)}'`, isError: false };
       if (file === "BIG") return { text: "[note] 1 file(s) over 8 MB not searched.", isError: false };
+      if (file.startsWith("GREPFAIL")) {
+        return file === "GREPFAIL-error" ? { text: "Error: grep failed", isError: true } : { text: "x.md: [scan aborted at 2000ms]", isError: false };
+      }
       const re = new RegExp(String(input.pattern), input.case_sensitive ? "" : "i");
       const n = file.split("\n").filter((l) => re.test(l)).length;
       // As Hands answers a count: the path relative to the workspace, a colon and the number of matching lines.
@@ -198,6 +201,12 @@ test("CS4 a cited report too large, unreadable, or with no checked deliver_text 
     huge.router.citeCheck = check();
     assert.deepEqual(await deliverFile(huge, path), { text: CITED_FILE_TOO_LARGE, isError: true }, path);
     assert.equal(huge.reads.length, 0, "a file too large to search is not read");
+  }
+  // A large text file the search could not finish on is not ruled out.
+  for (const file of ["GREPFAIL-error", "GREPFAIL-aborted"]) {
+    const r = routerOver(file);
+    r.router.citeCheck = check();
+    assert.deepEqual(await deliverFile(r, "/workspace/big.md"), { text: CITED_FILE_TOO_LARGE, isError: true }, file);
   }
   // Large, but not a text file, or a text file without citations: copied as before.
   for (const [file, path] of [[`${"x".repeat(300 * 1024)} [1].\n\n[1]: vLLM on ROCm — ${A}`, "/workspace/data.bin"], [`${"x".repeat(300 * 1024)}\nno citations`, "/workspace/log.txt"]] as const) {

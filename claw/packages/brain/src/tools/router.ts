@@ -518,8 +518,9 @@ export class ToolRouter {
 
   /**
    * Whether a text file too large to be delivered checked may be a cited report: the sandbox's own `grep` (which reads the whole
-   * file) counts both a line of a list of sources and a line with a citation number (`CITED_FILE_PATTERNS`), or cannot search it (a
-   * file over its 8 MB). A file the search cannot read at all is not one: `deliver_file` then answers for it as it would.
+   * file) counts both a line of a list of sources and a line with a citation number (`CITED_FILE_PATTERNS`). Only two clean answers,
+   * one of them without a match, rule it out: a search that failed, was cut short or could not search the file (over its 8 MB)
+   * counts as may be.
    */
   private async largeFileMayCite(path: string, signal?: AbortSignal): Promise<boolean> {
     for (const pattern of CITED_FILE_PATTERNS) {
@@ -528,10 +529,10 @@ export class ToolRouter {
       try {
         text = await this.routeAllowed("grep", { pattern, path, output_mode: "count", case_sensitive: true }, signal, found);
       } catch {
-        return false;
+        return true;
       }
-      if (found.isError) return false;
-      if (/\bnot searched\b/.test(text)) return true;
+      // A search that did not answer, or did not read the whole file, rules nothing out.
+      if (found.isError || /^(Error|Invalid|Pattern)\b/.test(text.trim()) || /\bnot searched\b|\[scan aborted|\[grep aborted/.test(text)) return true;
       // A match is the file's count line, `<path>:<n>` with n > 0, whatever the path's name; no note ends that way.
       if (!text.split("\n").some((l) => Number(l.trim().match(/.:(\d+)$/)?.[1] ?? 0) > 0)) return false;
     }
