@@ -253,7 +253,8 @@ test("S9b the review-as-X set, the multi-turn scripts and the recent-issue cases
   // Review as another person, a merge confirmation and stopping a review are each covered.
   assert.ok(review.some((c) => c.turns.some((t) => t.user.includes("{EVAL_OTHER_PERSON}")) && c.route === "review"));
   assert.ok(review.some((c) => c.tools_must?.some((p) => toolPattern(p).test("mcp__assistant__confirmation_answer"))));
-  assert.ok(review.some((c) => c.tools_must?.some((p) => toolPattern(p).test("mcp__assistant__work_stop"))));
+  // Stopping a review: the person's open reviews come with every message, so no tool is required; what is left open is read.
+  assert.ok(review.some((c) => /停|stop/i.test(c.turns.at(-1)!.user) && c.facts?.some((f) => /where:kind=review\b/.test(f.oracle?.query ?? ""))));
   // A merged pull request is answered with when it merged, read from GitHub, and starts no review.
   assert.ok(review.some((c) => c.facts?.some((f) => /pulls\/\d+#merged_at/.test(f.oracle?.query ?? ""))));
   const sim = of("sim");
@@ -266,6 +267,23 @@ test("S9b the review-as-X set, the multi-turn scripts and the recent-issue cases
   for (const c of [...review, ...sim, ...recent]) {
     const decidable = (c.facts ?? []).some((f) => (f.oracle?.kind !== "api" && f.oracle?.value !== undefined) || oracleQuery({ kind: "api", query: (f.oracle?.query ?? "").replace(/\{\{[\w.]+\}\}|\{[A-Z_]+\}/g, "x") }));
     assert.ok(decidable || c.items_closed, `${c.id}: no fact a run can decide`);
+  }
+});
+
+test("S9c what the router is given with every message needs no tool; a bare number has no language; a merge time is read", () => {
+  const byId = new Map(loadCases(SEED_DIR).cases.map((c) => [c.id, c]));
+  const get = (id: string) => { const c = byId.get(id); assert.ok(c, `${id} is in the seed set`); return c!; };
+  // The person's items, what waits for them and the reviews they asked for come with each message (the router prompt): an answer
+  // from that list is right, and a case that requires a recall of it fails a correct reply.
+  for (const id of ["cat-items-y8-014", "cat-review-a8-013", "cat-review-a8-014", "cat-review-a8-017", "cat-review-a8-018", "cat-review-a8-019",
+    "sim-items-mt-004", "sim-items-mt-014"]) {
+    assert.deepEqual(get(id).tools_must, [], `${id}: no tool required`);
+  }
+  // "Only the number": a reply of digits has no language to follow.
+  for (const id of ["cat-safe-y8-015", "sim-general-mt-012"]) assert.equal(get(id).style?.reply_lang, undefined, `${id}: no reply language`);
+  // When a pull request merged is read in the turn, with pr_state as well as GitHub's own read.
+  for (const id of ["cat-review-a8-021", "sim-github-mt-002"]) {
+    assert.ok(get(id).tools_must?.some((p) => toolPattern(p).test("mcp__assistant__pr_state")), `${id}: pr_state counts as the read`);
   }
 });
 
