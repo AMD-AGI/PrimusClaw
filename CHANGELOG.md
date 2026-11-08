@@ -120,6 +120,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- The brief also leaves out a release-gate fixture whose watch ended before polls kept a pull request's branches (2026-11-08 retest:
+  "#381: 2 comments" still listed): each watch that no poll reads any more and whose news is from the last 7 days has its branches
+  read once with its owner's token (`claw_work_item_subscriptions.refs_read_at`, added at api start), claimed across replicas and
+  never again; after the first passes following the release no GitHub call is made.
 - The brief leaves release-gate fixture pull requests out of its pull request section, told by their branches as `pr_list` tells them
   (a weekly report said "#381: 2 comments" for the fixture on 2026-11-08); a watched pull request's head and base branches are kept
   with its watch (`claw_work_item_subscriptions.head_ref`, `base_ref`, added at api start). The brief's pull request section also

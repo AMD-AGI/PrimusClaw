@@ -194,6 +194,8 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   // left out of the brief.
   await client.query("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS head_ref TEXT");
   await client.query("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS base_ref TEXT");
+  // When the branches were last read, by a poll or by the one backfill of watches the polls no longer read (`backfillSubscriptionRefs`).
+  await client.query("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS refs_read_at TIMESTAMPTZ");
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_work_item_github_events (
       -- gh:<subscription>:<kind>:<GitHub's id>: the same comment read twice is the same row.
