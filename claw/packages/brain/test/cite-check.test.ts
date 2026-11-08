@@ -573,6 +573,17 @@ test("CC19 a run's second check judges only what is new or changed", async () =>
   judged.length = 0;
   await checkReport("- Statement on alpha {alpha} [1]. Then a sentence that changes what it is about.\n\n[1]: A — " + A, check.ports, undefined, check.verdicts);
   assert.deepEqual(judged, ["Statement on alpha {alpha}"], "the same statement in another line: judged again");
+  // No characters in a statement can make two different statements share a key.
+  const { verdictKey } = await import("../src/tools/cite-check.js");
+  assert.notEqual(verdictKey(A, "a\u0000b", "c"), verdictKey(A, "a", "b\u0000c"));
+  const nul = parseCiteCheck({ tools: ["t"] }, {
+    fetchPage: async () => ({ ok: true, text: "x" }),
+    judge: async ({ claims }) => claims.map((c) => c.startsWith("good")),
+  })!;
+  const nulReport = (line: string) => `${line}\n\n[1]: A — ${A}`;
+  await checkReport(nulReport("good\u0000part [1] tail"), nul.ports, undefined, nul.verdicts);
+  const r = await checkReport(nulReport("good [1] part\u0000tail"), nul.ports, undefined, nul.verdicts);
+  assert.equal(r.supported, 1);
   judged.length = 0;
   const other = parseCiteCheck({ tools: ["mcp__assistant__deliver_text"] }, ports)!;
   assert.equal(other.verdicts.size, 0, "a new run starts with nothing");

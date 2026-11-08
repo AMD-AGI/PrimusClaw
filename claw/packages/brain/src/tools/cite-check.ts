@@ -299,9 +299,12 @@ export function tableHeader(lines: string[], i: number): string[] | null {
  */
 export type VerdictCache = Map<string, boolean>;
 
-/** The key of a verdict: the source's address, the statement's text and its context, as the judge was given them. */
+/**
+ * The key of a verdict: the source's address, the statement's text and its context, as the judge was given them, encoded as a JSON
+ * array so that no text, whatever characters it holds, can make two different triples one key.
+ */
 export function verdictKey(url: string, text: string, context: string): string {
-  return `${url}\u0000${text}\u0000${context}`;
+  return JSON.stringify([url, text, context]);
 }
 
 /** Run `work` over `items`, at most `limit` at a time. */
