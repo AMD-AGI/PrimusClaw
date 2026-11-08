@@ -302,12 +302,13 @@ describe("router quality, the prompt", () => {
     // live, a follow-up with the earlier files, progress from what the job wrote now with its age, a derived number from the unrounded
     // values; router-v17: a translation said alone, in the language asked for; router-v18: the tool for a worker's report, a request to
     // remember and a channel setting named outright; router-v19: the quick line before deliver_text, trigger_create, review_mode_set and
-    // devenv_); its review prompt is router-v25 (v25: a pull request pr_state says is not_found said not to exist); router-read-v9 adds
+    // devenv_; router-v20: a question asked again compared from this turn's lookups alone); its review prompt is router-v26 (v25: a pull
+    // request pr_state says is not_found said not to exist; v26: v25 on router-v20); router-read-v9 adds
     // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
     // now from the source that states them.
-    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v19");
-    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v15");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v25");
+    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v20");
+    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v16");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v26");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): a say after it in the turn is added to that same message, so never repeat the start/],
@@ -357,6 +358,13 @@ describe("router quality, the prompt", () => {
       ["a translation said alone, in its language", /a text the user asked for in a language they named \(把这句翻成英文, translate it into English\): say that text alone, in that language, with nothing before or after it \(no 译文：, no quotes, no note\)/],
       ["how many is answered with the list", /"How many pull requests \(issues\) do I have open" is answered with the total \(total_count\) and then the list itself, never the number alone[^\n]*refs_by_repo/],
       ["a pull request that does not exist is said so", /When a GitHub read answers no_such_pull_request, the pull request does not exist[^\n]*Never say it might be private or a permission problem/],
+      // N13 (2026-11-08 03:12Z on router-v19): brief no longer listed the release-gate fixture #381, and the answer still said
+      // "上次提到的 PrimusClaw#381 的 2 条评论这次没有再出现新动态", carried over from an earlier, wrong answer of the conversation.
+      ["a question asked again is compared from this turn's lookups", /This turn's lookups are the answer, and the comparison is made from them alone/],
+      ["what this turn does not support is not said again", /Something your earlier answer named that this turn's lookups do not return or support \(a pull request, an item, a comment, a reason\) is not said again, not even to say it has no news or is gone \(上次提到的 #381 这次没有新动态, #381 还是那 2 条评论\): leave it out, unless the user asks about it, and then look it up first/],
+      ["a reason for a changed count only from this turn", /When a count changed, give a reason for the difference only when this turn's lookups show one/],
+      // The devenv section forbids 上次 and still for machines: asked again, they are not compared at all.
+      ["machines are never compared", /Machines and the sessions on them are not compared at all: say them from this turn's read alone, never with 上次 or still\./],
       ["no number without its title", /never by its number alone: say refuses "#6、#8" without the titles/],
       // router-v18 (2026-11-06 nightly: cat-items-ro-003 answered from the list, cat-settings-wr-002 made a scheduled task).
       ["a worker's report is read with work_recall", /What a worker reported, found or answered on an item[^\n]*work_recall\(item, "reports"\) for that item[^\n]*never from its line in the list alone/],
