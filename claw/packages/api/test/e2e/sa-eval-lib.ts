@@ -19,6 +19,9 @@
  *   route            answer | item | review | confirm | clarify         expected handling of the last turn
  *   tools_must       tool names the last turn must each call; `*` matches anything, `a|b` either
  *   tools_must_not   tool names the last turn must not call (read-only questions list work_create)
+ *   said             true: the last turn must have answered with a message of its own: a say of the router's, or the plain text it
+ *                    ended with, which the server says for it (`deliverUnsaidAnswer`). The system's own lines never count: the "on it"
+ *                    line (`turnAckSayId`) and its notice for a turn that failed, was declined or said nothing (`SYSTEM_TURN_NOTICES`).
  *   facts            [{claim, oracle: {kind: static|api|fixture, value?, query?}}]; the final answer must name the value.
  *                    An `api` oracle is read at run time with the eval identity, in one of three forms (`oracleQuery`):
  *                      `/v1/...#<pick>`                a Claw API GET, e.g. `/v1/work-items?state=in_progress#data.length`
@@ -91,6 +94,7 @@ export interface EvalCase {
   route?: Route;
   tools_must?: string[];
   tools_must_not?: string[];
+  said?: boolean;
   facts?: Fact[];
   cards?: Cards;
   style?: { reply_lang?: "follow_user"; max_chars?: number; min_chars?: number; no_ids?: boolean };
@@ -155,6 +159,7 @@ export function problemsOf(c: Partial<EvalCase>): string[] {
   if (c.delivers !== undefined && (!Array.isArray(c.delivers) || c.delivers.some((d) => !d || (typeof d.name !== "string" && typeof d.type !== "string")))) {
     out.push("delivers needs a name or a type for each file");
   }
+  if (c.said !== undefined && typeof c.said !== "boolean") out.push(`said ${String(c.said)}`);
   if (c.route !== undefined && !ROUTES.includes(c.route)) out.push(`route ${c.route}`);
   if (c.cards !== undefined && !CARDS.includes(c.cards)) out.push(`cards ${c.cards}`);
   if (c.hold !== undefined) {
@@ -1032,6 +1037,34 @@ export function turnsAnswered(says: readonly Say[], messageIds: readonly string[
   });
 }
 
+/**
+ * What the server says in its own words when the turn answering the person ended without an answer: that the turn failed, that it was
+ * declined, or that it looked things up and put nothing together (`turnLostNotice`, `silentTurnNotice` in
+ * `src/assistant/router-turn-end.ts`; `test/sa-eval.test.ts` holds them to those). Published as a say like any other and not marked as
+ * the system's, so they are known by their words.
+ */
+export const SYSTEM_TURN_NOTICES: ReadonlySet<string> = new Set([
+  "刚才这条没有处理成功，请再说一次。进行中的事项不受影响。",
+  "That message did not go through; please say it again. Your work items are not affected.",
+  "这个请求我不能处理：它可能涉及访问内部地址、凭据或其他不安全的操作，所以我没有执行。换个问题或说明你想达到的目的，我可以继续帮你。进行中的事项不受影响。",
+  "I can't help with that request: it may involve reaching internal addresses, credentials or something else unsafe, so I did not do it. Ask something else or tell me what you want to achieve, and I'll help. Your work items are not affected.",
+  "我查了一些资料，但这次没能整理出答复。请再问我一次，或者把问题说得具体一点。",
+  "I looked into it but could not put an answer together this time. Please ask me again, or narrow the question down.",
+]);
+
+/**
+ * How many of the says of the turn answering `messageId` are its answer: the router's own say, or the plain text the turn ended with,
+ * which the server says for it a moment after its end (`deliverUnsaidAnswer`, E242 2026-11-08: the person gets it as one message, in
+ * place of the "on it" line). Not the system's own lines: a message about an item that needs the person (`fallback`), the "on it" line
+ * (known by its id), and the notice for a turn that failed, was declined or said nothing (`SYSTEM_TURN_NOTICES`). Null without the
+ * person's id: the "on it" line cannot be told from an answer.
+ */
+export function ownSays(says: readonly Say[], messageId: string, userId: string | null): number | null {
+  if (!userId) return null;
+  const ack = turnAckSayId(userId, messageId);
+  return says.filter((s) => s.turn === messageId && !s.fallback && s.sayId !== ack && !SYSTEM_TURN_NOTICES.has(s.text.trim())).length;
+}
+
 /** Everything said to the user in the case: its own turns' says and every say about its items. */
 export function caseSays(says: readonly Say[], messageIds: readonly string[], itemIds: readonly string[]): Say[] {
   const turns = new Set(messageIds);
@@ -1064,6 +1097,11 @@ export interface Observed {
   delivered?: SaidFile[];
   /** The highest item number on the person's board when the case was graded (assistant mode; absent when none was read). */
   itemSeqMax?: number;
+  /**
+   * The last turn's own answers (assistant mode): its says that are not the system's own lines (`ownSays`). Null when they cannot be
+   * told apart (the identity's user id was not read, so its "on it" line is not known); absent in baseline.
+   */
+  ownSays?: number | null;
 }
 
 /** The longest an item may take to hold its request for the person, from Brain asking: what a person waits for the card. */
@@ -1094,6 +1132,12 @@ export function grade(c: EvalCase, o: Observed): Check[] {
     out.push({ name: `no tool ${p}`, pass: hit.length === 0, detail: hit.join(",") });
   }
   out.push({ name: "answered", pass: o.final.trim().length > 0 });
+  if (c.said) {
+    // Said by the turn itself or for it, not the system's line in its place; a baseline session has no says.
+    if (o.mode === "baseline") skip("said");
+    else if (o.ownSays === null || o.ownSays === undefined) out.push({ name: "said", pass: false, unverified: true, detail: "the system's own lines could not be told apart" });
+    else out.push({ name: "said", pass: o.ownSays > 0, detail: o.ownSays ? `${o.ownSays} message(s)` : "only the system's own lines" });
+  }
   (c.facts ?? []).forEach((f, k) => {
     const values = o.factValues[k] ?? null;
     const name = `fact ${f.claim}`.slice(0, 80);
