@@ -129,6 +129,27 @@ function extractTextFromParts(parts: Part[]): string {
     .join("\n");
 }
 
+/** The most turn results (`ResultMessage` events) a task's `artifacts` carries: the latest ones. */
+export const A2A_MAX_ARTIFACTS = 100;
+
+/**
+ * The session's latest `max` turn results, oldest first. Not all of them: a context reused for months has one per turn,
+ * and every send builds the task (twice), so reading them all grew with the context's age.
+ */
+export async function latestResults(
+  sessionId: string, max: number = A2A_MAX_ARTIFACTS,
+): Promise<Array<Record<string, unknown>>> {
+  const r = await db.query(
+    `SELECT event_id, data FROM (
+       SELECT id, event_id, data FROM claw_session_events
+        WHERE session_id = $1 AND event = 'ResultMessage' AND deleted_at IS NULL
+        ORDER BY id DESC LIMIT $2
+     ) w ORDER BY id`,
+    [sessionId, max],
+  );
+  return (r.rows ?? []) as Array<Record<string, unknown>>;
+}
+
 async function buildTaskFromDb(
   sessionId: string,
   historyLength?: number,
@@ -175,14 +196,9 @@ async function buildTaskFromDb(
   }
 
   if (includeArtifacts) {
-    const eventsResult = await db.query(
-      `SELECT event_id, data FROM claw_session_events
-       WHERE session_id = $1 AND event = 'ResultMessage' AND deleted_at IS NULL
-       ORDER BY id`,
-      [sessionId],
-    );
-    if (eventsResult.rows?.length) {
-      task.artifacts = (eventsResult.rows as Array<Record<string, unknown>>).map((e, i) => {
+    const results = await latestResults(sessionId);
+    if (results.length) {
+      task.artifacts = results.map((e, i) => {
         // A result message repeats whatever the agent produced, so it is masked
         // like every other event that leaves the API.
         const data = e.data

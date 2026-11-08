@@ -28,7 +28,7 @@ import { anthropicErrorPayload } from "../auth/middleware.js";
 import { isAdmin } from "../auth/models.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
-import { RUN_DOORBELL_DISPATCH } from "../config.js";
+import { RUN_DOORBELL_DISPATCH, SSE_HISTORY_TAIL } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import { applySessionGateTransition, stopSessionRuns } from "../tasks/chat-run.js";
 import { actingTurnRefusal } from "../github-review/acting-turns.js";
@@ -1417,6 +1417,22 @@ interface AnthropicEventStream {
   write: (frame: string) => boolean;
 }
 
+/**
+ * The history the stream sends before its live events: the session's last `tail` (SSE_HISTORY_TAIL) stored events,
+ * oldest first, not all of them -- a long session's whole history was read into this process on every connection. The
+ * CLI needs only the latest turn; all of it is the paged list route (`GET /anthropic/v1/sessions/:id/events`).
+ */
+export async function streamHistoryRows(
+  sessionId: string, tail: number = SSE_HISTORY_TAIL,
+): Promise<Array<{ event_id: unknown; data: unknown }>> {
+  return (await db.query(
+    `SELECT event_id, data FROM (
+       SELECT id, event_id, data FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL ORDER BY id DESC LIMIT $2
+     ) w ORDER BY id`,
+    [sessionId, tail],
+  )).rows as Array<{ event_id: unknown; data: unknown }>;
+}
+
 async function openAnthropicEventStream(
   req: FastifyRequest,
   reply: FastifyReply,
@@ -1443,10 +1459,7 @@ async function openAnthropicEventStream(
     try { response.write(frame); return true; } catch { return false; }
   };
   const seenIds = new Set<string>();
-  const historyRows = (await db.query(
-    "SELECT event_id, data FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL ORDER BY id",
-    [sessionId],
-  )).rows;
+  const historyRows = await streamHistoryRows(sessionId);
   for (const row of historyRows) {
     const data = sanitizeSessionEvent(
       (typeof row.data === "object" && row.data) ? row.data as Record<string, unknown> : {},

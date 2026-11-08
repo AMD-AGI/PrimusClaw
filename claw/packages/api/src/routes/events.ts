@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import type { ServerResponse } from "node:http";
 import type { FastifyInstance } from "fastify";
 import { getUser } from "../auth/middleware.js";
 import { canAccessSessionAsOperator } from "../auth/models.js";
@@ -10,6 +11,7 @@ import { AppEventOrder, appEventIdentity, appEventKey } from "../events/app-even
 import { redactPublicJson } from "../events/redaction.js";
 import { TOOL_TEXT_DELTA_EVENT } from "../events/consumer.js";
 import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
+import { SSE_HISTORY_TAIL } from "../config.js";
 /**
  * V2-native SSE event stream: Brain events are forwarded verbatim (raw V2
  * `type` as the SSE `event` field, full payload as `data`); the historical V1
@@ -112,6 +114,30 @@ export function historySegment(
   opts: ForwardOpts,
   /** App events already shown, by identity (see events/app-events.ts); filled as frames are made. */
   seenAppEvents: Set<string> = new Set(),
+  /** Older events of the session were not sent (see {@link historyCompleteFrame}). */
+  hasMore = false,
+): HistorySegment {
+  const segment = historyFrames(rows, opts, seenAppEvents);
+  segment.frames.push(historyCompleteFrame(segment.frames.length, hasMore));
+  return segment;
+}
+
+/**
+ * The marker that ends the history segment. `count`: the events it sent. `has_more`: the history was cut to the session's
+ * last events (a stream that does not say where it resumes gets the last `SSE_HISTORY_TAIL`) and older ones were not
+ * sent; `?history=all` asks for all of them, and `?mode=replay&after=` / `&tail=` reads them as JSON. Always present, so
+ * a client can tell this server from one that predates it (whose `after` compared ids as text).
+ */
+export function historyCompleteFrame(count: number, hasMore: boolean): string {
+  return `event: ${HISTORY_COMPLETE_EVENT}\n`
+    + `data: ${JSON.stringify({ type: HISTORY_COMPLETE_EVENT, count, has_more: hasMore })}\n\n`;
+}
+
+/** One page of history as SSE frames, with no marker. */
+function historyFrames(
+  rows: Array<{ event_id: unknown; data: unknown }>,
+  opts: ForwardOpts,
+  seenAppEvents: Set<string>,
 ): HistorySegment {
   const frames: string[] = [];
   const seenIds: string[] = [];
@@ -131,10 +157,6 @@ export function historySegment(
     seenIds.push(eid);
     frames.push(`id: ${eid}\nevent: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
   }
-  frames.push(
-    `event: ${HISTORY_COMPLETE_EVENT}\n`
-    + `data: ${JSON.stringify({ type: HISTORY_COMPLETE_EVENT, count: frames.length })}\n\n`,
-  );
   return { frames, seenIds };
 }
 
@@ -195,6 +217,112 @@ export function parseReplayWindow(q: { tail?: string; limit?: string; after?: st
   return { tail, limit, after };
 }
 
+/** `shouldForward` as a SQL predicate on `claw_session_events.data` (its parameters appended to `params`); null: all rows. */
+function forwardFilterSql(opts: ForwardOpts, params: unknown[]): string | null {
+  // A sub-agent event is one whose subagent_id is a non-empty string.
+  const isSub = "COALESCE(jsonb_typeof(data->'subagent_id') = 'string' AND data->>'subagent_id' <> '', false)";
+  if (opts.subagentFilter) {
+    params.push(opts.subagentFilter);
+    return `${isSub} AND data->>'subagent_id' = $${params.length}`;
+  }
+  if (opts.foldSubagents) {
+    params.push([...SUBAGENT_LIFECYCLE_PASSTHROUGH]);
+    return `(NOT ${isSub} OR COALESCE(data->>'type' = ANY($${params.length}::text[]), false))`;
+  }
+  return null;
+}
+
+/** Rows one page of an SSE history reads: what the stream holds in memory at once, however long the history is. */
+export const HISTORY_PAGE_ROWS = 500;
+
+/** Where an SSE history starts: after the row `afterId` (0: from the first), and whether older events were left out. */
+export interface HistoryStart {
+  afterId: number;
+  hasMore: boolean;
+}
+
+/**
+ * The row an `after` cursor stands for: its place in the table (`id`), so what follows it is read by row order and
+ * `claw-10` follows `claw-9` (comparing the ids as text put `claw-10` first, and a reconnect after `claw-9` lost it).
+ * A stream id the table does not hold yet (`claw-<seq>`: the live event reached the client before its row was written)
+ * stands after the last stored stream event at or before that sequence. Null: not an event this session can place.
+ */
+async function cursorRowId(sessionId: string, after: string): Promise<number | null> {
+  const exact = (await db.query(
+    "SELECT id FROM claw_session_events WHERE session_id = $1 AND event_id = $2",
+    [sessionId, after],
+  )).rows[0] as { id: number | string } | undefined;
+  if (exact) return Number(exact.id);
+  const seq = /^claw-([0-9]{1,15})$/.exec(after);
+  if (!seq) return null;
+  const before = (await db.query(
+    `SELECT COALESCE(MAX(id), 0) AS id FROM claw_session_events
+      WHERE session_id = $1 AND event_id ~ '^claw-[0-9]{1,15}$' AND substr(event_id, 6)::bigint <= $2::bigint`,
+    [sessionId, seq[1]],
+  )).rows[0] as { id: number | string } | undefined;
+  return Number(before?.id ?? 0);
+}
+
+/**
+ * Where an SSE connection's history starts. After `after` when it names a place in this session; otherwise the
+ * whole history when `all`, else the last `tail` events the caller is shown (the sub-agent filter applies), with
+ * `hasMore` when older ones exist. Reads ids only.
+ */
+export async function historyStart(
+  sessionId: string, after: string | null, all: boolean, tail: number, opts: ForwardOpts,
+): Promise<HistoryStart> {
+  if (after) {
+    const afterId = await cursorRowId(sessionId, after);
+    if (afterId !== null) return { afterId, hasMore: false };
+  }
+  if (all) return { afterId: 0, hasMore: false };
+  const params: unknown[] = [sessionId];
+  const where = ["session_id = $1", "deleted_at IS NULL"];
+  const filter = forwardFilterSql(opts, params);
+  if (filter) where.push(filter);
+  params.push(tail);
+  const edge = (await db.query(
+    `SELECT id FROM claw_session_events WHERE ${where.join(" AND ")} ORDER BY id DESC OFFSET $${params.length} LIMIT 1`,
+    params,
+  )).rows[0] as { id: number | string } | undefined;
+  return edge ? { afterId: Number(edge.id), hasMore: true } : { afterId: 0, hasMore: false };
+}
+
+/** The next page of history after row `afterId`, oldest first, at most HISTORY_PAGE_ROWS rows. */
+export async function historyPage(
+  sessionId: string, afterId: number, opts: ForwardOpts,
+): Promise<Array<{ id: number | string; event_id: unknown; data: unknown }>> {
+  const params: unknown[] = [sessionId, afterId];
+  const where = ["session_id = $1", "deleted_at IS NULL", "id > $2"];
+  const filter = forwardFilterSql(opts, params);
+  if (filter) where.push(filter);
+  params.push(HISTORY_PAGE_ROWS);
+  return (await db.query(
+    `SELECT id, event_id, event, data FROM claw_session_events WHERE ${where.join(" AND ")} ORDER BY id LIMIT $${params.length}`,
+    params,
+  )).rows as Array<{ id: number | string; event_id: unknown; data: unknown }>;
+}
+
+/**
+ * Resolves when `res` can take more (true), or once it is closed (false), so that a slow client is not buffered for:
+ * `backlog` is what the last `res.write` said (false: its buffer is full, and `drain` follows once it is not).
+ */
+function drained(res: ServerResponse, backlog: boolean): Promise<boolean> {
+  if (res.destroyed || res.writableEnded) return Promise.resolve(false);
+  if (!backlog) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const done = (ok: boolean): void => {
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+      resolve(ok);
+    };
+    const onDrain = (): void => done(true);
+    const onClose = (): void => done(false);
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+  });
+}
+
 /**
  * One window of a session's stored events, oldest first, in the row shape of the whole replay
  * (`event_id, event_type, data, created_at`), redacted the same way. The sub-agent filter is applied in SQL, so
@@ -216,15 +344,8 @@ export async function readReplayWindow(
     params.push(cursor.id);
     where.push(`id > $${params.length}`);
   }
-  // shouldForward, in SQL: a sub-agent event is one whose subagent_id is a non-empty string.
-  const isSub = "COALESCE(jsonb_typeof(data->'subagent_id') = 'string' AND data->>'subagent_id' <> '', false)";
-  if (opts.subagentFilter) {
-    params.push(opts.subagentFilter);
-    where.push(`${isSub} AND data->>'subagent_id' = $${params.length}`);
-  } else if (opts.foldSubagents) {
-    params.push([...SUBAGENT_LIFECYCLE_PASSTHROUGH]);
-    where.push(`(NOT ${isSub} OR COALESCE(data->>'type' = ANY($${params.length}::text[]), false))`);
-  }
+  const filter = forwardFilterSql(opts, params);
+  if (filter) where.push(filter);
   const count = window.tail ?? window.limit ?? REPLAY_WINDOW_MAX;
   params.push(count + 1);
   const rows = (await db.query(
@@ -258,6 +379,8 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       tail?: string;
       /** `mode=replay` only: at most N events after `after` (or from the start). */
       limit?: string;
+      /** SSE only: `all` replays the whole history; without it a stream that does not resume gets the last SSE_HISTORY_TAIL events. */
+      history?: string;
       subagent_id?: string;
       fold_subagents?: string;
       // Legacy alias kept for back-compat: when callers pass it explicitly
@@ -322,8 +445,9 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       });
       res.flushHeaders();
 
+      let backlog = false;   // the last write was buffered past the response's limit (see drained)
       const sseWrite = (frame: string): boolean => {
-        try { res.write(frame); return true; }
+        try { backlog = !res.write(frame); return true; }
         catch { return false; }
       };
 
@@ -335,27 +459,8 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       const appEventOrder = new AppEventOrder();
       const streamVoided = new StreamVoided();
 
-      // 1. Push history from DB — one SSE frame per row.
-      // `Last-Event-ID` too: it is what a browser's EventSource sends when it
-      // reconnects by itself -- after a pod drain ended the stream with a
-      // `retry:` (infra/graceful-shutdown.ts), say -- to the same URL, which
-      // has no `?after=`. Without it the reconnect replays the whole history.
-      const afterEventId = req.query.after || lastEventIdOf(req.headers["last-event-id"]) || null;
-      const historyRows = afterEventId
-        ? (await db.query(
-            "SELECT event_id, event, data FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL AND event_id > $2 ORDER BY id",
-            [sessionId, afterEventId],
-          )).rows
-        : (await db.query(
-            "SELECT event_id, event, data FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL ORDER BY id",
-            [sessionId],
-          )).rows;
-
-      const history = historySegment(historyRows, fwdOpts, seenAppEvents);
-      for (const eid of history.seenIds) seenIds.add(eid);
-      for (const frame of history.frames) sseWrite(frame);
-
-      // 2. Live NATS events + keepalive (dedup against history via seenIds)
+      // Keepalive and the close handler, set up before the history is sent: a client that leaves while it is still
+      // being sent closes the subscription (and stops the history) too.
       const keepAlive = setInterval(() => {
         try { res.write(": keepalive\n\n"); } catch { /* client gone */ }
       }, 15_000);
@@ -364,6 +469,30 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
         clearInterval(keepAlive);
         subscription.close();
       });
+
+      // 1. Push history from DB — one SSE frame per row, read a page at a time
+      // (then 2., the live events, deduped against it via seenIds).
+      // `Last-Event-ID` too: it is what a browser's EventSource sends when it
+      // reconnects by itself -- after a pod drain ended the stream with a
+      // `retry:` (infra/graceful-shutdown.ts), say -- to the same URL, which
+      // has no `?after=`. Without it the reconnect replays the history again.
+      // Without either, only the last SSE_HISTORY_TAIL events are sent (the marker says `has_more`), unless the client
+      // asks for `?history=all`: a long session's whole history was read into this process on every connection.
+      const afterEventId = req.query.after || lastEventIdOf(req.headers["last-event-id"]) || null;
+      const start = await historyStart(sessionId, afterEventId, req.query.history === "all", SSE_HISTORY_TAIL, fwdOpts);
+      let cursor = start.afterId;
+      let sent = 0;
+      for (;;) {
+        const rows = await historyPage(sessionId, cursor, fwdOpts);
+        const page = historyFrames(rows, fwdOpts, seenAppEvents);
+        for (const eid of page.seenIds) seenIds.add(eid);
+        for (const frame of page.frames) sseWrite(frame);
+        sent += page.frames.length;
+        if (rows.length < HISTORY_PAGE_ROWS) break;
+        cursor = Number(rows[rows.length - 1].id);
+        if (!(await drained(res, backlog))) break;
+      }
+      sseWrite(historyCompleteFrame(sent, start.hasMore));
 
       try {
         // Live path uses eventsWithSeq() so the SSE `id:` field carries the

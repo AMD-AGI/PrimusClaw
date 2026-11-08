@@ -1,0 +1,201 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * The history a session's event stream (`GET /v1/chat/sessions/:id/messages`) sends before its live events.
+ *
+ * Every connection without `?after=` used to read the session's whole history into this process in one statement and
+ * write all of it to the client; an assistant session reached 33,196 events (28.6 MB), and the web console and the
+ * Teams worker open such a connection on every visit and every turn. Now a connection that does not say where it resumes
+ * gets the last SSE_HISTORY_TAIL events and a marker that says older ones exist (`has_more`), `?history=all` asks for
+ * everything, and the history is read a page at a time. `after` (and Last-Event-ID) is placed by row, so `claw-10`
+ * follows `claw-9` (comparing ids as text lost it).
+ *
+ * Driven through the route on PGlite (no NATS here, so the live part ends at once and the reply is the history).
+ * Also: the Anthropic-compatible stream's history and an A2A task's artifacts read only the latest rows.
+ */
+
+import test, { after, before, beforeEach } from "node:test";
+import assert from "node:assert/strict";
+import Fastify, { type FastifyInstance } from "fastify";
+
+import { SSE_HISTORY_TAIL } from "../src/config.js";
+import { db } from "../src/infra/db.js";
+import { HISTORY_PAGE_ROWS, registerEventRoutes } from "../src/routes/events.js";
+import { streamHistoryRows } from "../src/routes/anthropic-managed-agents.js";
+import { latestResults } from "../src/routes/a2a.js";
+import { startHarness, type Harness } from "./scenario-harness.js";
+
+const OWNER = { userId: "u-owner", userName: "u-owner", roles: ["default"], platformKey: "pk", virtualKey: "vk" };
+const SID = "s-long";
+
+let h: Harness;
+let app: FastifyInstance;
+/** Rows each statement on claw_session_events handed back, in order. */
+let rowsRead: number[] = [];
+
+before(async () => {
+  h = await startHarness();
+  const harnessQuery = db.query;
+  db.query = (async (text: string, params?: unknown[]) => {
+    const r = await (harnessQuery as (t: string, p?: unknown[]) => Promise<{ rows: unknown[]; rowCount: number }>)(text, params);
+    if (/FROM claw_session_events/.test(text)) rowsRead.push(r.rows.length);
+    return r;
+  }) as typeof db.query;
+  app = Fastify();
+  app.addHook("preHandler", async (req) => { (req as unknown as { user: unknown }).user = OWNER; });
+  await registerEventRoutes(app);
+  await app.ready();
+});
+beforeEach(async () => {
+  await h.reset();
+  rowsRead = [];
+  await h.sql("INSERT INTO claw_sessions (session_id, user_id) VALUES ($1, $2)", [SID, OWNER.userId]);
+});
+after(async () => {
+  await app?.close();
+  await h?.close();
+});
+
+/** Events claw-<from>..claw-<to> in that order; every `subEvery`-th one (when set) belongs to sub-agent `sub-a`. */
+async function seed(to: number, subEvery = 0, from = 1, event = "toolUsed"): Promise<void> {
+  await h.sql(
+    `INSERT INTO claw_session_events (event_id, session_id, event, data)
+     SELECT 'claw-' || g, $1, $5,
+            CASE WHEN $3 > 0 AND g % $3 = 0
+                 THEN jsonb_build_object('type', $5::text, 'n', g, 'subagent_id', 'sub-a')
+                 ELSE jsonb_build_object('type', $5::text, 'n', g) END
+       FROM generate_series($4::int, $2::int) g ORDER BY g`,
+    [SID, to, subEvery, from, event],
+  );
+  rowsRead = [];
+}
+
+interface Stream { status: number; ns: number[]; ids: string[]; marker: Record<string, unknown> | null }
+
+async function stream(query = "", headers: Record<string, string> = {}): Promise<Stream> {
+  const res = await app.inject({ method: "GET", url: `/v1/chat/sessions/${SID}/messages${query}`, headers });
+  const ns: number[] = [];
+  const ids: string[] = [];
+  let marker: Record<string, unknown> | null = null;
+  for (const frame of res.body.split("\n\n")) {
+    const event = /^event: (.+)$/m.exec(frame)?.[1];
+    const data = /^data: (.*)$/m.exec(frame)?.[1];
+    if (!event || data === undefined) continue;
+    const parsed = JSON.parse(data) as Record<string, unknown>;
+    if (event === "historyComplete") { marker = parsed; continue; }
+    assert.equal(marker, null, "no event after the marker");
+    ns.push(parsed.n as number);
+    ids.push(/^id: (.+)$/m.exec(frame)![1]);
+  }
+  return { status: res.statusCode, ns, ids, marker };
+}
+
+const range = (from: number, to: number): number[] => Array.from({ length: to - from + 1 }, (_, i) => from + i);
+
+test("without after, a long session sends its last SSE_HISTORY_TAIL events and says older ones exist", async () => {
+  const total = SSE_HISTORY_TAIL + 1000;
+  await seed(total);
+  const s = await stream();
+  assert.equal(s.status, 200);
+  assert.deepEqual(s.ns, range(total - SSE_HISTORY_TAIL + 1, total));
+  assert.deepEqual(s.marker, { type: "historyComplete", count: SSE_HISTORY_TAIL, has_more: true });
+  assert.ok(Math.max(...rowsRead) <= HISTORY_PAGE_ROWS, `no statement handed back more than a page: ${rowsRead}`);
+});
+
+test("a session shorter than the tail is sent whole, and the marker says nothing is left out", async () => {
+  await seed(30);
+  const s = await stream();
+  assert.deepEqual(s.ns, range(1, 30));
+  assert.deepEqual(s.marker, { type: "historyComplete", count: 30, has_more: false });
+});
+
+test("history=all sends the whole history, a page at a time", async () => {
+  const total = SSE_HISTORY_TAIL + 1000;
+  await seed(total);
+  const s = await stream("?history=all");
+  assert.deepEqual(s.ns, range(1, total));
+  assert.deepEqual(s.marker, { type: "historyComplete", count: total, has_more: false });
+  assert.ok(Math.max(...rowsRead) <= HISTORY_PAGE_ROWS, `no statement handed back more than a page: ${rowsRead}`);
+});
+
+test("after=claw-9 is followed by claw-10: the cursor is placed by row, not compared as text", async () => {
+  await seed(12);
+  const s = await stream("?after=claw-9");
+  assert.deepEqual(s.ids, ["claw-10", "claw-11", "claw-12"]);
+  assert.deepEqual(s.marker, { type: "historyComplete", count: 3, has_more: false });
+});
+
+test("Last-Event-ID resumes the same way as after", async () => {
+  await seed(12);
+  const s = await stream("", { "last-event-id": "claw-9" });
+  assert.deepEqual(s.ids, ["claw-10", "claw-11", "claw-12"]);
+});
+
+test("after is not cut to the tail: a reconnect gets everything it missed, a page at a time", async () => {
+  const total = SSE_HISTORY_TAIL + 1000;
+  await seed(total);
+  const s = await stream("?after=claw-5");
+  assert.deepEqual(s.ns, range(6, total));
+  assert.equal(s.marker?.has_more, false);
+  assert.ok(Math.max(...rowsRead) <= HISTORY_PAGE_ROWS, `no statement handed back more than a page: ${rowsRead}`);
+});
+
+test("a stream id the table does not hold yet resumes after the last stored event at or before it", async () => {
+  await seed(9);
+  await seed(12, 0, 12);   // claw-10 and claw-11 reached the client live and are not stored (yet)
+  assert.deepEqual((await stream("?after=claw-10")).ids, ["claw-12"]);
+  assert.deepEqual((await stream("?after=claw-99")).ids, []);
+});
+
+test("an after that is no event of this session is read as no after: the tail", async () => {
+  await seed(5);
+  const s = await stream("?after=not-an-event");
+  assert.deepEqual(s.ns, range(1, 5));
+  assert.equal(s.marker?.has_more, false);
+});
+
+test("the tail counts the events the caller is shown: subagent_id gets that sub-agent's last events", async () => {
+  const total = 3 * (SSE_HISTORY_TAIL + 10);
+  await seed(total, 3);
+  const s = await stream("?subagent_id=sub-a");
+  assert.equal(s.ns.length, SSE_HISTORY_TAIL);
+  assert.ok(s.ns.every((n) => n % 3 === 0));
+  assert.equal(s.ns[s.ns.length - 1], total);
+  assert.equal(s.marker?.has_more, true);
+});
+
+test("the Anthropic-compatible stream's history is the last events, oldest first", async () => {
+  await seed(50);
+  const rows = await streamHistoryRows(SID, 10);
+  assert.deepEqual(rows.map((r) => (r.data as { n: number }).n), range(41, 50));
+  assert.deepEqual(rowsRead, [10]);
+});
+
+test("an A2A task's artifacts are its latest results, oldest first", async () => {
+  await seed(250, 0, 1, "ResultMessage");
+  const rows = await latestResults(SID);
+  assert.deepEqual(rows.map((r) => (r.data as { n: number }).n), range(151, 250));
+  assert.deepEqual(rowsRead, [100]);
+});
+
+test("the next page is not read while the client has not taken the last one", async () => {
+  await seed(3 * HISTORY_PAGE_ROWS);
+  // A page larger than the response's buffer, so the client not reading is something the stream can see.
+  await h.sql("UPDATE claw_session_events SET data = data || jsonb_build_object('pad', repeat('x', 400))");
+  rowsRead = [];
+  const res = await app.inject({ method: "GET", url: `/v1/chat/sessions/${SID}/messages?history=all`, payloadAsStream: true });
+  const body = (async () => {
+    let text = "";
+    for await (const chunk of res.stream()) text += chunk.toString();
+    return text;
+  });
+  try {
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    assert.deepEqual(rowsRead, [HISTORY_PAGE_ROWS], "one page read, then the stream waits for the client");
+  } finally {
+    const text = await body();
+    assert.equal((text.match(/^id: /gm) ?? []).length, 3 * HISTORY_PAGE_ROWS);
+    assert.match(text, /"has_more":false/);
+  }
+});
