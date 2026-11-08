@@ -385,6 +385,30 @@ export function renderItemMemories(entries: ReadonlyArray<{ id: number; type: st
 
 /** The most of an entry's body the turn's recall shows: all of what a write may store; only an older, longer entry is cut. */
 const TURN_RECALL_BODY_CHARS = BODY_MAX;
+/** The most entries one turn's recall shows: what the message matched, then what their links reach. */
+export const TURN_RECALL_MAX_ENTRIES = 8;
+/** The most body characters one turn's recall shows, all entries together; an entry past it is cut, and none follows it. */
+export const TURN_RECALL_MAX_CHARS = 2400;
+
+export interface TurnRecallEntry { id: number; type: string; title: string; body: string; work_item_id?: string | null; via?: string }
+
+/**
+ * The entries a turn's recall shows, in order, each body cut to what is left of TURN_RECALL_MAX_CHARS (and to BODY_MAX), at most
+ * TURN_RECALL_MAX_ENTRIES: what fits of the matched entries first, then of what their links reach.
+ */
+export function fitTurnRecall(entries: readonly TurnRecallEntry[]): TurnRecallEntry[] {
+  const out: TurnRecallEntry[] = [];
+  let left = TURN_RECALL_MAX_CHARS;
+  for (const e of entries) {
+    if (out.length >= TURN_RECALL_MAX_ENTRIES || left <= 0) break;
+    const body = [...oneLine(e.body)];
+    const room = Math.min(TURN_RECALL_BODY_CHARS, left);
+    const shown = body.length > room ? `${body.slice(0, room - 1).join("")}…` : body.join("");
+    left -= [...shown].length;
+    out.push({ ...e, body: shown });
+  }
+  return out;
+}
 
 /**
  * What the router is shown, with the person's message, of the entries that message is about (`routerTurnRecall`): in full, so a
@@ -392,20 +416,21 @@ const TURN_RECALL_BODY_CHARS = BODY_MAX;
  * is a lead to read, not an answer.
  */
 export function renderTurnRecall(
-  entries: ReadonlyArray<{ id: number; type: string; title: string; body: string; work_item_id?: string | null }>,
+  entries: readonly TurnRecallEntry[],
   cites: ReadonlyMap<number, ReadonlyArray<{ id: number; title: string }>> = new Map(),
 ): string {
+  const shown = fitTurnRecall(entries);
   return [
-    `<memory-recall count="${entries.length}">`,
+    `<memory-recall count="${shown.length}">`,
     "Entries of the user's long-term memory that their message is about, found for this turn before you answer (you did not call memory_recall). "
       + "Background, as the index is. When they hold the answer, answer from them and do not look the name up elsewhere; when one names another "
       + "entry (「its title」), read that one with memory_recall(query) before saying you do not know. \"cites #N\" is the entry it names, as it "
-      + "stands now, whatever its own words say about that entry (an entry may say another was not recorded yet when it was written before it).",
-    ...entries.map((e) => {
-      const body = [...oneLine(e.body)];
-      const shown = body.length > TURN_RECALL_BODY_CHARS ? `${body.slice(0, TURN_RECALL_BODY_CHARS - 1).join("")}…` : body.join("");
+      + "stands now, whatever its own words say about that entry (an entry may say another was not recorded yet when it was written before it). "
+      + "An entry marked \"found because …\" did not match the message: an entry that did links to it, as it says.",
+    ...shown.map((e) => {
       const cited = (cites.get(e.id) ?? []).map((c) => `#${c.id} ${oneLine(c.title)}`);
-      return `- [${e.type}] #${e.id} ${oneLine(e.title)}${e.work_item_id ? " (about one item)" : ""}: ${shown}${cited.length ? ` (cites ${cited.join("; ")})` : ""}`;
+      return `- [${e.type}] #${e.id} ${oneLine(e.title)}${e.work_item_id ? " (about one item)" : ""}: ${e.body}`
+        + `${cited.length ? ` (cites ${cited.join("; ")})` : ""}${e.via ? ` (found because ${e.via})` : ""}`;
     }),
     "</memory-recall>",
   ].join("\n");

@@ -28,7 +28,7 @@ import {
   BODY_MAX, NOTE_MAX, SIMILARITY_THRESHOLD, TITLE_MAX, isMemoryType, legacyType, memoryCommand, normalizeText,
   quoteIsFrom, quoteSupports, rankByMessage, scanInjection, scanSecrets, similarity, type MemoryType,
 } from "./gates.js";
-import { citedBy, linkDerived, relinkEntry, resolveNames, unlinkErased } from "./links.js";
+import { citedBy, LINKS_PER_ENTRY_MAX, linkDerived, relinkEntry, resolveNames, unlinkErased } from "./links.js";
 
 const logger = pino({ name: "memory-service" });
 
@@ -619,6 +619,68 @@ export async function memoriesForMessage(userId: string, message: string): Promi
   )).rows.map(toRow);
   return rankByMessage(message, rows, (r) => `${r.title}\n${r.body}`, { limit: MESSAGE_RECALL_LIMIT, minScore: MESSAGE_RECALL_MIN_SCORE })
     .map((x) => x.item);
+}
+
+/** How far the turn recall follows the entries' links from what the message matched (E242: at most two hops). */
+export const LINK_RECALL_DEPTH = 2;
+
+/** An entry reached along a link, and the link it was reached by: `#410 cites it`, `it cites #415`. */
+export interface LinkedMemory { row: MemoryRow; hop: number; via: string }
+
+/**
+ * The entries the user's links reach from `seeds`, breadth first, at most LINK_RECALL_DEPTH hops and `max` entries, in both
+ * directions (what a seed cites or is derived from, and what cites it or is derived from it). Every hop is read from this user's
+ * rows only: a link is this user's, and the entry it reaches must be this user's, active and not past review; a hop never passes
+ * through one that is not. Not counted as reads, as the seeds are not. At most CLAW_MEMORY_MAX_ENTRIES x LINKS_PER_ENTRY_MAX links
+ * are read, and one read of the entries per hop.
+ */
+export async function expandAlongLinks(userId: string, seeds: readonly MemoryRow[], max: number): Promise<LinkedMemory[]> {
+  if (!seeds.length || max <= 0) return [];
+  const links = (await db.query(
+    `SELECT from_id, rel, to_id FROM claw_memory_links WHERE user_id = $1 AND to_kind = 'memory' LIMIT $2`,
+    [userId, CLAW_MEMORY_MAX_ENTRIES * LINKS_PER_ENTRY_MAX],
+  )).rows as Array<{ from_id: number; rel: string; to_id: string }>;
+  const next = new Map<number, Array<{ to: number; via: (from: number) => string }>>();
+  const add = (a: number, b: number, via: (from: number) => string): void => {
+    const list = next.get(a) ?? [];
+    list.push({ to: b, via });
+    next.set(a, list);
+  };
+  for (const l of links) {
+    const from = Number(l.from_id);
+    const to = Number(l.to_id);
+    if (!Number.isSafeInteger(to) || from === to) continue;
+    const verb = l.rel === "derived_from" ? "is derived from" : "cites";
+    add(from, to, (x) => `#${x} ${verb} it`);
+    add(to, from, (x) => `it ${verb} #${x}`);
+  }
+  const seen = new Set(seeds.map((r) => r.id));
+  const out: LinkedMemory[] = [];
+  let frontier = seeds.map((r) => r.id);
+  for (let hop = 1; hop <= LINK_RECALL_DEPTH && frontier.length && out.length < max; hop += 1) {
+    const reached: Array<{ id: number; via: string }> = [];
+    for (const f of frontier) {
+      for (const e of next.get(f) ?? []) {
+        if (seen.has(e.to) || reached.some((r) => r.id === e.to)) continue;
+        reached.push({ id: e.to, via: e.via(f) });
+      }
+    }
+    if (!reached.length) break;
+    const rows = new Map((await db.query(
+      `SELECT ${ROW_COLUMNS} FROM claw_memory_entries
+        WHERE user_id = $1 AND id = ANY($2::int[]) AND ${USER_ROWS} AND status = 'active' AND (expires_at IS NULL OR expires_at > NOW())`,
+      [userId, reached.map((r) => r.id)],
+    )).rows.map(toRow).map((r) => [r.id, r] as const));
+    frontier = [];
+    for (const r of reached) {
+      const row = rows.get(r.id);
+      if (!row || out.length >= max) continue;
+      seen.add(r.id);
+      out.push({ row, hop, via: r.via });
+      frontier.push(r.id);
+    }
+  }
+  return out;
 }
 
 /** The active entries each of `ids` cites (`claw_memory_links`), of this user only. */

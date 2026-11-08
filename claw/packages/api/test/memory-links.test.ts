@@ -16,6 +16,10 @@
  *   L9  a cited entry renamed away takes the citation with it: the name is dangling again, and the recall shows no citation
  *   L10 a later entry that ties with the cited one leaves the name unjoined
  *   L11 an entry waiting for its owner's confirmation does not capture a name; confirmed, it is joined
+ *   X1  the turn recall follows links from what the message matched, two hops at most, saying how each entry was reached
+ *   X2  ... in both directions: what cites a matched entry, and what it cites
+ *   X3  ... never to another user's entry, nor through one waiting for confirmation or past review
+ *   X4  ... and shows at most TURN_RECALL_MAX_ENTRIES entries and TURN_RECALL_MAX_CHARS body characters in all
  *   L12 an update waits for the user's write lock before it locks a row: a forget-all holding the lock deletes the row, and neither
  *       deadlocks
  */
@@ -188,6 +192,94 @@ describe("memory citations", { skip }, () => {
       await other.query("ROLLBACK").catch(() => undefined);
       other.release();
     }
+  });
+
+  /** The router turn's recall block for the person's message (alice is on the recall list). */
+  async function recallFor(message: string): Promise<string> {
+    mt.turnRecallSettings.all = false;
+    mt.turnRecallSettings.users = new Set(["alice"]);
+    const alice = await w.user("alice");
+    const turn = await w.routerTurn(alice);
+    await w.q(
+      `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, user_name, content, attended_via, channel_context, received_at)
+       VALUES ($1, $2, 'alice', NULL, $3, '{"kind":"person"}'::jsonb, '{}'::jsonb, NOW())`,
+      [turn.sid, turn.mid, message],
+    );
+    const task: Record<string, unknown> = { task_id: turn.task_id, message_id: turn.mid, prompt: message };
+    await w.mod.role.applySessionRoleToTask(task, alice.routerSid);
+    return /<memory-recall[\s\S]*?<\/memory-recall>/.exec(String(task.prompt))?.[0] ?? "";
+  }
+  const lineOf = (block: string, id: number): string => block.split("\n").find((l) => l.startsWith("- [") && l.includes(`] #${id} `)) ?? "";
+
+  /** A chain no word of which but the first entry's is in the question: A cites B, B cites C, C cites D. */
+  async function chain(): Promise<{ a: number; b: number; c: number; d: number }> {
+    const d = await save("alice", "审查清单", "清单共有十二项，逐项打勾。");
+    const c = await save("alice", "合规审查", `合规审查由 Osprey 每季度做一次，按 #${d} 逐项过。`);
+    const b = await save("alice", "Wren-v3 许可", `Wren 许可：只能内部评测，对外发布要先过 #${c}。`);
+    const a = await save("alice", "Kestrel 数据集", "Kestrel 用的数据集叫 Wren-v3，许可证见「Wren 许可」。");
+    return { a, b, c, d };
+  }
+
+  test("X1 the turn recall follows links two hops from what the message matched", async () => {
+    const { a, b, c, d } = await chain();
+    const block = await recallFor("Kestrel 用的数据集叫什么？");
+    assert.ok(lineOf(block, a) && !lineOf(block, a).includes("found because"), block);
+    assert.ok(lineOf(block, b).includes("只能内部评测") && lineOf(block, b).endsWith(`(found because #${a} cites it)`), block);
+    assert.ok(lineOf(block, c).includes("每季度") && lineOf(block, c).endsWith(`(found because #${b} cites it)`), block);
+    assert.equal(lineOf(block, d), "", `three hops away, and shown: ${block}`);
+  });
+
+  test("X2 links are followed both ways", async () => {
+    const { a, b, c, d } = await chain();
+    const block = await recallFor("合规审查多久一次？");
+    assert.ok(lineOf(block, c) && !lineOf(block, c).includes("found because"), block);
+    assert.ok(lineOf(block, b).endsWith(`(found because it cites #${c})`), block);
+    assert.ok(lineOf(block, d).endsWith(`(found because #${c} cites it)`), block);
+    assert.ok(lineOf(block, a).endsWith(`(found because it cites #${b})`), block);
+  });
+
+  test("X3 never to another user's entry, nor through one waiting for confirmation or past review", async () => {
+    const a = await save("alice", "Kestrel 数据集", "Kestrel 用的数据集叫 Wren-v3。");
+    const theirs = await save("bob", "Bob 的秘密", "Bob 的门禁密码在抽屉里。");
+    const pending = await save("alice", "回滚负责人", "回滚找 Osprey。");
+    const behind = await save("alice", "Osprey 的电话", "Osprey 的分机是 4321。");
+    const due = await save("alice", "旧日历", "去年的上线日历在 wiki。");
+    await w.q("UPDATE claw_memory_entries SET status = 'pending' WHERE id = $1", [pending]);
+    await w.q("UPDATE claw_memory_entries SET expires_at = NOW() - interval '1 day' WHERE id = $1", [due]);
+    // Rows no write would make: a link of alice's to bob's entry, and one of bob's to alice's entry.
+    for (const [user, from, to] of [["alice", a, theirs], ["bob", theirs, a], ["alice", a, pending], ["alice", pending, behind], ["alice", a, due]] as const) {
+      await w.q(
+        "INSERT INTO claw_memory_links (user_id, from_id, rel, name, to_kind, to_id, created_by) VALUES ($1, $2, 'cites', '', 'memory', $3, 'system')",
+        [user, from, String(to)],
+      );
+    }
+    const block = await recallFor("Kestrel 用的数据集叫什么？");
+    assert.ok(lineOf(block, a), block);
+    for (const id of [theirs, pending, behind, due]) assert.equal(lineOf(block, id), "", `#${id} shown: ${block}`);
+    assert.ok(!block.includes("门禁") && !block.includes("4321"), block);
+  });
+
+  test("X4 at most TURN_RECALL_MAX_ENTRIES entries and TURN_RECALL_MAX_CHARS body characters in all", async () => {
+    const { TURN_RECALL_MAX_ENTRIES, TURN_RECALL_MAX_CHARS } = await import("../src/assistant/prompts.js");
+    const a = await save("alice", "Kestrel 数据集", "Kestrel 用的数据集叫 Wren-v3。");
+    const glyphs = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥";
+    for (let i = 0; i < 12; i += 1) {
+      const body = `第${i}条：${Array.from({ length: 450 }, (_, k) => glyphs[(i * 7 + k * 5) % glyphs.length]).join("")}`;
+      const [row] = await w.q(
+        `INSERT INTO claw_memory_entries (user_id, category, content, mtype, title, status) VALUES ('alice', 'project', $1, 'project', $2, 'active') RETURNING id`,
+        [body, `附录 ${i}`],
+      );
+      await w.q(
+        "INSERT INTO claw_memory_links (user_id, from_id, rel, name, to_kind, to_id, created_by) VALUES ('alice', $1, 'cites', '', 'memory', $2, 'system')",
+        [a, String(row.id)],
+      );
+    }
+    const block = await recallFor("Kestrel 用的数据集叫什么？");
+    const lines = block.split("\n").filter((l) => l.startsWith("- ["));
+    assert.ok(lines.length > 1 && lines.length <= TURN_RECALL_MAX_ENTRIES, block);
+    const chars = lines.reduce((n, l) => n + [...l.replace(/^- \[[a-z]+\] #\d+ [^:]*: /, "").replace(/ \((?:cites|found because) [^)]*\)/g, "")].length, 0);
+    assert.ok(chars <= TURN_RECALL_MAX_CHARS, `${chars} body characters`);
+    assert.match(block, /<memory-recall count="\d+">/);
   });
 });
 
