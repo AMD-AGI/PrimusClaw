@@ -2986,6 +2986,8 @@ class AgentLoopRunner {
         webToolServices: this.router.getWebToolServices?.(),
         // Forwarded, never re-derived: a sub-agent is no way around the list.
         toolAllowlist: this.opts.toolAllowlist,
+        // Nor around the check of a cited report it delivers.
+        citeCheck: this.router.citeCheck,
         ...(this.opts.turnPool ? { turnPool: this.opts.turnPool } : {}),
         });
         resultText = sub.finalText || "(sub-agent produced no final text)";

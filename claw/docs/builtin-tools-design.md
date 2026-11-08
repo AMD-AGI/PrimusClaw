@@ -457,7 +457,7 @@ interface WebSearchProvider {
   }): Promise<SearchHit[]>;
 }
 
-// config: WEB_SEARCH_PROVIDER = "anthropic" | "tavily" | "brave" | "serper" | "disabled"
+// config: WEB_SEARCH_PROVIDER = "anthropic" | "tavily" | "brave" | "serper" | "duckduckgo" | "disabled"
 ```
 
 Default order:
@@ -1710,8 +1710,8 @@ All new behavior is gated by env vars so deployments can opt in:
 
 | Env var | Default | Effect |
 |---|---|---|
-| `WEB_SEARCH_PROVIDER` | `"disabled"` | `anthropic` / `tavily` / `brave` / `serper` / `disabled`; recommended for Claude deployments: `anthropic` |
-| `WEB_SEARCH_FALLBACK` | `""` | Comma-separated providers to try if primary fails |
+| `WEB_SEARCH_PROVIDER` | `"disabled"` | `anthropic` / `tavily` / `brave` / `serper` / `duckduckgo` / `disabled`; recommended for Claude deployments: `anthropic` |
+| `WEB_SEARCH_FALLBACK` | `""` | Comma-separated providers to try if primary fails. `duckduckgo` needs no key (it reads DuckDuckGo's HTML results page): behind `anthropic` it answers only while the native search fails, so the native search takes over again by itself once the gateway accepts it |
 | `WEB_SEARCH_MAX_USES` | `8` | Anthropic native: `max_uses` field; 3rd-party: max calls per loop turn |
 | `TAVILY_API_KEY` / `BRAVE_API_KEY` / `SERPER_API_KEY` | unset | Required for the matching provider |
 | `WEB_SEARCH_MODEL` | `""` | Override model for Anthropic sub-LLM wrapper (e.g. `claude-3-5-haiku-latest`); empty = use main model |

@@ -58,6 +58,7 @@ import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 import { disciplineOn } from "./discipline.js";
 import { applyRouterTurnSpeed } from "./router-speed.js";
 import { routerCite } from "./citations.js";
+import { applyWorkerResearch, assistantResearchOn, RESEARCH_PROMPT_VERSION, ROUTER_RESEARCH_PROMPT } from "./research.js";
 
 const logger = pino({ name: "assistant-role" });
 
@@ -303,6 +304,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     const cite = routerCite(lookups.githubServers, stringField(task, "prompt"), undefined, read?.servers ?? []);
     if (cite) task.cite = cite;
     else delete task.cite;
+    // A router's deliver_text is its own writing, delivered at once: never checked as a worker's research report is.
+    delete task.cite_check;
     // Neither the deployment's default MCP servers nor its default skills: the hint that lists them would follow the user's message.
     task.skip_platform_defaults = true;
     // The system prompt is the same on every turn, so it and the history after it come from the prompt cache. What changes
@@ -315,6 +318,9 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     ));
     // What it writes itself (a document, a draft, a translation), and how a file or a comment of its reaches the user (`writing-prompt.ts`).
     withSystemAppend(task, renderRouterWritingSection({ comment: assistantSchedulesOn() }));
+    // A research report is a work item, never text the router writes from what it knows: after the writing section, which it narrows.
+    const research = assistantResearchOn();
+    if (research) withSystemAppend(task, ROUTER_RESEARCH_PROMPT);
     const asked = await askedOfOthersManifest(role.userId);
     const state = [renderRouterItems(await routerManifest(role.userId), asked, new Date(), asked.length ? await askedOfOthersTotalsManifest(role.userId) : undefined)];
     // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
@@ -387,6 +393,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       read: ROUTER_READ_PROMPT_VERSION, write: ROUTER_WRITING_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),
       ...(cite ? { cite: ROUTER_CITE_PROMPT_VERSION } : {}), self: ROUTER_SELF_PROMPT_VERSION, selfStatus: self,
       ...(discipline ? { discipline: ROUTER_DISCIPLINE_PROMPT_VERSION } : {}),
+      ...(research ? { research: RESEARCH_PROMPT_VERSION } : {}),
     }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);
@@ -403,7 +410,13 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     if (CLAW_ASSISTANT_DECISION_WAIT_SEC > 0) task.decision_wait_ms = CLAW_ASSISTANT_DECISION_WAIT_SEC * 1000;
     const memory = await workerMemoryBlock(role.userId, started.itemId, sessionId);
     if (memory) withSystemAppend(task, memory);
-    logger.info({ sessionId, taskId, itemId: started.itemId, generation: started.generation, prompt: discipline ? WORKER_DISCIPLINE_PROMPT_VERSION : WORKER_PROMPT_VERSION }, "assistant.worker_turn");
+    // A research report: its method, and its deliver_text checked against its citations by Brain before the file is stored.
+    const research = applyWorkerResearch(task, (text) => withSystemAppend(task, text));
+    logger.info({
+      sessionId, taskId, itemId: started.itemId, generation: started.generation,
+      prompt: discipline ? WORKER_DISCIPLINE_PROMPT_VERSION : WORKER_PROMPT_VERSION,
+      ...(research ? { research: RESEARCH_PROMPT_VERSION } : {}),
+    }, "assistant.worker_turn");
   }
 
   // Replaces a server of the same name that the request carried: the user's own session config must not

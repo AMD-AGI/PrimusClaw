@@ -892,6 +892,11 @@ export const CLAW_ASSISTANT_CITATIONS = envBool("CLAW_ASSISTANT_CITATIONS", fals
 // with the prefix those pages' addresses have: `agent-board=https://host/board/`, comma-separated. A router turn that has such a
 // server may cite the issues and boards it read there (`ExecuteRequest.cite.link_servers`). Empty (the default): none.
 export const CLAW_ASSISTANT_CITE_LINK_SERVERS = env("CLAW_ASSISTANT_CITE_LINK_SERVERS");
+// `true` makes a research report a background work item whose citations are checked before it is delivered (`assistant/research.ts`):
+// the router hands "research X / a comparison report on X" to a worker, the worker researches with web_search and web_fetch and
+// delivers a Markdown report with numbered citations through deliver_text, and Brain opens every cited source and marks each
+// statement no source supports as unverified before the file is stored (`ExecuteRequest.cite_check`). Off (the default): neither.
+export const CLAW_ASSISTANT_RESEARCH = envBool("CLAW_ASSISTANT_RESEARCH", false);
 // `true` (the default) gives the router's `say` an optional `suggested`: up to three short replies the user is likely to send next,
 // carried by `assistant.say` as `suggested_replies` for a channel to show as buttons that send them (`assistant/suggested.ts`).
 export const CLAW_ASSISTANT_SUGGESTED_REPLIES = envBool("CLAW_ASSISTANT_SUGGESTED_REPLIES", true);

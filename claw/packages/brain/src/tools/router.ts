@@ -11,6 +11,7 @@ import type { McpToolCaller } from "../clients/mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
 import type { RunCitations } from "./citations.js";
+import { CITED_FILE_PATTERNS, CITED_FILE_REFUSAL, REPORT_FILE_EXTENSIONS, checkNote, checkReport, type CiteCheck } from "./cite-check.js";
 import type { LogReads } from "./log-reads.js";
 import { callWithWorkspaceFanout, fansOut } from "./workspace-fanout.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
@@ -276,6 +277,8 @@ export class ToolRouter {
   readTaint: ReadTaint | null = null;
   /** The run's `cite` (`citations.ts`): set by the engine on the top-level router, null when the request has none. */
   citations: RunCitations | null = null;
+  /** The run's `cite_check` (`cite-check.ts`): set by the engine on the top-level router, null when the request has none. */
+  citeCheck: CiteCheck | null = null;
   /** The run's `log_reads` (`log-reads.ts`): set by the engine, null when the request has none. */
   logReads: LogReads | null = null;
 
@@ -478,6 +481,57 @@ export class ToolRouter {
     if (this.toolAllowlist && !this.toolAllowlist.allows(name)) {
       return refuse(outcome, toolNotAllowedMessage(name));
     }
+    // A research report is checked against its own sources before it is delivered, and only the checked text goes on
+    // (`cite-check.ts`); the model is told what the check found before what the tool answered.
+    const check = this.citeCheck;
+    // The same report copied out of the sandbox would reach the user unchecked: a text file that is one is refused, and the model
+    // is told to deliver it as text.
+    if (check && name === DELIVER_FILE_TOOL && typeof input.path === "string" && await this.sandboxFileIsCitedReport(input.path, signal)) {
+      return refuse(outcome, CITED_FILE_REFUSAL);
+    }
+    if (check?.checks(name) && typeof input.text === "string" && input.text.trim()) {
+      const result = await checkReport(input.text, check.ports, signal);
+      if (result.checked) {
+        const answered: RouteOutcome = outcome ?? { isError: false };
+        const text = await this.routeListed(name, { ...input, text: result.text }, signal, answered, ctx);
+        return answered.isError ? text : `${checkNote(result)}\n\n${text}`;
+      }
+    }
+    return this.routeListed(name, input, signal, outcome, ctx);
+  }
+
+  /**
+   * Whether the sandbox file at `path` is a cited report: the sandbox's own `grep` (which reads the whole file) counts both a line of
+   * a list of sources and a line that cites a number (`CITED_FILE_PATTERNS`). A file the search cannot read is not one: `deliver_file`
+   * then answers for it as it would.
+   */
+  private async sandboxFileIsCitedReport(path: string, signal?: AbortSignal): Promise<boolean> {
+    for (const pattern of CITED_FILE_PATTERNS) {
+      const found: RouteOutcome = { isError: false };
+      let text: string;
+      try {
+        text = await this.routeAllowed("grep", { pattern, path, output_mode: "count", case_sensitive: true }, signal, found);
+      } catch {
+        return false;
+      }
+      // A match is the file's count line, `<path>:<n>` with n > 0, whatever the path's name; no note (a file too large to search, a
+      // scan cut short) ends that way. A refusal that did is read as a match: the file then goes through deliver_text, never unchecked.
+      const matched = text.split("\n").some((l) => Number(l.trim().match(/.:(\d+)$/)?.[1] ?? 0) > 0);
+      // A report too large to search is not taken to be anything else (a log or a table that size is delivered as before).
+      const unsearched = !matched && REPORT_FILE_EXTENSIONS.test(path) && /\bnot searched\b/.test(text);
+      if (found.isError || (!matched && !unsearched)) return false;
+    }
+    return true;
+  }
+
+  /** `route()` for a call the allow-list let through: the read taint and the citations, then the tool. */
+  private async routeListed(
+    name: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+    outcome?: RouteOutcome,
+    ctx?: { stepIdentity?: string },
+  ): Promise<string> {
     const taint = this.readTaint;
     const cite = this.citations;
     if (!taint && !cite) return this.routeAllowed(name, input, signal, outcome, ctx);
