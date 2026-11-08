@@ -237,6 +237,8 @@ for (const phase of ["terminal", "absent"] as const) {
     assert.equal(h.world.rec.restarts, 1);
     assert.equal(h.world.rec.sandbox_workload_id, null);
     assert.equal(h.world.rec.last_exit?.cause, "sandbox_lost");
+    assert.deepEqual(h.world.readers.map((r) => r.id), ["rd-1"], "shared storage was looked at before the restart was counted");
+    assert.deepEqual(h.world.liveReaders(), [], "and the reader was stopped");
     await until(h, "running");
     assert.equal(h.world.rec.sandbox_workload_id, "wl-2");
     assert.equal(h.world.starts.length, 2);
@@ -273,14 +275,15 @@ test("T14 a lost sandbox past max_restarts ends the run as failed, never above t
   assert.equal(h.world.rec.restarts, 1);
   h.world.killWorkload(wl, "terminal");
   await h.runner.reconcile();
-  // The budget is spent: one more sandbox only to look for a final exit, restarts unchanged.
-  assert.equal(h.world.rec.state, "provisioning");
-  assert.equal(h.world.rec.restarts, 1);
-  assert.equal(h.world.rec.last_exit?.recovery, true);
-  await until(h, "finishing");
+  // The budget is spent and the reader found no final: finishing, restarts unchanged,
+  // and no application-sized sandbox made only to look.
+  assert.equal(h.world.rec.state, "finishing");
   assert.equal(h.world.rec.restarts, 1);
   assert.equal(h.world.rec.last_exit?.cause, "restarts_exhausted");
-  assert.equal(h.world.starts.length, 2, "the recovery sandbox starts nothing");
+  assert.deepEqual(h.world.created, ["wl-1", "wl-2"]);
+  assert.equal(h.world.readers.length, 2, "one look per loss");
+  assert.deepEqual(h.world.liveReaders(), []);
+  assert.equal(h.world.starts.length, 2);
   const r = await h.runner.reconcile();
   assert.equal(r.done && r.outcome.success, false);
 });
@@ -291,27 +294,40 @@ test("T14b a final exit hidden by a lost sandbox is found even with the budget s
   h.world.appExits(wl, finalExit(0));
   h.world.killWorkload(wl, "terminal");
   await h.runner.reconcile();
-  assert.equal(h.world.rec.state, "provisioning");
-  await until(h, "finishing");
+  assert.equal(h.world.rec.state, "finishing");
   assert.equal(h.world.rec.last_exit?.final, true);
   const r = await h.runner.reconcile();
   assert.deepEqual(r, { done: true, outcome: { success: true, reason: "app finished", captures: { session_dir: STATE_DIR } } });
   assert.equal(h.world.starts.length, 1, "FINAL is not run again");
+  assert.deepEqual(h.world.created, ["wl-1"], "read through a reader, not a second application sandbox");
   assert.equal(h.world.rec.restarts, 0);
 });
 
-test("T14c losing the recovery sandbox too ends the run as failed: one look, not a loop", async () => {
+test("T14c a reader that cannot be made is retried; after three failed looks the loss is counted without one", async () => {
   const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } } });
   const wl = await toRunning(h);
   h.world.killWorkload(wl, "terminal");
-  await h.runner.reconcile();
-  assert.equal(h.world.rec.state, "provisioning");
-  await h.runner.reconcile(); // provisioning -> starting
-  h.world.killWorkload(h.world.rec.sandbox_workload_id!, "terminal");
+  h.world.failReader = 3;
+  await assert.rejects(h.runner.reconcile(), /reader could not be created/);
+  assert.equal(h.world.rec.state, "running", "a look that failed changes nothing");
+  await assert.rejects(h.runner.reconcile(), /reader could not be created/);
   await h.runner.reconcile();
   assert.equal(h.world.rec.state, "finishing");
   assert.equal(h.world.rec.last_exit?.cause, "restarts_exhausted");
-  assert.deepEqual(h.world.created, ["wl-1", "wl-2"]);
+  assert.deepEqual(h.world.created, ["wl-1"]);
+});
+
+test("T14c' a reader that fails once and then reads a final ends the run as the success it was", async () => {
+  const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } } });
+  const wl = await toRunning(h);
+  h.world.appExits(wl, finalExit(0, { stop_reason: "time_exhausted" }));
+  h.world.killWorkload(wl, "terminal");
+  h.world.failReader = 1;
+  await assert.rejects(h.runner.reconcile(), /reader could not be created/);
+  await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "finishing");
+  const r = await h.runner.reconcile();
+  assert.equal(r.done && r.outcome.success, true);
 });
 
 test("T14d a sandbox lost before the app ever started (no state dir) has nothing to recover", async () => {
@@ -320,20 +336,50 @@ test("T14d a sandbox lost before the app ever started (no state dir) has nothing
   h.world.killWorkload(h.world.rec.sandbox_workload_id!, "terminal");
   await h.runner.reconcile();
   assert.equal(h.world.rec.state, "finishing");
+  assert.deepEqual(h.world.readers, [], "no state directory, nothing to read");
 });
 
-test("T15 a sandbox lost after the app finished ends the run, it does not repeat it", async () => {
+test("T15 a sandbox lost after the app finished ends the run as a success with its stop reason, it does not repeat it", async () => {
   const h = harness();
   const wl = await toRunning(h);
-  // The app wrote its final exit.json to shared storage and the sandbox died before the next tick.
-  h.world.appExits(wl, finalExit(0));
+  // The app wrote its final exit.json to shared storage and the sandbox died before the next tick
+  // (hosting, 2026-11-08: the node was preempted 39 s after the application wrote it).
+  h.world.appExits(wl, finalExit(0, { stop_reason: "time_exhausted" }));
   h.world.killWorkload(wl, "terminal");
-  await h.runner.reconcile(); // lost -> provisioning (counted)
-  assert.equal(h.world.rec.state, "provisioning");
-  await until(h, "finishing");
-  assert.equal(h.world.starts.length, 1, "FINAL is not run again in the replacement sandbox");
+  await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "finishing", "straight to finishing: the loss is not counted as a restart");
+  assert.equal(h.world.rec.restarts, 0);
+  assert.equal(h.world.starts.length, 1, "FINAL is not run again");
+  assert.deepEqual(h.world.created, ["wl-1"], "no replacement sandbox");
   const r = await h.runner.reconcile();
-  assert.equal(r.done && r.outcome.success, true);
+  assert.deepEqual(r, {
+    done: true,
+    outcome: { success: true, reason: "app finished", captures: { session_dir: STATE_DIR, stop_reason: "time_exhausted" } },
+  });
+  assert.equal(h.world.rec.last_exit?.stop_reason, "time_exhausted");
+  assert.deepEqual(h.world.liveReaders(), []);
+});
+
+test("T15b a Brain that takes over a run whose sandbox went while nobody held it reads the final (the 2026-11-08 run)", async () => {
+  // As the row stood when the takeover came: still `running`, the recorded sandbox gone
+  // (ContainerStatusUnknown, then deleted), and `final: true, returncode: 0` on shared storage.
+  const world = new World(MANIFEST, {
+    state: "running", sandbox_workload_id: "wl-9", state_dir: STATE_DIR, task_status: "running",
+  });
+  world.workloads.set("wl-9", "absent");
+  world.files.set(`${STATE_DIR}/exit.json`, JSON.stringify(finalExit(0, { stop_reason: "time_exhausted" })));
+  const runner = new AppRunner(RUN_ID, PLATFORM_KEY, {
+    store: world.store, sandbox: world.sandbox, now: world.now, sleep: world.sleep, tickMs: 5000,
+  });
+  const result = await runner.run(new AbortController().signal);
+  assert.deepEqual(result, {
+    kind: "ended",
+    outcome: { success: true, reason: "app finished", captures: { session_dir: STATE_DIR, stop_reason: "time_exhausted" } },
+  });
+  assert.deepEqual(world.created, [], "no application sandbox was made");
+  assert.equal(world.readers.length, 1);
+  assert.deepEqual(world.liveReaders(), []);
+  assert.equal(world.starts.length, 0, "nothing started again");
 });
 
 test("T16 finishing: seams in order, revoke before the sandbox is stopped, then ended", async () => {
@@ -662,13 +708,13 @@ test("R4b the run's stop reaches the sandbox ensure, but not the one finishNow m
   // The application wrote a successful final to shared storage, and its sandbox went.
   h.world.appExits(wl, finalExit(0));
   h.world.killWorkload(wl, "absent");
-  // An ensure that honours the stop, as the real one does: nothing is made once it has fired.
-  const ensure = h.world.sandbox.ensure;
+  // A reader that honours the stop, as the real one does: nothing is made once it has fired.
+  const reader = h.world.sandbox.reader;
   const seen: Array<boolean | undefined> = [];
-  h.world.sandbox.ensure = async (run, opts) => {
+  h.world.sandbox.reader = async (run, opts) => {
     seen.push(opts?.signal?.aborted);
     if (opts?.signal?.aborted) throw new SandboxProvisionTerminalError("sandbox_wait_interrupted", "stopped");
-    return ensure(run, opts);
+    return reader(run, opts);
   };
   const stop = new AbortController();
   stop.abort();
@@ -820,7 +866,8 @@ test("R5g a takeover finishing a cancelled run whose sandbox is gone makes no sa
       store: world.store, sandbox: world.sandbox, now: world.now, sleep: world.sleep, tickMs: 5000,
     });
     await runner.finishNow("row_terminal");
-    assert.deepEqual(world.created, [], `no reader sandbox for ${JSON.stringify(closed)}`);
+    assert.deepEqual(world.created, [], `no sandbox for ${JSON.stringify(closed)}`);
+    assert.deepEqual(world.readers, [], `no reader sandbox for ${JSON.stringify(closed)}`);
     assert.equal(world.rec.state, "ended");
   }
 });
@@ -836,7 +883,9 @@ test("R5h a run whose task failed (not cancelled) still reads the result it may 
     store: world.store, sandbox: world.sandbox, now: world.now, sleep: world.sleep, tickMs: 5000,
   });
   const outcome = await runner.finishNow("row_terminal");
-  assert.equal(world.created.length, 1, "the reader is made, as before");
+  assert.equal(world.readers.length, 1, "the reader is made, as before");
+  assert.deepEqual(world.created, [], "a reader, not a sandbox the size of the application's");
+  assert.deepEqual(world.liveReaders(), [], "and stopped once read");
   assert.equal(outcome.success, true);
 });
 

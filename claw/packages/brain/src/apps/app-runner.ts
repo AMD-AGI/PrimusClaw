@@ -14,7 +14,8 @@
  *   provisioning -> starting -> running -> finishing -> ended
  *                       ^           |
  *                       +-restarting+      (process exited without `final`)
- *   a lost sandbox, in any state, goes back to provisioning and counts as a restart
+ *   a lost sandbox, in any state, goes back to provisioning and counts as a restart,
+ *   unless `exit.json` (read through a small reader sandbox) says the app already ended
  *
  * Three rules carry the safety of it, each of them in one place:
  *
@@ -72,6 +73,8 @@ const EXEC_TIMEOUT = "30s";
 const START_FAILURES_BEFORE_RESTART = 3;
 /** Consecutive unreadable `exit.json` reads before it is taken as having no `final`. */
 const UNPARSEABLE_EXIT_READS = 3;
+/** Consecutive failed looks at shared storage after a lost sandbox before the loss is counted without one. */
+const LOST_SANDBOX_LOOKS = 3;
 /** Attempts at each finishing step before it is given up on, so a run is never held open for ever. */
 const FINISH_STEP_ATTEMPTS = 5;
 /** Consecutive failed ticks, with the store or SaFE unreachable, before finishNow gives up. */
@@ -195,6 +198,12 @@ export interface AppRunnerSeams {
 export interface AppSandboxOps {
   /** An existing live sandbox of the run, or a new one, Running; records its id. */
   ensure(run: AppSandboxRun, opts?: AppSandboxEnsureOptions): Promise<AppSandbox>;
+  /**
+   * A new small sandbox with no accelerator, in the run's workspace, made only to read the run's
+   * state directory (shared storage) after the run's own sandbox is gone. Never adopted as the
+   * run's sandbox; the caller stops it.
+   */
+  reader(run: AppSandboxRun, opts?: AppSandboxEnsureOptions): Promise<AppSandbox>;
   instance(run: Pick<AppSandboxRun, "workspaceId" | "platformKey" | "sandboxSpec">, workloadId: string): SandboxInstance;
   status(inst: SandboxInstance): Promise<SandboxStatus>;
   exec(inst: SandboxInstance, command: string, timeout: string, opts?: SandboxExecOptions): Promise<SandboxExecResult>;
@@ -307,6 +316,7 @@ export class AppRunner {
   private inflight: Promise<TickResult> | null = null;
   private startFailures = 0;
   private unparseableExits = 0;
+  private failedLossLooks = 0;
   private readonly finishAttempts = new Map<string, number>();
   private readonly finishDone = new Set<string>();
   /** Set when the signal given to `run` fires; cleared by `finishNow`, which ends the run on purpose. */
@@ -928,14 +938,8 @@ export class AppRunner {
     const rec = this.rec;
     const lastExit: AppLastExit = last ?? { at: this.iso(), cause, final: false };
     if (rec.restarts >= maxRestarts(rec.manifest)) {
-      // A sandbox lost with the budget spent may have taken a finished run with
-      // it: `final` is on shared storage and cannot be read without a sandbox.
-      // Failing the run here would report a success as a failure, so one more
-      // sandbox is made, once, to look (`launch` reads it and starts nothing).
-      if (cause === "sandbox_lost" && rec.state_dir && rec.last_exit?.recovery !== true) {
-        await this.move({ state: "provisioning", sandbox_workload_id: null, last_exit: { ...lastExit, recovery: true } });
-        return { done: false };
-      }
+      // A lost sandbox has already been looked behind (`finalAfterLoss`, through a small
+      // reader sandbox): no application-sized sandbox is made only to read `exit.json`.
       await this.move({ state: "finishing", last_exit: { ...lastExit, cause: "restarts_exhausted" } });
       return { done: false };
     }
@@ -969,7 +973,50 @@ export class AppRunner {
     }
     if (status.state !== "terminal" && status.state !== "absent") return null;
     logger.warn({ runId: this.runId, workloadId: inst.id, state: status.state, reason: status.reason }, "app_run.sandbox_lost");
+    // A sandbox can be lost after the application finished (its node preempted, its pod gone
+    // with no exit status): `final` is on shared storage and decides, as it does for an exit.
+    const exit = await this.finalAfterLoss();
+    if (exit) return this.finishFromExit(exit);
     return this.countedRestart("sandbox_lost");
+  }
+
+  /**
+   * The run's sandbox is gone. Before that is counted as a restart (or, with the budget spent, as
+   * the run failing), look in the state directory for a `final` exit through a reader sandbox.
+   * Null when there is none, when the application never got a state directory, or when the run is
+   * closed for its user (a cancel keeps the cancel). A look that fails throws, so the tick ends and
+   * the next one looks again; after {@link LOST_SANDBOX_LOOKS} failed looks the loss is counted
+   * without one, so a reader that cannot be made does not hold the run for ever.
+   */
+  private async finalAfterLoss(): Promise<Extract<ExitRead, { kind: "exit" }> | null> {
+    const stateDir = this.rec.state_dir;
+    if (!stateDir) return null;
+    try {
+      if (await this.closedBeforeCreate()) return null;
+      const exit = await this.readThroughReader(stateDir);
+      if (exit.kind === "unreadable") throw new Error("exit.json could not be read");
+      this.failedLossLooks = 0;
+      return exit.kind === "exit" && exit.final ? exit : null;
+    } catch (err) {
+      if (err instanceof RunnerHalted || err instanceof AppRunWriteRefused) throw err;
+      if (++this.failedLossLooks < LOST_SANDBOX_LOOKS) throw err;
+      this.failedLossLooks = 0;
+      logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.lost_sandbox_final_unread");
+      return null;
+    }
+  }
+
+  /** Read `exit.json` through a new reader sandbox, which is stopped whatever the read answered. */
+  private async readThroughReader(stateDir: string): Promise<ExitRead> {
+    this.assertActive();
+    const reader = await this.deps.sandbox.reader(this.sandboxRun(), this.ensureStop);
+    try {
+      return await this.readExit(reader.instance, stateDir);
+    } finally {
+      await this.deps.sandbox.stop(reader.instance).catch((err) => {
+        logger.warn({ runId: this.runId, workloadId: reader.workloadId, err: this.safeText(err) }, "app_run.reader_stop_failed");
+      });
+    }
   }
 
   /** False only when SaFE says the workload is terminal or absent; a status that cannot be read throws, and the step retries. */
@@ -1141,12 +1188,12 @@ export class AppRunner {
 
   /**
    * The sandbox is gone but the state directory is not: it is shared storage. The
-   * only way to read `exit.json` from it is a sandbox, so one is made, once (the
-   * `recovery` mark on the row says it was done, across takeovers), as the restart
-   * path does for a lost sandbox: the application may have written `final` in its
-   * grace just before the sandbox went, and not reading it would report a finished
-   * run as the cancel it was. The sandbox is stopped by the finishing step that
-   * stops every sandbox of the run.
+   * only way to read `exit.json` from it is a sandbox, so a small reader is made, once
+   * (the `recovery` mark on the row says it was done, across takeovers), as the
+   * restart path does for a lost sandbox: the application may have written `final` in
+   * its grace just before the sandbox went, and not reading it would report a finished
+   * run as the cancel it was. The reader has no accelerator and is stopped as soon as
+   * it has been read from.
    */
   private async readFinalFromSharedStorage(stateDir: string): Promise<Extract<ExitRead, { kind: "exit" }> | null> {
     if (this.rec.last_exit?.recovery === true) return null;
@@ -1155,8 +1202,7 @@ export class AppRunner {
     // application's. Measured on 2026-11-07, a finish-only takeover of a deleted
     // session's run made one, as the run's last act.
     if (await this.closedBeforeCreate()) return null;
-    const reader = await this.deps.sandbox.ensure(this.sandboxRun(), this.ensureStop);
-    const exit = await this.readExit(reader.instance, stateDir);
+    const exit = await this.readThroughReader(stateDir);
     // A read that failed (the sandbox could not be made, the file could not be
     // read) is retried by the finishing step and is NOT marked done: the mark says
     // "the shared storage was looked at", and only a look that happened earns it.

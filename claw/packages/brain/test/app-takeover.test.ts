@@ -217,7 +217,9 @@ test("G6 the sandbox disappearing during the grace ends the wait; a final left o
   assert.equal(h.world.rec.last_exit?.final, true);
   assert.equal(h.world.rec.state, "ended");
   assert.equal(h.grant.revokes.length, 1);
-  assert.deepEqual(h.world.stopped.sort(), h.world.created.slice().sort(), "the sandbox made to read it is stopped too");
+  assert.deepEqual(h.world.created, ["wl-1"], "no application-sized sandbox was made to read it");
+  assert.deepEqual(h.world.readers.map((r) => r.id), ["rd-1"], "a reader was");
+  assert.deepEqual(h.world.stopped.slice().sort(), ["rd-1", "wl-1"], "and the reader is stopped too");
 });
 
 test("G6b the same read happens once, and a sandbox gone with no final leaves the cancel as it was", async () => {
@@ -229,20 +231,23 @@ test("G6b the same read happens once, and a sandbox gone with no final leaves th
   const outcome = await finishing;
   assert.equal(outcome.success, false);
   assert.equal(h.world.rec.last_exit?.cause, "cancelled");
-  assert.equal(h.world.created.length, 2, "exactly one extra sandbox, to read the file");
+  assert.equal(h.world.readers.length, 1, "exactly one reader, to read the file");
+  assert.equal(h.world.created.length, 1, "and no second application sandbox");
+  assert.deepEqual(h.world.liveReaders(), []);
 });
 
 test("G6c a recovery sandbox that cannot be made yet is retried, and the final is still read", async () => {
   const h = harness();
   const wl = await toRunning(h);
   h.world.onTerm = () => {};
-  const realEnsure = h.world.sandbox.ensure;
+  const realReader = h.world.sandbox.reader;
   let failures = 2;
-  h.world.sandbox.ensure = async (run) => { if (failures-- > 0) throw new Error("SaFE unavailable"); return realEnsure(run); };
+  h.world.sandbox.reader = async (run, opts) => { if (failures-- > 0) throw new Error("SaFE unavailable"); return realReader(run, opts); };
   const finishing = h.runner.finishNow("cancelled");
   h.world.at(h.world.clock + 15_000, () => { h.world.appExits(wl, finalExit(0)); h.world.killWorkload(wl, "terminal"); });
   const outcome = await finishing;
   assert.equal(outcome.success, true, "the failed attempts did not use up the one look at shared storage");
+  assert.equal(failures, -1, "both failed attempts were made, and the third succeeded");
   assert.equal(h.world.rec.state, "ended");
 });
 
