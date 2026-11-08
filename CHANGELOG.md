@@ -149,6 +149,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A session's event stream opened without a cursor on a session longer than `SSE_HISTORY_TAIL` events sends `historyComplete`
+  and its live events again. The tail is a whole number of pages; after the last one the empty page that follows wrote
+  nothing, and the stream waited for a `drain` the earlier write had already had, so it stayed silent but for keepalives.
+  It now waits only while the response's buffer is still full.
 - A session's event stream (`GET /v1/chat/sessions/:id/messages`) no longer reads the whole history into memory on every
   connection. Without `?after=` or `Last-Event-ID` it replays the session's last `SSE_HISTORY_TAIL` events (default 2000), and
   the `historyComplete` marker carries `has_more: true` when older ones were left out; `?history=all` replays all of them, and

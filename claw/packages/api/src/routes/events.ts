@@ -379,11 +379,14 @@ export async function historyPage(
 
 /**
  * Resolves when `res` can take more (true), or once it is closed (false), so that a slow client is not buffered for:
- * `backlog` is what the last `res.write` said (false: its buffer is full, and `drain` follows once it is not).
+ * `backlog` is what the last `res.write` said (false: its buffer was full, and `drain` follows once it is not). It waits
+ * only while the buffer is still full (`writableNeedDrain`): a buffer flushed since that write has emitted its `drain`
+ * already, and no other comes. (Waiting on a stale `backlog` -- after an empty page, which writes nothing -- hung a
+ * long session's stream after its history for good.) The caller clears its `backlog` once this resolves.
  */
 export function drained(res: ServerResponse, backlog: boolean): Promise<boolean> {
   if (res.destroyed || res.writableEnded) return Promise.resolve(false);
-  if (!backlog) return Promise.resolve(true);
+  if (!backlog || !res.writableNeedDrain) return Promise.resolve(true);
   return new Promise((resolve) => {
     const done = (ok: boolean): void => {
       res.off("drain", onDrain);
@@ -578,6 +581,7 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
           for (const frame of page.frames) sseWrite(frame);
           sent += page.frames.length;
           if (!(await drained(res, backlog))) { open = false; break; }
+          backlog = false;   // (drained: what that write left in the buffer is gone)
           if (rows.length < HISTORY_PAGE_ROWS) break;
           cursor = Number(rows[rows.length - 1].id);
         }
