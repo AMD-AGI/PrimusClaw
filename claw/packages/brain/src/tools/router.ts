@@ -553,12 +553,14 @@ export class ToolRouter {
     const path = file.real;
     const read: RouteOutcome = { isError: false };
     let text: string;
+    // A text file that cannot be read back may be a report: refused. Any other (an image Hands cannot decode) is copied as before.
+    const unreadable = (): string | null => (REPORT_FILE_EXTENSIONS.test(path) ? refuse(outcome, CITED_FILE_UNREADABLE) : null);
     try {
       text = await this.routeAllowed("read", { path, line_numbers: false }, signal, read);
     } catch {
-      return refuse(outcome, CITED_FILE_UNREADABLE);
+      return unreadable();
     }
-    if (read.isError || /^Error\b/.test(text)) return refuse(outcome, CITED_FILE_UNREADABLE);
+    if (read.isError || /^Error\b/.test(text)) return unreadable();
     // Not a report the check reads (a binary file, notes, citations only inside code blocks): deliver_file copies it as any other
     // file, as deliver_text would have passed its text on unchanged. Asked first: the text read may be longer than the file's bytes.
     if (!isCitedReport(text)) return null;

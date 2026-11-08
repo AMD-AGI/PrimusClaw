@@ -19,6 +19,8 @@ import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import type { Message, ToolSchema } from "@claw/protocol";
 
+// deliver_file on, as a deployment that offers it has it: ordinary files are copied by it.
+process.env.DELIVER_FILE_ENABLED = "true";
 const { runSubagent } = await import("../src/agent/sub-agent.js");
 const { parseCiteCheck, CITED_FILE_REFUSAL, CITED_FILE_TOO_LARGE, CITED_FILE_UNREADABLE } = await import("../src/tools/cite-check.js");
 const { ToolRouter } = await import("../src/tools/router.js");
@@ -97,10 +99,17 @@ function routerOver(file: string | null, opts: { unreadable?: boolean; size?: nu
   const searches: Array<Record<string, unknown>> = [];
   const reads: Array<Record<string, unknown>> = [];
   const delivered: Array<Record<string, unknown>> = [];
+  const copied: string[] = [];
   const hands = {
     // deliver_file's own probe (`workspaceFile`): the file's type and size, and where it resolves, under /workspace.
     callTool: async (name: string, input: Record<string, unknown>) => {
       const command = String(input.command ?? "");
+      if (name === "upload_to_s3") {
+        const local = (input.files as Array<{ local_path: string }>)[0].local_path;
+        copied.push(local);
+        return JSON.stringify({ ok: [local], failed: [], total: 1 });
+      }
+      if (name === "bash" && command.includes("base64 -w0 --")) return "__claw_deliver_data__\n";
       if (name !== "bash" || !command.startsWith("stat ")) throw new Error(`unexpected ${name}`);
       const p = /^stat -L -c '[^']*' -- '((?:[^']|'\\'')*)' 2>&1 && /.exec(command)![1].replace(/'\\''/g, "'");
       if (file === null) return `stat: cannot statx '${p}': No such file or directory\n\nExit code: 1`;
@@ -133,7 +142,10 @@ function routerOver(file: string | null, opts: { unreadable?: boolean; size?: nu
       return "{\"ok\":true}";
     },
   };
-  return { router: new ToolRouter(hands, new Map([["assistant", assistant as never]])), searches, reads, delivered };
+  const router = new ToolRouter(hands, new Map([["assistant", assistant as never]]));
+  // deliver_file's own copy needs a session to copy into.
+  router.a2aContext = { userId: "u", sessionId: "s" };
+  return { router, searches, reads, delivered, copied };
 }
 
 const check = () => parseCiteCheck({ tools: ["mcp__assistant__deliver_text"] }, ports);
@@ -189,6 +201,10 @@ test("CS2 deliver_file of a cited report is delivered as checked text; other fil
     const o = await deliverFile(r, path);
     assert.equal(r.delivered.length, 0, path);
     assert.doesNotMatch(o.text, /numbered citations/, path);
+    if (file !== null) {
+      assert.deepEqual(r.copied, [path], `${path}: copied by deliver_file as before`);
+      assert.equal(o.isError, false, path);
+    }
   }
   const unchecked = routerOver(REPORT);
   await deliverFile(unchecked, "/workspace/report.md");
@@ -226,6 +242,13 @@ test("CS4 a cited report too large, unreadable, or with no checked deliver_text 
   gone.router.citeCheck = check();
   assert.deepEqual(await deliverFile(gone, "/workspace/report.md"), { text: CITED_FILE_UNREADABLE, isError: true });
   assert.equal(gone.delivered.length, 0);
+  // A file of another type that cannot be read as text (a damaged image) is copied as before, never refused for it.
+  const image = routerOver(REPORT, { unreadable: true });
+  image.router.citeCheck = check();
+  const im = await deliverFile(image, "/workspace/chart.png");
+  assert.notEqual(im.text, CITED_FILE_UNREADABLE);
+  assert.equal(image.delivered.length, 0);
+  assert.deepEqual([image.copied, im.isError], [["/workspace/chart.png"], false], "the image is copied as before");
 
   const other = routerOver(REPORT);
   other.router.citeCheck = parseCiteCheck({ tools: ["mcp__assistant__other"] }, ports);
