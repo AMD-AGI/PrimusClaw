@@ -494,11 +494,14 @@ export class ToolRouter {
     if (check && name === DELIVER_FILE_TOOL && typeof input.path === "string") {
       const found = await workspaceFile(await this.requireHands(), input.path, signal);
       if (found.ok) {
-        const kind = await this.sandboxFileCitedReport(found.real, signal);
-        if (kind === "too_large" || (kind === "report" && found.size > CITED_FILE_MAX_BYTES)) return refuse(outcome, CITED_FILE_TOO_LARGE);
-        if (kind === "report") {
+        // A file one text delivery can hold is read, and the check's own parsing decides whether it is a cited report. A larger one
+        // cannot be delivered checked: a text file that may be a report (the search finds a source line and a citation, or cannot
+        // search it) is refused; any other is copied as before.
+        if (found.size <= CITED_FILE_MAX_BYTES) {
           const delivered = await this.deliverCitedFile(check, found, input, signal, outcome, ctx);
           if (delivered !== null) return delivered;
+        } else if (REPORT_FILE_EXTENSIONS.test(found.real) && await this.largeFileMayCite(found.real, signal)) {
+          return refuse(outcome, CITED_FILE_TOO_LARGE);
         }
       }
     }
@@ -514,29 +517,25 @@ export class ToolRouter {
   }
 
   /**
-   * Whether the sandbox file at `path` is a cited report: the sandbox's own `grep` (which reads the whole file) counts both a line of
-   * a list of sources and a line that cites a number (`CITED_FILE_PATTERNS`). A file the search cannot read is not one: `deliver_file`
-   * then answers for it as it would.
+   * Whether a text file too large to be delivered checked may be a cited report: the sandbox's own `grep` (which reads the whole
+   * file) counts both a line of a list of sources and a line with a citation number (`CITED_FILE_PATTERNS`), or cannot search it (a
+   * file over its 8 MB). A file the search cannot read at all is not one: `deliver_file` then answers for it as it would.
    */
-  private async sandboxFileCitedReport(path: string, signal?: AbortSignal): Promise<"report" | "too_large" | "no"> {
-    let unsearchable = false;
+  private async largeFileMayCite(path: string, signal?: AbortSignal): Promise<boolean> {
     for (const pattern of CITED_FILE_PATTERNS) {
       const found: RouteOutcome = { isError: false };
       let text: string;
       try {
         text = await this.routeAllowed("grep", { pattern, path, output_mode: "count", case_sensitive: true }, signal, found);
       } catch {
-        return "no";
+        return false;
       }
-      // A match is the file's count line, `<path>:<n>` with n > 0, whatever the path's name; no note (a file too large to search, a
-      // scan cut short) ends that way. A refusal that did is read as a match: the file then goes through deliver_text, never unchecked.
-      const matched = text.split("\n").some((l) => Number(l.trim().match(/.:(\d+)$/)?.[1] ?? 0) > 0);
-      // A report too large to search is not taken to be anything else (a log or a table that size is delivered as before).
-      const unsearched = !matched && REPORT_FILE_EXTENSIONS.test(path) && /\bnot searched\b/.test(text);
-      if (found.isError || (!matched && !unsearched)) return "no";
-      if (unsearched) unsearchable = true;
+      if (found.isError) return false;
+      if (/\bnot searched\b/.test(text)) return true;
+      // A match is the file's count line, `<path>:<n>` with n > 0, whatever the path's name; no note ends that way.
+      if (!text.split("\n").some((l) => Number(l.trim().match(/.:(\d+)$/)?.[1] ?? 0) > 0)) return false;
     }
-    return unsearchable ? "too_large" : "report";
+    return true;
   }
 
   /**

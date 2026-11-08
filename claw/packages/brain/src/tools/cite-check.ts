@@ -163,17 +163,18 @@ export function isCitedReport(text: string): boolean {
 }
 
 /**
- * A file in the sandbox that is a cited report, as two searches of the whole file (JavaScript regular expressions, one line each):
- * a line of a list of sources, and a line with a citation number that is not a source line's own. Both must match. Looser than the
- * check's own parsing (a code block is not skipped), so a report in its usual shape cannot pass as a file the check would not read.
+ * A text file too large to be delivered checked that may be a cited report, as two searches of the whole file (JavaScript regular
+ * expressions, one line each): a line of a list of sources, and any citation number. Both must match. Looser than the check's own
+ * parsing (a code block is not skipped, a source line's own number counts), so no report the check reads passes as another file. A
+ * file small enough to be delivered checked is read instead, and the check's own parsing decides (`isCitedReport`).
  */
 export const CITED_FILE_PATTERNS = [
   String.raw`^\s{0,3}(?:[-*+]\s+)?\[\d{1,3}\][:.]?\s+.*https?://`,
-  String.raw`\[\d{1,3}(?:\s*[,，、]\s*\d{1,3})*\](?!\(|[:.]?\s+.*https?://)`,
+  String.raw`\[\d{1,3}(?:\s*[,，、]\s*\d{1,3})*\](?!\()`,
 ];
 
-/** A report's own file types: one too large for the sandbox's search is taken to be a cited report, and refused as one. */
-export const REPORT_FILE_EXTENSIONS = /\.(md|markdown|html?)$/i;
+/** The text files a report may be written as: one too large to be delivered checked that may be a cited report is refused. */
+export const REPORT_FILE_EXTENSIONS = /\.(md|markdown|txt|html?)$/i;
 
 /** The largest cited report delivered from a file: what one text delivery takes (the API's `TEXT_DELIVERY_MAX_BYTES`). */
 export const CITED_FILE_MAX_BYTES = 256 * 1024;

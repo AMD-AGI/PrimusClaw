@@ -5,11 +5,12 @@
  * A run's citation check (`ExecuteRequest.cite_check`, `tools/cite-check.ts`) has no way around it.
  *
  *   CS1 a sub-agent's deliver_text of a cited report is checked as its parent's would be; without the forwarded check it is not
- *   CS2 deliver_file of a cited report in the sandbox, whatever its extension and however long (the whole file is searched), is
- *       read whole and delivered through the run's checked deliver_text, so the text stored is the checked one; a file with only one
- *       of the two, a file that cannot be searched, and any file in a run without the check are left to deliver_file
- *   CS4 a cited report that is too large, cannot be read back, or has no checked deliver_text to go through is refused, nothing
- *       delivered
+ *   CS2 deliver_file of a cited report in the sandbox, whatever its extension and its citation shape (the check's own parsing
+ *       decides), is read whole and delivered through the run's checked deliver_text, so the text stored is the checked one; a file
+ *       that is not one, one that does not exist, and any file in a run without the check are left to deliver_file
+ *   CS4 a text file too large to be delivered checked that may be a cited report (or cannot be searched) is refused, nothing
+ *       delivered, as is a cited report that cannot be read back or has no checked deliver_text to go through; a large file of
+ *       another type, or one with no citations, is left to deliver_file
  *   CS5 the file is the one deliver_file would copy: a path outside /workspace is never searched or read; a file whose citations
  *       are all inside code blocks is not a report the check reads, and deliver_file copies it as any other
  *   CS3 the check's budget ends a wait for a page that never answers: the check returns, and the statement is not checked
@@ -144,7 +145,7 @@ test("CS2 deliver_file of a cited report is delivered as checked text; other fil
   report.router.citeCheck = check();
   const out = await deliverFile(report, "/workspace/report.md", { caption: "the comparison" });
   assert.equal(out.isError, false);
-  assert.equal(report.searches.length, 2, "the whole file is searched for a list of sources and for a citation");
+  assert.equal(report.searches.length, 0, "a file one text delivery can hold is read, not searched");
   assert.deepEqual(report.reads, [{ path: "/workspace/report.md", line_numbers: false }], "read whole, raw");
   assert.equal(report.delivered.length, 1);
   assert.equal(report.delivered[0].name, "report.md");
@@ -155,8 +156,10 @@ test("CS2 deliver_file of a cited report is delivered as checked text; other fil
   assert.match(out.text, /^This file is a report with numbered citations: it was delivered as text \(report\.md\), checked against its sources\./);
   assert.match(out.text, /Citation check before delivery: 1 of 2 cited statements are supported/);
 
-  // A name that looks like a note, a citation at the start of its line, a report past any read limit under another extension.
+  // A name that looks like a note, a citation at the start of its line, a report past any read limit under another extension, a
+  // citation followed by an address in the text.
   for (const [file, path, name] of [
+    [`Finding [1]: https://example.com/x supports the claim.\n\n[1]: Example — ${A}`, "/workspace/inline.txt", "inline.txt"],
     [REPORT, "/workspace/[1].md", "[1].md"],
     [REPORT, "/workspace/[note] 1 file.md", "[note] 1 file.md"],
     [`[1] vLLM supports MI300X.\n\n[1]: vLLM on ROCm — ${A}`, "/workspace/r.md", "r.md"],
@@ -170,7 +173,7 @@ test("CS2 deliver_file of a cited report is delivered as checked text; other fil
     assert.match(String(r.delivered[0].text), /^Citation check /m, path);
   }
 
-  // Not a cited report, or not searchable: deliver_file answers for it as before, nothing goes through deliver_text.
+  // Not a cited report: deliver_file answers for it as before, nothing goes through deliver_text.
   for (const [file, path] of [
     ["Plain notes.\nNo citations.", "/workspace/notes.md"],
     [`Links only.\n[1]: a page — ${A}`, "/workspace/links.md"],
@@ -181,7 +184,7 @@ test("CS2 deliver_file of a cited report is delivered as checked text; other fil
     const r = routerOver(file);
     r.router.citeCheck = check();
     const o = await deliverFile(r, path);
-    assert.deepEqual([r.delivered.length, r.reads.length], [0, 0], path);
+    assert.equal(r.delivered.length, 0, path);
     assert.doesNotMatch(o.text, /numbered citations/, path);
   }
   const unchecked = routerOver(REPORT);
@@ -190,10 +193,20 @@ test("CS2 deliver_file of a cited report is delivered as checked text; other fil
 });
 
 test("CS4 a cited report too large, unreadable, or with no checked deliver_text is refused, nothing delivered", async () => {
-  const huge = routerOver("BIG");
-  huge.router.citeCheck = check();
-  assert.deepEqual(await deliverFile(huge, "/workspace/huge.md"), { text: CITED_FILE_TOO_LARGE, isError: true });
-  assert.equal(huge.reads.length, 0, "a file too large to search is not read");
+  for (const path of ["/workspace/huge.md", "/workspace/huge.txt"]) {
+    const huge = routerOver("BIG");
+    huge.router.citeCheck = check();
+    assert.deepEqual(await deliverFile(huge, path), { text: CITED_FILE_TOO_LARGE, isError: true }, path);
+    assert.equal(huge.reads.length, 0, "a file too large to search is not read");
+  }
+  // Large, but not a text file, or a text file without citations: copied as before.
+  for (const [file, path] of [[`${"x".repeat(300 * 1024)} [1].\n\n[1]: vLLM on ROCm — ${A}`, "/workspace/data.bin"], [`${"x".repeat(300 * 1024)}\nno citations`, "/workspace/log.txt"]] as const) {
+    const r = routerOver(file);
+    r.router.citeCheck = check();
+    const o = await deliverFile(r, path);
+    assert.notEqual(o.text, CITED_FILE_TOO_LARGE, path);
+    assert.deepEqual([r.reads.length, r.delivered.length], [0, 0], path);
+  }
 
   const big = routerOver(`${"x".repeat(300 * 1024)} [1].\n\n[1]: vLLM on ROCm — ${A}`);
   big.router.citeCheck = check();
@@ -222,8 +235,8 @@ test("CS5 only the file deliver_file would copy is read, and only a report the c
   const fenced = routerOver(["```", "vLLM supports MI300X [1].", `[1]: vLLM on ROCm — ${A}`, "```"].join("\n"));
   fenced.router.citeCheck = check();
   const o = await deliverFile(fenced, "/workspace/snippet.md");
-  assert.equal(fenced.searches.length, 2, "the search takes it for a report");
-  assert.equal(fenced.delivered.length, 0, "the check does not: it is not delivered through deliver_text");
+  assert.equal(fenced.reads.length, 1, "it is read");
+  assert.equal(fenced.delivered.length, 0, "the check does not take it for a report: it is not delivered through deliver_text");
   assert.doesNotMatch(o.text, /numbered citations/);
 });
 
