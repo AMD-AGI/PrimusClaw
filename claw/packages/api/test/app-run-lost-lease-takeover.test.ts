@@ -24,6 +24,8 @@ import { startAdmissionCluster, type AdmissionCluster } from "./support/admissio
 const skip = postgresSkipReason();
 const WORKLOAD = "claw-0001-sandbox-abcde";
 const STATE_DIR = "/shared/users/u-1/.claw-apps/app-1";
+/** The stream sequence of the message the drained holder was executing. */
+const SEQ = 4242;
 
 describe("an app run whose holder went away is taken over, not closed", { skip }, () => {
   let c: AdmissionCluster;
@@ -32,6 +34,10 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
   let dispatcher: typeof import("../src/tasks/dispatcher.js");
   let grace: number;
   let routes: FastifyInstance;
+  /** Sequences the task stream still holds; anything else is gone (the stream's max_age dropped it). */
+  const inStream = new Set<number>();
+  const asked: number[] = [];
+  let realGone: (typeof import("../src/tasks/sweeper.js"))["appTakeoverPorts"]["taskMessageGone"];
   const published: Array<Record<string, any>> = [];
   const sql = async (text: string, params: unknown[] = []) => (await c.app.db.db.query(text, params)).rows as any[];
 
@@ -41,6 +47,15 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
     state = await import("../src/tasks/app-run-state.js");
     dispatcher = await import("../src/tasks/dispatcher.js");
     grace = (await import("../src/config.js")).LEASE_LOST_GRACE_SEC;
+    realGone = sweeper.appTakeoverPorts.taskMessageGone;
+    // The real port, over a stream that answers like NATS does: 10037 for a message it no longer has.
+    sweeper.appTakeoverPorts.taskMessageGone = (seq) => {
+      asked.push(seq);
+      return realGone(seq, async (n) => {
+        if (inStream.has(n)) return { seq: n };
+        throw Object.assign(new Error("no message found"), { code: "404", api_error: { err_code: 10037 } });
+      });
+    };
     dispatcher.taskPublisher.publish = (async (payload: unknown) => { published.push(JSON.parse(typeof payload === "string" ? payload : new TextDecoder().decode(payload as Uint8Array))); }) as never;
     const { registerInternalTaskRoutes } = await import("../src/routes/internal-tasks.js");
     routes = Fastify();
@@ -51,6 +66,8 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
   beforeEach(async () => {
     for (const t of ["claw_app_runs", "claw_tasks", "claw_sessions"]) await sql(`DELETE FROM ${t}`);
     published.length = 0;
+    inStream.clear();
+    asked.length = 0;
     await sql(`INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status, config)
                VALUES ('s1', 't', 'u-1', 'claw', 'idle', '{"platform_key":"pk","_server_managed_credentials":true}'::jsonb)`);
     await sql("INSERT INTO claw_plugins (plugin_id, name) VALUES (8, 'p') ON CONFLICT DO NOTHING").catch(() => undefined);
@@ -61,13 +78,13 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
     await sql(
       `INSERT INTO claw_tasks (task_id, session_id, name, status, origin, mode, executor,
                                lease_owner, lease_expires_at, heartbeat_at, claim_count, callback_url,
-                               started_at, deadline_at, metadata)
+                               started_at, deadline_at, metadata, delivery_seq)
        VALUES ('app-1', 's1', 'app', $1, 'task', 'app', 'brain',
                'brain-A', NOW() - ($2::int * INTERVAL '1 second'), NOW() - ($2::int * INTERVAL '1 second') - INTERVAL '15 seconds', 3,
                'http://api/v1/internal/tasks/app-1', NOW() - INTERVAL '3 hours',
                CASE WHEN $3 THEN NOW() - INTERVAL '1 minute' ELSE NOW() + INTERVAL '2 days' END,
-               CASE WHEN $4::int IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('app_takeover_requeues', $4::int) END)`,
-      [opts.status ?? "running", opts.ageSec ?? grace + 5, opts.deadlinePast === true, opts.requeues ?? null],
+               CASE WHEN $4::int IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('app_takeover_requeues', $4::int) END, $5)`,
+      [opts.status ?? "running", opts.ageSec ?? grace + 5, opts.deadlinePast === true, opts.requeues ?? null, SEQ],
     );
     await sql(
       `INSERT INTO claw_app_runs (task_id, session_id, plugin_id, manifest, state, state_dir, sandbox_workload_id, mcp_token_enc, grant_id)
@@ -93,6 +110,11 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
     await sweeper.requeueUnfinishedAppRuns();
   }
 
+  /** The first lease of the Brain that took the new dispatch: its attempt, on the new message (a later stream sequence). */
+  const takeoverLease = async () => ({
+    brain_id: "brain-B", lease_seconds: 45, attempt_id: "att-takeover",
+    claim_count: Number((await task()).claim_count), delivery_seq: SEQ + 1, delivery_count: 1,
+  });
   const post = async (req: Record<string, any>, path: string, payload: object) => (await routes.inject({
     method: "POST", url: `/v1/internal/tasks/app-1/${path}`,
     headers: { authorization: `Bearer ${req.backend_internal_token}` }, payload,
@@ -127,7 +149,7 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
     const req = published.at(-1)!;
     assert.equal(req.mode, "app");
     assert.equal(req.app_finish_only, undefined);
-    assert.equal(await post(req, "lease", { brain_id: "brain-B", lease_seconds: 45 }), 200);
+    assert.equal(await post(req, "lease", await takeoverLease()), 200);
     const held = await task();
     assert.equal(held.lease_owner, "brain-B");
     const fence = { brainId: "brain-B", claimCount: Number(held.claim_count) };
@@ -169,7 +191,7 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
     assert.deepEqual(await dispatcher.dispatchTask("app-1"), { ok: true });
     const req = published.at(-1)!;
     assert.equal(req.app_finish_only, true);
-    assert.equal(await post(req, "lease", { brain_id: "brain-B", lease_seconds: 45 }), 200);
+    assert.equal(await post(req, "lease", await takeoverLease()), 200);
     const fence = { brainId: "brain-B", claimCount: Number((await task()).claim_count) };
     // The finish read `exit.json` through a reader: the application's own final result, as the
     // row holds it once written (the write path's secret scrub is not this suite's subject, and
@@ -192,7 +214,7 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
     await tick();
     assert.deepEqual(await dispatcher.dispatchTask("app-1"), { ok: true });
     const req = published.at(-1)!;
-    assert.equal(await post(req, "lease", { brain_id: "brain-B", lease_seconds: 45 }), 200);
+    assert.equal(await post(req, "lease", await takeoverLease()), 200);
     const fence = { brainId: "brain-B", claimCount: Number((await task()).claim_count) };
     await sql(`UPDATE claw_app_runs SET last_exit = '{"at":"t","cause":"exit","final":true,"returncode":2,"stop_reason":"crashed"}'::jsonb
                 WHERE task_id = 'app-1'`);
@@ -202,6 +224,37 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
     assert.equal(t.status, "failed");
     assert.equal(t.failure_reason, "worker_lost");
     assert.deepEqual(t.captures, {}, "captures are a success's");
+  });
+
+  test("while the stream still holds the message, the run is left to its redelivery and then closed as before", async () => {
+    // A second dispatch beside a message that can still be redelivered would let that stale copy,
+    // whose token the new dispatch replaces, take the run's lock first.
+    await seed({});
+    inStream.add(SEQ);
+    await tick();
+    assert.deepEqual(asked, [SEQ], "the stream was asked about the message the holder was executing");
+    const t = await task();
+    assert.equal(t.status, "failed", "not requeued: the lost-lease reaper closes it, as before this change");
+    assert.equal(t.failure_reason, "worker_lost");
+    assert.equal(t.metadata.app_takeover_requeues, undefined);
+  });
+
+  test("a row that names no message is not requeued: there is nothing to ask the stream about", async () => {
+    await seed({});
+    await sql("UPDATE claw_tasks SET delivery_seq = 0");
+    assert.equal(await sweeper.requeueLostAppLeases(), 0);
+  });
+
+  test("a stream that cannot be read is not taken as a message gone", async () => {
+    const gone = async () => { throw Object.assign(new Error("no message found"), { code: "404", api_error: { err_code: 10037 } }); };
+    const noStream = async () => { throw Object.assign(new Error("stream not found"), { code: "404", api_error: { err_code: 10059 } }); };
+    const timeout = async () => { throw new Error("TIMEOUT"); };
+    const held = async () => ({ seq: SEQ });
+    assert.equal(await realGone(SEQ, gone), true, "only the stream's own 'no message found'");
+    assert.equal(await realGone(SEQ, noStream), false, "a missing stream is not a missing message");
+    assert.equal(await realGone(SEQ, timeout), false);
+    assert.equal(await realGone(SEQ, held), false);
+    assert.equal(await realGone(0, gone), false, "no sequence, no answer");
   });
 
   const leftAlone: Array<{ name: string; seed: Parameters<typeof seed>[0]; setup?: string; why: string }> = [
