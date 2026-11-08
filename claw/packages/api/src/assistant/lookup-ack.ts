@@ -105,8 +105,13 @@ async function reasonToStaySilent(
   if (!run) return "no_run";
   if (run.prompt.startsWith(WORK_EVENT_PREFIX)) return "report_turn";
   if (run.status === "completed" || run.status === "failed" || run.status === "cancelled") return "turn_ended";
-  // Anything said to the person since the turn began: the router's line, an item's start notice, this line itself.
-  const said = await q("SELECT 1 FROM claw_assistant_says WHERE user_id = $1 AND created_at >= $2 LIMIT 1", [userId, run.began]);
+  // Anything said to the person since the turn began: the router's line, an item's start notice, this line itself. A turn that has not
+  // begun (its message queued behind another turn, or its run not yet claimed) has said nothing of its own but this line: what was said
+  // meanwhile is the turn in front's, answering something else (2026-11-08 E249 sim-safe-mt-007: a follow-up sent while the turn before
+  // it was still answering heard nothing for 7.8 s, held back by that turn's answer).
+  const said = run.status === "queued"
+    ? await q("SELECT 1 FROM claw_assistant_says WHERE say_id = $1 LIMIT 1", [lookupAckSayId(userId, messageId)])
+    : await q("SELECT 1 FROM claw_assistant_says WHERE user_id = $1 AND created_at >= $2 LIMIT 1", [userId, run.began]);
   if (said.rowCount) return "spoke";
   // A say the router has started and that has not ended (written beside the lookup, still being stored). One that ended stored a row
   // (`spoke`) or was refused: a refused say holds nothing back, the router writes it again a few seconds later (2026-11-07 run:
