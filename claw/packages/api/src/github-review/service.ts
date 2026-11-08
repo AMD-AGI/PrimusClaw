@@ -25,7 +25,7 @@ import pino from "pino";
 import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
 import { evaluateChecks, hasMergeQueueRule, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
 import { commentableLines } from "./diff.js";
-import { GithubClient, GithubError, GithubGraphqlError, parsePrRef, repoPath, type PrRef } from "./github.js";
+import { GithubClient, GithubError, GithubGraphqlError, parsePrRef, repoPath, type GithubAnswer, type PrRef } from "./github.js";
 import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "./legacy-names.js";
 import { MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, type InstructionChanges, diffNotSent, normaliseJudgement, parseRepoConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
 import { PAGE_MAX_CHARS, SECTIONS, conversationText, diffRanges, diffText, filesText, fitPage, isSection, type Comment, type Section } from "./pages.js";
@@ -286,6 +286,11 @@ const REVIEW_EVENTS: readonly ReviewEvent[] = ["COMMENT", "REQUEST_CHANGES", "AP
  * about seven seconds in all; a merge state that is still not CLEAN after them is refused as it is.
  */
 const MERGE_STATE_SETTLE_MS = [500, 1000, 2000, 4000];
+/**
+ * The waits (ms) before each retry of a merge GitHub refused with 405 "Base branch was modified" (another merge landed a moment before):
+ * two retries, then the refusal is reported as it is.
+ */
+const BASE_MODIFIED_RETRY_MS = [1000, 2000];
 const REVIEW_PAGE = 100;
 /** A pull request with more reviews than this (REVIEW_PAGE each) is refused, not read in part. */
 const MAX_REVIEW_PAGES = 10;
@@ -891,7 +896,7 @@ export class GithubReview {
         body = await this.enqueue(ctx, ref, pr, state, pr.headSha, false);
       } else {
         try {
-          const merged = await ctx.client.request<{ sha?: string }>("PUT", repoPath(ref, `/pulls/${ref.number}/merge`), { body: { sha: pr.headSha, merge_method: method } });
+          const merged = await this.putMerge<{ sha?: string }>(ctx, ref, pr.headSha, method);
           body = { status: "merged", merge_sha: merged.json?.sha ?? null, method, url: pr.url, head_sha: pr.headSha, github_request_id: merged.requestId };
         } catch (err) {
           if (err instanceof GithubError && err.status === 409) throw new Refusal("head_moved", "the pull request changed while it was being merged; nothing was merged");
@@ -1822,14 +1827,29 @@ export class GithubReview {
     ctx.acc.write = true;
     if (queue) return this.enqueue(ctx, ref, pr, state, headSha, approved);
     try {
-      const merged = await ctx.client.request<{ sha?: string; merged?: boolean; message?: string }>("PUT", repoPath(ref, `/pulls/${ref.number}/merge`), {
-        body: { sha: headSha, merge_method: method },
-      });
+      const merged = await this.putMerge<{ sha?: string; merged?: boolean; message?: string }>(ctx, ref, headSha, method);
       return { status: "merged", merge_sha: merged.json?.sha ?? null, method, url: pr.url, github_request_id: merged.requestId };
     } catch (err) {
       if (err instanceof GithubError && err.status === 409) throw new Refusal("head_moved", "the pull request changed while it was being merged; nothing was merged", { github_request_id: err.requestId });
       if (err instanceof GithubError && (err.status === 405 || err.status === 422)) throw new Refusal("not_mergeable", `GitHub refused the merge: ${err.message}`, { github_request_id: err.requestId });
       throw err;
+    }
+  }
+
+  /**
+   * The merge itself, pinned to `headSha`. GitHub answers 405 "Base branch was modified" when another merge moved the base between its
+   * mergeability check and this one: nothing was merged and the head is unchanged, so the same merge is tried again after a short wait
+   * (BASE_MODIFIED_RETRY_MS), and only then reported as refused. Any other answer is the caller's to read.
+   */
+  private async putMerge<T>(ctx: Ctx, ref: PrRef, headSha: string, method: string | null | undefined): Promise<GithubAnswer<T>> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await ctx.client.request<T>("PUT", repoPath(ref, `/pulls/${ref.number}/merge`), { body: { sha: headSha, merge_method: method } });
+      } catch (err) {
+        const wait = BASE_MODIFIED_RETRY_MS[attempt];
+        if (wait === undefined || !(err instanceof GithubError && err.status === 405 && /base branch was modified/i.test(err.message))) throw err;
+        await this.sleep(wait);
+      }
     }
   }
 
