@@ -20,6 +20,10 @@
  *       lookup at all leaves the turn alone as in T2
  *   T10 every such turn is counted by what its end did (`claw_assistant_router_unsaid_total`): its text delivered, delivered in place
  *       of an early line (K2), the system's notice, or left unsaid after a say that answered; a turn that said its answer is not counted
+ *   T11 a turn a worker's answer woke that ended without saying it -- stopped for the user's next message, failed, written in plain
+ *       text, or silent -- has the answer said by the system at once, once, about the item (release gate run 1108021655-0c1088: the
+ *       turn was stopped for the next message and the answer came only from the silent sweep five minutes later); a turn that said it,
+ *       naming the item or not, is left alone
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -385,5 +389,52 @@ describe("assistant router turn end", { skip }, () => {
     await w.q("TRUNCATE claw_assistant_says");
     assert.equal(await end(await endedTurn(REPORT), { finalText: "Nothing for the user." }), "skipped");
     assert.deepEqual(await gained(), {});
+  });
+
+  test("T11 a turn an answer woke that ended without saying it has the answer said by the system at once, once", async () => {
+    await w.subscribe("alice");
+    const ANSWER = "The first line is GATE-FILE-1.";
+    /** An item answered by its worker, and the router turn its report woke, ended. */
+    async function answeredAndWoken(title: string) {
+      const answered = await w.createItem(alice, title);
+      const worker = await w.workerTurn(answered.itemId);
+      assert.equal((await w.mod.tools.report(worker, { kind: "answer", summary: ANSWER })).status, "recorded");
+      await w.closeRun(worker.task_id);
+      const wake = String((await w.pending(alice.routerSid)).at(-1)!.content);
+      assert.ok(wake.startsWith(`[work_event] #${answered.seq} (item_id: ${answered.itemId}) answer:`), wake);
+      assert.ok(!wake.includes("already sent"), "a short answer with no file is the router's to say");
+      return { answered, wake };
+    }
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["stopped for the user's next message", { interrupted: true, finalText: "[Interrupted by user before any turn completed]" }],
+      ["failed", { failed: true }],
+      ["ended in plain text", { finalText: `The answer: ${ANSWER}` }],
+      ["ended without a word", {}],
+    ];
+    for (const [n, [why, extra]] of cases.entries()) {
+      await w.q("TRUNCATE claw_assistant_says, claw_pending_messages, claw_notification_outbox");
+      const title = `Read file ${n}`;
+      const { answered, wake } = await answeredAndWoken(title);
+      assert.equal((await says()).length, 0, `nothing said before the turn ends: ${why}`);
+      const turn = await endedTurn(wake);
+      assert.equal(await end(turn, extra), "said", why);
+      const [told, ...more] = await says();
+      assert.equal(more.length, 0, `the answer only, no notice that the turn was lost: ${why}`);
+      assert.deepEqual([told.fallback, told.item_id], [true, answered.itemId], why);
+      assert.equal(told.text, `#${answered.seq} "${title}": ${ANSWER}`, why);
+      assert.equal((await w.q("SELECT 1 FROM claw_notification_outbox WHERE event_id = $1", [told.say_id])).length, 1, `queued: ${why}`);
+      assert.equal(await end(turn, extra), "skipped", `once: ${why}`);
+      assert.equal((await says()).length, 1, `once: ${why}`);
+    }
+
+    // The router said it (naming no item: the say is recorded about the item its answer woke it for): nothing more.
+    await w.q("TRUNCATE claw_assistant_says, claw_pending_messages, claw_notification_outbox");
+    const { wake } = await answeredAndWoken("Read file again");
+    const turn = await w.routerTurn(alice);
+    await w.q("UPDATE claw_tasks SET prompt = $2, started_at = NOW() WHERE task_id = $1", [turn.task_id, wake]);
+    await w.mod.tools.say(turn, { text: `Done: ${ANSWER}` }, w.sayDeps);
+    await w.closeRun(turn.task_id, "completed", undefined, 1);
+    assert.equal(await end(turn, { finalText: "Said it." }), "skipped");
+    assert.deepEqual((await says()).map((s) => [s.text, s.fallback]), [[`Done: ${ANSWER}`, false]]);
   });
 });

@@ -750,6 +750,12 @@ export function earlierConversationItemOf(prompt: string | null | undefined): st
 }
 const WORK_EVENT_ITEM_RE = new RegExp(`^${WORK_EVENT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} #\\d+ \\(item_id: (kwi_[0-9A-Za-z]+)\\)`);
 
+/** The item whose answer (`formatWorkEvent` with kind `answer`) this prompt reports, or undefined: what woke a router turn to say it. */
+export function answerEventItemOf(prompt: string | null | undefined): string | undefined {
+  return prompt?.match(ANSWER_EVENT_RE)?.[1];
+}
+const ANSWER_EVENT_RE = new RegExp(`^${WORK_EVENT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} #\\d+ \\(item_id: (kwi_[0-9A-Za-z]+)\\) answer:`);
+
 /** The prompt of a watcher's turns (`observe.ts`): a place's messages, decided on and recorded, never acted on. */
 /**
  * router-devenv-v1: the user's development environments (开发环境, 开发机, my machine) are their own machines through the Claw

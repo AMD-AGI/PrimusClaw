@@ -15,7 +15,11 @@
  *
  * Only for a turn that answers the user. A turn that a worker's report started may end without a word on purpose
  * (the prompt says to speak only when the user must decide something), and what a model writes then is not for them;
- * an item that needs the user and was not announced is the silent sweep's.
+ * an item that needs the user and was not announced is the silent sweep's. Except an answer (`tellUnsaidAnswers`): a report
+ * of kind `answer` closes its item with what the user asked for, and nothing else will tell them. A turn woken to say one that
+ * ended without saying it -- stopped for the user's next message (`preemptReportTurn`), failed, or written in plain text -- has
+ * the system say it in its own words at once, not the silent sweep five minutes later (release gate run 1108021655-0c1088:
+ * the file was delivered, the router's line said its content would follow, and nothing followed inside the scenario).
  *
  * Nor for a turn that handed a review to the person's channel (`turnHandedOffReview`): the channel answers that message itself, in
  * one message, so neither the turn's plain text nor a notice that it failed is said beside it.
@@ -23,10 +27,13 @@
 import pino from "pino";
 import { db } from "../infra/db.js";
 import { detectLanguage } from "./language.js";
-import { SAY_TEXT_MAX, publishSayEvent, recordAssistantSay, recordSystemNotice, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
+import {
+  ANSWERED_UNSAID_SQL, SAY_TEXT_MAX, publishSayEvent, recordAssistantSay, recordNeedsYouFallback, recordSystemNotice, SayRefused,
+  turnHandedOffReview, type SayDeps,
+} from "./outbound.js";
 import { citedNumbers } from "./citations.js";
 import { internalTextIn, userWordsOf } from "./internal-text.js";
-import { TOOL_NAME_PREFIX, WORK_EVENT_PREFIX } from "./prompts.js";
+import { answerEventItemOf, TOOL_NAME_PREFIX, WORK_EVENT_PREFIX } from "./prompts.js";
 import { ROUTER_ASSISTANT_READS, ROUTER_SPEAK_TOOL } from "./read-tools.js";
 import { releaseHeldSays } from "./say-hold.js";
 import { kickDelivery } from "../notifications/outbox.js";
@@ -126,7 +133,9 @@ export function lostWhy(end: Pick<RouterTurnEnd, "failed" | "interrupted" | "fro
 }
 
 export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}): Promise<"said" | "skipped"> {
-  const out = await deliverUnsaid(end, deps);
+  let out = await deliverUnsaid(end, deps);
+  // After what the turn held was released (in `deliverUnsaid`): a say it made about the answer is then the one found.
+  if (await tellUnsaidAnswers(end, deps) > 0) out = "said";
   // After the delivery, so the timing counts what it sent; never in its way.
   try {
     const timing = await routerTurnTiming(end);
@@ -135,6 +144,38 @@ export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}
     logger.warn({ err, sessionId: end.sessionId }, "assistant.router_turn_timing_failed");
   }
   return out;
+}
+
+/**
+ * The answers this turn was woken to say (a report of kind `answer`, `formatWorkEvent`) that nobody said: the item is closed and
+ * answered, and no message about its current need was stored -- not the router's (`say` records the item an answer woke it for even
+ * when it names none), not the system's (`storeAnswerWhole`, a long answer or one that came with files). Each is said now in the
+ * system's words (`recordNeedsYouFallback`: the silent sweep's message under the same id, so it is said once whoever says it first),
+ * however the turn ended. Returns how many were said.
+ */
+export async function tellUnsaidAnswers(end: Pick<RouterTurnEnd, "sessionId" | "runIds">, deps: SayDeps = {}): Promise<number> {
+  const runs = (await db.query(
+    `SELECT a.user_id, COALESCE(t.prompt, t.input->>'prompt', '') AS prompt
+       FROM claw_tasks t JOIN claw_assistants a ON a.session_id = t.session_id
+      WHERE t.session_id = $1 AND t.task_id = ANY($2::text[]) AND t.origin = 'chat'`,
+    [end.sessionId, end.runIds],
+  )).rows as Array<{ user_id: string; prompt: string }>;
+  const items = [...new Set(runs.map((r) => answerEventItemOf(r.prompt)).filter((i): i is string => !!i))];
+  if (!items.length) return 0;
+  const unsaid = (await db.query(
+    `SELECT w.item_id FROM claw_work_items w
+      WHERE w.item_id = ANY($1::text[]) AND w.user_id = $2 AND w.kind <> 'remote' AND (${ANSWERED_UNSAID_SQL})
+        AND NOT EXISTS (SELECT 1 FROM claw_assistant_says s WHERE s.item_id = w.item_id AND s.item_attention_seq = w.attention_seq)`,
+    [items, runs[0].user_id],
+  )).rows as Array<{ item_id: string }>;
+  let told = 0;
+  for (const { item_id: itemId } of unsaid) {
+    if (!(await recordNeedsYouFallback({ itemId }, deps))) continue;
+    told += 1;
+    logger.warn({ sessionId: end.sessionId, runIds: end.runIds, itemId }, "assistant.unsaid_report_answer_told");
+    metrics.onAssistantRouterUnsaid("report_answer");
+  }
+  return told;
 }
 
 /**

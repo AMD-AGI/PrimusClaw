@@ -25,6 +25,9 @@
  *       with its line breaks; the router is told it was sent; any other report stays at REPORT_SUMMARY_MAX
  *   F6b the router is told an answer was sent in full only when it was stored for sending in the same transaction: a store that fails
  *       fails the report (the worker sends it again), never leaving a router that says one line about an answer nobody sent
+ *   F6c a short answer that comes with files the worker delivered is said whole by the system with them, before them, and the router
+ *       is told it was sent (release gate run 1108021655-0c1088: the chat showed "交付了文件 result.md" and the router's second turn
+ *       that was to say the first line never did); an answer whose files were announced before is the router's to say, as any short one
  *   F7  say takes a long answer whole, up to SAY_TEXT_MAX, and refuses past it; a router turn that ended in plain text is cut only there
  *   F8  no delivered file is lost: every one is announced however many there are; a report whose announcement the store failed is
  *       announced by the sweep (and recorded, so the next sweep reads nothing); a file delivered after the item's last report is
@@ -393,6 +396,41 @@ describe("assistant files in, results out", { skip }, () => {
     assert.ok(String((await w.pending(alice.routerSid)).at(-1)!.content).includes("already sent to the user in full"));
     const outbox = await w.q("SELECT payload FROM claw_notification_outbox WHERE event_id = (SELECT say_id::text FROM claw_assistant_says WHERE item_id = $1)", [item.itemId]);
     assert.equal(outbox.length, 1, "queued for the channel in the same transaction");
+  });
+
+  test("F6c a short answer that comes with files is said whole by the system with them; the router is told it was sent", async () => {
+    await w.subscribe("alice");
+    const title = "取附件首行写入 result.md 并交付";
+    const item = await w.createItem(alice, title);
+    stored.set(`${prefix(item.workerSid)}.deliveries/${DELIVERY_A}/result.md`, { size: 28, at: new Date() });
+    const answer = "已把附件第一行原样写入 result.md 并交付。第一行内容逐字为：GATE-FILE-1108021655-0c1088";
+    assert.ok(answer.length <= 600, "short: without the file it would be the router's to say (F6)");
+    const turn = await w.workerTurn(item.itemId);
+    assert.equal((await w.mod.tools.report(turn, { kind: "answer", summary: answer })).status, "recorded");
+    const says = await w.q("SELECT say_id::text, text, fallback, item_id FROM claw_assistant_says ORDER BY created_at");
+    assert.equal(says.length, 2, "the answer and the file, each once");
+    assert.equal(says[0].text, `#${item.seq} ${title}：${answer}`, "the answer, whole, in the system's words");
+    assert.equal(says[0].item_id, item.itemId, "about the item: the say the silent sweep and the router's turn end look for");
+    assert.ok(says[1].text.startsWith(`#${item.seq} ${title} 交付了文件`), "then the file");
+    const outbox = (await w.q("SELECT event_id FROM claw_notification_outbox ORDER BY id")).map((r) => r.event_id);
+    assert.deepEqual(outbox, [says[0].say_id, says[1].say_id], "queued for the channel answer first, then the file");
+    const wake = (await w.pending(alice.routerSid)).at(-1)!;
+    assert.ok(String(wake.content).includes("already sent to the user in full"), "the router is not left to say it a second time");
+    await w.closeRun(turn.task_id);
+
+    // Files announced by an earlier report do not come with this answer: it is the router's to say, as any short one.
+    const again = await w.createItem(alice, "Chart and count");
+    stored.set(`${prefix(again.workerSid)}.deliveries/${DELIVERY_B}/chart.csv`, { size: 10, at: new Date() });
+    const first = await w.workerTurn(again.itemId);
+    await w.mod.tools.report(first, { kind: "blocked", summary: "chart delivered, need the week", question: "Which week?" });
+    await w.closeRun(first.task_id);
+    assert.equal((await w.q("SELECT 1 FROM claw_assistant_says WHERE text LIKE '%chart.csv%'")).length, 1);
+    await w.q("UPDATE claw_work_items SET board_state = 'in_progress' WHERE item_id = $1", [again.itemId]);
+    const second = await w.workerTurn(again.itemId);
+    await w.mod.tools.report(second, { kind: "answer", summary: "42 rows" });
+    assert.equal((await w.q("SELECT 1 FROM claw_assistant_says WHERE item_id = $1 AND NOT fallback", [again.itemId])).length, 0);
+    assert.equal((await w.q("SELECT 1 FROM claw_assistant_says WHERE item_id = $1", [again.itemId])).length, 0, "nothing said for the router");
+    assert.ok(!String((await w.pending(alice.routerSid)).at(-1)!.content).includes("already sent"));
   });
 
   test("F7 say takes a long answer whole up to SAY_TEXT_MAX; a plain-text end is cut only past it", async () => {

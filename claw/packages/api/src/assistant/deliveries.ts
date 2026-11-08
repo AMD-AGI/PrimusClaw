@@ -171,6 +171,40 @@ function sayEvent(sessionId: string, sayId: string, text: string, file: Assistan
   };
 }
 
+/** A task item whose worker's deliveries can be announced: its worker's session is the user's (one that is not names no file of theirs). */
+async function deliveringItem(itemId: string): Promise<
+  { user_id: string; seq: number; title: string; worker_session_id: string; router_session_id: string } | null
+> {
+  const item = (await db.query(
+    `SELECT w.user_id, w.seq, w.title, w.worker_session_id, a.session_id AS router_session_id
+       FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id
+      WHERE w.item_id = $1 AND w.kind = 'task'`,
+    [itemId],
+  )).rows[0] as { user_id: string; seq: number; title: string; worker_session_id: string; router_session_id: string } | undefined;
+  if (!item?.worker_session_id) return null;
+  const owner = (await db.query("SELECT user_id FROM claw_sessions WHERE session_id = $1", [item.worker_session_id])).rows[0] as
+    { user_id: string | null } | undefined;
+  return owner && owner.user_id === item.user_id ? item : null;
+}
+
+/** The id of a delivery's message: derived from the delivery, so it is announced once. */
+const deliveryKey = (d: StoredDelivery) => `delivery:${d.id}`;
+const deliveryMessageId = (userId: string, d: StoredDelivery) => deterministicEventId("assistant.notice", userId, deliveryKey(d));
+
+/**
+ * Whether the item's worker delivered a file the user has not been told of: one the next report announces (`announceItemDeliveries`).
+ * Read before a report of kind `answer` is recorded (`ingestReport`), so that an answer which comes with files is said with them, by
+ * the system, and not left to a second turn of the router after the files are shown. Throws for a fault of the store or the database.
+ */
+export async function hasUnannouncedDeliveries(itemId: string): Promise<boolean> {
+  const item = await deliveringItem(itemId);
+  if (!item) return false;
+  const deliveries = await sessionDeliveries(item.user_id, item.worker_session_id);
+  if (!deliveries.length) return false;
+  const known = await messagesOf(deliveries.map((d) => deliveryMessageId(item.user_id, d)), item.router_session_id);
+  return deliveries.some((d) => !known.get(deliveryMessageId(item.user_id, d))?.carried);
+}
+
 /**
  * Announce the item's delivered files that have not been announced, oldest first, one system message each (at most
  * ANNOUNCE_BATCH_MAX in one call). With `throughEventId` (the report that asked), the item is recorded as announced through
@@ -179,21 +213,12 @@ function sayEvent(sessionId: string, sayId: string, text: string, file: Assistan
  * announces what this one did not.
  */
 export async function announceItemDeliveries(itemId: string, deps: SayDeps = {}, throughEventId?: number): Promise<number> {
-  const item = (await db.query(
-    `SELECT w.user_id, w.seq, w.title, w.worker_session_id, a.session_id AS router_session_id
-       FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id
-      WHERE w.item_id = $1 AND w.kind = 'task'`,
-    [itemId],
-  )).rows[0] as { user_id: string; seq: number; title: string; worker_session_id: string; router_session_id: string } | undefined;
-  if (!item?.worker_session_id) return 0;
-  const owner = (await db.query("SELECT user_id FROM claw_sessions WHERE session_id = $1", [item.worker_session_id])).rows[0] as
-    { user_id: string | null } | undefined;
-  // The worker's session is the user's: one that is not names no file of theirs.
-  if (!owner || owner.user_id !== item.user_id) return 0;
+  const item = await deliveringItem(itemId);
+  if (!item) return 0;
   const deliveries = await sessionDeliveries(item.user_id, item.worker_session_id);
   // What became of each one's message is read before anything else is read for it (the message id is the delivery's).
-  const keyOf = (d: StoredDelivery) => `delivery:${d.id}`;
-  const idOf = (d: StoredDelivery) => deterministicEventId("assistant.notice", item.user_id, keyOf(d));
+  const keyOf = deliveryKey;
+  const idOf = (d: StoredDelivery) => deliveryMessageId(item.user_id, d);
   const known = await messagesOf(deliveries.map(idOf), item.router_session_id);
   const textOf = (d: StoredDelivery) => deliveryText({ seq: Number(item.seq), title: item.title }, d);
   let told = 0;

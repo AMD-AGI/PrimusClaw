@@ -126,6 +126,12 @@ record it.
   "#381: 2 comments" still listed): each ended watch whose news is from the last 7 days has its branches read once with its owner's
   token, beside the poll pass and never holding it back (`claw_work_item_subscriptions.refs_read_at`, added at api start), claimed across replicas and
   never again; after the first passes following the release no GitHub call is made.
+- A worker's answer reaches the chat without waiting on the router (release gate run 1108021655-0c1088: the item delivered
+  `result.md`, the chat showed "delivered result.md (28 B)", the router's line said the file's first line would follow, and it came
+  only from the silent sweep five minutes later). An answer that comes with files the worker delivered is said whole by the system
+  with them, before them, as a long answer already was, and the router is told it was sent. A router turn woken to say an answer that
+  ended without saying it -- stopped for the user's next message, failed, or written in plain text -- has the system say the answer
+  at once instead of five minutes later (`claw_assistant_router_unsaid_total{outcome="report_answer"}`).
 - The brief leaves release-gate fixture pull requests out of its pull request section, told by their branches as `pr_list` tells them
   (a weekly report said "#381: 2 comments" for the fixture on 2026-11-08); a watched pull request's head and base branches are kept
   with its watch (`claw_work_item_subscriptions.head_ref`, `base_ref`, added at api start). The brief's pull request section also
