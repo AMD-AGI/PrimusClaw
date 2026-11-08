@@ -91,10 +91,10 @@ const textPreviewNoted = new Map<string, boolean>();
  * `source: "text"`), or that it was taken back (`toolTextVoid`, same source): the turn has started to answer, so the "on it" line is not
  * said over it (`reasonToStaySilent`), and its end takes back what was shown if it does not say it (`router-turn-end.ts`). The deltas
  * are never stored, and the events of one turn reach every API process, so it is kept on the run. Taken back wins: a delta handled late
- * by another process never marks the run again. Best effort: a failure is logged and leaves the run as it was.
+ * by another process never marks the run again. False when it could not be written: the caller has the event delivered again.
  */
-export async function noteTextPreview(sessionId: string, messageId: string, showing: boolean, q: Querier = (t, p) => db.query(t, p)): Promise<void> {
-  if (!sessionId || !messageId || textPreviewNoted.get(messageId) === showing) return;
+export async function noteTextPreview(sessionId: string, messageId: string, showing: boolean, q: Querier = (t, p) => db.query(t, p)): Promise<boolean> {
+  if (!sessionId || !messageId || textPreviewNoted.get(messageId) === showing) return true;
   if (textPreviewNoted.size >= ROUTER_CACHE_MAX) textPreviewNoted.clear();
   textPreviewNoted.set(messageId, showing);
   try {
@@ -104,9 +104,11 @@ export async function noteTextPreview(sessionId: string, messageId: string, show
           AND ($3::boolean = false OR NOT (COALESCE(metadata, '{}'::jsonb) ? 'text_preview'))`,
       [sessionId, messageId, showing],
     );
+    return true;
   } catch (err) {
     textPreviewNoted.delete(messageId);
     logger.warn({ err: (err as Error)?.message, sessionId, messageId }, "assistant.text_preview_note_failed");
+    return false;
   }
 }
 

@@ -273,6 +273,13 @@ describe("assistant lookup ack and silent turns", { skip }, () => {
     await deliver({ ...delta, text: "下个月冻结期从" });
     assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "said");
     assert.deepEqual((await says()).map((r) => r.text), ["收到，我上网查一下。"]);
+    // A note that could not be written says so (the consumer has the event delivered again), and is written on the next try.
+    const third = await turn("再问一个");
+    const broken = async () => { throw new Error("db down"); };
+    assert.equal(await ack.noteTextPreview(alice.routerSid, third.mid, true, broken as never), false);
+    assert.equal(await ack.noteTextPreview(alice.routerSid, third.mid, true), true);
+    const noted = await w.q("SELECT metadata->>'text_preview' AS v FROM claw_tasks WHERE task_id = $1", [third.task_id]);
+    assert.equal(noted[0].v, "true");
   });
 
   test("A9 a router turn has its own text streamed only for the people who have it, and only when it answers them", async (t0) => {

@@ -328,3 +328,29 @@ test("a sub-agent's text is never the run's to show", async () => {
   assert.equal(sayDeltas(events).length, 0);
 });
 
+
+test("text shown by a model call that failed and is tried again is taken back; the retry shows its own", async (t) => {
+  t.mock.method(Math, "random", () => 0); // the shortest backoff the loop draws (2.5 s)
+  let calls = 0;
+  const s: LlmSession = {
+    async streamTurn(_m: Message[], _t: ToolSchema[], _s?: AbortSignal, options?: StreamTurnOptions): Promise<LlmTurnResult> {
+      calls += 1;
+      options!.text!.onText({ index: 0, text: calls === 1 ? "下个月冻" : "下个月冻结期从 12 月 4 日开始。" });
+      if (calls === 1) throw new TypeError("terminated"); // a dropped stream: tried again
+      await sleep(5);
+      return {
+        content: [{ type: "text", text: "下个月冻结期从 12 月 4 日开始。" }], stopReason: "end_turn",
+        usage: { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 }, firstByteMs: 1,
+      };
+    },
+    async complete() { return ""; },
+  };
+  const { opts: o, events } = opts({ llmSession: s, streamToolText: [SAY], streamTextAs: SAY });
+  await agentLoop([{ role: "user", content: "下个月冻结期？" }], TOOLS, o);
+  const shown = events.filter((e) => e.type === "toolTextDelta" || e.type === "toolTextVoid").map((e) => [e.type, e.actionId, e.reason ?? e.text]);
+  assert.deepEqual(shown, [
+    ["toolTextDelta", "text-1-0", "下个月冻"],
+    ["toolTextVoid", "text-1-0", "retry"],
+    ["toolTextDelta", "text-2-0", "下个月冻结期从 12 月 4 日开始。"],
+  ]);
+});

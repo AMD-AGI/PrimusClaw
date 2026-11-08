@@ -446,11 +446,14 @@ export async function consumeEventDelivery(msg: {
     // nothing is kept of it: it would be rows nobody reads back, several for every message the assistant says. Nor of the event that
     // takes such a preview back (`toolTextVoid`): it is about the preview only.
     if (event.type === TOOL_TEXT_DELTA_EVENT || event.type === TOOL_TEXT_VOID_EVENT) {
-      msg.ack();
-      // A router turn's own text shown as its say's (`stream_text_as`), or taken back: noted on its run (`noteTextPreview`).
-      if (event.source === "text" && typeof event.message_id === "string") {
-        await noteTextPreview(sessionId, event.message_id, event.type === TOOL_TEXT_DELTA_EVENT);
+      // A router turn's own text shown as its say's (`stream_text_as`), or taken back: noted on its run (`noteTextPreview`), which its
+      // end reads to take back what it does not say. A note that could not be written is asked for again, not dropped.
+      if (event.source === "text" && typeof event.message_id === "string"
+        && !(await noteTextPreview(sessionId, event.message_id, event.type === TOOL_TEXT_DELTA_EVENT))) {
+        msg.nak(TOMBSTONE_UNKNOWN_NAK_MS);
+        return;
       }
+      msg.ack();
       return;
     }
 

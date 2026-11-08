@@ -2354,7 +2354,7 @@ class AgentLoopRunner {
           this.textPreviewShown = id;
           throttle.preview(id, textAs, text);
         },
-        onToolCall: () => this.voidTextPreview(throttle, textAs),
+        onToolCall: () => this.voidTextPreview(throttle),
       };
     }
     return throttle;
@@ -2364,13 +2364,24 @@ class AgentLoopRunner {
    * The model's own text shown so far (`streamTextAs`) is not the answer: a tool call follows it. It is taken back once, and nothing more
    * of the run's own text is shown.
    */
-  private voidTextPreview(throttle: ToolTextThrottle, tool: string): void {
+  private voidTextPreview(throttle: ToolTextThrottle): void {
+    if (!this.textPreviewOpen) return;
+    if (this.retractTextPreview(throttle, "tool_call")) this.textPreviewOpen = false;
+  }
+
+  /**
+   * Take back the run's own text shown last (`toolTextVoid` under its id), if any: true when there was one. `reason` is why: a tool call
+   * followed it (`tool_call`), or the model call that wrote it failed and is tried again (`retry`).
+   */
+  private retractTextPreview(throttle: ToolTextThrottle, reason: "tool_call" | "retry"): boolean {
     const id = this.textPreviewShown;
-    if (!id || !this.textPreviewOpen) return;
-    this.textPreviewOpen = false;
+    const tool = this.opts.streamTextAs;
+    if (!id || !tool) return false;
+    this.textPreviewShown = null;
     throttle.drop(id);
-    Promise.resolve(this.onEvent({ type: "toolTextVoid", tool, actionId: id, reason: "tool_call", source: "text" })).catch((err: unknown) =>
+    Promise.resolve(this.onEvent({ type: "toolTextVoid", tool, actionId: id, reason, source: "text" })).catch((err: unknown) =>
       logger.warn({ err: (err as Error)?.message, sessionId: this.sessionId, tool }, "agent-loop.text_void_failed"));
+    return true;
   }
 
   /** One LLM streamTurn call with retry-with-backoff on transient errors. */
@@ -2404,7 +2415,7 @@ class AgentLoopRunner {
         if (toolText && textAs && this.textPreviewOpen && this.depth === 0) {
           const calls = result.content.filter((b) => b.type === "tool_use");
           // A call after the text (a provider that reported none while streaming): the text was not the answer.
-          if (calls.length) this.voidTextPreview(toolText, textAs);
+          if (calls.length) this.voidTextPreview(toolText);
           // The run says something itself: its say streams from now on, not its text.
           if (calls.some((b) => (b as { name?: string }).name === textAs)) this.textPreviewOpen = false;
         }
@@ -2414,6 +2425,8 @@ class AgentLoopRunner {
       } catch (err: any) {
         // A failed attempt's text is not the turn's: the retry streams it again from the start.
         toolText?.cancel();
+        // What the attempt showed of the run's own text is taken back: the retry shows its own under a new id, or a tool call.
+        if (toolText) this.retractTextPreview(toolText, "retry");
         let code = err?.code as string | undefined;
         const errMsg = err?.message || String(err);
         if (!sanitizedRetryUsed && !this.signal?.aborted && looksLikeToolArgumentsRejection(err)) {

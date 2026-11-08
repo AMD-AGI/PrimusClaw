@@ -145,19 +145,27 @@ export function historySegment(
  */
 export class StreamVoided {
   private readonly turns = new Set<string>();
+  /** The router's own text taken back (`source: "text"`, Brain's `stream_text_as`), by turn and preview id: only that preview. */
+  private readonly texts = new Set<string>();
 
   constructor(private readonly max = 64) {}
 
-  /** False for a `toolTextDelta` of a turn voided before it on this stream; true for everything else. */
+  /**
+   * False for a `toolTextDelta` of a turn voided before it on this stream; true for everything else. A void of the turn's own text
+   * (`source: "text"`, a tool call followed it) takes back that text only: the say the turn writes next is still its say, and streams.
+   */
   forward(evt: Record<string, unknown>): boolean {
     const turn = typeof evt.message_id === "string" ? evt.message_id : "";
     if (!turn) return true;
+    const preview = evt.source === "text" && typeof evt.actionId === "string" ? `${turn}\u0000${evt.actionId}` : null;
     if (evt.type === TOOL_TEXT_VOID_EVENT) {
-      this.turns.add(turn);
-      if (this.turns.size > this.max) this.turns.delete(this.turns.values().next().value as string);
+      const set = preview ? this.texts : this.turns;
+      set.add(preview ?? turn);
+      if (set.size > this.max) set.delete(set.values().next().value as string);
       return true;
     }
-    return !(evt.type === TOOL_TEXT_DELTA_EVENT && this.turns.has(turn));
+    if (evt.type !== TOOL_TEXT_DELTA_EVENT) return true;
+    return !this.turns.has(turn) && !(preview && this.texts.has(preview));
   }
 }
 
