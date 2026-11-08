@@ -217,12 +217,12 @@ describe("state files written off the event loop", () => {
     f.save("a");
     f.save("a"); // while the first write is under way
     assert.equal(await f.settled(), true);
-    // A link keeps the inode written: a rewrite (a new file renamed over this one) would give the name another inode.
+    // A second link to the inode written: a rewrite (a new file renamed over this one) would leave it the only one.
     const seen = `${file}.seen`;
     fs.linkSync(file, seen);
     for (let i = 0; i < 5; i++) f.save("a");
     assert.equal(await f.settled(), true);
-    assert.equal(fs.statSync(file).ino, fs.statSync(seen).ino, "the same content is not written again");
+    assert.equal(fs.statSync(seen).nlink, 2, "the same content is not written again");
     f.save("b");
     assert.equal(await f.settled(), true);
     assert.equal(fs.readFileSync(file, "utf8"), "b");
