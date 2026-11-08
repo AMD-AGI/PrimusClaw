@@ -254,8 +254,11 @@ test("a stream event stored before a lower one still follows it: after is placed
 });
 
 test("a stream id not stored yet is placed by sequence too", async () => {
-  await seed(9);
+  // claw-10 reached the client live and its row is not written yet; claw-12 was stored before claw-8, the last stored
+  // stream event at or before it, so placing the cursor by that row would leave claw-12 out.
+  await seed(7);
   await store1("claw-12", 12);
-  await store1("claw-11", 11);    // claw-10 reached the client live; its row is not written yet
+  await store1("claw-8", 8);
+  await store1("claw-11", 11);
   assert.deepEqual((await stream("?after=claw-10")).ids, ["claw-12", "claw-11"]);
 });
