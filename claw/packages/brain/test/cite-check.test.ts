@@ -8,7 +8,8 @@
  *   CC1 a statement whose source opened and supports it keeps its number; one its source does not support is marked unverified
  *   CC2 a source whose page cannot be opened is marked in the list, and every statement resting on it alone is unverified
  *   CC3 a statement with two sources keeps only the one that supports it
- *   CC4 a number no listed source carries, a judge that fails or answers the wrong count: unverified, never supported
+ *   CC4 a number no listed source carries, a page that does not open: unverified; a judge that fails or answers the wrong count twice:
+ *       not checked; never supported
  *   CC5 a Chinese report is marked in Chinese, and its closing line counts in Chinese
  *   CC6 a text with no numbered citations, or no list of sources, is passed on unchanged and fetches nothing
  *   CC7 the router sends the checked text, not the model's, to a checking tool, and tells the model what the check found
@@ -16,6 +17,9 @@
  *   CC9 a page is read the way web_fetch reads it: an error is unreadable, a redirect to another host is followed once, a long page
  *       is read on by offset
  *   CC10 the judge's answer is read as booleans only
+ *   CC11 a judge that gives no answer (an empty reply cut at max_tokens) is asked once more: answered then, its verdicts hold; not
+ *        answered again, its statements are marked not checked (未核对), counted apart, and counted in the metric
+ *   CC12 the judge is asked with an output budget a thinking model can answer in, and an empty reply is no answer
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -83,18 +87,20 @@ test("CC1-CC3 supported statements keep their numbers, the rest are marked, a de
   assert.match(r.text.trimEnd().split("\n").at(-1)!, /^Citation check .*3 of 5 cited statements are supported.*2 are marked unverified; 1 of the 3 cited sources/);
 });
 
-test("CC4 a number with no source, a failing judge and a judge with the wrong count all leave statements unverified", async () => {
+test("CC4 a number with no source is unverified; a failing judge or one with the wrong count leaves its statements not checked", async () => {
   const text = [`Fact one {a} [1].`, `Fact two {b} [9].`, "", `[1]: Page — ${A}`].join("\n");
   const missing = await checkReport(text, fakePorts({ [A]: "a" }).ports);
   assert.match(missing.text, /Fact one \{a\} \[1\]\./);
   assert.match(missing.text, /Fact two \{b\} \(unverified\)\./, "[9] names no source");
 
   const threw = await checkReport(text, fakePorts({ [A]: "a" }, { judge: async () => { throw new Error("gateway 500"); } }).ports);
-  assert.match(threw.text, /Fact one \{a\} \(unverified\)\./);
-  assert.equal(threw.supported, 0);
+  assert.match(threw.text, /Fact one \{a\} \(not checked\)\./);
+  assert.match(threw.text, /Fact two \{b\} \(unverified\)\./, "a number with no source is still unverified");
+  assert.deepEqual([threw.supported, threw.unchecked, threw.unverified], [0, 1, 1]);
 
   const short = await checkReport(text, fakePorts({ [A]: "a" }, { judge: async () => [] }).ports);
   assert.equal(short.supported, 0, "an answer that is not one boolean per statement supports nothing");
+  assert.equal(short.unchecked, 1);
 
   const fetchThrew = await checkReport(text, { fetchPage: async () => { throw new Error("socket"); }, judge: async (i) => i.claims.map(() => true) });
   assert.equal(fetchThrew.supported, 0);
@@ -222,4 +228,55 @@ test("CC10 the judge is asked with the page as data and answered with booleans o
   assert.equal(parseVerdicts("[true]", 2), null);
   assert.equal(parseVerdicts("[\"yes\", true]", 2), null);
   assert.equal(parseVerdicts("no array", 1), null);
+});
+
+test("CC11 a judge with no answer is asked once more; still none: not checked, counted apart and in the metric", async () => {
+  const { registry } = await import("../src/infra/metrics.js");
+  const judged = async (outcome: string) => {
+    const m = (await registry.getSingleMetric("claw_cite_check_judge_total")!.get()).values.find((v) => v.labels.outcome === outcome);
+    return m?.value ?? 0;
+  };
+  const text = [`Fact one {a} [1].`, `Fact two {b} [1].`, "", `[1]: Page — ${A}`].join("\n");
+
+  let calls = 0;
+  const once = await checkReport(text, fakePorts({ [A]: "a" }, {
+    judge: async ({ claims }) => (++calls === 1 ? null : claims.map((c) => c.includes("{a}"))),
+  }).ports);
+  assert.equal(calls, 2, "asked once more");
+  assert.match(once.text, /Fact one \{a\} \[1\]\./);
+  assert.match(once.text, /Fact two \{b\} \(unverified\)\./, "the retry's verdicts hold");
+  assert.deepEqual([once.supported, once.unverified, once.unchecked, once.judgeFailures], [1, 1, 0, 0]);
+
+  const before = await judged("no_answer");
+  calls = 0;
+  const none = await checkReport(text, fakePorts({ [A]: "a" }, { judge: async () => { calls++; return null; } }).ports);
+  assert.equal(calls, 2, "asked twice, no more");
+  assert.match(none.text, /Fact one \{a\} \(not checked\)\./);
+  assert.match(none.text, /Fact two \{b\} \(not checked\)\./);
+  assert.doesNotMatch(none.text, /\(unverified\)/, "nothing decided is never called unverified");
+  assert.deepEqual([none.supported, none.unverified, none.unchecked, none.judgeFailures], [0, 0, 2, 1]);
+  assert.match(none.text.trimEnd().split("\n").at(-1)!, /0 are marked unverified, 2 are marked not checked/);
+  assert.equal(await judged("no_answer"), before + 1, "the failed batch is counted where it can be seen");
+
+  const zh = await checkReport(["# 对比报告：两个推理框架在 MI300X 上的支持情况与性能差异的总结说明", "vLLM 已正式支持 MI300X {a} [1]。", "", `[1]: 文档 — ${A}`].join("\n"),
+    fakePorts({ [A]: "a" }, { judge: async () => null }).ports);
+  assert.match(zh.text, /vLLM 已正式支持 MI300X \{a\}（未核对）。/);
+  assert.match(zh.text.trimEnd().split("\n").at(-1)!, /0 条标为“未证实”，1 条因核对未能完成标为“未核对”/);
+});
+
+test("CC12 the judge has an output budget a thinking model can answer in, and an empty reply is no answer", async () => {
+  const { webCiteCheckPorts, CITE_CHECK_JUDGE_MAX_TOKENS } = await import("../src/tools/web/cite-check-ports.js");
+  const asked: Array<{ max_tokens: number }> = [];
+  let reply: { content: unknown[]; stop_reason: string } = { content: [], stop_reason: "max_tokens" };
+  const ctx = {
+    anthropic: { messages: { create: async (body: { max_tokens: number }) => { asked.push(body); return { ...reply, usage: { input_tokens: 1, output_tokens: 1 } }; } } },
+    sessionCost: { addUsage() {} },
+  };
+  const ports = webCiteCheckPorts({} as never, ctx as never)!;
+  const signal = new AbortController().signal;
+  assert.equal(await ports.judge({ url: A, page: "p", claims: ["x", "y"] }, signal), null, "an empty reply cut at max_tokens is no answer");
+  reply = { content: [{ type: "thinking", thinking: "..." }, { type: "text", text: "[true, false]" }], stop_reason: "end_turn" };
+  assert.deepEqual(await ports.judge({ url: A, page: "p", claims: ["x", "y"] }, signal), [true, false]);
+  assert.equal(CITE_CHECK_JUDGE_MAX_TOKENS, 4096);
+  assert.deepEqual(asked.map((a) => a.max_tokens), [4096, 4096]);
 });

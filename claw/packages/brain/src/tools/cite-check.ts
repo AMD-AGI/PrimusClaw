@@ -15,13 +15,15 @@
  *  - a source whose page could not be opened or read is marked so in the list of sources;
  *  - the file ends with one line that says how many statements were checked and how many are unverified.
  *
- * What could not be checked counts as not supported: a page that failed to open, a judge that did not answer, a statement over the
- * caps, a number no source in the list carries. A page's text is data for the judge, never instructions; the judge's answer is
+ * What could not be checked counts as not supported: a page that failed to open, a statement over the caps, a number no source in
+ * the list carries. A judge that gives no answer is asked once more; when it still gives none, the statements it was asked about are
+ * marked not checked (`（未核对）`, `(not checked)`) rather than unverified, counted apart, and logged and counted as a metric. A page's text is data for the judge, never instructions; the judge's answer is
  * read as booleans only, so a page can at most change whether its own statements count as supported.
  *
  * A text with no numbered citation, or no list of sources, is not a research report and is passed on unchanged.
  */
 import pino from "pino";
+import { metrics } from "../infra/metrics.js";
 
 const logger = pino({ name: "cite-check" });
 
@@ -78,6 +80,13 @@ export interface CiteCheckResult {
   unverified: number;
   sources: number;
   unreadable: number;
+  /**
+   * Statements none of whose sources supports them and at least one of whose sources the judge gave no answer for, asked twice:
+   * marked "not checked" (未核对), never "unverified", since nothing was decided about them.
+   */
+  unchecked: number;
+  /** Judge calls that gave no answer, after their retry: a batch of statements each. */
+  judgeFailures: number;
 }
 
 const SOURCE_LINE = /^\s{0,3}(?:[-*+]\s+)?\[(\d{1,3})\][:.]?\s+(.*)$/;
@@ -191,7 +200,7 @@ async function eachLimited<T>(items: T[], limit: number, work: (item: T) => Prom
 
 /** `text` as it is, marked as not a report: the numbers are all zero. */
 function unchanged(text: string): CiteCheckResult {
-  return { text, checked: false, claims: 0, supported: 0, unverified: 0, sources: 0, unreadable: 0 };
+  return { text, checked: false, claims: 0, supported: 0, unverified: 0, sources: 0, unreadable: 0, unchecked: 0, judgeFailures: 0 };
 }
 
 /**
@@ -213,6 +222,9 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
 
   // For each statement, the numbers whose page supports it.
   const supportedBy: Set<number>[] = claims.map(() => new Set<number>());
+  // For each statement, the numbers whose judge gave no answer: nothing was decided about the statement and those pages.
+  const unjudged: Set<number>[] = claims.map(() => new Set<number>());
+  let judgeFailures = 0;
   const checkedClaims = claims.slice(0, CITE_CHECK_MAX_CLAIMS);
   const cited = [...new Set(checkedClaims.flatMap((c) => c.numbers))].filter((n) => sources.has(n)).slice(0, CITE_CHECK_MAX_SOURCES);
   const unreadable = new Set<number>();
@@ -234,14 +246,31 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
       for (let k = 0; k < mine.length; k += CITE_CHECK_CLAIMS_PER_CALL) {
         if (budget.signal.aborted || now() > deadline) return;
         const batch = mine.slice(k, k + CITE_CHECK_CLAIMS_PER_CALL);
-        let verdicts: boolean[] | null;
-        try {
-          verdicts = await untilAborted(ports.judge({ url: source.url, page: page.text, claims: batch.map(({ c }) => c.text) }, budget.signal), budget.signal);
-        } catch (err) {
-          logger.info({ host: hostOf(source.url), err: err instanceof Error ? err.message : String(err) }, "cite_check.judge_threw");
-          verdicts = null;
+        const ask = async (): Promise<boolean[] | null> => {
+          try {
+            const v = await untilAborted(ports.judge({ url: source.url, page: page.text, claims: batch.map(({ c }) => c.text) }, budget.signal), budget.signal);
+            return v && v.length === batch.length ? v : null;
+          } catch (err) {
+            logger.info({ host: hostOf(source.url), err: err instanceof Error ? err.message : String(err) }, "cite_check.judge_threw");
+            return null;
+          }
+        };
+        // A judge that gave no answer (an empty reply, one cut short, one that is not a boolean per statement) is asked once more;
+        // a second miss leaves the batch not checked, and is counted where it can be seen (`cite_check.judge_no_answer`, the metric).
+        let verdicts = await ask();
+        if (verdicts) metrics.onCiteCheckJudge("answered");
+        else {
+          logger.warn({ host: hostOf(source.url), statements: batch.length }, "cite_check.judge_no_answer_retrying");
+          verdicts = await ask();
+          if (verdicts) metrics.onCiteCheckJudge("answered_on_retry");
+          else {
+            metrics.onCiteCheckJudge("no_answer");
+            judgeFailures += 1;
+            logger.warn({ host: hostOf(source.url), statements: batch.length }, "cite_check.judge_no_answer");
+            batch.forEach(({ i }) => unjudged[i].add(n));
+            continue;
+          }
         }
-        if (!verdicts || verdicts.length !== batch.length) continue;
         batch.forEach(({ i }, j) => { if (verdicts![j] === true) supportedBy[i].add(n); });
       }
     });
@@ -252,18 +281,22 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
 
   const zh = isChinese(text);
   const mark = zh ? "（未证实）" : " (unverified)";
+  const notChecked = zh ? "（未核对）" : " (not checked)";
   // Each line's statements, rewritten from the last to the first so the earlier offsets hold.
   const byLine = new Map<number, number[]>();
   claims.forEach((c, i) => byLine.set(c.line, [...(byLine.get(c.line) ?? []), i]));
   let supported = 0;
+  let unchecked = 0;
   for (const [ln, idx] of byLine) {
     let line = lines[ln];
     for (const i of [...idx].reverse()) {
       const c = claims[i];
       const keep = c.numbers.filter((n) => supportedBy[i].has(n));
+      const open = !keep.length && unjudged[i].size > 0;
       if (keep.length) supported += 1;
+      else if (open) unchecked += 1;
       const trailing = line.slice(c.start, c.end).match(/\s*$/)?.[0] ?? "";
-      const group = keep.length ? keep.map((n) => `[${n}]`).join("") : mark;
+      const group = keep.length ? keep.map((n) => `[${n}]`).join("") : open ? notChecked : mark;
       // The mark follows the statement's last word; kept numbers stay where they were.
       const head = keep.length ? line.slice(0, c.start) : line.slice(0, c.start).replace(/\s+$/, "");
       line = `${head}${group}${trailing}${line.slice(c.end)}`;
@@ -274,13 +307,16 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
     const s = sources.get(n)!;
     lines[s.line] = `${lines[s.line].replace(/\s+$/, "")}${zh ? "（未能打开或读取，未作为依据）" : " (could not be opened or read; not used as evidence)"}`;
   }
-  const unverified = claims.length - supported;
+  const unverified = claims.length - supported - unchecked;
   const summary = zh
-    ? `引用核对（交付前由系统逐条打开来源核对）：${claims.length} 条带引用的结论中 ${supported} 条有来源支持，${unverified} 条标为“未证实”；被引用的 ${cited.length} 个来源中 ${unreadable.size} 个未能打开或读取。`
-    : `Citation check (each source opened and checked by the system before delivery): ${supported} of ${claims.length} cited statements are supported by their sources, ${unverified} are marked unverified; ${unreadable.size} of the ${cited.length} cited sources could not be opened or read.`;
+    ? `引用核对（交付前由系统逐条打开来源核对）：${claims.length} 条带引用的结论中 ${supported} 条有来源支持，${unverified} 条标为“未证实”${unchecked ? `，${unchecked} 条因核对未能完成标为“未核对”` : ""}；被引用的 ${cited.length} 个来源中 ${unreadable.size} 个未能打开或读取。`
+    : `Citation check (each source opened and checked by the system before delivery): ${supported} of ${claims.length} cited statements are supported by their sources, ${unverified} are marked unverified${unchecked ? `, ${unchecked} are marked not checked (the check could not be completed for them)` : ""}; ${unreadable.size} of the ${cited.length} cited sources could not be opened or read.`;
   const out = `${lines.join("\n").replace(/\s+$/, "")}\n\n---\n\n${summary}\n`;
-  logger.info({ claims: claims.length, supported, unverified, sources: cited.length, unreadable: unreadable.size }, "cite_check.done");
-  return { text: out, checked: true, claims: claims.length, supported, unverified, sources: cited.length, unreadable: unreadable.size };
+  metrics.onCiteCheckStatements(supported, unverified, unchecked);
+  logger.info({ claims: claims.length, supported, unverified, unchecked, judgeFailures, sources: cited.length, unreadable: unreadable.size }, "cite_check.done");
+  return {
+    text: out, checked: true, claims: claims.length, supported, unverified, sources: cited.length, unreadable: unreadable.size, unchecked, judgeFailures,
+  };
 }
 
 /** Host only, for the logs: an address the model wrote may carry anything in its path or query. */
@@ -291,7 +327,8 @@ function hostOf(url: string): string {
 /** What the model is told about the check, before what the checking tool answered. */
 export function checkNote(r: CiteCheckResult): string {
   return `Citation check before delivery: ${r.supported} of ${r.claims} cited statements are supported by their sources; `
-    + `${r.unverified} were marked unverified in the delivered file and ${r.unreadable} of ${r.sources} cited sources could not be opened or read. `
+    + `${r.unverified} were marked unverified in the delivered file${r.unchecked ? `, ${r.unchecked} were marked not checked (the check could not judge them)` : ""} `
+    + `and ${r.unreadable} of ${r.sources} cited sources could not be opened or read. `
     + "The file delivered is the checked text. Give these numbers in your report; do not present an unverified statement as a finding.";
 }
 

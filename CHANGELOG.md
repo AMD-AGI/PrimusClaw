@@ -122,6 +122,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A research report's citation check no longer marks whole batches unverified when its judge answers nothing: the judge has a
+  4096-token output budget (at 1024 claude-haiku-5.5 spent it thinking and replied empty), a batch with no answer is asked once more,
+  and one still unanswered is marked not checked (未核对), counted apart, logged (`cite_check.judge_no_answer`) and counted in
+  `claw_cite_check_judge_total{outcome}`; every checked statement is counted in `claw_cite_check_statements_total{verdict}`.
 - The brief also leaves out a release-gate fixture whose watch ended before polls kept a pull request's branches (2026-11-08 retest:
   "#381: 2 comments" still listed): each ended watch whose news is from the last 7 days has its branches read once with its owner's
   token, beside the poll pass and never holding it back (`claw_work_item_subscriptions.refs_read_at`, added at api start), claimed across replicas and
