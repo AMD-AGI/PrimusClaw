@@ -17,11 +17,13 @@
 
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import type { ServerResponse } from "node:http";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { SSE_HISTORY_TAIL } from "../src/config.js";
 import { db } from "../src/infra/db.js";
-import { HISTORY_PAGE_ROWS, registerEventRoutes } from "../src/routes/events.js";
+import { drained, HISTORY_PAGE_ROWS, registerEventRoutes } from "../src/routes/events.js";
 import { streamHistoryRows } from "../src/routes/anthropic-managed-agents.js";
 import { latestResults } from "../src/routes/a2a.js";
 import { startHarness, type Harness } from "./scenario-harness.js";
@@ -33,13 +35,18 @@ let h: Harness;
 let app: FastifyInstance;
 /** Rows each statement on claw_session_events handed back, in order. */
 let rowsRead: number[] = [];
+/** Run after each page of history is read (a writer racing the stream). */
+let afterPage: (() => Promise<void>) | undefined;
 
 before(async () => {
   h = await startHarness();
   const harnessQuery = db.query;
   db.query = (async (text: string, params?: unknown[]) => {
     const r = await (harnessQuery as (t: string, p?: unknown[]) => Promise<{ rows: unknown[]; rowCount: number }>)(text, params);
-    if (/FROM claw_session_events/.test(text)) rowsRead.push(r.rows.length);
+    if (/FROM claw_session_events/.test(text)) {
+      rowsRead.push(r.rows.length);
+      if (/LIMIT \$\d+$/.test(text.trim()) && afterPage) await afterPage();
+    }
     return r;
   }) as typeof db.query;
   app = Fastify();
@@ -50,6 +57,7 @@ before(async () => {
 beforeEach(async () => {
   await h.reset();
   rowsRead = [];
+  afterPage = undefined;
   await h.sql("INSERT INTO claw_sessions (session_id, user_id) VALUES ($1, $2)", [SID, OWNER.userId]);
 });
 after(async () => {
@@ -179,23 +187,45 @@ test("an A2A task's artifacts are its latest results, oldest first", async () =>
   assert.deepEqual(rowsRead, [100]);
 });
 
-test("the next page is not read while the client has not taken the last one", async () => {
-  await seed(3 * HISTORY_PAGE_ROWS);
-  // A page larger than the response's buffer, so the client not reading is something the stream can see.
-  await h.sql("UPDATE claw_session_events SET data = data || jsonb_build_object('pad', repeat('x', 400))");
-  rowsRead = [];
-  const res = await app.inject({ method: "GET", url: `/v1/chat/sessions/${SID}/messages?history=all`, payloadAsStream: true });
-  const body = (async () => {
-    let text = "";
-    for await (const chunk of res.stream()) text += chunk.toString();
-    return text;
-  });
-  try {
-    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
-    assert.deepEqual(rowsRead, [HISTORY_PAGE_ROWS], "one page read, then the stream waits for the client");
-  } finally {
-    const text = await body();
-    assert.equal((text.match(/^id: /gm) ?? []).length, 3 * HISTORY_PAGE_ROWS);
-    assert.match(text, /"has_more":false/);
-  }
+test("the next page waits while the client has not taken the last one, and stops when it has gone", async () => {
+  const fake = () => Object.assign(new EventEmitter(), { destroyed: false, writableEnded: false }) as unknown as ServerResponse;
+  assert.equal(await drained(fake(), false), true, "nothing buffered: go on at once");
+
+  const slow = fake();
+  let settled: boolean | undefined;
+  void drained(slow, true).then((ok) => { settled = ok; });
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(settled, undefined, "buffered: wait");
+  slow.emit("drain");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(settled, true);
+
+  const gone = fake();
+  const waiting = drained(gone, true);
+  gone.emit("close");
+  assert.equal(await waiting, false);
+  assert.equal(await drained(Object.assign(fake(), { destroyed: true }), false), false, "a closed response is not written to");
+});
+
+test("events stored while the history is sent do not extend it: they are the live part", async () => {
+  await seed(HISTORY_PAGE_ROWS + 100);
+  let next = HISTORY_PAGE_ROWS + 100;
+  let writes = 5;   // a page more after each page read, five times (an unbounded history would send them all)
+  afterPage = async () => {
+    if (writes-- <= 0) return;
+    const from = next + 1;
+    next += HISTORY_PAGE_ROWS;
+    await seed(next, 0, from);
+  };
+  const s = await stream("?history=all");
+  assert.deepEqual(s.ns, range(1, HISTORY_PAGE_ROWS + 100));
+  assert.equal(s.marker?.count, HISTORY_PAGE_ROWS + 100);
+});
+
+test("events the stream never sends do not take places in the tail", async () => {
+  await seed(SSE_HISTORY_TAIL);
+  await seed(SSE_HISTORY_TAIL + 5, 0, SSE_HISTORY_TAIL + 1, "exec_complete");
+  const s = await stream();
+  assert.deepEqual(s.ns, range(1, SSE_HISTORY_TAIL));
+  assert.equal(s.marker?.has_more, false);
 });

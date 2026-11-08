@@ -235,10 +235,26 @@ function forwardFilterSql(opts: ForwardOpts, params: unknown[]): string | null {
 /** Rows one page of an SSE history reads: what the stream holds in memory at once, however long the history is. */
 export const HISTORY_PAGE_ROWS = 500;
 
-/** Where an SSE history starts: after the row `afterId` (0: from the first), and whether older events were left out. */
+/**
+ * Where an SSE history starts: after the row `afterId` (0: from the first), and whether older events were left out. It
+ * ends at row `upTo`, the newest row when it was asked: what is stored later reaches the client live, so a session
+ * written to faster than its history is sent still gets to its live events.
+ */
 export interface HistoryStart {
   afterId: number;
+  upTo: number;
   hasMore: boolean;
+}
+
+/**
+ * The rows a stream's history can send: the caller's sub-agent filter (`shouldForward`), and an event with a name that is
+ * not skipped (`eventName`), so the tail is counted in events the client is shown. Its parameters are appended to `params`.
+ */
+function shownSql(opts: ForwardOpts, params: unknown[]): string {
+  params.push([...SKIP_EVENTS]);
+  const named = `jsonb_typeof(data->'type') = 'string' AND data->>'type' <> '' AND data->>'type' <> ALL($${params.length}::text[])`;
+  const filter = forwardFilterSql(opts, params);
+  return filter ? `${named} AND ${filter}` : named;
 }
 
 /**
@@ -257,7 +273,8 @@ async function cursorRowId(sessionId: string, after: string): Promise<number | n
   if (!seq) return null;
   const before = (await db.query(
     `SELECT COALESCE(MAX(id), 0) AS id FROM claw_session_events
-      WHERE session_id = $1 AND event_id ~ '^claw-[0-9]{1,15}$' AND substr(event_id, 6)::bigint <= $2::bigint`,
+      WHERE session_id = $1
+        AND (CASE WHEN event_id ~ '^claw-[0-9]{1,15}$' THEN substr(event_id, 6)::bigint END) <= $2::bigint`,
     [sessionId, seq[1]],
   )).rows[0] as { id: number | string } | undefined;
   return Number(before?.id ?? 0);
@@ -271,31 +288,32 @@ async function cursorRowId(sessionId: string, after: string): Promise<number | n
 export async function historyStart(
   sessionId: string, after: string | null, all: boolean, tail: number, opts: ForwardOpts,
 ): Promise<HistoryStart> {
+  const newest = (await db.query(
+    "SELECT COALESCE(MAX(id), 0) AS id FROM claw_session_events WHERE session_id = $1",
+    [sessionId],
+  )).rows[0] as { id: number | string } | undefined;
+  const upTo = Number(newest?.id ?? 0);
   if (after) {
     const afterId = await cursorRowId(sessionId, after);
-    if (afterId !== null) return { afterId, hasMore: false };
+    if (afterId !== null) return { afterId, upTo, hasMore: false };
   }
-  if (all) return { afterId: 0, hasMore: false };
-  const params: unknown[] = [sessionId];
-  const where = ["session_id = $1", "deleted_at IS NULL"];
-  const filter = forwardFilterSql(opts, params);
-  if (filter) where.push(filter);
+  if (all) return { afterId: 0, upTo, hasMore: false };
+  const params: unknown[] = [sessionId, upTo];
+  const where = ["session_id = $1", "deleted_at IS NULL", "id <= $2", shownSql(opts, params)];
   params.push(tail);
   const edge = (await db.query(
     `SELECT id FROM claw_session_events WHERE ${where.join(" AND ")} ORDER BY id DESC OFFSET $${params.length} LIMIT 1`,
     params,
   )).rows[0] as { id: number | string } | undefined;
-  return edge ? { afterId: Number(edge.id), hasMore: true } : { afterId: 0, hasMore: false };
+  return edge ? { afterId: Number(edge.id), upTo, hasMore: true } : { afterId: 0, upTo, hasMore: false };
 }
 
-/** The next page of history after row `afterId`, oldest first, at most HISTORY_PAGE_ROWS rows. */
+/** The next page of history after row `afterId` and up to row `upTo`, oldest first, at most HISTORY_PAGE_ROWS rows. */
 export async function historyPage(
-  sessionId: string, afterId: number, opts: ForwardOpts,
+  sessionId: string, afterId: number, upTo: number, opts: ForwardOpts,
 ): Promise<Array<{ id: number | string; event_id: unknown; data: unknown }>> {
-  const params: unknown[] = [sessionId, afterId];
-  const where = ["session_id = $1", "deleted_at IS NULL", "id > $2"];
-  const filter = forwardFilterSql(opts, params);
-  if (filter) where.push(filter);
+  const params: unknown[] = [sessionId, afterId, upTo];
+  const where = ["session_id = $1", "deleted_at IS NULL", "id > $2", "id <= $3", shownSql(opts, params)];
   params.push(HISTORY_PAGE_ROWS);
   return (await db.query(
     `SELECT id, event_id, event, data FROM claw_session_events WHERE ${where.join(" AND ")} ORDER BY id LIMIT $${params.length}`,
@@ -307,7 +325,7 @@ export async function historyPage(
  * Resolves when `res` can take more (true), or once it is closed (false), so that a slow client is not buffered for:
  * `backlog` is what the last `res.write` said (false: its buffer is full, and `drain` follows once it is not).
  */
-function drained(res: ServerResponse, backlog: boolean): Promise<boolean> {
+export function drained(res: ServerResponse, backlog: boolean): Promise<boolean> {
   if (res.destroyed || res.writableEnded) return Promise.resolve(false);
   if (!backlog) return Promise.resolve(true);
   return new Promise((resolve) => {
@@ -478,12 +496,16 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       // has no `?after=`. Without it the reconnect replays the history again.
       // Without either, only the last SSE_HISTORY_TAIL events are sent (the marker says `has_more`), unless the client
       // asks for `?history=all`: a long session's whole history was read into this process on every connection.
+      // The live consumer is made before the newest row is read (`start.upTo`), so what is stored after that row
+      // arrives live; made lazily after the history, as it was, what was stored while the history was being sent would
+      // be in neither. (An event published just before the consumer began and stored just after the read still is.)
+      await subscription.ready();
       const afterEventId = req.query.after || lastEventIdOf(req.headers["last-event-id"]) || null;
       const start = await historyStart(sessionId, afterEventId, req.query.history === "all", SSE_HISTORY_TAIL, fwdOpts);
       let cursor = start.afterId;
       let sent = 0;
       for (;;) {
-        const rows = await historyPage(sessionId, cursor, fwdOpts);
+        const rows = await historyPage(sessionId, cursor, start.upTo, fwdOpts);
         const page = historyFrames(rows, fwdOpts, seenAppEvents);
         for (const eid of page.seenIds) seenIds.add(eid);
         for (const frame of page.frames) sseWrite(frame);
