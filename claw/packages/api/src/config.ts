@@ -564,6 +564,14 @@ export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
 // The most `say` messages one user's assistant may send in an hour. A guard against a
 // looping assistant, not a quota: a person is not meant to meet it.
 export const CLAW_ASSISTANT_SAY_MAX_PER_HOUR = envInt("CLAW_ASSISTANT_SAY_MAX_PER_HOUR", 120, { min: 1 });
+// The evaluation identities (Claw user ids, comma-separated; no wildcard) whose assistant may say up to
+// CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR messages an hour instead: a nightly evaluation runs one identity through hundreds of
+// cases, about two says each, and at the people's cap it spends most of the night waiting. Still a cap, against a looping run.
+// Empty (the default): nobody, and every user has CLAW_ASSISTANT_SAY_MAX_PER_HOUR.
+export const CLAW_ASSISTANT_SAY_EVAL_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_ASSISTANT_SAY_EVAL_USERS").split(",").map((u) => u.trim()).filter((u) => u && u !== "*"),
+);
+export const CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR = envInt("CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR", 600, { min: 1 });
 
 // --- Assistant (default OFF) ---
 // When false: no assistant tables and no routes, as if the feature did not exist.

@@ -28,6 +28,12 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `CLAW_ASSISTANT_SAY_EVAL_USERS` (Claw user ids, comma-separated, no wildcard; default none) and
+  `CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR` (default 600): the evaluation identities named there have that hourly say cap instead of
+  `CLAW_ASSISTANT_SAY_MAX_PER_HOUR` (120, unchanged for everyone else). `POST /v1/assistant` answers the caller's own cap as
+  `say_max_per_hour`, and the sa-eval runner keeps its pace (`EVAL_SAY_PER_HOUR`) at least 20 under it, so a pace raised for an
+  evaluation identity is safe on a server that does not give it the higher cap (2026-11-08: the 359-case nightly spent about
+  three of its first three and a quarter hours waiting at 100 says an hour, about two says a case).
 - `CLAW_ASSISTANT_STREAM_TEXT` (`on`, default off) and `CLAW_ASSISTANT_STREAM_TEXT_USERS` (Claw user ids, the canary): a router turn's
   own text, outside any tool call, is published as its say's preview while the model writes it (`ExecuteRequest.stream_text_as`,
   `toolTextDelta` with `source: "text"`), so a turn that ends in plain text, which the server says for it once it ends, shows its words

@@ -915,6 +915,20 @@ export function sayWaitMs(says: readonly number[], now: number, perHour: number,
   return recent[Math.min(over, recent.length) - 1]! + HOUR_MS - now + 1_000;
 }
 
+/** Says a run leaves under the server's cap for what it cannot see: today's 100 of the people's 120. */
+export const SERVER_CAP_MARGIN = 20;
+
+/**
+ * The pace a run keeps: EVAL_SAY_PER_HOUR (`configured`; 0 is no pace), but never closer than SERVER_CAP_MARGIN to the cap the
+ * server answered POST /v1/assistant with (`serverCap`, `say_max_per_hour`): an EVAL_SAY_PER_HOUR raised for an evaluation
+ * identity's own cap stays safe against a server that does not give the identity that cap. A server that does not say keeps
+ * `configured`.
+ */
+export function pacedPerHour(configured: number, serverCap: unknown, reserve: number): number {
+  if (configured <= 0 || typeof serverCap !== "number" || !Number.isInteger(serverCap) || serverCap <= 0) return configured;
+  return Math.min(configured, Math.max(reserve + 1, serverCap - SERVER_CAP_MARGIN));
+}
+
 /**
  * The says of the assistant the server refused for its hourly cap since `since`, other than in the turns of the messages in
  * `earlier` (an earlier attempt's, arriving late after a reconnect): an attempt with one is the run's failure.

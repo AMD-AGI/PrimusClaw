@@ -16,7 +16,10 @@
  */
 import { randomUUID } from "node:crypto";
 import pino from "pino";
-import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_SAY_MAX_PER_HOUR, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
+import {
+  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR, CLAW_ASSISTANT_SAY_EVAL_USERS, CLAW_ASSISTANT_SAY_MAX_PER_HOUR,
+  CLAW_NOTIFICATIONS_ENABLED,
+} from "../config.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { publishEvent } from "../events/store.js";
 import { HOLD_SECONDS, heldStatus, turnAnnouncedStart, turnToldStart } from "./say-hold.js";
@@ -105,7 +108,7 @@ export interface SayInput {
 }
 
 export interface SayDeps {
-  /** Overrides `CLAW_ASSISTANT_SAY_MAX_PER_HOUR`. */
+  /** Overrides the user's cap (`sayMaxPerHour`). */
   maxPerHour?: number;
   publishSessionEvent?: (sessionId: string, event: Record<string, unknown>) => Promise<void>;
   kick?: () => Promise<void>;
@@ -577,17 +580,30 @@ async function storeSettled(
 }
 
 /**
+ * The most says `userId`'s assistant may make in an hour: CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR for an evaluation identity named
+ * in CLAW_ASSISTANT_SAY_EVAL_USERS, CLAW_ASSISTANT_SAY_MAX_PER_HOUR for everyone else.
+ */
+export function sayMaxPerHour(
+  userId: string,
+  evalUsers: ReadonlySet<string> = CLAW_ASSISTANT_SAY_EVAL_USERS,
+  evalMax: number = CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR,
+  max: number = CLAW_ASSISTANT_SAY_MAX_PER_HOUR,
+): number {
+  return evalUsers.has(userId) ? evalMax : max;
+}
+
+/**
  * Record a message the assistant chose to say. Throws {@link SayRefused} for an
  * empty or over-long text, for an item that is not this user's or is not named as
  * an item is (`item-ref.ts`), and for a user who
- * has already had `CLAW_ASSISTANT_SAY_MAX_PER_HOUR` messages in the last hour, who
+ * has already had their cap (`sayMaxPerHour`) of messages in the last hour, who
  * is then told so once (`refusedByCap`).
  */
 export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): Promise<SayOutcome> {
   const text = input.text.trim();
   if (!text) throw new SayRefused("empty_text", "a message needs text");
   if (text.length > SAY_TEXT_MAX) throw new SayRefused("text_too_long", `a message is at most ${SAY_TEXT_MAX} characters`);
-  const limit = deps.maxPerHour ?? CLAW_ASSISTANT_SAY_MAX_PER_HOUR;
+  const limit = deps.maxPerHour ?? sayMaxPerHour(input.userId);
 
   // One id for every attempt: what tells, after a failover took the COMMIT's answer, whether the message was stored.
   const sayId = randomUUID();

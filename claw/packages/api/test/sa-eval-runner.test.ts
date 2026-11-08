@@ -131,6 +131,8 @@ class FakeClaw {
   private readonly sessionGets = new Map<string, number>();
   /** Called when the run asks for its assistant session: what the run reads right after is set up relative to that moment. */
   onAssistant: () => void = () => {};
+  /** The caller's hourly say cap POST /v1/assistant answers with (`say_max_per_hour`); undefined: not said, as an older server. */
+  sayMaxPerHour: number | undefined = undefined;
   /** Stored events the stream does not deliver (a stream stalled without dropping): a new stream's history still has them. */
   hidden: (data: Record<string, unknown>) => boolean = () => false;
   /** Stored events no stream ever delivers, not even in a new stream's history. */
@@ -202,7 +204,7 @@ class FakeClaw {
         this.created = true;
       }
       if (!this.sessions.has(this.assistant)) this.sessions.set(this.assistant, { status: "idle", stale: 0 });
-      return send(200, { ok: true, data: { session_id: this.assistant, created: this.created } });
+      return send(200, { ok: true, data: { session_id: this.assistant, created: this.created, ...(this.sayMaxPerHour === undefined ? {} : { say_max_per_hour: this.sayMaxPerHour }) } });
     }
     if ((m = /^\/v1\/work-items\/([^/]+)$/.exec(path)) && method === "GET") {
       if (this.failItemDetail.has(m[1]!)) return send(503, { ok: false });
@@ -526,6 +528,31 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       const kept = readFileSync(join(dir, "says.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l).id);
       assert.ok(kept.includes("say-msg-1"), "the run leaves its own say for the next run");
       assert.ok(!kept.includes("older"), "only the last hour's");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("R4c a pace raised past the server's cap for the identity is kept 20 under that cap", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    claw.sayMaxPerHour = 23;
+    const base = await claw.start();
+    const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    // As R4b: three says of an earlier run that leave the hour 4 s after the run asks for its session. EVAL_SAY_PER_HOUR=550 would
+    // send at once; the server's 23 makes the pace 3, and with the reserve of 1 the case waits for them.
+    let old = 0;
+    claw.onAssistant = () => {
+      old = Date.now() - 3_600_000 + 4_000;
+      writeFileSync(join(dir, "says.jsonl"), [0, 1, 2].map((k) => JSON.stringify({ id: `old-${k}`, at: old + k })).join("\n") + "\n");
+    };
+    claw.router = (_content, id) => claw.turn(id, { say: "There are 3 nodes." });
+    const r = runner(base, [{ id: "t-answer-003", pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: "how many nodes?" }] }],
+      { EVAL_SAY_PER_HOUR: "550", EVAL_SAY_RESERVE: "1" }, dir);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      assert.match(run.out, /say pace: 3 an hour \(EVAL_SAY_PER_HOUR=550; the server's cap for this identity: 23\)/);
+      assert.match(run.out, /say cap: waiting \ds for room \(pace 3 an hour/);
+      assert.ok(claw.sent[0]!.at >= old + 3_600_000, "held under the server's cap, not the configured pace");
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

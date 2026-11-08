@@ -68,7 +68,7 @@ import {
   type Arms,
   apiQuery, caseSays, cardsOf, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
-  assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
+  assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, pacedPerHour, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
   ownSays, SYSTEM_TURN_NOTICES,
   bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
 } from "./e2e/sa-eval-lib.js";
@@ -670,6 +670,12 @@ test("S19 the say cap", () => {
   assert.equal(sayWaitMs(says, says[4]! + H + 1000, 100, 10), 0, "and then it goes");
   assert.equal(sayWaitMs([...at(50, now - 2 * H), ...at(80, now - 60_000)], now, 100, 10), 0, "says older than an hour do not count");
   assert.equal(sayWaitMs(at(500, now - 1000), now, 0, 10), 0, "0 turns pacing off");
+  assert.equal(pacedPerHour(100, undefined, 10), 100, "a server that does not say its cap: the configured pace");
+  assert.equal(pacedPerHour(550, 120, 10), 100, "a raised pace against the people's cap: 20 under it");
+  assert.equal(pacedPerHour(550, 600, 10), 550, "under the evaluation identity's cap: as configured");
+  assert.equal(pacedPerHour(0, 120, 10), 0, "0 stays no pace");
+  assert.equal(pacedPerHour(100, 15, 10), 11, "never at or under the reserve");
+  assert.equal(pacedPerHour(100, "600", 10), 100, "only a whole number counts");
   const live = [ev(1, { type: "AssistantSay", say_id: "a" }), ev(2, { type: "AssistantSay", say_id: "b", fallback: true }), ev(3, { type: "toolUsed" })];
   assert.deepEqual(countedSays(live), [{ id: "a", at: 1 }], "the system's fallback is not counted by the cap");
   assert.deepEqual(countedSaysOf([
