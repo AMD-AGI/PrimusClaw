@@ -44,7 +44,8 @@
  *      graded and timed; without the wait the case had no answer
  *   R14 EVAL_FRESH_SESSION_EVERY: each case in a new assistant session, the one before closed and deleted (seen gone) first; an
  *      assistant session the identity already has is deleted (seen gone) before anything is sent, its says still counted for the
- *      pace, and the first case starts in a new one; one in use refuses the run, nothing deleted
+ *      pace, and the first case starts in a new one; one in use refuses the run, nothing deleted, also when it starts a turn between
+ *      the run's first look and the DELETE (it is looked at once more right before)
  *   R15 EVAL_VARS_CMD is run before each case, so a value read right before it fills its text; one that fails is the run's error for
  *      that case, and nothing of it is sent
  *   R16 EVAL_GAP_S: the next case waits that long after the last one ended
@@ -117,6 +118,9 @@ class FakeClaw {
   loseCreateAnswers = 0;
   private readonly idempotent = new Map<string, unknown>();
   router: (content: string, messageId: string, sessionId: string) => void = () => {};
+  /** Called on every GET of a session, with how many there were of it so far (this one included). */
+  onSessionGet: (sessionId: string, n: number) => void = () => {};
+  private readonly sessionGets = new Map<string, number>();
   /** Called when the run asks for its assistant session: what the run reads right after is set up relative to that moment. */
   onAssistant: () => void = () => {};
   /** Stored events the stream does not deliver (a stream stalled without dropping). */
@@ -201,6 +205,11 @@ class FakeClaw {
       return send(200, { ok: true, data: i });
     }
     if ((m = /^\/v1\/sessions\/([^/]+)$/.exec(path))) {
+      if (method === "GET") {
+        const n = (this.sessionGets.get(m[1]!) ?? 0) + 1;
+        this.sessionGets.set(m[1]!, n);
+        this.onSessionGet(m[1]!, n);
+      }
       const s = this.sessions.get(m[1]!);
       if (method === "GET") {
         return s ? send(200, { ok: true, data: { session_id: m[1], agent_status: s.status, created_at: new Date(s.createdAt ?? Date.now() - 7_200_000).toISOString() } })
@@ -1022,6 +1031,24 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.ok(!other.sessions.has("asst-1") && !other.sessions.has("asst-2"));
       assert.ok(readFileSync(join(r2.dir, "says.jsonl"), "utf8").includes("say-before-the-run"), "its say still counts for the pace");
     } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+
+    // One that starts a turn while the run looks at it (between its first look and the DELETE): the second look, right before the
+    // DELETE, refuses the run; nothing is deleted or sent.
+    const racing = new FakeClaw();
+    const base4 = await racing.start();
+    racing.created = false;
+    racing.sessions.set(racing.assistant, { status: "idle", stale: 0 });
+    racing.onSessionGet = (sid, n) => { if (sid === "asst-1" && n === 1) setImmediate(() => { racing.sessions.get("asst-1")!.status = "running"; }); };
+    const r4 = runner(base4, [answerCase("t-fresh-005")], { EVAL_FRESH_SESSION_EVERY: "1" });
+    const run4 = await r4.done;
+    await racing.stop();
+    try {
+      assert.equal(run4.code, 2, run4.out);
+      assert.match(run4.out, /refusing to run: .*running/);
+      assert.equal(racing.sent.length, 0);
+      assert.deepEqual(racing.calls.filter((c) => c.startsWith("DELETE")), []);
+      assert.ok(racing.sessions.has("asst-1"));
+    } finally { rmSync(r4.dir, { recursive: true, force: true }); }
 
     // One in use is not deleted: refused, nothing sent, nothing deleted.
     const busy = new FakeClaw();

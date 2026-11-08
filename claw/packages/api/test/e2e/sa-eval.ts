@@ -962,6 +962,21 @@ interface AssistantSession {
   unknownSends: number;
 }
 
+/**
+ * An assistant session the run did not make, read now: its stored events, when nobody is using it (no turn running, no event within
+ * EVAL_QUIET_S, not made a moment ago: `assistantInUse`). Otherwise, or when it cannot be read, the run is refused before anything is sent.
+ */
+async function quietOrRefuse(id: string): Promise<{ rows: EventRow[] }> {
+  const s = await api("GET", `/v1/sessions/${id}`);
+  if (s.status !== 200) { console.error(`refusing to run: GET of the assistant session answered ${s.status}`); process.exit(2); }
+  const rows = await replay(id).catch(() => null);
+  if (!rows) { console.error("refusing to run: the assistant session's events could not be read"); process.exit(2); }
+  const lastAt = rows.reduce<number | null>((m, x) => { const t = Date.parse(x.created_at); return Number.isFinite(t) && (m === null || t > m) ? t : m; }, null);
+  const busy = assistantInUse(s.json?.data ?? null, lastAt, Date.now(), QUIET_MS);
+  if (busy) { console.error(`refusing to run: ${busy}; another run or a person is using this identity`); process.exit(2); }
+  return { rows };
+}
+
 /** The counted says of an assistant session the run deleted before it began (EVAL_FRESH_SESSION_EVERY): they still count for the pace. */
 const DELETED_SAYS: SayMark[] = [];
 
@@ -981,17 +996,17 @@ async function openAssistant(first: boolean): Promise<AssistantSession> {
   else {
     // Nobody else may be using it: another run's messages and items would be taken for this one's, and either run's
     // cleanup would close what the other is still grading. Each parallel run needs an identity of its own.
-    const s = await api("GET", `/v1/sessions/${id}`);
-    if (s.status !== 200) { console.error(`refusing to run: GET of the assistant session answered ${s.status}`); process.exit(2); }
-    const rows = await replay(id).catch(() => null);
-    if (!rows) { console.error("refusing to run: the assistant session's events could not be read"); process.exit(2); }
-    const lastAt = rows.reduce<number | null>((m, x) => { const t = Date.parse(x.created_at); return Number.isFinite(t) && (m === null || t > m) ? t : m; }, null);
-    const busy = assistantInUse(s.json?.data ?? null, lastAt, Date.now(), QUIET_MS);
-    if (busy) { console.error(`refusing to run: ${busy}; another run or a person is using this identity`); process.exit(2); }
+    const { rows } = await quietOrRefuse(id);
     if (FRESH_EVERY) {
       // Nobody is using it (above), and the identity is a test one (`identityRefusal`): the first case gets a new conversation as
-      // well, not this one's. Its says of the last hour still count against the cap.
+      // well, not this one's. Its says of the last hour still count against the cap. The API has no delete-if-idle, so it is
+      // looked at once more right before the DELETE: still quiet, and not one event more than at the first look.
       DELETED_SAYS.push(...countedSaysOf(rows));
+      const again = await quietOrRefuse(id);
+      if (again.rows.length !== rows.length) {
+        console.error(`refusing to run: the identity's assistant session ${id} changed while the run looked at it; another run or a person is using this identity`);
+        process.exit(2);
+      }
       if (!(await deleteSessionConfirmed(api, id, Date.now() + 60_000, 5_000))) {
         console.error(`refusing to run: EVAL_FRESH_SESSION_EVERY could not delete the identity's assistant session ${id} (a GET after the DELETE did not answer 404)`);
         process.exit(2);
