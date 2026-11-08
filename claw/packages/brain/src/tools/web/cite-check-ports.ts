@@ -72,8 +72,8 @@ export function webCiteCheckPorts(fetch: WebFetchService | undefined, ctx: WebTo
   if (!fetch || !ctx) return null;
   return {
     fetchPage: (url) => readCitedPage(fetch, url),
-    judge: async ({ url, page, claims, contexts }, signal) => {
-      const { system, user } = judgePrompt(url, page, claims, contexts);
+    judge: async ({ url, page, claims, contexts, sourceCounts }, signal) => {
+      const { system, user } = judgePrompt(url, page, claims, contexts, sourceCounts);
       const model = citeCheckModel();
       const t0 = Date.now();
       const resp = await ctx.anthropic.messages.create(

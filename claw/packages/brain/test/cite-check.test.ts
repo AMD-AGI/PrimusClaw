@@ -30,13 +30,16 @@
  *   CC17 a statement whose line says too little (a table row of numbers) that a judge said no to is marked so and counted apart,
  *        not as unverified; one that is supported stays supported; one no judge looked at (a number with no source, a page that did
  *        not open) stays unverified
+ *   CC18 a table row's cells are separate statements: each read within its own cell, with the row label and the column header,
+ *        and judged only against the sources it cites, never with the other cells; a statement citing several sources is
+ *        supported when any of them supports it, and the judge is told it need support only its own part
  *   CC13 up to 80 sources are checked; a source past that cap, a statement past the statements cap and a batch the budget ran out
  *        before are not checked (未核对), never unverified
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  CITE_CHECK_EXCERPT_CHARS, CITE_CHECK_SECOND_CLAIMS_PER_CALL, CITE_CHECK_SECOND_EXCERPT_CHARS, checkReport, isThin, judgePrompt, pageExcerpt, parseCiteCheck, parseVerdicts, type CheckedPage, type CiteCheckPorts,
+  tableCells, tableHeader, CITE_CHECK_EXCERPT_CHARS, CITE_CHECK_SECOND_CLAIMS_PER_CALL, CITE_CHECK_SECOND_EXCERPT_CHARS, checkReport, isThin, judgePrompt, pageExcerpt, parseCiteCheck, parseVerdicts, type CheckedPage, type CiteCheckPorts,
 } from "../src/tools/cite-check.js";
 import { readCitedPage } from "../src/tools/web/cite-check-ports.js";
 import { ToolRouter } from "../src/tools/router.js";
@@ -479,4 +482,41 @@ test("CC17 a statement that says too little is marked so and counted apart when 
   assert.deepEqual([u.thin, u.unverified, u.unreadable], [0, 2, 1]);
   assert.match(u.text, /\| GPU \| 881（未证实） \|/);
   assert.match(u.text, /\| GPU \| 280（未证实） \|/);
+});
+
+test("CC18 a table row's cells are judged one by one, each against its own sources", async () => {
+  assert.deepEqual(tableCells("| a | b [1] |")?.length, 2);
+  assert.equal(tableCells("not a table"), null);
+  const lines = ["| 指标 | vLLM | SGLang |", "|---|---|---|", "| 当前开放 PR | 881 [1] | 280 [2] |", "| 合计 | 共 1161 个 [1][2] | — |"];
+  assert.deepEqual(tableHeader(lines, 2), ["指标", "vLLM", "SGLang"]);
+  const report = [
+    "# 对比报告：两个推理框架在 MI300X 上的支持情况与性能差异的总结说明",
+    ...lines,
+    "",
+    `[1]: vLLM 页 — ${A}`,
+    `[2]: SGLang 页 — ${B}`,
+  ].join("\n");
+  const pages: Record<string, string> = { [A]: "vLLM has 881 open PRs", [B]: "SGLang has 280 open PRs" };
+  const asked: Array<{ url: string; claims: string[]; contexts?: string[]; sourceCounts?: number[] }> = [];
+  const r = await checkReport(report, {
+    fetchPage: async (u) => ({ ok: true, text: pages[u] }),
+    judge: async (input) => {
+      asked.push(input);
+      // Each page supports exactly the number it states; the total cell is supported by either page alone (its own part).
+      return input.claims.map((c, k) => (input.sourceCounts?.[k] ?? 1) > 1 || input.page.includes(c.match(/(\d{3})$/)?.[1] ?? "\u0000"));
+    },
+  });
+  const onA = asked.find((a) => a.url === A)!;
+  const onB = asked.find((a) => a.url === B)!;
+  assert.deepEqual(onA.claims, ["当前开放 PR — vLLM: 881", "合计 — vLLM: 共 1161 个"], "page 1 is asked only about the cells citing it");
+  assert.deepEqual(onB.claims, ["当前开放 PR — SGLang: 280", "合计 — vLLM: 共 1161 个"]);
+  assert.ok(onA.contexts!.every((c) => !c.includes("280")), "a cell is never read with another cell of its row");
+  assert.deepEqual(onA.sourceCounts, [1, 2]);
+  assert.equal(r.supported, 3);
+  assert.equal(r.unverified, 0);
+  assert.match(r.text, /\| 当前开放 PR \| 881 \[1\] \| 280 \[2\] \|/);
+  assert.match(r.text, /\| 合计 \| 共 1161 个 \[1\]\[2\] \| — \|/, "a statement citing two sources is supported when either supports its part");
+  const { user, system } = judgePrompt(A, "p", onA.claims, onA.contexts, onA.sourceCounts);
+  assert.match(user, /2\. 合计 — vLLM: 共 1161 个\n   \(cites 2 sources; this page need support only its own part\)/);
+  assert.match(system, /may take each of its facts from a different one/);
 });
