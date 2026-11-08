@@ -96,6 +96,8 @@ export class ToolTextThrottle {
   /** Per call, how many of its publishes are started or queued and not yet settled. */
   private readonly inflight = new Map<string, number>();
   private closed = false;
+  /** Ids whose text was taken back (`drop`): nothing more is published for them. */
+  private readonly dropped = new Set<string>();
   /** The attempt failed: what is still queued behind a slow publish is not sent either. */
   private cancelled = false;
   readonly options: StreamTurnOptions;
@@ -109,7 +111,7 @@ export class ToolTextThrottle {
   }
 
   private onText({ id, name, text }: { id: string; name: string; text: string }): void {
-    if (this.closed) return;
+    if (this.closed || this.dropped.has(id)) return;
     const wait = (this.lastAt.get(id) ?? -Infinity) + this.intervalMs - Date.now();
     if (wait <= 0) {
       this.send(id, name, text);
@@ -138,6 +140,20 @@ export class ToolTextThrottle {
     const prev = this.chains.get(id);
     const started = queued && prev ? prev.then(send) : new Promise<void>((resolve) => resolve(send()));
     this.chains.set(id, started.catch(() => {}).finally(() => this.inflight.set(id, (this.inflight.get(id) ?? 1) - 1)));
+  }
+
+  /** A text that is not a tool call's (`StreamTurnOptions.text`), published the same way under `id`. */
+  preview(id: string, name: string, text: string): void {
+    if (!this.dropped.has(id)) this.onText({ id, name, text });
+  }
+
+  /** Publish nothing more under `id`: what is held for it is dropped, a publish already on its way still lands. */
+  drop(id: string): void {
+    this.dropped.add(id);
+    const timer = this.timers.get(id);
+    if (timer) clearTimeout(timer);
+    this.timers.delete(id);
+    this.pending.delete(id);
   }
 
   /** The turn is whole: publish what is pending now, and wait for every publish so far. */
@@ -418,6 +434,15 @@ export interface LoopOptions {
    * The call itself runs as every call does, when the turn is whole; the events only let a reader show its words sooner.
    */
   streamToolText?: readonly string[];
+  /**
+   * `ExecuteRequest.stream_text_as`: the top-level loop's own text (outside any tool call) is published while the model writes it, as
+   * `toolTextDelta` events of this tool (`{tool, actionId, text, source: "text"}`), throttled as a streamed tool's text is. A router turn
+   * that ends in plain text has it said for it by the API (`deliverUnsaidAnswer`), so a channel can show its words as they come, as for
+   * a say. Only until the run's first call of this tool (its own say then streams) and never after a text was taken back: when a tool
+   * call follows the text in the same model turn, the text was not the answer, and a `toolTextVoid` (`{tool, actionId, reason:
+   * "tool_call", source: "text"}`) takes it back.
+   */
+  streamTextAs?: string;
   /**
    * `ExecuteRequest.report_at_turn_cap`: the top-level loop, too, asks its model for a text-only reply when it used its last turn without
    * ending (`reportAtTurnCap`), as a sub-agent's always does. Sub-agents are unaffected (they always do).
@@ -967,6 +992,12 @@ class AgentLoopRunner {
   /** Built on the first approval and kept, so a refused summary model is refused once per run. */
   private summaryComplete?: Completer;
   private readonly depth: number;
+  /** `streamTextAs`: the run's own text may still be shown (no call of that tool yet, and none taken back). */
+  private textPreviewOpen = true;
+  /** The ids of the run's own text on screen (`streamTextAs`): what a void takes back, every block of the model call that wrote them. */
+  private readonly textPreviewShown = new Set<string>();
+  /** Model calls that could show the run's own text, for unique ids across retries and turns. */
+  private textPreviewAttempts = 0;
   /** A sub-agent runs inside the slot its parent holds, so its waits must not
    *  park: that would hand back a slot this loop never acquired. */
   private readonly waitMode: WaitMode;
@@ -2305,10 +2336,55 @@ class AgentLoopRunner {
    */
   private toolTextOptions(): ToolTextThrottle | undefined {
     const names = this.opts.streamToolText;
-    if (this.depth !== 0 || !names?.length) return undefined;
-    return new ToolTextThrottle(new Set(names), TOOL_TEXT_DELTA_INTERVAL_MS, ({ id, name, text }) =>
-      Promise.resolve(this.onEvent({ type: "toolTextDelta", tool: name, actionId: id, text })).catch((err: unknown) =>
-        logger.warn({ err: (err as Error)?.message, sessionId: this.sessionId, tool: name }, "agent-loop.tool_text_delta_failed")));
+    const textAs = this.depth === 0 && this.textPreviewOpen ? this.opts.streamTextAs : undefined;
+    if (this.depth !== 0 || (!names?.length && !textAs)) return undefined;
+    // The ids under which this attempt publishes the model's own text, not a call's (`streamTextAs`).
+    const texts = new Set<string>();
+    const throttle = new ToolTextThrottle(new Set(names ?? []), TOOL_TEXT_DELTA_INTERVAL_MS, ({ id, name, text }) =>
+      Promise.resolve(this.onEvent({ type: "toolTextDelta", tool: name, actionId: id, text, ...(texts.has(id) ? { source: "text" } : {}) }))
+        .catch((err: unknown) =>
+          logger.warn({ err: (err as Error)?.message, sessionId: this.sessionId, tool: name }, "agent-loop.tool_text_delta_failed")));
+    if (textAs) {
+      const attempt = ++this.textPreviewAttempts;
+      throttle.options.text = {
+        onText: ({ index, text }) => {
+          if (!this.textPreviewOpen) return;
+          const id = `text-${attempt}-${index}`;
+          texts.add(id);
+          this.textPreviewShown.add(id);
+          throttle.preview(id, textAs, text);
+        },
+        onToolCall: () => this.voidTextPreview(throttle),
+      };
+    }
+    return throttle;
+  }
+
+  /**
+   * The model's own text shown so far (`streamTextAs`) is not the answer: a tool call follows it. It is taken back once, and nothing more
+   * of the run's own text is shown.
+   */
+  private voidTextPreview(throttle: ToolTextThrottle): void {
+    if (!this.textPreviewOpen) return;
+    if (this.retractTextPreview(throttle, "tool_call")) this.textPreviewOpen = false;
+  }
+
+  /**
+   * Take back every text of the run's own on screen (`toolTextVoid` under each id; a model call can write two text blocks, split by its
+   * thinking), if any: true when there was one. `reason` is why: a tool call followed it (`tool_call`), or the model call that wrote it
+   * failed and is tried again (`retry`). A delta of it already on its way may land after the void: a reader drops a preview's deltas
+   * after its void (`StreamVoided` in the API's `routes/events.ts`), and a channel that took text back shows no more of it.
+   */
+  private retractTextPreview(throttle: ToolTextThrottle, reason: "tool_call" | "retry"): boolean {
+    const tool = this.opts.streamTextAs;
+    if (!this.textPreviewShown.size || !tool) return false;
+    for (const id of this.textPreviewShown) {
+      throttle.drop(id);
+      Promise.resolve(this.onEvent({ type: "toolTextVoid", tool, actionId: id, reason, source: "text" })).catch((err: unknown) =>
+        logger.warn({ err: (err as Error)?.message, sessionId: this.sessionId, tool }, "agent-loop.text_void_failed"));
+    }
+    this.textPreviewShown.clear();
+    return true;
   }
 
   /** One LLM streamTurn call with retry-with-backoff on transient errors. */
@@ -2338,12 +2414,22 @@ class AgentLoopRunner {
         const llmMessages = filterResumeNotices(this.workingMessages);
         toolText = this.toolTextOptions();
         const result = await this.session.streamTurn(llmMessages, this.effectiveTools, this.signal, toolText?.options);
+        const textAs = this.opts.streamTextAs;
+        if (toolText && textAs && this.textPreviewOpen && this.depth === 0) {
+          const calls = result.content.filter((b) => b.type === "tool_use");
+          // A call after the text (a provider that reported none while streaming): the text was not the answer.
+          if (calls.length) this.voidTextPreview(toolText);
+          // The run says something itself: its say streams from now on, not its text.
+          if (calls.some((b) => (b as { name?: string }).name === textAs)) this.textPreviewOpen = false;
+        }
         // The text written since the last delta, before the calls run: without it a text written inside one interval is a single delta.
         await toolText?.flush();
         return result;
       } catch (err: any) {
         // A failed attempt's text is not the turn's: the retry streams it again from the start.
         toolText?.cancel();
+        // What the attempt showed of the run's own text is taken back: the retry shows its own under a new id, or a tool call.
+        if (toolText) this.retractTextPreview(toolText, "retry");
         let code = err?.code as string | undefined;
         const errMsg = err?.message || String(err);
         if (!sanitizedRetryUsed && !this.signal?.aborted && looksLikeToolArgumentsRejection(err)) {

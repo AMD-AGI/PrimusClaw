@@ -42,3 +42,19 @@ test("the void names the turn and the say, and a publish that fails is not the t
   assert.equal(published.length, 1, "no turn named: nothing to take back");
   await voidStreamedSay("s1", "m1", "empty_text", async () => { throw new Error("nats down"); });
 });
+
+test("a take-back of a router turn's own text holds back that text only: the say the turn writes next still streams", () => {
+  const voided = new StreamVoided();
+  const t = "claw-1";
+  const delta = (actionId: string, text: string, source?: string) =>
+    ({ type: "toolTextDelta", tool: "mcp__assistant__say", message_id: t, actionId, text, ...(source ? { source } : {}) });
+  assert.equal(voided.forward(delta("text-1-0", "查一下", "text")), true);
+  assert.equal(voided.forward({ type: "toolTextVoid", tool: "mcp__assistant__say", message_id: t, actionId: "text-1-0", reason: "tool_call", source: "text" }), true);
+  assert.equal(voided.forward(delta("text-1-0", "查一下。", "text")), false, "a late delta of the text taken back");
+  assert.equal(voided.forward(delta("toolu_say", "12 个节点空闲")), true, "the turn's say streams");
+  // A say's own take-back (refused, handed off) still ends every preview of the turn, the turn's text included.
+  assert.equal(voided.forward({ type: "toolTextVoid", tool: "mcp__assistant__say", message_id: t, reason: "handed_off" }), true);
+  assert.equal(voided.forward(delta("toolu_say", "12 个节点空闲。")), false);
+  assert.equal(voided.forward(delta("text-2-0", "x", "text")), false);
+});
+

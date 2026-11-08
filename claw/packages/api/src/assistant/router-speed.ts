@@ -12,7 +12,7 @@
  * is whole; what streams is a preview of it.
  */
 import pino from "pino";
-import { CLAW_ASSISTANT_ROUTER_EFFORT, CLAW_ASSISTANT_STREAM_SAY } from "../config.js";
+import { CLAW_ASSISTANT_ROUTER_EFFORT, CLAW_ASSISTANT_STREAM_SAY, CLAW_ASSISTANT_STREAM_TEXT, CLAW_ASSISTANT_STREAM_TEXT_USERS } from "../config.js";
 import { publishEvent } from "../events/store.js";
 import { TOOL_NAME_PREFIX } from "./prompts.js";
 
@@ -21,13 +21,36 @@ const logger = pino({ name: "assistant-router-speed" });
 /** The router's `say`, as Brain names it: the one tool whose text is streamed. */
 export const STREAMED_SAY_TOOL = `${TOOL_NAME_PREFIX}say`;
 
+/**
+ * Who has a router turn's own text streamed as its say's (`CLAW_ASSISTANT_STREAM_TEXT`, `_USERS`). A turn that answers the person and ends
+ * in plain text is said for it by the server once it has ended (`deliverUnsaidAnswer`, about 0.3 s after the model wrote it); a say is
+ * shown while it is written. Measured 2026-11-08 on the last 24 h: one router turn in ten ended so, and its first reply came at p50 3.5 s
+ * (the system's "on it" line) against 2.9 s for a turn that said. With this on, Brain publishes the text as the say's preview
+ * (`stream_text_as`), and takes it back if a tool call follows it.
+ */
+export interface StreamTextSettings { all: boolean; users: ReadonlySet<string> }
+
+export const streamTextSettings: StreamTextSettings = { all: CLAW_ASSISTANT_STREAM_TEXT, users: CLAW_ASSISTANT_STREAM_TEXT_USERS };
+
+/** Whether this user's router turns have their own text streamed. */
+export function streamTextOn(userId: string | null | undefined, settings: StreamTextSettings = streamTextSettings): boolean {
+  return settings.all || (!!userId && settings.users.has(userId));
+}
+
+/**
+ * `streamText`: the turn answers the person (not a worker's report, whose text is not for them) and the user has it (`streamTextOn`).
+ * The text streams as the say's, so only with the say streamed.
+ */
 export function applyRouterTurnSpeed(
   task: Record<string, unknown>,
   settings: { effort: string | null; streamSay: boolean } = { effort: CLAW_ASSISTANT_ROUTER_EFFORT, streamSay: CLAW_ASSISTANT_STREAM_SAY },
+  streamText = false,
 ): void {
   if (settings.effort && !task.effort) task.effort = settings.effort;
   if (settings.streamSay) task.stream_tool_text = [STREAMED_SAY_TOOL];
   else delete task.stream_tool_text;
+  if (settings.streamSay && streamText) task.stream_text_as = STREAMED_SAY_TOOL;
+  else delete task.stream_text_as;
 }
 
 /**

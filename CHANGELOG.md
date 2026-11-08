@@ -28,6 +28,14 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `CLAW_ASSISTANT_STREAM_TEXT` (`on`, default off) and `CLAW_ASSISTANT_STREAM_TEXT_USERS` (Claw user ids, the canary): a router turn's
+  own text, outside any tool call, is published as its say's preview while the model writes it (`ExecuteRequest.stream_text_as`,
+  `toolTextDelta` with `source: "text"`), so a turn that ends in plain text, which the server says for it once it ends, shows its words
+  as they come, as a say does. A tool call after the text takes it back (`toolTextVoid`, `reason: "tool_call"`); the run's first say
+  ends it. While the text shows, the server's "on it" line is not said over it; a turn whose text is then not said as its answer (it
+  failed, handed a review over, wrote internal text, met the say limit) has it taken back. Only for a turn that answers the person,
+  and only with `CLAW_ASSISTANT_STREAM_SAY` (2026-11-08, last 24 h: one router turn in ten ended in plain text; first reply p50 3.5 s
+  against 2.9 s for a turn that said).
 - The router's turn recall (`CLAW_MEMORY_TURN_RECALL`, no new switch) follows `claw_memory_links` from the entries the message
   matched, two hops at most and both ways (what a matched entry cites, and what cites it), and says how each entry it adds was
   reached (`found because #410 cites it`), so a chain's second and third entries reach the model though they share no word with the

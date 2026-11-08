@@ -76,6 +76,11 @@ export function streamToolText(raw: unknown): string[] | undefined {
   return names.length ? names.slice(0, 8) : undefined;
 }
 
+/** `ExecuteRequest.stream_text_as` as the loop takes it: the tool name, or undefined for none or anything else. */
+export function streamTextAs(raw: unknown): string | undefined {
+  return typeof raw === "string" && raw.trim() !== "" && raw.length <= 200 ? raw.trim() : undefined;
+}
+
 /**
  * Headers for the web-tool Anthropic client.
  *
@@ -667,6 +672,7 @@ export class AgentEngine {
           ...(isReasoningEffort(request.effort) ? { effort: request.effort } : {}),
           ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
           ...(streamToolText(request.stream_tool_text) ? { streamToolText: streamToolText(request.stream_tool_text)! } : {}),
+          ...(streamTextAs(request.stream_text_as) ? { streamTextAs: streamTextAs(request.stream_text_as)! } : {}),
           ...(request.report_at_turn_cap === true ? { reportAtTurnCap: true } : {}),
           parallelTools: readTaintSources(request.read_taint),
           ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),

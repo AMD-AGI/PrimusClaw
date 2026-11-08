@@ -236,3 +236,139 @@ test("a failed attempt's deltas queued behind a slow publish are not sent after 
   await sleep(20);
   assert.deepEqual(delivered, ["A"]);
 });
+
+const sayDeltas = (events: Ev[]) => events.filter((e) => e.type === "toolTextDelta");
+
+test("a router turn's own text is published as its say's text while it is written, when the run asks for it", async () => {
+  const { session: s, seen } = session([
+    {
+      content: [{ type: "text", text: "下个月冻结期从 12 月 4 日（周五）开始。" }],
+      during: async (o) => {
+        o!.text!.onText({ index: 0, text: "下个月冻结期" });
+        o!.text!.onText({ index: 0, text: "下个月冻结期从 12 月 4 日（周五）开始。" });
+      },
+    },
+  ]);
+  const { opts: o, events } = opts({ llmSession: s, streamToolText: [SAY], streamTextAs: SAY });
+  await agentLoop([{ role: "user", content: "下个月 Kestrel 的冻结期从哪天开始？" }], TOOLS, o);
+  assert.ok(seen[0]?.text, "the provider is asked for the text");
+  assert.deepEqual(sayDeltas(events).map((e) => [e.tool, e.actionId, e.text, e.source]), [
+    [SAY, "text-1-0", "下个月冻结期", "text"],
+    [SAY, "text-1-0", "下个月冻结期从 12 月 4 日（周五）开始。", "text"],
+  ]);
+  assert.equal(events.some((e) => e.type === "toolTextVoid"), false);
+});
+
+test("text followed by a tool call is taken back, and the run's later text is not shown", async () => {
+  let voidedMidTurn = false;
+  const { session: s } = session([
+    {
+      content: [{ type: "text", text: "查一下" }, use("toolu_m", "mcp__safe__node_list")],
+      during: async (o) => {
+        o!.text!.onText({ index: 0, text: "查一下" });
+        o!.text!.onToolCall();
+        await sleep(10);
+        // When the call starts, not when the model's turn ends: the words go before the call's arguments are even written.
+        voidedMidTurn = events.some((e) => e.type === "toolTextVoid");
+      },
+    },
+    {
+      content: [{ type: "text", text: "12 个节点空闲。" }],
+      during: async (o) => { o?.text?.onText({ index: 0, text: "12 个节点空闲。" }); },
+    },
+  ]);
+  const { opts: o, events } = opts({ llmSession: s, streamToolText: [SAY], streamTextAs: SAY });
+  await agentLoop([{ role: "user", content: "nodes?" }], TOOLS, o);
+  const voids = events.filter((e) => e.type === "toolTextVoid");
+  assert.equal(voidedMidTurn, true);
+  assert.deepEqual(voids.map((e) => [e.tool, e.actionId, e.reason, e.source]), [[SAY, "text-1-0", "tool_call", "text"]]);
+  assert.deepEqual(sayDeltas(events).map((e) => e.text), ["查一下"], "nothing of the run's text after the void");
+  assert.ok(events.indexOf(voids[0]!) > events.indexOf(sayDeltas(events)[0]!));
+});
+
+test("a tool call the provider did not report while streaming still takes the text back", async () => {
+  const { session: s } = session([
+    {
+      content: [{ type: "text", text: "Checking" }, use("toolu_m", "mcp__safe__node_list")],
+      during: async (o) => { o!.text!.onText({ index: 0, text: "Checking" }); },
+    },
+    { content: [{ type: "text", text: "done" }] },
+  ]);
+  const { opts: o, events } = opts({ llmSession: s, streamToolText: [SAY], streamTextAs: SAY });
+  await agentLoop([{ role: "user", content: "nodes?" }], TOOLS, o);
+  assert.equal(events.filter((e) => e.type === "toolTextVoid").length, 1);
+});
+
+test("once the run says something itself, its text is no longer shown; without the option it never is", async () => {
+  const { session: s, seen } = session([
+    { content: [use("toolu_say", SAY, { text: "12 个节点空闲。" })] },
+    {
+      content: [{ type: "text", text: "已回答。" }],
+      during: async (o) => { o?.text?.onText({ index: 0, text: "已回答。" }); },
+    },
+  ]);
+  const { opts: o, events } = opts({ llmSession: s, streamToolText: [SAY], streamTextAs: SAY });
+  await agentLoop([{ role: "user", content: "nodes?" }], TOOLS, o);
+  assert.equal(seen[1]?.text, undefined, "the turn after the say is not asked for its text");
+  assert.equal(sayDeltas(events).some((e) => e.source === "text"), false);
+  assert.equal(events.some((e) => e.type === "toolTextVoid"), false, "a say with no text before it takes nothing back");
+
+  const off = session([{ content: [{ type: "text", text: "ok" }] }]);
+  const { opts: o2, events: e2 } = opts({ llmSession: off.session, streamToolText: [SAY] });
+  await agentLoop([{ role: "user", content: "hi" }], TOOLS, o2);
+  assert.equal(off.seen[0]?.text, undefined);
+  assert.equal(sayDeltas(e2).length, 0);
+});
+
+test("a sub-agent's text is never the run's to show", async () => {
+  const sub = session([{ content: [{ type: "text", text: "inner" }], during: async (o) => { o?.text?.onText({ index: 0, text: "inner" }); } }]);
+  const { opts: o, events } = opts({ llmSession: sub.session, streamToolText: [SAY], streamTextAs: SAY, depth: 1 } as Partial<LoopOptions>);
+  await agentLoop([{ role: "user", content: "x" }], TOOLS, o);
+  assert.equal(sub.seen[0]?.text, undefined);
+  assert.equal(sayDeltas(events).length, 0);
+});
+
+
+test("text shown by a model call that failed and is tried again is taken back; the retry shows its own", async (t) => {
+  t.mock.method(Math, "random", () => 0); // the shortest backoff the loop draws (2.5 s)
+  let calls = 0;
+  const s: LlmSession = {
+    async streamTurn(_m: Message[], _t: ToolSchema[], _s?: AbortSignal, options?: StreamTurnOptions): Promise<LlmTurnResult> {
+      calls += 1;
+      options!.text!.onText({ index: 0, text: calls === 1 ? "下个月冻" : "下个月冻结期从 12 月 4 日开始。" });
+      if (calls === 1) throw new TypeError("terminated"); // a dropped stream: tried again
+      await sleep(5);
+      return {
+        content: [{ type: "text", text: "下个月冻结期从 12 月 4 日开始。" }], stopReason: "end_turn",
+        usage: { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 }, firstByteMs: 1,
+      };
+    },
+    async complete() { return ""; },
+  };
+  const { opts: o, events } = opts({ llmSession: s, streamToolText: [SAY], streamTextAs: SAY });
+  await agentLoop([{ role: "user", content: "下个月冻结期？" }], TOOLS, o);
+  const shown = events.filter((e) => e.type === "toolTextDelta" || e.type === "toolTextVoid").map((e) => [e.type, e.actionId, e.reason ?? e.text]);
+  assert.deepEqual(shown, [
+    ["toolTextDelta", "text-1-0", "下个月冻"],
+    ["toolTextVoid", "text-1-0", "retry"],
+    ["toolTextDelta", "text-2-0", "下个月冻结期从 12 月 4 日开始。"],
+  ]);
+});
+
+test("every text a model call showed is taken back when a tool call follows, two blocks split by thinking included", async () => {
+  const { session: s } = session([
+    {
+      content: [{ type: "text", text: "先看一下" }, { type: "thinking", thinking: "" } as unknown as LlmContentBlock, { type: "text", text: "再查节点" },
+        use("toolu_m", "mcp__safe__node_list")],
+      during: async (o) => {
+        o!.text!.onText({ index: 0, text: "先看一下" });
+        o!.text!.onText({ index: 2, text: "再查节点" });
+        o!.text!.onToolCall();
+      },
+    },
+    { content: [{ type: "text", text: "done" }] },
+  ]);
+  const { opts: o, events } = opts({ llmSession: s, streamToolText: [SAY], streamTextAs: SAY });
+  await agentLoop([{ role: "user", content: "nodes?" }], TOOLS, o);
+  assert.deepEqual(events.filter((e) => e.type === "toolTextVoid").map((e) => e.actionId).sort(), ["text-1-0", "text-1-2"]);
+});

@@ -237,4 +237,125 @@ describe("assistant lookup ack and silent turns", { skip }, () => {
     assert.equal(task.report_at_turn_cap, true);
     assert.ok(Number(task.max_turns) > 0, "a router turn has a cap to report at");
   });
+
+  test("A8 a turn whose own text is being shown has started to answer: no line over it; once taken back, the line comes", async (t0) => {
+    const t = await turn("下个月 Kestrel 的冻结期从哪天开始？");
+    const realTombstone = { ...w.mod.consumer.tombstoneReader };
+    Object.assign(w.mod.consumer.tombstoneReader, { has: async () => false });
+    t0.after(() => { Object.assign(w.mod.consumer.tombstoneReader, realTombstone); });
+    // From Brain, through the consumer: the deltas are not stored, and the run is marked once.
+    const deliver = async (event: Record<string, unknown>) => {
+      const verdicts: string[] = [];
+      await w.mod.consumer.consumeEventDelivery({
+        subject: `events.${alice.routerSid}`, data: new TextEncoder().encode(JSON.stringify({ ...event, message_id: t.mid, ts: Date.now() })),
+        seq: 9_500 + ++seq, ack: () => { verdicts.push("ack"); }, nak: () => { verdicts.push("nak"); },
+      } as never);
+      assert.deepEqual(verdicts, ["ack"]);
+    };
+    const delta = { type: "toolTextDelta", tool: "mcp__assistant__say", actionId: "text-1-0", text: "下个月冻结期", source: "text" };
+    await deliver(delta);
+    const stored = await w.q("SELECT count(*)::int AS n FROM claw_session_events WHERE session_id = $1", [alice.routerSid]);
+    assert.equal(stored[0].n, 0, "a preview is never stored");
+    assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "writing");
+    assert.equal(await ack.ackFirstReply(alice.routerSid, t.mid, { ...w.sayDeps, enabled: true, users: "alice" }), "writing");
+    // A say's own preview (no source) marks nothing: that is the stored say start's to tell.
+    const other = await turn("还有别的吗");
+    await w.mod.consumer.consumeEventDelivery({
+      subject: `events.${alice.routerSid}`, seq: 9_600,
+      data: new TextEncoder().encode(JSON.stringify({ type: "toolTextDelta", tool: "mcp__assistant__say", actionId: "toolu_1", text: "还", message_id: other.mid })),
+      ack: () => {}, nak: () => {},
+    } as never);
+    const marked = await w.q("SELECT metadata ? 'text_shown' AS marked FROM claw_tasks WHERE task_id = $1", [other.task_id]);
+    assert.equal(marked[0].marked, false);
+    // Taken back (a tool call followed it): the turn has said nothing after all, and a late delta does not mark it again.
+    await deliver({ type: "toolTextVoid", tool: "mcp__assistant__say", actionId: "text-1-0", reason: "tool_call", source: "text" });
+    ack.resetLookupAckCacheForTest();
+    await deliver({ ...delta, text: "下个月冻结期从" });
+    assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "said");
+    assert.deepEqual((await says()).map((r) => r.text), ["收到，我上网查一下。"]);
+    // A note that could not be written says so (the consumer has the event delivered again), and is written on the next try.
+    const third = await turn("再问一个");
+    const broken = async () => { throw new Error("db down"); };
+    assert.equal(await ack.noteTextPreview(alice.routerSid, third.mid, "text-1-0", true, broken as never), false);
+    assert.equal(await ack.noteTextPreview(alice.routerSid, third.mid, "text-1-0", true), true);
+    const noted = await w.q("SELECT metadata->'text_shown' AS v FROM claw_tasks WHERE task_id = $1", [third.task_id]);
+    assert.deepEqual(noted[0].v, ["text-1-0"]);
+  });
+
+  test("A10 a model call that failed takes its text back and the retry shows its own: the turn is writing again (review of #539)", async (t0) => {
+    const t = await turn("下个月 Kestrel 的冻结期从哪天开始？");
+    const realTombstone = { ...w.mod.consumer.tombstoneReader };
+    Object.assign(w.mod.consumer.tombstoneReader, { has: async () => false });
+    t0.after(() => { Object.assign(w.mod.consumer.tombstoneReader, realTombstone); });
+    const deliver = async (event: Record<string, unknown>) => {
+      await w.mod.consumer.consumeEventDelivery({
+        subject: `events.${alice.routerSid}`, data: new TextEncoder().encode(JSON.stringify({ ...event, message_id: t.mid, ts: Date.now() })),
+        seq: 9_700 + ++seq, ack: () => {}, nak: () => { assert.fail("nak"); },
+      } as never);
+    };
+    const delta = (actionId: string, text: string) => ({ type: "toolTextDelta", tool: "mcp__assistant__say", actionId, text, source: "text" });
+    const voidOf = (actionId: string) => ({ type: "toolTextVoid", tool: "mcp__assistant__say", actionId, reason: "retry", source: "text" });
+    const { TEXT_SHOWN_SQL } = await import("../src/assistant/lookup-ack.js");
+    const shown = async (taskId = t.task_id) => (await w.q(`SELECT ${TEXT_SHOWN_SQL} AS v FROM claw_tasks WHERE task_id = $1`, [taskId]))[0].v;
+    await deliver(delta("text-1-0", "下个月冻"));
+    await deliver(voidOf("text-1-0"));
+    assert.equal(await shown(), false);
+    await deliver(delta("text-2-0", "下个月冻结期从 12 月 4 日开始。"));
+    assert.equal(await shown(), true, "the retry's text is on screen");
+    assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "writing", "no line over it");
+    // Late events of the text taken back change nothing: a delta of it marks nothing, its void again leaves the retry's text marked.
+    ack.resetLookupAckCacheForTest();
+    await deliver(delta("text-1-0", "下个月冻结"));
+    await deliver(voidOf("text-1-0"));
+    assert.equal(await shown(), true);
+    assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "writing");
+    // Its own take-back clears it.
+    await deliver({ ...voidOf("text-2-0"), reason: "tool_call" });
+    assert.equal(await shown(), false);
+    assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "said");
+
+    // Processes write in any order (codex round 4 of #539): the retry's delta first, then the failed call's delta, then its void. The
+    // retry's text is still the one on screen.
+    const u = await turn("再问一次冻结期");
+    const at = async (event: Record<string, unknown>) => {
+      await w.mod.consumer.consumeEventDelivery({
+        subject: `events.${alice.routerSid}`, data: new TextEncoder().encode(JSON.stringify({ ...event, message_id: u.mid, ts: Date.now() })),
+        seq: 9_800 + ++seq, ack: () => {}, nak: () => { assert.fail("nak"); },
+      } as never);
+    };
+    await at(delta("text-2-0", "下个月冻结期从 12 月 4 日开始。"));
+    await at(delta("text-1-0", "下个月冻"));
+    await at(voidOf("text-1-0"));
+    assert.equal(await shown(u.task_id), true);
+    // And a void that comes before its own delta still wins over it.
+    await at(voidOf("text-3-0"));
+    await at(delta("text-3-0", "x"));
+    await at({ ...voidOf("text-2-0"), reason: "tool_call" });
+    assert.equal(await shown(u.task_id), false);
+    // Nothing else of the run's metadata is touched.
+    const meta = (await w.q("SELECT metadata FROM claw_tasks WHERE task_id = $1", [u.task_id]))[0].metadata;
+    assert.equal(meta.message_id, u.mid);
+  });
+
+  test("A9 a router turn has its own text streamed only for the people who have it, and only when it answers them", async (t0) => {
+    const speed = await import("../src/assistant/router-speed.js");
+    const saved = { ...speed.streamTextSettings };
+    t0.after(() => { Object.assign(speed.streamTextSettings, saved); });
+    const ask = async (prompt: string) => {
+      const t = await turn(prompt);
+      const task: Record<string, unknown> = { task_id: t.task_id, message_id: t.mid, prompt };
+      await w.mod.role.applySessionRoleToTask(task, alice.routerSid);
+      return task;
+    };
+    Object.assign(speed.streamTextSettings, { all: false, users: new Set(["someone-else"]) });
+    assert.equal((await ask("下个月冻结期从哪天开始？")).stream_text_as, undefined, "not named: as before");
+    Object.assign(speed.streamTextSettings, { all: false, users: new Set(["alice"]) });
+    const task = await ask("下个月冻结期从哪天开始？");
+    assert.equal(task.stream_text_as, "mcp__assistant__say");
+    assert.deepEqual(task.stream_tool_text, ["mcp__assistant__say"]);
+    assert.equal((await ask("[work_event] #1 (item_id: kwi_x) ready v1: done")).stream_text_as, undefined, "a report's text is not the person's");
+    Object.assign(speed.streamTextSettings, { all: true, users: new Set() });
+    assert.equal((await ask("hi")).stream_text_as, "mcp__assistant__say", "on for everyone");
+  });
 });
+

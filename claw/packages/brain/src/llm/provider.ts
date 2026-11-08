@@ -153,6 +153,15 @@ export interface StreamTurnOptions {
     tools: ReadonlySet<string>;
     onText: (call: { id: string; name: string; text: string }) => void;
   };
+  /**
+   * The model's own text, outside any tool call, read as it is written: `onText` is given a text block's index and its text so far each
+   * time more of it arrives (every value a prefix of the final one), and `onToolCall` is called when a tool call starts in the same turn.
+   * The turn is unchanged. A provider that cannot stream text calls nothing.
+   */
+  text?: {
+    onText: (block: { index: number; text: string }) => void;
+    onToolCall: () => void;
+  };
 }
 
 export interface LlmSession {

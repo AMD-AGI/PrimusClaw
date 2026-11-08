@@ -120,3 +120,38 @@ test("a reader that throws does not end the turn", async () => {
   });
   assert.deepEqual((res.content[0] as any).input, { text: "xy" });
 });
+
+/** A stream whose text block arrives in `parts` (`text_delta`), followed by a tool call when `then` names one. */
+function textStream(parts: string[], then?: string) {
+  return {
+    async *[Symbol.asyncIterator]() {
+      yield { type: "message_start", message: { model: "m", usage: { input_tokens: 3 } } };
+      yield { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } };
+      for (const p of parts) yield { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: p } };
+      yield { type: "content_block_stop", index: 0 };
+      if (then) {
+        yield { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_2", name: then, input: {} } };
+        yield { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{}" } };
+        yield { type: "content_block_stop", index: 1 };
+      }
+      yield { type: "message_delta", delta: { stop_reason: then ? "tool_use" : "end_turn" }, usage: { output_tokens: 9 } };
+      yield { type: "message_stop" };
+    },
+  };
+}
+
+test("the model's own text is reported as it grows, and a tool call after it is reported when it starts", async () => {
+  const seen: string[] = [];
+  const { client } = stub(textStream(["Kestrel ", "下月冻结期", "从 12 月 4 日开始。"], "mcp__safe__node_list"));
+  const res = await buildAnthropicSession(client, CLAUDE).streamTurn([{ role: "user", content: "q" }], TOOLS, undefined, {
+    text: { onText: (b) => seen.push(`${b.index}:${b.text}`), onToolCall: () => seen.push("call") },
+  });
+  assert.deepEqual(seen, ["0:Kestrel ", "0:Kestrel 下月冻结期", "0:Kestrel 下月冻结期从 12 月 4 日开始。", "call"]);
+  assert.equal((res.content[0] as any).text, "Kestrel 下月冻结期从 12 月 4 日开始。");
+  // A reader that throws does not end the turn either.
+  const { client: c2 } = stub(textStream(["a", "b"]));
+  const r2 = await buildAnthropicSession(c2, CLAUDE).streamTurn([{ role: "user", content: "q" }], TOOLS, undefined, {
+    text: { onText: () => { throw new Error("reader broke"); }, onToolCall: () => {} },
+  });
+  assert.equal((r2.content[0] as any).text, "ab");
+});

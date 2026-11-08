@@ -506,6 +506,14 @@ export interface ExecuteRequest {
    */
   stream_tool_text?: string[];
   /**
+   * A tool (by full name) under which the top-level loop's own text, outside any tool call, is published while the model writes it: a
+   * `toolTextDelta` event of that tool with `source: "text"`, throttled as `stream_tool_text` is, until the run first calls that tool.
+   * When a tool call follows the text in the same model turn, a `toolTextVoid` (`reason: "tool_call"`, `source: "text"`) takes it back
+   * and no more of the run's text is published. An assistant router's turn that ends in plain text, which the API says for it: a channel
+   * can show its words as they come, as it does for a say. Absent: none.
+   */
+  stream_text_as?: string;
+  /**
    * True: when the top-level loop uses its last allowed turn without ending (`max_turns`), the model is asked once more for a reply in
    * text only, with what it found so far, as a sub-agent always is at its cap. An assistant router's turn, whose plain text reaches the
    * person (the API delivers it as the turn's answer) where a run that ran out of turns would otherwise leave them with nothing.
