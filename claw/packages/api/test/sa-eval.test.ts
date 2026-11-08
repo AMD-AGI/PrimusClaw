@@ -62,12 +62,14 @@ import { fileURLToPath } from "node:url";
 import type { ToolCall } from "./e2e/agent-eval-lib.js";
 import * as readTools from "../src/assistant/read-tools.js";
 import { lookupAckSayId } from "../src/assistant/lookup-ack.js";
+import { silentTurnNotice, turnLostNotice } from "../src/assistant/router-turn-end.js";
 import {
   BUILTIN_TOOLS, CAPABILITY_DENIAL, SELF_INABILITY, fill, oracleMcpTarget, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
   type Arms,
   apiQuery, caseSays, cardsOf, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
   assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
+  ownSays, SYSTEM_TURN_NOTICES,
   bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
 } from "./e2e/sa-eval-lib.js";
 
@@ -982,4 +984,38 @@ test("S30 a turn's reply is not its \"on it\" line", () => {
   assert.equal(turnsAnswered(saysOf([say(3000, m, "收到，我看一下。", { say_id: lookupAckSayId("someone-else", m) })]), [m], user), true);
   // Without the person's id every say of the turn counts.
   assert.equal(turnsAnswered(saysOf([ack]), [m], null), true);
+});
+
+test("S31 said: the turn answered with a message of its own, the router's say or its plain text said for it, never the system's line", () => {
+  const user = "fd1bf0fe08a931e3c14020b85f29abf5";
+  const m = "claw-1794128783366";
+  const ack = say(3534, m, "收到，我查一下。", { say_id: lookupAckSayId(user, m) });
+  // E242 cat-memory-chain-013 (memchain4, 2026-11-08): the router ended in plain text and the server said it in the line's place.
+  const delivered = say(4019, m, "Kestrel 下月冻结期从 12 月 4 日（周五）开始。", { replaces: lookupAckSayId(user, m) });
+  const c: EvalCase = { id: "c", pipeline: "catalog", area: "memory", lang: "zh", turns: [{ user: "下个月 Kestrel 的冻结期从哪天开始？" }], route: "answer", said: true };
+  const observed = (says: LiveEvent[], userId: string | null = user, mode: "assistant" | "baseline" = "assistant"): Observed => ({
+    mode, route: "answer", cards: "none", calls: [], shown: [], final: "x", firstReplyMs: 1, finalMs: 1, replyMs: [1], items: [], factValues: [],
+    ownSays: ownSays(saysOf(says), m, userId),
+  });
+  const check = (o: Observed) => grade(c, o).find((x) => x.name === "said");
+  assert.equal(check(observed([ack, delivered]))?.pass, true, "the plain text the server said for the turn is its answer");
+  assert.equal(check(observed([say(1319, m, "Heron 负责 Kestrel 的值班。")]))?.pass, true, "the router's own say");
+  assert.equal(check(observed([ack]))?.pass, false, "the \"on it\" line alone is no answer");
+  assert.equal(check(observed([say(900, "claw-other", "别的回合")]))?.pass, false, "another turn's say");
+  assert.equal(check(observed([say(900, m, "#7 需要你看一下", { fallback: true })]))?.pass, false, "an item's needs-you message");
+  // The system's notice for a turn that failed, was declined or said nothing, in both languages, as the server words it.
+  const notices = [
+    turnLostNotice(["中文消息"]), turnLostNotice(["an English message"]), turnLostNotice(["中文消息"], "declined"),
+    turnLostNotice(["an English message"], "declined"), silentTurnNotice(["中文消息"]), silentTurnNotice(["an English message"]),
+  ];
+  assert.deepEqual([...SYSTEM_TURN_NOTICES].sort(), notices.map((n) => n!).sort());
+  for (const n of notices) assert.equal(check(observed([ack, say(5000, m, n!)]))?.pass, false, `the system's notice: ${n}`);
+  // Without the person's id the line cannot be told apart: not graded as a pass, and not silently passed.
+  const blind = check(observed([ack, delivered], null));
+  assert.equal(blind?.pass, false);
+  assert.equal(blind?.unverified, true);
+  assert.equal(check(observed([], user, "baseline"))?.skipped, true);
+  // Only a boolean: a case that writes it otherwise is reported, not read as false.
+  assert.deepEqual(parseCases(JSON.stringify({ ...c, said: "yes" })).bad.length, 1);
+  assert.equal(grade({ ...c, said: undefined }, observed([ack])).some((x) => x.name === "said"), false);
 });
