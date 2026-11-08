@@ -211,6 +211,79 @@ describe("state files written off the event loop", () => {
     await sleep(50);
     assert.equal(fs.readFileSync(file, "utf8"), "[2]");
   });
+  test("content equal to what is on disk is not written again; newer content is, and so is the content of a write that failed", async () => {
+    const file = path.join(tmpdir(), "connector.json");
+    const f = new SnapshotFile(file, undefined, true);
+    f.save("a");
+    f.save("a"); // while the first write is under way
+    assert.equal(await f.settled(), true);
+    // A second link to the inode written: a rewrite (a new file renamed over this one) would leave it the only one.
+    const seen = `${file}.seen`;
+    fs.linkSync(file, seen);
+    for (let i = 0; i < 5; i++) f.save("a");
+    assert.equal(await f.settled(), true);
+    assert.equal(fs.statSync(seen).nlink, 2, "the same content is not written again");
+    f.save("b");
+    assert.equal(await f.settled(), true);
+    assert.equal(fs.readFileSync(file, "utf8"), "b");
+    fs.mkdirSync(`${file}.tmp`); // the next write fails
+    f.save("c");
+    assert.equal(await f.settled(500), false);
+    fs.rmdirSync(`${file}.tmp`);
+    f.save("c");
+    assert.equal(await f.settled(), true, "a failed write's content is written by the next save of it");
+    assert.equal(fs.readFileSync(file, "utf8"), "c");
+    f.close();
+  });
+  test("touch() stamps the time of a file that is on disk without writing it, and does not make one that is gone", async () => {
+    const dir = tmpdir();
+    const file = path.join(dir, "connector.json");
+    const f = new SnapshotFile(file, undefined, true);
+    f.touch(); // nothing saved yet: nothing to stamp
+    assert.equal(fs.existsSync(file), false);
+    f.save("a");
+    assert.equal(await f.settled(), true);
+    const seen = `${file}.seen`;
+    fs.linkSync(file, seen);
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    f.touch();
+    const deadline = Date.now() + 5_000;
+    while (Date.now() - fs.statSync(seen).mtimeMs > 60_000 && Date.now() < deadline) await sleep(20);
+    assert.ok(Date.now() - fs.statSync(seen).mtimeMs < 60_000, "stamped now");
+    assert.equal(fs.statSync(seen).nlink, 2, "not written again");
+    fs.rmSync(file);
+    fs.rmSync(seen);
+    f.touch();
+    await sleep(100);
+    assert.equal(fs.existsSync(file), false, "a file that is gone is not made again");
+    f.close();
+  });
+  test("a touch() asked while a write or another stamp is under way is done once that is over, not dropped", async () => {
+    const file = path.join(tmpdir(), "connector.json");
+    const stamps: Array<() => void> = [];
+    const f = new SnapshotFile(file, undefined, true, undefined, () => new Promise<void>((resolve) => { stamps.push(resolve); }));
+    const until = async (what: string, ok: () => boolean) => {
+      const deadline = Date.now() + 5_000;
+      while (!ok() && Date.now() < deadline) await sleep(10);
+      assert.ok(ok(), what);
+    };
+    f.save("a");
+    f.touch(); // the write is under way: its data may be older than this heartbeat
+    assert.equal(stamps.length, 0);
+    assert.equal(await f.settled(), true);
+    await until("stamped once the write is over", () => stamps.length === 1);
+    f.touch(); // that stamp is still under way
+    f.touch();
+    await sleep(50);
+    assert.equal(stamps.length, 1, "one stamp at a time");
+    stamps[0]!();
+    await until("stamped again once the first stamp is over", () => stamps.length === 2);
+    stamps[1]!();
+    await sleep(50);
+    assert.equal(stamps.length, 2, "the two asked meanwhile are one stamp");
+    f.close();
+  });
   test("one failed write of sessions.json.pending does not hold back every later event (written() settles)", async () => {
     const dir = tmp();
     const file = path.join(dir, "sessions.json");

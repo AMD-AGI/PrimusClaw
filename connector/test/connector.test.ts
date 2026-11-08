@@ -26,6 +26,26 @@ const alive = (pid: number) => processStart(pid) !== null;
 const fileExists = (p: string) => fs.existsSync(p);
 
 describe("identity, heartbeat and presence", () => {
+  test("an idle connector's heartbeats do not rewrite connector.json, so they keep no file operation of the process waiting; they still stamp its time", async () => {
+    const h = await make();
+    await h.online();
+    const file = identityFile(h.dirs);
+    await h.claw.until("connector.json to be written", () => fs.existsSync(file));
+    // A second link to the inode written: a rewrite (a new file renamed over this one) would leave it the only one.
+    const seen = `${file}.seen`;
+    fs.linkSync(file, seen);
+    const beats = h.claw.heartbeats.length;
+    await h.claw.until("five more heartbeats", () => h.claw.heartbeats.length >= beats + 5);
+    assert.equal(fs.statSync(seen).nlink, 2, "connector.json was written again with nothing changed");
+    // Its modification time still says when the last heartbeat was: the next run reads it as how long the machine was away.
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    const now = h.claw.heartbeats.length;
+    await h.claw.until("two more heartbeats", () => h.claw.heartbeats.length >= now + 2);
+    await h.claw.until("connector.json's time to be the last heartbeat's", () => Date.now() - fs.statSync(seen).mtimeMs < 60_000);
+    assert.equal(fs.statSync(seen).nlink, 2, "stamped, not written again");
+    fs.unlinkSync(seen);
+  });
   test("registers, sends the agents and a heartbeat that parses with the server's own parser, with the credential and a client label", async () => {
     const h = await make();
     await h.online();

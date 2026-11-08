@@ -818,6 +818,8 @@ export class Connector {
         await this.heartbeat();
         this.authFailures = 0;
         this.writeIdentity();
+        // Its modification time is the last heartbeat (read by the next run), whether or not its content changed.
+        this.identityOut.touch();
       } catch (e) {
         if (this.isRevocation(e)) return void (await this.onRevoked(e));
         this.noteOutage(e);

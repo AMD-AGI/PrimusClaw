@@ -108,18 +108,47 @@ export class SnapshotFile {
 
   /**
    * `durable`: each write is flushed to the disk before it replaces the file ({@link writeWhole}). `access`: how a retry
-   * checks that the directory is still there (the tests hold it pending).
+   * checks that the directory is still there, and `stamp`: how {@link touch} sets the time (the tests hold them pending).
    */
   constructor(
     readonly file: string, private readonly report?: WriteReport, private readonly durable = false,
     private readonly access: (dir: string) => Promise<unknown> = (dir) => fsp.access(dir),
+    private readonly stamp: (file: string, at: Date) => Promise<unknown> = (file, at) => fsp.utimes(file, at, at),
   ) {}
 
+  /**
+   * Content equal to the newest already saved is not written again while that one is on disk or a write under way will put it
+   * there: connector.json is saved after every heartbeat, and rewriting (and, durable, flushing) an unchanged file each time kept
+   * the libuv thread pool busy, so every other file operation of the process (an adapter's start, the session records an event
+   * waits for) queued behind those flushes. After a failed write the same content is written again, as before.
+   */
   save(data: string): void {
+    if (this.saved > 0 && data === this.latest && this.failed < this.saved && (this.written >= this.saved || this.running !== null)) return;
     this.latest = data;
     this.saved += 1;
     this.running ??= this.drain();
   }
+
+  /**
+   * Sets the file's modification time to now without writing it. connector.json's is the last heartbeat a later run reads
+   * (`Connector.run`: how long the machine was away, and a crashed run's last heartbeat), and an unchanged one is no longer
+   * written (`save`). Asked while a write or another stamp is under way, or while saved content is still to be written (a
+   * write's time is when its data was written, which may be before this was asked), it is done once those are over. No flush,
+   * a failure is ignored, and a file that is gone is not made again.
+   */
+  touch(): void {
+    if (this.closed || this.saved === 0) return;
+    if (this.touching || this.running !== null || this.written < this.saved) { this.touchAgain = true; return; }
+    this.touchAgain = false;
+    this.touching = true;
+    this.stamp(this.file, new Date()).catch(() => undefined).finally(() => {
+      this.touching = false;
+      if (this.touchAgain) this.touch();
+    });
+  }
+  private touching = false;
+  /** A {@link touch} asked while it could not be done yet. */
+  private touchAgain = false;
 
   /**
    * Whether everything saved so far is on disk: false when a write failed, or after `ms` (never, for `Infinity`). Asked
@@ -153,7 +182,10 @@ export class SnapshotFile {
     // Saved again while the last write was failing: try once more for the newer content.
     if (this.written < this.saved && this.failed < this.saved) this.running = this.drain();
     else if (this.written < this.saved) this.retryLater();
-    else this.retries = 0;
+    else {
+      this.retries = 0;
+      if (this.touchAgain) this.touch();
+    }
   }
 
   /** No more retries on its own (the connector that owns the file has stopped); `save` and `settled` still write. */
