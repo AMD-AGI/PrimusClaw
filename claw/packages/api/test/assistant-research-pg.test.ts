@@ -40,7 +40,7 @@ describe("research reports on Postgres, opened for alice", { skip: postgresSkipR
         task_id: run.taskId, message_id: run.messageId, cite_check: { tools: ["mcp__assistant__deliver_text"] },
       };
       await w.mod.role.applySessionRoleToTask(task, row.worker_session_id);
-      assert.deepEqual(task.cite_check, on ? { tools: ["mcp__assistant__deliver_text"] } : undefined, `worker ${u.userId}`);
+      assert.deepEqual(task.cite_check, on ? { tools: ["mcp__assistant__deliver_text"], revise: { rounds: 1, unverified_ratio: 0.05 } } : undefined, `worker ${u.userId}`);
       assert.equal(text(task).includes("When the item asks for research or a report with sources"), on, `worker ${u.userId}`);
 
       const router = await w.openRun(u.routerSid);

@@ -10,6 +10,7 @@ import { fitShellSchemas, ToolRouter } from "../tools/router.js";
 import { filterToolSchemas, forgetEarlierReads, parseReadTaint, parseToolAllowlist, readTaintSources } from "../tools/allowlist.js";
 import { parseCite } from "../tools/citations.js";
 import { parseCiteCheck } from "../tools/cite-check.js";
+import { bindCiteRevise, parseCiteRevise } from "../tools/cite-revise.js";
 import { webCiteCheckPorts } from "../tools/web/cite-check-ports.js";
 import { parseLogReads } from "../tools/log-reads.js";
 import { agentLoop, type TurnPool } from "./agent-loop.js";
@@ -512,6 +513,8 @@ export class AgentEngine {
       router.citations = parseCite(request.cite, mergedMcp);
       // `cite_check`: a report a checking tool delivers is checked against its own sources first (`tools/cite-check.ts`).
       router.citeCheck = parseCiteCheck(request.cite_check, webCiteCheckPorts(router.getWebToolServices().webFetch, webToolCtx));
+      // `cite_check.revise`: a report with too much unverified goes back to its writer first, a bounded number of times (`tools/cite-revise.ts`).
+      bindCiteRevise(router.citeCheck, parseCiteRevise(request.cite_check));
       router.logReads = parseLogReads(request.log_reads);
       const allToolSchemas = fitShellSchemas(filterToolSchemas([...router.getToolSchemas(), ...mcpResult.schemas], toolAllowlist));
 
