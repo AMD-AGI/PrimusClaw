@@ -259,6 +259,31 @@ describe("state files written off the event loop", () => {
     assert.equal(fs.existsSync(file), false, "a file that is gone is not made again");
     f.close();
   });
+  test("a touch() asked while a write or another stamp is under way is done once that is over, not dropped", async () => {
+    const file = path.join(tmpdir(), "connector.json");
+    const stamps: Array<() => void> = [];
+    const f = new SnapshotFile(file, undefined, true, undefined, () => new Promise<void>((resolve) => { stamps.push(resolve); }));
+    const until = async (what: string, ok: () => boolean) => {
+      const deadline = Date.now() + 5_000;
+      while (!ok() && Date.now() < deadline) await sleep(10);
+      assert.ok(ok(), what);
+    };
+    f.save("a");
+    f.touch(); // the write is under way: its data may be older than this heartbeat
+    assert.equal(stamps.length, 0);
+    assert.equal(await f.settled(), true);
+    await until("stamped once the write is over", () => stamps.length === 1);
+    f.touch(); // that stamp is still under way
+    f.touch();
+    await sleep(50);
+    assert.equal(stamps.length, 1, "one stamp at a time");
+    stamps[0]!();
+    await until("stamped again once the first stamp is over", () => stamps.length === 2);
+    stamps[1]!();
+    await sleep(50);
+    assert.equal(stamps.length, 2, "the two asked meanwhile are one stamp");
+    f.close();
+  });
   test("one failed write of sessions.json.pending does not hold back every later event (written() settles)", async () => {
     const dir = tmp();
     const file = path.join(dir, "sessions.json");
