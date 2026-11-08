@@ -638,9 +638,24 @@ describe("B lists a turn sees whole", () => {
     respond = (url) => (url.pathname === "/repos/o/r/pulls"
       ? json(Array.from({ length: 100 }, (_, i) => { const k = (Number(url.searchParams.get("page")) - 1) * 100 + i; return pr(5000 - k, { state: "closed", merged_at: "2026-01-01T00:00:00Z", closed_at: t(k), updated_at: t(k) }); }))
       : json({}, 404));
-    const deep = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", per_page: 50, page: 11 })).text);
+    seen = [];
+    const m11 = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", per_page: 50, page: 11 })).text);
+    assert.deepEqual([m11.items.length, m11.next_page], [50, 12], "read on past the scan to the page asked for");
+    assert.equal(seen.length, 6);
+    const deep = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", per_page: 50, page: 50 })).text);
     assert.deepEqual([deep.items.length, deep.next_page ?? null, deep.total_count], [0, null, null]);
-    assert.match(deep.note, /no more can be read page by page: narrow with since or author/);
+    assert.match(deep.note, /pr_list reads no further: for older ones search with issue_search \(is:pr repo:o\/r is:merged\), or narrow with since/);
+    // One person's, sparse: three of 700, two of them past the first 500.
+    const sparse = Array.from({ length: 700 }, (_, i) => pr(1000 - i, { user: { login: [10, 600, 650].includes(i) ? "bob" : "alice" } }));
+    respond = (url) => {
+      if (url.pathname !== "/repos/o/r/pulls") return json({}, 404);
+      const n = Number(url.searchParams.get("page"));
+      return json(sparse.slice((n - 1) * 100, n * 100));
+    };
+    const b1 = JSON.parse((await call(c, "pr_list", { repo: "o/r", author: "bob", per_page: 2 })).text);
+    assert.deepEqual([b1.items.map((p: any) => p.number), b1.next_page, b1.total_count], [[990, 400], 2, null]);
+    const b2 = JSON.parse((await call(c, "pr_list", { repo: "o/r", author: "bob", per_page: 2, page: 2 })).text);
+    assert.deepEqual([b2.items.map((p: any) => p.number), b2.next_page ?? null, b2.total_count], [[350], null, 3]);
   });
 
   test("B22 the list reads still name each item they answer as a source, now from the answer's items", async () => {

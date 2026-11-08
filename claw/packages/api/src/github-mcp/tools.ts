@@ -333,10 +333,12 @@ async function scanPulls(
   let fixtures = 0;
   let read = 0;
   let oldestRead = Infinity;
-  // In creation order a page past the scan is read on to it, so that the items before it are counted with the same filter (a fixture
-  // left out of an earlier page moves every later one): one more than the page needs, to know whether another follows.
-  const pages = ordered ? MAX_SCAN_PAGES : Math.min(MAX_LIST_PAGES, Math.max(MAX_SCAN_PAGES, Math.ceil((want + 1) / 100)));
-  for (let n = 1; n <= pages && !ended && !settled && !windowRead && !(n > MAX_SCAN_PAGES && kept.length > want); n++) {
+  // Past the scan, reading goes on while the page asked for is not yet in hand (or, with since, while the window is not read), with
+  // the same filter throughout, so that the items before it are counted the same way (a fixture left out of an earlier page moves
+  // every later one); and one more than the page needs, to know whether another follows. A list in creation order with no author
+  // filter is read as far as GitHub pages; a filtered or reordered one at most MAX_DEEP_PAGES, past which the note names the search.
+  const limit = !ordered && author === null ? MAX_LIST_PAGES : MAX_DEEP_PAGES;
+  for (let n = 1; n <= limit && !ended && !settled && !windowRead && (n <= MAX_SCAN_PAGES || since !== null || kept.length <= want); n++) {
     const q = { ...filter, state: state === "merged" ? "closed" : state, sort: ordered ? "updated" : "created", direction: "desc", per_page: 100, page: n };
     const list = (await gh.get<any[]>(repoPath(r, "/pulls"), q)).json ?? [];
     read += list.length;
@@ -372,7 +374,10 @@ async function scanPulls(
       ...(known ? [] : [
         `read the ${read} most recently ${ordered ? "updated" : "created"} ${what}pull requests, not all of them: how many there are in all is not known`
           + (ordered && !settled ? `, and older ones may have ${state === "merged" ? "merged" : "closed"} later than some shown` : "")
-          + (all.length <= want ? `; no more can be read page by page: narrow with since${author === null ? " or author" : ""}` : ""),
+          + (all.length <= want
+            ? `; pr_list reads no further: for older ones search with issue_search (is:pr repo:${r.owner}/${r.repo}${state === "all" ? "" : ` is:${state}`}`
+              + `${author !== null ? ` author:${author}` : ""}), or narrow with since`
+            : ""),
       ]),
       ...(fixtures ? [`${fixtures} release-gate fixture pull request(s) of those read are left out (test fixtures, never the project's work); include_fixtures: true lists them`] : []),
     ].join("; ") || undefined,
@@ -542,6 +547,8 @@ const SCOPED_SEARCH_REFUSED = "GitHub answered 422: a search narrowed with repo:
 const MAX_SCAN_PAGES = 5;
 /** How far a list in creation order is read for a page asked past the scan: GitHub's own page limit. */
 const MAX_LIST_PAGES = 100;
+/** How far a list filtered by author, or ordered by when it closed or merged, is read for a page not yet in hand. */
+const MAX_DEEP_PAGES = 20;
 
 /**
  * Release-gate fixtures: pull requests a release gate opens against its own fixture branches (`release-gate-fixture/base`, heads under
