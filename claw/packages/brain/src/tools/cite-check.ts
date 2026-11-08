@@ -292,6 +292,18 @@ export function tableHeader(lines: string[], i: number): string[] | null {
   return null;
 }
 
+/**
+ * The verdicts one run's checks have settled, by source address, statement text and statement context (`verdictKey`): true, the
+ * page supports the statement; false, both looks said it does not. Kept by the run's `CiteCheck` only: a report sent back to its
+ * writer and delivered again (`cite-revise.ts`) is judged only for what changed. Never shared between runs or users.
+ */
+export type VerdictCache = Map<string, boolean>;
+
+/** The key of a verdict: the source's address, the statement's text and its context, as the judge was given them. */
+export function verdictKey(url: string, text: string, context: string): string {
+  return `${url}\u0000${text}\u0000${context}`;
+}
+
 /** Run `work` over `items`, at most `limit` at a time. */
 async function eachLimited<T>(items: T[], limit: number, work: (item: T) => Promise<void>): Promise<void> {
   let next = 0;
@@ -315,7 +327,9 @@ function unchanged(text: string): CiteCheckResult {
  * Check `text` against its sources (see the file's comment) and return the text to deliver with what was found. Never throws for
  * what a page or the judge did: a failure there is a source or a statement that is not supported.
  */
-export async function checkReport(text: string, ports: CiteCheckPorts, parent?: AbortSignal): Promise<CiteCheckResult> {
+export async function checkReport(
+  text: string, ports: CiteCheckPorts, parent?: AbortSignal, verdicts: VerdictCache = new Map(),
+): Promise<CiteCheckResult> {
   const lines = text.split("\n");
   const { sources, claims } = parseReport(lines);
   if (!sources.size || !claims.length) return unchanged(text);
@@ -338,6 +352,12 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
   const pages = new Map<number, string>();
   let judgeFailures = 0;
   let secondLook = 0;
+  // Verdicts this run already settled for a statement on a source (`VerdictCache`): applied as they are, not judged again.
+  const key = (n: number, i: number): string => verdictKey(sources.get(n)!.url, claims[i].text, claims[i].context);
+  const settled = new Set<string>();
+  // The (source, statement) pairs the second look said no to: settled, kept for the run's next check.
+  const secondNo = new Set<string>();
+  let reused = 0;
   const checkedClaims = claims.slice(0, CITE_CHECK_MAX_CLAIMS);
   const allCited = [...new Set(claims.flatMap((c) => c.numbers))].filter((n) => sources.has(n));
   const cited = [...new Set(checkedClaims.flatMap((c) => c.numbers))].filter((n) => sources.has(n)).slice(0, CITE_CHECK_MAX_SOURCES);
@@ -389,7 +409,20 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
   try {
     await eachLimited(cited, CITE_CHECK_CONCURRENCY, async (n) => {
       const source = sources.get(n)!;
-      if (budget.signal.aborted || now() > deadline) { notReached(n); return; }
+      // What an earlier check of this run settled for the same statement on the same page is taken as it was; a source whose
+      // statements are all settled is not read again.
+      const fresh = checkedClaims.map((c, i) => ({ c, i })).filter(({ c, i }) => {
+        if (!c.numbers.includes(n)) return false;
+        const known = verdicts.get(key(n, i));
+        if (known === undefined) return true;
+        reused += 1;
+        settled.add(key(n, i));
+        if (known) supportedBy[i].add(n);
+        else judgedNo[i].add(n);
+        return false;
+      });
+      if (!fresh.length) return;
+      if (budget.signal.aborted || now() > deadline) { fresh.forEach(({ i }) => unjudged[i].add(n)); return; }
       let page: CheckedPage;
       try {
         // The budget ends the wait even when the fetch itself would go on: a page still loading then leaves its statements not checked.
@@ -397,12 +430,12 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
       } catch (err) {
         logger.info({ host: hostOf(source.url), err: err instanceof Error ? err.message : String(err) }, "cite_check.fetch_threw");
         // The budget ran out while the page loaded: nothing is known about the page, so its statements are not checked.
-        if (budget.signal.aborted) { notReached(n); return; }
+        if (budget.signal.aborted) { fresh.forEach(({ i }) => unjudged[i].add(n)); return; }
         page = { ok: false };
       }
       if (!page.ok || !page.text.trim()) { unreadable.add(n); return; }
       pages.set(n, page.text);
-      const mine = checkedClaims.map((c, i) => ({ c, i })).filter(({ c }) => c.numbers.includes(n));
+      const mine = fresh;
       for (let k = 0; k < mine.length; k += CITE_CHECK_CLAIMS_PER_CALL) {
         if (budget.signal.aborted || now() > deadline) {
           mine.slice(k).forEach(({ i }) => unjudged[i].add(n));
@@ -426,7 +459,7 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
     const again = new Map<number, number[]>();
     checkedClaims.forEach((_, i) => {
       if (supportedBy[i].size) return;
-      for (const n of judgedNo[i]) again.set(n, [...(again.get(n) ?? []), i]);
+      for (const n of judgedNo[i]) if (!settled.has(key(n, i)) && pages.has(n)) again.set(n, [...(again.get(n) ?? []), i]);
     });
     await eachLimited([...again.keys()], CITE_CHECK_CONCURRENCY, async (n) => {
       const source = sources.get(n)!;
@@ -442,7 +475,7 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
         // No answer the second time: the first look's no stands.
         if (!verdicts) continue;
         batch.forEach((i, j) => {
-          if (verdicts[j] !== true) return;
+          if (verdicts[j] !== true) { secondNo.add(key(n, i)); return; }
           if (!supportedBy[i].size) secondLook += 1;
           supportedBy[i].add(n);
         });
@@ -452,6 +485,15 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
     clearTimeout(timer);
     parent?.removeEventListener("abort", onParent);
   }
+  // What this check settled, for the run's next check (a report sent back and delivered again): a page that supports a statement,
+  // and a statement both looks said no to. A first look's no alone is not kept: the next check gives it its second look.
+  checkedClaims.forEach((c, i) => {
+    for (const n of c.numbers) {
+      if (!sources.has(n)) continue;
+      if (supportedBy[i].has(n)) verdicts.set(key(n, i), true);
+      else if (secondNo.has(key(n, i))) verdicts.set(key(n, i), false);
+    }
+  });
 
   const zh = isChinese(text);
   const mark = zh ? "（未证实）" : " (unverified)";
@@ -492,7 +534,7 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
     : `Citation check (each source opened and checked by the system before delivery): ${supported} of ${claims.length} cited statements are supported by their sources, ${unverified} are marked unverified${unchecked ? `, ${unchecked} are marked not checked (the check could not be completed for them)` : ""}${thin ? `, ${thin} say too little to be checked (a table row of numbers, say)` : ""}; ${unreadable.size} of the ${allCited.length} cited sources could not be opened or read.`;
   const out = `${lines.join("\n").replace(/\s+$/, "")}\n\n---\n\n${summary}\n`;
   metrics.onCiteCheckStatements(supported, unverified, unchecked, thin);
-  logger.info({ claims: claims.length, supported, unverified, unchecked, thin, secondLook, judgeFailures, sources: allCited.length, checkedSources: cited.length, unreadable: unreadable.size, ms: now() - (deadline - CITE_CHECK_BUDGET_MS) }, "cite_check.done");
+  logger.info({ claims: claims.length, supported, unverified, unchecked, thin, secondLook, reused, judgeFailures, sources: allCited.length, checkedSources: cited.length, unreadable: unreadable.size, ms: now() - (deadline - CITE_CHECK_BUDGET_MS) }, "cite_check.done");
   return {
     text: out, checked: true, claims: claims.length, supported, unverified, sources: allCited.length, unreadable: unreadable.size, unchecked, judgeFailures,
     thin, secondLook,
@@ -515,6 +557,9 @@ export function checkNote(r: CiteCheckResult): string {
 
 /** The run's check: which tools' `text` is checked, and with what. */
 export class CiteCheck {
+  /** This run's settled verdicts (`VerdictCache`); the object lives for one run, its sub-agents sharing it. */
+  readonly verdicts: VerdictCache = new Map();
+
   constructor(private readonly tools: ReadonlySet<string>, readonly ports: CiteCheckPorts) {}
 
   /** Whether a call of `name` has its `text` checked. */
