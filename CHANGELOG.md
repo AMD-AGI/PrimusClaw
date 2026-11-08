@@ -141,6 +141,13 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- `GET /v1/chat/sessions/:id/messages?mode=replay` reads a window of the history instead of all of it when asked: `tail=N` is
+  the last N events, `after=<event_id>&limit=N` at most N events after that one (`after` alone: at most 5000), both oldest first,
+  with `has_more` saying whether events remain beyond the window. Only those rows are read from the table, with the
+  `subagent_id` / `fold_subagents` filters applied in SQL so `tail=N` is N events the caller is shown; N is cut to 5000. `after` is
+  ordered by row, so `claw-9` is followed by `claw-10`. A bad `tail`, `limit` or `after`, or `tail` with `limit`, is a 400.
+  Without any of them the reply is the whole history, as before. A long-lived assistant session had reached 33,196 events
+  (28.6 MB), and each whole read of it cost its reader about 200 MB, which ended a 512 MiB pod.
 - A research report's citation check reads a table row cell by cell: each cited cell is a statement of its own, read with
   its row label and column header and judged only against the sources it cites, never with the other cells of the row. A
   statement citing several sources is supported when any of them supports it, and the judge is told the page need support
