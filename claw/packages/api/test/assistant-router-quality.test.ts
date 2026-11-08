@@ -361,8 +361,10 @@ describe("router quality, the prompt", () => {
       // N13 (2026-11-08 03:12Z on router-v19): brief no longer listed the release-gate fixture #381, and the answer still said
       // "上次提到的 PrimusClaw#381 的 2 条评论这次没有再出现新动态", carried over from an earlier, wrong answer of the conversation.
       ["a question asked again is compared from this turn's lookups", /This turn's lookups are the answer, and the comparison is made from them alone/],
-      ["what this turn does not support is not said again", /Something your earlier answer named that this turn's lookups do not return or support \(a pull request, an item, a comment, a reason\) is not said again, not even to say it has no news or is gone \(上次提到的 #381 这次没有新动态, #381 还是那 2 条评论\): leave it out/],
-      ["a reason for a changed count only from this turn", /say the count now and the count before, and give a reason only when this turn's lookups show it/],
+      ["what this turn does not support is not said again", /Something your earlier answer named that this turn's lookups do not return or support \(a pull request, an item, a comment, a reason\) is not said again, not even to say it has no news or is gone \(上次提到的 #381 这次没有新动态, #381 还是那 2 条评论\): leave it out, unless the user asks about it, and then look it up first/],
+      ["a reason for a changed count only from this turn", /When a count changed, give a reason for the difference only when this turn's lookups show one/],
+      // The devenv section forbids 上次 and still for machines: asked again, they are not compared at all.
+      ["machines are never compared", /Machines and the sessions on them are not compared at all: say them from this turn's read alone, never with 上次 or still\./],
       ["no number without its title", /never by its number alone: say refuses "#6、#8" without the titles/],
       // router-v18 (2026-11-06 nightly: cat-items-ro-003 answered from the list, cat-settings-wr-002 made a scheduled task).
       ["a worker's report is read with work_recall", /What a worker reported, found or answered on an item[^\n]*work_recall\(item, "reports"\) for that item[^\n]*never from its line in the list alone/],

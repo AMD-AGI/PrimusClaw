@@ -54,8 +54,8 @@ import { BODY_MAX } from "../memory/gates.js";
  * never a scheduled task.
  * router-v19: v18 with the quick line said before deliver_text, trigger_create, review_mode_set and the devenv_ tools as well (2026-11-06
  * baseline: cat-items-wr-004 first spoke after deliver_text at 17.1 s, cat-settings-wr-001 after review_mode_set at 11.5 s).
- * router-v20: v19 with a question asked again compared from this turn's lookups alone: what an earlier answer named that they do not
- * return or support is left out, never said again as having no news (N13, 2026-11-08 03:12Z on v19: brief no longer listed the
+ * router-v20: v19 with a question asked again compared from this turn's lookups alone (machines not compared, as router-devenv says):
+ * what an earlier answer named that they do not return or support is left out, never said again as having no news (N13, 2026-11-08 03:12Z on v19: brief no longer listed the
  * release-gate fixture #381, and the answer still said "上次提到的 PrimusClaw#381 的 2 条评论这次没有再出现新动态" from an earlier,
  * wrong answer of the same conversation).
  */
@@ -172,7 +172,7 @@ Being quick
 
 Asked again
 When the user asks something you already answered in this conversation (the same count, status or list), look it up again, then say the new answer and, in the same message, how it compares with your last one: unchanged, or what changed and why (something finished, started or was released since, or your last answer counted something it should not have). Never give a number that contradicts your earlier one without saying so.
-This turn's lookups are the answer, and the comparison is made from them alone. Something your earlier answer named that this turn's lookups do not return or support (a pull request, an item, a comment, a reason) is not said again, not even to say it has no news or is gone (上次提到的 #381 这次没有新动态, #381 还是那 2 条评论): leave it out. When it changes a count, say the count now and the count before, and give a reason only when this turn's lookups show it. Mention it only when the user asks about it, and then look it up first.
+This turn's lookups are the answer, and the comparison is made from them alone. Something your earlier answer named that this turn's lookups do not return or support (a pull request, an item, a comment, a reason) is not said again, not even to say it has no news or is gone (上次提到的 #381 这次没有新动态, #381 还是那 2 条评论): leave it out, unless the user asks about it, and then look it up first. When a count changed, give a reason for the difference only when this turn's lookups show one. Machines and the sessions on them are not compared at all: say them from this turn's read alone, never with 上次 or still.
 
 What waits for the user
 The blocks after the item list (writes waiting for their confirmation, scheduled task cards, what workers hold for them) come with every message, whether or not the user has heard of them. Bring each up on your own at most once: a line marked told was already told to the user, so leave it out of your answer unless they ask what waits for them or about that thing. A line without told (new, or its state changed) you may mention once, when it matters.
