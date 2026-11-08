@@ -876,7 +876,7 @@ export async function pollSubscription(sub: Subscription): Promise<{ stored: num
   }
   // Best effort: the branches only tell the brief what to leave out, and a failure to keep them never holds back the events read.
   if (read.refs && (read.refs.head !== null || read.refs.base !== null)) {
-    await db.query("UPDATE claw_work_item_subscriptions SET head_ref = $2, base_ref = $3 WHERE id = $1", [sub.id, read.refs.head, read.refs.base])
+    await db.query("UPDATE claw_work_item_subscriptions SET head_ref = $2, base_ref = $3, refs_read_at = NOW() WHERE id = $1", [sub.id, read.refs.head, read.refs.base])
       .catch((err) => logger.warn({ subId: sub.id, err: (err as Error)?.message }, "github_events.refs_not_kept"));
   }
   return storeEvents(sub, read);
@@ -1053,7 +1053,58 @@ export async function deliverPendingEvents(): Promise<number> {
  * the same pull request at once), read them, then deliver whatever is stored and not yet delivered, including what an earlier turn
  * could not.
  */
+/** How many watches one backfill pass reads the branches of. */
+const REFS_BACKFILL_BATCH = 20;
+
+/**
+ * The branches of watches that no poll will read any more (ended before polls kept them, #511; an active one's own poll keeps them) and whose news a weekly brief still
+ * shows: read once each, with their owner's token, so the brief can tell a release-gate fixture (`brief.ts`). A watch is claimed by
+ * setting `refs_read_at` before it is read, across replicas, and never claimed again, read or not: after the first passes
+ * following a release there is nothing left to claim, and no GitHub call is made. The subscription holds no title to tell one by.
+ */
+export async function backfillSubscriptionRefs(batch: number = REFS_BACKFILL_BATCH): Promise<number> {
+  const claimed = (await db.query(
+    `UPDATE claw_work_item_subscriptions s SET refs_read_at = NOW()
+      WHERE s.id IN (
+        SELECT id FROM claw_work_item_subscriptions c
+         WHERE c.state <> 'active' AND c.refs_read_at IS NULL AND c.head_ref IS NULL AND c.base_ref IS NULL
+           AND EXISTS (SELECT 1 FROM claw_work_item_github_events e WHERE e.sub_id = c.id AND e.created_at > NOW() - INTERVAL '7 days')
+         ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED)
+      RETURNING s.id, s.user_id, s.owner, s.repo, s.number`,
+    [batch],
+  )).rows as Array<{ id: string | number; user_id: string; owner: string; repo: string; number: number }>;
+  let read = 0;
+  for (const s of claimed) {
+    try {
+      const token = await githubEventPorts.loadToken(s.user_id, PURPOSE.poll);
+      if (!token) continue;
+      const pr = (await watchedGithub(token).gh.get<any>(repoPath({ owner: s.owner, repo: s.repo }, `/pulls/${Number(s.number)}`))).json ?? {};
+      const ref = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+      await db.query("UPDATE claw_work_item_subscriptions SET head_ref = $2, base_ref = $3 WHERE id = $1", [s.id, ref(pr?.head?.ref), ref(pr?.base?.ref)]);
+      read += 1;
+    } catch (err) {
+      logger.warn({ subId: s.id, err: (err as Error)?.message }, "github_events.refs_backfill_failed");
+    }
+  }
+  return read;
+}
+
+/** This process's backfill pass, while one runs: started beside a poll pass, never awaited by it. */
+let backfilling: Promise<void> | null = null;
+
+/** Settles when this process has no backfill pass running (for tests, and a clean shutdown). */
+export function refsBackfillIdle(): Promise<void> {
+  return backfilling ?? Promise.resolve();
+}
+
 export async function pollDueSubscriptions(intervalSec: number = CLAW_ASSISTANT_GITHUB_POLL_SEC): Promise<{ polled: number; stored: number; delivered: number }> {
+  // Beside the pass, not before it: its reads of ended watches (up to 20, each up to GitHub's timeout) never hold back the polling and
+  // delivery of active ones. One at a time per process.
+  if (!backfilling) {
+    backfilling = backfillSubscriptionRefs()
+      .then(() => undefined, (err) => logger.warn({ err: (err as Error)?.message }, "github_events.refs_backfill_failed"))
+      .finally(() => { backfilling = null; });
+  }
   const due = (await db.query(
     `UPDATE claw_work_item_subscriptions s SET polled_at = NOW()
       WHERE s.id IN (
