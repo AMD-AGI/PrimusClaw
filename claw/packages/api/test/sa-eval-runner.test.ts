@@ -64,7 +64,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fstatSync, mkdtempSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -765,13 +765,18 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.deepEqual(judged("t-m-003").judge, { pass: false, why: "FAIL: the count is wrong" });
       // The recording, in a directory made private, keeps the whole answers and every judge answer.
       assert.equal(statSync(records).mode & 0o777, 0o700);
-      const file = join(records, "assistant-recordings.jsonl");
-      assert.equal(statSync(file).mode & 0o777, 0o600);
-      const recs = readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      // One open file: its mode and its text are of the same file.
+      const fd = openSync(join(records, "assistant-recordings.jsonl"), "r");
+      let text: string;
+      try {
+        assert.equal(fstatSync(fd).mode & 0o777, 0o600);
+        text = readFileSync(fd, "utf8");
+      } finally { closeSync(fd); }
+      const recs = text.trim().split("\n").map((l) => JSON.parse(l));
       const rec = recs.find((x) => x.case_id === "t-m-001");
       assert.equal(rec.observed.final, "The latest ROCm is 10.1.0.");
       assert.deepEqual(rec.judge, { pass: true, answers: ["FAIL: ROCm 10.1.0 does not exist", "PASS: states 10.1.0", "PASS: the version read for the run"] });
-      assert.doesNotMatch(readFileSync(file, "utf8"), /test-key-not-a-secret|judge-key-not-a-secret/);
+      assert.doesNotMatch(text, /test-key-not-a-secret|judge-key-not-a-secret/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
 
     // A recording directory others can read: refused before anything is sent.
