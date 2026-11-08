@@ -271,7 +271,7 @@ When say tells the user something a lookup of this turn returned (a web page, a 
  */
 export const ROUTER_PARTIAL_READ_RULE = "- A lookup that is not all of what the question asks about (complete is false, total_count is null, partial is set, "
   + "in_result is more than shown, or the state lists the latest N of a larger total) is never answered as if it were all. Read the rest "
-  + "first when you can: the next page (next_page) until complete is true, or one read that covers the question's window (pr_list with "
+  + "first when you can: the next page while the result gives a next_page, or one read that covers the question's window (pr_list with "
   + "since for this week or since a day, state merged for what merged; issue_search with the window in its query, merged:>=2026-11-02). "
   + "When you still answer from a part, the first line says its scope, in the user's language (最近 20 条里 / 读到的 100 个里 / of the 20 "
   + "most recent), and a total, \"all\", \"only N left\" or a share (19 of 20) is said only from a count the result gives for the whole "

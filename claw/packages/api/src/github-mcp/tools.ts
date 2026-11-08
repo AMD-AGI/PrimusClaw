@@ -234,6 +234,8 @@ export function listAnswer(
   meta: {
     total_count?: number | null; complete: boolean; next_page?: number | null; note?: string; by_repo?: Record<string, number>;
     refs_by_repo?: Record<string, string[]>; since?: string; fixtures_excluded?: number | string;
+    /** The page of the list these items are (1 for the first); false `count_exact` when total_count may be low (a search that timed out). */
+    page?: number; count_exact?: boolean;
   },
 ): Record<string, unknown> {
   const head = {
@@ -256,7 +258,11 @@ export function listAnswer(
   const complete = meta.complete && !cutBySize;
   return {
     ...head, shown: kept.length, complete,
-    ...(complete ? {} : { partial: partialLine(kept.length, meta.total_count ?? null) }),
+    ...(complete ? {} : {
+      partial: partialLine(kept.length, meta.total_count ?? null, {
+        page: meta.page ?? 1, more: cutBySize || Boolean(meta.next_page), exact: meta.count_exact !== false,
+      }),
+    }),
     ...(cutBySize ? { not_shown: items.length - kept.length, cut: "the answer holds no more: ask for fewer per page, or narrow the query" } : {}),
     ...(!complete && !cutBySize && meta.next_page ? { next_page: meta.next_page } : {}),
     items: kept,
@@ -268,14 +274,20 @@ export function listAnswer(
  * answered "17 merged in the last 11 hours" and "only 3 open" (2026-11-07 06:09, the owner's 研发进度): the router had complete: false
  * and a note, and counted the page. So the answer names its own scope, and what to do before a count.
  */
-export function partialLine(shown: number, total: number | null): string {
-  return `items holds ${shown} of ${total === null ? "an unknown number of" : total} matches, not all of them. Before you give a count, `
-    + "a total or \"all\"/\"only N\", read next_page until complete is true (or narrow: since, state, author, a repository); if you "
-    + `answer from these alone, say in the answer that it covers only these ${shown} (最近 ${shown} 条里 / of the ${shown} most recent)`
-    + (total === null ? "" : `, and give ${total} as the total`);
+export function partialLine(shown: number, total: number | null, at: { page?: number; more?: boolean; exact?: boolean } = {}): string {
+  const page = at.page ?? 1;
+  const these = page === 1 ? `the ${shown} most recent (最近 ${shown} 条里)` : `page ${page}, ${shown} of them (第 ${page} 页)`;
+  const where = `items holds ${these}, not all the matches`;
+  const rest = at.more ? "; to list the others, read next_page while there is one" : "";
+  if (total !== null && at.exact !== false) {
+    return `${where}. total_count ${total} counts all of them: give that as the total, never a count of items${rest}.`;
+  }
+  return `${where}, and ${total === null ? "how many there are in all is not known" : `total_count ${total} may be low`}. Before you give a `
+    + "count, a total or \"all\"/\"only N\", read next_page while there is one (or narrow: since, state, author, a repository); if "
+    + `you answer from these alone, say in the answer that it covers only these: ${these}.`;
 }
 /** Room the envelope keeps for `partialLine`. */
-const PARTIAL_ROOM = 420;
+const PARTIAL_ROOM = 460;
 
 /**
  * One page of a list GitHub pages itself (`per_page`, `page`): a page shorter than asked is the list's end, which gives the
@@ -287,6 +299,7 @@ export function pageAnswer(items: readonly unknown[], perPage: number, page: num
     total_count: ended ? (page - 1) * perPage + items.length : null,
     complete: ended && page === 1,
     next_page: ended ? null : page + 1,
+    page,
   });
 }
 
@@ -342,17 +355,31 @@ async function scanPulls(
   }
   const known = ended || windowRead;
   const all = ordered ? [...kept].sort(latestFirst) : kept;
+  // Past what the scan reads, a list in GitHub's own order (newest first, no author or window) is read at GitHub's page, as before
+  // the scan: its fixtures are left out of that page, and the count is not known.
+  if (!known && !ordered && author === null && since === null && all.length < want) {
+    const list = (await gh.get<any[]>(repoPath(r, "/pulls"), { ...filter, state, sort: "created", direction: "desc", per_page: perPage, page })).json ?? [];
+    const shown = includeFixtures ? list : list.filter((p) => !isGateFixture(p));
+    return listAnswer(shown.map(prLine), {
+      total_count: null, complete: false, next_page: list.length < perPage ? null : page + 1, page,
+      ...(list.length - shown.length ? { fixtures_excluded: list.length - shown.length } : {}),
+      note: `this page is GitHub's page ${page} of ${perPage}: past the first ${MAX_SCAN_PAGES * 100} the count is not known`,
+    });
+  }
   const what = state === "all" ? "" : `${state === "merged" ? "closed" : state} `;
   return listAnswer(all.slice((page - 1) * perPage, want).map(prLine), {
     total_count: known ? all.length : null,
     complete: known && page === 1 && all.length <= perPage,
-    next_page: !known || all.length > want ? page + 1 : null,
+    // A next page only where there is one to give: past what the scan read, a page would come back empty and name the one after it.
+    next_page: all.length > want || (!known && settled) ? page + 1 : null,
+    page,
     ...(opts.sinceText ? { since: opts.sinceText } : {}),
     ...(fixtures ? { fixtures_excluded: fixtures } : {}),
     note: [
       ...(known ? [] : [
         `read the ${read} most recently ${ordered ? "updated" : "created"} ${what}pull requests, not all of them: how many there are in all is not known`
-          + (ordered && !settled ? `, and older ones may have ${state === "merged" ? "merged" : "closed"} later than some shown` : ""),
+          + (ordered && !settled ? `, and older ones may have ${state === "merged" ? "merged" : "closed"} later than some shown` : "")
+          + (!settled && all.length <= want ? `; no more can be read page by page: narrow with since${author === null ? " or author" : ""}` : ""),
       ]),
       ...(fixtures ? [`${fixtures} release-gate fixture pull request(s) of those read are left out (test fixtures, never the project's work); include_fixtures: true lists them`] : []),
     ].join("; ") || undefined,
@@ -363,7 +390,11 @@ async function scanPulls(
 function sinceOf(text: string | undefined): number | null {
   if (text === undefined || text.trim() === "") return null;
   const t = text.trim();
-  const ms = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?)?$/.test(t) ? Date.parse(/T/.test(t) && !/(Z|[+-]\d{2}:\d{2})$/.test(t) ? `${t}Z` : t) : NaN;
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})?)?$/.exec(t);
+  // Each field in its range, the day in its month: Date.parse would move 2026-02-30 to March 2 and count another window.
+  const [y, mo, d, h, mi, sec] = m ? [1, 2, 3, 4, 5, 6].map((i) => Number(m[i] ?? 0)) : [];
+  const valid = m !== null && mo >= 1 && mo <= 12 && d >= 1 && d <= new Date(Date.UTC(y, mo, 0)).getUTCDate() && h <= 23 && mi <= 59 && sec <= 59;
+  const ms = valid ? Date.parse(m[4] !== undefined && m[7] === undefined ? `${t}Z` : t) : NaN;
   if (!Number.isFinite(ms)) throw new BadInput("since must be an ISO date or time, such as 2026-11-02 or 2026-11-02T00:00:00Z");
   return ms;
 }
@@ -818,6 +849,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
       total_count: total,
       complete: page === 1 && total !== null && items.length >= total && !incomplete,
       next_page: total !== null && seen < total && items.length === perPage ? page + 1 : null,
+      page, count_exact: !incomplete,
       ...(byRepo ? { by_repo: byRepo } : {}),
       refs_by_repo: refsByRepo(items, byRepo),
       ...(query !== a.query ? { fixtures_excluded: `release-gate fixture pull requests (base ${FIXTURE_BASE}) are left out of the search and its counts; include_fixtures: true counts them` } : {}),

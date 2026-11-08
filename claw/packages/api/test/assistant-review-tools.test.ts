@@ -1678,7 +1678,7 @@ describe("assistant review tools", { skip }, () => {
     const listed = await rp.askedOfOthersManifest(alice.userId);
     assert.equal(listed.length, 20, "the list stays the latest 20");
     const items = prompts.renderRouterItems([], listed, new Date(), totals);
-    assert.match(items, new RegExp(`${prompts.ASKED_OF_OTHERS_HEADER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\nIn all: 25 in all, open ones and ones closed in the last day: 3 open, 22 closed, of the closed 18 merged and 4 with changes requested\. Only the 20 most recently updated are listed below\.`));
+    assert.ok(items.includes(`${prompts.ASKED_OF_OTHERS_HEADER}\nIn all: 25 in all, open ones and ones closed in the last day: 3 open, 22 closed, of the closed 18 merged and 4 with changes requested. Only the 20 most recently updated are listed below.`), items);
     assert.match(items, /never from counting the lines below, and a list of them says it is the latest 20 of 25\./);
     assert.match(prompts.formatAskedOfOthersTotals(3, { total: 3, open: 1, closed: 2, merged: 2, changes_requested: 0 }), /Every one of them is listed below\.$/);
   });

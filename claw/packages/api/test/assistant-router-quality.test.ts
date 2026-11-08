@@ -332,7 +332,7 @@ describe("router quality, the prompt", () => {
       // N8 (2026-11-07): 研发进度 answered "17 merged, only 3 open" from 20 of the merged pull requests (complete: false) with a
       // release-gate fixture among the open ones.
       ["a part is never answered as all", /A lookup that is not all of what the question asks about \(complete is false, total_count is null, partial is set, in_result is more than shown, or the state lists the latest N of a larger total\) is never answered as if it were all/],
-      ["read the rest or a window first", /the next page \(next_page\) until complete is true, or one read that covers the question's window \(pr_list with since/],
+      ["read the rest or a window first", /the next page while the result gives a next_page, or one read that covers the question's window \(pr_list with since/],
       ["the scope in the first line", /When you still answer from a part, the first line says its scope, in the user's language \(最近 20 条里/],
       ["totals only from a whole count", /a total, "all", "only N left" or a share \(19 of 20\) is said only from a count the result gives for the whole/],
       ["a fixture is nobody's work", /A release-gate fixture pull request \(left out by default: fixtures_excluded\) is never counted as anyone's work/],
