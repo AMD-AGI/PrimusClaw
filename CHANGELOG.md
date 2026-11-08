@@ -155,6 +155,11 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- `channel_context.via` on a message to the person's assistant: `on_behalf` (the only value kept; anything else is dropped) says the
+  channel posted the message into the person's own chat for them (Clawy's on-behalf endpoint, their coordinator's review request)
+  rather than their typing it. It is stored with the message (`claw_assistant_messages.channel_context`) so that what counts the
+  person's own messages can count these apart, and it widens nothing a turn may do (2026-11-08: Clawy's daily failure mining counted
+  52 "real user messages" in a day, all of them such requests).
 - A session's event stream opened without a cursor on a session longer than `SSE_HISTORY_TAIL` events sends `historyComplete`
   and its live events again. The tail is a whole number of pages; after the last one the empty page that follows wrote
   nothing, and the stream waited for a `drain` the earlier write had already had, so it stayed silent but for keepalives.

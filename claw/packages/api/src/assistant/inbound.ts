@@ -104,8 +104,19 @@ function parseAttached(raw: unknown): ChannelAttached | null | undefined {
   };
 }
 
+/**
+ * How the message reached the chat it came from, when not typed there by the person (`channel_context.via`). `on_behalf`: the channel
+ * posted it into the person's own chat for them (Clawy's `POST /primus-claw-agent/on-behalf`, their coordinator's review request) and
+ * then handed it on as typed. Stored with the message so that what counts the person's own messages (Clawy's daily failure mining) can
+ * count these apart. A label the channel gives, kept to this closed set: it is read for counting only and widens nothing a turn may do.
+ */
+export const CHANNEL_VIAS = ["on_behalf"] as const;
+export type ChannelVia = (typeof CHANNEL_VIAS)[number];
+
 export interface ChannelContext {
   channel?: string;
+  /** How the message reached the chat (`ChannelVia`); absent: typed there, or not said. */
+  via?: ChannelVia;
   channel_message_id?: string;
   people: ChannelPerson[];
   actions: ChannelAction[];
@@ -185,8 +196,9 @@ export function parseChannelContext(raw: unknown): ChannelContext {
   const channel = str(c.channel);
   const channelMessageId = str(c.channel_message_id);
   const attached = parseAttached(c.attached);
+  const via = CHANNEL_VIAS.find((v) => v === c.via);
   return {
-    ...(channel ? { channel } : {}), ...(channelMessageId ? { channel_message_id: channelMessageId } : {}),
+    ...(channel ? { channel } : {}), ...(via ? { via } : {}), ...(channelMessageId ? { channel_message_id: channelMessageId } : {}),
     people, actions, repos, handoffs, files: parseFiles(c.files),
     ...(attached !== undefined ? { attached } : {}),
   };
