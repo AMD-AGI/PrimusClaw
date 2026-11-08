@@ -14,6 +14,7 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CITE_SOURCES_META, GITHUB_LIST_MAX_CHARS, type CiteSource } from "@claw/protocol";
+import { FIXTURE_BASE, isGateFixture } from "./fixtures.js";
 import pino from "pino";
 import { z } from "zod";
 import { GithubError, GithubGraphqlError, isValidOwner, parseRepoRef, repoPath, type GithubClient } from "../github-review/github.js";
@@ -582,21 +583,7 @@ const MAX_LIST_PAGES = 100;
 /** How far a list filtered by author, or ordered by when it closed or merged, is read for a page not yet in hand. */
 const MAX_DEEP_PAGES = 20;
 
-/**
- * Release-gate fixtures: pull requests a release gate opens against its own fixture branches (`release-gate-fixture/base`, heads under
- * `release-gate-fixture/` or `<name>-e2e-fixture/`), titled "..., do not merge". They are nobody's work, and a "merged" one merged into
- * the fixture branch, not into the project: listed with the rest they were counted as "3 still open" and as merged work (2026-11-07
- * 06:09). Lists and searches leave them out unless asked (`include_fixtures`). A person's own "[do not merge]" pull request is theirs:
- * the title alone excludes only together with the word fixture.
- */
-export const FIXTURE_BASE = "release-gate-fixture/base";
-const FIXTURE_REF_RE = /^(?:release-gate-fixture|[A-Za-z0-9._-]+-e2e-fixture)\//;
-
-export function isGateFixture(p: Record<string, any>): boolean {
-  const refs = [p?.head?.ref, p?.base?.ref].filter((r): r is string => typeof r === "string");
-  const title = typeof p?.title === "string" ? p.title : "";
-  return refs.some((r) => FIXTURE_REF_RE.test(r)) || (/\bfixture\b/i.test(title) && /\bdo not merge\b/i.test(title));
-}
+export { FIXTURE_BASE, isGateFixture } from "./fixtures.js";
 
 /** The search qualifier that leaves the fixtures out of an issue_search (it leaves issues, which have no base, as they are). */
 export const FIXTURE_SEARCH_EXCLUSION = `-base:${FIXTURE_BASE}`;

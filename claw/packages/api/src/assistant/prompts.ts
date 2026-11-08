@@ -602,12 +602,16 @@ export interface AskedOfOthersCounts { total: number; open: number; closed: numb
  * them. Shown only the 20 latest, the router answered 汇报进度 with "19 of the 20 merged" when 82 had been handed over (2026-11-07).
  */
 export function formatAskedOfOthersTotals(listed: number, t: AskedOfOthersCounts): string {
-  const counts = `${t.total} in all, open ones and ones closed in the last day: ${t.open} open, ${t.closed} closed, of the closed ${t.merged} merged`
-    + ` and ${t.changes_requested} with changes requested`;
+  // The window is said with the numbers, and that it is not a week's: under a weekly report's heading the last day's 23 read as the
+  // week's (2026-11-08, "这周研发进度"). A week's count is brief's (range week), which counts over its own range.
+  const counts = `${t.total} in all in the last 24 hours (open ones, and ones closed in the last 24 hours; not this week's): ${t.open} open, `
+    + `${t.closed} closed, of the closed ${t.merged} merged and ${t.changes_requested} with changes requested`;
+  const scope = " Any of these numbers is said with its window, in the user's language (过去 24 小时 / in the last 24 hours), never under a "
+    + "week's heading; for this week's count, call brief with range week, whose pull request section counts the reviews asked of others over the week.";
   return t.total > listed
     ? `In all: ${counts}. Only the ${listed} most recently updated are listed below. How many, how many merged, or "all of them" is said from `
-      + `these totals, never from counting the lines below, and a list of them says it is the latest ${listed} of ${t.total}.`
-    : `In all: ${counts}. Every one of them is listed below.`;
+      + `these totals, never from counting the lines below, and a list of them says it is the latest ${listed} of ${t.total}.${scope}`
+    : `In all: ${counts}. Every one of them is listed below.${scope}`;
 }
 
 /** The prompt and the item list in one text, as a single-message evaluation gives them to the model. */

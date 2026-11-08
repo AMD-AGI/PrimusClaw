@@ -30,6 +30,8 @@ import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { recordSystemNotice } from "./outbound.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, ToolRefused } from "./tools.js";
+import { isGateFixture } from "../github-mcp/fixtures.js";
+import { askedOfOthersTotals } from "./requester-view.js";
 
 const logger = pino({ name: "assistant-brief" });
 
@@ -177,6 +179,7 @@ const T = {
     prLine: (pr: string, parts: string[]) => `${pr}：${parts.join("，")}`,
     comments: (n: number) => `${n} 条评论`, reviews: (n: number) => `${n} 个 review`, ciFailed: "CI 失败", closed: "已关闭", merged: "已合入",
     prOff: "没有开启 PR 盯盘",
+    asked: (t: number, m: number, c: number, per: string) => `请别人代审：${per}共 ${t} 个，已合入 ${m} 个，被要求修改 ${c} 个`,
     noteSummary: (c: number, f: number, a: number, w: number) => `运行完成 ${c} 次、失败 ${f} 次，请求审批 ${a} 次；${w} 个写操作等你确认`,
     noteFailed: (t: string) => `失败：${t}`, noteWaiting: (t: string) => `等你确认：${t}`,
     notesOff: "这里没有开启通知",
@@ -205,6 +208,7 @@ const T = {
     comments: (n: number) => `${n} comment${n === 1 ? "" : "s"}`, reviews: (n: number) => `${n} review${n === 1 ? "" : "s"}`,
     ciFailed: "CI failed", closed: "closed", merged: "merged",
     prOff: "pull requests are not watched here",
+    asked: (t: number, m: number, c: number, per: string) => `reviews asked of others ${per}: ${t}, ${m} merged, ${c} with changes requested`,
     noteSummary: (c: number, f: number, a: number, w: number) => `${c} runs finished, ${f} failed, ${a} approvals asked; ${w} writes wait for your confirmation`,
     noteFailed: (t: string) => `failed: ${t}`, noteWaiting: (t: string) => `waits for you: ${t}`,
     notesOff: "notifications are off here",
@@ -252,18 +256,24 @@ async function itemsSection(q: Querier, userId: string, w: Words, needs: string[
 
 async function pullRequestSection(q: Querier, userId: string, w: Words, needs: string[], r: BriefRange): Promise<BriefSection> {
   if (!CLAW_ASSISTANT_GITHUB_EVENTS) return { key: "pull_requests", title: w.pull_requests, checked: false, summary: w.couldNot(w.prOff), lines: [] };
-  const watched = Number((await q(
-    "SELECT COUNT(*)::int AS n FROM claw_work_item_subscriptions WHERE user_id = $1 AND state = 'active'", [userId],
-  )).rows[0].n);
-  const events = (await q(
-    `SELECT s.owner, s.repo, s.number,
+  // A release-gate fixture (told by its branches, as pr_list and issue_search tell it: `github-mcp/fixtures.ts`) is nobody's work: it
+  // is neither counted as watched nor reported, as "#381: 2 comments" was in a weekly report on 2026-11-08.
+  const fixture = (row: { head_ref: string | null; base_ref: string | null }) => isGateFixture({ head: { ref: row.head_ref }, base: { ref: row.base_ref } });
+  const watched = ((await q(
+    "SELECT head_ref, base_ref FROM claw_work_item_subscriptions WHERE user_id = $1 AND state = 'active'", [userId],
+  )).rows as Array<{ head_ref: string | null; base_ref: string | null }>).filter((s) => !fixture(s)).length;
+  const events = ((await q(
+    `SELECT s.owner, s.repo, s.number, s.head_ref, s.base_ref,
             CASE WHEN e.kind = 'pr_closed' AND e.github_id = 'merged' THEN 'pr_merged' ELSE e.kind END AS kind, COUNT(*)::int AS n
        FROM claw_work_item_github_events e JOIN claw_work_item_subscriptions s ON s.id = e.sub_id
       WHERE s.user_id = $1 AND e.created_at > NOW() - $2::interval AND e.dropped_at IS NULL
-      GROUP BY 1, 2, 3, 4
+      GROUP BY 1, 2, 3, 4, 5, 6
       ORDER BY s.owner, s.repo, s.number`,
     [userId, RANGE_INTERVAL[r]],
-  )).rows as Array<{ owner: string; repo: string; number: number; kind: string; n: number }>;
+  )).rows as Array<{ owner: string; repo: string; number: number; head_ref: string | null; base_ref: string | null; kind: string; n: number }>)
+    .filter((e) => !fixture(e));
+  // The reviews the user asked of others, over the brief's own range: a weekly report counts the week's, never the last day's.
+  const asked = await askedOfOthersTotals({ query: q }, userId, RANGE_INTERVAL[r]);
   const byPr = new Map<string, Record<string, number>>();
   for (const e of events) {
     const pr = `${e.owner}/${e.repo}#${e.number}`;
@@ -277,6 +287,7 @@ async function pullRequestSection(q: Querier, userId: string, w: Words, needs: s
     // A week's report names its source: the pull request's own page.
     return r === "week" ? `${w.prLine(pr, parts)} ${prUrl(pr)}` : w.prLine(pr, parts);
   });
+  if (asked.total) lines.unshift(w.asked(asked.total, asked.merged, asked.changes_requested, w.period[r]));
   return {
     key: "pull_requests", title: w.pull_requests, checked: true, lines: lines.slice(0, SECTION_LINES_MAX[r]),
     summary: w.prSummary(watched, events.reduce((n, e) => n + Number(e.n), 0), w.period[r]),

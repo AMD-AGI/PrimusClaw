@@ -190,6 +190,10 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_work_item_subscriptions_due ON claw_work_item_subscriptions(polled_at) WHERE state = 'active'",
   );
+  // The pull request's branches as its last read saw them: a release-gate fixture (`github-mcp/fixtures.ts`) is told by them, and is
+  // left out of the brief.
+  await client.query("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS head_ref TEXT");
+  await client.query("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS base_ref TEXT");
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_work_item_github_events (
       -- gh:<subscription>:<kind>:<GitHub's id>: the same comment read twice is the same row.

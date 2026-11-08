@@ -574,6 +574,8 @@ export interface PullRequestRead {
   writers: ReadonlySet<string>;
   /** Authors whose permission the owner's token may not see (GitHub wants push access to tell): held back, and the owner told. */
   unverifiable: ReadonlySet<string>;
+  /** The pull request's head and base branches, as GitHub answered: what tells a release-gate fixture. */
+  refs?: { head: string | null; base: string | null };
 }
 
 /**
@@ -678,7 +680,8 @@ export async function readPullRequestEvents(
     const json = got.json as { role_name?: unknown; permission?: unknown } | null;
     if (TRUSTED_PERMISSIONS.has(String(json?.role_name ?? "")) || TRUSTED_PERMISSIONS.has(String(json?.permission ?? ""))) writers.add(author);
   }
-  return { events, closed, readUpTo, login: me, writers, unverifiable };
+  const ref = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+  return { events, closed, readUpTo, login: me, writers, unverifiable, refs: { head: ref(pr?.head?.ref), base: ref(pr?.base?.ref) } };
 }
 
 export const eventIdOf = (subId: number, e: Pick<GithubEvent, "kind" | "githubId">): string => `gh:${subId}:${e.kind}:${e.githubId}`;
@@ -870,6 +873,9 @@ export async function pollSubscription(sub: Subscription): Promise<{ stored: num
   } finally {
     const seen = rate();
     if (seen && seen.remaining < seen.limit * RATE_FLOOR_SHARE) await deferUser(sub.user_id, seen.resetAt);
+  }
+  if (read.refs && (read.refs.head !== null || read.refs.base !== null)) {
+    await db.query("UPDATE claw_work_item_subscriptions SET head_ref = $2, base_ref = $3 WHERE id = $1", [sub.id, read.refs.head, read.refs.base]);
   }
   return storeEvents(sub, read);
 }

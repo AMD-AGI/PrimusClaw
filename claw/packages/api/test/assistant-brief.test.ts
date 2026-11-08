@@ -400,6 +400,41 @@ describe("assistant brief", { skip }, () => {
     assert.equal(brief.briefRangeFor("0 9 * * 1,4", "Asia/Shanghai", new Date("2026-11-09T01:00:00Z")), "day");
   });
 
+  test("B10 a release-gate fixture is neither watched nor reported, and the reviews asked of others are counted over the brief's own range", async () => {
+    // As on 2026-11-08: a weekly report said "#381: 2 comments" for the release-gate fixture, and "23 reviews, 22 merged" from the last
+    // 24 hours under the week's heading.
+    await world();
+    const [fx] = await w.q(
+      `INSERT INTO claw_work_item_subscriptions (item_id, user_id, owner, repo, number, since, cursor_at, head_ref, base_ref)
+       VALUES ('kwi_3', 'alice', 'AMD-AGI', 'PrimusClaw', 381, NOW(), NOW(), 'release-gate-fixture/head', 'release-gate-fixture/base') RETURNING id`,
+    );
+    for (const i of [1, 2]) {
+      await w.q(`INSERT INTO claw_work_item_github_events (event_id, sub_id, item_id, kind, github_id) VALUES ($1, $2, 'kwi_3', 'issue_comment', $3)`,
+        [`gh:fx:${i}`, fx.id, `fx${i}`]);
+    }
+    const review = async (n: number, closedDaysAgo: number | null, merged: boolean, verdict = "approve") => w.q(
+      `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, kind, params, closed_at)
+       VALUES ($1, 'bob', $2, $3, $4, 'ws_' || $1, 'review', $5::jsonb, CASE WHEN $6::float8 IS NULL THEN NULL ELSE NOW() - make_interval(secs => $6::float8 * 86400) END)`,
+      [`kwi_rev${n}`, 100 + n, `review ${n}`, closedDaysAgo === null ? "in_progress" : "done",
+        JSON.stringify({ requested_by: "alice", pr: { owner: "o", repo: "r", number: n }, ...(closedDaysAgo === null ? {} : { requester_view: { status: "done", pr_url: null, verdict, merged, waiting_for: null, findings: null, note: null } }) }),
+        closedDaysAgo],
+    );
+    await review(1, null, false);
+    await review(2, 0.1, true);
+    await review(3, 3, true);
+    await review(4, 4, false, "request_changes");
+    await review(5, 10, true);
+    const week = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "en", timezone: "UTC", now, range: "week" });
+    const s = Object.fromEntries(week.sections.map((x) => [x.key, x]));
+    assert.ok(!week.text.includes("#381"), week.text);
+    assert.equal(s.pull_requests.summary, "1 watched, 3 new events in the last week", "the fixture is neither watched nor its comments counted");
+    assert.equal(s.pull_requests.lines[0], "reviews asked of others in the last week: 4, 2 merged, 1 with changes requested");
+    const day = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "en", timezone: "UTC", now });
+    assert.equal(Object.fromEntries(day.sections.map((x) => [x.key, x])).pull_requests.lines[0], "reviews asked of others in the last day: 2, 1 merged, 0 with changes requested");
+    const zh = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "zh", timezone: "UTC", now, range: "week" });
+    assert.match(zh.text, /请别人代审：过去一周共 4 个，已合入 2 个，被要求修改 1 个/);
+  });
+
   test("B9 a weekly brief trigger says the week, and a brief is never held back as overlapping a run", async () => {
     await world();
     await w.subscribe("alice");

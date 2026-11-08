@@ -68,7 +68,7 @@ interface Posted { method: string; path: string; body: string }
 /** A pull request on a GitHub that lives in this process. */
 function fakeGithub() {
   const s = {
-    pr: { state: "open", merged: false, head: { sha: HEAD }, html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR}`, closed_at: null as string | null, merged_by: null as unknown },
+    pr: { state: "open", merged: false, head: { sha: HEAD, ref: "feat/parser" }, base: { ref: "main" }, html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR}`, closed_at: null as string | null, merged_by: null as unknown },
     issueComments: [] as Array<Record<string, any>>,
     reviewComments: [] as Array<Record<string, any>>,
     reviews: [] as Array<Record<string, any>>,
@@ -265,6 +265,8 @@ describe("assistant GitHub events", { skip }, () => {
     assert.equal(e.event_id, `gh:${it.subId}:issue_comment:${c.id}`);
     assert.equal(e.author, "bob");
     assert.ok(e.delivered_at, "delivered in the same poll that stored it");
+    // The pull request's branches are kept with the watch: the brief tells a release-gate fixture by them.
+    assert.deepEqual((await w.q("SELECT head_ref, base_ref FROM claw_work_item_subscriptions WHERE id = $1", [it.subId]))[0], { head_ref: "feat/parser", base_ref: "main" });
 
     // Redelivery: the same comment read again, by a later poll and by two polls at once.
     await poll();
