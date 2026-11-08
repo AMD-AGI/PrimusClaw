@@ -260,7 +260,9 @@ stream.
 ### 5.3 Serving history and live events together
 
 `GET /v1/chat/sessions/:id/messages` serves conversation history followed by live events;
-a replay mode returns the history as JSON instead. The subscription is established
+a replay mode returns the history as JSON instead: all of it, or one window read from the
+table alone (`?mode=replay&tail=N` for the last N events, `&after=<event_id>&limit=N` to page
+forward), which is what a long-lived session's reader should ask for. The subscription is established
 *before* the history query runs, which closes the window in which an event published
 between the two would be lost.
 

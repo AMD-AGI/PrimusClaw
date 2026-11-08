@@ -161,14 +161,103 @@ export class StreamVoided {
   }
 }
 
+/** The most events one windowed `mode=replay` read returns; a larger `tail` or `limit` is cut to this. */
+export const REPLAY_WINDOW_MAX = 5000;
+
+export interface ReplayWindow {
+  /** The last `tail` events of the range. */
+  tail?: number;
+  /** The first `limit` events of the range. */
+  limit?: number;
+  /** The range starts after this event id (an `event_id` of the session). */
+  after?: string;
+}
+
+function windowCount(value: string | undefined, name: string): number | undefined | { error: string } {
+  if (value === undefined || value === "") return undefined;
+  if (!/^[0-9]{1,9}$/.test(value) || Number(value) < 1) return { error: `${name} must be a positive integer` };
+  return Math.min(REPLAY_WINDOW_MAX, Number(value));
+}
+
+/**
+ * The window a `mode=replay` request asks for. With none of `tail`, `limit` or `after` the reply is the whole
+ * history, as it always was; with any of them only the rows asked for are read from the table, so a session of
+ * tens of thousands of events costs its caller (and this process) a page, not the whole session.
+ */
+export function parseReplayWindow(q: { tail?: string; limit?: string; after?: string }): ReplayWindow | { error: string } {
+  const tail = windowCount(q.tail, "tail");
+  if (typeof tail === "object") return tail;
+  const limit = windowCount(q.limit, "limit");
+  if (typeof limit === "object") return limit;
+  if (tail !== undefined && limit !== undefined) return { error: "tail and limit cannot be combined" };
+  const after = q.after === undefined || q.after === "" ? undefined : lastEventIdOf(q.after);
+  if (after === null) return { error: "after is not an event id" };
+  return { tail, limit, after };
+}
+
+/**
+ * One window of a session's stored events, oldest first, in the row shape of the whole replay
+ * (`event_id, event_type, data, created_at`), redacted the same way. The sub-agent filter is applied in SQL, so
+ * `tail=N` is the last N events the caller would have been shown, not the last N rows with some filtered out.
+ * `hasMore`: events outside the window remain on the side it was cut (before it for `tail`, after it otherwise).
+ */
+export async function readReplayWindow(
+  sessionId: string, window: ReplayWindow, opts: ForwardOpts,
+): Promise<{ rows: Array<Record<string, unknown>>; hasMore: boolean } | { error: string }> {
+  const params: unknown[] = [sessionId];
+  const where = ["session_id = $1", "deleted_at IS NULL"];
+  if (window.after !== undefined) {
+    // By row order, not by comparing ids as text ('claw-10' sorts before 'claw-9').
+    const cursor = (await db.query(
+      "SELECT id FROM claw_session_events WHERE session_id = $1 AND event_id = $2",
+      [sessionId, window.after],
+    )).rows[0] as { id: number | string } | undefined;
+    if (!cursor) return { error: "after is not an event of this session" };
+    params.push(cursor.id);
+    where.push(`id > $${params.length}`);
+  }
+  // shouldForward, in SQL: a sub-agent event is one whose subagent_id is a non-empty string.
+  const isSub = "COALESCE(jsonb_typeof(data->'subagent_id') = 'string' AND data->>'subagent_id' <> '', false)";
+  if (opts.subagentFilter) {
+    params.push(opts.subagentFilter);
+    where.push(`${isSub} AND data->>'subagent_id' = $${params.length}`);
+  } else if (opts.foldSubagents) {
+    params.push([...SUBAGENT_LIFECYCLE_PASSTHROUGH]);
+    where.push(`(NOT ${isSub} OR COALESCE(data->>'type' = ANY($${params.length}::text[]), false))`);
+  }
+  const count = window.tail ?? window.limit ?? REPLAY_WINDOW_MAX;
+  params.push(count + 1);
+  const rows = (await db.query(
+    `SELECT event_id, event_type, data, created_at FROM (
+       SELECT id, event_id, event AS event_type, data, created_at FROM claw_session_events
+        WHERE ${where.join(" AND ")}
+        ORDER BY id ${window.tail !== undefined ? "DESC" : "ASC"} LIMIT $${params.length}
+     ) w ORDER BY id`,
+    params,
+  )).rows as Array<{ data: unknown; [key: string]: unknown }>;
+  const hasMore = rows.length > count;
+  const kept = hasMore ? (window.tail !== undefined ? rows.slice(rows.length - count) : rows.slice(0, count)) : rows;
+  return {
+    hasMore,
+    rows: kept
+      .filter((row) => shouldForward((typeof row.data === "object" && row.data) ? row.data as Record<string, unknown> : {}, opts))
+      .map((row) => ({ ...row, data: redactPublicJson(row.data) })),
+  };
+}
+
 export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
 
-  // SSE event stream (supports ?mode=replay for full history JSON).
+  // SSE event stream (supports ?mode=replay for history JSON: the whole history,
+  // or with ?tail=N / ?after=<event_id>&limit=N one window of it).
   app.get<{
     Params: { id: string };
     Querystring: {
       after?: string;
       mode?: string;
+      /** `mode=replay` only: the last N events (oldest first), read as N rows from the table. */
+      tail?: string;
+      /** `mode=replay` only: at most N events after `after` (or from the start). */
+      limit?: string;
       subagent_id?: string;
       fold_subagents?: string;
       // Legacy alias kept for back-compat: when callers pass it explicitly
@@ -195,6 +284,13 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       }
 
       if (mode === "replay") {
+        const window = parseReplayWindow(req.query);
+        if ("error" in window) return reply.status(400).send({ ok: false, error: window.error });
+        if (window.tail !== undefined || window.limit !== undefined || window.after !== undefined) {
+          const page = await readReplayWindow(sessionId, window, fwdOpts);
+          if ("error" in page) return reply.status(400).send({ ok: false, error: page.error });
+          return { ok: true, data: page.rows, has_more: page.hasMore };
+        }
         const events = (await db.query(
           "SELECT event_id, event as event_type, data, created_at FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL ORDER BY id",
           [sessionId],
