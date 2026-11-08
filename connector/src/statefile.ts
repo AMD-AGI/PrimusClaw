@@ -129,6 +129,20 @@ export class SnapshotFile {
   }
 
   /**
+   * Sets the file's modification time to now without writing it, once everything saved is on disk (a write under way, or one
+   * still to be made, stamps it itself). connector.json's is the last heartbeat a later run reads (`Connector.run`: how long
+   * the machine was away, and a crashed run's last heartbeat), and an unchanged one is no longer written (`save`). No flush,
+   * one at a time, a failure is ignored, and a file that is gone is not made again.
+   */
+  touch(): void {
+    if (this.touching || this.saved === 0 || this.running !== null || this.written < this.saved) return;
+    this.touching = true;
+    const now = new Date();
+    fsp.utimes(this.file, now, now).catch(() => undefined).finally(() => { this.touching = false; });
+  }
+  private touching = false;
+
+  /**
    * Whether everything saved so far is on disk: false when a write failed, or after `ms` (never, for `Infinity`). Asked
    * after a failed write, it tries that write again rather than wait for a drain that is not coming.
    */

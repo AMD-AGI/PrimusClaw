@@ -235,6 +235,30 @@ describe("state files written off the event loop", () => {
     assert.equal(fs.readFileSync(file, "utf8"), "c");
     f.close();
   });
+  test("touch() stamps the time of a file that is on disk without writing it, and does not make one that is gone", async () => {
+    const dir = tmpdir();
+    const file = path.join(dir, "connector.json");
+    const f = new SnapshotFile(file, undefined, true);
+    f.touch(); // nothing saved yet: nothing to stamp
+    assert.equal(fs.existsSync(file), false);
+    f.save("a");
+    assert.equal(await f.settled(), true);
+    const seen = `${file}.seen`;
+    fs.linkSync(file, seen);
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    f.touch();
+    const deadline = Date.now() + 5_000;
+    while (Date.now() - fs.statSync(seen).mtimeMs > 60_000 && Date.now() < deadline) await sleep(20);
+    assert.ok(Date.now() - fs.statSync(seen).mtimeMs < 60_000, "stamped now");
+    assert.equal(fs.statSync(seen).nlink, 2, "not written again");
+    fs.rmSync(file);
+    fs.rmSync(seen);
+    f.touch();
+    await sleep(100);
+    assert.equal(fs.existsSync(file), false, "a file that is gone is not made again");
+    f.close();
+  });
   test("one failed write of sessions.json.pending does not hold back every later event (written() settles)", async () => {
     const dir = tmp();
     const file = path.join(dir, "sessions.json");
