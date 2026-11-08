@@ -1057,7 +1057,7 @@ export async function deliverPendingEvents(): Promise<number> {
 const REFS_BACKFILL_BATCH = 20;
 
 /**
- * The branches of watches that no poll will read any more (ended before polls kept them, #511) and whose news a weekly brief still
+ * The branches of watches that no poll will read any more (ended before polls kept them, #511; an active one's own poll keeps them) and whose news a weekly brief still
  * shows: read once each, with their owner's token, so the brief can tell a release-gate fixture (`brief.ts`). A watch is claimed by
  * setting `refs_read_at` before it is read, across replicas, and never claimed again, read or not: after the first passes
  * following a release there is nothing left to claim, and no GitHub call is made. The subscription holds no title to tell one by.
@@ -1067,7 +1067,7 @@ export async function backfillSubscriptionRefs(batch: number = REFS_BACKFILL_BAT
     `UPDATE claw_work_item_subscriptions s SET refs_read_at = NOW()
       WHERE s.id IN (
         SELECT id FROM claw_work_item_subscriptions c
-         WHERE c.refs_read_at IS NULL AND c.head_ref IS NULL AND c.base_ref IS NULL
+         WHERE c.state <> 'active' AND c.refs_read_at IS NULL AND c.head_ref IS NULL AND c.base_ref IS NULL
            AND EXISTS (SELECT 1 FROM claw_work_item_github_events e WHERE e.sub_id = c.id AND e.created_at > NOW() - INTERVAL '7 days')
          ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED)
       RETURNING s.id, s.user_id, s.owner, s.repo, s.number`,
@@ -1089,8 +1089,22 @@ export async function backfillSubscriptionRefs(batch: number = REFS_BACKFILL_BAT
   return read;
 }
 
+/** This process's backfill pass, while one runs: started beside a poll pass, never awaited by it. */
+let backfilling: Promise<void> | null = null;
+
+/** Settles when this process has no backfill pass running (for tests, and a clean shutdown). */
+export function refsBackfillIdle(): Promise<void> {
+  return backfilling ?? Promise.resolve();
+}
+
 export async function pollDueSubscriptions(intervalSec: number = CLAW_ASSISTANT_GITHUB_POLL_SEC): Promise<{ polled: number; stored: number; delivered: number }> {
-  await backfillSubscriptionRefs().catch((err) => logger.warn({ err: (err as Error)?.message }, "github_events.refs_backfill_failed"));
+  // Beside the pass, not before it: its reads of ended watches (up to 20, each up to GitHub's timeout) never hold back the polling and
+  // delivery of active ones. One at a time per process.
+  if (!backfilling) {
+    backfilling = backfillSubscriptionRefs()
+      .then(() => undefined, (err) => logger.warn({ err: (err as Error)?.message }, "github_events.refs_backfill_failed"))
+      .finally(() => { backfilling = null; });
+  }
   const due = (await db.query(
     `UPDATE claw_work_item_subscriptions s SET polled_at = NOW()
       WHERE s.id IN (

@@ -328,7 +328,15 @@ describe("assistant GitHub events", { skip }, () => {
     await w.q("UPDATE claw_work_item_subscriptions SET state = 'ended', end_reason = 'user', ended_at = NOW(), head_ref = NULL, base_ref = NULL, refs_read_at = NULL WHERE id = $1", [old.subId]);
     await w.q("INSERT INTO claw_work_item_github_events (event_id, sub_id, item_id, kind, github_id, created_at) VALUES ('gh:bf:2', $1, $2, 'issue_comment', 'bf2', NOW() - INTERVAL '8 days')", [old.subId, old.itemId]);
     gh.s.paths.length = 0;
-    await ev.pollDueSubscriptions(30);
+    // The pass does not wait for the backfill: GitHub holds its read until let go, and the pass is done before that.
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    gh.s.onRead = async () => { await held; };
+    const pass = await Promise.race([ev.pollDueSubscriptions(30).then(() => "done"), new Promise((r) => setTimeout(() => r("held"), 2000))]);
+    assert.equal(pass, "done", "the poll pass is not held by the backfill's read");
+    gh.s.onRead = null;
+    release();
+    await ev.refsBackfillIdle();
     assert.deepEqual((await w.q("SELECT head_ref, base_ref FROM claw_work_item_subscriptions WHERE id = $1", [it.subId]))[0], { head_ref: "feat/parser", base_ref: "main" });
     assert.deepEqual((await w.q("SELECT head_ref, base_ref, refs_read_at FROM claw_work_item_subscriptions WHERE id = $1", [old.subId]))[0], { head_ref: null, base_ref: null, refs_read_at: null }, "no recent news: not read");
     assert.equal(gh.s.paths.filter((p) => p === `/repos/${OWNER}/${REPO}/pulls/${PR}`).length, 1, "one read of the pull request");
@@ -336,6 +344,7 @@ describe("assistant GitHub events", { skip }, () => {
     await w.q("UPDATE claw_work_item_subscriptions SET head_ref = NULL, base_ref = NULL WHERE id = $1", [it.subId]);
     gh.s.paths.length = 0;
     await ev.pollDueSubscriptions(30);
+    await ev.refsBackfillIdle();
     assert.deepEqual(gh.s.paths, []);
   });
 
