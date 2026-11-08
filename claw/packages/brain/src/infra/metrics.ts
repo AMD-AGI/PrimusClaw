@@ -71,7 +71,7 @@ const citeCheckJudgeTotal = new Counter({
 });
 const citeCheckStatementsTotal = new Counter({
   name: "claw_cite_check_statements_total",
-  help: "Cited statements of the research reports checked before delivery, by verdict: supported, unverified, or not checked.",
+  help: "Cited statements of the research reports checked before delivery, by verdict: supported, unverified, not checked, or too little to check.",
   labelNames: ["verdict"] as const,
   registers: [registry],
 });
@@ -809,10 +809,11 @@ export const metrics = {
     citeCheckJudgeTotal.inc({ outcome });
   },
   /** The verdicts of one checked report's statements. */
-  onCiteCheckStatements(supported: number, unverified: number, unchecked: number): void {
+  onCiteCheckStatements(supported: number, unverified: number, unchecked: number, thin = 0): void {
     if (supported) citeCheckStatementsTotal.inc({ verdict: "supported" }, supported);
     if (unverified) citeCheckStatementsTotal.inc({ verdict: "unverified" }, unverified);
     if (unchecked) citeCheckStatementsTotal.inc({ verdict: "not_checked" }, unchecked);
+    if (thin) citeCheckStatementsTotal.inc({ verdict: "too_little" }, thin);
   },
   /** One skill staged for a turn: `outcome` says whether its files were downloaded. */
   onSkillStage(source: "plugin" | "tool", outcome: "hit" | "joined" | "downloaded"): void {

@@ -24,13 +24,19 @@
  *   CC14 a long page is cut to the parts that bear on the statements: each statement's best paragraph, within the excerpt budget,
  *        in page order; a short page is given whole
  *   CC15 the judge gets each statement with its whole line, and the excerpt, not the whole page
+ *   CC16 a statement the first look rejects is looked at again with more of the page (the whole page when short enough), alone
+ *        with the others rejected on that source; supported then, it is supported; a statement no judge answered for, or one
+ *        already supported, gets no second look; a second look with no answer leaves the first look's no
+ *   CC17 a statement whose line says too little (a table row of numbers) that a judge said no to is marked so and counted apart,
+ *        not as unverified; one that is supported stays supported; one no judge looked at (a number with no source, a page that did
+ *        not open) stays unverified
  *   CC13 up to 80 sources are checked; a source past that cap, a statement past the statements cap and a batch the budget ran out
  *        before are not checked (未核对), never unverified
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  CITE_CHECK_EXCERPT_CHARS, checkReport, judgePrompt, pageExcerpt, parseCiteCheck, parseVerdicts, type CheckedPage, type CiteCheckPorts,
+  CITE_CHECK_EXCERPT_CHARS, CITE_CHECK_SECOND_CLAIMS_PER_CALL, CITE_CHECK_SECOND_EXCERPT_CHARS, checkReport, isThin, judgePrompt, pageExcerpt, parseCiteCheck, parseVerdicts, type CheckedPage, type CiteCheckPorts,
 } from "../src/tools/cite-check.js";
 import { readCitedPage } from "../src/tools/web/cite-check-ports.js";
 import { ToolRouter } from "../src/tools/router.js";
@@ -249,7 +255,7 @@ test("CC11 a judge with no answer is asked once more; still none: not checked, c
   const once = await checkReport(text, fakePorts({ [A]: "a" }, {
     judge: async ({ claims }) => (++calls === 1 ? null : claims.map((c) => c.includes("{a}"))),
   }).ports);
-  assert.equal(calls, 2, "asked once more");
+  assert.equal(calls, 3, "asked once more, then a second look at the statement it said no to");
   assert.match(once.text, /Fact one \{a\} \[1\]\./);
   assert.match(once.text, /Fact two \{b\} \(unverified\)\./, "the retry's verdicts hold");
   assert.deepEqual([once.supported, once.unverified, once.unchecked, once.judgeFailures], [1, 1, 0, 0]);
@@ -367,4 +373,110 @@ test("CC15 the judge gets each statement with its whole line, and an excerpt of 
   assert.deepEqual(seen[0].contexts, ["1. vLLM supports mi300x and more since v0.6."], "the statement's whole line, citations out");
   const { user } = judgePrompt(A, "p", seen[0].claims, seen[0].contexts);
   assert.match(user, /1\. 1\. vLLM supports mi300x\n   \(its line: 1\. vLLM supports mi300x and more since v0\.6\.\)/);
+});
+
+test("CC16 a rejected statement gets a second look with more of the page; supported then, it is supported", async () => {
+  // A long page whose evidence for statement b sits where a first excerpt shared with many statements leaves it out.
+  const filler = (i: number) => `Paragraph ${i} about alpha${i} beta${i} gamma${i} delta${i} and nothing more of note here at all.`;
+  const page = [...Array.from({ length: 300 }, (_, i) => filler(i)), "The engine ships zeta-image tags for the target."].join("\n\n");
+  const looks: Array<{ claims: string[]; page: string }> = [];
+  const judge: CiteCheckPorts["judge"] = async (input) => {
+    looks.push({ claims: input.claims, page: input.page });
+    return input.claims.map((c) => input.page.includes(c.includes("zeta") ? "zeta-image" : "alpha1 "));
+  };
+  const lines = [
+    ...Array.from({ length: 24 }, (_, i) => `- Item ${i} mentions alpha${i} beta${i} gamma${i} delta${i} [1].`),
+    "- The engine ships zeta tags for the target [1].", "", `[1]: Page — ${A}`,
+  ];
+  // The first look, with the excerpt cut to almost nothing, cannot see the zeta paragraph; the second, alone, can.
+  let first = true;
+  const r = await checkReport(lines.join("\n"), {
+    fetchPage: async () => ({ ok: true, text: page }),
+    judge: async (input) => {
+      if (first) { first = false; looks.push({ claims: input.claims, page: input.page }); return input.claims.map(() => false); }
+      return judge(input);
+    },
+  });
+  assert.equal(looks.length, 1 + Math.ceil(25 / CITE_CHECK_SECOND_CLAIMS_PER_CALL), "one first look of 25 statements, then the rejected ones in batches");
+  const second = looks.slice(1);
+  assert.ok(second.every((l) => l.page.length <= CITE_CHECK_SECOND_EXCERPT_CHARS));
+  assert.ok(second.some((l) => l.claims.some((c) => c.includes("zeta")) && l.page.includes("zeta-image")), "the second look sees the evidence");
+  assert.match(r.text, /The engine ships zeta tags for the target \[1\]\./);
+  assert.equal(r.secondLook >= 1, true);
+  assert.equal(r.supported, r.secondLook, "every statement supported here was supported on the second look");
+
+  // Short page: the second look gets the whole page. No answer the second time: the first no stands.
+  const short = "The page says x is 3.";
+  const seen: string[] = [];
+  let n = 0;
+  const kept = await checkReport([`x is four for this engine {q} [1].`, "", `[1]: P — ${A}`].join("\n"), {
+    fetchPage: async () => ({ ok: true, text: short }),
+    judge: async (input) => { seen.push(input.page); n++; return n === 1 ? [false] : null; },
+  });
+  assert.deepEqual(seen, [short, short, short], "first look, then a second look asked twice, each with the whole short page");
+  assert.equal(kept.unverified, 1);
+  assert.match(kept.text, /\(unverified\)/);
+
+  // A page longer than the first look's excerpt but within the second's: the second look reads it whole.
+  const midLines: string[] = [];
+  while (midLines.join("\n\n").length <= CITE_CHECK_EXCERPT_CHARS + 500) midLines.push(`Line ${midLines.length} of a mid-sized page about subject${midLines.length} and more words.`);
+  const mid = midLines.join("\n\n");
+  assert.ok(mid.length > CITE_CHECK_EXCERPT_CHARS && mid.length <= CITE_CHECK_SECOND_EXCERPT_CHARS, `${mid.length}`);
+  const midSeen: string[] = [];
+  await checkReport([`The page covers subject7 in some detail [1].`, "", `[1]: P — ${A}`].join("\n"), {
+    fetchPage: async () => ({ ok: true, text: mid }),
+    judge: async (input) => { midSeen.push(input.page); return [false]; },
+  });
+  assert.equal(midSeen.length, 2);
+  assert.ok(midSeen[0].length < mid.length, "the first look reads an excerpt");
+  assert.equal(midSeen[1], mid, "the second look reads the whole page");
+
+  // A statement already supported, or one no judge answered for, gets no second look.
+  let calls = 0;
+  await checkReport([`Supported statement here {a} [1].`, "", `[1]: P — ${A}`].join("\n"), {
+    fetchPage: async () => ({ ok: true, text: "a" }), judge: async (i) => { calls++; return i.claims.map(() => true); },
+  });
+  assert.equal(calls, 1);
+  calls = 0;
+  const silent = await checkReport([`Some statement here {a} [1].`, "", `[1]: P — ${A}`].join("\n"), {
+    fetchPage: async () => ({ ok: true, text: "a" }), judge: async () => { calls++; return null; },
+  });
+  assert.equal(calls, 2, "no answer twice in the first look: not checked, no second look");
+  assert.equal(silent.unchecked, 1);
+});
+
+test("CC17 a statement that says too little is marked so and counted apart when nothing supports it", async () => {
+  assert.equal(isThin("当前开放 PR 881 280"), true);
+  assert.equal(isThin("2026-10-09 起已合并 PR(标签) 384 174"), false);
+  assert.equal(isThin("vLLM supports MI300X"), false);
+  const text = [
+    "# 对比报告：两个推理框架在 MI300X 上的支持情况与性能差异的总结说明",
+    "| 当前开放 PR | 881 | 280 [1] |",
+    "| 合并 PR | 2166 [1] |",
+    "vLLM 已正式支持 MI300X 并提供镜像 [1]。",
+    "",
+    `[1]: 页面 — ${A}`,
+  ].join("\n");
+  const r = await checkReport(text, {
+    fetchPage: async () => ({ ok: true, text: "2166 merged" }),
+    judge: async ({ claims }) => claims.map((c) => c.includes("2166")),
+  });
+  assert.deepEqual([r.supported, r.unverified, r.thin, r.unchecked], [1, 1, 1, 0]);
+  assert.match(r.text, /\| 当前开放 PR \| 881 \| 280（信息过少，未能核对） \|/);
+  assert.match(r.text, /\| 合并 PR \| 2166 \[1\] \|/, "a thin statement that is supported stays supported");
+  assert.match(r.text, /vLLM 已正式支持 MI300X 并提供镜像（未证实）。/);
+  assert.match(r.text.trimEnd().split("\n").at(-1)!, /1 条信息过少（如只有数字的表格行）未能核对/);
+
+  // A short line no judge answered for (a number with no source, a page that did not open) stays unverified, never thin.
+  const unjudged = [
+    "# 对比报告：两个推理框架在 MI300X 上的支持情况与性能差异的总结说明",
+    "| GPU | 881 [9] |",
+    "| GPU | 280 [2] |",
+    "",
+    `[2]: 打不开的页面 — ${C}`,
+  ].join("\n");
+  const u = await checkReport(unjudged, { fetchPage: async () => ({ ok: false }), judge: async ({ claims }) => claims.map(() => false) });
+  assert.deepEqual([u.thin, u.unverified, u.unreadable], [0, 2, 1]);
+  assert.match(u.text, /\| GPU \| 881（未证实） \|/);
+  assert.match(u.text, /\| GPU \| 280（未证实） \|/);
 });
