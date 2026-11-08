@@ -40,8 +40,8 @@
  *                     oracle reads from it; default: only their length). Write such results only somewhere private. The judge's
  *                     reasons are kept either way (keys scrubbed, 300 characters each), so a FAIL can be looked into
  *   EVAL_OUT          a directory for the results: <mode>.json and <mode>.md
- *   EVAL_RECORD_DIR   a private directory (the operator's own, no access for group or others; made 0700 when missing, refused
- *                     otherwise) for <mode>-recordings.jsonl (0600): every attempt as observed, in full (what the identity was
+ *   EVAL_RECORD_DIR   a private directory (the operator's own, no access for group or others, under directories nobody else can
+ *                     change; made 0700 when missing, refused otherwise before anything is sent) for <mode>-recordings.jsonl (0600): every attempt as observed, in full (what the identity was
  *                     shown included), and the judge's whole answers, for EVAL_OFFLINE and for looking into a verdict; keys
  *                     scrubbed. Written only when set; EVAL_KEEP_TEXT is not needed for it
  *   EVAL_JUDGE_URL, EVAL_JUDGE_MODEL, EVAL_JUDGE_KEY_FILE, EVAL_JUDGE_MAX_TOKENS (default 1024)
@@ -114,7 +114,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -134,18 +134,39 @@ import {
 } from "./sa-eval-lib.js";
 import * as readTools from "../../src/assistant/read-tools.js";
 
-/** Null when `dir` is (or is made, 0700) a directory of this process's user that group and others cannot enter; else why not. */
-function privateDir(dir: string): string | null {
+/**
+ * `dir` as a private directory, made (0700) when missing: its real path (symlinks are followed here, once) must be a directory of this
+ * process's user that group and others cannot enter, and every directory above it must be owned by root or this user and writable by
+ * nobody else unless sticky, so that nobody else can move it away and put another in its place before the run writes there. Its real
+ * path, or why not.
+ */
+function privateDir(dir: string): { path: string } | { why: string } {
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const st = statSync(dir);
-    if (!st.isDirectory()) return "is not a directory";
-    if (typeof process.getuid === "function" && st.uid !== process.getuid()) return "is not the operator's own directory";
-    if (st.mode & 0o077) return `is open to group or others (mode ${(st.mode & 0o777).toString(8)}; chmod 700 it)`;
-    return null;
+    const real = realpathSync(dir);
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    const why = ownPrivate(real, uid);
+    if (why) return { why };
+    for (let up = dirname(real); ; up = dirname(up)) {
+      const a = statSync(up);
+      if ((uid !== null && a.uid !== 0 && a.uid !== uid) || ((a.mode & 0o022) && !(a.mode & 0o1000))) {
+        return { why: `lies under ${up}, which someone else could change (owner ${a.uid}, mode ${(a.mode & 0o7777).toString(8)}): use a directory under the operator's own` };
+      }
+      if (up === dirname(up)) break;
+    }
+    return { path: real };
   } catch (err) {
-    return `cannot be made (${err instanceof Error ? err.message : String(err)})`;
+    return { why: `cannot be made (${err instanceof Error ? err.message : String(err)})` };
   }
+}
+
+/** Null when `path` itself (not a symlink) is a directory of `uid` that group and others cannot enter; else why not. */
+function ownPrivate(path: string, uid: number | null): string | null {
+  const st = lstatSync(path);
+  if (!st.isDirectory()) return "is not a directory";
+  if (uid !== null && st.uid !== uid) return "is not the operator's own directory";
+  if (st.mode & 0o077) return `is open to group or others (mode ${(st.mode & 0o777).toString(8)}; chmod 700 it)`;
+  return null;
 }
 
 const need = (name: string): string => {
@@ -186,9 +207,11 @@ const turnWaitMs = (router: boolean): number => (TURN_WAIT_S ?? (router ? 180 : 
 // A recording holds what the identity was shown (and so anything an oracle reads back from its data): it is written only
 // when the operator also asks to keep the text, knowingly.
 // EVAL_RECORD_DIR holds what the identity was shown, in full: only a directory nobody else can read.
+let RECORD_PATH: string | null = null;   // EVAL_RECORD_DIR's real path, checked private before the run
 if (RECORD_DIR && LIVE) {
-  const why = privateDir(RECORD_DIR);
-  if (why) { console.error(`refusing to run: EVAL_RECORD_DIR ${why}`); process.exit(2); }
+  const dir = privateDir(RECORD_DIR);
+  if ("why" in dir) { console.error(`refusing to run: EVAL_RECORD_DIR ${dir.why}`); process.exit(2); }
+  RECORD_PATH = dir.path;
 }
 
 /** The key, from the environment or the file named there; never a default. Never printed, never written. */
@@ -1266,10 +1289,15 @@ async function main(): Promise<void> {
   if (sessionsLeft.length) cleanupFailed.push(`sessions the run made not deleted: ${sessionsLeft.join(",")}`);
   cleanupFailed.push(...new Set(CLEANUP_ISSUES));
   cleanupFailed = cleanupFailed.map(scrub);
-  if (RECORD_DIR) {
-    const file = join(RECORD_DIR, `${MODE}-recordings.jsonl`);
-    writeFileSync(file, scrub(recordings.map((r) => JSON.stringify(r)).join("\n") + "\n"), { mode: 0o600 });
-    chmodSync(file, 0o600);   // a file that was there keeps its mode otherwise
+  if (RECORD_PATH) {
+    // Written by the real path checked before the run (nobody else can have replaced it: see privateDir), checked once more.
+    const why = ownPrivate(RECORD_PATH, typeof process.getuid === "function" ? process.getuid() : null);
+    if (why) cleanupFailed.push(`the recordings were not written: EVAL_RECORD_DIR ${why}`);
+    else {
+      const file = join(RECORD_PATH, `${MODE}-recordings.jsonl`);
+      writeFileSync(file, scrub(recordings.map((r) => JSON.stringify(r)).join("\n") + "\n"), { mode: 0o600 });
+      chmodSync(file, 0o600);   // a file that was there keeps its mode otherwise
+    }
   }
   report(results, cases.length, leftOpen, cleanupFailed);
 }

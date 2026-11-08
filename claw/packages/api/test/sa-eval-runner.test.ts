@@ -57,7 +57,7 @@
  *   R21 the judge: its FAIL on a case every deterministic check passed is asked again (a third time on a split) and the majority
  *      decides, a case a check failed is judged once; it is told the values the run read as the truth; its reasons are kept without
  *      EVAL_KEEP_TEXT; EVAL_RECORD_DIR (no EVAL_KEEP_TEXT needed) is made 0700 and its file 0600 with the whole answers and every
- *      judge answer, and a directory open to others refuses the run before anything is sent
+ *      judge answer, and a directory open to others, or under one others may change, refuses the run before anything is sent
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -780,12 +780,19 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
     const dir2 = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
     mkdirSync(join(dir2, "shared"), { mode: 0o755 });
     chmodSync(join(dir2, "shared"), 0o755);
+    // A private directory under one others may write (not sticky): it could be moved away and replaced before the write.
+    mkdirSync(join(dir2, "anyones"), { mode: 0o777 });
+    chmodSync(join(dir2, "anyones"), 0o777);
     const r2 = runner(base2, [version("t-m-004")], { EVAL_RECORD_DIR: join(dir2, "shared") }, dir2);
     const run2 = await r2.done;
+    const r3 = runner(base2, [version("t-m-005")], { EVAL_RECORD_DIR: join(dir2, "anyones", "mine") }, dir2);
+    const run3 = await r3.done;
     await open.stop();
     try {
       assert.equal(run2.code, 2, run2.out);
       assert.match(run2.out, /refusing to run: EVAL_RECORD_DIR is open to group or others \(mode 755/);
+      assert.equal(run3.code, 2, run3.out);
+      assert.match(run3.out, /refusing to run: EVAL_RECORD_DIR lies under \S+anyones, which someone else could change \(owner \d+, mode 777\)/);
       assert.equal(open.sent.length, 0);
     } finally { rmSync(dir2, { recursive: true, force: true }); }
   });
