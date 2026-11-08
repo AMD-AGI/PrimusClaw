@@ -8,7 +8,7 @@
  *   CS2 deliver_file of a cited report in the sandbox is refused, and the model told to deliver it with deliver_text, whatever its
  *       extension and however long (the whole file is searched); a file with only one of the two, a file that cannot be read, and
  *       any file in a run without the check are not refused for it
- *   CS3 the check's budget ends a wait for a page that never answers: the statement is unverified and the check returns
+ *   CS3 the check's budget ends a wait for a page that never answers: the check returns, and the statement is not checked
  */
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
@@ -159,5 +159,7 @@ test("CS3 a page that never answers does not hold the check past its budget", { 
   t.mock.timers.tick(CITE_CHECK_BUDGET_MS + 1);
   const r = await pending;
   assert.equal(r.supported, 0);
-  assert.equal(r.unreadable, 1);
+  assert.equal(r.unreadable, 0, "a page the budget ran out on is not known to be unreadable");
+  assert.equal(r.unchecked, 2);
+  assert.equal(r.unverified, 0);
 });

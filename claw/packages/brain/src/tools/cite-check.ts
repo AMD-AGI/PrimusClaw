@@ -15,9 +15,9 @@
  *  - a source whose page could not be opened or read is marked so in the list of sources;
  *  - the file ends with one line that says how many statements were checked and how many are unverified.
  *
- * What could not be checked counts as not supported: a page that failed to open, a statement over the caps, a number no source in
- * the list carries. A judge that gives no answer is asked once more; when it still gives none, the statements it was asked about are
- * marked not checked (`（未核对）`, `(not checked)`) rather than unverified, counted apart, and logged and counted as a metric. A page's text is data for the judge, never instructions; the judge's answer is
+ * A page that failed to open and a number no source in the list carries count as not supported: those statements are unverified. What
+ * the check never decided is marked not checked (`（未核对）`, `(not checked)`) instead, counted apart: a judge that gave no answer
+ * twice (logged and counted as a metric), a source or a statement past the caps, a page or a batch the budget ran out before. A page's text is data for the judge, never instructions; the judge's answer is
  * read as booleans only, so a page can at most change whether its own statements count as supported.
  *
  * A text with no numbered citation, or no list of sources, is not a research report and is passed on unchanged.
@@ -28,7 +28,7 @@ import { metrics } from "../infra/metrics.js";
 const logger = pino({ name: "cite-check" });
 
 /** The most sources one report has checked; a statement citing only sources past it is unverified. */
-export const CITE_CHECK_MAX_SOURCES = 40;
+export const CITE_CHECK_MAX_SOURCES = 80;
 /** The most statements one report has checked; the rest are unverified. */
 export const CITE_CHECK_MAX_CLAIMS = 200;
 /** The most statements one judge call reads. */
@@ -226,25 +226,38 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
   const unjudged: Set<number>[] = claims.map(() => new Set<number>());
   let judgeFailures = 0;
   const checkedClaims = claims.slice(0, CITE_CHECK_MAX_CLAIMS);
+  const allCited = [...new Set(claims.flatMap((c) => c.numbers))].filter((n) => sources.has(n));
   const cited = [...new Set(checkedClaims.flatMap((c) => c.numbers))].filter((n) => sources.has(n)).slice(0, CITE_CHECK_MAX_SOURCES);
   const unreadable = new Set<number>();
+  // What the check did not get to (a source or a statement past the caps, a source or a batch the budget ran out before) decided
+  // nothing: its statements are not checked, never unverified. A statement past the claims cap is never judged at all.
+  const notReached = (n: number): void => {
+    claims.forEach((c, i) => { if (c.numbers.includes(n)) unjudged[i].add(n); });
+  };
+  claims.forEach((c, i) => { if (i >= CITE_CHECK_MAX_CLAIMS) c.numbers.filter((n) => sources.has(n)).forEach((n) => unjudged[i].add(n)); });
+  for (const n of allCited) if (!cited.includes(n)) notReached(n);
 
   try {
     await eachLimited(cited, CITE_CHECK_CONCURRENCY, async (n) => {
       const source = sources.get(n)!;
-      if (budget.signal.aborted || now() > deadline) { unreadable.add(n); return; }
+      if (budget.signal.aborted || now() > deadline) { notReached(n); return; }
       let page: CheckedPage;
       try {
         // The budget ends the wait even when the fetch itself would go on: a page still loading then counts as unreadable.
         page = await untilAborted(ports.fetchPage(source.url, budget.signal), budget.signal);
       } catch (err) {
         logger.info({ host: hostOf(source.url), err: err instanceof Error ? err.message : String(err) }, "cite_check.fetch_threw");
+        // The budget ran out while the page loaded: nothing is known about the page, so its statements are not checked.
+        if (budget.signal.aborted) { notReached(n); return; }
         page = { ok: false };
       }
       if (!page.ok || !page.text.trim()) { unreadable.add(n); return; }
       const mine = checkedClaims.map((c, i) => ({ c, i })).filter(({ c }) => c.numbers.includes(n));
       for (let k = 0; k < mine.length; k += CITE_CHECK_CLAIMS_PER_CALL) {
-        if (budget.signal.aborted || now() > deadline) return;
+        if (budget.signal.aborted || now() > deadline) {
+          mine.slice(k).forEach(({ i }) => unjudged[i].add(n));
+          return;
+        }
         const batch = mine.slice(k, k + CITE_CHECK_CLAIMS_PER_CALL);
         const ask = async (): Promise<boolean[] | null> => {
           try {
@@ -309,13 +322,13 @@ export async function checkReport(text: string, ports: CiteCheckPorts, parent?: 
   }
   const unverified = claims.length - supported - unchecked;
   const summary = zh
-    ? `引用核对（交付前由系统逐条打开来源核对）：${claims.length} 条带引用的结论中 ${supported} 条有来源支持，${unverified} 条标为“未证实”${unchecked ? `，${unchecked} 条因核对未能完成标为“未核对”` : ""}；被引用的 ${cited.length} 个来源中 ${unreadable.size} 个未能打开或读取。`
-    : `Citation check (each source opened and checked by the system before delivery): ${supported} of ${claims.length} cited statements are supported by their sources, ${unverified} are marked unverified${unchecked ? `, ${unchecked} are marked not checked (the check could not be completed for them)` : ""}; ${unreadable.size} of the ${cited.length} cited sources could not be opened or read.`;
+    ? `引用核对（交付前由系统逐条打开来源核对）：${claims.length} 条带引用的结论中 ${supported} 条有来源支持，${unverified} 条标为“未证实”${unchecked ? `，${unchecked} 条因核对未能完成标为“未核对”` : ""}；被引用的 ${allCited.length} 个来源中 ${unreadable.size} 个未能打开或读取。`
+    : `Citation check (each source opened and checked by the system before delivery): ${supported} of ${claims.length} cited statements are supported by their sources, ${unverified} are marked unverified${unchecked ? `, ${unchecked} are marked not checked (the check could not be completed for them)` : ""}; ${unreadable.size} of the ${allCited.length} cited sources could not be opened or read.`;
   const out = `${lines.join("\n").replace(/\s+$/, "")}\n\n---\n\n${summary}\n`;
   metrics.onCiteCheckStatements(supported, unverified, unchecked);
-  logger.info({ claims: claims.length, supported, unverified, unchecked, judgeFailures, sources: cited.length, unreadable: unreadable.size }, "cite_check.done");
+  logger.info({ claims: claims.length, supported, unverified, unchecked, judgeFailures, sources: allCited.length, checkedSources: cited.length, unreadable: unreadable.size, ms: now() - (deadline - CITE_CHECK_BUDGET_MS) }, "cite_check.done");
   return {
-    text: out, checked: true, claims: claims.length, supported, unverified, sources: cited.length, unreadable: unreadable.size, unchecked, judgeFailures,
+    text: out, checked: true, claims: claims.length, supported, unverified, sources: allCited.length, unreadable: unreadable.size, unchecked, judgeFailures,
   };
 }
 

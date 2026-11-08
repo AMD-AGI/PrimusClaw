@@ -127,6 +127,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A research report's citation check reaches up to 80 sources (was 40), and what it never decided is marked not checked (未核对),
+  not unverified: a source or a statement past the caps, a page or a batch the time budget ran out before. A 63-source report had
+  36 statements marked unverified only because their sources were past the old cap. `CITE_CHECK_MODEL` chooses the judge's model
+  (blank: `WEB_FETCH_SUMMARIZE_MODEL`, as before); each judgement logs its model, time and tokens (`cite_check.judge_call`).
 - A research report's citation check no longer marks whole batches unverified when its judge answers nothing: the judge has a
   4096-token output budget (at 1024 claude-haiku-5.5 spent it thinking and replied empty), a batch with no answer is asked once more,
   and one still unanswered is marked not checked (未核对), counted apart, logged (`cite_check.judge_no_answer`) and counted in
