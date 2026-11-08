@@ -597,9 +597,10 @@ describe("B lists a turn sees whole", () => {
     assert.deepEqual([whole.complete, whole.partial], [true, undefined]);
   });
 
-  test("B27 pr_list pages past what it scans: an open list reads GitHub's own page, and nothing names a page that would come back empty", async () => {
-    // 700 open ones, newest first; the scan reads 500 of them.
-    const all = Array.from({ length: 700 }, (_, i) => pr(1000 - i, i === 520 ? { title: "release-gate fixture, do not merge", head: { ref: "release-gate-fixture/head" } } : {}));
+  test("B27 pr_list pages past what it scans with the same filter: no pull request listed twice or skipped, and no page named that would come back empty", async () => {
+    // 700 open ones, newest first, two of them fixtures: one in the first 500 the scan reads, one past them.
+    const fixture = { title: "release-gate fixture, do not merge", head: { ref: "release-gate-fixture/head" } };
+    const all = Array.from({ length: 700 }, (_, i) => pr(1000 - i, i === 20 || i === 520 ? fixture : {}));
     respond = (url) => {
       if (url.pathname !== "/repos/o/r/pulls") return json({}, 404);
       const per = Number(url.searchParams.get("per_page"));
@@ -607,11 +608,20 @@ describe("B lists a turn sees whole", () => {
       return json(url.searchParams.get("state") === "open" ? all.slice((n - 1) * per, n * per) : []);
     };
     const c = await connect(token());
+    const listed: number[] = [];
+    let page: number | null = 1;
+    let last: any = null;
+    while (page !== null) {
+      last = JSON.parse((await call(c, "pr_list", { repo: "o/r", per_page: 50, page })).text);
+      listed.push(...last.items.map((p: any) => p.number));
+      page = last.next_page ?? null;
+    }
+    const want = all.map((p) => p.number).filter((n) => n !== 980 && n !== 480);
+    assert.deepEqual(listed, want, "every one once, in order, the fixtures left out");
+    assert.equal(last.total_count, 698, "read to the end: counted");
     const p11 = JSON.parse((await call(c, "pr_list", { repo: "o/r", per_page: 50, page: 11 })).text);
-    assert.deepEqual([p11.items[0].number, p11.items.length, p11.fixtures_excluded, p11.next_page, p11.total_count], [500, 49, 1, 12, null]);
-    assert.match(p11.partial, /^items holds page 11, 49 of them/);
-    const p14 = JSON.parse((await call(c, "pr_list", { repo: "o/r", per_page: 50, page: 14 })).text);
-    assert.deepEqual([p14.items[0].number, p14.items.length, p14.next_page], [350, 50, 15]);
+    assert.deepEqual([p11.items[0].number, p11.items.length, p11.next_page], [499, 50, 12]);
+    assert.match(p11.partial, /^items holds page 11, 50 of them/);
     const p15 = JSON.parse((await call(c, "pr_list", { repo: "o/r", per_page: 50, page: 15 })).text);
     assert.deepEqual([p15.items.length, p15.next_page ?? null], [0, null]);
     // A merged list past its scan names no page after it, and says to narrow instead.

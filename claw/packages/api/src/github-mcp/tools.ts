@@ -333,7 +333,10 @@ async function scanPulls(
   let fixtures = 0;
   let read = 0;
   let oldestRead = Infinity;
-  for (let n = 1; n <= MAX_SCAN_PAGES && !ended && !settled && !windowRead; n++) {
+  // In creation order a page past the scan is read on to it, so that the items before it are counted with the same filter (a fixture
+  // left out of an earlier page moves every later one): one more than the page needs, to know whether another follows.
+  const pages = ordered ? MAX_SCAN_PAGES : Math.min(MAX_LIST_PAGES, Math.max(MAX_SCAN_PAGES, Math.ceil((want + 1) / 100)));
+  for (let n = 1; n <= pages && !ended && !settled && !windowRead && !(n > MAX_SCAN_PAGES && kept.length > want); n++) {
     const q = { ...filter, state: state === "merged" ? "closed" : state, sort: ordered ? "updated" : "created", direction: "desc", per_page: 100, page: n };
     const list = (await gh.get<any[]>(repoPath(r, "/pulls"), q)).json ?? [];
     read += list.length;
@@ -355,23 +358,12 @@ async function scanPulls(
   }
   const known = ended || windowRead;
   const all = ordered ? [...kept].sort(latestFirst) : kept;
-  // Past what the scan reads, a list in GitHub's own order (newest first, no author or window) is read at GitHub's page, as before
-  // the scan: its fixtures are left out of that page, and the count is not known.
-  if (!known && !ordered && author === null && since === null && all.length < want) {
-    const list = (await gh.get<any[]>(repoPath(r, "/pulls"), { ...filter, state, sort: "created", direction: "desc", per_page: perPage, page })).json ?? [];
-    const shown = includeFixtures ? list : list.filter((p) => !isGateFixture(p));
-    return listAnswer(shown.map(prLine), {
-      total_count: null, complete: false, next_page: list.length < perPage ? null : page + 1, page,
-      ...(list.length - shown.length ? { fixtures_excluded: list.length - shown.length } : {}),
-      note: `this page is GitHub's page ${page} of ${perPage}: past the first ${MAX_SCAN_PAGES * 100} the count is not known`,
-    });
-  }
   const what = state === "all" ? "" : `${state === "merged" ? "closed" : state} `;
   return listAnswer(all.slice((page - 1) * perPage, want).map(prLine), {
     total_count: known ? all.length : null,
     complete: known && page === 1 && all.length <= perPage,
     // A next page only where there is one to give: past what the scan read, a page would come back empty and name the one after it.
-    next_page: all.length > want || (!known && settled) ? page + 1 : null,
+    next_page: all.length > want || (!known && all.length >= want) ? page + 1 : null,
     page,
     ...(opts.sinceText ? { since: opts.sinceText } : {}),
     ...(fixtures ? { fixtures_excluded: fixtures } : {}),
@@ -547,6 +539,8 @@ const SCOPED_SEARCH_REFUSED = "GitHub answered 422: a search narrowed with repo:
 
 /** The most pages of 100 a list reads to filter or order it: past them it says it did not read to the end. */
 const MAX_SCAN_PAGES = 5;
+/** How far a list in creation order is read for a page asked past the scan: GitHub's own page limit. */
+const MAX_LIST_PAGES = 100;
 
 /**
  * Release-gate fixtures: pull requests a release gate opens against its own fixture branches (`release-gate-fixture/base`, heads under
