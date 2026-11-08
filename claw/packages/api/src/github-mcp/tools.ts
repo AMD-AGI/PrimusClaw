@@ -354,7 +354,8 @@ async function scanPulls(
     // close or merge no later than they are updated), or, in creation order, created no later than the last one read.
     if (since !== null && last) windowRead = (ordered ? oldestRead : Date.parse(String(last.created_at)) || 0) < since;
     // Without a window, the reading stops once the page asked for is settled; with one, it reads the whole window, to count it.
-    if (since === null && ordered && !ended && kept.length >= want) settled = timeOf([...kept].sort(latestFirst)[want - 1]) >= oldestRead;
+    // Settled one past the page asked for, so that a next page is named only when it has one to give.
+    if (since === null && ordered && !ended && kept.length > want) settled = timeOf([...kept].sort(latestFirst)[want]) >= oldestRead;
   }
   const known = ended || windowRead;
   const all = ordered ? [...kept].sort(latestFirst) : kept;
@@ -363,7 +364,7 @@ async function scanPulls(
     total_count: known ? all.length : null,
     complete: known && page === 1 && all.length <= perPage,
     // A next page only where there is one to give: past what the scan read, a page would come back empty and name the one after it.
-    next_page: all.length > want || (!known && all.length >= want) ? page + 1 : null,
+    next_page: all.length > want ? page + 1 : null,
     page,
     ...(opts.sinceText ? { since: opts.sinceText } : {}),
     ...(fixtures ? { fixtures_excluded: fixtures } : {}),
@@ -371,7 +372,7 @@ async function scanPulls(
       ...(known ? [] : [
         `read the ${read} most recently ${ordered ? "updated" : "created"} ${what}pull requests, not all of them: how many there are in all is not known`
           + (ordered && !settled ? `, and older ones may have ${state === "merged" ? "merged" : "closed"} later than some shown` : "")
-          + (!settled && all.length <= want ? `; no more can be read page by page: narrow with since${author === null ? " or author" : ""}` : ""),
+          + (all.length <= want ? `; no more can be read page by page: narrow with since${author === null ? " or author" : ""}` : ""),
       ]),
       ...(fixtures ? [`${fixtures} release-gate fixture pull request(s) of those read are left out (test fixtures, never the project's work); include_fixtures: true lists them`] : []),
     ].join("; ") || undefined,

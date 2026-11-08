@@ -624,6 +624,15 @@ describe("B lists a turn sees whole", () => {
     assert.match(p11.partial, /^items holds page 11, 50 of them/);
     const p15 = JSON.parse((await call(c, "pr_list", { repo: "o/r", per_page: 50, page: 15 })).text);
     assert.deepEqual([p15.items.length, p15.next_page ?? null], [0, null]);
+    // A page that holds exactly the last of a filtered list names no page after it: 50 merged, then only closed ones.
+    respond = (url) => (url.pathname === "/repos/o/r/pulls"
+      ? json(Number(url.searchParams.get("page")) === 1 ? Array.from({ length: 100 }, (_, i) => {
+          const at = new Date(Date.UTC(2026, 10, 7) - i * 60_000).toISOString();
+          return pr(3000 - i, { state: "closed", merged_at: i < 50 ? at : null, closed_at: at, updated_at: at });
+        }) : [])
+      : json({}, 404));
+    const exact = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", per_page: 50 })).text);
+    assert.deepEqual([exact.items.length, exact.next_page ?? null], [50, null]);
     // A merged list past its scan names no page after it, and says to narrow instead.
     const t = (i: number) => new Date(Date.UTC(2026, 10, 7) - i * 60_000).toISOString();
     respond = (url) => (url.pathname === "/repos/o/r/pulls"
