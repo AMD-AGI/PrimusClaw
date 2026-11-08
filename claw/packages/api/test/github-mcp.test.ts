@@ -649,6 +649,8 @@ describe("B lists a turn sees whole", () => {
     assert.match(narrowed.note, /issue_search \(is:pr repo:o\/r is:merged base:main\), or narrow with since/, "the search carries the list's own filters");
     const windowed = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", since: "2020-01-01", per_page: 50, page: 50 })).text);
     assert.match(windowed.note, /issue_search \(is:pr repo:o\/r is:merged merged:>=2020-01-01T00:00:00Z\)$/);
+    const withFixtures = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", include_fixtures: true, per_page: 50, page: 50 })).text);
+    assert.match(withFixtures.note, /issue_search \(is:pr repo:o\/r is:merged, include_fixtures: true\)/);
     // A fork's branch (alice:feature) has no search of its own: the search names a branch in every fork, so none is offered.
     const forked = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", head: "alice:feature", per_page: 50, page: 50 })).text);
     assert.match(forked.note, /pr_list reads no further: narrow with since/);
@@ -683,6 +685,14 @@ describe("B lists a turn sees whole", () => {
     assert.equal(out.refs_by_repo, undefined);
     assert.match(String(out.refs_by_repo_cut), /by_repo counts them/);
     assert.ok(typeof out.partial === "string");
+    // 300 repositories with long names: by_repo itself leaves no room, and keeps the ones with the most matches.
+    const long = Array.from({ length: 300 }, (_, i) => `an-organisation-with-a-rather-long-name/a-repository-with-a-long-name-too-${i}`);
+    const many = listAnswer(items, { total_count: 9000, complete: false, by_repo: Object.fromEntries(long.map((r, i) => [r, 300 - i])), refs_by_repo: {}, page: 1 });
+    assert.ok(JSON.stringify(many).length <= GITHUB_LIST_MAX_CHARS, `${JSON.stringify(many).length}`);
+    const kept = Object.keys(many.by_repo as object);
+    assert.ok(kept.length > 0 && kept.length < 300 && kept[0] === long[0], `${kept.length}`);
+    const left = long.slice(kept.length).reduce((n, _r, i) => n + (300 - kept.length - i), 0);
+    assert.equal(many.by_repo_cut, `${300 - kept.length} more repositories (${left} matches) are not listed in by_repo: name one with repo: to count it`);
     const small = listAnswer(items.slice(0, 2), { total_count: 2, complete: true, by_repo: { a: 2 }, refs_by_repo: { a: ["#1", "#2"] } });
     assert.deepEqual(small.refs_by_repo, { a: ["#1", "#2"] }, "kept where it fits");
 

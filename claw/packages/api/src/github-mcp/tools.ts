@@ -238,8 +238,13 @@ export function listAnswer(
     page?: number; count_exact?: boolean;
   },
 ): Record<string, unknown> {
-  const headOf = (refs: boolean) => ({
-    total_count: meta.total_count ?? null, shown: 0, complete: false, ...(meta.by_repo ? { by_repo: meta.by_repo } : {}),
+  const repos = meta.by_repo ? Object.entries(meta.by_repo) : [];
+  const headOf = (refs: boolean, repoKeep: number = repos.length) => ({
+    total_count: meta.total_count ?? null, shown: 0, complete: false,
+    ...(meta.by_repo ? { by_repo: Object.fromEntries(repos.slice(0, repoKeep)) } : {}),
+    ...(repoKeep < repos.length
+      ? { by_repo_cut: `${repos.length - repoKeep} more repositories (${repos.slice(repoKeep).reduce((n, [, c]) => n + c, 0)} matches) are not listed in by_repo: name one with repo: to count it` }
+      : {}),
     ...(meta.refs_by_repo && refs ? { refs_by_repo: meta.refs_by_repo } : {}),
     ...(meta.refs_by_repo && !refs ? { refs_by_repo_cut: "too many repositories for every number to fit: by_repo counts them; list one repository's with its repo: qualifier" } : {}),
     ...(meta.since ? { since: meta.since } : {}),
@@ -249,8 +254,11 @@ export function listAnswer(
   // The envelope's own size, with room for the fields filled in below (the partial line among them). An envelope that leaves no room
   // for them drops its numbers per repository first (by_repo still counts them): an answer over the cap is cut in two by Brain, and
   // is no longer JSON at all.
+  const room = (h: object): boolean => JSON.stringify(h).length + ENVELOPE_ROOM + PARTIAL_ROOM <= GITHUB_LIST_MAX_CHARS;
   let head = headOf(true);
-  if (JSON.stringify(head).length + ENVELOPE_ROOM + PARTIAL_ROOM > GITHUB_LIST_MAX_CHARS) head = headOf(false);
+  if (!room(head)) head = headOf(false);
+  // Still no room: the repositories with the most matches are kept in by_repo, the rest counted in one line.
+  for (let keep = repos.length - 1; !room(head) && keep >= 0; keep--) head = headOf(false, keep);
   const kept: unknown[] = [];
   let size = JSON.stringify(head).length + ENVELOPE_ROOM + PARTIAL_ROOM;
   for (const item of items) {
@@ -385,7 +393,8 @@ async function scanPulls(
           + (all.length <= want
             ? `; pr_list reads no further`
               + (searchOfList(r, state, author, filter, opts.sinceText ?? null) !== null
-                ? `: for older ones search with issue_search (${searchOfList(r, state, author, filter, opts.sinceText ?? null)})` : "")
+                ? `: for older ones search with issue_search (${searchOfList(r, state, author, filter, opts.sinceText ?? null)}`
+                  + `${includeFixtures ? ", include_fixtures: true" : ""})` : "")
               + (since === null ? `${searchOfList(r, state, author, filter, null) !== null ? ", or" : ":"} narrow with since` : "")
             : ""),
       ]),
