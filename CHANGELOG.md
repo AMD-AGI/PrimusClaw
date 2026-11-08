@@ -133,6 +133,9 @@ record it.
   cannot do that, shall I file an issue". It also reads devenv_list in the turn for every question about the person's machines (how
   many, one by name, reconnecting one's connector) instead of repeating an earlier turn's read, except which session the chat itself
   is attached to, and never says it reconnected a connector. Router prompt router-devenv-v12.
+- A message sent while the assistant is still answering the one before it hears "收到，我看一下" 3.5 s after it came in again: the
+  first-reply line of a turn that has not begun (its message queued, or its run not yet claimed) is held back only by that line
+  itself, no longer by the answer the turn in front says meanwhile. A follow-up queued behind a slow answer heard nothing for 7.8 s.
 - The brief also leaves out a release-gate fixture whose watch ended before polls kept a pull request's branches (2026-11-08 retest:
   "#381: 2 comments" still listed): each ended watch whose news is from the last 7 days has its branches read once with its owner's
   token, beside the poll pass and never holding it back (`claw_work_item_subscriptions.refs_read_at`, added at api start), claimed across replicas and

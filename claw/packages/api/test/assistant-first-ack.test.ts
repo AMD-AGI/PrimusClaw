@@ -15,6 +15,8 @@
  *   F5  a say the router started and that was refused does not hold the line back; one still being written does
  *   F6  a message the route queues behind a running turn hears the line 3.5 s after it came in, before its run opens, and the
  *       answer of the run that later carries it takes the line's place
+ *   F6b the turn in front answering its own message after the queued one came in does not hold the queued one's line back (E249,
+ *       2026-11-08: a follow-up heard nothing for 7.8 s); the line itself still does, and a run that has begun is held back as before
  *   F7  a turn that starts an item after the line: the start notice takes the line's place, and the router's words after it are added
  *       to that same message (one message in the channel, as without the line); but never once the line's message shows something
  *       else: after the router's say took its place, or for a second item's notice, the notice is its own message, as without the line;
@@ -222,6 +224,35 @@ describe("assistant first ack by the clock", { skip }, () => {
     assert.equal(answer.payload.replaces, ack.lookupAckSayId("alice", mid), "one message: the answer edits the line");
     // The run's own timer, armed when it opened, finds the line said.
     assert.equal(await first(alice.routerSid, mid), "spoke");
+  });
+
+  test("F6b the turn in front answering after a message queued does not hold that message's line back", async () => {
+    await w.subscribe("alice");
+    // The turn in front is answering the person's earlier message; the follow-up queues behind it (no timer: the check is called here).
+    const front = await turn("global-cpu 的节点列出来");
+    const pending = (await w.q("INSERT INTO claw_pending_messages (session_id, content) VALUES ($1, $2) RETURNING id", [alice.routerSid, "你列的条数和总数对得上吗？"]))[0].id;
+    const mid = `claw-pending-${pending}`;
+    await message(alice.routerSid, mid, "你列的条数和总数对得上吗？");
+    await sleep(20);
+    const began = (await w.q("SELECT started_at FROM claw_tasks WHERE task_id = $1", [front.taskId]))[0].started_at;
+    await w.mod.outbound.recordAssistantSay({
+      userId: "alice", sessionId: alice.routerSid, text: "global-cpu 一共 6 个节点：vm07 到 vm12。", turnMessageId: front.mid, turnBegan: began,
+    }, w.sayDeps);
+    assert.equal(await first(alice.routerSid, mid), "said", "the follow-up hears its line though the turn in front just spoke");
+    assert.deepEqual((await says()).map((r) => r.say_id).filter((id) => id === ack.lookupAckSayId("alice", mid)).length, 1);
+    assert.equal(await first(alice.routerSid, mid), "spoke", "its own line holds a second one back");
+    // A queued run row (not yet claimed) is the same: the turn in front's answer does not hold its line back.
+    const queued = await turn("要我处理的呢？", {}, "queued");
+    await w.mod.outbound.recordAssistantSay({
+      userId: "alice", sessionId: alice.routerSid, text: "没有等你确认的。", turnMessageId: front.mid, turnBegan: began,
+    }, w.sayDeps);
+    assert.equal(await first(alice.routerSid, queued.mid), "said");
+    // A run that has begun is held back by what was said since it began, as before.
+    const running = await turn("第一个问题的数字再说一下");
+    await w.mod.outbound.recordAssistantSay({
+      userId: "alice", sessionId: alice.routerSid, text: "还是 6 个。", turnMessageId: running.mid, turnBegan: new Date(),
+    }, w.sayDeps);
+    assert.equal(await first(alice.routerSid, running.mid), "spoke");
   });
 
   test("F4 a turn whose run waited in the queue: the answer still replaces the line said while it waited", async () => {
