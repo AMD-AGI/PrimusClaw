@@ -237,4 +237,63 @@ describe("assistant lookup ack and silent turns", { skip }, () => {
     assert.equal(task.report_at_turn_cap, true);
     assert.ok(Number(task.max_turns) > 0, "a router turn has a cap to report at");
   });
+
+  test("A8 a turn whose own text is being shown has started to answer: no line over it; once taken back, the line comes", async (t0) => {
+    const t = await turn("下个月 Kestrel 的冻结期从哪天开始？");
+    const realTombstone = { ...w.mod.consumer.tombstoneReader };
+    Object.assign(w.mod.consumer.tombstoneReader, { has: async () => false });
+    t0.after(() => { Object.assign(w.mod.consumer.tombstoneReader, realTombstone); });
+    // From Brain, through the consumer: the deltas are not stored, and the run is marked once.
+    const deliver = async (event: Record<string, unknown>) => {
+      const verdicts: string[] = [];
+      await w.mod.consumer.consumeEventDelivery({
+        subject: `events.${alice.routerSid}`, data: new TextEncoder().encode(JSON.stringify({ ...event, message_id: t.mid, ts: Date.now() })),
+        seq: 9_500 + ++seq, ack: () => { verdicts.push("ack"); }, nak: () => { verdicts.push("nak"); },
+      } as never);
+      assert.deepEqual(verdicts, ["ack"]);
+    };
+    const delta = { type: "toolTextDelta", tool: "mcp__assistant__say", actionId: "text-1-0", text: "下个月冻结期", source: "text" };
+    await deliver(delta);
+    const stored = await w.q("SELECT count(*)::int AS n FROM claw_session_events WHERE session_id = $1", [alice.routerSid]);
+    assert.equal(stored[0].n, 0, "a preview is never stored");
+    assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "writing");
+    assert.equal(await ack.ackFirstReply(alice.routerSid, t.mid, { ...w.sayDeps, enabled: true, users: "alice" }), "writing");
+    // A say's own preview (no source) marks nothing: that is the stored say start's to tell.
+    const other = await turn("还有别的吗");
+    await w.mod.consumer.consumeEventDelivery({
+      subject: `events.${alice.routerSid}`, seq: 9_600,
+      data: new TextEncoder().encode(JSON.stringify({ type: "toolTextDelta", tool: "mcp__assistant__say", actionId: "toolu_1", text: "还", message_id: other.mid })),
+      ack: () => {}, nak: () => {},
+    } as never);
+    const marked = await w.q("SELECT metadata ? 'text_preview' AS marked FROM claw_tasks WHERE task_id = $1", [other.task_id]);
+    assert.equal(marked[0].marked, false);
+    // Taken back (a tool call followed it): the turn has said nothing after all, and a late delta does not mark it again.
+    await deliver({ type: "toolTextVoid", tool: "mcp__assistant__say", actionId: "text-1-0", reason: "tool_call", source: "text" });
+    ack.resetLookupAckCacheForTest();
+    await deliver({ ...delta, text: "下个月冻结期从" });
+    assert.equal(await run(alice.routerSid, start(t.mid, "web_search")), "said");
+    assert.deepEqual((await says()).map((r) => r.text), ["收到，我上网查一下。"]);
+  });
+
+  test("A9 a router turn has its own text streamed only for the people who have it, and only when it answers them", async (t0) => {
+    const speed = await import("../src/assistant/router-speed.js");
+    const saved = { ...speed.streamTextSettings };
+    t0.after(() => { Object.assign(speed.streamTextSettings, saved); });
+    const ask = async (prompt: string) => {
+      const t = await turn(prompt);
+      const task: Record<string, unknown> = { task_id: t.task_id, message_id: t.mid, prompt };
+      await w.mod.role.applySessionRoleToTask(task, alice.routerSid);
+      return task;
+    };
+    Object.assign(speed.streamTextSettings, { all: false, users: new Set(["someone-else"]) });
+    assert.equal((await ask("下个月冻结期从哪天开始？")).stream_text_as, undefined, "not named: as before");
+    Object.assign(speed.streamTextSettings, { all: false, users: new Set(["alice"]) });
+    const task = await ask("下个月冻结期从哪天开始？");
+    assert.equal(task.stream_text_as, "mcp__assistant__say");
+    assert.deepEqual(task.stream_tool_text, ["mcp__assistant__say"]);
+    assert.equal((await ask("[work_event] #1 (item_id: kwi_x) ready v1: done")).stream_text_as, undefined, "a report's text is not the person's");
+    Object.assign(speed.streamTextSettings, { all: true, users: new Set() });
+    assert.equal((await ask("hi")).stream_text_as, "mcp__assistant__say", "on for everyone");
+  });
 });
+

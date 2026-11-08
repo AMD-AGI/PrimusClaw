@@ -83,6 +83,15 @@ function toolTextSoFar(
   }
 }
 
+/** Run a `StreamTurnOptions.text` callback: one that throws is logged and the turn goes on, as for `toolTextSoFar`. */
+function plainTextCallback(call: () => void): void {
+  try {
+    call();
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message }, "llm.plain_text.callback_failed");
+  }
+}
+
 /**
  * The stream's events, with an event that is not JSON reported as a cut stream.
  *
@@ -301,7 +310,10 @@ async function streamingTurn(
         case "content_block_start": {
           const b = evt.content_block as ContentBlock;
           blocks[evt.index] = structuredClone(b);
-          if (b.type === "tool_use") toolJsonBuf.set(evt.index, "");
+          if (b.type === "tool_use") {
+            toolJsonBuf.set(evt.index, "");
+            if (options?.text) plainTextCallback(() => options.text!.onToolCall());
+          }
           break;
         }
         case "content_block_delta": {
@@ -310,6 +322,9 @@ async function streamingTurn(
           const d = evt.delta as unknown as Record<string, unknown>;
           if (cur.type === "text" && d.type === "text_delta") {
             cur.text += String(d.text ?? "");
+            const soFar = cur.text;
+            const index = evt.index;
+            if (options?.text && soFar) plainTextCallback(() => options.text!.onText({ index, text: soFar }));
           } else if (cur.type === "thinking" && d.type === "thinking_delta") {
             cur.thinking += String(d.thinking ?? "");
           } else if (cur.type === "thinking" && d.type === "signature_delta") {

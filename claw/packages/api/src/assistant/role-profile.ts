@@ -56,7 +56,7 @@ import { renderRouterSelfSection, ROUTER_SELF_PROMPT_VERSION, selfStatusOn } fro
 import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 import { disciplineOn } from "./discipline.js";
-import { applyRouterTurnSpeed } from "./router-speed.js";
+import { applyRouterTurnSpeed, streamTextOn } from "./router-speed.js";
 import { routerCite } from "./citations.js";
 import { applyWorkerResearch, assistantResearchOn, RESEARCH_PROMPT_VERSION, ROUTER_RESEARCH_PROMPT } from "./research.js";
 
@@ -385,8 +385,9 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       const rerun = await rerunModelOf(sessionId, messageId);
       if (rerun) task.model = rerun;
     }
-    // Little thinking, and the say streamed while it is written (`router-speed.ts`).
-    applyRouterTurnSpeed(task);
+    // Little thinking, and the say streamed while it is written (`router-speed.ts`); for the users who have it, the turn's own text
+    // too, when it answers them (a worker's report is not theirs: what the turn writes then is not for them).
+    applyRouterTurnSpeed(task, undefined, streamTextOn(role.userId) && !stringField(task, "prompt").startsWith(WORK_EVENT_PREFIX));
     await addReplyLanguage(task, sessionId);
     // Even with no words (a turn the system starts): the list is what the prompt says to answer from.
     task.prompt = withTurnState(stringField(task, "prompt"), state);
@@ -400,6 +401,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       ...(cite ? { cite: ROUTER_CITE_PROMPT_VERSION } : {}), self: ROUTER_SELF_PROMPT_VERSION, selfStatus: self,
       ...(discipline ? { discipline: ROUTER_DISCIPLINE_PROMPT_VERSION } : {}),
       ...(research ? { research: RESEARCH_PROMPT_VERSION } : {}),
+      ...(task.stream_text_as ? { streamText: true } : {}),
     }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);

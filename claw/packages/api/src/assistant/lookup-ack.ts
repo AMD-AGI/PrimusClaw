@@ -80,8 +80,35 @@ async function routerUser(q: Querier, sessionId: string): Promise<string | null>
   return row?.user_id ?? null;
 }
 
-/** For the tests: forget which sessions were routers. */
-export function resetLookupAckCacheForTest(): void { routerUserOf.clear(); }
+/** For the tests: forget which sessions were routers, and which turns' text was noted. */
+export function resetLookupAckCacheForTest(): void { routerUserOf.clear(); textPreviewNoted.clear(); }
+
+/** The turns whose shown text this process has noted, by message id, and how: a delta every few hundred ms writes the run once. */
+const textPreviewNoted = new Map<string, boolean>();
+
+/**
+ * Note on the run answering `messageId` that its own text is being shown as its say's (`stream_text_as`: a `toolTextDelta` with
+ * `source: "text"`), or that it was taken back (`toolTextVoid`, same source): the turn has started to answer, so the "on it" line is not
+ * said over it (`reasonToStaySilent`), and its end takes back what was shown if it does not say it (`router-turn-end.ts`). The deltas
+ * are never stored, and the events of one turn reach every API process, so it is kept on the run. Taken back wins: a delta handled late
+ * by another process never marks the run again. Best effort: a failure is logged and leaves the run as it was.
+ */
+export async function noteTextPreview(sessionId: string, messageId: string, showing: boolean, q: Querier = (t, p) => db.query(t, p)): Promise<void> {
+  if (!sessionId || !messageId || textPreviewNoted.get(messageId) === showing) return;
+  if (textPreviewNoted.size >= ROUTER_CACHE_MAX) textPreviewNoted.clear();
+  textPreviewNoted.set(messageId, showing);
+  try {
+    await q(
+      `UPDATE claw_tasks SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{text_preview}', to_jsonb($3::boolean), true)
+        WHERE session_id = $1 AND origin = 'chat' AND metadata->>'message_id' = $2
+          AND ($3::boolean = false OR NOT (COALESCE(metadata, '{}'::jsonb) ? 'text_preview'))`,
+      [sessionId, messageId, showing],
+    );
+  } catch (err) {
+    textPreviewNoted.delete(messageId);
+    logger.warn({ err: (err as Error)?.message, sessionId, messageId }, "assistant.text_preview_note_failed");
+  }
+}
 
 /**
  * Why the turn answering `messageId` is not to be told "on it" now, or null when it is: read fresh each time, so the check after the
@@ -91,11 +118,12 @@ async function reasonToStaySilent(
   q: Querier, sessionId: string, userId: string, messageId: string, pendingSince?: Date,
 ): Promise<string | null> {
   let run = (await q(
-    `SELECT COALESCE(started_at, created_at) AS began, status, COALESCE(prompt, input->>'prompt', '') AS prompt
+    `SELECT COALESCE(started_at, created_at) AS began, status, COALESCE(prompt, input->>'prompt', '') AS prompt,
+            metadata->>'text_preview' AS text_preview
        FROM claw_tasks WHERE session_id = $1 AND origin = 'chat' AND metadata->>'message_id' = $2
       ORDER BY created_at DESC LIMIT 1`,
     [sessionId, messageId],
-  )).rows[0] as { began: Date; status: string; prompt: string } | undefined;
+  )).rows[0] as { began: Date; status: string; prompt: string; text_preview?: string | null } | undefined;
   // A message still queued behind another turn (a worker's report being read): no run yet, and the person has waited since it came in.
   if (!run && pendingSince) {
     const pending = /^claw-pending-(\d+)$/.exec(messageId);
@@ -113,6 +141,8 @@ async function reasonToStaySilent(
     ? await q("SELECT 1 FROM claw_assistant_says WHERE say_id = $1 LIMIT 1", [lookupAckSayId(userId, messageId)])
     : await q("SELECT 1 FROM claw_assistant_says WHERE user_id = $1 AND created_at >= $2 LIMIT 1", [userId, run.began]);
   if (said.rowCount) return "spoke";
+  // Its own text is on the person's screen as it is written (`noteTextPreview`): the turn has started to answer, as with a say.
+  if (run.text_preview === "true") return "writing";
   // A say the router has started and that has not ended (written beside the lookup, still being stored). One that ended stored a row
   // (`spoke`) or was refused: a refused say holds nothing back, the router writes it again a few seconds later (2026-11-07 run:
   // cat-memory-ro-001 and cat-items-ro-001, a say refused at 3.2 s and said again at 5.3 s and 5.9 s).

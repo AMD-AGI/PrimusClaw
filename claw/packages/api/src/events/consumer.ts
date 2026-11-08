@@ -31,7 +31,7 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTIO
 import { skipsSkillSelection } from "../assistant/role-profile.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
-import { ackBeforeLookupInBackground } from "../assistant/lookup-ack.js";
+import { ackBeforeLookupInBackground, noteTextPreview } from "../assistant/lookup-ack.js";
 import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
 import { rerunOnFallback } from "../assistant/model-fallback.js";
 import { a2aPushEnabled } from "../routes/a2a-flags.js";
@@ -447,6 +447,10 @@ export async function consumeEventDelivery(msg: {
     // takes such a preview back (`toolTextVoid`): it is about the preview only.
     if (event.type === TOOL_TEXT_DELTA_EVENT || event.type === TOOL_TEXT_VOID_EVENT) {
       msg.ack();
+      // A router turn's own text shown as its say's (`stream_text_as`), or taken back: noted on its run (`noteTextPreview`).
+      if (event.source === "text" && typeof event.message_id === "string") {
+        await noteTextPreview(sessionId, event.message_id, event.type === TOOL_TEXT_DELTA_EVENT);
+      }
       return;
     }
 

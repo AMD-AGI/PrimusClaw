@@ -893,6 +893,14 @@ export const CLAW_ASSISTANT_ROUTER_EFFORT = routerEffortSetting(env("CLAW_ASSIST
 // `false` stops publishing a router's `say` while the model writes it (`ExecuteRequest.stream_tool_text`, `toolTextDelta` events): a
 // channel that follows the turn shows the words as they come instead of when the step ends.
 export const CLAW_ASSISTANT_STREAM_SAY = envBool("CLAW_ASSISTANT_STREAM_SAY", true);
+// `on` publishes a router turn's own text (outside any tool call) as its say's text while the model writes it, for every user
+// (`ExecuteRequest.stream_text_as`, `assistant/router-speed.ts`): a turn that ends in plain text is said by the server only after it ends
+// (`deliverUnsaidAnswer`), so without it the person sees none of its words until then. Off (the default), only the users named in
+// CLAW_ASSISTANT_STREAM_TEXT_USERS (Claw user ids, comma-separated) get it: the evaluation identities first. Needs CLAW_ASSISTANT_STREAM_SAY.
+export const CLAW_ASSISTANT_STREAM_TEXT = env("CLAW_ASSISTANT_STREAM_TEXT", "off").trim().toLowerCase() === "on";
+export const CLAW_ASSISTANT_STREAM_TEXT_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_ASSISTANT_STREAM_TEXT_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
 // `true` lets a router's `say` cite where its answer came from (`assistant/citations.ts`): the model writes [1], [2] in the text and
 // names each number's address in `sources`; Brain keeps only addresses this turn's lookups returned, and an `assistant.say` carries
 // them as `sources` for the channel to show. Off (the default): no `sources` on `say`, and the prompt asks for links in the text.

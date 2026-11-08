@@ -437,4 +437,31 @@ describe("assistant router turn end", { skip }, () => {
     assert.equal(await end(turn, { finalText: "Said it." }), "skipped");
     assert.deepEqual((await says()).map((s) => [s.text, s.fallback]), [[`Done: ${ANSWER}`, false]]);
   });
+
+  test("T12 a turn whose own text was shown as it was written has it taken back when the text is not said as its answer", async () => {
+    const shownTurn = async (prompt: string) => {
+      const turn = await endedTurn(prompt);
+      await (await import("../src/assistant/lookup-ack.js")).noteTextPreview(alice.routerSid, turn.mid, true);
+      return turn;
+    };
+    const voids = () => w.events.filter((e) => e.type === "toolTextVoid");
+    // Said as the answer: what was shown is the message, nothing is taken back.
+    const said = await shownTurn("autopilot 有几台节点");
+    assert.equal(await end(said, { finalText: "有 3 台。", messageId: said.mid }), "said");
+    assert.deepEqual(voids(), []);
+    // Withheld (it names a tool): the words shown are taken back, for that turn, and the system's notice is said instead.
+    const leaked = await shownTurn("autopilot 有几台节点");
+    assert.equal(await end(leaked, { finalText: "我调用了 mcp__autopilot__get_status，有 3 台。", messageId: leaked.mid }), "said");
+    assert.deepEqual(voids().map((e) => [e.tool, e.message_id, e.reason]), [["mcp__assistant__say", leaked.mid, "withheld"]]);
+    // Failed after its text was shown: taken back too.
+    w.events.length = 0;
+    const failed = await shownTurn("autopilot 有几台节点");
+    assert.equal(await end(failed, { failed: true, finalText: "boom", messageId: failed.mid }), "said");
+    assert.deepEqual(voids().map((e) => e.reason), ["turn_lost"]);
+    // Nothing shown (the switch off for this person): nothing to take back, as before.
+    w.events.length = 0;
+    const plain = await endedTurn("autopilot 有几台节点");
+    assert.equal(await end(plain, { finalText: "我调用了 mcp__autopilot__get_status，有 3 台。", messageId: plain.mid }), "said");
+    assert.deepEqual(voids(), []);
+  });
 });
