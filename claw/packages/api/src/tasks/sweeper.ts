@@ -1138,6 +1138,13 @@ async function restoreFinishOnlyTasks(extraWhere: string, params: unknown[]): Pr
                                 THEN NULL ELSE metadata->'app_finish_prior'->>'failure_reason' END`,
           `error_message = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
                                THEN NULL ELSE metadata->'app_finish_prior'->>'error_message' END`,
+          // What a success reported by the run's own holder carries (`outcomeOf`): the state
+          // directory and the application's stop reason.
+          `captures = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
+                          THEN COALESCE(captures, '{}'::jsonb) || (SELECT jsonb_strip_nulls(jsonb_build_object(
+                                 'session_dir', r.state_dir, 'stop_reason', left(r.last_exit->>'stop_reason', 300)))
+                               FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id)
+                          ELSE captures END`,
         ],
         where: `mode = 'app' AND metadata->'app_finish_prior' IS NOT NULL AND ${extraWhere}`,
         params,
@@ -1354,6 +1361,65 @@ export async function requeueUnfinishedAppRuns(): Promise<number> {
     { requeued: rows.length, ids: rows.map((row: ClawTaskRow) => row.task_id) },
     "sweeper.requeued_unfinished_app_runs",
   );
+  return rows.length;
+}
+
+/** How many times one app run is handed to a new Brain after its holder went away; past it the run is closed as worker_lost. */
+export const APP_TAKEOVER_REQUEUE_MAX = 10;
+
+/**
+ * Hand an app run whose holder went away to another Brain, instead of closing it as `worker_lost`.
+ *
+ * A Brain that drains (a release) or dies leaves its app run to be taken over, and the takeover
+ * used to come only from the queue redelivering the task's message. The task stream keeps a
+ * message for `resolveTaskStreamMaxAgeNs` (2 h 41 min on the default budget), and an app run
+ * routinely outlives that: on 2026-11-08 a three-hour run's Brain was drained at 3 h 16 min, there
+ * was no message left to redeliver, nobody took the run over, and `reapLostLeases` closed it as
+ * `worker_lost` -- while the application finished normally six minutes later and wrote
+ * `final: true, returncode: 0` to its state directory, which nothing then read.
+ *
+ * So the run is requeued: the scheduler dispatches it again and the Brain that takes it reconciles
+ * the run row from where it is, which is the same takeover a redelivery gives. The new holder reads
+ * `exit.json` when it finds the process or the sandbox gone, so an application that finished in
+ * the gap ends as the success it was, and one still running carries on.
+ *
+ * Only after the lease has been gone for the grace, the same wait `reapLostLeases` makes, so a
+ * redelivery that is still coming lands first; only a run row a live AppRunner drives (a run in
+ * `finishing` has its own hand-over, `requeueUnfinishedAppRuns`); not a finish-only dispatch; not
+ * past the task's deadline; and bounded, so a run that loses every holder is closed in the end.
+ * `started_at` and `deadline_at` are kept: the run has not started again.
+ */
+export async function requeueLostAppLeases(): Promise<number> {
+  const rows = await applyTaskStatusTransition("queued", {
+    extra: {
+      lease_owner: null,
+      lease_expires_at: null,
+      heartbeat_at: null,
+      internal_token_hash: null,
+      attempt_id: null,
+    },
+    setSql: [`metadata = jsonb_set(${requeueSojournSql("COALESCE(metadata, '{}'::jsonb)")},
+         '{app_takeover_requeues}', to_jsonb(COALESCE((metadata->>'app_takeover_requeues')::int, 0) + 1))`],
+    where: `mode = 'app'
+        AND executor = 'brain'
+        AND status IN ('preparing','running')
+        AND metadata->'app_finish_prior' IS NULL
+        AND lease_expires_at IS NOT NULL
+        AND lease_expires_at < NOW() - ($1::int * INTERVAL '1 second')
+        AND (deadline_at IS NULL OR deadline_at > NOW())
+        AND COALESCE((metadata->>'app_takeover_requeues')::int, 0) < $2::int
+        AND EXISTS (SELECT 1 FROM claw_app_runs r
+                     WHERE r.task_id = claw_tasks.task_id AND r.state IN ${APP_RUN_DRIVEN_STATES})`,
+    params: [LEASE_LOST_GRACE_SEC, APP_TAKEOVER_REQUEUE_MAX],
+  });
+  if (!rows.length) return 0;
+  logger.warn(
+    { requeued: rows.length, graceSec: LEASE_LOST_GRACE_SEC,
+      rows: rows.map((row: ClawTaskRow) => ({ task_id: row.task_id, session_id: row.session_id,
+        requeues: Number(row.metadata?.app_takeover_requeues ?? 0) })) },
+    "sweeper.requeued_lost_app_leases",
+  );
+  metrics.onQueueEntered("requeue", rows.length);
   return rows.length;
 }
 
@@ -3152,6 +3218,8 @@ export async function sweeperTick(): Promise<void> {
   // backstop, so a run that is both past its budget and abandoned is closed
   // with the reason that explains it rather than the one that noticed second.
   await runContained("sweeper.requeued_doorbell_leases_failed", () => requeueLostDoorbellLeases());
+  // Before reapLostLeases: an app run whose holder went away is handed to another Brain, not closed.
+  await runContained("sweeper.lost_app_leases_failed", requeueLostAppLeases);
   await runContained("sweeper.lost_leases_failed", reapLostLeases);
   // After the reapers that close a task: a run they closed mid-finish is handed back here.
   // First one closed before its holder reached `finishing`, so the requeue below takes it in this tick.

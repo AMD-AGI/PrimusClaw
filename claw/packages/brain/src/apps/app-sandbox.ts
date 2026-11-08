@@ -410,6 +410,82 @@ export async function ensureAppSandbox(
   }
 }
 
+/** Component label of a reader sandbox: made only to read a run's state directory, never to run it. */
+export const APP_READER_COMPONENT = "app-reader";
+/**
+ * Env a reader sandbox carries its run's id under. Not {@link APP_RUN_ID_ENV}: the run's own
+ * lookup (`findLiveAppSandboxes`) matches on that, and a reader it found would be adopted as the
+ * run's sandbox and the application started in it.
+ */
+export const APP_READER_ENV = "CLAW_APP_READER_OF";
+/**
+ * What a reader is given: enough to `cat` one file from shared storage, and no accelerator. Not
+ * the run's resources: those are sized for the application, and a reader made with them took a
+ * second application's worth of capacity only to read `exit.json`.
+ */
+export const APP_READER_RESOURCES: Readonly<Record<string, string>> = Object.freeze({
+  cpu: "1", memory: "2Gi", "ephemeral-storage": "1Gi",
+});
+/** A reader is stopped as soon as it has been read from; this bounds one whose Brain died first. */
+export const APP_READER_TIMEOUT_SEC = 600;
+
+/**
+ * A small sandbox in the run's workspace, made only to read the run's state directory -- which
+ * is shared storage, so it outlives the run's own sandbox -- once that sandbox is gone. The run's
+ * image (it has the shell the read needs), {@link APP_READER_RESOURCES}, no spec env and no
+ * credentials. Returns once it is Running. The caller stops it when the read is done.
+ */
+export async function createAppReaderSandbox(
+  run: AppSandboxRun,
+  deps: Pick<AppSandboxDeps, "create" | "stop"> = {},
+  abort: AppSandboxEnsureOptions = {},
+): Promise<AppSandbox> {
+  if (isKubernetesMode()) {
+    throw new Error("app sandboxes are created through SaFE; kubernetes mode is not supported");
+  }
+  if (!run.platformKey) throw new Error("createAppReaderSandbox: platformKey is required");
+  if (!run.sandboxSpec?.image?.trim()) throw new Error("createAppReaderSandbox: sandbox_spec has no image");
+  if (abort.signal?.aborted) {
+    throw new SandboxProvisionTerminalError(
+      "sandbox_wait_interrupted", `app run ${run.runId} was stopped before its reader was created`,
+    );
+  }
+  const create = deps.create ?? createSafeWorkloadSandbox;
+  const stop = deps.stop ?? ((id: string) => getSafeWorkloadProvider().stop(appSandboxInstance(run, id)));
+  let createdId: string | undefined;
+  try {
+    const inst = await create({
+      sessionId: run.sessionId,
+      namespace: appSandboxNamespace(run),
+      image: run.sandboxSpec.image,
+      resources: { ...APP_READER_RESOURCES },
+      env: { [APP_READER_ENV]: run.runId },
+      labels: {
+        ...composeSandboxLabels({ sessionId: run.sessionId, component: APP_READER_COMPONENT, own: { [APP_RUN_ID_LABEL]: run.runId } }),
+        [COMPONENT_LABEL]: APP_READER_COMPONENT,
+      },
+      timeoutSec: APP_READER_TIMEOUT_SEC,
+      ttlSec: DEFAULT_SANDBOX_TTL_SEC,
+      platformKey: run.platformKey,
+      onProvisioned: async (id) => { createdId = id; },
+      ...(abort.signal ? { signal: abort.signal } : {}),
+      // A reader is nobody's to adopt: whatever cut its wait short, it is stopped.
+      reclaimOnAbort: () => true,
+    });
+    logger.info({ runId: run.runId, workloadId: inst.id }, "app_sandbox.reader_created");
+    return { instance: appSandboxInstance(run, inst.id), workloadId: inst.id, created: true };
+  } catch (err) {
+    if (createdId !== undefined) {
+      try {
+        await stop(createdId);
+      } catch (e) {
+        logger.error({ runId: run.runId, workloadId: createdId, err: e instanceof Error ? e.message : String(e) }, "app_sandbox.reader_reclaim_failed");
+      }
+    }
+    throw err;
+  }
+}
+
 /**
  * The node the sandbox runs on, for the app's `NODE_NAME`.
  *

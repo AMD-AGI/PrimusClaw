@@ -17,7 +17,10 @@ import { filterToRegExp } from "./nats-kv-stub.js";
 import fs from "node:fs";
 import { secretValuesOf } from "../src/apps/app-env.js";
 import { applyPlatformKeyEnv } from "../src/sandbox/params.js";
-import { appModelKeyEnv, appSandboxNamespace, appStartEnv, ensureAppSandbox, readSandboxNodeName, type AppSandboxRun } from "../src/apps/app-sandbox.js";
+import {
+  APP_READER_RESOURCES, appModelKeyEnv, appSandboxNamespace, appStartEnv, createAppReaderSandbox, ensureAppSandbox, readSandboxNodeName,
+  type AppSandboxRun,
+} from "../src/apps/app-sandbox.js";
 import { SANDBOX_DEFAULT_TIMEOUT_SECONDS } from "../src/config.js";
 import { workloadTimeoutSeconds } from "../src/sandbox/safe-workload-provider.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
@@ -547,4 +550,60 @@ test("creating an app sandbox never writes the model key to a log", async () => 
   const out = written.join("");
   assert.match(out, /app_sandbox\.created/, "the capture sees the log line");
   assert.ok(!out.includes("ak-LEAKCANARY"));
+});
+
+// ---------------------------------------------------------------------------
+// The reader: what is made to read `exit.json` once the run's own sandbox is gone
+// ---------------------------------------------------------------------------
+
+/** The run as hosted on 2026-11-08: a 32-CPU application, and GPU resources any spec may name. */
+const hostedRun = (resources: Record<string, string>) => run({
+  workspaceId: "crusoe-spur-vk",
+  sandboxSpec: { ...run().sandboxSpec, resources, env: { FROM_SPEC: "1", HF_TOKEN: "hf_secretvalue0123456789" } },
+});
+
+test("a reader asks for no accelerator and a small fixed size, whatever the run's own sandbox was given", async () => {
+  for (const resources of [
+    { cpu: "32", memory: "256Gi", "ephemeral-storage": "200Gi" },
+    { cpu: "16", memory: "64Gi", "amd.com/gpu": "8" },
+    { gpu: "2", "nvidia.com/gpu": "1", cpu: "8" },
+  ]) {
+    const safe = fakeSafe();
+    const out = await createAppReaderSandbox(hostedRun(resources));
+    assert.equal(out.created, true);
+    assert.equal(safe.created.length, 1);
+    const p = safe.created[0]!;
+    assert.deepEqual(p.resources, { ...APP_READER_RESOURCES }, `reader resources for ${JSON.stringify(resources)}`);
+    assert.equal(Object.keys(p.resources ?? {}).some((k) => /gpu/i.test(k)), false, "no GPU in a reader");
+    assert.equal(p.image, "registry.example/app:1", "the run's image: it has the shell the read needs");
+    assert.equal(p.namespace, "crusoe-spur-vk", "the run's workspace: its storage is where the state directory is");
+  }
+  assert.deepEqual(Object.keys(APP_READER_RESOURCES).sort(), ["cpu", "ephemeral-storage", "memory"]);
+});
+
+test("a reader is never the run's sandbox: the run's lookup does not find it, and it carries none of the spec's env", async () => {
+  const safe = fakeSafe();
+  const r = hostedRun({ cpu: "32", memory: "256Gi" });
+  const reader = await createAppReaderSandbox(r);
+  const p = safe.created[0]!;
+  assert.equal(p.env.CLAW_APP_RUN_ID, undefined, "the env the run's own lookup matches on");
+  assert.equal(p.env.CLAW_APP_READER_OF, "run-1");
+  assert.equal(p.env.FROM_SPEC, undefined);
+  assert.equal(p.env.HF_TOKEN, undefined);
+  assert.equal(p.env.CLAW_SESSION_ID, undefined);
+  assert.equal(p.labels!["primus-claw/component"], "app-reader");
+  assert.equal(p.labels!["primus-claw/app-run-id"], "run-1");
+  assert.ok((p.timeoutSec ?? 0) > 0 && (p.timeoutSec ?? 0) <= 600, "bounded, for a reader whose Brain died before stopping it");
+  // The run's own ensure, after the reader exists, makes the application's sandbox rather than adopting the reader.
+  const own = await ensureAppSandbox(r, { fetch: safe.fetch, recordWorkloadId: async () => undefined });
+  assert.equal(own.created, true);
+  assert.notEqual(own.workloadId, reader.workloadId);
+  assert.deepEqual(safe.created[1]!.resources, { cpu: "32", memory: "256Gi" });
+});
+
+test("a reader whose create fails after the workload exists is stopped", async () => {
+  const safe = fakeSafe();
+  safe.failCreateAfterProvisioned(new Error("wait gave up"));
+  await assert.rejects(createAppReaderSandbox(hostedRun({ cpu: "32" })), /wait gave up/);
+  assert.deepEqual(safe.stopped, ["wl-1"]);
 });

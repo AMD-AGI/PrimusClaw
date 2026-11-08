@@ -74,6 +74,10 @@ export class World {
   execs: ExecRecord[] = [];
   starts: StartRecord[] = [];
   created: string[] = [];
+  /** Reader sandboxes made (what they are made with is app-sandbox.ts's, tested in app-sandbox.test.ts). */
+  readers: Array<{ id: string }> = [];
+  /** Fail the next N reader creates. */
+  failReader = 0;
   stopped: string[] = [];
   /** The fake clock when each sandbox was stopped, in the same order as `stopped`. */
   stoppedAt: number[] = [];
@@ -179,7 +183,8 @@ export class World {
 
   sandbox: AppSandboxOps = {
     ensure: async (run) => {
-      const live = [...this.workloads].filter(([, p]) => p === "running").map(([id]) => id);
+      // A reader carries its run under another env key, so the run's own lookup never finds it.
+      const live = [...this.workloads].filter(([id, p]) => p === "running" && !this.isReader(id)).map(([id]) => id);
       if (live.length > 0) {
         const id = live[live.length - 1]!;
         return { instance: this.inst(id), workloadId: id, created: false };
@@ -188,6 +193,13 @@ export class World {
       this.workloads.set(id, "running");
       this.created.push(id);
       await this.store.patch(run.runId, { sandbox_workload_id: id });
+      return { instance: this.inst(id), workloadId: id, created: true };
+    },
+    reader: async () => {
+      if (this.failReader > 0) { this.failReader -= 1; throw new Error("reader could not be created"); }
+      const id = `rd-${this.readers.length + 1}`;
+      this.workloads.set(id, "running");
+      this.readers.push({ id });
       return { instance: this.inst(id), workloadId: id, created: true };
     },
     instance: (_run, id) => this.inst(id),
@@ -199,9 +211,14 @@ export class World {
     },
     exec: async (inst, command, _timeout, opts) => this.exec(inst.id, command, opts),
     stop: async (inst) => { this.stopped.push(inst.id); this.stoppedAt.push(this.clock); this.killWorkload(inst.id, "terminal"); },
-    liveIds: async () => [...this.workloads].filter(([, p]) => p === "running").map(([id]) => id),
+    liveIds: async () => [...this.workloads].filter(([id, p]) => p === "running" && !this.isReader(id)).map(([id]) => id),
     nodeName: async () => "node-7",
   };
+
+  isReader(id: string): boolean { return this.readers.some((r) => r.id === id); }
+
+  /** Readers that were made and never stopped. */
+  liveReaders(): string[] { return this.readers.map((r) => r.id).filter((id) => this.workloads.get(id) === "running"); }
 
   private inst(id: string): SandboxInstance {
     return { provider: "safe-workload", id, sandboxName: id, namespace: "ws-1", handsBaseUrl: "", platformKey: "pk" };

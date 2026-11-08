@@ -15,7 +15,7 @@ import { httpAppRunStore, type AppRunRecord, type AppRunStore } from "./app-run-
 import { createEventTailer } from "./event-tailer.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import {
-  appSandboxInstance, appSandboxNamespace, ensureAppSandbox, findLiveAppSandboxes, readSandboxNodeName,
+  appSandboxInstance, appSandboxNamespace, createAppReaderSandbox, ensureAppSandbox, findLiveAppSandboxes, readSandboxNodeName,
 } from "./app-sandbox.js";
 
 export function realAppSandbox(store: AppRunStore): AppSandboxOps {
@@ -23,6 +23,7 @@ export function realAppSandbox(store: AppRunStore): AppSandboxOps {
     ensure: (run, opts) => ensureAppSandbox(run, {
       recordWorkloadId: async (runId, workloadId) => { await store.patch(runId, { sandbox_workload_id: workloadId }); },
     }, opts),
+    reader: (run, opts) => createAppReaderSandbox(run, {}, opts),
     instance: appSandboxInstance,
     status: (inst) => getSafeWorkloadProvider().get(inst),
     exec: (inst, command, timeout, opts) => getSafeWorkloadProvider().exec(inst, command, timeout, undefined, opts),
