@@ -136,6 +136,11 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A research report's citation check judges each statement with the whole line it is written in (a statement cut at a
+  mid-sentence citation was judged as a fragment), and reads only the parts of a long page that bear on the statements: the
+  paragraphs sharing the most rare words with them, each statement's best first, at most about 4k tokens a judgement (a whole
+  page was about 33k). On a 137-statement report this took the judge's input from 1.54M to 0.29M tokens. The judge's verdicts
+  are the last array of booleans in its answer, so one that reasons first is still read.
 - A research report written to a file is delivered checked: `deliver_file` of a sandbox file that is a cited report reads it whole
   and delivers it through the run's checked `deliver_text` (a `.md` name kept, another given `.md`), instead of refusing it; one
   larger than a text delivery (256 KB) is refused. The worker is told to write a report too long for one call to a file
