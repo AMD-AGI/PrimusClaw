@@ -645,8 +645,14 @@ describe("B lists a turn sees whole", () => {
     const deep = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", per_page: 50, page: 50 })).text);
     assert.deepEqual([deep.items.length, deep.next_page ?? null, deep.total_count], [0, null, null]);
     assert.match(deep.note, /pr_list reads no further: for older ones search with issue_search \(is:pr repo:o\/r is:merged\), or narrow with since/);
-    const narrowed = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", base: "main", head: "o:feat", per_page: 50, page: 50 })).text);
-    assert.match(narrowed.note, /issue_search \(is:pr repo:o\/r is:merged base:main head:feat\)/, "the search carries the list's own filters");
+    const narrowed = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", base: "main", per_page: 50, page: 50 })).text);
+    assert.match(narrowed.note, /issue_search \(is:pr repo:o\/r is:merged base:main\), or narrow with since/, "the search carries the list's own filters");
+    const windowed = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", since: "2020-01-01", per_page: 50, page: 50 })).text);
+    assert.match(windowed.note, /issue_search \(is:pr repo:o\/r is:merged merged:>=2020-01-01T00:00:00Z\)$/);
+    // A fork's branch (alice:feature) has no search of its own: the search names a branch in every fork, so none is offered.
+    const forked = JSON.parse((await call(c, "pr_list", { repo: "o/r", state: "merged", head: "alice:feature", per_page: 50, page: 50 })).text);
+    assert.match(forked.note, /pr_list reads no further: narrow with since/);
+    assert.ok(!/issue_search/.test(forked.note), forked.note);
     // One person's, sparse: three of 700, two of them past the first 500.
     const sparse = Array.from({ length: 700 }, (_, i) => pr(1000 - i, { user: { login: [10, 600, 650].includes(i) ? "bob" : "alice" } }));
     respond = (url) => {

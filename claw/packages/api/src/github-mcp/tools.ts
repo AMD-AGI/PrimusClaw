@@ -383,8 +383,10 @@ async function scanPulls(
         `read the ${read} most recently ${ordered ? "updated" : "created"} ${what}pull requests, not all of them: how many there are in all is not known`
           + (ordered && !settled ? `, and older ones may have ${state === "merged" ? "merged" : "closed"} later than some shown` : "")
           + (all.length <= want
-            ? `; pr_list reads no further: for older ones search with issue_search (${searchOfList(r, state, author, filter, opts.sinceText ?? null)})`
-              + (since === null ? ", or narrow with since" : "")
+            ? `; pr_list reads no further`
+              + (searchOfList(r, state, author, filter, opts.sinceText ?? null) !== null
+                ? `: for older ones search with issue_search (${searchOfList(r, state, author, filter, opts.sinceText ?? null)})` : "")
+              + (since === null ? `${searchOfList(r, state, author, filter, null) !== null ? ", or" : ":"} narrow with since` : "")
             : ""),
       ]),
       ...(fixtures ? [`${fixtures} release-gate fixture pull request(s) of those read are left out (test fixtures, never the project's work); include_fixtures: true lists them`] : []),
@@ -392,13 +394,16 @@ async function scanPulls(
   });
 }
 
-/** The issue_search query that reads the same pull requests as a pr_list call: its state, author, branches and window. */
-function searchOfList(r: { owner: string; repo: string }, state: PullState, author: string | null, filter: Record<string, string>, since: string | null): string {
+/**
+ * The issue_search query that reads the same pull requests as a pr_list call (its state, author, base and window), or null when there
+ * is none: GitHub's search names a head branch without the fork it is on, so a head filter (owner:branch) has no search of its own.
+ */
+function searchOfList(r: { owner: string; repo: string }, state: PullState, author: string | null, filter: Record<string, string>, since: string | null): string | null {
+  if (filter.head) return null;
   const when = state === "merged" ? "merged" : state === "closed" ? "closed" : "created";
-  const head = filter.head ? filter.head.slice(filter.head.indexOf(":") + 1) : null;
   return [
     `is:pr repo:${r.owner}/${r.repo}`, ...(state === "all" ? [] : [`is:${state}`]), ...(author !== null ? [`author:${author}`] : []),
-    ...(filter.base ? [`base:${filter.base}`] : []), ...(head ? [`head:${head}`] : []), ...(since ? [`${when}:>=${since.slice(0, 19)}Z`] : []),
+    ...(filter.base ? [`base:${filter.base}`] : []), ...(since ? [`${when}:>=${since.slice(0, 19)}Z`] : []),
   ].join(" ");
 }
 
