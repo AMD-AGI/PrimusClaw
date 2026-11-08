@@ -254,6 +254,12 @@ export const SESSION_SANDBOX_HOLD_MS = Math.min(
   BRAIN_REGISTRY_TTL_MS,
 );
 
+// Session history an event stream replays (routes/events.ts, routes/anthropic-managed-agents.ts). A stream that does not
+// say where it resumes (no `?after=`, no Last-Event-ID) is sent the session's last SSE_HISTORY_TAIL stored events, not
+// all of them: an assistant session runs for weeks (one reached 33,196 events, 28.6 MB), and every connection to it read
+// the whole history into this process and wrote it to the client. `?history=all` still asks for everything.
+export const SSE_HISTORY_TAIL = envInt("SSE_HISTORY_TAIL", 2000, { min: 1, max: 1_000_000 });
+
 // --- The browser terminal ---
 // `GET /v1/sessions/:id/terminal/ws` is a WebSocket proxy to the sandbox's shell,
 // so every open terminal holds two sockets and a pod's pty for as long as it
