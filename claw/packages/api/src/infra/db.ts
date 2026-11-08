@@ -1679,18 +1679,20 @@ export async function initDb(): Promise<void> {
       )
     `);
     await client.query("CREATE INDEX IF NOT EXISTS idx_memory_events_entry ON claw_memory_events(user_id, entry_id)");
-    // What each entry cites (memory/links.ts, E242): another entry of the same user by number, or a name no entry answers yet
-    // (`to_kind = 'title'`, joined when one does). Kept by the server from what the entry says; an entry's rows go with it.
+    // What each entry cites (memory/links.ts, E242): another entry of the same user by number (`name` empty) or by the name it
+    // wrote (`name`), joined to the entry that name names now or dangling (`to_kind = 'title'`). Kept by the server from what the
+    // entry says, and resolved again on every write of the user's; an entry's rows go with it.
     await client.query(`
       CREATE TABLE IF NOT EXISTS claw_memory_links (
         user_id     TEXT NOT NULL,
         from_id     INT NOT NULL REFERENCES claw_memory_entries(id) ON DELETE CASCADE,
         rel         TEXT NOT NULL CHECK (rel IN ('cites', 'derived_from')),
+        name        TEXT NOT NULL DEFAULT '',
         to_kind     TEXT NOT NULL CHECK (to_kind IN ('memory', 'title')),
         to_id       TEXT NOT NULL,
         created_by  TEXT NOT NULL,
         created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (user_id, from_id, rel, to_kind, to_id)
+        PRIMARY KEY (user_id, from_id, rel, name, to_kind, to_id)
       )
     `);
     await client.query("CREATE INDEX IF NOT EXISTS idx_memory_links_to ON claw_memory_links(user_id, to_kind, to_id)");

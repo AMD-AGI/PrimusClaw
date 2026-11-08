@@ -225,7 +225,7 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
   {
     table: "claw_memory_links",
     // An entry's citations (memory/links.ts), kept with every memory write and read by the router's turn recall.
-    columns: ["user_id", "from_id", "rel", "to_kind", "to_id", "created_by", "created_at"],
+    columns: ["user_id", "from_id", "rel", "name", "to_kind", "to_id", "created_by", "created_at"],
   },
   {
     table: "claw_assistants",

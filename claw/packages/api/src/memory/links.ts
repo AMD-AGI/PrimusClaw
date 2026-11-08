@@ -6,13 +6,15 @@
  * written before its target existed ("记在「Wren 许可」那一条里") is joined to that entry the moment it is saved, instead of
  * staying words that say it does not exist yet.
  *
- * An entry cites another by its number (`#12`, an active entry of the same user) or by a name in corner brackets
- * (「Kestrel 发布窗口」, 『…』). A name is joined to the one entry it names (`resolveCitation`); a name that names none yet is
- * kept as a dangling citation (`to_kind = 'title'`) and joined when an entry it names is saved or changed. Nothing here
- * reaches past one user: every row carries the user, and every candidate is that user's.
+ * An entry cites another by its number (`#12`, a live entry of the same user) or by a name in corner brackets
+ * (「Kestrel 发布窗口」, 『…』). A name is joined to the one active entry it names (`resolveCitation`) and keeps the name it was
+ * joined by (`name`); a name that names none is kept dangling (`to_kind = 'title'`). Since what a name names changes whenever
+ * any entry of the user is saved, changed, undone or deleted, every name citation of the user is resolved again then
+ * (`resolveNames`): a citation follows a renamed entry away, falls back to dangling on a tie, and is joined when its entry
+ * appears. Nothing here reaches past one user: every row carries the user, and every candidate is that user's.
  *
- * The pure half (what a text cites, which entry a name names) is here; the writes are `relinkEntry` and `joinDangling`,
- * called by the service inside the transaction that changed the entry.
+ * The pure half (what a text cites, which entry a name names) is here; the writes are `relinkEntry` and `resolveNames`,
+ * called by the service inside the transaction that changed an entry, under the user's write lock.
  */
 import type { Querier } from "../infra/db.js";
 import { recallTerms } from "./gates.js";
@@ -28,7 +30,8 @@ const NAME_MAX = 60;
 export function citationsIn(text: string): { ids: number[]; names: string[] } {
   const ids: number[] = [];
   const names: string[] = [];
-  for (const m of (text || "").matchAll(/(?<![A-Za-z0-9_.\-/#])#([1-9]\d{0,9})(?![0-9])/g)) {
+  // Not `repo#12`, and not a number that names something else: `PR #529`, `issue #3`, `事项 #12` (a work item).
+  for (const m of (text || "").matchAll(/(?<![A-Za-z0-9_.\-/#])(?<!(?:\b(?:pr|mr|pull|issue|issues|bug|ticket|item|items|cl|run|job)|事项|工单|任务|问题)\s?)#([1-9]\d{0,9})(?![0-9])/gi)) {
     const id = Number(m[1]);
     if (Number.isSafeInteger(id) && !ids.includes(id)) ids.push(id);
   }
@@ -41,31 +44,48 @@ export function citationsIn(text: string): { ids: number[]; names: string[] } {
 
 export interface LinkCandidate { id: number; title: string; body: string }
 
+/** A candidate's terms, computed once per resolution pass rather than once per name. */
+interface Indexed { id: number; all: Set<string>; title: Set<string> }
+
+function indexed(candidates: readonly LinkCandidate[]): Indexed[] {
+  return candidates.map((c) => ({ id: c.id, all: recallTerms(`${c.title}\n${c.body}`), title: recallTerms(c.title) }));
+}
+
 /**
  * The one entry a name names, or null. An entry names it when its title and body hold every term of the name (`recallTerms`):
  * 「Wren 许可」 names "Wren-v3 许可：仅限内部评测" whose body begins "Wren 许可：…". Of several, the one whose title alone holds
  * the most of the name's terms; a tie names none, since a citation joined to the wrong entry is worse than one not joined.
  */
 export function resolveCitation(name: string, candidates: readonly LinkCandidate[], self: number | null): number | null {
+  return resolveIndexed(name, indexed(candidates), self);
+}
+
+function resolveIndexed(name: string, candidates: readonly Indexed[], self: number | null): number | null {
   const terms = [...recallTerms(name)];
   if (!terms.length) return null;
   const scored = candidates
-    .filter((c) => c.id !== self)
-    .filter((c) => { const all = recallTerms(`${c.title}\n${c.body}`); return terms.every((t) => all.has(t)); })
-    .map((c) => { const t = recallTerms(c.title); return { id: c.id, inTitle: terms.filter((x) => t.has(x)).length }; })
+    .filter((c) => c.id !== self && terms.every((t) => c.all.has(t)))
+    .map((c) => ({ id: c.id, inTitle: terms.filter((x) => c.title.has(x)).length }))
     .sort((a, b) => b.inTitle - a.inTitle);
   if (!scored.length) return null;
   if (scored.length > 1 && scored[0].inTitle === scored[1].inTitle) return null;
   return scored[0].id;
 }
 
-/** The user's entries a citation may name: theirs, live (active or waiting for confirmation), not the knowledge base's. */
-async function candidatesOf(q: Querier, userId: string): Promise<LinkCandidate[]> {
-  return ((await q(
-    `SELECT id, COALESCE(title, '') AS title, content FROM claw_memory_entries
+/**
+ * The user's entries a citation may name, not the knowledge base's: `active` for a name (an entry waiting for its owner's confirmation
+ * does not capture one: it is joined when it is confirmed), and every live one for a number, which says which entry it means.
+ */
+async function candidatesOf(q: Querier, userId: string): Promise<{ named: LinkCandidate[]; live: Set<number> }> {
+  const rows = (await q(
+    `SELECT id, COALESCE(title, '') AS title, content, status FROM claw_memory_entries
       WHERE user_id = $1 AND kind IS NULL AND deleted_at IS NULL AND category <> 'user_profile' AND status IN ('active', 'pending')`,
     [userId],
-  )).rows as Array<{ id: number; title: string; content: string }>).map((r) => ({ id: Number(r.id), title: r.title, body: r.content }));
+  )).rows as Array<{ id: number; title: string; content: string; status: string }>;
+  return {
+    named: rows.filter((r) => r.status === "active").map((r) => ({ id: Number(r.id), title: r.title, body: r.content })),
+    live: new Set(rows.map((r) => Number(r.id))),
+  };
 }
 
 /**
@@ -81,40 +101,49 @@ export async function relinkEntry(q: Querier, userId: string, id: number): Promi
   if (!row) return;
   const { ids, names } = citationsIn(`${row.title}\n${row.content}`);
   if (!ids.length && !names.length) return;
-  const candidates = await candidatesOf(q, userId);
-  const live = new Set(candidates.map((c) => c.id));
-  const targets: Array<{ kind: "memory" | "title"; to: string }> = [];
-  for (const n of ids) if (n !== id && live.has(n)) targets.push({ kind: "memory", to: String(n) });
+  const { named, live } = await candidatesOf(q, userId);
+  const index = indexed(named);
+  const targets: Array<{ kind: "memory" | "title"; to: string; name: string }> = [];
+  for (const n of ids) if (n !== id && live.has(n)) targets.push({ kind: "memory", to: String(n), name: "" });
   for (const name of names) {
-    const found = resolveCitation(name, candidates, id);
-    targets.push(found === null ? { kind: "title", to: name } : { kind: "memory", to: String(found) });
+    const found = resolveIndexed(name, index, id);
+    targets.push(found === null ? { kind: "title", to: name, name } : { kind: "memory", to: String(found), name });
   }
   for (const t of targets.slice(0, LINKS_PER_ENTRY_MAX)) {
     await q(
-      `INSERT INTO claw_memory_links (user_id, from_id, rel, to_kind, to_id, created_by) VALUES ($1, $2, 'cites', $3, $4, 'system')
+      `INSERT INTO claw_memory_links (user_id, from_id, rel, name, to_kind, to_id, created_by) VALUES ($1, $2, 'cites', $3, $4, $5, 'system')
        ON CONFLICT DO NOTHING`,
-      [userId, id, t.kind, t.to],
+      [userId, id, t.name, t.kind, t.to],
     );
   }
 }
 
-/** Join the user's dangling citations that the entry `id` now answers (it was saved, or its title or body changed). */
-export async function joinDangling(q: Querier, userId: string, id: number): Promise<void> {
-  const dangling = (await q(
-    "SELECT from_id, to_id FROM claw_memory_links WHERE user_id = $1 AND to_kind = 'title' AND from_id <> $2", [userId, id],
-  )).rows as Array<{ from_id: number; to_id: string }>;
-  if (!dangling.length) return;
-  const candidates = await candidatesOf(q, userId);
-  for (const d of dangling) {
-    if (resolveCitation(d.to_id, candidates, Number(d.from_id)) !== id) continue;
+/**
+ * Resolve every name citation of the user again, over their active entries as they are now (`except`: the entry just derived by
+ * `relinkEntry`, whose own rows are fresh). One that now names another entry, or none (renamed, deleted, or tied with a new one), is
+ * moved; a dangling one whose entry now exists is joined. At most CLAW_MEMORY_MAX_ENTRIES x LINKS_PER_ENTRY_MAX names, each over
+ * the candidates' terms computed once.
+ */
+export async function resolveNames(q: Querier, userId: string, except: number | null): Promise<void> {
+  const rows = (await q(
+    `SELECT from_id, name, to_kind, to_id FROM claw_memory_links
+      WHERE user_id = $1 AND rel = 'cites' AND name <> '' AND ($2::int IS NULL OR from_id <> $2::int)`,
+    [userId, except],
+  )).rows as Array<{ from_id: number; name: string; to_kind: string; to_id: string }>;
+  if (!rows.length) return;
+  const index = indexed((await candidatesOf(q, userId)).named);
+  for (const r of rows) {
+    const found = resolveIndexed(r.name, index, Number(r.from_id));
+    const next = found === null ? { kind: "title", to: r.name } : { kind: "memory", to: String(found) };
+    if (next.kind === r.to_kind && next.to === r.to_id) continue;
     await q(
-      `DELETE FROM claw_memory_links WHERE user_id = $1 AND from_id = $2 AND rel = 'cites' AND to_kind = 'title' AND to_id = $3`,
-      [userId, d.from_id, d.to_id],
+      "DELETE FROM claw_memory_links WHERE user_id = $1 AND from_id = $2 AND rel = 'cites' AND name = $3 AND to_kind = $4 AND to_id = $5",
+      [userId, r.from_id, r.name, r.to_kind, r.to_id],
     );
     await q(
-      `INSERT INTO claw_memory_links (user_id, from_id, rel, to_kind, to_id, created_by) VALUES ($1, $2, 'cites', 'memory', $3, 'system')
+      `INSERT INTO claw_memory_links (user_id, from_id, rel, name, to_kind, to_id, created_by) VALUES ($1, $2, 'cites', $3, $4, $5, 'system')
        ON CONFLICT DO NOTHING`,
-      [userId, d.from_id, String(id)],
+      [userId, r.from_id, r.name, next.kind, next.to],
     );
   }
 }
@@ -122,24 +151,23 @@ export async function joinDangling(q: Querier, userId: string, id: number): Prom
 /** A new entry made in place of a close one (`force_new`): it is derived from that one. */
 export async function linkDerived(q: Querier, userId: string, id: number, from: number, by: "model" | "api"): Promise<void> {
   await q(
-    `INSERT INTO claw_memory_links (user_id, from_id, rel, to_kind, to_id, created_by) VALUES ($1, $2, 'derived_from', 'memory', $3, $4)
+    `INSERT INTO claw_memory_links (user_id, from_id, rel, name, to_kind, to_id, created_by) VALUES ($1, $2, 'derived_from', '', 'memory', $3, $4)
      ON CONFLICT DO NOTHING`,
     [userId, id, String(from), by],
   );
 }
 
 /**
- * Before entries are erased: every citation of them by another entry goes with them, and each entry that cited them derives its
- * citations again, so its words name a dangling citation once more rather than a number that no longer exists. Their own
- * citations go with their rows (`ON DELETE CASCADE`).
+ * Before entries are erased: what cites them by number, or is derived from them, goes with them. What cites them by name is
+ * resolved again once they are gone (`resolveNames`: to another entry, or back to dangling). Their own rows go with their rows
+ * (`ON DELETE CASCADE`).
  */
-export async function unlinkErased(q: Querier, userId: string, ids: readonly number[]): Promise<number[]> {
-  if (!ids.length) return [];
-  const citing = (await q(
-    `DELETE FROM claw_memory_links WHERE user_id = $1 AND to_kind = 'memory' AND to_id = ANY($2::text[]) RETURNING from_id`,
+export async function unlinkErased(q: Querier, userId: string, ids: readonly number[]): Promise<void> {
+  if (!ids.length) return;
+  await q(
+    "DELETE FROM claw_memory_links WHERE user_id = $1 AND to_kind = 'memory' AND to_id = ANY($2::text[]) AND name = ''",
     [userId, ids.map(String)],
-  )).rows.map((r) => Number(r.from_id));
-  return [...new Set(citing)].filter((f) => !ids.includes(f));
+  );
 }
 
 /** The active entries each of `ids` cites, by number and title, of this user only, at most LINKS_PER_ENTRY_MAX each. */
@@ -147,7 +175,7 @@ export async function citedBy(q: Querier, userId: string, ids: readonly number[]
   const out = new Map<number, Array<{ id: number; title: string }>>();
   if (!ids.length) return out;
   const rows = (await q(
-    `SELECT l.from_id, e.id, COALESCE(e.title, '') AS title FROM claw_memory_links l
+    `SELECT DISTINCT l.from_id, e.id, COALESCE(e.title, '') AS title FROM claw_memory_links l
        JOIN claw_memory_entries e ON e.user_id = l.user_id AND e.id::text = l.to_id
       WHERE l.user_id = $1 AND l.from_id = ANY($2::int[]) AND l.rel = 'cites' AND l.to_kind = 'memory'
         AND e.kind IS NULL AND e.deleted_at IS NULL AND e.category <> 'user_profile' AND e.status = 'active'

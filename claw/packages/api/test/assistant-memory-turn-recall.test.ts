@@ -10,7 +10,7 @@
  *   K2  off (a user not on the list, or the list emptied): the turn is the same text as without the feature, the system prompt too
  *   K3  only the user's own active entries, and none where the index is not shown (memory off, a session marked `memory: "off"`)
  *   K4  a recall is not counted as a read
- *   K5  a store above the entry limit (lowered since) is read only to the limit, newest first
+ *   K5  a store above the entry limit (lowered since) is read only to the limit, pinned then newest first
  *   K6  an entry's body is shown whole, up to what a write may store
  *   R*  the ranking itself (`rankByMessage`), pure
  */
@@ -154,6 +154,9 @@ describe("router turn recall", { skip }, () => {
     }
     const prompt = String((await turnFor(alice, "Kestrel 一般在哪天发布？")).task.prompt);
     assert.ok(!prompt.includes(`#${old} Kestrel 发布窗口:`), prompt);
+    // A pinned entry is read first, however old.
+    await w.q("UPDATE claw_memory_entries SET pinned = TRUE WHERE id = $1", [old]);
+    assert.ok(String((await turnFor(alice, "Kestrel 一般在哪天发布？")).task.prompt).includes(`#${old} Kestrel 发布窗口:`));
   });
 
   test("K6 an entry's body is shown whole, up to what a write may store", async () => {

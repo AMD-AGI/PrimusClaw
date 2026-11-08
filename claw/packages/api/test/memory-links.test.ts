@@ -13,6 +13,9 @@
  *   L6  nothing reaches another user: their entry neither answers a dangling name nor is cited by number
  *   L7  an entry made in place of a close one (force_new) is derived from it
  *   L8  the router's turn recall shows what a recalled entry cites, as it stands now
+ *   L9  a cited entry renamed away takes the citation with it: the name is dangling again, and the recall shows no citation
+ *   L10 a later entry that ties with the cited one leaves the name unjoined
+ *   L11 an entry waiting for its owner's confirmation does not capture a name; confirmed, it is joined
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -131,12 +134,46 @@ describe("memory citations", { skip }, () => {
     const line = recalled.split("\n").find((l) => l.includes(`#${dataset} `)) ?? "";
     assert.ok(line.endsWith(`(cites #${licence} Wren-v3 许可：仅限内部评测)`), recalled);
   });
+
+  test("L9 a cited entry renamed away takes the citation with it", async () => {
+    mt.turnRecallSettings.all = true;
+    const dataset = await save("alice", "Kestrel 用的数据集是 Wren-v3", "Kestrel 用的数据集叫 Wren-v3。许可证限制记在「Wren 许可」那一条里。");
+    const licence = await save("alice", "Wren-v3 许可：仅限内部评测", "Wren 许可：Wren-v3 只能用于内部评测。");
+    assert.deepEqual(await links(), [`${dataset} cites memory:${licence}`]);
+    const r = await svc.updateMemory("alice", licence, { title: "Kestrel 发布窗口", body: "Kestrel 只在每月第二个周四发布。" }, { kind: "api", attended: true });
+    assert.ok(r.ok, JSON.stringify(r));
+    assert.deepEqual(await links(), [`${dataset} cites title:Wren 许可`]);
+    assert.equal((await svc.citationsOf("alice", [dataset])).get(dataset), undefined);
+    // Undone, the old words name it again.
+    assert.equal(await svc.undoMemory("alice", licence, "api"), "restored");
+    assert.deepEqual(await links(), [`${dataset} cites memory:${licence}`]);
+    mt.turnRecallSettings.all = false;
+  });
+
+  test("L10 a later entry that ties with the cited one leaves the name unjoined", async () => {
+    const dataset = await save("alice", "Kestrel 数据集", "数据集 Wren-v3，许可证见「Wren 许可」。");
+    const licence = await save("alice", "Wren 许可（评测）", "Wren 许可：Wren-v3 只能用于内部评测。");
+    assert.deepEqual(await links(), [`${dataset} cites memory:${licence}`]);
+    await save("alice", "Wren 许可变更记录", "Wren 许可在 2027 年会放宽到外部研究。");
+    assert.deepEqual(await links(), [`${dataset} cites title:Wren 许可`]);
+  });
+
+  test("L11 an entry waiting for confirmation does not capture a name; confirmed, it is joined", async () => {
+    const dataset = await save("alice", "Kestrel 数据集", "数据集 Wren-v3，许可证见「Wren 许可」。");
+    const r = await svc.writeMemory("alice", { type: "project", title: "Wren-v3 许可", body: "Wren 许可：Wren-v3 只能用于内部评测。" }, { kind: "api", attended: false });
+    assert.ok(r.ok && r.status === "pending", JSON.stringify(r));
+    assert.deepEqual(await links(), [`${dataset} cites title:Wren 许可`]);
+    const ok = await svc.updateMemory("alice", r.id, {}, { kind: "api", attended: true });
+    assert.ok(ok.ok && ok.status === "active", JSON.stringify(ok));
+    assert.deepEqual(await links(), [`${dataset} cites memory:${r.id}`]);
+  });
 });
 
 describe("citations, pure", () => {
   test("C1 numbers and corner-bracket names, each once; not repo#12, not a quotation", () => {
     assert.deepEqual(citationsIn("见 #12 和 #12、repo#13、x#14，「Kestrel 发布窗口」与『Heron 联系方式』"), { ids: [12], names: ["Kestrel 发布窗口", "Heron 联系方式"] });
     assert.deepEqual(citationsIn(`「${"长".repeat(61)}」 「」 「！」`).names, []);
+    assert.deepEqual(citationsIn("PR #12、pull #13、issue #14、事项 #15、事项#16、item #17 都不是；记忆 #18 是").ids, [18]);
   });
   test("C2 a name names the one entry holding all its terms; of two, the one whose title holds more; a tie names none", () => {
     const c = [
