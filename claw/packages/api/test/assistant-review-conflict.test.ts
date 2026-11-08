@@ -10,6 +10,9 @@
  *       (a second block on the same head is not told again, a new head that still conflicts is)
  *   C2  nothing is told to alice when the block is not a conflict (BEHIND, a merge that later went through, no merge tried), when the
  *       item is bob's own (no requested_by), when it does not need bob, or when alice asked for a review only (no merge)
+ *   C3  the shape production has (2026-11-08, N5): a review handed over on someone's behalf whose session posts its review and then has
+ *       its merge refused on DIRTY sends no worker report; the item becomes blocked through `syncReviewItem` (a 'policy' event), and the
+ *       one who asked is told from there, once per head commit; a sync that finds the same state again tells nothing new
  * The check runs after the report is answered, not waited for (`checkConflictLater`): the tests wait for it (`conflictChecksSettled`).
  * The audit rows are written as the review service writes them; that it records GitHub's merge state on a refused merge is
  * github-review-service.test.ts M8c.
@@ -26,17 +29,19 @@ type Row = Record<string, any>;
 describe("a review stopped by a conflict tells the one who asked", { skip }, () => {
   let w: World;
   let conflict: typeof import("../src/assistant/review-conflict.js");
+  let ri: typeof import("../src/assistant/review-items.js");
   let alice: { userId: string; routerSid: string };
   let bob: { userId: string; routerSid: string };
 
   before(async () => {
     w = await startWorld({ CLAW_GITHUB_REVIEW_ENABLED: "true", CLAW_GITHUB_REVIEW_MCP_SECRET: "t".repeat(40) });
     conflict = await import("../src/assistant/review-conflict.js");
+    ri = await import("../src/assistant/review-items.js");
   });
   after(async () => { await w?.stop(); });
   beforeEach(async () => {
     await w.q(`TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_assistant_messages, claw_pending_messages,
-      claw_tasks, claw_assistants, claw_sessions, claw_github_audit CASCADE`);
+      claw_tasks, claw_assistants, claw_sessions, claw_github_audit, claw_github_confirmations CASCADE`);
     alice = await w.user("alice");
     bob = await w.user("bob");
     // alice asked for the review in Chinese, through her own assistant; bob has never written to his.
@@ -133,5 +138,55 @@ describe("a review stopped by a conflict tells the one who asked", { skip }, () 
     await merged(only, "refused", "merge_state_not_clean", "DIRTY");
     await blocked(only);
     assert.deepEqual(await toldAlice(), []);
+  });
+
+  test("C3 a review handed over on someone's behalf, blocked by its sync on a DIRTY merge, tells the one who asked", async () => {
+    // The params a handed-over review is made with in production (`review-items.ts`): bob reviews as himself, alice asked, merge asked.
+    const item = await reviewFor("alice", {
+      acting_as: "bob", acting_as_name: "Name bob", brief: "Review and merge it", effort: null, model: null, requester_note: null,
+    });
+    // Its one turn ran and finished: the review was posted, then the merge was refused on DIRTY (gh_pr_follow rows follow it, as live).
+    const run = await w.openRun(item.workerSid);
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, repo, pr, head_sha, result, detail, at)
+       VALUES ('alice', 'bob', $1, 'gh_review_submit', 'AMD-AGI/demo', $2, $3, 'ok', 'submitted', NOW() - interval '10 seconds')`,
+      [item.workerSid, item.pr, HEAD],
+    );
+    await merged(item, "refused", "merge_state_not_clean", "DIRTY");
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, repo, pr, head_sha, result, detail)
+       VALUES ('alice', 'bob', $1, 'gh_pr_follow', 'AMD-AGI/demo', $2, $3, 'ok', 'merge_state_not_clean')`,
+      [item.workerSid, item.pr, HEAD],
+    );
+    await w.closeRun(run.taskId);
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    const row = await w.item(item.itemId);
+    assert.equal(row.board_state, "needs_you");
+    assert.equal(row.last_report_kind, "blocked");
+    const events = await w.itemEvents(item.itemId);
+    assert.deepEqual(events.filter((e: Row) => e.kind === "blocked").map((e: Row) => e.source), ["policy"]);
+    // Through the same sync as bob's own blocked notice, nothing reported by a worker.
+    assert.equal(events.filter((e: Row) => e.source === "worker").length, 0);
+    let told = await toldAlice();
+    assert.equal(told.length, 1, JSON.stringify(told));
+    const pr = `AMD-AGI/demo#${item.pr}`;
+    assert.ok(told[0].text.startsWith(`你请人评审并合入的 ${pr} 合不进去：GitHub 显示这个分支和目标分支有冲突`), told[0].text);
+    assert.match(told[0].text, new RegExp(`https://github\\.com/AMD-AGI/demo/pull/${item.pr}$`));
+    // A sync that finds the same state writes nothing and tells nothing new.
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await toldAlice()).length, 1);
+    // The author pushed, and the merge on the new head is refused on DIRTY again: the state reads the same, the one who asked is told again.
+    await merged(item, "refused", "merge_state_not_clean", "DIRTY", "b".repeat(40));
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    told = await toldAlice();
+    assert.equal(told.length, 2);
+    // A block that is not a conflict, through the same sync: nothing more.
+    await merged(item, "refused", "merge_state_not_clean", "BEHIND", "c".repeat(40));
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await toldAlice()).length, 2);
   });
 });

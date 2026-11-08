@@ -35,6 +35,7 @@ import { getOrCreateAssistant } from "./assistant.js";
 import { drainSessionIfIdle, queueServerMessage, type QueuedServerMessage } from "./messages.js";
 import { queueRouterWake, tellUnwoken } from "./reports.js";
 import { freezeRequesterView } from "./requester-view.js";
+import { checkConflictLater } from "./review-conflict.js";
 import { clipOneLine, getWorkItem, insertWorkItem, itemView, MAX_QUEUED_ITEMS, RUNNING, WAITING, type Outcome, type WorkItemView } from "./work-items.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { modelAnswer, modelChoiceOn, ModelChoiceRefused, resolveItemModel, type ResolvedModel } from "./model-choice.js";
@@ -1240,7 +1241,11 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
  * to, is the one change that wakes the assistant (a finished review is told by the channel's own review card, so it is not said twice).
  */
 export async function syncReviewItem(itemId: string): Promise<WorkItemView | null> {
+  // Whether the item needs its owner after this sync, written or not: a review someone else asked for that is blocked on a conflict is
+  // told to the one who asked too (`review-conflict.ts`, once per head commit), and a new head that still conflicts reads as the same state.
+  let needsYou = false;
   const woke = await inTransaction(async (query) => {
+    needsYou = false;
     const q = { query };
     const row = (await query(
       `SELECT item_id, user_id, worker_session_id, params, kind, board_state, last_report_kind, summary, pending_question, generation, attention_seq
@@ -1253,6 +1258,7 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
     const reportKind = state.boardState === "needs_you" ? state.reportKind : state.boardState === "done" ? null : "progress";
     const question = state.boardState === "done" ? null : state.question;
     const summary = clipOneLine(state.summary, 80);
+    needsYou = state.boardState === "needs_you";
     // What the review has posted so far, kept on the item for whoever reads the board; a re-review reads it again from the facts.
     const record = await reviewRecord(q, row.worker_session_id as string, params);
     const recordChanged = JSON.stringify(record) !== JSON.stringify((row.params as Record<string, unknown> | null)?.record ?? null);
@@ -1283,6 +1289,9 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
   });
   if (woke?.status === "queued") await drainSessionIfIdle(woke.sessionId, woke.userId);
   else if (woke?.status === "refused") await tellUnwoken(itemId);
+  // Where a review's "blocked" is written: its session reports nothing itself (no worker report reaches `ingestReport`), so the check
+  // there never ran for one (2026-11-08, N5: four reviews refused on DIRTY, none told). Not waited for, as there.
+  if (needsYou) checkConflictLater(itemId);
   const after = (await db.query("SELECT * FROM claw_work_items WHERE item_id = $1", [itemId])).rows[0] as Record<string, unknown> | undefined;
   return after ? itemView(after) : null;
 }
