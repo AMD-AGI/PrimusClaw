@@ -118,7 +118,9 @@ describe("devenv_pair", { skip }, () => {
       assert.match(section, /`claw-connector service install`/, "the restart command is written as code, not as the end of the template");
       // "只能看不能发，这正常吗" was answered "watching is normal"; the shared-session ask "the product cannot do that".
       assert.match(section, /One marked typed_into_terminal can be joined from the chat without taking it over: what they send is typed into that terminal/);
-      assert.match(section, /One marked read_only can only be watched[^\n]*not running inside tmux, or its connector is too old/);
+      assert.match(section, /One marked read_only can only be watched[^\n]*without picking one you cannot see: typing into a terminal needs the session to run inside tmux, on Linux, with connector 0\.1\.9 or newer, and terminal_input not turned off/);
+      // Which session this chat is attached to is the chat's to say (renderAttachedState), not a devenv_list read.
+      assert.match(section, /the one exception is which session this chat itself is attached to, which is answered from what the chat says/);
       assert.match(section, /never call it a missing feature or offer to file a request for it/);
     }
   });

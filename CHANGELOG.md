@@ -127,11 +127,12 @@ record it.
   refuses such a number as `not_found`, and the router says it does not exist. Before, "请 X 帮我审 #483 和 #99999" was answered
   "#99999: GitHub could not be read". Router review prompt router-v25.
 - The assistant answers questions about a session open in a terminal on the person's machine as it works today: one whose
-  connector types into that terminal (devenv_list `typed_into_terminal`, a tmux pane) can be written to from the chat while the
-  terminal keeps working; one marked `read_only` can only be watched (not in tmux, or an old connector). Before, "只能看不能发，这正常吗"
-  was answered "watching is normal" and the shared-session request "the product cannot do that, shall I file an issue". It also reads
-  devenv_list in the turn for every question about the person's machines (how many, one by name, reconnecting one's connector)
-  instead of repeating an earlier turn's read, and never says it reconnected a connector. Router prompt router-devenv-v12.
+  connector types into that terminal (devenv_list `typed_into_terminal`) can be written to from the chat while the terminal keeps
+  working; one marked `read_only` can only be watched, said with what typing needs (tmux, Linux, connector 0.1.9 or newer,
+  `terminal_input` on). Before, "只能看不能发，这正常吗" was answered "watching is normal" and the shared-session request "the product
+  cannot do that, shall I file an issue". It also reads devenv_list in the turn for every question about the person's machines (how
+  many, one by name, reconnecting one's connector) instead of repeating an earlier turn's read, except which session the chat itself
+  is attached to, and never says it reconnected a connector. Router prompt router-devenv-v12.
 - The brief also leaves out a release-gate fixture whose watch ended before polls kept a pull request's branches (2026-11-08 retest:
   "#381: 2 comments" still listed): each ended watch whose news is from the last 7 days has its branches read once with its owner's
   token, beside the poll pass and never holding it back (`claw_work_item_subscriptions.refs_read_at`, added at api start), claimed across replicas and
