@@ -114,7 +114,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1290,13 +1290,19 @@ async function main(): Promise<void> {
   cleanupFailed.push(...new Set(CLEANUP_ISSUES));
   cleanupFailed = cleanupFailed.map(scrub);
   if (RECORD_PATH) {
-    // Written by the real path checked before the run (nobody else can have replaced it: see privateDir), checked once more.
+    // Written by the real path checked before the run (nobody else can have replaced it: see privateDir), checked once more, into a
+    // new file of the run's own (`wx`: never through one that was there) that then takes the recordings' name.
     const why = ownPrivate(RECORD_PATH, typeof process.getuid === "function" ? process.getuid() : null);
     if (why) cleanupFailed.push(`the recordings were not written: EVAL_RECORD_DIR ${why}`);
     else {
       const file = join(RECORD_PATH, `${MODE}-recordings.jsonl`);
-      writeFileSync(file, scrub(recordings.map((r) => JSON.stringify(r)).join("\n") + "\n"), { mode: 0o600 });
-      chmodSync(file, 0o600);   // a file that was there keeps its mode otherwise
+      const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        writeFileSync(tmp, scrub(recordings.map((r) => JSON.stringify(r)).join("\n") + "\n"), { mode: 0o600, flag: "wx" });
+        renameSync(tmp, file);
+      } catch (err) {
+        cleanupFailed.push(`the recordings were not written: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
   report(results, cases.length, leftOpen, cleanupFailed);

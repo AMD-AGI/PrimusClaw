@@ -1233,16 +1233,23 @@ export function judgePrompt(c: EvalCase, turns: readonly Turn[], final: string, 
 /** What the judge is told of the values the run read: they are the truth, and may be newer than what it knows. */
 export const ORACLE_TRUTH_NOTE = "The correct values, read for this run from the source of truth just before the reply. They can be newer than "
   + "anything you know (a release, a version, a count, a date after your training): take them as correct, and never fail a reply "
-  + "for stating one of them, or because a value is later than you expected:";
+  + "for stating one of them, or because a value is later than you expected. A fact listed with several values (\"all of\") needs "
+  + "every one of them; a value given as alternatives (\"one of\") is stated by any one of them:";
 
 /**
- * Each fact with a value the run has for it (an oracle's read for the run, or the value written in the case): its claim and the
- * values a reply may give for it. A fact with none is left out.
+ * Each fact with a value the run has for it (an oracle's read for the run, or the value written in the case): its claim and what
+ * the fact check requires (`grade`): the first 10 values, all of them, each satisfied by any of its `a||b` alternatives (`names`).
+ * A fact with none is left out.
  */
 export function oracleTruth(c: EvalCase, values: ReadonlyArray<readonly string[] | null>): string[] {
+  const one = (v: string): string => {
+    const alts = v.split("||").filter((x) => x !== "");
+    return alts.length > 1 ? `one of ${alts.map((x) => JSON.stringify(x)).join(", ")}` : JSON.stringify(alts[0] ?? v);
+  };
   return (c.facts ?? []).flatMap((f, k) => {
-    const v = (values[k] ?? []).filter((x) => x !== "");
-    return v.length ? [`${f.claim}: ${v.map((x) => JSON.stringify(x)).join(" or ")}`] : [];
+    const v = (values[k] ?? []).filter((x) => x !== "").slice(0, 10);
+    if (!v.length) return [];
+    return [`${f.claim}: ${v.length > 1 ? `all of: ${v.map((x) => `(${one(x)})`).join(" and ")}` : one(v[0]!)}`];
   });
 }
 
