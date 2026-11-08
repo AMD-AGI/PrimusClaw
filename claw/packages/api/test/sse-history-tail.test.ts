@@ -262,3 +262,22 @@ test("a stream id not stored yet is placed by sequence too", async () => {
   await store1("claw-11", 11);
   assert.deepEqual((await stream("?after=claw-10")).ids, ["claw-12", "claw-11"]);
 });
+
+// A user message's row is `claw-<Date.now()>` (sessions/dispatch.ts newChatMessageId): 13 digits, not a stream sequence.
+const USER_MSG = "claw-1733000000000";
+
+test("a reconnect does not send the session's user messages again: their ids are not stream sequences", async () => {
+  await seed(9);
+  await store1(USER_MSG, 1000);
+  await store1("claw-10", 10);
+  await store1("claw-11", 11);
+  assert.deepEqual((await stream("?after=claw-10")).ids, ["claw-11"]);
+});
+
+test("a reconnect after a user message gets the events stored after it", async () => {
+  await seed(9);
+  await store1(USER_MSG, 1000);
+  await store1("claw-10", 10);
+  await store1("claw-11", 11);
+  assert.deepEqual((await stream("", { "last-event-id": USER_MSG })).ids, ["claw-10", "claw-11"]);
+});

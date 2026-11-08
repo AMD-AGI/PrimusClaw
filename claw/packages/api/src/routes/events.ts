@@ -258,8 +258,15 @@ function shownSql(opts: ForwardOpts, params: unknown[]): string {
   return filter ? `${named} AND ${filter}` : named;
 }
 
+/**
+ * The stream id pattern: `claw-<seq>` with at most 12 digits. A user message's id is `claw-<Date.now()>`
+ * (sessions/dispatch.ts newChatMessageId), 13 digits, and is no stream sequence: read as one it would sort after every
+ * stream event. One pattern for SQL and for the cursor, so both read the same ids as stream ids.
+ */
+const STREAM_SEQ_DIGITS = 12;
+const STREAM_ID = new RegExp(`^claw-([0-9]{1,${STREAM_SEQ_DIGITS}})$`);
 /** A stream event id's sequence (`claw-<seq>`) in SQL; NULL for any other id. Cast only where it matches. */
-const STREAM_SEQ_SQL = "(CASE WHEN event_id ~ '^claw-[0-9]{1,15}$' THEN substr(event_id, 6)::bigint END)";
+const STREAM_SEQ_SQL = `(CASE WHEN event_id ~ '^claw-[0-9]{1,${STREAM_SEQ_DIGITS}}$' THEN substr(event_id, 6)::bigint END)`;
 
 /**
  * What follows an `after` cursor. A stream id (`claw-<seq>`) is followed by every stream event of a higher sequence,
@@ -279,7 +286,7 @@ export interface AfterCursor {
  * Null: not an event this session can place.
  */
 async function afterCursor(sessionId: string, after: string): Promise<AfterCursor | null> {
-  const m = /^claw-([0-9]{1,15})$/.exec(after);
+  const m = STREAM_ID.exec(after);
   const seq = m ? Number(m[1]) : null;
   const exact = (await db.query(
     "SELECT id FROM claw_session_events WHERE session_id = $1 AND event_id = $2",
