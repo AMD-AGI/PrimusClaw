@@ -37,7 +37,7 @@ import {
   CLAW_ASSISTANT_ENABLED, DOORBELL_DEAD_LEASE_GRACE_SEC, DOORBELL_TAKEOVER_SWEEP_MS, RUN_LEASE_HEARTBEAT_MS, RUN_LEASE_TTL_MS,
   envBool, envInt, LEASE_LOST_GRACE_SEC, RUN_FAT_PREPARING_RECONCILE, TASK_SWEEPER_TICK_MS,
 } from "../config.js";
-import { jsm, nc, TASK_STREAM, taskDeliverySettlement } from "../infra/nats.js";
+import { jsm, kv, nc, TASK_STREAM, taskDeliverySettlement } from "../infra/nats.js";
 import { isNoMessageFound } from "./sandbox-stopper.js";
 import { LEADER_LOCK_IDS, type LeaderLease, withLeaderLock } from "../infra/leader-lock.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
@@ -1388,6 +1388,25 @@ export const appTakeoverPorts = {
       return false;
     }
   },
+  /**
+   * Whether nobody holds the run's lock (`lock.app.<task_id>` in the Brain registry): no entry,
+   * or the tombstone a release leaves. A Brain still running the run refreshes it every few
+   * seconds, whatever its database lease says, so a held lock means a holder that may be alive.
+   * A read that fails, or an entry that is there, is false.
+   */
+  async runLockFree(
+    taskId: string,
+    get: (key: string) => Promise<{ operation?: string; value?: Uint8Array } | null> = (key) => kv.get(key),
+  ): Promise<boolean> {
+    try {
+      const entry = await get(`lock.app.${taskId}`);
+      // The same reading as Brain's `isTombstone`: a delete, a purge, or an empty value.
+      return !entry || entry.operation === "DEL" || entry.operation === "PURGE" || !entry.value || entry.value.length === 0;
+    } catch (err) {
+      logger.warn({ taskId, err: (err as Error)?.message ?? String(err) }, "sweeper.app_takeover_lock_unknown");
+      return false;
+    }
+  },
 };
 
 const LOST_APP_LEASE_SQL = `mode = 'app'
@@ -1420,10 +1439,12 @@ const LOST_APP_LEASE_SQL = `mode = 'app'
  * on.
  *
  * Only when the stream no longer holds the message the last holder was executing (`delivery_seq`,
- * asked of the stream itself): while it does, a redelivery of it may still come, and a second
- * dispatch beside it would let that stale copy -- whose token the new dispatch replaces -- take the
- * run's lock first. Such a run is left to the redelivery, and to `reapLostLeases` after it, as
- * before. Otherwise only after the lease has been gone for the grace, the same wait
+ * asked of the stream itself), and nobody holds the run's lock (`lock.app.<task_id>`): while the
+ * message is there a redelivery of it may still come, and while the lock is held a Brain may still
+ * be running the run with its database lease unrenewed; either one would hold the lock against
+ * the new dispatch (whose token replaces theirs), and the new delivery would wait out its budget
+ * behind it. Such a run is left to the redelivery or its holder, and to `reapLostLeases` after
+ * them, as before. Otherwise only after the lease has been gone for the grace, the same wait
  * `reapLostLeases` makes; only a run row a live AppRunner drives (a run in `finishing` has its own
  * hand-over, `requeueUnfinishedAppRuns`); not a finish-only dispatch; not past the task's
  * deadline; and bounded, so a run that loses every holder is closed in the end. `started_at` and
@@ -1437,7 +1458,8 @@ export async function requeueLostAppLeases(): Promise<number> {
   )).rows as Array<{ task_id: string; delivery_seq: string | number | null }>;
   const gone: string[] = [];
   for (const c of candidates) {
-    if (await appTakeoverPorts.taskMessageGone(Number(c.delivery_seq ?? 0))) gone.push(c.task_id);
+    if (!(await appTakeoverPorts.taskMessageGone(Number(c.delivery_seq ?? 0)))) continue;
+    if (await appTakeoverPorts.runLockFree(c.task_id)) gone.push(c.task_id);
   }
   if (!gone.length) return 0;
   const rows = await applyTaskStatusTransition("queued", {

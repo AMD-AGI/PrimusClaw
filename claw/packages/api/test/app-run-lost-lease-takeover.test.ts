@@ -26,6 +26,8 @@ const WORKLOAD = "claw-0001-sandbox-abcde";
 const STATE_DIR = "/shared/users/u-1/.claw-apps/app-1";
 /** The stream sequence of the message the drained holder was executing. */
 const SEQ = 4242;
+/** A lock value as Brain writes one. */
+const HELD = new TextEncoder().encode(JSON.stringify({ holderId: "h", seq: SEQ, task: "app-1" }));
 
 describe("an app run whose holder went away is taken over, not closed", { skip }, () => {
   let c: AdmissionCluster;
@@ -37,6 +39,9 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
   /** Sequences the task stream still holds; anything else is gone (the stream's max_age dropped it). */
   const inStream = new Set<number>();
   const asked: number[] = [];
+  /** Tasks whose `lock.app.<task_id>` a Brain still holds. */
+  const locked = new Set<string>();
+  let realLockFree: (typeof import("../src/tasks/sweeper.js"))["appTakeoverPorts"]["runLockFree"];
   let realGone: (typeof import("../src/tasks/sweeper.js"))["appTakeoverPorts"]["taskMessageGone"];
   const published: Array<Record<string, any>> = [];
   const sql = async (text: string, params: unknown[] = []) => (await c.app.db.db.query(text, params)).rows as any[];
@@ -49,6 +54,10 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
     grace = (await import("../src/config.js")).LEASE_LOST_GRACE_SEC;
     realGone = sweeper.appTakeoverPorts.taskMessageGone;
     // The real port, over a stream that answers like NATS does: 10037 for a message it no longer has.
+    realLockFree = sweeper.appTakeoverPorts.runLockFree;
+    // The real port, over a registry that holds the locks in `locked` and has none for anything else.
+    sweeper.appTakeoverPorts.runLockFree = (taskId) => realLockFree(taskId, async (key) =>
+      (locked.has(key.replace(/^lock\.app\./, "")) ? { operation: "PUT", value: HELD } : null));
     sweeper.appTakeoverPorts.taskMessageGone = (seq) => {
       asked.push(seq);
       return realGone(seq, async (n) => {
@@ -67,6 +76,7 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
     for (const t of ["claw_app_runs", "claw_tasks", "claw_sessions"]) await sql(`DELETE FROM ${t}`);
     published.length = 0;
     inStream.clear();
+    locked.clear();
     asked.length = 0;
     await sql(`INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status, config)
                VALUES ('s1', 't', 'u-1', 'claw', 'idle', '{"platform_key":"pk","_server_managed_credentials":true}'::jsonb)`);
@@ -237,6 +247,29 @@ describe("an app run whose holder went away is taken over, not closed", { skip }
     assert.equal(t.status, "failed", "not requeued: the lost-lease reaper closes it, as before this change");
     assert.equal(t.failure_reason, "worker_lost");
     assert.equal(t.metadata.app_takeover_requeues, undefined);
+  });
+
+  test("a Brain still holding the run's lock keeps the run, whatever its database lease says", async () => {
+    // Its lease renewals stopped landing (the API unreachable from it), but it still refreshes
+    // the lock and runs the app: a new dispatch would only wait behind that lock.
+    await seed({});
+    locked.add("app-1");
+    assert.equal(await sweeper.requeueLostAppLeases(), 0);
+    assert.equal((await task()).status, "running");
+    locked.clear();
+    assert.equal(await sweeper.requeueLostAppLeases(), 1, "once the lock is gone, the run is handed over");
+  });
+
+  test("the lock read: no entry or a release's tombstone is free; an entry, or a read that fails, is not", async () => {
+    assert.equal(await realLockFree("app-1", async () => null), true);
+    assert.equal(await realLockFree("app-1", async () => ({ operation: "DEL", value: new Uint8Array() })), true);
+    assert.equal(await realLockFree("app-1", async () => ({ operation: "PURGE", value: new Uint8Array() })), true);
+    assert.equal(await realLockFree("app-1", async () => ({ operation: "PUT", value: new Uint8Array() })), true, "an empty value, as Brain reads it");
+    assert.equal(await realLockFree("app-1", async () => ({ operation: "PUT", value: HELD })), false);
+    assert.equal(await realLockFree("app-1", async () => { throw new Error("TIMEOUT"); }), false);
+    const keys: string[] = [];
+    await realLockFree("ktsk_1", async (k) => { keys.push(k); return null; });
+    assert.deepEqual(keys, ["lock.app.ktsk_1"], "the key Brain's pickLockKey gives an app run");
   });
 
   test("a row that names no message is not requeued: there is nothing to ask the stream about", async () => {
