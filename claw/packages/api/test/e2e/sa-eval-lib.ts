@@ -1185,7 +1185,8 @@ export interface Attempt {
   finalMs: number | null;
   /** Every item the case's turns started; `last`: the graded (last) turn started it (earlier turns are context). */
   items: Array<Pick<ItemSeen, "seq" | "kind" | "board_state"> & { cleanup: string; last?: boolean }>;
-  judge?: { pass: boolean; why: string } | null;
+  /** The judge's verdict and reason (keys scrubbed, 300 characters); `votes` when it was asked more than once (majority). */
+  judge?: { pass: boolean; why: string; votes?: Array<{ pass: boolean; why: string }> } | null;
   /** Not fully graded, so not a pass: content only a judge can grade and no judge graded it, or an oracle not read (offline). */
   unjudged?: true;
   error?: string;
@@ -1216,14 +1217,33 @@ export const NO_FALSE_DENIAL_RULE = "The reply must not say that it cannot reach
  * what the rule needs to be applied: the tools the case expects the assistant to have for this request (its tools_must) and every
  * tool call of the turn, by name, with whether it failed (no tool output: that is the identity's data).
  */
-export function judgePrompt(c: EvalCase, turns: readonly Turn[], final: string, calls: readonly ToolCall[] = []): string {
+export function judgePrompt(c: EvalCase, turns: readonly Turn[], final: string, calls: readonly ToolCall[] = [],
+  values: ReadonlyArray<readonly string[] | null> = []): string {
   const facts = judgeFacts(c);
+  const truth = oracleTruth(c, values);
   const evidence = c.may_deny ? "" : `Tools it has for this request: ${(c.tools_must ?? []).join(", ") || "none named by the case"}\n`
     + `Tool calls it made in this turn: ${calls.map((x) => `${x.name} (${x.ok === false ? "failed" : x.ok === true ? "ok" : "no result"})`).join(", ") || "none"}\n`;
   return `You grade one reply of an assistant to a user.\nUser said:\n${turns.map((t) => t.user).join("\n")}\n\n`
     + `Assistant's final reply:\n${final}\n\n${c.rubric ? `Rubric: ${c.rubric}\n` : ""}${facts.length ? `The reply must state: ${facts.join("; ")}\n` : ""}`
+    + (truth.length ? `${ORACLE_TRUTH_NOTE}\n${truth.map((t) => `- ${t}`).join("\n")}\n` : "")
     + `${c.may_deny ? "" : `Always: ${NO_FALSE_DENIAL_RULE}\n${evidence}`}`
     + "\nAnswer with one line: PASS or FAIL, a colon, and one short reason.";
+}
+
+/** What the judge is told of the values the run read: they are the truth, and may be newer than what it knows. */
+export const ORACLE_TRUTH_NOTE = "The correct values, read for this run from the source of truth just before the reply. They can be newer than "
+  + "anything you know (a release, a version, a count, a date after your training): take them as correct, and never fail a reply "
+  + "for stating one of them, or because a value is later than you expected:";
+
+/**
+ * Each fact with a value the run has for it (an oracle's read for the run, or the value written in the case): its claim and the
+ * values a reply may give for it. A fact with none is left out.
+ */
+export function oracleTruth(c: EvalCase, values: ReadonlyArray<readonly string[] | null>): string[] {
+  return (c.facts ?? []).flatMap((f, k) => {
+    const v = (values[k] ?? []).filter((x) => x !== "");
+    return v.length ? [`${f.claim}: ${v.map((x) => JSON.stringify(x)).join(" or ")}`] : [];
+  });
 }
 
 /**
@@ -1366,7 +1386,11 @@ export function planOf(cases: readonly EvalCase[], mode: Mode, env: Record<strin
  * One attempt as it was observed, so it can be graded again offline (EVAL_OFFLINE) after the cases or the grader
  * change. It holds what the identity was shown, so it is written only where the operator asks (EVAL_RECORD_DIR).
  */
-export interface Recording { case_id: string; mode: Mode; attempt: number; at: string; observed: Observed }
+export interface Recording {
+  case_id: string; mode: Mode; attempt: number; at: string; observed: Observed;
+  /** The judge's verdict and each of its whole answers, in order (`failed`: it gave none). */
+  judge?: { pass: boolean; failed?: true; answers: string[] };
+}
 
 export function parseRecordings(text: string): Recording[] {
   return text.split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Recording)

@@ -442,6 +442,14 @@ test("S15 runnable oracles, and what the judge is shown", () => {
   assert.match(withCalls, /Tools it has for this request: mcp__github__issue_search\n/);
   assert.match(withCalls, /Tool calls it made in this turn: mcp__github__issue_search \(failed\), web_search \(ok\)\n/);
   assert.doesNotMatch(withCalls, /secret-ish/, "no tool output");
+  // The values the run read are given as the truth, newer than the judge may know (E249: "ROCm 10.x does not exist"); a fact with
+  // no value is left out, and without values there is no such line.
+  const rocm = caseOf({ facts: [{ claim: "the latest ROCm release", oracle: { kind: "api", query: "gh:/repos/ROCm/TheRock/releases/latest#tag_name" } },
+    { claim: "where it was read", oracle: { kind: "api", query: "a description" } }, { claim: "nothing read", oracle: { kind: "api", query: "gh:/x#y" } }] });
+  const truth = judgePrompt(rocm, [{ user: "ROCm 最新版本？" }], "10.1.0", [], [["10.1.0", "v10.1.0"], null, []]);
+  assert.match(truth, /source of truth[^\n]*newer than anything you know[\s\S]*\n- the latest ROCm release: "10\.1\.0" or "v10\.1\.0"\n/);
+  assert.doesNotMatch(truth, /- where it was read:|- nothing read:/);
+  assert.doesNotMatch(judgePrompt(rocm, [{ user: "q" }], "a"), /source of truth/);
   assert.equal(needsJudge(caseOf({ facts: [{ claim: "n", oracle: { kind: "api", query: "gh:/x#y" } }] })), false, "a runnable oracle needs no judge");
   // Offline, a GitHub or MCP oracle was not read either: unverified, never a pass.
   const gh = caseOf({ facts: [{ claim: "n", oracle: { kind: "api", query: "gh:/x#y" } }] });

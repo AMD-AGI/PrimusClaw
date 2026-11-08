@@ -37,15 +37,21 @@
  *   EVAL_K            attempts per case (default 3): the report has pass@1 (mean) and pass^k
  *   EVAL_ITEM_WAIT    seconds to wait for an item's result, unless the case sets item_wait_s (default 300)
  *   EVAL_KEEP_TEXT    1: keep the final answers in the results (they are the identity's own data, and can contain what an
- *                     oracle reads from it; default: only their length). Write such results only somewhere private.
+ *                     oracle reads from it; default: only their length). Write such results only somewhere private. The judge's
+ *                     reasons are kept either way (keys scrubbed, 300 characters each), so a FAIL can be looked into
  *   EVAL_OUT          a directory for the results: <mode>.json and <mode>.md
- *   EVAL_RECORD_DIR   a directory for <mode>-recordings.jsonl: every attempt as observed (what the identity was shown
- *                     included), for EVAL_OFFLINE; written only when set, and only together with EVAL_KEEP_TEXT=1
+ *   EVAL_RECORD_DIR   a private directory (the operator's own, no access for group or others; made 0700 when missing, refused
+ *                     otherwise) for <mode>-recordings.jsonl (0600): every attempt as observed, in full (what the identity was
+ *                     shown included), and the judge's whole answers, for EVAL_OFFLINE and for looking into a verdict; keys
+ *                     scrubbed. Written only when set; EVAL_KEEP_TEXT is not needed for it
  *   EVAL_JUDGE_URL, EVAL_JUDGE_MODEL, EVAL_JUDGE_KEY_FILE, EVAL_JUDGE_MAX_TOKENS (default 1024)
  *                     an Anthropic-compatible gateway, a model and its key: every case is also graded by that model (the
  *                     no-false-denial rule with the turn's calls, and the case's rubric and judge-only facts). Its FAIL fails
  *                     the case and it decides what the denial detectors left to it; it never passes a case a deterministic
- *                     check failed.
+ *                     check failed. A FAIL on a case every deterministic check passed is asked again, and a third time when the
+ *                     two disagree: the majority decides (each vote is in the attempt's `judge.votes`). The judge is given the
+ *                     values the facts' oracles read for the run, as the truth to grade against (they can be newer than the
+ *                     judge's own knowledge: a version it does not know is not a reason to fail).
  *   EVAL_VARS_FILE    a JSON object of run variables for `{{name}}` placeholders (nested objects give `{{a.b}}`); EVAL_VAR_<NAME>
  *                     sets one too. A case whose placeholders have no value is skipped and says which.
  *   EVAL_VARS_CMD     a command (a program and its arguments separated by spaces, run without a shell) run right before
@@ -108,7 +114,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -123,10 +129,24 @@ import {
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   sayWaitMs, saysOf, staticFindings, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
-  type SayMark, type Arms, type Attempt, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
+  type SayMark, type Arms, type Attempt, type Check, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
 import * as readTools from "../../src/assistant/read-tools.js";
+
+/** Null when `dir` is (or is made, 0700) a directory of this process's user that group and others cannot enter; else why not. */
+function privateDir(dir: string): string | null {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const st = statSync(dir);
+    if (!st.isDirectory()) return "is not a directory";
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) return "is not the operator's own directory";
+    if (st.mode & 0o077) return `is open to group or others (mode ${(st.mode & 0o777).toString(8)}; chmod 700 it)`;
+    return null;
+  } catch (err) {
+    return `cannot be made (${err instanceof Error ? err.message : String(err)})`;
+  }
+}
 
 const need = (name: string): string => {
   const v = process.env[name];
@@ -165,7 +185,11 @@ const TURN_WAIT_S = process.env.EVAL_TURN_WAIT_S ? int("EVAL_TURN_WAIT_S", 180, 
 const turnWaitMs = (router: boolean): number => (TURN_WAIT_S ?? (router ? 180 : 600)) * 1000;
 // A recording holds what the identity was shown (and so anything an oracle reads back from its data): it is written only
 // when the operator also asks to keep the text, knowingly.
-if (RECORD_DIR && !KEEP_TEXT) { console.error("EVAL_RECORD_DIR writes the answers the identity was shown: set EVAL_KEEP_TEXT=1 as well to say so"); process.exit(2); }
+// EVAL_RECORD_DIR holds what the identity was shown, in full: only a directory nobody else can read.
+if (RECORD_DIR && LIVE) {
+  const why = privateDir(RECORD_DIR);
+  if (why) { console.error(`refusing to run: EVAL_RECORD_DIR ${why}`); process.exit(2); }
+}
 
 /** The key, from the environment or the file named there; never a default. Never printed, never written. */
 function apiKey(): string {
@@ -492,12 +516,32 @@ function mcpClient(server: string): Promise<Client> {
 // ("judge gave no PASS or FAIL") rather than a grade.
 const JUDGE_MAX_TOKENS = int("EVAL_JUDGE_MAX_TOKENS", 1024, 64, 16_384);
 
-async function judge(c: EvalCase, turns: Turn[], final: string, calls: readonly ToolCall[]): Promise<{ pass: boolean; why: string; failed?: true } | null> {
+/** One ask of the judge: its verdict, its reason (300 characters) and its whole answer (`text`), keys scrubbed. */
+interface JudgeVote { pass: boolean; why: string; text?: string; failed?: true }
+
+/**
+ * The judge's verdict on an attempt. A FAIL on an attempt every deterministic check passed (`checksPass`) is asked again, and a third
+ * time when the two disagree: the majority decides, so one bad sample does not fail a right answer (E249: a judge that held a newer
+ * ROCm version than it knew to be made up). Every vote is kept. A vote the judge did not give makes it the run's error.
+ */
+async function judge(c: EvalCase, turns: Turn[], o: Observed, checksPass: boolean): Promise<(JudgeVote & { votes?: JudgeVote[] }) | null> {
   const url = process.env.EVAL_JUDGE_URL, model = process.env.EVAL_JUDGE_MODEL, keyFile = process.env.EVAL_JUDGE_KEY_FILE;
   // Every case, not only those with content only a judge can grade: the no-false-denial rule is in every prompt.
   if (!url || !model || !keyFile) return null;
   const key = readFileSync(keyFile, "utf8").trim();
-  const prompt = judgePrompt(c, turns, final, calls);
+  const prompt = judgePrompt(c, turns, o.final, o.calls, o.factValues);
+  const first = await judgeOnce(url, model, key, prompt);
+  if (first.failed || first.pass || !checksPass) return first;
+  const votes = [first, await judgeOnce(url, model, key, prompt)];
+  if (!votes[1]!.failed && votes[1]!.pass) votes.push(await judgeOnce(url, model, key, prompt));
+  const failed = votes.find((v) => v.failed);
+  if (failed) return { ...failed, votes };
+  const passes = votes.filter((v) => v.pass).length;
+  const pass = passes * 2 > votes.length;
+  return { ...votes.find((v) => v.pass === pass)!, pass, votes };
+}
+
+async function judgeOnce(url: string, model: string, key: string, prompt: string): Promise<JudgeVote> {
   // An answer without a verdict, a gateway that is busy or down (429, 5xx) and a request that failed are asked once more: the
   // gateway's model sometimes spends its turn on a thinking block, or reasons first and gives no verdict line. The second ask of a
   // verdict-less answer says what was missing. Only then is it the run's error.
@@ -519,7 +563,10 @@ async function judge(c: EvalCase, turns: Turn[], final: string, calls: readonly 
       const body = (await res.json()) as any;
       const text = (Array.isArray(body?.content) ? body.content : []).filter((b: any) => b?.type === "text").map((b: any) => String(b.text ?? "")).join("\n");
       const word = judgeVerdict(text);
-      if (word) return { pass: word === "PASS", why: scrubWith(text.trim().slice(0, 300), [KEY, key]) };
+      if (word) {
+        const whole = scrubWith(text.trim(), [KEY, key, ...sendTokens]);
+        return { pass: word === "PASS", why: whole.slice(0, 300), text: whole };
+      }
       why = `judge gave no PASS or FAIL (stop_reason ${String(body?.stop_reason ?? "?")}, ${text.length} chars of text)`;
       noVerdict = true;
     } catch (err) {
@@ -529,16 +576,25 @@ async function judge(c: EvalCase, turns: Turn[], final: string, calls: readonly 
   return { pass: false, why, failed: true };
 }
 
+/** Every deterministic check passed: what is left to decide is the judge's (`verdictOf`). */
+const checksPassed = (checks: readonly Check[]): boolean => checks.every((x) => x.pass && (!x.unverified || x.name === "no false denial"));
+
 const attemptOf = async (c: EvalCase, turns: Turn[], o: Observed, tools: string[], items: Attempt["items"]): Promise<Attempt> => {
   const checks = grade(c, o);
-  if (RECORD_DIR) recordings.push({ case_id: c.id, mode: MODE, attempt: recordings.filter((r) => r.case_id === c.id).length + 1, at: iso(), observed: forRecording(c, o) });
-  const verdict = await judge(c, turns, o.final, o.calls);
+  const verdict = await judge(c, turns, o, checksPassed(checks));
+  // The recording keeps the judge's whole answers; the results keep each reason (keys scrubbed, 300 characters), with or without
+  // EVAL_KEEP_TEXT: without it a FAIL could not be looked into.
+  const short = (v: JudgeVote): { pass: boolean; why: string } => ({ pass: v.pass, why: scrub(v.why) });
+  if (RECORD_DIR) {
+    recordings.push({ case_id: c.id, mode: MODE, attempt: recordings.filter((r) => r.case_id === c.id).length + 1, at: iso(), observed: forRecording(c, o),
+      ...(verdict ? { judge: { pass: verdict.pass, ...(verdict.failed ? { failed: true } : {}), answers: (verdict.votes ?? [verdict]).map((v) => v.text ?? v.why) } } : {}) });
+  }
   const kept = KEEP_TEXT ? checks : checks.map((x) => (TEXT_DETAIL.test(x.name) && x.detail ? { ...x, detail: "<hidden: EVAL_KEEP_TEXT>" } : x));
   return {
     // A judge that gave no verdict makes the attempt an error of the run, never a FAIL of the assistant.
     ...(verdict?.failed ? { pass: false, error: scrub(`infra: ${verdict.why}`) } : verdictOf(c, checks, verdict)), checks: kept, route: o.route, cards: o.cards, tools, final: KEEP_TEXT ? scrub(o.final) : null, finalChars: o.final.length,
-    // The judge's reason can quote the answer: kept only with the text.
-    firstReplyMs: o.firstReplyMs, finalMs: o.finalMs, items, judge: verdict && (KEEP_TEXT ? verdict : { pass: verdict.pass, why: "" }),
+    firstReplyMs: o.firstReplyMs, finalMs: o.finalMs, items,
+    judge: verdict && { ...short(verdict), ...(verdict.votes ? { votes: verdict.votes.map(short) } : {}) },
   };
 };
 
@@ -1211,8 +1267,9 @@ async function main(): Promise<void> {
   cleanupFailed.push(...new Set(CLEANUP_ISSUES));
   cleanupFailed = cleanupFailed.map(scrub);
   if (RECORD_DIR) {
-    mkdirSync(RECORD_DIR, { recursive: true });
-    writeFileSync(join(RECORD_DIR, `${MODE}-recordings.jsonl`), scrub(recordings.map((r) => JSON.stringify(r)).join("\n") + "\n"));
+    const file = join(RECORD_DIR, `${MODE}-recordings.jsonl`);
+    writeFileSync(file, scrub(recordings.map((r) => JSON.stringify(r)).join("\n") + "\n"), { mode: 0o600 });
+    chmodSync(file, 0o600);   // a file that was there keeps its mode otherwise
   }
   report(results, cases.length, leftOpen, cleanupFailed);
 }
