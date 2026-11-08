@@ -607,6 +607,30 @@ describe("assistant outbound", { skip }, () => {
       assert.equal(events.length, 0);
     });
 
+    test("of a review someone else asked for, to a reviewer who has written nothing, is in the language the asker writes in, not the English title's", async () => {
+      await subscribe("u2");
+      const assistants = await import("../src/assistant/assistant.js");
+      const write = async (userId: string, content: string) => {
+        const { sessionId } = await assistants.getOrCreateAssistant(userId);
+        await q(
+          `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context) VALUES ($1, $2, $3, $4, '{}'::jsonb)`,
+          [sessionId, `m-${userId}-${Math.random()}`, userId, content],
+        );
+      };
+      await write("u1", "请 u2 帮我 review 并合入：https://github.com/AMD-AGI/demo/pull/7");
+      const review = async (params: Record<string, unknown>) => {
+        const itemId = await seedItem({ user_id: "u2", title: "Review+merge AMD-AGI/demo#7", last_report_kind: "blocked", pending_question: "GitHub says the branch has conflicts" });
+        await q("UPDATE claw_work_items SET kind = 'review', params = $2::jsonb WHERE item_id = $1", [itemId, JSON.stringify(params)]);
+        await outbound.recordNeedsYouFallback({ itemId }, deps());
+        return (await saysRows()).at(-1).text as string;
+      };
+      assert.equal(await review({ requested_by: "u1" }), `#${itemNo} Review+merge AMD-AGI/demo#7 卡住了，需要你回复：GitHub says the branch has conflicts`);
+      assert.equal(await review({}), `#${itemNo} "Review+merge AMD-AGI/demo#7" is blocked and needs your answer: GitHub says the branch has conflicts`, "no one asked: the title's");
+      // The reviewer's own words come first.
+      await write("u2", "Please merge it when it is green");
+      assert.equal(await review({ requested_by: "u1" }), `#${itemNo} "Review+merge AMD-AGI/demo#7" is blocked and needs your answer: GitHub says the branch has conflicts`);
+    });
+
     test("belongs to the item's owner, not to whoever asked", async () => {
       await subscribe("u2");
       const out = await outbound.recordNeedsYouFallback({ itemId: await seedItem({ user_id: "u2" }) }, deps());

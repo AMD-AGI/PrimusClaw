@@ -642,6 +642,18 @@ describe("M the merge gates", () => {
     }
   });
 
+  test("M8c a merge refused on GitHub's merge state records that state on its audit row (DIRTY: a conflict only the author resolves); a merge made records none", async () => {
+    e.gh.graphql.mergeStateStatus = "DIRTY";
+    approvedHere();
+    const o = await merge();
+    assert.equal(reason(o), "merge_state_not_clean", o.text);
+    const row = async () => (await e.sql("SELECT result, detail, merge_state FROM claw_github_audit WHERE tool = 'gh_pr_merge' ORDER BY id DESC LIMIT 1"))[0];
+    assert.deepEqual({ ...(await row()) }, { result: "refused", detail: "merge_state_not_clean", merge_state: "DIRTY" });
+    e.gh.graphql.mergeStateStatus = "CLEAN";
+    assert.equal(reason(await merge()), "merged");
+    assert.deepEqual({ ...(await row()) }, { result: "ok", detail: "merged", merge_state: null });
+  });
+
   test("M16 GitHub works the merge state out after the approval a person's allow made, not at once: UNKNOWN, and BLOCKED while the review does not count yet, are waited for, a few seconds at most; the merge is made when it settles, and not otherwise", async () => {
     const st = (mergeStateStatus: string, extra: Record<string, unknown> = {}) => ({ mergeStateStatus, ...extra });
     // [name, the states the reads after the approval answer, in order, then what every later read answers, expected reason or "merged", waits]

@@ -38,6 +38,7 @@ import { deterministicEventId, enqueue, kickDelivery, onDelivered } from "../not
 import type { ItemRefError } from "./item-ref.js";
 import { detectLanguage, languageToAnswerIn } from "./language.js";
 import { canAccept, resolveWorkItem } from "./work-items.js";
+import { requestedByOfItem } from "./requester-view.js";
 
 const logger = pino({ name: "assistant-outbound" });
 
@@ -710,18 +711,28 @@ function needsYouText(item: ItemRow, zh = false): string {
 /** How many of the person's latest messages to their assistant say which language they write in. */
 const PERSON_LANGUAGE_LOOKBACK = 5;
 
-/**
- * Whether the person writes to their assistant in Chinese: their latest messages to it, newest first, as the router's reply language is
- * worked out (`languageToAnswerIn`); failing that, `fallback` (what they named the work, an item's title). A message the system sends
- * them on its own (an item that needs them, a write to approve) is in their language, not in English.
- */
-export async function personWritesChinese(q: Querier, userId: string, fallback = ""): Promise<boolean> {
-  const language = await languageToAnswerIn(null, async () => ((await q(
+/** The language of `userId`'s latest messages to their assistant, newest first, as the router's reply language is worked out; null when they tell none. */
+async function messagesLanguage(q: Querier, userId: string): Promise<string | null> {
+  return languageToAnswerIn(null, async () => ((await q(
     `SELECT m.content FROM claw_assistant_messages m JOIN claw_assistants a ON a.session_id = m.session_id
       WHERE a.user_id = $1 ORDER BY m.received_at DESC LIMIT $2`,
     [userId, PERSON_LANGUAGE_LOOKBACK],
   )).rows as Array<{ content: string }>).map((r) => r.content));
-  return (language ?? (fallback ? detectLanguage(fallback) : null)) === "Chinese";
+}
+
+/**
+ * Whether the person writes to their assistant in Chinese: their latest messages to it, newest first, as the router's reply language is
+ * worked out (`languageToAnswerIn`); failing that, for an item someone else asked of them (a review: `params.requested_by`), the language
+ * the one who asked writes in; failing that, `fallback` (what they named the work, an item's title). A message the system sends them on
+ * its own (an item that needs them, a write to approve) is in their language, not in English. A reviewer asked through someone else's
+ * assistant may never have written to their own, and the title of the item made for them is the system's ("Review+merge …"): read alone,
+ * it made every notice of such an item English (2026-11-07 daily gaps, N5: 23 in a day, to a reviewer asked in Chinese).
+ */
+export async function personWritesChinese(q: Querier, userId: string, fallback = "", askedBy: string | null = null): Promise<boolean> {
+  const language = await messagesLanguage(q, userId)
+    ?? (askedBy && askedBy !== userId ? await messagesLanguage(q, askedBy) : null)
+    ?? (fallback ? detectLanguage(fallback) : null);
+  return language === "Chinese";
 }
 
 /** A write a worker holds for the person, as `holds.ts` records it: what it would do in their words, and the text it would write. */
@@ -918,12 +929,11 @@ async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToSt
   const where = await itemSession(q, item.item_id);
   // No session is read: nothing is stored, so a later call (the sweep's, once a session exists) says it.
   if (!where) return null;
-  const held = answered ? null
-    : (await q("SELECT params, worker_session_id FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0] as
-      { params: Record<string, unknown> | null; worker_session_id: string | null } | undefined;
-  const params = held?.params ?? null;
+  const held = (await q("SELECT params, worker_session_id FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0] as
+    { params: Record<string, unknown> | null; worker_session_id: string | null } | undefined;
+  const params = answered ? null : held?.params ?? null;
   const heldWrite = answered ? null : heldWriteCard(item, params, held?.worker_session_id ?? null);
-  const zh = await personWritesChinese(q, item.user_id, item.title);
+  const zh = await personWritesChinese(q, item.user_id, item.title, requestedByOfItem(held?.params ?? null));
   const said = answered
     ? (zh ? `#${item.seq} ${item.title}：${answer}` : `#${item.seq} "${item.title}": ${answer}`)
     : heldWriteText(item, params) ?? needsYouText(item, zh);
