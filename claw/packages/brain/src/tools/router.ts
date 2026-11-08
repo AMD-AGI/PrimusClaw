@@ -12,7 +12,7 @@ import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
 import type { RunCitations } from "./citations.js";
 import {
-  CITED_FILE_MAX_BYTES, CITED_FILE_PATTERNS, CITED_FILE_REFUSAL, CITED_FILE_TOO_LARGE, CITED_FILE_UNREADABLE, REPORT_FILE_EXTENSIONS, checkNote,
+  CITED_FILE_MAX_BYTES, isCitedReport, CITED_FILE_PATTERNS, CITED_FILE_REFUSAL, CITED_FILE_TOO_LARGE, CITED_FILE_UNREADABLE, REPORT_FILE_EXTENSIONS, checkNote,
   checkReport, type CiteCheck,
 } from "./cite-check.js";
 import type { LogReads } from "./log-reads.js";
@@ -27,7 +27,7 @@ import {
   DELIVER_FILE_ENABLED, DELIVER_FILE_MAX_BYTES,
 } from "../config.js";
 import type { Delivery } from "@claw/protocol";
-import { DELIVER_FILE_TOOL, deliverFile, deliverFileSchema } from "./deliver-file.js";
+import { DELIVER_FILE_TOOL, deliverFile, deliverFileSchema, workspaceFile } from "./deliver-file.js";
 import type { WebSearchService } from "./web/search.js";
 import type { WebFetchService } from "./web/fetch.js";
 import { LOAD_SKILL_TOOL, type SkillStore } from "../agent/skill-store.js";
@@ -489,10 +489,18 @@ export class ToolRouter {
     const check = this.citeCheck;
     // The same report copied out of the sandbox would reach the user unchecked: a file that is one is read and delivered as checked
     // text instead (a report too long for one deliver_text call is written to a file, so this is how it is delivered).
+    // The file is the one deliver_file would copy (`workspaceFile`: under /workspace, links followed); one it would refuse is left
+    // to refuse.
     if (check && name === DELIVER_FILE_TOOL && typeof input.path === "string") {
-      const kind = await this.sandboxFileCitedReport(input.path, signal);
-      if (kind === "too_large") return refuse(outcome, CITED_FILE_TOO_LARGE);
-      if (kind === "report") return this.deliverCitedFile(check, input.path, input, signal, outcome, ctx);
+      const found = await workspaceFile(await this.requireHands(), input.path, signal);
+      if (found.ok) {
+        const kind = await this.sandboxFileCitedReport(found.real, signal);
+        if (kind === "too_large" || (kind === "report" && found.size > CITED_FILE_MAX_BYTES)) return refuse(outcome, CITED_FILE_TOO_LARGE);
+        if (kind === "report") {
+          const delivered = await this.deliverCitedFile(check, found, input, signal, outcome, ctx);
+          if (delivered !== null) return delivered;
+        }
+      }
     }
     if (check?.checks(name) && typeof input.text === "string" && input.text.trim()) {
       const result = await checkReport(input.text, check.ports, signal);
@@ -532,14 +540,17 @@ export class ToolRouter {
   }
 
   /**
-   * Deliver the sandbox file at `path`, a cited report, as `deliver_text` would deliver its text: read whole with the sandbox's own
-   * `read`, then handed to the run's checked `deliver_text` (`route`), so it is checked against its sources before it is stored. Its
-   * name is the file's, with `.md` added when it is not a text file's; the caption is the call's. Refused, with nothing delivered, when
-   * the file cannot be read, is larger than one text delivery, or the run has no checked `deliver_text`.
+   * Deliver the sandbox file `file` (resolved as deliver_file resolves it), a cited report, as `deliver_text` would deliver its text:
+   * read whole with the sandbox's own `read` at its resolved path, then handed to the run's checked `deliver_text` (`route`), so it is
+   * checked against its sources before it is stored. Its name is the file's, with `.md` added when it is not a text file's; the
+   * caption is the call's. Refused, with nothing delivered, when the file cannot be read, is larger than one text delivery, or the run
+   * has no checked `deliver_text`. Null when the text read is not a report the check reads: deliver_file then copies it as it is.
    */
   private async deliverCitedFile(
-    check: CiteCheck, path: string, input: Record<string, unknown>, signal?: AbortSignal, outcome?: RouteOutcome, ctx?: { stepIdentity?: string },
-  ): Promise<string> {
+    check: CiteCheck, file: { file: string; real: string }, input: Record<string, unknown>, signal?: AbortSignal, outcome?: RouteOutcome,
+    ctx?: { stepIdentity?: string },
+  ): Promise<string | null> {
+    const path = file.real;
     const tool = check.deliverTool();
     if (!tool) return refuse(outcome, CITED_FILE_REFUSAL);
     const read: RouteOutcome = { isError: false };
@@ -551,7 +562,10 @@ export class ToolRouter {
     }
     if (read.isError || /^Error\b/.test(text)) return refuse(outcome, CITED_FILE_UNREADABLE);
     if (Buffer.byteLength(text, "utf8") > CITED_FILE_MAX_BYTES) return refuse(outcome, CITED_FILE_TOO_LARGE);
-    const base = path.split("/").filter(Boolean).pop() ?? "report.md";
+    // What the search took for a report the check may not (its citations only inside code blocks): not a report, so deliver_file
+    // copies it as any other file, as deliver_text would have passed it on unchanged.
+    if (!isCitedReport(text)) return null;
+    const base = file.file.split("/").filter(Boolean).pop() ?? "report.md";
     const fileName = /\.(md|markdown|txt)$/i.test(base) ? base : `${base.replace(/\.[^.]*$/, "")}.md`;
     const args: Record<string, unknown> = { name: fileName, text };
     if (typeof input.caption === "string" && input.caption.trim()) args.caption = input.caption;

@@ -156,6 +156,12 @@ function parseReport(lines: string[]): { sources: Map<number, ListedSource>; cla
   return { sources, claims };
 }
 
+/** Whether `text` is a report the check reads (it cites a number outside code blocks and lists a source); nothing is fetched. */
+export function isCitedReport(text: string): boolean {
+  const { sources, claims } = parseReport(text.split("\n"));
+  return sources.size > 0 && claims.length > 0;
+}
+
 /**
  * A file in the sandbox that is a cited report, as two searches of the whole file (JavaScript regular expressions, one line each):
  * a line of a list of sources, and a line with a citation number that is not a source line's own. Both must match. Looser than the

@@ -10,6 +10,8 @@
  *       of the two, a file that cannot be searched, and any file in a run without the check are left to deliver_file
  *   CS4 a cited report that is too large, cannot be read back, or has no checked deliver_text to go through is refused, nothing
  *       delivered
+ *   CS5 the file is the one deliver_file would copy: a path outside /workspace is never searched or read; a file whose citations
+ *       are all inside code blocks is not a report the check reads, and deliver_file copies it as any other
  *   CS3 the check's budget ends a wait for a page that never answers: the check returns, and the statement is not checked
  */
 import test, { after, before } from "node:test";
@@ -95,6 +97,15 @@ function routerOver(file: string | null, opts: { unreadable?: boolean } = {}) {
   const reads: Array<Record<string, unknown>> = [];
   const delivered: Array<Record<string, unknown>> = [];
   const hands = {
+    // deliver_file's own probe (`workspaceFile`): the file's type and size, and where it resolves, under /workspace.
+    callTool: async (name: string, input: Record<string, unknown>) => {
+      const command = String(input.command ?? "");
+      if (name !== "bash" || !command.startsWith("stat ")) throw new Error(`unexpected ${name}`);
+      const p = /^stat -L -c '[^']*' -- '((?:[^']|'\\'')*)' 2>&1 && /.exec(command)![1].replace(/'\\''/g, "'");
+      if (file === null) return `stat: cannot statx '${p}': No such file or directory\n\nExit code: 1`;
+      const size = file === "BIG" ? 9 * 1024 * 1024 : Buffer.byteLength(file, "utf8");
+      return `__claw_deliver_stat__regular file|${size}\n__claw_deliver_real__${Buffer.from(`/workspace\0${p}\0`, "utf8").toString("base64")}\n`;
+    },
     callToolFull: async (name: string, input: Record<string, unknown>) => {
       if (name === "read") {
         reads.push(input);
@@ -187,7 +198,7 @@ test("CS4 a cited report too large, unreadable, or with no checked deliver_text 
   const big = routerOver(`${"x".repeat(300 * 1024)} [1].\n\n[1]: vLLM on ROCm — ${A}`);
   big.router.citeCheck = check();
   assert.deepEqual(await deliverFile(big, "/workspace/big.md"), { text: CITED_FILE_TOO_LARGE, isError: true });
-  assert.equal(big.delivered.length, 0);
+  assert.deepEqual([big.reads.length, big.delivered.length], [0, 0], "its size is known before it is read: it is not read");
 
   const gone = routerOver(REPORT, { unreadable: true });
   gone.router.citeCheck = check();
@@ -198,6 +209,22 @@ test("CS4 a cited report too large, unreadable, or with no checked deliver_text 
   other.router.citeCheck = parseCiteCheck({ tools: ["mcp__assistant__other"] }, ports);
   assert.deepEqual(await deliverFile(other, "/workspace/report.md"), { text: CITED_FILE_REFUSAL, isError: true });
   assert.deepEqual([other.reads.length, other.delivered.length], [0, 0]);
+});
+
+test("CS5 only the file deliver_file would copy is read, and only a report the check reads goes through deliver_text", async () => {
+  const outside = routerOver(REPORT);
+  outside.router.citeCheck = check();
+  await deliverFile(outside, "/etc/report.md");
+  assert.deepEqual([outside.searches.length, outside.reads.length, outside.delivered.length], [0, 0, 0]);
+  await deliverFile(outside, "/workspace/../etc/report.md");
+  assert.deepEqual([outside.searches.length, outside.reads.length, outside.delivered.length], [0, 0, 0]);
+
+  const fenced = routerOver(["```", "vLLM supports MI300X [1].", `[1]: vLLM on ROCm — ${A}`, "```"].join("\n"));
+  fenced.router.citeCheck = check();
+  const o = await deliverFile(fenced, "/workspace/snippet.md");
+  assert.equal(fenced.searches.length, 2, "the search takes it for a report");
+  assert.equal(fenced.delivered.length, 0, "the check does not: it is not delivered through deliver_text");
+  assert.doesNotMatch(o.text, /numbered citations/);
 });
 
 test("CS3 a page that never answers does not hold the check past its budget", { timeout: 10_000 }, async (t) => {
