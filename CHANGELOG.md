@@ -1146,6 +1146,11 @@ record it.
 - `@primusclaw/connector` 0.1.12: a command held in the socket through a stall (a laptop lid closed, a network gap) is confirmed
   with Claw before it runs, so a prompt the chat has since withdrawn or let go is not run late (#469, connector part; needs Claw
   with #469, live since :202611080318).
+- `@primusclaw/connector` 0.1.13: a command waiting behind a turn is confirmed with Claw when the stream missed its pings (a
+  short network hold), and a prompt for a session closed meanwhile is refused as `session_closed` (#503, connector part; needs
+  Claw with #503, live since :202611080436); an unchanged connector.json is no longer rewritten (and flushed) after every
+  heartbeat (its modification time is still set), so on a slow disk a session's start no longer queues behind those durable
+  writes (#527).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
