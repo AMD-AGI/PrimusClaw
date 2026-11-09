@@ -71,8 +71,8 @@ describe("pr_summary through the tools", () => {
     assert.equal(o.body.status, "submitted");
     assert.equal(o.body.pr_summary, "Adds a summary line to the review card.");
     assert.deepEqual(Object.keys(o.body).slice(0, 2), ["status", "pr_summary"], "first, so that an answer cut for display keeps it");
-    assert.equal(await latestPrSummary(e.db, e.actor.sessionId), "Adds a summary line to the review card.");
-    assert.equal(await latestPrSummary(e.db, "another-session"), null);
+    assert.equal(await latestPrSummary(e.db, e.actor.sessionId, "AMD-AGI/demo", 7), "Adds a summary line to the review card.");
+    assert.equal(await latestPrSummary(e.db, "another-session", "AMD-AGI/demo", 7), null);
   });
 
   test("a review without one answers as it always did, and nothing is read for it", async () => {
@@ -80,7 +80,7 @@ describe("pr_summary through the tools", () => {
     const o = await e.service.submitReview(e.actor, { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Looks fine.", risk_judgement: LOW });
     assert.equal(o.isError, false, o.text);
     assert.equal("pr_summary" in o.body, false);
-    assert.equal(await latestPrSummary(e.db, e.actor.sessionId), null);
+    assert.equal(await latestPrSummary(e.db, e.actor.sessionId, "AMD-AGI/demo", 7), null);
   });
 
   test("a merge held for the acting user keeps the sentence its call gave, for the card that asks them", async () => {
@@ -90,6 +90,40 @@ describe("pr_summary through the tools", () => {
     });
     assert.equal(held.body.status, "confirmation_required", held.text);
     assert.equal(held.body.pr_summary, "修改合并队列的重试逻辑");
-    assert.equal(await latestPrSummary(e.db, e.actor.sessionId), "修改合并队列的重试逻辑");
+    assert.equal(await latestPrSummary(e.db, e.actor.sessionId, "AMD-AGI/demo", 7), "修改合并队列的重试逻辑");
+  });
+
+  test("a refused call never lends its sentence: not one refused at its checks, not one on a pull request the session is not bound to", async () => {
+    await e.service.getPr(e.actor, { pr: PR });
+    const ok = await e.service.submitReview(e.actor, { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Looks fine.", risk_judgement: LOW, pr_summary: "the real one" });
+    assert.equal(ok.isError, false, ok.text);
+    // Refused on the same pull request (a bad event), after the first: audited with its sentence, and not read.
+    const bad = await e.service.submitReview(e.actor, { pr: PR, head_sha: HEAD, event: "NOPE", body: "x", pr_summary: "refused, same pull request" });
+    assert.equal(bad.isError, true);
+    // A session bound to this pull request, asked about another one (an instruction injected through the diff, say): refused.
+    const bound = { ...e.actor, reviewTarget: { owner: "AMD-AGI", repo: "demo", number: 7 } };
+    const other = await e.service.submitReview(bound, { pr: "AMD-AGI/demo#8", head_sha: HEAD, event: "COMMENT", body: "x", pr_summary: "another pull request" });
+    assert.equal(other.isError, true);
+    assert.equal(other.body.reason ?? other.body.error ?? other.body.code, "review_target_mismatch", other.text);
+    const rows = await e.sql("SELECT arguments->>'pr_summary' AS s, result FROM claw_github_audit WHERE arguments ? 'pr_summary' ORDER BY id");
+    assert.deepEqual(rows.map((r) => [r.s, r.result]), [["the real one", "ok"], ["refused, same pull request", "refused"], ["another pull request", "refused"]],
+      "all three were audited with their sentence");
+    assert.equal(await latestPrSummary(e.db, e.actor.sessionId, "AMD-AGI/demo", 7), "the real one");
+    assert.equal(await latestPrSummary(e.db, e.actor.sessionId, "amd-agi/DEMO", 7), "the real one", "the repository's case does not matter");
+    assert.equal(await latestPrSummary(e.db, e.actor.sessionId, "AMD-AGI/demo", 8), null);
+  });
+
+  test("a session that acted on two pull requests has each one's own sentence", async () => {
+    const insert = (pr: number, summary: string, result = "ok") => e.sql(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, tool, result, detail, arguments)
+       VALUES ('u-alice', 'u-bob', 's-9', 'AMD-AGI/demo', $1, 'gh_pr_merge', $2, 'confirmation_required', $3::jsonb)`,
+      [pr, result, JSON.stringify({ pr_summary: summary })]);
+    await insert(1, "Adds X");
+    await insert(2, "Fixes Y");
+    assert.equal(await latestPrSummary(e.db, "s-9", "AMD-AGI/demo", 1), "Adds X");
+    assert.equal(await latestPrSummary(e.db, "s-9", "AMD-AGI/demo", 2), "Fixes Y");
+    assert.equal(await latestPrSummary(e.db, "s-9", "AMD-AGI/other", 1), null);
+    for (const bad of [undefined, null, "", 1] as unknown[]) assert.equal(await latestPrSummary(e.db, "s-9", bad, 1), null);
+    assert.equal(await latestPrSummary(e.db, "s-9", "AMD-AGI/demo", "1"), null);
   });
 });

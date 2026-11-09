@@ -68,6 +68,13 @@ function foundOf(params: Record<string, unknown>): Pick<RequesterView, "findings
   return { findings: open.length, note: line ? (line.length > NOTE_MAX ? `${line.slice(0, NOTE_MAX - 1)}…` : line) : null };
 }
 
+/** The review's sentence of what the item's own pull request does (`params.pr`), never one given for another pull request. */
+async function summaryOf(q: StatementRunner, sessionId: unknown, params: Record<string, unknown>): Promise<string | null> {
+  const pr = params.pr as { owner?: unknown; repo?: unknown; number?: unknown } | undefined;
+  if (!pr || typeof pr.owner !== "string" || typeof pr.repo !== "string") return null;
+  return latestPrSummary(q, sessionId, `${pr.owner}/${pr.repo}`, pr.number);
+}
+
 /** The view as it is now, read from the item row and from what the session did (the audit and confirmation tables). */
 export async function currentRequesterView(
   q: StatementRunner, row: { board_state: unknown; outcome: unknown; worker_session_id: unknown; params: unknown; last_report_kind?: unknown },
@@ -97,7 +104,7 @@ export async function currentRequesterView(
     : facts.held === "merge" ? "confirm_merge" : facts.held === "review" ? "confirm_review" : "reviewer";
   return {
     status, pr_url: prUrlOf(params), verdict: VERDICTS[String(facts.verdict ?? "").toUpperCase()] ?? null, merged: facts.merged === true,
-    waiting_for: waitingFor, ...foundOf(params), pr_summary: await latestPrSummary(q, row.worker_session_id),
+    waiting_for: waitingFor, ...foundOf(params), pr_summary: await summaryOf(q, row.worker_session_id, params),
   };
 }
 

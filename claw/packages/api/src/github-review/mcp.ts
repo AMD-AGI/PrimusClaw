@@ -288,16 +288,19 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     const rows = await listConfirmations(database, user.userId, {
       sessionId: typeof q.session_id === "string" && q.session_id ? q.session_id : undefined, status: status as ConfirmationStatus,
     });
-    // The sentence of what the pull request does that the session gave with its review or merge call, read per session (a listing is a
-    // few rows): the card that asks the acting user shows it beside the verdict. A read that fails leaves it out, never the listing.
+    // The sentence of what the pull request does that the session gave with its review or merge call of THAT pull request, read per
+    // confirmation (a listing is a few rows): the card that asks the acting user shows it beside the verdict. A session that acted on
+    // several pull requests never lends one's sentence to another's card. A read that fails leaves it out, never the listing.
     const summaries = new Map<string, string | null>();
-    for (const sessionId of new Set(rows.map((c) => c.sessionId))) {
-      summaries.set(sessionId, await latestPrSummary(database, sessionId).catch(() => null));
+    for (const c of rows) {
+      const key = JSON.stringify([c.sessionId, c.repo.toLowerCase(), c.pr]);
+      if (!summaries.has(key)) summaries.set(key, await latestPrSummary(database, c.sessionId, c.repo, c.pr).catch(() => null));
     }
     const items = rows.map((c) => ({
       id: c.id, kind: c.kind, review: c.review, repo: c.repo, pr: c.pr, title: c.title, author: c.author, head_sha: c.headSha, reasons: c.reasons, checks: c.checks,
       actor_user_id: c.actorUserId, requester_user_id: c.requesterUserId, session_id: c.sessionId, expires_at: c.expiresAt, status: c.status,
-      decided_by: c.decidedBy, decided_via: c.decidedVia, pr_summary: summaries.get(c.sessionId) ?? null,
+      decided_by: c.decidedBy, decided_via: c.decidedVia,
+      pr_summary: summaries.get(JSON.stringify([c.sessionId, c.repo.toLowerCase(), c.pr])) ?? null,
     }));
     return { ok: true, items, data: { items } };
   });

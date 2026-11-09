@@ -853,7 +853,7 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual([frozen.verdict, frozen.findings, frozen.note], ["approve", 1, "Nit: a name"]);
   });
 
-  test("Q6f the requester's view carries the review's one sentence of what the pull request does, clipped and masked; the router's does not; the held write's listing has it", async () => {
+  test("Q6f the requester's view carries the review's one sentence of what its own pull request does, from accepted calls only, clipped and masked; the router's does not; each held write's listing has its own pull request's", async () => {
     const rv = await import("../src/assistant/requester-view.js");
     const read = async (id: string) => (await app.inject({ method: "GET", url: `/v1/work-items/${id}`, headers: { "x-test-user": "alice" } })).json().data;
     const it = await askedOfBob({ review_only: false });
@@ -872,15 +872,39 @@ describe("assistant review items", { skip }, () => {
     assert.equal(listed.statusCode, 200, listed.body);
     const item = (listed.json().data.items as Array<Record<string, unknown>>).find((c) => c.id === held);
     assert.equal(item?.pr_summary, view.pr_summary);
-    // A later merge call's sentence is the one shown; one too long is cut, in whichever language it is written.
-    await audit(it.session_id, "gh_pr_merge", "refused", "ci_not_green", "bob");
+    // A later merge call's sentence is the one shown (held: a call that went through its checks); one too long is cut, in whichever
+    // language it is written.
+    await audit(it.session_id, "gh_pr_merge", "ok", "confirmation_required", "bob");
     const long = "Adds a one-sentence summary of what the pull request does to the review conclusion card, " + "and more words ".repeat(20);
     await w.q("UPDATE claw_github_audit SET arguments = $2::jsonb WHERE session_id = $1 AND tool = 'gh_pr_merge'", [it.session_id, JSON.stringify({ pr_summary: long })]);
     const later = (await read(it.item_id)).pr_summary as string;
     assert.ok(later.startsWith("Adds a one-sentence summary") && later.endsWith("…") && Array.from(later).length === 160, later);
+    // Newer calls that must not lend their sentence to this pull request: one refused (as a review_target_mismatch is, or any refusal),
+    // one on another pull request of the same session, and one audited before its checks named any pull request.
+    await audit(it.session_id, "gh_review_submit", "refused", "review_target_mismatch", "bob");
+    await w.q("UPDATE claw_github_audit SET arguments = '{\"pr_summary\": \"refused sentence\"}'::jsonb WHERE session_id = $1 AND result = 'refused' AND tool = 'gh_review_submit'", [it.session_id]);
+    await audit(it.session_id, "gh_review_submit", "ok", "submitted", "bob", true);
+    await w.q(`UPDATE claw_github_audit SET pr = 999, arguments = '{"pr_summary": "another pull request"}'::jsonb
+                WHERE id = (SELECT max(id) FROM claw_github_audit WHERE session_id = $1)`, [it.session_id]);
+    await audit(it.session_id, "gh_pr_merge", "ok", "confirmation_required", "bob");
+    await w.q(`UPDATE claw_github_audit SET repo = '', pr = NULL, arguments = '{"pr_summary": "no pull request named"}'::jsonb
+                WHERE id = (SELECT max(id) FROM claw_github_audit WHERE session_id = $1)`, [it.session_id]);
+    assert.equal((await read(it.item_id)).pr_summary, later, "only an accepted call on the item's own pull request");
+    // Two held writes of one session on two pull requests: each card shows its own pull request's sentence, or none.
+    const other = await confirmation(it.session_id, "pending", "review", "bob");
+    await w.q("UPDATE claw_github_confirmations SET pr = 999 WHERE confirmation_id = $1", [other]);
+    const cards = (await app.inject({ method: "GET", url: `/v1/github-review/confirmations?session_id=${it.session_id}`, headers: { "x-test-user": "bob" } }))
+      .json().data.items as Array<Record<string, unknown>>;
+    assert.deepEqual([cards.find((c) => c.id === held)?.pr_summary, cards.find((c) => c.id === other)?.pr_summary], [later, "another pull request"]);
+    await w.q("UPDATE claw_github_confirmations SET pr = 998 WHERE confirmation_id = $1", [other]);
+    const none = (await app.inject({ method: "GET", url: `/v1/github-review/confirmations?session_id=${it.session_id}`, headers: { "x-test-user": "bob" } }))
+      .json().data.items as Array<Record<string, unknown>>;
+    assert.equal(none.find((c) => c.id === other)?.pr_summary, null, "a pull request the session gave no sentence for has none");
     // Frozen with the item: what the session says after it closed does not reach alice.
     await call("alice", `/v1/work-items/${it.item_id}/stop`, {});
-    await w.q("UPDATE claw_github_audit SET arguments = '{\"pr_summary\": \"something else\"}'::jsonb WHERE session_id = $1", [it.session_id]);
+    await audit(it.session_id, "gh_review_submit", "ok", "submitted", "bob", true);
+    await w.q(`UPDATE claw_github_audit SET arguments = '{"pr_summary": "something else"}'::jsonb
+                WHERE id = (SELECT max(id) FROM claw_github_audit WHERE session_id = $1)`, [it.session_id]);
     assert.equal((await read(it.item_id)).pr_summary, later);
   });
 

@@ -29,16 +29,24 @@ export function clipPrSummary(value: unknown): string | null {
 }
 
 /**
- * The latest summary the session gave with a review or merge call, as the audit log kept it (every call is audited with its arguments
- * before it runs, a held or refused one included: the sentence is about the pull request, whatever came of the call). Null when none.
+ * The latest summary the session gave for that pull request (`repo` as owner/repo, `pr` its number) with a review or merge call that
+ * went through its checks, as the audit log kept it. Every call is audited with its arguments before it runs, so only a call whose row
+ * names that pull request (`repo` and `pr` are written once the review-target and owner checks passed) and that was not refused
+ * (`result = 'ok'`: posted, merged, queued or held) counts: a refused call, or one on another pull request, never puts its sentence
+ * beside this one. Null when none.
  */
-export async function latestPrSummary(q: { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }> }, sessionId: unknown): Promise<string | null> {
-  if (typeof sessionId !== "string" || !sessionId) return null;
+export async function latestPrSummary(
+  q: { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }> }, sessionId: unknown, repo: unknown, pr: unknown,
+): Promise<string | null> {
+  if (typeof sessionId !== "string" || !sessionId || typeof repo !== "string" || !repo || typeof pr !== "number" || !Number.isSafeInteger(pr)) {
+    return null;
+  }
   const row = (await q.query(
     `SELECT arguments->>'pr_summary' AS pr_summary FROM claw_github_audit
-      WHERE session_id = $1 AND tool IN ('gh_review_submit', 'gh_pr_merge') AND COALESCE(arguments->>'pr_summary', '') <> ''
+      WHERE session_id = $1 AND lower(repo) = lower($2) AND pr = $3 AND result = 'ok'
+        AND tool IN ('gh_review_submit', 'gh_pr_merge') AND COALESCE(arguments->>'pr_summary', '') <> ''
       ORDER BY id DESC LIMIT 1`,
-    [sessionId],
+    [sessionId, repo, pr],
   )).rows[0] as { pr_summary?: unknown } | undefined;
   return clipPrSummary(row?.pr_summary);
 }
