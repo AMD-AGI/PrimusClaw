@@ -50,7 +50,9 @@
  * a tool the case must call cannot be reached on its arm yet: the static check reports it instead of failing on it),
  * `may_deny` (saying it cannot do something is a right answer here: a refusal of an unsafe request),
  * `hold` (assistant mode: the case's item holds a request for its person, a write to approve or a question, and the
- * runner answers it as the person's channel does, see {@link HoldSpec}), `delivers` ([{name?, type?}]: files the last turn's
+ * runner answers it as the person's channel does, see {@link HoldSpec}), `setup` (assistant mode: what the identity must have before each
+ * attempt, made by the runner through the API and removed after it; `triggers`: [{name, schedule, timezone, prompt?, action?}], made with
+ * `POST /v1/triggers`, see {@link CaseSetup}), `delivers` ([{name?, type?}]: files the last turn's
  * items must hand the user, each matched by a name pattern and a media type prefix, from the files the assistant's messages
  * carry). A case with files runs on the assistant path only.
  *
@@ -110,8 +112,19 @@ export interface EvalCase {
   blocked?: string;
   may_deny?: boolean;
   hold?: HoldSpec;
+  setup?: CaseSetup;
   delivers?: Delivers[];
 }
+
+/**
+ * What the identity must already have when an attempt of the case starts (a scheduled task the user asks to cancel), made by the runner
+ * through the API before every attempt and removed after it. `triggers` are made with `POST /v1/triggers` (`action` run, the default, or
+ * brief); a name the identity already has a trigger under makes the attempt an error, never a second trigger the case did not mean.
+ */
+export interface SetupTrigger { name: string; schedule: string; timezone: string; prompt?: string; action?: "run" | "brief" }
+export interface CaseSetup { triggers?: SetupTrigger[] }
+/** The most triggers a case's setup makes (the server's own cap per user is higher; a case needs one or two). */
+export const SETUP_TRIGGERS_MAX = 5;
 
 /**
  * A request the case's item holds for its person (an entry of the item's `params.holds`, `assistant/holds.ts`): which tool, and how the
@@ -169,7 +182,84 @@ export function problemsOf(c: Partial<EvalCase>): string[] {
     if (h.decide === "answer" && (!h.answers || typeof h.answers !== "object" || !Object.keys(h.answers).length)) out.push("hold answer without answers");
     if (h.wait_s !== undefined && !(Number.isInteger(h.wait_s) && h.wait_s >= 0 && h.wait_s <= 7200)) out.push(`hold wait_s ${h.wait_s}`);
   }
+  if (c.setup !== undefined) out.push(...setupProblems(c.setup));
   return out;
+}
+
+function setupProblems(setup: unknown): string[] {
+  if (!setup || typeof setup !== "object" || Array.isArray(setup)) return ["setup is not an object"];
+  const out: string[] = [];
+  const { triggers, ...rest } = setup as CaseSetup & Record<string, unknown>;
+  if (Object.keys(rest).length) out.push(`setup ${Object.keys(rest).join(",")} unknown`);
+  if (triggers === undefined) return out;
+  if (!Array.isArray(triggers) || !triggers.length || triggers.length > SETUP_TRIGGERS_MAX) return [...out, `setup triggers is a list of 1 to ${SETUP_TRIGGERS_MAX}`];
+  const names = new Set<string>();
+  for (const t of triggers as Array<Partial<SetupTrigger>>) {
+    const str = (v: unknown): boolean => typeof v === "string" && v.trim() !== "";
+    if (!str(t?.name) || !str(t?.schedule) || !str(t?.timezone)) out.push("a setup trigger without a name, schedule and timezone");
+    else if (names.has(t.name!.trim())) out.push(`setup trigger ${t.name} twice`);
+    else names.add(t.name!.trim());
+    if (t?.prompt !== undefined && !str(t.prompt)) out.push("a setup trigger with an empty prompt");
+    if (t?.action !== undefined && t.action !== "run" && t.action !== "brief") out.push(`setup trigger action ${String(t.action)}`);
+    if (t?.action !== "brief" && t?.prompt === undefined) out.push(`setup trigger ${String(t?.name)} runs nothing: a run trigger needs a prompt`);
+  }
+  return out;
+}
+
+/** The body of `POST /v1/triggers` for a setup trigger. */
+export function setupTriggerBody(t: SetupTrigger): Record<string, unknown> {
+  return { name: t.name.trim(), schedule: t.schedule.trim(), timezone: t.timezone, action: t.action ?? "run", ...(t.prompt !== undefined ? { prompt: t.prompt } : {}) };
+}
+
+/**
+ * EVAL_FRESH_SESSION_EVERY: a number of cases per assistant session (0: one for the run), or `attempt`: every attempt (and the second
+ * try of one) in a new session, with the cards waiting from before closed first where they can be (`closableCards`). Null when it is
+ * neither.
+ */
+export function freshSessionEvery(raw: string | undefined): { cases: number; attempt: boolean } | null {
+  const v = (raw ?? "").trim();
+  if (v === "attempt") return { cases: 1, attempt: true };
+  if (v === "") return { cases: 0, attempt: false };
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 && n <= 100_000 ? { cases: n, attempt: false } : null;
+}
+
+/**
+ * A card waiting for the identity's answer: a write held on a card by the assistant (`GET /v1/assistant/confirmations`: a scheduled
+ * task, a comment, an instruction for a machine) or a held GitHub write of a review (`GET /v1/github-review/confirmations`). The
+ * assistant is shown every one of them, in every conversation of the identity, until it is answered or lapses (a day): a case that
+ * asks for the same write again is answered with "it is already waiting", and shows no card.
+ */
+export interface WaitingCard { id: string; kind: string; source: "assistant" | "github" }
+
+/** The cards of the two listings' bodies (`data` of the assistant's, `data.items` or `items` of the review's); what is not a list is none. */
+export function waitingCards(assistantBody: unknown, githubBody: unknown): WaitingCard[] {
+  const out: WaitingCard[] = [];
+  const a = (assistantBody as { data?: unknown } | null)?.data;
+  for (const c of Array.isArray(a) ? a : []) {
+    if (typeof c?.confirmation_id === "string" && c.confirmation_id) out.push({ id: c.confirmation_id, kind: String(c.kind ?? ""), source: "assistant" });
+  }
+  const g = githubBody as { data?: { items?: unknown }; items?: unknown } | null;
+  const items = Array.isArray(g?.data?.items) ? g!.data!.items as unknown[] : Array.isArray(g?.items) ? g!.items as unknown[] : [];
+  for (const c of items as Array<Record<string, unknown>>) {
+    if (typeof c?.id === "string" && c.id && (c.status === undefined || c.status === "pending")) out.push({ id: c.id, kind: String(c.kind ?? ""), source: "github" });
+  }
+  return out;
+}
+
+/**
+ * Why an attempt is not graded on its cards, or null: the case expects a card, and a card an earlier attempt of the run left is still
+ * waiting (it is not in `atStart`, the cards waiting when the run began). The assistant then says the write is already waiting and shows
+ * none, so a miss would be the run's, not the assistant's. Cards that waited before the run are said (`cardsWaiting`) but not held
+ * against the attempt: the run did not make them, and cannot tell them from a person's.
+ */
+export function cardsLeftError(c: Pick<EvalCase, "cards">, waiting: readonly WaitingCard[], atStart: ReadonlySet<string>): string | null {
+  if (c.cards !== "confirm" && c.cards !== "accept") return null;
+  const left = waiting.filter((w) => !atStart.has(w.id));
+  if (!left.length) return null;
+  const kinds = [...new Set(left.map((w) => w.kind || w.source))].join(",");
+  return `infra: ${left.length} card(s) an earlier attempt of the run left waiting (${kinds}) could not be closed before this one `
+    + "(closing one is the person's answer: EVAL_SEND_TOKEN_CMD), so the assistant is shown them: not graded";
 }
 
 /** The request a worker raised under this id, as its session's events stored it: Brain's `ts` and the tool, or null. */
@@ -1286,6 +1376,8 @@ export interface Attempt {
   reopened?: string[];
   /** The error of a first try that the run ran again (once): this attempt is the second try. */
   retried?: string;
+  /** How many cards waited for the identity's answer when the attempt started (after the run closed what it could): the assistant saw them. */
+  cardsWaiting?: number;
 }
 
 /** The case has content only a judge can grade: a rubric, or a fact whose value is neither written nor read by an oracle. */
