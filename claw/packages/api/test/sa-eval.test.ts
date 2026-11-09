@@ -70,6 +70,7 @@ import {
   assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, pacedPerHour, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
   ownSays, SYSTEM_TURN_NOTICES,
   bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
+  cardsLeftError, freshSessionEvery, setupTriggerBody, waitingCards,
 } from "./e2e/sa-eval-lib.js";
 import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
@@ -1024,4 +1025,58 @@ test("S31 said: the turn answered with a message of its own, the router's say or
   // Only a boolean: a case that writes it otherwise is reported, not read as false.
   assert.deepEqual(parseCases(JSON.stringify({ ...c, said: "yes" })).bad.length, 1);
   assert.equal(grade({ ...c, said: undefined }, observed([ack])).some((x) => x.name === "said"), false);
+});
+
+test("S32 EVAL_FRESH_SESSION_EVERY: a count of cases, or every attempt", () => {
+  assert.deepEqual(freshSessionEvery(undefined), { cases: 0, attempt: false });
+  assert.deepEqual(freshSessionEvery(""), { cases: 0, attempt: false });
+  assert.deepEqual(freshSessionEvery("3"), { cases: 3, attempt: false });
+  assert.deepEqual(freshSessionEvery("attempt"), { cases: 1, attempt: true });
+  for (const bad of ["-1", "1.5", "attempts", "case", "100001"]) assert.equal(freshSessionEvery(bad), null, bad);
+});
+
+test("S33 the cards waiting for the identity, and when an attempt cannot be graded on its cards", () => {
+  // e232 (2026-11-09, sa-eval-bot-4, k=3): the second and third attempts of cat-github-wr-001 were told "已经在等你确认" and showed no card.
+  const assistant = { ok: true, data: [
+    { confirmation_id: "cf2e00aa-0000-4000-8000-000000000001", kind: "github_comment", ref: "cf2e00" },
+    { confirmation_id: "542a02aa-0000-4000-8000-000000000002", kind: "trigger_create", ref: "542a02" },
+    { kind: "trigger_create" },
+  ] };
+  const github = { ok: true, items: [{ id: "g1", kind: "merge", status: "pending" }, { id: "g2", kind: "merge", status: "denied" }], data: { items: [{ id: "g1", kind: "merge", status: "pending" }] } };
+  const waiting = waitingCards(assistant, github);
+  assert.deepEqual(waiting.map((w) => `${w.source}:${w.kind}:${w.id.slice(0, 6)}`), ["assistant:github_comment:cf2e00", "assistant:trigger_create:542a02", "github:merge:g1"]);
+  // A list that is not there (404: the feature is off) or is not a list is no card.
+  assert.deepEqual(waitingCards(null, "not found"), []);
+  assert.deepEqual(waitingCards({ data: { x: 1 } }, { items: "x" }), []);
+  const card = (cards: EvalCase["cards"]) => ({ cards });
+  const own = new Set(["cf2e00aa-0000-4000-8000-000000000001"]);
+  // A card an earlier attempt of the same case made, still waiting: a case that expects a card is not graded.
+  assert.match(cardsLeftError(card("confirm"), waiting, own) ?? "", /^infra: 1 card\(s\) an earlier attempt of this case left waiting \(github_comment\)/);
+  assert.match(cardsLeftError(card("accept"), waiting, own) ?? "", /^infra: /);
+  // A case that expects no card is graded: a card waiting cannot make one appear.
+  assert.equal(cardsLeftError(card("none"), waiting, own), null);
+  assert.equal(cardsLeftError(card(undefined), waiting, own), null);
+  // Another case's card, or one from before the run, is said (cardsWaiting), never held against the attempt: the assistant still proposes
+  // a different write while it waits (e232 after-run 2026-11-09: one comment card held 12 other cases back when it counted).
+  assert.equal(cardsLeftError(card("confirm"), waiting, new Set()), null);
+  assert.equal(cardsLeftError(card("confirm"), waiting, new Set(["not-waiting-any-more"])), null);
+  assert.equal(cardsLeftError(card("confirm"), [], own), null);
+});
+
+test("S34 a case's setup: triggers the runner makes before each attempt", () => {
+  const base: EvalCase = { id: "cat-proactive-wr-003", pipeline: "catalog", area: "proactive", lang: "zh", turns: [{ user: "把每天 9 点那个 PR 早报取消掉" }], cards: "confirm" };
+  const ok = { triggers: [{ name: "PR 早报", schedule: "0 9 * * *", timezone: "Asia/Shanghai", prompt: "列出我开着的 PR" }, { name: "晨报", schedule: "0 8 * * *", timezone: "UTC", action: "brief" as const }] };
+  assert.deepEqual(parseCases(JSON.stringify({ ...base, setup: ok })).bad, []);
+  assert.deepEqual(setupTriggerBody(ok.triggers[0]!), { name: "PR 早报", schedule: "0 9 * * *", timezone: "Asia/Shanghai", action: "run", prompt: "列出我开着的 PR" });
+  assert.deepEqual(setupTriggerBody(ok.triggers[1]!), { name: "晨报", schedule: "0 8 * * *", timezone: "UTC", action: "brief" });
+  const bad = (setup: unknown): string => parseCases(JSON.stringify({ ...base, setup })).bad.join("; ");
+  assert.match(bad([]), /setup is not an object/);
+  assert.match(bad({ items: [] }), /setup items unknown/);
+  assert.match(bad({ triggers: [] }), /setup triggers is a list of 1 to 5/);
+  assert.match(bad({ triggers: Array(6).fill(ok.triggers[1]) }), /setup triggers is a list of 1 to 5/);
+  assert.match(bad({ triggers: [{ name: "x", schedule: "0 9 * * *", prompt: "p" }] }), /without a name, schedule and timezone/);
+  assert.match(bad({ triggers: [ok.triggers[1], ok.triggers[1]] }), /setup trigger 晨报 twice/);
+  assert.match(bad({ triggers: [{ ...ok.triggers[1], action: "watch" }] }), /setup trigger action watch/);
+  assert.match(bad({ triggers: [{ name: "x", schedule: "0 9 * * *", timezone: "UTC" }] }), /runs nothing: a run trigger needs a prompt/);
+  assert.match(bad({ triggers: [{ ...ok.triggers[0], prompt: " " }] }), /empty prompt/);
 });

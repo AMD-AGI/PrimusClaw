@@ -89,14 +89,20 @@
  *   EVAL_INFRA_RETRY  1 (default): an attempt that ended in an error of the run (not a grade: a missed stream, a read or a judge
  *                     that failed, a turn that did not end) is run again once, and the second try is the one reported (`retried`
  *                     names the first one's error; a recording of the first try is dropped); 0 runs each attempt once. In the
- *                     assistant mode the second try runs in the same session as the first, as further attempts of a case do
- *                     (EVAL_FRESH_SESSION_EVERY counts cases, not tries)
+ *                     assistant mode the second try runs in the same session as the first, as further attempts of a case do,
+ *                     unless EVAL_FRESH_SESSION_EVERY=attempt
  *   EVAL_FRESH_SESSION_EVERY
  *                     assistant mode: a new assistant session every that many cases (1: each case its own; default 0: one for
  *                     the run), so no case is read in the context of earlier ones. The session before is let finish, its items
  *                     closed, and it is deleted and seen gone first. An assistant session the identity already has when the run
  *                     starts is deleted (and seen gone) before anything is sent, so the first case starts in a new one too; one
- *                     in use (see EVAL_QUIET_S) refuses the run instead, and its says of the last hour still count for the pace
+ *                     in use (see EVAL_QUIET_S) refuses the run instead, and its says of the last hour still count for the pace.
+ *                     `attempt`: every attempt (and the second try of one) in a new session, and before each the cards waiting for
+ *                     the identity's answer (`GET /v1/assistant/confirmations`, `GET /v1/github-review/confirmations`) are closed:
+ *                     the assistant is shown them in every session, and answers a case asked again with "it is already waiting"
+ *                     instead of a card. Closing a card is the person's answer, so it is done with EVAL_SEND_TOKEN_CMD's token (a
+ *                     `deny`); without one they stay, and an attempt of a case that expects a card while one an earlier attempt of
+ *                     the same case made still waits is the run's error, not a grade. Each attempt records `cardsWaiting`
  *   EVAL_SEND_TOKEN_CMD
  *                     assistant mode: a command (as EVAL_VARS_CMD: no shell) that prints a signed-in access token of the key's own identity (an identity
  *                     provider's, for the Claw API): the run's messages are sent with it, as a person's channel sends them, so a
@@ -105,6 +111,10 @@
  *   EVAL_QUIET_S      the assistant mode refuses to start when the identity's assistant session has a turn running, or had any
  *                     event less than this many seconds ago (default 300; 0 checks only for a running turn): another run, or a
  *                     person, is using the identity. Each run going at the same time needs an identity of its own
+ *
+ * A case's `setup` (`triggers`) is made before each of its attempts with the key (`POST /v1/triggers`), after its session is open, and
+ * deleted after the attempt (seen gone: a GET answers 404); one the run could not delete fails the run. A trigger the identity already has
+ * under a setup trigger's name makes the attempt an error.
  *
  * EVAL_STATIC reports, without sending anything, every case that can never pass on its arm (a tools_must no tool of the arm
  * matches: the router's from `assistant/read-tools.ts`, the worker's every plugin server, given as EVAL_STATIC_SERVERS or the
@@ -141,7 +151,8 @@ import {
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   ownSays, sayWaitMs, saysOf, staticFindings, turnsAnswered, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
-  type SayMark, type Arms, type Attempt, type Check, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
+  freshSessionEvery, waitingCards, cardsLeftError, setupTriggerBody,
+  type SayMark, type WaitingCard, type Arms, type Attempt, type Check, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
 import * as readTools from "../../src/assistant/read-tools.js";
@@ -266,7 +277,10 @@ function commandWords(cmd: string): string[] {
   if (!words.length) { console.error("an EVAL_*_CMD is empty"); process.exit(2); }
   return words;
 }
-const FRESH_EVERY = int("EVAL_FRESH_SESSION_EVERY", 0, 0, 100_000);
+const FRESH = freshSessionEvery(process.env.EVAL_FRESH_SESSION_EVERY);
+if (!FRESH) { console.error("EVAL_FRESH_SESSION_EVERY must be an integer in 0..100000 or attempt"); process.exit(2); }
+const FRESH_EVERY = FRESH.cases;
+const FRESH_ATTEMPT = FRESH.attempt;
 const SEND_TOKEN_CMD = process.env.EVAL_SEND_TOKEN_CMD;
 const sendTokens: string[] = [];   // every token EVAL_SEND_TOKEN_CMD gave: scrubbed like the key
 let sendTokenCached: { token: string; until: number } | null = null;
@@ -1244,6 +1258,89 @@ async function closeRunItems(floorAtStart: number, leftOpen: number[], session: 
   return issues;
 }
 
+// --- Cards waiting, and a case's setup ----------------------------------------------------------------------------------
+
+/** The cards that appeared during each case's attempts (EVAL_FRESH_SESSION_EVERY=attempt), by case id: the next attempt must not find them. */
+const CASE_CARDS = new Map<string, Set<string>>();
+
+/**
+ * The cards waiting for the identity's answer now (`waitingCards`), or null when a list could not be read. A deployment without the
+ * feature of one of the two lists answers 404 for it: no card of that kind can wait.
+ */
+async function cardsNow(): Promise<WaitingCard[] | null> {
+  const [a, g] = await Promise.all([api("GET", "/v1/assistant/confirmations"), api("GET", "/v1/github-review/confirmations")]);
+  if ((a.status !== 200 && a.status !== 404) || (g.status !== 200 && g.status !== 404)) return null;
+  return waitingCards(a.status === 200 ? a.json : null, g.status === 200 ? g.json : null);
+}
+
+/**
+ * Close every card waiting for the identity (a test one, `identityRefusal`): `deny` on its decision route, which takes only the
+ * person's signed-in answer, so with EVAL_SEND_TOKEN_CMD's token; without one nothing can close them. The cards still waiting after,
+ * or null when they could not be read.
+ */
+async function closeCards(): Promise<WaitingCard[] | null> {
+  const waiting = await cardsNow();
+  if (!waiting?.length || !SEND_TOKEN_CMD) return waiting;
+  const token = sendToken();
+  for (const w of waiting) {
+    live();   // a stop sends no more decisions
+    const route = w.source === "assistant" ? "/v1/assistant/confirmations" : "/v1/github-review/confirmations";
+    const r = await api("POST", `${route}/${encodeURIComponent(w.id)}/decision`, { decision: "deny" }, token).catch(() => null);
+    log(`card ${w.source}:${w.kind || "?"} waiting before the attempt: deny answered ${r?.status ?? "nothing"}`);
+  }
+  return cardsNow();
+}
+
+/** Triggers the run made for a case's setup and has not seen gone: deleted after their attempt, and again at the end. */
+const SETUP_TRIGGERS = new Set<string>();
+
+/**
+ * Make what the case's `setup` says the identity has (`triggers`, with `POST /v1/triggers`): the ids made. Throws an `infra:` error, having
+ * removed what it made, when a trigger cannot be made, or the identity already has one under a setup trigger's name (the case would be
+ * graded against a trigger it did not mean).
+ */
+async function makeSetup(c: EvalCase): Promise<string[]> {
+  const wanted = c.setup?.triggers ?? [];
+  if (!wanted.length) return [];
+  const list = await api("GET", "/v1/triggers");
+  if (list.status !== 200 || !Array.isArray(list.json?.data)) throw new Error(`infra: setup: GET /v1/triggers answered ${list.status}`);
+  const have = new Set((list.json.data as Array<{ name?: unknown }>).map((t) => String(t?.name ?? "").trim()));
+  const clash = wanted.filter((t) => have.has(t.name.trim())).map((t) => JSON.stringify(t.name));
+  if (clash.length) throw new Error(`infra: setup: the identity already has a trigger named ${clash.join(", ")}, which the run did not make for this attempt`);
+  const made: string[] = [];
+  for (const t of wanted) {
+    if (stopSignal) { await removeSetup(made); live(); }   // a stop makes nothing more
+    const r = await api("POST", "/v1/triggers", setupTriggerBody(t)).catch(() => null);
+    const id = r?.json?.data?.trigger_id;
+    if (r?.status !== 200 || typeof id !== "string" || !id) {
+      // One made whose answer was lost is found by its name: the identity had no trigger under any setup name before (above).
+      const now = await api("GET", "/v1/triggers").catch(() => null);
+      const wantedNames = new Set(wanted.map((x) => x.name.trim()));
+      for (const x of (Array.isArray(now?.json?.data) ? now!.json.data : []) as Array<{ trigger_id?: unknown; name?: unknown }>) {
+        if (typeof x?.trigger_id === "string" && wantedNames.has(String(x.name ?? "").trim()) && !made.includes(x.trigger_id)) {
+          SETUP_TRIGGERS.add(x.trigger_id);
+          made.push(x.trigger_id);
+        }
+      }
+      await removeSetup(made);
+      throw new Error(`infra: setup: POST /v1/triggers for ${JSON.stringify(t.name)} answered ${r?.status ?? "nothing"}${typeof r?.json?.error === "string" ? ` (${r.json.error})` : ""}`);
+    }
+    SETUP_TRIGGERS.add(id);
+    made.push(id);
+  }
+  log(`setup of ${c.id}: made ${made.length} trigger(s)`);
+  return made;
+}
+
+/** Delete setup triggers the run made; each one a GET then answers 404 for is gone. What is left stays in SETUP_TRIGGERS. */
+async function removeSetup(ids: readonly string[]): Promise<void> {
+  for (const id of ids) {
+    const path = `/v1/triggers/${encodeURIComponent(id)}`;
+    await api("DELETE", path).catch(() => null);
+    if ((await api("GET", path).catch(() => null))?.status === 404) SETUP_TRIGGERS.delete(id);
+  }
+}
+
 // --- The run ------------------------------------------------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -1290,11 +1387,34 @@ async function main(): Promise<void> {
   let cleanupFailed: string[] = [];
   const leftOpen: number[] = [];
   let casesInSession = 0;
+  let attemptsInSession = 0;
+  /**
+   * Change to a new assistant session: the one before is settled (its items closed) and deleted, and seen gone, first. False (with why in
+   * cleanupFailed) when that could not be done: the run stops.
+   */
+  const nextSession = async (): Promise<boolean> => {
+    priorSays = mergeSays([priorSays, countedSays(session!.stream.events)], Date.now());
+    const old = session!;
+    session = null;
+    const issues = await closeSession(old, floorAtStart, leftOpen);
+    if (issues.length) { cleanupFailed.push(...issues); return false; }
+    try { session = await openAssistant(false); } catch (err) {
+      cleanupFailed.push(`a new assistant session could not be had: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+    attemptsInSession = 0;
+    return true;
+  };
   try {
     if (MODE === "assistant") {
       live();
       session = await openAssistant(true);
       priorSays = mergeSays([readSayLog(sayLog), countedSaysOf(session.before), DELETED_SAYS], Date.now());
+      if (FRESH_ATTEMPT) {
+        const waiting = await cardsNow();
+        if (!waiting) throw new Error("the cards waiting for the identity's answer could not be read");
+        log(`cards waiting for the identity when the run began: ${waiting.length}${waiting.length && !SEND_TOKEN_CMD ? " (they stay: closing one needs EVAL_SEND_TOKEN_CMD)" : ""}`);
+      }
     }
     let lastCaseEnd = 0;   // when the last case that sent anything ended: the next waits EVAL_GAP_S from it
     cases: for (const c of cases) {
@@ -1320,20 +1440,14 @@ async function main(): Promise<void> {
       const turns = filled.turns;
       // A new assistant conversation every EVAL_FRESH_SESSION_EVERY cases: what an earlier case said is not this one's context. The
       // old one is settled (its items closed) and deleted, and seen gone, first; a run that cannot do that stops.
-      if (MODE === "assistant" && FRESH_EVERY && casesInSession >= FRESH_EVERY) {
-        priorSays = mergeSays([priorSays, countedSays(session!.stream.events)], Date.now());
-        const old = session!;
-        session = null;
-        const issues = await closeSession(old, floorAtStart, leftOpen);
-        if (issues.length) { cleanupFailed.push(...issues); break cases; }
-        try { session = await openAssistant(false); } catch (err) {
-          cleanupFailed.push(`a new assistant session could not be had: ${err instanceof Error ? err.message : String(err)}`);
-          break cases;
-        }
+      if (MODE === "assistant" && FRESH_EVERY && !FRESH_ATTEMPT && casesInSession >= FRESH_EVERY) {
+        if (!(await nextSession())) break cases;
         casesInSession = 0;
       }
       casesInSession++;
       for (let k = 0; k < K; k++) {
+        // EVAL_FRESH_SESSION_EVERY=attempt: each attempt in a new session (the first of the run has one already).
+        if (MODE === "assistant" && FRESH_ATTEMPT && attemptsInSession > 0 && !(await nextSession())) break cases;
         if (MODE === "assistant") {
           try { await paceSays(session!.stream, priorSays); } catch (err) { if (err instanceof Interrupted) break cases; throw err; }
         }
@@ -1341,11 +1455,34 @@ async function main(): Promise<void> {
           let a: Attempt;
           const caseStart = Date.now();
           const earlier = new Set(RUN_MESSAGES);   // an earlier attempt's refusal that arrives late is not this one's
+          let waiting: WaitingCard[] | null = null;
+          let setup: string[] = [];
+          attemptsInSession++;
+          preflightFailed = true;
           try {
+            if (MODE === "assistant" && FRESH_ATTEMPT) {
+              waiting = await closeCards();
+              if (!waiting) throw new Error("infra: the cards waiting for the identity's answer could not be read: not graded");
+              const left = cardsLeftError(filled, waiting, CASE_CARDS.get(c.id) ?? new Set());
+              if (left) throw new Error(left);
+            }
+            setup = await makeSetup(filled);
+            preflightFailed = false;
             a = MODE === "assistant" ? await runAssistant(filled, turns, session!) : await runBaseline(filled, turns);
           } catch (err) {
             a = { pass: false, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: null, finalMs: null, items: [], error: scrub(err instanceof Error ? err.message : String(err)) };
+          } finally {
+            if (setup.length) await removeSetup(setup);
           }
+          // The cards this attempt made: those waiting now that did not before it. A card it made that could not be read stays unseen,
+          // and the next attempt is graded as without it (the same as before this runner closed cards at all).
+          if (waiting && !preflightFailed) {
+            const before = new Set(waiting.map((w) => w.id));
+            const own = CASE_CARDS.get(c.id) ?? new Set<string>();
+            for (const w of (await cardsNow().catch(() => null)) ?? []) if (!before.has(w.id)) own.add(w.id);
+            CASE_CARDS.set(c.id, own);
+          }
+          if (waiting) a = { ...a, cardsWaiting: waiting.length };
           // A say the server refused for its hourly cap is the run's failure, not the assistant's.
           const refused = MODE === "assistant" && !a.error ? capRefusedSays(session!.stream.events, caseStart, earlier) : 0;
           if (refused) a = { ...a, pass: false, error: `infra: ${refused} say(s) refused by the hourly cap (say_rate_limited)` };
@@ -1354,11 +1491,14 @@ async function main(): Promise<void> {
           return reopened.length ? { ...a, reopened } : a;
         };
         const recorded = recordings.length;
+        let preflightFailed = false;
         let a = await once();
         // An attempt that ended in an error of the run (a missed stream, a read or a judge that failed, a turn that did not end) is
-        // run again once: what is reported is the second try, with the first one's error. A stop is not run again.
-        if (a.error && INFRA_RETRY && !stopSignal) {
+        // run again once: what is reported is the second try, with the first one's error. A stop is not run again, nor an attempt
+        // that never ran because a card the run left could not be closed or its setup could not be made: a second try finds the same.
+        if (a.error && INFRA_RETRY && !stopSignal && !preflightFailed) {
           log(`ERROR ${c.id}#${k + 1} ${a.error}: running it again once`);
+          if (MODE === "assistant" && FRESH_ATTEMPT && !(await nextSession())) { r.attempts.push(a); break cases; }
           if (MODE === "assistant") {
             try { await paceSays(session!.stream, priorSays); } catch (err) { if (err instanceof Interrupted) { r.attempts.push(a); break cases; } throw err; }
           }
@@ -1394,6 +1534,8 @@ async function main(): Promise<void> {
       if (leftOpen.length) cleanupFailed.push(`items still open: ${leftOpen.join(",")}`);
     }
   }
+  if (SETUP_TRIGGERS.size) await removeSetup([...SETUP_TRIGGERS]);
+  if (SETUP_TRIGGERS.size) cleanupFailed.push(`setup triggers the run made not deleted: ${[...SETUP_TRIGGERS].join(",")}`);
   if (sessionsLeft.length) cleanupFailed.push(`sessions the run made not deleted: ${sessionsLeft.join(",")}`);
   cleanupFailed.push(...new Set(CLEANUP_ISSUES));
   cleanupFailed = cleanupFailed.map(scrub);
