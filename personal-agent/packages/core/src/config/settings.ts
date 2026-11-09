@@ -38,7 +38,11 @@ export interface Settings {
   readonly observeUsers: ReadonlySet<string>;
   /** TEAMS_LIMIT_<OPERATION>: the per-person limits of operations that act with someone's authority. */
   readonly sensitiveLimits: ReadonlyMap<string, Limit>;
-  readonly linkLimits: LinkLimits;
+  /**
+   * TEAMS_LINK_MAX_FAILURES_PER_USER (5) / TEAMS_LINK_MAX_FAILURES_GLOBAL (100) / TEAMS_LINK_ATTEMPT_WINDOW_SECONDS (600).
+   * The shape of the store's `LinkLimits` (ports/store/link.ts), which it is handed to as it is.
+   */
+  readonly linkLimits: { readonly perUser: number; readonly global: number; readonly windowSeconds: number };
   readonly userLimits: UserLimits;
   /** SECRETS_SOURCE (env | keyvault). */
   readonly secretsSource: SecretsSourceName;
@@ -116,13 +120,6 @@ export interface AssistantSettings {
 export interface Limit {
   readonly count: number;
   readonly windowSeconds: number;
-}
-
-/** TEAMS_LINK_MAX_FAILURES_PER_USER / _GLOBAL / TEAMS_LINK_ATTEMPT_WINDOW_SECONDS. */
-export interface LinkLimits {
-  readonly maxFailuresPerUser: number;
-  readonly maxFailuresGlobal: number;
-  readonly attemptWindowSeconds: number;
 }
 
 /** TEAMS_USER_MESSAGE_LIMIT per TEAMS_USER_MESSAGE_WINDOW_SECONDS, TEAMS_USER_MAX_CONCURRENT_TASKS. */
