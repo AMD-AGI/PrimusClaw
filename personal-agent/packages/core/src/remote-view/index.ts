@@ -21,7 +21,6 @@ export * from "./listing.js";
 export * from "./live-view.js";
 export * from "./machine-views.js";
 export * from "./options.js";
-export type { RemoteAgent, RemoteConnector, RemoteSession } from "./pending-model.js";
 export * from "./permission-view.js";
 export * from "./sessions-view.js";
 export * from "./status-view.js";

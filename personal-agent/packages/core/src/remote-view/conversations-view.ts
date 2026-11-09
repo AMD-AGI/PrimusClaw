@@ -13,7 +13,7 @@ import { canTypeIntoTerminals, typesInto, watchesLive } from "./agents.js";
 import { type Conversation, WATCH_STATE, resumableOf } from "./conversations.js";
 import { lit } from "./inert.js";
 import { IDLE_SHOWN, RESUMABLE_SHOWN } from "./limits.js";
-import type { RemoteAgent, RemoteConnector } from "./pending-model.js";
+import type { Agent, Connector } from "../remote/model.js";
 import { agoEpoch } from "./time.js";
 
 export type ConversationItem =
@@ -30,7 +30,7 @@ const UNKNOWN_SHOWN = 2;
 
 /** The line under a conversation open in a terminal: what connecting to it does, and when the phone can only watch, why and
  * what to change. */
-export function shareNote(agent: RemoteAgent, entry: Conversation, lang: Lang): string {
+export function shareNote(agent: Agent, entry: Conversation, lang: Lang): string {
   const words = remoteText.in(lang);
   if (typesInto(agent, entry)) return words.shareNoteTyped;
   return canTypeIntoTerminals(agent) ? words.shareNoteNoTmux : words.shareNoteOld;
@@ -38,7 +38,7 @@ export function shareNote(agent: RemoteAgent, entry: Conversation, lang: Lang): 
 
 /** The one button a conversation open in a terminal offers: connect, when what is sent is typed into that terminal; else watch. */
 export function shareButton(
-  agent: RemoteAgent,
+  agent: Agent,
   entry: Conversation,
   lang: Lang,
 ): { title: string; style: "positive" | null } {
@@ -73,7 +73,7 @@ function resume(title: string, style: "positive" | null, entry: Conversation, pl
 }
 
 function liveItems(
-  agent: RemoteAgent,
+  agent: Agent,
   entry: Conversation,
   place: Place,
   connected: ReadonlyMap<string, { readonly number: number; readonly sessionId: string }>,
@@ -100,8 +100,8 @@ function liveItems(
 
 /** The conversations of one online agent on the agents card. */
 export function conversationItems(
-  connector: RemoteConnector,
-  agent: RemoteAgent,
+  connector: Connector,
+  agent: Agent,
   now: number,
   lang: Lang,
   joined: {

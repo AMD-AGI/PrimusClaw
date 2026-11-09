@@ -17,7 +17,7 @@ import { lit } from "./inert.js";
 import { CONVERSATIONS_PER_AGENT, SESSIONS_PER_AGENT } from "./limits.js";
 import { activeSessions, conversationLine, newestFirst, offlineSince } from "./listing.js";
 import { MARKS } from "./marks.js";
-import type { RemoteAgent, RemoteConnector, RemoteSession } from "./pending-model.js";
+import type { Agent, Connector, Session } from "../remote/model.js";
 import type { ConnectSteps, ConnectorSetupWords } from "./setup.js";
 import { windowText } from "./status-view.js";
 import { ago } from "./time.js";
@@ -57,8 +57,8 @@ export interface SessionsView {
 }
 
 export interface SessionsInput {
-  readonly connectors: readonly RemoteConnector[];
-  readonly sessions: readonly RemoteSession[];
+  readonly connectors: readonly Connector[];
+  readonly sessions: readonly Session[];
   readonly attached: string | null;
   readonly now: number;
   readonly lang?: Lang;
@@ -77,7 +77,7 @@ interface Counters {
   agents: number;
 }
 
-function needCount(input: SessionsInput, active: readonly RemoteSession[]): number {
+function needCount(input: SessionsInput, active: readonly Session[]): number {
   const waiting = input.waiting ?? new Set<string>();
   const open = new Set(active.map((s) => s.sessionId));
   const sessions = [...open].filter((sid) => waiting.has(sid)).length;
@@ -89,24 +89,24 @@ function needCount(input: SessionsInput, active: readonly RemoteSession[]): numb
   return sessions + terminals;
 }
 
-function hasEntries(agent: RemoteAgent, connectorId: string, active: readonly RemoteSession[]): boolean {
+function hasEntries(agent: Agent, connectorId: string, active: readonly Session[]): boolean {
   const ofAgent = active.some((s) => s.connectorId === connectorId && s.agentId === agent.agentId);
   return ofAgent || resumableOf(agent).some((e) => e.state !== "attached");
 }
 
 /** An agent with nothing to list is left out when another agent of the machine has something: one "no session" line at most. */
 function listedAgents(
-  agents: readonly RemoteAgent[],
+  agents: readonly Agent[],
   connectorId: string,
-  active: readonly RemoteSession[],
-): RemoteAgent[] {
+  active: readonly Session[],
+): Agent[] {
   const listed = agents.filter((a) => hasEntries(a, connectorId, active));
   const quiet = agents.filter((a) => !listed.includes(a));
   if (listed.length > 0 && quiet.length > 0) return listed;
   return quiet.length > 0 ? quiet.slice(0, 1) : [...agents];
 }
 
-function sessionRows(mine: readonly RemoteSession[], input: SessionsInput, counters: Counters): AgentRow[] {
+function sessionRows(mine: readonly Session[], input: SessionsInput, counters: Counters): AgentRow[] {
   const lang = input.lang ?? "en";
   const words = remoteText.in(lang);
   const waiting = input.waiting ?? new Set<string>();
@@ -134,8 +134,8 @@ function sessionRows(mine: readonly RemoteSession[], input: SessionsInput, count
 }
 
 function conversationRows(
-  connector: RemoteConnector,
-  agent: RemoteAgent,
+  connector: Connector,
+  agent: Agent,
   entry: Conversation,
   input: SessionsInput,
   rowId: number,
@@ -161,9 +161,9 @@ function conversationRows(
 }
 
 function agentItem(
-  connector: RemoteConnector,
-  agent: RemoteAgent,
-  active: readonly RemoteSession[],
+  connector: Connector,
+  agent: Agent,
+  active: readonly Session[],
   input: SessionsInput,
   counters: Counters,
 ): SessionsItem {
@@ -189,8 +189,8 @@ function agentItem(
 }
 
 function machineItems(
-  connector: RemoteConnector,
-  active: readonly RemoteSession[],
+  connector: Connector,
+  active: readonly Session[],
   input: SessionsInput,
   counters: Counters,
 ): SessionsItem[] {

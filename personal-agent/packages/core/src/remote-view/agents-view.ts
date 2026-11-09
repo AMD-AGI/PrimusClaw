@@ -17,7 +17,7 @@ import { lit, neutral, plain } from "./inert.js";
 import { AGENT_BLOCKS_MAX, ROOT_MAX, SUBFOLDER_MAX } from "./limits.js";
 import { byConnector, offlineSince, sessionFacts, shownSessions } from "./listing.js";
 import { placeOf } from "./lines.js";
-import type { RemoteAgent, RemoteConnector, RemoteSession } from "./pending-model.js";
+import type { Agent, Connector, Session } from "../remote/model.js";
 import type { ConnectorSetupWords } from "./setup.js";
 
 /** Where a new session starts: a choice of the roots the agent reported and a subfolder, or (none reported) the whole folder. */
@@ -84,8 +84,8 @@ export interface AgentsView {
 }
 
 export interface AgentsInput {
-  readonly connectors: readonly RemoteConnector[];
-  readonly sessions: readonly RemoteSession[];
+  readonly connectors: readonly Connector[];
+  readonly sessions: readonly Session[];
   /** The session the chat is attached to. */
   readonly attached: string | null;
   readonly now: number;
@@ -100,7 +100,7 @@ export interface AgentsInput {
   readonly setup: ConnectorSetupWords;
 }
 
-function startOf(connector: RemoteConnector, agent: RemoteAgent, slot: number, lang: Lang): AgentBlock["start"] {
+function startOf(connector: Connector, agent: Agent, slot: number, lang: Lang): AgentBlock["start"] {
   if (agent.kind === "attach") return null;
   const words = remoteText.in(lang);
   const roots = agentRoots(agent);
@@ -130,8 +130,8 @@ interface Joined {
 }
 
 function agentBlock(
-  connector: RemoteConnector,
-  agent: RemoteAgent,
+  connector: Connector,
+  agent: Agent,
   slot: number,
   input: AgentsInput,
   joined: Joined,
@@ -151,7 +151,7 @@ function agentBlock(
   };
 }
 
-function offlineAgent(agent: RemoteAgent, lang: Lang): AgentsItem {
+function offlineAgent(agent: Agent, lang: Lang): AgentsItem {
   const { icon, label } = kindLabel(agent.kind);
   const name = `${icon} ${lit(agent.name, 60) || label}`;
   const words = remoteText.in(lang);
@@ -160,7 +160,7 @@ function offlineAgent(agent: RemoteAgent, lang: Lang): AgentsItem {
 }
 
 /** What a machine's heading says: its name, online or since when it is offline, its connector's version and health. */
-function machineHeading(connector: RemoteConnector, input: AgentsInput, separator: boolean): AgentsItem[] {
+function machineHeading(connector: Connector, input: AgentsInput, separator: boolean): AgentsItem[] {
   const lang = input.lang ?? "en";
   const words = remoteText.in(lang);
   const state = connector.online ? words.online : offlineSince(connector, lang);
@@ -207,7 +207,7 @@ function sessionButtons(sid: string, attached: string | null, ref: string, lang:
   return [first, close];
 }
 
-function sessionRows(input: AgentsInput, shown: readonly RemoteSession[]): SessionRow[] {
+function sessionRows(input: AgentsInput, shown: readonly Session[]): SessionRow[] {
   const lang = input.lang ?? "en";
   const words = remoteText.in(lang);
   const index = byConnector(input.connectors);
@@ -227,7 +227,7 @@ function sessionRows(input: AgentsInput, shown: readonly RemoteSession[]): Sessi
   });
 }
 
-function joinedOf(input: AgentsInput, shown: readonly RemoteSession[]): Joined {
+function joinedOf(input: AgentsInput, shown: readonly Session[]): Joined {
   const names = input.names ?? new Map<string, { title: string; ref: string }>();
   const shownIds = shown.map((s) => s.sessionId);
   const mine = new Set<string>();

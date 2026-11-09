@@ -11,7 +11,7 @@ import type { Conversation } from "./conversations.js";
 import { lit, neutral } from "./inert.js";
 import { BUTTON_TITLE_MAX, OPTION_BUTTONS_MAX } from "./limits.js";
 import { disconnectTitle } from "./lines.js";
-import type { RemoteAgent, RemoteConnector } from "./pending-model.js";
+import type { Agent, Connector } from "../remote/model.js";
 import type { ConnectorSetupWords } from "./setup.js";
 
 export interface DisconnectView {
@@ -61,8 +61,8 @@ export interface TakeoverView {
 /** What a tap on Take over… for a conversation open in a terminal opens: what will happen, in so many words, then Take over and
  * Cancel. `ticket`: what the confirmation carries ("1" when none). */
 export function takeoverView(
-  connector: RemoteConnector,
-  agent: RemoteAgent,
+  connector: Connector,
+  agent: Agent,
   entry: Conversation,
   lang: Lang = "en",
   view = "",
@@ -98,7 +98,7 @@ export interface ApprovalInput {
 }
 
 /** The choice between asking for approval and not, for an agent whose connector lets a client switch; null otherwise. */
-export function approvalInput(agent: RemoteAgent, slot: number, lang: Lang): ApprovalInput | null {
+export function approvalInput(agent: Agent, slot: number, lang: Lang): ApprovalInput | null {
   const choice = approvalChoice(agent);
   if (!choice) return null;
   const words = remoteText.in(lang);
@@ -128,8 +128,8 @@ export interface MachineChoiceView {
 /** `/agent new MACHINE PATH` named a machine with more than one online agent: a block per agent, each starting the session in
  * `path`. The folder is not in the buttons: the worker keeps what was typed under `token`, so a card cannot choose it. */
 export function machineChoiceView(
-  connector: RemoteConnector,
-  agents: readonly RemoteAgent[],
+  connector: Connector,
+  agents: readonly Agent[],
   token: string,
   path: string,
   lang: Lang = "en",

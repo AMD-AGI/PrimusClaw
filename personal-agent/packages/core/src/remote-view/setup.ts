@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { Lang } from "../locales/lang.js";
-import type { RemoteConnector } from "./pending-model.js";
+import type { Connector } from "../remote/model.js";
 
 /** The connect steps for a card: the first line (the lead, or "You have no machine connected.", then what to run), each command
  * on a line of its own, what to do after, and the per-system notes (one line each, joined by newlines). */
@@ -23,7 +23,7 @@ export interface ConnectorSetupWords {
   /** The same for a card; `lead` replaces the first sentence. */
   connectSteps(lang: Lang, lead?: string): ConnectSteps;
   /** One line under a machine whose connector Claw says is old, with the command that upgrades it; null otherwise. */
-  versionNote(connector: RemoteConnector, lang: Lang): string | null;
+  versionNote(connector: Connector, lang: Lang): string | null;
   /** What brings an offline machine back. */
   offlineHint(lang: Lang): string;
   /** The exact `claw-connector login` command. */

@@ -10,35 +10,35 @@ import { healthLines } from "./health.js";
 import { lit, neutral } from "./inert.js";
 import { MARKS } from "./marks.js";
 import { SESSION_CARD_MAX, SESSIONS_SHOWN, WAITING_FOR_MAX } from "./limits.js";
-import type { RemoteConnector, RemoteSession } from "./pending-model.js";
+import type { Connector, Session } from "../remote/model.js";
 import type { ConnectorSetupWords } from "./setup.js";
 import { ago, agoEpoch, parseIsoSeconds, utcStamp } from "./time.js";
 
 /** How an offline machine is shown: when it was last seen, in UTC (`last_seen_at`, else its last heartbeat). */
-export function offlineSince(connector: RemoteConnector, lang: Lang = "en"): string {
+export function offlineSince(connector: Connector, lang: Lang = "en"): string {
   const at = parseIsoSeconds(connector.lastSeenAt || connector.heartbeatAt);
   const words = remoteText.in(lang);
   return at === null ? words.offline : words.offlineSince({ stamp: utcStamp(at) });
 }
 
 /** Sessions newest first (by `updated_at` as Claw wrote it), the order kept among equals. */
-export function newestFirst(sessions: readonly RemoteSession[]): RemoteSession[] {
-  const key = (s: RemoteSession): string => s.updatedAt ?? "";
+export function newestFirst(sessions: readonly Session[]): Session[] {
+  const key = (s: Session): string => s.updatedAt ?? "";
   return [...sessions].sort((a, b) => (key(a) < key(b) ? 1 : key(a) > key(b) ? -1 : 0));
 }
 
 /** The active sessions (a closed one can be neither attached nor closed). */
-export function activeSessions(sessions: readonly RemoteSession[]): RemoteSession[] {
+export function activeSessions(sessions: readonly Session[]): Session[] {
   return sessions.filter((s) => s.status === "active" && s.sessionId !== "");
 }
 
 /** The sessions the agents card lists: the active ones, newest first, at most SESSION_CARD_MAX. */
-export function shownSessions(sessions: readonly RemoteSession[]): RemoteSession[] {
+export function shownSessions(sessions: readonly Session[]): Session[] {
   return newestFirst(activeSessions(sessions)).slice(0, SESSION_CARD_MAX);
 }
 
 /** The connectors by id. */
-export function byConnector(connectors: readonly RemoteConnector[]): Map<string, RemoteConnector> {
+export function byConnector(connectors: readonly Connector[]): Map<string, Connector> {
   return new Map(connectors.map((c) => [c.connectorId, c]));
 }
 
@@ -55,8 +55,8 @@ const SESSION_STATUS = { active: "statusActive", closed: "statusClosed" } as con
 
 /** Who, where and how one session of a listing is. A status Claw has no words for here is shown as it came, made inert. */
 export function sessionFacts(
-  session: RemoteSession,
-  connectors: ReadonlyMap<string, RemoteConnector>,
+  session: Session,
+  connectors: ReadonlyMap<string, Connector>,
   attached: string | null,
   now: number,
   lang: Lang = "en",
@@ -82,7 +82,7 @@ export function sessionFacts(
 
 /** `/agents` as text. With no machine: the exact commands that connect one (markdown, for a rich message). */
 export function agentsText(
-  connectors: readonly RemoteConnector[],
+  connectors: readonly Connector[],
   setup: ConnectorSetupWords,
   lang: Lang = "en",
 ): string {
@@ -108,8 +108,8 @@ export function agentsText(
 
 /** The message, and the session ids in the order shown: the newest sessions first, numbered for `/agent attach N`. */
 export function sessionsText(
-  sessions: readonly RemoteSession[],
-  connectors: readonly RemoteConnector[],
+  sessions: readonly Session[],
+  connectors: readonly Connector[],
   attached: string | null,
   now: number,
   lang: Lang = "en",

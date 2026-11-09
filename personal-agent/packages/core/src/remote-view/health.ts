@@ -12,12 +12,12 @@ import { remoteHealthText, remoteText } from "../locales/remote.js";
 import { kindLabel } from "./agents.js";
 import { HEALTH_LINES_MAX, HEALTH_READ_MAX } from "./limits.js";
 import { orEmpty, slice } from "./py-text.js";
-import type { RemoteAgent, RemoteConnector } from "./pending-model.js";
+import type { Agent, Connector } from "../remote/model.js";
 import { list, objOrNull } from "./reported.js";
 
 export interface MachineProblem {
   /** The agent it is about, or null for one of the machine as a whole (said once). */
-  readonly agent: RemoteAgent | null;
+  readonly agent: Agent | null;
   readonly code: string;
   /** A failure, not a warning. */
   readonly fail: boolean;
@@ -29,7 +29,7 @@ const CODE = /^[a-z][a-z0-9_]{0,63}$/;
 /** A fix that is a command line (said as "run `…`"), not a sentence of what to do (said as "Fix: …"). */
 const COMMAND_FIX = /^\(?(?:claude|codex|claw-connector|npm|npx|mkdir|chmod|export|loginctl|agent|curl|crontab|sh)\b/;
 
-function problemsOf(agent: RemoteAgent): { problems: readonly unknown[]; checked: string | null } | null {
+function problemsOf(agent: Agent): { problems: readonly unknown[]; checked: string | null } | null {
   const health = objOrNull(agent.capabilities["health"]);
   if (!health || !Array.isArray(health["problems"])) return null;
   const checked = health["checked_at"];
@@ -39,7 +39,7 @@ function problemsOf(agent: RemoteAgent): { problems: readonly unknown[]; checked
 /** The machine's problems, failures first, a machine-wide one once, and when they were checked; null when no agent reports
  * health (an older connector: unknown, not fine). */
 export function machineProblems(
-  connector: RemoteConnector,
+  connector: Connector,
 ): { problems: MachineProblem[]; checked: string | null } | null {
   const out: MachineProblem[] = [];
   const seen = new Set<string>();
@@ -94,7 +94,7 @@ function problemLine(problem: MachineProblem, lang: Lang): string {
 
 /** One line per problem of the machine (at most HEALTH_LINES_MAX, then how many more): what is wrong and the command that fixes it
  * on that machine. [] when it reports none or no health at all. */
-export function healthLines(connector: RemoteConnector, lang: Lang = "en"): string[] {
+export function healthLines(connector: Connector, lang: Lang = "en"): string[] {
   const found = machineProblems(connector);
   if (!found) return [];
   const lines = found.problems.slice(0, HEALTH_LINES_MAX).map((p) => problemLine(p, lang));
