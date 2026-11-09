@@ -9,6 +9,7 @@
  */
 
 import { errorName } from "../../errors.js";
+import { pySplit } from "../../text/py-text.js";
 import { accountText as t } from "../../locales/review-account.js";
 import { NARROW_HINT as NARROW, NOT_YET_TEXT, REAUTHORIZE_LEAD, USAGE } from "../../locales/review-github.js";
 import {
@@ -54,7 +55,7 @@ export class GithubAccount {
 
   /** `/github ...` in a 1:1 chat. */
   async command(sender: UserRef, args: string, conversation: Conversation): Promise<void> {
-    const failure = await this.run(sender, args.toLowerCase().split(/\s+/u).filter(Boolean), conversation);
+    const failure = await this.run(sender, pySplit(args.toLowerCase()), conversation);
     if (failure === undefined) return;
     if (failure.kind === "not_bound") {
       await this.connectFirst(sender, conversation);

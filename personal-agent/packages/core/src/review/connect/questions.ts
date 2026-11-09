@@ -7,26 +7,34 @@
  */
 
 import { isUpper } from "../../review-text/text/unicode.js";
+import { pyRegExp } from "../../text/py-regex.js";
 
 // A word for something on GitHub, bounded by anything that is not an ASCII letter ("的pr" has no word boundary in Unicode).
-const NOUN =
-  /(?<![A-Za-z])(?:github|PRs?|pull\s*requests?|CI|issues?|commits?|checks?|repos?|workflows?)(?![A-Za-z])|仓库|合入|合并请求|流水线|提交记录/iu;
+const NOUN = pyRegExp(
+  String.raw`(?<![A-Za-z])(?:github|PRs?|pull\s*requests?|CI|issues?|commits?|checks?|repos?|workflows?)(?![A-Za-z])|仓库|合入|合并请求|流水线|提交记录`,
+  "i",
+);
 // The person themselves, or a Chinese phrasing that leaves it implicit.
-const PERSON = /我|咱|最近一次|上一次|开着的|(?<![A-Za-z])(?:my|mine|me|I|our)(?![A-Za-z])/iu;
+const PERSON = pyRegExp(String.raw`我|咱|最近一次|上一次|开着的|(?<![A-Za-z])(?:my|mine|me|I|our)(?![A-Za-z])`, "i");
 // What is asked about it: its state or number.
-const STATE =
-  /开着|打开的|没合|合了|关了|挂|红|失败|几个|多少|哪些|最近|最新|状态|等我|(?<![A-Za-z])(?:open|opened|merged|closed|failing|failed|red|how\s+many|latest|last|status|waiting|assigned)(?![A-Za-z])/iu;
+const STATE = pyRegExp(
+  String.raw`开着|打开的|没合|合了|关了|挂|红|失败|几个|多少|哪些|最近|最新|状态|等我|` +
+    String.raw`(?<![A-Za-z])(?:open|opened|merged|closed|failing|failed|red|how\s+many|latest|last|status|waiting|assigned)(?![A-Za-z])`,
+  "i",
+);
 // A review asked for: reviews go their own way, and no card is offered beside one.
-const REVIEW_NEAR = /(?:合入|merge|https?:\/\/|[A-Za-z0-9-]+\/[A-Za-z0-9._-]+#\p{Nd})/iu;
-const REVIEW_WORD = /(?<![A-Za-z])review(?![A-Za-z])/giu;
-const REVIEW_OTHER = /代审|帮.{0,6}审/u;
+const REVIEW_NEAR = pyRegExp(String.raw`(?:合入|merge|https?://|[A-Za-z0-9-]+/[A-Za-z0-9._-]+#\d)`, "i");
+const REVIEW_WORD = pyRegExp(String.raw`(?<![A-Za-z])review(?![A-Za-z])`, "gi");
+const REVIEW_OTHER = pyRegExp(String.raw`代审|帮.{0,6}审`);
 
 export const MAX_QUESTION_CHARS = 2000;
 export const MAX_REPOS_LOOKED_AT = 3;
 
-const REPO_LINK = /github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})/giu;
-const REPO_NAME =
-  /(?<![\p{L}\p{N}_./-])([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})(?![\p{L}\p{N}_/])/gu;
+const REPO_LINK = pyRegExp(String.raw`github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100})`, "gi");
+const REPO_NAME = pyRegExp(
+  String.raw`(?<![\w./-])([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100})(?![\w/])`,
+  "g",
+);
 
 /** "review" followed within 40 characters of its line by a merge word, a link or owner/repo#N; or 代审, 帮…审. */
 function asksForReview(text: string): boolean {

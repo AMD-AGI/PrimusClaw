@@ -7,6 +7,7 @@
  * link written after it. A message that merely contains the words is chat, and goes on as chat.
  */
 
+import { pyFullmatch, pyRegExp } from "../text/py-regex.js";
 import {
   type Mention,
   markerIndexes,
@@ -21,7 +22,6 @@ import {
 import { MARK_CLOSE, pullsIn } from "../review-text/pull-ref.js";
 import type { PullRef } from "../claw/model.js";
 import { isPySpace } from "../text/py-chars.js";
-import { pyRegExp } from "../text/py-regex.js";
 import { pyStrip } from "../text/py-text.js";
 import { MODEL_ID, asksReviewOnly, modelFieldPattern, saysReviewAndMerge } from "../review-text/asks.js";
 import { bareName, flat, unique } from "../review-text/text/unicode.js";
@@ -134,7 +134,7 @@ function askedAgain(text: string, from: number): string[] {
   return whos;
 }
 
-const MODEL_ALONE = new RegExp(`^(?:${MODEL_ID})\\s*$`, "u");
+const MODEL_ALONE = pyFullmatch(String.raw`(?:${MODEL_ID})\s*`);
 
 /** "用 X" at the end of a name (after its start, a space or a mention): where 用 is, and the model. */
 function useModel(who: string): { readonly at: number; readonly model: string } | undefined {

@@ -6,6 +6,7 @@
  * then, once the turn ends, that headline with the model's answer under it, without its verdict line and in plain words.
  */
 
+import { pyRegExp } from "../text/py-regex.js";
 import {
   PLAIN_WORDS,
   mergeWords,
@@ -25,7 +26,7 @@ import { pickLang } from "../review-text/text/unicode.js";
 export const SUMMARY_CHARS = 1200;
 export const DM_SUMMARY_CHARS = 700;
 
-const VERDICT = /^\s*VERDICT:\s*(CLEAN|BLOCKING|NOT_REVIEWED)\s*$/iu;
+const VERDICT = pyRegExp(String.raw`^\s*VERDICT:\s*(CLEAN|BLOCKING|NOT_REVIEWED)\s*$`, "i");
 const CJK = /[一-鿿]/u;
 const NAMES = Object.keys(PLAIN_WORDS)
   .sort((a, b) => b.length - a.length)

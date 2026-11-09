@@ -7,6 +7,7 @@
  * writes, and a model is one it writes.
  */
 
+import { pyFullmatch } from "../text/py-regex.js";
 import { reviewRequestText } from "../locales/review-request.js";
 import { decimalInt, pyStrip, squashSpaces } from "../text/py-text.js";
 import { type BareGroup, bareGroups } from "../review-text/bare-numbers.js";
@@ -17,6 +18,8 @@ import { MODEL_ID } from "../review-text/asks.js";
 import { type ReviewAsk, reviewAsk } from "./request-parse.js";
 import { wordHashNumbers } from "../review-text/text/scan.js";
 import { casefold, flat, unique } from "../review-text/text/unicode.js";
+
+const BARE_NUMBER = pyFullmatch(String.raw`#?\s*\d{1,7}`);
 
 export const INTENTS = ["review_merge", "review", "none"] as const;
 
@@ -71,7 +74,7 @@ export function pullsWritten(item: string, keys: ReadonlySet<PullKey>): Set<Pull
   const refs = pullsIn(item);
   if (refs.length) return new Set(refs.map(pullKey).filter((k) => keys.has(k)));
   let groups: BareGroup[];
-  if (/^#?\s*\p{Nd}{1,7}$/u.test(item)) {
+  if (BARE_NUMBER.test(item)) {
     groups = [{ spans: [[0, 0]], numbers: [decimalInt(pyStrip(item.replace(/^#+/u, "")))], repo: "", explicit: true }];
   } else {
     groups = bareGroups(item);
