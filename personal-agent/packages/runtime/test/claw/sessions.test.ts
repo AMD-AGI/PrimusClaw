@@ -205,6 +205,18 @@ describe("reading a session", () => {
       "https://claw.test/v1/sessions/s%201%2Fx/deliveries/d%2F2",
     );
     assert.equal(new Wire().client({ baseUrl: "http://claw.local" }).sessions.deliveryLink("s", "d"), null);
+    for (const [session, delivery] of [
+      ["s1", ".."],
+      ["..", "d1"],
+      ["s1", "."],
+      ["", "d1"],
+    ]) {
+      assert.equal(
+        claw.sessions.deliveryLink(session ?? "", delivery ?? ""),
+        null,
+        `${String(session)}/${String(delivery)}`,
+      );
+    }
   });
 
   it("a network failure is ClawUnreachable, never the library's error", async () => {
