@@ -309,7 +309,7 @@ export class GithubAccount {
   }
 
   /** Shows the card for a 1:1 message that asked about the setting (`suggested`: the one asked for; undefined: show it). */
-  async showMode(sender: UserRef, suggested: ReviewMode | undefined, conversation: Conversation): Promise<void> {
+  async showMode(sender: UserRef, suggested: ReviewMode | "" | "show", conversation: Conversation): Promise<void> {
     const status = await this.deps.credentials.status(sender.id);
     if (!status.ok) {
       if (status.error.kind === "not_bound") {
@@ -324,7 +324,7 @@ export class GithubAccount {
       await say(this.deps, conversation, t.notConnectedYet);
       return;
     }
-    if (suggested === undefined) {
+    if (suggested === "show") {
       await this.status(sender, conversation);
       return;
     }
@@ -334,7 +334,7 @@ export class GithubAccount {
       return;
     }
     const lead =
-      suggested === current ? t.alreadyThisOne(REVIEW_MODES[suggested][0]) + t.pressToChange : t.pressToChange;
+      suggested !== "" && suggested === current ? t.alreadyThisOne(REVIEW_MODES[suggested][0]) + t.pressToChange : t.pressToChange;
     await conversation.send(this.modeCard(sender.id, current, suggested, lead));
   }
 

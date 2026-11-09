@@ -205,12 +205,9 @@ export class GithubReview {
     const key = this.deps.intent === undefined ? null : this.deps.store.links.getKey(sender.id);
     const raw = key && this.deps.intent !== undefined ? await this.deps.intent.readMode(key, text) : undefined;
     if (raw === undefined && !MODE_STRONG.test(text)) return false;
-    let suggested: ReturnType<typeof modeWanted> = undefined;
-    if (raw !== undefined) {
-      suggested = modeWanted(raw);
-      if (suggested === null) return false;
-    }
-    await this.account.showMode(sender, suggested === "show" ? undefined : (suggested ?? undefined), conversation);
+    const suggested = raw === undefined ? "" : modeWanted(raw);
+    if (suggested === null) return false;
+    await this.account.showMode(sender, suggested, conversation);
     return true;
   }
 
@@ -356,7 +353,7 @@ function githubWord(
 /** The setting a model reading asks for: a mode, "show" to see it, or null when the reading is not about it. */
 function modeWanted(
   raw: Readonly<Record<string, unknown>>,
-): "high_risk_confirm" | "fully_auto" | "show" | null | undefined {
+): "high_risk_confirm" | "fully_auto" | "show" | null {
   if (raw.intent === "show_review_mode") return "show";
   if (raw.intent !== "set_review_mode" || !isReviewMode(raw.mode)) return null;
   return raw.mode;
