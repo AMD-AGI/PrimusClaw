@@ -5,7 +5,7 @@
 
 import { errorName } from "../../errors.js";
 import type { Envelope } from "../../ports/surface.js";
-import { cardQuestions } from "../interim-views.js";
+import { cardQuestions } from "../../approvals/questions.js";
 import { isObject, type JsonObject, textOf, truthy } from "../json.js";
 import type { StatusMessage } from "../progress/status-message.js";
 import type { Step } from "../step.js";
