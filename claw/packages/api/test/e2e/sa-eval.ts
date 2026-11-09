@@ -102,7 +102,7 @@
  *                     the assistant is shown them in every session, and answers a case asked again with "it is already waiting"
  *                     instead of a card. Closing a card is the person's answer, so it is done with EVAL_SEND_TOKEN_CMD's token (a
  *                     `deny`); without one they stay, and an attempt of a case that expects a card while one an earlier attempt of
- *                     the run left still waits is the run's error, not a grade. Each attempt records `cardsWaiting`
+ *                     the same case made still waits is the run's error, not a grade. Each attempt records `cardsWaiting`
  *   EVAL_SEND_TOKEN_CMD
  *                     assistant mode: a command (as EVAL_VARS_CMD: no shell) that prints a signed-in access token of the key's own identity (an identity
  *                     provider's, for the Claw API): the run's messages are sent with it, as a person's channel sends them, so a
@@ -1260,8 +1260,8 @@ async function closeRunItems(floorAtStart: number, leftOpen: number[], session: 
 
 // --- Cards waiting, and a case's setup ----------------------------------------------------------------------------------
 
-/** The cards waiting for the identity's answer when the run began (EVAL_FRESH_SESSION_EVERY=attempt): not the run's own. */
-const CARDS_AT_START = new Set<string>();
+/** The cards that appeared during each case's attempts (EVAL_FRESH_SESSION_EVERY=attempt), by case id: the next attempt must not find them. */
+const CASE_CARDS = new Map<string, Set<string>>();
 
 /**
  * The cards waiting for the identity's answer now (`waitingCards`), or null when a list could not be read. A deployment without the
@@ -1283,6 +1283,7 @@ async function closeCards(): Promise<WaitingCard[] | null> {
   if (!waiting?.length || !SEND_TOKEN_CMD) return waiting;
   const token = sendToken();
   for (const w of waiting) {
+    live();   // a stop sends no more decisions
     const route = w.source === "assistant" ? "/v1/assistant/confirmations" : "/v1/github-review/confirmations";
     const r = await api("POST", `${route}/${encodeURIComponent(w.id)}/decision`, { decision: "deny" }, token).catch(() => null);
     log(`card ${w.source}:${w.kind || "?"} waiting before the attempt: deny answered ${r?.status ?? "nothing"}`);
@@ -1308,9 +1309,19 @@ async function makeSetup(c: EvalCase): Promise<string[]> {
   if (clash.length) throw new Error(`infra: setup: the identity already has a trigger named ${clash.join(", ")}, which the run did not make for this attempt`);
   const made: string[] = [];
   for (const t of wanted) {
+    if (stopSignal) { await removeSetup(made); live(); }   // a stop makes nothing more
     const r = await api("POST", "/v1/triggers", setupTriggerBody(t)).catch(() => null);
     const id = r?.json?.data?.trigger_id;
     if (r?.status !== 200 || typeof id !== "string" || !id) {
+      // One made whose answer was lost is found by its name: the identity had no trigger under any setup name before (above).
+      const now = await api("GET", "/v1/triggers").catch(() => null);
+      const wantedNames = new Set(wanted.map((x) => x.name.trim()));
+      for (const x of (Array.isArray(now?.json?.data) ? now!.json.data : []) as Array<{ trigger_id?: unknown; name?: unknown }>) {
+        if (typeof x?.trigger_id === "string" && wantedNames.has(String(x.name ?? "").trim()) && !made.includes(x.trigger_id)) {
+          SETUP_TRIGGERS.add(x.trigger_id);
+          made.push(x.trigger_id);
+        }
+      }
       await removeSetup(made);
       throw new Error(`infra: setup: POST /v1/triggers for ${JSON.stringify(t.name)} answered ${r?.status ?? "nothing"}${typeof r?.json?.error === "string" ? ` (${r.json.error})` : ""}`);
     }
@@ -1402,7 +1413,6 @@ async function main(): Promise<void> {
       if (FRESH_ATTEMPT) {
         const waiting = await cardsNow();
         if (!waiting) throw new Error("the cards waiting for the identity's answer could not be read");
-        for (const w of waiting) CARDS_AT_START.add(w.id);
         log(`cards waiting for the identity when the run began: ${waiting.length}${waiting.length && !SEND_TOKEN_CMD ? " (they stay: closing one needs EVAL_SEND_TOKEN_CMD)" : ""}`);
       }
     }
@@ -1453,7 +1463,7 @@ async function main(): Promise<void> {
             if (MODE === "assistant" && FRESH_ATTEMPT) {
               waiting = await closeCards();
               if (!waiting) throw new Error("infra: the cards waiting for the identity's answer could not be read: not graded");
-              const left = cardsLeftError(filled, waiting, CARDS_AT_START);
+              const left = cardsLeftError(filled, waiting, CASE_CARDS.get(c.id) ?? new Set());
               if (left) throw new Error(left);
             }
             setup = await makeSetup(filled);
@@ -1463,6 +1473,14 @@ async function main(): Promise<void> {
             a = { pass: false, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: null, finalMs: null, items: [], error: scrub(err instanceof Error ? err.message : String(err)) };
           } finally {
             if (setup.length) await removeSetup(setup);
+          }
+          // The cards this attempt made: those waiting now that did not before it. A card it made that could not be read stays unseen,
+          // and the next attempt is graded as without it (the same as before this runner closed cards at all).
+          if (waiting && !preflightFailed) {
+            const before = new Set(waiting.map((w) => w.id));
+            const own = CASE_CARDS.get(c.id) ?? new Set<string>();
+            for (const w of (await cardsNow().catch(() => null)) ?? []) if (!before.has(w.id)) own.add(w.id);
+            CASE_CARDS.set(c.id, own);
           }
           if (waiting) a = { ...a, cardsWaiting: waiting.length };
           // A say the server refused for its hourly cap is the run's failure, not the assistant's.

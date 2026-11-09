@@ -248,17 +248,17 @@ export function waitingCards(assistantBody: unknown, githubBody: unknown): Waiti
 }
 
 /**
- * Why an attempt is not graded on its cards, or null: the case expects a card, and a card an earlier attempt of the run left is still
- * waiting (it is not in `atStart`, the cards waiting when the run began). The assistant then says the write is already waiting and shows
- * none, so a miss would be the run's, not the assistant's. Cards that waited before the run are said (`cardsWaiting`) but not held
- * against the attempt: the run did not make them, and cannot tell them from a person's.
+ * Why an attempt is not graded on its cards, or null: the case expects a card, and a card an earlier attempt of the same case made (`own`:
+ * the cards that appeared during those attempts) is still waiting. The assistant then says that write is already waiting and shows none,
+ * so a miss would be the run's, not the assistant's. Every other card waiting (another case's, one from before the run) is said
+ * (`cardsWaiting`) but not held against the attempt: the assistant still proposes a different write while one waits.
  */
-export function cardsLeftError(c: Pick<EvalCase, "cards">, waiting: readonly WaitingCard[], atStart: ReadonlySet<string>): string | null {
+export function cardsLeftError(c: Pick<EvalCase, "cards">, waiting: readonly WaitingCard[], own: ReadonlySet<string>): string | null {
   if (c.cards !== "confirm" && c.cards !== "accept") return null;
-  const left = waiting.filter((w) => !atStart.has(w.id));
+  const left = waiting.filter((w) => own.has(w.id));
   if (!left.length) return null;
   const kinds = [...new Set(left.map((w) => w.kind || w.source))].join(",");
-  return `infra: ${left.length} card(s) an earlier attempt of the run left waiting (${kinds}) could not be closed before this one `
+  return `infra: ${left.length} card(s) an earlier attempt of this case left waiting (${kinds}) could not be closed before this one `
     + "(closing one is the person's answer: EVAL_SEND_TOKEN_CMD), so the assistant is shown them: not graded";
 }
 

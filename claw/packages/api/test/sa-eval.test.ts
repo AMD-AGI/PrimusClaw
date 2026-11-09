@@ -1049,16 +1049,18 @@ test("S33 the cards waiting for the identity, and when an attempt cannot be grad
   assert.deepEqual(waitingCards(null, "not found"), []);
   assert.deepEqual(waitingCards({ data: { x: 1 } }, { items: "x" }), []);
   const card = (cards: EvalCase["cards"]) => ({ cards });
-  const before = new Set(["542a02aa-0000-4000-8000-000000000002", "g1"]);
-  // A card an earlier attempt of the run made, still waiting: a case that expects a card is not graded.
-  assert.match(cardsLeftError(card("confirm"), waiting, before) ?? "", /^infra: 1 card\(s\) an earlier attempt of the run left waiting \(github_comment\)/);
-  assert.match(cardsLeftError(card("accept"), waiting, before) ?? "", /^infra: /);
+  const own = new Set(["cf2e00aa-0000-4000-8000-000000000001"]);
+  // A card an earlier attempt of the same case made, still waiting: a case that expects a card is not graded.
+  assert.match(cardsLeftError(card("confirm"), waiting, own) ?? "", /^infra: 1 card\(s\) an earlier attempt of this case left waiting \(github_comment\)/);
+  assert.match(cardsLeftError(card("accept"), waiting, own) ?? "", /^infra: /);
   // A case that expects no card is graded: a card waiting cannot make one appear.
-  assert.equal(cardsLeftError(card("none"), waiting, before), null);
-  assert.equal(cardsLeftError(card(undefined), waiting, before), null);
-  // Cards that waited before the run are not the run's: said (cardsWaiting), never held against the attempt.
-  assert.equal(cardsLeftError(card("confirm"), waiting, new Set(waiting.map((w) => w.id))), null);
-  assert.equal(cardsLeftError(card("confirm"), [], before), null);
+  assert.equal(cardsLeftError(card("none"), waiting, own), null);
+  assert.equal(cardsLeftError(card(undefined), waiting, own), null);
+  // Another case's card, or one from before the run, is said (cardsWaiting), never held against the attempt: the assistant still proposes
+  // a different write while it waits (e232 after-run 2026-11-09: one comment card held 12 other cases back when it counted).
+  assert.equal(cardsLeftError(card("confirm"), waiting, new Set()), null);
+  assert.equal(cardsLeftError(card("confirm"), waiting, new Set(["not-waiting-any-more"])), null);
+  assert.equal(cardsLeftError(card("confirm"), [], own), null);
 });
 
 test("S34 a case's setup: triggers the runner makes before each attempt", () => {
