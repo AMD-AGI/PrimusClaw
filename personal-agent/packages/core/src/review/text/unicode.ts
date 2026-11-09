@@ -9,33 +9,9 @@
 const WORD_CHAR = /[\p{L}\p{N}_]/u;
 const ALNUM = /[\p{L}\p{N}]/u;
 
-/** The number of code points in `text` (Python's `len`). */
-export function cpLength(text: string): number {
-  return codePoints(text).length;
-}
-
 /** The code points of `text` (Python iterates a string by code point). */
 export function codePoints(text: string): string[] {
   return Array.from(text);
-}
-
-/** The first `limit` code points of `text` (Python's `text[:limit]`). */
-export function cpSlice(text: string, limit: number): string {
-  if (limit <= 0) return "";
-  if (text.length <= limit) return text;
-  let out = "";
-  let n = 0;
-  for (const ch of text) {
-    if (n >= limit) break;
-    out += ch;
-    n += 1;
-  }
-  return out;
-}
-
-/** `" ".join(text.split())`: every run of white space becomes one space, none at either end. */
-export function collapseSpaces(text: string): string {
-  return text.split(/\s+/u).filter(Boolean).join(" ");
 }
 
 /** Case left out, as names and repositories are compared. */

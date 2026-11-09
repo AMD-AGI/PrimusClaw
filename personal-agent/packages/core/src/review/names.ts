@@ -6,8 +6,9 @@
  * member list. Only an exact way of writing a member's name ever counts; a resemblance is offered back, never acted on.
  */
 
+import { cpHead, squashSpaces } from "../text/py-text.js";
 import { MARK_CLOSE, MARK_OPEN } from "./pull-ref.js";
-import { casefold, codePoints, collapseSpaces, cpSlice, flat, unique } from "./text/unicode.js";
+import { casefold, codePoints, flat, unique } from "./text/unicode.js";
 
 /** One person @mentioned in a message: the channel's id for them, their directory id ('' not given) and display name. */
 export interface Mention {
@@ -57,12 +58,12 @@ export function hasCjk(text: string): boolean {
 
 /** A display name as a prompt or a message carries it: one line, no markup, at most 60 characters. */
 export function displayName(value: string): string {
-  return cpSlice(collapseSpaces(value.replace(MARKUP, " ")), 60);
+  return cpHead(squashSpaces(value.replace(MARKUP, " ")), 60);
 }
 
 /** Text that came from outside as one plain line: no markup, at most `limit` characters. */
 export function oneLine(value: unknown, limit: number): string {
-  return cpSlice(collapseSpaces(plainText(value).replace(MARKUP, " ")), limit);
+  return cpHead(squashSpaces(plainText(value).replace(MARKUP, " ")), limit);
 }
 
 /** A value from outside as text: a string as it is, a number as written, anything else (or nothing) as ''. */
@@ -74,7 +75,7 @@ export function plainText(value: unknown): string {
 
 /** A name compared as words: case and runs of space left out. */
 export function normName(name: string): string {
-  return collapseSpaces(casefold(name));
+  return squashSpaces(casefold(name));
 }
 
 /** Strings sorted by code point (Python's `sorted`). */
@@ -161,7 +162,7 @@ export function namedWithin(who: string, span: string, mentions: readonly Mentio
 
 /** Who a reviewer the model wrote is, to tell two people apart: a mention's id (by id or display name), else the name, flat. */
 export function personOf(who: string, mentions: readonly Mention[]): string {
-  const said = collapseSpaces(who);
+  const said = squashSpaces(who);
   for (const m of mentions) {
     if (said === mentionId(m) || flat(said) === flat(m.name)) return `id:${mentionId(m)}`;
   }

@@ -19,6 +19,7 @@ import {
   displayName,
 } from "./names.js";
 import { MARK_CLOSE, type PullRef, pullsIn } from "./pull-ref.js";
+import { pyStrip } from "../text/py-text.js";
 import { bareName, flat, unique } from "./text/unicode.js";
 
 /** What a request says. */
@@ -85,10 +86,10 @@ function modelsWritten(text: string): string[] {
 
 /** A name with the model taken out of it: "model: X" anywhere, or "用 X" at its end. */
 function nameAndModel(who: string): { readonly who: string; readonly model: string | undefined } {
-  const named = who.replace(modelFieldPattern(), " ").trim();
+  const named = pyStrip(who.replace(modelFieldPattern(), " "));
   const used = USE_MODEL.exec(named);
   if (!used) return { who: named, model: undefined };
-  return { who: named.slice(0, used.index).trim(), model: used.groups?.model ?? "" };
+  return { who: pyStrip(named.slice(0, used.index)), model: used.groups?.model ?? "" };
 }
 
 /** "请 XX 帮我 review ..." that names someone and says nothing of merging. */
@@ -148,7 +149,7 @@ function personKeys(who: string, mentions: readonly Mention[]): { ids: Set<strin
   const refs = markerIndexes(who).filter((i) => i < mentions.length);
   const ids = new Set(refs.map((r) => mentionId(mentions[r] as Mention)));
   const names = refs.length
-    ? [normName(refs.map((r) => (mentions[r]?.name ?? "").trim()).join(" "))]
+    ? [normName(refs.map((r) => pyStrip(mentions[r]?.name ?? "")).join(" "))]
     : [normName(bareName(withoutMarkers(who)))];
   const keys = new Set<string>();
   // (a name's words in any order, run together or not: "Hui, Rui", "Rui Hui" and "huirui" are one name)
@@ -178,7 +179,7 @@ export function otherReviewers(ask: ReviewAsk): string[] {
       .filter((i) => i < ask.mentions.length)
       .map((i) => ask.mentions[i]?.name ?? "")
       .join(" ");
-    const shown = mentioned || withoutMarkers(who).trim();
+    const shown = mentioned || pyStrip(withoutMarkers(who));
     if (!others.includes(shown)) others.push(displayName(shown) || "?");
   }
   return others;
