@@ -6,7 +6,7 @@
  * prints reaches every member, and an agent that reads a workload's environment can put API keys into its answer. It is
  * a net, not a guarantee: a secret in a shape it does not know, or split across messages, gets through.
  */
-import { B_END, B_START, S, W } from "./py-regex.js";
+import { B_END, B_START, S, W } from "../text/py-regex.js";
 
 /** What a masked value is replaced with. */
 export const MASK = "[hidden]";
