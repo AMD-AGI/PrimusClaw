@@ -481,3 +481,81 @@ test("a message that is refused leaves the chat followed", () =>
     assert.equal(onItsOwn(w).length, 2);
     assert.deepEqual(prompts(w), []);
   }));
+
+test("a turn end with no new text does not say the last text again", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    await w.server.say(sid, "Said once.");
+    await settle();
+    assert.equal(onItsOwn(w).length, 1);
+    await w.server.tool(sid, "t1", "Run tests", "pending");
+    await w.server.tool(sid, "t1", "Run tests", "completed");
+    await w.server.end(sid); // a connector that does end its turns: only steps since the text
+    await settle();
+    assert.equal(onItsOwn(w).length, 1);
+  }));
+
+// --- found by the review: a step's late update, a send that fails, an end that cannot be read ----------------------------------
+
+test("an update of a step that says no status does not reopen it after it ended", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    await w.server.say(sid, "The tests ran.");
+    await w.server.tool(sid, "t1", "Run tests", "pending");
+    await w.server.tool(sid, "t1", "Run tests", "completed");
+    await w.server.acp(sid, "tool_call_update", { toolCallId: "t1", title: "Run tests" }); // more output of it: no status
+    await sleep(700); // past `quietMs` (250), well short of `toolQuietMs` (1000): nothing is open
+    assert.equal(onItsOwn(w).length, 1);
+  }));
+
+test("text that cannot be sent when the user writes is held and not part of the answer", () =>
+  remoteWorld(async (w) => {
+    const { sid, script } = await attachedClaude(w);
+    refollow(w, { quietMs: 30_000, toolQuietMs: 30_000, maxAgeMs: 60_000 });
+    script.onPrompt = answer("Answer to the prompt.");
+    await w.server.say(sid, "Read, not yet said.");
+    await sleep(300);
+    w.refuse = (message) => JSON.stringify(message).includes("Read, not yet said."); // (the queue is down for it)
+    await w.say("go on");
+    assert.equal(w.answer(), "Answer to the prompt.", w.said().join(" | ")); // the unsent text is not carried by this answer
+    assert.deepEqual(onItsOwn(w), []);
+    // held for the assistant's release (its quiet-hours sweep, tested with it)
+    assert.equal(w.held.length, 1);
+    assert.ok(w.held[0]?.text.includes("Read, not yet said."));
+    assert.equal(w.held[0]?.chatKey, AAD);
+  }));
+
+test("a message is not sent when the end of the session cannot be read and goes when it can", () =>
+  remoteWorld(async (w) => {
+    const { sid, script } = await attachedClaude(w);
+    followOff(w);
+    script.onPrompt = answer("Clean answer.");
+    for (let n = 0; n < 2; n += 1) await w.server.say(sid, `older output ${String(n)}. `);
+    w.server.failOn("GET", "/events", 500);
+    await w.say("hello?");
+    assert.ok(w.last().includes("nothing was sent"), w.last());
+    assert.deepEqual(prompts(w), []);
+    w.server.fail.delete("GET /events");
+    await w.say("hello again");
+    assert.deepEqual(prompts(w), ["hello again"]);
+    assert.equal(w.answer(), "Clean answer.", w.said().join(" | "));
+  }));
+
+test("a worker that restarts in the middle of a turn delivers the rest of it and closes the turn", () =>
+  remoteWorld(async (w) => {
+    const { sid, script } = await attachedClaude(w);
+    w.remote.shutdown();
+    w.test.store.remoteState.setRemoteTurn(AAD, sid, true); // (a prompt had been sent and the worker died before the answer)
+    await w.server.say(sid, "Half of the answer, ");
+    await w.server.say(sid, "and the rest.");
+    await w.server.end(sid);
+    w.remote.resume(); // the worker is back
+    await w.until(() => onItsOwn(w).length > 0);
+    assert.ok(onItsOwn(w)[0]?.includes("Half of the answer, and the rest."), onItsOwn(w)[0] ?? "");
+    assert.equal(w.test.store.remoteState.attachedRemote(AAD)?.turnOpen, false);
+    script.onPrompt = answer("Fresh answer.");
+    await w.say("next"); // the turn is over: this is a new prompt, not "I lost track of your previous task"
+    assert.deepEqual(prompts(w), ["next"]);
+    assert.ok(!w.said().some((t) => t.includes("lost track")));
+    assert.ok(w.answer().includes("Fresh answer."));
+  }));
