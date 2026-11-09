@@ -72,6 +72,8 @@ export interface AssistantChatOptions {
   readonly onFilesDropped: (path: string, count: number) => void;
   /** The locale of the client the message being handled came from ("" none). */
   readonly clientLocale?: () => string;
+  /** `/board` (assistant.py `board`). */
+  readonly board: { show(userId: string, credential: string, conversation: Conversation): Promise<void> };
   /** The router's reading of commands (commands.py parse_command, command_args). */
   readonly commands: {
     parse(text: string): string | undefined;
@@ -387,6 +389,11 @@ export class AssistantChat {
     const command = this.o.commands.parse(said);
     if (command === "new" || command === "sessions") return t.noSessions;
     return this.o.commands.args(said, "repo") === undefined ? undefined : t.noRepo;
+  }
+
+  /** `/board`: the person's work items, and a card for each one that waits for them. */
+  board(userId: string, credential: string, conversation: Conversation): Promise<void> {
+    return this.o.board.show(userId, credential, conversation);
   }
 
   /** `/stop`: interrupts what the assistant is doing this moment; a task is stopped by name. */

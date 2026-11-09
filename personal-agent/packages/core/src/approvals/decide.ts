@@ -87,7 +87,11 @@ export class ApprovalDecisions {
     }
     if (pending.userId !== click.sender.id) {
       const en = decisionText.in("en");
-      await this.again(click, { ...press, tool: pending.tool }, press.answering ? en.onlyAskerAnswers : en.onlyAskerDecides);
+      await this.again(
+        click,
+        { ...press, tool: pending.tool },
+        press.answering ? en.onlyAskerAnswers : en.onlyAskerDecides,
+      );
       return;
     }
     if (this.deps.store.reviewDelegation.isActingSession(press.sessionId)) {

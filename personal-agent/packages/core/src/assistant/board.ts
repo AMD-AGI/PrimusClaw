@@ -48,6 +48,8 @@ export interface BoardDeps {
   /** The chat talks to the assistant (`AssistantChat.on`). */
   readonly on: (userId: string) => boolean;
   readonly remoteAsk: BoardRemoteAsk;
+  /** The locale of the client the message being handled came from ("" none): the language before the person said one. */
+  readonly clientLocale?: () => string;
 }
 
 function view(v: View): OutMessage {
@@ -63,6 +65,10 @@ export class Board {
   noRetryUntil = 0;
 
   constructor(private readonly deps: BoardDeps) {}
+
+  private locale(): string {
+    return this.deps.clientLocale?.() ?? "";
+  }
 
   /** `/board`: the person's work items, and a card for each one that waits for them. */
   async show(userId: string, key: string, conversation: Conversation): Promise<void> {
@@ -122,7 +128,7 @@ export class Board {
       );
       const cardId = store.assistantCards.addAssistantCard(userId, item.itemId, item.resultVersion, item.canAccept);
       const said = item.pendingQuestion ?? item.summary;
-      const lang = answerLang(store.prefs.getPrefs(userId).lang, "", said, item.title);
+      const lang = answerLang(store.prefs.getPrefs(userId).lang, this.locale(), said, item.title);
       const watching = store.assistantCards.autoReply(userId, item.itemId) !== null;
       await conversation.send(
         view({ name: "workCard", model: { item, text: said, cardId, note: "", watch: false, watching, lang } }),
@@ -156,7 +162,7 @@ export class Board {
         about: `#${String(item.seq)} ${item.title}`,
         expiresAt: perm.expiresAt,
         zone: zoneOf(prefs),
-        lang: answerLang(prefs.lang, "", item.title),
+        lang: answerLang(prefs.lang, this.locale(), item.title),
       });
     }
     return undefined;
@@ -165,7 +171,7 @@ export class Board {
   /** The board with its own buttons, each button's card recorded first; in the person's language. */
   model(userId: string, items: readonly WorkItem[], asked: readonly ReviewAskedOfOther[]) {
     const { store } = this.deps;
-    const lang = answerLang(store.prefs.getPrefs(userId).lang, "", ...items.slice(0, 5).map((i) => i.title));
+    const lang = answerLang(store.prefs.getPrefs(userId).lang, this.locale(), ...items.slice(0, 5).map((i) => i.title));
     const acceptable = items.filter((i) => i.boardState === "needs_you" && i.canAccept).slice(0, ACCEPT_ALL_MAX);
     const accept =
       acceptable.length > 1

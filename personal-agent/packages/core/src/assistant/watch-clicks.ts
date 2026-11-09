@@ -55,7 +55,13 @@ export class WatchClicks {
   }
 
   /** The card again (when it is still open and the item still waits) with what was said under it, else the words alone. */
-  private async putBack(click: CardClick, card: AssistantCard, item: WorkItem, said: string, flags: { watching?: boolean; watch?: boolean }) {
+  private async putBack(
+    click: CardClick,
+    card: AssistantCard,
+    item: WorkItem,
+    said: string,
+    flags: { watching?: boolean; watch?: boolean },
+  ) {
     const again = card.state === "open" && item.boardState === "needs_you";
     const model = {
       item,
@@ -86,11 +92,19 @@ export class WatchClicks {
     }
     const { item, pulls } = found;
     const [pull] = pulls;
-    const outcome = pull === undefined ? { said: t.noPull({ label: itemLabel(item) }), watching: false } : await this.turnOn(click, key, item, pull);
+    const outcome =
+      pull === undefined
+        ? { said: t.noPull({ label: itemLabel(item) }), watching: false }
+        : await this.turnOn(click, key, item, pull);
     await this.putBack(click, card, item, outcome.said, { watching: outcome.watching });
   }
 
-  private async turnOn(click: CardClick, key: string, item: WorkItem, pull: string): Promise<{ said: string; watching: boolean }> {
+  private async turnOn(
+    click: CardClick,
+    key: string,
+    item: WorkItem,
+    pull: string,
+  ): Promise<{ said: string; watching: boolean }> {
     const token = await this.token(click.sender.id);
     if (token === undefined) return { said: t.watchNeedsSignIn, watching: false };
     // (whether it was on already: Claw's answer to the press does not tell an upgrade of the watch from one that was on)
@@ -103,11 +117,19 @@ export class WatchClicks {
       const refused = refusal(error);
       if (refused === undefined) return { said: b.unreachable, watching: false };
       const refusedText =
-        refused.status === 409 ? t.watchRefused409({ label }) : refused.status === 404 ? t.watchRefused404 : refused.status === 403 ? t.watchRefused403 : failureText(refused.status, refused.code);
+        refused.status === 409
+          ? t.watchRefused409({ label })
+          : refused.status === 404
+            ? t.watchRefused404
+            : refused.status === 403
+              ? t.watchRefused403
+              : failureText(refused.status, refused.code);
       return { said: refusedText, watching: false };
     }
     this.deps.store.assistantCards.setAutoReply(click.sender.id, item.itemId, pull);
-    const said = already ? t.watchingAlready({ pull, short: shortPull(pull) }) : t.watching({ pull, label, short: shortPull(pull) });
+    const said = already
+      ? t.watchingAlready({ pull, short: shortPull(pull) })
+      : t.watching({ pull, label, short: shortPull(pull) });
     return { said, watching: true };
   }
 

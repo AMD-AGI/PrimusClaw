@@ -3,6 +3,7 @@
 
 export * from "./approval-decisions.js";
 export * from "./approval.js";
+export * from "./assistant-actions.js";
 export * from "./assistant-board.js";
 export * from "./assistant-cards.js";
 export * from "./assistant-chat.js";
