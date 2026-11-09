@@ -36,6 +36,11 @@ export interface ReviewTurnStart {
   after(outcome: TurnOutcome): Promise<void>;
 }
 
+/** A turn that was started: it runs on its own, and `done` settles when it is over (it never rejects). */
+export interface RunningTurn {
+  readonly done: Promise<void>;
+}
+
 export interface StartTurn {
   readonly chat: Chat;
   /** What the turn calls Claw with (for a review: the asker's identity token). */
@@ -64,8 +69,8 @@ export class TurnStarter {
     return Promise.all([...this.running]).then(() => undefined);
   }
 
-  /** The turn's promise, or undefined when none was started (the person was told why). */
-  async start(request: StartTurn): Promise<Promise<void> | undefined> {
+  /** The turn that runs (its end is `done`), or undefined when none was started (the person was told why). */
+  async start(request: StartTurn): Promise<RunningTurn | undefined> {
     const { chat, review } = request;
     const key = review
       ? reviewTurnKey(chat.sender.id, chat.scope, review.itemId, review.pull)
@@ -84,7 +89,7 @@ export class TurnStarter {
     const task = this.guarded(request, run, key, turn);
     this.running.add(task);
     void task.finally(() => this.running.delete(task));
-    return task;
+    return { done: task };
   }
 
   /** True when admitted as the chat's first turn; false when the chat has one (queue behind it); undefined: refused. */

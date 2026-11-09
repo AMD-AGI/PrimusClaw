@@ -5,7 +5,7 @@ import type { GithubConnection } from "../claw/model.js";
 import type { JsonObject } from "../json.js";
 import type { KeyOwner } from "../plugins/identity-lookup.js";
 import type { Lang } from "../locales/lang.js";
-import type { Conversation, InboundFile, InboundMessage, UserRef } from "../ports/surface.js";
+import type { Conversation, InboundFile, InboundMessage, OutMessage, UserRef } from "../ports/surface.js";
 
 /**
  * What the router asks of the features it hands messages to. Each is implemented by the feature's own module (the
@@ -220,3 +220,17 @@ export interface MessageText {
   /** The line that names the files the channel gave no way to fetch (undefined: none). */
   unreadable(message: InboundMessage): { readonly line: string; readonly count: number } | undefined;
 }
+
+/** A button on a note card: what it says and what pressing it sends back (the card data's verb and fields). */
+export interface NoteButton {
+  readonly title: string;
+  readonly verb: string;
+  readonly data: Readonly<Record<string, string>>;
+  readonly style?: "positive" | "destructive";
+}
+
+/** The note card a settled click ends as (rendered by the channel; the Python `render.note_card`). */
+export type NoteFactory = (
+  text: string,
+  options?: { readonly title?: string; readonly tone?: string; readonly buttons?: readonly NoteButton[] },
+) => OutMessage;

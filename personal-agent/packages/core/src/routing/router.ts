@@ -20,7 +20,7 @@ import { LinkCommands } from "./link-commands.js";
 import { Onboarding } from "./onboarding.js";
 import { PersonalRouter } from "./personal-router.js";
 import { filesNotReviewed, PersonalText } from "./personal-text.js";
-import { TurnStarter, type StartTurn } from "./turn-start.js";
+import { TurnStarter, type RunningTurn, type StartTurn } from "./turn-start.js";
 
 /**
  * The entry point of every inbound event (the Python `Agent.handle`, `_route`, `_settle_click`, `_dispatch`): idempotent
@@ -153,7 +153,7 @@ export class Router {
   // --- what the features ask of the router -------------------------------------------------------------------------
 
   /** Start (or queue) a turn: the review service starts its reviews here. */
-  startTurn(request: StartTurn): Promise<Promise<void> | undefined> {
+  startTurn(request: StartTurn): Promise<RunningTurn | undefined> {
     return this.starter.start(request);
   }
 

@@ -15,13 +15,13 @@ import type { StorePort } from "../ports/store/index.js";
 import type { ConversationRef, OutMessage, Surface } from "../ports/surface.js";
 import type { JsonObject } from "../json.js";
 import type { SecurityEventName } from "../observability/security-events.js";
-import type { NoteFactory } from "./chat.js";
 import type {
   AssistantChat,
   ChannelContextBuilder,
   ConnectionsText,
   GithubChat,
   MessageText,
+  NoteFactory,
   Observing,
   RemoteChat,
   ReviewStopReader,
